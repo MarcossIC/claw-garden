@@ -1,0 +1,100 @@
+<div class="chat-panel">
+  @if (chatService.activeAgentId()) {
+    <div class="messages" #messageList role="log" aria-live="polite" aria-label="Chat messages">
+      @for (msg of chatService.messages(); track msg.id) {
+        @if (msg.isCompaction) {
+          <div class="compaction-indicator" role="status">
+            <span class="compaction-icon">&#128220;</span>
+            <span class="compaction-text">{{ msg.content }}</span>
+          </div>
+        } @else if (msg.anomaly; as anomaly) {
+          <div
+            class="anomaly-card"
+            role="status"
+            [attr.data-anomaly-type]="anomaly.anomaly_type"
+          >
+            <header class="anomaly-header">
+              <span class="anomaly-icon" aria-hidden="true">&#9888;</span>
+              <span class="anomaly-badge">{{ anomaly.anomaly_type }}</span>
+              <span class="anomaly-title">Agent self-report</span>
+            </header>
+            <p class="anomaly-description">{{ anomaly.description }}</p>
+            @if (anomaly.intended_action) {
+              <section class="anomaly-action" aria-label="Intended action">
+                <span class="anomaly-action-label">Intended action</span>
+                <code class="anomaly-action-text">{{ anomaly.intended_action }}</code>
+              </section>
+            }
+          </div>
+        } @else {
+          <div
+            class="message"
+            [class]="'message-' + msg.role"
+            [class.message-error]="!!msg.failedUserMessage"
+          >
+            <span class="message-role">{{ msg.role === 'user' ? 'You' : 'Agent' }}</span>
+            @if (msg.toolUse) {
+              <div class="tool-indicator">
+                <span class="tool-icon">&#128269;</span> {{ msg.toolUse }}
+              </div>
+            }
+            @if (msg.role === 'assistant' && msg.content && !msg.isStreaming && !msg.failedUserMessage) {
+              <div class="message-content markdown-body" [innerHTML]="msg.content | markdown"></div>
+            } @else {
+              <div class="message-content">{{ msg.content }}</div>
+            }
+            @if (msg.isStreaming) {
+              <span class="typing-dots" aria-label="Agent is typing">
+                <span class="dot"></span>
+                <span class="dot"></span>
+                <span class="dot"></span>
+              </span>
+            }
+            @if (msg.failedUserMessage && !chatService.isStreaming()) {
+              <div class="error-actions">
+                <button
+                  class="error-action-btn retry-btn"
+                  (click)="retry(msg.id)"
+                  aria-label="Retry message"
+                >Retry</button>
+                <button
+                  class="error-action-btn edit-btn"
+                  (click)="editAndRetry(msg.id)"
+                  aria-label="Edit and resend message"
+                >Edit</button>
+              </div>
+            }
+          </div>
+        }
+      } @empty {
+        <p class="empty-chat">Send a message to start chatting with the agent</p>
+      }
+    </div>
+
+    <div class="input-area">
+      <div class="input-row">
+        <textarea
+          class="chat-input"
+          placeholder="Type a message..."
+          [value]="inputText()"
+          (input)="onInput($event)"
+          (keydown)="onKeydown($event)"
+          [disabled]="chatService.isStreaming()"
+          rows="1"
+        ></textarea>
+        <button
+          class="send-btn"
+          (click)="send()"
+          [disabled]="chatService.isStreaming() || !inputText().trim()"
+          aria-label="Send message"
+        >
+          Send
+        </button>
+      </div>
+    </div>
+  } @else {
+    <div class="no-agent">
+      <p>Select an agent to start chatting</p>
+    </div>
+  }
+</div>

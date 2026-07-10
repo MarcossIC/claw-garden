@@ -38,6 +38,10 @@ testem.log
 /typings
 __screenshots__/
 
+# Tauri
+/src-tauri/target
+
 # System files
 .DS_Store
 Thumbs.db
+**/docs/completed-impl/*

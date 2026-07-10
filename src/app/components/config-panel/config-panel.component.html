@@ -1,0 +1,246 @@
+<div class="config-panel">
+  <section class="config-section">
+    <h3>AI Provider</h3>
+    <div class="field">
+      <label for="provider-select">Provider</label>
+      <select
+        id="provider-select"
+        [ngModel]="providerType()"
+        (ngModelChange)="providerType.set($event)"
+      >
+        <option value="ollama">Ollama (Local)</option>
+        <option value="anthropic">Claude (Anthropic)</option>
+        <option value="openrouter">OpenRouter (300+ models)</option>
+      </select>
+    </div>
+  </section>
+
+  @if (providerType() === 'ollama') {
+    <section class="config-section">
+      <div class="section-header">
+        <h3>Ollama Settings</h3>
+        <span class="status-dot" [class.connected]="ollamaRunning()"></span>
+      </div>
+
+      <div class="field">
+        <label for="ollama-host">Host</label>
+        <input id="ollama-host" type="text" [ngModel]="ollamaHost()" (ngModelChange)="ollamaHost.set($event)" />
+      </div>
+      <div class="field">
+        <label for="ollama-port">Port</label>
+        <input id="ollama-port" type="number" [ngModel]="ollamaPort()" (ngModelChange)="ollamaPort.set($event)" />
+      </div>
+      <div class="field">
+        <label for="ollama-model">Model</label>
+        @if (ollamaModels().length > 0) {
+          <select id="ollama-model" [ngModel]="ollamaModel()" (ngModelChange)="ollamaModel.set($event)">
+            @for (model of ollamaModels(); track model) {
+              <option [value]="model">{{ model }}</option>
+            }
+          </select>
+        } @else {
+          <input id="ollama-model" type="text" [ngModel]="ollamaModel()" (ngModelChange)="ollamaModel.set($event)" placeholder="e.g. llama3.1" />
+        }
+      </div>
+      <button class="btn btn-secondary" (click)="refreshOllama()">Detect Ollama</button>
+    </section>
+  }
+
+  @if (providerType() === 'anthropic') {
+    <section class="config-section">
+      <h3>Claude Settings</h3>
+      <div class="field">
+        <label for="anthropic-key">API Key</label>
+        <input id="anthropic-key" type="password" [ngModel]="anthropicApiKey()" (ngModelChange)="anthropicApiKey.set($event)" placeholder="sk-ant-..." />
+      </div>
+      <div class="field">
+        <label for="anthropic-model">Model</label>
+        <select id="anthropic-model" [ngModel]="anthropicModel()" (ngModelChange)="anthropicModel.set($event)">
+          <option value="claude-sonnet-4-5-20250514">Claude Sonnet 4.5</option>
+          <option value="claude-haiku-4-5-20251001">Claude Haiku 4.5</option>
+        </select>
+      </div>
+    </section>
+  }
+
+  @if (providerType() === 'openrouter') {
+    <section class="config-section">
+      <h3>OpenRouter Settings</h3>
+      <div class="field">
+        <label for="or-key">API Key</label>
+        <div class="path-row">
+          <input id="or-key" type="password" [ngModel]="openrouterApiKey()" (ngModelChange)="openrouterApiKey.set($event)" placeholder="sk-or-v1-..." />
+          <button class="btn btn-secondary btn-small" (click)="loadOpenRouterModels()">Load Models</button>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>Quick Select (auto-routers)</label>
+        <div class="router-options">
+          <button
+            class="router-btn"
+            [class.selected]="openrouterModel() === 'openrouter/free'"
+            (click)="selectOpenRouterModel('openrouter/free')"
+          >
+            Free Router
+            <span class="router-desc">Auto-selects free models. Zero cost.</span>
+          </button>
+          <button
+            class="router-btn"
+            [class.selected]="openrouterModel() === 'openrouter/auto'"
+            (click)="selectOpenRouterModel('openrouter/auto')"
+          >
+            Auto Router
+            <span class="router-desc">Best model for your prompt. May incur costs.</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>Selected: <strong>{{ openrouterModel() }}</strong></label>
+      </div>
+
+      @if (configService.openrouterModels().length > 0) {
+
+        <div class="model-filters">
+          <label class="filter-label">
+            <input type="checkbox" [ngModel]="openrouterFreeOnly()" (ngModelChange)="openrouterFreeOnly.set($event)" />
+            Free only
+          </label>
+          <label class="filter-label">
+            <input type="checkbox" [ngModel]="openrouterToolsOnly()" (ngModelChange)="openrouterToolsOnly.set($event)" />
+            With tools
+          </label>
+        </div>
+
+        <div class="field">
+          <input
+            type="text"
+            [ngModel]="openrouterSearch()"
+            (ngModelChange)="openrouterSearch.set($event)"
+            placeholder="Search models..."
+            class="search-input"
+          />
+        </div>
+
+        <div class="model-list">
+          @for (model of filteredOpenRouterModels(); track model.id) {
+            <button
+              class="model-item"
+              [class.selected]="model.id === openrouterModel()"
+              (click)="selectOpenRouterModel(model.id)"
+            >
+              <span class="model-name">{{ model.name }}</span>
+              <span class="model-meta">
+                @if (isFreeModel(model)) {
+                  <span class="badge free">FREE</span>
+                } @else {
+                  <span class="badge cost">${{ model.pricing?.prompt }}/M</span>
+                }
+                <span class="ctx">{{ model.context_length | number }}ctx</span>
+              </span>
+            </button>
+          } @empty {
+            <p class="empty-state">No models match filters</p>
+          }
+        </div>
+      } @else {
+        <div class="field">
+          <label for="or-model">Model ID</label>
+          <input id="or-model" type="text" [ngModel]="openrouterModel()" (ngModelChange)="openrouterModel.set($event)" placeholder="openrouter/auto" />
+        </div>
+        <p class="hint">Enter API key and click "Load Models" to see available models</p>
+      }
+    </section>
+  }
+
+  <button class="btn btn-primary" (click)="saveProvider()" [disabled]="saveStatus() === 'saving'">
+    @switch (saveStatus()) {
+      @case ('saving') { Saving... }
+      @case ('saved') { Saved! }
+      @case ('error') { Error }
+      @default { Save Provider }
+    }
+  </button>
+  @if (saveStatus() === 'saved' || saveStatus() === 'error') {
+    <span class="save-feedback" [class.error]="saveStatus() === 'error'">{{ saveMessage() }}</span>
+  }
+
+  <section class="config-section">
+    <h3>Project</h3>
+    <div class="field">
+      <label for="project-path">Project Directory</label>
+      <div class="path-row">
+        <input id="project-path" type="text" [ngModel]="projectPath()" (ngModelChange)="projectPath.set($event)" placeholder="/path/to/project" />
+        <button class="btn btn-secondary btn-small" (click)="saveProjectPath()">Connect</button>
+      </div>
+    </div>
+    @if (configService.config().project_path) {
+      <span class="status-text connected">MCP connected: {{ configService.config().project_path }}</span>
+    }
+  </section>
+
+  <section
+    class="config-section embedder-section"
+    role="region"
+    aria-labelledby="embedder-heading"
+  >
+    <h3 id="embedder-heading">Embedder</h3>
+
+    @switch (embedderService.status().phase) {
+      @case ('idle') {
+        <p class="embedder-copy">Embedder not yet started.</p>
+      }
+      @case ('start') {
+        <p class="embedder-copy" role="status" aria-live="polite">
+          Preparing embedder download...
+        </p>
+      }
+      @case ('downloading') {
+        <label class="embedder-copy" id="embedder-progress-label" for="embedder-progress">
+          Downloading model
+          ({{ embedderService.status().bytesDownloaded ?? 0 | number }} /
+          {{ embedderService.status().bytesTotal ?? 0 | number }} bytes)
+        </label>
+        <div
+          id="embedder-progress"
+          class="embedder-progressbar"
+          role="progressbar"
+          aria-label="Embedder download progress"
+          [attr.aria-valuemin]="0"
+          [attr.aria-valuemax]="100"
+          [attr.aria-valuenow]="embedderProgressPercent()"
+          [attr.aria-labelledby]="'embedder-progress-label'"
+        >
+          <div
+            class="embedder-progressbar-fill"
+            [style.width.%]="embedderProgressPercent()"
+          ></div>
+        </div>
+      }
+      @case ('verifying') {
+        <p class="embedder-copy" role="status" aria-live="polite">
+          <span class="embedder-spinner" aria-hidden="true"></span>
+          Verifying model integrity...
+        </p>
+      }
+      @case ('done') {
+        <p class="embedder-copy status-text connected">
+          Embedder ready: multilingual-e5-small (384 dims)
+        </p>
+      }
+      @case ('error') {
+        <p class="embedder-copy embedder-error" role="alert">
+          Embedder failed: {{ embedderService.status().error }}
+        </p>
+        <button
+          type="button"
+          class="btn btn-secondary"
+          (click)="embedderService.retry()"
+        >
+          Retry download
+        </button>
+      }
+    }
+  </section>
+</div>

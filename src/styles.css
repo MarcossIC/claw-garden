@@ -1,1 +1,65 @@
-/* You can add global styles to this file, and also import other style files */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  /* RPG Color Palette */
+  --rpg-bg-deep: #0d0d1a;
+  --rpg-bg: #1a1a2e;
+  --rpg-bg-panel: #16132a;
+  --rpg-frame: #5a4a7a;
+  --rpg-frame-light: #7a6a9a;
+  --rpg-frame-dark: #2a1a3a;
+  --rpg-gold: #f0c040;
+  --rpg-gold-dim: #b89030;
+  --rpg-mana: #40a0e0;
+  --rpg-hp: #e04050;
+  --rpg-xp: #40c050;
+  --rpg-text: #e8e0d0;
+  --rpg-text-muted: #8878a0;
+  --rpg-text-dim: #5a4a6a;
+
+  /* Fonts */
+  --font-pixel: 'Press Start 2P', monospace;
+  --font-body: 'Courier New', 'Consolas', monospace;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--rpg-bg-deep);
+  color: var(--rpg-text);
+  font-family: var(--font-body);
+  font-size: 14px;
+  image-rendering: pixelated;
+}
+
+/* Pixel-art scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--rpg-bg-deep);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--rpg-frame);
+  border: 2px solid var(--rpg-bg-deep);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--rpg-frame-light);
+}
+
+/* Selection color */
+::selection {
+  background: var(--rpg-gold);
+  color: var(--rpg-bg-deep);
+}

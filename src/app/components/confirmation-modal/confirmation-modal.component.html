@@ -1,0 +1,69 @@
+@if (current(); as req) {
+  <div class="modal-backdrop" aria-hidden="true"></div>
+  <div
+    class="modal-dialog"
+    role="alertdialog"
+    aria-modal="true"
+    [attr.aria-labelledby]="'conf-title-' + req.call_id"
+    [attr.aria-describedby]="'conf-desc-' + req.call_id"
+  >
+    <header class="modal-header">
+      <span
+        class="modal-badge"
+        [class.badge-destructive]="req.source === 'destructive_tool'"
+        [class.badge-hook]="req.source === 'hook_ask'"
+      >
+        @if (req.source === 'destructive_tool') {
+          Destructive
+        } @else {
+          Hook policy
+        }
+      </span>
+      <h2 [id]="'conf-title-' + req.call_id" class="modal-title">{{ headline() }}</h2>
+    </header>
+
+    <div [id]="'conf-desc-' + req.call_id" class="modal-body">
+      <p class="modal-lede">
+        The agent wants to invoke
+        <code class="tool-name">{{ req.tool_name }}</code>
+        @if (req.source === 'destructive_tool') {
+          which can modify your system. Review the input and decide.
+        } @else {
+          and a hook policy is asking you to confirm. Review the input and decide.
+        }
+      </p>
+
+      @if (req.reason) {
+        <section class="modal-reason" aria-label="Reason from hook">
+          <h3 class="reason-heading">Reason</h3>
+          <p class="reason-text">{{ req.reason }}</p>
+        </section>
+      }
+
+      <section class="modal-args" aria-label="Tool arguments">
+        <h3 class="args-heading">Arguments</h3>
+        <pre class="args-pre"><code>{{ formattedArgs() }}</code></pre>
+      </section>
+    </div>
+
+    <footer class="modal-footer">
+      <button
+        #denyBtn
+        type="button"
+        class="btn btn-deny"
+        (click)="deny(req)"
+        aria-keyshortcuts="Escape"
+      >
+        Deny
+        <span class="btn-hint">Esc</span>
+      </button>
+      <button
+        type="button"
+        class="btn btn-allow"
+        (click)="approve(req)"
+      >
+        Allow
+      </button>
+    </footer>
+  </div>
+}

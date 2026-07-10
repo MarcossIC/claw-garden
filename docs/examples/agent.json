@@ -1,0 +1,59 @@
+{
+  "id": "senior-dev",
+  "name": "Senior Dev",
+  "role": "developer",
+  "provider_id": "anthropic-prod",
+  "project_path": "/path/to/project",
+  "efficient_mode": false,
+  "position": { "x": 5.0, "y": 5.0 },
+  "state": { "kind": "Idle" },
+
+  "hooks": {
+    "PreToolUse": [
+      {
+        "command": "./hooks/zone-router.sh",
+        "tools": ["Bash", "edit_file", "read_file", "grep_search", "glob_search"],
+        "async": true,
+        "status_message": "Moviendo al agente..."
+      },
+      {
+        "command": "./hooks/command-formatter.sh",
+        "if": "Bash(*)",
+        "phase": "main"
+      },
+      {
+        "command": "./hooks/git-guard.sh",
+        "if": "Bash(git push*)",
+        "phase": "enforce",
+        "on_timeout": "continue"
+      },
+      {
+        "command": "./hooks/permission-guard.sh",
+        "phase": "enforce",
+        "timeout_secs": 5
+      }
+    ],
+
+    "PostToolUse": [
+      {
+        "command": "./hooks/visual-update.sh",
+        "async": true
+      }
+    ],
+
+    "PostToolUseFailure": [
+      "./hooks/error-handler.sh"
+    ],
+
+    "Stop": [
+      {
+        "command": "./hooks/idle-animation.sh",
+        "async": true
+      }
+    ],
+
+    "pre_tool_use_timeout_secs": 10,
+    "post_tool_use_timeout_secs": 30,
+    "post_tool_use_failure_timeout_secs": 30
+  }
+}

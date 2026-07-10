@@ -1,0 +1,672 @@
+:host {
+  display: block;
+  height: 100%;
+}
+
+.sidebar {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--rpg-bg-panel);
+  border-left: 4px solid var(--rpg-frame);
+  box-shadow:
+    inset 2px 0 0 0 var(--rpg-frame-light),
+    -4px 0 0 0 var(--rpg-frame-dark);
+  overflow: hidden;
+}
+
+/* ── Header ── */
+.sidebar-header {
+  padding: 16px 16px 10px;
+  border-bottom: 3px solid var(--rpg-frame);
+}
+
+.sidebar-header h2 {
+  font-family: var(--font-pixel);
+  font-size: 0.7rem;
+  color: var(--rpg-gold);
+  letter-spacing: 0.15em;
+  text-shadow: 2px 2px 0 var(--rpg-frame-dark);
+}
+
+/* ── Feedback Toast ── */
+.feedback {
+  padding: 6px 16px;
+  background: var(--rpg-frame-dark);
+  color: var(--rpg-xp);
+  font-family: var(--font-pixel);
+  font-size: 0.4rem;
+  text-align: center;
+  border-bottom: 2px solid var(--rpg-frame);
+}
+
+/* ── Tabs ── */
+.tabs {
+  display: flex;
+  padding: 0;
+  border-bottom: 3px solid var(--rpg-frame);
+}
+
+.tab {
+  flex: 1;
+  padding: 10px 0;
+  background: var(--rpg-bg-deep, #0d0d1a);
+  border: none;
+  border-right: 2px solid var(--rpg-frame-dark);
+  color: var(--rpg-text-muted);
+  cursor: pointer;
+  font-family: var(--font-pixel);
+  font-size: 0.45rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  transition: background 0.1s, color 0.1s;
+}
+
+.tab:last-child {
+  border-right: none;
+}
+
+.tab:hover {
+  background: var(--rpg-bg);
+  color: var(--rpg-text);
+}
+
+.tab.active {
+  background: var(--rpg-bg-panel);
+  color: var(--rpg-gold);
+  box-shadow: inset 0 -2px 0 0 var(--rpg-gold);
+}
+
+/* ── Tab Content ── */
+.tab-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 14px;
+}
+
+.chat-tab {
+  padding: 0;
+  overflow: hidden;
+}
+
+/* ── List Cards ── */
+.list-card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  padding: 10px 12px;
+  background: var(--rpg-bg-deep);
+  border: 2px solid var(--rpg-frame-dark);
+  color: var(--rpg-text);
+  cursor: pointer;
+  font-family: var(--font-body);
+  font-size: 0.8rem;
+  text-align: left;
+  margin-bottom: 6px;
+  transition: border-color 0.1s;
+}
+
+.list-card:hover {
+  border-color: var(--rpg-gold-dim);
+}
+
+.card-name {
+  font-weight: 700;
+  font-size: 0.85rem;
+}
+
+.card-meta {
+  font-family: var(--font-pixel);
+  font-size: 0.35rem;
+  color: var(--rpg-text-muted);
+  letter-spacing: 0.05em;
+}
+
+/* ── Agent card with edit button ── */
+.agent-card-row {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  cursor: default;
+}
+
+.agent-select {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  background: var(--rpg-bg-deep);
+  border: 2px solid var(--rpg-frame-dark);
+  color: var(--rpg-text);
+  cursor: pointer;
+  font-family: var(--font-body);
+  font-size: 0.8rem;
+  text-align: left;
+  transition: border-color 0.1s;
+}
+
+.agent-select:hover {
+  border-color: var(--rpg-gold-dim);
+}
+
+.agent-select.selected {
+  border-color: var(--rpg-gold);
+  background: var(--rpg-bg);
+}
+
+.btn-icon {
+  background: var(--rpg-frame-dark);
+  border: 2px solid var(--rpg-frame);
+  color: var(--rpg-text-muted);
+  cursor: pointer;
+  padding: 6px 8px;
+  font-size: 0.9rem;
+  transition: color 0.1s;
+}
+
+.btn-icon:hover {
+  color: var(--rpg-gold);
+}
+
+/* ── Add Button ── */
+.btn-add {
+  width: 100%;
+  padding: 10px;
+  background: transparent;
+  border: 2px dashed var(--rpg-frame);
+  color: var(--rpg-gold);
+  cursor: pointer;
+  font-family: var(--font-pixel);
+  font-size: 0.45rem;
+  text-align: center;
+  margin-bottom: 10px;
+  transition: border-color 0.1s, color 0.1s;
+}
+
+.btn-add:hover {
+  border-color: var(--rpg-gold);
+  color: #fff;
+}
+
+/* ── Forms ── */
+.form-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+h3 {
+  font-family: var(--font-pixel);
+  font-size: 0.5rem;
+  color: var(--rpg-gold);
+  margin: 0;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.field label {
+  font-family: var(--font-pixel);
+  font-size: 0.4rem;
+  color: var(--rpg-text-muted);
+  letter-spacing: 0.05em;
+}
+
+.field input,
+.field select,
+.field textarea {
+  padding: 6px 10px;
+  background: var(--rpg-bg-deep);
+  border: 2px solid var(--rpg-frame-dark);
+  color: var(--rpg-text);
+  font-family: var(--font-body);
+  font-size: 0.8rem;
+  outline: none;
+  transition: border-color 0.1s;
+}
+
+.field input:focus,
+.field select:focus,
+.field textarea:focus {
+  border-color: var(--rpg-gold);
+}
+
+.field textarea {
+  resize: vertical;
+  min-height: 60px;
+}
+
+.instructions-area {
+  max-height: 400px;
+}
+
+/* ── Path input with browse button ── */
+.path-input-wrap {
+  position: relative;
+  display: flex;
+}
+
+.path-input-wrap input {
+  flex: 1;
+  padding-right: 36px;
+  text-overflow: ellipsis;
+}
+
+.path-browse-btn {
+  position: absolute;
+  right: 2px;
+  top: 2px;
+  bottom: 2px;
+  width: 32px;
+  background: var(--rpg-frame-dark);
+  border: none;
+  border-left: 2px solid var(--rpg-frame);
+  color: var(--rpg-text);
+  cursor: pointer;
+  font-size: 0.9rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.1s;
+}
+
+.path-browse-btn:hover {
+  background: var(--rpg-frame);
+}
+
+.field input::placeholder,
+.field textarea::placeholder {
+  color: var(--rpg-text-dim);
+}
+
+.field-row {
+  display: flex;
+  gap: 6px;
+}
+
+.field-row input {
+  flex: 1;
+}
+
+.filter-check {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--font-pixel);
+  font-size: 0.35rem;
+  color: var(--rpg-text-muted);
+  cursor: pointer;
+}
+
+.filter-check input[type='checkbox'] {
+  accent-color: var(--rpg-gold);
+}
+
+.model-list {
+  max-height: 160px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border: 2px solid var(--rpg-frame-dark);
+  padding: 4px;
+}
+
+.model-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 5px 8px;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--rpg-text);
+  cursor: pointer;
+  font-family: var(--font-body);
+  font-size: 0.7rem;
+  text-align: left;
+}
+
+.model-item:hover {
+  background: var(--rpg-bg-panel);
+  border-color: var(--rpg-frame-dark);
+}
+
+.model-item.selected {
+  background: var(--rpg-bg);
+  border-color: var(--rpg-gold);
+}
+
+.model-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-badges {
+  flex-shrink: 0;
+  margin-left: 4px;
+}
+
+.badge {
+  font-family: var(--font-pixel);
+  font-size: 0.3rem;
+  padding: 2px 5px;
+  border: 1px solid;
+}
+
+.badge.free {
+  background: var(--rpg-xp);
+  border-color: #2a8a3a;
+  color: var(--rpg-bg-deep);
+}
+
+.badge.cost {
+  background: var(--rpg-frame-dark);
+  border-color: var(--rpg-frame);
+  color: var(--rpg-text-muted);
+}
+
+.form-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.btn {
+  padding: 8px 14px;
+  border: 2px solid;
+  cursor: pointer;
+  font-family: var(--font-pixel);
+  font-size: 0.4rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  box-shadow: 2px 2px 0 0 var(--rpg-frame-dark);
+  transition: transform 0.05s, box-shadow 0.05s;
+}
+
+.btn:hover:not(:disabled) {
+  transform: translate(-1px, -1px);
+  box-shadow: 3px 3px 0 0 var(--rpg-frame-dark);
+}
+
+.btn:active:not(:disabled) {
+  transform: translate(1px, 1px);
+  box-shadow: 1px 1px 0 0 var(--rpg-frame-dark);
+}
+
+.btn-primary {
+  background: var(--rpg-gold);
+  border-color: var(--rpg-gold-dim);
+  color: var(--rpg-bg-deep);
+}
+
+.btn-primary:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+.btn-secondary {
+  background: var(--rpg-frame-dark);
+  border-color: var(--rpg-frame);
+  color: var(--rpg-text);
+}
+
+.btn-sm {
+  padding: 5px 8px;
+  font-size: 0.35rem;
+}
+
+.btn-danger {
+  background: var(--rpg-hp);
+  border-color: #a02030;
+  color: #fff;
+}
+
+/* ── Chat Header ── */
+.chat-header {
+  padding: 10px 14px;
+  border-bottom: 2px solid var(--rpg-frame);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.chat-agent-name {
+  font-family: var(--font-pixel);
+  font-size: 0.5rem;
+  color: var(--rpg-gold);
+}
+
+.chat-agent-meta {
+  font-family: var(--font-pixel);
+  font-size: 0.35rem;
+  color: var(--rpg-text-muted);
+}
+
+/* ── Empty States ── */
+.empty-state {
+  color: var(--rpg-text-dim);
+  font-family: var(--font-pixel);
+  font-size: 0.4rem;
+  text-align: center;
+  padding: 20px 0;
+  line-height: 2;
+}
+
+.hint {
+  font-family: var(--font-pixel);
+  font-size: 0.35rem;
+  color: var(--rpg-text-dim);
+  line-height: 1.8;
+}
+
+/* ── OAuth Section ── */
+.oauth-section {
+  padding: 12px;
+  margin-bottom: 12px;
+  background: var(--rpg-bg-deep);
+  border: 2px solid var(--rpg-frame-dark);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.oauth-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.oauth-title {
+  font-family: var(--font-pixel);
+  font-size: 0.45rem;
+  color: var(--rpg-text);
+  letter-spacing: 0.05em;
+}
+
+.auth-badge {
+  font-family: var(--font-pixel);
+  font-size: 0.3rem;
+  padding: 2px 6px;
+  border: 1px solid;
+  letter-spacing: 0.05em;
+}
+
+.auth-badge.auth-oauth {
+  background: #1a3a5c;
+  border-color: #2a6aaa;
+  color: #6ab4ff;
+}
+
+.auth-badge.auth-env {
+  background: #1a3a2a;
+  border-color: #2a8a3a;
+  color: var(--rpg-xp);
+}
+
+.auth-badge.auth-config {
+  background: var(--rpg-frame-dark);
+  border-color: var(--rpg-frame);
+  color: var(--rpg-text-muted);
+}
+
+.oauth-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.oauth-connected {
+  font-family: var(--font-pixel);
+  font-size: 0.35rem;
+  color: var(--rpg-xp);
+}
+
+.oauth-expired {
+  font-family: var(--font-pixel);
+  font-size: 0.3rem;
+  color: var(--rpg-hp);
+  padding: 1px 5px;
+  border: 1px solid var(--rpg-hp);
+}
+
+.oauth-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.oauth-hint {
+  font-family: var(--font-pixel);
+  font-size: 0.35rem;
+  color: var(--rpg-text-dim);
+  line-height: 1.8;
+  margin: 0;
+}
+
+.btn-oauth {
+  width: 100%;
+  padding: 10px 14px;
+  background: #1a3a5c;
+  border: 2px solid #2a6aaa;
+  color: #6ab4ff;
+  cursor: pointer;
+  font-family: var(--font-pixel);
+  font-size: 0.45rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  box-shadow: 2px 2px 0 0 var(--rpg-frame-dark);
+  transition: transform 0.05s, box-shadow 0.05s, background 0.1s;
+}
+
+.btn-oauth:hover:not(:disabled) {
+  background: #224a6e;
+  transform: translate(-1px, -1px);
+  box-shadow: 3px 3px 0 0 var(--rpg-frame-dark);
+}
+
+.btn-oauth:active:not(:disabled) {
+  transform: translate(1px, 1px);
+  box-shadow: 1px 1px 0 0 var(--rpg-frame-dark);
+}
+
+.btn-oauth:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+
+/* ── OAuth inline in form ── */
+.oauth-inline-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: #0d1a2a;
+  border: 2px solid #1a3a5c;
+}
+
+.oauth-inline-text {
+  font-family: var(--font-pixel);
+  font-size: 0.35rem;
+  color: #6ab4ff;
+}
+
+/* ── Workspace Config Section ── */
+.workspace-section {
+  border: 2px solid var(--rpg-frame-dark);
+  background: var(--rpg-bg-deep);
+}
+
+.workspace-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  background: transparent;
+  border: none;
+  color: var(--rpg-text-muted);
+  cursor: pointer;
+  font-family: var(--font-pixel);
+  font-size: 0.38rem;
+  text-align: left;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  transition: color 0.1s, background 0.1s;
+}
+
+.workspace-toggle:hover {
+  color: var(--rpg-gold-dim);
+  background: var(--rpg-bg);
+}
+
+.workspace-toggle-label {
+  flex: 1;
+}
+
+.workspace-badge {
+  padding: 1px 5px;
+  background: var(--rpg-frame-dark);
+  border: 1px solid var(--rpg-frame);
+  color: var(--rpg-text-dim);
+  font-size: 0.3rem;
+}
+
+.workspace-badge.active {
+  border-color: var(--rpg-gold-dim);
+  color: var(--rpg-gold-dim);
+}
+
+.workspace-chevron {
+  font-size: 0.45rem;
+  color: var(--rpg-text-dim);
+}
+
+.workspace-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 10px 10px;
+  border-top: 1px solid var(--rpg-frame-dark);
+}
+
+.workspace-hint {
+  font-family: var(--font-pixel);
+  font-size: 0.32rem;
+  color: var(--rpg-text-dim);
+  line-height: 1.8;
+  margin: 0;
+}
+
+.workspace-save-btn {
+  align-self: flex-start;
+}

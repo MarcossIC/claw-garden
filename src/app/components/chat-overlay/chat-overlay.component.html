@@ -1,0 +1,41 @@
+<div class="chat-overlay" [class.open]="isOpen()" role="dialog" aria-label="Agent chat">
+  @if (activeAgent(); as agent) {
+    <!-- Resize handles per dock position -->
+    @switch (position()) {
+      @case ('bottom') {
+        <div class="rh rh-top" (mousedown)="startResize($event, 'height')"></div>
+        <div class="rh rh-left" (mousedown)="startResize($event, 'width')"></div>
+        <div class="rh rh-right" (mousedown)="startResize($event, 'width')"></div>
+      }
+      @case ('top') {
+        <div class="rh rh-bottom" (mousedown)="startResize($event, 'height')"></div>
+        <div class="rh rh-left" (mousedown)="startResize($event, 'width')"></div>
+        <div class="rh rh-right" (mousedown)="startResize($event, 'width')"></div>
+      }
+      @case ('left') {
+        <div class="rh rh-right" (mousedown)="startResize($event, 'width')"></div>
+      }
+      @case ('right') {
+        <div class="rh rh-left" (mousedown)="startResize($event, 'width')"></div>
+      }
+    }
+
+    <div class="overlay-header" (mousedown)="onHeaderDown($event)">
+      <div class="header-info">
+        <span class="agent-name">{{ agent.name }}</span>
+        <span class="agent-role">{{ agent.role }}</span>
+      </div>
+      <button class="close-btn" (click)="close()" aria-label="Close chat">&#10005;</button>
+    </div>
+    <app-chat-panel class="overlay-body" />
+  }
+</div>
+
+@if (isDragging()) {
+  <div class="drop-zones" aria-hidden="true">
+    <div class="dz dz-top" [class.active]="dragTarget() === 'top'"></div>
+    <div class="dz dz-bottom" [class.active]="dragTarget() === 'bottom'"></div>
+    <div class="dz dz-left" [class.active]="dragTarget() === 'left'"></div>
+    <div class="dz dz-right" [class.active]="dragTarget() === 'right'"></div>
+  </div>
+}
