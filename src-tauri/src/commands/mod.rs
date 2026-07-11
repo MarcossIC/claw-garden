@@ -5,6 +5,7 @@ pub mod chat;
 pub mod config;
 pub mod confirmations;
 pub mod embedder;
+pub mod memory_admin;
 pub mod providers;
 pub mod session;
 pub mod workspace;

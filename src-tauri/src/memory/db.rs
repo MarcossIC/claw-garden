@@ -59,6 +59,7 @@ impl MemoryStore {
         run_migrations(&conn).await?;
         crate::memory::score::register_score_udfs(&conn).await?;
         crate::memory::tier::register_tier_udf(&conn).await?;
+        crate::memory::tier::register_demote_udf(&conn).await?;
         // Raise SQLITE_LIMIT_VARIABLE_NUMBER from the default 999 to 32766 (SQLite hard
         // maximum). Flush batches of ≤500 rows × 3 bind vars = 1500 params would otherwise
         // exceed the default limit at row 334. See REQ-LIMIT (LIMIT-1).
@@ -92,6 +93,7 @@ impl MemoryStore {
         run_migrations(&conn).await?;
         crate::memory::score::register_score_udfs(&conn).await?;
         crate::memory::tier::register_tier_udf(&conn).await?;
+        crate::memory::tier::register_demote_udf(&conn).await?;
         // Raise SQLITE_LIMIT_VARIABLE_NUMBER — same as open() path. See REQ-LIMIT (LIMIT-2).
         conn.call(|c| -> rusqlite::Result<()> {
             // SAFETY: c is the exclusive connection reference for this call.

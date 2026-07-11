@@ -55,6 +55,11 @@ pub fn run() {
             // start_memory_worker and is the Phase 8+ supervision extension point.
             start_access_worker(app.handle().clone());
 
+            // memoria-3-capas-fase-3: spawn the maintenance job (periodic
+            // inactivity-based tier demotion). First pass fires 5 minutes
+            // after startup, then every 24h — see `memory::maintenance`.
+            crate::memory::maintenance::start_maintenance_worker(app.handle().clone());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -88,6 +93,9 @@ pub fn run() {
             commands::workspace::set_workspace_config,
             commands::confirmations::resolve_tool_confirmation,
             commands::embedder::retry_embedder_download,
+            commands::memory_admin::list_memories,
+            commands::memory_admin::set_importance,
+            commands::memory_admin::delete_memory,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

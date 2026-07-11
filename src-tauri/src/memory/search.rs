@@ -315,14 +315,19 @@ pub(crate) async fn search_all_memories(
     });
     all.truncate(k_final);
 
+    // memoria-3-capas-fase-4 (Requirement: Tier-per-hit logging) — appended to
+    // the existing retrieval debug line via the pure, unit-tested
+    // `format_tier_distribution` helper (t1 is always 0 here: the SEARCH_SQL_*
+    // `tier > 1` filter means tier-1 rows never reach KNN, not a bug).
     log::debug!(
-        "retrieval={}ms hits={} pool=({}+{}+{}) k_final={}",
+        "retrieval={}ms hits={} pool=({}+{}+{}) k_final={} dist={}",
         t0.elapsed().as_millis(),
         all.len(),
         scope.memory.unwrap_or(0),
         scope.episodic.unwrap_or(0),
         scope.procedural.unwrap_or(0),
         k_final,
+        crate::commands::memory_admin::format_tier_distribution(&all),
     );
 
     Ok(all)
@@ -735,5 +740,80 @@ mod tests {
         assert!(hits.iter().all(|h| h.score > 0.0), "scores must be positive");
         assert!(hits[0].score >= hits[1].score, "sorted DESC");
         assert!(hits[1].score >= hits[2].score, "sorted DESC");
+    }
+
+    // ── Lote 4 (memoria-3-capas-fase-2) — episodic_trajectory KNN retrieval ──
+    //
+    // No production code change here: SEARCH_SQL_EPISODIC's pre-existing
+    // `epi.agent_id = ?3 AND epi.tier > 1` filter already supports
+    // `episodic_trajectory` rows (tier=3 via compute_tier) without modification.
+    // These tests exist to PROVE that (S12/S13), not to add new behavior.
+
+    async fn insert_episodic_row_for_knn(
+        store: &MemoryStore,
+        agent_id: &str,
+        task: &str,
+        embedding: Vec<f32>,
+    ) -> i64 {
+        use crate::memory::store_insert::{CreatedByType, NewEpisodicTrajectoryRecord};
+        let record = NewEpisodicTrajectoryRecord {
+            scope: "agent",
+            agent_id: Some(agent_id.to_string()),
+            project_id: None,
+            session_id: format!("sess-knn-{agent_id}"),
+            task: task.to_string(),
+            tool_calls_json: "[]".to_string(),
+            errors_json: "[]".to_string(),
+            resolution: None,
+            success_score: 0.9,
+            created_by_type: CreatedByType::System,
+            created_by_ref: agent_id.to_string(),
+            importance: 5.0,
+            created_at_ms: 0,
+        };
+        store.insert_episodic_trajectory(record, embedding).await.unwrap()
+    }
+
+    // Task 4.1 (S12): row with agent_id="agent-a" is KNN-retrievable when the
+    // query is searched with the SAME agent_id; surfaced as memory_type='episode'.
+    #[tokio::test]
+    async fn episodic_trajectory_retrievable_by_same_agent_id() {
+        use crate::memory::embedder::FakeEmbedder;
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let embedder = FakeEmbedder::default();
+        let task = "depurar timeout de red";
+        let emb = embedder.embed(task).await.unwrap();
+        let id = insert_episodic_row_for_knn(&store, "agent-a", task, emb.clone()).await;
+
+        let hits = search_all_memories(&store, &emb, "agent-a", SearchScope::all_default(), 10)
+            .await
+            .unwrap();
+
+        let hit = hits
+            .iter()
+            .find(|h| h.id == id)
+            .expect("expected episodic row to be retrievable for the same agent_id");
+        assert_eq!(hit.memory_type, "episode", "episodic rows must surface memory_type='episode'");
+    }
+
+    // Task 4.2 (S13): the SAME row is NOT retrievable for a DIFFERENT agent_id
+    // — expected behavior (filter exclusion), not a regression.
+    #[tokio::test]
+    async fn episodic_trajectory_not_retrievable_by_different_agent_id() {
+        use crate::memory::embedder::FakeEmbedder;
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let embedder = FakeEmbedder::default();
+        let task = "depurar timeout de red";
+        let emb = embedder.embed(task).await.unwrap();
+        let id = insert_episodic_row_for_knn(&store, "agent-a", task, emb.clone()).await;
+
+        let hits = search_all_memories(&store, &emb, "agent-b", SearchScope::all_default(), 10)
+            .await
+            .unwrap();
+
+        assert!(
+            !hits.iter().any(|h| h.id == id),
+            "row must NOT be retrievable for a different agent_id (S13)"
+        );
     }
 }

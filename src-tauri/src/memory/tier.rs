@@ -121,6 +121,39 @@ pub(crate) async fn register_tier_udf(
     })
 }
 
+/// Registers the `demote_tier` scalar UDF on the connection.
+///
+/// Arity 3, `SQLITE_UTF8 | SQLITE_DETERMINISTIC`.  Delegates argument
+/// extraction to the closure and computation to the pure-Rust
+/// [`demote_inactive`] function. Mirrors [`register_tier_udf`] above.
+/// Called alongside it in `MemoryStore::open()` and
+/// `MemoryStore::new_for_test()` (memoria-3-capas-fase-3, maintenance job).
+pub(crate) async fn register_demote_udf(
+    conn: &tokio_rusqlite::Connection,
+) -> Result<(), MemoryError> {
+    conn.call(|c| {
+        use rusqlite::functions::FunctionFlags;
+        let det = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+
+        c.create_scalar_function("demote_tier", 3, det, |ctx| {
+            let current_tier: i64 = ctx.get(0)?;
+            let days_since_last_access: f64 = ctx.get(1)?;
+            let importance: f64 = ctx.get(2)?;
+            Ok(demote_inactive(current_tier, days_since_last_access, importance))
+        })?;
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| match e {
+        tokio_rusqlite::Error::Error(rusqlite_err) => MemoryError::Sqlite(rusqlite_err),
+        tokio_rusqlite::Error::ConnectionClosed => {
+            MemoryError::Backend("connection closed during demote UDF registration".into())
+        }
+        other => MemoryError::Backend(other.to_string()),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -286,5 +319,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v, 1, "expected tier 1 (user_preference INSERT), got {v}");
+    }
+
+    // ── T-05-test: register_demote_udf — SQL callable (memoria-3-capas-fase-3) ──
+
+    #[tokio::test]
+    async fn register_demote_udf_makes_demote_tier_callable_via_sql() {
+        // Uses new_for_test() which calls register_demote_udf internally.
+        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let v: i64 = store
+            .conn
+            .call(|c| {
+                c.query_row("SELECT demote_tier(1, 91.0, 5.0)", [], |r| r.get(0))
+            })
+            .await
+            .unwrap();
+        assert_eq!(v, 2, "expected tier 2 (DEMOTE-4, >90 days), got {v}");
     }
 }

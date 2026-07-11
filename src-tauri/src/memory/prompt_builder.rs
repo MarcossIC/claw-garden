@@ -107,6 +107,20 @@ pub(crate) async fn build_memory_prompt(
         tracker.record(hits.iter().map(|h| h.id).collect());
     }
 
+    // memoria-3-capas-fase-4 (Requirement: Tier-1 coverage logging) — the real
+    // measure of doc-7's "Tier 1 covers 80%" criterion (workspace_content
+    // presence alone, or hit count alone, can't answer it — both signals are
+    // needed together). Logged unconditionally, BEFORE `bucket_by_recency`
+    // consumes `hits` below. `log::info!` (vs search.rs's `log::debug!`) —
+    // this is the criterion's capturable signal.
+    log::info!(
+        "{}",
+        crate::commands::memory_admin::format_tier1_coverage(
+            !workspace_content.is_empty(),
+            hits.len()
+        )
+    );
+
     // 3. Bucket hits into RECENT vs LONG-TERM.
     let now_secs = std::time::SystemTime::now()
         .duration_since(UNIX_EPOCH)
