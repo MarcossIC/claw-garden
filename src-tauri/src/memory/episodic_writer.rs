@@ -1,11 +1,14 @@
 //! Episodic-trajectory writer (Fase 2 — memoria-3-capas).
 //!
-//! Fire-and-forget entry point `run_episodic_writer` (Lote 5), spawned from
-//! `commands/session.rs` on session close, mirroring `resolver::run_resolver`
-//! and `extractor::run_extractor`. Unlike the extractor, `build_trajectory` is
-//! a **pure, deterministic** function (no LLM, no DB): it aggregates the
-//! ENTIRE multi-agent session snapshot into a single `TrajectoryDraft`, since
-//! `episodic_trajectory.session_id` is UNIQUE (one row per session).
+//! `build_trajectory` and its testable core `run_episodic_writer_core` — the
+//! latter now consumed by `memory::miner::mine_session_core` (trajectory-miner
+//! Fase 1), which is the sole fire-and-forget entry point spawned from
+//! `commands/session.rs` on session close (the `run_episodic_writer` wrapper
+//! that used to live here was eliminated in favor of `miner::run_miner`).
+//! `build_trajectory` is a **pure, deterministic** function (no LLM, no DB):
+//! it aggregates the ENTIRE multi-agent session snapshot into a single
+//! `TrajectoryDraft`, since `episodic_trajectory.session_id` is UNIQUE (one
+//! row per session).
 //!
 //! # Design constraints (LOCKED — see `sdd/memoria-3-capas-fase-2/design`)
 //! - `build_trajectory` never panics and performs no I/O.
@@ -176,9 +179,9 @@ pub(crate) async fn run_episodic_writer_core(
     embedder: Option<Arc<dyn Embedder>>,
     project_by_agent: &HashMap<String, Option<String>>,
     now_ms: u64,
-) {
+) -> Option<(i64, TrajectoryDraft)> {
     if history.iter().all(|(_, m)| m.is_empty()) {
-        return;
+        return None;
     }
 
     // LOCKED: check the embedder ONCE, BEFORE build_trajectory/insert — saves
@@ -188,21 +191,21 @@ pub(crate) async fn run_episodic_writer_core(
         log::debug!(
             "episodic_writer: embedder not ready; skipping trajectory write for session={session_id}"
         );
-        return;
+        return None;
     };
 
     let Some(draft) = build_trajectory(&session_id, &history) else {
         // No non-empty Role::User anywhere in history — SKIP write (R2/S6
         // amended, no fallback: an empty/placeholder task would violate
         // NOT NULL and contaminate KNN with a meaningless embed).
-        return;
+        return None;
     };
 
     let embedding = match embedder.embed(&draft.task).await {
         Ok(v) => v,
         Err(e) => {
             log::warn!("episodic_writer: embed failed for session={session_id}: {e}");
-            return;
+            return None;
         }
     };
 
@@ -245,72 +248,16 @@ pub(crate) async fn run_episodic_writer_core(
         created_at_ms: now_ms,
     };
 
-    if let Err(e) = store.insert_episodic_trajectory(record, embedding).await {
-        log::warn!(
-            "episodic_writer: insert_episodic_trajectory failed for session={session_id}: {e}"
-        );
-    }
-}
-
-/// Fire-and-forget entry point spawned from `commands/session.rs` on session
-/// close (`new_session` / `resume_session`), mirroring `extractor::run_extractor`
-/// and `resolver::run_resolver`. Receives the OUTGOING session's `session_id`
-/// (captured by the caller BEFORE the session is replaced) and its `history`
-/// snapshot (cloned by the caller — the 2nd consumer alongside the extractor).
-///
-/// Resolves dependencies from `AppState` — embedder cell, memory store, and a
-/// snapshot of `agent_id -> project_path` with the `MutexGuard` dropped before
-/// any `.await` — then delegates to [`run_episodic_writer_core`].
-pub(crate) async fn run_episodic_writer(
-    app: tauri::AppHandle,
-    session_id: String,
-    history: Vec<(String, Vec<ChatMessage>)>,
-) {
-    use tauri::Manager;
-
-    if history.iter().all(|(_, m)| m.is_empty()) {
-        return;
-    }
-
-    let state = app.state::<crate::state::AppState>();
-
-    // Check embedder BEFORE any further work — saves the agents lock entirely.
-    let Some(embedder) = state.embedder.get().cloned() else {
-        log::debug!(
-            "episodic_writer: embedder not ready; skipping trajectory write for session={session_id}"
-        );
-        return;
-    };
-
-    let store = state.memory_store.clone();
-
-    // Snapshot agent_id -> project_path; DROP the MutexGuard before any
-    // `.await` (same discipline as resolver::run_resolver / extractor::run_extractor).
-    let agent_pid: HashMap<String, Option<String>> = {
-        match state.agents.lock() {
-            Ok(agents) => agents.iter().map(|a| (a.id.clone(), a.project_path.clone())).collect(),
-            Err(e) => {
-                log::warn!("run_episodic_writer: could not lock agents: {e}");
-                HashMap::new()
-            }
+    match store.insert_episodic_trajectory(record, embedding).await {
+        Ok(rowid) => Some((rowid, draft)),
+        Err(e) => {
+            log::warn!(
+                "episodic_writer: insert_episodic_trajectory failed for session={session_id}: {e}"
+            );
+            None
         }
-    }; // MutexGuard dropped here — safe to .await below.
-
-    let now_ms = crate::models::chat::current_time_millis();
-
-    run_episodic_writer_core(session_id, history, &store, Some(embedder), &agent_pid, now_ms).await;
+    }
 }
-
-// Compile-time proof: every type captured by the future passed to
-// `tauri::async_runtime::spawn(run_episodic_writer(app, session_id, history))`
-// must be `Send + 'static`.
-const _: fn() = || {
-    fn s<T: Send + 'static>() {}
-    s::<tauri::AppHandle>();
-    s::<String>();
-    s::<Arc<MemoryStore>>();
-    s::<Vec<(String, Vec<ChatMessage>)>>();
-};
 
 #[cfg(test)]
 mod tests {
@@ -741,15 +688,96 @@ mod tests {
         assert_eq!(parsed[0].chars().count(), 500, "each error item must be capped to 500 chars");
     }
 
-    // Task 5.6: compile-time Send + 'static proof for the value(s) captured by
-    // the future passed to
-    // tauri::async_runtime::spawn(run_episodic_writer(app, session_id, history)).
-    #[test]
-    fn run_episodic_writer_captured_types_are_send_static() {
-        fn s<T: Send + 'static>() {}
-        s::<tauri::AppHandle>();
-        s::<String>();
-        s::<Arc<MemoryStore>>();
-        s::<Vec<(String, Vec<ChatMessage>)>>();
+    // ── trajectory-miner-fase-1 Lote 2 — Option<(i64, TrajectoryDraft)> return ──
+
+    // core happy path: Some((rowid, draft)) with rowid > 0 and draft fields intact.
+    #[tokio::test]
+    async fn core_happy_path_returns_some_rowid_and_draft() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let embedder: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let history = vec![(
+            "agent-a".to_string(),
+            vec![msg(Role::User, "fix the bug", 0), msg(Role::Assistant, "done", 1)],
+        )];
+        let project_by_agent: HashMap<String, Option<String>> = HashMap::new();
+
+        let result = run_episodic_writer_core(
+            "sess-core-happy".to_string(),
+            history,
+            &store,
+            Some(embedder),
+            &project_by_agent,
+            0,
+        )
+        .await;
+
+        let (rowid, draft) = result.expect("expected Some((rowid, draft)) on happy path");
+        assert!(rowid > 0, "expected positive rowid, got {rowid}");
+        assert_eq!(draft.task, "fix the bug");
+        assert!((draft.success_score - 0.9).abs() < 1e-9);
     }
+
+    // core missing embedder: None, and no row inserted.
+    #[tokio::test]
+    async fn core_missing_embedder_returns_none() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let history = vec![(
+            "agent-a".to_string(),
+            vec![msg(Role::User, "fix the bug", 0), msg(Role::Assistant, "done", 1)],
+        )];
+        let project_by_agent: HashMap<String, Option<String>> = HashMap::new();
+
+        let result = run_episodic_writer_core(
+            "sess-core-none-embedder".to_string(),
+            history,
+            &store,
+            None,
+            &project_by_agent,
+            0,
+        )
+        .await;
+
+        assert!(result.is_none(), "missing embedder must yield None");
+        assert_eq!(count_episodic(&store).await, 0);
+    }
+
+    // core duplicate session_id: 2nd call violates UNIQUE -> None, no panic, 1 row total.
+    #[tokio::test]
+    async fn core_duplicate_session_id_returns_none() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let make_history = || {
+            vec![(
+                "agent-a".to_string(),
+                vec![msg(Role::User, "fix the bug", 0), msg(Role::Assistant, "done", 1)],
+            )]
+        };
+        let embedder1: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let embedder2: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let project_by_agent: HashMap<String, Option<String>> = HashMap::new();
+
+        let first = run_episodic_writer_core(
+            "sess-core-dup".to_string(),
+            make_history(),
+            &store,
+            Some(embedder1),
+            &project_by_agent,
+            0,
+        )
+        .await;
+        assert!(first.is_some(), "first insert must succeed");
+
+        let second = run_episodic_writer_core(
+            "sess-core-dup".to_string(),
+            make_history(),
+            &store,
+            Some(embedder2),
+            &project_by_agent,
+            0,
+        )
+        .await;
+
+        assert!(second.is_none(), "duplicate session_id must yield None, not panic");
+        assert_eq!(count_episodic(&store).await, 1, "only the first insert must persist");
+    }
+
 }

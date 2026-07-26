@@ -96,6 +96,8 @@ pub fn run() {
             commands::memory_admin::list_memories,
             commands::memory_admin::set_importance,
             commands::memory_admin::delete_memory,
+            commands::memory_admin::get_skill_steps_trend,
+            commands::memory_admin::get_failure_histogram,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

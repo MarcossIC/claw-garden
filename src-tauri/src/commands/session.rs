@@ -18,7 +18,7 @@ fn snapshot_conversations(
 
 /// Captures the OUTGOING session's `session_id` BEFORE `session` is replaced
 /// by a new/loaded `SessionManager` (Fase 2 — memoria-3-capas). Used by both
-/// `new_session` and `resume_session` so `run_episodic_writer` receives the
+/// `new_session` and `resume_session` so the trajectory miner receives the
 /// id of the CLOSING session, not the incoming one — mirrors
 /// `snapshot_conversations`'s "capture before the swap/clear" pattern, and is
 /// extracted as a standalone pure helper for the same reason: this codebase
@@ -68,7 +68,7 @@ pub fn new_session(
             .map_err(|e| AppError::Internal(e.to_string()))?;
 
         // Capture the OUTGOING session's id BEFORE `*session = new` overwrites
-        // it (Fase 2 — S10): run_episodic_writer must receive the CLOSING
+        // it (Fase 2 — S10): the trajectory miner must receive the CLOSING
         // session's id, not the incoming one.
         let outgoing_id = outgoing_session_id(&session);
 
@@ -107,12 +107,13 @@ pub fn new_session(
         crate::memory::extractor::run_extractor(handle2, history).await;
     });
 
-    // Fire-and-forget: spawn the episodic-trajectory writer (Fase 2) on the
-    // closing session's snapshot, independent from resolver/extractor above.
+    // Fire-and-forget: spawn the trajectory miner (Fase 1) — it is the ONLY
+    // writer of episodic_trajectory per session (build + INSERT) and
+    // additionally mines Golden candidates. Replaces the old episodic-writer
+    // wrapper (now eliminated from memory::episodic_writer).
     let handle3 = app.clone();
     tauri::async_runtime::spawn(async move {
-        crate::memory::episodic_writer::run_episodic_writer(handle3, outgoing_id, history_for_episodic)
-            .await;
+        crate::memory::miner::run_miner(handle3, outgoing_id, history_for_episodic).await;
     });
 
     Ok(meta)
@@ -175,12 +176,13 @@ pub fn resume_session(
         crate::memory::extractor::run_extractor(handle2, history).await;
     });
 
-    // Fire-and-forget: spawn the episodic-trajectory writer (Fase 2) on the
-    // outgoing session's snapshot, independent from resolver/extractor above.
+    // Fire-and-forget: spawn the trajectory miner (Fase 1) — it is the ONLY
+    // writer of episodic_trajectory per session (build + INSERT) and
+    // additionally mines Golden candidates. Replaces the old episodic-writer
+    // wrapper (now eliminated from memory::episodic_writer).
     let handle3 = app.clone();
     tauri::async_runtime::spawn(async move {
-        crate::memory::episodic_writer::run_episodic_writer(handle3, outgoing_id, history_for_episodic)
-            .await;
+        crate::memory::miner::run_miner(handle3, outgoing_id, history_for_episodic).await;
     });
 
     Ok(meta)

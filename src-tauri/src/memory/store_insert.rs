@@ -5,6 +5,7 @@ use crate::memory::chunker::Chunk;
 use crate::memory::events::{MemoryEvent, MemorySource};
 use crate::memory::MemoryStore;
 use crate::models::chat::Role;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,6 +278,197 @@ impl MemoryStore {
                 )?;
                 tx.commit()?;
                 Ok(id)
+            })
+            .await
+            .map_err(MemoryStoreError::from)
+    }
+
+    /// Fire-and-forget RCA persistence (Fase 3, design point 3): a single
+    /// UPDATE by `id`, NO `c.transaction()` (single-statement, precedent
+    /// `fetch_prior_trajectories`) — the caller (`miner.rs`) always warns and
+    /// never propagates `Err` upward, so this stays a plain `.execute()`.
+    pub(crate) async fn update_trajectory_root_cause(
+        &self,
+        trajectory_id: i64,
+        root_cause: &str,
+    ) -> Result<(), MemoryStoreError> {
+        let value = root_cause.to_string(); // own for 'static closure
+        self.conn
+            .call(move |c| -> rusqlite::Result<()> {
+                c.execute(
+                    "UPDATE episodic_trajectory SET root_cause = ?1 WHERE id = ?2",
+                    rusqlite::params![value, trajectory_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(MemoryStoreError::from)
+    }
+}
+
+/// One candidate procedural skill, ready for atomic dedup-check +
+/// INSERT-or-UPDATE via [`MemoryStore::promote_to_procedural_skill`]. Built
+/// (in `miner.rs`) from a [`crate::memory::miner::MinedSkillCandidate`] that
+/// cleared the recurrence threshold.
+#[derive(Debug, Clone)]
+pub(crate) struct NewProceduralSkillRecord {
+    pub agent_id: String,
+    pub project_id: Option<String>,
+    pub skill_name: String,
+    pub trigger: String,
+    /// `serialize_tool_sequence(normalized)` — the ONLY producer of this
+    /// value (spec R5), used both as the dedup SELECT key and the
+    /// `tool_sequence` column value.
+    pub tool_sequence_json: String,
+    /// `[current_trajectory_id, ...matched_prior_ids]`.
+    pub source_trajectory_ids: Vec<i64>,
+    pub importance: f64,
+    pub now_ms: u64,
+}
+
+/// Result of [`MemoryStore::promote_to_procedural_skill`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromoteOutcome {
+    /// A brand-new `procedural_skill` row (+ vector) was inserted; carries its rowid.
+    Inserted(i64),
+    /// An existing row (same `agent_id` + `tool_sequence`) was updated; carries its id.
+    Updated(i64),
+    /// No dedup hit and no embedding was available — nothing was written (R9).
+    SkippedNoEmbedding,
+}
+
+impl MemoryStore {
+    /// Prior Golden trajectories eligible as `filter_recurring` inputs (spec R6).
+    ///
+    /// Returns raw `tool_calls` JSON (normalization happens in `miner.rs`, to
+    /// keep this store→miner-free) for rows where `agent_id = ?`, `id !=
+    /// exclude_id`, `status = 'active'`, `deleted_at IS NULL`, `success_score
+    /// > min_success_score`, ordered by `last_accessed_at DESC`, bounded by
+    /// `limit`. Uses `idx_epi_agent_active`.
+    pub(crate) async fn fetch_prior_trajectories(
+        &self,
+        agent_id: &str,
+        exclude_id: i64,
+        min_success_score: f64,
+        limit: i64,
+    ) -> Result<Vec<(i64, String)>, MemoryStoreError> {
+        let agent_id = agent_id.to_string();
+        self.conn
+            .call(move |c| -> rusqlite::Result<Vec<(i64, String)>> {
+                let mut stmt = c.prepare(
+                    "SELECT id, tool_calls FROM episodic_trajectory \
+                     WHERE agent_id = ?1 AND id != ?2 AND status = 'active' AND deleted_at IS NULL \
+                       AND success_score > ?3 \
+                     ORDER BY last_accessed_at DESC LIMIT ?4",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![agent_id, exclude_id, min_success_score, limit], |r| {
+                        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .map_err(MemoryStoreError::from)
+    }
+
+    /// Atomic dedup-check + INSERT-or-UPDATE for a promotable skill candidate
+    /// (spec R7/R8/R9), inside a SINGLE `.call()` + `tx.transaction()` —
+    /// `tokio_rusqlite` serializes closures on one thread, so the SELECT→branch
+    /// is race-free without extra locking.
+    ///
+    /// - MISS + `Some(embedding)`: INSERT row+vector (`tier` via
+    ///   `compute_tier`, `success_count = source_trajectory_ids.len()`) → `Inserted`.
+    /// - MISS + `None`: no write → `SkippedNoEmbedding` (R9, new-skill path
+    ///   needs a vector).
+    /// - HIT: union `stored_ids ∪ source_trajectory_ids` in Rust (preserving
+    ///   order, appending only missing ids), `success_count =
+    ///   len(unioned)` — the invariant `success_count == len(distinct
+    ///   source_trajectory_ids)` (R8 amendment) — no vector needed → `Updated`.
+    pub(crate) async fn promote_to_procedural_skill(
+        &self,
+        rec: NewProceduralSkillRecord,
+        embedding: Option<Vec<f32>>,
+    ) -> Result<PromoteOutcome, MemoryStoreError> {
+        if let Some(emb) = &embedding {
+            if emb.len() != 384 {
+                return Err(MemoryStoreError::DimensionMismatch { expected: 384, actual: emb.len() });
+            }
+        }
+        let bytes = embedding.as_ref().map(|e| serialize_f32_vec(e));
+        let now_ms = rec.now_ms as i64;
+        // Rust pre-call — NEVER a hardcoded literal (R7).
+        let tier: i64 = crate::memory::tier::compute_tier(3, rec.importance, 0, "procedural_skill");
+
+        self.conn
+            .call(move |c| -> rusqlite::Result<PromoteOutcome> {
+                let tx = c.transaction()?;
+
+                let existing: Option<(i64, String)> = tx
+                    .query_row(
+                        "SELECT id, source_trajectory_ids FROM procedural_skill \
+                         WHERE agent_id = ?1 AND tool_sequence = ?2",
+                        rusqlite::params![rec.agent_id, rec.tool_sequence_json],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+
+                let outcome = match existing {
+                    Some((id, stored_json)) => {
+                        let mut unioned: Vec<i64> = serde_json::from_str(&stored_json).unwrap_or_default();
+                        for candidate_id in &rec.source_trajectory_ids {
+                            if !unioned.contains(candidate_id) {
+                                unioned.push(*candidate_id);
+                            }
+                        }
+                        let unioned_json =
+                            serde_json::to_string(&unioned).expect("Vec<i64> serialises infallibly");
+                        tx.execute(
+                            "UPDATE procedural_skill SET source_trajectory_ids = ?1, success_count = ?2, \
+                             last_modified_at = ?3, update_count = update_count + 1 WHERE id = ?4",
+                            rusqlite::params![unioned_json, unioned.len() as i64, now_ms, id],
+                        )?;
+                        PromoteOutcome::Updated(id)
+                    }
+                    None => {
+                        let Some(bytes) = bytes else {
+                            return Ok(PromoteOutcome::SkippedNoEmbedding);
+                        };
+                        let ids_json = serde_json::to_string(&rec.source_trajectory_ids)
+                            .expect("Vec<i64> serialises infallibly");
+                        tx.execute(
+                            "INSERT INTO procedural_skill \
+                             (scope, agent_id, project_id, skill_name, trigger, tool_sequence, \
+                              success_count, promoted_at, source_trajectory_ids, created_at, \
+                              created_by_type, created_by_ref, last_modified_at, last_accessed_at, \
+                              importance, tier, status) \
+                             VALUES ('agent', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, \
+                                     'system', ?1, ?9, ?9, ?10, ?11, 'active')",
+                            rusqlite::params![
+                                rec.agent_id,
+                                rec.project_id,
+                                rec.skill_name,
+                                rec.trigger,
+                                rec.tool_sequence_json,
+                                rec.source_trajectory_ids.len() as i64,
+                                now_ms,
+                                ids_json,
+                                now_ms,
+                                rec.importance,
+                                tier,
+                            ],
+                        )?;
+                        let id = tx.last_insert_rowid();
+                        tx.execute(
+                            "INSERT INTO procedural_vectors(rowid, embedding) VALUES (?, ?)",
+                            rusqlite::params![id, bytes],
+                        )?;
+                        PromoteOutcome::Inserted(id)
+                    }
+                };
+
+                tx.commit()?;
+                Ok(outcome)
             })
             .await
             .map_err(MemoryStoreError::from)
@@ -782,6 +974,221 @@ mod tests {
         assert_eq!(status, "active");
     }
 
+    // ── Lote 2 (trajectory-miner-fase-2) — fetch_prior_trajectories + promote_to_procedural_skill ──
+
+    async fn seed_episodic_raw(
+        store: &MemoryStore,
+        agent_id: &str,
+        session_id: &str,
+        status: &str,
+        deleted_at: Option<i64>,
+        success_score: f64,
+        last_accessed_at: i64,
+    ) -> i64 {
+        let agent_id = agent_id.to_string();
+        let session_id = session_id.to_string();
+        let status = status.to_string();
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<i64> {
+                c.execute(
+                    "INSERT INTO episodic_trajectory \
+                     (scope, agent_id, session_id, task, tool_calls, success_score, \
+                      created_at, last_modified_at, last_accessed_at, status, deleted_at) \
+                     VALUES ('agent', ?1, ?2, 'task', '[\"a\"]', ?3, 0, 0, ?4, ?5, ?6)",
+                    rusqlite::params![agent_id, session_id, success_score, last_accessed_at, status, deleted_at],
+                )?;
+                Ok(c.last_insert_rowid())
+            })
+            .await
+            .unwrap()
+    }
+
+    // R6: only active, non-deleted, Golden (score > 0.85), same-agent, non-self
+    // rows are returned, ordered by last_accessed_at DESC.
+    #[tokio::test]
+    async fn fetch_prior_trajectories_filters() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+
+        let exclude_id = seed_episodic_raw(&store, "agent-a", "self", "active", None, 0.9, 999).await;
+        let golden_low = seed_episodic_raw(&store, "agent-a", "golden-low", "active", None, 0.9, 150).await;
+        let golden_high = seed_episodic_raw(&store, "agent-a", "golden-high", "active", None, 0.9, 500).await;
+        seed_episodic_raw(&store, "agent-a", "non-golden", "active", None, 0.4, 200).await;
+        seed_episodic_raw(&store, "agent-a", "deleted-golden", "active", Some(999), 0.9, 300).await;
+        seed_episodic_raw(&store, "agent-b", "other-agent-golden", "active", None, 0.9, 400).await;
+
+        let result = store.fetch_prior_trajectories("agent-a", exclude_id, 0.85, 500).await.unwrap();
+
+        let ids: Vec<i64> = result.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![golden_high, golden_low], "expected only same-agent Golden rows, ordered by last_accessed_at DESC");
+    }
+
+    fn make_skill_record(agent_id: &str, seq_json: &str, ids: Vec<i64>, now_ms: u64) -> NewProceduralSkillRecord {
+        NewProceduralSkillRecord {
+            agent_id: agent_id.to_string(),
+            project_id: None,
+            skill_name: "Fix login flow".to_string(),
+            trigger: "when login fails".to_string(),
+            tool_sequence_json: seq_json.to_string(),
+            source_trajectory_ids: ids,
+            importance: 8.0,
+            now_ms,
+        }
+    }
+
+    async fn count_procedural(store: &MemoryStore) -> i64 {
+        store.conn.call(|c| c.query_row("SELECT COUNT(*) FROM procedural_skill", [], |r| r.get(0))).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn promote_inserts_row_and_vector_same_rowid() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let seq = crate::memory::miner::serialize_tool_sequence(&["read".to_string(), "edit".to_string()]);
+        let rec = make_skill_record("agent-a", &seq, vec![42], 1000);
+        let embedding = make_embedding_384();
+
+        let outcome = store.promote_to_procedural_skill(rec, Some(embedding)).await.unwrap();
+        let id = match outcome {
+            PromoteOutcome::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+        assert!(id > 0);
+
+        let (skill_count, vec_count): (i64, i64) = store
+            .conn
+            .call(move |c| {
+                let sc: i64 =
+                    c.query_row("SELECT COUNT(*) FROM procedural_skill WHERE id = ?1", rusqlite::params![id], |r| r.get(0))?;
+                let vc: i64 = c.query_row(
+                    "SELECT COUNT(*) FROM procedural_vectors WHERE rowid = ?1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )?;
+                Ok::<_, rusqlite::Error>((sc, vc))
+            })
+            .await
+            .unwrap();
+        assert_eq!(skill_count, 1, "expected 1 row in procedural_skill for id={id}");
+        assert_eq!(vec_count, 1, "expected 1 row in procedural_vectors for rowid={id}");
+    }
+
+    #[tokio::test]
+    async fn promote_distinct_sequence_inserts_second_row() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let seq1 = crate::memory::miner::serialize_tool_sequence(&["read".to_string()]);
+        let seq2 = crate::memory::miner::serialize_tool_sequence(&["write".to_string()]);
+        let rec1 = make_skill_record("agent-a", &seq1, vec![1], 1000);
+        let rec2 = make_skill_record("agent-a", &seq2, vec![2], 1000);
+
+        store.promote_to_procedural_skill(rec1, Some(make_embedding_384())).await.unwrap();
+        store.promote_to_procedural_skill(rec2, Some(make_embedding_384())).await.unwrap();
+
+        assert_eq!(count_procedural(&store).await, 2, "distinct sequences must insert 2 separate rows");
+    }
+
+    #[tokio::test]
+    async fn promote_tier_is_compute_tier() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let seq = crate::memory::miner::serialize_tool_sequence(&["read".to_string()]);
+        let rec = make_skill_record("agent-a", &seq, vec![1], 1000);
+
+        let outcome = store.promote_to_procedural_skill(rec, Some(make_embedding_384())).await.unwrap();
+        let id = match outcome {
+            PromoteOutcome::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+
+        let tier: i64 = store
+            .conn
+            .call(move |c| c.query_row("SELECT tier FROM procedural_skill WHERE id = ?1", rusqlite::params![id], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(
+            tier,
+            crate::memory::tier::compute_tier(3, 8.0, 0, "procedural_skill"),
+            "tier must be produced by compute_tier, never hardcoded"
+        );
+    }
+
+    // R9: NEW-skill path requires a vector — embedder absent => 0 rows written,
+    // SkippedNoEmbedding, no panic. Unreachable via mine_session_core (the
+    // episodic writer gates on the embedder first) — tested here at store level.
+    #[tokio::test]
+    async fn promote_none_embedding_new_skill_skips() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let seq = crate::memory::miner::serialize_tool_sequence(&["read".to_string()]);
+        let rec = make_skill_record("agent-a", &seq, vec![1], 1000);
+
+        let outcome = store.promote_to_procedural_skill(rec, None).await.unwrap();
+        assert!(matches!(outcome, PromoteOutcome::SkippedNoEmbedding), "expected SkippedNoEmbedding");
+        assert_eq!(count_procedural(&store).await, 0, "no row must be written on the None-embedding new-skill path");
+    }
+
+    // R9: dedup-UPDATE path does NOT need a vector — success_count still grows.
+    #[tokio::test]
+    async fn promote_none_embedding_dedup_updates() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let seq = crate::memory::miner::serialize_tool_sequence(&["read".to_string(), "edit".to_string()]);
+        let rec1 = make_skill_record("agent-a", &seq, vec![42, 7], 1000);
+        store.promote_to_procedural_skill(rec1, Some(make_embedding_384())).await.unwrap();
+
+        let rec2 = make_skill_record("agent-a", &seq, vec![55, 42, 7], 2000);
+        let outcome = store.promote_to_procedural_skill(rec2, None).await.unwrap();
+        let id = match outcome {
+            PromoteOutcome::Updated(id) => id,
+            other => panic!("expected Updated, got {other:?}"),
+        };
+
+        let success_count: i64 = store
+            .conn
+            .call(move |c| {
+                c.query_row("SELECT success_count FROM procedural_skill WHERE id = ?1", rusqlite::params![id], |r| r.get(0))
+            })
+            .await
+            .unwrap();
+        assert_eq!(success_count, 3, "only the new id (55) must increment success_count, invariant == len(distinct ids)");
+        assert_eq!(count_procedural(&store).await, 1, "dedup hit must NOT insert a second row");
+    }
+
+    // ── Post-verify S1 (R8) — idempotencia pura: todos los ids ya presentes ──
+
+    // R8 scenario "All ids already present → no increment": a re-promotion
+    // where EVERY id (current + matched priors) is already in
+    // `source_trajectory_ids` must leave `success_count` AND the array
+    // untouched — the invariant `success_count == len(distinct ids)` holds
+    // with zero appends.
+    #[tokio::test]
+    async fn promote_all_ids_already_present_no_increment() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let seq = crate::memory::miner::serialize_tool_sequence(&["read".to_string(), "edit".to_string()]);
+        let rec1 = make_skill_record("agent-a", &seq, vec![42, 7, 55], 1000);
+        store.promote_to_procedural_skill(rec1, Some(make_embedding_384())).await.unwrap();
+
+        // Same ids, different order — a pure re-match with nothing new.
+        let rec2 = make_skill_record("agent-a", &seq, vec![55, 42, 7], 2000);
+        let outcome = store.promote_to_procedural_skill(rec2, None).await.unwrap();
+        let id = match outcome {
+            PromoteOutcome::Updated(id) => id,
+            other => panic!("expected Updated, got {other:?}"),
+        };
+
+        let (success_count, source_ids_json): (i64, String) = store
+            .conn
+            .call(move |c| {
+                c.query_row(
+                    "SELECT success_count, source_trajectory_ids FROM procedural_skill WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(success_count, 3, "no new ids appended ⇒ success_count must stay 3");
+        let source_ids: Vec<i64> = serde_json::from_str(&source_ids_json).unwrap();
+        assert_eq!(source_ids, vec![42, 7, 55], "source_trajectory_ids must be byte-for-byte intact (order preserved)");
+        assert_eq!(count_procedural(&store).await, 1, "still exactly 1 row");
+    }
+
     // Task 3.4 (S8): second insert with the same session_id → Err, no panic,
     // no partial row in either table.
     #[tokio::test]
@@ -810,5 +1217,78 @@ mod tests {
         assert_eq!(epi_count, 1, "only the first insert's row must survive, got {epi_count}");
         assert_eq!(vec_count, 1, "only the first insert's vector must survive, got {vec_count}");
         assert!(id1 > 0);
+    }
+
+    // ── Phase 1 (trajectory-miner-fase-3) — V4 migration + update_trajectory_root_cause ──
+
+    // Task 1.1: proves V4 applied — SELECT root_cause on a fresh row succeeds
+    // and defaults to NULL (SQLite ADD COLUMN is nullable by default).
+    #[tokio::test]
+    async fn root_cause_column_exists_and_defaults_null() {
+        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let record = make_episodic_record("sess-rca-column", 5.0);
+        let embedding = make_embedding_384();
+        let id = store.insert_episodic_trajectory(record, embedding).await.unwrap();
+
+        let conn = store.conn.clone();
+        let root_cause: Option<String> = conn
+            .call(move |c| {
+                c.query_row("SELECT root_cause FROM episodic_trajectory WHERE id = ?1", rusqlite::params![id], |r| {
+                    r.get(0)
+                })
+            })
+            .await
+            .unwrap();
+        assert!(root_cause.is_none(), "root_cause must default to NULL for a never-classified row");
+    }
+
+    // Task 1.3a: update_trajectory_root_cause targets exactly one row — the
+    // sibling row's root_cause must remain untouched (NULL).
+    #[tokio::test]
+    async fn update_trajectory_root_cause_targets_exactly_one_row() {
+        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let record1 = make_episodic_record("sess-rca-target", 5.0);
+        let record2 = make_episodic_record("sess-rca-sibling", 5.0);
+        let id1 = store.insert_episodic_trajectory(record1, make_embedding_384()).await.unwrap();
+        let id2 = store.insert_episodic_trajectory(record2, make_embedding_384()).await.unwrap();
+
+        store.update_trajectory_root_cause(id1, "missing_context").await.unwrap();
+
+        let conn = store.conn.clone();
+        let (rc1, rc2): (Option<String>, Option<String>) = conn
+            .call(move |c| {
+                let a: Option<String> =
+                    c.query_row("SELECT root_cause FROM episodic_trajectory WHERE id = ?1", rusqlite::params![id1], |r| r.get(0))?;
+                let b: Option<String> =
+                    c.query_row("SELECT root_cause FROM episodic_trajectory WHERE id = ?1", rusqlite::params![id2], |r| r.get(0))?;
+                Ok::<_, rusqlite::Error>((a, b))
+            })
+            .await
+            .unwrap();
+        assert_eq!(rc1.as_deref(), Some("missing_context"), "target row must be updated");
+        assert!(rc2.is_none(), "sibling row must remain untouched");
+    }
+
+    // Task 1.3b: overwrite semantics = last-write-wins — a second UPDATE on
+    // the same row replaces the already-set value.
+    #[tokio::test]
+    async fn update_trajectory_root_cause_overwrite_is_last_write_wins() {
+        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let record = make_episodic_record("sess-rca-overwrite", 5.0);
+        let id = store.insert_episodic_trajectory(record, make_embedding_384()).await.unwrap();
+
+        store.update_trajectory_root_cause(id, "missing_context").await.unwrap();
+        store.update_trajectory_root_cause(id, "model_limitation").await.unwrap();
+
+        let conn = store.conn.clone();
+        let root_cause: Option<String> = conn
+            .call(move |c| {
+                c.query_row("SELECT root_cause FROM episodic_trajectory WHERE id = ?1", rusqlite::params![id], |r| {
+                    r.get(0)
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(root_cause.as_deref(), Some("model_limitation"), "second UPDATE must overwrite the first (last-write-wins)");
     }
 }

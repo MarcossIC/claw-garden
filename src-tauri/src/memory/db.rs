@@ -434,7 +434,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 3, "Expected exactly 3 applied migrations, got {}", count);
+        assert_eq!(count, 4, "Expected exactly 4 applied migrations, got {}", count);
     }
 
     // -----------------------------------------------------------------------
@@ -655,6 +655,6 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 3);
+        assert_eq!(migration_count, 4);
     }
 }

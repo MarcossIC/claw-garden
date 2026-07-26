@@ -53,4 +53,5 @@ pub(crate) mod contradiction;
 pub(crate) mod resolver;
 pub(crate) mod extractor;
 pub(crate) mod episodic_writer;
+pub(crate) mod miner;
 pub(crate) mod maintenance;

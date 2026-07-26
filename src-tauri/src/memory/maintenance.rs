@@ -46,17 +46,28 @@ const DEMOTE_SQL: &str = "\
 /// Runs one bulk inactivity-demotion pass against `memory`.
 ///
 /// `now_ms` is computed HERE, once, in Rust (mirrors `access.rs::flush:121`)
-/// and bound as `?1` for both the `days_since_last_access` calculation and
-/// the `last_modified_at` stamp — a single consistent "now" per pass.
-///
-/// Never panics: a recoverable DB error is logged via `log::warn!` and the
-/// call returns — the caller (the maintenance loop, Lote 3) keeps ticking.
+/// and handed to [`run_maintenance_once_at`] — a single consistent "now"
+/// per pass.
 pub(crate) async fn run_maintenance_once(store: &MemoryStore) {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64;
 
+    run_maintenance_once_at(store, now_ms).await;
+}
+
+/// Clock-injected core of [`run_maintenance_once`]: `now_ms` is bound as
+/// `?1` for both the `days_since_last_access` calculation and the
+/// `last_modified_at` stamp. Injectable so boundary tests can seed rows and
+/// run the pass against the SAME instant — the just-under-boundary cases
+/// (90d/180d minus 1ms) are only deterministic when seed and pass share
+/// one "now"; with two wall-clock reads any >1ms scheduling gap crosses
+/// the boundary and demotes spuriously.
+///
+/// Never panics: a recoverable DB error is logged via `log::warn!` and the
+/// call returns — the caller (the maintenance loop, Lote 3) keeps ticking.
+pub(crate) async fn run_maintenance_once_at(store: &MemoryStore, now_ms: i64) {
     if let Err(e) = store
         .conn
         .call(move |c| c.execute(DEMOTE_SQL, rusqlite::params![now_ms]))
@@ -136,13 +147,16 @@ mod tests {
 
     /// Seeds one row in `table` ("memory" | "episodic_trajectory" |
     /// "procedural_skill") with the given `tier`/`importance`, and
-    /// `last_accessed_at = now_ms() + offset_ms` (so a NEGATIVE `offset_ms`
+    /// `last_accessed_at = now + offset_ms` (so a NEGATIVE `offset_ms`
     /// places the row that many milliseconds in the PAST — matching the
     /// spec's worked-example offsets, e.g. `-7_776_000_001` for "just over
-    /// 90 days ago"). `last_modified_at`/`created_at` are seeded at `0` so
-    /// tests can assert "untouched" by checking they stay `0`.
-    async fn seed_row(store: &MemoryStore, table: &str, tier: i64, importance: f64, offset_ms: i64) -> i64 {
-        let last_accessed_at = now_ms() + offset_ms;
+    /// 90 days ago"). `now` is passed in (not read here) so a test can run
+    /// `run_maintenance_once_at` against the SAME instant it seeded with —
+    /// the 1ms-under-boundary offsets are racy otherwise.
+    /// `last_modified_at`/`created_at` are seeded at `0` so tests can
+    /// assert "untouched" by checking they stay `0`.
+    async fn seed_row(store: &MemoryStore, table: &str, tier: i64, importance: f64, now: i64, offset_ms: i64) -> i64 {
+        let last_accessed_at = now + offset_ms;
         let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
         let table = table.to_string();
         store
@@ -224,9 +238,10 @@ mod tests {
     #[tokio::test]
     async fn tier1_low_importance_over_90_days_demotes_to_2() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let id = seed_row(&store, "memory", 1, 5.0, -7_776_000_001).await;
+        let now = now_ms();
+        let id = seed_row(&store, "memory", 1, 5.0, now, -7_776_000_001).await;
 
-        super::run_maintenance_once(&store).await;
+        super::run_maintenance_once_at(&store, now).await;
 
         assert_eq!(tier_of(&store, "memory", id).await, 2);
     }
@@ -236,9 +251,12 @@ mod tests {
     #[tokio::test]
     async fn tier1_low_importance_under_90_days_unchanged_last_modified_intact() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let id = seed_row(&store, "memory", 1, 5.0, -7_775_999_999).await;
+        let now = now_ms();
+        // 90 days minus exactly 1ms — deterministic ONLY because the pass
+        // below runs against the same `now` the row was seeded with.
+        let id = seed_row(&store, "memory", 1, 5.0, now, -7_775_999_999).await;
 
-        super::run_maintenance_once(&store).await;
+        super::run_maintenance_once_at(&store, now).await;
 
         assert_eq!(tier_of(&store, "memory", id).await, 1, "must NOT demote before 90 days");
         assert_eq!(
@@ -253,9 +271,10 @@ mod tests {
     #[tokio::test]
     async fn tier2_over_180_days_demotes_to_3() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let id = seed_row(&store, "memory", 2, 5.0, -15_552_000_001).await;
+        let now = now_ms();
+        let id = seed_row(&store, "memory", 2, 5.0, now, -15_552_000_001).await;
 
-        super::run_maintenance_once(&store).await;
+        super::run_maintenance_once_at(&store, now).await;
 
         assert_eq!(tier_of(&store, "memory", id).await, 3);
     }
@@ -265,9 +284,12 @@ mod tests {
     #[tokio::test]
     async fn tier2_under_180_days_unchanged() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let id = seed_row(&store, "memory", 2, 5.0, -15_551_999_999).await;
+        let now = now_ms();
+        // 180 days minus exactly 1ms — same shared-now discipline as the
+        // 90-day under-boundary test above.
+        let id = seed_row(&store, "memory", 2, 5.0, now, -15_551_999_999).await;
 
-        super::run_maintenance_once(&store).await;
+        super::run_maintenance_once_at(&store, now).await;
 
         assert_eq!(tier_of(&store, "memory", id).await, 2, "must NOT demote before 180 days");
     }
@@ -277,9 +299,10 @@ mod tests {
     #[tokio::test]
     async fn tier1_pivotal_importance_never_demotes() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let id = seed_row(&store, "memory", 1, 9.5, -31_536_000_000).await;
+        let now = now_ms();
+        let id = seed_row(&store, "memory", 1, 9.5, now, -31_536_000_000).await;
 
-        super::run_maintenance_once(&store).await;
+        super::run_maintenance_once_at(&store, now).await;
 
         assert_eq!(tier_of(&store, "memory", id).await, 1, "importance >= 9.0 must never demote");
     }
@@ -294,7 +317,7 @@ mod tests {
         // unconditionally), so this test specifically pins tier staying 3
         // AND last_modified_at staying untouched (proving the row was never
         // part of the UPDATE's matched set).
-        let id = seed_row(&store, "memory", 3, 5.0, -15_552_000_001).await;
+        let id = seed_row(&store, "memory", 3, 5.0, now_ms(), -15_552_000_001).await;
 
         super::run_maintenance_once(&store).await;
 
@@ -309,11 +332,12 @@ mod tests {
     async fn only_memory_table_is_demoted_other_tables_untouched() {
         let store = MemoryStore::new_for_test().await.unwrap();
 
-        let mem_id = seed_row(&store, "memory", 1, 5.0, -7_776_000_001).await;
-        let epi_id = seed_row(&store, "episodic_trajectory", 1, 5.0, -7_776_000_001).await;
-        let proc_id = seed_row(&store, "procedural_skill", 1, 5.0, -7_776_000_001).await;
+        let now = now_ms();
+        let mem_id = seed_row(&store, "memory", 1, 5.0, now, -7_776_000_001).await;
+        let epi_id = seed_row(&store, "episodic_trajectory", 1, 5.0, now, -7_776_000_001).await;
+        let proc_id = seed_row(&store, "procedural_skill", 1, 5.0, now, -7_776_000_001).await;
 
-        super::run_maintenance_once(&store).await;
+        super::run_maintenance_once_at(&store, now).await;
 
         assert_eq!(tier_of(&store, "memory", mem_id).await, 2, "memory row must demote");
         assert_eq!(
@@ -340,7 +364,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn loop_does_not_fire_before_startup_delay_then_fires_first_pass_after_delay() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let id = seed_row(&store, "memory", 1, 5.0, -7_776_000_001).await;
+        // The loop reads the real wall clock per pass, so the seed uses a
+        // fresh now_ms(): the over-boundary offset only grows staler as
+        // real time advances — safe direction, no shared-now needed.
+        let id = seed_row(&store, "memory", 1, 5.0, now_ms(), -7_776_000_001).await;
         let store = Arc::new(store);
 
         let handle = tokio::spawn(super::run_maintenance_loop(
@@ -389,7 +416,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn loop_second_pass_fires_only_after_full_period_not_before() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let id = seed_row(&store, "memory", 1, 5.0, -15_552_000_001).await;
+        let id = seed_row(&store, "memory", 1, 5.0, now_ms(), -15_552_000_001).await;
         let store = Arc::new(store);
 
         let handle = tokio::spawn(super::run_maintenance_loop(

@@ -121,6 +121,14 @@ pub(crate) async fn build_memory_prompt(
         )
     );
 
+    // trajectory-miner-fase-4 (Requirement: Skill-hit logging) — counts hits
+    // whose `kind == TableKind::Procedural`. Borrows `&hits` BEFORE
+    // `bucket_by_recency` moves `hits` below.
+    log::info!(
+        "{}",
+        crate::commands::memory_admin::format_skill_hits(&hits)
+    );
+
     // 3. Bucket hits into RECENT vs LONG-TERM.
     let now_secs = std::time::SystemTime::now()
         .duration_since(UNIX_EPOCH)

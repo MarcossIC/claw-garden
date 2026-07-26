@@ -11,6 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::memory::search::RankedHit;
+use crate::memory::TableKind;
 use crate::memory::{MemoryError, MemoryStore};
 use crate::models::AppError;
 use crate::state::AppState;
@@ -66,6 +67,14 @@ pub(crate) fn format_tier_distribution(hits: &[RankedHit]) -> String {
 /// criterion (neither signal alone can answer it).
 pub(crate) fn format_tier1_coverage(workspace_present: bool, hit_count: usize) -> String {
     format!("tier1_present={workspace_present} tier23_hits={hit_count}")
+}
+
+/// Counts hits whose `kind == TableKind::Procedural` (skill hits) and renders
+/// `"skill_hits={n}"` — the single call site (`prompt_builder.rs`) logs this
+/// beside `format_tier1_coverage`, before `bucket_by_recency` moves `hits`.
+pub(crate) fn format_skill_hits(hits: &[RankedHit]) -> String {
+    let n = hits.iter().filter(|h| h.kind == TableKind::Procedural).count();
+    format!("skill_hits={n}")
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +213,13 @@ pub(crate) struct MemoryAdminRow {
     pub last_accessed_at: i64,
     pub superseded_by: Option<i64>,
     pub deleted_at: Option<i64>,
+    /// `Some` only for `kind == Procedural`; `None` for memory/episodic rows.
+    pub success_count: Option<i64>,
+    /// `Some` only for `kind == Procedural`; `None` for memory/episodic rows.
+    pub trigger: Option<String>,
+    /// Raw JSON text (e.g. `"[42,7,55]"`). `Some` only for `kind ==
+    /// Procedural`; `None` for memory/episodic rows.
+    pub source_trajectory_ids: Option<String>,
 }
 
 /// Filter/pagination params for `list_memories_core`. `kind: None` merges
@@ -332,6 +348,9 @@ fn query_memory_rows(
             last_accessed_at: row.get(11)?,
             superseded_by: row.get(12)?,
             deleted_at: row.get(13)?,
+            success_count: None,
+            trigger: None,
+            source_trajectory_ids: None,
         })
     })?;
     let mut out = Vec::new();
@@ -379,6 +398,9 @@ fn query_episodic_rows(
             last_accessed_at: row.get(10)?,
             superseded_by: row.get(11)?,
             deleted_at: row.get(12)?,
+            success_count: None,
+            trigger: None,
+            source_trajectory_ids: None,
         })
     })?;
     let mut out = Vec::new();
@@ -396,7 +418,8 @@ fn query_procedural_rows(
 ) -> rusqlite::Result<Vec<MemoryAdminRow>> {
     let mut sql = String::from(
         "SELECT id, scope, agent_id, project_id, skill_name, tier, importance, status, \
-         access_count, created_at, last_accessed_at, superseded_by, deleted_at \
+         access_count, created_at, last_accessed_at, superseded_by, deleted_at, \
+         success_count, trigger, source_trajectory_ids \
          FROM procedural_skill WHERE deleted_at IS NULL",
     );
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
@@ -426,6 +449,9 @@ fn query_procedural_rows(
             last_accessed_at: row.get(10)?,
             superseded_by: row.get(11)?,
             deleted_at: row.get(12)?,
+            success_count: Some(row.get(13)?),
+            trigger: Some(row.get(14)?),
+            source_trajectory_ids: Some(row.get(15)?),
         })
     })?;
     let mut out = Vec::new();
@@ -433,6 +459,145 @@ fn query_procedural_rows(
         out.push(r?);
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// get_failure_histogram — trajectory-miner-fase-4. Root-cause histogram
+// bucketed by `created_at` (already ms — no `/1000`, D1). Excludes NULL
+// `root_cause`: RCA only classifies FAILED trajectories (miner.rs:379,
+// `success_score <= GOLDEN_SCORE_THRESHOLD`); golden/successful rows never
+// get a `root_cause` and including them would count successes as failures
+// (D5). No agent/project scoping — matches `list_memories`.
+// ---------------------------------------------------------------------------
+
+/// One `(bucket, root_cause)` group from `get_failure_histogram_core`.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct FailureHistogramRow {
+    pub bucket_start_ms: i64,
+    pub root_cause: String,
+    pub count: i64,
+}
+
+/// Groups failed `episodic_trajectory` rows by `(created_at / bucket_ms) *
+/// bucket_ms` and `root_cause`, excluding `root_cause IS NULL` (D5) and
+/// soft-deleted rows. `bucket_ms` is clamped to at least `1` (division-by-zero
+/// guard).
+pub(crate) async fn get_failure_histogram_core(
+    store: &MemoryStore,
+    bucket_ms: i64,
+) -> Result<Vec<FailureHistogramRow>, MemoryError> {
+    let bucket_ms = bucket_ms.max(1);
+
+    store
+        .conn
+        .call(move |c| -> rusqlite::Result<Vec<FailureHistogramRow>> {
+            let mut stmt = c.prepare(
+                "SELECT (created_at / ?1) * ?1 AS bucket_start_ms, root_cause, COUNT(*) \
+                 FROM episodic_trajectory \
+                 WHERE root_cause IS NOT NULL AND deleted_at IS NULL \
+                 GROUP BY bucket_start_ms, root_cause \
+                 ORDER BY bucket_start_ms ASC, root_cause ASC",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![bucket_ms], |row| {
+                Ok(FailureHistogramRow {
+                    bucket_start_ms: row.get(0)?,
+                    root_cause: row.get(1)?,
+                    count: row.get(2)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| match e {
+            tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
+            tokio_rusqlite::Error::ConnectionClosed => {
+                MemoryError::Backend("connection closed during get_failure_histogram_core".into())
+            }
+            other => MemoryError::Backend(other.to_string()),
+        })
+}
+
+// ---------------------------------------------------------------------------
+// get_skill_steps_trend — trajectory-miner-fase-4. INNER-joins each
+// `procedural_skill.source_trajectory_ids` entry (via `json_each`) to its
+// `episodic_trajectory` row: dangling/soft-deleted ids silently produce zero
+// rows, never an error (join semantics, not a manual filter). `step_count`
+// guards `json_array_length` with `json_valid` — SQLite's
+// `json_array_length` RAISES "malformed JSON" on invalid input (it does NOT
+// return NULL, so `COALESCE` alone cannot catch it).
+// ---------------------------------------------------------------------------
+
+/// One `(skill, trajectory)` point from `get_skill_steps_trend_core`.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SkillStepsTrendRow {
+    pub skill_id: i64,
+    pub skill_name: String,
+    pub trajectory_id: i64,
+    pub created_at_ms: i64,
+    pub step_count: i64,
+}
+
+/// Steps-per-task trend: for each `procedural_skill` (optionally filtered by
+/// `skill_id`), joins its `source_trajectory_ids` to the matching
+/// `episodic_trajectory` rows and reports `step_count` (length of
+/// `tool_calls`). `deleted_at IS NULL` on both tables. `limit` clamps to
+/// `[1, 1000]` (default `500`) after the deterministic `ORDER BY ps.id ASC,
+/// e.created_at ASC`.
+pub(crate) async fn get_skill_steps_trend_core(
+    store: &MemoryStore,
+    skill_id: Option<i64>,
+    limit: Option<u32>,
+) -> Result<Vec<SkillStepsTrendRow>, MemoryError> {
+    let limit = limit.unwrap_or(500).clamp(1, 1000) as i64;
+
+    store
+        .conn
+        .call(move |c| -> rusqlite::Result<Vec<SkillStepsTrendRow>> {
+            let mut sql = String::from(
+                "SELECT ps.id, ps.skill_name, e.id, e.created_at, \
+                 CASE WHEN json_valid(e.tool_calls) \
+                      THEN COALESCE(json_array_length(e.tool_calls), 0) \
+                      ELSE 0 END AS step_count \
+                 FROM procedural_skill ps, json_each(ps.source_trajectory_ids) je \
+                 JOIN episodic_trajectory e ON e.id = je.value \
+                 WHERE ps.deleted_at IS NULL AND e.deleted_at IS NULL",
+            );
+            let mut params: Vec<rusqlite::types::Value> = Vec::new();
+            if let Some(sid) = skill_id {
+                sql.push_str(" AND ps.id = ?");
+                params.push(rusqlite::types::Value::Integer(sid));
+            }
+            sql.push_str(" ORDER BY ps.id ASC, e.created_at ASC LIMIT ?");
+            params.push(rusqlite::types::Value::Integer(limit));
+
+            let mut stmt = c.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+                Ok(SkillStepsTrendRow {
+                    skill_id: row.get(0)?,
+                    skill_name: row.get(1)?,
+                    trajectory_id: row.get(2)?,
+                    created_at_ms: row.get(3)?,
+                    step_count: row.get(4)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| match e {
+            tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
+            tokio_rusqlite::Error::ConnectionClosed => {
+                MemoryError::Backend("connection closed during get_skill_steps_trend_core".into())
+            }
+            other => MemoryError::Backend(other.to_string()),
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -478,6 +643,27 @@ pub async fn delete_memory(
     kind: MemoryKind,
 ) -> Result<usize, AppError> {
     delete_memory_core(&state.memory_store, id, kind)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn get_failure_histogram(
+    state: tauri::State<'_, AppState>,
+    bucket_ms: i64,
+) -> Result<Vec<FailureHistogramRow>, AppError> {
+    get_failure_histogram_core(&state.memory_store, bucket_ms)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn get_skill_steps_trend(
+    state: tauri::State<'_, AppState>,
+    skill_id: Option<i64>,
+    limit: Option<u32>,
+) -> Result<Vec<SkillStepsTrendRow>, AppError> {
+    get_skill_steps_trend_core(&state.memory_store, skill_id, limit)
         .await
         .map_err(Into::into)
 }
@@ -913,6 +1099,314 @@ mod tests {
         );
     }
 
+    // ── trajectory-miner-fase-4 Lote 1 — format_skill_hits (Task 1.1) ────────
+
+    fn make_kind_hit(kind: crate::memory::TableKind) -> RankedHit {
+        RankedHit {
+            id: 1,
+            kind,
+            content: String::new(),
+            memory_type: "chat_message".to_string(),
+            tier: 2,
+            status: "active".to_string(),
+            score: 0.0,
+            distance: 0.0,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn format_skill_hits_counts_only_procedural() {
+        let hits = vec![
+            make_kind_hit(crate::memory::TableKind::Procedural),
+            make_kind_hit(crate::memory::TableKind::Procedural),
+            make_kind_hit(crate::memory::TableKind::Memory),
+            make_kind_hit(crate::memory::TableKind::Memory),
+            make_kind_hit(crate::memory::TableKind::Memory),
+            make_kind_hit(crate::memory::TableKind::Episodic),
+        ];
+        assert_eq!(format_skill_hits(&hits), "skill_hits=2");
+    }
+
+    #[test]
+    fn format_skill_hits_empty_is_zero() {
+        assert_eq!(format_skill_hits(&[]), "skill_hits=0");
+    }
+
+    // ── trajectory-miner-fase-4 Lote 2 — get_failure_histogram_core ─────────
+    // (Tasks 2.1–2.4, RED)
+
+    /// Seeds a raw `episodic_trajectory` row with an explicit `created_at`
+    /// and optional `root_cause` — the columns `seed_episodic_row` above
+    /// doesn't expose. `deleted_at` stays NULL.
+    async fn seed_episodic_with_cause(
+        store: &MemoryStore,
+        created_at: i64,
+        root_cause: Option<&str>,
+    ) -> i64 {
+        let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
+        let root_cause = root_cause.map(|s| s.to_string());
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<i64> {
+                c.execute(
+                    "INSERT INTO episodic_trajectory \
+                     (scope, agent_id, session_id, task, root_cause, tier, importance, \
+                      created_at, last_modified_at, last_accessed_at, \
+                      created_by_type, created_by_ref) \
+                     VALUES ('agent', 'test-agent', ?, 'seed task', ?, 3, 5.0, \
+                             ?, ?, ?, 'agent', '')",
+                    rusqlite::params![
+                        format!("sess-hist-{nonce}"),
+                        root_cause,
+                        created_at,
+                        created_at,
+                        created_at
+                    ],
+                )?;
+                Ok(c.last_insert_rowid())
+            })
+            .await
+            .expect("seed_episodic_with_cause failed")
+    }
+
+    // Task 2.2 — groups by bucket and cause; ordered bucket_start_ms ASC.
+    #[tokio::test]
+    async fn failure_histogram_groups_by_bucket_and_cause() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        const BUCKET_MS: i64 = 86_400_000;
+        // Bucket 0: two 'missing_context' rows.
+        seed_episodic_with_cause(&store, 0, Some("missing_context")).await;
+        seed_episodic_with_cause(&store, 1_000, Some("missing_context")).await;
+        // Bucket 1 (different day): one 'model_limitation' row.
+        seed_episodic_with_cause(&store, BUCKET_MS, Some("model_limitation")).await;
+
+        let rows = get_failure_histogram_core(&store, BUCKET_MS).await.unwrap();
+
+        assert_eq!(rows.len(), 2, "expected 2 groups, got {rows:?}");
+        assert_eq!(rows[0].bucket_start_ms, 0);
+        assert_eq!(rows[0].root_cause, "missing_context");
+        assert_eq!(rows[0].count, 2);
+        assert_eq!(rows[1].bucket_start_ms, BUCKET_MS);
+        assert_eq!(rows[1].root_cause, "model_limitation");
+        assert_eq!(rows[1].count, 1);
+        for w in rows.windows(2) {
+            assert!(w[0].bucket_start_ms <= w[1].bucket_start_ms, "must be ASC");
+        }
+    }
+
+    // Task 2.3 — golden/NULL root_cause excluded (D5).
+    #[tokio::test]
+    async fn failure_histogram_excludes_null_root_cause() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed_episodic_with_cause(&store, 0, Some("missing_context")).await;
+        seed_episodic_with_cause(&store, 0, None).await; // golden
+        seed_episodic_with_cause(&store, 0, None).await; // golden
+
+        let rows = get_failure_histogram_core(&store, 86_400_000).await.unwrap();
+
+        assert_eq!(rows.len(), 1, "NULL root_cause rows must be excluded, got {rows:?}");
+        assert_eq!(rows[0].count, 1);
+        assert_eq!(rows[0].root_cause, "missing_context");
+        assert!(
+            rows.iter().all(|r| !r.root_cause.is_empty()),
+            "no row may have an empty/NULL root_cause"
+        );
+    }
+
+    // Task 2.4 — empty table → Ok(vec![]).
+    #[tokio::test]
+    async fn failure_histogram_empty_table_returns_empty() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+
+        let rows = get_failure_histogram_core(&store, 86_400_000).await.unwrap();
+
+        assert!(rows.is_empty());
+    }
+
+    // ── trajectory-miner-fase-4 Lote 3 — get_skill_steps_trend_core ─────────
+    // (Tasks 3.1–3.6, RED)
+
+    fn tool_calls_json_of_len(n: usize) -> String {
+        serde_json::to_string(&(0..n).map(|i| format!("t{i}")).collect::<Vec<String>>())
+            .expect("serialize tool_calls fixture")
+    }
+
+    /// Seeds a raw `episodic_trajectory` row with an explicit `created_at`
+    /// and `tool_calls` JSON array — the columns `seed_episodic_row` above
+    /// doesn't expose.
+    async fn seed_episodic_with_tool_calls(
+        store: &MemoryStore,
+        created_at: i64,
+        tool_calls_json: &str,
+    ) -> i64 {
+        let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
+        let tool_calls = tool_calls_json.to_string();
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<i64> {
+                c.execute(
+                    "INSERT INTO episodic_trajectory \
+                     (scope, agent_id, session_id, task, tool_calls, tier, importance, \
+                      created_at, last_modified_at, last_accessed_at, \
+                      created_by_type, created_by_ref) \
+                     VALUES ('agent', 'test-agent', ?, 'seed task', ?, 3, 5.0, \
+                             ?, ?, ?, 'agent', '')",
+                    rusqlite::params![
+                        format!("sess-trend-{nonce}"),
+                        tool_calls,
+                        created_at,
+                        created_at,
+                        created_at
+                    ],
+                )?;
+                Ok(c.last_insert_rowid())
+            })
+            .await
+            .expect("seed_episodic_with_tool_calls failed")
+    }
+
+    /// Seeds a `procedural_skill` row with an explicit `source_trajectory_ids`
+    /// JSON array (`seed_procedural_row` above always writes `'[]'`).
+    async fn seed_procedural_with_sources(store: &MemoryStore, source_ids_json: &str) -> i64 {
+        let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
+        let ids = source_ids_json.to_string();
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<i64> {
+                c.execute(
+                    "INSERT INTO procedural_skill \
+                     (scope, agent_id, skill_name, trigger, tier, importance, \
+                      promoted_at, source_trajectory_ids, \
+                      created_at, last_modified_at, last_accessed_at, \
+                      created_by_type, created_by_ref) \
+                     VALUES ('agent', 'test-agent', ?, 'seed trigger', 1, 8.0, \
+                             0, ?, 0, 0, 0, 'agent', '')",
+                    rusqlite::params![format!("skill-trend-{nonce}"), ids],
+                )?;
+                Ok(c.last_insert_rowid())
+            })
+            .await
+            .expect("seed_procedural_with_sources failed")
+    }
+
+    // Task 3.2 — ordered by skill and time, step_count from tool_calls length.
+    #[tokio::test]
+    async fn skill_steps_trend_ordered_by_skill_and_time() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let id1 = seed_episodic_with_tool_calls(&store, 100, &tool_calls_json_of_len(8)).await;
+        let id2 = seed_episodic_with_tool_calls(&store, 200, &tool_calls_json_of_len(5)).await;
+        let id3 = seed_episodic_with_tool_calls(&store, 300, &tool_calls_json_of_len(3)).await;
+        let skill_id = seed_procedural_with_sources(
+            &store,
+            &serde_json::to_string(&[id1, id2, id3]).unwrap(),
+        )
+        .await;
+
+        let rows = get_skill_steps_trend_core(&store, Some(skill_id), None)
+            .await
+            .unwrap();
+
+        assert_eq!(rows.len(), 3, "expected 3 rows, got {rows:?}");
+        assert_eq!(rows[0].step_count, 8);
+        assert_eq!(rows[1].step_count, 5);
+        assert_eq!(rows[2].step_count, 3);
+        for w in rows.windows(2) {
+            assert!(w[0].created_at_ms <= w[1].created_at_ms, "must be ASC by time");
+        }
+    }
+
+    // Task 3.3 — empty procedural_skill table → Ok(vec![]).
+    #[tokio::test]
+    async fn skill_steps_trend_empty_table_returns_empty() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+
+        let rows = get_skill_steps_trend_core(&store, None, None).await.unwrap();
+
+        assert!(rows.is_empty());
+    }
+
+    // Task 3.4 — malformed/empty tool_calls never errors; step_count=0 for both.
+    #[tokio::test]
+    async fn skill_steps_trend_malformed_or_empty_tool_calls_never_errors() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let empty_id = seed_episodic_with_tool_calls(&store, 100, "[]").await;
+        let malformed_id = seed_episodic_with_tool_calls(&store, 200, "[]").await;
+        // Bypass the typed insert (serde `Vec<String>` + NOT NULL DEFAULT '[]'
+        // make malformed JSON unreachable in prod) via a raw UPDATE.
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<()> {
+                c.execute(
+                    "UPDATE episodic_trajectory SET tool_calls = '{bad' WHERE id = ?1",
+                    rusqlite::params![malformed_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let skill_id = seed_procedural_with_sources(
+            &store,
+            &serde_json::to_string(&[empty_id, malformed_id]).unwrap(),
+        )
+        .await;
+
+        let rows = get_skill_steps_trend_core(&store, Some(skill_id), None)
+            .await
+            .expect("must return Ok even with malformed JSON, never Err");
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.step_count == 0), "both must yield step_count=0, got {rows:?}");
+    }
+
+    // Task 3.5 — dangling trajectory id silently dropped by the INNER JOIN.
+    #[tokio::test]
+    async fn skill_steps_trend_dangling_id_dropped_silently() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let live_id = seed_episodic_with_tool_calls(&store, 100, &tool_calls_json_of_len(4)).await;
+        let skill_id = seed_procedural_with_sources(
+            &store,
+            &serde_json::to_string(&[live_id, 999_999]).unwrap(),
+        )
+        .await;
+
+        let rows = get_skill_steps_trend_core(&store, Some(skill_id), None)
+            .await
+            .unwrap();
+
+        assert_eq!(rows.len(), 1, "dangling id must be dropped with no error, got {rows:?}");
+        assert_eq!(rows[0].trajectory_id, live_id);
+    }
+
+    // Task 3.6 — limit clamp math: unwrap_or(500).clamp(1,1000). Routed
+    // through a variable-parameter helper (not a bare `Some(_).unwrap_or`
+    // literal) so clippy's `unnecessary_literal_unwrap` doesn't fire on a
+    // pattern that mirrors production `get_skill_steps_trend_core`'s real
+    // clamp, which operates on a runtime `Option<u32>` argument.
+    fn clamp_limit(limit: Option<u32>) -> u32 {
+        limit.unwrap_or(500).clamp(1, 1000)
+    }
+
+    #[test]
+    fn skill_steps_trend_limit_clamp_math() {
+        assert_eq!(clamp_limit(Some(5_000)), 1_000);
+        assert_eq!(clamp_limit(None), 500);
+    }
+
+    #[tokio::test]
+    async fn skill_steps_trend_large_limit_does_not_error_on_small_set() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let id1 = seed_episodic_with_tool_calls(&store, 100, &tool_calls_json_of_len(1)).await;
+        let skill_id =
+            seed_procedural_with_sources(&store, &serde_json::to_string(&[id1]).unwrap()).await;
+
+        let rows = get_skill_steps_trend_core(&store, Some(skill_id), Some(5_000))
+            .await
+            .unwrap();
+
+        assert_eq!(rows.len(), 1, "limit=5000 clamps to 1000 but must not error or truncate below actual count");
+    }
+
     // ── Lote 4 — list_memories_core (Tasks 4.2–4.8) ──────────────────────────
 
     async fn seed_memory_full(
@@ -1082,5 +1576,123 @@ mod tests {
         assert_eq!(rows.len(), 1, "deleted row must be excluded");
         assert_eq!(rows[0].id, superseded_id);
         assert_eq!(rows[0].status, "superseded", "superseded rows must remain visible");
+    }
+
+    // ── trajectory-miner-fase-4 Lote 4 — MemoryAdminRow +3 skill fields ──────
+    // (Tasks 4.1–4.2, RED)
+
+    /// Seeds a `procedural_skill` row with explicit `success_count`, `trigger`,
+    /// and `source_trajectory_ids` (`seed_procedural_row` above hardcodes
+    /// `trigger`/`success_count`/`ids`).
+    async fn seed_procedural_full(
+        store: &MemoryStore,
+        success_count: i64,
+        trigger: &str,
+        source_ids_json: &str,
+    ) -> i64 {
+        let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
+        let trigger = trigger.to_string();
+        let ids = source_ids_json.to_string();
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<i64> {
+                c.execute(
+                    "INSERT INTO procedural_skill \
+                     (scope, agent_id, skill_name, trigger, success_count, tier, importance, \
+                      promoted_at, source_trajectory_ids, \
+                      created_at, last_modified_at, last_accessed_at, \
+                      created_by_type, created_by_ref) \
+                     VALUES ('agent', 'test-agent', ?, ?, ?, 1, 8.0, \
+                             0, ?, 0, 0, 0, 'agent', '')",
+                    rusqlite::params![format!("skill-full-{nonce}"), trigger, success_count, ids],
+                )?;
+                Ok(c.last_insert_rowid())
+            })
+            .await
+            .expect("seed_procedural_full failed")
+    }
+
+    // Task 4.1 — procedural row populates the 3 new fields.
+    #[tokio::test]
+    async fn list_memories_procedural_row_populates_skill_fields() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed_procedural_full(&store, 3, "when login fails", "[1,2,3]").await;
+
+        let rows = list_memories_core(
+            &store,
+            ListParams { kind: Some(MemoryKind::Procedural), ..Default::default() },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].success_count, Some(3));
+        assert_eq!(rows[0].trigger, Some("when login fails".to_string()));
+        assert_eq!(rows[0].source_trajectory_ids, Some("[1,2,3]".to_string()));
+    }
+
+    // Task 4.2 — memory/episodic rows keep the 3 new fields as None.
+    #[tokio::test]
+    async fn list_memories_memory_and_episodic_rows_have_none_skill_fields() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed_memory_full(&store, "chat_message", 3, "active", false, 100).await;
+        seed_episodic_row(&store, 3, 5.0).await;
+
+        let rows = list_memories_core(&store, ListParams::default()).await.unwrap();
+
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row.success_count, None, "row {row:?} must have success_count=None");
+            assert_eq!(row.trigger, None, "row {row:?} must have trigger=None");
+            assert_eq!(
+                row.source_trajectory_ids, None,
+                "row {row:?} must have source_trajectory_ids=None"
+            );
+        }
+    }
+
+    // ── trajectory-miner-fase-4 Lote 5 — guardrail (Task 5.2) ────────────────
+    //
+    // D4: `format_skill_hits` is a pure function — it touches ZERO DB. This
+    // asserts the orthogonal STATE invariant (not a call-count): a seeded
+    // `procedural_skill.access_count` must stay `0` after the skill-hits path
+    // runs, proving no procedural/episodic id ever reaches
+    // `AccessTracker::record` (which only ever `UPDATE memory` — access.rs).
+
+    #[tokio::test]
+    async fn skill_hits_path_never_touches_access_tracker() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let skill_id = seed_procedural_row(&store, 1, 8.0).await;
+
+        let hits = vec![RankedHit {
+            id: skill_id,
+            kind: crate::memory::TableKind::Procedural,
+            content: String::new(),
+            memory_type: "skill".to_string(),
+            tier: 1,
+            status: "active".to_string(),
+            score: 0.0,
+            distance: 0.0,
+            created_at: 0,
+        }];
+
+        assert_eq!(format_skill_hits(&hits), "skill_hits=1");
+
+        let access_count: i64 = store
+            .conn
+            .call(move |c| {
+                c.query_row(
+                    "SELECT access_count FROM procedural_skill WHERE id = ?1",
+                    [skill_id],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            access_count, 0,
+            "format_skill_hits must never write to AccessTracker/DB; access_count must stay 0"
+        );
     }
 }
