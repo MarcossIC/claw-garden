@@ -1,8 +1,16 @@
-// T11-test placeholder — stub to allow T05 compile
-// Real implementation added in T11-impl
+//! Insert-path types and DB operations for the memory store.
+//!
+//! Defines `MemoryType`/`CreatedByType` enums plus three record types —
+//! `NewMemoryRecord` (chat/tool/session memories), `NewEpisodicTrajectoryRecord`
+//! (agent task trajectories), and `NewProceduralSkillRecord` (deduplicated
+//! mined skills) — and the `MemoryStore` methods that insert each one. Every
+//! insert writes its row and matching embedding-vector row atomically in the
+//! same transaction.
 
 use crate::memory::chunker::Chunk;
+use crate::memory::clock::TimestampMs;
 use crate::memory::events::{MemoryEvent, MemorySource};
+use crate::memory::vector::to_unit;
 use crate::memory::MemoryStore;
 use crate::models::chat::Role;
 use rusqlite::OptionalExtension;
@@ -110,8 +118,12 @@ impl NewMemoryRecord {
 
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryStoreError {
-    #[error("vector dimension mismatch: expected {expected}, got {actual}")]
-    DimensionMismatch { expected: usize, actual: usize },
+    /// Covers every way an embedding fails the shared vector-space invariant
+    /// (`memory::vector::to_unit`): wrong dimension, a non-finite component, or
+    /// zero/non-normalizable magnitude. One variant because the caller's response
+    /// is identical in all three cases — discard before the write, never partial.
+    #[error("invalid embedding: {reason}")]
+    InvalidEmbedding { reason: String },
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("tokio_rusqlite error: {0}")]
@@ -124,21 +136,17 @@ impl MemoryStore {
         record: NewMemoryRecord,
         embedding: Vec<f32>,
     ) -> Result<i64, MemoryStoreError> {
-        if embedding.len() != 384 {
-            return Err(MemoryStoreError::DimensionMismatch {
-                expected: 384,
-                actual: embedding.len(),
-            });
-        }
-        let bytes = serialize_f32_vec(&embedding);
-        let created_at = record.created_at_ms as i64;
-        // T06 [IMPL] REQ-06: derive dispute columns in Rust before .call() so all 15
+        let unit = to_unit(&embedding)
+            .map_err(|e| MemoryStoreError::InvalidEmbedding { reason: e.to_string() })?;
+        let bytes = serialize_f32_vec(&unit);
+        let created_at = TimestampMs::from_unix_millis_u64(record.created_at_ms);
+        // Derive dispute columns in Rust before .call() so all 15
         // params flow through a single c.transaction() — atomic, no partial writes.
         let da_vec: Option<&Vec<i64>> = record.disputed_against.as_ref().filter(|v| !v.is_empty());
         let status: &'static str = if da_vec.is_some() { "disputed" } else { "active" };
         let da_json: Option<String> = da_vec.map(|v| serde_json::to_string(v).expect("Vec<i64> serialises infallibly"));
-        let last_disp: Option<i64> = da_vec.map(|_| created_at);
-        // T2 [IMPL] REQ: compute the initial tier explicitly instead of relying
+        let last_disp: Option<TimestampMs> = da_vec.map(|_| created_at);
+        // Compute the initial tier explicitly instead of relying
         // on the schema DEFAULT — single source of truth shared by every
         // producer (worker.rs, extractor.rs). PROMOTE-ONLY, starts from
         // current=3 (see memory/tier.rs).
@@ -221,23 +229,19 @@ impl MemoryStore {
     /// `session_id` is `UNIQUE`: a second insert for the same session fails
     /// with `Err` (surfaced via `MemoryStoreError::Connection`, no panic) and
     /// leaves no partial row in either table — the transaction is dropped
-    /// (and rolled back) before `commit()` is reached (S8).
+    /// (and rolled back) before `commit()` is reached.
     ///
     /// `tier` is always derived via `compute_tier(3, importance, 0,
-    /// "episodic_trajectory")` — never hardcoded (R3).
+    /// "episodic_trajectory")` — never hardcoded.
     pub async fn insert_episodic_trajectory(
         &self,
         record: NewEpisodicTrajectoryRecord,
         embedding: Vec<f32>,
     ) -> Result<i64, MemoryStoreError> {
-        if embedding.len() != 384 {
-            return Err(MemoryStoreError::DimensionMismatch {
-                expected: 384,
-                actual: embedding.len(),
-            });
-        }
-        let bytes = serialize_f32_vec(&embedding);
-        let created_at = record.created_at_ms as i64;
+        let unit = to_unit(&embedding)
+            .map_err(|e| MemoryStoreError::InvalidEmbedding { reason: e.to_string() })?;
+        let bytes = serialize_f32_vec(&unit);
+        let created_at = TimestampMs::from_unix_millis_u64(record.created_at_ms);
         let tier: i64 =
             crate::memory::tier::compute_tier(3, record.importance, 0, "episodic_trajectory");
 
@@ -283,7 +287,7 @@ impl MemoryStore {
             .map_err(MemoryStoreError::from)
     }
 
-    /// Fire-and-forget RCA persistence (Fase 3, design point 3): a single
+    /// Fire-and-forget RCA persistence: a single
     /// UPDATE by `id`, NO `c.transaction()` (single-statement, precedent
     /// `fetch_prior_trajectories`) — the caller (`miner.rs`) always warns and
     /// never propagates `Err` upward, so this stays a plain `.execute()`.
@@ -317,7 +321,7 @@ pub(crate) struct NewProceduralSkillRecord {
     pub skill_name: String,
     pub trigger: String,
     /// `serialize_tool_sequence(normalized)` — the ONLY producer of this
-    /// value (spec R5), used both as the dedup SELECT key and the
+    /// value, used both as the dedup SELECT key and the
     /// `tool_sequence` column value.
     pub tool_sequence_json: String,
     /// `[current_trajectory_id, ...matched_prior_ids]`.
@@ -333,12 +337,12 @@ pub(crate) enum PromoteOutcome {
     Inserted(i64),
     /// An existing row (same `agent_id` + `tool_sequence`) was updated; carries its id.
     Updated(i64),
-    /// No dedup hit and no embedding was available — nothing was written (R9).
+    /// No dedup hit and no embedding was available — nothing was written.
     SkippedNoEmbedding,
 }
 
 impl MemoryStore {
-    /// Prior Golden trajectories eligible as `filter_recurring` inputs (spec R6).
+    /// Prior Golden trajectories eligible as `filter_recurring` inputs.
     ///
     /// Returns raw `tool_calls` JSON (normalization happens in `miner.rs`, to
     /// keep this store→miner-free) for rows where `agent_id = ?`, `id !=
@@ -372,32 +376,30 @@ impl MemoryStore {
             .map_err(MemoryStoreError::from)
     }
 
-    /// Atomic dedup-check + INSERT-or-UPDATE for a promotable skill candidate
-    /// (spec R7/R8/R9), inside a SINGLE `.call()` + `tx.transaction()` —
+    /// Atomic dedup-check + INSERT-or-UPDATE for a promotable skill candidate,
+    /// inside a SINGLE `.call()` + `tx.transaction()` —
     /// `tokio_rusqlite` serializes closures on one thread, so the SELECT→branch
     /// is race-free without extra locking.
     ///
     /// - MISS + `Some(embedding)`: INSERT row+vector (`tier` via
     ///   `compute_tier`, `success_count = source_trajectory_ids.len()`) → `Inserted`.
-    /// - MISS + `None`: no write → `SkippedNoEmbedding` (R9, new-skill path
+    /// - MISS + `None`: no write → `SkippedNoEmbedding` (new-skill path
     ///   needs a vector).
     /// - HIT: union `stored_ids ∪ source_trajectory_ids` in Rust (preserving
     ///   order, appending only missing ids), `success_count =
     ///   len(unioned)` — the invariant `success_count == len(distinct
-    ///   source_trajectory_ids)` (R8 amendment) — no vector needed → `Updated`.
+    ///   source_trajectory_ids)` — no vector needed → `Updated`.
     pub(crate) async fn promote_to_procedural_skill(
         &self,
         rec: NewProceduralSkillRecord,
         embedding: Option<Vec<f32>>,
     ) -> Result<PromoteOutcome, MemoryStoreError> {
-        if let Some(emb) = &embedding {
-            if emb.len() != 384 {
-                return Err(MemoryStoreError::DimensionMismatch { expected: 384, actual: emb.len() });
-            }
-        }
+        let embedding = embedding
+            .map(|e| to_unit(&e).map_err(|err| MemoryStoreError::InvalidEmbedding { reason: err.to_string() }))
+            .transpose()?;
         let bytes = embedding.as_ref().map(|e| serialize_f32_vec(e));
-        let now_ms = rec.now_ms as i64;
-        // Rust pre-call — NEVER a hardcoded literal (R7).
+        let now_ms = TimestampMs::from_unix_millis_u64(rec.now_ms);
+        // Rust pre-call — NEVER a hardcoded literal.
         let tier: i64 = crate::memory::tier::compute_tier(3, rec.importance, 0, "procedural_skill");
 
         self.conn
@@ -487,14 +489,12 @@ fn serialize_f32_vec(v: &[f32]) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    // ── T2-test (REQ-2): MemoryType::SessionSummary.as_str() == "session_summary" ──
-
     #[test]
     fn memory_type_session_summary_as_str() {
         assert_eq!(MemoryType::SessionSummary.as_str(), "session_summary");
     }
 
-    // ── Phase 1 (memoria-3-capas-fase-1) — Task 1.1: new pivotal variants ──
+    // ── New pivotal variants ──
 
     #[test]
     fn as_str_new_variants() {
@@ -511,13 +511,15 @@ mod tests {
 
     #[test]
     fn memory_store_error_displays_message() {
-        let e = MemoryStoreError::DimensionMismatch { expected: 384, actual: 100 };
+        let e = MemoryStoreError::InvalidEmbedding {
+            reason: "expected 384-dim vector, got 100".to_string(),
+        };
         let s = format!("{e}");
         assert!(s.contains("384"), "message should contain 384: {s}");
         assert!(s.contains("100"), "message should contain 100: {s}");
     }
 
-    // ---------- T12-tests: insert_memory_with_vector (REQ-INS-001, REQ-INS-003) ----------
+    // ---------- insert_memory_with_vector ----------
 
     fn make_record(agent_id: &str, project_id: Option<String>) -> NewMemoryRecord {
         NewMemoryRecord {
@@ -558,11 +560,11 @@ mod tests {
         let small_embedding = vec![0.1_f32; 10];
         let err = store.insert_memory_with_vector(record, small_embedding).await.unwrap_err();
         match err {
-            MemoryStoreError::DimensionMismatch { expected, actual } => {
-                assert_eq!(expected, 384);
-                assert_eq!(actual, 10);
+            MemoryStoreError::InvalidEmbedding { reason } => {
+                assert!(reason.contains("384"), "reason should mention 384: {reason}");
+                assert!(reason.contains("10"), "reason should mention 10: {reason}");
             }
-            other => panic!("expected DimensionMismatch, got {other:?}"),
+            other => panic!("expected InvalidEmbedding, got {other:?}"),
         }
     }
 
@@ -630,7 +632,7 @@ mod tests {
         assert!(result.is_ok(), "expected Ok for agent scope with project, got {:?}", result.err());
     }
 
-    // ── T03 [TEST] REQ-05: NewMemoryRecord.disputed_against defaults None ─────
+    // ── NewMemoryRecord.disputed_against defaults None ─────
 
     #[test]
     fn new_memory_record_disputed_against_defaults_none_in_make_record() {
@@ -658,7 +660,7 @@ mod tests {
             "from_event_and_chunk must default disputed_against=None");
     }
 
-    // ── T3-test (REQ-3): source-first arm — Compaction source overrides role ──
+    // ── Source-first arm — Compaction source overrides role ──
 
     #[test]
     fn from_event_and_chunk_compaction_source_yields_session_summary_system_6() {
@@ -681,7 +683,7 @@ mod tests {
         assert_eq!(rec.importance, 6.0, "Compaction source must fix importance at 6.0");
     }
 
-    // ── T05 [TEST] REQ-06: INSERT writes status/disputed_against/last_disputed_at ──
+    // ── INSERT writes status/disputed_against/last_disputed_at ──
 
     #[tokio::test]
     async fn insert_with_no_dispute_writes_active_status() {
@@ -763,7 +765,7 @@ mod tests {
         assert_eq!(vec_count, 1, "memory_vectors row must exist");
     }
 
-    // ── Phase 2 (memoria-3-capas-fase-1) — tier fijo en el INSERT ──────────
+    // ── tier fijo en el INSERT ──────────
     // compute_tier(3, importance, 0, memory_type.as_str()) must be written to
     // the `tier` column instead of relying on the schema DEFAULT.
 
@@ -789,7 +791,7 @@ mod tests {
         .unwrap()
     }
 
-    // Task 2.1: chat_message imp=5.0 → tier=3 (regression lock).
+    // chat_message imp=5.0 → tier=3 (regression lock).
     #[tokio::test]
     async fn insert_chat_message_importance_5_yields_tier_3() {
         let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
@@ -798,7 +800,7 @@ mod tests {
         assert_eq!(tier, 3, "chat_message imp=5.0 must insert at tier=3");
     }
 
-    // Task 2.2: tool_error imp=6.0 → tier=3 (regression lock).
+    // tool_error imp=6.0 → tier=3 (regression lock).
     #[tokio::test]
     async fn insert_tool_error_importance_6_yields_tier_3() {
         let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
@@ -807,7 +809,7 @@ mod tests {
         assert_eq!(tier, 3, "tool_error imp=6.0 must insert at tier=3");
     }
 
-    // Task 2.3: session_summary imp=6.0 → tier=2. CORRECTION vs the old SQL
+    // session_summary imp=6.0 → tier=2. CORRECTION vs the old SQL
     // `DEFAULT 3` — locked per tier.rs:38-44 (INSERT initial-tier rule), no
     // effect on workspace.md (session_summary is not a workspace producer).
     #[tokio::test]
@@ -818,7 +820,7 @@ mod tests {
         assert_eq!(tier, 2, "session_summary imp=6.0 must insert at tier=2 (corrected from DEFAULT 3)");
     }
 
-    // Task 2.4: user_preference imp=5.0 → tier=1 (pivotal, type-based rule).
+    // user_preference imp=5.0 → tier=1 (pivotal, type-based rule).
     #[tokio::test]
     async fn insert_user_preference_importance_5_yields_tier_1() {
         let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
@@ -827,7 +829,7 @@ mod tests {
         assert_eq!(tier, 1, "user_preference imp=5.0 must insert at tier=1");
     }
 
-    // Task 2.5: architectural_decision imp=5.0 → tier=2 (pivotal, type-based rule).
+    // architectural_decision imp=5.0 → tier=2 (pivotal, type-based rule).
     #[tokio::test]
     async fn insert_architectural_decision_importance_5_yields_tier_2() {
         let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
@@ -836,7 +838,7 @@ mod tests {
         assert_eq!(tier, 2, "architectural_decision imp=5.0 must insert at tier=2");
     }
 
-    // Task 2.6: semantic_fact imp=5.0 → tier=3 (no promotion rule, doc 7).
+    // semantic_fact imp=5.0 → tier=3 (no promotion rule).
     #[tokio::test]
     async fn insert_semantic_fact_importance_5_yields_tier_3() {
         let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
@@ -845,7 +847,7 @@ mod tests {
         assert_eq!(tier, 3, "semantic_fact imp=5.0 must insert at tier=3 (no promotion rule)");
     }
 
-    // Task 2.7: semantic_fact imp=9.5 → tier=1 (importance>=9 fast-track overrides type).
+    // semantic_fact imp=9.5 → tier=1 (importance>=9 fast-track overrides type).
     #[tokio::test]
     async fn insert_semantic_fact_importance_9_5_yields_tier_1() {
         let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
@@ -874,7 +876,7 @@ mod tests {
         }
     }
 
-    // Task 3.1 (S7): valid record + 384-dim embedding → 1 row in
+    // valid record + 384-dim embedding → 1 row in
     // episodic_trajectory + 1 row in episodic_vectors, same rowid, same tx.
     #[tokio::test]
     async fn insert_episodic_trajectory_writes_row_and_vector_same_rowid() {
@@ -905,7 +907,7 @@ mod tests {
         assert_eq!(vec_count, 1, "expected 1 row in episodic_vectors for rowid={id}");
     }
 
-    // Task 3.2 (R3): tier==3 via compute_tier(3, 5.0, 0, "episodic_trajectory")
+    // tier==3 via compute_tier(3, 5.0, 0, "episodic_trajectory")
     // invoked explicitly — never hardcoded. Cross-checked with an
     // importance>=9.0 record, which the SAME compute_tier call promotes to
     // tier=1 (proves the column is NOT hardcoded to a literal `3`).
@@ -951,7 +953,7 @@ mod tests {
         assert_eq!(tier, 1, "importance=9.5 fast-track must override the tier=3 default, proving compute_tier is invoked (not hardcoded)");
     }
 
-    // Task 3.3 (S7): created_by_type=='system', status=='active'.
+    // created_by_type=='system', status=='active'.
     #[tokio::test]
     async fn insert_episodic_trajectory_sets_system_creator_and_active_status() {
         let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
@@ -1004,7 +1006,7 @@ mod tests {
             .unwrap()
     }
 
-    // R6: only active, non-deleted, Golden (score > 0.85), same-agent, non-self
+    // Only active, non-deleted, Golden (score > 0.85), same-agent, non-self
     // rows are returned, ordered by last_accessed_at DESC.
     #[tokio::test]
     async fn fetch_prior_trajectories_filters() {
@@ -1110,7 +1112,7 @@ mod tests {
         );
     }
 
-    // R9: NEW-skill path requires a vector — embedder absent => 0 rows written,
+    // NEW-skill path requires a vector — embedder absent => 0 rows written,
     // SkippedNoEmbedding, no panic. Unreachable via mine_session_core (the
     // episodic writer gates on the embedder first) — tested here at store level.
     #[tokio::test]
@@ -1124,7 +1126,7 @@ mod tests {
         assert_eq!(count_procedural(&store).await, 0, "no row must be written on the None-embedding new-skill path");
     }
 
-    // R9: dedup-UPDATE path does NOT need a vector — success_count still grows.
+    // dedup-UPDATE path does NOT need a vector — success_count still grows.
     #[tokio::test]
     async fn promote_none_embedding_dedup_updates() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1150,9 +1152,9 @@ mod tests {
         assert_eq!(count_procedural(&store).await, 1, "dedup hit must NOT insert a second row");
     }
 
-    // ── Post-verify S1 (R8) — idempotencia pura: todos los ids ya presentes ──
+    // ── Idempotencia pura: todos los ids ya presentes ──
 
-    // R8 scenario "All ids already present → no increment": a re-promotion
+    // Scenario "All ids already present → no increment": a re-promotion
     // where EVERY id (current + matched priors) is already in
     // `source_trajectory_ids` must leave `success_count` AND the array
     // untouched — the invariant `success_count == len(distinct ids)` holds
@@ -1189,7 +1191,7 @@ mod tests {
         assert_eq!(count_procedural(&store).await, 1, "still exactly 1 row");
     }
 
-    // Task 3.4 (S8): second insert with the same session_id → Err, no panic,
+    // Second insert with the same session_id → Err, no panic,
     // no partial row in either table.
     #[tokio::test]
     async fn insert_episodic_trajectory_duplicate_session_id_fails_without_partial_rows() {
@@ -1219,9 +1221,60 @@ mod tests {
         assert!(id1 > 0);
     }
 
-    // ── Phase 1 (trajectory-miner-fase-3) — V4 migration + update_trajectory_root_cause ──
+    // ── Embedding contract: both edges normalize to unit length ──
 
-    // Task 1.1: proves V4 applied — SELECT root_cause on a fresh row succeeds
+    /// Reads the raw `memory_vectors.embedding` blob back as `f32`s — little-endian,
+    /// matching `serialize_f32_vec`'s encoding.
+    async fn read_back_embedding(store: &MemoryStore, id: i64) -> Vec<f32> {
+        let bytes: Vec<u8> = store
+            .conn
+            .call(move |c| {
+                c.query_row(
+                    "SELECT embedding FROM memory_vectors WHERE rowid = ?1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn insert_normalizes_to_unit_length() {
+        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let record = make_record("a", None);
+        // Non-unit on purpose: ||v|| = sqrt(384 * 0.01) ≈ 1.9596.
+        let embedding = make_embedding_384();
+        let id = store.insert_memory_with_vector(record, embedding).await.unwrap();
+
+        let stored = read_back_embedding(&store, id).await;
+        let norm: f32 = stored.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-4, "stored vector must have unit norm, got {norm}");
+    }
+
+    #[tokio::test]
+    async fn zero_embedding_is_rejected_and_writes_nothing() {
+        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let record = make_record("a", None);
+        let zero_embedding = vec![0.0_f32; 384];
+        let result = store.insert_memory_with_vector(record, zero_embedding).await;
+        assert!(result.is_err(), "zero-magnitude embedding must be rejected, got {result:?}");
+
+        let count: i64 = store
+            .conn
+            .call(|c| c.query_row("SELECT COUNT(*) FROM memory", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "a rejected embedding must leave the row unwritten too — never a memory row without a vector row");
+    }
+
+    // ── V4 migration + update_trajectory_root_cause ──
+
+    // Proves V4 applied — SELECT root_cause on a fresh row succeeds
     // and defaults to NULL (SQLite ADD COLUMN is nullable by default).
     #[tokio::test]
     async fn root_cause_column_exists_and_defaults_null() {
@@ -1242,7 +1295,7 @@ mod tests {
         assert!(root_cause.is_none(), "root_cause must default to NULL for a never-classified row");
     }
 
-    // Task 1.3a: update_trajectory_root_cause targets exactly one row — the
+    // update_trajectory_root_cause targets exactly one row — the
     // sibling row's root_cause must remain untouched (NULL).
     #[tokio::test]
     async fn update_trajectory_root_cause_targets_exactly_one_row() {
@@ -1269,7 +1322,7 @@ mod tests {
         assert!(rc2.is_none(), "sibling row must remain untouched");
     }
 
-    // Task 1.3b: overwrite semantics = last-write-wins — a second UPDATE on
+    // Overwrite semantics = last-write-wins — a second UPDATE on
     // the same row replaces the already-set value.
     #[tokio::test]
     async fn update_trajectory_root_cause_overwrite_is_last_write_wins() {

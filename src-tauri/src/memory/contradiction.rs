@@ -8,6 +8,9 @@ use crate::memory::search::{search_all_memories, SearchScope};
 use crate::memory::record::TableKind;
 use crate::memory::MemoryStore;
 
+#[cfg(test)]
+use crate::memory::vector::to_unit;
+
 /// L2 distance below which two embeddings are considered contradictory.
 ///
 /// LOCKED decision D1 (design §LOCKED). Value 0.20 is a conservative starting
@@ -65,8 +68,16 @@ mod tests {
     }
 
     /// Insert one memory row with a known embedding. Returns the new row id.
+    ///
+    /// Normalizes before writing: this bypasses `insert_memory_with_vector`
+    /// (raw SQL, no `to_unit`), but `detect_contradiction`'s queries go through
+    /// `search_all_memories`, which normalizes the query side. Storing the raw
+    /// fixture here would compare an unnormalized ~11-unit stored vector against
+    /// a unit query and never match — every distance blows out to 10+ regardless
+    /// of how close the two fixtures are in direction.
     async fn insert_row(store: &MemoryStore, agent_id: &str, embedding: &[f32]) -> i64 {
-        let bytes = emb_bytes(embedding);
+        let unit = to_unit(embedding).expect("test fixtures are never zero-magnitude");
+        let bytes = emb_bytes(&unit);
         let agent = agent_id.to_string();
         store
             .conn
@@ -257,15 +268,22 @@ mod tests {
             .collect()
     }
 
-    /// Near vector: v + delta per dimension, ‖delta‖ = eps.
-    /// With eps=0.10: L2(near, base) = eps < CONTRADICTION_THRESHOLD (0.20).
+    /// Near vector: v + delta per dimension, ‖delta‖ = eps, BEFORE either side
+    /// is normalized. `detect_contradiction` compares these post-normalization
+    /// (via `insert_row` and `search_all_memories`), where the threshold check
+    /// actually happens — for `base_vec`'s ‖v‖ ≈ 11.3, eps=0.10 becomes an
+    /// angular offset of ≈ eps/‖v‖ ≈ 0.009 rad, i.e. unit-space L2 ≈ 0.009,
+    /// still comfortably under CONTRADICTION_THRESHOLD (0.20).
     fn near(v: &[f32], eps: f32) -> Vec<f32> {
         // Uniform delta per dim: ‖delta‖ = sqrt(384 * d^2) = sqrt(384)*d = eps → d = eps/sqrt(384)
         let delta = eps / (384.0_f32).sqrt();
         v.iter().map(|x| x + delta).collect()
     }
 
-    /// Far vector: shifts each dim by +1.0 → L2 = sqrt(384) ≈ 19.6 >> 0.50.
+    /// Far vector: shifts each dim by +1.0 → raw L2 = sqrt(384) ≈ 19.6, BEFORE
+    /// normalization. Post-normalization (what `detect_contradiction` actually
+    /// compares) the two directions differ enough that cos ≈ 0.947, i.e.
+    /// unit-space L2 ≈ 0.33 — still safely over CONTRADICTION_THRESHOLD (0.20).
     fn far(v: &[f32]) -> Vec<f32> {
         v.iter().map(|x| x + 1.0).collect()
     }

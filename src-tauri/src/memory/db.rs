@@ -1,9 +1,39 @@
 use std::path::Path;
-use std::sync::Once;
+use std::sync::{Arc, Once};
 
+use rusqlite::OptionalExtension;
 use tokio_rusqlite::Connection;
 
 use crate::memory::error::MemoryError;
+use crate::memory::latency::KnnLatency;
+
+// ---------------------------------------------------------------------------
+// Embedding contract
+// ---------------------------------------------------------------------------
+
+/// Outcome of comparing the active embedder's identity against the
+/// persisted `embedding_contract` row.
+///
+/// `Match` and `Initialized` are kept distinct (rather than collapsed into a
+/// single "ok" case) because "row absent -> written" and "row present ->
+/// left alone" are two different assertions callers and tests care about
+/// separately.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ContractStatus {
+    /// An existing row's `model_id` + `dim` match the active embedder.
+    Match,
+    /// No row existed; one was just written from the active embedder's metadata.
+    Initialized,
+    /// An existing row's `model_id` or `dim` differs from the active embedder —
+    /// the store holds vectors from a different embedding space than the one
+    /// currently loaded.
+    Mismatch {
+        stored_model_id: String,
+        stored_dim: i64,
+        actual_model_id: String,
+        actual_dim: usize,
+    },
+}
 
 // ---------------------------------------------------------------------------
 // vec0 static registration
@@ -41,13 +71,17 @@ fn ensure_vec0_registered() {
 #[derive(Clone)]
 pub struct MemoryStore {
     pub conn: Connection,
+    /// Shared with every clone deliberately: the handles all address one
+    /// database, so they belong to one latency series instead of each
+    /// keeping a private slice too short to mean anything.
+    knn_latency: Arc<KnnLatency>,
 }
 
 impl MemoryStore {
     /// Open (or create) the memory database at `<base_dir>/memory.db`.
     ///
     /// Registers the `sqlite-vec` extension (process-global, idempotent) and
-    /// runs all three refinery migrations before returning.
+    /// runs all five refinery migrations before returning.
     pub async fn open(base_dir: &Path) -> Result<Self, MemoryError> {
         ensure_vec0_registered();
         // Best-effort directory creation — we'll get a clean error on open if it fails.
@@ -62,7 +96,7 @@ impl MemoryStore {
         crate::memory::tier::register_demote_udf(&conn).await?;
         // Raise SQLITE_LIMIT_VARIABLE_NUMBER from the default 999 to 32766 (SQLite hard
         // maximum). Flush batches of ≤500 rows × 3 bind vars = 1500 params would otherwise
-        // exceed the default limit at row 334. See REQ-LIMIT (LIMIT-1).
+        // exceed the default limit at row 334.
         conn.call(|c| -> rusqlite::Result<()> {
             // SAFETY: c is the exclusive connection reference for this call.
             unsafe {
@@ -76,7 +110,10 @@ impl MemoryStore {
         })
         .await
         .map_err(MemoryError::Connection)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            knn_latency: Arc::new(KnnLatency::new()),
+        })
     }
 
     /// In-memory database for unit tests.
@@ -94,7 +131,7 @@ impl MemoryStore {
         crate::memory::score::register_score_udfs(&conn).await?;
         crate::memory::tier::register_tier_udf(&conn).await?;
         crate::memory::tier::register_demote_udf(&conn).await?;
-        // Raise SQLITE_LIMIT_VARIABLE_NUMBER — same as open() path. See REQ-LIMIT (LIMIT-2).
+        // Raise SQLITE_LIMIT_VARIABLE_NUMBER — same as open() path.
         conn.call(|c| -> rusqlite::Result<()> {
             // SAFETY: c is the exclusive connection reference for this call.
             unsafe {
@@ -108,7 +145,71 @@ impl MemoryStore {
         })
         .await
         .map_err(MemoryError::Connection)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            knn_latency: Arc::new(KnnLatency::new()),
+        })
+    }
+
+    /// The shared KNN latency recorder for this store's database.
+    ///
+    /// Every clone of this `MemoryStore` returns the same recorder — see the
+    /// field doc comment for why that sharing is intended, not accidental.
+    pub(crate) fn knn_latency(&self) -> &KnnLatency {
+        &self.knn_latency
+    }
+
+    /// Write-if-absent, verify-if-present bootstrap for the single-row
+    /// `embedding_contract` table.
+    ///
+    /// Compares ONLY `model_id` + `dim` against the stored row — `metric`
+    /// and `normalized` are invariants `memory::vector::to_unit` imposes on
+    /// every row in this store, not properties the embedder itself reports,
+    /// so they are never part of the comparison.
+    pub(crate) async fn ensure_embedding_contract(
+        &self,
+        model_id: &str,
+        dim: usize,
+    ) -> Result<ContractStatus, MemoryError> {
+        let model_id = model_id.to_string();
+        let dim_i64 = dim as i64;
+        self.conn
+            .call(move |c| -> rusqlite::Result<ContractStatus> {
+                let existing: Option<(String, i64)> = c
+                    .query_row(
+                        "SELECT model_id, dim FROM embedding_contract WHERE id = 1",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+
+                match existing {
+                    None => {
+                        let created_at = crate::memory::clock::TimestampMs::now();
+                        c.execute(
+                            "INSERT INTO embedding_contract \
+                             (id, model_id, dim, metric, normalized, query_prefix, passage_prefix, created_at) \
+                             VALUES (1, ?1, ?2, 'l2_unit', 1, '', '', ?3)",
+                            rusqlite::params![model_id, dim_i64, created_at],
+                        )?;
+                        Ok(ContractStatus::Initialized)
+                    }
+                    Some((stored_model_id, stored_dim)) => {
+                        if stored_model_id == model_id && stored_dim == dim_i64 {
+                            Ok(ContractStatus::Match)
+                        } else {
+                            Ok(ContractStatus::Mismatch {
+                                stored_model_id,
+                                stored_dim,
+                                actual_model_id: model_id,
+                                actual_dim: dim,
+                            })
+                        }
+                    }
+                }
+            })
+            .await
+            .map_err(MemoryError::Connection)
     }
 }
 
@@ -336,7 +437,7 @@ mod tests {
             })
             .await
             .unwrap();
-        // 3 regular tables + 3 vec0 virtual + 1 view + 14 indices = 21 rows minimum
+        // 4 regular tables + 3 vec0 virtual + 1 view + 14 indices = 22 rows minimum
         assert!(
             count >= 18,
             "Expected at least 18 schema objects, got {}",
@@ -368,7 +469,9 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // T-04-test: SQLITE_LIMIT_VARIABLE_NUMBER == 32766 in BOTH paths
+    // SQLITE_LIMIT_VARIABLE_NUMBER must be 32766 through BOTH connection-
+    // opening paths (open() and new_for_test()) — a mismatch here would mean
+    // only one of the two ever benefits from the raised bind-parameter cap.
     // -----------------------------------------------------------------------
 
     /// LIMIT-1 — production open() path sets SQLITE_LIMIT_VARIABLE_NUMBER = 32766.
@@ -434,7 +537,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 4, "Expected exactly 4 applied migrations, got {}", count);
+        assert_eq!(count, 5, "Expected exactly 5 applied migrations, got {}", count);
     }
 
     // -----------------------------------------------------------------------
@@ -655,6 +758,85 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 4);
+        assert_eq!(migration_count, 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // Embedding contract: write-if-absent, verify-if-present
+    // -----------------------------------------------------------------------
+
+    /// First call on an empty table writes the row and reports `Initialized`;
+    /// a second call with the SAME model_id/dim finds the row unchanged and
+    /// reports `Match` instead of rewriting it.
+    #[tokio::test]
+    async fn ensure_embedding_contract_initializes_then_matches() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let status1 = store
+            .ensure_embedding_contract("multilingual-e5-small", 384)
+            .await
+            .unwrap();
+        assert_eq!(
+            status1,
+            ContractStatus::Initialized,
+            "empty table must be initialized on first call"
+        );
+
+        let status2 = store
+            .ensure_embedding_contract("multilingual-e5-small", 384)
+            .await
+            .unwrap();
+        assert_eq!(
+            status2,
+            ContractStatus::Match,
+            "second call with the same model_id/dim must match, not rewrite"
+        );
+    }
+
+    /// A different `model_id` against an existing row is reported as a
+    /// mismatch carrying both sides of the comparison.
+    #[tokio::test]
+    async fn ensure_embedding_contract_reports_mismatch_on_different_model() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        store
+            .ensure_embedding_contract("multilingual-e5-small", 384)
+            .await
+            .unwrap();
+        let status = store
+            .ensure_embedding_contract("other-model", 384)
+            .await
+            .unwrap();
+        match status {
+            ContractStatus::Mismatch {
+                stored_model_id,
+                stored_dim,
+                actual_model_id,
+                actual_dim,
+            } => {
+                assert_eq!(stored_model_id, "multilingual-e5-small");
+                assert_eq!(stored_dim, 384);
+                assert_eq!(actual_model_id, "other-model");
+                assert_eq!(actual_dim, 384);
+            }
+            other => panic!("expected Mismatch, got {other:?}"),
+        }
+    }
+
+    /// A different `dim` against an existing row (same model_id) is also a
+    /// mismatch — the comparison is on the pair, not just the name.
+    #[tokio::test]
+    async fn ensure_embedding_contract_reports_mismatch_on_different_dim() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        store
+            .ensure_embedding_contract("multilingual-e5-small", 384)
+            .await
+            .unwrap();
+        let status = store
+            .ensure_embedding_contract("multilingual-e5-small", 768)
+            .await
+            .unwrap();
+        assert!(
+            matches!(status, ContractStatus::Mismatch { .. }),
+            "different dim must be reported as mismatch, got {status:?}"
+        );
     }
 }

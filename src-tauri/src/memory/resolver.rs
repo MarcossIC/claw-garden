@@ -1,25 +1,27 @@
-//! Contradiction resolver for Phase 6 sycophancy guard (REQ-07 — REQ-10).
+//! Contradiction resolver for the sycophancy guard.
 //!
 //! Adjudicates disputed memory clusters by consulting an LLM provider and
 //! applies the verdict atomically to the SQLite store.
 //!
-//! # Design constraints (LOCKED)
-//! - D2: importance guard — winner `importance = MIN(importance, 6.0)` keeps
+//! # Design constraints (deliberate — changing any of these requires
+//! # auditing every place that reads or relies on them)
+//! - Importance guard — winner `importance = MIN(importance, 6.0)` keeps
 //!   disputed rows below `tier.rs:26` fast-track (importance ≥ 9 → tier 1).
-//! - D3: `RESOLVER_TIMEOUT = 30 s`.
-//! - D5: `state.get_agent_provider(pid)` already falls back to global provider
+//! - `RESOLVER_TIMEOUT = 30 s`.
+//! - `state.get_agent_provider(pid)` already falls back to global provider
 //!   when `pid` is unknown — use it directly.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::memory::clock::TimestampMs;
 use crate::memory::MemoryStore;
 use crate::models::{ChatMessage, ChatRequest, ChatStreamResult, Role};
 use crate::providers::{AiProvider, StreamSender};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// Maximum wall-clock time allowed for a single LLM adjudication call (LOCKED D3).
+/// Maximum wall-clock time allowed for a single LLM adjudication call.
 const RESOLVER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// System prompt for the adjudication LLM call.
@@ -152,12 +154,12 @@ pub(crate) async fn adjudicate_cluster(
 /// Apply a `Resolution` atomically to the SQLite store.
 ///
 /// All UPDATE statements run in a single `conn.call` + `tx.transaction()` per
-/// `Resolution` arm (LOCKED, design §apply_resolution).
+/// `Resolution` arm.
 ///
 /// - `Add`:    all cluster rows → `status='active'`, `disputed_against=NULL`.
 /// - `Update`: winner → `importance=MIN(importance,6.0)`, `status='active'`,
 ///             `disputed_against=NULL`; losers → `status='disputed'`,
-///             `last_disputed_at=now` (LOCKED D2 importance guard).
+///             `last_disputed_at=now`.
 /// - `NoOp`:   zero DB writes; rows remain as-is.
 pub(crate) async fn apply_resolution(
     store: &MemoryStore,
@@ -197,18 +199,15 @@ pub(crate) async fn apply_resolution(
                 .filter(|&id| id != winner)
                 .collect();
             let winner_id = winner;
-            let now_ms: i64 = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64;
+            let now_ms = TimestampMs::now();
 
             store
                 .conn
                 .call(move |conn| -> Result<(), rusqlite::Error> {
                     let tx = conn.transaction()?;
 
-                    // Winner: restore to active, cap importance (LOCKED D2),
-                    // clear dispute markers, bump modification metadata.
+                    // Winner: restore to active, cap importance, clear
+                    // dispute markers, bump modification metadata.
                     tx.execute(
                         "UPDATE memory \
                          SET status='active', \
@@ -348,7 +347,7 @@ pub(crate) async fn load_disputed_clusters(store: &MemoryStore) -> Vec<DisputedC
 /// Fire-and-forget entry point spawned from `commands/session.rs` on each
 /// new or resumed session.
 ///
-/// # Design (LOCKED D5)
+/// # Design
 ///
 /// 1. Clone the `MemoryStore` handle (cheap — it is a channel clone).
 /// 2. Load all pending disputed clusters.
@@ -455,7 +454,7 @@ mod tests {
         }
     }
 
-    /// Provider whose `chat_stream` future never resolves — used for T19 timeout test.
+    /// Provider whose `chat_stream` future never resolves — used to test timeout handling.
     struct NeverProvider;
 
     #[async_trait::async_trait]
@@ -566,7 +565,7 @@ mod tests {
             .unwrap()
     }
 
-    // ── T16 [TEST] parse_verdict ──────────────────────────────────────────────
+    // ── parse_verdict ──────────────────────────────────────────────
 
     /// "ADD" maps to Resolution::Add.
     #[test]
@@ -636,7 +635,7 @@ mod tests {
         );
     }
 
-    // ── T17 [TEST] adjudicate_cluster — FakeProvider("ADD") ─────────────────
+    // ── adjudicate_cluster — FakeProvider("ADD") ─────────────────
 
     #[tokio::test]
     async fn adjudicate_cluster_fake_add_returns_add() {
@@ -648,7 +647,7 @@ mod tests {
         assert_eq!(result, Resolution::Add, "FakeProvider('ADD') must yield Add");
     }
 
-    // ── T18 [TEST] adjudicate_cluster — FakeProvider("UPDATE n") ────────────
+    // ── adjudicate_cluster — FakeProvider("UPDATE n") ────────────
 
     #[tokio::test]
     async fn adjudicate_cluster_fake_update_returns_update() {
@@ -664,7 +663,7 @@ mod tests {
         );
     }
 
-    // ── T19 [TEST] timeout — ZERO real sleep ─────────────────────────────────
+    // ── timeout — ZERO real sleep ─────────────────────────────────
 
     /// A provider that never completes must produce NoOp after the timeout fires.
     ///
@@ -700,7 +699,7 @@ mod tests {
         );
     }
 
-    // ── T21 [TEST] apply_resolution Add ──────────────────────────────────────
+    // ── apply_resolution Add ──────────────────────────────────────
 
     /// After Add: both the new row and the against row are `status='active'`
     /// with `disputed_against=NULL`.
@@ -740,7 +739,7 @@ mod tests {
         );
     }
 
-    // ── T22 [TEST] apply_resolution Update ───────────────────────────────────
+    // ── apply_resolution Update ───────────────────────────────────
 
     /// After Update { winner }: winner is `status='active'`,
     /// `importance = MIN(importance, 6.0)`, `disputed_against=NULL`.
@@ -819,7 +818,7 @@ mod tests {
         );
     }
 
-    // ── T23 [TEST] apply_resolution NoOp ─────────────────────────────────────
+    // ── apply_resolution NoOp ─────────────────────────────────────
 
     /// After NoOp: zero DB writes — both rows remain exactly as before.
     #[tokio::test]

@@ -12,10 +12,17 @@ mod services;
 mod session;
 mod state;
 
+/// Narrow, feature-gated door into retrieval internals for the evaluation
+/// binary. `memory` itself stays a private module — see `eval_api.rs` for
+/// why an opaque wrapper is preferred over widening the module tree.
+#[cfg(feature = "eval")]
+pub mod eval_api;
+
 use std::sync::Arc;
 
 use tauri::{AppHandle, Emitter, Manager};
 
+use memory::db::ContractStatus;
 use memory::embedder::{Embedder, FastEmbedLocal};
 use memory::model_download::{ensure_model, DownloadProgress};
 use models::chat::StreamEvent;
@@ -36,23 +43,24 @@ pub fn run() {
                         .build(),
                 )?;
             }
-            // Phase 2 RAG (REQ-STATE-001, REQ-EVT-002): spawn the embedder
-            // bootstrap task. It downloads the model in the background and
-            // forwards progress events via `app.emit("embedder-download", …)`.
-            // Non-blocking — failure leaves the OnceCell empty and the rest
-            // of the app keeps running.
+            // Spawn the embedder bootstrap task. It downloads the model in the
+            // background and forwards progress events via
+            // `app.emit("embedder-download", …)`. Non-blocking — failure
+            // leaves the OnceCell empty and the rest of the app keeps running.
             start_embedder_bootstrap(app.handle().clone());
 
-            // Phase 3 RAG (REQ-WRK-001): spawn the memory ingest worker.
-            // Receives MemoryEvents from push_and_persist and writes rows to
-            // memory + memory_vectors. memory_rx is moved here and consumed
-            // by the worker task for the app lifetime.
+            // Spawn the memory ingest worker. Receives MemoryEvents from
+            // push_and_persist and writes rows to memory + memory_vectors.
+            // memory_rx is moved here and consumed by the worker task for the
+            // app lifetime.
             crate::memory::worker::start_memory_worker(app.handle().clone(), memory_rx);
 
-            // Phase 5 RAG (REQ-STATE): access tracker lifecycle hook.
-            // The flush worker is already running (spawned inside AccessTracker::new()
-            // during AppState::new()). This call exists for lifecycle parity with
-            // start_memory_worker and is the Phase 8+ supervision extension point.
+            // Access tracker lifecycle hook. The flush worker is already
+            // running (spawned inside AccessTracker::new() during
+            // AppState::new()). This call exists for lifecycle parity with
+            // start_memory_worker and is the extension point for a future
+            // supervision/reconnect mechanism, should the flush worker ever
+            // need one.
             start_access_worker(app.handle().clone());
 
             // memoria-3-capas-fase-3: spawn the maintenance job (periodic
@@ -104,7 +112,7 @@ pub fn run() {
 }
 
 // ============================================================================
-// Phase 5 RAG — access tracker lifecycle hook
+// Access tracker lifecycle hook
 // ============================================================================
 
 /// Lifecycle hook called from `run()` after `start_memory_worker`.
@@ -112,13 +120,15 @@ pub fn run() {
 /// The access tracker flush worker is already running — it is spawned inside
 /// [`crate::memory::access::AccessTracker::new`] during `AppState::new()`.
 /// This function exists for lifecycle parity with `start_memory_worker` and
-/// is the extension point for Phase 8+ supervision / reconnect logic.
+/// is the extension point for a future supervision/reconnect mechanism,
+/// should the flush worker ever need one.
 fn start_access_worker(_app_handle: AppHandle) {
-    // No-op for Phase 5. The worker is alive for the duration of AppState.
+    // No-op today: the worker is already alive for the duration of AppState,
+    // spawned by AccessTracker::new() rather than by this hook.
 }
 
 // ============================================================================
-// Phase 2 RAG — embedder bootstrap orchestration
+// Embedder bootstrap orchestration
 // ============================================================================
 
 /// Translate a backend [`DownloadProgress`] into the wire-shape
@@ -214,6 +224,18 @@ type LoadEmbedderFn = Arc<
         + Sync,
 >;
 
+/// Type alias for the injectable embedding-contract verification seam.
+///
+/// Owned `(String, usize)` rather than `&dyn Embedder`: a borrow cannot live
+/// inside a `'static` future, and the owned pair also makes "compare only
+/// model_id + dim" structural in the signature itself instead of a
+/// convention callers have to remember.
+type ContractVerifyFn = Arc<
+    dyn Fn(String, usize) -> futures::future::BoxFuture<'static, Result<ContractStatus, String>>
+        + Send
+        + Sync,
+>;
+
 /// Public entry point used by both the setup hook and the
 /// [`commands::embedder::retry_embedder_download`] command. Spawns the
 /// embedder bootstrap on `tauri::async_runtime` and returns immediately.
@@ -231,6 +253,7 @@ pub(crate) fn start_embedder_bootstrap(app_handle: AppHandle) {
     let state = app_handle.state::<AppState>();
     let base_dir = state.base_dir.clone();
     let embedder_cell = state.embedder.clone();
+    let store = state.memory_store.clone();
     let sink = Arc::new(AppHandleSink {
         app: app_handle.clone(),
     });
@@ -243,9 +266,22 @@ pub(crate) fn start_embedder_bootstrap(app_handle: AppHandle) {
             .map(|local| Arc::new(local) as Arc<dyn Embedder>)
             .map_err(|e| e.to_string())
     });
+    // `state.memory_store` is the only place that sees both the app's
+    // `AppHandle` and the open store, so it is the only place that can build
+    // this closure — `run_embedder_bootstrap` itself stays store-agnostic
+    // and testable without a `MemoryStore` at all.
+    let verify: ContractVerifyFn = Arc::new(move |model_id, dim| {
+        let store = store.clone();
+        Box::pin(async move {
+            store
+                .ensure_embedding_contract(&model_id, dim)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    });
 
     tauri::async_runtime::spawn(async move {
-        run_embedder_bootstrap(base_dir, embedder_cell, sink, ensure, load).await;
+        run_embedder_bootstrap(base_dir, embedder_cell, sink, ensure, load, verify).await;
     });
 }
 
@@ -260,6 +296,7 @@ pub(crate) async fn run_embedder_bootstrap(
     sink: Arc<dyn EmbedderEventSink>,
     ensure: EnsureModelFn,
     load: LoadEmbedderFn,
+    verify: ContractVerifyFn,
 ) {
     if embedder_cell.get().is_some() {
         // Defensive: another bootstrap (or a test seed) already filled the
@@ -310,15 +347,76 @@ pub(crate) async fn run_embedder_bootstrap(
             let load_res =
                 tokio::task::spawn_blocking(move || load_fn(files)).await;
             match load_res {
+                // Verified AFTER load, not before: `load` is an injected
+                // closure (tests substitute `FakeEmbedder`), so `model_id`/
+                // `dimensions()` are only known once it has returned — a
+                // pre-load check would need a hardcoded model id and would
+                // be false in every test. The 470 MB download already
+                // happened inside `ensure` above regardless of the
+                // contract's outcome; a wasted download on a genuine
+                // mismatch is an accepted, named cost of this ordering.
                 Ok(Ok(arc)) => {
-                    // `.set` returns Err only if the cell is already filled —
-                    // survivable race; treat both outcomes as success.
-                    let _ = embedder_cell.set(arc);
-                    StreamEvent::EmbedderDownload {
-                        phase: "done".into(),
-                        bytes_downloaded: None,
-                        bytes_total: None,
-                        error: None,
+                    let model_id = arc.model_id().to_string();
+                    let dim = arc.dimensions();
+                    match verify(model_id, dim).await {
+                        Ok(ContractStatus::Match) | Ok(ContractStatus::Initialized) => {
+                            // `.set` returns Err only if the cell is already filled —
+                            // survivable race; treat both outcomes as success.
+                            let _ = embedder_cell.set(arc);
+                            StreamEvent::EmbedderDownload {
+                                phase: "done".into(),
+                                bytes_downloaded: None,
+                                bytes_total: None,
+                                error: None,
+                            }
+                        }
+                        Ok(ContractStatus::Mismatch {
+                            stored_model_id,
+                            stored_dim,
+                            actual_model_id,
+                            actual_dim,
+                        }) => {
+                            // Cell stays empty — the existing fail-soft reads in
+                            // worker.rs and prompt_builder.rs already treat an
+                            // empty cell as "memory disabled", so this needs no
+                            // new degraded-mode logic of its own.
+                            log::warn!(
+                                "embedding contract mismatch: store holds vectors from \
+                                 '{stored_model_id}' (dim {stored_dim}), active embedder is \
+                                 '{actual_model_id}' (dim {actual_dim}); memory reads/writes \
+                                 are disabled until this is resolved"
+                            );
+                            StreamEvent::EmbedderDownload {
+                                phase: "error".into(),
+                                bytes_downloaded: None,
+                                bytes_total: None,
+                                error: Some(format!(
+                                    "embedding contract mismatch: the store has vectors from \
+                                     '{stored_model_id}' (dim {stored_dim}), but the active \
+                                     embedder is '{actual_model_id}' (dim {actual_dim}); memory \
+                                     is disabled until the mismatch is resolved — retrying will \
+                                     not fix this"
+                                )),
+                            }
+                        }
+                        Err(e) => {
+                            // Fail-closed: a contract we could not verify is a
+                            // contract we cannot trust, same as an explicit
+                            // mismatch. Not permanent — the next app start or
+                            // manual retry re-runs the whole bootstrap.
+                            log::warn!(
+                                "embedding contract verification failed: {e}; treating as a \
+                                 mismatch (fail-closed)"
+                            );
+                            StreamEvent::EmbedderDownload {
+                                phase: "error".into(),
+                                bytes_downloaded: None,
+                                bytes_total: None,
+                                error: Some(format!(
+                                    "embedding contract verification failed: {e}"
+                                )),
+                            }
+                        }
                     }
                 }
                 Ok(Err(e)) => StreamEvent::EmbedderDownload {
@@ -347,13 +445,13 @@ pub(crate) async fn run_embedder_bootstrap(
 }
 
 // ============================================================================
-// Phase 2 RAG — translator + bootstrap factoring tests
+// Embedder bootstrap: progress-translator and lifecycle tests
 // ============================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ---------- T075: progress_to_stream_event ----------
+    // ---------- progress_to_stream_event ----------
 
     #[test]
     fn translates_start() {
@@ -455,15 +553,16 @@ mod tests {
         }
     }
 
-    // ---------- T085: start_embedder_bootstrap factoring ----------
+    // ---------- start_embedder_bootstrap factoring ----------
     //
     // Tauri's `AppHandle` cannot be constructed without a real Tauri runtime,
     // so the public `start_embedder_bootstrap` is verified by compile-time
     // correctness (the setup hook compiles) PLUS the parametric
     // `run_embedder_bootstrap` which is the unit-test seam: it accepts an
-    // injectable `EmbedderEventSink`, `EnsureModelFn`, and `LoadEmbedderFn`,
-    // so the full lifecycle (early-exit, happy path, error path, AND the
-    // forwarder→sink pipeline) can be asserted in-process without Tauri.
+    // injectable `EmbedderEventSink`, `EnsureModelFn`, `LoadEmbedderFn`, and
+    // `ContractVerifyFn`, so the full lifecycle (early-exit, happy path,
+    // error path, contract mismatch, AND the forwarder→sink pipeline) can be
+    // asserted in-process without Tauri.
 
     use crate::memory::embedder::FakeEmbedder;
     use crate::memory::model_download::{DownloadError, ModelFiles};
@@ -524,6 +623,14 @@ mod tests {
         }
     }
 
+    /// Test-only `ContractVerifyFn` that always reports a match — the
+    /// behavior every lifecycle test except the mismatch test itself wants,
+    /// so each one that reaches the seam gets a one-line "accept whatever
+    /// arrives" verifier instead of repeating the closure inline.
+    fn accept_contract() -> ContractVerifyFn {
+        Arc::new(|_model_id, _dim| Box::pin(async { Ok(ContractStatus::Match) }))
+    }
+
     #[tokio::test]
     async fn run_embedder_bootstrap_is_noop_when_cell_filled() {
         // Cell already seeded → bootstrap emits a single synthetic `done`
@@ -561,6 +668,7 @@ mod tests {
             sink_for_run,
             ensure,
             load,
+            accept_contract(),
         )
         .await;
 
@@ -608,8 +716,15 @@ mod tests {
         });
 
         let sink: Arc<dyn EmbedderEventSink> = Arc::new(MockSink::default());
-        run_embedder_bootstrap(std::env::temp_dir(), cell.clone(), sink, ensure, load)
-            .await;
+        run_embedder_bootstrap(
+            std::env::temp_dir(),
+            cell.clone(),
+            sink,
+            ensure,
+            load,
+            accept_contract(),
+        )
+        .await;
 
         assert_eq!(
             ensure_calls.load(Ordering::SeqCst),
@@ -674,6 +789,7 @@ mod tests {
             sink_for_run,
             ensure,
             load,
+            accept_contract(),
         )
         .await;
 
@@ -758,6 +874,7 @@ mod tests {
             sink_for_run,
             ensure,
             load,
+            accept_contract(),
         )
         .await;
 
@@ -775,5 +892,75 @@ mod tests {
             "no `done` events on the error path; got {phases:?}"
         );
         assert!(cell.get().is_none(), "OnceCell must stay empty on error");
+    }
+
+    /// On a contract mismatch, the bootstrap MUST NOT call `embedder_cell.set()`
+    /// (the empty `OnceCell` reuses the fail-soft path `worker.rs`/`prompt_builder.rs`
+    /// already have for "no embedder") and MUST terminate with an `error` event
+    /// carrying a message that identifies the mismatch — not a generic download
+    /// failure the user might think a retry can fix.
+    #[tokio::test]
+    async fn run_embedder_bootstrap_skips_set_on_contract_mismatch() {
+        let cell: Arc<once_cell::sync::OnceCell<Arc<dyn Embedder>>> =
+            Arc::new(once_cell::sync::OnceCell::new());
+
+        let ensure: EnsureModelFn =
+            Arc::new(move |_base, _progress| Box::pin(async move { Ok(empty_model_files()) }));
+        let load: LoadEmbedderFn = Arc::new(move |_files| {
+            Ok(Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>)
+        });
+        let verify: ContractVerifyFn = Arc::new(|_model_id, _dim| {
+            Box::pin(async move {
+                Ok(ContractStatus::Mismatch {
+                    stored_model_id: "multilingual-e5-small".into(),
+                    stored_dim: 384,
+                    actual_model_id: "fake-embedder".into(),
+                    actual_dim: 384,
+                })
+            })
+        });
+
+        let sink = Arc::new(MockSink::default());
+        let sink_for_run: Arc<dyn EmbedderEventSink> = sink.clone();
+        run_embedder_bootstrap(
+            std::env::temp_dir(),
+            cell.clone(),
+            sink_for_run,
+            ensure,
+            load,
+            verify,
+        )
+        .await;
+
+        assert!(
+            cell.get().is_none(),
+            "OnceCell must stay empty on a contract mismatch"
+        );
+
+        let events = sink.snapshot();
+        let phases: Vec<&str> = events.iter().map(phase_of_event).collect();
+        assert_eq!(
+            phases.last().copied(),
+            Some("error"),
+            "mismatch must terminate with `error`; got {phases:?}"
+        );
+        assert_eq!(
+            count_done_phases(&events),
+            0,
+            "no `done` events when the contract mismatches; got {phases:?}"
+        );
+        match events.last() {
+            Some(StreamEvent::EmbedderDownload {
+                error: Some(msg), ..
+            }) => {
+                assert!(
+                    msg.to_lowercase().contains("contract")
+                        || msg.to_lowercase().contains("mismatch"),
+                    "error message must identify a contract mismatch (not a generic \
+                     download failure a retry could fix), got: {msg}"
+                );
+            }
+            other => panic!("expected a terminal EmbedderDownload error event, got {other:?}"),
+        }
     }
 }

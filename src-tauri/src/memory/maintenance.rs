@@ -1,15 +1,16 @@
-//! Maintenance job — periodic inactivity-based tier demotion
-//! (memoria-3-capas-fase-3).
+//! Maintenance job — periodic inactivity-based tier demotion.
 //!
 //! Wires [`crate::memory::tier::demote_inactive`] (pure, previously unused)
 //! into a bulk `UPDATE` against `memory` ONLY, on a timer (`maintenance`
-//! module, Lote 3). 5th instance of the wrapper/core convention
+//! module). 5th instance of the wrapper/core convention
 //! (worker → resolver → extractor → episodic_writer → maintenance).
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::memory::clock::TimestampMs;
 use crate::memory::db::MemoryStore;
+use crate::memory::MemoryError;
 
 /// Startup delay before the first maintenance pass: long enough to let the
 /// initial-ingest burst (embedder model download + `memory_worker` draining
@@ -26,15 +27,14 @@ pub(crate) const MAINTENANCE_PERIOD: Duration = Duration::from_secs(24 * 60 * 60
 /// `?1` is `now_ms`, computed in Rust (see [`run_maintenance_once`]) and
 /// bound here — NEVER via `strftime`. All producers (`access.rs::flush`,
 /// `worker.rs`, `episodic_writer.rs`) store `last_accessed_at` in
-/// MILLISECONDS since UNIX epoch. `search.rs:83` treats it as SECONDS
-/// (`strftime('%s','now') - m.last_accessed_at`) — a PRE-EXISTING unit
-/// mismatch bug, out of scope here and tracked by the future
-/// `fix-decay-unit-mismatch` change. Do NOT copy that pattern.
+/// MILLISECONDS since UNIX epoch, and this pass divides that stamp by the
+/// same millisecond day constant the retrieval queries use, so this pass
+/// and retrieval agree on the unit.
 ///
 /// The `WHERE tier < 3 AND demote_tier(...) <> tier` guard means only rows
 /// that actually change tier get their `last_modified_at` bumped — avoids
 /// stamping every tier<3 row (and the WAL churn that would cause) on every
-/// pass, and scopes the statement to `memory` ONLY (R3 — `episodic_trajectory`
+/// pass, and scopes the statement to `memory` ONLY (`episodic_trajectory`
 /// / `procedural_skill` are never touched by this job).
 const DEMOTE_SQL: &str = "\
     UPDATE memory \
@@ -49,10 +49,7 @@ const DEMOTE_SQL: &str = "\
 /// and handed to [`run_maintenance_once_at`] — a single consistent "now"
 /// per pass.
 pub(crate) async fn run_maintenance_once(store: &MemoryStore) {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
+    let now_ms = TimestampMs::now();
 
     run_maintenance_once_at(store, now_ms).await;
 }
@@ -66,8 +63,8 @@ pub(crate) async fn run_maintenance_once(store: &MemoryStore) {
 /// the boundary and demotes spuriously.
 ///
 /// Never panics: a recoverable DB error is logged via `log::warn!` and the
-/// call returns — the caller (the maintenance loop, Lote 3) keeps ticking.
-pub(crate) async fn run_maintenance_once_at(store: &MemoryStore, now_ms: i64) {
+/// call returns — the caller (the maintenance loop) keeps ticking.
+pub(crate) async fn run_maintenance_once_at(store: &MemoryStore, now_ms: TimestampMs) {
     if let Err(e) = store
         .conn
         .call(move |c| c.execute(DEMOTE_SQL, rusqlite::params![now_ms]))
@@ -75,6 +72,92 @@ pub(crate) async fn run_maintenance_once_at(store: &MemoryStore, now_ms: i64) {
     {
         log::warn!("maintenance: bulk tier demotion failed: {e}");
     }
+
+    // Placed after the demotion pass so the counts describe the post-pass
+    // state. A query failure here logs and returns like the demotion above —
+    // losing one day's corpus-size log line is not worth stopping the loop.
+    match count_rows(store).await {
+        Ok(counts) => {
+            log::info!(
+                "corpus live/total memory={}/{} episodic={}/{} procedural={}/{}",
+                counts.memory.live,
+                counts.memory.total,
+                counts.episodic.live,
+                counts.episodic.total,
+                counts.procedural.live,
+                counts.procedural.total,
+            );
+        }
+        Err(e) => log::warn!("maintenance: row count query failed: {e}"),
+    }
+}
+
+/// Total vs. live (`deleted_at IS NULL`) row count for one table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RowCounts {
+    pub(crate) total: i64,
+    pub(crate) live: i64,
+}
+
+/// Row counts for all three memory tables, queried once per maintenance pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TableRowCounts {
+    pub(crate) memory: RowCounts,
+    pub(crate) episodic: RowCounts,
+    pub(crate) procedural: RowCounts,
+}
+
+/// Two narrow `SELECT COUNT(*)` statements per table rather than one
+/// `SUM(deleted_at IS NULL)`: the bare count rides `idx_memory_last_accessed`
+/// (`V1__init.sql`, the only non-partial index on `memory`) as a
+/// covering-index scan, and the live count rides the partial
+/// `idx_memory_agent_active` (`WHERE deleted_at IS NULL`) exactly. Folding
+/// both into one `SUM` expression forces a full table scan instead, because
+/// `deleted_at` sits in neither index's payload — verified with `EXPLAIN
+/// QUERY PLAN` against this schema: the two-statement form scans via
+/// `COVERING INDEX idx_memory_last_accessed` and `INDEX
+/// idx_memory_agent_active` respectively, while the folded `SUM` form falls
+/// back to a bare `SCAN memory`.
+///
+/// Reporting only the live count would understate what this telemetry
+/// exists to measure: soft deletion never removes the corresponding vector
+/// row (no `DELETE FROM memory_vectors`, or the episodic/procedural
+/// equivalents, exists anywhere in this codebase), so a soft-deleted row
+/// keeps costing the brute-force vec0 scan even though it can no longer be
+/// retrieved. The gap between `total` and `live` is exactly that dead
+/// weight.
+pub(crate) async fn count_rows(store: &MemoryStore) -> Result<TableRowCounts, MemoryError> {
+    store
+        .conn
+        .call(|c| -> rusqlite::Result<TableRowCounts> {
+            let count = |sql: &str| -> rusqlite::Result<i64> { c.query_row(sql, [], |r| r.get(0)) };
+            Ok(TableRowCounts {
+                memory: RowCounts {
+                    total: count("SELECT COUNT(*) FROM memory")?,
+                    live: count("SELECT COUNT(*) FROM memory WHERE deleted_at IS NULL")?,
+                },
+                episodic: RowCounts {
+                    total: count("SELECT COUNT(*) FROM episodic_trajectory")?,
+                    live: count(
+                        "SELECT COUNT(*) FROM episodic_trajectory WHERE deleted_at IS NULL",
+                    )?,
+                },
+                procedural: RowCounts {
+                    total: count("SELECT COUNT(*) FROM procedural_skill")?,
+                    live: count(
+                        "SELECT COUNT(*) FROM procedural_skill WHERE deleted_at IS NULL",
+                    )?,
+                },
+            })
+        })
+        .await
+        .map_err(|e| match e {
+            tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
+            tokio_rusqlite::Error::ConnectionClosed => {
+                MemoryError::Backend("connection closed during count_rows".into())
+            }
+            other => MemoryError::Backend(other.to_string()),
+        })
 }
 
 /// Drives [`run_maintenance_once`] on a timer: fires the first pass
@@ -127,6 +210,7 @@ const _: fn() = || {
 
 #[cfg(test)]
 mod tests {
+    use crate::memory::clock::TimestampMs;
     use crate::memory::db::MemoryStore;
     use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -134,11 +218,8 @@ mod tests {
 
     /// Current wall-clock time in milliseconds since UNIX epoch — same
     /// formula used in production (`run_maintenance_once`, `access.rs::flush`).
-    fn now_ms() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64
+    fn now_ms() -> TimestampMs {
+        TimestampMs::now()
     }
 
     /// Monotonic counter to keep `episodic_trajectory.session_id` (UNIQUE)
@@ -155,8 +236,11 @@ mod tests {
     /// the 1ms-under-boundary offsets are racy otherwise.
     /// `last_modified_at`/`created_at` are seeded at `0` so tests can
     /// assert "untouched" by checking they stay `0`.
-    async fn seed_row(store: &MemoryStore, table: &str, tier: i64, importance: f64, now: i64, offset_ms: i64) -> i64 {
-        let last_accessed_at = now + offset_ms;
+    async fn seed_row(store: &MemoryStore, table: &str, tier: i64, importance: f64, now: TimestampMs, offset_ms: i64) -> i64 {
+        // Adding a millisecond offset to an instant leaves the type, because the
+        // instant deliberately exposes no arithmetic — every value enters it through a
+        // named constructor so the unit is written at each construction site.
+        let last_accessed_at = now.as_millis_i64() + offset_ms;
         let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
         let table = table.to_string();
         store
@@ -233,7 +317,38 @@ mod tests {
             .unwrap()
     }
 
-    // ── Task 2.2 — tier1, importance<9, >90 days → tier 2 ───────────────────
+    /// Polls `tier_of(store, "memory", id)` until it equals `want`, bounded by
+    /// `budget` of REAL wall-clock time (`std::time::Instant`, never
+    /// `tokio::time`). These loop tests run under a PAUSED tokio clock
+    /// (`#[tokio::test(start_paused = true)]`); `tokio::time::sleep` auto-advances
+    /// that virtual clock while paused, which would fire additional scheduled
+    /// `interval` ticks the test is deliberately trying to hold still — so this
+    /// polls with `tokio::task::yield_now()` (never touches the clock) and times
+    /// the budget against the OS clock instead. `run_maintenance_loop` drives its
+    /// pass through `store.conn` (`tokio_rusqlite`), which dispatches to a real
+    /// background OS thread — a fixed `yield_now` count is not a synchronization
+    /// primitive for that hop, so this bounds the wait instead of guessing a
+    /// count (see obs #1582 / `sdd/rag-pool-telemetry/flake-fix`).
+    async fn await_tier(
+        store: &MemoryStore,
+        id: i64,
+        want: i64,
+        budget: std::time::Duration,
+    ) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            let got = tier_of(store, "memory", id).await;
+            if got == want {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "tier stayed at {got}, expected {want}, after {budget:?} of real time"
+                ));
+            }
+            tokio::task::yield_now().await;
+        }
+    }
 
     #[tokio::test]
     async fn tier1_low_importance_over_90_days_demotes_to_2() {
@@ -245,8 +360,6 @@ mod tests {
 
         assert_eq!(tier_of(&store, "memory", id).await, 2);
     }
-
-    // ── Task 2.3 — tier1, importance<9, <90 days → unchanged, last_modified_at intact ──
 
     #[tokio::test]
     async fn tier1_low_importance_under_90_days_unchanged_last_modified_intact() {
@@ -265,8 +378,6 @@ mod tests {
             "last_modified_at must stay untouched (0) when the guard skips the row"
         );
     }
-
-    // ── Task 2.4 — tier2, >180 days → tier 3 ─────────────────────────────────
 
     #[tokio::test]
     async fn tier2_over_180_days_demotes_to_3() {
@@ -294,8 +405,6 @@ mod tests {
         assert_eq!(tier_of(&store, "memory", id).await, 2, "must NOT demote before 180 days");
     }
 
-    // ── Task 2.5 — tier1, importance>=9.0 (pivotal), 365 days → NEVER demotes ──
-
     #[tokio::test]
     async fn tier1_pivotal_importance_never_demotes() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -306,8 +415,6 @@ mod tests {
 
         assert_eq!(tier_of(&store, "memory", id).await, 1, "importance >= 9.0 must never demote");
     }
-
-    // ── Task 2.6 — tier3 rows are never touched (WHERE tier < 3 guard) ──────
 
     #[tokio::test]
     async fn tier3_row_untouched() {
@@ -324,9 +431,6 @@ mod tests {
         assert_eq!(tier_of(&store, "memory", id).await, 3);
         assert_eq!(last_modified_at_of(&store, "memory", id).await, 0);
     }
-
-    // ── Task 2.7 (R3) — only `memory` is scoped; episodic_trajectory / ──────
-    // ── procedural_skill stay untouched even with identical demotable rows ──
 
     #[tokio::test]
     async fn only_memory_table_is_demoted_other_tables_untouched() {
@@ -352,15 +456,12 @@ mod tests {
         );
     }
 
-    // ── Lote 3 — timer/loop ──────────────────────────────────────────────────
-
     use std::sync::Arc;
     use std::time::Duration;
 
-    // Task 3.1 + 3.2 — interval_at's first tick fires at now+startup_delay,
-    // NOT at t=0: asserts NO change before any clock advance (anti
-    // false-green), then asserts the first pass DOES fire once startup_delay
-    // elapses.
+    // interval_at's first tick fires at now+startup_delay, NOT at t=0:
+    // asserts NO change before any clock advance (anti false-green), then
+    // asserts the first pass DOES fire once startup_delay elapses.
     #[tokio::test(start_paused = true)]
     async fn loop_does_not_fire_before_startup_delay_then_fires_first_pass_after_delay() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -388,20 +489,15 @@ mod tests {
 
         // Advance past startup_delay=1s.
         tokio::time::advance(Duration::from_secs(2)).await;
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            tier_of(&store, "memory", id).await,
-            2,
-            "first pass must fire once startup_delay elapses"
-        );
+        await_tier(&store, id, 2, Duration::from_secs(5))
+            .await
+            .expect("first pass must fire once startup_delay elapses");
 
         handle.abort();
     }
 
-    // Task 3.3 — a second pass fires ONLY after a full `period` has elapsed
-    // since the first tick, not before.
+    // A second pass fires ONLY after a full `period` has elapsed since the
+    // first tick, not before.
     //
     // Strategy: ONE row, seeded ONCE before spawning (no `conn.call` is ever
     // interleaved between `advance()` calls while the loop task is
@@ -433,32 +529,27 @@ mod tests {
 
         // ONE jump past startup_delay (1s) but well below the next deadline
         // (startup_delay + period = 61s) — tick 1 fires, tick 2 must NOT.
+        // Polling until tier==2 here is still sound as an anti-false-green
+        // check for tick 2: the virtual clock only sits at t=32s (advance()
+        // moved it, yield_now never does), so tick 2 — scheduled at t=61s —
+        // cannot structurally have fired yet, regardless of how long this
+        // poll takes in real time.
         tokio::time::advance(Duration::from_secs(32)).await;
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            tier_of(&store, "memory", id).await,
-            2,
-            "only tick 1 must have fired by t=32s (tier 1→2), tick 2 (t=61s) must NOT fire yet"
-        );
+        await_tier(&store, id, 2, Duration::from_secs(5))
+            .await
+            .expect("only tick 1 must have fired by t=32s (tier 1→2), tick 2 (t=61s) must NOT fire yet");
 
         // Complete the period (total elapsed since spawn now > 61s) → tick 2
         // fires → tier 2→3.
         tokio::time::advance(Duration::from_secs(35)).await;
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            tier_of(&store, "memory", id).await,
-            3,
-            "second pass must fire once the full period elapses"
-        );
+        await_tier(&store, id, 3, Duration::from_secs(5))
+            .await
+            .expect("second pass must fire once the full period elapses");
 
         handle.abort();
     }
 
-    // Task 4.3 — compile-time Send + 'static proof for the value(s) captured
+    // Compile-time Send + 'static proof for the value(s) captured
     // by the future passed to
     // tauri::async_runtime::spawn(run_maintenance_loop(store, delay, period)).
     #[test]
@@ -467,5 +558,43 @@ mod tests {
         s::<tauri::AppHandle>();
         s::<Arc<MemoryStore>>();
         s::<Duration>();
+    }
+
+    // ── count_rows ────────────────────────────────────────────────────────
+    //
+    // Asserts the struct directly, matching the pure-formatter convention
+    // used elsewhere in this codebase (e.g. `format_tier_distribution`) — no
+    // log capture needed.
+
+    #[tokio::test]
+    async fn count_rows_reports_live_and_total_separately() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let now = now_ms();
+
+        // 2 memory rows, one soft-deleted -> total 2, live 1.
+        let live_id = seed_row(&store, "memory", 3, 5.0, now, 0).await;
+        let deleted_id = seed_row(&store, "memory", 3, 5.0, now, 0).await;
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE memory SET deleted_at = 1 WHERE id = ?1",
+                    rusqlite::params![deleted_id],
+                )
+            })
+            .await
+            .unwrap();
+        let _ = live_id;
+
+        // 1 episodic row, not deleted -> total 1, live 1.
+        seed_row(&store, "episodic_trajectory", 3, 5.0, now, 0).await;
+
+        // 0 procedural rows -> total 0, live 0.
+
+        let counts = super::count_rows(&store).await.unwrap();
+
+        assert_eq!((counts.memory.total, counts.memory.live), (2, 1));
+        assert_eq!((counts.episodic.total, counts.episodic.live), (1, 1));
+        assert_eq!((counts.procedural.total, counts.procedural.live), (0, 0));
     }
 }

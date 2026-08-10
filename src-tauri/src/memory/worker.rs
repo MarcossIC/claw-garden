@@ -1,4 +1,4 @@
-//! Memory ingest worker (Phase 3 — REQ-WRK-001, REQ-WRK-002).
+//! Memory ingest worker.
 //!
 //! Spawned once at app startup from `lib.rs::run()` setup hook. Drains
 //! `MemoryEvent`s from the channel, selects the appropriate chunker, embeds
@@ -24,8 +24,9 @@ pub(crate) enum MemoryWorkerError {
     Embed(#[from] EmbedError),
     #[error("store insert failed: {0}")]
     Store(#[from] MemoryStoreError),
-    /// Reserved for Phase 4 where the code chunker might surface an explicit
-    /// "0 chunks produced" signal; currently the worker silently continues.
+    /// Reserved for a future code-chunker enhancement that surfaces an
+    /// explicit "0 chunks produced" signal; currently the worker silently
+    /// continues past an empty chunk list.
     #[allow(dead_code)]
     #[error("chunker produced 0 chunks for non-empty content")]
     EmptyChunks,
@@ -33,7 +34,12 @@ pub(crate) enum MemoryWorkerError {
 
 /// Top-level worker loop. One per app instance.
 ///
-/// Drains events FIFO. Failure isolation per chunk (see lifecycle §1 in design.md).
+/// Drains events FIFO. Each chunk's embed+insert is isolated: a failure on
+/// one chunk (an embed error other than `NotReady`/`WorkerGone`, or an
+/// insert error) is logged and the worker moves on to the next chunk without
+/// aborting the event; the embedder going away mid-stream (`NotReady` /
+/// `WorkerGone`) drops the rest of the current event's chunks but leaves the
+/// worker itself running for the next event.
 /// Exits cleanly when all `Sender`s are dropped (app shutdown).
 pub(crate) async fn memory_worker(
     mut rx: UnboundedReceiver<MemoryEvent>,
@@ -69,9 +75,12 @@ async fn process_event(
     chat_chunker: &Arc<ChatChunker>,
     code_chunker: &Arc<CodeChunker>,
 ) -> Result<(), MemoryWorkerError> {
-    // Source-first: Compaction-sourced events bypass select_chunker (and thus the
-    // LOCKED D8 Role::System→Skip guard) entirely — they always chunk via
-    // ChatChunker. All other sources keep the existing role-based routing.
+    // Source-first: Compaction-sourced events bypass select_chunker (and thus
+    // the Role::System→Skip rule that ordinarily drops system-authored
+    // content from ingestion) entirely — they always chunk via ChatChunker,
+    // because a compaction summary is deliberately synthesized content worth
+    // keeping regardless of which role produced the text it summarizes. All
+    // other sources keep the existing role-based routing.
     let chunks = if evt.source == MemorySource::Compaction {
         chat_chunker.chunk(&evt.content, 480)
     } else {
@@ -88,7 +97,11 @@ async fn process_event(
         return Ok(());
     }
 
-    // LOCKED D4 — embedder not ready: drop the entire event, no half-inserts.
+    // No embedder loaded yet (contract bootstrap still running, or
+    // permanently mismatched): drop the entire event rather than embedding
+    // only some of its chunks — a half-embedded event would be unrecoverable
+    // without tracking which chunks already made it in, so the whole event
+    // is dropped uniformly and cheaply instead.
     let Some(embedder) = embedder_cell.get().cloned() else {
         log::debug!(
             "embedder NotReady; dropping {} chunks for agent={}",
@@ -101,7 +114,10 @@ async fn process_event(
     for chunk in chunks {
         match embedder.embed(&chunk.text).await {
             Ok(vec) => {
-                // T14 [IMPL] REQ-05: contradiction hook — runs between embed and insert.
+                // The contradiction hook runs between embed and insert: it needs
+                // the freshly computed embedding to find near-duplicate candidates
+                // via KNN, and its result (which existing rows this chunk disputes)
+                // must be attached to the record before it is written, not after.
                 // detect_contradiction is async and requires &MemoryStore; Arc<MemoryStore>
                 // derefs to MemoryStore via Deref coercion.
                 let mut record = NewMemoryRecord::from_event_and_chunk(evt, &chunk);
@@ -223,7 +239,7 @@ mod tests {
             .expect("worker must not panic");
     }
 
-    // ── T05: spawn returns join handle ──────────────────────────────────────────
+    // ── Worker spawn returns a join handle usable for shutdown/panic detection ──
 
     #[tokio::test]
     async fn spawn_memory_worker_returns_join_handle() {
@@ -245,7 +261,7 @@ mod tests {
         assert!(result.unwrap().is_ok(), "worker must not panic");
     }
 
-    // ── T14: graceful shutdown + per-event error isolation ──────────────────────
+    // ── Graceful shutdown and per-event error isolation ──────────────────────
 
     #[tokio::test]
     async fn worker_exits_gracefully_when_all_senders_dropped() {
@@ -292,7 +308,7 @@ mod tests {
         assert_eq!(rows, 1, "expected 1 row for valid event; got {rows}");
     }
 
-    // ── T15: embedder gate (LOCKED D4) ──────────────────────────────────────────
+    // ── Embedder-not-ready gate: empty cell drops events without inserting ──────
 
     #[tokio::test]
     async fn embedder_cell_empty_no_rows_inserted() {
@@ -376,6 +392,46 @@ mod tests {
         assert_eq!(rows, 1, "expected 1 row (second event), got {rows}");
     }
 
+    /// An embedder that returns a vector containing NaN never reaches the
+    /// vec0 table: `store_insert.rs` routes every embedding through
+    /// `memory::vector::to_unit`, which rejects any non-finite component
+    /// before the transaction opens. The chunk is dropped, not the worker —
+    /// the same `Err` -> `log::warn!` + continue path already exercised by
+    /// `store_write_failure_worker_stays_alive` above handles it with no
+    /// NaN-specific branch anywhere in the worker loop.
+    #[tokio::test]
+    async fn nan_embedding_drops_chunk_worker_stays_alive() {
+        struct NanEmbedder;
+        #[async_trait::async_trait]
+        impl Embedder for NanEmbedder {
+            async fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {
+                Ok(vec![f32::NAN; 384])
+            }
+            fn dimensions(&self) -> usize {
+                384
+            }
+            fn model_id(&self) -> &str {
+                "nan-embedder"
+            }
+        }
+
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(NanEmbedder);
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        tx.send(make_event(Role::User, "hello", None, 1)).unwrap();
+        // Second event through the same worker proves the loop kept running
+        // past the rejected chunk instead of merely exiting cleanly on drop.
+        tx.send(make_event(Role::User, "still alive", None, 2)).unwrap();
+        drain_worker(tx, handle).await;
+
+        let rows = count_memory(&store).await;
+        assert_eq!(
+            rows, 0,
+            "NaN embedding must be rejected before any row is written; got {rows} rows"
+        );
+    }
+
     #[tokio::test]
     async fn store_write_failure_worker_stays_alive() {
         // Drop memory_vectors between events to cause insert failure.
@@ -404,7 +460,7 @@ mod tests {
         // Worker stayed alive (drain_worker didn't panic or timeout) — test passes.
     }
 
-    // ── T16: memory_type / created_by_type derivation ────────────────────────
+    // ── memory_type / created_by_type derivation from role and error flag ───
 
     #[tokio::test]
     async fn user_role_produces_chat_message_type_user_creator() {
@@ -490,7 +546,7 @@ mod tests {
         assert_eq!(cbt, "system");
     }
 
-    // ── T17: project_id flow-through ─────────────────────────────────────────
+    // ── project_id flow-through from event to stored row ─────────────────────
 
     #[tokio::test]
     async fn project_id_derived_from_path() {
@@ -534,7 +590,7 @@ mod tests {
         assert!(pid.is_none(), "expected NULL project_id, got {pid:?}");
     }
 
-    // ── T19: 5-turn E2E integration ───────────────────────────────────────────
+    // ── 5-turn end-to-end integration: a full chat exchange through the worker ──
 
     #[tokio::test]
     async fn e2e_5_turn_chat_produces_5_rows() {
@@ -676,7 +732,7 @@ mod tests {
         assert_eq!(null_count, 5, "all rows must have NULL project_id; got {null_count}");
     }
 
-    // ── T20: system_role / empty assistant tool-call filtering ────────────────
+    // ── system_role / empty assistant tool-call filtering ────────────────────
 
     #[tokio::test]
     async fn system_role_never_reaches_worker() {
@@ -732,7 +788,7 @@ mod tests {
         assert!(result2.is_some(), "non-empty assistant content must produce an event");
     }
 
-    // ── T18: compile-time Send + Sync guards ─────────────────────────────────
+    // ── Compile-time Send + Sync guards ──────────────────────────────────────
 
     #[test]
     fn memory_event_and_worker_types_are_send_sync() {
@@ -743,7 +799,7 @@ mod tests {
         _sync::<Arc<OnceCell<Arc<dyn Embedder>>>>();
     }
 
-    // ── T12/T13 [TEST] REQ-05: worker contradiction hook ─────────────────────
+    // ── Worker contradiction hook: disputed_against set on match, left None otherwise ──
 
     /// Helper: insert a memory row with a given embedding directly into the store.
     /// Uses tier=3, status='active' so it is visible to search.
@@ -775,8 +831,8 @@ mod tests {
             .unwrap()
     }
 
-    /// T12 — detect_contradiction returns non-empty ids → new row has
-    ///         disputed_against=Some(ids) and status='disputed'.
+    /// detect_contradiction returns non-empty ids → new row has
+    /// disputed_against=Some(ids) and status='disputed'.
     ///
     /// Strategy: send two identical events through the same worker.
     /// The first is inserted with status='active'. When the second arrives,
@@ -835,8 +891,8 @@ mod tests {
         );
     }
 
-    /// T13 — detect_contradiction returns empty → new row has
-    ///         disputed_against=None and status='active'.
+    /// detect_contradiction returns empty → new row has
+    /// disputed_against=None and status='active'.
     #[tokio::test]
     async fn worker_leaves_disputed_against_none_when_no_contradiction() {
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
@@ -863,7 +919,7 @@ mod tests {
         assert!(da.is_none(), "single event with no prior rows must have disputed_against=NULL");
     }
 
-    // ── T4-test (REQ-4 regression): D8 guard intact for non-Compaction System events ──
+    // ── Regression: the System→Skip guard still applies to non-Compaction events ──
 
     #[tokio::test]
     async fn system_role_with_chat_source_still_yields_zero_rows() {
@@ -883,10 +939,10 @@ mod tests {
         drain_worker(tx, handle).await;
 
         let rows = count_memory(&store).await;
-        assert_eq!(rows, 0, "Role::System + source=Chat must still Skip (D8 intact); got {rows}");
+        assert_eq!(rows, 0, "Role::System + source=Chat must still Skip; got {rows}");
     }
 
-    // ── T5-test (REQ-4): Compaction event bypasses D8, produces 1 session_summary row ──
+    // ── Compaction events bypass the System→Skip guard, producing 1 session_summary row ──
 
     #[tokio::test]
     async fn compaction_event_produces_one_session_summary_row() {
@@ -906,7 +962,7 @@ mod tests {
         drain_worker(tx, handle).await;
 
         let rows = count_memory(&store).await;
-        assert_eq!(rows, 1, "Compaction source must bypass D8 and insert exactly 1 row; got {rows}");
+        assert_eq!(rows, 1, "Compaction source must bypass the System→Skip guard and insert exactly 1 row; got {rows}");
 
         let (mt, vec_count): (String, i64) = store.conn
             .call(|c| -> Result<(String, i64), rusqlite::Error> {
@@ -926,6 +982,174 @@ mod tests {
             .unwrap();
         assert_eq!(mt, "session_summary", "expected memory_type='session_summary'; got {mt}");
         assert_eq!(vec_count, 1, "expected 1 matching memory_vectors row; got {vec_count}");
+    }
+
+    // ── Shared fixture: write two real messages, read them back ────────────
+
+    use crate::memory::prompt_builder::{
+        build_memory_prompt, SEP_LONGTERM_TEST, SEP_RECENT_TEST,
+    };
+    use crate::memory::search::{search_all_memories, RankedHit, SearchScope};
+    use crate::memory::workspace::WorkspaceManager;
+    use crate::models::chat::{current_time_millis, ChatMessage};
+
+    /// State shared by the two gates below: one fresh message and one a month
+    /// old, written through the real worker and read back through both
+    /// `search_all_memories` and `build_memory_prompt`. Not a test itself and
+    /// not gated behind either test's ignore reason — it exists so the write
+    /// path runs once instead of once per assertion group.
+    struct WrittenMemoryFixture {
+        hits: Vec<RankedHit>,
+        prompt: String,
+        fresh: ChatMessage,
+        stale: ChatMessage,
+    }
+
+    async fn write_fresh_and_stale_then_read_back() -> WrittenMemoryFixture {
+        const AGENT: &str = "agent-invariant";
+        const DAY_MS: u64 = 86_400_000;
+
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder = Arc::new(FakeEmbedder::default());
+        let (tx, handle) =
+            spawn_test_worker(Arc::clone(&store), embedder.clone() as Arc<dyn Embedder>).await;
+
+        let now_ms = current_time_millis();
+        let fresh = ChatMessage {
+            id: "msg-fresh".to_string(),
+            role: Role::User,
+            content: "el proyecto usa pnpm y no npm".to_string(),
+            tool_calls: None,
+            timestamp_ms: now_ms,
+            is_error: None,
+        };
+        let stale = ChatMessage {
+            id: "msg-stale".to_string(),
+            role: Role::User,
+            content: "el monorepo entero se instala con pnpm".to_string(),
+            tool_calls: None,
+            timestamp_ms: now_ms - 30 * DAY_MS,
+            is_error: None,
+        };
+
+        for msg in [&fresh, &stale] {
+            let evt = MemoryEvent::from_message(
+                AGENT.to_string(), None, msg, MemorySource::Chat,
+            )
+            .expect("a user message with content must produce an ingest event");
+            tx.send(evt).unwrap();
+        }
+
+        // Dropping the sender closes the channel; the worker's recv loop awaits each
+        // insert inline, so it can only observe the closed channel after the last
+        // write committed. Awaiting the handle is the barrier — no sleeping.
+        drain_worker(tx, handle).await;
+
+        let q_vec = embedder.embed(&fresh.content).await.unwrap();
+        let hits = search_all_memories(
+            &store, &q_vec, AGENT, SearchScope::all_default(), 10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            hits.len(), 2,
+            "both messages must come back as one row each; a different count means \
+             the chunker split them, which changes what the rest of this test measures"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let prompt = build_memory_prompt(
+            &store, &wm, Some(embedder.clone() as Arc<dyn Embedder>),
+            AGENT, None, &fresh.content, None,
+        )
+        .await
+        .unwrap();
+
+        WrittenMemoryFixture { hits, prompt, fresh, stale }
+    }
+
+    // A written memory has to render with a date a human could read and land in
+    // the right recency block. Nothing here names an instant: the two messages
+    // are stamped by the same clock production uses, one of them a month back,
+    // so the assertions cannot be satisfied by a fixture that happens to agree
+    // with a broken unit.
+    #[tokio::test]
+    async fn e2e_real_write_path_produces_sane_date_and_buckets() {
+        let fixture = write_fresh_and_stale_then_read_back().await;
+        let mut violations: Vec<String> = Vec::new();
+
+        // Every rendered hit opens with `[YYYY-MM-DD]`.
+        let years: Vec<i32> = fixture
+            .prompt
+            .lines()
+            .filter_map(|l| l.strip_prefix('['))
+            .filter_map(|l| l.split('-').next())
+            .filter_map(|y| y.parse::<i32>().ok())
+            .collect();
+        if years.len() != 2 {
+            violations.push(format!("expected one rendered date per hit, got {years:?}"));
+        }
+        for y in &years {
+            if !(2020..=2100).contains(y) {
+                violations.push(format!("rendered year {y} is not a date anyone lived through"));
+            }
+        }
+
+        match (
+            fixture.prompt.find(SEP_RECENT_TEST),
+            fixture.prompt.find(SEP_LONGTERM_TEST),
+        ) {
+            (Some(r), Some(l)) => {
+                if !fixture.prompt[r..l].contains(&fixture.fresh.content) {
+                    violations.push("the just-written message did not bucket as recent".into());
+                }
+                if !fixture.prompt[l..].contains(&fixture.stale.content) {
+                    violations.push("the month-old message did not bucket as long-term".into());
+                }
+            }
+            (Some(_), None) => violations.push(
+                "every hit bucketed as recent — the month-old message never reached long-term".into(),
+            ),
+            (None, _) => violations.push("no recent block was rendered at all".into()),
+        }
+
+        assert!(
+            violations.is_empty(),
+            "unit invariants violated:\n  - {}",
+            violations.join("\n  - ")
+        );
+    }
+
+    // A written memory's score has to land inside its own contract: strictly
+    // positive, never above one. The similarity factor is
+    // `cosine_from_l2_unit(distance)` (score.rs), which converts the raw L2
+    // distance between two UNIT vectors into exact cosine similarity and
+    // clamps it to `MAX(0.0, 1.0 - distance^2/2)` — both edges (insert and
+    // query) route through `to_unit` (vector.rs) before a distance is ever
+    // measured, so the similarity factor is structurally bounded in [0,1]
+    // rather than merely bounded for embeddings that happen to be close
+    // together. The remaining three multiplicative factors (decay,
+    // importance, dispute) are each already clamped to [0,1] on their own,
+    // so the product stays inside the contract too. This end-to-end test
+    // exercises a real write followed by a real read to prove the whole
+    // pipeline honors the bound, not just the UDF in isolation.
+    #[tokio::test]
+    async fn e2e_real_write_path_produces_bounded_score() {
+        let fixture = write_fresh_and_stale_then_read_back().await;
+        let mut violations: Vec<String> = Vec::new();
+
+        for h in &fixture.hits {
+            if !(h.score > 0.0 && h.score <= 1.0) {
+                violations.push(format!("score {} is outside (0.0, 1.0]", h.score));
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "score contract violated:\n  - {}",
+            violations.join("\n  - ")
+        );
     }
 
     // ── Test harnesses ───────────────────────────────────────────────────────
@@ -949,7 +1173,8 @@ mod tests {
         (tx, handle)
     }
 
-    /// Variant with optional embedder — None = empty cell (for D4 tests).
+    /// Variant with optional embedder — None = empty cell, for tests that
+    /// exercise the embedder-not-ready gate.
     pub(crate) async fn spawn_test_worker_opt(
         store: Arc<MemoryStore>,
         embedder: Option<Arc<dyn Embedder>>,

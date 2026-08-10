@@ -1,4 +1,4 @@
-/// Fire-and-forget access tracker for the RAG hot path (Phase 5, REQ-TRACK).
+/// Fire-and-forget access tracker for the RAG hot path.
 ///
 /// [`AccessTracker`] receives memory IDs via [`record`] from the retrieval hot
 /// path and forwards them to an async worker over an unbounded channel.  The
@@ -9,19 +9,21 @@
 ///
 /// * `UnboundedSender<Vec<i64>>` — sender-only public surface keeps the struct
 ///   `Send + Sync` without interior `Connection`/`Mutex`.  The hot path MUST
-///   NOT block; `UnboundedSender::send` never awaits (AD-1 in `design.md`).
+///   NOT block; `UnboundedSender::send` never awaits.
 /// * `record` is synchronous, infallible, and zero-copy beyond the `Vec<i64>`
-///   already owned by the caller (locked-b in `proposal.md`).
+///   already owned by the caller.
 /// * Empty vectors are discarded at `record` entry — no channel traffic for
 ///   no-op calls (TRACK-2).
 /// * Flush errors are logged via `log::warn!` and the worker continues —
-///   never panics (FLUSH-3, locked-c).
+///   never panics (FLUSH-3).
 ///
 /// [`record`]: AccessTracker::record
 
 use std::collections::HashMap;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_rusqlite::Connection;
+
+use crate::memory::clock::TimestampMs;
 
 /// Buffers retrieved memory IDs and forwards them to the async flush worker.
 pub(crate) struct AccessTracker {
@@ -51,9 +53,9 @@ impl AccessTracker {
             let mut buffer: Vec<i64> = Vec::new();
             // `interval_at(now + 30s, 30s)` — first tick fires 30 s after creation,
             // NOT immediately.  `interval(30s)` would fire an initial tick at t=0 which
-            // races non-deterministically with rx.recv() in select!, making T-07
-            // (size trigger) flaky: if the timer arm wins N times before buffer=500 it
-            // flushes a partial buffer and the final count is wrong.
+            // races non-deterministically with rx.recv() in select!, making the
+            // size-trigger flush test flaky: if the timer arm wins N times before
+            // buffer=500 it flushes a partial buffer and the final count is wrong.
             let start =
                 tokio::time::Instant::now() + std::time::Duration::from_secs(30);
             let mut interval =
@@ -111,17 +113,14 @@ impl AccessTracker {
 /// `compute_tier` is called inside the same statement (FLUSH-4).
 ///
 /// On error: logs via `log::warn!` and returns normally — the worker loop
-/// MUST continue, never panic (FLUSH-3, locked-c).
+/// MUST continue, never panic (FLUSH-3).
 async fn flush(conn: &Connection, buffer: Vec<i64>) {
     if buffer.is_empty() {
         return;
     }
 
     // Timestamp for this flush batch (milliseconds since UNIX epoch).
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
+    let now_ms = TimestampMs::now();
 
     // Coalesce: sum hits per unique ID (HashMap dedup — design §6:739).
     let mut deduped: HashMap<i64, i64> = HashMap::new();
@@ -130,7 +129,7 @@ async fn flush(conn: &Connection, buffer: Vec<i64>) {
     }
 
     // Build ordered (id, last_ts, hits) entries for VALUES clause.
-    let entries: Vec<(i64, i64, i64)> = deduped
+    let entries: Vec<(i64, TimestampMs, i64)> = deduped
         .into_iter()
         .map(|(id, hits)| (id, now_ms, hits))
         .collect();
@@ -160,7 +159,13 @@ async fn flush(conn: &Connection, buffer: Vec<i64>) {
         .flat_map(|(id, ts, hits)| {
             [
                 rusqlite::types::Value::Integer(*id),
-                rusqlite::types::Value::Integer(*ts),
+                // The batch is a dynamically built Vec<Value>, so the instant's ToSql impl
+                // never runs here — a Value has to already be an Integer. This is the only
+                // place the SQL bind boundary drops the type; every other bind in this module
+                // hands the typed value straight to params!. If you find yourself writing
+                // as_millis_i64() at another bind site, bind the typed value instead of copying
+                // this line.
+                rusqlite::types::Value::Integer(ts.as_millis_i64()),
                 rusqlite::types::Value::Integer(*hits),
             ]
         })
@@ -259,7 +264,48 @@ mod tests {
         .expect("seed_n_rows failed")
     }
 
-    // ── T-05-test: compile-time Send + Sync guard ────────────────────────────
+    /// Polls `access_count` for `row_id` until it equals `want`, bounded by
+    /// `budget` of REAL wall-clock time (`std::time::Instant`, never
+    /// `tokio::time`). FLUSH-1/FLUSH-2 run under a PAUSED tokio clock
+    /// (`#[tokio::test(start_paused = true)]`); `tokio::time::sleep` auto-advances
+    /// that virtual clock while paused, which would fire the 30s `interval` again
+    /// mid-poll — so this polls with `tokio::task::yield_now()` (never touches
+    /// the clock) and times the budget against the OS clock instead. The flush
+    /// worker drives its write through `conn` (`tokio_rusqlite`), which dispatches
+    /// to a real background OS thread — a fixed `yield_now` count is not a
+    /// synchronization primitive for that hop, so this bounds the wait instead of
+    /// guessing a count (see obs #1582 / `sdd/rag-pool-telemetry/flake-fix`).
+    async fn await_access_count(
+        conn: &Connection,
+        row_id: i64,
+        want: i64,
+        budget: std::time::Duration,
+    ) -> Result<i64, String> {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            let got: i64 = conn
+                .call(move |c| {
+                    c.query_row(
+                        "SELECT access_count FROM memory WHERE id = ?",
+                        [row_id],
+                        |r| r.get(0),
+                    )
+                })
+                .await
+                .unwrap();
+            if got == want {
+                return Ok(got);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "access_count stayed at {got}, expected {want}, after {budget:?} of real time"
+                ));
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    // ── Compile-time Send + Sync guard ────────────────────────────
     //
     // The `const _` guard above the impl block is the actual compile-time
     // assertion.  If `AccessTracker` were not `Send + Sync`, this file would
@@ -273,7 +319,7 @@ mod tests {
         _assert_send::<AccessTracker>();
     }
 
-    // ── T-05-test: TRACK-2 — empty vec is a no-op ───────────────────────────
+    // ── TRACK-2 — empty vec is a no-op ───────────────────────────
 
     #[test]
     fn record_empty_vec_sends_nothing_to_channel() {
@@ -303,7 +349,7 @@ mod tests {
         }
     }
 
-    // ── T-06-test: FLUSH-1 — timer trigger ───────────────────────────────────
+    // ── FLUSH-1 — timer trigger ───────────────────────────────────
     //
     // Uses `start_paused = true` so Tokio's clock only moves via
     // `tokio::time::advance`.  No real sleep or wall-clock delay.
@@ -331,30 +377,14 @@ mod tests {
         // Advance Tokio's mock clock past the 30 s threshold.
         tokio::time::advance(std::time::Duration::from_secs(31)).await;
 
-        // Let the worker process the second timer tick and complete the flush.
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-
-        let access_count: i64 = store
-            .conn
-            .call(move |c| {
-                c.query_row(
-                    "SELECT access_count FROM memory WHERE id = ?",
-                    [row_id],
-                    |r| r.get(0),
-                )
-            })
+        // Let the worker process the second timer tick and complete the flush —
+        // bounded poll, not a fixed yield count (see `await_access_count`).
+        await_access_count(&store.conn, row_id, 1, std::time::Duration::from_secs(5))
             .await
-            .unwrap();
-
-        assert_eq!(
-            access_count, 1,
-            "timer-triggered flush must increment access_count to 1; got {access_count}"
-        );
+            .expect("timer-triggered flush must increment access_count to 1");
     }
 
-    // ── T-07-test: FLUSH-2 — size trigger at ≥500 entries ────────────────────
+    // ── FLUSH-2 — size trigger at ≥500 entries ────────────────────
     //
     // Sends 500 records of the same ID (dedup → 1 row with 500 hits).
     // The flush MUST fire without advancing the clock.
@@ -375,34 +405,21 @@ mod tests {
             tracker.record(vec![row_id]);
         }
 
-        // Each `select!` iteration processes one message; we need 500+ yields
-        // for the worker to accumulate and flush.  Use generous headroom.
+        // Each `select!` iteration processes one message, so the worker needs
+        // many iterations to drain the channel before the size trigger fires —
+        // and the flush itself is a real cross-thread DB round trip. Bounded
+        // poll instead of a fixed yield count (see `await_access_count`);
         // (initial interval tick fires at t=0 with empty buffer → no flush;
         //  subsequent ticks require advance() which we never call → only size
         //  trigger can fire.)
-        for _ in 0..1_200 {
-            tokio::task::yield_now().await;
-        }
-
-        let access_count: i64 = store
-            .conn
-            .call(move |c| -> rusqlite::Result<i64> {
-                c.query_row(
-                    "SELECT access_count FROM memory WHERE id = ?",
-                    [row_id],
-                    |r| r.get(0),
-                )
-            })
+        await_access_count(&store.conn, row_id, 500, std::time::Duration::from_secs(5))
             .await
-            .unwrap();
-
-        assert_eq!(
-            access_count, 500,
-            "size-triggered flush must set access_count=500 (500 hits deduped to 1 row); got {access_count}"
-        );
+            .expect(
+                "size-triggered flush must set access_count=500 (500 hits deduped to 1 row)",
+            );
     }
 
-    // ── T-08-test: FLUSH-3 — DB error recovery ────────────────────────────────
+    // ── FLUSH-3 — DB error recovery ────────────────────────────────
     //
     // Drop `memory` table so the next flush fails.  Worker MUST log `log::warn!`
     // and continue — no panic, channel stays open.
@@ -434,7 +451,7 @@ mod tests {
         // Reaching here without panic means FLUSH-3 is satisfied.
     }
 
-    // ── T-08-test: FLUSH-4 — tier promotion in the SAME CTE UPDATE ───────────
+    // ── FLUSH-4 — tier promotion in the SAME CTE UPDATE ───────────
     //
     // Seeds a row with tier=2, access_count=2, memory_type='architectural_decision'.
     // After flush with 1 hit: access_count becomes 3 → compute_tier returns 1.
@@ -471,7 +488,7 @@ mod tests {
         );
     }
 
-    // ── T-09-test: TRACK-3 — 1000 concurrent record() calls ──────────────────
+    // ── TRACK-3 — 1000 concurrent record() calls ──────────────────
     //
     // Spawn 1000 tokio tasks each calling record().  All must complete without
     // stalling — UnboundedSender::send never blocks the caller (TRACK-3).
@@ -495,9 +512,9 @@ mod tests {
         // All 1000 tasks joined — no stall.
     }
 
-    // ── T-09-test: LIMIT-3 — 500-entry flush (1500 bind vars) ────────────────
+    // ── LIMIT-3 — 500-entry flush (1500 bind vars) ────────────────
     //
-    // Verifies that `set_limit(SQLITE_LIMIT_VARIABLE_NUMBER, 32766)` from T-04
+    // Verifies that `set_limit(SQLITE_LIMIT_VARIABLE_NUMBER, 32766)`
     // allows a single CTE UPDATE with 500 rows × 3 vars = 1500 bind variables.
     // Without the limit raise this would error at row 334 (default limit = 999).
 

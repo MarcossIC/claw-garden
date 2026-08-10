@@ -22,8 +22,10 @@ pub enum Scope {
 /// Every implementor provides access to the 12 shared fields defined by the
 /// memory schema (doc 6). The `table_kind` method identifies the source table.
 ///
-/// `disputed_against` returns the raw JSON string stored in the column (Phase 1).
-/// A typed `Vec<i64>` accessor is planned for Phase 5/6.
+/// `disputed_against` returns the raw JSON string exactly as the column holds
+/// it; `disputed_against_ids` parses it into `Vec<i64>`. Both exist: the raw
+/// form spares callers that only need "is this disputed at all" a JSON parse,
+/// and keeps a malformed value inspectable instead of collapsing it to None.
 pub trait MemoryRecord {
     fn id(&self) -> i64;
     fn scope(&self) -> &str;
@@ -38,7 +40,8 @@ pub trait MemoryRecord {
     fn status(&self) -> &str;
     fn dispute_count(&self) -> u32;
     /// Raw JSON array of disputed-against record IDs, or `None` if not disputed.
-    /// Phase 1 — typed `Vec<i64>` accessor ships Phase 5/6.
+    /// For the parsed form use `disputed_against_ids`, whose default implementation
+    /// is directly below.
     fn disputed_against(&self) -> Option<&str>;
     /// Typed accessor — parses raw `disputed_against` JSON into `Vec<i64>`.
     /// Keeps the raw `disputed_against()` for back-compat.
@@ -53,6 +56,15 @@ pub trait MemoryRecord {
 // ---------------------------------------------------------------------------
 // Row structs
 // ---------------------------------------------------------------------------
+
+// MemoryRow, EpisodicTrajectoryRow and ProceduralSkillRow keep bare i64
+// timestamps on purpose. Nothing outside this file builds them — they are
+// defined here, re-exported by the memory module, and constructed only by the
+// tests below. Giving their timestamps the millisecond newtype would put the
+// compiler on guard over a path that never runs, and the churn would land in a
+// review whose actual subject is the live retrieval path. If they ever get a
+// production caller, type them in that same change; until then you would be
+// paying for a guarantee nobody collects.
 
 /// A row from the `memory` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]

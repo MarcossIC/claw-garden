@@ -10,6 +10,11 @@
 
 use serde::{Deserialize, Serialize};
 
+// Only the test fixtures below build a RankedHit, and its timestamp field is a
+// typed instant. Production code here never constructs one — it only reads rows
+// this module queries itself — so the import is test-only.
+#[cfg(test)]
+use crate::memory::clock::TimestampMs;
 use crate::memory::search::RankedHit;
 use crate::memory::TableKind;
 use crate::memory::{MemoryError, MemoryStore};
@@ -75,6 +80,25 @@ pub(crate) fn format_tier1_coverage(workspace_present: bool, hit_count: usize) -
 pub(crate) fn format_skill_hits(hits: &[RankedHit]) -> String {
     let n = hits.iter().filter(|h| h.kind == TableKind::Procedural).count();
     format!("skill_hits={n}")
+}
+
+/// Renders requested against returned pool size per table (`memory`,
+/// `episodic`, `procedural`, in that order).
+///
+/// A returned count consistently below the requested one means rows are
+/// being dropped after the vector scan already committed to its candidates —
+/// the failure these two triples exist to expose. Neither number alone can
+/// show it: a low `returned` count is equally consistent with "the corpus
+/// genuinely has fewer matching rows" as with "another agent's rows starved
+/// the pool", so this only makes the symptom visible, not the diagnosis.
+pub(crate) fn format_pool_survival(
+    requested: (usize, usize, usize),
+    returned: (usize, usize, usize),
+) -> String {
+    format!(
+        "pool_req=({}+{}+{}) pool_ret=({}+{}+{})",
+        requested.0, requested.1, requested.2, returned.0, returned.1, returned.2,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +216,16 @@ pub(crate) async fn delete_memory_core(
 // requirement in spec.md). `summary` is the table-specific content column:
 // `content` (memory) | `task` (episodic) | `skill_name` (procedural).
 // ---------------------------------------------------------------------------
+
+// MemoryAdminRow, FailureHistogramRow and SkillStepsTrendRow keep bare i64
+// millisecond fields. They cross into the frontend through Serialize, and the
+// millisecond newtype the memory module uses internally deliberately implements
+// neither Serialize nor Deserialize: a tuple struct that derived it would emit
+// {"0":1700000000000} where the UI reads a bare number — it compiles, it runs,
+// and nothing logs. Leaving these three untyped is what turns that mistake into
+// a compile error instead of a wire-format surprise. If a timestamp here ever
+// needs the newtype it needs #[serde(transparent)] and a test asserting the
+// emitted JSON is a bare integer, in the same change.
 
 /// A single row from the `list_memories` inspection command, normalized
 /// across the 3 physical tables.
@@ -706,7 +740,7 @@ mod tests {
             status: "active".to_string(),
             score: 0.0,
             distance: 0.0,
-            created_at: 0,
+            created_at: TimestampMs::from_unix_millis(0),
         }
     }
 
@@ -736,6 +770,16 @@ mod tests {
         assert_eq!(
             format_tier1_coverage(false, 0),
             "tier1_present=false tier23_hits=0"
+        );
+    }
+
+    // ── format_pool_survival ──────────────────────────────────────────────
+
+    #[test]
+    fn format_pool_survival_renders_both_triples() {
+        assert_eq!(
+            format_pool_survival((30, 5, 5), (28, 5, 2)),
+            "pool_req=(30+5+5) pool_ret=(28+5+2)"
         );
     }
 
@@ -1111,7 +1155,7 @@ mod tests {
             status: "active".to_string(),
             score: 0.0,
             distance: 0.0,
-            created_at: 0,
+            created_at: TimestampMs::from_unix_millis(0),
         }
     }
 
@@ -1673,7 +1717,7 @@ mod tests {
             status: "active".to_string(),
             score: 0.0,
             distance: 0.0,
-            created_at: 0,
+            created_at: TimestampMs::from_unix_millis(0),
         }];
 
         assert_eq!(format_skill_hits(&hits), "skill_hits=1");

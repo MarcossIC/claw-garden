@@ -1,10 +1,10 @@
-//! Assembles the 4-block memory prefix for the system prompt (doc 6:1049-1073).
+//! Assembles the 4-block memory prefix for the system prompt.
 
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
 
 use crate::memory::{
     access::AccessTracker,
+    clock::TimestampMs,
     embedder::Embedder,
     search::{search_all_memories, RankedHit, SearchScope},
     workspace::WorkspaceManager,
@@ -23,8 +23,12 @@ const SEP_CONFLICTS: &str = "=== ACTIVE CONFLICTS (review needed) ===";
 /// Exposed for cross-module test assertions only.
 #[cfg(test)]
 pub(crate) const SEP_WORKSPACE_TEST: &str = SEP_WORKSPACE;
+#[cfg(test)]
+pub(crate) const SEP_RECENT_TEST: &str = SEP_RECENT;
+#[cfg(test)]
+pub(crate) const SEP_LONGTERM_TEST: &str = SEP_LONGTERM;
 
-const RECENT_WINDOW_SECS: i64 = 7 * 86_400;
+const RECENT_WINDOW_MS: i64 = 7 * 86_400_000;
 const K_FINAL: usize = 10;
 
 // ---------------------------------------------------------------------------
@@ -33,12 +37,12 @@ const K_FINAL: usize = 10;
 
 struct ConflictPair {
     old_id: i64,
-    old_created_at: i64,
+    old_created_at: TimestampMs,
     old_content: String,
     old_importance: f64,
     old_tier: i64,
     new_id: i64,
-    new_created_at: i64,
+    new_created_at: TimestampMs,
     new_content: String,
     new_importance: f64,
 }
@@ -52,8 +56,8 @@ struct ConflictPair {
 /// Returns `Ok(String::new())` when all four blocks would be empty.
 /// Each internal failure is degraded to "the matching block is empty".
 ///
-/// `access_tracker` is fired-and-forgotten after retrieval hits are assembled
-/// (REQ-TRACK, STATE-3).  Production callers pass `Some(&state.access_tracker)`;
+/// `access_tracker` is fired-and-forgotten after retrieval hits are assembled.
+/// Production callers pass `Some(&state.access_tracker)`;
 /// test callers pass `None` to skip recording.
 pub(crate) async fn build_memory_prompt(
     store: &MemoryStore,
@@ -100,19 +104,18 @@ pub(crate) async fn build_memory_prompt(
         }
     };
 
-    // Fire-and-forget access recording (REQ-TRACK, STATE-3).
+    // Fire-and-forget access recording.
     // Called AFTER hits are assembled — non-blocking, never awaits.
-    // `record` discards empty vecs internally (TRACK-2) so no extra guard needed.
+    // `record` discards empty vecs internally so no extra guard needed.
     if let Some(tracker) = access_tracker {
         tracker.record(hits.iter().map(|h| h.id).collect());
     }
 
-    // memoria-3-capas-fase-4 (Requirement: Tier-1 coverage logging) — the real
-    // measure of doc-7's "Tier 1 covers 80%" criterion (workspace_content
-    // presence alone, or hit count alone, can't answer it — both signals are
-    // needed together). Logged unconditionally, BEFORE `bucket_by_recency`
-    // consumes `hits` below. `log::info!` (vs search.rs's `log::debug!`) —
-    // this is the criterion's capturable signal.
+    // Tier-1 coverage logging — the real measure of the "Tier 1 covers 80%"
+    // criterion (workspace_content presence alone, or hit count alone, can't
+    // answer it — both signals are needed together). Logged unconditionally,
+    // BEFORE `bucket_by_recency` consumes `hits` below. `log::info!` (vs
+    // search.rs's `log::debug!`) — this is the criterion's capturable signal.
     log::info!(
         "{}",
         crate::commands::memory_admin::format_tier1_coverage(
@@ -121,22 +124,17 @@ pub(crate) async fn build_memory_prompt(
         )
     );
 
-    // trajectory-miner-fase-4 (Requirement: Skill-hit logging) — counts hits
-    // whose `kind == TableKind::Procedural`. Borrows `&hits` BEFORE
-    // `bucket_by_recency` moves `hits` below.
+    // Skill-hit logging — counts hits whose `kind == TableKind::Procedural`.
+    // Borrows `&hits` BEFORE `bucket_by_recency` moves `hits` below.
     log::info!(
         "{}",
         crate::commands::memory_admin::format_skill_hits(&hits)
     );
 
     // 3. Bucket hits into RECENT vs LONG-TERM.
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let (recent, longterm) = bucket_by_recency(hits, now_secs);
+    let (recent, longterm) = bucket_by_recency(hits, TimestampMs::now());
 
-    // 4. Fetch conflicts (always query; output conditional on D8).
+    // 4. Fetch conflicts (always query; CONFLICTS block emitted only when non-empty).
     let conflicts = fetch_active_conflicts(store, agent_id).await.unwrap_or_else(|e| {
         log::warn!("fetch_active_conflicts failed: {e}; CONFLICTS block omitted");
         Vec::new()
@@ -217,10 +215,19 @@ fn unix_secs_to_ymd(ts: i64) -> (i32, u32, u32) {
     (y as i32, m as u32, d as u32)
 }
 
+/// Converts a millisecond instant to a calendar date. Divides with
+/// `div_euclid` because `unix_secs_to_ymd` already floors explicitly for
+/// negative dates and truncation would land one day late; takes the
+/// timestamp type so the raw-integer call that rendered year 57,000 cannot
+/// be written.
+fn unix_millis_to_ymd(ts: TimestampMs) -> (i32, u32, u32) {
+    unix_secs_to_ymd(ts.as_millis_i64().div_euclid(1_000))
+}
+
 /// Formats a single retrieval hit into the canonical line format.
 /// `[YYYY-MM-DD] SOURCE: {kind:?} | TYPE: {memory_type}\nCONTENT: {content}`
 fn format_hit_line(hit: &RankedHit) -> String {
-    let (y, m, d) = unix_secs_to_ymd(hit.created_at);
+    let (y, m, d) = unix_millis_to_ymd(hit.created_at);
     format!(
         "[{y:04}-{m:02}-{d:02}] SOURCE: {:?} | TYPE: {}\nCONTENT: {}",
         hit.kind, hit.memory_type, hit.content
@@ -229,8 +236,8 @@ fn format_hit_line(hit: &RankedHit) -> String {
 
 /// Formats a conflict pair into the 4-line format from design §3.5.
 fn format_conflict_pair(p: &ConflictPair) -> String {
-    let (oy, om, od) = unix_secs_to_ymd(p.old_created_at);
-    let (ny, nm, nd) = unix_secs_to_ymd(p.new_created_at);
+    let (oy, om, od) = unix_millis_to_ymd(p.old_created_at);
+    let (ny, nm, nd) = unix_millis_to_ymd(p.new_created_at);
     format!(
         "[{oy:04}-{om:02}-{od:02}] OLD: \"{}\" [memory:{}, importance:{:.0}, tier:{}]\n\
          [{ny:04}-{nm:02}-{nd:02}] NEW: \"{}\" [memory:{}, importance:{:.0}, status:disputed]\n\
@@ -241,9 +248,12 @@ fn format_conflict_pair(p: &ConflictPair) -> String {
     )
 }
 
-/// Partitions hits into (recent, longterm) by `hit.created_at >= now_secs - RECENT_WINDOW_SECS`.
-fn bucket_by_recency(hits: Vec<RankedHit>, now_secs: i64) -> (Vec<RankedHit>, Vec<RankedHit>) {
-    let threshold = now_secs - RECENT_WINDOW_SECS;
+/// Partitions hits into (recent, longterm) at `now - RECENT_WINDOW_MS`. A stamp
+/// at or after the threshold is recent; the epoch or a negative stamp falls to
+/// long-term; a future stamp counts as recent rather than being clamped, so a
+/// skewed clock stays visible.
+fn bucket_by_recency(hits: Vec<RankedHit>, now: TimestampMs) -> (Vec<RankedHit>, Vec<RankedHit>) {
+    let threshold = TimestampMs::from_unix_millis(now.as_millis_i64().saturating_sub(RECENT_WINDOW_MS));
     let mut recent = Vec::new();
     let mut longterm = Vec::new();
     for h in hits {
@@ -344,9 +354,8 @@ async fn fetch_active_conflicts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{db::MemoryStore, embedder::Embedder, TableKind};
+    use crate::memory::{clock::TimestampMs, db::MemoryStore, embedder::Embedder, TableKind};
 
-    // T21-test: unix_secs_to_ymd
     #[test]
     fn unix_secs_zero_is_1970_01_01() {
         assert_eq!(unix_secs_to_ymd(0), (1970, 1, 1));
@@ -358,7 +367,26 @@ mod tests {
         assert_eq!(unix_secs_to_ymd(1_700_000_000), (2023, 11, 14));
     }
 
-    // T21-test: format_hit_line
+    #[test]
+    fn unix_millis_zero_is_1970_01_01() {
+        assert_eq!(unix_millis_to_ymd(TimestampMs::from_unix_millis(0)), (1970, 1, 1));
+    }
+
+    #[test]
+    fn unix_millis_known_epoch_to_date() {
+        // 1_700_000_000_000 ms = 2023-11-14 (verified known epoch)
+        assert_eq!(
+            unix_millis_to_ymd(TimestampMs::from_unix_millis(1_700_000_000_000)),
+            (2023, 11, 14)
+        );
+    }
+
+    #[test]
+    fn unix_millis_negative_is_correct_pre_1970_date() {
+        // -1 ms is the last millisecond of 1969-12-31.
+        assert_eq!(unix_millis_to_ymd(TimestampMs::from_unix_millis(-1)), (1969, 12, 31));
+    }
+
     #[test]
     fn format_hit_line_emits_canonical_format() {
         let hit = RankedHit {
@@ -370,7 +398,7 @@ mod tests {
             status: "active".to_string(),
             score: 0.9,
             distance: 0.1,
-            created_at: 1_700_000_000,
+            created_at: TimestampMs::from_unix_millis(1_700_000_000_000),
         };
         let line = format_hit_line(&hit);
         assert!(
@@ -380,12 +408,40 @@ mod tests {
         assert!(line.contains("CONTENT: test content"), "got: {line}");
     }
 
-    // T21-test: bucket_by_recency
+    #[test]
+    fn format_conflict_pair_renders_both_dates_in_sane_range() {
+        let pair = ConflictPair {
+            old_id: 1,
+            old_created_at: TimestampMs::from_unix_millis(1_690_000_000_000), // ~2023-07-22
+            old_content: "old fact".to_string(),
+            old_importance: 8.0,
+            old_tier: 2,
+            new_id: 2,
+            new_created_at: TimestampMs::from_unix_millis(1_700_000_000_000), // 2023-11-14
+            new_content: "new fact".to_string(),
+            new_importance: 8.0,
+        };
+        let line = format_conflict_pair(&pair);
+        let years: Vec<i32> = line
+            .lines()
+            .filter_map(|l| l.strip_prefix('['))
+            .filter_map(|l| l.split('-').next())
+            .filter_map(|y| y.parse::<i32>().ok())
+            .collect();
+        assert_eq!(years.len(), 2, "expected exactly 2 rendered dates, got: {line}");
+        for y in &years {
+            assert!(
+                (2020..=2100).contains(y),
+                "rendered year {y} is not a date anyone lived through: {line}"
+            );
+        }
+    }
+
     #[test]
     fn bucket_by_recency_splits_at_7_days() {
-        let now_secs: i64 = 1_700_000_000;
-        let recent_ts = now_secs - 86_400; // 1 day ago
-        let old_ts = now_secs - 30 * 86_400; // 30 days ago
+        let now_ms: i64 = 1_700_000_000_000;
+        let recent_ts = now_ms - 86_400_000; // 1 day ago
+        let old_ts = now_ms - 30 * 86_400_000; // 30 days ago
 
         let make_hit = |ts: i64| RankedHit {
             id: 0,
@@ -396,16 +452,72 @@ mod tests {
             status: "active".to_string(),
             score: 0.5,
             distance: 0.5,
-            created_at: ts,
+            created_at: TimestampMs::from_unix_millis(ts),
         };
 
         let hits = vec![make_hit(recent_ts), make_hit(recent_ts), make_hit(old_ts)];
-        let (recent, longterm) = bucket_by_recency(hits, now_secs);
+        let (recent, longterm) = bucket_by_recency(hits, TimestampMs::from_unix_millis(now_ms));
         assert_eq!(recent.len(), 2, "expected 2 recent hits");
         assert_eq!(longterm.len(), 1, "expected 1 longterm hit");
     }
 
-    // T22-test: fetch_active_conflicts
+    #[test]
+    fn bucket_by_recency_zero_timestamp_goes_to_longterm() {
+        let hit = RankedHit {
+            id: 0,
+            kind: TableKind::Memory,
+            content: String::new(),
+            memory_type: String::new(),
+            tier: 2,
+            status: "active".to_string(),
+            score: 0.5,
+            distance: 0.5,
+            created_at: TimestampMs::from_unix_millis(0),
+        };
+        let now_ms: i64 = 1_700_000_000_000;
+        let (recent, longterm) = bucket_by_recency(vec![hit], TimestampMs::from_unix_millis(now_ms));
+        assert_eq!(recent.len(), 0);
+        assert_eq!(longterm.len(), 1, "epoch timestamp must land in LONG-TERM");
+    }
+
+    #[test]
+    fn bucket_by_recency_negative_timestamp_goes_to_longterm() {
+        let hit = RankedHit {
+            id: 0,
+            kind: TableKind::Memory,
+            content: String::new(),
+            memory_type: String::new(),
+            tier: 2,
+            status: "active".to_string(),
+            score: 0.5,
+            distance: 0.5,
+            created_at: TimestampMs::from_unix_millis(-86_400_000),
+        };
+        let now_ms: i64 = 1_700_000_000_000;
+        let (recent, longterm) = bucket_by_recency(vec![hit], TimestampMs::from_unix_millis(now_ms));
+        assert_eq!(recent.len(), 0);
+        assert_eq!(longterm.len(), 1, "negative (pre-epoch) timestamp must land in LONG-TERM");
+    }
+
+    #[test]
+    fn bucket_by_recency_future_timestamp_goes_to_recent() {
+        let now_ms: i64 = 1_700_000_000_000;
+        let hit = RankedHit {
+            id: 0,
+            kind: TableKind::Memory,
+            content: String::new(),
+            memory_type: String::new(),
+            tier: 2,
+            status: "active".to_string(),
+            score: 0.5,
+            distance: 0.5,
+            created_at: TimestampMs::from_unix_millis(now_ms + 86_400_000),
+        };
+        let (recent, longterm) = bucket_by_recency(vec![hit], TimestampMs::from_unix_millis(now_ms));
+        assert_eq!(recent.len(), 1, "a future timestamp counts as recent rather than being clamped");
+        assert_eq!(longterm.len(), 0);
+    }
+
     #[tokio::test]
     async fn conflicts_query_zero_disputed_rows() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -473,8 +585,8 @@ mod tests {
         assert!(result.is_empty(), "json_each(NULL) should return zero rows, not error");
     }
 
-    // T-11-test: build_memory_prompt accepts Option<&AccessTracker> as last parameter.
-    // This test will FAIL TO COMPILE until T-11-impl adds the parameter (= RED).
+    // build_memory_prompt accepts Option<&AccessTracker> as its last parameter.
+    // This test intentionally fails to compile until that parameter is added (RED).
     #[tokio::test]
     async fn t11_build_memory_prompt_accepts_none_access_tracker() {
         use crate::memory::access::AccessTracker;
@@ -482,14 +594,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
-        // 7th argument `None::<&AccessTracker>` — must compile after T-11-impl.
+        // 7th argument `None::<&AccessTracker>` — must compile once the parameter exists.
         let result = build_memory_prompt(&store, &wm, None, "agent-1", None, "query", None::<&AccessTracker>)
             .await
             .unwrap();
         assert_eq!(result, "", "all empty → empty string");
     }
 
-    // T23-test: build_memory_prompt
     #[tokio::test]
     async fn all_empty_returns_empty_string() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -611,13 +722,10 @@ mod tests {
         let fake_vec = embedder.embed("dummy").await.unwrap();
         let fake_bytes = crate::memory::search::serialize_f32_query_pub(&fake_vec);
 
-        let now_secs: i64 = std::time::SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let now_ms: i64 = TimestampMs::now().as_millis_i64();
 
-        let recent_ts = now_secs - 86_400; // 1 day ago
-        let old_ts = now_secs - 30 * 86_400; // 30 days ago
+        let recent_ts = now_ms - 86_400_000; // 1 day ago
+        let old_ts = now_ms - 30 * 86_400_000; // 30 days ago
 
         // Insert 3 rows into memory with embeddings matching our fake embedder output
         // Tier 2+ to pass the tier > 1 filter in search
@@ -655,38 +763,38 @@ mod tests {
 
     #[tokio::test]
     async fn recent_longterm_split_by_7day_window() {
-        let now_secs: i64 = 1_700_000_000;
+        let now_ms: i64 = 1_700_000_000_000;
         let recent = vec![
-            RankedHit { id: 1, kind: TableKind::Memory, content: "r".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: now_secs - 86_400 },
+            RankedHit { id: 1, kind: TableKind::Memory, content: "r".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000) },
         ];
         let old = vec![
-            RankedHit { id: 2, kind: TableKind::Memory, content: "o".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: now_secs - 8 * 86_400 },
+            RankedHit { id: 2, kind: TableKind::Memory, content: "o".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 8 * 86_400_000) },
         ];
-        let (r, l) = bucket_by_recency(recent.into_iter().chain(old).collect(), now_secs);
+        let (r, l) = bucket_by_recency(recent.into_iter().chain(old).collect(), TimestampMs::from_unix_millis(now_ms));
         assert_eq!(r.len(), 1);
         assert_eq!(l.len(), 1);
     }
 
     #[tokio::test]
     async fn all_old_hits_go_to_longterm_only() {
-        let now_secs: i64 = 1_700_000_000;
+        let now_ms: i64 = 1_700_000_000_000;
         let hits = vec![
-            RankedHit { id: 1, kind: TableKind::Memory, content: "a".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: now_secs - 30 * 86_400 },
-            RankedHit { id: 2, kind: TableKind::Memory, content: "b".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: now_secs - 20 * 86_400 },
+            RankedHit { id: 1, kind: TableKind::Memory, content: "a".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 30 * 86_400_000) },
+            RankedHit { id: 2, kind: TableKind::Memory, content: "b".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 20 * 86_400_000) },
         ];
-        let (r, l) = bucket_by_recency(hits, now_secs);
+        let (r, l) = bucket_by_recency(hits, TimestampMs::from_unix_millis(now_ms));
         assert_eq!(r.len(), 0);
         assert_eq!(l.len(), 2);
     }
 
     #[tokio::test]
     async fn all_recent_hits_go_to_recent_only() {
-        let now_secs: i64 = 1_700_000_000;
+        let now_ms: i64 = 1_700_000_000_000;
         let hits = vec![
-            RankedHit { id: 1, kind: TableKind::Memory, content: "a".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: now_secs - 86_400 },
-            RankedHit { id: 2, kind: TableKind::Memory, content: "b".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: now_secs - 2 * 86_400 },
+            RankedHit { id: 1, kind: TableKind::Memory, content: "a".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000) },
+            RankedHit { id: 2, kind: TableKind::Memory, content: "b".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 2 * 86_400_000) },
         ];
-        let (r, l) = bucket_by_recency(hits, now_secs);
+        let (r, l) = bucket_by_recency(hits, TimestampMs::from_unix_millis(now_ms));
         assert_eq!(r.len(), 2);
         assert_eq!(l.len(), 0);
     }
@@ -703,13 +811,10 @@ mod tests {
         let fake_vec = embedder.embed("dummy").await.unwrap();
         let fake_bytes = crate::memory::search::serialize_f32_query_pub(&fake_vec);
 
-        let now_secs: i64 = std::time::SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let now_ms: i64 = TimestampMs::now().as_millis_i64();
 
-        let recent_ts = now_secs - 86_400;
-        let old_ts = now_secs - 30 * 86_400;
+        let recent_ts = now_ms - 86_400_000;
+        let old_ts = now_ms - 30 * 86_400_000;
 
         // 3 chat_message rows (2 recent + 1 old)
         for (ts, content) in &[(recent_ts, "chat recent 1"), (recent_ts, "chat recent 2"), (old_ts, "chat old 1")] {

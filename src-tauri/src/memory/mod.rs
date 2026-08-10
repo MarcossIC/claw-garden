@@ -14,15 +14,12 @@
 //! thread). Therefore, callers may `.clone()` the store freely and the outer `Arc` in
 //! `AppState` is only a cheap reference-count, not exclusion.
 //!
-//! # `disputed_against` in Phase 1
+//! # `disputed_against`
 //!
-//! The `disputed_against` column stores a JSON array of `i64` IDs as raw TEXT. Phase 1
-//! returns this column as `Option<&str>` from [`MemoryRecord::disputed_against`]. A typed
-//! `Vec<i64>` accessor is planned for Phase 5/6 of the roadmap (see doc 6).
-//!
-//! # Roadmap pointer
-//!
-//! See the claw-garden RAG roadmap (doc 6) for the full Phase 1–7 plan.
+//! The `disputed_against` column stores a JSON array of `i64` IDs as raw TEXT.
+//! [`MemoryRecord::disputed_against`] hands back that raw string;
+//! [`MemoryRecord::disputed_against_ids`] parses it into `Vec<i64>`, returning
+//! `None` for NULL or malformed JSON rather than panicking.
 
 pub mod chunker;
 pub mod db;
@@ -43,6 +40,8 @@ pub use record::{
     EpisodicTrajectoryRow, MemoryRecord, MemoryRow, ProceduralSkillRow, Scope, TableKind,
 };
 
+pub(crate) mod clock;
+pub(crate) mod latency;
 pub(crate) mod access;
 pub(crate) mod score;
 pub(crate) mod tier;
@@ -55,3 +54,4 @@ pub(crate) mod extractor;
 pub(crate) mod episodic_writer;
 pub(crate) mod miner;
 pub(crate) mod maintenance;
+pub(crate) mod vector;

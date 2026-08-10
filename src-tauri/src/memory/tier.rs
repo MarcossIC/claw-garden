@@ -50,10 +50,17 @@ pub(crate) fn compute_tier(
 
 /// Applies inactivity-based demotion to a memory tier.
 ///
-/// Only called by autoDream (Phase 8+). Phase 5 delivers but does NOT invoke.
+/// Runs in production today: the maintenance pass wires this in through the
+/// demote_tier UDF and sweeps the memory table on a timer.
 ///
-/// Demote-only: the returned value is never numerically less than `current`
-/// (inactivity can only lower the tier, not raise it).
+/// Takes a day count as f64, never a timestamp — the subtraction that produces
+/// it happens inside the demotion SQL, one expression for the whole table.
+/// Handing this function a millisecond-typed instant instead would drag that
+/// arithmetic back into Rust and turn a single bulk UPDATE into a per-row round
+/// trip. The type discipline is worth a great deal; it is not worth that.
+///
+/// Demote-only: the returned value is never numerically less than
+/// `current_tier` (inactivity can only lower the tier, not raise it).
 pub(crate) fn demote_inactive(
     current_tier: i64,
     days_since_last_access: f64,

@@ -444,6 +444,19 @@ fn try_load_cached(cache_dir: &Path, files: &[FileSpec]) -> Option<ModelFiles> {
     })
 }
 
+/// Cache-presence probe that never touches the network: true iff every file
+/// in the manifest is already on disk with a matching SHA-256. Every other
+/// entry point into this module downloads on a cache miss, so a caller that
+/// only wants to know "is the model ready" without risking a multi-hundred-
+/// megabyte download as a side effect delegates to the same on-disk check
+/// [`ensure_model`] uses internally rather than a separate reimplementation
+/// that could drift from it.
+#[cfg(feature = "eval")]
+pub(crate) fn model_is_cached(base_dir: &Path) -> bool {
+    let cache_dir = base_dir.join("models").join("multilingual-e5-small");
+    try_load_cached(&cache_dir, &ALL_FILES).is_some()
+}
+
 /// Identical to [`try_load_cached`] but turns a missing file or SHA mismatch
 /// into an `Err` (used post-download, when every file MUST be present).
 fn load_cached_or_err(

@@ -1,0 +1,224 @@
+{
+  "corpus": [
+    {
+      "ref": "c01",
+      "content": "Decidimos usar rusqlite con la extensión vec0 para el KNN de memoria en vez de un servicio externo de embeddings, para no depender de red en producción.",
+      "memory_type": "architectural_decision",
+      "importance": 6.5,
+      "lang": "es"
+    },
+    {
+      "ref": "c02",
+      "content": "We decided to encode timestamps as TimestampMs (i64 milliseconds) instead of raw u64 seconds, to remove the unit-mismatch bug across the memory tier decay logic.",
+      "memory_type": "architectural_decision",
+      "importance": 7.0,
+      "lang": "en"
+    },
+    {
+      "ref": "c03",
+      "content": "Sesion del 20 de julio: implementamos el resolver de tres capas de memoria y dejamos pendiente el harness de evaluacion de retrieval.",
+      "memory_type": "session_summary",
+      "importance": 5.0,
+      "lang": "es"
+    },
+    {
+      "ref": "c04",
+      "content": "Session 2026-07-22: wired the trajectory miner and fixed a race condition in the maintenance worker's demote pass.",
+      "memory_type": "session_summary",
+      "importance": 5.5,
+      "lang": "en"
+    },
+    {
+      "ref": "c05",
+      "content": "cargo test --lib fallo con 'linker `link.exe` not found' porque faltaba el Build Tools de Visual Studio en la maquina nueva.",
+      "memory_type": "tool_error",
+      "importance": 4.0,
+      "lang": "es"
+    },
+    {
+      "ref": "c06",
+      "content": "npm install failed with EACCES because the global node_modules directory was owned by root after a previous sudo install.",
+      "memory_type": "tool_error",
+      "importance": 4.0,
+      "lang": "en"
+    },
+    {
+      "ref": "c07",
+      "content": "El usuario planteo una duda sobre por que el indice vec0 usa distancia L2 en vez de similitud coseno, y si eso rompe la curva de contradiccion.",
+      "memory_type": "chat_message",
+      "importance": 3.0,
+      "lang": "es"
+    },
+    {
+      "ref": "c08",
+      "content": "The user asked why FakeEmbedder doesn't normalize its output vectors, and whether that throws off the contradiction threshold sweep.",
+      "memory_type": "chat_message",
+      "importance": 3.0,
+      "lang": "en"
+    },
+    {
+      "ref": "c09",
+      "content": "El modelo de embeddings usado en produccion es multilingual-e5-small, con vectores de 384 dimensiones.",
+      "memory_type": "semantic_fact",
+      "importance": 4.5,
+      "lang": "es"
+    },
+    {
+      "ref": "c10",
+      "content": "El usuario prefiere que nunca se ejecute `cargo build` automaticamente despues de hacer cambios.",
+      "memory_type": "user_preference",
+      "importance": 6.0,
+      "lang": "es"
+    },
+    {
+      "ref": "c11",
+      "content": "The user prefers commit messages in Conventional Commits format, with no AI attribution trailer.",
+      "memory_type": "user_preference",
+      "importance": 5.0,
+      "lang": "en"
+    },
+    {
+      "ref": "c12",
+      "content": "Flagged as a pivotal architectural decision: the vec0 index measures raw L2 distance, not cosine similarity, and every downstream threshold assumes this.",
+      "memory_type": "architectural_decision",
+      "importance": 9.5,
+      "lang": "en"
+    },
+    {
+      "ref": "c13",
+      "content": "pub fn compute_tier(current: i64, importance: f64, access_count: i64, memory_type: &str) -> i64 { if importance >= 9.0 { return current.min(1); } ... }",
+      "memory_type": "code_block",
+      "importance": 3.5,
+      "lang": "en"
+    }
+  ],
+  "retrieval_cases": [
+    {
+      "query": "¿Por qué elegimos rusqlite con la extensión vec0 en vez de un servicio externo de embeddings?",
+      "corpus_refs": ["c01", "c05", "c09"],
+      "expected_refs": ["c01"]
+    },
+    {
+      "query": "Why did we adopt TimestampMs instead of raw u64 seconds for timestamps?",
+      "corpus_refs": ["c02", "c06", "c04"],
+      "expected_refs": ["c02"]
+    },
+    {
+      "query": "¿Qué se implementó en la sesión de memoria del 20 de julio?",
+      "corpus_refs": ["c03", "c01", "c07"],
+      "expected_refs": ["c03"]
+    },
+    {
+      "query": "What got fixed in the July 22 session involving the maintenance worker?",
+      "corpus_refs": ["c04", "c02", "c08"],
+      "expected_refs": ["c04"]
+    },
+    {
+      "query": "¿Por qué falló cargo test en la máquina nueva?",
+      "corpus_refs": ["c05", "c06", "c09"],
+      "expected_refs": ["c05"]
+    },
+    {
+      "query": "Why did npm install fail with a permissions error?",
+      "corpus_refs": ["c06", "c05", "c02"],
+      "expected_refs": ["c06"]
+    },
+    {
+      "query": "¿Qué preocupación planteó el usuario sobre la distancia L2 en el índice vec0?",
+      "corpus_refs": ["c07", "c08", "c09"],
+      "expected_refs": ["c07"]
+    },
+    {
+      "query": "What did the user ask about FakeEmbedder's output vectors?",
+      "corpus_refs": ["c08", "c07", "c01"],
+      "expected_refs": ["c08"]
+    },
+    {
+      "query": "¿Qué modelo de embeddings usa el sistema en producción?",
+      "corpus_refs": ["c09", "c05", "c02"],
+      "expected_refs": ["c09"]
+    },
+    {
+      "query": "Show me the tier promotion function that decides when a memory gets promoted to tier 1.",
+      "corpus_refs": ["c13", "c01", "c02"],
+      "expected_refs": ["c13"]
+    },
+    {
+      "query": "¿Qué preferencia tiene el usuario sobre ejecutar cargo build automáticamente?",
+      "corpus_refs": ["c10"],
+      "expected_refs": ["c10"],
+      "status": "known_red",
+      "blocked_by": "rag-tier-reachability"
+    },
+    {
+      "query": "What does the user prefer for commit message format and AI attribution?",
+      "corpus_refs": ["c11"],
+      "expected_refs": ["c11"],
+      "status": "known_red",
+      "blocked_by": "rag-tier-reachability"
+    },
+    {
+      "query": "What architectural decision was flagged as critically important regarding vec0's distance metric?",
+      "corpus_refs": ["c12"],
+      "expected_refs": ["c12"],
+      "status": "known_red",
+      "blocked_by": "rag-tier-reachability"
+    }
+  ],
+  "contradiction_pairs": [
+    {
+      "a": "Decidimos usar distancia coseno para el ranking de similitud en vec0.",
+      "b": "El índice vec0 usa distancia euclídea (L2), no coseno, para el ranking.",
+      "label": "contradiction",
+      "lang": "es"
+    },
+    {
+      "a": "The maintenance worker demotes tier-1 memories after 90 days of inactivity, regardless of importance.",
+      "b": "Tier-1 memories with importance >= 9.0 never demote, no matter how long they've been inactive.",
+      "label": "contradiction",
+      "lang": "en"
+    },
+    {
+      "a": "El usuario prefiere que Claude nunca ejecute `cargo build` después de un cambio.",
+      "b": "El usuario pidió que se corra `cargo build` automáticamente cada vez que se edita un archivo .rs.",
+      "label": "contradiction",
+      "lang": "es"
+    },
+    {
+      "a": "El modelo de embeddings en producción es multilingual-e5-small con 384 dimensiones.",
+      "b": "El umbral de contradicción actual es 0.20 sobre distancia L2.",
+      "label": "no_contradiction",
+      "lang": "es"
+    },
+    {
+      "a": "cargo test --lib passed 653 tests, with 0 failures and 2 ignored.",
+      "b": "The eval harness lives in a separate binary, so it doesn't run under cargo test --lib.",
+      "label": "no_contradiction",
+      "lang": "en"
+    },
+    {
+      "a": "Las decisiones arquitectónicas se guardan con memory_type architectural_decision y tier inicial 2.",
+      "b": "Los resúmenes de sesión también entran en tier 2 al insertarse, salvo que acumulen tres accesos.",
+      "label": "no_contradiction",
+      "lang": "es"
+    },
+    {
+      "a": "El usuario prefiere convenciones de commit convencionales sin atribución de IA.",
+      "b": "El usuario prefiere convenciones de commit convencionales sin atribución de IA.",
+      "label": "identical",
+      "lang": "es"
+    },
+    {
+      "a": "FakeEmbedder fills 384 floats uniformly in [-1, 1] using a SipHash-seeded LCG, with no normalization.",
+      "b": "FakeEmbedder fills 384 floats uniformly in [-1, 1] using a SipHash-seeded LCG, with no normalization.",
+      "label": "identical",
+      "lang": "en"
+    },
+    {
+      "a": "El usuario prefiere que las respuestas técnicas usen voseo rioplatense.",
+      "b": "Al usuario le gusta que le hablen con voseo rioplatense en las respuestas técnicas.",
+      "label": "identical",
+      "lang": "es"
+    }
+  ]
+}

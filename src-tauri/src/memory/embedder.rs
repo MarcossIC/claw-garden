@@ -207,25 +207,39 @@ impl Embedder for OpenAIEmbedder {
 }
 
 // ============================================================================
-// FakeEmbedder — deterministic test double (REQ-EMB-001 / REQ-TEST-001).
+// FakeEmbedder — deterministic test double for the Embedder trait.
 //
-// Inline `#[cfg(test)]` per proposal decision #11. Phase 3 may relax this to
-// `#[cfg(any(test, feature = "test-helpers"))]` for cross-file reuse.
+// SipHash-seeds a linear congruential generator from the input text and fills
+// `dim` floats from it, so the same text always yields the same vector and
+// distinct texts (almost always) yield distinct ones — no model load, no
+// I/O, no cross-run or cross-platform non-determinism.
+//
+// Reachable outside plain unit tests as well, when the evaluation-harness
+// feature is enabled, so an offline harness can seed and query a store
+// without downloading the real embedding model.
+//
+// Load-bearing property for anyone reading eval output: the generator is NOT
+// L2-normalized. It draws each of the 384 coordinates uniformly from [-1, 1],
+// which puts the expected vector norm at roughly 11.3 (sqrt(384/3)) instead
+// of 1.0. Distances computed against these vectors are therefore not on the
+// same scale as distances computed against the real model's unit-norm
+// output — any threshold or score tuned against the real embedder will not
+// behave the same way here.
 // ============================================================================
 
-#[cfg(test)]
+#[cfg(any(test, feature = "eval"))]
 pub(crate) struct FakeEmbedder {
     dim: usize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "eval"))]
 impl Default for FakeEmbedder {
     fn default() -> Self {
         Self { dim: 384 }
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "eval"))]
 #[async_trait]
 impl Embedder for FakeEmbedder {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
