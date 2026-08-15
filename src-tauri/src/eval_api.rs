@@ -249,20 +249,3 @@ pub fn model_is_cached(base_dir: &Path) -> bool {
     model_download::model_is_cached(base_dir)
 }
 
-/// The tier a freshly-inserted row at this importance/type would be
-/// assigned, using the exact promotion rule production applies on insert
-/// (current tier 3, access count 0). Calls the real function rather than
-/// restating its rule table, so a change to the promotion rules can never
-/// silently desynchronize this prediction from what insert actually does.
-pub fn predicted_tier(importance: f64, memory_type: &str) -> i64 {
-    compute_tier(3, importance, 0, memory_type)
-}
-
-/// True iff a row at this importance/type would land at a tier the KNN
-/// search pool actually scans. Search excludes tier-1 rows outright, so a
-/// golden-set row predicted to land at tier 1 can never be retrieved no
-/// matter how well it matches a query — a structural exclusion, not a
-/// ranking miss.
-pub fn knn_reachable(importance: f64, memory_type: &str) -> bool {
-    predicted_tier(importance, memory_type) > 1
-}

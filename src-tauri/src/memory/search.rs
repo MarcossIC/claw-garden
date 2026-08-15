@@ -102,7 +102,6 @@ const SEARCH_SQL_MEMORY: &str = "
       AND m.status IN ('active', 'disputed')
       AND m.deleted_at IS NULL
       AND m.agent_id = ?3
-      AND m.tier > 1
     ORDER BY score DESC
 ";
 
@@ -124,7 +123,6 @@ const SEARCH_SQL_EPISODIC: &str = "
       AND epi.status IN ('active', 'disputed')
       AND epi.deleted_at IS NULL
       AND epi.agent_id = ?3
-      AND epi.tier > 1
     ORDER BY score DESC
 ";
 
@@ -146,7 +144,6 @@ const SEARCH_SQL_PROCEDURAL: &str = "
       AND pro.status IN ('active', 'disputed')
       AND pro.deleted_at IS NULL
       AND pro.agent_id = ?3
-      AND pro.tier > 1
     ORDER BY score DESC
 ";
 
@@ -352,11 +349,9 @@ pub(crate) async fn search_all_memories(
     store.knn_latency().record(elapsed);
 
     // Tier-per-hit and pool-survival logging — appended to the existing
-    // retrieval debug line via pure, unit-tested helpers (t1 is always 0
-    // here: the SEARCH_SQL_* `tier > 1` filter means tier-1 rows never reach
-    // KNN, not a bug). `snapshot()` sits inside the macro args deliberately:
-    // it is the one part of this line that's fine to skip sorting for when
-    // debug logging is off.
+    // retrieval debug line via pure, unit-tested helpers. `snapshot()` sits
+    // inside the macro args deliberately: it is the one part of this line
+    // that's fine to skip sorting for when debug logging is off.
     log::debug!(
         "retrieval={}ms hits={} {} k_final={} dist={} {}",
         elapsed.as_millis(),
@@ -514,8 +509,14 @@ mod tests {
         assert_eq!(bytes.len(), 384 * 4);
     }
 
+    // Tier 1 is the hottest tier, not an excluded one. A row lands there by
+    // being important or by being a type that is always kept close, and the
+    // KNN pool has to be able to reach it — the deterministic workspace
+    // channel only carries a fixed slice of tier 1 (importance >= 8 and the
+    // top few skills), so anything the pool refuses to scan is delivered by
+    // nobody at all.
     #[tokio::test]
-    async fn tier1_rows_excluded_from_results() {
+    async fn tier1_rows_are_reachable_by_knn() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let emb = unit_basis_embedding();
 
@@ -530,18 +531,74 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(hits.iter().all(|h| h.tier > 1), "tier=1 row must not appear in results");
-        assert_eq!(hits.len(), 3, "expected 3 tier-3 hits");
+        assert!(
+            hits.iter().any(|h| h.tier == 1),
+            "a tier=1 row must be reachable by KNN"
+        );
+        assert_eq!(hits.len(), 4, "expected all 4 rows, tier-1 included");
 
         // The assertion above can't distinguish "the query correctly returned
-        // 3" from "the query returned something else and a later truncation
-        // coincidentally landed on 3". Calling the pool query directly, before
-        // any merge or truncation, tests the tier filter in isolation.
+        // 4" from "the query returned something else and a later truncation
+        // coincidentally landed on 4". Calling the pool query directly, before
+        // any merge or truncation, tests the scan set in isolation.
         assert_eq!(
             knn_memory(&store, &emb, "agent-test", 30).await.unwrap().len(),
-            3,
-            "the tier filter must drop the tier-1 row inside the query, before any merge or truncation"
+            4,
+            "the tier-1 row must survive inside the query, before any merge or truncation"
         );
+    }
+
+    // `procedural_skill` rows are born at tier 1 (`compute_tier` pins that
+    // type there) and nothing demotes them, so a pool that skipped tier 1
+    // returned zero skills for every query ever issued — the miner's whole
+    // output was unreachable through this channel.
+    #[tokio::test]
+    async fn knn_procedural_returns_skill_rows() {
+        use crate::memory::embedder::FakeEmbedder;
+        use crate::memory::store_insert::{NewProceduralSkillRecord, PromoteOutcome};
+
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let embedder = FakeEmbedder::default();
+        let trigger = "un test falla después de editar";
+        let q_vec = embedder.embed(trigger).await.unwrap();
+
+        let outcome = store
+            .promote_to_procedural_skill(
+                NewProceduralSkillRecord {
+                    agent_id: "agent-skill".to_string(),
+                    project_id: None,
+                    skill_name: "reparar-test-roto".to_string(),
+                    trigger: trigger.to_string(),
+                    tool_sequence_json: "[\"read\",\"edit\",\"test\"]".to_string(),
+                    source_trajectory_ids: vec![1, 2, 3],
+                    importance: 8.0,
+                    now_ms: 1_700_000_000_000,
+                },
+                Some(q_vec.clone()),
+            )
+            .await
+            .unwrap();
+        let id = match outcome {
+            PromoteOutcome::Inserted(id) => id,
+            other => panic!("expected a fresh insert, got {other:?}"),
+        };
+
+        let q_bytes = serialize_f32_query(&to_unit(&q_vec).unwrap());
+        assert_eq!(
+            knn_procedural(&store, &q_bytes, "agent-skill", 5).await.unwrap().len(),
+            1,
+            "the procedural pool must return the skill row"
+        );
+
+        let hits = search_all_memories(&store, &q_vec, "agent-skill", SearchScope::all_default(), 10)
+            .await
+            .unwrap();
+        let hit = hits
+            .iter()
+            .find(|h| h.id == id && h.kind == TableKind::Procedural)
+            .expect("the skill must reach the merged result set");
+        assert_eq!(hit.tier, 1, "skills live at tier 1 — that is the point of this test");
+        assert_eq!(hit.memory_type, "procedure");
     }
 
     // A query vector reaching `search_all_memories` at any magnitude must be
@@ -976,7 +1033,7 @@ mod tests {
         let rows = vec![
             ("tier3-a", "chat_message", 3i64, 5.0f64, "active"),
             ("tier3-b", "user_preference", 3, 7.0, "active"),
-            ("tier1-c", "chat_message", 1, 9.0, "active"),  // tier=1 excluded
+            ("tier1-c", "chat_message", 1, 9.0, "active"),
             ("tier2-d", "chat_message", 2, 5.0, "active"),
             ("tier2-e", "user_preference", 2, 8.0, "active"),
         ];
@@ -988,8 +1045,10 @@ mod tests {
         let hits = search_all_memories(&store, &q_vec, agent, SearchScope::all_default(), 3)
             .await.unwrap();
 
+        // All five rows are candidates — this asserts the merge-and-truncate
+        // contract, not which tier survives it. Which tiers the pool scans is
+        // asserted directly in `tier1_rows_are_reachable_by_knn`.
         assert_eq!(hits.len(), 3, "expected exactly 3 hits");
-        assert!(hits.iter().all(|h| h.tier > 1), "no tier=1 in results");
         // When query vec == stored vec, distance ≈ 0, so (1-distance) ≈ 1 → score > 0
         assert!(hits.iter().all(|h| h.score > 0.0), "scores must be positive");
         assert!(hits[0].score >= hits[1].score, "sorted DESC");
@@ -998,9 +1057,8 @@ mod tests {
 
     // ── episodic_trajectory KNN retrieval ──
     //
-    // No production code change here: SEARCH_SQL_EPISODIC's pre-existing
-    // `epi.agent_id = ?3 AND epi.tier > 1` filter already supports
-    // `episodic_trajectory` rows (tier=3 via compute_tier) without modification.
+    // No production code change here: SEARCH_SQL_EPISODIC's `epi.agent_id = ?3`
+    // filter already supports `episodic_trajectory` rows without modification.
     // These tests exist to prove that, not to add new behavior.
 
     async fn insert_episodic_row_for_knn(

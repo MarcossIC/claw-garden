@@ -1,0 +1,530 @@
+{
+  "date": "2026-08-15",
+  "mode": "real",
+  "model_id": "multilingual-e5-small",
+  "git_sha": "27319f1",
+  "k_pool": {
+    "memory": 30,
+    "episodic": 5,
+    "procedural": 5
+  },
+  "k_final": 10,
+  "corpus_size": 13,
+  "n_retrieval_cases": 13,
+  "n_contradiction_pairs": 9,
+  "known_bugs_live": [],
+  "golden_set": {
+    "provisional": true,
+    "note": "only the ~13-case template sample is authored so far; the domain cases from real usage are still pending, so a later run against a fuller golden set will move every metric for reasons that have nothing to do with retrieval quality"
+  },
+  "retrieval": {
+    "aggregate": {
+      "recall@1": 0.07692307692307693,
+      "recall@5": 0.5384615384615384,
+      "recall@10": 1.0,
+      "mrr": 0.321031746031746,
+      "ndcg@10": 0.47843046412774626
+    },
+    "by_lang": [
+      {
+        "lang": "en",
+        "n_cases": 7,
+        "aggregate": {
+          "recall@1": 0.14285714285714285,
+          "recall@5": 0.5714285714285714,
+          "recall@10": 1.0,
+          "mrr": 0.36167800453514737,
+          "ndcg@10": 0.5094747254618219
+        }
+      },
+      {
+        "lang": "es",
+        "n_cases": 6,
+        "aggregate": {
+          "recall@1": 0.0,
+          "recall@5": 0.5,
+          "recall@10": 1.0,
+          "mrr": 0.2736111111111111,
+          "ndcg@10": 0.4422121592379911
+        }
+      }
+    ],
+    "per_case": [
+      {
+        "query": "¿Por qué elegimos rusqlite con la extensión vec0 en vez de un servicio externo de embeddings?",
+        "expected_refs": [
+          "c01"
+        ],
+        "ranked_refs": [
+          "c12",
+          "c01",
+          "c02",
+          "c10",
+          "c04",
+          "c03",
+          "c09",
+          "c11",
+          "c05",
+          "c06"
+        ],
+        "recall@1": 0.0,
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 0.5,
+        "ndcg@10": 0.6309297535714575,
+        "status": "active",
+        "lang": "es"
+      },
+      {
+        "query": "Why did we adopt TimestampMs instead of raw u64 seconds for timestamps?",
+        "expected_refs": [
+          "c02"
+        ],
+        "ranked_refs": [
+          "c12",
+          "c02",
+          "c01",
+          "c10",
+          "c04",
+          "c11",
+          "c03",
+          "c09",
+          "c05",
+          "c06"
+        ],
+        "recall@1": 0.0,
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 0.5,
+        "ndcg@10": 0.6309297535714575,
+        "status": "active",
+        "lang": "en"
+      },
+      {
+        "query": "¿Qué se implementó en la sesión de memoria del 20 de julio?",
+        "expected_refs": [
+          "c03"
+        ],
+        "ranked_refs": [
+          "c12",
+          "c01",
+          "c02",
+          "c03",
+          "c10",
+          "c04",
+          "c11",
+          "c09",
+          "c05",
+          "c06"
+        ],
+        "recall@1": 0.0,
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 0.25,
+        "ndcg@10": 0.43067655807339306,
+        "status": "active",
+        "lang": "es"
+      },
+      {
+        "query": "What got fixed in the July 22 session involving the maintenance worker?",
+        "expected_refs": [
+          "c04"
+        ],
+        "ranked_refs": [
+          "c12",
+          "c02",
+          "c04",
+          "c01",
+          "c10",
+          "c03",
+          "c11",
+          "c09",
+          "c05",
+          "c06"
+        ],
+        "recall@1": 0.0,
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 0.3333333333333333,
+        "ndcg@10": 0.5,
+        "status": "active",
+        "lang": "en"
+      },
+      {
+        "query": "¿Por qué falló cargo test en la máquina nueva?",
+        "expected_refs": [
+          "c05"
+        ],
+        "ranked_refs": [
+          "c12",
+          "c02",
+          "c10",
+          "c01",
+          "c04",
+          "c03",
+          "c11",
+          "c05",
+          "c09",
+          "c06"
+        ],
+        "recall@1": 0.0,
+        "recall@5": 0.0,
+        "recall@10": 1.0,
+        "mrr": 0.125,
+        "ndcg@10": 0.31546487678572877,
+        "status": "active",
+        "lang": "es"
+      },
+      {
+        "query": "Why did npm install fail with a permissions error?",
+        "expected_refs": [
+          "c06"
+        ],
+        "ranked_refs": [
+          "c12",
+          "c02",
+          "c01",
+          "c10",
+          "c04",
+          "c11",
+          "c06",
+          "c03",
+          "c09",
+          "c05"
+        ],
+        "recall@1": 0.0,
+        "recall@5": 0.0,
+        "recall@10": 1.0,
+        "mrr": 0.14285714285714285,
+        "ndcg@10": 0.3333333333333333,
+        "status": "active",
+        "lang": "en"
+      },
+      {
+        "query": "¿Qué preocupación planteó el usuario sobre la distancia L2 en el índice vec0?",
+        "expected_refs": [
+          "c07"
+        ],
+        "ranked_refs": [
+          "c12",
+          "c02",
+          "c01",
+          "c10",
+          "c04",
+          "c03",
+          "c11",
+          "c09",
+          "c05",
+          "c07"
+        ],
+        "recall@1": 0.0,
+        "recall@5": 0.0,
+        "recall@10": 1.0,
+        "mrr": 0.1,
+        "ndcg@10": 0.2890648263178879,
+        "status": "active",
+        "lang": "es"
+      },
+      {
+        "query": "What did the user ask about FakeEmbedder's output vectors?",
+        "expected_refs": [
+          "c08"
+        ],
+        "ranked_refs": [
+          "c12",
+          "c02",
+          "c01",
+          "c10",
+          "c04",
+          "c11",
+          "c09",
+          "c03",
+          "c08",
+          "c05"
+        ],
+        "recall@1": 0.0,
+        "recall@5": 0.0,
+        "recall@10": 1.0,
+        "mrr": 0.1111111111111111,
+        "ndcg@10": 0.3010299956639812,
+        "status": "active",
+        "lang": "en"
+      },
+      {
+        "query": "¿Qué modelo de embeddings usa el sistema en producción?",
+        "expected_refs": [
+          "c09"
+        ],
+        "ranked_refs": [
+          "c12",
+          "c01",
+          "c02",
+          "c10",
+          "c04",
+          "c09",
+          "c03",
+          "c11",
+          "c05",
+          "c06"
+        ],
+        "recall@1": 0.0,
+        "recall@5": 0.0,
+        "recall@10": 1.0,
+        "mrr": 0.16666666666666666,
+        "ndcg@10": 0.3562071871080222,
+        "status": "active",
+        "lang": "es"
+      },
+      {
+        "query": "Show me the tier promotion function that decides when a memory gets promoted to tier 1.",
+        "expected_refs": [
+          "c13"
+        ],
+        "ranked_refs": [
+          "c12",
+          "c02",
+          "c01",
+          "c10",
+          "c04",
+          "c03",
+          "c11",
+          "c09",
+          "c13",
+          "c05"
+        ],
+        "recall@1": 0.0,
+        "recall@5": 0.0,
+        "recall@10": 1.0,
+        "mrr": 0.1111111111111111,
+        "ndcg@10": 0.3010299956639812,
+        "status": "active",
+        "lang": "en"
+      },
+      {
+        "query": "¿Qué preferencia tiene el usuario sobre ejecutar cargo build automáticamente?",
+        "expected_refs": [
+          "c10"
+        ],
+        "ranked_refs": [
+          "c12",
+          "c10",
+          "c02",
+          "c01",
+          "c04",
+          "c11",
+          "c03",
+          "c05",
+          "c09",
+          "c06"
+        ],
+        "recall@1": 0.0,
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 0.5,
+        "ndcg@10": 0.6309297535714575,
+        "status": "active",
+        "lang": "es"
+      },
+      {
+        "query": "What does the user prefer for commit message format and AI attribution?",
+        "expected_refs": [
+          "c11"
+        ],
+        "ranked_refs": [
+          "c12",
+          "c02",
+          "c11",
+          "c10",
+          "c01",
+          "c04",
+          "c03",
+          "c09",
+          "c05",
+          "c06"
+        ],
+        "recall@1": 0.0,
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 0.3333333333333333,
+        "ndcg@10": 0.5,
+        "status": "active",
+        "lang": "en"
+      },
+      {
+        "query": "What architectural decision was flagged as critically important regarding vec0's distance metric?",
+        "expected_refs": [
+          "c12"
+        ],
+        "ranked_refs": [
+          "c12",
+          "c02",
+          "c01",
+          "c10",
+          "c04",
+          "c11",
+          "c03",
+          "c09",
+          "c05",
+          "c06"
+        ],
+        "recall@1": 1.0,
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 1.0,
+        "ndcg@10": 1.0,
+        "status": "active",
+        "lang": "en"
+      }
+    ],
+    "blocked": []
+  },
+  "contradiction": {
+    "curve": [
+      {
+        "threshold": 0.1,
+        "recall": 0.0,
+        "fpr_no_contradiction": 0.0,
+        "fpr_identical": 0.6666666666666666
+      },
+      {
+        "threshold": 0.15,
+        "recall": 0.0,
+        "fpr_no_contradiction": 0.0,
+        "fpr_identical": 1.0
+      },
+      {
+        "threshold": 0.2,
+        "recall": 0.0,
+        "fpr_no_contradiction": 0.0,
+        "fpr_identical": 1.0
+      },
+      {
+        "threshold": 0.25,
+        "recall": 0.0,
+        "fpr_no_contradiction": 0.0,
+        "fpr_identical": 1.0
+      },
+      {
+        "threshold": 0.3,
+        "recall": 0.3333333333333333,
+        "fpr_no_contradiction": 0.0,
+        "fpr_identical": 1.0
+      },
+      {
+        "threshold": 0.35,
+        "recall": 1.0,
+        "fpr_no_contradiction": 0.0,
+        "fpr_identical": 1.0
+      },
+      {
+        "threshold": 0.4,
+        "recall": 1.0,
+        "fpr_no_contradiction": 0.6666666666666666,
+        "fpr_identical": 1.0
+      }
+    ],
+    "by_lang": [
+      {
+        "lang": "en",
+        "n_pairs": 3,
+        "curve": [
+          {
+            "threshold": 0.1,
+            "recall": 0.0,
+            "fpr_no_contradiction": 0.0,
+            "fpr_identical": 1.0
+          },
+          {
+            "threshold": 0.15,
+            "recall": 0.0,
+            "fpr_no_contradiction": 0.0,
+            "fpr_identical": 1.0
+          },
+          {
+            "threshold": 0.2,
+            "recall": 0.0,
+            "fpr_no_contradiction": 0.0,
+            "fpr_identical": 1.0
+          },
+          {
+            "threshold": 0.25,
+            "recall": 0.0,
+            "fpr_no_contradiction": 0.0,
+            "fpr_identical": 1.0
+          },
+          {
+            "threshold": 0.3,
+            "recall": 0.0,
+            "fpr_no_contradiction": 0.0,
+            "fpr_identical": 1.0
+          },
+          {
+            "threshold": 0.35,
+            "recall": 1.0,
+            "fpr_no_contradiction": 0.0,
+            "fpr_identical": 1.0
+          },
+          {
+            "threshold": 0.4,
+            "recall": 1.0,
+            "fpr_no_contradiction": 1.0,
+            "fpr_identical": 1.0
+          }
+        ]
+      },
+      {
+        "lang": "es",
+        "n_pairs": 6,
+        "curve": [
+          {
+            "threshold": 0.1,
+            "recall": 0.0,
+            "fpr_no_contradiction": 0.0,
+            "fpr_identical": 0.5
+          },
+          {
+            "threshold": 0.15,
+            "recall": 0.0,
+            "fpr_no_contradiction": 0.0,
+            "fpr_identical": 1.0
+          },
+          {
+            "threshold": 0.2,
+            "recall": 0.0,
+            "fpr_no_contradiction": 0.0,
+            "fpr_identical": 1.0
+          },
+          {
+            "threshold": 0.25,
+            "recall": 0.0,
+            "fpr_no_contradiction": 0.0,
+            "fpr_identical": 1.0
+          },
+          {
+            "threshold": 0.3,
+            "recall": 0.5,
+            "fpr_no_contradiction": 0.0,
+            "fpr_identical": 1.0
+          },
+          {
+            "threshold": 0.35,
+            "recall": 1.0,
+            "fpr_no_contradiction": 0.0,
+            "fpr_identical": 1.0
+          },
+          {
+            "threshold": 0.4,
+            "recall": 1.0,
+            "fpr_no_contradiction": 0.5,
+            "fpr_identical": 1.0
+          }
+        ]
+      }
+    ]
+  },
+  "norm_check": {
+    "asserted": true,
+    "mean_norm": 0.9999999905584622,
+    "max_deviation": 1.8723137806819778e-7
+  }
+}

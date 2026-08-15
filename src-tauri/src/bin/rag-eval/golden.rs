@@ -9,8 +9,6 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use agent_office_lib::eval_api::knn_reachable;
-
 /// The `MemoryType` serde names a corpus row may declare, copied from
 /// `store_insert.rs`'s `#[serde(rename_all = "snake_case")]` enum rather than
 /// imported. `procedural_skill` is deliberately excluded: it lives in a
@@ -43,9 +41,8 @@ pub struct CorpusRow {
     #[serde(rename = "ref")]
     pub ref_: String,
     pub content: String,
-    /// Kept as the raw on-disk string rather than parsed into an enum: the
-    /// tier gate below hands this same string straight to `knn_reachable`,
-    /// the exact call the production insert path makes, so there is only one
+    /// Kept as the raw on-disk string rather than parsed into an enum: it is
+    /// handed straight to the production insert path, so there is only one
     /// string in play and it can never drift from what actually gets seeded.
     pub memory_type: String,
     pub importance: f64,
@@ -169,24 +166,13 @@ pub enum GoldenError {
     )]
     ExpectedNotInPool { query: String, expected_ref: String },
 
-    #[error(
-        "E_TIER1_UNMARKED: retrieval_case '{query}' expects '{corpus_ref}' (memory_type={memory_type}, importance={importance}) which seeds at tier 1 and is invisible to search_all_memories; mark {{\"status\":\"known_red\",\"blocked_by\":\"<change>\"}} or change the expectation"
-    )]
-    Tier1Unmarked {
-        query: String,
-        corpus_ref: String,
-        memory_type: String,
-        importance: f64,
-    },
-
     #[error("E_MISSING_BLOCKED_BY: retrieval_case '{0}' is marked known_red but has no blocked_by")]
     MissingBlockedBy(String),
 }
 
-/// Reads and parses `path`, then validates it. Returns the validated set plus
-/// any non-fatal warnings (currently just stale `known_red` markers) — no
-/// database is opened and no row is seeded here.
-pub fn load(path: &Path) -> Result<(GoldenSet, Vec<String>), GoldenError> {
+/// Reads, parses and validates `path` — no database is opened and no row is
+/// seeded here.
+pub fn load(path: &Path) -> Result<GoldenSet, GoldenError> {
     let raw = std::fs::read_to_string(path).map_err(|source| GoldenError::Io {
         path: path.display().to_string(),
         source,
@@ -195,16 +181,23 @@ pub fn load(path: &Path) -> Result<(GoldenSet, Vec<String>), GoldenError> {
         path: path.display().to_string(),
         source,
     })?;
-    let warnings = validate(&golden)?;
-    Ok((golden, warnings))
+    validate(&golden)?;
+    Ok(golden)
 }
 
 /// Validates a parsed golden set, aborting on the first structural problem
 /// found. Order: duplicate refs, unknown memory types, per-case reference
-/// resolution (`corpus_refs ⊆ corpus`, `expected_refs ⊆ corpus_refs`), the
-/// `known_red`/`blocked_by` pairing, then the tier-reachability gate. Returns
-/// any stale-marker warnings collected along the way.
-pub fn validate(golden: &GoldenSet) -> Result<Vec<String>, GoldenError> {
+/// resolution (`corpus_refs ⊆ corpus`, `expected_refs ⊆ corpus_refs`), then
+/// the `known_red`/`blocked_by` pairing.
+///
+/// Whether a `known_red` marker is still deserved is NOT decided here. It was,
+/// while retrieval had one structural exclusion this file could predict from a
+/// row's declared type and importance; that exclusion is gone, and guessing at
+/// the replacement would put a second model of retrieval in the loader, free
+/// to disagree with the real one. The run itself answers it instead: a blocked
+/// case that scores is reported as `KNOWN_RED CASE NOW PASSING`, which is
+/// evidence rather than prediction.
+pub fn validate(golden: &GoldenSet) -> Result<(), GoldenError> {
     let mut seen_refs = HashSet::new();
     for row in &golden.corpus {
         if !seen_refs.insert(row.ref_.as_str()) {
@@ -223,8 +216,6 @@ pub fn validate(golden: &GoldenSet) -> Result<Vec<String>, GoldenError> {
 
     let corpus_by_ref: HashMap<&str, &CorpusRow> =
         golden.corpus.iter().map(|r| (r.ref_.as_str(), r)).collect();
-
-    let mut warnings = Vec::new();
 
     for case in &golden.retrieval_cases {
         for corpus_ref in &case.corpus_refs {
@@ -249,36 +240,9 @@ pub fn validate(golden: &GoldenSet) -> Result<Vec<String>, GoldenError> {
         if case.status == CaseStatus::KnownRed && case.blocked_by.is_none() {
             return Err(GoldenError::MissingBlockedBy(case.query.clone()));
         }
-
-        // Every `expected_ref` here is already proven present in
-        // `corpus_by_ref` by the resolution checks above (expected_refs is a
-        // subset of corpus_refs, and corpus_refs was just proven a subset of
-        // corpus), so the direct index below cannot panic.
-        let mut any_tier1 = false;
-        for expected_ref in &case.expected_refs {
-            let row = corpus_by_ref[expected_ref.as_str()];
-            if !knn_reachable(row.importance, &row.memory_type) {
-                any_tier1 = true;
-                if case.status != CaseStatus::KnownRed {
-                    return Err(GoldenError::Tier1Unmarked {
-                        query: case.query.clone(),
-                        corpus_ref: expected_ref.clone(),
-                        memory_type: row.memory_type.clone(),
-                        importance: row.importance,
-                    });
-                }
-            }
-        }
-
-        if case.status == CaseStatus::KnownRed && !any_tier1 {
-            warnings.push(format!(
-                "W_STALE_KNOWN_RED: '{}' is marked known_red but no expected ref seeds at tier 1 — remove the marker",
-                case.query
-            ));
-        }
     }
 
-    Ok(warnings)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -306,10 +270,9 @@ mod tests {
     // --- valid file ------------------------------------------------------
 
     #[test]
-    fn valid_minimal_file_validates_with_no_warnings() {
+    fn valid_minimal_file_validates() {
         let golden = parse_only(VALID_MINIMAL);
-        let warnings = validate(&golden).expect("minimal golden set must validate");
-        assert!(warnings.is_empty(), "expected no warnings, got {warnings:?}");
+        validate(&golden).expect("minimal golden set must validate");
         assert_eq!(golden.corpus.len(), 1);
         assert_eq!(golden.retrieval_cases.len(), 1);
         assert_eq!(golden.contradiction_pairs.len(), 1);
@@ -394,10 +357,15 @@ mod tests {
         );
     }
 
-    // --- tier gate: unmarked user_preference --------------------------------
+    // --- a tier-1 expectation is an ordinary expectation ---------------------
+    //
+    // These used to abort the load: a row seeding at tier 1 was structurally
+    // unreachable, so expecting it could only ever measure a bug. The pool
+    // scans every tier now, which makes both of these plain cases that the run
+    // is free to pass or fail on its own merits.
 
     #[test]
-    fn unmarked_tier1_user_preference_expectation_aborts() {
+    fn a_tier1_user_preference_expectation_is_valid() {
         let raw = r#"{
             "corpus": [
                 {"ref": "c1", "content": "prefers dark mode", "memory_type": "user_preference", "importance": 5.0}
@@ -407,18 +375,11 @@ mod tests {
             ],
             "contradiction_pairs": []
         }"#;
-        let golden = parse_only(raw);
-        let err = validate(&golden).expect_err("unmarked tier-1 expectation must abort");
-        assert_eq!(
-            err.to_string(),
-            "E_TIER1_UNMARKED: retrieval_case 'q1' expects 'c1' (memory_type=user_preference, importance=5) which seeds at tier 1 and is invisible to search_all_memories; mark {\"status\":\"known_red\",\"blocked_by\":\"<change>\"} or change the expectation"
-        );
+        validate(&parse_only(raw)).expect("a tier-1 expectation must validate");
     }
 
-    // --- tier gate: unmarked high-importance non-preference type ------------
-
     #[test]
-    fn unmarked_tier1_high_importance_non_preference_type_also_aborts() {
+    fn a_high_importance_tier1_expectation_is_valid() {
         let raw = r#"{
             "corpus": [
                 {"ref": "c2", "content": "critical fact", "memory_type": "chat_message", "importance": 9.5}
@@ -428,20 +389,13 @@ mod tests {
             ],
             "contradiction_pairs": []
         }"#;
-        let golden = parse_only(raw);
-        let err = validate(&golden).expect_err("importance-forced tier-1 must also abort");
-        match err {
-            GoldenError::Tier1Unmarked { memory_type, .. } => {
-                assert_eq!(memory_type, "chat_message");
-            }
-            other => panic!("expected Tier1Unmarked, got {other:?}"),
-        }
+        validate(&parse_only(raw)).expect("an importance-forced tier-1 expectation must validate");
     }
 
-    // --- tier gate: marked known_red is accepted ---------------------------
-
+    // A `known_red` marker still parses and still requires its `blocked_by`;
+    // only the automatic guess at whether it is deserved is gone.
     #[test]
-    fn marked_known_red_tier1_case_is_accepted_with_no_warnings() {
+    fn marked_known_red_case_is_accepted() {
         let raw = r#"{
             "corpus": [
                 {"ref": "c1", "content": "prefers dark mode", "memory_type": "user_preference", "importance": 5.0}
@@ -452,14 +406,12 @@ mod tests {
                     "corpus_refs": ["c1"],
                     "expected_refs": ["c1"],
                     "status": "known_red",
-                    "blocked_by": "rag-tier-reachability"
+                    "blocked_by": "some-future-change"
                 }
             ],
             "contradiction_pairs": []
         }"#;
-        let golden = parse_only(raw);
-        let warnings = validate(&golden).expect("marked known_red tier-1 case must validate");
-        assert!(warnings.is_empty(), "expected no warnings, got {warnings:?}");
+        validate(&parse_only(raw)).expect("marked known_red case must validate");
     }
 
     // --- known_red without blocked_by aborts --------------------------------
@@ -480,34 +432,6 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "E_MISSING_BLOCKED_BY: retrieval_case 'q1' is marked known_red but has no blocked_by"
-        );
-    }
-
-    // --- stale known_red marker warns, does not abort -----------------------
-
-    #[test]
-    fn stale_known_red_marker_warns_but_does_not_abort() {
-        let raw = r#"{
-            "corpus": [
-                {"ref": "c1", "content": "a", "memory_type": "chat_message", "importance": 5.0}
-            ],
-            "retrieval_cases": [
-                {
-                    "query": "q1",
-                    "corpus_refs": ["c1"],
-                    "expected_refs": ["c1"],
-                    "status": "known_red",
-                    "blocked_by": "rag-tier-reachability"
-                }
-            ],
-            "contradiction_pairs": []
-        }"#;
-        let golden = parse_only(raw);
-        let warnings = validate(&golden).expect("stale marker must not abort the load");
-        assert_eq!(warnings.len(), 1, "expected exactly one warning, got {warnings:?}");
-        assert_eq!(
-            warnings[0],
-            "W_STALE_KNOWN_RED: 'q1' is marked known_red but no expected ref seeds at tier 1 — remove the marker"
         );
     }
 

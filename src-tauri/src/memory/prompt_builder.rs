@@ -7,7 +7,7 @@ use crate::memory::{
     clock::TimestampMs,
     embedder::Embedder,
     search::{search_all_memories, RankedHit, SearchScope},
-    workspace::WorkspaceManager,
+    workspace::{EmittedIds, WorkspaceManager},
     MemoryError, MemoryStore,
 };
 
@@ -56,6 +56,11 @@ struct ConflictPair {
 /// Returns `Ok(String::new())` when all four blocks would be empty.
 /// Each internal failure is degraded to "the matching block is empty".
 ///
+/// `emitted` names the rows the workspace file already carries, so the same
+/// row is never handed to the model twice. It comes from the regeneration
+/// that produced the very file read below — not from a second copy of the
+/// workspace's selection rule, which would be free to drift from it.
+///
 /// `access_tracker` is fired-and-forgotten after retrieval hits are assembled.
 /// Production callers pass `Some(&state.access_tracker)`;
 /// test callers pass `None` to skip recording.
@@ -66,6 +71,7 @@ pub(crate) async fn build_memory_prompt(
     agent_id: &str,
     project_id: Option<&str>,
     user_query: &str,
+    emitted: &EmittedIds,
     access_tracker: Option<&AccessTracker>,
 ) -> Result<String, MemoryError> {
     // 1. Read workspace file (may be empty on fresh install or read failure).
@@ -82,10 +88,19 @@ pub(crate) async fn build_memory_prompt(
     };
 
     // 2. Compute query embedding ONLY if embedder is available.
-    let hits: Vec<RankedHit> = match embedder {
+    //
+    // The pool is asked for the workspace's worth of extra candidates, because
+    // the rows dropped just below are the high-importance ones most likely to
+    // rank near the top. Requesting exactly `K_FINAL` and then subtracting
+    // would let a well-stocked workspace starve the query-relevant channel:
+    // the better the standing context, the fewer hits the actual question
+    // gets. The per-table pools (30/5/5) are the real ceiling, so this only
+    // ever spends candidates that were already fetched.
+    let k_request = K_FINAL.saturating_add(emitted.len());
+    let mut hits: Vec<RankedHit> = match embedder {
         Some(emb) => match emb.embed(user_query).await {
             Ok(q_vec) => {
-                match search_all_memories(store, &q_vec, agent_id, SearchScope::all_default(), K_FINAL).await {
+                match search_all_memories(store, &q_vec, agent_id, SearchScope::all_default(), k_request).await {
                     Ok(h) => h,
                     Err(e) => {
                         log::warn!("search_all_memories failed: {e}; no retrieval hits this turn");
@@ -103,8 +118,13 @@ pub(crate) async fn build_memory_prompt(
             Vec::new()
         }
     };
+    hits.retain(|h| !emitted.contains(h.kind, h.id));
+    hits.truncate(K_FINAL);
+    let hits = hits;
 
-    // Fire-and-forget access recording.
+    // Fire-and-forget access recording. Runs on the filtered set: a row this
+    // channel suppressed was not retrieved by it, and counting it would
+    // inflate the access count that drives tier promotion.
     // Called AFTER hits are assembled — non-blocking, never awaits.
     // `record` discards empty vecs internally so no extra guard needed.
     if let Some(tracker) = access_tracker {
@@ -595,7 +615,7 @@ mod tests {
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
         // 7th argument `None::<&AccessTracker>` — must compile once the parameter exists.
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, "query", None::<&AccessTracker>)
+        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, "query", &EmittedIds::default(), None::<&AccessTracker>)
             .await
             .unwrap();
         assert_eq!(result, "", "all empty → empty string");
@@ -607,7 +627,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, "query", None).await.unwrap();
+        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, "query", &EmittedIds::default(), None).await.unwrap();
         assert_eq!(result, "", "all empty → empty string");
     }
 
@@ -623,7 +643,7 @@ mod tests {
         let path = wm.workspace_path("agent-1", None);
         tokio::fs::write(&path, "<!-- AUTO-START -->\n## Notes\n- something\n<!-- AUTO-END -->\n<!-- USER-START -->\n<!-- USER-END -->\n").await.unwrap();
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, "query", None).await.unwrap();
+        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, "query", &EmittedIds::default(), None).await.unwrap();
         assert!(result.contains(SEP_WORKSPACE), "should contain WORKSPACE separator");
         assert!(!result.contains(SEP_RECENT), "no embedder → no RECENT");
     }
@@ -634,7 +654,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, "query", None).await;
+        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, "query", &EmittedIds::default(), None).await;
         assert!(result.is_ok(), "should not panic or error");
         let s = result.unwrap();
         assert!(!s.contains(SEP_RECENT), "no RECENT block without embedder");
@@ -650,7 +670,7 @@ mod tests {
         tokio::fs::create_dir_all(path.parent().unwrap()).await.unwrap();
         tokio::fs::write(&path, "workspace content here\n").await.unwrap();
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, "query", None).await.unwrap();
+        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, "query", &EmittedIds::default(), None).await.unwrap();
         assert!(result.contains(SEP_WORKSPACE));
         assert!(!result.contains(SEP_RECENT));
         assert!(!result.contains(SEP_LONGTERM));
@@ -687,7 +707,7 @@ mod tests {
             Ok(())
         }).await.unwrap();
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-x", None, "query", None).await.unwrap();
+        let result = build_memory_prompt(&store, &wm, None, "agent-x", None, "query", &EmittedIds::default(), None).await.unwrap();
         assert!(result.contains(SEP_CONFLICTS), "should contain CONFLICTS separator");
         assert!(result.contains("ACTIVE CONFLICTS"));
     }
@@ -698,7 +718,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, "query", None).await.unwrap();
+        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, "query", &EmittedIds::default(), None).await.unwrap();
         assert!(!result.contains("ACTIVE CONFLICTS"), "no disputes → CONFLICTS block omitted");
     }
 
@@ -754,7 +774,8 @@ mod tests {
         }
 
         let result = build_memory_prompt(
-            &store, &wm, Some(embedder), "agent-split", None, "some query", None
+            &store, &wm, Some(embedder), "agent-split", None, "some query",
+            &EmittedIds::default(), None
         ).await.unwrap();
 
         assert!(result.contains(SEP_RECENT), "should have RECENT block");
@@ -797,6 +818,273 @@ mod tests {
         let (r, l) = bucket_by_recency(hits, TimestampMs::from_unix_millis(now_ms));
         assert_eq!(r.len(), 2);
         assert_eq!(l.len(), 0);
+    }
+
+    // ── the two delivery channels, and the seam between them ─────────────────
+
+    /// Unit-normalized bytes for a vector, the way every production insert
+    /// path stores them. Seeding a raw `FakeEmbedder` vector instead (norm
+    /// ≈ 11.3) puts the L2 distance above 2, which the cosine conversion
+    /// clamps to 0 — every row then ties at score 0 and the ranking under
+    /// test becomes arbitrary.
+    fn unit_bytes(v: &[f32]) -> Vec<u8> {
+        crate::memory::search::serialize_f32_query_pub(&crate::memory::vector::to_unit(v).unwrap())
+    }
+
+    /// Seeds one `memory` row with a vector, at the exact tier/importance the
+    /// caller asks for. Raw SQL on purpose: these tests are about which
+    /// channel reaches a given (tier, importance) coordinate, so the
+    /// coordinate has to be settable directly rather than derived.
+    async fn seed_memory(
+        store: &MemoryStore,
+        agent_id: &str,
+        content: &str,
+        memory_type: &str,
+        tier: i64,
+        importance: f64,
+        bytes: Vec<u8>,
+    ) -> i64 {
+        let agent = agent_id.to_string();
+        let content = content.to_string();
+        let memory_type = memory_type.to_string();
+        let ts = TimestampMs::now().as_millis_i64();
+        store
+            .conn
+            .call(move |c| -> Result<i64, rusqlite::Error> {
+                c.execute(
+                    "INSERT INTO memory (scope, agent_id, content, memory_type, source,
+                     created_at, created_by_type, created_by_ref,
+                     last_modified_at, last_accessed_at, importance, tier, status)
+                     VALUES ('agent', ?1, ?2, ?3, 'chat', ?4, 'user', ?1, ?4, ?4, ?5, ?6, 'active')",
+                    rusqlite::params![agent, content, memory_type, ts, importance, tier],
+                )?;
+                let id = c.last_insert_rowid();
+                c.execute(
+                    "INSERT INTO memory_vectors (rowid, embedding) VALUES (?1, ?2)",
+                    rusqlite::params![id, bytes],
+                )?;
+                Ok(id)
+            })
+            .await
+            .unwrap()
+    }
+
+    /// A tier-1 row below the workspace's importance bar used to be delivered
+    /// by nobody: the workspace only takes importance >= 8, and the pool
+    /// skipped tier 1 outright. It must now arrive through the query channel —
+    /// and through that one only.
+    #[tokio::test]
+    async fn a_tier1_row_below_the_workspace_bar_arrives_through_exactly_one_channel() {
+        use crate::memory::embedder::FakeEmbedder;
+
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let embedder = Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>;
+        let content = "prefiere ejecutar los tests antes de commitear";
+        let bytes = unit_bytes(&embedder.embed(content).await.unwrap());
+
+        seed_memory(&store, "agent-gap", content, "user_preference", 1, 5.0, bytes).await;
+
+        let emitted = wm.regenerate_auto_section("agent-gap", None, &store).await.unwrap();
+        assert_eq!(emitted.len(), 0, "importance 5 is below the workspace bar");
+
+        let result =
+            build_memory_prompt(&store, &wm, Some(embedder), "agent-gap", None, content, &emitted, None)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            result.matches(content).count(),
+            1,
+            "exactly one channel must deliver it:\n{result}"
+        );
+    }
+
+    /// Across all three backing tables, nothing the workspace rendered may
+    /// also arrive as a retrieval hit.
+    #[tokio::test]
+    async fn no_row_is_delivered_by_both_channels_across_the_three_tables() {
+        use crate::memory::embedder::FakeEmbedder;
+        use crate::memory::store_insert::{CreatedByType, NewEpisodicTrajectoryRecord, NewProceduralSkillRecord};
+
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let embedder = Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>;
+        let query = "cómo arreglo un test roto";
+        let q_vec = embedder.embed(query).await.unwrap();
+        let bytes = unit_bytes(&q_vec);
+
+        // memory: above the workspace bar, so the workspace renders it.
+        seed_memory(&store, "agent-3t", "prefiere voseo siempre", "user_preference", 1, 9.0, bytes.clone())
+            .await;
+        // procedural: skills are always tier 1 and the workspace takes the top 5.
+        store
+            .promote_to_procedural_skill(
+                NewProceduralSkillRecord {
+                    agent_id: "agent-3t".to_string(),
+                    project_id: None,
+                    skill_name: "arreglar-test-roto".to_string(),
+                    trigger: "un test falla".to_string(),
+                    tool_sequence_json: "[\"read\",\"edit\"]".to_string(),
+                    source_trajectory_ids: vec![1],
+                    importance: 8.0,
+                    now_ms: 1_700_000_000_000,
+                },
+                Some(q_vec.clone()),
+            )
+            .await
+            .unwrap();
+        // episodic: the workspace has no query for this table, so it is the
+        // control — it must still arrive, proving the filter is not blanket.
+        store
+            .insert_episodic_trajectory(
+                NewEpisodicTrajectoryRecord {
+                    scope: "agent",
+                    agent_id: Some("agent-3t".to_string()),
+                    project_id: None,
+                    session_id: "sess-3t".to_string(),
+                    task: "reparé el timeout del cliente".to_string(),
+                    tool_calls_json: "[]".to_string(),
+                    errors_json: "[]".to_string(),
+                    resolution: None,
+                    success_score: 0.9,
+                    created_by_type: CreatedByType::System,
+                    created_by_ref: "agent-3t".to_string(),
+                    importance: 5.0,
+                    created_at_ms: TimestampMs::now().as_millis_i64() as u64,
+                },
+                q_vec,
+            )
+            .await
+            .unwrap();
+
+        let emitted = wm.regenerate_auto_section("agent-3t", None, &store).await.unwrap();
+        assert_eq!(emitted.len(), 2, "one preference + one skill are rendered by the workspace");
+
+        let result =
+            build_memory_prompt(&store, &wm, Some(embedder), "agent-3t", None, query, &emitted, None)
+                .await
+                .unwrap();
+
+        assert_eq!(result.matches("prefiere voseo siempre").count(), 1, "memory row twice:\n{result}");
+        assert_eq!(result.matches("arreglar-test-roto").count(), 1, "skill row twice:\n{result}");
+        assert_eq!(
+            result.matches("reparé el timeout del cliente").count(),
+            1,
+            "the episodic row has no workspace channel and must still be delivered once:\n{result}"
+        );
+    }
+
+    /// Suppressing workspace rows must cost no delivery slots. The workspace
+    /// rows are exactly the high-importance ones that rank near the top, so
+    /// filtering a fixed-size pool would let a well-stocked workspace starve
+    /// the query channel.
+    #[tokio::test]
+    async fn dedup_does_not_shrink_the_retrieval_budget() {
+        use crate::memory::embedder::FakeEmbedder;
+
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let embedder = Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>;
+        let query = "algo sobre el proyecto";
+        let bytes = unit_bytes(&embedder.embed(query).await.unwrap());
+
+        // 5 rows the workspace will render, plus K_FINAL rows it will not.
+        for i in 0..5 {
+            seed_memory(
+                &store,
+                "agent-budget",
+                &format!("decisión de arquitectura {i}"),
+                "architectural_decision",
+                1,
+                10.0,
+                bytes.clone(),
+            )
+            .await;
+        }
+        for i in 0..K_FINAL {
+            seed_memory(
+                &store,
+                "agent-budget",
+                &format!("mensaje de chat {i}"),
+                "chat_message",
+                2,
+                5.0,
+                bytes.clone(),
+            )
+            .await;
+        }
+
+        let emitted = wm.regenerate_auto_section("agent-budget", None, &store).await.unwrap();
+        assert_eq!(emitted.len(), 5, "the fixture must actually fill the workspace");
+
+        let result =
+            build_memory_prompt(&store, &wm, Some(embedder), "agent-budget", None, query, &emitted, None)
+                .await
+                .unwrap();
+
+        let delivered = (0..K_FINAL)
+            .filter(|i| result.contains(&format!("mensaje de chat {i}")))
+            .count();
+        assert_eq!(
+            delivered, K_FINAL,
+            "the retrieval block must still carry K_FINAL hits after the workspace rows are removed"
+        );
+    }
+
+    /// `format_skill_hits` reported 0 for every query ever issued, because the
+    /// pool skipped tier 1 and skills only live there. The workspace carries
+    /// the top 5, so the query channel is what reaches the tail beyond them.
+    #[tokio::test]
+    async fn a_skill_beyond_the_workspace_top_five_is_reachable_by_query() {
+        use crate::memory::embedder::FakeEmbedder;
+        use crate::memory::record::TableKind;
+        use crate::memory::search::{search_all_memories, SearchScope};
+        use crate::memory::store_insert::NewProceduralSkillRecord;
+
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let embedder = FakeEmbedder::default();
+
+        // Six skills: the workspace renders the top five by access_count, all
+        // of which sit at 0 here, so the sixth is only ever reachable by query.
+        let mut ids = Vec::new();
+        for i in 0..6 {
+            let trigger = format!("cuando falla el escenario {i}");
+            let emb = embedder.embed(&trigger).await.unwrap();
+            let outcome = store
+                .promote_to_procedural_skill(
+                    NewProceduralSkillRecord {
+                        agent_id: "agent-tail".to_string(),
+                        project_id: None,
+                        skill_name: format!("skill-{i}"),
+                        trigger,
+                        tool_sequence_json: format!("[\"tool-{i}\"]"),
+                        source_trajectory_ids: vec![i as i64 + 1],
+                        importance: 8.0,
+                        now_ms: 1_700_000_000_000,
+                    },
+                    Some(emb),
+                )
+                .await
+                .unwrap();
+            ids.push(outcome);
+        }
+        assert_eq!(ids.len(), 6);
+
+        let target = embedder.embed("cuando falla el escenario 5").await.unwrap();
+        let hits = search_all_memories(&store, &target, "agent-tail", SearchScope::all_default(), 10)
+            .await
+            .unwrap();
+
+        let skill_hits = crate::commands::memory_admin::format_skill_hits(&hits);
+        assert_ne!(skill_hits, "skill_hits=0", "the query channel must reach skills");
+        assert!(
+            hits.iter().any(|h| h.kind == TableKind::Procedural && h.content == "skill-5"),
+            "the queried skill must be among the hits"
+        );
     }
 
     #[tokio::test]
@@ -888,10 +1176,10 @@ mod tests {
         }).await.unwrap();
 
         // Regenerate workspace AUTO section (captures user_preference)
-        wm.regenerate_auto_section("e2e-agent", None, &store).await.unwrap();
+        let emitted = wm.regenerate_auto_section("e2e-agent", None, &store).await.unwrap();
 
         let result = build_memory_prompt(
-            &store, &wm, Some(embedder), "e2e-agent", None, "some query", None
+            &store, &wm, Some(embedder), "e2e-agent", None, "some query", &emitted, None
         ).await.unwrap();
 
         // All four separators must appear in order
@@ -907,6 +1195,16 @@ mod tests {
         // user_preference content must be in workspace block (before RECENT)
         let workspace_block = &result[ws_pos..recent_pos];
         assert!(workspace_block.contains("prefer dark mode"), "user_preference must be in WORKSPACE block");
+
+        // …and nowhere else. The row is now inside the KNN scan set too, so
+        // without the emitted-id filter the same preference would be spent
+        // twice in the same prompt: once as standing context, once as a
+        // retrieval hit.
+        assert_eq!(
+            result.matches("prefer dark mode").count(),
+            1,
+            "a row the workspace already carries must not also arrive as a retrieval hit:\n{result}"
+        );
 
         // CONFLICTS block must contain the disputed pair
         let conflicts_block = &result[conf_pos..];

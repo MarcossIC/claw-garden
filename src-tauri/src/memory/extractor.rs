@@ -725,10 +725,16 @@ mod tests {
         );
     }
 
-    // Task 6.2 (regression lock): user_preference (tier=1) is NEVER
-    // KNN-retrievable — it is surfaced exclusively via workspace.md.
+    // A `user_preference` lands at tier 1 by type, and the workspace channel
+    // only carries the ones at importance >= 8. Leaving tier 1 out of the KNN
+    // pool therefore made every weaker preference unreachable through BOTH
+    // channels, and made the contradiction detector — which reuses this same
+    // search — structurally unable to fire against a preference, which is the
+    // case it exists for. Both channels now see tier 1; not delivering the
+    // same row twice is enforced in `prompt_builder`, against the ids the
+    // workspace actually emitted.
     #[tokio::test]
-    async fn user_preference_tier_1_is_excluded_from_knn_by_design() {
+    async fn user_preference_tier_1_is_retrievable_by_knn() {
         use crate::memory::search::{search_all_memories, SearchScope};
 
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -752,9 +758,46 @@ mod tests {
         let hits = search_all_memories(&store, &pref_emb, "agent-knn-pref", SearchScope::all_default(), 10)
             .await
             .unwrap();
+        let hit = hits
+            .iter()
+            .find(|h| h.id == pref_id)
+            .expect("user_preference must be reachable by KNN");
+        assert_eq!(hit.tier, 1, "the point of this test is that the row sits at tier 1");
+    }
+
+    // The anti-sycophancy guard runs through `search_all_memories`, so the
+    // pool's scan set decides what it can ever contradict. A preference that
+    // reverses an earlier one is the guard's reason to exist; this asserts it
+    // is now a candidate at all, independently of where the threshold lands.
+    #[tokio::test]
+    async fn contradiction_detection_sees_a_tier_1_user_preference() {
+        use crate::memory::contradiction::detect_contradiction;
+
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let embedder = FakeEmbedder::default();
+        let text = "Siempre usá voseo en las respuestas";
+        let emb = embedder.embed(text).await.unwrap();
+        let record = NewMemoryRecord {
+            scope: "agent",
+            agent_id: Some("agent-contra-pref".to_string()),
+            project_id: None,
+            content: text.to_string(),
+            memory_type: MemoryType::UserPreference,
+            source: MemorySource::Chat,
+            created_by_type: CreatedByType::System,
+            created_by_ref: "agent-contra-pref".to_string(),
+            importance: 8.0,
+            created_at_ms: 0,
+            disputed_against: None,
+        };
+        let stored_id = store.insert_memory_with_vector(record, emb.clone()).await.unwrap();
+
+        // Same embedding => distance 0, which is inside any threshold: this
+        // isolates "can the pool see it" from "is the threshold calibrated".
+        let candidates = detect_contradiction(&store, &emb, "agent-contra-pref").await;
         assert!(
-            !hits.iter().any(|h| h.id == pref_id),
-            "user_preference (tier=1) must NOT appear in KNN results (excluded by search.rs `tier > 1`)"
+            candidates.contains(&stored_id),
+            "a tier-1 user_preference must be a contradiction candidate"
         );
     }
 }

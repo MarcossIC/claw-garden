@@ -1061,7 +1061,8 @@ mod tests {
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let prompt = build_memory_prompt(
             &store, &wm, Some(embedder.clone() as Arc<dyn Embedder>),
-            AGENT, None, &fresh.content, None,
+            AGENT, None, &fresh.content,
+            &crate::memory::workspace::EmittedIds::default(), None,
         )
         .await
         .unwrap();

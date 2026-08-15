@@ -103,16 +103,13 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
         };
     }
 
-    let (golden_set, warnings) = match golden::load(&cli.golden_path) {
+    let golden_set = match golden::load(&cli.golden_path) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("golden set validation failed: {e}");
             return EXIT_GOLDEN_INVALID;
         }
     };
-    for warning in &warnings {
-        eprintln!("{warning}");
-    }
 
     let embedder = match cli.mode {
         cli::Mode::Fake => EvalEmbedder::fake(),

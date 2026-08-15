@@ -146,23 +146,17 @@
     {
       "query": "¿Qué preferencia tiene el usuario sobre ejecutar cargo build automáticamente?",
       "corpus_refs": ["c10"],
-      "expected_refs": ["c10"],
-      "status": "known_red",
-      "blocked_by": "rag-tier-reachability"
+      "expected_refs": ["c10"]
     },
     {
       "query": "What does the user prefer for commit message format and AI attribution?",
       "corpus_refs": ["c11"],
-      "expected_refs": ["c11"],
-      "status": "known_red",
-      "blocked_by": "rag-tier-reachability"
+      "expected_refs": ["c11"]
     },
     {
       "query": "What architectural decision was flagged as critically important regarding vec0's distance metric?",
       "corpus_refs": ["c12"],
-      "expected_refs": ["c12"],
-      "status": "known_red",
-      "blocked_by": "rag-tier-reachability"
+      "expected_refs": ["c12"]
     }
   ],
   "contradiction_pairs": [

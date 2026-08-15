@@ -460,9 +460,11 @@ fn project_id_from_path(project_path: Option<&str>) -> Option<String> {
 /// Computes the 4-block memory prefix (WORKSPACE / RECENT / LONG-TERM / CONFLICTS)
 /// for the given agent and user query.
 ///
-/// Regenerates the AUTO section of workspace.md unconditionally (D4 — cheap, ~2-5ms),
-/// then calls `build_memory_prompt`. Any failure is degraded to an empty prefix so
-/// chat ALWAYS proceeds (R-NEW-10 mitigation).
+/// Regenerates the AUTO section of workspace.md unconditionally — it costs
+/// ~2-5ms, cheap enough that tracking when it went stale would cost more than
+/// redoing it — then calls `build_memory_prompt`. Any failure is degraded to an
+/// empty prefix, because a memory subsystem that can block a chat turn is worse
+/// than one that occasionally forgets.
 ///
 /// Returns `(memory_prefix, combined_system_prompt)` where `combined_system_prompt`
 /// equals `agent_system_prompt` when the prefix is empty.
@@ -477,13 +479,18 @@ pub(crate) async fn compute_memory_prefix(
         state.base_dir.join("workspaces"),
     );
 
-    // D4 — unconditional regen of AUTO section (cheap, ~2-5ms)
-    if let Err(e) = workspace_mgr
+    // Unconditional regen of the AUTO section (cheap, ~2-5ms). Its return
+    // value names the rows the file now carries, so retrieval below can skip
+    // them instead of emitting the same content a second time. A failed regen
+    // leaves the previous file in place and yields no ids: the prompt may
+    // then repeat a row, which is a degraded prompt rather than a lost one.
+    let emitted = workspace_mgr
         .regenerate_auto_section(agent_id, project_id_opt, &state.memory_store)
         .await
-    {
-        log::warn!("workspace regen failed: {e}");
-    }
+        .unwrap_or_else(|e| {
+            log::warn!("workspace regen failed: {e}");
+            Default::default()
+        });
 
     let embedder_opt = state.embedder.get().cloned();
     let memory_prefix = crate::memory::prompt_builder::build_memory_prompt(
@@ -493,6 +500,7 @@ pub(crate) async fn compute_memory_prefix(
         agent_id,
         project_id_opt,
         user_query,
+        &emitted,
         Some(state.access_tracker.as_ref()),
     )
     .await

@@ -51,9 +51,8 @@ pub(crate) enum MemoryKind {
 
 /// Counts hits by tier and renders `"t1:{n1},t2:{n2},t3:{n3}"`.
 ///
-/// `t1` is always `0` when called from `search_all_memories` — the
-/// pre-existing `tier > 1` filter in `SEARCH_SQL_*` means tier-1 rows never
-/// reach KNN results. That is expected, not a bug.
+/// All three counts can be non-zero: the KNN pool scans every tier, so `t1`
+/// reports how much of the hottest tier the query actually pulled in.
 pub(crate) fn format_tier_distribution(hits: &[RankedHit]) -> String {
     let (mut t1, mut t2, mut t3) = (0u32, 0u32, 0u32);
     for h in hits {
@@ -67,8 +66,8 @@ pub(crate) fn format_tier_distribution(hits: &[RankedHit]) -> String {
     format!("t1:{t1},t2:{t2},t3:{t3}")
 }
 
-/// Renders whether tier-1 workspace content was present alongside the tier
-/// 2/3 retrieval hit count — the real measure of doc-7's "Tier 1 covers 80%"
+/// Renders whether tier-1 workspace content was present alongside the
+/// retrieval hit count — the real measure of the "Tier 1 covers 80%"
 /// criterion (neither signal alone can answer it).
 pub(crate) fn format_tier1_coverage(workspace_present: bool, hit_count: usize) -> String {
     format!("tier1_present={workspace_present} tier23_hits={hit_count}")
