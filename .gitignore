@@ -45,3 +45,4 @@ __screenshots__/
 .DS_Store
 Thumbs.db
 **/docs/completed-impl/*
+docs/golden.json

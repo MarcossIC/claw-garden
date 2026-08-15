@@ -25,6 +25,14 @@ name = "rag-eval"
 path = "src/bin/rag-eval/main.rs"
 required-features = ["eval"]
 
+# Authoring tool for the golden set, kept out of `rag-eval` on purpose: that
+# binary measures retrieval quality, and a measuring instrument must not also
+# build the yardstick it measures against.
+[[bin]]
+name = "golden-mine"
+path = "src/bin/golden-mine/main.rs"
+required-features = ["eval"]
+
 [build-dependencies]
 tauri-build = { version = "2.5.6", features = [] }
 

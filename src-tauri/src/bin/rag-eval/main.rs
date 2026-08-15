@@ -1,3 +1,4 @@
+mod audit;
 mod cli;
 mod golden;
 mod metrics;
@@ -27,6 +28,10 @@ const EXIT_RUNTIME_FAILURE: i32 = 1;
 const EXIT_GOLDEN_INVALID: i32 = 2;
 const EXIT_MODEL_ABSENT: i32 = 3;
 const EXIT_RESULTS_EXISTS: i32 = 4;
+/// The golden set loaded and scored, but `--audit` proved it cannot support a
+/// claim. Distinct from `EXIT_GOLDEN_INVALID`, which means the file is
+/// structurally broken: this one means the file is well-formed and useless.
+const EXIT_GOLDEN_UNFIT: i32 = 5;
 
 // Single-threaded runtime: the crate's declared tokio features (sync, macros,
 // time, rt, process, io-util) do not include `rt-multi-thread`, so the
@@ -256,6 +261,11 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
         cli::Mode::Real => report::Mode::Real,
     };
 
+    // Audited over the active cases only, matching what `aggregate` reports: a
+    // `known_red` case is blocked by a change that does not exist yet, so its
+    // ranking says nothing about whether the golden set can discriminate.
+    let audit_report = cli.audit.then(|| audit::audit(&per_case, &golden_set.corpus));
+
     let results = report::RunResults {
         date: current_date_string(),
         mode,
@@ -267,13 +277,10 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
         n_retrieval_cases: golden_set.retrieval_cases.len(),
         n_contradiction_pairs: golden_set.contradiction_pairs.len(),
         known_bugs_live: known_bugs_live(cli.mode),
-        golden_set: report::GoldenSetProvenance {
-            provisional: true,
-            note: "only the ~13-case template sample is authored so far; the domain cases from real \
-                   usage are still pending, so a later run against a fuller golden set will move every \
-                   metric for reasons that have nothing to do with retrieval quality"
-                .to_string(),
-        },
+        golden_set: report::GoldenSetProvenance::derive(
+            golden_set.retrieval_cases.len(),
+            golden_set.contradiction_pairs.len(),
+        ),
         retrieval: report::RetrievalResults {
             aggregate,
             by_lang: by_lang_aggregate,
@@ -286,11 +293,19 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             mean_norm: seeded.mean_norm,
             max_deviation: seeded.max_norm_deviation,
         },
+        audit: audit_report,
     };
 
     report::print_stdout(&results);
+    if let Some(a) = &results.audit {
+        audit::print_report(a);
+    }
 
-    match report::write_json(&results, &cli.out_dir, cli.force) {
+    // The results file is written even when the audit fails. A run that proved
+    // its own golden set unfit is exactly the evidence a later reader needs in
+    // order to discount the numbers above it, and withholding the artifact
+    // would leave that conclusion undocumented.
+    let write_outcome = match report::write_json(&results, &cli.out_dir, cli.force) {
         Ok(path) => {
             println!("results written to {}", path.display());
             EXIT_OK
@@ -303,7 +318,17 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             eprintln!("failed to write results: {e}");
             EXIT_RUNTIME_FAILURE
         }
+    };
+
+    // A failed audit only overrides a run that was otherwise clean: an
+    // unwritten results file is the more urgent problem, and masking it behind
+    // the audit code would hide it.
+    if write_outcome == EXIT_OK
+        && results.audit.as_ref().is_some_and(|a| a.verdict == audit::Verdict::Unusable)
+    {
+        return EXIT_GOLDEN_UNFIT;
     }
+    write_outcome
 }
 
 /// The language to attribute a retrieval case to: the `lang` its expected

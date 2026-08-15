@@ -124,15 +124,68 @@ pub struct NormCheck {
     pub max_deviation: f64,
 }
 
-/// Marks whether the golden set backing this run is the ~10-case template
-/// sample or the full domain set. A later run against a fuller golden set
-/// will move every metric, and that movement must never be read as a
-/// retrieval improvement or regression — it is a change in what was
-/// measured, not in how well it was measured.
+/// Marks whether the golden set backing this run is the small template sample
+/// or a domain set large enough to measure against. A run against a fuller
+/// golden set moves every metric, and that movement must never be read as a
+/// retrieval improvement or regression — it is a change in what was measured,
+/// not in how well it was measured.
 #[derive(Debug, Clone, Serialize)]
 pub struct GoldenSetProvenance {
     pub provisional: bool,
     pub note: String,
+}
+
+/// Case and pair counts below which a golden set cannot carry a claim. Taken
+/// from the sizes the improvement plan specifies for the domain set (~30–50
+/// retrieval cases, ~20–30 contradiction pairs) rather than picked here: a set
+/// that reaches them is the set that plan asked for.
+const DOMAIN_SET_MIN_CASES: usize = 30;
+const DOMAIN_SET_MIN_PAIRS: usize = 20;
+
+impl GoldenSetProvenance {
+    /// Derives provenance from what the loaded golden set actually contains.
+    ///
+    /// This was a hardcoded `provisional: true` and stayed true after it
+    /// stopped being so — the same failure mode a `known_bugs_live` entry hit
+    /// earlier, and worse here because the flag is serialized into every
+    /// results file. A stale `true` teaches every future reader to discount
+    /// numbers that deserve to be trusted, and nothing in a passing test suite
+    /// would ever contradict it. Computing it from the counts means the claim
+    /// cannot outlive the condition it describes.
+    pub fn derive(n_cases: usize, n_pairs: usize) -> Self {
+        let short_on_cases = n_cases < DOMAIN_SET_MIN_CASES;
+        let short_on_pairs = n_pairs < DOMAIN_SET_MIN_PAIRS;
+        let lacking = match (short_on_cases, short_on_pairs) {
+            // The one arm that is not a shortfall, kept inside the match so
+            // the compiler proves every combination is handled.
+            (false, false) => {
+                return Self {
+                    provisional: false,
+                    note: format!(
+                        "domain golden set: {n_cases} retrieval cases, \
+                         {n_pairs} contradiction pairs"
+                    ),
+                }
+            }
+            (true, true) => format!(
+                "only {n_cases} retrieval cases (needs {DOMAIN_SET_MIN_CASES}) and \
+                 {n_pairs} contradiction pairs (needs {DOMAIN_SET_MIN_PAIRS})"
+            ),
+            (true, false) => format!(
+                "only {n_cases} retrieval cases (needs {DOMAIN_SET_MIN_CASES})"
+            ),
+            (false, true) => format!(
+                "only {n_pairs} contradiction pairs (needs {DOMAIN_SET_MIN_PAIRS})"
+            ),
+        };
+        Self {
+            provisional: true,
+            note: format!(
+                "{lacking}; a later run against a fuller golden set will move every metric \
+                 for reasons that have nothing to do with retrieval quality"
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -154,6 +207,11 @@ pub struct RunResults {
     pub golden_set: GoldenSetProvenance,
     pub retrieval: RetrievalResults,
     pub contradiction: ContradictionResults,
+    /// Present only when the run was asked to audit its own golden set.
+    /// Absent — rather than a zeroed report — when it was not, so a reader can
+    /// tell "this set was never audited" from "this set was audited and passed".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit: Option<crate::audit::AuditReport>,
     pub norm_check: NormCheck,
 }
 
@@ -356,6 +414,50 @@ pub fn print_stdout(results: &RunResults) {
 mod tests {
     use super::*;
 
+    // --- golden-set provenance ------------------------------------------
+
+    #[test]
+    fn a_full_domain_set_is_not_provisional() {
+        let p = GoldenSetProvenance::derive(46, 28);
+        assert!(!p.provisional);
+        assert!(p.note.contains("46 retrieval cases"), "note was: {}", p.note);
+    }
+
+    #[test]
+    fn a_set_exactly_at_both_thresholds_is_not_provisional() {
+        // The boundary is the one place an off-by-one would flip the meaning
+        // of every results file written that day.
+        assert!(!GoldenSetProvenance::derive(DOMAIN_SET_MIN_CASES, DOMAIN_SET_MIN_PAIRS).provisional);
+    }
+
+    #[test]
+    fn too_few_cases_stays_provisional_and_says_which_count_is_short() {
+        let p = GoldenSetProvenance::derive(13, 28);
+        assert!(p.provisional);
+        assert!(p.note.contains("13 retrieval cases"), "note was: {}", p.note);
+        assert!(!p.note.contains("contradiction pairs (needs"), "note was: {}", p.note);
+    }
+
+    #[test]
+    fn too_few_pairs_stays_provisional_even_with_plenty_of_cases() {
+        let p = GoldenSetProvenance::derive(46, 9);
+        assert!(p.provisional);
+        assert!(p.note.contains("9 contradiction pairs"), "note was: {}", p.note);
+    }
+
+    #[test]
+    fn short_on_both_counts_reports_both() {
+        let p = GoldenSetProvenance::derive(13, 9);
+        assert!(p.provisional);
+        assert!(p.note.contains("13 retrieval cases"), "note was: {}", p.note);
+        assert!(p.note.contains("9 contradiction pairs"), "note was: {}", p.note);
+    }
+
+    #[test]
+    fn an_empty_golden_set_is_provisional() {
+        assert!(GoldenSetProvenance::derive(0, 0).provisional);
+    }
+
     fn case(query: &str, recall_10: f64, status: CaseStatus) -> CaseResult {
         CaseResult {
             query: query.to_string(),
@@ -470,10 +572,7 @@ mod tests {
             n_retrieval_cases: 1,
             n_contradiction_pairs: 0,
             known_bugs_live: vec!["fake-embedder-unnormalized-contradiction-sweep-degenerate".to_string()],
-            golden_set: GoldenSetProvenance {
-                provisional: true,
-                note: "template sample only".to_string(),
-            },
+            golden_set: GoldenSetProvenance::derive(1, 0),
             retrieval: RetrievalResults {
                 aggregate: Aggregate::default(),
                 by_lang: vec![],
@@ -482,7 +581,21 @@ mod tests {
             },
             contradiction: ContradictionResults { curve: vec![], by_lang: vec![] },
             norm_check: NormCheck { asserted: false, mean_norm: 11.3, max_deviation: 10.3 },
+            audit: None,
         }
+    }
+
+    #[test]
+    fn an_unaudited_run_omits_the_audit_key_entirely() {
+        // Serializing it as `null` would read as "audited, found nothing",
+        // which is a different claim from "never audited".
+        let out_dir = std::env::temp_dir().join(format!("rag-eval-report-test-{}", uuid::Uuid::new_v4()));
+        let results = minimal_results("2026-07-27", Mode::Fake);
+        let path = write_json(&results, &out_dir, false).expect("write must succeed");
+        let written = std::fs::read_to_string(&path).expect("must read back");
+        let json: serde_json::Value = serde_json::from_str(&written).expect("valid JSON");
+        assert!(json.get("audit").is_none(), "audit key must be absent, got {:?}", json.get("audit"));
+        std::fs::remove_dir_all(&out_dir).ok();
     }
 
     #[test]

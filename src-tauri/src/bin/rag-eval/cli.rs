@@ -22,6 +22,12 @@ pub struct Cli {
     pub golden_path: PathBuf,
     pub out_dir: PathBuf,
     pub force: bool,
+    /// Audit the golden set's own fitness in addition to scoring retrieval,
+    /// and fail the run if it cannot carry a claim. Additive rather than a
+    /// third mode: the audit reads the rankings the normal run already
+    /// produces, so making it exclusive with `--fake`/`--real` would mean
+    /// computing them twice to answer two questions about the same run.
+    pub audit: bool,
 }
 
 /// What a parse attempt produces. `--help` is not an error: it takes
@@ -58,6 +64,9 @@ MODES (exactly one required):
 OPTIONS:
     --check-only        Valid only with --real: verify the model is cached without downloading it
                          or running the harness. Combined with --fake this is a harmless no-op.
+    --audit             Also audit whether the golden set can carry a claim at all
+                         (saturation, query-independence of the ranking, and whether
+                         queries restate their own answers). Exits 5 if it cannot.
     --golden <path>     Override the default golden set (docs/eval/golden.json)
     --out <dir>         Override the default results directory (docs/eval/results/)
     --force             Allow overwriting an existing results file for the same date+config
@@ -69,6 +78,7 @@ EXIT CODES:
     2    golden set failed validation
     3    --real --check-only and the model is not cached
     4    a results file for this date+config already exists and --force was not given
+    5    --audit and the golden set is not fit to measure against
 ";
 
 /// Default golden-set path, resolved relative to this crate's own manifest
@@ -103,6 +113,7 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
     let mut golden_path: Option<PathBuf> = None;
     let mut out_dir: Option<PathBuf> = None;
     let mut force = false;
+    let mut audit = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -121,6 +132,7 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
             }
             "--check-only" => check_only = true,
             "--force" => force = true,
+            "--audit" => audit = true,
             "--golden" => {
                 let value = args
                     .next()
@@ -145,6 +157,7 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
         golden_path: golden_path.unwrap_or_else(default_golden_path),
         out_dir: out_dir.unwrap_or_else(default_out_dir),
         force,
+        audit,
     }))
 }
 
@@ -172,8 +185,17 @@ mod tests {
         assert_eq!(cli.mode, Mode::Fake);
         assert!(!cli.check_only);
         assert!(!cli.force);
+        assert!(!cli.audit, "auditing must be opt-in: it can fail an otherwise fine run");
         assert_eq!(cli.golden_path, default_golden_path());
         assert_eq!(cli.out_dir, default_out_dir());
+    }
+
+    #[test]
+    fn audit_composes_with_either_mode_rather_than_replacing_it() {
+        assert!(run_cli(&["--fake", "--audit"]).audit);
+        let cli = run_cli(&["--audit", "--real"]);
+        assert!(cli.audit);
+        assert_eq!(cli.mode, Mode::Real);
     }
 
     #[test]
