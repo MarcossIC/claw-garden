@@ -4,12 +4,55 @@ use std::sync::{Arc, Once};
 use rusqlite::OptionalExtension;
 use tokio_rusqlite::Connection;
 
+use crate::memory::embedder::Embedder;
 use crate::memory::error::MemoryError;
 use crate::memory::latency::KnnLatency;
 
 // ---------------------------------------------------------------------------
 // Embedding contract
 // ---------------------------------------------------------------------------
+
+/// The active embedder's full identity, as reported by the embedder itself —
+/// never assembled from two different sources. `model_id`/`dim`/`query_prefix`/
+/// `passage_prefix` are properties the embedder reports about itself (like
+/// `dim = 384`), not invariants the store imposes; `metric`/`normalized` stay
+/// out of this type for exactly that reason (see `ensure_embedding_contract`'s
+/// doc comment).
+///
+/// Named fields, not four positional args: two adjacent `String` prefixes
+/// would let a query/passage swap compile silently and produce a contract
+/// wrong in a way nothing would notice unless a test asserted orientation.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct EmbeddingIdentity {
+    pub(crate) model_id: String,
+    pub(crate) dim: usize,
+    pub(crate) query_prefix: String,
+    pub(crate) passage_prefix: String,
+}
+
+impl EmbeddingIdentity {
+    /// Reads all four fields off ONE embedder instance — a mismatch cannot be
+    /// assembled by pairing metadata from two different sources.
+    pub(crate) fn of(e: &dyn Embedder) -> Self {
+        Self {
+            model_id: e.model_id().to_string(),
+            dim: e.dimensions(),
+            query_prefix: e.query_prefix().to_string(),
+            passage_prefix: e.passage_prefix().to_string(),
+        }
+    }
+}
+
+/// The `embedding_contract` row as it was actually persisted. `dim` is `i64`
+/// because it came out of SQLite, not `usize` like the active embedder
+/// reports — the boundary is the point where that type change happens.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StoredContract {
+    pub(crate) model_id: String,
+    pub(crate) dim: i64,
+    pub(crate) query_prefix: String,
+    pub(crate) passage_prefix: String,
+}
 
 /// Outcome of comparing the active embedder's identity against the
 /// persisted `embedding_contract` row.
@@ -20,19 +63,49 @@ use crate::memory::latency::KnnLatency;
 /// separately.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ContractStatus {
-    /// An existing row's `model_id` + `dim` match the active embedder.
+    /// An existing row's `model_id` + `dim` + `query_prefix` + `passage_prefix`
+    /// match the active embedder.
     Match,
     /// No row existed; one was just written from the active embedder's metadata.
     Initialized,
-    /// An existing row's `model_id` or `dim` differs from the active embedder —
-    /// the store holds vectors from a different embedding space than the one
-    /// currently loaded.
+    /// An existing row differs from the active embedder on at least one of
+    /// `model_id` / `dim` / `query_prefix` / `passage_prefix` — the store
+    /// holds vectors from a different embedding space than the one currently
+    /// loaded.
     Mismatch {
-        stored_model_id: String,
-        stored_dim: i64,
-        actual_model_id: String,
-        actual_dim: usize,
+        stored: StoredContract,
+        actual: EmbeddingIdentity,
     },
+}
+
+/// One entry per field that differs between `stored` and `actual`, each
+/// naming the field and `{:?}`-quoting both sides so a one-trailing-space
+/// prefix difference is visible in a log line instead of looking identical.
+/// Pure — this is the message body, not a side-effecting log call.
+pub(crate) fn differing_fields(stored: &StoredContract, actual: &EmbeddingIdentity) -> Vec<String> {
+    let mut out = Vec::new();
+    if stored.model_id != actual.model_id {
+        out.push(format!(
+            "model_id: stored={:?} actual={:?}",
+            stored.model_id, actual.model_id
+        ));
+    }
+    if stored.dim != actual.dim as i64 {
+        out.push(format!("dim: stored={:?} actual={:?}", stored.dim, actual.dim));
+    }
+    if stored.query_prefix != actual.query_prefix {
+        out.push(format!(
+            "query_prefix: stored={:?} actual={:?}",
+            stored.query_prefix, actual.query_prefix
+        ));
+    }
+    if stored.passage_prefix != actual.passage_prefix {
+        out.push(format!(
+            "passage_prefix: stored={:?} actual={:?}",
+            stored.passage_prefix, actual.passage_prefix
+        ));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -162,24 +235,28 @@ impl MemoryStore {
     /// Write-if-absent, verify-if-present bootstrap for the single-row
     /// `embedding_contract` table.
     ///
-    /// Compares ONLY `model_id` + `dim` against the stored row — `metric`
-    /// and `normalized` are invariants `memory::vector::to_unit` imposes on
-    /// every row in this store, not properties the embedder itself reports,
-    /// so they are never part of the comparison.
+    /// Compares `model_id` + `dim` + `query_prefix` + `passage_prefix`
+    /// against the stored row, byte-exact — no trim, no normalization: a
+    /// prefix is fed verbatim to the tokenizer, so `"query:"` and `"query: "`
+    /// tokenize to different sequences and a trimmed comparison would forgive
+    /// exactly the difference that matters. `metric` and `normalized` stay
+    /// OUT of the comparison for the opposite reason: they are invariants
+    /// `memory::vector::to_unit` imposes on every row in this store, not
+    /// properties the embedder itself reports — the four compared fields are
+    /// all things the embedder tells you about itself (like `dim = 384`);
+    /// `metric`/`normalized` are things this codebase decided.
     pub(crate) async fn ensure_embedding_contract(
         &self,
-        model_id: &str,
-        dim: usize,
+        identity: EmbeddingIdentity,
     ) -> Result<ContractStatus, MemoryError> {
-        let model_id = model_id.to_string();
-        let dim_i64 = dim as i64;
         self.conn
             .call(move |c| -> rusqlite::Result<ContractStatus> {
-                let existing: Option<(String, i64)> = c
+                let existing: Option<(String, i64, String, String)> = c
                     .query_row(
-                        "SELECT model_id, dim FROM embedding_contract WHERE id = 1",
+                        "SELECT model_id, dim, query_prefix, passage_prefix \
+                         FROM embedding_contract WHERE id = 1",
                         [],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                     )
                     .optional()?;
 
@@ -189,21 +266,32 @@ impl MemoryStore {
                         c.execute(
                             "INSERT INTO embedding_contract \
                              (id, model_id, dim, metric, normalized, query_prefix, passage_prefix, created_at) \
-                             VALUES (1, ?1, ?2, 'l2_unit', 1, '', '', ?3)",
-                            rusqlite::params![model_id, dim_i64, created_at],
+                             VALUES (1, ?1, ?2, 'l2_unit', 1, ?3, ?4, ?5)",
+                            rusqlite::params![
+                                identity.model_id,
+                                identity.dim as i64,
+                                identity.query_prefix,
+                                identity.passage_prefix,
+                                created_at
+                            ],
                         )?;
                         Ok(ContractStatus::Initialized)
                     }
-                    Some((stored_model_id, stored_dim)) => {
-                        if stored_model_id == model_id && stored_dim == dim_i64 {
+                    Some((stored_model_id, stored_dim, stored_query_prefix, stored_passage_prefix)) => {
+                        let stored = StoredContract {
+                            model_id: stored_model_id,
+                            dim: stored_dim,
+                            query_prefix: stored_query_prefix,
+                            passage_prefix: stored_passage_prefix,
+                        };
+                        if stored.model_id == identity.model_id
+                            && stored.dim == identity.dim as i64
+                            && stored.query_prefix == identity.query_prefix
+                            && stored.passage_prefix == identity.passage_prefix
+                        {
                             Ok(ContractStatus::Match)
                         } else {
-                            Ok(ContractStatus::Mismatch {
-                                stored_model_id,
-                                stored_dim,
-                                actual_model_id: model_id,
-                                actual_dim: dim,
-                            })
+                            Ok(ContractStatus::Mismatch { stored, actual: identity })
                         }
                     }
                 }
@@ -765,14 +853,111 @@ mod tests {
     // Embedding contract: write-if-absent, verify-if-present
     // -----------------------------------------------------------------------
 
+    /// Test-only embedder double with configurable, independently-settable
+    /// query/passage prefixes — `FakeEmbedder` returns `""` for both, which
+    /// cannot exercise a prefix-only mismatch.
+    struct MockEmbedder {
+        model_id: String,
+        dim: usize,
+        query_prefix: String,
+        passage_prefix: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::memory::embedder::Embedder for MockEmbedder {
+        async fn embed_with_role(
+            &self,
+            _text: &str,
+            _role: crate::memory::embedder::EmbedRole,
+        ) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+            Ok(vec![0.0; self.dim])
+        }
+        fn dimensions(&self) -> usize {
+            self.dim
+        }
+        fn model_id(&self) -> &str {
+            &self.model_id
+        }
+        fn query_prefix(&self) -> &str {
+            &self.query_prefix
+        }
+        fn passage_prefix(&self) -> &str {
+            &self.passage_prefix
+        }
+    }
+
+    fn identity(model_id: &str, dim: usize, query_prefix: &str, passage_prefix: &str) -> EmbeddingIdentity {
+        EmbeddingIdentity {
+            model_id: model_id.to_string(),
+            dim,
+            query_prefix: query_prefix.to_string(),
+            passage_prefix: passage_prefix.to_string(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // EmbeddingIdentity::of — reads all 4 fields off one embedder instance
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn embedding_identity_of_reads_all_four_fields_off_one_embedder() {
+        let mock = MockEmbedder {
+            model_id: "multilingual-e5-small".to_string(),
+            dim: 384,
+            query_prefix: "query: ".to_string(),
+            passage_prefix: "passage: ".to_string(),
+        };
+        let got = EmbeddingIdentity::of(&mock);
+        assert_eq!(got.model_id, "multilingual-e5-small");
+        assert_eq!(got.dim, 384);
+        assert_eq!(got.query_prefix, "query: ");
+        assert_eq!(got.passage_prefix, "passage: ");
+    }
+
+    // -----------------------------------------------------------------------
+    // differing_fields — pure
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn differing_fields_matching_contract_is_empty() {
+        let stored = StoredContract {
+            model_id: "m".to_string(),
+            dim: 384,
+            query_prefix: "query: ".to_string(),
+            passage_prefix: "passage: ".to_string(),
+        };
+        let actual = identity("m", 384, "query: ", "passage: ");
+        assert!(differing_fields(&stored, &actual).is_empty());
+    }
+
+    #[test]
+    fn differing_fields_passage_prefix_only_names_exactly_that_field() {
+        let stored = StoredContract {
+            model_id: "m".to_string(),
+            dim: 384,
+            query_prefix: "query: ".to_string(),
+            passage_prefix: "passage:".to_string(), // missing the trailing space
+        };
+        let actual = identity("m", 384, "query: ", "passage: ");
+        let diffs = differing_fields(&stored, &actual);
+        assert_eq!(diffs.len(), 1, "expected exactly one differing field, got {diffs:?}");
+        assert!(diffs[0].contains("passage_prefix"), "got {diffs:?}");
+        assert!(diffs[0].contains("\"passage:\""), "stored value must be Debug-quoted, got {diffs:?}");
+        assert!(diffs[0].contains("\"passage: \""), "actual value must be Debug-quoted, got {diffs:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // ensure_embedding_contract — widened to compare prefixes too
+    // -----------------------------------------------------------------------
+
     /// First call on an empty table writes the row and reports `Initialized`;
-    /// a second call with the SAME model_id/dim finds the row unchanged and
+    /// a second call with the SAME identity finds the row unchanged and
     /// reports `Match` instead of rewriting it.
     #[tokio::test]
     async fn ensure_embedding_contract_initializes_then_matches() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let status1 = store
-            .ensure_embedding_contract("multilingual-e5-small", 384)
+            .ensure_embedding_contract(identity("multilingual-e5-small", 384, "query: ", "passage: "))
             .await
             .unwrap();
         assert_eq!(
@@ -782,14 +967,38 @@ mod tests {
         );
 
         let status2 = store
-            .ensure_embedding_contract("multilingual-e5-small", 384)
+            .ensure_embedding_contract(identity("multilingual-e5-small", 384, "query: ", "passage: "))
             .await
             .unwrap();
         assert_eq!(
             status2,
             ContractStatus::Match,
-            "second call with the same model_id/dim must match, not rewrite"
+            "second call with the same identity must match, not rewrite"
         );
+    }
+
+    /// A fresh store's INSERT writes the REAL prefixes, not `''` literals.
+    #[tokio::test]
+    async fn ensure_embedding_contract_insert_writes_real_prefixes_not_empty_string() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        store
+            .ensure_embedding_contract(identity("multilingual-e5-small", 384, "query: ", "passage: "))
+            .await
+            .unwrap();
+
+        let (query_prefix, passage_prefix): (String, String) = store
+            .conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT query_prefix, passage_prefix FROM embedding_contract WHERE id = 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(query_prefix, "query: ");
+        assert_eq!(passage_prefix, "passage: ");
     }
 
     /// A different `model_id` against an existing row is reported as a
@@ -798,45 +1007,80 @@ mod tests {
     async fn ensure_embedding_contract_reports_mismatch_on_different_model() {
         let store = MemoryStore::new_for_test().await.unwrap();
         store
-            .ensure_embedding_contract("multilingual-e5-small", 384)
+            .ensure_embedding_contract(identity("multilingual-e5-small", 384, "query: ", "passage: "))
             .await
             .unwrap();
         let status = store
-            .ensure_embedding_contract("other-model", 384)
+            .ensure_embedding_contract(identity("other-model", 384, "query: ", "passage: "))
             .await
             .unwrap();
         match status {
-            ContractStatus::Mismatch {
-                stored_model_id,
-                stored_dim,
-                actual_model_id,
-                actual_dim,
-            } => {
-                assert_eq!(stored_model_id, "multilingual-e5-small");
-                assert_eq!(stored_dim, 384);
-                assert_eq!(actual_model_id, "other-model");
-                assert_eq!(actual_dim, 384);
+            ContractStatus::Mismatch { stored, actual } => {
+                assert_eq!(stored.model_id, "multilingual-e5-small");
+                assert_eq!(stored.dim, 384);
+                assert_eq!(actual.model_id, "other-model");
+                assert_eq!(actual.dim, 384);
             }
             other => panic!("expected Mismatch, got {other:?}"),
         }
     }
 
-    /// A different `dim` against an existing row (same model_id) is also a
-    /// mismatch — the comparison is on the pair, not just the name.
+    /// A different `dim` against an existing row (same model_id, same
+    /// prefixes) is also a mismatch — model_id/dim comparison still works
+    /// standalone after the widening.
     #[tokio::test]
     async fn ensure_embedding_contract_reports_mismatch_on_different_dim() {
         let store = MemoryStore::new_for_test().await.unwrap();
         store
-            .ensure_embedding_contract("multilingual-e5-small", 384)
+            .ensure_embedding_contract(identity("multilingual-e5-small", 384, "query: ", "passage: "))
             .await
             .unwrap();
         let status = store
-            .ensure_embedding_contract("multilingual-e5-small", 768)
+            .ensure_embedding_contract(identity("multilingual-e5-small", 768, "query: ", "passage: "))
             .await
             .unwrap();
         assert!(
             matches!(status, ContractStatus::Mismatch { .. }),
             "different dim must be reported as mismatch, got {status:?}"
         );
+    }
+
+    /// Matching model_id/dim/query_prefix but a stale `passage_prefix` — even
+    /// by one trailing space — must still be reported as a mismatch. This is
+    /// the scenario `Normalize` vs. `ReInfer`-without-completion produces.
+    #[tokio::test]
+    async fn ensure_embedding_contract_reports_mismatch_on_stale_passage_prefix_only() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        store
+            .ensure_embedding_contract(identity("multilingual-e5-small", 384, "query: ", "passage:"))
+            .await
+            .unwrap();
+        let status = store
+            .ensure_embedding_contract(identity("multilingual-e5-small", 384, "query: ", "passage: "))
+            .await
+            .unwrap();
+        match status {
+            ContractStatus::Mismatch { stored, actual } => {
+                assert_eq!(stored.model_id, actual.model_id, "model_id must still match");
+                assert_eq!(stored.dim, actual.dim as i64, "dim must still match");
+                assert_ne!(stored.passage_prefix, actual.passage_prefix);
+            }
+            other => panic!("expected Mismatch on passage_prefix alone, got {other:?}"),
+        }
+    }
+
+    /// Matching prefixes on both sides → `Match`, not a false mismatch.
+    #[tokio::test]
+    async fn ensure_embedding_contract_matches_when_prefixes_agree() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        store
+            .ensure_embedding_contract(identity("multilingual-e5-small", 384, "query: ", "passage: "))
+            .await
+            .unwrap();
+        let status = store
+            .ensure_embedding_contract(identity("multilingual-e5-small", 384, "query: ", "passage: "))
+            .await
+            .unwrap();
+        assert_eq!(status, ContractStatus::Match);
     }
 }

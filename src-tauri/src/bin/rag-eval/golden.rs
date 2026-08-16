@@ -170,9 +170,20 @@ pub enum GoldenError {
     MissingBlockedBy(String),
 }
 
+/// A validated golden set paired with the SHA-256 of the exact bytes it was
+/// parsed from. The hash is computed over the same read, never a re-read by
+/// path (which could see a different file) or over the re-serialized struct
+/// (which would hide a whitespace-only edit) — it is the one honest answer to
+/// "what set did this run actually score against".
+#[derive(Debug)]
+pub struct LoadedGolden {
+    pub set: GoldenSet,
+    pub content_sha256: String,
+}
+
 /// Reads, parses and validates `path` — no database is opened and no row is
 /// seeded here.
-pub fn load(path: &Path) -> Result<GoldenSet, GoldenError> {
+pub fn load(path: &Path) -> Result<LoadedGolden, GoldenError> {
     let raw = std::fs::read_to_string(path).map_err(|source| GoldenError::Io {
         path: path.display().to_string(),
         source,
@@ -182,7 +193,8 @@ pub fn load(path: &Path) -> Result<GoldenSet, GoldenError> {
         source,
     })?;
     validate(&golden)?;
-    Ok(golden)
+    let content_sha256 = agent_office_lib::eval_api::sha256_hex(raw.as_bytes());
+    Ok(LoadedGolden { set: golden, content_sha256 })
 }
 
 /// Validates a parsed golden set, aborting on the first structural problem
@@ -466,6 +478,27 @@ mod tests {
             Err(GoldenError::Io { .. }) => {}
             other => panic!("expected Io error, got {other:?}"),
         }
+    }
+
+    // --- content hash ------------------------------------------------------
+
+    #[test]
+    fn loaded_golden_carries_the_sha256_of_its_own_raw_bytes() {
+        let path = std::env::temp_dir().join(format!(
+            "rag-eval-golden-test-hash-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, VALID_MINIMAL).expect("write temp fixture");
+
+        let loaded = load(&path).expect("valid fixture must load");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            loaded.content_sha256,
+            agent_office_lib::eval_api::sha256_hex(VALID_MINIMAL.as_bytes()),
+            "the hash must describe the exact bytes on disk, not a re-serialization"
+        );
+        assert_eq!(loaded.set.corpus.len(), 1);
     }
 
     // --- RefMap: trivial bidirectional lookups ------------------------------

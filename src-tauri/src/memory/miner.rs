@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::memory::db::MemoryStore;
-use crate::memory::embedder::Embedder;
+use crate::memory::embedder::{EmbedRole, Embedder};
 use crate::memory::episodic_writer::{run_episodic_writer_core, TrajectoryDraft};
 use crate::models::chat::Role;
 use crate::models::{ChatMessage, ChatRequest, ChatStreamResult};
@@ -105,6 +105,17 @@ const RECURRING_THRESHOLD: usize = 2;
 /// Bound on the number of prior Golden trajectories fetched per candidate
 /// (spec R6, LOCKED).
 const PRIOR_TRAJECTORIES_LIMIT: i64 = 500;
+
+/// Single producer of the text embedded for a procedural skill row — trigger
+/// FIRST, then skill_name (spec R3). Shared between the live write path
+/// (below) and `reembed_all`'s backfill: the two MUST build the identical
+/// string from the same `(trigger, skill_name)` pair, or the backfill
+/// silently re-infers a vector for a different string than the one the row
+/// was originally written against, changing what the row means without
+/// anyone deciding that.
+pub(crate) fn skill_embedding_text(trigger: &str, skill_name: &str) -> String {
+    format!("{trigger} {skill_name}")
+}
 
 /// Single producer of the dedup key / `tool_sequence` column value (spec R5)
 /// — used on BOTH the SELECT (dedup check) and INSERT/UPDATE paths. Inline
@@ -480,10 +491,20 @@ pub(crate) async fn mine_session_core(
             let mut source_trajectory_ids = vec![candidate.source_trajectory_id];
             source_trajectory_ids.extend(matched);
 
-            // R3: embed "{trigger} {skill_name}" (trigger first). Absent
-            // embedder / embed failure => None, never fatal (R9).
+            // R3: embed "{trigger} {skill_name}" (trigger first), via the
+            // single shared producer `skill_embedding_text` — `reembed_all`
+            // calls the same function so a backfilled vector always matches
+            // what a live write would have produced. Passage: a skill row is
+            // stored content, retrieved later by a Query-role search.
+            // Absent embedder / embed failure => None, never fatal (R9).
             let embedding = match &embedder {
-                Some(e) => match e.embed(&format!("{} {}", candidate.trigger, candidate.skill_name)).await {
+                Some(e) => match e
+                    .embed_with_role(
+                        &skill_embedding_text(&candidate.trigger, &candidate.skill_name),
+                        EmbedRole::Passage,
+                    )
+                    .await
+                {
                     Ok(v) => Some(v),
                     Err(e) => {
                         log::warn!(
@@ -1533,25 +1554,36 @@ mod tests {
 
     // ── Post-verify W1 (R3) — embed text exacto "{trigger} {skill_name}" ─────
 
-    /// Wraps FakeEmbedder and records every input text — lets tests assert
-    /// the EXACT string handed to `embed()` (R3: trigger first, then
-    /// skill_name), which the stored vector alone cannot prove readably.
+    /// Wraps FakeEmbedder and records every `(role, text)` pair — lets tests
+    /// assert the EXACT string AND role handed to `embed_with_role` (R3:
+    /// trigger first, then skill_name; role Passage), which the stored
+    /// vector alone cannot prove readably.
     struct CapturingEmbedder {
         inner: FakeEmbedder,
-        texts: Arc<std::sync::Mutex<Vec<String>>>,
+        calls: Arc<std::sync::Mutex<Vec<(EmbedRole, String)>>>,
     }
 
     #[async_trait::async_trait]
     impl Embedder for CapturingEmbedder {
-        async fn embed(&self, text: &str) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
-            self.texts.lock().unwrap().push(text.to_string());
-            self.inner.embed(text).await
+        async fn embed_with_role(
+            &self,
+            text: &str,
+            role: EmbedRole,
+        ) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+            self.calls.lock().unwrap().push((role, text.to_string()));
+            self.inner.embed_with_role(text, role).await
         }
         fn dimensions(&self) -> usize {
             384
         }
         fn model_id(&self) -> &str {
             "capturing-fake"
+        }
+        fn query_prefix(&self) -> &str {
+            ""
+        }
+        fn passage_prefix(&self) -> &str {
+            ""
         }
     }
 
@@ -1563,9 +1595,9 @@ mod tests {
     #[tokio::test]
     async fn skill_embed_text_is_trigger_then_skill_name() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let texts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let embedder: Arc<dyn Embedder> =
-            Arc::new(CapturingEmbedder { inner: FakeEmbedder::default(), texts: texts.clone() });
+            Arc::new(CapturingEmbedder { inner: FakeEmbedder::default(), calls: calls.clone() });
         let provider_by_agent: HashMap<String, Arc<dyn AiProvider>> = HashMap::new();
         let project_by_agent: HashMap<String, Option<String>> = HashMap::new();
 
@@ -1593,10 +1625,19 @@ mod tests {
         // skill_name = "→"-joined normalized sequence.
         let expected = format!("{} {}", "fix the bug", "read_file→edit_file");
         let swapped = format!("{} {}", "read_file→edit_file", "fix the bug");
-        let captured = texts.lock().unwrap().clone();
+        let captured = calls.lock().unwrap().clone();
         assert_eq!(captured.len(), 2, "exactly 2 embeds: task (episodic) + skill (procedural), got {captured:?}");
-        assert_eq!(captured[1], expected, "skill embed text must be trigger FIRST, then skill_name (R3)");
-        assert_ne!(captured[1], swapped, "an order swap must be detectable by this test");
+        assert_eq!(captured[1].1, expected, "skill embed text must be trigger FIRST, then skill_name (R3)");
+        assert_ne!(captured[1].1, swapped, "an order swap must be detectable by this test");
+        assert_eq!(captured[0].0, EmbedRole::Passage, "episodic task embed must be role Passage");
+        assert_eq!(captured[1].0, EmbedRole::Passage, "skill embed must be role Passage");
+    }
+
+    // ── skill_embedding_text — pure, shared with reembed_all's backfill ──────
+
+    #[test]
+    fn skill_embedding_text_is_trigger_then_skill_name() {
+        assert_eq!(skill_embedding_text("t", "s"), "t s");
     }
 
     // ── Post-verify W2 (R4) — project_id RAW positivo ─────────────────────────

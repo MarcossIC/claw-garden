@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::memory::db::MemoryStore;
-use crate::memory::embedder::Embedder;
+use crate::memory::embedder::{EmbedRole, Embedder};
 use crate::memory::events::MemorySource;
 use crate::memory::store_insert::{CreatedByType, MemoryType, NewMemoryRecord};
 use crate::models::chat::Role;
@@ -234,7 +234,7 @@ pub(crate) async fn run_extraction_core(
         let now_ms = crate::models::chat::current_time_millis();
 
         for em in extracted {
-            let vec = match embedder.embed(&em.content).await {
+            let vec = match embedder.embed_with_role(&em.content, EmbedRole::Passage).await {
                 Ok(v) => v,
                 Err(e) => {
                     log::warn!("extractor: embed failed for agent={agent_id}: {e}; skipping memory");
@@ -440,8 +440,64 @@ mod tests {
     use std::time::Duration;
 
     use crate::memory::db::MemoryStore;
-    use crate::memory::embedder::{Embedder, FakeEmbedder};
+    use crate::memory::embedder::{EmbedError, EmbedRole, Embedder, FakeEmbedder};
     use crate::models::chat::Role;
+
+    /// Records every `(role, text)` pair handed to `embed_with_role`.
+    struct RecordingEmbedder {
+        calls: std::sync::Mutex<Vec<(EmbedRole, String)>>,
+    }
+    #[async_trait::async_trait]
+    impl Embedder for RecordingEmbedder {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+            self.calls.lock().unwrap().push((role, text.to_string()));
+            Ok(vec![0.1_f32; 384])
+        }
+        fn dimensions(&self) -> usize {
+            384
+        }
+        fn model_id(&self) -> &str {
+            "recording"
+        }
+        fn query_prefix(&self) -> &str {
+            ""
+        }
+        fn passage_prefix(&self) -> &str {
+            ""
+        }
+    }
+
+    /// `run_extraction_core` must embed each extracted memory's content with
+    /// role `Passage` — the extracted memory is stored, not a search query.
+    #[tokio::test]
+    async fn run_extraction_core_embeds_extracted_memories_with_role_passage() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let recording = Arc::new(RecordingEmbedder { calls: std::sync::Mutex::new(Vec::new()) });
+        let embedder: Arc<dyn Embedder> = recording.clone();
+        let provider: Arc<dyn AiProvider> = Arc::new(FakeProvider {
+            response: r#"[{"memory_type":"semantic_fact","content":"a durable fact","importance":6}]"#.to_string(),
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let mut provider_by_agent: HashMap<String, Arc<dyn AiProvider>> = HashMap::new();
+        provider_by_agent.insert("agent-a".to_string(), provider);
+        let project_by_agent: HashMap<String, Option<String>> = HashMap::new();
+        let history = vec![("agent-a".to_string(), vec![make_msg(Role::User, "hello")])];
+
+        run_extraction_core(
+            history,
+            &store,
+            Some(embedder),
+            &project_by_agent,
+            &provider_by_agent,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let calls = recording.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "expected exactly one embed call, got {calls:?}");
+        assert_eq!(calls[0].0, EmbedRole::Passage);
+        assert_eq!(calls[0].1, "a durable fact");
+    }
     use crate::models::{AppError, ChatMessage, ChatRequest, ChatStreamResult};
     use crate::providers::{AiProvider, StreamSender};
 
@@ -676,7 +732,7 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         let embedder = FakeEmbedder::default();
 
-        let arch_emb = embedder.embed("Use hexagonal architecture for the tools module").await.unwrap();
+        let arch_emb = embedder.embed_with_role("Use hexagonal architecture for the tools module", EmbedRole::Passage).await.unwrap();
         let arch_record = NewMemoryRecord {
             scope: "agent",
             agent_id: Some("agent-knn".to_string()),
@@ -692,7 +748,7 @@ mod tests {
         };
         let arch_id = store.insert_memory_with_vector(arch_record, arch_emb.clone()).await.unwrap();
 
-        let fact_emb = embedder.embed("tier=1 rows are excluded from KNN search by design").await.unwrap();
+        let fact_emb = embedder.embed_with_role("tier=1 rows are excluded from KNN search by design", EmbedRole::Passage).await.unwrap();
         let fact_record = NewMemoryRecord {
             scope: "agent",
             agent_id: Some("agent-knn".to_string()),
@@ -739,7 +795,7 @@ mod tests {
 
         let store = MemoryStore::new_for_test().await.unwrap();
         let embedder = FakeEmbedder::default();
-        let pref_emb = embedder.embed("Always use voseo").await.unwrap();
+        let pref_emb = embedder.embed_with_role("Always use voseo", EmbedRole::Passage).await.unwrap();
         let pref_record = NewMemoryRecord {
             scope: "agent",
             agent_id: Some("agent-knn-pref".to_string()),
@@ -776,7 +832,7 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         let embedder = FakeEmbedder::default();
         let text = "Siempre usá voseo en las respuestas";
-        let emb = embedder.embed(text).await.unwrap();
+        let emb = embedder.embed_with_role(text, EmbedRole::Passage).await.unwrap();
         let record = NewMemoryRecord {
             scope: "agent",
             agent_id: Some("agent-contra-pref".to_string()),

@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use tauri::{AppHandle, Emitter, Manager};
 
-use memory::db::ContractStatus;
+use memory::db::{ContractStatus, EmbeddingIdentity};
 use memory::embedder::{Embedder, FastEmbedLocal};
 use memory::model_download::{ensure_model, DownloadProgress};
 use models::chat::StreamEvent;
@@ -106,6 +106,7 @@ pub fn run() {
             commands::memory_admin::delete_memory,
             commands::memory_admin::get_skill_steps_trend,
             commands::memory_admin::get_failure_histogram,
+            commands::memory_admin::reembed_all,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -226,12 +227,12 @@ type LoadEmbedderFn = Arc<
 
 /// Type alias for the injectable embedding-contract verification seam.
 ///
-/// Owned `(String, usize)` rather than `&dyn Embedder`: a borrow cannot live
-/// inside a `'static` future, and the owned pair also makes "compare only
-/// model_id + dim" structural in the signature itself instead of a
-/// convention callers have to remember.
+/// Owned `EmbeddingIdentity` rather than `&dyn Embedder`: a borrow cannot
+/// live inside a `'static` future, and the owned struct also makes "compare
+/// model_id + dim + query_prefix + passage_prefix" structural in the
+/// signature itself instead of a convention callers have to remember.
 type ContractVerifyFn = Arc<
-    dyn Fn(String, usize) -> futures::future::BoxFuture<'static, Result<ContractStatus, String>>
+    dyn Fn(EmbeddingIdentity) -> futures::future::BoxFuture<'static, Result<ContractStatus, String>>
         + Send
         + Sync,
 >;
@@ -270,11 +271,11 @@ pub(crate) fn start_embedder_bootstrap(app_handle: AppHandle) {
     // `AppHandle` and the open store, so it is the only place that can build
     // this closure — `run_embedder_bootstrap` itself stays store-agnostic
     // and testable without a `MemoryStore` at all.
-    let verify: ContractVerifyFn = Arc::new(move |model_id, dim| {
+    let verify: ContractVerifyFn = Arc::new(move |identity| {
         let store = store.clone();
         Box::pin(async move {
             store
-                .ensure_embedding_contract(&model_id, dim)
+                .ensure_embedding_contract(identity)
                 .await
                 .map_err(|e| e.to_string())
         })
@@ -356,9 +357,8 @@ pub(crate) async fn run_embedder_bootstrap(
                 // contract's outcome; a wasted download on a genuine
                 // mismatch is an accepted, named cost of this ordering.
                 Ok(Ok(arc)) => {
-                    let model_id = arc.model_id().to_string();
-                    let dim = arc.dimensions();
-                    match verify(model_id, dim).await {
+                    let identity = EmbeddingIdentity::of(arc.as_ref());
+                    match verify(identity).await {
                         Ok(ContractStatus::Match) | Ok(ContractStatus::Initialized) => {
                             // `.set` returns Err only if the cell is already filled —
                             // survivable race; treat both outcomes as success.
@@ -370,32 +370,25 @@ pub(crate) async fn run_embedder_bootstrap(
                                 error: None,
                             }
                         }
-                        Ok(ContractStatus::Mismatch {
-                            stored_model_id,
-                            stored_dim,
-                            actual_model_id,
-                            actual_dim,
-                        }) => {
+                        Ok(ContractStatus::Mismatch { stored, actual }) => {
                             // Cell stays empty — the existing fail-soft reads in
                             // worker.rs and prompt_builder.rs already treat an
                             // empty cell as "memory disabled", so this needs no
                             // new degraded-mode logic of its own.
+                            let diffs = memory::db::differing_fields(&stored, &actual);
                             log::warn!(
-                                "embedding contract mismatch: store holds vectors from \
-                                 '{stored_model_id}' (dim {stored_dim}), active embedder is \
-                                 '{actual_model_id}' (dim {actual_dim}); memory reads/writes \
-                                 are disabled until this is resolved"
+                                "embedding contract mismatch ({}); memory reads/writes are \
+                                 disabled until this is resolved",
+                                diffs.join("; ")
                             );
                             StreamEvent::EmbedderDownload {
                                 phase: "error".into(),
                                 bytes_downloaded: None,
                                 bytes_total: None,
                                 error: Some(format!(
-                                    "embedding contract mismatch: the store has vectors from \
-                                     '{stored_model_id}' (dim {stored_dim}), but the active \
-                                     embedder is '{actual_model_id}' (dim {actual_dim}); memory \
-                                     is disabled until the mismatch is resolved — retrying will \
-                                     not fix this"
+                                    "embedding contract mismatch ({}); memory is disabled until \
+                                     the mismatch is resolved — retrying will not fix this",
+                                    diffs.join("; ")
                                 )),
                             }
                         }
@@ -628,7 +621,7 @@ mod tests {
     /// so each one that reaches the seam gets a one-line "accept whatever
     /// arrives" verifier instead of repeating the closure inline.
     fn accept_contract() -> ContractVerifyFn {
-        Arc::new(|_model_id, _dim| Box::pin(async { Ok(ContractStatus::Match) }))
+        Arc::new(|_identity| Box::pin(async { Ok(ContractStatus::Match) }))
     }
 
     #[tokio::test]
@@ -909,13 +902,21 @@ mod tests {
         let load: LoadEmbedderFn = Arc::new(move |_files| {
             Ok(Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>)
         });
-        let verify: ContractVerifyFn = Arc::new(|_model_id, _dim| {
+        let verify: ContractVerifyFn = Arc::new(|_identity| {
             Box::pin(async move {
                 Ok(ContractStatus::Mismatch {
-                    stored_model_id: "multilingual-e5-small".into(),
-                    stored_dim: 384,
-                    actual_model_id: "fake-embedder".into(),
-                    actual_dim: 384,
+                    stored: memory::db::StoredContract {
+                        model_id: "multilingual-e5-small".into(),
+                        dim: 384,
+                        query_prefix: "".into(),
+                        passage_prefix: "".into(),
+                    },
+                    actual: EmbeddingIdentity {
+                        model_id: "fake-embedder".into(),
+                        dim: 384,
+                        query_prefix: "".into(),
+                        passage_prefix: "".into(),
+                    },
                 })
             })
         });
@@ -958,6 +959,76 @@ mod tests {
                         || msg.to_lowercase().contains("mismatch"),
                     "error message must identify a contract mismatch (not a generic \
                      download failure a retry could fix), got: {msg}"
+                );
+            }
+            other => panic!("expected a terminal EmbedderDownload error event, got {other:?}"),
+        }
+    }
+
+    /// A mismatch on `passage_prefix` ALONE (matching `model_id`/`dim`) must
+    /// degrade exactly like a model_id/dim mismatch: cell stays empty, the
+    /// terminal event is `error`, and chat is untouched (this test only
+    /// covers the memory subsystem — chat has no dependency on this cell at
+    /// all, so there is nothing further to assert here about it).
+    #[tokio::test]
+    async fn run_embedder_bootstrap_skips_set_on_prefix_only_mismatch() {
+        let cell: Arc<once_cell::sync::OnceCell<Arc<dyn Embedder>>> =
+            Arc::new(once_cell::sync::OnceCell::new());
+
+        let ensure: EnsureModelFn =
+            Arc::new(move |_base, _progress| Box::pin(async move { Ok(empty_model_files()) }));
+        let load: LoadEmbedderFn = Arc::new(move |_files| {
+            Ok(Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>)
+        });
+        let verify: ContractVerifyFn = Arc::new(|_identity| {
+            Box::pin(async move {
+                Ok(ContractStatus::Mismatch {
+                    stored: memory::db::StoredContract {
+                        model_id: "fake-embedder".into(),
+                        dim: 384,
+                        query_prefix: "query: ".into(),
+                        passage_prefix: "passage:".into(), // stale: missing trailing space
+                    },
+                    actual: EmbeddingIdentity {
+                        model_id: "fake-embedder".into(),
+                        dim: 384,
+                        query_prefix: "query: ".into(),
+                        passage_prefix: "passage: ".into(),
+                    },
+                })
+            })
+        });
+
+        let sink = Arc::new(MockSink::default());
+        let sink_for_run: Arc<dyn EmbedderEventSink> = sink.clone();
+        run_embedder_bootstrap(
+            std::env::temp_dir(),
+            cell.clone(),
+            sink_for_run,
+            ensure,
+            load,
+            verify,
+        )
+        .await;
+
+        assert!(
+            cell.get().is_none(),
+            "OnceCell must stay empty on a prefix-only contract mismatch"
+        );
+
+        let events = sink.snapshot();
+        let phases: Vec<&str> = events.iter().map(phase_of_event).collect();
+        assert_eq!(
+            phases.last().copied(),
+            Some("error"),
+            "prefix-only mismatch must terminate with `error`; got {phases:?}"
+        );
+        assert_eq!(count_done_phases(&events), 0);
+        match events.last() {
+            Some(StreamEvent::EmbedderDownload { error: Some(msg), .. }) => {
+                assert!(
+                    msg.contains("passage_prefix"),
+                    "error message must name the differing field, got: {msg}"
                 );
             }
             other => panic!("expected a terminal EmbedderDownload error event, got {other:?}"),

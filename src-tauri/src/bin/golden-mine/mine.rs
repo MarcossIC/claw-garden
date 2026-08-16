@@ -9,6 +9,13 @@
 //! evaluation set is, and a set that is accidentally easy reports perfect
 //! scores while measuring nothing.
 
+// `cosine` lives in `eval_api` now, not here: binaries cannot share modules
+// with each other, only with the lib, and the function that produced this
+// module's mined distractor gaps and the function `rag-eval`'s similarity
+// block ranks against must be one definition or a comparison between the two
+// runs is a comparison between two unverified implementations.
+use agent_office_lib::eval_api::cosine;
+
 /// A candidate document paired with its embedding. Index into the slice is the
 /// document's identity throughout this module: refs and ids are the caller's
 /// concern, and threading them through here would only add a translation layer
@@ -18,33 +25,6 @@ pub struct Embedded {
     pub memory_type: String,
     pub lang: String,
     pub vector: Vec<f32>,
-}
-
-/// Cosine similarity of two vectors, computed directly rather than recovered
-/// from an L2 distance.
-///
-/// Production recovers cosine arithmetically (`1 - d²/2`) because it only ever
-/// receives a distance back from the vector index. This module holds both
-/// vectors, so the direct form is available and preferable: it needs no
-/// unit-norm precondition to be correct, which means a candidate that somehow
-/// arrives un-normalized produces a wrong-but-bounded similarity here instead
-/// of a silently clamped zero.
-pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
-    if a.len() != b.len() {
-        return 0.0;
-    }
-    let mut dot = 0.0f64;
-    let mut norm_a = 0.0f64;
-    let mut norm_b = 0.0f64;
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += f64::from(*x) * f64::from(*y);
-        norm_a += f64::from(*x) * f64::from(*x);
-        norm_b += f64::from(*y) * f64::from(*y);
-    }
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
-    }
-    dot / (norm_a.sqrt() * norm_b.sqrt())
 }
 
 /// Indices of the `k` documents most similar to `target`, nearest first,

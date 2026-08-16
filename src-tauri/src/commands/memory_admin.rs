@@ -751,12 +751,76 @@ pub async fn get_skill_steps_trend(
 }
 
 // ---------------------------------------------------------------------------
+// reembed_all — operator-invoked E5-prefix backfill (memory/maintenance.rs)
+// ---------------------------------------------------------------------------
+
+/// Which [`crate::memory::maintenance::ReembedMode`] a `reembed_all` call
+/// means. A required, non-`Option` argument with no default variant: the
+/// accident this type exists to prevent is a caller INTENDING a `ReInfer`
+/// (paying for real inference, migrating the embedding space) and getting a
+/// free `Normalize` no-op instead because an optional argument was left
+/// unset. Every invocation must name its mode explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReembedModeArg {
+    Normalize,
+    ReInfer,
+}
+
+#[tauri::command]
+pub async fn reembed_all(
+    state: tauri::State<'_, AppState>,
+    mode: ReembedModeArg,
+) -> Result<crate::memory::maintenance::ReembedReport, AppError> {
+    let mode = match mode {
+        ReembedModeArg::Normalize => crate::memory::maintenance::ReembedMode::Normalize,
+        ReembedModeArg::ReInfer => {
+            // ReInfer needs a live embedder to derive the identity it will
+            // write to `embedding_contract` on success — if the model
+            // hasn't finished loading yet there is nothing correct to do
+            // but refuse, not silently fall back to Normalize.
+            let embedder = state.embedder.get().cloned().ok_or_else(|| {
+                AppError::from(MemoryError::Backend(
+                    "reembed_all: embedder not yet loaded — cannot ReInfer".into(),
+                ))
+            })?;
+            crate::memory::maintenance::ReembedMode::ReInfer(
+                crate::memory::maintenance::ReInferPlan::new(embedder),
+            )
+        }
+    };
+    Ok(crate::memory::maintenance::reembed_all(&state.memory_store, mode).await)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── reembed_all — ReembedModeArg serde round-trip ────────────────────────
+    //
+    // No `Option<_>` or default anywhere on this type or the command that
+    // takes it: the frontend must always state which mode it means, so
+    // there is no path where an omitted argument silently resolves to
+    // Normalize when a ReInfer was intended.
+
+    #[test]
+    fn reembed_mode_arg_serde_snake_case_roundtrip() {
+        let cases = [
+            (ReembedModeArg::Normalize, "\"normalize\""),
+            (ReembedModeArg::ReInfer, "\"re_infer\""),
+        ];
+        for (mode, expected_json) in cases {
+            let json = serde_json::to_string(&mode).expect("serialize ReembedModeArg");
+            assert_eq!(json, expected_json, "unexpected JSON for {mode:?}");
+            let back: ReembedModeArg =
+                serde_json::from_str(&json).expect("deserialize ReembedModeArg");
+            assert_eq!(back, mode, "round-trip mismatch for {mode:?}");
+        }
+    }
 
     // ── Lote 1 — MemoryKind serde round-trip (Task 1.1) ─────────────────────
 
@@ -1169,7 +1233,10 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         let embedder = FakeEmbedder::default();
         let content = "content for delete-then-search test";
-        let emb = embedder.embed(content).await.unwrap();
+        let emb = embedder
+            .embed_with_role(content, crate::memory::embedder::EmbedRole::Passage)
+            .await
+            .unwrap();
         let emb_bytes: Vec<u8> = emb.iter().flat_map(|f| f.to_le_bytes()).collect();
         let agent = "agent-delete-search";
 

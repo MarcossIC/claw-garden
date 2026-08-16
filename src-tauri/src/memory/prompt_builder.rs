@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::memory::{
     access::AccessTracker,
     clock::TimestampMs,
-    embedder::Embedder,
+    embedder::{EmbedRole, Embedder},
     search::{search_all_memories, RankedHit, SearchScope},
     workspace::{EmittedIds, WorkspaceManager},
     MemoryError, MemoryStore,
@@ -98,7 +98,8 @@ pub(crate) async fn build_memory_prompt(
     // ever spends candidates that were already fetched.
     let k_request = K_FINAL.saturating_add(emitted.len());
     let mut hits: Vec<RankedHit> = match embedder {
-        Some(emb) => match emb.embed(user_query).await {
+        // Query: the user's own text is the thing being searched FOR.
+        Some(emb) => match emb.embed_with_role(user_query, EmbedRole::Query).await {
             Ok(q_vec) => {
                 match search_all_memories(store, &q_vec, agent_id, SearchScope::all_default().with_project(project_id), k_request).await {
                     Ok(h) => h,
@@ -374,7 +375,51 @@ async fn fetch_active_conflicts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{clock::TimestampMs, db::MemoryStore, embedder::Embedder, TableKind};
+    use crate::memory::{clock::TimestampMs, db::MemoryStore, embedder::{EmbedError, Embedder}, TableKind};
+
+    /// Records every `(role, text)` pair handed to `embed_with_role`.
+    struct RecordingEmbedder {
+        calls: std::sync::Mutex<Vec<(EmbedRole, String)>>,
+    }
+    #[async_trait::async_trait]
+    impl Embedder for RecordingEmbedder {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+            self.calls.lock().unwrap().push((role, text.to_string()));
+            Ok(vec![0.1_f32; 384])
+        }
+        fn dimensions(&self) -> usize {
+            384
+        }
+        fn model_id(&self) -> &str {
+            "recording"
+        }
+        fn query_prefix(&self) -> &str {
+            ""
+        }
+        fn passage_prefix(&self) -> &str {
+            ""
+        }
+    }
+
+    /// `build_memory_prompt` must embed the user's query with role `Query` —
+    /// the only Query call site in production.
+    #[tokio::test]
+    async fn build_memory_prompt_embeds_the_user_query_with_role_query() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let recording = Arc::new(RecordingEmbedder { calls: std::sync::Mutex::new(Vec::new()) });
+        let embedder: Arc<dyn Embedder> = recording.clone();
+
+        build_memory_prompt(&store, &wm, Some(embedder), "agent-1", None, "some query", &EmittedIds::default(), None)
+            .await
+            .unwrap();
+
+        let calls = recording.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "expected exactly one embed call, got {calls:?}");
+        assert_eq!(calls[0].0, EmbedRole::Query, "the user query must be embedded with role Query");
+        assert_eq!(calls[0].1, "some query");
+    }
 
     #[test]
     fn unix_secs_zero_is_1970_01_01() {
@@ -739,7 +784,7 @@ mod tests {
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
         let embedder = Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>;
-        let fake_vec = embedder.embed("dummy").await.unwrap();
+        let fake_vec = embedder.embed_with_role("dummy", EmbedRole::Passage).await.unwrap();
         let fake_bytes = crate::memory::search::serialize_f32_query_pub(&fake_vec);
 
         let now_ms: i64 = TimestampMs::now().as_millis_i64();
@@ -882,7 +927,7 @@ mod tests {
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let embedder = Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>;
         let content = "prefiere ejecutar los tests antes de commitear";
-        let bytes = unit_bytes(&embedder.embed(content).await.unwrap());
+        let bytes = unit_bytes(&embedder.embed_with_role(content, EmbedRole::Passage).await.unwrap());
 
         seed_memory(&store, "agent-gap", content, "user_preference", 1, 5.0, bytes).await;
 
@@ -913,7 +958,7 @@ mod tests {
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let embedder = Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>;
         let query = "cómo arreglo un test roto";
-        let q_vec = embedder.embed(query).await.unwrap();
+        let q_vec = embedder.embed_with_role(query, EmbedRole::Passage).await.unwrap();
         let bytes = unit_bytes(&q_vec);
 
         // memory: above the workspace bar, so the workspace renders it.
@@ -990,7 +1035,7 @@ mod tests {
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let embedder = Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>;
         let query = "algo sobre el proyecto";
-        let bytes = unit_bytes(&embedder.embed(query).await.unwrap());
+        let bytes = unit_bytes(&embedder.embed_with_role(query, EmbedRole::Passage).await.unwrap());
 
         // 5 rows the workspace will render, plus K_FINAL rows it will not.
         for i in 0..5 {
@@ -1053,7 +1098,7 @@ mod tests {
         let mut ids = Vec::new();
         for i in 0..6 {
             let trigger = format!("cuando falla el escenario {i}");
-            let emb = embedder.embed(&trigger).await.unwrap();
+            let emb = embedder.embed_with_role(&trigger, EmbedRole::Passage).await.unwrap();
             let outcome = store
                 .promote_to_procedural_skill(
                     NewProceduralSkillRecord {
@@ -1074,7 +1119,7 @@ mod tests {
         }
         assert_eq!(ids.len(), 6);
 
-        let target = embedder.embed("cuando falla el escenario 5").await.unwrap();
+        let target = embedder.embed_with_role("cuando falla el escenario 5", EmbedRole::Query).await.unwrap();
         let hits = search_all_memories(&store, &target, "agent-tail", SearchScope::all_default(), 10)
             .await
             .unwrap();
@@ -1096,7 +1141,7 @@ mod tests {
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
         let embedder = Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>;
-        let fake_vec = embedder.embed("dummy").await.unwrap();
+        let fake_vec = embedder.embed_with_role("dummy", EmbedRole::Passage).await.unwrap();
         let fake_bytes = crate::memory::search::serialize_f32_query_pub(&fake_vec);
 
         let now_ms: i64 = TimestampMs::now().as_millis_i64();

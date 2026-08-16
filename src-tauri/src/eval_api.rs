@@ -21,6 +21,10 @@ use std::path::Path;
 
 use crate::memory::db::MemoryStore;
 use crate::memory::embedder::{Embedder, FakeEmbedder, FastEmbedLocal};
+
+/// Re-exported so the `rag-eval` and `golden-mine` binaries can name a role
+/// without reaching into the private `memory` module tree.
+pub use crate::memory::embedder::EmbedRole;
 use crate::memory::events::MemorySource;
 use crate::memory::model_download;
 use crate::memory::search::{search_all_memories, SearchScope};
@@ -229,9 +233,9 @@ impl EvalEmbedder {
         Ok(EvalEmbedder(Box::new(inner)))
     }
 
-    pub async fn embed(&self, text: &str) -> Result<Vec<f32>, EvalError> {
+    pub async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EvalError> {
         self.0
-            .embed(text)
+            .embed_with_role(text, role)
             .await
             .map_err(|e| EvalError::Embed(e.to_string()))
     }
@@ -243,6 +247,14 @@ impl EvalEmbedder {
     pub fn model_id(&self) -> &str {
         self.0.model_id()
     }
+
+    pub fn query_prefix(&self) -> &str {
+        self.0.query_prefix()
+    }
+
+    pub fn passage_prefix(&self) -> &str {
+        self.0.passage_prefix()
+    }
 }
 
 /// True iff the real embedding model is already cached at `base_dir` —
@@ -251,5 +263,90 @@ impl EvalEmbedder {
 /// drift from what a real load would accept.
 pub fn model_is_cached(base_dir: &Path) -> bool {
     model_download::model_is_cached(base_dir)
+}
+
+/// Cosine similarity of two vectors, computed directly rather than recovered
+/// from an L2 distance. The single definition shared by every binary that
+/// compares embeddings offline: `golden-mine` uses it to mine hard
+/// distractors, `rag-eval` uses it to rank candidates for the similarity
+/// measurement block, and a statistic quoted from one is only comparable to a
+/// statistic quoted from the other because both ran through this exact
+/// function.
+pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
+    let mut dot = 0.0f64;
+    let mut norm_a = 0.0f64;
+    let mut norm_b = 0.0f64;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += f64::from(*x) * f64::from(*y);
+        norm_a += f64::from(*x) * f64::from(*x);
+        norm_b += f64::from(*y) * f64::from(*y);
+    }
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+    dot / (norm_a.sqrt() * norm_b.sqrt())
+}
+
+/// Hex-lowercase SHA-256 of `bytes`. Shared by every binary that needs to
+/// stamp a file's exact content into a report: hashing the same bytes twice
+/// through two separate implementations would make "do these two runs agree
+/// on which golden set they scored" a question about two unverified digest
+/// functions instead of one.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(bytes);
+    let out = h.finalize();
+    let mut s = String::with_capacity(out.len() * 2);
+    for b in out {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cosine_of_identical_vectors_is_one() {
+        assert!((cosine(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0]) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cosine_of_orthogonal_vectors_is_zero() {
+        assert!(cosine(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-12);
+    }
+
+    /// `EvalEmbedder::embed_with_role` must dispatch straight through to the
+    /// production trait's `embed_with_role` — mechanical pass-through, no
+    /// logic of its own to get wrong beyond wiring the role through.
+    #[tokio::test]
+    async fn embed_with_role_dispatches_role_to_the_inner_embedder() {
+        let e = EvalEmbedder::fake();
+        let q = e.embed_with_role("hola", EmbedRole::Query).await.unwrap();
+        let p = e.embed_with_role("hola", EmbedRole::Passage).await.unwrap();
+        assert_eq!(
+            q, p,
+            "FakeEmbedder ignores role deterministically; both roles must pass through identically"
+        );
+        assert_eq!(q.len(), e.dimensions());
+    }
+
+    #[test]
+    fn sha256_hex_of_a_known_fixture_matches_the_pinned_digest() {
+        // sha256("hello world") — the canonical example digest, so this test
+        // fails loudly (a wrong-but-plausible hex string) if the hashing or
+        // hex-encoding ever regresses, rather than only failing when nothing
+        // else can compute the reference value.
+        assert_eq!(
+            sha256_hex(b"hello world"),
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+    }
 }
 

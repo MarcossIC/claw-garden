@@ -1,6 +1,10 @@
-//! Embedder trait + concrete impls for the v1 RAG roadmap (Phase 2).
-//!
-//! Skeleton; filled out across Phase 2.1 — 2.3 per `docs/sdd/rag-embedder/tasks.md`.
+//! The [`Embedder`] trait and its concrete implementations: [`FastEmbedLocal`]
+//! (the production embedder, backed by `multilingual-e5-small` via
+//! fastembed-rs), [`OllamaEmbedder`]/[`OpenAIEmbedder`] (unimplemented stubs
+//! reserved for future backends), and `FakeEmbedder` (a deterministic test
+//! double). Every embed call carries an explicit [`EmbedRole`] so a caller
+//! can never forget which side of the query/passage distinction it is on —
+//! see [`EmbedRole`] below for why that distinction matters.
 
 use async_trait::async_trait;
 use fastembed::{
@@ -8,13 +12,40 @@ use fastembed::{
 };
 use tokio::sync::{mpsc, oneshot};
 
+/// Which side of an asymmetric embedding model a text plays: the thing being
+/// searched FOR, or the thing being searched THROUGH. E5-family models were
+/// trained with a different string prepended to each side, so the two sides
+/// occupy different (though related) regions of the embedding space — using
+/// the wrong prefix for a given call is not a style mismatch, it is querying
+/// with the wrong instrument.
+///
+/// Deliberately no `Default`: there is no role a caller could fall back to
+/// without silently mis-labeling the text it is embedding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedRole {
+    /// The text is something being searched FOR (a user query).
+    Query,
+    /// The text is something being searched THROUGH (a stored chunk/document).
+    Passage,
+}
+
 /// Async embedder contract. All embedder impls are `Send + Sync` so they can
 /// live behind `Arc<dyn Embedder>` in `AppState`.
+///
+/// `embed` (role-free) does not exist on this trait and never will: a default
+/// method delegating to an unprefixed call, or a "convention" about which
+/// internal callers may skip the role, would both let an unmigrated call site
+/// keep the old unprefixed behavior and compile clean — exactly the silent
+/// mismatch this trait shape exists to make unreachable. Every call site
+/// states a role; every impl states its own prefixes. Neither `query_prefix`
+/// nor `passage_prefix` has a default body for the same reason: a new impl
+/// that inherits `""` for both is silently claiming "no prefixes" instead of
+/// deciding to have none.
 #[async_trait]
 pub trait Embedder: Send + Sync {
-    /// Compute the embedding for a single text. Vector length MUST equal
-    /// [`Embedder::dimensions`].
-    async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedError>;
+    /// Compute the embedding for a single text, prefixed per `role`. Vector
+    /// length MUST equal [`Embedder::dimensions`].
+    async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError>;
 
     /// Embedding dimensionality (e.g. 384 for `multilingual-e5-small`).
     fn dimensions(&self) -> usize;
@@ -22,6 +53,54 @@ pub trait Embedder: Send + Sync {
     /// Stable identifier for the active model
     /// (e.g. `"multilingual-e5-small"`, `"fake-embedder"`).
     fn model_id(&self) -> &str;
+
+    /// The literal string prepended to text embedded with [`EmbedRole::Query`].
+    fn query_prefix(&self) -> &str;
+
+    /// The literal string prepended to text embedded with [`EmbedRole::Passage`].
+    fn passage_prefix(&self) -> &str;
+}
+
+/// E5-family prefix for [`EmbedRole::Query`] text. The trailing space is
+/// load-bearing: `"query:"` and `"query: "` tokenize to different sequences,
+/// so dropping it would silently change the embedding space, not just the
+/// string's appearance.
+const E5_QUERY_PREFIX: &str = "query: ";
+
+/// E5-family prefix for [`EmbedRole::Passage`] text. Currently set to the
+/// SAME string as [`E5_QUERY_PREFIX`] rather than `"passage: "`.
+///
+/// Retrieval in this app is a near-symmetric task: queries are full
+/// natural-language questions and the corpus rows they search over are
+/// conversational memory of comparable length and register — not the
+/// short-question-against-long-reference-document shape the asymmetric E5
+/// prefixes are built for. intfloat's own model card recommends `"query: "`
+/// on both sides for symmetric tasks and reserves the query/passage split
+/// for genuinely asymmetric retrieval.
+///
+/// This was measured, not assumed: giving passages their own `"passage: "`
+/// prefix scored WORSE on the domain golden set than the symmetric split —
+/// sim recall@10 dropped from 0.8261 to 0.6957 (95% CI excluding 0) — while
+/// doc-to-doc structure was essentially unchanged. If this corpus later
+/// gains a genuinely asymmetric shape (e.g. short queries against long
+/// standalone documents), this constant is the one line to move back to
+/// `"passage: "`.
+const E5_PASSAGE_PREFIX: &str = "query: ";
+
+/// The single authority on how a role becomes a prefixed string. Pure: no
+/// I/O, no dependency on which embedder is active — the caller supplies the
+/// prefixes, this function only selects and concatenates.
+pub(crate) fn apply_role_prefix(
+    role: EmbedRole,
+    text: &str,
+    query_prefix: &str,
+    passage_prefix: &str,
+) -> String {
+    let prefix = match role {
+        EmbedRole::Query => query_prefix,
+        EmbedRole::Passage => passage_prefix,
+    };
+    format!("{prefix}{text}")
 }
 
 /// Errors returned from the embedder pipeline.
@@ -39,17 +118,16 @@ pub enum EmbedError {
 
 // ============================================================================
 // FastEmbedLocal — fastembed-rs backed embedder, confined to a single owning
-// thread via a tokio::mpsc request/oneshot channel (REQ-EMB-002).
+// thread via a tokio::mpsc request/oneshot channel.
 //
-// Per design §3 (worker-thread architecture): the inner `fastembed::TextEmbedding`
-// is NOT guaranteed `Send`, so it lives on one dedicated `std::thread` for its
-// entire life. The public struct holds only channel senders + primitives, which
-// keeps it `Send + Sync` — verified by the const-block at the bottom of this file.
+// The inner `fastembed::TextEmbedding` is NOT guaranteed `Send`, so it lives
+// on one dedicated `std::thread` for its entire life. The public struct holds
+// only channel senders + primitives, which keeps it `Send + Sync` — verified
+// by the const-block at the bottom of this file.
 // ============================================================================
 
 /// Internal request crossing the channel: text to embed + oneshot reply slot.
 pub(crate) struct EmbedRequest {
-    #[allow(dead_code)] // Read inside the worker loop (block_on / pattern-match).
     pub(crate) text: String,
     pub(crate) resp: oneshot::Sender<Result<Vec<f32>, EmbedError>>,
 }
@@ -62,11 +140,12 @@ pub struct FastEmbedLocal {
 
 #[async_trait]
 impl Embedder for FastEmbedLocal {
-    async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+    async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+        let prefixed = apply_role_prefix(role, text, self.query_prefix(), self.passage_prefix());
         let (resp_tx, resp_rx) = oneshot::channel();
         self.req_tx
             .send(EmbedRequest {
-                text: text.to_string(),
+                text: prefixed,
                 resp: resp_tx,
             })
             .map_err(|_| EmbedError::WorkerGone)?;
@@ -81,6 +160,14 @@ impl Embedder for FastEmbedLocal {
 
     fn model_id(&self) -> &str {
         self.model_id
+    }
+
+    fn query_prefix(&self) -> &str {
+        E5_QUERY_PREFIX
+    }
+
+    fn passage_prefix(&self) -> &str {
+        E5_PASSAGE_PREFIX
     }
 }
 
@@ -137,9 +224,10 @@ impl FastEmbedLocal {
 #[cfg(test)]
 impl FastEmbedLocal {
     /// Test-only constructor: take a pre-wired request sender connected to a
-    /// hand-rolled mock worker. The real `from_bytes` spawns the worker itself
-    /// and is covered by manual smoke at CHECKPOINT 3 (the real ~470 MB model
-    /// load is `[BLOCKED-BY-EXTERNAL]`).
+    /// hand-rolled mock worker. The real `from_bytes` downloads and loads an
+    /// actual ~470 MB model, which this suite never does automatically —
+    /// exercising it means running the app once and confirming embeddings
+    /// come back, not something a fast unit test can assert on cheaply.
     pub(crate) fn from_mock_worker(req_tx: mpsc::UnboundedSender<EmbedRequest>) -> Self {
         Self {
             req_tx,
@@ -150,7 +238,7 @@ impl FastEmbedLocal {
 }
 
 // ============================================================================
-// Compile-time Send + Sync regression guards (REQ-EMB-002 / T021).
+// Compile-time Send + Sync regression guards.
 //
 // The assertion IS the test — if any of these types regress to !Send or !Sync
 // the crate will fail to compile. No #[test] fn needed.
@@ -168,20 +256,21 @@ const _: fn() = || {
 };
 
 // ============================================================================
-// Stub embedders (REQ-EMB-003).
+// Stub embedders.
 //
-// Non-feature-gated by design: future phases pattern-match on `Box<dyn Embedder>`
-// without `#[cfg]` branches. `embed` panics via `unimplemented!()`; `dimensions`
-// and `model_id` return real metadata so the rest of the system can still reason
-// about a stub instance (e.g. log "active embedder: openai-placeholder").
+// Not feature-gated: code that pattern-matches on `Box<dyn Embedder>` should
+// never need a `#[cfg]` branch just because the active backend happens to be
+// unimplemented. `embed_with_role` panics via `unimplemented!()`; `dimensions`
+// and `model_id` return real metadata so the rest of the system can still
+// reason about a stub instance (e.g. log "active embedder: openai-placeholder").
 // ============================================================================
 
 pub struct OllamaEmbedder;
 
 #[async_trait]
 impl Embedder for OllamaEmbedder {
-    async fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {
-        unimplemented!("OllamaEmbedder is a Phase X feature")
+    async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+        unimplemented!("no Ollama embedding backend is wired up yet")
     }
     fn dimensions(&self) -> usize {
         384
@@ -189,20 +278,32 @@ impl Embedder for OllamaEmbedder {
     fn model_id(&self) -> &str {
         "ollama-placeholder"
     }
+    fn query_prefix(&self) -> &str {
+        ""
+    }
+    fn passage_prefix(&self) -> &str {
+        ""
+    }
 }
 
 pub struct OpenAIEmbedder;
 
 #[async_trait]
 impl Embedder for OpenAIEmbedder {
-    async fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {
-        unimplemented!("OpenAIEmbedder is a Phase X feature")
+    async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+        unimplemented!("no OpenAI embedding backend is wired up yet")
     }
     fn dimensions(&self) -> usize {
         1536
     }
     fn model_id(&self) -> &str {
         "openai-placeholder"
+    }
+    fn query_prefix(&self) -> &str {
+        ""
+    }
+    fn passage_prefix(&self) -> &str {
+        ""
     }
 }
 
@@ -242,7 +343,12 @@ impl Default for FakeEmbedder {
 #[cfg(any(test, feature = "eval"))]
 #[async_trait]
 impl Embedder for FakeEmbedder {
-    async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+    // `role` is deliberately ignored: this is a SipHash of the raw text with
+    // no learned geometry, so prefixing it would churn every fixture vector
+    // in the suite while making the double no more faithful to what a real
+    // E5 model does with a prefix — there is no "more correct" fake output to
+    // aim for, only a different arbitrary one.
+    async fn embed_with_role(&self, text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
         // Deterministic algorithm per design §3.4:
         //   SipHash the text → seed a LCG → fill `dim` floats in [-1, 1].
         use std::hash::{Hash, Hasher};
@@ -267,35 +373,56 @@ impl Embedder for FakeEmbedder {
     fn model_id(&self) -> &str {
         "fake-embedder"
     }
+
+    // Empty, matching that `embed_with_role` never applies a prefix — an
+    // impl claiming a non-empty prefix here while never using one in
+    // `embed_with_role` would be a comment the code contradicts.
+    fn query_prefix(&self) -> &str {
+        ""
+    }
+
+    fn passage_prefix(&self) -> &str {
+        ""
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ---------- REQ-EMB-001: Embedder trait + FakeEmbedder (T010) ----------
+    // ---------- Embedder trait + FakeEmbedder ----------
 
     #[tokio::test]
     async fn fake_embedder_returns_384_dim_vec() {
         let e = FakeEmbedder::default();
-        let v = e.embed("hola mundo").await.unwrap();
+        let v = e.embed_with_role("hola mundo", EmbedRole::Passage).await.unwrap();
         assert_eq!(v.len(), 384);
     }
 
     #[tokio::test]
     async fn fake_embedder_is_deterministic() {
         let e = FakeEmbedder::default();
-        let a = e.embed("hola mundo").await.unwrap();
-        let b = e.embed("hola mundo").await.unwrap();
+        let a = e.embed_with_role("hola mundo", EmbedRole::Passage).await.unwrap();
+        let b = e.embed_with_role("hola mundo", EmbedRole::Passage).await.unwrap();
         assert_eq!(a, b, "deterministic same-input → same-output");
     }
 
     #[tokio::test]
     async fn fake_embedder_different_inputs_differ() {
         let e = FakeEmbedder::default();
-        let a = e.embed("a").await.unwrap();
-        let b = e.embed("b").await.unwrap();
+        let a = e.embed_with_role("a", EmbedRole::Passage).await.unwrap();
+        let b = e.embed_with_role("b", EmbedRole::Passage).await.unwrap();
         assert_ne!(a, b, "anti-collision smoke: distinct inputs must yield distinct vectors");
+    }
+
+    /// `FakeEmbedder` deliberately ignores `role` (comment on the impl): the
+    /// same text embeds identically regardless of which role is passed.
+    #[tokio::test]
+    async fn fake_embedder_ignores_role_deterministically() {
+        let e = FakeEmbedder::default();
+        let q = e.embed_with_role("hola mundo", EmbedRole::Query).await.unwrap();
+        let p = e.embed_with_role("hola mundo", EmbedRole::Passage).await.unwrap();
+        assert_eq!(q, p, "FakeEmbedder must return the identical vector for both roles");
     }
 
     #[test]
@@ -310,7 +437,7 @@ mod tests {
         assert_eq!(e.dimensions(), 384);
     }
 
-    // ---------- REQ-EMB-003: Stub embedders (T015) ----------
+    // ---------- Stub embedders ----------
 
     #[test]
     fn ollama_stub_compiles_and_implements_trait() {
@@ -333,13 +460,13 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "Phase X")]
+    #[should_panic(expected = "no Ollama embedding backend")]
     async fn ollama_stub_embed_is_unimplemented() {
         // unwrap() of a panicking unimplemented!() body — should_panic catches it.
-        let _ = OllamaEmbedder.embed("x").await;
+        let _ = OllamaEmbedder.embed_with_role("x", EmbedRole::Passage).await;
     }
 
-    // ---------- REQ-EMB-002: FastEmbedLocal worker plumbing (T020) ----------
+    // ---------- FastEmbedLocal worker plumbing ----------
 
     #[tokio::test]
     async fn embed_request_round_trip_through_channel() {
@@ -357,7 +484,7 @@ mod tests {
         });
 
         let local = FastEmbedLocal::from_mock_worker(req_tx);
-        let out = local.embed("anything").await.unwrap();
+        let out = local.embed_with_role("anything", EmbedRole::Passage).await.unwrap();
         assert_eq!(out.len(), 384);
         assert_eq!(out, canned, "worker reply must flow back unchanged");
     }
@@ -368,10 +495,91 @@ mod tests {
         // Drop receiver immediately to simulate the worker thread exiting.
         drop(req_rx);
         let local = FastEmbedLocal::from_mock_worker(req_tx);
-        let err = local.embed("anything").await.unwrap_err();
+        let err = local.embed_with_role("anything", EmbedRole::Passage).await.unwrap_err();
         assert!(
             matches!(err, EmbedError::WorkerGone),
             "expected WorkerGone, got {err:?}"
         );
+    }
+
+    /// `FastEmbedLocal::embed_with_role` must apply the E5 prefix BEFORE the
+    /// text crosses the channel to the model thread — asserted on the exact
+    /// string the mock worker receives, not on the (prefix-insensitive)
+    /// output vector.
+    #[tokio::test]
+    async fn embed_with_role_sends_prefixed_text_over_the_channel() {
+        use std::sync::{Arc, Mutex};
+
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel::<EmbedRequest>();
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let captured_for_worker = captured.clone();
+        std::thread::spawn(move || {
+            while let Some(EmbedRequest { text, resp }) =
+                futures::executor::block_on(req_rx.recv())
+            {
+                *captured_for_worker.lock().unwrap() = Some(text);
+                let _ = resp.send(Ok(vec![0.0f32; 384]));
+            }
+        });
+
+        let local = FastEmbedLocal::from_mock_worker(req_tx);
+        local
+            .embed_with_role("chunk", EmbedRole::Passage)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            captured.lock().unwrap().as_deref(),
+            Some("query: chunk"),
+            "the model must receive the prefixed string, not the bare chunk text"
+        );
+    }
+
+    // ---------- apply_role_prefix (pure) ----------
+
+    #[test]
+    fn apply_role_prefix_query_selects_query_prefix() {
+        assert_eq!(
+            apply_role_prefix(EmbedRole::Query, "hola", "query: ", "passage: "),
+            "query: hola"
+        );
+    }
+
+    #[test]
+    fn apply_role_prefix_passage_selects_passage_prefix() {
+        assert_eq!(
+            apply_role_prefix(EmbedRole::Passage, "hola", "query: ", "passage: "),
+            "passage: hola"
+        );
+    }
+
+    #[test]
+    fn apply_role_prefix_prepends_not_appends() {
+        let out = apply_role_prefix(EmbedRole::Query, "hola", "query: ", "passage: ");
+        assert!(out.starts_with("query: "), "prefix must come before the text, got {out:?}");
+        assert!(!out.ends_with("query: "), "prefix must not be appended, got {out:?}");
+    }
+
+    #[test]
+    fn apply_role_prefix_empty_prefix_is_identity() {
+        assert_eq!(apply_role_prefix(EmbedRole::Query, "hola", "", ""), "hola");
+    }
+
+    /// Pins what each role currently emits: both [`EmbedRole::Query`] and
+    /// [`EmbedRole::Passage`] resolve to the SAME literal string under the
+    /// symmetric configuration (see the comment on `E5_PASSAGE_PREFIX` for
+    /// the measured reason). The trailing space stays load-bearing
+    /// regardless: `"query:"` and `"query: "` tokenize to different
+    /// sequences, so losing it would silently change the embedding space no
+    /// matter which role produced the text.
+    #[test]
+    fn e5_prefix_constants_are_symmetric_with_the_load_bearing_trailing_space() {
+        assert_eq!(E5_QUERY_PREFIX, "query: ");
+        assert_eq!(E5_PASSAGE_PREFIX, "query: ");
+        assert_eq!(
+            E5_QUERY_PREFIX, E5_PASSAGE_PREFIX,
+            "symmetric configuration: both roles currently emit the identical prefix"
+        );
+        assert_ne!(E5_QUERY_PREFIX, "query:", "the trailing space is load-bearing");
     }
 }

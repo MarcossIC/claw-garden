@@ -578,7 +578,7 @@ pub(crate) async fn search_all_memories(
 mod tests {
     use super::*;
     use crate::memory::db::MemoryStore;
-    use crate::memory::embedder::Embedder;
+    use crate::memory::embedder::{EmbedRole, Embedder};
     use rusqlite::params;
 
     fn serialize_embedding(v: &[f32]) -> Vec<u8> {
@@ -775,7 +775,7 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         let embedder = FakeEmbedder::default();
         let trigger = "un test falla después de editar";
-        let q_vec = embedder.embed(trigger).await.unwrap();
+        let q_vec = embedder.embed_with_role(trigger, EmbedRole::Passage).await.unwrap();
 
         let outcome = store
             .promote_to_procedural_skill(
@@ -1245,7 +1245,7 @@ mod tests {
         // so the stored fixture is normalized here too, or the two would compare
         // FakeEmbedder's raw ~11.3 magnitude against a unit query and never match.
         let embedder = FakeEmbedder::default();
-        let q_vec = embedder.embed("test").await.unwrap();
+        let q_vec = embedder.embed_with_role("test", EmbedRole::Passage).await.unwrap();
         let emb_bytes = serialize_f32_query(&to_unit(&q_vec).unwrap());
 
         // Insert 5 rows: 2 tier=3, 1 tier=1, 2 tier=2
@@ -1313,7 +1313,7 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         let embedder = FakeEmbedder::default();
         let task = "depurar timeout de red";
-        let emb = embedder.embed(task).await.unwrap();
+        let emb = embedder.embed_with_role(task, EmbedRole::Passage).await.unwrap();
         let id = insert_episodic_row_for_knn(&store, "agent-a", task, emb.clone()).await;
 
         let hits = search_all_memories(&store, &emb, "agent-a", SearchScope::all_default(), 10)
@@ -1335,7 +1335,7 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         let embedder = FakeEmbedder::default();
         let task = "depurar timeout de red";
-        let emb = embedder.embed(task).await.unwrap();
+        let emb = embedder.embed_with_role(task, EmbedRole::Passage).await.unwrap();
         let id = insert_episodic_row_for_knn(&store, "agent-a", task, emb.clone()).await;
 
         let hits = search_all_memories(&store, &emb, "agent-b", SearchScope::all_default(), 10)
@@ -1473,7 +1473,7 @@ mod tests {
         use crate::memory::embedder::FakeEmbedder;
         let store = MemoryStore::new_for_test().await.unwrap();
         let embedder = FakeEmbedder::default();
-        let emb = embedder.embed("scoped episodic task").await.unwrap();
+        let emb = embedder.embed_with_role("scoped episodic task", EmbedRole::Passage).await.unwrap();
         let own = insert_episodic_row_with_project(
             &store, "agent-scope", Some("P1"), "sess-epi-own", emb.clone(),
         ).await;
@@ -1496,7 +1496,7 @@ mod tests {
         use crate::memory::embedder::FakeEmbedder;
         let store = MemoryStore::new_for_test().await.unwrap();
         let embedder = FakeEmbedder::default();
-        let emb = embedder.embed("scoped procedural trigger").await.unwrap();
+        let emb = embedder.embed_with_role("scoped procedural trigger", EmbedRole::Passage).await.unwrap();
         let own = insert_procedural_row_with_project(
             &store, "agent-scope", Some("P1"), "skill-own", emb.clone(),
         ).await;
@@ -1537,7 +1537,7 @@ mod tests {
         use crate::memory::embedder::FakeEmbedder;
         let store = MemoryStore::new_for_test().await.unwrap();
         let embedder = FakeEmbedder::default();
-        let emb = embedder.embed("scoped null episodic task").await.unwrap();
+        let emb = embedder.embed_with_role("scoped null episodic task", EmbedRole::Passage).await.unwrap();
         let id = insert_episodic_row_with_project(
             &store, "agent-scope-null", None, "sess-epi-null", emb.clone(),
         ).await;
@@ -1556,7 +1556,7 @@ mod tests {
         use crate::memory::embedder::FakeEmbedder;
         let store = MemoryStore::new_for_test().await.unwrap();
         let embedder = FakeEmbedder::default();
-        let emb = embedder.embed("scoped null procedural trigger").await.unwrap();
+        let emb = embedder.embed_with_role("scoped null procedural trigger", EmbedRole::Passage).await.unwrap();
         let id = insert_procedural_row_with_project(
             &store, "agent-scope-null", None, "skill-null", emb.clone(),
         ).await;
@@ -2167,7 +2167,7 @@ mod tests {
         // against something that no longer points the same length — distances
         // stop being comparable to the cosine the score formula assumes, and
         // any ordering read off them is an accident of the fixture.
-        let emb = to_unit(&embedder.embed("cross table outcome").await.unwrap()).unwrap();
+        let emb = to_unit(&embedder.embed_with_role("cross table outcome", EmbedRole::Passage).await.unwrap()).unwrap();
         insert_episodic_row_with_project(&store, "agent-x", Some("P1"), "sess-x", emb.clone()).await;
         insert_procedural_row_with_project(&store, "agent-x", Some("P1"), "skill-x", emb.clone()).await;
 
@@ -2186,7 +2186,7 @@ mod tests {
         use crate::memory::embedder::FakeEmbedder;
         let store = MemoryStore::new_for_test().await.unwrap();
         let embedder = FakeEmbedder::default();
-        let emb = embedder.embed("unscoped episodic task").await.unwrap();
+        let emb = embedder.embed_with_role("unscoped episodic task", EmbedRole::Passage).await.unwrap();
         let p1 = insert_episodic_row_with_project(&store, "agent-uns-epi", Some("P1"), "sess-own", emb.clone()).await;
         let p2 = insert_episodic_row_with_project(&store, "agent-uns-epi", Some("P2"), "sess-foreign", emb.clone()).await;
         let none = insert_episodic_row_with_project(&store, "agent-uns-epi", None, "sess-unowned", emb.clone()).await;
@@ -2208,7 +2208,7 @@ mod tests {
         use crate::memory::embedder::FakeEmbedder;
         let store = MemoryStore::new_for_test().await.unwrap();
         let embedder = FakeEmbedder::default();
-        let emb = embedder.embed("unscoped procedural trigger").await.unwrap();
+        let emb = embedder.embed_with_role("unscoped procedural trigger", EmbedRole::Passage).await.unwrap();
         let p1 = insert_procedural_row_with_project(&store, "agent-uns-pro", Some("P1"), "skill-own", emb.clone()).await;
         let p2 = insert_procedural_row_with_project(&store, "agent-uns-pro", Some("P2"), "skill-foreign", emb.clone()).await;
         let none = insert_procedural_row_with_project(&store, "agent-uns-pro", None, "skill-unowned", emb.clone()).await;

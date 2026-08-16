@@ -623,7 +623,10 @@ mod tests {
             .embedder
             .get()
             .expect("new_for_test_async must pre-fill the embedder cell");
-        let v = embedder.embed("x").await.expect("FakeEmbedder.embed");
+        let v = embedder
+            .embed_with_role("x", crate::memory::embedder::EmbedRole::Passage)
+            .await
+            .expect("FakeEmbedder.embed_with_role");
         assert_eq!(v.len(), 384, "FakeEmbedder must yield 384-dim vector");
     }
 

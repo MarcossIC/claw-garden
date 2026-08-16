@@ -22,7 +22,7 @@ mod mine;
 
 use std::path::PathBuf;
 
-use agent_office_lib::eval_api::EvalEmbedder;
+use agent_office_lib::eval_api::{cosine, EmbedRole, EvalEmbedder};
 
 use mine::{Embedded, Quota};
 
@@ -159,7 +159,9 @@ async fn run<I: Iterator<Item = String>>(argv: I) -> i32 {
 
     let mut embedded = Vec::with_capacity(pool.len());
     for (i, c) in pool.iter().enumerate() {
-        match embedder.embed(&c.content).await {
+        // Passage: mining from stored-content-shaped text, so a future
+        // re-mine happens in the same space production writes to.
+        match embedder.embed_with_role(&c.content, EmbedRole::Passage).await {
             Ok(vector) => embedded.push(Embedded {
                 memory_type: c.memory_type.clone(),
                 lang: c.lang.clone(),
@@ -194,7 +196,7 @@ async fn run<I: Iterator<Item = String>>(argv: I) -> i32 {
         .map(|c| {
             c.distractors
                 .iter()
-                .map(|&d| mine::cosine(&corpus[c.expected].vector, &corpus[d].vector))
+                .map(|&d| cosine(&corpus[c.expected].vector, &corpus[d].vector))
                 .fold(f64::NEG_INFINITY, f64::max)
         })
         .collect();

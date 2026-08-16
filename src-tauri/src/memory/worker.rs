@@ -11,7 +11,7 @@ use once_cell::sync::OnceCell;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::memory::chunker::{select_chunker, ChatChunker, ChunkerKind, CodeChunker};
-use crate::memory::embedder::{EmbedError, Embedder};
+use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::events::{MemoryEvent, MemorySource};
 use crate::memory::store_insert::{MemoryStoreError, NewMemoryRecord};
 use crate::memory::MemoryStore;
@@ -112,7 +112,12 @@ async fn process_event(
     };
 
     for chunk in chunks {
-        match embedder.embed(&chunk.text).await {
+        // Passage: a stored chunk is the thing being searched THROUGH. The one
+        // vector produced here feeds BOTH consumers below — insert and the
+        // contradiction KNN probe — with no second inference call, so both
+        // sides of `contradiction.rs`'s comparison live in the same Passage
+        // space `CONTRADICTION_THRESHOLD` was tuned against.
+        match embedder.embed_with_role(&chunk.text, EmbedRole::Passage).await {
             Ok(vec) => {
                 // The contradiction hook runs between embed and insert: it needs
                 // the freshly computed embedding to find near-duplicate candidates
@@ -334,11 +339,13 @@ mod tests {
         struct NotReadyEmbedder;
         #[async_trait::async_trait]
         impl Embedder for NotReadyEmbedder {
-            async fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {
+            async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
                 Err(EmbedError::NotReady)
             }
             fn dimensions(&self) -> usize { 384 }
             fn model_id(&self) -> &str { "not-ready" }
+            fn query_prefix(&self) -> &str { "" }
+            fn passage_prefix(&self) -> &str { "" }
         }
 
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
@@ -366,7 +373,7 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl Embedder for CountingEmbedder {
-            async fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {
+            async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
                 let n = self.calls.fetch_add(1, Ordering::SeqCst);
                 if n == 0 {
                     Err(EmbedError::WorkerGone)
@@ -376,6 +383,8 @@ mod tests {
             }
             fn dimensions(&self) -> usize { 384 }
             fn model_id(&self) -> &str { "counting" }
+            fn query_prefix(&self) -> &str { "" }
+            fn passage_prefix(&self) -> &str { "" }
         }
 
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
@@ -408,7 +417,7 @@ mod tests {
         struct NanEmbedder;
         #[async_trait::async_trait]
         impl Embedder for NanEmbedder {
-            async fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {
+            async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
                 Ok(vec![f32::NAN; 384])
             }
             fn dimensions(&self) -> usize {
@@ -416,6 +425,12 @@ mod tests {
             }
             fn model_id(&self) -> &str {
                 "nan-embedder"
+            }
+            fn query_prefix(&self) -> &str {
+                ""
+            }
+            fn passage_prefix(&self) -> &str {
+                ""
             }
         }
 
@@ -923,6 +938,56 @@ mod tests {
         assert!(da.is_none(), "single event with no prior rows must have disputed_against=NULL");
     }
 
+    // ── Role: worker embeds Passage exactly once per chunk, reused by both consumers ──
+
+    /// Records every `(role, text)` pair handed to `embed_with_role`.
+    struct RecordingEmbedder {
+        calls: Arc<std::sync::Mutex<Vec<(EmbedRole, String)>>>,
+    }
+    #[async_trait::async_trait]
+    impl Embedder for RecordingEmbedder {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+            self.calls.lock().unwrap().push((role, text.to_string()));
+            Ok(vec![0.1_f32; 384])
+        }
+        fn dimensions(&self) -> usize {
+            384
+        }
+        fn model_id(&self) -> &str {
+            "recording"
+        }
+        fn query_prefix(&self) -> &str {
+            ""
+        }
+        fn passage_prefix(&self) -> &str {
+            ""
+        }
+    }
+
+    /// A one-chunk ingest event must produce exactly ONE `embed_with_role`
+    /// call, role `Passage` — the same vector feeds both
+    /// `insert_memory_with_vector` and `detect_contradiction`'s KNN probe, so
+    /// there must be no second inference for the contradiction check.
+    #[tokio::test]
+    async fn worker_embeds_passage_exactly_once_per_chunk() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let embedder: Arc<dyn Embedder> = Arc::new(RecordingEmbedder { calls: calls.clone() });
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        tx.send(make_event(Role::User, "single chunk of content", None, 1)).unwrap();
+        drain_worker(tx, handle).await;
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "expected exactly one embed call for a one-chunk event, got {recorded:?}"
+        );
+        assert_eq!(recorded[0].0, EmbedRole::Passage, "worker must embed with role Passage");
+        assert_eq!(recorded[0].1, "single chunk of content");
+    }
+
     // ── Regression: the System→Skip guard still applies to non-Compaction events ──
 
     #[tokio::test]
@@ -1049,7 +1114,7 @@ mod tests {
         // write committed. Awaiting the handle is the barrier — no sleeping.
         drain_worker(tx, handle).await;
 
-        let q_vec = embedder.embed(&fresh.content).await.unwrap();
+        let q_vec = embedder.embed_with_role(&fresh.content, EmbedRole::Query).await.unwrap();
         let hits = search_all_memories(
             &store, &q_vec, AGENT, SearchScope::all_default(), 10,
         )

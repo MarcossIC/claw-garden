@@ -28,6 +28,13 @@ pub struct Cli {
     /// produces, so making it exclusive with `--fake`/`--real` would mean
     /// computing them twice to answer two questions about the same run.
     pub audit: bool,
+    /// Distinguishes this run's results file from another of the same
+    /// date+mode — see [`crate::report::results_filename`]. Its whole reason
+    /// to exist is keeping `--force` away from a baseline: without it, two
+    /// real runs taken on one day collide on `{date}-{mode}.json`, and
+    /// `--force` becomes the tempting fix that overwrites the very file the
+    /// second run was supposed to be compared against.
+    pub tag: Option<String>,
 }
 
 /// What a parse attempt produces. `--help` is not an error: it takes
@@ -69,6 +76,8 @@ OPTIONS:
                          queries restate their own answers). Exits 5 if it cannot.
     --golden <path>     Override the default golden set (docs/eval/golden.json)
     --out <dir>         Override the default results directory (docs/eval/results/)
+    --tag <slug>        Distinguish this run's results file from another of the same
+                         date+mode: {date}-{mode}-{tag}.json instead of {date}-{mode}.json
     --force             Allow overwriting an existing results file for the same date+config
     --help, -h          Print this message and exit
 
@@ -114,6 +123,7 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
     let mut out_dir: Option<PathBuf> = None;
     let mut force = false;
     let mut audit = false;
+    let mut tag: Option<String> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -145,6 +155,12 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
                     .ok_or_else(|| CliError::MissingValue("--out".to_string()))?;
                 out_dir = Some(PathBuf::from(value));
             }
+            "--tag" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| CliError::MissingValue("--tag".to_string()))?;
+                tag = Some(value);
+            }
             other => return Err(CliError::UnknownFlag(other.to_string())),
         }
     }
@@ -158,6 +174,7 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
         out_dir: out_dir.unwrap_or_else(default_out_dir),
         force,
         audit,
+        tag,
     }))
 }
 
@@ -204,6 +221,23 @@ mod tests {
         assert_eq!(cli.mode, Mode::Real);
         assert!(cli.check_only);
         assert!(cli.force);
+    }
+
+    #[test]
+    fn tag_is_none_by_default() {
+        assert_eq!(run_cli(&["--fake"]).tag, None);
+    }
+
+    #[test]
+    fn tag_is_captured_verbatim_when_given() {
+        let cli = run_cli(&["--real", "--tag", "pre-prefix"]);
+        assert_eq!(cli.tag, Some("pre-prefix".to_string()));
+    }
+
+    #[test]
+    fn tag_without_a_value_is_an_error() {
+        let err = parse(argv(&["--fake", "--tag"])).expect_err("missing value must error");
+        assert_eq!(err, CliError::MissingValue("--tag".to_string()));
     }
 
     #[test]

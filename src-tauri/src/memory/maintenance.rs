@@ -9,8 +9,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::memory::clock::TimestampMs;
-use crate::memory::db::MemoryStore;
+use crate::memory::db::{EmbeddingIdentity, MemoryStore};
+use crate::memory::embedder::{EmbedRole, Embedder};
+use crate::memory::vector::to_unit;
 use crate::memory::MemoryError;
+use serde::Serialize;
 
 /// Startup delay before the first maintenance pass: long enough to let the
 /// initial-ingest burst (embedder model download + `memory_worker` draining
@@ -287,10 +290,440 @@ const _: fn() = || {
     s::<Duration>();
 };
 
+// ---------------------------------------------------------------------------
+// reembed_all — operator-invoked E5-prefix backfill
+// ---------------------------------------------------------------------------
+
+/// Rows per batch for [`reembed_table`]. Unlike [`sweep_orphaned_vectors`],
+/// which loads every candidate id unbounded, this cannot: each row carries
+/// full TEXT and pays ONNX inference, so an unbounded load would hold the
+/// whole corpus's text in memory at once and never surface partial progress.
+/// Keyset-paginated (`id > last_id`, never `OFFSET`) — ids are stable and
+/// never rewritten, so the cursor needs no re-scan of rows already passed.
+const REEMBED_BATCH: i64 = 200;
+
+/// Which of the three vector-bearing tables [`reembed_table`] is walking.
+/// A closed enum rather than a `(&str, &str)` pair like
+/// [`sweep_orphaned_vectors`]'s `TABLES`, because `procedural_skill` needs a
+/// THIRD column (`skill_name`, alongside `trigger`) the other two tables
+/// don't have — a uniform 2-column tuple can't express that without a
+/// sentinel value threaded through code that doesn't need it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReembedTable {
+    Memory,
+    Episodic,
+    Procedural,
+}
+
+impl ReembedTable {
+    fn parent(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Episodic => "episodic_trajectory",
+            Self::Procedural => "procedural_skill",
+        }
+    }
+
+    fn vectors(self) -> &'static str {
+        match self {
+            Self::Memory => "memory_vectors",
+            Self::Episodic => "episodic_vectors",
+            Self::Procedural => "procedural_vectors",
+        }
+    }
+}
+
+/// One row read by [`select_reembed_batch`]: its id, the text a `ReInfer`
+/// pass would embed (for `procedural_skill` this is already
+/// [`crate::memory::miner::skill_embedding_text`]'s output — never rebuilt
+/// by hand here), and the raw bytes currently sitting in the matching
+/// vector row (what a `Normalize` pass renormalizes).
+struct ReembedRow {
+    id: i64,
+    text: String,
+    existing: Vec<u8>,
+}
+
+/// Two modes as types: which operation [`reembed_all`] performs against the
+/// store's three vector tables.
+///
+/// `Normalize` carries no embedder and no identity — structurally, not by
+/// convention, it cannot reach the arm in [`reembed_all`] that writes
+/// `embedding_contract`. That makes the contract row a receipt readable
+/// without opening this file: old prefixes in the row means no
+/// re-inference ever ran. It is idempotent AND cheap — [`to_unit`] is
+/// proven idempotent (`vector.rs::to_unit_is_idempotent`), so a repeated
+/// pass writes byte-identical bytes.
+///
+/// `ReInfer` pays for real inference on every row. It is idempotent in
+/// RESULT — the model is deterministic, so a re-run produces the same
+/// bytes — but NOT in cost: a re-run pays for every row's inference again.
+/// Because a failed pass leaves `embedding_contract` untouched (see
+/// [`reembed_all`]'s failure semantics), re-running IS the recovery path,
+/// and it converges: rows already written get the same bytes back, rows
+/// that were skipped get done, and the contract flips only once all three
+/// tables come back clean.
+pub(crate) enum ReembedMode {
+    Normalize,
+    ReInfer(ReInferPlan),
+}
+
+/// The embedder driving a [`ReembedMode::ReInfer`] pass, plus the identity
+/// that will be written to `embedding_contract` if the pass fully succeeds.
+///
+/// Both fields are PRIVATE and [`ReInferPlan::new`] is the only
+/// constructor: it derives `identity` FROM `embedder` via
+/// `EmbeddingIdentity::of`, so there is no way to construct a plan whose
+/// `identity` describes a different embedder than the one that will
+/// actually produce every vector. A public two-field variant would let a
+/// caller pair embedder A with identity B and write a contract for vectors
+/// that embedder never made.
+pub(crate) struct ReInferPlan {
+    embedder: Arc<dyn Embedder>,
+    identity: EmbeddingIdentity,
+}
+
+impl ReInferPlan {
+    pub(crate) fn new(embedder: Arc<dyn Embedder>) -> Self {
+        let identity = EmbeddingIdentity::of(embedder.as_ref());
+        Self { embedder, identity }
+    }
+}
+
+/// Attempted/updated/failed/aborted counts for one table's pass. The unit
+/// [`reembed_all`]'s caller reads to learn what actually happened, since
+/// [`reembed_all`] itself never returns `Err`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TableOutcome {
+    pub(crate) table: &'static str,
+    pub(crate) attempted: usize,
+    pub(crate) updated: usize,
+    pub(crate) failed: usize,
+    pub(crate) aborted: bool,
+}
+
+/// Outcome of a full [`reembed_all`] pass across all three tables.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ReembedReport {
+    pub(crate) per_table: [TableOutcome; 3],
+    pub(crate) contract_updated: bool,
+}
+
+/// Operator-invoked backfill for the three vector tables — never wired to
+/// run automatically. Auto-running full-corpus ONNX inference at startup
+/// because a config changed would turn the embedding contract's loud, safe
+/// stop (an empty cell, an `error` event, chat still working) into a
+/// silent, unbounded, CPU-heavy migration nobody asked for; this function
+/// exists so an operator CAN run that migration on purpose, not so the app
+/// runs it for them.
+///
+/// Never returns `Err` — fail-soft like [`sweep_orphaned_vectors`]. Each
+/// table is walked independently; a failure in one (a batch's `UPDATE`
+/// transaction failing, which rolls the whole batch back and aborts the
+/// REST of that table) does not stop the other two from being attempted.
+/// [`ReembedReport`] is how the caller finds out what actually happened.
+///
+/// The `embedding_contract` row is written LAST, and only when `mode` is
+/// `ReInfer` AND every table came back with `failed == 0` and
+/// `aborted == false`. After a partial `ReInfer` failure the store holds
+/// vectors from BOTH the old and the new embedding space, and no value
+/// written to the contract can describe that truthfully — so the choice is
+/// between two lies. Leaving the OLD prefixes in place produces a
+/// `Mismatch` the next time the app boots with the new embedder: the cell
+/// stays empty, memory is degraded, chat keeps working — the loud, safe
+/// stop doing exactly its job. Writing the NEW prefixes would produce a
+/// `Match`, and the store would silently serve half its rows out of a
+/// space the active embedder never produced them in, forever, with
+/// nothing left to detect it. The old value is the only one that stays
+/// honest, so leaving the contract untouched on any failure is not an
+/// omission — it is the whole point of writing it last.
+pub(crate) async fn reembed_all(store: &MemoryStore, mode: ReembedMode) -> ReembedReport {
+    let memory = reembed_table(store, &mode, ReembedTable::Memory).await;
+    let episodic = reembed_table(store, &mode, ReembedTable::Episodic).await;
+    let procedural = reembed_table(store, &mode, ReembedTable::Procedural).await;
+    let per_table = [memory, episodic, procedural];
+
+    let contract_updated = match &mode {
+        ReembedMode::Normalize => false,
+        ReembedMode::ReInfer(plan) => {
+            let all_clean = per_table.iter().all(|t| t.failed == 0 && !t.aborted);
+            if !all_clean {
+                false
+            } else {
+                match write_embedding_contract(store, &plan.identity).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::warn!(
+                            "reembed_all: all 3 tables migrated cleanly but the contract write \
+                             failed: {e} — embedding_contract still holds the OLD identity, so \
+                             the next boot will report Mismatch rather than trust a migration \
+                             that never got its receipt written"
+                        );
+                        false
+                    }
+                }
+            }
+        }
+    };
+
+    ReembedReport { per_table, contract_updated }
+}
+
+/// Walks one table to completion via keyset pagination. Three steps per
+/// batch, in this order and no other: (1) SELECT the batch inside
+/// `conn.call`, connection released immediately after; (2) OUTSIDE the
+/// connection, compute every row's new vector (`embed_with_role` is async
+/// and the writer connection's closure is sync, so inference cannot happen
+/// inside `conn.call`); (3) one `conn.call` transaction that `UPDATE`s
+/// every successfully-computed row and commits — the writer is held only
+/// for SQL, and the batch is all-or-nothing.
+async fn reembed_table(store: &MemoryStore, mode: &ReembedMode, table: ReembedTable) -> TableOutcome {
+    let mut attempted = 0usize;
+    let mut updated = 0usize;
+    let mut failed = 0usize;
+    let mut after_id: i64 = 0;
+
+    loop {
+        let batch = match select_reembed_batch(store, table, after_id, REEMBED_BATCH).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                log::warn!("reembed_all: batch select failed for {}: {e}", table.parent());
+                return TableOutcome { table: table.parent(), attempted, updated, failed, aborted: true };
+            }
+        };
+        if batch.is_empty() {
+            break;
+        }
+        let batch_len = batch.len();
+        after_id = batch.last().map(|r| r.id).unwrap_or(after_id);
+        attempted += batch_len;
+
+        // Outside the connection: one un-embeddable row must not deny every
+        // other row in the batch its migration, so a per-row failure is
+        // logged, counted, and left out of this batch's write — its old
+        // vector stays exactly as it was.
+        let mut writes = Vec::with_capacity(batch_len);
+        for row in &batch {
+            match compute_new_embedding(mode, row).await {
+                Ok(v) => writes.push((row.id, serialize_f32_vec(&v))),
+                Err(e) => {
+                    log::warn!(
+                        "reembed_all: embed failed for {} id={}: {e} — row keeps its old vector",
+                        table.parent(),
+                        row.id
+                    );
+                    failed += 1;
+                }
+            }
+        }
+
+        if !writes.is_empty() {
+            let n = writes.len();
+            match write_reembed_batch(store, table, writes).await {
+                Ok(()) => updated += n,
+                Err(e) => {
+                    // A write failure here is about the STORE refusing a
+                    // write, not about any one row's content — burning
+                    // inference against more batches would not change
+                    // that, so this table stops here while the other two
+                    // still get their own independent attempt.
+                    log::warn!("reembed_all: batch UPDATE failed for {}: {e}", table.parent());
+                    return TableOutcome { table: table.parent(), attempted, updated, failed, aborted: true };
+                }
+            }
+        }
+
+        if batch_len < REEMBED_BATCH as usize {
+            break;
+        }
+    }
+
+    TableOutcome { table: table.parent(), attempted, updated, failed, aborted: false }
+}
+
+/// Computes one row's new vector. `ReInfer` re-runs inference — always
+/// [`EmbedRole::Passage`], since every reembedded row is something searched
+/// THROUGH, never a query — then [`to_unit`]s the result. `Normalize`
+/// deserializes the vector already sitting in the store and [`to_unit`]s
+/// THAT — no embedder call, which is also why `Normalize` cannot fail on
+/// inference, only on a corrupt stored blob.
+async fn compute_new_embedding(mode: &ReembedMode, row: &ReembedRow) -> Result<Vec<f32>, String> {
+    match mode {
+        ReembedMode::Normalize => {
+            let existing = deserialize_f32_vec(&row.existing);
+            to_unit(&existing).map_err(|e| e.to_string())
+        }
+        ReembedMode::ReInfer(plan) => {
+            let raw = plan
+                .embedder
+                .embed_with_role(&row.text, EmbedRole::Passage)
+                .await
+                .map_err(|e| e.to_string())?;
+            to_unit(&raw).map_err(|e| e.to_string())
+        }
+    }
+}
+
+/// One batch's SELECT, joined to its vector table so the currently-stored
+/// bytes ride along with the text in a single point-lookup pass (same
+/// `rowid = p.id` join shape as [`sweep_orphaned_vectors`]) — `Normalize`
+/// needs those bytes and `ReInfer` needs the text, and fetching both
+/// unconditionally is cheaper than a second round trip to find out which
+/// one the caller actually wanted.
+///
+/// `procedural_skill` is the one table where the "text" isn't a single
+/// column: it resolves `trigger`+`skill_name` through
+/// [`crate::memory::miner::skill_embedding_text`] — the SAME function the
+/// original promotion write used — instead of concatenating them here by
+/// hand, which would silently re-embed a different string than the one the
+/// row was originally written with.
+async fn select_reembed_batch(
+    store: &MemoryStore,
+    table: ReembedTable,
+    after_id: i64,
+    limit: i64,
+) -> Result<Vec<ReembedRow>, tokio_rusqlite::Error> {
+    store
+        .conn
+        .call(move |c| -> rusqlite::Result<Vec<ReembedRow>> {
+            match table {
+                ReembedTable::Procedural => {
+                    let mut stmt = c.prepare(
+                        "SELECT p.id, p.trigger, p.skill_name, v.embedding \
+                         FROM procedural_skill p JOIN procedural_vectors v ON v.rowid = p.id \
+                         WHERE p.deleted_at IS NULL AND p.id > ?1 ORDER BY p.id LIMIT ?2",
+                    )?;
+                    let rows = stmt.query_map(rusqlite::params![after_id, limit], |r| {
+                        let id: i64 = r.get(0)?;
+                        let trigger: String = r.get(1)?;
+                        let skill_name: String = r.get(2)?;
+                        let existing: Vec<u8> = r.get(3)?;
+                        Ok(ReembedRow {
+                            id,
+                            text: crate::memory::miner::skill_embedding_text(&trigger, &skill_name),
+                            existing,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(rows)
+                }
+                ReembedTable::Memory | ReembedTable::Episodic => {
+                    let (parent, vectors, text_col) = match table {
+                        ReembedTable::Memory => ("memory", "memory_vectors", "content"),
+                        ReembedTable::Episodic => ("episodic_trajectory", "episodic_vectors", "task"),
+                        ReembedTable::Procedural => unreachable!(),
+                    };
+                    let sql = format!(
+                        "SELECT p.id, p.{text_col}, v.embedding FROM {parent} p \
+                         JOIN {vectors} v ON v.rowid = p.id \
+                         WHERE p.deleted_at IS NULL AND p.id > ?1 ORDER BY p.id LIMIT ?2"
+                    );
+                    let mut stmt = c.prepare(&sql)?;
+                    let rows = stmt
+                        .query_map(rusqlite::params![after_id, limit], |r| {
+                            let id: i64 = r.get(0)?;
+                            let text: String = r.get(1)?;
+                            let existing: Vec<u8> = r.get(2)?;
+                            Ok(ReembedRow { id, text, existing })
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(rows)
+                }
+            }
+        })
+        .await
+}
+
+/// One batch's write: a single transaction, one `UPDATE ... WHERE rowid = ?`
+/// per row, then commit. vec0 in-place `UPDATE` is correct for this
+/// schema — verified in vendored `sqlite-vec.c` (`vec0Update` →
+/// `vec0Update_Update` → `vec0Update_UpdateVectorColumn`); `V2__vectors.sql`
+/// declares only `embedding float[384]` with no partition/auxiliary/metadata
+/// columns, so the "not supported yet" rejection those functions guard
+/// against is unreachable against this schema. No DELETE+INSERT dance, and
+/// no `rowid IN (subquery)` either — a bare `rowid = ?` is the point-lookup
+/// plan the vector virtual table supports directly.
+async fn write_reembed_batch(
+    store: &MemoryStore,
+    table: ReembedTable,
+    updates: Vec<(i64, Vec<u8>)>,
+) -> Result<(), tokio_rusqlite::Error> {
+    let vectors = table.vectors();
+    let sql = format!("UPDATE {vectors} SET embedding = ?1 WHERE rowid = ?2");
+    store
+        .conn
+        .call(move |c| -> rusqlite::Result<()> {
+            let tx = c.transaction()?;
+            for (id, bytes) in &updates {
+                tx.execute(&sql, rusqlite::params![bytes, id])?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+}
+
+/// Unconditionally writes `identity` to the single-row `embedding_contract`
+/// table — an UPSERT, unlike [`MemoryStore::ensure_embedding_contract`]'s
+/// write-if-absent/verify-if-present semantics. By the time `reembed_all`
+/// reaches this call a row already exists (the app booted with SOME
+/// embedder), and the whole point is to REPLACE it with the identity that
+/// just finished producing every vector in the store.
+async fn write_embedding_contract(
+    store: &MemoryStore,
+    identity: &EmbeddingIdentity,
+) -> Result<(), tokio_rusqlite::Error> {
+    let identity = identity.clone();
+    store
+        .conn
+        .call(move |c| -> rusqlite::Result<()> {
+            let created_at = crate::memory::clock::TimestampMs::now();
+            c.execute(
+                "INSERT INTO embedding_contract \
+                 (id, model_id, dim, metric, normalized, query_prefix, passage_prefix, created_at) \
+                 VALUES (1, ?1, ?2, 'l2_unit', 1, ?3, ?4, ?5) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                   model_id = excluded.model_id, \
+                   dim = excluded.dim, \
+                   query_prefix = excluded.query_prefix, \
+                   passage_prefix = excluded.passage_prefix, \
+                   created_at = excluded.created_at",
+                rusqlite::params![
+                    identity.model_id,
+                    identity.dim as i64,
+                    identity.query_prefix,
+                    identity.passage_prefix,
+                    created_at,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+}
+
+/// Little-endian `f32` -> bytes, matching every vector column's encoding in
+/// this schema (`store_insert.rs`'s producer, `db.rs`'s test-side reader).
+fn serialize_f32_vec(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for &f in v {
+        out.extend_from_slice(&f.to_le_bytes());
+    }
+    out
+}
+
+/// Inverse of [`serialize_f32_vec`].
+fn deserialize_f32_vec(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::memory::clock::TimestampMs;
     use crate::memory::db::MemoryStore;
+    use crate::memory::embedder::{EmbedRole, Embedder};
     use std::sync::atomic::{AtomicI64, Ordering};
 
     // ── Test helpers ──────────────────────────────────────────────────────
@@ -790,5 +1223,407 @@ mod tests {
         let second = super::sweep_orphaned_vectors(&store).await;
         assert_eq!(second, 0, "an already-swept corpus must give the second pass nothing to do");
         assert_eq!(vector_row_count(&store, "memory_vectors", id).await, 0, "second pass must stay a no-op, not error or re-delete");
+    }
+
+    // ── reembed_all ──────────────────────────────────────────────────────
+
+    async fn seed_reembed_memory(store: &MemoryStore, content: &str, raw_vector: Vec<f32>) -> i64 {
+        let bytes = super::serialize_f32_vec(&raw_vector);
+        let content = content.to_string();
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<i64> {
+                let tx = c.transaction()?;
+                tx.execute(
+                    "INSERT INTO memory \
+                     (scope, agent_id, content, memory_type, tier, importance, \
+                      created_at, last_modified_at, last_accessed_at, \
+                      created_by_type, created_by_ref) \
+                     VALUES ('agent', 'test-agent', ?1, 'chat_message', 3, 5.0, 0, 0, 0, 'agent', '')",
+                    rusqlite::params![content],
+                )?;
+                let id = tx.last_insert_rowid();
+                tx.execute(
+                    "INSERT INTO memory_vectors(rowid, embedding) VALUES (?, ?)",
+                    rusqlite::params![id, bytes],
+                )?;
+                tx.commit()?;
+                Ok(id)
+            })
+            .await
+            .expect("seed_reembed_memory failed")
+    }
+
+    async fn seed_reembed_episodic(store: &MemoryStore, task: &str, raw_vector: Vec<f32>) -> i64 {
+        let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
+        let bytes = super::serialize_f32_vec(&raw_vector);
+        let task = task.to_string();
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<i64> {
+                let tx = c.transaction()?;
+                tx.execute(
+                    "INSERT INTO episodic_trajectory \
+                     (scope, agent_id, session_id, task, tier, importance, \
+                      created_at, last_modified_at, last_accessed_at, \
+                      created_by_type, created_by_ref) \
+                     VALUES ('agent', 'test-agent', ?1, ?2, 3, 5.0, 0, 0, 0, 'agent', '')",
+                    rusqlite::params![format!("sess-reembed-{nonce}"), task],
+                )?;
+                let id = tx.last_insert_rowid();
+                tx.execute(
+                    "INSERT INTO episodic_vectors(rowid, embedding) VALUES (?, ?)",
+                    rusqlite::params![id, bytes],
+                )?;
+                tx.commit()?;
+                Ok(id)
+            })
+            .await
+            .expect("seed_reembed_episodic failed")
+    }
+
+    async fn seed_reembed_procedural(
+        store: &MemoryStore,
+        trigger: &str,
+        skill_name: &str,
+        raw_vector: Vec<f32>,
+    ) -> i64 {
+        let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
+        let bytes = super::serialize_f32_vec(&raw_vector);
+        let trigger = trigger.to_string();
+        let skill_name = skill_name.to_string();
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<i64> {
+                let tx = c.transaction()?;
+                tx.execute(
+                    "INSERT INTO procedural_skill \
+                     (scope, agent_id, skill_name, trigger, tier, importance, \
+                      promoted_at, source_trajectory_ids, \
+                      created_at, last_modified_at, last_accessed_at, \
+                      created_by_type, created_by_ref) \
+                     VALUES ('agent', 'test-agent', ?1, ?2, 3, 5.0, 0, '[]', 0, 0, 0, 'agent', ?3)",
+                    rusqlite::params![skill_name, trigger, format!("t-{nonce}")],
+                )?;
+                let id = tx.last_insert_rowid();
+                tx.execute(
+                    "INSERT INTO procedural_vectors(rowid, embedding) VALUES (?, ?)",
+                    rusqlite::params![id, bytes],
+                )?;
+                tx.commit()?;
+                Ok(id)
+            })
+            .await
+            .expect("seed_reembed_procedural failed")
+    }
+
+    async fn read_vector_bytes(store: &MemoryStore, vectors_table: &'static str, id: i64) -> Vec<u8> {
+        let sql = format!("SELECT embedding FROM {vectors_table} WHERE rowid = ?1");
+        store.conn.call(move |c| c.query_row(&sql, [id], |r| r.get(0))).await.unwrap()
+    }
+
+    async fn read_contract_row(store: &MemoryStore) -> Option<(String, i64, String, String)> {
+        use rusqlite::OptionalExtension;
+        store
+            .conn
+            .call(|c| -> rusqlite::Result<Option<(String, i64, String, String)>> {
+                c.query_row(
+                    "SELECT model_id, dim, query_prefix, passage_prefix FROM embedding_contract WHERE id = 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Records `(role, text)` for every call — same "recording fake"
+    /// convention used at `worker.rs:337,369,411` / `state.rs:531-544`.
+    /// Reused here to pin which role `reembed_all` uses per table, and to
+    /// pin that `procedural_skill` embeds `skill_embedding_text(trigger,
+    /// skill_name)` rather than a hand-rebuilt string.
+    struct RecordingEmbedder {
+        calls: std::sync::Mutex<Vec<(EmbedRole, String)>>,
+    }
+
+    impl RecordingEmbedder {
+        fn new() -> Self {
+            Self { calls: std::sync::Mutex::new(Vec::new()) }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for RecordingEmbedder {
+        async fn embed_with_role(
+            &self,
+            text: &str,
+            role: EmbedRole,
+        ) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+            self.calls.lock().unwrap().push((role, text.to_string()));
+            Ok(vec![1.0f32; 384])
+        }
+        fn dimensions(&self) -> usize {
+            384
+        }
+        fn model_id(&self) -> &str {
+            "recording-embedder"
+        }
+        fn query_prefix(&self) -> &str {
+            ""
+        }
+        fn passage_prefix(&self) -> &str {
+            ""
+        }
+    }
+
+    /// Fails on exactly the Nth call (1-indexed), succeeds deterministically
+    /// on every other call — the seam the design names for the "one row's
+    /// embed fails, batch continues" failure-semantics test.
+    struct FlakyEmbedder {
+        fail_on_call: usize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for FlakyEmbedder {
+        async fn embed_with_role(
+            &self,
+            text: &str,
+            _role: EmbedRole,
+        ) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if n == self.fail_on_call {
+                return Err(crate::memory::embedder::EmbedError::InferenceFailed(
+                    "simulated failure".into(),
+                ));
+            }
+            Ok(vec![(text.len() as f32) + 1.0; 384])
+        }
+        fn dimensions(&self) -> usize {
+            384
+        }
+        fn model_id(&self) -> &str {
+            "flaky-embedder"
+        }
+        fn query_prefix(&self) -> &str {
+            ""
+        }
+        fn passage_prefix(&self) -> &str {
+            ""
+        }
+    }
+
+    #[tokio::test]
+    async fn reembed_normalize_leaves_contract_row_byte_identical() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        store
+            .ensure_embedding_contract(crate::memory::db::EmbeddingIdentity {
+                model_id: "multilingual-e5-small".into(),
+                dim: 384,
+                query_prefix: "query: ".into(),
+                passage_prefix: "passage: ".into(),
+            })
+            .await
+            .unwrap();
+        let before = read_contract_row(&store).await;
+
+        let report = super::reembed_all(&store, super::ReembedMode::Normalize).await;
+
+        let after = read_contract_row(&store).await;
+        assert_eq!(before, after, "Normalize must never touch the embedding_contract row");
+        assert!(!report.contract_updated, "Normalize's report must say contract_updated=false");
+    }
+
+    #[tokio::test]
+    async fn reembed_normalize_renormalizes_and_is_idempotent() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        // Deliberately non-unit: ||v|| = sqrt(384 * 4) ≈ 39.2.
+        let raw: Vec<f32> = vec![2.0; 384];
+        let id = seed_reembed_memory(&store, "needs renormalizing", raw).await;
+
+        super::reembed_all(&store, super::ReembedMode::Normalize).await;
+        let once = read_vector_bytes(&store, "memory_vectors", id).await;
+        let once_f = super::deserialize_f32_vec(&once);
+        let norm: f32 = once_f.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-4, "Normalize must renormalize to unit length, got norm={norm}");
+
+        super::reembed_all(&store, super::ReembedMode::Normalize).await;
+        let twice = read_vector_bytes(&store, "memory_vectors", id).await;
+        assert_eq!(once, twice, "a second Normalize pass must write byte-identical bytes (idempotent)");
+    }
+
+    #[tokio::test]
+    async fn reembed_reinfer_uses_passage_role_and_shared_skill_embedding_text() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed_reembed_memory(&store, "hello world", vec![0.3; 384]).await;
+        seed_reembed_episodic(&store, "fix the bug", vec![0.3; 384]).await;
+        seed_reembed_procedural(&store, "when login fails", "Fix login flow", vec![0.3; 384]).await;
+
+        let recorder = std::sync::Arc::new(RecordingEmbedder::new());
+        let embedder: std::sync::Arc<dyn Embedder> = recorder.clone();
+        let plan = super::ReInferPlan::new(embedder);
+
+        super::reembed_all(&store, super::ReembedMode::ReInfer(plan)).await;
+
+        let calls = recorder.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3, "expected exactly one embed call per seeded row");
+        for (role, _) in calls.iter() {
+            assert_eq!(*role, EmbedRole::Passage, "reembed_all must always embed with role Passage");
+        }
+        let texts: std::collections::HashSet<&str> = calls.iter().map(|(_, t)| t.as_str()).collect();
+        assert!(texts.contains("hello world"), "memory.content must reach the embedder verbatim");
+        assert!(texts.contains("fix the bug"), "episodic_trajectory.task must reach the embedder verbatim");
+        let expected_skill_text =
+            crate::memory::miner::skill_embedding_text("when login fails", "Fix login flow");
+        assert!(
+            texts.contains(expected_skill_text.as_str()),
+            "procedural_skill must embed skill_embedding_text(trigger, skill_name), not a hand-rebuilt string"
+        );
+    }
+
+    #[tokio::test]
+    async fn reembed_reinfer_skips_failed_row_keeps_old_vector_and_continues_batch() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let _id1 = seed_reembed_memory(&store, "row one", vec![1.0f32; 384]).await;
+        let id2 = seed_reembed_memory(&store, "row two", vec![1.0f32; 384]).await;
+        let _id3 = seed_reembed_memory(&store, "row three", vec![1.0f32; 384]).await;
+        let before2 = read_vector_bytes(&store, "memory_vectors", id2).await;
+
+        let embedder: std::sync::Arc<dyn Embedder> = std::sync::Arc::new(FlakyEmbedder {
+            fail_on_call: 2,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let plan = super::ReInferPlan::new(embedder);
+        let report = super::reembed_all(&store, super::ReembedMode::ReInfer(plan)).await;
+
+        let memory_outcome = &report.per_table[0];
+        assert_eq!(memory_outcome.attempted, 3);
+        assert_eq!(memory_outcome.updated, 2);
+        assert_eq!(memory_outcome.failed, 1);
+        assert!(!memory_outcome.aborted, "a per-row embed failure must not abort the table");
+
+        let after2 = read_vector_bytes(&store, "memory_vectors", id2).await;
+        assert_eq!(before2, after2, "the failed row must keep its old vector, byte-for-byte");
+        assert!(!report.contract_updated, "a partial failure must never write the contract");
+    }
+
+    #[tokio::test]
+    async fn reembed_reinfer_update_failure_aborts_only_that_table() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed_reembed_memory(&store, "will not survive the write", vec![1.0; 384]).await;
+
+        // Force every write to fail (reads still work) so the failure lands
+        // in the batch's UPDATE transaction, not the SELECT — the seam the
+        // design calls out as distinct from a per-row embed failure.
+        store.conn.call(|c| c.execute("PRAGMA query_only = ON", [])).await.unwrap();
+
+        let embedder: std::sync::Arc<dyn Embedder> =
+            std::sync::Arc::new(crate::memory::embedder::FakeEmbedder::default());
+        let plan = super::ReInferPlan::new(embedder);
+        let report = super::reembed_all(&store, super::ReembedMode::ReInfer(plan)).await;
+
+        let memory_outcome = &report.per_table[0];
+        assert!(memory_outcome.aborted, "a failing UPDATE transaction must abort the table");
+        assert_eq!(memory_outcome.updated, 0, "no row can have been written if the UPDATE tx failed");
+        assert!(!report.per_table[1].aborted, "an empty table with no batch attempted must not be marked aborted");
+        assert!(!report.per_table[2].aborted, "an empty table with no batch attempted must not be marked aborted");
+        assert!(!report.contract_updated);
+    }
+
+    #[tokio::test]
+    async fn reembed_reinfer_writes_contract_only_after_total_success() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed_reembed_memory(&store, "one row is enough", vec![1.0; 384]).await;
+
+        let embedder: std::sync::Arc<dyn Embedder> =
+            std::sync::Arc::new(crate::memory::embedder::FakeEmbedder::default());
+        let plan = super::ReInferPlan::new(embedder);
+        let report = super::reembed_all(&store, super::ReembedMode::ReInfer(plan)).await;
+
+        assert!(report.per_table.iter().all(|t| t.failed == 0 && !t.aborted));
+        assert!(report.contract_updated, "a fully clean ReInfer pass must write the contract");
+
+        let (model_id, dim, query_prefix, passage_prefix) =
+            read_contract_row(&store).await.expect("contract row must exist after a clean ReInfer pass");
+        assert_eq!(model_id, "fake-embedder");
+        assert_eq!(dim, 384);
+        assert_eq!(query_prefix, "");
+        assert_eq!(passage_prefix, "");
+    }
+
+    #[tokio::test]
+    async fn reembed_reinfer_partial_failure_leaves_old_contract_row_untouched() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        store
+            .ensure_embedding_contract(crate::memory::db::EmbeddingIdentity {
+                model_id: "old-model".into(),
+                dim: 384,
+                query_prefix: "".into(),
+                passage_prefix: "".into(),
+            })
+            .await
+            .unwrap();
+
+        seed_reembed_memory(&store, "row A", vec![1.0; 384]).await;
+        seed_reembed_memory(&store, "row B", vec![1.0; 384]).await;
+
+        let embedder: std::sync::Arc<dyn Embedder> = std::sync::Arc::new(FlakyEmbedder {
+            fail_on_call: 1,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let plan = super::ReInferPlan::new(embedder);
+        let report = super::reembed_all(&store, super::ReembedMode::ReInfer(plan)).await;
+
+        assert!(!report.contract_updated, "any failed row must block the contract write entirely");
+        let (model_id, ..) = read_contract_row(&store).await.unwrap();
+        assert_eq!(
+            model_id, "old-model",
+            "after a partial failure the store still holds the OLD identity — a mismatch on next \
+             boot is the honest signal; a rewritten contract would silently claim the whole store \
+             was migrated when it was not"
+        );
+    }
+
+    #[tokio::test]
+    async fn reembed_keyset_pagination_processes_every_row_past_one_batch_boundary() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        // REEMBED_BATCH is 200; seed comfortably past two full batches so an
+        // off-by-one on the `id > last_id` cursor (`>=` would drop the
+        // boundary row; a cursor that never advances would spin forever) is
+        // forced to show up as a wrong `attempted` count.
+        for i in 0..450 {
+            seed_reembed_memory(&store, &format!("row {i}"), vec![1.0; 384]).await;
+        }
+
+        let report = super::reembed_all(&store, super::ReembedMode::Normalize).await;
+
+        let memory_outcome = &report.per_table[0];
+        assert_eq!(memory_outcome.attempted, 450);
+        assert_eq!(memory_outcome.updated, 450);
+        assert_eq!(memory_outcome.failed, 0);
+        assert!(!memory_outcome.aborted);
+    }
+
+    #[tokio::test]
+    async fn reembed_reinfer_is_idempotent_in_result_across_two_runs() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let id = seed_reembed_memory(&store, "stable content", vec![1.0; 384]).await;
+
+        let embedder1: std::sync::Arc<dyn Embedder> =
+            std::sync::Arc::new(crate::memory::embedder::FakeEmbedder::default());
+        super::reembed_all(&store, super::ReembedMode::ReInfer(super::ReInferPlan::new(embedder1))).await;
+        let first = read_vector_bytes(&store, "memory_vectors", id).await;
+
+        let embedder2: std::sync::Arc<dyn Embedder> =
+            std::sync::Arc::new(crate::memory::embedder::FakeEmbedder::default());
+        super::reembed_all(&store, super::ReembedMode::ReInfer(super::ReInferPlan::new(embedder2))).await;
+        let second = read_vector_bytes(&store, "memory_vectors", id).await;
+
+        assert_eq!(
+            first, second,
+            "re-running ReInfer over unchanged text must produce byte-identical vectors — \
+             same bytes, but NOT free: it pays for inference again"
+        );
     }
 }

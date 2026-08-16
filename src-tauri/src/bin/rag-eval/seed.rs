@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use agent_office_lib::eval_api::{EvalEmbedder, EvalError, EvalStore};
+use agent_office_lib::eval_api::{EmbedRole, EvalEmbedder, EvalError, EvalStore};
 
 use crate::golden::{CorpusRow, RefMap};
 
@@ -31,6 +31,16 @@ pub struct SeedResult {
     pub store_path: PathBuf,
     pub mean_norm: f64,
     pub max_norm_deviation: f64,
+    /// Every corpus row's own ref paired with the embedding that was inserted
+    /// for it, cloned in the same loop that seeds the store. The store only
+    /// ever hands a vector back through a distance, never the vector itself,
+    /// so a caller that needs the raw corpus vectors — the similarity
+    /// measurement block ranking by cosine — has to hold its own copy from
+    /// the one place they exist before being moved into the store. Cloning
+    /// here costs one extra `Vec<f32>` per row; re-embedding the corpus a
+    /// second time to get the same vectors back would cost the whole
+    /// inference pass again.
+    pub vectors: Vec<(String, Vec<f32>)>,
 }
 
 /// Opens a fresh temp store and inserts every row of `corpus` into it,
@@ -43,10 +53,15 @@ pub async fn seed(corpus: &[CorpusRow], embedder: &EvalEmbedder) -> Result<SeedR
     let store = EvalStore::open(&store_path).await?;
     let mut refs = RefMap::new();
     let mut norms: Vec<f64> = Vec::with_capacity(corpus.len());
+    let mut vectors: Vec<(String, Vec<f32>)> = Vec::with_capacity(corpus.len());
 
     for row in corpus {
-        let embedding = embedder.embed(&row.content).await?;
+        // Passage: corpus rows are the stored side of the space — this must
+        // match production's worker.rs role, or the harness seeds a space
+        // production never writes to.
+        let embedding = embedder.embed_with_role(&row.content, EmbedRole::Passage).await?;
         norms.push(l2_norm(&embedding));
+        vectors.push((row.ref_.clone(), embedding.clone()));
         let id = store
             .insert(AGENT_ID, &row.content, &row.memory_type, row.importance, embedding)
             .await?;
@@ -55,7 +70,7 @@ pub async fn seed(corpus: &[CorpusRow], embedder: &EvalEmbedder) -> Result<SeedR
 
     let (mean_norm, max_norm_deviation) = norm_stats(&norms);
 
-    Ok(SeedResult { store, refs, store_path, mean_norm, max_norm_deviation })
+    Ok(SeedResult { store, refs, store_path, mean_norm, max_norm_deviation, vectors })
 }
 
 /// A path under the system temp directory, unique per run. Not cleaned up
@@ -147,6 +162,24 @@ mod tests {
         // unrelated reasons.
         assert!(result.mean_norm > 5.0, "expected an unnormalized fake vector, got mean_norm={}", result.mean_norm);
         assert!(result.max_norm_deviation > 4.0);
+
+        std::fs::remove_dir_all(&result.store_path).ok();
+    }
+
+    #[tokio::test]
+    async fn seed_result_carries_every_corpus_vector_at_the_embedders_dimension() {
+        let corpus = vec![
+            row("c1", "alpha content", "chat_message", 3.0),
+            row("c2", "beta content", "code_block", 4.0),
+        ];
+        let embedder = EvalEmbedder::fake();
+
+        let result = seed(&corpus, &embedder).await.expect("seeding must succeed");
+
+        assert_eq!(result.vectors.len(), corpus.len());
+        for (_ref_, vector) in &result.vectors {
+            assert_eq!(vector.len(), embedder.dimensions());
+        }
 
         std::fs::remove_dir_all(&result.store_path).ok();
     }

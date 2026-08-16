@@ -133,6 +133,12 @@ pub struct NormCheck {
 pub struct GoldenSetProvenance {
     pub provisional: bool,
     pub note: String,
+    /// SHA-256 of the exact golden-set bytes this run scored against
+    /// (`golden::LoadedGolden::content_sha256`). Makes "were these two runs
+    /// scored against the same set" a machine-checkable equality instead of
+    /// an eyeballed guess: two results files with different hashes here were
+    /// never comparable, whether or not anything else about them looks alike.
+    pub content_sha256: String,
 }
 
 /// Case and pair counts below which a golden set cannot carry a claim. Taken
@@ -152,7 +158,7 @@ impl GoldenSetProvenance {
     /// numbers that deserve to be trusted, and nothing in a passing test suite
     /// would ever contradict it. Computing it from the counts means the claim
     /// cannot outlive the condition it describes.
-    pub fn derive(n_cases: usize, n_pairs: usize) -> Self {
+    pub fn derive(n_cases: usize, n_pairs: usize, content_sha256: String) -> Self {
         let short_on_cases = n_cases < DOMAIN_SET_MIN_CASES;
         let short_on_pairs = n_pairs < DOMAIN_SET_MIN_PAIRS;
         let lacking = match (short_on_cases, short_on_pairs) {
@@ -165,6 +171,7 @@ impl GoldenSetProvenance {
                         "domain golden set: {n_cases} retrieval cases, \
                          {n_pairs} contradiction pairs"
                     ),
+                    content_sha256,
                 }
             }
             (true, true) => format!(
@@ -184,14 +191,50 @@ impl GoldenSetProvenance {
                 "{lacking}; a later run against a fuller golden set will move every metric \
                  for reasons that have nothing to do with retrieval quality"
             ),
+            content_sha256,
         }
     }
+}
+
+/// The pure-cosine measurement block: retrieval quality scored by ranking
+/// raw embeddings directly, bypassing the store's own scoring path entirely.
+/// `aggregate`/`per_case` are built through the exact same `metrics.rs`
+/// functions the ranked path uses — there is no second metric
+/// implementation that a `sim` number could disagree with a `ranked` number
+/// by being wrong in its own, different way.
+#[derive(Debug, Clone, Serialize)]
+pub struct SimilarityResults {
+    pub aggregate: Aggregate,
+    pub per_case: Vec<CaseResult>,
+    /// Query-anchored: each active case's weakest expected match minus its
+    /// strongest rival, meaned across cases. Not comparable to a mined
+    /// distractor-gap statistic — see `mean_corpus_distractor_gap` for the
+    /// field that is.
+    pub mean_expected_distractor_gap: f64,
+    /// Doc-anchored, same `cosine`/`1 - max` shape as the golden-set miner's
+    /// own statistic: comparable to it directly, pre- vs post-change, on the
+    /// frozen set's unchanged distractor structure.
+    pub mean_corpus_distractor_gap: f64,
+    /// The prefix strings actually applied to queries/passages during this
+    /// run, copied from the live embedder. An empty string here is not a
+    /// placeholder — it is the true value for a run that predates prefixing,
+    /// and a non-empty value on a run meant to be a baseline is self-refuting
+    /// evidence that the wrong code path ran.
+    pub query_prefix: String,
+    pub passage_prefix: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RunResults {
     pub date: String,
     pub mode: Mode,
+    /// Operator-supplied slug distinguishing this run from another of the
+    /// same date and mode — e.g. `pre-prefix` vs `e5-prefix` for the two
+    /// gate runs either side of a re-embedding change. Absent by default:
+    /// most runs need no tag, and folding it into `mode` would force every
+    /// caller to invent one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
     pub model_id: String,
     pub git_sha: String,
     pub k_pool: KPool,
@@ -213,6 +256,13 @@ pub struct RunResults {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit: Option<crate::audit::AuditReport>,
     pub norm_check: NormCheck,
+    /// Present only when the run computed the pure-cosine similarity block —
+    /// never under `--fake`, since `FakeEmbedder` has no learned geometry for
+    /// a cosine measurement to describe. Absent, not null, for the same
+    /// reason `audit` is: a reader must be able to tell "not computed" from
+    /// "computed and empty".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub similarity: Option<SimilarityResults>,
 }
 
 /// Averages the five per-case metrics across `cases`. Callers decide which
@@ -269,13 +319,21 @@ pub fn aggregate_by_lang(cases: &[CaseResult]) -> Vec<LangAggregate> {
 
 /// The on-disk filename for a run's results: `{date}-{mode}.json`, matching
 /// the spec's `docs/eval/results/{fecha}-{config}.json` pattern with `mode`
-/// standing in for `config` (the only axis this harness varies today).
-pub fn results_filename(date: &str, mode: Mode) -> String {
+/// standing in for `config` (the only axis this harness varies today) —
+/// unless `tag` is given, in which case it becomes `{date}-{mode}-{tag}.json`.
+/// The tag exists so two real runs on the same day (a baseline and its
+/// follow-up) can each get their own file without either one reaching for
+/// `--force`, which would let a rerun silently replace the very baseline it
+/// was meant to be compared against.
+pub fn results_filename(date: &str, mode: Mode, tag: Option<&str>) -> String {
     let config = match mode {
         Mode::Fake => "fake",
         Mode::Real => "real",
     };
-    format!("{date}-{config}.json")
+    match tag {
+        Some(tag) => format!("{date}-{config}-{tag}.json"),
+        None => format!("{date}-{config}.json"),
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -310,7 +368,7 @@ pub enum ReportError {
 pub fn write_json(results: &RunResults, out_dir: &Path, force: bool) -> Result<PathBuf, ReportError> {
     std::fs::create_dir_all(out_dir)
         .map_err(|e| ReportError::CreateDir { path: out_dir.to_path_buf(), source: e })?;
-    let path = out_dir.join(results_filename(&results.date, results.mode));
+    let path = out_dir.join(results_filename(&results.date, results.mode, results.tag.as_deref()));
     if path.exists() && !force {
         return Err(ReportError::AlreadyExists { path });
     }
@@ -418,21 +476,34 @@ mod tests {
 
     #[test]
     fn a_full_domain_set_is_not_provisional() {
-        let p = GoldenSetProvenance::derive(46, 28);
+        let p = GoldenSetProvenance::derive(46, 28, "deadbeef".to_string());
         assert!(!p.provisional);
         assert!(p.note.contains("46 retrieval cases"), "note was: {}", p.note);
+    }
+
+    #[test]
+    fn provenance_carries_the_content_hash_it_was_given() {
+        // Not re-derived here: the hash describes the exact bytes `golden::load`
+        // read, and `derive` has no file to re-hash — it must simply carry the
+        // value through, so two results files can be compared without either
+        // one being reopened.
+        let p = GoldenSetProvenance::derive(46, 28, "abc123".to_string());
+        assert_eq!(p.content_sha256, "abc123");
     }
 
     #[test]
     fn a_set_exactly_at_both_thresholds_is_not_provisional() {
         // The boundary is the one place an off-by-one would flip the meaning
         // of every results file written that day.
-        assert!(!GoldenSetProvenance::derive(DOMAIN_SET_MIN_CASES, DOMAIN_SET_MIN_PAIRS).provisional);
+        assert!(
+            !GoldenSetProvenance::derive(DOMAIN_SET_MIN_CASES, DOMAIN_SET_MIN_PAIRS, "h".to_string())
+                .provisional
+        );
     }
 
     #[test]
     fn too_few_cases_stays_provisional_and_says_which_count_is_short() {
-        let p = GoldenSetProvenance::derive(13, 28);
+        let p = GoldenSetProvenance::derive(13, 28, "h".to_string());
         assert!(p.provisional);
         assert!(p.note.contains("13 retrieval cases"), "note was: {}", p.note);
         assert!(!p.note.contains("contradiction pairs (needs"), "note was: {}", p.note);
@@ -440,14 +511,14 @@ mod tests {
 
     #[test]
     fn too_few_pairs_stays_provisional_even_with_plenty_of_cases() {
-        let p = GoldenSetProvenance::derive(46, 9);
+        let p = GoldenSetProvenance::derive(46, 9, "h".to_string());
         assert!(p.provisional);
         assert!(p.note.contains("9 contradiction pairs"), "note was: {}", p.note);
     }
 
     #[test]
     fn short_on_both_counts_reports_both() {
-        let p = GoldenSetProvenance::derive(13, 9);
+        let p = GoldenSetProvenance::derive(13, 9, "h".to_string());
         assert!(p.provisional);
         assert!(p.note.contains("13 retrieval cases"), "note was: {}", p.note);
         assert!(p.note.contains("9 contradiction pairs"), "note was: {}", p.note);
@@ -455,7 +526,7 @@ mod tests {
 
     #[test]
     fn an_empty_golden_set_is_provisional() {
-        assert!(GoldenSetProvenance::derive(0, 0).provisional);
+        assert!(GoldenSetProvenance::derive(0, 0, "h".to_string()).provisional);
     }
 
     fn case(query: &str, recall_10: f64, status: CaseStatus) -> CaseResult {
@@ -564,6 +635,7 @@ mod tests {
         RunResults {
             date: date.to_string(),
             mode,
+            tag: None,
             model_id: "fake-embedder".to_string(),
             git_sha: "deadbee".to_string(),
             k_pool: KPool { memory: 30, episodic: 5, procedural: 5 },
@@ -572,7 +644,7 @@ mod tests {
             n_retrieval_cases: 1,
             n_contradiction_pairs: 0,
             known_bugs_live: vec!["fake-embedder-unnormalized-contradiction-sweep-degenerate".to_string()],
-            golden_set: GoldenSetProvenance::derive(1, 0),
+            golden_set: GoldenSetProvenance::derive(1, 0, "h".to_string()),
             retrieval: RetrievalResults {
                 aggregate: Aggregate::default(),
                 by_lang: vec![],
@@ -582,7 +654,48 @@ mod tests {
             contradiction: ContradictionResults { curve: vec![], by_lang: vec![] },
             norm_check: NormCheck { asserted: false, mean_norm: 11.3, max_deviation: 10.3 },
             audit: None,
+            similarity: None,
         }
+    }
+
+    fn minimal_similarity_results() -> SimilarityResults {
+        SimilarityResults {
+            aggregate: Aggregate::default(),
+            per_case: vec![],
+            mean_expected_distractor_gap: 0.1,
+            mean_corpus_distractor_gap: 0.2,
+            query_prefix: "".to_string(),
+            passage_prefix: "".to_string(),
+        }
+    }
+
+    #[test]
+    fn an_unmeasured_run_omits_the_similarity_key_entirely() {
+        // Absent, not null: a reader must be able to tell "this run predates
+        // the similarity instrument" from "it was computed and found nothing".
+        let out_dir = std::env::temp_dir().join(format!("rag-eval-report-test-{}", uuid::Uuid::new_v4()));
+        let results = minimal_results("2026-07-27", Mode::Fake);
+        let path = write_json(&results, &out_dir, false).expect("write must succeed");
+        let written = std::fs::read_to_string(&path).expect("must read back");
+        let json: serde_json::Value = serde_json::from_str(&written).expect("valid JSON");
+        assert!(json.get("similarity").is_none(), "similarity key must be absent, got {:?}", json.get("similarity"));
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    #[test]
+    fn a_measured_run_serializes_the_similarity_block_with_both_prefixes() {
+        let out_dir = std::env::temp_dir().join(format!("rag-eval-report-test-{}", uuid::Uuid::new_v4()));
+        let mut results = minimal_results("2026-07-27", Mode::Real);
+        results.similarity = Some(minimal_similarity_results());
+        let path = write_json(&results, &out_dir, false).expect("write must succeed");
+        let written = std::fs::read_to_string(&path).expect("must read back");
+        let json: serde_json::Value = serde_json::from_str(&written).expect("valid JSON");
+        assert!(json.get("similarity").is_some(), "similarity key must be present when computed");
+        assert_eq!(json["similarity"]["query_prefix"], "");
+        assert_eq!(json["similarity"]["passage_prefix"], "");
+        assert_eq!(json["similarity"]["mean_expected_distractor_gap"], 0.1);
+        assert_eq!(json["similarity"]["mean_corpus_distractor_gap"], 0.2);
+        std::fs::remove_dir_all(&out_dir).ok();
     }
 
     #[test]
@@ -641,7 +754,19 @@ mod tests {
 
     #[test]
     fn results_filename_uses_mode_as_the_config_slug() {
-        assert_eq!(results_filename("2026-07-27", Mode::Fake), "2026-07-27-fake.json");
-        assert_eq!(results_filename("2026-07-27", Mode::Real), "2026-07-27-real.json");
+        assert_eq!(results_filename("2026-07-27", Mode::Fake, None), "2026-07-27-fake.json");
+        assert_eq!(results_filename("2026-07-27", Mode::Real, None), "2026-07-27-real.json");
+    }
+
+    #[test]
+    fn results_filename_appends_the_tag_when_one_is_given() {
+        assert_eq!(
+            results_filename("2026-07-27", Mode::Real, Some("pre-prefix")),
+            "2026-07-27-real-pre-prefix.json"
+        );
+        assert_eq!(
+            results_filename("2026-07-27", Mode::Fake, Some("e5-prefix")),
+            "2026-07-27-fake-e5-prefix.json"
+        );
     }
 }

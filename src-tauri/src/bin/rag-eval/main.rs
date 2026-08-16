@@ -4,11 +4,12 @@ mod golden;
 mod metrics;
 mod report;
 mod seed;
+mod similarity;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
-use agent_office_lib::eval_api::{model_is_cached, EvalEmbedder, EvalScope};
+use agent_office_lib::eval_api::{model_is_cached, EmbedRole, EvalEmbedder, EvalScope};
 
 use golden::{CaseStatus, PairLabel};
 
@@ -108,13 +109,14 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
         };
     }
 
-    let golden_set = match golden::load(&cli.golden_path) {
+    let loaded_golden = match golden::load(&cli.golden_path) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("golden set validation failed: {e}");
             return EXIT_GOLDEN_INVALID;
         }
     };
+    let golden_set = &loaded_golden.set;
 
     let embedder = match cli.mode {
         cli::Mode::Fake => EvalEmbedder::fake(),
@@ -149,8 +151,18 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
 
     let mut per_case = Vec::new();
     let mut blocked = Vec::new();
+    // Populated only under --real: FakeEmbedder has no learned geometry, so a
+    // cosine measurement over its vectors would describe nothing. The query
+    // vector each entry carries is the same one just computed for the ranked
+    // search two lines below — capturing it here costs one clone, not a
+    // second embedding call.
+    let mut sim_sources: Vec<SimCaseSource> = Vec::new();
     for case in &golden_set.retrieval_cases {
-        let embedding = match embedder.embed(&case.query).await {
+        // Query: must match production's prompt_builder.rs role — this vector
+        // also feeds the similarity block's ranking below, so a mismatched
+        // role here would make that measurement describe a different space
+        // than the one production actually searches.
+        let embedding = match embedder.embed_with_role(&case.query, EmbedRole::Query).await {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("failed to embed query '{}': {e}", case.query);
@@ -199,9 +211,31 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             }
             blocked.push(result);
         } else {
+            if cli.mode == cli::Mode::Real {
+                sim_sources.push(SimCaseSource {
+                    query: case.query.clone(),
+                    expected_refs: case.expected_refs.clone(),
+                    corpus_refs: case.corpus_refs.clone(),
+                    query_vector: embedding.clone(),
+                    lang: result.lang.clone(),
+                });
+            }
             per_case.push(result);
         }
     }
+
+    // Never computed under --fake — see `sim_sources`'s own comment above.
+    let similarity_results = if cli.mode == cli::Mode::Real {
+        Some(build_similarity_results(
+            &sim_sources,
+            &seeded.vectors,
+            K_FINAL,
+            embedder.query_prefix(),
+            embedder.passage_prefix(),
+        ))
+    } else {
+        None
+    };
 
     let mut contradiction_d = Vec::new();
     let mut no_contradiction_d = Vec::new();
@@ -213,14 +247,18 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
     // combined curve cannot answer.
     let mut by_lang: BTreeMap<String, (Vec<f64>, Vec<f64>, Vec<f64>)> = BTreeMap::new();
     for pair in &golden_set.contradiction_pairs {
-        let a = match embedder.embed(&pair.a).await {
+        // Passage/Passage, matching production: `worker.rs`'s contradiction
+        // hook compares a Passage chunk against Passage-embedded stored rows,
+        // so the harness's pair loop must mirror that exactly — otherwise
+        // `contradiction.curve` describes a space production never searches.
+        let a = match embedder.embed_with_role(&pair.a, EmbedRole::Passage).await {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("failed to embed a contradiction-pair text: {e}");
                 return EXIT_RUNTIME_FAILURE;
             }
         };
-        let b = match embedder.embed(&pair.b).await {
+        let b = match embedder.embed_with_role(&pair.b, EmbedRole::Passage).await {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("failed to embed a contradiction-pair text: {e}");
@@ -269,6 +307,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
     let results = report::RunResults {
         date: current_date_string(),
         mode,
+        tag: cli.tag.clone(),
         model_id: embedder.model_id().to_string(),
         git_sha: report::git_sha(),
         k_pool: report::KPool { memory: 30, episodic: 5, procedural: 5 },
@@ -280,6 +319,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
         golden_set: report::GoldenSetProvenance::derive(
             golden_set.retrieval_cases.len(),
             golden_set.contradiction_pairs.len(),
+            loaded_golden.content_sha256.clone(),
         ),
         retrieval: report::RetrievalResults {
             aggregate,
@@ -294,6 +334,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             max_deviation: seeded.max_norm_deviation,
         },
         audit: audit_report,
+        similarity: similarity_results,
     };
 
     report::print_stdout(&results);
@@ -329,6 +370,108 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
         return EXIT_GOLDEN_UNFIT;
     }
     write_outcome
+}
+
+/// One active retrieval case's data, captured during the ranked pass, ready
+/// for the similarity block to score independently. Deliberately its own
+/// type rather than reusing `golden::RetrievalCase`: that type has no query
+/// vector, and adding one to it would give every OTHER reader of a
+/// `RetrievalCase` a field that means nothing outside this one path.
+struct SimCaseSource {
+    query: String,
+    expected_refs: Vec<String>,
+    corpus_refs: Vec<String>,
+    query_vector: Vec<f32>,
+    lang: Option<String>,
+}
+
+/// Builds the pure-cosine similarity block from the query vectors captured
+/// during the ranked retrieval pass and the corpus vectors captured during
+/// seeding — zero extra inference either way. Every case is scored through
+/// the SAME `metrics.rs` functions the ranked path already calls; there is no
+/// second metric implementation a `sim` number could disagree with a
+/// `ranked` number by being wrong in its own, different way.
+fn build_similarity_results(
+    sources: &[SimCaseSource],
+    corpus_vectors: &[(String, Vec<f32>)],
+    k: usize,
+    query_prefix: &str,
+    passage_prefix: &str,
+) -> report::SimilarityResults {
+    let vector_by_ref: HashMap<&str, &Vec<f32>> =
+        corpus_vectors.iter().map(|(r, v)| (r.as_str(), v)).collect();
+
+    let mut per_case = Vec::with_capacity(sources.len());
+    let mut expected_gap_cases = Vec::with_capacity(sources.len());
+    let mut corpus_gap_cases = Vec::with_capacity(sources.len());
+
+    for src in sources {
+        let expected_set: HashSet<String> = src.expected_refs.iter().cloned().collect();
+        let ranked_refs = similarity::rank_by_cosine(&src.query_vector, corpus_vectors, k);
+
+        let recall_1 = metrics::recall_at_k(&ranked_refs, &expected_set, 1);
+        let recall_5 = metrics::recall_at_k(&ranked_refs, &expected_set, 5);
+        let recall_10 = metrics::recall_at_k(&ranked_refs, &expected_set, 10);
+        let mrr = metrics::mrr_contribution(&ranked_refs, &expected_set);
+        let ndcg_10 = metrics::ndcg_at_10(&ranked_refs, &expected_set);
+
+        per_case.push(report::CaseResult {
+            query: src.query.clone(),
+            expected_refs: src.expected_refs.clone(),
+            ranked_refs,
+            recall_1,
+            recall_5,
+            recall_10,
+            mrr,
+            ndcg_10,
+            status: CaseStatus::Active,
+            lang: src.lang.clone(),
+        });
+
+        // Query-anchored rivals: every OTHER corpus vector, not just this
+        // case's own pool — production search runs against the whole store,
+        // so scoping rivals to `corpus_refs` would measure an easier problem.
+        let expected_vectors: Vec<&[f32]> = src
+            .expected_refs
+            .iter()
+            .filter_map(|r| vector_by_ref.get(r.as_str()))
+            .map(|v| v.as_slice())
+            .collect();
+        let rivals: Vec<&[f32]> = corpus_vectors
+            .iter()
+            .filter(|(r, _)| !src.expected_refs.contains(r))
+            .map(|(_, v)| v.as_slice())
+            .collect();
+        expected_gap_cases.push(similarity::ExpectedGapCase {
+            query: &src.query_vector,
+            expected: expected_vectors.clone(),
+            rivals,
+        });
+
+        // Doc-anchored distractors: scoped to THIS case's own declared pool,
+        // matching the mined golden set's distractor structure exactly.
+        let distractors: Vec<&[f32]> = src
+            .corpus_refs
+            .iter()
+            .filter(|r| !src.expected_refs.contains(r))
+            .filter_map(|r| vector_by_ref.get(r.as_str()))
+            .map(|v| v.as_slice())
+            .collect();
+        corpus_gap_cases.push(similarity::CorpusGapCase { expected: expected_vectors, distractors });
+    }
+
+    report::SimilarityResults {
+        aggregate: report::aggregate(&per_case),
+        per_case,
+        mean_expected_distractor_gap: similarity::mean_expected_distractor_gap(&expected_gap_cases),
+        mean_corpus_distractor_gap: similarity::mean_corpus_distractor_gap(&corpus_gap_cases),
+        // The live embedder's own prefixes — copied here (not hardcoded) so a
+        // results file states the space it actually measured. A run whose
+        // wiring silently dropped the prefix would show up as an empty
+        // string here, self-refuting rather than silently wrong.
+        query_prefix: query_prefix.to_string(),
+        passage_prefix: passage_prefix.to_string(),
+    }
 }
 
 /// The language to attribute a retrieval case to: the `lang` its expected
@@ -534,6 +677,17 @@ mod tests {
         assert_eq!(curve_by_lang[0]["curve"].as_array().unwrap().len(), 7);
         assert_eq!(curve_by_lang[1]["lang"], "es");
 
+        // FakeEmbedder has no learned geometry: a cosine measurement over it
+        // would describe nothing, so the similarity block must be gated
+        // strictly on embedder kind and stay entirely absent under --fake —
+        // not present-and-empty, which would read as "measured, found
+        // nothing" rather than "not applicable to this run".
+        assert!(
+            json.get("similarity").is_none(),
+            "similarity key must be absent under --fake, got {:?}",
+            json.get("similarity")
+        );
+
         std::fs::remove_file(&golden_path).ok();
         std::fs::remove_dir_all(&out_dir).ok();
     }
@@ -572,6 +726,38 @@ mod tests {
         let args = vec!["rag-eval".to_string()];
         let code = run(args.into_iter()).await;
         assert_eq!(code, EXIT_RUNTIME_FAILURE);
+    }
+
+    #[test]
+    fn sim_and_ranked_paths_score_identical_input_through_the_same_metric_functions() {
+        // The similarity block's whole claim to being a like-for-like
+        // comparison rests on feeding `metrics.rs` through the SAME function
+        // calls the ranked path already uses — never a second
+        // implementation. Labeling one call "ranked" and the other "sim" over
+        // identical input must produce numerically identical output, because
+        // underneath they are the same function.
+        let ranked_refs = vec!["c2".to_string(), "c1".to_string(), "c3".to_string()];
+        let sim_ranked_refs = ranked_refs.clone();
+        let expected: HashSet<String> = ["c1".to_string()].into_iter().collect();
+
+        let ranked_recall_10 = metrics::recall_at_k(&ranked_refs, &expected, 10);
+        let sim_recall_10 = metrics::recall_at_k(&sim_ranked_refs, &expected, 10);
+        assert_eq!(ranked_recall_10, sim_recall_10);
+
+        let ranked_mrr = metrics::mrr_contribution(&ranked_refs, &expected);
+        let sim_mrr = metrics::mrr_contribution(&sim_ranked_refs, &expected);
+        assert_eq!(ranked_mrr, sim_mrr);
+
+        let ranked_ndcg = metrics::ndcg_at_10(&ranked_refs, &expected);
+        let sim_ndcg = metrics::ndcg_at_10(&sim_ranked_refs, &expected);
+        assert_eq!(ranked_ndcg, sim_ndcg);
+    }
+
+    #[test]
+    fn build_similarity_results_reports_the_live_embedders_own_prefixes() {
+        let result = build_similarity_results(&[], &[], K_FINAL, "query: ", "passage: ");
+        assert_eq!(result.query_prefix, "query: ");
+        assert_eq!(result.passage_prefix, "passage: ");
     }
 
     #[tokio::test]

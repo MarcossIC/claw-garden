@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::memory::db::MemoryStore;
-use crate::memory::embedder::Embedder;
+use crate::memory::embedder::{EmbedRole, Embedder};
 use crate::memory::store_insert::{CreatedByType, NewEpisodicTrajectoryRecord};
 use crate::models::chat::Role;
 use crate::models::ChatMessage;
@@ -201,7 +201,9 @@ pub(crate) async fn run_episodic_writer_core(
         return None;
     };
 
-    let embedding = match embedder.embed(&draft.task).await {
+    // Passage: a trajectory's task text is stored content, retrieved later by
+    // a Query-role search — not itself a query.
+    let embedding = match embedder.embed_with_role(&draft.task, EmbedRole::Passage).await {
         Ok(v) => v,
         Err(e) => {
             log::warn!("episodic_writer: embed failed for session={session_id}: {e}");
@@ -527,7 +529,7 @@ mod tests {
 
     // ── Lote 5 (memoria-3-capas-fase-2) — run_episodic_writer_core + wrapper ──
 
-    use crate::memory::embedder::FakeEmbedder;
+    use crate::memory::embedder::{EmbedError, FakeEmbedder};
 
     async fn count_episodic(store: &MemoryStore) -> i64 {
         store
@@ -535,6 +537,52 @@ mod tests {
             .call(|c| c.query_row("SELECT COUNT(*) FROM episodic_trajectory", [], |r| r.get(0)))
             .await
             .unwrap()
+    }
+
+    /// Records every `(role, text)` pair handed to `embed_with_role`.
+    struct RecordingEmbedder {
+        calls: std::sync::Mutex<Vec<(EmbedRole, String)>>,
+    }
+    #[async_trait::async_trait]
+    impl Embedder for RecordingEmbedder {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+            self.calls.lock().unwrap().push((role, text.to_string()));
+            Ok(vec![0.1_f32; 384])
+        }
+        fn dimensions(&self) -> usize {
+            384
+        }
+        fn model_id(&self) -> &str {
+            "recording"
+        }
+        fn query_prefix(&self) -> &str {
+            ""
+        }
+        fn passage_prefix(&self) -> &str {
+            ""
+        }
+    }
+
+    /// `run_episodic_writer_core` must embed the trajectory's task with role
+    /// `Passage` — stored content, not a search query.
+    #[tokio::test]
+    async fn run_episodic_writer_core_embeds_task_with_role_passage() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let recording = Arc::new(RecordingEmbedder { calls: std::sync::Mutex::new(Vec::new()) });
+        let embedder: Arc<dyn Embedder> = recording.clone();
+        let history = vec![(
+            "agent-a".to_string(),
+            vec![msg(Role::User, "fix the bug", 0), msg(Role::Assistant, "done", 1)],
+        )];
+        let project_by_agent: HashMap<String, Option<String>> = HashMap::new();
+
+        run_episodic_writer_core("sess-role".to_string(), history, &store, Some(embedder), &project_by_agent, 0)
+            .await;
+
+        let calls = recording.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "expected exactly one embed call, got {calls:?}");
+        assert_eq!(calls[0].0, EmbedRole::Passage);
+        assert_eq!(calls[0].1, "fix the bug");
     }
 
     // Task 5.1 (S9): embedder=None → 0 rows, return BEFORE build/insert.
