@@ -15,7 +15,9 @@ pub enum Mode {
     Real,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `PartialEq` only, not `Eq`: `sweep_imp`/`sweep_cos_floor` hold `f64`, which
+// has no total order and therefore no `Eq` impl.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Cli {
     pub mode: Mode,
     pub check_only: bool,
@@ -35,15 +37,29 @@ pub struct Cli {
     /// `--force` becomes the tempting fix that overwrites the very file the
     /// second run was supposed to be compared against.
     pub tag: Option<String>,
+    /// Each repetition of `--sweep-imp <min>:<max>` — the importance-factor
+    /// compression range `ImportanceFactor::spanning` derives `(base,
+    /// divisor)` from. Empty by default: building the empty-vec-means-one-
+    /// default-point cartesian product is main.rs's job, not this parser's —
+    /// it only reports what was actually typed.
+    pub sweep_imp: Vec<(f64, f64)>,
+    /// Each repetition of `--sweep-cos-floor <f>`, one candidate cosine floor
+    /// per entry. Empty by default, same reasoning as `sweep_imp`.
+    pub sweep_cos_floor: Vec<f64>,
 }
 
 /// What a parse attempt produces. `--help` is not an error: it takes
 /// precedence over every other flag (including a missing or conflicting
-/// mode) and short-circuits the moment it is seen.
-#[derive(Debug, PartialEq, Eq)]
+/// mode) and short-circuits the moment it is seen. `--diff` short-circuits
+/// the same way and for the same reason: comparing two existing results
+/// files needs neither a golden set nor a mode, so requiring either one
+/// first would make `--diff` depend on inputs it never reads.
+// `PartialEq` only — see the note on `Cli` above; `ParseOutcome::Run` wraps one.
+#[derive(Debug, PartialEq)]
 pub enum ParseOutcome {
     Help,
     Run(Cli),
+    Diff(PathBuf, PathBuf),
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -56,6 +72,10 @@ pub enum CliError {
     MissingMode,
     #[error("--fake and --real are mutually exclusive")]
     ConflictingMode,
+    #[error("invalid --sweep-imp value '{0}', expected '<min>:<max>' (e.g. '0.55:1.0')")]
+    InvalidSweepImp(String),
+    #[error("invalid --sweep-cos-floor value '{0}', expected a floating-point number")]
+    InvalidSweepCosFloor(String),
 }
 
 pub const HELP_TEXT: &str = "\
@@ -78,7 +98,18 @@ OPTIONS:
     --out <dir>         Override the default results directory (docs/eval/results/)
     --tag <slug>        Distinguish this run's results file from another of the same
                          date+mode: {date}-{mode}-{tag}.json instead of {date}-{mode}.json
+    --sweep-imp <min>:<max>
+                         Repeatable. Adds one importance-factor compression range to the
+                         sweep grid. Zero repetitions leaves importance at its default range.
+    --sweep-cos-floor <f>
+                         Repeatable. Adds one candidate cosine floor to the sweep grid.
+                         Zero repetitions leaves cosine re-scaling off (None).
     --force             Allow overwriting an existing results file for the same date+config
+    --diff <a.json> <b.json>
+                         Compare two existing results files' retrieval.per_case and
+                         similarity.per_case, joined on query, reporting better/worse/net
+                         per metric per block. Needs neither --fake/--real nor a golden set;
+                         short-circuits like --help.
     --help, -h          Print this message and exit
 
 EXIT CODES:
@@ -124,10 +155,21 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
     let mut force = false;
     let mut audit = false;
     let mut tag: Option<String> = None;
+    let mut sweep_imp: Vec<(f64, f64)> = Vec::new();
+    let mut sweep_cos_floor: Vec<f64> = Vec::new();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return Ok(ParseOutcome::Help),
+            "--diff" => {
+                let a = args
+                    .next()
+                    .ok_or_else(|| CliError::MissingValue("--diff".to_string()))?;
+                let b = args
+                    .next()
+                    .ok_or_else(|| CliError::MissingValue("--diff".to_string()))?;
+                return Ok(ParseOutcome::Diff(PathBuf::from(a), PathBuf::from(b)));
+            }
             "--fake" => {
                 if matches!(mode, Some(Mode::Real)) {
                     return Err(CliError::ConflictingMode);
@@ -161,6 +203,25 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
                     .ok_or_else(|| CliError::MissingValue("--tag".to_string()))?;
                 tag = Some(value);
             }
+            "--sweep-imp" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| CliError::MissingValue("--sweep-imp".to_string()))?;
+                let (min_str, max_str) = value
+                    .split_once(':')
+                    .ok_or_else(|| CliError::InvalidSweepImp(value.clone()))?;
+                let min: f64 = min_str.parse().map_err(|_| CliError::InvalidSweepImp(value.clone()))?;
+                let max: f64 = max_str.parse().map_err(|_| CliError::InvalidSweepImp(value.clone()))?;
+                sweep_imp.push((min, max));
+            }
+            "--sweep-cos-floor" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| CliError::MissingValue("--sweep-cos-floor".to_string()))?;
+                let floor: f64 =
+                    value.parse().map_err(|_| CliError::InvalidSweepCosFloor(value.clone()))?;
+                sweep_cos_floor.push(floor);
+            }
             other => return Err(CliError::UnknownFlag(other.to_string())),
         }
     }
@@ -175,6 +236,8 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
         force,
         audit,
         tag,
+        sweep_imp,
+        sweep_cos_floor,
     }))
 }
 
@@ -193,6 +256,7 @@ mod tests {
         match parse(argv(items)).expect("parse must succeed") {
             ParseOutcome::Run(cli) => cli,
             ParseOutcome::Help => panic!("expected Run, got Help"),
+            ParseOutcome::Diff(a, b) => panic!("expected Run, got Diff({a:?}, {b:?})"),
         }
     }
 
@@ -314,6 +378,90 @@ mod tests {
             parse(argv(&["--fake", "--help", "--real"])).unwrap(),
             ParseOutcome::Help
         );
+    }
+
+    #[test]
+    fn diff_flag_captures_both_paths_and_short_circuits_without_a_mode() {
+        // No --fake/--real given: --diff must not fall through to
+        // MissingMode, because comparing two results files needs neither.
+        assert_eq!(
+            parse(argv(&["--diff", "/tmp/a.json", "/tmp/b.json"])).unwrap(),
+            ParseOutcome::Diff(PathBuf::from("/tmp/a.json"), PathBuf::from("/tmp/b.json"))
+        );
+    }
+
+    #[test]
+    fn diff_short_circuits_before_a_later_conflict_would_fire() {
+        assert_eq!(
+            parse(argv(&["--fake", "--diff", "/tmp/a.json", "/tmp/b.json", "--real"])).unwrap(),
+            ParseOutcome::Diff(PathBuf::from("/tmp/a.json"), PathBuf::from("/tmp/b.json"))
+        );
+    }
+
+    #[test]
+    fn diff_missing_the_first_path_is_an_error() {
+        let err = parse(argv(&["--diff"])).expect_err("missing first value must error");
+        assert_eq!(err, CliError::MissingValue("--diff".to_string()));
+    }
+
+    #[test]
+    fn diff_missing_the_second_path_is_an_error() {
+        let err = parse(argv(&["--diff", "/tmp/a.json"])).expect_err("missing second value must error");
+        assert_eq!(err, CliError::MissingValue("--diff".to_string()));
+    }
+
+    #[test]
+    fn sweep_imp_is_empty_by_default() {
+        assert!(run_cli(&["--fake"]).sweep_imp.is_empty());
+    }
+
+    #[test]
+    fn sweep_cos_floor_is_empty_by_default() {
+        assert!(run_cli(&["--fake"]).sweep_cos_floor.is_empty());
+    }
+
+    #[test]
+    fn sweep_imp_is_repeatable_and_parses_min_max_pairs() {
+        let cli = run_cli(&["--fake", "--sweep-imp", "0.55:1.0", "--sweep-imp", "0.7:1.0"]);
+        assert_eq!(cli.sweep_imp, vec![(0.55, 1.0), (0.7, 1.0)]);
+    }
+
+    #[test]
+    fn sweep_cos_floor_is_repeatable_and_parses_each_value() {
+        let cli = run_cli(&["--fake", "--sweep-cos-floor", "0.8625", "--sweep-cos-floor", "0.8793"]);
+        assert_eq!(cli.sweep_cos_floor, vec![0.8625, 0.8793]);
+    }
+
+    #[test]
+    fn sweep_imp_bad_format_is_an_error() {
+        let err = parse(argv(&["--fake", "--sweep-imp", "notapair"])).expect_err("bad format must error");
+        assert_eq!(err, CliError::InvalidSweepImp("notapair".to_string()));
+    }
+
+    #[test]
+    fn sweep_imp_non_numeric_bound_is_an_error() {
+        let err =
+            parse(argv(&["--fake", "--sweep-imp", "abc:1.0"])).expect_err("non-numeric bound must error");
+        assert_eq!(err, CliError::InvalidSweepImp("abc:1.0".to_string()));
+    }
+
+    #[test]
+    fn sweep_imp_without_a_value_is_an_error() {
+        let err = parse(argv(&["--fake", "--sweep-imp"])).expect_err("missing value must error");
+        assert_eq!(err, CliError::MissingValue("--sweep-imp".to_string()));
+    }
+
+    #[test]
+    fn sweep_cos_floor_non_numeric_is_an_error() {
+        let err = parse(argv(&["--fake", "--sweep-cos-floor", "abc"]))
+            .expect_err("non-numeric floor must error");
+        assert_eq!(err, CliError::InvalidSweepCosFloor("abc".to_string()));
+    }
+
+    #[test]
+    fn sweep_cos_floor_without_a_value_is_an_error() {
+        let err = parse(argv(&["--fake", "--sweep-cos-floor"])).expect_err("missing value must error");
+        assert_eq!(err, CliError::MissingValue("--sweep-cos-floor".to_string()));
     }
 
     #[test]

@@ -1,7 +1,12 @@
 use serde::{Deserialize, Serialize};
 
 /// Discriminates which backing table a memory record originates from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Ordered (declaration order = Memory < Episodic < Procedural) so it can
+/// serve as a tie-break component in a merged-hit comparator: `id` alone is
+/// unique only within one table, so the pair `(kind, id)` is what is unique
+/// across all three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum TableKind {
     Memory,
     Episodic,
@@ -304,6 +309,26 @@ mod tests {
             last_disputed_at: None,
             deleted_at: None,
         }
+    }
+
+    /// `TableKind` needs a total order so a merged-hit comparator can use it
+    /// as a tie-break: reflexive (equal to itself), antisymmetric (Memory <
+    /// Episodic < Procedural in one direction only), and covering every pair.
+    #[test]
+    fn table_kind_has_a_total_order() {
+        use std::cmp::Ordering;
+        assert_eq!(TableKind::Memory.cmp(&TableKind::Memory), Ordering::Equal);
+        assert_eq!(TableKind::Episodic.cmp(&TableKind::Episodic), Ordering::Equal);
+        assert_eq!(TableKind::Procedural.cmp(&TableKind::Procedural), Ordering::Equal);
+
+        assert_eq!(TableKind::Memory.cmp(&TableKind::Episodic), Ordering::Less);
+        assert_eq!(TableKind::Episodic.cmp(&TableKind::Memory), Ordering::Greater);
+
+        assert_eq!(TableKind::Episodic.cmp(&TableKind::Procedural), Ordering::Less);
+        assert_eq!(TableKind::Procedural.cmp(&TableKind::Episodic), Ordering::Greater);
+
+        assert_eq!(TableKind::Memory.cmp(&TableKind::Procedural), Ordering::Less);
+        assert_eq!(TableKind::Procedural.cmp(&TableKind::Memory), Ordering::Greater);
     }
 
     /// H.1-test — compile-time assertion: all three types implement MemoryRecord.

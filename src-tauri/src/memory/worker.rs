@@ -1191,27 +1191,34 @@ mod tests {
         );
     }
 
-    // A written memory's score has to land inside its own contract: strictly
-    // positive, never above one. The similarity factor is
+    // A written memory's score has to land inside its own contract: never
+    // negative, never above one. The similarity factor is
     // `cosine_from_l2_unit(distance)` (score.rs), which converts the raw L2
     // distance between two UNIT vectors into exact cosine similarity and
     // clamps it to `MAX(0.0, 1.0 - distance^2/2)` — both edges (insert and
     // query) route through `to_unit` (vector.rs) before a distance is ever
     // measured, so the similarity factor is structurally bounded in [0,1]
     // rather than merely bounded for embeddings that happen to be close
-    // together. The remaining three multiplicative factors (decay,
-    // importance, dispute) are each already clamped to [0,1] on their own,
-    // so the product stays inside the contract too. This end-to-end test
-    // exercises a real write followed by a real read to prove the whole
-    // pipeline honors the bound, not just the UDF in isolation.
+    // together. The default config additionally re-scales that similarity
+    // factor against a measured floor
+    // (`(cos-floor)/(1-floor)`, clamped to `[0,1]`), and a candidate whose
+    // raw similarity falls below that floor clamps all the way down to
+    // exactly `0.0` by design — that is the floor doing its job, not a
+    // formula error, so the lower bound this test can actually promise is
+    // `0.0` inclusive, not a strictly-positive one. The remaining three
+    // multiplicative factors (decay, importance, dispute) are each already
+    // clamped to `[0,1]` on their own, so the product never exceeds `1.0`
+    // regardless. This end-to-end test exercises a real write followed by a
+    // real read to prove the whole pipeline honors the bound, not just the
+    // formula in isolation.
     #[tokio::test]
     async fn e2e_real_write_path_produces_bounded_score() {
         let fixture = write_fresh_and_stale_then_read_back().await;
         let mut violations: Vec<String> = Vec::new();
 
         for h in &fixture.hits {
-            if !(h.score > 0.0 && h.score <= 1.0) {
-                violations.push(format!("score {} is outside (0.0, 1.0]", h.score));
+            if !(h.score >= 0.0 && h.score <= 1.0) {
+                violations.push(format!("score {} is outside [0.0, 1.0]", h.score));
             }
         }
 

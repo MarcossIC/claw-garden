@@ -99,8 +99,7 @@ pub(crate) fn demote_inactive(
 ///
 /// Arity 4, `SQLITE_UTF8 | SQLITE_DETERMINISTIC`.  Delegates argument
 /// extraction to the closure and computation to the pure-Rust [`compute_tier`]
-/// function.  Called alongside [`crate::memory::score::register_score_udfs`]
-/// in `MemoryStore::open()` and `MemoryStore::new_for_test()`.
+/// function.  Called from `MemoryStore::open()` and `MemoryStore::new_for_test()`.
 pub(crate) async fn register_tier_udf(
     conn: &tokio_rusqlite::Connection,
 ) -> Result<(), MemoryError> {

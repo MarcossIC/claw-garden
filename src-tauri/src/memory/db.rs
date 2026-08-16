@@ -164,7 +164,6 @@ impl MemoryStore {
         let conn = Connection::open(&path).await
             .map_err(MemoryError::Sqlite)?;
         run_migrations(&conn).await?;
-        crate::memory::score::register_score_udfs(&conn).await?;
         crate::memory::tier::register_tier_udf(&conn).await?;
         crate::memory::tier::register_demote_udf(&conn).await?;
         // Raise SQLITE_LIMIT_VARIABLE_NUMBER from the default 999 to 32766 (SQLite hard
@@ -201,7 +200,6 @@ impl MemoryStore {
         let conn = Connection::open_in_memory().await
             .map_err(MemoryError::Sqlite)?;
         run_migrations(&conn).await?;
-        crate::memory::score::register_score_udfs(&conn).await?;
         crate::memory::tier::register_tier_udf(&conn).await?;
         crate::memory::tier::register_demote_udf(&conn).await?;
         // Raise SQLITE_LIMIT_VARIABLE_NUMBER — same as open() path.

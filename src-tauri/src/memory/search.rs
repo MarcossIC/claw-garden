@@ -4,6 +4,7 @@
 use std::time::Instant;
 
 use crate::memory::clock::TimestampMs;
+use crate::memory::score::{score as compute_score, RawHit, ScoringConfig};
 use crate::memory::vector::to_unit;
 use crate::memory::{MemoryError, MemoryStore, TableKind};
 
@@ -83,6 +84,19 @@ const _: fn() = || {
     _ss::<RankedHit>();
 };
 
+/// Score first, then a key that cannot repeat: id is unique per table and
+/// kind separates the three, so two hits can never compare Equal. Without
+/// the second half, rows that score identically would land in whatever
+/// order the join emitted them, and the same query could answer differently
+/// on two runs.
+fn hit_cmp(a: &RankedHit, b: &RankedHit) -> std::cmp::Ordering {
+    b.score
+        .partial_cmp(&a.score)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| a.kind.cmp(&b.kind))
+        .then_with(|| a.id.cmp(&b.id))
+}
+
 /// Encode query vector as little-endian bytes for vec0 MATCH operator.
 fn serialize_f32_query(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
@@ -104,21 +118,14 @@ pub(crate) fn serialize_f32_query_pub(v: &[f32]) -> Vec<u8> {
 // the number of results. `knn_one` documents what happens when those predicates
 // empty that pool.
 //
-// Stored stamps (`last_accessed_at`) are milliseconds and `exp_decay`'s first
-// argument is a whole number of seconds, so both sides of the subtraction are
-// lifted to milliseconds and the difference divided back down — `now` and the
-// stamp are never rounded apart. The division is integer because that argument
-// is read as an integer and a real value is rejected at runtime.
+// Nine raw columns, no UDF calls, no `strftime`, no `ORDER BY`: the score
+// this used to compute inline now happens in Rust (`score.rs`), which reads
+// `last_accessed_at` and `importance` straight off these rows instead of a
+// SQL-computed column. Rows still arrive in vec0's own distance order, not
+// score order — `knn_one` is what turns this into a score-ordered result.
 const SEARCH_SQL_MEMORY: &str = "
-    SELECT m.id, m.content, m.memory_type, m.tier, m.status, knn.distance, m.created_at,
-        cosine_from_l2_unit(knn.distance)
-        * MAX(
-            CASE m.tier WHEN 1 THEN 0.5 WHEN 2 THEN 0.2 ELSE 0.05 END,
-            exp_decay((strftime('%s','now') * 1000 - m.last_accessed_at) / 1000, lambda_for_type(m.memory_type))
-          )
-        * importance_factor(m.importance)
-        * dispute_factor(m.status)
-        AS score
+    SELECT m.id, m.content, m.memory_type, m.tier, m.status, knn.distance,
+        m.created_at, m.last_accessed_at, m.importance
     FROM memory_vectors knn
     JOIN memory m ON m.id = knn.rowid
     WHERE knn.embedding MATCH ?1
@@ -127,20 +134,15 @@ const SEARCH_SQL_MEMORY: &str = "
       AND m.deleted_at IS NULL
       AND m.agent_id = ?3
       AND (?4 IS NULL OR m.project_id = ?4 OR m.project_id IS NULL OR m.memory_type = 'user_preference')
-    ORDER BY score DESC
 ";
 
-// SQL for episodic table KNN (hardcoded lambda 0.0077)
+// SQL for episodic table KNN. The 0.0077 lambda this table always used no
+// longer lives here — it is `DecayLambdas.episode` in score.rs, reached
+// through `lambda_for` dispatching on `TableKind::Episodic` rather than on
+// the `'episode'` string this query still selects for display.
 const SEARCH_SQL_EPISODIC: &str = "
-    SELECT epi.id, epi.task, 'episode' AS memory_type, epi.tier, epi.status, knn.distance, epi.created_at,
-        cosine_from_l2_unit(knn.distance)
-        * MAX(
-            CASE epi.tier WHEN 1 THEN 0.5 WHEN 2 THEN 0.2 ELSE 0.05 END,
-            exp_decay((strftime('%s','now') * 1000 - epi.last_accessed_at) / 1000, 0.0077)
-          )
-        * importance_factor(epi.importance)
-        * dispute_factor(epi.status)
-        AS score
+    SELECT epi.id, epi.task, 'episode' AS memory_type, epi.tier, epi.status, knn.distance,
+        epi.created_at, epi.last_accessed_at, epi.importance
     FROM episodic_vectors knn
     JOIN episodic_trajectory epi ON epi.id = knn.rowid
     WHERE knn.embedding MATCH ?1
@@ -149,20 +151,13 @@ const SEARCH_SQL_EPISODIC: &str = "
       AND epi.deleted_at IS NULL
       AND epi.agent_id = ?3
       AND (?4 IS NULL OR epi.project_id = ?4 OR epi.project_id IS NULL)
-    ORDER BY score DESC
 ";
 
-// SQL for procedural table KNN (hardcoded lambda 0.0039)
+// SQL for procedural table KNN. Same as episodic: 0.0039 now lives in
+// `DecayLambdas.procedure`, dispatched by `TableKind::Procedural`.
 const SEARCH_SQL_PROCEDURAL: &str = "
-    SELECT pro.id, pro.skill_name, 'procedure' AS memory_type, pro.tier, pro.status, knn.distance, pro.created_at,
-        cosine_from_l2_unit(knn.distance)
-        * MAX(
-            CASE pro.tier WHEN 1 THEN 0.5 WHEN 2 THEN 0.2 ELSE 0.05 END,
-            exp_decay((strftime('%s','now') * 1000 - pro.last_accessed_at) / 1000, 0.0039)
-          )
-        * importance_factor(pro.importance)
-        * dispute_factor(pro.status)
-        AS score
+    SELECT pro.id, pro.skill_name, 'procedure' AS memory_type, pro.tier, pro.status, knn.distance,
+        pro.created_at, pro.last_accessed_at, pro.importance
     FROM procedural_vectors knn
     JOIN procedural_skill pro ON pro.id = knn.rowid
     WHERE knn.embedding MATCH ?1
@@ -171,7 +166,6 @@ const SEARCH_SQL_PROCEDURAL: &str = "
       AND pro.deleted_at IS NULL
       AND pro.agent_id = ?3
       AND (?4 IS NULL OR pro.project_id = ?4 OR pro.project_id IS NULL)
-    ORDER BY score DESC
 ";
 
 // How many rows THIS caller could receive at most, counted up to a ceiling of
@@ -362,10 +356,13 @@ async fn knn_one(
     agent_id: &str,
     project_id: Option<&str>,
     k: usize,
+    scoring: &ScoringConfig,
+    now: TimestampMs,
 ) -> Result<KnnOutcome, MemoryError> {
     let q = q_bytes.to_vec();
     let agent = agent_id.to_string();
     let proj = project_id.map(str::to_owned);
+    let scoring = *scoring;
     store
         .conn
         .call(move |c| {
@@ -385,13 +382,13 @@ async fn knn_one(
                 proj: &Option<String>,
                 k: usize,
                 passes: &mut usize,
-            ) -> Result<Vec<RankedHit>, rusqlite::Error> {
+            ) -> Result<Vec<RawHit>, rusqlite::Error> {
                 *passes += 1;
                 let mut stmt = c.prepare(table.sql)?;
                 let rows = stmt.query_map(
                     rusqlite::params![q, k as i64, agent, proj],
                     |row| {
-                        Ok(RankedHit {
+                        Ok(RawHit {
                             id: row.get(0)?,
                             kind: table.kind,
                             content: row.get(1)?,
@@ -400,7 +397,8 @@ async fn knn_one(
                             status: row.get(4)?,
                             distance: row.get(5)?,
                             created_at: row.get(6)?,
-                            score: row.get(7)?,
+                            last_accessed_at: row.get(7)?,
+                            importance: row.get(8)?,
                         })
                     },
                 )?;
@@ -412,8 +410,8 @@ async fn knn_one(
             }
 
             let mut passes = 0usize;
-            let mut hits = run(c, table, &q, &agent, &proj, k, &mut passes)?;
-            if hits.len() < k {
+            let mut raw = run(c, table, &q, &agent, &proj, k, &mut passes)?;
+            if raw.len() < k {
                 // Capped at k by the SQL's own LIMIT, so this is
                 // `min(k, eligible)` — the most this query could ever return.
                 let reachable: i64 = c.query_row(
@@ -421,11 +419,32 @@ async fn knn_one(
                     rusqlite::params![k as i64, &agent, &proj],
                     |row| row.get(0),
                 )?;
-                if hits.len() < reachable as usize {
-                    hits = run(c, table, &q, &agent, &proj, retry_window(k), &mut passes)?;
-                    hits.truncate(k);
+                if raw.len() < reachable as usize {
+                    raw = run(c, table, &q, &agent, &proj, retry_window(k), &mut passes)?;
                 }
             }
+            let mut hits: Vec<RankedHit> = raw
+                .into_iter()
+                .map(|r| RankedHit {
+                    id: r.id,
+                    kind: r.kind,
+                    score: compute_score(&scoring, &r, now),
+                    content: r.content,
+                    memory_type: r.memory_type,
+                    tier: r.tier,
+                    status: r.status,
+                    distance: r.distance,
+                    created_at: r.created_at,
+                })
+                .collect();
+            // Sorted before the trim, not after: the widened window is cut
+            // back to k, and the rows that survive that cut have to be the
+            // highest-scoring ones. The ordering used to arrive with the rows
+            // because the query produced it; the query no longer computes a
+            // score, so the cut would otherwise keep whichever k rows the
+            // join happened to emit first.
+            hits.sort_by(hit_cmp);
+            hits.truncate(k);
             Ok(KnnOutcome { hits, passes })
         })
         .await
@@ -477,6 +496,7 @@ async fn search_all_memories_inner(
     agent_id: &str,
     scope: SearchScope,
     k_final: usize,
+    scoring: &ScoringConfig,
 ) -> Result<(Vec<RankedHit>, String), MemoryError> {
     // Same funnel every caller shares (prompt_builder.rs, contradiction.rs,
     // eval_api.rs): an unusable query vector means "no direction to search
@@ -498,23 +518,27 @@ async fn search_all_memories_inner(
     // reference — `scope` itself is never moved out of, so this reads fine
     // even though the struct dropped `Copy` when `project_id` was added.
     let project_id = scope.project_id.as_deref();
+    // Read once and shared by every table: no two rows scored by this search
+    // may have their decay computed against a different instant, which three
+    // independent per-row `strftime('%s','now')` calls could never guarantee.
+    let now = TimestampMs::now();
 
     let (mem, epi, pro) = tokio::try_join!(
         async {
             match scope.memory {
-                Some(k) => knn_one(store, KNN_MEMORY, &q_bytes, agent_id, project_id, k).await,
+                Some(k) => knn_one(store, KNN_MEMORY, &q_bytes, agent_id, project_id, k, scoring, now).await,
                 None => Ok(KnnOutcome::skipped()),
             }
         },
         async {
             match scope.episodic {
-                Some(k) => knn_one(store, KNN_EPISODIC, &q_bytes, agent_id, project_id, k).await,
+                Some(k) => knn_one(store, KNN_EPISODIC, &q_bytes, agent_id, project_id, k, scoring, now).await,
                 None => Ok(KnnOutcome::skipped()),
             }
         },
         async {
             match scope.procedural {
-                Some(k) => knn_one(store, KNN_PROCEDURAL, &q_bytes, agent_id, project_id, k).await,
+                Some(k) => knn_one(store, KNN_PROCEDURAL, &q_bytes, agent_id, project_id, k, scoring, now).await,
                 None => Ok(KnnOutcome::skipped()),
             }
         },
@@ -526,11 +550,7 @@ async fn search_all_memories_inner(
     // than being reassembled at the log call.
     let pool_survival = format_pool_line(&scope, &mem, &epi, &pro);
     let mut all: Vec<RankedHit> = mem.hits.into_iter().chain(epi.hits).chain(pro.hits).collect();
-    all.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    all.sort_by(hit_cmp);
     all.truncate(k_final);
 
     // Read once so the per-call number logged below and the sample fed into
@@ -570,7 +590,25 @@ pub(crate) async fn search_all_memories(
     k_final: usize,
 ) -> Result<Vec<RankedHit>, MemoryError> {
     let (hits, _pool_survival) =
-        search_all_memories_inner(store, embedding, agent_id, scope, k_final).await?;
+        search_all_memories_inner(store, embedding, agent_id, scope, k_final, &ScoringConfig::DEFAULT).await?;
+    Ok(hits)
+}
+
+/// Same orchestration as [`search_all_memories`], with the scoring config
+/// exposed to the caller instead of pinned to `ScoringConfig::DEFAULT`. Every
+/// production call site keeps using the unparameterized wrapper above — this
+/// one exists for `rag-eval`, which needs to re-search a seeded corpus under
+/// several configs without re-seeding.
+pub(crate) async fn search_all_memories_with_scoring(
+    store: &MemoryStore,
+    embedding: &[f32],
+    agent_id: &str,
+    scope: SearchScope,
+    k_final: usize,
+    scoring: &ScoringConfig,
+) -> Result<Vec<RankedHit>, MemoryError> {
+    let (hits, _pool_survival) =
+        search_all_memories_inner(store, embedding, agent_id, scope, k_final, scoring).await?;
     Ok(hits)
 }
 
@@ -710,6 +748,45 @@ mod tests {
         assert!((hits[0].score - 0.9).abs() < 1e-9);
     }
 
+    // Score first, then a key that cannot repeat: id is unique per table and
+    // kind separates the three, so no two distinct hits may compare Equal —
+    // ties on score alone (same id, different kind is impossible in
+    // practice, but the comparator must still resolve it) fall through to
+    // kind, and ties on both score and kind fall through to id.
+    #[test]
+    fn hit_cmp_is_a_strict_total_order_even_on_score_ties() {
+        use std::cmp::Ordering;
+
+        fn make(id: i64, kind: TableKind, score: f64) -> RankedHit {
+            RankedHit {
+                id,
+                kind,
+                content: String::new(),
+                memory_type: String::new(),
+                tier: 3,
+                status: "active".into(),
+                score,
+                distance: 0.0,
+                created_at: TimestampMs::from_unix_millis(0),
+            }
+        }
+
+        let a = make(1, TableKind::Memory, 0.5);
+        let b = make(2, TableKind::Memory, 0.5); // tied score+kind, id breaks it
+        let c = make(1, TableKind::Episodic, 0.5); // tied score+id, kind breaks it
+        let d = make(3, TableKind::Procedural, 0.9); // higher score sorts first
+
+        assert_eq!(hit_cmp(&a, &b), Ordering::Less, "same score+kind: lower id sorts first");
+        assert_eq!(hit_cmp(&b, &a), Ordering::Greater);
+        assert_eq!(hit_cmp(&a, &c), Ordering::Less, "same score+id: Memory sorts before Episodic");
+        assert_eq!(hit_cmp(&c, &a), Ordering::Greater);
+        assert_eq!(hit_cmp(&d, &a), Ordering::Less, "higher score sorts first regardless of kind/id");
+
+        assert_ne!(hit_cmp(&a, &b), Ordering::Equal, "distinct hits must never compare Equal");
+        assert_ne!(hit_cmp(&a, &c), Ordering::Equal, "distinct hits must never compare Equal");
+        assert_eq!(hit_cmp(&a, &a), Ordering::Equal, "a hit compares Equal to itself");
+    }
+
     #[test]
     fn serialize_f32_query_produces_le_bytes() {
         let v = vec![1.0_f32, 0.0_f32];
@@ -757,7 +834,7 @@ mod tests {
         // coincidentally landed on 4". Calling the pool query directly, before
         // any merge or truncation, tests the scan set in isolation.
         assert_eq!(
-            knn_one(&store, KNN_MEMORY, &emb, "agent-test", None, 30).await.unwrap().hits.len(),
+            knn_one(&store, KNN_MEMORY, &emb, "agent-test", None, 30, &ScoringConfig::DEFAULT, TimestampMs::now()).await.unwrap().hits.len(),
             4,
             "the tier-1 row must survive inside the query, before any merge or truncation"
         );
@@ -800,7 +877,7 @@ mod tests {
 
         let q_bytes = serialize_f32_query(&to_unit(&q_vec).unwrap());
         assert_eq!(
-            knn_one(&store, KNN_PROCEDURAL, &q_bytes, "agent-skill", None, 5)
+            knn_one(&store, KNN_PROCEDURAL, &q_bytes, "agent-skill", None, 5, &ScoringConfig::DEFAULT, TimestampMs::now())
                 .await
                 .unwrap()
                 .hits
@@ -945,9 +1022,13 @@ mod tests {
 
         assert!(!hits.is_empty(), "expected at least 1 hit");
         let score = hits[0].score;
-        // score ≈ (1.0 - distance) * MAX(0.2, exp_decay(86400, 0.023)) * importance_factor(5.0) * dispute_factor('active')
-        // distance ≈ 0 (identical vectors), decay ≈ 0.977, imp=0.75, dispute=1.0
-        // ≈ 1.0 * 0.977 * 0.75 * 1.0 ≈ 0.73
+        // score ≈ cosine * MAX(tier_floor, exp(-lambda*age_days)) * importance * dispute,
+        // computed in Rust by score() (memory/score.rs) against ScoringConfig::DEFAULT —
+        // distance ≈ 0 gives cosine ≈ 1.0 both before and after the cosine-floor
+        // re-scale (a floor rescale maps 1.0 to 1.0 regardless of the floor), decay
+        // over 1 day at the chat_message lambda (0.023) ≈ 0.977 clears the tier-2
+        // floor (0.2), importance at 5.0 = 0.8333... + 5.0/60.0 ≈ 0.9167, dispute for
+        // 'active' = 1.0. So score ≈ 1.0 * 0.977 * 0.9167 * 1.0 ≈ 0.896.
         assert!(score > 0.0 && score <= 1.0, "score out of range: {score}");
         assert!(score > 0.5, "expected score > 0.5, got {score}");
     }
@@ -1167,7 +1248,7 @@ mod tests {
         // pre-truncation pool size directly proves k_final is what cuts the
         // result, not a starved pool.
         assert_eq!(
-            knn_one(&store, KNN_MEMORY, &emb, agent, None, 30).await.unwrap().hits.len(),
+            knn_one(&store, KNN_MEMORY, &emb, agent, None, 30, &ScoringConfig::DEFAULT, TimestampMs::now()).await.unwrap().hits.len(),
             5,
             "all five must survive the query; k_final is what cuts the result, not the pool"
         );
@@ -1614,7 +1695,7 @@ mod tests {
             &store, agent, Some("P2"), "user_preference", "pref content", far,
         ).await;
 
-        let outcome = knn_one(&store, KNN_MEMORY, &near, agent, Some("P1"), 30)
+        let outcome = knn_one(&store, KNN_MEMORY, &near, agent, Some("P1"), 30, &ScoringConfig::DEFAULT, TimestampMs::now())
             .await
             .unwrap();
 
@@ -1798,7 +1879,7 @@ mod tests {
         let emb = unit_basis_embedding();
         bulk_insert_memory_rows(&store, "agent-full", Some("P1"), 10, emb.clone()).await;
 
-        let outcome = knn_one(&store, KNN_MEMORY, &emb, "agent-full", Some("P1"), 5)
+        let outcome = knn_one(&store, KNN_MEMORY, &emb, "agent-full", Some("P1"), 5, &ScoringConfig::DEFAULT, TimestampMs::now())
             .await
             .unwrap();
 
@@ -1820,7 +1901,7 @@ mod tests {
         let emb = unit_basis_embedding();
         bulk_insert_memory_rows(&store, "agent-small", Some("P1"), 8, emb.clone()).await;
 
-        let outcome = knn_one(&store, KNN_MEMORY, &emb, "agent-small", Some("P1"), 30)
+        let outcome = knn_one(&store, KNN_MEMORY, &emb, "agent-small", Some("P1"), 30, &ScoringConfig::DEFAULT, TimestampMs::now())
             .await
             .unwrap();
 
@@ -1842,7 +1923,7 @@ mod tests {
         bulk_insert_memory_rows(&store, "agent-starved", Some("P2"), 100, near.clone()).await;
         let own = bulk_insert_memory_rows(&store, "agent-starved", Some("P1"), 5, far).await;
 
-        let outcome = knn_one(&store, KNN_MEMORY, &near, "agent-starved", Some("P1"), 30)
+        let outcome = knn_one(&store, KNN_MEMORY, &near, "agent-starved", Some("P1"), 30, &ScoringConfig::DEFAULT, TimestampMs::now())
             .await
             .unwrap();
 
@@ -1876,7 +1957,7 @@ mod tests {
         bulk_insert_memory_rows(&store, "agent-trunc", Some("P2"), 10, near.clone()).await;
         bulk_insert_memory_rows(&store, "agent-trunc", Some("P1"), 50, far).await;
 
-        let outcome = knn_one(&store, KNN_MEMORY, &near, "agent-trunc", Some("P1"), 10)
+        let outcome = knn_one(&store, KNN_MEMORY, &near, "agent-trunc", Some("P1"), 10, &ScoringConfig::DEFAULT, TimestampMs::now())
             .await
             .unwrap();
 
@@ -1912,7 +1993,7 @@ mod tests {
         bulk_insert_memory_rows(&store, "agent-telemetry", Some("P2"), 30, near.clone()).await;
         bulk_insert_memory_rows(&store, "agent-telemetry", Some("P1"), 40, far).await;
 
-        let mem = knn_one(&store, KNN_MEMORY, &near, "agent-telemetry", Some("P1"), k)
+        let mem = knn_one(&store, KNN_MEMORY, &near, "agent-telemetry", Some("P1"), k, &ScoringConfig::DEFAULT, TimestampMs::now())
             .await
             .unwrap();
         assert_eq!(mem.passes, 2, "test setup: the window has to have been starved");
@@ -1956,7 +2037,7 @@ mod tests {
         bulk_insert_memory_rows(&store, "agent-telemetry-wired", Some("P1"), 40, serialize_embedding(&far)).await;
 
         let (hits, line) =
-            search_all_memories_inner(&store, &near, "agent-telemetry-wired", scope, 30)
+            search_all_memories_inner(&store, &near, "agent-telemetry-wired", scope, 30, &ScoringConfig::DEFAULT)
                 .await
                 .unwrap();
 
@@ -2009,7 +2090,7 @@ mod tests {
             soft_delete_keeping_vector(&store, *id).await;
         }
 
-        let outcome = knn_one(&store, KNN_MEMORY, &near, "agent-deleted", Some("P1"), 30)
+        let outcome = knn_one(&store, KNN_MEMORY, &near, "agent-deleted", Some("P1"), 30, &ScoringConfig::DEFAULT, TimestampMs::now())
             .await
             .unwrap();
 
@@ -2049,7 +2130,7 @@ mod tests {
         let own = bulk_insert_memory_rows(&store, "agent-shared", Some("P1"), 3, near.clone()).await;
         bulk_insert_memory_rows(&store, "agent-shared", Some("P2"), 1000, far).await;
 
-        let outcome = knn_one(&store, KNN_MEMORY, &near, "agent-shared", Some("P1"), 30)
+        let outcome = knn_one(&store, KNN_MEMORY, &near, "agent-shared", Some("P1"), 30, &ScoringConfig::DEFAULT, TimestampMs::now())
             .await
             .unwrap();
 
@@ -2066,6 +2147,84 @@ mod tests {
     // vec0 rejects a k above its own ceiling outright, so a pool size past a
     // quarter of that ceiling turns the widened retry into a hard error unless
     // the window is clamped.
+    /// A unit vector at a controlled cosine similarity to `unit_basis_vec`
+    /// (`[1,0,0,…]`), so a fixture can pick an exact distance instead of
+    /// relying on `off_axis_vec`'s one fixed angle.
+    fn vec_at_cosine(cos_theta: f32) -> Vec<f32> {
+        let mut v = vec![0.0_f32; 384];
+        v[0] = cos_theta;
+        v[1] = (1.0_f32 - cos_theta * cos_theta).sqrt();
+        v
+    }
+
+    // The trap the SQL `ORDER BY score DESC` quietly covered for: the
+    // widened retry window comes back ordered by raw distance, not by the
+    // score a row actually earns once importance/status are applied. A row
+    // that arrives CLOSER — and so earlier in that stream — can still score
+    // LOWER than one that arrives farther away. Here NEAR is disputed and
+    // unimportant, FAR is active and maximally important, and FAR's score
+    // comes out well above NEAR's despite losing on raw distance.
+    // `knn_one` must score every row, order them by the real comparator, and
+    // only then cut to k — truncating on arrival order would keep NEAR and
+    // lose the row that actually ranks first.
+    //
+    // This is an approval test: it is written and confirmed green against
+    // today's SQL-sorted `knn_one` (`ORDER BY score DESC` already gets this
+    // right), and it MUST stay green once scoring moves to Rust and that
+    // clause is gone. If it goes red at that point, the port introduced the
+    // exact candidate-set bug it promised not to.
+    #[tokio::test]
+    async fn knn_one_retry_path_keeps_the_true_top_k_by_score_not_join_arrival_order() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let agent = "agent-retry-order";
+
+        // Two exact-match rows in a foreign project saturate the first
+        // pass's k=1 window entirely, forcing the retry.
+        let crowd = serialize_embedding(&unit_basis_vec());
+        for i in 0..2 {
+            insert_memory_row_with_project(
+                &store, agent, Some("P2"), "chat_message", &format!("crowd {i}"), crowd.clone(),
+            ).await;
+        }
+
+        // NEAR: closest of the caller's own rows, but disputed and
+        // unimportant — its score has to lose despite arriving first.
+        let near_emb = serialize_embedding(&vec_at_cosine(0.999));
+        let near_id = insert_memory_row(
+            &store, agent, "near but low score", "chat_message", 3, 1.0, "disputed", near_emb,
+        ).await;
+
+        // FAR: farther from the query than NEAR, but active and maximally
+        // important — its score has to win despite arriving second. Kept
+        // above `ScoringConfig::DEFAULT`'s cosine re-scale floor on purpose:
+        // a cosine below that floor clamps to a score of exactly zero
+        // regardless of importance (a separate, already-covered behavior),
+        // which would make this fixture test the floor instead of the thing
+        // it exists to test — truncation picking the true top score rather
+        // than arrival order.
+        let far_emb = serialize_embedding(&vec_at_cosine(0.95));
+        let far_id = insert_memory_row(
+            &store, agent, "far but high score", "chat_message", 3, 10.0, "active", far_emb,
+        ).await;
+
+        let q_bytes = serialize_embedding(&unit_basis_vec());
+        let outcome = knn_one(&store, KNN_MEMORY, &q_bytes, agent, Some("P1"), 1, &ScoringConfig::DEFAULT, TimestampMs::now())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.passes, 2, "test setup: the crowd must starve the first pass");
+        assert_eq!(
+            outcome.hits.len(),
+            1,
+            "k=1 must still cut the widened retry back to exactly one row"
+        );
+        assert_eq!(
+            outcome.hits[0].id, far_id,
+            "the higher-scoring row must survive truncation even though the \
+             lower-scoring row (id={near_id}) arrived first in raw distance order"
+        );
+    }
+
     #[tokio::test]
     async fn knn_retry_window_stays_within_engine_ceiling() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -2075,7 +2234,7 @@ mod tests {
         bulk_insert_memory_rows(&store, "agent-ceiling", Some("P2"), k, near.clone()).await;
         let own = bulk_insert_memory_rows(&store, "agent-ceiling", Some("P1"), 5, far).await;
 
-        let outcome = knn_one(&store, KNN_MEMORY, &near, "agent-ceiling", Some("P1"), k)
+        let outcome = knn_one(&store, KNN_MEMORY, &near, "agent-ceiling", Some("P1"), k, &ScoringConfig::DEFAULT, TimestampMs::now())
             .await
             .expect("the widened window must stay bindable");
 
@@ -2111,7 +2270,7 @@ mod tests {
         }
 
         let q_bytes = serialize_embedding(&near);
-        let outcome = knn_one(&store, KNN_EPISODIC, &q_bytes, "agent-epi-retry", Some("P1"), 5)
+        let outcome = knn_one(&store, KNN_EPISODIC, &q_bytes, "agent-epi-retry", Some("P1"), 5, &ScoringConfig::DEFAULT, TimestampMs::now())
             .await
             .unwrap();
 
@@ -2144,7 +2303,7 @@ mod tests {
         }
 
         let q_bytes = serialize_embedding(&near);
-        let outcome = knn_one(&store, KNN_PROCEDURAL, &q_bytes, "agent-pro-retry", Some("P1"), 5)
+        let outcome = knn_one(&store, KNN_PROCEDURAL, &q_bytes, "agent-pro-retry", Some("P1"), 5, &ScoringConfig::DEFAULT, TimestampMs::now())
             .await
             .unwrap();
 
@@ -2172,8 +2331,8 @@ mod tests {
         insert_procedural_row_with_project(&store, "agent-x", Some("P1"), "skill-x", emb.clone()).await;
 
         let q_bytes = serialize_f32_query(&emb);
-        let epi = knn_one(&store, KNN_EPISODIC, &q_bytes, "agent-x", Some("P1"), 5).await.unwrap();
-        let pro = knn_one(&store, KNN_PROCEDURAL, &q_bytes, "agent-x", Some("P1"), 5).await.unwrap();
+        let epi = knn_one(&store, KNN_EPISODIC, &q_bytes, "agent-x", Some("P1"), 5, &ScoringConfig::DEFAULT, TimestampMs::now()).await.unwrap();
+        let pro = knn_one(&store, KNN_PROCEDURAL, &q_bytes, "agent-x", Some("P1"), 5, &ScoringConfig::DEFAULT, TimestampMs::now()).await.unwrap();
 
         assert_eq!(epi.hits.len(), 1);
         assert_eq!(pro.hits.len(), 1);

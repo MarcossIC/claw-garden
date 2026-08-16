@@ -11,7 +11,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use agent_office_lib::eval_api::EvalScoringConfig;
+use serde::{Deserialize, Serialize};
 
 use crate::golden::CaseStatus;
 use crate::metrics::ThresholdCurveRow;
@@ -47,7 +48,12 @@ pub struct Aggregate {
     pub ndcg_10: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// `Deserialize` is added here for `diff.rs`'s benefit, not production's: a
+/// results file is written once by [`write_json`] and read back only by the
+/// paired-diff tool, which needs to turn `retrieval.per_case`/
+/// `similarity.per_case` JSON arrays back into this type to join them on
+/// `query`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaseResult {
     pub query: String,
     pub expected_refs: Vec<String>,
@@ -215,6 +221,20 @@ pub struct SimilarityResults {
     /// own statistic: comparable to it directly, pre- vs post-change, on the
     /// frozen set's unchanged distractor structure.
     pub mean_corpus_distractor_gap: f64,
+    /// Seven-number summary of every (query, corpus-doc) cosine value
+    /// gathered while ranking `per_case`/`aggregate` — the empirical cosine
+    /// distribution of the corpus in this run's actual embedding space, not
+    /// an assumed one. This is the measured floor a later re-scaling step
+    /// reads from; it must never be replaced with a hand-picked constant,
+    /// because a prefixed or re-trained embedder can shift it without
+    /// warning.
+    pub cosine_min: f64,
+    pub cosine_p5: f64,
+    pub cosine_p25: f64,
+    pub cosine_p50: f64,
+    pub cosine_p75: f64,
+    pub cosine_p95: f64,
+    pub cosine_max: f64,
     /// The prefix strings actually applied to queries/passages during this
     /// run, copied from the live embedder. An empty string here is not a
     /// placeholder — it is the true value for a run that predates prefixing,
@@ -242,6 +262,12 @@ pub struct RunResults {
     pub corpus_size: usize,
     pub n_retrieval_cases: usize,
     pub n_contradiction_pairs: usize,
+    /// The scoring config every hit in this run was ranked with. Always
+    /// serialized, never `skip_serializing_if`: every run scores with SOME
+    /// config, so absence in an old file means only "written by a build that
+    /// predates this field", not "not applicable to this run" — unlike
+    /// `audit`/`similarity`, which really can be legitimately absent.
+    pub scoring_config: EvalScoringConfig,
     /// Defects known to be live in the codebase at run time. A baseline taken
     /// on broken code is what later makes the repair measurable, so a reader
     /// needs to know which numbers are standing on a bug rather than a
@@ -334,6 +360,88 @@ pub fn results_filename(date: &str, mode: Mode, tag: Option<&str>) -> String {
         Some(tag) => format!("{date}-{config}-{tag}.json"),
         None => format!("{date}-{config}.json"),
     }
+}
+
+/// One grid cell of a sweep: the config that produced it, where its own
+/// full `RunResults` file landed, and the two audit numbers gate 3.11 reads
+/// (`importance_rank_dominance`/`modal_rank_agreement`) — computed for every
+/// point regardless of whether `--audit` was passed, since the sweep gate
+/// needs them unconditionally, not only when a full `AuditReport` was asked
+/// for.
+#[derive(Debug, Clone, Serialize)]
+pub struct SweepPoint {
+    pub slug: String,
+    pub results_file: String,
+    pub scoring_config: EvalScoringConfig,
+    pub aggregate: Aggregate,
+    pub importance_rank_dominance: f64,
+    pub modal_rank_agreement: f64,
+}
+
+/// The curve index a sweep run writes alongside its N `RunResults` files —
+/// one row per grid cell, so a reader can see every point's headline numbers
+/// without opening each file individually. Never the results themselves:
+/// see `RunResults` in the file-changes rationale — every existing consumer
+/// (the paired diff tool, `write_json`'s no-clobber rule, human diffing)
+/// takes a whole `RunResults` as its unit, and this index is additive to
+/// that, not a replacement for it.
+#[derive(Debug, Clone, Serialize)]
+pub struct SweepIndex {
+    pub date: String,
+    pub mode: Mode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    pub model_id: String,
+    pub git_sha: String,
+    pub points: Vec<SweepPoint>,
+}
+
+/// The importance factor's value at its own `clamp_lo` — i.e. the swept
+/// `min` a point's config was built with. Recovered from the stored config
+/// rather than carried as a separate field: `EvalScoringConfig` already
+/// determines it exactly (`base + clamp_lo/divisor`), and a second field
+/// holding the same number could drift from the config that actually ran.
+fn imp_min_of(cfg: &EvalScoringConfig) -> f64 {
+    cfg.importance_base + cfg.importance_clamp_lo / cfg.importance_divisor
+}
+
+/// Sorts sweep points by `(imp_min, cos_floor)` ascending, matching the
+/// design's curve-index ordering so two sweeps over the same grid produce
+/// byte-comparable JSON. `None` (no cosine re-scale) sorts before every
+/// `Some` floor: it is the "off" position of that axis, logically less than
+/// any active floor value rather than an arbitrary tie-break.
+pub fn sort_sweep_points(points: &mut [SweepPoint]) {
+    points.sort_by(|a, b| {
+        let a_imp = imp_min_of(&a.scoring_config);
+        let b_imp = imp_min_of(&b.scoring_config);
+        let a_floor = a.scoring_config.cosine_floor.unwrap_or(f64::NEG_INFINITY);
+        let b_floor = b.scoring_config.cosine_floor.unwrap_or(f64::NEG_INFINITY);
+        a_imp.total_cmp(&b_imp).then_with(|| a_floor.total_cmp(&b_floor))
+    });
+}
+
+/// Writes a sweep's curve index to `{out_dir}/{date}-{mode}[-{tag}]-sweep.json`
+/// — the same no-clobber-unless-`--force` discipline [`write_json`] applies,
+/// for the same reason: this file is also a measurement artifact someone
+/// will read later, not a scratch file.
+pub fn write_sweep_index(index: &SweepIndex, out_dir: &Path, force: bool) -> Result<PathBuf, ReportError> {
+    std::fs::create_dir_all(out_dir)
+        .map_err(|e| ReportError::CreateDir { path: out_dir.to_path_buf(), source: e })?;
+    let config = match index.mode {
+        Mode::Fake => "fake",
+        Mode::Real => "real",
+    };
+    let filename = match &index.tag {
+        Some(tag) => format!("{}-{config}-{tag}-sweep.json", index.date),
+        None => format!("{}-{config}-sweep.json", index.date),
+    };
+    let path = out_dir.join(filename);
+    if path.exists() && !force {
+        return Err(ReportError::AlreadyExists { path });
+    }
+    let json = serde_json::to_string_pretty(index)?;
+    std::fs::write(&path, json).map_err(|e| ReportError::Write { path: path.clone(), source: e })?;
+    Ok(path)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -643,6 +751,7 @@ mod tests {
             corpus_size: 1,
             n_retrieval_cases: 1,
             n_contradiction_pairs: 0,
+            scoring_config: EvalScoringConfig::default(),
             known_bugs_live: vec!["fake-embedder-unnormalized-contradiction-sweep-degenerate".to_string()],
             golden_set: GoldenSetProvenance::derive(1, 0, "h".to_string()),
             retrieval: RetrievalResults {
@@ -664,6 +773,13 @@ mod tests {
             per_case: vec![],
             mean_expected_distractor_gap: 0.1,
             mean_corpus_distractor_gap: 0.2,
+            cosine_min: 0.3,
+            cosine_p5: 0.4,
+            cosine_p25: 0.5,
+            cosine_p50: 0.6,
+            cosine_p75: 0.7,
+            cosine_p95: 0.8,
+            cosine_max: 0.9,
             query_prefix: "".to_string(),
             passage_prefix: "".to_string(),
         }
@@ -695,6 +811,60 @@ mod tests {
         assert_eq!(json["similarity"]["passage_prefix"], "");
         assert_eq!(json["similarity"]["mean_expected_distractor_gap"], 0.1);
         assert_eq!(json["similarity"]["mean_corpus_distractor_gap"], 0.2);
+        assert_eq!(json["similarity"]["cosine_min"], 0.3);
+        assert_eq!(json["similarity"]["cosine_p5"], 0.4);
+        assert_eq!(json["similarity"]["cosine_p25"], 0.5);
+        assert_eq!(json["similarity"]["cosine_p50"], 0.6);
+        assert_eq!(json["similarity"]["cosine_p75"], 0.7);
+        assert_eq!(json["similarity"]["cosine_p95"], 0.8);
+        assert_eq!(json["similarity"]["cosine_max"], 0.9);
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    #[test]
+    fn scoring_config_is_always_serialized_and_round_trips_every_field() {
+        let out_dir = std::env::temp_dir().join(format!("rag-eval-report-test-{}", uuid::Uuid::new_v4()));
+        let mut results = minimal_results("2026-07-27", Mode::Real);
+        results.scoring_config = EvalScoringConfig {
+            importance_base: 0.7,
+            importance_divisor: 15.0,
+            importance_clamp_lo: 1.0,
+            importance_clamp_hi: 10.0,
+            cosine_floor: Some(0.8625),
+        };
+        let path = write_json(&results, &out_dir, false).expect("write must succeed");
+        let written = std::fs::read_to_string(&path).expect("must read back");
+        let json: serde_json::Value = serde_json::from_str(&written).expect("valid JSON");
+
+        // Present unconditionally — no skip_serializing_if, unlike audit/similarity.
+        assert!(json.get("scoring_config").is_some(), "scoring_config key must always be present");
+        assert_eq!(json["scoring_config"]["importance_base"], 0.7);
+        assert_eq!(json["scoring_config"]["importance_divisor"], 15.0);
+        assert_eq!(json["scoring_config"]["importance_clamp_lo"], 1.0);
+        assert_eq!(json["scoring_config"]["importance_clamp_hi"], 10.0);
+        assert_eq!(json["scoring_config"]["cosine_floor"], 0.8625);
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    #[test]
+    fn scoring_config_is_present_even_at_default_values() {
+        // The zero point of a sweep is not "nothing to report" — it is the
+        // one config every non-sweep run has always scored with.
+        let out_dir = std::env::temp_dir().join(format!("rag-eval-report-test-{}", uuid::Uuid::new_v4()));
+        let results = minimal_results("2026-07-27", Mode::Fake);
+        let path = write_json(&results, &out_dir, false).expect("write must succeed");
+        let written = std::fs::read_to_string(&path).expect("must read back");
+        let json: serde_json::Value = serde_json::from_str(&written).expect("valid JSON");
+        assert!(json.get("scoring_config").is_some());
+        // Derived from EvalScoringConfig::default() rather than a bare
+        // literal: this test's subject is "the default's own floor got
+        // serialized", not "the floor happens to be this specific number" —
+        // it must keep testing the former even if the latter changes again.
+        let expected_floor = match EvalScoringConfig::default().cosine_floor {
+            Some(f) => serde_json::json!(f),
+            None => serde_json::Value::Null,
+        };
+        assert_eq!(json["scoring_config"]["cosine_floor"], expected_floor);
         std::fs::remove_dir_all(&out_dir).ok();
     }
 
@@ -749,6 +919,89 @@ mod tests {
         write_json(&results, &out_dir, true).expect("write with --force must succeed");
         let written = std::fs::read_to_string(out_dir.join("2026-07-27-fake.json")).unwrap();
         assert!(written.contains("\"corpus_size\": 99"));
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    // --- SweepIndex ---------------------------------------------------------
+
+    fn sweep_point(imp_min: f64, cos_floor: Option<f64>) -> SweepPoint {
+        // Sets `cosine_floor` directly to whatever the caller asked for
+        // (including `None`) rather than through `with_cosine_floor`, which
+        // can only ever set a `Some` — leaving a `None` request untouched
+        // would silently inherit the default's own floor instead of the
+        // test's intended "off" position on this axis.
+        let mut scoring_config = EvalScoringConfig::default().with_importance_span(imp_min, 1.0);
+        scoring_config.cosine_floor = cos_floor;
+        SweepPoint {
+            slug: format!("imp{imp_min:.2}"),
+            results_file: format!("2026-08-16-real-imp{imp_min:.2}.json"),
+            scoring_config,
+            aggregate: Aggregate::default(),
+            importance_rank_dominance: 0.5,
+            modal_rank_agreement: 0.2,
+        }
+    }
+
+    #[test]
+    fn sweep_index_serializes_the_full_shape() {
+        let index = SweepIndex {
+            date: "2026-08-16".to_string(),
+            mode: Mode::Real,
+            tag: Some("floor-sweep".to_string()),
+            model_id: "fake-embedder".to_string(),
+            git_sha: "deadbee".to_string(),
+            points: vec![sweep_point(0.55, Some(0.8625))],
+        };
+        let json = serde_json::to_value(&index).expect("must serialize");
+        assert_eq!(json["date"], "2026-08-16");
+        assert_eq!(json["mode"], "real");
+        assert_eq!(json["tag"], "floor-sweep");
+        assert_eq!(json["model_id"], "fake-embedder");
+        assert_eq!(json["git_sha"], "deadbee");
+        let points = json["points"].as_array().expect("points must be an array");
+        assert_eq!(points.len(), 1);
+        let p = &points[0];
+        assert_eq!(p["slug"], "imp0.55");
+        assert_eq!(p["results_file"], "2026-08-16-real-imp0.55.json");
+        assert!(p.get("scoring_config").is_some());
+        assert!(p.get("aggregate").is_some());
+        assert_eq!(p["importance_rank_dominance"], 0.5);
+        assert_eq!(p["modal_rank_agreement"], 0.2);
+    }
+
+    #[test]
+    fn sort_sweep_points_orders_by_imp_min_then_cos_floor() {
+        let mut points = vec![
+            sweep_point(0.7, Some(0.90)),
+            sweep_point(0.55, None),
+            sweep_point(0.7, Some(0.86)),
+            sweep_point(0.55, Some(0.86)),
+        ];
+        sort_sweep_points(&mut points);
+        let slugs: Vec<&str> = points.iter().map(|p| p.slug.as_str()).collect();
+        // imp_min ascending first (0.55 before 0.70); within a tied imp_min,
+        // cos_floor ascending with None (no re-scale) sorting before any Some.
+        assert_eq!(
+            points.iter().map(|p| (imp_min_of(&p.scoring_config), p.scoring_config.cosine_floor)).collect::<Vec<_>>(),
+            vec![(0.55, None), (0.55, Some(0.86)), (0.70, Some(0.86)), (0.70, Some(0.90))],
+            "slugs in this order: {slugs:?}"
+        );
+    }
+
+    #[test]
+    fn write_sweep_index_writes_the_expected_filename() {
+        let out_dir = std::env::temp_dir().join(format!("rag-eval-sweep-test-{}", uuid::Uuid::new_v4()));
+        let index = SweepIndex {
+            date: "2026-08-16".to_string(),
+            mode: Mode::Real,
+            tag: Some("floor-sweep".to_string()),
+            model_id: "fake-embedder".to_string(),
+            git_sha: "deadbee".to_string(),
+            points: vec![sweep_point(0.55, Some(0.8625))],
+        };
+        let path = write_sweep_index(&index, &out_dir, false).expect("write must succeed");
+        assert_eq!(path, out_dir.join("2026-08-16-real-floor-sweep-sweep.json"));
+        assert!(path.exists());
         std::fs::remove_dir_all(&out_dir).ok();
     }
 

@@ -19,6 +19,79 @@ pub fn rank_by_cosine(query: &[f32], corpus: &[(String, Vec<f32>)], k: usize) ->
     scored.into_iter().take(k).map(|(r, _)| r.to_string()).collect()
 }
 
+/// Cosine similarity between `query` and every vector in `corpus`, in
+/// `corpus`'s own order, unsorted and untruncated. These are the exact
+/// per-(query, corpus-doc) values [`rank_by_cosine`] computes internally to
+/// rank against — exposed separately so a caller can pool them across every
+/// case into a corpus-wide distribution without embedding anything a second
+/// time; this function calls no embedder, it only reduces vectors already in
+/// memory.
+pub fn cosine_scores(query: &[f32], corpus: &[(String, Vec<f32>)]) -> Vec<f64> {
+    corpus.iter().map(|(_, v)| cosine(query, v)).collect()
+}
+
+/// The seven-number summary of a cosine distribution: the extremes plus the
+/// quartiles and the 5th/95th percentiles. This is the shape the score
+/// formula's cosine floor is read off of: the p5 value becomes the measured
+/// corpus floor that `rescale_cosine` (`memory/score.rs`) stretches back out
+/// to `[0,1]` before it is multiplied into the ranking score. Not comparable to [`mean_expected_distractor_gap`]
+/// or [`mean_corpus_distractor_gap`] — those describe how well a query's
+/// expected matches separate from its rivals, this describes the raw
+/// cosine geometry `values` sit in, independent of any expected/rival split.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CosinePercentiles {
+    pub min: f64,
+    pub p5: f64,
+    pub p25: f64,
+    pub p50: f64,
+    pub p75: f64,
+    pub p95: f64,
+    pub max: f64,
+}
+
+/// Linear interpolation between the two closest ranks — the same rule
+/// numpy's default `percentile` method uses — so a percentile that falls
+/// between two observations is read off a straight line between them rather
+/// than snapped to whichever one happens to be nearest. All zero for an
+/// empty slice rather than a panic or NaN: this can only happen when a run
+/// scored zero active cases, which is a golden-set problem this function is
+/// not the one to flag.
+pub fn cosine_percentiles(values: &[f64]) -> CosinePercentiles {
+    if values.is_empty() {
+        return CosinePercentiles { min: 0.0, p5: 0.0, p25: 0.0, p50: 0.0, p75: 0.0, p95: 0.0, max: 0.0 };
+    }
+    let mut sorted: Vec<f64> = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    let at = |p: f64| percentile_of_sorted(&sorted, p);
+    CosinePercentiles {
+        min: sorted[0],
+        p5: at(5.0),
+        p25: at(25.0),
+        p50: at(50.0),
+        p75: at(75.0),
+        p95: at(95.0),
+        max: *sorted.last().expect("checked non-empty above"),
+    }
+}
+
+/// `sorted` ascending, `p` in `[0, 100]`. The virtual rank `p/100 * (n-1)`
+/// usually falls between two indices; the result is the linear interpolation
+/// between them, matching [`cosine_percentiles`]'s doc comment.
+fn percentile_of_sorted(sorted: &[f64], p: f64) -> f64 {
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    let rank = p / 100.0 * (sorted.len() - 1) as f64;
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    if lower == upper {
+        sorted[lower]
+    } else {
+        let frac = rank - lower as f64;
+        sorted[lower] + frac * (sorted[upper] - sorted[lower])
+    }
+}
+
 /// One case's data for the query-anchored gap, already resolved to vectors —
 /// this function has no notion of a ref, only of vectors.
 pub struct ExpectedGapCase<'a> {
@@ -182,6 +255,72 @@ mod tests {
     #[test]
     fn mean_corpus_distractor_gap_of_no_cases_is_zero_not_nan() {
         assert_eq!(mean_corpus_distractor_gap(&[]), 0.0);
+    }
+
+    // --- cosine_scores ------------------------------------------------------
+
+    #[test]
+    fn cosine_scores_returns_one_value_per_corpus_row_in_corpus_order() {
+        let corpus = vec![
+            ("a".to_string(), vec![1.0, 0.0]),
+            ("b".to_string(), vec![0.0, 1.0]),
+            ("c".to_string(), vec![0.9, 0.1]),
+        ];
+        let query = [1.0, 0.0];
+        let scores = cosine_scores(&query, &corpus);
+        assert_eq!(scores.len(), 3, "one score per corpus row, none dropped or added");
+        assert!((scores[0] - cosine(&query, &[1.0, 0.0])).abs() < 1e-12);
+        assert!((scores[1] - cosine(&query, &[0.0, 1.0])).abs() < 1e-12);
+        assert!((scores[2] - cosine(&query, &[0.9, 0.1])).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cosine_scores_of_an_empty_corpus_is_empty() {
+        let query = [1.0, 0.0];
+        assert!(cosine_scores(&query, &[]).is_empty());
+    }
+
+    // --- cosine_percentiles --------------------------------------------------
+
+    #[test]
+    fn cosine_percentiles_of_an_evenly_spaced_set_interpolates_linearly() {
+        // n=5, values 10..50: virtual rank = p/100 * (n-1) lands on an exact
+        // index for p5/p25/p50/p75/p95 except p5/p95, which fall strictly
+        // between two observations and must be linearly interpolated rather
+        // than rounded to whichever neighbor is closest.
+        let values = vec![30.0, 10.0, 50.0, 20.0, 40.0]; // deliberately unsorted
+        let p = cosine_percentiles(&values);
+        assert_eq!(p.min, 10.0);
+        assert_eq!(p.max, 50.0);
+        assert!((p.p5 - 12.0).abs() < 1e-9, "p5 was {}", p.p5);
+        assert_eq!(p.p25, 20.0);
+        assert_eq!(p.p50, 30.0);
+        assert_eq!(p.p75, 40.0);
+        assert!((p.p95 - 48.0).abs() < 1e-9, "p95 was {}", p.p95);
+    }
+
+    #[test]
+    fn cosine_percentiles_of_a_single_value_is_that_value_everywhere() {
+        let p = cosine_percentiles(&[0.42]);
+        assert_eq!(p.min, 0.42);
+        assert_eq!(p.p5, 0.42);
+        assert_eq!(p.p25, 0.42);
+        assert_eq!(p.p50, 0.42);
+        assert_eq!(p.p75, 0.42);
+        assert_eq!(p.p95, 0.42);
+        assert_eq!(p.max, 0.42);
+    }
+
+    #[test]
+    fn cosine_percentiles_of_an_empty_slice_is_all_zero_not_nan() {
+        let p = cosine_percentiles(&[]);
+        assert_eq!(p.min, 0.0);
+        assert_eq!(p.p5, 0.0);
+        assert_eq!(p.p25, 0.0);
+        assert_eq!(p.p50, 0.0);
+        assert_eq!(p.p75, 0.0);
+        assert_eq!(p.p95, 0.0);
+        assert_eq!(p.max, 0.0);
     }
 
     #[test]

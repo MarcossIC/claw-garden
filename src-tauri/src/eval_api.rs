@@ -19,6 +19,8 @@
 
 use std::path::Path;
 
+use serde::Serialize;
+
 use crate::memory::db::MemoryStore;
 use crate::memory::embedder::{Embedder, FakeEmbedder, FastEmbedLocal};
 
@@ -27,7 +29,8 @@ use crate::memory::embedder::{Embedder, FakeEmbedder, FastEmbedLocal};
 pub use crate::memory::embedder::EmbedRole;
 use crate::memory::events::MemorySource;
 use crate::memory::model_download;
-use crate::memory::search::{search_all_memories, SearchScope};
+use crate::memory::score::{ImportanceFactor, ScoringConfig};
+use crate::memory::search::{search_all_memories_with_scoring, SearchScope};
 use crate::memory::store_insert::{CreatedByType, MemoryType, NewMemoryRecord};
 use crate::memory::tier::compute_tier;
 use crate::memory::TableKind;
@@ -56,6 +59,73 @@ impl EvalScope {
             // unscoped pool, so this keeps every query bit-identical to
             // retrieval before project scoping existed.
             project_id: None,
+        }
+    }
+}
+
+/// This module's own copy of the scoring knobs `rag-eval`'s sweep varies —
+/// everything else in `ScoringConfig` stays at `ScoringConfig::DEFAULT`, the
+/// same "mirror only what's used" discipline [`EvalScope`] already follows
+/// for `SearchScope` (which also carries a `project_id` this module never
+/// sets). `Serialize` derives here, not on `ScoringConfig`: a scoring config
+/// is only ever written out from this border copy, the same way `EvalScope`
+/// rather than `SearchScope` would be if a report ever needed to record it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct EvalScoringConfig {
+    pub importance_base: f64,
+    pub importance_divisor: f64,
+    pub importance_clamp_lo: f64,
+    pub importance_clamp_hi: f64,
+    pub cosine_floor: Option<f64>,
+}
+
+impl EvalScoringConfig {
+    pub(crate) fn into_scoring_config(self) -> ScoringConfig {
+        ScoringConfig {
+            importance: ImportanceFactor {
+                base: self.importance_base,
+                divisor: self.importance_divisor,
+                clamp_lo: self.importance_clamp_lo,
+                clamp_hi: self.importance_clamp_hi,
+            },
+            cosine_floor: self.cosine_floor,
+            ..ScoringConfig::DEFAULT
+        }
+    }
+}
+
+impl EvalScoringConfig {
+    /// Builds a sweep point whose importance range is derived through
+    /// `ImportanceFactor::spanning`. Lives here, not in `main.rs`, because
+    /// `ImportanceFactor` is `pub(crate)` inside this library — the binary
+    /// crate can never name it directly, only cross the border through a
+    /// method this mirror type exposes, the same anti-corruption discipline
+    /// `into_scoring_config`/`into_search_scope` already follow.
+    pub fn with_importance_span(mut self, min: f64, max: f64) -> Self {
+        let f = ImportanceFactor::spanning(min, max);
+        self.importance_base = f.base;
+        self.importance_divisor = f.divisor;
+        self.importance_clamp_lo = f.clamp_lo;
+        self.importance_clamp_hi = f.clamp_hi;
+        self
+    }
+
+    /// Sets the cosine re-scale floor for a sweep point.
+    pub fn with_cosine_floor(mut self, floor: f64) -> Self {
+        self.cosine_floor = Some(floor);
+        self
+    }
+}
+
+impl Default for EvalScoringConfig {
+    fn default() -> Self {
+        let imp = ScoringConfig::DEFAULT.importance;
+        Self {
+            importance_base: imp.base,
+            importance_divisor: imp.divisor,
+            importance_clamp_lo: imp.clamp_lo,
+            importance_clamp_hi: imp.clamp_hi,
+            cosine_floor: ScoringConfig::DEFAULT.cosine_floor,
         }
     }
 }
@@ -167,13 +237,15 @@ impl EvalStore {
         agent_id: &str,
         scope: EvalScope,
         k_final: usize,
+        scoring: EvalScoringConfig,
     ) -> Result<Vec<EvalHit>, EvalError> {
-        let hits = search_all_memories(
+        let hits = search_all_memories_with_scoring(
             &self.0,
             embedding,
             agent_id,
             scope.into_search_scope(),
             k_final,
+            &scoring.into_scoring_config(),
         )
         .await
         .map_err(|e| EvalError::Search(e.to_string()))?;
@@ -311,6 +383,34 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eval_scoring_config_default_matches_scoring_config_default_field_for_field() {
+        assert_eq!(
+            EvalScoringConfig::default().into_scoring_config(),
+            crate::memory::score::ScoringConfig::DEFAULT,
+            "the sweep's implicit zero point must reproduce today's baseline exactly"
+        );
+    }
+
+    #[test]
+    fn with_importance_span_overrides_only_the_importance_fields() {
+        let base = EvalScoringConfig::default();
+        let spanned = base.with_importance_span(0.7, 1.0);
+        assert_ne!(spanned.importance_base, base.importance_base);
+        assert_ne!(spanned.importance_divisor, base.importance_divisor);
+        assert_eq!(spanned.importance_clamp_lo, base.importance_clamp_lo);
+        assert_eq!(spanned.importance_clamp_hi, base.importance_clamp_hi);
+        assert_eq!(spanned.cosine_floor, base.cosine_floor, "must not touch the unrelated axis");
+    }
+
+    #[test]
+    fn with_cosine_floor_overrides_only_the_cosine_floor() {
+        let base = EvalScoringConfig::default();
+        let floored = base.with_cosine_floor(0.8625);
+        assert_eq!(floored.cosine_floor, Some(0.8625));
+        assert_eq!(floored.importance_base, base.importance_base, "must not touch the unrelated axis");
+    }
 
     #[test]
     fn cosine_of_identical_vectors_is_one() {
