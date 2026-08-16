@@ -48,6 +48,10 @@ impl EvalScope {
             memory: self.memory,
             episodic: self.episodic,
             procedural: self.procedural,
+            // rag-eval never carries a project — its whole corpus is one
+            // unscoped pool, so this keeps every query bit-identical to
+            // retrieval before project scoping existed.
+            project_id: None,
         }
     }
 }

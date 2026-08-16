@@ -90,25 +90,52 @@ pub(crate) fn format_skill_hits(hits: &[RankedHit]) -> String {
 /// show it: a low `returned` count is equally consistent with "the corpus
 /// genuinely has fewer matching rows" as with "another agent's rows starved
 /// the pool", so this only makes the symptom visible, not the diagnosis.
+///
+/// `requested` is always the pool size the caller asked for, never the wider
+/// window a starved table was re-queried with — otherwise the denominator
+/// moves under the ratio and a rescued query reads as the worst one in the
+/// log. `retried` carries that fact separately, and only the tables it
+/// applies to are named, so a line with no marker means no table needed one.
 pub(crate) fn format_pool_survival(
     requested: (usize, usize, usize),
     returned: (usize, usize, usize),
+    retried: (bool, bool, bool),
 ) -> String {
-    format!(
+    let base = format!(
         "pool_req=({}+{}+{}) pool_ret=({}+{}+{})",
         requested.0, requested.1, requested.2, returned.0, returned.1, returned.2,
-    )
+    );
+    let names: Vec<&str> = [("mem", retried.0), ("epi", retried.1), ("pro", retried.2)]
+        .into_iter()
+        .filter_map(|(name, did)| did.then_some(name))
+        .collect();
+    if names.is_empty() {
+        base
+    } else {
+        format!("{base} retry=({})", names.join(","))
+    }
 }
 
 // ---------------------------------------------------------------------------
-// set_importance — D-E: single-statement UPDATE, atomic recompute via
-// compute_tier (arity-4 UDF, promote-only — tier.rs:104). D-B: the 4th arg
-// to compute_tier is the `memory_type` COLUMN for `memory`, and the literal
-// 'episodic_trajectory' / 'procedural_skill' for the other two tables
-// (mirrors store_insert.rs:241's INSERT-time literal). `importance` is set
-// unconditionally; `tier` stays promote-only via compute_tier itself.
-// `deleted_at IS NULL` makes this a no-op (0 rows) on soft-deleted rows —
-// locked design decision (open question in design.md), not an error.
+// set_importance — one UPDATE per table, with the tier recomputed inside the
+// same statement rather than read-modify-written from Rust: importance and
+// tier are derived from each other, and splitting them into two statements
+// would leave a window where a concurrent reader sees one updated and the
+// other stale.
+//
+// The 4th argument to `compute_tier` is the `memory_type` COLUMN on `memory`
+// but a hardcoded literal on the other two, because those tables have no such
+// column — the literal is the same value `store_insert.rs` writes at INSERT
+// time, so a tier recomputed here matches the one computed at ingest.
+//
+// `importance` is set unconditionally; `tier` can only ever move up, because
+// `compute_tier` itself is promote-only (see `tier.rs`) — lowering importance
+// must not silently discard a tier a row earned through access.
+//
+// `deleted_at IS NULL` makes this a 0-row no-op on an already-deleted row,
+// deliberately, not an error: the caller is adjusting metadata on a row that
+// no longer participates in retrieval, and nothing it could do with an error
+// differs from what it does with a 0.
 // ---------------------------------------------------------------------------
 
 const SET_IMPORTANCE_SQL_MEMORY: &str = "\
@@ -178,9 +205,20 @@ const DELETE_SQL_EPISODIC: &str =
 const DELETE_SQL_PROCEDURAL: &str =
     "UPDATE procedural_skill SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL";
 
+const DELETE_VEC_MEMORY: &str = "DELETE FROM memory_vectors WHERE rowid = ?1";
+const DELETE_VEC_EPISODIC: &str = "DELETE FROM episodic_vectors WHERE rowid = ?1";
+const DELETE_VEC_PROCEDURAL: &str = "DELETE FROM procedural_vectors WHERE rowid = ?1";
+
 /// Soft-deletes the row `id` in the table selected by `kind` by stamping
-/// `deleted_at = now_ms`. Returns the number of rows affected (`0` when
-/// `id` doesn't exist in that table or was already deleted — idempotent).
+/// `deleted_at = now_ms`, and prunes its vector row in the same transaction.
+/// Returns the number of rows affected by the UPDATE (`0` when `id` doesn't
+/// exist in that table or was already deleted — idempotent).
+///
+/// The vector DELETE runs unconditionally, never gated on the UPDATE's row
+/// count: a point delete on an absent rowid is a 0-row no-op, not an error,
+/// and running it every time means a row soft-deleted before this code
+/// existed gets its orphaned vector swept the next time anyone calls delete
+/// on it — no separate backfill needed.
 pub(crate) async fn delete_memory_core(
     store: &MemoryStore,
     id: i64,
@@ -190,15 +228,24 @@ pub(crate) async fn delete_memory_core(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64;
-    let sql = match kind {
-        MemoryKind::Memory => DELETE_SQL_MEMORY,
-        MemoryKind::Episodic => DELETE_SQL_EPISODIC,
-        MemoryKind::Procedural => DELETE_SQL_PROCEDURAL,
+    // Exhaustive match, not string interpolation: a new MemoryKind variant
+    // without a table pair here is a compile error, never a runtime SQL
+    // injection surface.
+    let (row_sql, vec_sql) = match kind {
+        MemoryKind::Memory => (DELETE_SQL_MEMORY, DELETE_VEC_MEMORY),
+        MemoryKind::Episodic => (DELETE_SQL_EPISODIC, DELETE_VEC_EPISODIC),
+        MemoryKind::Procedural => (DELETE_SQL_PROCEDURAL, DELETE_VEC_PROCEDURAL),
     };
 
     store
         .conn
-        .call(move |c| c.execute(sql, rusqlite::params![now_ms, id]))
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let affected = tx.execute(row_sql, rusqlite::params![now_ms, id])?;
+            tx.execute(vec_sql, rusqlite::params![id])?;
+            tx.commit()?;
+            Ok(affected)
+        })
         .await
         .map_err(|e| match e {
             tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
@@ -210,9 +257,11 @@ pub(crate) async fn delete_memory_core(
 }
 
 // ---------------------------------------------------------------------------
-// list_memories — DTO + params (Task 4.1). Per-table query, not the
-// `all_memories` view (the view lacks `memory_type` and can't filter it —
-// requirement in spec.md). `summary` is the table-specific content column:
+// list_memories — one query per physical table rather than the `all_memories`
+// view: the view does not carry `memory_type`, so a caller filtering on it
+// could not be served from the view at all, and filtering by memory type is
+// something this endpoint has to support.
+// `summary` is the table-specific content column:
 // `content` (memory) | `task` (episodic) | `skill_name` (procedural).
 // ---------------------------------------------------------------------------
 
@@ -777,12 +826,40 @@ mod tests {
     #[test]
     fn format_pool_survival_renders_both_triples() {
         assert_eq!(
-            format_pool_survival((30, 5, 5), (28, 5, 2)),
+            format_pool_survival((30, 5, 5), (28, 5, 2), (false, false, false)),
             "pool_req=(30+5+5) pool_ret=(28+5+2)"
         );
     }
 
-    // ── Lote 2 — set_importance_core (Tasks 2.1–2.6) ─────────────────────────
+    // A returned count below the requested one reads as "the corpus is thin"
+    // until you know whether a wider window was already tried. Naming the
+    // tables that retried is what separates a starved pool that recovered
+    // from one that was never crowded to begin with.
+    #[test]
+    fn format_pool_survival_names_the_tables_that_retried() {
+        assert_eq!(
+            format_pool_survival((30, 5, 5), (28, 5, 2), (true, false, true)),
+            "pool_req=(30+5+5) pool_ret=(28+5+2) retry=(mem,pro)"
+        );
+        assert_eq!(
+            format_pool_survival((30, 5, 5), (28, 5, 2), (false, true, false)),
+            "pool_req=(30+5+5) pool_ret=(28+5+2) retry=(epi)"
+        );
+    }
+
+    // The requested triple is the pool size the caller asked for, never the
+    // widened window a retry ran with. Reporting the widened number would make
+    // the survival ratio look catastrophic exactly on the queries the retry
+    // just rescued.
+    #[test]
+    fn format_pool_survival_denominator_survives_a_retry() {
+        assert_eq!(
+            format_pool_survival((30, 5, 5), (5, 5, 5), (true, false, false)),
+            "pool_req=(30+5+5) pool_ret=(5+5+5) retry=(mem)"
+        );
+    }
+
+    // ── set_importance_core ──────────────────────────────────────────────────
     //
     // Seed helpers mirror `memory/maintenance.rs`'s `seed_row` pattern: a
     // monotonic NONCE keeps `episodic_trajectory.session_id` /
@@ -1142,7 +1219,175 @@ mod tests {
         );
     }
 
-    // ── trajectory-miner-fase-4 Lote 1 — format_skill_hits (Task 1.1) ────────
+    // ── delete_memory_core — vector pruning on soft-delete ───────────────────
+
+    fn dummy_embedding_384() -> Vec<u8> {
+        vec![0u8; 384 * 4]
+    }
+
+    async fn seed_memory_row_with_vector(store: &MemoryStore) -> i64 {
+        let emb = dummy_embedding_384();
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<i64> {
+                let tx = c.transaction()?;
+                tx.execute(
+                    "INSERT INTO memory \
+                     (scope, agent_id, content, memory_type, tier, importance, \
+                      created_at, last_modified_at, last_accessed_at, \
+                      created_by_type, created_by_ref) \
+                     VALUES ('agent', 'test-agent', 'seed content', 'chat_message', \
+                             3, 5.0, 0, 0, 0, 'agent', '')",
+                    [],
+                )?;
+                let id = tx.last_insert_rowid();
+                tx.execute(
+                    "INSERT INTO memory_vectors(rowid, embedding) VALUES (?, ?)",
+                    rusqlite::params![id, emb],
+                )?;
+                tx.commit()?;
+                Ok(id)
+            })
+            .await
+            .expect("seed_memory_row_with_vector failed")
+    }
+
+    async fn seed_episodic_row_with_vector(store: &MemoryStore) -> i64 {
+        let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
+        let emb = dummy_embedding_384();
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<i64> {
+                let tx = c.transaction()?;
+                tx.execute(
+                    "INSERT INTO episodic_trajectory \
+                     (scope, agent_id, session_id, task, tier, importance, \
+                      created_at, last_modified_at, last_accessed_at, \
+                      created_by_type, created_by_ref) \
+                     VALUES ('agent', 'test-agent', ?1, 'seed task', 3, 5.0, \
+                             0, 0, 0, 'agent', '')",
+                    rusqlite::params![format!("sess-vec-{nonce}")],
+                )?;
+                let id = tx.last_insert_rowid();
+                tx.execute(
+                    "INSERT INTO episodic_vectors(rowid, embedding) VALUES (?, ?)",
+                    rusqlite::params![id, emb],
+                )?;
+                tx.commit()?;
+                Ok(id)
+            })
+            .await
+            .expect("seed_episodic_row_with_vector failed")
+    }
+
+    async fn seed_procedural_row_with_vector(store: &MemoryStore) -> i64 {
+        let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
+        let emb = dummy_embedding_384();
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<i64> {
+                let tx = c.transaction()?;
+                tx.execute(
+                    "INSERT INTO procedural_skill \
+                     (scope, agent_id, skill_name, trigger, tier, importance, \
+                      promoted_at, source_trajectory_ids, \
+                      created_at, last_modified_at, last_accessed_at, \
+                      created_by_type, created_by_ref) \
+                     VALUES ('agent', 'test-agent', ?1, 'seed trigger', 1, 8.0, \
+                             0, '[]', 0, 0, 0, 'agent', '')",
+                    rusqlite::params![format!("skill-vec-{nonce}")],
+                )?;
+                let id = tx.last_insert_rowid();
+                tx.execute(
+                    "INSERT INTO procedural_vectors(rowid, embedding) VALUES (?, ?)",
+                    rusqlite::params![id, emb],
+                )?;
+                tx.commit()?;
+                Ok(id)
+            })
+            .await
+            .expect("seed_procedural_row_with_vector failed")
+    }
+
+    async fn vector_row_count(store: &MemoryStore, vectors_table: &'static str, id: i64) -> i64 {
+        let sql = format!("SELECT COUNT(*) FROM {vectors_table} WHERE rowid = ?1");
+        store
+            .conn
+            .call(move |c| c.query_row(&sql, [id], |r| r.get(0)))
+            .await
+            .unwrap()
+    }
+
+    // Soft-deleting must not leave the vector row behind: a vector with no
+    // live parent still costs the vec0 scan on every future query, forever,
+    // for a row nothing can ever return again.
+    #[tokio::test]
+    async fn delete_memory_removes_vector_row_all_kinds() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+
+        let mem_id = seed_memory_row_with_vector(&store).await;
+        delete_memory_core(&store, mem_id, MemoryKind::Memory).await.unwrap();
+        assert_eq!(
+            vector_row_count(&store, "memory_vectors", mem_id).await,
+            0,
+            "memory_vectors row must be gone after soft-delete"
+        );
+
+        let epi_id = seed_episodic_row_with_vector(&store).await;
+        delete_memory_core(&store, epi_id, MemoryKind::Episodic).await.unwrap();
+        assert_eq!(
+            vector_row_count(&store, "episodic_vectors", epi_id).await,
+            0,
+            "episodic_vectors row must be gone after soft-delete"
+        );
+
+        let proc_id = seed_procedural_row_with_vector(&store).await;
+        delete_memory_core(&store, proc_id, MemoryKind::Procedural).await.unwrap();
+        assert_eq!(
+            vector_row_count(&store, "procedural_vectors", proc_id).await,
+            0,
+            "procedural_vectors row must be gone after soft-delete"
+        );
+    }
+
+    // Re-running delete on an already soft-deleted row must still clean up a
+    // vector the first delete missed (e.g. one soft-deleted before this
+    // change shipped) — the UPDATE affecting 0 rows must not gate the DELETE.
+    #[tokio::test]
+    async fn delete_memory_idempotent_self_heals_orphan_vector() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let id = seed_memory_row_with_vector(&store).await;
+
+        // Simulate a row soft-deleted before vector pruning existed: stamp
+        // deleted_at directly, bypassing delete_memory_core, so the vector
+        // row is left orphaned exactly like a pre-existing production row.
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE memory SET deleted_at = 1 WHERE id = ?1",
+                    rusqlite::params![id],
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            vector_row_count(&store, "memory_vectors", id).await,
+            1,
+            "test setup: the vector row must still be present before self-heal"
+        );
+
+        let affected = delete_memory_core(&store, id, MemoryKind::Memory).await.unwrap();
+
+        assert_eq!(affected, 0, "the row was already deleted, so the UPDATE affects 0 rows");
+        assert_eq!(
+            vector_row_count(&store, "memory_vectors", id).await,
+            0,
+            "the orphaned vector must be pruned even though the row update affected 0 rows"
+        );
+    }
+
+    // ── format_skill_hits ────────────────────────────────────────────────────
 
     fn make_kind_hit(kind: crate::memory::TableKind) -> RankedHit {
         RankedHit {

@@ -1,4 +1,4 @@
-//! Contradiction detection for the RAG sycophancy guard (Phase 6 — REQ-01, REQ-02, REQ-03).
+//! Contradiction detection for the RAG sycophancy guard.
 //!
 //! Detects existing memory rows that are semantically close (L2 distance < threshold)
 //! to a candidate embedding. Called in `worker.rs` between embed and insert so that
@@ -13,27 +13,37 @@ use crate::memory::vector::to_unit;
 
 /// L2 distance below which two embeddings are considered contradictory.
 ///
-/// LOCKED decision D1 (design §LOCKED). Value 0.20 is a conservative starting
-/// point; **needs empirical tuning post-model-load** since the FakeEmbedder used
-/// in tests is non-semantic (SipHash+LCG — NL pairs carry no meaning).
+/// 0.20 is deliberately conservative: it is cheaper to miss a contradiction
+/// than to flag two unrelated memories as disputing each other, because a
+/// dispute demotes both in retrieval scoring. It is NOT a measured value and
+/// re-tuning it is not a matter of taste — the tests here run on FakeEmbedder
+/// (SipHash + LCG), whose distances carry no semantics, so a real number can
+/// only come from re-measuring labelled pairs against the production embedder.
 pub(crate) const CONTRADICTION_THRESHOLD: f32 = 0.20;
 
 /// Return the IDs of existing memory rows whose embedding is within
-/// `CONTRADICTION_THRESHOLD` L2 distance of `embedding`, scoped to `agent_id`.
+/// `CONTRADICTION_THRESHOLD` L2 distance of `embedding`, scoped to `agent_id`
+/// and, when given, `project_id`.
 ///
-/// Memory-only scope (LOCKED D4 — episodic and procedural excluded).
+/// Deliberately searches `memory` only. An episodic trajectory records what
+/// happened and a procedural skill records how something is done — neither
+/// asserts a claim, so neither can contradict one; widening the scope would
+/// only add near-neighbours that can never legitimately be disputed.
 /// Errors are swallowed as `log::warn!` — a detection failure must never abort ingest.
 /// Self-match is impossible: the new row is not yet in the DB at hook time.
 pub(crate) async fn detect_contradiction(
     store: &MemoryStore,
     embedding: &[f32],
     agent_id: &str,
+    project_id: Option<&str>,
 ) -> Vec<i64> {
-    // Memory-only scope per LOCKED D4; k=5 candidates from vec0.
+    // Only the memory pool is requested (see above); k=5 is a candidate budget,
+    // not a result count — the threshold below decides what actually disputes.
     let scope = SearchScope {
         memory: Some(5),
         episodic: None,
         procedural: None,
+        project_id: project_id.map(str::to_owned),
     };
     match search_all_memories(store, embedding, agent_id, scope, 5).await {
         Ok(hits) => hits
@@ -104,8 +114,6 @@ mod tests {
             .unwrap()
     }
 
-    // ── T08 [TEST] REQ-01: no-contradiction → empty Vec ─────────────────────
-
     /// Far vectors (large L2) must not trigger contradiction detection.
     #[tokio::test]
     async fn detect_contradiction_far_vectors_returns_empty() {
@@ -127,11 +135,9 @@ mod tests {
 
         insert_row(&store, "agent-far", &base).await;
 
-        let ids = detect_contradiction(&store, &query, "agent-far").await;
+        let ids = detect_contradiction(&store, &query, "agent-far", None).await;
         assert!(ids.is_empty(), "far vectors must not be flagged; got {ids:?}");
     }
-
-    // ── T09 [TEST] REQ-01,02: near vector → returns stored id ───────────────
 
     /// Near vectors (L2 < CONTRADICTION_THRESHOLD) must be detected.
     #[tokio::test]
@@ -156,7 +162,7 @@ mod tests {
 
         let stored_id = insert_row(&store, "agent-near", &base).await;
 
-        let ids = detect_contradiction(&store, &query, "agent-near").await;
+        let ids = detect_contradiction(&store, &query, "agent-near", None).await;
         assert!(
             ids.contains(&stored_id),
             "stored_id={stored_id} must be in contradiction ids={ids:?}"
@@ -167,7 +173,7 @@ mod tests {
     async fn detect_contradiction_empty_db_returns_empty() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let base = base_vec(3);
-        let ids = detect_contradiction(&store, &base, "agent-empty").await;
+        let ids = detect_contradiction(&store, &base, "agent-empty", None).await;
         assert!(ids.is_empty(), "empty DB must yield empty contradiction ids");
     }
 
@@ -179,14 +185,12 @@ mod tests {
         insert_row(&store, "agent-a", &base).await;
         // Query with "agent-b" → different scope → empty
         let query = near(&base, 0.05);
-        let ids = detect_contradiction(&store, &query, "agent-b").await;
+        let ids = detect_contradiction(&store, &query, "agent-b", None).await;
         assert!(
             ids.is_empty(),
             "row from agent-a must not appear for agent-b; got {ids:?}"
         );
     }
-
-    // ── T11 [TEST] REQ-03: eval harness — recall ≥ 0.85 ────────────────────
 
     /// Manufactures ≥20 labeled (contradicting, stored, query) pairs.
     /// Contradicting pairs: stored=base_i, query=near(base_i, 0.10) → L2=0.10 < 0.20 ✓
@@ -227,7 +231,7 @@ mod tests {
 
         for (idx, (contradicting, _, query)) in fixtures.iter().enumerate() {
             let agent_id = format!("eval-agent-{idx}");
-            let ids = detect_contradiction(&store, query, &agent_id).await;
+            let ids = detect_contradiction(&store, query, &agent_id, None).await;
             let expected_id = stored_ids[idx].unwrap();
             let flagged = ids.contains(&expected_id);
 

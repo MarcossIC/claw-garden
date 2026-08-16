@@ -8,11 +8,19 @@ use crate::memory::vector::to_unit;
 use crate::memory::{MemoryError, MemoryStore, TableKind};
 
 /// Per-table k_pool selection. `None` means "skip this table entirely".
-#[derive(Debug, Clone, Copy)]
+///
+/// `project_id: None` means unscoped — every caller that does not thread a
+/// project through (rag-eval, and any test that builds a scope directly)
+/// keeps seeing the exact pre-scoping row set, because the SQL guard this
+/// drives is `?4 IS NULL OR ...`, a tautology when unset. `Copy` is dropped
+/// because `project_id` owns a `String`; every constructor still hands back
+/// an independent value, so callers pay nothing for it.
+#[derive(Debug, Clone)]
 pub(crate) struct SearchScope {
     pub memory: Option<usize>,
     pub episodic: Option<usize>,
     pub procedural: Option<usize>,
+    pub project_id: Option<String>,
 }
 
 impl SearchScope {
@@ -21,6 +29,7 @@ impl SearchScope {
             memory: Some(30),
             episodic: Some(5),
             procedural: Some(5),
+            project_id: None,
         }
     }
     /// Procedural-only scope — (None, None, Some(10)).
@@ -29,6 +38,7 @@ impl SearchScope {
             memory: None,
             episodic: None,
             procedural: Some(10),
+            project_id: None,
         }
     }
     /// Scope preset for surfacing factual-pivot candidates. Not currently
@@ -40,7 +50,15 @@ impl SearchScope {
             memory: Some(5),
             episodic: None,
             procedural: Some(5),
+            project_id: None,
         }
+    }
+
+    /// Scopes this query to `project_id`, owning a copy of it. `None` keeps
+    /// the scope unscoped — same as never calling this.
+    pub(crate) fn with_project(mut self, project_id: Option<&str>) -> Self {
+        self.project_id = project_id.map(str::to_owned);
+        self
     }
 }
 
@@ -77,8 +95,14 @@ pub(crate) fn serialize_f32_query_pub(v: &[f32]) -> Vec<u8> {
 }
 
 // SQL for memory table KNN
-// NOTE: vec0 requires LIMIT directly on the vec0 query. We use a subquery to get
-// the top-k by distance from vec0, then join and filter in the outer query.
+// The neighbour count reaches vec0 as a constraint on the virtual table itself
+// (`knn.k = ?2`), not as a LIMIT and not through a subquery: across a join a
+// LIMIT would bound the already-filtered result, which is a different number
+// than the one vec0 needs to size its scan. Everything the WHERE clause below
+// tests — status, deleted_at, agent, project — is therefore applied to rows
+// vec0 has ALREADY cut down to k, so k is a candidate-pool budget rather than
+// the number of results. `knn_one` documents what happens when those predicates
+// empty that pool.
 //
 // Stored stamps (`last_accessed_at`) are milliseconds and `exp_decay`'s first
 // argument is a whole number of seconds, so both sides of the subtraction are
@@ -102,6 +126,7 @@ const SEARCH_SQL_MEMORY: &str = "
       AND m.status IN ('active', 'disputed')
       AND m.deleted_at IS NULL
       AND m.agent_id = ?3
+      AND (?4 IS NULL OR m.project_id = ?4 OR m.project_id IS NULL OR m.memory_type = 'user_preference')
     ORDER BY score DESC
 ";
 
@@ -123,6 +148,7 @@ const SEARCH_SQL_EPISODIC: &str = "
       AND epi.status IN ('active', 'disputed')
       AND epi.deleted_at IS NULL
       AND epi.agent_id = ?3
+      AND (?4 IS NULL OR epi.project_id = ?4 OR epi.project_id IS NULL)
     ORDER BY score DESC
 ";
 
@@ -144,152 +170,314 @@ const SEARCH_SQL_PROCEDURAL: &str = "
       AND pro.status IN ('active', 'disputed')
       AND pro.deleted_at IS NULL
       AND pro.agent_id = ?3
+      AND (?4 IS NULL OR pro.project_id = ?4 OR pro.project_id IS NULL)
     ORDER BY score DESC
 ";
 
-async fn knn_memory(
+// How many rows THIS caller could receive at most, counted up to a ceiling of
+// `?1` (the pool size) because nothing above that changes any decision.
+//
+// Counting the vector table instead would answer a different question — "does
+// the corpus hold k vectors" — and that question is blind to who is asking.
+// On a database holding several projects' rows for one agent it is answered
+// "yes" permanently, while the caller's own eligible set may be three rows
+// wide, so a pool that can never be filled reads as a pool that was starved.
+// These predicates are the same ones the KNN query applies after vec0's cut,
+// so the number they produce is the ceiling on what any window could return.
+//
+// `agent_id = ?2` plus `deleted_at IS NULL` is exactly the leading column and
+// the partial predicate of each table's own index — `idx_memory_agent_active`,
+// `idx_epi_agent_active`, `idx_proc_agent_active` (`V1__init.sql:37`, `:96`,
+// `:147`) — so the count rides the matching index for whichever table this
+// constant serves, and the LIMIT stops it at k rather than walking the
+// agent's whole history.
+const ELIGIBLE_SQL_MEMORY: &str = "
+    SELECT COUNT(*) FROM (
+        SELECT m.id FROM memory m
+        WHERE m.status IN ('active', 'disputed')
+          AND m.deleted_at IS NULL
+          AND m.agent_id = ?2
+          AND (?3 IS NULL OR m.project_id = ?3 OR m.project_id IS NULL OR m.memory_type = 'user_preference')
+        LIMIT ?1
+    )
+";
+
+const ELIGIBLE_SQL_EPISODIC: &str = "
+    SELECT COUNT(*) FROM (
+        SELECT epi.id FROM episodic_trajectory epi
+        WHERE epi.status IN ('active', 'disputed')
+          AND epi.deleted_at IS NULL
+          AND epi.agent_id = ?2
+          AND (?3 IS NULL OR epi.project_id = ?3 OR epi.project_id IS NULL)
+        LIMIT ?1
+    )
+";
+
+const ELIGIBLE_SQL_PROCEDURAL: &str = "
+    SELECT COUNT(*) FROM (
+        SELECT pro.id FROM procedural_skill pro
+        WHERE pro.status IN ('active', 'disputed')
+          AND pro.deleted_at IS NULL
+          AND pro.agent_id = ?2
+          AND (?3 IS NULL OR pro.project_id = ?3 OR pro.project_id IS NULL)
+        LIMIT ?1
+    )
+";
+
+/// vec0 refuses to bind a `k` above this — it is the engine's own ceiling, not
+/// a policy choice made here. A widened window has to be clamped to it, or the
+/// second pass fails outright instead of simply returning fewer rows.
+const VEC0_MAX_K: usize = 4096;
+
+/// Everything that differs between the three vector-backed tables. Every field
+/// is static, so the descriptor is a `Copy` value the row-mapping closure can
+/// capture — one function over three descriptors instead of three functions
+/// that have to be kept identical by hand.
+#[derive(Clone, Copy)]
+struct KnnTable {
+    sql: &'static str,
+    eligible_sql: &'static str,
+    kind: TableKind,
+    /// Names the table in the "connection closed" message. The three branches
+    /// run concurrently, so a single shared message would leave the one fact
+    /// worth logging — which table lost the connection — unrecoverable.
+    label: &'static str,
+}
+
+const KNN_MEMORY: KnnTable = KnnTable {
+    sql: SEARCH_SQL_MEMORY,
+    eligible_sql: ELIGIBLE_SQL_MEMORY,
+    kind: TableKind::Memory,
+    label: "knn_memory",
+};
+
+const KNN_EPISODIC: KnnTable = KnnTable {
+    sql: SEARCH_SQL_EPISODIC,
+    eligible_sql: ELIGIBLE_SQL_EPISODIC,
+    kind: TableKind::Episodic,
+    label: "knn_episodic",
+};
+
+const KNN_PROCEDURAL: KnnTable = KnnTable {
+    sql: SEARCH_SQL_PROCEDURAL,
+    eligible_sql: ELIGIBLE_SQL_PROCEDURAL,
+    kind: TableKind::Procedural,
+    label: "knn_procedural",
+};
+
+/// One table's contribution to the merged result, plus how many KNN queries
+/// producing it took. Carried out rather than logged here so the retrieval
+/// line stays a single record of the whole search.
+///
+/// A count rather than a "did it retry" flag, because the row set cannot stand
+/// in for it: a recovery that widened the window repeatedly would return the
+/// same rows as one that widened it once, and a flag would read `true` for
+/// both. The number is the only thing that separates them, so it is the thing
+/// tests assert on.
+struct KnnOutcome {
+    hits: Vec<RankedHit>,
+    passes: usize,
+}
+
+impl KnnOutcome {
+    /// A table the scope switched off: it asked for nothing, so nothing was
+    /// queried and no pass ran.
+    fn skipped() -> Self {
+        Self { hits: Vec::new(), passes: 0 }
+    }
+
+    /// Whether recovery happened — a single pass is the ordinary path, and a
+    /// table that was never queried did not recover from anything.
+    fn retried(&self) -> bool {
+        self.passes > 1
+    }
+}
+
+/// The window a starved query is re-run with. Four times the pool gives a
+/// window crowded by ineligible rows real room to recover without degenerating
+/// into a full-table scan on a large corpus.
+fn retry_window(k: usize) -> usize {
+    k.saturating_mul(4).min(VEC0_MAX_K)
+}
+
+/// Runs one table's KNN query, recovering once from a window that the WHERE
+/// clause emptied out.
+///
+/// vec0 hands the join exactly `min(k, live vectors)` rows, and every predicate
+/// in the SQL above is applied after that cut, so a short result has two very
+/// different causes and only one of them a second query can fix. The one that
+/// separates them is how many rows this caller is eligible for at all — not
+/// how many the table holds. On a database carrying several projects for one
+/// agent those two numbers come apart permanently: the table stays full while
+/// the caller's own set stays small, and a rule reading the table alone would
+/// buy a second scan on every search forever to re-find rows the first scan
+/// had already delivered.
+///
+/// So the shortfall is measured against what was reachable:
+///
+/// - the pool came back full → nothing was filtered, and the count is not even
+///   queried;
+/// - fewer came back, but that is everything the caller is eligible for → the
+///   corpus does not hold the rest, whether because it is young or because the
+///   rest belongs to someone else. A wider window returns the identical rows;
+/// - fewer came back than the caller is eligible for → the window was crowded
+///   by rows the join then threw away, and eligible rows are sitting past the
+///   k-th neighbour where only a wider window reaches them.
+///
+/// What this does NOT promise is that the second pass is rare for every
+/// caller. A caller whose eligible rows persistently rank behind a crowd of
+/// ineligible ones will keep paying for the retry, and may still come back
+/// short: widening is four times the pool, not the whole table. What it does
+/// guarantee is that nobody pays for a second pass that provably cannot return
+/// a single extra row.
+///
+/// That guarantee holds only if `reachable` never overcounts what a wider
+/// window could actually surface, which needs every row it counts in the
+/// parent table to have a matching row in the vector table — a parent row
+/// without one would inflate `reachable` past what KNN can ever return, and
+/// the caller would pay a second pass on every one of its searches that a
+/// third or fourth pass could not fix either. Nothing in the schema enforces
+/// that pairing: no trigger, no foreign key ties `memory_vectors` (or the
+/// episodic/procedural equivalents) to its parent table. It holds today
+/// because every production insert path writes the parent row and its vector
+/// row together, in one transaction (`store_insert.rs`'s
+/// `insert_memory_with_vector`, `insert_episodic_trajectory`, and the
+/// procedural promote path, which short-circuits into `SkippedNoEmbedding`
+/// before touching the parent row when there is no vector to pair it with),
+/// and a delete only removes a row's vector after that row is already
+/// soft-deleted, so a live row is never left unpaired. A future insert path
+/// that skipped that pairing would break this invariant silently.
+///
+/// The recovery is a single branch, deliberately, not a loop that widens until
+/// it fills the pool: the second pass either finds the missing rows or the
+/// corpus does not hold them, and iterating would burn scans discovering that
+/// a third time. `KnnOutcome::passes` carries how many queries actually ran,
+/// so that stays a measured property rather than a claim. The widened result
+/// is trimmed back to k so the pool stays a budget for finding candidates
+/// rather than a licence to return more of them.
+async fn knn_one(
     store: &MemoryStore,
+    table: KnnTable,
     q_bytes: &[u8],
     agent_id: &str,
+    project_id: Option<&str>,
     k: usize,
-) -> Result<Vec<RankedHit>, MemoryError> {
+) -> Result<KnnOutcome, MemoryError> {
     let q = q_bytes.to_vec();
     let agent = agent_id.to_string();
-    let k_i64 = k as i64;
+    let proj = project_id.map(str::to_owned);
     store
         .conn
         .call(move |c| {
-            let mut stmt = c.prepare(SEARCH_SQL_MEMORY)?;
-            let rows = stmt.query_map(
-                rusqlite::params![q, k_i64, agent],
-                |row| {
-                    Ok(RankedHit {
-                        id: row.get(0)?,
-                        kind: TableKind::Memory,
-                        content: row.get(1)?,
-                        memory_type: row.get(2)?,
-                        tier: row.get(3)?,
-                        status: row.get(4)?,
-                        distance: row.get(5)?,
-                        created_at: row.get(6)?,
-                        score: row.get(7)?,
-                    })
-                },
-            )?;
-            let mut hits = Vec::new();
-            for row in rows {
-                hits.push(row?);
+            // Probe and both passes share one hop to the DB thread. `run` is a
+            // free function rather than a closure so the row mapping exists in
+            // exactly one place regardless of how many passes happen.
+            //
+            // It owns the pass counter instead of the caller bumping it at each
+            // call site: counted here, the number cannot drift from the number
+            // of queries actually issued, which is the whole reason it is
+            // reported at all.
+            fn run(
+                c: &rusqlite::Connection,
+                table: KnnTable,
+                q: &[u8],
+                agent: &str,
+                proj: &Option<String>,
+                k: usize,
+                passes: &mut usize,
+            ) -> Result<Vec<RankedHit>, rusqlite::Error> {
+                *passes += 1;
+                let mut stmt = c.prepare(table.sql)?;
+                let rows = stmt.query_map(
+                    rusqlite::params![q, k as i64, agent, proj],
+                    |row| {
+                        Ok(RankedHit {
+                            id: row.get(0)?,
+                            kind: table.kind,
+                            content: row.get(1)?,
+                            memory_type: row.get(2)?,
+                            tier: row.get(3)?,
+                            status: row.get(4)?,
+                            distance: row.get(5)?,
+                            created_at: row.get(6)?,
+                            score: row.get(7)?,
+                        })
+                    },
+                )?;
+                let mut hits = Vec::new();
+                for row in rows {
+                    hits.push(row?);
+                }
+                Ok(hits)
             }
-            Ok(hits)
+
+            let mut passes = 0usize;
+            let mut hits = run(c, table, &q, &agent, &proj, k, &mut passes)?;
+            if hits.len() < k {
+                // Capped at k by the SQL's own LIMIT, so this is
+                // `min(k, eligible)` — the most this query could ever return.
+                let reachable: i64 = c.query_row(
+                    table.eligible_sql,
+                    rusqlite::params![k as i64, &agent, &proj],
+                    |row| row.get(0),
+                )?;
+                if hits.len() < reachable as usize {
+                    hits = run(c, table, &q, &agent, &proj, retry_window(k), &mut passes)?;
+                    hits.truncate(k);
+                }
+            }
+            Ok(KnnOutcome { hits, passes })
         })
         .await
         .map_err(|e| match e {
             tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
             tokio_rusqlite::Error::ConnectionClosed => {
-                MemoryError::Backend("connection closed during knn_memory".into())
+                MemoryError::Backend(format!("connection closed during {}", table.label))
             }
             other => MemoryError::Backend(other.to_string()),
         })
 }
 
-async fn knn_episodic(
-    store: &MemoryStore,
-    q_bytes: &[u8],
-    agent_id: &str,
-    k: usize,
-) -> Result<Vec<RankedHit>, MemoryError> {
-    let q = q_bytes.to_vec();
-    let agent = agent_id.to_string();
-    let k_i64 = k as i64;
-    store
-        .conn
-        .call(move |c| {
-            let mut stmt = c.prepare(SEARCH_SQL_EPISODIC)?;
-            let rows = stmt.query_map(
-                rusqlite::params![q, k_i64, agent],
-                |row| {
-                    Ok(RankedHit {
-                        id: row.get(0)?,
-                        kind: TableKind::Episodic,
-                        content: row.get(1)?,
-                        memory_type: row.get(2)?,
-                        tier: row.get(3)?,
-                        status: row.get(4)?,
-                        distance: row.get(5)?,
-                        created_at: row.get(6)?,
-                        score: row.get(7)?,
-                    })
-                },
-            )?;
-            let mut hits = Vec::new();
-            for row in rows {
-                hits.push(row?);
-            }
-            Ok(hits)
-        })
-        .await
-        .map_err(|e| match e {
-            tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
-            tokio_rusqlite::Error::ConnectionClosed => {
-                MemoryError::Backend("connection closed during knn_episodic".into())
-            }
-            other => MemoryError::Backend(other.to_string()),
-        })
+/// Renders the pool-survival fragment of the retrieval line from what each
+/// table was asked for and what it gave back.
+///
+/// The requested side reads the scope, never the window a starved table was
+/// re-queried with: the wider window is a means of filling the pool the caller
+/// asked for, and reporting it would move the denominator under the ratio so
+/// that a rescued search reads as the worst one in the log. A table the scope
+/// switched off contributes 0 on both sides — it asked for nothing and got
+/// nothing, which is not a survival rate of zero.
+fn format_pool_line(
+    scope: &SearchScope,
+    mem: &KnnOutcome,
+    epi: &KnnOutcome,
+    pro: &KnnOutcome,
+) -> String {
+    crate::commands::memory_admin::format_pool_survival(
+        (
+            scope.memory.unwrap_or(0),
+            scope.episodic.unwrap_or(0),
+            scope.procedural.unwrap_or(0),
+        ),
+        (mem.hits.len(), epi.hits.len(), pro.hits.len()),
+        (mem.retried(), epi.retried(), pro.retried()),
+    )
 }
 
-async fn knn_procedural(
-    store: &MemoryStore,
-    q_bytes: &[u8],
-    agent_id: &str,
-    k: usize,
-) -> Result<Vec<RankedHit>, MemoryError> {
-    let q = q_bytes.to_vec();
-    let agent = agent_id.to_string();
-    let k_i64 = k as i64;
-    store
-        .conn
-        .call(move |c| {
-            let mut stmt = c.prepare(SEARCH_SQL_PROCEDURAL)?;
-            let rows = stmt.query_map(
-                rusqlite::params![q, k_i64, agent],
-                |row| {
-                    Ok(RankedHit {
-                        id: row.get(0)?,
-                        kind: TableKind::Procedural,
-                        content: row.get(1)?,
-                        memory_type: row.get(2)?,
-                        tier: row.get(3)?,
-                        status: row.get(4)?,
-                        distance: row.get(5)?,
-                        created_at: row.get(6)?,
-                        score: row.get(7)?,
-                    })
-                },
-            )?;
-            let mut hits = Vec::new();
-            for row in rows {
-                hits.push(row?);
-            }
-            Ok(hits)
-        })
-        .await
-        .map_err(|e| match e {
-            tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
-            tokio_rusqlite::Error::ConnectionClosed => {
-                MemoryError::Backend("connection closed during knn_procedural".into())
-            }
-            other => MemoryError::Backend(other.to_string()),
-        })
-}
-
-/// Top-level KNN orchestrator. Returns up to `k_final` hits sorted DESC by score.
-pub(crate) async fn search_all_memories(
+/// Does the actual work behind `search_all_memories`, plus hands back the
+/// pool-survival line it computed along the way. Split out so a test can
+/// drive the exact call site that builds that line (`format_pool_line`
+/// below) through the real orchestration path instead of re-assembling it
+/// from outcomes the test constructed itself — the public wrapper is nothing
+/// but this function with the second half of the tuple dropped, so nothing
+/// about the split changes what a caller of `search_all_memories` observes.
+async fn search_all_memories_inner(
     store: &MemoryStore,
     embedding: &[f32],
     agent_id: &str,
     scope: SearchScope,
     k_final: usize,
-) -> Result<Vec<RankedHit>, MemoryError> {
+) -> Result<(Vec<RankedHit>, String), MemoryError> {
     // Same funnel every caller shares (prompt_builder.rs, contradiction.rs,
     // eval_api.rs): an unusable query vector means "no direction to search
     // with", which is a caller-input problem, not a store failure — so this
@@ -300,36 +488,44 @@ pub(crate) async fn search_all_memories(
         Ok(v) => v,
         Err(e) => {
             log::warn!("search_all_memories: discarding unusable query vector: {e}");
-            return Ok(Vec::new());
+            return Ok((Vec::new(), String::new()));
         }
     };
 
     let t0 = Instant::now();
     let q_bytes = serialize_f32_query(&unit);
+    // Borrowed once from `scope`, then handed to every branch below by shared
+    // reference — `scope` itself is never moved out of, so this reads fine
+    // even though the struct dropped `Copy` when `project_id` was added.
+    let project_id = scope.project_id.as_deref();
 
     let (mem, epi, pro) = tokio::try_join!(
         async {
             match scope.memory {
-                Some(k) => knn_memory(store, &q_bytes, agent_id, k).await,
-                None => Ok(Vec::new()),
+                Some(k) => knn_one(store, KNN_MEMORY, &q_bytes, agent_id, project_id, k).await,
+                None => Ok(KnnOutcome::skipped()),
             }
         },
         async {
             match scope.episodic {
-                Some(k) => knn_episodic(store, &q_bytes, agent_id, k).await,
-                None => Ok(Vec::new()),
+                Some(k) => knn_one(store, KNN_EPISODIC, &q_bytes, agent_id, project_id, k).await,
+                None => Ok(KnnOutcome::skipped()),
             }
         },
         async {
             match scope.procedural {
-                Some(k) => knn_procedural(store, &q_bytes, agent_id, k).await,
-                None => Ok(Vec::new()),
+                Some(k) => knn_one(store, KNN_PROCEDURAL, &q_bytes, agent_id, project_id, k).await,
+                None => Ok(KnnOutcome::skipped()),
             }
         },
     )?;
 
-    let (mem_returned, epi_returned, pro_returned) = (mem.len(), epi.len(), pro.len());
-    let mut all: Vec<RankedHit> = mem.into_iter().chain(epi).chain(pro).collect();
+    // Built before the merge below consumes the per-table hits, which is also
+    // what lets a test assemble it from real outcomes instead of from numbers
+    // it invented: the requested/returned pairing lives in one place rather
+    // than being reassembled at the log call.
+    let pool_survival = format_pool_line(&scope, &mem, &epi, &pro);
+    let mut all: Vec<RankedHit> = mem.hits.into_iter().chain(epi.hits).chain(pro.hits).collect();
     all.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
@@ -356,20 +552,26 @@ pub(crate) async fn search_all_memories(
         "retrieval={}ms hits={} {} k_final={} dist={} {}",
         elapsed.as_millis(),
         all.len(),
-        crate::commands::memory_admin::format_pool_survival(
-            (
-                scope.memory.unwrap_or(0),
-                scope.episodic.unwrap_or(0),
-                scope.procedural.unwrap_or(0),
-            ),
-            (mem_returned, epi_returned, pro_returned),
-        ),
+        pool_survival,
         k_final,
         crate::commands::memory_admin::format_tier_distribution(&all),
         store.knn_latency().snapshot(),
     );
 
-    Ok(all)
+    Ok((all, pool_survival))
+}
+
+/// Top-level KNN orchestrator. Returns up to `k_final` hits sorted DESC by score.
+pub(crate) async fn search_all_memories(
+    store: &MemoryStore,
+    embedding: &[f32],
+    agent_id: &str,
+    scope: SearchScope,
+    k_final: usize,
+) -> Result<Vec<RankedHit>, MemoryError> {
+    let (hits, _pool_survival) =
+        search_all_memories_inner(store, embedding, agent_id, scope, k_final).await?;
+    Ok(hits)
 }
 
 #[cfg(test)]
@@ -461,6 +663,19 @@ mod tests {
     }
 
     #[test]
+    fn search_scope_with_project_sets_field() {
+        let s = SearchScope::all_default().with_project(Some("proj-1"));
+        assert_eq!(s.project_id, Some("proj-1".to_string()));
+    }
+
+    #[test]
+    fn ctors_default_to_no_project() {
+        assert_eq!(SearchScope::all_default().project_id, None);
+        assert_eq!(SearchScope::procedural_only().project_id, None);
+        assert_eq!(SearchScope::factual_pivots().project_id, None);
+    }
+
+    #[test]
     fn ranked_hit_is_send() {
         fn _s<T: Send>() {}
         _s::<RankedHit>();
@@ -542,7 +757,7 @@ mod tests {
         // coincidentally landed on 4". Calling the pool query directly, before
         // any merge or truncation, tests the scan set in isolation.
         assert_eq!(
-            knn_memory(&store, &emb, "agent-test", 30).await.unwrap().len(),
+            knn_one(&store, KNN_MEMORY, &emb, "agent-test", None, 30).await.unwrap().hits.len(),
             4,
             "the tier-1 row must survive inside the query, before any merge or truncation"
         );
@@ -585,7 +800,11 @@ mod tests {
 
         let q_bytes = serialize_f32_query(&to_unit(&q_vec).unwrap());
         assert_eq!(
-            knn_procedural(&store, &q_bytes, "agent-skill", 5).await.unwrap().len(),
+            knn_one(&store, KNN_PROCEDURAL, &q_bytes, "agent-skill", None, 5)
+                .await
+                .unwrap()
+                .hits
+                .len(),
             1,
             "the procedural pool must return the skill row"
         );
@@ -905,7 +1124,7 @@ mod tests {
     async fn search_respects_scope_none_skips_table() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let q_vec = unit_basis_vec();
-        let scope = SearchScope { memory: None, episodic: None, procedural: None };
+        let scope = SearchScope { memory: None, episodic: None, procedural: None, project_id: None };
         let hits = search_all_memories(&store, &q_vec, "agent-x", scope, 10)
             .await.unwrap();
         assert!(hits.is_empty(), "all scopes None → empty results");
@@ -948,7 +1167,7 @@ mod tests {
         // pre-truncation pool size directly proves k_final is what cuts the
         // result, not a starved pool.
         assert_eq!(
-            knn_memory(&store, &emb, agent, 30).await.unwrap().len(),
+            knn_one(&store, KNN_MEMORY, &emb, agent, None, 30).await.unwrap().hits.len(),
             5,
             "all five must survive the query; k_final is what cuts the result, not the pool"
         );
@@ -1128,5 +1347,881 @@ mod tests {
             "row must NOT be retrievable for a different agent_id — each KNN query filters \
              agent_id = ?3, so cross-agent isolation holds even for episodic rows"
         );
+    }
+
+    // ── project scoping ──
+
+    async fn insert_memory_row_with_project(
+        store: &MemoryStore,
+        agent_id: &str,
+        project_id: Option<&str>,
+        memory_type: &str,
+        content: &str,
+        embedding: Vec<u8>,
+    ) -> i64 {
+        let agent = agent_id.to_string();
+        let project = project_id.map(|p| p.to_string());
+        let memory_type = memory_type.to_string();
+        let content = content.to_string();
+        store
+            .conn
+            .call(move |c| -> Result<i64, rusqlite::Error> {
+                let tx = c.transaction()?;
+                tx.execute(
+                    "INSERT INTO memory (scope, agent_id, project_id, content, memory_type, source,
+                     created_at, created_by_type, created_by_ref,
+                     last_modified_at, last_accessed_at, importance, tier, status)
+                     VALUES ('agent', ?1, ?2, ?3, ?4, 'chat',
+                     0, 'user', ?1, 0, 0, 5.0, 3, 'active')",
+                    params![agent, project, content, memory_type],
+                )?;
+                let id = tx.last_insert_rowid();
+                tx.execute(
+                    "INSERT INTO memory_vectors(rowid, embedding) VALUES (?, ?)",
+                    params![id, embedding],
+                )?;
+                tx.commit()?;
+                Ok(id)
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn insert_episodic_row_with_project(
+        store: &MemoryStore,
+        agent_id: &str,
+        project_id: Option<&str>,
+        session_id: &str,
+        embedding: Vec<f32>,
+    ) -> i64 {
+        use crate::memory::store_insert::{CreatedByType, NewEpisodicTrajectoryRecord};
+        let record = NewEpisodicTrajectoryRecord {
+            scope: "agent",
+            agent_id: Some(agent_id.to_string()),
+            project_id: project_id.map(|p| p.to_string()),
+            session_id: session_id.to_string(),
+            task: "scoped task".to_string(),
+            tool_calls_json: "[]".to_string(),
+            errors_json: "[]".to_string(),
+            resolution: None,
+            success_score: 0.9,
+            created_by_type: CreatedByType::System,
+            created_by_ref: agent_id.to_string(),
+            importance: 5.0,
+            created_at_ms: 0,
+        };
+        store.insert_episodic_trajectory(record, embedding).await.unwrap()
+    }
+
+    async fn insert_procedural_row_with_project(
+        store: &MemoryStore,
+        agent_id: &str,
+        project_id: Option<&str>,
+        skill_name: &str,
+        embedding: Vec<f32>,
+    ) -> i64 {
+        use crate::memory::store_insert::{NewProceduralSkillRecord, PromoteOutcome};
+        let outcome = store
+            .promote_to_procedural_skill(
+                NewProceduralSkillRecord {
+                    agent_id: agent_id.to_string(),
+                    project_id: project_id.map(|p| p.to_string()),
+                    skill_name: skill_name.to_string(),
+                    trigger: format!("trigger-{skill_name}"),
+                    // Dedup key is (agent_id, tool_sequence): distinct per skill_name
+                    // so two rows for the same agent in this test don't collapse
+                    // into one UPDATE instead of two separate inserts.
+                    tool_sequence_json: format!("[\"read\",\"{skill_name}\"]"),
+                    source_trajectory_ids: vec![1],
+                    importance: 8.0,
+                    now_ms: 0,
+                },
+                Some(embedding),
+            )
+            .await
+            .unwrap();
+        match outcome {
+            PromoteOutcome::Inserted(id) => id,
+            other => panic!("expected a fresh insert, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn foreign_project_row_not_returned_memory() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let emb = unit_basis_embedding();
+        let own = insert_memory_row_with_project(
+            &store, "agent-scope", Some("P1"), "chat_message", "own project row", emb.clone(),
+        ).await;
+        let foreign = insert_memory_row_with_project(
+            &store, "agent-scope", Some("P2"), "chat_message", "foreign project row", emb.clone(),
+        ).await;
+
+        let q_vec = unit_basis_vec();
+        let scope = SearchScope::all_default().with_project(Some("P1"));
+        let hits = search_all_memories(&store, &q_vec, "agent-scope", scope, 10).await.unwrap();
+
+        assert!(hits.iter().any(|h| h.id == own), "own-project memory row must appear");
+        assert!(
+            !hits.iter().any(|h| h.id == foreign),
+            "foreign-project memory row must not appear when scoped to a different project"
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_project_row_not_returned_episodic() {
+        use crate::memory::embedder::FakeEmbedder;
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let embedder = FakeEmbedder::default();
+        let emb = embedder.embed("scoped episodic task").await.unwrap();
+        let own = insert_episodic_row_with_project(
+            &store, "agent-scope", Some("P1"), "sess-epi-own", emb.clone(),
+        ).await;
+        let foreign = insert_episodic_row_with_project(
+            &store, "agent-scope", Some("P2"), "sess-epi-foreign", emb.clone(),
+        ).await;
+
+        let scope = SearchScope::all_default().with_project(Some("P1"));
+        let hits = search_all_memories(&store, &emb, "agent-scope", scope, 10).await.unwrap();
+
+        assert!(hits.iter().any(|h| h.id == own && h.kind == TableKind::Episodic), "own-project episodic row must appear");
+        assert!(
+            !hits.iter().any(|h| h.id == foreign && h.kind == TableKind::Episodic),
+            "foreign-project episodic row must not appear when scoped to a different project"
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_project_row_not_returned_procedural() {
+        use crate::memory::embedder::FakeEmbedder;
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let embedder = FakeEmbedder::default();
+        let emb = embedder.embed("scoped procedural trigger").await.unwrap();
+        let own = insert_procedural_row_with_project(
+            &store, "agent-scope", Some("P1"), "skill-own", emb.clone(),
+        ).await;
+        let foreign = insert_procedural_row_with_project(
+            &store, "agent-scope", Some("P2"), "skill-foreign", emb.clone(),
+        ).await;
+
+        let scope = SearchScope::all_default().with_project(Some("P1"));
+        let hits = search_all_memories(&store, &emb, "agent-scope", scope, 10).await.unwrap();
+
+        assert!(hits.iter().any(|h| h.id == own && h.kind == TableKind::Procedural), "own-project procedural row must appear");
+        assert!(
+            !hits.iter().any(|h| h.id == foreign && h.kind == TableKind::Procedural),
+            "foreign-project procedural row must not appear when scoped to a different project"
+        );
+    }
+
+    #[tokio::test]
+    async fn null_project_row_visible_from_scoped_query_memory() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let emb = unit_basis_embedding();
+        let id = insert_memory_row_with_project(
+            &store, "agent-scope-null", None, "chat_message", "null project row", emb.clone(),
+        ).await;
+
+        let q_vec = unit_basis_vec();
+        let scope = SearchScope::all_default().with_project(Some("P1"));
+        let hits = search_all_memories(&store, &q_vec, "agent-scope-null", scope, 10).await.unwrap();
+
+        assert!(
+            hits.iter().any(|h| h.id == id),
+            "a NULL-project memory row must remain visible from a scoped query"
+        );
+    }
+
+    #[tokio::test]
+    async fn null_project_row_visible_from_scoped_query_episodic() {
+        use crate::memory::embedder::FakeEmbedder;
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let embedder = FakeEmbedder::default();
+        let emb = embedder.embed("scoped null episodic task").await.unwrap();
+        let id = insert_episodic_row_with_project(
+            &store, "agent-scope-null", None, "sess-epi-null", emb.clone(),
+        ).await;
+
+        let scope = SearchScope::all_default().with_project(Some("P1"));
+        let hits = search_all_memories(&store, &emb, "agent-scope-null", scope, 10).await.unwrap();
+
+        assert!(
+            hits.iter().any(|h| h.id == id && h.kind == TableKind::Episodic),
+            "a NULL-project episodic row must remain visible from a scoped query"
+        );
+    }
+
+    #[tokio::test]
+    async fn null_project_row_visible_from_scoped_query_procedural() {
+        use crate::memory::embedder::FakeEmbedder;
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let embedder = FakeEmbedder::default();
+        let emb = embedder.embed("scoped null procedural trigger").await.unwrap();
+        let id = insert_procedural_row_with_project(
+            &store, "agent-scope-null", None, "skill-null", emb.clone(),
+        ).await;
+
+        let scope = SearchScope::all_default().with_project(Some("P1"));
+        let hits = search_all_memories(&store, &emb, "agent-scope-null", scope, 10).await.unwrap();
+
+        assert!(
+            hits.iter().any(|h| h.id == id && h.kind == TableKind::Procedural),
+            "a NULL-project procedural row must remain visible from a scoped query"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_preference_crosses_project_boundary() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let emb = unit_basis_embedding();
+        let id = insert_memory_row_with_project(
+            &store, "agent-pref-cross", Some("P2"), "user_preference", "pref content", emb.clone(),
+        ).await;
+
+        let q_vec = unit_basis_vec();
+        let scope = SearchScope::all_default().with_project(Some("P1"));
+        let hits = search_all_memories(&store, &q_vec, "agent-pref-cross", scope, 10).await.unwrap();
+
+        assert!(
+            hits.iter().any(|h| h.id == id),
+            "a user_preference row must remain visible across project boundaries"
+        );
+    }
+
+    // The test above proves the carve-out lets a foreign `user_preference` row
+    // through the KNN join, but it does so with a one-row corpus where the
+    // shortfall gate never depends on the carve-out: `reachable` is 1 with it
+    // and 0 without, `hits.len()` is 1 either way, and `1 < 1` / `1 < 0` are
+    // both false, so no retry fires and the assertion above passes whether or
+    // not `ELIGIBLE_SQL_MEMORY` carries the disjunct. This starves the first
+    // window on purpose instead: a crowd of 30 foreign, ineligible rows sits
+    // closer to the query than the one foreign `user_preference` row, so vec0's
+    // first k-window is entirely crowd, the WHERE clause throws all of it away,
+    // and `hits.len()` comes back 0. Only the carve-out then makes `reachable`
+    // count the pref row (1), which is what makes `0 < reachable` true and
+    // fires the second pass that actually reaches past the crowd to find it.
+    // Drop the disjunct from `ELIGIBLE_SQL_MEMORY` and `reachable` drops to 0
+    // too, the gate never opens, and the row is lost with no error raised.
+    #[tokio::test]
+    async fn user_preference_carve_out_gates_the_retry_that_recovers_it() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let near = unit_basis_embedding();
+        let far = off_axis_embedding();
+        let agent = "agent-pref-starved";
+
+        bulk_insert_memory_rows(&store, agent, Some("P2"), 30, near.clone()).await;
+        let pref_id = insert_memory_row_with_project(
+            &store, agent, Some("P2"), "user_preference", "pref content", far,
+        ).await;
+
+        let outcome = knn_one(&store, KNN_MEMORY, &near, agent, Some("P1"), 30)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.passes, 2,
+            "the carve-out is the only thing that makes reachable (1) exceed \
+             hits.len() (0) here; without it the retry never fires"
+        );
+        assert!(
+            outcome.hits.iter().any(|h| h.id == pref_id),
+            "the retry must recover the foreign user_preference row the crowd pushed past the k-th neighbour"
+        );
+    }
+
+    // A caller that never opts into project scoping must see the exact
+    // pre-scoping row set — otherwise every unscoped query silently loses
+    // rows the moment scoping ships, rag-eval included. This passes with
+    // zero production code above it (the `?4 IS NULL` disjunct is already
+    // live by the time this test file runs), so its RED comes from
+    // deliberately breaking that disjunct in the SQL below, observing the
+    // failure, then reverting — the disjunct existing is the fact under
+    // test, not new behavior.
+    #[tokio::test]
+    async fn unscoped_caller_sees_full_pre_scoping_row_set_memory() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let emb = unit_basis_embedding();
+        let p1 = insert_memory_row_with_project(
+            &store, "agent-unscoped", Some("P1"), "chat_message", "p1 row", emb.clone(),
+        ).await;
+        let p2 = insert_memory_row_with_project(
+            &store, "agent-unscoped", Some("P2"), "chat_message", "p2 row", emb.clone(),
+        ).await;
+        let none = insert_memory_row_with_project(
+            &store, "agent-unscoped", None, "chat_message", "no-project row", emb.clone(),
+        ).await;
+
+        let q_vec = unit_basis_vec();
+        let hits = search_all_memories(&store, &q_vec, "agent-unscoped", SearchScope::all_default(), 10)
+            .await
+            .unwrap();
+
+        for id in [p1, p2, none] {
+            assert!(hits.iter().any(|h| h.id == id), "unscoped query must return row {id} regardless of its project_id");
+        }
+    }
+
+    // ── candidate-pool probe and bounded retry ──
+
+    async fn count_eligible_memory(
+        store: &MemoryStore,
+        agent_id: &str,
+        project_id: Option<&str>,
+        k: i64,
+    ) -> i64 {
+        let agent = agent_id.to_string();
+        let proj = project_id.map(str::to_owned);
+        store
+            .conn
+            .call(move |c| -> Result<i64, tokio_rusqlite::Error> {
+                Ok(c.query_row(ELIGIBLE_SQL_MEMORY, params![k, agent, proj], |row| {
+                    row.get::<_, i64>(0)
+                })?)
+            })
+            .await
+            .unwrap()
+    }
+
+    // The retry trigger has to tell "the join filtered rows out of a full
+    // k-window" apart from "this caller has nothing more to give", and only
+    // the second question can be answered without re-running the search. The
+    // count answers it over the parent table with the search's own predicates,
+    // capped at the pool size, so it never scans past the point where the
+    // answer stops changing.
+    #[tokio::test]
+    async fn eligible_count_is_scoped_to_the_caller_and_capped_at_the_pool() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let emb = unit_basis_embedding();
+        for i in 0..3 {
+            insert_memory_row_with_project(
+                &store, "agent-probe", Some("P1"), "chat_message", &format!("own row {i}"), emb.clone(),
+            ).await;
+        }
+        for i in 0..20 {
+            insert_memory_row_with_project(
+                &store, "agent-probe", Some("P2"), "chat_message", &format!("foreign row {i}"), emb.clone(),
+            ).await;
+        }
+        for i in 0..7 {
+            insert_memory_row_with_project(
+                &store, "other-agent", Some("P1"), "chat_message", &format!("other agent row {i}"), emb.clone(),
+            ).await;
+        }
+
+        assert_eq!(
+            count_eligible_memory(&store, "agent-probe", Some("P1"), 30).await,
+            3,
+            "a table full of rows belonging to another project or another agent leaves this caller three"
+        );
+        assert_eq!(
+            count_eligible_memory(&store, "agent-probe", None, 30).await,
+            23,
+            "an unscoped caller is eligible for every row of its own agent"
+        );
+        assert_eq!(
+            count_eligible_memory(&store, "agent-probe", None, 5).await,
+            5,
+            "the count must stop at the pool size, not walk the agent's whole history"
+        );
+    }
+
+    /// A unit vector measurably off the query direction, so rows carrying it
+    /// always lose the k-window race against `unit_basis_vec`. Ties would make
+    /// every starvation assertion below depend on vec0's internal iteration
+    /// order instead of on distance.
+    fn off_axis_vec() -> Vec<f32> {
+        let mut v = vec![0.0_f32; 384];
+        v[0] = 0.9;
+        v[1] = (1.0_f32 - 0.81).sqrt();
+        v
+    }
+
+    fn off_axis_embedding() -> Vec<u8> {
+        serialize_embedding(&off_axis_vec())
+    }
+
+    async fn bulk_insert_memory_rows(
+        store: &MemoryStore,
+        agent_id: &str,
+        project_id: Option<&str>,
+        count: usize,
+        embedding: Vec<u8>,
+    ) -> Vec<i64> {
+        let agent = agent_id.to_string();
+        let project = project_id.map(|p| p.to_string());
+        store
+            .conn
+            .call(move |c| -> Result<Vec<i64>, rusqlite::Error> {
+                let tx = c.transaction()?;
+                let mut ids = Vec::with_capacity(count);
+                for i in 0..count {
+                    tx.execute(
+                        "INSERT INTO memory (scope, agent_id, project_id, content, memory_type,
+                         source, created_at, created_by_type, created_by_ref,
+                         last_modified_at, last_accessed_at, importance, tier, status)
+                         VALUES ('agent', ?1, ?2, ?3, 'chat_message', 'chat',
+                         0, 'user', ?1, 0, 0, 5.0, 3, 'active')",
+                        params![agent, project, format!("bulk row {i}")],
+                    )?;
+                    let id = tx.last_insert_rowid();
+                    tx.execute(
+                        "INSERT INTO memory_vectors(rowid, embedding) VALUES (?, ?)",
+                        params![id, embedding],
+                    )?;
+                    ids.push(id);
+                }
+                tx.commit()?;
+                Ok(ids)
+            })
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn retry_window_widens_fourfold_up_to_the_engine_ceiling() {
+        assert_eq!(retry_window(30), 120);
+        assert_eq!(retry_window(1024), 4096);
+        assert_eq!(
+            retry_window(2000),
+            VEC0_MAX_K,
+            "8000 is past what vec0 will accept as k, so the widened window has to stop here"
+        );
+        assert_eq!(retry_window(VEC0_MAX_K), VEC0_MAX_K);
+    }
+
+    // A full pool proves nothing was filtered: the query asked for k and got k,
+    // so there is no evidence of a starved window and no reason to pay for a
+    // second scan.
+    #[tokio::test]
+    async fn knn_no_retry_when_pool_is_full() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let emb = unit_basis_embedding();
+        bulk_insert_memory_rows(&store, "agent-full", Some("P1"), 10, emb.clone()).await;
+
+        let outcome = knn_one(&store, KNN_MEMORY, &emb, "agent-full", Some("P1"), 5)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.hits.len(), 5, "a full window returns exactly k rows");
+        assert_eq!(
+            outcome.passes, 1,
+            "nothing was filtered, so a wider window cannot find more"
+        );
+    }
+
+    // The case that decides whether this feature costs one query or two on
+    // every search this app runs: a corpus smaller than k. vec0 already handed
+    // back every vector it has, so widening the window returns the identical
+    // rows — retrying here would double the query cost of the common case for
+    // no gain whatsoever.
+    #[tokio::test]
+    async fn knn_no_retry_on_small_corpus() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let emb = unit_basis_embedding();
+        bulk_insert_memory_rows(&store, "agent-small", Some("P1"), 8, emb.clone()).await;
+
+        let outcome = knn_one(&store, KNN_MEMORY, &emb, "agent-small", Some("P1"), 30)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.hits.len(), 8, "every row in the corpus is eligible");
+        assert_eq!(
+            outcome.passes, 1,
+            "the shortfall is the corpus being small, not the window being crowded"
+        );
+    }
+
+    // The failure this mechanism exists for: the k nearest vectors all belong
+    // to another project, so the join throws the entire window away and the
+    // caller's own rows — which do exist — are delivered by nobody.
+    #[tokio::test]
+    async fn knn_retry_fires_once_when_pool_saturated() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let near = unit_basis_embedding();
+        let far = off_axis_embedding();
+        bulk_insert_memory_rows(&store, "agent-starved", Some("P2"), 100, near.clone()).await;
+        let own = bulk_insert_memory_rows(&store, "agent-starved", Some("P1"), 5, far).await;
+
+        let outcome = knn_one(&store, KNN_MEMORY, &near, "agent-starved", Some("P1"), 30)
+            .await
+            .unwrap();
+
+        for id in &own {
+            assert!(
+                outcome.hits.iter().any(|h| h.id == *id),
+                "row {id} belongs to the caller's project and must survive the crowding"
+            );
+        }
+        // Two queries, not three and not a convergence loop. The counter is
+        // incremented by the query function itself, so this number is how many
+        // times the table was actually scanned — a variant that kept widening
+        // would land on the same 5 rows and would be caught here and nowhere
+        // else, because the hits are identical either way.
+        assert_eq!(
+            outcome.passes, 2,
+            "recovery is one extra pass; the row set alone cannot tell two passes from five"
+        );
+        assert_eq!(outcome.hits.len(), 5, "the eligible set is 5, so a full pool was never reachable");
+    }
+
+    // The widened window is a budget for finding eligible rows, not a licence
+    // to return four times as many. Letting it through would silently inflate
+    // one table's share of the merged result and detach the pool-survival
+    // denominator from what was actually asked for.
+    #[tokio::test]
+    async fn retry_result_truncated_to_original_k() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let near = unit_basis_embedding();
+        let far = off_axis_embedding();
+        bulk_insert_memory_rows(&store, "agent-trunc", Some("P2"), 10, near.clone()).await;
+        bulk_insert_memory_rows(&store, "agent-trunc", Some("P1"), 50, far).await;
+
+        let outcome = knn_one(&store, KNN_MEMORY, &near, "agent-trunc", Some("P1"), 10)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.passes, 2);
+        assert_eq!(
+            outcome.hits.len(),
+            10,
+            "the retry found more eligible rows than requested and must hand back only k"
+        );
+    }
+
+    // The denominator in the retrieval line is what makes a starved search
+    // readable at all, and a retry is exactly when it is easiest to get wrong:
+    // the second query asks vec0 for four times the pool, and reporting that
+    // number would turn a rescued search into the worst-looking line in the
+    // log. This drives a real starved table through a real recovery and reads
+    // the line that comes out, rather than handing the formatter numbers a
+    // test made up.
+    #[tokio::test]
+    async fn retrieval_line_reports_the_requested_pool_after_a_real_recovery() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let near = unit_basis_embedding();
+        let far = off_axis_embedding();
+        let scope = SearchScope {
+            memory: Some(30),
+            episodic: None,
+            procedural: None,
+            project_id: Some("P1".to_string()),
+        };
+        let k = scope.memory.unwrap();
+        // 30 foreign rows fill the first window exactly; 40 eligible rows sit
+        // behind them, so the recovery can hand back a genuinely full pool.
+        bulk_insert_memory_rows(&store, "agent-telemetry", Some("P2"), 30, near.clone()).await;
+        bulk_insert_memory_rows(&store, "agent-telemetry", Some("P1"), 40, far).await;
+
+        let mem = knn_one(&store, KNN_MEMORY, &near, "agent-telemetry", Some("P1"), k)
+            .await
+            .unwrap();
+        assert_eq!(mem.passes, 2, "test setup: the window has to have been starved");
+
+        let line = format_pool_line(&scope, &mem, &KnnOutcome::skipped(), &KnnOutcome::skipped());
+
+        assert!(
+            line.contains("pool_req=(30+0+0)"),
+            "the denominator is what the caller asked for, never the widened window: {line}"
+        );
+        assert!(
+            line.contains("pool_ret=(30+0+0)"),
+            "enough eligible rows existed, so the recovered pool is full: {line}"
+        );
+        assert!(
+            line.contains("retry=(mem)"),
+            "a line whose numbers were reached through a second pass has to say so: {line}"
+        );
+    }
+
+    // The test above drives `format_pool_line` directly with an outcome it
+    // built by hand — it pins the formatter, not the one-line wiring at the
+    // real call site inside `search_all_memories_inner` that hands that
+    // formatter the actual `mem`/`epi`/`pro` outcomes from a live search. A
+    // mutation there (wrong table in the wrong slot, wrong scope) would
+    // change nothing this driven-by-hand test could see. This drives the same
+    // starved-then-recovered fixture through the public orchestrator instead,
+    // so it is the real per-search outcomes that reach the formatter.
+    #[tokio::test]
+    async fn search_all_memories_wiring_reports_pool_line_from_a_real_recovery() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let near = unit_basis_vec();
+        let far = off_axis_vec();
+        let scope = SearchScope {
+            memory: Some(30),
+            episodic: None,
+            procedural: None,
+            project_id: Some("P1".to_string()),
+        };
+        bulk_insert_memory_rows(&store, "agent-telemetry-wired", Some("P2"), 30, serialize_embedding(&near)).await;
+        bulk_insert_memory_rows(&store, "agent-telemetry-wired", Some("P1"), 40, serialize_embedding(&far)).await;
+
+        let (hits, line) =
+            search_all_memories_inner(&store, &near, "agent-telemetry-wired", scope, 30)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            hits.len(),
+            30,
+            "the recovery has to reach the caller's own rows through the real orchestrator, not just knn_one"
+        );
+        assert!(
+            line.contains("pool_req=(30+0+0)"),
+            "the line built at the real call site must still read the requested pool: {line}"
+        );
+        assert!(
+            line.contains("pool_ret=(30+0+0)"),
+            "the line built at the real call site must still read what came back: {line}"
+        );
+        assert!(
+            line.contains("retry=(mem)"),
+            "the line built at the real call site must still say which table retried: {line}"
+        );
+    }
+
+    /// Soft-deletes a row and leaves its vector in place, the way rows deleted
+    /// before the delete path pruned vectors still sit in the database today.
+    /// That is the only state in which soft-deleted rows can crowd a window,
+    /// so it is the state worth searching against.
+    async fn soft_delete_keeping_vector(store: &MemoryStore, id: i64) {
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE memory SET deleted_at = 1 WHERE id = ?1", params![id]))
+            .await
+            .unwrap();
+    }
+
+    // Deleted rows keep their place in the vector index until something sweeps
+    // them, so on a corpus with a real deletion history they are exactly the
+    // kind of crowd that empties a window: nearest by distance, invisible by
+    // predicate. The pool the caller receives has to be full of live rows
+    // anyway — the deletions are the store's history, not a reduction of what
+    // the caller asked for.
+    #[tokio::test]
+    async fn knn_returns_a_full_live_pool_despite_soft_deleted_rows_in_the_index() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let near = unit_basis_embedding();
+        let far = off_axis_embedding();
+        let deleted =
+            bulk_insert_memory_rows(&store, "agent-deleted", Some("P1"), 20, near.clone()).await;
+        let live = bulk_insert_memory_rows(&store, "agent-deleted", Some("P1"), 30, far).await;
+        for id in &deleted {
+            soft_delete_keeping_vector(&store, *id).await;
+        }
+
+        let outcome = knn_one(&store, KNN_MEMORY, &near, "agent-deleted", Some("P1"), 30)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.hits.len(),
+            30,
+            "every live row was reachable, so the pool must come back full"
+        );
+        for id in &deleted {
+            assert!(
+                !outcome.hits.iter().any(|h| h.id == *id),
+                "soft-deleted row {id} must not reach the caller"
+            );
+        }
+        for id in &live {
+            assert!(
+                outcome.hits.iter().any(|h| h.id == *id),
+                "live row {id} belongs in the pool"
+            );
+        }
+    }
+
+    // One agent, several projects, one database — the arrangement this whole
+    // scoping effort exists to serve. The caller owns three rows out of a
+    // thousand, so no window of any width can fill a pool of thirty. Widening
+    // is not a recovery here, it is a second scan bought on every search this
+    // caller will ever run, forever, to re-find the same three rows the first
+    // scan already returned.
+    #[tokio::test]
+    async fn knn_does_not_retry_when_the_caller_already_has_every_row_it_could_get() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let near = unit_basis_embedding();
+        let far = off_axis_embedding();
+        // The caller's own rows sit closest to the query, so the first pass
+        // already delivers all three: the shortfall is the eligible set being
+        // small, not the window being crowded.
+        let own = bulk_insert_memory_rows(&store, "agent-shared", Some("P1"), 3, near.clone()).await;
+        bulk_insert_memory_rows(&store, "agent-shared", Some("P2"), 1000, far).await;
+
+        let outcome = knn_one(&store, KNN_MEMORY, &near, "agent-shared", Some("P1"), 30)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.hits.len(), 3, "three rows is everything this caller owns");
+        for id in &own {
+            assert!(outcome.hits.iter().any(|h| h.id == *id), "row {id} must be returned");
+        }
+        assert_eq!(
+            outcome.passes, 1,
+            "a full corpus around a tiny eligible set must not buy a second scan on every search"
+        );
+    }
+
+    // vec0 rejects a k above its own ceiling outright, so a pool size past a
+    // quarter of that ceiling turns the widened retry into a hard error unless
+    // the window is clamped.
+    #[tokio::test]
+    async fn knn_retry_window_stays_within_engine_ceiling() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let near = unit_basis_embedding();
+        let far = off_axis_embedding();
+        let k = 1100;
+        bulk_insert_memory_rows(&store, "agent-ceiling", Some("P2"), k, near.clone()).await;
+        let own = bulk_insert_memory_rows(&store, "agent-ceiling", Some("P1"), 5, far).await;
+
+        let outcome = knn_one(&store, KNN_MEMORY, &near, "agent-ceiling", Some("P1"), k)
+            .await
+            .expect("the widened window must stay bindable");
+
+        assert_eq!(outcome.passes, 2);
+        for id in &own {
+            assert!(outcome.hits.iter().any(|h| h.id == *id), "row {id} must be recovered");
+        }
+    }
+
+    // The recovery is wired per table through a descriptor, and only the
+    // memory branch was ever driven through a starved window. A descriptor
+    // pointing at the wrong table's count is a silent mistake as long as no
+    // test makes the other two tables recover anything: the memory table is
+    // empty in these fixtures, so borrowing its count would report nothing
+    // eligible and the rows below would never come back.
+    #[tokio::test]
+    async fn knn_retry_recovers_episodic_rows_crowded_out_of_the_window() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let near = unit_basis_vec();
+        let far = off_axis_vec();
+        for i in 0..15 {
+            insert_episodic_row_with_project(
+                &store, "agent-epi-retry", Some("P2"), &format!("sess-foreign-{i}"), near.clone(),
+            ).await;
+        }
+        let mut own = Vec::new();
+        for i in 0..3 {
+            own.push(
+                insert_episodic_row_with_project(
+                    &store, "agent-epi-retry", Some("P1"), &format!("sess-own-{i}"), far.clone(),
+                ).await,
+            );
+        }
+
+        let q_bytes = serialize_embedding(&near);
+        let outcome = knn_one(&store, KNN_EPISODIC, &q_bytes, "agent-epi-retry", Some("P1"), 5)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.passes, 2, "the first window held nothing this caller may see");
+        for id in &own {
+            assert!(
+                outcome.hits.iter().any(|h| h.id == *id && h.kind == TableKind::Episodic),
+                "episodic row {id} must be recovered by the wider window"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn knn_retry_recovers_procedural_rows_crowded_out_of_the_window() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let near = unit_basis_vec();
+        let far = off_axis_vec();
+        for i in 0..15 {
+            insert_procedural_row_with_project(
+                &store, "agent-pro-retry", Some("P2"), &format!("skill-foreign-{i}"), near.clone(),
+            ).await;
+        }
+        let mut own = Vec::new();
+        for i in 0..3 {
+            own.push(
+                insert_procedural_row_with_project(
+                    &store, "agent-pro-retry", Some("P1"), &format!("skill-own-{i}"), far.clone(),
+                ).await,
+            );
+        }
+
+        let q_bytes = serialize_embedding(&near);
+        let outcome = knn_one(&store, KNN_PROCEDURAL, &q_bytes, "agent-pro-retry", Some("P1"), 5)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.passes, 2, "the first window held nothing this caller may see");
+        for id in &own {
+            assert!(
+                outcome.hits.iter().any(|h| h.id == *id && h.kind == TableKind::Procedural),
+                "procedural row {id} must be recovered by the wider window"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn knn_one_reports_no_retry_for_episodic_and_procedural_small_corpora() {
+        use crate::memory::embedder::FakeEmbedder;
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let embedder = FakeEmbedder::default();
+        // Normalized before it is used on either side. The insert path unit-
+        // normalizes what it stores, so a raw query vector would be compared
+        // against something that no longer points the same length — distances
+        // stop being comparable to the cosine the score formula assumes, and
+        // any ordering read off them is an accident of the fixture.
+        let emb = to_unit(&embedder.embed("cross table outcome").await.unwrap()).unwrap();
+        insert_episodic_row_with_project(&store, "agent-x", Some("P1"), "sess-x", emb.clone()).await;
+        insert_procedural_row_with_project(&store, "agent-x", Some("P1"), "skill-x", emb.clone()).await;
+
+        let q_bytes = serialize_f32_query(&emb);
+        let epi = knn_one(&store, KNN_EPISODIC, &q_bytes, "agent-x", Some("P1"), 5).await.unwrap();
+        let pro = knn_one(&store, KNN_PROCEDURAL, &q_bytes, "agent-x", Some("P1"), 5).await.unwrap();
+
+        assert_eq!(epi.hits.len(), 1);
+        assert_eq!(pro.hits.len(), 1);
+        assert_eq!(epi.passes, 1);
+        assert_eq!(pro.passes, 1);
+    }
+
+    #[tokio::test]
+    async fn unscoped_caller_sees_full_pre_scoping_row_set_episodic() {
+        use crate::memory::embedder::FakeEmbedder;
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let embedder = FakeEmbedder::default();
+        let emb = embedder.embed("unscoped episodic task").await.unwrap();
+        let p1 = insert_episodic_row_with_project(&store, "agent-uns-epi", Some("P1"), "sess-own", emb.clone()).await;
+        let p2 = insert_episodic_row_with_project(&store, "agent-uns-epi", Some("P2"), "sess-foreign", emb.clone()).await;
+        let none = insert_episodic_row_with_project(&store, "agent-uns-epi", None, "sess-unowned", emb.clone()).await;
+
+        let hits = search_all_memories(&store, &emb, "agent-uns-epi", SearchScope::all_default(), 10)
+            .await
+            .unwrap();
+
+        for id in [p1, p2, none] {
+            assert!(
+                hits.iter().any(|h| h.id == id && h.kind == TableKind::Episodic),
+                "unscoped query must return episodic row {id} regardless of its project_id"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unscoped_caller_sees_full_pre_scoping_row_set_procedural() {
+        use crate::memory::embedder::FakeEmbedder;
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let embedder = FakeEmbedder::default();
+        let emb = embedder.embed("unscoped procedural trigger").await.unwrap();
+        let p1 = insert_procedural_row_with_project(&store, "agent-uns-pro", Some("P1"), "skill-own", emb.clone()).await;
+        let p2 = insert_procedural_row_with_project(&store, "agent-uns-pro", Some("P2"), "skill-foreign", emb.clone()).await;
+        let none = insert_procedural_row_with_project(&store, "agent-uns-pro", None, "skill-unowned", emb.clone()).await;
+
+        let hits = search_all_memories(&store, &emb, "agent-uns-pro", SearchScope::all_default(), 10)
+            .await
+            .unwrap();
+
+        for id in [p1, p2, none] {
+            assert!(
+                hits.iter().any(|h| h.id == id && h.kind == TableKind::Procedural),
+                "unscoped query must return procedural row {id} regardless of its project_id"
+            );
+        }
     }
 }

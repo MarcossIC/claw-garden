@@ -794,7 +794,7 @@ mod tests {
 
         // Same embedding => distance 0, which is inside any threshold: this
         // isolates "can the pool see it" from "is the threshold calibrated".
-        let candidates = detect_contradiction(&store, &emb, "agent-contra-pref").await;
+        let candidates = detect_contradiction(&store, &emb, "agent-contra-pref", None).await;
         assert!(
             candidates.contains(&stored_id),
             "a tier-1 user_preference must be a contradiction candidate"

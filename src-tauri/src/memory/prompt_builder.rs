@@ -100,7 +100,7 @@ pub(crate) async fn build_memory_prompt(
     let mut hits: Vec<RankedHit> = match embedder {
         Some(emb) => match emb.embed(user_query).await {
             Ok(q_vec) => {
-                match search_all_memories(store, &q_vec, agent_id, SearchScope::all_default(), k_request).await {
+                match search_all_memories(store, &q_vec, agent_id, SearchScope::all_default().with_project(project_id), k_request).await {
                     Ok(h) => h,
                     Err(e) => {
                         log::warn!("search_all_memories failed: {e}; no retrieval hits this turn");

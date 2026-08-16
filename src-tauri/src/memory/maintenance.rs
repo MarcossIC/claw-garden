@@ -73,6 +73,17 @@ pub(crate) async fn run_maintenance_once_at(store: &MemoryStore, now_ms: Timesta
         log::warn!("maintenance: bulk tier demotion failed: {e}");
     }
 
+    // Placed after the demotion pass (which can't orphan a vector — it never
+    // touches deleted_at) and before the corpus-size log below, so that log
+    // line reports the post-sweep state. Soft-deleting a row prunes its
+    // vector inline (`delete_memory_core`), but rows deleted before that
+    // code existed are still sitting on an orphaned vector row nothing will
+    // ever reference again — this sweep is the backfill for those.
+    let swept = sweep_orphaned_vectors(store).await;
+    if swept > 0 {
+        log::info!("maintenance: dropped {swept} vector rows left behind by soft-deleted rows");
+    }
+
     // Placed after the demotion pass so the counts describe the post-pass
     // state. A query failure here logs and returns like the demotion above —
     // losing one day's corpus-size log line is not worth stopping the loop.
@@ -90,6 +101,72 @@ pub(crate) async fn run_maintenance_once_at(store: &MemoryStore, now_ms: Timesta
         }
         Err(e) => log::warn!("maintenance: row count query failed: {e}"),
     }
+}
+
+/// Deletes the vector row of every soft-deleted parent row, across all 3
+/// tables, and reports how many it found. Two steps per table — select the
+/// orphans, then one `DELETE FROM {vectors} WHERE rowid = ?1` per id — rather
+/// than `DELETE ... WHERE rowid IN (subquery)`: a bare `rowid = ?` is the
+/// point-lookup plan the vector virtual table supports directly, while the
+/// `IN (subquery)` form drops to a full scan plus a per-row update on the
+/// whole vector table.
+///
+/// The selection joins the parent to its vector rather than listing every
+/// soft-deleted id, and that join is what makes a repeated pass free. Nothing
+/// in this codebase hard-deletes a parent row, so "soft-deleted" is a set that
+/// only ever grows: selecting on it alone would hand the loop below a longer
+/// list every single day and spend a point delete on each one to discover the
+/// vector had already been dropped years ago. Joining to the vector table
+/// means the list IS the orphans — once they are gone the select returns
+/// nothing and the loop runs zero statements, which is the property
+/// `maintenance_sweep_idempotent` pins down.
+///
+/// What the join costs is a walk of the vector table's rowid list, with one
+/// primary-key lookup per row (`SCAN v VIRTUAL TABLE INDEX 0:1` + `SEARCH p
+/// USING INTEGER PRIMARY KEY`, read off `EXPLAIN QUERY PLAN` against this
+/// schema). That walk touches no embedding blob and computes no distance, and
+/// it is bounded by how many vectors are live — a number that shrinks as rows
+/// are deleted instead of growing with every tombstone the parent table keeps.
+///
+/// A query failure is logged and this moves to the next table — one table's
+/// sweep failing must not block the others or abort the demotion pass already
+/// committed above.
+async fn sweep_orphaned_vectors(store: &MemoryStore) -> usize {
+    const TABLES: [(&str, &str); 3] = [
+        ("memory", "memory_vectors"),
+        ("episodic_trajectory", "episodic_vectors"),
+        ("procedural_skill", "procedural_vectors"),
+    ];
+
+    let mut swept = 0usize;
+    for (parent, vectors) in TABLES {
+        let select_sql = format!(
+            "SELECT p.id FROM {parent} p \
+             JOIN {vectors} v ON v.rowid = p.id \
+             WHERE p.deleted_at IS NOT NULL"
+        );
+        let delete_sql = format!("DELETE FROM {vectors} WHERE rowid = ?1");
+        let result = store
+            .conn
+            .call(move |c| -> rusqlite::Result<usize> {
+                let ids: Vec<i64> = {
+                    let mut stmt = c.prepare(&select_sql)?;
+                    let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+                    rows.collect::<rusqlite::Result<Vec<i64>>>()?
+                };
+                let n = ids.len();
+                for id in ids {
+                    c.execute(&delete_sql, rusqlite::params![id])?;
+                }
+                Ok(n)
+            })
+            .await;
+        match result {
+            Ok(n) => swept += n,
+            Err(e) => log::warn!("maintenance: orphaned-vector sweep failed for {parent}: {e}"),
+        }
+    }
+    swept
 }
 
 /// Total vs. live (`deleted_at IS NULL`) row count for one table.
@@ -119,13 +196,15 @@ pub(crate) struct TableRowCounts {
 /// idx_memory_agent_active` respectively, while the folded `SUM` form falls
 /// back to a bare `SCAN memory`.
 ///
-/// Reporting only the live count would understate what this telemetry
-/// exists to measure: soft deletion never removes the corresponding vector
-/// row (no `DELETE FROM memory_vectors`, or the episodic/procedural
-/// equivalents, exists anywhere in this codebase), so a soft-deleted row
-/// keeps costing the brute-force vec0 scan even though it can no longer be
-/// retrieved. The gap between `total` and `live` is exactly that dead
-/// weight.
+/// Reporting only the live count would hide how much of each table is
+/// soft-deleted. Those rows stay in the parent table forever — nothing in
+/// this codebase hard-deletes from `memory`, `episodic_trajectory` or
+/// `procedural_skill` — so the gap between `total` and `live` is accumulated
+/// tombstone weight. Their vectors no longer sit in that gap: a delete drops
+/// the vector row inline and [`sweep_orphaned_vectors`] backfills the ones
+/// deleted before that existed, so the gap no longer inflates the vec0 scan.
+/// What it still measures is parent-table growth, which is what decides when
+/// a real purge becomes necessary.
 pub(crate) async fn count_rows(store: &MemoryStore) -> Result<TableRowCounts, MemoryError> {
     store
         .conn
@@ -299,6 +378,79 @@ mod tests {
             .expect("seed_row failed")
     }
 
+    /// Seeds one row already soft-deleted (`deleted_at = 1`), plus its
+    /// vector row, via a raw transaction that bypasses `delete_memory_core`
+    /// entirely — the vector is never pruned, exactly like a row that was
+    /// soft-deleted before vector pruning existed. Returns the parent row's
+    /// id; the vector table's rowid is the same value.
+    async fn seed_orphaned_deleted_row(store: &MemoryStore, table: &str) -> i64 {
+        let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
+        let table = table.to_string();
+        let embedding = vec![0u8; 384 * 4];
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<i64> {
+                let tx = c.transaction()?;
+                let (vectors_table, id) = match table.as_str() {
+                    "memory" => {
+                        tx.execute(
+                            "INSERT INTO memory \
+                             (scope, agent_id, content, memory_type, tier, importance, \
+                              created_at, last_modified_at, last_accessed_at, \
+                              created_by_type, created_by_ref, deleted_at) \
+                             VALUES ('agent', 'test-agent', 'seed content', 'chat_message', \
+                                     3, 5.0, 0, 0, 0, 'agent', '', 1)",
+                            [],
+                        )?;
+                        ("memory_vectors", tx.last_insert_rowid())
+                    }
+                    "episodic_trajectory" => {
+                        tx.execute(
+                            "INSERT INTO episodic_trajectory \
+                             (scope, agent_id, session_id, task, tier, importance, \
+                              created_at, last_modified_at, last_accessed_at, \
+                              created_by_type, created_by_ref, deleted_at) \
+                             VALUES ('agent', 'test-agent', ?1, 'seed task', \
+                                     3, 5.0, 0, 0, 0, 'agent', '', 1)",
+                            rusqlite::params![format!("sess-sweep-{nonce}")],
+                        )?;
+                        ("episodic_vectors", tx.last_insert_rowid())
+                    }
+                    "procedural_skill" => {
+                        tx.execute(
+                            "INSERT INTO procedural_skill \
+                             (scope, agent_id, skill_name, trigger, tier, importance, \
+                              promoted_at, source_trajectory_ids, \
+                              created_at, last_modified_at, last_accessed_at, \
+                              created_by_type, created_by_ref, deleted_at) \
+                             VALUES ('agent', 'test-agent', ?1, 'seed trigger', \
+                                     1, 8.0, 0, '[]', 0, 0, 0, 'agent', '', 1)",
+                            rusqlite::params![format!("skill-sweep-{nonce}")],
+                        )?;
+                        ("procedural_vectors", tx.last_insert_rowid())
+                    }
+                    other => panic!("seed_orphaned_deleted_row: unknown table '{other}'"),
+                };
+                tx.execute(
+                    &format!("INSERT INTO {vectors_table}(rowid, embedding) VALUES (?, ?)"),
+                    rusqlite::params![id, embedding],
+                )?;
+                tx.commit()?;
+                Ok(id)
+            })
+            .await
+            .expect("seed_orphaned_deleted_row failed")
+    }
+
+    async fn vector_row_count(store: &MemoryStore, vectors_table: &'static str, id: i64) -> i64 {
+        let sql = format!("SELECT COUNT(*) FROM {vectors_table} WHERE rowid = ?1");
+        store
+            .conn
+            .call(move |c| c.query_row(&sql, [id], |r| r.get(0)))
+            .await
+            .unwrap()
+    }
+
     async fn tier_of(store: &MemoryStore, table: &str, id: i64) -> i64 {
         let sql = format!("SELECT tier FROM {table} WHERE id = ?1");
         store
@@ -447,12 +599,14 @@ mod tests {
         assert_eq!(
             tier_of(&store, "episodic_trajectory", epi_id).await,
             1,
-            "episodic_trajectory must NOT be touched by run_maintenance_once (R3)"
+            "inactivity demotion is scoped to `memory`; an unchanged tier here is \
+             what proves the UPDATE did not widen its reach"
         );
         assert_eq!(
             tier_of(&store, "procedural_skill", proc_id).await,
             1,
-            "procedural_skill must NOT be touched by run_maintenance_once (R3)"
+            "inactivity demotion is scoped to `memory`; an unchanged tier here is \
+             what proves the UPDATE did not widen its reach"
         );
     }
 
@@ -596,5 +750,45 @@ mod tests {
         assert_eq!((counts.memory.total, counts.memory.live), (2, 1));
         assert_eq!((counts.episodic.total, counts.episodic.live), (1, 1));
         assert_eq!((counts.procedural.total, counts.procedural.live), (0, 0));
+    }
+
+    // ── orphaned-vector sweep ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn maintenance_sweeps_orphan_vectors() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+
+        let mem_id = seed_orphaned_deleted_row(&store, "memory").await;
+        let epi_id = seed_orphaned_deleted_row(&store, "episodic_trajectory").await;
+        let proc_id = seed_orphaned_deleted_row(&store, "procedural_skill").await;
+
+        assert_eq!(vector_row_count(&store, "memory_vectors", mem_id).await, 1, "test setup: orphan must exist before the sweep");
+
+        super::run_maintenance_once_at(&store, now_ms()).await;
+
+        assert_eq!(vector_row_count(&store, "memory_vectors", mem_id).await, 0, "memory vector orphan must be swept");
+        assert_eq!(vector_row_count(&store, "episodic_vectors", epi_id).await, 0, "episodic vector orphan must be swept");
+        assert_eq!(vector_row_count(&store, "procedural_vectors", proc_id).await, 0, "procedural vector orphan must be swept");
+    }
+
+    #[tokio::test]
+    async fn maintenance_sweep_idempotent() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let id = seed_orphaned_deleted_row(&store, "memory").await;
+
+        let first = super::sweep_orphaned_vectors(&store).await;
+        assert_eq!(first, 1, "first pass must find and drop the one orphan");
+        assert_eq!(vector_row_count(&store, "memory_vectors", id).await, 0, "first pass must sweep the orphan");
+
+        // The parent row is still there and still soft-deleted — nothing in
+        // this codebase hard-deletes it. So "no work left" cannot mean "no
+        // soft-deleted rows left"; it has to mean the second pass finds no
+        // vector to drop and issues no statement at all. Asserting the count
+        // stayed 0 would not distinguish that from re-issuing a delete for
+        // every tombstone the table has ever accumulated, which is the same
+        // observable state at a cost that grows forever.
+        let second = super::sweep_orphaned_vectors(&store).await;
+        assert_eq!(second, 0, "an already-swept corpus must give the second pass nothing to do");
+        assert_eq!(vector_row_count(&store, "memory_vectors", id).await, 0, "second pass must stay a no-op, not error or re-delete");
     }
 }

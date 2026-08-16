@@ -121,9 +121,13 @@ async fn process_event(
                 // detect_contradiction is async and requires &MemoryStore; Arc<MemoryStore>
                 // derefs to MemoryStore via Deref coercion.
                 let mut record = NewMemoryRecord::from_event_and_chunk(evt, &chunk);
-                let disputed =
-                    crate::memory::contradiction::detect_contradiction(store, &vec, &evt.agent_id)
-                        .await;
+                let disputed = crate::memory::contradiction::detect_contradiction(
+                    store,
+                    &vec,
+                    &evt.agent_id,
+                    evt.project_id.as_deref(),
+                )
+                .await;
                 if !disputed.is_empty() {
                     record.disputed_against = Some(disputed);
                 }

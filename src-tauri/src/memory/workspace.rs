@@ -190,7 +190,15 @@ async fn fetch_auto_rows(
     store
         .conn
         .call(move |c| -> Result<AutoRows, rusqlite::Error> {
-            // Query 1: user_preference rows with importance >= 8
+            // Query 1: user_preference rows with importance >= 8.
+            //
+            // Filtered by agent only, deliberately: a preference describes the
+            // person the agent is working with — how they want to be spoken to,
+            // what they never want done — and that does not stop being true
+            // when they switch projects. The other two queries below scope by
+            // project because a decision or a skill belongs to a codebase;
+            // this one must not, or the same preference has to be re-taught
+            // once per project. Narrowing it is a behavior change, not a fix.
             let mut stmt = c.prepare(
                 "SELECT id, content FROM memory
                  WHERE memory_type = 'user_preference'
@@ -209,13 +217,20 @@ async fn fetch_auto_rows(
 
             // Query 2: architectural_decision rows, scoped to project when provided,
             // otherwise all architectural decisions for the agent. importance >= 8.
+            //
+            // A row with no project of its own is visible from every project:
+            // NULL there means "not attributed", not "belongs to nobody", and
+            // the writers that record a decision outside a project context
+            // leave it NULL. Matching only on equality would make those rows
+            // reachable exclusively from the unscoped listing — invisible from
+            // every real workspace, which is where they are actually needed.
             let arch_decisions: Vec<MemoryLine> = if let Some(ref pid) = proj {
                 let mut stmt2 = c.prepare(
                     "SELECT id, content FROM memory
                      WHERE memory_type = 'architectural_decision'
                        AND importance >= 8
                        AND agent_id = ?1
-                       AND project_id = ?2
+                       AND (project_id = ?2 OR project_id IS NULL)
                        AND tier = 1
                        AND deleted_at IS NULL
                      ORDER BY importance DESC",
@@ -246,26 +261,51 @@ async fn fetch_auto_rows(
                 rows
             };
 
-            // Query 3: top-5 procedural skills by access_count
-            let mut stmt3 = c.prepare(
-                "SELECT id, skill_name, trigger, tool_sequence FROM procedural_skill
-                 WHERE agent_id = ?1
-                   AND tier = 1
-                   AND deleted_at IS NULL
-                 ORDER BY access_count DESC
-                 LIMIT 5",
-            )?;
-            let top_skills: Vec<SkillLine> = stmt3
-                .query_map(rusqlite::params![agent], |row| {
-                    Ok(SkillLine {
-                        id: row.get(0)?,
-                        skill_name: row.get(1)?,
-                        trigger: row.get(2)?,
-                        tool_sequence_json: row.get(3)?,
-                    })
-                })?
-                .filter_map(|r| r.ok())
-                .collect();
+            // Query 3: top-5 procedural skills by access_count, under the same
+            // eligibility rule the KNN pool applies to this table — own project
+            // or unattributed. There are only five slots, so a skill learned in
+            // another codebase does not merely appear, it displaces one that
+            // belongs here. No cross-project carve-out exists for skills: a
+            // procedure is written against a specific stack and layout, and
+            // replaying it elsewhere is how the wrong command gets run.
+            let map_skill = |row: &rusqlite::Row<'_>| -> Result<SkillLine, rusqlite::Error> {
+                Ok(SkillLine {
+                    id: row.get(0)?,
+                    skill_name: row.get(1)?,
+                    trigger: row.get(2)?,
+                    tool_sequence_json: row.get(3)?,
+                })
+            };
+            let top_skills: Vec<SkillLine> = if let Some(ref pid) = proj {
+                let mut stmt3 = c.prepare(
+                    "SELECT id, skill_name, trigger, tool_sequence FROM procedural_skill
+                     WHERE agent_id = ?1
+                       AND (project_id = ?2 OR project_id IS NULL)
+                       AND tier = 1
+                       AND deleted_at IS NULL
+                     ORDER BY access_count DESC
+                     LIMIT 5",
+                )?;
+                let rows: Vec<SkillLine> = stmt3
+                    .query_map(rusqlite::params![agent, pid], |row| map_skill(row))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                rows
+            } else {
+                let mut stmt3 = c.prepare(
+                    "SELECT id, skill_name, trigger, tool_sequence FROM procedural_skill
+                     WHERE agent_id = ?1
+                       AND tier = 1
+                       AND deleted_at IS NULL
+                     ORDER BY access_count DESC
+                     LIMIT 5",
+                )?;
+                let rows: Vec<SkillLine> = stmt3
+                    .query_map(rusqlite::params![agent], |row| map_skill(row))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                rows
+            };
 
             let current_focus: Option<String> = None;
             let workspace_disputes: Vec<(i64, i64)> = Vec::new();
@@ -871,5 +911,229 @@ mod tests {
             "expected WorkspaceIo error, got {:?}",
             result
         );
+    }
+
+    // ── project scoping of the deterministic channel ─────────────────────────
+
+    async fn insert_tier1_memory_with_project(
+        store: &MemoryStore,
+        agent_id: &str,
+        project_id: Option<&str>,
+        content: &str,
+        memory_type: &str,
+        importance: f64,
+    ) -> i64 {
+        let agent = agent_id.to_string();
+        let project = project_id.map(|p| p.to_string());
+        let content = content.to_string();
+        let memory_type = memory_type.to_string();
+        store
+            .conn
+            .call(move |c| -> Result<i64, rusqlite::Error> {
+                c.execute(
+                    "INSERT INTO memory (scope, agent_id, project_id, content, memory_type, source,
+                     created_at, created_by_type, created_by_ref,
+                     last_modified_at, last_accessed_at, importance, tier, status)
+                     VALUES ('agent', ?1, ?2, ?3, ?4, 'chat', 0, 'user', ?1, 0, 0, ?5, 1, 'active')",
+                    rusqlite::params![agent, project, content, memory_type, importance],
+                )?;
+                Ok(c.last_insert_rowid())
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn insert_skill_with_project(
+        store: &MemoryStore,
+        agent_id: &str,
+        project_id: Option<&str>,
+        skill_name: &str,
+    ) -> i64 {
+        use crate::memory::store_insert::{NewProceduralSkillRecord, PromoteOutcome};
+        let mut embedding = vec![0.0_f32; 384];
+        embedding[skill_name.len() % 384] = 1.0;
+        let outcome = store
+            .promote_to_procedural_skill(
+                NewProceduralSkillRecord {
+                    agent_id: agent_id.to_string(),
+                    project_id: project_id.map(|p| p.to_string()),
+                    skill_name: skill_name.to_string(),
+                    trigger: format!("trigger-{skill_name}"),
+                    // The dedup key is (agent_id, tool_sequence): two rows for the
+                    // same agent sharing a sequence collapse into one UPDATE.
+                    tool_sequence_json: format!("[\"read\",\"{skill_name}\"]"),
+                    source_trajectory_ids: vec![1],
+                    importance: 8.0,
+                    now_ms: 1_700_000_000_000,
+                },
+                Some(embedding),
+            )
+            .await
+            .unwrap();
+        match outcome {
+            PromoteOutcome::Inserted(id) => id,
+            other => panic!("expected a fresh insert, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_top_skills_exclude_foreign_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let store = MemoryStore::new_for_test().await.unwrap();
+
+        let own = insert_skill_with_project(&store, "agent-skills", Some("P1"), "skill-own").await;
+        let foreign =
+            insert_skill_with_project(&store, "agent-skills", Some("P2"), "skill-foreign").await;
+
+        let emitted = wm
+            .regenerate_auto_section("agent-skills", Some("P1"), &store)
+            .await
+            .unwrap();
+
+        assert!(
+            emitted.contains(TableKind::Procedural, own),
+            "the skill belonging to the rendered project must be listed"
+        );
+        assert!(
+            !emitted.contains(TableKind::Procedural, foreign),
+            "a skill owned by another project must not occupy a slot in this project's listing"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_top_skills_include_null_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let store = MemoryStore::new_for_test().await.unwrap();
+
+        let unowned =
+            insert_skill_with_project(&store, "agent-skills-null", None, "skill-unowned").await;
+
+        let emitted = wm
+            .regenerate_auto_section("agent-skills-null", Some("P1"), &store)
+            .await
+            .unwrap();
+
+        assert!(
+            emitted.contains(TableKind::Procedural, unowned),
+            "a skill with no project of its own belongs to every project, so scoping must not hide it"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_top_skills_unscoped_listing_ignores_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let store = MemoryStore::new_for_test().await.unwrap();
+
+        let p1 = insert_skill_with_project(&store, "agent-skills-any", Some("P1"), "skill-p1").await;
+        let p2 = insert_skill_with_project(&store, "agent-skills-any", Some("P2"), "skill-p2").await;
+        let none = insert_skill_with_project(&store, "agent-skills-any", None, "skill-none").await;
+
+        let emitted = wm
+            .regenerate_auto_section("agent-skills-any", None, &store)
+            .await
+            .unwrap();
+
+        for id in [p1, p2, none] {
+            assert!(
+                emitted.contains(TableKind::Procedural, id),
+                "a caller that supplies no project must still see skill {id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_decisions_include_null_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let store = MemoryStore::new_for_test().await.unwrap();
+
+        let unowned = insert_tier1_memory_with_project(
+            &store,
+            "agent-arch",
+            None,
+            "hexagonal por defecto",
+            "architectural_decision",
+            9.0,
+        )
+        .await;
+
+        let emitted = wm
+            .regenerate_auto_section("agent-arch", Some("P1"), &store)
+            .await
+            .unwrap();
+
+        assert!(
+            emitted.contains(TableKind::Memory, unowned),
+            "a decision recorded without a project applies everywhere, so a scoped workspace must \
+             still render it"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_decisions_exclude_foreign_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let store = MemoryStore::new_for_test().await.unwrap();
+
+        let own = insert_tier1_memory_with_project(
+            &store,
+            "agent-arch-x",
+            Some("P1"),
+            "decision de este proyecto",
+            "architectural_decision",
+            9.0,
+        )
+        .await;
+        let foreign = insert_tier1_memory_with_project(
+            &store,
+            "agent-arch-x",
+            Some("P2"),
+            "decision de otro proyecto",
+            "architectural_decision",
+            9.0,
+        )
+        .await;
+
+        let emitted = wm
+            .regenerate_auto_section("agent-arch-x", Some("P1"), &store)
+            .await
+            .unwrap();
+
+        assert!(emitted.contains(TableKind::Memory, own), "own-project decision must be rendered");
+        assert!(
+            !emitted.contains(TableKind::Memory, foreign),
+            "another project's decision must not be rendered here"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_preferences_cross_project_boundaries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let store = MemoryStore::new_for_test().await.unwrap();
+
+        let p1 = insert_tier1_memory_with_project(
+            &store, "agent-prefs", Some("P1"), "prefiere voseo", "user_preference", 9.0,
+        )
+        .await;
+        let p2 = insert_tier1_memory_with_project(
+            &store, "agent-prefs", Some("P2"), "prefiere tabs", "user_preference", 9.0,
+        )
+        .await;
+
+        let emitted = wm
+            .regenerate_auto_section("agent-prefs", Some("P1"), &store)
+            .await
+            .unwrap();
+
+        for id in [p1, p2] {
+            assert!(
+                emitted.contains(TableKind::Memory, id),
+                "preference {id} describes the person, not the project, so it must survive scoping"
+            );
+        }
     }
 }
