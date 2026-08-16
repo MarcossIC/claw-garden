@@ -792,8 +792,9 @@ mod tests {
         let recent_ts = now_ms - 86_400_000; // 1 day ago
         let old_ts = now_ms - 30 * 86_400_000; // 30 days ago
 
-        // Insert 3 rows into memory with embeddings matching our fake embedder output
-        // Tier 2+ to pass the tier > 1 filter in search
+        // Insert 3 rows into memory with embeddings matching our fake embedder output.
+        // Tier value is arbitrary here — SEARCH_SQL_MEMORY has no tier filter, every
+        // tier is KNN-retrievable.
         for (ts, content) in &[(recent_ts, "recent 1"), (recent_ts, "recent 2"), (old_ts, "old 1")] {
             let ts = *ts;
             let content = content.to_string();

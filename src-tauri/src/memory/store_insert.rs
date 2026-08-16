@@ -40,6 +40,32 @@ impl MemoryType {
             Self::SemanticFact => "semantic_fact",
         }
     }
+
+    /// Only a type that asserts something can be contradicted. An explicit
+    /// `match` rather than `matches!`: adding an 8th variant is then a
+    /// compile error here, not a silent `false`.
+    pub(crate) fn is_claim_bearing(self) -> bool {
+        match self {
+            Self::UserPreference | Self::ArchitecturalDecision | Self::SemanticFact => true,
+            Self::ChatMessage | Self::ToolError | Self::CodeBlock | Self::SessionSummary => false,
+        }
+    }
+
+    /// Parses the raw DB string. Unknown or legacy values return `None` —
+    /// treated as not eligible for the contradiction type gate rather than
+    /// panicking on a value written by a future or foreign schema version.
+    pub(crate) fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "chat_message" => Some(Self::ChatMessage),
+            "tool_error" => Some(Self::ToolError),
+            "code_block" => Some(Self::CodeBlock),
+            "session_summary" => Some(Self::SessionSummary),
+            "user_preference" => Some(Self::UserPreference),
+            "architectural_decision" => Some(Self::ArchitecturalDecision),
+            "semantic_fact" => Some(Self::SemanticFact),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +157,92 @@ pub enum MemoryStoreError {
 }
 
 impl MemoryStore {
+    /// Reinforces the existing active row matching `(agent_id,
+    /// COALESCE(project_id,''), content_hash)`, if any: `access_count += 1`,
+    /// `last_accessed_at = MAX(last_accessed_at, now_ms)`, `tier` recomputed
+    /// via `compute_tier`. Returns the reinforced row's id, or `None` on a
+    /// miss.
+    ///
+    /// One `conn.call()` holding one `SELECT .optional()` → branch → `UPDATE`
+    /// — atomic for that pair, shaped after `promote_to_procedural_skill`
+    /// (`store_insert.rs`). `COALESCE(project_id,'')` is repeated
+    /// byte-identically against `idx_memory_dedup` so the planner can use it;
+    /// `status IN ('active','disputed')` mirrors `SEARCH_SQL_MEMORY` — a
+    /// `superseded` row was explicitly replaced and reinforcing it would
+    /// resurrect a retired claim. `deleted_at IS NULL` keeps a soft-deleted
+    /// row from being silently un-deleted by a resent chunk. `ORDER BY
+    /// created_at ASC LIMIT 1` makes the pick deterministic among
+    /// pre-dedup legacy duplicates, converging repeated content onto one
+    /// canonical (the oldest) row instead of a run-to-run coin flip.
+    ///
+    /// Fail-open: an error here degrades to today's behaviour (embed+insert
+    /// proceeds as if this were a miss) rather than dropping the ingest —
+    /// the caller in `worker.rs` treats `Err` the same as `Ok(None)`.
+    ///
+    /// The lookup-then-insert race (a chunk could be hashed, missed here,
+    /// then embedded and inserted as a duplicate row before another chunk
+    /// with the same hash finishes its own miss) is closed by
+    /// `memory_worker` being the single sequential consumer of one ingest
+    /// channel — not by a DB constraint, because `idx_memory_dedup` cannot
+    /// be `UNIQUE` (see the migration). `start_memory_worker` (`worker.rs`)
+    /// is the only spawn site (`rg -n 'start_memory_worker|memory_worker\('`
+    /// confirms this). If the worker is ever parallelized, this guarantee
+    /// breaks, and the fix is, in order: (i) a maintenance pass collapsing
+    /// legacy duplicate triples, reassigning `superseded_by` /
+    /// `disputed_against`; (ii) a migration swapping the index for a real
+    /// `UNIQUE` one; (iii) catching `SQLITE_CONSTRAINT_UNIQUE` on insert and
+    /// falling back to this method.
+    pub(crate) async fn reinforce_if_duplicate(
+        &self,
+        agent_id: &str,
+        project_id: Option<&str>,
+        content_hash: &str,
+        now_ms: u64,
+    ) -> Result<Option<i64>, MemoryStoreError> {
+        let agent_id = agent_id.to_string();
+        let project_id = project_id.map(str::to_string);
+        let content_hash = content_hash.to_string();
+        let now = TimestampMs::from_unix_millis_u64(now_ms);
+
+        self.conn
+            .call(move |c| -> rusqlite::Result<Option<i64>> {
+                let tx = c.transaction()?;
+
+                let existing_id: Option<i64> = tx
+                    .query_row(
+                        "SELECT id FROM memory \
+                         WHERE agent_id = ?1 \
+                           AND COALESCE(project_id, '') = COALESCE(?2, '') \
+                           AND content_hash = ?3 \
+                           AND content_hash IS NOT NULL \
+                           AND deleted_at IS NULL \
+                           AND status IN ('active', 'disputed') \
+                         ORDER BY created_at ASC LIMIT 1",
+                        rusqlite::params![agent_id, project_id, content_hash],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+
+                let Some(id) = existing_id else {
+                    return Ok(None);
+                };
+
+                tx.execute(
+                    "UPDATE memory \
+                     SET last_accessed_at = MAX(last_accessed_at, ?2), \
+                         access_count     = access_count + 1, \
+                         tier = compute_tier(tier, importance, access_count + 1, memory_type) \
+                     WHERE id = ?1",
+                    rusqlite::params![id, now],
+                )?;
+
+                tx.commit()?;
+                Ok(Some(id))
+            })
+            .await
+            .map_err(MemoryStoreError::from)
+    }
+
     pub async fn insert_memory_with_vector(
         &self,
         record: NewMemoryRecord,
@@ -151,6 +263,10 @@ impl MemoryStore {
         // producer (worker.rs, extractor.rs). PROMOTE-ONLY, starts from
         // current=3 (see memory/tier.rs).
         let tier: i64 = crate::memory::tier::compute_tier(3, record.importance, 0, record.memory_type.as_str());
+        // Same normalization the write-border dedup gate hashes against
+        // (worker.rs, before embed) — writing it here too keeps every row
+        // dedup-eligible regardless of which producer inserted it.
+        let content_hash = crate::memory::dedup::content_hash(&record.content);
 
         self.conn
             .call(move |c| -> Result<i64, rusqlite::Error> {
@@ -159,9 +275,9 @@ impl MemoryStore {
                     "INSERT INTO memory \
                      (scope, agent_id, project_id, content, memory_type, source, \
                       created_at, created_by_type, created_by_ref, \
-                      last_modified_at, last_accessed_at, importance, tier, \
-                      status, disputed_against, last_disputed_at) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                      last_modified_at, last_accessed_at, access_count, importance, tier, \
+                      status, disputed_against, last_disputed_at, content_hash) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     rusqlite::params![
                         record.scope,
                         record.agent_id,
@@ -178,11 +294,17 @@ impl MemoryStore {
                         record.created_by_ref,
                         created_at,
                         created_at,
+                        // Written explicitly as 1, not left at the schema's DEFAULT 0: this
+                        // row's creation is itself the first occurrence of this content, so
+                        // a chunk resent once (one REINFORCE, `access_count + 1`) reads as
+                        // "seen twice" — 2, not 1 — matching what REINFORCE's `+= 1` promises.
+                        1,
                         record.importance,
                         tier,
                         status,
                         da_json,
                         last_disp,
+                        content_hash,
                     ],
                 )?;
                 let id = tx.last_insert_rowid();
@@ -501,6 +623,68 @@ mod tests {
         assert_eq!(MemoryType::UserPreference.as_str(), "user_preference");
         assert_eq!(MemoryType::ArchitecturalDecision.as_str(), "architectural_decision");
         assert_eq!(MemoryType::SemanticFact.as_str(), "semantic_fact");
+    }
+
+    // ── is_claim_bearing — truth table over all 7 variants ─────────────────
+
+    #[test]
+    fn is_claim_bearing_true_for_user_preference() {
+        assert!(MemoryType::UserPreference.is_claim_bearing());
+    }
+
+    #[test]
+    fn is_claim_bearing_true_for_architectural_decision() {
+        assert!(MemoryType::ArchitecturalDecision.is_claim_bearing());
+    }
+
+    #[test]
+    fn is_claim_bearing_true_for_semantic_fact() {
+        assert!(MemoryType::SemanticFact.is_claim_bearing());
+    }
+
+    #[test]
+    fn is_claim_bearing_false_for_chat_message() {
+        assert!(!MemoryType::ChatMessage.is_claim_bearing());
+    }
+
+    #[test]
+    fn is_claim_bearing_false_for_tool_error() {
+        assert!(!MemoryType::ToolError.is_claim_bearing());
+    }
+
+    #[test]
+    fn is_claim_bearing_false_for_code_block() {
+        assert!(!MemoryType::CodeBlock.is_claim_bearing());
+    }
+
+    #[test]
+    fn is_claim_bearing_false_for_session_summary() {
+        assert!(!MemoryType::SessionSummary.is_claim_bearing());
+    }
+
+    // ── from_db_str — round-trips as_str(), unknown → None ─────────────────
+
+    #[test]
+    fn from_db_str_round_trips_every_variant() {
+        let variants = [
+            MemoryType::ChatMessage,
+            MemoryType::ToolError,
+            MemoryType::CodeBlock,
+            MemoryType::SessionSummary,
+            MemoryType::UserPreference,
+            MemoryType::ArchitecturalDecision,
+            MemoryType::SemanticFact,
+        ];
+        for v in variants {
+            assert_eq!(MemoryType::from_db_str(v.as_str()), Some(v), "round-trip failed for {v:?}");
+        }
+    }
+
+    #[test]
+    fn from_db_str_unknown_value_returns_none() {
+        assert_eq!(MemoryType::from_db_str("episode"), None);
+        assert_eq!(MemoryType::from_db_str("not_a_real_type"), None);
+        assert_eq!(MemoryType::from_db_str(""), None);
     }
 
     #[test]
@@ -1257,6 +1441,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn insert_writes_content_hash_matching_dedup_content_hash() {
+        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let record = make_record("a", None); // content = "test content"
+        let embedding = make_embedding_384();
+        let id = store.insert_memory_with_vector(record, embedding).await.unwrap();
+
+        let stored_hash: Option<String> = store
+            .conn
+            .call(move |c| {
+                c.query_row(
+                    "SELECT content_hash FROM memory WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_hash.as_deref(),
+            Some(crate::memory::dedup::content_hash("test content").as_str()),
+            "insert must write content_hash = dedup::content_hash(content)"
+        );
+    }
+
+    #[tokio::test]
     async fn zero_embedding_is_rejected_and_writes_nothing() {
         let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
         let record = make_record("a", None);
@@ -1343,5 +1552,218 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(root_cause.as_deref(), Some("model_limitation"), "second UPDATE must overwrite the first (last-write-wins)");
+    }
+
+    // ── reinforce_if_duplicate ───────────────────────────────────────────────
+
+    /// Raw-inserts a `memory` row with the given `content_hash`, `status`, and
+    /// `deleted_at`, bypassing `insert_memory_with_vector` (which does not yet
+    /// bind `content_hash`). Returns the new row id.
+    async fn seed_hashed_row(
+        store: &MemoryStore,
+        agent_id: &str,
+        project_id: Option<&str>,
+        content_hash: &str,
+        status: &str,
+        deleted_at: Option<i64>,
+        created_at: i64,
+        access_count: i64,
+    ) -> i64 {
+        let agent_id = agent_id.to_string();
+        let project_id = project_id.map(str::to_string);
+        let content_hash = content_hash.to_string();
+        let status = status.to_string();
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<i64> {
+                c.execute(
+                    "INSERT INTO memory \
+                     (scope, agent_id, project_id, content, memory_type, source, content_hash, \
+                      created_at, created_by_type, created_by_ref, last_modified_at, \
+                      last_accessed_at, access_count, importance, tier, status, deleted_at) \
+                     VALUES ('agent', ?1, ?2, 'dup content', 'chat_message', 'chat', ?3, \
+                      ?4, 'user', ?1, ?4, ?4, ?5, 5.0, 3, ?6, ?7)",
+                    rusqlite::params![agent_id, project_id, content_hash, created_at, access_count, status, deleted_at],
+                )?;
+                Ok(c.last_insert_rowid())
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn fetch_access_count_and_tier(store: &MemoryStore, id: i64) -> (i64, i64) {
+        store
+            .conn
+            .call(move |c| {
+                c.query_row(
+                    "SELECT access_count, tier FROM memory WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reinforce_if_duplicate_hit_increments_access_count_and_recomputes_tier() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        // architectural_decision at tier=2, access_count=2 — a 3rd access
+        // promotes to tier=1 via compute_tier's flush re-eval rule.
+        let hash = "hash-reinforce-1";
+        let id = seed_hashed_row(&store, "agent-r1", None, hash, "active", None, 1_000, 2).await;
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE memory SET memory_type='architectural_decision' WHERE id = ?1", [id]))
+            .await
+            .unwrap();
+
+        let result = store.reinforce_if_duplicate("agent-r1", None, hash, 2_000).await.unwrap();
+        assert_eq!(result, Some(id), "a matching active row must be reinforced");
+
+        let (access_count, tier) = fetch_access_count_and_tier(&store, id).await;
+        assert_eq!(access_count, 3, "access_count must increment by 1");
+        assert_eq!(tier, 1, "tier must be recomputed via compute_tier (flush re-eval: access_count>=3)");
+    }
+
+    #[tokio::test]
+    async fn reinforce_if_duplicate_miss_returns_none() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let result = store.reinforce_if_duplicate("agent-r2", None, "no-such-hash", 1_000).await.unwrap();
+        assert_eq!(result, None, "no matching row must return None");
+    }
+
+    #[tokio::test]
+    async fn reinforce_if_duplicate_soft_deleted_row_returns_none() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let hash = "hash-reinforce-deleted";
+        seed_hashed_row(&store, "agent-r3", None, hash, "active", Some(500), 1_000, 0).await;
+
+        let result = store.reinforce_if_duplicate("agent-r3", None, hash, 2_000).await.unwrap();
+        assert_eq!(result, None, "a soft-deleted row must never be reinforced");
+    }
+
+    #[tokio::test]
+    async fn reinforce_if_duplicate_superseded_row_returns_none() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let hash = "hash-reinforce-superseded";
+        seed_hashed_row(&store, "agent-r4", None, hash, "superseded", None, 1_000, 0).await;
+
+        let result = store.reinforce_if_duplicate("agent-r4", None, hash, 2_000).await.unwrap();
+        assert_eq!(result, None, "a superseded row must never be reinforced");
+    }
+
+    #[tokio::test]
+    async fn reinforce_if_duplicate_two_project_ids_are_independent() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let hash = "hash-reinforce-scoped";
+        let id_p1 = seed_hashed_row(&store, "agent-r5", Some("proj-1"), hash, "active", None, 1_000, 0).await;
+        let id_p2 = seed_hashed_row(&store, "agent-r5", Some("proj-2"), hash, "active", None, 1_000, 0).await;
+        assert_ne!(id_p1, id_p2);
+
+        let hit_p1 = store.reinforce_if_duplicate("agent-r5", Some("proj-1"), hash, 2_000).await.unwrap();
+        assert_eq!(hit_p1, Some(id_p1), "proj-1 lookup must reinforce only the proj-1 row");
+
+        let hit_p2 = store.reinforce_if_duplicate("agent-r5", Some("proj-2"), hash, 2_000).await.unwrap();
+        assert_eq!(hit_p2, Some(id_p2), "proj-2 lookup must reinforce only the proj-2 row");
+
+        let (ac_p1, _) = fetch_access_count_and_tier(&store, id_p1).await;
+        let (ac_p2, _) = fetch_access_count_and_tier(&store, id_p2).await;
+        assert_eq!(ac_p1, 1, "proj-1 row reinforced exactly once");
+        assert_eq!(ac_p2, 1, "proj-2 row reinforced exactly once");
+    }
+
+    #[tokio::test]
+    async fn reinforce_if_duplicate_null_project_ids_match_each_other() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let hash = "hash-reinforce-null-proj";
+        let id = seed_hashed_row(&store, "agent-r6", None, hash, "active", None, 1_000, 0).await;
+
+        let result = store.reinforce_if_duplicate("agent-r6", None, hash, 2_000).await.unwrap();
+        assert_eq!(result, Some(id), "NULL project_id on both sides must match via COALESCE");
+    }
+
+    #[tokio::test]
+    async fn reinforce_if_duplicate_picks_oldest_among_legacy_duplicates() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let hash = "hash-reinforce-legacy-dup";
+        let older = seed_hashed_row(&store, "agent-r7", None, hash, "active", None, 1_000, 0).await;
+        let _newer = seed_hashed_row(&store, "agent-r7", None, hash, "active", None, 2_000, 0).await;
+
+        let result = store.reinforce_if_duplicate("agent-r7", None, hash, 3_000).await.unwrap();
+        assert_eq!(result, Some(older), "must deterministically pick the oldest row among legacy duplicates");
+    }
+
+    /// `insert_memory_with_vector` writes `access_count = 1` (see that
+    /// function's own comment: the row's creation is itself the first
+    /// occurrence of its content), and `reinforce_if_duplicate` recomputes
+    /// tier from `access_count + 1` on every hit. `compute_tier`'s rule for
+    /// `architectural_decision` / `session_summary` fires at `access_count >=
+    /// 3`, so starting from 1 that threshold is crossed by the SECOND
+    /// reinforcement, not the third — pinned here so a change to either
+    /// number drifts loudly instead of silently.
+    #[tokio::test]
+    async fn architectural_decision_promotes_to_tier_1_after_two_reinforcements() {
+        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let record = make_record_typed(MemoryType::ArchitecturalDecision, 5.0);
+        let content = record.content.clone();
+        let agent_id = record.agent_id.clone().unwrap();
+        let id = store
+            .insert_memory_with_vector(record, make_embedding_384())
+            .await
+            .unwrap();
+        let hash = crate::memory::dedup::content_hash(&content);
+
+        let (access_count, tier) = fetch_access_count_and_tier(&store, id).await;
+        assert_eq!(access_count, 1, "insert must write access_count = 1");
+        assert_eq!(tier, 2, "architectural_decision inserts at tier 2, below the promotion rule");
+
+        store.reinforce_if_duplicate(&agent_id, None, &hash, 2_000).await.unwrap();
+        let (access_count, tier) = fetch_access_count_and_tier(&store, id).await;
+        assert_eq!(access_count, 2);
+        assert_eq!(tier, 2, "one reinforcement is not enough to promote");
+
+        store.reinforce_if_duplicate(&agent_id, None, &hash, 3_000).await.unwrap();
+        let (access_count, tier) = fetch_access_count_and_tier(&store, id).await;
+        assert_eq!(access_count, 3);
+        assert_eq!(tier, 1, "the second reinforcement crosses access_count >= 3 and promotes to tier 1");
+    }
+
+    /// The planner must actually use `idx_memory_dedup` for the lookup —
+    /// this is measured, not assumed (see the design's open question on the
+    /// COALESCE-expression index). A `SCAN memory` in the plan means the
+    /// index is not usable for this exact predicate shape and is flagged
+    /// here as an open risk rather than silently accepted.
+    #[tokio::test]
+    async fn reinforce_lookup_uses_dedup_index() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let plan: Vec<String> = store
+            .conn
+            .call(|c| -> rusqlite::Result<Vec<String>> {
+                let mut stmt = c.prepare(
+                    "EXPLAIN QUERY PLAN \
+                     SELECT id FROM memory \
+                     WHERE agent_id = ?1 \
+                       AND COALESCE(project_id, '') = COALESCE(?2, '') \
+                       AND content_hash = ?3 \
+                       AND content_hash IS NOT NULL \
+                       AND deleted_at IS NULL \
+                       AND status IN ('active', 'disputed') \
+                     ORDER BY created_at ASC LIMIT 1",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params!["a", Option::<String>::None, "h"], |r| {
+                        r.get::<_, String>(3) // EXPLAIN QUERY PLAN's `detail` column
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        let plan_text = plan.join(" | ");
+        assert!(
+            plan_text.contains("idx_memory_dedup"),
+            "expected the planner to use idx_memory_dedup, got plan: {plan_text}"
+        );
     }
 }

@@ -32,9 +32,17 @@ pub(crate) fn compute_tier(
         "user_preference" | "procedural_skill" => current.min(1),
 
         // Rule 3: architectural_decision / session_summary
-        //   – access_count >= 3: promote to tier 1 (flush re-eval locked rule).
+        //   – access_count >= 3: promote to tier 1.
         //   – otherwise:         promote to tier 2 (INSERT initial-tier rule).
         //   The min() call preserves the promote-only invariant when current < target.
+        //
+        //   A freshly inserted row's access_count starts at 1, not 0 — its own
+        //   creation counts as the first occurrence of its content (see
+        //   `insert_memory_with_vector` in store_insert.rs) — and the write-border
+        //   dedup gate adds one more per reinforced resend. So this rule's
+        //   access_count >= 3 threshold is crossed by the SECOND reinforcement of
+        //   an inserted row, not the third. Pinned in store_insert.rs so a change
+        //   to either number is caught instead of silently shifting this boundary.
         "architectural_decision" | "session_summary" => {
             if access_count >= 3 {
                 current.min(1)

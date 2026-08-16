@@ -169,8 +169,10 @@ pub(crate) async fn run_extraction_core(
         return;
     }
 
-    // LOCKED: check the embedder ONCE, BEFORE any LLM call — saves the call
-    // entirely when the embedder is not ready (mirrors worker.rs LOCKED D4).
+    // Check the embedder ONCE, BEFORE any LLM call — saves the call entirely
+    // when the embedder is not ready, instead of running extraction on every
+    // session in the batch only to find out at the end that none of it could
+    // be stored.
     let Some(embedder) = embedder else {
         log::debug!("extractor: embedder not ready; skipping extraction for this session");
         return;
@@ -712,19 +714,14 @@ mod tests {
         );
     }
 
-    // Task 6.2: retrieval by producer via search_all_memories.
+    // Retrieval by producer via search_all_memories.
     //
-    // IMPORTANT (documented divergence from a literal reading of the spec
-    // scenario): `search.rs::SEARCH_SQL_MEMORY` has a PRE-EXISTING filter
-    // `AND m.tier > 1` (predates this change). Since `compute_tier` ALWAYS
-    // assigns `user_preference` to tier=1 (tier.rs rule 2, no override), a
-    // `user_preference` row can NEVER satisfy `tier > 1` — it is structurally
-    // unretrievable via KNN. This is not a bug: tier=1 pivotal content is
-    // surfaced exclusively via workspace.md (task 6.1's bridge), not via KNN,
-    // avoiding duplicate delivery of the same content through two channels.
-    // So this test covers `architectural_decision` (tier=2) and
-    // `semantic_fact` (tier=3) — both satisfy `tier > 1` — plus an explicit
-    // regression-lock proving `user_preference` is excluded by design.
+    // `search.rs::SEARCH_SQL_MEMORY` carries no tier filter — every tier,
+    // including tier=1 (where `compute_tier` always places `user_preference`),
+    // is KNN-retrievable. This test covers `architectural_decision` (tier=2)
+    // and `semantic_fact` (tier=3); `user_preference` (tier=1) is covered
+    // separately below by `user_preference_tier_1_is_retrievable_by_knn`,
+    // which asserts the tier=1 case explicitly.
     #[tokio::test]
     async fn architectural_decision_and_semantic_fact_are_knn_retrievable() {
         use crate::memory::search::{search_all_memories, SearchScope};
@@ -821,39 +818,8 @@ mod tests {
         assert_eq!(hit.tier, 1, "the point of this test is that the row sits at tier 1");
     }
 
-    // The anti-sycophancy guard runs through `search_all_memories`, so the
-    // pool's scan set decides what it can ever contradict. A preference that
-    // reverses an earlier one is the guard's reason to exist; this asserts it
-    // is now a candidate at all, independently of where the threshold lands.
-    #[tokio::test]
-    async fn contradiction_detection_sees_a_tier_1_user_preference() {
-        use crate::memory::contradiction::detect_contradiction;
-
-        let store = MemoryStore::new_for_test().await.unwrap();
-        let embedder = FakeEmbedder::default();
-        let text = "Siempre usá voseo en las respuestas";
-        let emb = embedder.embed_with_role(text, EmbedRole::Passage).await.unwrap();
-        let record = NewMemoryRecord {
-            scope: "agent",
-            agent_id: Some("agent-contra-pref".to_string()),
-            project_id: None,
-            content: text.to_string(),
-            memory_type: MemoryType::UserPreference,
-            source: MemorySource::Chat,
-            created_by_type: CreatedByType::System,
-            created_by_ref: "agent-contra-pref".to_string(),
-            importance: 8.0,
-            created_at_ms: 0,
-            disputed_against: None,
-        };
-        let stored_id = store.insert_memory_with_vector(record, emb.clone()).await.unwrap();
-
-        // Same embedding => distance 0, which is inside any threshold: this
-        // isolates "can the pool see it" from "is the threshold calibrated".
-        let candidates = detect_contradiction(&store, &emb, "agent-contra-pref", None).await;
-        assert!(
-            candidates.contains(&stored_id),
-            "a tier-1 user_preference must be a contradiction candidate"
-        );
-    }
+    // The user_preference contradiction-detection regression test used to live
+    // here. It moved to `contradiction.rs::tests::user_preference_contradiction_detected_at_in_band_distance`
+    // and was re-fixtured to an in-band distance instead of a distance-0 probe
+    // — the near-duplicate floor added by this change makes distance 0 a skip.
 }

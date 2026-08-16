@@ -48,6 +48,13 @@ pub(crate) async fn memory_worker(
     chat_chunker: Arc<ChatChunker>,
     code_chunker: Arc<CodeChunker>,
 ) {
+    // Running count of chunks absorbed by the write-border dedup gate.
+    // Plain `u64`, no atomic: `memory_worker` is the single sequential
+    // consumer of this channel — see `MemoryStore::reinforce_if_duplicate`'s
+    // doc comment in `store_insert.rs`, which states that guarantee and its
+    // escalation path if the worker is ever parallelized — so nothing else
+    // can race an increment.
+    let mut absorbed_duplicates: u64 = 0;
     while let Some(evt) = rx.recv().await {
         if let Err(e) = process_event(
             &evt,
@@ -55,6 +62,7 @@ pub(crate) async fn memory_worker(
             &embedder_cell,
             &chat_chunker,
             &code_chunker,
+            &mut absorbed_duplicates,
         )
         .await
         {
@@ -74,6 +82,7 @@ async fn process_event(
     embedder_cell: &Arc<OnceCell<Arc<dyn Embedder>>>,
     chat_chunker: &Arc<ChatChunker>,
     code_chunker: &Arc<CodeChunker>,
+    absorbed: &mut u64,
 ) -> Result<(), MemoryWorkerError> {
     // Source-first: Compaction-sourced events bypass select_chunker (and thus
     // the Role::System→Skip rule that ordinarily drops system-authored
@@ -112,6 +121,39 @@ async fn process_event(
     };
 
     for chunk in chunks {
+        // A repeated chunk reinforces the existing memory instead of inserting another
+        // row: access_count += 1 promotes the tier through compute_tier, so repeating
+        // something makes it more retrievable. Chosen over replacing or rejecting the
+        // duplicate because in a memory system repetition IS signal. Reverting this
+        // reopens the duplicate-dispute path into the resolver, which costs one LLM
+        // call per false positive.
+        //
+        // Runs BEFORE embedding, not after: a hash lookup is orders of magnitude
+        // cheaper than an inference call, so a duplicate never pays for the vector
+        // it doesn't need. Fail-open on a lookup error — this must degrade to
+        // today's behavior (fall through to embed) rather than drop the chunk.
+        let hash = crate::memory::dedup::content_hash(&chunk.text);
+        match store
+            .reinforce_if_duplicate(&evt.agent_id, evt.project_id.as_deref(), &hash, evt.timestamp_ms)
+            .await
+        {
+            Ok(Some(id)) => {
+                *absorbed += 1;
+                log::debug!(
+                    "ingest absorbed duplicate (agent={}, memory_id={id}) absorbed_total={absorbed}",
+                    evt.agent_id
+                );
+                continue;
+            }
+            Ok(None) => {} // miss — fall through to embed + detect + insert
+            Err(e) => {
+                log::warn!(
+                    "dedup lookup failed (agent={}): {e}; falling through to embed",
+                    evt.agent_id
+                );
+            }
+        }
+
         // Passage: a stored chunk is the thing being searched THROUGH. The one
         // vector produced here feeds BOTH consumers below — insert and the
         // contradiction KNN probe — with no second inference call, so both
@@ -131,6 +173,7 @@ async fn process_event(
                     &vec,
                     &evt.agent_id,
                     evt.project_id.as_deref(),
+                    record.memory_type,
                 )
                 .await;
                 if !disputed.is_empty() {
@@ -167,7 +210,11 @@ async fn process_event(
 /// Spawn entry point — called from `lib.rs::run()` setup hook.
 ///
 /// Builds the two chunkers once, then hands ownership to the worker future.
-/// Returns immediately; the spawned task lives for the app lifetime.
+/// Returns immediately; the spawned task lives for the app lifetime. This is
+/// the ONLY call site that spawns `memory_worker` — the single-sequential-
+/// consumer guarantee the dedup gate and the absorbed-duplicates counter both
+/// depend on (see `MemoryStore::reinforce_if_duplicate` in `store_insert.rs`)
+/// holds only as long as that stays true. A second spawn site would race it.
 pub(crate) fn start_memory_worker(
     app_handle: tauri::AppHandle,
     memory_rx: UnboundedReceiver<MemoryEvent>,
@@ -850,64 +897,52 @@ mod tests {
             .unwrap()
     }
 
-    /// detect_contradiction returns non-empty ids → new row has
-    /// disputed_against=Some(ids) and status='disputed'.
-    ///
-    /// Strategy: send two identical events through the same worker.
-    /// The first is inserted with status='active'. When the second arrives,
-    /// detect_contradiction finds the first row (distance=0 < 0.20) and
-    /// sets disputed_against=[first_id] on the second row.
+    /// Two identical-content events must REINFORCE, not dispute: the
+    /// write-border dedup gate hashes the second chunk, finds the first row
+    /// by `(agent_id, project_id, content_hash)`, and increments its
+    /// `access_count` instead of inserting a second row and running the
+    /// contradiction detector against it. This deliberately inverts the
+    /// prior expectation of this test — a resent chunk used to reach
+    /// `detect_contradiction` at distance 0 and get marked `disputed`, which
+    /// was exactly the structural false positive the dedup gate exists to
+    /// prevent.
     #[tokio::test]
-    async fn worker_sets_disputed_against_when_contradiction_detected() {
+    async fn worker_reinforces_identical_content_instead_of_disputing() {
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
         let embedder: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
         let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
 
-        // Event 1: no prior rows → detect_contradiction returns [] → active
+        // Event 1: no prior rows → inserted, active.
         tx.send(make_event(Role::User, "identical content", None, 1)).unwrap();
-        // Wait for event 1 to be processed before sending event 2
-        // (yield_now a few times to let the async worker drain the channel entry)
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
 
-        // Event 2: identical content → same embedding → detect_contradiction finds row 1
+        // Event 2: identical content → hash matches row 1 → REINFORCE, not insert.
         tx.send(make_event(Role::User, "identical content", None, 2)).unwrap();
 
         drain_worker(tx, handle).await;
 
         // Fetch all rows ordered by id
         let conn = store.conn.clone();
-        let rows: Vec<(i64, String, Option<String>)> = conn
-            .call(|c| -> Result<Vec<(i64, String, Option<String>)>, rusqlite::Error> {
+        let rows: Vec<(i64, String, Option<String>, i64)> = conn
+            .call(|c| -> Result<Vec<(i64, String, Option<String>, i64)>, rusqlite::Error> {
                 let mut stmt = c.prepare(
-                    "SELECT id, status, disputed_against FROM memory ORDER BY id ASC"
+                    "SELECT id, status, disputed_against, access_count FROM memory ORDER BY id ASC"
                 )?;
                 let rows = stmt
-                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(rows)
             })
             .await
             .unwrap();
 
-        assert_eq!(rows.len(), 2, "expected exactly 2 rows; got {}", rows.len());
-        let (id1, status1, da1) = &rows[0];
-        let (_, status2, da2) = &rows[1];
-
-        // Row 1: no prior rows at insertion time → active, no dispute
-        assert_eq!(status1, "active", "row 1 must be active");
-        assert!(da1.is_none(), "row 1 must have disputed_against=NULL");
-
-        // Row 2: row 1 exists with distance=0 < 0.20 → disputed
-        assert_eq!(status2, "disputed", "row 2 must be disputed (detected contradiction)");
-        let da_json = da2.as_ref().expect("row 2 must have disputed_against set");
-        let parsed: Vec<i64> = serde_json::from_str(da_json)
-            .expect("disputed_against must be valid JSON");
-        assert!(
-            parsed.contains(id1),
-            "row 2's disputed_against must contain row 1's id={id1}; got {parsed:?}"
-        );
+        assert_eq!(rows.len(), 1, "the second identical event must REINFORCE, not insert a second row; got {} rows", rows.len());
+        let (_, status, disputed_against, access_count) = &rows[0];
+        assert_eq!(status, "active", "the reinforced row must stay active, never disputed");
+        assert!(disputed_against.is_none(), "reinforcement must never set disputed_against");
+        assert_eq!(*access_count, 2, "access_count must be 2 after one reinforcement");
     }
 
     /// detect_contradiction returns empty → new row has
@@ -986,6 +1021,69 @@ mod tests {
         );
         assert_eq!(recorded[0].0, EmbedRole::Passage, "worker must embed with role Passage");
         assert_eq!(recorded[0].1, "single chunk of content");
+    }
+
+    /// The write-border dedup gate runs BEFORE `embed_with_role`: a duplicate
+    /// chunk must never reach the embedder at all. Sending the identical text
+    /// twice through one worker must produce exactly ONE recorded embed call
+    /// — asserting `== 1`, not `== 0`, is the point: it proves the second
+    /// send was absorbed by the gate, not that the embedder was never wired.
+    #[tokio::test]
+    async fn worker_embeds_duplicate_chunk_zero_times() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let embedder: Arc<dyn Embedder> = Arc::new(RecordingEmbedder { calls: calls.clone() });
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        tx.send(make_event(Role::User, "repeated content", None, 1)).unwrap();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        tx.send(make_event(Role::User, "repeated content", None, 2)).unwrap();
+        drain_worker(tx, handle).await;
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the duplicate send must be absorbed by the dedup gate before embedding, got {recorded:?}"
+        );
+    }
+
+    // ── Absorbed-duplicates counter: pinned against deletion ─────────────────
+
+    /// `absorbed` is a plain counter incremented once per REINFORCE hit.
+    /// Every existing test in this module observes duplicate absorption only
+    /// indirectly — via row count or embed-call count — so deleting the
+    /// increment itself (or the whole `log::debug!` line reading it) would
+    /// leave the rest of the suite green. This test calls `process_event`
+    /// directly, twice, with identical content through the same store and
+    /// embedder, and asserts the counter's value after each call.
+    #[tokio::test]
+    async fn absorbed_duplicates_counter_increments_on_reinforce_hit() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let cell: OnceCell<Arc<dyn Embedder>> = OnceCell::new();
+        cell.set(embedder).ok();
+        let cell = Arc::new(cell);
+        let chat_chunker = Arc::new(ChatChunker::with_fallback());
+        let code_chunker = Arc::new(CodeChunker::new());
+
+        let mut absorbed: u64 = 0;
+        let evt = make_event(Role::User, "counter fixture content", None, 1);
+
+        process_event(&evt, &store, &cell, &chat_chunker, &code_chunker, &mut absorbed)
+            .await
+            .unwrap();
+        assert_eq!(absorbed, 0, "the first send has no prior row to reinforce");
+
+        process_event(&evt, &store, &cell, &chat_chunker, &code_chunker, &mut absorbed)
+            .await
+            .unwrap();
+        assert_eq!(
+            absorbed, 1,
+            "the second identical send must be absorbed by the dedup gate, incrementing the counter"
+        );
     }
 
     // ── Regression: the System→Skip guard still applies to non-Compaction events ──

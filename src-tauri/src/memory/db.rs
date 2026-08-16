@@ -154,7 +154,7 @@ impl MemoryStore {
     /// Open (or create) the memory database at `<base_dir>/memory.db`.
     ///
     /// Registers the `sqlite-vec` extension (process-global, idempotent) and
-    /// runs all five refinery migrations before returning.
+    /// runs all six refinery migrations before returning.
     pub async fn open(base_dir: &Path) -> Result<Self, MemoryError> {
         ensure_vec0_registered();
         // Best-effort directory creation — we'll get a clean error on open if it fails.
@@ -163,9 +163,8 @@ impl MemoryStore {
         // Connection::open returns Result<_, rusqlite::Error>
         let conn = Connection::open(&path).await
             .map_err(MemoryError::Sqlite)?;
+        register_udfs(&conn).await?;
         run_migrations(&conn).await?;
-        crate::memory::tier::register_tier_udf(&conn).await?;
-        crate::memory::tier::register_demote_udf(&conn).await?;
         // Raise SQLITE_LIMIT_VARIABLE_NUMBER from the default 999 to 32766 (SQLite hard
         // maximum). Flush batches of ≤500 rows × 3 bind vars = 1500 params would otherwise
         // exceed the default limit at row 334.
@@ -199,9 +198,8 @@ impl MemoryStore {
         // Connection::open_in_memory returns Result<_, rusqlite::Error>
         let conn = Connection::open_in_memory().await
             .map_err(MemoryError::Sqlite)?;
+        register_udfs(&conn).await?;
         run_migrations(&conn).await?;
-        crate::memory::tier::register_tier_udf(&conn).await?;
-        crate::memory::tier::register_demote_udf(&conn).await?;
         // Raise SQLITE_LIMIT_VARIABLE_NUMBER — same as open() path.
         conn.call(|c| -> rusqlite::Result<()> {
             // SAFETY: c is the exclusive connection reference for this call.
@@ -297,6 +295,25 @@ impl MemoryStore {
             .await
             .map_err(MemoryError::Connection)
     }
+}
+
+// ---------------------------------------------------------------------------
+// UDF registration
+// ---------------------------------------------------------------------------
+
+/// Registers every Rust scalar UDF this database's SQL may call.
+///
+/// Runs BEFORE the migration runner, not after: a migration body can call
+/// these (the content-hash backfill does), and an unregistered UDF is a
+/// "no such function" error that aborts migration on cold start. Nothing
+/// here touches the schema, so running it against an unmigrated connection
+/// is safe by construction. New UDFs go inside this function — never as a
+/// separate call beside run_migrations.
+async fn register_udfs(conn: &Connection) -> Result<(), MemoryError> {
+    crate::memory::dedup::register_content_hash_udf(conn).await?;
+    crate::memory::tier::register_tier_udf(conn).await?;
+    crate::memory::tier::register_demote_udf(conn).await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -623,7 +640,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 5, "Expected exactly 5 applied migrations, got {}", count);
+        assert_eq!(count, 6, "Expected exactly 6 applied migrations, got {}", count);
     }
 
     // -----------------------------------------------------------------------
@@ -844,7 +861,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 5);
+        assert_eq!(migration_count, 6);
     }
 
     // -----------------------------------------------------------------------

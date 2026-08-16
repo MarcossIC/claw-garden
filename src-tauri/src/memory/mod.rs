@@ -45,6 +45,7 @@ pub(crate) mod latency;
 pub(crate) mod access;
 pub(crate) mod score;
 pub(crate) mod tier;
+pub(crate) mod dedup;
 pub(crate) mod search;
 pub(crate) mod workspace;
 pub(crate) mod prompt_builder;
