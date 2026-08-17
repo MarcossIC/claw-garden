@@ -33,28 +33,6 @@ impl SearchScope {
             project_id: None,
         }
     }
-    /// Procedural-only scope — (None, None, Some(10)).
-    pub(crate) fn procedural_only() -> Self {
-        Self {
-            memory: None,
-            episodic: None,
-            procedural: Some(10),
-            project_id: None,
-        }
-    }
-    /// Scope preset for surfacing factual-pivot candidates. Not currently
-    /// called from production code — the live contradiction detector in
-    /// `contradiction.rs` builds its own narrower scope (memory-only, no
-    /// procedural) inline rather than using this constructor.
-    pub(crate) fn factual_pivots() -> Self {
-        Self {
-            memory: Some(5),
-            episodic: None,
-            procedural: Some(5),
-            project_id: None,
-        }
-    }
-
     /// Scopes this query to `project_id`, owning a copy of it. `None` keeps
     /// the scope unscoped — same as never calling this.
     pub(crate) fn with_project(mut self, project_id: Option<&str>) -> Self {
@@ -685,22 +663,6 @@ mod tests {
     }
 
     #[test]
-    fn scope_procedural_only_values() {
-        let s = SearchScope::procedural_only();
-        assert_eq!(s.memory, None);
-        assert_eq!(s.episodic, None);
-        assert_eq!(s.procedural, Some(10));
-    }
-
-    #[test]
-    fn scope_factual_pivots_values() {
-        let s = SearchScope::factual_pivots();
-        assert_eq!(s.episodic, None);
-        assert_eq!(s.memory, Some(5));
-        assert_eq!(s.procedural, Some(5));
-    }
-
-    #[test]
     fn search_scope_with_project_sets_field() {
         let s = SearchScope::all_default().with_project(Some("proj-1"));
         assert_eq!(s.project_id, Some("proj-1".to_string()));
@@ -709,8 +671,6 @@ mod tests {
     #[test]
     fn ctors_default_to_no_project() {
         assert_eq!(SearchScope::all_default().project_id, None);
-        assert_eq!(SearchScope::procedural_only().project_id, None);
-        assert_eq!(SearchScope::factual_pivots().project_id, None);
     }
 
     #[test]

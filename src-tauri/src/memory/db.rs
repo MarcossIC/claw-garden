@@ -154,7 +154,7 @@ impl MemoryStore {
     /// Open (or create) the memory database at `<base_dir>/memory.db`.
     ///
     /// Registers the `sqlite-vec` extension (process-global, idempotent) and
-    /// runs all six refinery migrations before returning.
+    /// runs every refinery migration before returning.
     pub async fn open(base_dir: &Path) -> Result<Self, MemoryError> {
         ensure_vec0_registered();
         // Best-effort directory creation — we'll get a clean error on open if it fails.
@@ -545,9 +545,17 @@ mod tests {
         );
     }
 
-    /// SPEC-2 Sc 2.3 — view present after open.
+    /// The schema carries no views at all, and `all_memories` in particular is
+    /// gone.
+    ///
+    /// V3 created it to scan the three memory kinds in one query; nothing ever
+    /// selected from it. That was structural: flattening three tables onto one
+    /// column list drops `memory_type` and every per-kind column, so callers
+    /// read the tables directly instead. V7 drops it, and asserting the view
+    /// list is EMPTY — rather than just that this one name is absent — is what
+    /// keeps a re-created view from slipping back in unnoticed.
     #[tokio::test]
-    async fn view_exists_after_open() {
+    async fn schema_carries_no_views_after_open() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let views: Vec<String> = store
             .conn
@@ -563,9 +571,56 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            views.contains(&"all_memories".to_string()),
-            "missing 'all_memories' view"
+            views.is_empty(),
+            "no view should survive the migration chain, found: {views:?}"
         );
+    }
+
+    /// An existing database that already has the view loses it on upgrade —
+    /// the drop has to reach installed schemas, not just freshly built ones.
+    /// `new_for_test()` runs the whole chain at once and so can never show
+    /// this; the two-step run is the only shape that can.
+    #[tokio::test]
+    async fn v7_drops_the_view_from_an_already_migrated_database() {
+        ensure_vec0_registered();
+        let conn = Connection::open_in_memory().await.unwrap();
+        register_udfs(&conn).await.unwrap();
+
+        conn.call(|c| {
+            crate::memory::migrations::runner()
+                .set_target(refinery::Target::Version(3))
+                .run(c)
+        })
+        .await
+        .unwrap();
+
+        let before: i64 = conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='view' AND name='all_memories'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(before, 1, "V3 must have created the view for this test to mean anything");
+
+        conn.call(|c| crate::memory::migrations::runner().run(c))
+            .await
+            .unwrap();
+
+        let after: i64 = conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='view' AND name='all_memories'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(after, 0, "V7 must drop the view on an upgraded database");
     }
 
     /// SPEC-2 Sc 2.4 — indices present after open.
@@ -771,7 +826,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 6, "Expected exactly 6 applied migrations, got {}", count);
+        assert_eq!(count, 7, "Expected exactly 7 applied migrations, got {}", count);
     }
 
     // -----------------------------------------------------------------------
@@ -899,7 +954,8 @@ mod tests {
         assert!(tables.contains(&"episodic_trajectory".to_string()));
         assert!(tables.contains(&"procedural_skill".to_string()));
 
-        // SPEC-2 Sc 2.3 — view
+        // The schema defines no views — V3's `all_memories` was dropped by V7
+        // after shipping unused for its whole life.
         let views: Vec<String> = store
             .conn
             .call(|c| -> Result<Vec<String>, rusqlite::Error> {
@@ -913,7 +969,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(views.contains(&"all_memories".to_string()));
+        assert!(views.is_empty(), "found unexpected views: {views:?}");
 
         // SPEC-3 Sc 3.1 — vec_version
         let version: String = store
@@ -992,7 +1048,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 6);
+        assert_eq!(migration_count, 7);
     }
 
     // -----------------------------------------------------------------------

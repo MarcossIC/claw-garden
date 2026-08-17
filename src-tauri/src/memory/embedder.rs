@@ -291,11 +291,18 @@ const _: fn() = || {
 // ============================================================================
 // Stub embedders.
 //
+// Metadata-only, deliberately — these are extension points, not half-built
+// backends. Neither can embed anything: `embed_with_role` panics via
+// `unimplemented!()`, and nothing constructs them outside their own tests.
+// What they DO carry is real `dimensions`/`model_id`, which is what makes them
+// useful before anyone implements them: the persisted embedding contract keys
+// off exactly those two values, so swapping to one of these backends produces
+// a clean contract mismatch on load instead of silently reading a corpus
+// embedded by a different model at a different dimension.
+//
 // Not feature-gated: code that pattern-matches on `Box<dyn Embedder>` should
 // never need a `#[cfg]` branch just because the active backend happens to be
-// unimplemented. `embed_with_role` panics via `unimplemented!()`; `dimensions`
-// and `model_id` return real metadata so the rest of the system can still
-// reason about a stub instance (e.g. log "active embedder: openai-placeholder").
+// unimplemented.
 // ============================================================================
 
 pub struct OllamaEmbedder;

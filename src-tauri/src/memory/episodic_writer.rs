@@ -1,16 +1,16 @@
-//! Episodic-trajectory writer (Fase 2 — memoria-3-capas).
+//! Episodic-trajectory writer.
 //!
 //! `build_trajectory` and its testable core `run_episodic_writer_core` — the
-//! latter now consumed by `memory::miner::mine_session_core` (trajectory-miner
-//! Fase 1), which is the sole fire-and-forget entry point spawned from
-//! `commands/session.rs` on session close (the `run_episodic_writer` wrapper
-//! that used to live here was eliminated in favor of `miner::run_miner`).
+//! latter consumed by `memory::miner::mine_session_core`, which is the sole
+//! fire-and-forget entry point spawned from `commands/session.rs` on session
+//! close (the `run_episodic_writer` wrapper that used to live here was
+//! eliminated in favor of `miner::run_miner`).
 //! `build_trajectory` is a **pure, deterministic** function (no LLM, no DB):
 //! it aggregates the ENTIRE multi-agent session snapshot into a single
 //! `TrajectoryDraft`, since `episodic_trajectory.session_id` is UNIQUE (one
 //! row per session).
 //!
-//! # Design constraints (LOCKED — see `sdd/memoria-3-capas-fase-2/design`)
+//! # Constraints that are deliberate, not incidental
 //! - `build_trajectory` never panics and performs no I/O.
 //! - No `Role::User` (non-empty) anywhere in `history` → `None` (SKIP write).
 //!   There is NO fallback to "first non-empty message of any role" — an
@@ -34,26 +34,43 @@ use crate::models::ChatMessage;
 const TASK_CHAR_CAP: usize = 512;
 
 /// Hard cap (in `chars`) applied PER-ITEM to `errors_encountered` before
-/// serializing to `errors_json` (Lote 5) — LOCKED per design. Note this is
-/// applied at the DB-boundary, NOT inside `build_trajectory`: the pure
+/// serializing to `errors_json`. Deliberately applied at the DB-boundary and
+/// NOT inside `build_trajectory`: the pure
 /// aggregation function keeps the full error content; the cap is a
 /// persistence concern (mirrors the `task`/`TASK_CHAR_CAP` split, but scoped
 /// to a different field and a different layer).
 const ERROR_ITEM_CHAR_CAP: usize = 500;
 
-/// `success_score` formula coefficients (LOCKED per design — worked examples
-/// in Lote 2 pin these exact values):
+/// `success_score` formula coefficients. Deliberate values, pinned by worked
+/// examples in the tests below — changing one silently reshapes which sessions
+/// get mined into skills.
+///
 ///   `success_score = (BASE_SCORE + completion_bonus - unresolved_penalty).clamp(0.0, 1.0)`
 ///   where `completion_bonus = COMPLETION_BONUS` if the session ended on an
 ///   `Assistant` message, else `0.0`, and
 ///   `unresolved_penalty = UNRESOLVED_PENALTY_COEFF * (unresolved / tool_calls.max(1))`.
+///
+/// **This score is a boolean wearing a float's clothes, and reading it as a
+/// gradient will mislead you.** `unresolved` counts errors positioned after the
+/// LAST assistant message, so a session that ends on an assistant message has
+/// no room for one: the bonus applies, the penalty cannot, and the score is
+/// exactly 0.9. A session that ends any other way never gets the bonus and
+/// lands in `[0.0, 0.4]`. The whole band between 0.4 and 0.9 is unreachable —
+/// `success_score_lands_only_in_two_disjoint_bands` is what keeps that true —
+/// and the miner's golden gate sits at 0.85, inside the gap. So the gate asks
+/// one question: did this session end on an assistant message?
+///
+/// That is a reasonable question and the gate is fine. What is not fine is
+/// treating the number as a quality measure: ranking sessions by it, picking a
+/// different threshold, or averaging it produces confident nonsense. Give it
+/// real resolution before asking it a real question.
 const BASE_SCORE: f64 = 0.4;
 const COMPLETION_BONUS: f64 = 0.5;
 const UNRESOLVED_PENALTY_COEFF: f64 = 0.5;
 
 /// One aggregated draft of an entire session's trajectory, ready to be
-/// embedded (on `task`) and persisted via `insert_episodic_trajectory`
-/// (Lote 3). Produced by [`build_trajectory`] — pure, no I/O.
+/// embedded (on `task`) and persisted via `insert_episodic_trajectory`.
+/// Produced by [`build_trajectory`] — pure, no I/O.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TrajectoryDraft {
     pub session_id: String,
@@ -184,9 +201,10 @@ pub(crate) async fn run_episodic_writer_core(
         return None;
     }
 
-    // LOCKED: check the embedder ONCE, BEFORE build_trajectory/insert — saves
-    // the aggregation work entirely when the embedder is not ready (mirrors
-    // extractor.rs / worker.rs LOCKED D4).
+    // Check the embedder ONCE, BEFORE build_trajectory/insert — deliberately
+    // ordered that way: it saves the whole aggregation when the embedder is not
+    // ready, and a trajectory cannot be persisted without its vector anyway.
+    // Same ordering as extractor.rs and worker.rs.
     let Some(embedder) = embedder else {
         log::debug!(
             "episodic_writer: embedder not ready; skipping trajectory write for session={session_id}"
@@ -222,7 +240,8 @@ pub(crate) async fn run_episodic_writer_core(
         .map(|s| crate::memory::identity::derive_project_id(std::path::Path::new(&s)));
 
     // Cap errors_encountered PER-ITEM to ERROR_ITEM_CHAR_CAP chars BEFORE
-    // serializing (LOCKED per design — build_trajectory itself does not cap).
+    // serializing — build_trajectory deliberately does not cap, so the pure
+    // aggregation keeps the full error text and only the DB boundary trims it.
     let capped_errors: Vec<String> = draft
         .errors_encountered
         .iter()
@@ -264,6 +283,7 @@ pub(crate) async fn run_episodic_writer_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::miner::GOLDEN_SCORE_THRESHOLD;
     use crate::models::chat::{ToolCall, ToolFunction};
 
     fn msg(role: Role, content: &str, ts: u64) -> ChatMessage {
@@ -303,6 +323,69 @@ mod tests {
             tool_calls: None,
             timestamp_ms: ts,
             is_error: Some(is_error),
+        }
+    }
+
+    /// The score never lands between 0.4 and 0.9, so the miner's 0.85 gate is a
+    /// yes/no on "did this end on an assistant message" and nothing finer.
+    ///
+    /// Swept rather than reasoned about in one case: the argument is that
+    /// `unresolved` counts errors AFTER the last assistant message, so ending on
+    /// one forces the penalty to zero and pins the score at exactly 0.9. This
+    /// enumerates the shapes that argument has to survive — varying tool count,
+    /// error count, error position and how the session ends — and asserts the
+    /// gap stays empty. Any coefficient change that opens a middle band shows up
+    /// here, where the doc comment above claims it cannot happen.
+    #[test]
+    fn success_score_lands_only_in_two_disjoint_bands() {
+        for tools in 0..4usize {
+            for errors in 0..4usize {
+                for ends_clean in [true, false] {
+                    for errors_trailing in [true, false] {
+                        let mut msgs = vec![msg(Role::User, "task", 0)];
+                        let mut ts = 1u64;
+
+                        if !errors_trailing {
+                            for i in 0..errors {
+                                msgs.push(tool_result(&format!("early err {i}"), ts, true));
+                                ts += 1;
+                            }
+                        }
+                        for i in 0..tools {
+                            msgs.push(assistant_with_tools("", ts, &[&format!("tool_{i}")]));
+                            ts += 1;
+                        }
+                        if errors_trailing {
+                            for i in 0..errors {
+                                msgs.push(tool_result(&format!("late err {i}"), ts, true));
+                                ts += 1;
+                            }
+                        }
+                        if ends_clean {
+                            msgs.push(msg(Role::Assistant, "done", ts));
+                        } else {
+                            msgs.push(tool_result("final failure", ts, true));
+                        }
+
+                        let draft = build_trajectory("sweep", &vec![("a".to_string(), msgs)])
+                            .expect("a User message is always present");
+                        let s = draft.success_score;
+
+                        assert!(
+                            s <= 0.4 + 1e-9 || (s - 0.9).abs() < 1e-9,
+                            "score {s} fell in the unreachable band \
+                             (tools={tools} errors={errors} ends_clean={ends_clean} \
+                              errors_trailing={errors_trailing})"
+                        );
+                        assert_eq!(
+                            s > GOLDEN_SCORE_THRESHOLD,
+                            ends_clean,
+                            "the golden gate must track ONLY how the session ended \
+                             (tools={tools} errors={errors} errors_trailing={errors_trailing})"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -454,7 +537,7 @@ mod tests {
         assert_eq!(draft.task, "x".repeat(512));
     }
 
-    // ── Lote 2 — coeficientes success_score lockeados (worked examples) ──────
+    // ── Worked examples pinning the success_score coefficients ───────────────
 
     #[test]
     fn locked_coefficients_have_designed_values() {
@@ -527,7 +610,7 @@ mod tests {
         assert_eq!(build_trajectory("s", &history).unwrap().success_score, 0.0);
     }
 
-    // ── Lote 5 (memoria-3-capas-fase-2) — run_episodic_writer_core + wrapper ──
+    // ── run_episodic_writer_core ─────────────────────────────────────────────
 
     use crate::memory::embedder::{EmbedError, FakeEmbedder};
 
@@ -736,7 +819,7 @@ mod tests {
         assert_eq!(parsed[0].chars().count(), 500, "each error item must be capped to 500 chars");
     }
 
-    // ── trajectory-miner-fase-1 Lote 2 — Option<(i64, TrajectoryDraft)> return ──
+    // ── Option<(i64, TrajectoryDraft)> return shape ──────────────────────────
 
     // core happy path: Some((rowid, draft)) with rowid > 0 and draft fields intact.
     #[tokio::test]

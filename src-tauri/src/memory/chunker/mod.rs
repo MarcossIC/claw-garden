@@ -1,4 +1,4 @@
-//! Chunker selector + shared types (Phase 3 — REQ-CHK-001, REQ-CHK-002, REQ-CHK-006).
+//! Chunker selector + shared types.
 
 pub(crate) mod chat;
 pub(crate) mod code;
@@ -13,10 +13,12 @@ use crate::models::chat::Role;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChunkerKind {
     Chat,
-    /// Reserved for Phase 4 file-watcher code ingest. `select_chunker` does not
-    /// return this variant in Phase 3 (all events come from `push_and_persist`),
-    /// but the worker match arm is present so Phase 4 can wire it without
-    /// touching the worker.
+    /// Never returned by `select_chunker` today: every event reaches the worker
+    /// through `push_and_persist`, which carries chat turns, and a chat turn is
+    /// never routed here. Reaching this variant needs a producer that ingests
+    /// files — a watcher emitting `MemorySource::CodeFile` — which does not
+    /// exist. The worker's match arm is kept so that producer can be added
+    /// without reopening the worker.
     #[allow(dead_code)]
     Code,
     /// Worker drops the event without inserting.
@@ -28,7 +30,9 @@ pub(crate) enum ChunkerKind {
 pub(crate) struct Chunk {
     pub text: String,
     /// Approximate token count (480 cap target). Set by the tokenizer path;
-    /// 0 in byte-fallback mode. Read by telemetry / Phase 4 retrieval re-ranking.
+    /// 0 in byte-fallback mode. Nothing reads it yet — it is carried so a
+    /// re-ranking or telemetry consumer does not have to re-tokenize text the
+    /// splitter already counted.
     #[allow(dead_code)]
     pub token_count: usize,
     /// Optional header describing context (e.g. "fn foo (rust)") — currently
@@ -38,8 +42,10 @@ pub(crate) struct Chunk {
 
 /// Error type for chunking operations.
 ///
-/// Currently unused at runtime — reserved for Phase 4 where code-chunk parse
-/// failures are surfaced through the command layer.
+/// Unused at runtime: the only chunker the worker reaches is the chat one,
+/// which cannot fail — it splits on speaker turns, never parses. These
+/// variants describe failures of the code path (tree-sitter parse, tokenizer
+/// init), which no producer exercises yet.
 #[allow(dead_code)]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ChunkerError {
@@ -64,7 +70,10 @@ pub(crate) fn select_chunker(
             let _ = is_error;
             ChunkerKind::Chat
         }
-        Role::System => ChunkerKind::Skip, // LOCKED D8 — defensive
+        // A system prompt is instructions the agent was given, not something
+        // that happened — storing it would put the harness's own configuration
+        // into the corpus and retrieve it back as if it were a memory.
+        Role::System => ChunkerKind::Skip,
     }
 }
 

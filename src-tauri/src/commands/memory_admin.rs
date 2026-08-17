@@ -28,9 +28,8 @@ use crate::state::AppState;
 // PascalCase serde (no rename) — it is a record-provenance concept consumed
 // by retrieval. `MemoryKind` here is a separate API-input concept: it
 // deserializes lowercase ("memory"|"episodic"|"procedural"), matching the
-// `all_memories` view's `kind` discriminator and the frontend invoke
-// convention. Unifying the two is an open question deferred to a future
-// change (ripple risk into RankedHit's existing serde shape).
+// frontend invoke convention. Unifying the two is an open question deferred to
+// a future change (ripple risk into RankedHit's existing serde shape).
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -257,10 +256,10 @@ pub(crate) async fn delete_memory_core(
 }
 
 // ---------------------------------------------------------------------------
-// list_memories — one query per physical table rather than the `all_memories`
-// view: the view does not carry `memory_type`, so a caller filtering on it
-// could not be served from the view at all, and filtering by memory type is
-// something this endpoint has to support.
+// list_memories — one query per physical table. A UNION view over the three
+// would have to flatten them onto one column list, which drops `memory_type`
+// (only `memory` has one) — and filtering by memory type is something this
+// endpoint has to support.
 // `summary` is the table-specific content column:
 // `content` (memory) | `task` (episodic) | `skill_name` (procedural).
 // ---------------------------------------------------------------------------
@@ -317,8 +316,7 @@ pub(crate) struct ListParams {
 }
 
 /// Lists rows from `memory` / `episodic_trajectory` / `procedural_skill`
-/// directly (never the `all_memories` view — it lacks `memory_type` and
-/// can't filter on it). `kind: None` runs all 3 per-table queries inside the
+/// directly. `kind: None` runs all 3 per-table queries inside the
 /// SAME `conn.call` and merges + sorts (`created_at DESC`) + paginates in
 /// Rust; `kind: Some(_)` pushes `LIMIT`/`OFFSET` down to SQL directly.
 /// `deleted_at IS NULL` is always applied; `status` is NOT filtered —

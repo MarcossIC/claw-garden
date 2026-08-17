@@ -1,9 +1,11 @@
-/// Tier promotion and demotion logic for the RAG access-tracker (Phase 5).
+/// Tier promotion and demotion logic for the RAG access-tracker.
 ///
-/// [`compute_tier`] is **promote-only** — it never returns a tier number
-/// greater than `current` (lower numbers = higher tier).  Use
-/// [`demote_inactive`] for inactivity-based decay; it is the *only* demoting
-/// function in Phase 5.
+/// The two directions are deliberately separate functions, not one that reads
+/// a signed delta: [`compute_tier`] is **promote-only** — it never returns a
+/// tier number greater than `current` (lower numbers = higher tier) — and
+/// [`demote_inactive`] is the only thing in this codebase that lowers one. A
+/// single function would let an access event demote a row, which is exactly
+/// backwards.
 
 use crate::memory::MemoryError;
 
@@ -59,7 +61,8 @@ pub(crate) fn compute_tier(
 /// Applies inactivity-based demotion to a memory tier.
 ///
 /// Runs in production today: the maintenance pass wires this in through the
-/// demote_tier UDF and sweeps the memory table on a timer.
+/// demote_tier UDF and sweeps `memory`, `episodic_trajectory` and
+/// `procedural_skill` on a timer.
 ///
 /// Takes a day count as f64, never a timestamp — the subtraction that produces
 /// it happens inside the demotion SQL, one expression for the whole table.
@@ -141,7 +144,8 @@ pub(crate) async fn register_tier_udf(
 /// extraction to the closure and computation to the pure-Rust
 /// [`demote_inactive`] function. Mirrors [`register_tier_udf`] above.
 /// Called alongside it in `MemoryStore::open()` and
-/// `MemoryStore::new_for_test()` (memoria-3-capas-fase-3, maintenance job).
+/// `MemoryStore::new_for_test()` — the demotion pass runs as bulk SQL, so the
+/// function has to be reachable from the connection before it fires.
 pub(crate) async fn register_demote_udf(
     conn: &tokio_rusqlite::Connection,
 ) -> Result<(), MemoryError> {

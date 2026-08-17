@@ -33,7 +33,15 @@ use crate::providers::{AiProvider, StreamSender};
 
 /// Golden Trajectory gate threshold. The gate uses strict `>` —
 /// `success_score == 0.85` exactly does NOT pass.
-const GOLDEN_SCORE_THRESHOLD: f64 = 0.85;
+///
+/// Visible to the crate so `episodic_writer` — which produces the scores this
+/// compares against — can assert the two agree. Its
+/// `success_score_lands_only_in_two_disjoint_bands` shows the reachable scores
+/// are `[0.0, 0.4]` and exactly `0.9`, so this value's real job is to sit in
+/// the empty gap between them; a threshold moved into either band would change
+/// the gate from "ended on an assistant message" into something the score has
+/// no resolution to answer.
+pub(crate) const GOLDEN_SCORE_THRESHOLD: f64 = 0.85;
 
 /// Maximum wall-clock time allowed for the namer LLM call (molde `EXTRACTOR_TIMEOUT`).
 const NAMER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);

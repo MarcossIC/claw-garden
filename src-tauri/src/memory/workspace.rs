@@ -138,11 +138,6 @@ struct AutoRows {
     user_prefs: Vec<MemoryLine>,
     arch_decisions: Vec<MemoryLine>,
     top_skills: Vec<SkillLine>,
-    /// No producer defines what "focus" means yet, so this is always `None`.
-    current_focus: Option<String>,
-    /// Always empty: live disputes reach the model through the prompt's own
-    /// CONFLICTS block, which queries them directly.
-    workspace_disputes: Vec<(i64, i64)>,
 }
 
 /// The rows the deterministic workspace channel actually rendered.
@@ -307,15 +302,10 @@ async fn fetch_auto_rows(
                 rows
             };
 
-            let current_focus: Option<String> = None;
-            let workspace_disputes: Vec<(i64, i64)> = Vec::new();
-
             Ok(AutoRows {
                 user_prefs,
                 arch_decisions,
                 top_skills,
-                current_focus,
-                workspace_disputes,
             })
         })
         .await
@@ -338,18 +328,9 @@ fn render_auto_section(rows: &AutoRows) -> (String, EmittedIds) {
     let mut kept = rows.clone();
     let mut content = render_rows(&kept);
 
-    // Reverse priority: disputes → focus → skills → decisions. Preferences
-    // are never trimmed — they are the standing contract with the user, and
-    // dropping one silently changes how the model behaves for a whole
-    // session.
-    if content.len() > AUTO_BYTE_CAP {
-        kept.workspace_disputes.clear();
-        content = render_rows(&kept);
-    }
-    if content.len() > AUTO_BYTE_CAP {
-        kept.current_focus = None;
-        content = render_rows(&kept);
-    }
+    // Reverse priority: skills → decisions. Preferences are never trimmed —
+    // they are the standing contract with the user, and dropping one silently
+    // changes how the model behaves for a whole session.
     while content.len() > AUTO_BYTE_CAP && !kept.top_skills.is_empty() {
         kept.top_skills.pop();
         content = render_rows(&kept);
@@ -415,14 +396,6 @@ fn render_rows(rows: &AutoRows) -> String {
     out.push_str("## Procedural Skills\n");
     for skill in &rows.top_skills {
         out.push_str(&format_skill_line(skill));
-    }
-    out.push_str("## Current Session Focus\n");
-    if let Some(ref focus) = rows.current_focus {
-        out.push_str(&format!("{}\n", focus));
-    }
-    out.push_str("## Active Workspace Disputes\n");
-    for (old_id, new_id) in &rows.workspace_disputes {
-        out.push_str(&format!("- conflict: memory:{} vs memory:{}\n", old_id, new_id));
     }
     out.push_str(AUTO_END);
     out.push('\n');
@@ -896,6 +869,47 @@ mod tests {
             emitted.len(),
             rendered,
             "emitted ids must count what survived the cap, not what was fetched"
+        );
+    }
+
+    /// The AUTO section carries a heading only for a channel that something
+    /// actually fills.
+    ///
+    /// It used to end with `## Current Session Focus` and `## Active Workspace
+    /// Disputes`, both written into every single prompt with nothing under them
+    /// — no producer ever defined what "focus" meant, and live disputes already
+    /// reach the model through the prompt's own CONFLICTS block. A permanently
+    /// empty heading is not free: it spends tokens telling the model a section
+    /// exists and then teaches it that the section is always blank.
+    ///
+    /// Pinned as an exact set rather than two `!contains` checks so the next
+    /// heading added without a producer behind it fails here too.
+    #[tokio::test]
+    async fn auto_section_has_no_heading_without_a_producer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let store = MemoryStore::new_for_test().await.unwrap();
+
+        wm.regenerate_auto_section("agent-headings", None, &store)
+            .await
+            .unwrap();
+
+        let content = tokio::fs::read_to_string(wm.workspace_path("agent-headings", None))
+            .await
+            .unwrap();
+        let headings: Vec<&str> = content
+            .lines()
+            .filter(|l| l.starts_with("## "))
+            .collect();
+
+        assert_eq!(
+            headings,
+            vec![
+                "## User Preferences (always active)",
+                "## Architectural Decisions",
+                "## Procedural Skills",
+            ],
+            "each AUTO heading must have a query behind it; got:\n{content}"
         );
     }
 

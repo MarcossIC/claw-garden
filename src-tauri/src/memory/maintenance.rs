@@ -37,14 +37,34 @@ pub(crate) const MAINTENANCE_PERIOD: Duration = Duration::from_secs(24 * 60 * 60
 /// The `WHERE tier < 3 AND demote_tier(...) <> tier` guard means only rows
 /// that actually change tier get their `last_modified_at` bumped — avoids
 /// stamping every tier<3 row (and the WAL churn that would cause) on every
-/// pass, and scopes the statement to `memory` ONLY (`episodic_trajectory`
-/// / `procedural_skill` are never touched by this job).
-const DEMOTE_SQL: &str = "\
-    UPDATE memory \
-    SET tier = demote_tier(tier, (?1 - last_accessed_at) / 86400000.0, importance), \
-        last_modified_at = ?1 \
-    WHERE tier < 3 \
-      AND demote_tier(tier, (?1 - last_accessed_at) / 86400000.0, importance) <> tier";
+/// pass.
+fn demote_sql(table: &str) -> String {
+    format!(
+        "UPDATE {table} \
+         SET tier = demote_tier(tier, (?1 - last_accessed_at) / 86400000.0, importance), \
+             last_modified_at = ?1 \
+         WHERE tier < 3 \
+           AND demote_tier(tier, (?1 - last_accessed_at) / 86400000.0, importance) <> tier"
+    )
+}
+
+/// Every table whose rows carry a tier that inactivity is allowed to lower.
+///
+/// All three, and the two beyond `memory` are not symmetry for its own sake.
+/// A skill is inserted at tier 1 with importance 8.0 — under the 9.0 pivotal
+/// cutoff — so one the user stopped reaching for a year ago kept a tier-1 floor
+/// forever and outranked fresh material on every query. That is the reachability
+/// bug this pass exists to prevent, and it was live on `procedural_skill`.
+///
+/// `episodic_trajectory` finds nothing today: the writer hands its insert a
+/// hardcoded importance of 5.0, which lands every trajectory on tier 3, and
+/// tier 3 is the floor. It is covered anyway because that is one literal, not a
+/// structural property — `compute_tier` fast-tracks importance >= 9.0 to tier 1
+/// before it looks at the type at all. Leaving the table out would mean the day
+/// someone derives trajectory importance from its success score, trajectories
+/// start promoting and never decay, and nothing says so. The cost of covering
+/// it is one UPDATE per day that matches zero rows.
+const DEMOTING_TABLES: [&str; 3] = ["memory", "episodic_trajectory", "procedural_skill"];
 
 /// Runs one bulk inactivity-demotion pass against `memory`.
 ///
@@ -68,12 +88,19 @@ pub(crate) async fn run_maintenance_once(store: &MemoryStore) {
 /// Never panics: a recoverable DB error is logged via `log::warn!` and the
 /// call returns — the caller (the maintenance loop) keeps ticking.
 pub(crate) async fn run_maintenance_once_at(store: &MemoryStore, now_ms: TimestampMs) {
-    if let Err(e) = store
-        .conn
-        .call(move |c| c.execute(DEMOTE_SQL, rusqlite::params![now_ms]))
-        .await
-    {
-        log::warn!("maintenance: bulk tier demotion failed: {e}");
+    // One statement per table, and a failure moves to the next rather than
+    // aborting: the three tables decay independently, so one table's demotion
+    // failing is no reason to leave the other two stale for a whole day. Same
+    // per-table isolation `sweep_orphaned_vectors` applies below.
+    for table in DEMOTING_TABLES {
+        let sql = demote_sql(table);
+        if let Err(e) = store
+            .conn
+            .call(move |c| c.execute(&sql, rusqlite::params![now_ms]))
+            .await
+        {
+            log::warn!("maintenance: bulk tier demotion failed for {table}: {e}");
+        }
     }
 
     // Placed after the demotion pass (which can't orphan a vector — it never
@@ -1018,28 +1045,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_memory_table_is_demoted_other_tables_untouched() {
+    async fn inactivity_demotion_covers_memory_and_procedural_skills() {
         let store = MemoryStore::new_for_test().await.unwrap();
 
         let now = now_ms();
         let mem_id = seed_row(&store, "memory", 1, 5.0, now, -7_776_000_001).await;
-        let epi_id = seed_row(&store, "episodic_trajectory", 1, 5.0, now, -7_776_000_001).await;
         let proc_id = seed_row(&store, "procedural_skill", 1, 5.0, now, -7_776_000_001).await;
 
         super::run_maintenance_once_at(&store, now).await;
 
         assert_eq!(tier_of(&store, "memory", mem_id).await, 2, "memory row must demote");
         assert_eq!(
-            tier_of(&store, "episodic_trajectory", epi_id).await,
-            1,
-            "inactivity demotion is scoped to `memory`; an unchanged tier here is \
-             what proves the UPDATE did not widen its reach"
+            tier_of(&store, "procedural_skill", proc_id).await,
+            2,
+            "a skill nobody has reached for in 90 days must lose its tier-1 floor \
+             like any other stale row"
+        );
+    }
+
+    /// A skill written by the miner lands at tier 1 with importance 8.0 — under
+    /// the 9.0 pivotal cutoff — so the pass reaches the DEFAULT skill, not just
+    /// a hand-seeded low-importance one. Without this, the test above could pass
+    /// on a row shape production never writes.
+    #[tokio::test]
+    async fn default_importance_skill_still_demotes_after_90_days() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+
+        let now = now_ms();
+        let id = seed_row(&store, "procedural_skill", 1, 8.0, now, -7_776_000_001).await;
+
+        super::run_maintenance_once_at(&store, now).await;
+
+        assert_eq!(tier_of(&store, "procedural_skill", id).await, 2);
+    }
+
+    #[tokio::test]
+    async fn procedural_skill_under_90_days_is_not_demoted() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+
+        let now = now_ms();
+        let id = seed_row(&store, "procedural_skill", 1, 5.0, now, -7_775_999_999).await;
+
+        super::run_maintenance_once_at(&store, now).await;
+
+        assert_eq!(tier_of(&store, "procedural_skill", id).await, 1, "must NOT demote before 90 days");
+        assert_eq!(
+            last_modified_at_of(&store, "procedural_skill", id).await,
+            0,
+            "last_modified_at must stay untouched (0) when the guard skips the row"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_episodic_trajectory_is_demoted() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+
+        let now = now_ms();
+        let id = seed_row(&store, "episodic_trajectory", 1, 5.0, now, -7_776_000_001).await;
+
+        super::run_maintenance_once_at(&store, now).await;
+
+        assert_eq!(tier_of(&store, "episodic_trajectory", id).await, 2);
+    }
+
+    /// Why the episodic arm of the pass finds nothing on today's corpus, and
+    /// why it is still there.
+    ///
+    /// `compute_tier` fast-tracks anything at importance >= 9.0 to tier 1 before
+    /// it ever looks at the memory type, so a trajectory is NOT structurally
+    /// pinned to tier 3 — it sits there only because the writer hands the insert
+    /// a hardcoded 5.0. That literal is one edit away from putting trajectories
+    /// on a tier that decays, and this test is what makes such an edit announce
+    /// itself instead of silently creating a row that promotes and never falls
+    /// back.
+    #[test]
+    fn trajectory_importance_is_the_only_thing_keeping_it_off_tier_1() {
+        use crate::memory::tier::compute_tier;
+
+        assert_eq!(
+            compute_tier(3, 5.0, 0, "episodic_trajectory"),
+            3,
+            "the importance the writer actually passes must keep trajectories at tier 3"
         );
         assert_eq!(
-            tier_of(&store, "procedural_skill", proc_id).await,
+            compute_tier(3, 9.0, 0, "episodic_trajectory"),
             1,
-            "inactivity demotion is scoped to `memory`; an unchanged tier here is \
-             what proves the UPDATE did not widen its reach"
+            "raising that importance past the pivotal cutoff WOULD put a trajectory \
+             on tier 1 — which is why the demotion pass covers this table"
         );
     }
 
