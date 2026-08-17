@@ -207,6 +207,26 @@ mod tests {
         );
     }
 
+    /// Pins `NEAR_DUPLICATE_FLOOR` as a bare literal, for the same reason the
+    /// test above pins the threshold: every other test that names this
+    /// constant measures its own fixture against the constant itself. The
+    /// floor test's fixture sits at unit-space L2 ≈ 0.009 and the near-band
+    /// test's at ≈ 0.10, so the pair of them only bounds the floor to the open
+    /// range (0.009, 0.10] — mutating 0.05 to 0.01 left all 801 tests green.
+    /// A 10x window is not a pin.
+    #[test]
+    fn near_duplicate_floor_pins_the_shipped_value() {
+        assert_eq!(
+            NEAR_DUPLICATE_FLOOR, 0.05,
+            "NEAR_DUPLICATE_FLOOR changed from its shipped value. This floor is what keeps a \
+             near-exact duplicate the content hash could not catch (casing, interior whitespace, \
+             a trivial edit) from being filed as a contradiction and burning an LLM adjudication \
+             — lowering it reopens exactly the false-positive path the write-border dedup work \
+             exists to close. If this changed on purpose, justify the new value against the \
+             near-duplicate distance distribution before re-pinning here."
+        );
+    }
+
     /// Far vectors (large L2) must not trigger contradiction detection.
     #[tokio::test]
     async fn detect_contradiction_far_vectors_returns_empty() {
@@ -355,16 +375,36 @@ mod tests {
     // ── Type gate: candidate side ───────────────────────────────────────────
 
     /// An ineligible candidate type must return `[]` without ever building a
-    /// `SearchScope` or hitting the KNN — asserted here by planting a stored
-    /// row at distance 0 (which would certainly flag if the KNN ran at all)
-    /// and confirming it never comes back.
+    /// `SearchScope` or hitting the KNN.
+    ///
+    /// The stored row sits at a distance measured to land INSIDE the dispute
+    /// band, and its type is claim-bearing, so the hit-side filter cannot
+    /// explain an empty result — only the candidate-side gate can. The
+    /// original fixture probed at distance 0 and claimed that "would certainly
+    /// flag if the KNN ran at all"; `NEAR_DUPLICATE_FLOOR` made that false —
+    /// distance 0 is precisely what the floor drops. With that fixture,
+    /// deleting the candidate-side gate outright left all 801 tests green
+    /// (mutation-verified). An in-band distance restores the test's teeth.
     #[tokio::test]
     async fn ineligible_candidate_type_returns_empty_without_knn() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let base = base_vec(10);
+        let query = near(&base, 1.5);
+
+        // Defensive: without this, a fixture drifting out of the band would
+        // turn this back into the vacuous test it just stopped being.
+        let ub = to_unit(&base).unwrap();
+        let uq = to_unit(&query).unwrap();
+        let dist: f32 = ub.iter().zip(uq.iter()).map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt();
+        assert!(
+            dist >= NEAR_DUPLICATE_FLOOR && dist < CONTRADICTION_THRESHOLD,
+            "fixture must land inside [{NEAR_DUPLICATE_FLOOR}, {CONTRADICTION_THRESHOLD}) so only \
+             the candidate gate can produce an empty result; got {dist}"
+        );
+
         insert_row_typed(&store, "agent-gate", "user_preference", &base).await;
 
-        let ids = detect_contradiction(&store, &base, "agent-gate", None, MemoryType::ChatMessage).await;
+        let ids = detect_contradiction(&store, &query, "agent-gate", None, MemoryType::ChatMessage).await;
         assert!(
             ids.is_empty(),
             "an ineligible candidate type must short-circuit to [], got {ids:?}"

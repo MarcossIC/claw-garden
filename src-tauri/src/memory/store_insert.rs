@@ -156,6 +156,23 @@ pub enum MemoryStoreError {
     Connection(#[from] tokio_rusqlite::Error),
 }
 
+/// The write-border dedup lookup, as one shared literal.
+///
+/// Production (`reinforce_if_duplicate`) and `reinforce_lookup_uses_dedup_index`
+/// both read THIS string. Each previously held its own copy, so the EXPLAIN
+/// test explained a sentence production no longer said: any drift in the real
+/// predicate — most importantly the `COALESCE(project_id,'')` that has to match
+/// `idx_memory_dedup`'s indexed expression byte-for-byte — moved production off
+/// the index while the test kept confirming the old copy still hit it.
+const REINFORCE_LOOKUP_SQL: &str = "SELECT id FROM memory \
+     WHERE agent_id = ?1 \
+       AND COALESCE(project_id, '') = COALESCE(?2, '') \
+       AND content_hash = ?3 \
+       AND content_hash IS NOT NULL \
+       AND deleted_at IS NULL \
+       AND status IN ('active', 'disputed') \
+     ORDER BY created_at ASC LIMIT 1";
+
 impl MemoryStore {
     /// Reinforces the existing active row matching `(agent_id,
     /// COALESCE(project_id,''), content_hash)`, if any: `access_count += 1`,
@@ -210,14 +227,7 @@ impl MemoryStore {
 
                 let existing_id: Option<i64> = tx
                     .query_row(
-                        "SELECT id FROM memory \
-                         WHERE agent_id = ?1 \
-                           AND COALESCE(project_id, '') = COALESCE(?2, '') \
-                           AND content_hash = ?3 \
-                           AND content_hash IS NOT NULL \
-                           AND deleted_at IS NULL \
-                           AND status IN ('active', 'disputed') \
-                         ORDER BY created_at ASC LIMIT 1",
+                        REINFORCE_LOOKUP_SQL,
                         rusqlite::params![agent_id, project_id, content_hash],
                         |r| r.get(0),
                     )
@@ -1683,6 +1693,59 @@ mod tests {
         assert_eq!(result, Some(id), "NULL project_id on both sides must match via COALESCE");
     }
 
+    /// `agent_id` is the outermost column of `idx_memory_dedup` and the first
+    /// predicate of the lookup, but every other test in this block seeds and
+    /// queries under ONE agent in its own fresh in-memory store — so dropping
+    /// the `agent_id = ?1` clause entirely left the whole suite green
+    /// (mutation-verified). Identical text from two agents is the ordinary
+    /// case, not an exotic one: without this clause agent-b's chunk reinforces
+    /// agent-a's row, agent-b silently never gets the memory, and agent-a's
+    /// access_count (hence its tier) is inflated by traffic that was never its
+    /// own. Two agents, same hash, same store — the isolation is the assertion.
+    #[tokio::test]
+    async fn reinforce_if_duplicate_other_agents_row_is_not_reinforced() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let hash = "hash-reinforce-cross-agent";
+        let id_a = seed_hashed_row(&store, "agent-a", None, hash, "active", None, 1_000, 0).await;
+
+        let miss = store.reinforce_if_duplicate("agent-b", None, hash, 2_000).await.unwrap();
+        assert_eq!(
+            miss, None,
+            "agent-b must not reinforce agent-a's row, even on an identical content hash"
+        );
+
+        let (ac_a, _) = fetch_access_count_and_tier(&store, id_a).await;
+        assert_eq!(ac_a, 0, "agent-a's access_count must be untouched by agent-b's lookup");
+
+        // And the same call under the owning agent still hits — proving the
+        // miss above came from the agent scope, not from a broken fixture.
+        let hit = store.reinforce_if_duplicate("agent-a", None, hash, 2_000).await.unwrap();
+        assert_eq!(hit, Some(id_a), "the owning agent must still reinforce its own row");
+    }
+
+    /// `idx_memory_dedup` indexes `COALESCE(project_id, '')`, so a NULL
+    /// project_id and an empty-string one are the SAME dedup key by
+    /// construction — the lookup repeats that COALESCE byte-identically to
+    /// stay on the index. `..._null_project_ids_match_each_other` only ever
+    /// exercises NULL-vs-NULL, and `..._two_project_ids_are_independent` only
+    /// non-empty-vs-non-empty, so nothing pinned the one pair the COALESCE
+    /// exists for: swapping the predicate to `project_id IS ?2` — which
+    /// splits NULL from `''` AND moves production off the indexed expression
+    /// — left the whole suite green (mutation-verified).
+    #[tokio::test]
+    async fn reinforce_if_duplicate_empty_string_project_id_matches_null() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let hash = "hash-reinforce-empty-proj";
+        let id = seed_hashed_row(&store, "agent-r8", Some(""), hash, "active", None, 1_000, 0).await;
+
+        let hit = store.reinforce_if_duplicate("agent-r8", None, hash, 2_000).await.unwrap();
+        assert_eq!(
+            hit,
+            Some(id),
+            "a project_id='' row and a project_id=NULL lookup are one dedup key under COALESCE"
+        );
+    }
+
     #[tokio::test]
     async fn reinforce_if_duplicate_picks_oldest_among_legacy_duplicates() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1734,23 +1797,18 @@ mod tests {
     /// COALESCE-expression index). A `SCAN memory` in the plan means the
     /// index is not usable for this exact predicate shape and is flagged
     /// here as an open risk rather than silently accepted.
+    ///
+    /// Explains `REINFORCE_LOOKUP_SQL` itself, never a transcription of it:
+    /// the previous version of this test carried its own copy of the SELECT,
+    /// so production's predicate could drift off the index shape while this
+    /// kept passing against the old text.
     #[tokio::test]
     async fn reinforce_lookup_uses_dedup_index() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let plan: Vec<String> = store
             .conn
             .call(|c| -> rusqlite::Result<Vec<String>> {
-                let mut stmt = c.prepare(
-                    "EXPLAIN QUERY PLAN \
-                     SELECT id FROM memory \
-                     WHERE agent_id = ?1 \
-                       AND COALESCE(project_id, '') = COALESCE(?2, '') \
-                       AND content_hash = ?3 \
-                       AND content_hash IS NOT NULL \
-                       AND deleted_at IS NULL \
-                       AND status IN ('active', 'disputed') \
-                     ORDER BY created_at ASC LIMIT 1",
-                )?;
+                let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {REINFORCE_LOOKUP_SQL}"))?;
                 let rows = stmt
                     .query_map(rusqlite::params!["a", Option::<String>::None, "h"], |r| {
                         r.get::<_, String>(3) // EXPLAIN QUERY PLAN's `detail` column

@@ -390,6 +390,73 @@ mod tests {
         assert!(!version.is_empty(), "vec_version() returned empty string");
     }
 
+    /// V6's eager backfill, exercised through the migration runner itself.
+    ///
+    /// `dedup.rs::backfilled_row_becomes_lookup_visible` covers the same
+    /// property by executing its own transcription of the UPDATE, so it says
+    /// nothing about the migration file: deleting the backfill statement from
+    /// `V6__content_hash.sql` outright left all 801 tests green
+    /// (mutation-verified). A shipped build with no backfill leaves every row
+    /// written before the upgrade at `content_hash IS NULL` — permanently
+    /// invisible to the dedup gate, which is the entire point of doing the
+    /// backfill eagerly instead of lazily.
+    ///
+    /// This is the only test that migrates in two steps: rows must exist
+    /// BEFORE V6 runs for a backfill to have anything to do, and
+    /// `new_for_test()` runs the whole chain against an empty database.
+    #[tokio::test]
+    async fn v6_migration_backfills_rows_written_before_it() {
+        ensure_vec0_registered();
+        let conn = Connection::open_in_memory().await.unwrap();
+        register_udfs(&conn).await.unwrap();
+
+        // Stop at V5: the schema has no content_hash column yet.
+        conn.call(|c| {
+            crate::memory::migrations::runner()
+                .set_target(refinery::Target::Version(5))
+                .run(c)
+        })
+        .await
+        .unwrap();
+
+        conn.call(|c| {
+            c.execute(
+                "INSERT INTO memory \
+                 (scope, agent_id, content, memory_type, source, \
+                  created_at, created_by_type, created_by_ref, \
+                  last_modified_at, last_accessed_at, importance, tier, status) \
+                 VALUES ('agent', 'agent-v6', 'pre-v6 content', 'chat_message', 'chat', \
+                  0, 'user', 'agent-v6', 0, 0, 5.0, 3, 'active')",
+                [],
+            )
+        })
+        .await
+        .unwrap();
+
+        // Now run V6 — the row above is exactly the legacy case it targets.
+        conn.call(|c| crate::memory::migrations::runner().run(c))
+            .await
+            .unwrap();
+
+        let hash: Option<String> = conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT content_hash FROM memory WHERE agent_id = 'agent-v6'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            hash.as_deref(),
+            Some(crate::memory::dedup::content_hash("pre-v6 content").as_str()),
+            "V6 must backfill content_hash for rows that predate the column, in the same hash \
+             space the runtime write path uses"
+        );
+    }
+
     /// SPEC-3 Sc 3.2 — ensure_vec0_registered is idempotent (no panic on second call).
     #[tokio::test]
     async fn ensure_vec0_idempotent() {
