@@ -5,12 +5,13 @@
 //! each chunk, and inserts both `memory` and `memory_vectors` rows atomically.
 //! Failure isolation: errors are logged and the worker NEVER panics.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use once_cell::sync::OnceCell;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::memory::chunker::{select_chunker, ChatChunker, ChunkerKind, CodeChunker};
+use crate::memory::chunker::{select_chunker, ChatChunker, Chunk, ChunkerKind, CodeChunker};
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::events::{MemoryEvent, MemorySource};
 use crate::memory::store_insert::{MemoryStoreError, NewMemoryRecord};
@@ -32,14 +33,83 @@ pub(crate) enum MemoryWorkerError {
     EmptyChunks,
 }
 
+/// Backlog size at which the ingest channel is worth reporting. Events are
+/// one per chat message or tool result, and draining one costs an embed batch
+/// plus a KNN probe plus an insert — tens of milliseconds — so 64 queued
+/// events is seconds of backlog: past any normal burst, far above the handful
+/// a single agent turn produces. A starting value chosen for that ratio, not
+/// a measured optimum; changing it should be deliberate, which is why the
+/// number is pinned by a test.
+const INGEST_QUEUE_WARN_DEPTH: usize = 64;
+
+/// Which way the backlog just crossed [`INGEST_QUEUE_WARN_DEPTH`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueDepthEdge {
+    Rising,
+    Falling,
+}
+
+/// Reports only crossings of the threshold, never the standing state.
+/// `None` is the common case. A level check would fire once per drained
+/// event, so a sustained backlog of 200 would emit 200 identical lines and
+/// bury the transition that actually carries information.
+fn queue_depth_transition(depth: usize, was_over: bool) -> Option<QueueDepthEdge> {
+    match (was_over, depth >= INGEST_QUEUE_WARN_DEPTH) {
+        (false, true) => Some(QueueDepthEdge::Rising),
+        (true, false) => Some(QueueDepthEdge::Falling),
+        _ => None,
+    }
+}
+
+/// One chunk that survived intra-event collapse, with how many identical
+/// copies the event carried.
+struct PendingChunk {
+    chunk: Chunk,
+    content_hash: String,
+    /// Copies beyond the first are replayed through the dedup gate rather
+    /// than embedded again: on the path where the one surviving chunk
+    /// inserts successfully, repetition inside one event reinforces the
+    /// same row a repetition across two events would — same counter, same
+    /// log branch. That equivalence stops at an insert failure: today a
+    /// failed insert of chunk A still lets an identical chunk B later in the
+    /// same event embed and insert its own row, but once A and B collapse
+    /// into one `PendingChunk`, there is no separate B left to try — A's
+    /// insert failure now costs every copy this multiplicity stands for.
+    multiplicity: u32,
+}
+
+/// Collapses chunks with identical content into one entry each, preserving
+/// first-occurrence order.
+///
+/// Insertion order is load-bearing twice: the embed batch is zipped back
+/// against this list positionally, and contradiction detection for a chunk
+/// must see the chunks before it already inserted. A `HashMap` alone would
+/// keep the counts and lose the order, so the map only indexes into the
+/// ordered vector.
+fn collapse_duplicate_chunks(chunks: Vec<Chunk>) -> Vec<PendingChunk> {
+    let mut out: Vec<PendingChunk> = Vec::with_capacity(chunks.len());
+    let mut by_hash: HashMap<String, usize> = HashMap::with_capacity(chunks.len());
+    for chunk in chunks {
+        let content_hash = crate::memory::dedup::content_hash(&chunk.text);
+        match by_hash.get(&content_hash) {
+            Some(&idx) => out[idx].multiplicity += 1,
+            None => {
+                by_hash.insert(content_hash.clone(), out.len());
+                out.push(PendingChunk { chunk, content_hash, multiplicity: 1 });
+            }
+        }
+    }
+    out
+}
+
 /// Top-level worker loop. One per app instance.
 ///
-/// Drains events FIFO. Each chunk's embed+insert is isolated: a failure on
-/// one chunk (an embed error other than `NotReady`/`WorkerGone`, or an
-/// insert error) is logged and the worker moves on to the next chunk without
-/// aborting the event; the embedder going away mid-stream (`NotReady` /
-/// `WorkerGone`) drops the rest of the current event's chunks but leaves the
-/// worker itself running for the next event.
+/// Drains events FIFO. An event's surviving chunks are embedded in one call,
+/// so any embed failure loses that whole event rather than the failing chunk
+/// alone: the batch API returns a single result with no per-item outcome to
+/// salvage, and the failures it reports (model session, tokenizer) apply to
+/// every text in the call anyway. An insert failure stays isolated to its own
+/// chunk and the event's remaining chunks continue.
 /// Exits cleanly when all `Sender`s are dropped (app shutdown).
 pub(crate) async fn memory_worker(
     mut rx: UnboundedReceiver<MemoryEvent>,
@@ -55,7 +125,25 @@ pub(crate) async fn memory_worker(
     // escalation path if the worker is ever parallelized — so nothing else
     // can race an increment.
     let mut absorbed_duplicates: u64 = 0;
+    // Tracks which side of INGEST_QUEUE_WARN_DEPTH the backlog was on last
+    // time through the loop, so queue_depth_transition only reports the edge
+    // crossing rather than the level on every iteration.
+    let mut queue_over_depth = false;
     while let Some(evt) = rx.recv().await {
+        // Read after recv: this is the backlog still waiting, which is what
+        // "falling behind" means.
+        let depth = rx.len();
+        match queue_depth_transition(depth, queue_over_depth) {
+            Some(QueueDepthEdge::Rising) => {
+                queue_over_depth = true;
+                log::warn!("ingest queue depth={depth}; consumer is falling behind producers");
+            }
+            Some(QueueDepthEdge::Falling) => {
+                queue_over_depth = false;
+                log::info!("ingest queue depth={depth}; backlog drained");
+            }
+            None => {}
+        }
         if let Err(e) = process_event(
             &evt,
             &store,
@@ -74,6 +162,52 @@ pub(crate) async fn memory_worker(
         }
     }
     log::info!("memory_worker shutting down — channel closed");
+}
+
+/// Runs the write-border dedup gate for one chunk hash. `true` means the
+/// chunk was absorbed into an existing row and must not be inserted.
+///
+/// A repeated chunk reinforces the existing memory instead of inserting
+/// another row: `access_count += 1` promotes the tier through
+/// `compute_tier`, so repeating something makes it more retrievable. Chosen
+/// over replacing or rejecting the duplicate because in a memory system
+/// repetition IS signal. Reverting this reopens the duplicate-dispute path
+/// into the resolver, which costs one LLM call per false positive.
+///
+/// Runs BEFORE embedding: a hash lookup is orders of magnitude cheaper than
+/// an inference call, so a duplicate never pays for the vector it does not
+/// need.
+///
+/// This is the only place `absorbed` moves, so a copy arriving inside one
+/// event and a copy arriving in a later event increment it through the same
+/// branch and keep meaning the same thing.
+async fn absorb_duplicate(
+    store: &Arc<MemoryStore>,
+    evt: &MemoryEvent,
+    content_hash: &str,
+    absorbed: &mut u64,
+) -> bool {
+    match store
+        .reinforce_if_duplicate(&evt.agent_id, evt.project_id.as_deref(), content_hash, evt.timestamp_ms)
+        .await
+    {
+        Ok(Some(id)) => {
+            *absorbed += 1;
+            log::debug!(
+                "ingest absorbed duplicate (agent={}, memory_id={id}) absorbed_total={absorbed}",
+                evt.agent_id
+            );
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            // Fail open: a lookup failure degrades to embed+insert, the
+            // behaviour from before the gate existed, rather than dropping
+            // the chunk.
+            log::warn!("dedup lookup failed (agent={}): {e}; falling through to embed", evt.agent_id);
+            false
+        }
+    }
 }
 
 async fn process_event(
@@ -120,88 +254,86 @@ async fn process_event(
         return Ok(());
     };
 
-    for chunk in chunks {
-        // A repeated chunk reinforces the existing memory instead of inserting another
-        // row: access_count += 1 promotes the tier through compute_tier, so repeating
-        // something makes it more retrievable. Chosen over replacing or rejecting the
-        // duplicate because in a memory system repetition IS signal. Reverting this
-        // reopens the duplicate-dispute path into the resolver, which costs one LLM
-        // call per false positive.
-        //
-        // Runs BEFORE embedding, not after: a hash lookup is orders of magnitude
-        // cheaper than an inference call, so a duplicate never pays for the vector
-        // it doesn't need. Fail-open on a lookup error — this must degrade to
-        // today's behavior (fall through to embed) rather than drop the chunk.
-        let hash = crate::memory::dedup::content_hash(&chunk.text);
-        match store
-            .reinforce_if_duplicate(&evt.agent_id, evt.project_id.as_deref(), &hash, evt.timestamp_ms)
-            .await
-        {
-            Ok(Some(id)) => {
-                *absorbed += 1;
-                log::debug!(
-                    "ingest absorbed duplicate (agent={}, memory_id={id}) absorbed_total={absorbed}",
-                    evt.agent_id
-                );
-                continue;
+    // Stage 1 — gate. Every chunk passes the hash gate before anything is
+    // embedded; a collapsed entry absorbed by the gate is charged once per
+    // copy it stood for, which is what the same copies arriving one at a
+    // time would have done.
+    let mut survivors: Vec<PendingChunk> = Vec::new();
+    for pending in collapse_duplicate_chunks(chunks) {
+        if absorb_duplicate(store, evt, &pending.content_hash, absorbed).await {
+            for _ in 1..pending.multiplicity {
+                absorb_duplicate(store, evt, &pending.content_hash, absorbed).await;
             }
-            Ok(None) => {} // miss — fall through to embed + detect + insert
-            Err(e) => {
-                log::warn!(
-                    "dedup lookup failed (agent={}): {e}; falling through to embed",
-                    evt.agent_id
-                );
-            }
+            continue;
         }
+        survivors.push(pending);
+    }
+    if survivors.is_empty() {
+        return Ok(());
+    }
 
-        // Passage: a stored chunk is the thing being searched THROUGH. The one
-        // vector produced here feeds BOTH consumers below — insert and the
-        // contradiction KNN probe — with no second inference call, so both
-        // sides of `contradiction.rs`'s comparison live in the same Passage
-        // space `CONTRADICTION_THRESHOLD` was tuned against.
-        match embedder.embed_with_role(&chunk.text, EmbedRole::Passage).await {
-            Ok(vec) => {
-                // The contradiction hook runs between embed and insert: it needs
-                // the freshly computed embedding to find near-duplicate candidates
-                // via KNN, and its result (which existing rows this chunk disputes)
-                // must be attached to the record before it is written, not after.
-                // detect_contradiction is async and requires &MemoryStore; Arc<MemoryStore>
-                // derefs to MemoryStore via Deref coercion.
-                let mut record = NewMemoryRecord::from_event_and_chunk(evt, &chunk);
-                let disputed = crate::memory::contradiction::detect_contradiction(
-                    store,
-                    &vec,
-                    &evt.agent_id,
-                    evt.project_id.as_deref(),
-                    record.memory_type,
-                )
-                .await;
-                if !disputed.is_empty() {
-                    record.disputed_against = Some(disputed);
-                }
-                if let Err(e) = store.insert_memory_with_vector(record, vec).await {
-                    log::warn!(
-                        "insert_memory_with_vector failed (agent={}): {e}",
-                        evt.agent_id
-                    );
-                    // continue — worker stays alive
-                }
-            }
-            Err(EmbedError::NotReady) | Err(EmbedError::WorkerGone) => {
-                // Cell went empty mid-stream or worker thread died — drop rest of event.
-                log::warn!(
-                    "embedder became unavailable mid-event (agent={}); dropping rest",
-                    evt.agent_id
-                );
-                return Ok(());
-            }
-            Err(e) => {
-                // InferenceFailed / LoadFailed — single-chunk problem, skip & continue.
-                log::warn!(
-                    "embed failed for chunk (agent={}): {e}; skipping chunk",
-                    evt.agent_id
-                );
-            }
+    // Stage 2 — one inference call for the whole event. Passage: a stored
+    // chunk is the thing being searched THROUGH. Each vector produced here
+    // feeds BOTH consumers below — insert and the contradiction KNN probe —
+    // with no second inference call, so both sides of `contradiction.rs`'s
+    // comparison live in the same Passage space `CONTRADICTION_THRESHOLD`
+    // was tuned against.
+    let texts: Vec<String> = survivors.iter().map(|p| p.chunk.text.clone()).collect();
+    let vectors = match embedder.embed_batch(&texts, EmbedRole::Passage).await {
+        Ok(v) => v,
+        Err(EmbedError::NotReady) | Err(EmbedError::WorkerGone) => {
+            log::warn!("embedder became unavailable (agent={}); dropping {} chunks", evt.agent_id, survivors.len());
+            return Ok(());
+        }
+        Err(e) => {
+            log::warn!("embed batch failed (agent={}): {e}; dropping {} chunks", evt.agent_id, survivors.len());
+            return Ok(());
+        }
+    };
+    if vectors.len() != survivors.len() {
+        // Zipping a short reply would pair chunks with other chunks'
+        // vectors and store the mismatch as fact. Dropping the event is
+        // recoverable; a silently mislabeled memory is not.
+        log::warn!(
+            "embedder returned {} vectors for {} chunks (agent={}); dropping the event",
+            vectors.len(), survivors.len(), evt.agent_id
+        );
+        return Ok(());
+    }
+
+    // Stage 3 — sequential, one chunk at a time: chunk N's contradiction
+    // probe is a KNN search over rows already in the store, so chunk N-1 of
+    // this same event must be inserted before it runs. Not exercised by a
+    // same-event test today: `from_event_and_chunk` derives `memory_type`
+    // from `evt.role`/`is_error` alone, which only ever yields
+    // ChatMessage/ToolError/SessionSummary — none `is_claim_bearing()` — so
+    // `detect_contradiction`'s type gate returns `[]` before the KNN runs
+    // for every chunk this loop produces. The ordering is real (this is a
+    // synchronous per-iteration insert-then-probe loop, not a batch), but
+    // only a claim-bearing candidate (currently written only by the
+    // extractor, one row at a time, never through this multi-chunk path)
+    // would let a test observe it end-to-end.
+    for (pending, vec) in survivors.into_iter().zip(vectors) {
+        let PendingChunk { chunk, content_hash, multiplicity } = pending;
+        // The contradiction hook runs between embed and insert: it needs the
+        // freshly computed embedding to find near-duplicate candidates via
+        // KNN, and its result (which existing rows this chunk disputes) must
+        // be attached to the record before it is written, not after.
+        let mut record = NewMemoryRecord::from_event_and_chunk(evt, &chunk);
+        let disputed = crate::memory::contradiction::detect_contradiction(
+            store, &vec, &evt.agent_id, evt.project_id.as_deref(), record.memory_type,
+        ).await;
+        if !disputed.is_empty() {
+            record.disputed_against = Some(disputed);
+        }
+        if let Err(e) = store.insert_memory_with_vector(record, vec).await {
+            log::warn!("insert_memory_with_vector failed (agent={}): {e}", evt.agent_id);
+            continue; // nothing was written, so there is nothing to reinforce
+        }
+        // The extra copies now find the row this iteration just wrote and
+        // take the same branch a copy from a later event takes.
+        for _ in 1..multiplicity {
+            absorb_duplicate(store, evt, &content_hash, absorbed).await;
         }
     }
     Ok(())
@@ -1324,6 +1456,294 @@ mod tests {
             violations.is_empty(),
             "score contract violated:\n  - {}",
             violations.join("\n  - ")
+        );
+    }
+
+    // ── Ingest queue depth: pinned constant + pure edge-detection helper ────
+
+    #[test]
+    fn ingest_queue_warn_depth_is_64() {
+        assert_eq!(INGEST_QUEUE_WARN_DEPTH, 64);
+    }
+
+    #[test]
+    fn queue_depth_transition_below_threshold_not_over_is_none() {
+        assert_eq!(queue_depth_transition(63, false), None);
+    }
+
+    #[test]
+    fn queue_depth_transition_at_threshold_not_over_is_rising() {
+        assert_eq!(queue_depth_transition(64, false), Some(QueueDepthEdge::Rising));
+    }
+
+    #[test]
+    fn queue_depth_transition_at_threshold_already_over_is_none() {
+        assert_eq!(queue_depth_transition(64, true), None);
+    }
+
+    #[test]
+    fn queue_depth_transition_above_threshold_already_over_is_none() {
+        assert_eq!(queue_depth_transition(65, true), None);
+    }
+
+    #[test]
+    fn queue_depth_transition_below_threshold_already_over_is_falling() {
+        assert_eq!(queue_depth_transition(63, true), Some(QueueDepthEdge::Falling));
+    }
+
+    // ── collapse_duplicate_chunks (pure) ─────────────────────────────────────
+
+    fn make_chunk(text: &str) -> Chunk {
+        Chunk { text: text.to_string(), token_count: 0, header: None }
+    }
+
+    #[test]
+    fn collapse_duplicate_chunks_keeps_first_occurrence_order() {
+        let chunks = vec![make_chunk("a"), make_chunk("b"), make_chunk("a")];
+        let out = collapse_duplicate_chunks(chunks);
+        assert_eq!(out.len(), 2, "expected 2 collapsed entries");
+        assert_eq!(out[0].chunk.text, "a");
+        assert_eq!(out[1].chunk.text, "b");
+    }
+
+    #[test]
+    fn collapse_duplicate_chunks_counts_repeat_copies() {
+        let chunks = vec![make_chunk("a"), make_chunk("a"), make_chunk("a")];
+        let out = collapse_duplicate_chunks(chunks);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].multiplicity, 3, "three identical chunks must collapse to multiplicity 3");
+    }
+
+    #[test]
+    fn collapse_duplicate_chunks_of_all_distinct_is_identity() {
+        let chunks = vec![make_chunk("a"), make_chunk("b"), make_chunk("c")];
+        let out = collapse_duplicate_chunks(chunks);
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|p| p.multiplicity == 1), "all-distinct input must leave every multiplicity at 1");
+    }
+
+    // ── process_event: one embed_batch call per event ────────────────────────
+
+    /// `process_event` must route a multi-chunk event through exactly one
+    /// `embed_batch` call, never per-chunk `embed_with_role` calls.
+    #[tokio::test]
+    async fn multi_chunk_event_issues_one_embed_batch_call() {
+        struct BatchRecordingEmbedder {
+            batch_calls: Arc<std::sync::Mutex<Vec<usize>>>,
+        }
+        #[async_trait::async_trait]
+        impl Embedder for BatchRecordingEmbedder {
+            async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+                unreachable!("process_event must call embed_batch, not embed_with_role, for chunked events");
+            }
+            async fn embed_batch(&self, texts: &[String], _role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
+                self.batch_calls.lock().unwrap().push(texts.len());
+                Ok(texts.iter().map(|_| vec![0.1_f32; 384]).collect())
+            }
+            fn dimensions(&self) -> usize {
+                384
+            }
+            fn model_id(&self) -> &str {
+                "batch-recording"
+            }
+            fn query_prefix(&self) -> &str {
+                ""
+            }
+            fn passage_prefix(&self) -> &str {
+                ""
+            }
+        }
+
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let batch_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let embedder: Arc<dyn Embedder> =
+            Arc::new(BatchRecordingEmbedder { batch_calls: batch_calls.clone() });
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        // Three DISTINCT 1920-byte chunks (byte-fallback cap under
+        // ChatChunker::with_fallback()) — no dedup absorption, all 3 survive
+        // to the embed stage.
+        let content = format!("{}{}{}", "a".repeat(1920), "b".repeat(1920), "c".repeat(1920));
+        tx.send(make_event(Role::User, &content, None, 1)).unwrap();
+        drain_worker(tx, handle).await;
+
+        let calls = batch_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "expected exactly one embed_batch call for the whole event, got {calls:?}");
+        assert_eq!(calls[0], 3, "expected the single call to carry all 3 surviving chunks, got {calls:?}");
+    }
+
+    /// Event `[A, A]`, neither present in the store: stage 1 collapses to one
+    /// survivor with multiplicity 2, stage 3 inserts it once then replays the
+    /// reinforce path once more — 1 row, access_count=2, absorbed=1. Same
+    /// externally observable outcome as two identical chunks arriving in
+    /// separate events.
+    #[tokio::test]
+    async fn intra_event_duplicate_chunks_insert_one_row_and_reinforce() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let cell: OnceCell<Arc<dyn Embedder>> = OnceCell::new();
+        cell.set(embedder).ok();
+        let cell = Arc::new(cell);
+        let chat_chunker = Arc::new(ChatChunker::with_fallback());
+        let code_chunker = Arc::new(CodeChunker::new());
+
+        let mut absorbed: u64 = 0;
+        // "x".repeat(3840) → two IDENTICAL 1920-byte chunks under the 1920B cap.
+        let content = "x".repeat(3840);
+        let evt = make_event(Role::User, &content, None, 1);
+
+        process_event(&evt, &store, &cell, &chat_chunker, &code_chunker, &mut absorbed)
+            .await
+            .unwrap();
+
+        let rows = count_memory(&store).await;
+        assert_eq!(rows, 1, "two identical chunks in one event must insert exactly one row; got {rows}");
+        assert_eq!(absorbed, 1, "one duplicate copy absorbed within the event");
+
+        let access_count: i64 = store.conn
+            .call(|c| c.query_row("SELECT access_count FROM memory LIMIT 1", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(access_count, 2, "access_count must be insert(1) + intra-event reinforce replay(1) = 2");
+    }
+
+    /// Event `[A, A]` where `A` is ALREADY in the store (from a prior event):
+    /// collapsing first and gating once per survivor would under-count —
+    /// today's per-chunk loop hits the gate twice for this input. Both copies
+    /// must be replayed through `absorb_duplicate`, so `absorbed` must move
+    /// by 2, not 1 (design's under-count fix).
+    #[tokio::test]
+    async fn existing_duplicate_chunks_absorb_once_per_copy_not_once_per_event() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let cell: OnceCell<Arc<dyn Embedder>> = OnceCell::new();
+        cell.set(embedder).ok();
+        let cell = Arc::new(cell);
+        let chat_chunker = Arc::new(ChatChunker::with_fallback());
+        let code_chunker = Arc::new(CodeChunker::new());
+
+        // Seed the store with ONE row for chunk A ("x" * 1920).
+        let mut absorbed: u64 = 0;
+        let seed_evt = make_event(Role::User, &"x".repeat(1920), None, 1);
+        process_event(&seed_evt, &store, &cell, &chat_chunker, &code_chunker, &mut absorbed)
+            .await
+            .unwrap();
+        assert_eq!(absorbed, 0, "seed insert has no prior row to reinforce");
+        assert_eq!(count_memory(&store).await, 1);
+
+        // Now send an event carrying TWO copies of the already-stored chunk A.
+        absorbed = 0;
+        let dup_evt = make_event(Role::User, &"x".repeat(3840), None, 2);
+        process_event(&dup_evt, &store, &cell, &chat_chunker, &code_chunker, &mut absorbed)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            absorbed, 2,
+            "both copies of an already-stored chunk must be absorbed individually, not collapsed into one absorb"
+        );
+        assert_eq!(count_memory(&store).await, 1, "no new row inserted for an already-present chunk");
+
+        let access_count: i64 = store.conn
+            .call(|c| c.query_row("SELECT access_count FROM memory LIMIT 1", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(access_count, 3, "seed insert(1) + two reinforce hits(+2) = 3");
+    }
+
+    /// `InferenceFailed` from `embed_batch` must drop the WHOLE event, not
+    /// skip one chunk and continue — a deliberate behavior change from the
+    /// old per-chunk skip semantics (which would have left 4-of-5 chunks
+    /// inserted here).
+    #[tokio::test]
+    async fn batch_embed_failure_drops_the_whole_event() {
+        struct FailingBatchEmbedder;
+        #[async_trait::async_trait]
+        impl Embedder for FailingBatchEmbedder {
+            async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+                Err(EmbedError::InferenceFailed("boom".to_string()))
+            }
+            async fn embed_batch(&self, _texts: &[String], _role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
+                Err(EmbedError::InferenceFailed("boom".to_string()))
+            }
+            fn dimensions(&self) -> usize {
+                384
+            }
+            fn model_id(&self) -> &str {
+                "failing-batch"
+            }
+            fn query_prefix(&self) -> &str {
+                ""
+            }
+            fn passage_prefix(&self) -> &str {
+                ""
+            }
+        }
+
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FailingBatchEmbedder);
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        let content = format!(
+            "{}{}{}{}{}",
+            "a".repeat(1920), "b".repeat(1920), "c".repeat(1920), "d".repeat(1920), "e".repeat(1920)
+        );
+        tx.send(make_event(Role::User, &content, None, 1)).unwrap();
+        drain_worker(tx, handle).await;
+
+        let rows = count_memory(&store).await;
+        assert_eq!(
+            rows, 0,
+            "InferenceFailed from embed_batch must drop the whole event, not insert 4-of-5 chunks; got {rows}"
+        );
+    }
+
+    /// An `embed_batch` override that returns one FEWER vector than requested
+    /// — the shape a real batch backend produces on a partial reply. This
+    /// must never reach the zip: `process_event`'s own length check is the
+    /// only guard standing between a short reply and a chunk silently paired
+    /// with another chunk's vector.
+    #[tokio::test]
+    async fn embed_batch_returning_too_few_vectors_drops_the_event_not_mispairs_it() {
+        struct ShortReplyEmbedder;
+        #[async_trait::async_trait]
+        impl Embedder for ShortReplyEmbedder {
+            async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+                unreachable!("process_event must call embed_batch for chunked events");
+            }
+            async fn embed_batch(&self, texts: &[String], _role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
+                // One short: a real backend that dropped or merged one item
+                // mid-batch would look exactly like this.
+                Ok(texts.iter().skip(1).map(|_| vec![0.1_f32; 384]).collect())
+            }
+            fn dimensions(&self) -> usize {
+                384
+            }
+            fn model_id(&self) -> &str {
+                "short-reply"
+            }
+            fn query_prefix(&self) -> &str {
+                ""
+            }
+            fn passage_prefix(&self) -> &str {
+                ""
+            }
+        }
+
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(ShortReplyEmbedder);
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        // Three DISTINCT chunks so all three survive collapse and reach the
+        // embed stage; the mock then replies with only 2 vectors.
+        let content = format!("{}{}{}", "a".repeat(1920), "b".repeat(1920), "c".repeat(1920));
+        tx.send(make_event(Role::User, &content, None, 1)).unwrap();
+        drain_worker(tx, handle).await;
+
+        let rows = count_memory(&store).await;
+        assert_eq!(
+            rows, 0,
+            "a short embed_batch reply must drop the whole event, never zip a chunk to another chunk's vector; got {rows} rows"
         );
     }
 

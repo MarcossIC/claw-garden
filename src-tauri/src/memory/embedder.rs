@@ -47,6 +47,27 @@ pub trait Embedder: Send + Sync {
     /// length MUST equal [`Embedder::dimensions`].
     async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError>;
 
+    /// Compute embeddings for `texts` in one call, every text prefixed per
+    /// `role`. Returns exactly `texts.len()` vectors in input order: the
+    /// ingest worker zips the reply back against its chunks, so a short or
+    /// reordered reply attaches one chunk's vector to another chunk's
+    /// memory — corruption, not a recoverable error.
+    ///
+    /// One role per call rather than per item: the only batching caller
+    /// embeds one event's chunks, all passages, and a per-item role would
+    /// let a single call straddle two embedding spaces.
+    ///
+    /// The default body embeds one text at a time, which is correct for
+    /// every impl and merely unbatched — only backends with a real batch
+    /// API need to override it.
+    async fn embed_batch(&self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let mut out = Vec::with_capacity(texts.len());
+        for text in texts {
+            out.push(self.embed_with_role(text, role).await?);
+        }
+        Ok(out)
+    }
+
     /// Embedding dimensionality (e.g. 384 for `multilingual-e5-small`).
     fn dimensions(&self) -> usize;
 
@@ -126,10 +147,10 @@ pub enum EmbedError {
 // by the const-block at the bottom of this file.
 // ============================================================================
 
-/// Internal request crossing the channel: text to embed + oneshot reply slot.
+/// Internal request crossing the channel: texts to embed + oneshot reply slot.
 pub(crate) struct EmbedRequest {
-    pub(crate) text: String,
-    pub(crate) resp: oneshot::Sender<Result<Vec<f32>, EmbedError>>,
+    pub(crate) texts: Vec<String>,
+    pub(crate) resp: oneshot::Sender<Result<Vec<Vec<f32>>, EmbedError>>,
 }
 
 pub struct FastEmbedLocal {
@@ -140,18 +161,32 @@ pub struct FastEmbedLocal {
 
 #[async_trait]
 impl Embedder for FastEmbedLocal {
-    async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
-        let prefixed = apply_role_prefix(role, text, self.query_prefix(), self.passage_prefix());
+    async fn embed_batch(&self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let prefixed: Vec<String> = texts.iter()
+            .map(|t| apply_role_prefix(role, t, self.query_prefix(), self.passage_prefix()))
+            .collect();
+        let expected = prefixed.len();
         let (resp_tx, resp_rx) = oneshot::channel();
-        self.req_tx
-            .send(EmbedRequest {
-                text: prefixed,
-                resp: resp_tx,
-            })
+        self.req_tx.send(EmbedRequest { texts: prefixed, resp: resp_tx })
             .map_err(|_| EmbedError::WorkerGone)?;
         // Map the oneshot RecvError (sender dropped) to WorkerGone; otherwise
         // unwrap the inner Result the worker placed inside.
-        resp_rx.await.map_err(|_| EmbedError::WorkerGone)?
+        let vectors = resp_rx.await.map_err(|_| EmbedError::WorkerGone)??;
+        if vectors.len() != expected {
+            // Reported as an inference failure rather than trusted: the
+            // caller pairs these positionally, so a wrong count means the
+            // pairing is already meaningless.
+            return Err(EmbedError::InferenceFailed(format!(
+                "model returned {} vectors for {expected} texts", vectors.len()
+            )));
+        }
+        Ok(vectors)
+    }
+
+    async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+        let one = [text.to_string()];
+        let mut out = self.embed_batch(&one, role).await?;
+        out.pop().ok_or_else(|| EmbedError::InferenceFailed("empty reply for one text".to_string()))
     }
 
     fn dimensions(&self) -> usize {
@@ -200,12 +235,10 @@ impl FastEmbedLocal {
             .spawn(move || {
                 // futures::executor::block_on bridges tokio's mpsc receiver into
                 // a non-tokio thread. Loop exits naturally when all senders drop.
-                while let Some(EmbedRequest { text, resp }) =
+                while let Some(EmbedRequest { texts, resp }) =
                     futures::executor::block_on(req_rx.recv())
                 {
-                    let out = model
-                        .embed(vec![text.as_str()], None)
-                        .map(|mut v| v.pop().unwrap_or_default())
+                    let out = model.embed(texts, None)
                         .map_err(|e| EmbedError::InferenceFailed(e.to_string()));
                     // Dropped oneshot receiver = caller gave up; ignore the send error.
                     let _ = resp.send(out);
@@ -466,6 +499,30 @@ mod tests {
         let _ = OllamaEmbedder.embed_with_role("x", EmbedRole::Passage).await;
     }
 
+    // ---------- embed_batch (default impl + invariants) ----------
+
+    #[tokio::test]
+    async fn embed_batch_default_impl_matches_one_by_one() {
+        let e = FakeEmbedder::default();
+        let texts = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let batch = e.embed_batch(&texts, EmbedRole::Passage).await.unwrap();
+
+        let mut individual = Vec::new();
+        for t in &texts {
+            individual.push(e.embed_with_role(t, EmbedRole::Passage).await.unwrap());
+        }
+
+        assert_eq!(batch, individual, "embed_batch must match N sequential embed_with_role calls, in order");
+    }
+
+    #[tokio::test]
+    async fn embed_batch_default_impl_returns_empty_for_empty_input() {
+        let e = FakeEmbedder::default();
+        let texts: Vec<String> = Vec::new();
+        let batch = e.embed_batch(&texts, EmbedRole::Passage).await.unwrap();
+        assert!(batch.is_empty(), "expected empty output for empty input, got {batch:?}");
+    }
+
     // ---------- FastEmbedLocal worker plumbing ----------
 
     #[tokio::test]
@@ -476,10 +533,10 @@ mod tests {
         let canned: Vec<f32> = (0..384).map(|i| i as f32 * 0.001).collect();
         let canned_for_worker = canned.clone();
         std::thread::spawn(move || {
-            while let Some(EmbedRequest { text: _, resp }) =
+            while let Some(EmbedRequest { texts: _, resp }) =
                 futures::executor::block_on(req_rx.recv())
             {
-                let _ = resp.send(Ok(canned_for_worker.clone()));
+                let _ = resp.send(Ok(vec![canned_for_worker.clone()]));
             }
         });
 
@@ -487,6 +544,62 @@ mod tests {
         let out = local.embed_with_role("anything", EmbedRole::Passage).await.unwrap();
         assert_eq!(out.len(), 384);
         assert_eq!(out, canned, "worker reply must flow back unchanged");
+    }
+
+    /// `FastEmbedLocal::embed_batch` must send exactly one channel request
+    /// carrying every text, each already prefixed per `role`.
+    #[tokio::test]
+    async fn fast_embed_local_sends_one_request_with_all_prefixed_texts() {
+        use std::sync::{Arc, Mutex};
+
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel::<EmbedRequest>();
+        let captured: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_worker = captured.clone();
+        std::thread::spawn(move || {
+            while let Some(EmbedRequest { texts, resp }) =
+                futures::executor::block_on(req_rx.recv())
+            {
+                captured_for_worker.lock().unwrap().push(texts.clone());
+                let reply: Vec<Vec<f32>> = texts.iter().map(|_| vec![0.0f32; 384]).collect();
+                let _ = resp.send(Ok(reply));
+            }
+        });
+
+        let local = FastEmbedLocal::from_mock_worker(req_tx);
+        let texts = vec!["chunk-a".to_string(), "chunk-b".to_string()];
+        let out = local.embed_batch(&texts, EmbedRole::Passage).await.unwrap();
+        assert_eq!(out.len(), 2);
+
+        let calls = captured.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "expected exactly one channel request for the whole batch, got {calls:?}");
+        assert_eq!(
+            calls[0],
+            vec!["query: chunk-a".to_string(), "query: chunk-b".to_string()],
+            "every text must be prefixed per role before crossing the channel"
+        );
+    }
+
+    /// A reply with fewer (or more) vectors than texts submitted must be
+    /// reported as InferenceFailed, never trusted positionally.
+    #[tokio::test]
+    async fn fast_embed_local_rejects_reply_with_wrong_vector_count() {
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel::<EmbedRequest>();
+        std::thread::spawn(move || {
+            while let Some(EmbedRequest { texts: _, resp }) =
+                futures::executor::block_on(req_rx.recv())
+            {
+                // Reply with only 1 vector for however many texts were sent.
+                let _ = resp.send(Ok(vec![vec![0.0f32; 384]]));
+            }
+        });
+
+        let local = FastEmbedLocal::from_mock_worker(req_tx);
+        let texts = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let err = local.embed_batch(&texts, EmbedRole::Passage).await.unwrap_err();
+        assert!(
+            matches!(err, EmbedError::InferenceFailed(_)),
+            "expected InferenceFailed for a vector-count mismatch, got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -514,11 +627,11 @@ mod tests {
         let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let captured_for_worker = captured.clone();
         std::thread::spawn(move || {
-            while let Some(EmbedRequest { text, resp }) =
+            while let Some(EmbedRequest { texts, resp }) =
                 futures::executor::block_on(req_rx.recv())
             {
-                *captured_for_worker.lock().unwrap() = Some(text);
-                let _ = resp.send(Ok(vec![0.0f32; 384]));
+                *captured_for_worker.lock().unwrap() = texts.first().cloned();
+                let _ = resp.send(Ok(vec![vec![0.0f32; 384]]));
             }
         });
 

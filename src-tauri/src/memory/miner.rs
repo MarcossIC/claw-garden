@@ -1,13 +1,14 @@
-//! Trajectory miner (Fase 1 — pipeline + Golden Trajectory gating).
+//! Trajectory miner — pipeline + Golden Trajectory gating.
 //!
 //! Fire-and-forget entry point `run_miner`, spawned from `commands/session.rs`
 //! on session close, replacing `episodic_writer::run_episodic_writer`. Always
 //! delegates to `episodic_writer::run_episodic_writer_core` to INSERT the
 //! episodic trajectory, then — only if `success_score` clears
 //! [`GOLDEN_SCORE_THRESHOLD`] — extracts tool-call sequences and mines
-//! in-memory [`MinedSkillCandidate`]s (no new persistence — Fase 2).
+//! [`MinedSkillCandidate`]s, promoting recurring ones into `procedural_skill`
+//! via `promote_to_procedural_skill`.
 //!
-//! # Design constraints (LOCKED — see `sdd/trajectory-miner-fase-1/design`)
+//! # Design constraints
 //! - The gate is `draft.success_score > GOLDEN_SCORE_THRESHOLD` (strict `>`).
 //!   Structurally, this is a BINARY gate: `ended_clean` sessions always score
 //!   exactly `0.9` and pass; non-clean sessions always score `<= 0.4` and
@@ -26,43 +27,43 @@ use crate::memory::db::MemoryStore;
 use crate::memory::embedder::{EmbedRole, Embedder};
 use crate::memory::episodic_writer::{run_episodic_writer_core, TrajectoryDraft};
 use crate::models::chat::Role;
+use crate::models::config::{aux_job_enabled, AuxJob};
 use crate::models::{ChatMessage, ChatRequest, ChatStreamResult};
 use crate::providers::{AiProvider, StreamSender};
 
-/// Golden Trajectory gate threshold (spec R1, LOCKED). The gate uses strict
-/// `>` — `success_score == 0.85` exactly does NOT pass.
+/// Golden Trajectory gate threshold. The gate uses strict `>` —
+/// `success_score == 0.85` exactly does NOT pass.
 const GOLDEN_SCORE_THRESHOLD: f64 = 0.85;
 
 /// Maximum wall-clock time allowed for the namer LLM call (molde `EXTRACTOR_TIMEOUT`).
 const NAMER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Root-cause category vocabulary (Fase 3, LOCKED — spec R2). Closed to
-/// exactly these 3 snake_case values; no `unclassified` sentinel is ever
+/// Root-cause category vocabulary. Closed to exactly these 3 snake_case
+/// values; no `unclassified` sentinel is ever
 /// written.
 const RCA_MISSING_CONTEXT: &str = "missing_context";
 const RCA_MODEL_LIMITATION: &str = "model_limitation";
 const RCA_PROCEDURAL_ERROR: &str = "procedural_error";
 
-/// Per-item character cap applied inside `build_rca_prompt` (Amendment,
-/// post-spec-reconciliation). A SEPARATE const from episodic_writer's
-/// `ERROR_ITEM_CHAR_CAP` — same value, parallel frontier, per the codebase's
-/// per-layer cap doctrine (each frontier applies its own cap).
+/// Per-item character cap applied inside `build_rca_prompt`. A SEPARATE
+/// const from episodic_writer's `ERROR_ITEM_CHAR_CAP` — same value, parallel
+/// frontier, per the codebase's per-layer cap doctrine (each frontier
+/// applies its own cap).
 const RCA_ERROR_ITEM_CHAR_CAP: usize = 500;
 
-/// Maximum number of error items included in the RCA prompt (Amendment).
+/// Maximum number of error items included in the RCA prompt.
 /// Only the FIRST `RCA_MAX_ERROR_ITEMS` in flattened/chronological order are
 /// kept; items beyond the cap are dropped, not summarized.
 const RCA_MAX_ERROR_ITEMS: usize = 20;
 
 /// Cap (in tool-sequence steps) above which `heuristic_skill_name` switches
 /// from the full `→`-joined name to the abbreviated "first 2 + last + count"
-/// form. Fixed at 4 (design §1.2): abbreviating only shortens the string once
-/// it elides >= 2 names, i.e. from `n >= 5`.
+/// form. Fixed at 4: abbreviating only shortens the string once it elides
+/// >= 2 names, i.e. from `n >= 5`.
 const MAX_SKILL_NAME_STEPS: usize = 4;
 
-/// One mined skill candidate — the entry contract for Fase 2's
-/// `promote_to_procedural_skill`. Lives only in memory in Fase 1 (no new
-/// persistence); logged structurally per candidate.
+/// One mined skill candidate — the input to `promote_to_procedural_skill`,
+/// which upserts it into `procedural_skill`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct MinedSkillCandidate {
     pub source_trajectory_id: i64,
@@ -87,8 +88,7 @@ pub(crate) fn normalize_tool_sequence(seq: &[String]) -> Vec<String> {
 }
 
 /// At most 1 sequence per trajectory: the FULL `tool_calls` sequence,
-/// normalized, or `vec![]` if `tool_calls` is empty. No n-grams/sub-sequences
-/// (LOCKED).
+/// normalized, or `vec![]` if `tool_calls` is empty. No n-grams/sub-sequences.
 pub(crate) fn extract_tool_sequences(draft: &TrajectoryDraft) -> Vec<Vec<String>> {
     let normalized = normalize_tool_sequence(&draft.tool_calls);
     if normalized.is_empty() {
@@ -98,16 +98,15 @@ pub(crate) fn extract_tool_sequences(draft: &TrajectoryDraft) -> Vec<Vec<String>
     }
 }
 
-/// Recurrence threshold (spec R2, LOCKED): a candidate promotes iff
+/// Recurrence threshold: a candidate promotes iff
 /// `1 (actual) + filter_recurring(...).len() >= RECURRING_THRESHOLD`.
 const RECURRING_THRESHOLD: usize = 2;
 
-/// Bound on the number of prior Golden trajectories fetched per candidate
-/// (spec R6, LOCKED).
+/// Bound on the number of prior Golden trajectories fetched per candidate.
 const PRIOR_TRAJECTORIES_LIMIT: i64 = 500;
 
 /// Single producer of the text embedded for a procedural skill row — trigger
-/// FIRST, then skill_name (spec R3). Shared between the live write path
+/// FIRST, then skill_name. Shared between the live write path
 /// (below) and `reembed_all`'s backfill: the two MUST build the identical
 /// string from the same `(trigger, skill_name)` pair, or the backfill
 /// silently re-infers a vector for a different string than the one the row
@@ -117,8 +116,8 @@ pub(crate) fn skill_embedding_text(trigger: &str, skill_name: &str) -> String {
     format!("{trigger} {skill_name}")
 }
 
-/// Single producer of the dedup key / `tool_sequence` column value (spec R5)
-/// — used on BOTH the SELECT (dedup check) and INSERT/UPDATE paths. Inline
+/// Single producer of the dedup key / `tool_sequence` column value — used on
+/// BOTH the SELECT (dedup check) and INSERT/UPDATE paths. Inline
 /// `serde_json::to_string` calls for this purpose are prohibited outside
 /// this helper.
 pub(crate) fn serialize_tool_sequence(seq: &[String]) -> String {
@@ -126,7 +125,7 @@ pub(crate) fn serialize_tool_sequence(seq: &[String]) -> String {
 }
 
 /// `episodic_trajectory.id`s of PRIOR entries whose sequence equals
-/// `candidate_seq` by exact element-wise match (spec R1). Pure, no I/O — no
+/// `candidate_seq` by exact element-wise match. Pure, no I/O — no
 /// fuzzy/similarity matching.
 pub(crate) fn filter_recurring(candidate_seq: &[String], prior: &[(i64, Vec<String>)]) -> Vec<i64> {
     prior.iter().filter(|(_, seq)| seq == candidate_seq).map(|(id, _)| *id).collect()
@@ -159,8 +158,8 @@ const NAMER_SYS: &str = "You name a reusable coding skill mined from a successfu
     - trigger: one phrase describing WHEN to apply this skill (the situation/goal), e.g. \"when a unit test fails\".\n\
     Base both strictly on the task and the tool sequence given. Return your single best guess. Never return prose outside the JSON object.";
 
-/// System prompt for the RCA classifier LLM call (Fase 3). Closed vocabulary
-/// of exactly 3 categories — the model must never return anything else.
+/// System prompt for the RCA classifier LLM call. Closed vocabulary of
+/// exactly 3 categories — the model must never return anything else.
 const RCA_SYS: &str = "You classify why an AI coding agent's trajectory failed.\n\
     Return ONLY a JSON object (no prose, no markdown fences):\n\
     {\"root_cause\": <one of: \"missing_context\", \"model_limitation\", \"procedural_error\">}\n\
@@ -209,10 +208,10 @@ pub(crate) fn parse_skill_naming(txt: &str) -> Option<(String, String)> {
     Some((skill_name, trigger))
 }
 
-/// Build the user-turn content for the RCA classifier LLM call (Fase 3).
+/// Build the user-turn content for the RCA classifier LLM call.
 ///
-/// Applies the RCA-prompt-frontier caps (Amendment, post-spec-reconciliation):
-/// at most [`RCA_MAX_ERROR_ITEMS`] errors, each truncated to
+/// Applies the RCA-prompt-frontier caps: at most [`RCA_MAX_ERROR_ITEMS`]
+/// errors, each truncated to
 /// [`RCA_ERROR_ITEM_CHAR_CAP`] chars — items beyond the cap are dropped, not
 /// summarized. `resolution` stays uncapped (matches the `llm_name`
 /// precedent). Pure, no I/O.
@@ -307,7 +306,7 @@ async fn llm_name(
     parse_skill_naming(&text)
 }
 
-/// One RCA classification attempt (Fase 3). Mirror of `llm_name`: isolated
+/// One RCA classification attempt. Mirror of `llm_name`: isolated
 /// from `&MemoryStore` so it can be tested with a paused clock without any DB
 /// I/O between `advance` calls.
 ///
@@ -366,8 +365,8 @@ async fn llm_root_cause(
 /// most 1 tool-call sequence. (4) build each candidate with a heuristic
 /// name/trigger, then attempt ONE LLM override (never blocking, never
 /// dropping the candidate).
-// 8 params is the spec-locked contract (design §1.7) — narrowing it would
-// break the testable-core split this signature exists for.
+// 8 params is the fixed contract this testable-core split needs to keep
+// every dependency explicit — narrowing it would break that split.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn mine_session_core(
     session_id: String,
@@ -379,23 +378,31 @@ pub(crate) async fn mine_session_core(
     timeout: Duration,
     now_ms: u64,
 ) -> Vec<MinedSkillCandidate> {
+    // Counts LLM calls issued below (RCA + namer), logged once at every exit
+    // point as `aux_llm session={id} job=miner calls={n}`. Cloned before
+    // `session_id` is moved into `run_episodic_writer_core` so the earliest
+    // exit can still log it.
+    let mut calls: u64 = 0;
+    let session_id_for_log = session_id.clone();
     let Some((trajectory_id, draft)) =
         run_episodic_writer_core(session_id, history, store, embedder.clone(), project_by_agent, now_ms).await
     else {
+        log::info!("aux_llm session={session_id_for_log} job=miner calls={calls}");
         return Vec::new();
     };
 
     // Gate uses `<=` (clippy-clean equivalent of `!(score > THRESHOLD)`);
     // `success_score` is always clamped [0,1], never NaN.
     if draft.success_score <= GOLDEN_SCORE_THRESHOLD {
-        // Fase 3 — Root Cause Analysis (fire-and-forget, spec R1/R3):
-        // attempt RCA iff there is at least one error to classify. Every
+        // Root Cause Analysis (fire-and-forget): attempt RCA iff there is
+        // at least one error to classify. Every
         // failure path (absent provider, timeout, parse-fail, OOV, DB error)
         // warns and leaves `root_cause` NULL — never panics, never blocks
         // session close.
         if !draft.errors_encountered.is_empty() {
             match provider_by_agent.get(&draft.agent_id) {
                 Some(provider) => {
+                    calls += 1;
                     if let Some(cause) = llm_root_cause(
                         provider,
                         &draft.task,
@@ -416,13 +423,14 @@ pub(crate) async fn mine_session_core(
                 }
             }
         }
+        log::info!("aux_llm session={} job=miner calls={calls}", draft.session_id);
         return Vec::new();
     }
 
     let sequences = extract_tool_sequences(&draft);
 
-    // Golden priors for recurrence matching (R6). Errors are recoverable —
-    // `log::warn!` + empty list, mining must never block session close (R10).
+    // Golden priors for recurrence matching. Errors are recoverable —
+    // `log::warn!` + empty list, mining must never block session close.
     let priors_raw = store
         .fetch_prior_trajectories(&draft.agent_id, trajectory_id, GOLDEN_SCORE_THRESHOLD, PRIOR_TRAJECTORIES_LIMIT)
         .await
@@ -430,8 +438,8 @@ pub(crate) async fn mine_session_core(
             log::warn!("miner: fetch_prior_trajectories failed for agent={}: {e}", draft.agent_id);
             Vec::new()
         });
-    // Parse + normalize at query-time (R6-aligned); malformed JSON is skipped
-    // with a warning, not fatal (R10).
+    // Parse + normalize at query-time; malformed JSON is skipped with a
+    // warning, not fatal.
     let priors: Vec<(i64, Vec<String>)> = priors_raw
         .iter()
         .filter_map(|(id, tool_calls_json)| match serde_json::from_str::<Vec<String>>(tool_calls_json) {
@@ -457,6 +465,7 @@ pub(crate) async fn mine_session_core(
 
         match provider_by_agent.get(&draft.agent_id) {
             Some(provider) => {
+                calls += 1;
                 if let Some((name, trig)) = llm_name(
                     provider,
                     &candidate.task,
@@ -484,19 +493,19 @@ pub(crate) async fn mine_session_core(
             candidate.normalized_sequence.len(),
         );
 
-        // Recurrence + promotion (R2): total occurrences = 1 (actual) +
-        // matched priors. Threshold not met => log only, no persistence.
+        // Recurrence + promotion: total occurrences = 1 (actual) + matched
+        // priors. Threshold not met => log only, no persistence.
         let matched = filter_recurring(&candidate.normalized_sequence, &priors);
         if 1 + matched.len() >= RECURRING_THRESHOLD {
             let mut source_trajectory_ids = vec![candidate.source_trajectory_id];
             source_trajectory_ids.extend(matched);
 
-            // R3: embed "{trigger} {skill_name}" (trigger first), via the
-            // single shared producer `skill_embedding_text` — `reembed_all`
-            // calls the same function so a backfilled vector always matches
-            // what a live write would have produced. Passage: a skill row is
-            // stored content, retrieved later by a Query-role search.
-            // Absent embedder / embed failure => None, never fatal (R9).
+            // Embed "{trigger} {skill_name}" (trigger first), via the single
+            // shared producer `skill_embedding_text` — `reembed_all` calls
+            // the same function so a backfilled vector always matches what a
+            // live write would have produced. Passage: a skill row is stored
+            // content, retrieved later by a Query-role search.
+            // Absent embedder / embed failure => None, never fatal.
             let embedding = match &embedder {
                 Some(e) => match e
                     .embed_with_role(
@@ -519,7 +528,7 @@ pub(crate) async fn mine_session_core(
 
             let rec = crate::memory::store_insert::NewProceduralSkillRecord {
                 agent_id: candidate.agent_id.clone(),
-                // RAW project_by_agent lookup (R4) — no derive, matches the
+                // RAW project_by_agent lookup — no derive, matches the
                 // episodic writer's map but NOT its derived project_id value.
                 project_id: project_by_agent.get(&candidate.agent_id).cloned().flatten(),
                 skill_name: candidate.skill_name.clone(),
@@ -550,6 +559,7 @@ pub(crate) async fn mine_session_core(
 
         candidates.push(candidate);
     }
+    log::info!("aux_llm session={} job=miner calls={calls}", draft.session_id);
     candidates
 }
 
@@ -563,8 +573,8 @@ pub(crate) async fn mine_session_core(
 /// Resolves dependencies from `AppState` — embedder cell, memory store, and a
 /// snapshot of `agent_id -> (provider_id, project_path)` with the
 /// `MutexGuard` dropped before any `.await` — then delegates to
-/// [`mine_session_core`]. Candidates are observability-only in Fase 1
-/// (logged inside the core); Fase 2 persists them.
+/// [`mine_session_core`], which persists recurring candidates via
+/// `promote_to_procedural_skill`.
 pub(crate) async fn run_miner(
     app: tauri::AppHandle,
     session_id: String,
@@ -577,6 +587,18 @@ pub(crate) async fn run_miner(
     }
 
     let state = app.state::<crate::state::AppState>();
+
+    // Read the flag before any lock, query or LLM call. `info`, not `debug`:
+    // a user who disabled this and later wonders why memories stopped
+    // appearing needs the trace at the default level. A poisoned lock keeps
+    // the job running — the flag exists to save cost, not to gate correctness.
+    let enabled = state.config.read()
+        .map(|c| aux_job_enabled(&c, AuxJob::Miner))
+        .unwrap_or(true);
+    if !enabled {
+        log::info!("miner disabled by config; skipping session close");
+        return;
+    }
 
     // Check embedder BEFORE any further work — saves the agents lock entirely
     // (same branch as the eliminated run_episodic_writer wrapper).
@@ -616,8 +638,8 @@ pub(crate) async fn run_miner(
 
     let now_ms = crate::models::chat::current_time_millis();
 
-    // Fase 1: candidates are observability-only (logged inside the core);
-    // Fase 2 persists them via promote_to_procedural_skill.
+    // Candidates are persisted inside the core via promote_to_procedural_skill;
+    // the return value here is discarded since the core already logs the outcome.
     let _candidates = mine_session_core(
         session_id,
         history,
@@ -647,7 +669,7 @@ const _: fn() = || {
 mod tests {
     use super::*;
 
-    // ── R1 — consts lockeadas ────────────────────────────────────────────────
+    // ── Pinned constant values ───────────────────────────────────────────────
 
     #[test]
     fn consts_have_locked_values() {
@@ -656,7 +678,7 @@ mod tests {
         assert_eq!(MAX_SKILL_NAME_STEPS, 4);
     }
 
-    // ── Phase 2 (trajectory-miner-fase-3) — RCA consts locked (design #8, Amendment) ──
+    // ── RCA constant values ──────────────────────────────────────────────────
 
     #[test]
     fn rca_consts_have_locked_values() {
@@ -667,7 +689,7 @@ mod tests {
         assert_eq!(RCA_MAX_ERROR_ITEMS, 20);
     }
 
-    // ── Lote 1 — RECURRING_THRESHOLD, serialize_tool_sequence, filter_recurring ──
+    // ── RECURRING_THRESHOLD, serialize_tool_sequence, filter_recurring ───────
 
     #[test]
     fn recurring_threshold_locked_value() {
@@ -826,7 +848,7 @@ mod tests {
         assert_eq!(c.normalized_sequence, vec!["read_file".to_string()]);
     }
 
-    // ── Lote 3 — mine_session_core (pipeline + Golden gating) ────────────────
+    // ── mine_session_core (pipeline + Golden gating) ─────────────────────────
 
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -962,8 +984,8 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0, "provider must never be invoked");
     }
 
-    // score bajo (no-clean, 1 unresolved / 2 tool_calls => 0.15) → 1 fila,
-    // vec![] candidates, 0 namer LLM calls. Fase 3 note: the SAME
+    // low score (no-clean, 1 unresolved / 2 tool_calls => 0.15) → 1 row,
+    // vec![] candidates, 0 namer LLM calls. The SAME
     // provider_by_agent is reused for RCA below the gate (design: "no new
     // spawn, no re-fetch") — this history has 1 error_encountered, so RCA
     // DOES call the provider once; the namer itself is still never invoked
@@ -1093,7 +1115,7 @@ mod tests {
 
         // Spec rev2 Boundary scenario: assert the score COMPUTED by
         // build_trajectory for this exact history, with epsilon — expected
-        // derived from the LOCKED formula, not hardcoded: BASE 0.4 + bonus
+        // derived from the pinned formula, not hardcoded: BASE 0.4 + bonus
         // 0.0 (last message is Role::Tool, not ended_clean) − 0.5·(1
         // unresolved / 10 tool_calls) = 0.35.
         let expected = 0.4 - 0.5 * (1.0 / 10.0);
@@ -1303,7 +1325,7 @@ mod tests {
         assert!(!c.normalized_sequence.is_empty());
     }
 
-    // ── Lote 3 — recurrencia y promoción a procedural_skill (R12 replacement) ──
+    // ── Recurrence and promotion to procedural_skill ──────────────────────────
 
     fn seeded_prior_record(
         agent_id: &str,
@@ -1329,8 +1351,8 @@ mod tests {
         }
     }
 
-    // R2/R3/R4/R7/R12: 1 Golden prior with a consecutive-dup raw sequence
-    // (proves query-time normalization) recurring against the candidate ⇒
+    // 1 Golden prior with a consecutive-dup raw sequence (proves query-time
+    // normalization) recurring against the candidate ⇒
     // count_procedural==1, success_count==2, source_trajectory_ids==[current,prior],
     // tier==1, importance≈8.0, 1 procedural_vectors row.
     #[tokio::test]
@@ -1386,8 +1408,8 @@ mod tests {
         assert_eq!(vec_count, 1);
     }
 
-    // Replaces the eliminated `procedural_skill_untouched` (R12): 0 priors ⇒
-    // total occurrences = 1 < RECURRING_THRESHOLD ⇒ no promotion; candidate is
+    // Replaces the eliminated `procedural_skill_untouched`: 0 priors ⇒ total
+    // occurrences = 1 < RECURRING_THRESHOLD ⇒ no promotion; candidate is
     // still returned/logged.
     #[tokio::test]
     async fn single_occurrence_does_not_promote() {
@@ -1414,7 +1436,7 @@ mod tests {
         assert_eq!(count_procedural(&store).await, 0, "0 priors must not promote");
     }
 
-    // R6: a prior with an identical sequence but success_score=0.4 (non-clean
+    // A prior with an identical sequence but success_score=0.4 (non-clean
     // path) is filtered out at the SQL layer, so it never reaches
     // filter_recurring — no promotion.
     #[tokio::test]
@@ -1445,7 +1467,7 @@ mod tests {
         assert_eq!(count_procedural(&store).await, 0, "non-Golden prior must not count toward recurrence");
     }
 
-    // R1: a Golden prior with a DIFFERENT sequence never matches
+    // A Golden prior with a DIFFERENT sequence never matches
     // filter_recurring — no promotion.
     #[tokio::test]
     async fn prior_different_sequence_does_not_count() {
@@ -1475,7 +1497,7 @@ mod tests {
         assert_eq!(count_procedural(&store).await, 0, "a Golden prior with a different sequence must not count");
     }
 
-    // R8 amendment lock — this is the test that distinguishes the invariant
+    // This is the test that distinguishes the pinned invariant
     // `success_count == len(distinct source_trajectory_ids)` from the
     // rejected `+= total_occurrences` reading: 3 sessions with the identical
     // normalized sequence, mined in order ⇒ after the 3rd, exactly 1 row,
@@ -1552,12 +1574,12 @@ mod tests {
         assert_eq!(source_ids, expected);
     }
 
-    // ── Post-verify W1 (R3) — embed text exacto "{trigger} {skill_name}" ─────
+    // ── Skill embed text is exactly "{trigger} {skill_name}" ─────────────────
 
     /// Wraps FakeEmbedder and records every `(role, text)` pair — lets tests
-    /// assert the EXACT string AND role handed to `embed_with_role` (R3:
-    /// trigger first, then skill_name; role Passage), which the stored
-    /// vector alone cannot prove readably.
+    /// assert the EXACT string AND role handed to `embed_with_role` (trigger
+    /// first, then skill_name; role Passage), which the stored vector alone
+    /// cannot prove readably.
     struct CapturingEmbedder {
         inner: FakeEmbedder,
         calls: Arc<std::sync::Mutex<Vec<(EmbedRole, String)>>>,
@@ -1587,7 +1609,7 @@ mod tests {
         }
     }
 
-    // R3: the NEW-skill embedding input must be exactly
+    // The NEW-skill embedding input must be exactly
     // `format!("{trigger} {skill_name}")` — trigger FIRST. With no provider,
     // the heuristic name/trigger are deterministic, so the expected string is
     // fully known; the swapped-order string is asserted UNEQUAL to prove an
@@ -1627,7 +1649,7 @@ mod tests {
         let swapped = format!("{} {}", "read_file→edit_file", "fix the bug");
         let captured = calls.lock().unwrap().clone();
         assert_eq!(captured.len(), 2, "exactly 2 embeds: task (episodic) + skill (procedural), got {captured:?}");
-        assert_eq!(captured[1].1, expected, "skill embed text must be trigger FIRST, then skill_name (R3)");
+        assert_eq!(captured[1].1, expected, "skill embed text must be trigger FIRST, then skill_name");
         assert_ne!(captured[1].1, swapped, "an order swap must be detectable by this test");
         assert_eq!(captured[0].0, EmbedRole::Passage, "episodic task embed must be role Passage");
         assert_eq!(captured[1].0, EmbedRole::Passage, "skill embed must be role Passage");
@@ -1640,11 +1662,11 @@ mod tests {
         assert_eq!(skill_embedding_text("t", "s"), "t s");
     }
 
-    // ── Post-verify W2 (R4) — project_id RAW positivo ─────────────────────────
+    // ── project_id is the RAW project_by_agent value, not derived ────────────
 
-    // R4 positive scenario: `project_by_agent["agent-a"] = Some("proj-x")` ⇒
-    // the promoted row stores the RAW value "proj-x" (no derive — design
-    // #1254 locks raw; a derived id would fail this assert).
+    // Positive scenario: `project_by_agent["agent-a"] = Some("proj-x")` ⇒
+    // the promoted row stores the RAW value "proj-x" (no derive; a derived
+    // id would fail this assert).
     #[tokio::test]
     async fn promoted_skill_project_id_is_raw_map_value() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1681,11 +1703,11 @@ mod tests {
         assert_eq!(
             project_id.as_deref(),
             Some("proj-x"),
-            "procedural_skill.project_id must be the RAW project_by_agent value (R4), not a derived id"
+            "procedural_skill.project_id must be the RAW project_by_agent value, not a derived id"
         );
     }
 
-    // ── Lote 4 — resiliencia (R10): prior JSON malformado no bloquea el resto ──
+    // ── Resilience: a malformed prior JSON must not block the rest ───────────
 
     // A malformed prior `tool_calls` JSON (written directly, bypassing the
     // normal writer's own serialization) must be skipped with a `log::warn!`
@@ -1735,15 +1757,14 @@ mod tests {
         );
     }
 
-    // ── Lote 4 — namer LLM en profundidad ─────────────────────────────────────
+    // ── Namer LLM — deeper coverage ───────────────────────────────────────────
     //
-    // `parse_skill_naming`/`llm_name` were already implemented in Lote 3 (the
-    // tasks' reconciliation note requires them to land there so
-    // `mine_session_core` compiles end-to-end). This lote does NOT reimplement
-    // — it deepens coverage over the existing implementation: the parse
-    // matrix, explicit override/keep-heuristic paths through
-    // `mine_session_core`, and the timeout path (previously written but never
-    // exercised by a test).
+    // `parse_skill_naming`/`llm_name` are already implemented above this
+    // point (needed so `mine_session_core` compiles end-to-end). This section
+    // does NOT reimplement them — it deepens coverage over the existing
+    // implementation: the parse matrix, explicit override/keep-heuristic
+    // paths through `mine_session_core`, and the timeout path (previously
+    // written but never exercised by a test).
 
     // ── parse_skill_naming — matriz de parse defensivo ────────────────────────
 
@@ -1783,7 +1804,7 @@ mod tests {
         assert_eq!(parse_skill_naming(txt), None);
     }
 
-    // ── Phase 2 (trajectory-miner-fase-3) — parse_root_cause matrix (design #1-7, spec R2) ──
+    // ── parse_root_cause — defensive parse matrix ─────────────────────────────
 
     #[test]
     fn parse_root_cause_valid_missing_context() {
@@ -1839,7 +1860,7 @@ mod tests {
         assert_eq!(parse_root_cause(txt), None);
     }
 
-    // ── Amendment delta — build_rca_prompt caps (design "Amendment", tests #21-22) ──
+    // ── build_rca_prompt — per-item and per-list caps ─────────────────────────
 
     #[test]
     fn build_rca_prompt_truncates_error_item_to_500_chars() {
@@ -2005,7 +2026,7 @@ mod tests {
         assert_eq!(result, None, "LLM timeout must yield None (heuristic persists at the call site)");
     }
 
-    // ── Phase 3 (trajectory-miner-fase-3) — llm_root_cause isolated (design #9-11) ──
+    // ── llm_root_cause — isolated from &MemoryStore, paused-clock testable ───
 
     // Isolated timeout test: paused clock, NeverProvider, single advance(31s),
     // NO DB I/O between advances — llm_root_cause takes no &MemoryStore for
@@ -2059,7 +2080,7 @@ mod tests {
         assert_eq!(result, None, "ToolCalls response must yield None");
     }
 
-    // ── Phase 4 (trajectory-miner-fase-3) — mine_session_core RCA gate/integration (design #12-16) ──
+    // ── mine_session_core — RCA gate/integration ──────────────────────────────
 
     async fn fetch_root_cause(store: &MemoryStore, session_id: &str) -> Option<String> {
         let session_id = session_id.to_string();

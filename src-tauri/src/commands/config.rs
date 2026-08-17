@@ -31,6 +31,26 @@ pub async fn set_project_path(
 }
 
 #[tauri::command]
+pub fn set_aux_llm_flags(
+    disable_extractor: bool,
+    disable_resolver: bool,
+    disable_miner: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), AppError> {
+    if let Ok(mut config) = state.config.write() {
+        config.disable_extractor = disable_extractor;
+        config.disable_resolver = disable_resolver;
+        config.disable_miner = disable_miner;
+        let snapshot = config.clone();
+        drop(config);
+        if let Err(e) = config_store::save_config(&snapshot) {
+            log::error!("Failed to persist config: {}", e);
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
 pub fn get_project_path(state: tauri::State<'_, AppState>) -> Result<Option<String>, AppError> {
     let config = state
         .config

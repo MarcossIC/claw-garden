@@ -8,6 +8,9 @@ export interface AppConfig {
   anthropic: { api_key: string; model: string };
   openrouter: { api_key: string; model: string };
   project_path: string | null;
+  disable_extractor: boolean;
+  disable_resolver: boolean;
+  disable_miner: boolean;
 }
 
 export interface OllamaStatus {
@@ -34,6 +37,9 @@ const DEFAULT_CONFIG: AppConfig = {
   anthropic: { api_key: '', model: 'claude-sonnet-4-5-20250514' },
   openrouter: { api_key: '', model: 'openrouter/free' },
   project_path: null,
+  disable_extractor: false,
+  disable_resolver: false,
+  disable_miner: false,
 };
 
 @Injectable({ providedIn: 'root' })
@@ -133,6 +139,40 @@ export class ConfigService {
       this.config.update((c) => ({ ...c, project_path: path }));
     } catch (err) {
       console.error('Failed to set project path:', err);
+    }
+  }
+
+  /**
+   * Toggles the three session-close aux LLM jobs (extractor/resolver/miner).
+   * No UI surfaces this yet — callers must supply all three flags, mirroring
+   * the backend command's shape (a caller toggling one must resupply the
+   * others).
+   */
+  async setAuxLlmFlags(
+    disableExtractor: boolean,
+    disableResolver: boolean,
+    disableMiner: boolean,
+  ): Promise<void> {
+    if (!isTauriEnv()) {
+      this.config.update((c) => ({
+        ...c,
+        disable_extractor: disableExtractor,
+        disable_resolver: disableResolver,
+        disable_miner: disableMiner,
+      }));
+      return;
+    }
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      await invoke('set_aux_llm_flags', { disableExtractor, disableResolver, disableMiner });
+      this.config.update((c) => ({
+        ...c,
+        disable_extractor: disableExtractor,
+        disable_resolver: disableResolver,
+        disable_miner: disableMiner,
+      }));
+    } catch (err) {
+      console.error('Failed to set aux LLM flags:', err);
     }
   }
 }

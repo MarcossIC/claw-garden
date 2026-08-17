@@ -163,6 +163,26 @@ impl MemoryStore {
         // Connection::open returns Result<_, rusqlite::Error>
         let conn = Connection::open(&path).await
             .map_err(MemoryError::Sqlite)?;
+        // WAL plus synchronous=NORMAL: one writer and concurrent readers
+        // instead of a writer that locks readers out, at the cost of an
+        // fsync per checkpoint rather than per commit. Set before the
+        // migrations so the schema build runs under it too.
+        //
+        // Read back rather than assumed, and never fatal: journal_mode
+        // returns the mode it actually landed on, and a filesystem that
+        // refuses WAL (a network-mounted home does exactly this) must leave
+        // the app slower, not unable to start.
+        match conn
+            .call(|c| -> rusqlite::Result<String> {
+                c.pragma_update(None, "synchronous", "NORMAL")?;
+                c.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+            })
+            .await
+        {
+            Ok(mode) if mode.eq_ignore_ascii_case("wal") => {}
+            Ok(mode) => log::warn!("memory.db journal_mode is {mode}, not wal; falling back to the default rollback journal"),
+            Err(e) => log::warn!("could not set memory.db journal mode: {e}; falling back to the default rollback journal"),
+        }
         register_udfs(&conn).await?;
         run_migrations(&conn).await?;
         // Raise SQLITE_LIMIT_VARIABLE_NUMBER from the default 999 to 32766 (SQLite hard
@@ -689,6 +709,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(limit, 32766, "new_for_test(): expected 32766, got {limit}");
+    }
+
+    // -----------------------------------------------------------------------
+    // WAL durability — production open() enables journal_mode=WAL and
+    // synchronous=NORMAL; the in-memory test path is deliberately untouched.
+    // -----------------------------------------------------------------------
+
+    /// WAL-1 — production open() path reports journal_mode "wal" on read-back.
+    #[tokio::test]
+    async fn open_sets_journal_mode_wal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+        let mode: String = store
+            .conn
+            .call(|c| -> rusqlite::Result<String> { c.query_row("PRAGMA journal_mode", [], |r| r.get(0)) })
+            .await
+            .unwrap();
+        assert!(mode.eq_ignore_ascii_case("wal"), "expected journal_mode wal, got {mode}");
+    }
+
+    /// WAL-2 — production open() path sets synchronous=NORMAL (value 1).
+    #[tokio::test]
+    async fn open_sets_synchronous_normal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = MemoryStore::open(dir.path()).await.unwrap();
+        let synchronous: i64 = store
+            .conn
+            .call(|c| -> rusqlite::Result<i64> { c.query_row("PRAGMA synchronous", [], |r| r.get(0)) })
+            .await
+            .unwrap();
+        assert_eq!(synchronous, 1, "expected synchronous=NORMAL (1), got {synchronous}");
+    }
+
+    /// WAL-3 — new_for_test()'s in-memory connection is deliberately left
+    /// alone: no WAL pragma is issued, so journal_mode never becomes "wal".
+    #[tokio::test]
+    async fn new_for_test_journal_mode_is_not_wal() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let mode: String = store
+            .conn
+            .call(|c| -> rusqlite::Result<String> { c.query_row("PRAGMA journal_mode", [], |r| r.get(0)) })
+            .await
+            .unwrap();
+        assert!(!mode.eq_ignore_ascii_case("wal"), "in-memory path must not be wal, got {mode}");
     }
 
     /// SPEC-12 Sc 12.1–12.3 — second new_for_test() in same process succeeds.

@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use crate::memory::clock::TimestampMs;
 use crate::memory::MemoryStore;
+use crate::models::config::{aux_job_enabled, AuxJob};
 use crate::models::{ChatMessage, ChatRequest, ChatStreamResult, Role};
 use crate::providers::{AiProvider, StreamSender};
 
@@ -362,11 +363,25 @@ pub(crate) async fn run_resolver(app: tauri::AppHandle) {
     use std::collections::HashMap;
 
     let state = app.state::<crate::state::AppState>();
+
+    // Read the flag before any lock, query or LLM call. `info`, not `debug`:
+    // a user who disabled this and later wonders why memories stopped
+    // appearing needs the trace at the default level. A poisoned lock keeps
+    // the job running — the flag exists to save cost, not to gate correctness.
+    let enabled = state.config.read()
+        .map(|c| aux_job_enabled(&c, AuxJob::Resolver))
+        .unwrap_or(true);
+    if !enabled {
+        log::info!("resolver disabled by config; skipping session close");
+        return;
+    }
+
     let store = state.memory_store.clone();
 
     // Step 1: load pending clusters.
     let clusters = load_disputed_clusters(&store).await;
     if clusters.is_empty() {
+        log::info!("aux_llm job=resolver calls=0");
         return;
     }
 
@@ -385,12 +400,14 @@ pub(crate) async fn run_resolver(app: tauri::AppHandle) {
     }; // MutexGuard dropped here — safe to .await below.
 
     // Step 3: adjudicate + apply per cluster.
+    let mut calls: u64 = 0;
     for cluster in clusters {
         let provider = match agent_pid.get(&cluster.agent_id) {
             Some(pid) => state.get_agent_provider(pid),
             None => state.get_provider(),
         };
 
+        calls += 1;
         let resolution = adjudicate_cluster(&provider, &cluster, RESOLVER_TIMEOUT).await;
 
         if let Err(e) = apply_resolution(&store, &cluster, resolution).await {
@@ -400,6 +417,7 @@ pub(crate) async fn run_resolver(app: tauri::AppHandle) {
             );
         }
     }
+    log::info!("aux_llm job=resolver calls={calls}");
 }
 
 // Compile-time proof: every type captured by the future passed to

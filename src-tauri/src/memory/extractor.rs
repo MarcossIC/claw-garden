@@ -1,4 +1,4 @@
-//! Session-close memory extractor (Fase 1 — memoria-3-capas).
+//! Session-close memory extractor.
 //!
 //! Fire-and-forget entry point `run_extractor`, spawned from `commands/session.rs`
 //! on session close. Extracts pivotal memories (`user_preference`,
@@ -7,7 +7,7 @@
 //! embedding through `insert_memory_with_vector` (which now computes the correct
 //! initial `tier`). Clone of the `memory/resolver.rs` fire-and-forget pattern.
 //!
-//! # Design constraints (LOCKED)
+//! # Design constraints
 //! - `EXTRACTOR_TIMEOUT = 30s`.
 //! - Embedder `OnceCell` empty → `log::debug!` + return EARLY, before the LLM call.
 //! - `scope="agent"`, `created_by_type=System`, `created_by_ref=agent_id`.
@@ -22,10 +22,11 @@ use crate::memory::embedder::{EmbedRole, Embedder};
 use crate::memory::events::MemorySource;
 use crate::memory::store_insert::{CreatedByType, MemoryType, NewMemoryRecord};
 use crate::models::chat::Role;
+use crate::models::config::{aux_job_enabled, AuxJob};
 use crate::models::{ChatMessage, ChatRequest, ChatStreamResult};
 use crate::providers::{AiProvider, StreamSender};
 
-/// Maximum wall-clock time allowed for a single extraction LLM call (LOCKED).
+/// Maximum wall-clock time allowed for a single extraction LLM call.
 const EXTRACTOR_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Hard cap on the rendered transcript passed to the LLM (approx. chars, not tokens).
@@ -157,6 +158,10 @@ pub(crate) fn parse_extraction(txt: &str) -> Vec<ExtractedMemory> {
 ///
 /// Never panics: LLM errors/timeouts, parse failures, and embed/store errors
 /// are all `log::`'d and skipped — the loop always continues to the next item.
+///
+/// Returns the number of LLM calls issued — one per agent with non-empty
+/// history that has a resolved provider — so the caller can log
+/// `aux_llm job=extractor calls={n}`.
 pub(crate) async fn run_extraction_core(
     history: Vec<(String, Vec<ChatMessage>)>,
     store: &MemoryStore,
@@ -164,9 +169,9 @@ pub(crate) async fn run_extraction_core(
     project_by_agent: &HashMap<String, Option<String>>,
     provider_by_agent: &HashMap<String, Arc<dyn AiProvider>>,
     timeout: Duration,
-) {
+) -> u64 {
     if history.iter().all(|(_, m)| m.is_empty()) {
-        return;
+        return 0;
     }
 
     // Check the embedder ONCE, BEFORE any LLM call — saves the call entirely
@@ -175,8 +180,10 @@ pub(crate) async fn run_extraction_core(
     // be stored.
     let Some(embedder) = embedder else {
         log::debug!("extractor: embedder not ready; skipping extraction for this session");
-        return;
+        return 0;
     };
+
+    let mut calls = 0u64;
 
     for (agent_id, msgs) in history {
         if msgs.is_empty() {
@@ -205,6 +212,7 @@ pub(crate) async fn run_extraction_core(
         };
         let sender: StreamSender = Box::new(|_e| Ok(()));
 
+        calls += 1;
         let text = match tokio::time::timeout(timeout, provider.chat_stream(&req, sender)).await {
             Ok(Ok(ChatStreamResult::Text(txt))) => txt,
             Ok(Ok(ChatStreamResult::ToolCalls(_))) => {
@@ -261,6 +269,8 @@ pub(crate) async fn run_extraction_core(
             }
         }
     }
+
+    calls
 }
 
 /// Fire-and-forget entry point spawned from `commands/session.rs` on session
@@ -278,9 +288,22 @@ pub(crate) async fn run_extractor(app: tauri::AppHandle, history: Vec<(String, V
 
     let state = app.state::<crate::state::AppState>();
 
+    // Read the flag before any lock, query or LLM call. `info`, not `debug`:
+    // a user who disabled this and later wonders why memories stopped
+    // appearing needs the trace at the default level. A poisoned lock keeps
+    // the job running — the flag exists to save cost, not to gate correctness.
+    let enabled = state.config.read()
+        .map(|c| aux_job_enabled(&c, AuxJob::Extractor))
+        .unwrap_or(true);
+    if !enabled {
+        log::info!("extractor disabled by config; skipping session close");
+        return;
+    }
+
     // Check embedder BEFORE any further work — saves the agents lock + LLM call.
     let Some(embedder) = state.embedder.get().cloned() else {
         log::debug!("extractor: embedder not ready; skipping extraction for this session");
+        log::info!("aux_llm job=extractor calls=0");
         return;
     };
 
@@ -312,7 +335,7 @@ pub(crate) async fn run_extractor(app: tauri::AppHandle, history: Vec<(String, V
         provider_by_agent.insert(agent_id.clone(), provider);
     }
 
-    run_extraction_core(
+    let calls = run_extraction_core(
         history,
         &store,
         Some(embedder),
@@ -321,6 +344,7 @@ pub(crate) async fn run_extractor(app: tauri::AppHandle, history: Vec<(String, V
         EXTRACTOR_TIMEOUT,
     )
     .await;
+    log::info!("aux_llm job=extractor calls={calls}");
 }
 
 // Compile-time proof: every type captured by the future passed to
@@ -336,7 +360,7 @@ const _: fn() = || {
 mod tests {
     use super::*;
 
-    // ── Task 1.5: memory_type_from_str round trip ──────────────────────────
+    // ── memory_type_from_str round trip ─────────────────────────────────────
 
     #[test]
     fn memory_type_from_str_round_trip() {
@@ -346,16 +370,16 @@ mod tests {
         assert_eq!(memory_type_from_str("unknown_type"), None);
     }
 
-    // ── Phase 3 — parse_extraction (pure, defensive) ────────────────────────
+    // ── parse_extraction (pure, defensive) ────────────────────────────────────
 
-    // Task 3.1: prose with no JSON array → vec![], no panic.
+    // Prose with no JSON array → vec![], no panic.
     #[test]
     fn parse_extraction_non_json_prose_yields_empty_vec() {
         let out = parse_extraction("Sure, here is a summary of the conversation without any JSON.");
         assert_eq!(out, vec![]);
     }
 
-    // Task 3.2: JSON wrapped in ```json fences parses correctly.
+    // JSON wrapped in ```json fences parses correctly.
     #[test]
     fn parse_extraction_markdown_fenced_json_parses() {
         let txt = "```json\n[{\"memory_type\":\"user_preference\",\"content\":\"Use voseo\",\"importance\":8}]\n```";
@@ -370,7 +394,7 @@ mod tests {
         );
     }
 
-    // Task 3.3: non-numeric importance skips ONLY that element.
+    // Non-numeric importance skips ONLY that element.
     #[test]
     fn parse_extraction_non_numeric_importance_skips_only_that_element() {
         let txt = r#"[
@@ -384,7 +408,7 @@ mod tests {
         assert_eq!(out[1].content, "third");
     }
 
-    // Task 3.4: out-of-range importance is clamped, not skipped.
+    // Out-of-range importance is clamped, not skipped.
     #[test]
     fn parse_extraction_out_of_range_importance_is_clamped() {
         let txt = r#"[
@@ -397,7 +421,7 @@ mod tests {
         assert_eq!(out[1].importance, 10.0, "12 must clamp to 10.0");
     }
 
-    // Task 3.5: unknown memory_type skips that element.
+    // Unknown memory_type skips that element.
     #[test]
     fn parse_extraction_unknown_memory_type_skips_element() {
         let txt = r#"[
@@ -409,7 +433,7 @@ mod tests {
         assert_eq!(out[0].content, "kept");
     }
 
-    // Task 3.6: empty content (post-trim) skips that element.
+    // Empty content (post-trim) skips that element.
     #[test]
     fn parse_extraction_empty_content_skips_element() {
         let txt = r#"[
@@ -421,9 +445,9 @@ mod tests {
         assert_eq!(out[0].content, "kept");
     }
 
-    // ── Phase 4 — run_extraction_core ───────────────────────────────────────
+    // ── run_extraction_core ───────────────────────────────────────────────────
     //
-    // `run_extractor(app: tauri::AppHandle, history)` (task 4.5) cannot be unit
+    // `run_extractor(app: tauri::AppHandle, history)` cannot be unit
     // tested directly: this codebase does not enable the `tauri` "test" feature
     // (Cargo.toml has `tauri = { features = [] }`), and `resolver::run_resolver`
     // — the sibling fire-and-forget entry point this design explicitly mirrors —
@@ -432,9 +456,9 @@ mod tests {
     // (`memory_worker` core vs. `start_memory_worker` AppHandle-thin wrapper),
     // the testable surface is `run_extraction_core`, which takes explicit deps
     // (store, embedder, provider-by-agent map, project-by-agent map) instead of
-    // `app.state::<AppState>()`. `run_extractor` (4.5) resolves those deps from
+    // `app.state::<AppState>()`. `run_extractor` resolves those deps from
     // AppState and delegates to this core — covered only by the Send-proof
-    // (task 4.6), exactly like `run_resolver`.
+    // below, exactly like `run_resolver`.
 
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -543,7 +567,7 @@ mod tests {
             .unwrap()
     }
 
-    // Task 4.1: empty history → 0 LLM calls, 0 inserts.
+    // Empty history → 0 LLM calls, 0 inserts.
     #[tokio::test]
     async fn empty_history_yields_zero_calls_zero_inserts() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -571,7 +595,7 @@ mod tests {
         assert_eq!(count_memory(&store).await, 0, "empty history must insert zero rows");
     }
 
-    // Task 4.2: embedder OnceCell empty (None here) → 0 LLM calls, 0 inserts,
+    // Embedder OnceCell empty (None here) → 0 LLM calls, 0 inserts,
     // early return BEFORE the LLM is ever consulted.
     #[tokio::test]
     async fn missing_embedder_yields_zero_calls_zero_inserts() {
@@ -601,7 +625,7 @@ mod tests {
         assert_eq!(count_memory(&store).await, 0, "missing embedder must insert zero rows");
     }
 
-    // Task 4.3: mixed history + fake provider returning all 3 pivotal types →
+    // Mixed history + fake provider returning all 3 pivotal types →
     // 3 `memory` rows, one per type.
     #[tokio::test]
     async fn mixed_history_fake_provider_three_types_yields_three_rows() {
@@ -658,7 +682,41 @@ mod tests {
         );
     }
 
-    // Task 4.6: compile-time Send + 'static proof for the value(s) captured by
+    // `run_extraction_core` returns the number of LLM calls it issued, one per
+    // agent with non-empty history that has a resolved provider — logged by
+    // the caller as `aux_llm job=extractor calls={n}`.
+    #[tokio::test]
+    async fn run_extraction_core_counts_one_call_per_agent_with_history() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let embedder: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let provider_a: Arc<dyn AiProvider> =
+            Arc::new(FakeProvider { response: "[]".to_string(), calls: Arc::new(AtomicUsize::new(0)) });
+        let provider_b: Arc<dyn AiProvider> =
+            Arc::new(FakeProvider { response: "[]".to_string(), calls: Arc::new(AtomicUsize::new(0)) });
+        let mut provider_by_agent: HashMap<String, Arc<dyn AiProvider>> = HashMap::new();
+        provider_by_agent.insert("agent-a".to_string(), provider_a);
+        provider_by_agent.insert("agent-b".to_string(), provider_b);
+        let project_by_agent: HashMap<String, Option<String>> = HashMap::new();
+
+        let history = vec![
+            ("agent-a".to_string(), vec![make_msg(Role::User, "hi")]),
+            ("agent-b".to_string(), vec![make_msg(Role::User, "hello")]),
+        ];
+
+        let calls = run_extraction_core(
+            history,
+            &store,
+            Some(embedder),
+            &project_by_agent,
+            &provider_by_agent,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(calls, 2, "one LLM call per agent with non-empty history");
+    }
+
+    // Compile-time Send + 'static proof for the value(s) captured by
     // the future passed to tauri::async_runtime::spawn(run_extractor(app, history)).
     #[test]
     fn run_extractor_captured_types_are_send_static() {
@@ -668,9 +726,9 @@ mod tests {
         s::<Vec<(String, Vec<ChatMessage>)>>();
     }
 
-    // ── Phase 6 — integration: workspace bridge + retrieval KNN ─────────────
+    // ── Integration: workspace bridge + retrieval KNN ─────────────────────────
 
-    // Task 6.1: fake provider returns a pivotal (user_preference, importance=8,
+    // A fake provider returns a pivotal (user_preference, importance=8,
     // tier=1 at insert) → after run_extraction_core + WorkspaceManager
     // regeneration, the content appears in workspace.md's AUTO section.
     #[tokio::test]

@@ -77,6 +77,7 @@ pub fn run() {
             commands::config::get_project_path,
             commands::config::get_config,
             commands::config::set_provider,
+            commands::config::set_aux_llm_flags,
             commands::config::check_ollama,
             commands::config::openrouter_list_models,
             commands::config::get_auth_status,
