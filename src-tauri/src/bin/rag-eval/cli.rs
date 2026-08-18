@@ -46,6 +46,19 @@ pub struct Cli {
     /// Each repetition of `--sweep-cos-floor <f>`, one candidate cosine floor
     /// per entry. Empty by default, same reasoning as `sweep_imp`.
     pub sweep_cos_floor: Vec<f64>,
+    /// Each repetition of `--sweep-lexical <n>`, one candidate lexical-channel
+    /// budget per entry — `0` means the channel is off for that
+    /// point. Empty by default, same reasoning as `sweep_imp`/`sweep_cos_floor`:
+    /// building the "empty axis leaves the value untouched" cartesian product
+    /// is `main.rs`'s job, this parser only reports what was actually typed.
+    pub sweep_lexical: Vec<usize>,
+    /// `--fts-tokenizer <name>` — swaps `memory_fts`'s tokenizer for this run
+    /// only, via `EvalStore::recreate_fts_with_tokenizer`. `None` by default,
+    /// same shape as `--tag`: a single optional value, not a sweep axis of
+    /// its own — allowed values are validated where the DDL is actually
+    /// built, not here, the same "parser reports what was typed, the callee
+    /// validates" split `--golden`/`--out` already follow for paths.
+    pub fts_tokenizer: Option<String>,
 }
 
 /// What a parse attempt produces. `--help` is not an error: it takes
@@ -76,6 +89,8 @@ pub enum CliError {
     InvalidSweepImp(String),
     #[error("invalid --sweep-cos-floor value '{0}', expected a floating-point number")]
     InvalidSweepCosFloor(String),
+    #[error("invalid --sweep-lexical value '{0}', expected a non-negative integer")]
+    InvalidSweepLexical(String),
 }
 
 pub const HELP_TEXT: &str = "\
@@ -104,6 +119,17 @@ OPTIONS:
     --sweep-cos-floor <f>
                          Repeatable. Adds one candidate cosine floor to the sweep grid.
                          Zero repetitions leaves cosine re-scaling off (None).
+    --sweep-lexical <n>
+                         Repeatable. Adds one candidate lexical-channel budget to the
+                         sweep grid; 0 means the channel is off for that point.
+                         Zero repetitions leaves the lexical channel at its default.
+    --fts-tokenizer <name>
+                         Swaps memory_fts's tokenizer for this run only (allowed:
+                         'unicode61 remove_diacritics 2', 'trigram'). Absent by default,
+                         which leaves the store on the tokenizer the migration applied.
+                         A run that passes this writes to its own results filename and
+                         records the tokenizer in the file, so two runs differing only
+                         in this flag stay comparable side by side.
     --force             Allow overwriting an existing results file for the same date+config
     --diff <a.json> <b.json>
                          Compare two existing results files' retrieval.per_case and
@@ -157,6 +183,8 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
     let mut tag: Option<String> = None;
     let mut sweep_imp: Vec<(f64, f64)> = Vec::new();
     let mut sweep_cos_floor: Vec<f64> = Vec::new();
+    let mut sweep_lexical: Vec<usize> = Vec::new();
+    let mut fts_tokenizer: Option<String> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -222,6 +250,20 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
                     value.parse().map_err(|_| CliError::InvalidSweepCosFloor(value.clone()))?;
                 sweep_cos_floor.push(floor);
             }
+            "--sweep-lexical" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| CliError::MissingValue("--sweep-lexical".to_string()))?;
+                let budget: usize =
+                    value.parse().map_err(|_| CliError::InvalidSweepLexical(value.clone()))?;
+                sweep_lexical.push(budget);
+            }
+            "--fts-tokenizer" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| CliError::MissingValue("--fts-tokenizer".to_string()))?;
+                fts_tokenizer = Some(value);
+            }
             other => return Err(CliError::UnknownFlag(other.to_string())),
         }
     }
@@ -238,6 +280,8 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
         tag,
         sweep_imp,
         sweep_cos_floor,
+        sweep_lexical,
+        fts_tokenizer,
     }))
 }
 
@@ -462,6 +506,56 @@ mod tests {
     fn sweep_cos_floor_without_a_value_is_an_error() {
         let err = parse(argv(&["--fake", "--sweep-cos-floor"])).expect_err("missing value must error");
         assert_eq!(err, CliError::MissingValue("--sweep-cos-floor".to_string()));
+    }
+
+    #[test]
+    fn sweep_lexical_is_empty_by_default() {
+        assert!(run_cli(&["--fake"]).sweep_lexical.is_empty());
+    }
+
+    #[test]
+    fn sweep_lexical_is_repeatable_and_parses_each_value() {
+        let cli = run_cli(&["--fake", "--sweep-lexical", "0", "--sweep-lexical", "20"]);
+        assert_eq!(cli.sweep_lexical, vec![0, 20]);
+    }
+
+    #[test]
+    fn sweep_lexical_non_numeric_is_an_error() {
+        let err = parse(argv(&["--fake", "--sweep-lexical", "abc"]))
+            .expect_err("non-numeric budget must error");
+        assert_eq!(err, CliError::InvalidSweepLexical("abc".to_string()));
+    }
+
+    #[test]
+    fn sweep_lexical_negative_is_an_error() {
+        // usize rejects a leading '-' at parse time, same error path as any
+        // other non-numeric value — no separate "negative" variant needed.
+        let err = parse(argv(&["--fake", "--sweep-lexical", "-1"]))
+            .expect_err("negative budget must error");
+        assert_eq!(err, CliError::InvalidSweepLexical("-1".to_string()));
+    }
+
+    #[test]
+    fn sweep_lexical_without_a_value_is_an_error() {
+        let err = parse(argv(&["--fake", "--sweep-lexical"])).expect_err("missing value must error");
+        assert_eq!(err, CliError::MissingValue("--sweep-lexical".to_string()));
+    }
+
+    #[test]
+    fn fts_tokenizer_is_none_by_default() {
+        assert_eq!(run_cli(&["--fake"]).fts_tokenizer, None);
+    }
+
+    #[test]
+    fn fts_tokenizer_is_captured_verbatim_when_given() {
+        let cli = run_cli(&["--real", "--fts-tokenizer", "trigram"]);
+        assert_eq!(cli.fts_tokenizer, Some("trigram".to_string()));
+    }
+
+    #[test]
+    fn fts_tokenizer_without_a_value_is_an_error() {
+        let err = parse(argv(&["--fake", "--fts-tokenizer"])).expect_err("missing value must error");
+        assert_eq!(err, CliError::MissingValue("--fts-tokenizer".to_string()));
     }
 
     #[test]

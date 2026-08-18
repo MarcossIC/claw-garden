@@ -819,7 +819,7 @@ mod tests {
         };
         let fact_id = store.insert_memory_with_vector(fact_record, fact_emb.clone()).await.unwrap();
 
-        let arch_hits = search_all_memories(&store, &arch_emb, "agent-knn", SearchScope::all_default(), 10)
+        let arch_hits = search_all_memories(&store, &arch_emb, None, "agent-knn", SearchScope::all_default(), 10)
             .await
             .unwrap();
         assert!(
@@ -827,7 +827,7 @@ mod tests {
             "architectural_decision (tier=2) must be KNN-retrievable"
         );
 
-        let fact_hits = search_all_memories(&store, &fact_emb, "agent-knn", SearchScope::all_default(), 10)
+        let fact_hits = search_all_memories(&store, &fact_emb, None, "agent-knn", SearchScope::all_default(), 10)
             .await
             .unwrap();
         assert!(
@@ -866,7 +866,7 @@ mod tests {
         };
         let pref_id = store.insert_memory_with_vector(pref_record, pref_emb.clone()).await.unwrap();
 
-        let hits = search_all_memories(&store, &pref_emb, "agent-knn-pref", SearchScope::all_default(), 10)
+        let hits = search_all_memories(&store, &pref_emb, None, "agent-knn-pref", SearchScope::all_default(), 10)
             .await
             .unwrap();
         let hit = hits

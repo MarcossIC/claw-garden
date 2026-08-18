@@ -1,6 +1,7 @@
 //! KNN search across memory + episodic + procedural via tokio::try_join!,
 //! merged + ranked by the score formula computed in SQL.
 
+use std::collections::HashSet;
 use std::time::Instant;
 
 use crate::memory::clock::TimestampMs;
@@ -22,6 +23,9 @@ pub(crate) struct SearchScope {
     pub episodic: Option<usize>,
     pub procedural: Option<usize>,
     pub project_id: Option<String>,
+    /// Candidate budget for the lexical (FTS5) channel — `None` keeps the
+    /// channel off entirely: no MATCH query and no scoring query are issued.
+    pub lexical: Option<usize>,
 }
 
 impl SearchScope {
@@ -31,6 +35,7 @@ impl SearchScope {
             episodic: Some(5),
             procedural: Some(5),
             project_id: None,
+            lexical: Some(20),
         }
     }
     /// Scopes this query to `project_id`, owning a copy of it. `None` keeps
@@ -461,6 +466,359 @@ fn format_pool_line(
     )
 }
 
+// ── lexical (FTS5) candidate channel ──
+//
+// Wired into search_all_memories_inner's 4th try_join! arm below.
+
+/// Maximum number of OR-ed terms an FTS5 MATCH expression may carry, taken
+/// from the front of the token list. Bounds the expression so a pasted
+/// paragraph cannot build an unbounded OR chain; which tokens survive is
+/// deterministic (front-of-string) rather than picked by rarity — ranking
+/// tokens by how rare they are is an IDF question this function does not
+/// answer.
+const MAX_LEXICAL_TOKENS: usize = 16;
+
+/// The FTS5 MATCH expression for `query_text`, or `None` when there is
+/// nothing to match on. `None` means no MATCH statement is issued at all:
+/// `MATCH ''` is a syntax error, and catching a self-inflicted error is not
+/// the same thing as never causing it.
+///
+/// Tokens are runs of `char::is_alphanumeric() || '_'`; every other
+/// character is a separator. FTS5's own operators (`*` `:` `-` `"` `^` `(`
+/// `)` `NEAR`) are removed BY CONSTRUCTION rather than escaped — a run of
+/// alphanumeric-or-underscore characters can never contain one, so there is
+/// no escaping rule to get wrong. Each surviving token is double-quoted (it
+/// cannot itself contain a quote, by the same construction) and the tokens
+/// are OR-joined: this channel proposes candidates, and requiring every
+/// token to match would propose almost nothing.
+///
+/// A bare word that happens to spell an FTS5 keyword (`NEAR`, `AND`, `OR`,
+/// `NOT`) is not recognized as one here — it is just another token, quoted
+/// like any other, so it can only ever be searched for literally, never
+/// interpreted as the operator.
+fn fts_match_expression(query_text: &str, max_tokens: usize) -> Option<String> {
+    let tokens: Vec<&str> = query_text
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|t| !t.is_empty())
+        .take(max_tokens)
+        .collect();
+
+    if tokens.is_empty() {
+        return None;
+    }
+
+    Some(tokens.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(" OR "))
+}
+
+// Candidate query for the lexical channel over `memory`. `bm25()` returns a
+// NEGATIVE score in SQLite — more relevant is more negative — so plain
+// ascending order (SQLite's default for `ORDER BY`) is best-first. Without
+// it, `LIMIT` keeps whichever rows the scan reaches first, which on this
+// vtab is the lowest rowids: the oldest memories, close to the worst
+// possible selection for a candidate budget.
+//
+// The two scope predicates are copied verbatim from `SEARCH_SQL_MEMORY`,
+// including the `?3 IS NULL` tautology (an unscoped caller's row set stays
+// untouched) and the `user_preference` exemption. They run here, before the
+// `LIMIT`, so the budget is spent on PERMITTED candidates only — a row this
+// caller may not see never occupies one of the `?4` slots. Dropping the
+// `user_preference` disjunct would make this channel stricter than the
+// dense one about which project-scoped rows are allowed through.
+const LEXICAL_CANDIDATE_SQL: &str = "
+    SELECT rowid FROM memory_fts
+    WHERE memory_fts MATCH ?1
+      AND agent_id = ?2
+      AND (?3 IS NULL OR project_id = ?3 OR project_id IS NULL OR memory_type = 'user_preference')
+    ORDER BY bm25(memory_fts)
+    LIMIT ?4
+";
+
+/// Hard ceiling on how many candidate rowids one lexical search may carry
+/// into the scoring query, whatever budget the caller asked for.
+///
+/// Every surviving id becomes its own bind parameter in that query's
+/// `m.id IN (...)` list, and SQLite refuses to prepare a statement carrying
+/// more parameters than `SQLITE_LIMIT_VARIABLE_NUMBER`. Without a ceiling the
+/// difference between an ordinary budget and an absurd one is the difference
+/// between "fewer candidates than asked for" and "the scoring query does not
+/// prepare at all". The second one does not even announce itself: the scoring
+/// helper is fail-soft, so it would swallow the failure and contribute
+/// nothing — an oversized budget silently switching OFF the channel it was
+/// raised to widen. The clamp is what keeps a bad number a smaller answer
+/// instead of a missing one.
+///
+/// 512 sits far below that limit and far above any budget with a purpose:
+/// this channel proposes candidates for a final cut measured in tens, and a
+/// budget in the thousands would spend more time scoring rows than the dense
+/// arms spend finding them.
+const MAX_LEXICAL_CANDIDATES: usize = 512;
+
+/// The candidate budget one lexical search actually spends. Separated from
+/// its single call site so the ceiling is assertable without a corpus large
+/// enough to reach it.
+fn lexical_budget(requested: usize) -> usize {
+    requested.min(MAX_LEXICAL_CANDIDATES)
+}
+
+/// Candidate rowids for `query_text`, best-first by bm25, restricted to what
+/// `agent_id`/`project_id` may see. Never fails by contract — the return
+/// type carries no `Result` — because a missing table, a MATCH the parser
+/// rejects, or a dead connection all mean "this channel contributed
+/// nothing", which is strictly weaker than what the dense channel already
+/// produced, not a reason to fail a search that would otherwise succeed.
+async fn lexical_candidates(
+    store: &MemoryStore,
+    query_text: &str,
+    agent_id: &str,
+    project_id: Option<&str>,
+    k: usize,
+) -> Vec<i64> {
+    let Some(match_expr) = fts_match_expression(query_text, MAX_LEXICAL_TOKENS) else {
+        return Vec::new();
+    };
+    let k = lexical_budget(k);
+    let agent = agent_id.to_string();
+    let proj = project_id.map(str::to_owned);
+
+    store
+        .conn
+        .call(move |c| -> Result<Vec<i64>, rusqlite::Error> {
+            let mut stmt = c.prepare(LEXICAL_CANDIDATE_SQL)?;
+            let rows = stmt.query_map(
+                rusqlite::params![match_expr, agent, proj, k as i64],
+                |row| row.get::<_, i64>(0),
+            )?;
+            let mut ids = Vec::new();
+            for row in rows {
+                ids.push(row?);
+            }
+            Ok(ids)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            log::warn!("lexical_candidates: channel contributed nothing: {e}");
+            Vec::new()
+        })
+}
+
+// Second-stage scoring query for lexical candidates. The column list and
+// every predicate up to (not including) the `IN (...)` clause mirror
+// `SEARCH_SQL_MEMORY`, so the row-mapping closure and `compute_score` below
+// apply to a lexical-only candidate exactly as they apply to a dense one, by
+// construction rather than by discipline.
+// `status`/`deleted_at`/`agent_id`/project are all re-applied here even
+// though the candidate query already filtered on two of them: this join is
+// the last gate before a row reaches a caller, and it has to stand on its
+// own — a stale `memory_fts` row must not be enough by itself to leak a
+// soft-deleted memory through this channel.
+//
+// Two places deliberately do NOT mirror `SEARCH_SQL_MEMORY`, and both are
+// consequences of the same fact: this query already knows exactly which rows
+// it wants.
+//
+// The first is the `FROM`/`JOIN`. The dense query is driven by vec0 and joins
+// `memory` for the row body; this one is driven by `memory` on its rowid, and
+// `NOT INDEXED` is what keeps it that way. SQLite's planner works from fixed
+// row estimates here — the schema carries no `ANALYZE` — and under those
+// estimates an `IN` list of four or more terms scores worse than a lookup
+// through `idx_memory_agent_active`, so without `NOT INDEXED` the planner
+// drives the join from that index and visits EVERY live row the agent owns,
+// applying the id list afterwards as a filter. Same rows out, same distances,
+// cost proportional to the corpus instead of to the candidate list: at 5,000
+// rows and a 20-candidate budget that is ~730 µs instead of ~330 µs for this
+// query's `m.id IN` spelling with `NOT INDEXED` removed (measured on this
+// machine), and it grows with the corpus from there. The `v.rowid IN`
+// spelling pays far more for the same missing hint — tens of milliseconds at
+// the same corpus size — which is a separate, larger cost covered where that
+// spelling is rejected below. `NOT INDEXED` bars every index on `memory`
+// while explicitly leaving the rowid available, which is the one access path
+// a query holding a list of ids ever wants.
+//
+// The list is spelled `m.id IN` rather than `v.rowid IN` for a related
+// reason: measured against this vec0 build, a multi-valued `IN` on the vtab's
+// rowid is not accepted as a constraint and stays a post-filter whichever
+// table drives the join, so the only spelling that can reach the plan at all
+// is the one naming the rowid table. Both halves are needed —
+// `v.rowid IN` alone plans as an index scan from two ids up, `m.id IN` alone
+// from four — and both are pinned: `the_scoring_statement_reaches_its_rows_
+// by_id_at_every_candidate_count` asserts the `memory` plan line AND the
+// `memory_vectors` plan line, because `NOT INDEXED` alone forces `memory` to
+// `INTEGER PRIMARY KEY` under either spelling of the id list — that line
+// can't tell them apart — while the `memory_vectors` line is where `m.id IN`
+// (a per-id rowid lookup) and `v.rowid IN` (an unconstrained full scan)
+// actually diverge. Nothing about the RESULT of this query can tell any of
+// these forms apart — same rows, same distances — which is why the plan has
+// to be asserted at all.
+//
+// The second is how it obtains `distance`. The dense query asks vec0 for its k
+// nearest neighbours; this one names the ids it wants and asks for their
+// distance directly, via the scalar `vec_distance_l2`. That is not an optimization,
+// it is the only form that can answer the question this channel asks.
+// A vec0 KNN query's own `rowid IN (...)` is evaluated as an ordinary
+// post-filter over whatever the k-nearest scan already returned — measured
+// against this vec0 build, and the reason that formulation was rejected — so
+// ANY k-nearest formulation silently drops a requested row whose global
+// distance rank falls outside `k`, which is precisely the
+// identifier-beats-distance case this query exists for. There is no `k`
+// large enough to fix that: vec0 refuses a `k` above `VEC0_MAX_K`, so a
+// corpus past that many live vectors would lose exactly the far candidates
+// the channel promotes. The scalar function has no `k` at all — it computes
+// one distance per named id — and returns bit-identical values to the
+// `distance` column vec0's own KNN scan reports, which
+// `lexical_scoring_distance_is_bit_identical_to_the_dense_knn_distance`
+// pins.
+//
+// `vec_distance_l2` names the metric explicitly, and it matches the metric
+// `memory_vectors` was declared with (`vec0(embedding float[384])`, whose
+// default is L2). Those two facts have to stay in step: the score formula
+// converts this number to a cosine assuming unit vectors and a euclidean
+// distance, so a table redeclared with a different `distance_metric` would
+// keep both channels running while scoring lexically promoted rows on a
+// different scale from every other hit.
+//
+// What makes that divergence loud instead of silent is not the parity test by
+// itself but the corpus it runs on: its rows differ from the query vector in
+// every one of the 384 coordinates, which is the only way L1, L2 and L∞ take
+// different values at all. On a corpus whose rows differ in a single
+// coordinate the three metrics are equal bit for bit, and a parity assertion
+// written against it passes no matter which scalar this query names. That is
+// not hypothetical: this query passed its own parity test with
+// `vec_distance_l1` substituted here, and every other test with it, until
+// that fixture was rebuilt to differ in more than one coordinate.
+const LEXICAL_SCORE_SQL_PREFIX: &str = "
+    SELECT m.id, m.content, m.memory_type, m.tier, m.status,
+        vec_distance_l2(v.embedding, ?1) AS distance,
+        m.created_at, m.last_accessed_at, m.importance
+    FROM memory_vectors v
+    JOIN memory m NOT INDEXED ON m.id = v.rowid
+    WHERE m.status IN ('active', 'disputed')
+      AND m.deleted_at IS NULL
+      AND m.agent_id = ?2
+      AND (?3 IS NULL OR m.project_id = ?3 OR m.project_id IS NULL OR m.memory_type = 'user_preference')
+";
+
+/// Builds the `m.id IN (...)` placeholder list for `n` ids, explicitly
+/// numbered starting at `?4` (`LEXICAL_SCORE_SQL_PREFIX` already claims
+/// `?1`-`?3`). Never a bare `?`: SQLite assigns a bare `?` the index one
+/// greater than the largest index ALREADY SEEN while parsing the statement
+/// text left to right — not by where it sits relative to other named
+/// placeholders that appear later — so a bare `?` positioned before a named
+/// `?2`/`?3` elsewhere in a query would silently steal that index and bind
+/// the wrong value with no error. Explicit numbering makes that outcome
+/// impossible regardless of where this list is spliced into a larger
+/// statement, which a bare `?` cannot guarantee.
+fn lexical_rowid_placeholders(n: usize) -> String {
+    (0..n).map(|i| format!("?{}", i + 4)).collect::<Vec<_>>().join(", ")
+}
+
+/// The complete scoring statement for `n` candidate ids. `score_lexical_candidates`
+/// calls this function directly to obtain its SQL rather than assembling its own
+/// copy, so today there is exactly one builder and its output is what production
+/// prepares. That is a fact about this call site as written, not a guarantee any
+/// test enforces: no test observes the literal statement `score_lexical_candidates`
+/// hands to SQLite, only the text this function returns and the timing of the
+/// production call, so a future edit that has `score_lexical_candidates` build a
+/// diverging string instead of calling this function would not turn any test red.
+fn lexical_score_sql(n: usize) -> String {
+    format!("{LEXICAL_SCORE_SQL_PREFIX} AND m.id IN ({})", lexical_rowid_placeholders(n))
+}
+
+/// Scores lexical-channel candidate ids by the exact same distance and
+/// `compute_score` formula the dense arms use — see
+/// [`LEXICAL_SCORE_SQL_PREFIX`] for why the distance is computed per named
+/// id rather than read out of a k-nearest scan.
+///
+/// Costs one rowid lookup and one distance computation per requested id, and
+/// — because of the `NOT INDEXED` join documented on
+/// [`LEXICAL_SCORE_SQL_PREFIX`] — that is the whole cost: it does not grow
+/// with the number of rows the agent owns. Measured on a 5,000-row corpus, a
+/// full 20-candidate budget costs 4-6x what a single candidate costs; through
+/// the index-driven plan the same measurement was ~600x, and rising with the
+/// corpus size. `scoring_a_full_candidate_budget_costs_the_same_in_a_large_
+/// corpus_as_in_a_small_one` is what keeps that true, and it is written as a
+/// crossed fixture — many candidates AND a large corpus — because either
+/// dimension alone hides the difference completely.
+///
+/// Never fails by contract — the return type carries no `Result` — for the
+/// same reason [`lexical_candidates`] does not. This channel exists to ADD
+/// candidates to a search the dense arms have already answered, so there is
+/// no failure of it that is worth more than the answer it would destroy by
+/// propagating. Being infallible in the SIGNATURE rather than by a `?` a
+/// caller happens not to write is what makes that a fact a reader can check
+/// at a glance instead of a discipline every future call site has to repeat.
+async fn score_lexical_candidates(
+    store: &MemoryStore,
+    q_bytes: &[u8],
+    agent_id: &str,
+    project_id: Option<&str>,
+    ids: &[i64],
+    scoring: &ScoringConfig,
+    now: TimestampMs,
+) -> Vec<RankedHit> {
+    // A round-trip skipped, not a correctness fix: `m.id IN ()` is always
+    // false on its own, so this guard exists only to avoid paying for a DB
+    // call whose answer is already known to be empty.
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let q = q_bytes.to_vec();
+    let agent = agent_id.to_string();
+    let proj = project_id.map(str::to_owned);
+    let ids = ids.to_vec();
+    let scoring = *scoring;
+
+    store
+        .conn
+        .call(move |c| -> Result<Vec<RankedHit>, rusqlite::Error> {
+            let sql = lexical_score_sql(ids.len());
+            let mut stmt = c.prepare(&sql)?;
+
+            let mut binds: Vec<rusqlite::types::Value> = vec![q.into(), agent.into()];
+            binds.push(match proj {
+                Some(p) => rusqlite::types::Value::Text(p),
+                None => rusqlite::types::Value::Null,
+            });
+            binds.extend(ids.iter().copied().map(rusqlite::types::Value::Integer));
+
+            let rows = stmt.query_map(rusqlite::params_from_iter(binds), |row| {
+                Ok(RawHit {
+                    id: row.get(0)?,
+                    kind: TableKind::Memory,
+                    content: row.get(1)?,
+                    memory_type: row.get(2)?,
+                    tier: row.get(3)?,
+                    status: row.get(4)?,
+                    distance: row.get(5)?,
+                    created_at: row.get(6)?,
+                    last_accessed_at: row.get(7)?,
+                    importance: row.get(8)?,
+                })
+            })?;
+
+            let mut hits = Vec::new();
+            for row in rows {
+                let r = row?;
+                hits.push(RankedHit {
+                    id: r.id,
+                    kind: r.kind,
+                    score: compute_score(&scoring, &r, now),
+                    content: r.content,
+                    memory_type: r.memory_type,
+                    tier: r.tier,
+                    status: r.status,
+                    distance: r.distance,
+                    created_at: r.created_at,
+                });
+            }
+            Ok(hits)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            log::warn!("score_lexical_candidates: channel contributed nothing: {e}");
+            Vec::new()
+        })
+}
+
 /// Does the actual work behind `search_all_memories`, plus hands back the
 /// pool-survival line it computed along the way. Split out so a test can
 /// drive the exact call site that builds that line (`format_pool_line`
@@ -471,6 +829,10 @@ fn format_pool_line(
 async fn search_all_memories_inner(
     store: &MemoryStore,
     embedding: &[f32],
+    // The lexical half of the question "what am I asking?" — sits beside
+    // `embedding` (the dense half) rather than on `SearchScope`, which only
+    // answers "what subset am I allowed to see?".
+    query_text: Option<&str>,
     agent_id: &str,
     scope: SearchScope,
     k_final: usize,
@@ -501,7 +863,7 @@ async fn search_all_memories_inner(
     // independent per-row `strftime('%s','now')` calls could never guarantee.
     let now = TimestampMs::now();
 
-    let (mem, epi, pro) = tokio::try_join!(
+    let (mem, epi, pro, lex_ids) = tokio::try_join!(
         async {
             match scope.memory {
                 Some(k) => knn_one(store, KNN_MEMORY, &q_bytes, agent_id, project_id, k, scoring, now).await,
@@ -520,14 +882,64 @@ async fn search_all_memories_inner(
                 None => Ok(KnnOutcome::skipped()),
             }
         },
+        async {
+            // Infallible by construction: `lexical_candidates` never returns
+            // `Result` at all, so there is exactly one `Ok(...)` in this arm
+            // and nothing here can bubble an FTS5-specific failure into the
+            // rest of the search. `(None, _)` and `(_, None)` both mean "the
+            // channel has nothing to spend its budget on" — off, or on with
+            // no query text to match — and collapse into the same empty
+            // result as a sanitizer that yielded zero tokens.
+            let ids = match (scope.lexical, query_text) {
+                (Some(k), Some(q)) => lexical_candidates(store, q, agent_id, project_id, k).await,
+                _ => Vec::new(),
+            };
+            Ok::<Vec<i64>, MemoryError>(ids)
+        },
     )?;
+
+    // Differenced against memory-kind hits ONLY, never the merged 3-table
+    // pool: `memory`, `episodic_trajectory` and `procedural_skill` each keep
+    // their own independent autoincrement sequence, so an id from one table
+    // can equal an unrelated id from another by coincidence. Differencing
+    // against the merged pool would treat that coincidence as "already
+    // found" and silently drop a legitimate lexical candidate.
+    let dense_ids: HashSet<i64> = mem.hits.iter().map(|h| h.id).collect();
+    let leftover: Vec<i64> = lex_ids.into_iter().filter(|id| !dense_ids.contains(id)).collect();
+    let lexical_only = leftover.len();
+
+    // Skipped entirely when there is nothing left to score — the common case
+    // for a query with no lexical signal — rather than issuing a query whose
+    // `m.id IN ()` is already known to answer zero rows.
+    //
+    // No `?` here, and none available: `score_lexical_candidates` returns no
+    // `Result` at all, so hop 5 cannot fail this search any more than hop 4
+    // can. Both halves of the channel had to be infallible for that to be
+    // true — a fail-soft candidate query feeding a fallible scoring query is
+    // a channel that still breaks retrieval, just later.
+    let lex_hits = if leftover.is_empty() {
+        Vec::new()
+    } else {
+        score_lexical_candidates(store, &q_bytes, agent_id, project_id, &leftover, scoring, now).await
+    };
 
     // Built before the merge below consumes the per-table hits, which is also
     // what lets a test assemble it from real outcomes instead of from numbers
     // it invented: the requested/returned pairing lives in one place rather
     // than being reassembled at the log call.
     let pool_survival = format_pool_line(&scope, &mem, &epi, &pro);
-    let mut all: Vec<RankedHit> = mem.hits.into_iter().chain(epi.hits).chain(pro.hits).collect();
+    let channel_attribution =
+        crate::commands::memory_admin::format_channel_attribution(mem.hits.len(), lexical_only);
+    let telemetry = format!("{pool_survival} {channel_attribution}");
+
+    // A promoted lexical candidate competes for the same k_final slots as
+    // every dense hit and can displace one — there is no reserved quota. It
+    // is scored by the identical formula on an identical distance, so it can
+    // only win by outscoring what it displaces. The union happens strictly
+    // before this sort/truncate, so a lexical candidate is never exempt from
+    // the ordering that decides who survives.
+    let mut all: Vec<RankedHit> =
+        mem.hits.into_iter().chain(epi.hits).chain(pro.hits).chain(lex_hits).collect();
     all.sort_by(hit_cmp);
     all.truncate(k_final);
 
@@ -542,33 +954,36 @@ async fn search_all_memories_inner(
     // long time after someone turns it on.
     store.knn_latency().record(elapsed);
 
-    // Tier-per-hit and pool-survival logging — appended to the existing
-    // retrieval debug line via pure, unit-tested helpers. `snapshot()` sits
-    // inside the macro args deliberately: it is the one part of this line
-    // that's fine to skip sorting for when debug logging is off.
+    // Tier-per-hit, pool-survival and channel-attribution logging — appended
+    // to the existing retrieval debug line via pure, unit-tested helpers.
+    // `snapshot()` sits inside the macro args deliberately: it is the one
+    // part of this line that's fine to skip sorting for when debug logging
+    // is off.
     log::debug!(
         "retrieval={}ms hits={} {} k_final={} dist={} {}",
         elapsed.as_millis(),
         all.len(),
-        pool_survival,
+        telemetry,
         k_final,
         crate::commands::memory_admin::format_tier_distribution(&all),
         store.knn_latency().snapshot(),
     );
 
-    Ok((all, pool_survival))
+    Ok((all, telemetry))
 }
 
 /// Top-level KNN orchestrator. Returns up to `k_final` hits sorted DESC by score.
 pub(crate) async fn search_all_memories(
     store: &MemoryStore,
     embedding: &[f32],
+    query_text: Option<&str>,
     agent_id: &str,
     scope: SearchScope,
     k_final: usize,
 ) -> Result<Vec<RankedHit>, MemoryError> {
     let (hits, _pool_survival) =
-        search_all_memories_inner(store, embedding, agent_id, scope, k_final, &ScoringConfig::DEFAULT).await?;
+        search_all_memories_inner(store, embedding, query_text, agent_id, scope, k_final, &ScoringConfig::DEFAULT)
+            .await?;
     Ok(hits)
 }
 
@@ -580,13 +995,14 @@ pub(crate) async fn search_all_memories(
 pub(crate) async fn search_all_memories_with_scoring(
     store: &MemoryStore,
     embedding: &[f32],
+    query_text: Option<&str>,
     agent_id: &str,
     scope: SearchScope,
     k_final: usize,
     scoring: &ScoringConfig,
 ) -> Result<Vec<RankedHit>, MemoryError> {
     let (hits, _pool_survival) =
-        search_all_memories_inner(store, embedding, agent_id, scope, k_final, scoring).await?;
+        search_all_memories_inner(store, embedding, query_text, agent_id, scope, k_final, scoring).await?;
     Ok(hits)
 }
 
@@ -660,6 +1076,14 @@ mod tests {
         assert_eq!(s.memory, Some(30));
         assert_eq!(s.episodic, Some(5));
         assert_eq!(s.procedural, Some(5));
+        assert_eq!(s.project_id, None);
+        // Every production search reaches the store through this constructor,
+        // so this one field is what decides whether the lexical channel runs
+        // in the shipped app at all. Asserted as an exact value, not merely
+        // `is_some()`: a budget of 1 leaves the channel nominally on while
+        // starving it down to a single candidate, which is indistinguishable
+        // from off for every fixture that matters.
+        assert_eq!(s.lexical, Some(20));
     }
 
     #[test]
@@ -779,7 +1203,7 @@ mod tests {
         insert_memory_row(&store, "agent-test", "tier3 c", "chat_message", 3, 5.0, "active", emb.clone()).await;
 
         let q_vec = unit_basis_vec();
-        let hits = search_all_memories(&store, &q_vec, "agent-test", SearchScope::all_default(), 10)
+        let hits = search_all_memories(&store, &q_vec, None, "agent-test", SearchScope::all_default(), 10)
             .await
             .unwrap();
 
@@ -846,7 +1270,7 @@ mod tests {
             "the procedural pool must return the skill row"
         );
 
-        let hits = search_all_memories(&store, &q_vec, "agent-skill", SearchScope::all_default(), 10)
+        let hits = search_all_memories(&store, &q_vec, None, "agent-skill", SearchScope::all_default(), 10)
             .await
             .unwrap();
         let hit = hits
@@ -875,7 +1299,7 @@ mod tests {
         .await;
 
         let query: Vec<f32> = unit.iter().map(|x| x * 10.0).collect();
-        let hits = search_all_memories(&store, &query, "agent-normalize", SearchScope::all_default(), 10)
+        let hits = search_all_memories(&store, &query, None, "agent-normalize", SearchScope::all_default(), 10)
             .await
             .unwrap();
 
@@ -902,7 +1326,7 @@ mod tests {
         insert_memory_row(&store, "agent-zero-query", "content", "chat_message", 3, 5.0, "active", emb).await;
 
         let zero_query = vec![0.0_f32; 384];
-        let hits = search_all_memories(&store, &zero_query, "agent-zero-query", SearchScope::all_default(), 10)
+        let hits = search_all_memories(&store, &zero_query, None, "agent-zero-query", SearchScope::all_default(), 10)
             .await
             .expect("an unusable query vector must fail soft (Ok(vec![])), not propagate Err");
 
@@ -922,7 +1346,7 @@ mod tests {
         insert_memory_row(&store, "agent-test", "active", "chat_message", 3, 5.0, "active", emb.clone()).await;
 
         let q_vec = unit_basis_vec();
-        let hits = search_all_memories(&store, &q_vec, "agent-test", SearchScope::all_default(), 10)
+        let hits = search_all_memories(&store, &q_vec, None, "agent-test", SearchScope::all_default(), 10)
             .await
             .unwrap();
 
@@ -939,7 +1363,7 @@ mod tests {
         insert_memory_row(&store, "agent-test", "active content", "chat_message", 3, 5.0, "active", emb.clone()).await;
 
         let q_vec = unit_basis_vec();
-        let hits = search_all_memories(&store, &q_vec, "agent-test", SearchScope::all_default(), 10)
+        let hits = search_all_memories(&store, &q_vec, None, "agent-test", SearchScope::all_default(), 10)
             .await
             .unwrap();
 
@@ -976,7 +1400,7 @@ mod tests {
         }).await.unwrap();
 
         let q_vec = unit_basis_vec();
-        let hits = search_all_memories(&store, &q_vec, agent, SearchScope::all_default(), 10)
+        let hits = search_all_memories(&store, &q_vec, None, agent, SearchScope::all_default(), 10)
             .await
             .unwrap();
 
@@ -1045,7 +1469,7 @@ mod tests {
         }).await.unwrap();
 
         let q_vec = unit_basis_vec();
-        let hits = search_all_memories(&store, &q_vec, agent, SearchScope::all_default(), 10)
+        let hits = search_all_memories(&store, &q_vec, None, agent, SearchScope::all_default(), 10)
             .await
             .unwrap();
 
@@ -1094,7 +1518,7 @@ mod tests {
         }).await.unwrap();
 
         let q_vec = unit_basis_vec();
-        let active_hits = search_all_memories(&store, &q_vec, agent, SearchScope::all_default(), 10)
+        let active_hits = search_all_memories(&store, &q_vec, None, agent, SearchScope::all_default(), 10)
             .await.unwrap();
         let active_score = active_hits.iter().find(|h| h.id == active_id).unwrap().score;
 
@@ -1117,7 +1541,7 @@ mod tests {
             Ok(id)
         }).await.unwrap();
 
-        let all_hits = search_all_memories(&store, &q_vec, agent, SearchScope::all_default(), 10)
+        let all_hits = search_all_memories(&store, &q_vec, None, agent, SearchScope::all_default(), 10)
             .await.unwrap();
         let disputed_score = all_hits.iter().find(|h| h.id == disputed_id).unwrap().score;
 
@@ -1153,7 +1577,7 @@ mod tests {
         }
 
         let q_vec = unit_basis_vec();
-        let hits = search_all_memories(&store, &q_vec, agent, SearchScope::all_default(), 3)
+        let hits = search_all_memories(&store, &q_vec, None, agent, SearchScope::all_default(), 3)
             .await.unwrap();
 
         assert_eq!(hits.len(), 3);
@@ -1165,8 +1589,8 @@ mod tests {
     async fn search_respects_scope_none_skips_table() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let q_vec = unit_basis_vec();
-        let scope = SearchScope { memory: None, episodic: None, procedural: None, project_id: None };
-        let hits = search_all_memories(&store, &q_vec, "agent-x", scope, 10)
+        let scope = SearchScope { memory: None, episodic: None, procedural: None, project_id: None, lexical: None };
+        let hits = search_all_memories(&store, &q_vec, None, "agent-x", scope, 10)
             .await.unwrap();
         assert!(hits.is_empty(), "all scopes None → empty results");
     }
@@ -1198,7 +1622,7 @@ mod tests {
         }
 
         let q_vec = unit_basis_vec();
-        let hits = search_all_memories(&store, &q_vec, agent, SearchScope::all_default(), 2)
+        let hits = search_all_memories(&store, &q_vec, None, agent, SearchScope::all_default(), 2)
             .await.unwrap();
 
         assert_eq!(hits.len(), 2, "k_final=2 must return exactly 2 hits");
@@ -1222,7 +1646,7 @@ mod tests {
         let store_b = MemoryStore::new_for_test().await.unwrap();
         let q_vec = unit_basis_vec();
 
-        search_all_memories(&store_a, &q_vec, "agent-iso-a", SearchScope::all_default(), 10)
+        search_all_memories(&store_a, &q_vec, None, "agent-iso-a", SearchScope::all_default(), 10)
             .await
             .unwrap();
 
@@ -1239,7 +1663,7 @@ mod tests {
         let clone = store.clone();
         let q_vec = unit_basis_vec();
 
-        search_all_memories(&store, &q_vec, "agent-iso-clone", SearchScope::all_default(), 10)
+        search_all_memories(&store, &q_vec, None, "agent-iso-clone", SearchScope::all_default(), 10)
             .await
             .unwrap();
 
@@ -1256,7 +1680,7 @@ mod tests {
         let q_vec = unit_basis_vec();
 
         for _ in 0..3 {
-            search_all_memories(&store, &q_vec, "agent-iso-n", SearchScope::all_default(), 10)
+            search_all_memories(&store, &q_vec, None, "agent-iso-n", SearchScope::all_default(), 10)
                 .await
                 .unwrap();
         }
@@ -1268,7 +1692,7 @@ mod tests {
     async fn search_empty_db_returns_empty_vec() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let q_vec = unit_basis_vec();
-        let hits = search_all_memories(&store, &q_vec, "agent-x", SearchScope::all_default(), 10)
+        let hits = search_all_memories(&store, &q_vec, None, "agent-x", SearchScope::all_default(), 10)
             .await.unwrap();
         assert!(hits.is_empty());
     }
@@ -1302,7 +1726,7 @@ mod tests {
             insert_memory_row(&store, agent, content, mtype, tier, imp, status, emb_bytes.clone()).await;
         }
 
-        let hits = search_all_memories(&store, &q_vec, agent, SearchScope::all_default(), 3)
+        let hits = search_all_memories(&store, &q_vec, None, agent, SearchScope::all_default(), 3)
             .await.unwrap();
 
         // All five rows are candidates — this asserts the merge-and-truncate
@@ -1357,7 +1781,7 @@ mod tests {
         let emb = embedder.embed_with_role(task, EmbedRole::Passage).await.unwrap();
         let id = insert_episodic_row_for_knn(&store, "agent-a", task, emb.clone()).await;
 
-        let hits = search_all_memories(&store, &emb, "agent-a", SearchScope::all_default(), 10)
+        let hits = search_all_memories(&store, &emb, None, "agent-a", SearchScope::all_default(), 10)
             .await
             .unwrap();
 
@@ -1379,7 +1803,7 @@ mod tests {
         let emb = embedder.embed_with_role(task, EmbedRole::Passage).await.unwrap();
         let id = insert_episodic_row_for_knn(&store, "agent-a", task, emb.clone()).await;
 
-        let hits = search_all_memories(&store, &emb, "agent-b", SearchScope::all_default(), 10)
+        let hits = search_all_memories(&store, &emb, None, "agent-b", SearchScope::all_default(), 10)
             .await
             .unwrap();
 
@@ -1500,7 +1924,7 @@ mod tests {
 
         let q_vec = unit_basis_vec();
         let scope = SearchScope::all_default().with_project(Some("P1"));
-        let hits = search_all_memories(&store, &q_vec, "agent-scope", scope, 10).await.unwrap();
+        let hits = search_all_memories(&store, &q_vec, None, "agent-scope", scope, 10).await.unwrap();
 
         assert!(hits.iter().any(|h| h.id == own), "own-project memory row must appear");
         assert!(
@@ -1523,7 +1947,7 @@ mod tests {
         ).await;
 
         let scope = SearchScope::all_default().with_project(Some("P1"));
-        let hits = search_all_memories(&store, &emb, "agent-scope", scope, 10).await.unwrap();
+        let hits = search_all_memories(&store, &emb, None, "agent-scope", scope, 10).await.unwrap();
 
         assert!(hits.iter().any(|h| h.id == own && h.kind == TableKind::Episodic), "own-project episodic row must appear");
         assert!(
@@ -1546,7 +1970,7 @@ mod tests {
         ).await;
 
         let scope = SearchScope::all_default().with_project(Some("P1"));
-        let hits = search_all_memories(&store, &emb, "agent-scope", scope, 10).await.unwrap();
+        let hits = search_all_memories(&store, &emb, None, "agent-scope", scope, 10).await.unwrap();
 
         assert!(hits.iter().any(|h| h.id == own && h.kind == TableKind::Procedural), "own-project procedural row must appear");
         assert!(
@@ -1565,7 +1989,7 @@ mod tests {
 
         let q_vec = unit_basis_vec();
         let scope = SearchScope::all_default().with_project(Some("P1"));
-        let hits = search_all_memories(&store, &q_vec, "agent-scope-null", scope, 10).await.unwrap();
+        let hits = search_all_memories(&store, &q_vec, None, "agent-scope-null", scope, 10).await.unwrap();
 
         assert!(
             hits.iter().any(|h| h.id == id),
@@ -1584,7 +2008,7 @@ mod tests {
         ).await;
 
         let scope = SearchScope::all_default().with_project(Some("P1"));
-        let hits = search_all_memories(&store, &emb, "agent-scope-null", scope, 10).await.unwrap();
+        let hits = search_all_memories(&store, &emb, None, "agent-scope-null", scope, 10).await.unwrap();
 
         assert!(
             hits.iter().any(|h| h.id == id && h.kind == TableKind::Episodic),
@@ -1603,7 +2027,7 @@ mod tests {
         ).await;
 
         let scope = SearchScope::all_default().with_project(Some("P1"));
-        let hits = search_all_memories(&store, &emb, "agent-scope-null", scope, 10).await.unwrap();
+        let hits = search_all_memories(&store, &emb, None, "agent-scope-null", scope, 10).await.unwrap();
 
         assert!(
             hits.iter().any(|h| h.id == id && h.kind == TableKind::Procedural),
@@ -1621,7 +2045,7 @@ mod tests {
 
         let q_vec = unit_basis_vec();
         let scope = SearchScope::all_default().with_project(Some("P1"));
-        let hits = search_all_memories(&store, &q_vec, "agent-pref-cross", scope, 10).await.unwrap();
+        let hits = search_all_memories(&store, &q_vec, None, "agent-pref-cross", scope, 10).await.unwrap();
 
         assert!(
             hits.iter().any(|h| h.id == id),
@@ -1693,7 +2117,7 @@ mod tests {
         ).await;
 
         let q_vec = unit_basis_vec();
-        let hits = search_all_memories(&store, &q_vec, "agent-unscoped", SearchScope::all_default(), 10)
+        let hits = search_all_memories(&store, &q_vec, None, "agent-unscoped", SearchScope::all_default(), 10)
             .await
             .unwrap();
 
@@ -1946,6 +2370,7 @@ mod tests {
             episodic: None,
             procedural: None,
             project_id: Some("P1".to_string()),
+            lexical: None,
         };
         let k = scope.memory.unwrap();
         // 30 foreign rows fill the first window exactly; 40 eligible rows sit
@@ -1992,12 +2417,13 @@ mod tests {
             episodic: None,
             procedural: None,
             project_id: Some("P1".to_string()),
+            lexical: None,
         };
         bulk_insert_memory_rows(&store, "agent-telemetry-wired", Some("P2"), 30, serialize_embedding(&near)).await;
         bulk_insert_memory_rows(&store, "agent-telemetry-wired", Some("P1"), 40, serialize_embedding(&far)).await;
 
         let (hits, line) =
-            search_all_memories_inner(&store, &near, "agent-telemetry-wired", scope, 30, &ScoringConfig::DEFAULT)
+            search_all_memories_inner(&store, &near, None, "agent-telemetry-wired", scope, 30, &ScoringConfig::DEFAULT)
                 .await
                 .unwrap();
 
@@ -2310,7 +2736,7 @@ mod tests {
         let p2 = insert_episodic_row_with_project(&store, "agent-uns-epi", Some("P2"), "sess-foreign", emb.clone()).await;
         let none = insert_episodic_row_with_project(&store, "agent-uns-epi", None, "sess-unowned", emb.clone()).await;
 
-        let hits = search_all_memories(&store, &emb, "agent-uns-epi", SearchScope::all_default(), 10)
+        let hits = search_all_memories(&store, &emb, None, "agent-uns-epi", SearchScope::all_default(), 10)
             .await
             .unwrap();
 
@@ -2332,7 +2758,7 @@ mod tests {
         let p2 = insert_procedural_row_with_project(&store, "agent-uns-pro", Some("P2"), "skill-foreign", emb.clone()).await;
         let none = insert_procedural_row_with_project(&store, "agent-uns-pro", None, "skill-unowned", emb.clone()).await;
 
-        let hits = search_all_memories(&store, &emb, "agent-uns-pro", SearchScope::all_default(), 10)
+        let hits = search_all_memories(&store, &emb, None, "agent-uns-pro", SearchScope::all_default(), 10)
             .await
             .unwrap();
 
@@ -2342,5 +2768,1393 @@ mod tests {
                 "unscoped query must return procedural row {id} regardless of its project_id"
             );
         }
+    }
+
+    // ── lexical (FTS5) sanitizer ──
+
+    #[test]
+    fn fts_match_expression_folds_accented_spanish_text_into_ored_tokens() {
+        assert_eq!(
+            fts_match_expression("configuración del núcleo", MAX_LEXICAL_TOKENS),
+            Some("\"configuración\" OR \"del\" OR \"núcleo\"".to_string())
+        );
+    }
+
+    #[test]
+    fn fts_match_expression_splits_hyphenated_identifier() {
+        assert_eq!(
+            fts_match_expression("GPX-Store", MAX_LEXICAL_TOKENS),
+            Some("\"GPX\" OR \"Store\"".to_string())
+        );
+    }
+
+    #[test]
+    fn fts_match_expression_splits_colon_separated_terms() {
+        assert_eq!(
+            fts_match_expression("foo:bar", MAX_LEXICAL_TOKENS),
+            Some("\"foo\" OR \"bar\"".to_string())
+        );
+    }
+
+    #[test]
+    fn fts_match_expression_near_keyword_survives_quoted_as_a_literal_token() {
+        assert_eq!(
+            fts_match_expression("find NEAR the bug", MAX_LEXICAL_TOKENS),
+            Some("\"find\" OR \"NEAR\" OR \"the\" OR \"bug\"".to_string())
+        );
+    }
+
+    #[test]
+    fn fts_match_expression_unbalanced_quote_is_stripped_as_a_separator() {
+        assert_eq!(
+            fts_match_expression("\"unbalanced", MAX_LEXICAL_TOKENS),
+            Some("\"unbalanced\"".to_string())
+        );
+    }
+
+    #[test]
+    fn fts_match_expression_lone_asterisk_yields_none() {
+        assert_eq!(fts_match_expression("*", MAX_LEXICAL_TOKENS), None);
+    }
+
+    #[test]
+    fn fts_match_expression_empty_query_yields_none() {
+        assert_eq!(fts_match_expression("", MAX_LEXICAL_TOKENS), None);
+    }
+
+    // Symbol characters only, no alphanumeric word among them. A query that
+    // ALSO contains the bare word "NEAR" is a different case: "NEAR" is
+    // alphanumeric, so it survives as its own quoted token (see the
+    // NEAR-as-literal test above) and the token list is not empty there.
+    #[test]
+    fn fts_match_expression_operator_soup_with_no_alphanumeric_yields_none() {
+        assert_eq!(fts_match_expression("-^()\"* :", MAX_LEXICAL_TOKENS), None);
+    }
+
+    #[test]
+    fn fts_match_expression_double_underscore_identifier_is_one_token() {
+        assert_eq!(
+            fts_match_expression("V8__memory_fts", MAX_LEXICAL_TOKENS),
+            Some("\"V8__memory_fts\"".to_string())
+        );
+    }
+
+    #[test]
+    fn fts_match_expression_truncates_to_max_tokens_from_the_front() {
+        assert_eq!(
+            fts_match_expression("one two three four five", 2),
+            Some("\"one\" OR \"two\"".to_string())
+        );
+    }
+
+    /// The truncation test above passes `2` explicitly and never touches the
+    /// shipped `MAX_LEXICAL_TOKENS` — a query with 17 distinct tokens is one
+    /// more than the constant's current value of 16, so this fails RED if the
+    /// constant grows (all 17 would survive) or shrinks (fewer than 16 would
+    /// survive) in either direction, unlike a test that supplies its own limit.
+    #[test]
+    fn fts_match_expression_caps_at_the_shipped_max_lexical_tokens_constant() {
+        let query = (1..=17).map(|i| format!("tok{i}")).collect::<Vec<_>>().join(" ");
+        let expr = fts_match_expression(&query, MAX_LEXICAL_TOKENS)
+            .expect("17 alphanumeric tokens must yield a non-empty expression");
+
+        for i in 1..=16 {
+            assert!(
+                expr.contains(&format!("\"tok{i}\"")),
+                "token {i} of 17 must survive under the shipped MAX_LEXICAL_TOKENS; expr={expr}"
+            );
+        }
+        assert!(
+            !expr.contains("\"tok17\""),
+            "the 17th token must be truncated away by the shipped MAX_LEXICAL_TOKENS; expr={expr}"
+        );
+    }
+
+    // `LEXICAL_SCORE_SQL_PREFIX` claims ?1-?3, so the generated list must
+    // start at ?4 and number every hole explicitly — pinned as a string
+    // equality so a regression to bare `?` is caught here. Verified
+    // empirically that a bare `?` would not corrupt a bind for this exact
+    // placement today: SQLite's own auto-numbering happens to land on the
+    // same indices, since nothing upstream of this list introduces a gap.
+    // Explicit numbering is kept anyway as the defensively-correct choice —
+    // that auto-numbering rule depends on textual order, not on placement,
+    // so it would silently break the day a placeholder is added or
+    // reordered ahead of this one. This assertion is also what makes the
+    // offset and the prefix's parameter count impossible to change
+    // independently: the two only agree while both are edited together.
+    #[test]
+    fn lexical_rowid_placeholders_are_explicitly_numbered_from_four() {
+        assert_eq!(lexical_rowid_placeholders(0), "");
+        assert_eq!(lexical_rowid_placeholders(1), "?4");
+        assert_eq!(lexical_rowid_placeholders(3), "?4, ?5, ?6");
+    }
+
+    // The clamp is only reachable through a caller-supplied budget, which no
+    // production call site sets above 20 — so without this it is a defensive
+    // check nothing exercises, and removing it would go unnoticed until a
+    // scope built somewhere else fed a large number straight into a bind
+    // list SQLite then refuses to prepare.
+    #[test]
+    fn lexical_budget_is_clamped_to_the_bind_parameter_ceiling() {
+        assert_eq!(lexical_budget(20), 20, "an ordinary budget passes through untouched");
+        assert_eq!(lexical_budget(MAX_LEXICAL_CANDIDATES), MAX_LEXICAL_CANDIDATES);
+        assert_eq!(lexical_budget(MAX_LEXICAL_CANDIDATES + 1), MAX_LEXICAL_CANDIDATES);
+        assert_eq!(lexical_budget(usize::MAX), MAX_LEXICAL_CANDIDATES);
+    }
+
+    // Two halves of one claim, deliberately in the same test because either
+    // alone is worthless: the clamp really does bound what the candidate
+    // query returns (so the ceiling is not merely arithmetic in a helper),
+    // and a bind list of exactly that many ids really does prepare and run
+    // (so the ceiling is a number SQLite accepts, not a guess).
+    #[tokio::test]
+    async fn a_budget_past_the_ceiling_is_clamped_and_the_clamped_list_still_scores() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let agent = "agent-budget-ceiling";
+        let count = MAX_LEXICAL_CANDIDATES + 88;
+        insert_rows_at_increasing_distance(&store, agent, "ceiling_shared_token row", count).await;
+
+        let ids = lexical_candidates(&store, "ceiling_shared_token", agent, None, usize::MAX).await;
+        assert_eq!(
+            ids.len(),
+            MAX_LEXICAL_CANDIDATES,
+            "{count} rows match, so an unclamped budget would return all of them"
+        );
+
+        let hits = score_lexical_candidates(
+            &store,
+            &serialize_f32_query(&unit_basis_vec()),
+            agent,
+            None,
+            &ids,
+            &ScoringConfig::DEFAULT,
+            TimestampMs::now(),
+        )
+        .await;
+        assert_eq!(
+            hits.len(),
+            MAX_LEXICAL_CANDIDATES,
+            "a full-ceiling bind list must still prepare and run"
+        );
+    }
+
+    // ── lexical candidate query (FTS5 MATCH + scope) ──
+
+    // Agent B's rows are short (just the token), so bm25 ranks every one of
+    // them ahead of agent A's longer rows. If the scope predicate were
+    // applied AFTER the scan instead of inside the WHERE clause, the top 20
+    // by bm25 across both agents would be entirely B's rows and agent A's
+    // query would come back empty — a post-scan filter returns 0, not 20.
+    #[tokio::test]
+    async fn lexical_candidate_query_applies_scope_before_limit() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let emb = unit_basis_embedding();
+
+        for i in 0..30 {
+            insert_memory_row(
+                &store, "agent-b", "shared_tok", "chat_message", 3, 5.0, "active", emb.clone(),
+            ).await;
+            let _ = i;
+        }
+        let mut a_ids = Vec::new();
+        for i in 0..20 {
+            a_ids.push(
+                insert_memory_row(
+                    &store,
+                    "agent-a",
+                    &format!("shared_tok padding filler words number {i} to dilute the bm25 rank"),
+                    "chat_message",
+                    3,
+                    5.0,
+                    "active",
+                    emb.clone(),
+                )
+                .await,
+            );
+        }
+
+        let ids = lexical_candidates(&store, "shared_tok", "agent-a", None, 20).await;
+
+        assert_eq!(
+            ids.len(),
+            20,
+            "agent A has exactly 20 permitted matches; the budget must not be spent on agent B's better-ranked rows"
+        );
+        for id in &ids {
+            assert!(a_ids.contains(id), "candidate {id} does not belong to agent A");
+        }
+    }
+
+    // 20 noisy rows are inserted first (lower rowids), each a weak bm25
+    // match. The single best match is inserted LAST (highest rowid) and
+    // contains nothing but the token. Without `ORDER BY bm25(memory_fts)` a
+    // plain `LIMIT 20` keeps the lowest rowids and drops it; with it, the
+    // best match bubbles into the window despite arriving last.
+    #[tokio::test]
+    async fn lexical_candidate_query_order_by_bm25_pulls_best_match_into_window() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let emb = unit_basis_embedding();
+        let agent = "agent-bm25-order";
+
+        for i in 0..20 {
+            insert_memory_row(
+                &store,
+                agent,
+                &format!("unique_tok padding filler words number {i} to dilute the bm25 rank even further with more text"),
+                "chat_message",
+                3,
+                5.0,
+                "active",
+                emb.clone(),
+            )
+            .await;
+        }
+        let best_id = insert_memory_row(
+            &store, agent, "unique_tok", "chat_message", 3, 5.0, "active", emb.clone(),
+        ).await;
+
+        let ids = lexical_candidates(&store, "unique_tok", agent, None, 20).await;
+
+        assert!(
+            ids.contains(&best_id),
+            "the best bm25 match must survive the LIMIT even though it was inserted last \
+             (highest rowid) — without ORDER BY bm25(...) a plain LIMIT keeps the lowest \
+             rowids and drops it"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_candidates_folds_accents_between_query_and_stored_content() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let emb = unit_basis_embedding();
+        let id = insert_memory_row(
+            &store,
+            "agent-accent",
+            "informe de configuración del sistema",
+            "chat_message",
+            3,
+            5.0,
+            "active",
+            emb,
+        ).await;
+
+        let ids = lexical_candidates(&store, "configuracion", "agent-accent", None, 20).await;
+
+        assert!(
+            ids.contains(&id),
+            "an unaccented query must reach a row stored with the accented form — \
+             unicode61 remove_diacritics 2 folds both at index and query time"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_candidate_query_user_preference_crosses_project_boundary() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let emb = unit_basis_embedding();
+        let id = insert_memory_row_with_project(
+            &store, "agent-pref-lex", Some("P2"), "user_preference", "pref_tok content", emb,
+        ).await;
+
+        let ids = lexical_candidates(&store, "pref_tok", "agent-pref-lex", Some("P1"), 20).await;
+
+        assert!(
+            ids.contains(&id),
+            "a user_preference row must remain visible across project boundaries in the \
+             lexical channel too, exactly as it already does in the dense KNN channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_candidates_fails_soft_when_table_missing() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        store.conn.call(|c| c.execute("DROP TABLE memory_fts", [])).await.unwrap();
+
+        let ids = lexical_candidates(&store, "anything", "agent-x", None, 20).await;
+
+        assert!(
+            ids.is_empty(),
+            "a missing memory_fts table must degrade to an empty channel, never panic or propagate an error"
+        );
+    }
+
+    // ── lexical scoring query (rowid-driven `m.id IN (...)`) ──
+
+    // Both rows share the same embedding, importance, tier, status and
+    // last_accessed_at, so any score difference is attributable only to
+    // which query path computed it — the dense KNN query or the lexical
+    // scoring query.
+    #[tokio::test]
+    async fn score_lexical_candidates_matches_the_dense_scoring_formula_exactly() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let emb = unit_basis_embedding();
+        let agent = "agent-score-parity";
+
+        let dense_id = insert_memory_row(&store, agent, "dense row", "chat_message", 3, 5.0, "active", emb.clone()).await;
+        let lexical_id = insert_memory_row(&store, agent, "lexical row", "chat_message", 3, 5.0, "active", emb.clone()).await;
+
+        let now = TimestampMs::now();
+        let dense_hits = knn_one(&store, KNN_MEMORY, &emb, agent, None, 30, &ScoringConfig::DEFAULT, now)
+            .await
+            .unwrap();
+        let dense_score = dense_hits.hits.iter().find(|h| h.id == dense_id).unwrap().score;
+
+        let lexical_hits = score_lexical_candidates(&store, &emb, agent, None, &[lexical_id], &ScoringConfig::DEFAULT, now)
+            .await;
+        let lexical_score = lexical_hits.iter().find(|h| h.id == lexical_id).unwrap().score;
+
+        assert_eq!(
+            dense_score, lexical_score,
+            "identical distance/importance/recency must score identically regardless of which channel found the candidate"
+        );
+    }
+
+    // Requests a non-contiguous subset of ids so a placeholder-index mistake
+    // would surface as either the wrong rows coming back or a bind error.
+    #[tokio::test]
+    async fn score_lexical_candidates_returns_exactly_the_requested_ids_with_multiple_placeholders() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let emb = unit_basis_embedding();
+        let agent = "agent-multi-ids";
+
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            ids.push(insert_memory_row(&store, agent, &format!("row {i}"), "chat_message", 3, 5.0, "active", emb.clone()).await);
+        }
+        let requested = vec![ids[0], ids[2], ids[4]];
+
+        let hits = score_lexical_candidates(&store, &emb, agent, None, &requested, &ScoringConfig::DEFAULT, TimestampMs::now())
+            .await;
+
+        let mut returned: Vec<i64> = hits.iter().map(|h| h.id).collect();
+        returned.sort();
+        let mut expected = requested.clone();
+        expected.sort();
+        assert_eq!(returned, expected, "exactly the requested ids, and only those, must come back");
+    }
+
+    // The id is passed directly, as if a candidate query had somehow
+    // surfaced it (a stale `memory_fts` row, or any other source) — proving
+    // the scoring join's own `deleted_at` predicate is independently
+    // sufficient, not merely redundant with the FTS removal trigger.
+    #[tokio::test]
+    async fn score_lexical_candidates_excludes_soft_deleted_rows_even_when_requested_by_id() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let emb = unit_basis_embedding();
+        let agent = "agent-score-softdel";
+        let id = insert_memory_row(&store, agent, "will be deleted", "chat_message", 3, 5.0, "active", emb.clone()).await;
+        soft_delete_keeping_vector(&store, id).await;
+
+        let hits = score_lexical_candidates(&store, &emb, agent, None, &[id], &ScoringConfig::DEFAULT, TimestampMs::now())
+            .await;
+
+        assert!(hits.is_empty(), "a soft-deleted memory must never be scored, even if its id reaches this query directly");
+    }
+
+    // The comment above `LEXICAL_SCORE_SQL_PREFIX` claims all four scope
+    // predicates are re-applied because this join is the last gate before a
+    // row reaches a caller and has to stand on its own. The soft-delete case
+    // above pins one of them; these three pin the rest, so the claim is an
+    // asserted property of the query rather than a description of it. Each
+    // passes the id in directly, as a stale `memory_fts` row or a bug in the
+    // candidate query would.
+    #[tokio::test]
+    async fn score_lexical_candidates_never_crosses_an_agent_boundary() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let emb = unit_basis_embedding();
+        let other = insert_memory_row(
+            &store, "agent-owner", "another agent's row", "chat_message", 3, 5.0, "active", emb.clone(),
+        )
+        .await;
+
+        let hits = score_lexical_candidates(
+            &store, &emb, "agent-intruder", None, &[other], &ScoringConfig::DEFAULT, TimestampMs::now(),
+        )
+        .await;
+
+        assert!(hits.is_empty(), "a row belonging to another agent must never be scored for this caller");
+    }
+
+    #[tokio::test]
+    async fn score_lexical_candidates_excludes_rows_outside_the_live_status_set() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let emb = unit_basis_embedding();
+        let agent = "agent-score-status";
+        let superseded = insert_memory_row(
+            &store, agent, "an outdated fact", "semantic_fact", 3, 5.0, "superseded", emb.clone(),
+        )
+        .await;
+
+        let hits = score_lexical_candidates(
+            &store, &emb, agent, None, &[superseded], &ScoringConfig::DEFAULT, TimestampMs::now(),
+        )
+        .await;
+
+        assert!(hits.is_empty(), "only 'active' and 'disputed' rows are eligible to reach a caller");
+    }
+
+    // The disjunct is an EXEMPTION, so the killing evidence is a row that must
+    // come back, not one that must not: dropping it would make this channel
+    // stricter than the dense one about which project-scoped rows are
+    // permitted, and a user preference would go missing lexically while
+    // surfacing densely.
+    #[tokio::test]
+    async fn score_lexical_candidates_keeps_the_user_preference_project_exemption() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let emb = unit_basis_embedding();
+        let agent = "agent-score-pref";
+        let pref = insert_memory_row_with_project(
+            &store, agent, Some("project-other"), "user_preference", "always answer in Spanish", emb.clone(),
+        )
+        .await;
+
+        let hits = score_lexical_candidates(
+            &store, &emb, agent, Some("project-current"), &[pref], &ScoringConfig::DEFAULT, TimestampMs::now(),
+        )
+        .await;
+
+        assert_eq!(
+            hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![pref],
+            "a user preference reaches every project, exactly as it does through the dense arm"
+        );
+    }
+
+    #[tokio::test]
+    async fn score_lexical_candidates_returns_empty_for_an_empty_id_list() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let emb = unit_basis_embedding();
+        let hits = score_lexical_candidates(&store, &emb, "agent-empty", None, &[], &ScoringConfig::DEFAULT, TimestampMs::now())
+            .await;
+        assert!(hits.is_empty());
+    }
+
+    /// Reads BOTH the `memory` and `memory_vectors` lines out of
+    /// `EXPLAIN QUERY PLAN` for the real scoring statement at `n` candidate
+    /// ids. Both are needed: `NOT INDEXED` pins `memory` to
+    /// `INTEGER PRIMARY KEY` under every spelling of the id list, so that
+    /// line alone cannot tell `m.id IN` apart from `v.rowid IN` — only the
+    /// `memory_vectors` line does, and it is the one that actually flips
+    /// between a per-id rowid lookup and an unconstrained full scan.
+    async fn scoring_plan_lines_for(store: &MemoryStore, n: usize) -> (String, String) {
+        let sql = format!("EXPLAIN QUERY PLAN {}", lexical_score_sql(n));
+        store
+            .conn
+            .call(move |c| -> Result<(String, String), rusqlite::Error> {
+                let mut stmt = c.prepare(&sql)?;
+                let mut binds: Vec<rusqlite::types::Value> = vec![
+                    rusqlite::types::Value::Blob(serialize_f32_query(&unit_basis_vec())),
+                    rusqlite::types::Value::Text("plan-probe".into()),
+                    rusqlite::types::Value::Null,
+                ];
+                binds.extend((0..n).map(|i| rusqlite::types::Value::Integer(i as i64 + 1)));
+                let rows =
+                    stmt.query_map(rusqlite::params_from_iter(binds), |r| r.get::<_, String>(3))?;
+                let mut plan = Vec::new();
+                for r in rows {
+                    plan.push(r?);
+                }
+                let memory_line = plan
+                    .iter()
+                    .find(|l| l.ends_with(" m") || l.contains(" m "))
+                    .cloned()
+                    .unwrap_or_else(|| "no line for `memory` in the plan".to_string());
+                let vector_line = plan
+                    .iter()
+                    .find(|l| l.ends_with(" v") || l.contains(" v "))
+                    .cloned()
+                    .unwrap_or_else(|| "no line for `memory_vectors` in the plan".to_string());
+                Ok((memory_line, vector_line))
+            })
+            .await
+            .unwrap()
+    }
+
+    /// This query knows the exact ids it wants, so the only defensible way for
+    /// it to reach them is by id. The plan is asserted rather than inferred
+    /// because nothing else can see the difference: every other formulation
+    /// returns the identical rows with identical distances and differs only in
+    /// how many rows it had to visit to produce them — a defect with no
+    /// observable output, which is why it survived a full green suite once.
+    ///
+    /// Two planner facts make this worth pinning at several `n` rather than
+    /// one. SQLite rewrites a single-element `IN (?)` into `rowid = ?`, so a
+    /// one-id probe takes the fast path under EVERY formulation and proves
+    /// nothing about the others. And with no `ANALYZE` in this schema the
+    /// planner works from fixed row estimates, under which an `IN` list of
+    /// four or more terms looks more expensive than a lookup through
+    /// `idx_memory_agent_active` — so a form that plans correctly at two ids
+    /// can still fall back to scanning the agent's rows at four. `NOT INDEXED`
+    /// is what removes that choice: it bars every index on `memory` while
+    /// explicitly leaving the rowid available, which is the one access path
+    /// this statement ever wants.
+    ///
+    /// Both halves of the join have to be checked. `NOT INDEXED` alone already
+    /// forces the `memory` line to `INTEGER PRIMARY KEY` regardless of whether
+    /// the id list is spelled `m.id IN` or `v.rowid IN` — measured, both
+    /// spellings produce that exact line — so the `memory` assertion by
+    /// itself cannot distinguish them. What does distinguish them is the
+    /// `memory_vectors` line: `m.id IN` drives the join from `memory` and
+    /// looks each vector up by rowid (`INDEX 3:` in this vec0 build);
+    /// `v.rowid IN` drives it from `memory_vectors` instead and, because a
+    /// multi-valued `IN` is not accepted as a vec0 constraint, degrades to an
+    /// unconstrained scan of every live vector (`INDEX 0:1`) at every
+    /// candidate count above one.
+    #[tokio::test]
+    async fn the_scoring_statement_reaches_its_rows_by_id_at_every_candidate_count() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        for n in [1, 2, 4, 8, 20, MAX_LEXICAL_CANDIDATES] {
+            let (memory_line, vector_line) = scoring_plan_lines_for(&store, n).await;
+            assert!(
+                memory_line.contains("INTEGER PRIMARY KEY"),
+                "at {n} candidate ids the scoring query reaches `memory` by `{memory_line}` \
+                 instead of by rowid, which makes its cost a function of how many rows the agent \
+                 owns rather than of how many candidates were asked for"
+            );
+            assert!(
+                vector_line.contains("INDEX 3:"),
+                "at {n} candidate ids the scoring query reaches `memory_vectors` by \
+                 `{vector_line}` instead of a per-id rowid lookup — `NOT INDEXED` alone does not \
+                 catch this, since it only ever constrains `memory`'s own access path, not the \
+                 vtab's"
+            );
+        }
+    }
+
+    /// The two dimensions that matter here are the candidate count and the
+    /// size of the corpus around it, and they have to be crossed: a large
+    /// corpus queried for ONE id hides the defect behind SQLite's
+    /// `IN (?)` → `rowid = ?` rewrite, and a full candidate list over a small
+    /// corpus hides it behind the corpus being small. Production crosses them
+    /// every day — `SearchScope::all_default()` spends a budget of 20 against
+    /// however many memories an agent has accumulated.
+    ///
+    /// The bound is expressed against this machine's own measurement of the
+    /// same query doing the same work for a single candidate, so it constrains
+    /// the SHAPE of the cost rather than the speed of the hardware it is
+    /// measured on: scoring 20 candidates is 20 lookups, so it costs a small
+    /// multiple of one, not a multiple in the hundreds. Measured on this
+    /// machine, repeated runs of the shipped query land the 20-vs-1 ratio
+    /// between 2x and 5x — noisy because the 1-candidate side is a single
+    /// short-lived query where scheduler jitter dominates, but never close to
+    /// double digits. 25x leaves 5-12x headroom over that observed range,
+    /// which is enough to absorb a loaded CI machine without chasing a bound
+    /// so tight it flakes on noise alone, while still failing hard on a query
+    /// that is pricing itself by corpus size instead of candidate count: the
+    /// two regressions this bound has ever needed to catch measured 37x and
+    /// 287x. Both are also caught by
+    /// `the_scoring_statement_reaches_its_rows_by_id_at_every_candidate_count`
+    /// now that it reads the `memory_vectors` plan line — this bound is kept
+    /// as a second, independent signal (a plan can be pinned wrong; a
+    /// multi-millisecond query cannot look fast), not because either
+    /// regression is otherwise invisible.
+    #[tokio::test]
+    async fn scoring_a_full_candidate_budget_costs_the_same_in_a_large_corpus_as_in_a_small_one() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let agent = "agent-crossed-dimensions";
+        let corpus = 5_000;
+        let ids = insert_rows_at_increasing_distance(&store, agent, "crossed row", corpus).await;
+        let q_bytes = serialize_f32_query(&unit_basis_vec());
+        let budget = 20;
+        let requested: Vec<i64> = ids.iter().rev().take(budget).copied().collect();
+
+        let time_it = |batch: Vec<i64>| {
+            let store = &store;
+            let q = q_bytes.clone();
+            async move {
+                let mut best = std::time::Duration::from_secs(3600);
+                let mut hits = Vec::new();
+                for _ in 0..3 {
+                    let t = Instant::now();
+                    hits = score_lexical_candidates(
+                        store,
+                        &q,
+                        agent,
+                        None,
+                        &batch,
+                        &ScoringConfig::DEFAULT,
+                        TimestampMs::now(),
+                    )
+                    .await;
+                    best = best.min(t.elapsed());
+                }
+                (best, hits)
+            }
+        };
+
+        let (one, _) = time_it(vec![requested[0]]).await;
+        let (many, hits) = time_it(requested.clone()).await;
+
+        let mut returned: Vec<i64> = hits.iter().map(|h| h.id).collect();
+        returned.sort_unstable();
+        let mut expected = requested.clone();
+        expected.sort_unstable();
+        assert_eq!(returned, expected, "every requested candidate must still be scored");
+
+        assert!(
+            many < one * 25,
+            "scoring {budget} candidates out of {corpus} rows took {many:?}, {:.0}x the {one:?} \
+             this machine needs for one of them — the query is being priced by the size of the \
+             corpus, not by the number of candidates it was handed",
+            many.as_secs_f64() / one.as_secs_f64()
+        );
+    }
+
+    // ── lexical channel wiring (4th try_join! arm inside search_all_memories_inner) ──
+
+    /// Component-wise negation — cosine ≈ -1 after normalization, exactly
+    /// antipodal to `v`. Mirrors `contradiction.rs`'s `far()` fixture (same
+    /// negation construction), NOT this module's own `off_axis_vec()` (cosine
+    /// 0.9): the identifier-promotion scenario needs a vector the dense
+    /// channel unambiguously loses, not merely a weaker match.
+    fn far_vec(v: &[f32]) -> Vec<f32> {
+        v.iter().map(|x| -x).collect()
+    }
+
+    /// Seeds `count` memory rows whose distance to the `[1,0,0,…]` query
+    /// vector strictly increases with insertion order, so "the row at global
+    /// distance rank N" is a fact the fixture states rather than one the test
+    /// has to discover. Returns the ids in that same order, so the LAST id is
+    /// always the farthest row in the store.
+    ///
+    /// Every one of the 384 coordinates differs from the query vector, and
+    /// that is load-bearing rather than decorative. A row differing in a
+    /// SINGLE coordinate has, by elementary arithmetic, the same L1, L2 and
+    /// L∞ distance to the query — one term, one absolute value, one square
+    /// root of one square — so a fixture built that way cannot distinguish
+    /// the metric under test from any other metric, and every distance
+    /// assertion written against it holds no matter which one the query
+    /// names. Spreading the offset over all 384 coordinates separates them by
+    /// a factor of `sqrt(384)` ≈ 19.6, which no rounding can hide.
+    async fn insert_rows_at_increasing_distance(
+        store: &MemoryStore,
+        agent_id: &str,
+        content_prefix: &str,
+        count: usize,
+    ) -> Vec<i64> {
+        let agent = agent_id.to_string();
+        let prefix = content_prefix.to_string();
+        store
+            .conn
+            .call(move |c| -> Result<Vec<i64>, rusqlite::Error> {
+                let tx = c.transaction()?;
+                let mut ids = Vec::with_capacity(count);
+                for i in 0..count {
+                    tx.execute(
+                        "INSERT INTO memory (scope, agent_id, content, memory_type,
+                         source, created_at, created_by_type, created_by_ref,
+                         last_modified_at, last_accessed_at, importance, tier, status)
+                         VALUES ('agent', ?1, ?2, 'chat_message', 'chat',
+                         0, 'user', ?1, 0, 0, 5.0, 3, 'active')",
+                        params![agent, format!("{prefix} {i}")],
+                    )?;
+                    let id = tx.last_insert_rowid();
+                    // The difference from `[1,0,…]` is `t` in EVERY
+                    // coordinate, with `t = (i+1) * 1e-5` and alternating
+                    // signs so the offset is not a uniform shift either.
+                    // L2 distance is therefore `t * sqrt(384)` and L1 is
+                    // `t * 384`: both strictly increasing with insertion
+                    // order, and 19.6x apart from each other. The L2 step
+                    // between consecutive rows is ~1.96e-4, ~1600x f32's own
+                    // resolution near 1.0, so no two rows collapse onto the
+                    // same distance.
+                    let t = (i as f32 + 1.0) * 1e-5;
+                    let mut v = vec![t; 384];
+                    v[0] = 1.0 - t;
+                    for (j, slot) in v.iter_mut().enumerate().skip(1) {
+                        if j % 2 == 1 {
+                            *slot = -t;
+                        }
+                    }
+                    tx.execute(
+                        "INSERT INTO memory_vectors(rowid, embedding) VALUES (?, ?)",
+                        params![id, serialize_embedding(&v)],
+                    )?;
+                    ids.push(id);
+                }
+                tx.commit()?;
+                Ok(ids)
+            })
+            .await
+            .unwrap()
+    }
+
+    /// The scoring query must reach a candidate regardless of where it sits in
+    /// the store's global distance ordering. That is the entire reason this
+    /// channel exists: an exact identifier match on a semantically distant row
+    /// is, by definition, a row the distance ordering ranks badly. A scoring
+    /// query that can only see the nearest N rows re-imposes the very ranking
+    /// the lexical channel was added to bypass — silently, because the
+    /// candidate id is simply absent from the result instead of erroring.
+    ///
+    /// The corpus is deliberately larger than vec0's own maximum `k` (4096):
+    /// any implementation that scores candidates by running a k-nearest scan
+    /// and filtering it has a ceiling somewhere, and this fixture puts the
+    /// requested row above the highest ceiling such an implementation can
+    /// have.
+    #[tokio::test]
+    async fn score_lexical_candidates_reaches_the_farthest_row_in_a_corpus_larger_than_vec0_max_k() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let agent = "agent-beyond-k-ceiling";
+        let ids = insert_rows_at_increasing_distance(&store, agent, "beyond ceiling", VEC0_MAX_K + 1).await;
+        let farthest = *ids.last().unwrap();
+
+        let q_bytes = serialize_f32_query(&unit_basis_vec());
+        let hits = score_lexical_candidates(
+            &store,
+            &q_bytes,
+            agent,
+            None,
+            &[farthest],
+            &ScoringConfig::DEFAULT,
+            TimestampMs::now(),
+        )
+        .await;
+
+        assert_eq!(
+            hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![farthest],
+            "the requested candidate is the farthest of {} rows; a scoring query that only \
+             sees the nearest slice of the corpus drops exactly the rows this channel promotes",
+            ids.len()
+        );
+    }
+
+    /// The scoring query reports a distance the score formula consumes as if
+    /// it came from the dense arms, so the two must be the SAME number, not
+    /// merely two plausible ones. They agree only while the metric this query
+    /// names matches the metric `memory_vectors` was declared with; declaring
+    /// that table with a different `distance_metric`, or naming a different
+    /// scalar in the scoring query, would leave both paths running without
+    /// error and silently re-scale every lexically promoted row against the
+    /// rest of the result set.
+    ///
+    /// The first assertion below is what gives that claim teeth. Bit-identity
+    /// against the dense arm only constrains the metric if the fixture's rows
+    /// can actually tell two metrics apart, and a fixture whose rows differ
+    /// from the query in one coordinate cannot: L1, L2 and L∞ coincide there
+    /// exactly, so a scoring query naming any of them passes. So this test
+    /// first measures L1 against L2 on its own corpus and refuses to proceed
+    /// unless they diverge — the fixture is under test before the query is.
+    #[tokio::test]
+    async fn lexical_scoring_distance_is_bit_identical_to_the_dense_knn_distance() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let agent = "agent-distance-parity";
+        let ids = insert_rows_at_increasing_distance(&store, agent, "parity row", 40).await;
+        let q_bytes = serialize_f32_query(&unit_basis_vec());
+
+        let q_probe = q_bytes.clone();
+        let separation: Vec<(f64, f64)> = store
+            .conn
+            .call(move |c| -> Result<Vec<(f64, f64)>, rusqlite::Error> {
+                let mut stmt = c.prepare(
+                    "SELECT vec_distance_l1(v.embedding, ?1), vec_distance_l2(v.embedding, ?1)
+                     FROM memory_vectors v",
+                )?;
+                let rows = stmt.query_map(params![q_probe], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect()
+            })
+            .await
+            .unwrap();
+        assert_eq!(separation.len(), ids.len(), "every seeded row must be probed");
+        for (l1, l2) in &separation {
+            assert!(
+                l1 > &(l2 * 10.0),
+                "this corpus cannot distinguish one metric from another (l1={l1}, l2={l2}), so \
+                 the parity assertion below would hold for a scoring query naming any of them"
+            );
+        }
+
+        let lex = score_lexical_candidates(
+            &store,
+            &q_bytes,
+            agent,
+            None,
+            &ids,
+            &ScoringConfig::DEFAULT,
+            TimestampMs::now(),
+        )
+        .await;
+
+        let q = q_bytes.clone();
+        let knn: std::collections::HashMap<i64, f64> = store
+            .conn
+            .call(move |c| -> Result<std::collections::HashMap<i64, f64>, rusqlite::Error> {
+                let mut stmt = c.prepare(
+                    "SELECT knn.rowid, knn.distance FROM memory_vectors knn
+                     WHERE knn.embedding MATCH ?1 AND knn.k = 40",
+                )?;
+                let rows = stmt.query_map(params![q], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                let mut out = std::collections::HashMap::new();
+                for r in rows {
+                    let (id, d) = r?;
+                    out.insert(id, d);
+                }
+                Ok(out)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(lex.len(), ids.len(), "every seeded row must be scored");
+        for h in &lex {
+            let dense = knn.get(&h.id).copied().expect("every seeded row is inside the dense window");
+            assert_eq!(
+                h.distance.to_bits(),
+                dense.to_bits(),
+                "row {} scored at distance {} lexically but {} densely",
+                h.id,
+                h.distance,
+                dense
+            );
+        }
+    }
+
+
+    // `memory` and `episodic_trajectory` each keep their own independent
+    // autoincrement sequence, so their first-ever row both land on id 1 in a
+    // fresh store — a coincidence, not a bug, and the dedup step must not
+    // treat it as one. The episodic row (near, dense-visible) and M (far,
+    // lexical-only) share that same numeric id but different `TableKind`s;
+    // differencing lexical ids against the MERGED pool would see id 1
+    // "already found" via the episodic hit and wrongly drop M.
+    #[tokio::test]
+    async fn search_all_memories_inner_dedup_ignores_cross_table_id_collisions() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let near = unit_basis_vec();
+        let far = far_vec(&near);
+        let agent = "agent-id-collision";
+
+        let epi_id = insert_episodic_row_for_knn(&store, agent, "collision episode", near.clone()).await;
+        let m_id = insert_memory_row(
+            &store,
+            agent,
+            "collision_unique_tok content",
+            "chat_message",
+            3,
+            5.0,
+            "active",
+            serialize_embedding(&far),
+        )
+        .await;
+        assert_eq!(epi_id, m_id, "test setup: the two independent autoincrement sequences must actually collide");
+
+        bulk_insert_memory_rows(&store, agent, None, 20, serialize_embedding(&near)).await;
+
+        let scope = SearchScope {
+            memory: Some(20),
+            episodic: Some(5),
+            procedural: None,
+            project_id: None,
+            lexical: Some(20),
+        };
+        let (hits, _telemetry) = search_all_memories_inner(
+            &store,
+            &near,
+            Some("collision_unique_tok"),
+            agent,
+            scope,
+            30,
+            &ScoringConfig::DEFAULT,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            hits.iter().any(|h| h.id == m_id && h.kind == TableKind::Memory),
+            "M must survive dedup even though its numeric id collides with an unrelated episodic hit"
+        );
+    }
+
+    // The scenario the fail-soft contract exists for, exercised through the
+    // real wired call site rather than `lexical_candidates` alone: a missing
+    // `memory_fts` table must still leave `search_all_memories_inner`
+    // returning `Ok` with exactly the dense-only result.
+    #[tokio::test]
+    async fn search_all_memories_inner_fails_soft_when_memory_fts_is_missing() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let near = unit_basis_vec();
+        let agent = "agent-failsoft-wired";
+        bulk_insert_memory_rows(&store, agent, None, 10, serialize_embedding(&near)).await;
+
+        store.conn.call(|c| c.execute("DROP TABLE memory_fts", [])).await.unwrap();
+
+        let scope_on = SearchScope { lexical: Some(20), ..SearchScope::all_default() };
+        let (hits_on, _t_on) = search_all_memories_inner(
+            &store, &near, Some("bulk"), agent, scope_on, 30, &ScoringConfig::DEFAULT,
+        )
+        .await
+        .unwrap();
+
+        let scope_off = SearchScope { lexical: None, ..SearchScope::all_default() };
+        let (hits_off, _t_off) = search_all_memories_inner(
+            &store, &near, Some("bulk"), agent, scope_off, 30, &ScoringConfig::DEFAULT,
+        )
+        .await
+        .unwrap();
+
+        let ids_on: Vec<i64> = hits_on.iter().map(|h| h.id).collect();
+        let ids_off: Vec<i64> = hits_off.iter().map(|h| h.id).collect();
+        assert_eq!(
+            ids_on, ids_off,
+            "a missing memory_fts table must degrade to exactly the dense-only result, never Err"
+        );
+    }
+
+    // `lex_only` answers "how many rows did this channel add that the dense
+    // one had never seen", so the only fixture that can tell it apart from
+    // "how many candidates did this channel propose" is one where those two
+    // numbers DIFFER — a lexical candidate the dense arm had already found.
+    // Every other fixture in this module has the dense window either
+    // containing all the lexical candidates or none of them, and on those the
+    // pre-dedup and post-dedup counts are the same number, so the dedup step
+    // could be deleted from the attribution entirely and nothing would say so.
+    //
+    // Both rows carry the shared token, so the channel proposes 2. The dense
+    // window is deliberately one row wide and A is the only row near the query,
+    // so the dense arm finds A and misses B. 2 proposed, 1 new: the two
+    // readings of `lex_only` are 2 and 1 here, and only one of them is the
+    // number this telemetry claims to report.
+    #[tokio::test]
+    async fn lexical_only_counts_what_the_dense_channel_had_not_already_found() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let near = unit_basis_vec();
+        let far = far_vec(&near);
+        let agent = "agent-dedup-attribution";
+
+        let a_id = insert_memory_row(
+            &store, agent, "alpha carrying dedupattr_tok", "chat_message", 3, 5.0, "active",
+            serialize_embedding(&near),
+        )
+        .await;
+        let b_id = insert_memory_row(
+            &store, agent, "beta carrying dedupattr_tok", "chat_message", 3, 5.0, "active",
+            serialize_embedding(&far),
+        )
+        .await;
+
+        // Asserted, not assumed: if the token ever stopped matching both rows
+        // the test below would still pass while measuring nothing.
+        let proposed = lexical_candidates(&store, "dedupattr_tok", agent, None, 20).await;
+        assert_eq!(
+            proposed.len(),
+            2,
+            "the fixture only distinguishes the two counts while the channel proposes both rows"
+        );
+
+        let scope = SearchScope {
+            memory: Some(1),
+            episodic: None,
+            procedural: None,
+            project_id: None,
+            lexical: Some(20),
+        };
+        let (hits, telemetry) = search_all_memories_inner(
+            &store,
+            &near,
+            Some("dedupattr_tok"),
+            agent,
+            scope,
+            25,
+            &ScoringConfig::DEFAULT,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            hits.iter().any(|h| h.id == a_id) && hits.iter().any(|h| h.id == b_id),
+            "both rows must reach the caller — A densely, B lexically"
+        );
+        assert!(
+            telemetry.contains("lex_only=1"),
+            "the channel proposed 2 candidates but only B was new to the dense channel, so the \
+             attribution is 1; reporting 2 would credit this channel with a row it did not add: \
+             {telemetry}"
+        );
+    }
+
+    // The other half of the fail-soft contract, and the harder half: the
+    // candidate query failing is only the first way this channel can break.
+    // Once candidates exist, the SCORING query runs too, and it touches a
+    // different table — so a store where `memory_fts` is perfectly healthy and
+    // `memory_vectors` is not drives the channel all the way to hop 5 and then
+    // fails there. Every scope arm except the lexical one is off here on
+    // purpose: with the dense arms on, they would hit the same broken table
+    // first and this assertion would be about them instead.
+    //
+    // What must survive is the contract, not the result: a channel that exists
+    // to ADD candidates has nothing to offer a search it makes fail, so the
+    // worst it may ever do is contribute nothing.
+    #[tokio::test]
+    async fn search_all_memories_inner_fails_soft_when_the_scoring_query_cannot_run() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let near = unit_basis_vec();
+        let agent = "agent-failsoft-scoring";
+        insert_memory_row(
+            &store,
+            agent,
+            "row carrying scoringfailsoft_tok",
+            "chat_message",
+            3,
+            5.0,
+            "active",
+            serialize_embedding(&near),
+        )
+        .await;
+
+        // Dropped after the row is indexed, so `memory_fts` still promotes the
+        // candidate and the scoring query is genuinely reached.
+        store.conn.call(|c| c.execute("DROP TABLE memory_vectors", [])).await.unwrap();
+
+        let scope = SearchScope {
+            memory: None,
+            episodic: None,
+            procedural: None,
+            lexical: Some(20),
+            ..SearchScope::all_default()
+        };
+        let result = search_all_memories_inner(
+            &store,
+            &near,
+            Some("scoringfailsoft_tok"),
+            agent,
+            scope,
+            30,
+            &ScoringConfig::DEFAULT,
+        )
+        .await;
+
+        let (hits, _telemetry) = result.expect(
+            "a scoring query that cannot run means the lexical channel contributed nothing — \
+             never that the whole search failed",
+        );
+        assert!(hits.is_empty(), "nothing was scorable, so nothing may be returned");
+    }
+
+    // 20 near rows fill the dense window (scope.memory = 20) so M — whose
+    // vector is antipodal to the query — cannot survive on distance alone.
+    // Only the lexical channel, matching M's unique identifier token, can
+    // still surface it. The `lexical: None` control call proves the dense
+    // channel really does miss it on its own, isolating what this test
+    // claims to demonstrate.
+    #[tokio::test]
+    async fn search_all_memories_inner_lexical_channel_surfaces_identifier_dense_misses() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let near = unit_basis_vec();
+        let far = far_vec(&near);
+        let agent = "agent-identifier-promotion";
+
+        bulk_insert_memory_rows(&store, agent, None, 20, serialize_embedding(&near)).await;
+        let m_id = insert_memory_row(
+            &store,
+            agent,
+            "contains GPX-Store-7f3a as its unique identifier",
+            "chat_message",
+            3,
+            5.0,
+            "active",
+            serialize_embedding(&far),
+        )
+        .await;
+
+        let scope = SearchScope {
+            memory: Some(20),
+            episodic: None,
+            procedural: None,
+            project_id: None,
+            lexical: Some(20),
+        };
+
+        let (hits, telemetry) = search_all_memories_inner(
+            &store,
+            &near,
+            Some("GPX-Store-7f3a"),
+            agent,
+            scope.clone(),
+            25,
+            &ScoringConfig::DEFAULT,
+        )
+        .await
+        .unwrap();
+        assert!(
+            hits.iter().any(|h| h.id == m_id),
+            "the lexical channel must surface M even though it is semantically antipodal to the query"
+        );
+        assert!(
+            telemetry.contains("lex_only=1"),
+            "exactly one candidate (M) was promoted by the lexical channel and not seen by the dense one: {telemetry}"
+        );
+
+        let scope_off = SearchScope { lexical: None, ..scope };
+        let (hits_off, telemetry_off) = search_all_memories_inner(
+            &store,
+            &near,
+            Some("GPX-Store-7f3a"),
+            agent,
+            scope_off,
+            25,
+            &ScoringConfig::DEFAULT,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !hits_off.iter().any(|h| h.id == m_id),
+            "control: with the channel off, dense distance alone must not find M"
+        );
+        assert!(
+            telemetry_off.contains("lex_only=0"),
+            "the channel never ran, so it cannot have promoted anything: {telemetry_off}"
+        );
+    }
+
+    // Zero lexical overlap must be a strict no-op: the same ids, in the same
+    // order, with bit-exact scores, whether the channel is on or off. This is
+    // the assertion that matters once a lexical candidate can legitimately
+    // displace a dense hit — it proves the 4th arm never changes a result it
+    // has nothing new to contribute to.
+    #[tokio::test]
+    async fn search_all_memories_inner_no_lexical_overlap_is_byte_identical_to_channel_off() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let near = unit_basis_vec();
+        let agent = "agent-no-overlap";
+        bulk_insert_memory_rows(&store, agent, None, 10, serialize_embedding(&near)).await;
+
+        let scope_on = SearchScope::all_default();
+        let (hits_on, telemetry_on) = search_all_memories_inner(
+            &store,
+            &near,
+            Some("zzz_token_with_no_overlap_in_the_corpus"),
+            agent,
+            scope_on,
+            30,
+            &ScoringConfig::DEFAULT,
+        )
+        .await
+        .unwrap();
+        assert!(
+            telemetry_on.contains("lex_only=0"),
+            "the channel ran (it's on) but found nothing new: {telemetry_on}"
+        );
+
+        let scope_off = SearchScope { lexical: None, ..SearchScope::all_default() };
+        let (hits_off, _t_off) = search_all_memories_inner(
+            &store,
+            &near,
+            Some("zzz_token_with_no_overlap_in_the_corpus"),
+            agent,
+            scope_off,
+            30,
+            &ScoringConfig::DEFAULT,
+        )
+        .await
+        .unwrap();
+
+        let ids_on: Vec<i64> = hits_on.iter().map(|h| h.id).collect();
+        let ids_off: Vec<i64> = hits_off.iter().map(|h| h.id).collect();
+        assert_eq!(ids_on, ids_off, "same ids, same order, with or without the channel");
+        for (a, b) in hits_on.iter().zip(hits_off.iter()) {
+            assert_eq!(a.score, b.score, "scores must be bit-exact across both runs");
+        }
+    }
+
+    // `scope.lexical = None` must skip the channel entirely, not merely find
+    // nothing. Setup deliberately leaves a row (M) that the lexical channel
+    // WOULD surface if it ran at all — matching token, antipodal vector, same
+    // shape as the identifier-promotion fixture above — so a mutation that
+    // removes the `None`-skips branch is caught by the first assertion alone,
+    // regardless of what the table happens to contain.
+    #[tokio::test]
+    async fn search_all_memories_inner_lexical_none_skips_the_channel_entirely() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let near = unit_basis_vec();
+        let far = far_vec(&near);
+        let agent = "agent-kill-switch";
+
+        bulk_insert_memory_rows(&store, agent, None, 20, serialize_embedding(&near)).await;
+        let m_id = insert_memory_row(
+            &store,
+            agent,
+            "contains kill_switch_unique_token as its identifier",
+            "chat_message",
+            3,
+            5.0,
+            "active",
+            serialize_embedding(&far),
+        )
+        .await;
+
+        let scope = SearchScope {
+            memory: Some(20),
+            episodic: None,
+            procedural: None,
+            project_id: None,
+            lexical: None,
+        };
+
+        let (hits_present, _t1) = search_all_memories_inner(
+            &store,
+            &near,
+            Some("kill_switch_unique_token"),
+            agent,
+            scope.clone(),
+            25,
+            &ScoringConfig::DEFAULT,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !hits_present.iter().any(|h| h.id == m_id),
+            "lexical: None must not surface M even though memory_fts holds a matching row — \
+             the channel must be entirely skipped, not merely find nothing"
+        );
+
+        store.conn.call(|c| c.execute("DROP TABLE memory_fts", [])).await.unwrap();
+        let (hits_dropped, _t2) = search_all_memories_inner(
+            &store,
+            &near,
+            Some("kill_switch_unique_token"),
+            agent,
+            scope,
+            25,
+            &ScoringConfig::DEFAULT,
+        )
+        .await
+        .unwrap();
+
+        let ids_present: Vec<i64> = hits_present.iter().map(|h| h.id).collect();
+        let ids_dropped: Vec<i64> = hits_dropped.iter().map(|h| h.id).collect();
+        assert_eq!(
+            ids_present, ids_dropped,
+            "table-present + lexical:None must behave identically to table-dropped + lexical:None — \
+             proving the table is never touched when the channel is off"
+        );
+    }
+
+    #[tokio::test]
+    async fn soft_delete_removes_the_row_from_memory_fts() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let emb = unit_basis_embedding();
+        let agent = "agent-trigger-removal";
+        insert_memory_row(
+            &store, agent, "unique_trigger_removal_token content", "chat_message", 3, 5.0, "active", emb,
+        )
+        .await;
+
+        let ids_before = lexical_candidates(&store, "unique_trigger_removal_token", agent, None, 20).await;
+        assert_eq!(ids_before.len(), 1, "test setup: the row must be lexically reachable before deletion");
+        let id = ids_before[0];
+
+        crate::commands::memory_admin::delete_memory_core(
+            &store,
+            id,
+            crate::commands::memory_admin::MemoryKind::Memory,
+        )
+        .await
+        .unwrap();
+
+        let count: i64 = store
+            .conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM memory_fts WHERE memory_fts MATCH '\"unique_trigger_removal_token\"'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "the AFTER UPDATE OF deleted_at trigger must remove the row from memory_fts on soft delete"
+        );
+    }
+
+    // Soft delete, then hard delete the same row: the AFTER DELETE trigger's
+    // `WHEN old.deleted_at IS NULL` guard must keep the hard delete from
+    // subtracting postings that the soft-delete trigger already subtracted.
+    // Proven indirectly, through an unrelated survivor row: a corrupted
+    // external-content index would either error on the next MATCH statement
+    // (surfacing as a panicking `.unwrap()` below) or lose track of rows it
+    // still holds.
+    #[tokio::test]
+    async fn soft_then_hard_delete_does_not_double_subtract_from_memory_fts() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let emb = unit_basis_embedding();
+        let agent = "agent-trigger-balance";
+        let id = insert_memory_row(
+            &store, agent, "balance_token content", "chat_message", 3, 5.0, "active", emb.clone(),
+        )
+        .await;
+        let survivor = insert_memory_row(
+            &store, agent, "survivor_token content", "chat_message", 3, 5.0, "active", emb,
+        )
+        .await;
+
+        crate::commands::memory_admin::delete_memory_core(
+            &store,
+            id,
+            crate::commands::memory_admin::MemoryKind::Memory,
+        )
+        .await
+        .unwrap();
+        store
+            .conn
+            .call(move |c| c.execute("DELETE FROM memory WHERE id = ?1", params![id]))
+            .await
+            .unwrap();
+
+        let ids = lexical_candidates(&store, "survivor_token", agent, None, 20).await;
+        assert!(
+            ids.contains(&survivor),
+            "the index must remain intact for an unrelated row after a soft-then-hard delete sequence"
+        );
+    }
+
+    // The end-to-end pairing for the identifier-promotion fixture: the pure
+    // formatter, called directly with the same counts the wired call site
+    // computed, must render the identical substring the real telemetry line
+    // carries.
+    #[tokio::test]
+    async fn telemetry_lex_only_matches_format_channel_attribution_called_directly() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let near = unit_basis_vec();
+        let far = far_vec(&near);
+        let agent = "agent-attribution-parity";
+
+        bulk_insert_memory_rows(&store, agent, None, 20, serialize_embedding(&near)).await;
+        insert_memory_row(
+            &store,
+            agent,
+            "contains attribution_parity_token as its identifier",
+            "chat_message",
+            3,
+            5.0,
+            "active",
+            serialize_embedding(&far),
+        )
+        .await;
+
+        let scope = SearchScope {
+            memory: Some(20),
+            episodic: None,
+            procedural: None,
+            project_id: None,
+            lexical: Some(20),
+        };
+        let (_hits, telemetry) = search_all_memories_inner(
+            &store,
+            &near,
+            Some("attribution_parity_token"),
+            agent,
+            scope,
+            25,
+            &ScoringConfig::DEFAULT,
+        )
+        .await
+        .unwrap();
+
+        let expected = crate::commands::memory_admin::format_channel_attribution(20, 1);
+        assert!(
+            telemetry.contains(&expected),
+            "the wired telemetry line must contain exactly what the formatter renders for (dense=20, lex_only=1): {telemetry}"
+        );
     }
 }

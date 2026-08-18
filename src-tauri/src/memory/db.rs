@@ -682,7 +682,11 @@ mod tests {
             })
             .await
             .unwrap();
-        // 4 regular tables + 3 vec0 virtual + 1 view + 14 indices = 22 rows minimum
+        // A floor, not an exact count: vec0 and FTS5 each register their own shadow
+        // tables in sqlite_master alongside the ones this schema declares directly,
+        // and that shadow-table count is an extension implementation detail this
+        // test does not want to pin. No view is included — V7 dropped the one this
+        // schema used to carry, and nothing since has added one back.
         assert!(
             count >= 18,
             "Expected at least 18 schema objects, got {}",
@@ -826,7 +830,240 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 7, "Expected exactly 7 applied migrations, got {}", count);
+        assert_eq!(count, 8, "Expected exactly 8 applied migrations, got {}", count);
+    }
+
+    /// V8 — a fresh store lands on migration count 8 and carries the FTS5
+    /// lexical index alongside it, not one without the other.
+    #[tokio::test]
+    async fn v8_migration_creates_memory_fts_and_bumps_count_to_eight() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let count: i64 = store
+            .conn
+            .call(|c| -> Result<i64, rusqlite::Error> {
+                c.query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| r.get(0))
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 8, "V8 must be the 8th applied migration on a fresh store");
+
+        let fts_exists: i64 = store
+            .conn
+            .call(|c| -> Result<i64, rusqlite::Error> {
+                c.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name = 'memory_fts'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(fts_exists, 1, "V8 must create the memory_fts virtual table");
+    }
+
+    /// A store that stopped at V7 upgrades to V8 cleanly, and a second run of
+    /// the same migration set afterward is a no-op — refinery's own
+    /// idempotency, exercised against the new migration specifically rather
+    /// than assumed from the V6/V7 cases already covered above.
+    #[tokio::test]
+    async fn v7_store_upgrades_to_v8_and_a_second_run_is_a_noop() {
+        ensure_vec0_registered();
+        let conn = Connection::open_in_memory().await.unwrap();
+        register_udfs(&conn).await.unwrap();
+
+        conn.call(|c| {
+            crate::memory::migrations::runner()
+                .set_target(refinery::Target::Version(7))
+                .run(c)
+        })
+        .await
+        .unwrap();
+
+        let before: i64 = conn
+            .call(|c| c.query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(before, 7, "test setup: must actually stop at V7");
+
+        conn.call(|c| crate::memory::migrations::runner().run(c))
+            .await
+            .unwrap();
+        let after: i64 = conn
+            .call(|c| c.query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(after, 8, "V8 must apply on top of an existing V7 database");
+
+        // Re-run again: nothing left to apply, count must not move.
+        conn.call(|c| crate::memory::migrations::runner().run(c))
+            .await
+            .unwrap();
+        let after_second: i64 = conn
+            .call(|c| c.query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(after_second, 8, "a second run with nothing pending must be a no-op");
+    }
+
+    /// The migration's backfill is what makes a memory written before V8
+    /// existed lexically reachable — the three triggers only fire on writes
+    /// that happen after V8 creates them, so without the backfill this row
+    /// would be indexed nowhere.
+    #[tokio::test]
+    async fn v8_backfill_makes_a_pre_existing_row_lexically_searchable() {
+        ensure_vec0_registered();
+        let conn = Connection::open_in_memory().await.unwrap();
+        register_udfs(&conn).await.unwrap();
+
+        // Stop at V7: memory_fts does not exist yet, so this insert cannot be
+        // caught by any trigger — it is exactly the row the backfill exists for.
+        conn.call(|c| {
+            crate::memory::migrations::runner()
+                .set_target(refinery::Target::Version(7))
+                .run(c)
+        })
+        .await
+        .unwrap();
+
+        conn.call(|c| {
+            c.execute(
+                "INSERT INTO memory \
+                 (scope, agent_id, content, memory_type, source, \
+                  created_at, created_by_type, created_by_ref, \
+                  last_modified_at, last_accessed_at, importance, tier, status) \
+                 VALUES ('agent', 'agent-v8-backfill', 'pre-v8 content mentions ZQXJ77PREEXIST', \
+                  'chat_message', 'chat', 0, 'user', 'agent-v8-backfill', 0, 0, 5.0, 3, 'active')",
+                [],
+            )
+        })
+        .await
+        .unwrap();
+
+        // Now run V8 — the row above predates the FTS table and its triggers.
+        conn.call(|c| crate::memory::migrations::runner().run(c))
+            .await
+            .unwrap();
+
+        let found_rowid: Option<i64> = conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT rowid FROM memory_fts WHERE memory_fts MATCH '\"ZQXJ77PREEXIST\"'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+            })
+            .await
+            .unwrap();
+        assert!(
+            found_rowid.is_some(),
+            "the backfill must make a pre-V8 row reachable through the lexical index"
+        );
+    }
+
+    /// `agent_id`/`project_id`/`memory_type` on `memory_fts` are `UNINDEXED`:
+    /// they are filter inputs for the candidate query's scope predicates, not
+    /// search terms. If any of them were indexed instead, the literal text of
+    /// a project id would become matchable by an unrelated query, and a row
+    /// could surface for a search that never mentioned its content at all.
+    #[tokio::test]
+    async fn v8_scope_columns_do_not_contribute_searchable_tokens() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+
+        // Content carries no special token; only `project_id` does. An
+        // indexed `project_id` would make this row match a MATCH query for
+        // its own value even though the content never mentions it.
+        store
+            .conn
+            .call(|c| {
+                c.execute(
+                    "INSERT INTO memory \
+                     (scope, agent_id, project_id, content, memory_type, source, \
+                      created_at, created_by_type, created_by_ref, \
+                      last_modified_at, last_accessed_at, importance, tier, status) \
+                     VALUES ('agent', 'agent-v8-unindexed', 'PROJIDQXJ99UNIQUE', \
+                      'ordinary content, no special markers here', 'chat_message', 'chat', \
+                      0, 'user', 'agent-v8-unindexed', 0, 0, 5.0, 3, 'active')",
+                    [],
+                )
+            })
+            .await
+            .unwrap();
+
+        let found_rowid: Option<i64> = store
+            .conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT rowid FROM memory_fts WHERE memory_fts MATCH '\"PROJIDQXJ99UNIQUE\"'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+            })
+            .await
+            .unwrap();
+        assert!(
+            found_rowid.is_none(),
+            "a query for a project id's literal text must not match a row whose content \
+             never mentions it — UNINDEXED columns must not contribute searchable tokens"
+        );
+    }
+
+    /// The backfill is filtered to live rows (`WHERE deleted_at IS NULL`) —
+    /// the same invariant the three triggers maintain on every write after
+    /// V8. A row already soft-deleted before V8 ever ran must not become
+    /// lexically reachable, or the migration's index and the triggers'
+    /// index would disagree about what "live" means from the moment V8 applies.
+    #[tokio::test]
+    async fn v8_backfill_excludes_rows_already_soft_deleted_before_migration() {
+        ensure_vec0_registered();
+        let conn = Connection::open_in_memory().await.unwrap();
+        register_udfs(&conn).await.unwrap();
+
+        // Stop at V7: memory_fts does not exist yet.
+        conn.call(|c| {
+            crate::memory::migrations::runner()
+                .set_target(refinery::Target::Version(7))
+                .run(c)
+        })
+        .await
+        .unwrap();
+
+        // Insert a row that is ALREADY soft-deleted, predating V8 entirely —
+        // the backfill is the only mechanism that could ever index it.
+        conn.call(|c| {
+            c.execute(
+                "INSERT INTO memory \
+                 (scope, agent_id, content, memory_type, source, \
+                  created_at, created_by_type, created_by_ref, \
+                  last_modified_at, last_accessed_at, importance, tier, status, deleted_at) \
+                 VALUES ('agent', 'agent-v8-softdel', 'pre-v8 deleted content mentions ZQXJ88DELETED', \
+                  'chat_message', 'chat', 0, 'user', 'agent-v8-softdel', 0, 0, 5.0, 3, 'active', 12345)",
+                [],
+            )
+        })
+        .await
+        .unwrap();
+
+        conn.call(|c| crate::memory::migrations::runner().run(c))
+            .await
+            .unwrap();
+
+        let found_rowid: Option<i64> = conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT rowid FROM memory_fts WHERE memory_fts MATCH '\"ZQXJ88DELETED\"'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+            })
+            .await
+            .unwrap();
+        assert!(
+            found_rowid.is_none(),
+            "the backfill must not index a row that was already soft-deleted before V8 ran"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1048,7 +1285,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 7);
+        assert_eq!(migration_count, 8);
     }
 
     // -----------------------------------------------------------------------

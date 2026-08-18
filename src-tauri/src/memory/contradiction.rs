@@ -85,6 +85,36 @@ const _: () = assert!(NEAR_DUPLICATE_FLOOR < CONTRADICTION_THRESHOLD);
 /// returns `[]` without building a `SearchScope` at all, saving a search for
 /// every ingest that cannot possibly assert a claim (the overwhelming
 /// majority — every chat role maps to `ChatMessage`).
+// Only the memory pool is requested; k=5 is a candidate budget, not a result
+// count — the threshold in `detect_contradiction` decides what actually
+// disputes.
+//
+// `lexical: None`, deliberately: this detector's distance band is what
+// decides whether a candidate is a near-duplicate, and a lexically promoted
+// candidate can share vocabulary with the query while sitting nowhere near
+// it in embedding space — exactly the pair this detector must not treat as
+// a knowledge contradiction. Widening this pool with a channel that finds
+// text matches, not distance matches, would feed the threshold below rows
+// it was never calibrated against.
+//
+// Extracted from `detect_contradiction` so `lexical: None` is a directly
+// assertable value rather than a field inside a function-local literal:
+// `query_text: None` at this function's only call site already blocks the
+// lexical arm regardless of this field (`search_all_memories_inner` fires
+// lexical only when BOTH `scope.lexical` and `query_text` are `Some`), so a
+// black-box test of `detect_contradiction`'s output cannot distinguish this
+// field's value from its opposite. A direct assertion on the returned
+// struct is the only way to pin it.
+fn contradiction_search_scope(project_id: Option<&str>) -> SearchScope {
+    SearchScope {
+        memory: Some(5),
+        episodic: None,
+        procedural: None,
+        project_id: project_id.map(str::to_owned),
+        lexical: None,
+    }
+}
+
 pub(crate) async fn detect_contradiction(
     store: &MemoryStore,
     embedding: &[f32],
@@ -96,15 +126,8 @@ pub(crate) async fn detect_contradiction(
         return Vec::new();
     }
 
-    // Only the memory pool is requested (see above); k=5 is a candidate budget,
-    // not a result count — the threshold below decides what actually disputes.
-    let scope = SearchScope {
-        memory: Some(5),
-        episodic: None,
-        procedural: None,
-        project_id: project_id.map(str::to_owned),
-    };
-    match search_all_memories(store, embedding, agent_id, scope, 5).await {
+    let scope = contradiction_search_scope(project_id);
+    match search_all_memories(store, embedding, None, agent_id, scope, 5).await {
         // Two similar chat messages are not a knowledge contradiction. Only
         // types that assert something can contradict something, so the
         // detector is gated to those and skips the KNN entirely for the rest.
@@ -369,6 +392,25 @@ mod tests {
         assert_eq!(
             fp, 0,
             "no non-contradicting fixture should be flagged; got fp={fp}"
+        );
+    }
+
+    // ── Pinned field: contradiction_search_scope.lexical ────────────────────
+
+    /// `contradiction_search_scope`'s `lexical: None` cannot be pinned through
+    /// `detect_contradiction`'s output: its call site also passes
+    /// `query_text: None`, and `search_all_memories_inner` only spends the
+    /// lexical channel when BOTH are `Some` — so flipping this field alone,
+    /// with `query_text` left as `None`, changes no observable behavior at
+    /// all. This test asserts the constructed value directly, the only way
+    /// to catch that mutation.
+    #[test]
+    fn contradiction_search_scope_disables_the_lexical_channel() {
+        let scope = contradiction_search_scope(None);
+        assert_eq!(
+            scope.lexical, None,
+            "the near-duplicate detector's distance band must never be fed lexically \
+             promoted candidates — see the doc comment on contradiction_search_scope"
         );
     }
 

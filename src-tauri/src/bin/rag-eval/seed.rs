@@ -48,9 +48,22 @@ pub struct SeedResult {
 /// embedding or insert error aborts the whole pass rather than returning a
 /// partially-seeded store that would make every case scored against it
 /// silently wrong.
-pub async fn seed(corpus: &[CorpusRow], embedder: &EvalEmbedder) -> Result<SeedResult, EvalError> {
+///
+/// `fts_tokenizer`, when given, swaps `memory_fts`'s tokenizer via
+/// `EvalStore::recreate_fts_with_tokenizer` immediately after opening and
+/// before any row is inserted — so every row lands through the AFTER INSERT
+/// trigger under the requested tokenizer, with no separate backfill step.
+/// `None` leaves the store on the tokenizer the V8 migration already applied.
+pub async fn seed(
+    corpus: &[CorpusRow],
+    embedder: &EvalEmbedder,
+    fts_tokenizer: Option<&str>,
+) -> Result<SeedResult, EvalError> {
     let store_path = unique_store_path();
     let store = EvalStore::open(&store_path).await?;
+    if let Some(tokenizer) = fts_tokenizer {
+        store.recreate_fts_with_tokenizer(tokenizer).await?;
+    }
     let mut refs = RefMap::new();
     let mut norms: Vec<f64> = Vec::with_capacity(corpus.len());
     let mut vectors: Vec<(String, Vec<f32>)> = Vec::with_capacity(corpus.len());
@@ -132,7 +145,7 @@ mod tests {
 
         // seed() opens its own temp store; nothing to pass in but the corpus
         // and the embedder.
-        let result = seed(&corpus, &embedder).await.expect("seeding must succeed");
+        let result = seed(&corpus, &embedder, None).await.expect("seeding must succeed");
 
         let id1 = result.refs.id_of("c1").expect("c1 must be mapped");
         let id2 = result.refs.id_of("c2").expect("c2 must be mapped");
@@ -152,7 +165,7 @@ mod tests {
         let corpus = vec![row("c1", "some content", "chat_message", 3.0)];
         let embedder = EvalEmbedder::fake();
 
-        let result = seed(&corpus, &embedder).await.expect("seeding must succeed");
+        let result = seed(&corpus, &embedder, None).await.expect("seeding must succeed");
 
         // FakeEmbedder is documented (embedder.rs) as unnormalized with
         // ‖v‖ ≈ 11.3 — far from 1.0. Asserting a wide, generous band rather
@@ -174,7 +187,7 @@ mod tests {
         ];
         let embedder = EvalEmbedder::fake();
 
-        let result = seed(&corpus, &embedder).await.expect("seeding must succeed");
+        let result = seed(&corpus, &embedder, None).await.expect("seeding must succeed");
 
         assert_eq!(result.vectors.len(), corpus.len());
         for (_ref_, vector) in &result.vectors {
@@ -187,8 +200,8 @@ mod tests {
     #[tokio::test]
     async fn seed_uses_a_fresh_store_path_on_every_call() {
         let embedder = EvalEmbedder::fake();
-        let a = seed(&[], &embedder).await.expect("seeding an empty corpus must still open a store");
-        let b = seed(&[], &embedder).await.expect("seeding an empty corpus must still open a store");
+        let a = seed(&[], &embedder, None).await.expect("seeding an empty corpus must still open a store");
+        let b = seed(&[], &embedder, None).await.expect("seeding an empty corpus must still open a store");
         assert_ne!(a.store_path, b.store_path, "each run must get its own temp store");
         std::fs::remove_dir_all(&a.store_path).ok();
         std::fs::remove_dir_all(&b.store_path).ok();
@@ -208,10 +221,45 @@ mod tests {
         // opaque `EvalStore` handle deliberately, so `expect_err` (which
         // requires the whole `Result` to be `Debug`) is not usable here.
         // Matching directly on the outcome avoids that requirement.
-        match seed(&corpus, &embedder).await {
+        match seed(&corpus, &embedder, None).await {
             Err(EvalError::UnknownMemoryType(_)) => {}
             Err(other) => panic!("expected UnknownMemoryType, got {other}"),
             Ok(_) => panic!("unknown memory_type must fail the whole seed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn seed_with_a_tokenizer_swaps_it_before_any_row_lands() {
+        // Wiring-level smoke test: seeding under a non-default tokenizer must
+        // still succeed and map every row normally. The deeper claim — that a
+        // row inserted after the swap is immediately lexically findable with
+        // no separate backfill — is asserted at the DB level in
+        // `eval_api.rs`'s `recreate_fts_with_tokenizer_indexes_rows_inserted_
+        // after_the_swap`, where `EvalStore`'s inner connection is reachable;
+        // `EvalStore` is opaque from this module, so that assertion cannot be
+        // repeated here.
+        let corpus = vec![
+            row("c1", "trigram needle content", "chat_message", 3.0),
+            row("c2", "second row content", "chat_message", 3.0),
+        ];
+        let embedder = EvalEmbedder::fake();
+
+        let result = seed(&corpus, &embedder, Some("trigram")).await.expect("seeding must succeed");
+        assert!(result.refs.id_of("c1").is_some());
+        assert!(result.refs.id_of("c2").is_some());
+
+        std::fs::remove_dir_all(&result.store_path).ok();
+    }
+
+    #[tokio::test]
+    async fn seed_rejects_an_unlisted_tokenizer_before_seeding_anything() {
+        let corpus = vec![row("c1", "content", "chat_message", 3.0)];
+        let embedder = EvalEmbedder::fake();
+
+        match seed(&corpus, &embedder, Some("porter")).await {
+            Err(EvalError::UnknownTokenizer(t)) => assert_eq!(t, "porter"),
+            Err(other) => panic!("expected UnknownTokenizer, got {other}"),
+            Ok(_) => panic!("an unlisted tokenizer must fail before any row is inserted"),
         }
     }
 }

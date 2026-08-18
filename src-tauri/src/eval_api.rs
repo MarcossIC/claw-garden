@@ -39,6 +39,24 @@ use crate::memory::TableKind;
 /// method below — the wrapped store itself is never reachable.
 pub struct EvalStore(MemoryStore);
 
+/// The lexical-channel candidate budget the shipped application searches
+/// with, read off the production default itself rather than restated.
+///
+/// `rag-eval` exists to measure the retrieval configuration users actually
+/// run. A second, independently-edited copy of this number would let the two
+/// drift apart silently, and every committed measurement would then describe
+/// a configuration nobody ships — the failure mode is invisible precisely
+/// because both numbers look deliberate.
+pub fn production_lexical_budget() -> Option<usize> {
+    SearchScope::all_default().lexical
+}
+
+/// The tokenizer `memory_fts` carries when nothing swaps it — the value the
+/// migration itself writes. Named here so a run that never passed
+/// `--fts-tokenizer` can still record which tokenizer produced its numbers,
+/// instead of recording the absence of a flag.
+pub const MIGRATION_FTS_TOKENIZER: &str = "unicode61 remove_diacritics 2";
+
 /// Per-table result-pool sizes for a search call — this module's own copy of
 /// the store's scope shape, so a change to the internal one cannot silently
 /// change what this tool asks for.
@@ -47,6 +65,12 @@ pub struct EvalScope {
     pub memory: Option<usize>,
     pub episodic: Option<usize>,
     pub procedural: Option<usize>,
+    /// Candidate budget for the lexical (FTS5) channel — `None` keeps the
+    /// channel off, same meaning as `SearchScope::lexical`. This module's own
+    /// copy so a change to the internal field cannot silently change what
+    /// this tool asks for, the same "mirror only what's used" discipline
+    /// every other field on this struct already follows.
+    pub lexical: Option<usize>,
 }
 
 impl EvalScope {
@@ -59,6 +83,7 @@ impl EvalScope {
             // unscoped pool, so this keeps every query bit-identical to
             // retrieval before project scoping existed.
             project_id: None,
+            lexical: self.lexical,
         }
     }
 }
@@ -180,7 +205,26 @@ pub enum EvalError {
     Embed(String),
     #[error("model load failed: {0}")]
     ModelLoad(String),
+    #[error("unrecognized FTS5 tokenizer '{0}'; allowed: 'unicode61 remove_diacritics 2', 'trigram'")]
+    UnknownTokenizer(String),
+    #[error("failed to recreate memory_fts: {0}")]
+    RecreateFts(String),
 }
+
+/// Tokenizer strings [`EvalStore::recreate_fts_with_tokenizer`] accepts — an
+/// allowlist, never interpolation of caller text into DDL. This is also what
+/// keeps the `sqlite_master` byte-diff guard test finite: every tokenizer
+/// this binary can ever request is enumerated here, not typed at a call site.
+const ALLOWED_FTS_TOKENIZERS: &[&str] = &[MIGRATION_FTS_TOKENIZER, "trigram"];
+
+/// The `memory_fts` virtual table's CREATE statement, character-for-character
+/// identical to `migrations/V8__memory_fts.sql`'s own CREATE VIRTUAL TABLE
+/// statement except for the `tokenize=` value. That exactness is not
+/// cosmetic: SQLite stores a virtual table's `sqlite_master.sql` verbatim as
+/// submitted, so this is what makes the guard test's byte-diff meaningful —
+/// any other formatting divergence here would show up as a spurious
+/// difference that has nothing to do with the tokenizer.
+const FTS_CREATE_SQL_TEMPLATE: &str = "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(\n    content,\n    agent_id UNINDEXED,\n    project_id UNINDEXED,\n    memory_type UNINDEXED,\n    content='memory',\n    content_rowid='id',\n    tokenize='__TOKENIZER__'\n)";
 
 impl EvalStore {
     /// Opens (creating if absent) a store rooted at `base_dir`, migrations
@@ -230,7 +274,9 @@ impl EvalStore {
     }
 
     /// KNN search across all three tables, translated into this module's own
-    /// hit shape.
+    /// hit shape. `query_text` is the lexical half of the question — fed
+    /// through untouched to `search_all_memories_with_scoring`, mirroring
+    /// production's own `embedding`/`query_text` pairing (`search.rs`).
     pub async fn search(
         &self,
         embedding: &[f32],
@@ -238,10 +284,12 @@ impl EvalStore {
         scope: EvalScope,
         k_final: usize,
         scoring: EvalScoringConfig,
+        query_text: Option<&str>,
     ) -> Result<Vec<EvalHit>, EvalError> {
         let hits = search_all_memories_with_scoring(
             &self.0,
             embedding,
+            query_text,
             agent_id,
             scope.into_search_scope(),
             k_final,
@@ -260,6 +308,50 @@ impl EvalStore {
                 distance: h.distance,
             })
             .collect())
+    }
+
+    /// Drops and recreates `memory_fts` with a different tokenizer. Eval-only
+    /// — no production call site ever needs to swap a live index's
+    /// tokenizer, which is why this lives beside `search`/`insert` rather
+    /// than on `MemoryStore` itself.
+    ///
+    /// Issues no backfill statement. This is called from `seed()`, before
+    /// the insert loop, so the `AFTER INSERT` trigger — which survives the
+    /// `DROP TABLE`, since it names `memory_fts` but lives on `memory` —
+    /// indexes every row as it lands. Duplicating the migration's backfill
+    /// `INSERT..SELECT` here would be a second copy of it to keep in sync.
+    pub async fn recreate_fts_with_tokenizer(&self, tokenizer: &str) -> Result<(), EvalError> {
+        if !ALLOWED_FTS_TOKENIZERS.contains(&tokenizer) {
+            return Err(EvalError::UnknownTokenizer(tokenizer.to_string()));
+        }
+        let create_sql = FTS_CREATE_SQL_TEMPLATE.replace("__TOKENIZER__", tokenizer);
+        self.0
+            .conn
+            .call(move |c| -> rusqlite::Result<()> {
+                c.execute("DROP TABLE memory_fts", [])?;
+                c.execute(&create_sql, [])?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| EvalError::RecreateFts(e.to_string()))
+    }
+
+    /// The exact `sqlite_master.sql` text for `memory_fts` — used only by the
+    /// tokenizer-swap guard test to compare a migrated table's stored CREATE
+    /// statement against a rebuilt one, byte for byte.
+    #[cfg(test)]
+    async fn fts_schema_sql(&self) -> String {
+        self.0
+            .conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT sql FROM sqlite_master WHERE name = 'memory_fts'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+            })
+            .await
+            .expect("memory_fts must exist in sqlite_master")
     }
 }
 
@@ -383,6 +475,174 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn into_search_scope_maps_lexical_through_unchanged() {
+        // Guards the last border crossing before `SearchScope`: a mapping
+        // hardcoded to `None` here would switch the lexical channel off for
+        // every eval run while the whole sweep plumbing upstream kept
+        // carrying its value correctly. Nothing else in the eval binary
+        // observes `SearchScope.lexical` directly, so this is the only place
+        // that can catch it.
+        let on = EvalScope { memory: Some(30), episodic: Some(5), procedural: Some(5), lexical: Some(20) };
+        assert_eq!(on.into_search_scope().lexical, Some(20));
+
+        let off = EvalScope { memory: Some(30), episodic: Some(5), procedural: Some(5), lexical: None };
+        assert_eq!(off.into_search_scope().lexical, None);
+    }
+
+    /// `EvalScope.lexical` reaching `SearchScope` is only half of what the
+    /// eval instrument needs: the channel also has to be handed the query
+    /// TEXT, which travels as a separate argument. Dropping that argument on
+    /// the floor here leaves every scope-mapping assertion above green while
+    /// making `--sweep-lexical 0` and `--sweep-lexical 20` produce identical
+    /// numbers — a measuring instrument that reports the same reading for
+    /// both settings of the thing it measures.
+    ///
+    /// The fixture makes the lexical channel the ONLY way M can be returned:
+    /// 30 rows sit exactly on the query vector and fill the memory pool, so M
+    /// (cosine 0.995) is rank 31 and never enters the dense pool; M then wins
+    /// its way into the top 10 on importance, which the 30 fillers give up.
+    #[tokio::test]
+    async fn search_feeds_query_text_to_the_lexical_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EvalStore::open(dir.path()).await.expect("open must succeed");
+        let agent = "agent-query-text-wiring";
+
+        let mut on_axis = vec![0.0_f32; 384];
+        on_axis[0] = 1.0;
+        // cosine 0.995 to the query: outside the pool the 30 exact matches
+        // fill, but well above `cosine_floor` (0.8793), so the similarity term
+        // survives the rescale with room to be outweighed by importance.
+        let mut off_axis = vec![0.0_f32; 384];
+        off_axis[0] = 0.995;
+        off_axis[1] = (1.0_f32 - 0.995 * 0.995).sqrt();
+
+        for i in 0..30 {
+            store
+                .insert(agent, &format!("filler row {i}"), "chat_message", 1.0, on_axis.clone())
+                .await
+                .unwrap();
+        }
+        let m_id = store
+            .insert(
+                agent,
+                "the rollout checklist lives under ZQXIDENT42",
+                "chat_message",
+                10.0,
+                off_axis,
+            )
+            .await
+            .unwrap();
+
+        let scope = EvalScope {
+            memory: Some(30),
+            episodic: None,
+            procedural: None,
+            lexical: Some(20),
+        };
+        let scoring = EvalScoringConfig::default();
+
+        let with_text = store
+            .search(&on_axis, agent, scope, 10, scoring, Some("ZQXIDENT42"))
+            .await
+            .unwrap();
+        assert!(
+            with_text.iter().any(|h| h.id == m_id),
+            "M is reachable only through the lexical channel, so its absence means the query \
+             text never reached it: {:?}",
+            with_text.iter().map(|h| h.id).collect::<Vec<_>>()
+        );
+
+        let without_text = store.search(&on_axis, agent, scope, 10, scoring, None).await.unwrap();
+        assert!(
+            !without_text.iter().any(|h| h.id == m_id),
+            "the control must miss M — otherwise the assertion above proves nothing about the \
+             lexical channel"
+        );
+    }
+
+    // --- recreate_fts_with_tokenizer / tokenizer-diff guard -----------------
+
+    #[tokio::test]
+    async fn recreate_fts_with_tokenizer_same_tokenizer_matches_the_migrated_schema_byte_for_byte() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let store_a = EvalStore::open(dir_a.path()).await.expect("open must succeed");
+        let migrated_sql = store_a.fts_schema_sql().await;
+
+        let dir_b = tempfile::tempdir().unwrap();
+        let store_b = EvalStore::open(dir_b.path()).await.expect("open must succeed");
+        store_b
+            .recreate_fts_with_tokenizer("unicode61 remove_diacritics 2")
+            .await
+            .expect("recreate with the migration's own tokenizer must succeed");
+        let rebuilt_same_sql = store_b.fts_schema_sql().await;
+
+        assert_eq!(
+            migrated_sql, rebuilt_same_sql,
+            "rebuilding with the exact tokenizer the migration used must produce byte-identical DDL"
+        );
+    }
+
+    #[tokio::test]
+    async fn recreate_fts_with_tokenizer_trigram_differs_only_in_the_tokenize_clause() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let store_a = EvalStore::open(dir_a.path()).await.expect("open must succeed");
+        let migrated_sql = store_a.fts_schema_sql().await;
+
+        let dir_c = tempfile::tempdir().unwrap();
+        let store_c = EvalStore::open(dir_c.path()).await.expect("open must succeed");
+        store_c.recreate_fts_with_tokenizer("trigram").await.expect("recreate with trigram must succeed");
+        let rebuilt_trigram_sql = store_c.fts_schema_sql().await;
+
+        assert_eq!(
+            migrated_sql.replace("unicode61 remove_diacritics 2", "trigram"),
+            rebuilt_trigram_sql,
+            "a direct substring substitution of the tokenizer clause must reproduce the rebuilt DDL exactly — \
+             any other divergence means the rebuild's formatting drifted from the migration's"
+        );
+    }
+
+    #[tokio::test]
+    async fn recreate_fts_with_tokenizer_rejects_an_unlisted_tokenizer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EvalStore::open(dir.path()).await.expect("open must succeed");
+        match store.recreate_fts_with_tokenizer("porter").await {
+            Err(EvalError::UnknownTokenizer(t)) => assert_eq!(t, "porter"),
+            other => panic!("expected UnknownTokenizer, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn recreate_fts_with_tokenizer_indexes_rows_inserted_after_the_swap() {
+        // Confirms the "no backfill needed" design claim: the AFTER INSERT
+        // trigger must survive the DROP TABLE, so a row inserted after the
+        // swap is still lexically findable with no extra step.
+        let dir = tempfile::tempdir().unwrap();
+        let store = EvalStore::open(dir.path()).await.expect("open must succeed");
+        store.recreate_fts_with_tokenizer("trigram").await.expect("recreate must succeed");
+
+        let mut embedding = vec![0.0; 384];
+        embedding[0] = 1.0;
+        let id = store
+            .insert("agent-1", "unique_token_after_tokenizer_swap", "chat_message", 3.0, embedding)
+            .await
+            .expect("insert must succeed");
+
+        let found: i64 = store
+            .0
+            .conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT rowid FROM memory_fts WHERE memory_fts MATCH 'uni' LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .expect("trigram tokenizer must find a 3-char substring of the inserted content");
+        assert_eq!(found, id);
+    }
 
     #[test]
     fn eval_scoring_config_default_matches_scoring_config_default_field_for_field() {

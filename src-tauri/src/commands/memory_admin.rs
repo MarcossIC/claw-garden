@@ -115,6 +115,16 @@ pub(crate) fn format_pool_survival(
     }
 }
 
+/// Renders how many memory-kind hits came from the dense (KNN) channel
+/// versus how many the lexical (FTS5) channel found that the dense channel
+/// missed. `lexical_only` is exact — the size of the post-dedup leftover set
+/// — so it proves the lexical channel FIRED, never that what it found
+/// survived the final `k_final` truncation; only a measured eval delta can
+/// show that.
+pub(crate) fn format_channel_attribution(dense: usize, lexical_only: usize) -> String {
+    format!("chan=(dense={dense},lex_only={lexical_only})")
+}
+
 // ---------------------------------------------------------------------------
 // set_importance — one UPDATE per table, with the tier recomputed inside the
 // same statement rather than read-modify-written from Rust: importance and
@@ -921,6 +931,18 @@ mod tests {
         );
     }
 
+    // ── format_channel_attribution ──────────────────────────────────────────
+
+    #[test]
+    fn format_channel_attribution_renders_dense_and_lexical_only_counts() {
+        assert_eq!(format_channel_attribution(3, 2), "chan=(dense=3,lex_only=2)");
+    }
+
+    #[test]
+    fn format_channel_attribution_renders_zero_lexical_only() {
+        assert_eq!(format_channel_attribution(30, 0), "chan=(dense=30,lex_only=0)");
+    }
+
     // ── set_importance_core ──────────────────────────────────────────────────
     //
     // Seed helpers mirror `memory/maintenance.rs`'s `seed_row` pattern: a
@@ -1266,7 +1288,7 @@ mod tests {
                 .unwrap()
         };
 
-        let before = search_all_memories(&store, &emb, agent, SearchScope::all_default(), 10)
+        let before = search_all_memories(&store, &emb, None, agent, SearchScope::all_default(), 10)
             .await
             .unwrap();
         assert!(before.iter().any(|h| h.id == id), "row must be findable before delete");
@@ -1275,7 +1297,7 @@ mod tests {
             .await
             .unwrap();
 
-        let after = search_all_memories(&store, &emb, agent, SearchScope::all_default(), 10)
+        let after = search_all_memories(&store, &emb, None, agent, SearchScope::all_default(), 10)
             .await
             .unwrap();
         assert!(

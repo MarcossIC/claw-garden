@@ -1346,7 +1346,7 @@ mod tests {
 
         let q_vec = embedder.embed_with_role(&fresh.content, EmbedRole::Query).await.unwrap();
         let hits = search_all_memories(
-            &store, &q_vec, AGENT, SearchScope::all_default(), 10,
+            &store, &q_vec, None, AGENT, SearchScope::all_default(), 10,
         )
         .await
         .unwrap();

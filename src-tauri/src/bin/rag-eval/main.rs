@@ -10,7 +10,10 @@ mod similarity;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
-use agent_office_lib::eval_api::{model_is_cached, EmbedRole, EvalEmbedder, EvalScope, EvalScoringConfig};
+use agent_office_lib::eval_api::{
+    model_is_cached, production_lexical_budget, EmbedRole, EvalEmbedder, EvalScope,
+    EvalScoringConfig, MIGRATION_FTS_TOKENIZER,
+};
 
 use golden::{CaseStatus, PairLabel};
 
@@ -18,7 +21,16 @@ use golden::{CaseStatus, PairLabel};
 /// pool because every golden-set corpus row seeds into the memory table;
 /// `episodic`/`procedural` stay narrow since this harness never seeds either
 /// of those tables, so a wider pool there would only cost time.
-const K_POOL: EvalScope = EvalScope { memory: Some(30), episodic: Some(5), procedural: Some(5) };
+///
+/// `lexical` matches the shipped application's own default, and
+/// `k_pool_mirrors_the_production_lexical_budget` is what keeps it matching.
+/// A harness whose baseline runs a channel configuration production does not
+/// run measures a system nobody uses: every committed number would describe a
+/// retrieval path no user's query ever takes, and a comparison against those
+/// numbers would be a comparison against fiction. Turning the channel off for
+/// a run is what `--sweep-lexical 0` is for — it is a question the operator
+/// asks, not the default state of the instrument.
+const K_POOL: EvalScope = EvalScope { memory: Some(30), episodic: Some(5), procedural: Some(5), lexical: Some(20) };
 
 /// Cutoff production truncates search results to. Recall@10/nDCG@10 are
 /// defined against exactly this cutoff — raising it here would silently
@@ -131,7 +143,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
         },
     };
 
-    let seeded = match seed::seed(&golden_set.corpus, &embedder).await {
+    let seeded = match seed::seed(&golden_set.corpus, &embedder, cli.fts_tokenizer.as_deref()).await {
         Ok(s) => s,
         Err(e) => {
             eprintln!("seeding failed: {e}");
@@ -276,29 +288,61 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
         loaded_golden.content_sha256.clone(),
     );
 
-    // Zero sweep flags on both axes degenerates `build_grid` to exactly one
-    // point built from `EvalScoringConfig::default()` — never
-    // `with_importance_span`/`with_cosine_floor` — so this is the regression
-    // guard on the sweep plumbing itself: a plain run reproduces today's
-    // numbers bit-for-bit, not merely "close enough".
-    let grid = build_grid(&cli.sweep_imp, &cli.sweep_cos_floor);
-    let is_sweep = !cli.sweep_imp.is_empty() || !cli.sweep_cos_floor.is_empty();
+    // Zero sweep flags on all three axes degenerates `build_grid` to exactly
+    // one point: `EvalScoringConfig::default()` — never
+    // `with_importance_span`/`with_cosine_floor` — with `K_POOL`'s own lexical
+    // budget left untouched. That is the regression guard on the sweep
+    // plumbing itself: a flagless run measures the shipped configuration, not
+    // one the flag parser invented along the way.
+    //
+    // It is deliberately NOT the claim that a flagless run reproduces the
+    // numbers from before the lexical channel existed. `K_POOL.lexical` is
+    // `Some(20)`, matching the application's own default, so a flagless run
+    // exercises that channel exactly as production does — which is the only
+    // way committed numbers can describe what users actually get. Reproducing
+    // the pre-channel numbers is what `--sweep-lexical 0` is for, and every
+    // results file records the `k_pool.lexical` that produced it, so the two
+    // are never confusable after the fact.
+    let grid = build_grid(&cli.sweep_imp, &cli.sweep_cos_floor, &cli.sweep_lexical);
+    let is_sweep =
+        !cli.sweep_imp.is_empty() || !cli.sweep_cos_floor.is_empty() || !cli.sweep_lexical.is_empty();
+
+    // The tokenizer is a property of the whole run, not of a grid point:
+    // `memory_fts` is rebuilt once during seeding and every point then
+    // searches the same index. So it is folded into the tag ONCE, ahead of
+    // the per-point slug, which is what keeps two runs differing only by
+    // `--fts-tokenizer` from writing to the same filename — a collision that
+    // `write_json` reports as "results file already exists" and that `--force`
+    // would turn into one run silently overwriting the other's numbers.
+    let run_tag = fold_tag(cli.tag.as_deref(), tokenizer_slug(cli.fts_tokenizer.as_deref()).as_deref());
+    // Recorded as the tokenizer actually in effect, never as "the flag was
+    // absent": a results file exists to answer what produced its numbers, and
+    // the absence of a flag is a fact about a command line, not about an index.
+    let fts_tokenizer =
+        cli.fts_tokenizer.clone().unwrap_or_else(|| MIGRATION_FTS_TOKENIZER.to_string());
 
     let mut sweep_points: Vec<report::SweepPoint> = Vec::new();
     let mut any_unusable = false;
 
     for point in &grid {
+        // Resolved once per point rather than per case, since it does not
+        // vary across `embedded_cases`.
+        let scope = EvalScope { lexical: resolve_lexical_scope(point.lexical, K_POOL.lexical), ..K_POOL };
+
         let mut per_case = Vec::new();
         let mut blocked = Vec::new();
         for ec in &embedded_cases {
-            let hits =
-                match seeded.store.search(&ec.embedding, seed::AGENT_ID, K_POOL, K_FINAL, point.scoring).await {
-                    Ok(h) => h,
-                    Err(e) => {
-                        eprintln!("search failed for query '{}': {e}", ec.query);
-                        return EXIT_RUNTIME_FAILURE;
-                    }
-                };
+            let hits = match seeded
+                .store
+                .search(&ec.embedding, seed::AGENT_ID, scope, K_FINAL, point.scoring, Some(&ec.query))
+                .await
+            {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("search failed for query '{}': {e}", ec.query);
+                    return EXIT_RUNTIME_FAILURE;
+                }
+            };
             let ranked_refs: Vec<String> = hits
                 .iter()
                 .filter_map(|h| seeded.refs.ref_of(h.id))
@@ -354,7 +398,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
         // set can discriminate.
         let audit_report = cli.audit.then(|| audit::audit(&per_case, &golden_set.corpus));
 
-        let tag = fold_tag(cli.tag.as_deref(), point_slug(point).as_deref());
+        let tag = fold_tag(run_tag.as_deref(), point_slug(point).as_deref());
 
         let results = report::RunResults {
             date: date.clone(),
@@ -362,7 +406,8 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             tag,
             model_id: model_id.clone(),
             git_sha: git_sha.clone(),
-            k_pool: report::KPool { memory: 30, episodic: 5, procedural: 5 },
+            k_pool: report::KPool { memory: 30, episodic: 5, procedural: 5, lexical: scope.lexical },
+            fts_tokenizer: fts_tokenizer.clone(),
             k_final: K_FINAL,
             corpus_size: golden_set.corpus.len(),
             n_retrieval_cases: golden_set.retrieval_cases.len(),
@@ -430,7 +475,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
         let index = report::SweepIndex {
             date,
             mode,
-            tag: cli.tag.clone(),
+            tag: run_tag.clone(),
             model_id,
             git_sha,
             points: sweep_points,
@@ -500,16 +545,24 @@ struct GridPoint {
     scoring: EvalScoringConfig,
     imp_range: Option<(f64, f64)>,
     cos_floor: Option<f64>,
+    /// The raw `--sweep-lexical` value this point was built from, or `None`
+    /// when the axis was never swept at all. Deliberately NOT the same thing
+    /// as "the lexical channel is off": `Some(0)` also means off, but was
+    /// asked for explicitly and gets its own `lexoff` slug so its results
+    /// file is distinguishable from a run that never touched this axis.
+    lexical: Option<usize>,
 }
 
-/// Builds the cartesian product of `sweep_imp` x `sweep_cos_floor`. Each
-/// empty axis contributes exactly one `None` cell rather than being dropped
-/// from the product — that is what makes zero flags on both axes degenerate
-/// to exactly one point built from `EvalScoringConfig::default()` (never
-/// `with_importance_span`/`with_cosine_floor`, so it is bit-identical to the
-/// pre-sweep baseline), and what lets sweeping only one axis leave the other
-/// at its default instead of requiring both to be specified together.
-fn build_grid(sweep_imp: &[(f64, f64)], sweep_cos_floor: &[f64]) -> Vec<GridPoint> {
+/// Builds the cartesian product of `sweep_imp` x `sweep_cos_floor` x
+/// `sweep_lexical`. Each empty axis contributes exactly one `None` cell
+/// rather than being dropped from the product — that is what makes zero
+/// flags on every axis degenerate to exactly one point built from
+/// `EvalScoringConfig::default()` (never `with_importance_span`/
+/// `with_cosine_floor`, so it is bit-identical to the pre-sweep baseline)
+/// with the lexical channel left at `K_POOL`'s own value, and what lets
+/// sweeping only one axis leave the others at their default instead of
+/// requiring all three to be specified together.
+fn build_grid(sweep_imp: &[(f64, f64)], sweep_cos_floor: &[f64], sweep_lexical: &[usize]) -> Vec<GridPoint> {
     let imp_axis: Vec<Option<(f64, f64)>> =
         if sweep_imp.is_empty() { vec![None] } else { sweep_imp.iter().copied().map(Some).collect() };
     let cos_axis: Vec<Option<f64>> = if sweep_cos_floor.is_empty() {
@@ -517,34 +570,88 @@ fn build_grid(sweep_imp: &[(f64, f64)], sweep_cos_floor: &[f64]) -> Vec<GridPoin
     } else {
         sweep_cos_floor.iter().copied().map(Some).collect()
     };
+    let lex_axis: Vec<Option<usize>> = if sweep_lexical.is_empty() {
+        vec![None]
+    } else {
+        sweep_lexical.iter().copied().map(Some).collect()
+    };
 
-    let mut grid = Vec::with_capacity(imp_axis.len() * cos_axis.len());
+    let mut grid = Vec::with_capacity(imp_axis.len() * cos_axis.len() * lex_axis.len());
     for imp in &imp_axis {
         for cos in &cos_axis {
-            let mut scoring = EvalScoringConfig::default();
-            if let Some((min, max)) = imp {
-                scoring = scoring.with_importance_span(*min, *max);
+            for lex in &lex_axis {
+                let mut scoring = EvalScoringConfig::default();
+                if let Some((min, max)) = imp {
+                    scoring = scoring.with_importance_span(*min, *max);
+                }
+                if let Some(floor) = cos {
+                    scoring = scoring.with_cosine_floor(*floor);
+                }
+                grid.push(GridPoint { scoring, imp_range: *imp, cos_floor: *cos, lexical: *lex });
             }
-            if let Some(floor) = cos {
-                scoring = scoring.with_cosine_floor(*floor);
-            }
-            grid.push(GridPoint { scoring, imp_range: *imp, cos_floor: *cos });
         }
     }
     grid
 }
 
+/// Resolves one point's `--sweep-lexical` value into the `EvalScope.lexical`
+/// it actually searches with. `point_lexical = None` (axis never swept)
+/// leaves `default` (K_POOL's own value) untouched — that is the "leave
+/// K_POOL's value" contract. `Some(0)` (typed explicitly) and `Some(n)` both
+/// override it: `0` turns the channel off, same end state as `None` would
+/// have produced, but reached because the operator asked for it rather than
+/// because the axis was never touched — which is why it still gets its own
+/// `lexoff` slug from [`point_slug`] even though the resulting scope is the
+/// same as the untouched case.
+fn resolve_lexical_scope(point_lexical: Option<usize>, default: Option<usize>) -> Option<usize> {
+    point_lexical.map(|n| (n != 0).then_some(n)).unwrap_or(default)
+}
+
 /// The filename-safe fragment identifying one grid point, or `None` for the
 /// implicit default point (no sweep flags typed at all) — `None` is what
 /// keeps that point's filename identical to a pre-sweep run's, satisfying the
-/// "zero flags reproduces today's filename" regression guard.
+/// "zero flags reproduces today's filename" regression guard. Fragments are
+/// joined in a fixed axis order (imp, cos, lexical) so two runs of the same
+/// grid always name their points identically.
 fn point_slug(point: &GridPoint) -> Option<String> {
-    match (point.imp_range, point.cos_floor) {
-        (None, None) => None,
-        (Some((min, max)), None) => Some(format!("imp{min:.2}-{max:.2}")),
-        (None, Some(floor)) => Some(format!("cos{floor:.4}")),
-        (Some((min, max)), Some(floor)) => Some(format!("imp{min:.2}-{max:.2}_cos{floor:.4}")),
+    let mut parts = Vec::with_capacity(3);
+    if let Some((min, max)) = point.imp_range {
+        parts.push(format!("imp{min:.2}-{max:.2}"));
     }
+    if let Some(floor) = point.cos_floor {
+        parts.push(format!("cos{floor:.4}"));
+    }
+    if let Some(n) = point.lexical {
+        parts.push(if n == 0 { "lexoff".to_string() } else { format!("lex{n}") });
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("_"))
+    }
+}
+
+/// The filename-safe fragment identifying the tokenizer a run rebuilt
+/// `memory_fts` with, or `None` when no `--fts-tokenizer` was given.
+///
+/// `None` rather than the migration's own tokenizer name, deliberately: a run
+/// that passes no flag must keep writing the exact filename it wrote before
+/// this fragment existed, or every committed results file becomes unfindable
+/// by the name it was referenced under. The distinguishing fragment is only
+/// needed to separate a swapped-tokenizer run from the default one, and one
+/// of the two can carry it.
+///
+/// Non-alphanumeric runs collapse to `-` because an allowed tokenizer name
+/// can contain spaces (`unicode61 remove_diacritics 2`) and a filename
+/// carrying those is a filename that needs quoting everywhere it is typed.
+fn tokenizer_slug(tokenizer: Option<&str>) -> Option<String> {
+    let name = tokenizer?;
+    let cleaned = name
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    Some(format!("tok-{cleaned}"))
 }
 
 /// Folds a per-point slug into the operator-supplied `--tag`. The slug
@@ -980,6 +1087,120 @@ mod tests {
         }"#
     }
 
+    /// A golden set big enough that the memory pool (30) cannot hold it, with
+    /// the query's rare token confined to the five lowest-id rows.
+    ///
+    /// Both halves matter. The corpus has to outsize the pool, or the dense
+    /// arm returns every row and there is nothing left for a second channel
+    /// to add. And the token has to be rare, or every row is a lexical
+    /// candidate and which ones get promoted stops being a property of the
+    /// fixture. Under the fake embedder every hit's similarity term clamps to
+    /// zero, so the final ordering is decided entirely by the tie-break on
+    /// id — which is what makes "a promoted row shows up at the front"
+    /// something this fixture guarantees rather than hopes for.
+    fn lexical_wiring_golden_json() -> String {
+        let mut corpus = Vec::new();
+        for i in 1..=5 {
+            corpus.push(format!(
+                r#"{{"ref": "c{i}", "content": "rollout checklist ZQXIDENT42 note number {i}", "memory_type": "chat_message", "importance": 3.0}}"#
+            ));
+        }
+        for i in 6..=200 {
+            corpus.push(format!(
+                r#"{{"ref": "c{i}", "content": "unrelated background material entry number {i} with no shared identifier", "memory_type": "chat_message", "importance": 3.0}}"#
+            ));
+        }
+        format!(
+            r#"{{
+                "corpus": [{}],
+                "retrieval_cases": [
+                    {{"query": "ZQXIDENT42", "corpus_refs": ["c1"], "expected_refs": ["c1"]}}
+                ],
+                "contradiction_pairs": [
+                    {{"a": "a first statement", "b": "a second, unrelated statement", "label": "no_contradiction", "lang": "en"}}
+                ]
+            }}"#,
+            corpus.join(",\n")
+        )
+    }
+
+    fn read_results(out_dir: &std::path::Path, tag: &str) -> serde_json::Value {
+        let filename = format!("{}-fake-{tag}.json", current_date_string());
+        let raw = std::fs::read_to_string(out_dir.join(&filename))
+            .unwrap_or_else(|e| panic!("{filename} must exist: {e}"));
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    /// `--sweep-lexical` is only a measurement if every link between the flag
+    /// and the search actually carries it. Each link is a one-line
+    /// pass-through — the grid point into the scope, and the case's query text
+    /// into `EvalStore::search` — and severing any one of them leaves a fully
+    /// green suite while making both sweep points report identical numbers.
+    /// An instrument that reads the same for both settings of the thing it
+    /// measures is worse than no instrument, because its output looks like
+    /// evidence.
+    ///
+    /// Asserted on the written artifacts rather than on internals, because
+    /// the artifacts are what a later reader draws the conclusion from.
+    #[tokio::test]
+    async fn the_two_sweep_lexical_points_search_differently_and_say_so_in_their_results() {
+        let golden_path = temp_path("lexical-wiring-golden.json");
+        std::fs::write(&golden_path, lexical_wiring_golden_json()).expect("write golden fixture");
+        let out_dir = temp_path("lexical-wiring-out");
+
+        let args = vec![
+            "rag-eval".to_string(),
+            "--fake".to_string(),
+            "--golden".to_string(),
+            golden_path.to_string_lossy().to_string(),
+            "--out".to_string(),
+            out_dir.to_string_lossy().to_string(),
+            "--sweep-lexical".to_string(),
+            "0".to_string(),
+            "--sweep-lexical".to_string(),
+            "20".to_string(),
+        ];
+        let code = run(args.into_iter()).await;
+        assert_eq!(code, EXIT_OK);
+
+        let off = read_results(&out_dir, "lexoff");
+        let on = read_results(&out_dir, "lex20");
+
+        // The channel config each file was produced under. Without this the
+        // two files are two numbers with no record of what separates them.
+        assert_eq!(off["k_pool"]["lexical"], serde_json::Value::Null);
+        assert_eq!(on["k_pool"]["lexical"], serde_json::json!(20));
+
+        let off_ranked = off["retrieval"]["per_case"][0]["ranked_refs"].clone();
+        let on_ranked = on["retrieval"]["per_case"][0]["ranked_refs"].clone();
+        assert_ne!(
+            off_ranked, on_ranked,
+            "the lexical channel promoted nothing the dense arm had not already found, so this \
+             run measured the same thing twice: {off_ranked:?}"
+        );
+
+        // Named concretely rather than left at "they differ": the rows the
+        // channel is supposed to promote are the ones carrying the query's
+        // token, and at least one of them must be a row only the lexical
+        // point returned.
+        let on_refs: HashSet<String> =
+            on_ranked.as_array().unwrap().iter().map(|r| r.as_str().unwrap().to_string()).collect();
+        let off_refs: HashSet<String> =
+            off_ranked.as_array().unwrap().iter().map(|r| r.as_str().unwrap().to_string()).collect();
+        let promoted: Vec<&String> = on_refs
+            .difference(&off_refs)
+            .filter(|r| ["c1", "c2", "c3", "c4", "c5"].contains(&r.as_str()))
+            .collect();
+        assert!(
+            !promoted.is_empty(),
+            "expected at least one token-carrying row to reach the ranked list only with the \
+             lexical channel on; on={on_refs:?} off={off_refs:?}"
+        );
+
+        std::fs::remove_file(&golden_path).ok();
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
     #[tokio::test]
     async fn zero_sweep_flags_writes_exactly_one_file_matching_todays_filename() {
         // The regression guard on the sweep plumbing itself: with no sweep
@@ -1089,10 +1310,200 @@ mod tests {
         std::fs::remove_dir_all(&out_dir).ok();
     }
 
+    /// The harness must ask the store for the same lexical configuration the
+    /// application does. Derived from the production default rather than
+    /// restated as a literal, so the two cannot be edited apart: a run whose
+    /// channel config differs from the shipped one produces numbers that are
+    /// about a system nobody uses, and nothing about the output would say so.
+    #[test]
+    fn k_pool_mirrors_the_production_lexical_budget() {
+        assert_eq!(K_POOL.lexical, production_lexical_budget());
+    }
+
+    #[test]
+    fn tokenizer_slug_is_absent_without_the_flag_and_filename_safe_with_it() {
+        // Absent by default is what keeps a plain run's filename identical to
+        // the one every committed results file was referenced under.
+        assert_eq!(tokenizer_slug(None), None);
+        assert_eq!(tokenizer_slug(Some("trigram")), Some("tok-trigram".to_string()));
+        assert_eq!(
+            tokenizer_slug(Some(MIGRATION_FTS_TOKENIZER)),
+            Some("tok-unicode61-remove-diacritics-2".to_string()),
+            "an allowed tokenizer name carries spaces; a filename must not"
+        );
+    }
+
+    /// The tokenizer comparison is two runs whose ONLY difference is the
+    /// tokenizer, so the two things it needs are that the runs land in
+    /// separate files and that each file names its own tokenizer. Without the
+    /// first the second run cannot even be written; without the second the
+    /// two files are a pair of numbers whose provenance lives only in
+    /// whatever terminal produced them.
+    #[tokio::test]
+    async fn two_runs_differing_only_in_tokenizer_write_separate_self_describing_files() {
+        let golden_path = temp_path("tokenizer-provenance-golden.json");
+        std::fs::write(&golden_path, sweep_golden_json()).expect("write golden fixture");
+        let out_dir = temp_path("tokenizer-provenance-out");
+
+        let base_args = |extra: Vec<&str>| {
+            let mut args = vec![
+                "rag-eval".to_string(),
+                "--fake".to_string(),
+                "--golden".to_string(),
+                golden_path.to_string_lossy().to_string(),
+                "--out".to_string(),
+                out_dir.to_string_lossy().to_string(),
+            ];
+            args.extend(extra.into_iter().map(str::to_string));
+            args
+        };
+
+        assert_eq!(run(base_args(vec![]).into_iter()).await, EXIT_OK);
+        assert_eq!(
+            run(base_args(vec!["--fts-tokenizer", "trigram"]).into_iter()).await,
+            EXIT_OK,
+            "the second run must not collide with the first — a collision is reported as \
+             'results file already exists' and leaves the comparison with one half of its data"
+        );
+
+        let date = current_date_string();
+        let default_run: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(out_dir.join(format!("{date}-fake.json"))).unwrap(),
+        )
+        .unwrap();
+        let trigram_run: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(out_dir.join(format!("{date}-fake-tok-trigram.json"))).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(default_run["fts_tokenizer"], serde_json::json!(MIGRATION_FTS_TOKENIZER));
+        assert_eq!(trigram_run["fts_tokenizer"], serde_json::json!("trigram"));
+
+        // Both halves of a tokenizer comparison are meaningless unless the
+        // lexical channel was actually queried — a tokenizer only changes how
+        // `memory_fts` is indexed, and an index nothing reads produces the
+        // same numbers whatever is in it.
+        assert_eq!(default_run["k_pool"]["lexical"], serde_json::json!(20));
+        assert_eq!(trigram_run["k_pool"]["lexical"], serde_json::json!(20));
+
+        std::fs::remove_file(&golden_path).ok();
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fts_tokenizer_flag_reaches_the_store_and_a_run_still_succeeds() {
+        // End-to-end proof that `cli.fts_tokenizer` actually reaches
+        // `seed::seed`'s third argument, not just that `cli.rs` parses it:
+        // a wrong or dropped pass-through here would either error out or
+        // silently run against the migration's own tokenizer instead.
+        let golden_path = temp_path("fts-tokenizer-golden.json");
+        std::fs::write(&golden_path, sweep_golden_json()).expect("write golden fixture");
+        let out_dir = temp_path("fts-tokenizer-out");
+
+        let args = vec![
+            "rag-eval".to_string(),
+            "--fake".to_string(),
+            "--golden".to_string(),
+            golden_path.to_string_lossy().to_string(),
+            "--out".to_string(),
+            out_dir.to_string_lossy().to_string(),
+            "--fts-tokenizer".to_string(),
+            "trigram".to_string(),
+        ];
+        let code = run(args.into_iter()).await;
+        assert_eq!(code, EXIT_OK, "a run under an allowed tokenizer must still succeed end to end");
+
+        std::fs::remove_file(&golden_path).ok();
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unlisted_fts_tokenizer_flag_fails_the_run_before_writing_anything() {
+        let golden_path = temp_path("fts-tokenizer-bad-golden.json");
+        std::fs::write(&golden_path, sweep_golden_json()).expect("write golden fixture");
+        let out_dir = temp_path("fts-tokenizer-bad-out");
+
+        let args = vec![
+            "rag-eval".to_string(),
+            "--fake".to_string(),
+            "--golden".to_string(),
+            golden_path.to_string_lossy().to_string(),
+            "--out".to_string(),
+            out_dir.to_string_lossy().to_string(),
+            "--fts-tokenizer".to_string(),
+            "porter".to_string(),
+        ];
+        let code = run(args.into_iter()).await;
+        assert_eq!(code, EXIT_RUNTIME_FAILURE, "an unlisted tokenizer must fail the run, not silently ignore the flag");
+        assert!(!out_dir.exists(), "a rejected tokenizer must abort before any results file is written");
+
+        std::fs::remove_file(&golden_path).ok();
+    }
+
     #[tokio::test]
     async fn help_flag_exits_zero_without_touching_anything() {
         let args = vec!["rag-eval".to_string(), "--help".to_string()];
         let code = run(args.into_iter()).await;
         assert_eq!(code, EXIT_OK);
+    }
+
+    #[test]
+    fn zero_sweep_lexical_flags_leaves_the_lexical_axis_untouched() {
+        // Mirrors the imp/cos-floor regression guard: an empty third axis
+        // must degenerate to exactly one `None` cell, not be dropped from
+        // the product — that is what lets "leave K_POOL's value" hold and
+        // what keeps a plain run's grid at exactly one point.
+        let grid = build_grid(&[], &[], &[]);
+        assert_eq!(grid.len(), 1);
+        assert_eq!(grid[0].lexical, None);
+    }
+
+    #[test]
+    fn sweep_lexical_flags_populate_the_third_axis() {
+        let grid = build_grid(&[], &[], &[0, 20]);
+        assert_eq!(grid.len(), 2);
+        assert_eq!(grid.iter().map(|p| p.lexical).collect::<Vec<_>>(), vec![Some(0), Some(20)]);
+    }
+
+    #[test]
+    fn all_three_axes_cross_multiply() {
+        let grid = build_grid(&[(0.55, 1.0), (0.7, 1.0)], &[0.86], &[0, 20]);
+        assert_eq!(grid.len(), 4, "2 imp x 1 cos x 2 lexical = 4 points");
+    }
+
+    #[test]
+    fn point_slug_renders_lexoff_for_zero_and_lex_n_for_nonzero() {
+        let grid = build_grid(&[], &[], &[0, 20]);
+        let slugs: Vec<Option<String>> = grid.iter().map(point_slug).collect();
+        assert_eq!(slugs, vec![Some("lexoff".to_string()), Some("lex20".to_string())]);
+    }
+
+    #[test]
+    fn point_slug_is_none_when_no_axis_was_swept() {
+        let grid = build_grid(&[], &[], &[]);
+        assert_eq!(point_slug(&grid[0]), None);
+    }
+
+    #[test]
+    fn point_slug_combines_all_three_fragments_in_order() {
+        let grid = build_grid(&[(0.55, 1.0)], &[0.86], &[20]);
+        assert_eq!(point_slug(&grid[0]), Some("imp0.55-1.00_cos0.8600_lex20".to_string()));
+    }
+
+    #[test]
+    fn resolve_lexical_scope_untouched_axis_falls_back_to_the_default() {
+        assert_eq!(resolve_lexical_scope(None, Some(20)), Some(20));
+        assert_eq!(resolve_lexical_scope(None, None), None);
+    }
+
+    #[test]
+    fn resolve_lexical_scope_explicit_zero_turns_the_channel_off() {
+        assert_eq!(resolve_lexical_scope(Some(0), Some(20)), None);
+    }
+
+    #[test]
+    fn resolve_lexical_scope_explicit_nonzero_overrides_the_default() {
+        assert_eq!(resolve_lexical_scope(Some(45), Some(20)), Some(45));
+        assert_eq!(resolve_lexical_scope(Some(45), None), Some(45));
     }
 }

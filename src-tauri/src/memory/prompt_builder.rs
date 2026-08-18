@@ -101,7 +101,7 @@ pub(crate) async fn build_memory_prompt(
         // Query: the user's own text is the thing being searched FOR.
         Some(emb) => match emb.embed_with_role(user_query, EmbedRole::Query).await {
             Ok(q_vec) => {
-                match search_all_memories(store, &q_vec, agent_id, SearchScope::all_default().with_project(project_id), k_request).await {
+                match search_all_memories(store, &q_vec, Some(user_query), agent_id, SearchScope::all_default().with_project(project_id), k_request).await {
                     Ok(h) => h,
                     Err(e) => {
                         log::warn!("search_all_memories failed: {e}; no retrieval hits this turn");
@@ -915,6 +915,148 @@ mod tests {
             .unwrap()
     }
 
+    /// Seeds one `memory` row at an explicit age, so a fixture can put a row
+    /// far enough in the past for its decay term to bottom out at the tier
+    /// floor. [`seed_memory`] always stamps "now", which cannot express that.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_memory_aged(
+        store: &MemoryStore,
+        agent_id: &str,
+        content: &str,
+        memory_type: &str,
+        tier: i64,
+        importance: f64,
+        age_days: i64,
+        bytes: Vec<u8>,
+    ) -> i64 {
+        let agent = agent_id.to_string();
+        let content = content.to_string();
+        let memory_type = memory_type.to_string();
+        let ts = TimestampMs::now().as_millis_i64() - age_days * 86_400_000;
+        store
+            .conn
+            .call(move |c| -> Result<i64, rusqlite::Error> {
+                c.execute(
+                    "INSERT INTO memory (scope, agent_id, content, memory_type, source,
+                     created_at, created_by_type, created_by_ref,
+                     last_modified_at, last_accessed_at, importance, tier, status)
+                     VALUES ('agent', ?1, ?2, ?3, 'chat', ?4, 'user', ?1, ?4, ?4, ?5, ?6, 'active')",
+                    rusqlite::params![agent, content, memory_type, ts, importance, tier],
+                )?;
+                let id = c.last_insert_rowid();
+                c.execute(
+                    "INSERT INTO memory_vectors (rowid, embedding) VALUES (?1, ?2)",
+                    rusqlite::params![id, bytes],
+                )?;
+                Ok(id)
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Always answers with the same unit vector, whatever it is asked to
+    /// embed. Lets a fixture place stored rows at chosen distances from the
+    /// query without the query vector depending on the query STRING — which
+    /// is what makes the lexical half of this test independent of the dense
+    /// half.
+    struct FixedVecEmbedder;
+    #[async_trait::async_trait]
+    impl Embedder for FixedVecEmbedder {
+        async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+            let mut v = vec![0.0_f32; 384];
+            v[0] = 1.0;
+            Ok(v)
+        }
+        fn dimensions(&self) -> usize {
+            384
+        }
+        fn model_id(&self) -> &str {
+            "fixed-vec"
+        }
+        fn query_prefix(&self) -> &str {
+            ""
+        }
+        fn passage_prefix(&self) -> &str {
+            ""
+        }
+    }
+
+    /// The app's ONE retrieval call site must hand the user's own text to the
+    /// lexical channel, not just the vector it embedded from that text. The
+    /// two are separate arguments, so passing `None` for the second compiles,
+    /// runs, and silently turns the whole channel off for every real user
+    /// while every helper-level test of the channel keeps passing.
+    ///
+    /// The fixture is built so ONLY the lexical channel can deliver M: 30
+    /// filler rows sit at distance 0 and fill the memory pool exactly, so M —
+    /// at cosine 0.95 — is rank 31 and never enters the dense pool. M then has
+    /// to survive the k_final cut on score alone, which it does because the
+    /// fillers are a year stale (decay bottomed out at the tier floor) while M
+    /// is fresh and maximally important.
+    #[tokio::test]
+    async fn the_production_retrieval_call_site_feeds_the_user_query_to_the_lexical_channel() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let embedder = Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>;
+        let agent = "agent-lexical-wiring";
+
+        let mut near = vec![0.0_f32; 384];
+        near[0] = 1.0;
+        let near_bytes = unit_bytes(&near);
+        // cosine 0.95 to the query — comfortably above `cosine_floor`
+        // (0.8793), so M's similarity term survives the rescale instead of
+        // clamping to zero, yet far enough out to lose the pool race.
+        let mut off = vec![0.0_f32; 384];
+        off[0] = 0.95;
+        off[1] = (1.0_f32 - 0.95 * 0.95).sqrt();
+        let off_bytes = unit_bytes(&off);
+
+        for i in 0..30 {
+            seed_memory_aged(
+                &store,
+                agent,
+                &format!("filler row {i}"),
+                "chat_message",
+                3,
+                1.0,
+                365,
+                near_bytes.clone(),
+            )
+            .await;
+        }
+        seed_memory_aged(
+            &store,
+            agent,
+            "the deployment runbook lives under GPXSTORE7F3A",
+            "chat_message",
+            3,
+            10.0,
+            0,
+            off_bytes,
+        )
+        .await;
+
+        let result = build_memory_prompt(
+            &store,
+            &wm,
+            Some(embedder),
+            agent,
+            None,
+            "GPXSTORE7F3A",
+            &EmittedIds::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result.contains("GPXSTORE7F3A"),
+            "the identifier row is reachable only through the lexical channel, so its absence \
+             means the production call site is not feeding the user's query text into it: {result}"
+        );
+    }
+
     /// A tier-1 row below the workspace's importance bar used to be delivered
     /// by nobody: the workspace only takes importance >= 8, and the pool
     /// skipped tier 1 outright. It must now arrive through the query channel —
@@ -1121,7 +1263,7 @@ mod tests {
         assert_eq!(ids.len(), 6);
 
         let target = embedder.embed_with_role("cuando falla el escenario 5", EmbedRole::Query).await.unwrap();
-        let hits = search_all_memories(&store, &target, "agent-tail", SearchScope::all_default(), 10)
+        let hits = search_all_memories(&store, &target, None, "agent-tail", SearchScope::all_default(), 10)
             .await
             .unwrap();
 

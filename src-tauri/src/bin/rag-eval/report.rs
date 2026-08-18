@@ -33,6 +33,12 @@ pub struct KPool {
     pub memory: usize,
     pub episodic: usize,
     pub procedural: usize,
+    /// The lexical-channel candidate budget this run actually searched with
+    /// — `None` means the channel was off. Recorded so a reader of the
+    /// results JSON can tell which channel config produced these numbers
+    /// without having to re-derive it from `scoring_config` (which does not
+    /// carry it — the lexical budget is a pool-size knob, not a scoring one).
+    pub lexical: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Default)]
@@ -257,6 +263,14 @@ pub struct RunResults {
     pub tag: Option<String>,
     pub model_id: String,
     pub git_sha: String,
+    /// The FTS5 tokenizer `memory_fts` was carrying when these numbers were
+    /// produced. Sits beside `model_id` rather than inside `k_pool` because
+    /// it answers the same kind of question — which instrument produced this
+    /// reading — while `k_pool` carries pool SIZES, and a tokenizer is not
+    /// one. Always the effective value, never "no flag was passed": a
+    /// tokenizer comparison whose files do not each name their own tokenizer
+    /// is two numbers and a memory of which terminal produced them.
+    pub fts_tokenizer: String,
     pub k_pool: KPool,
     pub k_final: usize,
     pub corpus_size: usize,
@@ -746,7 +760,8 @@ mod tests {
             tag: None,
             model_id: "fake-embedder".to_string(),
             git_sha: "deadbee".to_string(),
-            k_pool: KPool { memory: 30, episodic: 5, procedural: 5 },
+            fts_tokenizer: "unicode61 remove_diacritics 2".to_string(),
+            k_pool: KPool { memory: 30, episodic: 5, procedural: 5, lexical: None },
             k_final: 10,
             corpus_size: 1,
             n_retrieval_cases: 1,

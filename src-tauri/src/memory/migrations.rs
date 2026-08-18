@@ -10,6 +10,13 @@ use refinery::embed_migrations;
 
 // `embed_migrations!` generates an inner module named `migrations` with a `runner()`
 // function that returns a `refinery::Runner`.
+//
+// `embed_migrations!` does not emit `cargo:rerun-if-changed` for the `migrations/`
+// directory, so adding a new SQL file there does not by itself invalidate the
+// build cache — `cargo test` can rerun a stale binary against a database the new
+// migration was never embedded into. Touching THIS file — in the same commit
+// as any new `V{N}__*.sql` migration — is what forces the recompile; the SQL
+// file's own directory is not watched, so editing only that file is not enough.
 embed_migrations!("migrations");
 
 // Re-export so callers can write `crate::memory::migrations::runner()`.
