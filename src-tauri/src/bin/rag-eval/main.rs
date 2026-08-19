@@ -1,6 +1,7 @@
 mod audit;
 mod cli;
 mod diff;
+mod follow_up;
 mod golden;
 mod metrics;
 mod report;
@@ -11,8 +12,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use agent_office_lib::eval_api::{
-    model_is_cached, production_lexical_budget, EmbedRole, EvalEmbedder, EvalScope,
-    EvalScoringConfig, MIGRATION_FTS_TOKENIZER,
+    compose_query_context, model_is_cached, production_lexical_budget, query_budget_tokens,
+    EmbedRole, EvalEmbedder, EvalScope, EvalScoringConfig, EvalTokenCounter, MIGRATION_FTS_TOKENIZER,
+    EMBED_MAX_TOKENS, SPECIAL_TOKEN_RESERVE,
 };
 
 use golden::{CaseStatus, PairLabel};
@@ -143,6 +145,27 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
         },
     };
 
+    // The token counter query-context composition needs, for both the
+    // always-on history composition below and the `--follow-up` arms.
+    // `--real`'s tokenizer.json is already on disk by this point —
+    // `EvalEmbedder::real` downloads and verifies the whole model bundle,
+    // tokenizer file included, before returning.
+    let counter = match cli.mode {
+        cli::Mode::Fake => EvalTokenCounter::fake(),
+        cli::Mode::Real => match EvalTokenCounter::real(&base_dir) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("failed to load the tokenizer for query-context composition: {e}");
+                return EXIT_RUNTIME_FAILURE;
+            }
+        },
+    };
+    let budget = query_budget_tokens(
+        EMBED_MAX_TOKENS,
+        SPECIAL_TOKEN_RESERVE,
+        counter.count(embedder.query_prefix()),
+    );
+
     let seeded = match seed::seed(&golden_set.corpus, &embedder, cli.fts_tokenizer.as_deref()).await {
         Ok(s) => s,
         Err(e) => {
@@ -169,11 +192,20 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
     // per point) happens later, inside the grid loop.
     let mut embedded_cases: Vec<EmbeddedCase> = Vec::with_capacity(golden_set.retrieval_cases.len());
     for case in &golden_set.retrieval_cases {
+        // `history` is chronological oldest-first, as a human writes it;
+        // `compose_query_context` wants newest-first, hence the reverse.
+        // Empty history (every case in the current golden.json) makes this
+        // byte-identical to embedding `case.query` alone — one code path,
+        // not an `if history.is_empty()` branch to rot.
+        let prior_turns: Vec<String> = case.history.iter().rev().cloned().collect();
+        let embed_text =
+            compose_query_context(&case.query, &prior_turns, budget, &|s: &str| counter.count(s));
+
         // Query: must match production's prompt_builder.rs role — this vector
         // also feeds the similarity block's ranking below, so a mismatched
         // role here would make that measurement describe a different space
         // than the one production actually searches.
-        let embedding = match embedder.embed_with_role(&case.query, EmbedRole::Query).await {
+        let embedding = match embedder.embed_with_role(&embed_text, EmbedRole::Query).await {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("failed to embed query '{}': {e}", case.query);
@@ -288,6 +320,42 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
         loaded_golden.content_sha256.clone(),
     );
 
+    // The tokenizer is a property of the whole run, not of a grid point:
+    // `memory_fts` is rebuilt once during seeding, so it is folded into the
+    // tag ONCE, ahead of any per-point slug — computed here (rather than
+    // just below the grid, where it used to live) because the `--follow-up`
+    // branch needs it too and returns before the grid is ever built.
+    let run_tag = fold_tag(cli.tag.as_deref(), tokenizer_slug(cli.fts_tokenizer.as_deref()).as_deref());
+    // Recorded as the tokenizer actually in effect, never as "the flag was
+    // absent": a results file exists to answer what produced its numbers, and
+    // the absence of a flag is a fact about a command line, not about an index.
+    let fts_tokenizer =
+        cli.fts_tokenizer.clone().unwrap_or_else(|| MIGRATION_FTS_TOKENIZER.to_string());
+
+    if cli.follow_up {
+        return run_follow_up(FollowUpRunContext {
+            golden_set,
+            embedder: &embedder,
+            seeded: &seeded,
+            counter: &counter,
+            budget,
+            lang_by_ref: &lang_by_ref,
+            date,
+            mode,
+            model_id,
+            git_sha,
+            known_bugs,
+            golden_provenance,
+            fts_tokenizer,
+            run_tag,
+            contradiction_curve: curve.clone(),
+            contradiction_curve_by_lang: curve_by_lang.clone(),
+            out_dir: &cli.out_dir,
+            force: cli.force,
+        })
+        .await;
+    }
+
     // Zero sweep flags on all three axes degenerates `build_grid` to exactly
     // one point: `EvalScoringConfig::default()` — never
     // `with_importance_span`/`with_cosine_floor` — with `K_POOL`'s own lexical
@@ -306,20 +374,6 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
     let grid = build_grid(&cli.sweep_imp, &cli.sweep_cos_floor, &cli.sweep_lexical);
     let is_sweep =
         !cli.sweep_imp.is_empty() || !cli.sweep_cos_floor.is_empty() || !cli.sweep_lexical.is_empty();
-
-    // The tokenizer is a property of the whole run, not of a grid point:
-    // `memory_fts` is rebuilt once during seeding and every point then
-    // searches the same index. So it is folded into the tag ONCE, ahead of
-    // the per-point slug, which is what keeps two runs differing only by
-    // `--fts-tokenizer` from writing to the same filename — a collision that
-    // `write_json` reports as "results file already exists" and that `--force`
-    // would turn into one run silently overwriting the other's numbers.
-    let run_tag = fold_tag(cli.tag.as_deref(), tokenizer_slug(cli.fts_tokenizer.as_deref()).as_deref());
-    // Recorded as the tokenizer actually in effect, never as "the flag was
-    // absent": a results file exists to answer what produced its numbers, and
-    // the absence of a flag is a fact about a command line, not about an index.
-    let fts_tokenizer =
-        cli.fts_tokenizer.clone().unwrap_or_else(|| MIGRATION_FTS_TOKENIZER.to_string());
 
     let mut sweep_points: Vec<report::SweepPoint> = Vec::new();
     let mut any_unusable = false;
@@ -518,6 +572,233 @@ fn run_diff(a_path: &std::path::Path, b_path: &std::path::Path) -> i32 {
         Err(e) => {
             eprintln!("error: {e}");
             EXIT_RUNTIME_FAILURE
+        }
+    }
+}
+
+/// Everything [`run_follow_up`] needs, gathered in one place because it
+/// branches off `run()` before the grid loop and would otherwise need a
+/// dozen positional parameters. Borrowed rather than owned where an owned
+/// copy already lives in `run()`'s scope, since `run_follow_up` runs to
+/// completion before `run()` would need those values again anyway (it always
+/// returns).
+struct FollowUpRunContext<'a> {
+    golden_set: &'a golden::GoldenSet,
+    embedder: &'a EvalEmbedder,
+    seeded: &'a seed::SeedResult,
+    counter: &'a EvalTokenCounter,
+    budget: usize,
+    lang_by_ref: &'a HashMap<&'a str, &'a str>,
+    date: String,
+    mode: report::Mode,
+    model_id: String,
+    git_sha: String,
+    known_bugs: Vec<String>,
+    golden_provenance: report::GoldenSetProvenance,
+    fts_tokenizer: String,
+    run_tag: Option<String>,
+    contradiction_curve: Vec<metrics::ThresholdCurveRow>,
+    contradiction_curve_by_lang: Vec<report::LangCurve>,
+    out_dir: &'a std::path::Path,
+    force: bool,
+}
+
+/// Runs the `--follow-up` synthetic Ceiling/Floor/Treatment measurement:
+/// scores Ceiling and Floor first, computes the resolvability verdict BEFORE
+/// ever scoring Treatment (a void run has no treatment number to report
+/// weakly), and writes both computed arms' results files regardless of the
+/// verdict — the evidence for discounting the numbers is itself an artifact,
+/// same principle as the sweep-index write further down in `run()`.
+async fn run_follow_up(ctx: FollowUpRunContext<'_>) -> i32 {
+    let active_cases: Vec<&golden::RetrievalCase> = ctx
+        .golden_set
+        .retrieval_cases
+        .iter()
+        .filter(|c| c.status == CaseStatus::Active)
+        .collect();
+    let n_active = active_cases.len();
+
+    let mut arms_by_case: Vec<(&golden::RetrievalCase, follow_up::FollowUpArms)> =
+        Vec::with_capacity(n_active);
+    for (i, case) in active_cases.iter().enumerate() {
+        let lang = case_lang(&case.expected_refs, ctx.lang_by_ref);
+        let template = follow_up::template_for(lang.as_deref(), i);
+        let arms = follow_up::build_arms(&case.query, template, ctx.budget, &|s: &str| {
+            ctx.counter.count(s)
+        });
+        arms_by_case.push((case, arms));
+    }
+
+    let ceiling_per_case =
+        match score_follow_up_arm(&ctx, arms_by_case.iter().map(|(c, a)| (*c, &a.ceiling))).await {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+    let floor_per_case =
+        match score_follow_up_arm(&ctx, arms_by_case.iter().map(|(c, a)| (*c, &a.floor))).await {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+
+    let ceiling_agg = report::aggregate(&ceiling_per_case);
+    let floor_agg = report::aggregate(&floor_per_case);
+    let verdict = follow_up::verdict(ceiling_agg.recall_10, floor_agg.recall_10, n_active);
+    println!(
+        "--follow-up resolvability gate: ceiling recall@10={:.4} floor recall@10={:.4} n_active_cases={n_active} -> {verdict:?}",
+        ceiling_agg.recall_10, floor_agg.recall_10
+    );
+
+    let ceiling_results = build_follow_up_run_results(&ctx, "ceiling", ceiling_per_case, ceiling_agg);
+    let floor_results = build_follow_up_run_results(&ctx, "floor", floor_per_case, floor_agg);
+    for results in [&ceiling_results, &floor_results] {
+        report::print_stdout(results);
+        if let Err(e) = write_follow_up_arm_results(results, ctx.out_dir, ctx.force) {
+            return e;
+        }
+    }
+
+    if let Some(code) = follow_up::follow_up_exit_code(verdict) {
+        println!(
+            "--follow-up gate: Void — the golden set at n={n_active} cannot resolve the claimed \
+             recovery effect; exiting before scoring the treatment arm"
+        );
+        return code;
+    }
+
+    let treatment_per_case =
+        match score_follow_up_arm(&ctx, arms_by_case.iter().map(|(c, a)| (*c, &a.treatment))).await {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+    let treatment_agg = report::aggregate(&treatment_per_case);
+    let treatment_results =
+        build_follow_up_run_results(&ctx, "treatment", treatment_per_case, treatment_agg);
+    report::print_stdout(&treatment_results);
+    if let Err(e) = write_follow_up_arm_results(&treatment_results, ctx.out_dir, ctx.force) {
+        return e;
+    }
+
+    EXIT_OK
+}
+
+/// Embeds and searches one arm across every active case, in the SAME
+/// `(embedding, lexical text)` shape production's own retrieval call site
+/// uses — `arm.embedded` goes to the dense channel, `arm.lexical` to the
+/// lexical/FTS5 channel via `Some(&arm.lexical)`. `K_POOL`/
+/// `EvalScoringConfig::default()`: `--follow-up` is mutually exclusive with
+/// every sweep flag, so there is exactly one scoring config to measure with.
+async fn score_follow_up_arm<'a>(
+    ctx: &FollowUpRunContext<'_>,
+    items: impl Iterator<Item = (&'a golden::RetrievalCase, &'a follow_up::ArmQuery)>,
+) -> Result<Vec<report::CaseResult>, i32> {
+    let mut per_case = Vec::new();
+    for (case, arm) in items {
+        let embedding = match ctx.embedder.embed_with_role(&arm.embedded, EmbedRole::Query).await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("failed to embed follow-up arm text for '{}': {e}", case.query);
+                return Err(EXIT_RUNTIME_FAILURE);
+            }
+        };
+        let hits = match ctx
+            .seeded
+            .store
+            .search(&embedding, seed::AGENT_ID, K_POOL, K_FINAL, EvalScoringConfig::default(), Some(&arm.lexical))
+            .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("search failed for '{}': {e}", case.query);
+                return Err(EXIT_RUNTIME_FAILURE);
+            }
+        };
+        let ranked_refs: Vec<String> =
+            hits.iter().filter_map(|h| ctx.seeded.refs.ref_of(h.id)).map(|r| r.to_string()).collect();
+        let expected: HashSet<String> = case.expected_refs.iter().cloned().collect();
+
+        let recall_1 = metrics::recall_at_k(&ranked_refs, &expected, 1);
+        let recall_5 = metrics::recall_at_k(&ranked_refs, &expected, 5);
+        let recall_10 = metrics::recall_at_k(&ranked_refs, &expected, 10);
+        let mrr = metrics::mrr_contribution(&ranked_refs, &expected);
+        let ndcg_10 = metrics::ndcg_at_10(&ranked_refs, &expected);
+
+        per_case.push(report::CaseResult {
+            query: case.query.clone(),
+            expected_refs: case.expected_refs.clone(),
+            ranked_refs,
+            recall_1,
+            recall_5,
+            recall_10,
+            mrr,
+            ndcg_10,
+            status: case.status,
+            lang: case_lang(&case.expected_refs, ctx.lang_by_ref),
+        });
+    }
+    Ok(per_case)
+}
+
+/// Assembles one arm's full `RunResults`. `audit`/`similarity` stay `None` —
+/// neither describes a single synthetic arm meaningfully — and
+/// `scoring_config` is always `EvalScoringConfig::default()`, the one config
+/// `--follow-up` ever scores with.
+fn build_follow_up_run_results(
+    ctx: &FollowUpRunContext<'_>,
+    arm_name: &str,
+    per_case: Vec<report::CaseResult>,
+    aggregate: report::Aggregate,
+) -> report::RunResults {
+    let by_lang_aggregate = report::aggregate_by_lang(&per_case);
+    report::RunResults {
+        date: ctx.date.clone(),
+        mode: ctx.mode,
+        tag: fold_tag(ctx.run_tag.as_deref(), Some(&format!("followup-{arm_name}"))),
+        model_id: ctx.model_id.clone(),
+        git_sha: ctx.git_sha.clone(),
+        k_pool: report::KPool { memory: 30, episodic: 5, procedural: 5, lexical: K_POOL.lexical },
+        fts_tokenizer: ctx.fts_tokenizer.clone(),
+        k_final: K_FINAL,
+        corpus_size: ctx.golden_set.corpus.len(),
+        n_retrieval_cases: ctx.golden_set.retrieval_cases.len(),
+        n_contradiction_pairs: ctx.golden_set.contradiction_pairs.len(),
+        known_bugs_live: ctx.known_bugs.clone(),
+        golden_set: ctx.golden_provenance.clone(),
+        scoring_config: EvalScoringConfig::default(),
+        retrieval: report::RetrievalResults { aggregate, by_lang: by_lang_aggregate, per_case, blocked: vec![] },
+        contradiction: report::ContradictionResults {
+            curve: ctx.contradiction_curve.clone(),
+            by_lang: ctx.contradiction_curve_by_lang.clone(),
+        },
+        norm_check: report::NormCheck {
+            asserted: ctx.mode == report::Mode::Real,
+            mean_norm: ctx.seeded.mean_norm,
+            max_deviation: ctx.seeded.max_norm_deviation,
+        },
+        audit: None,
+        similarity: None,
+    }
+}
+
+/// Writes one arm's results file, mapping every failure onto
+/// `EXIT_RUNTIME_FAILURE`/`EXIT_RESULTS_EXISTS` the same way the normal
+/// per-point write further down in `run()` does.
+fn write_follow_up_arm_results(
+    results: &report::RunResults,
+    out_dir: &std::path::Path,
+    force: bool,
+) -> Result<(), i32> {
+    match report::write_json(results, out_dir, force) {
+        Ok(path) => {
+            println!("results written to {}", path.display());
+            Ok(())
+        }
+        Err(report::ReportError::AlreadyExists { path }) => {
+            println!("results file already exists: {}", path.display());
+            Err(EXIT_RESULTS_EXISTS)
+        }
+        Err(e) => {
+            eprintln!("failed to write results: {e}");
+            Err(EXIT_RUNTIME_FAILURE)
         }
     }
 }
@@ -1436,6 +1717,225 @@ mod tests {
         let code = run(args.into_iter()).await;
         assert_eq!(code, EXIT_RUNTIME_FAILURE, "an unlisted tokenizer must fail the run, not silently ignore the flag");
         assert!(!out_dir.exists(), "a rejected tokenizer must abort before any results file is written");
+
+        std::fs::remove_file(&golden_path).ok();
+    }
+
+    // --- --follow-up ---------------------------------------------------------
+
+    /// A golden set built so the resolvability gate passes with a wide
+    /// margin under `--fake`: 10 target rows, each an EXACT self-match for
+    /// its own query (guarantees ceiling recall@10 == 1.0, the same
+    /// deterministic-distance-0 property `fake_end_to_end_run_produces_a_
+    /// valid_results_json` relies on), padded out to 100 total rows with
+    /// unrelated filler so the floor arm's content-free template — whose
+    /// fake vector shares no structure with any target row — has only
+    /// roughly a 10-in-100 chance per case of landing a target in the
+    /// top 10, pulling floor recall@10 well below the `5.0/n` bar.
+    fn follow_up_golden_json() -> String {
+        let mut corpus = Vec::new();
+        let mut cases = Vec::new();
+        for i in 1..=10 {
+            let content = format!("target content about topic number {i} with distinct wording {i}");
+            corpus.push(format!(
+                r#"{{"ref": "t{i}", "content": "{content}", "memory_type": "chat_message", "importance": 3.0}}"#
+            ));
+            cases.push(format!(
+                r#"{{"query": "{content}", "corpus_refs": ["t{i}"], "expected_refs": ["t{i}"]}}"#
+            ));
+        }
+        for i in 1..=90 {
+            corpus.push(format!(
+                r#"{{"ref": "f{i}", "content": "unrelated filler background entry number {i}", "memory_type": "chat_message", "importance": 3.0}}"#
+            ));
+        }
+        format!(
+            r#"{{
+                "corpus": [{}],
+                "retrieval_cases": [{}],
+                "contradiction_pairs": []
+            }}"#,
+            corpus.join(",\n"),
+            cases.join(",\n")
+        )
+    }
+
+    fn read_follow_up_results(out_dir: &std::path::Path, arm: &str) -> serde_json::Value {
+        let filename = format!("{}-fake-followup-{arm}.json", current_date_string());
+        let raw = std::fs::read_to_string(out_dir.join(&filename))
+            .unwrap_or_else(|e| panic!("{filename} must exist: {e}"));
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    #[tokio::test]
+    async fn fake_follow_up_writes_three_tagged_files_with_differing_numbers() {
+        let golden_path = temp_path("follow-up-golden.json");
+        std::fs::write(&golden_path, follow_up_golden_json()).expect("write golden fixture");
+        let out_dir = temp_path("follow-up-out");
+
+        let args = vec![
+            "rag-eval".to_string(),
+            "--fake".to_string(),
+            "--golden".to_string(),
+            golden_path.to_string_lossy().to_string(),
+            "--out".to_string(),
+            out_dir.to_string_lossy().to_string(),
+            "--follow-up".to_string(),
+        ];
+        let code = run(args.into_iter()).await;
+        assert_eq!(code, EXIT_OK, "a resolvable --follow-up run must exit 0");
+
+        let ceiling = read_follow_up_results(&out_dir, "ceiling");
+        let floor = read_follow_up_results(&out_dir, "floor");
+        let treatment = read_follow_up_results(&out_dir, "treatment");
+
+        let ceiling_r10 = ceiling["retrieval"]["aggregate"]["recall@10"].as_f64().unwrap();
+        let floor_r10 = floor["retrieval"]["aggregate"]["recall@10"].as_f64().unwrap();
+        assert_eq!(ceiling_r10, 1.0, "every case's ceiling query is an exact self-match");
+        assert!(
+            ceiling_r10 - floor_r10 > 5.0 / 10.0,
+            "fixture must clear the resolvability gate: ceiling={ceiling_r10} floor={floor_r10}"
+        );
+
+        assert_ne!(
+            ceiling["retrieval"]["per_case"], floor["retrieval"]["per_case"],
+            "ceiling and floor must score differently"
+        );
+        assert_ne!(
+            floor["retrieval"]["per_case"], treatment["retrieval"]["per_case"],
+            "floor and treatment must score differently — the treatment arm has the query folded in"
+        );
+
+        // The treatment arm's LEXICAL channel gets the content-free template,
+        // never the composed text — the spec forbids handing the golden query
+        // to BM25 in this arm, because a lexical channel that can see the
+        // query stops describing what production does with a real follow-up.
+        //
+        // The ceiling is exactly the arm whose lexical channel DOES hold the
+        // golden query, and every target row here is an exact self-match for
+        // it, so the ceiling scores 1.0. The treatment arm cannot reach that
+        // without the same lexical advantage: its dense text is
+        // `template + query`, which the fake embedder hashes to something
+        // unrelated to any row. Measured here: treatment 0.5 against a
+        // ceiling of 1.0; routing `arm.embedded` to the lexical channel
+        // instead lifts treatment to exactly 1.0, which is what this
+        // comparison catches.
+        let treatment_r10 = treatment["retrieval"]["aggregate"]["recall@10"].as_f64().unwrap();
+        assert!(
+            treatment_r10 < ceiling_r10,
+            "the treatment arm tied the ceiling (treatment={treatment_r10} ceiling={ceiling_r10}) — \
+             it can only do that if the composed text reached the lexical/FTS5 channel, letting \
+             BM25 score against the golden query the arm is supposed to be blind to"
+        );
+
+        std::fs::remove_file(&golden_path).ok();
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    /// A golden set the gate must VOID: the corpus is exactly `K_FINAL` rows,
+    /// so every query — the golden one and the content-free template alike —
+    /// returns the whole corpus in its top 10 and both arms score recall@10
+    /// = 1.0. The gap is 0, which resolves nothing, and that is precisely
+    /// what the gate exists to refuse to report on.
+    fn void_follow_up_golden_json() -> String {
+        let mut corpus = Vec::new();
+        let mut cases = Vec::new();
+        for i in 1..=10 {
+            let content = format!("target content about topic number {i} with distinct wording {i}");
+            corpus.push(format!(
+                r#"{{"ref": "t{i}", "content": "{content}", "memory_type": "chat_message", "importance": 3.0}}"#
+            ));
+            cases.push(format!(
+                r#"{{"query": "{content}", "corpus_refs": ["t{i}"], "expected_refs": ["t{i}"]}}"#
+            ));
+        }
+        format!(
+            r#"{{
+                "corpus": [{}],
+                "retrieval_cases": [{}],
+                "contradiction_pairs": []
+            }}"#,
+            corpus.join(",\n"),
+            cases.join(",\n")
+        )
+    }
+
+    /// A void run is a hard error, and the verdict is decided BEFORE the
+    /// treatment arm is scored — so the run exits 5 with no treatment number
+    /// to report weakly, while both arms that WERE computed still leave their
+    /// results files behind (the evidence for discounting a run is itself an
+    /// artifact).
+    ///
+    /// The missing treatment file is the load-bearing assertion: it is the
+    /// only thing that can tell "gate before treatment" apart from "gate
+    /// after treatment", since the exit code is 5 either way.
+    #[tokio::test]
+    async fn a_void_follow_up_run_exits_golden_unfit_without_scoring_the_treatment_arm() {
+        let golden_path = temp_path("follow-up-void-golden.json");
+        std::fs::write(&golden_path, void_follow_up_golden_json()).expect("write golden fixture");
+        let out_dir = temp_path("follow-up-void-out");
+
+        let args = vec![
+            "rag-eval".to_string(),
+            "--fake".to_string(),
+            "--golden".to_string(),
+            golden_path.to_string_lossy().to_string(),
+            "--out".to_string(),
+            out_dir.to_string_lossy().to_string(),
+            "--follow-up".to_string(),
+        ];
+        let code = run(args.into_iter()).await;
+        assert_eq!(
+            code, EXIT_GOLDEN_UNFIT,
+            "a gap the golden set cannot resolve must be a hard error, not a weak result"
+        );
+
+        let date = current_date_string();
+        assert!(
+            out_dir.join(format!("{date}-fake-followup-ceiling.json")).exists(),
+            "the ceiling arm was computed, so its results file must still be written"
+        );
+        assert!(
+            out_dir.join(format!("{date}-fake-followup-floor.json")).exists(),
+            "the floor arm was computed, so its results file must still be written"
+        );
+        assert!(
+            !out_dir.join(format!("{date}-fake-followup-treatment.json")).exists(),
+            "the treatment arm must never be scored on a void run — a treatment file here means \
+             the gate was evaluated AFTER it instead of before"
+        );
+
+        std::fs::remove_file(&golden_path).ok();
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn follow_up_with_sweep_lexical_exits_runtime_failure_before_any_run() {
+        let golden_path = temp_path("follow-up-sweep-golden.json");
+        std::fs::write(&golden_path, sweep_golden_json()).expect("write golden fixture");
+        let out_dir = temp_path("follow-up-sweep-out");
+
+        let args = vec![
+            "rag-eval".to_string(),
+            "--fake".to_string(),
+            "--golden".to_string(),
+            golden_path.to_string_lossy().to_string(),
+            "--out".to_string(),
+            out_dir.to_string_lossy().to_string(),
+            "--follow-up".to_string(),
+            "--sweep-lexical".to_string(),
+            "20".to_string(),
+        ];
+        let code = run(args.into_iter()).await;
+        assert_eq!(
+            code, EXIT_RUNTIME_FAILURE,
+            "--follow-up + --sweep-lexical must be rejected at the CLI layer before any model, \
+             seeding, or scoring work happens"
+        );
+        assert!(
+            !out_dir.exists(),
+            "the CLI conflict must be caught before the out dir is even created, let alone a file written into it"
+        );
 
         std::fs::remove_file(&golden_path).ok();
     }

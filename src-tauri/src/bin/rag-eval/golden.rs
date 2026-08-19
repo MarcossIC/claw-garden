@@ -60,6 +60,14 @@ pub struct RetrievalCase {
     pub status: CaseStatus,
     #[serde(default)]
     pub blocked_by: Option<String>,
+    /// Prior turns for the `--follow-up` synthetic mode, chronological
+    /// (oldest-first), as a human would write them. `#[serde(default)]` so
+    /// every case in the current `golden.json` — which has no `history`
+    /// key at all — still parses, with `history == []`; `deny_unknown_fields`
+    /// only rejects keys present IN the file, so adding a known optional
+    /// field here only widens what parses, it never narrows it.
+    #[serde(default)]
+    pub history: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -499,6 +507,74 @@ mod tests {
             "the hash must describe the exact bytes on disk, not a re-serialization"
         );
         assert_eq!(loaded.set.corpus.len(), 1);
+    }
+
+    // --- history field: hash-safety and default-parse -----------------------
+
+    /// `content_sha256` hashes the file's raw bytes (`golden::load`'s own doc
+    /// comment says so), never the re-serialized struct. Adding an optional
+    /// `history` field to `RetrievalCase` widens what the struct can hold,
+    /// but does not touch a single byte on disk — so hashing the SAME
+    /// `VALID_MINIMAL` bytes before and after this field existed must produce
+    /// the identical digest. What actually proves this (the struct change
+    /// already landed by the time this test runs) is that the hash comes
+    /// from `sha256_hex(raw.as_bytes())`, never from `serde_json::to_string`
+    /// on the parsed `GoldenSet` — a re-serialization hash would silently
+    /// start including the new field's default value and drift.
+    #[test]
+    fn an_added_optional_field_does_not_change_content_sha256() {
+        let path = std::env::temp_dir().join(format!(
+            "rag-eval-golden-test-history-hash-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, VALID_MINIMAL).expect("write temp fixture");
+
+        let loaded = load(&path).expect("valid fixture must load");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            loaded.content_sha256,
+            agent_office_lib::eval_api::sha256_hex(VALID_MINIMAL.as_bytes()),
+            "the hash must describe the exact bytes on disk — an added optional field must not move it"
+        );
+    }
+
+    /// The current `golden.json` shape has no `history` key at all. Every
+    /// case must still parse, defaulting `history` to an empty vec.
+    #[test]
+    fn a_case_with_no_history_key_defaults_to_an_empty_vec() {
+        let golden = parse_only(VALID_MINIMAL);
+        assert_eq!(golden.retrieval_cases.len(), 1);
+        assert_eq!(
+            golden.retrieval_cases[0].history,
+            Vec::<String>::new(),
+            "a case written before `history` existed must default to an empty vec, not fail to parse"
+        );
+    }
+
+    /// A case that DOES declare `history` must carry it through untouched,
+    /// oldest-first, exactly as written.
+    #[test]
+    fn a_case_with_an_explicit_history_parses_it_verbatim() {
+        let raw = r#"{
+            "corpus": [
+                {"ref": "c1", "content": "hello world", "memory_type": "chat_message", "importance": 5.0}
+            ],
+            "retrieval_cases": [
+                {
+                    "query": "q1",
+                    "corpus_refs": ["c1"],
+                    "expected_refs": ["c1"],
+                    "history": ["oldest turn", "newest turn"]
+                }
+            ],
+            "contradiction_pairs": []
+        }"#;
+        let golden = parse_only(raw);
+        assert_eq!(
+            golden.retrieval_cases[0].history,
+            vec!["oldest turn".to_string(), "newest turn".to_string()]
+        );
     }
 
     // --- RefMap: trivial bidirectional lookups ------------------------------

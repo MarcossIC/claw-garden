@@ -421,6 +421,88 @@ impl EvalEmbedder {
     }
 }
 
+/// The token window the live embedder truncates to — re-exported so the eval
+/// binary's `--follow-up` budget reads the exact same number production's
+/// embedder enforces, rather than a second copy that could drift from it.
+pub const EMBED_MAX_TOKENS: usize = crate::memory::embedder::EMBED_MAX_TOKENS;
+/// Special-token headroom the query-context budget reserves — see
+/// `EMBED_MAX_TOKENS`'s doc comment for why this is a re-export, not a copy.
+pub const SPECIAL_TOKEN_RESERVE: usize = crate::memory::embedder::SPECIAL_TOKEN_RESERVE;
+
+/// Delegates to `memory::query_context::compose_query_context` — one source
+/// of truth for both production and this harness, so the `--follow-up`
+/// treatment arm composes its query exactly the way
+/// `commands/chat.rs::compute_memory_prefix` does, never a reimplementation
+/// that could quietly diverge from it.
+pub fn compose_query_context(
+    current: &str,
+    prior_turns_newest_first: &[String],
+    budget_tokens: usize,
+    count_tokens: &dyn Fn(&str) -> usize,
+) -> String {
+    crate::memory::query_context::compose_query_context(
+        current,
+        prior_turns_newest_first,
+        budget_tokens,
+        count_tokens,
+    )
+}
+
+/// Delegates to `memory::query_context::query_budget_tokens` — same
+/// one-source-of-truth reasoning as [`compose_query_context`].
+pub fn query_budget_tokens(max_tokens: usize, reserve: usize, prefix_tokens: usize) -> usize {
+    crate::memory::query_context::query_budget_tokens(max_tokens, reserve, prefix_tokens)
+}
+
+/// A token counter for the eval binary's own query-context composition —
+/// the same role the counter closure plays inside `compute_memory_prefix` in
+/// production, wrapped in a named type so callers outside this module never
+/// need to name `tokenizers::Tokenizer` directly (this module's whole reason
+/// to exist — see the module doc comment).
+pub struct EvalTokenCounter(EvalTokenCounterInner);
+
+enum EvalTokenCounterInner {
+    Real(std::sync::Arc<tokenizers::Tokenizer>),
+    Fake,
+}
+
+impl EvalTokenCounter {
+    /// Loads the SAME `tokenizer.json` production loads
+    /// (`model_download::tokenizer_path`, via `model_download::load_tokenizer`),
+    /// so a `--real --follow-up` run's budget matches exactly what a real
+    /// chat turn would compute — never a second, independently-loaded copy.
+    pub fn real(base_dir: &Path) -> Result<Self, EvalError> {
+        model_download::load_tokenizer(base_dir)
+            .map(|tok| Self(EvalTokenCounterInner::Real(tok)))
+            .ok_or_else(|| {
+                EvalError::ModelLoad(format!(
+                    "tokenizer.json not loadable under {}",
+                    base_dir.display()
+                ))
+            })
+    }
+
+    /// Whitespace-word counting — documented as plumbing-only, the same
+    /// caveat [`EvalEmbedder::fake`] already carries: no learned
+    /// tokenization, just enough of a counter shape to exercise the
+    /// composition code path without downloading the real model.
+    pub fn fake() -> Self {
+        Self(EvalTokenCounterInner::Fake)
+    }
+
+    /// Counts `s`. Encode failure on the real path admits nothing
+    /// (`usize::MAX`) — the same fail-toward-"no extra context" rule
+    /// production's own counter closure follows.
+    pub fn count(&self, s: &str) -> usize {
+        match &self.0 {
+            EvalTokenCounterInner::Real(tok) => {
+                tok.encode(s, false).map(|e| e.len()).unwrap_or(usize::MAX)
+            }
+            EvalTokenCounterInner::Fake => s.split_whitespace().count(),
+        }
+    }
+}
+
 /// True iff the real embedding model is already cached at `base_dir` —
 /// never triggers a download. Delegates to the module that owns the
 /// cache-dir layout and the on-disk verification, so this check can never
@@ -695,6 +777,95 @@ mod tests {
             "FakeEmbedder ignores role deterministically; both roles must pass through identically"
         );
         assert_eq!(q.len(), e.dimensions());
+    }
+
+    // --- compose_query_context / query_budget_tokens: delegation, not reimplementation ---
+
+    #[test]
+    fn compose_query_context_delegates_to_the_memory_module() {
+        // A case sensitive to ordering AND to the separator being charged —
+        // if this module ever grew its own reimplementation instead of
+        // delegating, drifting on either detail would leave this test the
+        // only place that would notice.
+        let counter = |s: &str| s.split_whitespace().count();
+        let out = compose_query_context(
+            "current message",
+            &["prior turn text".to_string()],
+            100,
+            &counter,
+        );
+        assert_eq!(out, "current message\nprior turn text");
+    }
+
+    #[test]
+    fn compose_query_context_empty_prior_turns_is_the_current_message_unchanged() {
+        let counter = |s: &str| s.split_whitespace().count();
+        assert_eq!(compose_query_context("hello world", &[], 100, &counter), "hello world");
+    }
+
+    #[test]
+    fn query_budget_tokens_delegates_and_subtracts_both_terms() {
+        assert_eq!(query_budget_tokens(512, 4, 2), 506);
+    }
+
+    /// The two constants are re-exports, not copies — the whole point is that
+    /// a `--follow-up` run's budget reads the SAME number the live embedder
+    /// truncates to. The delegating FUNCTIONS above are covered by their own
+    /// behavior; nothing else would notice these two silently becoming
+    /// hardcoded literals that drift from `memory::embedder`.
+    #[test]
+    fn the_embedder_window_constants_are_re_exports_not_second_copies() {
+        assert_eq!(EMBED_MAX_TOKENS, crate::memory::embedder::EMBED_MAX_TOKENS);
+        assert_eq!(SPECIAL_TOKEN_RESERVE, crate::memory::embedder::SPECIAL_TOKEN_RESERVE);
+    }
+
+    // --- EvalTokenCounter ----------------------------------------------------
+
+    #[test]
+    fn eval_token_counter_fake_counts_whitespace_words() {
+        let counter = EvalTokenCounter::fake();
+        assert_eq!(counter.count("hello world"), 2);
+        assert_eq!(counter.count(""), 0);
+        assert_eq!(counter.count("one two three four"), 4);
+    }
+
+    /// `real` must load the exact file `model_download::tokenizer_path`
+    /// resolves to — proven by writing a real, minimal tokenizer there and
+    /// confirming `count` genuinely tokenizes (not falls back to a word
+    /// heuristic under a different name).
+    #[test]
+    fn eval_token_counter_real_loads_the_same_file_production_loads() {
+        use tokenizers::models::wordlevel::WordLevel;
+        use tokenizers::pre_tokenizers::whitespace::Whitespace;
+
+        let base_dir = std::env::temp_dir().join(format!(
+            "claw-garden-eval-token-counter-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let target = crate::memory::model_download::tokenizer_path(&base_dir);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let vocab_path = target.parent().unwrap().join("vocab.json");
+        std::fs::write(&vocab_path, r#"{"[UNK]":0,"hello":1,"world":2}"#).unwrap();
+        let model = WordLevel::from_file(vocab_path.to_str().unwrap(), "[UNK]".to_string()).unwrap();
+        let mut tok = tokenizers::Tokenizer::new(model);
+        tok.with_pre_tokenizer(Some(Whitespace));
+        tok.save(&target, false).unwrap();
+
+        let counter = EvalTokenCounter::real(&base_dir).expect("tokenizer.json is present at the exact path expected");
+        assert_eq!(counter.count("hello world"), 2, "must genuinely tokenize via the loaded file, not fall back silently");
+
+        std::fs::remove_dir_all(&base_dir).ok();
+    }
+
+    #[test]
+    fn eval_token_counter_real_errs_when_no_tokenizer_is_present() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "claw-garden-eval-token-counter-test-absent-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        assert!(EvalTokenCounter::real(&base_dir).is_err());
     }
 
     #[test]

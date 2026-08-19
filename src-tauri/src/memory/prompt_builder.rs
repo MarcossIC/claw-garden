@@ -35,6 +35,37 @@ const K_FINAL: usize = 10;
 // Internal data types
 // ---------------------------------------------------------------------------
 
+/// The two texts a retrieval turn needs, kept separate because the query
+/// composer (`memory::query_context`) only ever widens the DENSE side: the
+/// lexical/FTS5 channel must keep scoring against the raw message the user
+/// actually typed, never the composed text with prior turns folded in —
+/// composing a lexical query would let BM25 match on words the user never
+/// wrote this turn.
+///
+/// Named fields at the one production construction site make "pass the
+/// composed text where the raw one belongs" a compile-visible swap instead
+/// of two adjacent `&str` parameters a reviewer has to line up by position.
+pub(crate) struct QueryTexts<'a> {
+    /// Fed to `search_all_memories`'s lexical/FTS5 channel — always the raw
+    /// current message.
+    pub(crate) lexical: &'a str,
+    /// Embedded with `EmbedRole::Query` — the composed text when context
+    /// composition ran, or the raw message when it did not (empty history,
+    /// no tokenizer, `MAX_CONTEXT_TURNS == 0`).
+    pub(crate) embedded: &'a str,
+}
+
+impl<'a> QueryTexts<'a> {
+    /// Both fields set to the same text — today's pre-composition behavior,
+    /// stated explicitly. Every call site that has no context to offer
+    /// (single-shot eval, most tests) uses this rather than repeating `q`
+    /// twice at the call site, which is what invited the two fields being
+    /// swapped by accident in the first place.
+    pub(crate) fn single_shot(q: &'a str) -> Self {
+        Self { lexical: q, embedded: q }
+    }
+}
+
 struct ConflictPair {
     old_id: i64,
     old_created_at: TimestampMs,
@@ -70,7 +101,7 @@ pub(crate) async fn build_memory_prompt(
     embedder: Option<Arc<dyn Embedder>>,
     agent_id: &str,
     project_id: Option<&str>,
-    user_query: &str,
+    query: QueryTexts<'_>,
     emitted: &EmittedIds,
     access_tracker: Option<&AccessTracker>,
 ) -> Result<String, MemoryError> {
@@ -98,10 +129,13 @@ pub(crate) async fn build_memory_prompt(
     // ever spends candidates that were already fetched.
     let k_request = K_FINAL.saturating_add(emitted.len());
     let mut hits: Vec<RankedHit> = match embedder {
-        // Query: the user's own text is the thing being searched FOR.
-        Some(emb) => match emb.embed_with_role(user_query, EmbedRole::Query).await {
+        // Query: the composed (or, absent composition, raw) text is the thing
+        // being searched FOR on the dense side; the lexical/FTS5 side always
+        // gets the raw text — see `QueryTexts`'s doc comment for why the two
+        // must never be the same variable here.
+        Some(emb) => match emb.embed_with_role(query.embedded, EmbedRole::Query).await {
             Ok(q_vec) => {
-                match search_all_memories(store, &q_vec, Some(user_query), agent_id, SearchScope::all_default().with_project(project_id), k_request).await {
+                match search_all_memories(store, &q_vec, Some(query.lexical), agent_id, SearchScope::all_default().with_project(project_id), k_request).await {
                     Ok(h) => h,
                     Err(e) => {
                         log::warn!("search_all_memories failed: {e}; no retrieval hits this turn");
@@ -411,7 +445,7 @@ mod tests {
         let recording = Arc::new(RecordingEmbedder { calls: std::sync::Mutex::new(Vec::new()) });
         let embedder: Arc<dyn Embedder> = recording.clone();
 
-        build_memory_prompt(&store, &wm, Some(embedder), "agent-1", None, "some query", &EmittedIds::default(), None)
+        build_memory_prompt(&store, &wm, Some(embedder), "agent-1", None, QueryTexts::single_shot("some query"), &EmittedIds::default(), None)
             .await
             .unwrap();
 
@@ -660,7 +694,7 @@ mod tests {
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
         // 7th argument `None::<&AccessTracker>` — must compile once the parameter exists.
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, "query", &EmittedIds::default(), None::<&AccessTracker>)
+        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, QueryTexts::single_shot("query"), &EmittedIds::default(), None::<&AccessTracker>)
             .await
             .unwrap();
         assert_eq!(result, "", "all empty → empty string");
@@ -672,7 +706,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, "query", &EmittedIds::default(), None).await.unwrap();
+        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, QueryTexts::single_shot("query"), &EmittedIds::default(), None).await.unwrap();
         assert_eq!(result, "", "all empty → empty string");
     }
 
@@ -688,7 +722,7 @@ mod tests {
         let path = wm.workspace_path("agent-1", None);
         tokio::fs::write(&path, "<!-- AUTO-START -->\n## Notes\n- something\n<!-- AUTO-END -->\n<!-- USER-START -->\n<!-- USER-END -->\n").await.unwrap();
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, "query", &EmittedIds::default(), None).await.unwrap();
+        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, QueryTexts::single_shot("query"), &EmittedIds::default(), None).await.unwrap();
         assert!(result.contains(SEP_WORKSPACE), "should contain WORKSPACE separator");
         assert!(!result.contains(SEP_RECENT), "no embedder → no RECENT");
     }
@@ -699,7 +733,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, "query", &EmittedIds::default(), None).await;
+        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, QueryTexts::single_shot("query"), &EmittedIds::default(), None).await;
         assert!(result.is_ok(), "should not panic or error");
         let s = result.unwrap();
         assert!(!s.contains(SEP_RECENT), "no RECENT block without embedder");
@@ -715,7 +749,7 @@ mod tests {
         tokio::fs::create_dir_all(path.parent().unwrap()).await.unwrap();
         tokio::fs::write(&path, "workspace content here\n").await.unwrap();
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, "query", &EmittedIds::default(), None).await.unwrap();
+        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, QueryTexts::single_shot("query"), &EmittedIds::default(), None).await.unwrap();
         assert!(result.contains(SEP_WORKSPACE));
         assert!(!result.contains(SEP_RECENT));
         assert!(!result.contains(SEP_LONGTERM));
@@ -752,7 +786,7 @@ mod tests {
             Ok(())
         }).await.unwrap();
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-x", None, "query", &EmittedIds::default(), None).await.unwrap();
+        let result = build_memory_prompt(&store, &wm, None, "agent-x", None, QueryTexts::single_shot("query"), &EmittedIds::default(), None).await.unwrap();
         assert!(result.contains(SEP_CONFLICTS), "should contain CONFLICTS separator");
         assert!(result.contains("ACTIVE CONFLICTS"));
     }
@@ -763,7 +797,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, "query", &EmittedIds::default(), None).await.unwrap();
+        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, QueryTexts::single_shot("query"), &EmittedIds::default(), None).await.unwrap();
         assert!(!result.contains("ACTIVE CONFLICTS"), "no disputes → CONFLICTS block omitted");
     }
 
@@ -820,7 +854,7 @@ mod tests {
         }
 
         let result = build_memory_prompt(
-            &store, &wm, Some(embedder), "agent-split", None, "some query",
+            &store, &wm, Some(embedder), "agent-split", None, QueryTexts::single_shot("some query"),
             &EmittedIds::default(), None
         ).await.unwrap();
 
@@ -1043,7 +1077,7 @@ mod tests {
             Some(embedder),
             agent,
             None,
-            "GPXSTORE7F3A",
+            QueryTexts::single_shot("GPXSTORE7F3A"),
             &EmittedIds::default(),
             None,
         )
@@ -1054,6 +1088,95 @@ mod tests {
             result.contains("GPXSTORE7F3A"),
             "the identifier row is reachable only through the lexical channel, so its absence \
              means the production call site is not feeding the user's query text into it: {result}"
+        );
+    }
+
+    /// `QueryTexts::lexical` and `QueryTexts::embedded` can legitimately
+    /// differ once query-context composition folds prior turns into the
+    /// embedded text — the lexical/FTS5 channel must never see that widened
+    /// text. Fixture shape mirrors the test above: a row reachable ONLY
+    /// through an exact lexical match, with `FixedVecEmbedder` making the
+    /// dense channel blind to word content, so the only way this row could
+    /// surface is if `search_all_memories` were wrongly handed `embedded`
+    /// instead of `lexical`.
+    #[tokio::test]
+    async fn the_lexical_channel_never_sees_the_composed_context() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let embedder = Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>;
+        let agent = "agent-composed-context-lexical";
+
+        let mut near = vec![0.0_f32; 384];
+        near[0] = 1.0;
+        let near_bytes = unit_bytes(&near);
+        let mut off = vec![0.0_f32; 384];
+        off[0] = 0.95;
+        off[1] = (1.0_f32 - 0.95 * 0.95).sqrt();
+        let off_bytes = unit_bytes(&off);
+
+        for i in 0..30 {
+            seed_memory_aged(
+                &store, agent, &format!("filler row {i}"), "chat_message", 3, 1.0, 365, near_bytes.clone(),
+            )
+            .await;
+        }
+        seed_memory_aged(
+            &store,
+            agent,
+            "the deployment runbook lives under RAREIDENT99XY",
+            "chat_message",
+            3,
+            10.0,
+            0,
+            off_bytes,
+        )
+        .await;
+
+        // The identifier lives ONLY in `embedded` (as a prior turn folded in
+        // by composition), never in `lexical` (the raw current message).
+        let query = QueryTexts {
+            lexical: "what should I check next",
+            embedded: "what should I check next\nRAREIDENT99XY",
+        };
+
+        let result = build_memory_prompt(&store, &wm, Some(embedder), agent, None, query, &EmittedIds::default(), None)
+            .await
+            .unwrap();
+
+        assert!(
+            !result.contains("RAREIDENT99XY"),
+            "the identifier is only in `embedded`; the lexical channel — which must only ever see \
+             `lexical` — has no exact-match term to find this row by, so its presence means \
+             `query.embedded` leaked into the lexical search: {result}"
+        );
+    }
+
+    /// The dense channel must embed exactly `QueryTexts::embedded` — the
+    /// composed text — not `QueryTexts::lexical`, the raw current message.
+    #[tokio::test]
+    async fn the_dense_channel_embeds_the_composed_text() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let recording = Arc::new(RecordingEmbedder { calls: std::sync::Mutex::new(Vec::new()) });
+        let embedder: Arc<dyn Embedder> = recording.clone();
+
+        let query = QueryTexts {
+            lexical: "raw current message",
+            embedded: "raw current message\nprior turn folded in by composition",
+        };
+
+        build_memory_prompt(&store, &wm, Some(embedder), "agent-1", None, query, &EmittedIds::default(), None)
+            .await
+            .unwrap();
+
+        let calls = recording.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "expected exactly one embed call, got {calls:?}");
+        assert_eq!(calls[0].0, EmbedRole::Query, "the composed text must be embedded with role Query");
+        assert_eq!(
+            calls[0].1, "raw current message\nprior turn folded in by composition",
+            "the dense channel must embed the COMPOSED text, not the raw lexical text"
         );
     }
 
@@ -1078,7 +1201,7 @@ mod tests {
         assert_eq!(emitted.len(), 0, "importance 5 is below the workspace bar");
 
         let result =
-            build_memory_prompt(&store, &wm, Some(embedder), "agent-gap", None, content, &emitted, None)
+            build_memory_prompt(&store, &wm, Some(embedder), "agent-gap", None, QueryTexts::single_shot(content), &emitted, None)
                 .await
                 .unwrap();
 
@@ -1152,7 +1275,7 @@ mod tests {
         assert_eq!(emitted.len(), 2, "one preference + one skill are rendered by the workspace");
 
         let result =
-            build_memory_prompt(&store, &wm, Some(embedder), "agent-3t", None, query, &emitted, None)
+            build_memory_prompt(&store, &wm, Some(embedder), "agent-3t", None, QueryTexts::single_shot(query), &emitted, None)
                 .await
                 .unwrap();
 
@@ -1210,7 +1333,7 @@ mod tests {
         assert_eq!(emitted.len(), 5, "the fixture must actually fill the workspace");
 
         let result =
-            build_memory_prompt(&store, &wm, Some(embedder), "agent-budget", None, query, &emitted, None)
+            build_memory_prompt(&store, &wm, Some(embedder), "agent-budget", None, QueryTexts::single_shot(query), &emitted, None)
                 .await
                 .unwrap();
 
@@ -1367,7 +1490,7 @@ mod tests {
         let emitted = wm.regenerate_auto_section("e2e-agent", None, &store).await.unwrap();
 
         let result = build_memory_prompt(
-            &store, &wm, Some(embedder), "e2e-agent", None, "some query", &emitted, None
+            &store, &wm, Some(embedder), "e2e-agent", None, QueryTexts::single_shot("some query"), &emitted, None
         ).await.unwrap();
 
         // All four separators must appear in order

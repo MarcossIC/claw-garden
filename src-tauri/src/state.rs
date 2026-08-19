@@ -71,22 +71,35 @@ pub struct AppState {
     /// `MemoryStore` is `Clone` (channel handle) — `Arc` provides cheap shared
     /// ownership; no `Mutex` needed.
     pub memory_store: Arc<MemoryStore>,
-    /// Producer side of the ingest pipeline (Phase 3 — REQ-STATE-001, LOCKED D2).
+    /// Producer side of the memory ingest pipeline.
     ///
     /// Cheaply cloneable (`UnboundedSender` is an Arc-like). Consumed by the worker
     /// spawned in `lib.rs::run()` setup hook. Unbounded — chat hot path MUST NOT block.
     pub memory_tx: UnboundedSender<MemoryEvent>,
-    /// Lazily-filled embedder for the RAG pipeline (Phase 2 — REQ-STATE-001).
+    /// Lazily-filled embedder for the RAG pipeline.
     ///
     /// `AppState::new()` initializes this as an EMPTY `OnceCell`; the setup
     /// hook in `lib.rs` spawns a background task that downloads the model and
     /// then `cell.set(...)`s a `FastEmbedLocal` instance. Lock-free reads via
-    /// `OnceCell::get()`. Cannot hot-swap — Phase X concern.
+    /// `OnceCell::get()`. A `OnceCell` is write-once by construction, so the
+    /// embedder cannot be swapped at runtime — changing the model means a
+    /// restart, which is the safe outcome anyway: every vector already in the
+    /// store belongs to the old model's space and mixing the two silently
+    /// corrupts similarity.
     ///
     /// In `new_for_test()` / `new_for_test_async()` the cell is PRE-SEEDED
     /// with a `FakeEmbedder` so tests never race the bootstrap task.
     pub embedder: Arc<OnceCell<Arc<dyn Embedder>>>,
-    /// Fire-and-forget access tracker for the RAG hot path (Phase 5 — REQ-STATE).
+    /// Shared tokenizer for query-context composition on the chat path. Same
+    /// `tokenizer.json` the chat chunker loads (`model_download::tokenizer_path`),
+    /// so the two never disagree about what a "token" is. Filled once by the
+    /// memory worker's setup task; `compute_memory_prefix` self-heals a still-
+    /// empty cell via `get_or_try_init` on the query path, so a turn that
+    /// arrives before the worker's own load finishes still gets one retry.
+    /// Empty `OnceCell` in every constructor (production and both test ones) —
+    /// there is no eager load here, only a shared slot for whoever fills it.
+    pub tokenizer: Arc<OnceCell<Arc<tokenizers::Tokenizer>>>,
+    /// Fire-and-forget access tracker for the RAG hot path.
     ///
     /// Buffers retrieved memory IDs and flushes them atomically to SQLite
     /// (access_count + tier via `compute_tier` UDF) every 30 s or when ≥500
@@ -108,8 +121,11 @@ pub struct MemoryTestHandle {
 
 impl AppState {
     /// Build production AppState + the Receiver the setup hook will hand to
-    /// the memory worker. The Receiver MUST be moved out of AppState — only one
-    /// consumer end exists per channel by design (LOCKED D2).
+    /// the memory worker. The Receiver is returned instead of being stored on
+    /// `AppState` because an mpsc channel has exactly one consumer end: it is
+    /// not `Clone`, and `AppState` is shared behind `&`, so it could never be
+    /// taken back out. Returning it makes the single-drainer ownership explicit
+    /// at the call site rather than a runtime surprise.
     pub fn new() -> (Self, UnboundedReceiver<MemoryEvent>) {
         let config = config_store::load_config();
         let provider = create_provider_from_config(&config);
@@ -151,13 +167,12 @@ impl AppState {
             .expect("Failed to open memory store at base_dir/memory.db"),
         );
 
-        // Phase 3 ingest channel (LOCKED D2).
+        // Memory ingest channel. Single-consumer by design — see `memory_tx`.
         let (memory_tx, memory_rx) = tokio::sync::mpsc::unbounded_channel::<MemoryEvent>();
 
-        // Phase 5 access tracker (REQ-STATE).  AccessTracker::new() calls
-        // tokio::spawn internally, so we wrap it in block_on to enter the
-        // tauri async runtime context — identical pattern to the MemoryStore
-        // open() call above.
+        // AccessTracker::new() calls tokio::spawn internally, so we wrap it in
+        // block_on to enter the tauri async runtime context — identical pattern
+        // to the MemoryStore open() call above.
         let access_tracker = Arc::new(
             tauri::async_runtime::block_on(async {
                 crate::memory::access::AccessTracker::new(memory_store.conn.clone())
@@ -186,6 +201,7 @@ impl AppState {
             // AppState::new() MUST NOT block on the download — keeps startup snappy
             // and lets the UI render even when the embedder fails to load.
             embedder: Arc::new(OnceCell::new()),
+            tokenizer: Arc::new(OnceCell::new()),
             access_tracker,
         };
         (state, memory_rx)
@@ -240,10 +256,9 @@ impl AppState {
 
         let (memory_tx, memory_rx) = tokio::sync::mpsc::unbounded_channel::<MemoryEvent>();
 
-        // Phase 5 access tracker. No tokio runtime is active here (the Err
-        // branch guarantees that), so we use block_on to enter the tauri
-        // runtime context for the duration of AccessTracker::new() which
-        // calls tokio::spawn internally.
+        // No tokio runtime is active here (the Err branch above guarantees
+        // that), so we use block_on to enter the tauri runtime context for the
+        // duration of AccessTracker::new(), which calls tokio::spawn internally.
         let access_tracker = Arc::new(
             tauri::async_runtime::block_on(async {
                 crate::memory::access::AccessTracker::new(memory_store.conn.clone())
@@ -269,6 +284,7 @@ impl AppState {
             memory_store,
             memory_tx,
             embedder: seeded_embedder_cell(),
+            tokenizer: Arc::new(OnceCell::new()),
             access_tracker,
         };
         (state, memory_rx)
@@ -277,7 +293,8 @@ impl AppState {
     /// Async variant of [`new_for_test`] for use inside `#[tokio::test]`.
     ///
     /// Returns `(Self, UnboundedReceiver<MemoryEvent>)`. Tests that don't assert
-    /// on events should drain the receiver in a sink task (see T04-impl note).
+    /// on events should still drain the receiver — the channel is unbounded, so
+    /// an ignored receiver grows without bound for the life of the test.
     /// Identical fields to `new_for_test()` but builds `memory_store` via `.await`
     /// to avoid the `block_on`-inside-tokio panic.
     #[cfg(test)]
@@ -308,8 +325,8 @@ impl AppState {
 
         let (memory_tx, memory_rx) = tokio::sync::mpsc::unbounded_channel::<MemoryEvent>();
 
-        // Phase 5 access tracker. We are inside a #[tokio::test] context so
-        // tokio::spawn (called inside AccessTracker::new()) works directly.
+        // We are inside a #[tokio::test] context, so tokio::spawn (called inside
+        // AccessTracker::new()) works directly — no block_on wrapper needed.
         let access_tracker = Arc::new(
             crate::memory::access::AccessTracker::new(memory_store.conn.clone())
         );
@@ -333,6 +350,7 @@ impl AppState {
             memory_store,
             memory_tx,
             embedder: seeded_embedder_cell(),
+            tokenizer: Arc::new(OnceCell::new()),
             access_tracker,
         };
         (state, memory_rx)
@@ -532,9 +550,11 @@ fn create_provider_from_config(config: &AppConfig) -> Arc<dyn AiProvider> {
 /// constructors. Shared helper so `new_for_test()` and `new_for_test_async()`
 /// stay in sync.
 ///
-/// Per design.md §6.2: pre-seeding in BOTH test helpers eliminates the
-/// otherwise-present race where a test would call `state.embedder.get()`
-/// before the (non-existent in tests) setup-hook bootstrap task fired.
+/// Pre-seeding in BOTH test helpers is what keeps tests deterministic: in
+/// production the cell is filled by the setup-hook bootstrap task, which does
+/// not exist under test, so an unseeded cell would make every
+/// `state.embedder.get()` return `None` — or race, once a test spawns its own
+/// filler. Seeding at construction removes the window entirely.
 #[cfg(test)]
 fn seeded_embedder_cell() -> Arc<OnceCell<Arc<dyn Embedder>>> {
     use crate::memory::embedder::FakeEmbedder;
@@ -549,19 +569,20 @@ fn seeded_embedder_cell() -> Arc<OnceCell<Arc<dyn Embedder>>> {
 mod tests {
     use super::*;
 
-    // ---------- T-10-test: STATE-1/STATE-2 — AppState constructors wire access_tracker ----------
+    // ---------- AppState constructors wire access_tracker ----------
 
-    /// STATE-1/STATE-2: new_for_test_async must produce an Arc<AccessTracker> that
-    /// accepts record() calls without blocking or panicking.
+    /// `new_for_test_async` must produce an `Arc<AccessTracker>` that accepts
+    /// `record()` calls without blocking or panicking — it sits on the retrieval
+    /// hot path, so a blocking or panicking tracker would stall chat.
     #[tokio::test]
     async fn t10_new_for_test_async_access_tracker_accepts_record() {
         let (state, _rx) = AppState::new_for_test_async().await;
         // access_tracker field must exist and record must not block or panic
         state.access_tracker.record(vec![1, 2, 3]);
-        state.access_tracker.record(vec![]); // empty vec is a no-op (TRACK-2)
+        state.access_tracker.record(vec![]); // empty vec is a no-op
     }
 
-    /// STATE-2: Arc<AccessTracker> must be clonable for shared ownership across threads.
+    /// `Arc<AccessTracker>` must be clonable for shared ownership across threads.
     #[tokio::test]
     async fn t10_access_tracker_arc_is_clonable_and_usable() {
         let (state, _rx) = AppState::new_for_test_async().await;
@@ -569,8 +590,9 @@ mod tests {
         tracker_ref.record(vec![99, 100]); // record on the clone must not block
     }
 
-    /// J.1-test — SPEC for AppState::new_for_test_async builds memory_store.
-    /// Tests that new_for_test_async().await succeeds and memory_store has vec0.
+    /// `new_for_test_async()` must build a memory_store with the `vec0`
+    /// extension actually loaded — a store that opens but lacks `vec0` would
+    /// only fail much later, inside a vector query.
     #[tokio::test]
     async fn new_for_test_async_opens_memory_store() {
         let (state, _rx) = AppState::new_for_test_async().await;
@@ -586,7 +608,9 @@ mod tests {
         assert!(!version.is_empty(), "memory_store vec_version() returned empty");
     }
 
-    /// J.1-test — new_for_test() panics when called from #[tokio::test].
+    /// `new_for_test()` must panic when called from `#[tokio::test]`: it
+    /// `block_on`s, which deadlocks inside an active runtime. Failing loudly
+    /// points the author at `new_for_test_async()` instead of hanging the suite.
     #[tokio::test]
     async fn new_for_test_panics_in_tokio_context() {
         // AppState::new_for_test() should panic inside a tokio context.
@@ -596,7 +620,7 @@ mod tests {
         assert!(result.is_err(), "Expected panic from new_for_test() in tokio context");
     }
 
-    // ---------- Phase 2 RAG — REQ-STATE-001 / T070 ----------
+    // ---------- Embedder / tokenizer cell wiring ----------
 
     /// `AppState::new_for_test()` is sync-only — calling it inside a tokio
     /// runtime panics (see `new_for_test_panics_in_tokio_context`). We can't
@@ -630,6 +654,25 @@ mod tests {
         assert_eq!(v.len(), 384, "FakeEmbedder must yield 384-dim vector");
     }
 
+    /// `state.tokenizer` starts empty in every constructor, unlike
+    /// `state.embedder` — no test double is pre-seeded here, because every
+    /// query-composition test injects its own counter closure and never
+    /// needs a real `Tokenizer` (see `memory::query_context`'s tests).
+    #[tokio::test]
+    async fn new_for_test_async_exposes_an_empty_tokenizer_cell() {
+        let (state, _rx) = AppState::new_for_test_async().await;
+        assert!(state.tokenizer.get().is_none(), "the tokenizer cell must start empty");
+    }
+
+    /// `new_for_test()` is sync-only but safe to call from a plain (non-tokio)
+    /// `#[test]` — this is that direct call, covering the ctor
+    /// `new_for_test_async` above cannot reach.
+    #[test]
+    fn new_for_test_exposes_an_empty_tokenizer_cell() {
+        let (state, _rx) = AppState::new_for_test();
+        assert!(state.tokenizer.get().is_none(), "the tokenizer cell must start empty");
+    }
+
     /// `AppState::new()` cannot be exercised from a `#[tokio::test]` either —
     /// it `block_on`s the memory-store open. So we assert the WIRING via the
     /// same shape: a default-constructed `Arc::new(OnceCell::new())` returns
@@ -644,7 +687,7 @@ mod tests {
         );
     }
 
-    // ---------- T04-test — REQ-STATE-001, REQ-STATE-002 ----------
+    // ---------- Memory ingest channel ----------
 
     #[tokio::test]
     async fn memory_tx_send_before_worker_buffers_event() {

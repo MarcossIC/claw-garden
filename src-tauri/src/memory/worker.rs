@@ -11,7 +11,9 @@ use std::sync::Arc;
 use once_cell::sync::OnceCell;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::memory::chunker::{select_chunker, ChatChunker, Chunk, ChunkerKind, CodeChunker};
+use crate::memory::chunker::{
+    select_chunker, ChatChunker, Chunk, ChunkerKind, CodeChunker, CHUNK_MAX_TOKENS,
+};
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::events::{MemoryEvent, MemorySource};
 use crate::memory::store_insert::{MemoryStoreError, NewMemoryRecord};
@@ -225,11 +227,11 @@ async fn process_event(
     // keeping regardless of which role produced the text it summarizes. All
     // other sources keep the existing role-based routing.
     let chunks = if evt.source == MemorySource::Compaction {
-        chat_chunker.chunk(&evt.content, 480)
+        chat_chunker.chunk(&evt.content, CHUNK_MAX_TOKENS)
     } else {
         let kind = select_chunker(evt.role.clone(), evt.is_error, &evt.content);
         match kind {
-            ChunkerKind::Chat => chat_chunker.chunk(&evt.content, 480),
+            ChunkerKind::Chat => chat_chunker.chunk(&evt.content, CHUNK_MAX_TOKENS),
             ChunkerKind::Code => code_chunker.chunk(&evt.content, None),
             ChunkerKind::Skip => return Ok(()),
         }
@@ -339,6 +341,22 @@ async fn process_event(
     Ok(())
 }
 
+/// Resolves the shared tokenizer exactly once and builds the chat chunker
+/// from that SAME value: `tokenizer_cell` and the returned chunker can never
+/// disagree about which parse of `tokenizer.json` they got, and the file is
+/// never read twice for one process. Pulled out of `start_memory_worker` so
+/// this wiring is unit-testable without a `tauri::AppHandle`.
+fn resolve_tokenizer_and_chunker(
+    base_dir: &std::path::Path,
+    tokenizer_cell: &OnceCell<Arc<tokenizers::Tokenizer>>,
+) -> Arc<ChatChunker> {
+    let tok = crate::memory::model_download::load_tokenizer(base_dir);
+    if let Some(t) = &tok {
+        let _ = tokenizer_cell.set(t.clone());
+    }
+    Arc::new(ChatChunker::from_tokenizer(tok))
+}
+
 /// Spawn entry point — called from `lib.rs::run()` setup hook.
 ///
 /// Builds the two chunkers once, then hands ownership to the worker future.
@@ -356,9 +374,10 @@ pub(crate) fn start_memory_worker(
     let store = state.memory_store.clone();
     let embedder_cell = state.embedder.clone();
     let base_dir = state.base_dir.clone();
+    let tokenizer_cell = state.tokenizer.clone();
 
     tauri::async_runtime::spawn(async move {
-        let chat_chunker = Arc::new(ChatChunker::new_from_base_dir(&base_dir));
+        let chat_chunker = resolve_tokenizer_and_chunker(&base_dir, &tokenizer_cell);
         let code_chunker = Arc::new(CodeChunker::new());
         memory_worker(memory_rx, store, embedder_cell, chat_chunker, code_chunker).await;
     });
@@ -371,6 +390,7 @@ const _: fn() = || {
     _send::<UnboundedReceiver<MemoryEvent>>();
     _send::<Arc<MemoryStore>>();
     _send::<Arc<OnceCell<Arc<dyn Embedder>>>>();
+    _send::<Arc<OnceCell<Arc<tokenizers::Tokenizer>>>>();
     _send::<Arc<ChatChunker>>();
     _send::<Arc<CodeChunker>>();
 };
@@ -1286,7 +1306,7 @@ mod tests {
     // ── Shared fixture: write two real messages, read them back ────────────
 
     use crate::memory::prompt_builder::{
-        build_memory_prompt, SEP_LONGTERM_TEST, SEP_RECENT_TEST,
+        build_memory_prompt, QueryTexts, SEP_LONGTERM_TEST, SEP_RECENT_TEST,
     };
     use crate::memory::search::{search_all_memories, RankedHit, SearchScope};
     use crate::memory::workspace::WorkspaceManager;
@@ -1360,7 +1380,7 @@ mod tests {
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let prompt = build_memory_prompt(
             &store, &wm, Some(embedder.clone() as Arc<dyn Embedder>),
-            AGENT, None, &fresh.content,
+            AGENT, None, QueryTexts::single_shot(&fresh.content),
             &crate::memory::workspace::EmittedIds::default(), None,
         )
         .await
@@ -1560,16 +1580,18 @@ mod tests {
             Arc::new(BatchRecordingEmbedder { batch_calls: batch_calls.clone() });
         let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
 
-        // Three DISTINCT 1920-byte chunks (byte-fallback cap under
-        // ChatChunker::with_fallback()) — no dedup absorption, all 3 survive
-        // to the embed stage.
+        // 5760 bytes at the byte-fallback cap (1920B) with 256B overlap
+        // (stride 1664B) splits into 4 windows — [0,1920) [1664,3584)
+        // [3328,5248) [4992,5760) — all distinct strings (the source is
+        // three DIFFERENT repeated letters), so none absorb each other and
+        // all 4 survive to the embed stage.
         let content = format!("{}{}{}", "a".repeat(1920), "b".repeat(1920), "c".repeat(1920));
         tx.send(make_event(Role::User, &content, None, 1)).unwrap();
         drain_worker(tx, handle).await;
 
         let calls = batch_calls.lock().unwrap().clone();
         assert_eq!(calls.len(), 1, "expected exactly one embed_batch call for the whole event, got {calls:?}");
-        assert_eq!(calls[0], 3, "expected the single call to carry all 3 surviving chunks, got {calls:?}");
+        assert_eq!(calls[0], 4, "expected the single call to carry all 4 surviving chunks, got {calls:?}");
     }
 
     /// Event `[A, A]`, neither present in the store: stage 1 collapses to one
@@ -1588,8 +1610,11 @@ mod tests {
         let code_chunker = Arc::new(CodeChunker::new());
 
         let mut absorbed: u64 = 0;
-        // "x".repeat(3840) → two IDENTICAL 1920-byte chunks under the 1920B cap.
-        let content = "x".repeat(3840);
+        // 3584 bytes = cap(1920) + stride(1664): the windowing produces
+        // exactly two windows, [0,1920) and [1664,3584), both 1920 bytes of
+        // the same repeated char — i.e. two byte-identical chunks, no
+        // third partial one.
+        let content = "x".repeat(3584);
         let evt = make_event(Role::User, &content, None, 1);
 
         process_event(&evt, &store, &cell, &chat_chunker, &code_chunker, &mut absorbed)
@@ -1632,8 +1657,12 @@ mod tests {
         assert_eq!(count_memory(&store).await, 1);
 
         // Now send an event carrying TWO copies of the already-stored chunk A.
+        // 3584 bytes (cap + stride), not 3840: with overlap the windowing
+        // over "x"*3840 would produce a third, shorter (512-byte) window
+        // distinct from A — a brand-new chunk this test isn't about. 3584
+        // keeps the fixture to exactly two 1920-byte windows, both == A.
         absorbed = 0;
-        let dup_evt = make_event(Role::User, &"x".repeat(3840), None, 2);
+        let dup_evt = make_event(Role::User, &"x".repeat(3584), None, 2);
         process_event(&dup_evt, &store, &cell, &chat_chunker, &code_chunker, &mut absorbed)
             .await
             .unwrap();
@@ -1649,6 +1678,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(access_count, 3, "seed insert(1) + two reinforce hits(+2) = 3");
+    }
+
+    /// Integration-level counterpart of the unit-level boundary test in
+    /// `token_splitter.rs`: a marker straddling the old (pre-overlap)
+    /// 0-overlap cut point must come out whole in one persisted `memory`
+    /// row, not just inside one in-memory `Chunk`.
+    #[tokio::test]
+    async fn boundary_straddling_span_survives_whole_in_one_persisted_row() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        // The old splitter cut at multiples of 1920 bytes with zero overlap;
+        // this marker straddles the first such cut point.
+        let mut content = "a".repeat(1900);
+        content.push_str("MARKER_SPANNING_BOUNDARY");
+        content.push_str(&"b".repeat(2000));
+        tx.send(make_event(Role::User, &content, None, 1)).unwrap();
+        drain_worker(tx, handle).await;
+
+        let hits: i64 = store
+            .conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM memory WHERE content LIKE '%MARKER_SPANNING_BOUNDARY%'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            hits, 1,
+            "marker straddling the old cut point must survive whole in exactly one persisted row"
+        );
     }
 
     /// `InferenceFailed` from `embed_batch` must drop the WHOLE event, not
@@ -1745,6 +1809,76 @@ mod tests {
             rows, 0,
             "a short embed_batch reply must drop the whole event, never zip a chunk to another chunk's vector; got {rows} rows"
         );
+    }
+
+    // ── Shared tokenizer lifecycle: cell + chunker come from ONE load ────────
+
+    /// Writes a real, minimal `tokenizer.json` under `base_dir` — a
+    /// `WordLevel` model with a tiny vocab and a whitespace pre-tokenizer, so
+    /// `Tokenizer::from_file` genuinely parses it and `encode` genuinely
+    /// splits on words (unlike the byte-length fallback this proves the code
+    /// is NOT taking).
+    fn write_minimal_tokenizer_fixture(base_dir: &std::path::Path) {
+        use tokenizers::models::wordlevel::WordLevel;
+        use tokenizers::pre_tokenizers::whitespace::Whitespace;
+
+        let target = crate::memory::model_download::tokenizer_path(base_dir);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let vocab_path = target.parent().unwrap().join("vocab.json");
+        std::fs::write(&vocab_path, r#"{"[UNK]":0,"hello":1,"world":2}"#).unwrap();
+
+        let model = WordLevel::from_file(vocab_path.to_str().unwrap(), "[UNK]".to_string())
+            .expect("fixture vocab must build a WordLevel model");
+        let mut tok = tokenizers::Tokenizer::new(model);
+        tok.with_pre_tokenizer(Some(Whitespace));
+        tok.save(&target, false).expect("fixture tokenizer must save to tokenizer_path");
+    }
+
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "claw-garden-worker-test-{label}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn resolve_tokenizer_and_chunker_fills_the_cell_and_shares_the_identical_arc() {
+        let base_dir = unique_temp_dir("resolve-tok");
+        write_minimal_tokenizer_fixture(&base_dir);
+
+        let cell: OnceCell<Arc<tokenizers::Tokenizer>> = OnceCell::new();
+        let chunker = resolve_tokenizer_and_chunker(&base_dir, &cell);
+
+        let cell_tok = cell.get().expect("cell must be filled when tokenizer.json is present");
+        let cell_ptr: *const tokenizers::Tokenizer = Arc::as_ptr(cell_tok);
+        assert_eq!(
+            chunker.tokenizer_ptr(),
+            Some(cell_ptr),
+            "the cell and the chunker must share the exact same Arc — one load, not two independent parses"
+        );
+
+        // Behavioral confirmation this is really the tokenizer path, not the
+        // byte-length fallback: "hello world" is 2 words in the fixture
+        // vocab, so a max_tokens=1 cap must split it into 2 chunks.
+        let chunks = chunker.chunk("hello world", 1);
+        assert_eq!(chunks.len(), 2, "a real word-level tokenizer must split 2 words at max_tokens=1");
+
+        std::fs::remove_dir_all(&base_dir).ok();
+    }
+
+    #[test]
+    fn resolve_tokenizer_and_chunker_leaves_the_cell_empty_when_the_file_is_absent() {
+        let base_dir = unique_temp_dir("resolve-tok-absent");
+        let cell: OnceCell<Arc<tokenizers::Tokenizer>> = OnceCell::new();
+        let chunker = resolve_tokenizer_and_chunker(&base_dir, &cell);
+
+        assert!(cell.get().is_none(), "no tokenizer.json on disk must leave the cell empty");
+        assert!(chunker.tokenizer_ptr().is_none(), "the chunker must be running the byte fallback");
+
+        std::fs::remove_dir_all(&base_dir).ok();
     }
 
     // ── Test harnesses ───────────────────────────────────────────────────────

@@ -55,4 +55,5 @@ pub(crate) mod extractor;
 pub(crate) mod episodic_writer;
 pub(crate) mod miner;
 pub(crate) mod maintenance;
+pub(crate) mod query_context;
 pub(crate) mod vector;

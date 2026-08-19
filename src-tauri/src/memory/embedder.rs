@@ -108,6 +108,20 @@ const E5_QUERY_PREFIX: &str = "query: ";
 /// `"passage: "`.
 const E5_PASSAGE_PREFIX: &str = "query: ";
 
+/// The token window fastembed truncates the model input to. Pinned as an
+/// explicit constant rather than left at fastembed's own default: the query
+/// composer's budget (`memory::query_context::query_budget_tokens`) has to
+/// read the SAME number the embedder actually enforces, and a value only
+/// implicit in a library default can silently drift out of sync with it.
+pub(crate) const EMBED_MAX_TOKENS: usize = 512;
+
+/// Tokens the composer's budget reserves for what the model adds around the
+/// text itself: `<s>`/`</s>` (2) plus slack for a BPE merge that can span the
+/// prefix/text boundary and tokenize slightly differently than summing
+/// `count(prefix) + count(text)` would predict. 4 covers both with room to
+/// spare.
+pub(crate) const SPECIAL_TOKEN_RESERVE: usize = 4;
+
 /// The single authority on how a role becomes a prefixed string. Pure: no
 /// I/O, no dependency on which embedder is active — the caller supplies the
 /// prefixes, this function only selects and concatenates.
@@ -223,7 +237,10 @@ impl FastEmbedLocal {
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<EmbedRequest>();
 
         let user_model = UserDefinedEmbeddingModel::new(onnx, tokenizer);
-        let init_opts = InitOptionsUserDefined::new();
+        // Pinned explicitly so the composer's budget and the embedder's own
+        // truncation point are provably the same number, not two constants
+        // that happen to agree today.
+        let init_opts = InitOptionsUserDefined::new().with_max_length(EMBED_MAX_TOKENS);
 
         // Synchronous load on the calling thread: surface load errors immediately.
         // `embed()` takes `&mut self` in fastembed v5 (interior session state).
@@ -475,6 +492,20 @@ mod tests {
     fn fake_embedder_dimensions_is_384() {
         let e = FakeEmbedder::default();
         assert_eq!(e.dimensions(), 384);
+    }
+
+    // ---------- Embedder window pin ----------
+
+    /// Pins the two constants the query composer's budget depends on. This
+    /// is the only place that can catch `.with_max_length(EMBED_MAX_TOKENS)`
+    /// being deleted from `from_bytes` — `TextEmbedding` exposes no getter
+    /// for its effective max length, so that deletion is otherwise
+    /// unobservable from a unit test; a real-model control run is the other
+    /// half of that coverage, out of this test's reach.
+    #[test]
+    fn embed_max_tokens_and_special_token_reserve_are_pinned() {
+        assert_eq!(EMBED_MAX_TOKENS, 512);
+        assert_eq!(SPECIAL_TOKEN_RESERVE, 4);
     }
 
     // ---------- Stub embedders ----------

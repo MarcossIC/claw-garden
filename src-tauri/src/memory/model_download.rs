@@ -1,17 +1,17 @@
-//! First-run model download + SHA-256 verification (Phase 2).
-//!
-//! Populated across Phase 2.4 — 2.8 per `docs/sdd/rag-embedder/tasks.md`.
+//! First-run model download + SHA-256 verification.
 //!
 //! # Test indirection: HuggingFace base URL
 //!
 //! Production code hits `https://huggingface.co/intfloat/multilingual-e5-small/resolve/main`.
-//! Tests MUST NEVER hit the real HF — that would (a) be slow, (b) be flaky, (c) violate
-//! REQ-TEST-001. So `base_url()` consults the `CLAW_GARDEN_HF_BASE_URL` env var; tests
+//! Tests MUST NEVER hit the real HF — that would be slow, flaky, and would make the
+//! suite depend on a third-party host being up. So `base_url()` consults the
+//! `CLAW_GARDEN_HF_BASE_URL` env var; tests
 //! set it to a `mockito::Server::url()` value, prod leaves it unset and falls back to
 //! [`HF_BASE_URL`]. The `ensure_model_with_oracle` test seam also accepts an explicit
 //! `base_url` parameter so individual tests can be parallel-safe (env vars are global).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
 use fastembed::TokenizerFiles;
@@ -21,7 +21,7 @@ pub(super) const HF_BASE_URL: &str =
     "https://huggingface.co/intfloat/multilingual-e5-small/resolve/main";
 
 // ============================================================================
-// File specifications (REQ-DL-001, REQ-DL-002).
+// File specifications.
 //
 // The model is 5 files. Each has:
 //   - a relative path under `<base>/models/multilingual-e5-small/`
@@ -43,7 +43,7 @@ pub(super) const HF_BASE_URL: &str =
 //   tokenizer_config.json     — non-LFS; SHA-256 computed locally on 2026-05-24
 //                                (443 bytes).
 //
-// The 3 small JSON SHAs were pinned during CHECKPOINT 3 (tasks.md T040) by
+// The 3 small JSON SHAs were pinned by
 // downloading from /raw/<commit>/<file> and running PowerShell's
 // `Get-FileHash -Algorithm SHA256`. See `scripts/compute_sha.ps1` for the
 // repro recipe. Production callers use [`HF_BASE_URL`] which hits /resolve/main
@@ -113,14 +113,36 @@ pub const ALL_FILES: [FileSpec; 5] = [
 /// Returns the path where `tokenizer.json` is expected to live under `base_dir`.
 ///
 /// Path: `<base_dir>/models/multilingual-e5-small/tokenizer.json`.
-/// Used by `ChatChunker::new_from_base_dir` to load the tokenizer (proposal R8, design §6.1).
+/// Single source of truth for that path: `ChatChunker::new_from_base_dir` and
+/// the query-context token counter both go through here, so they can never
+/// drift onto two different tokenizer files.
 pub fn tokenizer_path(base_dir: &Path) -> PathBuf {
     base_dir.join("models").join("multilingual-e5-small").join("tokenizer.json")
 }
 
+/// Loads the shared tokenizer every consumer (the chat chunker, the query
+/// composer's token counter) reads from the same file. Owns the path
+/// resolution itself via [`tokenizer_path`] so callers never construct that
+/// path a second, independently-editable way.
+///
+/// Returns `None` — never panics — when the file is absent (still
+/// downloading, or download failed) or malformed (corrupted write, wrong
+/// format): both are recoverable states a caller degrades from (byte-length
+/// chunking, or skipping query-context composition for this turn) rather
+/// than states that should crash chat or ingestion.
+pub(crate) fn load_tokenizer(base_dir: &Path) -> Option<Arc<tokenizers::Tokenizer>> {
+    let path = tokenizer_path(base_dir);
+    match tokenizers::Tokenizer::from_file(&path) {
+        Ok(tok) => Some(Arc::new(tok)),
+        Err(e) => {
+            log::warn!("load_tokenizer: not loadable at {} ({e}); returning None", path.display());
+            None
+        }
+    }
+}
+
 /// Returns the base URL for HF resolve requests. Honors the
 /// `CLAW_GARDEN_HF_BASE_URL` env var to enable mockito-driven tests.
-#[allow(dead_code)] // Wired in T045 (download path).
 pub(super) fn base_url() -> String {
     std::env::var("CLAW_GARDEN_HF_BASE_URL").unwrap_or_else(|_| HF_BASE_URL.to_string())
 }
@@ -143,12 +165,12 @@ impl DiskOracle for Fs2Oracle {
     }
 }
 
-/// Retry-backoff schedule per REQ-DL-004: 5s before attempt 2, 30s before
+/// Retry-backoff schedule: 5s before attempt 2, 30s before
 /// attempt 3. The 120s entry exists for symmetry but is never consumed (after
 /// 3 attempts the retry loop exits with `RetryExhausted`).
 pub(crate) const RETRY_BACKOFF_SECS: [u64; 3] = [5, 30, 120];
 
-/// Backoff-policy seam (REQ-DL-004 + REQ-TEST-001). Production [`RealBackoff`]
+/// Backoff-policy seam. Production [`RealBackoff`]
 /// uses `tokio::time::sleep`; the test-only [`ZeroBackoff`] returns immediately
 /// so the suite never sleeps for real seconds.
 pub trait BackoffPolicy: Send + Sync {
@@ -228,7 +250,7 @@ impl std::fmt::Debug for ModelFiles {
     }
 }
 
-/// Progress events emitted while `ensure_model` runs (REQ-EVT-002).
+/// Progress events emitted while `ensure_model` runs.
 ///
 /// Lifecycle on success:  `Start` → `Chunk` (1..N, throttled) → `Verify` → `Done`.
 /// Lifecycle on error:    any prefix, then exactly one terminal `Error`.
@@ -315,9 +337,10 @@ pub(crate) async fn ensure_model_with_oracle_spec(
     progress: Option<UnboundedSender<DownloadProgress>>,
     files: &[FileSpec],
 ) -> Result<ModelFiles, DownloadError> {
-    // Run the pipeline and translate any error into a terminal `Error` event
-    // (REQ-EVT-002). The match-on-Result indirection keeps the happy path
-    // readable while guaranteeing exactly one error event on every failure.
+    // Run the pipeline and translate any error into a terminal `Error` event.
+    // The match-on-Result indirection keeps the happy path readable while
+    // guaranteeing exactly one error event on every failure — the UI treats
+    // `Error` as terminal, so a second one would resurrect a finished download.
     match ensure_model_with_oracle_spec_inner(
         base_dir,
         oracle,
@@ -354,13 +377,16 @@ async fn ensure_model_with_oracle_spec_inner(
         source: e,
     })?;
 
-    // (1) Cache-hit fast path: NO events emitted (REQ-EVT-002 silence on
-    // cached startup; ConfigPanel stays at idle until a real download fires).
+    // (1) Cache-hit fast path: NO events emitted. Every startup after the first
+    // takes this branch, and emitting progress here would flash a download UI
+    // for work that never happens — ConfigPanel stays idle until a real
+    // download fires.
     if let Some(model_files) = try_load_cached(&cache_dir, files) {
         return Ok(model_files);
     }
 
-    // (2) Disk pre-flight (REQ-DL-003).
+    // (2) Disk pre-flight: fail before the first byte rather than half a
+    // gigabyte in, when the user can still act on the message.
     let free = oracle.available_bytes(&cache_dir).map_err(|e| DownloadError::Io {
         file: cache_dir.display().to_string(),
         source: e,
@@ -402,12 +428,12 @@ async fn ensure_model_with_oracle_spec_inner(
 
     // (5) Re-read every committed file and assemble ModelFiles.
     //
-    // REQ-EVT-002 compliance: emit `Verify` here, but DO NOT emit `Done`.
+    // Emit `Verify` here, but DO NOT emit `Done`.
     // The semantic `Done` event means "the embedder is ready to use" and that
     // is only true after the bootstrap layer (lib.rs::start_embedder_bootstrap)
     // has called `FastEmbedLocal::from_bytes` + filled the OnceCell. Emitting
     // `Done` here as well would deliver TWO `done` events to the UI on the
-    // happy path (see verify-report WARNING #1, 2026-05-23). On disk the model
+    // happy path. On disk the model
     // is already valid by the time we return Ok — the `ModelFiles` return value
     // is the contract, the wire event is not.
     if let Some(tx) = progress {
@@ -542,9 +568,10 @@ fn partial_path_for(target: &Path) -> std::path::PathBuf {
 /// Throttle Chunk events to one per `CHUNK_PROGRESS_BYTES`.
 const CHUNK_PROGRESS_BYTES: u64 = 64 * 1024;
 
-/// Per-file download with retry per REQ-DL-004 (3 attempts, 5s/30s/120s
-/// backoff). Per design §4.4 step 6, a SHA-256 mismatch returns IMMEDIATELY
-/// — likely tampering or persistent corruption; retrying would just refail.
+/// Per-file download with retry (3 attempts, 5s/30s/120s backoff). A SHA-256
+/// mismatch returns IMMEDIATELY and does NOT consume the retry budget: the
+/// bytes arrived intact but wrong, which means tampering or persistent
+/// corruption upstream, and retrying would just re-fetch the same wrong bytes.
 /// All other errors (HTTP / network / IO) consume the retry budget and clean
 /// up the `.partial` file on each attempt.
 ///
@@ -690,7 +717,8 @@ async fn download_one(
         };
         let got = sha256_hex(&bytes);
         if got != spec.sha256 {
-            // Per design §4.4 step 6 — return immediately, do NOT retry.
+            // Return immediately, do NOT retry: a checksum mismatch is not a
+            // transient fault, so the retry budget would buy nothing.
             let _ = std::fs::remove_file(&partial);
             return Err(DownloadError::ChecksumMismatch {
                 file: spec.path.into(),
@@ -783,7 +811,7 @@ mod tests {
         }
     }
 
-    // ---------- REQ-DL-003: disk pre-flight (T030) ----------
+    // ---------- Disk pre-flight ----------
 
     #[tokio::test]
     async fn insufficient_disk_returns_err_no_http() {
@@ -841,7 +869,7 @@ mod tests {
         );
     }
 
-    // ---------- REQ-DL-001 + REQ-DL-002: SHA constants + cached fast path (T040) ----------
+    // ---------- SHA constants + cached fast path ----------
 
     /// Build a 5-FileSpec slice from in-memory fixture bytes whose SHAs are
     /// computed on the fly. Returns the fixture file list directly.
@@ -997,7 +1025,7 @@ mod tests {
         m_other.assert_async().await;
     }
 
-    // ---------- REQ-DL-001 + REQ-DL-002 + REQ-DL-004: download + retry (T045) ----------
+    // ---------- Download + retry ----------
 
     /// Mounts mockito routes for all 5 fixture files with the given response
     /// (status + body). Returns the mockito mocks so tests can assert hit counts.
@@ -1208,9 +1236,9 @@ mod tests {
 
     #[tokio::test]
     async fn sha_mismatch_after_retries_returns_checksum_err() {
-        // Per design §4.4 step 6: SHA mismatch returns IMMEDIATELY without
-        // consuming retry budget. Expect exactly 1 hit + ChecksumMismatch +
-        // no .partial files left behind.
+        // A SHA mismatch must return IMMEDIATELY without consuming the retry
+        // budget. Expect exactly 1 hit + ChecksumMismatch + no .partial files
+        // left behind.
         let tmp = TestDir::new("dl-sha-mismatch");
         let files = fixture_files();
         let specs = fixture_specs(&files);
@@ -1330,7 +1358,7 @@ mod tests {
         }
     }
 
-    // ---------- REQ-EVT-002: progress events (T050) ----------
+    // ---------- Progress events ----------
 
     fn drain_progress(
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<DownloadProgress>,
@@ -1354,13 +1382,13 @@ mod tests {
 
     #[tokio::test]
     async fn lifecycle_events_in_expected_order() {
-        // REQ-EVT-002 compliance: `ensure_model` MUST emit `start → chunk(s)
+        // `ensure_model` MUST emit `start → chunk(s)
         // → verify` and STOP there. The semantic terminal `done` event means
         // "embedder is ready to use" — that is the bootstrap's responsibility
         // to emit AFTER `FastEmbedLocal::from_bytes` + `OnceCell::set` succeed.
         // If `ensure_model` also emitted `Done`, the forwarder→app.emit path
         // in `lib.rs` would deliver TWO `done` events to the UI on the happy
-        // path (see verify-report WARNING #1, 2026-05-23).
+        // path.
         let tmp = TestDir::new("evt-order");
         let files = fixture_files();
         let specs = fixture_specs(&files);
@@ -1451,7 +1479,7 @@ mod tests {
     #[tokio::test]
     async fn downloading_events_rate_limited_by_64kb() {
         // Serve a 256 KB body for onnx/model.onnx; cap fixture so chunk-rate
-        // throttling is observable. Per design §4.4 step 4: one Chunk per
+        // throttling is observable. One Chunk per
         // 64 KB → ceil(256 / 64) = 4 chunks, plus a final flush event tolerance
         // of ±1.
         let tmp = TestDir::new("evt-throttle");
@@ -1496,7 +1524,7 @@ mod tests {
         );
     }
 
-    // ---------- REQ-DL-004: backoff policy (T035) ----------
+    // ---------- Backoff policy ----------
 
     #[tokio::test]
     async fn zero_backoff_sleeps_for_zero_duration() {
@@ -1546,7 +1574,7 @@ mod tests {
         );
     }
 
-    // ---------- T09-test: tokenizer_path helper (proposal R8) ----------
+    // ---------- tokenizer_path helper ----------
 
     #[test]
     fn tokenizer_path_returns_correct_subpath() {
@@ -1557,5 +1585,22 @@ mod tests {
             PathBuf::from("/base/models/multilingual-e5-small/tokenizer.json"),
             "tokenizer_path must resolve to the expected subpath"
         );
+    }
+
+    // ---------- load_tokenizer: shared tokenizer lifecycle ----------
+
+    #[test]
+    fn load_tokenizer_returns_none_for_a_missing_file_without_panicking() {
+        let tmp = TestDir::new("load-tokenizer-missing");
+        assert!(load_tokenizer(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn load_tokenizer_returns_none_for_a_malformed_file_without_panicking() {
+        let tmp = TestDir::new("load-tokenizer-malformed");
+        let path = tokenizer_path(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "not a valid tokenizer.json").unwrap();
+        assert!(load_tokenizer(tmp.path()).is_none());
     }
 }

@@ -153,7 +153,9 @@ fn try_auto_compact(
 
         Some(CompactAction::Full { result, original_tokens }) => {
             // Capture the disjoint delta BEFORE `result.compacted_messages` is
-            // partial-moved below (drift note #4) — cheap, avoids fragility.
+            // partial-moved into `conversations` below. A String clone is cheap
+            // next to the compaction itself, and it stops this read from
+            // silently breaking if the move order below ever changes.
             let delta = result.new_summary.clone();
             let tokens_freed = original_tokens
                 .saturating_sub(estimate_history_tokens(&result.compacted_messages));
@@ -193,9 +195,11 @@ fn try_auto_compact(
                     estimated_tokens_freed: tokens_freed,
                 });
 
-                // REQ-5: feed the disjoint delta summary into the RAG memory
-                // pipeline. Only on Full compaction, only after the snapshot
-                // persisted — mirrors the StreamEvent::Compaction gate above.
+                // Feed the disjoint delta summary into the RAG memory pipeline.
+                // Only on Full compaction (Micro truncates in place and produces
+                // no summary), and only after the snapshot persisted — indexing a
+                // summary of history the session file never received would leave
+                // memory describing a conversation that no longer exists on disk.
                 let project_id = project_id_from_path(agent_project_path);
                 let evt = build_compaction_event(agent_id, project_id, delta, current_time_millis());
                 if let Err(e) = state.memory_tx.send(evt) {
@@ -212,8 +216,12 @@ fn try_auto_compact(
 ///
 /// Lock order: session_manager → conversations (matches session commands).
 /// If persist fails, the in-memory push is rolled back.
-/// R-NEW-1: `agent_project_path` is derived at the call site and forwarded to the
-/// MemoryEvent builder. None means no project — project_id will be None in the event.
+/// `agent_project_path` is resolved at the call site (where the agent is known)
+/// and forwarded, rather than looked up here: this function already holds two
+/// locks and must not reach back into the agent registry for a third. `None`
+/// means the agent has no project, and the emitted event carries `project_id:
+/// None` — memories from a project-less agent stay unscoped instead of leaking
+/// into some other project's retrieval.
 fn push_and_persist(
     state: &AppState,
     agent_id: &str,
@@ -255,7 +263,10 @@ pub(crate) fn push_and_persist_inner(
         return;
     }
 
-    // ── Phase 3: emit MemoryEvent (design §4.d, R-NEW-1) ─────────────────────
+    // ── Emit the MemoryEvent ──────────────────────────────────────────────────
+    // Deliberately AFTER the persist-or-rollback above: the RAG index must never
+    // hold a message the session file rejected. Send is fire-and-forget on an
+    // unbounded channel so the chat hot path never blocks on ingestion.
     // Derive project_id from the path if provided.
     let project_id: Option<String> = agent_project_path
         .filter(|s| !s.is_empty())
@@ -270,7 +281,7 @@ pub(crate) fn push_and_persist_inner(
     }
 }
 
-// ── Compaction → memory pipeline (Phase 7, REQ-5) ──────────────────────────────
+// ── Compaction → memory pipeline ──────────────────────────────────────────────
 
 /// Pure builder for the `MemoryEvent` sent to the RAG pipeline after a Full
 /// compaction. Tauri-runtime-free — mirrors `MemoryEvent::from_message`'s
@@ -304,7 +315,7 @@ fn unix_now_secs() -> u64 {
         .as_secs()
 }
 
-// ── 12-B: agent self-report (advisory) ────────────────────────────────────────
+// ── Agent self-report (advisory) ──────────────────────────────────────────────
 
 /// Handle the `report_anomaly` pseudo-tool. NO external side effect — emits
 /// `StreamEvent::AnomalyReported` to the UI and returns an acknowledgement
@@ -443,7 +454,7 @@ async fn request_user_confirmation(
     decision
 }
 
-// ── Memory pre-compute helper (Phase 4) ─────────────────────────────────────
+// ── Memory pre-compute helper: builds the query-aware system prompt once, before the agentic loop ──
 
 /// Derives the project_id string from the agent's `project_path` (if set).
 /// Used by both `stream_chat` and tests.
@@ -493,13 +504,61 @@ pub(crate) async fn compute_memory_prefix(
         });
 
     let embedder_opt = state.embedder.get().cloned();
+
+    // Widens the DENSE half of the query with up to MAX_CONTEXT_TURNS recent
+    // prior user turns, so a short follow-up ("y el segundo?") can still
+    // retrieve what it refers to. The lexical/FTS5 channel always keeps
+    // `user_query` untouched — see `QueryTexts`'s doc comment. Requires BOTH
+    // an embedder (its `query_prefix()` sizes the budget) and a resolved
+    // tokenizer (the only token counter this ever uses, never the byte/4
+    // heuristic); either missing degrades to embedding the raw message,
+    // which is today's exact behavior and also this function's original
+    // control path when neither exists yet.
+    let embed_query: String = match &embedder_opt {
+        Some(emb) => {
+            let prior_turns = {
+                let conversations = state.conversations.lock().unwrap_or_else(|e| e.into_inner());
+                crate::memory::query_context::select_prior_user_turns(
+                    &conversations,
+                    agent_id,
+                    user_query,
+                    crate::memory::query_context::MAX_CONTEXT_TURNS,
+                )
+            };
+            match resolve_tokenizer(state).await {
+                Some(tok) => {
+                    // Encode failure admits nothing (usize::MAX): a turn the
+                    // tokenizer cannot even count can never be judged to fit
+                    // the budget, so it fails toward "no extra context"
+                    // rather than toward a silent under-count.
+                    let counter = move |s: &str| {
+                        tok.encode(s, false).map(|e| e.len()).unwrap_or(usize::MAX)
+                    };
+                    let budget = crate::memory::query_context::query_budget_tokens(
+                        crate::memory::embedder::EMBED_MAX_TOKENS,
+                        crate::memory::embedder::SPECIAL_TOKEN_RESERVE,
+                        counter(emb.query_prefix()),
+                    );
+                    crate::memory::query_context::compose_query_context(
+                        user_query,
+                        &prior_turns,
+                        budget,
+                        &counter,
+                    )
+                }
+                None => user_query.to_string(),
+            }
+        }
+        None => user_query.to_string(),
+    };
+
     let memory_prefix = crate::memory::prompt_builder::build_memory_prompt(
         &state.memory_store,
         &workspace_mgr,
         embedder_opt,
         agent_id,
         project_id_opt,
-        user_query,
+        crate::memory::prompt_builder::QueryTexts { lexical: user_query, embedded: &embed_query },
         &emitted,
         Some(state.access_tracker.as_ref()),
     )
@@ -511,6 +570,30 @@ pub(crate) async fn compute_memory_prefix(
     } else {
         format!("{}\n\n{}", memory_prefix, agent_system_prompt)
     }
+}
+
+/// Resolves the shared tokenizer for query-context composition: a lock-free
+/// fast path when `state.tokenizer` is already filled (the common case, once
+/// the memory worker's own load has landed), and a one-time self-healing
+/// retry when it is still empty — the worker's load may not have finished
+/// yet, or the tokenizer file may have just become available. The retry runs
+/// on `spawn_blocking` because parsing a ~17 MB `tokenizer.json` is CPU work
+/// that must not sit on the async executor; `get_or_try_init` leaves the cell
+/// EMPTY on failure, so the very next turn tries again rather than caching a
+/// permanent "absent" state.
+async fn resolve_tokenizer(state: &AppState) -> Option<std::sync::Arc<tokenizers::Tokenizer>> {
+    if let Some(tok) = state.tokenizer.get() {
+        return Some(tok.clone());
+    }
+    let cell = state.tokenizer.clone();
+    let base_dir = state.base_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        cell.get_or_try_init(|| crate::memory::model_download::load_tokenizer(&base_dir).ok_or(()))
+            .ok()
+            .cloned()
+    })
+    .await
+    .unwrap_or(None)
 }
 
 // ── Command ───────────────────────────────────────────────────────────────────
@@ -612,7 +695,7 @@ pub async fn stream_chat(
         .map(|sm| sm.current_session_dir())
         .unwrap_or_else(|_| PathBuf::from("/tmp/claw-garden"));
 
-    // ── Point 1: Pre-flight OAuth refresh ────────────────────────────────────
+    // ── Pre-flight OAuth refresh ─────────────────────────────────────────────
     // Must happen BEFORE get_agent_provider() so resolve_anthropic_auth() reads
     // the freshly written token from disk.
     match crate::services::auth::ensure_oauth_fresh(&state.oauth_refresh_lock).await {
@@ -646,9 +729,11 @@ pub async fn stream_chat(
         agent_zone: None, // populated when zone system is wired up
     };
 
-    // ── Phase 4: pre-loop memory pre-computation (D2) ────────────────────────
-    // Runs ONCE before the agentic loop. The same combined_system_prompt is
-    // reused for all MAX_TOOL_ITERATIONS iterations (D2 — one embed per turn).
+    // ── Memory pre-computation runs once, before the agentic loop starts ────
+    // The same combined_system_prompt is reused for every iteration below:
+    // re-running retrieval per tool round-trip would pay for an extra embed
+    // call each time for no benefit, since the user's own message does not
+    // change mid-loop.
     let project_id_opt = project_id_from_path(agent_project_path.as_deref());
     let combined_system_prompt = compute_memory_prefix(
         &state,
@@ -658,8 +743,9 @@ pub async fn stream_chat(
         &message_text_for_query,
     )
     .await;
-    // TODO Phase 5+: re-run retrieval per iteration when AccessTracker emits
-    // synchronous tier-change events mid-loop (D2 forward-marker)
+    // TODO: re-run retrieval per iteration once the access tracker can emit a
+    // synchronous tier-change signal mid-loop — today it only flushes on its
+    // own timer, so there is no event yet for this loop to react to.
 
     // === AGENTIC LOOP ===
     for iteration in 0..MAX_TOOL_ITERATIONS {
@@ -796,7 +882,7 @@ pub async fn stream_chat(
                     },
                 );
 
-                // Point 2: Two-phase auto-compaction after text response
+                // Two-phase auto-compaction after text response
                 try_auto_compact(&state, &agent_id, provider.name(), &on_event, agent_project_path.as_deref());
 
                 // Stop hook — always fire & forget, the agent has finished its turn.
@@ -926,7 +1012,9 @@ pub async fn stream_chat(
                     //   1. Hook said Deny → block immediately.
                     //   2. Hook said Ask → request user confirmation (with hook's reason).
                     //   3. Hook said Allow → if the tool is a NATIVE destructive built-in,
-                    //      gate on user confirmation regardless of hook config (12-A).
+                    //      gate on user confirmation regardless of hook config —
+                    //      a permissive hook must not be able to silently waive
+                    //      the built-in destructive-operation prompt.
                     //   4. Otherwise → execute.
                     //
                     // Note: native-destructive gate runs on the EFFECTIVE input (post-hook
@@ -1003,7 +1091,7 @@ pub async fn stream_chat(
                         };
                         (format!("{base}{tail}"), true)
                     } else if tool_name == "report_anomaly" {
-                        // ── 12-B: advisory self-report — bypass the executor ─────────
+                        // ── Advisory self-report — bypass the executor ───────────────
                         // No side effect, no pipeline — emit event, return ack, let the
                         // agentic loop continue. PostToolUse hooks still run below so
                         // operators can plug in additional logging or telemetry.
@@ -1223,12 +1311,19 @@ pub async fn stream_chat(
                             content: final_content,
                             tool_calls: Some(vec![tc.clone()]),
                             timestamp_ms: current_time_millis(),
-                            is_error: Some(is_error), // Phase 3 D1 — is_error in scope from line ~814
+                            // Marks a TOOL-level failure — the tool returned an
+                            // error, or it was denied before it ran — as opposed
+                            // to a harness failure. Ingestion reads it: a Tool
+                            // message with `Some(true)` is stored as a ToolError
+                            // memory (higher importance than a plain chat
+                            // message) and the episodic writer collects it into
+                            // `errors_encountered`.
+                            is_error: Some(is_error),
                         },
                     );
                 }
 
-                // Point 2: Two-phase auto-compaction after tool execution
+                // Two-phase auto-compaction after tool execution
                 try_auto_compact(&state, &agent_id, provider.name(), &on_event, agent_project_path.as_deref());
 
                 let _ = on_event.send(StreamEvent::State {
@@ -1258,7 +1353,7 @@ pub async fn stream_chat(
     Ok(())
 }
 
-// ── T13-tests: push_and_persist MemoryEvent emission (REQ-INT-002) ────────────
+// ── Tests: push_and_persist MemoryEvent emission ──────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -1315,7 +1410,7 @@ mod tests {
         push_and_persist_inner(&state, "agent-1", None, msg);
     }
 
-    // ── T6-test (REQ-5): pure build_compaction_event helper ───────────────────
+    // ── Pure build_compaction_event helper ────────────────────────────────────
 
     #[test]
     fn build_compaction_event_sets_compaction_source_and_system_sentinel_role() {
@@ -1339,7 +1434,7 @@ mod tests {
         assert_eq!(evt.project_id, None);
     }
 
-    // ── T7-test (REQ-5): try_auto_compact Compaction-event gating ─────────────
+    // ── try_auto_compact Compaction-event gating ──────────────────────────────
 
     fn make_test_channel() -> Channel<StreamEvent> {
         Channel::new(|_| Ok(()))
@@ -1357,7 +1452,9 @@ mod tests {
     }
 
     /// Drains ALL pending events off `rx` and returns only the ones sourced
-    /// from Compaction — the signal under test in every T7 scenario.
+    /// from Compaction. Filtering — rather than a single `try_recv` — keeps
+    /// these assertions about the compaction pipeline immune to any other
+    /// traffic the shared `memory_tx` may carry.
     fn drain_compaction_events(
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<MemoryEvent>,
     ) -> Vec<MemoryEvent> {
@@ -1500,7 +1597,7 @@ mod tests {
         );
     }
 
-    // T24-tests: compute_memory_prefix (pre-loop memory pre-compute) ─────────
+    // ── compute_memory_prefix (pre-loop memory pre-compute) ───────────────────
 
     /// With no memories and no workspace file, compute_memory_prefix should
     /// return the agent_system_prompt unchanged (byte-equal).
@@ -1611,5 +1708,419 @@ mod tests {
             result.contains(agent_system_prompt),
             "should contain agent_system_prompt even with no embedder"
         );
+    }
+
+    // ── Query-context composition wiring ──────────────────────────────────
+
+    /// Records every `(role, text)` pair handed to `embed_with_role`, so a
+    /// test can see exactly what text `compute_memory_prefix` chose to embed
+    /// without depending on retrieval hits existing at all.
+    struct RecordingEmbedder {
+        calls: std::sync::Mutex<Vec<(crate::memory::embedder::EmbedRole, String)>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::memory::embedder::Embedder for RecordingEmbedder {
+        async fn embed_with_role(
+            &self,
+            text: &str,
+            role: crate::memory::embedder::EmbedRole,
+        ) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+            self.calls.lock().unwrap().push((role, text.to_string()));
+            Ok(vec![0.1_f32; 384])
+        }
+        fn dimensions(&self) -> usize {
+            384
+        }
+        fn model_id(&self) -> &str {
+            "recording"
+        }
+        fn query_prefix(&self) -> &str {
+            ""
+        }
+        fn passage_prefix(&self) -> &str {
+            ""
+        }
+    }
+
+    /// Writes a real, minimal `tokenizer.json` under `base_dir` — same
+    /// fixture shape as `memory::worker`'s tokenizer-lifecycle tests: a
+    /// `WordLevel` model with a whitespace pre-tokenizer, genuinely parsed
+    /// and genuinely counting one token per word.
+    fn write_minimal_tokenizer_fixture(base_dir: &std::path::Path) {
+        use tokenizers::models::wordlevel::WordLevel;
+        use tokenizers::pre_tokenizers::whitespace::Whitespace;
+
+        let target = crate::memory::model_download::tokenizer_path(base_dir);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let vocab_path = target.parent().unwrap().join("vocab.json");
+        std::fs::write(&vocab_path, r#"{"[UNK]":0,"hello":1,"world":2}"#).unwrap();
+
+        let model = WordLevel::from_file(vocab_path.to_str().unwrap(), "[UNK]".to_string())
+            .expect("fixture vocab must build a WordLevel model");
+        let mut tok = tokenizers::Tokenizer::new(model);
+        tok.with_pre_tokenizer(Some(Whitespace));
+        tok.save(&target, false).expect("fixture tokenizer must save to tokenizer_path");
+    }
+
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "claw-garden-chat-test-{label}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Seeds two distinct prior `Role::User` turns for `agent_id` directly
+    /// into `state.conversations`, bypassing `push_and_persist` — this test
+    /// only needs history to already exist, not the exact mechanics of how
+    /// it got there.
+    fn seed_prior_user_turns(state: &AppState, agent_id: &str, turns: &[&str]) {
+        let mut conversations = state.conversations.lock().unwrap();
+        let messages = turns
+            .iter()
+            .enumerate()
+            .map(|(i, content)| ChatMessage {
+                id: format!("prior-{i}"),
+                role: Role::User,
+                content: content.to_string(),
+                tool_calls: None,
+                timestamp_ms: i as u64,
+                is_error: None,
+            })
+            .collect();
+        conversations.insert(agent_id.to_string(), messages);
+    }
+
+    /// With a resolvable tokenizer AND prior turns that fit the budget, the
+    /// text handed to the embedder must be the composed one — current
+    /// message first, then the prior turns — never the raw message alone.
+    #[tokio::test]
+    async fn compute_memory_prefix_embeds_composed_text_when_tokenizer_and_prior_turns_are_present() {
+        let (mut state, _rx) = AppState::new_for_test_async().await;
+
+        // Isolated from every other test sharing new_for_test_async()'s
+        // default base_dir — writing a real tokenizer.json there would leak
+        // across tests running in the same process.
+        let base_dir = unique_temp_dir("compose-present");
+        write_minimal_tokenizer_fixture(&base_dir);
+        state.base_dir = base_dir.clone();
+
+        let recording = std::sync::Arc::new(RecordingEmbedder { calls: std::sync::Mutex::new(Vec::new()) });
+        state.embedder = std::sync::Arc::new(once_cell::sync::OnceCell::new());
+        state
+            .embedder
+            .set(recording.clone() as std::sync::Arc<dyn crate::memory::embedder::Embedder>)
+            .ok();
+
+        let agent_id = "agent-compose";
+        seed_prior_user_turns(&state, agent_id, &["first prior turn", "second prior turn"]);
+
+        compute_memory_prefix(&state, "system prompt", agent_id, None, "current message").await;
+
+        let calls = recording.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "expected exactly one embed call, got {calls:?}");
+        assert_eq!(calls[0].0, crate::memory::embedder::EmbedRole::Query);
+        assert_ne!(
+            calls[0].1, "current message",
+            "with a resolvable tokenizer and fitting prior turns, the embedded text must be composed"
+        );
+        assert!(calls[0].1.starts_with("current message"), "composed text must lead with the current message");
+        assert!(calls[0].1.contains("second prior turn"), "the newest prior turn must be present");
+
+        std::fs::remove_dir_all(&base_dir).ok();
+    }
+
+    /// The self-heal: a turn that arrives before the model download has
+    /// landed must skip composition WITHOUT caching that absence, so a later
+    /// turn — once `tokenizer.json` exists — fills the cell and composes.
+    ///
+    /// `get_or_try_init` is what makes this work: it leaves the cell EMPTY on
+    /// failure. A plain `get_or_init` (or any variant that seeds a
+    /// placeholder to avoid re-loading) would permanently pin the first
+    /// turn's "no tokenizer" answer, and every later turn in the process
+    /// would silently keep embedding the raw message even though the file is
+    /// now on disk.
+    #[tokio::test]
+    async fn an_empty_tokenizer_cell_self_heals_on_a_later_turn() {
+        let (mut state, _rx) = AppState::new_for_test_async().await;
+
+        let base_dir = unique_temp_dir("self-heal"); // no tokenizer.json yet
+        state.base_dir = base_dir.clone();
+
+        let recording =
+            std::sync::Arc::new(RecordingEmbedder { calls: std::sync::Mutex::new(Vec::new()) });
+        state.embedder = std::sync::Arc::new(once_cell::sync::OnceCell::new());
+        state
+            .embedder
+            .set(recording.clone() as std::sync::Arc<dyn crate::memory::embedder::Embedder>)
+            .ok();
+
+        let agent_id = "agent-self-heal";
+        seed_prior_user_turns(&state, agent_id, &["a prior turn"]);
+
+        // Turn 1 — the download has not landed.
+        compute_memory_prefix(&state, "system prompt", agent_id, None, "first message").await;
+        assert_eq!(
+            recording.calls.lock().unwrap()[0].1,
+            "first message",
+            "no tokenizer yet: composition must be skipped and the raw message embedded"
+        );
+        assert!(
+            state.tokenizer.get().is_none(),
+            "a failed load must leave the cell EMPTY — caching the failure would make the skip permanent"
+        );
+
+        // The download lands between turns.
+        write_minimal_tokenizer_fixture(&base_dir);
+
+        // Turn 2 — the same process, the same state, no restart.
+        compute_memory_prefix(&state, "system prompt", agent_id, None, "second message").await;
+        let calls = recording.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "expected one embed call per turn, got {calls:?}");
+        assert_eq!(
+            calls[1].1, "second message\na prior turn",
+            "once tokenizer.json exists the very next turn must compose — this is the self-heal"
+        );
+        assert!(
+            state.tokenizer.get().is_some(),
+            "the successful load must fill the shared cell so later turns take the lock-free fast path"
+        );
+
+        drop(calls);
+        std::fs::remove_dir_all(&base_dir).ok();
+    }
+
+    /// The budget must be spent in TOKENS from the real tokenizer, never in
+    /// the byte/4 heuristic the chat chunker falls back to — the spec forbids
+    /// that fallback on the query path outright.
+    ///
+    /// The two counters are only distinguishable when they straddle an
+    /// admission decision, so this fixture is built to straddle one: the
+    /// oversized turn is 700 single-character words. The real word-level
+    /// tokenizer counts 700 tokens for it, which does not fit the remaining
+    /// budget; byte/4 counts 1399/4 = 349, which fits comfortably. A shorter
+    /// turn sits NEWER than it so admission is proven to run at all (a test
+    /// that only asserted the oversized turn's absence would also pass if
+    /// composition had been skipped entirely).
+    #[tokio::test]
+    async fn the_budget_is_spent_in_real_tokens_not_a_byte_length_heuristic() {
+        let (mut state, _rx) = AppState::new_for_test_async().await;
+
+        let base_dir = unique_temp_dir("token-budget");
+        write_minimal_tokenizer_fixture(&base_dir);
+        state.base_dir = base_dir.clone();
+
+        let recording =
+            std::sync::Arc::new(RecordingEmbedder { calls: std::sync::Mutex::new(Vec::new()) });
+        state.embedder = std::sync::Arc::new(once_cell::sync::OnceCell::new());
+        state
+            .embedder
+            .set(recording.clone() as std::sync::Arc<dyn crate::memory::embedder::Embedder>)
+            .ok();
+
+        let agent_id = "agent-token-budget";
+        // 700 words, 1399 bytes: 700 tokens under the real tokenizer,
+        // 349 under byte/4.
+        let oversized: String =
+            std::iter::repeat("z").take(700).collect::<Vec<_>>().join(" ");
+        seed_prior_user_turns(&state, agent_id, &[&oversized, "short turn"]);
+
+        compute_memory_prefix(&state, "system prompt", agent_id, None, "current message").await;
+
+        let calls = recording.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "expected exactly one embed call, got {calls:?}");
+        assert_eq!(
+            calls[0].1, "current message\nshort turn",
+            "the newer short turn must be admitted (proving composition ran) and the 700-token \
+             turn rejected — under a byte/4 counter it would measure only 349 and be admitted too"
+        );
+
+        std::fs::remove_dir_all(&base_dir).ok();
+    }
+
+    /// Answers with the same unit vector whatever it is asked to embed, so a
+    /// fixture can place stored rows at chosen distances from the query
+    /// without the query VECTOR depending on the query STRING — which is what
+    /// makes the lexical half of the test below independent of the dense half.
+    struct FixedVecEmbedder;
+    #[async_trait::async_trait]
+    impl crate::memory::embedder::Embedder for FixedVecEmbedder {
+        async fn embed_with_role(
+            &self,
+            _text: &str,
+            _role: crate::memory::embedder::EmbedRole,
+        ) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+            let mut v = vec![0.0_f32; 384];
+            v[0] = 1.0;
+            Ok(v)
+        }
+        fn dimensions(&self) -> usize {
+            384
+        }
+        fn model_id(&self) -> &str {
+            "fixed-vec"
+        }
+        fn query_prefix(&self) -> &str {
+            ""
+        }
+        fn passage_prefix(&self) -> &str {
+            ""
+        }
+    }
+
+    fn unit_bytes(v: &[f32]) -> Vec<u8> {
+        crate::memory::search::serialize_f32_query_pub(&crate::memory::vector::to_unit(v).unwrap())
+    }
+
+    /// Seeds one `memory` row at an exact (tier, importance, age, vector)
+    /// coordinate. Raw SQL on purpose: this test is about WHICH channel
+    /// reaches a given coordinate, so the coordinate has to be settable
+    /// directly rather than derived from an ingestion path.
+    async fn seed_memory_aged(
+        store: &crate::memory::MemoryStore,
+        agent_id: &str,
+        content: &str,
+        importance: f64,
+        age_days: i64,
+        bytes: Vec<u8>,
+    ) {
+        let agent = agent_id.to_string();
+        let content = content.to_string();
+        let ts = crate::memory::clock::TimestampMs::now().as_millis_i64() - age_days * 86_400_000;
+        store
+            .conn
+            .call(move |c| -> Result<(), rusqlite::Error> {
+                c.execute(
+                    "INSERT INTO memory (scope, agent_id, content, memory_type, source,
+                     created_at, created_by_type, created_by_ref,
+                     last_modified_at, last_accessed_at, importance, tier, status)
+                     VALUES ('agent', ?1, ?2, 'chat_message', 'chat', ?3, 'user', ?1, ?3, ?3, ?4, 3, 'active')",
+                    rusqlite::params![agent, content, ts, importance],
+                )?;
+                let id = c.last_insert_rowid();
+                c.execute(
+                    "INSERT INTO memory_vectors (rowid, embedding) VALUES (?1, ?2)",
+                    rusqlite::params![id, bytes],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    /// The change's core invariant, asserted at the ONE production call site
+    /// that builds `QueryTexts`: composition widens only the DENSE half of
+    /// the query. `search_all_memories`'s lexical/FTS5 channel must keep
+    /// scoring against the raw message the user actually typed — feeding it
+    /// the composed text would let BM25 match on words from a PRIOR turn that
+    /// the user never wrote this turn, which is the exact-identifier strength
+    /// the lexical channel exists for.
+    ///
+    /// `prompt_builder`'s own `the_lexical_channel_never_sees_the_composed_context`
+    /// proves `build_memory_prompt` routes the two fields correctly once they
+    /// are built; nothing there can see the fields being MISBUILT here, which
+    /// is why this test constructs the fixture at the `compute_memory_prefix`
+    /// level instead.
+    ///
+    /// Fixture shape: a row reachable ONLY through an exact lexical match
+    /// (`FixedVecEmbedder` makes the dense channel blind to word content, and
+    /// the row sits off-axis behind 30 nearer fillers), carrying a rare
+    /// identifier that lives ONLY in the prior turn — never in the current
+    /// message. If it surfaces, the composed text reached the lexical channel.
+    #[tokio::test]
+    async fn the_lexical_channel_receives_the_raw_message_not_the_composed_text() {
+        let (mut state, _rx) = AppState::new_for_test_async().await;
+
+        let base_dir = unique_temp_dir("lexical-raw");
+        write_minimal_tokenizer_fixture(&base_dir);
+        state.base_dir = base_dir.clone();
+
+        state.embedder = std::sync::Arc::new(once_cell::sync::OnceCell::new());
+        state
+            .embedder
+            .set(std::sync::Arc::new(FixedVecEmbedder)
+                as std::sync::Arc<dyn crate::memory::embedder::Embedder>)
+            .ok();
+
+        let agent_id = "agent-lexical-raw";
+
+        let mut near = vec![0.0_f32; 384];
+        near[0] = 1.0;
+        let near_bytes = unit_bytes(&near);
+        let mut off = vec![0.0_f32; 384];
+        off[0] = 0.95;
+        off[1] = (1.0_f32 - 0.95 * 0.95).sqrt();
+        let off_bytes = unit_bytes(&off);
+
+        for i in 0..30 {
+            seed_memory_aged(
+                &state.memory_store,
+                agent_id,
+                &format!("filler row {i}"),
+                1.0,
+                365,
+                near_bytes.clone(),
+            )
+            .await;
+        }
+        seed_memory_aged(
+            &state.memory_store,
+            agent_id,
+            "the deployment runbook lives under RAREIDENT99XY",
+            10.0,
+            0,
+            off_bytes,
+        )
+        .await;
+
+        // The identifier exists ONLY in the prior turn, so it can only reach
+        // the lexical channel by way of the composed text.
+        seed_prior_user_turns(&state, agent_id, &["where is RAREIDENT99XY documented"]);
+
+        let prefix =
+            compute_memory_prefix(&state, "system prompt", agent_id, None, "what should I check next")
+                .await;
+
+        assert!(
+            !prefix.contains("RAREIDENT99XY"),
+            "the identifier appears only in the PRIOR turn, so the raw current message gives the \
+             lexical channel no exact-match term for this row; its presence means the composed \
+             text was handed to `search_all_memories` as `query_text`: {prefix}"
+        );
+
+        std::fs::remove_dir_all(&base_dir).ok();
+    }
+
+    /// Control for the test above: no `tokenizer.json` exists under
+    /// `base_dir`, so `state.tokenizer` never resolves. Composition must be
+    /// skipped entirely and the raw message embedded — today's exact
+    /// pre-composition behavior.
+    #[tokio::test]
+    async fn compute_memory_prefix_embeds_the_raw_message_when_no_tokenizer_resolves() {
+        let (mut state, _rx) = AppState::new_for_test_async().await;
+        state.base_dir = unique_temp_dir("compose-absent"); // no tokenizer.json written here
+
+        let recording = std::sync::Arc::new(RecordingEmbedder { calls: std::sync::Mutex::new(Vec::new()) });
+        state.embedder = std::sync::Arc::new(once_cell::sync::OnceCell::new());
+        state
+            .embedder
+            .set(recording.clone() as std::sync::Arc<dyn crate::memory::embedder::Embedder>)
+            .ok();
+
+        let agent_id = "agent-compose-control";
+        seed_prior_user_turns(&state, agent_id, &["a prior turn that must be ignored"]);
+
+        compute_memory_prefix(&state, "system prompt", agent_id, None, "current message").await;
+
+        let calls = recording.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "expected exactly one embed call, got {calls:?}");
+        assert_eq!(
+            calls[0].1, "current message",
+            "no resolvable tokenizer must skip composition and embed the raw message unchanged"
+        );
+
+        std::fs::remove_dir_all(&state.base_dir).ok();
     }
 }

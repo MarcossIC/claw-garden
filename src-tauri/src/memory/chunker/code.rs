@@ -56,7 +56,7 @@ impl CodeChunker {
             Some("rs") => &self.rust,
             Some("ts") | Some("tsx") => &self.typescript,
             Some("py") => &self.python,
-            _ => return self.fallback.split(content, 480),
+            _ => return self.fallback.split(content, super::CHUNK_MAX_TOKENS, 0),
         };
 
         let tree_opt = {
@@ -65,7 +65,7 @@ impl CodeChunker {
         };
 
         let Some(tree) = tree_opt else {
-            return self.fallback.split(content, 480);
+            return self.fallback.split(content, super::CHUNK_MAX_TOKENS, 0);
         };
 
         let bytes = content.as_bytes();
@@ -86,8 +86,11 @@ impl CodeChunker {
             let header =
                 Some(format!("{} ({})", node.kind(), language.unwrap_or("unknown")));
 
-            // Each node may itself exceed 480 tokens — sub-split via fallback.
-            for mut c in self.fallback.split(snippet, 480) {
+            // Each node may itself exceed the cap — sub-split via fallback.
+            // No overlap here: a node boundary from the AST is already a
+            // meaningful split point, unlike the hard mid-turn cut chat
+            // content gets, so there is nothing straddling to protect.
+            for mut c in self.fallback.split(snippet, super::CHUNK_MAX_TOKENS, 0) {
                 c.header = header.clone();
                 chunks.push(c);
             }
@@ -95,7 +98,7 @@ impl CodeChunker {
 
         if chunks.is_empty() {
             // Root had no named children (e.g. malformed input or empty tree).
-            return self.fallback.split(content, 480);
+            return self.fallback.split(content, super::CHUNK_MAX_TOKENS, 0);
         }
 
         chunks
@@ -185,6 +188,34 @@ mod tests {
         // Must not panic, must return >= 1 chunk
         let chunks = chunker.chunk(content, Some("rs"));
         assert!(!chunks.is_empty(), "malformed input must still produce at least 1 chunk");
+    }
+
+    #[test]
+    fn fallback_split_uses_the_shared_cap_and_no_overlap() {
+        // Both halves of the CodeChunker contract in one place: the cap comes
+        // from `CHUNK_MAX_TOKENS` (so a chunk still fits the embedder window),
+        // and adjacent chunks do NOT overlap — deliberately, because an AST
+        // node boundary is already a meaningful split point, unlike the hard
+        // mid-turn cut chat content gets. Without this, changing either the
+        // cap or the overlap here is silent.
+        let max_bytes = super::super::CHUNK_MAX_TOKENS * 4;
+        let content = "let x = 1; ".repeat(600); // 6600 bytes, no parseable AST
+        let chunker = CodeChunker::new();
+        let chunks = chunker.chunk(&content, None);
+
+        assert!(chunks.len() >= 3, "expected >= 3 chunks, got {}", chunks.len());
+        for chunk in &chunks[..chunks.len() - 1] {
+            assert_eq!(
+                chunk.text.len(),
+                max_bytes,
+                "every non-final fallback chunk must fill the shared cap exactly"
+            );
+        }
+        let concatenated: String = chunks.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            concatenated, content,
+            "zero overlap: concatenating the chunks must reproduce the input exactly"
+        );
     }
 
     #[test]

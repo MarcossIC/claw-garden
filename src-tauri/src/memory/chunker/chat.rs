@@ -1,10 +1,12 @@
-//! Turn-based chat chunker (Phase 3 — REQ-CHK-003).
+//! Turn-based chat chunker.
 //!
-//! Phase 3 contract (LOCKED D6, D7):
-//!   - Speaker boundary is the OUTER hard rule (each call here is ONE turn).
-//!   - 480-token cap (under the 512-token model limit, safety margin).
-//!   - NO overlap.
-//!   - NO markdown-fence / AST enrichment (deferred to Phase 4).
+//! Speaker boundary is the outer hard rule, deliberately: each call here is
+//! ONE turn, and letting a chunk cross turns would mix two speakers' voices
+//! into a single vector. Inside a turn, content is capped at
+//! `CHUNK_MAX_TOKENS` (headroom under the embedder's 512-token model limit)
+//! with `CHUNK_OVERLAP_TOKENS` of repeated content between adjacent chunks,
+//! so a fact spanning a cut point still lands whole in at least one chunk.
+//! No markdown-fence or AST-aware enrichment — that stays the code chunker's job.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -26,23 +28,24 @@ const _: fn() = || {
 };
 
 impl ChatChunker {
-    /// Build a chunker by loading the tokenizer from the Phase 2 cache.
-    /// Falls back to byte-length splitter if the file is absent (R-NEW-2 mitigation).
-    pub fn new_from_base_dir(base_dir: &Path) -> Self {
-        let path = crate::memory::model_download::tokenizer_path(base_dir);
-        match tokenizers::Tokenizer::from_file(&path) {
-            Ok(tok) => Self {
-                splitter: TokenSplitter::with_tokenizer(Arc::new(tok)),
-            },
-            Err(e) => {
-                log::warn!(
-                    "ChatChunker: tokenizer not loadable at {} ({e}); \
-                     falling back to byte-length splitter",
-                    path.display()
-                );
-                Self { splitter: TokenSplitter::fallback() }
-            }
+    /// Build a chunker from an already-resolved tokenizer — `Some` uses it,
+    /// `None` falls back to the byte-length splitter. Pulled out of
+    /// `new_from_base_dir` so a caller that already loaded (or shares) a
+    /// tokenizer via `model_download::load_tokenizer` never pays for a
+    /// second parse of the same ~17 MB file.
+    pub fn from_tokenizer(tokenizer: Option<Arc<tokenizers::Tokenizer>>) -> Self {
+        match tokenizer {
+            Some(tok) => Self { splitter: TokenSplitter::with_tokenizer(tok) },
+            None => Self { splitter: TokenSplitter::fallback() },
         }
+    }
+
+    /// Build a chunker by loading the tokenizer from the model download cache.
+    /// Falls back to the byte-length splitter if the file is absent — the
+    /// tokenizer download can fail or still be in flight, and chunking must
+    /// keep working (with a coarser cap estimate) rather than block ingestion.
+    pub fn new_from_base_dir(base_dir: &Path) -> Self {
+        Self::from_tokenizer(crate::memory::model_download::load_tokenizer(base_dir))
     }
 
     /// Test-only — pre-wired tokenizer.
@@ -58,12 +61,20 @@ impl ChatChunker {
     }
 
     /// Chunk a single turn's content. The speaker boundary is implicit:
-    /// the caller (worker) invokes this once per `MemoryEvent`.
+    /// the caller (worker) invokes this once per `MemoryEvent`. Adjacent
+    /// chunks share `CHUNK_OVERLAP_TOKENS` tokens so a fact that would
+    /// otherwise straddle a hard cut stays whole in at least one of them.
     pub fn chunk(&self, content: &str, max_tokens: usize) -> Vec<Chunk> {
         if content.is_empty() {
             return vec![];
         }
-        self.splitter.split(content, max_tokens)
+        self.splitter.split(content, max_tokens, super::CHUNK_OVERLAP_TOKENS)
+    }
+
+    /// Test-only: see `TokenSplitter::tokenizer_ptr`.
+    #[cfg(test)]
+    pub(crate) fn tokenizer_ptr(&self) -> Option<*const tokenizers::Tokenizer> {
+        self.splitter.tokenizer_ptr()
     }
 }
 
@@ -97,14 +108,33 @@ mod tests {
     }
 
     #[test]
-    fn no_overlap_adjacent_chunks() {
+    fn adjacent_chunks_share_exactly_overlap() {
+        let chunker = ChatChunker::with_fallback();
+        let content: String = "word ".repeat(1200); // 6000 bytes
+        let chunks = chunker.chunk(&content, 480);
+        // 6000 bytes at cap 1920 / overlap 256 (stride 1664) is
+        // ceil((6000 - 256) / 1664) = 4 windows. Pinning the count and not
+        // just `>= 2` is what makes a stride change visible here.
+        assert_eq!(chunks.len(), 4, "expected 4 chunks, got {}", chunks.len());
+        for pair in chunks.windows(2) {
+            let tail = &pair[0].text[pair[0].text.len() - 256..];
+            let head = &pair[1].text[..256];
+            assert_eq!(tail, head, "adjacent chunks must share exactly 256 overlap bytes");
+        }
+    }
+
+    #[test]
+    fn chunks_reconstruct_input_when_overlap_removed() {
         let chunker = ChatChunker::with_fallback();
         let content: String = "word ".repeat(1200);
         let chunks = chunker.chunk(&content, 480);
-        let concatenated: String = chunks.iter().map(|c| c.text.as_str()).collect();
+        let mut reconstructed = chunks[0].text.clone();
+        for c in &chunks[1..] {
+            reconstructed.push_str(&c.text[256..]);
+        }
         assert_eq!(
-            concatenated, content,
-            "concatenated chunks must equal original input (no gaps, no overlaps)"
+            reconstructed, content,
+            "removing each chunk's shared overlap must reconstruct the original input exactly (no gaps, no data loss)"
         );
     }
 
@@ -117,7 +147,20 @@ mod tests {
 
     #[test]
     fn tokenizer_absent_falls_back_to_byte_heuristic() {
-        // /nonexistent/path cannot contain tokenizer.json
+        // from_tokenizer(None) is what new_from_base_dir reduces to once the
+        // tokenizer file cannot be loaded — tested directly here rather than
+        // through a nonexistent path, so this test exercises the exact same
+        // fallback branch a caller with a pre-resolved `None` from
+        // `model_download::load_tokenizer` takes.
+        let chunker = ChatChunker::from_tokenizer(None);
+        let chunks = chunker.chunk("hello", 480);
+        assert!(!chunks.is_empty(), "fallback chunker should produce at least 1 chunk");
+    }
+
+    #[test]
+    fn new_from_base_dir_still_falls_back_when_the_file_is_absent() {
+        // Regression coverage for the thin wrapper itself: new_from_base_dir
+        // must still degrade gracefully end to end, not just its delegate.
         let chunker = ChatChunker::new_from_base_dir(std::path::Path::new("/nonexistent/path"));
         let chunks = chunker.chunk("hello", 480);
         assert!(!chunks.is_empty(), "fallback chunker should produce at least 1 chunk");

@@ -59,6 +59,13 @@ pub struct Cli {
     /// built, not here, the same "parser reports what was typed, the callee
     /// validates" split `--golden`/`--out` already follow for paths.
     pub fts_tokenizer: Option<String>,
+    /// `--follow-up`: run the synthetic Ceiling/Floor/Treatment arms instead
+    /// of the normal single-arm scoring pass. Mutually exclusive with every
+    /// sweep axis (`--sweep-imp`, `--sweep-cos-floor`, `--sweep-lexical`) and
+    /// with `--fts-tokenizer` — the sweep varies scoring config, this varies
+    /// query TEXT, and crossing them would multiply runs while making the
+    /// resolvability gate per-point instead of per-run.
+    pub follow_up: bool,
 }
 
 /// What a parse attempt produces. `--help` is not an error: it takes
@@ -91,6 +98,8 @@ pub enum CliError {
     InvalidSweepCosFloor(String),
     #[error("invalid --sweep-lexical value '{0}', expected a non-negative integer")]
     InvalidSweepLexical(String),
+    #[error("--follow-up is mutually exclusive with the sweep flags (--sweep-imp, --sweep-cos-floor, --sweep-lexical, --fts-tokenizer)")]
+    FollowUpWithSweep,
 }
 
 pub const HELP_TEXT: &str = "\
@@ -136,6 +145,10 @@ OPTIONS:
                          similarity.per_case, joined on query, reporting better/worse/net
                          per metric per block. Needs neither --fake/--real nor a golden set;
                          short-circuits like --help.
+    --follow-up          Run the synthetic Ceiling/Floor/Treatment arms instead of the
+                         normal single-arm pass, measuring whether conversational context
+                         helps a content-free follow-up retrieve the right document.
+                         Mutually exclusive with every sweep flag and --fts-tokenizer.
     --help, -h          Print this message and exit
 
 EXIT CODES:
@@ -185,10 +198,12 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
     let mut sweep_cos_floor: Vec<f64> = Vec::new();
     let mut sweep_lexical: Vec<usize> = Vec::new();
     let mut fts_tokenizer: Option<String> = None;
+    let mut follow_up = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return Ok(ParseOutcome::Help),
+            "--follow-up" => follow_up = true,
             "--diff" => {
                 let a = args
                     .next()
@@ -270,6 +285,19 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
 
     let mode = mode.ok_or(CliError::MissingMode)?;
 
+    // `--follow-up` varies query TEXT; the sweep axes vary scoring CONFIG.
+    // Crossing them would multiply runs and turn the resolvability gate
+    // per-point instead of per-run — rejected before any run starts, same
+    // spirit as the mode conflict check above.
+    if follow_up
+        && (!sweep_imp.is_empty()
+            || !sweep_cos_floor.is_empty()
+            || !sweep_lexical.is_empty()
+            || fts_tokenizer.is_some())
+    {
+        return Err(CliError::FollowUpWithSweep);
+    }
+
     Ok(ParseOutcome::Run(Cli {
         mode,
         check_only,
@@ -282,6 +310,7 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
         sweep_cos_floor,
         sweep_lexical,
         fts_tokenizer,
+        follow_up,
     }))
 }
 
@@ -556,6 +585,63 @@ mod tests {
     fn fts_tokenizer_without_a_value_is_an_error() {
         let err = parse(argv(&["--fake", "--fts-tokenizer"])).expect_err("missing value must error");
         assert_eq!(err, CliError::MissingValue("--fts-tokenizer".to_string()));
+    }
+
+    // --- --follow-up -----------------------------------------------------
+
+    #[test]
+    fn follow_up_is_false_by_default() {
+        assert!(!run_cli(&["--fake"]).follow_up);
+    }
+
+    #[test]
+    fn follow_up_alone_parses_true() {
+        assert!(run_cli(&["--fake", "--follow-up"]).follow_up);
+    }
+
+    #[test]
+    fn follow_up_with_sweep_lexical_is_an_error() {
+        let err = parse(argv(&["--fake", "--follow-up", "--sweep-lexical", "20"]))
+            .expect_err("--follow-up + --sweep-lexical must be rejected");
+        assert_eq!(err, CliError::FollowUpWithSweep);
+    }
+
+    #[test]
+    fn follow_up_with_sweep_imp_is_an_error() {
+        let err = parse(argv(&["--fake", "--follow-up", "--sweep-imp", "0.55:1.0"]))
+            .expect_err("--follow-up + --sweep-imp must be rejected");
+        assert_eq!(err, CliError::FollowUpWithSweep);
+    }
+
+    #[test]
+    fn follow_up_with_sweep_cos_floor_is_an_error() {
+        let err = parse(argv(&["--fake", "--follow-up", "--sweep-cos-floor", "0.86"]))
+            .expect_err("--follow-up + --sweep-cos-floor must be rejected");
+        assert_eq!(err, CliError::FollowUpWithSweep);
+    }
+
+    #[test]
+    fn follow_up_with_fts_tokenizer_is_an_error() {
+        let err = parse(argv(&["--fake", "--follow-up", "--fts-tokenizer", "trigram"]))
+            .expect_err("--follow-up + --fts-tokenizer must be rejected");
+        assert_eq!(err, CliError::FollowUpWithSweep);
+    }
+
+    #[test]
+    fn follow_up_order_does_not_matter_for_the_conflict_check() {
+        // The sweep flag typed BEFORE --follow-up must still be caught —
+        // this is a post-parse check over the final state, not a per-token one.
+        let err = parse(argv(&["--fake", "--sweep-lexical", "20", "--follow-up"]))
+            .expect_err("order must not matter for the conflict check");
+        assert_eq!(err, CliError::FollowUpWithSweep);
+    }
+
+    #[test]
+    fn follow_up_composes_with_audit_and_force() {
+        let cli = run_cli(&["--fake", "--follow-up", "--audit", "--force"]);
+        assert!(cli.follow_up);
+        assert!(cli.audit);
+        assert!(cli.force);
     }
 
     #[test]
