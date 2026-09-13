@@ -15,7 +15,7 @@ implementar, se anota en "Casos inesperados" y se decide en conversación aparte
 | Fase | Nombre | Estado | Criterio de salida |
 |------|--------|--------|--------------------|
 | 0 | Identidad, split del workspace, aislamiento de perfiles | ✅ implementada 2026-09-11 · commiteada 2026-09-13 (`d018c0c`, `57119d3`) | `clawg-core` compila sin `tauri` ✅; `cargo run` escribe en `~/.clawg-dev` y no puede abrir `~/.clawg` ✅ (por tests, no por ejecución); suite verde en el número baseline ✅ 998 + 37 + 202 |
-| 1 | Núcleo: `clawg serve` + `clawg mcp` | 🟡 implementada y commiteada 2026-09-13 (`4623960`, `2593849`); **falta la verificación manual del criterio de salida** | Claude Code recuerda algo entre dos sesiones sin la app abierta, contra perfil dev · suite 1.385 tests, 0 failed ✅ · sin `tauri` en `clawg-cli` ✅ · ejecución real del binario: pendiente |
+| 1 | Núcleo: `clawg serve` + `clawg mcp` | ✅ implementada, commiteada y verificada 2026-09-13 (`4623960`, `2593849`) | Claude Code recuerda algo entre dos sesiones sin la app abierta, contra perfil dev ✅ (dos `claude -p` separados, memoria #2) · suite 1.385 tests, 0 failed ✅ · sin `tauri` en `clawg-cli` ✅ |
 | 2 | Release e instalador (compuerta) | ⚪ pendiente | Claw Garden instalado, arranca contra `~/.clawg`, convive con la versión dev. Cero datos migrados hasta acá |
 | 3 | Migración desde engram (6 etapas) | ⚪ pendiente | `CLAUDE.md` apunta a Claw Garden, engram desregistrado, snapshot archivado |
 | 4 | Panel de control | ⚪ pendiente | Encontrar y corregir una memoria mal extraída en < 30 s |
@@ -612,3 +612,46 @@ manual pendiente de Marco** (ver "Pendiente para cerrar la fase").
 - **Con stdio como transporte, stdout es sagrado.** Loggers, `println!` de debug y el stdin de cualquier hijo
   spawneado son los tres lugares por donde se corrompe el protocolo MCP. Los tres quedaron cerrados en código,
   no por convención.
+
+### Verificación manual del criterio de salida (2026-09-13, ejecutada a pedido de Marco)
+
+Todo con el binario debug `target/debug/clawg.exe` (54 MB, `clawg 0.1.0`) contra el perfil dev. La app de escritorio
+estuvo cerrada todo el tiempo.
+
+**Datos.** Se copió sólo `~/.claw-garden/models/multilingual-e5-small/` (465 MB) a `~/.clawg-dev/models/`.
+`~/.claw-garden` quedó intacto: la decisión de renombrarlo o borrarlo sigue siendo de Marco, pero ya no bloquea nada.
+El modelo copiado pasó la verificación de checksums: el embedder estuvo `ready` a los 12 s de arrancar, sin descarga.
+
+| Paso | Comando / acción | Resultado |
+|------|------------------|-----------|
+| Perfil | `clawg serve --profile prod` con binario debug | rechazado: `--profile prod is forbidden in a debug build; use --profile dev, or run a release build to use prod`, exit 1 |
+| Sin daemon | `clawg status --profile dev` | `running: false`, `daemon: null`, exit 1 |
+| Arranque | `clawg serve --profile dev` | crea `~/.clawg-dev/memory.db`, aplica V1..V8, publica `daemon.json` (pid, port 27381) y `token` (64 hex), `daemon.lock` |
+| Health | `GET /health` | `{"status":"ok","version":"0.1.0","profile":"dev","embedder":"loading"}` → `"ready"` a los 15 s de uptime |
+| Auth | `GET /v1/memories` sin token / con token inválido | 401 / 401 |
+| Guardar | `POST /v1/memories` con `memory_type: semantic_fact`, `importance: 8` | 202 `queued`; la fila apareció en `GET /v1/memories` con `importance: 8.0`, `tier: 3` |
+| Validación | `POST /v1/memories` con contenido en blanco | 400 `content must not be empty` |
+| Búsqueda | `POST /v1/search` con la query "que puerto usa el daemon en desarrollo" (palabras distintas al texto guardado) | 1 hit, `distance 0.366`, `score 0.429`: **retrieval semántico real con el modelo ONNX** |
+| Contexto | `POST /v1/context` | bloque `=== RECENT CONTEXT (Last 7 Days) ===` con la memoria |
+| Apagado | `clawg stop --profile dev` | `daemon.json` y `token` eliminados, log `clawg serve dev stopped`, exit 0 |
+| Registro | `claude mcp add clawg-dev -- <repo>\target\debug\clawg.exe mcp --profile dev` | agregado en scope local del proyecto (`~/.claude.json`); `claude mcp list` → `✔ Connected` |
+| Autostart | el handshake de `claude mcp list` corrió `clawg mcp` sin daemon | el puente lanzó `serve` desacoplado (pid nuevo), que **siguió vivo después de que el puente cerró**; logs en `~/.clawg-dev/logs/serve.log` |
+| **Sesión 1** | `claude -p` (proceso propio, Haiku) con `save_memory`: "El bar de la esquina de Marco se llama Los Girasoles Violetas y cierra los martes", `semantic_fact`, importancia 9 | la tool devolvió `queued` |
+| **Sesión 2** | `claude -p` (otro proceso, sin ningún dato de la sesión 1) con `search_memory "bar de Marco"` | respondió: "El bar se llama **Los Girasoles Violetas**, cierra los **martes**, y el ID de la memoria es **#2**" |
+| Fila resultante | `GET /v1/memories` | `id 2`, `agent_id: "claude-code"` (vino del `clientInfo.name` del initialize), `project_id: "claw-garden-0c70"` (`derive_project_id(cwd)`), `importance: 9.0` |
+
+**Criterio de salida de la fase 1: cumplido.** Claude Code recordó algo entre dos sesiones distintas, sin la app de
+escritorio abierta, contra el perfil dev, con autostart del daemon incluido.
+
+Al cierre de la verificación el daemon se apagó con `clawg stop --profile dev`: hasta la fase 4, desktop y daemon
+no deben correr a la vez sobre el mismo perfil. El puente lo vuelve a levantar solo la próxima vez que Claude Code lo necesite.
+
+**Observaciones de la ejecución real** (no aparecieron en tests):
+
+1. **Los archivos `daemon.json` y `token` quedan `rw-r--r--` en Windows.** Es lo que la bitácora ya decía (el HOME
+   protege), pero visto en `ls -la` llama la atención. Si la fase 2 mueve datos fuera del perfil de usuario, revisar.
+2. **`access_count: 1` en la fila recién guardada** antes de cualquier búsqueda. Viene del `GET /v1/memories`
+   previo o del insert; no es un problema, pero el panel de la fase 4 no debería presentar ese 1 como "accedida una vez".
+3. **La sección `=== RECENT CONTEXT ===` del prompt trae la memoria aunque la búsqueda densa también la devuelva.**
+   Correcto según `build_memory_prompt` (buckets por recencia), pero `recall_context` y `search_memory` se pisan en
+   los primeros 7 días. Es comportamiento heredado del chat, no del daemon.
