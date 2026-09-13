@@ -25,7 +25,13 @@ use rusqlite::ToSql;
 /// nothing to gain from a wider visibility keyword. The inner field stays
 /// private regardless — the single-constructor unit guarantee this type
 /// exists for is a separate axis from how far its name travels.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+/// `Serialize` is a transparent newtype over the raw `i64`, so a serialized
+/// instant is the same millisecond number every other layer already speaks —
+/// no date string, no object wrapper. It was added for `RankedHit`, which the
+/// `clawg serve` daemon returns as JSON; keeping the wire shape numeric means
+/// the daemon's clients read `created_at` exactly as SQLite stores it.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash, serde::Serialize)]
+#[serde(transparent)]
 pub struct TimestampMs(i64);
 
 impl TimestampMs {
@@ -125,6 +131,20 @@ mod tests {
     fn derives_match_the_locked_set() {
         fn _f<T: Copy + Clone + PartialEq + Eq + PartialOrd + Ord + std::fmt::Debug + std::hash::Hash>() {}
         _f::<TimestampMs>();
+        fn _ser<T: serde::Serialize>() {}
+        _ser::<TimestampMs>();
+    }
+
+    /// The `transparent` attribute is the contract, not an implementation
+    /// detail: a wrapper object or an ISO string here would change the daemon's
+    /// JSON shape for every `RankedHit.created_at` at once.
+    #[test]
+    fn serializes_as_a_bare_millisecond_number() {
+        let ts = TimestampMs::from_unix_millis_u64(1_700_000_000_000);
+        assert_eq!(
+            serde_json::to_string(&ts).expect("TimestampMs must serialize"),
+            "1700000000000"
+        );
     }
 
     #[test]

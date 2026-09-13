@@ -12,6 +12,9 @@ pub mod memory;
 pub mod models;
 pub mod paths;
 pub mod providers;
+/// Host-agnostic assembly of the memory substrate — the store, the ingest
+/// channel and the background workers, without any desktop runtime.
+pub mod runtime;
 pub mod services;
 
 /// Narrow, feature-gated door into retrieval internals for the evaluation

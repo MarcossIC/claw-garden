@@ -390,14 +390,17 @@ pub struct FakeEmbedder {
     dim: usize,
 }
 
-#[cfg(any(test, feature = "eval"))]
+// Gated exactly like the struct above (`testing` included): exposing the type
+// to another crate's tests without its `Default` and `Embedder` impls hands
+// them a name they cannot construct or use.
+#[cfg(any(test, feature = "eval", feature = "testing"))]
 impl Default for FakeEmbedder {
     fn default() -> Self {
         Self { dim: 384 }
     }
 }
 
-#[cfg(any(test, feature = "eval"))]
+#[cfg(any(test, feature = "eval", feature = "testing"))]
 #[async_trait]
 impl Embedder for FakeEmbedder {
     // `role` is deliberately ignored: this is a SipHash of the raw text with

@@ -21,6 +21,7 @@
 //! [`MemoryRecord::disputed_against_ids`] parses it into `Vec<i64>`, returning
 //! `None` for NULL or malformed JSON rather than panicking.
 
+pub mod bootstrap;
 pub mod chunker;
 pub mod db;
 pub mod embedder;
@@ -39,6 +40,12 @@ pub use identity::derive_project_id;
 pub use record::{
     EpisodicTrajectoryRow, MemoryRecord, MemoryRow, ProceduralSkillRow, Scope, TableKind,
 };
+/// Re-exported at the `memory` root because structured retrieval is now an
+/// entry point in its own right: the `clawg serve` daemon and the `clawg mcp`
+/// bridge call it directly, without the chat pipeline that used to be the only
+/// caller. Keeping the import path one level shorter than `memory::search::…`
+/// mirrors how [`MemoryStore`] is already re-exported out of `db`.
+pub use search::{search_all_memories, RankedHit, SearchScope};
 
 pub mod clock;
 pub(crate) mod latency;

@@ -22,15 +22,12 @@ use clawg_core::memory::chunker::{ChatChunker, CodeChunker};
 use clawg_core::memory::embedder::Embedder;
 use clawg_core::memory::events::MemoryEvent;
 use clawg_core::memory::extractor::{run_extraction_core, EXTRACTOR_TIMEOUT};
-use clawg_core::memory::maintenance::{
-    run_maintenance_loop, MAINTENANCE_PERIOD, STARTUP_DELAY,
-};
 use clawg_core::memory::miner::{mine_session_core, NAMER_TIMEOUT};
 use clawg_core::memory::resolver::{
     adjudicate_cluster, apply_resolution, load_disputed_clusters, RESOLVER_TIMEOUT,
 };
-use clawg_core::memory::worker::{memory_worker, resolve_tokenizer_and_chunker};
 use clawg_core::memory::MemoryStore;
+use clawg_core::runtime::{ingest_worker_future, maintenance_worker_future};
 use clawg_core::models::config::{aux_job_enabled, AuxJob};
 use clawg_core::models::ChatMessage;
 use clawg_core::providers::AiProvider;
@@ -55,37 +52,23 @@ use clawg_core::providers::AiProvider;
 /// holds only as long as that stays true. A second spawn site would race it.
 
 pub(crate) fn start_memory_worker(
-
     app_handle: tauri::AppHandle,
-
     memory_rx: UnboundedReceiver<MemoryEvent>,
-
 ) {
-
     use tauri::Manager;
-
     let state = app_handle.state::<crate::state::AppState>();
 
-    let store = state.memory_store.clone();
-
-    let embedder_cell = state.embedder.clone();
-
-    let base_dir = state.base_dir.clone();
-
-    let tokenizer_cell = state.tokenizer.clone();
-
-
-
-    tauri::async_runtime::spawn(async move {
-
-        let chat_chunker = resolve_tokenizer_and_chunker(&base_dir, &tokenizer_cell);
-
-        let code_chunker = Arc::new(CodeChunker::new());
-
-        memory_worker(memory_rx, store, embedder_cell, chat_chunker, code_chunker).await;
-
-    });
-
+    // The worker body itself lives in `clawg_core::runtime` so the headless
+    // hosts (`clawg serve`, `clawg mcp`) run the identical loop; all this
+    // wrapper still owns is resolving the handles out of `AppState` and
+    // choosing the executor.
+    tauri::async_runtime::spawn(ingest_worker_future(
+        state.base_dir.clone(),
+        state.memory_store.clone(),
+        state.embedder.clone(),
+        state.tokenizer.clone(),
+        memory_rx,
+    ));
 }
 
 // Compile-time Send proof — every captured value MUST be Send + 'static so
@@ -391,9 +374,8 @@ const _: fn() = || {
 pub(crate) fn start_maintenance_worker(app_handle: tauri::AppHandle) {
     use tauri::Manager;
     let state = app_handle.state::<crate::state::AppState>();
-    let store = state.memory_store.clone();
 
-    tauri::async_runtime::spawn(run_maintenance_loop(store, STARTUP_DELAY, MAINTENANCE_PERIOD));
+    tauri::async_runtime::spawn(maintenance_worker_future(state.memory_store.clone()));
 }
 
 // Compile-time Send proof — every captured value MUST be Send + 'static so

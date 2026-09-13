@@ -104,11 +104,54 @@ pub struct NewMemoryRecord {
     pub disputed_against: Option<Vec<i64>>,
 }
 
+/// Neutral importance for a row nothing has said anything special about.
+/// Named because three arms below reach for it and one of them is a fallback
+/// from an override that failed validation — a bare `5.0` there would read as
+/// an arbitrary number rather than "back to the default".
+const DEFAULT_IMPORTANCE: f64 = 5.0;
+
+/// Inclusive bounds of the store's importance scale.
+///
+/// Not a stylistic range: `tier::compute_tier` fast-tracks `importance >= 9.0`
+/// to tier 1 and `score.rs` clamps into the same domain, so a client-supplied
+/// value outside it would not merely be unusual — it would sit off the end of
+/// every curve that reads the column.
+const IMPORTANCE_MIN: f64 = 0.0;
+const IMPORTANCE_MAX: f64 = 10.0;
+
 impl NewMemoryRecord {
     pub fn from_event_and_chunk(evt: &MemoryEvent, chunk: &Chunk) -> Self {
         // Source-first: Compaction-sourced events always map to SessionSummary,
         // regardless of role, BEFORE the role-based derivation below runs.
-        let (memory_type, created_by_type, importance) = if evt.source == MemorySource::Compaction {
+        let (memory_type, created_by_type, importance) = if evt.source == MemorySource::Explicit {
+            // A deliberately saved memory is the ONE case where the producer
+            // knows more than the pipeline can derive: there is no role to read
+            // the type off, and the act of saving is itself the statement of
+            // importance. Both overrides are therefore honoured — and only
+            // here, so a chat turn can never talk its way out of its derivation.
+            //
+            // The type arrives as a free string (that is what an MCP client can
+            // express) but is mapped onto `MemoryType` rather than stored raw:
+            // the `memory_type` column is untyped TEXT, so a raw string WOULD
+            // persist, but `compute_tier` and the contradiction gate both
+            // classify by this enum, and an unrecognised value silently opts
+            // the row out of both. Falling back is the honest failure.
+            let memory_type = evt
+                .memory_type
+                .as_deref()
+                .and_then(MemoryType::from_db_str)
+                .unwrap_or(MemoryType::SemanticFact);
+            // `SemanticFact` as the fallback because a user-declared memory
+            // with no stated type IS an asserted fact — and, being
+            // claim-bearing, it stays eligible for contradiction resolution
+            // instead of landing in the inert `ChatMessage` bucket.
+            let importance = evt
+                .importance
+                .filter(|v| !v.is_nan()) // NaN has no place on the scale to clamp it to.
+                .map(|v| v.clamp(IMPORTANCE_MIN, IMPORTANCE_MAX))
+                .unwrap_or(DEFAULT_IMPORTANCE);
+            (memory_type, CreatedByType::User, importance)
+        } else if evt.source == MemorySource::Compaction {
             (MemoryType::SessionSummary, CreatedByType::System, 6.0)
         } else {
             let memory_type = match (evt.role.clone(), evt.is_error) {
@@ -123,7 +166,11 @@ impl NewMemoryRecord {
                 Role::Tool => CreatedByType::System,
                 Role::System => CreatedByType::System,
             };
-            let importance = if matches!(memory_type, MemoryType::ToolError) { 6.0 } else { 5.0 };
+            let importance = if matches!(memory_type, MemoryType::ToolError) {
+                6.0
+            } else {
+                DEFAULT_IMPORTANCE
+            };
             (memory_type, created_by_type, importance)
         };
         Self {
@@ -298,6 +345,7 @@ impl MemoryStore {
                             MemorySource::Chat => "chat",
                             MemorySource::Compaction => "compaction",
                             MemorySource::CodeFile => "code_file",
+                            MemorySource::Explicit => "explicit",
                         },
                         created_at,
                         record.created_by_type.as_str(),
@@ -847,6 +895,8 @@ mod tests {
             is_error: None,
             source: MemorySource::Chat,
             timestamp_ms: 0,
+            memory_type: None,
+            importance: None,
         };
         let chunk = Chunk { text: "hello".to_string(), token_count: 1, header: None };
         let rec = NewMemoryRecord::from_event_and_chunk(&evt, &chunk);
@@ -869,12 +919,142 @@ mod tests {
             is_error: None,
             source: MemorySource::Compaction,
             timestamp_ms: 0,
+            memory_type: None,
+            importance: None,
         };
         let chunk = Chunk { text: "delta summary text".to_string(), token_count: 3, header: None };
         let rec = NewMemoryRecord::from_event_and_chunk(&evt, &chunk);
         assert_eq!(rec.memory_type, MemoryType::SessionSummary, "Compaction source must map to SessionSummary");
         assert_eq!(rec.created_by_type, CreatedByType::System, "Compaction source must map to System creator");
         assert_eq!(rec.importance, 6.0, "Compaction source must fix importance at 6.0");
+    }
+
+    // ── Explicit source — client overrides ─────────────────────────────
+
+    /// Builds an `Explicit` event with the two optional overrides, so each
+    /// case below reads as the one thing it varies.
+    fn explicit_event(
+        memory_type: Option<&str>,
+        importance: Option<f64>,
+    ) -> crate::memory::events::MemoryEvent {
+        crate::memory::events::MemoryEvent {
+            agent_id: "agent-x".to_string(),
+            project_id: None,
+            role: crate::models::chat::Role::User,
+            content: "the team uses conventional commits".to_string(),
+            is_error: None,
+            source: MemorySource::Explicit,
+            timestamp_ms: 0,
+            memory_type: memory_type.map(str::to_owned),
+            importance,
+        }
+    }
+
+    fn chunk_of(text: &str) -> crate::memory::chunker::Chunk {
+        crate::memory::chunker::Chunk { text: text.to_string(), token_count: 4, header: None }
+    }
+
+    #[test]
+    fn explicit_source_honours_both_overrides() {
+        let evt = explicit_event(Some("architectural_decision"), Some(8.5));
+        let rec = NewMemoryRecord::from_event_and_chunk(&evt, &chunk_of("x"));
+        assert_eq!(rec.memory_type, MemoryType::ArchitecturalDecision);
+        assert_eq!(rec.importance, 8.5);
+        assert_eq!(
+            rec.created_by_type,
+            CreatedByType::User,
+            "an explicitly saved memory is authored by the user, whatever role the \
+             transport stamped on the event"
+        );
+        assert_eq!(rec.source, MemorySource::Explicit);
+    }
+
+    /// A client that saves a bare string declares a fact. `SemanticFact` is
+    /// the only variant that means exactly that, and it is claim-bearing, so
+    /// the contradiction detector can still adjudicate it later.
+    #[test]
+    fn explicit_source_without_a_type_override_falls_back_to_semantic_fact() {
+        let evt = explicit_event(None, None);
+        let rec = NewMemoryRecord::from_event_and_chunk(&evt, &chunk_of("x"));
+        assert_eq!(rec.memory_type, MemoryType::SemanticFact);
+        assert_eq!(rec.importance, 5.0, "no override keeps the store's neutral default");
+    }
+
+    /// An unrecognised type string must not be able to write a row the tier
+    /// UDF and the contradiction gate cannot classify — it degrades to the
+    /// same fallback as no override at all.
+    #[test]
+    fn explicit_source_with_an_unknown_type_override_falls_back_to_semantic_fact() {
+        let evt = explicit_event(Some("not_a_real_type"), None);
+        let rec = NewMemoryRecord::from_event_and_chunk(&evt, &chunk_of("x"));
+        assert_eq!(rec.memory_type, MemoryType::SemanticFact);
+    }
+
+    /// The store's importance domain is 0–10 (`tier.rs` fast-tracks >= 9.0 and
+    /// `score.rs` clamps into that range); a client cannot escape it.
+    #[test]
+    fn explicit_importance_override_is_clamped_to_the_stores_domain() {
+        let hi = NewMemoryRecord::from_event_and_chunk(
+            &explicit_event(None, Some(42.0)),
+            &chunk_of("x"),
+        );
+        assert_eq!(hi.importance, 10.0, "above-range importance clamps to the maximum");
+
+        let lo = NewMemoryRecord::from_event_and_chunk(
+            &explicit_event(None, Some(-3.0)),
+            &chunk_of("x"),
+        );
+        assert_eq!(lo.importance, 0.0, "below-range importance clamps to the minimum");
+    }
+
+    /// NaN is not a point on the scale, so it cannot be clamped into one —
+    /// it falls back to the default rather than poisoning every comparison
+    /// the score formula makes against it.
+    #[test]
+    fn explicit_importance_override_rejects_nan() {
+        let rec = NewMemoryRecord::from_event_and_chunk(
+            &explicit_event(None, Some(f64::NAN)),
+            &chunk_of("x"),
+        );
+        assert_eq!(rec.importance, 5.0);
+    }
+
+    /// The overrides are scoped to `Explicit` by design: a chat turn's type is
+    /// derived from its role, and that derivation must not become overridable.
+    #[test]
+    fn chat_and_compaction_sources_ignore_the_overrides_entirely() {
+        let mut chat = explicit_event(Some("architectural_decision"), Some(9.9));
+        chat.source = MemorySource::Chat;
+        let rec = NewMemoryRecord::from_event_and_chunk(&chat, &chunk_of("x"));
+        assert_eq!(rec.memory_type, MemoryType::ChatMessage);
+        assert_eq!(rec.importance, 5.0);
+        assert_eq!(rec.created_by_type, CreatedByType::User);
+
+        let mut compaction = explicit_event(Some("architectural_decision"), Some(9.9));
+        compaction.source = MemorySource::Compaction;
+        let rec = NewMemoryRecord::from_event_and_chunk(&compaction, &chunk_of("x"));
+        assert_eq!(rec.memory_type, MemoryType::SessionSummary);
+        assert_eq!(rec.importance, 6.0);
+        assert_eq!(rec.created_by_type, CreatedByType::System);
+    }
+
+    #[tokio::test]
+    async fn explicit_source_is_stored_as_the_string_explicit() {
+        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let evt = explicit_event(Some("user_preference"), Some(9.5));
+        let record = NewMemoryRecord::from_event_and_chunk(&evt, &chunk_of("x"));
+        let id = store
+            .insert_memory_with_vector(record, make_embedding_384())
+            .await
+            .expect("insert");
+        let source: String = store
+            .conn
+            .call(move |c| -> Result<String, rusqlite::Error> {
+                c.query_row("SELECT source FROM memory WHERE id = ?1", [id], |r| r.get(0))
+            })
+            .await
+            .expect("select");
+        assert_eq!(source, "explicit");
     }
 
     // ── INSERT writes status/disputed_against/last_disputed_at ──

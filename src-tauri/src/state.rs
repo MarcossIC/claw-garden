@@ -8,6 +8,7 @@ use crate::mcp::McpPool;
 use clawg_core::memory::MemoryStore;
 use clawg_core::memory::embedder::Embedder;
 use clawg_core::memory::events::MemoryEvent;
+use clawg_core::runtime::MemoryRuntime;
 use crate::recovery::gate::RecoveryGate;
 use crate::tools::{GlobalToolRegistry, executor::ToolExecutor};
 use once_cell::sync::OnceCell;
@@ -159,26 +160,31 @@ impl AppState {
         let tool_registry = Arc::new(GlobalToolRegistry::new());
         let tool_executor = Arc::new(ToolExecutor::new(tool_registry.clone()));
 
-        // Open memory store synchronously. AppState::new() is called from the sync
-        // lib.rs::run() — no tokio context exists yet, so block_on is safe here.
-        let memory_store = Arc::new(
-            tauri::async_runtime::block_on(async {
-                MemoryStore::open(&base_dir).await
-            })
-            .expect("Failed to open memory store at base_dir/memory.db"),
-        );
-
-        // Memory ingest channel. Single-consumer by design — see `memory_tx`.
-        let (memory_tx, memory_rx) = tokio::sync::mpsc::unbounded_channel::<MemoryEvent>();
-
-        // AccessTracker::new() calls tokio::spawn internally, so we wrap it in
-        // block_on to enter the tauri async runtime context — identical pattern
-        // to the MemoryStore open() call above.
-        let access_tracker = Arc::new(
-            tauri::async_runtime::block_on(async {
-                clawg_core::memory::access::AccessTracker::new(memory_store.conn.clone())
-            })
-        );
+        // Assemble the memory substrate. `AppState::new()` is called from the
+        // sync `lib.rs::run()` — no tokio context exists yet — so the single
+        // `block_on` here is what gives `MemoryRuntime::open` the runtime it
+        // needs (the store open is async, and `AccessTracker::new` spawns its
+        // flush worker during construction). One `block_on` rather than the
+        // two this used to have, because both steps now live behind one await.
+        let (
+            MemoryRuntime {
+                // `base_dir` is already owned above and stored on `AppState`
+                // itself; the runtime's copy is the same path.
+                base_dir: _,
+                store: memory_store,
+                memory_tx,
+                // Empty OnceCells: filled by the setup-hook bootstrap task in
+                // lib.rs and by the ingest worker's setup step respectively.
+                // Startup MUST NOT block on the model download — that keeps
+                // launch snappy and lets the UI render even when the embedder
+                // fails to load.
+                embedder,
+                tokenizer,
+                access_tracker,
+            },
+            memory_rx,
+        ) = tauri::async_runtime::block_on(MemoryRuntime::open(base_dir.clone()))
+            .expect("Failed to open memory store at base_dir/memory.db");
 
         let state = Self {
             base_dir,
@@ -198,11 +204,8 @@ impl AppState {
             pending_confirmations: Mutex::new(HashMap::new()),
             memory_store,
             memory_tx,
-            // Empty OnceCell: filled by the setup-hook bootstrap task in lib.rs.
-            // AppState::new() MUST NOT block on the download — keeps startup snappy
-            // and lets the UI render even when the embedder fails to load.
-            embedder: Arc::new(OnceCell::new()),
-            tokenizer: Arc::new(OnceCell::new()),
+            embedder,
+            tokenizer,
             access_tracker,
         };
         (state, memory_rx)
@@ -237,34 +240,31 @@ impl AppState {
         let tool_registry = Arc::new(GlobalToolRegistry::new());
         let tool_executor = Arc::new(ToolExecutor::new(tool_registry.clone()));
 
-        // Build memory_store. Detect tokio context: if we're inside a tokio runtime,
-        // block_on would panic — force callers to use new_for_test_async() instead.
-        let memory_store = match tokio::runtime::Handle::try_current() {
-            Err(_) => {
-                // Safe: no tokio runtime active.
-                Arc::new(
-                    tauri::async_runtime::block_on(async {
-                        MemoryStore::new_for_test().await
-                    })
-                    .expect("test memory store"),
-                )
-            }
-            Ok(_) => panic!(
+        // Build the memory substrate. Detect tokio context first: if we're
+        // inside a tokio runtime, block_on would panic — force callers to use
+        // new_for_test_async() instead.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            panic!(
                 "AppState::new_for_test() cannot be called from #[tokio::test]; \
                  use AppState::new_for_test_async().await instead"
-            ),
-        };
-
-        let (memory_tx, memory_rx) = tokio::sync::mpsc::unbounded_channel::<MemoryEvent>();
-
-        // No tokio runtime is active here (the Err branch above guarantees
-        // that), so we use block_on to enter the tauri runtime context for the
-        // duration of AccessTracker::new(), which calls tokio::spawn internally.
-        let access_tracker = Arc::new(
-            tauri::async_runtime::block_on(async {
-                clawg_core::memory::access::AccessTracker::new(memory_store.conn.clone())
-            })
-        );
+            );
+        }
+        // Safe: no tokio runtime is active (the check above guarantees it), so
+        // block_on enters the tauri runtime context for the duration of
+        // `MemoryRuntime::new_for_test`, which spawns the access flush worker.
+        let (
+            MemoryRuntime {
+                base_dir: _,
+                store: memory_store,
+                memory_tx,
+                // Pre-seeded with a FakeEmbedder by the core constructor — see
+                // its doc comment for why every test ctor seeds it.
+                embedder,
+                tokenizer,
+                access_tracker,
+            },
+            memory_rx,
+        ) = tauri::async_runtime::block_on(MemoryRuntime::new_for_test(temp_dir.clone()));
 
         let state = Self {
             base_dir: temp_dir,
@@ -284,8 +284,8 @@ impl AppState {
             pending_confirmations: Mutex::new(HashMap::new()),
             memory_store,
             memory_tx,
-            embedder: seeded_embedder_cell(),
-            tokenizer: Arc::new(OnceCell::new()),
+            embedder,
+            tokenizer,
             access_tracker,
         };
         (state, memory_rx)
@@ -318,19 +318,21 @@ impl AppState {
         let (session_manager, conversations) = Self::init_session(&sessions_dir);
         let tool_registry = Arc::new(GlobalToolRegistry::new());
         let tool_executor = Arc::new(ToolExecutor::new(tool_registry.clone()));
-        let memory_store = Arc::new(
-            MemoryStore::new_for_test()
-                .await
-                .expect("test memory store"),
-        );
 
-        let (memory_tx, memory_rx) = tokio::sync::mpsc::unbounded_channel::<MemoryEvent>();
-
-        // We are inside a #[tokio::test] context, so tokio::spawn (called inside
-        // AccessTracker::new()) works directly — no block_on wrapper needed.
-        let access_tracker = Arc::new(
-            clawg_core::memory::access::AccessTracker::new(memory_store.conn.clone())
-        );
+        // We are inside a #[tokio::test] context, so the constructor's internal
+        // tokio::spawn (the access flush worker) works directly — no block_on
+        // wrapper needed, which is the whole reason this variant exists.
+        let (
+            MemoryRuntime {
+                base_dir: _,
+                store: memory_store,
+                memory_tx,
+                embedder,
+                tokenizer,
+                access_tracker,
+            },
+            memory_rx,
+        ) = MemoryRuntime::new_for_test(temp_dir.clone()).await;
 
         let state = Self {
             base_dir: temp_dir,
@@ -350,8 +352,8 @@ impl AppState {
             pending_confirmations: Mutex::new(HashMap::new()),
             memory_store,
             memory_tx,
-            embedder: seeded_embedder_cell(),
-            tokenizer: Arc::new(OnceCell::new()),
+            embedder,
+            tokenizer,
             access_tracker,
         };
         (state, memory_rx)
@@ -547,25 +549,6 @@ fn create_provider_from_config(config: &AppConfig) -> Arc<dyn AiProvider> {
     }
 }
 
-/// Build an [`OnceCell`] pre-filled with a [`FakeEmbedder`] for the test
-/// constructors. Shared helper so `new_for_test()` and `new_for_test_async()`
-/// stay in sync.
-///
-/// Pre-seeding in BOTH test helpers is what keeps tests deterministic: in
-/// production the cell is filled by the setup-hook bootstrap task, which does
-/// not exist under test, so an unseeded cell would make every
-/// `state.embedder.get()` return `None` — or race, once a test spawns its own
-/// filler. Seeding at construction removes the window entirely.
-#[cfg(test)]
-fn seeded_embedder_cell() -> Arc<OnceCell<Arc<dyn Embedder>>> {
-    use clawg_core::memory::embedder::FakeEmbedder;
-    let cell: OnceCell<Arc<dyn Embedder>> = OnceCell::new();
-    // .ok() — set() can only fail if the cell is already filled, which is
-    // impossible on a brand-new instance.
-    cell.set(Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>).ok();
-    Arc::new(cell)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,15 +607,16 @@ mod tests {
     // ---------- Embedder / tokenizer cell wiring ----------
 
     /// `AppState::new_for_test()` is sync-only — calling it inside a tokio
-    /// runtime panics (see `new_for_test_panics_in_tokio_context`). We can't
-    /// invoke it directly from a `#[tokio::test]`, so this test verifies the
-    /// SHARED `seeded_embedder_cell()` helper that both ctors use.
-    #[tokio::test]
-    async fn new_for_test_preseeds_fake_embedder() {
-        let cell = seeded_embedder_cell();
-        let embedder = cell
+    /// runtime panics (see `new_for_test_panics_in_tokio_context`) — so this
+    /// is a plain `#[test]`, the only place the sync ctor's own seeding can be
+    /// observed rather than inferred from its async twin.
+    #[test]
+    fn new_for_test_preseeds_fake_embedder() {
+        let (state, _rx) = AppState::new_for_test();
+        let embedder = state
+            .embedder
             .get()
-            .expect("seeded_embedder_cell must pre-fill the OnceCell");
+            .expect("new_for_test must pre-fill the embedder cell");
         assert_eq!(
             embedder.model_id(),
             "fake-embedder",
@@ -703,6 +687,8 @@ mod tests {
             is_error: None,
             source: MemorySource::Chat,
             timestamp_ms: 0,
+            memory_type: None,
+            importance: None,
         });
         assert!(result.is_ok(), "send must succeed before worker is connected");
     }
@@ -721,6 +707,8 @@ mod tests {
             is_error: None,
             source: MemorySource::Chat,
             timestamp_ms: 1,
+            memory_type: None,
+            importance: None,
         }).unwrap();
         tx2.send(MemoryEvent {
             agent_id: "b".into(),
@@ -730,6 +718,8 @@ mod tests {
             is_error: None,
             source: MemorySource::Chat,
             timestamp_ms: 2,
+            memory_type: None,
+            importance: None,
         }).unwrap();
         let e1 = memory_rx.recv().await.expect("first event");
         let e2 = memory_rx.recv().await.expect("second event");
@@ -751,6 +741,8 @@ mod tests {
                 is_error: None,
                 source: MemorySource::Chat,
                 timestamp_ms: i,
+                memory_type: None,
+                importance: None,
             }).is_ok());
         }
     }
@@ -768,6 +760,8 @@ mod tests {
             is_error: None,
             source: MemorySource::Chat,
             timestamp_ms: 42,
+            memory_type: None,
+            importance: None,
         }).unwrap();
         let evt = handle.memory_rx.recv().await.expect("event received");
         assert_eq!(evt.content, "hello");

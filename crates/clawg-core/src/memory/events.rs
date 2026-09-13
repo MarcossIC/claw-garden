@@ -19,6 +19,23 @@ pub struct MemoryEvent {
     pub is_error: Option<bool>,
     pub source: MemorySource,
     pub timestamp_ms: u64,
+    /// Client-declared memory type, honoured only for [`MemorySource::Explicit`].
+    ///
+    /// A chat turn's type is *derived* — the role and `is_error` already say
+    /// what the message is, and letting a producer override that would let the
+    /// ingest path disagree with the conversation it came from. A deliberately
+    /// saved memory has no such derivation available: only the client knows
+    /// whether it just recorded a preference, a decision or a fact.
+    ///
+    /// `#[serde(default)]` so every payload written before this field existed
+    /// still parses, and so an MCP client may simply omit it.
+    #[serde(default)]
+    pub memory_type: Option<String>,
+    /// Client-declared importance on the store's 0–10 scale, honoured only for
+    /// [`MemorySource::Explicit`] and clamped on the way in. Same rationale and
+    /// same `#[serde(default)]` contract as [`MemoryEvent::memory_type`].
+    #[serde(default)]
+    pub importance: Option<f64>,
 }
 
 /// Where the ingest event originated (which producer).
@@ -34,6 +51,16 @@ pub enum MemorySource {
     Compaction,
     /// File-watcher-driven code ingest (reserved — Phase 4+).
     CodeFile,
+    /// A memory a client saved deliberately (the MCP `save_memory` tool), not
+    /// derived from a conversation.
+    ///
+    /// Kept distinct from [`MemorySource::Chat`] because the provenance is
+    /// genuinely different: a chat memory is something the pipeline *noticed*,
+    /// an explicit one is something a user *asserted*. That difference is what
+    /// justifies honouring the client's `memory_type`/`importance` overrides
+    /// here and nowhere else, and it keeps "what did I save on purpose?"
+    /// answerable with a `WHERE source = 'explicit'`.
+    Explicit,
 }
 
 impl MemoryEvent {
@@ -60,6 +87,10 @@ impl MemoryEvent {
                 is_error: msg.is_error,
                 source,
                 timestamp_ms: msg.timestamp_ms,
+                // A chat turn derives both from role/is_error — see the field
+                // docs for why a producer is not allowed to override them.
+                memory_type: None,
+                importance: None,
             }),
         }
     }
@@ -77,7 +108,7 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::chat::Role;
+    use crate::models::chat::{ChatMessage, Role};
 
     #[test]
     fn memory_event_is_send() {
@@ -95,6 +126,8 @@ mod tests {
             project_id: None,
             source: MemorySource::Chat,
             timestamp_ms: 123,
+            memory_type: None,
+            importance: None,
         };
         assert!(matches!(evt.role, Role::Tool));
         assert_eq!(evt.is_error, Some(true));
@@ -114,7 +147,76 @@ mod tests {
             MemorySource::Chat => "chat",
             MemorySource::Compaction => "compaction",
             MemorySource::CodeFile => "code_file",
+            MemorySource::Explicit => "explicit",
         };
+    }
+
+    // ── Explicit source + client overrides ───────────────────────────────
+
+    /// The MCP `save_memory` tool serializes an event over the wire, so the
+    /// snake_case discriminant is a protocol constant, not an internal name.
+    #[test]
+    fn explicit_source_round_trips_through_serde_as_snake_case() {
+        let json = serde_json::to_string(&MemorySource::Explicit).expect("serialize");
+        assert_eq!(json, "\"explicit\"");
+        let back: MemorySource = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, MemorySource::Explicit);
+    }
+
+    #[test]
+    fn explicit_event_round_trips_with_its_overrides() {
+        let evt = MemoryEvent {
+            agent_id: "a".into(),
+            project_id: Some("p".into()),
+            role: Role::User,
+            content: "the team uses conventional commits".into(),
+            is_error: None,
+            source: MemorySource::Explicit,
+            timestamp_ms: 7,
+            memory_type: Some("user_preference".into()),
+            importance: Some(9.5),
+        };
+        let json = serde_json::to_string(&evt).expect("serialize");
+        let back: MemoryEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.source, MemorySource::Explicit);
+        assert_eq!(back.memory_type.as_deref(), Some("user_preference"));
+        assert_eq!(back.importance, Some(9.5));
+    }
+
+    /// `#[serde(default)]` is what lets an MCP client omit both overrides —
+    /// and what keeps every already-serialized chat event parseable.
+    #[test]
+    fn overrides_default_to_none_when_absent_from_the_payload() {
+        let json = r#"{
+            "agent_id": "a",
+            "project_id": null,
+            "role": "user",
+            "content": "hello",
+            "is_error": null,
+            "source": "chat",
+            "timestamp_ms": 0
+        }"#;
+        let evt: MemoryEvent = serde_json::from_str(json).expect("legacy payload must still parse");
+        assert_eq!(evt.memory_type, None);
+        assert_eq!(evt.importance, None);
+    }
+
+    /// Chat ingest never carries overrides: they exist for deliberately saved
+    /// memories, and a chat turn has no client to declare them.
+    #[test]
+    fn from_message_leaves_both_overrides_unset() {
+        let msg = ChatMessage {
+            id: "msg-1".into(),
+            role: Role::User,
+            content: "hello".into(),
+            tool_calls: None,
+            timestamp_ms: 3,
+            is_error: None,
+        };
+        let evt = MemoryEvent::from_message("a".into(), None, &msg, MemorySource::Chat)
+            .expect("user message is ingested");
+        assert_eq!(evt.memory_type, None);
+        assert_eq!(evt.importance, None);
     }
 
     #[test]
@@ -129,6 +231,8 @@ mod tests {
             is_error: None,
             source: MemorySource::Chat,
             timestamp_ms: 0,
+            memory_type: None,
+            importance: None,
         });
         // Result is Err when receiver is dropped — must not panic
         let _ = result;

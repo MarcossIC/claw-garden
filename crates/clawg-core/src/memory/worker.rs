@@ -379,6 +379,8 @@ mod tests {
             is_error,
             source: MemorySource::Chat,
             timestamp_ms: ts,
+            memory_type: None,
+            importance: None,
         }
     }
 
@@ -391,6 +393,8 @@ mod tests {
             is_error: None,
             source: MemorySource::Chat,
             timestamp_ms: ts,
+            memory_type: None,
+            importance: None,
         }
     }
 
@@ -458,6 +462,8 @@ mod tests {
             is_error: None,
             source: MemorySource::Chat,
             timestamp_ms: 1,
+            memory_type: None,
+            importance: None,
         };
         // Wait: the "tool_calls" filter is in from_message, but the worker just
         // calls select_chunker(Role::Assistant, None, "") → Skip (empty content).
@@ -794,6 +800,8 @@ mod tests {
                 is_error: *is_error,
                 source: MemorySource::Chat,
                 timestamp_ms: (i as u64) + 1,
+                memory_type: None,
+                importance: None,
             }).unwrap();
         }
         drain_worker(tx, handle).await;
@@ -872,6 +880,8 @@ mod tests {
                 is_error: *is_error,
                 source: MemorySource::Chat,
                 timestamp_ms: (i as u64) + 1,
+                memory_type: None,
+                importance: None,
             }).unwrap();
         }
         drain_worker(tx2, handle2).await;
@@ -898,6 +908,8 @@ mod tests {
                 is_error: *is_error,
                 source: MemorySource::Chat,
                 timestamp_ms: (i as u64) + 1,
+                memory_type: None,
+                importance: None,
             }).unwrap();
         }
         drain_worker(tx3, handle3).await;
@@ -1216,6 +1228,8 @@ mod tests {
             is_error: None,
             source: MemorySource::Chat,
             timestamp_ms: 1,
+            memory_type: None,
+            importance: None,
         }).unwrap();
         drain_worker(tx, handle).await;
 
@@ -1239,6 +1253,8 @@ mod tests {
             is_error: None,
             source: MemorySource::Compaction,
             timestamp_ms: 1,
+            memory_type: None,
+            importance: None,
         }).unwrap();
         drain_worker(tx, handle).await;
 

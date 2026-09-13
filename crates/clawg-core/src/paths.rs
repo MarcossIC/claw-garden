@@ -122,6 +122,25 @@ impl Profile {
             Profile::Prod => "clawg",
         }
     }
+
+    /// Loopback TCP port the `clawg serve` daemon binds for this profile.
+    ///
+    /// Two ports rather than one because the profiles are not alternatives at
+    /// runtime: a developer routinely runs a release build against `~/.clawg`
+    /// while a debug build works on `~/.clawg-dev`, and those are two live
+    /// daemons. Sharing a port would make the second one fail to bind — or,
+    /// worse, make an MCP client talk to the daemon of the *other* data
+    /// directory, which is exactly the isolation [`Profile::dir_name`] exists
+    /// to guarantee. Picked from the IANA dynamic/private range (49152+ is
+    /// reserved for ephemeral allocation, so 27380/27381 sits below it where a
+    /// fixed service port belongs) and adjacent so the pair reads as one
+    /// allocation.
+    pub const fn default_port(self) -> u16 {
+        match self {
+            Profile::Prod => 27380,
+            Profile::Dev => 27381,
+        }
+    }
 }
 
 /// Name of the project-relative configuration directory
@@ -144,6 +163,27 @@ pub fn data_dir(profile: Profile) -> PathBuf {
 /// [`Profile::from_env`].
 pub fn data_dir_from_env() -> Result<PathBuf, ProfileError> {
     Ok(data_dir(Profile::from_env()?))
+}
+
+/// Where the `clawg serve` daemon publishes its liveness record
+/// (`<base_dir>/daemon.json`: pid, port, version).
+///
+/// Lives beside the data it serves rather than in a system run directory so
+/// the record is isolated per profile for free — a dev daemon can never
+/// overwrite the prod daemon's entry, because they resolve different
+/// `base_dir`s.
+pub fn daemon_state_file(base_dir: &std::path::Path) -> PathBuf {
+    base_dir.join("daemon.json")
+}
+
+/// Where the daemon's loopback bearer token is stored (`<base_dir>/token`).
+///
+/// Separate from [`daemon_state_file`] on purpose: the state file is meant to
+/// be read by anything that wants to know whether a daemon is up, while this
+/// one is a secret whose file permissions are the access control. Merging them
+/// would leak the token to every liveness check.
+pub fn token_file(base_dir: &std::path::Path) -> PathBuf {
+    base_dir.join("token")
 }
 
 #[cfg(test)]
@@ -285,6 +325,41 @@ mod tests {
     fn mcp_server_name_matches_profile() {
         assert_eq!(Profile::Dev.mcp_server_name(), "clawg-dev");
         assert_eq!(Profile::Prod.mcp_server_name(), "clawg");
+    }
+
+    // ── default_port ─────────────────────────────────────────────────────
+
+    #[test]
+    fn default_port_matches_profile() {
+        assert_eq!(Profile::Prod.default_port(), 27380);
+        assert_eq!(Profile::Dev.default_port(), 27381);
+    }
+
+    /// The whole point of a per-profile port: a dev daemon and a prod daemon
+    /// must be able to listen at the same time without one refusing to bind.
+    #[test]
+    fn default_port_differs_between_profiles() {
+        assert_ne!(Profile::Dev.default_port(), Profile::Prod.default_port());
+    }
+
+    // ── daemon_state_file / token_file ───────────────────────────────────
+
+    #[test]
+    fn daemon_state_file_is_daemon_json_under_base_dir() {
+        let base = PathBuf::from("/base");
+        assert_eq!(daemon_state_file(&base), base.join("daemon.json"));
+    }
+
+    #[test]
+    fn token_file_is_token_under_base_dir() {
+        let base = PathBuf::from("/base");
+        assert_eq!(token_file(&base), base.join("token"));
+    }
+
+    #[test]
+    fn daemon_state_file_and_token_file_are_distinct() {
+        let base = PathBuf::from("/base");
+        assert_ne!(daemon_state_file(&base), token_file(&base));
     }
 
     // ── data_dir ─────────────────────────────────────────────────────────

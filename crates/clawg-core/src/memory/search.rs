@@ -18,7 +18,7 @@ use crate::memory::{MemoryError, MemoryStore, TableKind};
 /// because `project_id` owns a `String`; every constructor still hands back
 /// an independent value, so callers pay nothing for it.
 #[derive(Debug, Clone)]
-pub(crate) struct SearchScope {
+pub struct SearchScope {
     pub memory: Option<usize>,
     pub episodic: Option<usize>,
     pub procedural: Option<usize>,
@@ -29,7 +29,7 @@ pub(crate) struct SearchScope {
 }
 
 impl SearchScope {
-    pub(crate) fn all_default() -> Self {
+    pub fn all_default() -> Self {
         Self {
             memory: Some(30),
             episodic: Some(5),
@@ -40,14 +40,18 @@ impl SearchScope {
     }
     /// Scopes this query to `project_id`, owning a copy of it. `None` keeps
     /// the scope unscoped — same as never calling this.
-    pub(crate) fn with_project(mut self, project_id: Option<&str>) -> Self {
+    pub fn with_project(mut self, project_id: Option<&str>) -> Self {
         self.project_id = project_id.map(str::to_owned);
         self
     }
 }
 
 /// One result row after the score formula has been applied SQL-side.
-#[derive(Debug, Clone)]
+///
+/// `Serialize` because the `clawg serve` daemon answers retrieval requests
+/// with these rows as JSON; the desktop app never needed it, so it is the
+/// daemon that pulled the derive in.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RankedHit {
     pub id: i64,
     pub kind: TableKind,
@@ -973,7 +977,7 @@ async fn search_all_memories_inner(
 }
 
 /// Top-level KNN orchestrator. Returns up to `k_final` hits sorted DESC by score.
-pub(crate) async fn search_all_memories(
+pub async fn search_all_memories(
     store: &MemoryStore,
     embedding: &[f32],
     query_text: Option<&str>,

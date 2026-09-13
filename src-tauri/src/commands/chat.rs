@@ -303,6 +303,10 @@ fn build_compaction_event(
         is_error: None,
         source: MemorySource::Compaction,
         timestamp_ms: ts,
+        // Compaction derives both from its source (SessionSummary / 6.0); the
+        // overrides exist for `MemorySource::Explicit` only.
+        memory_type: None,
+        importance: None,
     }
 }
 
