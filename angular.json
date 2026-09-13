@@ -6,7 +6,7 @@
   },
   "newProjectRoot": "projects",
   "projects": {
-    "claw-garden": {
+    "clawg-desktop": {
       "projectType": "application",
       "schematics": {},
       "root": "",
@@ -26,7 +26,8 @@
             ],
             "styles": [
               "src/styles.css"
-            ]
+            ],
+            "outputPath": "dist/clawg-desktop"
           },
           "configurations": {
             "production": {
@@ -56,10 +57,10 @@
           "builder": "@angular/build:dev-server",
           "configurations": {
             "production": {
-              "buildTarget": "claw-garden:build:production"
+              "buildTarget": "clawg-desktop:build:production"
             },
             "development": {
-              "buildTarget": "claw-garden:build:development"
+              "buildTarget": "clawg-desktop:build:development"
             }
           },
           "defaultConfiguration": "development"

@@ -1,10 +1,10 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "AgentOffice",
+  "productName": "Claw Garden",
   "version": "0.1.0",
-  "identifier": "com.agentoffice.app",
+  "identifier": "com.clawgarden.app",
   "build": {
-    "frontendDist": "../dist/claw-garden/browser",
+    "frontendDist": "../dist/clawg-desktop/browser",
     "devUrl": "http://localhost:4200",
     "beforeDevCommand": "bun run start",
     "beforeBuildCommand": "bun run build"
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "AgentOffice",
+        "title": "Claw Garden",
         "width": 1280,
         "height": 800,
         "resizable": true,
