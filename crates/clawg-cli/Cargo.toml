@@ -1,0 +1,62 @@
+[package]
+name = "clawg-cli"
+description = "Claw Garden command line: the `clawg` daemon and its MCP stdio bridge"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# The binary is `clawg`, not `clawg-cli`: the package name is a crate-registry
+# concern, the binary name is the product's user-facing identity.
+[[bin]]
+name = "clawg"
+path = "src/main.rs"
+
+# A library beside the binary so integration tests can drive the axum router and
+# the MCP tool functions in-process, without ever spawning the real binary (that
+# would trigger the 470 MB model download).
+[lib]
+name = "clawg_cli"
+path = "src/lib.rs"
+
+[dependencies]
+clawg-core.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+dirs.workspace = true
+rand.workspace = true
+fs2.workspace = true
+reqwest.workspace = true
+
+# `rt-multi-thread` for `#[tokio::main]`, `signal` for Ctrl-C-driven graceful
+# shutdown, `net` for the loopback `TcpListener`, `io-std` for the MCP stdio
+# transport. Features are additive across the workspace, so this widens the
+# shared `tokio` declaration rather than replacing it.
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "net", "io-std"] }
+
+# Not in `[workspace.dependencies]` on purpose: the root manifest reserves that
+# table for "dependencies shared by two or more workspace members", and every
+# crate below is used by this member alone.
+clap = { version = "4", features = ["derive"] }
+axum = "0.8"
+env_logger = "0.11"
+# Declared per-crate exactly like `src-tauri`'s own `rmcp` line. Cargo unifies
+# the two on one 1.3.0 build; the feature sets are additive, so the desktop's
+# client-side features and this crate's server-side features coexist.
+rmcp = { version = "1", features = ["server", "transport-io", "macros", "schemars"] }
+# rmcp 1.3 generates tool schemas with schemars 1.x — a 0.8 here would not
+# satisfy its `JsonSchema` bound.
+schemars = "1"
+
+[dev-dependencies]
+clawg-core = { workspace = true, features = ["testing"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+# Lets a test swap a MemoryRuntime's embedder cell for an empty one, which is
+# how the pre-bootstrap 503 path is reproduced without a second core constructor.
+once_cell.workspace = true

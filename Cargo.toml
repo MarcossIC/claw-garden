@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/clawg-core", "crates/clawg-eval", "src-tauri"]
+members = ["crates/clawg-cli", "crates/clawg-core", "crates/clawg-eval", "src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
