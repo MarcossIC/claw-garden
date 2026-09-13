@@ -1,11 +1,12 @@
 use std::path::PathBuf;
 
-use crate::config::{ConfigLoader, WorkspaceConfig};
-use crate::models::AppError;
+use clawg_core::config::{ConfigLoader, WorkspaceConfig};
+use clawg_core::models::AppError;
 
 /// Return the workspace-level config for the given project path.
 ///
-/// Reads `<project_path>/.claw-garden/config.json`.
+/// Reads `<project_path>/.clawg/config.json` (see
+/// [`clawg_core::paths::PROJECT_CONFIG_DIR`]).
 /// Returns an empty [`WorkspaceConfig`] when no file exists yet.
 #[tauri::command]
 pub fn get_workspace_config(project_path: String) -> Result<WorkspaceConfig, AppError> {
@@ -15,9 +16,9 @@ pub fn get_workspace_config(project_path: String) -> Result<WorkspaceConfig, App
 
 /// Persist workspace-level config for the given project path.
 ///
-/// Writes to `<project_path>/.claw-garden/config.json`, creating the directory
-/// if necessary. Passing `None` (or an empty string) for a field clears that
-/// override so the global default applies instead.
+/// Writes to `<project_path>/.clawg/config.json` (see [`clawg_core::paths::PROJECT_CONFIG_DIR`]),
+/// creating the directory if necessary. Passing `None` (or an empty string)
+/// for a field clears that override so the global default applies instead.
 #[tauri::command]
 pub fn set_workspace_config(
     project_path: String,

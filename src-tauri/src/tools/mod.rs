@@ -54,10 +54,10 @@ pub struct ToolSpec {
 
 impl ToolSpec {
     /// Convert to the API-compatible ToolDefinition (what gets sent to the LLM).
-    pub fn to_definition(&self) -> crate::models::ToolDefinition {
-        crate::models::ToolDefinition {
+    pub fn to_definition(&self) -> clawg_core::models::ToolDefinition {
+        clawg_core::models::ToolDefinition {
             tool_type: "function".to_string(),
-            function: crate::models::ToolFunctionDef {
+            function: clawg_core::models::ToolFunctionDef {
                 name: self.name.to_string(),
                 description: self.description.to_string(),
                 parameters: self.input_schema.clone(),

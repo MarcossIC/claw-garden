@@ -3,11 +3,11 @@ use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::models::{AppError, McpError, StreamEvent};
+use clawg_core::models::{AppError, McpError, StreamEvent};
 use crate::recovery::recipes::{EscalationPolicy, ToolRecoveryStep, recipe_for};
 use crate::recovery::tool_failure::ToolFailureKind;
-use crate::services::auth::ensure_oauth_fresh;
-use crate::services::retry::{RetryConfig, compute_delay};
+use clawg_core::services::auth::ensure_oauth_fresh;
+use clawg_core::services::retry::{RetryConfig, compute_delay};
 use crate::state::AppState;
 
 /// Decay window for attempt counters.

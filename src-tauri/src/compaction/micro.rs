@@ -1,4 +1,4 @@
-use crate::models::{ChatMessage, Role};
+use clawg_core::models::{ChatMessage, Role};
 
 /// Tool results smaller than this are left untouched.
 const TRUNCATE_THRESHOLD_CHARS: usize = 500;
@@ -85,8 +85,8 @@ fn find_truncation_point(s: &str, target: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{ToolCall, ToolFunction};
-    use crate::models::chat::{current_time_millis, generate_message_id};
+    use clawg_core::models::{ToolCall, ToolFunction};
+    use clawg_core::models::chat::{current_time_millis, generate_message_id};
 
     fn tool_msg(content: &str, name: &str) -> ChatMessage {
         ChatMessage {

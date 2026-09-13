@@ -1,6 +1,6 @@
-use crate::models::chat::current_time_millis;
-use crate::models::prompt::AgentRole;
-use crate::models::{Agent, AgentState, AppError, Position};
+use clawg_core::models::chat::current_time_millis;
+use clawg_core::models::prompt::AgentRole;
+use clawg_core::models::{Agent, AgentState, AppError, Position};
 use crate::state::AppState;
 
 #[tauri::command]
@@ -41,7 +41,7 @@ pub fn create_agent(
         }
     };
 
-    let system_prompt = crate::models::compose_system_prompt(
+    let system_prompt = clawg_core::models::compose_system_prompt(
         &name,
         &role,
         false,

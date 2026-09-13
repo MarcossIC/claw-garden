@@ -1,5 +1,5 @@
-use crate::models::provider_config::ProviderConfig;
-use crate::models::AppError;
+use clawg_core::models::provider_config::ProviderConfig;
+use clawg_core::models::AppError;
 use crate::state::AppState;
 
 #[tauri::command]
@@ -14,10 +14,10 @@ pub fn list_providers(state: tauri::State<'_, AppState>) -> Result<Vec<ProviderC
 #[tauri::command]
 pub fn add_provider(
     name: String,
-    provider_type: crate::models::config::ProviderType,
-    ollama: Option<crate::models::config::OllamaSettings>,
-    anthropic: Option<crate::models::config::AnthropicSettings>,
-    openrouter: Option<crate::models::config::OpenRouterSettings>,
+    provider_type: clawg_core::models::config::ProviderType,
+    ollama: Option<clawg_core::models::config::OllamaSettings>,
+    anthropic: Option<clawg_core::models::config::AnthropicSettings>,
+    openrouter: Option<clawg_core::models::config::OpenRouterSettings>,
     state: tauri::State<'_, AppState>,
 ) -> Result<ProviderConfig, AppError> {
     let config = ProviderConfig {
@@ -43,10 +43,10 @@ pub fn add_provider(
 pub fn update_provider(
     id: String,
     name: String,
-    provider_type: crate::models::config::ProviderType,
-    ollama: Option<crate::models::config::OllamaSettings>,
-    anthropic: Option<crate::models::config::AnthropicSettings>,
-    openrouter: Option<crate::models::config::OpenRouterSettings>,
+    provider_type: clawg_core::models::config::ProviderType,
+    ollama: Option<clawg_core::models::config::OllamaSettings>,
+    anthropic: Option<clawg_core::models::config::AnthropicSettings>,
+    openrouter: Option<clawg_core::models::config::OpenRouterSettings>,
     state: tauri::State<'_, AppState>,
 ) -> Result<ProviderConfig, AppError> {
     let mut providers = state

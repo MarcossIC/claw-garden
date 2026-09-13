@@ -1,4 +1,4 @@
-use crate::models::ChatMessage;
+use clawg_core::models::ChatMessage;
 
 /// Estimates tokens for a single message. Heuristic: ~4 chars per token.
 pub fn estimate_message_tokens(message: &ChatMessage) -> usize {
@@ -26,7 +26,7 @@ pub fn estimate_history_tokens(messages: &[ChatMessage]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::chat::{current_time_millis, generate_message_id, Role, ToolCall, ToolFunction};
+    use clawg_core::models::chat::{current_time_millis, generate_message_id, Role, ToolCall, ToolFunction};
 
     fn make_msg(role: Role, content: &str) -> ChatMessage {
         ChatMessage {

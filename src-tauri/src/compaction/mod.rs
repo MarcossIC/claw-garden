@@ -9,8 +9,8 @@ pub use micro::micro_compact_tool_results;
 pub use result::CompactionResult;
 pub use tokens::{estimate_history_tokens, estimate_message_tokens};
 
-use crate::models::chat::{current_time_millis, generate_message_id};
-use crate::models::{ChatMessage, Role};
+use clawg_core::models::chat::{current_time_millis, generate_message_id};
+use clawg_core::models::{ChatMessage, Role};
 use summarize::{build_continuation_message, merge_summaries, summarize_messages};
 
 /// Default auto-compaction threshold (estimated tokens).
@@ -115,7 +115,7 @@ pub fn compact_history(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::chat::{current_time_millis, generate_message_id};
+    use clawg_core::models::chat::{current_time_millis, generate_message_id};
 
     fn make_msg(role: Role, content: &str) -> ChatMessage {
         ChatMessage {

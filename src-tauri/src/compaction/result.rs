@@ -1,4 +1,4 @@
-use crate::models::ChatMessage;
+use clawg_core::models::ChatMessage;
 
 /// Result of a compaction operation.
 #[derive(Debug, Clone)]

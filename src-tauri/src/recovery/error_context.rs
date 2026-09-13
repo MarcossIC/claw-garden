@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::models::{AppError, McpError};
+use clawg_core::models::{AppError, McpError};
 use crate::recovery::tool_failure::ToolFailureKind;
 
 /// Structured error context sent to the LLM when recovery fails.

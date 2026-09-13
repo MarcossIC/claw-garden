@@ -7,21 +7,21 @@ use crate::compaction::{
     compact_history, estimate_history_tokens, micro_compact_tool_results,
     suggested_threshold_for_provider, CompactionConfig, CompactionResult,
 };
-use crate::hooks::permission::UserDecision;
-use crate::hooks::{
+use clawg_core::hooks::permission::UserDecision;
+use clawg_core::hooks::{
     AgentContext, AgentHookConfig, FinalDecision, HookRunner, StderrDestination, StderrLevel,
 };
-use crate::memory::events::{MemoryEvent, MemorySource};
-use crate::memory::identity::derive_project_id;
-use crate::models::chat::{current_time_millis, generate_message_id};
-use crate::models::{AppError, ChatMessage, ChatRequest, ChatStreamResult, Role, StreamEvent};
+use clawg_core::memory::events::{MemoryEvent, MemorySource};
+use clawg_core::memory::identity::derive_project_id;
+use clawg_core::models::chat::{current_time_millis, generate_message_id};
+use clawg_core::models::{AppError, ChatMessage, ChatRequest, ChatStreamResult, Role, StreamEvent};
 use crate::tools::executor::AgentToolContext;
 use crate::tools::PermissionMode;
 use crate::recovery::{
     ToolFailureKind, ToolRecoveryContext, ToolRecoveryResult, attempt_tool_recovery,
     build_error_context,
 };
-use crate::services::retry;
+use clawg_core::services::retry;
 use crate::state::AppState;
 use tokio::sync::oneshot;
 
@@ -463,7 +463,7 @@ fn project_id_from_path(project_path: Option<&str>) -> Option<String> {
         if p.is_empty() {
             None
         } else {
-            Some(crate::memory::identity::derive_project_id(Path::new(p)))
+            Some(clawg_core::memory::identity::derive_project_id(Path::new(p)))
         }
     })
 }
@@ -486,7 +486,7 @@ pub(crate) async fn compute_memory_prefix(
     project_id_opt: Option<&str>,
     user_query: &str,
 ) -> String {
-    let workspace_mgr = crate::memory::workspace::WorkspaceManager::new(
+    let workspace_mgr = clawg_core::memory::workspace::WorkspaceManager::new(
         state.base_dir.join("workspaces"),
     );
 
@@ -518,11 +518,11 @@ pub(crate) async fn compute_memory_prefix(
         Some(emb) => {
             let prior_turns = {
                 let conversations = state.conversations.lock().unwrap_or_else(|e| e.into_inner());
-                crate::memory::query_context::select_prior_user_turns(
+                clawg_core::memory::query_context::select_prior_user_turns(
                     &conversations,
                     agent_id,
                     user_query,
-                    crate::memory::query_context::MAX_CONTEXT_TURNS,
+                    clawg_core::memory::query_context::MAX_CONTEXT_TURNS,
                 )
             };
             match resolve_tokenizer(state).await {
@@ -534,12 +534,12 @@ pub(crate) async fn compute_memory_prefix(
                     let counter = move |s: &str| {
                         tok.encode(s, false).map(|e| e.len()).unwrap_or(usize::MAX)
                     };
-                    let budget = crate::memory::query_context::query_budget_tokens(
-                        crate::memory::embedder::EMBED_MAX_TOKENS,
-                        crate::memory::embedder::SPECIAL_TOKEN_RESERVE,
+                    let budget = clawg_core::memory::query_context::query_budget_tokens(
+                        clawg_core::memory::embedder::EMBED_MAX_TOKENS,
+                        clawg_core::memory::embedder::SPECIAL_TOKEN_RESERVE,
                         counter(emb.query_prefix()),
                     );
-                    crate::memory::query_context::compose_query_context(
+                    clawg_core::memory::query_context::compose_query_context(
                         user_query,
                         &prior_turns,
                         budget,
@@ -552,13 +552,13 @@ pub(crate) async fn compute_memory_prefix(
         None => user_query.to_string(),
     };
 
-    let memory_prefix = crate::memory::prompt_builder::build_memory_prompt(
+    let memory_prefix = clawg_core::memory::prompt_builder::build_memory_prompt(
         &state.memory_store,
         &workspace_mgr,
         embedder_opt,
         agent_id,
         project_id_opt,
-        crate::memory::prompt_builder::QueryTexts { lexical: user_query, embedded: &embed_query },
+        clawg_core::memory::prompt_builder::QueryTexts { lexical: user_query, embedded: &embed_query },
         &emitted,
         Some(state.access_tracker.as_ref()),
     )
@@ -588,7 +588,7 @@ async fn resolve_tokenizer(state: &AppState) -> Option<std::sync::Arc<tokenizers
     let cell = state.tokenizer.clone();
     let base_dir = state.base_dir.clone();
     tokio::task::spawn_blocking(move || {
-        cell.get_or_try_init(|| crate::memory::model_download::load_tokenizer(&base_dir).ok_or(()))
+        cell.get_or_try_init(|| clawg_core::memory::model_download::load_tokenizer(&base_dir).ok_or(()))
             .ok()
             .cloned()
     })
@@ -693,12 +693,12 @@ pub async fn stream_chat(
         .session_manager
         .lock()
         .map(|sm| sm.current_session_dir())
-        .unwrap_or_else(|_| PathBuf::from("/tmp/claw-garden"));
+        .unwrap_or_else(|_| std::env::temp_dir().join(clawg_core::paths::Profile::compiled_default().dir_name()));
 
     // ── Pre-flight OAuth refresh ─────────────────────────────────────────────
     // Must happen BEFORE get_agent_provider() so resolve_anthropic_auth() reads
     // the freshly written token from disk.
-    match crate::services::auth::ensure_oauth_fresh(&state.oauth_refresh_lock).await {
+    match clawg_core::services::auth::ensure_oauth_fresh(&state.oauth_refresh_lock).await {
         Ok(true) => {
             // Token was refreshed — evict the cached provider so the next call
             // picks up fresh credentials.
@@ -750,7 +750,7 @@ pub async fn stream_chat(
     // === AGENTIC LOOP ===
     for iteration in 0..MAX_TOOL_ITERATIONS {
         // Re-check OAuth freshness on each iteration (tool chains can span minutes)
-        if let Ok(true) = crate::services::auth::ensure_oauth_fresh(&state.oauth_refresh_lock).await {
+        if let Ok(true) = clawg_core::services::auth::ensure_oauth_fresh(&state.oauth_refresh_lock).await {
             log::info!("OAuth token refreshed mid-loop — invalidating cached provider");
             state.invalidate_agent_provider(&agent_provider_id);
             provider = state.get_agent_provider(&agent_provider_id);
@@ -825,7 +825,7 @@ pub async fn stream_chat(
                     tokio::time::sleep(delay).await;
 
                     // Refresh OAuth before retry too
-                    if let Ok(true) = crate::services::auth::ensure_oauth_fresh(
+                    if let Ok(true) = clawg_core::services::auth::ensure_oauth_fresh(
                         &state.oauth_refresh_lock,
                     ).await {
                         state.invalidate_agent_provider(&agent_provider_id);
@@ -834,7 +834,7 @@ pub async fn stream_chat(
                 }
 
                 let channel_clone = on_event.clone();
-                let sender: crate::providers::StreamSender = Box::new(move |event| {
+                let sender: clawg_core::providers::StreamSender = Box::new(move |event| {
                     channel_clone.send(event).map_err(|e| e.to_string())
                 });
 
@@ -866,7 +866,7 @@ pub async fn stream_chat(
 
         match stream_result {
             Ok(ChatStreamResult::Text(response_text)) => {
-                crate::services::sycophancy::check_response(&agent_id, &response_text);
+                clawg_core::services::sycophancy::check_response(&agent_id, &response_text);
 
                 push_and_persist(
                     &state,
@@ -1177,7 +1177,7 @@ pub async fn stream_chat(
                                 .call_tool(&path_buf, tool_name, effective_input.clone())
                                 .await
                         } else {
-                            Err(crate::models::McpError::InitializationFailed {
+                            Err(clawg_core::models::McpError::InitializationFailed {
                                 message: "No project path configured for this agent".into(),
                             }
                             .into())
@@ -1358,8 +1358,8 @@ pub async fn stream_chat(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::events::MemorySource;
-    use crate::models::chat::Role;
+    use clawg_core::memory::events::MemorySource;
+    use clawg_core::models::chat::Role;
 
     fn make_test_message(role: Role, content: &str, is_error: Option<bool>) -> ChatMessage {
         ChatMessage {
@@ -1624,7 +1624,7 @@ mod tests {
     /// prompt should contain at least one memory block separator.
     #[tokio::test]
     async fn stream_chat_with_memories_prepends_blocks_to_system_prompt() {
-        use crate::memory::workspace::{WorkspaceManager, AUTO_START, AUTO_END, USER_START, USER_END};
+        use clawg_core::memory::workspace::{WorkspaceManager, AUTO_START, AUTO_END, USER_START, USER_END};
 
         let (state, _rx) = crate::state::AppState::new_for_test_async().await;
         let agent_system_prompt = "You are a helpful agent.";
@@ -1650,7 +1650,7 @@ mod tests {
         ).await;
 
         assert!(
-            result.contains(crate::memory::prompt_builder::SEP_WORKSPACE_TEST),
+            result.contains(clawg_core::memory::prompt_builder::SEP_WORKSPACE_TEST),
             "combined_system_prompt should contain WORKSPACE separator when workspace has content; got: {}",
             &result[..result.len().min(200)]
         );
@@ -1689,7 +1689,7 @@ mod tests {
     #[tokio::test]
     async fn stream_chat_with_embedder_not_ready_does_not_panic() {
         use once_cell::sync::OnceCell;
-        use crate::memory::embedder::Embedder;
+        use clawg_core::memory::embedder::Embedder;
 
         let (mut state, _rx) = crate::state::AppState::new_for_test_async().await;
         // Replace embedder with empty OnceCell to simulate "not yet bootstrapped"
@@ -1716,15 +1716,15 @@ mod tests {
     /// test can see exactly what text `compute_memory_prefix` chose to embed
     /// without depending on retrieval hits existing at all.
     struct RecordingEmbedder {
-        calls: std::sync::Mutex<Vec<(crate::memory::embedder::EmbedRole, String)>>,
+        calls: std::sync::Mutex<Vec<(clawg_core::memory::embedder::EmbedRole, String)>>,
     }
     #[async_trait::async_trait]
-    impl crate::memory::embedder::Embedder for RecordingEmbedder {
+    impl clawg_core::memory::embedder::Embedder for RecordingEmbedder {
         async fn embed_with_role(
             &self,
             text: &str,
-            role: crate::memory::embedder::EmbedRole,
-        ) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+            role: clawg_core::memory::embedder::EmbedRole,
+        ) -> Result<Vec<f32>, clawg_core::memory::embedder::EmbedError> {
             self.calls.lock().unwrap().push((role, text.to_string()));
             Ok(vec![0.1_f32; 384])
         }
@@ -1750,7 +1750,7 @@ mod tests {
         use tokenizers::models::wordlevel::WordLevel;
         use tokenizers::pre_tokenizers::whitespace::Whitespace;
 
-        let target = crate::memory::model_download::tokenizer_path(base_dir);
+        let target = clawg_core::memory::model_download::tokenizer_path(base_dir);
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         let vocab_path = target.parent().unwrap().join("vocab.json");
         std::fs::write(&vocab_path, r#"{"[UNK]":0,"hello":1,"world":2}"#).unwrap();
@@ -1764,7 +1764,7 @@ mod tests {
 
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "claw-garden-chat-test-{label}-{}-{}",
+            "clawg-chat-test-{label}-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
@@ -1811,7 +1811,7 @@ mod tests {
         state.embedder = std::sync::Arc::new(once_cell::sync::OnceCell::new());
         state
             .embedder
-            .set(recording.clone() as std::sync::Arc<dyn crate::memory::embedder::Embedder>)
+            .set(recording.clone() as std::sync::Arc<dyn clawg_core::memory::embedder::Embedder>)
             .ok();
 
         let agent_id = "agent-compose";
@@ -1821,7 +1821,7 @@ mod tests {
 
         let calls = recording.calls.lock().unwrap();
         assert_eq!(calls.len(), 1, "expected exactly one embed call, got {calls:?}");
-        assert_eq!(calls[0].0, crate::memory::embedder::EmbedRole::Query);
+        assert_eq!(calls[0].0, clawg_core::memory::embedder::EmbedRole::Query);
         assert_ne!(
             calls[0].1, "current message",
             "with a resolvable tokenizer and fitting prior turns, the embedded text must be composed"
@@ -1854,7 +1854,7 @@ mod tests {
         state.embedder = std::sync::Arc::new(once_cell::sync::OnceCell::new());
         state
             .embedder
-            .set(recording.clone() as std::sync::Arc<dyn crate::memory::embedder::Embedder>)
+            .set(recording.clone() as std::sync::Arc<dyn clawg_core::memory::embedder::Embedder>)
             .ok();
 
         let agent_id = "agent-self-heal";
@@ -1917,7 +1917,7 @@ mod tests {
         state.embedder = std::sync::Arc::new(once_cell::sync::OnceCell::new());
         state
             .embedder
-            .set(recording.clone() as std::sync::Arc<dyn crate::memory::embedder::Embedder>)
+            .set(recording.clone() as std::sync::Arc<dyn clawg_core::memory::embedder::Embedder>)
             .ok();
 
         let agent_id = "agent-token-budget";
@@ -1946,12 +1946,12 @@ mod tests {
     /// makes the lexical half of the test below independent of the dense half.
     struct FixedVecEmbedder;
     #[async_trait::async_trait]
-    impl crate::memory::embedder::Embedder for FixedVecEmbedder {
+    impl clawg_core::memory::embedder::Embedder for FixedVecEmbedder {
         async fn embed_with_role(
             &self,
             _text: &str,
-            _role: crate::memory::embedder::EmbedRole,
-        ) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+            _role: clawg_core::memory::embedder::EmbedRole,
+        ) -> Result<Vec<f32>, clawg_core::memory::embedder::EmbedError> {
             let mut v = vec![0.0_f32; 384];
             v[0] = 1.0;
             Ok(v)
@@ -1971,7 +1971,7 @@ mod tests {
     }
 
     fn unit_bytes(v: &[f32]) -> Vec<u8> {
-        crate::memory::search::serialize_f32_query_pub(&crate::memory::vector::to_unit(v).unwrap())
+        clawg_core::memory::search::serialize_f32_query_pub(&clawg_core::memory::vector::to_unit(v).unwrap())
     }
 
     /// Seeds one `memory` row at an exact (tier, importance, age, vector)
@@ -1979,7 +1979,7 @@ mod tests {
     /// reaches a given coordinate, so the coordinate has to be settable
     /// directly rather than derived from an ingestion path.
     async fn seed_memory_aged(
-        store: &crate::memory::MemoryStore,
+        store: &clawg_core::memory::MemoryStore,
         agent_id: &str,
         content: &str,
         importance: f64,
@@ -1988,7 +1988,7 @@ mod tests {
     ) {
         let agent = agent_id.to_string();
         let content = content.to_string();
-        let ts = crate::memory::clock::TimestampMs::now().as_millis_i64() - age_days * 86_400_000;
+        let ts = clawg_core::memory::clock::TimestampMs::now().as_millis_i64() - age_days * 86_400_000;
         store
             .conn
             .call(move |c| -> Result<(), rusqlite::Error> {
@@ -2041,7 +2041,7 @@ mod tests {
         state
             .embedder
             .set(std::sync::Arc::new(FixedVecEmbedder)
-                as std::sync::Arc<dyn crate::memory::embedder::Embedder>)
+                as std::sync::Arc<dyn clawg_core::memory::embedder::Embedder>)
             .ok();
 
         let agent_id = "agent-lexical-raw";
@@ -2106,7 +2106,7 @@ mod tests {
         state.embedder = std::sync::Arc::new(once_cell::sync::OnceCell::new());
         state
             .embedder
-            .set(recording.clone() as std::sync::Arc<dyn crate::memory::embedder::Embedder>)
+            .set(recording.clone() as std::sync::Arc<dyn clawg_core::memory::embedder::Embedder>)
             .ok();
 
         let agent_id = "agent-compose-control";

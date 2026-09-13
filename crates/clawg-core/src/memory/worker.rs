@@ -1,0 +1,1888 @@
+//! Memory ingest worker.
+//!
+//! Spawned once at app startup from `lib.rs::run()` setup hook. Drains
+//! `MemoryEvent`s from the channel, selects the appropriate chunker, embeds
+//! each chunk, and inserts both `memory` and `memory_vectors` rows atomically.
+//! Failure isolation: errors are logged and the worker NEVER panics.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use once_cell::sync::OnceCell;
+use tokio::sync::mpsc::UnboundedReceiver;
+
+use crate::memory::chunker::{
+    select_chunker, ChatChunker, Chunk, ChunkerKind, CodeChunker, CHUNK_MAX_TOKENS,
+};
+use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
+use crate::memory::events::{MemoryEvent, MemorySource};
+use crate::memory::store_insert::{MemoryStoreError, NewMemoryRecord};
+use crate::memory::MemoryStore;
+
+/// Worker-internal error type. Only used for logging via `warn!`.
+/// All variants are recoverable — the worker loop never exits on error.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum MemoryWorkerError {
+    #[error("embed failed: {0}")]
+    Embed(#[from] EmbedError),
+    #[error("store insert failed: {0}")]
+    Store(#[from] MemoryStoreError),
+    /// Reserved for a future code-chunker enhancement that surfaces an
+    /// explicit "0 chunks produced" signal; currently the worker silently
+    /// continues past an empty chunk list.
+    #[allow(dead_code)]
+    #[error("chunker produced 0 chunks for non-empty content")]
+    EmptyChunks,
+}
+
+/// Backlog size at which the ingest channel is worth reporting. Events are
+/// one per chat message or tool result, and draining one costs an embed batch
+/// plus a KNN probe plus an insert — tens of milliseconds — so 64 queued
+/// events is seconds of backlog: past any normal burst, far above the handful
+/// a single agent turn produces. A starting value chosen for that ratio, not
+/// a measured optimum; changing it should be deliberate, which is why the
+/// number is pinned by a test.
+const INGEST_QUEUE_WARN_DEPTH: usize = 64;
+
+/// Which way the backlog just crossed [`INGEST_QUEUE_WARN_DEPTH`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueDepthEdge {
+    Rising,
+    Falling,
+}
+
+/// Reports only crossings of the threshold, never the standing state.
+/// `None` is the common case. A level check would fire once per drained
+/// event, so a sustained backlog of 200 would emit 200 identical lines and
+/// bury the transition that actually carries information.
+fn queue_depth_transition(depth: usize, was_over: bool) -> Option<QueueDepthEdge> {
+    match (was_over, depth >= INGEST_QUEUE_WARN_DEPTH) {
+        (false, true) => Some(QueueDepthEdge::Rising),
+        (true, false) => Some(QueueDepthEdge::Falling),
+        _ => None,
+    }
+}
+
+/// One chunk that survived intra-event collapse, with how many identical
+/// copies the event carried.
+struct PendingChunk {
+    chunk: Chunk,
+    content_hash: String,
+    /// Copies beyond the first are replayed through the dedup gate rather
+    /// than embedded again: on the path where the one surviving chunk
+    /// inserts successfully, repetition inside one event reinforces the
+    /// same row a repetition across two events would — same counter, same
+    /// log branch. That equivalence stops at an insert failure: today a
+    /// failed insert of chunk A still lets an identical chunk B later in the
+    /// same event embed and insert its own row, but once A and B collapse
+    /// into one `PendingChunk`, there is no separate B left to try — A's
+    /// insert failure now costs every copy this multiplicity stands for.
+    multiplicity: u32,
+}
+
+/// Collapses chunks with identical content into one entry each, preserving
+/// first-occurrence order.
+///
+/// Insertion order is load-bearing twice: the embed batch is zipped back
+/// against this list positionally, and contradiction detection for a chunk
+/// must see the chunks before it already inserted. A `HashMap` alone would
+/// keep the counts and lose the order, so the map only indexes into the
+/// ordered vector.
+fn collapse_duplicate_chunks(chunks: Vec<Chunk>) -> Vec<PendingChunk> {
+    let mut out: Vec<PendingChunk> = Vec::with_capacity(chunks.len());
+    let mut by_hash: HashMap<String, usize> = HashMap::with_capacity(chunks.len());
+    for chunk in chunks {
+        let content_hash = crate::memory::dedup::content_hash(&chunk.text);
+        match by_hash.get(&content_hash) {
+            Some(&idx) => out[idx].multiplicity += 1,
+            None => {
+                by_hash.insert(content_hash.clone(), out.len());
+                out.push(PendingChunk { chunk, content_hash, multiplicity: 1 });
+            }
+        }
+    }
+    out
+}
+
+/// Top-level worker loop. One per app instance.
+///
+/// Drains events FIFO. An event's surviving chunks are embedded in one call,
+/// so any embed failure loses that whole event rather than the failing chunk
+/// alone: the batch API returns a single result with no per-item outcome to
+/// salvage, and the failures it reports (model session, tokenizer) apply to
+/// every text in the call anyway. An insert failure stays isolated to its own
+/// chunk and the event's remaining chunks continue.
+/// Exits cleanly when all `Sender`s are dropped (app shutdown).
+pub async fn memory_worker(
+    mut rx: UnboundedReceiver<MemoryEvent>,
+    store: Arc<MemoryStore>,
+    embedder_cell: Arc<OnceCell<Arc<dyn Embedder>>>,
+    chat_chunker: Arc<ChatChunker>,
+    code_chunker: Arc<CodeChunker>,
+) {
+    // Running count of chunks absorbed by the write-border dedup gate.
+    // Plain `u64`, no atomic: `memory_worker` is the single sequential
+    // consumer of this channel — see `MemoryStore::reinforce_if_duplicate`'s
+    // doc comment in `store_insert.rs`, which states that guarantee and its
+    // escalation path if the worker is ever parallelized — so nothing else
+    // can race an increment.
+    let mut absorbed_duplicates: u64 = 0;
+    // Tracks which side of INGEST_QUEUE_WARN_DEPTH the backlog was on last
+    // time through the loop, so queue_depth_transition only reports the edge
+    // crossing rather than the level on every iteration.
+    let mut queue_over_depth = false;
+    while let Some(evt) = rx.recv().await {
+        // Read after recv: this is the backlog still waiting, which is what
+        // "falling behind" means.
+        let depth = rx.len();
+        match queue_depth_transition(depth, queue_over_depth) {
+            Some(QueueDepthEdge::Rising) => {
+                queue_over_depth = true;
+                log::warn!("ingest queue depth={depth}; consumer is falling behind producers");
+            }
+            Some(QueueDepthEdge::Falling) => {
+                queue_over_depth = false;
+                log::info!("ingest queue depth={depth}; backlog drained");
+            }
+            None => {}
+        }
+        if let Err(e) = process_event(
+            &evt,
+            &store,
+            &embedder_cell,
+            &chat_chunker,
+            &code_chunker,
+            &mut absorbed_duplicates,
+        )
+        .await
+        {
+            log::warn!(
+                "ingest event dropped (agent={}, role={:?}): {e}",
+                evt.agent_id,
+                evt.role
+            );
+        }
+    }
+    log::info!("memory_worker shutting down — channel closed");
+}
+
+/// Runs the write-border dedup gate for one chunk hash. `true` means the
+/// chunk was absorbed into an existing row and must not be inserted.
+///
+/// A repeated chunk reinforces the existing memory instead of inserting
+/// another row: `access_count += 1` promotes the tier through
+/// `compute_tier`, so repeating something makes it more retrievable. Chosen
+/// over replacing or rejecting the duplicate because in a memory system
+/// repetition IS signal. Reverting this reopens the duplicate-dispute path
+/// into the resolver, which costs one LLM call per false positive.
+///
+/// Runs BEFORE embedding: a hash lookup is orders of magnitude cheaper than
+/// an inference call, so a duplicate never pays for the vector it does not
+/// need.
+///
+/// This is the only place `absorbed` moves, so a copy arriving inside one
+/// event and a copy arriving in a later event increment it through the same
+/// branch and keep meaning the same thing.
+async fn absorb_duplicate(
+    store: &Arc<MemoryStore>,
+    evt: &MemoryEvent,
+    content_hash: &str,
+    absorbed: &mut u64,
+) -> bool {
+    match store
+        .reinforce_if_duplicate(&evt.agent_id, evt.project_id.as_deref(), content_hash, evt.timestamp_ms)
+        .await
+    {
+        Ok(Some(id)) => {
+            *absorbed += 1;
+            log::debug!(
+                "ingest absorbed duplicate (agent={}, memory_id={id}) absorbed_total={absorbed}",
+                evt.agent_id
+            );
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            // Fail open: a lookup failure degrades to embed+insert, the
+            // behaviour from before the gate existed, rather than dropping
+            // the chunk.
+            log::warn!("dedup lookup failed (agent={}): {e}; falling through to embed", evt.agent_id);
+            false
+        }
+    }
+}
+
+async fn process_event(
+    evt: &MemoryEvent,
+    store: &Arc<MemoryStore>,
+    embedder_cell: &Arc<OnceCell<Arc<dyn Embedder>>>,
+    chat_chunker: &Arc<ChatChunker>,
+    code_chunker: &Arc<CodeChunker>,
+    absorbed: &mut u64,
+) -> Result<(), MemoryWorkerError> {
+    // Source-first: Compaction-sourced events bypass select_chunker (and thus
+    // the Role::System→Skip rule that ordinarily drops system-authored
+    // content from ingestion) entirely — they always chunk via ChatChunker,
+    // because a compaction summary is deliberately synthesized content worth
+    // keeping regardless of which role produced the text it summarizes. All
+    // other sources keep the existing role-based routing.
+    let chunks = if evt.source == MemorySource::Compaction {
+        chat_chunker.chunk(&evt.content, CHUNK_MAX_TOKENS)
+    } else {
+        let kind = select_chunker(evt.role.clone(), evt.is_error, &evt.content);
+        match kind {
+            ChunkerKind::Chat => chat_chunker.chunk(&evt.content, CHUNK_MAX_TOKENS),
+            ChunkerKind::Code => code_chunker.chunk(&evt.content, None),
+            ChunkerKind::Skip => return Ok(()),
+        }
+    };
+
+    if chunks.is_empty() {
+        // Content was all-whitespace or empty after chunker policy. Not an error.
+        return Ok(());
+    }
+
+    // No embedder loaded yet (contract bootstrap still running, or
+    // permanently mismatched): drop the entire event rather than embedding
+    // only some of its chunks — a half-embedded event would be unrecoverable
+    // without tracking which chunks already made it in, so the whole event
+    // is dropped uniformly and cheaply instead.
+    let Some(embedder) = embedder_cell.get().cloned() else {
+        log::debug!(
+            "embedder NotReady; dropping {} chunks for agent={}",
+            chunks.len(),
+            evt.agent_id
+        );
+        return Ok(());
+    };
+
+    // Stage 1 — gate. Every chunk passes the hash gate before anything is
+    // embedded; a collapsed entry absorbed by the gate is charged once per
+    // copy it stood for, which is what the same copies arriving one at a
+    // time would have done.
+    let mut survivors: Vec<PendingChunk> = Vec::new();
+    for pending in collapse_duplicate_chunks(chunks) {
+        if absorb_duplicate(store, evt, &pending.content_hash, absorbed).await {
+            for _ in 1..pending.multiplicity {
+                absorb_duplicate(store, evt, &pending.content_hash, absorbed).await;
+            }
+            continue;
+        }
+        survivors.push(pending);
+    }
+    if survivors.is_empty() {
+        return Ok(());
+    }
+
+    // Stage 2 — one inference call for the whole event. Passage: a stored
+    // chunk is the thing being searched THROUGH. Each vector produced here
+    // feeds BOTH consumers below — insert and the contradiction KNN probe —
+    // with no second inference call, so both sides of `contradiction.rs`'s
+    // comparison live in the same Passage space `CONTRADICTION_THRESHOLD`
+    // was tuned against.
+    let texts: Vec<String> = survivors.iter().map(|p| p.chunk.text.clone()).collect();
+    let vectors = match embedder.embed_batch(&texts, EmbedRole::Passage).await {
+        Ok(v) => v,
+        Err(EmbedError::NotReady) | Err(EmbedError::WorkerGone) => {
+            log::warn!("embedder became unavailable (agent={}); dropping {} chunks", evt.agent_id, survivors.len());
+            return Ok(());
+        }
+        Err(e) => {
+            log::warn!("embed batch failed (agent={}): {e}; dropping {} chunks", evt.agent_id, survivors.len());
+            return Ok(());
+        }
+    };
+    if vectors.len() != survivors.len() {
+        // Zipping a short reply would pair chunks with other chunks'
+        // vectors and store the mismatch as fact. Dropping the event is
+        // recoverable; a silently mislabeled memory is not.
+        log::warn!(
+            "embedder returned {} vectors for {} chunks (agent={}); dropping the event",
+            vectors.len(), survivors.len(), evt.agent_id
+        );
+        return Ok(());
+    }
+
+    // Stage 3 — sequential, one chunk at a time: chunk N's contradiction
+    // probe is a KNN search over rows already in the store, so chunk N-1 of
+    // this same event must be inserted before it runs. Not exercised by a
+    // same-event test today: `from_event_and_chunk` derives `memory_type`
+    // from `evt.role`/`is_error` alone, which only ever yields
+    // ChatMessage/ToolError/SessionSummary — none `is_claim_bearing()` — so
+    // `detect_contradiction`'s type gate returns `[]` before the KNN runs
+    // for every chunk this loop produces. The ordering is real (this is a
+    // synchronous per-iteration insert-then-probe loop, not a batch), but
+    // only a claim-bearing candidate (currently written only by the
+    // extractor, one row at a time, never through this multi-chunk path)
+    // would let a test observe it end-to-end.
+    for (pending, vec) in survivors.into_iter().zip(vectors) {
+        let PendingChunk { chunk, content_hash, multiplicity } = pending;
+        // The contradiction hook runs between embed and insert: it needs the
+        // freshly computed embedding to find near-duplicate candidates via
+        // KNN, and its result (which existing rows this chunk disputes) must
+        // be attached to the record before it is written, not after.
+        let mut record = NewMemoryRecord::from_event_and_chunk(evt, &chunk);
+        let disputed = crate::memory::contradiction::detect_contradiction(
+            store, &vec, &evt.agent_id, evt.project_id.as_deref(), record.memory_type,
+        ).await;
+        if !disputed.is_empty() {
+            record.disputed_against = Some(disputed);
+        }
+        if let Err(e) = store.insert_memory_with_vector(record, vec).await {
+            log::warn!("insert_memory_with_vector failed (agent={}): {e}", evt.agent_id);
+            continue; // nothing was written, so there is nothing to reinforce
+        }
+        // The extra copies now find the row this iteration just wrote and
+        // take the same branch a copy from a later event takes.
+        for _ in 1..multiplicity {
+            absorb_duplicate(store, evt, &content_hash, absorbed).await;
+        }
+    }
+    Ok(())
+}
+
+/// Resolves the shared tokenizer exactly once and builds the chat chunker
+/// from that SAME value: `tokenizer_cell` and the returned chunker can never
+/// disagree about which parse of `tokenizer.json` they got, and the file is
+/// never read twice for one process. Pulled out of `start_memory_worker` so
+/// this wiring is unit-testable without a desktop `AppHandle`.
+pub fn resolve_tokenizer_and_chunker(
+    base_dir: &std::path::Path,
+    tokenizer_cell: &OnceCell<Arc<tokenizers::Tokenizer>>,
+) -> Arc<ChatChunker> {
+    let tok = crate::memory::model_download::load_tokenizer(base_dir);
+    if let Some(t) = &tok {
+        let _ = tokenizer_cell.set(t.clone());
+    }
+    Arc::new(ChatChunker::from_tokenizer(tok))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use super::*;
+    use crate::memory::MemoryStore;
+    use crate::memory::embedder::{EmbedError, Embedder, FakeEmbedder};
+    use crate::memory::events::MemorySource;
+    use crate::models::chat::Role;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::task::JoinHandle;
+
+    // ── Test helpers ────────────────────────────────────────────────────────────
+
+    fn make_event(role: Role, content: &str, is_error: Option<bool>, ts: u64) -> MemoryEvent {
+        MemoryEvent {
+            agent_id: "agent-test".to_string(),
+            project_id: None,
+            role,
+            content: content.to_string(),
+            is_error,
+            source: MemorySource::Chat,
+            timestamp_ms: ts,
+        }
+    }
+
+    fn make_event_with_project(role: Role, content: &str, project_id: Option<String>, ts: u64) -> MemoryEvent {
+        MemoryEvent {
+            agent_id: "agent-test".to_string(),
+            project_id,
+            role,
+            content: content.to_string(),
+            is_error: None,
+            source: MemorySource::Chat,
+            timestamp_ms: ts,
+        }
+    }
+
+    async fn count_memory(store: &MemoryStore) -> i64 {
+        store.conn
+            .call(|c| c.query_row("SELECT COUNT(*) FROM memory", [], |r| r.get(0)))
+            .await
+            .unwrap()
+    }
+
+    async fn drain_worker(tx: UnboundedSender<MemoryEvent>, handle: JoinHandle<()>) {
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_millis(500), handle)
+            .await
+            .expect("worker must exit within timeout after sender dropped")
+            .expect("worker must not panic");
+    }
+
+    // ── Worker spawn returns a join handle usable for shutdown/panic detection ──
+
+    #[tokio::test]
+    async fn spawn_memory_worker_returns_join_handle() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+
+        let (tx, handle) = spawn_test_worker(store, embedder).await;
+
+        // Handle should NOT be done immediately
+        assert!(!handle.is_finished());
+
+        drop(tx);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            handle,
+        )
+        .await;
+        assert!(result.is_ok(), "worker must exit within timeout after sender dropped");
+        assert!(result.unwrap().is_ok(), "worker must not panic");
+    }
+
+    // ── Graceful shutdown and per-event error isolation ──────────────────────
+
+    #[tokio::test]
+    async fn worker_exits_gracefully_when_all_senders_dropped() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let (tx, handle) = spawn_test_worker(store, embedder).await;
+        drain_worker(tx, handle).await;
+    }
+
+    #[tokio::test]
+    async fn worker_continues_after_per_event_error() {
+        // First event: Role::Assistant with empty content + tool_calls (Skip path).
+        // Second event: valid user message (should be processed + inserted).
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        // Skip event (empty assistant tool-call)
+        let skip_evt = MemoryEvent {
+            agent_id: "agent-test".to_string(),
+            project_id: None,
+            role: Role::Assistant,
+            content: String::new(),
+            is_error: None,
+            source: MemorySource::Chat,
+            timestamp_ms: 1,
+        };
+        // Wait: the "tool_calls" filter is in from_message, but the worker just
+        // calls select_chunker(Role::Assistant, None, "") → Skip (empty content).
+        tx.send(skip_evt).unwrap();
+
+        // Valid user event
+        tx.send(make_event(Role::User, "hello world", None, 2)).unwrap();
+
+        // Give the worker time to process
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_millis(500), handle)
+            .await
+            .expect("worker must exit within timeout")
+            .expect("worker must not panic");
+
+        // Worker must have processed the valid event (1 row)
+        let rows = count_memory(&store).await;
+        assert_eq!(rows, 1, "expected 1 row for valid event; got {rows}");
+    }
+
+    // ── Embedder-not-ready gate: empty cell drops events without inserting ──────
+
+    #[tokio::test]
+    async fn embedder_cell_empty_no_rows_inserted() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        // Empty cell — no embedder seeded
+        let (tx, handle) = spawn_test_worker_opt(Arc::clone(&store), None).await;
+        tx.send(make_event(Role::User, "hello", None, 1)).unwrap();
+        drain_worker(tx, handle).await;
+        let rows = count_memory(&store).await;
+        assert_eq!(rows, 0, "empty embedder cell → 0 rows; got {rows}");
+    }
+
+    #[tokio::test]
+    async fn embedder_not_ready_no_rows_inserted() {
+        // FakeEmbedder with dim=0 → always returns Ok([]) → insert will fail dim
+        // check → 0 rows. Alternative: use a dim that triggers DimensionMismatch.
+        // Actually the dim check is for wrong dimension (not 384). Let's use a
+        // test embedder that returns NotReady.
+        struct NotReadyEmbedder;
+        #[async_trait::async_trait]
+        impl Embedder for NotReadyEmbedder {
+            async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+                Err(EmbedError::NotReady)
+            }
+            fn dimensions(&self) -> usize { 384 }
+            fn model_id(&self) -> &str { "not-ready" }
+            fn query_prefix(&self) -> &str { "" }
+            fn passage_prefix(&self) -> &str { "" }
+        }
+
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(NotReadyEmbedder);
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+        tx.send(make_event(Role::User, "hello", None, 1)).unwrap();
+        drain_worker(tx, handle).await;
+        let rows = count_memory(&store).await;
+        assert_eq!(rows, 0, "NotReady embedder → 0 rows; got {rows}");
+    }
+
+    #[tokio::test]
+    async fn embedder_worker_gone_skips_chunk_continues() {
+        // First event: WorkerGone → 0 rows.
+        // Second event: FakeEmbedder (we test worker survival by checking rows = 1).
+        // Since we can't hot-swap the embedder in the same worker instance, we
+        // verify that the WORKER itself stays alive (doesn't exit) after WorkerGone,
+        // and that a subsequent event with a good embedder would still be drainable.
+        // Practical test: send 1 event with WorkerGone → worker logs + returns Ok().
+        // Worker is still alive → send second valid event, but wait — same embedder.
+        // So we use a counting embedder that fails on call 1, succeeds on call 2.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingEmbedder {
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl Embedder for CountingEmbedder {
+            async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Err(EmbedError::WorkerGone)
+                } else {
+                    Ok(vec![0.1_f32; 384])
+                }
+            }
+            fn dimensions(&self) -> usize { 384 }
+            fn model_id(&self) -> &str { "counting" }
+            fn query_prefix(&self) -> &str { "" }
+            fn passage_prefix(&self) -> &str { "" }
+        }
+
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let embedder: Arc<dyn Embedder> = Arc::new(CountingEmbedder { calls });
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        // First event → WorkerGone → 0 rows for this event
+        tx.send(make_event(Role::User, "first", None, 1)).unwrap();
+        // Second event → Ok → 1 row
+        tx.send(make_event(Role::User, "second", None, 2)).unwrap();
+
+        drain_worker(tx, handle).await;
+
+        let rows = count_memory(&store).await;
+        // First event: WorkerGone breaks inner loop → 0 rows.
+        // Second event: Ok → 1 row.
+        assert_eq!(rows, 1, "expected 1 row (second event), got {rows}");
+    }
+
+    /// An embedder that returns a vector containing NaN never reaches the
+    /// vec0 table: `store_insert.rs` routes every embedding through
+    /// `memory::vector::to_unit`, which rejects any non-finite component
+    /// before the transaction opens. The chunk is dropped, not the worker —
+    /// the same `Err` -> `log::warn!` + continue path already exercised by
+    /// `store_write_failure_worker_stays_alive` above handles it with no
+    /// NaN-specific branch anywhere in the worker loop.
+    #[tokio::test]
+    async fn nan_embedding_drops_chunk_worker_stays_alive() {
+        struct NanEmbedder;
+        #[async_trait::async_trait]
+        impl Embedder for NanEmbedder {
+            async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+                Ok(vec![f32::NAN; 384])
+            }
+            fn dimensions(&self) -> usize {
+                384
+            }
+            fn model_id(&self) -> &str {
+                "nan-embedder"
+            }
+            fn query_prefix(&self) -> &str {
+                ""
+            }
+            fn passage_prefix(&self) -> &str {
+                ""
+            }
+        }
+
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(NanEmbedder);
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        tx.send(make_event(Role::User, "hello", None, 1)).unwrap();
+        // Second event through the same worker proves the loop kept running
+        // past the rejected chunk instead of merely exiting cleanly on drop.
+        tx.send(make_event(Role::User, "still alive", None, 2)).unwrap();
+        drain_worker(tx, handle).await;
+
+        let rows = count_memory(&store).await;
+        assert_eq!(
+            rows, 0,
+            "NaN embedding must be rejected before any row is written; got {rows} rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_write_failure_worker_stays_alive() {
+        // Drop memory_vectors between events to cause insert failure.
+        // Worker must continue processing and not exit.
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        // First event: process before drop (should succeed)
+        tx.send(make_event(Role::User, "event1", None, 1)).unwrap();
+
+        // Give time for event1 to be processed
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Drop memory_vectors to cause subsequent inserts to fail
+        store.conn
+            .call(|c| c.execute("DROP TABLE IF EXISTS memory_vectors", []))
+            .await
+            .unwrap();
+
+        // Second event: insert fails but worker stays alive
+        tx.send(make_event(Role::User, "event2", None, 2)).unwrap();
+
+        drain_worker(tx, handle).await;
+        // Worker stayed alive (drain_worker didn't panic or timeout) — test passes.
+    }
+
+    // ── memory_type / created_by_type derivation from role and error flag ───
+
+    #[tokio::test]
+    async fn user_role_produces_chat_message_type_user_creator() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        tx.send(make_event(Role::User, "hello", None, 1)).unwrap();
+        drain_worker(tx, handle).await;
+
+        let (mt, cbt): (String, String) = store.conn
+            .call(|c| c.query_row(
+                "SELECT memory_type, created_by_type FROM memory LIMIT 1",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(mt, "chat_message");
+        assert_eq!(cbt, "user");
+    }
+
+    #[tokio::test]
+    async fn assistant_role_produces_agent_creator() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        tx.send(make_event(Role::Assistant, "I can help you", None, 1)).unwrap();
+        drain_worker(tx, handle).await;
+
+        let cbt: String = store.conn
+            .call(|c| c.query_row(
+                "SELECT created_by_type FROM memory LIMIT 1",
+                [],
+                |r| r.get(0),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cbt, "agent");
+    }
+
+    #[tokio::test]
+    async fn tool_error_produces_tool_error_type_system_creator_importance_6() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        tx.send(make_event(Role::Tool, "error output", Some(true), 1)).unwrap();
+        drain_worker(tx, handle).await;
+
+        let (mt, cbt, imp): (String, String, f64) = store.conn
+            .call(|c| c.query_row(
+                "SELECT memory_type, created_by_type, importance FROM memory LIMIT 1",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(mt, "tool_error");
+        assert_eq!(cbt, "system");
+        assert!(imp >= 6.0, "expected importance >= 6.0, got {imp}");
+    }
+
+    #[tokio::test]
+    async fn tool_success_produces_chat_message_type_system_creator() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        tx.send(make_event(Role::Tool, "tool output", Some(false), 1)).unwrap();
+        drain_worker(tx, handle).await;
+
+        let (mt, cbt): (String, String) = store.conn
+            .call(|c| c.query_row(
+                "SELECT memory_type, created_by_type FROM memory LIMIT 1",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(mt, "chat_message");
+        assert_eq!(cbt, "system");
+    }
+
+    // ── project_id flow-through from event to stored row ─────────────────────
+
+    #[tokio::test]
+    async fn project_id_derived_from_path() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        let evt = make_event_with_project(Role::User, "hello", Some("derived-hash".to_string()), 1);
+        tx.send(evt).unwrap();
+        drain_worker(tx, handle).await;
+
+        let pid: Option<String> = store.conn
+            .call(|c| c.query_row(
+                "SELECT project_id FROM memory LIMIT 1",
+                [],
+                |r| r.get(0),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(pid.as_deref(), Some("derived-hash"));
+    }
+
+    #[tokio::test]
+    async fn project_id_none_when_no_path() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        let evt = make_event_with_project(Role::User, "hello", None, 1);
+        tx.send(evt).unwrap();
+        drain_worker(tx, handle).await;
+
+        let pid: Option<String> = store.conn
+            .call(|c| c.query_row(
+                "SELECT project_id FROM memory LIMIT 1",
+                [],
+                |r| r.get(0),
+            ))
+            .await
+            .unwrap();
+        assert!(pid.is_none(), "expected NULL project_id, got {pid:?}");
+    }
+
+    // ── 5-turn end-to-end integration: a full chat exchange through the worker ──
+
+    #[tokio::test]
+    async fn e2e_5_turn_chat_produces_5_rows() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        let roles = [
+            (Role::User, "msg1", None),
+            (Role::Assistant, "msg2", None),
+            (Role::Tool, "msg3", Some(false)),
+            (Role::User, "msg4", None),
+            (Role::Assistant, "msg5", None),
+        ];
+        for (i, (role, content, is_error)) in roles.iter().enumerate() {
+            tx.send(MemoryEvent {
+                agent_id: "agent-test".to_string(),
+                project_id: None,
+                role: role.clone(),
+                content: content.to_string(),
+                is_error: *is_error,
+                source: MemorySource::Chat,
+                timestamp_ms: (i as u64) + 1,
+            }).unwrap();
+        }
+        drain_worker(tx, handle).await;
+
+        // 5 rows in memory
+        let mc = count_memory(&store).await;
+        assert_eq!(mc, 5, "expected 5 rows in memory, got {mc}");
+
+        // 5 rows in memory_vectors
+        let vc: i64 = store.conn
+            .call(|c| c.query_row("SELECT COUNT(*) FROM memory_vectors", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(vc, 5, "expected 5 rows in memory_vectors, got {vc}");
+
+        // All rows have agent_id = "agent-test"
+        let agent_count: i64 = store.conn
+            .call(|c| c.query_row(
+                "SELECT COUNT(*) FROM memory WHERE agent_id = 'agent-test'",
+                [],
+                |r| r.get(0),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(agent_count, 5, "all rows must have agent_id=agent-test");
+
+        // memory_vectors rowids match memory ids
+        let mismatch: i64 = store.conn
+            .call(|c| c.query_row(
+                "SELECT COUNT(*) FROM memory m \
+                 LEFT JOIN memory_vectors v ON m.id = v.rowid \
+                 WHERE v.rowid IS NULL",
+                [],
+                |r| r.get(0),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(mismatch, 0, "all memory rows must have matching vector rows");
+
+        // FIFO ordering: rows must come back in the same order they were sent.
+        // Asserting on (created_at, content) pairs catches a regression where the
+        // consumer or the INSERT path scrambles temporal order — the kind of bug
+        // that a bare count check would silently let through.
+        let ordered: Vec<(i64, String)> = store.conn
+            .call(|c| -> Result<Vec<(i64, String)>, rusqlite::Error> {
+                let mut stmt = c.prepare(
+                    "SELECT created_at, content FROM memory ORDER BY created_at ASC, id ASC",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<Result<Vec<(i64, String)>, rusqlite::Error>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        let expected: Vec<(i64, &str)> = vec![
+            (1, "msg1"), (2, "msg2"), (3, "msg3"), (4, "msg4"), (5, "msg5"),
+        ];
+        assert_eq!(
+            ordered.iter().map(|(ts, c)| (*ts, c.as_str())).collect::<Vec<_>>(),
+            expected,
+            "FIFO order broken — rows arrived in {:?}",
+            ordered,
+        );
+
+        // Repeat with project_id = Some("proj-hash")
+        let store2 = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder2: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let (tx2, handle2) = spawn_test_worker(Arc::clone(&store2), embedder2).await;
+        for (i, (role, content, is_error)) in roles.iter().enumerate() {
+            tx2.send(MemoryEvent {
+                agent_id: "agent-test".to_string(),
+                project_id: Some("proj-hash".to_string()),
+                role: role.clone(),
+                content: content.to_string(),
+                is_error: *is_error,
+                source: MemorySource::Chat,
+                timestamp_ms: (i as u64) + 1,
+            }).unwrap();
+        }
+        drain_worker(tx2, handle2).await;
+        let proj_count: i64 = store2.conn
+            .call(|c| c.query_row(
+                "SELECT COUNT(*) FROM memory WHERE project_id IS NOT NULL",
+                [],
+                |r| r.get(0),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(proj_count, 5, "all rows must have project_id set; got {proj_count}");
+
+        // Repeat with project_id = None
+        let store3 = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder3: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let (tx3, handle3) = spawn_test_worker(Arc::clone(&store3), embedder3).await;
+        for (i, (role, content, is_error)) in roles.iter().enumerate() {
+            tx3.send(MemoryEvent {
+                agent_id: "agent-test".to_string(),
+                project_id: None,
+                role: role.clone(),
+                content: content.to_string(),
+                is_error: *is_error,
+                source: MemorySource::Chat,
+                timestamp_ms: (i as u64) + 1,
+            }).unwrap();
+        }
+        drain_worker(tx3, handle3).await;
+        let null_count: i64 = store3.conn
+            .call(|c| c.query_row(
+                "SELECT COUNT(*) FROM memory WHERE project_id IS NULL",
+                [],
+                |r| r.get(0),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(null_count, 5, "all rows must have NULL project_id; got {null_count}");
+    }
+
+    // ── system_role / empty assistant tool-call filtering ────────────────────
+
+    #[tokio::test]
+    async fn system_role_never_reaches_worker() {
+        // MemoryEvent::from_message returns None for Role::System — this is
+        // tested here to confirm the filter contract, even though the worker
+        // also has select_chunker(Role::System, ...) → Skip as a defensive arm.
+        use crate::models::chat::ChatMessage;
+        let msg = ChatMessage {
+            id: "t".to_string(),
+            role: Role::System,
+            content: "system prompt".to_string(),
+            tool_calls: None,
+            timestamp_ms: 0,
+            is_error: None,
+        };
+        let result = crate::memory::events::MemoryEvent::from_message(
+            "agent".to_string(),
+            None,
+            &msg,
+            MemorySource::Chat,
+        );
+        assert!(result.is_none(), "system role must return None from from_message");
+    }
+
+    #[tokio::test]
+    async fn empty_assistant_tool_call_not_ingested() {
+        use crate::models::chat::ChatMessage;
+        let mut msg = ChatMessage {
+            id: "t".to_string(),
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: Some(vec![]),
+            timestamp_ms: 0,
+            is_error: None,
+        };
+        let result = crate::memory::events::MemoryEvent::from_message(
+            "agent".to_string(),
+            None,
+            &msg,
+            MemorySource::Chat,
+        );
+        assert!(result.is_none(), "empty assistant tool-call must return None from from_message");
+
+        // Also verify non-empty assistant content DOES produce an event
+        msg.content = "actual response".to_string();
+        msg.tool_calls = None;
+        let result2 = crate::memory::events::MemoryEvent::from_message(
+            "agent".to_string(),
+            None,
+            &msg,
+            MemorySource::Chat,
+        );
+        assert!(result2.is_some(), "non-empty assistant content must produce an event");
+    }
+
+    // ── Compile-time Send + Sync guards ──────────────────────────────────────
+
+    #[test]
+    fn memory_event_and_worker_types_are_send_sync() {
+        fn _send<T: Send + 'static>() {}
+        fn _sync<T: Sync>() {}
+        _send::<MemoryEvent>();
+        _send::<Arc<OnceCell<Arc<dyn Embedder>>>>();
+        _sync::<Arc<OnceCell<Arc<dyn Embedder>>>>();
+    }
+
+    // ── Worker contradiction hook: disputed_against set on match, left None otherwise ──
+
+    /// Helper: insert a memory row with a given embedding directly into the store.
+    /// Uses tier=3, status='active' so it is visible to search.
+    async fn insert_row_with_embedding(store: &MemoryStore, agent_id: &str, embedding: &[f32]) -> i64 {
+        let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let agent = agent_id.to_string();
+        store
+            .conn
+            .call(move |c| -> Result<i64, rusqlite::Error> {
+                let tx = c.transaction()?;
+                tx.execute(
+                    "INSERT INTO memory \
+                     (scope, agent_id, content, memory_type, source, \
+                      created_at, created_by_type, created_by_ref, \
+                      last_modified_at, last_accessed_at, importance, tier, status) \
+                     VALUES ('agent', ?1, 'pre content', 'chat_message', 'chat', \
+                      0, 'user', ?1, 0, 0, 5.0, 3, 'active')",
+                    rusqlite::params![agent],
+                )?;
+                let id = tx.last_insert_rowid();
+                tx.execute(
+                    "INSERT INTO memory_vectors(rowid, embedding) VALUES (?, ?)",
+                    rusqlite::params![id, bytes],
+                )?;
+                tx.commit()?;
+                Ok(id)
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Two identical-content events must REINFORCE, not dispute: the
+    /// write-border dedup gate hashes the second chunk, finds the first row
+    /// by `(agent_id, project_id, content_hash)`, and increments its
+    /// `access_count` instead of inserting a second row and running the
+    /// contradiction detector against it. This deliberately inverts the
+    /// prior expectation of this test — a resent chunk used to reach
+    /// `detect_contradiction` at distance 0 and get marked `disputed`, which
+    /// was exactly the structural false positive the dedup gate exists to
+    /// prevent.
+    #[tokio::test]
+    async fn worker_reinforces_identical_content_instead_of_disputing() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        // Event 1: no prior rows → inserted, active.
+        tx.send(make_event(Role::User, "identical content", None, 1)).unwrap();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Event 2: identical content → hash matches row 1 → REINFORCE, not insert.
+        tx.send(make_event(Role::User, "identical content", None, 2)).unwrap();
+
+        drain_worker(tx, handle).await;
+
+        // Fetch all rows ordered by id
+        let conn = store.conn.clone();
+        let rows: Vec<(i64, String, Option<String>, i64)> = conn
+            .call(|c| -> Result<Vec<(i64, String, Option<String>, i64)>, rusqlite::Error> {
+                let mut stmt = c.prepare(
+                    "SELECT id, status, disputed_against, access_count FROM memory ORDER BY id ASC"
+                )?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(rows.len(), 1, "the second identical event must REINFORCE, not insert a second row; got {} rows", rows.len());
+        let (_, status, disputed_against, access_count) = &rows[0];
+        assert_eq!(status, "active", "the reinforced row must stay active, never disputed");
+        assert!(disputed_against.is_none(), "reinforcement must never set disputed_against");
+        assert_eq!(*access_count, 2, "access_count must be 2 after one reinforcement");
+    }
+
+    /// detect_contradiction returns empty → new row has
+    /// disputed_against=None and status='active'.
+    #[tokio::test]
+    async fn worker_leaves_disputed_against_none_when_no_contradiction() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        // Single event, no prior rows → detect_contradiction returns [] → active
+        tx.send(make_event(Role::User, "unique content abc123", None, 1)).unwrap();
+        drain_worker(tx, handle).await;
+
+        let conn = store.conn.clone();
+        let (status, da): (String, Option<String>) = conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT status, disputed_against FROM memory LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(status, "active", "single event with no prior rows must be active");
+        assert!(da.is_none(), "single event with no prior rows must have disputed_against=NULL");
+    }
+
+    // ── Role: worker embeds Passage exactly once per chunk, reused by both consumers ──
+
+    /// Records every `(role, text)` pair handed to `embed_with_role`.
+    struct RecordingEmbedder {
+        calls: Arc<std::sync::Mutex<Vec<(EmbedRole, String)>>>,
+    }
+    #[async_trait::async_trait]
+    impl Embedder for RecordingEmbedder {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+            self.calls.lock().unwrap().push((role, text.to_string()));
+            Ok(vec![0.1_f32; 384])
+        }
+        fn dimensions(&self) -> usize {
+            384
+        }
+        fn model_id(&self) -> &str {
+            "recording"
+        }
+        fn query_prefix(&self) -> &str {
+            ""
+        }
+        fn passage_prefix(&self) -> &str {
+            ""
+        }
+    }
+
+    /// A one-chunk ingest event must produce exactly ONE `embed_with_role`
+    /// call, role `Passage` — the same vector feeds both
+    /// `insert_memory_with_vector` and `detect_contradiction`'s KNN probe, so
+    /// there must be no second inference for the contradiction check.
+    #[tokio::test]
+    async fn worker_embeds_passage_exactly_once_per_chunk() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let embedder: Arc<dyn Embedder> = Arc::new(RecordingEmbedder { calls: calls.clone() });
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        tx.send(make_event(Role::User, "single chunk of content", None, 1)).unwrap();
+        drain_worker(tx, handle).await;
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "expected exactly one embed call for a one-chunk event, got {recorded:?}"
+        );
+        assert_eq!(recorded[0].0, EmbedRole::Passage, "worker must embed with role Passage");
+        assert_eq!(recorded[0].1, "single chunk of content");
+    }
+
+    /// The write-border dedup gate runs BEFORE `embed_with_role`: a duplicate
+    /// chunk must never reach the embedder at all. Sending the identical text
+    /// twice through one worker must produce exactly ONE recorded embed call
+    /// — asserting `== 1`, not `== 0`, is the point: it proves the second
+    /// send was absorbed by the gate, not that the embedder was never wired.
+    #[tokio::test]
+    async fn worker_embeds_duplicate_chunk_zero_times() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let embedder: Arc<dyn Embedder> = Arc::new(RecordingEmbedder { calls: calls.clone() });
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        tx.send(make_event(Role::User, "repeated content", None, 1)).unwrap();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        tx.send(make_event(Role::User, "repeated content", None, 2)).unwrap();
+        drain_worker(tx, handle).await;
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the duplicate send must be absorbed by the dedup gate before embedding, got {recorded:?}"
+        );
+    }
+
+    // ── Absorbed-duplicates counter: pinned against deletion ─────────────────
+
+    /// `absorbed` is a plain counter incremented once per REINFORCE hit.
+    /// Every existing test in this module observes duplicate absorption only
+    /// indirectly — via row count or embed-call count — so deleting the
+    /// increment itself (or the whole `log::debug!` line reading it) would
+    /// leave the rest of the suite green. This test calls `process_event`
+    /// directly, twice, with identical content through the same store and
+    /// embedder, and asserts the counter's value after each call.
+    #[tokio::test]
+    async fn absorbed_duplicates_counter_increments_on_reinforce_hit() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let cell: OnceCell<Arc<dyn Embedder>> = OnceCell::new();
+        cell.set(embedder).ok();
+        let cell = Arc::new(cell);
+        let chat_chunker = Arc::new(ChatChunker::with_fallback());
+        let code_chunker = Arc::new(CodeChunker::new());
+
+        let mut absorbed: u64 = 0;
+        let evt = make_event(Role::User, "counter fixture content", None, 1);
+
+        process_event(&evt, &store, &cell, &chat_chunker, &code_chunker, &mut absorbed)
+            .await
+            .unwrap();
+        assert_eq!(absorbed, 0, "the first send has no prior row to reinforce");
+
+        process_event(&evt, &store, &cell, &chat_chunker, &code_chunker, &mut absorbed)
+            .await
+            .unwrap();
+        assert_eq!(
+            absorbed, 1,
+            "the second identical send must be absorbed by the dedup gate, incrementing the counter"
+        );
+    }
+
+    // ── Regression: the System→Skip guard still applies to non-Compaction events ──
+
+    #[tokio::test]
+    async fn system_role_with_chat_source_still_yields_zero_rows() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        tx.send(MemoryEvent {
+            agent_id: "agent-test".to_string(),
+            project_id: None,
+            role: Role::System,
+            content: "system prompt".to_string(),
+            is_error: None,
+            source: MemorySource::Chat,
+            timestamp_ms: 1,
+        }).unwrap();
+        drain_worker(tx, handle).await;
+
+        let rows = count_memory(&store).await;
+        assert_eq!(rows, 0, "Role::System + source=Chat must still Skip; got {rows}");
+    }
+
+    // ── Compaction events bypass the System→Skip guard, producing 1 session_summary row ──
+
+    #[tokio::test]
+    async fn compaction_event_produces_one_session_summary_row() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        tx.send(MemoryEvent {
+            agent_id: "agent-test".to_string(),
+            project_id: None,
+            role: Role::System,
+            content: "<summary>\nConversation summary:\n- Scope: 3 messages compacted.\n</summary>".to_string(),
+            is_error: None,
+            source: MemorySource::Compaction,
+            timestamp_ms: 1,
+        }).unwrap();
+        drain_worker(tx, handle).await;
+
+        let rows = count_memory(&store).await;
+        assert_eq!(rows, 1, "Compaction source must bypass the System→Skip guard and insert exactly 1 row; got {rows}");
+
+        let (mt, vec_count): (String, i64) = store.conn
+            .call(|c| -> Result<(String, i64), rusqlite::Error> {
+                let mt: String = c.query_row(
+                    "SELECT memory_type FROM memory LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let vc: i64 = c.query_row(
+                    "SELECT COUNT(*) FROM memory_vectors",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok((mt, vc))
+            })
+            .await
+            .unwrap();
+        assert_eq!(mt, "session_summary", "expected memory_type='session_summary'; got {mt}");
+        assert_eq!(vec_count, 1, "expected 1 matching memory_vectors row; got {vec_count}");
+    }
+
+    // ── Shared fixture: write two real messages, read them back ────────────
+
+    use crate::memory::prompt_builder::{
+        build_memory_prompt, QueryTexts, SEP_LONGTERM_TEST, SEP_RECENT_TEST,
+    };
+    use crate::memory::search::{search_all_memories, RankedHit, SearchScope};
+    use crate::memory::workspace::WorkspaceManager;
+    use crate::models::chat::{current_time_millis, ChatMessage};
+
+    /// State shared by the two gates below: one fresh message and one a month
+    /// old, written through the real worker and read back through both
+    /// `search_all_memories` and `build_memory_prompt`. Not a test itself and
+    /// not gated behind either test's ignore reason — it exists so the write
+    /// path runs once instead of once per assertion group.
+    struct WrittenMemoryFixture {
+        hits: Vec<RankedHit>,
+        prompt: String,
+        fresh: ChatMessage,
+        stale: ChatMessage,
+    }
+
+    async fn write_fresh_and_stale_then_read_back() -> WrittenMemoryFixture {
+        const AGENT: &str = "agent-invariant";
+        const DAY_MS: u64 = 86_400_000;
+
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder = Arc::new(FakeEmbedder::default());
+        let (tx, handle) =
+            spawn_test_worker(Arc::clone(&store), embedder.clone() as Arc<dyn Embedder>).await;
+
+        let now_ms = current_time_millis();
+        let fresh = ChatMessage {
+            id: "msg-fresh".to_string(),
+            role: Role::User,
+            content: "el proyecto usa pnpm y no npm".to_string(),
+            tool_calls: None,
+            timestamp_ms: now_ms,
+            is_error: None,
+        };
+        let stale = ChatMessage {
+            id: "msg-stale".to_string(),
+            role: Role::User,
+            content: "el monorepo entero se instala con pnpm".to_string(),
+            tool_calls: None,
+            timestamp_ms: now_ms - 30 * DAY_MS,
+            is_error: None,
+        };
+
+        for msg in [&fresh, &stale] {
+            let evt = MemoryEvent::from_message(
+                AGENT.to_string(), None, msg, MemorySource::Chat,
+            )
+            .expect("a user message with content must produce an ingest event");
+            tx.send(evt).unwrap();
+        }
+
+        // Dropping the sender closes the channel; the worker's recv loop awaits each
+        // insert inline, so it can only observe the closed channel after the last
+        // write committed. Awaiting the handle is the barrier — no sleeping.
+        drain_worker(tx, handle).await;
+
+        let q_vec = embedder.embed_with_role(&fresh.content, EmbedRole::Query).await.unwrap();
+        let hits = search_all_memories(
+            &store, &q_vec, None, AGENT, SearchScope::all_default(), 10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            hits.len(), 2,
+            "both messages must come back as one row each; a different count means \
+             the chunker split them, which changes what the rest of this test measures"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let prompt = build_memory_prompt(
+            &store, &wm, Some(embedder.clone() as Arc<dyn Embedder>),
+            AGENT, None, QueryTexts::single_shot(&fresh.content),
+            &crate::memory::workspace::EmittedIds::default(), None,
+        )
+        .await
+        .unwrap();
+
+        WrittenMemoryFixture { hits, prompt, fresh, stale }
+    }
+
+    // A written memory has to render with a date a human could read and land in
+    // the right recency block. Nothing here names an instant: the two messages
+    // are stamped by the same clock production uses, one of them a month back,
+    // so the assertions cannot be satisfied by a fixture that happens to agree
+    // with a broken unit.
+    #[tokio::test]
+    async fn e2e_real_write_path_produces_sane_date_and_buckets() {
+        let fixture = write_fresh_and_stale_then_read_back().await;
+        let mut violations: Vec<String> = Vec::new();
+
+        // Every rendered hit opens with `[YYYY-MM-DD]`.
+        let years: Vec<i32> = fixture
+            .prompt
+            .lines()
+            .filter_map(|l| l.strip_prefix('['))
+            .filter_map(|l| l.split('-').next())
+            .filter_map(|y| y.parse::<i32>().ok())
+            .collect();
+        if years.len() != 2 {
+            violations.push(format!("expected one rendered date per hit, got {years:?}"));
+        }
+        for y in &years {
+            if !(2020..=2100).contains(y) {
+                violations.push(format!("rendered year {y} is not a date anyone lived through"));
+            }
+        }
+
+        match (
+            fixture.prompt.find(SEP_RECENT_TEST),
+            fixture.prompt.find(SEP_LONGTERM_TEST),
+        ) {
+            (Some(r), Some(l)) => {
+                if !fixture.prompt[r..l].contains(&fixture.fresh.content) {
+                    violations.push("the just-written message did not bucket as recent".into());
+                }
+                if !fixture.prompt[l..].contains(&fixture.stale.content) {
+                    violations.push("the month-old message did not bucket as long-term".into());
+                }
+            }
+            (Some(_), None) => violations.push(
+                "every hit bucketed as recent — the month-old message never reached long-term".into(),
+            ),
+            (None, _) => violations.push("no recent block was rendered at all".into()),
+        }
+
+        assert!(
+            violations.is_empty(),
+            "unit invariants violated:\n  - {}",
+            violations.join("\n  - ")
+        );
+    }
+
+    // A written memory's score has to land inside its own contract: never
+    // negative, never above one. The similarity factor is
+    // `cosine_from_l2_unit(distance)` (score.rs), which converts the raw L2
+    // distance between two UNIT vectors into exact cosine similarity and
+    // clamps it to `MAX(0.0, 1.0 - distance^2/2)` — both edges (insert and
+    // query) route through `to_unit` (vector.rs) before a distance is ever
+    // measured, so the similarity factor is structurally bounded in [0,1]
+    // rather than merely bounded for embeddings that happen to be close
+    // together. The default config additionally re-scales that similarity
+    // factor against a measured floor
+    // (`(cos-floor)/(1-floor)`, clamped to `[0,1]`), and a candidate whose
+    // raw similarity falls below that floor clamps all the way down to
+    // exactly `0.0` by design — that is the floor doing its job, not a
+    // formula error, so the lower bound this test can actually promise is
+    // `0.0` inclusive, not a strictly-positive one. The remaining three
+    // multiplicative factors (decay, importance, dispute) are each already
+    // clamped to `[0,1]` on their own, so the product never exceeds `1.0`
+    // regardless. This end-to-end test exercises a real write followed by a
+    // real read to prove the whole pipeline honors the bound, not just the
+    // formula in isolation.
+    #[tokio::test]
+    async fn e2e_real_write_path_produces_bounded_score() {
+        let fixture = write_fresh_and_stale_then_read_back().await;
+        let mut violations: Vec<String> = Vec::new();
+
+        for h in &fixture.hits {
+            if !(h.score >= 0.0 && h.score <= 1.0) {
+                violations.push(format!("score {} is outside [0.0, 1.0]", h.score));
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "score contract violated:\n  - {}",
+            violations.join("\n  - ")
+        );
+    }
+
+    // ── Ingest queue depth: pinned constant + pure edge-detection helper ────
+
+    #[test]
+    fn ingest_queue_warn_depth_is_64() {
+        assert_eq!(INGEST_QUEUE_WARN_DEPTH, 64);
+    }
+
+    #[test]
+    fn queue_depth_transition_below_threshold_not_over_is_none() {
+        assert_eq!(queue_depth_transition(63, false), None);
+    }
+
+    #[test]
+    fn queue_depth_transition_at_threshold_not_over_is_rising() {
+        assert_eq!(queue_depth_transition(64, false), Some(QueueDepthEdge::Rising));
+    }
+
+    #[test]
+    fn queue_depth_transition_at_threshold_already_over_is_none() {
+        assert_eq!(queue_depth_transition(64, true), None);
+    }
+
+    #[test]
+    fn queue_depth_transition_above_threshold_already_over_is_none() {
+        assert_eq!(queue_depth_transition(65, true), None);
+    }
+
+    #[test]
+    fn queue_depth_transition_below_threshold_already_over_is_falling() {
+        assert_eq!(queue_depth_transition(63, true), Some(QueueDepthEdge::Falling));
+    }
+
+    // ── collapse_duplicate_chunks (pure) ─────────────────────────────────────
+
+    fn make_chunk(text: &str) -> Chunk {
+        Chunk { text: text.to_string(), token_count: 0, header: None }
+    }
+
+    #[test]
+    fn collapse_duplicate_chunks_keeps_first_occurrence_order() {
+        let chunks = vec![make_chunk("a"), make_chunk("b"), make_chunk("a")];
+        let out = collapse_duplicate_chunks(chunks);
+        assert_eq!(out.len(), 2, "expected 2 collapsed entries");
+        assert_eq!(out[0].chunk.text, "a");
+        assert_eq!(out[1].chunk.text, "b");
+    }
+
+    #[test]
+    fn collapse_duplicate_chunks_counts_repeat_copies() {
+        let chunks = vec![make_chunk("a"), make_chunk("a"), make_chunk("a")];
+        let out = collapse_duplicate_chunks(chunks);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].multiplicity, 3, "three identical chunks must collapse to multiplicity 3");
+    }
+
+    #[test]
+    fn collapse_duplicate_chunks_of_all_distinct_is_identity() {
+        let chunks = vec![make_chunk("a"), make_chunk("b"), make_chunk("c")];
+        let out = collapse_duplicate_chunks(chunks);
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|p| p.multiplicity == 1), "all-distinct input must leave every multiplicity at 1");
+    }
+
+    // ── process_event: one embed_batch call per event ────────────────────────
+
+    /// `process_event` must route a multi-chunk event through exactly one
+    /// `embed_batch` call, never per-chunk `embed_with_role` calls.
+    #[tokio::test]
+    async fn multi_chunk_event_issues_one_embed_batch_call() {
+        struct BatchRecordingEmbedder {
+            batch_calls: Arc<std::sync::Mutex<Vec<usize>>>,
+        }
+        #[async_trait::async_trait]
+        impl Embedder for BatchRecordingEmbedder {
+            async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+                unreachable!("process_event must call embed_batch, not embed_with_role, for chunked events");
+            }
+            async fn embed_batch(&self, texts: &[String], _role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
+                self.batch_calls.lock().unwrap().push(texts.len());
+                Ok(texts.iter().map(|_| vec![0.1_f32; 384]).collect())
+            }
+            fn dimensions(&self) -> usize {
+                384
+            }
+            fn model_id(&self) -> &str {
+                "batch-recording"
+            }
+            fn query_prefix(&self) -> &str {
+                ""
+            }
+            fn passage_prefix(&self) -> &str {
+                ""
+            }
+        }
+
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let batch_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let embedder: Arc<dyn Embedder> =
+            Arc::new(BatchRecordingEmbedder { batch_calls: batch_calls.clone() });
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        // 5760 bytes at the byte-fallback cap (1920B) with 256B overlap
+        // (stride 1664B) splits into 4 windows — [0,1920) [1664,3584)
+        // [3328,5248) [4992,5760) — all distinct strings (the source is
+        // three DIFFERENT repeated letters), so none absorb each other and
+        // all 4 survive to the embed stage.
+        let content = format!("{}{}{}", "a".repeat(1920), "b".repeat(1920), "c".repeat(1920));
+        tx.send(make_event(Role::User, &content, None, 1)).unwrap();
+        drain_worker(tx, handle).await;
+
+        let calls = batch_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "expected exactly one embed_batch call for the whole event, got {calls:?}");
+        assert_eq!(calls[0], 4, "expected the single call to carry all 4 surviving chunks, got {calls:?}");
+    }
+
+    /// Event `[A, A]`, neither present in the store: stage 1 collapses to one
+    /// survivor with multiplicity 2, stage 3 inserts it once then replays the
+    /// reinforce path once more — 1 row, access_count=2, absorbed=1. Same
+    /// externally observable outcome as two identical chunks arriving in
+    /// separate events.
+    #[tokio::test]
+    async fn intra_event_duplicate_chunks_insert_one_row_and_reinforce() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let cell: OnceCell<Arc<dyn Embedder>> = OnceCell::new();
+        cell.set(embedder).ok();
+        let cell = Arc::new(cell);
+        let chat_chunker = Arc::new(ChatChunker::with_fallback());
+        let code_chunker = Arc::new(CodeChunker::new());
+
+        let mut absorbed: u64 = 0;
+        // 3584 bytes = cap(1920) + stride(1664): the windowing produces
+        // exactly two windows, [0,1920) and [1664,3584), both 1920 bytes of
+        // the same repeated char — i.e. two byte-identical chunks, no
+        // third partial one.
+        let content = "x".repeat(3584);
+        let evt = make_event(Role::User, &content, None, 1);
+
+        process_event(&evt, &store, &cell, &chat_chunker, &code_chunker, &mut absorbed)
+            .await
+            .unwrap();
+
+        let rows = count_memory(&store).await;
+        assert_eq!(rows, 1, "two identical chunks in one event must insert exactly one row; got {rows}");
+        assert_eq!(absorbed, 1, "one duplicate copy absorbed within the event");
+
+        let access_count: i64 = store.conn
+            .call(|c| c.query_row("SELECT access_count FROM memory LIMIT 1", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(access_count, 2, "access_count must be insert(1) + intra-event reinforce replay(1) = 2");
+    }
+
+    /// Event `[A, A]` where `A` is ALREADY in the store (from a prior event):
+    /// collapsing first and gating once per survivor would under-count —
+    /// today's per-chunk loop hits the gate twice for this input. Both copies
+    /// must be replayed through `absorb_duplicate`, so `absorbed` must move
+    /// by 2, not 1 (design's under-count fix).
+    #[tokio::test]
+    async fn existing_duplicate_chunks_absorb_once_per_copy_not_once_per_event() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let cell: OnceCell<Arc<dyn Embedder>> = OnceCell::new();
+        cell.set(embedder).ok();
+        let cell = Arc::new(cell);
+        let chat_chunker = Arc::new(ChatChunker::with_fallback());
+        let code_chunker = Arc::new(CodeChunker::new());
+
+        // Seed the store with ONE row for chunk A ("x" * 1920).
+        let mut absorbed: u64 = 0;
+        let seed_evt = make_event(Role::User, &"x".repeat(1920), None, 1);
+        process_event(&seed_evt, &store, &cell, &chat_chunker, &code_chunker, &mut absorbed)
+            .await
+            .unwrap();
+        assert_eq!(absorbed, 0, "seed insert has no prior row to reinforce");
+        assert_eq!(count_memory(&store).await, 1);
+
+        // Now send an event carrying TWO copies of the already-stored chunk A.
+        // 3584 bytes (cap + stride), not 3840: with overlap the windowing
+        // over "x"*3840 would produce a third, shorter (512-byte) window
+        // distinct from A — a brand-new chunk this test isn't about. 3584
+        // keeps the fixture to exactly two 1920-byte windows, both == A.
+        absorbed = 0;
+        let dup_evt = make_event(Role::User, &"x".repeat(3584), None, 2);
+        process_event(&dup_evt, &store, &cell, &chat_chunker, &code_chunker, &mut absorbed)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            absorbed, 2,
+            "both copies of an already-stored chunk must be absorbed individually, not collapsed into one absorb"
+        );
+        assert_eq!(count_memory(&store).await, 1, "no new row inserted for an already-present chunk");
+
+        let access_count: i64 = store.conn
+            .call(|c| c.query_row("SELECT access_count FROM memory LIMIT 1", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(access_count, 3, "seed insert(1) + two reinforce hits(+2) = 3");
+    }
+
+    /// Integration-level counterpart of the unit-level boundary test in
+    /// `token_splitter.rs`: a marker straddling the old (pre-overlap)
+    /// 0-overlap cut point must come out whole in one persisted `memory`
+    /// row, not just inside one in-memory `Chunk`.
+    #[tokio::test]
+    async fn boundary_straddling_span_survives_whole_in_one_persisted_row() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FakeEmbedder::default());
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        // The old splitter cut at multiples of 1920 bytes with zero overlap;
+        // this marker straddles the first such cut point.
+        let mut content = "a".repeat(1900);
+        content.push_str("MARKER_SPANNING_BOUNDARY");
+        content.push_str(&"b".repeat(2000));
+        tx.send(make_event(Role::User, &content, None, 1)).unwrap();
+        drain_worker(tx, handle).await;
+
+        let hits: i64 = store
+            .conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM memory WHERE content LIKE '%MARKER_SPANNING_BOUNDARY%'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            hits, 1,
+            "marker straddling the old cut point must survive whole in exactly one persisted row"
+        );
+    }
+
+    /// `InferenceFailed` from `embed_batch` must drop the WHOLE event, not
+    /// skip one chunk and continue — a deliberate behavior change from the
+    /// old per-chunk skip semantics (which would have left 4-of-5 chunks
+    /// inserted here).
+    #[tokio::test]
+    async fn batch_embed_failure_drops_the_whole_event() {
+        struct FailingBatchEmbedder;
+        #[async_trait::async_trait]
+        impl Embedder for FailingBatchEmbedder {
+            async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+                Err(EmbedError::InferenceFailed("boom".to_string()))
+            }
+            async fn embed_batch(&self, _texts: &[String], _role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
+                Err(EmbedError::InferenceFailed("boom".to_string()))
+            }
+            fn dimensions(&self) -> usize {
+                384
+            }
+            fn model_id(&self) -> &str {
+                "failing-batch"
+            }
+            fn query_prefix(&self) -> &str {
+                ""
+            }
+            fn passage_prefix(&self) -> &str {
+                ""
+            }
+        }
+
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(FailingBatchEmbedder);
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        let content = format!(
+            "{}{}{}{}{}",
+            "a".repeat(1920), "b".repeat(1920), "c".repeat(1920), "d".repeat(1920), "e".repeat(1920)
+        );
+        tx.send(make_event(Role::User, &content, None, 1)).unwrap();
+        drain_worker(tx, handle).await;
+
+        let rows = count_memory(&store).await;
+        assert_eq!(
+            rows, 0,
+            "InferenceFailed from embed_batch must drop the whole event, not insert 4-of-5 chunks; got {rows}"
+        );
+    }
+
+    /// An `embed_batch` override that returns one FEWER vector than requested
+    /// — the shape a real batch backend produces on a partial reply. This
+    /// must never reach the zip: `process_event`'s own length check is the
+    /// only guard standing between a short reply and a chunk silently paired
+    /// with another chunk's vector.
+    #[tokio::test]
+    async fn embed_batch_returning_too_few_vectors_drops_the_event_not_mispairs_it() {
+        struct ShortReplyEmbedder;
+        #[async_trait::async_trait]
+        impl Embedder for ShortReplyEmbedder {
+            async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+                unreachable!("process_event must call embed_batch for chunked events");
+            }
+            async fn embed_batch(&self, texts: &[String], _role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
+                // One short: a real backend that dropped or merged one item
+                // mid-batch would look exactly like this.
+                Ok(texts.iter().skip(1).map(|_| vec![0.1_f32; 384]).collect())
+            }
+            fn dimensions(&self) -> usize {
+                384
+            }
+            fn model_id(&self) -> &str {
+                "short-reply"
+            }
+            fn query_prefix(&self) -> &str {
+                ""
+            }
+            fn passage_prefix(&self) -> &str {
+                ""
+            }
+        }
+
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder: Arc<dyn Embedder> = Arc::new(ShortReplyEmbedder);
+        let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
+
+        // Three DISTINCT chunks so all three survive collapse and reach the
+        // embed stage; the mock then replies with only 2 vectors.
+        let content = format!("{}{}{}", "a".repeat(1920), "b".repeat(1920), "c".repeat(1920));
+        tx.send(make_event(Role::User, &content, None, 1)).unwrap();
+        drain_worker(tx, handle).await;
+
+        let rows = count_memory(&store).await;
+        assert_eq!(
+            rows, 0,
+            "a short embed_batch reply must drop the whole event, never zip a chunk to another chunk's vector; got {rows} rows"
+        );
+    }
+
+    // ── Shared tokenizer lifecycle: cell + chunker come from ONE load ────────
+
+    /// Writes a real, minimal `tokenizer.json` under `base_dir` — a
+    /// `WordLevel` model with a tiny vocab and a whitespace pre-tokenizer, so
+    /// `Tokenizer::from_file` genuinely parses it and `encode` genuinely
+    /// splits on words (unlike the byte-length fallback this proves the code
+    /// is NOT taking).
+    fn write_minimal_tokenizer_fixture(base_dir: &std::path::Path) {
+        use tokenizers::models::wordlevel::WordLevel;
+        use tokenizers::pre_tokenizers::whitespace::Whitespace;
+
+        let target = crate::memory::model_download::tokenizer_path(base_dir);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let vocab_path = target.parent().unwrap().join("vocab.json");
+        std::fs::write(&vocab_path, r#"{"[UNK]":0,"hello":1,"world":2}"#).unwrap();
+
+        let model = WordLevel::from_file(vocab_path.to_str().unwrap(), "[UNK]".to_string())
+            .expect("fixture vocab must build a WordLevel model");
+        let mut tok = tokenizers::Tokenizer::new(model);
+        tok.with_pre_tokenizer(Some(Whitespace));
+        tok.save(&target, false).expect("fixture tokenizer must save to tokenizer_path");
+    }
+
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "clawg-worker-test-{label}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn resolve_tokenizer_and_chunker_fills_the_cell_and_shares_the_identical_arc() {
+        let base_dir = unique_temp_dir("resolve-tok");
+        write_minimal_tokenizer_fixture(&base_dir);
+
+        let cell: OnceCell<Arc<tokenizers::Tokenizer>> = OnceCell::new();
+        let chunker = resolve_tokenizer_and_chunker(&base_dir, &cell);
+
+        let cell_tok = cell.get().expect("cell must be filled when tokenizer.json is present");
+        let cell_ptr: *const tokenizers::Tokenizer = Arc::as_ptr(cell_tok);
+        assert_eq!(
+            chunker.tokenizer_ptr(),
+            Some(cell_ptr),
+            "the cell and the chunker must share the exact same Arc — one load, not two independent parses"
+        );
+
+        // Behavioral confirmation this is really the tokenizer path, not the
+        // byte-length fallback: "hello world" is 2 words in the fixture
+        // vocab, so a max_tokens=1 cap must split it into 2 chunks.
+        let chunks = chunker.chunk("hello world", 1);
+        assert_eq!(chunks.len(), 2, "a real word-level tokenizer must split 2 words at max_tokens=1");
+
+        std::fs::remove_dir_all(&base_dir).ok();
+    }
+
+    #[test]
+    fn resolve_tokenizer_and_chunker_leaves_the_cell_empty_when_the_file_is_absent() {
+        let base_dir = unique_temp_dir("resolve-tok-absent");
+        let cell: OnceCell<Arc<tokenizers::Tokenizer>> = OnceCell::new();
+        let chunker = resolve_tokenizer_and_chunker(&base_dir, &cell);
+
+        assert!(cell.get().is_none(), "no tokenizer.json on disk must leave the cell empty");
+        assert!(chunker.tokenizer_ptr().is_none(), "the chunker must be running the byte fallback");
+
+        std::fs::remove_dir_all(&base_dir).ok();
+    }
+
+    // ── Test harnesses ───────────────────────────────────────────────────────
+
+    /// Test harness — spawns `memory_worker` with a seeded embedder cell.
+    pub(crate) async fn spawn_test_worker(
+        store: Arc<MemoryStore>,
+        embedder: Arc<dyn Embedder>,
+    ) -> (tokio::sync::mpsc::UnboundedSender<MemoryEvent>, tokio::task::JoinHandle<()>) {
+        let cell: OnceCell<Arc<dyn Embedder>> = OnceCell::new();
+        cell.set(embedder).ok();
+        let cell = Arc::new(cell);
+
+        let chat_chunker = Arc::new(ChatChunker::with_fallback());
+        let code_chunker = Arc::new(CodeChunker::new());
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<MemoryEvent>();
+        let handle = tokio::spawn(async move {
+            memory_worker(rx, store, cell, chat_chunker, code_chunker).await;
+        });
+        (tx, handle)
+    }
+
+    /// Variant with optional embedder — None = empty cell, for tests that
+    /// exercise the embedder-not-ready gate.
+    pub(crate) async fn spawn_test_worker_opt(
+        store: Arc<MemoryStore>,
+        embedder: Option<Arc<dyn Embedder>>,
+    ) -> (tokio::sync::mpsc::UnboundedSender<MemoryEvent>, tokio::task::JoinHandle<()>) {
+        let cell: OnceCell<Arc<dyn Embedder>> = OnceCell::new();
+        if let Some(e) = embedder {
+            cell.set(e).ok();
+        }
+        let cell = Arc::new(cell);
+
+        let chat_chunker = Arc::new(ChatChunker::with_fallback());
+        let code_chunker = Arc::new(CodeChunker::new());
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<MemoryEvent>();
+        let handle = tokio::spawn(async move {
+            memory_worker(rx, store, cell, chat_chunker, code_chunker).await;
+        });
+        (tx, handle)
+    }
+}

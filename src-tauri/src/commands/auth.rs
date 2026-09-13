@@ -1,7 +1,7 @@
 use serde::Serialize;
 
-use crate::models::AppError;
-use crate::services::{credentials, oauth};
+use clawg_core::models::AppError;
+use clawg_core::services::{credentials, oauth};
 
 #[derive(Debug, Serialize)]
 pub struct OAuthStatusResponse {

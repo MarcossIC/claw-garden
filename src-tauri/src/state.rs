@@ -2,35 +2,35 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::config::ProviderPool;
-use crate::hooks::permission::UserDecision;
+use clawg_core::config::ProviderPool;
+use clawg_core::hooks::permission::UserDecision;
 use crate::mcp::McpPool;
-use crate::memory::MemoryStore;
-use crate::memory::embedder::Embedder;
-use crate::memory::events::MemoryEvent;
+use clawg_core::memory::MemoryStore;
+use clawg_core::memory::embedder::Embedder;
+use clawg_core::memory::events::MemoryEvent;
 use crate::recovery::gate::RecoveryGate;
 use crate::tools::{GlobalToolRegistry, executor::ToolExecutor};
 use once_cell::sync::OnceCell;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
-use crate::models::config::{
+use clawg_core::models::config::{
     AnthropicSettings, AppConfig, OllamaSettings, OllamaStatus, OpenRouterSettings, ProviderType,
 };
-use crate::services::auth::{
+use clawg_core::services::auth::{
     resolve_anthropic_auth, resolve_api_key, resolve_base_url, ANTHROPIC_BASE_URL_ENV,
     DEFAULT_ANTHROPIC_URL, DEFAULT_OPENROUTER_URL, OPENROUTER_BASE_URL_ENV,
     OPENROUTER_KEY_ENV,
 };
-use crate::services::config_store;
-use crate::services::model_meta;
-use crate::models::provider_config::ProviderConfig;
-use crate::models::{
+use clawg_core::services::config_store;
+use clawg_core::services::model_meta;
+use clawg_core::models::provider_config::ProviderConfig;
+use clawg_core::models::{
     compose_system_prompt, Agent, AgentState, AppError, ChatMessage,
 };
-use crate::providers::anthropic::{AnthropicConfig, AnthropicProvider};
-use crate::providers::ollama::{OllamaConfig, OllamaProvider};
-use crate::providers::openrouter::{OpenRouterConfig, OpenRouterProvider};
-use crate::providers::AiProvider;
+use clawg_core::providers::anthropic::{AnthropicConfig, AnthropicProvider};
+use clawg_core::providers::ollama::{OllamaConfig, OllamaProvider};
+use clawg_core::providers::openrouter::{OpenRouterConfig, OpenRouterProvider};
+use clawg_core::providers::AiProvider;
 use crate::session::SessionManager;
 
 pub struct AppState {
@@ -108,7 +108,7 @@ pub struct AppState {
     ///
     /// `tokio_rusqlite::Connection` is `Clone` (channel handle) so no extra
     /// `Mutex` is needed here; the `Arc` provides cheap shared ownership.
-    pub access_tracker: Arc<crate::memory::access::AccessTracker>,
+    pub access_tracker: Arc<clawg_core::memory::access::AccessTracker>,
 }
 
 /// Test handle bundling `AppState` with its `memory_rx` so tests can assert on
@@ -130,9 +130,10 @@ impl AppState {
         let config = config_store::load_config();
         let provider = create_provider_from_config(&config);
 
-        let base_dir = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".claw-garden");
+        // Misconfiguration (an invalid or unsafe CLAWG_PROFILE) must be fatal
+        // at startup, never silently fall back to a wrong data directory.
+        let base_dir = clawg_core::paths::data_dir_from_env()
+            .unwrap_or_else(|e| panic!("failed to resolve data directory: {e}"));
 
         let sessions_dir = base_dir.join("sessions");
 
@@ -175,7 +176,7 @@ impl AppState {
         // to the MemoryStore open() call above.
         let access_tracker = Arc::new(
             tauri::async_runtime::block_on(async {
-                crate::memory::access::AccessTracker::new(memory_store.conn.clone())
+                clawg_core::memory::access::AccessTracker::new(memory_store.conn.clone())
             })
         );
 
@@ -217,10 +218,10 @@ impl AppState {
     /// Use [`AppState::new_for_test_async`] from async tests that need `AppState`.
     #[cfg(test)]
     pub fn new_for_test() -> (Self, UnboundedReceiver<MemoryEvent>) {
-        use crate::providers::ollama::{OllamaConfig, OllamaProvider};
-        use crate::models::config::AppConfig;
+        use clawg_core::providers::ollama::{OllamaConfig, OllamaProvider};
+        use clawg_core::models::config::AppConfig;
 
-        let temp_dir = std::env::temp_dir().join(format!("claw-garden-test-{}", std::process::id()));
+        let temp_dir = std::env::temp_dir().join(format!("clawg-test-{}", std::process::id()));
         let sessions_dir = temp_dir.join("sessions");
         let _ = std::fs::create_dir_all(&sessions_dir);
 
@@ -261,7 +262,7 @@ impl AppState {
         // duration of AccessTracker::new(), which calls tokio::spawn internally.
         let access_tracker = Arc::new(
             tauri::async_runtime::block_on(async {
-                crate::memory::access::AccessTracker::new(memory_store.conn.clone())
+                clawg_core::memory::access::AccessTracker::new(memory_store.conn.clone())
             })
         );
 
@@ -299,11 +300,11 @@ impl AppState {
     /// to avoid the `block_on`-inside-tokio panic.
     #[cfg(test)]
     pub async fn new_for_test_async() -> (Self, UnboundedReceiver<MemoryEvent>) {
-        use crate::providers::ollama::{OllamaConfig, OllamaProvider};
-        use crate::models::config::AppConfig;
+        use clawg_core::providers::ollama::{OllamaConfig, OllamaProvider};
+        use clawg_core::models::config::AppConfig;
 
         let temp_dir = std::env::temp_dir()
-            .join(format!("claw-garden-test-async-{}", std::process::id()));
+            .join(format!("clawg-test-async-{}", std::process::id()));
         let sessions_dir = temp_dir.join("sessions");
         let _ = std::fs::create_dir_all(&sessions_dir);
 
@@ -328,7 +329,7 @@ impl AppState {
         // We are inside a #[tokio::test] context, so tokio::spawn (called inside
         // AccessTracker::new()) works directly — no block_on wrapper needed.
         let access_tracker = Arc::new(
-            crate::memory::access::AccessTracker::new(memory_store.conn.clone())
+            clawg_core::memory::access::AccessTracker::new(memory_store.conn.clone())
         );
 
         let state = Self {
@@ -557,7 +558,7 @@ fn create_provider_from_config(config: &AppConfig) -> Arc<dyn AiProvider> {
 /// filler. Seeding at construction removes the window entirely.
 #[cfg(test)]
 fn seeded_embedder_cell() -> Arc<OnceCell<Arc<dyn Embedder>>> {
-    use crate::memory::embedder::FakeEmbedder;
+    use clawg_core::memory::embedder::FakeEmbedder;
     let cell: OnceCell<Arc<dyn Embedder>> = OnceCell::new();
     // .ok() — set() can only fail if the cell is already filled, which is
     // impossible on a brand-new instance.
@@ -648,7 +649,7 @@ mod tests {
             .get()
             .expect("new_for_test_async must pre-fill the embedder cell");
         let v = embedder
-            .embed_with_role("x", crate::memory::embedder::EmbedRole::Passage)
+            .embed_with_role("x", clawg_core::memory::embedder::EmbedRole::Passage)
             .await
             .expect("FakeEmbedder.embed_with_role");
         assert_eq!(v.len(), 384, "FakeEmbedder must yield 384-dim vector");
@@ -691,8 +692,8 @@ mod tests {
 
     #[tokio::test]
     async fn memory_tx_send_before_worker_buffers_event() {
-        use crate::memory::events::{MemoryEvent, MemorySource};
-        use crate::models::chat::Role;
+        use clawg_core::memory::events::{MemoryEvent, MemorySource};
+        use clawg_core::models::chat::Role;
         let (state, _memory_rx) = AppState::new_for_test_async().await;
         let result = state.memory_tx.send(MemoryEvent {
             agent_id: "a".into(),
@@ -708,8 +709,8 @@ mod tests {
 
     #[tokio::test]
     async fn memory_tx_clone_sends_independently() {
-        use crate::memory::events::{MemoryEvent, MemorySource};
-        use crate::models::chat::Role;
+        use clawg_core::memory::events::{MemoryEvent, MemorySource};
+        use clawg_core::models::chat::Role;
         let (state, mut memory_rx) = AppState::new_for_test_async().await;
         let tx2 = state.memory_tx.clone();
         state.memory_tx.send(MemoryEvent {
@@ -738,8 +739,8 @@ mod tests {
 
     #[tokio::test]
     async fn new_for_test_async_memory_tx_does_not_deadlock() {
-        use crate::memory::events::{MemoryEvent, MemorySource};
-        use crate::models::chat::Role;
+        use clawg_core::memory::events::{MemoryEvent, MemorySource};
+        use clawg_core::models::chat::Role;
         let (state, _rx) = AppState::new_for_test_async().await;
         for i in 0..3u64 {
             assert!(state.memory_tx.send(MemoryEvent {
@@ -756,8 +757,8 @@ mod tests {
 
     #[tokio::test]
     async fn new_for_test_with_memory_rx_round_trip() {
-        use crate::memory::events::{MemoryEvent, MemorySource};
-        use crate::models::chat::Role;
+        use clawg_core::memory::events::{MemoryEvent, MemorySource};
+        use clawg_core::models::chat::Role;
         let mut handle = AppState::new_for_test_with_memory_rx().await;
         handle.state.memory_tx.send(MemoryEvent {
             agent_id: "a".into(),

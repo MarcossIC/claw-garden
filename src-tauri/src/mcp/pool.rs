@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::mcp::McpManager;
-use crate::models::{AppError, McpError, ToolDefinition};
+use clawg_core::models::{AppError, McpError, ToolDefinition};
 
 /// Pool of MCP connections, one per project path.
 ///

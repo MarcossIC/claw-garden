@@ -2,8 +2,8 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::models::chat::{current_time_millis, generate_message_id, ChatMessage, Role};
-use crate::models::session::{PersistedMessage, SessionMeta, SessionRecord};
+use clawg_core::models::chat::{current_time_millis, generate_message_id, ChatMessage, Role};
+use clawg_core::models::session::{PersistedMessage, SessionMeta, SessionRecord};
 
 use super::SessionError;
 

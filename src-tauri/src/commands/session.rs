@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::models::{AppError, ChatMessage, SessionMeta};
+use clawg_core::models::{AppError, ChatMessage, SessionMeta};
 use crate::session::SessionManager;
 use crate::state::AppState;
 
@@ -97,14 +97,14 @@ pub fn new_session(
     // `tauri::State` is NEVER moved across the await boundary.
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        crate::memory::resolver::run_resolver(handle).await;
+        crate::memory_runtime::run_resolver(handle).await;
     });
 
     // Fire-and-forget: spawn the memory extractor (Fase 1) on the closing
     // session's snapshot, independent from the resolver above.
     let handle2 = app.clone();
     tauri::async_runtime::spawn(async move {
-        crate::memory::extractor::run_extractor(handle2, history).await;
+        crate::memory_runtime::run_extractor(handle2, history).await;
     });
 
     // Fire-and-forget: spawn the trajectory miner (Fase 1) — it is the ONLY
@@ -113,7 +113,7 @@ pub fn new_session(
     // wrapper (now eliminated from memory::episodic_writer).
     let handle3 = app.clone();
     tauri::async_runtime::spawn(async move {
-        crate::memory::miner::run_miner(handle3, outgoing_id, history_for_episodic).await;
+        crate::memory_runtime::run_miner(handle3, outgoing_id, history_for_episodic).await;
     });
 
     Ok(meta)
@@ -166,14 +166,14 @@ pub fn resume_session(
 
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        crate::memory::resolver::run_resolver(handle).await;
+        crate::memory_runtime::run_resolver(handle).await;
     });
 
     // Fire-and-forget: spawn the memory extractor (Fase 1) on the outgoing
     // session's snapshot, independent from the resolver above.
     let handle2 = app.clone();
     tauri::async_runtime::spawn(async move {
-        crate::memory::extractor::run_extractor(handle2, history).await;
+        crate::memory_runtime::run_extractor(handle2, history).await;
     });
 
     // Fire-and-forget: spawn the trajectory miner (Fase 1) — it is the ONLY
@@ -182,7 +182,7 @@ pub fn resume_session(
     // wrapper (now eliminated from memory::episodic_writer).
     let handle3 = app.clone();
     tauri::async_runtime::spawn(async move {
-        crate::memory::miner::run_miner(handle3, outgoing_id, history_for_episodic).await;
+        crate::memory_runtime::run_miner(handle3, outgoing_id, history_for_episodic).await;
     });
 
     Ok(meta)
@@ -263,7 +263,7 @@ mod tests {
             "agent-a".to_string(),
             vec![ChatMessage {
                 id: "m1".to_string(),
-                role: crate::models::chat::Role::User,
+                role: clawg_core::models::chat::Role::User,
                 content: "hello".to_string(),
                 tool_calls: None,
                 timestamp_ms: 0,
@@ -274,7 +274,7 @@ mod tests {
             "agent-b".to_string(),
             vec![ChatMessage {
                 id: "m2".to_string(),
-                role: crate::models::chat::Role::Assistant,
+                role: clawg_core::models::chat::Role::Assistant,
                 content: "hi there".to_string(),
                 tool_calls: None,
                 timestamp_ms: 1,
@@ -305,7 +305,7 @@ mod tests {
             vec![
                 ChatMessage {
                     id: "m1".to_string(),
-                    role: crate::models::chat::Role::User,
+                    role: clawg_core::models::chat::Role::User,
                     content: "first turn".to_string(),
                     tool_calls: None,
                     timestamp_ms: 0,
@@ -313,7 +313,7 @@ mod tests {
                 },
                 ChatMessage {
                     id: "m2".to_string(),
-                    role: crate::models::chat::Role::Assistant,
+                    role: clawg_core::models::chat::Role::Assistant,
                     content: "second turn".to_string(),
                     tool_calls: None,
                     timestamp_ms: 1,
@@ -354,7 +354,7 @@ mod tests {
     #[test]
     fn outgoing_session_id_survives_replacement() {
         let temp_dir = std::env::temp_dir().join(format!(
-            "claw-garden-test-outgoing-session-id-{}-{}",
+            "clawg-test-outgoing-session-id-{}-{}",
             std::process::id(),
             line!()
         ));

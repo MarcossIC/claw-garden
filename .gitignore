@@ -38,6 +38,10 @@ testem.log
 /typings
 __screenshots__/
 
+# Rust / Cargo — the workspace target dir now lives at the repo root.
+# `src-tauri/.gitignore` still covers /target and /gen/schemas in that crate.
+/target
+
 # Tauri
 /src-tauri/target
 

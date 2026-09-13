@@ -506,7 +506,7 @@ pub async fn web_fetch(
     let response = tokio::time::timeout(
         Duration::from_secs(30),
         client.get(url)
-            .header("User-Agent", "claw-garden/1.0")
+            .header("User-Agent", concat!("clawg/", env!("CARGO_PKG_VERSION")))
             .send(),
     )
     .await

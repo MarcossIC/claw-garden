@@ -1,4 +1,4 @@
-use crate::models::chat::{ChatMessage, Role};
+use clawg_core::models::chat::{ChatMessage, Role};
 
 /// Generates a heuristic summary of removed messages.
 /// Does NOT call the LLM — deterministic and free.
@@ -222,7 +222,7 @@ fn truncate(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::chat::{current_time_millis, generate_message_id, ToolCall, ToolFunction};
+    use clawg_core::models::chat::{current_time_millis, generate_message_id, ToolCall, ToolFunction};
 
     fn make_msg(role: Role, content: &str) -> ChatMessage {
         ChatMessage {

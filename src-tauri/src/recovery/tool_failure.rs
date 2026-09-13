@@ -1,4 +1,4 @@
-use crate::models::{AppError, LlmError, McpError};
+use clawg_core::models::{AppError, LlmError, McpError};
 
 /// Semantic classification of a tool failure.
 ///

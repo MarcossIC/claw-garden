@@ -1,10 +1,10 @@
-use crate::models::config::{
+use clawg_core::models::config::{
     AnthropicSettings, AppConfig, OllamaSettings, OllamaStatus, OpenRouterSettings, ProviderType,
 };
-use crate::models::AppError;
-use crate::providers::openrouter::OpenRouterModel;
-use crate::services::auth::{self, ANTHROPIC_KEY_ENV, OPENROUTER_KEY_ENV};
-use crate::services::config_store;
+use clawg_core::models::AppError;
+use clawg_core::providers::openrouter::OpenRouterModel;
+use clawg_core::services::auth::{self, ANTHROPIC_KEY_ENV, OPENROUTER_KEY_ENV};
+use clawg_core::services::config_store;
 use crate::state::{self, AppState};
 use serde::Serialize;
 
@@ -86,12 +86,12 @@ pub async fn check_ollama() -> Result<OllamaStatus, AppError> {
 
 #[tauri::command]
 pub async fn openrouter_list_models(api_key: String) -> Result<Vec<OpenRouterModel>, AppError> {
-    use crate::providers::openrouter::{OpenRouterConfig, OpenRouterProvider};
+    use clawg_core::providers::openrouter::{OpenRouterConfig, OpenRouterProvider};
 
     let provider = OpenRouterProvider::new(OpenRouterConfig {
         api_key,
         model: String::new(),
-        base_url: crate::services::auth::DEFAULT_OPENROUTER_URL.to_string(),
+        base_url: clawg_core::services::auth::DEFAULT_OPENROUTER_URL.to_string(),
     });
     provider.list_models().await
 }

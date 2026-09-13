@@ -1,4 +1,4 @@
-use crate::models::ToolDefinition;
+use clawg_core::models::ToolDefinition;
 use super::{ToolSpec, builtin::builtin_tools, rate_limiter::RateLimiter};
 
 /// Global registry. Holds built-in tools. MCP tools added at session build time.

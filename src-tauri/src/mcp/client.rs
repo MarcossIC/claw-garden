@@ -8,7 +8,7 @@ use rmcp::{
 };
 use tokio::process::Command;
 
-use crate::models::{McpError, ToolDefinition, ToolFunctionDef};
+use clawg_core::models::{McpError, ToolDefinition, ToolFunctionDef};
 
 // ── rmcp → McpError mapping helpers ──────────────────────────────────────────
 

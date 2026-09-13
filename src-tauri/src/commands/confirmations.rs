@@ -1,6 +1,6 @@
 use tauri::State;
 
-use crate::hooks::permission::UserDecision;
+use clawg_core::hooks::permission::UserDecision;
 use crate::state::AppState;
 
 /// Resolve a pending HITL confirmation issued by the chat loop.

@@ -1,4 +1,4 @@
-use crate::models::{Agent, AppError};
+use clawg_core::models::{Agent, AppError};
 use crate::state::AppState;
 
 #[tauri::command]

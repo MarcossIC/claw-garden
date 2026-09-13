@@ -1,31 +1,20 @@
 mod commands;
 mod compaction;
-mod config;
-mod hooks;
 mod mcp;
-mod memory;
-mod models;
+mod memory_runtime;
 mod tools;
-mod providers;
 mod recovery;
-mod services;
 mod session;
 mod state;
-
-/// Narrow, feature-gated door into retrieval internals for the evaluation
-/// binary. `memory` itself stays a private module — see `eval_api.rs` for
-/// why an opaque wrapper is preferred over widening the module tree.
-#[cfg(feature = "eval")]
-pub mod eval_api;
 
 use std::sync::Arc;
 
 use tauri::{AppHandle, Emitter, Manager};
 
-use memory::db::{ContractStatus, EmbeddingIdentity};
-use memory::embedder::{Embedder, FastEmbedLocal};
-use memory::model_download::{ensure_model, DownloadProgress};
-use models::chat::StreamEvent;
+use clawg_core::memory::db::{ContractStatus, EmbeddingIdentity};
+use clawg_core::memory::embedder::{Embedder, FastEmbedLocal};
+use clawg_core::memory::model_download::{ensure_model, DownloadProgress};
+use clawg_core::models::chat::StreamEvent;
 use state::AppState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -53,7 +42,7 @@ pub fn run() {
             // push_and_persist and writes rows to memory + memory_vectors.
             // memory_rx is moved here and consumed by the worker task for the
             // app lifetime.
-            crate::memory::worker::start_memory_worker(app.handle().clone(), memory_rx);
+            crate::memory_runtime::start_memory_worker(app.handle().clone(), memory_rx);
 
             // Access tracker lifecycle hook. The flush worker is already
             // running (spawned inside AccessTracker::new() during
@@ -66,7 +55,7 @@ pub fn run() {
             // memoria-3-capas-fase-3: spawn the maintenance job (periodic
             // inactivity-based tier demotion). First pass fires 5 minutes
             // after startup, then every 24h — see `memory::maintenance`.
-            crate::memory::maintenance::start_maintenance_worker(app.handle().clone());
+            crate::memory_runtime::start_maintenance_worker(app.handle().clone());
 
             Ok(())
         })
@@ -120,7 +109,7 @@ pub fn run() {
 /// Lifecycle hook called from `run()` after `start_memory_worker`.
 ///
 /// The access tracker flush worker is already running — it is spawned inside
-/// [`crate::memory::access::AccessTracker::new`] during `AppState::new()`.
+/// [`clawg_core::memory::access::AccessTracker::new`] during `AppState::new()`.
 /// This function exists for lifecycle parity with `start_memory_worker` and
 /// is the extension point for a future supervision/reconnect mechanism,
 /// should the flush worker ever need one.
@@ -211,8 +200,8 @@ type EnsureModelFn = Arc<
         ) -> futures::future::BoxFuture<
             'static,
             Result<
-                memory::model_download::ModelFiles,
-                memory::model_download::DownloadError,
+                clawg_core::memory::model_download::ModelFiles,
+                clawg_core::memory::model_download::DownloadError,
             >,
         > + Send
         + Sync,
@@ -221,7 +210,7 @@ type EnsureModelFn = Arc<
 /// Type alias for the injectable model-load seam (replaces
 /// `FastEmbedLocal::from_bytes` in tests).
 type LoadEmbedderFn = Arc<
-    dyn Fn(memory::model_download::ModelFiles) -> Result<Arc<dyn Embedder>, String>
+    dyn Fn(clawg_core::memory::model_download::ModelFiles) -> Result<Arc<dyn Embedder>, String>
         + Send
         + Sync,
 >;
@@ -376,7 +365,7 @@ pub(crate) async fn run_embedder_bootstrap(
                             // worker.rs and prompt_builder.rs already treat an
                             // empty cell as "memory disabled", so this needs no
                             // new degraded-mode logic of its own.
-                            let diffs = memory::db::differing_fields(&stored, &actual);
+                            let diffs = clawg_core::memory::db::differing_fields(&stored, &actual);
                             log::warn!(
                                 "embedding contract mismatch ({}); memory reads/writes are \
                                  disabled until this is resolved",
@@ -558,8 +547,8 @@ mod tests {
     // error path, contract mismatch, AND the forwarder→sink pipeline) can be
     // asserted in-process without Tauri.
 
-    use crate::memory::embedder::FakeEmbedder;
-    use crate::memory::model_download::{DownloadError, ModelFiles};
+    use clawg_core::memory::embedder::FakeEmbedder;
+    use clawg_core::memory::model_download::{DownloadError, ModelFiles};
     use fastembed::TokenizerFiles;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -906,7 +895,7 @@ mod tests {
         let verify: ContractVerifyFn = Arc::new(|_identity| {
             Box::pin(async move {
                 Ok(ContractStatus::Mismatch {
-                    stored: memory::db::StoredContract {
+                    stored: clawg_core::memory::db::StoredContract {
                         model_id: "multilingual-e5-small".into(),
                         dim: 384,
                         query_prefix: "".into(),
@@ -984,7 +973,7 @@ mod tests {
         let verify: ContractVerifyFn = Arc::new(|_identity| {
             Box::pin(async move {
                 Ok(ContractStatus::Mismatch {
-                    stored: memory::db::StoredContract {
+                    stored: clawg_core::memory::db::StoredContract {
                         model_id: "fake-embedder".into(),
                         dim: 384,
                         query_prefix: "query: ".into(),
