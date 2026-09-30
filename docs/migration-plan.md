@@ -16,7 +16,7 @@ implementar, se anota en "Casos inesperados" y se decide en conversación aparte
 |------|--------|--------|--------------------|
 | 0 | Identidad, split del workspace, aislamiento de perfiles | ✅ implementada 2026-09-11 · commiteada 2026-09-13 (`d018c0c`, `57119d3`) | `clawg-core` compila sin `tauri` ✅; `cargo run` escribe en `~/.clawg-dev` y no puede abrir `~/.clawg` ✅ (por tests, no por ejecución); suite verde en el número baseline ✅ 998 + 37 + 202 |
 | 1 | Núcleo: `clawg serve` + `clawg mcp` | ✅ implementada, commiteada y verificada 2026-09-13 (`4623960`, `2593849`) · regresión de handshake con Claude Code 2.1.285 corregida y re-verificada 2026-09-29 (`fa048ad`, `1dd91b5`) | Claude Code recuerda algo entre dos sesiones sin la app abierta, contra perfil dev ✅ (dos `claude -p` separados, memoria #2; re-verificado el 29-09 con 2.1.285) · suite 1.397 tests, 0 failed ✅ · sin `tauri` en `clawg-cli` ✅ |
-| 2 | Release e instalador (compuerta) | ⚪ pendiente | Claw Garden instalado, arranca contra `~/.clawg`, convive con la versión dev. Cero datos migrados hasta acá |
+| 2 | Release e instalador (compuerta) | 🟡 en curso desde 2026-09-29: plan y paquetes del repo; build + instalación pendientes de autorización | Claw Garden instalado, arranca contra `~/.clawg`, convive con la versión dev. Cero datos migrados hasta acá |
 | 3 | Migración desde engram (6 etapas) | ⚪ pendiente | `CLAUDE.md` apunta a Claw Garden, engram desregistrado, snapshot archivado |
 | 4 | Panel de control | ⚪ pendiente | Encontrar y corregir una memoria mal extraída en < 30 s |
 | 5 | Motor de flujos deterministas | ⚪ diseño diferido | Por definir en su propia conversación |
@@ -733,3 +733,169 @@ sin ambigüedad, y resultaron ser **dos bugs independientes** que se tapaban ent
   `agent_id` tienen las memorias guardadas desde entonces, así que va en conversación aparte.
 - **Unix.** El bug 2 no aplica (los fds 0–2 del hijo se reemplazan y std abre todo con close-on-exec); `detach.rs` es
   sólo `cfg(windows)` a propósito.
+
+---
+
+## Fase 2 — Release e instalador (compuerta)
+
+**Inicio:** 2026-09-29 · **Branch:** `feat/migration-claw-garden` · **Base:** `3ebae36` (fase 1 + regresión de handshake)
+
+Alcance según el documento: bundle de Tauri con el identifier definitivo, versionado real, `clawg --version`, el
+binario `clawg` en el PATH después de instalar, y `bundle.targets` fijado a lo que de verdad se produce. Criterio de
+salida: Claw Garden instalado como aplicación, arranca contra `~/.clawg`, convive con la versión dev sin pisarla, y
+**cero datos migrados**.
+
+### Estado de partida (verificado 2026-09-29, leyendo fuentes, no documentación de segunda mano)
+
+| Tema | Realidad | Consecuencia |
+|------|----------|--------------|
+| Identidad | `tauri.conf.json`: `Claw Garden` / `com.clawgarden.app`; flavor dev por merge patch (fase 0) | Nada que hacer: es la identidad definitiva |
+| Versión | `[workspace.package] 0.1.0`, `tauri.conf.json` `0.1.0`, **`package.json` `0.0.0`**. `clawg --version` ya existe (clap `version`, con test) | Unificar y **proteger con un test**. Tauri cae a la versión de `Cargo.toml` si se quita `version` (doc de `tauri-utils 2.8.3`), pero no se depende de que el CLI resuelva `version.workspace = true` |
+| `bundle.targets` | `"all"` → en Windows produce MSI (WiX) y NSIS | Sólo NSIS: instala por usuario sin admin (`%LOCALAPPDATA%`) y soporta hooks |
+| Sidecar | `tauri-build 2.5.6` (`lib.rs:527`) procesa `bundle.externalBin` en **cada** build del desktop, no sólo en `tauri build`: exige que el archivo exista y lo copia a `target/<perfil>/<nombre sin triple>`. `TAURI_CONFIG` (lo que exporta `tauri build --config`) sí se mergea (`lib.rs:474`) | `externalBin` en la config base rompería `cargo test --workspace` sin el archivo y **pisaría `target/debug/clawg.exe`**, el binario que Claude Code tiene registrado como `clawg-dev`. Va en un overlay que sólo lee `tauri build` |
+| Procesos durante el install | El template NSIS de Tauri (embebido en `@tauri-apps/cli` 2.10) sólo chequea `${MAINBINARYNAME}.exe` | Un `clawg serve` de prod vivo bloquearía el reemplazo de `clawg.exe` en un update o desinstalación. Hook `PREINSTALL`/`PREUNINSTALL` que lo apague |
+| `clawg stop` | Manda `POST /v1/shutdown` y sale sin esperar | El proceso sigue reteniendo `clawg.exe` y `daemon.lock` unos instantes: el hook de NSIS no sirve y `clawg stop && clawg serve` falla con "another instance". `stop` tiene que esperar a que el proceso termine |
+| PATH | NSIS no trae manejo de PATH; el plugin `EnVar` no viene con Tauri, y la manipulación de strings de NSIS trunca a `NSIS_MAX_STRLEN` (1024): el clásico instalador que borra el PATH del usuario | La lógica va en Rust (`clawg path add/remove`), con núcleo puro testeable, y el hook sólo la invoca |
+| ONNX Runtime | `fastembed` con `ort-download-binaries`: no hay ninguna `.dll` en `target/debug` (linkeo estático) | Nada extra que empaquetar |
+| **Subsistema del exe de escritorio** | `src-tauri/build.rs` emite `/SUBSYSTEM:console,10.0` (MSVC) y `main.rs` pide `windows_subsystem = "windows"` en release. Experimento en el scratchpad (crate de juguete con las dos cosas, lectura del header PE): **`CONSOLE 10.0`**, gana el link-arg | **Bug latente**: el primer release abriría una consola negra detrás de la ventana. Nunca se vio porque nunca se hizo un build de release |
+| Toolchain | `x86_64-pc-windows-msvc`, rustc 1.91.1, `tauri 2.10.3`, `tauri-build 2.5.6`, `@tauri-apps/cli ^2.10.1` | El triple del sidecar es `x86_64-pc-windows-msvc` |
+
+### Decisiones de diseño de la fase 2
+
+- **Tres capas de config, cada una con un lector distinto.** `tauri.conf.json` (identidad, lo lee todo),
+  `tauri.windows.conf.json` (bundler de Windows: targets NSIS, `installMode: currentUser`, hooks; Tauri la mergea sola
+  en Windows y `tauri-build` no valida nada de eso) y `tauri.release.conf.json` (sólo `tauri build --config`:
+  `externalBin` y el `beforeBuildCommand` que compila el sidecar). Así `cargo test` y `tauri dev` nunca ven el sidecar.
+- **El sidecar se compila en release antes del bundle.** `scripts/build-sidecar.ts` corre
+  `cargo build --release --locked -p clawg-cli` y copia `target/release/clawg.exe` a
+  `src-tauri/binaries/clawg-<triple>.exe` (ignorado por git). `tauri-build` después lo copia de vuelta a
+  `target/release/clawg.exe`: mismos bytes, inofensivo.
+- **PATH por Rust, no por NSIS.** `clawg path add|remove [--dir]` (default: el directorio del propio ejecutable).
+  Núcleo puro sobre el string (`with_entry`/`without_entry`: comparación sin distinguir mayúsculas ni `\` final,
+  preserva el resto byte por byte); I/O de registro en `HKCU\Environment\Path` **preservando el tipo**
+  (`REG_EXPAND_SZ` sigue siendo `REG_EXPAND_SZ`, o se romperían las entradas `%VAR%`), y broadcast de
+  `WM_SETTINGCHANGE` para que las terminales nuevas lo vean sin cerrar sesión.
+- **`clawg stop` espera a que el proceso termine.** Usa el `pid` que devuelve `/health` (vivo y verificado, no el de
+  `daemon.json`), y en Windows espera el handle del proceso (`OpenProcess` + `WaitForSingleObject`), que es lo que
+  suelta el archivo `.exe`. Timeout explícito, error legible si vence.
+- **El subsistema sigue a `debug_assertions`, igual que `main.rs`.** `build.rs` emite `console,10.0` sólo cuando
+  `debug_assertions` está activo y `windows,10.0` en caso contrario, así el atributo de `main.rs` y el link-arg
+  dicen lo mismo.
+- **Una sola fuente de versión, con guardia.** `[workspace.package]` manda; `tauri.conf.json` y `package.json` la
+  repiten y un test de `clawg-desktop` falla si alguno se desalinea.
+- **El instalador no toca Claude Code.** Registrar `clawg` (prod) es la etapa 5 de la fase 3, no un efecto del
+  install. Hasta entonces el daemon de prod sólo corre si alguien escribe `clawg serve`.
+- **Fuera de alcance, declarado:** firma de código (SmartScreen va a advertir; aceptable para uso personal),
+  instalador para macOS/Linux, auto-update.
+
+### Plan de trabajo
+
+1. **Paquete A — correcciones previas al primer release** (TDD donde hay algo testeable): subsistema en `build.rs`
+   (verificado con el crate de juguete: rojo `CONSOLE` → verde `WINDOWS`), guardia de versión, `clawg stop` que espera.
+2. **Paquete B — `clawg path add|remove`** (TDD): núcleo puro, I/O de registro contra una clave descartable en los
+   tests (nunca contra el `Environment` real), subcomando.
+3. **Paquete C — receta de release**: `tauri.windows.conf.json`, `tauri.release.conf.json`,
+   `scripts/build-sidecar.ts` (+ test de la parte pura), `src-tauri/windows/hooks.nsh`, scripts de `package.json`, `.gitignore`.
+4. **Paquete D — compuerta** (build de producción + instalación: **requiere autorización de Marco**): `bun run tauri:build`,
+   subsistema del exe instalado, `clawg --version`, PATH en una terminal nueva, `clawg status` contra `~/.clawg`
+   (puerto 27380), convivencia con dev (`clawg-dev` sigue conectado, `~/.clawg-dev` intacto), y la prueba contra el host
+   real que dejó la regresión del 29-09 (binario instalado con `--profile dev`, para no escribir nada en prod).
+
+### Implementado (paquetes A, B y C)
+
+| Commit | Qué |
+|--------|-----|
+| `631d761 fix(desktop): link release builds with the windows subsystem` | `src-tauri/build.rs`: con `PROFILE=release` emite `/SUBSYSTEM:windows,10.0` + `/ENTRY:mainCRTStartup`; si no, `/SUBSYSTEM:console,10.0` como antes |
+| `2d6c3bc build: align package.json with the workspace version and guard it with a test` | `package.json` `0.0.0` → `0.1.0`; `src-tauri/tests/release_config.rs` exige que `tauri.conf.json` y `package.json` declaren `CARGO_PKG_VERSION` |
+| `4cef3d8 feat(cli): make clawg stop wait until the daemon process has exited` | `crates/clawg-cli/src/process.rs` (`Watched::open/wait`: `OpenProcess(SYNCHRONIZE)` + `WaitForSingleObject` en Windows, `kill(pid, 0)` en Unix) y `stop.rs` (`stop_in`: pid de `/health` → handle abierto **antes** del shutdown → espera; `STOP_TIMEOUT` 15 s; `ClientError::StopTimeout { pid, timeout }`) |
+| `d7af972 feat(cli): add clawg path to manage the user PATH on Windows` | `crates/clawg-cli/src/user_path.rs` (`with_entry`/`without_entry` puros; `registry::{add, remove}` sobre `HKCU\<subkey>\Path` como valor crudo; `broadcast_environment_change`) y el subcomando `clawg path add` / `clawg path remove [--dir]`, idempotente. `winreg 0.55` (ya en el lock) |
+| `63926b7 build: add the Windows release recipe with clawg bundled as a sidecar` | `tauri.windows.conf.json`, `tauri.release.conf.json`, `scripts/build-sidecar.ts` (+ `.test.ts`), `src-tauri/windows/hooks.nsh`, scripts `build:sidecar` / `build:release` / `test:scripts` / `tauri:build`, `/src-tauri/binaries` en `.gitignore`, 4 guardias más en `release_config.rs` |
+
+### Verificaciones realizadas (paquetes A, B y C)
+
+| Momento | Comando / acción | Resultado |
+|---------|------------------|-----------|
+| Subsistema, rojo | crate de juguete con el `main.rs` y el `build.rs` reales, lectura del header PE | release → `CONSOLE 10.0` |
+| Subsistema, primer intento | elegir por `CARGO_CFG_DEBUG_ASSERTIONS` | release `WINDOWS`, pero **dev no linkea** (`LNK2019 WinMain`): Cargo no expone esa variable a build scripts. Descartado (caso inesperado 1) |
+| Subsistema, verde | mismo crate, `target/` limpio | bin dev `CONSOLE 10.0` · bin release `WINDOWS 10.0` · `cargo test` y `cargo test --release` linkean y pasan |
+| Versión | `release_config` | rojo `left: "0.0.0" right: "0.1.0"` → verde |
+| `process` | 3 tests contra procesos reales (`ping -n 30`) | rojo 2/3 con stub → verde 3/3 |
+| `stop` | 3 tests (sin daemon, daemon publicado pero muerto, daemon que no termina) | rojo 3/3 → verde 3/3 |
+| `stop`, binario real | daemon dev por autostart, `clawg stop`, `tasklist` inmediato | **0 procesos** al volver `stop`, `daemon.json` y `token` borrados. 356 ms con el embedder `ready`; 6.712 ms si se para durante la carga de ONNX (caso inesperado 2) |
+| `user_path` | 9 tests puros + 3 de registro contra `HKCU\Software\clawg-test\*` | rojo 8/12 → verde 12/12; `REG_EXPAND_SZ` preservado en ida y vuelta; sin residuo en el registro |
+| CLI | 3 tests de parseo de `clawg path` | rojo por compilación (E0599) → verde |
+| Receta | 4 guardias nuevas en `release_config` | rojo 4/4 (archivos inexistentes) → verde; 6 en total |
+| Script | `bun run test:scripts` | rojo (módulo inexistente) → 5/5 |
+| Hooks NSIS | `makensis -V2 -WX` (el de `%LOCALAPPDATA%\tauri\NSIS`, el que usa Tauri) sobre un `.nsi` mínimo que incluye `hooks.nsh` con `LogicLib` | compila sin warnings |
+| Config | `bunx tauri info` | parsea base + overlay de Windows sin errores |
+| **Suite** | `cargo test --workspace --all-features` | clawg-cli **125** + api 18, core 878 + 8, desktop 150 + `release_config` **6**, golden-mine 37, rag-eval 202 → **1.424, 0 failed**; más 5 de `bun` |
+| Warnings | `cargo check --workspace --all-features` / clippy de los crates tocados | 55 = baseline / 0 nuevos |
+
+**Lo que NO se ejecutó, a propósito:** `clawg path add` contra el `Environment` real (habría puesto `target\debug` en el
+PATH del usuario) y cualquier build de release del proyecto (`tauri build`, `cargo build --release`): eso es la compuerta.
+
+### Casos inesperados (fase 2)
+
+1. **Cargo no le pasa `debug_assertions` a los build scripts.** El primer arreglo del subsistema usaba
+   `CARGO_CFG_DEBUG_ASSERTIONS`, que existe para otras cfgs pero se filtra para ésta. El verde de release escondía que
+   en dev emitía `/SUBSYSTEM:windows` sobre un `main` de consola: `cargo test` del desktop habría dejado de linkear.
+   Se vio sólo porque se probaron los dos perfiles. `PROFILE` sí es confiable y coincide con `debug_assertions` en los
+   perfiles de stock; el workspace no define perfiles propios. Si algún día se define uno que herede de `release` con
+   `debug-assertions = true`, `build.rs` y `main.rs` dejarían de coincidir.
+2. **Parar el daemon durante la carga del embedder tarda lo que falte de esa carga.** `stop` ahora dice la verdad
+   sobre cuánto tarda el proceso en terminar: el runtime de tokio espera la tarea bloqueante de ONNX antes de salir
+   (6,7 s medidos contra 356 ms en régimen). `STOP_TIMEOUT` de 15 s lo cubre; si el instalador corre justo después de
+   un autostart, el paso de `stop` puede demorar unos segundos. No es nuevo: antes pasaba igual y `stop` devolvía antes.
+3. **`tauri-build` y `clawg-cli` escriben el mismo archivo.** `externalBin` en la config base habría hecho que cada
+   build del desktop copiara el sidecar sobre `target/debug/clawg.exe`, el mismo archivo que produce `clawg-cli` y que
+   Claude Code ejecuta como `clawg-dev`. Resuelto con el overlay y protegido por test.
+4. **El template NSIS de Tauri no mira los sidecars.** `CheckIfAppIsRunning` sólo recibe `${MAINBINARYNAME}.exe`
+   (leído del binario del CLI de npm, donde está embebido). De ahí los hooks de `stop`.
+5. **Los tests de registro dejaban la clave padre vacía.** `HKCU\Software\clawg-test` quedaba después de borrar las
+   hojas; el `Drop` ahora intenta borrarla también (falla, a propósito, mientras otro test paralelo la esté usando).
+
+### Pendiente para cerrar la fase: la compuerta (paquete D)
+
+Requiere un build de producción y una instalación real, así que **no se ejecuta sin autorización de Marco**. Checklist:
+
+1. `bun run tauri:build` → compila `clawg` en release, el frontend y el desktop, y deja el instalador en
+   `target/release/bundle/nsis/`.
+2. Header PE de `target/release/clawg-desktop.exe` → `WINDOWS`; `target/release/clawg.exe --version` → `clawg 0.1.0`.
+3. (Opcional, recomendado) copiar `~/.clawg-dev/models/` a `~/.clawg/models/` para evitar la descarga de 470 MB. Es el
+   modelo, no datos del usuario: "cero datos migrados" se sostiene.
+4. Instalar. Esperado: sin pedido de admin, en `%LOCALAPPDATA%\Claw Garden\`, advertencia de SmartScreen (sin firma).
+5. Terminal **nueva**: `clawg --version`, `where clawg` → carpeta de instalación, `clawg status` → `profile: prod`,
+   `data_dir: ~/.clawg`, `running: false`.
+6. Abrir la app: sin consola detrás; crea `~/.clawg` con una `memory.db` vacía.
+7. Convivencia: `claude mcp list` sigue mostrando `clawg-dev ✔ Connected`; `~/.clawg-dev` intacto; `bun run tauri:dev`
+   sigue siendo `Claw Garden (Dev)` contra `~/.clawg-dev`.
+8. Host real sobre el binario instalado, **en perfil dev** (para no escribir nada en prod): registrar temporalmente
+   `"%LOCALAPPDATA%\Claw Garden\clawg.exe" mcp --profile dev`, `claude mcp list`, y desregistrarlo.
+9. Update: correr el instalador otra vez con un `clawg serve` de prod vivo → el hook lo para, sin "error opening file".
+10. Desinstalar → la entrada de PATH desaparece y `~/.clawg` queda. Reinstalar.
+
+### Consideraciones para las fases siguientes (lo que la fase 2 deja a la vista)
+
+- **Desktop y daemon sobre el mismo perfil siguen sin exclusión en código.** La regla "no corren a la vez hasta la
+  fase 4" es una convención. En la fase 2 no molesta (nadie registra el MCP de prod), pero la etapa 5 de la fase 3
+  registra `clawg` de prod mientras la app instalada puede estar abierta, y ahí serían dos procesos con su ingest
+  worker sobre `~/.clawg/memory.db`. **Antes de la etapa 5** conviene que el desktop tome el mismo `daemon.lock` y se
+  niegue a abrir la memoria si lo tiene el daemon (o al revés), con un mensaje que diga cuál cerrar. Es una decisión
+  de comportamiento del desktop congelado: va en conversación aparte.
+- **Los puentes `clawg mcp` también retienen `clawg.exe`.** Con el MCP de prod registrado (fase 3), un update con
+  Claude Code abierto va a encontrar el archivo en uso por el puente, no por el daemon. El hook no puede pararlos sin
+  matar sesiones ajenas; lo razonable es que el instalador avise. A resolver cuando exista el registro de prod.
+- **Firma de código.** Fuera de alcance hoy; si Claw Garden sale de esta máquina, SmartScreen lo va a frenar.
+
+### Cosas aprendidas (fase 2, hasta la compuerta)
+
+- **Un verde en el perfil que te importa no prueba nada del otro.** El arreglo del subsistema pasó en release y
+  rompía dev. Toda decisión en un build script que dependa del perfil se prueba en los dos.
+- **Un crate de juguete es la forma barata de interrogar al linker.** Cinco líneas y leer dos campos del header PE
+  contestaron lo que ninguna doc decía (qué `/SUBSYSTEM` gana) sin compilar el proyecto en release.
+- **"Configuración del bundle" no significa "sólo la lee el bundler".** `tauri-build` actúa sobre `externalBin` en cada
+  `cargo build`. Antes de poner algo en una config, averiguar quién la lee, no sólo quién debería.
+- **Un comando que "pide" algo tiene que esperar a que pase, o nombrarse distinto.** `stop` que no espera no es un
+  stop, es un `request-stop`; el costo aparece en el primer script o instalador que confía en el nombre.
+- **La mitad del trabajo de un instalador es no romper lo que ya hay en la máquina.** PATH truncado, tipo de registro
+  cambiado, un `.exe` en uso: ninguno es una feature, los tres son la diferencia entre instalar y dañar.
