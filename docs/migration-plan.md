@@ -16,7 +16,7 @@ implementar, se anota en "Casos inesperados" y se decide en conversación aparte
 |------|--------|--------|--------------------|
 | 0 | Identidad, split del workspace, aislamiento de perfiles | ✅ implementada 2026-09-11 · commiteada 2026-09-13 (`d018c0c`, `57119d3`) | `clawg-core` compila sin `tauri` ✅; `cargo run` escribe en `~/.clawg-dev` y no puede abrir `~/.clawg` ✅ (por tests, no por ejecución); suite verde en el número baseline ✅ 998 + 37 + 202 |
 | 1 | Núcleo: `clawg serve` + `clawg mcp` | ✅ implementada, commiteada y verificada 2026-09-13 (`4623960`, `2593849`) · regresión de handshake con Claude Code 2.1.285 corregida y re-verificada 2026-09-29 (`fa048ad`, `1dd91b5`) | Claude Code recuerda algo entre dos sesiones sin la app abierta, contra perfil dev ✅ (dos `claude -p` separados, memoria #2; re-verificado el 29-09 con 2.1.285) · suite 1.397 tests, 0 failed ✅ · sin `tauri` en `clawg-cli` ✅ |
-| 2 | Release e instalador (compuerta) | 🟡 en curso desde 2026-09-29: plan y paquetes del repo; build + instalación pendientes de autorización | Claw Garden instalado, arranca contra `~/.clawg`, convive con la versión dev. Cero datos migrados hasta acá |
+| 2 | Release e instalador (compuerta) | ✅ implementada 2026-09-29, compuerta ejecutada y verificada 2026-09-30 con autorización de Marco (`631d761`…`b9db085`) | Claw Garden instalado, arranca contra `~/.clawg`, convive con la versión dev. Cero datos migrados hasta acá |
 | 3 | Migración desde engram (6 etapas) | ⚪ pendiente | `CLAUDE.md` apunta a Claw Garden, engram desregistrado, snapshot archivado |
 | 4 | Panel de control | ⚪ pendiente | Encontrar y corregir una memoria mal extraída en < 30 s |
 | 5 | Motor de flujos deterministas | ⚪ diseño diferido | Por definir en su propia conversación |
@@ -899,3 +899,70 @@ Requiere un build de producción y una instalación real, así que **no se ejecu
   stop, es un `request-stop`; el costo aparece en el primer script o instalador que confía en el nombre.
 - **La mitad del trabajo de un instalador es no romper lo que ya hay en la máquina.** PATH truncado, tipo de registro
   cambiado, un `.exe` en uso: ninguno es una feature, los tres son la diferencia entre instalar y dañar.
+
+### Compuerta ejecutada (2026-09-30, autorizada por Marco)
+
+Marco autorizó el build de producción, la instalación y el checklist completo, y eligió copiar el modelo desde dev.
+Antes de tocar nada se exportó `HKCU\Environment` a un `.reg` de respaldo y se guardó el PATH de usuario como texto.
+
+| Paso | Acción | Resultado |
+|------|--------|-----------|
+| 1 | `bun run tauri:build`, primer intento | el sidecar compiló y se copió bien (`clawg` release en 1m 28s); **falló el `ng build` de producción** por budget de estilos (caso inesperado 6) → `92b2a10` |
+| 1 | `bun run tauri:build`, segundo intento | `target/release/bundle/nsis/Claw Garden_0.1.0_x64-setup.exe`, 22 MB. Warning de Tauri sobre el identifier (caso inesperado 7) |
+| 2 | header PE y versión | `clawg-desktop.exe` → **`WINDOWS 10.0`**; `clawg.exe` → `CONSOLE` (correcto para un CLI), `clawg 0.1.0`; el sidecar staged es byte a byte `target/release/clawg.exe` |
+| 3 | modelo | `~/.clawg-dev/models` → `~/.clawg/models` (465 MB) |
+| 4 | instalar (`/S`) | exit 0 en 2 s, sin admin, en `%LOCALAPPDATA%\Claw Garden\` (`clawg-desktop.exe`, `clawg.exe`, `uninstall.exe`) |
+| 5 | PATH y terminal nueva (PATH reconstruido desde el registro) | `REG_EXPAND_SZ` preservado, las 36 entradas previas idénticas, **una sola entrada agregada**; `where clawg` → la instalación; `clawg --version` → `0.1.0`; `clawg status` → `profile: prod`, `data_dir: ~/.clawg`, `running: false` |
+| 6 | abrir la app | ventana "Claw Garden" (no "(Dev)"), **0 procesos `conhost` hijos**; creó `~/.clawg/memory.db` (schema 8) y `sessions/` |
+| 7 | convivencia, con la app de prod abierta | `claude mcp list` → `clawg-dev ✔ Connected`, y el daemon dev (binario debug) corriendo **a la vez** que la app de prod. `~/.clawg`: 0 filas en `memory`, `episodic_trajectory` y `procedural_skill`. `~/.clawg-dev`: sus 2 memorias intactas |
+| 8 | host real sobre el binario instalado, perfil dev, aislado con `--strict-mcp-config` | autostart en frío de un daemon **de release** (`AppData\Local\Claw Garden\clawg.exe serve --profile dev`); conexión 150 ms `legacy`; `search_memory` 21 ms → "Los Girasoles Violetas, martes, #2" |
+| 9 | update con **dos** daemons vivos desde el `clawg.exe` instalado (prod y dev; app cerrada) | primero se detectó que el hook no cubría dev (caso inesperado 8) → `b9db085`, rebuild. Con el instalador nuevo: exit 0 en 4 s; los logs de los dos daemons muestran apagado ordenado; archivos reemplazados |
+| 10 | desinstalar (`/S`) y reinstalar | carpeta eliminada; PATH **byte a byte idéntico** a la foto previa (comparación case-sensitive, `REG_EXPAND_SZ`, 36 entradas); `~/.clawg` intacto. Reinstalación: exit 0, `clawg` de vuelta en el PATH |
+
+**Criterio de salida de la fase 2: cumplido.** Claw Garden está instalado como aplicación, arranca contra `~/.clawg`,
+convive con la versión dev sin pisarla (probado con los dos corriendo a la vez) y no se migró un solo dato: la base
+de prod tiene cero filas. Estado final de la máquina: app instalada, `clawg` en el PATH, ningún daemon corriendo,
+`clawg-dev` registrado y conectando.
+
+### Casos inesperados (compuerta)
+
+6. **El primer `ng build` de producción de la historia del repo falló por budget.** `sidebar.component.css` pesa
+   9,70 kB contra un error a los 8 kB (el default de Angular). Nadie lo había visto porque el build de producción del
+   frontend nunca se había corrido (la fase 0 lo dejó como "no verificado"). Alternativas: recortar el CSS (trabajo de
+   frontend fuera de alcance, sobre un componente que la fase 4 rehace como navegación del panel), compilar con la
+   config `development` (no sería un release), o subir el error. Se subió el error a 12 kB y el warning quedó en 4 kB,
+   así los excesos siguen visibles (`92b2a10`).
+7. **Tauri advierte que `com.clawgarden.app` termina en `.app`**, que en macOS es la extensión de los bundles de
+   aplicación. El documento de producto fija ese identifier como definitivo y macOS está fuera de alcance, así que
+   no se cambió. Lo que queda atado al identifier en Windows es poco: los datos del usuario viven en `~/.clawg`, no
+   en carpetas derivadas del identifier; sí quedaría huérfano el perfil de WebView2
+   (`%LOCALAPPDATA%\com.clawgarden.app`). **Decisión pendiente de Marco**: mantenerlo, o cambiarlo (por ejemplo a
+   `com.clawgarden.desktop`) antes de cualquier build para macOS o de distribuir el instalador fuera de esta máquina.
+8. **Un daemon dev lanzado desde el `clawg.exe` instalado también bloquea el update.** El binario de release puede
+   servir `--profile dev` (así ensaya la fase 3), y el hook sólo paraba prod. Se detectó en la prueba del paso 8 y se
+   confirmó con un control negativo; los hooks ahora paran los dos perfiles (`b9db085`). Parar un daemon dev que
+   corre desde otro lado es inofensivo: el próximo `clawg mcp` lo vuelve a levantar.
+9. **El `cp` de MSYS no sirve como control negativo de "archivo en uso".** Sobre un `.exe` en ejecución, `cp -f`
+   "funcionó": Cygwin/MSYS renombra el original y crea uno nuevo (semántica POSIX de unlink), y el proceso sigue con
+   la imagen renombrada. NSIS abre el existente para escritura, que es otra operación. El control válido fue
+   `[System.IO.File]::Open(path, Open, Write, None)` contra un daemon recién lanzado desde ese archivo: bloqueado.
+10. **El PATH de usuario de esta máquina mide 1.294 caracteres.** Más que el `NSIS_MAX_STRLEN` de 1.024: la receta
+    clásica de PATH en NSIS lo habría truncado al escribirlo. La decisión de hacerlo en Rust dejó de ser teórica.
+11. **`claude mcp list` sondea todos los servers a la vez.** Con `clawg-dev` (debug) y el smoke test (release)
+    registrados, el debug ganó la carrera del autostart y la prueba no ejercitó el binario instalado. La prueba
+    aislada se hizo con `claude -p --strict-mcp-config --mcp-config <archivo>`, sin tocar `~/.claude.json`.
+12. **NSIS preserva la fecha del archivo de origen.** `clawg.exe` instalado conserva la fecha del build del sidecar,
+    así que la fecha no sirve para probar que un update lo reemplazó; la prueba es que los daemons se apagaron por el
+    hook (sus logs) y que el instalador terminó con exit 0.
+
+### Cosas aprendidas (compuerta)
+
+- **Un control negativo que "falla" puede estar midiendo otra cosa.** El `cp` que sobrescribió un `.exe` en uso no
+  probaba que no hubiera lock: probaba que MSYS no escribe como NSIS. Antes de concluir, reproducir la operación
+  exacta del sistema bajo prueba.
+- **La primera vez que corre un camino, aparecen deudas que ningún test veía.** El budget de CSS, el subsistema del
+  exe y la advertencia del identifier existían desde antes del pivot; los reveló el primer build de producción.
+- **Las pruebas contra el host tienen que aislar qué binario se está probando.** Con dos registros del mismo daemon,
+  el resultado depende de quién gana una carrera. `--strict-mcp-config` convierte esa carrera en una prueba.
+- **Foto antes, comparación byte a byte después.** El respaldo de `HKCU\Environment` y la comparación exacta del PATH
+  fueron lo que permitió afirmar "la desinstalación deja la máquina como estaba" en vez de "parece que anduvo".
