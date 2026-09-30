@@ -15,7 +15,7 @@ implementar, se anota en "Casos inesperados" y se decide en conversación aparte
 | Fase | Nombre | Estado | Criterio de salida |
 |------|--------|--------|--------------------|
 | 0 | Identidad, split del workspace, aislamiento de perfiles | ✅ implementada 2026-09-11 · commiteada 2026-09-13 (`d018c0c`, `57119d3`) | `clawg-core` compila sin `tauri` ✅; `cargo run` escribe en `~/.clawg-dev` y no puede abrir `~/.clawg` ✅ (por tests, no por ejecución); suite verde en el número baseline ✅ 998 + 37 + 202 |
-| 1 | Núcleo: `clawg serve` + `clawg mcp` | ✅ implementada, commiteada y verificada 2026-09-13 (`4623960`, `2593849`) | Claude Code recuerda algo entre dos sesiones sin la app abierta, contra perfil dev ✅ (dos `claude -p` separados, memoria #2) · suite 1.385 tests, 0 failed ✅ · sin `tauri` en `clawg-cli` ✅ |
+| 1 | Núcleo: `clawg serve` + `clawg mcp` | ✅ implementada, commiteada y verificada 2026-09-13 (`4623960`, `2593849`) · regresión de handshake con Claude Code 2.1.285 corregida y re-verificada 2026-09-29 (`fa048ad`, `1dd91b5`) | Claude Code recuerda algo entre dos sesiones sin la app abierta, contra perfil dev ✅ (dos `claude -p` separados, memoria #2; re-verificado el 29-09 con 2.1.285) · suite 1.397 tests, 0 failed ✅ · sin `tauri` en `clawg-cli` ✅ |
 | 2 | Release e instalador (compuerta) | ⚪ pendiente | Claw Garden instalado, arranca contra `~/.clawg`, convive con la versión dev. Cero datos migrados hasta acá |
 | 3 | Migración desde engram (6 etapas) | ⚪ pendiente | `CLAUDE.md` apunta a Claw Garden, engram desregistrado, snapshot archivado |
 | 4 | Panel de control | ⚪ pendiente | Encontrar y corregir una memoria mal extraída en < 30 s |
@@ -655,3 +655,81 @@ no deben correr a la vez sobre el mismo perfil. El puente lo vuelve a levantar s
 3. **La sección `=== RECENT CONTEXT ===` del prompt trae la memoria aunque la búsqueda densa también la devuelva.**
    Correcto según `build_memory_prompt` (buckets por recencia), pero `recall_context` y `search_memory` se pisan en
    los primeros 7 días. Es comportamiento heredado del chat, no del daemon.
+
+### Regresión del 2026-09-29: el puente dejó de conectar con Claude Code 2.1.285
+
+**Síntoma.** Al abrir una sesión nueva en este repo, `clawg-dev` falló con `CONNECT_TIMEOUT` a los 28 s. El daemon sí
+arrancó (autostart del puente, `listening` en el mismo segundo). Nada del repo había cambiado desde el 13-09: cambió
+el host. El log de Claude Code (`%LOCALAPPDATA%/claude-cli-nodejs/Cache/<proyecto>/mcp-logs-clawg-dev/*.jsonl`) lo dijo
+sin ambigüedad, y resultaron ser **dos bugs independientes** que se tapaban entre sí.
+
+| # | Bug | Causa raíz | Evidencia |
+|---|-----|-----------|-----------|
+| 1 | El puente moría en el handshake | Claude Code 2.1.285 abre cada sesión stdio con un request `server/discover` (id `server-discover-probe-1`) y cae a `initialize` sólo si el probe vuelve con error. rmcp 1.3 acepta como primer request únicamente `initialize` o `ping`; cualquier otro termina el servidor con `ExpectedInitializeRequest` (`service/server.rs:189`). El puente salía sin responder | stderr en el log: `expect initialized request, but received: ... server/discover`. engram (Go) y notebooklm (Python) reciben el mismo probe, responden error y conectan en ~200 ms con `protocolEra: "legacy"` |
+| 2 | El host no se enteraba de que el puente había muerto | En Windows `std::process::Command` llama a `CreateProcess` con herencia de handles activada, que copia **todo** handle heredable al hijo, no sólo su stdio configurado. El daemon autoarrancado heredaba el extremo de escritura del pipe de stdout del host (el puente lo tenía heredable porque así lo recibió de node) | `echo <initialize> \| clawg mcp \| cat` tardó **67.075 ms** y terminó exactamente al hacer `clawg stop`. Por eso el bug 1 se vio como un timeout de 28 s y no como un fallo inmediato |
+
+**Alternativas evaluadas para el bug 1.**
+
+| Opción | A favor | En contra | Decisión |
+|--------|---------|-----------|----------|
+| `cargo update` dentro de 1.x (1.8.0) o subir a 2.2.0 | Barato | Verificado en el fuente: 1.8.0 y 2.2.0 tienen el mismo bucle de init que 1.3; no conocen `server/discover` | Descartada: no arregla nada |
+| rmcp 3.5.0 sólo en `clawg-cli` (desktop sigue en 1.3; Cargo admite dos majors) | Soporte nativo del lifecycle nuevo (`DiscoverRequest`, `ServerHandler::discover`) | Dos majors de API en `server.rs` (830 líneas con macros). Y lo importante: en el lifecycle nuevo una sesión puede empezar **sin `initialize`**, y hoy `agent_id` sale de `clientInfo.name` del `initialize`. Migrar obliga a rediseñar la identidad del cliente | Diferida: decisión propia, no un hotfix |
+| **Shim `PreInitGuard` sobre rmcp 1.3** | ~60 líneas, un solo build de rmcp, mismo camino de fallback que ya usan engram y notebooklm, no toca la derivación de identidad | Deuda explícita: se borra el día que el puente pase a rmcp 3.x | **Elegida** |
+
+**Implementado** (dos commits, cada uno compila y pasa la suite solo):
+
+- `fa048ad fix(cli): answer pre-initialize probes so MCP hosts can fall back to initialize` —
+  `crates/clawg-cli/src/mcp/handshake.rs` (nuevo). `before_initialize(&msg) -> PreInit` es puro: `initialize` pasa y
+  abre la sesión; `ping` pasa (rmcp ya lo contesta); un método que rmcp parsea como `CustomRequest` (o sea, que no
+  implementa) recibe `-32601 method not found: <método>` con el id del request; un método conocido enviado antes de
+  tiempo recibe `-32600 <método> sent before initialize`; notificaciones y respuestas sueltas se descartan.
+  `PreInitGuard<T: Transport<RoleServer>>` aplica eso en `receive()` hasta ver `initialize` y después es transparente
+  (post-init, contestar métodos desconocidos es trabajo del dispatcher de rmcp). `mcp/mod.rs` sirve sobre
+  `PreInitGuard::new(AsyncRwTransport::new_server(stdin, stdout))` en vez de `stdio()` pelado.
+- `1dd91b5 fix(cli): keep the autostarted daemon from inheriting the bridge's stdio on Windows` —
+  `crates/clawg-cli/src/detach.rs` (nuevo, sólo `cfg(windows)`): `clear_inherit(&[RawHandle])` limpia
+  `HANDLE_FLAG_INHERIT` (best effort, salta handles nulos) y `disinherit_std_handles()` lo aplica a stdin/stdout/stderr.
+  `ProcessSpawner::spawn_serve` lo llama justo antes del `spawn`. `Command` sigue dándole al daemon su propio stdio
+  (null + log) con handles que duplica a propósito. `windows-sys 0.61` como dependencia `cfg(windows)`: ya estaba en el
+  lock vía `mio`, el lockfile sólo suma la arista (1 línea).
+
+**Verificaciones.**
+
+| Momento | Comando / acción | Resultado |
+|---------|------------------|-----------|
+| Rojo bug 1 | 10 tests de `mcp::handshake` contra un stub pass-through | 8 failed; el end-to-end cae en `the bridge is still alive` (el stream se cierra ante el probe: el bug, reproducido en proceso) |
+| Verde bug 1 | ídem con la implementación | 10 passed |
+| Rojo bug 2 | `an_inheritable_handle_stops_being_inheritable` contra `clear_inherit` vacío | failed en `!is_inheritable(handle)` |
+| Verde bug 2 | ídem | 2 passed |
+| Suite | `cargo test --workspace --all-features` | clawg-cli **104** + api 18, core 878 + 8, desktop 150, golden-mine 37, rag-eval 202 → **1.397, 0 failed** (1.385 + 12 nuevos) |
+| Warnings | `cargo check --workspace --all-features` / `cargo clippy -p clawg-cli --all-targets` | 55 = baseline / 0 del crate |
+| Binario real, bug 2 | el mismo `echo <initialize> \| clawg mcp \| cat` con el daemon parado | **649 ms** (antes 67.075 ms); el daemon autoarrancado sigue vivo después |
+| Binario real, bug 1 | `server/discover` + `initialize` por stdin | `{"id":"server-discover-probe-1","error":{"code":-32601,...}}` y después el `InitializeResult` |
+| Host real, en frío | daemon parado + `claude mcp list` (Claude Code 2.1.285) | `clawg-dev ... √ Connected`; log: `Successfully connected in 562ms`, `protocolEra: "legacy"`, `STDIO connection closed after 0s (cleanly)`; el daemon sobrevivió al `Terminating MCP server process tree` del host |
+| **Criterio de salida, otra vez** | `claude -p --model haiku` con `search_memory "bar de Marco"` | "Los Girasoles Violetas, cierra los martes, ID #2"; conexión 189 ms, tool en 20 ms |
+
+**Cosas aprendidas.**
+
+- **El host es una dependencia que no está en `Cargo.lock`.** Nada del repo cambió entre el 13 y el 29 de septiembre;
+  cambió Claude Code. Un criterio de salida verificado contra un host externo es una foto, no una garantía: hay que
+  poder re-verificarlo barato (`claude mcp list` + una llamada `claude -p`) cada vez que el host se actualiza.
+- **Ante un método desconocido, contestar error; nunca morir.** Es lo que permite que un cliente negocie hacia atrás.
+  rmcp 1.x lo hace bien después de `initialize` y mal antes; los SDKs de Go y Python lo hacen bien siempre.
+- **"Detached" en Windows no incluye los handles.** `DETACHED_PROCESS` suelta la consola; la herencia de handles es
+  otra cosa y `Command` la deja siempre activa. Un hijo de larga vida lanzado desde un proceso con stdio en pipes se
+  queda con esos pipes si nadie limpia el flag.
+- **Un timeout largo puede ser un EOF que no llegó.** El síntoma "tarda 28 s" sugería performance; el cold start medido
+  del puente era de 655 ms. Medir antes de optimizar evitó perseguir el problema equivocado.
+- **Los logs de MCP del host son la primera fuente, no la última.** Muestran el stderr del server, el tiempo de
+  conexión y la era de protocolo negociada; con ellos la causa del bug 1 salió en una lectura.
+
+**Consideraciones que deja.**
+
+- **Fase 2.** El checklist de release suma una prueba contra el host real sobre el binario **instalado**:
+  `claude mcp list` (conexión en frío, con autostart) y una llamada `claude -p` que use una tool. La suite sola no
+  habría visto ninguno de los dos bugs.
+- **Migración a rmcp 3.x.** Cuando el puente migre: borrar `PreInitGuard` (y sus 10 tests) y decidir de dónde sale
+  `agent_id` en una sesión que empieza con `server/discover` y nunca manda `initialize`. Esa decisión condiciona qué
+  `agent_id` tienen las memorias guardadas desde entonces, así que va en conversación aparte.
+- **Unix.** El bug 2 no aplica (los fds 0–2 del hijo se reemplazan y std abre todo con close-on-exec); `detach.rs` es
+  sólo `cfg(windows)` a propósito.
