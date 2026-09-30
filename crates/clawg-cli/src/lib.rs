@@ -25,5 +25,7 @@
 pub mod cli;
 pub mod client;
 pub mod daemon;
+#[cfg(windows)]
+pub mod detach;
 pub mod mcp;
 pub mod status;

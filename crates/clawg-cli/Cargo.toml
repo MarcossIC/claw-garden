@@ -53,6 +53,12 @@ rmcp = { version = "1", features = ["server", "transport-io", "macros", "schemar
 # satisfy its `JsonSchema` bound.
 schemars = "1"
 
+# Clears the inherit flag on the bridge's own stdio before it spawns the daemon
+# (see `detach.rs`). Already in the lockfile through tokio's `mio`, so this adds
+# no crate to the build.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
+
 [dev-dependencies]
 clawg-core = { workspace = true, features = ["testing"] }
 tempfile.workspace = true

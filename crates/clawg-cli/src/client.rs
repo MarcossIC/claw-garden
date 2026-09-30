@@ -437,6 +437,10 @@ impl DaemonSpawner for ProcessSpawner {
             const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
             const DETACHED_PROCESS: u32 = 0x0000_0008;
             cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+            // Detaching the console is not detaching the handles: without
+            // this the daemon inherits the host's stdio pipes and the host
+            // never sees this bridge exit. See `detach.rs`.
+            crate::detach::disinherit_std_handles();
         }
         #[cfg(unix)]
         {
