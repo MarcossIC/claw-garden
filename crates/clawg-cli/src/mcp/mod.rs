@@ -8,14 +8,17 @@
 //! logging is initialised against stderr in `main`, and nothing in this module
 //! or in [`server`] ever writes to stdout directly.
 
+pub mod handshake;
 pub mod server;
 pub mod tools;
 
 use clawg_core::paths::{data_dir, Profile};
+use rmcp::transport::async_rw::AsyncRwTransport;
 use rmcp::transport::stdio;
 use rmcp::ServiceExt;
 
 use crate::client::{ensure_running, ClientError, ProcessSpawner};
+use handshake::PreInitGuard;
 use server::ClawgMcp;
 
 #[derive(Debug, thiserror::Error)]
@@ -39,8 +42,12 @@ pub async fn run(profile: Profile, autostart: bool) -> Result<(), McpError> {
         client.base_url()
     );
 
+    // Guarded, never bare: a host that opens with a probe rmcp 1.3 does not
+    // know (`server/discover`) must get an error back, not a dead process.
+    let (stdin, stdout) = stdio();
+    let transport = PreInitGuard::new(AsyncRwTransport::new_server(stdin, stdout));
     let service = ClawgMcp::new(client, profile)
-        .serve(stdio())
+        .serve(transport)
         .await
         .map_err(|e| McpError::Serve(e.to_string()))?;
 
