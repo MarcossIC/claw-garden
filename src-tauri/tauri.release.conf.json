@@ -1,0 +1,9 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "build": {
+    "beforeBuildCommand": "bun run build:release"
+  },
+  "bundle": {
+    "externalBin": ["binaries/clawg"]
+  }
+}

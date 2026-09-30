@@ -44,6 +44,8 @@ __screenshots__/
 
 # Tauri
 /src-tauri/target
+# The release sidecar, staged by scripts/build-sidecar.ts before `tauri build`.
+/src-tauri/binaries
 
 # System files
 .DS_Store

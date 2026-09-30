@@ -5,11 +5,14 @@
     "ng": "ng",
     "start": "ng serve",
     "build": "ng build",
+    "build:sidecar": "bun scripts/build-sidecar.ts",
+    "build:release": "bun run build:sidecar && bun run build",
     "watch": "ng build --watch --configuration development",
     "test": "ng test",
+    "test:scripts": "bun test scripts",
     "tauri": "tauri",
     "tauri:dev": "tauri dev --config src-tauri/tauri.dev.conf.json",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build --config src-tauri/tauri.release.conf.json"
   },
   "prettier": {
     "printWidth": 100,
