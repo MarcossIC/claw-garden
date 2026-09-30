@@ -104,13 +104,21 @@ fn hook_body<'a>(hooks: &'a str, name: &str) -> &'a str {
 }
 
 #[test]
-fn the_hooks_stop_the_prod_daemon_and_manage_the_path() {
+fn the_hooks_stop_both_daemons_and_manage_the_path() {
     let hooks = std::fs::read_to_string(manifest_dir().join("windows").join("hooks.nsh"))
         .expect("read hooks.nsh");
-    // Tauri's own running-app check covers only the main binary; a live
-    // production daemon holds clawg.exe open through an update or uninstall.
-    assert!(hook_body(&hooks, "NSIS_HOOK_PREINSTALL").contains("stop --profile prod"));
-    assert!(hook_body(&hooks, "NSIS_HOOK_PREUNINSTALL").contains("stop --profile prod"));
+    // Tauri's own running-app check covers only the main binary, and a daemon
+    // of EITHER profile started from the installed clawg.exe holds it open
+    // through an update or uninstall: the release binary may serve dev too
+    // (`--profile dev`), which is exactly how phase 3 rehearses the migration.
+    for hook in ["NSIS_HOOK_PREINSTALL", "NSIS_HOOK_PREUNINSTALL"] {
+        for profile in ["prod", "dev"] {
+            assert!(
+                hook_body(&hooks, hook).contains(&format!("stop --profile {profile}")),
+                "{hook} must stop the {profile} daemon"
+            );
+        }
+    }
     assert!(hook_body(&hooks, "NSIS_HOOK_POSTINSTALL").contains("path add"));
     assert!(hook_body(&hooks, "NSIS_HOOK_PREUNINSTALL").contains("path remove"));
 }
