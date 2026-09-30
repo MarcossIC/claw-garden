@@ -31,3 +31,4 @@ pub mod mcp;
 pub mod process;
 pub mod status;
 pub mod stop;
+pub mod user_path;

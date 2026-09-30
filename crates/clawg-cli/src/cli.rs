@@ -4,6 +4,8 @@
 //! data, so the whole surface is testable by feeding argv vectors to clap
 //! without touching a filesystem, a port or a database.
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 use clawg_core::paths::{Profile, ProfileError};
 
@@ -40,10 +42,32 @@ pub enum Command {
         #[command(flatten)]
         profile: ProfileArg,
     },
-    /// Ask a running daemon to shut down.
+    /// Stop the running daemon and wait until its process has exited.
     Stop {
         #[command(flatten)]
         profile: ProfileArg,
+    },
+    /// Add or remove a directory on the user PATH (Windows). The installer
+    /// runs this so `clawg` works from any new terminal.
+    Path {
+        #[command(subcommand)]
+        action: PathAction,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum PathAction {
+    /// Append the directory unless an equivalent entry is already there.
+    Add {
+        /// Directory to add. Defaults to the one holding this `clawg` binary.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// Remove every entry naming the directory.
+    Remove {
+        /// Directory to remove. Defaults to the one holding this `clawg` binary.
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
 }
 
@@ -180,6 +204,33 @@ mod tests {
             parse(&["clawg", "stop"]).command,
             Command::Stop { profile: ProfileArg { profile: None } }
         );
+    }
+
+    #[test]
+    fn path_add_and_remove_default_to_the_binarys_own_directory() {
+        assert_eq!(
+            parse(&["clawg", "path", "add"]).command,
+            Command::Path { action: PathAction::Add { dir: None } }
+        );
+        assert_eq!(
+            parse(&["clawg", "path", "remove"]).command,
+            Command::Path { action: PathAction::Remove { dir: None } }
+        );
+    }
+
+    #[test]
+    fn path_accepts_an_explicit_directory() {
+        assert_eq!(
+            parse(&["clawg", "path", "add", "--dir", r"C:\Program Files\Claw Garden"]).command,
+            Command::Path {
+                action: PathAction::Add { dir: Some(r"C:\Program Files\Claw Garden".into()) }
+            }
+        );
+    }
+
+    #[test]
+    fn path_without_an_action_is_a_usage_error() {
+        assert!(Cli::try_parse_from(["clawg", "path"]).is_err());
     }
 
     #[test]

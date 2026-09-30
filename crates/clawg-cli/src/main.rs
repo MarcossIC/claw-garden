@@ -7,9 +7,11 @@
 //! Exit codes: `0` success, `1` a runtime failure (message on stderr), `2` a
 //! usage error (clap's own, emitted before `main` ever runs).
 
+#[cfg(windows)]
+use std::path::Path;
 use std::process::ExitCode;
 
-use clawg_cli::cli::{Cli, Command};
+use clawg_cli::cli::{Cli, Command, PathAction};
 use clawg_cli::client::{ClientError, DaemonClient};
 use clawg_cli::daemon::lifecycle::read_state;
 use clawg_cli::daemon::serve;
@@ -107,5 +109,52 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             println!("stopped the {} daemon (pid {pid})", profile.as_str());
             Ok(ExitCode::SUCCESS)
         }
+
+        Command::Path { action } => run_path(action),
     }
+}
+
+/// `clawg path add|remove`. Idempotent on purpose: the installer runs it on
+/// every install and uninstall, and "already there" is success, not failure.
+#[cfg(windows)]
+fn run_path(action: PathAction) -> Result<ExitCode, String> {
+    use clawg_cli::user_path::{registry, Change};
+
+    let (dir, adding) = match action {
+        PathAction::Add { dir } => (dir, true),
+        PathAction::Remove { dir } => (dir, false),
+    };
+    let dir = match dir {
+        Some(dir) => dir,
+        None => std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+            .ok_or("cannot locate the directory of this clawg binary; pass --dir")?,
+    };
+    let dir = dir.to_str().ok_or("the directory is not valid Unicode")?;
+
+    let change = if adding {
+        registry::add(registry::ENVIRONMENT_KEY, dir)
+    } else {
+        registry::remove(registry::ENVIRONMENT_KEY, dir)
+    }
+    .map_err(|e| format!("could not update the user PATH: {e}"))?;
+
+    if matches!(change, Change::Added | Change::Removed) {
+        registry::broadcast_environment_change();
+    }
+    match change {
+        Change::Added => println!("added {dir} to the user PATH; new terminals will find clawg"),
+        Change::AlreadyPresent => println!("{dir} is already on the user PATH"),
+        Change::Removed => println!("removed {dir} from the user PATH"),
+        Change::NotPresent => println!("{dir} was not on the user PATH"),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(windows))]
+fn run_path(_action: PathAction) -> Result<ExitCode, String> {
+    Err("`clawg path` manages the Windows user PATH; on this platform, add the \
+         directory holding clawg to your shell profile instead"
+        .to_string())
 }
