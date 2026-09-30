@@ -52,6 +52,8 @@ pub enum ClientError {
     Spawn(String),
     #[error("timed out after {0:?} waiting for the daemon to start")]
     StartTimeout(Duration),
+    #[error("the daemon (pid {pid}) accepted the shutdown but is still running after {timeout:?}")]
+    StopTimeout { pid: u32, timeout: Duration },
 }
 
 // ── Wire types the client reads back ────────────────────────────────────────

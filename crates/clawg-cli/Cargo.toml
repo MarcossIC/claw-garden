@@ -54,10 +54,15 @@ rmcp = { version = "1", features = ["server", "transport-io", "macros", "schemar
 schemars = "1"
 
 # Clears the inherit flag on the bridge's own stdio before it spawns the daemon
-# (see `detach.rs`). Already in the lockfile through tokio's `mio`, so this adds
-# no crate to the build.
+# (see `detach.rs`) and waits on the daemon's process handle in `clawg stop`
+# (see `process.rs`). Already in the lockfile through tokio's `mio`, so this
+# adds no crate to the build.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+# `kill(pid, 0)` for the Unix side of `process.rs`. Already in the lockfile.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 clawg-core = { workspace = true, features = ["testing"] }

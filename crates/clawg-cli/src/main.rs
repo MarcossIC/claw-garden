@@ -10,11 +10,12 @@
 use std::process::ExitCode;
 
 use clawg_cli::cli::{Cli, Command};
-use clawg_cli::client::DaemonClient;
+use clawg_cli::client::{ClientError, DaemonClient};
 use clawg_cli::daemon::lifecycle::read_state;
 use clawg_cli::daemon::serve;
 use clawg_cli::mcp;
 use clawg_cli::status::status_report;
+use clawg_cli::stop::{stop_in, STOP_TIMEOUT};
 use clawg_core::paths::data_dir;
 use clap::Parser;
 
@@ -92,11 +93,18 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
 
         Command::Stop { profile } => {
             let profile = profile.resolve().map_err(|e| e.to_string())?;
-            let base_dir = data_dir(profile);
-            let client = DaemonClient::from_data_dir(&base_dir)
-                .ok_or_else(|| format!("no clawg daemon is running for profile {}", profile.as_str()))?;
-            client.shutdown().await.map_err(|e| e.to_string())?;
-            println!("stopping the {} daemon", profile.as_str());
+            // Returns only once the process has ended, so `clawg stop && clawg
+            // serve` cannot lose the race for the lock, and an installer can
+            // replace `clawg.exe` right after.
+            let pid = stop_in(&data_dir(profile), STOP_TIMEOUT)
+                .await
+                .map_err(|e| match e {
+                    ClientError::NotRunning => {
+                        format!("no clawg daemon is running for profile {}", profile.as_str())
+                    }
+                    other => other.to_string(),
+                })?;
+            println!("stopped the {} daemon (pid {pid})", profile.as_str());
             Ok(ExitCode::SUCCESS)
         }
     }
