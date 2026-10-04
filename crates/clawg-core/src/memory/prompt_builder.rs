@@ -8,7 +8,7 @@ use crate::memory::{
     embedder::{EmbedRole, Embedder},
     search::{search_all_memories, RankedHit, SearchScope},
     workspace::{EmittedIds, WorkspaceManager},
-    MemoryError, MemoryStore,
+    MemoryError, MemoryStore, TableKind,
 };
 
 // ---------------------------------------------------------------------------
@@ -162,8 +162,16 @@ pub async fn build_memory_prompt(
     // inflate the access count that drives tier promotion.
     // Called AFTER hits are assembled — non-blocking, never awaits.
     // `record` discards empty vecs internally so no extra guard needed.
+    // Only `memory` ids: the flush updates `memory WHERE id = ?`, and ids are
+    // per-table, so a skill or trajectory id would land on an unrelated
+    // `memory` row that happens to share the number.
     if let Some(tracker) = access_tracker {
-        tracker.record(hits.iter().map(|h| h.id).collect());
+        tracker.record(
+            hits.iter()
+                .filter(|h| h.kind == TableKind::Memory)
+                .map(|h| h.id)
+                .collect(),
+        );
     }
 
     // Tier-1 coverage logging — the real measure of the "Tier 1 covers 80%"
@@ -1395,6 +1403,127 @@ mod tests {
             hits.iter().any(|h| h.kind == TableKind::Procedural && h.content == "skill-5"),
             "the queried skill must be among the hits"
         );
+    }
+
+    /// Reads `(access_count, last_accessed_at)` for one `memory` row.
+    async fn memory_access_state(store: &MemoryStore, id: i64) -> (i64, i64) {
+        store
+            .conn
+            .call(move |c| -> Result<(i64, i64), rusqlite::Error> {
+                c.query_row(
+                    "SELECT access_count, last_accessed_at FROM memory WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Drives the tracker's 30 s timer flush and waits (bounded, real time)
+    /// until `witness` shows the flush landed.
+    async fn force_flush_until_counted(store: &MemoryStore, witness: i64) {
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while memory_access_state(store, witness).await.0 == 0 {
+            assert!(std::time::Instant::now() < deadline, "the access flush never landed");
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// The flush only knows how to update `memory`, so a hit from another
+    /// table must not reach it: its id would land on whatever `memory` row
+    /// happens to share that number.
+    #[tokio::test(start_paused = true)]
+    async fn a_hit_from_another_table_does_not_touch_the_memory_row_with_the_same_id() {
+        use crate::memory::store_insert::NewProceduralSkillRecord;
+
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let embedder = Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>;
+        let agent = "agent-id-collision";
+
+        let mut like_query = vec![0.0_f32; 384];
+        like_query[0] = 1.0;
+
+        // Id 1: another agent's row, so it is invisible to this search.
+        let bystander = seed_memory(&store, "agent-someone-else", "bystander", "chat_message", 3, 5.0, unit_bytes(&like_query)).await;
+        // Id 2: a real memory hit, the witness that the flush ran.
+        let witness = seed_memory(&store, agent, "witness", "chat_message", 3, 5.0, unit_bytes(&like_query)).await;
+        // The skill table is empty, so its first row gets the bystander's id.
+        store
+            .promote_to_procedural_skill(
+                NewProceduralSkillRecord {
+                    agent_id: agent.to_string(),
+                    project_id: None,
+                    skill_name: "colliding-skill".to_string(),
+                    trigger: "witness".to_string(),
+                    tool_sequence_json: "[]".to_string(),
+                    source_trajectory_ids: vec![1],
+                    importance: 8.0,
+                    now_ms: 1_700_000_000_000,
+                },
+                Some(like_query),
+            )
+            .await
+            .unwrap();
+        let before = memory_access_state(&store, bystander).await;
+
+        let tracker = AccessTracker::new(store.conn.clone());
+        let result = build_memory_prompt(
+            &store,
+            &wm,
+            Some(embedder),
+            agent,
+            None,
+            QueryTexts::single_shot("witness"),
+            &EmittedIds::default(),
+            Some(&tracker),
+        )
+        .await
+        .unwrap();
+        assert!(result.contains("colliding-skill"), "the skill must be a hit: {result}");
+        assert!(!result.contains("bystander"), "the bystander must not be a hit: {result}");
+
+        force_flush_until_counted(&store, witness).await;
+
+        assert_eq!(
+            memory_access_state(&store, bystander).await,
+            before,
+            "a skill hit with the same id must not count as an access to the memory row"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_memory_hit_is_recorded_by_the_access_tracker() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let embedder = Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>;
+        let agent = "agent-access-control";
+
+        let mut like_query = vec![0.0_f32; 384];
+        like_query[0] = 1.0;
+        let hit = seed_memory(&store, agent, "witness", "chat_message", 3, 5.0, unit_bytes(&like_query)).await;
+
+        let tracker = AccessTracker::new(store.conn.clone());
+        build_memory_prompt(
+            &store,
+            &wm,
+            Some(embedder),
+            agent,
+            None,
+            QueryTexts::single_shot("witness"),
+            &EmittedIds::default(),
+            Some(&tracker),
+        )
+        .await
+        .unwrap();
+
+        force_flush_until_counted(&store, hit).await;
+
+        assert_eq!(memory_access_state(&store, hit).await.0, 1);
     }
 
     #[tokio::test]
