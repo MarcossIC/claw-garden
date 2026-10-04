@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 // this module queries itself — so the import is test-only.
 #[cfg(test)]
 use crate::memory::clock::TimestampMs;
-use crate::memory::search::RankedHit;
+use crate::memory::search::{viewer_match_expression, RankedHit};
 use crate::memory::TableKind;
 use crate::memory::{MemoryError, MemoryStore};
 
@@ -305,36 +305,124 @@ pub struct MemoryAdminRow {
     /// Raw JSON text (e.g. `"[42,7,55]"`). `Some` only for `kind ==
     /// Procedural`; `None` for memory/episodic rows.
     pub source_trajectory_ids: Option<String>,
+    // Provenance. Only `memory` rows carry it: the viewer shows where a stored
+    // fact came from, which the other two tables derive rather than record.
+    pub source: Option<String>,
+    pub source_session_id: Option<String>,
+    pub created_by_type: Option<String>,
+    pub created_by_ref: Option<String>,
+    pub last_modified_at: Option<i64>,
+    pub update_count: Option<i64>,
+    pub dispute_count: Option<i64>,
+    /// Raw JSON text of the ids this row disputes.
+    pub disputed_against: Option<String>,
+    pub last_disputed_at: Option<i64>,
 }
 
 /// Filter/pagination params for `list_memories_core`. `kind: None` merges
-/// all 3 tables; `memory_type` is a no-op (silently ignored) on non-`Memory`
-/// kinds.
+/// all 3 tables; `memory_type` and `query` are no-ops (silently ignored) on
+/// non-`Memory` kinds, the only table with a text index. `agent_id`,
+/// `project_id` and `status` are exact matches applied to every table.
+///
+/// Unlike retrieval, `agent_id` is not a visibility rule: this is the owner's
+/// inspection tool, so it filters instead of scoping.
 #[derive(Debug, Clone, Default)]
 pub struct ListParams {
     pub kind: Option<MemoryKind>,
     pub tier: Option<i64>,
     pub memory_type: Option<String>,
+    pub agent_id: Option<String>,
+    pub project_id: Option<String>,
+    pub status: Option<String>,
+    /// Free text over `memory.content`: every token must match, each as a
+    /// prefix, ignoring case and accents. A query with no token filters nothing.
+    pub query: Option<String>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+}
+
+/// Whether `query` holds anything `ListParams::query` can search for. A query
+/// that does not (only punctuation, only spaces) filters nothing, so a caller
+/// that cares can refuse it instead of showing an unfiltered list as a result.
+pub fn query_has_tokens(query: &str) -> bool {
+    viewer_match_expression(query).is_some()
+}
+
+/// `ListParams` after validation and MATCH-expression building, shaped for
+/// the SQL builders. Every value reaches SQL as a bound parameter.
+#[derive(Default)]
+struct RowFilter {
+    tier: Option<i64>,
+    memory_type: Option<String>,
+    agent_id: Option<String>,
+    project_id: Option<String>,
+    status: Option<String>,
+    match_expr: Option<String>,
+}
+
+/// Appends the filters every table understands, then the `memory`-only ones
+/// when `memory_table` is set. Pure: no I/O, so the SQL shape is testable
+/// without a connection.
+fn push_filters(
+    sql: &mut String,
+    params: &mut Vec<rusqlite::types::Value>,
+    f: &RowFilter,
+    memory_table: bool,
+) {
+    use rusqlite::types::Value;
+    if let Some(t) = f.tier {
+        sql.push_str(" AND tier = ?");
+        params.push(Value::Integer(t));
+    }
+    if let Some(a) = &f.agent_id {
+        sql.push_str(" AND agent_id = ?");
+        params.push(Value::Text(a.clone()));
+    }
+    if let Some(p) = &f.project_id {
+        sql.push_str(" AND project_id = ?");
+        params.push(Value::Text(p.clone()));
+    }
+    if let Some(s) = &f.status {
+        sql.push_str(" AND status = ?");
+        params.push(Value::Text(s.clone()));
+    }
+    if !memory_table {
+        return;
+    }
+    if let Some(mt) = &f.memory_type {
+        sql.push_str(" AND memory_type = ?");
+        params.push(Value::Text(mt.clone()));
+    }
+    if let Some(expr) = &f.match_expr {
+        // No LIMIT inside: a cap here would drop matches before the live,
+        // filtered rows are chosen and make the page depend on index order.
+        sql.push_str(" AND id IN (SELECT rowid FROM memory_fts WHERE memory_fts MATCH ?)");
+        params.push(Value::Text(expr.clone()));
+    }
 }
 
 /// Lists rows from `memory` / `episodic_trajectory` / `procedural_skill`
 /// directly. `kind: None` runs all 3 per-table queries inside the
 /// SAME `conn.call` and merges + sorts (`created_at DESC`) + paginates in
 /// Rust; `kind: Some(_)` pushes `LIMIT`/`OFFSET` down to SQL directly.
-/// `deleted_at IS NULL` is always applied; `status` is NOT filtered —
-/// `superseded` rows remain visible (inspection is an active inventory with
-/// superseded shown, distinct from retrieval's stricter filter).
+/// `deleted_at IS NULL` is always applied; `status` is only filtered when
+/// asked — `superseded` rows stay visible by default (inspection is an active
+/// inventory with superseded shown, distinct from retrieval's stricter filter).
 pub async fn list_memories_core(
     store: &MemoryStore,
     params: ListParams,
 ) -> Result<Vec<MemoryAdminRow>, MemoryError> {
     let limit = params.limit.unwrap_or(50).clamp(1, 100) as i64;
     let offset = params.offset.unwrap_or(0) as i64;
-    let tier = params.tier;
-    let memory_type = params.memory_type;
     let kind = params.kind;
+    let filter = RowFilter {
+        tier: params.tier,
+        memory_type: params.memory_type,
+        agent_id: params.agent_id,
+        project_id: params.project_id,
+        status: params.status,
+        match_expr: params.query.as_deref().and_then(viewer_match_expression),
+    };
 
     store
         .conn
@@ -353,23 +441,19 @@ pub async fn list_memories_core(
 
             let mut rows: Vec<MemoryAdminRow> = Vec::new();
             if want_memory {
-                rows.extend(query_memory_rows(
-                    c,
-                    tier,
-                    memory_type.as_deref(),
-                    per_table_limit,
-                    per_table_offset,
-                )?);
+                rows.extend(query_memory_rows(c, &filter, per_table_limit, per_table_offset)?);
             }
             if want_episodic {
-                rows.extend(query_episodic_rows(c, tier, per_table_limit, per_table_offset)?);
+                rows.extend(query_episodic_rows(c, &filter, per_table_limit, per_table_offset)?);
             }
             if want_procedural {
-                rows.extend(query_procedural_rows(c, tier, per_table_limit, per_table_offset)?);
+                rows.extend(query_procedural_rows(c, &filter, per_table_limit, per_table_offset)?);
             }
 
             if is_merge {
-                rows.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                rows.sort_by(|a, b| {
+                    b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id))
+                });
                 rows = rows
                     .into_iter()
                     .skip(offset as usize)
@@ -389,104 +473,133 @@ pub async fn list_memories_core(
         })
 }
 
+// Column order here is the contract with the `map_*_row` functions below.
+const SELECT_MEMORY: &str = "SELECT id, scope, agent_id, project_id, memory_type, content, \
+     tier, importance, status, access_count, created_at, last_accessed_at, superseded_by, \
+     deleted_at, source, source_session_id, created_by_type, created_by_ref, \
+     last_modified_at, update_count, dispute_count, disputed_against, last_disputed_at \
+     FROM memory";
+const SELECT_EPISODIC: &str = "SELECT id, scope, agent_id, project_id, task, tier, importance, \
+     status, access_count, created_at, last_accessed_at, superseded_by, deleted_at \
+     FROM episodic_trajectory";
+const SELECT_PROCEDURAL: &str = "SELECT id, scope, agent_id, project_id, skill_name, tier, \
+     importance, status, access_count, created_at, last_accessed_at, superseded_by, \
+     deleted_at, success_count, trigger, source_trajectory_ids \
+     FROM procedural_skill";
+
+/// Reads one row by `(kind, id)` for inspection. Unlike the list it also
+/// returns soft-deleted rows, reporting them through `deleted_at`: someone
+/// holding an id from an earlier listing should learn the row was deleted,
+/// not that it never existed. Read-only on purpose — it records no access, so
+/// looking at a row never promotes it.
+pub async fn get_memory_core(
+    store: &MemoryStore,
+    kind: MemoryKind,
+    id: i64,
+) -> Result<Option<MemoryAdminRow>, MemoryError> {
+    store
+        .conn
+        .call(move |c| -> rusqlite::Result<Option<MemoryAdminRow>> {
+            use rusqlite::OptionalExtension;
+            match kind {
+                MemoryKind::Memory => c
+                    .query_row(&format!("{SELECT_MEMORY} WHERE id = ?1"), [id], map_memory_row)
+                    .optional(),
+                MemoryKind::Episodic => c
+                    .query_row(
+                        &format!("{SELECT_EPISODIC} WHERE id = ?1"),
+                        [id],
+                        map_episodic_row,
+                    )
+                    .optional(),
+                MemoryKind::Procedural => c
+                    .query_row(
+                        &format!("{SELECT_PROCEDURAL} WHERE id = ?1"),
+                        [id],
+                        map_procedural_row,
+                    )
+                    .optional(),
+            }
+        })
+        .await
+        .map_err(|e| match e {
+            tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
+            tokio_rusqlite::Error::ConnectionClosed => {
+                MemoryError::Backend("connection closed during get_memory_core".into())
+            }
+            other => MemoryError::Backend(other.to_string()),
+        })
+}
+
 fn query_memory_rows(
     c: &rusqlite::Connection,
-    tier: Option<i64>,
-    memory_type: Option<&str>,
+    filter: &RowFilter,
     limit: i64,
     offset: i64,
 ) -> rusqlite::Result<Vec<MemoryAdminRow>> {
-    let mut sql = String::from(
-        "SELECT id, scope, agent_id, project_id, memory_type, content, tier, importance, \
-         status, access_count, created_at, last_accessed_at, superseded_by, deleted_at \
-         FROM memory WHERE deleted_at IS NULL",
-    );
+    let mut sql = format!("{SELECT_MEMORY} WHERE deleted_at IS NULL");
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
-    if let Some(t) = tier {
-        sql.push_str(" AND tier = ?");
-        params.push(rusqlite::types::Value::Integer(t));
-    }
-    if let Some(mt) = memory_type {
-        sql.push_str(" AND memory_type = ?");
-        params.push(rusqlite::types::Value::Text(mt.to_string()));
-    }
-    sql.push_str(" ORDER BY created_at DESC LIMIT ? OFFSET ?");
+    push_filters(&mut sql, &mut params, filter, true);
+    sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?");
     params.push(rusqlite::types::Value::Integer(limit));
     params.push(rusqlite::types::Value::Integer(offset));
 
     let mut stmt = c.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
-        Ok(MemoryAdminRow {
-            id: row.get(0)?,
-            kind: MemoryKind::Memory,
-            scope: row.get(1)?,
-            agent_id: row.get(2)?,
-            project_id: row.get(3)?,
-            memory_type: row.get(4)?,
-            summary: row.get(5)?,
-            tier: row.get(6)?,
-            importance: row.get(7)?,
-            status: row.get(8)?,
-            access_count: row.get(9)?,
-            created_at: row.get(10)?,
-            last_accessed_at: row.get(11)?,
-            superseded_by: row.get(12)?,
-            deleted_at: row.get(13)?,
-            success_count: None,
-            trigger: None,
-            source_trajectory_ids: None,
-        })
-    })?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params), map_memory_row)?;
     let mut out = Vec::new();
     for r in rows {
         out.push(r?);
     }
     Ok(out)
+}
+
+fn map_memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryAdminRow> {
+    Ok(MemoryAdminRow {
+        id: row.get(0)?,
+        kind: MemoryKind::Memory,
+        scope: row.get(1)?,
+        agent_id: row.get(2)?,
+        project_id: row.get(3)?,
+        memory_type: row.get(4)?,
+        summary: row.get(5)?,
+        tier: row.get(6)?,
+        importance: row.get(7)?,
+        status: row.get(8)?,
+        access_count: row.get(9)?,
+        created_at: row.get(10)?,
+        last_accessed_at: row.get(11)?,
+        superseded_by: row.get(12)?,
+        deleted_at: row.get(13)?,
+        success_count: None,
+        trigger: None,
+        source_trajectory_ids: None,
+        source: Some(row.get(14)?),
+        source_session_id: row.get(15)?,
+        created_by_type: Some(row.get(16)?),
+        created_by_ref: Some(row.get(17)?),
+        last_modified_at: Some(row.get(18)?),
+        update_count: Some(row.get(19)?),
+        dispute_count: Some(row.get(20)?),
+        disputed_against: row.get(21)?,
+        last_disputed_at: row.get(22)?,
+    })
 }
 
 fn query_episodic_rows(
     c: &rusqlite::Connection,
-    tier: Option<i64>,
+    filter: &RowFilter,
     limit: i64,
     offset: i64,
 ) -> rusqlite::Result<Vec<MemoryAdminRow>> {
-    let mut sql = String::from(
-        "SELECT id, scope, agent_id, project_id, task, tier, importance, status, \
-         access_count, created_at, last_accessed_at, superseded_by, deleted_at \
-         FROM episodic_trajectory WHERE deleted_at IS NULL",
-    );
+    let mut sql = format!("{SELECT_EPISODIC} WHERE deleted_at IS NULL");
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
-    if let Some(t) = tier {
-        sql.push_str(" AND tier = ?");
-        params.push(rusqlite::types::Value::Integer(t));
-    }
-    sql.push_str(" ORDER BY created_at DESC LIMIT ? OFFSET ?");
+    push_filters(&mut sql, &mut params, filter, false);
+    sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?");
     params.push(rusqlite::types::Value::Integer(limit));
     params.push(rusqlite::types::Value::Integer(offset));
 
     let mut stmt = c.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
-        Ok(MemoryAdminRow {
-            id: row.get(0)?,
-            kind: MemoryKind::Episodic,
-            scope: row.get(1)?,
-            agent_id: row.get(2)?,
-            project_id: row.get(3)?,
-            memory_type: None,
-            summary: row.get(4)?,
-            tier: row.get(5)?,
-            importance: row.get(6)?,
-            status: row.get(7)?,
-            access_count: row.get(8)?,
-            created_at: row.get(9)?,
-            last_accessed_at: row.get(10)?,
-            superseded_by: row.get(11)?,
-            deleted_at: row.get(12)?,
-            success_count: None,
-            trigger: None,
-            source_trajectory_ids: None,
-        })
-    })?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params), map_episodic_row)?;
     let mut out = Vec::new();
     for r in rows {
         out.push(r?);
@@ -494,55 +607,258 @@ fn query_episodic_rows(
     Ok(out)
 }
 
+fn map_episodic_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryAdminRow> {
+    Ok(MemoryAdminRow {
+        id: row.get(0)?,
+        kind: MemoryKind::Episodic,
+        scope: row.get(1)?,
+        agent_id: row.get(2)?,
+        project_id: row.get(3)?,
+        memory_type: None,
+        summary: row.get(4)?,
+        tier: row.get(5)?,
+        importance: row.get(6)?,
+        status: row.get(7)?,
+        access_count: row.get(8)?,
+        created_at: row.get(9)?,
+        last_accessed_at: row.get(10)?,
+        superseded_by: row.get(11)?,
+        deleted_at: row.get(12)?,
+        success_count: None,
+        trigger: None,
+        source_trajectory_ids: None,
+        source: None,
+        source_session_id: None,
+        created_by_type: None,
+        created_by_ref: None,
+        last_modified_at: None,
+        update_count: None,
+        dispute_count: None,
+        disputed_against: None,
+        last_disputed_at: None,
+    })
+}
+
 fn query_procedural_rows(
     c: &rusqlite::Connection,
-    tier: Option<i64>,
+    filter: &RowFilter,
     limit: i64,
     offset: i64,
 ) -> rusqlite::Result<Vec<MemoryAdminRow>> {
-    let mut sql = String::from(
-        "SELECT id, scope, agent_id, project_id, skill_name, tier, importance, status, \
-         access_count, created_at, last_accessed_at, superseded_by, deleted_at, \
-         success_count, trigger, source_trajectory_ids \
-         FROM procedural_skill WHERE deleted_at IS NULL",
-    );
+    let mut sql = format!("{SELECT_PROCEDURAL} WHERE deleted_at IS NULL");
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
-    if let Some(t) = tier {
-        sql.push_str(" AND tier = ?");
-        params.push(rusqlite::types::Value::Integer(t));
-    }
-    sql.push_str(" ORDER BY created_at DESC LIMIT ? OFFSET ?");
+    push_filters(&mut sql, &mut params, filter, false);
+    sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?");
     params.push(rusqlite::types::Value::Integer(limit));
     params.push(rusqlite::types::Value::Integer(offset));
 
     let mut stmt = c.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
-        Ok(MemoryAdminRow {
-            id: row.get(0)?,
-            kind: MemoryKind::Procedural,
-            scope: row.get(1)?,
-            agent_id: row.get(2)?,
-            project_id: row.get(3)?,
-            memory_type: None,
-            summary: row.get(4)?,
-            tier: row.get(5)?,
-            importance: row.get(6)?,
-            status: row.get(7)?,
-            access_count: row.get(8)?,
-            created_at: row.get(9)?,
-            last_accessed_at: row.get(10)?,
-            superseded_by: row.get(11)?,
-            deleted_at: row.get(12)?,
-            success_count: Some(row.get(13)?),
-            trigger: Some(row.get(14)?),
-            source_trajectory_ids: Some(row.get(15)?),
-        })
-    })?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params), map_procedural_row)?;
     let mut out = Vec::new();
     for r in rows {
         out.push(r?);
     }
     Ok(out)
+}
+
+fn map_procedural_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryAdminRow> {
+    Ok(MemoryAdminRow {
+        id: row.get(0)?,
+        kind: MemoryKind::Procedural,
+        scope: row.get(1)?,
+        agent_id: row.get(2)?,
+        project_id: row.get(3)?,
+        memory_type: None,
+        summary: row.get(4)?,
+        tier: row.get(5)?,
+        importance: row.get(6)?,
+        status: row.get(7)?,
+        access_count: row.get(8)?,
+        created_at: row.get(9)?,
+        last_accessed_at: row.get(10)?,
+        superseded_by: row.get(11)?,
+        deleted_at: row.get(12)?,
+        success_count: Some(row.get(13)?),
+        trigger: Some(row.get(14)?),
+        source_trajectory_ids: Some(row.get(15)?),
+        source: None,
+        source_session_id: None,
+        created_by_type: None,
+        created_by_ref: None,
+        last_modified_at: None,
+        update_count: None,
+        dispute_count: None,
+        disputed_against: None,
+        last_disputed_at: None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// memory_stats — what is stored, at a glance. Live rows only, with the
+// soft-deleted ones reported apart so a total is never silently inflated by
+// rows nothing can return any more.
+// ---------------------------------------------------------------------------
+
+/// Optional narrowing applied to every figure in [`MemoryStats`].
+#[derive(Debug, Clone, Default)]
+pub struct StatsParams {
+    pub agent_id: Option<String>,
+    pub project_id: Option<String>,
+}
+
+/// One bucket of a grouping. `key: None` is the NULL bucket (rows with no
+/// project, for instance), kept distinct from any real value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Count {
+    pub key: Option<String>,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StatsTotals {
+    pub memory: u64,
+    pub episodic: u64,
+    pub procedural: u64,
+    /// Soft-deleted rows across the three tables; not part of the live counts.
+    pub deleted: u64,
+}
+
+/// Snapshot of the stores. The groupings cover `memory` only: type and the
+/// dispute lifecycle are not columns of the other two tables.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MemoryStats {
+    pub totals: StatsTotals,
+    pub by_type: Vec<Count>,
+    pub by_tier: Vec<Count>,
+    pub by_status: Vec<Count>,
+    pub by_agent: Vec<Count>,
+    pub by_project: Vec<Count>,
+    /// Newest `created_at` (ms) among live rows of any table.
+    pub newest_created_at: Option<i64>,
+}
+
+/// The `memory` column a grouping is computed over. An enum with an exhaustive
+/// match, so the SQL fragment is always one of these literals and never text
+/// that came from a caller.
+#[derive(Clone, Copy)]
+enum GroupBy {
+    Type,
+    Tier,
+    Status,
+    Agent,
+    Project,
+}
+
+impl GroupBy {
+    fn column(self) -> &'static str {
+        match self {
+            GroupBy::Type => "memory_type",
+            GroupBy::Tier => "CAST(tier AS TEXT)",
+            GroupBy::Status => "status",
+            GroupBy::Agent => "agent_id",
+            GroupBy::Project => "project_id",
+        }
+    }
+}
+
+const STATS_TABLES: [&str; 3] = ["memory", "episodic_trajectory", "procedural_skill"];
+
+fn stats_where(deleted: bool, filter: &RowFilter) -> (String, Vec<rusqlite::types::Value>) {
+    let mut sql = String::from(if deleted {
+        " WHERE deleted_at IS NOT NULL"
+    } else {
+        " WHERE deleted_at IS NULL"
+    });
+    let mut params = Vec::new();
+    push_filters(&mut sql, &mut params, filter, false);
+    (sql, params)
+}
+
+fn count_rows(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    deleted: bool,
+    filter: &RowFilter,
+) -> rusqlite::Result<u64> {
+    let (clause, params) = stats_where(deleted, filter);
+    tx.query_row(
+        &format!("SELECT COUNT(*) FROM {table}{clause}"),
+        rusqlite::params_from_iter(params),
+        |r| r.get(0),
+    )
+}
+
+fn group_memory(
+    tx: &rusqlite::Transaction<'_>,
+    by: GroupBy,
+    filter: &RowFilter,
+) -> rusqlite::Result<Vec<Count>> {
+    let (clause, params) = stats_where(false, filter);
+    let col = by.column();
+    let mut stmt = tx.prepare(&format!(
+        "SELECT {col}, COUNT(*) FROM memory{clause} GROUP BY 1 ORDER BY 2 DESC, 1 ASC"
+    ))?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
+        Ok(Count { key: r.get(0)?, count: r.get(1)? })
+    })?;
+    rows.collect()
+}
+
+/// Computes [`MemoryStats`] inside a single transaction so the totals and the
+/// groupings describe the same instant even while the ingest worker writes.
+pub async fn memory_stats_core(
+    store: &MemoryStore,
+    params: StatsParams,
+) -> Result<MemoryStats, MemoryError> {
+    let filter = RowFilter {
+        agent_id: params.agent_id,
+        project_id: params.project_id,
+        ..Default::default()
+    };
+
+    store
+        .conn
+        .call(move |c| -> rusqlite::Result<MemoryStats> {
+            let tx = c.transaction()?;
+            let mut live = [0u64; 3];
+            let mut deleted = 0;
+            let mut newest: Option<i64> = None;
+            for (slot, table) in live.iter_mut().zip(STATS_TABLES) {
+                *slot = count_rows(&tx, table, false, &filter)?;
+                deleted += count_rows(&tx, table, true, &filter)?;
+                let (clause, params) = stats_where(false, &filter);
+                let max: Option<i64> = tx.query_row(
+                    &format!("SELECT MAX(created_at) FROM {table}{clause}"),
+                    rusqlite::params_from_iter(params),
+                    |r| r.get(0),
+                )?;
+                newest = newest.max(max);
+            }
+            let stats = MemoryStats {
+                totals: StatsTotals {
+                    memory: live[0],
+                    episodic: live[1],
+                    procedural: live[2],
+                    deleted,
+                },
+                by_type: group_memory(&tx, GroupBy::Type, &filter)?,
+                by_tier: group_memory(&tx, GroupBy::Tier, &filter)?,
+                by_status: group_memory(&tx, GroupBy::Status, &filter)?,
+                by_agent: group_memory(&tx, GroupBy::Agent, &filter)?,
+                by_project: group_memory(&tx, GroupBy::Project, &filter)?,
+                newest_created_at: newest,
+            };
+            tx.commit()?;
+            Ok(stats)
+        })
+        .await
+        .map_err(|e| match e {
+            tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
+            tokio_rusqlite::Error::ConnectionClosed => {
+                MemoryError::Backend("connection closed during memory_stats_core".into())
+            }
+            other => MemoryError::Backend(other.to_string()),
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -1788,6 +2104,508 @@ mod tests {
         assert_eq!(page1.len(), 2);
         assert_eq!(page2.len(), 2);
         assert_ne!(page1[0].id, page2[0].id, "offset must shift the page window");
+    }
+
+    // Fragments of one save share `created_at`; without a tiebreak the page
+    // boundaries between equal timestamps are undefined.
+    #[tokio::test]
+    async fn list_memories_ties_on_created_at_order_by_id_desc() {
+        for kind in [Some(MemoryKind::Memory), None] {
+            let store = MemoryStore::new_for_test().await.unwrap();
+            let mut ids = Vec::new();
+            for _ in 0..5 {
+                ids.push(seed_memory_full(&store, "chat_message", 3, "active", false, 100).await);
+            }
+            let expected: Vec<i64> = ids.iter().rev().copied().collect();
+
+            let all = list_memories_core(&store, ListParams { kind, ..Default::default() })
+                .await
+                .unwrap();
+            assert_eq!(all.iter().map(|r| r.id).collect::<Vec<_>>(), expected, "kind={kind:?}");
+
+            let mut paged = Vec::new();
+            for offset in [0u32, 2, 4] {
+                let page = list_memories_core(
+                    &store,
+                    ListParams { kind, limit: Some(2), offset: Some(offset), ..Default::default() },
+                )
+                .await
+                .unwrap();
+                paged.extend(page.iter().map(|r| r.id));
+            }
+            assert_eq!(paged, expected, "pages must neither overlap nor skip, kind={kind:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn list_memories_memory_row_carries_provenance() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        store
+            .conn
+            .call(|c| {
+                c.execute(
+                    "INSERT INTO memory \
+                     (scope, agent_id, content, memory_type, source, source_session_id, \
+                      created_at, created_by_type, created_by_ref, last_modified_at, \
+                      update_count, last_accessed_at, dispute_count, disputed_against, \
+                      last_disputed_at, status) \
+                     VALUES ('agent', 'a1', 'body', 'observation', 'explicit', 'sess-9', \
+                             10, 'user', 'marco', 20, 3, 30, 2, '[7,8]', 40, 'disputed')",
+                    [],
+                )
+            })
+            .await
+            .unwrap();
+
+        let rows = list_memories_core(&store, ListParams::default()).await.unwrap();
+
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.source.as_deref(), Some("explicit"));
+        assert_eq!(row.source_session_id.as_deref(), Some("sess-9"));
+        assert_eq!(row.created_by_type.as_deref(), Some("user"));
+        assert_eq!(row.created_by_ref.as_deref(), Some("marco"));
+        assert_eq!(row.last_modified_at, Some(20));
+        assert_eq!(row.update_count, Some(3));
+        assert_eq!(row.dispute_count, Some(2));
+        assert_eq!(row.disputed_against.as_deref(), Some("[7,8]"));
+        assert_eq!(row.last_disputed_at, Some(40));
+    }
+
+    #[tokio::test]
+    async fn episodic_row_has_no_source() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed_episodic_row(&store, 3, 5.0).await;
+        seed_procedural_row(&store, 1, 8.0).await;
+
+        let rows = list_memories_core(&store, ListParams::default()).await.unwrap();
+
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row.source, None, "{row:?}");
+            assert_eq!(row.source_session_id, None, "{row:?}");
+            assert_eq!(row.created_by_type, None, "{row:?}");
+            assert_eq!(row.created_by_ref, None, "{row:?}");
+            assert_eq!(row.last_modified_at, None, "{row:?}");
+            assert_eq!(row.update_count, None, "{row:?}");
+            assert_eq!(row.dispute_count, None, "{row:?}");
+            assert_eq!(row.disputed_against, None, "{row:?}");
+            assert_eq!(row.last_disputed_at, None, "{row:?}");
+        }
+    }
+
+    // ── list_memories_core filters ──────────────────
+
+    async fn seed_memory_scoped(
+        store: &MemoryStore,
+        content: &str,
+        agent: &str,
+        project: Option<&str>,
+        status: &str,
+    ) -> i64 {
+        let (content, agent, project, status) = (
+            content.to_string(),
+            agent.to_string(),
+            project.map(str::to_string),
+            status.to_string(),
+        );
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<i64> {
+                c.execute(
+                    "INSERT INTO memory \
+                     (scope, agent_id, project_id, content, memory_type, status, \
+                      created_at, last_modified_at, last_accessed_at, \
+                      created_by_type, created_by_ref) \
+                     VALUES ('agent', ?, ?, ?, 'observation', ?, 0, 0, 0, 'agent', '')",
+                    rusqlite::params![agent, project, content, status],
+                )?;
+                Ok(c.last_insert_rowid())
+            })
+            .await
+            .expect("seed_memory_scoped failed")
+    }
+
+    async fn seed_episodic_scoped(store: &MemoryStore, agent: &str, task: &str) {
+        let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
+        let (agent, task) = (agent.to_string(), task.to_string());
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO episodic_trajectory \
+                     (scope, agent_id, session_id, task, created_at, last_modified_at, \
+                      last_accessed_at, created_by_type, created_by_ref) \
+                     VALUES ('agent', ?, ?, ?, 0, 0, 0, 'agent', '')",
+                    rusqlite::params![agent, format!("sess-scoped-{nonce}"), task],
+                )
+            })
+            .await
+            .expect("seed_episodic_scoped failed");
+    }
+
+    async fn seed_procedural_scoped(store: &MemoryStore, agent: &str) {
+        let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
+        let agent = agent.to_string();
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO procedural_skill \
+                     (scope, agent_id, skill_name, trigger, promoted_at, \
+                      source_trajectory_ids, created_at, last_modified_at, \
+                      last_accessed_at, created_by_type, created_by_ref) \
+                     VALUES ('agent', ?, ?, 'trig', 0, '[]', 0, 0, 0, 'agent', '')",
+                    rusqlite::params![agent, format!("skill-scoped-{nonce}")],
+                )
+            })
+            .await
+            .expect("seed_procedural_scoped failed");
+    }
+
+    fn ids_of(rows: &[MemoryAdminRow]) -> Vec<i64> {
+        let mut ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[tokio::test]
+    async fn list_filters_by_agent() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let a = seed_memory_scoped(&store, "one", "agent-a", None, "active").await;
+        seed_memory_scoped(&store, "two", "agent-b", None, "active").await;
+
+        let rows = list_memories_core(
+            &store,
+            ListParams { agent_id: Some("agent-a".into()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ids_of(&rows), vec![a]);
+    }
+
+    #[tokio::test]
+    async fn list_filters_by_project() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let exact = seed_memory_scoped(&store, "one", "a", Some("proj"), "active").await;
+        seed_memory_scoped(&store, "two", "a", Some("proj-2"), "active").await;
+        seed_memory_scoped(&store, "three", "a", None, "active").await;
+
+        let rows = list_memories_core(
+            &store,
+            ListParams { project_id: Some("proj".into()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ids_of(&rows), vec![exact], "project filter is equality, not prefix");
+    }
+
+    #[tokio::test]
+    async fn list_filters_by_status() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed_memory_scoped(&store, "one", "a", None, "active").await;
+        let disputed = seed_memory_scoped(&store, "two", "a", None, "disputed").await;
+        seed_memory_scoped(&store, "three", "a", None, "superseded").await;
+
+        let rows = list_memories_core(
+            &store,
+            ListParams { status: Some("disputed".into()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ids_of(&rows), vec![disputed]);
+    }
+
+    #[tokio::test]
+    async fn agent_filter_applies_to_every_kind() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed_memory_scoped(&store, "m1", "a1", None, "active").await;
+        seed_memory_scoped(&store, "m2", "a2", None, "active").await;
+        seed_episodic_scoped(&store, "a1", "t1").await;
+        seed_episodic_scoped(&store, "a2", "t2").await;
+        seed_procedural_scoped(&store, "a1").await;
+        seed_procedural_scoped(&store, "a2").await;
+
+        let rows = list_memories_core(
+            &store,
+            ListParams { agent_id: Some("a1".into()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(rows.iter().all(|r| r.agent_id.as_deref() == Some("a1")));
+        let mut kinds: Vec<_> = rows.iter().map(|r| format!("{:?}", r.kind)).collect();
+        kinds.sort();
+        assert_eq!(kinds, ["Episodic", "Memory", "Procedural"]);
+    }
+
+    #[tokio::test]
+    async fn viewer_match_is_prefix_and_folds_accents() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let id = seed_memory_scoped(&store, "la configuración del núcleo", "a", None, "active").await;
+        seed_memory_scoped(&store, "otra cosa distinta", "a", None, "active").await;
+
+        for query in ["configuracion", "config", "CONFIGURACIÓN nucleo"] {
+            let rows = list_memories_core(
+                &store,
+                ListParams { query: Some(query.into()), ..Default::default() },
+            )
+            .await
+            .unwrap();
+            assert_eq!(ids_of(&rows), vec![id], "query {query:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn text_query_requires_every_token_across_rows() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let both = seed_memory_scoped(&store, "alpha and beta together", "a", None, "active").await;
+        seed_memory_scoped(&store, "only alpha here", "a", None, "active").await;
+
+        let rows = list_memories_core(
+            &store,
+            ListParams { query: Some("alpha beta".into()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ids_of(&rows), vec![both]);
+    }
+
+    #[tokio::test]
+    async fn query_skips_tables_without_text_index() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed_episodic_scoped(&store, "a", "unrelated task").await;
+        seed_procedural_scoped(&store, "a").await;
+
+        let rows = list_memories_core(
+            &store,
+            ListParams { query: Some("needle".into()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rows.len(), 2, "episodic and procedural have no text index: {rows:?}");
+    }
+
+    // ── get_memory_core ─────────────────────────────
+
+    #[tokio::test]
+    async fn get_memory_by_kind_and_id() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let mem = seed_memory_scoped(&store, "full body text", "a1", Some("p1"), "active").await;
+        let proc_id = seed_procedural_full(&store, 4, "on failure", "[1]").await;
+
+        let row = get_memory_core(&store, MemoryKind::Memory, mem).await.unwrap().unwrap();
+        assert_eq!(row.kind, MemoryKind::Memory);
+        assert_eq!(row.summary, "full body text");
+        assert_eq!(row.agent_id.as_deref(), Some("a1"));
+        assert_eq!(row.project_id.as_deref(), Some("p1"));
+        assert_eq!(row.source.as_deref(), Some("agent"));
+
+        let skill = get_memory_core(&store, MemoryKind::Procedural, proc_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(skill.kind, MemoryKind::Procedural);
+        assert_eq!(skill.trigger.as_deref(), Some("on failure"));
+        assert_eq!(skill.success_count, Some(4));
+    }
+
+    #[tokio::test]
+    async fn get_kind_disambiguates_colliding_ids() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let mem_id = seed_memory_scoped(&store, "a memory", "a", None, "active").await;
+        seed_episodic_scoped(&store, "a", "an episode").await;
+        let epi_id = mem_id; // fresh tables: both first rows get id 1
+        assert_eq!(
+            get_memory_core(&store, MemoryKind::Episodic, epi_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .summary,
+            "an episode"
+        );
+        assert_eq!(
+            get_memory_core(&store, MemoryKind::Memory, mem_id).await.unwrap().unwrap().summary,
+            "a memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_missing_is_none() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed_memory_scoped(&store, "x", "a", None, "active").await;
+
+        assert!(get_memory_core(&store, MemoryKind::Memory, 999).await.unwrap().is_none());
+        assert!(get_memory_core(&store, MemoryKind::Procedural, 1).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_returns_soft_deleted() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let id = seed_memory_scoped(&store, "gone", "a", None, "active").await;
+        delete_memory_core(&store, id, MemoryKind::Memory).await.unwrap();
+
+        let row = get_memory_core(&store, MemoryKind::Memory, id).await.unwrap().unwrap();
+
+        assert!(row.deleted_at.is_some());
+        assert_eq!(row.summary, "gone");
+    }
+
+    #[tokio::test]
+    async fn get_does_not_touch_access_count() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let id = seed_memory_scoped(&store, "x", "a", None, "active").await;
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE memory SET access_count = 7, last_accessed_at = 55 WHERE id = ?1",
+                    [id],
+                )
+            })
+            .await
+            .unwrap();
+
+        for _ in 0..2 {
+            let row = get_memory_core(&store, MemoryKind::Memory, id).await.unwrap().unwrap();
+            assert_eq!((row.access_count, row.last_accessed_at), (7, 55));
+        }
+    }
+
+    // ── memory_stats_core ───────────────────────────
+
+    async fn seed_stat_row(
+        store: &MemoryStore,
+        (memory_type, tier, status): (&str, i64, &str),
+        (agent, project): (&str, Option<&str>),
+        created_at: i64,
+        deleted: bool,
+    ) {
+        let (memory_type, status, agent, project) = (
+            memory_type.to_string(),
+            status.to_string(),
+            agent.to_string(),
+            project.map(str::to_string),
+        );
+        let deleted_at: Option<i64> = deleted.then_some(1);
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO memory \
+                     (scope, agent_id, project_id, content, memory_type, tier, status, \
+                      created_at, last_modified_at, last_accessed_at, \
+                      created_by_type, created_by_ref, deleted_at) \
+                     VALUES ('agent', ?, ?, 'c', ?, ?, ?, ?, 0, 0, 'agent', '', ?)",
+                    rusqlite::params![agent, project, memory_type, tier, status, created_at, deleted_at],
+                )
+            })
+            .await
+            .expect("seed_stat_row failed");
+    }
+
+    fn count(key: Option<&str>, n: u64) -> Count {
+        Count { key: key.map(str::to_string), count: n }
+    }
+
+    #[tokio::test]
+    async fn stats_counts_live_per_kind_and_deleted_apart() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed_memory_full(&store, "observation", 3, "active", false, 10).await;
+        seed_memory_full(&store, "observation", 3, "active", false, 20).await;
+        seed_memory_full(&store, "observation", 3, "active", true, 30).await;
+        seed_episodic_row(&store, 3, 5.0).await;
+        seed_procedural_row(&store, 1, 8.0).await;
+        let gone = seed_procedural_row(&store, 1, 8.0).await;
+        delete_memory_core(&store, gone, MemoryKind::Procedural).await.unwrap();
+
+        let stats = memory_stats_core(&store, StatsParams::default()).await.unwrap();
+
+        assert_eq!(
+            stats.totals,
+            StatsTotals { memory: 2, episodic: 1, procedural: 1, deleted: 2 }
+        );
+        assert_eq!(stats.newest_created_at, Some(20), "newest live row, deleted ones ignored");
+    }
+
+    #[tokio::test]
+    async fn stats_groups_by_type_tier_status_agent_project() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed_stat_row(&store, ("fact", 1, "active"), ("a2", Some("p1")), 1, false).await;
+        seed_stat_row(&store, ("fact", 3, "active"), ("a1", Some("p1")), 2, false).await;
+        seed_stat_row(&store, ("note", 3, "disputed"), ("a1", Some("p2")), 3, false).await;
+        // Deleted rows must not reach any grouping.
+        seed_stat_row(&store, ("ghost", 2, "superseded"), ("a9", Some("p9")), 4, true).await;
+
+        let stats = memory_stats_core(&store, StatsParams::default()).await.unwrap();
+
+        assert_eq!(stats.by_type, vec![count(Some("fact"), 2), count(Some("note"), 1)]);
+        assert_eq!(stats.by_tier, vec![count(Some("3"), 2), count(Some("1"), 1)]);
+        assert_eq!(stats.by_status, vec![count(Some("active"), 2), count(Some("disputed"), 1)]);
+        assert_eq!(stats.by_agent, vec![count(Some("a1"), 2), count(Some("a2"), 1)]);
+        assert_eq!(stats.by_project, vec![count(Some("p1"), 2), count(Some("p2"), 1)]);
+    }
+
+    #[tokio::test]
+    async fn stats_filters_by_agent_and_project() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed_stat_row(&store, ("fact", 3, "active"), ("a1", Some("p1")), 1, false).await;
+        seed_stat_row(&store, ("fact", 3, "active"), ("a1", Some("p2")), 2, false).await;
+        seed_stat_row(&store, ("fact", 3, "active"), ("a2", Some("p1")), 3, false).await;
+        seed_stat_row(&store, ("fact", 3, "active"), ("a1", Some("p1")), 4, true).await;
+        seed_episodic_scoped(&store, "a1", "t").await;
+        seed_episodic_scoped(&store, "a2", "t").await;
+
+        let stats = memory_stats_core(
+            &store,
+            StatsParams { agent_id: Some("a1".into()), project_id: Some("p1".into()) },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.totals.memory, 1);
+        assert_eq!(stats.totals.deleted, 1);
+        assert_eq!(stats.by_agent, vec![count(Some("a1"), 1)]);
+        assert_eq!(stats.by_project, vec![count(Some("p1"), 1)]);
+
+        let by_agent = memory_stats_core(
+            &store,
+            StatsParams { agent_id: Some("a1".into()), project_id: None },
+        )
+        .await
+        .unwrap();
+        assert_eq!((by_agent.totals.memory, by_agent.totals.episodic), (2, 1));
+    }
+
+    #[tokio::test]
+    async fn stats_empty_store_is_zero() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+
+        let stats = memory_stats_core(&store, StatsParams::default()).await.unwrap();
+
+        assert_eq!(stats.totals, StatsTotals { memory: 0, episodic: 0, procedural: 0, deleted: 0 });
+        assert!(stats.by_type.is_empty() && stats.by_tier.is_empty());
+        assert!(stats.by_status.is_empty() && stats.by_agent.is_empty());
+        assert!(stats.by_project.is_empty());
+        assert_eq!(stats.newest_created_at, None);
+    }
+
+    #[tokio::test]
+    async fn stats_null_project_is_own_bucket() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed_stat_row(&store, ("fact", 3, "active"), ("a", None), 1, false).await;
+        seed_stat_row(&store, ("fact", 3, "active"), ("a", None), 2, false).await;
+        seed_stat_row(&store, ("fact", 3, "active"), ("a", Some("p")), 3, false).await;
+
+        let stats = memory_stats_core(&store, StatsParams::default()).await.unwrap();
+
+        assert_eq!(stats.by_project, vec![count(None, 2), count(Some("p"), 1)]);
     }
 
     // Deleted_at excluded; status='superseded' visible.

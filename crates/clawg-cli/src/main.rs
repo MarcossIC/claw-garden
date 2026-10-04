@@ -12,10 +12,11 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use clawg_cli::cli::{Cli, Command, PathAction};
-use clawg_cli::client::{ClientError, DaemonClient};
-use clawg_cli::daemon::lifecycle::read_state;
+use clawg_cli::client::{probe_running, ClientError, DaemonClient, Probe};
+use clawg_cli::daemon::lifecycle::{now_ms, read_state};
 use clawg_cli::daemon::serve;
 use clawg_cli::mcp;
+use clawg_cli::memories;
 use clawg_cli::status::status_report;
 use clawg_cli::stop::{stop_in, STOP_TIMEOUT};
 use clawg_core::paths::data_dir;
@@ -107,6 +108,26 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                     other => other.to_string(),
                 })?;
             println!("stopped the {} daemon (pid {pid})", profile.as_str());
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Memories { action } => {
+            let profile = action.profile().resolve().map_err(|e| e.to_string())?;
+            let unavailable = |e: ClientError| memories::explain_unavailable(&e, profile);
+
+            // No autostart: reading must not launch a process, and a daemon
+            // the user did not ask for would also hold the store lock.
+            let client = match probe_running(&data_dir(profile), false)
+                .await
+                .map_err(unavailable)?
+            {
+                Probe::Running(client) => client,
+                Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
+            };
+            let out = memories::run(&client, action, now_ms() as i64)
+                .await
+                .map_err(unavailable)?;
+            println!("{out}");
             Ok(ExitCode::SUCCESS)
         }
 

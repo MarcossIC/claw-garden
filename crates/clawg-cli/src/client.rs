@@ -52,6 +52,10 @@ pub enum ClientError {
     Daemon { status: u16, message: String },
     #[error("transport error talking to the daemon: {0}")]
     Http(String),
+    /// `--here` needs the current directory to name the project, and the
+    /// operating system would not give it.
+    #[error("cannot read the current directory for --here: {0}")]
+    WorkingDir(String),
     #[error("could not start a daemon: {0}")]
     Spawn(String),
     #[error("timed out after {0:?} waiting for the daemon to start")]
@@ -107,18 +111,91 @@ pub struct Hit {
 }
 
 /// One inventory row from `GET /v1/memories`.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// Every field past `access_count` is optional and defaulted: a daemon that
+/// predates them omits the keys, and the MCP bridge must keep reading it.
+/// Serialized under the API's own field names, which is what `--json` prints.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct MemoryRow {
     pub id: i64,
     /// `"memory"` | `"episodic"` | `"procedural"` (lowercase — `MemoryKind`,
     /// not `TableKind`; the two spellings are a known wart in core).
     pub kind: String,
     pub memory_type: Option<String>,
+    /// The row's full content, not a preview.
     pub summary: String,
     pub tier: i64,
     pub importance: f64,
     pub status: String,
     pub access_count: i64,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<i64>,
+    #[serde(default)]
+    pub last_accessed_at: Option<i64>,
+    #[serde(default)]
+    pub superseded_by: Option<i64>,
+    #[serde(default)]
+    pub deleted_at: Option<i64>,
+    #[serde(default)]
+    pub success_count: Option<i64>,
+    #[serde(default)]
+    pub trigger: Option<String>,
+    #[serde(default)]
+    pub source_trajectory_ids: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub source_session_id: Option<String>,
+    #[serde(default)]
+    pub created_by_type: Option<String>,
+    #[serde(default)]
+    pub created_by_ref: Option<String>,
+    #[serde(default)]
+    pub last_modified_at: Option<i64>,
+    #[serde(default)]
+    pub update_count: Option<i64>,
+    #[serde(default)]
+    pub dispute_count: Option<i64>,
+    /// Raw JSON text of the ids this row disputes.
+    #[serde(default)]
+    pub disputed_against: Option<String>,
+    #[serde(default)]
+    pub last_disputed_at: Option<i64>,
+}
+
+/// One bucket of a grouping from `GET /v1/stats`. `key: None` is the NULL
+/// bucket (rows with no project, say).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Count {
+    pub key: Option<String>,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct StatsTotals {
+    pub memory: u64,
+    pub episodic: u64,
+    pub procedural: u64,
+    /// Soft-deleted rows across the three tables; not part of the live counts.
+    pub deleted: u64,
+}
+
+/// The body of `GET /v1/stats`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MemoryStats {
+    pub totals: StatsTotals,
+    pub by_type: Vec<Count>,
+    pub by_tier: Vec<Count>,
+    pub by_status: Vec<Count>,
+    pub by_agent: Vec<Count>,
+    pub by_project: Vec<Count>,
+    pub newest_created_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -143,6 +220,11 @@ pub struct ListArgs {
     pub kind: Option<String>,
     pub tier: Option<i64>,
     pub memory_type: Option<String>,
+    pub agent: Option<String>,
+    pub project: Option<String>,
+    pub status: Option<String>,
+    /// Free text over memory content; the daemon then lists `memory` rows only.
+    pub q: Option<String>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
 }
@@ -324,6 +406,18 @@ impl DaemonClient {
         if let Some(mt) = &args.memory_type {
             query.push(("memory_type", mt.clone()));
         }
+        if let Some(a) = &args.agent {
+            query.push(("agent", a.clone()));
+        }
+        if let Some(p) = &args.project {
+            query.push(("project", p.clone()));
+        }
+        if let Some(s) = &args.status {
+            query.push(("status", s.clone()));
+        }
+        if let Some(q) = &args.q {
+            query.push(("q", q.clone()));
+        }
         if let Some(l) = args.limit {
             query.push(("limit", l.to_string()));
         }
@@ -340,6 +434,47 @@ impl DaemonClient {
             .await
             .map_err(Self::map_transport)?;
         Ok(Self::read_response::<Body>(resp).await?.items)
+    }
+
+    /// One row with every column, soft-deleted rows included (they carry
+    /// `deleted_at`). A missing row is the daemon's 404.
+    pub async fn get(&self, kind: &str, id: i64) -> Result<MemoryRow, ClientError> {
+        #[derive(Deserialize)]
+        struct Body {
+            item: MemoryRow,
+        }
+        let resp = self
+            .http
+            .get(self.url(&format!("/v1/memories/{kind}/{id}")))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(Self::map_transport)?;
+        Ok(Self::read_response::<Body>(resp).await?.item)
+    }
+
+    /// Counts of what is stored, optionally narrowed to an agent and/or project.
+    pub async fn stats(
+        &self,
+        agent: Option<&str>,
+        project: Option<&str>,
+    ) -> Result<MemoryStats, ClientError> {
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        if let Some(a) = agent {
+            query.push(("agent", a));
+        }
+        if let Some(p) = project {
+            query.push(("project", p));
+        }
+        let resp = self
+            .http
+            .get(self.url("/v1/stats"))
+            .bearer_auth(&self.token)
+            .query(&query)
+            .send()
+            .await
+            .map_err(Self::map_transport)?;
+        Self::read_response(resp).await
     }
 
     pub async fn set_importance(
@@ -578,7 +713,7 @@ pub async fn start_daemon(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -593,13 +728,13 @@ mod tests {
     use crate::daemon::lifecycle::{write_state, write_token, DaemonState};
 
     /// An in-process daemon plus the tempdir holding its lifecycle files.
-    struct TestDaemon {
-        dir: tempfile::TempDir,
+    pub(crate) struct TestDaemon {
+        pub(crate) dir: tempfile::TempDir,
         addr: SocketAddr,
         token: String,
     }
 
-    async fn start_daemon() -> TestDaemon {
+    pub(crate) async fn start_daemon() -> TestDaemon {
         let dir = tempfile::tempdir().expect("tempdir");
         let (runtime, rx) = MemoryRuntime::new_for_test(dir.path().to_path_buf()).await;
         tokio::spawn(runtime.ingest_worker(rx));
@@ -624,7 +759,7 @@ mod tests {
     }
 
     /// Publishes the daemon's lifecycle files so `from_data_dir` can find it.
-    fn publish(d: &TestDaemon) {
+    pub(crate) fn publish(d: &TestDaemon) {
         write_state(
             d.dir.path(),
             &DaemonState {
@@ -1019,5 +1154,154 @@ mod tests {
         publish(&d);
         let c = DaemonClient::from_data_dir(d.dir.path()).expect("client");
         c.shutdown().await.expect("shutdown must be accepted");
+    }
+
+    // ── Viewer reads ────────────────────────────────────────────────────────
+
+    /// Queues one memory and waits until the ingest worker has stored it.
+    pub(crate) async fn save_and_wait(
+        c: &DaemonClient,
+        content: &str,
+        agent: &str,
+        project: Option<&str>,
+        want_rows: usize,
+    ) {
+        c.save(SaveArgs {
+            content: content.into(),
+            agent_id: agent.into(),
+            project_id: project.map(str::to_owned),
+            memory_type: Some("semantic_fact".into()),
+            importance: Some(6.0),
+        })
+        .await
+        .expect("save");
+        for _ in 0..40 {
+            let rows = c.list(ListArgs::default()).await.expect("list");
+            if rows.len() >= want_rows {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("ingest never produced {want_rows} row(s) within 2 s");
+    }
+
+    #[tokio::test]
+    async fn get_reads_one_row() {
+        let d = start_daemon().await;
+        publish(&d);
+        let c = DaemonClient::from_data_dir(d.dir.path()).expect("client");
+        save_and_wait(&c, "the staging database lives in eu-west", "agent-get", Some("proj-x"), 1)
+            .await;
+        let id = c.list(ListArgs::default()).await.expect("list")[0].id;
+
+        let row = c.get("memory", id).await.expect("get");
+        assert_eq!(row.id, id);
+        assert_eq!(row.kind, "memory");
+        assert_eq!(row.summary, "the staging database lives in eu-west");
+        assert_eq!(row.agent_id.as_deref(), Some("agent-get"));
+        assert_eq!(row.project_id.as_deref(), Some("proj-x"));
+        assert_eq!(row.source.as_deref(), Some("explicit"));
+        assert_eq!(row.update_count, Some(0));
+        assert!(row.created_at.is_some_and(|t| t > 0), "{row:?}");
+        assert_eq!(row.deleted_at, None);
+    }
+
+    #[tokio::test]
+    async fn get_missing_maps_to_daemon_404() {
+        let d = start_daemon().await;
+        publish(&d);
+        let c = DaemonClient::from_data_dir(d.dir.path()).expect("client");
+
+        match c.get("memory", 999_999).await.expect_err("no such row") {
+            ClientError::Daemon { status, message } => {
+                assert_eq!(status, 404);
+                assert!(message.contains("999999"), "message was: {message}");
+            }
+            other => panic!("expected a daemon error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stats_reads_counts() {
+        let d = start_daemon().await;
+        publish(&d);
+        let c = DaemonClient::from_data_dir(d.dir.path()).expect("client");
+        save_and_wait(&c, "first note about queues", "agent-a", None, 1).await;
+        save_and_wait(&c, "second note about indexes", "agent-b", Some("proj-1"), 2).await;
+
+        let all = c.stats(None, None).await.expect("stats");
+        assert_eq!(all.totals.memory, 2);
+        assert_eq!(all.totals.deleted, 0);
+        assert_eq!(all.by_agent.len(), 2, "{all:?}");
+        assert!(
+            all.by_project.iter().any(|b| b.key.is_none() && b.count == 1),
+            "the row with no project is its own bucket: {all:?}"
+        );
+        assert!(all.newest_created_at.is_some());
+
+        let one = c.stats(Some("agent-a"), None).await.expect("stats");
+        assert_eq!(one.totals.memory, 1);
+    }
+
+    #[tokio::test]
+    async fn list_forwards_new_filters() {
+        let d = start_daemon().await;
+        publish(&d);
+        let c = DaemonClient::from_data_dir(d.dir.path()).expect("client");
+        save_and_wait(&c, "alpha note about caching layers", "agent-a", Some("proj-1"), 1).await;
+        save_and_wait(&c, "beta note about retry budgets", "agent-b", Some("proj-1"), 2).await;
+        save_and_wait(&c, "gamma note about schema drift", "agent-a", Some("proj-2"), 3).await;
+
+        let by_agent = c
+            .list(ListArgs { agent: Some("agent-a".into()), ..Default::default() })
+            .await
+            .expect("list");
+        assert_eq!(by_agent.len(), 2);
+
+        let by_both = c
+            .list(ListArgs {
+                agent: Some("agent-a".into()),
+                project: Some("proj-1".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("list");
+        assert_eq!(by_both.len(), 1);
+        assert_eq!(by_both[0].summary, "alpha note about caching layers");
+
+        let by_text = c
+            .list(ListArgs { q: Some("retry".into()), ..Default::default() })
+            .await
+            .expect("list");
+        assert_eq!(by_text.len(), 1);
+        assert_eq!(by_text[0].summary, "beta note about retry budgets");
+
+        let by_status = c
+            .list(ListArgs { status: Some("disputed".into()), ..Default::default() })
+            .await
+            .expect("list");
+        assert!(by_status.is_empty(), "nothing is disputed: {by_status:?}");
+    }
+
+    /// A daemon older than the viewer answers without the new columns; the
+    /// bridge and the viewer must both keep reading it.
+    #[test]
+    fn memory_row_tolerates_missing_provenance_fields() {
+        let old = serde_json::json!({
+            "id": 7,
+            "kind": "memory",
+            "memory_type": "semantic_fact",
+            "summary": "kept",
+            "tier": 2,
+            "importance": 5.0,
+            "status": "active",
+            "access_count": 1
+        });
+        let row: MemoryRow = serde_json::from_value(old).expect("old shape still parses");
+        assert_eq!(row.id, 7);
+        assert_eq!(row.source, None);
+        assert_eq!(row.created_at, None);
+        assert_eq!(row.update_count, None);
+        assert_eq!(row.agent_id, None);
     }
 }

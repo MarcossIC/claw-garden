@@ -26,8 +26,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clawg_core::memory::admin::{
-    delete_memory_core, list_memories_core, set_importance_core, ListParams, MemoryAdminRow,
-    MemoryKind,
+    delete_memory_core, get_memory_core, list_memories_core, memory_stats_core, query_has_tokens,
+    set_importance_core, ListParams, MemoryAdminRow, MemoryKind, MemoryStats, StatsParams,
 };
 use clawg_core::memory::embedder::EmbedRole;
 use clawg_core::memory::events::{MemoryEvent, MemorySource};
@@ -132,6 +132,60 @@ fn unknown_kind(raw: &str) -> ApiError {
     ))
 }
 
+/// The lifecycle states a memory row can be filtered by.
+const STATUSES: [&str; 3] = ["active", "disputed", "superseded"];
+
+/// Validates a listing request and turns it into the core's parameters.
+///
+/// Pure, so each refusal is testable without a server. Every refusal is a 400
+/// naming what was wrong: a viewer that quietly answered an unfiltered list to
+/// a bad filter would present it as the result of that filter.
+pub fn list_params_from_query(q: ListQuery) -> ApiResult<ListParams> {
+    let mut kind = match q.kind.as_deref() {
+        None => None,
+        Some(raw) => Some(parse_kind(raw).ok_or_else(|| unknown_kind(raw))?),
+    };
+
+    if let Some(status) = q.status.as_deref() {
+        if !STATUSES.contains(&status) {
+            return Err(ApiError::bad_request(format!(
+                "unknown status {status:?}: accepted values are \"active\", \"disputed\" and \"superseded\""
+            )));
+        }
+    }
+
+    if let Some(text) = q.q.as_deref() {
+        // Only `memory` has a text index; another kind would silently ignore
+        // the query and list every row.
+        if kind.is_some_and(|k| k != MemoryKind::Memory) {
+            return Err(ApiError::bad_request(
+                "q only applies to kind \"memory\": the other kinds have no text index",
+            ));
+        }
+        if !query_has_tokens(text) {
+            return Err(ApiError::bad_request(
+                "q must contain at least one letter or digit to search for",
+            ));
+        }
+        // A text search names no kind when the caller means "any that can be
+        // searched". Left unset, the merge of all three tables would list every
+        // episodic and procedural row next to the matches.
+        kind.get_or_insert(MemoryKind::Memory);
+    }
+
+    Ok(ListParams {
+        kind,
+        tier: q.tier,
+        memory_type: q.memory_type,
+        agent_id: q.agent,
+        project_id: q.project,
+        status: q.status,
+        query: q.q,
+        limit: q.limit,
+        offset: q.offset,
+    })
+}
+
 /// Length-then-content comparison that does not stop at the first differing
 /// byte.
 ///
@@ -189,7 +243,11 @@ pub struct ContextRequest {
     pub project_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+/// `deny_unknown_fields` because every field here narrows the result: an
+/// ignored typo (`agnet=x`) would answer with the unfiltered list, which reads
+/// as a successful filter.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListQuery {
     #[serde(default)]
     pub kind: Option<String>,
@@ -198,9 +256,29 @@ pub struct ListQuery {
     #[serde(default)]
     pub memory_type: Option<String>,
     #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Free text over memory content.
+    #[serde(default)]
+    pub q: Option<String>,
+    #[serde(default)]
     pub limit: Option<u32>,
     #[serde(default)]
     pub offset: Option<u32>,
+}
+
+/// Strict for the same reason as [`ListQuery`]: a misspelt filter would answer
+/// with the totals of everything.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatsQuery {
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,6 +322,11 @@ pub struct ListBody {
 }
 
 #[derive(Debug, Serialize)]
+pub struct ItemBody {
+    pub item: MemoryAdminRow,
+}
+
+#[derive(Debug, Serialize)]
 pub struct UpdatedBody {
     pub updated: usize,
 }
@@ -263,8 +346,9 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         .route("/context", post(context))
         .route(
             "/memories/{kind}/{id}",
-            axum::routing::patch(patch_importance).delete(delete_memory),
+            get(get_memory).patch(patch_importance).delete(delete_memory),
         )
+        .route("/stats", get(stats))
         .route("/shutdown", post(shutdown))
         .layer(axum::middleware::from_fn_with_state(app.clone(), require_bearer));
 
@@ -438,27 +522,39 @@ async fn list_memories(
     State(app): State<Arc<AppCtx>>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<ListBody>> {
-    // Absent `kind` merges all three tables; a present but unknown one is a
-    // typo the caller has to see.
-    let kind = match q.kind.as_deref() {
-        None => None,
-        Some(raw) => Some(parse_kind(raw).ok_or_else(|| unknown_kind(raw))?),
-    };
+    let items = list_memories_core(&app.runtime.store, list_params_from_query(q)?)
+        .await
+        .map_err(ApiError::internal)?;
 
-    let items = list_memories_core(
+    Ok(Json(ListBody { items }))
+}
+
+/// Counts what is stored, optionally narrowed to an agent and/or project.
+async fn stats(
+    State(app): State<Arc<AppCtx>>,
+    Query(q): Query<StatsQuery>,
+) -> ApiResult<Json<MemoryStats>> {
+    let stats = memory_stats_core(
         &app.runtime.store,
-        ListParams {
-            kind,
-            tier: q.tier,
-            memory_type: q.memory_type,
-            limit: q.limit,
-            offset: q.offset,
-        },
+        StatsParams { agent_id: q.agent, project_id: q.project },
     )
     .await
     .map_err(ApiError::internal)?;
+    Ok(Json(stats))
+}
 
-    Ok(Json(ListBody { items }))
+/// One row with every column the viewer shows, soft-deleted rows included
+/// (they report `deleted_at`). Deliberately not a search: it records no access.
+async fn get_memory(
+    State(app): State<Arc<AppCtx>>,
+    Path((kind, id)): Path<(String, i64)>,
+) -> ApiResult<Json<ItemBody>> {
+    let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
+    let item = get_memory_core(&app.runtime.store, kind, id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("no {kind:?} row with id {id}")))?;
+    Ok(Json(ItemBody { item }))
 }
 
 async fn patch_importance(
@@ -559,6 +655,103 @@ mod tests {
     fn constant_time_eq_rejects_a_first_byte_and_a_last_byte_miss_alike() {
         assert!(!constant_time_eq(b"Xbcdef", b"abcdef"));
         assert!(!constant_time_eq(b"abcdeX", b"abcdef"));
+    }
+
+    fn query(f: impl FnOnce(&mut ListQuery)) -> ListQuery {
+        let mut q = ListQuery::default();
+        f(&mut q);
+        q
+    }
+
+    #[test]
+    fn list_params_carry_every_filter_through() {
+        let params = list_params_from_query(query(|q| {
+            q.kind = Some("memory".into());
+            q.tier = Some(2);
+            q.memory_type = Some("semantic_fact".into());
+            q.agent = Some("a1".into());
+            q.project = Some("p1".into());
+            q.status = Some("disputed".into());
+            q.q = Some("deploy".into());
+            q.limit = Some(5);
+            q.offset = Some(10);
+        }))
+        .expect("valid");
+
+        assert_eq!(params.kind, Some(MemoryKind::Memory));
+        assert_eq!(params.tier, Some(2));
+        assert_eq!(params.memory_type.as_deref(), Some("semantic_fact"));
+        assert_eq!(params.agent_id.as_deref(), Some("a1"));
+        assert_eq!(params.project_id.as_deref(), Some("p1"));
+        assert_eq!(params.status.as_deref(), Some("disputed"));
+        assert_eq!(params.query.as_deref(), Some("deploy"));
+        assert_eq!((params.limit, params.offset), (Some(5), Some(10)));
+    }
+
+    #[test]
+    fn list_params_reject_an_unknown_status_naming_the_accepted_set() {
+        let err = list_params_from_query(query(|q| q.status = Some("stale".into())))
+            .expect_err("invalid");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        for word in ["stale", "active", "disputed", "superseded"] {
+            assert!(err.message.contains(word), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn list_params_reject_an_unknown_kind() {
+        let err = list_params_from_query(query(|q| q.kind = Some("bogus".into())))
+            .expect_err("invalid");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("bogus"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_text_query_with_a_non_memory_kind_is_rejected() {
+        for kind in ["episodic", "procedural"] {
+            let err = list_params_from_query(query(|q| {
+                q.kind = Some(kind.into());
+                q.q = Some("deploy".into());
+            }))
+            .expect_err("only memory has a text index");
+            assert_eq!(err.status, StatusCode::BAD_REQUEST);
+            assert!(err.message.contains("memory"), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn a_text_query_is_fine_without_a_kind_or_with_memory() {
+        assert!(list_params_from_query(query(|q| q.q = Some("deploy".into()))).is_ok());
+        assert!(list_params_from_query(query(|q| {
+            q.kind = Some("memory".into());
+            q.q = Some("deploy".into());
+        }))
+        .is_ok());
+    }
+
+    /// Without this, the unfiltered merge of the three tables would hand back
+    /// every episodic and procedural row beside the matches, since neither has
+    /// a text index to narrow it.
+    #[test]
+    fn a_text_query_without_a_kind_is_restricted_to_memory() {
+        let params = list_params_from_query(query(|q| q.q = Some("deploy".into())))
+            .expect("valid");
+        assert_eq!(params.kind, Some(MemoryKind::Memory));
+    }
+
+    #[test]
+    fn a_listing_without_a_text_query_keeps_every_table() {
+        let params = list_params_from_query(query(|_| {})).expect("valid");
+        assert_eq!(params.kind, None);
+    }
+
+    #[test]
+    fn a_text_query_without_any_word_is_rejected() {
+        for text in ["", "   ", "-^()\"* :"] {
+            let err = list_params_from_query(query(|q| q.q = Some(text.into())))
+                .expect_err("nothing to search for");
+            assert_eq!(err.status, StatusCode::BAD_REQUEST, "{text:?}");
+        }
     }
 
     #[test]

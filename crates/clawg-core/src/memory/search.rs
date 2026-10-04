@@ -500,17 +500,37 @@ const MAX_LEXICAL_TOKENS: usize = 16;
 /// like any other, so it can only ever be searched for literally, never
 /// interpreted as the operator.
 fn fts_match_expression(query_text: &str, max_tokens: usize) -> Option<String> {
-    let tokens: Vec<&str> = query_text
-        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .filter(|t| !t.is_empty())
-        .take(max_tokens)
-        .collect();
+    let tokens: Vec<&str> = fts_tokens(query_text).take(max_tokens).collect();
 
     if tokens.is_empty() {
         return None;
     }
 
     Some(tokens.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(" OR "))
+}
+
+/// Splits `query_text` into the runs of `char::is_alphanumeric() || '_'` that
+/// both MATCH builders quote. Nothing it yields can contain an FTS5 operator
+/// or a double quote.
+pub(crate) fn fts_tokens(query_text: &str) -> impl Iterator<Item = &str> {
+    query_text
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|t| !t.is_empty())
+}
+
+/// MATCH expression for a person typing into a viewer: every token must be
+/// present and each one matches as a prefix (`"tok"*`), so a half-typed word
+/// still finds its rows. Unlike [`fts_match_expression`] it is not capped:
+/// silently dropping a token would widen the result set the person narrowed.
+/// `None` when the query has no token.
+pub(crate) fn viewer_match_expression(query_text: &str) -> Option<String> {
+    let tokens: Vec<String> = fts_tokens(query_text).map(|t| format!("\"{t}\"*")).collect();
+
+    if tokens.is_empty() {
+        return None;
+    }
+
+    Some(tokens.join(" AND "))
 }
 
 // Candidate query for the lexical channel over `memory`. `bm25()` returns a
@@ -2770,6 +2790,28 @@ mod tests {
     }
 
     // ── lexical (FTS5) sanitizer ──
+
+    #[test]
+    fn viewer_match_requires_every_token() {
+        assert_eq!(
+            viewer_match_expression("Config núcleo_2"),
+            Some("\"Config\"* AND \"núcleo_2\"*".to_string())
+        );
+    }
+
+    #[test]
+    fn punctuation_only_query_has_no_expression() {
+        assert_eq!(viewer_match_expression("-^()\"* :"), None);
+        assert_eq!(viewer_match_expression("   "), None);
+    }
+
+    #[test]
+    fn viewer_match_keeps_fts_keywords_literal() {
+        assert_eq!(
+            viewer_match_expression("find NEAR OR bug"),
+            Some("\"find\"* AND \"NEAR\"* AND \"OR\"* AND \"bug\"*".to_string())
+        );
+    }
 
     #[test]
     fn fts_match_expression_folds_accented_spanish_text_into_ored_tokens() {

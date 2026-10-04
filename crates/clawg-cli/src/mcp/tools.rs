@@ -175,6 +175,7 @@ mod tests {
             importance: 5.0,
             status: "active".into(),
             access_count: 3,
+            ..Default::default()
         }
     }
 

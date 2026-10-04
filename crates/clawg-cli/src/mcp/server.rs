@@ -347,6 +347,7 @@ impl ClawgMcp {
                 memory_type: args.memory_type,
                 limit: args.limit,
                 offset: args.offset,
+                ..Default::default()
             })
             .await
         {
@@ -594,6 +595,42 @@ mod tests {
             assert!(names.contains(&expected.to_string()), "missing {expected}: {names:?}");
         }
         assert_eq!(names.len(), 6, "no extra tools: {names:?}");
+    }
+
+    /// The memory viewer (`clawg memories`) is for the person at the terminal.
+    /// Handing a model its filters by agent and project, or its text search over
+    /// every row, would let it read across agents; so the tool a model sees keeps
+    /// exactly its five arguments, and the set of tools does not grow.
+    #[tokio::test]
+    async fn the_viewer_is_not_exposed_to_the_model() {
+        let (b, _d) = bridge().await;
+        let tools = b.tool_router.list_all();
+
+        let mut names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "delete_memory",
+                "list_memories",
+                "memory_status",
+                "recall_context",
+                "save_memory",
+                "search_memory",
+            ]
+        );
+
+        let list = tools.iter().find(|t| t.name == "list_memories").expect("list_memories");
+        let mut properties: Vec<&str> = list
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("the schema has properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        properties.sort();
+        assert_eq!(properties, ["kind", "limit", "memory_type", "offset", "tier"]);
     }
 
     /// The model has to pick `memory_type` from the set the store recognises;

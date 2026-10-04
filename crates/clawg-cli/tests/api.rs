@@ -20,6 +20,20 @@ use clawg_core::runtime::MemoryRuntime;
 use once_cell::sync::OnceCell;
 use serde_json::{json, Value};
 
+/// Which embedder a test daemon was started with.
+enum EmbedderState {
+    Ready,
+    NeverLoaded,
+    ServedEmpty,
+}
+
+/// Swaps in a fresh, EMPTY embedder cell while moving every other handle
+/// across untouched — the cheapest way to reproduce a pre-bootstrap daemon
+/// without a second constructor in core.
+fn with_empty_embedder(runtime: MemoryRuntime) -> MemoryRuntime {
+    MemoryRuntime { embedder: Arc::new(OnceCell::<Arc<dyn Embedder>>::new()), ..runtime }
+}
+
 /// A live daemon on a loopback port, plus everything a test needs to talk to it.
 struct Harness {
     addr: SocketAddr,
@@ -33,35 +47,47 @@ struct Harness {
 impl Harness {
     /// Normal daemon: embedder ready, ingest worker running.
     async fn start() -> Self {
-        Self::start_inner(true).await
+        Self::start_inner(EmbedderState::Ready).await
     }
 
     /// Daemon whose embedder cell was never filled — the state a real daemon is
     /// in for the first minutes after a cold start, while the model downloads.
     async fn start_without_embedder() -> Self {
-        Self::start_inner(false).await
+        Self::start_inner(EmbedderState::NeverLoaded).await
     }
 
-    async fn start_inner(with_embedder: bool) -> Self {
+    /// Daemon that reads as if the model had not loaded, over rows that were
+    /// ingested while it had: the only way to put data in a store a read path
+    /// is then exercised against with an empty cell, since ingest needs the
+    /// embedder.
+    async fn start_serving_without_embedder() -> Self {
+        Self::start_inner(EmbedderState::ServedEmpty).await
+    }
+
+    async fn start_inner(embedder: EmbedderState) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let (runtime, rx) = MemoryRuntime::new_for_test(dir.path().to_path_buf()).await;
 
-        // Struct-update syntax swaps in a fresh, EMPTY cell while moving every
-        // other handle across untouched — the cheapest way to reproduce a
-        // pre-bootstrap daemon without a second constructor in core.
-        let runtime = if with_embedder {
-            runtime
-        } else {
-            MemoryRuntime {
-                embedder: Arc::new(OnceCell::<Arc<dyn Embedder>>::new()),
-                ..runtime
-            }
-        };
-
         // The ingest worker is what turns a queued event into a row. Without
         // it `POST /v1/memories` would answer 202 forever and nothing would
-        // ever land, which is exactly the bug these tests exist to catch.
-        tokio::spawn(runtime.ingest_worker(rx));
+        // ever land, which is exactly the bug these tests exist to catch. It
+        // clones its handles when it is created, so what it holds is whatever
+        // the runtime had at that moment.
+        let runtime = match embedder {
+            EmbedderState::Ready => {
+                tokio::spawn(runtime.ingest_worker(rx));
+                runtime
+            }
+            EmbedderState::NeverLoaded => {
+                let runtime = with_empty_embedder(runtime);
+                tokio::spawn(runtime.ingest_worker(rx));
+                runtime
+            }
+            EmbedderState::ServedEmpty => {
+                tokio::spawn(runtime.ingest_worker(rx));
+                with_empty_embedder(runtime)
+            }
+        };
 
         let token = "test-token-0123456789abcdef".to_string();
         let (shutdown, _rx) = tokio::sync::watch::channel(false);
@@ -457,6 +483,10 @@ async fn an_unknown_kind_is_a_400_everywhere_it_appears() {
         .await
         .expect("request");
     assert_eq!(r.status(), 400);
+
+    let (status, body) = h.get_json("/v1/memories/bogus/1").await;
+    assert_eq!(status, 400);
+    assert!(body["error"].as_str().is_some_and(|e| e.contains("bogus")), "{body}");
 }
 
 #[tokio::test]
@@ -472,6 +502,223 @@ async fn listing_without_a_kind_merges_every_table() {
     let (status, body) = h.get_json("/v1/memories").await;
     assert_eq!(status, 200);
     assert_eq!(body["items"].as_array().expect("items").len(), 1);
+}
+
+// ── Viewer reads: filters, text query ───────────────────────────────────────
+
+#[tokio::test]
+async fn listing_filters_by_agent_and_project() {
+    let h = Harness::start().await;
+    let saves = [
+        ("alpha note about caching layers", "agent-a", "proj-1"),
+        ("beta note about retry budgets", "agent-b", "proj-1"),
+        ("gamma note about schema drift", "agent-a", "proj-2"),
+    ];
+    for (content, agent, project) in saves {
+        h.post_json(
+            "/v1/memories",
+            json!({ "content": content, "agent_id": agent, "project_id": project }),
+        )
+        .await;
+    }
+    h.wait_for_rows("memory", 3).await;
+
+    let (status, body) = h.get_json("/v1/memories?agent=agent-a&project=proj-1").await;
+    assert_eq!(status, 200, "{body}");
+    let items = body["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "{body}");
+    assert_eq!(items[0]["summary"], "alpha note about caching layers");
+
+    let (_, body) = h.get_json("/v1/memories?agent=agent-a").await;
+    assert_eq!(body["items"].as_array().expect("items").len(), 2);
+}
+
+#[tokio::test]
+async fn a_text_query_finds_a_saved_memory_without_the_embedder() {
+    let h = Harness::start_serving_without_embedder().await;
+    for content in ["la configuración del núcleo cambió", "an unrelated remark"] {
+        h.post_json("/v1/memories", json!({ "content": content, "agent_id": "agent-http" }))
+            .await;
+    }
+    h.wait_for_rows("memory", 2).await;
+
+    let (status, body) = h.get_json("/v1/memories?q=configuracion%20nucleo").await;
+    assert_eq!(status, 200, "{body}");
+    let items = body["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "{body}");
+    assert_eq!(items[0]["summary"], "la configuración del núcleo cambió");
+
+    let (status, _) = h.get_json("/v1/memories?kind=episodic&q=configuracion").await;
+    assert_eq!(status, 400, "episodic rows have no text index");
+}
+
+/// Episodic rows have no text index, so a text query that names no kind must
+/// not list them beside the matches.
+#[tokio::test]
+async fn a_text_query_without_a_kind_lists_only_memory_rows() {
+    use clawg_core::memory::store_insert::{CreatedByType, NewEpisodicTrajectoryRecord};
+
+    let h = Harness::start().await;
+    h.post_json(
+        "/v1/memories",
+        json!({ "content": "la configuración del núcleo cambió", "agent_id": "agent-http" }),
+    )
+    .await;
+    h.wait_for_rows("memory", 1).await;
+
+    let record = NewEpisodicTrajectoryRecord {
+        scope: "agent",
+        agent_id: Some("agent-http".to_string()),
+        project_id: None,
+        session_id: "sess-text-query".to_string(),
+        task: "configuracion de un trabajo ajeno".to_string(),
+        tool_calls_json: "[]".to_string(),
+        errors_json: "[]".to_string(),
+        resolution: None,
+        success_score: 0.5,
+        created_by_type: CreatedByType::System,
+        created_by_ref: "agent-http".to_string(),
+        importance: 5.0,
+        created_at_ms: 1_000_000,
+    };
+    h.ctx
+        .runtime
+        .store
+        .insert_episodic_trajectory(record, vec![0.5; 384])
+        .await
+        .expect("seed an episodic row");
+
+    let (_, body) = h.get_json("/v1/memories").await;
+    assert_eq!(body["items"].as_array().expect("items").len(), 2, "both tables are seeded");
+
+    let (status, body) = h.get_json("/v1/memories?q=configuracion").await;
+    assert_eq!(status, 200, "{body}");
+    let items = body["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "{body}");
+    assert_eq!(items[0]["kind"], "memory");
+}
+
+#[tokio::test]
+async fn an_unknown_list_param_is_a_400() {
+    let h = Harness::start().await;
+    let (status, _) = h.get_json("/v1/memories?agnet=typo").await;
+    assert_eq!(status, 400, "a misspelt filter must not be silently ignored");
+}
+
+// ── Viewer reads: one row, stats ────────────────────────────────────────────
+
+#[tokio::test]
+async fn show_returns_every_metadata_field_of_a_saved_memory() {
+    let h = Harness::start().await;
+    h.post_json(
+        "/v1/memories",
+        json!({
+            "content": CONTENT,
+            "agent_id": "agent-http",
+            "project_id": "proj-show",
+            "memory_type": "semantic_fact",
+            "importance": 8.0
+        }),
+    )
+    .await;
+    let id = h.wait_for_rows("memory", 1).await[0]["id"].as_i64().expect("id");
+
+    let (status, body) = h.get_json(&format!("/v1/memories/memory/{id}")).await;
+
+    assert_eq!(status, 200, "{body}");
+    let item = &body["item"];
+    assert_eq!(item["id"], id);
+    assert_eq!(item["kind"], "memory");
+    assert_eq!(item["summary"], CONTENT, "the full content, not a preview");
+    assert_eq!(item["source"], "explicit");
+    assert_eq!(item["created_by_type"], "user");
+    assert_eq!(item["agent_id"], "agent-http");
+    assert_eq!(item["project_id"], "proj-show");
+    assert_eq!(item["memory_type"], "semantic_fact");
+    assert_eq!(item["importance"], 8.0);
+    assert_eq!(item["status"], "active");
+    assert!(item["deleted_at"].is_null());
+    for field in [
+        "created_at",
+        "last_modified_at",
+        "last_accessed_at",
+        "update_count",
+        "dispute_count",
+        "created_by_ref",
+        "tier",
+        "access_count",
+    ] {
+        assert!(!item[field].is_null(), "{field} missing from {item}");
+    }
+}
+
+#[tokio::test]
+async fn show_missing_is_404() {
+    let h = Harness::start().await;
+    for path in ["/v1/memories/memory/999999", "/v1/memories/episodic/1"] {
+        let (status, body) = h.get_json(path).await;
+        assert_eq!(status, 404, "{path}");
+        assert!(body["error"].is_string(), "{body}");
+    }
+}
+
+/// Looking at a row must not feed the signal that promotes it.
+#[tokio::test]
+async fn show_is_not_an_access() {
+    let h = Harness::start().await;
+    h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "agent-http" })).await;
+    let id = h.wait_for_rows("memory", 1).await[0]["id"].as_i64().expect("id");
+    let path = format!("/v1/memories/memory/{id}");
+
+    let (_, before) = h.get_json(&path).await;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    for _ in 0..3 {
+        h.get_json(&path).await;
+    }
+    let (_, after) = h.get_json(&path).await;
+
+    assert_eq!(after["item"]["access_count"], before["item"]["access_count"]);
+    assert_eq!(after["item"]["last_accessed_at"], before["item"]["last_accessed_at"]);
+}
+
+#[tokio::test]
+async fn stats_counts_what_was_saved() {
+    let h = Harness::start().await;
+    let saves = [
+        ("alpha note about caching layers", "agent-a", "proj-1"),
+        ("beta note about retry budgets", "agent-b", "proj-1"),
+        ("gamma note about schema drift", "agent-a", "proj-2"),
+    ];
+    for (content, agent, project) in saves {
+        h.post_json(
+            "/v1/memories",
+            json!({ "content": content, "agent_id": agent, "project_id": project }),
+        )
+        .await;
+    }
+    h.wait_for_rows("memory", 3).await;
+
+    let (status, body) = h.get_json("/v1/stats").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["totals"]["memory"], 3);
+    assert_eq!(body["totals"]["deleted"], 0);
+    assert_eq!(body["by_agent"][0], json!({ "key": "agent-a", "count": 2 }));
+    assert_eq!(body["by_agent"][1], json!({ "key": "agent-b", "count": 1 }));
+    assert!(body["newest_created_at"].is_i64(), "{body}");
+
+    let (status, body) = h.get_json("/v1/stats?agent=agent-a&project=proj-1").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["totals"]["memory"], 1);
+
+    let (status, _) = h.get_json("/v1/stats?agnet=typo").await;
+    assert_eq!(status, 400, "an unknown parameter must not be ignored");
+}
+
+#[tokio::test]
+async fn stats_requires_the_token() {
+    let h = Harness::start().await;
+    let r = h.http.get(h.url("/v1/stats")).send().await.expect("request");
+    assert_eq!(r.status(), 401);
 }
 
 // ── Shutdown ────────────────────────────────────────────────────────────────
