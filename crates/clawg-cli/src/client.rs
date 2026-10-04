@@ -497,11 +497,29 @@ pub async fn ensure_running_in(
     spawner: &dyn DaemonSpawner,
     timeout: Duration,
 ) -> Result<DaemonClient, ClientError> {
+    match probe_running(base_dir, autostart).await? {
+        Probe::Running(client) => Ok(client),
+        Probe::NeedsStart => start_daemon(base_dir, profile, spawner, timeout).await,
+    }
+}
+
+/// What the quick half of [`ensure_running_in`] found.
+pub enum Probe {
+    /// A daemon answered `/health`.
+    Running(DaemonClient),
+    /// None answered and one may be started: the slow half, [`start_daemon`].
+    NeedsStart,
+}
+
+/// The half of [`ensure_running_in`] that is bounded by one short `/health`
+/// probe and two file reads, so a caller can run it before it must answer
+/// anyone. Everything that can wait on a cold start is in [`start_daemon`].
+pub async fn probe_running(base_dir: &Path, autostart: bool) -> Result<Probe, ClientError> {
     // A state file alone proves nothing: it survives a crash, and its pid may
     // belong to something else entirely by now. Only a `/health` answer counts.
     if let Some(client) = DaemonClient::from_data_dir(base_dir) {
         if client.health().await.is_ok() {
-            return Ok(client);
+            return Ok(Probe::Running(client));
         }
     }
 
@@ -524,6 +542,16 @@ pub async fn ensure_running_in(
         return Err(ClientError::NotRunning);
     }
 
+    Ok(Probe::NeedsStart)
+}
+
+/// Spawns a daemon and polls until it answers `/health` or `timeout` passes.
+pub async fn start_daemon(
+    base_dir: &Path,
+    profile: Profile,
+    spawner: &dyn DaemonSpawner,
+    timeout: Duration,
+) -> Result<DaemonClient, ClientError> {
     // The data directory has to exist before the daemon can publish into it —
     // on a first ever run it does not.
     std::fs::create_dir_all(base_dir)

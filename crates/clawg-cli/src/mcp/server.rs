@@ -31,6 +31,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::client::{ClientError, DaemonClient, ListArgs, SaveArgs, SearchArgs};
+use crate::mcp::startup::ClientHandle;
 use crate::mcp::tools::{
     format_context, format_hits, format_rows, format_status, resolve_project_id,
 };
@@ -136,7 +137,7 @@ pub struct DeleteMemoryArgs {
 /// The MCP server: one daemon client, one identity, one tool router.
 #[derive(Clone)]
 pub struct ClawgMcp {
-    client: DaemonClient,
+    client: ClientHandle,
     /// Used when the peer has not identified itself.
     agent_id: String,
     /// The project the bridge process itself is sitting in.
@@ -153,15 +154,29 @@ impl ClawgMcp {
     /// "which project do these memories belong to?" have the same answer
     /// without anyone configuring it.
     pub fn new(client: DaemonClient, profile: Profile) -> Self {
+        Self::pending(ClientHandle::ready(client), profile)
+    }
+
+    /// [`ClawgMcp::new`] for a daemon that may still be starting: each tool
+    /// call waits on the handle instead of assuming a live client.
+    pub fn pending(client: ClientHandle, profile: Profile) -> Self {
         let default_project_id = std::env::current_dir()
             .ok()
             .map(|cwd| derive_project_id(&cwd));
-        Self::with_project(client, profile, default_project_id)
+        Self::with_handle(client, profile, default_project_id)
     }
 
     /// [`ClawgMcp::new`] with the default project stated explicitly.
     pub fn with_project(
         client: DaemonClient,
+        profile: Profile,
+        default_project_id: Option<String>,
+    ) -> Self {
+        Self::with_handle(ClientHandle::ready(client), profile, default_project_id)
+    }
+
+    fn with_handle(
+        client: ClientHandle,
         profile: Profile,
         default_project_id: Option<String>,
     ) -> Self {
@@ -193,13 +208,23 @@ impl ClawgMcp {
         Ok(CallToolResult::error(vec![Content::text(text.into())]))
     }
 
+    /// The daemon client, once the background start has produced one.
+    ///
+    /// The failure is already the sentence the model should read, so each tool
+    /// returns it as its own result instead of hanging or dropping the bridge.
+    async fn daemon(&self) -> Result<DaemonClient, CallToolResult> {
+        self.client.get().await.map_err(|e| {
+            CallToolResult::error(vec![Content::text(Self::explain(&e))])
+        })
+    }
+
     /// Turns a client failure into the sentence a model should act on.
     ///
     /// The two cases worth distinguishing are the two a caller can do something
     /// about: a daemon that is not up (tell the user to start one) and an
     /// embedder that is not ready yet (wait and retry). Everything else is one
     /// message, because the model's next move is the same either way.
-    fn explain(err: ClientError) -> String {
+    fn explain(err: &ClientError) -> String {
         match err {
             ClientError::NotRunning | ClientError::StartTimeout(_) => {
                 "no clawg daemon is running; start one with `clawg serve` and try again"
@@ -232,8 +257,11 @@ impl ClawgMcp {
             false,
         );
 
-        match self
-            .client
+        let client = match self.daemon().await {
+            Ok(c) => c,
+            Err(failure) => return Ok(failure),
+        };
+        match client
             .save(SaveArgs {
                 content: args.content,
                 agent_id: agent_id.to_string(),
@@ -247,7 +275,7 @@ impl ClawgMcp {
             // model otherwise invites it to search for something that is still
             // in a channel.
             Ok(()) => Self::ok("queued"),
-            Err(e) => Self::failed(Self::explain(e)),
+            Err(e) => Self::failed(Self::explain(&e)),
         }
     }
 
@@ -262,8 +290,11 @@ impl ClawgMcp {
             args.all_projects.unwrap_or(false),
         );
 
-        match self
-            .client
+        let client = match self.daemon().await {
+            Ok(c) => c,
+            Err(failure) => return Ok(failure),
+        };
+        match client
             .search(SearchArgs {
                 query: args.query,
                 agent_id: agent_id.to_string(),
@@ -273,7 +304,7 @@ impl ClawgMcp {
             .await
         {
             Ok(hits) => Self::ok(format_hits(&hits)),
-            Err(e) => Self::failed(Self::explain(e)),
+            Err(e) => Self::failed(Self::explain(&e)),
         }
     }
 
@@ -288,13 +319,16 @@ impl ClawgMcp {
             false,
         );
 
-        match self
-            .client
+        let client = match self.daemon().await {
+            Ok(c) => c,
+            Err(failure) => return Ok(failure),
+        };
+        match client
             .context(&args.query, agent_id, project_id.as_deref())
             .await
         {
             Ok(prompt) => Self::ok(format_context(&prompt)),
-            Err(e) => Self::failed(Self::explain(e)),
+            Err(e) => Self::failed(Self::explain(&e)),
         }
     }
 
@@ -302,8 +336,11 @@ impl ClawgMcp {
         &self,
         args: ListMemoriesArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        match self
-            .client
+        let client = match self.daemon().await {
+            Ok(c) => c,
+            Err(failure) => return Ok(failure),
+        };
+        match client
             .list(ListArgs {
                 kind: args.kind,
                 tier: args.tier,
@@ -314,7 +351,7 @@ impl ClawgMcp {
             .await
         {
             Ok(rows) => Self::ok(format_rows(&rows)),
-            Err(e) => Self::failed(Self::explain(e)),
+            Err(e) => Self::failed(Self::explain(&e)),
         }
     }
 
@@ -322,16 +359,24 @@ impl ClawgMcp {
         &self,
         args: DeleteMemoryArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        match self.client.delete(&args.kind, args.id).await {
+        let client = match self.daemon().await {
+            Ok(c) => c,
+            Err(failure) => return Ok(failure),
+        };
+        match client.delete(&args.kind, args.id).await {
             Ok(n) => Self::ok(format!("deleted {n}")),
-            Err(e) => Self::failed(Self::explain(e)),
+            Err(e) => Self::failed(Self::explain(&e)),
         }
     }
 
     pub async fn memory_status_impl(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        match self.client.health().await {
-            Ok(health) => Self::ok(format_status(&health, self.profile, self.client.base_dir())),
-            Err(e) => Self::failed(Self::explain(e)),
+        let client = match self.daemon().await {
+            Ok(c) => c,
+            Err(failure) => return Ok(failure),
+        };
+        match client.health().await {
+            Ok(health) => Self::ok(format_status(&health, self.profile, client.base_dir())),
+            Err(e) => Self::failed(Self::explain(&e)),
         }
     }
 }
