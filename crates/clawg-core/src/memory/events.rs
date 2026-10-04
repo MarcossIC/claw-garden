@@ -1,4 +1,4 @@
-//! Memory ingest event types (Phase 3 — REQ-EVT-001, REQ-EVT-002, REQ-EVT-003).
+//! Memory ingest event types.
 
 use serde::{Deserialize, Serialize};
 
@@ -40,16 +40,16 @@ pub struct MemoryEvent {
 
 /// Where the ingest event originated (which producer).
 ///
-/// `source` describes the producer — NOT the role. Phase 3 only fires
-/// `MemorySource::Chat`; the other variants are reserved.
+/// `source` describes the producer — NOT the role. Only `Chat` and `Explicit`
+/// are produced today; `Compaction` and `CodeFile` are reserved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemorySource {
     /// Chat turn — user/assistant/tool message from `push_and_persist`.
     Chat,
-    /// Compaction summary (reserved — Phase 7 may emit; not produced in Phase 3).
+    /// Compaction summary (reserved; nothing emits it yet).
     Compaction,
-    /// File-watcher-driven code ingest (reserved — Phase 4+).
+    /// File-watcher-driven code ingest (reserved; nothing emits it yet).
     CodeFile,
     /// A memory a client saved deliberately (the MCP `save_memory` tool), not
     /// derived from a conversation.
@@ -67,7 +67,7 @@ impl MemoryEvent {
     /// Build an event from a persisted `ChatMessage`.
     ///
     /// Returns `None` for messages we deliberately do NOT ingest:
-    ///   - `Role::System` (LOCKED D8 — never reaches push_and_persist anyway, defensive)
+    ///   - `Role::System` (never reaches `push_and_persist` anyway; defensive)
     ///   - `Role::Assistant` with empty content AND `tool_calls = Some(_)`
     ///     (the "I'm about to call a tool" announcement — no content to embed)
     pub fn from_message(
@@ -96,7 +96,7 @@ impl MemoryEvent {
     }
 }
 
-// Compile-time Send + 'static proof (Phase 2 carry-forward pattern — REQ-STATE-003).
+// Compile-time Send + 'static proof.
 const _: fn() = || {
     fn _send_static<T: Send + 'static>() {}
     fn _sync<T: Sync>() {}

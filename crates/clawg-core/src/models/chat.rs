@@ -21,9 +21,9 @@ pub struct ChatMessage {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(default = "current_time_millis")]
     pub timestamp_ms: u64,
-    /// Phase 3 (LOCKED D1) — only `Some(true)` on `Role::Tool` messages whose
-    /// underlying tool execution surfaced an error. Default `None` keeps old
-    /// persisted session JSON forward-compatible (R1).
+    /// Only `Some(true)` on `Role::Tool` messages whose underlying tool
+    /// execution surfaced an error. Default `None` keeps previously persisted
+    /// JSON deserializable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
 }
@@ -95,7 +95,7 @@ pub enum ChatStreamResult {
     ToolCalls(Vec<ToolCall>),
 }
 
-/// Events sent through the desktop app's streaming channel.
+/// Events sent through a streaming channel.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(tag = "kind")]
 pub enum StreamEvent {
@@ -105,24 +105,6 @@ pub enum StreamEvent {
     #[serde(rename = "state")]
     State { state: String },
 
-    #[serde(rename = "done")]
-    Done { full_response: String },
-
-    #[serde(rename = "error")]
-    Error { error: String },
-
-    #[serde(rename = "tool_use")]
-    ToolUse {
-        tool_name: String,
-        arguments: String,
-    },
-
-    #[serde(rename = "compaction")]
-    Compaction {
-        removed_count: usize,
-        estimated_tokens_freed: usize,
-    },
-
     #[serde(rename = "usage")]
     Usage {
         input_tokens: u32,
@@ -131,116 +113,11 @@ pub enum StreamEvent {
         cache_read_tokens: u32,
     },
 
-    /// Warning message from a hook — shown to the user, NOT injected into the LLM.
-    #[serde(rename = "hook_warning")]
-    HookWarning { message: String },
-
-    /// Garden event emitted by a hook — drives UI animations and zone changes.
-    #[serde(rename = "hook_garden_event")]
-    HookGardenEvent {
-        move_to_zone: Option<String>,
-        animation: Option<String>,
-        notify: Option<String>,
-    },
-
-    /// A recovery step is about to be executed for a failing tool.
-    /// Gives the user real-time feedback instead of silent hanging.
-    #[serde(rename = "recovery_attempt")]
-    RecoveryAttempt {
-        tool: String,
-        /// Human-readable description of the step being attempted.
-        step: String,
-        /// 1-based attempt number within `max_attempts`.
-        attempt: u32,
-    },
-
-    /// The outcome of a recovery sequence for a tool.
-    #[serde(rename = "recovery_result")]
-    RecoveryResult {
-        tool: String,
-        succeeded: bool,
-        /// Short outcome code: "recovered", "escalated", "max_attempts_exhausted",
-        /// "escalated_to_llm", "recovery-step-timeout", "oauth-refresh-failed", etc.
-        outcome: String,
-    },
-
-    /// Incremental progress from a long-running tool (bash stdout chunks, web_fetch bytes, etc.).
-    /// Emitted BEFORE the final tool_result so the UI can animate the agent in real time
-    /// instead of showing a frozen state until the tool finishes.
+    /// Embedder model bootstrap progress.
     ///
-    /// The fields mirror `tools::progress::ToolProgress`:
-    ///   - `stdout_chunk` / `stderr_chunk` are filled by bash line-by-line streaming
-    ///   - `bytes_read` is filled by web_fetch during body download
-    ///   - `message` is a free-form description for Generic events
-    ///
-    /// All structured fields are optional; consumers switch on which is present.
-    #[serde(rename = "tool_progress")]
-    ToolProgress {
-        tool: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        stdout_chunk: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        stderr_chunk: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        bytes_read: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        message: Option<String>,
-    },
-
-    /// Human-in-the-loop gate: the agent is about to invoke a tool that
-    /// requires explicit user approval (destructive native tool, or hook
-    /// `Ask` decision). The chat loop is paused on a oneshot until the UI
-    /// resolves it via `resolve_tool_confirmation(call_id, decision)`.
-    #[serde(rename = "confirmation_required")]
-    ConfirmationRequired {
-        /// Stable identifier for matching the response. Distinct from the
-        /// LLM-issued tool_use id so hook-only Asks (no tool_call) also fit.
-        call_id: String,
-        tool_name: String,
-        /// Effective input the tool will receive if approved (post-hook mutation).
-        arguments: serde_json::Value,
-        /// Why we are asking — populated for hook Asks; None for is_destructive gate.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
-        /// What triggered the prompt: "destructive_tool" | "hook_ask".
-        source: String,
-    },
-
-    /// Echoed back after the user resolves a confirmation, for UI bookkeeping
-    /// (closing the modal, logging in transcript). The actual gate result is
-    /// delivered via the oneshot inside the chat loop.
-    #[serde(rename = "confirmation_resolved")]
-    ConfirmationResolved {
-        call_id: String,
-        /// "allow" | "deny"
-        decision: String,
-    },
-
-    /// The agent invoked the `report_anomaly` self-reporting tool (12-B).
-    /// This is an ADVISORY signal — the chat loop continues without pause.
-    /// The UI surfaces it as a system message so the user can audit the
-    /// agent's self-assessment in real time.
-    #[serde(rename = "anomaly_reported")]
-    AnomalyReported {
-        /// Stable id for this report (so the UI can dedupe if the loop replays).
-        report_id: String,
-        /// One of: unintended_action | reasoning_mismatch |
-        /// prompt_injection_suspicion | irreversible_action.
-        anomaly_type: String,
-        description: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        intended_action: Option<String>,
-    },
-
-    /// Embedder model bootstrap progress (Phase 2 RAG — REQ-EVT-001).
-    ///
-    /// Emitted app-wide via `app.emit("embedder-download", payload)` (a NEW
-    /// pattern in this codebase — see `docs/sdd/rag-embedder/design.md` §5.6).
-    /// Lifecycle on success:  `start` → `downloading` (1..N, rate-limited) →
-    /// `verifying` → `done`. On error: any prefix, then exactly one terminal
+    /// Lifecycle on success: `start` -> `downloading` (1..N, rate-limited) ->
+    /// `verifying` -> `done`. On error: any prefix, then exactly one terminal
     /// `error` event.
-    ///
-    /// The Angular union in `src/app/models/chat.model.ts` mirrors this shape.
     #[serde(rename = "embedder_download")]
     EmbedderDownload {
         /// One of: `"start" | "downloading" | "verifying" | "done" | "error"`.
@@ -254,15 +131,9 @@ pub enum StreamEvent {
     },
 }
 
-// ============================================================================
-// Phase 2 RAG — StreamEvent::EmbedderDownload serde shape (REQ-EVT-001 / T060)
-// Phase 3 RAG — ChatMessage.is_error field (REQ-INT-001)
-// ============================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ---------- T03-test — REQ-INT-001: ChatMessage.is_error ----------
 
     #[test]
     fn is_error_field_defaults_to_none_on_missing_key() {

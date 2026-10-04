@@ -19,7 +19,7 @@ use serde::Serialize;
 /// initial-ingest burst (embedder model download + `memory_worker` draining
 /// the first session) drain off the single-writer `tokio_rusqlite` connection
 /// without contending for disk/writer, and short enough (<< a typical
-/// multi-hour desktop session) that the first pass reliably fires.
+/// multi-hour session) that the first pass reliably fires.
 pub const STARTUP_DELAY: Duration = Duration::from_secs(5 * 60);
 
 /// Steady-state period between maintenance passes.
@@ -744,7 +744,7 @@ mod tests {
     /// "procedural_skill") with the given `tier`/`importance`, and
     /// `last_accessed_at = now + offset_ms` (so a NEGATIVE `offset_ms`
     /// places the row that many milliseconds in the PAST — matching the
-    /// spec's worked-example offsets, e.g. `-7_776_000_001` for "just over
+    /// boundary offsets, e.g. `-7_776_000_001` for "just over
     /// 90 days ago"). `now` is passed in (not read here) so a test can run
     /// `run_maintenance_once_at` against the SAME instant it seeded with —
     /// the 1ms-under-boundary offsets are racy otherwise.
@@ -915,7 +915,7 @@ mod tests {
     /// pass through `store.conn` (`tokio_rusqlite`), which dispatches to a real
     /// background OS thread — a fixed `yield_now` count is not a synchronization
     /// primitive for that hop, so this bounds the wait instead of guessing a
-    /// count (see obs #1582 / `sdd/rag-pool-telemetry/flake-fix`).
+    /// count.
     async fn await_tier(
         store: &MemoryStore,
         id: i64,
@@ -977,7 +977,7 @@ mod tests {
         assert_eq!(tier_of(&store, "memory", id).await, 3);
     }
 
-    // ── Extra triangulation — tier2, <180 days → unchanged ───────────────────
+    // ── tier2, <180 days → unchanged ─────────────────────────────────────────
 
     #[tokio::test]
     async fn tier2_under_180_days_unchanged() {
@@ -1395,9 +1395,7 @@ mod tests {
             .unwrap()
     }
 
-    /// Records `(role, text)` for every call — same "recording fake"
-    /// convention used at `worker.rs:337,369,411` / `state.rs:531-544`.
-    /// Reused here to pin which role `reembed_all` uses per table, and to
+    /// Records `(role, text)` for every call. Used to pin which role `reembed_all` uses per table, and to
     /// pin that `procedural_skill` embeds `skill_embedding_text(trigger,
     /// skill_name)` rather than a hand-rebuilt string.
     struct RecordingEmbedder {
@@ -1435,8 +1433,8 @@ mod tests {
     }
 
     /// Fails on exactly the Nth call (1-indexed), succeeds deterministically
-    /// on every other call — the seam the design names for the "one row's
-    /// embed fails, batch continues" failure-semantics test.
+    /// on every other call — the seam for the "one row's embed fails, batch
+    /// continues" failure-semantics test.
     struct FlakyEmbedder {
         fail_on_call: usize,
         calls: std::sync::atomic::AtomicUsize,
@@ -1571,8 +1569,8 @@ mod tests {
         seed_reembed_memory(&store, "will not survive the write", vec![1.0; 384]).await;
 
         // Force every write to fail (reads still work) so the failure lands
-        // in the batch's UPDATE transaction, not the SELECT — the seam the
-        // design calls out as distinct from a per-row embed failure.
+        // in the batch's UPDATE transaction, not the SELECT — a failure
+        // mode distinct from a per-row embed failure.
         store.conn.call(|c| c.execute("PRAGMA query_only = ON", [])).await.unwrap();
 
         let embedder: std::sync::Arc<dyn Embedder> =

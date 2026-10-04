@@ -143,14 +143,6 @@ impl Profile {
     }
 }
 
-/// Name of the project-relative configuration directory
-/// (`<project>/.clawg/config.json`, `<project>/.clawg/agents/*.json`).
-///
-/// Deliberately NOT profile-dependent: profile isolation protects the user's
-/// home data directory ([`data_dir`]); a folder that lives next to a project
-/// is shared by whoever opens that project, regardless of build type.
-pub const PROJECT_CONFIG_DIR: &str = ".clawg";
-
 /// Data directory for `profile`: `<home>/<profile.dir_name()>`, falling back
 /// to the current directory when the home directory cannot be determined.
 pub fn data_dir(profile: Profile) -> PathBuf {
@@ -186,15 +178,25 @@ pub fn token_file(base_dir: &std::path::Path) -> PathBuf {
     base_dir.join("token")
 }
 
+/// The file whose exclusive OS lock means "a process owns this profile's
+/// memory store" (`<base_dir>/memory.lock`). Only ever locked, never read or
+/// written — see [`store_owner_file`] for why the two are separate.
+pub fn store_lock_file(base_dir: &std::path::Path) -> PathBuf {
+    base_dir.join("memory.lock")
+}
+
+/// Where the store's holder says who it is (`<base_dir>/memory.owner`).
+///
+/// Separate from [`store_lock_file`] because on Windows a locked file cannot be
+/// read by other processes, and the whole point of this record is to be read by
+/// the process that just lost the lock.
+pub fn store_owner_file(base_dir: &std::path::Path) -> PathBuf {
+    base_dir.join("memory.owner")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn project_config_dir_is_fixed_and_not_profile_dependent() {
-        assert_eq!(PROJECT_CONFIG_DIR, ".clawg");
-        assert_ne!(PROJECT_CONFIG_DIR, Profile::Dev.dir_name());
-    }
 
     // ── resolve: unset / empty ──────────────────────────────────────────
 
@@ -354,6 +356,27 @@ mod tests {
     fn token_file_is_token_under_base_dir() {
         let base = PathBuf::from("/base");
         assert_eq!(token_file(&base), base.join("token"));
+    }
+
+    #[test]
+    fn store_lock_file_is_memory_lock_under_base_dir() {
+        let base = PathBuf::from("/base");
+        assert_eq!(store_lock_file(&base), base.join("memory.lock"));
+    }
+
+    #[test]
+    fn store_owner_file_is_memory_owner_under_base_dir() {
+        let base = PathBuf::from("/base");
+        assert_eq!(store_owner_file(&base), base.join("memory.owner"));
+    }
+
+    /// The lock is never read and the record is read by losers; on Windows a
+    /// locked file cannot be read by other processes, so merging them would
+    /// make the "who holds it" message unreadable exactly when it is needed.
+    #[test]
+    fn store_lock_file_and_store_owner_file_are_distinct() {
+        let base = PathBuf::from("/base");
+        assert_ne!(store_lock_file(&base), store_owner_file(&base));
     }
 
     #[test]

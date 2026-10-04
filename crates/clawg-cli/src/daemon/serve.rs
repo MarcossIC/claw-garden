@@ -11,21 +11,27 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use clawg_core::memory::bootstrap::{production_deps, run_embedder_bootstrap, LogSink};
+use clawg_core::memory::store_lock::StoreHolder;
+use clawg_core::memory::MemoryError;
 use clawg_core::paths::{data_dir, Profile};
 use clawg_core::runtime::MemoryRuntime;
 
 use super::api::{router, AppCtx};
 use super::lifecycle::{
     clear_state, generate_token, now_ms, write_state, write_token, DaemonState, LifecycleError,
-    SingleInstanceLock,
 };
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
     #[error(transparent)]
     Lifecycle(#[from] LifecycleError),
+    /// Another process (a second daemon or an evaluation run) owns the store.
+    /// Its own variant because it is not a fault: the fix is the user's, and
+    /// the message has to say so instead of reading like a corrupt database.
+    #[error("{0}; only one process can own the data directory, so close it (or run `clawg stop` if it is a daemon) and try again")]
+    StoreInUse(MemoryError),
     #[error("could not open the memory store: {0}")]
-    Memory(#[from] clawg_core::memory::MemoryError),
+    Memory(MemoryError),
     #[error("could not bind 127.0.0.1:{port}: {source}")]
     Bind {
         port: u16,
@@ -42,6 +48,15 @@ pub enum ServeError {
     Server(std::io::Error),
 }
 
+/// Splits "someone else has the store" from every other reason opening it can
+/// fail; see [`ServeError::StoreInUse`].
+fn classify_open_error(err: MemoryError) -> ServeError {
+    match err {
+        MemoryError::StoreInUse { .. } => ServeError::StoreInUse(err),
+        other => ServeError::Memory(other),
+    }
+}
+
 /// Runs the daemon until Ctrl-C or `POST /v1/shutdown`.
 ///
 /// `port` of `0` asks the OS for an ephemeral port; the real one is what gets
@@ -54,13 +69,15 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
         source,
     })?;
 
-    // Taken BEFORE the store is opened. Two daemons on one database would each
-    // drain the ingest channel, and the dedup gate is only correct with a
-    // single sequential consumer — so losing this race has to mean "do not
-    // start", not "start and hope".
-    let _lock = SingleInstanceLock::acquire(&base_dir)?;
-
-    let (runtime, ingest_rx) = MemoryRuntime::open(base_dir.clone()).await?;
+    // The store lock is taken inside `open`, BEFORE SQLite is touched, and held
+    // by `runtime.store` for the life of this process. Two processes on one
+    // database would each drain the ingest channel, and the dedup gate is only
+    // correct with a single sequential consumer, so losing the race has to
+    // mean "do not start", not "start and hope". The same lock also keeps a
+    // second daemon out, which is why there is no daemon-specific lock any more.
+    let (runtime, ingest_rx) = MemoryRuntime::open(base_dir.clone(), StoreHolder::Daemon)
+        .await
+        .map_err(classify_open_error)?;
 
     // Background, never awaited: the model may not be on disk yet, and the
     // daemon must answer `/health` and accept saves throughout the download.
@@ -160,7 +177,36 @@ async fn shutdown_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clawg_core::memory::store_lock::{StoreHolder, StoreOwner};
+    use clawg_core::memory::MemoryError;
     use std::time::Duration;
+
+    /// The daemon losing the store to another process is a user-facing event,
+    /// not a database fault: the message must name the holder and say what to
+    /// do, and must not be dressed up as "could not open the memory store".
+    #[test]
+    fn a_lost_store_race_is_reported_with_the_holder_and_what_to_do() {
+        let err = classify_open_error(MemoryError::StoreInUse {
+            owner: Some(StoreOwner { holder: StoreHolder::Eval, pid: 4242, started_at_ms: 1 }),
+        });
+        let msg = err.to_string();
+        assert!(msg.contains("an evaluation run (pid 4242)"), "{msg}");
+        assert!(msg.contains("close it"), "{msg}");
+        assert!(!msg.contains("could not open"), "{msg}");
+    }
+
+    #[test]
+    fn a_lost_store_race_with_an_unknown_holder_still_explains_itself() {
+        let msg = classify_open_error(MemoryError::StoreInUse { owner: None }).to_string();
+        assert!(msg.contains("another process"), "{msg}");
+    }
+
+    #[test]
+    fn any_other_open_failure_keeps_the_could_not_open_wording() {
+        let msg = classify_open_error(MemoryError::Internal("boom".into())).to_string();
+        assert!(msg.starts_with("could not open the memory store"), "{msg}");
+        assert!(msg.contains("boom"), "{msg}");
+    }
 
     #[tokio::test]
     async fn shutdown_signal_waits_while_the_flag_is_false() {

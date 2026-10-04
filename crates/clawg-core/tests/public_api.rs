@@ -12,11 +12,14 @@
 
 use clawg_core::memory::clock::TimestampMs;
 use clawg_core::memory::events::{MemoryEvent, MemorySource};
-use clawg_core::memory::{search_all_memories, MemoryStore, RankedHit, SearchScope, TableKind};
+use clawg_core::memory::store_lock::StoreHolder;
+use clawg_core::memory::{
+    search_all_memories, MemoryError, MemoryStore, RankedHit, SearchScope, TableKind,
+};
 use clawg_core::models::chat::Role;
 use clawg_core::runtime::MemoryRuntime;
 
-// ── A4: structured search is public ───────────────────────────────────────
+// ── structured search is public ───────────────────────────────────────────
 
 /// The daemon builds a scope, so both constructors and every field must be
 /// reachable from another crate.
@@ -75,7 +78,7 @@ fn ranked_hit_serializes_to_json() {
     assert!(json["created_at"].is_i64(), "created_at must serialize as a millisecond number");
 }
 
-// ── A3: explicit memories are constructible from outside the crate ────────
+// ── explicit memories are constructible from outside the crate ────────────
 
 fn explicit_event(content: &str, memory_type: Option<&str>, importance: Option<f64>) -> MemoryEvent {
     MemoryEvent {
@@ -91,17 +94,42 @@ fn explicit_event(content: &str, memory_type: Option<&str>, importance: Option<f
     }
 }
 
-// ── A1: MemoryRuntime boots without a desktop runtime ─────────────────────
+// ── Exclusive ownership, seen from outside the crate ──────────────────────
 
-/// The whole point of work package A: a plain tokio runtime — no desktop
-/// framework, no `AppState` — can open the store and get a usable handle set
-/// back.
+/// The guarantee a host relies on: while one runtime is alive on a data
+/// directory, a second `open` — from ANY host — is refused and says who has it.
+#[tokio::test]
+async fn a_second_runtime_open_on_the_same_dir_is_refused_naming_the_first_holder() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let base = tmp.path().to_path_buf();
+
+    let (_first, _rx) = MemoryRuntime::open(base.clone(), StoreHolder::Daemon)
+        .await
+        .expect("first open");
+
+    let err = MemoryRuntime::open(base, StoreHolder::Eval)
+        .await
+        .err()
+        .expect("a second open must be refused while the first runtime lives");
+    match err {
+        MemoryError::StoreInUse { owner: Some(owner) } => {
+            assert_eq!(owner.holder, StoreHolder::Daemon);
+            assert_eq!(owner.pid, std::process::id());
+        }
+        other => panic!("expected StoreInUse naming the daemon, got {other:?}"),
+    }
+}
+
+// ── MemoryRuntime boots on a plain tokio runtime ──────────────────────────
+
+/// A plain tokio runtime, with no host framework, can open the store and get a
+/// usable handle set back.
 #[tokio::test]
 async fn memory_runtime_open_creates_the_db_and_returns_a_usable_store() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let base = tmp.path().to_path_buf();
 
-    let (rt, _rx) = MemoryRuntime::open(base.clone())
+    let (rt, _rx) = MemoryRuntime::open(base.clone(), StoreHolder::Daemon)
         .await
         .expect("MemoryRuntime::open must succeed on a fresh dir");
 
@@ -131,7 +159,7 @@ async fn memory_runtime_open_creates_the_db_and_returns_a_usable_store() {
     // The access tracker's flush worker is running (record must never block).
     rt.access_tracker.record(vec![1, 2, 3]);
 
-    // workspaces() points at <base_dir>/workspaces, the path chat.rs uses.
+    // workspaces() points at <base_dir>/workspaces.
     let wm = rt.workspaces();
     assert_eq!(
         wm.workspace_path("agent-1", None),
@@ -139,9 +167,9 @@ async fn memory_runtime_open_creates_the_db_and_returns_a_usable_store() {
     );
 }
 
-/// `new_for_test` is the daemon's and the desktop's shared shortcut: an
-/// in-memory store with the embedder already seeded, so nothing races a
-/// bootstrap that does not exist under test.
+/// `new_for_test` is a shortcut for hosts' tests: an in-memory store with the
+/// embedder already seeded, so nothing races a bootstrap that does not exist
+/// under test.
 #[cfg(feature = "testing")]
 #[tokio::test]
 async fn memory_runtime_new_for_test_preseeds_the_embedder() {
@@ -156,8 +184,8 @@ async fn memory_runtime_new_for_test_preseeds_the_embedder() {
     );
 }
 
-/// End to end with no desktop runtime: spawn the ingest worker future on
-/// plain tokio, push one event, and see a row land.
+/// End to end: spawn the ingest worker future on plain tokio, push one event,
+/// and see a row land.
 #[cfg(feature = "testing")]
 #[tokio::test]
 async fn memory_runtime_ingest_worker_drains_an_event_into_a_row() {
@@ -168,7 +196,7 @@ async fn memory_runtime_ingest_worker_drains_an_event_into_a_row() {
 
     let worker = tokio::spawn(rt.ingest_worker(rx));
 
-    tx.send(explicit_event("the daemon ingests with no desktop runtime", None, None))
+    tx.send(explicit_event("the daemon ingests on a plain tokio runtime", None, None))
         .expect("send");
     drop(tx);
     drop(rt);
@@ -185,7 +213,7 @@ async fn memory_runtime_ingest_worker_drains_an_event_into_a_row() {
 }
 
 /// The maintenance loop runs forever, so the assertion is that its future is
-/// spawnable at all — the same `Send + 'static` proof the desktop wrapper has.
+/// spawnable at all (`Send + 'static`).
 #[cfg(feature = "testing")]
 #[tokio::test]
 async fn memory_runtime_maintenance_worker_returns_a_spawnable_future() {

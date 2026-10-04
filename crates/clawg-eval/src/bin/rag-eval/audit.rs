@@ -36,7 +36,7 @@ const MAX_SATURATION: f64 = 0.90;
 
 /// Agreement with the modal ranking above which the ordering is effectively
 /// independent of the query. Measured at 0.69 and 0.62 on earlier sets, both
-/// of which were flagged in the plan as evidence the ranking ignored the
+/// of which were taken as evidence that the ranking ignored the
 /// query; the gate sits above those so it fires on a set that is worse, not on
 /// one merely known to be imperfect.
 const MAX_MODAL_AGREEMENT: f64 = 0.80;
@@ -166,8 +166,8 @@ fn saturation(cases: &[CaseResult], pick: impl Fn(&CaseResult) -> f64) -> f64 {
 /// For every rank position, the modal document is whichever one appears there
 /// most often across cases; a case's agreement is the fraction of positions
 /// where it matches. High agreement means the ordering barely responds to the
-/// query — the finding that opened the score-weighting phase, computed by hand
-/// there and computed here instead.
+/// query — the symptom of a ranking driven by document attributes instead of
+/// by the query.
 pub fn modal_rank_agreement(cases: &[CaseResult]) -> f64 {
     let scored: Vec<&CaseResult> = cases.iter().filter(|c| !c.ranked_refs.is_empty()).collect();
     if scored.is_empty() {
@@ -268,8 +268,8 @@ fn pearson(xs: &[f64], ys: &[f64]) -> f64 {
 ///
 /// `+1.0` means the two orderings coincide exactly: the most important
 /// document is first for every query, whatever was asked. That is the
-/// score-weighting finding, and this is the number that phase needs in order
-/// to claim it improved anything.
+/// degenerate case, and this is the number a scoring change has to bring down
+/// before it can claim to have improved anything.
 ///
 /// Only documents that appear in at least one ranking are included — a
 /// document that never surfaces has no mean rank, and treating its absence as

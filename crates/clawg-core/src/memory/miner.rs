@@ -1,8 +1,6 @@
 //! Trajectory miner — pipeline + Golden Trajectory gating.
 //!
-//! Fire-and-forget entry point `run_miner`, spawned from `commands/session.rs`
-//! on session close, replacing `episodic_writer::run_episodic_writer`. Always
-//! delegates to `episodic_writer::run_episodic_writer_core` to INSERT the
+//! Run on session close. Always delegates to `episodic_writer::run_episodic_writer_core` to INSERT the
 //! episodic trajectory, then — only if `success_score` clears
 //! [`GOLDEN_SCORE_THRESHOLD`] — extracts tool-call sequences and mines
 //! [`MinedSkillCandidate`]s, promoting recurring ones into `procedural_skill`
@@ -42,7 +40,7 @@ use crate::providers::{AiProvider, StreamSender};
 /// no resolution to answer.
 pub(crate) const GOLDEN_SCORE_THRESHOLD: f64 = 0.85;
 
-/// Maximum wall-clock time allowed for the namer LLM call (molde `EXTRACTOR_TIMEOUT`).
+/// Maximum wall-clock time allowed for the namer LLM call (same budget as `EXTRACTOR_TIMEOUT`).
 pub const NAMER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Root-cause category vocabulary. Closed to exactly these 3 snake_case
@@ -361,9 +359,8 @@ async fn llm_root_cause(
     parse_root_cause(&text)
 }
 
-/// Testable core of the mining pipeline — takes explicit dependencies instead
-/// of the desktop `AppHandle`, so it can be unit tested without a running desktop
-/// app. Mirrors `extractor::run_extraction_core` / `run_episodic_writer_core`.
+/// Testable core of the mining pipeline — takes explicit dependencies, so it
+/// can be unit tested without any host. Mirrors `extractor::run_extraction_core` / `run_episodic_writer_core`.
 ///
 /// Flow: (1) delegate to `run_episodic_writer_core` — the episodic trajectory
 /// is INSERTed unconditionally, before any gate; `None` short-circuits to
@@ -578,7 +575,7 @@ mod tests {
     // ── Pinned constant values ───────────────────────────────────────────────
 
     #[test]
-    fn consts_have_locked_values() {
+    fn consts_have_pinned_values() {
         assert_eq!(GOLDEN_SCORE_THRESHOLD, 0.85);
         assert_eq!(NAMER_TIMEOUT, std::time::Duration::from_secs(30));
         assert_eq!(MAX_SKILL_NAME_STEPS, 4);
@@ -587,7 +584,7 @@ mod tests {
     // ── RCA constant values ──────────────────────────────────────────────────
 
     #[test]
-    fn rca_consts_have_locked_values() {
+    fn rca_consts_have_pinned_values() {
         assert_eq!(RCA_MISSING_CONTEXT, "missing_context");
         assert_eq!(RCA_MODEL_LIMITATION, "model_limitation");
         assert_eq!(RCA_PROCEDURAL_ERROR, "procedural_error");
@@ -598,7 +595,7 @@ mod tests {
     // ── RECURRING_THRESHOLD, serialize_tool_sequence, filter_recurring ───────
 
     #[test]
-    fn recurring_threshold_locked_value() {
+    fn recurring_threshold_pinned_value() {
         assert_eq!(RECURRING_THRESHOLD, 2);
     }
 
@@ -892,8 +889,8 @@ mod tests {
 
     // low score (no-clean, 1 unresolved / 2 tool_calls => 0.15) → 1 row,
     // vec![] candidates, 0 namer LLM calls. The SAME
-    // provider_by_agent is reused for RCA below the gate (design: "no new
-    // spawn, no re-fetch") — this history has 1 error_encountered, so RCA
+    // provider_by_agent is reused for RCA below the gate (no new spawn, no
+    // re-fetch) — this history has 1 error_encountered, so RCA
     // DOES call the provider once; the namer itself is still never invoked
     // (extract_tool_sequences/heuristic naming only run past the golden gate).
     #[tokio::test]
@@ -1019,7 +1016,7 @@ mod tests {
         }
         let history = vec![("agent-a".to_string(), msgs)];
 
-        // Spec rev2 Boundary scenario: assert the score COMPUTED by
+        // Boundary case: assert the score COMPUTED by
         // build_trajectory for this exact history, with epsilon — expected
         // derived from the pinned formula, not hardcoded: BASE 0.4 + bonus
         // 0.0 (last message is Role::Tool, not ended_clean) − 0.5·(1
@@ -1094,8 +1091,7 @@ mod tests {
         // `std::hint::black_box` keeps these opaque to clippy's constant-folding
         // (assertions_on_constants) — the values ARE compile-time constants, but
         // the point of this test is to lock the boundary AT RUNTIME comparison.
-        // `<=` (not `!(a > b)`) mirrors the reconciled production form (design
-        // §Reconciliación item 3) and avoids `neg_cmp_op_on_partial_ord`.
+        // `<=` (not `!(a > b)`) mirrors the production form and avoids `neg_cmp_op_on_partial_ord`.
         let at_boundary = std::hint::black_box(0.85_f64);
         let above_boundary = std::hint::black_box(0.9_f64);
         assert!(at_boundary <= GOLDEN_SCORE_THRESHOLD, "exact 0.85 must NOT pass — strict `>`");
@@ -1780,8 +1776,7 @@ mod tests {
         assert!(!prompt.contains(&full), "prompt must NOT contain the full untruncated 600-char item");
     }
 
-    // Spec R "RCA prompt carries the classification inputs" — Scenario
-    // "Prompt contains all three fields".
+    // The RCA prompt carries all three classification inputs.
     #[test]
     fn build_rca_prompt_contains_task_errors_and_resolution() {
         let errors = vec!["boom".to_string(), "kaboom".to_string()];
@@ -2019,7 +2014,7 @@ mod tests {
         vec![("agent-a".to_string(), msgs)]
     }
 
-    // Design test 12: golden/clean (0.9) → root_cause NULL, provider not
+    // Golden/clean (0.9) → root_cause NULL, provider not
     // called for RCA. Chat-only history (no tool_calls) so the namer's
     // llm_name is also never invoked — isolates the assertion to RCA.
     #[tokio::test]
@@ -2052,7 +2047,7 @@ mod tests {
         assert!(fetch_root_cause(&store, "sess-rca-golden").await.is_none(), "root_cause must stay NULL");
     }
 
-    // Design test 13: non-clean + zero errors → NULL, no LLM call.
+    // Non-clean + zero errors → NULL, no LLM call.
     #[tokio::test]
     async fn rca_nonclean_zero_errors_skips_rca() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -2083,7 +2078,7 @@ mod tests {
         assert!(fetch_root_cause(&store, "sess-rca-nonclean-noerr").await.is_none());
     }
 
-    // Design test 14: non-clean + errors + FakeProvider valid category =>
+    // Non-clean + errors + FakeProvider valid category =>
     // root_cause == category.
     #[tokio::test]
     async fn rca_nonclean_with_errors_valid_category_persists() {
@@ -2118,7 +2113,7 @@ mod tests {
         );
     }
 
-    // Design test 15: out-of-vocabulary response => root_cause stays NULL.
+    // Out-of-vocabulary response => root_cause stays NULL.
     #[tokio::test]
     async fn rca_out_of_vocabulary_response_stays_null() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -2148,7 +2143,7 @@ mod tests {
         assert!(fetch_root_cause(&store, "sess-rca-oov").await.is_none(), "OOV category must leave root_cause NULL");
     }
 
-    // Design test 16: no provider entry for the agent => NULL, no panic.
+    // No provider entry for the agent => NULL, no panic.
     #[tokio::test]
     async fn rca_no_provider_for_agent_stays_null() {
         let store = MemoryStore::new_for_test().await.unwrap();

@@ -549,7 +549,7 @@ mod tests {
         }
     }
 
-    // ── age_secs truncation — an exact port of the original integer division ──
+    // ── age_secs truncation — behaves like integer division ──
 
     #[test]
     fn age_secs_truncates_toward_zero() {

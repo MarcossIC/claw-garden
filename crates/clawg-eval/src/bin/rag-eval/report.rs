@@ -153,10 +153,10 @@ pub struct GoldenSetProvenance {
     pub content_sha256: String,
 }
 
-/// Case and pair counts below which a golden set cannot carry a claim. Taken
-/// from the sizes the improvement plan specifies for the domain set (~30–50
-/// retrieval cases, ~20–30 contradiction pairs) rather than picked here: a set
-/// that reaches them is the set that plan asked for.
+/// Case and pair counts below which a golden set cannot carry a claim. Sized
+/// for a domain set (~30–50 retrieval cases, ~20–30 contradiction pairs)
+/// rather than picked arbitrarily: a set that reaches them is large enough to
+/// support a comparison.
 const DOMAIN_SET_MIN_CASES: usize = 30;
 const DOMAIN_SET_MIN_PAIRS: usize = 20;
 
@@ -358,7 +358,7 @@ pub fn aggregate_by_lang(cases: &[CaseResult]) -> Vec<LangAggregate> {
 }
 
 /// The on-disk filename for a run's results: `{date}-{mode}.json`, matching
-/// the spec's `docs/eval/results/{fecha}-{config}.json` pattern with `mode`
+/// the `docs/eval/results/{fecha}-{config}.json` pattern with `mode`
 /// standing in for `config` (the only axis this harness varies today) —
 /// unless `tag` is given, in which case it becomes `{date}-{mode}-{tag}.json`.
 /// The tag exists so two real runs on the same day (a baseline and its
@@ -377,7 +377,7 @@ pub fn results_filename(date: &str, mode: Mode, tag: Option<&str>) -> String {
 }
 
 /// One grid cell of a sweep: the config that produced it, where its own
-/// full `RunResults` file landed, and the two audit numbers gate 3.11 reads
+/// full `RunResults` file landed, and the two audit numbers the sweep gate reads
 /// (`importance_rank_dominance`/`modal_rank_agreement`) — computed for every
 /// point regardless of whether `--audit` was passed, since the sweep gate
 /// needs them unconditionally, not only when a full `AuditReport` was asked
@@ -419,9 +419,8 @@ fn imp_min_of(cfg: &EvalScoringConfig) -> f64 {
     cfg.importance_base + cfg.importance_clamp_lo / cfg.importance_divisor
 }
 
-/// Sorts sweep points by `(imp_min, cos_floor)` ascending, matching the
-/// design's curve-index ordering so two sweeps over the same grid produce
-/// byte-comparable JSON. `None` (no cosine re-scale) sorts before every
+/// Sorts sweep points by `(imp_min, cos_floor)` ascending so two sweeps over
+/// the same grid produce byte-comparable JSON. `None` (no cosine re-scale) sorts before every
 /// `Some` floor: it is the "off" position of that axis, logically less than
 /// any active floor value rather than an arbitrary tie-break.
 pub fn sort_sweep_points(points: &mut [SweepPoint]) {

@@ -1,6 +1,6 @@
-//! On-disk liveness record, bearer token, and the single-instance lock.
+//! On-disk liveness record and bearer token.
 //!
-//! Three separate files under the profile's data directory, each with a reason
+//! Two separate files under the profile's data directory, each with a reason
 //! to be separate:
 //!
 //! * `daemon.json` — **public**. Anything that wants to know whether a daemon
@@ -8,13 +8,15 @@
 //! * `token` — **secret**. Its file permissions are the access control for the
 //!   whole loopback API; merging it into `daemon.json` would hand the token to
 //!   every liveness check.
-//! * `daemon.lock` — **never read**. Only its advisory lock matters, and a lock
-//!   has to outlive every write to the other two, so it cannot be either of them.
 //!
-//! Two daemons on one data directory would each run an ingest worker, and the
-//! pipeline's dedup gate is only correct with a single sequential consumer of
-//! the channel — hence [`SingleInstanceLock`], which makes "one daemon per
-//! profile" an OS-enforced fact rather than a convention.
+//! Nothing here keeps two daemons apart. Two daemons on one data directory
+//! would each run an ingest worker, and the pipeline's dedup gate is only
+//! correct with a single sequential consumer of the channel, but that is a
+//! property of the *store*, not of the daemon, so the exclusion lives where the
+//! store is opened: `clawg_core::memory::store_lock`, taken inside
+//! `MemoryStore::open`. It covers a second daemon and an evaluation run alike.
+//! (Older builds kept a `daemon.lock` here; the file may still sit on disk and
+//! is inert.)
 
 use std::fs::File;
 use std::io::Write;
@@ -41,17 +43,9 @@ pub struct DaemonState {
     pub started_at_ms: u64,
 }
 
-/// Failure in the lifecycle files or the instance lock.
+/// Failure in the lifecycle files.
 #[derive(Debug, thiserror::Error)]
 pub enum LifecycleError {
-    /// Another process already holds this profile's lock. `state` is whatever
-    /// `daemon.json` said, when it could be read — best-effort, because the
-    /// holder may be mid-startup and not have written it yet.
-    #[error("a clawg daemon is already running for this data directory{}", match .state {
-        Some(s) => format!(" (pid {}, port {})", s.pid, s.port),
-        None => String::new(),
-    })]
-    AlreadyRunning { state: Option<DaemonState> },
     #[error("lifecycle file error at {path}: {source}")]
     Io {
         path: PathBuf,
@@ -148,43 +142,6 @@ pub fn read_token(base_dir: &Path) -> Option<String> {
 pub fn clear_state(base_dir: &Path) {
     let _ = std::fs::remove_file(daemon_state_file(base_dir));
     let _ = std::fs::remove_file(token_file(base_dir));
-}
-
-/// An advisory exclusive lock on `<base_dir>/daemon.lock`, held for as long as
-/// the value lives.
-///
-/// The lock is on a file that is never read or written, only locked — so a
-/// crashed daemon leaves no state to clean up: the OS drops the lock with the
-/// process, and the next start acquires it immediately. A pid-file scheme would
-/// instead need to decide whether a recorded pid is stale, which is unanswerable
-/// after pid reuse.
-#[derive(Debug)]
-pub struct SingleInstanceLock {
-    // Never read; the `Drop` that releases the OS lock is the whole value.
-    _file: File,
-}
-
-impl SingleInstanceLock {
-    /// Takes the lock, or reports who already has it.
-    pub fn acquire(base_dir: &Path) -> Result<Self, LifecycleError> {
-        let path = base_dir.join("daemon.lock");
-        let file = File::options()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(io_err(&path))?;
-
-        // Fully qualified: `std::fs::File` grew inherent `try_lock*` methods,
-        // and an unqualified call would silently resolve to whichever the
-        // compiler prefers — with a different return type and different
-        // semantics than the one this code was written against.
-        match fs2::FileExt::try_lock_exclusive(&file) {
-            Ok(()) => Ok(Self { _file: file }),
-            Err(_) => Err(LifecycleError::AlreadyRunning { state: read_state(base_dir) }),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -290,52 +247,6 @@ mod tests {
         assert!(!dir.path().join("token").exists());
 
         clear_state(dir.path()); // idempotent: shutdown must never fail here
-    }
-
-    #[test]
-    fn first_lock_succeeds_and_creates_the_lock_file() {
-        let dir = tmp();
-        let _lock = SingleInstanceLock::acquire(dir.path()).expect("first acquire");
-        assert!(dir.path().join("daemon.lock").exists());
-    }
-
-    /// The guarantee the whole type exists for: while one holder lives, a
-    /// second daemon on the same data directory cannot start.
-    #[test]
-    fn second_lock_fails_while_the_first_is_held_and_succeeds_after_drop() {
-        let dir = tmp();
-        let first = SingleInstanceLock::acquire(dir.path()).expect("first acquire");
-
-        let err = SingleInstanceLock::acquire(dir.path())
-            .expect_err("a second lock must be refused while the first is held");
-        assert!(matches!(err, LifecycleError::AlreadyRunning { .. }));
-
-        drop(first);
-        SingleInstanceLock::acquire(dir.path()).expect("acquire after the holder is dropped");
-    }
-
-    /// The refusal has to be actionable: when a state file exists, the message
-    /// names the process the user has to deal with.
-    #[test]
-    fn already_running_error_reports_the_recorded_pid_and_port() {
-        let dir = tmp();
-        write_state(dir.path(), &sample_state()).expect("write");
-        let _first = SingleInstanceLock::acquire(dir.path()).expect("first acquire");
-
-        let err = SingleInstanceLock::acquire(dir.path()).expect_err("refused");
-        let msg = err.to_string();
-        assert!(msg.contains("4242"), "message was: {msg}");
-        assert!(msg.contains("27381"), "message was: {msg}");
-    }
-
-    /// A holder that has not written `daemon.json` yet still has to produce a
-    /// usable message rather than a panic or an empty string.
-    #[test]
-    fn already_running_error_without_a_state_file_still_explains_itself() {
-        let dir = tmp();
-        let _first = SingleInstanceLock::acquire(dir.path()).expect("first acquire");
-        let err = SingleInstanceLock::acquire(dir.path()).expect_err("refused");
-        assert!(err.to_string().contains("already running"), "{err}");
     }
 
     #[cfg(unix)]

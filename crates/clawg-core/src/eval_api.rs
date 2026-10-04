@@ -32,7 +32,7 @@ use crate::memory::model_download;
 use crate::memory::score::{ImportanceFactor, ScoringConfig};
 use crate::memory::search::{search_all_memories_with_scoring, SearchScope};
 use crate::memory::store_insert::{CreatedByType, MemoryType, NewMemoryRecord};
-use crate::memory::tier::compute_tier;
+use crate::memory::store_lock::StoreHolder;
 use crate::memory::TableKind;
 
 /// Opaque handle to a memory store. Every operation available on it is a
@@ -230,7 +230,7 @@ impl EvalStore {
     /// Opens (creating if absent) a store rooted at `base_dir`, migrations
     /// included — the same path production startup takes.
     pub async fn open(base_dir: &Path) -> Result<Self, EvalError> {
-        MemoryStore::open(base_dir)
+        MemoryStore::open(base_dir, StoreHolder::Eval)
             .await
             .map(EvalStore)
             .map_err(|e| EvalError::Open(e.to_string()))
@@ -431,9 +431,8 @@ pub const SPECIAL_TOKEN_RESERVE: usize = crate::memory::embedder::SPECIAL_TOKEN_
 
 /// Delegates to `memory::query_context::compose_query_context` — one source
 /// of truth for both production and this harness, so the `--follow-up`
-/// treatment arm composes its query exactly the way
-/// `commands/chat.rs::compute_memory_prefix` does, never a reimplementation
-/// that could quietly diverge from it.
+/// treatment arm composes its query exactly the way production does, never a
+/// reimplementation that could quietly diverge from it.
 pub fn compose_query_context(
     current: &str,
     prior_turns_newest_first: &[String],
@@ -697,7 +696,7 @@ mod tests {
 
     #[tokio::test]
     async fn recreate_fts_with_tokenizer_indexes_rows_inserted_after_the_swap() {
-        // Confirms the "no backfill needed" design claim: the AFTER INSERT
+        // Confirms no backfill is needed: the AFTER INSERT
         // trigger must survive the DROP TABLE, so a row inserted after the
         // swap is still lexically findable with no extra step.
         let dir = tempfile::tempdir().unwrap();

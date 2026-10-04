@@ -430,10 +430,9 @@ async fn ensure_model_with_oracle_spec_inner(
     //
     // Emit `Verify` here, but DO NOT emit `Done`.
     // The semantic `Done` event means "the embedder is ready to use" and that
-    // is only true after the bootstrap layer (lib.rs::start_embedder_bootstrap)
-    // has called `FastEmbedLocal::from_bytes` + filled the OnceCell. Emitting
-    // `Done` here as well would deliver TWO `done` events to the UI on the
-    // happy path. On disk the model
+    // is only true after the bootstrap layer (`memory::bootstrap`) has called
+    // `FastEmbedLocal::from_bytes` + filled the OnceCell. Emitting `Done` here
+    // as well would deliver TWO `done` events on the happy path. On disk the model
     // is already valid by the time we return Ok — the `ModelFiles` return value
     // is the contract, the wire event is not.
     if let Some(tx) = progress {
@@ -757,8 +756,8 @@ fn commit_file(partial: &Path, final_path: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
-    // Project convention (see state.rs): use std::env::temp_dir() + unique
-    // subdir per test rather than the `tempfile` crate.
+    // Use std::env::temp_dir() + a unique subdir per test rather than the
+    // `tempfile` crate.
     struct TestDir {
         path: std::path::PathBuf,
     }
@@ -877,7 +876,7 @@ mod tests {
         vec![
             FixtureFile {
                 path: "onnx/model.onnx",
-                bytes: b"fake-onnx-model-bytes-T040".to_vec(),
+                bytes: b"fake-onnx-model-bytes".to_vec(),
                 kind: FileKind::Onnx,
             },
             FixtureFile {
@@ -1386,8 +1385,8 @@ mod tests {
         // → verify` and STOP there. The semantic terminal `done` event means
         // "embedder is ready to use" — that is the bootstrap's responsibility
         // to emit AFTER `FastEmbedLocal::from_bytes` + `OnceCell::set` succeed.
-        // If `ensure_model` also emitted `Done`, the forwarder→app.emit path
-        // in `lib.rs` would deliver TWO `done` events to the UI on the happy
+        // If `ensure_model` also emitted `Done`, the forwarder→sink path in
+        // `memory::bootstrap` would deliver TWO `done` events on the happy
         // path.
         let tmp = TestDir::new("evt-order");
         let files = fixture_files();
@@ -1423,8 +1422,8 @@ mod tests {
             "expected at least one chunk event"
         );
         // ensure_model MUST NOT emit Done — that responsibility moved to the
-        // bootstrap layer (lib.rs::start_embedder_bootstrap) so the UI receives
-        // EXACTLY ONE terminal `done`, after the embedder is actually loadable.
+        // bootstrap layer (`memory::bootstrap`) so a listener receives EXACTLY
+        // ONE terminal `done`, after the embedder is actually loadable.
         assert!(
             !phases.iter().any(|p| *p == "done"),
             "ensure_model must NOT emit Done; got {phases:?}"

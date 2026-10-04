@@ -1,4 +1,4 @@
-//! Persistent-memory substrate for the v1 RAG roadmap (Phase 1 of 7).
+//! Persistent-memory substrate: a SQLite-backed store with vector search.
 //!
 //! # Architecture
 //!
@@ -11,8 +11,8 @@
 //!
 //! [`MemoryStore`] wraps a [`tokio_rusqlite::Connection`], which is itself `Clone`
 //! (it is a channel handle — cloning hands you another handle to the same background
-//! thread). Therefore, callers may `.clone()` the store freely and the outer `Arc` in
-//! `AppState` is only a cheap reference-count, not exclusion.
+//! thread). Therefore, callers may `.clone()` the store freely, and wrapping it in an
+//! `Arc` is only a cheap reference-count, not exclusion.
 //!
 //! # `disputed_against`
 //!
@@ -27,6 +27,7 @@ pub mod db;
 pub mod embedder;
 pub mod events;
 pub mod store_insert;
+pub mod store_lock;
 pub mod worker;
 pub mod error;
 pub mod identity;

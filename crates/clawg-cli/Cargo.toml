@@ -30,7 +30,6 @@ thiserror.workspace = true
 log.workspace = true
 dirs.workspace = true
 rand.workspace = true
-fs2.workspace = true
 reqwest.workspace = true
 
 # `rt-multi-thread` for `#[tokio::main]`, `signal` for Ctrl-C-driven graceful
@@ -45,9 +44,6 @@ tokio = { workspace = true, features = ["rt-multi-thread", "signal", "net", "io-
 clap = { version = "4", features = ["derive"] }
 axum = "0.8"
 env_logger = "0.11"
-# Declared per-crate exactly like `src-tauri`'s own `rmcp` line. Cargo unifies
-# the two on one 1.3.0 build; the feature sets are additive, so the desktop's
-# client-side features and this crate's server-side features coexist.
 rmcp = { version = "1", features = ["server", "transport-io", "macros", "schemars"] }
 # rmcp 1.3 generates tool schemas with schemars 1.x — a 0.8 here would not
 # satisfy its `JsonSchema` bound.

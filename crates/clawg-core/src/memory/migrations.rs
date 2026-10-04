@@ -26,7 +26,7 @@ pub use migrations::runner;
 mod tests {
     use super::*;
 
-    /// E.1-test: Smoke test — runner() is callable without a DB connection.
+    /// Smoke test — runner() is callable without a DB connection.
     /// This is a compile-time + API-availability test.
     #[test]
     fn runner_is_accessible() {

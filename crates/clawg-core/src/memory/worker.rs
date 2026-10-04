@@ -1,6 +1,6 @@
 //! Memory ingest worker.
 //!
-//! Spawned once at app startup from `lib.rs::run()` setup hook. Drains
+//! Spawned once per process (see `MemoryRuntime::ingest_worker`). Drains
 //! `MemoryEvent`s from the channel, selects the appropriate chunker, embeds
 //! each chunk, and inserts both `memory` and `memory_vectors` rows atomically.
 //! Failure isolation: errors are logged and the worker NEVER panics.
@@ -344,8 +344,8 @@ async fn process_event(
 /// Resolves the shared tokenizer exactly once and builds the chat chunker
 /// from that SAME value: `tokenizer_cell` and the returned chunker can never
 /// disagree about which parse of `tokenizer.json` they got, and the file is
-/// never read twice for one process. Pulled out of `start_memory_worker` so
-/// this wiring is unit-testable without a desktop `AppHandle`.
+/// never read twice for one process. Pulled out of the worker's setup so this
+/// wiring is unit-testable on its own.
 pub fn resolve_tokenizer_and_chunker(
     base_dir: &std::path::Path,
     tokenizer_cell: &OnceCell<Arc<tokenizers::Tokenizer>>,
@@ -1614,7 +1614,7 @@ mod tests {
     /// collapsing first and gating once per survivor would under-count —
     /// today's per-chunk loop hits the gate twice for this input. Both copies
     /// must be replayed through `absorb_duplicate`, so `absorbed` must move
-    /// by 2, not 1 (design's under-count fix).
+    /// by 2, not 1.
     #[tokio::test]
     async fn existing_duplicate_chunks_absorb_once_per_copy_not_once_per_event() {
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());

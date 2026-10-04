@@ -1,6 +1,6 @@
-//! AST-aware code chunker (Phase 3 — REQ-CHK-004).
+//! AST-aware code chunker.
 //!
-//! Phase 3 scope: Rust, TypeScript, Python. Unknown languages or parse failures
+//! Supported languages: Rust, TypeScript, Python. Unknown languages or parse failures
 //! degrade gracefully to the shared `TokenSplitter`. NEVER panics.
 
 use std::sync::Mutex;
@@ -12,7 +12,7 @@ use super::Chunk;
 /// behind a `Mutex` (tree-sitter `Parser` is `Send` but NOT `Sync` —
 /// verified via the compile-time block below).
 ///
-/// Phase 3 scope: Rust, TypeScript, Python. Unknown languages OR parse
+/// Supported languages: Rust, TypeScript, Python. Unknown languages OR parse
 /// failures degrade to the shared `TokenSplitter`. NEVER panics.
 pub struct CodeChunker {
     rust: Mutex<tree_sitter::Parser>,

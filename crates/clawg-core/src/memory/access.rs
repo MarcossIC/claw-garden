@@ -3,7 +3,7 @@
 /// [`AccessTracker`] receives memory IDs via [`record`] from the retrieval hot
 /// path and forwards them to an async worker over an unbounded channel.  The
 /// worker uses `tokio::select!` to flush the buffer either when 30 seconds
-/// elapse (FLUSH-1) or when ≥500 entries accumulate (FLUSH-2).
+/// elapse or when ≥500 entries accumulate.
 ///
 /// # Design decisions
 ///
@@ -13,9 +13,9 @@
 /// * `record` is synchronous, infallible, and zero-copy beyond the `Vec<i64>`
 ///   already owned by the caller.
 /// * Empty vectors are discarded at `record` entry — no channel traffic for
-///   no-op calls (TRACK-2).
+///   no-op calls.
 /// * Flush errors are logged via `log::warn!` and the worker continues —
-///   never panics (FLUSH-3).
+///   never panics.
 ///
 /// [`record`]: AccessTracker::record
 
@@ -31,7 +31,7 @@ pub struct AccessTracker {
 }
 
 // Compile-time guard — `AccessTracker` MUST be `Send + Sync` so it can live
-// inside `Arc<AccessTracker>` in `AppState` and be shared across threads.
+// inside an `Arc<AccessTracker>` and be shared across threads.
 const _: fn() = || {
     fn _ss<T: Send + Sync>() {}
     _ss::<AccessTracker>();
@@ -40,12 +40,12 @@ const _: fn() = || {
 impl AccessTracker {
     /// Create a new `AccessTracker` and spawn the background flush worker.
     ///
-    /// The worker uses `tokio::select!` with two triggers (REQ-FLUSH):
-    /// * **FLUSH-1** — 30-second interval tick.
-    /// * **FLUSH-2** — buffer reaches ≥500 entries.
+    /// The worker uses `tokio::select!` with two triggers:
+    /// * a 30-second interval tick;
+    /// * the buffer reaching ≥500 entries.
     ///
-    /// Flush errors are logged via `log::warn!` and the loop continues
-    /// (FLUSH-3).  The worker exits cleanly when all `Sender`s are dropped.
+    /// Flush errors are logged via `log::warn!` and the loop continues.
+    /// The worker exits cleanly when all `Sender`s are dropped.
     pub fn new(conn: Connection) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<i64>>();
 
@@ -69,14 +69,14 @@ impl AccessTracker {
                             Some(ids) => {
                                 buffer.extend(ids);
                                 if buffer.len() >= 500 {
-                                    // FLUSH-2: size trigger
+                                    // Size trigger.
                                     flush(&conn, std::mem::take(&mut buffer)).await;
                                 }
                             }
                         }
                     }
                     _ = interval.tick() => {
-                        // FLUSH-1: timer trigger
+                        // Timer trigger.
                         if !buffer.is_empty() {
                             flush(&conn, std::mem::take(&mut buffer)).await;
                         }
@@ -91,7 +91,7 @@ impl AccessTracker {
     /// Record that the given memory IDs were accessed on the retrieval hot path.
     ///
     /// The call returns immediately without awaiting.  Empty `ids` vectors are
-    /// silently discarded (TRACK-2) — no channel send occurs.
+    /// silently discarded — no channel send occurs.
     pub fn record(&self, ids: Vec<i64>) {
         if ids.is_empty() {
             return;
@@ -110,10 +110,10 @@ impl AccessTracker {
 /// parameterised `WITH updates … UPDATE memory … FROM updates` statement.
 /// The `MAX(memory.last_accessed_at, updates.last_ts)` guard prevents
 /// anti-regression from out-of-order batches.
-/// `compute_tier` is called inside the same statement (FLUSH-4).
+/// `compute_tier` is called inside the same statement.
 ///
 /// On error: logs via `log::warn!` and returns normally — the worker loop
-/// MUST continue, never panic (FLUSH-3).
+/// MUST continue, never panic.
 async fn flush(conn: &Connection, buffer: Vec<i64>) {
     if buffer.is_empty() {
         return;
@@ -122,7 +122,7 @@ async fn flush(conn: &Connection, buffer: Vec<i64>) {
     // Timestamp for this flush batch (milliseconds since UNIX epoch).
     let now_ms = TimestampMs::now();
 
-    // Coalesce: sum hits per unique ID (HashMap dedup — design §6:739).
+    // Coalesce: sum hits per unique ID.
     let mut deduped: HashMap<i64, i64> = HashMap::new();
     for id in buffer {
         *deduped.entry(id).or_insert(0) += 1;
@@ -140,7 +140,7 @@ async fn flush(conn: &Connection, buffer: Vec<i64>) {
         .collect::<Vec<_>>()
         .join(",");
 
-    // Single CTE UPDATE — tier recomputed in the same statement (FLUSH-4).
+    // Single CTE UPDATE — tier recomputed in the same statement.
     let sql = format!(
         "WITH updates(id, last_ts, hits) AS (VALUES {placeholders}) \
          UPDATE memory \
@@ -171,7 +171,7 @@ async fn flush(conn: &Connection, buffer: Vec<i64>) {
         })
         .collect();
 
-    // Single conn.call → tx.transaction() → execute (design §6:737-740).
+    // Single conn.call → tx.transaction() → execute.
     if let Err(e) = conn
         .call(move |c| -> rusqlite::Result<()> {
             let tx = c.transaction()?;
@@ -183,7 +183,7 @@ async fn flush(conn: &Connection, buffer: Vec<i64>) {
         })
         .await
     {
-        // FLUSH-3: log and return — worker loop continues, never panics.
+        // Log and return — the worker loop continues, never panics.
         log::warn!("access tracker flush failed (buffered updates discarded): {e}");
     }
 }
@@ -266,7 +266,7 @@ mod tests {
 
     /// Polls `access_count` for `row_id` until it equals `want`, bounded by
     /// `budget` of REAL wall-clock time (`std::time::Instant`, never
-    /// `tokio::time`). FLUSH-1/FLUSH-2 run under a PAUSED tokio clock
+    /// `tokio::time`). The timer and size triggers run under a PAUSED tokio clock
     /// (`#[tokio::test(start_paused = true)]`); `tokio::time::sleep` auto-advances
     /// that virtual clock while paused, which would fire the 30s `interval` again
     /// mid-poll — so this polls with `tokio::task::yield_now()` (never touches
@@ -274,7 +274,7 @@ mod tests {
     /// worker drives its write through `conn` (`tokio_rusqlite`), which dispatches
     /// to a real background OS thread — a fixed `yield_now` count is not a
     /// synchronization primitive for that hop, so this bounds the wait instead of
-    /// guessing a count (see obs #1582 / `sdd/rag-pool-telemetry/flake-fix`).
+    /// guessing a count.
     async fn await_access_count(
         conn: &Connection,
         row_id: i64,
@@ -319,7 +319,7 @@ mod tests {
         _assert_send::<AccessTracker>();
     }
 
-    // ── TRACK-2 — empty vec is a no-op ───────────────────────────
+    // ── empty vec is a no-op ─────────────────────────────────────
 
     #[test]
     fn record_empty_vec_sends_nothing_to_channel() {
@@ -349,12 +349,12 @@ mod tests {
         }
     }
 
-    // ── FLUSH-1 — timer trigger ───────────────────────────────────
+    // ── timer trigger ─────────────────────────────────────────────
     //
     // Uses `start_paused = true` so Tokio's clock only moves via
     // `tokio::time::advance`.  No real sleep or wall-clock delay.
     //
-    // Scenario: buffer has < 500 entries; after advance(31 s) the 30-second
+    // Buffer has < 500 entries; after advance(31 s) the 30-second
     // interval tick fires and flush() executes, incrementing access_count.
 
     #[tokio::test(start_paused = true)]
@@ -384,7 +384,7 @@ mod tests {
             .expect("timer-triggered flush must increment access_count to 1");
     }
 
-    // ── FLUSH-2 — size trigger at ≥500 entries ────────────────────
+    // ── size trigger at ≥500 entries ──────────────────────────────
     //
     // Sends 500 records of the same ID (dedup → 1 row with 500 hits).
     // The flush MUST fire without advancing the clock.
@@ -419,7 +419,7 @@ mod tests {
             );
     }
 
-    // ── FLUSH-3 — DB error recovery ────────────────────────────────
+    // ── DB error recovery ──────────────────────────────────────────
     //
     // Drop `memory` table so the next flush fails.  Worker MUST log `log::warn!`
     // and continue — no panic, channel stays open.
@@ -448,10 +448,10 @@ mod tests {
 
         // Verify the channel is still open — worker did not exit from the panic.
         tracker.record(vec![9999]);
-        // Reaching here without panic means FLUSH-3 is satisfied.
+        // Reaching here without panic means the worker survived the failed flush.
     }
 
-    // ── FLUSH-4 — tier promotion in the SAME CTE UPDATE ───────────
+    // ── tier promotion in the SAME CTE UPDATE ─────────────────────
     //
     // Seeds a row with tier=2, access_count=2, memory_type='architectural_decision'.
     // After flush with 1 hit: access_count becomes 3 → compute_tier returns 1.
@@ -488,10 +488,10 @@ mod tests {
         );
     }
 
-    // ── TRACK-3 — 1000 concurrent record() calls ──────────────────
+    // ── 1000 concurrent record() calls ────────────────────────────
     //
     // Spawn 1000 tokio tasks each calling record().  All must complete without
-    // stalling — UnboundedSender::send never blocks the caller (TRACK-3).
+    // stalling — UnboundedSender::send never blocks the caller.
 
     #[tokio::test]
     async fn concurrent_1000_record_calls_no_stall() {
@@ -512,7 +512,7 @@ mod tests {
         // All 1000 tasks joined — no stall.
     }
 
-    // ── LIMIT-3 — 500-entry flush (1500 bind vars) ────────────────
+    // ── 500-entry flush (1500 bind vars) ──────────────────────────
     //
     // Verifies that `set_limit(SQLITE_LIMIT_VARIABLE_NUMBER, 32766)`
     // allows a single CTE UPDATE with 500 rows × 3 vars = 1500 bind variables.

@@ -181,7 +181,7 @@ impl std::fmt::Display for LatencySnapshot {
 }
 
 // A held guard across an await point would make the enclosing future
-// `!Send`, which matters because retrieval runs on the desktop async runtime.
+// `!Send`, which matters because retrieval runs on a multi-threaded async runtime.
 // Asserting both types stay `Send + Sync` here catches that class of
 // regression at compile time instead of leaving it to be discovered by a
 // runtime deadlock or a spawn error far from this file.

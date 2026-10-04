@@ -1,10 +1,7 @@
 //! Episodic-trajectory writer.
 //!
 //! `build_trajectory` and its testable core `run_episodic_writer_core` — the
-//! latter consumed by `memory::miner::mine_session_core`, which is the sole
-//! fire-and-forget entry point spawned from `commands/session.rs` on session
-//! close (the `run_episodic_writer` wrapper that used to live here was
-//! eliminated in favor of `miner::run_miner`).
+//! latter consumed by `memory::miner::mine_session_core`.
 //! `build_trajectory` is a **pure, deterministic** function (no LLM, no DB):
 //! it aggregates the ENTIRE multi-agent session snapshot into a single
 //! `TrajectoryDraft`, since `episodic_trajectory.session_id` is UNIQUE (one
@@ -85,9 +82,9 @@ pub(crate) struct TrajectoryDraft {
 /// Aggregates a multi-agent session snapshot into a single [`TrajectoryDraft`].
 ///
 /// Pure and deterministic — no LLM, no DB. Returns `None` (SKIP write) when
-/// there is no non-empty `Role::User` message anywhere in `history` (R2/S6
-/// amended per tasks reconciliation: NO fallback to another role — `task` is
-/// NOT NULL and an empty/placeholder embed would contaminate KNN).
+/// there is no non-empty `Role::User` message anywhere in `history` (NO
+/// fallback to another role — `task` is NOT NULL and an empty/placeholder
+/// embed would contaminate KNN).
 ///
 /// # Algorithm
 /// 1. Flatten `history` into one sequence: agents in `Vec` order, messages in
@@ -98,7 +95,7 @@ pub(crate) struct TrajectoryDraft {
 ///    [`TASK_CHAR_CAP`] chars. `agent_id` = the agent that owns that message.
 /// 3. `tool_calls` = names of every `ToolCall` on every `Assistant` message,
 ///    in flattened order (across ALL agents — this is what the trajectory
-///    miner, doc 8, consumes as-is).
+///    miner consumes as-is).
 /// 4. `errors_encountered` = content of every `Role::Tool` message with
 ///    `is_error == Some(true)`, in flattened order.
 /// 5. `unresolved` = count of those errors whose flattened index is AFTER the
@@ -120,7 +117,7 @@ pub(crate) fn build_trajectory(
         return None;
     }
 
-    // R2/S5/S6 (amended): earliest non-empty Role::User by timestamp_ms, tied
+    // Earliest non-empty Role::User by timestamp_ms, tied
     // broken by flattened (Vec/message) position. None found → SKIP (None).
     let (_, (agent_id, task_msg)) = flattened
         .iter()
@@ -180,11 +177,8 @@ pub(crate) fn build_trajectory(
 }
 
 /// Testable core of the episodic-trajectory write pipeline — takes explicit
-/// dependencies instead of the desktop `AppHandle`/`AppState`, so it can be unit
-/// tested without a running desktop app (this codebase does not enable the
-/// desktop runtime's "test" feature). Mirrors `extractor::run_extraction_core` — this is
-/// the 4th instance of the AppHandle-wrapper / testable-core split convention
-/// (worker → resolver → extractor → episodic_writer).
+/// dependencies, so it can be unit tested without any host. Mirrors
+/// `extractor::run_extraction_core`.
 ///
 /// Never panics: a missing embedder, an unbuildable draft (no `Role::User`),
 /// an embed failure, or an insert failure are all `log::`'d and the function
@@ -213,8 +207,8 @@ pub(crate) async fn run_episodic_writer_core(
     };
 
     let Some(draft) = build_trajectory(&session_id, &history) else {
-        // No non-empty Role::User anywhere in history — SKIP write (R2/S6
-        // amended, no fallback: an empty/placeholder task would violate
+        // No non-empty Role::User anywhere in history — SKIP write (no
+        // fallback: an empty/placeholder task would violate
         // NOT NULL and contaminate KNN with a meaningless embed).
         return None;
     };
@@ -389,7 +383,7 @@ mod tests {
         }
     }
 
-    // ── Task 1.1 (S1) — sesión limpia: 2 tool_calls, 0 errores, termina Assistant ──
+    // ── Sesión limpia: 2 tool_calls, 0 errores, termina Assistant ──
 
     #[test]
     fn clean_session_two_tool_calls_no_errors_yields_score_0_9() {
@@ -408,10 +402,10 @@ mod tests {
         let draft = build_trajectory("sess-1", &history).expect("expected Some draft");
         assert_eq!(draft.tool_calls, vec!["read_file", "write_file"]);
         assert!(draft.errors_encountered.is_empty());
-        assert_eq!(draft.success_score, 0.9, "S1 amended ceiling is 0.9, not 1.0");
+        assert_eq!(draft.success_score, 0.9, "ceiling is 0.9, not 1.0");
     }
 
-    // ── Task 1.2 (S2) — error Tool resuelto antes del último Assistant no-error ──
+    // ── Error Tool resuelto antes del último Assistant no-error ──
 
     #[test]
     fn resolved_error_before_last_assistant_does_not_count_as_unresolved() {
@@ -429,10 +423,10 @@ mod tests {
 
         let draft = build_trajectory("sess-2", &history).expect("expected Some draft");
         assert_eq!(draft.errors_encountered, vec!["boom".to_string()]);
-        assert_eq!(draft.success_score, 0.9, "resolved error must not penalize (S2)");
+        assert_eq!(draft.success_score, 0.9, "resolved error must not penalize");
     }
 
-    // ── Task 1.3 (S3) — error Tool posterior al último Assistant (termina en error) ──
+    // ── Error Tool posterior al último Assistant (termina en error) ──
 
     #[test]
     fn unresolved_trailing_error_penalizes_score_strictly_below_s1_s2() {
@@ -450,13 +444,13 @@ mod tests {
         let draft = build_trajectory("sess-3", &history).expect("expected Some draft");
         assert!(
             (draft.success_score - 0.15).abs() < 1e-9,
-            "S3: 1 unresolved / 2 tool_calls => 0.4 - 0.25, got {}",
+            "1 unresolved / 2 tool_calls => 0.4 - 0.25, got {}",
             draft.success_score
         );
-        assert!(draft.success_score < 0.9, "S3 must score strictly below S1/S2");
+        assert!(draft.success_score < 0.9, "an unresolved trailing error must score strictly below a clean session");
     }
 
-    // ── Task 1.4 (S4 sub-caso real) — solo chat, 0 tool_calls, termina Assistant ──
+    // ── Solo chat, 0 tool_calls, termina Assistant ──
 
     #[test]
     fn chat_only_no_tool_calls_ended_clean_yields_score_0_9() {
@@ -470,7 +464,7 @@ mod tests {
         assert_eq!(draft.success_score, 0.9);
     }
 
-    // ── Task 1.5 (S6 amended) — sin ningún Role::User → None, sin panic ──
+    // ── Sin ningún Role::User → None, sin panic ──
 
     #[test]
     fn no_user_message_anywhere_yields_none() {
@@ -482,7 +476,7 @@ mod tests {
         assert!(build_trajectory("sess-5", &history).is_none());
     }
 
-    // ── Task 1.6 (S4 amended) — history totalmente vacío → None ──
+    // ── History totalmente vacío → None ──
 
     #[test]
     fn totally_empty_history_yields_none() {
@@ -496,7 +490,7 @@ mod tests {
         assert!(build_trajectory("sess-6b", &history).is_none());
     }
 
-    // ── Task 1.7 — agregación multi-agente: 1 solo draft; agent_id = dueño ──
+    // ── Agregación multi-agente: 1 solo draft; agent_id = dueño ──
     // ── del User más temprano; tool_calls aplanados en orden del Vec ─────────
 
     #[test]
@@ -522,7 +516,7 @@ mod tests {
         );
     }
 
-    // ── Task 1.8 (S5) — task truncado a TASK_CHAR_CAP=512 ──
+    // ── Task truncado a TASK_CHAR_CAP=512 ──
 
     #[test]
     fn task_longer_than_cap_is_truncated_to_512_chars() {
@@ -540,7 +534,7 @@ mod tests {
     // ── Worked examples pinning the success_score coefficients ───────────────
 
     #[test]
-    fn locked_coefficients_have_designed_values() {
+    fn coefficients_have_pinned_values() {
         assert_eq!(BASE_SCORE, 0.4);
         assert_eq!(COMPLETION_BONUS, 0.5);
         assert_eq!(UNRESOLVED_PENALTY_COEFF, 0.5);
@@ -668,7 +662,7 @@ mod tests {
         assert_eq!(calls[0].1, "fix the bug");
     }
 
-    // Task 5.1 (S9): embedder=None → 0 rows, return BEFORE build/insert.
+    // Embedder=None → 0 rows, return BEFORE build/insert.
     #[tokio::test]
     async fn missing_embedder_yields_zero_rows_returns_before_build() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -684,7 +678,7 @@ mod tests {
         assert_eq!(count_episodic(&store).await, 0, "missing embedder must skip the write entirely");
     }
 
-    // Task 5.2: history vacío/todos vacíos → 0 filas, return temprano.
+    // History vacío/todos vacíos → 0 filas, return temprano.
     #[tokio::test]
     async fn all_empty_history_yields_zero_rows() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -705,7 +699,7 @@ mod tests {
         assert_eq!(count_episodic(&store).await, 0, "all-empty history must insert zero rows");
     }
 
-    // Task 5.3: build_trajectory devuelve None (sin User) → 0 filas insertadas.
+    // Build_trajectory devuelve None (sin User) → 0 filas insertadas.
     #[tokio::test]
     async fn no_user_message_yields_zero_rows() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -726,7 +720,7 @@ mod tests {
         assert_eq!(count_episodic(&store).await, 0, "no Role::User must skip the write (None draft)");
     }
 
-    // Task 5.4: caso feliz — embed(task), record armado, insert_episodic_trajectory
+    // Caso feliz — embed(task), record armado, insert_episodic_trajectory
     // invocado, 1 fila con los campos esperados.
     #[tokio::test]
     async fn happy_path_inserts_one_row_with_expected_fields() {
@@ -782,8 +776,8 @@ mod tests {
         assert!(project_id.is_some(), "project_id must be derived from project_by_agent");
     }
 
-    // Triangulation: errors_encountered is capped PER-ITEM to 500 chars before
-    // being serialized into errors_json (design-locked, NOT done in build_trajectory).
+    // errors_encountered is capped PER-ITEM to 500 chars before
+    // being serialized into errors_json (done here, NOT in build_trajectory).
     #[tokio::test]
     async fn errors_encountered_capped_to_500_chars_per_item_before_serializing() {
         let store = MemoryStore::new_for_test().await.unwrap();

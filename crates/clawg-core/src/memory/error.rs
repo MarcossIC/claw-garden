@@ -1,3 +1,5 @@
+use crate::memory::store_lock::StoreOwner;
+
 /// Memory subsystem errors.
 ///
 /// This enum consolidates all failure modes of the persistent-memory substrate:
@@ -38,6 +40,24 @@ pub enum MemoryError {
     /// tokio_rusqlite channel error not tied to a SQLite error code.
     #[error("memory backend channel error: {0}")]
     Backend(String),
+
+    /// Another process already owns this data directory's store. `owner` is
+    /// whatever `memory.owner` said — best-effort, because the holder may not
+    /// have written it yet (or could not).
+    #[error("the memory store is in use by {}", match .owner {
+        Some(o) => format!("{} (pid {})", o.holder, o.pid),
+        None => "another process".to_string(),
+    })]
+    StoreInUse { owner: Option<StoreOwner> },
+
+    /// The store's lock file could not be opened or locked for a reason other
+    /// than contention (permissions, a read-only file system).
+    #[error("memory store lock error at {path}: {source}")]
+    StoreLockIo {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 #[cfg(test)]
@@ -45,7 +65,6 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    // T01-test: MemoryError new variants compile
     #[test]
     fn workspace_io_error_displays_path_and_source() {
         let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
@@ -70,7 +89,35 @@ mod tests {
         _s::<MemoryError>();
     }
 
-    /// FIX-2 — Internal variant carries message and displays it.
+    #[test]
+    fn store_in_use_names_the_holder_and_its_pid() {
+        use crate::memory::store_lock::{StoreHolder, StoreOwner};
+        let e = MemoryError::StoreInUse {
+            owner: Some(StoreOwner { holder: StoreHolder::Eval, pid: 4242, started_at_ms: 1 }),
+        };
+        assert_eq!(
+            e.to_string(),
+            "the memory store is in use by an evaluation run (pid 4242)"
+        );
+    }
+
+    #[test]
+    fn store_in_use_without_an_owner_still_explains_itself() {
+        let e = MemoryError::StoreInUse { owner: None };
+        assert_eq!(e.to_string(), "the memory store is in use by another process");
+    }
+
+    #[test]
+    fn store_lock_io_displays_path_and_source() {
+        let e = MemoryError::StoreLockIo {
+            path: PathBuf::from("/x/memory.lock"),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("memory.lock") && msg.contains("denied"), "{msg}");
+    }
+
+    /// Internal variant carries message and displays it.
     #[test]
     fn internal_variant_displays_message() {
         let e = MemoryError::Internal("boom".into());
@@ -78,7 +125,7 @@ mod tests {
         assert!(msg.contains("boom"), "Expected 'boom' in: {msg}");
     }
 
-    /// SPEC-7 Sc 7.2 — From<rusqlite::Error> allows ? propagation.
+    /// From<rusqlite::Error> allows ? propagation.
     #[test]
     fn from_rusqlite_error() {
         // Create a rusqlite error via the documented FromSql trait violation path.
@@ -91,7 +138,7 @@ mod tests {
         );
     }
 
-    /// SPEC-7 Sc 7.3 — RowDecode Display contains table name.
+    /// RowDecode Display contains table name.
     #[test]
     fn row_decode_displays_table_name() {
         let err = MemoryError::RowDecode {

@@ -59,9 +59,7 @@ async fn main() {
 }
 
 /// Production's own base directory, resolved through the shared
-/// `clawg_core::paths` resolver rather than imported from `state.rs`
-/// (which is not reachable through `eval_api` and should not become so just
-/// for this one path). Pointing `--real` at anywhere else would mean this
+/// `clawg_core::paths` resolver. Pointing `--real` at anywhere else would mean this
 /// harness never benefits from a model the running application already
 /// downloaded, and `--check-only` would answer a question about a cache the
 /// application never looks at.
@@ -90,7 +88,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
         Ok(cli::ParseOutcome::Diff(a, b)) => return run_diff(&a, &b),
         Ok(cli::ParseOutcome::Run(cli)) => cli,
         Err(e) => {
-            // Not one of the spec's pinned exit codes (0/2/3/4): a usage
+            // Not one of the dedicated exit codes (0/2/3/4): a usage
             // error happens before any golden set, model, or database is
             // touched, so it is reported as a generic runtime failure rather
             // than overloading one of the more specific codes with a meaning
@@ -104,7 +102,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
     let base_dir = production_base_dir();
 
     // `--check-only` only means something for `--real`; combined with
-    // `--fake` it is a harmless no-op per spec, since there is no model to
+    // `--fake` it is a harmless no-op, since there is no model to
     // check readiness for.
     if cli.check_only {
         return match cli.mode {
@@ -561,7 +559,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
 
 /// Runs `--diff`: reads two existing results files, joins their
 /// `retrieval.per_case`/`similarity.per_case` on `query`, and prints the
-/// better/worse/net report. Not one of the spec's pinned exit codes: like a
+/// better/worse/net report. Not one of the dedicated exit codes: like a
 /// CLI usage error, this happens before any golden set, model, or database is
 /// touched, so a failure here is reported as a generic runtime failure rather
 /// than overloading a more specific code with a meaning it does not have.
@@ -1809,8 +1807,8 @@ mod tests {
         );
 
         // The treatment arm's LEXICAL channel gets the content-free template,
-        // never the composed text — the spec forbids handing the golden query
-        // to BM25 in this arm, because a lexical channel that can see the
+        // never the composed text — handing the golden query
+        // to BM25 in this arm is forbidden, because a lexical channel that can see the
         // query stops describing what production does with a real follow-up.
         //
         // The ceiling is exactly the arm whose lexical channel DOES hold the

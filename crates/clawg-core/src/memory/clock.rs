@@ -128,7 +128,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn derives_match_the_locked_set() {
+    fn derives_match_the_pinned_set() {
         fn _f<T: Copy + Clone + PartialEq + Eq + PartialOrd + Ord + std::fmt::Debug + std::hash::Hash>() {}
         _f::<TimestampMs>();
         fn _ser<T: serde::Serialize>() {}

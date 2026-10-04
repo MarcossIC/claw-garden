@@ -648,7 +648,7 @@ mod tests {
 
     #[test]
     fn check_only_combined_with_fake_parses_cleanly() {
-        // Not an error at the parse layer: the spec treats this combination
+        // Not an error at the parse layer: this combination is treated
         // as a harmless no-op resolved by main's control flow, not a parse
         // failure.
         let cli = run_cli(&["--fake", "--check-only"]);

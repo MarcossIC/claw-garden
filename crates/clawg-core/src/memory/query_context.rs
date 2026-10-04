@@ -11,16 +11,6 @@
 //! way. `saturating_sub` makes that case structural instead of a comparison
 //! a mutation test could flip without changing behavior.
 
-use std::collections::HashMap;
-
-use crate::models::chat::{ChatMessage, Role};
-
-/// How many of the most recent prior user turns are ever offered to the
-/// composer. Lives on the selector rather than the composer so a change to
-/// this bound is observable in a pure unit test over `select_prior_user_turns`
-/// alone, without needing a chat-path integration test to notice it.
-pub const MAX_CONTEXT_TURNS: usize = 2;
-
 /// Separator placed between the current message and each admitted prior
 /// turn. A plain newline: stored chat chunks already carry them, so this
 /// stays in-distribution for the tokenizer instead of introducing a symbol
@@ -76,54 +66,9 @@ pub fn query_budget_tokens(max_tokens: usize, reserve: usize, prefix_tokens: usi
     max_tokens.saturating_sub(reserve).saturating_sub(prefix_tokens)
 }
 
-/// Walks `agent_id`'s conversation newest-first, keeping up to `max_turns`
-/// prior `Role::User` messages and returning them newest-first. Skips
-/// whitespace-only turns and any turn whose trimmed content equals
-/// `current.trim()` — checked at every position, not just the most recent
-/// one, so this catches the just-pushed message wherever it landed (including
-/// the `is_retry` path, which re-sends the same content without appending a
-/// new row).
-pub fn select_prior_user_turns(
-    conversations: &HashMap<String, Vec<ChatMessage>>,
-    agent_id: &str,
-    current: &str,
-    max_turns: usize,
-) -> Vec<String> {
-    let current_trimmed = current.trim();
-    let Some(history) = conversations.get(agent_id) else {
-        return Vec::new();
-    };
-    let mut out = Vec::with_capacity(max_turns);
-    for msg in history.iter().rev() {
-        if out.len() >= max_turns {
-            break;
-        }
-        if msg.role != Role::User {
-            continue;
-        }
-        let trimmed = msg.content.trim();
-        if trimmed.is_empty() || trimmed == current_trimmed {
-            continue;
-        }
-        out.push(msg.content.clone());
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn make_msg(role: Role, content: &str) -> ChatMessage {
-        ChatMessage {
-            id: "id".to_string(),
-            role,
-            content: content.to_string(),
-            tool_calls: None,
-            timestamp_ms: 0,
-            is_error: None,
-        }
-    }
 
     // A word-count counter: genuinely varies per string, so ordering and cost
     // mutations are independently observable (a constant counter would make
@@ -217,95 +162,5 @@ mod tests {
     fn query_budget_tokens_subtracts_both_the_reserve_and_the_prefix() {
         assert_eq!(query_budget_tokens(512, 4, 2), 506);
         assert_eq!(query_budget_tokens(10, 4, 20), 0, "must saturate, never underflow");
-    }
-
-    #[test]
-    fn the_just_pushed_message_is_never_repeated_as_context() {
-        let mut conversations = HashMap::new();
-        conversations.insert(
-            "agent-1".to_string(),
-            vec![
-                make_msg(Role::User, "older distinct turn"),
-                make_msg(Role::Assistant, "assistant reply"),
-                make_msg(Role::User, "the current message"),
-            ],
-        );
-        let turns = select_prior_user_turns(&conversations, "agent-1", "the current message", 5);
-        assert!(
-            !turns.iter().any(|t| t.trim() == "the current message"),
-            "the just-pushed message must never appear as its own context, regardless of position"
-        );
-        assert_eq!(turns, vec!["older distinct turn".to_string()]);
-    }
-
-    /// The `is_retry` shape: `stream_chat` does NOT re-push the message on a
-    /// retry, so the current message is already in history from the first
-    /// attempt — with the failed attempt's assistant turn sitting AFTER it.
-    /// The current message is therefore not the newest row, and a skip check
-    /// that only looked at the most recent position would feed the message
-    /// back to itself as its own context. The test above cannot see that: its
-    /// fixture puts the current message last, which is the one position an
-    /// index-0-only check still covers.
-    #[test]
-    fn the_current_message_is_skipped_even_when_it_is_not_the_newest_turn() {
-        let mut conversations = HashMap::new();
-        conversations.insert(
-            "agent-1".to_string(),
-            vec![
-                make_msg(Role::User, "older distinct turn"),
-                make_msg(Role::User, "the current message"),
-                make_msg(Role::Assistant, "failed attempt reply"),
-            ],
-        );
-        let turns = select_prior_user_turns(&conversations, "agent-1", "the current message", 5);
-        assert_eq!(
-            turns,
-            vec!["older distinct turn".to_string()],
-            "the current message must be skipped at ANY position, not only the newest one"
-        );
-    }
-
-    #[test]
-    fn select_prior_user_turns_ignores_assistant_turns() {
-        let mut conversations = HashMap::new();
-        conversations.insert(
-            "agent-1".to_string(),
-            vec![
-                make_msg(Role::User, "user turn one"),
-                make_msg(Role::Assistant, "assistant turn"),
-                make_msg(Role::Tool, "tool turn"),
-            ],
-        );
-        let turns = select_prior_user_turns(&conversations, "agent-1", "current", 5);
-        assert_eq!(turns, vec!["user turn one".to_string()]);
-    }
-
-    #[test]
-    fn turns_from_another_agent_never_enter_the_selection() {
-        let mut conversations = HashMap::new();
-        conversations.insert("agent-a".to_string(), vec![make_msg(Role::User, "agent a turn")]);
-        conversations.insert("agent-b".to_string(), vec![make_msg(Role::User, "agent b turn")]);
-        let turns = select_prior_user_turns(&conversations, "agent-a", "current", 5);
-        assert_eq!(turns, vec!["agent a turn".to_string()]);
-    }
-
-    #[test]
-    fn select_prior_user_turns_takes_at_most_max_context_turns_of_more_eligible() {
-        let mut conversations = HashMap::new();
-        conversations.insert(
-            "agent-1".to_string(),
-            vec![
-                make_msg(Role::User, "turn one"),
-                make_msg(Role::User, "turn two"),
-                make_msg(Role::User, "turn three"),
-                make_msg(Role::User, "turn four"),
-            ],
-        );
-        let turns = select_prior_user_turns(&conversations, "agent-1", "current", MAX_CONTEXT_TURNS);
-        assert_eq!(
-            turns,
-            vec!["turn four".to_string(), "turn three".to_string()],
-            "newest-first, capped at MAX_CONTEXT_TURNS ({MAX_CONTEXT_TURNS})"
-        );
     }
 }

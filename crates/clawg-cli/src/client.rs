@@ -1,9 +1,8 @@
 //! HTTP client for a running `clawg serve`.
 //!
-//! Used by `clawg mcp`, `clawg status` and `clawg stop`, and — in a later
-//! phase — by the desktop app. It owns the only two pieces of knowledge a
-//! client needs: where the daemon is (`daemon.json`) and how to prove it may
-//! talk to it (`token`).
+//! Used by `clawg mcp`, `clawg status` and `clawg stop`. It owns the only two
+//! pieces of knowledge a client needs: where the daemon is (`daemon.json`) and
+//! how to prove it may talk to it (`token`).
 //!
 //! # Autostart
 //!
@@ -13,10 +12,15 @@
 //! behind [`DaemonSpawner`] rather than called directly, because the real
 //! implementation launches a process that downloads a 470 MB model — a test
 //! substitutes an in-process daemon instead.
+//!
+//! Autostart is skipped, with [`ClientError::StoreHeld`], when the memory store
+//! is owned by something that is not a daemon: such a daemon could never start,
+//! and finding that out by polling costs the whole [`AUTOSTART_TIMEOUT`].
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use clawg_core::memory::store_lock::{StoreHolder, StoreLock, StoreOwner};
 use clawg_core::paths::{data_dir, Profile};
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +58,14 @@ pub enum ClientError {
     StartTimeout(Duration),
     #[error("the daemon (pid {pid}) accepted the shutdown but is still running after {timeout:?}")]
     StopTimeout { pid: u32, timeout: Duration },
+    /// The memory store is owned by something that is not a daemon (an
+    /// evaluation run), so no daemon can start and waiting for one is pointless.
+    /// Raised at once instead of after [`AUTOSTART_TIMEOUT`].
+    #[error(
+        "the memory store is held by {} (pid {}), not by a clawg daemon; close it and reconnect",
+        .0.holder, .0.pid
+    )]
+    StoreHeld(StoreOwner),
 }
 
 // ── Wire types the client reads back ────────────────────────────────────────
@@ -493,6 +505,21 @@ pub async fn ensure_running_in(
         }
     }
 
+    // Before anything that waits. A store owned by a NON-daemon (an evaluation
+    // run) means the `clawg serve` we would spawn dies on the store lock at
+    // once, and the poll below would burn the whole timeout on a daemon that
+    // cannot come up. A daemon holder — possibly still starting, so not yet
+    // publishing `daemon.json` — or an unknown holder falls through to the
+    // normal path: only a positively-identified non-daemon short-circuits.
+    // Ahead of the `autostart` check because "something else has the store" is
+    // the truthful answer even with `--no-autostart`, where "not running" would
+    // send the user to start a daemon that cannot start.
+    if let Some(owner) = StoreLock::current_owner(base_dir) {
+        if owner.holder != StoreHolder::Daemon {
+            return Err(ClientError::StoreHeld(owner));
+        }
+    }
+
     if !autostart {
         return Err(ClientError::NotRunning);
     }
@@ -530,6 +557,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
+    use clawg_core::memory::store_lock::{StoreHolder, StoreLock, StoreOwner};
+    use clawg_core::paths::{store_lock_file, store_owner_file};
     use clawg_core::runtime::MemoryRuntime;
 
     use crate::daemon::api::{router, AppCtx};
@@ -601,6 +630,26 @@ mod tests {
     struct DeadSpawner;
     impl DaemonSpawner for DeadSpawner {
         fn spawn_serve(&self, _profile: Profile) -> Result<(), ClientError> {
+            Ok(())
+        }
+    }
+
+    /// [`DeadSpawner`] that counts its calls, for the tests that must prove a
+    /// spawn did or did not happen.
+    struct CountingDeadSpawner {
+        calls: AtomicUsize,
+    }
+    impl CountingDeadSpawner {
+        fn new() -> Self {
+            Self { calls: AtomicUsize::new(0) }
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+    impl DaemonSpawner for CountingDeadSpawner {
+        fn spawn_serve(&self, _profile: Profile) -> Result<(), ClientError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -841,6 +890,98 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "the timeout must bound the wait, not merely decorate it"
+        );
+    }
+
+    // ── ensure_running: who holds the store ─────────────────────────────────
+
+    /// A holder that is not a daemon can never answer `/health`, so spawning
+    /// one and polling for a minute is a guaranteed wait for nothing: the
+    /// spawned `clawg serve` dies on the store lock at once. Fail at once too,
+    /// and name the holder so the user knows what to close.
+    #[tokio::test]
+    async fn a_store_held_by_a_non_daemon_fails_fast_without_spawning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _holder = StoreLock::acquire(dir.path(), StoreHolder::Eval).expect("holder has it");
+        let spawner = CountingDeadSpawner::new();
+
+        let started = Instant::now();
+        let err = ensure_running_in(dir.path(), Profile::Dev, true, &spawner, Duration::from_secs(5))
+            .await
+            .expect_err("the store is held by a non-daemon");
+
+        match err {
+            ClientError::StoreHeld(owner) => assert_eq!(owner.holder, StoreHolder::Eval),
+            other => panic!("expected StoreHeld, got {other:?}"),
+        }
+        assert_eq!(spawner.calls(), 0, "a daemon cannot start while a non-daemon holds the store");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "failing fast means not waiting on the timeout: took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A daemon that holds the store but has not published `daemon.json` yet is
+    /// just a slow start — the exact case the poll loop exists for.
+    #[tokio::test]
+    async fn a_store_held_by_a_daemon_still_takes_the_autostart_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _daemon = StoreLock::acquire(dir.path(), StoreHolder::Daemon).expect("daemon holds it");
+        let spawner = CountingDeadSpawner::new();
+
+        let err = ensure_running_in(dir.path(), Profile::Dev, true, &spawner, Duration::from_millis(300))
+            .await
+            .expect_err("no daemon.json ever appears");
+        assert!(matches!(err, ClientError::StartTimeout(_)), "{err:?}");
+        assert_eq!(spawner.calls(), 1, "a daemon holder must not short-circuit the spawn");
+    }
+
+    /// A crashed holder leaves `memory.owner` behind with the lock already gone;
+    /// believing it would refuse the bridge forever.
+    #[tokio::test]
+    async fn a_stale_owner_record_does_not_block_autostart() {
+        let daemon = start_daemon().await;
+        let base = daemon.dir.path().to_path_buf();
+        let stale = StoreOwner { holder: StoreHolder::Eval, pid: 4242, started_at_ms: 1 };
+        std::fs::write(store_owner_file(&base), serde_json::to_string(&stale).expect("json"))
+            .expect("write stale record");
+        std::fs::write(store_lock_file(&base), b"").expect("unlocked lock file");
+        let spawner = FakeSpawner { daemon, calls: AtomicUsize::new(0) };
+
+        let c = ensure_running_in(&base, Profile::Dev, true, &spawner, Duration::from_secs(5))
+            .await
+            .expect("a dead holder's leftovers must not stop the daemon from starting");
+        assert_eq!(spawner.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(c.health().await.expect("health").status, "ok");
+    }
+
+    /// With `--no-autostart` the useful answer is still "something else has
+    /// it", not "no daemon is running", which would send the user to start a
+    /// daemon that cannot start.
+    #[tokio::test]
+    async fn a_held_store_is_reported_even_without_autostart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _holder = StoreLock::acquire(dir.path(), StoreHolder::Eval).expect("holder has it");
+        let spawner = CountingDeadSpawner::new();
+
+        let err = ensure_running_in(dir.path(), Profile::Dev, false, &spawner, Duration::from_secs(5))
+            .await
+            .expect_err("held by a non-daemon");
+        assert!(matches!(err, ClientError::StoreHeld(_)), "{err:?}");
+        assert_eq!(spawner.calls(), 0);
+    }
+
+    #[test]
+    fn store_held_names_the_holder_and_says_it_is_not_a_daemon() {
+        let err = ClientError::StoreHeld(StoreOwner {
+            holder: StoreHolder::Eval,
+            pid: 4242,
+            started_at_ms: 1,
+        });
+        assert_eq!(
+            err.to_string(),
+            "the memory store is held by an evaluation run (pid 4242), not by a clawg daemon; close it and reconnect"
         );
     }
 

@@ -2,12 +2,11 @@
 //!
 //! # Why plain JSON over HTTP and not MCP streamable HTTP
 //!
-//! Two very different clients have to speak to this daemon: the `clawg mcp`
-//! bridge, and — in a later phase — the desktop app. MCP is the bridge's
-//! problem, not the daemon's; making the daemon an MCP server would force the
-//! desktop to speak a protocol designed for LLM tool calls in order to list
-//! rows in a table. So the daemon exposes an ordinary JSON API, and the bridge
-//! is the only thing that knows what a tool call is.
+//! MCP is the `clawg mcp` bridge's problem, not the daemon's; making the daemon
+//! an MCP server would force every other client to speak a protocol designed
+//! for LLM tool calls in order to list rows in a table. So the daemon exposes
+//! an ordinary JSON API, and the bridge is the only thing that knows what a
+//! tool call is.
 //!
 //! # Auth
 //!
@@ -396,11 +395,9 @@ async fn search(
     Ok(Json(SearchBody { hits }))
 }
 
-/// Builds the 4-block memory prefix for a query — the same text the desktop
-/// app prepends to a chat turn's system prompt.
+/// Builds the 4-block memory prefix for a query.
 ///
-/// Unlike the desktop's `compute_memory_prefix`, the dense half of the query is
-/// the raw text: widening it with prior conversation turns needs a conversation
+/// The dense half of the query is the raw text: widening it with prior conversation turns needs a conversation
 /// and a resolved tokenizer, and a daemon serving stateless HTTP has neither.
 /// The lexical half is the raw text in both.
 async fn context(
@@ -412,7 +409,7 @@ async fn context(
 
     // Unconditional regen (~2-5 ms). A failure degrades to "no ids were
     // emitted", which can make the prompt repeat a row — a degraded prompt
-    // beats a failed request, exactly as on the desktop path.
+    // beats a failed request.
     let emitted = workspace
         .regenerate_auto_section(&body.agent_id, project_id, &app.runtime.store)
         .await

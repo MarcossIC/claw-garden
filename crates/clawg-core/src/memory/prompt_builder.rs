@@ -51,7 +51,7 @@ pub struct QueryTexts<'a> {
     pub lexical: &'a str,
     /// Embedded with `EmbedRole::Query` — the composed text when context
     /// composition ran, or the raw message when it did not (empty history,
-    /// no tokenizer, `MAX_CONTEXT_TURNS == 0`).
+    /// no tokenizer).
     pub embedded: &'a str,
 }
 
@@ -289,7 +289,7 @@ fn format_hit_line(hit: &RankedHit) -> String {
     )
 }
 
-/// Formats a conflict pair into the 4-line format from design §3.5.
+/// Formats a conflict pair into a 4-line block.
 fn format_conflict_pair(p: &ConflictPair) -> String {
     let (oy, om, od) = unix_millis_to_ymd(p.old_created_at);
     let (ny, nm, nd) = unix_millis_to_ymd(p.new_created_at);
@@ -685,9 +685,8 @@ mod tests {
     }
 
     // build_memory_prompt accepts Option<&AccessTracker> as its last parameter.
-    // This test intentionally fails to compile until that parameter is added (RED).
     #[tokio::test]
-    async fn t11_build_memory_prompt_accepts_none_access_tracker() {
+    async fn build_memory_prompt_accepts_none_access_tracker() {
         use crate::memory::access::AccessTracker;
         let store = MemoryStore::new_for_test().await.unwrap();
         let tmp = tempfile::tempdir().unwrap();

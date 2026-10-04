@@ -1,16 +1,9 @@
 //! Embedder bootstrap: download the model, load it, verify the embedding
 //! contract, and fill the process-wide embedder cell.
 //!
-//! Lives in `clawg-core` rather than in the desktop crate because there is now
-//! more than one host: the desktop app fills its `AppState.embedder` cell from a
-//! setup hook, and the `clawg serve` daemon fills the identical cell on
-//! `MemoryRuntime` with no UI to report progress to. The logic is the same in
-//! both; only the event sink and where the future is spawned differ, and both
-//! of those are already parameters here.
-//!
-//! No desktop types are involved: the wire-shape event is
-//! [`StreamEvent::EmbedderDownload`], which has always lived in
-//! `clawg_core::models::chat`.
+//! Hosts differ only in the event sink and in where the future is spawned, and
+//! both of those are parameters here. The wire-shape event is
+//! [`StreamEvent::EmbedderDownload`], from `clawg_core::models::chat`.
 //!
 //! # Testing seams
 //!
@@ -34,7 +27,8 @@ use crate::models::chat::StreamEvent;
 /// [`StreamEvent::EmbedderDownload`] that the frontend listens for.
 ///
 /// Pure function — no I/O, no allocation beyond the small string field. The
-/// translation is one-to-one with the lifecycle defined in design §5.1.
+/// translation is one-to-one with the download lifecycle (`start`,
+/// `downloading`, `verifying`, `done`, `error`).
 pub fn progress_to_stream_event(p: DownloadProgress) -> StreamEvent {
     match p {
         DownloadProgress::Start { bytes_total } => StreamEvent::EmbedderDownload {
@@ -76,17 +70,14 @@ pub fn progress_to_stream_event(p: DownloadProgress) -> StreamEvent {
 // ----------------------------------------------------------------------------
 // EmbedderEventSink — abstraction over the host's event transport.
 //
-// The desktop wires `AppHandleSink(AppHandle)` (which stays in the desktop
-// crate — it is the only piece that needs the GUI framework) to forward each
-// `StreamEvent` to the desktop event bus. A headless host wires `LogSink`. Tests
-// inject a `MockSink` that records emissions to an in-memory
-// `Vec<StreamEvent>`, which is how the "exactly one terminal `done`"
-// assertion (REQ-EVT-002, verify-report WARNING #1) is covered at the
-// bootstrap layer instead of the lower `ensure_model` layer.
+// A headless host wires `LogSink`. Tests inject a `MockSink` that records
+// emissions to an in-memory `Vec<StreamEvent>`, which is how the "exactly one
+// terminal `done`" assertion is covered at the bootstrap layer instead of the
+// lower `ensure_model` layer.
 // ----------------------------------------------------------------------------
 
 /// Abstraction over the host's "tell the user about the download" transport,
-/// so the bootstrap logic is unit-testable without a real desktop runtime.
+/// so the bootstrap logic is unit-testable without a real host.
 pub trait EmbedderEventSink: Send + Sync + 'static {
     fn emit_event(&self, event: StreamEvent);
 }
@@ -111,8 +102,7 @@ impl EmbedderEventSink for LogSink {
             error,
         } = event
         else {
-            // The sink is declared over the whole `StreamEvent` enum for the
-            // desktop's sake (it forwards onto a bus typed that way); the
+            // The sink is declared over the whole `StreamEvent` enum; the
             // bootstrap only ever emits `EmbedderDownload`, so anything else
             // is not this sink's business.
             return;
@@ -176,7 +166,7 @@ pub type ContractVerifyFn = Arc<
 /// Exposed as one function because the trio is a unit — every host needs all
 /// three, and the only host-specific ingredient is the open [`MemoryStore`]
 /// the verifier closes over. Keeping the closures here rather than at each
-/// call site means the daemon and the desktop cannot drift into verifying the
+/// call site means no two hosts can drift into verifying the
 /// contract against different stores or loading the model two different ways.
 pub fn production_deps(
     store: Arc<MemoryStore>,
@@ -240,10 +230,9 @@ pub async fn run_embedder_bootstrap(
     // Lives in its own task so the download future can keep pushing without
     // back-pressure. Terminates naturally when the last `progress_tx` clone
     // is dropped (which happens when `ensure` returns and `progress_tx` goes
-    // out of scope) — see verify-report WARNING #1 fix notes (2026-05-23):
-    // since `ensure_model` no longer emits `Done`, the forwarder's last
-    // forwarded event is `Verify` and there is no race with the synthetic
-    // terminal `done` emitted below.
+    // out of scope). Since `ensure_model` never emits `Done`, the forwarder's
+    // last forwarded event is `Verify` and there is no race with the
+    // synthetic terminal `done` emitted below.
     let forwarder_sink = sink.clone();
     let forwarder = tokio::spawn(async move {
         while let Some(p) = progress_rx.recv().await {
@@ -465,14 +454,13 @@ mod tests {
 
     // ---------- run_embedder_bootstrap lifecycle ----------
     //
-    // The host-facing entry points (`clawg_desktop_lib::start_embedder_bootstrap`,
-    // and the daemon's equivalent) cannot be constructed without their runtime,
-    // so they are verified by compile-time correctness PLUS this parametric
-    // core, which is the unit-test seam: it accepts an injectable
+    // The host-facing entry points cannot be constructed without their
+    // runtime, so they are verified by compile-time correctness PLUS this
+    // parametric core, which is the unit-test seam: it accepts an injectable
     // `EmbedderEventSink`, `EnsureModelFn`, `LoadEmbedderFn`, and
     // `ContractVerifyFn`, so the full lifecycle (early-exit, happy path, error
     // path, contract mismatch, AND the forwarder→sink pipeline) can be
-    // asserted in-process without a desktop runtime.
+    // asserted in-process without a host runtime.
 
     use crate::memory::embedder::FakeEmbedder;
     use crate::memory::model_download::{DownloadError, ModelFiles};
@@ -650,13 +638,12 @@ mod tests {
         );
     }
 
-    /// REQ-EVT-002 compliance (verify-report WARNING #1, 2026-05-23): on the
-    /// happy path the UI MUST receive EXACTLY ONE terminal `done` event,
+    /// On the happy path the UI MUST receive EXACTLY ONE terminal `done` event,
     /// emitted as the LAST event of the lifecycle by the bootstrap (after
     /// `load` + `OnceCell::set`), NOT by `ensure_model`.
     ///
-    /// Before the fix the forwarder relayed a `Done` from `ensure_model` AND
-    /// the bootstrap emitted its own synthetic `done` → UI saw `done` twice.
+    /// If the forwarder relayed a `Done` from `ensure_model` AND the bootstrap
+    /// emitted its own synthetic `done`, the UI would see `done` twice.
     /// This test pumps a realistic lifecycle (`Start → Chunk → Verify`)
     /// through the channel and asserts (a) exactly one `done`, (b) it is the
     /// LAST event, (c) the preceding events are in source order.
@@ -667,7 +654,7 @@ mod tests {
         let ensure: EnsureModelFn = Arc::new(move |_base, progress| {
             Box::pin(async move {
                 // Simulate the real `ensure_model` event sequence per the
-                // post-fix contract: Start → Chunk → Verify. NO Done — that
+                // contract: Start → Chunk → Verify. NO Done — that
                 // is the bootstrap's responsibility.
                 if let Some(tx) = progress {
                     let _ = tx.send(DownloadProgress::Start { bytes_total: 100 });
@@ -702,7 +689,7 @@ mod tests {
         let events = sink.snapshot();
         let phases: Vec<&str> = events.iter().map(phase_of_event).collect();
 
-        // (a) EXACTLY one terminal `done` — the core REQ-EVT-002 invariant.
+        // (a) EXACTLY one terminal `done` — the core invariant.
         assert_eq!(
             count_done_phases(&events),
             1,
@@ -752,9 +739,7 @@ mod tests {
     }
 
     /// Error path: when `ensure` returns Err, the bootstrap emits exactly one
-    /// terminal `error` event and the cell stays empty. Confirms the chosen
-    /// fix did not break the error-path invariant (verify-report mentioned the
-    /// error path was already healthy; this is the regression guard).
+    /// terminal `error` event and the cell stays empty.
     #[tokio::test]
     async fn run_embedder_bootstrap_emits_terminal_error_when_ensure_fails() {
         let cell: Arc<OnceCell<Arc<dyn Embedder>>> = Arc::new(OnceCell::new());

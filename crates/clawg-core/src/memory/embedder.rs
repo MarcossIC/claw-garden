@@ -30,7 +30,7 @@ pub enum EmbedRole {
 }
 
 /// Async embedder contract. All embedder impls are `Send + Sync` so they can
-/// live behind `Arc<dyn Embedder>` in `AppState`.
+/// live behind `Arc<dyn Embedder>`.
 ///
 /// `embed` (role-free) does not exist on this trait and never will: a default
 /// method delegating to an unprefixed call, or a "convention" about which
@@ -409,7 +409,7 @@ impl Embedder for FakeEmbedder {
     // E5 model does with a prefix — there is no "more correct" fake output to
     // aim for, only a different arbitrary one.
     async fn embed_with_role(&self, text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
-        // Deterministic algorithm per design §3.4:
+        // Deterministic algorithm:
         //   SipHash the text → seed a LCG → fill `dim` floats in [-1, 1].
         use std::hash::{Hash, Hasher};
         let mut h = siphasher::sip::SipHasher::new();

@@ -1,16 +1,5 @@
 # See https://docs.github.com/get-started/getting-started-with-git/ignoring-files for more about ignoring files.
 
-# Compiled output
-/dist
-/tmp
-/out-tsc
-/bazel-out
-
-# Node
-/node_modules
-npm-debug.log
-yarn-error.log
-
 # IDEs and editors
 .idea/
 .project
@@ -29,23 +18,10 @@ yarn-error.log
 .history/*
 
 # Miscellaneous
-/.angular/cache
-.sass-cache/
-/connect.lock
 /coverage
-/libpeerconnection.log
-testem.log
-/typings
-__screenshots__/
 
-# Rust / Cargo — the workspace target dir now lives at the repo root.
-# `src-tauri/.gitignore` still covers /target and /gen/schemas in that crate.
+# Rust / Cargo
 /target
-
-# Tauri
-/src-tauri/target
-# The release sidecar, staged by scripts/build-sidecar.ts before `tauri build`.
-/src-tauri/binaries
 
 # System files
 .DS_Store

@@ -14,15 +14,13 @@ crate-type = ["rlib"]
 
 [features]
 # Opens `eval_api` — the narrow, feature-gated door into retrieval internals
-# used by the `clawg-eval` binaries. Off by default so the desktop app never
-# links it.
+# used by the `clawg-eval` binaries. Off by default so production builds never
+# link it.
 eval = []
 
 # Opens `MemoryStore::new_for_test()`, `FakeEmbedder` and the two cross-module
-# test helpers to OTHER crates' test builds — the desktop crate's unit tests
-# reached them through `#[cfg(test)]` back when everything lived in one crate.
-# Never enabled by a production build: only `clawg-desktop`'s dev-dependency
-# turns it on.
+# test helpers to OTHER crates' test builds. Never enabled by a production
+# build: only dev-dependencies turn it on.
 testing = []
 
 [dependencies]
@@ -30,7 +28,6 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-regex.workspace = true
 reqwest.workspace = true
 futures.workspace = true
 async-trait.workspace = true
@@ -39,34 +36,25 @@ log.workspace = true
 dirs.workspace = true
 sha2.workspace = true
 unicode-normalization.workspace = true
-base64.workspace = true
-rand.workspace = true
-globset.workspace = true
 once_cell.workspace = true
 
-# RAG foundations (Phase 1)
+# Storage and vector search
 tokio-rusqlite.workspace = true
 rusqlite.workspace = true
 refinery.workspace = true
 sqlite-vec.workspace = true
 siphasher.workspace = true
 
-# RAG Phase 2 (embedder)
+# Embedder
 fastembed.workspace = true
 fs2.workspace = true
 
-# RAG Phase 3 (ingest)
+# Ingest (chunking and tokenization)
 tree-sitter.workspace = true
 tree-sitter-rust.workspace = true
 tree-sitter-typescript.workspace = true
 tree-sitter-python.workspace = true
 tokenizers.workspace = true
-
-# libc is used on Unix for process-group kill (kill(-PGID, SIGKILL)).
-# Declared explicitly even though it is almost certainly a transitive
-# dependency — relying on implicit resolution is fragile.
-[target.'cfg(unix)'.dependencies]
-libc.workspace = true
 
 [dev-dependencies]
 # Enables tokio::time::pause() / advance() and #[tokio::test(start_paused = true)]

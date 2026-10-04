@@ -778,7 +778,7 @@ mod tests {
             chunks.iter().any(|c| c.text.contains(&straddling)),
             "span crossing the old cut point must be whole in >= 1 chunk"
         );
-        // Control: with overlap 0 it is NOT, which is the bug this change fixes.
+        // Control: with overlap 0 it is NOT, which is why the overlap exists.
         let cut = splitter.split(&text, max, 0);
         assert!(
             !cut.iter().any(|c| c.text.contains(&straddling)),

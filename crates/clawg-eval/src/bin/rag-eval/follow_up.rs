@@ -7,8 +7,7 @@
 //! Three arms per case, none of them hand-authored multi-turn golden data:
 //! - **Ceiling**: the golden query, unmodified — today's normal retrieval.
 //! - **Floor**: a content-free template alone — the query-independent
-//!   ranking (importance/recency decay), not chance; see the module-level
-//!   discovery this design amended the spec around.
+//!   ranking (importance/recency decay), not chance.
 //! - **Treatment**: the template composed with the golden query as its one
 //!   prior turn — what a real follow-up message would actually embed.
 

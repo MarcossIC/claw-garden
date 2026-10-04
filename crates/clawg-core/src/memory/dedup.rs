@@ -148,7 +148,7 @@ mod tests {
 
     // ── Backfill: simulates a row written before V6, exercises the backfill
     // UPDATE statement directly (not migration ordering — the whole suite
-    // failing loudly already proves that, see D-A) ──────────────────────────
+    // failing loudly already proves that) ───────────────────────────────────
 
     /// The exact `idx_memory_dedup`-shaped lookup: a row with `content_hash
     /// IS NULL` (simulated legacy state) must be invisible to it; running the

@@ -308,9 +308,9 @@ mod tests {
 
     #[test]
     fn quotas_sum_to_a_corpus_large_enough_to_discriminate() {
-        // The plan's §0.3.2 asks for ~40 retrieval cases; with one case per
-        // document, the corpus has to be at least that big.
+        // A golden set needs ~40 retrieval cases to carry a claim; with one case
+        // per document, the corpus has to be at least that big.
         let total: usize = QUOTAS.iter().map(|(_, n)| n).sum();
-        assert!(total >= 40, "quotas sum to {total}, below the ~40 the plan requires");
+        assert!(total >= 40, "quotas sum to {total}, below the ~40 a golden set requires");
     }
 }

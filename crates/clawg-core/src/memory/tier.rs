@@ -79,10 +79,10 @@ pub(crate) fn demote_inactive(
 ) -> i64 {
     match current_tier {
         1 => {
-            // DEMOTE-2: absolutely pivotal memories (importance >= 9.0) NEVER demote.
+            // Absolutely pivotal memories (importance >= 9.0) NEVER demote.
             if importance >= 9.0 {
                 1
-            // DEMOTE-4: low-importance tier-1 demotes to tier 2 after 90 days.
+            // Low-importance tier-1 demotes to tier 2 after 90 days.
             } else if days_since_last_access > 90.0 {
                 2
             } else {
@@ -90,14 +90,14 @@ pub(crate) fn demote_inactive(
             }
         }
         2 => {
-            // DEMOTE-3: tier-2 demotes to tier 3 after 180 days.
+            // Tier-2 demotes to tier 3 after 180 days.
             if days_since_last_access > 180.0 {
                 3
             } else {
                 2
             }
         }
-        // DEMOTE-5: no condition met — return current unchanged.
+        // No condition met — return current unchanged.
         _ => current_tier,
     }
 }
@@ -180,9 +180,9 @@ pub(crate) async fn register_demote_udf(
 mod tests {
     use super::*;
 
-    // ── T-01-test: compute_tier truth table ─────────────────────────────────
+    // ── compute_tier truth table ────────────────────────────────────────────
 
-    // TIER-4: INSERT tier-1 types (compute_tier(3, importance, 0, type) → 1)
+    // INSERT tier-1 types (compute_tier(3, importance, 0, type) → 1)
 
     #[test]
     fn compute_tier_user_preference_inserts_at_tier_1() {
@@ -194,7 +194,7 @@ mod tests {
         assert_eq!(compute_tier(3, 5.0, 0, "procedural_skill"), 1);
     }
 
-    // TIER-5: INSERT tier-2 types (compute_tier(3, importance, 0, type) → 2)
+    // INSERT tier-2 types (compute_tier(3, importance, 0, type) → 2)
 
     #[test]
     fn compute_tier_architectural_decision_inserts_at_tier_2() {
@@ -206,7 +206,7 @@ mod tests {
         assert_eq!(compute_tier(3, 5.0, 0, "session_summary"), 2);
     }
 
-    // TIER-6: INSERT tier-3 types (compute_tier(3, importance, 0, type) → 3)
+    // INSERT tier-3 types (compute_tier(3, importance, 0, type) → 3)
 
     #[test]
     fn compute_tier_chat_message_inserts_at_tier_3() {
@@ -218,7 +218,7 @@ mod tests {
         assert_eq!(compute_tier(3, 5.0, 0, "episodic_trajectory"), 3);
     }
 
-    // TIER-2: promote-only invariant — result MUST NOT exceed current.
+    // Promote-only invariant — result MUST NOT exceed current.
 
     #[test]
     fn compute_tier_promote_only_chat_message_at_tier_1_stays_1() {
@@ -226,7 +226,7 @@ mod tests {
         assert_eq!(compute_tier(1, 1.0, 0, "chat_message"), 1);
     }
 
-    // TIER-7: no rule fires → returns current unchanged.
+    // No rule fires → returns current unchanged.
 
     #[test]
     fn compute_tier_no_rule_fires_returns_current_unchanged() {
@@ -234,7 +234,7 @@ mod tests {
         assert_eq!(compute_tier(2, 2.0, 1, "chat_message"), 2);
     }
 
-    // Extra: importance >= 9.0 fast-track (from tasks.md impl description).
+    // Importance >= 9.0 fast-track.
 
     #[test]
     fn compute_tier_high_importance_promotes_any_type_to_tier_1() {
@@ -250,7 +250,7 @@ mod tests {
         assert_eq!(compute_tier(1, 5.0, 0, "architectural_decision"), 1);
     }
 
-    // ── T-01: flush re-eval rule (TIER-1 scenario, pure Rust)
+    // ── flush re-evaluation rule (pure Rust)
 
     #[test]
     fn compute_tier_architectural_decision_access_count_3_promotes_to_tier_1() {
@@ -263,16 +263,16 @@ mod tests {
         assert_eq!(compute_tier(2, 5.0, 3, "session_summary"), 1);
     }
 
-    // ── T-02-test: demote_inactive truth table ──────────────────────────────
+    // ── demote_inactive truth table ─────────────────────────────────────────
 
-    // DEMOTE-4: tier 1 → 2 when days > 90 AND importance < 9.0.
+    // Tier 1 → 2 when days > 90 AND importance < 9.0.
 
     #[test]
     fn demote_inactive_tier1_low_importance_over_90_days_demotes_to_2() {
         assert_eq!(demote_inactive(1, 91.0, 5.0), 2);
     }
 
-    // DEMOTE-2: importance >= 9.0 → tier 1 NEVER demotes.
+    // Importance >= 9.0 → tier 1 NEVER demotes.
 
     #[test]
     fn demote_inactive_tier1_high_importance_never_demotes() {
@@ -281,14 +281,14 @@ mod tests {
         assert_eq!(demote_inactive(1, 365.0, 9.0), 1);
     }
 
-    // DEMOTE-3: tier 2 → 3 when days > 180.
+    // Tier 2 → 3 when days > 180.
 
     #[test]
     fn demote_inactive_tier2_over_180_days_demotes_to_3() {
         assert_eq!(demote_inactive(2, 181.0, 5.0), 3);
     }
 
-    // DEMOTE-5: no condition met → returns current unchanged.
+    // No condition met → returns current unchanged.
 
     #[test]
     fn demote_inactive_tier2_not_inactive_enough_returns_current() {
@@ -302,11 +302,11 @@ mod tests {
         assert_eq!(demote_inactive(1, 89.0, 5.0), 1);
     }
 
-    // ── T-03-test: register_tier_udf — SQL callable ─────────────────────────
+    // ── register_tier_udf — SQL callable ────────────────────────────────────
 
     #[tokio::test]
     async fn register_tier_udf_makes_compute_tier_callable_via_sql() {
-        // Uses new_for_test() which calls register_tier_udf internally (T-04-impl).
+        // Uses new_for_test() which calls register_tier_udf internally.
         let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
         let v: i64 = store
             .conn
@@ -339,7 +339,7 @@ mod tests {
         assert_eq!(v, 1, "expected tier 1 (user_preference INSERT), got {v}");
     }
 
-    // ── T-05-test: register_demote_udf — SQL callable (memoria-3-capas-fase-3) ──
+    // ── register_demote_udf — SQL callable ──────────────────────────────────
 
     #[tokio::test]
     async fn register_demote_udf_makes_demote_tier_callable_via_sql() {
@@ -352,6 +352,6 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(v, 2, "expected tier 2 (DEMOTE-4, >90 days), got {v}");
+        assert_eq!(v, 2, "expected tier 2 (>90 days), got {v}");
     }
 }

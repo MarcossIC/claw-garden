@@ -37,14 +37,14 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// SPEC-6 Sc 6.1 — same path → same id.
+    /// Same path → same id.
     #[test]
     fn same_path_same_id() {
         let path = PathBuf::from("/home/user/projects/my-app");
         assert_eq!(derive_project_id(&path), derive_project_id(&path));
     }
 
-    /// SPEC-6 Sc 6.2 — format matches `{basename}-[0-9a-f]{4}`.
+    /// Format matches `{basename}-[0-9a-f]{4}`.
     #[test]
     fn format_matches_basename_hash4() {
         let path = PathBuf::from("/home/user/projects/my-app");
@@ -65,7 +65,7 @@ mod tests {
         );
     }
 
-    /// SPEC-6 Sc 6.3 — different paths → different ids.
+    /// Different paths → different ids.
     #[test]
     fn different_paths_different_ids() {
         let p1 = PathBuf::from("/home/user/projects/my-app");

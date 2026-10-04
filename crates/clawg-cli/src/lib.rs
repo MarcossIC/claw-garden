@@ -20,7 +20,9 @@
 //! database is not a style choice — the ingest pipeline's dedup gate is only
 //! correct while a single sequential consumer drains the channel (see
 //! `MemoryRuntime::ingest_worker`), and two processes with the same `memory.db`
-//! would each have one.
+//! would each have one. So ownership is enforced, not agreed on: the store lock
+//! taken inside `MemoryStore::open` (`clawg_core::memory::store_lock`) refuses
+//! a second opener, whether it is another daemon or an evaluation run.
 
 pub mod cli;
 pub mod client;

@@ -7,6 +7,7 @@ use tokio_rusqlite::Connection;
 use crate::memory::embedder::Embedder;
 use crate::memory::error::MemoryError;
 use crate::memory::latency::KnnLatency;
+use crate::memory::store_lock::{StoreHolder, StoreLock};
 
 // ---------------------------------------------------------------------------
 // Embedding contract
@@ -148,6 +149,14 @@ pub struct MemoryStore {
     /// database, so they belong to one latency series instead of each
     /// keeping a private slice too short to mean anything.
     knn_latency: Arc<KnnLatency>,
+    /// Exclusive ownership of `<base_dir>/memory.db`, shared with every clone.
+    ///
+    /// Never read: the guard is the value. Behind an `Arc` so the store stays
+    /// owned until the LAST clone is dropped — the runtime hands clones to the
+    /// ingest worker and the maintenance loop, and releasing the lock when the
+    /// first one goes would let a second process in under still-live writers.
+    /// `None` for the in-memory test store, which has nothing to exclude.
+    _lock: Option<Arc<StoreLock>>,
 }
 
 impl MemoryStore {
@@ -155,10 +164,17 @@ impl MemoryStore {
     ///
     /// Registers the `sqlite-vec` extension (process-global, idempotent) and
     /// runs every refinery migration before returning.
-    pub async fn open(base_dir: &Path) -> Result<Self, MemoryError> {
+    ///
+    /// Takes exclusive ownership of the data directory FIRST — before SQLite is
+    /// touched — and keeps it for as long as any clone of the returned store
+    /// lives. A process that loses gets [`MemoryError::StoreInUse`] and has not
+    /// created, opened or migrated `memory.db`: those are the holder's alone.
+    /// `holder` says who is asking, so the loser's message can name it.
+    pub async fn open(base_dir: &Path, holder: StoreHolder) -> Result<Self, MemoryError> {
         ensure_vec0_registered();
         // Best-effort directory creation — we'll get a clean error on open if it fails.
         let _ = std::fs::create_dir_all(base_dir);
+        let lock = StoreLock::acquire(base_dir, holder)?;
         let path = base_dir.join("memory.db");
         // Connection::open returns Result<_, rusqlite::Error>
         let conn = Connection::open(&path).await
@@ -204,6 +220,7 @@ impl MemoryStore {
         Ok(Self {
             conn,
             knn_latency: Arc::new(KnnLatency::new()),
+            _lock: Some(Arc::new(lock)),
         })
     }
 
@@ -237,6 +254,7 @@ impl MemoryStore {
         Ok(Self {
             conn,
             knn_latency: Arc::new(KnnLatency::new()),
+            _lock: None,
         })
     }
 
@@ -393,10 +411,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // F.1-test: vec0 registration + schema tests
+    // Vec0 registration + schema tests
     // -----------------------------------------------------------------------
 
-    /// SPEC-3 Sc 3.1, 3.2 — vec_version() returns a non-empty string.
+    /// Vec_version() returns a non-empty string.
     #[tokio::test]
     async fn vec_version_returns_string() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -477,7 +495,7 @@ mod tests {
         );
     }
 
-    /// SPEC-3 Sc 3.2 — ensure_vec0_registered is idempotent (no panic on second call).
+    /// Ensure_vec0_registered is idempotent (no panic on second call).
     #[tokio::test]
     async fn ensure_vec0_idempotent() {
         // Call registration twice in the same process — Once guard prevents double-init.
@@ -486,7 +504,7 @@ mod tests {
         // If we reach here without panic, the test passes.
     }
 
-    /// SPEC-2 Sc 2.1 — tables present after open.
+    /// Tables present after open.
     #[tokio::test]
     async fn tables_exist_after_open() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -514,7 +532,7 @@ mod tests {
         );
     }
 
-    /// SPEC-2 Sc 2.2 — virtual tables (vec0) present after open.
+    /// Virtual tables (vec0) present after open.
     #[tokio::test]
     async fn virtual_tables_exist_after_open() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -623,7 +641,7 @@ mod tests {
         assert_eq!(after, 0, "V7 must drop the view on an upgraded database");
     }
 
-    /// SPEC-2 Sc 2.4 — indices present after open.
+    /// Indices present after open.
     #[tokio::test]
     async fn indices_exist_after_open() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -666,7 +684,7 @@ mod tests {
         }
     }
 
-    /// SPEC-2 total object count.
+    /// Total object count.
     #[tokio::test]
     async fn nine_schema_objects_exist() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -694,7 +712,7 @@ mod tests {
         );
     }
 
-    /// SPEC-5 Sc 5.1, 5.2 — MemoryStore is Clone, both handles work.
+    /// MemoryStore is Clone, both handles work.
     #[tokio::test]
     async fn memory_store_is_clone() {
         let s1 = MemoryStore::new_for_test().await.unwrap();
@@ -723,7 +741,7 @@ mod tests {
     // only one of the two ever benefits from the raised bind-parameter cap.
     // -----------------------------------------------------------------------
 
-    /// LIMIT-1 — production open() path sets SQLITE_LIMIT_VARIABLE_NUMBER = 32766.
+    /// Production open() path sets SQLITE_LIMIT_VARIABLE_NUMBER = 32766.
     ///
     /// Uses `sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, -1)` to query the
     /// current value without changing it (SQLite contract: any negative new_val
@@ -731,7 +749,7 @@ mod tests {
     #[tokio::test]
     async fn limit_variable_number_set_in_open_path() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = MemoryStore::open(dir.path()).await.unwrap();
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let limit: i32 = store
             .conn
             .call(|c| -> rusqlite::Result<i32> {
@@ -749,7 +767,7 @@ mod tests {
         assert_eq!(limit, 32766, "open(): expected 32766, got {limit}");
     }
 
-    /// LIMIT-2 — test new_for_test() path sets SQLITE_LIMIT_VARIABLE_NUMBER = 32766.
+    /// Test new_for_test() path sets SQLITE_LIMIT_VARIABLE_NUMBER = 32766.
     #[tokio::test]
     async fn limit_variable_number_set_in_new_for_test_path() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -779,7 +797,7 @@ mod tests {
     #[tokio::test]
     async fn open_sets_journal_mode_wal() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = MemoryStore::open(dir.path()).await.unwrap();
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let mode: String = store
             .conn
             .call(|c| -> rusqlite::Result<String> { c.query_row("PRAGMA journal_mode", [], |r| r.get(0)) })
@@ -792,7 +810,7 @@ mod tests {
     #[tokio::test]
     async fn open_sets_synchronous_normal() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = MemoryStore::open(dir.path()).await.unwrap();
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let synchronous: i64 = store
             .conn
             .call(|c| -> rusqlite::Result<i64> { c.query_row("PRAGMA synchronous", [], |r| r.get(0)) })
@@ -814,7 +832,7 @@ mod tests {
         assert!(!mode.eq_ignore_ascii_case("wal"), "in-memory path must not be wal, got {mode}");
     }
 
-    /// SPEC-12 Sc 12.1–12.3 — second new_for_test() in same process succeeds.
+    /// Second new_for_test() in same process succeeds.
     #[tokio::test]
     async fn idempotent_migrations_second_open() {
         let _s1 = MemoryStore::new_for_test().await.unwrap();
@@ -1067,10 +1085,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // G.1-test: vec0 KNN
+    // Vec0 KNN
     // -----------------------------------------------------------------------
 
-    /// SPEC-4 Sc 4.1, 4.2 — INSERT vector + KNN returns rowid=1.
+    /// INSERT vector + KNN returns rowid=1.
     #[tokio::test]
     async fn vec0_insert_and_knn() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1106,10 +1124,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // I.1-test: CHECK constraints
+    // CHECK constraints
     // -----------------------------------------------------------------------
 
-    /// SPEC-11 Sc 11.1 — scope='agent' with agent_id IS NULL rejected.
+    /// Scope='agent' with agent_id IS NULL rejected.
     #[tokio::test]
     async fn check_agent_scope_null_agent_id_rejected() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1127,7 +1145,7 @@ mod tests {
         assert!(result.is_err(), "Expected CHECK constraint violation");
     }
 
-    /// SPEC-11 Sc 11.2 — scope='project' with project_id IS NULL rejected.
+    /// Scope='project' with project_id IS NULL rejected.
     #[tokio::test]
     async fn check_project_scope_null_project_id_rejected() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1145,7 +1163,7 @@ mod tests {
         assert!(result.is_err(), "Expected CHECK constraint violation");
     }
 
-    /// SPEC-11 Sc 11.3 — scope='global' with agent_id IS NOT NULL rejected.
+    /// Scope='global' with agent_id IS NOT NULL rejected.
     #[tokio::test]
     async fn check_global_scope_nonnull_agent_id_rejected() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1164,15 +1182,16 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // K.1-test: End-to-end integration smoke test
+    // End-to-end integration smoke test
     // -----------------------------------------------------------------------
 
-    /// SPEC-2 through SPEC-12 — covers all 12 spec scenarios in one run.
+    /// Covers tables, vec_version, KNN, clone, CHECK constraints and migration
+    /// count in one run.
     #[tokio::test]
-    async fn e2e_all_spec_scenarios() {
+    async fn e2e_store_smoke() {
         let store = MemoryStore::new_for_test().await.unwrap();
 
-        // SPEC-2 Sc 2.1 — tables
+        // Tables
         let tables: Vec<String> = store
             .conn
             .call(|c| -> Result<Vec<String>, rusqlite::Error> {
@@ -1208,7 +1227,7 @@ mod tests {
             .unwrap();
         assert!(views.is_empty(), "found unexpected views: {views:?}");
 
-        // SPEC-3 Sc 3.1 — vec_version
+        // Vec_version
         let version: String = store
             .conn
             .call(|c| -> Result<String, rusqlite::Error> {
@@ -1218,7 +1237,7 @@ mod tests {
             .unwrap();
         assert!(!version.is_empty());
 
-        // SPEC-4 Sc 4.1, 4.2 — KNN insert + search
+        // KNN insert + search
         let embedding: Vec<f32> = vec![1.0f32; 384];
         let bytes = serialize_f32_vec(&embedding);
         store
@@ -1248,7 +1267,7 @@ mod tests {
             .unwrap();
         assert_eq!(rowid, 1);
 
-        // SPEC-5 Sc 5.2 — clone
+        // Clone
         let s2 = store.clone();
         let v2: String = s2
             .conn
@@ -1259,7 +1278,7 @@ mod tests {
             .unwrap();
         assert!(!v2.is_empty());
 
-        // SPEC-11 Sc 11.1 — CHECK constraints
+        // CHECK constraints
         let bad = store
             .conn
             .call(|c| -> Result<usize, rusqlite::Error> {
@@ -1273,7 +1292,7 @@ mod tests {
             .await;
         assert!(bad.is_err());
 
-        // SPEC-12 Sc 12.3 — migration count
+        // Migration count
         let migration_count: i64 = store
             .conn
             .call(|c| -> Result<i64, rusqlite::Error> {
@@ -1521,5 +1540,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, ContractStatus::Match);
+    }
+
+    // -----------------------------------------------------------------------
+    // Exclusive ownership — the store lock is taken before SQLite is touched
+    // and lives as long as any clone of the store.
+    // -----------------------------------------------------------------------
+
+    /// A store whose lock is held elsewhere must refuse to open, and must not
+    /// have touched `memory.db` on the way out: creating or migrating the file
+    /// is exactly what the holder is entitled to do alone.
+    #[tokio::test]
+    async fn open_refuses_a_held_store_and_never_creates_memory_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _holder = StoreLock::acquire(dir.path(), StoreHolder::Daemon).expect("holder");
+
+        let err = MemoryStore::open(dir.path(), StoreHolder::Eval)
+            .await
+            .err()
+            .expect("a held store must not open");
+        match err {
+            MemoryError::StoreInUse { owner: Some(o) } => assert_eq!(o.holder, StoreHolder::Daemon),
+            other => panic!("expected StoreInUse naming the daemon, got {other:?}"),
+        }
+        assert!(
+            !dir.path().join("memory.db").exists(),
+            "the loser must never create or migrate the database"
+        );
+    }
+
+    /// `MemoryStore` is `Clone`, and the runtime hands clones to the ingest
+    /// worker and the maintenance loop: the store is only free once the LAST
+    /// clone is gone, not the first.
+    #[tokio::test]
+    async fn the_lock_lives_as_long_as_any_clone_of_the_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = MemoryStore::open(dir.path(), StoreHolder::Daemon).await.expect("open a");
+        let b = a.clone();
+
+        drop(a);
+        assert!(
+            matches!(
+                MemoryStore::open(dir.path(), StoreHolder::Eval).await.err(),
+                Some(MemoryError::StoreInUse { .. })
+            ),
+            "a clone is still alive, so the store must still be held"
+        );
+
+        drop(b);
+        MemoryStore::open(dir.path(), StoreHolder::Eval)
+            .await
+            .map(|_| ())
+            .expect("the last clone is gone, so the store is free");
+    }
+
+    /// The in-memory test store has nothing to exclude anybody from.
+    #[tokio::test]
+    async fn new_for_test_takes_no_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _t = MemoryStore::new_for_test().await.expect("test store");
+        StoreLock::acquire(dir.path(), StoreHolder::Daemon).expect("nothing to collide with");
     }
 }

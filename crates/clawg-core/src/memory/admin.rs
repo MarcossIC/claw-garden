@@ -1,14 +1,8 @@
-//! Inspection/override primitives for the 3 memory tables
-//! (memoria-3-capas-fase-4), plus 2 additive pure log-formatting helpers that
-//! measure doc-7's "Tier 1 covers 80%" criterion.
+//! Inspection/override primitives for the 3 memory tables, plus 2 additive
+//! pure log-formatting helpers that measure the "Tier 1 covers 80%" criterion.
 //!
-//! Wrapper/core split (6th instance of the convention — see
-//! `clawg_desktop_lib::commands::embedder` / `::commands::session` /
-//! `memory::maintenance`): the desktop command wrappers live in
-//! `clawg_desktop_lib::commands::memory_admin`, resolve `state.memory_store`
-//! and delegate to the `pub async fn *_core(store: &MemoryStore, ...)`
-//! functions here, which are directly testable via
-//! `MemoryStore::new_for_test()` without a desktop runtime.
+//! The `pub async fn *_core(store: &MemoryStore, ...)` functions here are
+//! directly testable via `MemoryStore::new_for_test()`.
 
 use serde::{Deserialize, Serialize};
 
@@ -22,14 +16,14 @@ use crate::memory::TableKind;
 use crate::memory::{MemoryError, MemoryStore};
 
 // ---------------------------------------------------------------------------
-// MemoryKind — D-A: fresh enum, NOT a mutation of `record::TableKind`.
+// MemoryKind — a fresh enum, NOT a mutation of `record::TableKind`.
 //
 // `record::TableKind` is used as `RankedHit.kind` (search.rs:47) with
 // PascalCase serde (no rename) — it is a record-provenance concept consumed
 // by retrieval. `MemoryKind` here is a separate API-input concept: it
 // deserializes lowercase ("memory"|"episodic"|"procedural"), matching the
-// frontend invoke convention. Unifying the two is an open question deferred to
-// a future change (ripple risk into RankedHit's existing serde shape).
+// frontend invoke convention. Unifying the two is deliberately not done here
+// (ripple risk into RankedHit's existing serde shape).
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,8 +35,8 @@ pub enum MemoryKind {
 }
 
 // ---------------------------------------------------------------------------
-// Pure log-formatting helpers (Requirement: Tier-per-hit logging /
-// Tier-1 coverage logging). Unit-testable without a DB — the call sites in
+// Pure log-formatting helpers (tier-per-hit logging / tier-1 coverage
+// logging). Unit-testable without a DB — the call sites in
 // `memory/search.rs` and `memory/prompt_builder.rs` route their side-effect
 // (log::debug!/log::info!) through these, per the "side-effect at the call
 // site, not the primitive" convention.
@@ -330,8 +324,8 @@ pub struct ListParams {
 /// SAME `conn.call` and merges + sorts (`created_at DESC`) + paginates in
 /// Rust; `kind: Some(_)` pushes `LIMIT`/`OFFSET` down to SQL directly.
 /// `deleted_at IS NULL` is always applied; `status` is NOT filtered —
-/// `superseded` rows remain visible (D-C: inspection is an active inventory
-/// with superseded shown, distinct from retrieval's stricter filter).
+/// `superseded` rows remain visible (inspection is an active inventory with
+/// superseded shown, distinct from retrieval's stricter filter).
 pub async fn list_memories_core(
     store: &MemoryStore,
     params: ListParams,
@@ -552,12 +546,12 @@ fn query_procedural_rows(
 }
 
 // ---------------------------------------------------------------------------
-// get_failure_histogram — trajectory-miner-fase-4. Root-cause histogram
-// bucketed by `created_at` (already ms — no `/1000`, D1). Excludes NULL
+// get_failure_histogram — root-cause histogram
+// bucketed by `created_at` (already ms — no `/1000`). Excludes NULL
 // `root_cause`: RCA only classifies FAILED trajectories (miner.rs:379,
 // `success_score <= GOLDEN_SCORE_THRESHOLD`); golden/successful rows never
-// get a `root_cause` and including them would count successes as failures
-// (D5). No agent/project scoping — matches `list_memories`.
+// get a `root_cause` and including them would count successes as failures.
+// No agent/project scoping — matches `list_memories`.
 // ---------------------------------------------------------------------------
 
 /// One `(bucket, root_cause)` group from `get_failure_histogram_core`.
@@ -569,7 +563,7 @@ pub struct FailureHistogramRow {
 }
 
 /// Groups failed `episodic_trajectory` rows by `(created_at / bucket_ms) *
-/// bucket_ms` and `root_cause`, excluding `root_cause IS NULL` (D5) and
+/// bucket_ms` and `root_cause`, excluding `root_cause IS NULL` and
 /// soft-deleted rows. `bucket_ms` is clamped to at least `1` (division-by-zero
 /// guard).
 pub async fn get_failure_histogram_core(
@@ -612,7 +606,7 @@ pub async fn get_failure_histogram_core(
 }
 
 // ---------------------------------------------------------------------------
-// get_skill_steps_trend — trajectory-miner-fase-4. INNER-joins each
+// get_skill_steps_trend — INNER-joins each
 // `procedural_skill.source_trajectory_ids` entry (via `json_each`) to its
 // `episodic_trajectory` row: dangling/soft-deleted ids silently produce zero
 // rows, never an error (join semantics, not a manual filter). `step_count`
@@ -695,7 +689,7 @@ mod tests {
     use super::*;
 
 
-    // ── Lote 1 — MemoryKind serde round-trip (Task 1.1) ─────────────────────
+    // ── MemoryKind serde round-trip ─────────────────────
 
     #[test]
     fn memory_kind_serde_lowercase_roundtrip() {
@@ -713,7 +707,7 @@ mod tests {
         }
     }
 
-    // ── Lote 1 — format_tier_distribution (Task 1.3) ─────────────────────────
+    // ── format_tier_distribution ─────────────────────────
 
     fn make_hit(tier: i64) -> RankedHit {
         RankedHit {
@@ -740,7 +734,7 @@ mod tests {
         assert_eq!(format_tier_distribution(&[]), "t1:0,t2:0,t3:0");
     }
 
-    // ── Lote 1 — format_tier1_coverage (Task 1.5) ────────────────────────────
+    // ── format_tier1_coverage ────────────────────────────
 
     #[test]
     fn format_tier1_coverage_present_true_with_hits() {
@@ -928,7 +922,7 @@ mod tests {
             .unwrap()
     }
 
-    // Task 2.1 — memory tier=3 imp=5 architectural_decision, set 9 → tier=1 (Rule 1).
+    // Memory tier=3 imp=5 architectural_decision, set 9 → tier=1 (Rule 1).
     #[tokio::test]
     async fn set_importance_memory_high_importance_promotes_to_tier_1() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -944,7 +938,7 @@ mod tests {
         assert!((importance - 9.0).abs() < 1e-9);
     }
 
-    // Task 2.2 — memory tier=1 imp=9.5, set 2.0 → tier stays 1 (promote-only), importance=2.0.
+    // Memory tier=1 imp=9.5, set 2.0 → tier stays 1 (promote-only), importance=2.0.
     #[tokio::test]
     async fn set_importance_lowering_never_demotes_tier_1() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -960,7 +954,7 @@ mod tests {
         assert!((importance - 2.0).abs() < 1e-9);
     }
 
-    // Task 2.3 — episodic tier=3, set 7 → tier stays 3 (no compute_tier rule for
+    // Episodic tier=3, set 7 → tier stays 3 (no compute_tier rule for
     // the 'episodic_trajectory' literal), importance=7.
     #[tokio::test]
     async fn set_importance_episodic_no_type_rule_only_rule_1() {
@@ -977,7 +971,7 @@ mod tests {
         assert!((importance - 7.0).abs() < 1e-9);
     }
 
-    // Task 2.4 — procedural tier=1, set 3.0 → tier stays 1 (Rule 2, benign no-op), importance=3.0.
+    // Procedural tier=1, set 3.0 → tier stays 1 (Rule 2, benign no-op), importance=3.0.
     #[tokio::test]
     async fn set_importance_procedural_recompute_is_benign_noop() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -993,7 +987,7 @@ mod tests {
         assert!((importance - 3.0).abs() < 1e-9);
     }
 
-    // Task 2.5 — id inexistente → Ok(0).
+    // Id inexistente → Ok(0).
     #[tokio::test]
     async fn set_importance_nonexistent_id_returns_zero() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1005,7 +999,7 @@ mod tests {
         assert_eq!(affected, 0);
     }
 
-    // Task 2.6 — deleted_at set → returns 0, no-op (open question locked: no-op, not error).
+    // Deleted_at set → returns 0, no-op (no-op, not error).
     #[tokio::test]
     async fn set_importance_soft_deleted_row_is_noop() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1018,7 +1012,7 @@ mod tests {
         assert_eq!(affected, 0, "deleted rows must not be updated");
     }
 
-    // ── Lote 3 — delete_memory_core (Tasks 3.1–3.4) ──────────────────────────
+    // ── delete_memory_core ──────────────────────────
 
     async fn memory_deleted_at(store: &MemoryStore, id: i64) -> Option<i64> {
         store
@@ -1048,7 +1042,7 @@ mod tests {
             .unwrap()
     }
 
-    // Task 3.1 — seed → delete → deleted_at set (SELECT follow-up).
+    // Seed → delete → deleted_at set (SELECT follow-up).
     #[tokio::test]
     async fn delete_memory_sets_deleted_at() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1066,7 +1060,7 @@ mod tests {
         );
     }
 
-    // Task 3.2 — colliding autoincrement ids across tables: kind disambiguates.
+    // Colliding autoincrement ids across tables: kind disambiguates.
     #[tokio::test]
     async fn delete_memory_kind_disambiguates_colliding_ids() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1092,7 +1086,7 @@ mod tests {
         );
     }
 
-    // Task 3.3 — 2nd delete of the same id → 0 rows affected (idempotent).
+    // 2nd delete of the same id → 0 rows affected (idempotent).
     #[tokio::test]
     async fn delete_memory_second_delete_is_idempotent_zero() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1109,7 +1103,7 @@ mod tests {
         assert_eq!(second, 0, "second delete of an already-deleted row must affect 0 rows");
     }
 
-    // Task 3.4 — deleted row is invisible in search_all_memories end-to-end (D-C).
+    // Deleted row is invisible in search_all_memories end-to-end.
     #[tokio::test]
     async fn delete_memory_row_invisible_in_search_end_to_end() {
         use crate::memory::embedder::{Embedder, FakeEmbedder};
@@ -1373,8 +1367,7 @@ mod tests {
         assert_eq!(format_skill_hits(&[]), "skill_hits=0");
     }
 
-    // ── trajectory-miner-fase-4 Lote 2 — get_failure_histogram_core ─────────
-    // (Tasks 2.1–2.4, RED)
+    // ── get_failure_histogram_core ─────────
 
     /// Seeds a raw `episodic_trajectory` row with an explicit `created_at`
     /// and optional `root_cause` — the columns `seed_episodic_row` above
@@ -1410,7 +1403,7 @@ mod tests {
             .expect("seed_episodic_with_cause failed")
     }
 
-    // Task 2.2 — groups by bucket and cause; ordered bucket_start_ms ASC.
+    // Groups by bucket and cause; ordered bucket_start_ms ASC.
     #[tokio::test]
     async fn failure_histogram_groups_by_bucket_and_cause() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1435,7 +1428,7 @@ mod tests {
         }
     }
 
-    // Task 2.3 — golden/NULL root_cause excluded (D5).
+    // Golden/NULL root_cause excluded.
     #[tokio::test]
     async fn failure_histogram_excludes_null_root_cause() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1454,7 +1447,7 @@ mod tests {
         );
     }
 
-    // Task 2.4 — empty table → Ok(vec![]).
+    // Empty table → Ok(vec![]).
     #[tokio::test]
     async fn failure_histogram_empty_table_returns_empty() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1464,8 +1457,7 @@ mod tests {
         assert!(rows.is_empty());
     }
 
-    // ── trajectory-miner-fase-4 Lote 3 — get_skill_steps_trend_core ─────────
-    // (Tasks 3.1–3.6, RED)
+    // ── get_skill_steps_trend_core ─────────
 
     fn tool_calls_json_of_len(n: usize) -> String {
         serde_json::to_string(&(0..n).map(|i| format!("t{i}")).collect::<Vec<String>>())
@@ -1530,7 +1522,7 @@ mod tests {
             .expect("seed_procedural_with_sources failed")
     }
 
-    // Task 3.2 — ordered by skill and time, step_count from tool_calls length.
+    // Ordered by skill and time, step_count from tool_calls length.
     #[tokio::test]
     async fn skill_steps_trend_ordered_by_skill_and_time() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1556,7 +1548,7 @@ mod tests {
         }
     }
 
-    // Task 3.3 — empty procedural_skill table → Ok(vec![]).
+    // Empty procedural_skill table → Ok(vec![]).
     #[tokio::test]
     async fn skill_steps_trend_empty_table_returns_empty() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1566,7 +1558,7 @@ mod tests {
         assert!(rows.is_empty());
     }
 
-    // Task 3.4 — malformed/empty tool_calls never errors; step_count=0 for both.
+    // Malformed/empty tool_calls never errors; step_count=0 for both.
     #[tokio::test]
     async fn skill_steps_trend_malformed_or_empty_tool_calls_never_errors() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1599,7 +1591,7 @@ mod tests {
         assert!(rows.iter().all(|r| r.step_count == 0), "both must yield step_count=0, got {rows:?}");
     }
 
-    // Task 3.5 — dangling trajectory id silently dropped by the INNER JOIN.
+    // Dangling trajectory id silently dropped by the INNER JOIN.
     #[tokio::test]
     async fn skill_steps_trend_dangling_id_dropped_silently() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1618,7 +1610,7 @@ mod tests {
         assert_eq!(rows[0].trajectory_id, live_id);
     }
 
-    // Task 3.6 — limit clamp math: unwrap_or(500).clamp(1,1000). Routed
+    // Limit clamp math: unwrap_or(500).clamp(1,1000). Routed
     // through a variable-parameter helper (not a bare `Some(_).unwrap_or`
     // literal) so clippy's `unnecessary_literal_unwrap` doesn't fire on a
     // pattern that mirrors production `get_skill_steps_trend_core`'s real
@@ -1647,7 +1639,7 @@ mod tests {
         assert_eq!(rows.len(), 1, "limit=5000 clamps to 1000 but must not error or truncate below actual count");
     }
 
-    // ── Lote 4 — list_memories_core (Tasks 4.2–4.8) ──────────────────────────
+    // ── list_memories_core ──────────────────────────
 
     async fn seed_memory_full(
         store: &MemoryStore,
@@ -1678,7 +1670,7 @@ mod tests {
             .expect("seed_memory_full failed")
     }
 
-    // Task 4.2 — kind=Some filters to 1 table.
+    // Kind=Some filters to 1 table.
     #[tokio::test]
     async fn list_memories_kind_some_filters_to_one_table() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1697,7 +1689,7 @@ mod tests {
         assert_eq!(rows[0].kind, MemoryKind::Memory);
     }
 
-    // Task 4.3 — kind=None merges 3 tables, ORDER BY created_at DESC.
+    // Kind=None merges 3 tables, ORDER BY created_at DESC.
     #[tokio::test]
     async fn list_memories_kind_none_merges_all_tables_sorted_desc() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1716,7 +1708,7 @@ mod tests {
         }
     }
 
-    // Task 4.4 — tier filter (WHERE).
+    // Tier filter (WHERE).
     #[tokio::test]
     async fn list_memories_tier_filter_applies() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1734,7 +1726,7 @@ mod tests {
         assert_eq!(rows[0].tier, 2);
     }
 
-    // Task 4.5 — memory_type filters ONLY the `memory` kind; no-op (no error) elsewhere.
+    // Memory_type filters ONLY the `memory` kind; no-op (no error) elsewhere.
     #[tokio::test]
     async fn list_memories_memory_type_is_noop_on_other_kinds() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1754,7 +1746,7 @@ mod tests {
         assert_eq!(rows.len(), 1, "memory_type filter must be ignored for non-Memory kinds");
     }
 
-    // Task 4.6 — limit=500 clamps to <=100.
+    // Limit=500 clamps to <=100.
     #[tokio::test]
     async fn list_memories_limit_clamps_to_100() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1772,7 +1764,7 @@ mod tests {
         assert_eq!(rows.len(), 100, "limit must clamp to the hard cap of 100");
     }
 
-    // Task 4.7 — offset paginates over the kind=None merge.
+    // Offset paginates over the kind=None merge.
     #[tokio::test]
     async fn list_memories_offset_paginates_merged_results() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1798,7 +1790,7 @@ mod tests {
         assert_ne!(page1[0].id, page2[0].id, "offset must shift the page window");
     }
 
-    // Task 4.8 — deleted_at excluded; status='superseded' visible.
+    // Deleted_at excluded; status='superseded' visible.
     #[tokio::test]
     async fn list_memories_excludes_deleted_keeps_superseded() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1818,8 +1810,7 @@ mod tests {
         assert_eq!(rows[0].status, "superseded", "superseded rows must remain visible");
     }
 
-    // ── trajectory-miner-fase-4 Lote 4 — MemoryAdminRow +3 skill fields ──────
-    // (Tasks 4.1–4.2, RED)
+    // ── MemoryAdminRow +3 skill fields ──────
 
     /// Seeds a `procedural_skill` row with explicit `success_count`, `trigger`,
     /// and `source_trajectory_ids` (`seed_procedural_row` above hardcodes
@@ -1852,7 +1843,7 @@ mod tests {
             .expect("seed_procedural_full failed")
     }
 
-    // Task 4.1 — procedural row populates the 3 new fields.
+    // Procedural row populates the 3 new fields.
     #[tokio::test]
     async fn list_memories_procedural_row_populates_skill_fields() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1871,7 +1862,7 @@ mod tests {
         assert_eq!(rows[0].source_trajectory_ids, Some("[1,2,3]".to_string()));
     }
 
-    // Task 4.2 — memory/episodic rows keep the 3 new fields as None.
+    // Memory/episodic rows keep the 3 new fields as None.
     #[tokio::test]
     async fn list_memories_memory_and_episodic_rows_have_none_skill_fields() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1891,9 +1882,9 @@ mod tests {
         }
     }
 
-    // ── trajectory-miner-fase-4 Lote 5 — guardrail (Task 5.2) ────────────────
+    // ── skill hits never touch the access tracker ──
     //
-    // D4: `format_skill_hits` is a pure function — it touches ZERO DB. This
+    // `format_skill_hits` is a pure function — it touches ZERO DB. This
     // asserts the orthogonal STATE invariant (not a call-count): a seeded
     // `procedural_skill.access_count` must stay `0` after the skill-hits path
     // runs, proving no procedural/episodic id ever reaches

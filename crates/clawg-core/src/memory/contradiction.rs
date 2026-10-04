@@ -554,14 +554,13 @@ mod tests {
         v.iter().map(|x| -x).collect()
     }
 
-    // ── user_preference regression: relocated from extractor.rs ────────────
+    // ── user_preference regression ──────────────────────────────────────────
     //
-    // The original probed with an identical embedding (distance 0) to isolate
-    // "can the pool see it" from "is the threshold calibrated". The
-    // NEAR_DUPLICATE_FLOOR added by this change makes distance 0 a skip, not
-    // a dispute, so that probe no longer proves what it once did. Re-fixtured
-    // here to a distance measured (not assumed) to land inside the dispute
-    // band, through the real `insert_memory_with_vector` write path.
+    // Probing with an identical embedding (distance 0) would isolate "can the
+    // pool see it" from "is the threshold calibrated", but
+    // NEAR_DUPLICATE_FLOOR makes distance 0 a skip, not a dispute. So this
+    // uses a distance measured (not assumed) to land inside the dispute band,
+    // through the real `insert_memory_with_vector` write path.
 
     /// A contradictory `user_preference` — the anti-sycophancy guard's
     /// reason to exist — must be detected once its embedding lands inside

@@ -25,7 +25,7 @@ pub enum Scope {
 /// Common interface for all three memory record types.
 ///
 /// Every implementor provides access to the 12 shared fields defined by the
-/// memory schema (doc 6). The `table_kind` method identifies the source table.
+/// memory schema. The `table_kind` method identifies the source table.
 ///
 /// `disputed_against` returns the raw JSON string exactly as the column holds
 /// it; `disputed_against_ids` parses it into `Vec<i64>`. Both exist: the raw
@@ -331,8 +331,7 @@ mod tests {
         assert_eq!(TableKind::Procedural.cmp(&TableKind::Memory), Ordering::Greater);
     }
 
-    /// H.1-test — compile-time assertion: all three types implement MemoryRecord.
-    /// SPEC-10 Sc 10.3
+    /// Compile-time assertion: all three types implement MemoryRecord.
     #[test]
     fn trait_dispatch_all_three_types() {
         fn check<T: MemoryRecord>(_: &T) {}
@@ -341,8 +340,7 @@ mod tests {
         check(&make_procedural_row());
     }
 
-    /// H.1-test — agent_id returns None when field is None.
-    /// SPEC-9 Sc 9.2
+    /// agent_id returns None when field is None.
     #[test]
     fn agent_id_returns_option_none() {
         let mut row = make_memory_row();
@@ -350,8 +348,7 @@ mod tests {
         assert_eq!(row.agent_id(), None);
     }
 
-    /// H.1-test — each row type returns its correct TableKind.
-    /// SPEC-10 Sc 10.2, 10.3
+    /// Each row type returns its correct TableKind.
     #[test]
     fn table_kind_per_type() {
         assert_eq!(make_memory_row().table_kind(), TableKind::Memory);
@@ -359,7 +356,7 @@ mod tests {
         assert_eq!(make_procedural_row().table_kind(), TableKind::Procedural);
     }
 
-    /// SPEC-10 Sc 10.2 — MemoryRecord impl returns struct fields.
+    /// MemoryRecord impl returns struct fields.
     #[test]
     fn memory_record_returns_fields() {
         let row = make_memory_row();
@@ -367,7 +364,7 @@ mod tests {
         assert_eq!(row.scope(), "agent");
     }
 
-    /// SPEC-10 Sc 10.3 — dyn MemoryRecord works for all three types.
+    /// dyn MemoryRecord works for all three types.
     #[test]
     fn dyn_memory_record_works() {
         fn print_id(r: &dyn MemoryRecord) -> i64 { r.id() }
@@ -376,9 +373,9 @@ mod tests {
         assert_eq!(print_id(&make_procedural_row()), 1);
     }
 
-    // ── T01 [TEST] REQ-04: disputed_against_ids() default trait method ────────
+    // ── disputed_against_ids() default trait method ───────────────────────────
 
-    /// T01a — valid JSON array → Some(vec)
+    /// Valid JSON array → Some(vec)
     #[test]
     fn disputed_against_ids_valid_json_returns_some() {
         let mut row = make_memory_row();
@@ -386,14 +383,14 @@ mod tests {
         assert_eq!(row.disputed_against_ids(), Some(vec![1i64, 2, 3]));
     }
 
-    /// T01b — field is None → returns None without panic
+    /// Field is None → returns None without panic
     #[test]
     fn disputed_against_ids_null_returns_none() {
         let row = make_memory_row(); // disputed_against starts as None
         assert_eq!(row.disputed_against_ids(), None);
     }
 
-    /// T01c — malformed JSON → returns None without panic
+    /// Malformed JSON → returns None without panic
     #[test]
     fn disputed_against_ids_malformed_json_returns_none() {
         let mut row = make_memory_row();
@@ -401,7 +398,7 @@ mod tests {
         assert_eq!(row.disputed_against_ids(), None);
     }
 
-    /// T01d — empty JSON array → Some(empty vec)
+    /// Empty JSON array → Some(empty vec)
     #[test]
     fn disputed_against_ids_empty_array_returns_some_empty() {
         let mut row = make_memory_row();
@@ -409,7 +406,7 @@ mod tests {
         assert_eq!(row.disputed_against_ids(), Some(vec![]));
     }
 
-    /// T01e — all three implementors inherit the default method correctly
+    /// All three implementors inherit the default method correctly
     #[test]
     fn disputed_against_ids_inherited_by_all_three_types() {
         let mut mem = make_memory_row();

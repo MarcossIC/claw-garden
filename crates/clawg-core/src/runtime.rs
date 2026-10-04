@@ -6,16 +6,9 @@
 //!
 //! # Why this exists
 //!
-//! The same five handles used to be fields on the desktop app's `AppState`,
-//! built inside a constructor that reached for the desktop runtime's own
-//! `block_on`. That made "can memory run?" and "is the desktop app running?" the same
-//! question, which stopped being true the moment a headless host appeared:
+//! Assembling those handles is independent of any UI or process framework:
 //! `clawg serve` (the loopback daemon) and `clawg mcp` (the stdio bridge) need
-//! the identical set and have no `AppHandle` to get it from.
-//!
-//! So the assembly moved here and the desktop keeps its field names,
-//! destructuring a `MemoryRuntime` into them. Nothing in this module mentions
-//! a UI framework; the only thing the hosts still choose for themselves is
+//! the identical set. The only thing a host still chooses for itself is
 //! *which executor* the background futures are spawned on — which is why
 //! [`MemoryRuntime::ingest_worker`] and [`MemoryRuntime::maintenance_worker`]
 //! return futures instead of spawning.
@@ -31,6 +24,7 @@ use crate::memory::access::AccessTracker;
 use crate::memory::chunker::CodeChunker;
 use crate::memory::embedder::Embedder;
 use crate::memory::events::MemoryEvent;
+use crate::memory::store_lock::StoreHolder;
 use crate::memory::maintenance::{run_maintenance_loop, MAINTENANCE_PERIOD, STARTUP_DELAY};
 use crate::memory::worker::{memory_worker, resolve_tokenizer_and_chunker};
 use crate::memory::workspace::WorkspaceManager;
@@ -39,8 +33,8 @@ use crate::memory::{MemoryError, MemoryStore};
 /// The memory substrate's live handles for one process.
 ///
 /// Every field is deliberately public and deliberately cheap to clone: the
-/// desktop destructures them straight into `AppState`'s same-named fields, and
-/// the daemon holds the struct itself. `MemoryStore` is a channel handle,
+/// hosts can destructure them, and the daemon holds the struct itself.
+/// `MemoryStore` is a channel handle,
 /// `UnboundedSender` is `Arc`-like, and the two cells plus the tracker are
 /// already behind `Arc` — so cloning a field is a refcount bump, never a
 /// second database or a second flush worker.
@@ -80,8 +74,8 @@ impl MemoryRuntime {
     ///
     /// MUST be awaited from inside a tokio runtime: [`AccessTracker::new`]
     /// spawns its flush worker during construction, and `tokio::spawn` outside
-    /// a runtime panics. A host with no runtime yet (the desktop's synchronous
-    /// `AppState::new`) wraps this call in its own `block_on`.
+    /// a runtime panics. A host with no runtime yet wraps this call in its own
+    /// `block_on`.
     ///
     /// Returns the ingest `Receiver` alongside the runtime instead of storing
     /// it on the struct, for the reason an mpsc channel has exactly one
@@ -89,10 +83,15 @@ impl MemoryRuntime {
     /// so it could never be taken back out. Returning it makes the
     /// single-drainer ownership explicit at the call site rather than a
     /// runtime surprise.
+    ///
+    /// Fails with [`MemoryError::StoreInUse`] when another process already owns
+    /// the store; `holder` is what that process will see if it is refused in
+    /// turn. The ownership lasts as long as `store` (or any clone of it) lives.
     pub async fn open(
         base_dir: PathBuf,
+        holder: StoreHolder,
     ) -> Result<(Self, UnboundedReceiver<MemoryEvent>), MemoryError> {
-        let store = Arc::new(MemoryStore::open(&base_dir).await?);
+        let store = Arc::new(MemoryStore::open(&base_dir, holder).await?);
         let (memory_tx, memory_rx) = tokio::sync::mpsc::unbounded_channel::<MemoryEvent>();
         let access_tracker = Arc::new(AccessTracker::new(store.conn.clone()));
 
@@ -112,8 +111,7 @@ impl MemoryRuntime {
     /// The ingest worker's future — **not** spawned.
     ///
     /// Returning the future rather than spawning it is what lets one body of
-    /// code serve both hosts: the desktop hands it to its own framework's
-    /// `spawn`, the daemon to `tokio::spawn`.
+    /// code serve any host: each hands it to the `spawn` of its own executor.
     ///
     /// # This must stay the ONLY spawn site per process
     ///
@@ -144,9 +142,7 @@ impl MemoryRuntime {
         maintenance_worker_future(self.store.clone())
     }
 
-    /// Workspace manager rooted at `<base_dir>/workspaces` — byte-identical to
-    /// the path the desktop's chat path builds, so both hosts read and write
-    /// the same `workspace.md` files.
+    /// Workspace manager rooted at `<base_dir>/workspaces`.
     pub fn workspaces(&self) -> WorkspaceManager {
         WorkspaceManager::new(self.base_dir.join("workspaces"))
     }
@@ -206,19 +202,12 @@ impl MemoryRuntime {
     }
 }
 
-/// Free-function form of [`MemoryRuntime::ingest_worker`], for hosts that hold
-/// the handles individually rather than as a `MemoryRuntime`.
-///
-/// The desktop is exactly that case: `AppState` owns `memory_store`,
-/// `embedder`, `tokenizer` and `base_dir` as separate fields (they are reached
-/// independently from dozens of commands), so its spawn wrapper resolves them
-/// out of state and calls this. The method above is the same call with the
-/// arguments read off `&self`.
+/// Body of [`MemoryRuntime::ingest_worker`].
 ///
 /// Builds the two chunkers once — resolving the tokenizer as a side effect,
 /// which is what fills `tokenizer_cell` for the query path — then hands
 /// ownership to the worker loop.
-pub fn ingest_worker_future(
+fn ingest_worker_future(
     base_dir: PathBuf,
     store: Arc<MemoryStore>,
     embedder: Arc<OnceCell<Arc<dyn Embedder>>>,
@@ -232,23 +221,20 @@ pub fn ingest_worker_future(
     }
 }
 
-/// Free-function form of [`MemoryRuntime::maintenance_worker`] — see
-/// [`ingest_worker_future`] for why both shapes exist.
+/// Body of [`MemoryRuntime::maintenance_worker`].
 ///
 /// Periodic inactivity-based tier demotion: first pass [`STARTUP_DELAY`] after
 /// the future starts, then every [`MAINTENANCE_PERIOD`].
-pub fn maintenance_worker_future(
+fn maintenance_worker_future(
     store: Arc<MemoryStore>,
 ) -> impl Future<Output = ()> + Send + 'static {
     run_maintenance_loop(store, STARTUP_DELAY, MAINTENANCE_PERIOD)
 }
 
 // Compile-time proof that every handle the two futures capture is
-// `Send + 'static`, which is what `tokio::spawn` and the desktop framework's
-// own `spawn` both demand. Stated here, in the crate that
-// owns the types, rather than only in the desktop wrapper that used to carry
-// it — a regression would otherwise surface as a confusing error inside a
-// different crate.
+// `Send + 'static`, which is what `tokio::spawn` demands. Stated here, in the
+// crate that owns the types — a regression would otherwise surface as a
+// confusing error inside a different crate.
 const _: fn() = || {
     fn _send_static<T: Send + 'static>() {}
     _send_static::<UnboundedReceiver<MemoryEvent>>();
@@ -289,7 +275,7 @@ mod tests {
     #[tokio::test]
     async fn open_creates_memory_db_and_a_usable_store() {
         let tmp = tmp_base();
-        let (rt, _rx) = MemoryRuntime::open(tmp.path().to_path_buf())
+        let (rt, _rx) = MemoryRuntime::open(tmp.path().to_path_buf(), StoreHolder::Daemon)
             .await
             .expect("open");
 
@@ -314,7 +300,7 @@ mod tests {
     #[tokio::test]
     async fn open_leaves_the_embedder_and_tokenizer_cells_empty() {
         let tmp = tmp_base();
-        let (rt, _rx) = MemoryRuntime::open(tmp.path().to_path_buf())
+        let (rt, _rx) = MemoryRuntime::open(tmp.path().to_path_buf(), StoreHolder::Daemon)
             .await
             .expect("open");
         assert!(!rt.embedder_ready());
@@ -327,7 +313,7 @@ mod tests {
     #[tokio::test]
     async fn open_returns_the_two_ends_of_one_live_channel() {
         let tmp = tmp_base();
-        let (rt, mut rx) = MemoryRuntime::open(tmp.path().to_path_buf())
+        let (rt, mut rx) = MemoryRuntime::open(tmp.path().to_path_buf(), StoreHolder::Daemon)
             .await
             .expect("open");
         rt.memory_tx.send(chat_event("hello")).expect("send");
@@ -341,7 +327,7 @@ mod tests {
     #[tokio::test]
     async fn open_starts_the_access_flush_worker() {
         let tmp = tmp_base();
-        let (rt, _rx) = MemoryRuntime::open(tmp.path().to_path_buf())
+        let (rt, _rx) = MemoryRuntime::open(tmp.path().to_path_buf(), StoreHolder::Daemon)
             .await
             .expect("open");
         rt.access_tracker.record(vec![1, 2, 3]);
@@ -351,7 +337,7 @@ mod tests {
     #[tokio::test]
     async fn workspaces_is_rooted_under_base_dir() {
         let tmp = tmp_base();
-        let (rt, _rx) = MemoryRuntime::open(tmp.path().to_path_buf())
+        let (rt, _rx) = MemoryRuntime::open(tmp.path().to_path_buf(), StoreHolder::Daemon)
             .await
             .expect("open");
         assert_eq!(
@@ -380,8 +366,8 @@ mod tests {
     }
 
     /// The end-to-end assertion this whole module exists for: on a plain tokio
-    /// runtime, with no desktop runtime anywhere, an event sent on the channel
-    /// becomes a row.
+    /// runtime, with nothing else running, an event sent on the channel becomes a
+    /// row.
     #[tokio::test]
     async fn ingest_worker_future_drains_an_event_into_a_row() {
         let tmp = tmp_base();
@@ -390,7 +376,7 @@ mod tests {
         let tx = rt.memory_tx.clone();
 
         let worker = tokio::spawn(rt.ingest_worker(rx));
-        tx.send(chat_event("a row lands without a desktop runtime"))
+        tx.send(chat_event("a row lands on a plain tokio runtime"))
             .expect("send");
         // Dropping every sender is what ends the worker loop — the runtime
         // holds one of its own, so it has to go too.
@@ -413,8 +399,7 @@ mod tests {
     }
 
     /// The maintenance loop never returns, so what is actually assertable is
-    /// that its future satisfies the bounds every executor demands — the same
-    /// compile-time proof the desktop wrapper carries.
+    /// that its future satisfies the bounds every executor demands.
     #[tokio::test]
     async fn maintenance_worker_future_is_send_static_and_spawnable() {
         let tmp = tmp_base();
@@ -425,9 +410,8 @@ mod tests {
         tokio::spawn(fut).abort();
     }
 
-    /// The free functions are the desktop's entry point (its `AppState` holds
-    /// the handles separately), so they must work standing alone, not only
-    /// through the methods.
+    /// The free functions take the handles individually, so they must work
+    /// standing alone, not only through the methods.
     #[tokio::test]
     async fn free_functions_accept_handles_taken_apart_from_the_runtime() {
         let tmp = tmp_base();

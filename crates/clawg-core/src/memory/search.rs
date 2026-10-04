@@ -49,8 +49,7 @@ impl SearchScope {
 /// One result row after the score formula has been applied SQL-side.
 ///
 /// `Serialize` because the `clawg serve` daemon answers retrieval requests
-/// with these rows as JSON; the desktop app never needed it, so it is the
-/// daemon that pulled the derive in.
+/// with these rows as JSON.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RankedHit {
     pub id: i64,
@@ -2100,12 +2099,8 @@ mod tests {
 
     // A caller that never opts into project scoping must see the exact
     // pre-scoping row set — otherwise every unscoped query silently loses
-    // rows the moment scoping ships, rag-eval included. This passes with
-    // zero production code above it (the `?4 IS NULL` disjunct is already
-    // live by the time this test file runs), so its RED comes from
-    // deliberately breaking that disjunct in the SQL below, observing the
-    // failure, then reverting — the disjunct existing is the fact under
-    // test, not new behavior.
+    // rows, rag-eval included. The `?4 IS NULL` disjunct in the SQL is what
+    // guarantees it: breaking that disjunct makes this test fail.
     #[tokio::test]
     async fn unscoped_caller_sees_full_pre_scoping_row_set_memory() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -2853,7 +2848,7 @@ mod tests {
 
     /// The truncation test above passes `2` explicitly and never touches the
     /// shipped `MAX_LEXICAL_TOKENS` — a query with 17 distinct tokens is one
-    /// more than the constant's current value of 16, so this fails RED if the
+    /// more than the constant's current value of 16, so this fails if the
     /// constant grows (all 17 would survive) or shrinks (fewer than 16 would
     /// survive) in either direction, unlike a test that supplies its own limit.
     #[test]

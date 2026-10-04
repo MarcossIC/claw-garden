@@ -121,8 +121,7 @@ pub async fn adjudicate_cluster(
     // No-op sender: we only need the accumulated Text result.
     let sender: StreamSender = Box::new(|_e| Ok(()));
 
-    // `model: String::new()` — the provider already holds the model name
-    // (verified as-built: chat.rs:636 uses the same pattern; design §facts).
+    // `model: String::new()` — the provider already holds the model name.
     let req = ChatRequest {
         model: String::new(),
         messages: vec![ChatMessage {

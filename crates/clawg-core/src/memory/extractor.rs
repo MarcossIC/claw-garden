@@ -1,7 +1,6 @@
 //! Session-close memory extractor.
 //!
-//! Fire-and-forget entry point `run_extractor`, spawned from `commands/session.rs`
-//! on session close. Extracts pivotal memories (`user_preference`,
+//! Run on session close. Extracts pivotal memories (`user_preference`,
 //! `architectural_decision`, `semantic_fact`) from the outgoing conversation via an
 //! LLM call, parses the response defensively, and inserts each memory with its
 //! embedding through `insert_memory_with_vector` (which now computes the correct
@@ -33,7 +32,7 @@ const TRANSCRIPT_CHAR_CAP: usize = 12_000;
 
 /// System prompt for the extraction LLM call.
 ///
-/// CRITICAL (design divergence note): `workspace.rs` requires `importance >= 8`
+/// CRITICAL: `workspace.rs` requires `importance >= 8`
 /// for `user_preference` / `architectural_decision` to appear in the workspace
 /// AUTO section. This prompt pushes the LLM to reserve 8+ for genuine pivotals —
 /// without it, rows insert correctly but stay invisible in workspace.md.
@@ -146,15 +145,12 @@ pub(crate) fn parse_extraction(txt: &str) -> Vec<ExtractedMemory> {
     out
 }
 
-/// Testable core of the extraction pipeline — takes explicit dependencies
-/// instead of the desktop `AppHandle`/`AppState` so it can be unit tested without
-/// a running desktop app. The thin `AppHandle` wrapper that resolves these deps
-/// and calls in lives in `clawg_desktop_lib::memory_runtime::run_extractor`.
+/// Testable core of the extraction pipeline — takes explicit dependencies, so
+/// it can be unit tested without any host.
 ///
 /// `project_by_agent` / `provider_by_agent` are keyed by `agent_id` and are
-/// expected to already contain an entry for every agent present in `history`
-/// (the `run_extractor` wrapper resolves these from `AppState` before calling
-/// in). An agent with no provider entry is skipped with `log::warn!`.
+/// expected to already contain an entry for every agent present in `history`.
+/// An agent with no provider entry is skipped with `log::warn!`.
 ///
 /// Never panics: LLM errors/timeouts, parse failures, and embed/store errors
 /// are all `log::`'d and skipped — the loop always continues to the next item.
@@ -364,19 +360,6 @@ mod tests {
     }
 
     // ── run_extraction_core ───────────────────────────────────────────────────
-    //
-    // `memory_runtime::run_extractor(app, history)` cannot be unit
-    // tested directly: this codebase does not enable the desktop runtime's "test"
-    // feature, and `memory_runtime::run_resolver`
-    // — the sibling fire-and-forget entry point this design explicitly mirrors —
-    // has ZERO direct unit tests for the same reason (only a Send-proof exists
-    // for it). Instead, following the established `worker.rs` split
-    // (`memory_worker` core vs. `start_memory_worker` AppHandle-thin wrapper),
-    // the testable surface is `run_extraction_core`, which takes explicit deps
-    // (store, embedder, provider-by-agent map, project-by-agent map) instead of
-    // `app.state::<AppState>()`. `run_extractor` resolves those deps from
-    // AppState and delegates to this core — covered only by the Send-proof
-    // below, exactly like `run_resolver`.
 
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -784,9 +767,4 @@ mod tests {
             .expect("user_preference must be reachable by KNN");
         assert_eq!(hit.tier, 1, "the point of this test is that the row sits at tier 1");
     }
-
-    // The user_preference contradiction-detection regression test used to live
-    // here. It moved to `contradiction.rs::tests::user_preference_contradiction_detected_at_in_band_distance`
-    // and was re-fixtured to an in-band distance instead of a distance-0 probe
-    // — the near-duplicate floor added by this change makes distance 0 a skip.
 }

@@ -248,9 +248,8 @@ impl MemoryStore {
     /// with the same hash finishes its own miss) is closed by
     /// `memory_worker` being the single sequential consumer of one ingest
     /// channel — not by a DB constraint, because `idx_memory_dedup` cannot
-    /// be `UNIQUE` (see the migration). `start_memory_worker` (`worker.rs`)
-    /// is the only spawn site (`rg -n 'start_memory_worker|memory_worker\('`
-    /// confirms this). If the worker is ever parallelized, this guarantee
+    /// be `UNIQUE` (see the migration). `MemoryRuntime::ingest_worker`
+    /// is the only spawn site (`rg -n 'ingest_worker\('` confirms this). If the worker is ever parallelized, this guarantee
     /// breaks, and the fix is, in order: (i) a maintenance pass collapsing
     /// legacy duplicate triples, reassigning `superseded_by` /
     /// `disputed_against`; (ii) a migration swapping the index for a real
@@ -380,7 +379,7 @@ impl MemoryStore {
 
 /// One aggregated episodic trajectory, ready for atomic row+vector insertion
 /// via [`MemoryStore::insert_episodic_trajectory`]. Built (outside this
-/// module, Lote 5) from a [`crate::memory::episodic_writer::TrajectoryDraft`]
+/// module) from a [`crate::memory::episodic_writer::TrajectoryDraft`]
 /// — `tool_calls_json`/`errors_json` are the already-serialized
 /// `Vec<String>` JSON arrays (serialization happens before this boundary so
 /// this struct stays a thin DB-row mirror, same split as `NewMemoryRecord`).
@@ -796,7 +795,6 @@ mod tests {
     async fn insert_memory_with_vector_returns_err_on_wrong_dimension() {
         // Proxy test for connection error: pass a 10-dim embedding and assert
         // Err(MemoryStoreError::DimensionMismatch { expected: 384, actual: 10 })
-        // TODO: R-NEW-7 — connection-close testing deferred
         let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
         let record = make_record("a", None);
         let small_embedding = vec![0.1_f32; 10];
@@ -812,7 +810,6 @@ mod tests {
 
     #[tokio::test]
     async fn both_rows_present_after_successful_insert() {
-        use tokio_rusqlite::Connection;
         let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
         let record = make_record("a", None);
         let embedding = make_embedding_384();
@@ -1183,9 +1180,9 @@ mod tests {
         assert_eq!(tier, 3, "tool_error imp=6.0 must insert at tier=3");
     }
 
-    // session_summary imp=6.0 → tier=2. CORRECTION vs the old SQL
-    // `DEFAULT 3` — locked per tier.rs:38-44 (INSERT initial-tier rule), no
-    // effect on workspace.md (session_summary is not a workspace producer).
+    // session_summary imp=6.0 → tier=2, not the SQL `DEFAULT 3`: the initial
+    // tier follows the INSERT initial-tier rule in tier.rs, with no effect on
+    // workspace.md (session_summary is not a workspace producer).
     #[tokio::test]
     async fn insert_session_summary_importance_6_yields_tier_2() {
         let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
@@ -1230,7 +1227,7 @@ mod tests {
         assert_eq!(tier, 1, "semantic_fact imp=9.5 must insert at tier=1 (importance>=9 override)");
     }
 
-    // ── Lote 3 (memoria-3-capas-fase-2) — insert_episodic_trajectory ────────
+    // ── insert_episodic_trajectory ──────────────────────────────────────────
 
     fn make_episodic_record(session_id: &str, importance: f64) -> NewEpisodicTrajectoryRecord {
         NewEpisodicTrajectoryRecord {
@@ -1350,7 +1347,7 @@ mod tests {
         assert_eq!(status, "active");
     }
 
-    // ── Lote 2 (trajectory-miner-fase-2) — fetch_prior_trajectories + promote_to_procedural_skill ──
+    // ── fetch_prior_trajectories + promote_to_procedural_skill ──
 
     async fn seed_episodic_raw(
         store: &MemoryStore,
@@ -1528,7 +1525,7 @@ mod tests {
 
     // ── Idempotencia pura: todos los ids ya presentes ──
 
-    // Scenario "All ids already present → no increment": a re-promotion
+    // "All ids already present → no increment": a re-promotion
     // where EVERY id (current + matched priors) is already in
     // `source_trajectory_ids` must leave `success_count` AND the array
     // untouched — the invariant `success_count == len(distinct ids)` holds
@@ -1973,8 +1970,7 @@ mod tests {
     }
 
     /// The planner must actually use `idx_memory_dedup` for the lookup —
-    /// this is measured, not assumed (see the design's open question on the
-    /// COALESCE-expression index). A `SCAN memory` in the plan means the
+    /// this is measured, not assumed (the index is on a COALESCE expression). A `SCAN memory` in the plan means the
     /// index is not usable for this exact predicate shape and is flagged
     /// here as an open risk rather than silently accepted.
     ///

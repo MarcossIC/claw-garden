@@ -1,19 +1,15 @@
 //! Claw Garden memory substrate.
 //!
-//! Everything in this crate is free of the desktop runtime: it is the local-first memory,
-//! provider and configuration layer that the desktop app (`clawg-desktop`) and
-//! the evaluation harness (`clawg-eval`) both build on. Background jobs are
-//! split into a pure, unit-testable core (here) and a thin `AppHandle` wrapper
-//! that lives in the desktop crate — see `clawg_desktop_lib::memory_runtime`.
+//! The local-first memory layer, the LLM providers behind its extraction
+//! pipeline and the shared chat types, which the daemon (`clawg-cli`) and the
+//! evaluation harness (`clawg-eval`) both build on.
 
-pub mod config;
-pub mod hooks;
 pub mod memory;
 pub mod models;
 pub mod paths;
 pub mod providers;
 /// Host-agnostic assembly of the memory substrate — the store, the ingest
-/// channel and the background workers, without any desktop runtime.
+/// channel and the background workers, without any UI runtime.
 pub mod runtime;
 pub mod services;
 

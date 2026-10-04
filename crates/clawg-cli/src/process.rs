@@ -3,8 +3,8 @@
 //! # Why `clawg stop` needs this
 //!
 //! Asking the daemon to shut down is not the same as the daemon being gone.
-//! Until the process ends it still holds `daemon.lock` (so `clawg stop && clawg
-//! serve` loses the race and reports "another instance"), and on Windows it
+//! Until the process ends it still owns the memory store (so `clawg stop &&
+//! clawg serve` loses the race and reports the store as in use), and on Windows it
 //! still holds its own `clawg.exe` image, which an installer updating that
 //! file cannot overwrite. Only the end of the process releases either.
 //!
