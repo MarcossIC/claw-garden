@@ -29,3 +29,6 @@ Thumbs.db
 **/docs/completed-impl/*
 docs/**/golden.json
 docs/**/results/*
+
+# Release binary copied next to the install script
+/scripts/clawg.exe
