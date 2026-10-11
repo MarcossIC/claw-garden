@@ -1,6 +1,6 @@
 //! The score formula applied to every KNN hit: a pure, synchronous
 //! `score()` combining cosine similarity, tier-floor-bounded recency decay,
-//! an importance multiplier, and a dispute penalty into one ranking value.
+//! an importance multiplier, and a live-status gate into one ranking value.
 
 use crate::memory::clock::TimestampMs;
 use crate::memory::TableKind;
@@ -89,14 +89,6 @@ impl ImportanceFactor {
     }
 }
 
-/// Score multiplier applied per `status`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct DisputeFactors {
-    pub active: f64,
-    pub disputed: f64,
-    pub other: f64,
-}
-
 /// Everything `score()` needs, parameterized. Production always scores
 /// through `&ScoringConfig::DEFAULT`; a sweep point is built as
 /// `ScoringConfig { importance: X, ..ScoringConfig::DEFAULT }`.
@@ -105,7 +97,6 @@ pub(crate) struct ScoringConfig {
     pub tier_floors: TierFloors,
     pub decay: DecayLambdas,
     pub importance: ImportanceFactor,
-    pub dispute: DisputeFactors,
     /// Re-scales cosine similarity as `(cos-floor)/(1-floor)`, clamped to
     /// `[0,1]`, when `Some`. `None` means no arithmetic runs at all — the
     /// no-op is read off the code rather than argued from IEEE equality.
@@ -158,7 +149,6 @@ impl ScoringConfig {
             clamp_lo: 1.0,
             clamp_hi: 10.0,
         },
-        dispute: DisputeFactors { active: 1.0, disputed: 0.6, other: 0.0 },
         // Re-scales cosine similarity against 0.8793, the 5th percentile of
         // the cosine-similarity distribution measured over the evaluation
         // corpus (the full observed range across that corpus was
@@ -285,13 +275,17 @@ pub(crate) fn score(cfg: &ScoringConfig, hit: &RawHit, now: TimestampMs) -> f64 
             .clamp(cfg.importance.clamp_lo, cfg.importance.clamp_hi)
             / cfg.importance.divisor;
 
-    let dispute = match hit.status.as_str() {
-        "active" => cfg.dispute.active,
-        "disputed" => cfg.dispute.disputed,
-        _ => cfg.dispute.other,
+    // A disputed row ranks like an active one. The contradiction detector
+    // flags neighbours by embedding distance, which measures topical
+    // similarity, so it also flags same-topic rows holding a different fact;
+    // demoting them buried correct answers. The possible conflict stays
+    // recorded on the row and visible in the CONFLICTS block of the context.
+    let status = match hit.status.as_str() {
+        "active" | "disputed" => 1.0,
+        _ => 0.0,
     };
 
-    cosine * tier_floor.max(decay) * importance * dispute
+    cosine * tier_floor.max(decay) * importance * status
 }
 
 #[cfg(test)]
@@ -403,7 +397,7 @@ mod tests {
     }
 
     // importance_factor: base + clamp(imp,lo,hi)/divisor. Every case below
-    // drives the full `score()` pipeline with cosine, decay, and dispute
+    // drives the full `score()` pipeline with cosine, decay, and status
     // neutralized to 1.0, so the result is exactly this one factor. The
     // expectation is computed from `ScoringConfig::DEFAULT`'s own fields
     // (independently of `score()`'s internals) rather than pinned as a bare
@@ -469,7 +463,7 @@ mod tests {
         // Reassembles the expected score from the same building blocks
         // score() itself calls (cosine_from_l2_unit, the cosine re-scale
         // gate, lambda_for, age_secs_from, the importance formula, the
-        // dispute lookup) rather than pinning a printed-out literal. This
+        // status gate) rather than pinning a printed-out literal. This
         // still catches an assembly bug in score() — wrong multiplication
         // order, a dropped factor, tier_floor/decay picking the wrong
         // branch, the re-scale gate not actually being wired up — while
@@ -492,12 +486,34 @@ mod tests {
         let age_days = age_secs_from(now, raw.last_accessed_at) as f64 / 86_400.0;
         let decay = (-lambda * age_days).exp();
         let importance = expected_importance_factor(&cfg, raw.importance);
-        let dispute = cfg.dispute.active; // raw.status == "active"
-        let expected = cosine * tier_floor.max(decay) * importance * dispute;
+        let expected = cosine * tier_floor.max(decay) * importance;
 
         let v = score(&cfg, &raw, now);
         assert!((v - expected).abs() < 1e-9, "expected {expected}, got {v}");
         assert!(v > 0.0 && v <= 1.0, "must be in (0.0, 1.0], got {v}");
+    }
+
+    // A disputed row is a possible conflict, not a wrong answer: it must rank
+    // exactly like an active one. Anything else (superseded) never ranks.
+    #[test]
+    fn disputed_scores_exactly_like_active() {
+        let cfg = ScoringConfig::DEFAULT;
+        let now = TimestampMs::from_unix_millis(1_700_000_000_000);
+        let at = TimestampMs::from_unix_millis(now.as_millis_i64() - 86_400_000);
+        let hit = |status| make_raw_hit(TableKind::Memory, "semantic_fact", 2, status, 0.1, at, 5.0);
+
+        let active = score(&cfg, &hit("active"), now);
+        let disputed = score(&cfg, &hit("disputed"), now);
+
+        assert!(active > 0.0);
+        assert_eq!(disputed, active);
+    }
+
+    #[test]
+    fn superseded_never_ranks() {
+        let cfg = ScoringConfig::DEFAULT;
+        let v = score(&cfg, &neutral_hit_at_importance(5.0, "superseded"), epoch());
+        assert_eq!(v, 0.0);
     }
 
     // cosine_from_l2_unit — converts L2 distance between unit vectors into

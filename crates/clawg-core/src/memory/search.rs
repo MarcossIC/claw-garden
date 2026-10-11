@@ -1516,7 +1516,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disputed_status_reduces_score_by_factor_0_6() {
+    async fn disputed_status_does_not_change_score() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let emb = unit_basis_embedding();
         let agent = "agent-dispute-test";
@@ -1568,8 +1568,8 @@ mod tests {
             .await.unwrap();
         let disputed_score = all_hits.iter().find(|h| h.id == disputed_id).unwrap().score;
 
-        assert!(disputed_score <= active_score * 0.61,
-            "disputed score {disputed_score} should be <= 0.6 * active score {active_score}");
+        assert_eq!(disputed_score, active_score,
+            "a disputed row must rank like an active one");
     }
 
     #[tokio::test]
@@ -2564,10 +2564,10 @@ mod tests {
 
     // The trap the SQL `ORDER BY score DESC` quietly covered for: the
     // widened retry window comes back ordered by raw distance, not by the
-    // score a row actually earns once importance/status are applied. A row
+    // score a row actually earns once importance/tier are applied. A row
     // that arrives CLOSER — and so earlier in that stream — can still score
-    // LOWER than one that arrives farther away. Here NEAR is disputed and
-    // unimportant, FAR is active and maximally important, and FAR's score
+    // LOWER than one that arrives farther away. Here NEAR is tier 3 and
+    // unimportant, FAR is tier 1 and maximally important, and FAR's score
     // comes out well above NEAR's despite losing on raw distance.
     // `knn_one` must score every row, order them by the real comparator, and
     // only then cut to k — truncating on arrival order would keep NEAR and
@@ -2592,14 +2592,14 @@ mod tests {
             ).await;
         }
 
-        // NEAR: closest of the caller's own rows, but disputed and
+        // NEAR: closest of the caller's own rows, but low tier and
         // unimportant — its score has to lose despite arriving first.
         let near_emb = serialize_embedding(&vec_at_cosine(0.999));
         let near_id = insert_memory_row(
-            &store, agent, "near but low score", "chat_message", 3, 1.0, "disputed", near_emb,
+            &store, agent, "near but low score", "chat_message", 3, 1.0, "active", near_emb,
         ).await;
 
-        // FAR: farther from the query than NEAR, but active and maximally
+        // FAR: farther from the query than NEAR, but top tier and maximally
         // important — its score has to win despite arriving second. Kept
         // above `ScoringConfig::DEFAULT`'s cosine re-scale floor on purpose:
         // a cosine below that floor clamps to a score of exactly zero
@@ -2609,7 +2609,7 @@ mod tests {
         // than arrival order.
         let far_emb = serialize_embedding(&vec_at_cosine(0.95));
         let far_id = insert_memory_row(
-            &store, agent, "far but high score", "chat_message", 3, 10.0, "active", far_emb,
+            &store, agent, "far but high score", "chat_message", 1, 10.0, "active", far_emb,
         ).await;
 
         let q_bytes = serialize_embedding(&unit_basis_vec());
