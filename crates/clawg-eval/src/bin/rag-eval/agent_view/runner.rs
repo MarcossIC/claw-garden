@@ -278,7 +278,12 @@ mod tests {
             counter: &EvalTokenCounter::fake(),
             tokenizer_dir: Path::new("."),
         };
-        let outside = std::env::current_dir().unwrap().join("rag-eval-must-not-be-created");
+        // Derived from the temp dir itself, not the working directory: a checkout
+        // can live under the temp dir, and then the cwd is not "outside" at all.
+        let outside = std::env::temp_dir()
+            .parent()
+            .expect("the temp dir has a parent")
+            .join(format!("rag-eval-must-not-be-created-{}", std::process::id()));
 
         match run(&input, &outside).await {
             Err(RunError::OutsideTemp(path, _)) => assert_eq!(path, outside),
