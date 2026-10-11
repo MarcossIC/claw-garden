@@ -46,8 +46,9 @@ pub const FALLBACK_AGENT_ID: &str = "mcp";
 /// What the host is told this server is for, at `initialize` time.
 const INSTRUCTIONS: &str = "\
 Persistent memory for this user across sessions. Use `save_memory` whenever the \
-user states a durable fact, preference or decision; use `search_memory` or \
-`recall_context` before answering anything that depends on earlier sessions. \
+user states a durable fact, preference or decision; use `search_memory` before \
+answering anything that depends on earlier sessions, and `recall_context` once \
+when a broad task needs background. \
 Memories are scoped to the current project unless you say otherwise.";
 
 // ── Tool parameters ─────────────────────────────────────────────────────────
@@ -59,7 +60,8 @@ pub struct SaveMemoryArgs {
     pub content: String,
     /// What kind of memory this is. One of: semantic_fact, user_preference,
     /// architectural_decision, session_summary, code_block, chat_message,
-    /// tool_error. Defaults to a plain chat message when omitted.
+    /// tool_error.
+    /// Defaults to semantic_fact when omitted.
     #[serde(default)]
     pub memory_type: Option<String>,
     /// How much this matters, 0 to 10. Higher values survive longer and are
@@ -390,8 +392,10 @@ impl ClawgMcp {
         name = "save_memory",
         description = "Store something worth remembering across sessions: a fact about the \
                        user or their project, a preference they stated, or a decision that was \
-                       made. Write the content so it still makes sense months from now, with \
-                       no conversation around it. Returns once the memory is queued."
+                       made. Save one fact per call, in a few sentences: a long text is split \
+                       into separate pieces that are found independently and never reassembled. \
+                       Write the content so it still makes sense months from now, with no \
+                       conversation around it. Returns once the memory is queued."
     )]
     async fn save_memory(
         &self,
@@ -403,8 +407,10 @@ impl ClawgMcp {
 
     #[tool(
         name = "search_memory",
-        description = "Find stored memories related to a query. Use this before answering \
-                       anything that depends on what happened in an earlier session. Returns a \
+        description = "Find stored memories related to a query. Use this first, before \
+                       answering anything that depends on an earlier session. Matching is by \
+                       meaning, so pass a full natural-language question, not keywords; it \
+                       finds memories written in other words or in another language. Returns a \
                        numbered list of memories with their ids, kinds and relevance scores; \
                        content longer than 500 characters is truncated."
     )]
@@ -420,8 +426,9 @@ impl ClawgMcp {
         name = "recall_context",
         description = "Get a ready-to-read background block for a query: the user's workspace \
                        notes, recent memories and long-term memories, already assembled and \
-                       deduplicated. Prefer this over `search_memory` when you want context to \
-                       reason with rather than a list of rows to pick from."
+                       deduplicated, with full content. It costs several times the tokens of \
+                       `search_memory`, so use it once when starting a broad task that needs \
+                       background, and `search_memory` for specific questions."
     )]
     async fn recall_context(
         &self,
@@ -497,6 +504,7 @@ mod tests {
     use clawg_core::runtime::MemoryRuntime;
 
     use crate::daemon::api::{router, AppCtx};
+    use crate::mcp::tools::CONTENT_PREVIEW_LIMIT;
 
     /// Brings up an in-process daemon and returns a bridge pointed at it.
     async fn bridge() -> (ClawgMcp, tempfile::TempDir) {
@@ -668,6 +676,68 @@ mod tests {
             let d = t.description.clone().unwrap_or_default();
             assert!(d.len() > 40, "{} has a thin description: {d:?}", t.name);
         }
+    }
+
+    fn tool(b: &ClawgMcp, name: &str) -> rmcp::model::Tool {
+        b.tool_router
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} must be registered"))
+    }
+
+    fn description(b: &ClawgMcp, name: &str) -> String {
+        tool(b, name).description.map(|d| d.to_string()).unwrap_or_default()
+    }
+
+    /// An explicit save with no type is stored as `semantic_fact`
+    /// (`NewMemoryRecord::from_event_and_chunk`). A schema that names another
+    /// default teaches the model to pass a type it did not mean.
+    #[tokio::test]
+    async fn the_save_memory_schema_states_the_default_type_the_store_applies() {
+        let (b, _d) = bridge().await;
+        let schema = serde_json::to_string(&tool(&b, "save_memory").input_schema).expect("schema");
+        assert!(schema.contains("Defaults to semantic_fact"), "schema: {schema}");
+        assert!(!schema.contains("Defaults to a plain chat message"), "schema: {schema}");
+    }
+
+    /// A long save is split into chunks stored as unrelated rows, and no tool
+    /// can put them back together; one fact per call is the only way the model
+    /// gets back what it saved.
+    #[tokio::test]
+    async fn save_memory_asks_for_one_fact_per_call() {
+        let (b, _d) = bridge().await;
+        let d = description(&b, "save_memory");
+        assert!(d.contains("one fact"), "description: {d}");
+    }
+
+    /// Retrieval is semantic: measured on the golden set, keyword queries find
+    /// fewer expected memories than the full question does.
+    #[tokio::test]
+    async fn search_memory_asks_for_a_question_rather_than_keywords() {
+        let (b, _d) = bridge().await;
+        let d = description(&b, "search_memory");
+        assert!(d.contains("natural-language question"), "description: {d}");
+        assert!(d.contains("not keywords"), "description: {d}");
+    }
+
+    /// `recall_context` returns several times the tokens of `search_memory` for
+    /// the same query, so it must not be presented as the default lookup.
+    #[tokio::test]
+    async fn recall_context_is_not_offered_as_the_default_lookup() {
+        let (b, _d) = bridge().await;
+        let d = description(&b, "recall_context");
+        assert!(!d.contains("Prefer this over"), "description: {d}");
+        assert!(d.contains("costs several times"), "description: {d}");
+    }
+
+    /// The model never sees more than a preview of each hit, and there is no
+    /// tool that fetches a memory by id; promising otherwise sends it looking.
+    #[tokio::test]
+    async fn search_memory_states_the_preview_limit_it_applies() {
+        let (b, _d) = bridge().await;
+        let d = description(&b, "search_memory");
+        assert!(d.contains(&format!("{CONTENT_PREVIEW_LIMIT} characters")), "description: {d}");
     }
 
     // ── end to end against a real daemon ────────────────────────────────────
