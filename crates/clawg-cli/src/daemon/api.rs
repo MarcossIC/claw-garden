@@ -358,6 +358,30 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         .with_state(app)
 }
 
+/// Serves [`router`] on an OS-picked loopback port in a background task and
+/// returns where it listens, with the task's handle.
+///
+/// For in-process callers (the evaluation harness) that need the real HTTP
+/// surface without a daemon process, a data directory or a state file. The
+/// server stops on `POST /v1/shutdown`, like the daemon, and awaiting the
+/// handle is how a caller knows it has let go of the runtime it was built
+/// around.
+pub async fn serve_ephemeral(
+    app: Arc<AppCtx>,
+) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<std::io::Result<()>>)> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+    let addr = listener.local_addr()?;
+    let mut stop = app.shutdown.subscribe();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router(app))
+            .with_graceful_shutdown(async move {
+                let _ = stop.wait_for(|requested| *requested).await;
+            })
+            .await
+    });
+    Ok((addr, server))
+}
+
 /// Rejects anything under `/v1` without the daemon's bearer token.
 async fn require_bearer(
     State(app): State<Arc<AppCtx>>,
@@ -603,6 +627,42 @@ async fn shutdown(State(app): State<Arc<AppCtx>>) -> (StatusCode, Json<QueuedBod
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn serve_ephemeral_answers_over_http_on_the_address_it_returns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (runtime, _rx) = MemoryRuntime::new_for_test(dir.path().to_path_buf()).await;
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        let app = Arc::new(AppCtx {
+            runtime,
+            token: "ephemeral-token".to_string(),
+            profile: Profile::Dev,
+            started_at: Instant::now(),
+            shutdown,
+        });
+
+        let (addr, server) = serve_ephemeral(app).await.expect("bind an ephemeral loopback port");
+
+        assert!(addr.ip().is_loopback());
+        assert_ne!(addr.port(), 0, "the returned address must carry the port the OS picked");
+        let health = reqwest::get(format!("http://{addr}/health")).await.expect("health");
+        assert_eq!(health.status(), StatusCode::OK);
+        let unauthorized = reqwest::get(format!("http://{addr}/v1/stats")).await.expect("stats");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED, "it is the real router, bearer layer included");
+
+        let stop = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/shutdown"))
+            .bearer_auth("ephemeral-token")
+            .send()
+            .await
+            .expect("shutdown");
+        assert_eq!(stop.status(), StatusCode::ACCEPTED);
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("the server must stop once shutdown is requested")
+            .expect("the server task must not panic")
+            .expect("a graceful stop is not an error");
+    }
 
     #[test]
     fn parse_kind_accepts_the_three_wire_spellings() {
