@@ -88,6 +88,17 @@ impl AccessTracker {
         Self { tx }
     }
 
+    /// A tracker whose `record` goes nowhere: no flush worker, nothing ever
+    /// reaches SQLite. For measurement runs, where retrieval must leave the
+    /// store exactly as it found it.
+    #[cfg(feature = "eval")]
+    pub(crate) fn inert() -> Self {
+        // The receiver is dropped on purpose; `record` already ignores a send
+        // error, so every call becomes a no-op.
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel::<Vec<i64>>();
+        Self { tx }
+    }
+
     /// Record that the given memory IDs were accessed on the retrieval hot path.
     ///
     /// The call returns immediately without awaiting.  Empty `ids` vectors are

@@ -18,22 +18,30 @@
 //! application's public surface is unchanged by this module's existence.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use serde::Serialize;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::task::JoinHandle;
 
+use crate::memory::access::AccessTracker;
+use crate::memory::chunker::CodeChunker;
 use crate::memory::db::MemoryStore;
 use crate::memory::embedder::{Embedder, FakeEmbedder, FastEmbedLocal};
 
 /// Re-exported so the `rag-eval` and `golden-mine` binaries can name a role
 /// without reaching into the private `memory` module tree.
 pub use crate::memory::embedder::EmbedRole;
-use crate::memory::events::MemorySource;
+use crate::memory::events::{MemoryEvent, MemorySource};
 use crate::memory::model_download;
 use crate::memory::score::{ImportanceFactor, ScoringConfig};
 use crate::memory::search::{search_all_memories_with_scoring, SearchScope};
 use crate::memory::store_insert::{CreatedByType, MemoryType, NewMemoryRecord};
 use crate::memory::store_lock::StoreHolder;
+use crate::memory::worker::{memory_worker, resolve_tokenizer_and_chunker};
 use crate::memory::TableKind;
+use crate::models::chat::Role;
+use crate::runtime::MemoryRuntime;
 
 /// Opaque handle to a memory store. Every operation available on it is a
 /// method below — the wrapped store itself is never reachable.
@@ -372,7 +380,7 @@ fn parse_memory_type(raw: &str) -> Result<MemoryType, EvalError> {
 /// discipline as [`EvalStore`]: the concrete implementation is boxed behind
 /// this module's own type, so neither the `Embedder` trait nor either of its
 /// implementations is ever named outside this file.
-pub struct EvalEmbedder(Box<dyn Embedder>);
+pub struct EvalEmbedder(Arc<dyn Embedder>);
 
 impl EvalEmbedder {
     /// A deterministic double: the same text always yields the same vector,
@@ -382,7 +390,7 @@ impl EvalEmbedder {
     /// the real model — a run against this embedder validates plumbing and
     /// metric code, not retrieval quality.
     pub fn fake() -> Self {
-        EvalEmbedder(Box::new(FakeEmbedder::default()))
+        EvalEmbedder(Arc::new(FakeEmbedder::default()))
     }
 
     /// Loads the real embedding model rooted at `base_dir`, downloading it
@@ -394,7 +402,7 @@ impl EvalEmbedder {
             .map_err(|e| EvalError::ModelLoad(e.to_string()))?;
         let inner = FastEmbedLocal::from_bytes(files.onnx, files.tokenizer)
             .map_err(|e| EvalError::ModelLoad(e.to_string()))?;
-        Ok(EvalEmbedder(Box::new(inner)))
+        Ok(EvalEmbedder(Arc::new(inner)))
     }
 
     pub async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EvalError> {
@@ -418,6 +426,96 @@ impl EvalEmbedder {
 
     pub fn passage_prefix(&self) -> &str {
         self.0.passage_prefix()
+    }
+}
+
+/// The production ingest pipeline running over an isolated store, for
+/// measuring what an agent actually sees after a save — chunking, the dedup
+/// gate, contradiction detection and tiering all included, none of which the
+/// direct [`EvalStore::insert`] path goes through.
+///
+/// Events enter exactly as the daemon's `save_memory` handler queues them
+/// (`MemorySource::Explicit`, user role), and the same `memory_worker`
+/// drains them.
+pub struct EvalIngest {
+    tx: UnboundedSender<MemoryEvent>,
+    worker: JoinHandle<()>,
+    runtime: MemoryRuntime,
+}
+
+impl EvalIngest {
+    /// Opens a store rooted at `base_dir` and starts the ingest worker on it.
+    /// `tokenizer_dir` is where the worker looks for `tokenizer.json`: the
+    /// profile directory under `--real`, so chunk boundaries match the ones a
+    /// real daemon cuts, and any directory without one under `--fake`, which
+    /// leaves the worker on its byte-splitting fallback.
+    pub async fn open(
+        base_dir: &Path,
+        embedder: &EvalEmbedder,
+        tokenizer_dir: &Path,
+    ) -> Result<Self, EvalError> {
+        let (mut runtime, _) = MemoryRuntime::open(base_dir.to_path_buf(), StoreHolder::Eval)
+            .await
+            .map_err(|e| EvalError::Open(e.to_string()))?;
+        let _ = runtime.embedder.set(embedder.0.clone());
+        runtime.access_tracker = Arc::new(AccessTracker::inert());
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<MemoryEvent>();
+        let chat_chunker = resolve_tokenizer_and_chunker(tokenizer_dir, &runtime.tokenizer);
+        let worker = tokio::spawn(memory_worker(
+            rx,
+            runtime.store.clone(),
+            runtime.embedder.clone(),
+            chat_chunker,
+            Arc::new(CodeChunker::new()),
+        ));
+
+        Ok(Self { tx, worker, runtime })
+    }
+
+    /// Queues one explicit save. `memory_type` is validated here, up front: the
+    /// worker would quietly fall back to `semantic_fact` for a typo, and a
+    /// golden-set row must not be measured as something it never declared.
+    pub fn send(
+        &self,
+        agent_id: &str,
+        content: &str,
+        memory_type: &str,
+        importance: f64,
+    ) -> Result<(), EvalError> {
+        parse_memory_type(memory_type)?;
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.tx
+            .send(MemoryEvent {
+                agent_id: agent_id.to_string(),
+                project_id: None,
+                role: Role::User,
+                content: content.to_string(),
+                is_error: None,
+                source: MemorySource::Explicit,
+                timestamp_ms,
+                memory_type: Some(memory_type.to_string()),
+                importance: Some(importance),
+            })
+            .map_err(|_| EvalError::Insert("the ingest worker has stopped".to_string()))
+    }
+
+    /// Closes the queue and waits for the worker to finish it. The worker only
+    /// ends once every sender is gone, so this is the one "everything queued
+    /// is now stored" signal the pipeline has.
+    ///
+    /// Hands back the runtime the daemon's router is built around. Its access
+    /// tracker is inert: retrieval during a measurement must not bump
+    /// `access_count` or promote tiers, or each query would be answered from a
+    /// store the previous query had already changed.
+    pub async fn finish(self) -> Result<MemoryRuntime, EvalError> {
+        let Self { tx, worker, runtime } = self;
+        drop(tx);
+        worker.await.map_err(|e| EvalError::Insert(format!("the ingest worker failed: {e}")))?;
+        Ok(runtime)
     }
 }
 
@@ -865,6 +963,115 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         assert!(EvalTokenCounter::real(&base_dir).is_err());
+    }
+
+    // --- EvalIngest ----------------------------------------------------------
+
+    /// `(content, memory_type, importance, tier, access_count)`.
+    type StoredRow = (String, String, f64, i64, i64);
+
+    async fn stored_rows(runtime: &MemoryRuntime) -> Vec<StoredRow> {
+        runtime
+            .store
+            .conn
+            .call(|c| -> rusqlite::Result<Vec<StoredRow>> {
+                let mut stmt = c.prepare(
+                    "SELECT content, memory_type, importance, tier, access_count FROM memory ORDER BY id",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .expect("select rows")
+    }
+
+    #[tokio::test]
+    async fn ingest_finish_returns_only_after_every_event_is_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
+        for i in 0..5 {
+            ingest
+                .send("agent-ingest", &format!("distinct memory number {i} about the ingest drain"), "chat_message", 3.0)
+                .unwrap();
+        }
+
+        let runtime = ingest.finish().await.expect("finish must drain the worker");
+
+        assert_eq!(
+            stored_rows(&runtime).await.len(),
+            5,
+            "finish() is the drained signal: every queued event must already be a row when it returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_honours_the_declared_type_and_importance() {
+        let dir = tempfile::tempdir().unwrap();
+        let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
+        ingest.send("agent-ingest", "always answer in rioplatense spanish", "user_preference", 9.5).unwrap();
+
+        let runtime = ingest.finish().await.unwrap();
+
+        let rows = stored_rows(&runtime).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "user_preference");
+        assert_eq!(rows[0].2, 9.5);
+        assert_eq!(rows[0].3, 1, "importance >= 9 on a user_preference is the tier-1 fast track");
+    }
+
+    #[tokio::test]
+    async fn ingest_rejects_an_unknown_memory_type_before_queueing_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
+
+        match ingest.send("agent-ingest", "content", "not_a_real_type", 3.0) {
+            Err(EvalError::UnknownMemoryType(t)) => assert_eq!(t, "not_a_real_type"),
+            other => panic!("expected UnknownMemoryType, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ingest_runtime_is_rooted_at_the_given_base_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
+
+        let runtime = ingest.finish().await.unwrap();
+
+        assert_eq!(
+            runtime.base_dir,
+            dir.path(),
+            "the workspace tree hangs off this directory, so it is what keeps every write inside the caller's temp dir"
+        );
+        assert!(runtime.embedder_ready(), "the query side needs the same embedder that stored the rows");
+    }
+
+    /// 600 ids is past the tracker's 500-entry size trigger, so a LIVE tracker
+    /// flushes at once and bumps `access_count` on the spot — no 30 s wait
+    /// needed to tell the two apart.
+    #[tokio::test]
+    async fn ingest_runtime_never_records_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
+        ingest.send("agent-ingest", "a single row whose access count must not move", "chat_message", 3.0).unwrap();
+        let runtime = ingest.finish().await.unwrap();
+        let id: i64 = runtime
+            .store
+            .conn
+            .call(|c| c.query_row("SELECT id FROM memory LIMIT 1", [], |r| r.get(0)))
+            .await
+            .unwrap();
+
+        let before = stored_rows(&runtime).await;
+        runtime.access_tracker.record(vec![id; 600]);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert_eq!(
+            stored_rows(&runtime).await,
+            before,
+            "a measurement run must not move the rows it measures"
+        );
     }
 
     #[test]
