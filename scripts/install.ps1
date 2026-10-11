@@ -173,11 +173,33 @@ if (Test-Path -LiteralPath $target) {
 }
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+
+# Binaries set aside by earlier runs. One that is still mapped cannot be
+# deleted yet and is left for a later run.
+Get-ChildItem -LiteralPath $InstallDir -Filter 'clawg.exe.old-*' |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+
+# Windows refuses to overwrite an executable that another process has mapped:
+# a running clawg, but also an antivirus or the search indexer reading it, with
+# no clawg process left. Renaming a mapped file is allowed, so the previous
+# binary is moved aside instead of overwritten.
+$aside = $null
+if (Test-Path -LiteralPath $target) {
+    $aside = "$target.old-$(Get-Date -Format yyyyMMddHHmmssfff)"
+    try {
+        Move-Item -LiteralPath $target -Destination $aside
+    }
+    catch {
+        throw "Could not move the previous $target out of the way. Nothing was changed. ($($_.Exception.Message))"
+    }
+}
 try {
-    Copy-Item -LiteralPath $source -Destination $target -Force
+    Copy-Item -LiteralPath $source -Destination $target
 }
 catch {
-    throw "Could not replace $target. A clawg process still holds it: close the Claude Code sessions that use clawg and run this script again. ($($_.Exception.Message))"
+    $reason = $_.Exception.Message
+    if ($aside) { Move-Item -LiteralPath $aside -Destination $target -ErrorAction SilentlyContinue }
+    throw "Could not copy clawg.exe to $target; the previous binary was left in place. ($reason)"
 }
 
 if (-not $SkipPath) {
