@@ -15,6 +15,7 @@ use clawg_cli::cli::{Cli, Command, PathAction};
 use clawg_cli::client::{probe_running, ClientError, DaemonClient, Probe};
 use clawg_cli::daemon::lifecycle::{now_ms, read_state};
 use clawg_cli::daemon::serve;
+use clawg_cli::doctor;
 use clawg_cli::mcp;
 use clawg_cli::memories;
 use clawg_cli::status::status_report;
@@ -109,6 +110,20 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 })?;
             println!("stopped the {} daemon (pid {pid})", profile.as_str());
             Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Doctor { profile } => {
+            let profile = profile.resolve().map_err(|e| e.to_string())?;
+            let report = doctor::run(profile).map_err(|e| e.to_string())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+            );
+            Ok(if report.analysis.is_healthy() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(EXIT_FAILURE)
+            })
         }
 
         Command::Memories { action } => {

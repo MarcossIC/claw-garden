@@ -47,6 +47,12 @@ pub enum Command {
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Report which `clawg` executables the PATH resolves to and whether this
+    /// one is the one a terminal runs. Exits 1 if shadowed or duplicated.
+    Doctor {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
     /// Browse what the daemon has stored. Read-only; needs a running daemon.
     Memories {
         #[command(subcommand)]
@@ -378,6 +384,18 @@ mod tests {
         assert_eq!(
             parse(&["clawg", "stop"]).command,
             Command::Stop { profile: ProfileArg { profile: None } }
+        );
+    }
+
+    #[test]
+    fn doctor_takes_only_a_profile() {
+        assert_eq!(
+            parse(&["clawg", "doctor"]).command,
+            Command::Doctor { profile: ProfileArg { profile: None } }
+        );
+        assert_eq!(
+            parse(&["clawg", "doctor", "--profile", "dev"]).command,
+            Command::Doctor { profile: ProfileArg { profile: Some("dev".into()) } }
         );
     }
 
