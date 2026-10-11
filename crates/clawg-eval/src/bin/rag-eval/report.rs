@@ -303,6 +303,11 @@ pub struct RunResults {
     /// "computed and empty".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub similarity: Option<SimilarityResults>,
+    /// Present only for `--agent-view` runs, which score the text the MCP
+    /// tools return rather than the store's ranking. Absent otherwise, so every
+    /// earlier results file reads as a run that never measured it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_view: Option<crate::agent_view::AgentViewResults>,
 }
 
 /// Averages the five per-case metrics across `cases`. Callers decide which
@@ -778,6 +783,20 @@ mod tests {
             norm_check: NormCheck { asserted: false, mean_norm: 11.3, max_deviation: 10.3 },
             audit: None,
             similarity: None,
+            agent_view: None,
+        }
+    }
+
+    fn minimal_agent_view_results() -> crate::agent_view::AgentViewResults {
+        crate::agent_view::AgentViewResults {
+            corpus_size: 3,
+            stored_rows: 4,
+            min_segment_chars: 40,
+            ambiguous_refs: vec![],
+            unmatchable_refs: vec!["c3".to_string()],
+            search: Default::default(),
+            context: Default::default(),
+            per_case: vec![],
         }
     }
 
@@ -810,6 +829,38 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&written).expect("valid JSON");
         assert!(json.get("similarity").is_none(), "similarity key must be absent, got {:?}", json.get("similarity"));
         std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    #[test]
+    fn an_ordinary_run_omits_the_agent_view_key_entirely() {
+        let json = serde_json::to_value(minimal_results("2026-07-27", Mode::Fake)).unwrap();
+        assert!(json.get("agent_view").is_none(), "got {:?}", json.get("agent_view"));
+    }
+
+    #[test]
+    fn an_agent_view_run_serializes_the_block_and_it_reads_back() {
+        let mut results = minimal_results("2026-07-27", Mode::Fake);
+        results.agent_view = Some(minimal_agent_view_results());
+        let json = serde_json::to_value(&results).unwrap();
+        let back: crate::agent_view::AgentViewResults =
+            serde_json::from_value(json["agent_view"].clone()).expect("the block must read back");
+        assert_eq!(back, minimal_agent_view_results());
+    }
+
+    #[test]
+    fn a_committed_results_file_without_the_block_still_diffs_against_one_with_it() {
+        let committed = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/eval/results/2026-08-15-fake.json");
+        let old: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&committed).expect("committed results file"))
+                .expect("committed results file is valid JSON");
+        assert!(old.get("agent_view").is_none(), "the file predates the block");
+
+        let mut with_block = minimal_results("2026-07-27", Mode::Fake);
+        with_block.agent_view = Some(minimal_agent_view_results());
+        let new = serde_json::to_value(&with_block).unwrap();
+
+        crate::diff::diff_values(&old, &committed, &new, &committed).expect("a block it ignores must not break the diff");
     }
 
     #[test]

@@ -27,6 +27,9 @@ path = "src/bin/golden-mine/main.rs"
 
 [dependencies]
 clawg-core = { workspace = true, features = ["eval"] }
+# Only `rag-eval --agent-view` uses it: it serves the daemon's own router in-process
+# so the text it measures is the text an agent receives.
+clawg-cli.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

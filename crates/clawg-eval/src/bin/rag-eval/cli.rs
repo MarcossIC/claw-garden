@@ -66,6 +66,11 @@ pub struct Cli {
     /// query TEXT, and crossing them would multiply runs while making the
     /// resolvability gate per-point instead of per-run.
     pub follow_up: bool,
+    /// `--agent-view`: ingest the corpus through the real pipeline and score
+    /// the text the MCP tools return, instead of the store's own ranking.
+    /// Mutually exclusive with `--follow-up` and every sweep flag — those vary
+    /// the ranking, this measures what an agent sees of a single fixed one.
+    pub agent_view: bool,
 }
 
 /// What a parse attempt produces. `--help` is not an error: it takes
@@ -100,6 +105,8 @@ pub enum CliError {
     InvalidSweepLexical(String),
     #[error("--follow-up is mutually exclusive with the sweep flags (--sweep-imp, --sweep-cos-floor, --sweep-lexical, --fts-tokenizer)")]
     FollowUpWithSweep,
+    #[error("--agent-view is mutually exclusive with --follow-up and the sweep flags (--sweep-imp, --sweep-cos-floor, --sweep-lexical, --fts-tokenizer)")]
+    AgentViewWithOtherMode,
 }
 
 pub const HELP_TEXT: &str = "\
@@ -149,6 +156,12 @@ OPTIONS:
                          normal single-arm pass, measuring whether conversational context
                          helps a content-free follow-up retrieve the right document.
                          Mutually exclusive with every sweep flag and --fts-tokenizer.
+    --agent-view         Ingest the corpus through the real save pipeline, answer every case
+                         through the daemon's own search and context endpoints, and score the
+                         text an agent would actually receive: whether the expected rows are
+                         visible, their token cost and their latency. Writes
+                         {date}-{mode}-agent-view.json. Mutually exclusive with --follow-up
+                         and every sweep flag.
     --help, -h          Print this message and exit
 
 EXIT CODES:
@@ -201,11 +214,13 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
     let mut sweep_lexical: Vec<usize> = Vec::new();
     let mut fts_tokenizer: Option<String> = None;
     let mut follow_up = false;
+    let mut agent_view = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return Ok(ParseOutcome::Help),
             "--follow-up" => follow_up = true,
+            "--agent-view" => agent_view = true,
             "--diff" => {
                 let a = args
                     .next()
@@ -300,6 +315,16 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
         return Err(CliError::FollowUpWithSweep);
     }
 
+    if agent_view
+        && (follow_up
+            || !sweep_imp.is_empty()
+            || !sweep_cos_floor.is_empty()
+            || !sweep_lexical.is_empty()
+            || fts_tokenizer.is_some())
+    {
+        return Err(CliError::AgentViewWithOtherMode);
+    }
+
     Ok(ParseOutcome::Run(Cli {
         mode,
         check_only,
@@ -313,6 +338,7 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
         sweep_lexical,
         fts_tokenizer,
         follow_up,
+        agent_view,
     }))
 }
 
@@ -644,6 +670,59 @@ mod tests {
         assert!(cli.follow_up);
         assert!(cli.audit);
         assert!(cli.force);
+    }
+
+    // --- --agent-view ----------------------------------------------------
+
+    #[test]
+    fn agent_view_is_false_by_default() {
+        assert!(!run_cli(&["--fake"]).agent_view);
+    }
+
+    #[test]
+    fn agent_view_alone_parses_true() {
+        assert!(run_cli(&["--real", "--agent-view"]).agent_view);
+    }
+
+    #[test]
+    fn agent_view_with_follow_up_is_an_error() {
+        let err = parse(argv(&["--fake", "--agent-view", "--follow-up"]))
+            .expect_err("--agent-view + --follow-up must be rejected");
+        assert_eq!(err, CliError::AgentViewWithOtherMode);
+    }
+
+    #[test]
+    fn agent_view_with_every_sweep_flag_is_an_error() {
+        for extra in [
+            ["--sweep-imp", "0.55:1.0"],
+            ["--sweep-cos-floor", "0.86"],
+            ["--sweep-lexical", "20"],
+            ["--fts-tokenizer", "trigram"],
+        ] {
+            let err = parse(argv(&["--fake", "--agent-view", extra[0], extra[1]]))
+                .expect_err("--agent-view + a sweep flag must be rejected");
+            assert_eq!(err, CliError::AgentViewWithOtherMode, "{extra:?}");
+        }
+    }
+
+    #[test]
+    fn agent_view_order_does_not_matter_for_the_conflict_check() {
+        let err = parse(argv(&["--fake", "--follow-up", "--agent-view"]))
+            .expect_err("order must not matter for the conflict check");
+        assert_eq!(err, CliError::AgentViewWithOtherMode);
+    }
+
+    #[test]
+    fn agent_view_composes_with_tag_and_force() {
+        let cli = run_cli(&["--fake", "--agent-view", "--tag", "baseline", "--force"]);
+        assert!(cli.agent_view);
+        assert_eq!(cli.tag, Some("baseline".to_string()));
+        assert!(cli.force);
+    }
+
+    #[test]
+    fn the_help_text_documents_agent_view() {
+        assert!(HELP_TEXT.contains("--agent-view"));
     }
 
     #[test]

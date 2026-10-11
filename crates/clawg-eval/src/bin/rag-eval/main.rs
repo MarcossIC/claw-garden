@@ -1,3 +1,4 @@
+mod agent_view;
 mod audit;
 mod cli;
 mod diff;
@@ -165,6 +166,12 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
         SPECIAL_TOKEN_RESERVE,
         counter.count(embedder.query_prefix()),
     );
+
+    // Branches off before the direct seeding below: this mode stores the corpus
+    // through the real ingest pipeline into a store of its own.
+    if cli.agent_view {
+        return run_agent_view(&cli, &loaded_golden, &embedder, &counter, &base_dir).await;
+    }
 
     let seeded = match seed::seed(&golden_set.corpus, &embedder, cli.fts_tokenizer.as_deref()).await {
         Ok(s) => s,
@@ -483,6 +490,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             },
             audit: audit_report,
             similarity: similarity_results.clone(),
+            agent_view: None,
         };
 
         report::print_stdout(&results);
@@ -555,6 +563,104 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
         return EXIT_GOLDEN_UNFIT;
     }
     EXIT_OK
+}
+
+/// Runs `--agent-view`: scores what the MCP tools would hand an agent for
+/// every case, and writes a results file whose `agent_view` block carries it.
+async fn run_agent_view(
+    cli: &cli::Cli,
+    loaded_golden: &golden::LoadedGolden,
+    embedder: &EvalEmbedder,
+    counter: &EvalTokenCounter,
+    base_dir: &std::path::Path,
+) -> i32 {
+    let scratch = agent_view::runner::scratch_dir();
+    let input = agent_view::runner::AgentViewInput {
+        golden_set: &loaded_golden.set,
+        embedder,
+        counter,
+        // `--real` chunks with the tokenizer the profile already holds; under
+        // `--fake` the scratch directory has none, which selects the byte
+        // fallback the fake embedder is paired with.
+        tokenizer_dir: match cli.mode {
+            cli::Mode::Real => base_dir,
+            cli::Mode::Fake => &scratch,
+        },
+    };
+    let view = match agent_view::runner::run(&input, &scratch).await {
+        Ok(view) => view,
+        Err(e) => {
+            eprintln!("agent-view run failed: {e}");
+            return EXIT_RUNTIME_FAILURE;
+        }
+    };
+    print!("{}", agent_view::render_summary(&view));
+
+    // Only the agent-view summary is printed: the ordinary report would show
+    // an empty retrieval block, as if the ranking had been scored and failed.
+    let results = build_agent_view_run_results(cli, loaded_golden, embedder, view);
+    match report::write_json(&results, &cli.out_dir, cli.force) {
+        Ok(path) => {
+            println!("results written to {}", path.display());
+            EXIT_OK
+        }
+        Err(report::ReportError::AlreadyExists { path }) => {
+            println!("results file already exists: {}", path.display());
+            EXIT_RESULTS_EXISTS
+        }
+        Err(e) => {
+            eprintln!("failed to write results: {e}");
+            EXIT_RUNTIME_FAILURE
+        }
+    }
+}
+
+/// Wraps an agent-view reading in the common results envelope. The store's own
+/// ranking is not scored in this mode, so `retrieval` is present but empty and
+/// the contradiction and norm blocks carry nothing — the same "present, empty"
+/// shape a golden set with no cases would produce.
+fn build_agent_view_run_results(
+    cli: &cli::Cli,
+    loaded_golden: &golden::LoadedGolden,
+    embedder: &EvalEmbedder,
+    view: agent_view::AgentViewResults,
+) -> report::RunResults {
+    let golden_set = &loaded_golden.set;
+    let mode = match cli.mode {
+        cli::Mode::Fake => report::Mode::Fake,
+        cli::Mode::Real => report::Mode::Real,
+    };
+    report::RunResults {
+        date: current_date_string(),
+        mode,
+        tag: fold_tag(cli.tag.as_deref(), Some("agent-view")),
+        model_id: embedder.model_id().to_string(),
+        git_sha: report::git_sha(),
+        k_pool: report::KPool { memory: 30, episodic: 5, procedural: 5, lexical: K_POOL.lexical },
+        fts_tokenizer: MIGRATION_FTS_TOKENIZER.to_string(),
+        k_final: K_FINAL,
+        corpus_size: golden_set.corpus.len(),
+        n_retrieval_cases: golden_set.retrieval_cases.len(),
+        n_contradiction_pairs: golden_set.contradiction_pairs.len(),
+        known_bugs_live: known_bugs_live(cli.mode),
+        golden_set: report::GoldenSetProvenance::derive(
+            golden_set.retrieval_cases.len(),
+            golden_set.contradiction_pairs.len(),
+            loaded_golden.content_sha256.clone(),
+        ),
+        scoring_config: EvalScoringConfig::default(),
+        retrieval: report::RetrievalResults {
+            aggregate: report::Aggregate::default(),
+            by_lang: vec![],
+            per_case: vec![],
+            blocked: vec![],
+        },
+        contradiction: report::ContradictionResults { curve: vec![], by_lang: vec![] },
+        norm_check: report::NormCheck { asserted: false, mean_norm: 0.0, max_deviation: 0.0 },
+        audit: None,
+        similarity: None,
+        agent_view: Some(view),
+    }
 }
 
 /// Runs `--diff`: reads two existing results files, joins their
@@ -776,6 +882,7 @@ fn build_follow_up_run_results(
         },
         audit: None,
         similarity: None,
+        agent_view: None,
     }
 }
 
@@ -1938,6 +2045,81 @@ mod tests {
         );
 
         std::fs::remove_file(&golden_path).ok();
+    }
+
+    const AGENT_VIEW_ROW_A: &str = "the retrieval decay term compares milliseconds against seconds";
+    const AGENT_VIEW_ROW_B: &str = "el indice knn mide distancia l2 cruda y no similitud coseno";
+
+    fn agent_view_golden_json() -> String {
+        format!(
+            r#"{{
+                "corpus": [
+                    {{"ref": "c1", "content": "{AGENT_VIEW_ROW_A}", "memory_type": "chat_message", "importance": 3.0}},
+                    {{"ref": "c2", "content": "{AGENT_VIEW_ROW_B}", "memory_type": "chat_message", "importance": 3.0}}
+                ],
+                "retrieval_cases": [
+                    {{"query": "{AGENT_VIEW_ROW_A}", "corpus_refs": ["c1","c2"], "expected_refs": ["c1"]}},
+                    {{"query": "{AGENT_VIEW_ROW_B}", "corpus_refs": ["c1","c2"], "expected_refs": ["c2"]}}
+                ],
+                "contradiction_pairs": []
+            }}"#
+        )
+    }
+
+    fn agent_view_args(golden: &std::path::Path, out_dir: &std::path::Path, extra: &[&str]) -> Vec<String> {
+        ["rag-eval", "--fake", "--agent-view", "--golden"]
+            .into_iter()
+            .map(String::from)
+            .chain([golden.to_string_lossy().to_string(), "--out".to_string(), out_dir.to_string_lossy().to_string()])
+            .chain(extra.iter().map(|s| s.to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn agent_view_run_writes_its_own_results_file_carrying_the_block() {
+        let golden_path = temp_path("agent-view-golden.json");
+        std::fs::write(&golden_path, agent_view_golden_json()).expect("write golden fixture");
+        let out_dir = temp_path("agent-view-out");
+
+        let code = run(agent_view_args(&golden_path, &out_dir, &[]).into_iter()).await;
+        assert_eq!(code, EXIT_OK);
+
+        let date = current_date_string();
+        assert!(
+            !out_dir.join(format!("{date}-fake.json")).exists(),
+            "an agent-view run must not pose as the ordinary retrieval baseline"
+        );
+        let path = out_dir.join(format!("{date}-fake-agent-view.json"));
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("results file")).expect("valid JSON");
+        assert_eq!(json["tag"], "agent-view");
+        assert_eq!(json["agent_view"]["corpus_size"], 2);
+        assert_eq!(json["agent_view"]["stored_rows"], 2);
+        assert_eq!(json["agent_view"]["per_case"].as_array().map(Vec::len), Some(2));
+        assert_eq!(json["agent_view"]["search"]["active"]["hit_rate"], 1.0);
+        assert_eq!(json["agent_view"]["context"]["active"]["hit_rate"], 1.0);
+        assert_eq!(
+            json["retrieval"]["per_case"].as_array().map(Vec::len),
+            Some(0),
+            "the store's own ranking is not scored in this mode"
+        );
+
+        std::fs::remove_file(&golden_path).ok();
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn agent_view_run_refuses_to_overwrite_its_results_file_without_force() {
+        let golden_path = temp_path("agent-view-again-golden.json");
+        std::fs::write(&golden_path, agent_view_golden_json()).expect("write golden fixture");
+        let out_dir = temp_path("agent-view-again-out");
+
+        assert_eq!(run(agent_view_args(&golden_path, &out_dir, &[]).into_iter()).await, EXIT_OK);
+        assert_eq!(run(agent_view_args(&golden_path, &out_dir, &[]).into_iter()).await, EXIT_RESULTS_EXISTS);
+        assert_eq!(run(agent_view_args(&golden_path, &out_dir, &["--force"]).into_iter()).await, EXIT_OK);
+
+        std::fs::remove_file(&golden_path).ok();
+        std::fs::remove_dir_all(&out_dir).ok();
     }
 
     #[tokio::test]

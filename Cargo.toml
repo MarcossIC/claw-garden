@@ -54,3 +54,4 @@ mockito = "1"
 tempfile = "3"
 
 clawg-core = { path = "crates/clawg-core" }
+clawg-cli = { path = "crates/clawg-cli" }
