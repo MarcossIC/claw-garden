@@ -44,6 +44,9 @@ pub(crate) enum MemoryWorkerError {
 /// number is pinned by a test.
 const INGEST_QUEUE_WARN_DEPTH: usize = 64;
 
+/// How often a worker held for the embedder checks whether it has loaded.
+const EMBEDDER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Which way the backlog just crossed [`INGEST_QUEUE_WARN_DEPTH`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueueDepthEdge {
@@ -146,6 +149,14 @@ pub async fn memory_worker(
             }
             None => {}
         }
+        if !wait_for_embedder(&embedder_cell, &rx).await {
+            log::warn!(
+                "ingest event dropped at shutdown, the embedder never loaded (agent={}, role={:?})",
+                evt.agent_id,
+                evt.role
+            );
+            continue;
+        }
         if let Err(e) = process_event(
             &evt,
             &store,
@@ -164,6 +175,34 @@ pub async fn memory_worker(
         }
     }
     log::info!("memory_worker shutting down — channel closed");
+}
+
+/// Holds the worker until the embedder is available, so an event accepted
+/// while the model is still loading is ingested afterwards instead of lost.
+///
+/// The queue keeps its FIFO order because the worker simply stops draining:
+/// everything behind the held event waits with it. `OnceCell` has no async
+/// wait, so this polls; the model takes seconds to load, which makes a
+/// 100 ms tick free next to it and keeps the cell's shape untouched.
+///
+/// `false` means the channel closed while waiting (shutdown), so the held
+/// event has nowhere left to go. Checking `is_closed` on every tick is what
+/// keeps a model that never loads from blocking the daemon's shutdown.
+async fn wait_for_embedder(
+    embedder_cell: &Arc<OnceCell<Arc<dyn Embedder>>>,
+    rx: &UnboundedReceiver<MemoryEvent>,
+) -> bool {
+    if embedder_cell.get().is_some() {
+        return true;
+    }
+    log::info!("ingest is waiting for the embedder to load");
+    while embedder_cell.get().is_none() {
+        if rx.is_closed() {
+            return false;
+        }
+        tokio::time::sleep(EMBEDDER_POLL_INTERVAL).await;
+    }
+    true
 }
 
 /// Runs the write-border dedup gate for one chunk hash. `true` means the
@@ -242,11 +281,10 @@ async fn process_event(
         return Ok(());
     }
 
-    // No embedder loaded yet (contract bootstrap still running, or
-    // permanently mismatched): drop the entire event rather than embedding
-    // only some of its chunks — a half-embedded event would be unrecoverable
-    // without tracking which chunks already made it in, so the whole event
-    // is dropped uniformly and cheaply instead.
+    // `memory_worker` holds events until the embedder is loaded, so this only
+    // fires for a caller that skips that wait. Drop the whole event rather
+    // than embedding some of its chunks: a half-embedded event could not be
+    // told apart from a finished one later.
     let Some(embedder) = embedder_cell.get().cloned() else {
         log::debug!(
             "embedder NotReady; dropping {} chunks for agent={}",
@@ -484,17 +522,37 @@ mod tests {
         assert_eq!(rows, 1, "expected 1 row for valid event; got {rows}");
     }
 
-    // ── Embedder-not-ready gate: empty cell drops events without inserting ──────
+    // ── Embedder-not-ready gate: events wait for the embedder, in order ─────────
 
     #[tokio::test]
-    async fn embedder_cell_empty_no_rows_inserted() {
+    async fn events_sent_before_the_embedder_loads_are_ingested_once_it_does() {
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
-        // Empty cell — no embedder seeded
+        let cell: Arc<OnceCell<Arc<dyn Embedder>>> = Arc::new(OnceCell::new());
+        let (tx, handle) = spawn_test_worker_on_cell(Arc::clone(&store), Arc::clone(&cell)).await;
+
+        tx.send(make_event(Role::User, "first fact", None, 1)).unwrap();
+        tx.send(make_event(Role::User, "second fact", None, 2)).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(count_memory(&store).await, 0, "nothing can be embedded before the model loads");
+
+        cell.set(Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>).ok();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while count_memory(&store).await < 2 {
+            assert!(tokio::time::Instant::now() < deadline, "events queued before the embedder loaded were lost");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        drain_worker(tx, handle).await;
+    }
+
+    #[tokio::test]
+    async fn worker_exits_when_senders_drop_while_the_embedder_never_loads() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
         let (tx, handle) = spawn_test_worker_opt(Arc::clone(&store), None).await;
         tx.send(make_event(Role::User, "hello", None, 1)).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drain_worker(tx, handle).await;
-        let rows = count_memory(&store).await;
-        assert_eq!(rows, 0, "empty embedder cell → 0 rows; got {rows}");
+        assert_eq!(count_memory(&store).await, 0);
     }
 
     #[tokio::test]
@@ -1890,8 +1948,15 @@ mod tests {
         if let Some(e) = embedder {
             cell.set(e).ok();
         }
-        let cell = Arc::new(cell);
+        spawn_test_worker_on_cell(store, Arc::new(cell)).await
+    }
 
+    /// Variant that shares the embedder cell with the caller, so a test can
+    /// fill it after the worker is already running.
+    pub(crate) async fn spawn_test_worker_on_cell(
+        store: Arc<MemoryStore>,
+        cell: Arc<OnceCell<Arc<dyn Embedder>>>,
+    ) -> (tokio::sync::mpsc::UnboundedSender<MemoryEvent>, tokio::task::JoinHandle<()>) {
         let chat_chunker = Arc::new(ChatChunker::with_fallback());
         let code_chunker = Arc::new(CodeChunker::new());
 
