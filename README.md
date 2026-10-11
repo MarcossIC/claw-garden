@@ -1,74 +1,380 @@
 # Claw Garden
 
-Local-first memory for coding agents. Claw Garden stores, classifies and retrieves memories and context, and serves them to an agent (Claude Code today) through a local HTTP daemon and a stdio MCP bridge. Everything runs on your machine: SQLite for storage, ONNX embeddings for semantic search.
+Memoria local para agentes de código. Claw Garden guarda, clasifica y recupera memorias y contexto, y se los sirve a un agente (hoy Claude Code) mediante un daemon HTTP local y un puente MCP por stdio. Todo corre en tu máquina: SQLite para el almacenamiento y embeddings ONNX para la búsqueda semántica.
 
-## Build
+## Contenido
+
+- [Instalar en Windows](#instalar-en-windows)
+- [Comprobar que funciona](#comprobar-que-funciona)
+- [Ver lo que se guarda](#ver-lo-que-se-guarda)
+- [Conectarlo a Claude Code](#conectarlo-a-claude-code)
+- [Otros clientes MCP](#otros-clientes-mcp)
+- [Si algo falla](#si-algo-falla)
+- [Desinstalar](#desinstalar)
+- [Referencia](#referencia)
+
+## Instalar en Windows
+
+Hoy no hay binarios publicados: se compila desde el código fuente y un script lo instala sólo para tu usuario, sin permisos de administrador. Son cinco pasos. Los comandos van en **PowerShell**.
+
+### Paso 1. Instalar lo necesario
+
+Necesitás tres cosas:
+
+1. **Git**: <https://git-scm.com>.
+2. **Rust**, con `rustup`: <https://rustup.rs>. Aceptá la opción por defecto, que instala el toolchain **MSVC**.
+3. **Build Tools de Visual Studio**, con el componente **"Desarrollo para escritorio con C++"**. Si no lo tenés, `rustup` te lo pide al instalar.
+
+Después comprobá que tenés el toolchain MSVC:
+
+```powershell
+rustup toolchain list
+```
+
+La lista tiene que incluir una línea `stable-x86_64-pc-windows-msvc`.
+
+- **Si está en la lista**, seguí al paso 2.
+- **Si no está**, instalalo y seguí:
+
+```powershell
+rustup toolchain install stable-x86_64-pc-windows-msvc
+```
+
+> **Por qué MSVC y no GNU:** el runtime de ONNX (`ort`) sólo trae binarios para el toolchain MSVC. Con el toolchain GNU la compilación falla con `ort does not provide prebuilt binaries for the target x86_64-pc-windows-gnu`.
+
+### Paso 2. Descargar el código
+
+```powershell
+git clone <URL-del-repositorio> claw-garden
+cd claw-garden
+```
+
+### Paso 3. Compilar
+
+```powershell
+rustup run stable-x86_64-pc-windows-msvc cargo build --release -p clawg-cli
+```
+
+Tarda unos minutos la primera vez y necesita internet. Al terminar existe el archivo `target\release\clawg.exe`.
+
+Se usa `rustup run stable-x86_64-pc-windows-msvc` a propósito: elige el `cargo` del toolchain MSVC. Pero **no alcanza si tenés otro Rust instalado**: ese `cargo` busca `rustc` en el PATH y usa el primero que encuentra.
+
+**Antes de compilar, comprobá cuántos `rustc` tenés:**
+
+```powershell
+Get-Command rustc -All
+```
+
+- **Si aparece una sola línea**, o la primera es `C:\Users\<tu-usuario>\.cargo\bin\rustc.exe`, usá el comando de arriba tal cual.
+- **Si la primera es otra**, por ejemplo `C:\msys64\mingw64\bin\rustc.exe`, tenés dos Rust instalados. Compilá como dice la sección siguiente.
+
+#### Si tenés dos Rust instalados
+
+Pasa cuando además de `rustup` tenés el Rust de MSYS2 (u otro) antes en el PATH. Ese `rustc` es GNU: compila las dependencias con el compilador equivocado y la compilación falla con alguno de estos errores:
+
+- ``could not find native static library `onnxruntime`, perhaps an -L flag is missing?``
+- `E0514` / `compiled by an incompatible version of rustc`
+
+Los dos pueden decir `rustc 1.91.1`, pero son compiladores distintos. Para verlo, corré `rustc -vV`: si dice `Built by MSYS2 project` o `host: x86_64-pc-windows-gnu`, es el de MSYS2.
+
+**`cargo clean` solo no lo arregla.** Borra lo compilado, pero la próxima compilación vuelve a usar el mismo `rustc` equivocado.
+
+La solución es decirle a `cargo` exactamente qué `rustc` usar con la variable `RUSTC`. No hace falta buscar la ruta a mano, `rustup` te la da:
+
+```powershell
+rustup which rustc --toolchain stable-x86_64-pc-windows-msvc
+```
+
+Imprime algo como `C:\Users\<tu-usuario>\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\rustc.exe`.
+
+**Todo en una sola línea** (fija `RUSTC`, borra los restos del intento anterior y compila):
+
+```powershell
+$env:RUSTC = rustup which rustc --toolchain stable-x86_64-pc-windows-msvc; rustup run stable-x86_64-pc-windows-msvc cargo clean --release; rustup run stable-x86_64-pc-windows-msvc cargo build --release -p clawg-cli
+```
+
+- `$env:RUSTC = ...` guarda en `RUSTC` la ruta que imprime `rustup which`. `cargo` usa esa variable antes que el PATH.
+- `cargo clean --release` borra `target\release`, que puede tener restos compilados con el otro `rustc`. Mezclarlos rompe la compilación.
+- La variable vale **sólo para esa ventana de PowerShell**. Si abrís otra para volver a compilar, repetí la línea.
+
+Para no tener que repetirla: si no usás el Rust de MSYS2 para otra cosa, desinstalalo desde la terminal de MSYS2 con `pacman -R mingw-w64-x86_64-rust`. Después `Get-Command rustc -All` muestra un solo `rustc` y alcanza con el comando normal.
+
+### Paso 4. Instalar
+
+El script de instalación busca `clawg.exe` **al lado de sí mismo**, así que primero se copia ahí:
+
+```powershell
+Copy-Item target\release\clawg.exe scripts\clawg.exe; powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+```
+
+Al terminar muestra `clawg 0.1.0` e `Installed to ...`.
+
+El script:
+
+- copia `clawg.exe` a `%LOCALAPPDATA%\Programs\clawg`;
+- agrega esa carpeta al PATH **de tu usuario** (no toca el del sistema);
+- si ya había un `clawg` instalado, detiene su daemon y **renombra** el binario viejo a `clawg.exe.old-<fecha>` en vez de sobrescribirlo. Windows no deja sobrescribir un `.exe` que otro programa tiene abierto (un antivirus, el indexador o una sesión de Claude Code), pero sí renombrarlo. Esos `.old` se borran solos en la próxima instalación, o podés borrarlos a mano;
+- se niega a continuar si hay otro `clawg` que taparía al nuevo, y al final comprueba que una terminal nueva resuelva `clawg` al archivo recién instalado.
+
+El script no está firmado; por eso se lanza con `-ExecutionPolicy Bypass`, que vale sólo para ese comando. Es corto: podés leerlo antes en `scripts\install.ps1`.
+
+Opciones del script, por si las necesitás:
+
+- `-InstallDir <ruta>`: instalar en otra carpeta.
+- `-SkipPath`: no tocar el PATH.
+- `-RemoveLegacy`: desinstalar en silencio una instalación vieja de "Claw Garden" antes de instalar.
+
+### Paso 5. Abrir una terminal nueva
+
+El PATH actualizado sólo lo ven las terminales abiertas **después** de instalar. Cerrá la actual y abrí otra. Seguí con [Comprobar que funciona](#comprobar-que-funciona).
+
+> **¿Linux o macOS?** El script y `clawg path` son sólo para Windows. Podés compilar con `cargo build --release -p clawg-cli` y poner `target/release/clawg` en tu PATH a mano, pero esa ruta no está probada.
+
+## Comprobar que funciona
+
+En la terminal nueva, corré estos tres comandos uno por uno.
+
+**1. La versión**
+
+```powershell
+clawg --version
+```
+
+Imprime `clawg 0.1.0` (o la versión actual). Si dice que no reconoce el comando, no abriste una terminal nueva o el PATH no se actualizó.
+
+**2. El diagnóstico del PATH**
+
+```powershell
+clawg doctor
+```
+
+Muestra en JSON qué archivos `clawg.exe` encuentra tu PATH. Termina con código `0` si el primero es el que acabás de instalar y no hay copias duplicadas, y con código `1` si hay otra copia que lo tapa. No abre la base de datos, así que se puede correr cuando quieras.
+
+**3. El estado del daemon**
+
+```powershell
+clawg status --profile prod
+```
+
+Recién instalado, lo normal es que diga `"running": false` y termine con código `1`: todavía nadie arrancó el daemon.
+
+### Probar el daemon a mano
+
+Abrí **dos** terminales. En la primera:
+
+```powershell
+clawg serve --profile prod
+```
+
+Dejala abierta. En la segunda:
+
+```powershell
+clawg status --profile prod
+```
+
+Ahora debería decir `"running": true`. La primera vez, el modelo de embeddings se descarga en segundo plano desde Hugging Face (una sola vez, necesita internet): mientras tanto el daemon ya responde, pero la búsqueda semántica todavía no está lista. Repetí `status` y vas a ver el modelo pasar de `loading` a `ready`; suele tardar entre 3 y 15 segundos.
+
+Para detenerlo:
+
+```powershell
+clawg stop --profile prod
+```
+
+Si lo usás desde Claude Code no hace falta arrancarlo a mano: `clawg mcp` lo lanza solo cuando no hay uno corriendo.
+
+## Ver lo que se guarda
+
+`clawg memories` es un visor de sólo lectura para comprobar qué guardaron los agentes. **Necesita un daemon corriendo** (no lo arranca solo) y no modifica nada.
+
+Los cuatro comandos:
+
+```powershell
+clawg memories stats --profile prod                # cuántas memorias hay, agrupadas por tipo, tier, estado, agente y proyecto
+clawg memories list --profile prod                 # las más recientes primero (20 por defecto)
+clawg memories search "base de datos" --profile prod   # busca; todas las palabras deben aparecer
+clawg memories show 12 --profile prod              # una memoria completa, con todos sus metadatos
+```
+
+El número de `show` es el `id` que aparece en `list` y `search`.
+
+Se pueden agregar estos filtros a `list` y `search`:
+
+- `--here`: sólo las memorias del proyecto del directorio actual.
+- `--project <ID>` y `--agent <ID>`: filtran por proyecto o por agente.
+- `--type <T>`: filtra por tipo de memoria.
+- `--tier <1|2|3>`: 1 es caliente, 2 tibia, 3 fría.
+- `--status <active|disputed|superseded>`: estado del ciclo de vida.
+- `--limit <N>` y `--offset <N>`: paginado; `--limit` va de 1 a 100.
+- `--json`: salida en JSON, para scripts.
+
+Detalles útiles:
+
+- La búsqueda ignora mayúsculas y acentos: `configuracion` encuentra `configuración`.
+- `show` mira por defecto la tabla `memory`; con `--kind episodic` o `--kind procedural` mira las otras. Los ids son por tabla.
+- Un texto largo se guarda partido en fragmentos, y el visor los muestra como filas separadas.
+
+## Conectarlo a Claude Code
+
+`clawg mcp` es un servidor MCP por stdio: Claude Code lanza el comando y habla con él. Registralo a nivel de usuario, así queda disponible en todos tus proyectos:
+
+```powershell
+claude mcp add --scope user clawg -- "$env:LOCALAPPDATA\Programs\clawg\clawg.exe" mcp --profile prod
+```
+
+Lo que va después de `--` es el comando que Claude Code ejecuta. Se usa la ruta completa a propósito, para no depender del PATH del proceso que lanza Claude Code.
+
+Comprobá que quedó registrado:
+
+```powershell
+claude mcp list
+```
+
+Después **abrí una sesión nueva** de Claude Code. Adentro:
+
+1. Escribí `/mcp` para ver el estado del servidor `clawg`.
+2. Pedile al agente que use la herramienta `memory_status`: te dice si el daemon está corriendo, qué perfil usa y si el modelo ya cargó.
+3. Pedile que guarde algo, por ejemplo: "guardá en memoria que en este proyecto usamos pnpm".
+4. En una terminal, comprobalo con el visor: `clawg memories list --here --profile prod`.
+
+El agente dispone de seis herramientas (ver [Herramientas MCP](#herramientas-mcp)).
+
+## Otros clientes MCP
+
+Cualquier cliente que acepte servidores MCP por stdio sirve: hay que darle el comando y sus argumentos. En los que se configuran con un JSON del estilo `mcpServers` (por ejemplo Cursor), sería:
+
+```json
+{
+  "mcpServers": {
+    "clawg": {
+      "command": "C:\\Users\\<tu-usuario>\\AppData\\Local\\Programs\\clawg\\clawg.exe",
+      "args": ["mcp", "--profile", "prod"]
+    }
+  }
+}
+```
+
+El camino probado hoy es Claude Code. La configuración de otros clientes sigue el estándar MCP, pero no está verificada con cada uno.
+
+## Si algo falla
+
+**Al compilar: `ort does not provide prebuilt binaries for the target x86_64-pc-windows-gnu`.**
+Estás compilando con el toolchain GNU. Usá el comando del paso 3 tal cual, con `rustup run stable-x86_64-pc-windows-msvc`. Si tampoco anda, tenés dos Rust instalados: seguí [Si tenés dos Rust instalados](#si-tenés-dos-rust-instalados).
+
+**Al compilar: ``could not find native static library `onnxruntime`, perhaps an -L flag is missing?``.**
+El `rustc` que usa `cargo` es el de MSYS2 (u otro GNU), no el de `rustup`. Volver a correr `cargo clean` no lo arregla. Compilá con la línea de [Si tenés dos Rust instalados](#si-tenés-dos-rust-instalados).
+
+**Al compilar: cientos de errores en `tokio` u otras dependencias, con `E0514` o `compiled by an incompatible version of rustc`.**
+Hay restos compilados por otro `rustc` en `target\release`, normalmente de un intento anterior con el toolchain GNU o con el Rust de MSYS2. Aunque ambos digan `rustc 1.91.1`, son compiladores distintos. Si `Get-Command rustc -All` muestra un solo `rustc`, alcanza con borrar y compilar de nuevo:
+
+```powershell
+rustup run stable-x86_64-pc-windows-msvc cargo clean --release
+rustup run stable-x86_64-pc-windows-msvc cargo build --release -p clawg-cli
+```
+
+Si muestra más de uno, esos dos comandos vuelven a fallar porque se compila otra vez con el `rustc` equivocado. Usá la línea de [Si tenés dos Rust instalados](#si-tenés-dos-rust-instalados).
+
+**Al compilar: `rustup toolchain install` falla con `detected conflict: 'bin\cargo.exe'`.**
+Significa que el toolchain MSVC **ya estaba instalado** y rustup intentó actualizarlo. No hace falta reinstalarlo: saltá al paso 3.
+
+**Al compilar: error de `link.exe` o del linker.**
+Faltan las Build Tools de Visual Studio con el componente de C++ (paso 1, punto 3).
+
+**`clawg` no se reconoce como comando.**
+La terminal es anterior a la instalación. Abrí una nueva.
+
+**El instalador dice que otro `clawg` taparía al nuevo.**
+Hay una instalación vieja. Repetí el paso 4 agregando `-RemoveLegacy`, o borrá a mano la copia que indica el mensaje.
+
+**El instalador dice `Could not replace ... clawg.exe` o `user-mapped section open`.**
+Tenés una versión vieja de `scripts\install.ps1`, que intentaba sobrescribir el binario. Actualizá el código (`git pull`) y repetí el paso 4. La versión actual renombra el binario viejo y no choca con este bloqueo.
+
+**El instalador dice `Could not move the previous ... clawg.exe out of the way`.**
+Algún programa tiene el binario viejo abierto sin permitir que se renombre. No se tocó nada. Fijate si es un `clawg` con `Get-Process clawg -ErrorAction SilentlyContinue | Select-Object Id, Path`. Si aparece, cerrá las sesiones de Claude Code que lo usan. Si no aparece ninguno, esperá un minuto. En los dos casos, después repetí el paso 4.
+
+**`clawg memories ...` dice que no hay daemon.**
+El visor no lo arranca solo. Corré `clawg serve --profile prod` en otra terminal, o abrí una sesión de Claude Code con el servidor registrado.
+
+**Después de `clawg stop` o de actualizar, el agente no encuentra el servidor.**
+El puente no se reconecta solo. En Claude Code, escribí `/mcp` y reconectalo.
+
+**`clawg doctor` termina con código 1.**
+Hay otro `clawg.exe` en el PATH que gana, o una copia duplicada. El JSON que imprime dice cuál.
+
+## Desinstalar
+
+```powershell
+clawg stop --profile prod
+clawg path remove --dir "$env:LOCALAPPDATA\Programs\clawg"
+claude mcp remove clawg
+Remove-Item -Recurse "$env:LOCALAPPDATA\Programs\clawg"
+```
+
+Esto, en orden: detiene el daemon, saca la carpeta del PATH, quita el servidor de Claude Code (sólo si lo registraste) y borra el binario.
+
+Tus memorias **no se borran**: viven en `~/.clawg`. Si también querés eliminarlas, borrá esa carpeta a mano.
+
+## Referencia
+
+### Compilar para desarrollo
 
 ```
 cargo build -p clawg-cli
 ```
 
-This produces the `clawg` binary (`target/debug/clawg`; `target/release/clawg` with `--release`).
+Produce el binario `clawg` (`target/debug/clawg`; `target/release/clawg` con `--release`). En Windows, usá el toolchain MSVC como en el paso 3.
 
-## Run
-
-```
-clawg serve --profile dev     # the memory daemon
-clawg mcp --profile dev       # stdio MCP bridge; starts a daemon if none is running
-clawg status --profile dev    # daemon state and health as JSON (exit 1 if not running)
-clawg stop --profile dev      # stop the daemon
-clawg doctor                  # which clawg the PATH resolves to (exit 1 if shadowed or duplicated)
-```
-
-`clawg mcp --no-autostart` fails instead of starting a daemon. `clawg serve --port <n>` overrides the default port (`0` picks a free one). `clawg path add|remove [--dir <dir>]` edits the user PATH on Windows.
-
-## Register the MCP server in Claude Code
-
-The server is a stdio command, so everything after `--` is the command Claude Code launches. Dev profile, pointing at a debug build:
+### Comandos
 
 ```
-claude mcp add clawg-dev -- /path/to/claw-garden/target/debug/clawg mcp --profile dev
+clawg serve --profile dev     # el daemon de memoria
+clawg mcp --profile dev       # puente MCP por stdio; arranca un daemon si no hay ninguno
+clawg status --profile dev    # estado y salud del daemon en JSON (sale con 1 si no está corriendo)
+clawg stop --profile dev      # detiene el daemon
+clawg doctor                  # a qué clawg resuelve el PATH (sale con 1 si hay uno que tapa o está duplicado)
+clawg memories list|search|show|stats   # visor de sólo lectura
 ```
 
-On Windows use the full path to `clawg.exe`. For the prod profile (release build only) register it as `clawg`:
+`clawg mcp --no-autostart` falla en vez de arrancar un daemon. `clawg serve --port <n>` cambia el puerto por defecto (`0` elige uno libre). `clawg path add|remove [--dir <dir>]` edita el PATH del usuario en Windows.
+
+### Registrar el servidor MCP en un build de desarrollo
+
+Perfil `dev`, apuntando a un build debug:
 
 ```
-claude mcp add clawg -- /path/to/clawg mcp --profile prod
+claude mcp add clawg-dev -- /ruta/a/claw-garden/target/debug/clawg mcp --profile dev
 ```
 
-The names `clawg-dev` and `clawg` are the identities each profile uses.
+En Windows usá la ruta completa a `clawg.exe`. Los nombres `clawg-dev` y `clawg` son las identidades que usa cada perfil.
 
-## MCP tools
+### Herramientas MCP
 
-- `save_memory`: store a fact, preference or decision so it survives across sessions.
-- `search_memory`: find stored memories related to a query, with ids, kinds and relevance scores.
-- `recall_context`: get a ready-to-read background block (workspace notes, recent and long-term memories) for a query.
-- `list_memories`: browse stored memories, newest first, without searching.
-- `delete_memory`: delete one memory by id and kind.
-- `memory_status`: report whether the daemon is running, its profile and data directory, and whether the embedding model has loaded.
+- `save_memory`: guarda un hecho, preferencia o decisión para que sobreviva entre sesiones.
+- `search_memory`: busca memorias relacionadas con una consulta, con ids, tipos y puntajes de relevancia.
+- `recall_context`: devuelve un bloque de contexto listo para leer (notas del workspace, memorias recientes y de largo plazo) para una consulta.
+- `list_memories`: recorre las memorias guardadas, las más nuevas primero, sin buscar.
+- `delete_memory`: borra una memoria por id y tipo.
+- `memory_status`: informa si el daemon está corriendo, su perfil y su directorio de datos, y si el modelo de embeddings ya cargó.
 
-## Profiles and data
+### Perfiles y datos
 
-| Profile | Data directory | Default port |
-| --- | --- | --- |
-| `dev` | `~/.clawg-dev` | 27381 |
-| `prod` | `~/.clawg` | 27380 |
+- Perfil `dev`: datos en `~/.clawg-dev`, puerto por defecto 27381.
+- Perfil `prod`: datos en `~/.clawg`, puerto por defecto 27380.
 
-The profile comes from `--profile dev|prod`, then the `CLAWG_PROFILE` environment variable, then the build type (debug is `dev`, release is `prod`). A debug build refuses `prod`, so it can never touch `~/.clawg`. The daemon listens on 127.0.0.1 only; `/v1` endpoints require a bearer token stored in the data directory.
+El perfil sale de `--profile dev|prod`, luego de la variable de entorno `CLAWG_PROFILE`, y por último del tipo de build (debug es `dev`, release es `prod`). Un build debug rechaza `prod`, así que nunca puede tocar `~/.clawg`. El daemon escucha sólo en 127.0.0.1; los endpoints `/v1` exigen un token bearer guardado en el directorio de datos.
 
-Each data directory holds the SQLite memory store plus `daemon.json` (pid, port, version), `token`, and `memory.lock` / `memory.owner`, which ensure a single process owns the store.
+Cada directorio de datos contiene la base SQLite de memoria, `daemon.json` (pid, puerto, versión), `token`, y `memory.lock` / `memory.owner`, que garantizan que un único proceso sea dueño del almacén.
 
-## Workspace
+### Workspace
 
-- `crates/clawg-core`: memory engine (storage, embeddings, ranking, background workers).
-- `crates/clawg-cli`: the `clawg` binary and its daemon and MCP bridge.
-- `crates/clawg-eval`: evaluation tools, `rag-eval` and `golden-mine`.
-- `docs/`: design documents and examples.
+- `crates/clawg-core`: motor de memoria (almacenamiento, embeddings, ranking, workers en segundo plano).
+- `crates/clawg-cli`: el binario `clawg`, con su daemon y el puente MCP.
+- `crates/clawg-eval`: herramientas de evaluación, `rag-eval` y `golden-mine`.
+- `docs/`: documentos de diseño y ejemplos.
 
-## Test
+### Tests
 
 ```
 cargo test --workspace
 ```
 
-See `AGENTS.md` for contributor and agent conventions.
+Mirá `AGENTS.md` para las convenciones de contribución y de agentes.
