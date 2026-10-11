@@ -1,59 +1,74 @@
 # Claw Garden
 
-This project was generated using [Angular CLI](https://github.com/angular/angular-cli) version 21.0.4.
+Local-first memory for coding agents. Claw Garden stores, classifies and retrieves memories and context, and serves them to an agent (Claude Code today) through a local HTTP daemon and a stdio MCP bridge. Everything runs on your machine: SQLite for storage, ONNX embeddings for semantic search.
 
-## Development server
+## Build
 
-To start a local development server, run:
-
-```bash
-ng serve
+```
+cargo build -p clawg-cli
 ```
 
-Once the server is running, open your browser and navigate to `http://localhost:4200/`. The application will automatically reload whenever you modify any of the source files.
+This produces the `clawg` binary (`target/debug/clawg`; `target/release/clawg` with `--release`).
 
-## Code scaffolding
+## Run
 
-Angular CLI includes powerful code scaffolding tools. To generate a new component, run:
-
-```bash
-ng generate component component-name
+```
+clawg serve --profile dev     # the memory daemon
+clawg mcp --profile dev       # stdio MCP bridge; starts a daemon if none is running
+clawg status --profile dev    # daemon state and health as JSON (exit 1 if not running)
+clawg stop --profile dev      # stop the daemon
+clawg doctor                  # which clawg the PATH resolves to (exit 1 if shadowed or duplicated)
 ```
 
-For a complete list of available schematics (such as `components`, `directives`, or `pipes`), run:
+`clawg mcp --no-autostart` fails instead of starting a daemon. `clawg serve --port <n>` overrides the default port (`0` picks a free one). `clawg path add|remove [--dir <dir>]` edits the user PATH on Windows.
 
-```bash
-ng generate --help
+## Register the MCP server in Claude Code
+
+The server is a stdio command, so everything after `--` is the command Claude Code launches. Dev profile, pointing at a debug build:
+
+```
+claude mcp add clawg-dev -- /path/to/claw-garden/target/debug/clawg mcp --profile dev
 ```
 
-## Building
+On Windows use the full path to `clawg.exe`. For the prod profile (release build only) register it as `clawg`:
 
-To build the project run:
-
-```bash
-ng build
+```
+claude mcp add clawg -- /path/to/clawg mcp --profile prod
 ```
 
-This will compile your project and store the build artifacts in the `dist/` directory. By default, the production build optimizes your application for performance and speed.
+The names `clawg-dev` and `clawg` are the identities each profile uses.
 
-## Running unit tests
+## MCP tools
 
-To execute unit tests with the [Vitest](https://vitest.dev/) test runner, use the following command:
+- `save_memory`: store a fact, preference or decision so it survives across sessions.
+- `search_memory`: find stored memories related to a query, with ids, kinds and relevance scores.
+- `recall_context`: get a ready-to-read background block (workspace notes, recent and long-term memories) for a query.
+- `list_memories`: browse stored memories, newest first, without searching.
+- `delete_memory`: delete one memory by id and kind.
+- `memory_status`: report whether the daemon is running, its profile and data directory, and whether the embedding model has loaded.
 
-```bash
-ng test
+## Profiles and data
+
+| Profile | Data directory | Default port |
+| --- | --- | --- |
+| `dev` | `~/.clawg-dev` | 27381 |
+| `prod` | `~/.clawg` | 27380 |
+
+The profile comes from `--profile dev|prod`, then the `CLAWG_PROFILE` environment variable, then the build type (debug is `dev`, release is `prod`). A debug build refuses `prod`, so it can never touch `~/.clawg`. The daemon listens on 127.0.0.1 only; `/v1` endpoints require a bearer token stored in the data directory.
+
+Each data directory holds the SQLite memory store plus `daemon.json` (pid, port, version), `token`, and `memory.lock` / `memory.owner`, which ensure a single process owns the store.
+
+## Workspace
+
+- `crates/clawg-core`: memory engine (storage, embeddings, ranking, background workers).
+- `crates/clawg-cli`: the `clawg` binary and its daemon and MCP bridge.
+- `crates/clawg-eval`: evaluation tools, `rag-eval` and `golden-mine`.
+- `docs/`: design documents and examples.
+
+## Test
+
+```
+cargo test --workspace
 ```
 
-## Running end-to-end tests
-
-For end-to-end (e2e) testing, run:
-
-```bash
-ng e2e
-```
-
-Angular CLI does not come with an end-to-end testing framework by default. You can choose one that suits your needs.
-
-## Additional Resources
-
-For more information on using the Angular CLI, including detailed command references, visit the [Angular CLI Overview and Command Reference](https://angular.dev/tools/cli) page.
+See `AGENTS.md` for contributor and agent conventions.
