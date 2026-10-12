@@ -14,7 +14,7 @@ use clawg_core::memory::bootstrap::{production_deps, run_embedder_bootstrap, Log
 use clawg_core::memory::store_lock::StoreHolder;
 use clawg_core::memory::MemoryError;
 use clawg_core::paths::{data_dir, PathsError, Profile};
-use clawg_core::runtime::MemoryRuntime;
+use clawg_core::runtime::{MemoryRuntime, Workers};
 
 use super::api::{router, AppCtx};
 use super::lifecycle::{
@@ -93,8 +93,12 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
         verify,
     ));
     // The single ingest spawn site for this process.
-    tokio::spawn(runtime.ingest_worker(ingest_rx, tokio::sync::watch::channel(None).1));
-    tokio::spawn(runtime.maintenance_worker());
+    let (drain, drain_rx) = tokio::sync::watch::channel(None);
+    let workers = Workers {
+        ingest: tokio::spawn(runtime.ingest_worker(ingest_rx, drain_rx)),
+        maintenance: tokio::spawn(runtime.maintenance_worker()),
+        drain,
+    };
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
@@ -134,9 +138,13 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
         base_dir.display()
     );
 
-    let result = axum::serve(listener, router(ctx))
+    let result = axum::serve(listener, router(ctx.clone()))
         .with_graceful_shutdown(shutdown_signal(shutdown_rx))
         .await;
+
+    // No request can queue a save any more, so whatever is queued now is all
+    // there is to drain or spill.
+    ctx.runtime.shutdown(workers).await;
 
     // Always, on every exit path: a stale `daemon.json` sends the next client
     // to a port nothing is listening on, and the failure looks like a hang.
