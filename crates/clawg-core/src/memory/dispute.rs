@@ -136,6 +136,13 @@ pub(crate) fn release_challengers(c: &Connection, id: i64, now: TimestampMs) -> 
     c.execute(&sql, rusqlite::params![now, id])
 }
 
+/// Settles every `disputed` row. A delete that ran before deletes released
+/// their challengers left those rows `disputed` with nothing to be resolved
+/// against; this is the backfill for them.
+pub(crate) fn settle_disputed(c: &Connection, now: TimestampMs) -> rusqlite::Result<usize> {
+    c.execute(&settle_sql("status = 'disputed'"), rusqlite::params![now])
+}
+
 const SELECT_PAIR_ROW: &str =
     "SELECT id, status, superseded_by, disputed_against FROM memory WHERE id = ?1 AND deleted_at IS NULL";
 
@@ -533,6 +540,31 @@ mod tests {
             Err(ResolveError::NotInDispute { .. })
         ));
         assert_eq!(row(&store, b).await.status, "active");
+    }
+
+    #[tokio::test]
+    async fn disputes_written_by_the_previous_version_resolve_and_release() {
+        let store = store().await;
+        let old = seed(&store, "old", "active", &[], 0).await;
+        let new = seed(&store, "new", "disputed", &[old], 1).await;
+        let gone = seed(&store, "gone", "active", &[], 2).await;
+        let orphan = seed(&store, "orphan", "disputed", &[gone], 3).await;
+        soft_delete(&store, gone).await;
+
+        for (axis, id) in [(1, new), (3, orphan)] {
+            let hits = search_all_memories(&store, &basis(axis), None, "agent-d", SearchScope::all_default(), 10)
+                .await
+                .unwrap();
+            assert_eq!(hits.first().map(|h| h.id), Some(id), "{hits:?}");
+        }
+
+        resolve_dispute_core(&store, new, old, Outcome::Supersede).await.unwrap();
+        let now = TimestampMs::now();
+        store.conn.call(move |c| settle_disputed(c, now)).await.unwrap();
+
+        assert_eq!(row(&store, old).await.status, "superseded");
+        assert_eq!(row(&store, new).await.status, "active");
+        assert_eq!(row(&store, orphan).await.status, "active");
     }
 
     #[tokio::test]

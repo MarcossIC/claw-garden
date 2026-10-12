@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::memory::clock::TimestampMs;
 use crate::memory::db::{EmbeddingIdentity, MemoryStore};
+use crate::memory::dispute::settle_disputed;
 use crate::memory::embedder::{EmbedRole, Embedder};
 use crate::memory::vector::to_unit;
 use crate::memory::MemoryError;
@@ -114,6 +115,11 @@ pub(crate) async fn run_maintenance_once_at(store: &MemoryStore, now_ms: Timesta
         log::info!("maintenance: dropped {swept} vector rows left behind by soft-deleted rows");
     }
 
+    let released = release_orphaned_disputes(store, now_ms).await;
+    if released > 0 {
+        log::info!("maintenance: released {released} disputes whose other side was deleted");
+    }
+
     // Placed after the demotion pass so the counts describe the post-pass
     // state. A query failure here logs and returns like the demotion above —
     // losing one day's corpus-size log line is not worth stopping the loop.
@@ -197,6 +203,19 @@ async fn sweep_orphaned_vectors(store: &MemoryStore) -> usize {
         }
     }
     swept
+}
+
+/// Returns every `disputed` row with no live row left to dispute to
+/// `active`, and reports how many it changed. A failure is logged and
+/// reported as 0, like the vector sweep above.
+async fn release_orphaned_disputes(store: &MemoryStore, now_ms: TimestampMs) -> usize {
+    match store.conn.call(move |c| settle_disputed(c, now_ms)).await {
+        Ok(n) => n,
+        Err(e) => {
+            log::warn!("maintenance: orphaned-dispute release failed: {e}");
+            0
+        }
+    }
 }
 
 /// Total vs. live (`deleted_at IS NULL`) row count for one table.
@@ -1280,6 +1299,75 @@ mod tests {
         let second = super::sweep_orphaned_vectors(&store).await;
         assert_eq!(second, 0, "an already-swept corpus must give the second pass nothing to do");
         assert_eq!(vector_row_count(&store, "memory_vectors", id).await, 0, "second pass must stay a no-op, not error or re-delete");
+    }
+
+    // ── orphaned-dispute release ──────────────────────────────────────────
+
+    /// A row as the detector writes it: `disputed`, naming `against`.
+    async fn seed_dispute(store: &MemoryStore, content: &str, status: &str, against: Option<i64>) -> i64 {
+        let (content, status) = (content.to_string(), status.to_string());
+        let against = against.map(|id| format!("[{id}]"));
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<i64> {
+                c.execute(
+                    "INSERT INTO memory (scope, agent_id, content, memory_type, source, created_at, \
+                     created_by_type, created_by_ref, last_modified_at, last_accessed_at, importance, \
+                     tier, status, disputed_against, last_disputed_at) \
+                     VALUES ('agent', 'agent-m', ?1, 'semantic_fact', 'explicit', 0, 'user', 'agent-m', \
+                     0, 0, 5.0, 3, ?2, ?3, CASE WHEN ?3 IS NULL THEN NULL ELSE 0 END)",
+                    rusqlite::params![content, status, against],
+                )?;
+                Ok(c.last_insert_rowid())
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn status_of(store: &MemoryStore, id: i64) -> (String, i64) {
+        store
+            .conn
+            .call(move |c| {
+                c.query_row("SELECT status, last_modified_at FROM memory WHERE id = ?1", [id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn maintenance_releases_disputes_left_by_an_earlier_delete() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let gone = seed_dispute(&store, "gone", "active", None).await;
+        let orphan = seed_dispute(&store, "orphan", "disputed", Some(gone)).await;
+        let live = seed_dispute(&store, "live", "active", None).await;
+        let open = seed_dispute(&store, "open", "disputed", Some(live)).await;
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE memory SET deleted_at = 1 WHERE id = ?1", [gone]))
+            .await
+            .unwrap();
+
+        super::run_maintenance_once_at(&store, now_ms()).await;
+
+        assert_eq!(status_of(&store, orphan).await.0, "active");
+        assert_eq!(status_of(&store, open).await, ("disputed".to_string(), 0), "an open dispute is not touched");
+    }
+
+    #[tokio::test]
+    async fn maintenance_release_is_idempotent() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let gone = seed_dispute(&store, "gone", "active", None).await;
+        seed_dispute(&store, "orphan", "disputed", Some(gone)).await;
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE memory SET deleted_at = 1 WHERE id = ?1", [gone]))
+            .await
+            .unwrap();
+
+        assert_eq!(super::release_orphaned_disputes(&store, now_ms()).await, 1);
+        assert_eq!(super::release_orphaned_disputes(&store, now_ms()).await, 0);
     }
 
     // ── reembed_all ──────────────────────────────────────────────────────
