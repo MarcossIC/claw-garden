@@ -15,6 +15,12 @@ Cada tarea es un commit atómico: primero el test que falla, después el código
 - [x] `identifier_tokens` puro; `identifier_matches` (FTS5 `AND`, `LIMIT presupuesto + 1`, mismos predicados de scope, fail-soft) antes del `try_join!`; `knn_one` y `score_lexical_candidates` marcan `lexical_match`; los matches se suman a los candidatos léxicos.
 - Commit: `feat(core): rank rows that carry the query's exact identifier first` (`6b2ead6`)
 
+## 3. Un identificador con `_` se exige tal cual (R5)
+
+- [x] Tests `an_underscore_identifier_is_held_only_as_written` y `words_split_like_an_underscore_identifier_neither_match_nor_use_the_budget`.
+- [x] `holds_identifier` puro; la consulta trae el contenido con una ventana de `MAX_LEXICAL_CANDIDATES` y filtra antes del presupuesto.
+- Commit: `fix(core): require an underscore identifier as written before rewarding it` (`3c72f9b`)
+
 ## Verify
 
 - [x] `cargo test --workspace`: sin fallas nuevas contra la base (ver `verify.md`).

@@ -13,7 +13,7 @@
   - tiene una minúscula seguida inmediatamente de una mayúscula (`getEstadoLabel`).
   Un número solo (`4821`) no es identificador.
 - **Identificadores de la consulta:** los tokens identificadores distintos de toda la consulta, en orden de aparición, hasta 8 (`MAX_IDENTIFIER_TOKENS`).
-- **Match de identificador:** fila de `memory` visible para el llamador (mismos predicados de agente, proyecto, estado y `deleted_at` que el canal léxico) cuyo contenido tiene **todos** los identificadores de la consulta, según FTS5 (`"t1" AND "t2" …`).
+- **Match de identificador:** fila de `memory` visible para el llamador (mismos predicados de agente, proyecto, estado y `deleted_at` que el canal léxico) cuyo contenido tiene **todos** los identificadores de la consulta, según FTS5 (`"t1" AND "t2" …`). FTS5 separa en `_`, así que `"user_id"` es una frase que también matchea `user id` y `user-id`: para los identificadores con `_` el contenido MUST tenerlos escritos tal cual (sin distinguir mayúsculas y sin pegarse a otro nombre). Las filas que no los tienen así no reciben bono ni cuentan para el presupuesto.
 - **Presupuesto léxico:** `SearchScope.lexical` (20 por defecto, `search.rs:38`).
 - **Bono léxico:** `ScoringConfig.lexical_bonus`, 1,0 por defecto.
 
@@ -95,6 +95,13 @@ Un match de identificador MUST cumplir los mismos predicados que el candidato l�
 - THEN su fila lleva el bono
 
 **Test:** `rows_the_caller_cannot_see_neither_match_nor_count_against_the_budget` en `search.rs`.
+
+#### Escenario: palabras partidas como el identificador
+- GIVEN 25 filas con `snake case` o `snake-case` y una con `snake_case`, y presupuesto 20
+- WHEN se busca `snake_case`
+- THEN sólo la fila con `snake_case` es match
+
+**Test:** `an_underscore_identifier_is_held_only_as_written` y `words_split_like_an_underscore_identifier_neither_match_nor_use_the_budget` en `search.rs`.
 
 ## R6. La búsqueda no falla por el canal
 

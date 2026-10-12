@@ -30,6 +30,10 @@ La consulta de matches pide `LIMIT presupuesto + 1`. Si vuelven más filas que e
 
 Alternativa descartada: ponderar el bono por IDF. Agrega una escala continua que habría que calibrar con mediciones que este entorno no puede hacer, y el gate binario ya separa "nombra una cosa" de "nombra muchas".
 
+### Identificadores con `_`
+
+`unicode61` separa en `_`, así que el MATCH de `"user_id"` es la frase `user id` y también trae filas con `user id` o `user-id`. Por eso la consulta trae el contenido de hasta `MAX_LEXICAL_CANDIDATES` filas y `holds_identifier` descarta, en Rust, las que no tienen el nombre escrito tal cual; el presupuesto se aplica después. Si la frase trae más filas que esa ventana, no hay bono. Un tokenizer que conserve `_` se descartó: cambiarlo re-indexa toda la base y cambia también el canal léxico de hoy.
+
 ## D4. `AND` entre identificadores
 
 Una fila es match si tiene **todos** los identificadores de la consulta. Con uno solo (el caso común) da igual. Con dos, una fila que tiene uno no recibe nada: queda como hoy. Un bono parcial (por fracción de identificadores) queda fuera de alcance hasta que el golden set tenga casos con varios identificadores.
