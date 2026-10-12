@@ -15,7 +15,8 @@ use clawg_core::memory::MemoryStore;
 use clawg_core::models::chat::Role;
 use clawg_core::runtime::{MemoryRuntime, Workers};
 use once_cell::sync::OnceCell;
-use tokio::sync::mpsc::UnboundedReceiver;
+use clawg_core::memory::worker::IngestRequest;
+use tokio::sync::mpsc::Receiver;
 
 fn event(content: &str) -> MemoryEvent {
     MemoryEvent {
@@ -31,7 +32,7 @@ fn event(content: &str) -> MemoryEvent {
     }
 }
 
-fn start(runtime: &MemoryRuntime, rx: UnboundedReceiver<MemoryEvent>) -> Workers {
+fn start(runtime: &MemoryRuntime, rx: Receiver<IngestRequest>) -> Workers {
     let (drain, drain_rx) = tokio::sync::watch::channel(None);
     Workers {
         ingest: tokio::spawn(runtime.ingest_worker(rx, drain_rx)),
@@ -97,7 +98,7 @@ async fn shutdown_ingests_every_queued_event_when_the_embedder_is_ready() {
     let workers = start(&runtime, rx);
     let sent: Vec<String> = (0..20).map(|i| format!("queued fact number {i}")).collect();
     for content in &sent {
-        runtime.memory_tx.send(event(content)).unwrap();
+        runtime.memory_tx.try_send(event(content).into()).unwrap();
     }
 
     runtime.shutdown(workers).await;
@@ -113,7 +114,7 @@ async fn shutdown_spills_events_held_for_an_embedder_that_never_loaded() {
     let runtime = MemoryRuntime { embedder: Arc::new(OnceCell::<Arc<dyn Embedder>>::new()), ..runtime };
     let workers = start(&runtime, rx);
     for content in ["first", "second", "third"] {
-        runtime.memory_tx.send(event(content)).unwrap();
+        runtime.memory_tx.try_send(event(content).into()).unwrap();
     }
     // Long enough for the worker to take "first" and hold it.
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -139,7 +140,7 @@ async fn shutdown_spills_what_the_drain_deadline_left_unstarted() {
     let workers = start(&runtime, rx);
     let sent: Vec<String> = (0..5).map(|i| format!("slow fact number {i}")).collect();
     for content in &sent {
-        runtime.memory_tx.send(event(content)).unwrap();
+        runtime.memory_tx.try_send(event(content).into()).unwrap();
     }
     // Let the first event start embedding before the drain begins.
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -176,7 +177,7 @@ async fn spilled_events_are_ingested_first_on_startup() {
     let tmp = tempfile::tempdir().unwrap();
     write_spill(tmp.path(), &[spill_line("spilled one"), spill_line("spilled two")]);
     let (runtime, rx) = MemoryRuntime::new_for_test(tmp.path().to_path_buf()).await;
-    runtime.memory_tx.send(event("saved after the restart")).unwrap();
+    runtime.memory_tx.try_send(event("saved after the restart").into()).unwrap();
 
     let workers = start(&runtime, rx);
     let rows = wait_for_rows(&runtime.store, 3).await;
@@ -209,7 +210,7 @@ async fn a_shutdown_during_replay_keeps_the_unreplayed_lines_first() {
     write_spill(tmp.path(), &[spill_line("old 1"), spill_line("old 2"), spill_line("old 3")]);
     let (runtime, rx) = MemoryRuntime::new_for_test(tmp.path().to_path_buf()).await;
     let runtime = MemoryRuntime { embedder: Arc::new(OnceCell::<Arc<dyn Embedder>>::new()), ..runtime };
-    runtime.memory_tx.send(event("new")).unwrap();
+    runtime.memory_tx.try_send(event("new").into()).unwrap();
 
     let workers = start(&runtime, rx);
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -229,7 +230,7 @@ async fn shutdown_checkpoints_the_wal_into_memory_db() {
         .unwrap();
     runtime.embedder.set(Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>).ok();
     let workers = start(&runtime, rx);
-    runtime.memory_tx.send(event("written just before the stop")).unwrap();
+    runtime.memory_tx.try_send(event("written just before the stop").into()).unwrap();
     assert_eq!(wait_for_rows(&runtime.store, 1).await.len(), 1);
 
     runtime.shutdown(workers).await;

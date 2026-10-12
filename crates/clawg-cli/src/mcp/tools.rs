@@ -387,6 +387,8 @@ mod tests {
             profile: "dev".into(),
             pid: 4242,
             embedder: "loading".into(),
+            embedder_error: None,
+            embedder_retryable: None,
             uptime_s: 12,
         }
     }

@@ -116,7 +116,7 @@ Con el embedder `failed`, el save MUST responder `503` sin encolar:
 {"error": "embedder_failed", "detail": "<causa>", "retryable": true}
 ```
 
-`POST /v1/search` y `POST /v1/context` MUST distinguir `embedder_failed` de `embedder_not_ready` con el mismo cuerpo.
+`POST /v1/search` MUST distinguir `embedder_failed` de `embedder_not_ready` con el mismo cuerpo. `POST /v1/context` no responde ninguno de los dos: sin embedder cae a la recuperación léxica.
 
 #### Escenario
 - GIVEN un bootstrap cuya descarga falla
@@ -225,7 +225,7 @@ Los ids MUST servir tal cual para `delete_memory` con `kind: "memory"`.
 | R1 | `a_save_answers_201_with_the_id_of_the_row_it_wrote`, `a_multi_chunk_save_returns_one_id_per_chunk` | `crates/clawg-cli/tests/api.rs` |
 | R2 | `saving_the_same_text_twice_returns_the_same_id_as_reinforced` | `tests/api.rs` |
 | R3 | `a_failed_embed_reaches_the_caller_as_an_error`; `process_event_reports_the_rows_written_before_an_insert_failed` | `tests/api.rs`; `worker.rs` |
-| R4 | `a_save_the_worker_does_not_confirm_in_time_answers_202_unconfirmed` | `tests/api.rs` |
+| R4 | `a_save_the_worker_does_not_confirm_in_time_answers_202_unconfirmed`, `a_save_whose_reply_is_dropped_answers_202_unconfirmed` | `tests/api.rs` |
 | R5 | `a_save_while_the_model_loads_answers_202_and_lands_once_it_loads` | `tests/api.rs` |
 | R6 | `a_save_after_the_bootstrap_failed_is_503_with_the_cause`, `search_after_the_bootstrap_failed_says_failed_not_loading` | `tests/api.rs` |
 | R7 | `health_reports_failed_with_the_cause_after_a_failed_bootstrap`; `a_failed_embedder_shows_in_the_status_report` | `tests/api.rs`; `status.rs` |

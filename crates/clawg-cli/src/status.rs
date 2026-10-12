@@ -57,8 +57,24 @@ mod tests {
             profile: "dev".into(),
             pid: 4242,
             embedder: "ready".into(),
+            embedder_error: None,
+            embedder_retryable: None,
             uptime_s: 12,
         }
+    }
+
+    #[test]
+    fn a_failed_embedder_shows_in_the_status_report() {
+        let failed = Health {
+            embedder: "failed".into(),
+            embedder_error: Some("connection refused".into()),
+            embedder_retryable: Some(true),
+            ..health()
+        };
+        let v = status_report(Profile::Dev, Path::new("/x"), Some(&state()), Some(&failed));
+        assert_eq!(v["health"]["embedder"], "failed");
+        assert_eq!(v["health"]["embedder_error"], "connection refused");
+        assert_eq!(v["health"]["embedder_retryable"], true);
     }
 
     #[test]

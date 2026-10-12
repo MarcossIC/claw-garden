@@ -11,12 +11,16 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use clawg_cli::daemon::api::{router, AppCtx};
-use clawg_core::memory::embedder::Embedder;
+use clawg_cli::daemon::api::{router, AppCtx, SAVE_CONFIRM_TIMEOUT};
+use clawg_core::memory::bootstrap::EmbedderStatus;
+use clawg_core::memory::embedder::{EmbedError, EmbedRole, Embedder, FakeEmbedder};
+use clawg_core::memory::worker::IngestRequest;
 use clawg_core::paths::Profile;
-use clawg_core::runtime::MemoryRuntime;
+use clawg_core::runtime::{MemoryRuntime, INGEST_QUEUE_CAPACITY};
+use tokio::sync::mpsc::Receiver;
+
 use once_cell::sync::OnceCell;
 use serde_json::{json, Value};
 
@@ -25,13 +29,57 @@ enum EmbedderState {
     Ready,
     NeverLoaded,
     ServedEmpty,
+    /// The bootstrap gave up or is waiting to retry. No worker runs, so
+    /// whatever reaches the queue stays there for the test to see.
+    Failed { error: &'static str, retryable: bool },
+    /// The model is still loading and no worker drains the queue, so a test
+    /// can fill it.
+    LoadingWithoutWorker,
+    /// The embedder is ready but no worker runs, so no save is ever confirmed.
+    ReadyWithoutWorker,
+    /// The embedder loaded but every embedding call fails.
+    FailingEmbedder,
+    /// The embedder is ready and something takes each save off the queue but
+    /// drops its reply unanswered, as a worker spilling at shutdown does.
+    DroppingReplies,
 }
+
+/// An embedder that loaded and then fails every call, as a broken ONNX
+/// session would.
+struct FailingEmbedder;
+
+#[async_trait::async_trait]
+impl Embedder for FailingEmbedder {
+    async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+        Err(EmbedError::InferenceFailed("onnx session crashed".into()))
+    }
+    fn dimensions(&self) -> usize {
+        384
+    }
+    fn model_id(&self) -> &str {
+        "failing"
+    }
+    fn query_prefix(&self) -> &str {
+        ""
+    }
+    fn passage_prefix(&self) -> &str {
+        ""
+    }
+}
+
+/// How long a test daemon waits for the worker to confirm a save when the
+/// test is about the wait running out.
+const SHORT_CONFIRM_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Swaps in a fresh, EMPTY embedder cell while moving every other handle
 /// across untouched — the cheapest way to reproduce a pre-bootstrap daemon
 /// without a second constructor in core.
-fn with_empty_embedder(runtime: MemoryRuntime) -> MemoryRuntime {
-    MemoryRuntime { embedder: Arc::new(OnceCell::<Arc<dyn Embedder>>::new()), ..runtime }
+fn with_empty_embedder(runtime: MemoryRuntime, status: EmbedderStatus) -> MemoryRuntime {
+    MemoryRuntime {
+        embedder: Arc::new(OnceCell::<Arc<dyn Embedder>>::new()),
+        embedder_status: tokio::sync::watch::Sender::new(status),
+        ..runtime
+    }
 }
 
 /// A live daemon on a loopback port, plus everything a test needs to talk to it.
@@ -40,6 +88,9 @@ struct Harness {
     token: String,
     http: reqwest::Client,
     ctx: Arc<AppCtx>,
+    /// The queue's consumer end when no worker drains it, held so the queue
+    /// stays open.
+    _ingest_rx: Option<Receiver<IngestRequest>>,
     // Held so the temporary data directory outlives the server.
     _dir: tempfile::TempDir,
 }
@@ -64,28 +115,81 @@ impl Harness {
         Self::start_inner(EmbedderState::ServedEmpty).await
     }
 
+    /// Daemon whose bootstrap failed with `error`.
+    async fn start_failed(error: &'static str, retryable: bool) -> Self {
+        Self::start_inner(EmbedderState::Failed { error, retryable }).await
+    }
+
+    /// Daemon with a ready embedder whose saves are never confirmed.
+    async fn start_without_worker() -> Self {
+        Self::start_inner(EmbedderState::ReadyWithoutWorker).await
+    }
+
+    /// Daemon whose saves are taken off the queue and never answered.
+    async fn start_dropping_replies() -> Self {
+        Self::start_inner(EmbedderState::DroppingReplies).await
+    }
+
+    /// Daemon whose embedder fails every call.
+    async fn start_with_failing_embedder() -> Self {
+        Self::start_inner(EmbedderState::FailingEmbedder).await
+    }
+
+    /// Daemon whose model is loading, with an undrained queue of `capacity`.
+    async fn start_loading_with_queue(capacity: usize) -> Self {
+        Self::start_with(EmbedderState::LoadingWithoutWorker, capacity).await
+    }
+
     async fn start_inner(embedder: EmbedderState) -> Self {
+        Self::start_with(embedder, INGEST_QUEUE_CAPACITY).await
+    }
+
+    async fn start_with(embedder: EmbedderState, capacity: usize) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (runtime, rx) = MemoryRuntime::new_for_test(dir.path().to_path_buf()).await;
+        let (runtime, rx) =
+            MemoryRuntime::new_for_test_with_capacity(dir.path().to_path_buf(), capacity).await;
 
         // The ingest worker is what turns a queued event into a row. Without
         // it `POST /v1/memories` would answer 202 forever and nothing would
         // ever land, which is exactly the bug these tests exist to catch. It
         // clones its handles when it is created, so what it holds is whatever
         // the runtime had at that moment.
-        let runtime = match embedder {
+        let save_timeout = match embedder {
+            EmbedderState::ReadyWithoutWorker => SHORT_CONFIRM_TIMEOUT,
+            _ => SAVE_CONFIRM_TIMEOUT,
+        };
+        let (runtime, ingest_rx) = match embedder {
             EmbedderState::Ready => {
                 tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
-                runtime
+                (runtime, None)
             }
             EmbedderState::NeverLoaded => {
-                let runtime = with_empty_embedder(runtime);
+                let runtime = with_empty_embedder(runtime, EmbedderStatus::Loading);
                 tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
-                runtime
+                (runtime, None)
             }
             EmbedderState::ServedEmpty => {
                 tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
-                with_empty_embedder(runtime)
+                (with_empty_embedder(runtime, EmbedderStatus::Loading), None)
+            }
+            EmbedderState::Failed { error, retryable } => {
+                let status = EmbedderStatus::Failed { error: error.into(), retryable };
+                (with_empty_embedder(runtime, status), Some(rx))
+            }
+            EmbedderState::LoadingWithoutWorker => {
+                (with_empty_embedder(runtime, EmbedderStatus::Loading), Some(rx))
+            }
+            EmbedderState::ReadyWithoutWorker => (runtime, Some(rx)),
+            EmbedderState::FailingEmbedder => {
+                let runtime = with_empty_embedder(runtime, EmbedderStatus::Ready);
+                runtime.embedder.set(Arc::new(FailingEmbedder) as Arc<dyn Embedder>).ok();
+                tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
+                (runtime, None)
+            }
+            EmbedderState::DroppingReplies => {
+                let mut rx = rx;
+                tokio::spawn(async move { while rx.recv().await.is_some() {} });
+                (runtime, None)
             }
         };
 
@@ -97,6 +201,7 @@ impl Harness {
             profile: Profile::Dev,
             started_at: Instant::now(),
             shutdown,
+            save_timeout,
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -108,7 +213,7 @@ impl Harness {
             let _ = axum::serve(listener, app).await;
         });
 
-        Self { addr, token, http: reqwest::Client::new(), ctx, _dir: dir }
+        Self { addr, token, http: reqwest::Client::new(), ctx, _ingest_rx: ingest_rx, _dir: dir }
     }
 
     fn url(&self, path: &str) -> String {
@@ -172,6 +277,8 @@ async fn health_answers_without_a_token() {
     assert_eq!(body["status"], "ok");
     assert_eq!(body["profile"], "dev");
     assert_eq!(body["embedder"], "ready");
+    assert!(body["embedder_error"].is_null());
+    assert!(body["embedder_retryable"].is_null());
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(body["pid"], std::process::id());
     assert!(body["uptime_s"].is_u64());
@@ -188,6 +295,31 @@ async fn health_reports_loading_while_the_embedder_cell_is_empty() {
     let body: Value = r.json().await.expect("json");
     assert_eq!(body["status"], "ok");
     assert_eq!(body["embedder"], "loading");
+    assert!(body["embedder_error"].is_null());
+    assert!(body["embedder_retryable"].is_null());
+}
+
+#[tokio::test]
+async fn health_reports_failed_with_the_cause_after_a_failed_bootstrap() {
+    let h = Harness::start_failed("download failed: connection refused", true).await;
+    let r = h.http.get(h.url("/health")).send().await.expect("request");
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.expect("json");
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["embedder"], "failed");
+    assert!(
+        body["embedder_error"].as_str().is_some_and(|e| e.contains("connection refused")),
+        "got {body}"
+    );
+    assert_eq!(body["embedder_retryable"], true);
+}
+
+#[tokio::test]
+async fn health_reports_a_contract_mismatch_as_not_retryable() {
+    let h = Harness::start_failed("embedding contract mismatch (dim)", false).await;
+    let body: Value = h.http.get(h.url("/health")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(body["embedder"], "failed");
+    assert_eq!(body["embedder_retryable"], false);
 }
 
 // ── Auth ────────────────────────────────────────────────────────────────────
@@ -244,12 +376,73 @@ async fn a_non_bearer_authorization_header_is_unauthorized() {
     assert_eq!(r.status(), 401);
 }
 
+// ── Save while the embedder is not ready ────────────────────────────────────
+
+const FAILED_CAUSE: &str = "download failed: connection refused";
+
+#[tokio::test]
+async fn a_save_after_the_bootstrap_failed_is_503_with_the_cause() {
+    let h = Harness::start_failed(FAILED_CAUSE, true).await;
+    let (status, body) = h
+        .post_json("/v1/memories", json!({ "content": "not stored", "agent_id": "a" }))
+        .await;
+
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"], "embedder_failed");
+    assert_eq!(body["detail"], FAILED_CAUSE);
+    assert_eq!(body["retryable"], true);
+    let tx = &h.ctx.runtime.memory_tx;
+    assert_eq!(tx.capacity(), tx.max_capacity(), "a refused save must not reach the queue");
+}
+
+#[tokio::test]
+async fn search_after_the_bootstrap_failed_says_failed_not_loading() {
+    let h = Harness::start_failed(FAILED_CAUSE, false).await;
+    let (status, body) = h
+        .post_json("/v1/search", json!({ "query": "anything", "agent_id": "a" }))
+        .await;
+
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"], "embedder_failed");
+    assert_eq!(body["detail"], FAILED_CAUSE);
+    assert_eq!(body["retryable"], false);
+}
+
+#[tokio::test]
+async fn a_save_while_the_model_loads_answers_202_and_lands_once_it_loads() {
+    let h = Harness::start_without_embedder().await;
+    let (status, body) = h
+        .post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "agent-http" }))
+        .await;
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(body["status"], "queued");
+    assert_eq!(body["reason"], "embedder_loading");
+
+    h.ctx.runtime.embedder.set(Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>).ok();
+
+    let items = h.wait_for_rows("memory", 1).await;
+    assert_eq!(items[0]["summary"], CONTENT);
+}
+
+#[tokio::test]
+async fn a_save_into_a_full_queue_is_503_queue_full() {
+    let h = Harness::start_loading_with_queue(2).await;
+    let save = |n: u32| h.post_json("/v1/memories", json!({ "content": format!("save {n}"), "agent_id": "a" }));
+
+    assert_eq!(save(1).await.0, 202);
+    assert_eq!(save(2).await.0, 202);
+    let (status, body) = save(3).await;
+
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"], "ingest_queue_full");
+}
+
 // ── Save → list → search → context → patch → delete ─────────────────────────
 
 const CONTENT: &str = "the deployment pipeline uses blue green releases on fridays";
 
 #[tokio::test]
-async fn a_saved_memory_is_queued_then_becomes_a_listable_row() {
+async fn a_saved_memory_is_a_listable_row_when_the_save_returns() {
     let h = Harness::start().await;
 
     let (status, body) = h
@@ -263,10 +456,13 @@ async fn a_saved_memory_is_queued_then_becomes_a_listable_row() {
             }),
         )
         .await;
-    assert_eq!(status, 202, "save must be accepted, not completed: {body}");
-    assert_eq!(body["status"], "queued");
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["status"], "saved");
 
-    let items = h.wait_for_rows("memory", 1).await;
+    let (status, list) = h.get_json("/v1/memories?kind=memory").await;
+    assert_eq!(status, 200);
+    let items = list["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "the row must exist by the time the save answers");
     let row = &items[0];
     assert_eq!(row["kind"], "memory");
     assert_eq!(row["agent_id"], "agent-http");
@@ -276,6 +472,100 @@ async fn a_saved_memory_is_queued_then_becomes_a_listable_row() {
         "an explicit save must honour the caller's declared type"
     );
     assert_eq!(row["importance"], 8.0);
+}
+
+#[tokio::test]
+async fn a_save_answers_201_with_the_id_of_the_row_it_wrote() {
+    let h = Harness::start().await;
+    let (status, body) = h
+        .post_json("/v1/memories", json!({ "content": "the train leaves on tuesdays", "agent_id": "a" }))
+        .await;
+
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["status"], "saved");
+    let memories = body["memories"].as_array().expect("memories");
+    assert_eq!(memories.len(), 1);
+    assert_eq!(memories[0]["kind"], "memory");
+    assert_eq!(memories[0]["outcome"], "inserted");
+    let id = memories[0]["id"].as_i64().expect("id");
+
+    let (status, item) = h.get_json(&format!("/v1/memories/memory/{id}")).await;
+    assert_eq!(status, 200, "{item}");
+    assert_eq!(item["item"]["summary"], "the train leaves on tuesdays");
+}
+
+#[tokio::test]
+async fn a_multi_chunk_save_returns_one_id_per_chunk() {
+    let h = Harness::start().await;
+    // Distinct words, long enough for three windows of the fallback chunker.
+    let content = (0..700).map(|i| format!("w{i:05}")).collect::<Vec<_>>().join(" ");
+    let (status, body) = h.post_json("/v1/memories", json!({ "content": content, "agent_id": "a" })).await;
+
+    assert_eq!(status, 201, "{body}");
+    let memories = body["memories"].as_array().expect("memories");
+    assert_eq!(memories.len(), 3, "{body}");
+    assert!(memories.iter().all(|m| m["outcome"] == "inserted"));
+    let mut ids: Vec<i64> = memories.iter().map(|m| m["id"].as_i64().unwrap()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 3, "each chunk has its own row: {body}");
+}
+
+#[tokio::test]
+async fn saving_the_same_text_twice_returns_the_same_id_as_reinforced() {
+    let h = Harness::start().await;
+    let save = || h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a" }));
+
+    let (_, first) = save().await;
+    let (status, second) = save().await;
+
+    assert_eq!(status, 201, "{second}");
+    assert_eq!(second["memories"].as_array().map(Vec::len), Some(1));
+    assert_eq!(second["memories"][0]["id"], first["memories"][0]["id"]);
+    assert_eq!(second["memories"][0]["outcome"], "reinforced");
+    let (_, list) = h.get_json("/v1/memories?kind=memory").await;
+    assert_eq!(list["items"].as_array().map(Vec::len), Some(1));
+}
+
+#[tokio::test]
+async fn a_failed_embed_reaches_the_caller_as_an_error() {
+    let h = Harness::start_with_failing_embedder().await;
+    let (status, body) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a" })).await;
+
+    assert_eq!(status, 500, "{body}");
+    assert_eq!(body["error"], "ingest_failed");
+    assert!(body["detail"].as_str().is_some_and(|d| d.contains("onnx session crashed")), "{body}");
+    assert_eq!(body["memories"], json!([]));
+    let (_, list) = h.get_json("/v1/memories?kind=memory").await;
+    assert_eq!(list["items"].as_array().map(Vec::len), Some(0));
+}
+
+#[tokio::test]
+async fn a_save_the_worker_does_not_confirm_in_time_answers_202_unconfirmed() {
+    let h = Harness::start_without_worker().await;
+    let started = Instant::now();
+    let (status, body) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a" })).await;
+
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(body["status"], "queued");
+    assert_eq!(body["reason"], "unconfirmed");
+    assert!(started.elapsed() < Duration::from_secs(1), "took {:?}", started.elapsed());
+}
+
+#[tokio::test]
+async fn a_save_whose_reply_is_dropped_answers_202_unconfirmed() {
+    let h = Harness::start_dropping_replies().await;
+    let started = Instant::now();
+    let (status, body) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a" })).await;
+
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(body["status"], "queued");
+    assert_eq!(body["reason"], "unconfirmed");
+    assert!(
+        started.elapsed() < SAVE_CONFIRM_TIMEOUT / 2,
+        "a dropped reply must not wait out the confirmation timeout: took {:?}",
+        started.elapsed()
+    );
 }
 
 #[tokio::test]

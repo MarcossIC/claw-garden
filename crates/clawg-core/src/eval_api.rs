@@ -21,7 +21,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use serde::Serialize;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 
 use crate::memory::access::AccessTracker;
@@ -38,10 +38,10 @@ use crate::memory::score::{ImportanceFactor, ScoringConfig};
 use crate::memory::search::{search_all_memories_with_scoring, SearchScope};
 use crate::memory::store_insert::{CreatedByType, MemoryType, NewMemoryRecord};
 use crate::memory::store_lock::StoreHolder;
-use crate::memory::worker::{memory_worker, resolve_tokenizer_and_chunker};
+use crate::memory::worker::{memory_worker, resolve_tokenizer_and_chunker, IngestRequest};
 use crate::memory::TableKind;
 use crate::models::chat::Role;
-use crate::runtime::MemoryRuntime;
+use crate::runtime::{MemoryRuntime, INGEST_QUEUE_CAPACITY};
 
 /// Opaque handle to a memory store. Every operation available on it is a
 /// method below — the wrapped store itself is never reachable.
@@ -438,7 +438,7 @@ impl EvalEmbedder {
 /// (`MemorySource::Explicit`, user role), and the same `memory_worker`
 /// drains them.
 pub struct EvalIngest {
-    tx: UnboundedSender<MemoryEvent>,
+    tx: Sender<IngestRequest>,
     worker: JoinHandle<Vec<MemoryEvent>>,
     runtime: MemoryRuntime,
 }
@@ -460,7 +460,7 @@ impl EvalIngest {
         let _ = runtime.embedder.set(embedder.0.clone());
         runtime.access_tracker = Arc::new(AccessTracker::inert());
 
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<MemoryEvent>();
+        let (tx, rx) = tokio::sync::mpsc::channel(INGEST_QUEUE_CAPACITY);
         let chat_chunker = resolve_tokenizer_and_chunker(tokenizer_dir, &runtime.tokenizer);
         let worker = tokio::spawn(memory_worker(
             rx,
@@ -478,7 +478,10 @@ impl EvalIngest {
     /// Queues one explicit save. `memory_type` is validated here, up front: the
     /// worker would quietly fall back to `semantic_fact` for a typo, and a
     /// golden-set row must not be measured as something it never declared.
-    pub fn send(
+    ///
+    /// Waits for room when the queue is full: a measurement loads its whole
+    /// set before reading, and refusing a row would measure a smaller set.
+    pub async fn send(
         &self,
         agent_id: &str,
         content: &str,
@@ -501,7 +504,9 @@ impl EvalIngest {
                 timestamp_ms,
                 memory_type: Some(memory_type.to_string()),
                 importance: Some(importance),
-            })
+            }
+            .into())
+            .await
             .map_err(|_| EvalError::Insert("the ingest worker has stopped".to_string()))
     }
 
@@ -996,6 +1001,7 @@ mod tests {
         for i in 0..5 {
             ingest
                 .send("agent-ingest", &format!("distinct memory number {i} about the ingest drain"), "chat_message", 3.0)
+                .await
                 .unwrap();
         }
 
@@ -1012,7 +1018,7 @@ mod tests {
     async fn ingest_honours_the_declared_type_and_importance() {
         let dir = tempfile::tempdir().unwrap();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
-        ingest.send("agent-ingest", "always answer in rioplatense spanish", "user_preference", 9.5).unwrap();
+        ingest.send("agent-ingest", "always answer in rioplatense spanish", "user_preference", 9.5).await.unwrap();
 
         let runtime = ingest.finish().await.unwrap();
 
@@ -1028,7 +1034,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
 
-        match ingest.send("agent-ingest", "content", "not_a_real_type", 3.0) {
+        match ingest.send("agent-ingest", "content", "not_a_real_type", 3.0).await {
             Err(EvalError::UnknownMemoryType(t)) => assert_eq!(t, "not_a_real_type"),
             other => panic!("expected UnknownMemoryType, got {other:?}"),
         }
@@ -1056,7 +1062,7 @@ mod tests {
     async fn ingest_runtime_never_records_access() {
         let dir = tempfile::tempdir().unwrap();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
-        ingest.send("agent-ingest", "a single row whose access count must not move", "chat_message", 3.0).unwrap();
+        ingest.send("agent-ingest", "a single row whose access count must not move", "chat_message", 3.0).await.unwrap();
         let runtime = ingest.finish().await.unwrap();
         let id: i64 = runtime
             .store

@@ -30,7 +30,7 @@ use rmcp::{tool, tool_handler, tool_router, Peer, RoleServer, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::client::{ClientError, DaemonClient, ListArgs, SaveArgs, SearchArgs};
+use crate::client::{ClientError, DaemonClient, ListArgs, SaveArgs, SaveOutcome, SearchArgs};
 use crate::mcp::startup::ClientHandle;
 use crate::mcp::tools::{
     format_context, format_rows, format_search, format_status, resolve_project_id,
@@ -222,22 +222,82 @@ impl ClawgMcp {
 
     /// Turns a client failure into the sentence a model should act on.
     ///
-    /// The two cases worth distinguishing are the two a caller can do something
-    /// about: a daemon that is not up (tell the user to start one) and an
-    /// embedder that is not ready yet (wait and retry). Everything else is one
-    /// message, because the model's next move is the same either way.
+    /// The cases worth distinguishing are the ones a caller can do something
+    /// about: a daemon that is not up (tell the user to start one), an
+    /// embedder that is not ready yet (wait and retry) and one that failed to
+    /// load (search is out until it does). Everything else is one message,
+    /// because the model's next move is the same either way.
     fn explain(err: &ClientError) -> String {
         match err {
             ClientError::NotRunning | ClientError::StartTimeout(_) => {
                 "no clawg daemon is running; start one with `clawg serve` and try again"
                     .to_string()
             }
-            ClientError::Daemon { status: 503, message } if message == "embedder_not_ready" => {
+            ClientError::Daemon { status: 503, message, .. } if message == "embedder_not_ready" => {
                 "the memory index is still loading its embedding model; \
                  saving works now, and search will work in a minute"
                     .to_string()
             }
+            ClientError::Daemon { message, details, .. } if message == "embedder_failed" => {
+                format!(
+                    "the memory index could not load its embedding model ({}); search and \
+                     saving are unavailable {}",
+                    details.detail.as_deref().unwrap_or("no cause given"),
+                    if details.retryable == Some(true) {
+                        "until clawg's retry succeeds"
+                    } else {
+                        "until the cause is fixed"
+                    }
+                )
+            }
             other => other.to_string(),
+        }
+    }
+
+    /// What `save_memory` tells the model: `Ok` is a success result, `Err` an
+    /// error result. Every id it names is one `delete_memory` takes with
+    /// `kind: "memory"`.
+    fn save_outcome_text(result: Result<SaveOutcome, ClientError>) -> Result<String, String> {
+        let ids = |memories: &[crate::client::SavedMemory]| {
+            memories.iter().map(|m| format!("#{}", m.id)).collect::<Vec<_>>().join(", ")
+        };
+        match result {
+            Ok(SaveOutcome::Saved { memories }) => Ok(match memories.as_slice() {
+                [one] if one.outcome == "reinforced" => {
+                    format!("already stored as #{}; reinforced it instead of saving a copy", one.id)
+                }
+                [one] => format!("saved #{}", one.id),
+                many => format!("saved as {} pieces: {}", many.len(), ids(many)),
+            }),
+            Ok(SaveOutcome::Queued { reason }) if reason.as_deref() == Some("embedder_loading") => {
+                Ok("accepted; it will be stored once the embedding model finishes loading".into())
+            }
+            Ok(SaveOutcome::Queued { .. }) => Ok(
+                "accepted but not confirmed yet; check with list_memories before relying on it".into(),
+            ),
+            Err(ClientError::Daemon { message, details, .. }) if message == "embedder_failed" => {
+                let mut text = format!(
+                    "not saved: the embedding model failed to load ({})",
+                    details.detail.as_deref().unwrap_or("no cause given")
+                );
+                if details.retryable == Some(true) {
+                    text.push_str("; clawg will retry");
+                }
+                Err(text)
+            }
+            Err(ClientError::Daemon { message, .. }) if message == "ingest_queue_full" => {
+                Err("not saved: the ingest queue is full; try again shortly".into())
+            }
+            Err(ClientError::Daemon { message, details, .. })
+                if message == "ingest_failed" || message == "embedder_unavailable" =>
+            {
+                let mut text = format!("not saved: {}", details.detail.unwrap_or(message));
+                if !details.memories.is_empty() {
+                    text.push_str(&format!("; partially saved as {}", ids(&details.memories)));
+                }
+                Err(text)
+            }
+            Err(other) => Err(Self::explain(&other)),
         }
     }
 
@@ -263,7 +323,7 @@ impl ClawgMcp {
             Ok(c) => c,
             Err(failure) => return Ok(failure),
         };
-        match client
+        let result = client
             .save(SaveArgs {
                 content: args.content,
                 agent_id: agent_id.to_string(),
@@ -271,13 +331,13 @@ impl ClawgMcp {
                 memory_type: args.memory_type,
                 importance: args.importance,
             })
-            .await
-        {
-            // "queued", not "saved": the row does not exist yet, and telling a
-            // model otherwise invites it to search for something that is still
-            // in a channel.
-            Ok(()) => Self::ok("queued"),
-            Err(e) => Self::failed(Self::explain(&e)),
+            .await;
+        // "saved" only when the daemon confirmed the rows exist: telling a
+        // model otherwise invites it to search for something still in a
+        // channel.
+        match Self::save_outcome_text(result) {
+            Ok(text) => Self::ok(text),
+            Err(text) => Self::failed(text),
         }
     }
 
@@ -395,7 +455,8 @@ impl ClawgMcp {
                        made. Save one fact per call, in a few sentences: a long text is split \
                        into separate pieces that are found independently and never reassembled. \
                        Write the content so it still makes sense months from now, with no \
-                       conversation around it. Returns once the memory is queued."
+                       conversation around it. Returns the id of each stored piece, which \
+                       delete_memory accepts, or why nothing was stored."
     )]
     async fn save_memory(
         &self,
@@ -503,15 +564,23 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use clawg_core::memory::bootstrap::EmbedderStatus;
     use clawg_core::runtime::MemoryRuntime;
 
-    use crate::daemon::api::{router, AppCtx};
+    use crate::client::{ErrorDetails, SaveOutcome, SavedMemory};
+    use crate::daemon::api::{router, AppCtx, SAVE_CONFIRM_TIMEOUT};
     use crate::mcp::tools::CONTENT_PREVIEW_LIMIT;
 
     /// Brings up an in-process daemon and returns a bridge pointed at it.
     async fn bridge() -> (ClawgMcp, tempfile::TempDir) {
+        bridge_with(|runtime| runtime).await
+    }
+
+    /// [`bridge`] over a runtime that `adjust` changed first.
+    async fn bridge_with(adjust: impl FnOnce(MemoryRuntime) -> MemoryRuntime) -> (ClawgMcp, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let (runtime, rx) = MemoryRuntime::new_for_test(dir.path().to_path_buf()).await;
+        let runtime = adjust(runtime);
         tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
 
         let token = "mcp-test-token".to_string();
@@ -522,6 +591,7 @@ mod tests {
             profile: Profile::Dev,
             started_at: Instant::now(),
             shutdown,
+            save_timeout: SAVE_CONFIRM_TIMEOUT,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr: SocketAddr = listener.local_addr().expect("addr");
@@ -754,7 +824,7 @@ mod tests {
     // ── end to end against a real daemon ────────────────────────────────────
 
     #[tokio::test]
-    async fn save_then_list_then_search_then_delete_through_the_tools() {
+    async fn save_memory_returns_the_id_that_delete_memory_accepts() {
         let (b, _d) = bridge().await;
         let content = "the team deploys on tuesdays and never on fridays";
 
@@ -771,28 +841,24 @@ mod tests {
             .await
             .expect("save");
         assert!(!is_error(&saved), "save failed: {}", text(&saved));
-        assert!(text(&saved).contains("queued"), "text was: {}", text(&saved));
+        let id: i64 = text(&saved)
+            .strip_prefix("saved #")
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("expected `saved #<id>`, got: {}", text(&saved)));
 
-        // Ingest is asynchronous by contract.
-        let mut listed = String::new();
-        for _ in 0..40 {
-            let r = b
-                .list_memories_impl(ListMemoriesArgs {
-                    kind: Some("memory".into()),
-                    tier: None,
-                    memory_type: None,
-                    limit: None,
-                    offset: None,
-                })
-                .await
-                .expect("list");
-            listed = text(&r);
-            if listed.contains(content) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(listed.contains(content), "the saved memory never appeared: {listed}");
+        let listed = b
+            .list_memories_impl(ListMemoriesArgs {
+                kind: Some("memory".into()),
+                tier: None,
+                memory_type: None,
+                limit: None,
+                offset: None,
+            })
+            .await
+            .expect("list");
+        let listed = text(&listed);
+        assert!(listed.contains(content), "the saved memory must be listable at once: {listed}");
+        assert!(listed.contains(&format!("#{id}")), "the listing must show the saved id: {listed}");
 
         let found = b
             .search_memory_impl(
@@ -809,20 +875,134 @@ mod tests {
         assert!(!is_error(&found), "search failed: {}", text(&found));
         assert!(text(&found).contains(content), "text was: {}", text(&found));
 
-        // The id the model would read off the listing is the id delete takes.
-        let id: i64 = listed
-            .split_whitespace()
-            .next()
-            .and_then(|first| first.strip_prefix('#'))
-            .and_then(|n| n.parse().ok())
-            .expect("the listing must lead with a parseable #id");
-
         let deleted = b
             .delete_memory_impl(DeleteMemoryArgs { id, kind: "memory".into() })
             .await
             .expect("delete");
         assert!(!is_error(&deleted), "delete failed: {}", text(&deleted));
         assert!(text(&deleted).contains("deleted"), "text was: {}", text(&deleted));
+    }
+
+    #[tokio::test]
+    async fn save_memory_is_an_error_when_the_embedder_failed() {
+        let (b, _d) = bridge_with(|runtime| MemoryRuntime {
+            embedder: Arc::new(once_cell::sync::OnceCell::new()),
+            embedder_status: tokio::sync::watch::Sender::new(EmbedderStatus::Failed {
+                error: "download failed: connection refused".into(),
+                retryable: true,
+            }),
+            ..runtime
+        })
+        .await;
+
+        let r = b
+            .save_memory_impl(
+                "agent-mcp",
+                SaveMemoryArgs {
+                    content: "not stored".into(),
+                    memory_type: None,
+                    importance: None,
+                    project_path: None,
+                },
+            )
+            .await
+            .expect("save");
+
+        assert!(is_error(&r), "text was: {}", text(&r));
+        assert!(text(&r).contains("connection refused"), "text was: {}", text(&r));
+    }
+
+    fn daemon_error(status: u16, message: &str, details: ErrorDetails) -> ClientError {
+        ClientError::Daemon { status, message: message.into(), details }
+    }
+
+    fn saved(id: i64, outcome: &str) -> SavedMemory {
+        SavedMemory { kind: "memory".into(), id, outcome: outcome.into() }
+    }
+
+    #[test]
+    fn save_outcome_text_covers_every_daemon_answer() {
+        let text = |r| ClawgMcp::save_outcome_text(r);
+        assert_eq!(
+            text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "inserted")] })),
+            Ok("saved #57".to_string())
+        );
+        assert_eq!(
+            text(Ok(SaveOutcome::Saved {
+                memories: vec![saved(57, "inserted"), saved(58, "inserted"), saved(59, "reinforced")]
+            })),
+            Ok("saved as 3 pieces: #57, #58, #59".to_string())
+        );
+        assert_eq!(
+            text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "reinforced")] })),
+            Ok("already stored as #57; reinforced it instead of saving a copy".to_string())
+        );
+        assert_eq!(
+            text(Ok(SaveOutcome::Queued { reason: Some("unconfirmed".into()) })),
+            Ok("accepted but not confirmed yet; check with list_memories before relying on it".to_string())
+        );
+        assert_eq!(
+            text(Ok(SaveOutcome::Queued { reason: Some("embedder_loading".into()) })),
+            Ok("accepted; it will be stored once the embedding model finishes loading".to_string())
+        );
+        assert_eq!(
+            text(Err(daemon_error(
+                503,
+                "embedder_failed",
+                ErrorDetails { detail: Some("connection refused".into()), retryable: Some(true), memories: vec![] },
+            ))),
+            Err("not saved: the embedding model failed to load (connection refused); clawg will retry".to_string())
+        );
+        assert_eq!(
+            text(Err(daemon_error(
+                503,
+                "embedder_failed",
+                ErrorDetails { detail: Some("contract mismatch".into()), retryable: Some(false), memories: vec![] },
+            ))),
+            Err("not saved: the embedding model failed to load (contract mismatch)".to_string())
+        );
+        assert_eq!(
+            text(Err(daemon_error(
+                500,
+                "ingest_failed",
+                ErrorDetails {
+                    detail: Some("store insert failed: disk full".into()),
+                    retryable: None,
+                    memories: vec![saved(57, "inserted")],
+                },
+            ))),
+            Err("not saved: store insert failed: disk full; partially saved as #57".to_string())
+        );
+        assert_eq!(
+            text(Err(daemon_error(503, "embedder_unavailable", ErrorDetails::default()))),
+            Err("not saved: embedder_unavailable".to_string())
+        );
+        assert_eq!(
+            text(Err(daemon_error(503, "ingest_queue_full", ErrorDetails::default()))),
+            Err("not saved: the ingest queue is full; try again shortly".to_string())
+        );
+        for answer in [
+            text(Ok(SaveOutcome::Queued { reason: None })),
+            text(Ok(SaveOutcome::Queued { reason: Some("unconfirmed".into()) })),
+        ] {
+            let t = answer.unwrap();
+            assert!(!t.split(|c: char| !c.is_alphanumeric()).any(|w| w == "queued"), "{t}");
+        }
+    }
+
+    #[test]
+    fn explain_does_not_promise_search_when_the_embedder_failed() {
+        let failed = daemon_error(
+            503,
+            "embedder_failed",
+            ErrorDetails { detail: Some("connection refused".into()), retryable: Some(true), memories: vec![] },
+        );
+        let t = ClawgMcp::explain(&failed);
+        assert!(!t.contains("in a minute"), "{t}");
+        assert!(t.contains("connection refused"), "{t}");
+
+        let loading = daemon_error(503, "embedder_not_ready", ErrorDetails::default());
+        assert!(ClawgMcp::explain(&loading).contains("loading"));
     }
 
     #[tokio::test]

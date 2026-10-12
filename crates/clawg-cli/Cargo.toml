@@ -66,6 +66,8 @@ libc = "0.2"
 
 [dev-dependencies]
 clawg-core = { workspace = true, features = ["testing"] }
+# Implements an `Embedder` that fails, to reach the save's error path.
+async-trait.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 # Lets a test swap a MemoryRuntime's embedder cell for an empty one, which is

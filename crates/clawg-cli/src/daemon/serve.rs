@@ -10,13 +10,13 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use clawg_core::memory::bootstrap::{production_deps, run_embedder_bootstrap, LogSink};
+use clawg_core::memory::bootstrap::{production_deps, run_embedder_bootstrap_with_retry, LogSink};
 use clawg_core::memory::store_lock::StoreHolder;
 use clawg_core::memory::MemoryError;
 use clawg_core::paths::{data_dir, PathsError, Profile};
 use clawg_core::runtime::{MemoryRuntime, Workers};
 
-use super::api::{router, AppCtx};
+use super::api::{router, AppCtx, SAVE_CONFIRM_TIMEOUT};
 use super::lifecycle::{
     clear_state, generate_token, now_ms, write_state, write_token, DaemonState, LifecycleError,
 };
@@ -83,14 +83,17 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
 
     // Background, never awaited: the model may not be on disk yet, and the
     // daemon must answer `/health` and accept saves throughout the download.
+    // A failed download is retried until the network comes back.
     let (ensure, load, verify) = production_deps(runtime.store.clone());
-    tokio::spawn(run_embedder_bootstrap(
+    tokio::spawn(run_embedder_bootstrap_with_retry(
         base_dir.clone(),
         runtime.embedder.clone(),
+        runtime.embedder_status.clone(),
         Arc::new(LogSink),
         ensure,
         load,
         verify,
+        tokio::time::sleep,
     ));
     // The single ingest spawn site for this process.
     let (drain, drain_rx) = tokio::sync::watch::channel(None);
@@ -130,6 +133,7 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
         profile,
         started_at: Instant::now(),
         shutdown: shutdown_tx,
+        save_timeout: SAVE_CONFIRM_TIMEOUT,
     });
 
     log::info!(
