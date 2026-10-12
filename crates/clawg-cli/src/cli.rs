@@ -61,6 +61,12 @@ pub enum Command {
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// List the stored memories that hold a secret of a known format, by id
+    /// and kind, never the secret. Read-only; works with the daemon running.
+    Secrets {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
     /// Report which `clawg` executables the PATH resolves to and whether this
     /// one is the one a terminal runs. Exits 1 if shadowed or duplicated.
     Doctor {
@@ -423,6 +429,18 @@ mod tests {
             }
         );
         assert!(Cli::try_parse_from(["clawg", "restore"]).is_err(), "the file is required");
+    }
+
+    #[test]
+    fn secrets_takes_only_a_profile() {
+        assert_eq!(
+            parse(&["clawg", "secrets"]).command,
+            Command::Secrets { profile: ProfileArg { profile: None } }
+        );
+        assert_eq!(
+            parse(&["clawg", "secrets", "--profile", "dev"]).command,
+            Command::Secrets { profile: ProfileArg { profile: Some("dev".into()) } }
+        );
     }
 
     #[test]

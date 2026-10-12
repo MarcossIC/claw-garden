@@ -35,6 +35,7 @@ pub mod memories;
 pub mod process;
 pub mod relevance;
 pub mod restore;
+pub mod secrets;
 pub mod status;
 pub mod stop;
 pub mod user_path;
