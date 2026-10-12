@@ -2,6 +2,7 @@
 //! the AUTO section is regenerated from DB queries, the USER section is
 //! preserved byte-for-byte.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -41,7 +42,7 @@ impl WorkspaceManager {
     /// Resolves the on-disk path. Pure — no I/O.
     pub fn workspace_path(&self, agent_id: &str, project_id: Option<&str>) -> PathBuf {
         self.workspaces_root
-            .join(agent_id)
+            .join(workspace_segment(agent_id).as_ref())
             .join(project_id.unwrap_or(DEFAULT_PROJECT_SEGMENT))
             .join("workspace.md")
     }
@@ -63,11 +64,11 @@ impl WorkspaceManager {
             Err(e) => return Err(io_err(&self.workspaces_root)(e)),
         };
         while let Some(agent) = agents.next_entry().await.map_err(io_err(&self.workspaces_root))? {
-            let Some(agent_id) = agent.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            let from = self.workspace_path(&agent_id, Some(legacy_id));
-            let to = self.workspace_path(&agent_id, Some(project_id));
+            // Already a segment on disk: going through `workspace_path` would
+            // encode an encoded name a second time.
+            let agent_dir = agent.path();
+            let from = agent_dir.join(legacy_id).join("workspace.md");
+            let to = agent_dir.join(project_id).join("workspace.md");
             let legacy = match tokio::fs::read(&from).await {
                 Ok(bytes) => bytes,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -587,6 +588,44 @@ fn assemble_file(existing: &str, auto_section: &str) -> String {
     out
 }
 
+/// The folder name of an agent's workspaces.
+///
+/// The id comes from the MCP client, so it can hold a separator or be `..`
+/// and point outside the workspaces root. A name that cannot do that is used
+/// as is, which keeps every existing folder (and the USER section written in
+/// it) where it is; any other is percent-encoded byte by byte. `%` counts as
+/// unsafe so an encoded name never equals a literal one, and the empty id,
+/// which no encoding produces, gets the lone `%`.
+fn workspace_segment(agent_id: &str) -> Cow<'_, str> {
+    fn unsafe_char(c: char) -> bool {
+        matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '%') || c.is_control()
+    }
+    fn encode(s: &str, out: &mut String) {
+        for b in s.bytes() {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    if agent_id.is_empty() {
+        return Cow::Borrowed("%");
+    }
+    let mut out = String::new();
+    if agent_id == "." || agent_id == ".." {
+        encode(agent_id, &mut out);
+        return Cow::Owned(out);
+    }
+    if !agent_id.chars().any(unsafe_char) {
+        return Cow::Borrowed(agent_id);
+    }
+    for c in agent_id.chars() {
+        if unsafe_char(c) {
+            encode(c.encode_utf8(&mut [0; 4]), &mut out);
+        } else {
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,6 +662,60 @@ mod tests {
         let read = |p| std::fs::read_to_string(ws.workspace_path("agent-a", Some(p))).unwrap();
         assert_eq!(read("repo-3c4d"), "current");
         assert_eq!(read("src-1a2b"), "legacy");
+    }
+
+    #[test]
+    fn a_safe_agent_id_is_its_own_segment() {
+        for agent in ["claude-code", "cursor", "Claude Code", "código", "agent_1.2"] {
+            assert_eq!(workspace_segment(agent), agent);
+        }
+        let ws = WorkspaceManager::new(PathBuf::from("/base/workspaces"));
+        assert_eq!(
+            ws.workspace_path("claude-code", Some("proj")),
+            PathBuf::from("/base/workspaces").join("claude-code").join("proj").join("workspace.md")
+        );
+    }
+
+    #[test]
+    fn an_unsafe_agent_id_is_encoded_inside_the_root() {
+        let root = PathBuf::from("/base/workspaces");
+        let ws = WorkspaceManager::new(root.clone());
+        for (agent, segment) in [
+            ("../escape", "..%2Fescape"),
+            ("a/b", "a%2Fb"),
+            ("a\\b", "a%5Cb"),
+            ("c:", "c%3A"),
+            ("..", "%2E%2E"),
+            (".", "%2E"),
+            ("", "%"),
+            ("50%", "50%25"),
+            ("tab\there", "tab%09here"),
+        ] {
+            assert_eq!(workspace_segment(agent), segment, "{agent:?}");
+            let path = ws.workspace_path(agent, None);
+            assert_eq!(path.parent().and_then(|p| p.parent()).and_then(|p| p.parent()), Some(root.as_path()), "{agent:?}");
+        }
+    }
+
+    #[test]
+    fn encoding_never_makes_two_agents_share_a_folder() {
+        let agents = ["a/b", "a%2Fb", "a%252Fb", "..", "%2E%2E", ".", "%2E", "", "%"];
+        let segments: HashSet<String> = agents.iter().map(|a| workspace_segment(a).into_owned()).collect();
+        assert_eq!(segments.len(), agents.len(), "{segments:?}");
+    }
+
+    #[tokio::test]
+    async fn adopting_a_legacy_workspace_keeps_an_encoded_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = WorkspaceManager::new(dir.path().to_path_buf());
+        let legacy = ws.workspace_path("team/bot", Some("src-1a2b"));
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "notes").unwrap();
+
+        ws.adopt_legacy("src-1a2b", "repo-3c4d").await.unwrap();
+
+        let adopted = ws.workspace_path("team/bot", Some("repo-3c4d"));
+        assert_eq!(std::fs::read_to_string(adopted).unwrap(), "notes");
     }
 
     #[tokio::test]

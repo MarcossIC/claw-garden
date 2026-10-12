@@ -67,9 +67,9 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
 
-        Command::Mcp { profile, no_autostart } => {
+        Command::Mcp { profile, no_autostart, agent } => {
             let profile = profile.resolve().map_err(|e| e.to_string())?;
-            mcp::run(profile, !no_autostart).await.map_err(|e| e.to_string())?;
+            mcp::run(profile, !no_autostart, agent).await.map_err(|e| e.to_string())?;
             Ok(ExitCode::SUCCESS)
         }
 

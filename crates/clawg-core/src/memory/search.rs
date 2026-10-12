@@ -4236,6 +4236,7 @@ mod tests {
             &store,
             id,
             crate::memory::admin::MemoryKind::Memory,
+            None,
         )
         .await
         .unwrap();
@@ -4282,6 +4283,7 @@ mod tests {
             &store,
             id,
             crate::memory::admin::MemoryKind::Memory,
+            None,
         )
         .await
         .unwrap();

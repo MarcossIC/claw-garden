@@ -28,13 +28,13 @@ Design documents live in `docs/`.
 ## Commands
 
 - `clawg serve [--profile P] [--port N]`: run the daemon (`--port 0` binds an ephemeral port).
-- `clawg mcp [--profile P] [--no-autostart]`: stdio MCP bridge to the daemon; starts one if none is running unless `--no-autostart`.
+- `clawg mcp [--profile P] [--no-autostart] [--agent NAME]`: stdio MCP bridge to the daemon; starts one if none is running unless `--no-autostart`. The agent id is `--agent`, else the client's `clientInfo.name`, else `mcp`.
 - `clawg status [--profile P]`: print daemon state and health as JSON; exit 1 if not running.
 - `clawg stop [--profile P]`: stop the daemon and wait for the process to exit.
 - `clawg doctor [--profile P]`: print as JSON which `clawg.exe` files the PATH resolves to; exit 1 if the first is not the running binary or a second copy exists. Does not open the store.
 - `clawg path add|remove [--dir D]`: edit the user PATH (Windows).
 
-Daemon HTTP API: `GET /health` (open) and, behind the bearer token, `POST/GET /v1/memories`, `POST /v1/search`, `POST /v1/context`, `PATCH/DELETE /v1/memories/{kind}/{id}`, `POST /v1/disputes/resolve`, `POST /v1/shutdown`.
+Daemon HTTP API: `GET /health` (open) and, behind the bearer token, `POST/GET /v1/memories`, `POST /v1/search`, `POST /v1/context`, `PATCH/DELETE /v1/memories/{kind}/{id}` (`?agent=` limits them to that agent's rows), `POST /v1/disputes/resolve` (optional `agent_id`, same scope), `POST /v1/shutdown`.
 
 MCP tools (`crates/clawg-cli/src/mcp/server.rs`): `save_memory`, `search_memory`, `recall_context`, `list_memories`, `delete_memory`, `resolve_conflict`, `memory_status`.
 

@@ -236,6 +236,18 @@ Después **abrí una sesión nueva** de Claude Code. Adentro:
 3. Pedile que guarde algo, por ejemplo: "guardá en memoria que en este proyecto usamos pnpm".
 4. En una terminal, comprobalo con el visor: `clawg memories list --here --profile prod`.
 
+### Fijar la identidad del agente
+
+Cada agente ve sólo sus propias memorias: las busca, las lista, las borra y resuelve sus conflictos, pero no los de otro. Sin configurar nada, el agente es el nombre que reporta el cliente MCP. Si el cliente cambia ese nombre, o deja de mandarlo (la versión nueva del protocolo lo vuelve opcional), lo guardado antes deja de verse.
+
+Para que no pase, fijalo con `--agent` al registrar el servidor:
+
+```powershell
+claude mcp add --scope user clawg -- "$env:LOCALAPPDATA\Programs\clawg\clawg.exe" mcp --profile prod --agent claude-code
+```
+
+Usá el mismo nombre con el que ya venías guardando, o lo anterior queda con el nombre viejo: `memory_status` dice qué agente está en uso y de dónde salió, y `clawg memories stats` cuenta las memorias por agente. Nada se borra al cambiarlo; vuelve a verse con el nombre anterior.
+
 El agente dispone de seis herramientas (ver [Herramientas MCP](#herramientas-mcp)).
 
 ## Otros clientes MCP
@@ -334,7 +346,7 @@ clawg doctor                  # a qué clawg resuelve el PATH (sale con 1 si hay
 clawg memories list|search|show|stats   # visor de sólo lectura
 ```
 
-`clawg mcp --no-autostart` falla en vez de arrancar un daemon. `clawg serve --port <n>` cambia el puerto por defecto (`0` elige uno libre). `clawg path add|remove [--dir <dir>]` edita el PATH del usuario en Windows.
+`clawg mcp --no-autostart` falla en vez de arrancar un daemon, y `clawg mcp --agent <nombre>` fija el agente con el que guarda y busca. `clawg serve --port <n>` cambia el puerto por defecto (`0` elige uno libre). `clawg path add|remove [--dir <dir>]` edita el PATH del usuario en Windows.
 
 ### Registrar el servidor MCP en un build de desarrollo
 
@@ -351,10 +363,10 @@ En Windows usá la ruta completa a `clawg.exe`. Los nombres `clawg-dev` y `clawg
 - `save_memory`: guarda un hecho, preferencia o decisión para que sobreviva entre sesiones.
 - `search_memory`: busca memorias relacionadas con una consulta, con ids, tipos y puntajes de relevancia.
 - `recall_context`: devuelve un bloque de contexto listo para leer (notas del workspace, memorias recientes y de largo plazo) para una consulta.
-- `list_memories`: recorre las memorias guardadas, las más nuevas primero, sin buscar.
-- `delete_memory`: borra una memoria por id y tipo.
+- `list_memories`: recorre las memorias del agente, las más nuevas primero, sin buscar.
+- `delete_memory`: borra una memoria del agente por id y tipo.
 - `resolve_conflict`: cierra un conflicto de ACTIVE CONFLICTS con la respuesta del usuario: una memoria queda y la otra pasa a reemplazada, o quedan las dos.
-- `memory_status`: informa si el daemon está corriendo, su perfil y su directorio de datos, y si el modelo de embeddings ya cargó.
+- `memory_status`: informa si el daemon está corriendo, su perfil y su directorio de datos, si el modelo de embeddings ya cargó, y con qué agente guarda y busca.
 
 ### Perfiles y datos
 

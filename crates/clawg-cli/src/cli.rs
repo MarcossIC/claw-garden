@@ -17,6 +17,16 @@ pub struct Cli {
     pub command: Command,
 }
 
+/// Trims an `--agent` value, refusing one with nothing left: a blank id
+/// would be an agent no client could ever name again.
+fn parse_agent(raw: &str) -> Result<String, String> {
+    let agent = raw.trim();
+    if agent.is_empty() {
+        return Err("the agent id must not be blank".into());
+    }
+    Ok(agent.to_string())
+}
+
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum Command {
     /// Run the memory daemon (owns the database, the embedder and the workers).
@@ -36,6 +46,11 @@ pub enum Command {
         /// Fail instead of starting a daemon when none is running.
         #[arg(long)]
         no_autostart: bool,
+        /// The agent id this bridge reads and writes memories as. Without it,
+        /// the name the MCP client reports is used. Pin it to keep what was
+        /// saved reachable if the client stops reporting a name or changes it.
+        #[arg(long, value_parser = parse_agent)]
+        agent: Option<String>,
     },
     /// Print the daemon's state file and health as JSON. Exits 1 if not running.
     Status {
@@ -372,7 +387,8 @@ mod tests {
             cli.command,
             Command::Mcp {
                 profile: ProfileArg { profile: None },
-                no_autostart: false
+                no_autostart: false,
+                agent: None,
             }
         );
     }
@@ -384,9 +400,33 @@ mod tests {
             cli.command,
             Command::Mcp {
                 profile: ProfileArg { profile: None },
-                no_autostart: true
+                no_autostart: true,
+                agent: None,
             }
         );
+    }
+
+    #[test]
+    fn mcp_takes_an_agent() {
+        let cli = parse(&["clawg", "mcp", "--agent", " claude-code "]);
+        assert_eq!(
+            cli.command,
+            Command::Mcp {
+                profile: ProfileArg { profile: None },
+                no_autostart: false,
+                agent: Some("claude-code".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn mcp_rejects_a_blank_agent() {
+        for blank in ["", "   "] {
+            assert!(
+                Cli::try_parse_from(["clawg", "mcp", "--agent", blank]).is_err(),
+                "{blank:?} must not become an agent id"
+            );
+        }
     }
 
     #[test]
