@@ -20,7 +20,7 @@ exploration -> proposal -> spec (+ design si hace falta) -> tasks -> apply -> ve
 
 | # | Cambio | Objetivo | Tamaño | Depende de | Estado |
 |---|--------|----------|--------|------------|--------|
-| 1 | [data-preservation](changes/data-preservation/exploration.md) | transversal | L (se parte en A–F) | — | exploración |
+| 1 | [data-preservation](changes/data-preservation/proposal.md) | transversal | M (partes A + F; B–E siguen en la exploración) | — | tareas |
 | 2 | [ingest-durability](changes/ingest-durability/proposal.md) | 1 | M | — | tareas |
 | 3 | [retrieval-hygiene](changes/retrieval-hygiene/exploration.md) | 1 | S | — | exploración |
 | 4 | [project-identity](changes/project-identity/exploration.md) | 2 | M | 1 (backup antes del re-key) | exploración |
