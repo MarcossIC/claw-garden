@@ -7,10 +7,13 @@
 //! describing something the agent no longer receives.
 
 /// One numbered line of a search result.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SearchLine {
     /// The 1-based position the tool printed.
     pub rank: usize,
+    pub score: f64,
+    /// The whole line, which is what it costs the agent.
+    pub printed: String,
     /// Content exactly as shown, truncation marker included.
     pub content: String,
 }
@@ -45,13 +48,14 @@ fn parse_search_line(line: &str) -> Option<SearchLine> {
     if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    let (_, after) = rest.split_once(']')?;
+    let (meta, after) = rest.split_once(']')?;
+    let score = meta.split_once(" score=")?.1.parse().ok()?;
     let content = match after.strip_prefix(' ') {
         Some(content) => content,
         None if after.is_empty() => after,
         None => return None,
     };
-    Some(SearchLine { rank, content: content.to_string() })
+    Some(SearchLine { rank, score, printed: line.to_string(), content: content.to_string() })
 }
 
 /// Content fragments of a `recall_context` prompt: each hit's `CONTENT:`
@@ -123,19 +127,28 @@ mod tests {
 
     #[test]
     fn the_empty_result_sentence_parses_to_no_lines() {
-        assert_eq!(parse_search_output("no memories found"), Ok(vec![]));
+        assert!(parse_search_output("no memories found").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_hit_line_yields_its_score_and_the_line_as_printed() {
+        let text = "2. #42 [Memory/chat_message/t3 score=0.87] some content";
+        let line = &parse_search_output(text).unwrap()[0];
+        assert_eq!(line.score, 0.87);
+        assert_eq!(line.printed, text);
+    }
+
+    #[test]
+    fn a_line_without_a_score_is_an_error() {
+        assert!(parse_search_output("1. #5 [Memory/chat_message/t3] content").is_err());
     }
 
     #[test]
     fn a_hit_line_yields_its_rank_and_content() {
         let text = "1. #42 [Memory/chat_message/t3 score=0.87] the retrieval decay term compares milliseconds";
-        assert_eq!(
-            parse_search_output(text),
-            Ok(vec![SearchLine {
-                rank: 1,
-                content: "the retrieval decay term compares milliseconds".to_string()
-            }])
-        );
+        let line = &parse_search_output(text).unwrap()[0];
+        assert_eq!(line.rank, 1);
+        assert_eq!(line.content, "the retrieval decay term compares milliseconds");
     }
 
     #[test]

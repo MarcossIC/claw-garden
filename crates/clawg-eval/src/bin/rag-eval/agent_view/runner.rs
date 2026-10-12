@@ -130,7 +130,8 @@ async fn answer_cases(
             .await?;
         let search_text = format_hits(&hits);
         let search_ms = elapsed_ms(started);
-        let search_read = read_search(&search_text, &case.expected_refs, corpus)
+        let count_tokens = |line: &str| input.counter.count(line);
+        let search_read = read_search(&search_text, &count_tokens, &case.expected_refs, corpus)
             .map_err(|source| RunError::Parse { query: case.query.clone(), source })?;
 
         let started = Instant::now();
@@ -156,6 +157,7 @@ async fn answer_cases(
                 tokens: input.counter.count(&search_text),
                 latency_ms: search_ms,
                 truncated: search_read.truncated,
+                lines: search_read.lines,
             },
             context: ContextOutcome {
                 found: !context_found.is_empty(),

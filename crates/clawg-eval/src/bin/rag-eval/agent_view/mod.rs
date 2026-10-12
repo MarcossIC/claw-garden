@@ -34,6 +34,19 @@ pub struct SearchOutcome {
     /// A line carrying an expected row was cut at the preview limit, so the
     /// agent saw only the start of it.
     pub truncated: bool,
+    /// Every printed line, in order. Results written before lines were
+    /// recorded have none.
+    #[serde(default)]
+    pub lines: Vec<LineView>,
+}
+
+/// One printed search line, reduced to what a cut-off rule needs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LineView {
+    pub score: f64,
+    pub tokens: usize,
+    /// The line carries a row the case expects.
+    pub expected: bool,
 }
 
 /// What `recall_context` showed for one case.
@@ -92,16 +105,20 @@ pub struct SearchRead {
     pub found_refs: Vec<String>,
     pub rank: Option<usize>,
     pub truncated: bool,
+    pub lines: Vec<LineView>,
 }
 
+/// `count_tokens` prices one printed line.
 pub fn read_search(
     text: &str,
+    count_tokens: &dyn Fn(&str) -> usize,
     expected: &[String],
     corpus: &Corpus,
 ) -> Result<SearchRead, ParseError> {
     let mut found: HashSet<&str> = HashSet::new();
     let mut rank = None;
     let mut truncated = false;
+    let mut lines = Vec::new();
     for line in parse_search_output(text)? {
         let shown = visible_segment(&line.content);
         let carried: Vec<&str> = corpus
@@ -109,6 +126,11 @@ pub fn read_search(
             .into_iter()
             .filter(|r| expected.iter().any(|e| e == r))
             .collect();
+        lines.push(LineView {
+            score: line.score,
+            tokens: count_tokens(&line.printed),
+            expected: !carried.is_empty(),
+        });
         if carried.is_empty() {
             continue;
         }
@@ -116,7 +138,7 @@ pub fn read_search(
         truncated |= shown.truncated;
         found.extend(carried);
     }
-    Ok(SearchRead { found_refs: in_expected_order(expected, &found), rank, truncated })
+    Ok(SearchRead { found_refs: in_expected_order(expected, &found), rank, truncated, lines })
 }
 
 /// Expected rows a `recall_context` output shows.
@@ -237,24 +259,54 @@ mod tests {
         format!("{rank}. #{rank} [Memory/chat_message/t3 score=0.50] {content}")
     }
 
+    fn no_tokens(_: &str) -> usize {
+        0
+    }
+
+    /// Enough to replay any cut-off rule over a finished run: what each line
+    /// scored, what it cost, and whether the case needed it.
+    #[test]
+    fn read_search_records_each_line_score_tokens_and_whether_it_was_expected() {
+        let text = [
+            format!("1. #1 [Memory/chat_message/t3 score=0.91] {B}"),
+            format!("2. #2 [Memory/chat_message/t3 score=0.40] {A}"),
+        ]
+        .join("\n");
+        let read = read_search(&text, &|line: &str| line.len(), &refs(&["c1"]), &corpus()).unwrap();
+        assert_eq!(
+            read.lines,
+            vec![
+                LineView { score: 0.91, tokens: text.lines().next().unwrap().len(), expected: false },
+                LineView { score: 0.40, tokens: text.lines().nth(1).unwrap().len(), expected: true },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_result_written_before_lines_were_recorded_still_parses() {
+        let json = r#"{"found":true,"found_refs":["c1"],"rank":1,"tokens":10,"latency_ms":1.0,"truncated":false}"#;
+        let outcome: SearchOutcome = serde_json::from_str(json).unwrap();
+        assert!(outcome.lines.is_empty());
+    }
+
     #[test]
     fn read_search_reports_the_rank_of_the_first_expected_row() {
         let text = [hit(1, B), hit(2, A)].join("\n");
-        let read = read_search(&text, &refs(&["c1"]), &corpus()).unwrap();
-        assert_eq!(read, SearchRead { found_refs: refs(&["c1"]), rank: Some(2), truncated: false });
+        let read = read_search(&text, &no_tokens, &refs(&["c1"]), &corpus()).unwrap();
+        assert_eq!((read.found_refs, read.rank, read.truncated), (refs(&["c1"]), Some(2), false));
     }
 
     #[test]
     fn read_search_ignores_rows_the_case_does_not_expect() {
         let text = hit(1, B);
-        let read = read_search(&text, &refs(&["c1"]), &corpus()).unwrap();
-        assert_eq!(read, SearchRead { found_refs: vec![], rank: None, truncated: false });
+        let read = read_search(&text, &no_tokens, &refs(&["c1"]), &corpus()).unwrap();
+        assert_eq!((read.found_refs, read.rank, read.truncated), (vec![], None, false));
     }
 
     #[test]
     fn read_search_lists_every_expected_row_it_finds_in_expected_order() {
         let text = [hit(1, B), hit(2, A)].join("\n");
-        let read = read_search(&text, &refs(&["c1", "c2"]), &corpus()).unwrap();
+        let read = read_search(&text, &no_tokens, &refs(&["c1", "c2"]), &corpus()).unwrap();
         assert_eq!(read.found_refs, refs(&["c1", "c2"]));
         assert_eq!(read.rank, Some(1));
     }
@@ -265,7 +317,7 @@ mod tests {
         let corpus = Corpus::new([("c1", long_row.as_str())]);
         let preview: String = long_row.chars().take(500).collect();
         let text = hit(1, &format!("{preview}…"));
-        let read = read_search(&text, &refs(&["c1"]), &corpus).unwrap();
+        let read = read_search(&text, &no_tokens, &refs(&["c1"]), &corpus).unwrap();
         assert_eq!(read.found_refs, refs(&["c1"]));
         assert!(read.truncated);
     }
@@ -273,19 +325,19 @@ mod tests {
     #[test]
     fn read_search_does_not_flag_a_cut_line_that_matched_nothing_expected() {
         let text = hit(1, &format!("{B} and then a long tail that got cut off by the preview…"));
-        let read = read_search(&text, &refs(&["c1"]), &corpus()).unwrap();
+        let read = read_search(&text, &no_tokens, &refs(&["c1"]), &corpus()).unwrap();
         assert!(!read.truncated);
     }
 
     #[test]
     fn read_search_of_the_empty_sentence_finds_nothing() {
-        let read = read_search("no memories found", &refs(&["c1"]), &corpus()).unwrap();
-        assert_eq!(read, SearchRead { found_refs: vec![], rank: None, truncated: false });
+        let read = read_search("no memories found", &no_tokens, &refs(&["c1"]), &corpus()).unwrap();
+        assert_eq!((read.found_refs, read.rank, read.truncated), (vec![], None, false));
     }
 
     #[test]
     fn read_search_surfaces_a_format_it_cannot_parse() {
-        assert!(read_search("garbage", &refs(&["c1"]), &corpus()).is_err());
+        assert!(read_search("garbage", &no_tokens, &refs(&["c1"]), &corpus()).is_err());
     }
 
     #[test]
@@ -315,6 +367,7 @@ mod tests {
                 tokens,
                 latency_ms: 1.0,
                 truncated: false,
+                lines: vec![],
             },
             context: ContextOutcome {
                 found: context_found,
