@@ -44,6 +44,11 @@ Cada tarea es un commit atómico: primero el test que falla, después el código
 - [x] `derived_from` en `save_memory`; herramienta `synthesize` con el agente que llama; recordatorio en `recall_context`; instrucciones del servidor.
 - Commit: `feat(mcp): let the agent draw conclusions from its memories` (631fccd)
 
+## Después del merge de main
+
+- [x] Test `purging_drops_the_links_to_and_from_the_row` en `secrets.rs`; `purge` borra los enlaces de la fila purgada (R6).
+- Commit: `fix(core): drop a purged memory's provenance links` (47d2ce7)
+
 ## Verify
 
 - [x] `cargo test --workspace` en Linux, contra la base: sin fallas nuevas, con el conteo justificado ([`verify.md`](verify.md#linux)).

@@ -82,7 +82,9 @@ El detector de contradicciones MUST excluir de sus candidatos las fuentes del sa
 
 Borrar una conclusión MUST NOT tocar sus fuentes ni sus filas de `memory_derivation`. Borrar una fuente MUST NOT tocar la conclusión. Una conclusión borrada o reemplazada MUST dejar de contar para decidir qué memorias están pendientes.
 
-**Test:** cubierto por R7 (`deleting_a_conclusion_makes_its_sources_pending_again`).
+Purgar una fila (`clawg purge`, de secret-hygiene) sí la borra de verdad, y su id puede volver a usarse: MUST borrar en la misma transacción sus filas de `memory_derivation`, como conclusión y como fuente, para que una fila nueva con ese id no herede la procedencia.
+
+**Test:** R7 (`deleting_a_conclusion_makes_its_sources_pending_again`) y `purging_drops_the_links_to_and_from_the_row` en `crates/clawg-core/src/memory/secrets.rs`.
 
 ## R7. Síntesis
 
