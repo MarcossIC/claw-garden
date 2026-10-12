@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use clawg_core::memory::embedder::{EmbedError, EmbedRole, Embedder, FakeEmbedder};
 use clawg_core::memory::events::{MemoryEvent, MemorySource};
 use clawg_core::memory::spill::{REJECTED_FILE, SPILL_FILE};
+use clawg_core::memory::store_lock::StoreHolder;
 use clawg_core::memory::MemoryStore;
 use clawg_core::models::chat::Role;
 use clawg_core::runtime::{MemoryRuntime, Workers};
@@ -218,4 +219,31 @@ async fn a_shutdown_during_replay_keeps_the_unreplayed_lines_first() {
         spilled_contents(tmp.path()),
         Some(vec!["old 1".to_string(), "old 2".to_string(), "old 3".to_string(), "new".to_string()])
     );
+}
+
+#[tokio::test]
+async fn shutdown_checkpoints_the_wal_into_memory_db() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (runtime, rx) = MemoryRuntime::open(tmp.path().to_path_buf(), StoreHolder::Daemon)
+        .await
+        .unwrap();
+    runtime.embedder.set(Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>).ok();
+    let workers = start(&runtime, rx);
+    runtime.memory_tx.send(event("written just before the stop")).unwrap();
+    assert_eq!(wait_for_rows(&runtime.store, 1).await.len(), 1);
+
+    runtime.shutdown(workers).await;
+
+    let wal = tmp.path().join("memory.db-wal");
+    let wal_len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(wal_len, 0, "the WAL must be folded into memory.db");
+
+    let copy_dir = tempfile::tempdir().unwrap();
+    let copy = copy_dir.path().join("memory.db");
+    std::fs::copy(tmp.path().join("memory.db"), &copy).unwrap();
+    let conn = rusqlite::Connection::open(&copy).unwrap();
+    let content: String = conn
+        .query_row("SELECT content FROM memory WHERE agent_id = 'agent-shutdown'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(content, "written just before the stop");
 }

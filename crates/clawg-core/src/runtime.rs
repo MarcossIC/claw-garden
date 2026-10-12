@@ -173,8 +173,8 @@ impl MemoryRuntime {
 
     /// Orderly shutdown, once nothing can send new events: drains the ingest
     /// queue for up to [`DRAIN_DEADLINE`] and spills what is left to
-    /// `<base_dir>/ingest-pending.jsonl`, flushes the access tracker and stops
-    /// maintenance.
+    /// `<base_dir>/ingest-pending.jsonl`, flushes the access tracker, stops
+    /// maintenance and checkpoints the WAL.
     pub async fn shutdown(&self, workers: Workers) {
         self.shutdown_by(workers, DRAIN_DEADLINE).await;
     }
@@ -211,6 +211,7 @@ impl MemoryRuntime {
         self.access_tracker.shutdown().await;
         workers.maintenance.abort();
         let _ = workers.maintenance.await;
+        checkpoint(&self.store).await;
     }
 
     /// Workspace manager rooted at `<base_dir>/workspaces`.
@@ -270,6 +271,28 @@ impl MemoryRuntime {
             },
             memory_rx,
         )
+    }
+}
+
+/// Folds the WAL into `memory.db` after the last write, so the database file
+/// stands on its own once the process is gone (a copy of it, a backup, an
+/// installer replacing the binary). Best-effort: everything is already
+/// committed in the WAL, and SQLite replays it on the next open.
+async fn checkpoint(store: &MemoryStore) {
+    let result = store
+        .conn
+        .call(|c| -> Result<(i64, i64, i64), rusqlite::Error> {
+            c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+        })
+        .await;
+    match result {
+        Ok((0, _, _)) => log::info!("checkpointed the WAL into memory.db"),
+        Ok((_, log_frames, done)) => log::warn!(
+            "WAL checkpoint was blocked by another connection ({done} of {log_frames} frames copied); it completes on the next open"
+        ),
+        Err(e) => log::warn!("WAL checkpoint failed: {e}; it completes on the next open"),
     }
 }
 
