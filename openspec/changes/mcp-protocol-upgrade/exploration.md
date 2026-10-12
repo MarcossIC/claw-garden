@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 4 (interoperabilidad) | M | visibility-policy (fuente de identidad) | exploración (borrador) |
+| 4 (interoperabilidad) | M | visibility-policy (fuente de identidad) | exploración (cerrada: ver [proposal.md](proposal.md)) |
 
 **Tesis:** la spec MCP vigente (2026-07-28) elimina el handshake `initialize`, también en stdio. Hoy no se rompe nada, porque rmcp 1.3.0 negocia `initialize` y los clientes nuevos hacen fallback. El riesgo aparece al actualizar rmcp o cuando un cliente deje de hacer fallback.
 
@@ -56,9 +56,9 @@ Fuente: [changelog](https://modelcontextprotocol.io/specification/2026-07-28/cha
 
 ## Decisiones abiertas
 
-- [ ] **¿Cuándo?** ¿Ahora, o cuando Claude Code adopte 2026-07-28? Hay que averiguar el estado actual de Claude Code.
-- [ ] **¿Directo a 3.5.1 o por etapas** (2.x primero)?
-- [ ] **¿Se mantiene la versión en el `ServerInfo`** que hoy se publica?
+- [x] **¿Cuándo?** ¿Ahora, o cuando Claude Code adopte 2026-07-28? Hay que averiguar el estado actual de Claude Code. → Ahora ([propuesta](proposal.md#decisiones-cierran-las-abiertas-de-la-exploración)).
+- [x] **¿Directo a 3.5.1 o por etapas** (2.x primero)? → Directo.
+- [x] **¿Se mantiene la versión en el `ServerInfo`** que hoy se publica? → Sí.
 
 ## Cómo se mide
 

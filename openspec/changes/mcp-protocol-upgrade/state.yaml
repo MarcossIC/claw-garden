@@ -1,14 +1,14 @@
 change: mcp-protocol-upgrade
 objective: "4"
-depends_on: [visibility-policy]
-phase: explore
+depends_on: [visibility-policy]  # --agent, mergeado en #15
+phase: verify
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
-  apply: pending
-  verify: pending
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: in_progress  # faltan Windows y Claude Code real (máquina de Marcos)
   archive: pending
-updated: 2026-10-11
+updated: 2026-10-12
