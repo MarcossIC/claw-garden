@@ -443,8 +443,11 @@ impl ClawgMcp {
         }
     }
 
+    /// Lists the calling agent's rows only, across all of its projects: the
+    /// agent is the visibility boundary, the project is not.
     pub async fn list_memories_impl(
         &self,
+        agent_id: &str,
         args: ListMemoriesArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let client = match self.daemon().await {
@@ -458,6 +461,7 @@ impl ClawgMcp {
                 memory_type: args.memory_type,
                 limit: args.limit,
                 offset: args.offset,
+                agent: Some(agent_id.to_string()),
                 ..Default::default()
             })
             .await
@@ -467,29 +471,33 @@ impl ClawgMcp {
         }
     }
 
+    /// Another agent's row is refused as missing, like an id that is not there.
     pub async fn delete_memory_impl(
         &self,
+        agent_id: &str,
         args: DeleteMemoryArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let client = match self.daemon().await {
             Ok(c) => c,
             Err(failure) => return Ok(failure),
         };
-        match client.delete(&args.kind, args.id, None).await {
+        match client.delete(&args.kind, args.id, Some(agent_id)).await {
             Ok(n) => Self::ok(format!("deleted {n}")),
             Err(e) => Self::failed(Self::explain(&e)),
         }
     }
 
+    /// Both rows must be the calling agent's, as in `delete_memory_impl`.
     pub async fn resolve_conflict_impl(
         &self,
+        agent_id: &str,
         args: ResolveConflictArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let client = match self.daemon().await {
             Ok(c) => c,
             Err(failure) => return Ok(failure),
         };
-        match client.resolve(args.keep, args.other, args.keep_both.unwrap_or(false), None).await {
+        match client.resolve(args.keep, args.other, args.keep_both.unwrap_or(false), Some(agent_id)).await {
             Ok(resolution) => Self::ok(format_resolution(&resolution)),
             Err(e) => Self::failed(Self::explain(&e)),
         }
@@ -573,9 +581,10 @@ impl ClawgMcp {
     )]
     async fn list_memories(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(args): Parameters<ListMemoriesArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.list_memories_impl(args).await
+        self.list_memories_impl(&self.agent_id_for(Some(&peer)), args).await
     }
 
     #[tool(
@@ -586,9 +595,10 @@ impl ClawgMcp {
     )]
     async fn delete_memory(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(args): Parameters<DeleteMemoryArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.delete_memory_impl(args).await
+        self.delete_memory_impl(&self.agent_id_for(Some(&peer)), args).await
     }
 
     #[tool(
@@ -601,9 +611,10 @@ impl ClawgMcp {
     )]
     async fn resolve_conflict(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(args): Parameters<ResolveConflictArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.resolve_conflict_impl(args).await
+        self.resolve_conflict_impl(&self.agent_id_for(Some(&peer)), args).await
     }
 
     #[tool(
@@ -1035,7 +1046,7 @@ mod tests {
             .unwrap_or_else(|| panic!("expected `saved #<id>`, got: {}", text(&saved)));
 
         let listed = b
-            .list_memories_impl(ListMemoriesArgs {
+            .list_memories_impl("agent-mcp", ListMemoriesArgs {
                 kind: Some("memory".into()),
                 tier: None,
                 memory_type: None,
@@ -1064,7 +1075,7 @@ mod tests {
         assert!(text(&found).contains(content), "text was: {}", text(&found));
 
         let deleted = b
-            .delete_memory_impl(DeleteMemoryArgs { id, kind: "memory".into() })
+            .delete_memory_impl("agent-mcp", DeleteMemoryArgs { id, kind: "memory".into() })
             .await
             .expect("delete");
         assert!(!is_error(&deleted), "delete failed: {}", text(&deleted));
@@ -1250,7 +1261,7 @@ mod tests {
     async fn deleting_a_missing_row_is_an_error_result_the_model_can_read() {
         let (b, _d) = bridge().await;
         let r = b
-            .delete_memory_impl(DeleteMemoryArgs { id: 999_999, kind: "memory".into() })
+            .delete_memory_impl("agent-mcp", DeleteMemoryArgs { id: 999_999, kind: "memory".into() })
             .await
             .expect("the call itself must succeed");
         assert!(is_error(&r), "a failed delete must be marked as an error");
@@ -1290,7 +1301,7 @@ mod tests {
             .expect("mark the dispute");
 
         let r = b
-            .resolve_conflict_impl(ResolveConflictArgs { keep: new, other: old, keep_both: None })
+            .resolve_conflict_impl("agent-mcp", ResolveConflictArgs { keep: new, other: old, keep_both: None })
             .await
             .expect("call");
 
@@ -1302,7 +1313,7 @@ mod tests {
     async fn resolve_conflict_reports_a_refusal() {
         let (b, _d) = bridge().await;
         let r = b
-            .resolve_conflict_impl(ResolveConflictArgs { keep: 4, other: 4, keep_both: Some(true) })
+            .resolve_conflict_impl("agent-mcp", ResolveConflictArgs { keep: 4, other: 4, keep_both: Some(true) })
             .await
             .expect("call");
         assert!(is_error(&r));
@@ -1313,7 +1324,7 @@ mod tests {
     async fn an_unknown_kind_is_reported_as_a_readable_error() {
         let (b, _d) = bridge().await;
         let r = b
-            .delete_memory_impl(DeleteMemoryArgs { id: 1, kind: "bogus".into() })
+            .delete_memory_impl("agent-mcp", DeleteMemoryArgs { id: 1, kind: "bogus".into() })
             .await
             .expect("call");
         assert!(is_error(&r));
@@ -1332,6 +1343,92 @@ mod tests {
             "the message must name the fix: {}",
             text(&r)
         );
+    }
+
+    // ── agent scope ─────────────────────────────────────────────────────────
+
+    async fn saved_id(b: &ClawgMcp, agent: &str, content: &str) -> i64 {
+        let saved = b.save_memory_impl(agent, save_args(content)).await.expect("save");
+        text(&saved)
+            .strip_prefix("saved #")
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("expected `saved #<id>`, got: {}", text(&saved)))
+    }
+
+    fn list_all() -> ListMemoriesArgs {
+        ListMemoriesArgs { kind: None, tier: None, memory_type: None, limit: None, offset: None }
+    }
+
+    #[tokio::test]
+    async fn an_agent_cannot_delete_another_agents_memory() {
+        let (b, _d) = bridge().await;
+        let content = "agent a keeps its release notes in the wiki";
+        let id = saved_id(&b, "agent-a", content).await;
+
+        let r = b
+            .delete_memory_impl("agent-b", DeleteMemoryArgs { id, kind: "memory".into() })
+            .await
+            .expect("call");
+        assert!(is_error(&r), "another agent's memory must not be deletable: {}", text(&r));
+
+        let listed = b.list_memories_impl("agent-a", list_all()).await.expect("list");
+        assert!(text(&listed).contains(content), "the row must survive: {}", text(&listed));
+
+        let r = b
+            .delete_memory_impl("agent-a", DeleteMemoryArgs { id, kind: "memory".into() })
+            .await
+            .expect("call");
+        assert!(!is_error(&r), "the owner deletes it: {}", text(&r));
+    }
+
+    #[tokio::test]
+    async fn an_agent_lists_only_its_own_memories() {
+        let (b, _d) = bridge().await;
+        saved_id(&b, "agent-a", "agent a prefers tabs over spaces").await;
+        saved_id(&b, "agent-b", "agent b prefers spaces over tabs").await;
+
+        let listed = text(&b.list_memories_impl("agent-b", list_all()).await.expect("list"));
+
+        assert!(listed.contains("agent b prefers"), "{listed}");
+        assert!(!listed.contains("agent a prefers"), "another agent's memory leaked: {listed}");
+    }
+
+    #[tokio::test]
+    async fn an_agent_cannot_resolve_another_agents_conflict() {
+        let mut store = None;
+        let (b, _d) = bridge_with(|runtime| {
+            store = Some(runtime.store.clone());
+            runtime
+        })
+        .await;
+        let old = saved_id(&b, "agent-a", "the cache expires after one hour").await;
+        let new = saved_id(&b, "agent-a", "the cache expires after one day").await;
+        let store = store.expect("the runtime's store");
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    &format!("UPDATE memory SET status = 'disputed', disputed_against = '[{old}]' WHERE id = {new}"),
+                    [],
+                )
+            })
+            .await
+            .expect("mark the dispute");
+
+        let r = b
+            .resolve_conflict_impl("agent-b", ResolveConflictArgs { keep: new, other: old, keep_both: None })
+            .await
+            .expect("call");
+
+        assert!(is_error(&r), "another agent's conflict must not be resolvable: {}", text(&r));
+        let client = b.daemon().await.expect("daemon");
+        let mut rows = client
+            .list(ListArgs { kind: Some("memory".into()), ..Default::default() })
+            .await
+            .expect("list");
+        rows.sort_by_key(|r| r.id);
+        let statuses: Vec<&str> = rows.iter().map(|r| r.status.as_str()).collect();
+        assert_eq!(statuses, ["active", "disputed"], "a refused resolution changes nothing");
     }
 
     // ── project scoping ─────────────────────────────────────────────────────
