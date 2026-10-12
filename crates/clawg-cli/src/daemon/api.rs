@@ -32,7 +32,7 @@ use clawg_core::memory::admin::{
 use clawg_core::memory::embedder::EmbedRole;
 use clawg_core::memory::events::{MemoryEvent, MemorySource};
 use clawg_core::memory::prompt_builder::{build_memory_prompt, QueryTexts};
-use clawg_core::memory::{search_all_memories, RankedHit, SearchScope, TableKind};
+use clawg_core::memory::{search_all_memories, RankedHit, SearchScope};
 use clawg_core::models::chat::Role;
 use clawg_core::paths::Profile;
 use clawg_core::runtime::MemoryRuntime;
@@ -490,15 +490,7 @@ async fn search(
     .await
     .map_err(ApiError::internal)?;
 
-    // Only `memory` rows: the access tracker's flush is a CTE `UPDATE memory`,
-    // and ids are per-table autoincrements, so feeding it an episodic id would
-    // promote whichever unrelated `memory` row happens to share that number.
-    app.runtime.access_tracker.record(
-        hits.iter()
-            .filter(|h| h.kind == TableKind::Memory)
-            .map(|h| h.id)
-            .collect(),
-    );
+    app.runtime.access_tracker.record_hits(&hits);
 
     Ok(Json(SearchBody { hits }))
 }
