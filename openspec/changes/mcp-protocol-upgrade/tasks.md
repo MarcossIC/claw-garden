@@ -21,6 +21,11 @@ Cada tarea es un commit atómico: primero el test que falla, después el código
 - [x] `PreInitGuard` anota el id de la request que puede empezar la sesión y se apaga recién cuando rmcp la contesta con un resultado.
 - Commit: `fix(mcp): keep the pre-session guard on after a refused request` (`08dc9ba`)
 
+## 4. Merge con visibility-policy
+
+- [x] `agent_id_from` pasa a `client_name(declarado, recordado)`, que alimenta `resolve_agent(flag, client)`. Las siete herramientas leen la identidad del `RequestContext`.
+- Commit: `merge: bring main into the MCP upgrade` (`53db597`)
+
 ## Verify
 
 - [x] `cargo test --workspace` en Linux: sin fallas nuevas contra la base (ver `verify.md`).

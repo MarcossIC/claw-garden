@@ -40,9 +40,7 @@ La alternativa, leer `_meta` a mano y caer a `peer_info()`, repite lo que rmcp y
 | **b. La request, si no el último nombre declarado a este proceso, si no `"mcp"`** | Un puente stdio sirve a un solo cliente, así que el nombre anterior es del mismo cliente | Un `Mutex<Option<String>>` compartido por los clones del servidor, como ya pasa con `registered` |
 | c. Exigir `clientInfo` y rechazar la request | Explícito | Rompe a un cliente que cumple la spec, porque es SHOULD |
 
-**Elegida b.** `server/discover` también recuerda: el servidor sobrescribe `discover` con la respuesta de rmcp más el registro del nombre. La regla queda en `agent_id_from(declarado, recordado, fallback)`, pura y probada sin transporte.
-
-Cuando visibility-identity agregue `--agent`, entra como primer argumento de esa misma función. No hace falta tocar cómo se lee el contexto.
+**Elegida b.** `server/discover` también recuerda: el servidor sobrescribe `discover` con la respuesta de rmcp más el registro del nombre. La regla queda en `client_name(declarado, recordado)`, pura y probada sin transporte. Su resultado es el `client` de `resolve_agent(flag, client)`, que trajo visibility-policy con `--agent`: el flag gana, después el nombre, después `"mcp"`.
 
 ## D4. Sin cambios a lo que rmcp genera
 

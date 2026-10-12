@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 4 (interoperabilidad) | M | visibility-policy, sólo para `--agent` (fuera de alcance, ver abajo) | verify |
+| 4 (interoperabilidad) | M | visibility-policy (`--agent`, mergeado en #15) | verify |
 
 ## Problema
 
@@ -30,7 +30,7 @@ Hechos de la [exploración](exploration.md), verificados contra el código de `m
 
 ## Fuera de alcance
 
-- **`clawg mcp --agent <nombre>` y la precedencia configuración > clientInfo > fallback.** Es la pregunta 1 de visibility-policy ("visibility-identity"), que tiene su thread abierto. Este cambio deja la resolución en una función pura, `agent_id_from` (`server.rs`), donde esa configuración entra como un argumento más. Riesgo que queda: un cliente 2026-07-28 que **nunca** declara `clientInfo` (es SHOULD) guarda y busca bajo `"mcp"`. Es lo mismo que pasa hoy con un cliente sin nombre, pero ahora es un caso posible del protocolo. Lo cierra visibility-identity.
+- **`clawg mcp --agent <nombre>`.** Lo trajo visibility-policy (#15): `resolve_agent(flag, client)` en `server.rs`. Este cambio sólo decide de dónde sale `client`: el nombre que declara la request, si no el último declarado a este puente. Un cliente 2026-07-28 que **nunca** declara `clientInfo` (es SHOULD) guarda bajo `"mcp"`, salvo que el usuario fije el nombre con `--agent`.
 - Roots, Sampling y Logging: el puente no usa ninguno (`rg -i "roots|sampling|set_level" crates/clawg-cli/src/mcp` sólo encuentra un comentario sobre raíces de proyecto).
 - El transporte Streamable HTTP y `Mcp-Session-Id`: el daemon habla HTTP propio, no MCP.
 - Cambios a los datos guardados: ninguno. No hay migración ni cambia ningún `agent_id` ya escrito.

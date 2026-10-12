@@ -65,13 +65,14 @@ Test: `a_session_without_initialize_lists_the_tools_in_name_order` (`handshake.r
 
 ## R4. De dónde sale el `agent_id`
 
-`save_memory`, `search_memory` y `recall_context` MUST usar, en este orden:
+Toda herramienta MUST usar, en este orden:
 
-1. el nombre declarado en la request;
-2. si no hay, el último nombre que declaró un cliente a este proceso, en cualquier request, `server/discover` incluido;
-3. si no hay ninguno, `"mcp"` (`FALLBACK_AGENT_ID`).
+1. `--agent`, si se configuró (lo define visibility-policy);
+2. el nombre declarado en la request;
+3. si no hay, el último nombre que declaró un cliente a este proceso, en cualquier request, `server/discover` incluido;
+4. si no hay ninguno, `"mcp"` (`FALLBACK_AGENT_ID`).
 
-La regla MUST vivir en una función pura.
+Los pasos 2 y 3 MUST vivir en una función pura (`client_name`), y su resultado entra como `client` en `resolve_agent`.
 
 #### Escenario: sesión sin handshake que se nombra
 - GIVEN una sesión 2026-07-28 cuyo `_meta` declara `probe-host`

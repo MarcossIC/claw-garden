@@ -12,6 +12,8 @@
 |---|---|---|
 | Base (`origin/main`, 1127b50) | 1.675 | 10 |
 | Con el cambio (08dc9ba) | 1.685 | 10 |
+| Base después de visibility-policy (`origin/main`, c01a0af) | 1.696 | 10 |
+| Con el cambio sobre ese main (53db597) | 1.706 | 10 |
 
 Son 10 tests más y ninguna falla nueva. Las 10 fallas son las mismas en las dos corridas y vienen del entorno, no del código:
 
@@ -38,4 +40,4 @@ No aplica. El cambio no toca `clawg-core`, el ranking ni el golden set.
    - una búsqueda encuentra una memoria guardada **antes** del cambio. Es la prueba de que Claude Code se nombra igual en el ciclo de vida nuevo que en `initialize`;
    - `clawg memories` (o `list_memories`) muestra lo que se guarde en esta prueba con el mismo `agent_id` que las filas anteriores, y no `mcp`.
 
-   Si Claude Code se queda en el ciclo legacy, también vale: lo cubre R2. Si pasa al nuevo sin `clientInfo`, las filas nuevas van a quedar bajo `mcp`. En ese caso no se mergea: hace falta antes `--agent`, de visibility-policy.
+   Si Claude Code se queda en el ciclo legacy, también vale: lo cubre R2. Si pasa al nuevo sin `clientInfo`, las filas nuevas van a quedar bajo `mcp`. En ese caso hay que registrar el MCP con `--agent <nombre de siempre>` antes de usarlo, y repetir la búsqueda.

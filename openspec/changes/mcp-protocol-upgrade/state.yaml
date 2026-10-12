@@ -1,6 +1,6 @@
 change: mcp-protocol-upgrade
 objective: "4"
-depends_on: []  # visibility-policy sólo para --agent, que queda fuera de alcance (ver proposal.md)
+depends_on: [visibility-policy]  # --agent, mergeado en #15
 phase: verify
 artifacts:
   exploration: done
