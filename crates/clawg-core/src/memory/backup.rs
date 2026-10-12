@@ -144,6 +144,10 @@ pub enum BackupError {
     },
     #[error("there is no memory store at {path}")]
     NoStore { path: PathBuf },
+    #[error("cannot restore {path}: {reason}. Nothing was changed")]
+    Unusable { path: PathBuf, reason: String },
+    #[error("another connection kept {path} from being checkpointed. Nothing was changed")]
+    Busy { path: PathBuf },
     #[error("cannot snapshot to {path}: SQLite needs the path as UTF-8")]
     NonUtf8Path { path: PathBuf },
     #[error("could not write the snapshot {path}: {source}")]
@@ -296,6 +300,106 @@ pub fn backup_offline(base_dir: &Path) -> Result<PathBuf, MemoryError> {
     let _lock = StoreLock::acquire(base_dir, StoreHolder::Maintenance)?;
     let c = open_existing(base_dir)?;
     Ok(snapshot_into(&c, &crate::paths::backups_dir(base_dir), Reason::Manual)?)
+}
+
+/// What [`restore`] did.
+#[derive(Debug)]
+pub struct Restored {
+    /// The snapshot of the store it replaced; `None` when there was none.
+    pub previous: Option<PathBuf>,
+}
+
+/// Replaces `<base_dir>/memory.db` with the database at `from`.
+///
+/// Only on a stopped store: the lock is taken first, so a running daemon makes
+/// this fail before anything is read. `from` is checked before anything is
+/// touched, and the store it replaces is snapshotted first; either failing
+/// leaves the store as it was.
+pub fn restore(base_dir: &Path, from: &Path) -> Result<Restored, MemoryError> {
+    let _lock = StoreLock::acquire(base_dir, StoreHolder::Maintenance)?;
+    check_restorable(from)?;
+
+    let db = base_dir.join("memory.db");
+    let tmp = base_dir.join("memory.db.restore-tmp");
+    let restored = stage(from, &tmp)
+        .map_err(|source| MemoryError::from(BackupError::Io { path: tmp.clone(), source }))
+        .and_then(|()| keep_and_replace(base_dir, &db, &tmp));
+    if restored.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    restored
+}
+
+/// Copied before the snapshot of the current store is taken: that snapshot
+/// prunes old automatic ones, and `from` may be one of them.
+fn stage(from: &Path, tmp: &Path) -> std::io::Result<()> {
+    std::fs::copy(from, tmp)?;
+    std::fs::File::open(tmp)?.sync_all()
+}
+
+fn keep_and_replace(base_dir: &Path, db: &Path, tmp: &Path) -> Result<Restored, MemoryError> {
+    let previous = if db.exists() {
+        let c = open_existing(base_dir)?;
+        let snapshot = snapshot_into(&c, &crate::paths::backups_dir(base_dir), Reason::PreRestore)?;
+        // An empty WAL is what makes deleting it below lose nothing.
+        let busy: i64 = c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+        if busy != 0 {
+            return Err(BackupError::Busy { path: db.to_path_buf() }.into());
+        }
+        drop(c);
+        Some(snapshot)
+    } else {
+        None
+    };
+    swap_in(tmp, db).map_err(|source| BackupError::Io { path: db.to_path_buf(), source })?;
+    Ok(Restored { previous })
+}
+
+/// The WAL goes BEFORE the rename: the other way round, a crash in between
+/// would leave the old store's WAL beside the new file, and SQLite would apply
+/// it on the next open.
+fn swap_in(tmp: &Path, db: &Path) -> std::io::Result<()> {
+    for suffix in ["-wal", "-shm"] {
+        let mut side = db.as_os_str().to_owned();
+        side.push(suffix);
+        match std::fs::remove_file(PathBuf::from(side)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    std::fs::rename(tmp, db)
+}
+
+/// Whether `path` is a whole clawg store this binary can open, read without
+/// writing to it.
+fn check_restorable(path: &Path) -> Result<(), BackupError> {
+    let unusable = |reason: String| BackupError::Unusable { path: path.to_path_buf(), reason };
+    if !path.is_file() {
+        return Err(unusable("there is no such file".into()));
+    }
+    crate::memory::db::ensure_vec0_registered();
+    let c = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| unusable(e.to_string()))?;
+    let check: String = c
+        .query_row("PRAGMA quick_check", [], |r| r.get(0))
+        .map_err(|e| unusable(e.to_string()))?;
+    if check != "ok" {
+        return Err(unusable(format!("it is damaged ({check})")));
+    }
+    let history = read_history(&c).map_err(|e| unusable(e.to_string()))?;
+    match schema_plan(&history, &known_migrations()) {
+        SchemaPlan::Fresh => Err(unusable("it has no clawg migration history".into())),
+        SchemaPlan::Newer { db, binary } => Err(unusable(format!(
+            "it is at schema V{db}, newer than the V{binary} this clawg knows"
+        ))),
+        SchemaPlan::Diverged { version } => Err(unusable(format!(
+            "its migration V{version} does not match this clawg build"
+        ))),
+        SchemaPlan::UpToDate | SchemaPlan::Pending { .. } => Ok(()),
+    }
 }
 
 fn open_existing(base_dir: &Path) -> Result<rusqlite::Connection, MemoryError> {
@@ -543,6 +647,138 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = backup_offline(dir.path()).unwrap_err();
         assert!(matches!(err, MemoryError::Backup(BackupError::NoStore { .. })), "got {err:?}");
+    }
+
+    fn add_row(dir: &Path, content: &str) {
+        let c = rusqlite::Connection::open(dir.join("memory.db")).unwrap();
+        c.execute(INSERT_ROW, [content]).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restore_replaces_the_store_and_keeps_the_previous_one() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_on_disk(dir.path(), None).await;
+        let only_a = backup_offline(dir.path()).unwrap();
+        add_row(dir.path(), "added after the backup");
+
+        let restored = restore(dir.path(), &only_a).unwrap();
+
+        assert_eq!(contents(&dir.path().join("memory.db")), vec!["seeded on disk".to_string()]);
+        let previous = restored.previous.expect("the replaced store was kept");
+        assert_eq!(parse_snapshot_name(&previous.file_name().unwrap().to_string_lossy()), Some(Reason::PreRestore));
+        assert_eq!(
+            contents(&previous),
+            vec!["seeded on disk".to_string(), "added after the backup".to_string()]
+        );
+        let leftovers: Vec<String> =
+            files_in(dir.path()).into_iter().filter(|n| n.contains("restore-tmp")).collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        StoreLock::acquire(dir.path(), StoreHolder::Daemon).expect("the lock was released");
+    }
+
+    #[tokio::test]
+    async fn restore_refuses_files_it_cannot_open_safely() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_on_disk(dir.path(), None).await;
+        let elsewhere = tempfile::tempdir().unwrap();
+
+        let text = elsewhere.path().join("notes.db");
+        std::fs::write(&text, "not a database at all, just some words").unwrap();
+        let foreign = elsewhere.path().join("foreign.db");
+        rusqlite::Connection::open(&foreign).unwrap().execute_batch("CREATE TABLE x (y)").unwrap();
+        let newer_dir = tempfile::tempdir().unwrap();
+        seed_on_disk(newer_dir.path(), None).await;
+        rusqlite::Connection::open(newer_dir.path().join("memory.db"))
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+                 VALUES (9, 'from_the_future', '2026-10-12T00:00:00Z', '1')",
+            )
+            .unwrap();
+        let newer = newer_dir.path().join("memory.db");
+        let missing = elsewhere.path().join("missing.db");
+
+        let before = std::fs::read(dir.path().join("memory.db")).unwrap();
+        for (file, why) in [
+            (&text, "not a database"),
+            (&foreign, "no clawg migration history"),
+            (&newer, "V9"),
+            (&missing, "no such file"),
+        ] {
+            let err = restore(dir.path(), file).unwrap_err();
+            assert!(
+                matches!(err, MemoryError::Backup(BackupError::Unusable { .. })),
+                "{}: got {err:?}",
+                file.display()
+            );
+            let msg = err.to_string();
+            assert!(msg.contains(&file.display().to_string()) && msg.contains(why), "{msg}");
+        }
+        assert_eq!(std::fs::read(dir.path().join("memory.db")).unwrap(), before);
+        assert!(files_in(&dir.path().join("backups")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn restoring_the_oldest_kept_automatic_snapshot_survives_the_pruning() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_on_disk(dir.path(), None).await;
+        let manual = backup_offline(dir.path()).unwrap();
+        let backups = dir.path().join("backups");
+        let automatic: Vec<PathBuf> = (0..AUTO_KEEP as i64)
+            .map(|i| backups.join(snapshot_name(1_600_000_000_000 + i, Reason::PreMigration)))
+            .collect();
+        for path in &automatic {
+            std::fs::copy(&manual, path).unwrap();
+        }
+        add_row(dir.path(), "added after the backup");
+
+        restore(dir.path(), &automatic[0]).unwrap();
+
+        assert_eq!(contents(&dir.path().join("memory.db")), vec!["seeded on disk".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn restore_refuses_while_the_daemon_holds_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_on_disk(dir.path(), None).await;
+        let snapshot = backup_offline(dir.path()).unwrap();
+        let moved = dir.path().join("kept.db");
+        std::fs::rename(&snapshot, &moved).unwrap();
+        let _daemon = StoreLock::acquire(dir.path(), StoreHolder::Daemon).unwrap();
+
+        let err = restore(dir.path(), &moved).unwrap_err();
+
+        match err {
+            MemoryError::StoreInUse { owner: Some(o) } => assert_eq!(o.holder, StoreHolder::Daemon),
+            other => panic!("expected StoreInUse naming the daemon, got {other:?}"),
+        }
+        assert!(files_in(&dir.path().join("backups")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_restored_older_snapshot_migrates_on_the_next_open() {
+        let older = tempfile::tempdir().unwrap();
+        seed_on_disk(older.path(), Some(7)).await;
+        let v7 = backup_offline(older.path()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        seed_on_disk(dir.path(), None).await;
+
+        restore(dir.path(), &v7).unwrap();
+        assert_eq!(history_top(&dir.path().join("memory.db")), 7);
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        let top: i32 = store
+            .conn
+            .call(|c| c.query_row("SELECT MAX(version) FROM refinery_schema_history", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(top, 8);
+        let reasons: Vec<Option<Reason>> = files_in(&dir.path().join("backups"))
+            .iter()
+            .map(|n| parse_snapshot_name(n))
+            .collect();
+        assert!(reasons.contains(&Some(Reason::PreMigration)), "{reasons:?}");
+        assert!(reasons.contains(&Some(Reason::PreRestore)), "{reasons:?}");
     }
 
     #[tokio::test]
