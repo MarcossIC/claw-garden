@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| Transversal: la base del usuario es lo más importante del producto | L (al proponer se parte en partes A–F) | — | exploración (borrador) |
+| Transversal: la base del usuario es lo más importante del producto | L (al proponer se parte en partes A–F) | — | exploración (cerrada para A + F) |
 
 **Tesis:**
 
@@ -117,7 +117,7 @@ Agrupación sugerida para la propuesta:
   - es sólo por CLI, porque borrar en masa lo decide el usuario y no el agente;
   - depende de project-identity: con el `project_id` actual, un mismo repo puede estar partido en varios ids, y el borrado se quedaría corto.
 - [ ] **Perfil dev.** ¿El instalador también para el perfil dev?
-- [ ] **¿Se separa en los cuatro cambios sugeridos?**
+- [x] **¿Se separa en los cuatro cambios sugeridos?** Sí: `proposal.md` cubre A + F. B + C, D y E siguen acá hasta tener su propio cambio.
 
 ## Cómo se mide
 
