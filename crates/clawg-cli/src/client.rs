@@ -25,6 +25,7 @@ use clawg_core::paths::{data_dir, Profile};
 use serde::{Deserialize, Serialize};
 
 use crate::daemon::lifecycle::{read_state, read_token};
+use crate::relevance::RELEVANCE_RATIO;
 
 /// How often [`ensure_running`] re-checks a daemon it just asked for.
 pub const AUTOSTART_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -269,6 +270,23 @@ pub struct SearchArgs {
     pub limit: Option<usize>,
 }
 
+/// The body of `POST /v1/search`: the caller's arguments plus the bridge's
+/// relevance cut.
+///
+/// The cut rides on every search so the daemon records as accessed only the
+/// hits this client goes on to show; asking for the full list would count
+/// rows no agent ever read.
+#[derive(Serialize)]
+struct SearchRequest<'a> {
+    #[serde(flatten)]
+    args: &'a SearchArgs,
+    min_relative_score: f64,
+}
+
+fn search_request(args: &SearchArgs) -> SearchRequest<'_> {
+    SearchRequest { args, min_relative_score: RELEVANCE_RATIO }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ListArgs {
     pub kind: Option<String>,
@@ -413,7 +431,7 @@ impl DaemonClient {
             .http
             .post(self.url("/v1/search"))
             .bearer_auth(&self.token)
-            .json(&args)
+            .json(&search_request(&args))
             .send()
             .await
             .map_err(Self::map_transport)?;
@@ -972,6 +990,20 @@ pub(crate) mod tests {
 
         assert_eq!(c.set_importance("memory", id, 9.5).await.expect("patch"), 1);
         assert_eq!(c.delete("memory", id).await.expect("delete"), 1);
+    }
+
+    #[test]
+    fn search_request_carries_the_relevance_ratio() {
+        let args = SearchArgs {
+            query: "q".into(),
+            agent_id: "a".into(),
+            project_id: None,
+            limit: Some(5),
+        };
+        let body = serde_json::to_value(search_request(&args)).expect("serializes");
+        assert_eq!(body["min_relative_score"], serde_json::json!(crate::relevance::RELEVANCE_RATIO));
+        assert_eq!(body["query"], "q");
+        assert_eq!(body["limit"], 5);
     }
 
     // ── Error mapping ───────────────────────────────────────────────────────

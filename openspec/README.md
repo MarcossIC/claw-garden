@@ -22,7 +22,7 @@ exploration -> proposal -> spec (+ design si hace falta) -> tasks -> apply -> ve
 |---|--------|----------|--------|------------|--------|
 | 1 | [data-preservation](changes/data-preservation/proposal.md) | transversal | M (partes A + F; B–E siguen en la exploración) | — | tareas |
 | 2 | [ingest-durability](changes/ingest-durability/proposal.md) | 1 | M | — | verificación |
-| 3 | [retrieval-hygiene](changes/retrieval-hygiene/exploration.md) | 1 | S | — | exploración |
+| 3 | [retrieval-hygiene](changes/retrieval-hygiene/proposal.md) | 1 | S | — | verificación (falta rag-eval) |
 | 4 | [project-identity](changes/project-identity/exploration.md) | 2 | M | 1 (backup antes del re-key) | exploración |
 | 5 | [eval-golden-expansion](changes/eval-golden-expansion/exploration.md) | medición | M | — | exploración |
 | 6 | [visibility-policy](changes/visibility-policy/exploration.md) | 2, 4 | L | 4, 5 | exploración |
@@ -88,7 +88,7 @@ Ideas y afirmaciones contrastadas con el código. Las descartadas quedan con su 
 | Hallazgo | Cambio |
 |---|---|
 | Inflación de accesos: se cuentan hits que el agente nunca ve | retrieval-hygiene |
-| Los empates en score 0 se ordenan por id viejo | retrieval-hygiene |
+| Los empates en score 0 se ordenan por id viejo (es lo único que hoy deja ver un match léxico bajo el piso) | lexical-fusion |
 | Los saves aceptados se pierden al hacer `clawg stop`, también en cada actualización | data-preservation |
 | No hay backups, restore ni undelete. Un cambio de modelo esconde toda la memoria sin remedio | data-preservation |
 | Cola infinita si falla el bootstrap del embedder | ingest-durability |
