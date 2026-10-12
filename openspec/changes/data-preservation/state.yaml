@@ -1,14 +1,15 @@
 change: data-preservation
 objective: "cross-cutting: user data is never lost"
+scope: "parts A + F of the exploration; B + C, D and E become their own changes"
 depends_on: []
-phase: explore
+phase: tasks
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
   apply: pending
   verify: pending
   archive: pending
-updated: 2026-10-11
+updated: 2026-10-12
