@@ -1,7 +1,7 @@
 change: eval-golden-expansion
 objective: "measurement"
 depends_on: []
-phase: verify
+phase: archived
 artifacts:
   exploration: done
   proposal: done
@@ -10,5 +10,6 @@ artifacts:
   tasks: done
   apply: done
   verify: done
-  archive: pending
+  archive: done
+main_spec: openspec/specs/eval/spec.md
 updated: 2026-10-12
