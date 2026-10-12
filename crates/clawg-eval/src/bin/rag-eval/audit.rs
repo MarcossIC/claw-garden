@@ -421,6 +421,7 @@ mod tests {
             ndcg_10: recall_10,
             status: CaseStatus::Active,
             lang: None,
+            subset: crate::golden::CaseSubset::Natural,
         }
     }
 

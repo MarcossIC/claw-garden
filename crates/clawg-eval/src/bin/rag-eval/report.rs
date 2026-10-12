@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use clawg_core::eval_api::EvalScoringConfig;
 use serde::{Deserialize, Serialize};
 
-use crate::golden::CaseStatus;
+use crate::golden::{CaseStatus, CaseSubset};
 use crate::metrics::ThresholdCurveRow;
 
 /// Which embedder produced a run. A thin, report-local mirror of
@@ -79,6 +79,10 @@ pub struct CaseResult {
     /// or disagree about it — such a case still counts toward the headline
     /// aggregate, it just cannot be attributed to a single language.
     pub lang: Option<String>,
+    /// `#[serde(default)]` so a results file written before the label existed
+    /// still reads back in `--diff`.
+    #[serde(default)]
+    pub subset: CaseSubset,
 }
 
 /// Retrieval quality restricted to the cases of one language. The embedding
@@ -667,11 +671,29 @@ mod tests {
             ndcg_10: recall_10,
             status,
             lang: None,
+            subset: CaseSubset::Natural,
         }
     }
 
     fn case_in(query: &str, recall_10: f64, lang: Option<&str>) -> CaseResult {
         CaseResult { lang: lang.map(str::to_string), ..case(query, recall_10, CaseStatus::Active) }
+    }
+
+    #[test]
+    fn a_case_result_without_a_subset_reads_back_as_natural() {
+        let mut json = serde_json::to_value(case("q", 1.0, CaseStatus::Active)).unwrap();
+        json.as_object_mut().unwrap().remove("subset");
+        let back: CaseResult = serde_json::from_value(json).unwrap();
+        assert_eq!(back.subset, CaseSubset::Natural);
+    }
+
+    #[test]
+    fn a_lexical_case_result_round_trips() {
+        let lexical = CaseResult { subset: CaseSubset::Lexical, ..case("q", 1.0, CaseStatus::Active) };
+        let json = serde_json::to_value(&lexical).unwrap();
+        assert_eq!(json["subset"], "lexical");
+        let back: CaseResult = serde_json::from_value(json).unwrap();
+        assert_eq!(back.subset, CaseSubset::Lexical);
     }
 
     #[test]

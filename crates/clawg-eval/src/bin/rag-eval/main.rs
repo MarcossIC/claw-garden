@@ -18,7 +18,7 @@ use clawg_core::eval_api::{
     EMBED_MAX_TOKENS, SPECIAL_TOKEN_RESERVE,
 };
 
-use golden::{CaseStatus, PairLabel};
+use golden::{CaseStatus, CaseSubset, PairLabel};
 
 /// Result-pool sizes handed to `EvalStore::search`. `memory` is the widest
 /// pool because every golden-set corpus row seeds into the memory table;
@@ -225,6 +225,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             corpus_refs: case.corpus_refs.clone(),
             status: case.status,
             lang: case_lang(&case.expected_refs, &lang_by_ref),
+            subset: case.subset,
             embedding,
         });
     }
@@ -245,6 +246,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
                 corpus_refs: c.corpus_refs.clone(),
                 query_vector: c.embedding.clone(),
                 lang: c.lang.clone(),
+                subset: c.subset,
             })
             .collect();
         Some(build_similarity_results(
@@ -428,6 +430,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
                 ndcg_10,
                 status: ec.status,
                 lang: ec.lang.clone(),
+                subset: ec.subset,
             };
 
             if ec.status == CaseStatus::KnownRed {
@@ -839,6 +842,7 @@ async fn score_follow_up_arm<'a>(
             ndcg_10,
             status: case.status,
             lang: case_lang(&case.expected_refs, ctx.lang_by_ref),
+            subset: case.subset,
         });
     }
     Ok(per_case)
@@ -921,6 +925,7 @@ struct EmbeddedCase {
     corpus_refs: Vec<String>,
     status: CaseStatus,
     lang: Option<String>,
+    subset: CaseSubset,
     embedding: Vec<f32>,
 }
 
@@ -1066,6 +1071,7 @@ struct SimCaseSource {
     corpus_refs: Vec<String>,
     query_vector: Vec<f32>,
     lang: Option<String>,
+    subset: CaseSubset,
 }
 
 /// Builds the pure-cosine similarity block from the query vectors captured
@@ -1115,6 +1121,7 @@ fn build_similarity_results(
             ndcg_10,
             status: CaseStatus::Active,
             lang: src.lang.clone(),
+            subset: src.subset,
         });
 
         // Query-anchored rivals: every OTHER corpus vector, not just this
