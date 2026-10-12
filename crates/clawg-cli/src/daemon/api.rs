@@ -429,11 +429,14 @@ pub struct SaveBody {
     /// One entry per stored chunk, in chunk order, once the save is confirmed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memories: Option<Vec<SavedMemory>>,
+    /// The kinds of secret masked out of the content before it was stored.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub redacted: Vec<&'static str>,
 }
 
 impl SaveBody {
     fn queued(reason: &'static str) -> Self {
-        Self { status: "queued", reason: Some(reason), memories: None }
+        Self { status: "queued", reason: Some(reason), memories: None, redacted: Vec::new() }
     }
 }
 
@@ -628,7 +631,12 @@ fn save_response(confirmation: Confirmation) -> ApiResult<(StatusCode, SaveBody)
         None => {
             return Ok((
                 StatusCode::CREATED,
-                SaveBody { status: "saved", reason: None, memories: Some(memories) },
+                SaveBody {
+                    status: "saved",
+                    reason: None,
+                    memories: Some(memories),
+                    redacted: report.redacted.iter().map(|k| k.as_str()).collect(),
+                },
             ));
         }
         Some(IngestFailure::EmbedderUnavailable) => ApiError {
@@ -1023,6 +1031,7 @@ mod tests {
         let saved = save_response(Confirmation::Reported(IngestReport {
             memories: vec![chunk(57, ChunkOutcome::Inserted), chunk(12, ChunkOutcome::Reinforced)],
             failure: None,
+            ..Default::default()
         }))
         .expect("a clean report is a success");
         assert_eq!(saved.0, StatusCode::CREATED);
@@ -1040,6 +1049,7 @@ mod tests {
         let partial = save_response(Confirmation::Reported(IngestReport {
             memories: vec![chunk(57, ChunkOutcome::Inserted)],
             failure: Some(IngestFailure::Failed("store insert failed: disk full".into())),
+            ..Default::default()
         }))
         .expect_err("a failure is an error");
         assert_eq!(partial.status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -1050,11 +1060,34 @@ mod tests {
         let unavailable = save_response(Confirmation::Reported(IngestReport {
             memories: vec![],
             failure: Some(IngestFailure::EmbedderUnavailable),
+            ..Default::default()
         }))
         .expect_err("a failure is an error");
         assert_eq!(unavailable.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(unavailable.message, "embedder_unavailable");
         assert_eq!(unavailable.memories, Some(vec![]));
+    }
+
+    #[test]
+    fn a_confirmed_save_lists_the_kinds_it_masked() {
+        let (_, body) = save_response(Confirmation::Reported(IngestReport {
+            memories: vec![chunk(57, ChunkOutcome::Inserted)],
+            failure: None,
+            redacted: vec![
+                clawg_core::memory::redact::SecretKind::GithubToken,
+                clawg_core::memory::redact::SecretKind::Jwt,
+            ],
+        }))
+        .expect("a clean report is a success");
+        assert_eq!(body.redacted, vec!["github_token", "jwt"]);
+
+        let (_, plain) = save_response(Confirmation::Reported(IngestReport {
+            memories: vec![chunk(58, ChunkOutcome::Inserted)],
+            ..Default::default()
+        }))
+        .expect("a clean report is a success");
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("redacted").is_none(), "{json}");
     }
 
     #[test]

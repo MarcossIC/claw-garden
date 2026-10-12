@@ -15,11 +15,11 @@
 //!
 //! # Why `*_impl` exists beside each tool
 //!
-//! rmcp resolves the calling client from a `Peer`, which no test can construct
-//! (`Peer::new` is crate-private). So each `#[tool]` method does exactly two
-//! things — resolve the agent id from the peer, then delegate — and all the
-//! behaviour lives in an `*_impl` taking that id explicitly, where a test can
-//! drive it against an in-process daemon.
+//! rmcp resolves the calling client from a `RequestContext`, which no test can
+//! construct (its `Peer` is crate-private). So each `#[tool]` method does
+//! exactly two things — resolve the agent id from the request, then delegate —
+//! and all the behaviour lives in an `*_impl` taking that id explicitly, where
+//! a test can drive it against an in-process daemon.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -29,8 +29,11 @@ use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
-use rmcp::{tool, tool_handler, tool_router, Peer, RoleServer, ServerHandler};
+use rmcp::model::{
+    CallToolResult, ContentBlock, DiscoverResult, Implementation, ServerCapabilities, ServerConfig,
+};
+use rmcp::service::RequestContext;
+use rmcp::{tool, tool_handler, tool_router, RoleServer, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -87,7 +90,20 @@ pub fn resolve_agent(flag: Option<&str>, client: Option<&str>) -> (String, Agent
     }
 }
 
-/// What the host is told this server is for, at `initialize` time.
+/// The client name a request reads and writes under: the one it declares,
+/// else the last one a client declared to this bridge. Blank names count as
+/// none.
+///
+/// The second step is for the 2026-07-28 lifecycle, where a client names
+/// itself per request and only SHOULD: a stdio bridge serves one client, so a
+/// request that leaves the name out still comes from the one that gave it,
+/// and its memories must not drop out of sight under the fallback.
+fn client_name<'a>(declared: Option<&'a str>, remembered: Option<&'a str>) -> Option<&'a str> {
+    [declared, remembered].into_iter().flatten().find(|name| !name.trim().is_empty())
+}
+
+/// What the host is told this server is for, at `initialize` or
+/// `server/discover`.
 const INSTRUCTIONS: &str = "\
 Persistent memory for this user across sessions. Use `save_memory` whenever the \
 user states a durable fact, preference or decision; use `search_memory` before \
@@ -222,6 +238,9 @@ pub struct ClawgMcp {
     client: ClientHandle,
     /// `--agent`: wins over whatever the peer declares.
     configured_agent: Option<String>,
+    /// The last name a client declared to this bridge. Shared by every clone,
+    /// because rmcp clones the server per call.
+    declared: Arc<std::sync::Mutex<Option<String>>>,
     /// The project the bridge process itself is sitting in.
     default_project: Option<ProjectIdentity>,
     /// Roots (with the legacy id they were reached through) already sent to
@@ -269,6 +288,7 @@ impl ClawgMcp {
         Self {
             client,
             configured_agent: None,
+            declared: Arc::default(),
             default_project,
             registered: Arc::default(),
             profile,
@@ -284,24 +304,33 @@ impl ClawgMcp {
 
     /// Which agent's memory a call reads and writes, and why.
     ///
-    /// Resolved per call rather than once at construction because rmcp only
-    /// knows the peer after `initialize`, and a server built before that would
-    /// pin the fallback forever.
-    fn agent_for(&self, peer: Option<&Peer<RoleServer>>) -> (String, AgentSource) {
-        let client = peer.and_then(|p| p.peer_info().map(|info| info.client_info.name.clone()));
-        resolve_agent(self.configured_agent.as_deref(), client.as_deref())
+    /// Resolved per call rather than once at construction: the client names
+    /// itself in `initialize` or in each request's `_meta`, both after the
+    /// server is built.
+    fn agent_for(&self, ctx: Option<&RequestContext<RoleServer>>) -> (String, AgentSource) {
+        let declared = ctx.and_then(|ctx| self.remember(ctx));
+        let remembered = self.declared.lock().expect("declared lock").clone();
+        let client = client_name(declared.as_deref(), remembered.as_deref());
+        resolve_agent(self.configured_agent.as_deref(), client)
     }
 
-    fn agent_id_for(&self, peer: Option<&Peer<RoleServer>>) -> String {
-        self.agent_for(peer).0
+    fn agent_id_for(&self, ctx: Option<&RequestContext<RoleServer>>) -> String {
+        self.agent_for(ctx).0
+    }
+
+    /// Records the name `ctx`'s client declares, if any, and returns it.
+    fn remember(&self, ctx: &RequestContext<RoleServer>) -> Option<String> {
+        let name = ctx.client_info().map(|info| info.name).filter(|n| !n.trim().is_empty())?;
+        *self.declared.lock().expect("declared lock") = Some(name.clone());
+        Some(name)
     }
 
     fn ok(text: impl Into<String>) -> Result<CallToolResult, rmcp::ErrorData> {
-        Ok(CallToolResult::success(vec![Content::text(text.into())]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(text.into())]))
     }
 
     fn failed(text: impl Into<String>) -> Result<CallToolResult, rmcp::ErrorData> {
-        Ok(CallToolResult::error(vec![Content::text(text.into())]))
+        Ok(CallToolResult::error(vec![ContentBlock::text(text.into())]))
     }
 
     /// The daemon client, once the background start has produced one.
@@ -310,7 +339,7 @@ impl ClawgMcp {
     /// returns it as its own result instead of hanging or dropping the bridge.
     async fn daemon(&self) -> Result<DaemonClient, CallToolResult> {
         self.client.get().await.map_err(|e| {
-            CallToolResult::error(vec![Content::text(Self::explain(&e))])
+            CallToolResult::error(vec![ContentBlock::text(Self::explain(&e))])
         })
     }
 
@@ -364,13 +393,19 @@ impl ClawgMcp {
             memories.iter().map(|m| format!("#{}", m.id)).collect::<Vec<_>>().join(", ")
         };
         match result {
-            Ok(SaveOutcome::Saved { memories }) => Ok(match memories.as_slice() {
-                [one] if one.outcome == "reinforced" => {
-                    format!("already stored as #{}; reinforced it instead of saving a copy", one.id)
+            Ok(SaveOutcome::Saved { memories, redacted }) => {
+                let mut text = match memories.as_slice() {
+                    [one] if one.outcome == "reinforced" => {
+                        format!("already stored as #{}; reinforced it instead of saving a copy", one.id)
+                    }
+                    [one] => format!("saved #{}", one.id),
+                    many => format!("saved as {} pieces: {}", many.len(), ids(many)),
+                };
+                if !redacted.is_empty() {
+                    text.push_str(&format!("; masked {} before storing it", redacted.join(", ")));
                 }
-                [one] => format!("saved #{}", one.id),
-                many => format!("saved as {} pieces: {}", many.len(), ids(many)),
-            }),
+                Ok(text)
+            }
             Ok(SaveOutcome::Queued { reason }) if reason.as_deref() == Some("embedder_loading") => {
                 Ok("accepted; it will be stored once the embedding model finishes loading".into())
             }
@@ -630,10 +665,10 @@ impl ClawgMcp {
     )]
     async fn save_memory(
         &self,
-        peer: Peer<RoleServer>,
+        ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<SaveMemoryArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.save_memory_impl(&self.agent_id_for(Some(&peer)), args).await
+        self.save_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
     }
 
     #[tool(
@@ -649,10 +684,10 @@ impl ClawgMcp {
     )]
     async fn search_memory(
         &self,
-        peer: Peer<RoleServer>,
+        ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<SearchMemoryArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.search_memory_impl(&self.agent_id_for(Some(&peer)), args).await
+        self.search_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
     }
 
     #[tool(
@@ -665,10 +700,10 @@ impl ClawgMcp {
     )]
     async fn recall_context(
         &self,
-        peer: Peer<RoleServer>,
+        ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<RecallContextArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.recall_context_impl(&self.agent_id_for(Some(&peer)), args).await
+        self.recall_context_impl(&self.agent_id_for(Some(&ctx)), args).await
     }
 
     #[tool(
@@ -680,10 +715,10 @@ impl ClawgMcp {
     )]
     async fn list_memories(
         &self,
-        peer: Peer<RoleServer>,
+        ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<ListMemoriesArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.list_memories_impl(&self.agent_id_for(Some(&peer)), args).await
+        self.list_memories_impl(&self.agent_id_for(Some(&ctx)), args).await
     }
 
     #[tool(
@@ -694,10 +729,10 @@ impl ClawgMcp {
     )]
     async fn delete_memory(
         &self,
-        peer: Peer<RoleServer>,
+        ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<DeleteMemoryArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.delete_memory_impl(&self.agent_id_for(Some(&peer)), args).await
+        self.delete_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
     }
 
     #[tool(
@@ -710,10 +745,10 @@ impl ClawgMcp {
     )]
     async fn resolve_conflict(
         &self,
-        peer: Peer<RoleServer>,
+        ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<ResolveConflictArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.resolve_conflict_impl(&self.agent_id_for(Some(&peer)), args).await
+        self.resolve_conflict_impl(&self.agent_id_for(Some(&ctx)), args).await
     }
 
     #[tool(
@@ -728,10 +763,10 @@ impl ClawgMcp {
     )]
     async fn synthesize(
         &self,
-        peer: Peer<RoleServer>,
+        ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<SynthesizeArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.synthesize_impl(&self.agent_id_for(Some(&peer)), args).await
+        self.synthesize_impl(&self.agent_id_for(Some(&ctx)), args).await
     }
 
     #[tool(
@@ -741,18 +776,20 @@ impl ClawgMcp {
                        loading. Use this when a memory tool fails and you need to tell the \
                        user why."
     )]
-    async fn memory_status(&self, peer: Peer<RoleServer>) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.memory_status_impl(self.agent_for(Some(&peer))).await
+    async fn memory_status(&self, ctx: RequestContext<RoleServer>) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.memory_status_impl(self.agent_for(Some(&ctx))).await
     }
 }
 
-#[tool_handler]
+// The router built once in `with_handle`, not one per call, which is what
+// the macro does by default.
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for ClawgMcp {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         // Built through the constructor, not a struct literal: `ServerInfo` is
         // `#[non_exhaustive]`, so a literal would break on any rmcp release
         // that adds a field. Assignment afterwards is unaffected.
-        let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
+        let mut info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build());
         // The profile's own name, so a dev bridge and a prod bridge are two
         // distinguishable servers in the host's list rather than one shadowing
         // the other.
@@ -760,6 +797,16 @@ impl ServerHandler for ClawgMcp {
             Implementation::new(self.profile.mcp_server_name(), env!("CARGO_PKG_VERSION"));
         info.instructions = Some(INSTRUCTIONS.to_string());
         info
+    }
+
+    /// rmcp's own answer, plus remembering who asked: a 2026-07-28 client may
+    /// name itself here and leave the name out of later requests.
+    async fn discover(&self, context: RequestContext<RoleServer>) -> Result<DiscoverResult, rmcp::ErrorData> {
+        self.remember(&context);
+        Ok(DiscoverResult::from_server_info(
+            self.supported_protocol_versions().into_owned(),
+            self.get_info(),
+        ))
     }
 }
 
@@ -949,10 +996,165 @@ mod tests {
 
     // ── agent identity ──────────────────────────────────────────────────────
 
+    #[test]
+    fn the_name_the_request_declares_wins() {
+        assert_eq!(client_name(Some("claude-code"), Some("earlier")), Some("claude-code"));
+    }
+
+    #[test]
+    fn a_request_that_declares_no_name_keeps_the_one_declared_earlier() {
+        assert_eq!(client_name(None, Some("claude-code")), Some("claude-code"));
+    }
+
+    #[test]
+    fn a_blank_name_counts_as_none() {
+        assert_eq!(client_name(Some("  "), Some("claude-code")), Some("claude-code"));
+        assert_eq!(client_name(Some(""), None), None);
+    }
+
     #[tokio::test]
-    async fn agent_id_falls_back_when_no_peer_has_identified_itself() {
+    async fn agent_id_falls_back_when_no_client_has_identified_itself() {
         let (b, _d) = bridge().await;
         assert_eq!(b.agent_id_for(None), FALLBACK_AGENT_ID);
+    }
+
+    // ── agent identity over the wire ────────────────────────────────────────
+
+    type HostLines = tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>;
+
+    /// One MCP session against `b`, as a host would open it over stdio.
+    struct Session {
+        write: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        lines: HostLines,
+        next_id: u32,
+    }
+
+    impl Session {
+        fn open(b: &ClawgMcp) -> Self {
+            use rmcp::transport::async_rw::AsyncRwTransport;
+            use rmcp::ServiceExt;
+            use tokio::io::AsyncBufReadExt;
+
+            let (host, server) = tokio::io::duplex(64 * 1024);
+            let (server_read, server_write) = tokio::io::split(server);
+            let bridge = b.clone();
+            tokio::spawn(async move {
+                if let Ok(running) = bridge.serve(AsyncRwTransport::new_server(server_read, server_write)).await {
+                    let _ = running.waiting().await;
+                }
+            });
+            let (host_read, write) = tokio::io::split(host);
+            Self { write, lines: tokio::io::BufReader::new(host_read).lines(), next_id: 1 }
+        }
+
+        async fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+            use tokio::io::AsyncWriteExt;
+
+            let id = self.next_id;
+            self.next_id += 1;
+            let frame = serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+            self.write.write_all(format!("{frame}\n").as_bytes()).await.expect("host write");
+            let line = tokio::time::timeout(Duration::from_secs(10), self.lines.next_line())
+                .await
+                .expect("the bridge answers within 10 s")
+                .expect("readable stream")
+                .expect("the bridge is still alive");
+            let reply: serde_json::Value = serde_json::from_str(&line).expect("a JSON-RPC line");
+            assert_eq!(reply["id"], id, "{reply}");
+            reply
+        }
+
+        async fn initialize(&mut self, client: &str) {
+            let reply = self
+                .request(
+                    "initialize",
+                    serde_json::json!({
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": { "name": client, "version": "0" }
+                    }),
+                )
+                .await;
+            assert!(reply["result"].is_object(), "{reply}");
+        }
+
+        /// A tool call; `meta` is the request's `_meta`, absent in a legacy session.
+        async fn call(&mut self, meta: Option<serde_json::Value>, tool: &str, arguments: serde_json::Value) -> String {
+            let mut params = serde_json::json!({ "name": tool, "arguments": arguments });
+            if let Some(meta) = meta {
+                params["_meta"] = meta;
+            }
+            let reply = self.request("tools/call", params).await;
+            assert_eq!(reply["result"]["isError"], false, "{reply}");
+            reply["result"]["content"][0]["text"].as_str().unwrap_or_default().to_string()
+        }
+    }
+
+    /// The `_meta` a 2026-07-28 client puts on each request, naming itself as
+    /// `client` or, with `None`, not at all.
+    fn modern_meta(client: Option<&str>) -> serde_json::Value {
+        let mut meta = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {}
+        });
+        if let Some(name) = client {
+            meta["io.modelcontextprotocol/clientInfo"] = serde_json::json!({ "name": name, "version": "0" });
+        }
+        meta
+    }
+
+    async fn rows_of(b: &ClawgMcp, agent: &str) -> usize {
+        let client = b.daemon().await.expect("daemon");
+        client
+            .list(ListArgs { kind: Some("memory".into()), agent: Some(agent.into()), ..Default::default() })
+            .await
+            .expect("list")
+            .len()
+    }
+
+    #[tokio::test]
+    async fn a_session_without_initialize_saves_under_the_client_it_declares() {
+        let (b, _d) = bridge().await;
+        let mut session = Session::open(&b);
+
+        session
+            .call(Some(modern_meta(Some("probe-host"))), "save_memory", serde_json::json!({ "content": "deploys happen on tuesdays" }))
+            .await;
+
+        assert_eq!(rows_of(&b, "probe-host").await, 1);
+        assert_eq!(rows_of(&b, FALLBACK_AGENT_ID).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_request_without_client_info_keeps_the_name_declared_on_discover() {
+        let (b, _d) = bridge().await;
+        let mut session = Session::open(&b);
+
+        let discovered = session.request("server/discover", serde_json::json!({ "_meta": modern_meta(Some("probe-host")) })).await;
+        assert!(discovered["result"].is_object(), "{discovered}");
+        session
+            .call(Some(modern_meta(None)), "save_memory", serde_json::json!({ "content": "deploys happen on tuesdays" }))
+            .await;
+
+        assert_eq!(rows_of(&b, "probe-host").await, 1);
+    }
+
+    /// Memories a client saved through the `initialize` handshake are found
+    /// when the same client comes back without it.
+    #[tokio::test]
+    async fn memories_saved_through_initialize_stay_visible_without_it() {
+        let (b, _d) = bridge().await;
+        let content = "the team deploys on tuesdays and never on fridays";
+        let mut legacy = Session::open(&b);
+        legacy.initialize("probe-host").await;
+        legacy.call(None, "save_memory", serde_json::json!({ "content": content })).await;
+
+        let mut modern = Session::open(&b);
+        let found = modern
+            .call(Some(modern_meta(Some("probe-host"))), "search_memory", serde_json::json!({ "query": content }))
+            .await;
+
+        assert!(found.contains(content), "{found}");
     }
 
     #[test]
@@ -1399,20 +1601,42 @@ mod tests {
     }
 
     #[test]
+    fn a_masked_save_tells_the_agent_what_was_masked() {
+        let text = |r| ClawgMcp::save_outcome_text(r);
+        assert_eq!(
+            text(Ok(SaveOutcome::Saved {
+                memories: vec![saved(57, "inserted")],
+                redacted: vec!["slack_token".into()],
+            })),
+            Ok("saved #57; masked slack_token before storing it".to_string())
+        );
+        assert_eq!(
+            text(Ok(SaveOutcome::Saved {
+                memories: vec![saved(57, "reinforced")],
+                redacted: vec!["github_token".into(), "jwt".into()],
+            })),
+            Ok("already stored as #57; reinforced it instead of saving a copy; \
+                masked github_token, jwt before storing it"
+                .to_string())
+        );
+    }
+
+    #[test]
     fn save_outcome_text_covers_every_daemon_answer() {
         let text = |r| ClawgMcp::save_outcome_text(r);
         assert_eq!(
-            text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "inserted")] })),
+            text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "inserted")], redacted: vec![] })),
             Ok("saved #57".to_string())
         );
         assert_eq!(
             text(Ok(SaveOutcome::Saved {
-                memories: vec![saved(57, "inserted"), saved(58, "inserted"), saved(59, "reinforced")]
+                memories: vec![saved(57, "inserted"), saved(58, "inserted"), saved(59, "reinforced")],
+                redacted: vec![],
             })),
             Ok("saved as 3 pieces: #57, #58, #59".to_string())
         );
         assert_eq!(
-            text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "reinforced")] })),
+            text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "reinforced")], redacted: vec![] })),
             Ok("already stored as #57; reinforced it instead of saving a copy".to_string())
         );
         assert_eq!(

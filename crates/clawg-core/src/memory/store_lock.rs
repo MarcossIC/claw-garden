@@ -55,7 +55,7 @@ pub enum StoreHolder {
     Daemon,
     /// An evaluation run (`rag-eval`).
     Eval,
-    /// `clawg backup` or `clawg restore` on a stopped store.
+    /// `clawg backup`, `clawg restore` or `clawg purge` on a stopped store.
     Maintenance,
 }
 
@@ -64,7 +64,7 @@ impl std::fmt::Display for StoreHolder {
         f.write_str(match self {
             StoreHolder::Daemon => "the clawg daemon",
             StoreHolder::Eval => "an evaluation run",
-            StoreHolder::Maintenance => "a clawg backup or restore",
+            StoreHolder::Maintenance => "a clawg backup, restore or purge",
         })
     }
 }
@@ -326,7 +326,7 @@ mod tests {
     fn holders_have_human_names() {
         assert_eq!(StoreHolder::Daemon.to_string(), "the clawg daemon");
         assert_eq!(StoreHolder::Eval.to_string(), "an evaluation run");
-        assert_eq!(StoreHolder::Maintenance.to_string(), "a clawg backup or restore");
+        assert_eq!(StoreHolder::Maintenance.to_string(), "a clawg backup, restore or purge");
     }
 
     #[test]

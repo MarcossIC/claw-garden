@@ -67,6 +67,10 @@ pub enum MemoryError {
     #[error(transparent)]
     Backup(#[from] crate::memory::backup::BackupError),
 
+    /// A purge was refused, or could not finish.
+    #[error(transparent)]
+    Purge(#[from] crate::memory::secrets::PurgeError),
+
     /// The store's lock file could not be opened or locked for a reason other
     /// than contention (permissions, a read-only file system).
     #[error("memory store lock error at {path}: {source}")]

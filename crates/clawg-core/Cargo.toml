@@ -55,6 +55,7 @@ tree-sitter-rust.workspace = true
 tree-sitter-typescript.workspace = true
 tree-sitter-python.workspace = true
 tokenizers.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 # Enables tokio::time::pause() / advance() and #[tokio::test(start_paused = true)]

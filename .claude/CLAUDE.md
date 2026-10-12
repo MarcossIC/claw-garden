@@ -34,10 +34,14 @@ Design documents live in `docs/`.
 - `clawg stop [--profile P]`: stop the daemon and wait for the process to exit.
 - `clawg backup [--profile P]`: write a snapshot of `memory.db` to `<data>/backups` and print its path; goes through the daemon when one is running.
 - `clawg restore <FILE> [--profile P]`: replace `memory.db` with a snapshot. The daemon must be stopped; the replaced store is snapshotted first.
+- `clawg secrets [--profile P]`: list the `memory` rows, live or deleted, that hold a secret of a known format, by id and kind and never the secret. Read-only; works with the daemon running.
+- `clawg purge <ID> --yes [--profile P]`: remove one `memory` row for good (text, vector, index terms, free pages and WAL) and name the backups that still hold it. The daemon must be stopped; no snapshot is taken.
 - `clawg doctor [--profile P]`: print as JSON which `clawg.exe` files the PATH resolves to; exit 1 if the first is not the running binary or a second copy exists. Does not open the store.
 - `clawg path add|remove [--dir D]`: edit the user PATH (Windows).
 
 Daemon HTTP API: `GET /health` (open) and, behind the bearer token, `POST/GET /v1/memories`, `POST /v1/search`, `POST /v1/context`, `PATCH/DELETE /v1/memories/{kind}/{id}` (`?agent=` limits them to that agent's rows), `POST /v1/projects` (record a project root and move rows saved under its legacy ids), `POST /v1/backup`, `POST /v1/disputes/resolve` (optional `agent_id`, same scope), `POST /v1/synthesis` (memories no conclusion covers yet, and the conclusions already drawn; optional `agent_id`, same scope), `POST /v1/shutdown`.
+
+Ingest masks secrets of known formats (`crates/clawg-core/src/memory/redact.rs`) before a save is chunked, hashed or embedded; a confirmed save lists the masked kinds in `redacted`.
 
 MCP tools (`crates/clawg-cli/src/mcp/server.rs`): `save_memory`, `search_memory`, `recall_context`, `list_memories`, `delete_memory`, `resolve_conflict`, `synthesize`, `memory_status`.
 

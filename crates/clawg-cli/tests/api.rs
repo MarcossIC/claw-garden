@@ -495,6 +495,26 @@ async fn a_save_answers_201_with_the_id_of_the_row_it_wrote() {
 }
 
 #[tokio::test]
+async fn a_save_reports_the_secrets_it_masked() {
+    let h = Harness::start().await;
+    // Built at run time so no literal in the repository looks like a live
+    // credential to a secret scanner.
+    let token = format!("xoxb-{}", "12345-".repeat(4));
+    let (status, body) = h
+        .post_json("/v1/memories", json!({ "content": format!("the bot uses {token}"), "agent_id": "a" }))
+        .await;
+
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["redacted"], json!(["slack_token"]));
+    let id = body["memories"][0]["id"].as_i64().expect("id");
+    let (_, item) = h.get_json(&format!("/v1/memories/memory/{id}")).await;
+    assert_eq!(item["item"]["summary"], "the bot uses [REDACTED:slack_token]");
+
+    let (_, plain) = h.post_json("/v1/memories", json!({ "content": "nothing secret", "agent_id": "a" })).await;
+    assert!(plain.get("redacted").is_none(), "{plain}");
+}
+
+#[tokio::test]
 async fn a_multi_chunk_save_returns_one_id_per_chunk() {
     let h = Harness::start().await;
     // Distinct words, long enough for three windows of the fallback chunker.

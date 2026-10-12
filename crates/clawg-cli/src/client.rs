@@ -293,8 +293,9 @@ pub struct SavedMemory {
 /// How the daemon answered a save that did not fail.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SaveOutcome {
-    /// Stored, one entry per chunk.
-    Saved { memories: Vec<SavedMemory> },
+    /// Stored, one entry per chunk. `redacted` names the kinds of secret
+    /// masked out before storing; a daemon that predates masking sends none.
+    Saved { memories: Vec<SavedMemory>, redacted: Vec<String> },
     /// Accepted but not confirmed; `reason` says why (`"unconfirmed"`,
     /// `"embedder_loading"`).
     Queued { reason: Option<String> },
@@ -450,6 +451,8 @@ impl DaemonClient {
             reason: Option<String>,
             #[serde(default)]
             memories: Vec<SavedMemory>,
+            #[serde(default)]
+            redacted: Vec<String>,
         }
         let resp = self
             .http
@@ -461,7 +464,7 @@ impl DaemonClient {
             .map_err(Self::map_transport)?;
         let body: Body = Self::read_response(resp).await?;
         Ok(match body.status.as_str() {
-            "saved" => SaveOutcome::Saved { memories: body.memories },
+            "saved" => SaveOutcome::Saved { memories: body.memories, redacted: body.redacted },
             _ => SaveOutcome::Queued { reason: body.reason },
         })
     }
@@ -1165,7 +1168,7 @@ pub(crate) mod tests {
         };
 
         let first = c.save(args.clone()).await.expect("save");
-        let SaveOutcome::Saved { memories } = &first else { panic!("expected Saved, got {first:?}") };
+        let SaveOutcome::Saved { memories, .. } = &first else { panic!("expected Saved, got {first:?}") };
         assert_eq!(memories.len(), 1);
         assert_eq!(memories[0].kind, "memory");
         assert_eq!(memories[0].outcome, "inserted");
@@ -1174,7 +1177,8 @@ pub(crate) mod tests {
         assert_eq!(
             second,
             SaveOutcome::Saved {
-                memories: vec![SavedMemory { kind: "memory".into(), id: memories[0].id, outcome: "reinforced".into() }]
+                memories: vec![SavedMemory { kind: "memory".into(), id: memories[0].id, outcome: "reinforced".into() }],
+                redacted: vec![],
             }
         );
     }

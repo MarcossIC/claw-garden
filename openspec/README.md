@@ -30,10 +30,10 @@ exploration -> proposal -> spec (+ design si hace falta) -> tasks -> apply -> ve
 | 7 | [lexical-fusion](changes/lexical-fusion/proposal.md) | 1, 3 | M | 5 | verify: tests en verde; falta la medición `--real` con el golden set ([`verify.md`](changes/lexical-fusion/verify.md#pendiente-máquina-del-usuario)) |
 | 8 | [memory-update-tool](changes/memory-update-tool/exploration.md) | 1 | S | 6 (scope) | exploración |
 | 9 | [dispute-resolution](changes/dispute-resolution/proposal.md) | 1, 5 | M | 5 | verificación (falta rag-eval y Windows) |
-| 10 | [mcp-protocol-upgrade](changes/mcp-protocol-upgrade/exploration.md) | 4 | M | 6 (identidad) | exploración |
+| 10 | [mcp-protocol-upgrade](changes/mcp-protocol-upgrade/proposal.md) | 4 | M | 6 (`--agent`) | verify: tests en verde en Linux; faltan Windows y la prueba con Claude Code real ([`verify.md`](changes/mcp-protocol-upgrade/verify.md#pendiente-máquina-del-usuario)) |
 | 11 | [knowledge-synthesis](changes/knowledge-synthesis/proposal.md) | 5 | M (limpieza + síntesis dirigida por el agente) | — | verify: tests en verde en Linux; faltan Windows, `rag-eval --real` y la prueba con el perfil dev ([`verify.md`](changes/knowledge-synthesis/verify.md#pendiente-máquina-de-marcos)) |
 | 12 | [project-indexing](changes/project-indexing/exploration.md) | 3 | decisión | 5 | exploración |
-| 13 | [secret-hygiene](changes/secret-hygiene/exploration.md) | 1, 4 | S | — (tiene que cerrar antes de 6) | exploración |
+| 13 | [secret-hygiene](changes/secret-hygiene/proposal.md) | 1, 4 | S–M | — (tiene que cerrar antes de 6) | verify: tests en verde en Linux; faltan Windows, `rag-eval --real` y el perfil dev ([`verify.md`](changes/secret-hygiene/verify.md#pendiente-máquina-del-usuario)) |
 | 14 | [context-density](changes/context-density/exploration.md) | 1 | S–M | — (se suma a 9) | exploración |
 | 15 | [long-save-context](changes/long-save-context/exploration.md) | 1 | S–M | 5, después de 9 (1 si toca el esquema) | exploración |
 

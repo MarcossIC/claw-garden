@@ -1,90 +1,74 @@
-//! Tolerance for whatever a host sends before `initialize`.
+//! Tolerance for whatever a host sends before a session exists.
 //!
 //! # The failure this exists for
 //!
-//! rmcp 1.3 accepts exactly two things as a session's first request:
-//! `initialize`, and a `ping` before it. Anything else ends the server with
-//! `ExpectedInitializeRequest` — the process exits without answering. Claude
-//! Code 2.1.285 opens every stdio session with a `server/discover` probe for a
-//! newer protocol lifecycle, and falls back to `initialize` only once the
-//! probe comes back as an error. A server that dies instead of answering never
-//! gets that far: the host waits out its whole connect timeout (30 s) and
-//! reports `CONNECT_TIMEOUT`. Servers built on other SDKs (engram, notebooklm)
-//! answer the probe with an error and connect in the legacy era in ~200 ms.
+//! Until a session starts, rmcp answers requests itself: `ping`,
+//! `server/discover`, and any request missing the `_meta` the 2026-07-28
+//! lifecycle needs. A session starts with `initialize` (the legacy lifecycle)
+//! or with the first other request that carries that `_meta`. But a
+//! notification or a stray response before then ends the server with
+//! `ExpectedInitializeRequest`, and the process exits without a word. A host
+//! that gives up on its `server/discover` probe and cancels it, as Claude Code
+//! 2.1.285 can, sends exactly such a notification. A dead bridge leaves the
+//! host waiting out its connect timeout (30 s) and reporting `CONNECT_TIMEOUT`.
 //!
 //! # What the guard does
 //!
-//! [`PreInitGuard`] wraps the transport rmcp reads from. Until `initialize`
-//! goes through it answers, on rmcp's behalf, every request rmcp would die on:
-//! methods it has never heard of get `-32601 Method not found`, known methods
-//! sent too early get `-32600 Invalid request`. Notifications and stray
-//! responses have nobody to answer and are dropped. From `initialize` on the
-//! guard is transparent — rmcp's own dispatcher already answers unknown
-//! methods properly once a session exists.
-//!
-//! rmcp 3.x implements `server/discover` natively; this guard is the bridge's
-//! answer for as long as it stays on 1.x.
+//! [`PreInitGuard`] wraps the transport rmcp reads from. Until a session
+//! exists it drops notifications and stray responses, which have nobody to
+//! answer, and hands every request to rmcp. A request that can start a session
+//! only does once rmcp answers it with a result: rmcp refuses one without the
+//! `_meta` it needs and keeps waiting, and the guard keeps guarding. From the
+//! first result on it is transparent.
 
 use std::future::Future;
 
-use rmcp::model::{
-    ClientJsonRpcMessage, ClientRequest, ErrorCode, ErrorData, RequestId, ServerJsonRpcMessage,
-};
+use rmcp::model::{ClientJsonRpcMessage, ClientRequest, RequestId, ServerJsonRpcMessage};
 use rmcp::service::RxJsonRpcMessage;
 use rmcp::transport::Transport;
 use rmcp::RoleServer;
 
-/// What to do with one message that arrived before `initialize`.
+/// What to do with one message that arrived before a session exists.
 #[derive(Debug, PartialEq)]
 pub enum PreInit {
-    /// `initialize` itself: hand it to rmcp; the session starts here.
-    Initialize,
-    /// Something rmcp already tolerates before `initialize` (`ping`).
+    /// A request that can start a session: hand it to rmcp, which either
+    /// starts one or answers it and keeps waiting.
+    Start,
+    /// A request rmcp answers without starting a session (`ping`,
+    /// `server/discover`).
     Forward,
-    /// Answer request `id` with `error` on rmcp's behalf and keep waiting.
-    Reject { id: RequestId, error: ErrorData },
-    /// A notification or a stray response: nothing to answer, nothing rmcp
-    /// can use before a session exists.
+    /// A notification or a stray response: nothing to answer, and rmcp would
+    /// end the server on it.
     Discard,
 }
 
-/// Classifies a message received before `initialize`. Pure, so every branch
-/// is testable without a transport.
-pub fn before_initialize(msg: &ClientJsonRpcMessage) -> PreInit {
+/// Classifies a message received before a session exists. Pure, so every
+/// branch is testable without a transport.
+pub fn before_session(msg: &ClientJsonRpcMessage) -> PreInit {
     let ClientJsonRpcMessage::Request(req) = msg else {
         return PreInit::Discard;
     };
-    let method = req.request.method();
-    let error = match &req.request {
-        ClientRequest::InitializeRequest(_) => return PreInit::Initialize,
-        ClientRequest::PingRequest(_) => return PreInit::Forward,
-        // rmcp parses every method it has no type for into `CustomRequest`,
-        // so this arm is exactly "a method this server does not implement".
-        ClientRequest::CustomRequest(_) => ErrorData::new(
-            ErrorCode::METHOD_NOT_FOUND,
-            format!("method not found: {method}"),
-            None,
-        ),
-        _ => ErrorData::invalid_request(format!("{method} sent before initialize"), None),
-    };
-    PreInit::Reject {
-        id: req.id.clone(),
-        error,
+    match &req.request {
+        ClientRequest::PingRequest(_) | ClientRequest::DiscoverRequest(_) => PreInit::Forward,
+        _ => PreInit::Start,
     }
 }
 
-/// A transport that keeps rmcp alive through a host's pre-`initialize` probes.
-/// See the module docs for why.
+/// A transport that keeps rmcp alive through what a host sends before a
+/// session exists. See the module docs for why.
 pub struct PreInitGuard<T> {
     inner: T,
-    initialized: bool,
+    started: bool,
+    /// The request that may be starting a session, until rmcp answers it.
+    starting: Option<RequestId>,
 }
 
 impl<T> PreInitGuard<T> {
     pub fn new(inner: T) -> Self {
         Self {
             inner,
-            initialized: false,
+            started: false,
+            starting: None,
         }
     }
 }
@@ -99,30 +83,34 @@ where
         &mut self,
         item: ServerJsonRpcMessage,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+        if let Some(id) = &self.starting {
+            match &item {
+                ServerJsonRpcMessage::Response(r) if &r.id == id => {
+                    self.started = true;
+                    self.starting = None;
+                }
+                ServerJsonRpcMessage::Error(e) if e.id.as_ref() == Some(id) => self.starting = None,
+                _ => {}
+            }
+        }
         self.inner.send(item)
     }
 
     async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleServer>> {
         loop {
             let msg = self.inner.receive().await?;
-            if self.initialized {
+            if self.started {
                 return Some(msg);
             }
-            match before_initialize(&msg) {
-                PreInit::Initialize => {
-                    self.initialized = true;
+            match before_session(&msg) {
+                PreInit::Start => {
+                    if let ClientJsonRpcMessage::Request(req) = &msg {
+                        self.starting = Some(req.id.clone());
+                    }
                     return Some(msg);
                 }
                 PreInit::Forward => return Some(msg),
-                PreInit::Reject { id, error } => {
-                    log::debug!("answered a pre-initialize request: {}", error.message);
-                    if let Err(e) = self.inner.send(ServerJsonRpcMessage::error(error, id)).await {
-                        // The host is gone; there is no session left to start.
-                        log::warn!("could not answer a pre-initialize request: {e}");
-                        return None;
-                    }
-                }
-                PreInit::Discard => log::debug!("dropped a pre-initialize message"),
+                PreInit::Discard => log::debug!("dropped a message sent before a session"),
             }
         }
     }
@@ -148,9 +136,25 @@ mod tests {
     use crate::client::DaemonClient;
     use crate::mcp::server::ClawgMcp;
 
-    /// The probe exactly as Claude Code 2.1.285 opens a stdio session with it,
-    /// minus the `_meta` payload, which rmcp moves into extensions anyway.
-    const DISCOVER_PROBE: &str = r#"{"jsonrpc":"2.0","id":"server-discover-probe-1","method":"server/discover","params":{}}"#;
+    /// The probe Claude Code 2.1.285 opens a stdio session with, without the
+    /// `_meta` it carries.
+    const BARE_PROBE: &str = r#"{"jsonrpc":"2.0","id":"server-discover-probe-1","method":"server/discover","params":{}}"#;
+
+    const CANCEL_PROBE: &str = r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"server-discover-probe-1"}}"#;
+
+    /// The `_meta` a 2026-07-28 client puts on every request.
+    fn modern_meta() -> Value {
+        json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/clientInfo": { "name": "probe-host", "version": "0" }
+        })
+    }
+
+    fn modern(id: u32, method: &str) -> String {
+        json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": { "_meta": modern_meta() } })
+            .to_string()
+    }
 
     fn parse(line: &str) -> ClientJsonRpcMessage {
         serde_json::from_str(line).expect("a valid client message")
@@ -170,59 +174,38 @@ mod tests {
         .to_string()
     }
 
-    /// The wire form of a rejection, so the tests assert what the host reads.
-    fn rejection(action: PreInit) -> Value {
-        let PreInit::Reject { id, error } = action else {
-            panic!("expected a rejection, got {action:?}");
-        };
-        serde_json::to_value(ServerJsonRpcMessage::error(error, id)).expect("serialisable reply")
-    }
-
-    // ── before_initialize ───────────────────────────────────────────────────
+    // ── before_session ──────────────────────────────────────────────────────
 
     #[test]
-    fn an_unknown_method_is_answered_as_method_not_found_under_its_own_id() {
-        let reply = rejection(before_initialize(&parse(DISCOVER_PROBE)));
-        assert_eq!(reply["id"], "server-discover-probe-1");
-        assert_eq!(reply["error"]["code"], -32601);
-        assert!(
-            reply["error"]["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("server/discover"),
-            "the message should name the method: {reply}"
-        );
+    fn a_discover_probe_is_left_to_rmcp_which_answers_it() {
+        assert_eq!(before_session(&parse(BARE_PROBE)), PreInit::Forward);
+    }
+
+    #[test]
+    fn a_ping_is_left_to_rmcp_which_answers_it() {
+        let ping = r#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#;
+        assert_eq!(before_session(&parse(ping)), PreInit::Forward);
     }
 
     #[test]
     fn initialize_starts_the_session() {
-        assert_eq!(before_initialize(&parse(&initialize(1))), PreInit::Initialize);
+        assert_eq!(before_session(&parse(&initialize(1))), PreInit::Start);
     }
 
     #[test]
-    fn a_ping_is_left_to_rmcp_which_already_answers_it() {
-        let ping = r#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#;
-        assert_eq!(before_initialize(&parse(ping)), PreInit::Forward);
+    fn a_request_without_initialize_starts_the_session() {
+        assert_eq!(before_session(&parse(&modern(3, "tools/list"))), PreInit::Start);
     }
 
     #[test]
-    fn a_known_method_sent_too_early_is_an_invalid_request_not_a_missing_one() {
-        let early = r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#;
-        let reply = rejection(before_initialize(&parse(early)));
-        assert_eq!(reply["id"], 3);
-        assert_eq!(reply["error"]["code"], -32600);
+    fn a_notification_before_a_session_is_dropped() {
+        assert_eq!(before_session(&parse(CANCEL_PROBE)), PreInit::Discard);
     }
 
     #[test]
-    fn a_notification_before_initialize_is_dropped() {
-        let cancelled = r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"server-discover-probe-1"}}"#;
-        assert_eq!(before_initialize(&parse(cancelled)), PreInit::Discard);
-    }
-
-    #[test]
-    fn a_stray_response_before_initialize_is_dropped() {
+    fn a_stray_response_before_a_session_is_dropped() {
         let stray = r#"{"jsonrpc":"2.0","id":9,"result":{}}"#;
-        assert_eq!(before_initialize(&parse(stray)), PreInit::Discard);
+        assert_eq!(before_session(&parse(stray)), PreInit::Discard);
     }
 
     // ── PreInitGuard over a scripted transport ──────────────────────────────
@@ -275,40 +258,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_probe_is_answered_and_initialize_is_the_first_thing_rmcp_sees() {
+    async fn the_probe_reaches_rmcp_and_its_cancellation_does_not() {
         let init = initialize(1);
-        let (inner, sent) = Scripted::new(&[DISCOVER_PROBE, &init]);
+        let (inner, sent) = Scripted::new(&[BARE_PROBE, CANCEL_PROBE, &init]);
         let mut guard = PreInitGuard::new(inner);
 
-        let first = guard.receive().await.expect("initialize reaches rmcp");
-        assert_eq!(method_of(&first), "initialize");
+        let first = guard.receive().await.expect("the probe");
+        assert_eq!(method_of(&first), "server/discover");
+        let second = guard.receive().await.expect("initialize");
+        assert_eq!(method_of(&second), "initialize");
+        assert!(sent.lock().expect("sent lock").is_empty(), "answering is rmcp's job");
+    }
 
-        let sent = sent.lock().expect("sent lock");
-        assert_eq!(sent.len(), 1, "exactly one reply, to the probe");
-        let reply = serde_json::to_value(&sent[0]).expect("serialisable");
-        assert_eq!(reply["id"], "server-discover-probe-1");
-        assert_eq!(reply["error"]["code"], -32601);
+    fn reply(id: u32) -> ServerJsonRpcMessage {
+        serde_json::from_value(json!({ "jsonrpc": "2.0", "id": id, "result": {} })).expect("a reply")
+    }
+
+    fn refusal(id: u32) -> ServerJsonRpcMessage {
+        serde_json::from_value(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32602, "message": "no _meta" } }))
+            .expect("a refusal")
     }
 
     #[tokio::test]
-    async fn after_initialize_the_guard_forwards_everything_untouched() {
+    async fn after_the_session_starts_the_guard_forwards_everything_untouched() {
         let init = initialize(1);
-        let later_unknown = r#"{"jsonrpc":"2.0","id":2,"method":"server/discover","params":{}}"#;
-        let (inner, sent) = Scripted::new(&[&init, later_unknown]);
+        let initialized = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let (inner, _sent) = Scripted::new(&[&init, initialized]);
         let mut guard = PreInitGuard::new(inner);
 
         guard.receive().await.expect("initialize");
-        let second = guard.receive().await.expect("forwarded, not answered");
-        assert_eq!(method_of(&second), "server/discover");
-        assert!(
-            sent.lock().expect("sent lock").is_empty(),
-            "once a session exists, answering is rmcp's job"
-        );
+        guard.send(reply(1)).await.expect("answer initialize");
+        let second = guard.receive().await.expect("forwarded, not dropped");
+        assert!(matches!(second, ClientJsonRpcMessage::Notification(_)), "{second:?}");
     }
 
     #[tokio::test]
-    async fn a_closed_stream_before_initialize_ends_the_session() {
-        let (inner, _sent) = Scripted::new(&[DISCOVER_PROBE]);
+    async fn a_refused_request_leaves_the_guard_on() {
+        let early = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let init = initialize(2);
+        let (inner, _sent) = Scripted::new(&[early, CANCEL_PROBE, &init]);
+        let mut guard = PreInitGuard::new(inner);
+
+        guard.receive().await.expect("the early request");
+        guard.send(refusal(1)).await.expect("refuse it");
+        let next = guard.receive().await.expect("initialize, the cancellation dropped");
+        assert_eq!(method_of(&next), "initialize");
+    }
+
+    #[tokio::test]
+    async fn a_closed_stream_before_a_session_ends_it() {
+        let (inner, _sent) = Scripted::new(&[CANCEL_PROBE]);
         let mut guard = PreInitGuard::new(inner);
         assert!(guard.receive().await.is_none());
     }
@@ -335,16 +334,12 @@ mod tests {
         serde_json::from_str(&line).expect("a JSON-RPC line")
     }
 
-    /// Drives `ClawgMcp` over newline-delimited JSON exactly as the stdio
-    /// transport does, replaying the session opening that broke on
-    /// 2026-09-29: probe first, then the legacy handshake, then a tool list.
-    #[tokio::test]
-    async fn a_discover_probe_no_longer_kills_the_bridge() {
+    /// Serves `ClawgMcp` over newline-delimited JSON exactly as the stdio
+    /// transport does. No daemon: nothing these tests send reaches it.
+    fn serve_bridge() -> (WriteHalf<DuplexStream>, HostLines) {
         let (host, server) = tokio::io::duplex(64 * 1024);
         let (server_read, server_write) = tokio::io::split(server);
         let transport = PreInitGuard::new(AsyncRwTransport::new_server(server_read, server_write));
-
-        // No daemon needed: the handshake and the tool list never call it.
         let bridge = ClawgMcp::new(
             DaemonClient::new("http://127.0.0.1:1", "token", std::env::temp_dir()),
             Profile::Dev,
@@ -354,28 +349,101 @@ mod tests {
                 let _ = running.waiting().await;
             }
         });
+        let (host_read, host_write) = tokio::io::split(host);
+        (host_write, BufReader::new(host_read).lines())
+    }
 
-        let (host_read, mut host_write) = tokio::io::split(host);
-        let mut lines = BufReader::new(host_read).lines();
+    fn tool_names(reply: &Value) -> Vec<String> {
+        reply["result"]["tools"]
+            .as_array()
+            .map(|tools| tools.iter().filter_map(|t| t["name"].as_str().map(str::to_string)).collect())
+            .unwrap_or_default()
+    }
 
-        send_line(&mut host_write, DISCOVER_PROBE).await;
+    /// The session opening that broke on 2026-09-29: probe first, then its
+    /// cancellation, then the legacy handshake and a tool list.
+    #[tokio::test]
+    async fn a_bare_probe_and_its_cancellation_leave_the_legacy_handshake_working() {
+        let (mut host, mut lines) = serve_bridge();
+
+        send_line(&mut host, BARE_PROBE).await;
         let probe_reply = next_frame(&mut lines).await;
         assert_eq!(probe_reply["id"], "server-discover-probe-1");
-        assert_eq!(probe_reply["error"]["code"], -32601);
+        assert!(probe_reply["error"].is_object(), "a probe without _meta is refused: {probe_reply}");
+        send_line(&mut host, CANCEL_PROBE).await;
 
-        send_line(&mut host_write, &initialize(1)).await;
+        send_line(&mut host, &initialize(1)).await;
+        let init_reply = next_frame(&mut lines).await;
+        assert_eq!(init_reply["id"], 1);
+        assert_eq!(init_reply["result"]["protocolVersion"], "2025-06-18");
+        assert_eq!(init_reply["result"]["serverInfo"]["name"], "clawg-dev");
+
+        send_line(&mut host, r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).await;
+        send_line(&mut host, r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).await;
+        let tools = next_frame(&mut lines).await;
+        assert_eq!(tools["id"], 2);
+        assert_eq!(tool_names(&tools).len(), 8, "all eight memory tools are listed: {tools}");
+    }
+
+    /// rmcp refuses a request without `_meta` and keeps waiting for a session;
+    /// a notification after that refusal must not end the bridge either.
+    #[tokio::test]
+    async fn a_request_refused_for_missing_meta_does_not_start_the_session() {
+        let (mut host, mut lines) = serve_bridge();
+
+        send_line(&mut host, r#"{"jsonrpc":"2.0","id":"early","method":"tools/list"}"#).await;
+        let refused = next_frame(&mut lines).await;
+        assert_eq!(refused["id"], "early");
+        assert!(refused["error"].is_object(), "{refused}");
+        send_line(&mut host, r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"early"}}"#).await;
+
+        send_line(&mut host, &initialize(1)).await;
         let init_reply = next_frame(&mut lines).await;
         assert_eq!(init_reply["id"], 1);
         assert_eq!(init_reply["result"]["serverInfo"]["name"], "clawg-dev");
+    }
 
-        send_line(&mut host_write, r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).await;
-        send_line(&mut host_write, r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).await;
-        let tools = next_frame(&mut lines).await;
-        assert_eq!(tools["id"], 2);
-        assert_eq!(
-            tools["result"]["tools"].as_array().map(Vec::len),
-            Some(8),
-            "all eight memory tools are listed: {tools}"
+    #[tokio::test]
+    async fn a_discover_probe_is_answered_with_what_the_server_offers() {
+        let (mut host, mut lines) = serve_bridge();
+
+        send_line(&mut host, &modern(1, "server/discover")).await;
+        let reply = next_frame(&mut lines).await;
+
+        let result = &reply["result"];
+        let versions: Vec<&str> = result["supportedVersions"]
+            .as_array()
+            .map(|v| v.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        assert!(versions.contains(&"2026-07-28"), "{reply}");
+        assert!(versions.contains(&"2025-06-18"), "legacy hosts keep their version: {reply}");
+        assert!(result["capabilities"]["tools"].is_object(), "{reply}");
+        assert!(
+            result["instructions"].as_str().is_some_and(|i| i.contains("save_memory")),
+            "{reply}"
         );
+        let server = &result["_meta"]["io.modelcontextprotocol/serverInfo"];
+        assert_eq!(server["name"], "clawg-dev");
+        assert_eq!(server["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn a_session_without_initialize_lists_the_tools_in_name_order() {
+        let (mut host, mut lines) = serve_bridge();
+
+        send_line(&mut host, &modern(1, "server/discover")).await;
+        next_frame(&mut lines).await;
+        send_line(&mut host, &modern(2, "tools/list")).await;
+        let reply = next_frame(&mut lines).await;
+
+        let names = tool_names(&reply);
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names.len(), 8, "{reply}");
+        assert_eq!(names, sorted, "the order must not change between calls");
+        let result = &reply["result"];
+        assert_eq!(result["resultType"], "complete", "{reply}");
+        assert!(result["ttlMs"].is_u64(), "{reply}");
+        assert!(result["cacheScope"].is_string(), "{reply}");
     }
 }
