@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 2 | M | data-preservation parte B (snapshot antes de migrar) | propuesta |
+| 2 | M | data-preservation parte B (snapshot antes de migrar) | verify |
 
 ## Problema
 
@@ -46,7 +46,7 @@ El mismo repositorio termina con varios `project_id` según cómo se lo nombre, 
 ## Alcance
 
 1. Función `resolve_project_root(path)` en `clawg-core`, con la decisión pura separada del filesystem: normalización léxica, lectura del archivo `.git` y de `commondir`, y elección de la raíz.
-2. `project_id_for(path)`: deriva el id de la raíz resuelta. La usan el puente (cwd y `project_path`) y `clawg memories --here`.
+2. `ProjectIdentity::resolve(path)`: la raíz, su id y el id viejo de la ruta cruda. La usan el puente (cwd y `project_path`) y `clawg memories --here`.
 3. Migración nueva: tablas `project` (`id`, `root_path`, `created_at`) y `project_rekey`.
 4. `POST /v1/projects` en el daemon: registra la raíz y re-keyea los ids viejos que el puente manda. Es idempotente.
 5. El puente registra cada raíz una sola vez por proceso, antes de la primera tool que la usa.

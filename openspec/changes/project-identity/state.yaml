@@ -2,14 +2,14 @@ change: project-identity
 objective: "2"
 depends_on:
   - data-preservation (parte B, snapshot antes de migrar)
-phase: tasks
+phase: verify
 artifacts:
   exploration: done
   proposal: done
   spec: done
   design: done
   tasks: done
-  apply: pending
-  verify: pending
+  apply: done
+  verify: partial (Windows y binario real pendientes)
   archive: pending
 updated: 2026-10-12

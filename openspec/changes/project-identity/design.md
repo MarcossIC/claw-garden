@@ -72,7 +72,7 @@ La copia de `workspace.md` (R7) va después del commit y fuera de la transacció
 - `parse_gitdir(contenido, dir_del_archivo) -> Option<PathBuf>` (rutas relativas al directorio del `.git`);
 - `root_from_marker(dir, marker) -> PathBuf`, con `marker` = directorio, worktree (`commondir` leído) o submódulo.
 
-La función con I/O sólo recorre ancestros, lee y llama a esas. No hay trait de filesystem: los tests de la parte pura pasan valores, y los de integración usan directorios temporales (`tempfile` ya es dev-dependency de `clawg-core`).
+La función con I/O (`resolve_project_root`, y `ProjectIdentity::resolve` encima) sólo recorre ancestros, lee y llama a esas. No hay trait de filesystem: los tests de la parte pura pasan valores, y los de integración usan directorios temporales (`tempfile` ya es dev-dependency de `clawg-core`).
 
 ## D5. Número de la migración
 

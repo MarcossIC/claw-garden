@@ -23,7 +23,7 @@ exploration -> proposal -> spec (+ design si hace falta) -> tasks -> apply -> ve
 | 1 | [data-preservation](changes/archive/2026-10-12-data-preservation/proposal.md) | transversal | M (partes A + F; B–E siguen en la [exploración](changes/archive/2026-10-12-data-preservation/exploration.md#alcance-candidato-partes)) | — | A + F archivadas el 2026-10-12 ([`specs/storage`](specs/storage/spec.md)); B + C, D y E sin cambio propio todavía |
 | 2 | [ingest-durability](changes/archive/2026-10-12-ingest-durability/proposal.md) | 1 | M | — | archivado el 2026-10-12 ([`specs/ingest`](specs/ingest/spec.md)) |
 | 3 | [retrieval-hygiene](changes/archive/2026-10-12-retrieval-hygiene/proposal.md) | 1 | S | — | archivado el 2026-10-12 ([`specs/retrieval`](specs/retrieval/spec.md)) |
-| 4 | [project-identity](changes/project-identity/proposal.md) | 2 | M | 1 (backup antes del re-key) | tareas escritas; apply en curso |
+| 4 | [project-identity](changes/project-identity/proposal.md) | 2 | M | 1 (backup antes del re-key) | verify: Linux completo; Windows pendiente ([`verify.md`](changes/project-identity/verify.md)) |
 | 5 | [eval-golden-expansion](changes/archive/2026-10-12-eval-golden-expansion/proposal.md) | medición | M | — | archivado el 2026-10-12 ([`specs/eval`](specs/eval/spec.md)) |
 | 6 | [visibility-policy](changes/visibility-policy/exploration.md) | 2, 4 | L | 4, 5 | exploración |
 | 7 | [lexical-fusion](changes/lexical-fusion/exploration.md) | 1, 3 | M | 5 | exploración |

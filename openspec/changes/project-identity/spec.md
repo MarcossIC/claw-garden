@@ -59,20 +59,20 @@ El id nuevo de una ruta que ya es la raíz canónica MUST ser igual a `derive_pr
 
 #### Escenario
 - GIVEN `<tmp>/repo` canónica, con `.git/`
-- THEN `project_id_for(<tmp>/repo) == derive_project_id(<tmp>/repo)`
+- THEN `ProjectIdentity::resolve(<tmp>/repo).id == derive_project_id(<tmp>/repo)`, y su `legacy_id` es el mismo
 
-**Test:** `the_id_of_a_canonical_root_is_the_id_it_always_had` en `crates/clawg-core/tests/project_root.rs`.
+**Tests:** `the_id_of_a_canonical_root_is_the_id_it_always_had` y `a_subdirectory_keeps_its_old_id_as_the_legacy_one` en `crates/clawg-core/tests/project_root.rs`.
 
 ## R3. Todos los caminos usan la misma resolución
 
-El puente MCP (cwd y `project_path`) y `clawg memories --here` MUST derivar el id con `project_id_for`. Si falla `current_dir()`, el puente MUST seguir como hoy: sin proyecto por defecto (`crates/clawg-cli/src/mcp/server.rs:165-167`).
+El puente MCP (cwd y `project_path`) y `clawg memories --here` MUST derivar el id con `ProjectIdentity::resolve` (`crates/clawg-core/src/memory/identity.rs`). Si falla `current_dir()`, el puente MUST seguir como hoy: sin proyecto por defecto (`crates/clawg-cli/src/mcp/server.rs:165-167`).
 
 #### Escenario
 - GIVEN un puente con cwd en `<tmp>/repo/src`
 - WHEN guarda una memoria sin `project_path`
-- THEN la fila queda con `project_id_for(<tmp>/repo)`
+- THEN la fila queda con el id de `<tmp>/repo`
 
-**Tests:** `resolve_project_id` en `crates/clawg-cli/src/mcp/tools.rs` y `Scope::project_id` en `crates/clawg-cli/src/cli.rs`, con la resolución pasada como valor para seguir siendo puros.
+**Tests:** `resolve_project` en `crates/clawg-cli/src/mcp/tools.rs` (la resolución entra como función) y `Scope::project_id` en `crates/clawg-cli/src/cli.rs` (entra el id ya resuelto), para seguir siendo puros. `a_bridge_in_a_subdirectory_brings_what_was_saved_there_to_the_root` en `crates/clawg-cli/src/mcp/server.rs`.
 
 ## R4. Registro de proyecto y re-key
 
@@ -105,7 +105,7 @@ El puente MCP (cwd y `project_path`) y `clawg memories --here` MUST derivar el i
 - WHEN se busca ese término en el proyecto nuevo
 - THEN aparece por el canal léxico (FTS lee `project_id` de `memory`)
 
-**Tests:** integración en `crates/clawg-core/tests/project_rekey.rs` (función del store) y HTTP en `crates/clawg-cli/tests/api.rs` (400, 409, respuesta).
+**Tests:** `rows_of_a_legacy_id_move_to_the_resolved_root`, `registering_again_moves_nothing`, `the_rekey_log_restores_every_row_it_moved`, `a_moved_row_is_found_lexically_under_its_new_project`, `a_root_whose_id_belongs_to_another_root_moves_nothing` y `a_malformed_legacy_id_is_refused_before_anything_moves` en `crates/clawg-core/src/memory/project.rs`; HTTP en `crates/clawg-cli/tests/api.rs` (`registering_a_root_moves_the_rows_of_its_legacy_id`, 400, 409, 401).
 
 ## R5. Datos de la versión anterior
 
@@ -116,13 +116,13 @@ Una base creada por la versión anterior, con filas en ids viejos, MUST abrir co
 - WHEN se abre con la versión nueva
 - THEN las filas y sus `project_id` son idénticos, y existen `project` y `project_rekey` vacías
 
-**Test:** `a_database_from_the_previous_version_opens_with_its_project_ids_untouched` en `crates/clawg-core/tests/project_rekey.rs`.
+**Test:** `a_database_from_the_previous_version_opens_with_its_project_ids_untouched` en `crates/clawg-core/src/memory/db.rs` (siembra con el runner hasta V8).
 
 ## R6. El puente registra cada raíz una vez
 
 Antes de la primera tool que use una raíz, el puente MUST llamar a `POST /v1/projects` con esa raíz y el id viejo de la ruta cruda (si difiere), y MUST NOT volver a llamarlo para la misma raíz y ruta en el mismo proceso. Si la llamada falla, la tool MUST seguir con el id nuevo y registrar un warn: un registro fallido no bloquea un save.
 
-**Test:** unit del caché en `crates/clawg-cli/src/mcp/server.rs` con un cliente falso que cuenta llamadas.
+**Tests:** `a_root_is_registered_once_per_bridge` y `a_refused_registration_does_not_block_the_save` en `crates/clawg-cli/src/mcp/server.rs`, contra un daemon en proceso.
 
 ## R7. `workspace.md` sigue al proyecto
 
@@ -137,4 +137,4 @@ En un re-key, por cada agente con `<workspaces>/<agente>/<id viejo>/workspace.md
 - WHEN se registra la raíz con ese id viejo
 - THEN `agent-a/<id nuevo>/workspace.md` tiene la misma sección USER, y el viejo sigue igual
 
-**Test:** `a_rekey_copies_the_legacy_workspace_and_keeps_it` en `crates/clawg-core/src/memory/workspace.rs`.
+**Tests:** `a_rekey_copies_the_legacy_workspace_and_keeps_it`, `adopting_never_overwrites_the_projects_own_workspace` y `adopting_without_any_workspace_is_a_no_op` en `crates/clawg-core/src/memory/workspace.rs`; `registering_carries_the_legacy_workspace_over` en `project.rs`.
