@@ -10,7 +10,7 @@
 - **Conclusión:** fila de `memory` con al menos una fila en `memory_derivation` que la nombra como `memory_id`.
 - **Fuentes de una conclusión:** los `source_id` de sus filas en `memory_derivation`.
 - **Alcance:** un agente y un `project_id`, o todo el store cuando se pide sin proyecto. Como en la búsqueda y en visibility-policy, un agente sólo ve sus filas; sin agente el pedido es del dueño de la base (el visor, `curl`) y ve las de todos. Su clave en `synthesis_review` es `(agent_id, scope_key)`: el agente o `''` para el dueño, y el `project_id` o `''` para todo el store.
-- **Memoria pendiente de un alcance:** fila viva del alcance que no es conclusión y que no es fuente de ninguna conclusión viva.
+- **Memoria pendiente de un alcance:** fila viva del alcance que no es conclusión y que no es fuente de ninguna conclusión viva del mismo agente.
 - **Memoria sin revisar de un alcance:** memoria pendiente con `created_at` mayor que el `reviewed_at` del alcance, o cualquier pendiente si el alcance nunca se revisó.
 
 ## R1. Las filas que dejó la app siguen alcanzables
@@ -118,7 +118,7 @@ Purgar una fila (`clawg purge`, de secret-hygiene) sí la borra de verdad, y su 
 - WHEN A sintetiza P
 - THEN sólo está la de A, y B sigue teniendo su memoria sin revisar
 
-**Test:** `synthesis_lists_what_no_conclusion_covers`, `deleting_a_conclusion_makes_its_sources_pending_again`, `synthesis_stays_in_its_project`, `synthesis_stays_with_its_agent`, `synthesis_records_the_review_and_nothing_else`, `existing_ids_leave_out_unknown_and_deleted_rows` y `existing_ids_leave_out_another_agents_rows` en `crates/clawg-core/src/memory/synthesis.rs`; `synthesis_over_http`, `an_agent_neither_reviews_nor_cites_another_agents_memories` y `a_misspelt_synthesis_field_is_refused` en `crates/clawg-cli/tests/api.rs`; `the_synthesis_text_says_what_to_save`, `a_synthesis_with_nothing_pending_asks_for_nothing` en `tools.rs`; `synthesize_lists_what_no_conclusion_covers_and_recall_stops_reminding` en `server.rs`. Fallan hoy.
+**Test:** `synthesis_lists_what_no_conclusion_covers`, `deleting_a_conclusion_makes_its_sources_pending_again`, `synthesis_stays_in_its_project`, `synthesis_stays_with_its_agent`, `another_agents_conclusion_does_not_cover_a_memory`, `synthesis_records_the_review_and_nothing_else`, `existing_ids_leave_out_unknown_and_deleted_rows` y `existing_ids_leave_out_another_agents_rows` en `crates/clawg-core/src/memory/synthesis.rs`; `synthesis_over_http`, `an_agent_neither_reviews_nor_cites_another_agents_memories` y `a_misspelt_synthesis_field_is_refused` en `crates/clawg-cli/tests/api.rs`; `the_synthesis_text_says_what_to_save`, `a_synthesis_with_nothing_pending_asks_for_nothing` en `tools.rs`; `synthesize_lists_what_no_conclusion_covers_and_recall_stops_reminding` en `server.rs`. Fallan hoy.
 
 No hay filtro de texto: la síntesis le da al modelo lo que no revisó, no un buscador. Buscar por texto es `search_memory`, y el filtro del listado es del visor, que no se le expone al modelo.
 

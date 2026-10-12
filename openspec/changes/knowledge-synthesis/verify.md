@@ -23,10 +23,12 @@
 
 Todos los commits compilan, y las 10 fallas son las mismas en todos.
 
-Después se mergeó `main` (262f839, con mcp-protocol-upgrade y secret-hygiene) en la rama. Con el merge y `fix(core): drop a purged memory's provenance links` encima: **1.635 pasan, 10 fallan**, las mismas 10. El merge pidió dos ajustes:
+Después se mergeó `main` (262f839, con mcp-protocol-upgrade y secret-hygiene) en la rama. Con el merge, `fix(core): drop a purged memory's provenance links` y los arreglos de la revisión de CodeRabbit encima: **1.637 pasan, 10 fallan**, las mismas 10. El merge pidió dos ajustes:
 
 - `synthesize` toma el agente del `RequestContext` de cada pedido, como el resto de las herramientas desde rmcp 3.5.1.
-- `clawg purge` borra la fila de verdad, y SQLite puede darle su id a una fila nueva. Por eso ahora también borra sus enlaces de `memory_derivation` (spec R6). Vienen del entorno:
+- `clawg purge` borra la fila de verdad, y SQLite puede darle su id a una fila nueva. Por eso ahora también borra sus enlaces de `memory_derivation` (spec R6).
+
+Las 10 fallas vienen del entorno:
 
 - 7 de `doctor::tests`: modelan un PATH de Windows con `clawg.exe`.
 - 3 de `diff::tests` en `rag-eval`: leen `docs/eval/results/`, que está en `.gitignore` y no existe en un clon limpio.

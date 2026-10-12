@@ -49,6 +49,13 @@ Cada tarea es un commit atómico: primero el test que falla, después el código
 - [x] Test `purging_drops_the_links_to_and_from_the_row` en `secrets.rs`; `purge` borra los enlaces de la fila purgada (R6).
 - Commit: `fix(core): drop a purged memory's provenance links` (47d2ce7)
 
+## Revisión del PR
+
+- [x] Test `the_conclusions_show_even_with_nothing_pending` en `tools.rs`; `synthesize` muestra las conclusiones aunque no haya pendientes.
+- Commit: `fix(mcp): show the conclusions drawn when nothing is pending` (c5c73f2)
+- [x] Test `another_agents_conclusion_does_not_cover_a_memory` en `synthesis.rs`; sólo una conclusión del mismo agente cubre una memoria.
+- Commit: `fix(core): let only the agent's own conclusions cover its memories` (e94ef76)
+
 ## Verify
 
 - [x] `cargo test --workspace` en Linux, contra la base: sin fallas nuevas, con el conteo justificado ([`verify.md`](verify.md#linux)).
