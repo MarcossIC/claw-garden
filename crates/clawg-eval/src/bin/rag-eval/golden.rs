@@ -68,6 +68,21 @@ pub struct RetrievalCase {
     /// field here only widens what parses, it never narrows it.
     #[serde(default)]
     pub history: Vec<String>,
+    /// Which slice of the set this case belongs to, so the report can split
+    /// metrics by it. Absent means `natural`, which keeps the hand-written
+    /// `golden.json` parsing unchanged.
+    #[serde(default)]
+    pub subset: CaseSubset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaseSubset {
+    #[default]
+    Natural,
+    Lexical,
+    MultiRef,
+    HighImportance,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -296,6 +311,55 @@ mod tests {
         assert_eq!(golden.corpus.len(), 1);
         assert_eq!(golden.retrieval_cases.len(), 1);
         assert_eq!(golden.contradiction_pairs.len(), 1);
+    }
+
+    // --- subset label ------------------------------------------------------
+
+    fn case_with(extra: &str) -> String {
+        format!(
+            r#"{{
+                "corpus": [{{"ref": "c1", "content": "x", "memory_type": "chat_message", "importance": 5.0}}],
+                "retrieval_cases": [{{"query": "q", "corpus_refs": ["c1"], "expected_refs": ["c1"]{extra}}}],
+                "contradiction_pairs": []
+            }}"#
+        )
+    }
+
+    #[test]
+    fn a_case_without_a_subset_is_natural() {
+        let golden = parse_only(VALID_MINIMAL);
+        assert_eq!(golden.retrieval_cases[0].subset, CaseSubset::Natural);
+    }
+
+    #[test]
+    fn an_explicit_subset_is_parsed() {
+        let golden = parse_only(&case_with(r#", "subset": "lexical""#));
+        assert_eq!(golden.retrieval_cases[0].subset, CaseSubset::Lexical);
+    }
+
+    #[test]
+    fn every_subset_name_parses_in_snake_case() {
+        for (name, want) in [
+            ("natural", CaseSubset::Natural),
+            ("lexical", CaseSubset::Lexical),
+            ("multi_ref", CaseSubset::MultiRef),
+            ("high_importance", CaseSubset::HighImportance),
+        ] {
+            let golden = parse_only(&case_with(&format!(r#", "subset": "{name}""#)));
+            assert_eq!(golden.retrieval_cases[0].subset, want, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_misspelled_subset_key_fails_to_parse() {
+        let raw = case_with(r#", "subsett": "lexical""#);
+        assert!(serde_json::from_str::<GoldenSet>(&raw).is_err());
+    }
+
+    #[test]
+    fn an_unknown_subset_value_fails_to_parse() {
+        let raw = case_with(r#", "subset": "lexcial""#);
+        assert!(serde_json::from_str::<GoldenSet>(&raw).is_err());
     }
 
     // --- unknown memory_type ---------------------------------------------
