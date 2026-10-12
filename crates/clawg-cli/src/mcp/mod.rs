@@ -49,7 +49,7 @@ pub enum McpError {
 
 /// Serves MCP over stdio until the host closes the stream, starting a daemon in
 /// the background if none is running.
-pub async fn run(profile: Profile, autostart: bool) -> Result<(), McpError> {
+pub async fn run(profile: Profile, autostart: bool, agent: Option<String>) -> Result<(), McpError> {
     let base_dir = data_dir(profile)?;
     let spawner = Arc::new(ProcessSpawner { base_dir: base_dir.clone() });
     let (stdin, stdout) = stdio();
@@ -57,6 +57,7 @@ pub async fn run(profile: Profile, autostart: bool) -> Result<(), McpError> {
         profile,
         &base_dir,
         autostart,
+        agent,
         spawner,
         AUTOSTART_TIMEOUT,
         TOOL_READY_WAIT,
@@ -77,6 +78,7 @@ pub(crate) async fn run_with<T>(
     profile: Profile,
     base_dir: &Path,
     autostart: bool,
+    agent: Option<String>,
     spawner: Arc<dyn DaemonSpawner>,
     start_timeout: Duration,
     tool_wait: Duration,
@@ -123,6 +125,7 @@ where
     // before a session exists must not end the process.
     let transport = PreInitGuard::new(transport);
     let service = ClawgMcp::pending(client, profile)
+        .with_agent(agent)
         .serve(transport)
         .await
         .map_err(|e| McpError::Serve(e.to_string()))?;
@@ -255,6 +258,7 @@ mod tests {
                 Profile::Dev,
                 &base_dir,
                 autostart,
+                None,
                 spawner,
                 start_timeout,
                 tool_wait,

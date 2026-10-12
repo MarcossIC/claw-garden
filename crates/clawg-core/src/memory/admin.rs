@@ -143,30 +143,32 @@ const SET_IMPORTANCE_SQL_MEMORY: &str = "\
     SET importance = ?1, \
         tier = compute_tier(tier, ?1, access_count, memory_type), \
         last_modified_at = ?2 \
-    WHERE id = ?3 AND deleted_at IS NULL";
+    WHERE id = ?3 AND deleted_at IS NULL AND (?4 IS NULL OR agent_id = ?4)";
 
 const SET_IMPORTANCE_SQL_EPISODIC: &str = "\
     UPDATE episodic_trajectory \
     SET importance = ?1, \
         tier = compute_tier(tier, ?1, access_count, 'episodic_trajectory'), \
         last_modified_at = ?2 \
-    WHERE id = ?3 AND deleted_at IS NULL";
+    WHERE id = ?3 AND deleted_at IS NULL AND (?4 IS NULL OR agent_id = ?4)";
 
 const SET_IMPORTANCE_SQL_PROCEDURAL: &str = "\
     UPDATE procedural_skill \
     SET importance = ?1, \
         tier = compute_tier(tier, ?1, access_count, 'procedural_skill'), \
         last_modified_at = ?2 \
-    WHERE id = ?3 AND deleted_at IS NULL";
+    WHERE id = ?3 AND deleted_at IS NULL AND (?4 IS NULL OR agent_id = ?4)";
 
 /// Sets `importance` and atomically recomputes `tier` (promote-only) for the
 /// row `id` in the table selected by `kind`. Returns the number of rows
-/// affected (`0` when `id` doesn't exist or the row is soft-deleted).
+/// affected (`0` when `id` doesn't exist, the row is soft-deleted, or `owner`
+/// names an agent other than the row's).
 pub async fn set_importance_core(
     store: &MemoryStore,
     id: i64,
     kind: MemoryKind,
     importance: f64,
+    owner: Option<&str>,
 ) -> Result<usize, MemoryError> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -178,9 +180,10 @@ pub async fn set_importance_core(
         MemoryKind::Procedural => SET_IMPORTANCE_SQL_PROCEDURAL,
     };
 
+    let owner = owner.map(str::to_owned);
     store
         .conn
-        .call(move |c| c.execute(sql, rusqlite::params![importance, now_ms, id]))
+        .call(move |c| c.execute(sql, rusqlite::params![importance, now_ms, id, owner]))
         .await
         .map_err(|e| match e {
             tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
@@ -205,6 +208,10 @@ const DELETE_SQL_EPISODIC: &str =
 const DELETE_SQL_PROCEDURAL: &str =
     "UPDATE procedural_skill SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL";
 
+const OWNED_ELSEWHERE_MEMORY: &str = "SELECT 1 FROM memory WHERE id = ?1 AND agent_id IS NOT ?2";
+const OWNED_ELSEWHERE_EPISODIC: &str = "SELECT 1 FROM episodic_trajectory WHERE id = ?1 AND agent_id IS NOT ?2";
+const OWNED_ELSEWHERE_PROCEDURAL: &str = "SELECT 1 FROM procedural_skill WHERE id = ?1 AND agent_id IS NOT ?2";
+
 const DELETE_VEC_MEMORY: &str = "DELETE FROM memory_vectors WHERE rowid = ?1";
 const DELETE_VEC_EPISODIC: &str = "DELETE FROM episodic_vectors WHERE rowid = ?1";
 const DELETE_VEC_PROCEDURAL: &str = "DELETE FROM procedural_vectors WHERE rowid = ?1";
@@ -215,6 +222,10 @@ const DELETE_VEC_PROCEDURAL: &str = "DELETE FROM procedural_vectors WHERE rowid 
 /// Returns the number of rows affected by the UPDATE (`0` when `id` doesn't
 /// exist in that table or was already deleted — idempotent).
 ///
+/// With `owner`, a row that belongs to another agent is answered as missing
+/// and the transaction writes nothing, sweeps included: they would otherwise
+/// drop that agent's vector.
+///
 /// The vector DELETE runs unconditionally, never gated on the UPDATE's row
 /// count: a point delete on an absent rowid is a 0-row no-op, not an error,
 /// and running it every time means a row soft-deleted before this code
@@ -224,6 +235,7 @@ pub async fn delete_memory_core(
     store: &MemoryStore,
     id: i64,
     kind: MemoryKind,
+    owner: Option<&str>,
 ) -> Result<usize, MemoryError> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -232,16 +244,22 @@ pub async fn delete_memory_core(
     // Exhaustive match, not string interpolation: a new MemoryKind variant
     // without a table pair here is a compile error, never a runtime SQL
     // injection surface.
-    let (row_sql, vec_sql) = match kind {
-        MemoryKind::Memory => (DELETE_SQL_MEMORY, DELETE_VEC_MEMORY),
-        MemoryKind::Episodic => (DELETE_SQL_EPISODIC, DELETE_VEC_EPISODIC),
-        MemoryKind::Procedural => (DELETE_SQL_PROCEDURAL, DELETE_VEC_PROCEDURAL),
+    let (row_sql, vec_sql, elsewhere_sql) = match kind {
+        MemoryKind::Memory => (DELETE_SQL_MEMORY, DELETE_VEC_MEMORY, OWNED_ELSEWHERE_MEMORY),
+        MemoryKind::Episodic => (DELETE_SQL_EPISODIC, DELETE_VEC_EPISODIC, OWNED_ELSEWHERE_EPISODIC),
+        MemoryKind::Procedural => (DELETE_SQL_PROCEDURAL, DELETE_VEC_PROCEDURAL, OWNED_ELSEWHERE_PROCEDURAL),
     };
+    let owner = owner.map(str::to_owned);
 
     store
         .conn
         .call(move |c| {
             let tx = c.transaction()?;
+            if let Some(owner) = &owner {
+                if tx.prepare(elsewhere_sql)?.exists(rusqlite::params![id, owner])? {
+                    return Ok(0);
+                }
+            }
             let affected = tx.execute(row_sql, rusqlite::params![now_ms, id])?;
             tx.execute(vec_sql, rusqlite::params![id])?;
             // Unconditional for the same reason as the vector delete: a row
@@ -1248,7 +1266,7 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         let id = seed_memory_row(&store, "architectural_decision", 3, 5.0, false).await;
 
-        let affected = set_importance_core(&store, id, MemoryKind::Memory, 9.0)
+        let affected = set_importance_core(&store, id, MemoryKind::Memory, 9.0, None)
             .await
             .unwrap();
 
@@ -1264,7 +1282,7 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         let id = seed_memory_row(&store, "chat_message", 1, 9.5, false).await;
 
-        let affected = set_importance_core(&store, id, MemoryKind::Memory, 2.0)
+        let affected = set_importance_core(&store, id, MemoryKind::Memory, 2.0, None)
             .await
             .unwrap();
 
@@ -1281,7 +1299,7 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         let id = seed_episodic_row(&store, 3, 5.0).await;
 
-        let affected = set_importance_core(&store, id, MemoryKind::Episodic, 7.0)
+        let affected = set_importance_core(&store, id, MemoryKind::Episodic, 7.0, None)
             .await
             .unwrap();
 
@@ -1297,7 +1315,7 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         let id = seed_procedural_row(&store, 1, 8.0).await;
 
-        let affected = set_importance_core(&store, id, MemoryKind::Procedural, 3.0)
+        let affected = set_importance_core(&store, id, MemoryKind::Procedural, 3.0, None)
             .await
             .unwrap();
 
@@ -1312,7 +1330,7 @@ mod tests {
     async fn set_importance_nonexistent_id_returns_zero() {
         let store = MemoryStore::new_for_test().await.unwrap();
 
-        let affected = set_importance_core(&store, 999_999, MemoryKind::Memory, 9.0)
+        let affected = set_importance_core(&store, 999_999, MemoryKind::Memory, 9.0, None)
             .await
             .unwrap();
 
@@ -1325,7 +1343,7 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         let id = seed_memory_row(&store, "chat_message", 3, 5.0, true).await;
 
-        let affected = set_importance_core(&store, id, MemoryKind::Memory, 9.0)
+        let affected = set_importance_core(&store, id, MemoryKind::Memory, 9.0, None)
             .await
             .unwrap();
 
@@ -1369,7 +1387,7 @@ mod tests {
         let id = seed_memory_row(&store, "chat_message", 3, 5.0, false).await;
         assert_eq!(memory_deleted_at(&store, id).await, None);
 
-        let affected = delete_memory_core(&store, id, MemoryKind::Memory)
+        let affected = delete_memory_core(&store, id, MemoryKind::Memory, None)
             .await
             .unwrap();
 
@@ -1407,7 +1425,7 @@ mod tests {
         let old = seed_memory_scoped(&store, "old", "a", None, "active").await;
         let new = seed_disputing(&store, &[old]).await;
 
-        delete_memory_core(&store, old, MemoryKind::Memory).await.unwrap();
+        delete_memory_core(&store, old, MemoryKind::Memory, None).await.unwrap();
 
         assert_eq!(memory_status(&store, new).await, "active");
     }
@@ -1419,9 +1437,54 @@ mod tests {
         let second = seed_memory_scoped(&store, "second", "a", None, "active").await;
         let new = seed_disputing(&store, &[first, second]).await;
 
-        delete_memory_core(&store, first, MemoryKind::Memory).await.unwrap();
+        delete_memory_core(&store, first, MemoryKind::Memory, None).await.unwrap();
 
         assert_eq!(memory_status(&store, new).await, "disputed");
+    }
+
+    /// Another agent's row is answered as missing, and nothing about it moves:
+    /// not the row, not its vector, not the disputes that name it.
+    #[tokio::test]
+    async fn an_owner_mismatch_deletes_nothing() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let mem = seed_memory_row_with_vector(&store).await;
+        let epi = seed_episodic_row_with_vector(&store).await;
+        let pro = seed_procedural_row_with_vector(&store).await;
+        let challenger = seed_disputing(&store, &[mem]).await;
+
+        for (id, kind) in [(mem, MemoryKind::Memory), (epi, MemoryKind::Episodic), (pro, MemoryKind::Procedural)] {
+            assert_eq!(delete_memory_core(&store, id, kind, Some("other-agent")).await.unwrap(), 0);
+        }
+
+        assert_eq!(memory_deleted_at(&store, mem).await, None);
+        assert_eq!(episodic_deleted_at(&store, epi).await, None);
+        assert_eq!(vector_row_count(&store, "memory_vectors", mem).await, 1);
+        assert_eq!(vector_row_count(&store, "episodic_vectors", epi).await, 1);
+        assert_eq!(vector_row_count(&store, "procedural_vectors", pro).await, 1);
+        assert_eq!(memory_status(&store, challenger).await, "disputed");
+
+        assert_eq!(delete_memory_core(&store, mem, MemoryKind::Memory, Some("test-agent")).await.unwrap(), 1);
+        assert_eq!(vector_row_count(&store, "memory_vectors", mem).await, 0);
+        assert_eq!(memory_status(&store, challenger).await, "active");
+    }
+
+    #[tokio::test]
+    async fn an_owner_mismatch_changes_no_importance() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let mem = seed_memory_row(&store, "chat_message", 3, 5.0, false).await;
+        let epi = seed_episodic_row(&store, 3, 5.0).await;
+        let pro = seed_procedural_row(&store, 3, 5.0).await;
+
+        for (id, kind) in [(mem, MemoryKind::Memory), (epi, MemoryKind::Episodic), (pro, MemoryKind::Procedural)] {
+            assert_eq!(set_importance_core(&store, id, kind, 9.5, Some("other-agent")).await.unwrap(), 0);
+        }
+
+        assert_eq!(memory_tier_importance(&store, mem).await, (3, 5.0));
+        assert_eq!(episodic_tier_importance(&store, epi).await, (3, 5.0));
+        assert_eq!(procedural_tier_importance(&store, pro).await, (3, 5.0));
+
+        assert_eq!(set_importance_core(&store, mem, MemoryKind::Memory, 9.5, Some("test-agent")).await.unwrap(), 1);
+        assert_eq!(memory_tier_importance(&store, mem).await.1, 9.5);
     }
 
     #[tokio::test]
@@ -1430,7 +1493,7 @@ mod tests {
         let old = seed_memory_scoped(&store, "old", "a", None, "active").await;
         let new = seed_disputing(&store, &[old]).await;
 
-        delete_memory_core(&store, old, MemoryKind::Episodic).await.unwrap();
+        delete_memory_core(&store, old, MemoryKind::Episodic, None).await.unwrap();
 
         assert_eq!(memory_status(&store, new).await, "disputed", "ids are per table");
     }
@@ -1445,7 +1508,7 @@ mod tests {
         let epi_id = seed_episodic_row(&store, 3, 5.0).await;
         assert_eq!(mem_id, epi_id, "test setup requires a real id collision");
 
-        let affected = delete_memory_core(&store, epi_id, MemoryKind::Episodic)
+        let affected = delete_memory_core(&store, epi_id, MemoryKind::Episodic, None)
             .await
             .unwrap();
 
@@ -1467,10 +1530,10 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         let id = seed_memory_row(&store, "chat_message", 3, 5.0, false).await;
 
-        let first = delete_memory_core(&store, id, MemoryKind::Memory)
+        let first = delete_memory_core(&store, id, MemoryKind::Memory, None)
             .await
             .unwrap();
-        let second = delete_memory_core(&store, id, MemoryKind::Memory)
+        let second = delete_memory_core(&store, id, MemoryKind::Memory, None)
             .await
             .unwrap();
 
@@ -1527,7 +1590,7 @@ mod tests {
             .unwrap();
         assert!(before.iter().any(|h| h.id == id), "row must be findable before delete");
 
-        delete_memory_core(&store, id, MemoryKind::Memory)
+        delete_memory_core(&store, id, MemoryKind::Memory, None)
             .await
             .unwrap();
 
@@ -1647,7 +1710,7 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
 
         let mem_id = seed_memory_row_with_vector(&store).await;
-        delete_memory_core(&store, mem_id, MemoryKind::Memory).await.unwrap();
+        delete_memory_core(&store, mem_id, MemoryKind::Memory, None).await.unwrap();
         assert_eq!(
             vector_row_count(&store, "memory_vectors", mem_id).await,
             0,
@@ -1655,7 +1718,7 @@ mod tests {
         );
 
         let epi_id = seed_episodic_row_with_vector(&store).await;
-        delete_memory_core(&store, epi_id, MemoryKind::Episodic).await.unwrap();
+        delete_memory_core(&store, epi_id, MemoryKind::Episodic, None).await.unwrap();
         assert_eq!(
             vector_row_count(&store, "episodic_vectors", epi_id).await,
             0,
@@ -1663,7 +1726,7 @@ mod tests {
         );
 
         let proc_id = seed_procedural_row_with_vector(&store).await;
-        delete_memory_core(&store, proc_id, MemoryKind::Procedural).await.unwrap();
+        delete_memory_core(&store, proc_id, MemoryKind::Procedural, None).await.unwrap();
         assert_eq!(
             vector_row_count(&store, "procedural_vectors", proc_id).await,
             0,
@@ -1698,7 +1761,7 @@ mod tests {
             "test setup: the vector row must still be present before self-heal"
         );
 
-        let affected = delete_memory_core(&store, id, MemoryKind::Memory).await.unwrap();
+        let affected = delete_memory_core(&store, id, MemoryKind::Memory, None).await.unwrap();
 
         assert_eq!(affected, 0, "the row was already deleted, so the UPDATE affects 0 rows");
         assert_eq!(
@@ -2508,7 +2571,7 @@ mod tests {
     async fn get_returns_soft_deleted() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let id = seed_memory_scoped(&store, "gone", "a", None, "active").await;
-        delete_memory_core(&store, id, MemoryKind::Memory).await.unwrap();
+        delete_memory_core(&store, id, MemoryKind::Memory, None).await.unwrap();
 
         let row = get_memory_core(&store, MemoryKind::Memory, id).await.unwrap().unwrap();
 
@@ -2582,7 +2645,7 @@ mod tests {
         seed_episodic_row(&store, 3, 5.0).await;
         seed_procedural_row(&store, 1, 8.0).await;
         let gone = seed_procedural_row(&store, 1, 8.0).await;
-        delete_memory_core(&store, gone, MemoryKind::Procedural).await.unwrap();
+        delete_memory_core(&store, gone, MemoryKind::Procedural, None).await.unwrap();
 
         let stats = memory_stats_core(&store, StatsParams::default()).await.unwrap();
 

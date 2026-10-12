@@ -143,13 +143,15 @@ pub(crate) fn settle_disputed(c: &Connection, now: TimestampMs) -> rusqlite::Res
     c.execute(&settle_sql("status = 'disputed'"), rusqlite::params![now])
 }
 
-const SELECT_PAIR_ROW: &str =
-    "SELECT id, status, superseded_by, disputed_against FROM memory WHERE id = ?1 AND deleted_at IS NULL";
+const SELECT_PAIR_ROW: &str = "SELECT id, status, superseded_by, disputed_against FROM memory \
+     WHERE id = ?1 AND deleted_at IS NULL AND (?2 IS NULL OR agent_id = ?2)";
 
-fn read_pair_row(c: &Connection, id: i64) -> Result<PairRow, ResolveError> {
+/// Another agent's row reads as missing, so a scoped caller learns nothing
+/// about ids it does not own.
+fn read_pair_row(c: &Connection, id: i64, owner: Option<&str>) -> Result<PairRow, ResolveError> {
     use rusqlite::OptionalExtension;
     let row = c
-        .query_row(SELECT_PAIR_ROW, [id], |r| {
+        .query_row(SELECT_PAIR_ROW, rusqlite::params![id, owner], |r| {
             Ok(PairRow {
                 id: r.get(0)?,
                 status: r.get(1)?,
@@ -191,22 +193,28 @@ const SUPERSEDE_SQL: &str = "UPDATE memory SET status = 'superseded', superseded
                              WHERE id = ?1";
 
 /// Closes the dispute between `keep` and `other` in one transaction, and
-/// returns both rows as they stand afterwards.
+/// returns both rows as they stand afterwards. With `owner`, both rows must
+/// belong to that agent.
 pub async fn resolve_dispute_core(
     store: &MemoryStore,
     keep: i64,
     other: i64,
     outcome: Outcome,
+    owner: Option<&str>,
 ) -> Result<Resolution, ResolveError> {
     if keep == other {
         return Err(ResolveError::SameRow);
     }
     let now = TimestampMs::now();
+    let owner = owner.map(str::to_owned);
     store
         .conn
         .call(move |c| -> Result<Resolution, ResolveError> {
             let tx = c.transaction()?;
-            check_pair(&read_pair_row(&tx, keep)?, &read_pair_row(&tx, other)?)?;
+            check_pair(
+                &read_pair_row(&tx, keep, owner.as_deref())?,
+                &read_pair_row(&tx, other, owner.as_deref())?,
+            )?;
 
             let drop_dispute = drop_dispute_sql();
             tx.execute(&drop_dispute, rusqlite::params![keep, other, now])?;
@@ -376,7 +384,7 @@ mod tests {
         let old = seed(&store, "the API listens on 8080", "active", &[], 0).await;
         let new = seed(&store, "the API listens on 9090", "disputed", &[old], 1).await;
 
-        let resolution = resolve_dispute_core(&store, new, old, Outcome::Supersede).await.unwrap();
+        let resolution = resolve_dispute_core(&store, new, old, Outcome::Supersede, None).await.unwrap();
 
         assert_eq!(resolution.keep, ResolvedRow { id: new, status: "active".into(), superseded_by: None });
         assert_eq!(resolution.other, ResolvedRow { id: old, status: "superseded".into(), superseded_by: Some(new) });
@@ -391,7 +399,7 @@ mod tests {
         let old = seed(&store, "old", "active", &[], 0).await;
         let new = seed(&store, "new", "disputed", &[old], 1).await;
 
-        let resolution = resolve_dispute_core(&store, old, new, Outcome::Supersede).await.unwrap();
+        let resolution = resolve_dispute_core(&store, old, new, Outcome::Supersede, None).await.unwrap();
 
         assert_eq!(resolution.keep, ResolvedRow { id: old, status: "active".into(), superseded_by: None });
         assert_eq!(resolution.other, ResolvedRow { id: new, status: "superseded".into(), superseded_by: Some(old) });
@@ -405,12 +413,12 @@ mod tests {
         let second = seed(&store, "second", "active", &[], 1).await;
         let new = seed(&store, "new", "disputed", &[first, second], 2).await;
 
-        let resolution = resolve_dispute_core(&store, new, first, Outcome::Supersede).await.unwrap();
+        let resolution = resolve_dispute_core(&store, new, first, Outcome::Supersede, None).await.unwrap();
 
         assert_eq!(resolution.keep.status, "disputed");
         assert_eq!(row(&store, new).await.disputes, Some(format!("[{second}]")));
 
-        let resolution = resolve_dispute_core(&store, new, second, Outcome::Supersede).await.unwrap();
+        let resolution = resolve_dispute_core(&store, new, second, Outcome::Supersede, None).await.unwrap();
         assert_eq!(resolution.keep.status, "active");
     }
 
@@ -421,7 +429,7 @@ mod tests {
         let new = seed(&store, "new", "disputed", &[old], 1).await;
         let other_challenger = seed(&store, "another", "disputed", &[old], 2).await;
 
-        resolve_dispute_core(&store, new, old, Outcome::Supersede).await.unwrap();
+        resolve_dispute_core(&store, new, old, Outcome::Supersede, None).await.unwrap();
 
         assert_eq!(row(&store, other_challenger).await.status, "active");
     }
@@ -431,7 +439,7 @@ mod tests {
         let store = store().await;
         let old = seed(&store, "old", "active", &[], 0).await;
         let new = seed(&store, "new", "disputed", &[old], 1).await;
-        resolve_dispute_core(&store, new, old, Outcome::Supersede).await.unwrap();
+        resolve_dispute_core(&store, new, old, Outcome::Supersede, None).await.unwrap();
 
         let hits = search_all_memories(&store, &basis(0), None, "agent-d", SearchScope::all_default(), 10)
             .await
@@ -452,7 +460,7 @@ mod tests {
         let old = seed(&store, "old", "active", &[], 0).await;
         let new = seed(&store, "new", "disputed", &[old], 1).await;
 
-        let resolution = resolve_dispute_core(&store, new, old, Outcome::KeepBoth).await.unwrap();
+        let resolution = resolve_dispute_core(&store, new, old, Outcome::KeepBoth, None).await.unwrap();
 
         assert_eq!(resolution.keep, ResolvedRow { id: new, status: "active".into(), superseded_by: None });
         assert_eq!(resolution.other, ResolvedRow { id: old, status: "active".into(), superseded_by: None });
@@ -464,13 +472,13 @@ mod tests {
         let store = store().await;
         let old = seed(&store, "old", "active", &[], 0).await;
         let new = seed(&store, "new", "disputed", &[old], 1).await;
-        resolve_dispute_core(&store, new, old, Outcome::Supersede).await.unwrap();
+        resolve_dispute_core(&store, new, old, Outcome::Supersede, None).await.unwrap();
 
-        let resolution = resolve_dispute_core(&store, old, new, Outcome::Supersede).await.unwrap();
+        let resolution = resolve_dispute_core(&store, old, new, Outcome::Supersede, None).await.unwrap();
         assert_eq!(resolution.keep, ResolvedRow { id: old, status: "active".into(), superseded_by: None });
         assert_eq!(resolution.other, ResolvedRow { id: new, status: "superseded".into(), superseded_by: Some(old) });
 
-        let resolution = resolve_dispute_core(&store, new, old, Outcome::KeepBoth).await.unwrap();
+        let resolution = resolve_dispute_core(&store, new, old, Outcome::KeepBoth, None).await.unwrap();
         assert_eq!(resolution.keep.status, "active");
         assert_eq!(resolution.other.status, "active");
         assert_eq!(resolution.keep.superseded_by, None);
@@ -482,9 +490,9 @@ mod tests {
         let first = seed(&store, "first", "active", &[], 0).await;
         let second = seed(&store, "second", "active", &[], 1).await;
         let new = seed(&store, "new", "disputed", &[first, second], 2).await;
-        resolve_dispute_core(&store, first, new, Outcome::Supersede).await.unwrap();
+        resolve_dispute_core(&store, first, new, Outcome::Supersede, None).await.unwrap();
 
-        let resolution = resolve_dispute_core(&store, new, first, Outcome::KeepBoth).await.unwrap();
+        let resolution = resolve_dispute_core(&store, new, first, Outcome::KeepBoth, None).await.unwrap();
 
         assert_eq!(resolution.keep.status, "disputed", "the dispute with `second` was never closed");
     }
@@ -495,8 +503,8 @@ mod tests {
         let old = seed(&store, "old", "active", &[], 0).await;
         let new = seed(&store, "new", "disputed", &[old], 1).await;
 
-        let once = resolve_dispute_core(&store, new, old, Outcome::Supersede).await.unwrap();
-        let twice = resolve_dispute_core(&store, new, old, Outcome::Supersede).await.unwrap();
+        let once = resolve_dispute_core(&store, new, old, Outcome::Supersede, None).await.unwrap();
+        let twice = resolve_dispute_core(&store, new, old, Outcome::Supersede, None).await.unwrap();
 
         assert_eq!(once, twice);
     }
@@ -506,9 +514,26 @@ mod tests {
         let store = store().await;
         let id = seed(&store, "x", "disputed", &[], 0).await;
         assert!(matches!(
-            resolve_dispute_core(&store, id, id, Outcome::Supersede).await,
+            resolve_dispute_core(&store, id, id, Outcome::Supersede, None).await,
             Err(ResolveError::SameRow)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_pair_of_another_agent_is_not_found() {
+        let store = store().await;
+        let old = seed(&store, "old", "active", &[], 0).await;
+        let new = seed(&store, "new", "disputed", &[old], 1).await;
+
+        assert!(matches!(
+            resolve_dispute_core(&store, new, old, Outcome::Supersede, Some("agent-x")).await,
+            Err(ResolveError::NotFound(id)) if id == new
+        ));
+        assert_eq!(row(&store, new).await.status, "disputed", "a refused resolution changes nothing");
+        assert_eq!(row(&store, old).await.status, "active");
+
+        let resolution = resolve_dispute_core(&store, new, old, Outcome::Supersede, Some("agent-d")).await.unwrap();
+        assert_eq!(resolution.other.status, "superseded");
     }
 
     #[tokio::test]
@@ -518,12 +543,12 @@ mod tests {
         let new = seed(&store, "new", "disputed", &[old], 1).await;
 
         assert!(matches!(
-            resolve_dispute_core(&store, new, 999, Outcome::Supersede).await,
+            resolve_dispute_core(&store, new, 999, Outcome::Supersede, None).await,
             Err(ResolveError::NotFound(999))
         ));
         soft_delete(&store, old).await;
         assert!(matches!(
-            resolve_dispute_core(&store, new, old, Outcome::Supersede).await,
+            resolve_dispute_core(&store, new, old, Outcome::Supersede, None).await,
             Err(ResolveError::NotFound(id)) if id == old
         ));
         assert_eq!(row(&store, new).await.status, "disputed", "a refused resolution changes nothing");
@@ -536,7 +561,7 @@ mod tests {
         let b = seed(&store, "b", "active", &[], 1).await;
 
         assert!(matches!(
-            resolve_dispute_core(&store, a, b, Outcome::Supersede).await,
+            resolve_dispute_core(&store, a, b, Outcome::Supersede, None).await,
             Err(ResolveError::NotInDispute { .. })
         ));
         assert_eq!(row(&store, b).await.status, "active");
@@ -558,7 +583,7 @@ mod tests {
             assert_eq!(hits.first().map(|h| h.id), Some(id), "{hits:?}");
         }
 
-        resolve_dispute_core(&store, new, old, Outcome::Supersede).await.unwrap();
+        resolve_dispute_core(&store, new, old, Outcome::Supersede, None).await.unwrap();
         let now = TimestampMs::now();
         store.conn.call(move |c| settle_disputed(c, now)).await.unwrap();
 

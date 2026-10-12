@@ -43,28 +43,60 @@ use crate::mcp::tools::{
     format_context, format_resolution, format_rows, format_search, format_status, resolve_project,
 };
 
-/// Agent id used when the MCP client did not identify itself.
+/// Agent id used when neither `--agent` nor the MCP client named one.
 ///
 /// Memories are scoped per agent, so this is not cosmetic: everything saved
 /// under it is retrievable under it, and a client that changes its reported
 /// name effectively gets a new memory.
 pub const FALLBACK_AGENT_ID: &str = "mcp";
 
-/// Which agent's memory a request reads and writes: the name the request's
-/// client declares, else the last one a client declared to this bridge, else
-/// `fallback`. Blank names count as none.
+/// Where the agent id of a call came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentSource {
+    /// `clawg mcp --agent`, set by the user in the host's MCP registration.
+    Flag,
+    /// The `clientInfo.name` the client declared.
+    Client,
+    /// Nothing named one.
+    Fallback,
+}
+
+impl AgentSource {
+    /// How `memory_status` explains the origin to the person reading it.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Flag => "from --agent",
+            Self::Client => "reported by the client; pin it with --agent",
+            Self::Fallback => "the client did not identify itself; pin one with --agent",
+        }
+    }
+}
+
+/// The agent a call reads and writes as: the flag, then the client's name,
+/// then [`FALLBACK_AGENT_ID`].
 ///
-/// The middle step is for the 2026-07-28 lifecycle, where a client names
+/// The client's name is kept exactly as sent. Rows already carry it verbatim,
+/// so normalizing it here would hide them.
+pub fn resolve_agent(flag: Option<&str>, client: Option<&str>) -> (String, AgentSource) {
+    if let Some(flag) = flag {
+        return (flag.to_string(), AgentSource::Flag);
+    }
+    match client.filter(|name| !name.trim().is_empty()) {
+        Some(name) => (name.to_string(), AgentSource::Client),
+        None => (FALLBACK_AGENT_ID.to_string(), AgentSource::Fallback),
+    }
+}
+
+/// The client name a request reads and writes under: the one it declares,
+/// else the last one a client declared to this bridge. Blank names count as
+/// none.
+///
+/// The second step is for the 2026-07-28 lifecycle, where a client names
 /// itself per request and only SHOULD: a stdio bridge serves one client, so a
 /// request that leaves the name out still comes from the one that gave it,
 /// and its memories must not drop out of sight under the fallback.
-fn agent_id_from(declared: Option<&str>, remembered: Option<&str>, fallback: &str) -> String {
-    [declared, remembered]
-        .into_iter()
-        .flatten()
-        .find(|name| !name.trim().is_empty())
-        .unwrap_or(fallback)
-        .to_string()
+fn client_name<'a>(declared: Option<&'a str>, remembered: Option<&'a str>) -> Option<&'a str> {
+    [declared, remembered].into_iter().flatten().find(|name| !name.trim().is_empty())
 }
 
 /// What the host is told this server is for, at `initialize` or
@@ -180,8 +212,8 @@ pub struct ResolveConflictArgs {
 #[derive(Clone)]
 pub struct ClawgMcp {
     client: ClientHandle,
-    /// Used when no client has identified itself.
-    agent_id: String,
+    /// `--agent`: wins over whatever the peer declares.
+    configured_agent: Option<String>,
     /// The last name a client declared to this bridge. Shared by every clone,
     /// because rmcp clones the server per call.
     declared: Arc<std::sync::Mutex<Option<String>>>,
@@ -231,7 +263,7 @@ impl ClawgMcp {
     ) -> Self {
         Self {
             client,
-            agent_id: FALLBACK_AGENT_ID.to_string(),
+            configured_agent: None,
             declared: Arc::default(),
             default_project,
             registered: Arc::default(),
@@ -240,15 +272,26 @@ impl ClawgMcp {
         }
     }
 
-    /// Which agent's memory a call reads and writes, by [`agent_id_from`].
+    /// Pins the agent id every call uses, whatever the peer declares.
+    pub fn with_agent(mut self, agent: Option<String>) -> Self {
+        self.configured_agent = agent;
+        self
+    }
+
+    /// Which agent's memory a call reads and writes, and why.
     ///
     /// Resolved per call rather than once at construction: the client names
     /// itself in `initialize` or in each request's `_meta`, both after the
     /// server is built.
-    fn agent_id_for(&self, ctx: &RequestContext<RoleServer>) -> String {
-        let declared = self.remember(ctx);
+    fn agent_for(&self, ctx: Option<&RequestContext<RoleServer>>) -> (String, AgentSource) {
+        let declared = ctx.and_then(|ctx| self.remember(ctx));
         let remembered = self.declared.lock().expect("declared lock").clone();
-        agent_id_from(declared.as_deref(), remembered.as_deref(), &self.agent_id)
+        let client = client_name(declared.as_deref(), remembered.as_deref());
+        resolve_agent(self.configured_agent.as_deref(), client)
+    }
+
+    fn agent_id_for(&self, ctx: Option<&RequestContext<RoleServer>>) -> String {
+        self.agent_for(ctx).0
     }
 
     /// Records the name `ctx`'s client declares, if any, and returns it.
@@ -475,8 +518,11 @@ impl ClawgMcp {
         }
     }
 
+    /// Lists the calling agent's rows only, across all of its projects: the
+    /// agent is the visibility boundary, the project is not.
     pub async fn list_memories_impl(
         &self,
+        agent_id: &str,
         args: ListMemoriesArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let client = match self.daemon().await {
@@ -490,6 +536,7 @@ impl ClawgMcp {
                 memory_type: args.memory_type,
                 limit: args.limit,
                 offset: args.offset,
+                agent: Some(agent_id.to_string()),
                 ..Default::default()
             })
             .await
@@ -499,41 +546,54 @@ impl ClawgMcp {
         }
     }
 
+    /// Another agent's row is refused as missing, like an id that is not there.
     pub async fn delete_memory_impl(
         &self,
+        agent_id: &str,
         args: DeleteMemoryArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let client = match self.daemon().await {
             Ok(c) => c,
             Err(failure) => return Ok(failure),
         };
-        match client.delete(&args.kind, args.id).await {
+        match client.delete(&args.kind, args.id, Some(agent_id)).await {
             Ok(n) => Self::ok(format!("deleted {n}")),
             Err(e) => Self::failed(Self::explain(&e)),
         }
     }
 
+    /// Both rows must be the calling agent's, as in `delete_memory_impl`.
     pub async fn resolve_conflict_impl(
         &self,
+        agent_id: &str,
         args: ResolveConflictArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let client = match self.daemon().await {
             Ok(c) => c,
             Err(failure) => return Ok(failure),
         };
-        match client.resolve(args.keep, args.other, args.keep_both.unwrap_or(false)).await {
+        match client.resolve(args.keep, args.other, args.keep_both.unwrap_or(false), Some(agent_id)).await {
             Ok(resolution) => Self::ok(format_resolution(&resolution)),
             Err(e) => Self::failed(Self::explain(&e)),
         }
     }
 
-    pub async fn memory_status_impl(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+    pub async fn memory_status_impl(
+        &self,
+        (agent_id, source): (String, AgentSource),
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let client = match self.daemon().await {
             Ok(c) => c,
             Err(failure) => return Ok(failure),
         };
         match client.health().await {
-            Ok(health) => Self::ok(format_status(&health, self.profile, client.base_dir())),
+            Ok(health) => Self::ok(format_status(
+                &health,
+                self.profile,
+                client.base_dir(),
+                &agent_id,
+                source.describe(),
+            )),
             Err(e) => Self::failed(Self::explain(&e)),
         }
     }
@@ -558,7 +618,7 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<SaveMemoryArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.save_memory_impl(&self.agent_id_for(&ctx), args).await
+        self.save_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
     }
 
     #[tool(
@@ -577,7 +637,7 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<SearchMemoryArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.search_memory_impl(&self.agent_id_for(&ctx), args).await
+        self.search_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
     }
 
     #[tool(
@@ -593,7 +653,7 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<RecallContextArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.recall_context_impl(&self.agent_id_for(&ctx), args).await
+        self.recall_context_impl(&self.agent_id_for(Some(&ctx)), args).await
     }
 
     #[tool(
@@ -605,9 +665,10 @@ impl ClawgMcp {
     )]
     async fn list_memories(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<ListMemoriesArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.list_memories_impl(args).await
+        self.list_memories_impl(&self.agent_id_for(Some(&ctx)), args).await
     }
 
     #[tool(
@@ -618,9 +679,10 @@ impl ClawgMcp {
     )]
     async fn delete_memory(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<DeleteMemoryArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.delete_memory_impl(args).await
+        self.delete_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
     }
 
     #[tool(
@@ -633,9 +695,10 @@ impl ClawgMcp {
     )]
     async fn resolve_conflict(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<ResolveConflictArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.resolve_conflict_impl(args).await
+        self.resolve_conflict_impl(&self.agent_id_for(Some(&ctx)), args).await
     }
 
     #[tool(
@@ -645,8 +708,8 @@ impl ClawgMcp {
                        loading. Use this when a memory tool fails and you need to tell the \
                        user why."
     )]
-    async fn memory_status(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.memory_status_impl().await
+    async fn memory_status(&self, ctx: RequestContext<RoleServer>) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.memory_status_impl(self.agent_for(Some(&ctx))).await
     }
 }
 
@@ -866,23 +929,24 @@ mod tests {
 
     #[test]
     fn the_name_the_request_declares_wins() {
-        assert_eq!(agent_id_from(Some("claude-code"), Some("earlier"), FALLBACK_AGENT_ID), "claude-code");
+        assert_eq!(client_name(Some("claude-code"), Some("earlier")), Some("claude-code"));
     }
 
     #[test]
     fn a_request_that_declares_no_name_keeps_the_one_declared_earlier() {
-        assert_eq!(agent_id_from(None, Some("claude-code"), FALLBACK_AGENT_ID), "claude-code");
+        assert_eq!(client_name(None, Some("claude-code")), Some("claude-code"));
     }
 
     #[test]
     fn a_blank_name_counts_as_none() {
-        assert_eq!(agent_id_from(Some("  "), Some("claude-code"), FALLBACK_AGENT_ID), "claude-code");
-        assert_eq!(agent_id_from(Some(""), None, FALLBACK_AGENT_ID), FALLBACK_AGENT_ID);
+        assert_eq!(client_name(Some("  "), Some("claude-code")), Some("claude-code"));
+        assert_eq!(client_name(Some(""), None), None);
     }
 
-    #[test]
-    fn agent_id_falls_back_when_no_client_has_identified_itself() {
-        assert_eq!(agent_id_from(None, None, FALLBACK_AGENT_ID), FALLBACK_AGENT_ID);
+    #[tokio::test]
+    async fn agent_id_falls_back_when_no_client_has_identified_itself() {
+        let (b, _d) = bridge().await;
+        assert_eq!(b.agent_id_for(None), FALLBACK_AGENT_ID);
     }
 
     // ── agent identity over the wire ────────────────────────────────────────
@@ -1022,6 +1086,108 @@ mod tests {
             .await;
 
         assert!(found.contains(content), "{found}");
+    }
+
+    #[test]
+    fn the_configured_agent_wins_over_the_client() {
+        assert_eq!(resolve_agent(Some("claude-code"), Some("Claude Code")), ("claude-code".into(), AgentSource::Flag));
+        assert_eq!(resolve_agent(Some("claude-code"), None), ("claude-code".into(), AgentSource::Flag));
+    }
+
+    #[test]
+    fn without_a_flag_the_client_name_wins_over_the_fallback() {
+        assert_eq!(resolve_agent(None, Some("cursor")), ("cursor".into(), AgentSource::Client));
+        assert_eq!(resolve_agent(None, Some(" Cursor ")), (" Cursor ".into(), AgentSource::Client), "kept as sent");
+        assert_eq!(resolve_agent(None, Some("  ")), (FALLBACK_AGENT_ID.into(), AgentSource::Fallback));
+        assert_eq!(resolve_agent(None, None), (FALLBACK_AGENT_ID.into(), AgentSource::Fallback));
+    }
+
+    /// The failure the flag exists for: a client that stops sending
+    /// `clientInfo` must not lose sight of what it saved under its old name.
+    #[tokio::test]
+    async fn a_configured_agent_keeps_its_memories_without_client_info() {
+        let (b, _d) = bridge().await;
+        let b = b.with_agent(Some("claude-code".into()));
+        let content = "the staging database is refreshed every sunday night";
+        let client = b.daemon().await.expect("daemon");
+        client
+            .save(SaveArgs {
+                content: content.into(),
+                agent_id: "claude-code".into(),
+                project_id: Some("proj-test".into()),
+                memory_type: None,
+                importance: None,
+            })
+            .await
+            .expect("save");
+
+        let agent = b.agent_id_for(None);
+        assert_eq!(agent, "claude-code");
+        let found = b
+            .search_memory_impl(
+                &agent,
+                SearchMemoryArgs { query: content.into(), limit: None, project_path: None, all_projects: None },
+            )
+            .await
+            .expect("search");
+        assert!(text(&found).contains(content), "{}", text(&found));
+    }
+
+    #[tokio::test]
+    async fn memory_status_names_the_agent_and_where_it_came_from() {
+        let (b, _d) = bridge().await;
+        let pinned = b.clone().with_agent(Some("claude-code".into()));
+
+        let r = pinned.memory_status_impl(pinned.agent_for(None)).await.expect("status");
+        assert!(text(&r).contains("agent: claude-code (from --agent)"), "{}", text(&r));
+
+        let r = b.memory_status_impl(b.agent_for(None)).await.expect("status");
+        assert!(text(&r).contains(&format!("agent: {FALLBACK_AGENT_ID} (")), "{}", text(&r));
+        assert!(text(&r).contains("--agent"), "the fallback must say how to pin one: {}", text(&r));
+    }
+
+    /// Rows and a hand-written workspace as the previous version leaves them,
+    /// under the name the client used to report: pinning that same name keeps
+    /// every one of them reachable.
+    #[tokio::test]
+    async fn rows_and_workspace_of_a_client_name_survive_pinning_it() {
+        let mut workspaces = None;
+        let (b, _d) = bridge_with(|runtime| {
+            workspaces = Some(runtime.workspaces());
+            runtime
+        })
+        .await;
+        let workspaces = workspaces.expect("runtime");
+        let b = b.with_agent(Some("claude-code".into()));
+        let client = b.daemon().await.expect("daemon");
+        client
+            .save(SaveArgs {
+                content: "the release branch is cut on the first monday".into(),
+                agent_id: "claude-code".into(),
+                project_id: Some("proj-test".into()),
+                memory_type: None,
+                importance: None,
+            })
+            .await
+            .expect("save");
+        let path = workspaces.workspace_path("claude-code", Some("proj-test"));
+        assert!(path.ends_with("claude-code/proj-test/workspace.md"), "the path must not move: {}", path.display());
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            &path,
+            "<!-- AUTO-START -->\n<!-- AUTO-END -->\n<!-- USER-START -->\nask before force-pushing\n<!-- USER-END -->\n",
+        )
+        .expect("workspace");
+
+        let agent = b.agent_id_for(None);
+        let listed = text(&b.list_memories_impl(&agent, list_all()).await.expect("list"));
+        assert!(listed.contains("release branch"), "{listed}");
+        let context = b
+            .recall_context_impl(&agent, RecallContextArgs { query: "release branch".into(), project_path: None })
+            .await
+            .expect("recall");
+        assert!(text(&context).contains("ask before force-pushing"), "{}", text(&context));
+        assert!(text(&context).contains("release branch"), "{}", text(&context));
     }
 
     // ── get_info ────────────────────────────────────────────────────────────
@@ -1233,7 +1399,7 @@ mod tests {
             .unwrap_or_else(|| panic!("expected `saved #<id>`, got: {}", text(&saved)));
 
         let listed = b
-            .list_memories_impl(ListMemoriesArgs {
+            .list_memories_impl("agent-mcp", ListMemoriesArgs {
                 kind: Some("memory".into()),
                 tier: None,
                 memory_type: None,
@@ -1262,7 +1428,7 @@ mod tests {
         assert!(text(&found).contains(content), "text was: {}", text(&found));
 
         let deleted = b
-            .delete_memory_impl(DeleteMemoryArgs { id, kind: "memory".into() })
+            .delete_memory_impl("agent-mcp", DeleteMemoryArgs { id, kind: "memory".into() })
             .await
             .expect("delete");
         assert!(!is_error(&deleted), "delete failed: {}", text(&deleted));
@@ -1437,7 +1603,7 @@ mod tests {
     #[tokio::test]
     async fn memory_status_reports_the_daemon_and_the_profile() {
         let (b, _d) = bridge().await;
-        let r = b.memory_status_impl().await.expect("status");
+        let r = b.memory_status_impl(b.agent_for(None)).await.expect("status");
         assert!(!is_error(&r), "text was: {}", text(&r));
         let t = text(&r);
         assert!(t.contains("\"status\""), "the health JSON must be there: {t}");
@@ -1448,7 +1614,7 @@ mod tests {
     async fn deleting_a_missing_row_is_an_error_result_the_model_can_read() {
         let (b, _d) = bridge().await;
         let r = b
-            .delete_memory_impl(DeleteMemoryArgs { id: 999_999, kind: "memory".into() })
+            .delete_memory_impl("agent-mcp", DeleteMemoryArgs { id: 999_999, kind: "memory".into() })
             .await
             .expect("the call itself must succeed");
         assert!(is_error(&r), "a failed delete must be marked as an error");
@@ -1488,7 +1654,7 @@ mod tests {
             .expect("mark the dispute");
 
         let r = b
-            .resolve_conflict_impl(ResolveConflictArgs { keep: new, other: old, keep_both: None })
+            .resolve_conflict_impl("agent-mcp", ResolveConflictArgs { keep: new, other: old, keep_both: None })
             .await
             .expect("call");
 
@@ -1500,7 +1666,7 @@ mod tests {
     async fn resolve_conflict_reports_a_refusal() {
         let (b, _d) = bridge().await;
         let r = b
-            .resolve_conflict_impl(ResolveConflictArgs { keep: 4, other: 4, keep_both: Some(true) })
+            .resolve_conflict_impl("agent-mcp", ResolveConflictArgs { keep: 4, other: 4, keep_both: Some(true) })
             .await
             .expect("call");
         assert!(is_error(&r));
@@ -1511,7 +1677,7 @@ mod tests {
     async fn an_unknown_kind_is_reported_as_a_readable_error() {
         let (b, _d) = bridge().await;
         let r = b
-            .delete_memory_impl(DeleteMemoryArgs { id: 1, kind: "bogus".into() })
+            .delete_memory_impl("agent-mcp", DeleteMemoryArgs { id: 1, kind: "bogus".into() })
             .await
             .expect("call");
         assert!(is_error(&r));
@@ -1523,13 +1689,99 @@ mod tests {
     #[tokio::test]
     async fn a_dead_daemon_is_explained_rather_than_dumped() {
         let b = dead_bridge();
-        let r = b.memory_status_impl().await.expect("call");
+        let r = b.memory_status_impl(b.agent_for(None)).await.expect("call");
         assert!(is_error(&r));
         assert!(
             text(&r).contains("clawg serve"),
             "the message must name the fix: {}",
             text(&r)
         );
+    }
+
+    // ── agent scope ─────────────────────────────────────────────────────────
+
+    async fn saved_id(b: &ClawgMcp, agent: &str, content: &str) -> i64 {
+        let saved = b.save_memory_impl(agent, save_args(content)).await.expect("save");
+        text(&saved)
+            .strip_prefix("saved #")
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("expected `saved #<id>`, got: {}", text(&saved)))
+    }
+
+    fn list_all() -> ListMemoriesArgs {
+        ListMemoriesArgs { kind: None, tier: None, memory_type: None, limit: None, offset: None }
+    }
+
+    #[tokio::test]
+    async fn an_agent_cannot_delete_another_agents_memory() {
+        let (b, _d) = bridge().await;
+        let content = "agent a keeps its release notes in the wiki";
+        let id = saved_id(&b, "agent-a", content).await;
+
+        let r = b
+            .delete_memory_impl("agent-b", DeleteMemoryArgs { id, kind: "memory".into() })
+            .await
+            .expect("call");
+        assert!(is_error(&r), "another agent's memory must not be deletable: {}", text(&r));
+
+        let listed = b.list_memories_impl("agent-a", list_all()).await.expect("list");
+        assert!(text(&listed).contains(content), "the row must survive: {}", text(&listed));
+
+        let r = b
+            .delete_memory_impl("agent-a", DeleteMemoryArgs { id, kind: "memory".into() })
+            .await
+            .expect("call");
+        assert!(!is_error(&r), "the owner deletes it: {}", text(&r));
+    }
+
+    #[tokio::test]
+    async fn an_agent_lists_only_its_own_memories() {
+        let (b, _d) = bridge().await;
+        saved_id(&b, "agent-a", "agent a prefers tabs over spaces").await;
+        saved_id(&b, "agent-b", "agent b prefers spaces over tabs").await;
+
+        let listed = text(&b.list_memories_impl("agent-b", list_all()).await.expect("list"));
+
+        assert!(listed.contains("agent b prefers"), "{listed}");
+        assert!(!listed.contains("agent a prefers"), "another agent's memory leaked: {listed}");
+    }
+
+    #[tokio::test]
+    async fn an_agent_cannot_resolve_another_agents_conflict() {
+        let mut store = None;
+        let (b, _d) = bridge_with(|runtime| {
+            store = Some(runtime.store.clone());
+            runtime
+        })
+        .await;
+        let old = saved_id(&b, "agent-a", "the cache expires after one hour").await;
+        let new = saved_id(&b, "agent-a", "the cache expires after one day").await;
+        let store = store.expect("the runtime's store");
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    &format!("UPDATE memory SET status = 'disputed', disputed_against = '[{old}]' WHERE id = {new}"),
+                    [],
+                )
+            })
+            .await
+            .expect("mark the dispute");
+
+        let r = b
+            .resolve_conflict_impl("agent-b", ResolveConflictArgs { keep: new, other: old, keep_both: None })
+            .await
+            .expect("call");
+
+        assert!(is_error(&r), "another agent's conflict must not be resolvable: {}", text(&r));
+        let client = b.daemon().await.expect("daemon");
+        let mut rows = client
+            .list(ListArgs { kind: Some("memory".into()), ..Default::default() })
+            .await
+            .expect("list");
+        rows.sort_by_key(|r| r.id);
+        let statuses: Vec<&str> = rows.iter().map(|r| r.status.as_str()).collect();
+        assert_eq!(statuses, ["active", "disputed"], "a refused resolution changes nothing");
     }
 
     // ── project scoping ─────────────────────────────────────────────────────

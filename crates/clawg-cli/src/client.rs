@@ -304,6 +304,12 @@ pub struct ListArgs {
     pub offset: Option<u32>,
 }
 
+/// The query of a scoped change: no pair at all when unscoped, because
+/// `?agent=` would reach the daemon as a scope to the empty agent.
+fn owner_query(agent: Option<&str>) -> Vec<(&'static str, &str)> {
+    agent.map(|a| ("agent", a)).into_iter().collect()
+}
+
 // ── The client ──────────────────────────────────────────────────────────────
 
 /// A handle on one daemon: its address, its token, and a reusable HTTP client.
@@ -555,11 +561,14 @@ impl DaemonClient {
         Self::read_response(resp).await
     }
 
+    /// `agent` scopes the change to that agent's rows; another agent's row
+    /// comes back as not found.
     pub async fn set_importance(
         &self,
         kind: &str,
         id: i64,
         importance: f64,
+        agent: Option<&str>,
     ) -> Result<usize, ClientError> {
         #[derive(Deserialize)]
         struct Body {
@@ -568,6 +577,7 @@ impl DaemonClient {
         let resp = self
             .http
             .patch(self.url(&format!("/v1/memories/{kind}/{id}")))
+            .query(&owner_query(agent))
             .bearer_auth(&self.token)
             .json(&serde_json::json!({ "importance": importance }))
             .send()
@@ -576,7 +586,8 @@ impl DaemonClient {
         Ok(Self::read_response::<Body>(resp).await?.updated)
     }
 
-    pub async fn delete(&self, kind: &str, id: i64) -> Result<usize, ClientError> {
+    /// `agent` scopes the delete as in [`DaemonClient::set_importance`].
+    pub async fn delete(&self, kind: &str, id: i64, agent: Option<&str>) -> Result<usize, ClientError> {
         #[derive(Deserialize)]
         struct Body {
             deleted: usize,
@@ -584,6 +595,7 @@ impl DaemonClient {
         let resp = self
             .http
             .delete(self.url(&format!("/v1/memories/{kind}/{id}")))
+            .query(&owner_query(agent))
             .bearer_auth(&self.token)
             .send()
             .await
@@ -591,12 +603,19 @@ impl DaemonClient {
         Ok(Self::read_response::<Body>(resp).await?.deleted)
     }
 
-    pub async fn resolve(&self, keep: i64, other: i64, keep_both: bool) -> Result<Resolution, ClientError> {
+    /// `agent` scopes the resolution as in [`DaemonClient::set_importance`].
+    pub async fn resolve(
+        &self,
+        keep: i64,
+        other: i64,
+        keep_both: bool,
+        agent: Option<&str>,
+    ) -> Result<Resolution, ClientError> {
         let resp = self
             .http
             .post(self.url("/v1/disputes/resolve"))
             .bearer_auth(&self.token)
-            .json(&serde_json::json!({ "keep": keep, "other": other, "keep_both": keep_both }))
+            .json(&serde_json::json!({ "keep": keep, "other": other, "keep_both": keep_both, "agent_id": agent }))
             .send()
             .await
             .map_err(Self::map_transport)?;
@@ -1046,8 +1065,8 @@ pub(crate) mod tests {
         let prompt = c.context(content, "agent-client", None).await.expect("context");
         let _ = prompt; // an empty prompt is a valid answer
 
-        assert_eq!(c.set_importance("memory", id, 9.5).await.expect("patch"), 1);
-        assert_eq!(c.delete("memory", id).await.expect("delete"), 1);
+        assert_eq!(c.set_importance("memory", id, 9.5, None).await.expect("patch"), 1);
+        assert_eq!(c.delete("memory", id, None).await.expect("delete"), 1);
     }
 
     #[test]
@@ -1152,7 +1171,7 @@ pub(crate) mod tests {
         let c = DaemonClient::from_data_dir(d.dir.path()).expect("client");
 
         let err = c
-            .delete("memory", 999_999)
+            .delete("memory", 999_999, None)
             .await
             .expect_err("deleting a missing row must fail");
         match err {
@@ -1170,7 +1189,7 @@ pub(crate) mod tests {
         publish(&d);
         let c = DaemonClient::from_data_dir(d.dir.path()).expect("client");
 
-        let err = c.resolve(1, 1, false).await.expect_err("a row cannot be resolved against itself");
+        let err = c.resolve(1, 1, false, None).await.expect_err("a row cannot be resolved against itself");
 
         assert!(matches!(err, ClientError::Daemon { status: 400, .. }), "{err:?}");
     }
