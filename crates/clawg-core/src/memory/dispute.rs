@@ -12,7 +12,7 @@
 //! maintenance pass on one rule.
 
 use rusqlite::Connection;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::memory::clock::TimestampMs;
 use crate::memory::{MemoryError, MemoryStore};
@@ -47,14 +47,14 @@ impl From<rusqlite::Error> for ResolveError {
 }
 
 /// One side of a resolved pair, as it stands after the resolution.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedRow {
     pub id: i64,
     pub status: String,
     pub superseded_by: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resolution {
     pub keep: ResolvedRow,
     pub other: ResolvedRow,

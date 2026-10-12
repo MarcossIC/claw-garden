@@ -30,6 +30,7 @@ use clawg_core::memory::admin::{
     set_importance_core, ListParams, MemoryAdminRow, MemoryKind, MemoryStats, StatsParams,
 };
 use clawg_core::memory::bootstrap::EmbedderStatus;
+use clawg_core::memory::dispute::{resolve_dispute_core, Outcome, Resolution, ResolveError};
 use clawg_core::memory::embedder::EmbedRole;
 use clawg_core::memory::worker::{
     ChunkOutcome, IngestFailure, IngestReport, IngestRequest, SavedChunk,
@@ -438,6 +439,17 @@ pub struct DeletedBody {
     pub deleted: usize,
 }
 
+/// Closes the dispute between two `memory` rows. Disputes only ever pair
+/// `memory` rows, so there is no `kind`.
+#[derive(Debug, Deserialize)]
+pub struct ResolveRequest {
+    pub keep: i64,
+    pub other: i64,
+    /// Both rows stand instead of `other` being superseded by `keep`.
+    #[serde(default)]
+    pub keep_both: bool,
+}
+
 // ── Router ──────────────────────────────────────────────────────────────────
 
 /// Builds the daemon's router.
@@ -450,6 +462,7 @@ pub fn router(app: Arc<AppCtx>) -> Router {
             "/memories/{kind}/{id}",
             get(get_memory).patch(patch_importance).delete(delete_memory),
         )
+        .route("/disputes/resolve", post(resolve_dispute))
         .route("/stats", get(stats))
         .route("/shutdown", post(shutdown))
         .layer(axum::middleware::from_fn_with_state(app.clone(), require_bearer));
@@ -789,6 +802,24 @@ async fn delete_memory(
         return Err(ApiError::not_found(format!("no {kind:?} row with id {id}")));
     }
     Ok(Json(DeletedBody { deleted }))
+}
+
+async fn resolve_dispute(
+    State(app): State<Arc<AppCtx>>,
+    Json(body): Json<ResolveRequest>,
+) -> ApiResult<Json<Resolution>> {
+    let outcome = if body.keep_both { Outcome::KeepBoth } else { Outcome::Supersede };
+    resolve_dispute_core(&app.runtime.store, body.keep, body.other, outcome)
+        .await
+        .map(Json)
+        .map_err(|e| match e {
+            ResolveError::SameRow => ApiError::bad_request(e.to_string()),
+            ResolveError::NotFound(_) => ApiError::not_found(e.to_string()),
+            ResolveError::NotInDispute { .. } | ResolveError::SupersededElsewhere { .. } => {
+                ApiError::new(StatusCode::CONFLICT, e.to_string())
+            }
+            ResolveError::Store(_) => ApiError::internal(e),
+        })
 }
 
 async fn shutdown(State(app): State<Arc<AppCtx>>) -> (StatusCode, Json<QueuedBody>) {
