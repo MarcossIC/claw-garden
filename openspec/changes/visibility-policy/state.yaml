@@ -1,14 +1,15 @@
 change: visibility-policy
 objective: "2,4"
 depends_on: [project-identity, eval-golden-expansion]
-phase: explore
+scope: partes A (identidad) y B (scope de lo que modifica); C (compartir) espera a secret-hygiene, D (prefiltro vec0) a medir crowding
+phase: apply
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
-  apply: pending
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: in-progress
   verify: pending
   archive: pending
-updated: 2026-10-11
+updated: 2026-10-12
