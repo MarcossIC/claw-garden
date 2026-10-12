@@ -81,6 +81,8 @@ Dos defectos del ranking ensucian lo que el agente recibe y lo que el sistema ap
 
 El cambio de desempate puede mover R@k sólo cuando el esperado empata en score con otro hit dentro del top 10. Se reporta el diff caso por caso.
 
+Las corridas de eval no registran accesos (`crates/clawg-core/src/eval_api.rs:461` usa un tracker inerte), así que `rag-eval` sólo ve el cambio de desempate y el corte. El efecto sobre los accesos lo prueban los tests.
+
 ## Datos guardados
 
 - No cambia el esquema, ni identificadores, ni estados, ni el contrato de embeddings.
@@ -93,7 +95,6 @@ El cambio de desempate puede mover R@k sólo cuando el esperado empata en score 
 |---|---|---|
 | Menos accesos frena la promoción de tier de filas que sí se usan | Baja | Sólo se dejan de contar filas que el agente no vio o con score 0. Lo que el agente lee sigue contando igual |
 | Un daemon viejo ignora `min_relative_score` y sigue inflando | Media en la transición | serde ignora campos desconocidos en `SearchRequest`; el puente mantiene su corte, así que el agente ve lo mismo. Se corrige al reiniciar el daemon con la versión nueva |
-| `rag-eval --agent-view` cambia porque la corrida registra menos accesos entre casos | Media | Es el efecto buscado. El diff se lee por caso y se documenta en verify |
 | Un caller externo de `/v1/search` esperaba que todo lo devuelto contara | Baja | El campo es opcional: sin él sólo cambia que los ceros no cuentan |
 
 ## Design

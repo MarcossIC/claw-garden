@@ -53,7 +53,7 @@ Dos hits con el mismo score MUST ordenarse por `distance` ascendente. Si tambié
 - WHEN se busca con `min_relative_score = 1.5`
 - THEN la respuesta es 400
 
-**Test:** `search_applies_the_requested_relative_cut` y `search_rejects_a_relative_score_outside_zero_to_one` en `crates/clawg-cli/tests/api.rs`. Fallan hoy: el campo no existe (`api.rs:229-236`) y serde lo ignora.
+**Test:** `search_applies_the_requested_relative_cut`, `search_without_a_relative_cut_is_unchanged` y `search_rejects_a_relative_score_outside_zero_to_one` en `crates/clawg-cli/tests/api.rs`. Fallan hoy: el campo no existe (`api.rs:229-236`) y serde lo ignora.
 
 **Test:** la función del corte conserva los tests de `tools.rs:208-240` al moverse de módulo.
 
@@ -71,7 +71,7 @@ El handler `search` MUST registrar como acceso exactamente los hits contables de
 - WHEN se busca sin `min_relative_score` y se hace flush
 - THEN `access_count` de C no cambia
 
-**Test:** `a_hit_cut_for_relevance_does_not_count_as_an_access` y `a_zero_score_hit_does_not_count_as_an_access` en `crates/clawg-cli/tests/api.rs`. Fallan hoy: se registra todo lo que devuelve la búsqueda (`api.rs:496-501`).
+**Test:** `access_ids_keep_only_memory_hits_that_scored` en `crates/clawg-core/src/memory/access.rs` fija qué hits cuentan; el handler registra `access_ids` de la respuesta ya cortada, y `search_applies_the_requested_relative_cut` (R2) fija que esa respuesta no trae los cortados. Falla hoy: la función no existe y el handler registra todo lo que devuelve la búsqueda (`api.rs:496-501`). El flush del tracker corre cada 30 s y no se puede adelantar desde un test HTTP, por eso la prueba se parte en esas dos piezas.
 
 ## R4. `recall_context` no cuenta los ceros
 
@@ -89,11 +89,10 @@ El handler `search` MUST registrar como acceso exactamente los hits contables de
 `DaemonClient::search` MUST mandar `min_relative_score` igual a `RELEVANCE_RATIO` (0,6). El puente MUST seguir aplicando el corte al renderizar, de modo que contra un daemon que ignora el campo el agente vea lo mismo que hoy.
 
 #### Escenario
-- GIVEN un servidor de prueba que registra el cuerpo recibido
-- WHEN el cliente busca
-- THEN el cuerpo contiene `"min_relative_score": 0.6`
+- WHEN el cliente arma el cuerpo de una búsqueda
+- THEN el cuerpo contiene `"min_relative_score": 0.6` además de los campos de `SearchArgs`
 
-**Test:** `search_sends_the_relevance_ratio` en `client.rs` (mod tests). Falla hoy: `SearchArgs` no tiene el campo (`client.rs:211-216`).
+**Test:** `search_request_carries_the_relevance_ratio` en `client.rs` (mod tests), sobre el cuerpo que arma el cliente. Falla hoy: el cliente serializa `SearchArgs` tal cual (`client.rs:211-216`, `:357-359`).
 
 ## Compatibilidad de datos
 
