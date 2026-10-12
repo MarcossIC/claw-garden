@@ -124,7 +124,7 @@ static VEC0_REGISTERED: Once = Once::new();
 /// The `transmute` pattern matches the upstream `sqlite-vec` demo and is the
 /// correct approach for `rusqlite 0.37` (which still exposes the raw FFI).
 /// The `Once` guard makes this idempotent and thread-safe.
-fn ensure_vec0_registered() {
+pub(crate) fn ensure_vec0_registered() {
     VEC0_REGISTERED.call_once(|| {
         unsafe {
             rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
@@ -428,6 +428,39 @@ async fn run_migrations(conn: &Connection) -> Result<(), MemoryError> {
     Ok(())
 }
 
+/// Builds `<dir>/memory.db` migrated up to `target` (all when `None`),
+/// with one row, and closes it so the file stands alone.
+#[cfg(test)]
+pub(crate) async fn seed_on_disk(dir: &Path, target: Option<i32>) {
+    ensure_vec0_registered();
+    let conn = Connection::open(dir.join("memory.db")).await.unwrap();
+    register_udfs(&conn).await.unwrap();
+    conn.call(move |c| {
+        let runner = crate::memory::migrations::runner();
+        let runner = match target {
+            Some(v) => runner.set_target(refinery::Target::Version(v)),
+            None => runner,
+        };
+        runner.run(c)
+    })
+    .await
+    .unwrap();
+    conn.call(|c| {
+        c.execute(
+            "INSERT INTO memory \
+             (scope, agent_id, content, memory_type, source, \
+              created_at, created_by_type, created_by_ref, \
+              last_modified_at, last_accessed_at, importance, tier, status) \
+             VALUES ('agent', 'agent-seed', 'seeded on disk', 'chat_message', 'chat', \
+              0, 'user', 'agent-seed', 0, 0, 5.0, 3, 'active')",
+            [],
+        )
+    })
+    .await
+    .unwrap();
+    conn.close().await.unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -623,38 +656,6 @@ mod tests {
         let after = conn.call(snapshot).await.unwrap();
         assert_eq!(before, after);
         assert_eq!(after.0, 8);
-    }
-
-    /// Builds `<dir>/memory.db` migrated up to `target` (all when `None`),
-    /// with one row, and closes it so the file stands alone.
-    async fn seed_on_disk(dir: &Path, target: Option<i32>) {
-        ensure_vec0_registered();
-        let conn = Connection::open(dir.join("memory.db")).await.unwrap();
-        register_udfs(&conn).await.unwrap();
-        conn.call(move |c| {
-            let runner = crate::memory::migrations::runner();
-            let runner = match target {
-                Some(v) => runner.set_target(refinery::Target::Version(v)),
-                None => runner,
-            };
-            runner.run(c)
-        })
-        .await
-        .unwrap();
-        conn.call(|c| {
-            c.execute(
-                "INSERT INTO memory \
-                 (scope, agent_id, content, memory_type, source, \
-                  created_at, created_by_type, created_by_ref, \
-                  last_modified_at, last_accessed_at, importance, tier, status) \
-                 VALUES ('agent', 'agent-seed', 'seeded on disk', 'chat_message', 'chat', \
-                  0, 'user', 'agent-seed', 0, 0, 5.0, 3, 'active')",
-                [],
-            )
-        })
-        .await
-        .unwrap();
-        conn.close().await.unwrap();
     }
 
     fn tamper(dir: &Path, sql: &str) {

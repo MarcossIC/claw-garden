@@ -2,6 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::memory::store_lock::{StoreHolder, StoreLock};
+use crate::memory::MemoryError;
+
 /// One migration as the schema plan compares it: applied to a database
 /// (`refinery_schema_history`) or embedded in this binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +142,8 @@ pub enum BackupError {
         #[source]
         source: std::io::Error,
     },
+    #[error("there is no memory store at {path}")]
+    NoStore { path: PathBuf },
     #[error("cannot snapshot to {path}: SQLite needs the path as UTF-8")]
     NonUtf8Path { path: PathBuf },
     #[error("could not write the snapshot {path}: {source}")]
@@ -282,10 +287,33 @@ pub fn snapshot_into(
     Ok(path)
 }
 
+/// Snapshots a store no process is serving, without migrating it: a backup
+/// copies what is there, not what a newer binary would make of it.
+///
+/// Holds the store lock for the duration, so neither a daemon nor another
+/// backup can start in between.
+pub fn backup_offline(base_dir: &Path) -> Result<PathBuf, MemoryError> {
+    let _lock = StoreLock::acquire(base_dir, StoreHolder::Maintenance)?;
+    let c = open_existing(base_dir)?;
+    Ok(snapshot_into(&c, &crate::paths::backups_dir(base_dir), Reason::Manual)?)
+}
+
+fn open_existing(base_dir: &Path) -> Result<rusqlite::Connection, MemoryError> {
+    let path = base_dir.join("memory.db");
+    if !path.exists() {
+        return Err(BackupError::NoStore { path }.into());
+    }
+    crate::memory::db::ensure_vec0_registered();
+    Ok(rusqlite::Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::store_lock::StoreHolder;
+    use crate::memory::db::seed_on_disk;
     use crate::memory::MemoryStore;
 
     const INSERT_ROW: &str = "INSERT INTO memory \
@@ -473,6 +501,48 @@ mod tests {
         expected.push("notes.txt".into());
         expected.sort();
         assert_eq!(files_in(&backups), expected);
+    }
+
+    fn history_top(db: &Path) -> i32 {
+        let c = rusqlite::Connection::open(db).unwrap();
+        c.query_row("SELECT MAX(version) FROM refinery_schema_history", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_offline_backup_copies_without_migrating() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_on_disk(dir.path(), Some(7)).await;
+
+        let path = backup_offline(dir.path()).unwrap();
+
+        assert_eq!(parse_snapshot_name(&path.file_name().unwrap().to_string_lossy()), Some(Reason::Manual));
+        assert_eq!(contents(&path), vec!["seeded on disk".to_string()]);
+        assert_eq!(history_top(&path), 7);
+        assert_eq!(history_top(&dir.path().join("memory.db")), 7, "the store was not migrated");
+        StoreLock::acquire(dir.path(), StoreHolder::Daemon).expect("the lock was released");
+    }
+
+    #[tokio::test]
+    async fn an_offline_backup_refuses_a_held_store() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_on_disk(dir.path(), None).await;
+        let _daemon = StoreLock::acquire(dir.path(), StoreHolder::Daemon).unwrap();
+
+        let err = backup_offline(dir.path()).unwrap_err();
+
+        match err {
+            MemoryError::StoreInUse { owner: Some(o) } => assert_eq!(o.holder, StoreHolder::Daemon),
+            other => panic!("expected StoreInUse naming the daemon, got {other:?}"),
+        }
+        assert!(files_in(&dir.path().join("backups")).is_empty());
+    }
+
+    #[test]
+    fn an_offline_backup_of_nothing_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = backup_offline(dir.path()).unwrap_err();
+        assert!(matches!(err, MemoryError::Backup(BackupError::NoStore { .. })), "got {err:?}");
     }
 
     #[tokio::test]
