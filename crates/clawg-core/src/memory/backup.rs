@@ -297,6 +297,10 @@ pub fn snapshot_into(
 /// Holds the store lock for the duration, so neither a daemon nor another
 /// backup can start in between.
 pub fn backup_offline(base_dir: &Path) -> Result<PathBuf, MemoryError> {
+    let path = base_dir.join("memory.db");
+    if !path.exists() {
+        return Err(BackupError::NoStore { path }.into());
+    }
     let _lock = StoreLock::acquire(base_dir, StoreHolder::Maintenance)?;
     let c = open_existing(base_dir)?;
     Ok(snapshot_into(&c, &crate::paths::backups_dir(base_dir), Reason::Manual)?)
@@ -316,6 +320,10 @@ pub struct Restored {
 /// touched, and the store it replaces is snapshotted first; either failing
 /// leaves the store as it was.
 pub fn restore(base_dir: &Path, from: &Path) -> Result<Restored, MemoryError> {
+    // A machine that never ran clawg has no data directory yet, and restoring
+    // onto one is how a store moves to it.
+    std::fs::create_dir_all(base_dir)
+        .map_err(|source| BackupError::Dir { path: base_dir.to_path_buf(), source })?;
     let _lock = StoreLock::acquire(base_dir, StoreHolder::Maintenance)?;
     check_restorable(from)?;
 
@@ -716,8 +724,25 @@ mod tests {
     #[test]
     fn an_offline_backup_of_nothing_says_so() {
         let dir = tempfile::tempdir().unwrap();
-        let err = backup_offline(dir.path()).unwrap_err();
-        assert!(matches!(err, MemoryError::Backup(BackupError::NoStore { .. })), "got {err:?}");
+        for base in [dir.path().to_path_buf(), dir.path().join("never-created")] {
+            let err = backup_offline(&base).unwrap_err();
+            assert!(matches!(err, MemoryError::Backup(BackupError::NoStore { .. })), "got {err:?}");
+        }
+        assert!(!dir.path().join("never-created").exists());
+    }
+
+    #[tokio::test]
+    async fn restore_onto_a_machine_without_a_data_directory() {
+        let source = tempfile::tempdir().unwrap();
+        seed_on_disk(source.path(), None).await;
+        let snapshot = backup_offline(source.path()).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let base = home.path().join(".clawg-dev");
+
+        let restored = restore(&base, &snapshot).unwrap();
+
+        assert!(restored.previous.is_none());
+        assert_eq!(contents(&base.join("memory.db")), vec!["seeded on disk".to_string()]);
     }
 
     fn add_row(dir: &Path, content: &str) {
