@@ -339,6 +339,10 @@ pub struct MemoryAdminRow {
     /// Raw JSON text of the ids this row disputes.
     pub disputed_against: Option<String>,
     pub last_disputed_at: Option<i64>,
+    /// The `memory` rows this one was drawn from, ascending. Only a
+    /// conclusion has them; every other row omits the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derived_from: Option<Vec<i64>>,
 }
 
 /// Filter/pagination params for `list_memories_core`. `kind: None` merges
@@ -499,7 +503,8 @@ pub async fn list_memories_core(
 const SELECT_MEMORY: &str = "SELECT id, scope, agent_id, project_id, memory_type, content, \
      tier, importance, status, access_count, created_at, last_accessed_at, superseded_by, \
      deleted_at, source, source_session_id, created_by_type, created_by_ref, \
-     last_modified_at, update_count, dispute_count, disputed_against, last_disputed_at \
+     last_modified_at, update_count, dispute_count, disputed_against, last_disputed_at, \
+     (SELECT json_group_array(source_id) FROM memory_derivation WHERE memory_id = memory.id) \
      FROM memory";
 const SELECT_EPISODIC: &str = "SELECT id, scope, agent_id, project_id, task, tier, importance, \
      status, access_count, created_at, last_accessed_at, superseded_by, deleted_at \
@@ -604,7 +609,17 @@ fn map_memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryAdminRow> {
         dispute_count: Some(row.get(20)?),
         disputed_against: row.get(21)?,
         last_disputed_at: row.get(22)?,
+        derived_from: sources_from_json(&row.get::<_, String>(23)?),
     })
+}
+
+/// Reads the `json_group_array` of a row's sources: `None` for a row with
+/// none, so only a conclusion carries the field. Sorted here because an
+/// aggregate's order is not something SQLite promises.
+fn sources_from_json(json: &str) -> Option<Vec<i64>> {
+    let mut ids: Vec<i64> = serde_json::from_str(json).unwrap_or_default();
+    ids.sort_unstable();
+    Some(ids).filter(|ids| !ids.is_empty())
 }
 
 fn query_episodic_rows(
@@ -658,6 +673,7 @@ fn map_episodic_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryAdminRow>
         dispute_count: None,
         disputed_against: None,
         last_disputed_at: None,
+        derived_from: None,
     })
 }
 
@@ -712,6 +728,7 @@ fn map_procedural_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryAdminRo
         dispute_count: None,
         disputed_against: None,
         last_disputed_at: None,
+        derived_from: None,
     })
 }
 
@@ -1695,6 +1712,40 @@ mod tests {
             })
             .await
             .expect("seed_memory_full failed")
+    }
+
+    async fn link(store: &MemoryStore, memory_id: i64, source_id: i64) {
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO memory_derivation (memory_id, source_id, created_at) VALUES (?1, ?2, 0)",
+                    [memory_id, source_id],
+                )
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_listing_names_the_sources_of_a_conclusion() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let a = seed_memory_full(&store, "semantic_fact", 3, "active", false, 1).await;
+        let b = seed_memory_full(&store, "semantic_fact", 3, "active", false, 2).await;
+        let c = seed_memory_full(&store, "user_preference", 1, "active", false, 3).await;
+        link(&store, c, b).await;
+        link(&store, c, a).await;
+
+        let rows = list_memories_core(&store, ListParams::default()).await.unwrap();
+        let sources = |id: i64| rows.iter().find(|r| r.id == id).unwrap().derived_from.clone();
+        assert_eq!(sources(c), Some(vec![a, b]));
+        assert_eq!(sources(a), None);
+
+        let one = get_memory_core(&store, MemoryKind::Memory, c).await.unwrap().unwrap();
+        assert_eq!(one.derived_from, Some(vec![a, b]));
+        let json = serde_json::to_value(&rows).unwrap();
+        let plain = json.as_array().unwrap().iter().find(|r| r["id"] == a).unwrap();
+        assert!(plain.get("derived_from").is_none(), "a row with no sources omits the field: {plain}");
     }
 
     // Kind=Some filters to 1 table.
