@@ -15,7 +15,7 @@ use clawg_core::memory::dispute::{Resolution, ResolvedRow};
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
 
-use crate::client::{Health, Hit, MemoryRow};
+use crate::client::{Context, Health, Hit, MemoryRow, Synthesis};
 use crate::relevance::{relevant_len, RELEVANCE_RATIO};
 
 /// How much of a hit's content a search result shows.
@@ -107,7 +107,7 @@ pub fn format_rows(rows: &[MemoryRow]) -> String {
     rows.iter()
         .map(|r| {
             format!(
-                "#{} {} {} t{} imp={:.1} acc={} {} {}",
+                "#{} {} {} t{} imp={:.1} acc={} {}{} {}",
                 r.id,
                 r.kind,
                 // Only `memory` rows have a type; a dash keeps every later
@@ -117,11 +117,92 @@ pub fn format_rows(rows: &[MemoryRow]) -> String {
                 r.importance,
                 r.access_count,
                 r.status,
+                sources(r),
                 truncate_content(&r.summary, CONTENT_PREVIEW_LIMIT)
             )
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// ` from=#3,#7` for a conclusion, nothing for any other row.
+fn sources(r: &MemoryRow) -> String {
+    match &r.derived_from {
+        Some(ids) if !ids.is_empty() => {
+            let ids: Vec<String> = ids.iter().map(|id| format!("#{id}")).collect();
+            format!(" from={}", ids.join(","))
+        }
+        _ => String::new(),
+    }
+}
+
+/// What a conclusion is and how to save one, at the top of every
+/// `synthesize` answer that has something to review. It is the only place the
+/// model learns what this store means by a conclusion.
+const SYNTHESIS_GUIDE: &str = "\
+Look for conclusions in the memories below: a preference of the user, a convention or \
+guideline of the project, a recurring error and its fix, or a trend in the decisions made. \
+A conclusion generalizes two or more memories; do not restate a single one. Save each \
+conclusion with `save_memory`, the memory_type that fits (user_preference, \
+architectural_decision or semantic_fact), and `derived_from` set to the ids it rests on. \
+If an existing conclusion is now wrong or incomplete, save the corrected one and settle the \
+conflict it raises with `resolve_conflict`. If nothing generalizes yet, save nothing.";
+
+fn synthesis_line(r: &MemoryRow) -> String {
+    format!(
+        "#{} {}{} {}",
+        r.id,
+        r.memory_type.as_deref().unwrap_or("-"),
+        sources(r),
+        truncate_content(&r.summary, CONTENT_PREVIEW_LIMIT)
+    )
+}
+
+/// What `synthesize` hands the model: the guide, the conclusions already
+/// drawn (first, so a new one updates them instead of repeating them), then
+/// the memories no conclusion covers, saying how many more there are.
+pub fn format_synthesis(s: &Synthesis) -> String {
+    if s.pending.is_empty() {
+        return "no memories are waiting for a conclusion".to_string();
+    }
+    let mut out = vec![SYNTHESIS_GUIDE.to_string()];
+    if !s.conclusions.is_empty() {
+        out.push(String::new());
+        out.push("Conclusions already drawn:".to_string());
+        out.extend(s.conclusions.iter().map(synthesis_line));
+    }
+    out.push(String::new());
+    out.push(format!(
+        "Memories without a conclusion ({} of {}, newest first):",
+        s.pending.len(),
+        s.pending_total
+    ));
+    out.extend(s.pending.iter().map(synthesis_line));
+    out.join("\n")
+}
+
+/// Unreviewed memories from which `recall_context` reminds the model to look
+/// for conclusions. Below it a reminder would come with nearly every recall
+/// and stop being read; far above it, the review is a long read.
+pub const SYNTHESIS_NUDGE_THRESHOLD: usize = 20;
+
+fn synthesis_nudge(unreviewed: usize) -> Option<String> {
+    (unreviewed >= SYNTHESIS_NUDGE_THRESHOLD).then(|| {
+        format!(
+            "{unreviewed} memories here have not been reviewed for conclusions yet. When the \
+             current task is done, call `synthesize`."
+        )
+    })
+}
+
+/// What `recall_context` hands the model: the context, then the reminder to
+/// synthesize when enough memories wait for it.
+pub fn format_recall(context: &Context) -> String {
+    let text = format_context(&context.prompt);
+    match synthesis_nudge(context.unreviewed) {
+        Some(nudge) => format!("{text}\n\n{nudge}"),
+        None => text,
+    }
 }
 
 /// Passes a non-empty memory prompt through; substitutes a plain sentence when
@@ -339,6 +420,62 @@ mod tests {
         let out = format_rows(&[row(1, "memory", Some("chat_message"), &format!("{long}\nmore"))]);
         assert_eq!(out.lines().count(), 1);
         assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn rows_show_where_a_conclusion_came_from() {
+        let conclusion = MemoryRow { derived_from: Some(vec![3, 7]), ..row(9, "memory", Some("user_preference"), "tabs") };
+        let out = format_rows(&[conclusion, row(3, "memory", Some("semantic_fact"), "a fact")]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].contains(" from=#3,#7 "), "line was: {}", lines[0]);
+        assert!(!lines[1].contains("from="), "line was: {}", lines[1]);
+    }
+
+    // ── synthesis ───────────────────────────────────────────────────────────
+
+    fn synthesis(pending: Vec<MemoryRow>, pending_total: usize, conclusions: Vec<MemoryRow>) -> Synthesis {
+        Synthesis { pending, pending_total, conclusions }
+    }
+
+    #[test]
+    fn the_synthesis_text_says_what_to_save() {
+        let out = format_synthesis(&synthesis(
+            vec![row(12, "memory", Some("semantic_fact"), "the go service uses tabs")],
+            40,
+            vec![MemoryRow { derived_from: Some(vec![3, 7]), ..row(9, "memory", Some("user_preference"), "tabs everywhere") }],
+        ));
+
+        for needle in ["save_memory", "derived_from", "two or more", "save nothing", "resolve_conflict"] {
+            assert!(out.contains(needle), "the guide must mention {needle}: {out}");
+        }
+        assert!(out.contains("#9 user_preference from=#3,#7 tabs everywhere"), "{out}");
+        assert!(out.contains("1 of 40"), "the agent must know the list is partial: {out}");
+        assert!(out.contains("#12 semantic_fact the go service uses tabs"), "{out}");
+        assert!(out.find("#9 ").unwrap() < out.find("#12 ").unwrap(), "conclusions come first: {out}");
+    }
+
+    #[test]
+    fn a_synthesis_with_nothing_pending_asks_for_nothing() {
+        let out = format_synthesis(&synthesis(vec![], 0, vec![]));
+        assert!(!out.contains("save_memory"), "{out}");
+        assert!(out.contains("no memories"), "{out}");
+    }
+
+    #[test]
+    fn the_nudge_appears_from_the_threshold() {
+        let context = |unreviewed| Context { prompt: "## WORKSPACE\nstuff".into(), unreviewed };
+
+        assert_eq!(format_recall(&context(SYNTHESIS_NUDGE_THRESHOLD - 1)), "## WORKSPACE\nstuff");
+        let out = format_recall(&context(SYNTHESIS_NUDGE_THRESHOLD));
+        assert!(out.starts_with("## WORKSPACE\nstuff\n\n"), "the context comes first, untouched: {out}");
+        assert!(out.contains("synthesize"), "{out}");
+        assert!(out.contains(&SYNTHESIS_NUDGE_THRESHOLD.to_string()), "{out}");
+    }
+
+    #[test]
+    fn the_nudge_follows_an_empty_context_too() {
+        let out = format_recall(&Context { prompt: String::new(), unreviewed: 50 });
+        assert!(out.starts_with("no context yet\n\n"), "{out}");
     }
 
     #[test]
