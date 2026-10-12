@@ -81,6 +81,8 @@ Si el worker no contesta dentro del timeout, el save MUST responder `202` con:
 
 El evento MUST seguir en la cola: el handler deja de esperar, pero no lo retira. Cuando el worker lo procese, el resultado se descarta sin error.
 
+Si el worker suelta el canal de respuesta sin contestar (por ejemplo, porque el apagado de data-preservation vuelca el evento a disco en lugar de procesarlo), el save MUST responder lo mismo que con el timeout, sin esperar a que venza.
+
 #### Escenario
 - GIVEN un worker detenido a propósito (el test no lo lanza) y un timeout de prueba de 100 ms
 - WHEN se guarda un texto

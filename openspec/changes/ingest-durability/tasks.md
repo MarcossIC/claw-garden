@@ -60,7 +60,7 @@ El orden va de adentro hacia afuera: primero el worker y el runtime (`clawg-core
 
 - [ ] 7.1 RED en `tests/api.rs`: `a_save_answers_201_with_the_id_of_the_row_it_wrote`, `a_multi_chunk_save_returns_one_id_per_chunk`, `saving_the_same_text_twice_returns_the_same_id_as_reinforced`, `a_failed_embed_reaches_the_caller_as_an_error` y `a_save_the_worker_does_not_confirm_in_time_answers_202_unconfirmed`. Test puro de `save_response` en `api.rs` (mod tests) que recorre cada estado y cada resultado.
 - [ ] 7.2 `AppCtx` suma el timeout de confirmación (10 s por defecto, o el valor que salga de 0.2). El `Harness` lo baja a 100 ms.
-- [ ] 7.3 Con `Ready`, el handler encola con `reply`, espera con `tokio::time::timeout` y arma la respuesta con `save_response`.
+- [ ] 7.3 Con `Ready`, el handler encola con `reply`, espera con `tokio::time::timeout` y arma la respuesta con `save_response`. Un `oneshot` cerrado sin respuesta se trata como el timeout (test `a_save_whose_reply_is_dropped_answers_202_unconfirmed`).
 - [ ] 7.4 Reescribir `a_saved_memory_is_queued_then_becomes_a_listable_row` (`tests/api.rs:252`): ya no hace falta el polling.
 - [ ] 7.5 Actualizar la doc del handler (`api.rs:418-431`): la razón del consumidor único sigue valiendo, pero el save ya no es "accepted".
 - Commit: `feat(cli): answer a save with the ids it wrote or the reason it failed`
