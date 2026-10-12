@@ -40,3 +40,11 @@ Esto confirma lo que se esperaba:
 
 - El cambio no toca el ranking del core, y el eval llama a `store.search` directo.
 - El daemon ahora hace el corte antes de responder, pero es el mismo corte que el puente aplicaba después. Aplicarlo dos veces da lo mismo, y las corridas de eval no registran accesos (`crates/clawg-core/src/eval_api.rs:461`).
+
+## Diferencias con la spec al consolidar
+
+Al pasar la spec a `specs/retrieval/spec.md` se contrastó cada afirmación con el código de `main` (d9ce375). La spec principal dice lo que hace el código:
+
+- **Orden de los errores en `/v1/search`:** `check_relative_score` corre después de comprobar el embedder (`crates/clawg-cli/src/daemon/api.rs:642-651`). Sin embedder listo, un `min_relative_score` fuera de rango responde lo mismo que cualquier búsqueda en ese estado (`503`), no `400`. La spec decía `400` sin condición. En los dos casos no se busca ni se registra nada.
+- **Tests que la spec no listaba:** `a_relative_score_inside_zero_to_one_passes_through` (`api.rs`), `no_scores_keep_nothing` (`relevance.rs`), `relevant_hits_keeps_the_ones_the_cut_lets_through_in_order` y `the_search_output_shows_only_the_relevant_hits` (`tools.rs`). Los dos tests anteriores de `recall_context` sobre accesos (`a_memory_hit_is_recorded_by_the_access_tracker` y `a_hit_from_another_table_does_not_touch_the_memory_row_with_the_same_id`) siguen valiendo y pasan a la spec principal.
+- **Referencias de línea:** las de la spec del cambio apuntaban al código antes del merge. La spec principal cita las líneas de `main`.

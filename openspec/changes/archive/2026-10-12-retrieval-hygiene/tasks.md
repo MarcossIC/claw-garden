@@ -30,4 +30,4 @@ Cada tarea es un commit atómico: primero el test que falla, después el código
 ## Verify
 
 - [x] `cargo test --workspace`: sin fallas nuevas contra la base (ver `verify.md`).
-- [ ] `rag-eval --real --diff` y `--agent-view --diff` contra el baseline. Necesitan el modelo real, que no se puede descargar en el entorno donde se implementó.
+- [x] `rag-eval --real --diff` y `--agent-view --diff` contra el baseline: diff vacío en los dos (ver `verify.md`).
