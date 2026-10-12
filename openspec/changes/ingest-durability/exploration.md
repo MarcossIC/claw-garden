@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 | M | — | exploración (borrador) |
+| 1 | M | — | exploración (cerrada; decisiones en proposal.md) |
 
 **Tesis:** hoy un `save_memory` que respondió `queued` puede no llegar nunca a la base, y el agente no tiene forma de enterarse.
 

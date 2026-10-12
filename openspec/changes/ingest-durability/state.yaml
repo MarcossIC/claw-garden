@@ -1,14 +1,14 @@
 change: ingest-durability
 objective: "1"
 depends_on: []
-phase: explore
+phase: propose
 artifacts:
-  exploration: draft
-  proposal: pending
+  exploration: done
+  proposal: draft
   spec: pending
   design: pending
   tasks: pending
   apply: pending
   verify: pending
   archive: pending
-updated: 2026-10-11
+updated: 2026-10-12
