@@ -902,6 +902,7 @@ mod tests {
         let saved = save_response(Confirmation::Reported(IngestReport {
             memories: vec![chunk(57, ChunkOutcome::Inserted), chunk(12, ChunkOutcome::Reinforced)],
             failure: None,
+            ..Default::default()
         }))
         .expect("a clean report is a success");
         assert_eq!(saved.0, StatusCode::CREATED);
@@ -919,6 +920,7 @@ mod tests {
         let partial = save_response(Confirmation::Reported(IngestReport {
             memories: vec![chunk(57, ChunkOutcome::Inserted)],
             failure: Some(IngestFailure::Failed("store insert failed: disk full".into())),
+            ..Default::default()
         }))
         .expect_err("a failure is an error");
         assert_eq!(partial.status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -929,6 +931,7 @@ mod tests {
         let unavailable = save_response(Confirmation::Reported(IngestReport {
             memories: vec![],
             failure: Some(IngestFailure::EmbedderUnavailable),
+            ..Default::default()
         }))
         .expect_err("a failure is an error");
         assert_eq!(unavailable.status, StatusCode::SERVICE_UNAVAILABLE);

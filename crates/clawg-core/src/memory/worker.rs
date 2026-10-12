@@ -18,6 +18,7 @@ use crate::memory::chunker::{
 };
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::events::{MemoryEvent, MemorySource};
+use crate::memory::redact::{redact, SecretKind};
 use crate::memory::spill::Replay;
 use crate::memory::store_insert::NewMemoryRecord;
 use crate::memory::MemoryStore;
@@ -73,6 +74,8 @@ impl From<MemoryEvent> for IngestRequest {
 pub struct IngestReport {
     pub memories: Vec<SavedChunk>,
     pub failure: Option<IngestFailure>,
+    /// The kinds of secret masked out of the event before it was chunked.
+    pub redacted: Vec<SecretKind>,
 }
 
 /// Backlog size at which the ingest channel is worth reporting. Events are
@@ -260,6 +263,10 @@ pub async fn memory_worker(
                 evt.role
             );
         }
+        if !report.redacted.is_empty() {
+            let kinds: Vec<&str> = report.redacted.iter().map(|k| k.as_str()).collect();
+            log::info!("ingest masked {} (agent={})", kinds.join(", "), evt.agent_id);
+        }
         if let Some(reply) = reply {
             let _ = reply.send(report);
         }
@@ -413,6 +420,12 @@ async fn process_event(
     code_chunker: &Arc<CodeChunker>,
     absorbed: &mut u64,
 ) -> IngestReport {
+    // Masked before anything else reads the text, so the chunker, the dedup
+    // hash, the embedding, the full-text index and the stored row all see the
+    // same masked content, and the secret reaches none of them.
+    let masked = redact(&evt.content);
+    let redacted = masked.kinds;
+    let content = masked.text;
     // Source-first: Compaction-sourced events bypass select_chunker (and thus
     // the Role::System→Skip rule that ordinarily drops system-authored
     // content from ingestion) entirely — they always chunk via ChatChunker,
@@ -420,19 +433,19 @@ async fn process_event(
     // keeping regardless of which role produced the text it summarizes. All
     // other sources keep the existing role-based routing.
     let chunks = if evt.source == MemorySource::Compaction {
-        chat_chunker.chunk(&evt.content, CHUNK_MAX_TOKENS)
+        chat_chunker.chunk(&content, CHUNK_MAX_TOKENS)
     } else {
-        let kind = select_chunker(evt.role.clone(), evt.is_error, &evt.content);
+        let kind = select_chunker(evt.role.clone(), evt.is_error, &content);
         match kind {
-            ChunkerKind::Chat => chat_chunker.chunk(&evt.content, CHUNK_MAX_TOKENS),
-            ChunkerKind::Code => code_chunker.chunk(&evt.content, None),
-            ChunkerKind::Skip => return IngestReport::default(),
+            ChunkerKind::Chat => chat_chunker.chunk(&content, CHUNK_MAX_TOKENS),
+            ChunkerKind::Code => code_chunker.chunk(&content, None),
+            ChunkerKind::Skip => return IngestReport { redacted, ..Default::default() },
         }
     };
 
     if chunks.is_empty() {
         // Content was all-whitespace or empty after chunker policy. Not an error.
-        return IngestReport::default();
+        return IngestReport { redacted, ..Default::default() };
     }
 
     // `memory_worker` holds events until the embedder is loaded, so this only
@@ -445,7 +458,7 @@ async fn process_event(
             chunks.len(),
             evt.agent_id
         );
-        return IngestReport { memories: vec![], failure: Some(IngestFailure::EmbedderUnavailable) };
+        return IngestReport { memories: vec![], failure: Some(IngestFailure::EmbedderUnavailable), redacted };
     };
 
     // Stage 1 — gate. Every chunk passes the hash gate before anything is
@@ -470,6 +483,7 @@ async fn process_event(
     let report = |stored: Vec<Option<SavedChunk>>, failure| IngestReport {
         memories: stored.into_iter().flatten().collect(),
         failure,
+        redacted: redacted.clone(),
     };
     if survivors.is_empty() {
         return report(stored, None);
@@ -1609,6 +1623,7 @@ mod tests {
             IngestReport {
                 memories: vec![SavedChunk { id: first.memories[0].id, outcome: ChunkOutcome::Reinforced }],
                 failure: None,
+                ..Default::default()
             }
         );
     }
@@ -1653,7 +1668,87 @@ mod tests {
 
         let report = process_with(Arc::new(Gone), &store, &evt).await;
 
-        assert_eq!(report, IngestReport { memories: vec![], failure: Some(IngestFailure::EmbedderUnavailable) });
+        assert_eq!(report, IngestReport { memories: vec![], failure: Some(IngestFailure::EmbedderUnavailable), ..Default::default() });
+    }
+
+    // Built at run time so no literal in the repository looks like a live
+    // credential to a secret scanner.
+    fn fake_key(prefix: &str, unit: &str, len: usize) -> String {
+        format!("{prefix}{}", unit.chars().cycle().take(len).collect::<String>())
+    }
+
+    async fn stored_content(store: &MemoryStore, id: i64) -> String {
+        store
+            .conn
+            .call(move |c| c.query_row("SELECT content FROM memory WHERE id = ?1", [id], |r| r.get(0)))
+            .await
+            .unwrap()
+    }
+
+    async fn fts_hits(store: &MemoryStore, term: &str) -> i64 {
+        let phrase = format!("\"{term}\"");
+        store
+            .conn
+            .call(move |c| {
+                c.query_row("SELECT count(*) FROM memory_fts WHERE memory_fts MATCH ?1", [phrase], |r| r.get(0))
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_saved_secret_is_stored_masked_and_not_searchable() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let body = fake_key("", "a1B2", 36);
+        let evt = explicit_fact(&format!("deploy uses ghp_{body}"));
+
+        let report = process_with(Arc::new(FakeEmbedder::default()), &store, &evt).await;
+
+        assert_eq!(report.failure, None);
+        assert_eq!(report.redacted, vec![SecretKind::GithubToken]);
+        assert_eq!(stored_content(&store, report.memories[0].id).await, "deploy uses [REDACTED:github_token]");
+        assert_eq!(fts_hits(&store, &body).await, 0);
+        assert_eq!(fts_hits(&store, "deploy").await, 1);
+    }
+
+    #[tokio::test]
+    async fn saves_that_differ_only_in_a_masked_secret_are_one_memory() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let first = explicit_fact(&format!("the staging key is {}", fake_key("AKIA", "Q7ZX", 16)));
+        let second = explicit_fact(&format!("the staging key is {}", fake_key("AKIA", "M4NP", 16)));
+
+        let a = process_with(Arc::new(FakeEmbedder::default()), &store, &first).await;
+        let b = process_with(Arc::new(FakeEmbedder::default()), &store, &second).await;
+
+        assert_eq!(b.memories, vec![SavedChunk { id: a.memories[0].id, outcome: ChunkOutcome::Reinforced }]);
+        let rows: i64 = store
+            .conn
+            .call(|c| c.query_row("SELECT count(*) FROM memory", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[tokio::test]
+    async fn the_report_names_what_was_masked_even_when_the_save_fails() {
+        struct Gone;
+        #[async_trait::async_trait]
+        impl Embedder for Gone {
+            async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+                Err(EmbedError::WorkerGone)
+            }
+            fn dimensions(&self) -> usize { 384 }
+            fn model_id(&self) -> &str { "gone" }
+            fn query_prefix(&self) -> &str { "" }
+            fn passage_prefix(&self) -> &str { "" }
+        }
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let evt = explicit_fact(&format!("slack bot {}", fake_key("xoxb-", "12345-", 24)));
+
+        let report = process_with(Arc::new(Gone), &store, &evt).await;
+
+        assert_eq!(report.failure, Some(IngestFailure::EmbedderUnavailable));
+        assert_eq!(report.redacted, vec![SecretKind::SlackToken]);
     }
 
     // ── Regression: the System→Skip guard still applies to non-Compaction events ──
