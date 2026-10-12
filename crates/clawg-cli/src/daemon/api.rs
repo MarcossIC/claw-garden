@@ -453,7 +453,7 @@ async fn save_memory(
         importance: body.importance,
     };
 
-    app.runtime.memory_tx.send(event).map_err(|_| {
+    app.runtime.memory_tx.try_send(event.into()).map_err(|_| {
         ApiError::internal("the ingest worker has stopped; restart the daemon")
     })?;
 

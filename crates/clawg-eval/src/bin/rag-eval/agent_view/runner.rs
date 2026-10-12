@@ -81,7 +81,7 @@ async fn start(input: &AgentViewInput<'_>, scratch: &Path) -> Result<Session, Ru
 
     let ingest = EvalIngest::open(scratch, input.embedder, input.tokenizer_dir).await?;
     for row in &input.golden_set.corpus {
-        ingest.send(AGENT_ID, &row.content, &row.memory_type, row.importance)?;
+        ingest.send(AGENT_ID, &row.content, &row.memory_type, row.importance).await?;
     }
     let runtime = ingest.finish().await?;
     // The context endpoint writes a workspace file under the runtime's base

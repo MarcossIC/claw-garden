@@ -18,24 +18,30 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use once_cell::sync::OnceCell;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::memory::access::AccessTracker;
 use crate::memory::chunker::CodeChunker;
 use crate::memory::embedder::Embedder;
-use crate::memory::events::MemoryEvent;
 use crate::memory::store_lock::StoreHolder;
 use crate::memory::maintenance::{run_maintenance_loop, MAINTENANCE_PERIOD, STARTUP_DELAY};
-use crate::memory::worker::{memory_worker, resolve_tokenizer_and_chunker};
+use crate::memory::worker::{memory_worker, resolve_tokenizer_and_chunker, IngestRequest};
 use crate::memory::workspace::WorkspaceManager;
 use crate::memory::{MemoryError, MemoryStore};
+
+/// How many saves the ingest queue holds before a producer is refused.
+///
+/// The worker drains an event in tens of milliseconds, so the queue only
+/// fills while it is held for the embedder; the bound keeps a model that is
+/// still downloading from turning every save into unbounded memory.
+pub const INGEST_QUEUE_CAPACITY: usize = 1024;
 
 /// The memory substrate's live handles for one process.
 ///
 /// Every field is deliberately public and deliberately cheap to clone: the
 /// hosts can destructure them, and the daemon holds the struct itself.
 /// `MemoryStore` is a channel handle,
-/// `UnboundedSender` is `Arc`-like, and the two cells plus the tracker are
+/// `Sender` is `Arc`-like, and the two cells plus the tracker are
 /// already behind `Arc` — so cloning a field is a refcount bump, never a
 /// second database or a second flush worker.
 pub struct MemoryRuntime {
@@ -44,10 +50,11 @@ pub struct MemoryRuntime {
     pub base_dir: PathBuf,
     /// SQLite-vec persistent store, already migrated.
     pub store: Arc<MemoryStore>,
-    /// Producer side of the ingest pipeline. Unbounded on purpose — whatever
-    /// hot path produces events (a chat turn, an MCP `save_memory` call) MUST
-    /// NOT block behind embedding.
-    pub memory_tx: UnboundedSender<MemoryEvent>,
+    /// Producer side of the ingest pipeline, bounded at
+    /// [`INGEST_QUEUE_CAPACITY`]. Whatever hot path produces events (a chat
+    /// turn, an MCP `save_memory` call) MUST NOT block behind embedding, so
+    /// producers use `try_send` and treat a full queue as a refusal.
+    pub memory_tx: Sender<IngestRequest>,
     /// Lazily-filled embedder cell.
     ///
     /// [`MemoryRuntime::open`] leaves it EMPTY; the host fills it by running
@@ -90,9 +97,9 @@ impl MemoryRuntime {
     pub async fn open(
         base_dir: PathBuf,
         holder: StoreHolder,
-    ) -> Result<(Self, UnboundedReceiver<MemoryEvent>), MemoryError> {
+    ) -> Result<(Self, Receiver<IngestRequest>), MemoryError> {
         let store = Arc::new(MemoryStore::open(&base_dir, holder).await?);
-        let (memory_tx, memory_rx) = tokio::sync::mpsc::unbounded_channel::<MemoryEvent>();
+        let (memory_tx, memory_rx) = tokio::sync::mpsc::channel(INGEST_QUEUE_CAPACITY);
         let access_tracker = Arc::new(AccessTracker::new(store.conn.clone()));
 
         Ok((
@@ -124,7 +131,7 @@ impl MemoryRuntime {
     /// off two channels. A second spawn site would race it.
     pub fn ingest_worker(
         &self,
-        rx: UnboundedReceiver<MemoryEvent>,
+        rx: Receiver<IngestRequest>,
     ) -> impl Future<Output = ()> + Send + 'static {
         ingest_worker_future(
             self.base_dir.clone(),
@@ -170,7 +177,17 @@ impl MemoryRuntime {
     /// [`MemoryRuntime::workspaces`] resolve against it; only the database is
     /// in memory.
     #[cfg(any(test, feature = "testing"))]
-    pub async fn new_for_test(base_dir: PathBuf) -> (Self, UnboundedReceiver<MemoryEvent>) {
+    pub async fn new_for_test(base_dir: PathBuf) -> (Self, Receiver<IngestRequest>) {
+        Self::new_for_test_with_capacity(base_dir, INGEST_QUEUE_CAPACITY).await
+    }
+
+    /// [`MemoryRuntime::new_for_test`] with an ingest queue of `capacity`, so
+    /// a test can fill it with a handful of saves.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn new_for_test_with_capacity(
+        base_dir: PathBuf,
+        capacity: usize,
+    ) -> (Self, Receiver<IngestRequest>) {
         use crate::memory::embedder::FakeEmbedder;
 
         let store = Arc::new(
@@ -178,7 +195,7 @@ impl MemoryRuntime {
                 .await
                 .expect("in-memory test store"),
         );
-        let (memory_tx, memory_rx) = tokio::sync::mpsc::unbounded_channel::<MemoryEvent>();
+        let (memory_tx, memory_rx) = tokio::sync::mpsc::channel(capacity);
         let access_tracker = Arc::new(AccessTracker::new(store.conn.clone()));
 
         let embedder: OnceCell<Arc<dyn Embedder>> = OnceCell::new();
@@ -212,7 +229,7 @@ fn ingest_worker_future(
     store: Arc<MemoryStore>,
     embedder: Arc<OnceCell<Arc<dyn Embedder>>>,
     tokenizer: Arc<OnceCell<Arc<tokenizers::Tokenizer>>>,
-    rx: UnboundedReceiver<MemoryEvent>,
+    rx: Receiver<IngestRequest>,
 ) -> impl Future<Output = ()> + Send + 'static {
     async move {
         let chat_chunker = resolve_tokenizer_and_chunker(&base_dir, &tokenizer);
@@ -237,7 +254,7 @@ fn maintenance_worker_future(
 // confusing error inside a different crate.
 const _: fn() = || {
     fn _send_static<T: Send + 'static>() {}
-    _send_static::<UnboundedReceiver<MemoryEvent>>();
+    _send_static::<Receiver<IngestRequest>>();
     _send_static::<Arc<MemoryStore>>();
     _send_static::<Arc<OnceCell<Arc<dyn Embedder>>>>();
     _send_static::<Arc<OnceCell<Arc<tokenizers::Tokenizer>>>>();
@@ -248,7 +265,9 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::events::MemorySource;
+    use crate::memory::events::{MemoryEvent, MemorySource};
+    use crate::memory::worker::{ChunkOutcome, IngestReport};
+    use tokio::sync::mpsc::error::TrySendError;
     use crate::models::chat::Role;
 
     fn tmp_base() -> tempfile::TempDir {
@@ -316,9 +335,9 @@ mod tests {
         let (rt, mut rx) = MemoryRuntime::open(tmp.path().to_path_buf(), StoreHolder::Daemon)
             .await
             .expect("open");
-        rt.memory_tx.send(chat_event("hello")).expect("send");
-        let evt = rx.recv().await.expect("event");
-        assert_eq!(evt.content, "hello");
+        rt.memory_tx.try_send(chat_event("hello").into()).expect("send");
+        let req = rx.recv().await.expect("event");
+        assert_eq!(req.event.content, "hello");
     }
 
     /// The flush worker is spawned inside `AccessTracker::new` during `open`,
@@ -376,7 +395,7 @@ mod tests {
         let tx = rt.memory_tx.clone();
 
         let worker = tokio::spawn(rt.ingest_worker(rx));
-        tx.send(chat_event("a row lands on a plain tokio runtime"))
+        tx.try_send(chat_event("a row lands on a plain tokio runtime").into())
             .expect("send");
         // Dropping every sender is what ends the worker loop — the runtime
         // holds one of its own, so it has to go too.
@@ -432,7 +451,7 @@ mod tests {
             tokenizer,
             rx,
         ));
-        memory_tx.send(chat_event("through the free function")).expect("send");
+        memory_tx.try_send(chat_event("through the free function").into()).expect("send");
         drop(memory_tx);
         worker.await.expect("worker exits");
 
@@ -451,5 +470,41 @@ mod tests {
 
         fn assert_spawnable<F: Future<Output = ()> + Send + 'static>(_: &F) {}
         assert_spawnable(&maintenance_worker_future(store));
+    }
+
+    #[tokio::test]
+    async fn a_request_with_a_reply_channel_receives_its_ingest_report() {
+        let tmp = tmp_base();
+        let (rt, rx) = MemoryRuntime::new_for_test(tmp.path().to_path_buf()).await;
+        let worker = tokio::spawn(rt.ingest_worker(rx));
+
+        let (reply, report) = tokio::sync::oneshot::channel::<IngestReport>();
+        rt.memory_tx
+            .try_send(IngestRequest { event: chat_event("the report comes back"), reply: Some(reply) })
+            .expect("send");
+        let report = report.await.expect("the worker must answer a request that asked");
+
+        assert_eq!(report.failure, None);
+        assert_eq!(report.memories.len(), 1);
+        assert_eq!(report.memories[0].outcome, ChunkOutcome::Inserted);
+        drop(rt);
+        worker.await.expect("worker exits");
+    }
+
+    #[tokio::test]
+    async fn the_ingest_queue_refuses_a_send_past_its_capacity() {
+        let tmp = tmp_base();
+        let (rt, _rx) = MemoryRuntime::new_for_test_with_capacity(tmp.path().to_path_buf(), 2).await;
+
+        rt.memory_tx.try_send(chat_event("one").into()).expect("first fits");
+        rt.memory_tx.try_send(chat_event("two").into()).expect("second fits");
+        let third = rt.memory_tx.try_send(chat_event("three").into());
+
+        assert!(matches!(third, Err(TrySendError::Full(_))), "got {third:?}");
+    }
+
+    #[test]
+    fn the_production_ingest_queue_holds_1024_saves() {
+        assert_eq!(INGEST_QUEUE_CAPACITY, 1024);
     }
 }

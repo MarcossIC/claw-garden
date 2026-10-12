@@ -153,7 +153,7 @@ async fn memory_runtime_open_creates_the_db_and_returns_a_usable_store() {
 
     // The ingest channel is live end to end.
     rt.memory_tx
-        .send(explicit_event("hello", None, None))
+        .try_send(explicit_event("hello", None, None).into())
         .expect("memory_tx must accept a send before the worker is spawned");
 
     // The access tracker's flush worker is running (record must never block).
@@ -196,7 +196,7 @@ async fn memory_runtime_ingest_worker_drains_an_event_into_a_row() {
 
     let worker = tokio::spawn(rt.ingest_worker(rx));
 
-    tx.send(explicit_event("the daemon ingests on a plain tokio runtime", None, None))
+    tx.try_send(explicit_event("the daemon ingests on a plain tokio runtime", None, None).into())
         .expect("send");
     drop(tx);
     drop(rt);
@@ -237,11 +237,14 @@ async fn explicit_overrides_reach_the_stored_row() {
     let tx = rt.memory_tx.clone();
     let worker = tokio::spawn(rt.ingest_worker(rx));
 
-    tx.send(explicit_event(
-        "the team uses conventional commits",
-        Some("user_preference"),
-        Some(9.5),
-    ))
+    tx.try_send(
+        explicit_event(
+            "the team uses conventional commits",
+            Some("user_preference"),
+            Some(9.5),
+        )
+        .into(),
+    )
     .expect("send");
     drop(tx);
     drop(rt);
