@@ -15,6 +15,7 @@
 | `6b2ead6` feat(core): rank rows that carry the query's exact identifier first | 1565 | 10 |
 
 - +14 tests: 3 en `score.rs`, 11 en `search.rs`. Ninguna falla nueva.
+- Después de mergear `main` con project-identity (`967b966`): 1598 pasan, las mismas 10 fallan. project-identity no cambió los predicados de proyecto de `search.rs`, así que `IDENTIFIER_MATCH_SQL` sigue igual a ellos.
 - Las 10 fallas son las mismas en los tres commits y vienen del entorno, no del código:
   - 7 de `doctor::tests` (`crates/clawg-cli/src/doctor.rs`): modelan un PATH de Windows con `clawg.exe`.
   - 3 de `diff::tests` en `rag-eval`: leen `docs/eval/results/`, que está fuera de git.
