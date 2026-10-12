@@ -75,6 +75,40 @@ fn the_expanded_set_scores_under_rag_eval_and_reports_every_subset() {
 }
 
 #[test]
+fn the_audit_names_an_intruder_for_every_generated_subset() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = write_base(dir.path());
+    let expanded = dir.path().join("expanded.json");
+    assert!(synth(&base, &expanded, 7).status.success());
+
+    let results_dir = dir.path().join("results");
+    // The verdict of the audit decides the exit code, and a fake run may well
+    // be judged unusable; only the written report matters here.
+    Command::new(env!("CARGO_BIN_EXE_rag-eval"))
+        .args(["--fake", "--audit", "--golden"])
+        .arg(&expanded)
+        .arg("--out")
+        .arg(&results_dir)
+        .output()
+        .expect("rag-eval must start");
+
+    let file = std::fs::read_dir(&results_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "json"))
+        .expect("rag-eval must write a results file even when the audit fails");
+    let results: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+
+    let intruders = results["audit"]["top_intruders"].as_array().expect("the audit must carry top_intruders");
+    let subsets: Vec<&str> = intruders.iter().map(|i| i["subset"].as_str().unwrap()).collect();
+    assert_eq!(subsets, vec!["high_importance", "lexical", "low_importance", "multi_ref", "natural"]);
+    for intruder in intruders {
+        assert!(intruder["intruder_ref"].is_string());
+        assert!(intruder["fraction"].as_f64().unwrap() > 0.0);
+    }
+}
+
+#[test]
 fn the_base_file_is_left_untouched() {
     let dir = tempfile::tempdir().unwrap();
     let base = write_base(dir.path());
