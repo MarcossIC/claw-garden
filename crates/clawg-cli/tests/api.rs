@@ -904,6 +904,25 @@ async fn resolve_rows_without_a_dispute_conflict() {
 }
 
 #[tokio::test]
+async fn backup_endpoint_writes_a_manual_snapshot() {
+    let h = Harness::start().await;
+    h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "agent-http" })).await;
+    h.wait_for_rows("memory", 1).await;
+
+    let unauthorized = h.http.post(h.url("/v1/backup")).send().await.expect("request");
+    assert_eq!(unauthorized.status(), 401);
+
+    let (status, body) = h.post_json("/v1/backup", json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    let path = std::path::PathBuf::from(body["path"].as_str().expect("path"));
+    assert_eq!(path.parent(), Some(h.ctx.runtime.base_dir.join("backups").as_path()));
+    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(name.ends_with("-manual.db"), "{name}");
+    let bytes = std::fs::read(&path).expect("the snapshot exists");
+    assert!(bytes.starts_with(b"SQLite format 3\0"), "a whole SQLite database");
+}
+
+#[tokio::test]
 async fn an_unknown_kind_is_a_400_everywhere_it_appears() {
     let h = Harness::start().await;
 
@@ -1184,4 +1203,70 @@ async fn shutdown_requires_the_token() {
     let h = Harness::start().await;
     let r = h.http.post(h.url("/v1/shutdown")).send().await.expect("request");
     assert_eq!(r.status(), 401, "anyone on loopback must not be able to kill the daemon");
+}
+
+// ── /v1/projects ────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn registering_a_root_moves_the_rows_of_its_legacy_id() {
+    let h = Harness::start().await;
+    let (status, body) = h
+        .post_json(
+            "/v1/memories",
+            json!({ "content": "saved from a subdirectory", "agent_id": "a", "project_id": "src-1a2b" }),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+
+    let root = "/work/repo";
+    let (status, body) =
+        h.post_json("/v1/projects", json!({ "root_path": root, "legacy_ids": ["src-1a2b"] })).await;
+
+    assert_eq!(status, 200, "{body}");
+    let id = clawg_core::memory::derive_project_id(std::path::Path::new(root));
+    assert_eq!(body["project_id"], id.as_str());
+    assert_eq!(body["rekeyed"], 1);
+    let (_, list) = h.get_json(&format!("/v1/memories?kind=memory&project={id}")).await;
+    assert_eq!(list["items"].as_array().map(Vec::len), Some(1), "{list}");
+}
+
+#[tokio::test]
+async fn registering_with_a_malformed_legacy_id_is_a_bad_request() {
+    let h = Harness::start().await;
+    let (status, body) =
+        h.post_json("/v1/projects", json!({ "root_path": "/work/repo", "legacy_ids": ["nope"] })).await;
+    assert_eq!(status, 400, "{body}");
+}
+
+#[tokio::test]
+async fn registering_a_root_whose_id_is_taken_by_another_is_a_conflict() {
+    let h = Harness::start().await;
+    let root = "/work/repo";
+    let id = clawg_core::memory::derive_project_id(std::path::Path::new(root));
+    h.ctx
+        .runtime
+        .store
+        .conn
+        .call(move |c| {
+            c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, '/elsewhere/repo', 0)", [id])
+        })
+        .await
+        .expect("seed a colliding project");
+
+    let (status, body) = h.post_json("/v1/projects", json!({ "root_path": root })).await;
+    assert_eq!(status, 409, "{body}");
+}
+
+#[tokio::test]
+async fn registering_needs_the_token() {
+    let h = Harness::start().await;
+    let status = h
+        .http
+        .post(h.url("/v1/projects"))
+        .json(&json!({ "root_path": "/work/repo" }))
+        .send()
+        .await
+        .expect("request")
+        .status();
+    assert_eq!(status.as_u16(), 401);
 }

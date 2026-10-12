@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 2 | M | — | exploración (borrador) |
+| 2 | M | — | exploración (cerrada) |
 
 **Tesis:** el mismo repositorio termina con varios `project_id` según cómo se lo nombre. Las memorias quedan partidas entre ellos, sin aviso.
 
@@ -48,13 +48,13 @@
 3. **Tabla `project`** (`id`, `root_path`, `created_at`). Guarda la ruta canónica desde ahora, para poder volver a derivar el id si cambia el algoritmo.
 4. **Re-key perezoso:** al arrancar el puente, calcular el id legacy de la ruta tal cual llegó y el id nuevo. Si hay filas con el legacy, pasarlas al nuevo en una transacción.
 
-## Decisiones abiertas
+## Decisiones abiertas (cerradas en [`proposal.md`](proposal.md#decisiones-cierran-las-abiertas-de-la-exploración))
 
-- [ ] **Worktrees:** ¿comparten memorias con el repo principal (git common dir) o cada uno es su propio proyecto?
-- [ ] **Directorios sin git:** ¿cwd canonicalizado como raíz, o "sin proyecto"?
-- [ ] **Formato del id:** ¿se mantiene `basename-hash4` o se amplía el hash? Ampliarlo cambia todos los ids.
-- [ ] **Memorias guardadas desde subdirectorios:** su id legacy sólo se recupera si el puente vuelve a arrancar en ese subdirectorio. ¿Alcanza con eso, o hace falta un comando `clawg projects merge <id> <id>`?
-- [ ] **Rollback:** ¿la tabla de re-key guarda el mapeo legacy → nuevo para poder revertirlo?
+- [x] **Worktrees:** ¿comparten memorias con el repo principal (git common dir) o cada uno es su propio proyecto?
+- [x] **Directorios sin git:** ¿cwd canonicalizado como raíz, o "sin proyecto"?
+- [x] **Formato del id:** ¿se mantiene `basename-hash4` o se amplía el hash? Ampliarlo cambia todos los ids.
+- [x] **Memorias guardadas desde subdirectorios:** su id legacy sólo se recupera si el puente vuelve a arrancar en ese subdirectorio. ¿Alcanza con eso, o hace falta un comando `clawg projects merge <id> <id>`?
+- [x] **Rollback:** ¿la tabla de re-key guarda el mapeo legacy → nuevo para poder revertirlo?
 
 ## Cómo se mide
 

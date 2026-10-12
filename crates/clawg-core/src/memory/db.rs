@@ -4,6 +4,7 @@ use std::sync::{Arc, Once};
 use rusqlite::OptionalExtension;
 use tokio_rusqlite::Connection;
 
+use crate::memory::backup::{self, SchemaPlan};
 use crate::memory::embedder::Embedder;
 use crate::memory::error::MemoryError;
 use crate::memory::latency::KnnLatency;
@@ -123,7 +124,7 @@ static VEC0_REGISTERED: Once = Once::new();
 /// The `transmute` pattern matches the upstream `sqlite-vec` demo and is the
 /// correct approach for `rusqlite 0.37` (which still exposes the raw FFI).
 /// The `Once` guard makes this idempotent and thread-safe.
-fn ensure_vec0_registered() {
+pub(crate) fn ensure_vec0_registered() {
     VEC0_REGISTERED.call_once(|| {
         unsafe {
             rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
@@ -179,6 +180,9 @@ impl MemoryStore {
         // Connection::open returns Result<_, rusqlite::Error>
         let conn = Connection::open(&path).await
             .map_err(MemoryError::Sqlite)?;
+        // First, before any pragma: switching the journal mode rewrites the
+        // file header, and a database this binary refuses must stay untouched.
+        let plan = check_schema(&conn).await?;
         // WAL plus synchronous=NORMAL: one writer and concurrent readers
         // instead of a writer that locks readers out, at the cost of an
         // fsync per checkpoint rather than per commit. Set before the
@@ -200,6 +204,17 @@ impl MemoryStore {
             Err(e) => log::warn!("could not set memory.db journal mode: {e}; falling back to the default rollback journal"),
         }
         register_udfs(&conn).await?;
+        if let SchemaPlan::Pending { .. } = plan {
+            // Migrations only ever move forward, and a binary that applied
+            // them cannot be swapped back for the one before: this copy is
+            // the way back.
+            let backups = crate::paths::backups_dir(base_dir);
+            conn.call(move |c| -> rusqlite::Result<_> {
+                Ok(backup::snapshot_into(c, &backups, backup::Reason::PreMigration))
+            })
+            .await
+            .map_err(MemoryError::Connection)??;
+        }
         run_migrations(&conn).await?;
         // Raise SQLITE_LIMIT_VARIABLE_NUMBER from the default 999 to 32766 (SQLite hard
         // maximum). Flush batches of ≤500 rows × 3 bind vars = 1500 params would otherwise
@@ -368,6 +383,20 @@ fn configured(runner: refinery::Runner) -> refinery::Runner {
     runner.set_grouped(true)
 }
 
+/// Refuses a database this binary must not migrate, and says what opening it
+/// would do otherwise.
+async fn check_schema(conn: &Connection) -> Result<SchemaPlan, MemoryError> {
+    let applied = conn
+        .call(|c| backup::read_history(c))
+        .await
+        .map_err(MemoryError::Connection)?;
+    match backup::schema_plan(&applied, &backup::known_migrations()) {
+        SchemaPlan::Newer { db, binary } => Err(MemoryError::SchemaNewer { db, binary }),
+        SchemaPlan::Diverged { version } => Err(MemoryError::SchemaDiverged { version }),
+        plan => Ok(plan),
+    }
+}
+
 async fn run_migrations(conn: &Connection) -> Result<(), MemoryError> {
     conn.call(|c: &mut rusqlite::Connection| -> Result<refinery::Report, refinery::Error> {
         configured(crate::memory::migrations::runner()).run(c)
@@ -397,6 +426,39 @@ async fn run_migrations(conn: &Connection) -> Result<(), MemoryError> {
     })
     .map(|_report| ())?;
     Ok(())
+}
+
+/// Builds `<dir>/memory.db` migrated up to `target` (all when `None`),
+/// with one row, and closes it so the file stands alone.
+#[cfg(test)]
+pub(crate) async fn seed_on_disk(dir: &Path, target: Option<i32>) {
+    ensure_vec0_registered();
+    let conn = Connection::open(dir.join("memory.db")).await.unwrap();
+    register_udfs(&conn).await.unwrap();
+    conn.call(move |c| {
+        let runner = crate::memory::migrations::runner();
+        let runner = match target {
+            Some(v) => runner.set_target(refinery::Target::Version(v)),
+            None => runner,
+        };
+        runner.run(c)
+    })
+    .await
+    .unwrap();
+    conn.call(|c| {
+        c.execute(
+            "INSERT INTO memory \
+             (scope, agent_id, content, memory_type, source, \
+              created_at, created_by_type, created_by_ref, \
+              last_modified_at, last_accessed_at, importance, tier, status) \
+             VALUES ('agent', 'agent-seed', 'seeded on disk', 'chat_message', 'chat', \
+              0, 'user', 'agent-seed', 0, 0, 5.0, 3, 'active')",
+            [],
+        )
+    })
+    .await
+    .unwrap();
+    conn.close().await.unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -593,7 +655,198 @@ mod tests {
 
         let after = conn.call(snapshot).await.unwrap();
         assert_eq!(before, after);
-        assert_eq!(after.0, 8);
+        assert_eq!(after.0, 9);
+    }
+
+    /// Rows written before `project` existed keep their project ids when the
+    /// migration that adds it runs: moving them is the bridge's call, made per
+    /// path, never a blanket rewrite at open.
+    #[tokio::test]
+    async fn a_database_from_the_previous_version_opens_with_its_project_ids_untouched() {
+        ensure_vec0_registered();
+        let conn = Connection::open_in_memory().await.unwrap();
+        register_udfs(&conn).await.unwrap();
+        conn.call(|c| {
+            configured(crate::memory::migrations::runner())
+                .set_target(refinery::Target::Version(8))
+                .run(c)
+        })
+        .await
+        .unwrap();
+        conn.call(|c| {
+            for (agent, project) in [("a", Some("repo-1a2b")), ("a", Some("src-3c4d")), ("b", None)] {
+                c.execute(
+                    "INSERT INTO memory \
+                     (scope, agent_id, project_id, content, memory_type, source, \
+                      created_at, created_by_type, created_by_ref, \
+                      last_modified_at, last_accessed_at, importance, tier, status) \
+                     VALUES ('agent', ?1, ?2, 'seeded at v8', 'observation', 'agent', \
+                      0, 'agent', ?1, 0, 0, 5.0, 3, 'active')",
+                    rusqlite::params![agent, project],
+                )?;
+            }
+            c.execute(
+                "INSERT INTO episodic_trajectory \
+                 (scope, agent_id, project_id, session_id, task, created_at, \
+                  last_modified_at, last_accessed_at) \
+                 VALUES ('agent', 'a', 'repo-1a2b', 's', 't', 0, 0, 0)",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO procedural_skill \
+                 (scope, agent_id, project_id, skill_name, trigger, promoted_at, \
+                  source_trajectory_ids, created_at, last_modified_at, last_accessed_at) \
+                 VALUES ('agent', 'a', 'src-3c4d', 'k', 't', 0, '[]', 0, 0, 0)",
+                [],
+            )?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+
+        let project_ids = |c: &mut rusqlite::Connection| -> Result<Vec<Option<String>>, rusqlite::Error> {
+            let mut stmt = c.prepare(
+                "SELECT project_id FROM memory UNION ALL SELECT project_id FROM episodic_trajectory \
+                 UNION ALL SELECT project_id FROM procedural_skill",
+            )?;
+            let ids = stmt.query_map([], |r| r.get(0))?.collect();
+            ids
+        };
+        let before = conn.call(project_ids).await.unwrap();
+
+        run_migrations(&conn).await.unwrap();
+
+        assert_eq!(conn.call(project_ids).await.unwrap(), before);
+        let (projects, rekeyed): (i64, i64) = conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT (SELECT COUNT(*) FROM project), (SELECT COUNT(*) FROM project_rekey)",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!((projects, rekeyed), (0, 0));
+    }
+
+    fn tamper(dir: &Path, sql: &str) {
+        let c = rusqlite::Connection::open(dir.join("memory.db")).unwrap();
+        c.execute_batch(sql).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_newer_database_is_refused_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), None).await;
+        tamper(
+            dir.path(),
+            &format!(
+                "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+                 VALUES ({}, 'from_the_future', '2026-10-12T00:00:00Z', '1')",
+                backup::latest_known() + 1
+            ),
+        );
+        let before = std::fs::read(dir.path().join("memory.db")).unwrap();
+
+        let err = MemoryStore::open(dir.path(), StoreHolder::Eval)
+            .await
+            .err()
+            .expect("a newer database must not open");
+
+        let latest = backup::latest_known();
+        assert!(
+            matches!(err, MemoryError::SchemaNewer { db, binary } if db == latest + 1 && binary == latest),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("clawg restore"), "{err}");
+        assert_eq!(std::fs::read(dir.path().join("memory.db")).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn a_diverged_database_is_refused_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), None).await;
+        tamper(dir.path(), "UPDATE refinery_schema_history SET checksum = '1' WHERE version = 3");
+        let before = std::fs::read(dir.path().join("memory.db")).unwrap();
+
+        let err = MemoryStore::open(dir.path(), StoreHolder::Eval)
+            .await
+            .err()
+            .expect("a diverged database must not open");
+
+        assert!(matches!(err, MemoryError::SchemaDiverged { version: 3 }), "got {err:?}");
+        assert!(err.to_string().contains("clawg restore"), "{err}");
+        assert_eq!(std::fs::read(dir.path().join("memory.db")).unwrap(), before);
+    }
+
+    fn history_top(db: &Path) -> i32 {
+        let c = rusqlite::Connection::open(db).unwrap();
+        c.query_row("SELECT MAX(version) FROM refinery_schema_history", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn files_in(dir: &Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|rd| rd.map(|e| e.unwrap().path()).collect())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn opening_an_older_database_snapshots_it_before_migrating() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), Some(7)).await;
+
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        let snapshots = files_in(&dir.path().join("backups"));
+        assert_eq!(snapshots.len(), 1, "{snapshots:?}");
+        let name = snapshots[0].file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(backup::parse_snapshot_name(&name), Some(backup::Reason::PreMigration));
+        assert_eq!(history_top(&snapshots[0]), 7);
+        let c = rusqlite::Connection::open(&snapshots[0]).unwrap();
+        let content: String =
+            c.query_row("SELECT content FROM memory", [], |r| r.get(0)).unwrap();
+        assert_eq!(content, "seeded on disk");
+
+        let top: i32 = store
+            .conn
+            .call(|c| c.query_row("SELECT MAX(version) FROM refinery_schema_history", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(top, backup::latest_known());
+    }
+
+    #[tokio::test]
+    async fn opening_a_current_database_takes_no_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), None).await;
+
+        let _store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        assert!(files_in(&dir.path().join("backups")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_new_database_takes_no_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+        assert!(files_in(&dir.path().join("backups")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_snapshot_stops_the_migration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), Some(7)).await;
+        std::fs::write(dir.path().join("backups"), b"in the way").unwrap();
+
+        let err = MemoryStore::open(dir.path(), StoreHolder::Eval)
+            .await
+            .err()
+            .expect("no snapshot, no migration");
+
+        assert!(matches!(err, MemoryError::Backup(_)), "got {err:?}");
+        assert_eq!(history_top(&dir.path().join("memory.db")), 7);
     }
 
     /// Ensure_vec0_registered is idempotent (no panic on second call).
@@ -949,22 +1202,26 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 8, "Expected exactly 8 applied migrations, got {}", count);
+        assert_eq!(count, 9, "Expected exactly 9 applied migrations, got {}", count);
     }
 
-    /// V8 — a fresh store lands on migration count 8 and carries the FTS5
-    /// lexical index alongside it, not one without the other.
+    /// V8 — a fresh store records V8 as applied and carries the FTS5 lexical
+    /// index alongside it, not one without the other.
     #[tokio::test]
-    async fn v8_migration_creates_memory_fts_and_bumps_count_to_eight() {
+    async fn v8_migration_records_itself_and_creates_memory_fts() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let count: i64 = store
             .conn
             .call(|c| -> Result<i64, rusqlite::Error> {
-                c.query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| r.get(0))
+                c.query_row(
+                    "SELECT COUNT(*) FROM refinery_schema_history WHERE version = 8",
+                    [],
+                    |r| r.get(0),
+                )
             })
             .await
             .unwrap();
-        assert_eq!(count, 8, "V8 must be the 8th applied migration on a fresh store");
+        assert_eq!(count, 1, "a fresh store must record V8 as applied");
 
         let fts_exists: i64 = store
             .conn
@@ -1004,9 +1261,12 @@ mod tests {
             .unwrap();
         assert_eq!(before, 7, "test setup: must actually stop at V7");
 
-        conn.call(|c| crate::memory::migrations::runner().run(c))
-            .await
-            .unwrap();
+        let to_v8 = |c: &mut rusqlite::Connection| {
+            crate::memory::migrations::runner()
+                .set_target(refinery::Target::Version(8))
+                .run(c)
+        };
+        conn.call(to_v8).await.unwrap();
         let after: i64 = conn
             .call(|c| c.query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| r.get(0)))
             .await
@@ -1014,9 +1274,7 @@ mod tests {
         assert_eq!(after, 8, "V8 must apply on top of an existing V7 database");
 
         // Re-run again: nothing left to apply, count must not move.
-        conn.call(|c| crate::memory::migrations::runner().run(c))
-            .await
-            .unwrap();
+        conn.call(to_v8).await.unwrap();
         let after_second: i64 = conn
             .call(|c| c.query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| r.get(0)))
             .await
@@ -1405,7 +1663,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 8);
+        assert_eq!(migration_count, 9);
     }
 
     // -----------------------------------------------------------------------

@@ -367,7 +367,7 @@ mod tests {
         host.initialize(Duration::from_secs(1)).await;
         let first = host.memory_status(2, Duration::from_secs(5)).await;
         assert!(tool_failed(&first), "{first}");
-        assert!(tool_text(&first).contains("clawg serve"), "must name the fix: {first}");
+        assert!(tool_text(&first).contains("clawg status"), "must say where the cause is: {first}");
 
         let second = host.memory_status(3, Duration::from_secs(5)).await;
         assert!(tool_failed(&second), "the bridge must survive the first failure: {second}");

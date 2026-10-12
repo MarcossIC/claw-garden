@@ -18,8 +18,10 @@ use clawg_cli::daemon::serve;
 use clawg_cli::doctor;
 use clawg_cli::mcp;
 use clawg_cli::memories;
+use clawg_cli::restore;
 use clawg_cli::status::status_report;
 use clawg_cli::stop::{stop_in, STOP_TIMEOUT};
+use clawg_core::memory::backup::{backup_offline, probe, restore};
 use clawg_core::paths::data_dir;
 use clap::Parser;
 
@@ -84,7 +86,11 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             };
 
             let running = health.is_some();
-            let report = status_report(profile, &base_dir, state.as_ref(), health.as_ref());
+            // Only without a daemon: a running one has already opened the
+            // store, and its health says how that went.
+            let store = if running { None } else { Some(probe(&base_dir)) };
+            let report =
+                status_report(profile, &base_dir, state.as_ref(), health.as_ref(), store.as_ref());
             println!(
                 "{}",
                 serde_json::to_string_pretty(&report).unwrap_or_else(|_| report.to_string())
@@ -110,6 +116,31 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                     other => other.to_string(),
                 })?;
             println!("stopped the {} daemon (pid {pid})", profile.as_str());
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Backup { profile } => {
+            let profile = profile.resolve().map_err(|e| e.to_string())?;
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            // A running daemon holds the store and its only connection, so the
+            // snapshot has to come from it; with none, no daemon is started
+            // just to copy a file.
+            let path = match probe_running(&base_dir, false).await {
+                Ok(Probe::Running(client)) => client.backup().await.map_err(|e| e.to_string())?,
+                Ok(Probe::NeedsStart) | Err(ClientError::NotRunning) => {
+                    backup_offline(&base_dir).map_err(|e| e.to_string())?
+                }
+                Err(e) => return Err(e.to_string()),
+            };
+            println!("{}", path.display());
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Restore { file, profile } => {
+            let profile = profile.resolve().map_err(|e| e.to_string())?;
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let restored = restore(&base_dir, &file).map_err(restore::explain)?;
+            println!("{}", restore::report(&file, &restored));
             Ok(ExitCode::SUCCESS)
         }
 
