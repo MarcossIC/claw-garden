@@ -86,6 +86,13 @@ pub struct Health {
     pub profile: String,
     pub pid: u32,
     pub embedder: String,
+    /// Why the embedder failed; `None` unless `embedder` is `"failed"`, and
+    /// `default` so a daemon from before this field still parses.
+    #[serde(default)]
+    pub embedder_error: Option<String>,
+    /// Whether the daemon will retry the failed load on its own.
+    #[serde(default)]
+    pub embedder_retryable: Option<bool>,
     pub uptime_s: u64,
 }
 

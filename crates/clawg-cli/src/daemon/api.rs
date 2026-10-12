@@ -29,6 +29,7 @@ use clawg_core::memory::admin::{
     delete_memory_core, get_memory_core, list_memories_core, memory_stats_core, query_has_tokens,
     set_importance_core, ListParams, MemoryAdminRow, MemoryKind, MemoryStats, StatsParams,
 };
+use clawg_core::memory::bootstrap::EmbedderStatus;
 use clawg_core::memory::embedder::EmbedRole;
 use clawg_core::memory::events::{MemoryEvent, MemorySource};
 use clawg_core::memory::prompt_builder::{build_memory_prompt, QueryTexts};
@@ -292,12 +293,17 @@ pub struct HealthBody {
     pub version: &'static str,
     pub profile: &'static str,
     pub pid: u32,
-    /// `"ready"` once the embedder cell is filled, `"loading"` until then.
-    /// Health never waits on it: a daemon whose model is still downloading is
-    /// fully usable for saving and listing, and a client that could not tell
-    /// the difference would sit through a 470 MB download before its first
-    /// request.
+    /// `"ready"` once the embedder cell is filled, `"loading"` until then,
+    /// `"failed"` when the bootstrap could not load it. Health never waits on
+    /// it: a daemon whose model is still downloading is fully usable for
+    /// listing, and a client that could not tell the difference would sit
+    /// through a 470 MB download before its first request.
     pub embedder: &'static str,
+    /// The cause when `embedder` is `"failed"`, `null` otherwise.
+    pub embedder_error: Option<String>,
+    /// Whether the daemon retries the failed load by itself; `null` unless
+    /// `embedder` is `"failed"`.
+    pub embedder_retryable: Option<bool>,
     pub uptime_s: u64,
 }
 
@@ -406,12 +412,19 @@ async fn require_bearer(
 // ── Handlers ────────────────────────────────────────────────────────────────
 
 async fn health(State(app): State<Arc<AppCtx>>) -> Json<HealthBody> {
+    let (embedder, embedder_error, embedder_retryable) = match app.runtime.embedder_status() {
+        EmbedderStatus::Loading => ("loading", None, None),
+        EmbedderStatus::Ready => ("ready", None, None),
+        EmbedderStatus::Failed { error, retryable } => ("failed", Some(error), Some(retryable)),
+    };
     Json(HealthBody {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
         profile: app.profile.as_str(),
         pid: std::process::id(),
-        embedder: if app.runtime.embedder_ready() { "ready" } else { "loading" },
+        embedder,
+        embedder_error,
+        embedder_retryable,
         uptime_s: app.started_at.elapsed().as_secs(),
     })
 }

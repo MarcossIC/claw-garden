@@ -14,9 +14,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use clawg_cli::daemon::api::{router, AppCtx};
+use clawg_core::memory::bootstrap::EmbedderStatus;
 use clawg_core::memory::embedder::Embedder;
 use clawg_core::paths::Profile;
 use clawg_core::runtime::MemoryRuntime;
+
 use once_cell::sync::OnceCell;
 use serde_json::{json, Value};
 
@@ -25,13 +27,19 @@ enum EmbedderState {
     Ready,
     NeverLoaded,
     ServedEmpty,
+    /// The bootstrap gave up or is waiting to retry.
+    Failed { error: &'static str, retryable: bool },
 }
 
 /// Swaps in a fresh, EMPTY embedder cell while moving every other handle
 /// across untouched — the cheapest way to reproduce a pre-bootstrap daemon
 /// without a second constructor in core.
-fn with_empty_embedder(runtime: MemoryRuntime) -> MemoryRuntime {
-    MemoryRuntime { embedder: Arc::new(OnceCell::<Arc<dyn Embedder>>::new()), ..runtime }
+fn with_empty_embedder(runtime: MemoryRuntime, status: EmbedderStatus) -> MemoryRuntime {
+    MemoryRuntime {
+        embedder: Arc::new(OnceCell::<Arc<dyn Embedder>>::new()),
+        embedder_status: tokio::sync::watch::Sender::new(status),
+        ..runtime
+    }
 }
 
 /// A live daemon on a loopback port, plus everything a test needs to talk to it.
@@ -64,6 +72,11 @@ impl Harness {
         Self::start_inner(EmbedderState::ServedEmpty).await
     }
 
+    /// Daemon whose bootstrap failed with `error`.
+    async fn start_failed(error: &'static str, retryable: bool) -> Self {
+        Self::start_inner(EmbedderState::Failed { error, retryable }).await
+    }
+
     async fn start_inner(embedder: EmbedderState) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let (runtime, rx) = MemoryRuntime::new_for_test(dir.path().to_path_buf()).await;
@@ -79,13 +92,19 @@ impl Harness {
                 runtime
             }
             EmbedderState::NeverLoaded => {
-                let runtime = with_empty_embedder(runtime);
+                let runtime = with_empty_embedder(runtime, EmbedderStatus::Loading);
                 tokio::spawn(runtime.ingest_worker(rx));
                 runtime
             }
             EmbedderState::ServedEmpty => {
                 tokio::spawn(runtime.ingest_worker(rx));
-                with_empty_embedder(runtime)
+                with_empty_embedder(runtime, EmbedderStatus::Loading)
+            }
+            EmbedderState::Failed { error, retryable } => {
+                let status = EmbedderStatus::Failed { error: error.into(), retryable };
+                let runtime = with_empty_embedder(runtime, status);
+                tokio::spawn(runtime.ingest_worker(rx));
+                runtime
             }
         };
 
@@ -172,6 +191,8 @@ async fn health_answers_without_a_token() {
     assert_eq!(body["status"], "ok");
     assert_eq!(body["profile"], "dev");
     assert_eq!(body["embedder"], "ready");
+    assert!(body["embedder_error"].is_null());
+    assert!(body["embedder_retryable"].is_null());
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(body["pid"], std::process::id());
     assert!(body["uptime_s"].is_u64());
@@ -188,6 +209,31 @@ async fn health_reports_loading_while_the_embedder_cell_is_empty() {
     let body: Value = r.json().await.expect("json");
     assert_eq!(body["status"], "ok");
     assert_eq!(body["embedder"], "loading");
+    assert!(body["embedder_error"].is_null());
+    assert!(body["embedder_retryable"].is_null());
+}
+
+#[tokio::test]
+async fn health_reports_failed_with_the_cause_after_a_failed_bootstrap() {
+    let h = Harness::start_failed("download failed: connection refused", true).await;
+    let r = h.http.get(h.url("/health")).send().await.expect("request");
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.expect("json");
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["embedder"], "failed");
+    assert!(
+        body["embedder_error"].as_str().is_some_and(|e| e.contains("connection refused")),
+        "got {body}"
+    );
+    assert_eq!(body["embedder_retryable"], true);
+}
+
+#[tokio::test]
+async fn health_reports_a_contract_mismatch_as_not_retryable() {
+    let h = Harness::start_failed("embedding contract mismatch (dim)", false).await;
+    let body: Value = h.http.get(h.url("/health")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(body["embedder"], "failed");
+    assert_eq!(body["embedder_retryable"], false);
 }
 
 // ── Auth ────────────────────────────────────────────────────────────────────
