@@ -66,3 +66,4 @@ pub mod query_context;
 pub mod vector;
 pub mod admin;
 pub mod dispute;
+pub mod synthesis;

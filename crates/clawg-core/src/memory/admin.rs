@@ -500,7 +500,7 @@ pub async fn list_memories_core(
 }
 
 // Column order here is the contract with the `map_*_row` functions below.
-const SELECT_MEMORY: &str = "SELECT id, scope, agent_id, project_id, memory_type, content, \
+pub(crate) const SELECT_MEMORY: &str = "SELECT id, scope, agent_id, project_id, memory_type, content, \
      tier, importance, status, access_count, created_at, last_accessed_at, superseded_by, \
      deleted_at, source, source_session_id, created_by_type, created_by_ref, \
      last_modified_at, update_count, dispute_count, disputed_against, last_disputed_at, \
@@ -580,7 +580,7 @@ fn query_memory_rows(
     Ok(out)
 }
 
-fn map_memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryAdminRow> {
+pub(crate) fn map_memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryAdminRow> {
     Ok(MemoryAdminRow {
         id: row.get(0)?,
         kind: MemoryKind::Memory,
