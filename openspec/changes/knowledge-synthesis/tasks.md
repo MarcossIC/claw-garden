@@ -2,56 +2,51 @@
 
 Cada tarea es un commit atómico: primero el test que falla, después el código. El suite queda sin fallas nuevas en cada commit.
 
-## 1. Red para las filas que dejó la app (R1)
+## 1. Limpieza (D7, R1)
 
-- [ ] Test `rows_the_desktop_app_wrote_survive_the_upgrade` en `crates/clawg-core/tests/`: siembra una trayectoria y un skill como los escribía la app y prueba búsqueda, workspace, listado y texto de re-embed. Pasa hoy y tiene que seguir pasando.
-- Commit: `test(core): pin what search and the workspace read from episodic and procedural rows`
+- [x] R1 ya está cubierta por tests existentes de búsqueda, workspace, listado y re-embed; se corren antes y después del borrado. El de re-embed pasa a fijar el texto literal.
+- [x] Borrar `extractor`, `miner`, `resolver`, `episodic_writer`, `providers`, `services`, los lectores sin llamador de `admin.rs` y los tipos de `models` que sólo usaban ellos; mudar `skill_embedding_text` a `maintenance.rs`; dejar los escritores de trayectorias y skills sólo para tests.
+- Commit: `refactor(core): remove the unused LLM extraction pipeline` (675f574)
 
-## 2. Limpieza (D7)
+## 2. Migración V10 (D1, D4, R9)
 
-- [ ] Borrar `extractor`, `miner`, `resolver`, `episodic_writer`, `providers`, `services`, los escritores de trayectorias y skills de `store_insert.rs` y los lectores sin llamador de `admin.rs`; mudar `skill_embedding_text` a `maintenance.rs`; recortar `models` y las dependencias que queden sin usuario.
-- [ ] El test de la tarea 1 sigue pasando; el conteo baja por los tests del código borrado.
-- Commit: `refactor(core)!: remove the unused LLM extraction pipeline`
+- [x] Fila de V10 en `published_migration_checksums_are_pinned` (falla), y test de que una base en V9 abre con todas sus filas intactas.
+- [x] `V10__synthesis.sql` con `memory_derivation` y `synthesis_review`; se toca `migrations.rs`.
+- Commit: `feat(core): add tables for memory provenance and synthesis reviews` (8214a7d)
 
-## 3. Migración V10 (D1, D4, R9)
+## 3. Procedencia en la ingesta (R2, R4, R9)
 
-- [ ] Fila de V10 en `published_migration_checksums_are_pinned` (falla), y test de que una base en V9 abre con todas sus filas intactas.
-- [ ] `V10__synthesis.sql` con `memory_derivation` y `synthesis_review`; se toca `migrations.rs`.
-- Commit: `feat(core): add tables for memory provenance and synthesis reviews`
+- [x] Tests `a_conclusion_is_linked_to_its_sources`, `every_chunk_of_a_conclusion_is_linked`, `a_reinforced_conclusion_gains_the_new_sources`, `a_row_is_never_its_own_source`, `a_conclusion_does_not_dispute_its_sources` en `worker.rs`; `a_spill_without_sources_still_parses` en `spill.rs`.
+- [x] `derived_from` en `MemoryEvent` y `NewMemoryRecord`; enlaces en las transacciones de insert y refuerzo; las fuentes se suman a las exclusiones del detector.
+- Commit: `feat(core): record which memories a saved memory was derived from` (b1e41d6)
 
-## 4. Procedencia en la ingesta (R2, R4, R9)
+## 4. La procedencia se ve (R5)
 
-- [ ] Tests `a_conclusion_is_linked_to_its_sources`, `every_chunk_of_a_conclusion_is_linked`, `a_reinforced_conclusion_gains_the_new_sources`, `a_row_is_never_its_own_source`, `a_conclusion_does_not_dispute_its_sources` en `worker.rs`; `a_spill_without_sources_still_parses` en `spill.rs`.
-- [ ] `derived_from` en `MemoryEvent` y `NewMemoryRecord`; enlaces en las transacciones de insert y refuerzo; las fuentes se suman a las exclusiones del detector.
-- Commit: `feat(core): record which memories a saved memory was derived from`
+- [x] Test `the_listing_names_the_sources_of_a_conclusion` en `admin.rs`.
+- [x] `MemoryAdminRow.derived_from` en el listado y en `GET`.
+- Commit: `feat(core): show the sources of a derived memory` (71fa3a6)
 
-## 5. La procedencia se ve (R5)
+## 5. Síntesis en el core (R6, R7, R8)
 
-- [ ] Test `the_listing_names_the_sources_of_a_conclusion` en `admin.rs`.
-- [ ] `MemoryAdminRow.derived_from` en el listado y en `GET`.
-- Commit: `feat(core): show the sources of a derived memory`
+- [x] Tests `synthesis_lists_what_no_conclusion_covers`, `deleting_a_conclusion_makes_its_sources_pending_again`, `synthesis_stays_in_its_project`, `synthesis_records_the_review_and_nothing_else`, `unreviewed_counts_what_arrived_after_the_last_review`, `existing_ids_leave_out_unknown_and_deleted_rows`, `synthesis_stays_with_its_agent`, `existing_ids_leave_out_another_agents_rows` en `synthesis.rs`.
+- [x] `memory/synthesis.rs`: `synthesis_core`, `unreviewed_count`, `existing_memory_ids`.
+- Commit: `feat(core): list the memories no conclusion covers yet` (757f169)
 
-## 6. Síntesis en el core (R6, R7, R8)
+## 6. HTTP (R3, R7, R8)
 
-- [ ] Tests `synthesis_lists_what_no_conclusion_covers`, `deleting_a_conclusion_makes_its_sources_pending_again`, `synthesis_stays_in_its_project`, `synthesis_filters_by_text`, `synthesis_records_the_review_and_nothing_else`, `unreviewed_counts_what_arrived_after_the_last_review` en `synthesis.rs`.
-- [ ] `memory/synthesis.rs`: `synthesis_core`, `unreviewed_count`, `existing_memory_ids`.
-- Commit: `feat(core): list the memories no conclusion covers yet`
+- [x] Tests puros de `distinct_sources` y `missing_sources`; tests HTTP `a_save_from_unknown_sources_is_refused`, `synthesis_over_http`, `context_reports_unreviewed_memories`, `an_agent_neither_reviews_nor_cites_another_agents_memories` y `a_misspelt_synthesis_field_is_refused`.
+- [x] `derived_from` en `POST /v1/memories` con validación; `POST /v1/synthesis`; `unreviewed` en `POST /v1/context`; `DaemonClient` al día.
+- Commit: `feat(daemon): accept memory sources and serve synthesis` (81bec0c)
 
-## 7. HTTP (R3, R7, R8)
+## 7. MCP (R5, R7, R8)
 
-- [ ] Tests puros de `check_sources`; tests HTTP `a_save_from_unknown_sources_is_refused`, `synthesis_over_http` y `context_reports_unreviewed_memories`.
-- [ ] `derived_from` en `POST /v1/memories` con validación; `POST /v1/synthesis`; `unreviewed` en `POST /v1/context`; `DaemonClient` al día.
-- Commit: `feat(daemon): accept memory sources and serve synthesis`
-
-## 8. MCP (R5, R7, R8)
-
-- [ ] Tests `rows_show_where_a_conclusion_came_from`, `the_synthesis_text_says_what_to_save`, `the_nudge_appears_from_the_threshold` en `tools.rs`; conteo de herramientas e instrucciones en `server.rs`.
-- [ ] `derived_from` en `save_memory`; herramienta `synthesize`; recordatorio en `recall_context`; instrucciones del servidor.
-- Commit: `feat(mcp): let the agent draw conclusions from its memories`
+- [x] Tests `rows_show_where_a_conclusion_came_from`, `the_synthesis_text_says_what_to_save`, `the_nudge_appears_from_the_threshold` en `tools.rs`; conteo de herramientas e instrucciones en `server.rs` y `handshake.rs`.
+- [x] `derived_from` en `save_memory`; herramienta `synthesize` con el agente que llama; recordatorio en `recall_context`; instrucciones del servidor.
+- Commit: `feat(mcp): let the agent draw conclusions from its memories` (631fccd)
 
 ## Verify
 
-- [ ] `cargo test --workspace` en Linux, contra la base: sin fallas nuevas, con el conteo justificado (ver `verify.md`).
+- [x] `cargo test --workspace` en Linux, contra la base: sin fallas nuevas, con el conteo justificado ([`verify.md`](verify.md#linux)).
 - [ ] `cargo test --workspace --target-dir <otro-dir>` en Windows (máquina de Marcos).
 - [ ] `rag-eval --real --diff` y `--agent-view --diff` contra el baseline (máquina de Marcos; el golden set no está en el repo).
 - [ ] Prueba manual con el perfil dev en Claude Code: sintetizar, guardar una conclusión con `derived_from`, ver el recordatorio apagarse (máquina de Marcos).

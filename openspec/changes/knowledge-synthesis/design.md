@@ -27,8 +27,8 @@ El auto-enlace (refuerzo de la propia fuente) se filtra en SQL con `WHERE source
 
 El save es asíncrono: el worker corre después de que el daemon respondió (o mientras espera la confirmación). Si la validación viviera en el worker, un id malo se descubriría tarde, y con el embedder cargando la respuesta ya habría sido `queued`.
 
-- **Puro** (`api.rs`): `check_sources(pedidos, vivos) -> Result<Vec<i64>, Vec<i64>>`. Deduplica, ordena, aplica el tope de 50 y devuelve los rechazados. Se prueba sin base.
-- **Con base** (`synthesis.rs`): `existing_memory_ids(store, ids)`, un `SELECT id FROM memory WHERE deleted_at IS NULL AND id IN (...)`.
+- **Puro** (`api.rs`): `distinct_sources(pedidos)` deduplica, ordena y aplica el tope de 50; `missing_sources(pedidos, vivos)` devuelve los rechazados. Se prueban sin base.
+- **Con base** (`synthesis.rs`): `existing_memory_ids(store, ids, agente)`, un `SELECT id FROM memory WHERE id = ? AND deleted_at IS NULL AND (? IS NULL OR agent_id = ?)` por id. El daemon pasa el agente del save: una fila de otro agente es una fuente que no existe, como en visibility-policy.
 - **Carrera aceptada:** una fuente borrada entre la validación y el insert queda enlazada igual. Es lo mismo que borrarla un segundo después: la conclusión se queda y el enlace es historia (R6).
 
 ## D4. Revisión por alcance: tabla, no derivada
@@ -38,17 +38,17 @@ El recordatorio necesita saber "qué llegó desde la última vez que el agente m
 | Opción | A favor | En contra |
 |---|---|---|
 | a. Derivarlo de la conclusión más nueva del alcance | Sin estado | Si el agente revisa y no concluye nada, el recordatorio no se apaga nunca |
-| **b. `synthesis_review (scope_key TEXT PRIMARY KEY, reviewed_at INTEGER)`** | Se apaga al revisar, concluya o no | Una tabla más en la misma migración |
+| **b. `synthesis_review (agent_id, scope_key, reviewed_at)`, clave `(agent_id, scope_key)`** | Se apaga al revisar, concluya o no | Una tabla más en la misma migración |
 | c. Columna en `project` (V9) | Reusa una tabla | No cubre el alcance "todo el store", y es `ALTER TABLE` sobre una tabla con datos |
 
-**Elegida b.** Va en la misma migración que D1, así que no suma una migración. `scope_key` es el `project_id` o `''`.
+**Elegida b.** Va en la misma migración que D1, así que no suma una migración. `agent_id` es el agente o `''` para el dueño de la base; `scope_key` es el `project_id` o `''`. La revisión es por agente porque cada agente sólo ve sus memorias: que un agente revise no puede apagar el recordatorio de otro que nunca las miró.
 
 ## D5. La síntesis es una lectura más una marca
 
 `synthesis.rs` (nuevo, en `clawg-core/src/memory/`):
 
-- `synthesis_core(store, SynthesisParams { project_id, query, limit, now }) -> Synthesis { pending, pending_total, conclusions }`: tres consultas y un upsert en `synthesis_review`, todo en un `conn.call` con una transacción, para que el total y la lista vengan del mismo estado.
-- `unreviewed_count(store, project_id) -> usize`: un `COUNT` con la misma condición de pendiente más `created_at > reviewed_at`.
+- `synthesis_core(store, SynthesisParams { agent_id, project_id, limit }, now) -> Synthesis { pending, pending_total, conclusions }`: tres consultas y un upsert en `synthesis_review`, todo en un `conn.call` con una transacción, para que el total y la lista vengan del mismo estado.
+- `unreviewed_count(store, agent_id, project_id) -> usize`: un `COUNT` con la misma condición de pendiente más `created_at > reviewed_at`.
 - La condición de "pendiente" es una sola constante SQL que usan las dos, igual que la expresión del estado de reposo en dispute-resolution:
 
 ```sql
@@ -61,7 +61,7 @@ AND NOT EXISTS (
 ```
 
 - Las filas se devuelven como `MemoryAdminRow`, el mismo tipo del listado, para que `derived_from` y el renderizado sean uno solo. `SELECT_MEMORY` suma `derived_from` con un subselect `json_group_array` ordenado; `map_memory_row` lo convierte en `None` cuando está vacío.
-- El filtro de texto reusa `viewer_match_expression` de `admin.rs`.
+- Sin filtro de texto (spec R7): la síntesis devuelve lo que falta revisar, y la búsqueda por texto ya es `search_memory`.
 - No registra accesos: mirar memorias para sintetizar no es usarlas, y contarlo inflaría los tiers (retrieval-hygiene).
 
 ## D6. El recordatorio va en el puente, no en el prompt
@@ -84,12 +84,12 @@ Se borra (sin llamador en producción, `rg` lo confirma en cada commit):
 - de `models`: `ToolCall`, `ToolFunction`, `ToolDefinition`, `ToolFunctionDef`, `ChatRequest`, `ChatStreamResult`, `LlmError` y las variantes de `StreamEvent` y `AppError` que sólo producían los proveedores. Se quedan `Role`, `ChatMessage`, `current_time_millis`, `StreamEvent::EmbedderDownload` y lo que use el resto del crate (lo decide el compilador);
 - de `store_insert.rs`: `NewEpisodicTrajectoryRecord`, `insert_episodic_trajectory`, `update_trajectory_root_cause`, `fetch_prior_trajectories`, `promote_to_procedural_skill` y sus tests;
 - de `admin.rs`: `get_failure_histogram_core`, `get_skill_steps_trend_core` y sus tipos;
-- las dependencias que queden sin usuario (`async-trait`, `futures`, `uuid`, `mockito`, si el compilador lo confirma).
+- ninguna dependencia: `reqwest`, `async-trait`, `futures`, `uuid` y `mockito` siguen en uso (descarga del modelo, embedder, worker y sus tests).
 
 Se muda: `skill_embedding_text` a `maintenance.rs`, su único usuario vivo.
 
-Se queda todo lo que lee o administra las tablas (punto 1 del alcance de la propuesta, R1 de la spec). El test de R1 se escribe **antes** del borrado y tiene que pasar en los dos lados: es la red que pide `config.yaml`.
+Se queda todo lo que lee o administra las tablas (punto 1 del alcance de la propuesta, R1 de la spec). Los tests que ya cubren esa lectura usan `insert_episodic_trajectory` y `promote_to_procedural_skill` para sembrar; esos dos escritores se quedan detrás de `#[cfg(test)]` (y `testing` para el primero, que usan los tests HTTP de `clawg-cli`), así las filas de prueba son exactamente las que escribía la app. Reescribir unas 30 siembras a SQL crudo era más código y menos fiel.
 
 ## D8. Orden de los commits
 
-Primero la red (R1), después la limpieza en commits que compilan solos, después la migración, la procedencia, la síntesis, el HTTP y el MCP. Así la limpieza se puede revisar (o revertir) sin mirar la funcionalidad nueva, y si Marcos elige "sólo limpieza" la rama se corta después del commit de limpieza.
+Primero la limpieza (con R1 cubierta por los tests que ya existen) en commits que compilan solos, después la migración, la procedencia, la síntesis, el HTTP y el MCP. Así la limpieza se puede revisar (o revertir) sin mirar la funcionalidad nueva, y si Marcos elige "sólo limpieza" la rama se corta después del commit de limpieza.

@@ -30,7 +30,7 @@ El objetivo 5, extraer conclusiones con el tiempo, no tiene ningún camino vivo.
 
 ## Alcance
 
-1. **Limpieza** (`clawg-core`): borrar `extractor`, `miner`, `resolver`, `episodic_writer`, `providers`, `services`, los tipos de `models` que sólo usaban ellos, los escritores de trayectorias y skills de `store_insert.rs` y los dos lectores muertos de `admin.rs`. Las tablas, sus vectores, su KNN, el workspace, el listado, `GET`, `DELETE`, `PATCH` y el re-embed de `procedural_skill` siguen igual (`skill_embedding_text` se muda a `maintenance.rs`, su único usuario vivo).
+1. **Limpieza** (`clawg-core`): borrar `extractor`, `miner`, `resolver`, `episodic_writer`, `providers`, `services`, los tipos de `models` que sólo usaban ellos y los dos lectores muertos de `admin.rs`; los escritores de trayectorias y skills de `store_insert.rs` quedan sólo para tests. Las tablas, sus vectores, su KNN, el workspace, el listado, `GET`, `DELETE`, `PATCH` y el re-embed de `procedural_skill` siguen igual (`skill_embedding_text` se muda a `maintenance.rs`, su único usuario vivo).
 2. **Procedencia** (`clawg-core`): `save_memory` acepta `derived_from`, la lista de memorias de las que sale la fila. Se guarda en una tabla nueva, `memory_derivation`, en la misma transacción que el insert o el refuerzo. El detector de contradicciones no compara una fila contra sus fuentes. `GET` y `list_memories` muestran `derived_from`.
 3. **Síntesis** (`POST /v1/synthesis` y herramienta MCP `synthesize`): devuelve las memorias del alcance que todavía no respalda ninguna conclusión viva, las conclusiones que ya existen y las instrucciones de qué guardar. Registra cuándo se revisó ese alcance.
 4. **Recordatorio:** `POST /v1/context` devuelve cuántas memorias nuevas hay sin revisar desde la última síntesis del alcance, y el puente agrega una línea al final de `recall_context` cuando pasan de un umbral. Las instrucciones del servidor MCP nombran `synthesize`.
@@ -40,7 +40,7 @@ El objetivo 5, extraer conclusiones con el tiempo, no tiene ningún camino vivo.
 - Revivir el pipeline LLM (opción b) o ejecutar algo en segundo plano.
 - Borrar `episodic_trajectory`, `procedural_skill`, sus vectores o las ramas que las leen.
 - El chunker de código (`ChunkerKind::Code`): es de project-indexing.
-- Restringir qué memorias puede citar o ver cada agente: hoy `list`, `delete` y `PATCH` no tienen scope, y `synthesize` sigue la misma regla hasta visibility-policy.
+- Compartir memorias entre agentes (parte C de visibility-policy). `synthesize` y `derived_from` siguen la regla que visibility-policy ya dejó en `main`: un agente sólo revisa y cita sus propias filas.
 - Un tipo de memoria nuevo para las conclusiones: cambiaría tiers y pesos de ranking, y eso se mide aparte.
 - Prompts MCP (slash commands): la herramienta y el recordatorio alcanzan; un prompt se puede sumar después sin cambiar el contrato.
 
@@ -53,7 +53,7 @@ El objetivo 5, extraer conclusiones con el tiempo, no tiene ningún camino vivo.
 - una conclusión no se disputa contra sus fuentes, y sí contra otra fila cercana;
 - `synthesize` devuelve las memorias sin conclusión del alcance, no las que ya respalda una conclusión viva, y las vuelve a devolver si esa conclusión se borra;
 - el recordatorio aparece al pasar el umbral y se apaga después de una síntesis;
-- filas de `episodic_trajectory` y `procedural_skill` sembradas como las escribía la app siguen en la búsqueda, el workspace y el listado, y se re-embeben igual que antes (dato de la versión anterior).
+- filas de `episodic_trajectory` y `procedural_skill` sembradas como las escribía la app siguen en la búsqueda, el workspace y el listado, y se re-embeben igual que antes (los tests que ya existen siguen pasando), y una base en V9 con esas filas abre con todo intacto (dato de la versión anterior).
 
 `rag-eval --real --diff` contra el baseline: la búsqueda no cambia (el golden set no tiene filas episodic, procedural ni derivadas), así que se espera diff vacío.
 
@@ -66,7 +66,7 @@ La calidad de las conclusiones no tiene métrica automática: depende del agente
 
 ## Datos guardados
 
-- **Esquema:** una migración aditiva, `V10__synthesis.sql`, con dos tablas nuevas: `memory_derivation (memory_id, source_id, created_at)` y `synthesis_review (scope_key, reviewed_at)`. No toca ninguna tabla existente. `MemoryStore::open` ya guarda un snapshot `pre-migration` en `<data>/backups` antes de aplicarla (`specs/storage`).
+- **Esquema:** una migración aditiva, `V10__synthesis.sql`, con dos tablas nuevas: `memory_derivation (memory_id, source_id, created_at)` y `synthesis_review (agent_id, scope_key, reviewed_at)`. No toca ninguna tabla existente. `MemoryStore::open` ya guarda un snapshot `pre-migration` en `<data>/backups` antes de aplicarla (`specs/storage`).
 - **Estados:** no cambian. Una conclusión es una fila de `memory` como cualquier otra (`source = 'explicit'`), con su tier, su importancia y su lugar en el ranking.
 - **Borrado:** borrar una conclusión no toca sus fuentes ni sus enlaces; sus fuentes vuelven a aparecer en `synthesize` porque ya no las respalda una conclusión viva. Borrar una fuente no toca la conclusión.
 - **Datos de la versión anterior:** un test siembra filas de las tres tablas como las deja la versión actual (y las trayectorias y skills como las escribía la app) en una base en V9, la abre con la migración nueva y prueba que siguen alcanzables por búsqueda, workspace, listado y re-embed.
@@ -81,6 +81,6 @@ La calidad de las conclusiones no tiene métrica automática: depende del agente
 |---|---|---|
 | El agente escribe conclusiones pobres o repite una memoria | Media | Las instrucciones piden dos o más fuentes y no repetir; las fuentes no se tocan, y una conclusión se borra o se disputa como cualquier fila |
 | El recordatorio molesta | Media | Sólo aparece sobre un umbral de memorias nuevas desde la última revisión del alcance, y se apaga al llamar `synthesize` aunque no se guarde nada |
-| visibility-policy también agrega una migración `V10` | Media | El que se mergea segundo renumera su archivo y la fila de `published_migration_checksums_are_pinned`; ninguna de las dos se publicó todavía |
+| Otro cambio agrega una migración `V10` antes que éste | Baja | visibility-policy se mergeó sin migración. Si otro llega primero, se renumera el archivo y la fila de `published_migration_checksums_are_pinned`; V10 no se publicó todavía |
 | Un daemon viejo recibe `derived_from` o `synthesize` | Baja | `derived_from` se ignora (serde no lo rechaza) y la fila se guarda sin procedencia; `POST /v1/synthesis` da 404 y el puente lo informa. Se corrige al reiniciar el daemon |
 | Alguien quiere volver a la opción b | Baja | El código borrado sigue en el historial de git (`git show <commit>^:crates/clawg-core/src/memory/miner.rs`) |

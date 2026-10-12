@@ -31,7 +31,7 @@ exploration -> proposal -> spec (+ design si hace falta) -> tasks -> apply -> ve
 | 8 | [memory-update-tool](changes/memory-update-tool/exploration.md) | 1 | S | 6 (scope) | exploración |
 | 9 | [dispute-resolution](changes/dispute-resolution/proposal.md) | 1, 5 | M | 5 | verificación (falta rag-eval y Windows) |
 | 10 | [mcp-protocol-upgrade](changes/mcp-protocol-upgrade/exploration.md) | 4 | M | 6 (identidad) | exploración |
-| 11 | [knowledge-synthesis](changes/knowledge-synthesis/proposal.md) | 5 | M (limpieza + síntesis dirigida por el agente) | — | apply |
+| 11 | [knowledge-synthesis](changes/knowledge-synthesis/proposal.md) | 5 | M (limpieza + síntesis dirigida por el agente) | — | verify: tests en verde en Linux; faltan Windows, `rag-eval --real` y la prueba con el perfil dev ([`verify.md`](changes/knowledge-synthesis/verify.md#pendiente-máquina-de-marcos)) |
 | 12 | [project-indexing](changes/project-indexing/exploration.md) | 3 | decisión | 5 | exploración |
 | 13 | [secret-hygiene](changes/secret-hygiene/exploration.md) | 1, 4 | S | — (tiene que cerrar antes de 6) | exploración |
 | 14 | [context-density](changes/context-density/exploration.md) | 1 | S–M | — (se suma a 9) | exploración |

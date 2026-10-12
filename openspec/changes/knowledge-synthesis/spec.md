@@ -9,7 +9,7 @@
 - **Fila viva:** fila de `memory` con `deleted_at IS NULL` y `status <> 'superseded'` (la misma definición que usa dispute-resolution).
 - **Conclusión:** fila de `memory` con al menos una fila en `memory_derivation` que la nombra como `memory_id`.
 - **Fuentes de una conclusión:** los `source_id` de sus filas en `memory_derivation`.
-- **Alcance:** un `project_id`, o todo el store cuando se pide sin proyecto. Su clave en `synthesis_review` es el `project_id`, o `''` para todo el store.
+- **Alcance:** un agente y un `project_id`, o todo el store cuando se pide sin proyecto. Como en la búsqueda y en visibility-policy, un agente sólo ve sus filas; sin agente el pedido es del dueño de la base (el visor, `curl`) y ve las de todos. Su clave en `synthesis_review` es `(agent_id, scope_key)`: el agente o `''` para el dueño, y el `project_id` o `''` para todo el store.
 - **Memoria pendiente de un alcance:** fila viva del alcance que no es conclusión y que no es fuente de ninguna conclusión viva.
 - **Memoria sin revisar de un alcance:** memoria pendiente con `created_at` mayor que el `reviewed_at` del alcance, o cualquier pendiente si el alcance nunca se revisó.
 
@@ -17,12 +17,12 @@
 
 Borrar el pipeline LLM MUST NOT cambiar qué se recupera de `episodic_trajectory` y `procedural_skill`: la búsqueda MUST seguir consultándolas (KNN de 5 + 5), el workspace MUST seguir mostrando los skills del proyecto, y `list_memories`, `GET`, `PATCH` y `DELETE` MUST seguir aceptándolas. El re-embed de `procedural_skill` MUST seguir embebiendo `"{trigger} {skill_name}"`.
 
-#### Escenario: una base escrita por la app de escritorio
-- GIVEN una base en V9 con una trayectoria y un skill escritos con las columnas que usaba la app, y sus vectores
-- WHEN se abre con esta versión (que aplica V10) y se busca con un texto igual al del skill
-- THEN el skill está entre los hits, aparece en el workspace del proyecto y en `list_memories`, y su re-embed produce el mismo texto que antes
+#### Escenario: filas como las escribía la app de escritorio
+- GIVEN una trayectoria y un skill escritos con los mismos escritores que usaba la app (que quedan sólo para tests), y sus vectores
+- WHEN se busca con el vector del skill, se regenera el workspace del proyecto, se lista y se re-embebe
+- THEN el skill está entre los hits y en el workspace, las dos filas están en el listado, y el re-embed del skill embebe `"when login fails Fix login flow"` para `trigger = "when login fails"` y `skill_name = "Fix login flow"`
 
-**Test:** `rows_the_desktop_app_wrote_survive_the_upgrade` en `crates/clawg-core/tests/`. No falla hoy: protege el borrado (se escribe antes de borrar y tiene que seguir pasando después).
+**Test:** los que ya existen y siguen pasando después del borrado: `episodic_trajectory_retrievable_by_same_agent_id` y `knn_procedural_returns_skill_rows` (`search.rs`), `regenerate_reports_the_ids_it_rendered` y `workspace_top_skills_exclude_foreign_project` (`workspace.rs`), `list_memories_kind_none_merges_all_tables_sorted_desc` (`admin.rs`) y `reembed_reinfer_uses_passage_role_and_shared_skill_embedding_text` (`maintenance.rs`), que ahora fija el texto literal en vez de llamar a la función que se mudó. No fallan hoy: protegen el borrado. La apertura de una base en V9 con esas filas es R9.
 
 ## R2. Guardar una conclusión con sus fuentes
 
@@ -47,14 +47,19 @@ Borrar el pipeline LLM MUST NOT cambiar qué se recupera de `episodic_trajectory
 
 ## R3. Fuentes inválidas
 
-El daemon MUST rechazar con 400, sin encolar nada, un save cuyo `derived_from` nombre un id que no existe en `memory` o que está borrado, o que tenga más de 50 ids distintos. El mensaje MUST nombrar los ids rechazados.
+El daemon MUST rechazar con 400, sin encolar nada, un save cuyo `derived_from` nombre un id que no existe en `memory`, que está borrado o que es de otro agente, o que tenga más de 50 ids distintos. El mensaje MUST nombrar los ids rechazados, y MUST NOT distinguir una fila ajena de una que no existe (la misma regla de visibility-policy).
 
 #### Escenario
 - GIVEN una memoria viva A y una borrada D
 - WHEN se guarda C con `derived_from = [A, D, 999999]`
 - THEN la respuesta es 400 y nombra `D` y `999999`, y no se guarda nada
 
-**Test:** `a_save_from_unknown_sources_is_refused` en `crates/clawg-cli/tests/api.rs` y los tests puros de la validación en `crates/clawg-cli/src/daemon/api.rs`. Fallan hoy.
+#### Escenario: fuente de otro agente
+- GIVEN una memoria M del agente A y una T del agente B
+- WHEN A guarda C con `derived_from = [M, T]`
+- THEN la respuesta es 400 y nombra `T`
+
+**Test:** `a_save_from_unknown_sources_is_refused` en `crates/clawg-cli/tests/api.rs` y los tests puros de la validación en `crates/clawg-cli/src/daemon/api.rs` (`sources_are_counted_once_and_sorted`, `too_many_sources_are_refused`, `missing_sources_are_the_ones_that_were_not_found`). Fallan hoy.
 
 ## R4. Una conclusión no disputa a sus fuentes
 
@@ -81,12 +86,12 @@ Borrar una conclusión MUST NOT tocar sus fuentes ni sus filas de `memory_deriva
 
 ## R7. Síntesis
 
-`POST /v1/synthesis` (y la herramienta MCP `synthesize`) MUST, para un alcance y un filtro de texto opcional:
+`POST /v1/synthesis` (y la herramienta MCP `synthesize`) MUST, para un alcance:
 
 - devolver las memorias pendientes del alcance, de la más nueva a la más vieja, hasta `limit` (30 por defecto, entre 1 y 100), y cuántas pendientes hay en total;
 - devolver las conclusiones vivas del alcance (hasta 20, de la más nueva a la más vieja) con su `derived_from`;
-- con filtro de texto, aplicarlo a las dos listas con la misma regla que `list_memories` (cada token como prefijo, sin mayúsculas ni acentos), sin cambiar el total del recordatorio (R8);
-- registrar `reviewed_at = ahora` para el alcance en `synthesis_review`;
+- con agente, mirar sólo sus filas; la herramienta MCP siempre manda el agente que llama;
+- registrar `reviewed_at = ahora` para el alcance en `synthesis_review`; la revisión de un agente no apaga el recordatorio de otro;
 - MUST NOT escribir nada más: no crea, no borra ni cambia memorias, y no registra accesos.
 
 `synthesize` MUST devolver el texto con las instrucciones: qué es una conclusión, que generaliza dos o más memorias, que se guarda con `save_memory`, el tipo que corresponde y `derived_from`, que una conclusión vieja que quedó mal se corrige guardando la nueva y resolviendo el conflicto, y que si nada generaliza no se guarda nada.
@@ -106,11 +111,18 @@ Borrar una conclusión MUST NOT tocar sus fuentes ni sus filas de `memory_deriva
 - WHEN se sintetiza P
 - THEN F no está; y sintetizando sin proyecto, sí
 
-**Test:** `synthesis_lists_what_no_conclusion_covers`, `deleting_a_conclusion_makes_its_sources_pending_again`, `synthesis_stays_in_its_project`, `synthesis_filters_by_text`, `synthesis_records_the_review_and_nothing_else` en `crates/clawg-core/src/memory/synthesis.rs`; `synthesis_over_http` en `crates/clawg-cli/tests/api.rs`; `the_synthesis_text_says_what_to_save` en `tools.rs`. Fallan hoy.
+#### Escenario: otro agente no se mezcla
+- GIVEN una memoria del agente A y otra del agente B en P
+- WHEN A sintetiza P
+- THEN sólo está la de A, y B sigue teniendo su memoria sin revisar
+
+**Test:** `synthesis_lists_what_no_conclusion_covers`, `deleting_a_conclusion_makes_its_sources_pending_again`, `synthesis_stays_in_its_project`, `synthesis_stays_with_its_agent`, `synthesis_records_the_review_and_nothing_else`, `existing_ids_leave_out_unknown_and_deleted_rows` y `existing_ids_leave_out_another_agents_rows` en `crates/clawg-core/src/memory/synthesis.rs`; `synthesis_over_http`, `an_agent_neither_reviews_nor_cites_another_agents_memories` y `a_misspelt_synthesis_field_is_refused` en `crates/clawg-cli/tests/api.rs`; `the_synthesis_text_says_what_to_save`, `a_synthesis_with_nothing_pending_asks_for_nothing` en `tools.rs`; `synthesize_lists_what_no_conclusion_covers_and_recall_stops_reminding` en `server.rs`. Fallan hoy.
+
+No hay filtro de texto: la síntesis le da al modelo lo que no revisó, no un buscador. Buscar por texto es `search_memory`, y el filtro del listado es del visor, que no se le expone al modelo.
 
 ## R8. Recordatorio en `recall_context`
 
-`POST /v1/context` MUST devolver `unreviewed`: cuántas memorias sin revisar tiene el alcance pedido. `recall_context` MUST agregar al final del contexto una línea que nombra `synthesize` y la cantidad cuando `unreviewed` es 20 o más, y no agregar nada debajo de eso. La línea MUST NOT ir dentro del prompt que arma `build_memory_prompt`, para que `rag-eval --agent-view` no cambie.
+`POST /v1/context` MUST devolver `unreviewed`: cuántas memorias sin revisar tiene el alcance pedido, para el agente del pedido. `recall_context` MUST agregar al final del contexto una línea que nombra `synthesize` y la cantidad cuando `unreviewed` es 20 o más, y no agregar nada debajo de eso. La línea MUST NOT ir dentro del prompt que arma `build_memory_prompt`, para que `rag-eval --agent-view` no cambie.
 
 Las instrucciones del servidor MCP MUST nombrar `synthesize`.
 
@@ -127,4 +139,4 @@ Las instrucciones del servidor MCP MUST nombrar `synthesize`.
 
 Una base en V9 MUST abrirse con esta versión aplicando V10 sin cambiar ninguna fila existente, y todas sus memorias MUST quedar pendientes y sin revisar. Un volcado de la cola escrito sin `derived_from` MUST leerse con `derived_from` vacío.
 
-**Test:** R1 (`rows_the_desktop_app_wrote_survive_the_upgrade`), `a_spill_without_sources_still_parses` en `crates/clawg-core/src/memory/spill.rs` y la fila de V10 en `published_migration_checksums_are_pinned`. Fallan hoy, salvo R1.
+**Test:** `a_store_from_the_previous_version_opens_with_every_row_untouched` en `crates/clawg-core/src/memory/db.rs` (siembra en V9 una memoria, una trayectoria y un skill), `a_spill_without_sources_still_parses` en `crates/clawg-core/src/memory/spill.rs` y la fila de V10 en `published_migration_checksums_are_pinned`. Fallan hoy.
