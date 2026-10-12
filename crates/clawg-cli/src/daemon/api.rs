@@ -38,6 +38,8 @@ use clawg_core::paths::Profile;
 use clawg_core::runtime::MemoryRuntime;
 use serde::{Deserialize, Serialize};
 
+use crate::relevance::relevant_len;
+
 use super::lifecycle::now_ms;
 
 /// Largest `limit` any search will honour. A retrieval request is a vector
@@ -211,6 +213,21 @@ pub fn clamp_search_limit(requested: Option<usize>) -> usize {
         .clamp(1, MAX_SEARCH_LIMIT)
 }
 
+/// Checks a caller's `min_relative_score`: a share of the best score, so
+/// anything outside `0..=1` is a mistake rather than a strong preference.
+///
+/// Rejects instead of clamping, unlike the limit: a ratio above 1 would cut
+/// every hit past the minimum, and an answer that short would read as "the
+/// store has nothing else" when the caller only mistyped a number.
+fn check_relative_score(ratio: Option<f64>) -> Result<Option<f64>, ApiError> {
+    match ratio {
+        Some(r) if !(0.0..=1.0).contains(&r) => {
+            Err(ApiError::bad_request("min_relative_score must be between 0 and 1"))
+        }
+        r => Ok(r),
+    }
+}
+
 // ── Request / response bodies ───────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -233,6 +250,10 @@ pub struct SearchRequest {
     pub project_id: Option<String>,
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Share of the best hit's score the others need to be returned. Absent,
+    /// every ranked hit up to `limit` comes back.
+    #[serde(default)]
+    pub min_relative_score: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -472,13 +493,14 @@ async fn search(
     };
 
     let limit = clamp_search_limit(body.limit);
+    let min_relative_score = check_relative_score(body.min_relative_score)?;
     let embedding = embedder
         .embed_with_role(&body.query, EmbedRole::Query)
         .await
         .map_err(ApiError::internal)?;
 
     let scope = SearchScope::all_default().with_project(body.project_id.as_deref());
-    let hits = search_all_memories(
+    let mut hits = search_all_memories(
         &app.runtime.store,
         &embedding,
         // The raw text drives the lexical (FTS5) channel beside the vector one.
@@ -490,6 +512,13 @@ async fn search(
     .await
     .map_err(ApiError::internal)?;
 
+    // The cut runs before recording: a hit the caller never receives was not
+    // retrieved for it, and counting it would feed the ranking a row the
+    // agent never read.
+    if let Some(ratio) = min_relative_score {
+        let scores: Vec<f64> = hits.iter().map(|h| h.score).collect();
+        hits.truncate(relevant_len(&scores, ratio));
+    }
     app.runtime.access_tracker.record_hits(&hits);
 
     Ok(Json(SearchBody { hits }))
@@ -619,6 +648,22 @@ async fn shutdown(State(app): State<Arc<AppCtx>>) -> (StatusCode, Json<QueuedBod
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_relative_score_inside_zero_to_one_passes_through() {
+        assert_eq!(check_relative_score(None).unwrap(), None);
+        assert_eq!(check_relative_score(Some(0.0)).unwrap(), Some(0.0));
+        assert_eq!(check_relative_score(Some(0.6)).unwrap(), Some(0.6));
+        assert_eq!(check_relative_score(Some(1.0)).unwrap(), Some(1.0));
+    }
+
+    #[test]
+    fn a_relative_score_outside_zero_to_one_is_a_bad_request() {
+        for bad in [-0.1, 1.5, f64::NAN, f64::INFINITY] {
+            let err = check_relative_score(Some(bad)).expect_err("must be refused");
+            assert_eq!(err.status, StatusCode::BAD_REQUEST, "{bad}");
+        }
+    }
 
     #[tokio::test]
     async fn serve_ephemeral_answers_over_http_on_the_address_it_returns() {
