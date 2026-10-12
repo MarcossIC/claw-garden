@@ -102,6 +102,9 @@ pub fn purge(base_dir: &Path, id: i64) -> Result<Purged, MemoryError> {
     let tx = c.transaction()?;
     tx.execute("DELETE FROM memory_vectors WHERE rowid = ?1", [id])?;
     tx.execute("DELETE FROM memory WHERE id = ?1", [id])?;
+    // Unlike a soft delete, the id can be handed to a later row, which must
+    // not inherit this one's provenance.
+    tx.execute("DELETE FROM memory_derivation WHERE memory_id = ?1 OR source_id = ?1", [id])?;
     // After the delete, so the row no longer counts as live for them.
     if live {
         release_challengers(&tx, id, TimestampMs::now())?;
@@ -356,6 +359,34 @@ mod tests {
         let status: String =
             c.query_row("SELECT status FROM memory WHERE id = ?1", [challenger], |r| r.get(0)).unwrap();
         assert_eq!(status, "active");
+    }
+
+    #[tokio::test]
+    async fn purging_drops_the_links_to_and_from_the_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+        let source = insert(&store, "the go service uses tabs".to_string()).await;
+        let purged = insert(&store, "the user indents with tabs".to_string()).await;
+        let other = insert(&store, "the rust crate uses tabs".to_string()).await;
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO memory_derivation (memory_id, source_id, created_at) \
+                     VALUES (?1, ?2, 0), (?3, ?1, 0)",
+                    [purged, source, other],
+                )
+            })
+            .await
+            .unwrap();
+        store.conn.clone().close().await.unwrap();
+        drop(store);
+
+        purge(dir.path(), purged).unwrap();
+
+        // A later row can be given the purged id, and must not inherit its links.
+        let sql = "SELECT count(*) FROM memory_derivation WHERE memory_id = ?1 OR source_id = ?1";
+        assert_eq!(count(dir.path(), sql, purged), 0);
     }
 
     #[tokio::test]
