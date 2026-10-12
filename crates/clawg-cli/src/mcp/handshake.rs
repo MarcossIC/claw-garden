@@ -374,8 +374,8 @@ mod tests {
         assert_eq!(tools["id"], 2);
         assert_eq!(
             tools["result"]["tools"].as_array().map(Vec::len),
-            Some(6),
-            "all six memory tools are listed: {tools}"
+            Some(7),
+            "all seven memory tools are listed: {tools}"
         );
     }
 }

@@ -6,11 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
-// Only the test fixtures below build a RankedHit, and its timestamp field is a
-// typed instant. Production code here never constructs one — it only reads rows
-// this module queries itself — so the import is test-only.
-#[cfg(test)]
 use crate::memory::clock::TimestampMs;
+use crate::memory::dispute::release_challengers;
 use crate::memory::search::{viewer_match_expression, RankedHit};
 use crate::memory::TableKind;
 use crate::memory::{MemoryError, MemoryStore};
@@ -214,6 +211,7 @@ const DELETE_VEC_PROCEDURAL: &str = "DELETE FROM procedural_vectors WHERE rowid 
 
 /// Soft-deletes the row `id` in the table selected by `kind` by stamping
 /// `deleted_at = now_ms`, and prunes its vector row in the same transaction.
+/// Rows of `memory` that disputed it are released in that transaction too.
 /// Returns the number of rows affected by the UPDATE (`0` when `id` doesn't
 /// exist in that table or was already deleted — idempotent).
 ///
@@ -246,6 +244,12 @@ pub async fn delete_memory_core(
             let tx = c.transaction()?;
             let affected = tx.execute(row_sql, rusqlite::params![now_ms, id])?;
             tx.execute(vec_sql, rusqlite::params![id])?;
+            // Unconditional for the same reason as the vector delete: a row
+            // deleted before deletes released its challengers gets them
+            // released the next time anyone deletes it again.
+            if kind == MemoryKind::Memory {
+                release_challengers(&tx, id, TimestampMs::from_unix_millis(now_ms))?;
+            }
             tx.commit()?;
             Ok(affected)
         })
@@ -1374,6 +1378,61 @@ mod tests {
             memory_deleted_at(&store, id).await.is_some(),
             "deleted_at must be set after delete"
         );
+    }
+
+    async fn seed_disputing(store: &MemoryStore, disputes: &[i64]) -> i64 {
+        let id = seed_memory_scoped(store, "challenger", "a", None, "disputed").await;
+        let disputes = serde_json::to_string(disputes).unwrap();
+        store
+            .conn
+            .call(move |c| {
+                c.execute("UPDATE memory SET disputed_against = ?1 WHERE id = ?2", rusqlite::params![disputes, id])
+            })
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn memory_status(store: &MemoryStore, id: i64) -> String {
+        store
+            .conn
+            .call(move |c| c.query_row("SELECT status FROM memory WHERE id = ?1", [id], |r| r.get(0)))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn deleting_the_disputed_row_releases_its_challenger() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let old = seed_memory_scoped(&store, "old", "a", None, "active").await;
+        let new = seed_disputing(&store, &[old]).await;
+
+        delete_memory_core(&store, old, MemoryKind::Memory).await.unwrap();
+
+        assert_eq!(memory_status(&store, new).await, "active");
+    }
+
+    #[tokio::test]
+    async fn deleting_one_of_two_keeps_the_dispute() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let first = seed_memory_scoped(&store, "first", "a", None, "active").await;
+        let second = seed_memory_scoped(&store, "second", "a", None, "active").await;
+        let new = seed_disputing(&store, &[first, second]).await;
+
+        delete_memory_core(&store, first, MemoryKind::Memory).await.unwrap();
+
+        assert_eq!(memory_status(&store, new).await, "disputed");
+    }
+
+    #[tokio::test]
+    async fn deleting_an_episodic_row_leaves_memory_disputes_alone() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let old = seed_memory_scoped(&store, "old", "a", None, "active").await;
+        let new = seed_disputing(&store, &[old]).await;
+
+        delete_memory_core(&store, old, MemoryKind::Episodic).await.unwrap();
+
+        assert_eq!(memory_status(&store, new).await, "disputed", "ids are per table");
     }
 
     // Colliding autoincrement ids across tables: kind disambiguates.

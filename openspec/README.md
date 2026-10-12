@@ -29,7 +29,7 @@ exploration -> proposal -> spec (+ design si hace falta) -> tasks -> apply -> ve
 | 6 | [visibility-policy](changes/visibility-policy/exploration.md) | 2, 4 | L | 4, 5 | exploración |
 | 7 | [lexical-fusion](changes/lexical-fusion/proposal.md) | 1, 3 | M | 5 | verify: tests en verde; falta la medición `--real` con el golden set ([`verify.md`](changes/lexical-fusion/verify.md#pendiente-máquina-del-usuario)) |
 | 8 | [memory-update-tool](changes/memory-update-tool/exploration.md) | 1 | S | 6 (scope) | exploración |
-| 9 | [dispute-resolution](changes/dispute-resolution/exploration.md) | 1, 5 | M | 5 | exploración |
+| 9 | [dispute-resolution](changes/dispute-resolution/proposal.md) | 1, 5 | M | 5 | verificación (falta rag-eval y Windows) |
 | 10 | [mcp-protocol-upgrade](changes/mcp-protocol-upgrade/exploration.md) | 4 | M | 6 (identidad) | exploración |
 | 11 | [knowledge-synthesis](changes/knowledge-synthesis/exploration.md) | 5 | decisión | — | exploración |
 | 12 | [project-indexing](changes/project-indexing/exploration.md) | 3 | decisión | 5 | exploración |

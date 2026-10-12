@@ -246,6 +246,11 @@ async fn fetch_auto_rows(
             // project because a decision or a skill belongs to a codebase;
             // this one must not, or the same preference has to be re-taught
             // once per project. Narrowing it is a behavior change, not a fix.
+            //
+            // All three memory queries drop superseded rows but keep disputed
+            // ones: a disputed row ranks like an active one everywhere else,
+            // and the conflicts block reaches the prompt for every row this
+            // section emits, so the dispute is shown next to it.
             let mut stmt = c.prepare(
                 "SELECT id, content FROM memory
                  WHERE memory_type = 'user_preference'
@@ -253,6 +258,7 @@ async fn fetch_auto_rows(
                    AND agent_id = ?1
                    AND tier = 1
                    AND deleted_at IS NULL
+                   AND status <> 'superseded'
                  ORDER BY importance DESC",
             )?;
             let user_prefs: Vec<MemoryLine> = stmt
@@ -280,6 +286,7 @@ async fn fetch_auto_rows(
                        AND (project_id = ?2 OR project_id IS NULL)
                        AND tier = 1
                        AND deleted_at IS NULL
+                       AND status <> 'superseded'
                      ORDER BY importance DESC",
                 )?;
                 let rows: Vec<MemoryLine> = stmt2
@@ -297,6 +304,7 @@ async fn fetch_auto_rows(
                        AND agent_id = ?1
                        AND tier = 1
                        AND deleted_at IS NULL
+                       AND status <> 'superseded'
                      ORDER BY importance DESC",
                 )?;
                 let rows: Vec<MemoryLine> = stmt2
@@ -887,6 +895,51 @@ mod tests {
              the only channel that can still deliver it"
         );
         assert_eq!(emitted.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_superseded_row_is_not_in_the_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let agent = "agent-superseded";
+        let winner = insert_tier1_memory(&store, agent, "prefers tabs", "user_preference", 9.0).await;
+        let loser = insert_tier1_memory(&store, agent, "prefers spaces", "user_preference", 9.0).await;
+        let decision = insert_tier1_memory(&store, agent, "uses sqlite", "architectural_decision", 9.0).await;
+        let replaced = insert_tier1_memory(&store, agent, "uses postgres", "architectural_decision", 9.0).await;
+        let disputed = insert_tier1_memory(&store, agent, "prefers dark mode", "user_preference", 9.0).await;
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE memory SET status = 'superseded', superseded_by = ?2 WHERE id = ?1",
+                    rusqlite::params![loser, winner],
+                )?;
+                c.execute(
+                    "UPDATE memory SET status = 'superseded', superseded_by = ?2 WHERE id = ?1",
+                    rusqlite::params![replaced, decision],
+                )?;
+                c.execute(
+                    "UPDATE memory SET status = 'disputed', disputed_against = ?2 WHERE id = ?1",
+                    rusqlite::params![disputed, format!("[{winner}]")],
+                )
+            })
+            .await
+            .unwrap();
+
+        for project in [None, Some("P1")] {
+            let emitted = wm.regenerate_auto_section(agent, project, &store).await.unwrap();
+            let content = tokio::fs::read_to_string(wm.workspace_path(agent, project)).await.unwrap();
+
+            for (id, text) in [(winner, "prefers tabs"), (decision, "uses sqlite"), (disputed, "prefers dark mode")] {
+                assert!(content.contains(text), "{text} missing:\n{content}");
+                assert!(emitted.contains(TableKind::Memory, id));
+            }
+            for (id, text) in [(loser, "prefers spaces"), (replaced, "uses postgres")] {
+                assert!(!content.contains(text), "{text} was superseded:\n{content}");
+                assert!(!emitted.contains(TableKind::Memory, id));
+            }
+        }
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@
 
 use std::path::Path;
 
+use clawg_core::memory::dispute::{Resolution, ResolvedRow};
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
 
@@ -87,6 +88,15 @@ fn format_hits(hits: &[Hit]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// One line per side of a resolved dispute, the kept row first.
+pub fn format_resolution(r: &Resolution) -> String {
+    let line = |row: &ResolvedRow| match row.superseded_by {
+        Some(by) if row.status == "superseded" => format!("#{} superseded by #{by}", row.id),
+        _ => format!("#{} {}", row.id, row.status),
+    };
+    format!("{}\n{}", line(&r.keep), line(&r.other))
 }
 
 /// Renders inventory rows as a compact one-line-per-row table.
@@ -329,6 +339,13 @@ mod tests {
         let out = format_rows(&[row(1, "memory", Some("chat_message"), &format!("{long}\nmore"))]);
         assert_eq!(out.lines().count(), 1);
         assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn format_resolution_names_both_rows_and_what_replaced_one() {
+        let row = |id, status: &str, superseded_by| ResolvedRow { id, status: status.into(), superseded_by };
+        let out = format_resolution(&Resolution { keep: row(9, "active", None), other: row(4, "superseded", Some(9)) });
+        assert_eq!(out, "#9 active\n#4 superseded by #9");
     }
 
     // ── format_context ──────────────────────────────────────────────────────

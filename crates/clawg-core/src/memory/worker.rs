@@ -507,16 +507,12 @@ async fn process_event(
 
     // Stage 3 — sequential, one chunk at a time: chunk N's contradiction
     // probe is a KNN search over rows already in the store, so chunk N-1 of
-    // this same event must be inserted before it runs. Not exercised by a
-    // same-event test today: `from_event_and_chunk` derives `memory_type`
-    // from `evt.role`/`is_error` alone, which only ever yields
-    // ChatMessage/ToolError/SessionSummary — none `is_claim_bearing()` — so
-    // `detect_contradiction`'s type gate returns `[]` before the KNN runs
-    // for every chunk this loop produces. The ordering is real (this is a
-    // synchronous per-iteration insert-then-probe loop, not a batch), but
-    // only a claim-bearing candidate (currently written only by the
-    // extractor, one row at a time, never through this multi-chunk path)
-    // would let a test observe it end-to-end.
+    // this same event is already there when it runs. An explicit save
+    // carries a claim-bearing type, so a long one reaches the probe once per
+    // chunk; the chunks this event already inserted are passed as siblings,
+    // because two parts of one save are one claim by one author and must not
+    // dispute each other.
+    let mut siblings: Vec<i64> = Vec::new();
     for ((position, pending), vec) in survivors.into_iter().zip(vectors) {
         let PendingChunk { chunk, content_hash, multiplicity } = pending;
         // The contradiction hook runs between embed and insert: it needs the
@@ -525,7 +521,7 @@ async fn process_event(
         // be attached to the record before it is written, not after.
         let mut record = NewMemoryRecord::from_event_and_chunk(evt, &chunk);
         let disputed = crate::memory::contradiction::detect_contradiction(
-            store, &vec, &evt.agent_id, evt.project_id.as_deref(), record.memory_type,
+            store, &vec, &evt.agent_id, evt.project_id.as_deref(), record.memory_type, &siblings,
         ).await;
         if !disputed.is_empty() {
             record.disputed_against = Some(disputed);
@@ -537,6 +533,7 @@ async fn process_event(
             }
         };
         stored[position] = Some(SavedChunk { id, outcome: ChunkOutcome::Inserted });
+        siblings.push(id);
         // The extra copies now find the row this iteration just wrote and
         // take the same branch a copy from a later event takes.
         for _ in 1..multiplicity {
@@ -1477,6 +1474,92 @@ mod tests {
 
     fn chunk_count(content: &str) -> usize {
         ChatChunker::with_fallback().chunk(content, CHUNK_MAX_TOKENS).len()
+    }
+
+    /// Hands the i-th text of each batch the i-th vector, so a test decides
+    /// how close each chunk of one event lands to the others.
+    struct PlacedEmbedder {
+        vectors: Vec<Vec<f32>>,
+    }
+    #[async_trait::async_trait]
+    impl Embedder for PlacedEmbedder {
+        async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+            Ok(self.vectors[0].clone())
+        }
+        async fn embed_batch(&self, texts: &[String], _role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(self.vectors[..texts.len()].to_vec())
+        }
+        fn dimensions(&self) -> usize { 384 }
+        fn model_id(&self) -> &str { "placed" }
+        fn query_prefix(&self) -> &str { "" }
+        fn passage_prefix(&self) -> &str { "" }
+    }
+
+    /// `e0` turned `angle` radians toward `e{toward}`: two of these at
+    /// angles a and b sit `2·sin(|a−b|/2)` apart.
+    fn turned(toward: usize, angle: f32) -> Vec<f32> {
+        let mut v = vec![0.0_f32; 384];
+        v[0] = angle.cos();
+        v[toward] = angle.sin();
+        v
+    }
+
+    fn explicit_fact(content: &str) -> MemoryEvent {
+        MemoryEvent {
+            source: MemorySource::Explicit,
+            memory_type: Some("semantic_fact".into()),
+            ..make_event(Role::User, content, None, 1)
+        }
+    }
+
+    async fn disputes_of(store: &MemoryStore, id: i64) -> (String, Option<String>) {
+        store
+            .conn
+            .call(move |c| {
+                c.query_row("SELECT status, disputed_against FROM memory WHERE id = ?1", [id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sibling_chunks_of_one_save_do_not_dispute_each_other() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let content = distinct_text(400);
+        assert_eq!(chunk_count(&content), 2, "fixture must split into two chunks");
+        let in_band = PlacedEmbedder { vectors: vec![turned(1, 0.0), turned(1, 0.2)] };
+
+        let report = process_with(Arc::new(in_band), &store, &explicit_fact(&content)).await;
+
+        assert_eq!(report.failure, None);
+        for saved in &report.memories {
+            assert_eq!(disputes_of(&store, saved.id).await, ("active".to_string(), None));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_chunk_still_disputes_an_older_row() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let older = PlacedEmbedder { vectors: vec![turned(2, 0.2)] };
+        let older = process_with(Arc::new(older), &store, &explicit_fact("the build uses cargo")).await;
+        let older = older.memories[0].id;
+
+        // Every sibling sits closer to the last chunk than the older row
+        // does, so without room for them they fill the whole candidate pool.
+        let content = distinct_text(1600);
+        let chunks = chunk_count(&content);
+        assert!(chunks >= 7, "fixture must split into at least seven chunks, got {chunks}");
+        let siblings = PlacedEmbedder { vectors: (0..chunks).map(|i| turned(1, 0.01 * i as f32)).collect() };
+
+        let report = process_with(Arc::new(siblings), &store, &explicit_fact(&content)).await;
+
+        assert_eq!(report.failure, None);
+        assert_eq!(report.memories.len(), chunks);
+        for saved in &report.memories {
+            assert_eq!(disputes_of(&store, saved.id).await, ("disputed".to_string(), Some(format!("[{older}]"))));
+        }
     }
 
     #[tokio::test]

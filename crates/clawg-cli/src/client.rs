@@ -20,6 +20,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use clawg_core::memory::dispute::Resolution;
 use clawg_core::memory::store_lock::{StoreHolder, StoreLock, StoreOwner};
 use clawg_core::paths::{data_dir, PathsError, Profile};
 use serde::{Deserialize, Serialize};
@@ -590,6 +591,18 @@ impl DaemonClient {
         Ok(Self::read_response::<Body>(resp).await?.deleted)
     }
 
+    pub async fn resolve(&self, keep: i64, other: i64, keep_both: bool) -> Result<Resolution, ClientError> {
+        let resp = self
+            .http
+            .post(self.url("/v1/disputes/resolve"))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "keep": keep, "other": other, "keep_both": keep_both }))
+            .send()
+            .await
+            .map_err(Self::map_transport)?;
+        Self::read_response::<Resolution>(resp).await
+}
+
     /// Asks the daemon for a manual snapshot and returns where it wrote it.
     pub async fn backup(&self) -> Result<PathBuf, ClientError> {
         #[derive(Deserialize)]
@@ -1149,6 +1162,17 @@ pub(crate) mod tests {
             }
             other => panic!("expected a daemon error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_refuses_a_pair_without_a_dispute() {
+        let d = start_daemon().await;
+        publish(&d);
+        let c = DaemonClient::from_data_dir(d.dir.path()).expect("client");
+
+        let err = c.resolve(1, 1, false).await.expect_err("a row cannot be resolved against itself");
+
+        assert!(matches!(err, ClientError::Daemon { status: 400, .. }), "{err:?}");
     }
 
     #[tokio::test]

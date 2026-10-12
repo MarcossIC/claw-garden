@@ -37,7 +37,7 @@ use serde::Deserialize;
 use crate::client::{ClientError, DaemonClient, ListArgs, SaveArgs, SaveOutcome, SearchArgs};
 use crate::mcp::startup::ClientHandle;
 use crate::mcp::tools::{
-    format_context, format_rows, format_search, format_status, resolve_project,
+    format_context, format_resolution, format_rows, format_search, format_status, resolve_project,
 };
 
 /// Agent id used when the MCP client did not identify itself.
@@ -52,7 +52,8 @@ const INSTRUCTIONS: &str = "\
 Persistent memory for this user across sessions. Use `save_memory` whenever the \
 user states a durable fact, preference or decision; use `search_memory` before \
 answering anything that depends on earlier sessions, and `recall_context` once \
-when a broad task needs background. \
+when a broad task needs background. When it lists ACTIVE CONFLICTS, ask the user \
+which memory holds and record the answer with `resolve_conflict`. \
 Memories are scoped to the current project unless you say otherwise.";
 
 // ── Tool parameters ─────────────────────────────────────────────────────────
@@ -136,6 +137,20 @@ pub struct DeleteMemoryArgs {
     /// because each table numbers its rows independently — id 7 exists in all
     /// three and means something different in each.
     pub kind: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ResolveConflictArgs {
+    /// The memory id that stays, as shown in the ACTIVE CONFLICTS block.
+    pub keep: i64,
+    /// The other memory id of the same conflict. It is superseded by `keep`:
+    /// no longer retrieved, still listed, and restored by resolving the pair
+    /// the other way round.
+    pub other: i64,
+    /// Set to true when the two memories do not actually contradict each
+    /// other: both stay and the conflict is closed. Defaults to false.
+    #[serde(default)]
+    pub keep_both: Option<bool>,
 }
 
 // ── The server ──────────────────────────────────────────────────────────────
@@ -466,6 +481,20 @@ impl ClawgMcp {
         }
     }
 
+    pub async fn resolve_conflict_impl(
+        &self,
+        args: ResolveConflictArgs,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let client = match self.daemon().await {
+            Ok(c) => c,
+            Err(failure) => return Ok(failure),
+        };
+        match client.resolve(args.keep, args.other, args.keep_both.unwrap_or(false)).await {
+            Ok(resolution) => Self::ok(format_resolution(&resolution)),
+            Err(e) => Self::failed(Self::explain(&e)),
+        }
+    }
+
     pub async fn memory_status_impl(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let client = match self.daemon().await {
             Ok(c) => c,
@@ -560,6 +589,21 @@ impl ClawgMcp {
         Parameters(args): Parameters<DeleteMemoryArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         self.delete_memory_impl(args).await
+    }
+
+    #[tool(
+        name = "resolve_conflict",
+        description = "Settle a conflict listed under ACTIVE CONFLICTS by `recall_context`, once \
+                       the user has said which memory is right. `keep` stays; `other` is \
+                       superseded by it and stops being retrieved, but is still listed and comes \
+                       back if you resolve the pair the other way. Pass keep_both when the two \
+                       do not really contradict each other. Returns the status of both memories."
+    )]
+    async fn resolve_conflict(
+        &self,
+        Parameters(args): Parameters<ResolveConflictArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.resolve_conflict_impl(args).await
     }
 
     #[tool(
@@ -812,11 +856,12 @@ mod tests {
             "recall_context",
             "list_memories",
             "delete_memory",
+            "resolve_conflict",
             "memory_status",
         ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}: {names:?}");
         }
-        assert_eq!(names.len(), 6, "no extra tools: {names:?}");
+        assert_eq!(names.len(), 7, "no extra tools: {names:?}");
     }
 
     /// The memory viewer (`clawg memories`) is for the person at the terminal.
@@ -837,6 +882,7 @@ mod tests {
                 "list_memories",
                 "memory_status",
                 "recall_context",
+                "resolve_conflict",
                 "save_memory",
                 "search_memory",
             ]
@@ -1209,6 +1255,58 @@ mod tests {
             .expect("the call itself must succeed");
         assert!(is_error(&r), "a failed delete must be marked as an error");
         assert!(!text(&r).is_empty(), "an error result must explain itself");
+    }
+
+    #[tokio::test]
+    async fn resolve_conflict_reports_the_outcome() {
+        let mut store = None;
+        let (b, _d) = bridge_with(|runtime| {
+            store = Some(runtime.store.clone());
+            runtime
+        })
+        .await;
+        let mut ids = Vec::new();
+        for content in ["the deploy runs on fridays", "the deploy runs on mondays"] {
+            let saved = b
+                .save_memory_impl(
+                    "agent-mcp",
+                    SaveMemoryArgs { content: content.into(), memory_type: None, importance: None, project_path: None },
+                )
+                .await
+                .expect("save");
+            ids.push(text(&saved).strip_prefix("saved #").and_then(|n| n.parse::<i64>().ok()).expect("an id"));
+        }
+        let (old, new) = (ids[0], ids[1]);
+        store
+            .expect("the runtime's store")
+            .conn
+            .call(move |c| {
+                c.execute(
+                    &format!("UPDATE memory SET status = 'disputed', disputed_against = '[{old}]' WHERE id = {new}"),
+                    [],
+                )
+            })
+            .await
+            .expect("mark the dispute");
+
+        let r = b
+            .resolve_conflict_impl(ResolveConflictArgs { keep: new, other: old, keep_both: None })
+            .await
+            .expect("call");
+
+        assert!(!is_error(&r), "resolve failed: {}", text(&r));
+        assert_eq!(text(&r), format!("#{new} active\n#{old} superseded by #{new}"));
+    }
+
+    #[tokio::test]
+    async fn resolve_conflict_reports_a_refusal() {
+        let (b, _d) = bridge().await;
+        let r = b
+            .resolve_conflict_impl(ResolveConflictArgs { keep: 4, other: 4, keep_both: Some(true) })
+            .await
+            .expect("call");
+        assert!(is_error(&r));
+        assert!(text(&r).contains("itself"), "text was: {}", text(&r));
     }
 
     #[tokio::test]
