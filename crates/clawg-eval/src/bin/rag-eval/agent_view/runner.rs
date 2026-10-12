@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use clawg_cli::client::{ClientError, DaemonClient, SearchArgs};
-use clawg_cli::daemon::api::{serve_ephemeral, AppCtx};
+use clawg_cli::daemon::api::{serve_ephemeral, AppCtx, SAVE_CONFIRM_TIMEOUT};
 use clawg_cli::mcp::tools::{format_context, format_search};
 use clawg_core::eval_api::{EvalEmbedder, EvalError, EvalIngest, EvalTokenCounter};
 use clawg_core::paths::Profile;
@@ -98,6 +98,7 @@ async fn start(input: &AgentViewInput<'_>, scratch: &Path) -> Result<Session, Ru
         profile: Profile::Dev,
         started_at: Instant::now(),
         shutdown,
+        save_timeout: SAVE_CONFIRM_TIMEOUT,
     });
     let (addr, server) = serve_ephemeral(app).await.map_err(RunError::Serve)?;
     let client = DaemonClient::new(format!("http://{addr}"), TOKEN, scratch.to_path_buf());

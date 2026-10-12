@@ -731,7 +731,7 @@ pub(crate) mod tests {
     use clawg_core::paths::{store_lock_file, store_owner_file};
     use clawg_core::runtime::MemoryRuntime;
 
-    use crate::daemon::api::{router, AppCtx};
+    use crate::daemon::api::{router, AppCtx, SAVE_CONFIRM_TIMEOUT};
     use crate::daemon::lifecycle::{write_state, write_token, DaemonState};
 
     /// An in-process daemon plus the tempdir holding its lifecycle files.
@@ -754,6 +754,7 @@ pub(crate) mod tests {
             profile: Profile::Dev,
             started_at: Instant::now(),
             shutdown,
+            save_timeout: SAVE_CONFIRM_TIMEOUT,
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");

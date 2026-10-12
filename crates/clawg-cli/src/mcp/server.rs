@@ -505,7 +505,7 @@ mod tests {
 
     use clawg_core::runtime::MemoryRuntime;
 
-    use crate::daemon::api::{router, AppCtx};
+    use crate::daemon::api::{router, AppCtx, SAVE_CONFIRM_TIMEOUT};
     use crate::mcp::tools::CONTENT_PREVIEW_LIMIT;
 
     /// Brings up an in-process daemon and returns a bridge pointed at it.
@@ -522,6 +522,7 @@ mod tests {
             profile: Profile::Dev,
             started_at: Instant::now(),
             shutdown,
+            save_timeout: SAVE_CONFIRM_TIMEOUT,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr: SocketAddr = listener.local_addr().expect("addr");

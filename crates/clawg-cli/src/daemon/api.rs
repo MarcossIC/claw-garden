@@ -17,7 +17,7 @@
 //! nothing a port scan would not.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{Request, StatusCode};
@@ -31,6 +31,9 @@ use clawg_core::memory::admin::{
 };
 use clawg_core::memory::bootstrap::EmbedderStatus;
 use clawg_core::memory::embedder::EmbedRole;
+use clawg_core::memory::worker::{
+    ChunkOutcome, IngestFailure, IngestReport, IngestRequest, SavedChunk,
+};
 use clawg_core::memory::events::{MemoryEvent, MemorySource};
 use clawg_core::memory::prompt_builder::{build_memory_prompt, QueryTexts};
 use clawg_core::memory::{search_all_memories, RankedHit, SearchScope, TableKind};
@@ -39,6 +42,7 @@ use clawg_core::paths::Profile;
 use clawg_core::runtime::MemoryRuntime;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::oneshot;
 
 use super::lifecycle::now_ms;
 
@@ -63,7 +67,15 @@ pub struct AppCtx {
     /// Ctrl-C. A `watch` rather than a oneshot so the graceful-shutdown future
     /// can hold a receiver without consuming the sender's only send.
     pub shutdown: tokio::sync::watch::Sender<bool>,
+    /// How long a save waits for the worker to confirm it before answering
+    /// `202 unconfirmed`. [`SAVE_CONFIRM_TIMEOUT`] outside tests.
+    pub save_timeout: Duration,
 }
+
+/// How long a save waits for the worker. Long enough for a multi-chunk save
+/// on a slow CPU; past it the save is still queued and answers honestly that
+/// it is not confirmed.
+pub const SAVE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ── Error shape ─────────────────────────────────────────────────────────────
 
@@ -74,6 +86,9 @@ struct ErrorBody {
     detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     retryable: Option<bool>,
+    /// What a failed save stored before it stopped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memories: Option<Vec<SavedMemory>>,
 }
 
 /// Every failure this API can answer with, rendered as
@@ -88,11 +103,12 @@ pub struct ApiError {
     message: String,
     detail: Option<String>,
     retryable: Option<bool>,
+    memories: Option<Vec<SavedMemory>>,
 }
 
 impl ApiError {
     fn new(status: StatusCode, message: impl Into<String>) -> Self {
-        Self { status, message: message.into(), detail: None, retryable: None }
+        Self { status, message: message.into(), detail: None, retryable: None, memories: None }
     }
     /// The embedder will not load (or not yet, if `retryable`), so nothing
     /// that needs it can be served. `message` is a code a client branches on
@@ -121,7 +137,12 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = ErrorBody { error: self.message, detail: self.detail, retryable: self.retryable };
+        let body = ErrorBody {
+            error: self.message,
+            detail: self.detail,
+            retryable: self.retryable,
+            memories: self.memories,
+        };
         (self.status, Json(body)).into_response()
     }
 }
@@ -330,13 +351,40 @@ pub struct QueuedBody {
     pub status: &'static str,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, PartialEq, Serialize)]
 pub struct SaveBody {
     pub status: &'static str,
-    /// Why the save is queued instead of confirmed, when there is a reason a
-    /// client can act on.
+    /// Why the save is queued instead of confirmed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
+    /// One entry per stored chunk, in chunk order, once the save is confirmed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memories: Option<Vec<SavedMemory>>,
+}
+
+impl SaveBody {
+    fn queued(reason: &'static str) -> Self {
+        Self { status: "queued", reason: Some(reason), memories: None }
+    }
+}
+
+/// A row a save wrote or reinforced. `kind` is always `"memory"`, spelled out
+/// so the triple is exactly what `DELETE /v1/memories/{kind}/{id}` takes.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SavedMemory {
+    pub kind: &'static str,
+    pub id: i64,
+    pub outcome: &'static str,
+}
+
+impl From<SavedChunk> for SavedMemory {
+    fn from(chunk: SavedChunk) -> Self {
+        let outcome = match chunk.outcome {
+            ChunkOutcome::Inserted => "inserted",
+            ChunkOutcome::Reinforced => "reinforced",
+        };
+        Self { kind: "memory", id: chunk.id, outcome }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -456,19 +504,56 @@ async fn health(State(app): State<Arc<AppCtx>>) -> Json<HealthBody> {
     })
 }
 
-/// Queues a memory for ingest. Answers `202`, never `201`.
+/// How waiting for the worker's report on a save ended.
+#[derive(Debug)]
+enum Confirmation {
+    Reported(IngestReport),
+    /// The wait ran out, or the worker let go of the request without
+    /// answering (it was stopping). The event may still be stored later.
+    Unconfirmed,
+}
+
+/// The answer to a save that waited for the worker.
+fn save_response(confirmation: Confirmation) -> ApiResult<(StatusCode, SaveBody)> {
+    let report = match confirmation {
+        Confirmation::Unconfirmed => return Ok((StatusCode::ACCEPTED, SaveBody::queued("unconfirmed"))),
+        Confirmation::Reported(report) => report,
+    };
+    let memories: Vec<SavedMemory> = report.memories.into_iter().map(SavedMemory::from).collect();
+    let error = match report.failure {
+        None => {
+            return Ok((
+                StatusCode::CREATED,
+                SaveBody { status: "saved", reason: None, memories: Some(memories) },
+            ));
+        }
+        Some(IngestFailure::EmbedderUnavailable) => ApiError {
+            detail: Some(IngestFailure::EmbedderUnavailable.to_string()),
+            ..ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "embedder_unavailable")
+        },
+        Some(IngestFailure::Failed(detail)) => ApiError {
+            detail: Some(detail),
+            ..ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "ingest_failed")
+        },
+    };
+    Err(ApiError { memories: Some(memories), ..error })
+}
+
+/// Saves a memory and answers with the rows it wrote: `201` once the worker
+/// confirms, `202` when it cannot wait for that.
 ///
-/// # Why the save is asynchronous
+/// # Why the worker does the writing
 ///
-/// The row does not exist when this returns, and that is the design, not a
-/// shortcut. Ingest chunks the text, embeds every chunk and runs the dedup
-/// gate — and that gate is only correct while ONE sequential consumer drains
-/// the channel (see `MemoryRuntime::ingest_worker`). Answering synchronously
-/// would mean either doing that work on the request thread, which makes a save
-/// wait on a model, or letting a second writer in behind the worker's back,
-/// which is how a duplicate becomes two rows instead of one reinforcement.
-/// So the contract is "accepted", and a client that must see the row polls
-/// `GET /v1/memories`.
+/// Ingest chunks the text, embeds every chunk and runs the dedup gate, and
+/// that gate is only correct while ONE sequential consumer drains the channel
+/// (see `MemoryRuntime::ingest_worker`). Writing here instead would let a
+/// second writer in behind the worker's back, which is how a duplicate becomes
+/// two rows instead of one reinforcement. So the handler queues the event with
+/// a reply channel and waits for the worker's report, up to
+/// `AppCtx::save_timeout`.
+///
+/// While the model loads the handler does not wait at all: the first load can
+/// be a 470 MB download, and the save answers `202 embedder_loading` instead.
 async fn save_memory(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<SaveRequest>,
@@ -478,12 +563,12 @@ async fn save_memory(
     }
     // Refused before it is queued: with no embedder coming, a queued save
     // would sit in memory until the daemon stops and then be lost.
-    let reason = match app.runtime.embedder_status() {
+    let wait = match app.runtime.embedder_status() {
         EmbedderStatus::Failed { error, retryable } => {
             return Err(ApiError::embedder_failed(error, retryable));
         }
-        EmbedderStatus::Loading => Some("embedder_loading"),
-        EmbedderStatus::Ready => None,
+        EmbedderStatus::Loading => false,
+        EmbedderStatus::Ready => true,
     };
 
     let event = MemoryEvent {
@@ -502,14 +587,27 @@ async fn save_memory(
         importance: body.importance,
     };
 
-    app.runtime.memory_tx.try_send(event.into()).map_err(|e| match e {
+    let (reply, report) = if wait {
+        let (tx, rx) = oneshot::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    app.runtime.memory_tx.try_send(IngestRequest { event, reply }).map_err(|e| match e {
         TrySendError::Full(_) => ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "ingest_queue_full"),
         TrySendError::Closed(_) => {
             ApiError::internal("the ingest worker has stopped; restart the daemon")
         }
     })?;
 
-    Ok((StatusCode::ACCEPTED, Json(SaveBody { status: "queued", reason })))
+    let Some(report) = report else {
+        return Ok((StatusCode::ACCEPTED, Json(SaveBody::queued("embedder_loading"))));
+    };
+    let confirmation = match tokio::time::timeout(app.save_timeout, report).await {
+        Ok(Ok(report)) => Confirmation::Reported(report),
+        Ok(Err(_)) | Err(_) => Confirmation::Unconfirmed,
+    };
+    save_response(confirmation).map(|(status, body)| (status, Json(body)))
 }
 
 async fn search(
@@ -685,6 +783,49 @@ async fn shutdown(State(app): State<Arc<AppCtx>>) -> (StatusCode, Json<QueuedBod
 mod tests {
     use super::*;
 
+    fn chunk(id: i64, outcome: ChunkOutcome) -> SavedChunk {
+        SavedChunk { id, outcome }
+    }
+
+    #[test]
+    fn save_response_covers_every_worker_answer() {
+        let saved = save_response(Confirmation::Reported(IngestReport {
+            memories: vec![chunk(57, ChunkOutcome::Inserted), chunk(12, ChunkOutcome::Reinforced)],
+            failure: None,
+        }))
+        .expect("a clean report is a success");
+        assert_eq!(saved.0, StatusCode::CREATED);
+        assert_eq!(
+            saved.1.memories,
+            Some(vec![
+                SavedMemory { kind: "memory", id: 57, outcome: "inserted" },
+                SavedMemory { kind: "memory", id: 12, outcome: "reinforced" },
+            ])
+        );
+
+        let unconfirmed = save_response(Confirmation::Unconfirmed).expect("not an error");
+        assert_eq!(unconfirmed, (StatusCode::ACCEPTED, SaveBody::queued("unconfirmed")));
+
+        let partial = save_response(Confirmation::Reported(IngestReport {
+            memories: vec![chunk(57, ChunkOutcome::Inserted)],
+            failure: Some(IngestFailure::Failed("store insert failed: disk full".into())),
+        }))
+        .expect_err("a failure is an error");
+        assert_eq!(partial.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(partial.message, "ingest_failed");
+        assert_eq!(partial.detail.as_deref(), Some("store insert failed: disk full"));
+        assert_eq!(partial.memories, Some(vec![SavedMemory { kind: "memory", id: 57, outcome: "inserted" }]));
+
+        let unavailable = save_response(Confirmation::Reported(IngestReport {
+            memories: vec![],
+            failure: Some(IngestFailure::EmbedderUnavailable),
+        }))
+        .expect_err("a failure is an error");
+        assert_eq!(unavailable.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable.message, "embedder_unavailable");
+        assert_eq!(unavailable.memories, Some(vec![]));
+    }
+
     #[tokio::test]
     async fn serve_ephemeral_answers_over_http_on_the_address_it_returns() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -696,6 +837,7 @@ mod tests {
             profile: Profile::Dev,
             started_at: Instant::now(),
             shutdown,
+            save_timeout: SAVE_CONFIRM_TIMEOUT,
         });
 
         let (addr, server) = serve_ephemeral(app).await.expect("bind an ephemeral loopback port");

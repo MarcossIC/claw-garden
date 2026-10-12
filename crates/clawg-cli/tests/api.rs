@@ -11,11 +11,11 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use clawg_cli::daemon::api::{router, AppCtx};
+use clawg_cli::daemon::api::{router, AppCtx, SAVE_CONFIRM_TIMEOUT};
 use clawg_core::memory::bootstrap::EmbedderStatus;
-use clawg_core::memory::embedder::{Embedder, FakeEmbedder};
+use clawg_core::memory::embedder::{EmbedError, EmbedRole, Embedder, FakeEmbedder};
 use clawg_core::memory::worker::IngestRequest;
 use clawg_core::paths::Profile;
 use clawg_core::runtime::{MemoryRuntime, INGEST_QUEUE_CAPACITY};
@@ -35,7 +35,38 @@ enum EmbedderState {
     /// The model is still loading and no worker drains the queue, so a test
     /// can fill it.
     LoadingWithoutWorker,
+    /// The embedder is ready but no worker runs, so no save is ever confirmed.
+    ReadyWithoutWorker,
+    /// The embedder loaded but every embedding call fails.
+    FailingEmbedder,
 }
+
+/// An embedder that loaded and then fails every call, as a broken ONNX
+/// session would.
+struct FailingEmbedder;
+
+#[async_trait::async_trait]
+impl Embedder for FailingEmbedder {
+    async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+        Err(EmbedError::InferenceFailed("onnx session crashed".into()))
+    }
+    fn dimensions(&self) -> usize {
+        384
+    }
+    fn model_id(&self) -> &str {
+        "failing"
+    }
+    fn query_prefix(&self) -> &str {
+        ""
+    }
+    fn passage_prefix(&self) -> &str {
+        ""
+    }
+}
+
+/// How long a test daemon waits for the worker to confirm a save when the
+/// test is about the wait running out.
+const SHORT_CONFIRM_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Swaps in a fresh, EMPTY embedder cell while moving every other handle
 /// across untouched — the cheapest way to reproduce a pre-bootstrap daemon
@@ -86,6 +117,16 @@ impl Harness {
         Self::start_inner(EmbedderState::Failed { error, retryable }).await
     }
 
+    /// Daemon with a ready embedder whose saves are never confirmed.
+    async fn start_without_worker() -> Self {
+        Self::start_inner(EmbedderState::ReadyWithoutWorker).await
+    }
+
+    /// Daemon whose embedder fails every call.
+    async fn start_with_failing_embedder() -> Self {
+        Self::start_inner(EmbedderState::FailingEmbedder).await
+    }
+
     /// Daemon whose model is loading, with an undrained queue of `capacity`.
     async fn start_loading_with_queue(capacity: usize) -> Self {
         Self::start_with(EmbedderState::LoadingWithoutWorker, capacity).await
@@ -105,6 +146,10 @@ impl Harness {
         // ever land, which is exactly the bug these tests exist to catch. It
         // clones its handles when it is created, so what it holds is whatever
         // the runtime had at that moment.
+        let save_timeout = match embedder {
+            EmbedderState::ReadyWithoutWorker => SHORT_CONFIRM_TIMEOUT,
+            _ => SAVE_CONFIRM_TIMEOUT,
+        };
         let (runtime, ingest_rx) = match embedder {
             EmbedderState::Ready => {
                 tokio::spawn(runtime.ingest_worker(rx));
@@ -126,6 +171,13 @@ impl Harness {
             EmbedderState::LoadingWithoutWorker => {
                 (with_empty_embedder(runtime, EmbedderStatus::Loading), Some(rx))
             }
+            EmbedderState::ReadyWithoutWorker => (runtime, Some(rx)),
+            EmbedderState::FailingEmbedder => {
+                let runtime = with_empty_embedder(runtime, EmbedderStatus::Ready);
+                runtime.embedder.set(Arc::new(FailingEmbedder) as Arc<dyn Embedder>).ok();
+                tokio::spawn(runtime.ingest_worker(rx));
+                (runtime, None)
+            }
         };
 
         let token = "test-token-0123456789abcdef".to_string();
@@ -136,6 +188,7 @@ impl Harness {
             profile: Profile::Dev,
             started_at: Instant::now(),
             shutdown,
+            save_timeout,
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -376,7 +429,7 @@ async fn a_save_into_a_full_queue_is_503_queue_full() {
 const CONTENT: &str = "the deployment pipeline uses blue green releases on fridays";
 
 #[tokio::test]
-async fn a_saved_memory_is_queued_then_becomes_a_listable_row() {
+async fn a_saved_memory_is_a_listable_row_when_the_save_returns() {
     let h = Harness::start().await;
 
     let (status, body) = h
@@ -390,10 +443,13 @@ async fn a_saved_memory_is_queued_then_becomes_a_listable_row() {
             }),
         )
         .await;
-    assert_eq!(status, 202, "save must be accepted, not completed: {body}");
-    assert_eq!(body["status"], "queued");
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["status"], "saved");
 
-    let items = h.wait_for_rows("memory", 1).await;
+    let (status, list) = h.get_json("/v1/memories?kind=memory").await;
+    assert_eq!(status, 200);
+    let items = list["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "the row must exist by the time the save answers");
     let row = &items[0];
     assert_eq!(row["kind"], "memory");
     assert_eq!(row["agent_id"], "agent-http");
@@ -403,6 +459,83 @@ async fn a_saved_memory_is_queued_then_becomes_a_listable_row() {
         "an explicit save must honour the caller's declared type"
     );
     assert_eq!(row["importance"], 8.0);
+}
+
+#[tokio::test]
+async fn a_save_answers_201_with_the_id_of_the_row_it_wrote() {
+    let h = Harness::start().await;
+    let (status, body) = h
+        .post_json("/v1/memories", json!({ "content": "the train leaves on tuesdays", "agent_id": "a" }))
+        .await;
+
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["status"], "saved");
+    let memories = body["memories"].as_array().expect("memories");
+    assert_eq!(memories.len(), 1);
+    assert_eq!(memories[0]["kind"], "memory");
+    assert_eq!(memories[0]["outcome"], "inserted");
+    let id = memories[0]["id"].as_i64().expect("id");
+
+    let (status, item) = h.get_json(&format!("/v1/memories/memory/{id}")).await;
+    assert_eq!(status, 200, "{item}");
+    assert_eq!(item["item"]["summary"], "the train leaves on tuesdays");
+}
+
+#[tokio::test]
+async fn a_multi_chunk_save_returns_one_id_per_chunk() {
+    let h = Harness::start().await;
+    // Distinct words, long enough for three windows of the fallback chunker.
+    let content = (0..700).map(|i| format!("w{i:05}")).collect::<Vec<_>>().join(" ");
+    let (status, body) = h.post_json("/v1/memories", json!({ "content": content, "agent_id": "a" })).await;
+
+    assert_eq!(status, 201, "{body}");
+    let memories = body["memories"].as_array().expect("memories");
+    assert_eq!(memories.len(), 3, "{body}");
+    assert!(memories.iter().all(|m| m["outcome"] == "inserted"));
+    let mut ids: Vec<i64> = memories.iter().map(|m| m["id"].as_i64().unwrap()).collect();
+    ids.dedup();
+    assert_eq!(ids.len(), 3, "each chunk has its own row: {body}");
+}
+
+#[tokio::test]
+async fn saving_the_same_text_twice_returns_the_same_id_as_reinforced() {
+    let h = Harness::start().await;
+    let save = || h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a" }));
+
+    let (_, first) = save().await;
+    let (status, second) = save().await;
+
+    assert_eq!(status, 201, "{second}");
+    assert_eq!(second["memories"].as_array().map(Vec::len), Some(1));
+    assert_eq!(second["memories"][0]["id"], first["memories"][0]["id"]);
+    assert_eq!(second["memories"][0]["outcome"], "reinforced");
+    let (_, list) = h.get_json("/v1/memories?kind=memory").await;
+    assert_eq!(list["items"].as_array().map(Vec::len), Some(1));
+}
+
+#[tokio::test]
+async fn a_failed_embed_reaches_the_caller_as_an_error() {
+    let h = Harness::start_with_failing_embedder().await;
+    let (status, body) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a" })).await;
+
+    assert_eq!(status, 500, "{body}");
+    assert_eq!(body["error"], "ingest_failed");
+    assert!(body["detail"].as_str().is_some_and(|d| d.contains("onnx session crashed")), "{body}");
+    assert_eq!(body["memories"], json!([]));
+    let (_, list) = h.get_json("/v1/memories?kind=memory").await;
+    assert_eq!(list["items"].as_array().map(Vec::len), Some(0));
+}
+
+#[tokio::test]
+async fn a_save_the_worker_does_not_confirm_in_time_answers_202_unconfirmed() {
+    let h = Harness::start_without_worker().await;
+    let started = Instant::now();
+    let (status, body) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a" })).await;
+
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(body["status"], "queued");
+    assert_eq!(body["reason"], "unconfirmed");
+    assert!(started.elapsed() < Duration::from_secs(1), "took {:?}", started.elapsed());
 }
 
 #[tokio::test]

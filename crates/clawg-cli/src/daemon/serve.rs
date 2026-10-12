@@ -16,7 +16,7 @@ use clawg_core::memory::MemoryError;
 use clawg_core::paths::{data_dir, Profile};
 use clawg_core::runtime::MemoryRuntime;
 
-use super::api::{router, AppCtx};
+use super::api::{router, AppCtx, SAVE_CONFIRM_TIMEOUT};
 use super::lifecycle::{
     clear_state, generate_token, now_ms, write_state, write_token, DaemonState, LifecycleError,
 };
@@ -127,6 +127,7 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
         profile,
         started_at: Instant::now(),
         shutdown: shutdown_tx,
+        save_timeout: SAVE_CONFIRM_TIMEOUT,
     });
 
     log::info!(
