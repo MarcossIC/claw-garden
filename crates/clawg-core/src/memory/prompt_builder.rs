@@ -296,7 +296,7 @@ fn format_hit_line(hit: &RankedHit) -> String {
     )
 }
 
-/// Formats a conflict pair into a 4-line block.
+/// Formats a conflict pair into a 5-line block.
 fn format_conflict_pair(p: &ConflictPair) -> String {
     let (oy, om, od) = unix_millis_to_ymd(p.old_created_at);
     let (ny, nm, nd) = unix_millis_to_ymd(p.new_created_at);
@@ -304,7 +304,8 @@ fn format_conflict_pair(p: &ConflictPair) -> String {
         "[{oy:04}-{om:02}-{od:02}] OLD: \"{}\" [memory:{}, importance:{:.0}, tier:{}]\n\
          [{ny:04}-{nm:02}-{nd:02}] NEW: \"{}\" [memory:{}, importance:{:.0}, status:disputed]\n\
          NOTE: estas memorias se contradicen y aún no resolviste cuál vale.\n\
-         Si vas a tomar una decisión que dependa de esto, preguntale al usuario.",
+         Si vas a tomar una decisión que dependa de esto, preguntale al usuario.\n\
+         Con su respuesta, llamá a resolve_conflict (keep = la que vale, other = la otra).",
         p.old_content, p.old_id, p.old_importance, p.old_tier,
         p.new_content, p.new_id, p.new_importance,
     )
@@ -551,6 +552,24 @@ mod tests {
                 "rendered year {y} is not a date anyone lived through: {line}"
             );
         }
+    }
+
+    #[test]
+    fn the_conflict_note_names_the_tool() {
+        let pair = ConflictPair {
+            old_id: 11,
+            old_created_at: TimestampMs::from_unix_millis(1_690_000_000_000),
+            old_content: "old fact".to_string(),
+            old_importance: 8.0,
+            old_tier: 2,
+            new_id: 22,
+            new_created_at: TimestampMs::from_unix_millis(1_700_000_000_000),
+            new_content: "new fact".to_string(),
+            new_importance: 8.0,
+        };
+        let block = format_conflict_pair(&pair);
+        let note = block.lines().last().expect("a note line");
+        assert!(note.contains("resolve_conflict"), "{block}");
     }
 
     #[test]

@@ -353,6 +353,7 @@ En Windows usá la ruta completa a `clawg.exe`. Los nombres `clawg-dev` y `clawg
 - `recall_context`: devuelve un bloque de contexto listo para leer (notas del workspace, memorias recientes y de largo plazo) para una consulta.
 - `list_memories`: recorre las memorias guardadas, las más nuevas primero, sin buscar.
 - `delete_memory`: borra una memoria por id y tipo.
+- `resolve_conflict`: cierra un conflicto de ACTIVE CONFLICTS con la respuesta del usuario: una memoria queda y la otra pasa a reemplazada, o quedan las dos.
 - `memory_status`: informa si el daemon está corriendo, su perfil y su directorio de datos, y si el modelo de embeddings ya cargó.
 
 ### Perfiles y datos
