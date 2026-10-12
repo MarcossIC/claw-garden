@@ -1,13 +1,13 @@
 change: secret-hygiene
 objective: "1,4"
 depends_on: []
-phase: explore
+phase: tasks
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
   apply: pending
   verify: pending
   archive: pending

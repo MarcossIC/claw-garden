@@ -33,7 +33,7 @@ exploration -> proposal -> spec (+ design si hace falta) -> tasks -> apply -> ve
 | 10 | [mcp-protocol-upgrade](changes/mcp-protocol-upgrade/exploration.md) | 4 | M | 6 (identidad) | exploración |
 | 11 | [knowledge-synthesis](changes/knowledge-synthesis/exploration.md) | 5 | decisión | — | exploración |
 | 12 | [project-indexing](changes/project-indexing/exploration.md) | 3 | decisión | 5 | exploración |
-| 13 | [secret-hygiene](changes/secret-hygiene/exploration.md) | 1, 4 | S | — (tiene que cerrar antes de 6) | exploración |
+| 13 | [secret-hygiene](changes/secret-hygiene/proposal.md) | 1, 4 | S–M | — (tiene que cerrar antes de 6) | tareas: propuesta, spec y diseño listos |
 | 14 | [context-density](changes/context-density/exploration.md) | 1 | S–M | — (se suma a 9) | exploración |
 | 15 | [long-save-context](changes/long-save-context/exploration.md) | 1 | S–M | 5, después de 9 (1 si toca el esquema) | exploración |
 
