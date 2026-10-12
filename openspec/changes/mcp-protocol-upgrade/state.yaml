@@ -1,14 +1,14 @@
 change: mcp-protocol-upgrade
 objective: "4"
 depends_on: []  # visibility-policy sólo para --agent, que queda fuera de alcance (ver proposal.md)
-phase: apply
+phase: verify
 artifacts:
   exploration: done
   proposal: done
   spec: done
   design: done
   tasks: done
-  apply: in_progress
-  verify: pending
+  apply: done
+  verify: in_progress  # faltan Windows y Claude Code real (máquina de Marcos)
   archive: pending
 updated: 2026-10-12
