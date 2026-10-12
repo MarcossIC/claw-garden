@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 2 | M | data-preservation parte B (snapshot antes de migrar) | verify |
+| 2 | M | data-preservation parte B (snapshot antes de migrar) | archivado |
 
 ## Problema
 

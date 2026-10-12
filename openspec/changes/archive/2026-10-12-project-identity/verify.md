@@ -1,6 +1,6 @@
 # project-identity — Verificación
 
-**Estado:** Linux completo. Quedan pendientes dos pasos que necesitan Windows y la máquina de Marcos.
+**Estado:** Linux completo. Se archivó con dos pasos pendientes que necesitan Windows y la máquina de Marcos (abajo). Si alguno falla, el arreglo va en un cambio nuevo.
 
 ## Tests
 
@@ -39,3 +39,5 @@ No aplica: el cambio no toca el ranking ni el golden set, que no usa `project_id
 ## Dependencia
 
 El cambio de storage (backups, partes B + C de data-preservation, rama `claude/storage-sdd-xv8bd2`) no agrega migraciones, así que V9 no choca. Con storage, `MemoryStore::open` toma un snapshot antes de aplicar migraciones pendientes, y eso cubre el backup antes de V9. También rechaza una base con checksums distintos de `PINNED`; V9 ya tiene su fila ahí. Orden de merge: storage primero, después este cambio, rebaseado sobre él. El re-key no depende del snapshot para deshacerse: `project_rekey` guarda cada fila movida.
+
+Cuando storage esté en `main`, queda una mejora opcional para un cambio aparte: tomar un snapshot (`MemoryRuntime::snapshot`, con una razón nueva `PreRekey`) antes de un registro que vaya a mover filas. Hoy el re-key ya se puede deshacer con `project_rekey`; el snapshot sería una segunda red.
