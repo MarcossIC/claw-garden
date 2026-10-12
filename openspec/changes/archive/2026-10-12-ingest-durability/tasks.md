@@ -83,7 +83,7 @@ El orden va de adentro hacia afuera: primero el worker y el runtime (`clawg-core
 
 ## 10. Verificación
 
-- [x] 10.1 `cargo test --workspace`: reportar el conteo contra la base de 1.304, con 0 fallos.
+- [x] 10.1 `cargo test --workspace`: reportar el conteo contra la base de 1.304, con 0 fallos (hecho en Linux y en Windows; el único fallo en Windows es un fixture fuera de git, ver `verify.md`).
 - [x] 10.2 Repetir la medición de 0.2 con el código nuevo y reportar el p50 y el p99 antes y después. **Necesita autorización**, igual que 0.2.
 - [x] 10.3 Prueba manual en el perfil dev, **con autorización**:
   - un `save_memory` devuelve `saved #N`;

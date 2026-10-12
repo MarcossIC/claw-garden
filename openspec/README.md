@@ -21,7 +21,7 @@ exploration -> proposal -> spec (+ design si hace falta) -> tasks -> apply -> ve
 | # | Cambio | Objetivo | Tamaño | Depende de | Estado |
 |---|--------|----------|--------|------------|--------|
 | 1 | [data-preservation](changes/archive/2026-10-12-data-preservation/proposal.md) | transversal | M (partes A + F; B–E siguen en la [exploración](changes/archive/2026-10-12-data-preservation/exploration.md#alcance-candidato-partes)) | — | A + F archivadas el 2026-10-12 ([`specs/storage`](specs/storage/spec.md)); B + C, D y E sin cambio propio todavía |
-| 2 | [ingest-durability](changes/ingest-durability/proposal.md) | 1 | M | — | verificado, falta archivar |
+| 2 | [ingest-durability](changes/archive/2026-10-12-ingest-durability/proposal.md) | 1 | M | — | archivado el 2026-10-12 ([`specs/ingest`](specs/ingest/spec.md)) |
 | 3 | [retrieval-hygiene](changes/retrieval-hygiene/proposal.md) | 1 | S | — | verificación (falta rag-eval) |
 | 4 | [project-identity](changes/project-identity/exploration.md) | 2 | M | 1 (backup antes del re-key) | exploración |
 | 5 | [eval-golden-expansion](changes/eval-golden-expansion/exploration.md) | medición | M | — | exploración |

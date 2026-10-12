@@ -1,7 +1,7 @@
 # ingest-durability — Verificación
 
 **Código:** PR #6, una tarea por commit, más el merge con data-preservation.
-**Estado:** los doce requisitos tienen su test en verde, y la medición y la prueba manual están hechas.
+**Estado:** verificado. Los doce requisitos tienen su test en verde en Linux y en Windows, y la medición y la prueba manual están hechas.
 
 ## Suite
 
@@ -12,7 +12,18 @@
 | PR #6 | 1464 | 11 |
 
 - **Los 11 que fallan, fallan igual en `main`.** Son tests que sólo pasan en Windows: `doctor::tests::*` (7) y los fixtures de `rag-eval` en `diff`/`report` (4). Ninguno toca este cambio.
-- **La base de 1304 de `config.yaml`** se midió en Windows. Falta correrla en Windows para comparar contra esa cifra.
+- **La base de 1304 de `config.yaml`** se midió en Windows. En Linux la suite tiene más tests y estos 11 fallos de plataforma.
+
+`cargo test --workspace --no-fail-fast --target-dir <otro-dir>` en Windows, sobre `main` en `068c101`:
+
+| | Passed | Failed |
+|---|---|---|
+| `main` (`068c101`) | 1479 | 1 |
+
+- Los 7 de `doctor::tests` que fallan en Linux pasan acá.
+- **El único que falla** es `report::tests::a_committed_results_file_without_the_block_still_diffs_against_one_with_it` (`rag-eval`). Lee `docs/eval/results/2026-08-15-fake.json`, que está fuera de git (`.gitignore`: `docs/eval/**`) y no existe en esta máquina. No toca este cambio. Es el mismo fallo que registró la verificación de data-preservation sobre `791ad6b`.
+- Contra la base de 1304: +175 tests, que suman este cambio y los demás mergeados después de medir esa base.
+- **Warnings:** 9, los mismos.
 - **`rag-eval`:** no aplica, no cambia ranking ni recuperación.
 
 ## Requisitos
@@ -43,3 +54,13 @@ En el perfil dev de un entorno aislado, no en una máquina de usuario. El binari
 2. **Vuelve la red.** El servidor local pasó a reenviar a huggingface. En el siguiente reintento (30 s) el modelo se descargó y verificó, y `clawg status` mostró `ready` con el mismo pid: sin reiniciar.
 3. **`save_memory` por MCP** (`clawg mcp --no-autostart`) respondió `saved #1`. El mismo texto otra vez respondió `already stored as #1; reinforced it instead of saving a copy`.
 4. **`delete_memory`** con `kind: memory, id: 1` respondió `deleted 1`. Repetirlo dio `404`, y `list_memories` quedó vacío.
+
+## Diferencias con la spec al consolidar
+
+Al pasar la spec a `specs/ingest/spec.md` se contrastó cada afirmación con el código. La spec principal dice lo que hace el código:
+
+- **Canal cerrado:** si el worker ya no existe, el save responde `500` (`ApiError::internal`), no `503` (`crates/clawg-cli/src/daemon/api.rs:619`). La spec no lo cubría.
+- **`memories` en un error:** incluye los chunks reforzados además de los insertados, en orden (`crates/clawg-core/src/memory/worker.rs:455-468`). La spec decía "escritos".
+- **Contenido vacío:** también rechaza el que tiene sólo espacios, y el `400` va antes de mirar el estado del embedder. El test es `saving_empty_content_is_rejected_before_it_reaches_the_queue`.
+- **`/v1/search`:** responde `embedder_not_ready` también con el embedder `ready` y la celda vacía, no sólo con `loading`.
+- **Tests renombrados:** `a_saved_memory_is_queued_then_becomes_a_listable_row` pasó a ser `a_saved_memory_is_a_listable_row_when_the_save_returns`, y `save_then_list_then_search_then_delete_through_the_tools` fue reemplazado por `save_memory_returns_the_id_that_delete_memory_accepts`.

@@ -1,7 +1,7 @@
 change: ingest-durability
 objective: "1"
 depends_on: []
-phase: verify
+phase: archived
 artifacts:
   exploration: done
   proposal: done
@@ -10,5 +10,6 @@ artifacts:
   tasks: done
   apply: done
   verify: done
-  archive: pending
+  archive: done
+main_spec: openspec/specs/ingest/spec.md
 updated: 2026-10-12
