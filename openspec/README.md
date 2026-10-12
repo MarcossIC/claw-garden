@@ -20,7 +20,7 @@ exploration -> proposal -> spec (+ design si hace falta) -> tasks -> apply -> ve
 
 | # | Cambio | Objetivo | Tamaño | Depende de | Estado |
 |---|--------|----------|--------|------------|--------|
-| 1 | [data-preservation](changes/data-preservation/proposal.md) | transversal | M (partes A + F; B–E siguen en la exploración) | — | verificación (falta la prueba manual) |
+| 1 | [data-preservation](changes/archive/2026-10-12-data-preservation/proposal.md) | transversal | M (partes A + F; B–E siguen en la [exploración](changes/archive/2026-10-12-data-preservation/exploration.md#alcance-candidato-partes)) | — | A + F archivadas el 2026-10-12 ([`specs/storage`](specs/storage/spec.md)); B + C, D y E sin cambio propio todavía |
 | 2 | [ingest-durability](changes/ingest-durability/proposal.md) | 1 | M | — | verificado, falta archivar |
 | 3 | [retrieval-hygiene](changes/retrieval-hygiene/proposal.md) | 1 | S | — | verificación (falta rag-eval) |
 | 4 | [project-identity](changes/project-identity/exploration.md) | 2 | M | 1 (backup antes del re-key) | exploración |
@@ -126,4 +126,5 @@ Ideas y afirmaciones contrastadas con el código. Las descartadas quedan con su 
 
 - **Comentario desactualizado** en `crates/clawg-core/src/memory/worker.rs:344-355`: dice que ningún chunk carga afirmaciones, y los saves explícitos sí la cargan.
 - **`#[allow(dead_code)]` en el chunker** (`ChunkerKind::Code`): viola la convención del proyecto. Se resuelve con knowledge-synthesis o project-indexing.
+- **`clawg stop` mientras carga el modelo:** el apagado ordenado termina en 1–3 s, pero el proceso sigue vivo hasta que vuelve la carga del embedder. La carga corre en `spawn_blocking` (`crates/clawg-core/src/memory/bootstrap.rs:318`), y el runtime de `#[tokio::main]` (`crates/clawg-cli/src/main.rs:30`) espera a esas tareas. Con el binario debug, una vez se pasó de `STOP_TIMEOUT` y `stop` salió con 1. Los datos no corren riesgo: el volcado y el checkpoint terminan antes. Después de "stopped", el log dice "model load task panicked: task N was cancelled" y "retrying in 30s", y eso confunde. Un arreglo posible es `shutdown_timeout` del runtime cuando `serve::run` vuelve. Detalle en el `verify.md` archivado de data-preservation.
 - **`enum Scope` sin uso** (`crates/clawg-core/src/memory/record.rs:19`): se exporta, pero el insert escribe el literal `"agent"` (`store_insert.rs:177`). Se resuelve con visibility-policy: se usa o se borra.

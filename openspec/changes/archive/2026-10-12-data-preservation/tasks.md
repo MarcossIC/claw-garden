@@ -62,4 +62,4 @@ Los mensajes de commit son sugeridos. No mencionan planes, fases ni specs.
 ## Verificación
 
 - [x] `cargo test --workspace`: reportar el conteo contra la base de 1304. Ver `verify.md`.
-- [ ] Prueba manual en el perfil dev, **sólo con autorización** (hecha a medias con un HOME temporal, ver `verify.md`): arrancar el daemon, guardar mientras el modelo carga, `clawg stop`, comprobar que existe `ingest-pending.jsonl`, arrancar de nuevo y comprobar que las filas aparecen y el archivo ya no está.
+- [x] Prueba manual en el perfil dev, **sólo con autorización** (hecha en Windows el 2026-10-12, ver `verify.md`): arrancar el daemon, guardar mientras el modelo carga, `clawg stop`, comprobar que existe `ingest-pending.jsonl`, arrancar de nuevo y comprobar que las filas aparecen y el archivo ya no está.
