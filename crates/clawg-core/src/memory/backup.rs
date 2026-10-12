@@ -51,6 +51,13 @@ pub fn known_migrations() -> Vec<MigrationId> {
         .collect()
 }
 
+/// The newest migration this binary knows, so tests do not assume a count
+/// that the next migration changes.
+#[cfg(test)]
+pub(crate) fn latest_known() -> i32 {
+    known_migrations().iter().map(|m| m.version).max().unwrap_or(0)
+}
+
 /// What opening a database with this binary would do to its schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaPlan {
@@ -787,8 +794,11 @@ mod tests {
         rusqlite::Connection::open(newer_dir.path().join("memory.db"))
             .unwrap()
             .execute_batch(
-                "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
-                 VALUES (9, 'from_the_future', '2026-10-12T00:00:00Z', '1')",
+                &format!(
+                    "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+                     VALUES ({}, 'from_the_future', '2026-10-12T00:00:00Z', '1')",
+                    latest_known() + 1
+                ),
             )
             .unwrap();
         let newer = newer_dir.path().join("memory.db");
@@ -798,7 +808,7 @@ mod tests {
         for (file, why) in [
             (&text, "not a database"),
             (&foreign, "no clawg migration history"),
-            (&newer, "V9"),
+            (&newer, "newer than"),
             (&missing, "no such file"),
         ] {
             let err = restore(dir.path(), file).unwrap_err();
@@ -868,7 +878,7 @@ mod tests {
             .call(|c| c.query_row("SELECT MAX(version) FROM refinery_schema_history", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(top, 8);
+        assert_eq!(top, latest_known());
         let reasons: Vec<Option<Reason>> = files_in(&dir.path().join("backups"))
             .iter()
             .map(|n| parse_snapshot_name(n))
@@ -888,8 +898,11 @@ mod tests {
         rusqlite::Connection::open(dir.path().join("memory.db"))
             .unwrap()
             .execute_batch(
-                "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
-                 VALUES (9, 'from_the_future', '2026-10-12T00:00:00Z', '1')",
+                &format!(
+                    "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+                     VALUES ({}, 'from_the_future', '2026-10-12T00:00:00Z', '1')",
+                    latest_known() + 1
+                ),
             )
             .unwrap();
         let files = files_in(dir.path());
@@ -900,9 +913,12 @@ mod tests {
         assert_eq!(
             probe,
             StoreProbe {
-                state: ProbeState::Schema(SchemaPlan::Newer { db: 9, binary: 8 }),
-                db_version: Some(9),
-                binary_version: 8,
+                state: ProbeState::Schema(SchemaPlan::Newer {
+                    db: latest_known() + 1,
+                    binary: latest_known(),
+                }),
+                db_version: Some(latest_known() + 1),
+                binary_version: latest_known(),
             }
         );
         assert_eq!(std::fs::read(dir.path().join("memory.db")).unwrap(), before);

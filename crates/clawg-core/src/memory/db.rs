@@ -669,8 +669,11 @@ mod tests {
         seed_on_disk(dir.path(), None).await;
         tamper(
             dir.path(),
-            "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
-             VALUES (9, 'from_the_future', '2026-10-12T00:00:00Z', '1')",
+            &format!(
+                "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+                 VALUES ({}, 'from_the_future', '2026-10-12T00:00:00Z', '1')",
+                backup::latest_known() + 1
+            ),
         );
         let before = std::fs::read(dir.path().join("memory.db")).unwrap();
 
@@ -679,7 +682,11 @@ mod tests {
             .err()
             .expect("a newer database must not open");
 
-        assert!(matches!(err, MemoryError::SchemaNewer { db: 9, binary: 8 }), "got {err:?}");
+        let latest = backup::latest_known();
+        assert!(
+            matches!(err, MemoryError::SchemaNewer { db, binary } if db == latest + 1 && binary == latest),
+            "got {err:?}"
+        );
         assert!(err.to_string().contains("clawg restore"), "{err}");
         assert_eq!(std::fs::read(dir.path().join("memory.db")).unwrap(), before);
     }
@@ -735,7 +742,7 @@ mod tests {
             .call(|c| c.query_row("SELECT MAX(version) FROM refinery_schema_history", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(top, 8);
+        assert_eq!(top, backup::latest_known());
     }
 
     #[tokio::test]
