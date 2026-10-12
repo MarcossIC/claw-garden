@@ -14,14 +14,16 @@
 //!
 //! # What the guard does
 //!
-//! [`PreInitGuard`] wraps the transport rmcp reads from. Until a request that
-//! starts a session goes through, it drops notifications and stray responses,
-//! which have nobody to answer, and hands every request to rmcp. From then on
-//! it is transparent.
+//! [`PreInitGuard`] wraps the transport rmcp reads from. Until a session
+//! exists it drops notifications and stray responses, which have nobody to
+//! answer, and hands every request to rmcp. A request that can start a session
+//! only does once rmcp answers it with a result: rmcp refuses one without the
+//! `_meta` it needs and keeps waiting, and the guard keeps guarding. From the
+//! first result on it is transparent.
 
 use std::future::Future;
 
-use rmcp::model::{ClientJsonRpcMessage, ClientRequest, ServerJsonRpcMessage};
+use rmcp::model::{ClientJsonRpcMessage, ClientRequest, RequestId, ServerJsonRpcMessage};
 use rmcp::service::RxJsonRpcMessage;
 use rmcp::transport::Transport;
 use rmcp::RoleServer;
@@ -57,6 +59,8 @@ pub fn before_session(msg: &ClientJsonRpcMessage) -> PreInit {
 pub struct PreInitGuard<T> {
     inner: T,
     started: bool,
+    /// The request that may be starting a session, until rmcp answers it.
+    starting: Option<RequestId>,
 }
 
 impl<T> PreInitGuard<T> {
@@ -64,6 +68,7 @@ impl<T> PreInitGuard<T> {
         Self {
             inner,
             started: false,
+            starting: None,
         }
     }
 }
@@ -78,6 +83,16 @@ where
         &mut self,
         item: ServerJsonRpcMessage,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+        if let Some(id) = &self.starting {
+            match &item {
+                ServerJsonRpcMessage::Response(r) if &r.id == id => {
+                    self.started = true;
+                    self.starting = None;
+                }
+                ServerJsonRpcMessage::Error(e) if e.id.as_ref() == Some(id) => self.starting = None,
+                _ => {}
+            }
+        }
         self.inner.send(item)
     }
 
@@ -88,12 +103,10 @@ where
                 return Some(msg);
             }
             match before_session(&msg) {
-                // Also a request rmcp rejects for missing `_meta`, which
-                // starts nothing; the guard stands down anyway, because a
-                // host that was just told its request is malformed retries
-                // it before it sends anything else.
                 PreInit::Start => {
-                    self.started = true;
+                    if let ClientJsonRpcMessage::Request(req) = &msg {
+                        self.starting = Some(req.id.clone());
+                    }
                     return Some(msg);
                 }
                 PreInit::Forward => return Some(msg),
@@ -257,6 +270,15 @@ mod tests {
         assert!(sent.lock().expect("sent lock").is_empty(), "answering is rmcp's job");
     }
 
+    fn reply(id: u32) -> ServerJsonRpcMessage {
+        serde_json::from_value(json!({ "jsonrpc": "2.0", "id": id, "result": {} })).expect("a reply")
+    }
+
+    fn refusal(id: u32) -> ServerJsonRpcMessage {
+        serde_json::from_value(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32602, "message": "no _meta" } }))
+            .expect("a refusal")
+    }
+
     #[tokio::test]
     async fn after_the_session_starts_the_guard_forwards_everything_untouched() {
         let init = initialize(1);
@@ -265,8 +287,22 @@ mod tests {
         let mut guard = PreInitGuard::new(inner);
 
         guard.receive().await.expect("initialize");
+        guard.send(reply(1)).await.expect("answer initialize");
         let second = guard.receive().await.expect("forwarded, not dropped");
         assert!(matches!(second, ClientJsonRpcMessage::Notification(_)), "{second:?}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_request_leaves_the_guard_on() {
+        let early = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let init = initialize(2);
+        let (inner, _sent) = Scripted::new(&[early, CANCEL_PROBE, &init]);
+        let mut guard = PreInitGuard::new(inner);
+
+        guard.receive().await.expect("the early request");
+        guard.send(refusal(1)).await.expect("refuse it");
+        let next = guard.receive().await.expect("initialize, the cancellation dropped");
+        assert_eq!(method_of(&next), "initialize");
     }
 
     #[tokio::test]
@@ -347,6 +383,24 @@ mod tests {
         let tools = next_frame(&mut lines).await;
         assert_eq!(tools["id"], 2);
         assert_eq!(tool_names(&tools).len(), 7, "all seven memory tools are listed: {tools}");
+    }
+
+    /// rmcp refuses a request without `_meta` and keeps waiting for a session;
+    /// a notification after that refusal must not end the bridge either.
+    #[tokio::test]
+    async fn a_request_refused_for_missing_meta_does_not_start_the_session() {
+        let (mut host, mut lines) = serve_bridge();
+
+        send_line(&mut host, r#"{"jsonrpc":"2.0","id":"early","method":"tools/list"}"#).await;
+        let refused = next_frame(&mut lines).await;
+        assert_eq!(refused["id"], "early");
+        assert!(refused["error"].is_object(), "{refused}");
+        send_line(&mut host, r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"early"}}"#).await;
+
+        send_line(&mut host, &initialize(1)).await;
+        let init_reply = next_frame(&mut lines).await;
+        assert_eq!(init_reply["id"], 1);
+        assert_eq!(init_reply["result"]["serverInfo"]["name"], "clawg-dev");
     }
 
     #[tokio::test]
