@@ -2,36 +2,15 @@
 
 **Dominio destino:** `specs/retrieval/spec.md` (se fusiona al archivar).
 
-**Alcance:** el orden entre empates de `search_all_memories`, el corte relativo de `POST /v1/search` y qué hits registran un acceso en `search` y en `recall_context`. Ningún score cambia, y el esquema tampoco.
+**Alcance:** el corte relativo de `POST /v1/search` y qué hits registran un acceso en `search` y en `recall_context`. Ningún score ni orden del core cambia, y el esquema tampoco. El orden entre hits con score 0 pasó a lexical-fusion (ver `proposal.md`).
 
 ## Definiciones
 
-- **Corte relativo con ratio r:** sobre hits ordenados mejor primero, se conservan los primeros mientras la posición sea < 2 o `score >= r × mejor` (`crates/clawg-cli/src/mcp/tools.rs:65-76`). Es la regla actual del puente, sin cambios.
+- **Corte relativo con ratio r:** sobre hits ordenados mejor primero, se conservan los primeros mientras la posición sea < 2 o `score >= r × mejor` (`crates/clawg-cli/src/mcp/tools.rs:65-76` antes del cambio). La regla no cambia; pasa a `crates/clawg-cli/src/relevance.rs`.
 - **Acceso:** una entrada al access tracker, que en el flush suma `access_count`, mueve `last_accessed_at` y recalcula el tier (`crates/clawg-core/src/memory/access.rs:156-163`).
-- **Hit contable:** hit de `kind = memory` con `score > 0`. Sólo los `memory` cuentan por la razón de `api.rs:492-495` (ids por tabla).
+- **Hit contable:** hit de `kind = memory` con `score > 0`. Sólo los `memory` cuentan porque los ids son por tabla y el flush actualiza `memory` (`api.rs:492-495` antes del cambio).
 
-## R1. Desempate por distancia
-
-Dos hits con el mismo score MUST ordenarse por `distance` ascendente. Si también empatan en distancia, MUST seguir valiendo `(kind, id)` ascendente, de modo que el orden sea total y determinista. El score de ningún hit MUST cambiar.
-
-#### Escenario: ceros
-- GIVEN dos hits `memory` con score 0: id 1 con distancia 0,70 e id 9 con distancia 0,50
-- WHEN se ordenan
-- THEN el id 9 va primero
-
-#### Escenario: empate total
-- GIVEN dos hits con el mismo score y la misma distancia, ids 3 y 5
-- THEN el 3 va primero, como hoy
-
-#### Escenario: el score manda
-- GIVEN un hit con score 0,2 y distancia 0,9, y otro con score 0,1 y distancia 0,1
-- THEN el de score 0,2 va primero
-
-**Test:** `hit_cmp_breaks_score_ties_by_distance` en `search.rs` (mod tests). Falla hoy: `hit_cmp` pasa de score a `(kind, id)` (`search.rs:78-84`). El test existente `hit_cmp_is_a_strict_total_order_even_on_score_ties` (`search.rs:1164`) se mantiene: sus fixtures usan distancia 0 en todos los hits.
-
-**Test de integración:** `ties_at_zero_follow_the_closest_row_not_the_oldest` en `search.rs`: siembra una fila vieja lejana y una nueva cercana, las dos bajo el piso, y la nueva sale primero. Falla hoy.
-
-## R2. Corte relativo opcional en `/v1/search`
+## R1. Corte relativo opcional en `/v1/search`
 
 `POST /v1/search` MUST aceptar el campo opcional `min_relative_score` (número).
 
@@ -40,51 +19,51 @@ Dos hits con el mismo score MUST ordenarse por `distance` ascendente. Si tambié
 - Presente fuera de `[0, 1]`, o no finito: MUST responder 400 sin buscar ni registrar nada.
 
 #### Escenario: sin campo
-- GIVEN hits con scores 0,50, 0,40, 0,10
+- GIVEN una fila igual a la consulta y tres sin relación
 - WHEN se busca sin `min_relative_score`
-- THEN vuelven los tres
+- THEN vuelven las cuatro
 
 #### Escenario: con corte
-- GIVEN los mismos hits
+- GIVEN las mismas filas
 - WHEN se busca con `min_relative_score = 0.6`
-- THEN vuelven 0,50 y 0,40 (los dos mínimos; 0,10 < 0,30)
+- THEN vuelven los primeros `relevant_len(scores, 0.6)` hits de la búsqueda sin corte, en el mismo orden, y son menos que cuatro
 
 #### Escenario: fuera de rango
-- WHEN se busca con `min_relative_score = 1.5`
+- WHEN se busca con `min_relative_score = 1.5` o `-0.1`
 - THEN la respuesta es 400
 
-**Test:** `search_applies_the_requested_relative_cut`, `search_without_a_relative_cut_is_unchanged` y `search_rejects_a_relative_score_outside_zero_to_one` en `crates/clawg-cli/tests/api.rs`. Fallan hoy: el campo no existe (`api.rs:229-236`) y serde lo ignora.
+**Test:** `search_without_a_relative_cut_is_unchanged`, `search_applies_the_requested_relative_cut` y `search_rejects_a_relative_score_outside_zero_to_one` en `crates/clawg-cli/tests/api.rs`; `a_relative_score_outside_zero_to_one_is_a_bad_request` (incluye `NaN` e infinito) en `api.rs`. Fallaban antes del cambio: el campo no existía (`api.rs:229-236`) y serde lo ignoraba.
 
-**Test:** la función del corte conserva los tests de `tools.rs:208-240` al moverse de módulo.
+**Test:** los tests del corte se mueven con la regla a `relevance.rs`.
 
-## R3. `search` registra sólo lo que devuelve
+## R2. `search` registra sólo lo que devuelve
 
-El handler `search` MUST registrar como acceso exactamente los hits contables de la respuesta que envía, después del corte de R2. Un hit cortado, o con score 0, MUST NOT cambiar `access_count` ni `last_accessed_at`.
+El handler `search` MUST registrar como acceso exactamente los hits contables de la respuesta que envía, después del corte de R1. Un hit cortado, o con score 0, MUST NOT cambiar `access_count` ni `last_accessed_at`.
 
 #### Escenario: hit cortado
-- GIVEN una fila A que la consulta encuentra con score alto y una fila B que queda bajo el corte de 0,6 en posición ≥ 2
+- GIVEN una fila A con score alto y una fila B bajo el corte de 0,6 en posición ≥ 2
 - WHEN se busca con `min_relative_score = 0.6` y se hace flush del tracker
-- THEN `access_count` de A sube en 1 y el de B no cambia, ni su `last_accessed_at`
+- THEN `access_count` de A sube en 1, y el de B y su `last_accessed_at` no cambian
 
 #### Escenario: cero sin corte
 - GIVEN una fila C que vuelve con score 0
 - WHEN se busca sin `min_relative_score` y se hace flush
 - THEN `access_count` de C no cambia
 
-**Test:** `access_ids_keep_only_memory_hits_that_scored` en `crates/clawg-core/src/memory/access.rs` fija qué hits cuentan; el handler registra `access_ids` de la respuesta ya cortada, y `search_applies_the_requested_relative_cut` (R2) fija que esa respuesta no trae los cortados. Falla hoy: la función no existe y el handler registra todo lo que devuelve la búsqueda (`api.rs:496-501`). El flush del tracker corre cada 30 s y no se puede adelantar desde un test HTTP, por eso la prueba se parte en esas dos piezas.
+**Test:** `record_hits_keeps_only_memory_hits_that_scored` y `record_hits_with_nothing_countable_sends_nothing` en `crates/clawg-core/src/memory/access.rs` fijan qué hits cuentan. El handler registra `record_hits` sobre la respuesta ya cortada, y `search_applies_the_requested_relative_cut` (R1) fija que esa respuesta no trae los cortados. El flush del tracker corre cada 30 s y no se puede adelantar desde un test HTTP, por eso la prueba se parte en esas dos piezas.
 
-## R4. `recall_context` no cuenta los ceros
+## R3. `recall_context` no cuenta los ceros
 
 `build_memory_prompt` MUST registrar sólo los hits contables entre los que entran al prompt. Los hits con score 0 MUST seguir apareciendo en el prompt como hoy.
 
 #### Escenario
-- GIVEN un corpus donde la consulta deja 2 hits positivos y 3 en 0 dentro de `K_FINAL`
+- GIVEN una fila igual a la consulta y otra ortogonal (score 0)
 - WHEN se arma el prompt y se hace flush
-- THEN los 5 aparecen en el prompt y sólo los 2 positivos suben `access_count`
+- THEN las dos aparecen en el prompt y sólo la primera sube `access_count`
 
-**Test:** `recall_does_not_count_zero_score_hits_as_accesses` en `prompt_builder.rs`, con el helper de lectura de `prompt_builder.rs:1464-1475`. Falla hoy: registra todo el set (`prompt_builder.rs:168-175`).
+**Test:** `recall_does_not_count_zero_score_hits_as_accesses` en `prompt_builder.rs`. Fallaba antes del cambio: se registraba todo el set (`prompt_builder.rs:168-175`).
 
-## R5. El cliente pide el corte del puente
+## R4. El cliente pide el corte del puente
 
 `DaemonClient::search` MUST mandar `min_relative_score` igual a `RELEVANCE_RATIO` (0,6). El puente MUST seguir aplicando el corte al renderizar, de modo que contra un daemon que ignora el campo el agente vea lo mismo que hoy.
 
@@ -92,7 +71,7 @@ El handler `search` MUST registrar como acceso exactamente los hits contables de
 - WHEN el cliente arma el cuerpo de una búsqueda
 - THEN el cuerpo contiene `"min_relative_score": 0.6` además de los campos de `SearchArgs`
 
-**Test:** `search_request_carries_the_relevance_ratio` en `client.rs` (mod tests), sobre el cuerpo que arma el cliente. Falla hoy: el cliente serializa `SearchArgs` tal cual (`client.rs:211-216`, `:357-359`).
+**Test:** `search_request_carries_the_relevance_ratio` en `client.rs`. Fallaba antes del cambio: el cliente serializaba `SearchArgs` tal cual (`client.rs:211-216`, `:357-359`).
 
 ## Compatibilidad de datos
 

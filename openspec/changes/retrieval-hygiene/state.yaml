@@ -1,14 +1,14 @@
 change: retrieval-hygiene
 objective: "1"
 depends_on: []
-phase: apply
+phase: verify
 artifacts:
   exploration: done
   proposal: done
   spec: done
   design: skipped
   tasks: done
-  apply: pending
-  verify: pending
+  apply: done
+  verify: partial
   archive: pending
 updated: 2026-10-12

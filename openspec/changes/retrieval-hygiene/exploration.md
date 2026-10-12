@@ -44,7 +44,7 @@
 ## Decisiones abiertas
 
 - [x] Accesos: b, con el corte en el daemon (`clawg-cli`), no en el core. Además, un hit con score 0 no cuenta como acceso. Ver `proposal.md`.
-- [x] Ceros: a. La b queda para lexical-fusion, porque antes de la fusión haría desaparecer los matches léxicos bajo el piso.
+- [x] Ceros: pasan a lexical-fusion. Al implementar la a se vio que también borra los matches léxicos bajo el piso (ver `proposal.md`).
 
 ## Cómo se mide
 
