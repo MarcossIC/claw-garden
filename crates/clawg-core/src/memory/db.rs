@@ -358,9 +358,19 @@ async fn register_udfs(conn: &Connection) -> Result<(), MemoryError> {
 // Migration helper
 // ---------------------------------------------------------------------------
 
+/// The runner settings production migrates with.
+///
+/// Grouped: every pending migration and its history row commit in one
+/// transaction. Ungrouped, a kill between a migration's body and its history
+/// row re-runs the body on the next start, and for an `ADD COLUMN` that is a
+/// "duplicate column" error on every start from then on.
+fn configured(runner: refinery::Runner) -> refinery::Runner {
+    runner.set_grouped(true)
+}
+
 async fn run_migrations(conn: &Connection) -> Result<(), MemoryError> {
     conn.call(|c: &mut rusqlite::Connection| -> Result<refinery::Report, refinery::Error> {
-        crate::memory::migrations::runner().run(c)
+        configured(crate::memory::migrations::runner()).run(c)
     })
     .await
     .map_err(|e| match e {
@@ -493,6 +503,97 @@ mod tests {
             "V6 must backfill content_hash for rows that predate the column, in the same hash \
              space the runtime write path uses"
         );
+    }
+
+    fn table_exists(c: &rusqlite::Connection, name: &str) -> bool {
+        c.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
+            [name],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            > 0
+    }
+
+    /// A kill between a migration's body and its history row would re-run it
+    /// on the next start, and an `ADD COLUMN` re-run is "duplicate column" on
+    /// every start after that. Applying a run's migrations in one transaction
+    /// closes that window; a failure anywhere in the run must leave nothing.
+    #[tokio::test]
+    async fn a_failing_migration_rolls_back_every_migration_of_its_run() {
+        ensure_vec0_registered();
+        let conn = Connection::open_in_memory().await.unwrap();
+        register_udfs(&conn).await.unwrap();
+
+        let result = conn
+            .call(|c| {
+                let mut migrations = crate::memory::migrations::runner().get_migrations().clone();
+                migrations.push(
+                    refinery::Migration::unapplied("V9__broken", "THIS IS NOT SQL;").unwrap(),
+                );
+                configured(refinery::Runner::new(&migrations)).run(c)
+            })
+            .await;
+        assert!(result.is_err(), "the broken V9 must fail the run");
+
+        let (memory, vectors, history_rows) = conn
+            .call(|c| -> Result<(bool, bool, i64), rusqlite::Error> {
+                let history_rows = if table_exists(c, "refinery_schema_history") {
+                    c.query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| r.get(0))?
+                } else {
+                    0
+                };
+                Ok((table_exists(c, "memory"), table_exists(c, "memory_vectors"), history_rows))
+            })
+            .await
+            .unwrap();
+        assert!(!memory, "V1 must be rolled back");
+        assert!(!vectors, "the vec0 table from V2 must be rolled back");
+        assert_eq!(history_rows, 0, "no history row may survive a failed run");
+    }
+
+    /// Existing installs were migrated one migration per transaction. Under the
+    /// grouped runner they have nothing pending, so opening them must change
+    /// nothing.
+    #[tokio::test]
+    async fn a_v8_database_opens_unchanged_under_grouped_migrations() {
+        ensure_vec0_registered();
+        let conn = Connection::open_in_memory().await.unwrap();
+        register_udfs(&conn).await.unwrap();
+        conn.call(|c| crate::memory::migrations::runner().run(c))
+            .await
+            .unwrap();
+        conn.call(|c| {
+            c.execute(
+                "INSERT INTO memory \
+                 (scope, agent_id, content, memory_type, source, \
+                  created_at, created_by_type, created_by_ref, \
+                  last_modified_at, last_accessed_at, importance, tier, status) \
+                 VALUES ('agent', 'agent-v8', 'seeded before grouping', 'chat_message', 'chat', \
+                  0, 'user', 'agent-v8', 0, 0, 5.0, 3, 'active')",
+                [],
+            )
+        })
+        .await
+        .unwrap();
+
+        let snapshot = |c: &mut rusqlite::Connection| -> Result<(i64, String), rusqlite::Error> {
+            let history: i64 =
+                c.query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| r.get(0))?;
+            let content: String = c.query_row(
+                "SELECT group_concat(content, '|') FROM memory WHERE agent_id = 'agent-v8'",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok((history, content))
+        };
+        let before = conn.call(snapshot).await.unwrap();
+
+        run_migrations(&conn).await.unwrap();
+
+        let after = conn.call(snapshot).await.unwrap();
+        assert_eq!(before, after);
+        assert_eq!(after.0, 8);
     }
 
     /// Ensure_vec0_registered is idempotent (no panic on second call).

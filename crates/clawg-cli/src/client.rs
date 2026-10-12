@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clawg_core::memory::store_lock::{StoreHolder, StoreLock, StoreOwner};
-use clawg_core::paths::{data_dir, Profile};
+use clawg_core::paths::{data_dir, PathsError, Profile};
 use serde::{Deserialize, Serialize};
 
 use crate::daemon::lifecycle::{read_state, read_token};
@@ -71,6 +71,8 @@ pub enum ClientError {
         .0.holder, .0.pid
     )]
     StoreHeld(StoreOwner),
+    #[error(transparent)]
+    DataDir(#[from] PathsError),
 }
 
 // ── Wire types the client reads back ────────────────────────────────────────
@@ -639,7 +641,7 @@ pub async fn ensure_running(
     autostart: bool,
     spawner: &dyn DaemonSpawner,
 ) -> Result<DaemonClient, ClientError> {
-    ensure_running_in(&data_dir(profile), profile, autostart, spawner, AUTOSTART_TIMEOUT).await
+    ensure_running_in(&data_dir(profile)?, profile, autostart, spawner, AUTOSTART_TIMEOUT).await
 }
 
 /// [`ensure_running`] against an explicit data directory and timeout.
@@ -755,7 +757,7 @@ pub(crate) mod tests {
     pub(crate) async fn start_daemon() -> TestDaemon {
         let dir = tempfile::tempdir().expect("tempdir");
         let (runtime, rx) = MemoryRuntime::new_for_test(dir.path().to_path_buf()).await;
-        tokio::spawn(runtime.ingest_worker(rx));
+        tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
 
         let token = "0123456789abcdef0123456789abcdef".to_string();
         let (shutdown, _rx) = tokio::sync::watch::channel(false);

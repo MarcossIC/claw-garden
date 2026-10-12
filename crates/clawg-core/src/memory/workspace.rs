@@ -85,8 +85,7 @@ impl WorkspaceManager {
                 .map_err(|e| MemoryError::WorkspaceIo { path: path.clone(), source: e })?;
         }
 
-        // Write file
-        tokio::fs::write(&path, assembled.as_bytes())
+        write_atomically(&path, assembled.as_bytes())
             .await
             .map_err(|e| MemoryError::WorkspaceIo { path: path.clone(), source: e })?;
 
@@ -404,6 +403,25 @@ fn render_rows(rows: &AutoRows) -> String {
     out.push_str(AUTO_END);
     out.push('\n');
     out
+}
+
+/// Writes through `<file>.tmp` in the same directory and renames it over
+/// `path`, so a write that dies halfway leaves the previous file whole: a
+/// plain write truncates the target first, USER section included. The
+/// rename replaces an existing target on Windows too (`MoveFileExW` with
+/// `MOVEFILE_REPLACE_EXISTING`).
+pub(crate) async fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let written = match tokio::fs::write(&tmp, bytes).await {
+        Ok(()) => tokio::fs::rename(&tmp, path).await,
+        Err(e) => Err(e),
+    };
+    if written.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    written
 }
 
 /// Parse the existing file content to find AUTO and USER sections.
@@ -919,9 +937,12 @@ mod tests {
 
     #[tokio::test]
     async fn write_failure_returns_workspace_io_error() {
-        // On Windows, use a path under C:\Windows\System32 or a deeply nested path
-        // that should fail due to permissions
-        let wm = WorkspaceManager::new(PathBuf::from("C:\\Windows\\System32\\clawg-test-forbidden"));
+        // A regular file where a directory is expected makes `create_dir_all`
+        // fail on every platform.
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("not-a-dir");
+        std::fs::write(&blocker, "").unwrap();
+        let wm = WorkspaceManager::new(blocker.join("workspaces"));
         let store = MemoryStore::new_for_test().await.unwrap();
         let result = wm.regenerate_auto_section("agent-1", None, &store).await;
         assert!(
@@ -929,6 +950,38 @@ mod tests {
             "expected WorkspaceIo error, got {:?}",
             result
         );
+    }
+
+    /// `workspace.md` is rewritten on every `recall_context` and carries the
+    /// user's hand-written USER section, so a write that dies halfway must not
+    /// cost them the file.
+    #[tokio::test]
+    async fn a_failed_workspace_write_leaves_the_previous_file_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let path = wm.workspace_path("agent-1", None);
+        let dir = path.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        let previous = format!("{USER_START}\nmy own notes\n{USER_END}\n");
+        std::fs::write(&path, &previous).unwrap();
+        // A directory squatting on the temporary file's name makes its write fail.
+        std::fs::create_dir(dir.join("workspace.md.tmp")).unwrap();
+
+        let result = wm.regenerate_auto_section("agent-1", None, &store).await;
+
+        assert!(
+            matches!(result, Err(MemoryError::WorkspaceIo { .. })),
+            "expected WorkspaceIo error, got {:?}",
+            result
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), previous);
+        let mut entries: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, vec!["workspace.md", "workspace.md.tmp"]);
     }
 
     // ── project scoping of the deterministic channel ─────────────────────────

@@ -10,12 +10,15 @@ use std::sync::Arc;
 
 use once_cell::sync::OnceCell;
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::watch;
+use tokio::time::Instant;
 
 use crate::memory::chunker::{
     select_chunker, ChatChunker, Chunk, ChunkerKind, CodeChunker, CHUNK_MAX_TOKENS,
 };
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::events::{MemoryEvent, MemorySource};
+use crate::memory::spill::Replay;
 use crate::memory::store_insert::{MemoryStoreError, NewMemoryRecord};
 use crate::memory::MemoryStore;
 
@@ -107,6 +110,25 @@ fn collapse_duplicate_chunks(chunks: Vec<Chunk>) -> Vec<PendingChunk> {
     out
 }
 
+/// What the worker does with the next event it takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainStep {
+    Ingest,
+    Spill,
+}
+
+/// `deadline` is `None` until a shutdown asks for a drain. A draining worker
+/// spills once the deadline passes, and at once without an embedder: the model
+/// may still be downloading, and waiting for it would outlast any deadline.
+fn drain_step(now: Instant, deadline: Option<Instant>, embedder_ready: bool) -> DrainStep {
+    match deadline {
+        None => DrainStep::Ingest,
+        Some(_) if !embedder_ready => DrainStep::Spill,
+        Some(d) if now >= d => DrainStep::Spill,
+        Some(_) => DrainStep::Ingest,
+    }
+}
+
 /// Top-level worker loop. One per app instance.
 ///
 /// Drains events FIFO. An event's surviving chunks are embedded in one call,
@@ -115,14 +137,30 @@ fn collapse_duplicate_chunks(chunks: Vec<Chunk>) -> Vec<PendingChunk> {
 /// salvage, and the failures it reports (model session, tokenizer) apply to
 /// every text in the call anyway. An insert failure stays isolated to its own
 /// chunk and the event's remaining chunks continue.
-/// Exits cleanly when all `Sender`s are dropped (app shutdown).
+///
+/// `replay` holds the events a previous shutdown spilled. They go first, in
+/// file order, before anything from the channel.
+///
+/// `drain` carries the instant a shutdown wants the queue drained by. Once it
+/// is set the channel is closed to new events, what is already queued keeps
+/// being ingested until [`drain_step`] says to stop, and the events not yet
+/// started (unreplayed ones first) are returned in order for the caller to
+/// spill. The event in flight
+/// always finishes: a half-ingested event replayed later would duplicate the
+/// chunks that did land. A dropped `drain` sender never asks for a drain.
+///
+/// Also returns, with nothing spilled, when all `Sender`s are dropped and the
+/// queue is empty; events held for an embedder that never loaded are returned
+/// then too.
 pub async fn memory_worker(
     mut rx: UnboundedReceiver<MemoryEvent>,
+    drain: watch::Receiver<Option<Instant>>,
+    mut replay: Replay,
     store: Arc<MemoryStore>,
     embedder_cell: Arc<OnceCell<Arc<dyn Embedder>>>,
     chat_chunker: Arc<ChatChunker>,
     code_chunker: Arc<CodeChunker>,
-) {
+) -> Vec<MemoryEvent> {
     // Running count of chunks absorbed by the write-border dedup gate.
     // Plain `u64`, no atomic: `memory_worker` is the single sequential
     // consumer of this channel — see `MemoryStore::reinforce_if_duplicate`'s
@@ -134,7 +172,20 @@ pub async fn memory_worker(
     // time through the loop, so queue_depth_transition only reports the edge
     // crossing rather than the level on every iteration.
     let mut queue_over_depth = false;
-    while let Some(evt) = rx.recv().await {
+    let mut drain = Some(drain);
+    let mut deadline: Option<Instant> = None;
+    loop {
+        observe_drain(&mut rx, &mut drain, &mut deadline);
+        let evt = match replay.next() {
+            Some(evt) => evt,
+            None => {
+                replay.finish().await;
+                match next_event(&mut rx, &mut drain, &mut deadline).await {
+                    Some(evt) => evt,
+                    None => break,
+                }
+            }
+        };
         // Read after recv: this is the backlog still waiting, which is what
         // "falling behind" means.
         let depth = rx.len();
@@ -149,13 +200,9 @@ pub async fn memory_worker(
             }
             None => {}
         }
-        if !wait_for_embedder(&embedder_cell, &rx).await {
-            log::warn!(
-                "ingest event dropped at shutdown, the embedder never loaded (agent={}, role={:?})",
-                evt.agent_id,
-                evt.role
-            );
-            continue;
+        hold_for_embedder(&embedder_cell, &mut rx, &mut drain, &mut deadline).await;
+        if drain_step(Instant::now(), deadline, embedder_cell.get().is_some()) == DrainStep::Spill {
+            return unstarted(evt, replay, &mut rx);
         }
         if let Err(e) = process_event(
             &evt,
@@ -175,6 +222,45 @@ pub async fn memory_worker(
         }
     }
     log::info!("memory_worker shutting down — channel closed");
+    Vec::new()
+}
+
+/// Starts the drain the first time `drain` carries a deadline: from then on
+/// the channel accepts nothing new, and `recv` yields what is already queued.
+fn observe_drain(
+    rx: &mut UnboundedReceiver<MemoryEvent>,
+    drain: &mut Option<watch::Receiver<Option<Instant>>>,
+    deadline: &mut Option<Instant>,
+) {
+    if deadline.is_some() {
+        return;
+    }
+    if let Some(requested) = drain.as_mut().and_then(|d| *d.borrow_and_update()) {
+        *deadline = Some(requested);
+        rx.close();
+    }
+}
+
+/// The next queued event, or `None` once the channel is closed and empty.
+async fn next_event(
+    rx: &mut UnboundedReceiver<MemoryEvent>,
+    drain: &mut Option<watch::Receiver<Option<Instant>>>,
+    deadline: &mut Option<Instant>,
+) -> Option<MemoryEvent> {
+    loop {
+        observe_drain(rx, drain, deadline);
+        let signal = match drain.as_mut() {
+            Some(signal) if deadline.is_none() => signal,
+            _ => return rx.recv().await,
+        };
+        let sender_gone = tokio::select! {
+            evt = rx.recv() => return evt,
+            changed = signal.changed() => changed.is_err(),
+        };
+        if sender_gone {
+            *drain = None;
+        }
+    }
 }
 
 /// Holds the worker until the embedder is available, so an event accepted
@@ -185,24 +271,49 @@ pub async fn memory_worker(
 /// wait, so this polls; the model takes seconds to load, which makes a
 /// 100 ms tick free next to it and keeps the cell's shape untouched.
 ///
-/// `false` means the channel closed while waiting (shutdown), so the held
-/// event has nowhere left to go. Checking `is_closed` on every tick is what
-/// keeps a model that never loads from blocking the daemon's shutdown.
-async fn wait_for_embedder(
+/// Gives up when a drain starts, or when every sender is gone and nothing can
+/// ask for one; the latter counts as a drain due now. Either way the held
+/// event is spilled rather than waited on, which is what keeps a model that
+/// never loads from blocking the daemon's shutdown.
+async fn hold_for_embedder(
     embedder_cell: &Arc<OnceCell<Arc<dyn Embedder>>>,
-    rx: &UnboundedReceiver<MemoryEvent>,
-) -> bool {
+    rx: &mut UnboundedReceiver<MemoryEvent>,
+    drain: &mut Option<watch::Receiver<Option<Instant>>>,
+    deadline: &mut Option<Instant>,
+) {
     if embedder_cell.get().is_some() {
-        return true;
+        return;
     }
     log::info!("ingest is waiting for the embedder to load");
     while embedder_cell.get().is_none() {
+        observe_drain(rx, drain, deadline);
+        if deadline.is_some() {
+            return;
+        }
         if rx.is_closed() {
-            return false;
+            *deadline = Some(Instant::now());
+            return;
         }
         tokio::time::sleep(EMBEDDER_POLL_INTERVAL).await;
     }
-    true
+}
+
+/// `evt`, then the events left to replay, then everything still queued, in
+/// order. Closes the channel first so nothing can slip in behind the last
+/// event read.
+fn unstarted(
+    evt: MemoryEvent,
+    replay: Replay,
+    rx: &mut UnboundedReceiver<MemoryEvent>,
+) -> Vec<MemoryEvent> {
+    rx.close();
+    let mut events = vec![evt];
+    events.extend(replay.into_remaining());
+    while let Ok(next) = rx.try_recv() {
+        events.push(next);
+    }
+    log::info!("ingest stopped with {} events not yet ingested", events.len());
+    events
 }
 
 /// Runs the write-border dedup gate for one chunk hash. `true` means the
@@ -1917,7 +2028,37 @@ mod tests {
         std::fs::remove_dir_all(&base_dir).ok();
     }
 
+    // ── Drain decision ───────────────────────────────────────────────────────
+
+    #[test]
+    fn without_a_drain_the_worker_keeps_ingesting() {
+        let now = Instant::now();
+        assert_eq!(drain_step(now, None, true), DrainStep::Ingest);
+        assert_eq!(drain_step(now, None, false), DrainStep::Ingest);
+    }
+
+    #[test]
+    fn a_drain_keeps_ingesting_until_its_deadline() {
+        let now = Instant::now();
+        let later = now + std::time::Duration::from_secs(1);
+        assert_eq!(drain_step(now, Some(later), true), DrainStep::Ingest);
+        assert_eq!(drain_step(later, Some(later), true), DrainStep::Spill);
+        assert_eq!(drain_step(later + std::time::Duration::from_millis(1), Some(later), true), DrainStep::Spill);
+    }
+
+    #[test]
+    fn a_drain_without_an_embedder_spills_at_once() {
+        let now = Instant::now();
+        let later = now + std::time::Duration::from_secs(10);
+        assert_eq!(drain_step(now, Some(later), false), DrainStep::Spill);
+    }
+
     // ── Test harnesses ───────────────────────────────────────────────────────
+
+    /// A drain signal whose sender is already gone, so it never asks for one.
+    pub(crate) fn no_drain() -> watch::Receiver<Option<Instant>> {
+        watch::channel(None).1
+    }
 
     /// Test harness — spawns `memory_worker` with a seeded embedder cell.
     pub(crate) async fn spawn_test_worker(
@@ -1933,7 +2074,7 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<MemoryEvent>();
         let handle = tokio::spawn(async move {
-            memory_worker(rx, store, cell, chat_chunker, code_chunker).await;
+            memory_worker(rx, no_drain(), Replay::none(), store, cell, chat_chunker, code_chunker).await;
         });
         (tx, handle)
     }
@@ -1962,7 +2103,7 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<MemoryEvent>();
         let handle = tokio::spawn(async move {
-            memory_worker(rx, store, cell, chat_chunker, code_chunker).await;
+            memory_worker(rx, no_drain(), Replay::none(), store, cell, chat_chunker, code_chunker).await;
         });
         (tx, handle)
     }
