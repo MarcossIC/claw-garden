@@ -235,33 +235,6 @@ pub fn multi_aspect_queries(spanish: bool) -> &'static [(&'static [usize], &'sta
     }
 }
 
-/// Rows and questions for strict user rules, which carry the top importance.
-pub fn rule_frames(spanish: bool) -> &'static [(&'static str, &'static str)] {
-    if spanish {
-        &[
-            (
-                "El usuario exige las convenciones `{key}`: aplicarlas siempre antes de proponer cambios.",
-                "cuál es la regla del usuario sobre {key}",
-            ),
-            (
-                "Regla firme del usuario para `{key}`: nunca saltarla, ni siquiera en cambios menores.",
-                "qué exige el usuario respecto de {key}",
-            ),
-        ]
-    } else {
-        &[
-            (
-                "The user insists on `{key}` conventions: always apply them before proposing any change.",
-                "what is the user rule about {key}",
-            ),
-            (
-                "Firm user rule for `{key}`: never skip it, not even on minor changes.",
-                "what does the user require regarding {key}",
-            ),
-        ]
-    }
-}
-
 pub const CODENAME_ADJECTIVES: [&str; 10] =
     ["amber", "cobalt", "crimson", "ivory", "jade", "onyx", "scarlet", "teal", "umber", "violet"];
 pub const CODENAME_NOUNS: [&str; 10] =

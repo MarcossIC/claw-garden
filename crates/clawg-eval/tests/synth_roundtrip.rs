@@ -69,7 +69,7 @@ fn the_expanded_set_scores_under_rag_eval_and_reports_every_subset() {
 
     let by_subset = results["retrieval"]["by_subset"].as_array().expect("by_subset must be present");
     let names: Vec<&str> = by_subset.iter().map(|b| b["subset"].as_str().unwrap()).collect();
-    assert_eq!(names, vec!["high_importance", "lexical", "multi_ref", "natural"]);
+    assert_eq!(names, vec!["high_importance", "lexical", "low_importance", "multi_ref", "natural"]);
     let natural = by_subset.iter().find(|b| b["subset"] == "natural").unwrap();
     assert_eq!(natural["n_cases"], 2, "the base cases keep the natural label");
 }

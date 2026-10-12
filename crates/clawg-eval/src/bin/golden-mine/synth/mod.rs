@@ -23,9 +23,10 @@ const MAX_COPY_RETRIES: usize = 50;
 const LEXICAL_FAMILIES: usize = 30;
 const SIBLINGS_PER_FAMILY: usize = 8;
 const MULTI_REF_TOPICS: usize = 12;
-const HIGH_IMPORTANCE_ROWS: usize = 24;
-/// Rows in a high-importance case's pool: the expected one and its successors.
-const HIGH_IMPORTANCE_POOL: usize = 4;
+/// Cases per direction of the importance split.
+const CONTESTED_CASES: usize = 12;
+/// Rows that name the same entity in a contested case: the answer and five rivals.
+const CONTESTED_POOL: usize = 6;
 
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum SynthError {
@@ -73,7 +74,7 @@ pub fn generate(base: &Golden, seed: u64, sizes: &Sizes) -> Result<Golden, Synth
     let (rows, cases) = multi_ref_topics(base, &mut names, &mut rng);
     out.corpus.extend(rows);
     out.retrieval_cases.extend(cases);
-    let (rows, cases) = high_importance_rules(base, &mut names, &mut rng);
+    let (rows, cases) = contested_importance(base, &mut names, &mut rng);
     out.corpus.extend(rows);
     out.retrieval_cases.extend(cases);
 
@@ -339,41 +340,59 @@ fn multi_ref_topics(base: &Golden, names: &mut Codenames, rng: &mut SplitMix64) 
     (rows, cases)
 }
 
-/// User rules of importance 8 to 10, a range the hand-written set never
-/// reaches. Importance cycles 8, 9, 10, so two thirds sit at 9 or above.
-fn high_importance_rules(base: &Golden, names: &mut Codenames, rng: &mut SplitMix64) -> (Vec<Row>, Vec<Case>) {
+/// Which side of the importance split a contested case defends.
+#[derive(Clone, Copy)]
+enum Defends {
+    High,
+    Low,
+}
+
+/// Entities with six rows each, one per aspect, asked about one aspect. The
+/// row that answers sits at one end of the importance scale and its five
+/// rivals at the other, so which one ranks first shows whether importance
+/// moves the order, in both directions.
+fn contested_importance(base: &Golden, names: &mut Codenames, rng: &mut SplitMix64) -> (Vec<Row>, Vec<Case>) {
     let mut rows = Vec::new();
-    let mut queries = Vec::new();
+    let mut cases = Vec::new();
 
-    for i in 0..HIGH_IMPORTANCE_ROWS {
-        let key = names.next(base, rng);
-        let spanish = i % 2 == 1;
-        let (content, query) = templates::rule_frames(spanish)[(i / 2) % 2];
-        rows.push(Row {
-            ref_: format!("s-hi-{i:02}"),
-            content: templates::fill(content, &[("{key}", &key)]),
-            memory_type: "user_preference".to_string(),
-            importance: 8.0 + (i % 3) as f64,
-            lang: Some(if spanish { "es" } else { "en" }.to_string()),
-        });
-        queries.push(templates::fill(query, &[("{key}", &key)]));
+    for (defends, prefix, subset) in [
+        (Defends::High, "s-hi", Subset::HighImportance),
+        (Defends::Low, "s-lo", Subset::LowImportance),
+    ] {
+        for n in 0..CONTESTED_CASES {
+            let key = names.next(base, rng);
+            let spanish = n % 2 == 1;
+            let catalog = templates::aspect_catalog(spanish);
+            let target = (n * 3) % catalog.len();
+            let refs: Vec<String> = (0..CONTESTED_POOL).map(|j| format!("{prefix}-{n:02}-{j}")).collect();
+
+            for (j, ref_) in refs.iter().enumerate() {
+                let answers = j == 0;
+                let importance = match (defends, answers) {
+                    (Defends::High, true) => 8.0 + (n % 3) as f64,
+                    (Defends::High, false) => 3.0 + (j % 3) as f64,
+                    (Defends::Low, true) => 3.0 + (n % 3) as f64,
+                    (Defends::Low, false) => 8.0 + (j % 3) as f64,
+                };
+                rows.push(Row {
+                    ref_: ref_.clone(),
+                    content: templates::fill(catalog[(target + j) % catalog.len()].0, &[("{key}", &key)]),
+                    memory_type: "user_preference".to_string(),
+                    importance,
+                    lang: Some(if spanish { "es" } else { "en" }.to_string()),
+                });
+            }
+            cases.push(Case {
+                query: templates::fill(catalog[target].1, &[("{key}", &key)]),
+                expected_refs: vec![refs[0].clone()],
+                corpus_refs: refs,
+                status: Status::Active,
+                blocked_by: None,
+                history: Vec::new(),
+                subset,
+            });
+        }
     }
-
-    let cases = queries
-        .into_iter()
-        .enumerate()
-        .map(|(i, query)| Case {
-            query,
-            corpus_refs: (0..HIGH_IMPORTANCE_POOL)
-                .map(|k| rows[(i + k) % rows.len()].ref_.clone())
-                .collect(),
-            expected_refs: vec![rows[i].ref_.clone()],
-            status: Status::Active,
-            blocked_by: None,
-            history: Vec::new(),
-            subset: Subset::HighImportance,
-        })
-        .collect();
     (rows, cases)
 }
 
@@ -838,19 +857,63 @@ mod tests {
         }
     }
 
-    #[test]
-    fn each_high_importance_case_expects_a_row_of_importance_eight_or_more() {
-        let out = generate(&grouped_base(), 7, &NONE).unwrap();
-        let cases = cases_of(&out, Subset::HighImportance);
-        assert!(cases.len() >= 20);
+    /// The catalog row and question a contested case is about, found from the
+    /// expected row's content.
+    fn aspect_of(row: &Row, key: &str) -> (usize, bool) {
+        let spanish = row.lang.as_deref() == Some("es");
+        let index = templates::aspect_catalog(spanish)
+            .iter()
+            .position(|(content, _)| templates::fill(content, &[("{key}", key)]) == row.content)
+            .unwrap_or_else(|| panic!("not a catalog row: {}", row.content));
+        (index, spanish)
+    }
+
+    fn check_contested(out: &Golden, subset: Subset, expected_range: (f64, f64), others_range: (f64, f64)) {
+        let cases = cases_of(out, subset);
+        assert_eq!(cases.len(), 12, "{subset:?}");
         for case in cases {
             assert_eq!(case.expected_refs.len(), 1);
-            let expected = row_of(&out, &case.expected_refs[0]);
-            assert!(expected.importance >= 8.0, "{}", case.query);
-            assert!(case.corpus_refs.contains(&case.expected_refs[0]));
+            let expected = row_of(out, &case.expected_refs[0]);
             let key = ident_of(expected);
-            assert!(case.query.contains(key));
-            assert_eq!(out.corpus.iter().filter(|r| r.content.contains(key)).count(), 1);
+            assert!((expected_range.0..=expected_range.1).contains(&expected.importance), "{}", case.query);
+
+            let (aspect, spanish) = aspect_of(expected, key);
+            let question = templates::aspect_catalog(spanish)[aspect].1;
+            assert_eq!(case.query, templates::fill(question, &[("{key}", key)]));
+
+            let holders: Vec<&Row> = out.corpus.iter().filter(|r| r.content.contains(key)).collect();
+            assert_eq!(holders.len(), 6, "{key}");
+            assert_eq!(case.corpus_refs.len(), 6);
+            assert!(holders.iter().all(|h| case.corpus_refs.contains(&h.ref_)));
+            let contents: HashSet<&str> = holders.iter().map(|h| h.content.as_str()).collect();
+            assert_eq!(contents.len(), 6, "{key} repeats an aspect");
+            for other in holders.iter().filter(|h| h.ref_ != expected.ref_) {
+                assert!((others_range.0..=others_range.1).contains(&other.importance), "{key}: {other:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn each_high_importance_case_expects_a_high_row_among_low_ones_on_the_same_entity() {
+        let out = generate(&grouped_base(), 7, &Sizes { distractors: 50 }).unwrap();
+        check_contested(&out, Subset::HighImportance, (8.0, 10.0), (3.0, 5.0));
+    }
+
+    #[test]
+    fn each_low_importance_case_expects_a_low_row_among_high_ones_on_the_same_entity() {
+        let out = generate(&grouped_base(), 7, &Sizes { distractors: 50 }).unwrap();
+        check_contested(&out, Subset::LowImportance, (3.0, 5.0), (8.0, 10.0));
+    }
+
+    #[test]
+    fn the_importance_cases_use_keys_the_other_subsets_do_not() {
+        let out = generate(&grouped_base(), 7, &NONE).unwrap();
+        let mut keys = HashSet::new();
+        for subset in [Subset::MultiRef, Subset::HighImportance, Subset::LowImportance] {
+            for case in cases_of(&out, subset) {
+                let key = ident_of(row_of(&out, &case.expected_refs[0])).to_string();
+                assert!(keys.insert(key.clone()), "{key} is shared between cases");
+            }
         }
     }
 
@@ -858,7 +921,7 @@ mod tests {
     fn the_synthetic_refs_keep_their_prefixes() {
         let base = grouped_base();
         let out = generate(&base, 7, &Sizes { distractors: 5 }).unwrap();
-        for prefix in ["s-dis-", "s-lex-", "s-mr-", "s-hi-"] {
+        for prefix in ["s-dis-", "s-lex-", "s-mr-", "s-hi-", "s-lo-"] {
             assert!(synthetic_rows(&out, &base).iter().any(|r| r.ref_.starts_with(prefix)), "{prefix}");
         }
     }
