@@ -782,7 +782,8 @@ async fn context_reports_unreviewed_memories() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["unreviewed"], 2, "{body}");
 
-    h.post_json("/v1/synthesis", json!({ "agent_id": "b", "project_id": "p" })).await;
+    let (status, body) = h.post_json("/v1/synthesis", json!({ "agent_id": "b", "project_id": "p" })).await;
+    assert_eq!(status, 200, "{body}");
     let (_, body) = context().await;
     assert_eq!(body["unreviewed"], 2, "another agent's review is not this one's: {body}");
 
