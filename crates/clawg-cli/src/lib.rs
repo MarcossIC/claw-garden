@@ -33,6 +33,7 @@ pub mod doctor;
 pub mod mcp;
 pub mod memories;
 pub mod process;
+pub mod relevance;
 pub mod status;
 pub mod stop;
 pub mod user_path;
