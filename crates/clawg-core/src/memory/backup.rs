@@ -125,6 +125,10 @@ impl Reason {
             Reason::Manual => "manual",
         }
     }
+
+    fn is_automatic(self) -> bool {
+        !matches!(self, Reason::Manual)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -200,6 +204,44 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
+/// How many automatic snapshots (`pre-migration`, `pre-restore`) are kept.
+/// One is taken per upgrade that migrates or per restore, so five cover
+/// several in a row. A starting value, not measured.
+pub const AUTO_KEEP: usize = 5;
+
+/// The automatic snapshots among `names` that fall outside the newest
+/// [`AUTO_KEEP`]. Manual snapshots and names this module did not produce are
+/// never chosen.
+pub fn to_prune(names: &[String]) -> Vec<String> {
+    let mut automatic: Vec<&String> = names
+        .iter()
+        .filter(|n| parse_snapshot_name(n).is_some_and(Reason::is_automatic))
+        .collect();
+    automatic.sort();
+    let excess = automatic.len().saturating_sub(AUTO_KEEP);
+    automatic.into_iter().take(excess).cloned().collect()
+}
+
+/// Best effort: a snapshot that cannot be deleted is one too many, never an
+/// error.
+fn prune(dir: &Path) {
+    let names: Vec<String> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect(),
+        Err(e) => {
+            log::warn!("could not list {} to prune old snapshots: {e}", dir.display());
+            return;
+        }
+    };
+    for name in to_prune(&names) {
+        if let Err(e) = std::fs::remove_file(dir.join(&name)) {
+            log::warn!("could not delete the old snapshot {name}: {e}");
+        }
+    }
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -233,6 +275,9 @@ pub fn snapshot_into(
     if let Err(source) = std::fs::rename(&tmp, &path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(BackupError::Io { path, source });
+    }
+    if reason.is_automatic() {
+        prune(dir);
     }
     Ok(path)
 }
@@ -378,6 +423,56 @@ mod tests {
             )
             .unwrap();
         assert_eq!(nearest, id);
+    }
+
+    fn auto_and_manual_names() -> (Vec<String>, Vec<String>) {
+        let auto: Vec<String> = (0..7)
+            .map(|i| {
+                let reason = if i % 2 == 0 { Reason::PreMigration } else { Reason::PreRestore };
+                snapshot_name(1_700_000_000_000 + i * 1000, reason)
+            })
+            .collect();
+        let manual: Vec<String> =
+            (0..2).map(|i| snapshot_name(1_600_000_000_000 + i, Reason::Manual)).collect();
+        (auto, manual)
+    }
+
+    #[test]
+    fn pruning_keeps_the_newest_automatic_snapshots_and_every_manual_one() {
+        let (auto, manual) = auto_and_manual_names();
+        let mut names: Vec<String> = manual.clone();
+        names.extend(auto.iter().rev().cloned());
+        names.push("notes.txt".into());
+
+        assert_eq!(to_prune(&names), auto[..2].to_vec());
+        assert_eq!(to_prune(&auto[..AUTO_KEEP]), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn an_automatic_snapshot_prunes_older_automatic_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = dir.path().join("backups");
+        std::fs::create_dir_all(&backups).unwrap();
+        let (auto, manual) = auto_and_manual_names();
+        for name in auto.iter().chain(&manual).chain(std::iter::once(&"notes.txt".to_string())) {
+            std::fs::write(backups.join(name), b"").unwrap();
+        }
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        let target = backups.clone();
+        let new = store
+            .conn
+            .call(move |c| -> rusqlite::Result<_> { Ok(snapshot_into(c, &target, Reason::PreMigration)) })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut expected: Vec<String> = auto[3..].to_vec();
+        expected.push(new.file_name().unwrap().to_string_lossy().into_owned());
+        expected.extend(manual);
+        expected.push("notes.txt".into());
+        expected.sort();
+        assert_eq!(files_in(&backups), expected);
     }
 
     #[tokio::test]
