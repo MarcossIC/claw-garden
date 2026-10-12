@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use clawg_cli::client::{ClientError, DaemonClient, SearchArgs};
 use clawg_cli::daemon::api::{serve_ephemeral, AppCtx};
-use clawg_cli::mcp::tools::{format_context, format_hits};
+use clawg_cli::mcp::tools::{format_context, format_search};
 use clawg_core::eval_api::{EvalEmbedder, EvalError, EvalIngest, EvalTokenCounter};
 use clawg_core::paths::Profile;
 
@@ -128,7 +128,7 @@ async fn answer_cases(
                 limit: None,
             })
             .await?;
-        let search_text = format_hits(&hits);
+        let search_text = format_search(hits);
         let search_ms = elapsed_ms(started);
         let count_tokens = |line: &str| input.counter.count(line);
         let search_read = read_search(&search_text, &count_tokens, &case.expected_refs, corpus)

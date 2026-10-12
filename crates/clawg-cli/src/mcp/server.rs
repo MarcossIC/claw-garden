@@ -33,7 +33,7 @@ use serde::Deserialize;
 use crate::client::{ClientError, DaemonClient, ListArgs, SaveArgs, SearchArgs};
 use crate::mcp::startup::ClientHandle;
 use crate::mcp::tools::{
-    format_context, format_hits, format_rows, format_status, resolve_project_id,
+    format_context, format_rows, format_search, format_status, resolve_project_id,
 };
 
 /// Agent id used when the MCP client did not identify itself.
@@ -305,7 +305,7 @@ impl ClawgMcp {
             })
             .await
         {
-            Ok(hits) => Self::ok(format_hits(&hits)),
+            Ok(hits) => Self::ok(format_search(hits)),
             Err(e) => Self::failed(Self::explain(&e)),
         }
     }
@@ -411,8 +411,10 @@ impl ClawgMcp {
                        answering anything that depends on an earlier session. Matching is by \
                        meaning, so pass a full natural-language question, not keywords; it \
                        finds memories written in other words or in another language. Returns a \
-                       numbered list of memories with their ids, kinds and relevance scores; \
-                       content longer than 500 characters is truncated."
+                       numbered list of the memories close in relevance to the best match (at \
+                       least two), with their ids, kinds and relevance scores; a short list \
+                       means the rest scored far lower, not that nothing else is stored. \
+                       Content longer than 500 characters is truncated."
     )]
     async fn search_memory(
         &self,
@@ -729,6 +731,15 @@ mod tests {
         let d = description(&b, "recall_context");
         assert!(!d.contains("Prefer this over"), "description: {d}");
         assert!(d.contains("costs several times"), "description: {d}");
+    }
+
+    /// A short list is not a sign that memory is thin; the model has to know
+    /// the cut is by relevance or it reads a two-line answer as "nothing more".
+    #[tokio::test]
+    async fn search_memory_says_it_shows_only_the_hits_close_to_the_best() {
+        let (b, _d) = bridge().await;
+        let d = description(&b, "search_memory");
+        assert!(d.contains("close in relevance to the best match"), "description: {d}");
     }
 
     /// The model never sees more than a preview of each hit, and there is no

@@ -48,8 +48,40 @@ pub fn truncate_content(s: &str, max: usize) -> String {
     format!("{kept}…")
 }
 
+/// Share of the best hit's score another hit needs to be shown.
+///
+/// Relative, not absolute: measured on the golden set, the score of the
+/// expected memory and of the rest overlap (0.15–0.51 against up to 0.47), so
+/// no fixed floor separates them, while a clear winner can still shorten the
+/// list for free.
+pub const RELEVANCE_RATIO: f64 = 0.6;
+
+/// Hits shown regardless of score.
+pub const MIN_SHOWN_HITS: usize = 2;
+
+/// Drops the hits too far below the best one to be worth their tokens.
+///
+/// Expects `hits` best first, which is the order search returns them in.
+pub fn relevant_hits(mut hits: Vec<Hit>) -> Vec<Hit> {
+    let Some(best) = hits.first().map(|h| h.score) else {
+        return hits;
+    };
+    let shown = hits
+        .iter()
+        .enumerate()
+        .take_while(|(i, h)| *i < MIN_SHOWN_HITS || h.score >= RELEVANCE_RATIO * best)
+        .count();
+    hits.truncate(shown);
+    hits
+}
+
+/// What `search_memory` hands the model for a search's hits.
+pub fn format_search(hits: Vec<Hit>) -> String {
+    format_hits(&relevant_hits(hits))
+}
+
 /// Renders search hits as a numbered list, or says plainly that there were none.
-pub fn format_hits(hits: &[Hit]) -> String {
+fn format_hits(hits: &[Hit]) -> String {
     if hits.is_empty() {
         // A sentence, not an empty string: a model reading `""` cannot tell a
         // successful empty search from a broken tool.
@@ -163,6 +195,47 @@ mod tests {
             tier,
             score,
         }
+    }
+
+    fn scored(scores: &[f64]) -> Vec<Hit> {
+        scores.iter().enumerate().map(|(i, &s)| hit(i as i64 + 1, "Memory", "semantic_fact", 3, s, "x")).collect()
+    }
+
+    fn ids(hits: &[Hit]) -> Vec<i64> {
+        hits.iter().map(|h| h.id).collect()
+    }
+
+    #[test]
+    fn hits_far_below_the_best_match_are_not_shown() {
+        let kept = relevant_hits(scored(&[0.50, 0.40, 0.31, 0.29, 0.10]));
+        assert_eq!(ids(&kept), [1, 2, 3]);
+    }
+
+    #[test]
+    fn a_hit_exactly_at_the_ratio_is_shown() {
+        let kept = relevant_hits(scored(&[0.50, 0.40, 0.30]));
+        assert_eq!(ids(&kept), [1, 2, 3]);
+    }
+
+    /// When every score is low the best one is no clear winner, and the runner
+    /// up is as likely to be the answer: measured on the golden set, a query
+    /// whose answer scored 0.04 under a best of 0.10.
+    #[test]
+    fn the_two_best_are_shown_whatever_they_score() {
+        let kept = relevant_hits(scored(&[0.10, 0.04, 0.01]));
+        assert_eq!(ids(&kept), [1, 2]);
+    }
+
+    #[test]
+    fn the_search_output_shows_only_the_relevant_hits() {
+        let text = format_search(scored(&[0.50, 0.10, 0.05]));
+        assert!(text.contains("#1 ") && text.contains("#2 "), "{text}");
+        assert!(!text.contains("#3 "), "{text}");
+    }
+
+    #[test]
+    fn no_hits_stay_no_hits() {
+        assert!(relevant_hits(Vec::new()).is_empty());
     }
 
     fn row(id: i64, kind: &str, memory_type: Option<&str>, summary: &str) -> MemoryRow {

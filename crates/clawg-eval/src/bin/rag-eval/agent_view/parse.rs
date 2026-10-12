@@ -1,6 +1,6 @@
 //! Reads the text the MCP tools hand an agent back into content fragments.
 //!
-//! The formats are `clawg_cli::mcp::tools::format_hits` for search and the
+//! The formats are `clawg_cli::mcp::tools::format_search` for search and the
 //! prompt builder's blocks for recall. Parsing them (rather than reusing the
 //! structured hits) is what ties the measurement to the text itself: if either
 //! format drifts, these parsers fail loudly instead of the metric silently
@@ -27,7 +27,7 @@ pub enum ParseError {
 /// Text the search tool prints when nothing matched.
 const NO_HITS: &str = "no memories found";
 
-/// Splits `format_hits` output into its lines.
+/// Splits `format_search` output into its lines.
 pub fn parse_search_output(text: &str) -> Result<Vec<SearchLine>, ParseError> {
     if text.trim() == NO_HITS {
         return Ok(Vec::new());
