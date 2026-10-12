@@ -45,7 +45,7 @@ El bono tiene que estar en el score **antes** del recorte a k dentro de `knn_one
 
 ## D6. Los matches también son candidatos
 
-Los ids de `identifier_matches` se suman a los de `lexical_candidates` antes de restar los densos. Así un identificador que el KNN no trae (fuera del top 30, o pasado el token 16 del OR) igual se puntúa. El total queda acotado: como mucho presupuesto + presupuesto ids, bajo `MAX_LEXICAL_CANDIDATES` (512).
+Los ids de `identifier_matches` se suman a los de `lexical_candidates` antes de restar los densos. Así un identificador que el KNN no trae (fuera del top 30, o pasado el token 16 del OR) igual se puntúa. El total queda acotado a dos veces el presupuesto, y el presupuesto ya está acotado a `MAX_LEXICAL_CANDIDATES` (512, `search.rs:582`), muy por debajo del límite de parámetros de SQLite.
 
 ## D7. Medición
 
