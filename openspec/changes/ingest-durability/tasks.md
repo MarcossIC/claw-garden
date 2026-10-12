@@ -7,7 +7,7 @@ El orden va de adentro hacia afuera: primero el worker y el runtime (`clawg-core
 ## 0. Antes de empezar
 
 - [x] 0.1 Correr `cargo test --workspace` en la rama y anotar el conteo (base: 1.304, 0 fallos). En Windows, con `--target-dir` aparte.
-- [ ] 0.2 Medir el p50 y el p99 de un save con el embedder real, en el perfil dev, de un texto corto y de uno de varios chunks. **Necesita autorización** para usar `~/.clawg-dev`. Con eso se confirma o se ajusta el timeout de 10 s antes de la tarea 7.
+- [x] 0.2 Medir el p50 y el p99 de un save con el embedder real, en el perfil dev, de un texto corto y de uno de varios chunks. **Necesita autorización** para usar `~/.clawg-dev`. Con eso se confirma o se ajusta el timeout de 10 s antes de la tarea 7. Se midió después de la tarea 7, sobre `main` sin este cambio: el resultado está en `verify.md` y confirma los 10 s.
 
 ## 1. El worker informa qué escribió y qué falló (R3, D1)
 
@@ -84,8 +84,8 @@ El orden va de adentro hacia afuera: primero el worker y el runtime (`clawg-core
 ## 10. Verificación
 
 - [x] 10.1 `cargo test --workspace`: reportar el conteo contra la base de 1.304, con 0 fallos.
-- [ ] 10.2 Repetir la medición de 0.2 con el código nuevo y reportar el p50 y el p99 antes y después. **Necesita autorización**, igual que 0.2.
-- [ ] 10.3 Prueba manual en el perfil dev, **con autorización**:
+- [x] 10.2 Repetir la medición de 0.2 con el código nuevo y reportar el p50 y el p99 antes y después. **Necesita autorización**, igual que 0.2.
+- [x] 10.3 Prueba manual en el perfil dev, **con autorización**:
   - un `save_memory` devuelve `saved #N`;
   - `delete_memory` con ese id funciona;
   - sin red en el primer arranque, `clawg status` muestra `failed` con la causa, y al volver la red el embedder pasa a `ready` sin reiniciar.
