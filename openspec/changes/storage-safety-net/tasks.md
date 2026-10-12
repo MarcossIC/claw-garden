@@ -81,3 +81,15 @@ Lo encontró la prueba de punta a punta con el binario: sin directorio de datos,
 
 - [x] `cargo test --workspace`: reportar el conteo contra la base. Ver `verify.md`.
 - [ ] (pendiente, ver `verify.md`) Prueba manual en Windows, perfil dev, **sólo con autorización**: `clawg backup` con el daemon andando, `clawg stop`, `clawg restore`, arrancar y comparar el conteo de filas. Instalador con un daemon que no para.
+
+## Archivo
+
+Cuando los pendientes de `verify.md` pasen en Windows:
+
+- [ ] Marcar los pendientes de `verify.md` con su resultado y la suite de Windows; si cambia la base, actualizarla en `.claude/CLAUDE.md`.
+- [ ] `git mv openspec/changes/storage-safety-net openspec/changes/archive/AAAA-MM-DD-storage-safety-net`.
+- [ ] Consolidar `spec.md` en `openspec/specs/storage/spec.md`: agregar sus requisitos con las rutas y líneas del código en ese momento, y sumar el cambio a la línea **Origen**.
+- [ ] Corregir los enlaces relativos de los archivos movidos (un nivel más: `../2026-10-12-data-preservation/`, `../../../specs/`).
+- [ ] `state.yaml`: `phase: archived`, `verify: done`, `archive: done`.
+- [ ] `openspec/README.md`: filas 1 y 1b como archivadas, con enlace a `specs/storage`.
+- [ ] Commit: `docs(openspec): archive storage-safety-net`

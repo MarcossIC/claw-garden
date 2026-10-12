@@ -2,7 +2,7 @@
 
 **Código:** rama `claude/storage-sdd-xv8bd2`, un commit por tarea (más la corrección 9b y un ajuste de tests).
 **Modo:** Strict TDD (`openspec/config.yaml`: `strict_tdd: true`).
-**Estado:** verificado en Linux, con pendientes en Windows. R1 a R8 tienen sus tests en verde y se probaron de punta a punta con el binario debug. R9 (instalador) y la prueba manual en Windows quedan pendientes: este entorno no tiene PowerShell ni Windows.
+**Estado:** verificado en Linux, con pendientes en Windows. R1 a R8 tienen sus tests en verde y se probaron de punta a punta con el binario debug. R9 (instalador) y la prueba manual en Windows quedan pendientes: este entorno no tiene PowerShell ni Windows. El cambio queda en verify hasta que pasen; los pasos para archivarlo están en `tasks.md`.
 
 ## Suite
 
