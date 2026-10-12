@@ -29,7 +29,7 @@ use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{tool, tool_handler, tool_router, Peer, RoleServer, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -47,7 +47,8 @@ use crate::mcp::tools::{
 /// name effectively gets a new memory.
 pub const FALLBACK_AGENT_ID: &str = "mcp";
 
-/// What the host is told this server is for, at `initialize` time.
+/// What the host is told this server is for, at `initialize` or
+/// `server/discover`.
 const INSTRUCTIONS: &str = "\
 Persistent memory for this user across sessions. Use `save_memory` whenever the \
 user states a durable fact, preference or decision; use `search_memory` before \
@@ -227,11 +228,11 @@ impl ClawgMcp {
     }
 
     fn ok(text: impl Into<String>) -> Result<CallToolResult, rmcp::ErrorData> {
-        Ok(CallToolResult::success(vec![Content::text(text.into())]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(text.into())]))
     }
 
     fn failed(text: impl Into<String>) -> Result<CallToolResult, rmcp::ErrorData> {
-        Ok(CallToolResult::error(vec![Content::text(text.into())]))
+        Ok(CallToolResult::error(vec![ContentBlock::text(text.into())]))
     }
 
     /// The daemon client, once the background start has produced one.
@@ -240,7 +241,7 @@ impl ClawgMcp {
     /// returns it as its own result instead of hanging or dropping the bridge.
     async fn daemon(&self) -> Result<DaemonClient, CallToolResult> {
         self.client.get().await.map_err(|e| {
-            CallToolResult::error(vec![Content::text(Self::explain(&e))])
+            CallToolResult::error(vec![ContentBlock::text(Self::explain(&e))])
         })
     }
 
@@ -618,13 +619,15 @@ impl ClawgMcp {
     }
 }
 
-#[tool_handler]
+// The router built once in `with_handle`, not one per call, which is what
+// the macro does by default.
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for ClawgMcp {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         // Built through the constructor, not a struct literal: `ServerInfo` is
         // `#[non_exhaustive]`, so a literal would break on any rmcp release
         // that adds a field. Assignment afterwards is unaffected.
-        let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
+        let mut info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build());
         // The profile's own name, so a dev bridge and a prod bridge are two
         // distinguishable servers in the host's list rather than one shadowing
         // the other.

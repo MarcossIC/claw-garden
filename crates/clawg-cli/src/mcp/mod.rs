@@ -119,8 +119,8 @@ where
         }
     };
 
-    // Guarded, never bare: a host that opens with a probe rmcp 1.3 does not
-    // know (`server/discover`) must get an error back, not a dead process.
+    // Guarded, never bare: a host that cancels its `server/discover` probe
+    // before a session exists must not end the process.
     let transport = PreInitGuard::new(transport);
     let service = ClawgMcp::pending(client, profile)
         .serve(transport)

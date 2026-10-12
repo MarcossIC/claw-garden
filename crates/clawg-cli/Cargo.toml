@@ -44,8 +44,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "signal", "net", "io-
 clap = { version = "4", features = ["derive"] }
 axum = "0.8"
 env_logger = "0.11"
-rmcp = { version = "1", features = ["server", "transport-io", "macros", "schemars"] }
-# rmcp 1.3 generates tool schemas with schemars 1.x — a 0.8 here would not
+rmcp = { version = "3.5.1", features = ["server", "transport-io", "macros", "schemars"] }
+# rmcp generates tool schemas with schemars 1.x — a 0.8 here would not
 # satisfy its `JsonSchema` bound.
 schemars = "1"
 
