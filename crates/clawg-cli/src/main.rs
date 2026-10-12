@@ -18,9 +18,10 @@ use clawg_cli::daemon::serve;
 use clawg_cli::doctor;
 use clawg_cli::mcp;
 use clawg_cli::memories;
+use clawg_cli::restore;
 use clawg_cli::status::status_report;
 use clawg_cli::stop::{stop_in, STOP_TIMEOUT};
-use clawg_core::memory::backup::backup_offline;
+use clawg_core::memory::backup::{backup_offline, restore};
 use clawg_core::paths::data_dir;
 use clap::Parser;
 
@@ -128,6 +129,14 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 Err(e) => return Err(e.to_string()),
             };
             println!("{}", path.display());
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Restore { file, profile } => {
+            let profile = profile.resolve().map_err(|e| e.to_string())?;
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let restored = restore(&base_dir, &file).map_err(restore::explain)?;
+            println!("{}", restore::report(&file, &restored));
             Ok(ExitCode::SUCCESS)
         }
 

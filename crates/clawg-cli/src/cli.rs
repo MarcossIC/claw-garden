@@ -53,6 +53,14 @@ pub enum Command {
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Replace the memory store with a snapshot. The daemon must be stopped;
+    /// the store being replaced is snapshotted first.
+    Restore {
+        /// The snapshot to restore, usually one in `<data>/backups`.
+        file: PathBuf,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
     /// Report which `clawg` executables the PATH resolves to and whether this
     /// one is the one a terminal runs. Exits 1 if shadowed or duplicated.
     Doctor {
@@ -403,6 +411,18 @@ mod tests {
             parse(&["clawg", "backup", "--profile", "dev"]).command,
             Command::Backup { profile: ProfileArg { profile: Some("dev".into()) } }
         );
+    }
+
+    #[test]
+    fn restore_takes_a_file_and_a_profile() {
+        assert_eq!(
+            parse(&["clawg", "restore", "backups/memory-x-manual.db", "--profile", "dev"]).command,
+            Command::Restore {
+                file: PathBuf::from("backups/memory-x-manual.db"),
+                profile: ProfileArg { profile: Some("dev".into()) },
+            }
+        );
+        assert!(Cli::try_parse_from(["clawg", "restore"]).is_err(), "the file is required");
     }
 
     #[test]
