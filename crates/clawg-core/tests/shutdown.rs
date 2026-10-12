@@ -9,7 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use clawg_core::memory::embedder::{EmbedError, EmbedRole, Embedder, FakeEmbedder};
 use clawg_core::memory::events::{MemoryEvent, MemorySource};
-use clawg_core::memory::spill::SPILL_FILE;
+use clawg_core::memory::spill::{REJECTED_FILE, SPILL_FILE};
 use clawg_core::memory::MemoryStore;
 use clawg_core::models::chat::Role;
 use clawg_core::runtime::{MemoryRuntime, Workers};
@@ -147,4 +147,75 @@ async fn shutdown_spills_what_the_drain_deadline_left_unstarted() {
 
     assert_eq!(stored_contents(&runtime.store).await, sent[..1].to_vec());
     assert_eq!(spilled_contents(tmp.path()), Some(sent[1..].to_vec()));
+}
+
+fn write_spill(base_dir: &std::path::Path, lines: &[String]) {
+    let mut text = lines.join("\n");
+    text.push('\n');
+    std::fs::write(base_dir.join(SPILL_FILE), text).unwrap();
+}
+
+fn spill_line(content: &str) -> String {
+    serde_json::to_string(&event(content)).unwrap()
+}
+
+async fn wait_for_rows(store: &MemoryStore, n: usize) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let rows = stored_contents(store).await;
+        if rows.len() >= n || tokio::time::Instant::now() >= deadline {
+            return rows;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn spilled_events_are_ingested_first_on_startup() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_spill(tmp.path(), &[spill_line("spilled one"), spill_line("spilled two")]);
+    let (runtime, rx) = MemoryRuntime::new_for_test(tmp.path().to_path_buf()).await;
+    runtime.memory_tx.send(event("saved after the restart")).unwrap();
+
+    let workers = start(&runtime, rx);
+    let rows = wait_for_rows(&runtime.store, 3).await;
+
+    assert_eq!(rows, vec!["spilled one", "spilled two", "saved after the restart"]);
+    assert!(!tmp.path().join(SPILL_FILE).exists(), "a fully replayed spill must be removed");
+    runtime.shutdown(workers).await;
+}
+
+#[tokio::test]
+async fn a_corrupt_spill_line_is_set_aside_and_the_rest_ingested() {
+    let tmp = tempfile::tempdir().unwrap();
+    let truncated = "{\"agent_id\":\"agent-shutdown\",\"proj".to_string();
+    write_spill(tmp.path(), &[spill_line("before"), truncated.clone(), spill_line("after")]);
+    let (runtime, rx) = MemoryRuntime::new_for_test(tmp.path().to_path_buf()).await;
+
+    let workers = start(&runtime, rx);
+    let rows = wait_for_rows(&runtime.store, 2).await;
+    runtime.shutdown(workers).await;
+
+    assert_eq!(rows, vec!["before", "after"]);
+    let rejected = std::fs::read_to_string(tmp.path().join(REJECTED_FILE)).unwrap();
+    assert_eq!(rejected, format!("{truncated}\n"));
+    assert!(!tmp.path().join(SPILL_FILE).exists());
+}
+
+#[tokio::test]
+async fn a_shutdown_during_replay_keeps_the_unreplayed_lines_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_spill(tmp.path(), &[spill_line("old 1"), spill_line("old 2"), spill_line("old 3")]);
+    let (runtime, rx) = MemoryRuntime::new_for_test(tmp.path().to_path_buf()).await;
+    let runtime = MemoryRuntime { embedder: Arc::new(OnceCell::<Arc<dyn Embedder>>::new()), ..runtime };
+    runtime.memory_tx.send(event("new")).unwrap();
+
+    let workers = start(&runtime, rx);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    runtime.shutdown(workers).await;
+
+    assert_eq!(
+        spilled_contents(tmp.path()),
+        Some(vec!["old 1".to_string(), "old 2".to_string(), "old 3".to_string(), "new".to_string()])
+    );
 }

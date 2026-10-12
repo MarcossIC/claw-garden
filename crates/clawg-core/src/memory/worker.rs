@@ -18,6 +18,7 @@ use crate::memory::chunker::{
 };
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::events::{MemoryEvent, MemorySource};
+use crate::memory::spill::Replay;
 use crate::memory::store_insert::{MemoryStoreError, NewMemoryRecord};
 use crate::memory::MemoryStore;
 
@@ -137,10 +138,14 @@ fn drain_step(now: Instant, deadline: Option<Instant>, embedder_ready: bool) -> 
 /// every text in the call anyway. An insert failure stays isolated to its own
 /// chunk and the event's remaining chunks continue.
 ///
+/// `replay` holds the events a previous shutdown spilled. They go first, in
+/// file order, before anything from the channel.
+///
 /// `drain` carries the instant a shutdown wants the queue drained by. Once it
 /// is set the channel is closed to new events, what is already queued keeps
 /// being ingested until [`drain_step`] says to stop, and the events not yet
-/// started are returned in order for the caller to spill. The event in flight
+/// started (unreplayed ones first) are returned in order for the caller to
+/// spill. The event in flight
 /// always finishes: a half-ingested event replayed later would duplicate the
 /// chunks that did land. A dropped `drain` sender never asks for a drain.
 ///
@@ -150,6 +155,7 @@ fn drain_step(now: Instant, deadline: Option<Instant>, embedder_ready: bool) -> 
 pub async fn memory_worker(
     mut rx: UnboundedReceiver<MemoryEvent>,
     drain: watch::Receiver<Option<Instant>>,
+    mut replay: Replay,
     store: Arc<MemoryStore>,
     embedder_cell: Arc<OnceCell<Arc<dyn Embedder>>>,
     chat_chunker: Arc<ChatChunker>,
@@ -168,7 +174,18 @@ pub async fn memory_worker(
     let mut queue_over_depth = false;
     let mut drain = Some(drain);
     let mut deadline: Option<Instant> = None;
-    while let Some(evt) = next_event(&mut rx, &mut drain, &mut deadline).await {
+    loop {
+        observe_drain(&mut rx, &mut drain, &mut deadline);
+        let evt = match replay.next() {
+            Some(evt) => evt,
+            None => {
+                replay.finish().await;
+                match next_event(&mut rx, &mut drain, &mut deadline).await {
+                    Some(evt) => evt,
+                    None => break,
+                }
+            }
+        };
         // Read after recv: this is the backlog still waiting, which is what
         // "falling behind" means.
         let depth = rx.len();
@@ -185,7 +202,7 @@ pub async fn memory_worker(
         }
         hold_for_embedder(&embedder_cell, &mut rx, &mut drain, &mut deadline).await;
         if drain_step(Instant::now(), deadline, embedder_cell.get().is_some()) == DrainStep::Spill {
-            return unstarted(evt, &mut rx);
+            return unstarted(evt, replay, &mut rx);
         }
         if let Err(e) = process_event(
             &evt,
@@ -281,11 +298,17 @@ async fn hold_for_embedder(
     }
 }
 
-/// `evt` followed by everything still queued, in order. Closes the channel
-/// first so nothing can slip in behind the last event read.
-fn unstarted(evt: MemoryEvent, rx: &mut UnboundedReceiver<MemoryEvent>) -> Vec<MemoryEvent> {
+/// `evt`, then the events left to replay, then everything still queued, in
+/// order. Closes the channel first so nothing can slip in behind the last
+/// event read.
+fn unstarted(
+    evt: MemoryEvent,
+    replay: Replay,
+    rx: &mut UnboundedReceiver<MemoryEvent>,
+) -> Vec<MemoryEvent> {
     rx.close();
     let mut events = vec![evt];
+    events.extend(replay.into_remaining());
     while let Ok(next) = rx.try_recv() {
         events.push(next);
     }
@@ -2051,7 +2074,7 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<MemoryEvent>();
         let handle = tokio::spawn(async move {
-            memory_worker(rx, no_drain(), store, cell, chat_chunker, code_chunker).await;
+            memory_worker(rx, no_drain(), Replay::none(), store, cell, chat_chunker, code_chunker).await;
         });
         (tx, handle)
     }
@@ -2080,7 +2103,7 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<MemoryEvent>();
         let handle = tokio::spawn(async move {
-            memory_worker(rx, no_drain(), store, cell, chat_chunker, code_chunker).await;
+            memory_worker(rx, no_drain(), Replay::none(), store, cell, chat_chunker, code_chunker).await;
         });
         (tx, handle)
     }

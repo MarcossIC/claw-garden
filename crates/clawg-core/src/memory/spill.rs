@@ -5,12 +5,104 @@
 //! tested without a filesystem; the file is replaced atomically so a shutdown
 //! that dies mid-write leaves the previous spill whole.
 
-use std::path::Path;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 
 use crate::memory::events::MemoryEvent;
 
 /// Name of the spill file inside the data directory.
 pub const SPILL_FILE: &str = "ingest-pending.jsonl";
+
+/// Where spill lines that do not parse are kept. Nothing deletes it: those
+/// lines are someone's saves, and only a person can tell what they were.
+pub const REJECTED_FILE: &str = "ingest-pending.rejected.jsonl";
+
+/// Spilled events still to be ingested on this start, ahead of anything new.
+pub struct Replay {
+    events: VecDeque<MemoryEvent>,
+    /// The spill file to remove once every event is taken; `None` when there
+    /// is none, or when its unparseable lines could not be set aside and it
+    /// must stay as their only copy.
+    file: Option<PathBuf>,
+}
+
+impl Replay {
+    /// Nothing to replay.
+    pub fn none() -> Self {
+        Self { events: VecDeque::new(), file: None }
+    }
+
+    pub(crate) fn next(&mut self) -> Option<MemoryEvent> {
+        self.events.pop_front()
+    }
+
+    /// The events not taken yet, in order.
+    pub(crate) fn into_remaining(self) -> VecDeque<MemoryEvent> {
+        self.events
+    }
+
+    /// Removes the spill file once every event is taken. Until then a crash
+    /// replays the whole file again, and the dedup gate absorbs the events
+    /// already ingested.
+    pub(crate) async fn finish(&mut self) {
+        if !self.events.is_empty() {
+            return;
+        }
+        let Some(file) = self.file.take() else { return };
+        match tokio::fs::remove_file(&file).await {
+            Ok(()) => log::info!("replayed every spilled ingest event from {}", file.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!("could not remove {} after replaying it: {e}", file.display()),
+        }
+    }
+}
+
+/// Reads `<base_dir>/ingest-pending.jsonl` for replay, moving lines that do
+/// not parse to [`REJECTED_FILE`].
+pub(crate) async fn load(base_dir: &Path) -> Replay {
+    let path = base_dir.join(SPILL_FILE);
+    let text = match tokio::fs::read_to_string(&path).await {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Replay::none(),
+        Err(e) => {
+            log::error!("could not read {}, its events are not replayed: {e}", path.display());
+            return Replay::none();
+        }
+    };
+    let (events, rejected) = parse_lines(&text);
+    log::info!("replaying {} spilled ingest events from {}", events.len(), path.display());
+    let mut file = Some(path);
+    if !rejected.is_empty() {
+        let rejected_path = base_dir.join(REJECTED_FILE);
+        match append_lines(&rejected_path, &rejected) {
+            Ok(()) => log::warn!(
+                "{} spilled lines are not ingest events; kept in {}",
+                rejected.len(),
+                rejected_path.display()
+            ),
+            Err(e) => {
+                log::error!(
+                    "could not set aside {} unreadable spilled lines in {}: {e}; keeping the spill file",
+                    rejected.len(),
+                    rejected_path.display()
+                );
+                file = None;
+            }
+        }
+    }
+    Replay { events: events.into(), file }
+}
+
+/// Blocking on purpose: it runs once at startup, only when a spill had bad
+/// lines, and writes a few lines.
+fn append_lines(path: &Path, lines: &[String]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut text = lines.join("\n");
+    text.push('\n');
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    f.write_all(text.as_bytes())?;
+    f.sync_all()
+}
 
 /// One JSON line per event. JSON escapes newlines inside strings, so an event
 /// always fits on one line.

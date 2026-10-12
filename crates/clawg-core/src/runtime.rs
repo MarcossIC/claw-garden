@@ -289,7 +289,8 @@ fn ingest_worker_future(
     async move {
         let chat_chunker = resolve_tokenizer_and_chunker(&base_dir, &tokenizer);
         let code_chunker = Arc::new(CodeChunker::new());
-        memory_worker(rx, drain, store, embedder, chat_chunker, code_chunker).await
+        let replay = spill::load(&base_dir).await;
+        memory_worker(rx, drain, replay, store, embedder, chat_chunker, code_chunker).await
     }
 }
 

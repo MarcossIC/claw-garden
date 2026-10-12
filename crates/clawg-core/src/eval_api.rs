@@ -465,6 +465,7 @@ impl EvalIngest {
         let worker = tokio::spawn(memory_worker(
             rx,
             tokio::sync::watch::channel(None).1,
+            crate::memory::spill::Replay::none(),
             runtime.store.clone(),
             runtime.embedder.clone(),
             chat_chunker,
