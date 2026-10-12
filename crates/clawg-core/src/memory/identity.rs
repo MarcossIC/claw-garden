@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::hash::{Hash, Hasher};
 use siphasher::sip::SipHasher13;
 
@@ -12,6 +12,82 @@ pub fn derive_project_id(project_path: &Path) -> String {
     let name = basename(project_path);
     let h = hash4(project_path.as_os_str().as_encoded_bytes());
     format!("{}-{}", name, h)
+}
+
+/// What a directory's `.git` entry says about where its project's root is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitMarker {
+    /// `.git` is a directory: an ordinary checkout.
+    Dir,
+    /// `.git` is a file naming the real git directory, as worktrees and
+    /// submodules write it. `commondir` is the content of `<gitdir>/commondir`,
+    /// which only a worktree's git directory has.
+    Link { gitdir: PathBuf, commondir: Option<String> },
+}
+
+/// The project root for `dir`, the directory holding a `.git` described by `marker`.
+///
+/// A worktree resolves to the repository it was added from, so every branch
+/// checked out beside it shares one memory. That only holds when the common
+/// git directory is a `.git` inside a work tree; for a bare repository there
+/// is no such work tree, and the worktree stays its own root.
+pub fn root_from_marker(dir: &Path, marker: &GitMarker) -> PathBuf {
+    let GitMarker::Link { gitdir, commondir: Some(common) } = marker else {
+        return dir.to_path_buf();
+    };
+    let common = normalize_lexical(&gitdir.join(common.trim()));
+    match common.file_name() {
+        Some(name) if name == ".git" => common.parent().map_or_else(|| dir.to_path_buf(), Path::to_path_buf),
+        _ => dir.to_path_buf(),
+    }
+}
+
+/// The git directory a `.git` file in `dir` points at, or `None` when the
+/// content is not a `gitdir:` line. A relative target is relative to `dir`,
+/// as git writes it with `worktree.useRelativePaths`.
+pub fn parse_gitdir(contents: &str, dir: &Path) -> Option<PathBuf> {
+    let target = contents.lines().next()?.strip_prefix("gitdir:")?.trim();
+    if target.is_empty() {
+        return None;
+    }
+    Some(normalize_lexical(&dir.join(target)))
+}
+
+/// `path` without `.` components, trailing separators or `..` that a
+/// preceding name cancels. Purely textual: it never asks the filesystem
+/// whether a name is a link.
+pub fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => out.push(".."),
+            },
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// `path` without the `\\?\` verbatim prefix that `canonicalize` adds on
+/// Windows. Ids are hashed from the path's bytes, and the working directory a
+/// bridge starts in never carries that prefix.
+pub fn strip_verbatim(path: &Path) -> PathBuf {
+    let Some(s) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path.to_path_buf(),
+    }
 }
 
 /// Return the 4-hex-character SipHash-1-3 fingerprint of `s`.
@@ -71,5 +147,78 @@ mod tests {
         let p1 = PathBuf::from("/home/user/projects/my-app");
         let p2 = PathBuf::from("/home/user/projects/my-app-v2");
         assert_ne!(derive_project_id(&p1), derive_project_id(&p2));
+    }
+
+    #[test]
+    fn normalize_lexical_drops_dots_and_trailing_separators() {
+        assert_eq!(normalize_lexical(Path::new("/w/repo/")), PathBuf::from("/w/repo"));
+        assert_eq!(normalize_lexical(Path::new("/w/./repo/src/..")), PathBuf::from("/w/repo"));
+        assert_eq!(normalize_lexical(Path::new("/..")), PathBuf::from("/"));
+        assert_eq!(normalize_lexical(Path::new("../x/../y")), PathBuf::from("../y"));
+    }
+
+    #[test]
+    fn strip_verbatim_removes_only_the_prefix_canonicalize_adds() {
+        assert_eq!(strip_verbatim(Path::new(r"\\?\C:\Users\u\Repo")), PathBuf::from(r"C:\Users\u\Repo"));
+        assert_eq!(strip_verbatim(Path::new(r"\\?\UNC\srv\share\repo")), PathBuf::from(r"\\srv\share\repo"));
+        assert_eq!(strip_verbatim(Path::new(r"\\?\Volume{x}\repo")), PathBuf::from(r"\\?\Volume{x}\repo"));
+        assert_eq!(strip_verbatim(Path::new("/home/u/repo")), PathBuf::from("/home/u/repo"));
+    }
+
+    #[test]
+    fn parse_gitdir_reads_absolute_and_relative_targets() {
+        let dir = Path::new("/w/wt");
+        assert_eq!(
+            parse_gitdir("gitdir: /w/repo/.git/worktrees/wt\n", dir),
+            Some(PathBuf::from("/w/repo/.git/worktrees/wt"))
+        );
+        assert_eq!(
+            parse_gitdir("gitdir: ../repo/.git/worktrees/wt\r\n", dir),
+            Some(PathBuf::from("/w/repo/.git/worktrees/wt"))
+        );
+        assert_eq!(
+            parse_gitdir("gitdir: /w/my repo/.git/modules/sub", dir),
+            Some(PathBuf::from("/w/my repo/.git/modules/sub"))
+        );
+        assert_eq!(parse_gitdir("ref: refs/heads/main", dir), None);
+        assert_eq!(parse_gitdir("gitdir:   ", dir), None);
+    }
+
+    #[test]
+    fn a_git_directory_makes_its_parent_the_root() {
+        assert_eq!(root_from_marker(Path::new("/w/repo"), &GitMarker::Dir), PathBuf::from("/w/repo"));
+    }
+
+    #[test]
+    fn a_worktree_resolves_to_the_repository_it_was_added_from() {
+        let relative = GitMarker::Link {
+            gitdir: PathBuf::from("/w/repo/.git/worktrees/wt"),
+            commondir: Some("../..\n".into()),
+        };
+        assert_eq!(root_from_marker(Path::new("/w/wt"), &relative), PathBuf::from("/w/repo"));
+
+        let absolute = GitMarker::Link {
+            gitdir: PathBuf::from("/w/repo/.git/worktrees/wt"),
+            commondir: Some("/w/repo/.git".into()),
+        };
+        assert_eq!(root_from_marker(Path::new("/w/wt"), &absolute), PathBuf::from("/w/repo"));
+    }
+
+    #[test]
+    fn a_worktree_of_a_bare_repository_is_its_own_root() {
+        let marker = GitMarker::Link {
+            gitdir: PathBuf::from("/w/repo.git/worktrees/wt"),
+            commondir: Some("../..".into()),
+        };
+        assert_eq!(root_from_marker(Path::new("/w/wt"), &marker), PathBuf::from("/w/wt"));
+    }
+
+    #[test]
+    fn a_submodule_is_its_own_root() {
+        let marker = GitMarker::Link {
+            gitdir: PathBuf::from("/w/repo/.git/modules/sub"),
+            commondir: None,
+        };
+        assert_eq!(root_from_marker(Path::new("/w/repo/sub"), &marker), PathBuf::from("/w/repo/sub"));
     }
 }
