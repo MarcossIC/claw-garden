@@ -410,7 +410,7 @@ fn render_rows(rows: &AutoRows) -> String {
 /// plain write truncates the target first, USER section included. The
 /// rename replaces an existing target on Windows too (`MoveFileExW` with
 /// `MOVEFILE_REPLACE_EXISTING`).
-async fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) async fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);

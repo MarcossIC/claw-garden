@@ -58,6 +58,7 @@ pub mod search;
 pub mod workspace;
 pub mod prompt_builder;
 pub(crate) mod contradiction;
+pub mod spill;
 pub mod resolver;
 pub mod extractor;
 pub(crate) mod episodic_writer;
