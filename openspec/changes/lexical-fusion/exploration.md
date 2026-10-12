@@ -27,7 +27,8 @@
 ### Piso
 
 - Por debajo de 0,8793 el score es 0 (`crates/clawg-core/src/memory/score.rs:201-203`).
-- En `search_memory`, una fila en 0 sólo llega al agente si queda en las posiciones 0–1 o si el mejor score también es 0. Ver retrieval-hygiene.
+- En `search_memory`, una fila en 0 sólo llega al agente si queda en las posiciones 0–1 o si el mejor score también es 0.
+- **Empates en 0 (viene de retrieval-hygiene).** `hit_cmp` desempata por `(kind, id ASC)` (`search.rs:78-84`), así que entre ceros sale primero la memoria más vieja. Desempatar por distancia parece lo obvio, pero se probó y rompe `the_two_sweep_lexical_points_search_differently_and_say_so_in_their_results` (`crates/clawg-eval/src/bin/rag-eval/main.rs:1534`): un candidato que sólo trae el canal léxico está fuera de los k más cercanos del denso, así que por distancia siempre queda detrás de todos los ceros densos. Hoy ese candidato sólo llega al top 10 por ser más viejo. El orden entre ceros, y si se muestran, se decide con la fusión.
 
 ### No medible hoy
 

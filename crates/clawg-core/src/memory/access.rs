@@ -27,6 +27,7 @@ use tokio::task::JoinHandle;
 use tokio_rusqlite::Connection;
 
 use crate::memory::clock::TimestampMs;
+use crate::memory::{RankedHit, TableKind};
 
 /// Buffers retrieved memory IDs and forwards them to the async flush worker.
 pub struct AccessTracker {
@@ -137,6 +138,23 @@ impl AccessTracker {
         if let Err(e) = worker.await {
             log::warn!("access tracker worker ended abnormally: {e}");
         }
+    }
+
+    /// Records the hits a retrieval actually found, out of the ones it hands back.
+    ///
+    /// Only `memory` rows: the flush updates `memory WHERE id = ?`, and ids are
+    /// per-table, so an episodic or procedural id would land on an unrelated
+    /// `memory` row that happens to share the number. Only hits that scored:
+    /// a row at 0 is below the similarity floor and is there to fill a slot,
+    /// and counting it would reset its decay and push it toward a promotion
+    /// the query never earned it.
+    pub fn record_hits(&self, hits: &[RankedHit]) {
+        self.record(
+            hits.iter()
+                .filter(|h| h.kind == TableKind::Memory && h.score > 0.0)
+                .map(|h| h.id)
+                .collect(),
+        );
     }
 }
 
@@ -373,6 +391,47 @@ mod tests {
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {} // expected
             Err(e) => panic!("unexpected channel error: {e:?}"),
         }
+    }
+
+    // ── which hits count as an access ─────────────────────────────
+
+    fn ranked(id: i64, kind: crate::memory::TableKind, score: f64) -> crate::memory::RankedHit {
+        crate::memory::RankedHit {
+            id,
+            kind,
+            content: String::new(),
+            memory_type: String::new(),
+            tier: 3,
+            status: "active".into(),
+            score,
+            distance: 0.5,
+            created_at: TimestampMs::from_unix_millis(0),
+        }
+    }
+
+    #[test]
+    fn record_hits_keeps_only_memory_hits_that_scored() {
+        use crate::memory::TableKind;
+        let (tracker, mut rx) = AccessTracker::for_test();
+
+        tracker.record_hits(&[
+            ranked(1, TableKind::Memory, 0.4),
+            ranked(2, TableKind::Memory, 0.0),
+            ranked(3, TableKind::Procedural, 0.9),
+            ranked(4, TableKind::Memory, 0.1),
+        ]);
+
+        assert_eq!(rx.try_recv().expect("a batch"), Msg::Hit(vec![1, 4]));
+    }
+
+    #[test]
+    fn record_hits_with_nothing_countable_sends_nothing() {
+        use crate::memory::TableKind;
+        let (tracker, mut rx) = AccessTracker::for_test();
+
+        tracker.record_hits(&[ranked(2, TableKind::Memory, 0.0), ranked(3, TableKind::Episodic, 0.7)]);
+
+        assert!(rx.try_recv().is_err(), "a batch with no countable hit must not reach the channel");
     }
 
     // ── Extra: non-empty vec DOES send ──────────────────────────────────────
