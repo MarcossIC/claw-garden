@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 y 5 | M | eval-golden-expansion (archivado) | apply |
+| 1 y 5 | M | eval-golden-expansion (archivado) | verify |
 
 ## Problema
 
