@@ -19,6 +19,7 @@
 
 mod draft;
 mod mine;
+mod synth;
 
 use std::path::PathBuf;
 
@@ -60,6 +61,66 @@ struct Args {
     pool_cap: usize,
 }
 
+#[derive(Debug)]
+struct SynthArgs {
+    base: PathBuf,
+    out: PathBuf,
+    seed: u64,
+    distractors: usize,
+}
+
+#[derive(Debug)]
+enum Command {
+    Mine(Args),
+    Synth(SynthArgs),
+}
+
+fn parse_command<I: Iterator<Item = String>>(args: I) -> Result<Command, String> {
+    let argv: Vec<String> = args.collect();
+    if argv.get(1).map(String::as_str) == Some("synth") {
+        return parse_synth_args(argv.into_iter().skip(2)).map(Command::Synth);
+    }
+    parse_args(argv.into_iter()).map(Command::Mine)
+}
+
+fn parse_synth_args<I: Iterator<Item = String>>(mut args: I) -> Result<SynthArgs, String> {
+    let mut base = None;
+    let mut out = None;
+    let mut seed = None;
+    let mut distractors = synth::DEFAULT_DISTRACTORS;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--base" => base = Some(PathBuf::from(args.next().ok_or("--base requires a value")?)),
+            "--out" => out = Some(PathBuf::from(args.next().ok_or("--out requires a value")?)),
+            "--seed" => {
+                seed = Some(
+                    args.next()
+                        .ok_or("--seed requires a value")?
+                        .parse()
+                        .map_err(|_| "--seed must be a non-negative integer".to_string())?,
+                )
+            }
+            "--distractors" => {
+                distractors = args
+                    .next()
+                    .ok_or("--distractors requires a value")?
+                    .parse()
+                    .map_err(|_| "--distractors must be a non-negative integer".to_string())?
+            }
+            "--help" | "-h" => return Err(HELP.to_string()),
+            other => return Err(format!("unknown flag '{other}'")),
+        }
+    }
+
+    let base = base.ok_or("--base is required")?;
+    let out = out.ok_or("--out is required")?;
+    if out == base {
+        return Err("--out must differ from --base: the base set is never overwritten".to_string());
+    }
+    Ok(SynthArgs { base, out, seed: seed.ok_or("--seed is required")?, distractors })
+}
+
 fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
     args.next();
     let mut candidates = None;
@@ -98,6 +159,7 @@ golden-mine - builds a hard golden-set draft from a pool of candidate documents
 
 USAGE:
     golden-mine --candidates <path> --out <path> [--pool N]
+    golden-mine synth --base <path> --out <path> --seed <N> [--distractors N]
 
 OPTIONS:
     --candidates <path>  JSON array from the engram extractor
@@ -106,6 +168,15 @@ OPTIONS:
                          above the cap is ignored, so raising it widens the space
                          the miner can find hard distractors in, at linear cost.
     --help, -h           Print this message
+
+SYNTH:
+    Expands a golden set with synthetic rows and cases. The same base and seed
+    always produce the same file; the base is read, never modified.
+
+    --base <path>        Golden set to expand (rag-eval's golden.json)
+    --out <path>         Where to write the expanded set; must differ from --base
+    --seed <N>           Seed of the generator
+    --distractors N      Distractor rows to add (default 500)
 ";
 
 fn production_base_dir() -> PathBuf {
@@ -119,8 +190,9 @@ async fn main() {
 }
 
 async fn run<I: Iterator<Item = String>>(argv: I) -> i32 {
-    let args = match parse_args(argv) {
-        Ok(a) => a,
+    let args = match parse_command(argv) {
+        Ok(Command::Mine(a)) => a,
+        Ok(Command::Synth(a)) => return run_synth(&a),
         Err(message) => {
             eprintln!("{message}");
             return EXIT_FAILURE;
@@ -222,6 +294,56 @@ async fn run<I: Iterator<Item = String>>(argv: I) -> i32 {
     EXIT_OK
 }
 
+fn run_synth(args: &SynthArgs) -> i32 {
+    // Compared on disk as well as by name: `./g.json` and `g.json` are one file.
+    if let (Ok(base), Ok(out)) = (args.base.canonicalize(), args.out.canonicalize()) {
+        if base == out {
+            eprintln!("--out resolves to the same file as --base; the base set is never overwritten");
+            return EXIT_FAILURE;
+        }
+    }
+    let raw = match std::fs::read_to_string(&args.base) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("failed to read {}: {e}", args.base.display());
+            return EXIT_FAILURE;
+        }
+    };
+    let base: synth::golden::Golden = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("failed to parse {}: {e}", args.base.display());
+            return EXIT_FAILURE;
+        }
+    };
+    let expanded = match synth::generate(&base, args.seed, args.distractors) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("failed to generate: {e}");
+            return EXIT_FAILURE;
+        }
+    };
+    let mut json = match serde_json::to_string_pretty(&expanded) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("failed to serialize the golden set: {e}");
+            return EXIT_FAILURE;
+        }
+    };
+    json.push('\n');
+    if let Err(e) = std::fs::write(&args.out, &json) {
+        eprintln!("failed to write {}: {e}", args.out.display());
+        return EXIT_FAILURE;
+    }
+
+    println!("base   sha256: {}", clawg_core::eval_api::sha256_hex(raw.as_bytes()));
+    println!("output sha256: {}", clawg_core::eval_api::sha256_hex(json.as_bytes()));
+    println!("corpus:  {} rows ({} from the base)", expanded.corpus.len(), base.corpus.len());
+    println!("cases:   {} ({} from the base)", expanded.retrieval_cases.len(), base.retrieval_cases.len());
+    println!("wrote {}", args.out.display());
+    EXIT_OK
+}
+
 /// Keeps at most `cap / distinct_types` documents of each `memory_type`.
 fn cap_per_type(pool: Vec<draft::Candidate>, cap: usize) -> Vec<draft::Candidate> {
     let mut types: Vec<String> = pool.iter().map(|c| c.memory_type.clone()).collect();
@@ -270,6 +392,44 @@ mod tests {
         assert_eq!(args.candidates, PathBuf::from("in.json"));
         assert_eq!(args.out, PathBuf::from("out.json"));
         assert_eq!(args.pool_cap, 400);
+    }
+
+    #[test]
+    fn synth_parses_its_flags_and_defaults_the_distractors() {
+        let cmd = parse_command(argv(&["synth", "--base", "g.json", "--out", "x.json", "--seed", "7"])).unwrap();
+        let Command::Synth(args) = cmd else { panic!("expected the synth command") };
+        assert_eq!(args.base, PathBuf::from("g.json"));
+        assert_eq!(args.out, PathBuf::from("x.json"));
+        assert_eq!(args.seed, 7);
+        assert_eq!(args.distractors, 500);
+    }
+
+    #[test]
+    fn synth_takes_an_explicit_distractor_count() {
+        let cmd = parse_command(argv(&[
+            "synth", "--base", "g", "--out", "x", "--seed", "1", "--distractors", "20",
+        ]))
+        .unwrap();
+        let Command::Synth(args) = cmd else { panic!("expected the synth command") };
+        assert_eq!(args.distractors, 20);
+    }
+
+    #[test]
+    fn synth_without_a_seed_is_an_error() {
+        assert!(parse_command(argv(&["synth", "--base", "g", "--out", "x"])).is_err());
+    }
+
+    #[test]
+    fn synth_refuses_to_write_over_its_base() {
+        let err = parse_command(argv(&["synth", "--base", "g.json", "--out", "g.json", "--seed", "1"]))
+            .expect_err("--out equal to --base must fail");
+        assert!(err.contains("--out"), "got: {err}");
+    }
+
+    #[test]
+    fn the_mining_mode_still_parses_through_the_dispatcher() {
+        let cmd = parse_command(argv(&["--candidates", "in.json", "--out", "out.json"])).unwrap();
+        assert!(matches!(cmd, Command::Mine(_)));
     }
 
     #[test]
