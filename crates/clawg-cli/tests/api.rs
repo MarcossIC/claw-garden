@@ -75,16 +75,16 @@ impl Harness {
         // the runtime had at that moment.
         let runtime = match embedder {
             EmbedderState::Ready => {
-                tokio::spawn(runtime.ingest_worker(rx));
+                tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
                 runtime
             }
             EmbedderState::NeverLoaded => {
                 let runtime = with_empty_embedder(runtime);
-                tokio::spawn(runtime.ingest_worker(rx));
+                tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
                 runtime
             }
             EmbedderState::ServedEmpty => {
-                tokio::spawn(runtime.ingest_worker(rx));
+                tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
                 with_empty_embedder(runtime)
             }
         };

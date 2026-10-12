@@ -189,7 +189,7 @@ mod tests {
         async fn new(delay: Duration) -> Arc<Self> {
             let dir = tempfile::tempdir().expect("tempdir");
             let (runtime, rx) = MemoryRuntime::new_for_test(dir.path().to_path_buf()).await;
-            tokio::spawn(runtime.ingest_worker(rx));
+            tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
             let token = "slow-daemon-token".to_string();
             let (shutdown, _rx) = tokio::sync::watch::channel(false);
             let ctx = Arc::new(AppCtx {

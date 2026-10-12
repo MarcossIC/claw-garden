@@ -16,9 +16,13 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use once_cell::sync::OnceCell;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::memory::access::AccessTracker;
 use crate::memory::chunker::CodeChunker;
@@ -26,9 +30,28 @@ use crate::memory::embedder::Embedder;
 use crate::memory::events::MemoryEvent;
 use crate::memory::store_lock::StoreHolder;
 use crate::memory::maintenance::{run_maintenance_loop, MAINTENANCE_PERIOD, STARTUP_DELAY};
+use crate::memory::spill;
 use crate::memory::worker::{memory_worker, resolve_tokenizer_and_chunker};
 use crate::memory::workspace::WorkspaceManager;
 use crate::memory::{MemoryError, MemoryStore};
+
+/// How long a shutdown keeps ingesting what is queued before it spills the
+/// rest to disk. It must leave `clawg stop`'s timeout room for the event in
+/// flight, the spill, the access flush and the checkpoint, so the stop sees
+/// the process end; a test in `clawg-cli` pins that relation. A starting value
+/// chosen for that margin, not measured.
+pub const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The background tasks a host spawned from a [`MemoryRuntime`], handed back
+/// to [`MemoryRuntime::shutdown`].
+pub struct Workers {
+    /// The ingest worker's drain signal; shutdown sends the deadline on it.
+    pub drain: watch::Sender<Option<Instant>>,
+    /// [`MemoryRuntime::ingest_worker`], spawned.
+    pub ingest: JoinHandle<Vec<MemoryEvent>>,
+    /// [`MemoryRuntime::maintenance_worker`], spawned.
+    pub maintenance: JoinHandle<()>,
+}
 
 /// The memory substrate's live handles for one process.
 ///
@@ -122,16 +145,22 @@ impl MemoryRuntime {
     /// since the receiver is not `Clone`, the type system enforces "one
     /// drainer" as long as nobody spawns this future twice with two receivers
     /// off two channels. A second spawn site would race it.
+    ///
+    /// `drain` is the receiving end of [`Workers::drain`]: a host that will
+    /// call [`MemoryRuntime::shutdown`] keeps the sender there. The future
+    /// resolves to the events it did not ingest, which shutdown spills.
     pub fn ingest_worker(
         &self,
         rx: UnboundedReceiver<MemoryEvent>,
-    ) -> impl Future<Output = ()> + Send + 'static {
+        drain: watch::Receiver<Option<Instant>>,
+    ) -> impl Future<Output = Vec<MemoryEvent>> + Send + 'static {
         ingest_worker_future(
             self.base_dir.clone(),
             self.store.clone(),
             self.embedder.clone(),
             self.tokenizer.clone(),
             rx,
+            drain,
         )
     }
 
@@ -140,6 +169,48 @@ impl MemoryRuntime {
     /// host drops or aborts it at shutdown.
     pub fn maintenance_worker(&self) -> impl Future<Output = ()> + Send + 'static {
         maintenance_worker_future(self.store.clone())
+    }
+
+    /// Orderly shutdown, once nothing can send new events: drains the ingest
+    /// queue for up to [`DRAIN_DEADLINE`] and spills what is left to
+    /// `<base_dir>/ingest-pending.jsonl`, flushes the access tracker and stops
+    /// maintenance.
+    pub async fn shutdown(&self, workers: Workers) {
+        self.shutdown_by(workers, DRAIN_DEADLINE).await;
+    }
+
+    /// [`MemoryRuntime::shutdown`] with a drain deadline short enough for a test.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn shutdown_within(&self, workers: Workers, drain_deadline: Duration) {
+        self.shutdown_by(workers, drain_deadline).await;
+    }
+
+    async fn shutdown_by(&self, workers: Workers, drain_deadline: Duration) {
+        // An error means the worker already ended; awaiting it below says how.
+        let _ = workers.drain.send(Some(Instant::now() + drain_deadline));
+        let unstarted = match workers.ingest.await {
+            Ok(events) => events,
+            Err(e) => {
+                log::error!("the ingest worker ended abnormally: {e}");
+                Vec::new()
+            }
+        };
+        if !unstarted.is_empty() {
+            match spill::write(&self.base_dir, &unstarted).await {
+                Ok(()) => log::info!(
+                    "saved {} events not yet ingested to {} for the next start",
+                    unstarted.len(),
+                    self.base_dir.join(spill::SPILL_FILE).display()
+                ),
+                Err(e) => log::error!(
+                    "could not save {} events not yet ingested, they are lost: {e}",
+                    unstarted.len()
+                ),
+            }
+        }
+        self.access_tracker.shutdown().await;
+        workers.maintenance.abort();
+        let _ = workers.maintenance.await;
     }
 
     /// Workspace manager rooted at `<base_dir>/workspaces`.
@@ -213,11 +284,12 @@ fn ingest_worker_future(
     embedder: Arc<OnceCell<Arc<dyn Embedder>>>,
     tokenizer: Arc<OnceCell<Arc<tokenizers::Tokenizer>>>,
     rx: UnboundedReceiver<MemoryEvent>,
-) -> impl Future<Output = ()> + Send + 'static {
+    drain: watch::Receiver<Option<Instant>>,
+) -> impl Future<Output = Vec<MemoryEvent>> + Send + 'static {
     async move {
         let chat_chunker = resolve_tokenizer_and_chunker(&base_dir, &tokenizer);
         let code_chunker = Arc::new(CodeChunker::new());
-        memory_worker(rx, store, embedder, chat_chunker, code_chunker).await;
+        memory_worker(rx, drain, store, embedder, chat_chunker, code_chunker).await
     }
 }
 
@@ -238,6 +310,7 @@ fn maintenance_worker_future(
 const _: fn() = || {
     fn _send_static<T: Send + 'static>() {}
     _send_static::<UnboundedReceiver<MemoryEvent>>();
+    _send_static::<watch::Receiver<Option<Instant>>>();
     _send_static::<Arc<MemoryStore>>();
     _send_static::<Arc<OnceCell<Arc<dyn Embedder>>>>();
     _send_static::<Arc<OnceCell<Arc<tokenizers::Tokenizer>>>>();
@@ -375,7 +448,7 @@ mod tests {
         let store = rt.store.clone();
         let tx = rt.memory_tx.clone();
 
-        let worker = tokio::spawn(rt.ingest_worker(rx));
+        let worker = tokio::spawn(rt.ingest_worker(rx, watch::channel(None).1));
         tx.send(chat_event("a row lands on a plain tokio runtime"))
             .expect("send");
         // Dropping every sender is what ends the worker loop — the runtime
@@ -431,6 +504,7 @@ mod tests {
             embedder,
             tokenizer,
             rx,
+            watch::channel(None).1,
         ));
         memory_tx.send(chat_event("through the free function")).expect("send");
         drop(memory_tx);

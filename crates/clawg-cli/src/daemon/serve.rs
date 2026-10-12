@@ -93,7 +93,7 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
         verify,
     ));
     // The single ingest spawn site for this process.
-    tokio::spawn(runtime.ingest_worker(ingest_rx));
+    tokio::spawn(runtime.ingest_worker(ingest_rx, tokio::sync::watch::channel(None).1));
     tokio::spawn(runtime.maintenance_worker());
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))

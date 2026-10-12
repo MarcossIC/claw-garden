@@ -739,7 +739,7 @@ pub(crate) mod tests {
     pub(crate) async fn start_daemon() -> TestDaemon {
         let dir = tempfile::tempdir().expect("tempdir");
         let (runtime, rx) = MemoryRuntime::new_for_test(dir.path().to_path_buf()).await;
-        tokio::spawn(runtime.ingest_worker(rx));
+        tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
 
         let token = "0123456789abcdef0123456789abcdef".to_string();
         let (shutdown, _rx) = tokio::sync::watch::channel(false);
