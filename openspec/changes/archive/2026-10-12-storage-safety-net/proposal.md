@@ -2,9 +2,9 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| Transversal: la base del usuario no se pierde | M (partes B + C de la [exploración de data-preservation](../archive/2026-10-12-data-preservation/exploration.md#alcance-candidato-partes)) | data-preservation A + F (archivado) | propuesta |
+| Transversal: la base del usuario no se pierde | M (partes B + C de la [exploración de data-preservation](../2026-10-12-data-preservation/exploration.md#alcance-candidato-partes)) | data-preservation A + F (archivado) | archivado |
 
-**Este cambio cubre las partes B y C.** data-preservation se partió al proponerse: A + F ya están archivadas y consolidadas en [`specs/storage`](../../specs/storage/spec.md). Este cambio es el siguiente grupo que fijó esa exploración. D (cambio de modelo) y E (borrado recuperable) siguen siendo cambios propios (ver "Fuera de alcance").
+**Este cambio cubre las partes B y C.** data-preservation se partió al proponerse: A + F ya están archivadas y consolidadas en [`specs/storage`](../../../specs/storage/spec.md). Este cambio es el siguiente grupo que fijó esa exploración. D (cambio de modelo) y E (borrado recuperable) siguen siendo cambios propios (ver "Fuera de alcance").
 
 ## Problema
 

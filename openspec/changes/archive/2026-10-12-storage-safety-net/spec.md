@@ -25,12 +25,12 @@ La decisión MUST ser una función pura de (historial aplicado, migraciones del 
 Los mensajes MUST decir qué versión tiene la base y cuál conoce el binario, que la base no se tocó, y qué hacer: instalar la versión que la escribió, o `clawg restore` de un backup anterior.
 
 #### Escenario: base más nueva
-- GIVEN una base migrada a V8 con una fila V9 agregada a mano en `refinery_schema_history`
-- WHEN se abre con el binario actual (V8)
-- THEN el error es `SchemaNewer { db: 9, binary: 8 }`, el mensaje nombra `clawg restore`, y `memory.db` es byte a byte igual al de antes
+- GIVEN una base en la última versión del binario, N (hoy V9), con una fila N + 1 agregada a mano en `refinery_schema_history`
+- WHEN se abre
+- THEN el error es `SchemaNewer { db: N + 1, binary: N }`, el mensaje nombra `clawg restore`, y `memory.db` es byte a byte igual al de antes
 
 #### Escenario: checksum divergente
-- GIVEN una base migrada a V8 con el checksum de V3 cambiado en el historial
+- GIVEN una base al día con el checksum de V3 cambiado en el historial
 - WHEN se abre
 - THEN el error es `SchemaDiverged { version: 3 }` y la base no cambió
 
@@ -46,11 +46,11 @@ Con plan `Pending`, `open` MUST hacer un snapshot con motivo `pre-migration` ant
 
 #### Escenario: base vieja con filas
 - GIVEN una base migrada sólo hasta V7, con filas en `memory`
-- WHEN se abre con el binario V8
-- THEN `backups/` tiene un snapshot `pre-migration` cuyo historial llega a V7 y que contiene esas filas, y la base quedó en V8
+- WHEN se abre con el binario actual
+- THEN `backups/` tiene un snapshot `pre-migration` cuyo historial llega a V7 y que contiene esas filas, y la base quedó en la última versión
 
 #### Escenario: base al día
-- GIVEN una base ya en V8
+- GIVEN una base ya en la última versión
 - WHEN se abre
 - THEN `backups/` no existe o está vacío
 
@@ -107,7 +107,7 @@ Después de cada snapshot automático, el directorio de backups MUST conservar l
 - THEN responde 200 con una ruta bajo `backups/`, y ese archivo tiene las 3 filas
 
 #### Escenario: sin daemon
-- GIVEN un directorio de datos con una base en V8 y sin daemon
+- GIVEN un directorio de datos con una base en V7 y sin daemon
 - WHEN se hace el backup sin daemon
 - THEN existe un snapshot `manual` con las mismas filas, la base no cambió y el lock quedó libre
 
@@ -134,7 +134,7 @@ Una base restaurada con plan `Pending` MUST abrir con el próximo arranque, que 
 - THEN la base tiene sólo A, `backups/` tiene un `pre-restore` con A y B, y no quedan temporales
 
 #### Escenario: archivo inválido
-- GIVEN un archivo de texto, una base SQLite sin historial de refinery, y una base con V9
+- GIVEN un archivo de texto, una base SQLite sin historial de refinery, y una base más nueva que el binario
 - WHEN se intenta restaurar cada uno
 - THEN cada uno falla con un error que lo nombra, y `memory.db` es byte a byte igual
 
@@ -162,9 +162,9 @@ Una base restaurada con plan `Pending` MUST abrir con el próximo arranque, que 
 Sin daemon, el JSON de `clawg status` MUST tener un bloque `store` con `state` (`missing`, `fresh`, `up_to_date`, `pending`, `newer`, `diverged` o `unreadable`), `db_version`, `binary_version` y un `message` legible cuando el estado impide arrancar. Con daemon, `store` MUST ser `null`: el daemon ya abrió la base. La lectura MUST hacerse en sólo lectura, sin lock y sin migrar. El armado del bloque MUST ser puro.
 
 #### Escenario
-- GIVEN un directorio de datos sin daemon y con una base que tiene V9
+- GIVEN un directorio de datos sin daemon y con una base que tiene una versión N + 1 que el binario no conoce
 - WHEN se arma el reporte
-- THEN `running` es `false`, `store.state` es `newer`, `store.db_version` es 9 y `store.message` nombra `clawg restore`
+- THEN `running` es `false`, `store.state` es `newer`, `store.db_version` es N + 1 y `store.message` nombra `clawg restore`
 
 "Sin escribir" incluye no dejar `memory.db-wal` ni `memory.db-shm` donde no había.
 

@@ -1,8 +1,10 @@
 # storage — Especificación
 
-Fuente de verdad del comportamiento actual del almacenamiento: el apagado del daemon, el volcado y la reinyección de eventos sin ingerir, la resolución del directorio de datos, el runner de migraciones y la escritura de `workspace.md`.
+Fuente de verdad del comportamiento actual del almacenamiento: el apagado del daemon, el volcado y la reinyección de eventos sin ingerir, la resolución del directorio de datos, el runner de migraciones y la verificación del esquema, los snapshots, `clawg backup` y `clawg restore`, la escritura de `workspace.md`, y lo que `clawg status`, MCP y el instalador dicen cuando la base no se puede abrir.
 
-**Origen:** [data-preservation](../../changes/archive/2026-10-12-data-preservation/proposal.md) (partes A + F), archivado el 2026-10-12.
+**Origen:**
+- [data-preservation](../../changes/archive/2026-10-12-data-preservation/proposal.md) (partes A + F), archivado el 2026-10-12.
+- [storage-safety-net](../../changes/archive/2026-10-12-storage-safety-net/proposal.md) (partes B + C de data-preservation), archivado el 2026-10-12.
 
 ## Definiciones
 
@@ -10,6 +12,10 @@ Fuente de verdad del comportamiento actual del almacenamiento: el apagado del da
 - **Apagado ordenado:** el que empieza con Ctrl-C o con `POST /v1/shutdown`. Un kill del proceso no es un apagado ordenado.
 - **Plazo de drenaje (`DRAIN_DEADLINE`, `crates/clawg-core/src/runtime.rs:51`):** el tiempo máximo que el apagado dedica a ingerir lo encolado.
 - **Volcado:** el archivo `<data>/ingest-pending.jsonl` (`SPILL_FILE`, `crates/clawg-core/src/memory/spill.rs:14`), un `MemoryEvent` en JSON por línea.
+- **Directorio de backups:** `<data>/backups/` (`backups_dir`, `crates/clawg-core/src/paths.rs`).
+- **Snapshot:** una copia completa y autónoma de `memory.db` hecha con `VACUUM INTO`. Incluye lo commiteado en el WAL y no tiene archivo WAL propio.
+- **Motivo** de un snapshot (`Reason`, `crates/clawg-core/src/memory/backup.rs:119`): `pre-migration` y `pre-restore` son **automáticos**; `manual` es el de `clawg backup`.
+- **Plan de esquema** (`SchemaPlan`, `backup.rs:63`): la comparación entre el historial de `refinery_schema_history` y las migraciones embebidas en el binario. `Fresh` (sin historial), `UpToDate`, `Pending { from, to }` (un prefijo; faltan de `from + 1` a `to`), `Newer { db, binary }` (una versión aplicada mayor que la última del binario) o `Diverged { version }` (otro nombre o checksum, o un hueco).
 
 ## Apagado sin pérdida
 
@@ -137,6 +143,111 @@ Las migraciones pendientes de un arranque MUST aplicarse en una sola transacció
 Los checksums de las migraciones publicadas (V1–V8) MUST coincidir con una lista fija en el código (`PINNED`, `crates/clawg-core/src/memory/migrations.rs:44`). Cambiar una migración publicada MUST romper un test. Una migración nueva agrega su fila a la lista en el mismo commit.
 
 **Test:** `published_migration_checksums_are_pinned` (`migrations.rs`).
+
+### Verificación del esquema antes de migrar
+
+La decisión es pura (`schema_plan`, `backup.rs:83`). `MemoryStore::open` MUST calcularla antes de cualquier pragma y antes del runner (`check_schema`, `crates/clawg-core/src/memory/db.rs:388`, llamada en `db.rs:185`). Con `Newer` o `Diverged`, `open` MUST devolver `MemoryError::SchemaNewer` o `MemoryError::SchemaDiverged` (`crates/clawg-core/src/memory/error.rs:58` y `:64`) y MUST NOT escribir nada en `memory.db`. Los mensajes MUST decir las versiones, que nada cambió, y qué hacer: instalar la versión que la escribió o `clawg restore` de un backup anterior.
+
+#### Escenario: base más nueva
+- GIVEN una base en la última versión del binario, N (hoy V9), con una fila N + 1 agregada en `refinery_schema_history`
+- WHEN se abre
+- THEN el error es `SchemaNewer { db: N + 1, binary: N }`, nombra `clawg restore`, y `memory.db` es byte a byte igual
+
+#### Escenario: checksum divergente
+- GIVEN una base al día con el checksum de V3 cambiado
+- THEN el error es `SchemaDiverged { version: 3 }` y la base no cambió
+
+**Tests:** `schema_plan_covers_every_history_shape`, `a_divergence_the_binary_knows_about_wins_over_newer` y `history_order_does_not_matter` (`backup.rs`); `a_newer_database_is_refused_untouched` y `a_diverged_database_is_refused_untouched` (`db.rs`).
+
+### Snapshot antes de migrar
+
+Con plan `Pending`, `open` MUST hacer un snapshot `pre-migration` antes de aplicar la primera migración pendiente (`db.rs:207`). Si falla, MUST devolver `MemoryError::Backup` y MUST NOT migrar. Con `Fresh` y `UpToDate` MUST NOT hacer snapshot.
+
+#### Escenario
+- GIVEN una base migrada hasta V7, con filas
+- WHEN se abre con el binario actual
+- THEN `backups/` tiene un snapshot `pre-migration` en V7 con esas filas, y la base quedó en la última versión
+
+**Tests:** `opening_an_older_database_snapshots_it_before_migrating`, `opening_a_current_database_takes_no_snapshot`, `a_new_database_takes_no_snapshot` y `a_failed_snapshot_stops_the_migration` (`db.rs`).
+
+## Snapshots
+
+### Un snapshot es completo y no se ve a medias
+
+Un snapshot MUST contener todo lo commiteado, incluido lo que está sólo en el WAL, con las tablas vec0 y FTS consultables. MUST escribirse a un `.tmp` en el directorio de backups y renombrarse al terminar; uno fallido MUST NOT dejar archivos (`snapshot_into`, `backup.rs:275`).
+
+El nombre MUST ser `memory-<AAAA-MM-DD>T<hh-mm-ss.mmm>Z-<motivo>.db` en UTC, de una función pura (`snapshot_name`, `backup.rs:176`), de modo que el orden alfabético sea el cronológico. Por ejemplo, 1791827476123 ms y `manual` dan `memory-2026-10-12T17-51-16.123Z-manual.db`.
+
+**Tests:** `a_snapshot_includes_writes_still_in_the_wal`, `a_snapshot_keeps_vectors_and_full_text_searchable`, `snapshot_names_sort_in_time_order`, `snapshot_names_parse_back_to_their_reason` y `a_failed_snapshot_leaves_no_file_behind` (`backup.rs`).
+
+### Retención
+
+Después de cada snapshot automático, el directorio de backups MUST conservar los 5 automáticos más nuevos (`AUTO_KEEP`, `backup.rs:226`) y borrar los demás automáticos. Los `manual` MUST NOT borrarse nunca, y un archivo con otro nombre MUST NOT tocarse. La elección es pura (`to_prune`, `backup.rs:231`); el borrado es best-effort.
+
+#### Escenario
+- GIVEN 7 snapshots automáticos, 2 manuales y un `notas.txt`
+- WHEN se hace un snapshot automático más
+- THEN quedan los 5 automáticos más nuevos, los 2 manuales y `notas.txt`
+
+**Tests:** `pruning_keeps_the_newest_automatic_snapshots_and_every_manual_one` y `an_automatic_snapshot_prunes_older_automatic_ones` (`backup.rs`).
+
+## Backup y restore
+
+### `clawg backup`
+
+`clawg backup [--profile P]` (`crates/clawg-cli/src/main.rs:122`) MUST producir un snapshot `manual` e imprimir su ruta.
+
+- Con el daemon andando, MUST pedirlo por `POST /v1/backup` (con el token; `crates/clawg-cli/src/daemon/api.rs:806`), que lo hace sobre la conexión del daemon (`MemoryRuntime::snapshot`, `crates/clawg-core/src/runtime.rs:191`) y responde `{"path": "..."}`.
+- Sin daemon, MUST tomar el lock del store con el titular `Maintenance` (`crates/clawg-core/src/memory/store_lock.rs:59`), copiar sin migrar y soltar el lock (`backup_offline`, `backup.rs:306`).
+- Sin `memory.db`, MUST decir que no hay base, sin crear el directorio de datos.
+
+**Tests:** `backup_endpoint_writes_a_manual_snapshot` (`crates/clawg-cli/tests/api.rs`), `backup_takes_only_a_profile` (`cli.rs`), `an_offline_backup_copies_without_migrating`, `an_offline_backup_refuses_a_held_store` y `an_offline_backup_of_nothing_says_so` (`backup.rs`).
+
+### `clawg restore`
+
+`clawg restore <ARCHIVO> [--profile P]` (`main.rs:139`, `restore`, `backup.rs:329`) MUST, en este orden:
+
+1. crear el directorio de datos si no existe, y tomar el lock; si lo tiene el daemon, MUST fallar diciendo que se pare con `clawg stop` (`crates/clawg-cli/src/restore.rs:23`);
+2. validar el archivo en sólo lectura: `PRAGMA quick_check` = `ok`, con historial de refinery, y un plan que no sea `Newer`, `Diverged` ni `Fresh` (`check_restorable`, `backup.rs:390`). Si no pasa, MUST fallar sin tocar nada;
+3. copiar el archivo a `memory.db.restore-tmp` con `fsync` (`backup.rs:350`), antes del paso 4, cuya poda puede borrar el archivo que se restaura;
+4. si existe `memory.db`, hacer un snapshot `pre-restore` y un `wal_checkpoint(TRUNCATE)` (`backup.rs:355`). Si falla, MUST fallar sin reemplazar nada y sin dejar el temporal;
+5. borrar `memory.db-wal` y `memory.db-shm` **antes** del `rename` del temporal sobre `memory.db` (`backup.rs:376`): al revés, un corte dejaría el WAL viejo junto a la base nueva;
+6. imprimir el archivo restaurado y la ruta del `pre-restore`.
+
+Una base restaurada con plan `Pending` MUST abrir en el próximo arranque, que la migra con su propio snapshot.
+
+#### Escenario: restore
+- GIVEN una base con las filas A y B, y un snapshot que sólo tiene A
+- WHEN se restaura el snapshot
+- THEN la base tiene sólo A, `backups/` tiene un `pre-restore` con A y B, y no quedan temporales
+
+#### Escenario: archivo inválido
+- GIVEN un archivo de texto, una base SQLite sin historial, una base más nueva que el binario y una ruta que no existe
+- THEN cada uno falla nombrando el archivo, y `memory.db` es byte a byte igual
+
+**Tests:** `restore_replaces_the_store_and_keeps_the_previous_one`, `restore_refuses_files_it_cannot_open_safely`, `restore_refuses_while_the_daemon_holds_the_store`, `a_restored_older_snapshot_migrates_on_the_next_open`, `restoring_the_oldest_kept_automatic_snapshot_survives_the_pruning` y `restore_onto_a_machine_without_a_data_directory` (`backup.rs`); `a_store_held_by_the_daemon_says_to_stop_it` y `restore_takes_a_file_and_a_profile` (`clawg-cli`).
+
+## Mensajes y actualización
+
+### `clawg status` muestra el esquema sin daemon
+
+Sin daemon, el JSON de `clawg status` MUST tener un bloque `store` (`store_block`, `crates/clawg-cli/src/status.rs:48`) con `state` (`missing`, `fresh`, `up_to_date`, `pending`, `newer`, `diverged` o `unreadable`), `db_version`, `binary_version` y un `message` cuando el estado impide arrancar. Con daemon, `store` MUST ser `null` (`main.rs:91`).
+
+La lectura (`probe`, `backup.rs:440`) MUST hacerse sin lock, sin migrar y sin escribir, lo que incluye no dejar `memory.db-wal` ni `memory.db-shm`: sin `-wal`, la base se abre con la URI `immutable=1` (`open_for_probe` e `immutable_uri`, `backup.rs:462` y `:477`).
+
+**Tests:** `a_stopped_daemon_reports_the_store_schema` y `a_store_that_would_open_carries_no_message` (`status.rs`); `probing_a_newer_store_reads_without_writing`, `probing_without_a_store_creates_none`, `probing_a_file_that_is_not_a_store_says_unreadable` e `immutable_uris_escape_what_a_uri_cannot_hold` (`backup.rs`).
+
+### MCP nombra `clawg status` cuando el daemon no arrancó
+
+Con `StartTimeout`, el texto de la herramienta MUST decir que clawg intentó arrancar su daemon y que `clawg status` muestra la causa (`crates/clawg-cli/src/mcp/server.rs:248`). Con `NotRunning` (autoarranque apagado) MUST seguir pidiendo `clawg serve`.
+
+**Tests:** `a_daemon_that_did_not_start_points_at_status` (`server.rs`) y `a_tool_call_when_the_daemon_never_comes_up_gives_the_readable_error` (`mcp/mod.rs`).
+
+### El instalador aborta si el daemon sigue vivo
+
+Después de `clawg stop --profile prod`, `scripts/install.ps1` MUST ejecutar `clawg status --profile prod` con el binario anterior (`install.ps1:177`). Si sale con 0, MUST abortar antes de mover el binario, diciendo que el daemon sigue corriendo y que el binario no se reemplazó.
+
+**Verificación:** manual en Windows; no hay PowerShell en Linux ni en CI.
 
 ## Archivos del workspace
 

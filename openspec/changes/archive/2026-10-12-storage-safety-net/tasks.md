@@ -79,5 +79,5 @@ Lo encontró la prueba de punta a punta con el binario: sin directorio de datos,
 
 ## Verificación
 
-- [ ] `cargo test --workspace`: reportar el conteo contra la base. Ver `verify.md`.
-- [ ] Prueba manual en Windows, perfil dev, **sólo con autorización**: `clawg backup` con el daemon andando, `clawg stop`, `clawg restore`, arrancar y comparar el conteo de filas. Instalador con un daemon que no para.
+- [x] `cargo test --workspace`: reportar el conteo contra la base. Ver `verify.md`.
+- [ ] (pendiente, ver `verify.md`) Prueba manual en Windows, perfil dev, **sólo con autorización**: `clawg backup` con el daemon andando, `clawg stop`, `clawg restore`, arrancar y comparar el conteo de filas. Instalador con un daemon que no para.
