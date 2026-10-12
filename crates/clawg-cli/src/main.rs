@@ -19,9 +19,11 @@ use clawg_cli::doctor;
 use clawg_cli::mcp;
 use clawg_cli::memories;
 use clawg_cli::restore;
+use clawg_cli::secrets;
 use clawg_cli::status::status_report;
 use clawg_cli::stop::{stop_in, STOP_TIMEOUT};
 use clawg_core::memory::backup::{backup_offline, probe, restore};
+use clawg_core::memory::secrets::{purge, scan};
 use clawg_core::paths::data_dir;
 use clap::Parser;
 
@@ -141,6 +143,23 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
             let restored = restore(&base_dir, &file).map_err(restore::explain)?;
             println!("{}", restore::report(&file, &restored));
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Secrets { profile } => {
+            let profile = profile.resolve().map_err(|e| e.to_string())?;
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let flagged = scan(&base_dir).map_err(|e| e.to_string())?;
+            println!("{}", secrets::report(&flagged));
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Purge { id, yes, profile } => {
+            secrets::confirm(id, yes)?;
+            let profile = profile.resolve().map_err(|e| e.to_string())?;
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let purged = purge(&base_dir, id).map_err(secrets::explain)?;
+            println!("{}", secrets::purge_report(id, &purged));
             Ok(ExitCode::SUCCESS)
         }
 

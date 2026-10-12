@@ -369,13 +369,19 @@ impl ClawgMcp {
             memories.iter().map(|m| format!("#{}", m.id)).collect::<Vec<_>>().join(", ")
         };
         match result {
-            Ok(SaveOutcome::Saved { memories }) => Ok(match memories.as_slice() {
-                [one] if one.outcome == "reinforced" => {
-                    format!("already stored as #{}; reinforced it instead of saving a copy", one.id)
+            Ok(SaveOutcome::Saved { memories, redacted }) => {
+                let mut text = match memories.as_slice() {
+                    [one] if one.outcome == "reinforced" => {
+                        format!("already stored as #{}; reinforced it instead of saving a copy", one.id)
+                    }
+                    [one] => format!("saved #{}", one.id),
+                    many => format!("saved as {} pieces: {}", many.len(), ids(many)),
+                };
+                if !redacted.is_empty() {
+                    text.push_str(&format!("; masked {} before storing it", redacted.join(", ")));
                 }
-                [one] => format!("saved #{}", one.id),
-                many => format!("saved as {} pieces: {}", many.len(), ids(many)),
-            }),
+                Ok(text)
+            }
             Ok(SaveOutcome::Queued { reason }) if reason.as_deref() == Some("embedder_loading") => {
                 Ok("accepted; it will be stored once the embedding model finishes loading".into())
             }
@@ -1473,20 +1479,42 @@ mod tests {
     }
 
     #[test]
+    fn a_masked_save_tells_the_agent_what_was_masked() {
+        let text = |r| ClawgMcp::save_outcome_text(r);
+        assert_eq!(
+            text(Ok(SaveOutcome::Saved {
+                memories: vec![saved(57, "inserted")],
+                redacted: vec!["slack_token".into()],
+            })),
+            Ok("saved #57; masked slack_token before storing it".to_string())
+        );
+        assert_eq!(
+            text(Ok(SaveOutcome::Saved {
+                memories: vec![saved(57, "reinforced")],
+                redacted: vec!["github_token".into(), "jwt".into()],
+            })),
+            Ok("already stored as #57; reinforced it instead of saving a copy; \
+                masked github_token, jwt before storing it"
+                .to_string())
+        );
+    }
+
+    #[test]
     fn save_outcome_text_covers_every_daemon_answer() {
         let text = |r| ClawgMcp::save_outcome_text(r);
         assert_eq!(
-            text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "inserted")] })),
+            text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "inserted")], redacted: vec![] })),
             Ok("saved #57".to_string())
         );
         assert_eq!(
             text(Ok(SaveOutcome::Saved {
-                memories: vec![saved(57, "inserted"), saved(58, "inserted"), saved(59, "reinforced")]
+                memories: vec![saved(57, "inserted"), saved(58, "inserted"), saved(59, "reinforced")],
+                redacted: vec![],
             })),
             Ok("saved as 3 pieces: #57, #58, #59".to_string())
         );
         assert_eq!(
-            text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "reinforced")] })),
+            text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "reinforced")], redacted: vec![] })),
             Ok("already stored as #57; reinforced it instead of saving a copy".to_string())
         );
         assert_eq!(

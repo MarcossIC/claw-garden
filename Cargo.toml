@@ -49,6 +49,9 @@ tree-sitter-rust = "0.24"
 tree-sitter-typescript = "0.23"
 tree-sitter-python = "0.25"
 tokenizers = { version = "0.22.2", default-features = false }
+# Secret masking at ingest. Already linked through tokenizers, refinery-core and
+# tree-sitter, so a direct dependency adds nothing to the build.
+regex = "1"
 
 mockito = "1"
 tempfile = "3"

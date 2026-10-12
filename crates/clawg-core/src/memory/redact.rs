@@ -1,0 +1,261 @@
+//! Masking of secrets with a known format: API keys, tokens, private keys and
+//! passwords inside URLs.
+//!
+//! Only formats with a fixed prefix or structure are recognised. Nothing here
+//! guesses from entropy: commit hashes, UUIDs and checksums look random too,
+//! and they are memory worth keeping.
+
+use std::ops::Range;
+
+use once_cell::sync::Lazy;
+use regex::Regex;
+
+/// What kind of secret a match is. The name is what the placeholder carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SecretKind {
+    AwsAccessKey,
+    GithubToken,
+    AnthropicKey,
+    OpenaiKey,
+    SlackToken,
+    GoogleApiKey,
+    StripeKey,
+    PrivateKey,
+    Jwt,
+    UrlPassword,
+}
+
+impl SecretKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SecretKind::AwsAccessKey => "aws_access_key",
+            SecretKind::GithubToken => "github_token",
+            SecretKind::AnthropicKey => "anthropic_key",
+            SecretKind::OpenaiKey => "openai_key",
+            SecretKind::SlackToken => "slack_token",
+            SecretKind::GoogleApiKey => "google_api_key",
+            SecretKind::StripeKey => "stripe_key",
+            SecretKind::PrivateKey => "private_key",
+            SecretKind::Jwt => "jwt",
+            SecretKind::UrlPassword => "url_password",
+        }
+    }
+}
+
+/// One secret in a text: its byte range and kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Found {
+    pub range: Range<usize>,
+    pub kind: SecretKind,
+}
+
+/// A text with its secrets replaced by `[REDACTED:<kind>]`, and the kinds that
+/// were replaced, each once, in order of first appearance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Redacted {
+    pub text: String,
+    pub kinds: Vec<SecretKind>,
+}
+
+/// One regex per kind, in the order a tie between two matches starting at the
+/// same byte is settled. The capture group, when there is one, is what
+/// [`accepts`] checks; in a URL it is also the only part masked.
+static PATTERNS: Lazy<Vec<(SecretKind, Regex)>> = Lazy::new(|| {
+    [
+        (SecretKind::AwsAccessKey, r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+        (SecretKind::GithubToken, r"\b(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,})"),
+        (SecretKind::AnthropicKey, r"\bsk-ant-[A-Za-z0-9_-]{20,}"),
+        (SecretKind::OpenaiKey, r"\bsk-(?:proj-|svcacct-|admin-)?([A-Za-z0-9_-]{20,})"),
+        (SecretKind::SlackToken, r"\bxox[abposr]-[A-Za-z0-9-]{10,}"),
+        (SecretKind::GoogleApiKey, r"\bAIza[A-Za-z0-9_-]{35}"),
+        (SecretKind::StripeKey, r"\b[sr]k_live_[A-Za-z0-9]{16,}"),
+        (
+            SecretKind::PrivateKey,
+            r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?s:.*?-----END [A-Z ]*PRIVATE KEY-----|.*)",
+        ),
+        (SecretKind::Jwt, r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*"),
+        (SecretKind::UrlPassword, r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s:/@]+:([^\s/@]+)@"),
+    ]
+    .into_iter()
+    .map(|(kind, pattern)| (kind, Regex::new(pattern).expect("secret patterns are valid")))
+    .collect()
+});
+
+/// Whether a match the regex alone accepts is really one. `secret` is the
+/// part that would be masked.
+fn accepts(kind: SecretKind, secret: &str) -> bool {
+    match kind {
+        // `sk-` alone is a common prefix in hyphenated words. A real key is
+        // random, so it has letters and digits; `sk-ant-` is Anthropic's.
+        SecretKind::OpenaiKey => {
+            !secret.starts_with("ant-")
+                && secret.bytes().any(|b| b.is_ascii_digit())
+                && secret.bytes().any(|b| b.is_ascii_alphabetic())
+        }
+        // A variable, a template slot, an earlier placeholder or a masked
+        // value: none of them is the password.
+        SecretKind::UrlPassword => !secret.starts_with(['$', '<', '{', '[', '*']),
+        _ => true,
+    }
+}
+
+/// Every secret in `text`, in order, none overlapping. Of two that overlap,
+/// the one that starts first wins, and of two that start together, the
+/// longer.
+pub fn find_secrets(text: &str) -> Vec<Found> {
+    let mut found: Vec<Found> = Vec::new();
+    for (kind, regex) in PATTERNS.iter() {
+        for caps in regex.captures_iter(text) {
+            let whole = caps.get(0).expect("group 0 is the whole match");
+            let part = caps.get(1).unwrap_or(whole);
+            if !accepts(*kind, part.as_str()) {
+                continue;
+            }
+            let masked = if *kind == SecretKind::UrlPassword { part } else { whole };
+            found.push(Found { range: masked.range(), kind: *kind });
+        }
+    }
+    // Stable, so a tie in start and length keeps the pattern order.
+    found.sort_by(|a, b| a.range.start.cmp(&b.range.start).then(b.range.end.cmp(&a.range.end)));
+    let mut kept: Vec<Found> = Vec::with_capacity(found.len());
+    for f in found {
+        if kept.last().map_or(true, |last| f.range.start >= last.range.end) {
+            kept.push(f);
+        }
+    }
+    kept
+}
+
+/// `text` with every secret [`find_secrets`] reports replaced by its
+/// placeholder.
+pub fn redact(text: &str) -> Redacted {
+    let mut out = String::with_capacity(text.len());
+    let mut kinds: Vec<SecretKind> = Vec::new();
+    let mut at = 0;
+    for Found { range, kind } in find_secrets(text) {
+        out.push_str(&text[at..range.start]);
+        out.push_str("[REDACTED:");
+        out.push_str(kind.as_str());
+        out.push(']');
+        at = range.end;
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    out.push_str(&text[at..]);
+    Redacted { text: out, kinds }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Built at run time so no literal in the repository looks like a live
+    // credential to a secret scanner.
+    fn repeat(unit: &str, len: usize) -> String {
+        unit.chars().cycle().take(len).collect()
+    }
+
+    fn one_of_each() -> Vec<(String, SecretKind)> {
+        vec![
+            (format!("AKIA{}", repeat("Q7ZX", 16)), SecretKind::AwsAccessKey),
+            (format!("ghp_{}", repeat("a1B2", 36)), SecretKind::GithubToken),
+            (format!("sk-ant-api03-{}", repeat("x9Y_", 40)), SecretKind::AnthropicKey),
+            (format!("sk-proj-{}", repeat("k3Lm", 48)), SecretKind::OpenaiKey),
+            (format!("xoxb-{}", repeat("12345-", 24)), SecretKind::SlackToken),
+            (format!("AIza{}", repeat("Sy9-", 35)), SecretKind::GoogleApiKey),
+            (format!("sk_live_{}", repeat("4eC3", 24)), SecretKind::StripeKey),
+            (
+                format!(
+                    "-----BEGIN RSA PRIVATE KEY-----\n{}\n-----END RSA PRIVATE KEY-----",
+                    repeat("MIIEow", 64)
+                ),
+                SecretKind::PrivateKey,
+            ),
+            (
+                format!("eyJ{}.eyJ{}.{}", repeat("hbGc", 20), repeat("zdWI", 30), repeat("SflK", 43)),
+                SecretKind::Jwt,
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_known_secret_format_is_masked_in_place() {
+        let mut text = String::from("notes:");
+        let mut expected = String::from("notes:");
+        let mut kinds = Vec::new();
+        for (secret, kind) in one_of_each() {
+            text.push_str(&format!(" use {secret} here,"));
+            expected.push_str(&format!(" use [REDACTED:{}] here,", kind.as_str()));
+            kinds.push(kind);
+        }
+        text.push_str(" and postgres://app:s3cr3t-pass@db:5432/app.");
+        expected.push_str(" and postgres://app:[REDACTED:url_password]@db:5432/app.");
+        kinds.push(SecretKind::UrlPassword);
+
+        let out = redact(&text);
+        assert_eq!(out.text, expected);
+        assert_eq!(out.kinds, kinds);
+    }
+
+    #[test]
+    fn ordinary_identifiers_and_hashes_are_left_alone() {
+        let text = "commit 3f786850e387550fdab836ed7e6dc881de23001b, \
+                    uuid 123e4567-e89b-12d3-a456-426614174000, \
+                    sha256 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08, \
+                    MAX_LEXICAL_CANDIDATES_PER_QUERY_WINDOW, scikit-learn, \
+                    sk-learn-is-not-a-key-at-all, AKIA alone, ghp_short, \
+                    postgres://app:${DB_PASSWORD}@db:5432/app, \
+                    https://user:<password>@example.com, https://example.com/a@b, \
+                    risk-assessment-for-the-quarterly-plan-2026";
+        let out = redact(text);
+        assert_eq!(out.text, text);
+        assert!(out.kinds.is_empty(), "{:?}", out.kinds);
+    }
+
+    #[test]
+    fn a_url_keeps_everything_but_its_password() {
+        let out = redact("DATABASE_URL=postgres://app:s3cr3t-pass@db.internal:5432/app");
+        assert_eq!(out.text, "DATABASE_URL=postgres://app:[REDACTED:url_password]@db.internal:5432/app");
+        assert_eq!(out.kinds, vec![SecretKind::UrlPassword]);
+    }
+
+    #[test]
+    fn a_private_key_without_its_end_line_is_masked_to_the_end() {
+        let text = format!("config:\n-----BEGIN OPENSSH PRIVATE KEY-----\n{}", repeat("b3Bl", 70));
+        let out = redact(&text);
+        assert_eq!(out.text, "config:\n[REDACTED:private_key]");
+        assert_eq!(out.kinds, vec![SecretKind::PrivateKey]);
+    }
+
+    #[test]
+    fn masking_twice_finds_nothing_new() {
+        let mut text = String::new();
+        for (secret, _) in one_of_each() {
+            text.push_str(&secret);
+            text.push('\n');
+        }
+        text.push_str("mysql://root:hunter2@localhost/db\n");
+        let once = redact(&text);
+        assert!(!once.kinds.is_empty());
+        let twice = redact(&once.text);
+        assert_eq!(twice.text, once.text);
+        assert!(twice.kinds.is_empty(), "{:?}", twice.kinds);
+    }
+
+    #[test]
+    fn an_anthropic_key_is_never_reported_as_an_openai_one() {
+        let key = format!("sk-ant-api03-{}", repeat("a1B2", 90));
+        let found = find_secrets(&format!("key {key} end"));
+        assert_eq!(found, vec![Found { range: 4..4 + key.len(), kind: SecretKind::AnthropicKey }]);
+    }
+
+    #[test]
+    fn a_kind_found_twice_is_reported_once() {
+        let a = format!("ghp_{}", repeat("a1B2", 36));
+        let b = format!("ghp_{}", repeat("c3D4", 36));
+        let out = redact(&format!("{a} and {b}"));
+        assert_eq!(out.text, "[REDACTED:github_token] and [REDACTED:github_token]");
+        assert_eq!(out.kinds, vec![SecretKind::GithubToken]);
+    }
+}

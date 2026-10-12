@@ -461,7 +461,7 @@ pub fn probe(base_dir: &Path) -> StoreProbe {
 /// file, and cannot delete them on close. A stopped store has neither, so it
 /// is opened `immutable` and nothing appears. With a `-wal` left by a crash,
 /// the commits in it matter, so it is read through a plain read-only open.
-fn open_for_probe(path: &Path) -> rusqlite::Result<rusqlite::Connection> {
+pub(crate) fn open_for_probe(path: &Path) -> rusqlite::Result<rusqlite::Connection> {
     let mut wal = path.as_os_str().to_owned();
     wal.push("-wal");
     let read_only = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
@@ -490,7 +490,7 @@ fn immutable_uri(path: &Path) -> Option<String> {
     Some(uri)
 }
 
-fn open_existing(base_dir: &Path) -> Result<rusqlite::Connection, MemoryError> {
+pub(crate) fn open_existing(base_dir: &Path) -> Result<rusqlite::Connection, MemoryError> {
     let path = base_dir.join("memory.db");
     if !path.exists() {
         return Err(BackupError::NoStore { path }.into());
