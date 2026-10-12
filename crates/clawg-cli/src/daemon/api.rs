@@ -38,6 +38,7 @@ use clawg_core::models::chat::Role;
 use clawg_core::paths::Profile;
 use clawg_core::runtime::MemoryRuntime;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::error::TrySendError;
 
 use super::lifecycle::now_ms;
 
@@ -69,6 +70,10 @@ pub struct AppCtx {
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retryable: Option<bool>,
 }
 
 /// Every failure this API can answer with, rendered as
@@ -81,11 +86,23 @@ struct ErrorBody {
 pub struct ApiError {
     status: StatusCode,
     message: String,
+    detail: Option<String>,
+    retryable: Option<bool>,
 }
 
 impl ApiError {
     fn new(status: StatusCode, message: impl Into<String>) -> Self {
-        Self { status, message: message.into() }
+        Self { status, message: message.into(), detail: None, retryable: None }
+    }
+    /// The embedder will not load (or not yet, if `retryable`), so nothing
+    /// that needs it can be served. `message` is a code a client branches on
+    /// and `detail` the cause a person reads.
+    fn embedder_failed(cause: String, retryable: bool) -> Self {
+        Self {
+            detail: Some(cause),
+            retryable: Some(retryable),
+            ..Self::new(StatusCode::SERVICE_UNAVAILABLE, "embedder_failed")
+        }
     }
     fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, message)
@@ -104,7 +121,8 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(ErrorBody { error: self.message })).into_response()
+        let body = ErrorBody { error: self.message, detail: self.detail, retryable: self.retryable };
+        (self.status, Json(body)).into_response()
     }
 }
 
@@ -313,6 +331,15 @@ pub struct QueuedBody {
 }
 
 #[derive(Debug, Serialize)]
+pub struct SaveBody {
+    pub status: &'static str,
+    /// Why the save is queued instead of confirmed, when there is a reason a
+    /// client can act on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct SearchBody {
     pub hits: Vec<RankedHit>,
 }
@@ -445,10 +472,19 @@ async fn health(State(app): State<Arc<AppCtx>>) -> Json<HealthBody> {
 async fn save_memory(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<SaveRequest>,
-) -> ApiResult<(StatusCode, Json<QueuedBody>)> {
+) -> ApiResult<(StatusCode, Json<SaveBody>)> {
     if body.content.trim().is_empty() {
         return Err(ApiError::bad_request("content must not be empty"));
     }
+    // Refused before it is queued: with no embedder coming, a queued save
+    // would sit in memory until the daemon stops and then be lost.
+    let reason = match app.runtime.embedder_status() {
+        EmbedderStatus::Failed { error, retryable } => {
+            return Err(ApiError::embedder_failed(error, retryable));
+        }
+        EmbedderStatus::Loading => Some("embedder_loading"),
+        EmbedderStatus::Ready => None,
+    };
 
     let event = MemoryEvent {
         agent_id: body.agent_id,
@@ -466,11 +502,14 @@ async fn save_memory(
         importance: body.importance,
     };
 
-    app.runtime.memory_tx.try_send(event.into()).map_err(|_| {
-        ApiError::internal("the ingest worker has stopped; restart the daemon")
+    app.runtime.memory_tx.try_send(event.into()).map_err(|e| match e {
+        TrySendError::Full(_) => ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "ingest_queue_full"),
+        TrySendError::Closed(_) => {
+            ApiError::internal("the ingest worker has stopped; restart the daemon")
+        }
     })?;
 
-    Ok((StatusCode::ACCEPTED, Json(QueuedBody { status: "queued" })))
+    Ok((StatusCode::ACCEPTED, Json(SaveBody { status: "queued", reason })))
 }
 
 async fn search(
@@ -481,7 +520,12 @@ async fn search(
     // cannot search yet" are different answers, and a client that conflated
     // them would cache an empty corpus for the life of the model download.
     let Some(embedder) = app.runtime.embedder.get().cloned() else {
-        return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "embedder_not_ready"));
+        return Err(match app.runtime.embedder_status() {
+            EmbedderStatus::Failed { error, retryable } => ApiError::embedder_failed(error, retryable),
+            EmbedderStatus::Loading | EmbedderStatus::Ready => {
+                ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "embedder_not_ready")
+            }
+        });
     };
 
     let limit = clamp_search_limit(body.limit);

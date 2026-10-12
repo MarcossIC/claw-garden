@@ -15,9 +15,11 @@ use std::time::Instant;
 
 use clawg_cli::daemon::api::{router, AppCtx};
 use clawg_core::memory::bootstrap::EmbedderStatus;
-use clawg_core::memory::embedder::Embedder;
+use clawg_core::memory::embedder::{Embedder, FakeEmbedder};
+use clawg_core::memory::worker::IngestRequest;
 use clawg_core::paths::Profile;
-use clawg_core::runtime::MemoryRuntime;
+use clawg_core::runtime::{MemoryRuntime, INGEST_QUEUE_CAPACITY};
+use tokio::sync::mpsc::Receiver;
 
 use once_cell::sync::OnceCell;
 use serde_json::{json, Value};
@@ -27,8 +29,12 @@ enum EmbedderState {
     Ready,
     NeverLoaded,
     ServedEmpty,
-    /// The bootstrap gave up or is waiting to retry.
+    /// The bootstrap gave up or is waiting to retry. No worker runs, so
+    /// whatever reaches the queue stays there for the test to see.
     Failed { error: &'static str, retryable: bool },
+    /// The model is still loading and no worker drains the queue, so a test
+    /// can fill it.
+    LoadingWithoutWorker,
 }
 
 /// Swaps in a fresh, EMPTY embedder cell while moving every other handle
@@ -48,6 +54,9 @@ struct Harness {
     token: String,
     http: reqwest::Client,
     ctx: Arc<AppCtx>,
+    /// The queue's consumer end when no worker drains it, held so the queue
+    /// stays open.
+    _ingest_rx: Option<Receiver<IngestRequest>>,
     // Held so the temporary data directory outlives the server.
     _dir: tempfile::TempDir,
 }
@@ -77,34 +86,45 @@ impl Harness {
         Self::start_inner(EmbedderState::Failed { error, retryable }).await
     }
 
+    /// Daemon whose model is loading, with an undrained queue of `capacity`.
+    async fn start_loading_with_queue(capacity: usize) -> Self {
+        Self::start_with(EmbedderState::LoadingWithoutWorker, capacity).await
+    }
+
     async fn start_inner(embedder: EmbedderState) -> Self {
+        Self::start_with(embedder, INGEST_QUEUE_CAPACITY).await
+    }
+
+    async fn start_with(embedder: EmbedderState, capacity: usize) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (runtime, rx) = MemoryRuntime::new_for_test(dir.path().to_path_buf()).await;
+        let (runtime, rx) =
+            MemoryRuntime::new_for_test_with_capacity(dir.path().to_path_buf(), capacity).await;
 
         // The ingest worker is what turns a queued event into a row. Without
         // it `POST /v1/memories` would answer 202 forever and nothing would
         // ever land, which is exactly the bug these tests exist to catch. It
         // clones its handles when it is created, so what it holds is whatever
         // the runtime had at that moment.
-        let runtime = match embedder {
+        let (runtime, ingest_rx) = match embedder {
             EmbedderState::Ready => {
                 tokio::spawn(runtime.ingest_worker(rx));
-                runtime
+                (runtime, None)
             }
             EmbedderState::NeverLoaded => {
                 let runtime = with_empty_embedder(runtime, EmbedderStatus::Loading);
                 tokio::spawn(runtime.ingest_worker(rx));
-                runtime
+                (runtime, None)
             }
             EmbedderState::ServedEmpty => {
                 tokio::spawn(runtime.ingest_worker(rx));
-                with_empty_embedder(runtime, EmbedderStatus::Loading)
+                (with_empty_embedder(runtime, EmbedderStatus::Loading), None)
             }
             EmbedderState::Failed { error, retryable } => {
                 let status = EmbedderStatus::Failed { error: error.into(), retryable };
-                let runtime = with_empty_embedder(runtime, status);
-                tokio::spawn(runtime.ingest_worker(rx));
-                runtime
+                (with_empty_embedder(runtime, status), Some(rx))
+            }
+            EmbedderState::LoadingWithoutWorker => {
+                (with_empty_embedder(runtime, EmbedderStatus::Loading), Some(rx))
             }
         };
 
@@ -127,7 +147,7 @@ impl Harness {
             let _ = axum::serve(listener, app).await;
         });
 
-        Self { addr, token, http: reqwest::Client::new(), ctx, _dir: dir }
+        Self { addr, token, http: reqwest::Client::new(), ctx, _ingest_rx: ingest_rx, _dir: dir }
     }
 
     fn url(&self, path: &str) -> String {
@@ -288,6 +308,67 @@ async fn a_non_bearer_authorization_header_is_unauthorized() {
         .await
         .expect("request");
     assert_eq!(r.status(), 401);
+}
+
+// ── Save while the embedder is not ready ────────────────────────────────────
+
+const FAILED_CAUSE: &str = "download failed: connection refused";
+
+#[tokio::test]
+async fn a_save_after_the_bootstrap_failed_is_503_with_the_cause() {
+    let h = Harness::start_failed(FAILED_CAUSE, true).await;
+    let (status, body) = h
+        .post_json("/v1/memories", json!({ "content": "not stored", "agent_id": "a" }))
+        .await;
+
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"], "embedder_failed");
+    assert_eq!(body["detail"], FAILED_CAUSE);
+    assert_eq!(body["retryable"], true);
+    let tx = &h.ctx.runtime.memory_tx;
+    assert_eq!(tx.capacity(), tx.max_capacity(), "a refused save must not reach the queue");
+}
+
+#[tokio::test]
+async fn search_after_the_bootstrap_failed_says_failed_not_loading() {
+    let h = Harness::start_failed(FAILED_CAUSE, false).await;
+    let (status, body) = h
+        .post_json("/v1/search", json!({ "query": "anything", "agent_id": "a" }))
+        .await;
+
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"], "embedder_failed");
+    assert_eq!(body["detail"], FAILED_CAUSE);
+    assert_eq!(body["retryable"], false);
+}
+
+#[tokio::test]
+async fn a_save_while_the_model_loads_answers_202_and_lands_once_it_loads() {
+    let h = Harness::start_without_embedder().await;
+    let (status, body) = h
+        .post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "agent-http" }))
+        .await;
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(body["status"], "queued");
+    assert_eq!(body["reason"], "embedder_loading");
+
+    h.ctx.runtime.embedder.set(Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>).ok();
+
+    let items = h.wait_for_rows("memory", 1).await;
+    assert_eq!(items[0]["summary"], CONTENT);
+}
+
+#[tokio::test]
+async fn a_save_into_a_full_queue_is_503_queue_full() {
+    let h = Harness::start_loading_with_queue(2).await;
+    let save = |n: u32| h.post_json("/v1/memories", json!({ "content": format!("save {n}"), "agent_id": "a" }));
+
+    assert_eq!(save(1).await.0, 202);
+    assert_eq!(save(2).await.0, 202);
+    let (status, body) = save(3).await;
+
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"], "ingest_queue_full");
 }
 
 // ── Save → list → search → context → patch → delete ─────────────────────────
