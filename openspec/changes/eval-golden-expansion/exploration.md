@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| medición (habilita 1, 2, 3 y 4) | M | — | exploración (borrador) |
+| medición (habilita 1, 2, 3 y 4) | M | — | exploración (cerrada) |
 
 **Tesis:** el golden set actual no puede ver ni el canal léxico ni la visibilidad. Sin ampliarlo, lexical-fusion y visibility-policy no tienen con qué probar que mejoran algo.
 
@@ -45,16 +45,19 @@
 6. **Eje de fusión en `rag-eval`** (`--fusion current|rrf|...`), para que lexical-fusion pueda hacer A/B.
 7. **Reportar las métricas por subconjunto**: natural, léxico y visibilidad.
 
-## Decisiones abiertas
+## Decisiones (resueltas 2026-10-12)
 
-- [ ] **De dónde sale el corpus distractor:**
-  - sintético;
-  - minado del store real con `golden-mine`, lo que requiere autorización para leer `~/.clawg` y revisar privacidad;
-  - una mezcla de los dos.
-- [ ] **Versionado:** ¿se versiona el golden set? Hoy `docs/eval/**` está en `.gitignore` por decisión explícita.
-- [ ] **Umbrales pre-comprometidos** que tendrá que superar lexical-fusion (por ejemplo, R@5 del subconjunto léxico, sin regresión en el natural).
+- [x] **De dónde sale el corpus distractor:** 100 % sintético y reproducible (generador determinista con semilla, en código versionado). No se mina `~/.clawg`.
+- [x] **Versionado:** el golden set no se versiona; `docs/eval/**` sigue en `.gitignore`. La reproducibilidad sale del generador versionado más la semilla.
+- [x] **Umbrales pre-comprometidos:** fijados en `proposal.md`, relativos al baseline nuevo y congelados antes de implementar lexical-fusion.
 
 ## Cómo se mide
 
 - **El criterio de salida es que el baseline actual muestre una brecha** en el subconjunto léxico. Si el scorer actual ya acierta todo ahí, lexical-fusion no tiene nada que demostrar, y eso también es un resultado.
 - **Las métricas del subconjunto natural** quedan igual que el baseline actual: el corpus nuevo se agrega, no reemplaza.
+
+## Nota (2026-10-12, tras medir)
+
+- La brecha léxica no apareció, y no por mérito del scorer. Los hermanos léxicos sólo diferían en el identificador, así que el canal denso los separaba solo.
+- Encender o apagar el canal léxico no cambió ningún ranking en ninguna variante medida: el canal hoy es casi inerte.
+- El "resultado válido" que preveía esta exploración se reemplaza por un set rehecho con un criterio absoluto (`design.md`, D7 a D10).
