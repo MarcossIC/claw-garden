@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 5 | decisión de producto (después, uno o dos cambios) | — | exploración (borrador) |
+| 5 | decisión de producto (después, uno o dos cambios) | — | cerrada: ver la [propuesta](proposal.md) |
 
 **Tesis:** el objetivo 5, extraer conclusiones con el tiempo, no tiene hoy ningún camino vivo. El código que lo haría está compilado, pero le falta todo lo de alrededor: fuente de datos, proveedor, clave y disparador. Antes de escribir una spec hay que decidir si se revive, se reemplaza o se borra.
 
@@ -57,6 +57,8 @@
 | d. **Status quo** | Sin trabajo | Mantiene código muerto, KNN vacíos y violaciones de convención |
 
 ## Decisiones abiertas
+
+Cerradas en la [propuesta](proposal.md): limpieza + opción c, y las tablas episodic/procedural se quedan porque la app de escritorio sí las escribía.
 
 - [ ] **¿Qué significa "conclusión" en el producto?** Por ejemplo: preferencias del usuario, convenciones del proyecto, errores recurrentes, lineamientos.
 - [ ] **¿a, b o c?** El resultado probable son dos cambios:
