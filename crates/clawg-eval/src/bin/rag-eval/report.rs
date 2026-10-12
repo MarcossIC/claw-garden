@@ -848,19 +848,34 @@ mod tests {
     }
 
     #[test]
-    fn a_committed_results_file_without_the_block_still_diffs_against_one_with_it() {
-        let committed = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../docs/eval/results/2026-08-15-fake.json");
-        let old: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&committed).expect("committed results file"))
-                .expect("committed results file is valid JSON");
-        assert!(old.get("agent_view").is_none(), "the file predates the block");
+    fn a_results_file_without_the_block_still_diffs_against_one_with_it() {
+        let case = |recall_5: f64| {
+            serde_json::json!({
+                "query": "how is the cache invalidated",
+                "expected_refs": ["c1"],
+                "ranked_refs": ["c1"],
+                "recall@1": 1.0,
+                "recall@5": recall_5,
+                "recall@10": 1.0,
+                "mrr": 1.0,
+                "ndcg@10": 1.0,
+                "status": "active",
+                "lang": "en",
+            })
+        };
+        let mut old = serde_json::to_value(minimal_results("2026-07-27", Mode::Fake)).unwrap();
+        old["retrieval"]["per_case"] = serde_json::json!([case(0.0)]);
+        assert!(old.get("agent_view").is_none(), "the old shape has no block");
 
         let mut with_block = minimal_results("2026-07-27", Mode::Fake);
         with_block.agent_view = Some(minimal_agent_view_results());
-        let new = serde_json::to_value(&with_block).unwrap();
+        let mut new = serde_json::to_value(&with_block).unwrap();
+        new["retrieval"]["per_case"] = serde_json::json!([case(1.0)]);
 
-        crate::diff::diff_values(&old, &committed, &new, &committed).expect("a block it ignores must not break the diff");
+        let label = std::path::Path::new("results.json");
+        let diff = crate::diff::diff_values(&old, label, &new, label)
+            .expect("a block it ignores must not break the diff");
+        assert_eq!(diff.retrieval.recall_5.better, 1, "the one case must have been paired");
     }
 
     #[test]
