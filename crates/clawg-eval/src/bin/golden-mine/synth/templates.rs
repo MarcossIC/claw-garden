@@ -66,6 +66,79 @@ pub fn distractor_frames(memory_type: &str, spanish: bool) -> &'static [&'static
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentKind {
+    Function,
+    ErrorCode,
+}
+
+/// A row a lexical family repeats with only the identifier changing, and the
+/// question that asks for that identifier.
+pub struct LexicalFrame {
+    pub memory_type: &'static str,
+    pub content: &'static str,
+    pub query: &'static str,
+}
+
+pub fn lexical_frames(kind: IdentKind, spanish: bool) -> &'static [LexicalFrame] {
+    match (kind, spanish) {
+        (IdentKind::Function, false) => &[
+            LexicalFrame {
+                memory_type: "code_block",
+                content: "fn `{id}` normalizes the incoming payload and hands it to the caller without touching the cache.",
+                query: "what does {id} do",
+            },
+            LexicalFrame {
+                memory_type: "code_block",
+                content: "Helper `{id}` retries the request twice before it reports the failure upstream.",
+                query: "where is {id} used",
+            },
+        ],
+        (IdentKind::Function, true) => &[
+            LexicalFrame {
+                memory_type: "code_block",
+                content: "La función `{id}` normaliza la carga recibida y se la devuelve al llamador sin tocar la caché.",
+                query: "qué hace {id}",
+            },
+            LexicalFrame {
+                memory_type: "code_block",
+                content: "El helper `{id}` reintenta la petición dos veces antes de informar el fallo hacia arriba.",
+                query: "dónde se usa {id}",
+            },
+        ],
+        (IdentKind::ErrorCode, false) => &[
+            LexicalFrame {
+                memory_type: "tool_error",
+                content: "The command failed with `{id}` because the upstream service did not answer in time.",
+                query: "what does the error {id} mean",
+            },
+            LexicalFrame {
+                memory_type: "tool_error",
+                content: "Build aborted: `{id}` was raised while the lock was held.",
+                query: "how to fix {id}",
+            },
+        ],
+        (IdentKind::ErrorCode, true) => &[
+            LexicalFrame {
+                memory_type: "tool_error",
+                content: "El comando falló con `{id}` porque el servicio externo no respondió a tiempo.",
+                query: "qué significa el error {id}",
+            },
+            LexicalFrame {
+                memory_type: "tool_error",
+                content: "Compilación abortada: se lanzó `{id}` mientras el bloqueo estaba tomado.",
+                query: "cómo resolver {id}",
+            },
+        ],
+    }
+}
+
+pub const FUNCTION_VERBS: [&str; 8] =
+    ["resolve", "parse", "merge", "flush", "rotate", "hydrate", "normalize", "reconcile"];
+pub const FUNCTION_NOUNS: [&str; 8] =
+    ["Session", "Token", "Snapshot", "Manifest", "Cursor", "Ledger", "Bucket", "Journal"];
+pub const ERROR_AREAS: [&str; 8] = ["CACHE", "QUEUE", "AUTH", "SYNC", "INDEX", "LOCK", "ROUTE", "STORE"];
+
 /// Word used when a base row has no term of its own to give.
 pub fn fallback_word(spanish: bool) -> &'static str {
     if spanish {
@@ -110,6 +183,18 @@ mod tests {
                     for slot in ["{a}", "{b}", "{w1}", "{w2}"] {
                         assert!(frame.contains(slot), "{t} {spanish}: '{frame}' lacks {slot}");
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_lexical_frame_names_its_identifier_in_row_and_query() {
+        for kind in [IdentKind::Function, IdentKind::ErrorCode] {
+            for spanish in [false, true] {
+                for frame in lexical_frames(kind, spanish) {
+                    assert!(frame.content.contains("`{id}`"), "{}", frame.content);
+                    assert!(frame.query.contains("{id}"), "{}", frame.query);
                 }
             }
         }

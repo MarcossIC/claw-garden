@@ -9,11 +9,15 @@ mod rng;
 mod templates;
 mod vocab;
 
-use golden::{Golden, Row};
+use golden::{Case, Golden, Row, Status, Subset};
+use templates::IdentKind;
 use rng::SplitMix64;
 use vocab::Vocab;
 
 pub const DEFAULT_DISTRACTORS: usize = 500;
+
+const LEXICAL_FAMILIES: usize = 30;
+const SIBLINGS_PER_FAMILY: usize = 8;
 
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum SynthError {
@@ -51,6 +55,9 @@ pub fn generate(base: &Golden, seed: u64, sizes: &Sizes) -> Result<Golden, Synth
     let mut rng = SplitMix64::new(seed);
     let mut out = base.clone();
     out.corpus.extend(distractors(&vocab, &mut rng, sizes.distractors));
+    let (rows, cases) = lexical_families(base, &mut rng);
+    out.corpus.extend(rows);
+    out.retrieval_cases.extend(cases);
 
     check_unique(&out)?;
     Ok(out)
@@ -89,6 +96,67 @@ fn distractors(vocab: &Vocab, rng: &mut SplitMix64, count: usize) -> Vec<Row> {
             }
         })
         .collect()
+}
+
+/// Families of rows that differ only in one identifier, each with a question
+/// that names the identifier of one member. With eight siblings a random
+/// ranking would still miss the expected row from the top five often enough
+/// for recall to separate a lexical match from a dense guess.
+fn lexical_families(base: &Golden, rng: &mut SplitMix64) -> (Vec<Row>, Vec<Case>) {
+    let mut used: Vec<String> = Vec::new();
+    let mut rows = Vec::new();
+    let mut cases = Vec::new();
+
+    for family in 0..LEXICAL_FAMILIES {
+        let kind = if family % 2 == 0 { IdentKind::Function } else { IdentKind::ErrorCode };
+        let spanish = (family / 2) % 2 == 1;
+        let frame = rng.pick(templates::lexical_frames(kind, spanish));
+        let stem = match kind {
+            IdentKind::Function => format!(
+                "{}{}",
+                rng.pick(&templates::FUNCTION_VERBS),
+                rng.pick(&templates::FUNCTION_NOUNS)
+            ),
+            IdentKind::ErrorCode => format!("E_{}_", rng.pick(&templates::ERROR_AREAS)),
+        };
+
+        let mut refs = Vec::with_capacity(SIBLINGS_PER_FAMILY);
+        let mut idents = Vec::with_capacity(SIBLINGS_PER_FAMILY);
+        for sibling in 0..SIBLINGS_PER_FAMILY {
+            let ident = loop {
+                let candidate = format!("{stem}{}", 1000 + rng.below(9000));
+                let taken = used.iter().any(|u| u.contains(&candidate) || candidate.contains(u.as_str()))
+                    || base.corpus.iter().any(|r| r.content.contains(&candidate));
+                if !taken {
+                    break candidate;
+                }
+            };
+            used.push(ident.clone());
+
+            let ref_ = format!("s-lex-{family:02}-{sibling}");
+            rows.push(Row {
+                ref_: ref_.clone(),
+                content: templates::fill(frame.content, &[("{id}", &ident)]),
+                memory_type: frame.memory_type.to_string(),
+                importance: 5.0,
+                lang: Some(if spanish { "es" } else { "en" }.to_string()),
+            });
+            refs.push(ref_);
+            idents.push(ident);
+        }
+
+        let expected = rng.below(SIBLINGS_PER_FAMILY);
+        cases.push(Case {
+            query: templates::fill(frame.query, &[("{id}", &idents[expected])]),
+            corpus_refs: refs.clone(),
+            expected_refs: vec![refs[expected].clone()],
+            status: Status::Active,
+            blocked_by: None,
+            history: Vec::new(),
+            subset: Subset::Lexical,
+        });
+    }
+    (rows, cases)
 }
 
 /// A term from `primary`, else from `secondary`, else `fallback`.
@@ -269,6 +337,74 @@ mod tests {
             generate(&base, 7, &Sizes { distractors: 3 }),
             Err(SynthError::DuplicateRef("s-dis-0001".into()))
         );
+    }
+
+    fn lexical_cases(out: &Golden) -> Vec<&Case> {
+        out.retrieval_cases.iter().filter(|c| c.subset == Subset::Lexical).collect()
+    }
+
+    fn row_of<'a>(out: &'a Golden, r: &str) -> &'a Row {
+        out.corpus.iter().find(|row| row.ref_ == r).unwrap_or_else(|| panic!("no row {r}"))
+    }
+
+    /// The identifier a lexical row is about: its first backticked span.
+    fn ident_of(row: &Row) -> &str {
+        row.content.split('`').nth(1).expect("a lexical row names its identifier")
+    }
+
+    #[test]
+    fn there_are_at_least_thirty_lexical_cases_at_any_size() {
+        let base = grouped_base();
+        for distractors in [0, 10, 500] {
+            let out = generate(&base, 7, &Sizes { distractors }).unwrap();
+            assert!(lexical_cases(&out).len() >= 30, "distractors={distractors}");
+        }
+    }
+
+    #[test]
+    fn a_lexical_family_has_eight_siblings_and_the_expected_one_is_among_them() {
+        let out = generate(&grouped_base(), 7, &NONE).unwrap();
+        for case in lexical_cases(&out) {
+            assert_eq!(case.corpus_refs.len(), 8, "{}", case.query);
+            assert_eq!(case.expected_refs.len(), 1);
+            assert!(case.corpus_refs.contains(&case.expected_refs[0]));
+            for r in &case.corpus_refs {
+                row_of(&out, r);
+            }
+        }
+    }
+
+    #[test]
+    fn the_queried_identifier_appears_in_the_expected_row_and_nowhere_else() {
+        let out = generate(&grouped_base(), 7, &Sizes { distractors: 200 }).unwrap();
+        for case in lexical_cases(&out) {
+            let ident = ident_of(row_of(&out, &case.expected_refs[0]));
+            assert!(case.query.contains(ident), "{} lacks {ident}", case.query);
+            let holders = out.corpus.iter().filter(|r| r.content.contains(ident)).count();
+            assert_eq!(holders, 1, "{ident} must live in exactly one row");
+        }
+    }
+
+    #[test]
+    fn siblings_differ_from_the_expected_row_only_in_the_identifier() {
+        let out = generate(&grouped_base(), 7, &NONE).unwrap();
+        for case in lexical_cases(&out) {
+            let expected = row_of(&out, &case.expected_refs[0]);
+            let shape = expected.content.replace(ident_of(expected), "ID");
+            for r in &case.corpus_refs {
+                let sibling = row_of(&out, r);
+                assert_eq!(sibling.content.replace(ident_of(sibling), "ID"), shape);
+                assert_eq!(sibling.memory_type, expected.memory_type);
+                assert_eq!(sibling.lang, expected.lang);
+            }
+        }
+    }
+
+    #[test]
+    fn lexical_refs_use_their_own_prefix_and_the_base_stays_first() {
+        let base = grouped_base();
+        let out = generate(&base, 7, &NONE).unwrap();
+        assert!(out.corpus[base.corpus.len()..].iter().all(|r| r.ref_.starts_with("s-lex-")));
     }
 
     fn base() -> Golden {
