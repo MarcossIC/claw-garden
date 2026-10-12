@@ -166,10 +166,20 @@ foreach ($path in $foreign) {
 # does the stopping. "No daemon running" is reported on stderr, which Windows
 # PowerShell 5.1 turns into a terminating error under 'Stop', so the check is
 # done with errors relaxed.
+#
+# `stop` exits 1 both when no daemon was running and when it did not end in
+# time, so its exit code cannot tell the two apart. `status` exits 0 only when
+# a daemon still answers, which is exactly the case where replacing the binary
+# would leave the old version serving with the store locked.
 if (Test-Path -LiteralPath $target) {
     $ErrorActionPreference = 'Continue'
     & $target stop --profile prod *> $null
+    & $target status --profile prod *> $null
+    $stillRunning = $LASTEXITCODE -eq 0
     $ErrorActionPreference = 'Stop'
+    if ($stillRunning) {
+        throw "The clawg daemon for the prod profile is still running after 'clawg stop', so the binary was not replaced. Stop it (or close the editor whose MCP keeps restarting it) and run this script again."
+    }
 }
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
