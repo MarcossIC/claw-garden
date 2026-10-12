@@ -448,6 +448,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
 
         let aggregate = report::aggregate(&per_case);
         let by_lang_aggregate = report::aggregate_by_lang(&per_case);
+        let by_subset_aggregate = report::aggregate_by_subset(&per_case);
         // Computed unconditionally, not gated behind `cli.audit`: a sweep's
         // SweepPoint carries these two numbers regardless of whether the
         // full AuditReport (saturation/mirror-case gating) was asked for —
@@ -482,6 +483,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             retrieval: report::RetrievalResults {
                 aggregate,
                 by_lang: by_lang_aggregate,
+                by_subset: by_subset_aggregate,
                 per_case,
                 blocked,
             },
@@ -655,6 +657,7 @@ fn build_agent_view_run_results(
         retrieval: report::RetrievalResults {
             aggregate: report::Aggregate::default(),
             by_lang: vec![],
+            by_subset: vec![],
             per_case: vec![],
             blocked: vec![],
         },
@@ -859,6 +862,7 @@ fn build_follow_up_run_results(
     aggregate: report::Aggregate,
 ) -> report::RunResults {
     let by_lang_aggregate = report::aggregate_by_lang(&per_case);
+    let by_subset_aggregate = report::aggregate_by_subset(&per_case);
     report::RunResults {
         date: ctx.date.clone(),
         mode: ctx.mode,
@@ -874,7 +878,13 @@ fn build_follow_up_run_results(
         known_bugs_live: ctx.known_bugs.clone(),
         golden_set: ctx.golden_provenance.clone(),
         scoring_config: EvalScoringConfig::default(),
-        retrieval: report::RetrievalResults { aggregate, by_lang: by_lang_aggregate, per_case, blocked: vec![] },
+        retrieval: report::RetrievalResults {
+            aggregate,
+            by_lang: by_lang_aggregate,
+            by_subset: by_subset_aggregate,
+            per_case,
+            blocked: vec![],
+        },
         contradiction: report::ContradictionResults {
             curve: ctx.contradiction_curve.clone(),
             by_lang: ctx.contradiction_curve_by_lang.clone(),

@@ -97,6 +97,16 @@ pub struct LangAggregate {
     pub aggregate: Aggregate,
 }
 
+/// Retrieval quality restricted to the cases of one subset. The language split
+/// cannot tell an identifier lookup from a paraphrase, and averaging the two
+/// is what hides a lexical weakness behind natural-language wins.
+#[derive(Debug, Clone, Serialize)]
+pub struct SubsetAggregate {
+    pub subset: CaseSubset,
+    pub n_cases: usize,
+    pub aggregate: Aggregate,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RetrievalResults {
     pub aggregate: Aggregate,
@@ -104,6 +114,9 @@ pub struct RetrievalResults {
     /// with no unanimous language are absent here but present in `aggregate`,
     /// so these sub-counts need not sum to `per_case.len()`.
     pub by_lang: Vec<LangAggregate>,
+    /// Per-subset split of `aggregate`, over the same active cases. Only the
+    /// subsets present appear; the counts sum to the number of active cases.
+    pub by_subset: Vec<SubsetAggregate>,
     pub per_case: Vec<CaseResult>,
     /// `known_red` cases: scored and recorded, but never folded into
     /// `aggregate` — a structural impossibility (a row seeded at a tier the
@@ -366,6 +379,43 @@ pub fn aggregate_by_lang(cases: &[CaseResult]) -> Vec<LangAggregate> {
         .collect()
 }
 
+/// Splits `cases` by `CaseResult::subset` and aggregates each group on its
+/// own. Ordered by the serialized subset name so two runs of the same golden
+/// set produce byte-comparable JSON.
+pub fn aggregate_by_subset(cases: &[CaseResult]) -> Vec<SubsetAggregate> {
+    let mut grouped: BTreeMap<&str, (CaseSubset, Vec<CaseResult>)> = BTreeMap::new();
+    for case in cases {
+        grouped
+            .entry(case.subset.as_str())
+            .or_insert_with(|| (case.subset, Vec::new()))
+            .1
+            .push(case.clone());
+    }
+    grouped
+        .into_values()
+        .map(|(subset, group)| SubsetAggregate { subset, n_cases: group.len(), aggregate: aggregate(&group) })
+        .collect()
+}
+
+fn format_subset_table(split: &[SubsetAggregate]) -> String {
+    let mut out = String::from("    subset            n   recall@1  recall@5  recall@10     mrr   ndcg@10
+");
+    for s in split {
+        out.push_str(&format!(
+            "    {:<15} {:>3}  {:>9.4} {:>9.4} {:>10.4} {:>7.4} {:>9.4}
+",
+            s.subset.as_str(),
+            s.n_cases,
+            s.aggregate.recall_1,
+            s.aggregate.recall_5,
+            s.aggregate.recall_10,
+            s.aggregate.mrr,
+            s.aggregate.ndcg_10
+        ));
+    }
+    out
+}
+
 /// The on-disk filename for a run's results: `{date}-{mode}.json`, matching
 /// the `docs/eval/results/{fecha}-{config}.json` pattern with `mode`
 /// standing in for `config` (the only axis this harness varies today) —
@@ -559,6 +609,10 @@ pub fn print_stdout(results: &RunResults) {
             );
         }
     }
+    if !results.retrieval.by_subset.is_empty() {
+        println!("  retrieval by subset:");
+        print!("{}", format_subset_table(&results.retrieval.by_subset));
+    }
     if !results.retrieval.blocked.is_empty() {
         println!(
             "  blocked (known_red, excluded from aggregate, n={}):",
@@ -696,6 +750,80 @@ mod tests {
         assert_eq!(back.subset, CaseSubset::Lexical);
     }
 
+    fn case_of(query: &str, recall_5: f64, subset: CaseSubset) -> CaseResult {
+        CaseResult { recall_5, subset, ..case(query, recall_5, CaseStatus::Active) }
+    }
+
+    #[test]
+    fn aggregate_by_subset_scores_each_subset_on_its_own_cases_only() {
+        let cases = vec![
+            case_of("n1", 1.0, CaseSubset::Natural),
+            case_of("l1", 0.0, CaseSubset::Lexical),
+            case_of("l2", 1.0, CaseSubset::Lexical),
+        ];
+        let split = aggregate_by_subset(&cases);
+
+        // Ordered by the serialized name so two runs produce comparable JSON.
+        assert_eq!(
+            split.iter().map(|s| s.subset).collect::<Vec<_>>(),
+            vec![CaseSubset::Lexical, CaseSubset::Natural]
+        );
+        assert_eq!(split[0].n_cases, 2);
+        assert_eq!(split[0].aggregate.recall_5, 0.5);
+        assert_eq!(split[1].n_cases, 1);
+        assert_eq!(split[1].aggregate.recall_5, 1.0);
+    }
+
+    #[test]
+    fn aggregate_by_subset_only_lists_the_subsets_present() {
+        let cases = vec![case_of("m1", 1.0, CaseSubset::MultiRef)];
+        let split = aggregate_by_subset(&cases);
+        assert_eq!(split.len(), 1);
+        assert_eq!(split[0].subset, CaseSubset::MultiRef);
+    }
+
+    #[test]
+    fn with_only_natural_cases_the_single_bucket_equals_the_global_aggregate() {
+        let cases = vec![case_of("a", 1.0, CaseSubset::Natural), case_of("b", 0.0, CaseSubset::Natural)];
+        let split = aggregate_by_subset(&cases);
+        let global = aggregate(&cases);
+        assert_eq!(split.len(), 1);
+        assert_eq!(split[0].subset, CaseSubset::Natural);
+        assert_eq!(split[0].n_cases, 2);
+        assert_eq!(split[0].aggregate.recall_5, global.recall_5);
+        assert_eq!(split[0].aggregate.mrr, global.mrr);
+    }
+
+    #[test]
+    fn an_empty_case_list_has_no_subset_buckets() {
+        assert!(aggregate_by_subset(&[]).is_empty());
+    }
+
+    #[test]
+    fn the_stdout_table_names_every_subset() {
+        let split = aggregate_by_subset(&[
+            case_of("n1", 1.0, CaseSubset::Natural),
+            case_of("l1", 0.0, CaseSubset::Lexical),
+        ]);
+        let table = format_subset_table(&split);
+        assert!(table.contains("lexical"), "{table}");
+        assert!(table.contains("natural"), "{table}");
+    }
+
+    #[test]
+    fn a_results_file_without_by_subset_still_reads_and_diffs() {
+        let mut old = serde_json::to_value(minimal_results("2026-07-27", Mode::Fake)).unwrap();
+        old["retrieval"].as_object_mut().unwrap().remove("by_subset");
+        let mut with_subset = minimal_results("2026-07-27", Mode::Fake);
+        with_subset.retrieval.per_case = vec![case_of("q", 1.0, CaseSubset::Lexical)];
+        with_subset.retrieval.by_subset = aggregate_by_subset(&with_subset.retrieval.per_case);
+        let new = serde_json::to_value(&with_subset).unwrap();
+        assert!(new["retrieval"]["by_subset"].is_array());
+
+        let label = std::path::Path::new("results.json");
+        crate::diff::diff_values(&old, label, &new, label).expect("a missing by_subset must not break the diff");
+    }
+
     #[test]
     fn aggregate_by_lang_scores_each_language_on_its_own_cases_only() {
         let cases = vec![
@@ -798,6 +926,7 @@ mod tests {
             retrieval: RetrievalResults {
                 aggregate: Aggregate::default(),
                 by_lang: vec![],
+                by_subset: vec![],
                 per_case: vec![],
                 blocked: vec![],
             },

@@ -85,6 +85,19 @@ pub enum CaseSubset {
     HighImportance,
 }
 
+impl CaseSubset {
+    /// The name this subset serializes as, used to order and label report
+    /// buckets without a round trip through serde.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Natural => "natural",
+            Self::Lexical => "lexical",
+            Self::MultiRef => "multi_ref",
+            Self::HighImportance => "high_importance",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaseStatus {
