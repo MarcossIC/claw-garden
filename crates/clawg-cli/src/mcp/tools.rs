@@ -163,14 +163,14 @@ pub fn resolve_project(
 /// Renders `memory_status`: the daemon's health as pretty JSON, plus the two
 /// facts health cannot carry — which data directory and which profile this
 /// bridge is attached to.
-pub fn format_status(health: &Health, profile: Profile, base_dir: &Path) -> String {
+pub fn format_status(health: &Health, profile: Profile, base_dir: &Path, agent: &str, origin: &str) -> String {
     // `to_string_pretty` on a struct that always serializes cannot fail; the
     // fallback exists so this function has no panic in it rather than because
     // the branch is reachable.
     let json = serde_json::to_string_pretty(health)
         .unwrap_or_else(|_| format!("{{\"status\":\"{}\"}}", health.status));
     format!(
-        "{json}\n\nprofile: {}\ndata dir: {}",
+        "{json}\n\nprofile: {}\ndata dir: {}\nagent: {agent} ({origin})",
         profile.as_str(),
         base_dir.display()
     )
@@ -416,10 +416,16 @@ mod tests {
 
     #[test]
     fn format_status_includes_the_health_json_the_data_dir_and_the_profile() {
-        let out = format_status(&health(), Profile::Dev, Path::new("/home/u/.clawg-dev"));
+        let out = format_status(&health(), Profile::Dev, Path::new("/home/u/.clawg-dev"), "a", "from --agent");
         assert!(out.contains("\"pid\": 4242"), "health must be pretty JSON: {out}");
         assert!(out.contains("loading"), "out was: {out}");
         assert!(out.contains(".clawg-dev"), "the data dir must be named: {out}");
         assert!(out.contains("dev"), "out was: {out}");
+    }
+
+    #[test]
+    fn format_status_names_the_agent() {
+        let out = format_status(&health(), Profile::Dev, Path::new("/d"), "claude-code", "from --agent");
+        assert!(out.ends_with("agent: claude-code (from --agent)"), "out was: {out}");
     }
 }

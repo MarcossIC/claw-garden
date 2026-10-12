@@ -40,12 +40,49 @@ use crate::mcp::tools::{
     format_context, format_resolution, format_rows, format_search, format_status, resolve_project,
 };
 
-/// Agent id used when the MCP client did not identify itself.
+/// Agent id used when neither `--agent` nor the MCP client named one.
 ///
 /// Memories are scoped per agent, so this is not cosmetic: everything saved
 /// under it is retrievable under it, and a client that changes its reported
 /// name effectively gets a new memory.
 pub const FALLBACK_AGENT_ID: &str = "mcp";
+
+/// Where the agent id of a call came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentSource {
+    /// `clawg mcp --agent`, set by the user in the host's MCP registration.
+    Flag,
+    /// The `clientInfo.name` the client declared.
+    Client,
+    /// Nothing named one.
+    Fallback,
+}
+
+impl AgentSource {
+    /// How `memory_status` explains the origin to the person reading it.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Flag => "from --agent",
+            Self::Client => "reported by the client; pin it with --agent",
+            Self::Fallback => "the client did not identify itself; pin one with --agent",
+        }
+    }
+}
+
+/// The agent a call reads and writes as: the flag, then the client's name,
+/// then [`FALLBACK_AGENT_ID`].
+///
+/// The client's name is kept exactly as sent. Rows already carry it verbatim,
+/// so normalizing it here would hide them.
+pub fn resolve_agent(flag: Option<&str>, client: Option<&str>) -> (String, AgentSource) {
+    if let Some(flag) = flag {
+        return (flag.to_string(), AgentSource::Flag);
+    }
+    match client.filter(|name| !name.trim().is_empty()) {
+        Some(name) => (name.to_string(), AgentSource::Client),
+        None => (FALLBACK_AGENT_ID.to_string(), AgentSource::Fallback),
+    }
+}
 
 /// What the host is told this server is for, at `initialize` time.
 const INSTRUCTIONS: &str = "\
@@ -159,8 +196,8 @@ pub struct ResolveConflictArgs {
 #[derive(Clone)]
 pub struct ClawgMcp {
     client: ClientHandle,
-    /// Used when the peer has not identified itself.
-    agent_id: String,
+    /// `--agent`: wins over whatever the peer declares.
+    configured_agent: Option<String>,
     /// The project the bridge process itself is sitting in.
     default_project: Option<ProjectIdentity>,
     /// Roots (with the legacy id they were reached through) already sent to
@@ -207,7 +244,7 @@ impl ClawgMcp {
     ) -> Self {
         Self {
             client,
-            agent_id: FALLBACK_AGENT_ID.to_string(),
+            configured_agent: None,
             default_project,
             registered: Arc::default(),
             profile,
@@ -215,15 +252,24 @@ impl ClawgMcp {
         }
     }
 
-    /// Which agent's memory a call reads and writes.
+    /// Pins the agent id every call uses, whatever the peer declares.
+    pub fn with_agent(mut self, agent: Option<String>) -> Self {
+        self.configured_agent = agent;
+        self
+    }
+
+    /// Which agent's memory a call reads and writes, and why.
     ///
     /// Resolved per call rather than once at construction because rmcp only
     /// knows the peer after `initialize`, and a server built before that would
     /// pin the fallback forever.
+    fn agent_for(&self, peer: Option<&Peer<RoleServer>>) -> (String, AgentSource) {
+        let client = peer.and_then(|p| p.peer_info().map(|info| info.client_info.name.clone()));
+        resolve_agent(self.configured_agent.as_deref(), client.as_deref())
+    }
+
     fn agent_id_for(&self, peer: Option<&Peer<RoleServer>>) -> String {
-        peer.and_then(|p| p.peer_info().map(|info| info.client_info.name.clone()))
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or_else(|| self.agent_id.clone())
+        self.agent_for(peer).0
     }
 
     fn ok(text: impl Into<String>) -> Result<CallToolResult, rmcp::ErrorData> {
@@ -503,13 +549,22 @@ impl ClawgMcp {
         }
     }
 
-    pub async fn memory_status_impl(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+    pub async fn memory_status_impl(
+        &self,
+        (agent_id, source): (String, AgentSource),
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let client = match self.daemon().await {
             Ok(c) => c,
             Err(failure) => return Ok(failure),
         };
         match client.health().await {
-            Ok(health) => Self::ok(format_status(&health, self.profile, client.base_dir())),
+            Ok(health) => Self::ok(format_status(
+                &health,
+                self.profile,
+                client.base_dir(),
+                &agent_id,
+                source.describe(),
+            )),
             Err(e) => Self::failed(Self::explain(&e)),
         }
     }
@@ -624,8 +679,8 @@ impl ClawgMcp {
                        loading. Use this when a memory tool fails and you need to tell the \
                        user why."
     )]
-    async fn memory_status(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.memory_status_impl().await
+    async fn memory_status(&self, peer: Peer<RoleServer>) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.memory_status_impl(self.agent_for(Some(&peer))).await
     }
 }
 
@@ -835,6 +890,108 @@ mod tests {
     async fn agent_id_falls_back_when_no_peer_has_identified_itself() {
         let (b, _d) = bridge().await;
         assert_eq!(b.agent_id_for(None), FALLBACK_AGENT_ID);
+    }
+
+    #[test]
+    fn the_configured_agent_wins_over_the_client() {
+        assert_eq!(resolve_agent(Some("claude-code"), Some("Claude Code")), ("claude-code".into(), AgentSource::Flag));
+        assert_eq!(resolve_agent(Some("claude-code"), None), ("claude-code".into(), AgentSource::Flag));
+    }
+
+    #[test]
+    fn without_a_flag_the_client_name_wins_over_the_fallback() {
+        assert_eq!(resolve_agent(None, Some("cursor")), ("cursor".into(), AgentSource::Client));
+        assert_eq!(resolve_agent(None, Some(" Cursor ")), (" Cursor ".into(), AgentSource::Client), "kept as sent");
+        assert_eq!(resolve_agent(None, Some("  ")), (FALLBACK_AGENT_ID.into(), AgentSource::Fallback));
+        assert_eq!(resolve_agent(None, None), (FALLBACK_AGENT_ID.into(), AgentSource::Fallback));
+    }
+
+    /// The failure the flag exists for: a client that stops sending
+    /// `clientInfo` must not lose sight of what it saved under its old name.
+    #[tokio::test]
+    async fn a_configured_agent_keeps_its_memories_without_client_info() {
+        let (b, _d) = bridge().await;
+        let b = b.with_agent(Some("claude-code".into()));
+        let content = "the staging database is refreshed every sunday night";
+        let client = b.daemon().await.expect("daemon");
+        client
+            .save(SaveArgs {
+                content: content.into(),
+                agent_id: "claude-code".into(),
+                project_id: Some("proj-test".into()),
+                memory_type: None,
+                importance: None,
+            })
+            .await
+            .expect("save");
+
+        let agent = b.agent_id_for(None);
+        assert_eq!(agent, "claude-code");
+        let found = b
+            .search_memory_impl(
+                &agent,
+                SearchMemoryArgs { query: content.into(), limit: None, project_path: None, all_projects: None },
+            )
+            .await
+            .expect("search");
+        assert!(text(&found).contains(content), "{}", text(&found));
+    }
+
+    #[tokio::test]
+    async fn memory_status_names_the_agent_and_where_it_came_from() {
+        let (b, _d) = bridge().await;
+        let pinned = b.clone().with_agent(Some("claude-code".into()));
+
+        let r = pinned.memory_status_impl(pinned.agent_for(None)).await.expect("status");
+        assert!(text(&r).contains("agent: claude-code (from --agent)"), "{}", text(&r));
+
+        let r = b.memory_status_impl(b.agent_for(None)).await.expect("status");
+        assert!(text(&r).contains(&format!("agent: {FALLBACK_AGENT_ID} (")), "{}", text(&r));
+        assert!(text(&r).contains("--agent"), "the fallback must say how to pin one: {}", text(&r));
+    }
+
+    /// Rows and a hand-written workspace as the previous version leaves them,
+    /// under the name the client used to report: pinning that same name keeps
+    /// every one of them reachable.
+    #[tokio::test]
+    async fn rows_and_workspace_of_a_client_name_survive_pinning_it() {
+        let mut workspaces = None;
+        let (b, _d) = bridge_with(|runtime| {
+            workspaces = Some(runtime.workspaces());
+            runtime
+        })
+        .await;
+        let workspaces = workspaces.expect("runtime");
+        let b = b.with_agent(Some("claude-code".into()));
+        let client = b.daemon().await.expect("daemon");
+        client
+            .save(SaveArgs {
+                content: "the release branch is cut on the first monday".into(),
+                agent_id: "claude-code".into(),
+                project_id: Some("proj-test".into()),
+                memory_type: None,
+                importance: None,
+            })
+            .await
+            .expect("save");
+        let path = workspaces.workspace_path("claude-code", Some("proj-test"));
+        assert!(path.ends_with("claude-code/proj-test/workspace.md"), "the path must not move: {}", path.display());
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            &path,
+            "<!-- AUTO-START -->\n<!-- AUTO-END -->\n<!-- USER-START -->\nask before force-pushing\n<!-- USER-END -->\n",
+        )
+        .expect("workspace");
+
+        let agent = b.agent_id_for(None);
+        let listed = text(&b.list_memories_impl(&agent, list_all()).await.expect("list"));
+        assert!(listed.contains("release branch"), "{listed}");
+        let context = b
+            .recall_context_impl(&agent, RecallContextArgs { query: "release branch".into(), project_path: None })
+            .await
+            .expect("recall");
+        assert!(text(&context).contains("ask before force-pushing"), "{}", text(&context));
+        assert!(text(&context).contains("release branch"), "{}", text(&context));
     }
 
     // ── get_info ────────────────────────────────────────────────────────────
@@ -1250,7 +1407,7 @@ mod tests {
     #[tokio::test]
     async fn memory_status_reports_the_daemon_and_the_profile() {
         let (b, _d) = bridge().await;
-        let r = b.memory_status_impl().await.expect("status");
+        let r = b.memory_status_impl(b.agent_for(None)).await.expect("status");
         assert!(!is_error(&r), "text was: {}", text(&r));
         let t = text(&r);
         assert!(t.contains("\"status\""), "the health JSON must be there: {t}");
@@ -1336,7 +1493,7 @@ mod tests {
     #[tokio::test]
     async fn a_dead_daemon_is_explained_rather_than_dumped() {
         let b = dead_bridge();
-        let r = b.memory_status_impl().await.expect("call");
+        let r = b.memory_status_impl(b.agent_for(None)).await.expect("call");
         assert!(is_error(&r));
         assert!(
             text(&r).contains("clawg serve"),
