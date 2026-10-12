@@ -49,7 +49,7 @@ pub enum ClientError {
     Unauthorized,
     /// The daemon answered, and said no. `message` is its `{"error": …}` text.
     #[error("daemon returned {status}: {message}")]
-    Daemon { status: u16, message: String },
+    Daemon { status: u16, message: String, details: ErrorDetails },
     #[error("transport error talking to the daemon: {0}")]
     Http(String),
     /// `--here` needs the current directory to name the project, and the
@@ -70,6 +70,34 @@ pub enum ClientError {
         .0.holder, .0.pid
     )]
     StoreHeld(StoreOwner),
+}
+
+/// The parts of a daemon error body beyond its `error` code, kept so a caller
+/// can say why something failed and what a failed save still stored.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct ErrorDetails {
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub retryable: Option<bool>,
+    #[serde(default)]
+    pub memories: Vec<SavedMemory>,
+}
+
+/// Builds the error for a non-success answer from its JSON body, if it had
+/// one.
+fn daemon_error(status: reqwest::StatusCode, body: Option<serde_json::Value>) -> ClientError {
+    let message = body
+        .as_ref()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned))
+        // A body that is not the daemon's error shape (a proxy page, a
+        // truncated response) still has to produce something a user can act
+        // on.
+        .unwrap_or_else(|| status.to_string());
+    let details = body
+        .and_then(|v| serde_json::from_value::<ErrorDetails>(v).ok())
+        .unwrap_or_default();
+    ClientError::Daemon { status: status.as_u16(), message, details }
 }
 
 // ── Wire types the client reads back ────────────────────────────────────────
@@ -214,6 +242,25 @@ pub struct SaveArgs {
     pub importance: Option<f64>,
 }
 
+/// A row a save wrote or reinforced, as `POST /v1/memories` reports it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SavedMemory {
+    pub kind: String,
+    pub id: i64,
+    /// `"inserted"` or `"reinforced"`.
+    pub outcome: String,
+}
+
+/// How the daemon answered a save that did not fail.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SaveOutcome {
+    /// Stored, one entry per chunk.
+    Saved { memories: Vec<SavedMemory> },
+    /// Accepted but not confirmed; `reason` says why (`"unconfirmed"`,
+    /// `"embedder_loading"`).
+    Queued { reason: Option<String> },
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchArgs {
     pub query: String,
@@ -299,16 +346,8 @@ impl DaemonClient {
             return Err(ClientError::Unauthorized);
         }
         if !status.is_success() {
-            let message = resp
-                .json::<serde_json::Value>()
-                .await
-                .ok()
-                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned))
-                // A body that is not the daemon's error shape (a proxy page, a
-                // truncated response) still has to produce something a user can
-                // act on.
-                .unwrap_or_else(|| status.to_string());
-            return Err(ClientError::Daemon { status: status.as_u16(), message });
+            let body = resp.json::<serde_json::Value>().await.ok();
+            return Err(daemon_error(status, body));
         }
         resp.json::<T>().await.map_err(|e| ClientError::Http(e.to_string()))
     }
@@ -339,9 +378,17 @@ impl DaemonClient {
         Self::read_response(resp).await
     }
 
-    /// Queues a memory. Returns as soon as the daemon has accepted it — the row
-    /// does not exist yet (see `daemon::api::save_memory`).
-    pub async fn save(&self, args: SaveArgs) -> Result<(), ClientError> {
+    /// Saves a memory and reports what the daemon did with it (see
+    /// `daemon::api::save_memory`).
+    pub async fn save(&self, args: SaveArgs) -> Result<SaveOutcome, ClientError> {
+        #[derive(Deserialize)]
+        struct Body {
+            status: String,
+            #[serde(default)]
+            reason: Option<String>,
+            #[serde(default)]
+            memories: Vec<SavedMemory>,
+        }
         let resp = self
             .http
             .post(self.url("/v1/memories"))
@@ -350,8 +397,11 @@ impl DaemonClient {
             .send()
             .await
             .map_err(Self::map_transport)?;
-        let _: serde_json::Value = Self::read_response(resp).await?;
-        Ok(())
+        let body: Body = Self::read_response(resp).await?;
+        Ok(match body.status.as_str() {
+            "saved" => SaveOutcome::Saved { memories: body.memories },
+            _ => SaveOutcome::Queued { reason: body.reason },
+        })
     }
 
     pub async fn search(&self, args: SearchArgs) -> Result<Vec<Hit>, ClientError> {
@@ -944,6 +994,68 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn save_returns_the_ids_the_daemon_reported() {
+        let d = start_daemon().await;
+        publish(&d);
+        let c = DaemonClient::from_data_dir(d.dir.path()).expect("client");
+        let args = SaveArgs {
+            content: "the client reads back the id".into(),
+            agent_id: "a".into(),
+            project_id: None,
+            memory_type: None,
+            importance: None,
+        };
+
+        let first = c.save(args.clone()).await.expect("save");
+        let SaveOutcome::Saved { memories } = &first else { panic!("expected Saved, got {first:?}") };
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].kind, "memory");
+        assert_eq!(memories[0].outcome, "inserted");
+
+        let second = c.save(args).await.expect("save");
+        assert_eq!(
+            second,
+            SaveOutcome::Saved {
+                memories: vec![SavedMemory { kind: "memory".into(), id: memories[0].id, outcome: "reinforced".into() }]
+            }
+        );
+    }
+
+    #[test]
+    fn a_save_error_keeps_the_memories_detail_and_retryable() {
+        let body = serde_json::json!({
+            "error": "ingest_failed",
+            "detail": "store insert failed: disk full",
+            "retryable": false,
+            "memories": [{ "kind": "memory", "id": 57, "outcome": "inserted" }],
+        });
+        match daemon_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, Some(body)) {
+            ClientError::Daemon { status, message, details } => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "ingest_failed");
+                assert_eq!(details.detail.as_deref(), Some("store insert failed: disk full"));
+                assert_eq!(details.retryable, Some(false));
+                assert_eq!(
+                    details.memories,
+                    vec![SavedMemory { kind: "memory".into(), id: 57, outcome: "inserted".into() }]
+                );
+            }
+            other => panic!("expected a daemon error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_error_body_without_details_still_has_its_message() {
+        match daemon_error(reqwest::StatusCode::NOT_FOUND, Some(serde_json::json!({ "error": "gone" }))) {
+            ClientError::Daemon { message, details, .. } => {
+                assert_eq!(message, "gone");
+                assert_eq!(details, ErrorDetails::default());
+            }
+            other => panic!("expected a daemon error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn a_daemon_side_error_keeps_its_status_and_message() {
         let d = start_daemon().await;
         publish(&d);
@@ -954,7 +1066,7 @@ pub(crate) mod tests {
             .await
             .expect_err("deleting a missing row must fail");
         match err {
-            ClientError::Daemon { status, message } => {
+            ClientError::Daemon { status, message, .. } => {
                 assert_eq!(status, 404);
                 assert!(message.contains("999999"), "message was: {message}");
             }
@@ -1221,7 +1333,7 @@ pub(crate) mod tests {
         let c = DaemonClient::from_data_dir(d.dir.path()).expect("client");
 
         match c.get("memory", 999_999).await.expect_err("no such row") {
-            ClientError::Daemon { status, message } => {
+            ClientError::Daemon { status, message, .. } => {
                 assert_eq!(status, 404);
                 assert!(message.contains("999999"), "message was: {message}");
             }

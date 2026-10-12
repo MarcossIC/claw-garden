@@ -232,7 +232,7 @@ impl ClawgMcp {
                 "no clawg daemon is running; start one with `clawg serve` and try again"
                     .to_string()
             }
-            ClientError::Daemon { status: 503, message } if message == "embedder_not_ready" => {
+            ClientError::Daemon { status: 503, message, .. } if message == "embedder_not_ready" => {
                 "the memory index is still loading its embedding model; \
                  saving works now, and search will work in a minute"
                     .to_string()
@@ -276,7 +276,7 @@ impl ClawgMcp {
             // "queued", not "saved": the row does not exist yet, and telling a
             // model otherwise invites it to search for something that is still
             // in a channel.
-            Ok(()) => Self::ok("queued"),
+            Ok(_) => Self::ok("queued"),
             Err(e) => Self::failed(Self::explain(&e)),
         }
     }

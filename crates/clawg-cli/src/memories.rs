@@ -854,6 +854,7 @@ mod tests {
         let other = ClientError::Daemon {
             status: 404,
             message: "no Memory row with id 1".into(),
+            details: Default::default(),
         };
         assert_eq!(explain_unavailable(&other, Profile::Dev), other.to_string());
     }
