@@ -32,7 +32,7 @@
 
 - **Sin escritor en producción.**
 - **Se consultan igual en cada búsqueda:** KNN de 5 + 5 (`crates/clawg-core/src/memory/search.rs:32-39`).
-- **Costo real:** una sentencia KNN vacía más un `COUNT` por tabla, serializadas en el hilo de la base. Es chico, no el "costo de I/O en la ruta crítica" del análisis, pero es código muerto en el camino caliente.
+- **Costo real:** una sentencia KNN vacía más un `COUNT` por tabla, serializadas en el hilo de la base. Es chico, pero es código muerto en el camino caliente.
 - **Workspace:** la sección "skills" está siempre vacía.
 
 ### Golden set

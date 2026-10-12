@@ -4,7 +4,7 @@
 |---|---|---|---|
 | 1 y 3 | M | eval-golden-expansion | exploración (borrador) |
 
-**Tesis:** el canal léxico sólo **propone** candidatos. Después los puntúa el coseno, y un match exacto por identificador bajo el piso queda en 0. La dirección del análisis (fusionar) es razonable, pero hoy no hay cómo demostrar que mejora algo.
+**Tesis:** el canal léxico sólo **propone** candidatos. Después los puntúa el coseno, y un match exacto por identificador bajo el piso queda en 0. Fusionar es la dirección razonable, pero hoy no hay cómo demostrar que mejora algo.
 
 ## Problema (verificado)
 
@@ -33,9 +33,9 @@
 
 - Todas las corridas `lex*` y `tok-trigram-*` dieron métricas idénticas. Ver eval-golden-expansion.
 
-## El SQL del análisis, revisado
+## El RRF del ejemplo de sqlite-vec no alcanza
 
-El patrón (CTE con `row_number() OVER (ORDER BY distance)` sobre KNN, y `rrf_k = 60`) es el del ejemplo oficial de búsqueda híbrida de sqlite-vec. Funciona. Tal como está escrito, le faltan cosas:
+El ejemplo oficial de búsqueda híbrida de sqlite-vec (CTE con `row_number() OVER (ORDER BY distance)` sobre KNN, y `rrf_k = 60`) funciona, pero copiado tal cual le faltan cosas:
 
 - **Filtros.** No aplica estado, `deleted_at`, agente ni proyecto. Y si los agrega en el JOIN, quedan después del corte k (el mismo crowding que describe visibility-policy).
 - **Cobertura.** Sólo cubre `memory`. Las otras tablas no tienen FTS.

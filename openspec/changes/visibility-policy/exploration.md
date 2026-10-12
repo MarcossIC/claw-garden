@@ -4,7 +4,7 @@
 |---|---|---|---|
 | 2 y 4 | L (probablemente se parta) | project-identity, eval-golden-expansion | exploración (borrador) |
 
-**Tesis:** el objetivo 4 pide un cerebro compartido **con control del usuario sobre qué ve cada agente**. Hoy hay aislamiento total en lectura y ningún control en borrado. El análisis propone sacar el filtro por agente, y eso resuelve la mitad del objetivo y rompe la otra mitad.
+**Tesis:** el objetivo 4 pide un cerebro compartido **con control del usuario sobre qué ve cada agente**. Hoy hay aislamiento total en lectura y ningún control en borrado. Sacar el filtro por agente, la salida obvia, resuelve la mitad del objetivo y rompe la otra mitad.
 
 ## Problema (verificado)
 
@@ -43,6 +43,15 @@ AND (?4 IS NULL OR m.project_id = ?4 OR m.project_id IS NULL OR m.memory_type = 
 - `clientInfo` pasa a ser opcional y autodeclarado, y los servidores "SHOULD NOT" usarlo para cambiar comportamiento.
 - Cuando el cliente deje de mandar `initialize` y se actualice rmcp, `peer_info()` puede venir vacío. Todo cae al fallback `"mcp"` y las memorias existentes **dejan de verse sin ningún error**.
 
+### La columna `scope` ya existe, sin uso
+
+- Las tres tablas tienen `scope` con su CHECK (`crates/clawg-core/migrations/V1__init.sql:6-7, 30-34`):
+  - `agent` exige `agent_id` y admite `project_id`;
+  - `project` exige `project_id` y **`agent_id IS NULL`**;
+  - `global` exige los dos en NULL.
+- El insert escribe siempre el literal `"agent"` (`crates/clawg-core/src/memory/store_insert.rs:177`).
+- `enum Scope` (`crates/clawg-core/src/memory/record.rs:19`) se exporta (`memory/mod.rs:42`), pero nada lo usa. Los `Scope` de `clawg-cli` son otra struct: los filtros del visor (`crates/clawg-cli/src/cli.rs:133`).
+
 ### Seguridad de la ruta
 
 - `agent_id` se usa crudo en la ruta del workspace (`crates/clawg-core/src/memory/workspace.rs:43-46`).
@@ -62,6 +71,16 @@ AND (?4 IS NULL OR m.project_id = ?4 OR m.project_id IS NULL OR m.memory_type = 
    - sqlite-vec ≥ 0.1.6 soporta partition keys y metadata columns en vec0. El proyecto está en 0.1.9 (`Cargo.lock`).
    - Límites: las partition keys sólo aceptan TEXT o INTEGER, sin `IN`. Los NULL no están soportados en metadata, y `project_id` puede ser NULL, así que hace falta un sentinela.
    - Hay que recrear las tablas vec0 y re-insertar los vectores.
+   - Un `WHERE` sobre la tabla padre en la misma query del `MATCH` no alcanza: vec0 elige los k vecinos antes del join, y es el mismo crowding de hoy.
+7. **Procedencia de lo compartido.** Hoy cada hit se muestra como `[fecha] SOURCE | TYPE` y `CONTENT` crudo, sin autor (`crates/clawg-core/src/memory/prompt_builder.rs:300-306`). Mientras search filtra por `agent_id`, el autor siempre es el mismo agente. Cuando se comparta:
+   - el bloque de `recall_context` y `search_memory` tiene que decir **qué agente** guardó cada memoria ajena;
+   - el contenido ajeno se presenta como dato, no como instrucción. Una memoria envenenada (por ejemplo, guardada después de leer un README malicioso) no debería llegarle a otro agente como una orden;
+   - un secreto guardado por un agente viaja a otro cliente y a su proveedor. Ver secret-hygiene, que conviene cerrar antes de abrir la política.
+8. **Compartir con la columna o con una regla.**
+   - **Columna:** se pasa la fila a `scope = 'project'` o `'global'`. El invariante queda en la base, pero el CHECK obliga a poner `agent_id` en NULL, así que la autoría (pregunta 7) tiene que salir de `created_by_ref`, que hoy guarda el mismo `agent_id`. Es una migración de datos y lleva su test de preservación (`config.yaml`).
+   - **Regla de lectura:** `scope` queda como está y la visibilidad se decide en la consulta, según la política configurada. No toca ninguna fila, pero el invariante vive en código y configuración, no en la base.
+   - Principios candidatos, con cualquiera de las dos: una memoria tiene un solo scope (si algo vale para dos, son dos memorias con historia propia), y la promoción entre scopes es sólo manual, nunca automática.
+9. **Pesos por scope en el ranking.** Por ejemplo agente 1,20, proyecto 1,00 y global 0,85: una relación de 1,41x, mayor que todo el rango de importancia (1,18x). Ensanchar la importancia ya bajó R@10 de 0,891 a 0,826 (ver memory-update-tool). Hoy no cambian nada, porque todas las filas son `agent`. Sólo tienen sentido cuando se comparta, y entran únicamente si `rag-eval --diff` lo justifica.
 
 ## Posible partición en cambios más chicos
 
@@ -74,3 +93,6 @@ AND (?4 IS NULL OR m.project_id = ?4 OR m.project_id IS NULL OR m.memory_type = 
 - **Casos multi-agente y multi-proyecto** del golden set ampliado, cada uno con la visibilidad esperada.
 - **Un test por regla de la política**, incluido "el agente B no puede borrar la memoria de A si la política lo prohíbe".
 - **Test de regresión de identidad:** sin `clientInfo`, las memorias de un agente configurado siguen visibles.
+- **Test de procedencia:** una memoria de A que le llega a B en `recall_context` y en `search_memory` lleva el autor A; una memoria propia no cambia de formato.
+- **Si se elige la columna (pregunta 8):** un test que siembra filas `agent` en la versión anterior, las pasa a `project` y prueba que siguen visibles y conservan el autor.
+- **Si se agregan pesos por scope (pregunta 9):** `rag-eval --diff` contra el baseline, sobre los casos multi-agente.

@@ -42,10 +42,10 @@
 
 - Sus queries no filtran por estado, así que una fila `disputed` puede aparecer en `workspace.md`.
 
-### Lo que el análisis tenía mal
+### Lo que no hay que asumir
 
-- **"La detección está paralizada": falso.** Corre en cada save explícito.
-- **"El resolver marca superseded": nunca existió.**
+- **La detección no está parada.** Corre en cada save explícito.
+- **Ningún código marcó nunca `superseded`**, ni siquiera el resolver muerto.
 
 ## Enfoques
 

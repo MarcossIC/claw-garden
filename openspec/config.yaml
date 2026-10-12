@@ -7,7 +7,7 @@ context: |
   loopback HTTP daemon + stdio MCP bridge via rmcp), crates/clawg-eval (rag-eval, golden-mine,
   linked to clawg-core through the `eval` feature only).
   Profiles: dev (~/.clawg-dev, 27381) and prod (~/.clawg, 27380). A debug build refuses prod.
-  Product objectives (doc "Claw Garden — Cómo funciona hoy la memoria"):
+  Product objectives:
     1. Save and classify memories efficiently (type, tier, importance, dedup, contradictions, decay).
     2. Separate memories by project and also use them globally across projects.
     3. Index projects so the AI understands how each one works.
@@ -22,7 +22,7 @@ strict_tdd: true
 rules:
   general:
     - Detail is proportional to the change. A small fix is a one-page proposal plus tasks; design.md only when there is a real architectural decision with alternatives.
-    - Every claim about current behavior cites code as path:line, verified in this repo. No claim is copied from analisis-proyecto.md without checking it.
+    - Every claim about current behavior cites code as path:line, verified in this repo. No claim from an outside source is copied without checking it against the code.
     - Code, comments, test names, error messages and commit messages never reference plans, phases, changes or specs.
     - The user's database is the most important asset. No change may lose, hide or destroy stored memories. A new version either opens and serves the previous version's data, or refuses without touching it and with a documented way back.
     - Any change to the schema, stored identifiers (project_id, agent_id), statuses or the embedding contract ships with a test that seeds data at the previous version and proves it survives and stays reachable.

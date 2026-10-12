@@ -40,9 +40,9 @@
 
 **Menor:** el `AccessTracker` acumula hasta 30 s en memoria, que también se pierden ante un kill.
 
-### Lo que el análisis tenía mal
+### Lo que no es la causa
 
-El análisis atribuye las pérdidas a "bloqueos de base de datos". Eso no pasa:
+Las pérdidas no vienen de bloqueos de base de datos:
 
 - Hay una sola conexión, serializada por `tokio_rusqlite`.
 - WAL ya está activo (`crates/clawg-core/src/memory/db.rs:191-201`).

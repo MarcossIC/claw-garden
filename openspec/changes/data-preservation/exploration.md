@@ -71,6 +71,7 @@
 - El texto queda. El vector (`admin.rs:211-213`) y la entrada FTS (trigger de V8) se borran.
 - No hay undelete por MCP, HTTP ni CLI. Poner `deleted_at = NULL` a mano no alcanza, porque falta el vector y `reembed_all` sólo recorre filas que tienen vector.
 - **El delete no tiene scope:** cualquier agente con la herramienta puede borrar cualquier memoria, de a una (`crates/clawg-cli/src/mcp/server.rs:361-373`).
+- **No hay borrado por proyecto.** Sólo se borra fila por fila, por MCP o por `DELETE /v1/memories/{kind}/{id}` (`crates/clawg-cli/src/daemon/api.rs:347-349`). Las `user_preference` guardan el `project_id` de la carpeta desde donde se guardaron, como cualquier otro save (`crates/clawg-core/src/memory/store_insert.rs:179`). Se ven desde todos los proyectos sólo por una cláusula de la consulta (`search.rs:119-122`). Por eso un borrado ingenuo por `project_id` también borraría preferencias globales.
 
 ### 6. Menores
 
@@ -104,12 +105,17 @@ Agrupación sugerida para la propuesta:
 
 ## Decisiones abiertas
 
-- [ ] **Backups.** ¿Sólo antes de migrar o re-embeber, o también periódicos (por ejemplo, uno diario desde el worker de mantenimiento)? ¿Cuántos se retienen? ¿Dentro del directorio de datos o en otra ubicación configurable?
+- [ ] **Backups.** ¿Sólo antes de migrar o re-embeber, o también periódicos (por ejemplo, uno diario desde el worker de mantenimiento)? ¿Cuántos se retienen? ¿Dentro del directorio de datos o en otra ubicación configurable? Cada backup es otra copia en claro de toda la base, incluido cualquier secreto guardado por error: una ubicación fuera del directorio de datos (por ejemplo, una carpeta sincronizada a la nube) lo saca de la máquina. Ver secret-hygiene.
 - [ ] **Mecanismo de backup:**
   - la feature `backup` de rusqlite: es una feature de una dependencia que ya existe, no una dependencia nueva;
   - `VACUUM INTO`: queda por verificar que funcione con vec0 registrado en la conexión.
 - [ ] **Restore.** ¿Comando dedicado, o procedimiento manual documentado?
-- [ ] **Borrados.** ¿Restaurables siempre (sin purga, como hoy), o papelera con purga explícita?
+- [ ] **Borrados.** ¿Restaurables siempre (sin purga, como hoy), o papelera con purga explícita? La pregunta también tiene un lado de privacidad: sin purga, un secreto guardado por error queda en texto plano para siempre. secret-hygiene propone una purga de una fila, sólo por CLI y nunca por MCP; las dos decisiones se toman juntas.
+- [ ] **Borrado por proyecto.** ¿Hace falta "olvidar un proyecto" sin perder lo global? Si se agrega:
+  - no toca las `user_preference` ni lo que visibility-policy defina como global;
+  - se deshace en bloque con E;
+  - es sólo por CLI, porque borrar en masa lo decide el usuario y no el agente;
+  - depende de project-identity: con el `project_id` actual, un mismo repo puede estar partido en varios ids, y el borrado se quedaría corto.
 - [ ] **Perfil dev.** ¿El instalador también para el perfil dev?
 - [ ] **¿Se separa en los cuatro cambios sugeridos?**
 

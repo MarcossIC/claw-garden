@@ -26,10 +26,9 @@
 
 - El agente no recibe ids al guardar, porque la respuesta es `queued`. Para actualizar, primero tiene que buscar o listar.
 
-### Lo que el análisis tenía mal
+### El rango de importancia no es el problema
 
-- La premisa de que "el rango 0,85–1,0 es demasiado estrecho" es falsa como razonamiento.
-- El sweep 2D midió:
+- Ensanchar el rango 0,85–1,0 empeora la recuperación. El sweep 2D midió:
 
   | Rango de importancia | R@10 | MRR | `importance_rank_dominance` |
   |---|---|---|---|
@@ -49,6 +48,7 @@
 - [ ] **Tier al bajar la importancia.** ¿Se recalcula en las dos direcciones?
 - [ ] **Scope.** ¿Quién puede actualizar qué? Lo define visibility-policy. Si este cambio va antes, ¿con el scope actual (agente + proyecto) como mínimo?
 - [ ] **Re-guardado.** ¿Re-guardar contenido idéntico con otra importancia debería actualizarla?
+- [ ] **Promoción de scope.** ¿`update_memory` puede pasar una memoria de agente a proyecto o a global? Sólo a pedido explícito, nunca automático. Depende de la pregunta 8 de visibility-policy: si se comparte con la columna, promover deja `agent_id` en NULL (CHECK de `crates/clawg-core/migrations/V1__init.sql:30-34`) y la autoría queda en `created_by_ref`.
 
 ## Cómo se mide
 

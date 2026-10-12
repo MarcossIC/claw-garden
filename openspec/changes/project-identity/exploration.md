@@ -31,7 +31,7 @@
 
 **El store no guarda la ruta**, sólo el id (`crates/clawg-core/migrations/V1__init.sql`). Los ids existentes **no se pueden revertir** a una ruta.
 
-### Lo que el análisis tenía mal o incompleto
+### Lo que no hay que asumir
 
 - **La colisión no es el problema.** Para chocar hacen falta el mismo basename y los mismos 16 bits. El problema es la partición falsa.
 - **`_meta.project_root_canonical` no es estándar** y ningún cliente lo va a mandar.

@@ -4,7 +4,7 @@
 |---|---|---|---|
 | 1 | S | — | exploración (borrador) |
 
-**Tesis:** dos defectos chicos del ranking, que el análisis no menciona, ensucian lo que el agente recibe. Los dos se pueden medir con `rag-eval --agent-view`.
+**Tesis:** dos defectos chicos del ranking ensucian lo que el agente recibe. Los dos se pueden medir con `rag-eval --agent-view`.
 
 ## Problema 1: inflación de accesos (verificado)
 
