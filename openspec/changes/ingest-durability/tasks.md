@@ -53,7 +53,7 @@ El orden va de adentro hacia afuera: primero el worker y el runtime (`clawg-core
 
 - [x] 6.1 RED en `tests/api.rs`: `a_save_after_the_bootstrap_failed_is_503_with_the_cause`, `search_after_the_bootstrap_failed_says_failed_not_loading`, `a_save_while_the_model_loads_answers_202_and_lands_once_it_loads` y `a_save_into_a_full_queue_is_503_queue_full`.
 - [x] 6.2 El handler del save lee el estado: con `Failed` responde `503 embedder_failed` sin encolar, con `Loading` responde `202` con `reason: "embedder_loading"`, y con la cola llena responde `503 ingest_queue_full`. Con `Ready` sigue respondiendo `202 queued` hasta la tarea 7.
-- [x] 6.3 `search` y `context` responden `embedder_failed` con el mismo cuerpo cuando el estado es `Failed`.
+- [x] 6.3 `search` responde `embedder_failed` con el mismo cuerpo cuando el estado es `Failed`. `context` queda igual a propósito: nunca respondió `embedder_not_ready` y sin embedder cae a la recuperación léxica.
 - Commit: `feat(cli): refuse saves while the embedder is failed or the queue is full`
 
 ## 7. Save confirmado (R1, R2, R3, R4, D5)

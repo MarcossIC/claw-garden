@@ -116,7 +116,7 @@ Con el embedder `failed`, el save MUST responder `503` sin encolar:
 {"error": "embedder_failed", "detail": "<causa>", "retryable": true}
 ```
 
-`POST /v1/search` y `POST /v1/context` MUST distinguir `embedder_failed` de `embedder_not_ready` con el mismo cuerpo.
+`POST /v1/search` MUST distinguir `embedder_failed` de `embedder_not_ready` con el mismo cuerpo. `POST /v1/context` no responde ninguno de los dos: sin embedder cae a la recuperación léxica.
 
 #### Escenario
 - GIVEN un bootstrap cuya descarga falla
