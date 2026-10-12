@@ -35,6 +35,7 @@ use clawg_core::memory::worker::{
     ChunkOutcome, IngestFailure, IngestReport, IngestRequest, SavedChunk,
 };
 use clawg_core::memory::events::{MemoryEvent, MemorySource};
+use clawg_core::memory::project::{register_project, RegisterError};
 use clawg_core::memory::prompt_builder::{build_memory_prompt, QueryTexts};
 use clawg_core::memory::{search_all_memories, RankedHit, SearchScope};
 use clawg_core::models::chat::Role;
@@ -127,6 +128,9 @@ impl ApiError {
     }
     fn not_found(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, message)
+    }
+    fn conflict(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, message)
     }
     /// Anything the core reported. The `Display` text is forwarded verbatim
     /// because this API only ever listens on loopback for the user who started
@@ -451,6 +455,7 @@ pub fn router(app: Arc<AppCtx>) -> Router {
             get(get_memory).patch(patch_importance).delete(delete_memory),
         )
         .route("/stats", get(stats))
+        .route("/projects", post(register))
         .route("/shutdown", post(shutdown))
         .layer(axum::middleware::from_fn_with_state(app.clone(), require_bearer));
 
@@ -789,6 +794,47 @@ async fn delete_memory(
         return Err(ApiError::not_found(format!("no {kind:?} row with id {id}")));
     }
     Ok(Json(DeletedBody { deleted }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RegisterRequest {
+    /// The canonical project root, as the bridge resolved it.
+    pub root_path: String,
+    /// Ids the same project was saved under before paths were resolved.
+    #[serde(default)]
+    pub legacy_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegisteredBody {
+    pub project_id: String,
+    pub rekeyed: usize,
+}
+
+/// Records a project root and moves rows saved under its legacy ids onto it.
+///
+/// The id is derived here from `root_path` rather than taken from the caller,
+/// so the row in `project` can never name a root that does not hash to it.
+async fn register(
+    State(app): State<Arc<AppCtx>>,
+    Json(body): Json<RegisterRequest>,
+) -> ApiResult<Json<RegisteredBody>> {
+    if body.root_path.trim().is_empty() {
+        return Err(ApiError::bad_request("root_path must not be empty"));
+    }
+    let outcome = register_project(
+        &app.runtime.store,
+        &app.runtime.workspaces(),
+        std::path::Path::new(&body.root_path),
+        &body.legacy_ids,
+    )
+    .await
+    .map_err(|e| match e {
+        RegisterError::InvalidLegacyId(_) => ApiError::bad_request(e.to_string()),
+        RegisterError::RootCollision { .. } => ApiError::conflict(e.to_string()),
+        RegisterError::Store(_) => ApiError::internal(e),
+    })?;
+    Ok(Json(RegisteredBody { project_id: outcome.project_id, rekeyed: outcome.rekeyed }))
 }
 
 async fn shutdown(State(app): State<Arc<AppCtx>>) -> (StatusCode, Json<QueuedBody>) {
