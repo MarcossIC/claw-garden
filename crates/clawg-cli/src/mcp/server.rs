@@ -21,7 +21,11 @@
 //! behaviour lives in an `*_impl` taking that id explicitly, where a test can
 //! drive it against an in-process daemon.
 
-use clawg_core::memory::derive_project_id;
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -33,7 +37,7 @@ use serde::Deserialize;
 use crate::client::{ClientError, DaemonClient, ListArgs, SaveArgs, SaveOutcome, SearchArgs};
 use crate::mcp::startup::ClientHandle;
 use crate::mcp::tools::{
-    format_context, format_rows, format_search, format_status, resolve_project_id,
+    format_context, format_rows, format_search, format_status, resolve_project,
 };
 
 /// Agent id used when the MCP client did not identify itself.
@@ -143,7 +147,11 @@ pub struct ClawgMcp {
     /// Used when the peer has not identified itself.
     agent_id: String,
     /// The project the bridge process itself is sitting in.
-    default_project_id: Option<String>,
+    default_project: Option<ProjectIdentity>,
+    /// Roots (with the legacy id they were reached through) already sent to
+    /// `POST /v1/projects` by this process. Shared by every clone, because rmcp
+    /// clones the server per call.
+    registered: Arc<tokio::sync::Mutex<HashSet<(PathBuf, String)>>>,
     profile: Profile,
     tool_router: ToolRouter<Self>,
 }
@@ -162,30 +170,31 @@ impl ClawgMcp {
     /// [`ClawgMcp::new`] for a daemon that may still be starting: each tool
     /// call waits on the handle instead of assuming a live client.
     pub fn pending(client: ClientHandle, profile: Profile) -> Self {
-        let default_project_id = std::env::current_dir()
+        let default_project = std::env::current_dir()
             .ok()
-            .map(|cwd| derive_project_id(&cwd));
-        Self::with_handle(client, profile, default_project_id)
+            .map(|cwd| ProjectIdentity::resolve(&cwd));
+        Self::with_handle(client, profile, default_project)
     }
 
     /// [`ClawgMcp::new`] with the default project stated explicitly.
     pub fn with_project(
         client: DaemonClient,
         profile: Profile,
-        default_project_id: Option<String>,
+        default_project: Option<ProjectIdentity>,
     ) -> Self {
-        Self::with_handle(ClientHandle::ready(client), profile, default_project_id)
+        Self::with_handle(ClientHandle::ready(client), profile, default_project)
     }
 
     fn with_handle(
         client: ClientHandle,
         profile: Profile,
-        default_project_id: Option<String>,
+        default_project: Option<ProjectIdentity>,
     ) -> Self {
         Self {
             client,
             agent_id: FALLBACK_AGENT_ID.to_string(),
-            default_project_id,
+            default_project,
+            registered: Arc::default(),
             profile,
             tool_router: Self::tool_router(),
         }
@@ -309,6 +318,36 @@ impl ClawgMcp {
         }
     }
 
+    /// Which project a call is scoped to, registered with the daemon first so
+    /// rows saved under its legacy id are already under its id when the call
+    /// reads or writes.
+    ///
+    /// Each root and legacy id is sent once per process, even when the call
+    /// fails: a daemon that cannot register (an older version, say) must not
+    /// cost every tool call a round trip, and the scope is the same either way.
+    async fn project_for(
+        &self,
+        client: &DaemonClient,
+        project_path: Option<&str>,
+        all_projects: bool,
+    ) -> Option<String> {
+        let project = resolve_project(
+            self.default_project.as_ref(),
+            project_path,
+            all_projects,
+            ProjectIdentity::resolve,
+        )?;
+        let mut registered = self.registered.lock().await;
+        if registered.insert((project.root.clone(), project.legacy_id.clone())) {
+            let legacy: Vec<String> =
+                Some(project.legacy_id.clone()).filter(|l| *l != project.id).into_iter().collect();
+            if let Err(e) = client.register_project(&project.root, &legacy).await {
+                log::warn!("could not register project {}: {e}", project.root.display());
+            }
+        }
+        Some(project.id)
+    }
+
     // ── Implementations, testable without a Peer ────────────────────────────
 
     pub async fn save_memory_impl(
@@ -319,18 +358,13 @@ impl ClawgMcp {
         if args.content.trim().is_empty() {
             return Self::failed("content must not be empty");
         }
-        // A save is never "all projects": a memory belongs somewhere, and an
-        // unscoped write would be invisible to every project-scoped search.
-        let project_id = resolve_project_id(
-            self.default_project_id.as_deref(),
-            args.project_path.as_deref(),
-            false,
-        );
-
         let client = match self.daemon().await {
             Ok(c) => c,
             Err(failure) => return Ok(failure),
         };
+        // A save is never "all projects": a memory belongs somewhere, and an
+        // unscoped write would be invisible to every project-scoped search.
+        let project_id = self.project_for(&client, args.project_path.as_deref(), false).await;
         let result = client
             .save(SaveArgs {
                 content: args.content,
@@ -354,16 +388,13 @@ impl ClawgMcp {
         agent_id: &str,
         args: SearchMemoryArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let project_id = resolve_project_id(
-            self.default_project_id.as_deref(),
-            args.project_path.as_deref(),
-            args.all_projects.unwrap_or(false),
-        );
-
         let client = match self.daemon().await {
             Ok(c) => c,
             Err(failure) => return Ok(failure),
         };
+        let project_id = self
+            .project_for(&client, args.project_path.as_deref(), args.all_projects.unwrap_or(false))
+            .await;
         match client
             .search(SearchArgs {
                 query: args.query,
@@ -383,16 +414,11 @@ impl ClawgMcp {
         agent_id: &str,
         args: RecallContextArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let project_id = resolve_project_id(
-            self.default_project_id.as_deref(),
-            args.project_path.as_deref(),
-            false,
-        );
-
         let client = match self.daemon().await {
             Ok(c) => c,
             Err(failure) => return Ok(failure),
         };
+        let project_id = self.project_for(&client, args.project_path.as_deref(), false).await;
         match client
             .context(&args.query, agent_id, project_id.as_deref())
             .await
@@ -575,7 +601,7 @@ mod tests {
     use clawg_core::memory::bootstrap::EmbedderStatus;
     use clawg_core::runtime::MemoryRuntime;
 
-    use crate::client::{ErrorDetails, SaveOutcome, SavedMemory};
+    use crate::client::{ErrorDetails, ListArgs, SaveArgs, SaveOutcome, SavedMemory};
     use crate::daemon::api::{router, AppCtx, SAVE_CONFIRM_TIMEOUT};
     use crate::mcp::tools::CONTENT_PREVIEW_LIMIT;
 
@@ -586,6 +612,14 @@ mod tests {
 
     /// [`bridge`] over a runtime that `adjust` changed first.
     async fn bridge_with(adjust: impl FnOnce(MemoryRuntime) -> MemoryRuntime) -> (ClawgMcp, tempfile::TempDir) {
+        bridge_at(Some(test_project()), adjust).await
+    }
+
+    /// [`bridge_with`] for a bridge whose own project is `project`.
+    async fn bridge_at(
+        project: Option<ProjectIdentity>,
+        adjust: impl FnOnce(MemoryRuntime) -> MemoryRuntime,
+    ) -> (ClawgMcp, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let (runtime, rx) = MemoryRuntime::new_for_test(dir.path().to_path_buf()).await;
         let runtime = adjust(runtime);
@@ -613,9 +647,15 @@ mod tests {
             dir.path().to_path_buf(),
         );
         (
-            ClawgMcp::with_project(client, Profile::Dev, Some("proj-test".to_string())),
+            ClawgMcp::with_project(client, Profile::Dev, project),
             dir,
         )
+    }
+
+    /// The default project of [`bridge`]: a root that is already canonical, so
+    /// there is no legacy id to move.
+    fn test_project() -> ProjectIdentity {
+        ProjectIdentity { id: "proj-test".into(), root: "/proj-test".into(), legacy_id: "proj-test".into() }
     }
 
     /// A bridge pointed at an address where nothing is listening.
@@ -638,6 +678,100 @@ mod tests {
 
     fn is_error(result: &CallToolResult) -> bool {
         result.is_error.unwrap_or(false)
+    }
+
+    // ── project identity ────────────────────────────────────────────────────
+
+    /// A repository with a `src` directory, by canonical name, and the
+    /// identity a bridge started in `src` resolves to.
+    fn repo_with_src() -> (tempfile::TempDir, ProjectIdentity) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = std::fs::canonicalize(dir.path()).expect("canonicalize").join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect(".git");
+        std::fs::create_dir_all(repo.join("src")).expect("src");
+        let identity = ProjectIdentity::resolve(&repo.join("src"));
+        assert_ne!(identity.legacy_id, identity.id, "test setup: src must have its own legacy id");
+        (dir, identity)
+    }
+
+    async fn rows_in(b: &ClawgMcp, project: &str) -> usize {
+        let client = b.daemon().await.expect("daemon");
+        client
+            .list(ListArgs { kind: Some("memory".into()), project: Some(project.into()), ..Default::default() })
+            .await
+            .expect("list")
+            .len()
+    }
+
+    fn save_args(content: &str) -> SaveMemoryArgs {
+        SaveMemoryArgs { content: content.into(), memory_type: None, importance: None, project_path: None }
+    }
+
+    #[tokio::test]
+    async fn a_bridge_in_a_subdirectory_brings_what_was_saved_there_to_the_root() {
+        let (_repo, identity) = repo_with_src();
+        let (b, _d) = bridge_at(Some(identity.clone()), |r| r).await;
+        let client = b.daemon().await.expect("daemon");
+        client
+            .save(SaveArgs {
+                content: "saved before paths were resolved".into(),
+                agent_id: "a".into(),
+                project_id: Some(identity.legacy_id.clone()),
+                memory_type: None,
+                importance: None,
+            })
+            .await
+            .expect("seed a legacy row");
+
+        let saved = b.save_memory_impl("a", save_args("saved after")).await.unwrap();
+        assert!(!is_error(&saved), "{}", text(&saved));
+
+        assert_eq!(rows_in(&b, &identity.id).await, 2);
+        assert_eq!(rows_in(&b, &identity.legacy_id).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_root_is_registered_once_per_bridge() {
+        let (_repo, identity) = repo_with_src();
+        let (b, _d) = bridge_at(Some(identity), |r| r).await;
+
+        for content in ["one", "two"] {
+            b.save_memory_impl("a", save_args(content)).await.unwrap();
+        }
+        b.search_memory_impl(
+            "a",
+            SearchMemoryArgs { query: "one".into(), limit: None, project_path: None, all_projects: None },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(b.registered.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_refused_registration_does_not_block_the_save() {
+        let (_repo, identity) = repo_with_src();
+        let store = std::sync::Mutex::new(None);
+        let (b, _d) = bridge_at(Some(identity.clone()), |runtime| {
+            *store.lock().unwrap() = Some(runtime.store.clone());
+            runtime
+        })
+        .await;
+        let store = store.into_inner().unwrap().expect("store");
+        // Another root already owns this id, so the daemon answers 409.
+        let id = identity.id.clone();
+        store
+            .conn
+            .call(move |c| {
+                c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, '/elsewhere', 0)", [id])
+            })
+            .await
+            .expect("seed a colliding project");
+
+        let saved = b.save_memory_impl("a", save_args("still saved")).await.unwrap();
+
+        assert!(!is_error(&saved), "{}", text(&saved));
+        assert_eq!(rows_in(&b, &identity.id).await, 1);
     }
 
     // ── agent identity ──────────────────────────────────────────────────────

@@ -158,12 +158,12 @@ pub struct Scope {
 }
 
 impl Scope {
-    /// The project id to filter by: the one named, or the one derived from
-    /// `cwd` for `--here`. Takes the directory rather than reading it so the
-    /// rule is testable.
-    pub fn project_id(&self, cwd: Option<&std::path::Path>) -> Option<String> {
+    /// The project id to filter by: the one named, or for `--here` the id of
+    /// the project the current directory resolves to. Takes that id rather
+    /// than resolving it so the rule is testable without a filesystem.
+    pub fn project_id(&self, cwd_project: Option<String>) -> Option<String> {
         if self.here {
-            return cwd.map(clawg_core::memory::derive_project_id);
+            return cwd_project;
         }
         self.project.clone()
     }
@@ -571,17 +571,14 @@ mod tests {
 
     #[test]
     fn scope_resolves_the_project_it_names_or_the_working_directory() {
-        let cwd = std::path::Path::new("/work/claw-garden");
+        let cwd = || Some("claw-garden-1a2b".to_string());
         let named = Scope { project: Some("p1".into()), ..Scope::default() };
-        assert_eq!(named.project_id(Some(cwd)), Some("p1".to_string()));
+        assert_eq!(named.project_id(cwd()), Some("p1".to_string()));
 
         let here = Scope { here: true, ..Scope::default() };
-        assert_eq!(
-            here.project_id(Some(cwd)),
-            Some(clawg_core::memory::derive_project_id(cwd))
-        );
+        assert_eq!(here.project_id(cwd()), cwd());
 
-        assert_eq!(Scope::default().project_id(Some(cwd)), None, "no flag, no project");
+        assert_eq!(Scope::default().project_id(cwd()), None, "no flag, no project");
     }
 
     #[test]

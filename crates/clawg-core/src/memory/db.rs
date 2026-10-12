@@ -655,7 +655,79 @@ mod tests {
 
         let after = conn.call(snapshot).await.unwrap();
         assert_eq!(before, after);
-        assert_eq!(after.0, 8);
+        assert_eq!(after.0, 9);
+    }
+
+    /// Rows written before `project` existed keep their project ids when the
+    /// migration that adds it runs: moving them is the bridge's call, made per
+    /// path, never a blanket rewrite at open.
+    #[tokio::test]
+    async fn a_database_from_the_previous_version_opens_with_its_project_ids_untouched() {
+        ensure_vec0_registered();
+        let conn = Connection::open_in_memory().await.unwrap();
+        register_udfs(&conn).await.unwrap();
+        conn.call(|c| {
+            configured(crate::memory::migrations::runner())
+                .set_target(refinery::Target::Version(8))
+                .run(c)
+        })
+        .await
+        .unwrap();
+        conn.call(|c| {
+            for (agent, project) in [("a", Some("repo-1a2b")), ("a", Some("src-3c4d")), ("b", None)] {
+                c.execute(
+                    "INSERT INTO memory \
+                     (scope, agent_id, project_id, content, memory_type, source, \
+                      created_at, created_by_type, created_by_ref, \
+                      last_modified_at, last_accessed_at, importance, tier, status) \
+                     VALUES ('agent', ?1, ?2, 'seeded at v8', 'observation', 'agent', \
+                      0, 'agent', ?1, 0, 0, 5.0, 3, 'active')",
+                    rusqlite::params![agent, project],
+                )?;
+            }
+            c.execute(
+                "INSERT INTO episodic_trajectory \
+                 (scope, agent_id, project_id, session_id, task, created_at, \
+                  last_modified_at, last_accessed_at) \
+                 VALUES ('agent', 'a', 'repo-1a2b', 's', 't', 0, 0, 0)",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO procedural_skill \
+                 (scope, agent_id, project_id, skill_name, trigger, promoted_at, \
+                  source_trajectory_ids, created_at, last_modified_at, last_accessed_at) \
+                 VALUES ('agent', 'a', 'src-3c4d', 'k', 't', 0, '[]', 0, 0, 0)",
+                [],
+            )?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+
+        let project_ids = |c: &mut rusqlite::Connection| -> Result<Vec<Option<String>>, rusqlite::Error> {
+            let mut stmt = c.prepare(
+                "SELECT project_id FROM memory UNION ALL SELECT project_id FROM episodic_trajectory \
+                 UNION ALL SELECT project_id FROM procedural_skill",
+            )?;
+            let ids = stmt.query_map([], |r| r.get(0))?.collect();
+            ids
+        };
+        let before = conn.call(project_ids).await.unwrap();
+
+        run_migrations(&conn).await.unwrap();
+
+        assert_eq!(conn.call(project_ids).await.unwrap(), before);
+        let (projects, rekeyed): (i64, i64) = conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT (SELECT COUNT(*) FROM project), (SELECT COUNT(*) FROM project_rekey)",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!((projects, rekeyed), (0, 0));
     }
 
     fn tamper(dir: &Path, sql: &str) {
@@ -1130,22 +1202,26 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 8, "Expected exactly 8 applied migrations, got {}", count);
+        assert_eq!(count, 9, "Expected exactly 9 applied migrations, got {}", count);
     }
 
-    /// V8 — a fresh store lands on migration count 8 and carries the FTS5
-    /// lexical index alongside it, not one without the other.
+    /// V8 — a fresh store records V8 as applied and carries the FTS5 lexical
+    /// index alongside it, not one without the other.
     #[tokio::test]
-    async fn v8_migration_creates_memory_fts_and_bumps_count_to_eight() {
+    async fn v8_migration_records_itself_and_creates_memory_fts() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let count: i64 = store
             .conn
             .call(|c| -> Result<i64, rusqlite::Error> {
-                c.query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| r.get(0))
+                c.query_row(
+                    "SELECT COUNT(*) FROM refinery_schema_history WHERE version = 8",
+                    [],
+                    |r| r.get(0),
+                )
             })
             .await
             .unwrap();
-        assert_eq!(count, 8, "V8 must be the 8th applied migration on a fresh store");
+        assert_eq!(count, 1, "a fresh store must record V8 as applied");
 
         let fts_exists: i64 = store
             .conn
@@ -1185,9 +1261,12 @@ mod tests {
             .unwrap();
         assert_eq!(before, 7, "test setup: must actually stop at V7");
 
-        conn.call(|c| crate::memory::migrations::runner().run(c))
-            .await
-            .unwrap();
+        let to_v8 = |c: &mut rusqlite::Connection| {
+            crate::memory::migrations::runner()
+                .set_target(refinery::Target::Version(8))
+                .run(c)
+        };
+        conn.call(to_v8).await.unwrap();
         let after: i64 = conn
             .call(|c| c.query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| r.get(0)))
             .await
@@ -1195,9 +1274,7 @@ mod tests {
         assert_eq!(after, 8, "V8 must apply on top of an existing V7 database");
 
         // Re-run again: nothing left to apply, count must not move.
-        conn.call(|c| crate::memory::migrations::runner().run(c))
-            .await
-            .unwrap();
+        conn.call(to_v8).await.unwrap();
         let after_second: i64 = conn
             .call(|c| c.query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| r.get(0)))
             .await
@@ -1586,7 +1663,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 8);
+        assert_eq!(migration_count, 9);
     }
 
     // -----------------------------------------------------------------------

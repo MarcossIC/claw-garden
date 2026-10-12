@@ -232,3 +232,13 @@ Ninguno.
 ## Veredicto
 
 **Pasa con advertencias.** El código cumple R1 a R7 con tests en verde, cada commit compila y pasa, y la baseline de 18.3 a 18.5 se reprodujo exacta. El set generado queda como baseline aceptada con C4 y C5 fallados, ambos registrados sin relajar umbrales.
+
+## Diferencias con la spec al consolidar
+
+Al pasar la spec a `specs/eval/spec.md` se contrastó cada afirmación con el código. La spec principal dice lo que hace el código:
+
+- **Dónde escribe el generador:** la spec decía "escriba bajo `docs/eval/`". `synth` escribe donde diga `--out`, que sólo tiene que ser distinto de `--base`, por nombre y por ruta canónica (`crates/clawg-eval/src/bin/golden-mine/main.rs:118` y `:299-304`).
+- **Tamaño:** es `--distractors` (500 por defecto), y los conteos fijos son 30 `lexical`, 12 `multi_ref`, 12 `high_importance` y 12 `low_importance` (`synth/mod.rs:17-29`), por encima de los mínimos de la spec.
+- **Test autocontenido:** la spec lo ubicaba en `report.rs:851`; hoy es `a_results_file_without_the_block_still_diffs_against_one_with_it`, en `report.rs:1002`.
+- **Valores de `subset` desconocidos:** también fallan al parsear (`an_unknown_subset_value_fails_to_parse`). La spec sólo cubría la clave mal escrita.
+- **Criterio de salida:** pasa a la spec principal como baseline medida, con C4 y C5 registrados como no cumplidos y aceptados.
