@@ -25,6 +25,9 @@ pub(crate) struct RawHit {
     pub created_at: TimestampMs,
     pub last_accessed_at: TimestampMs,
     pub importance: f64,
+    /// The row holds every identifier the query names, and that identifier
+    /// is rare enough to single it out (`search::identifier_matches`).
+    pub lexical_match: bool,
 }
 
 /// Tier-floor decay minimums — `MAX(tier_floor, exp_decay(...))` never lets a
@@ -101,6 +104,10 @@ pub(crate) struct ScoringConfig {
     /// `[0,1]`, when `Some`. `None` means no arithmetic runs at all — the
     /// no-op is read off the code rather than argued from IEEE equality.
     pub cosine_floor: Option<f64>,
+    /// Added to the re-scaled cosine of a row that is a lexical match. The
+    /// embedder reads `resolveLedger4182` and `resolveLedger4812` as nearly
+    /// the same text; this is the term that tells them apart.
+    pub lexical_bonus: f64,
 }
 
 impl ScoringConfig {
@@ -170,6 +177,10 @@ impl ScoringConfig {
         // code path itself: if either prefix ever changes, this floor must
         // be re-measured against the new distribution, not carried over.
         cosine_floor: Some(0.8793),
+        // As much as a perfect cosine: with equal decay and importance an
+        // exact identifier always ranks above a row that only reads alike,
+        // while decay and importance keep multiplying both.
+        lexical_bonus: 1.0,
     };
 }
 
@@ -258,6 +269,9 @@ pub(crate) fn score(cfg: &ScoringConfig, hit: &RawHit, now: TimestampMs) -> f64 
         Some(floor) => rescale_cosine(cosine, floor),
         None => cosine,
     };
+    // Added after the re-scale so a match below the floor still scores. A
+    // row without a match runs no arithmetic and keeps its exact score.
+    let relevance = if hit.lexical_match { cosine + cfg.lexical_bonus } else { cosine };
 
     let tier_floor = match hit.tier {
         1 => cfg.tier_floors.tier1,
@@ -285,7 +299,7 @@ pub(crate) fn score(cfg: &ScoringConfig, hit: &RawHit, now: TimestampMs) -> f64 
         _ => 0.0,
     };
 
-    cosine * tier_floor.max(decay) * importance * status
+    relevance * tier_floor.max(decay) * importance * status
 }
 
 #[cfg(test)]
@@ -314,6 +328,7 @@ mod tests {
             created_at: TimestampMs::from_unix_millis(0),
             last_accessed_at,
             importance,
+            lexical_match: false,
         }
     }
 
@@ -350,7 +365,7 @@ mod tests {
     // numbers themselves change — a test built to survive the default
     // moving cannot also be the test that catches the default moving. This
     // test is that second, narrower check: it pins `ScoringConfig::DEFAULT`'s
-    // five ranking literals as bare values, so an edit to any of them fails
+    // six ranking literals as bare values, so an edit to any of them fails
     // a test instead of silently changing what config every formula test is
     // a tautology about.
     //
@@ -393,6 +408,10 @@ mod tests {
              corpus and is only valid for today's embedding prefixes — if this failed because \
              a prefix changed, the floor must be re-measured against the new distribution \
              before it is re-pinned here."
+        );
+        assert_eq!(
+            ScoringConfig::DEFAULT.lexical_bonus, 1.0,
+            "ScoringConfig::DEFAULT.lexical_bonus changed from its shipped value: {REEVAL_NOTE}"
         );
     }
 
@@ -761,5 +780,47 @@ mod tests {
         assert_eq!(lambda_for(&cfg, TableKind::Memory, "user_preference"), cfg.decay.user_preference);
         assert_eq!(lambda_for(&cfg, TableKind::Memory, "tool_error"), cfg.decay.tool_error);
         assert_eq!(lambda_for(&cfg, TableKind::Memory, "unrecognized"), cfg.decay.fallback);
+    }
+
+    // ── lexical bonus ──
+
+    #[test]
+    fn a_lexical_match_adds_the_bonus_after_the_floor() {
+        // A distance whose cosine sits below the floor: cos' is 0, so before
+        // the bonus this row scored exactly 0.
+        let now = epoch();
+        let mut raw = make_raw_hit(TableKind::Memory, "chat_message", 1, "active", 1.0, now, 1.0);
+        raw.lexical_match = true;
+        let cfg = ScoringConfig::DEFAULT;
+
+        let importance = cfg.importance.base + 1.0 / cfg.importance.divisor;
+        let s = score(&cfg, &raw, now);
+        assert!(s > 0.0, "a match below the floor must score above zero, got {s}");
+        assert_eq!(s, cfg.lexical_bonus * importance);
+    }
+
+    #[test]
+    fn without_a_match_the_score_is_unchanged() {
+        let now = TimestampMs::from_unix_millis(1_700_000_000_000);
+        let last_accessed_at = TimestampMs::from_unix_millis(now.as_millis_i64() - 86_400_000);
+        let raw = make_raw_hit(TableKind::Memory, "chat_message", 2, "active", 0.3, last_accessed_at, 5.0);
+        let without_bonus = ScoringConfig { lexical_bonus: 0.0, ..ScoringConfig::DEFAULT };
+
+        let a = score(&ScoringConfig::DEFAULT, &raw, now);
+        let b = score(&without_bonus, &raw, now);
+        assert_eq!(a.to_bits(), b.to_bits());
+
+        let below_floor = make_raw_hit(TableKind::Memory, "chat_message", 1, "active", 1.0, epoch(), 1.0);
+        assert_eq!(score(&ScoringConfig::DEFAULT, &below_floor, epoch()), 0.0);
+    }
+
+    #[test]
+    fn a_match_outranks_a_closer_row_with_the_same_decay_and_importance() {
+        let now = epoch();
+        let closer = make_raw_hit(TableKind::Memory, "code_block", 1, "active", 0.0, now, 5.0);
+        let mut matched = make_raw_hit(TableKind::Memory, "code_block", 1, "active", 0.3, now, 5.0);
+        matched.lexical_match = true;
+        let cfg = ScoringConfig::DEFAULT;
+        assert!(score(&cfg, &matched, now) > score(&cfg, &closer, now));
     }
 }

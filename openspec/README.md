@@ -27,7 +27,7 @@ exploration -> proposal -> spec (+ design si hace falta) -> tasks -> apply -> ve
 | 4 | [project-identity](changes/archive/2026-10-12-project-identity/proposal.md) | 2 | M | 1 (backup antes del re-key) | archivado el 2026-10-12 ([`specs/project`](specs/project/spec.md)); pruebas de Windows pendientes en su [`verify.md`](changes/archive/2026-10-12-project-identity/verify.md) |
 | 5 | [eval-golden-expansion](changes/archive/2026-10-12-eval-golden-expansion/proposal.md) | medición | M | — | archivado el 2026-10-12 ([`specs/eval`](specs/eval/spec.md)) |
 | 6 | [visibility-policy](changes/visibility-policy/exploration.md) | 2, 4 | L | 4, 5 | exploración |
-| 7 | [lexical-fusion](changes/lexical-fusion/exploration.md) | 1, 3 | M | 5 | exploración |
+| 7 | [lexical-fusion](changes/lexical-fusion/proposal.md) | 1, 3 | M | 5 | verify: tests en verde; falta la medición `--real` con el golden set ([`verify.md`](changes/lexical-fusion/verify.md#pendiente-máquina-del-usuario)) |
 | 8 | [memory-update-tool](changes/memory-update-tool/exploration.md) | 1 | S | 6 (scope) | exploración |
 | 9 | [dispute-resolution](changes/dispute-resolution/exploration.md) | 1, 5 | M | 5 | exploración |
 | 10 | [mcp-protocol-upgrade](changes/mcp-protocol-upgrade/exploration.md) | 4 | M | 6 (identidad) | exploración |
