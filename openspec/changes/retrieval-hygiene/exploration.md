@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 | S | — | exploración (borrador) |
+| 1 | S | — | exploración (cerrada) |
 
 **Tesis:** dos defectos chicos del ranking ensucian lo que el agente recibe. Los dos se pueden medir con `rag-eval --agent-view`.
 
@@ -43,8 +43,8 @@
 
 ## Decisiones abiertas
 
-- [ ] Accesos: ¿a, b o c?
-- [ ] Ceros: ¿a, b o c? Ojo: si se elige b antes de lexical-fusion, los matches léxicos bajo el piso desaparecen del todo.
+- [x] Accesos: b, con el corte en el daemon (`clawg-cli`), no en el core. Además, un hit con score 0 no cuenta como acceso. Ver `proposal.md`.
+- [x] Ceros: a. La b queda para lexical-fusion, porque antes de la fusión haría desaparecer los matches léxicos bajo el piso.
 
 ## Cómo se mide
 

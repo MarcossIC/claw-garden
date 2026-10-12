@@ -22,7 +22,7 @@ exploration -> proposal -> spec (+ design si hace falta) -> tasks -> apply -> ve
 |---|--------|----------|--------|------------|--------|
 | 1 | [data-preservation](changes/data-preservation/exploration.md) | transversal | L (se parte en A–F) | — | exploración |
 | 2 | [ingest-durability](changes/ingest-durability/exploration.md) | 1 | M | — | exploración |
-| 3 | [retrieval-hygiene](changes/retrieval-hygiene/exploration.md) | 1 | S | — | exploración |
+| 3 | [retrieval-hygiene](changes/retrieval-hygiene/proposal.md) | 1 | S | — | spec |
 | 4 | [project-identity](changes/project-identity/exploration.md) | 2 | M | 1 (backup antes del re-key) | exploración |
 | 5 | [eval-golden-expansion](changes/eval-golden-expansion/exploration.md) | medición | M | — | exploración |
 | 6 | [visibility-policy](changes/visibility-policy/exploration.md) | 2, 4 | L | 4, 5 | exploración |
