@@ -274,6 +274,7 @@ impl EvalStore {
             importance,
             created_at_ms,
             disputed_against: None,
+            derived_from: Vec::new(),
         };
         self.0
             .insert_memory_with_vector(record, embedding)
@@ -504,6 +505,7 @@ impl EvalIngest {
                 timestamp_ms,
                 memory_type: Some(memory_type.to_string()),
                 importance: Some(importance),
+                derived_from: Vec::new(),
             }
             .into())
             .await

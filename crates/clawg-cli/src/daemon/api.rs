@@ -640,6 +640,7 @@ async fn save_memory(
         timestamp_ms: now_ms(),
         memory_type: body.memory_type,
         importance: body.importance,
+        derived_from: Vec::new(),
     };
 
     let (reply, report) = if wait {

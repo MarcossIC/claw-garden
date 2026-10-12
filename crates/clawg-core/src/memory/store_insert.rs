@@ -100,6 +100,9 @@ pub struct NewMemoryRecord {
     /// When `Some(_)`, the row is inserted with `status='disputed'`.
     /// Set by the contradiction detector in worker.rs before INSERT.
     pub disputed_against: Option<Vec<i64>>,
+    /// The `memory` rows this one was drawn from, linked in the same
+    /// transaction as the insert.
+    pub derived_from: Vec<i64>,
 }
 
 /// Neutral importance for a row nothing has said anything special about.
@@ -183,8 +186,29 @@ impl NewMemoryRecord {
             importance,
             created_at_ms: evt.timestamp_ms,
             disputed_against: None,
+            derived_from: evt.sources().to_vec(),
         }
     }
+}
+
+/// Links `memory_id` to each of `sources` inside the caller's transaction. A
+/// pair already linked stays as it was, and a row is never linked to itself:
+/// a save that reinforces one of its own sources is that source, not
+/// something drawn from it.
+fn link_sources(
+    tx: &rusqlite::Transaction<'_>,
+    memory_id: i64,
+    sources: &[i64],
+    now: TimestampMs,
+) -> rusqlite::Result<()> {
+    let mut stmt = tx.prepare_cached(
+        "INSERT OR IGNORE INTO memory_derivation (memory_id, source_id, created_at) \
+         SELECT ?1, ?2, ?3 WHERE ?1 <> ?2",
+    )?;
+    for source in sources {
+        stmt.execute(rusqlite::params![memory_id, source, now])?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -258,11 +282,13 @@ impl MemoryStore {
         agent_id: &str,
         project_id: Option<&str>,
         content_hash: &str,
+        derived_from: &[i64],
         now_ms: u64,
     ) -> Result<Option<i64>, MemoryStoreError> {
         let agent_id = agent_id.to_string();
         let project_id = project_id.map(str::to_string);
         let content_hash = content_hash.to_string();
+        let derived_from = derived_from.to_vec();
         let now = TimestampMs::from_unix_millis_u64(now_ms);
 
         self.conn
@@ -289,6 +315,7 @@ impl MemoryStore {
                      WHERE id = ?1",
                     rusqlite::params![id, now],
                 )?;
+                link_sources(&tx, id, &derived_from, now)?;
 
                 tx.commit()?;
                 Ok(Some(id))
@@ -366,6 +393,7 @@ impl MemoryStore {
                     "INSERT INTO memory_vectors(rowid, embedding) VALUES (?, ?)",
                     rusqlite::params![id, bytes],
                 )?;
+                link_sources(&tx, id, &record.derived_from, created_at)?;
                 tx.commit()?;
                 Ok(id)
             })
@@ -720,6 +748,7 @@ mod tests {
             importance: 5.0,
             created_at_ms: 1_000_000,
             disputed_against: None,
+            derived_from: Vec::new(),
         }
     }
 
@@ -839,6 +868,7 @@ mod tests {
             timestamp_ms: 0,
             memory_type: None,
             importance: None,
+            derived_from: Vec::new(),
         };
         let chunk = Chunk { text: "hello".to_string(), token_count: 1, header: None };
         let rec = NewMemoryRecord::from_event_and_chunk(&evt, &chunk);
@@ -863,6 +893,7 @@ mod tests {
             timestamp_ms: 0,
             memory_type: None,
             importance: None,
+            derived_from: Vec::new(),
         };
         let chunk = Chunk { text: "delta summary text".to_string(), token_count: 3, header: None };
         let rec = NewMemoryRecord::from_event_and_chunk(&evt, &chunk);
@@ -889,6 +920,7 @@ mod tests {
             timestamp_ms: 0,
             memory_type: memory_type.map(str::to_owned),
             importance,
+            derived_from: Vec::new(),
         }
     }
 
@@ -1652,7 +1684,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = store.reinforce_if_duplicate("agent-r1", None, hash, 2_000).await.unwrap();
+        let result = store.reinforce_if_duplicate("agent-r1", None, hash, &[], 2_000).await.unwrap();
         assert_eq!(result, Some(id), "a matching active row must be reinforced");
 
         let (access_count, tier) = fetch_access_count_and_tier(&store, id).await;
@@ -1663,7 +1695,7 @@ mod tests {
     #[tokio::test]
     async fn reinforce_if_duplicate_miss_returns_none() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let result = store.reinforce_if_duplicate("agent-r2", None, "no-such-hash", 1_000).await.unwrap();
+        let result = store.reinforce_if_duplicate("agent-r2", None, "no-such-hash", &[], 1_000).await.unwrap();
         assert_eq!(result, None, "no matching row must return None");
     }
 
@@ -1673,7 +1705,7 @@ mod tests {
         let hash = "hash-reinforce-deleted";
         seed_hashed_row(&store, "agent-r3", None, hash, "active", Some(500), 1_000, 0).await;
 
-        let result = store.reinforce_if_duplicate("agent-r3", None, hash, 2_000).await.unwrap();
+        let result = store.reinforce_if_duplicate("agent-r3", None, hash, &[], 2_000).await.unwrap();
         assert_eq!(result, None, "a soft-deleted row must never be reinforced");
     }
 
@@ -1683,7 +1715,7 @@ mod tests {
         let hash = "hash-reinforce-superseded";
         seed_hashed_row(&store, "agent-r4", None, hash, "superseded", None, 1_000, 0).await;
 
-        let result = store.reinforce_if_duplicate("agent-r4", None, hash, 2_000).await.unwrap();
+        let result = store.reinforce_if_duplicate("agent-r4", None, hash, &[], 2_000).await.unwrap();
         assert_eq!(result, None, "a superseded row must never be reinforced");
     }
 
@@ -1695,10 +1727,10 @@ mod tests {
         let id_p2 = seed_hashed_row(&store, "agent-r5", Some("proj-2"), hash, "active", None, 1_000, 0).await;
         assert_ne!(id_p1, id_p2);
 
-        let hit_p1 = store.reinforce_if_duplicate("agent-r5", Some("proj-1"), hash, 2_000).await.unwrap();
+        let hit_p1 = store.reinforce_if_duplicate("agent-r5", Some("proj-1"), hash, &[], 2_000).await.unwrap();
         assert_eq!(hit_p1, Some(id_p1), "proj-1 lookup must reinforce only the proj-1 row");
 
-        let hit_p2 = store.reinforce_if_duplicate("agent-r5", Some("proj-2"), hash, 2_000).await.unwrap();
+        let hit_p2 = store.reinforce_if_duplicate("agent-r5", Some("proj-2"), hash, &[], 2_000).await.unwrap();
         assert_eq!(hit_p2, Some(id_p2), "proj-2 lookup must reinforce only the proj-2 row");
 
         let (ac_p1, _) = fetch_access_count_and_tier(&store, id_p1).await;
@@ -1713,7 +1745,7 @@ mod tests {
         let hash = "hash-reinforce-null-proj";
         let id = seed_hashed_row(&store, "agent-r6", None, hash, "active", None, 1_000, 0).await;
 
-        let result = store.reinforce_if_duplicate("agent-r6", None, hash, 2_000).await.unwrap();
+        let result = store.reinforce_if_duplicate("agent-r6", None, hash, &[], 2_000).await.unwrap();
         assert_eq!(result, Some(id), "NULL project_id on both sides must match via COALESCE");
     }
 
@@ -1732,7 +1764,7 @@ mod tests {
         let hash = "hash-reinforce-cross-agent";
         let id_a = seed_hashed_row(&store, "agent-a", None, hash, "active", None, 1_000, 0).await;
 
-        let miss = store.reinforce_if_duplicate("agent-b", None, hash, 2_000).await.unwrap();
+        let miss = store.reinforce_if_duplicate("agent-b", None, hash, &[], 2_000).await.unwrap();
         assert_eq!(
             miss, None,
             "agent-b must not reinforce agent-a's row, even on an identical content hash"
@@ -1743,7 +1775,7 @@ mod tests {
 
         // And the same call under the owning agent still hits — proving the
         // miss above came from the agent scope, not from a broken fixture.
-        let hit = store.reinforce_if_duplicate("agent-a", None, hash, 2_000).await.unwrap();
+        let hit = store.reinforce_if_duplicate("agent-a", None, hash, &[], 2_000).await.unwrap();
         assert_eq!(hit, Some(id_a), "the owning agent must still reinforce its own row");
     }
 
@@ -1762,7 +1794,7 @@ mod tests {
         let hash = "hash-reinforce-empty-proj";
         let id = seed_hashed_row(&store, "agent-r8", Some(""), hash, "active", None, 1_000, 0).await;
 
-        let hit = store.reinforce_if_duplicate("agent-r8", None, hash, 2_000).await.unwrap();
+        let hit = store.reinforce_if_duplicate("agent-r8", None, hash, &[], 2_000).await.unwrap();
         assert_eq!(
             hit,
             Some(id),
@@ -1777,7 +1809,7 @@ mod tests {
         let older = seed_hashed_row(&store, "agent-r7", None, hash, "active", None, 1_000, 0).await;
         let _newer = seed_hashed_row(&store, "agent-r7", None, hash, "active", None, 2_000, 0).await;
 
-        let result = store.reinforce_if_duplicate("agent-r7", None, hash, 3_000).await.unwrap();
+        let result = store.reinforce_if_duplicate("agent-r7", None, hash, &[], 3_000).await.unwrap();
         assert_eq!(result, Some(older), "must deterministically pick the oldest row among legacy duplicates");
     }
 
@@ -1805,12 +1837,12 @@ mod tests {
         assert_eq!(access_count, 1, "insert must write access_count = 1");
         assert_eq!(tier, 2, "architectural_decision inserts at tier 2, below the promotion rule");
 
-        store.reinforce_if_duplicate(&agent_id, None, &hash, 2_000).await.unwrap();
+        store.reinforce_if_duplicate(&agent_id, None, &hash, &[], 2_000).await.unwrap();
         let (access_count, tier) = fetch_access_count_and_tier(&store, id).await;
         assert_eq!(access_count, 2);
         assert_eq!(tier, 2, "one reinforcement is not enough to promote");
 
-        store.reinforce_if_duplicate(&agent_id, None, &hash, 3_000).await.unwrap();
+        store.reinforce_if_duplicate(&agent_id, None, &hash, &[], 3_000).await.unwrap();
         let (access_count, tier) = fetch_access_count_and_tier(&store, id).await;
         assert_eq!(access_count, 3);
         assert_eq!(tier, 1, "the second reinforcement crosses access_count >= 3 and promotes to tier 1");
