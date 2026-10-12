@@ -208,6 +208,11 @@ pub fn store_owner_file(base_dir: &std::path::Path) -> PathBuf {
     base_dir.join("memory.owner")
 }
 
+/// Where snapshots of `memory.db` go (`<base_dir>/backups`).
+pub fn backups_dir(base_dir: &std::path::Path) -> PathBuf {
+    base_dir.join("backups")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
