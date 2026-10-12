@@ -12,13 +12,13 @@ mod parse;
 pub mod runner;
 mod stats;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::golden::CaseStatus;
 use matcher::{visible_segment, Corpus};
-use parse::{context_segments, parse_search_output, ParseError};
+use parse::{context_sections, context_segments, parse_search_output, ParseError};
 use stats::{summarize, Sample, ToolStats};
 
 /// What the search tool showed for one case.
@@ -56,6 +56,10 @@ pub struct ContextOutcome {
     pub found_refs: Vec<String>,
     pub tokens: usize,
     pub latency_ms: f64,
+    /// Tokens of each titled section. Results written before sections were
+    /// recorded have none.
+    #[serde(default)]
+    pub sections: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -148,6 +152,14 @@ pub fn read_context(text: &str, expected: &[String], corpus: &Corpus) -> Vec<Str
         .flat_map(|segment| corpus.refs_containing(&visible_segment(segment).text))
         .collect();
     in_expected_order(expected, &found)
+}
+
+/// What each section of a `recall_context` prompt costs.
+pub fn context_section_tokens(
+    text: &str,
+    count_tokens: &dyn Fn(&str) -> usize,
+) -> BTreeMap<String, usize> {
+    context_sections(text).into_iter().map(|(title, section)| (title, count_tokens(&section))).collect()
 }
 
 fn in_expected_order(expected: &[String], found: &HashSet<&str>) -> Vec<String> {
@@ -283,6 +295,21 @@ mod tests {
     }
 
     #[test]
+    fn context_section_tokens_are_counted_per_section_title() {
+        let text = "=== WORKSPACE ===\n- a rule\n\n=== LONG-TERM KNOWLEDGE ===\nCONTENT: x\n";
+        let tokens = context_section_tokens(text, &|s: &str| s.len());
+        assert_eq!(tokens.get("WORKSPACE"), Some(&"=== WORKSPACE ===\n- a rule".len()));
+        assert_eq!(tokens.get("LONG-TERM KNOWLEDGE"), Some(&"=== LONG-TERM KNOWLEDGE ===\nCONTENT: x".len()));
+    }
+
+    #[test]
+    fn a_context_written_before_sections_were_recorded_still_parses() {
+        let json = r#"{"found":true,"found_refs":["c1"],"tokens":10,"latency_ms":1.0}"#;
+        let outcome: ContextOutcome = serde_json::from_str(json).unwrap();
+        assert!(outcome.sections.is_empty());
+    }
+
+    #[test]
     fn a_result_written_before_lines_were_recorded_still_parses() {
         let json = r#"{"found":true,"found_refs":["c1"],"rank":1,"tokens":10,"latency_ms":1.0,"truncated":false}"#;
         let outcome: SearchOutcome = serde_json::from_str(json).unwrap();
@@ -374,6 +401,7 @@ mod tests {
                 found_refs: vec![],
                 tokens: tokens * 2,
                 latency_ms: 2.0,
+                sections: BTreeMap::new(),
             },
         }
     }

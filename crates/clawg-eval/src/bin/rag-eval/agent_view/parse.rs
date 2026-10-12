@@ -58,6 +58,21 @@ fn parse_search_line(line: &str) -> Option<SearchLine> {
     Some(SearchLine { rank, score, printed: line.to_string(), content: content.to_string() })
 }
 
+/// A `recall_context` prompt cut at its `=== TITLE ===` lines, as
+/// `(title, section text with its header)`.
+pub fn context_sections(text: &str) -> Vec<(String, String)> {
+    let mut sections: Vec<(String, Vec<&str>)> = Vec::new();
+    for line in text.lines() {
+        let title = line.strip_prefix("=== ").and_then(|l| l.strip_suffix(" ==="));
+        match (title, sections.last_mut()) {
+            (Some(title), _) => sections.push((title.to_string(), vec![line])),
+            (None, Some((_, lines))) => lines.push(line),
+            (None, None) => {}
+        }
+    }
+    sections.into_iter().map(|(title, lines)| (title, lines.join("\n").trim_end().to_string())).collect()
+}
+
 /// Content fragments of a `recall_context` prompt: each hit's `CONTENT:`
 /// block and each workspace bullet, in the order they appear.
 pub fn context_segments(text: &str) -> Vec<String> {
@@ -180,6 +195,26 @@ mod tests {
     fn blank_lines_are_ignored() {
         let text = "1. #1 [Memory/chat_message/t3 score=0.40] only\n\n";
         assert_eq!(parse_search_output(text).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_prompt_splits_into_its_titled_sections_header_included() {
+        let text = "=== WORKSPACE ===\n- a rule\n\n=== ACTIVE CONFLICTS (review needed) ===\nOLD: x\nNEW: y\n";
+        assert_eq!(
+            context_sections(text),
+            vec![
+                ("WORKSPACE".to_string(), "=== WORKSPACE ===\n- a rule".to_string()),
+                (
+                    "ACTIVE CONFLICTS (review needed)".to_string(),
+                    "=== ACTIVE CONFLICTS (review needed) ===\nOLD: x\nNEW: y".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_no_context_sentence_has_no_sections() {
+        assert!(context_sections("no context yet").is_empty());
     }
 
     #[test]

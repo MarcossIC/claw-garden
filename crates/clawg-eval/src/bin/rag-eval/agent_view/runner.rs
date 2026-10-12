@@ -15,7 +15,7 @@ use clawg_core::paths::Profile;
 
 use super::matcher::Corpus;
 use super::parse::ParseError;
-use super::{build_results, read_context, read_search, AgentViewResults, CaseView, ContextOutcome, SearchOutcome};
+use super::{build_results, context_section_tokens, read_context, read_search, AgentViewResults, CaseView, ContextOutcome, SearchOutcome};
 use crate::golden::GoldenSet;
 use crate::seed::AGENT_ID;
 
@@ -164,6 +164,7 @@ async fn answer_cases(
                 found_refs: context_found,
                 tokens: input.counter.count(&context_text),
                 latency_ms: context_ms,
+                sections: context_section_tokens(&context_text, &count_tokens),
             },
         });
     }
