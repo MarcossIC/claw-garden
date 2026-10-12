@@ -162,15 +162,20 @@ fn synthesis_line(r: &MemoryRow) -> String {
 /// drawn (first, so a new one updates them instead of repeating them), then
 /// the memories no conclusion covers, saying how many more there are.
 pub fn format_synthesis(s: &Synthesis) -> String {
+    let conclusions = (!s.conclusions.is_empty()).then(|| {
+        let mut lines = vec![String::new(), "Conclusions already drawn:".to_string()];
+        lines.extend(s.conclusions.iter().map(synthesis_line));
+        lines
+    });
+    // The conclusions still answer "what have you learned" when nothing is
+    // left to conclude; only the guide to saving one would be noise.
     if s.pending.is_empty() {
-        return "no memories are waiting for a conclusion".to_string();
+        let mut out = vec!["no memories are waiting for a conclusion".to_string()];
+        out.extend(conclusions.into_iter().flatten());
+        return out.join("\n");
     }
     let mut out = vec![SYNTHESIS_GUIDE.to_string()];
-    if !s.conclusions.is_empty() {
-        out.push(String::new());
-        out.push("Conclusions already drawn:".to_string());
-        out.extend(s.conclusions.iter().map(synthesis_line));
-    }
+    out.extend(conclusions.into_iter().flatten());
     out.push(String::new());
     out.push(format!(
         "Memories without a conclusion ({} of {}, newest first):",
@@ -459,6 +464,18 @@ mod tests {
         let out = format_synthesis(&synthesis(vec![], 0, vec![]));
         assert!(!out.contains("save_memory"), "{out}");
         assert!(out.contains("no memories"), "{out}");
+    }
+
+    #[test]
+    fn the_conclusions_show_even_with_nothing_pending() {
+        let out = format_synthesis(&synthesis(
+            vec![],
+            0,
+            vec![MemoryRow { derived_from: Some(vec![3, 7]), ..row(9, "memory", Some("user_preference"), "tabs everywhere") }],
+        ));
+        assert!(out.contains("no memories"), "{out}");
+        assert!(out.contains("#9 user_preference from=#3,#7 tabs everywhere"), "what was learned stays visible: {out}");
+        assert!(!out.contains("save_memory"), "with nothing pending there is nothing to save: {out}");
     }
 
     #[test]
