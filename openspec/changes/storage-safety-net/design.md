@@ -50,10 +50,11 @@ El destino es `<backups>/<nombre>.tmp`; si `VACUUM INTO` termina bien, se hace `
 
 Orden de los pasos y por qué:
 
-1. **Lock primero.** `StoreLock::acquire` con un titular nuevo, `StoreHolder::Maintenance` ("a clawg backup or restore"). Si lo tiene el daemon, el error es `StoreInUse` y el comando agrega "run `clawg stop` first".
+1. **Lock primero.** `StoreLock::acquire` con un titular nuevo, `StoreHolder::Maintenance` ("a clawg backup or restore"). Si lo tiene el daemon, el error es `StoreInUse` y el comando agrega "run `clawg stop` first". Si el directorio de datos no existe (una máquina donde clawg nunca corrió), se crea antes: restaurar ahí es la forma de mudar la base.
 2. **Validar el archivo antes de tocar nada.** Se abre en sólo lectura: `PRAGMA quick_check`, lectura del historial y `schema_plan`. `Fresh` también se rechaza: un archivo sin historial no es una base de clawg.
-3. **Snapshot de la base actual, y checkpoint.** El snapshot ya incluye el WAL. El `wal_checkpoint(TRUNCATE)` deja `memory.db-wal` vacío, así que borrarlo en el paso 4 no pierde nada aunque el snapshot se borre después a mano.
-4. **Reemplazo.** Copia a `memory.db.restore-tmp` en el mismo directorio, `sync_all`, borrar `memory.db-wal` y `memory.db-shm`, y `rename` sobre `memory.db`. El WAL se borra **antes** del `rename`: al revés, un corte entre los dos pasos dejaría un WAL de la base vieja que SQLite aplicaría sobre la nueva.
+3. **Copiar el archivo a `memory.db.restore-tmp`**, en el mismo directorio, con `sync_all`. Va **antes** del snapshot del paso 4 porque ese snapshot poda los automáticos viejos, y el archivo a restaurar puede ser uno de ellos: con el orden al revés, restaurar el automático más viejo lo borraría antes de copiarlo. Lo fija `restoring_the_oldest_kept_automatic_snapshot_survives_the_pruning`.
+4. **Snapshot de la base actual, y checkpoint.** El snapshot ya incluye el WAL. El `wal_checkpoint(TRUNCATE)` deja `memory.db-wal` vacío, así que borrarlo en el paso 5 no pierde nada aunque el snapshot se borre después a mano.
+5. **Reemplazo.** Borrar `memory.db-wal` y `memory.db-shm`, y `rename` del temporal sobre `memory.db`. El WAL se borra **antes** del `rename`: al revés, un corte entre los dos pasos dejaría un WAL de la base vieja que SQLite aplicaría sobre la nueva. Si algo falla, el temporal se borra.
 
 El volcado `ingest-pending.jsonl` no se toca: son saves aceptados que todavía no están en ninguna base, y se ingieren en la restaurada.
 
@@ -87,7 +88,8 @@ Un snapshot `pre-migration` tiene el esquema anterior (plan `Pending`). `restore
 
 ## D7. Notas de C
 
-- **`clawg status` (R7).** `status_report` gana un parámetro `store: Option<&StoreProbe>`; `main.rs` sólo lo calcula si no hay daemon. `StoreProbe` sale de `backup::probe(base_dir)`: abre `memory.db` con `SQLITE_OPEN_READ_ONLY`, lee el historial y aplica `schema_plan`. No toma el lock: leer en sólo lectura no compite con nadie, y un probe que tomara el lock podría hacer fallar a un daemon que arranca en ese instante. Si `memory.db` no existe, `missing`, sin crear nada; cualquier error de lectura, `unreadable` con el texto del error.
+- **`clawg status` (R7).** `status_report` gana un parámetro `store: Option<&StoreProbe>`; `main.rs` sólo lo calcula si no hay daemon. `StoreProbe` sale de `backup::probe(base_dir)`: abre `memory.db` en sólo lectura, lee el historial y aplica `schema_plan`. No toma el lock: un probe que tomara el lock podría hacer fallar a un daemon que arranca en ese instante. Si `memory.db` no existe, `missing`, sin crear nada; cualquier error de lectura, `unreadable` con el texto del error.
+  - **Sólo lectura no alcanza para no escribir.** Una conexión `SQLITE_OPEN_READ_ONLY` sobre una base en WAL crea `memory.db-wal` y `memory.db-shm` y no puede borrarlos al cerrar. Una base parada no tiene ninguno de los dos, así que el probe la abre con la URI `file:…?immutable=1`, que no crea nada. Si hay un `-wal` (lo deja un kill), sus commits cuentan y se usa la apertura en sólo lectura común, sobre archivos que ya existen. La URI se arma con una función pura que escapa lo que una URI no admite y pasa las barras de Windows a `/`.
 - **MCP (R8).** `explain` separa `StartTimeout` de `NotRunning`. Es el único cambio: la lógica de autoarranque no cambia.
 - **Instalador (R9).** Después del `stop`, `& $target status --profile prod *> $null` y mirar `$LASTEXITCODE`. Se usa `status` y no el código de `stop` porque `stop` sale con 1 tanto si no había daemon (el caso normal de una primera instalación o de una máquina sin daemon) como si venció el plazo; `status` sale con 0 sólo si `/health` responde, que es exactamente "sigue vivo".
 
