@@ -12,10 +12,14 @@ mod vocab;
 use golden::{Case, Golden, Row, Status, Subset};
 use templates::IdentKind;
 use rng::SplitMix64;
-use vocab::Vocab;
+use vocab::{Group, Terms, Vocab};
 
 pub const DEFAULT_DISTRACTORS: usize = 500;
 
+const MAX_CHAINED_FRAMES: usize = 3;
+/// Words in a row that a distractor must not repeat from a base row.
+const COPY_RUN_WORDS: usize = 6;
+const MAX_COPY_RETRIES: usize = 50;
 const LEXICAL_FAMILIES: usize = 30;
 const SIBLINGS_PER_FAMILY: usize = 8;
 const MULTI_REF_TOPICS: usize = 12;
@@ -29,6 +33,8 @@ pub enum SynthError {
     DuplicateRef(String),
     #[error("query '{0}' appears more than once; `rag-eval --diff` joins cases on the query text")]
     DuplicateQuery(String),
+    #[error("could not build distractor '{0}' without repeating a run of a base row")]
+    DistractorCopiesBase(String),
     #[error("the base has no rows to model distractors on")]
     EmptyBase,
 }
@@ -58,7 +64,7 @@ pub fn generate(base: &Golden, seed: u64, sizes: &Sizes) -> Result<Golden, Synth
     let vocab = Vocab::from_rows(&base.corpus);
     let mut rng = SplitMix64::new(seed);
     let mut out = base.clone();
-    out.corpus.extend(distractors(&vocab, &mut rng, sizes.distractors));
+    out.corpus.extend(distractors(base, &vocab, &mut rng, sizes.distractors)?);
     let (rows, cases) = lexical_families(base, &mut rng);
     out.corpus.extend(rows);
     out.retrieval_cases.extend(cases);
@@ -76,38 +82,78 @@ pub fn generate(base: &Golden, seed: u64, sizes: &Sizes) -> Result<Golden, Synth
 }
 
 /// Rows that sit near real ones without answering anything: each mixes the
-/// identifiers and terms of two base rows of the same type and language.
-fn distractors(vocab: &Vocab, rng: &mut SplitMix64, count: usize) -> Vec<Row> {
-    (0..count)
-        .map(|n| {
-            let (g, first) = *rng.pick(&vocab.rows);
-            let group = &vocab.groups[g];
-            let second = rng.below(group.rows.len());
-            let (r, r2) = (&group.rows[first], &group.rows[second]);
+/// identifiers and terms of two base rows of the same type and language, and
+/// runs as long as the rows it imitates so length does not give it away.
+fn distractors(base: &Golden, vocab: &Vocab, rng: &mut SplitMix64, count: usize) -> Result<Vec<Row>, SynthError> {
+    let base_windows: HashSet<String> = base.corpus.iter().flat_map(|r| word_windows(&r.content)).collect();
+    let mut out = Vec::with_capacity(count);
+    for n in 0..count {
+        let ref_ = format!("s-dis-{:04}", n + 1);
+        let content = (0..MAX_COPY_RETRIES)
+            .find_map(|_| {
+                let (g, first) = *rng.pick(&vocab.rows);
+                let group = &vocab.groups[g];
+                let second = rng.below(group.rows.len());
+                let (content, _) = compose_distractor(rng, group, &group.rows[first], &group.rows[second]);
+                (!shares_word_run(&content, &base_windows)).then_some((g, content))
+            })
+            .ok_or_else(|| SynthError::DistractorCopiesBase(ref_.clone()))?;
+        let group = &vocab.groups[content.0];
+        out.push(Row {
+            ref_,
+            content: content.1,
+            memory_type: group.memory_type.clone(),
+            importance: importance_in(rng, group.importance_lo, group.importance_hi),
+            lang: group.lang.clone(),
+        });
+    }
+    Ok(out)
+}
 
-            let spanish = group.lang.as_deref() == Some("es");
-            let fallback = templates::fallback_word(spanish);
-            let a = pick_term(rng, &r.idents, &r.words, fallback);
-            let b = pick_term(rng, &r2.idents, &r2.words, fallback);
-            let w1 = pick_term(rng, &r.words, &r2.words, fallback);
-            let w2 = pick_term(rng, &r2.words, &r.words, fallback);
-            let w3 = pick_term(rng, &r.words, &r2.words, fallback);
+/// Chains frames over the same pair of rows until the text is as long as the
+/// group's median row or three frames are in; returns the text and how many
+/// frames it took.
+fn compose_distractor(rng: &mut SplitMix64, group: &Group, r: &Terms, r2: &Terms) -> (String, usize) {
+    let spanish = group.lang.as_deref() == Some("es");
+    let fallback = templates::fallback_word(spanish);
+    let frames = templates::distractor_frames(&group.memory_type, spanish);
+    let start = rng.below(frames.len());
+    let mut content = String::new();
+    let mut used = 0;
+    while used < MAX_CHAINED_FRAMES {
+        let a = pick_term(rng, &r.idents, &r.words, fallback);
+        let b = pick_term(rng, &r2.idents, &r2.words, fallback);
+        let w1 = pick_term(rng, &r.words, &r2.words, fallback);
+        let w2 = pick_term(rng, &r2.words, &r.words, fallback);
+        let w3 = pick_term(rng, &r.words, &r2.words, fallback);
+        if used > 0 {
+            content.push(' ');
+        }
+        content.push_str(&templates::fill(
+            frames[(start + used) % frames.len()],
+            &[("{a}", a), ("{b}", b), ("{w1}", w1), ("{w2}", w2), ("{w3}", w3)],
+        ));
+        used += 1;
+        if content.chars().count() >= group.median_len {
+            break;
+        }
+    }
+    (content, used)
+}
 
-            let frame = *rng.pick(templates::distractor_frames(&group.memory_type, spanish));
-            let content = templates::fill(
-                frame,
-                &[("{a}", a), ("{b}", b), ("{w1}", w1), ("{w2}", w2), ("{w3}", w3)],
-            );
+/// Every run of `COPY_RUN_WORDS` consecutive words in `text`, lowercased and
+/// stripped of punctuation.
+fn word_windows(text: &str) -> Vec<String> {
+    let words: Vec<String> = text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    words.windows(COPY_RUN_WORDS).map(|w| w.join(" ")).collect()
+}
 
-            Row {
-                ref_: format!("s-dis-{:04}", n + 1),
-                content,
-                memory_type: group.memory_type.clone(),
-                importance: importance_in(rng, group.importance_lo, group.importance_hi),
-                lang: group.lang.clone(),
-            }
-        })
-        .collect()
+fn shares_word_run(text: &str, base_windows: &HashSet<String>) -> bool {
+    word_windows(text).iter().any(|w| base_windows.contains(w))
 }
 
 /// Families of eight rows, each with a question that names the identifier of
@@ -661,6 +707,66 @@ mod tests {
         let ids = near_identifiers("E_CACHE_", "1111", 7, &mut SplitMix64::new(7), &|_| false);
         let set: HashSet<&str> = ids.iter().map(String::as_str).collect();
         assert_eq!(set, HashSet::from(["E_CACHE_1110", "E_CACHE_1112"]));
+    }
+
+    fn long_group_base() -> Golden {
+        let long = "The OrderService owns pricing rules and delegates persistence to `OrderRepository`;             the gateway keeps sessions in `SessionStore` and refreshes them every few minutes.";
+        Golden {
+            corpus: vec![
+                rich_row("c01", "architectural_decision", "en", 6.0, long),
+                rich_row("c02", "architectural_decision", "en", 7.0, long),
+                rich_row("c03", "tool_error", "en", 4.0, "Falló `x`."),
+            ],
+            retrieval_cases: vec![],
+            contradiction_pairs: vec![],
+        }
+    }
+
+    #[test]
+    fn a_distractor_reaches_its_groups_median_length_or_chains_three_frames() {
+        let base = long_group_base();
+        let vocab = Vocab::from_rows(&base.corpus);
+        let mut rng = SplitMix64::new(7);
+        for group in &vocab.groups {
+            for _ in 0..50 {
+                let (content, frames) = compose_distractor(&mut rng, group, &group.rows[0], &group.rows[group.rows.len() - 1]);
+                assert!((1..=3).contains(&frames));
+                assert!(content.chars().count() >= group.median_len || frames == 3, "{content}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_group_needs_one_frame_and_a_long_one_chains_more() {
+        let base = long_group_base();
+        let vocab = Vocab::from_rows(&base.corpus);
+        let mut rng = SplitMix64::new(7);
+        let frames_of = |group: &vocab::Group, rng: &mut SplitMix64| {
+            compose_distractor(rng, group, &group.rows[0], &group.rows[0]).1
+        };
+        let long = vocab.groups.iter().find(|g| g.memory_type == "architectural_decision").unwrap();
+        let short = vocab.groups.iter().find(|g| g.memory_type == "tool_error").unwrap();
+        assert!((0..20).all(|_| frames_of(short, &mut rng) == 1));
+        assert!((0..20).any(|_| frames_of(long, &mut rng) >= 2));
+    }
+
+    #[test]
+    fn a_run_of_six_words_is_detected_case_and_punctuation_insensitively() {
+        let windows = word_windows("The quick, brown fox jumps over the lazy dog");
+        let base: HashSet<String> = windows.into_iter().collect();
+        assert!(shares_word_run("Yesterday the QUICK brown fox jumps over it", &base));
+        assert!(!shares_word_run("the quick brown fox leaps over the lazy dog", &base));
+        assert!(!shares_word_run("too short", &base));
+    }
+
+    #[test]
+    fn no_distractor_shares_six_words_in_a_row_with_a_base_row() {
+        let base = grouped_base();
+        let out = generate(&base, 7, &Sizes { distractors: 300 }).unwrap();
+        let windows: HashSet<String> = base.corpus.iter().flat_map(|r| word_windows(&r.content)).collect();
+        for d in distractors(&out, &base) {
+            assert!(!shares_word_run(&d.content, &windows), "{}", d.content);
+        }
     }
 
     fn cases_of(out: &Golden, subset: Subset) -> Vec<&Case> {

@@ -34,6 +34,8 @@ pub struct Group {
     pub rows: Vec<Terms>,
     pub importance_lo: f64,
     pub importance_hi: f64,
+    /// Median length, in characters, of the group's rows.
+    pub median_len: usize,
 }
 
 #[derive(Debug)]
@@ -49,6 +51,7 @@ impl Vocab {
         let mut index: BTreeMap<(&str, Option<&str>), usize> = BTreeMap::new();
         let mut groups: Vec<Group> = Vec::new();
         let mut flat = Vec::with_capacity(rows.len());
+        let mut lengths: Vec<Vec<usize>> = Vec::new();
 
         for row in rows {
             let key = (row.memory_type.as_str(), row.lang.as_deref());
@@ -59,14 +62,21 @@ impl Vocab {
                     rows: Vec::new(),
                     importance_lo: row.importance,
                     importance_hi: row.importance,
+                    median_len: 0,
                 });
+                lengths.push(Vec::new());
                 groups.len() - 1
             });
             let group = &mut groups[g];
             group.importance_lo = group.importance_lo.min(row.importance);
             group.importance_hi = group.importance_hi.max(row.importance);
             group.rows.push(terms_of(&row.content));
+            lengths[g].push(row.content.chars().count());
             flat.push((g, group.rows.len() - 1));
+        }
+        for (group, mut lens) in groups.iter_mut().zip(lengths) {
+            lens.sort_unstable();
+            group.median_len = lens[lens.len() / 2];
         }
         Self { groups, rows: flat }
     }
@@ -160,6 +170,18 @@ mod tests {
         assert_eq!(vocab.groups[0].rows.len(), 2);
         assert_eq!((vocab.groups[0].importance_lo, vocab.groups[0].importance_hi), (4.0, 6.0));
         assert_eq!(vocab.rows.len(), 3);
+    }
+
+    #[test]
+    fn a_group_records_the_median_length_of_its_rows_in_characters() {
+        let vocab = Vocab::from_rows(&[
+            row("tool_error", Some("es"), 4.0, "12345"),
+            row("tool_error", Some("es"), 4.0, "123456789012345"),
+            row("tool_error", Some("es"), 4.0, "1234567890"),
+            row("tool_error", Some("en"), 4.0, "ñññññññññññ"),
+        ]);
+        assert_eq!(vocab.groups[0].median_len, 10);
+        assert_eq!(vocab.groups[1].median_len, 11);
     }
 
     #[test]
