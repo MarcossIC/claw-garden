@@ -38,4 +38,4 @@ No aplica: el cambio no toca el ranking ni el golden set, que no usa `project_id
 
 ## Dependencia
 
-La migración V9 corre después del snapshot automático que agrega el cambio de storage (backups, partes B + C de data-preservation), que se está escribiendo en paralelo y todavía no está en `main`. El re-key no depende de ese snapshot para poder deshacerse (`project_rekey` guarda cada fila movida), pero conviene que el snapshot llegue antes o junto con este cambio. Si storage también agrega una migración, la que llegue segunda a `main` se renumera (`design.md`, D5).
+El cambio de storage (backups, partes B + C de data-preservation, rama `claude/storage-sdd-xv8bd2`) no agrega migraciones, así que V9 no choca. Con storage, `MemoryStore::open` toma un snapshot antes de aplicar migraciones pendientes, y eso cubre el backup antes de V9. También rechaza una base con checksums distintos de `PINNED`; V9 ya tiene su fila ahí. Orden de merge: storage primero, después este cambio, rebaseado sobre él. El re-key no depende del snapshot para deshacerse: `project_rekey` guarda cada fila movida.
