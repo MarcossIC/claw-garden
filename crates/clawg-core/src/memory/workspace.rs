@@ -46,6 +46,55 @@ impl WorkspaceManager {
             .join("workspace.md")
     }
 
+    /// Gives every agent's `workspace.md` under `legacy_id` to `project_id`
+    /// when the new project has none yet, so a hand-written USER section
+    /// follows its rows. The legacy file is copied, never moved or changed: if
+    /// the user keeps editing it, both copies still exist. When both already
+    /// exist nothing is merged, only reported, because either could be the one
+    /// the user wants.
+    pub async fn adopt_legacy(&self, legacy_id: &str, project_id: &str) -> Result<(), MemoryError> {
+        let io_err = |path: &std::path::Path| {
+            let path = path.to_path_buf();
+            move |source| MemoryError::WorkspaceIo { path, source }
+        };
+        let mut agents = match tokio::fs::read_dir(&self.workspaces_root).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(io_err(&self.workspaces_root)(e)),
+        };
+        while let Some(agent) = agents.next_entry().await.map_err(io_err(&self.workspaces_root))? {
+            let Some(agent_id) = agent.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let from = self.workspace_path(&agent_id, Some(legacy_id));
+            let to = self.workspace_path(&agent_id, Some(project_id));
+            let legacy = match tokio::fs::read(&from).await {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(io_err(&from)(e)),
+            };
+            match tokio::fs::read(&to).await {
+                Ok(current) => {
+                    if current != legacy {
+                        log::warn!(
+                            "workspace {} was kept beside {}; merge them by hand if both matter",
+                            from.display(),
+                            to.display()
+                        );
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some(dir) = to.parent() {
+                        tokio::fs::create_dir_all(dir).await.map_err(io_err(dir))?;
+                    }
+                    write_atomically(&to, &legacy).await.map_err(io_err(&to))?;
+                }
+                Err(e) => return Err(io_err(&to)(e)),
+            }
+        }
+        Ok(())
+    }
+
     /// Regenerates the AUTO section from DB queries. USER section is preserved
     /// byte-for-byte.
     ///
@@ -534,6 +583,47 @@ fn assemble_file(existing: &str, auto_section: &str) -> String {
 mod tests {
     use super::*;
     use crate::memory::db::MemoryStore;
+
+        #[tokio::test]
+    async fn a_rekey_copies_the_legacy_workspace_and_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = WorkspaceManager::new(dir.path().to_path_buf());
+        let legacy = ws.workspace_path("agent-a", Some("src-1a2b"));
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let content = format!("{AUTO_START}\nauto\n{AUTO_END}\n{USER_START}\nwritten by hand\n{USER_END}\n");
+        std::fs::write(&legacy, &content).unwrap();
+
+        ws.adopt_legacy("src-1a2b", "repo-3c4d").await.unwrap();
+
+        let adopted = ws.workspace_path("agent-a", Some("repo-3c4d"));
+        assert_eq!(std::fs::read_to_string(&adopted).unwrap(), content);
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), content, "the legacy file stays as it was");
+    }
+
+    #[tokio::test]
+    async fn adopting_never_overwrites_the_projects_own_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = WorkspaceManager::new(dir.path().to_path_buf());
+        for (project, text) in [("src-1a2b", "legacy"), ("repo-3c4d", "current")] {
+            let path = ws.workspace_path("agent-a", Some(project));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+        }
+
+        ws.adopt_legacy("src-1a2b", "repo-3c4d").await.unwrap();
+
+        let read = |p| std::fs::read_to_string(ws.workspace_path("agent-a", Some(p))).unwrap();
+        assert_eq!(read("repo-3c4d"), "current");
+        assert_eq!(read("src-1a2b"), "legacy");
+    }
+
+    #[tokio::test]
+    async fn adopting_without_any_workspace_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = WorkspaceManager::new(dir.path().join("never-created"));
+        ws.adopt_legacy("src-1a2b", "repo-3c4d").await.unwrap();
+        assert!(!dir.path().join("never-created").exists());
+    }
 
     #[test]
     fn path_with_project_id() {
