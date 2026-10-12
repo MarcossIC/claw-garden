@@ -92,6 +92,10 @@ No es la medición de la propuesta: el golden set real está en la máquina del 
 - El audit da `unusable` en las dos corridas: con 2 casos naturales el set sustituto no pasa el chequeo de saturación. No cambia la lectura del diff pareado.
 - Dos corridas del cambio dan las mismas cifras.
 
+### Default antes de medir
+
+El usuario decidió mergear con `lexical_bonus = 1,0` y medir después (revisión de CodeRabbit sobre `score.rs`, 2026-10-12). Si un umbral de abajo falla, el bono baja a 0,0 en un cambio nuevo.
+
 ### Pendiente (máquina del usuario)
 
 Con los binarios de este cambio, contra los resultados guardados de eval-golden-expansion:
