@@ -37,8 +37,12 @@ use clawg_core::memory::worker::{
     ChunkOutcome, IngestFailure, IngestReport, IngestRequest, SavedChunk,
 };
 use clawg_core::memory::events::{MemoryEvent, MemorySource};
+use clawg_core::memory::clock::TimestampMs;
 use clawg_core::memory::project::{register_project, RegisterError};
 use clawg_core::memory::prompt_builder::{build_memory_prompt, QueryTexts};
+use clawg_core::memory::synthesis::{
+    existing_memory_ids, synthesis_core, unreviewed_count, Synthesis, SynthesisParams,
+};
 use clawg_core::memory::{search_all_memories, RankedHit, SearchScope};
 use clawg_core::models::chat::Role;
 use clawg_core::paths::Profile;
@@ -265,6 +269,30 @@ pub fn clamp_search_limit(requested: Option<usize>) -> usize {
 /// Rejects instead of clamping, unlike the limit: a ratio above 1 would cut
 /// every hit past the minimum, and an answer that short would read as "the
 /// store has nothing else" when the caller only mistyped a number.
+/// Most sources one save may name. A conclusion rests on a handful of
+/// memories; a list longer than this is a client passing a listing through,
+/// and every id costs a lookup before the save is queued.
+pub const MAX_SOURCES: usize = 50;
+
+/// The sources a save names, each once and ascending, or why they are refused.
+fn distinct_sources(ids: &[i64]) -> Result<Vec<i64>, ApiError> {
+    let mut ids = ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.len() > MAX_SOURCES {
+        return Err(ApiError::bad_request(format!(
+            "derived_from names {} memories; at most {MAX_SOURCES} are accepted",
+            ids.len()
+        )));
+    }
+    Ok(ids)
+}
+
+/// The requested sources that are not among the ones that exist, in order.
+fn missing_sources(requested: &[i64], existing: &[i64]) -> Vec<i64> {
+    requested.iter().copied().filter(|id| !existing.contains(id)).collect()
+}
+
 fn check_relative_score(ratio: Option<f64>) -> Result<Option<f64>, ApiError> {
     match ratio {
         Some(r) if !(0.0..=1.0).contains(&r) => {
@@ -286,6 +314,9 @@ pub struct SaveRequest {
     pub memory_type: Option<String>,
     #[serde(default)]
     pub importance: Option<f64>,
+    /// Ids of the memories this one is a conclusion drawn from.
+    #[serde(default)]
+    pub derived_from: Vec<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -433,6 +464,23 @@ pub struct SearchBody {
 #[derive(Debug, Serialize)]
 pub struct ContextBody {
     pub prompt: String,
+    /// Memories of the requested scope that arrived since it was last
+    /// reviewed for conclusions (`POST /v1/synthesis`).
+    pub unreviewed: usize,
+}
+
+/// Strict for the same reason as [`OwnerQuery`].
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SynthesisRequest {
+    /// Reviews only this agent's memories, as [`OwnerQuery`] scopes a change.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// Absent: the whole store.
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -482,6 +530,7 @@ pub fn router(app: Arc<AppCtx>) -> Router {
             get(get_memory).patch(patch_importance).delete(delete_memory),
         )
         .route("/disputes/resolve", post(resolve_dispute))
+        .route("/synthesis", post(synthesis))
         .route("/stats", get(stats))
         .route("/backup", post(backup))
         .route("/projects", post(register))
@@ -616,6 +665,21 @@ async fn save_memory(
     if body.content.trim().is_empty() {
         return Err(ApiError::bad_request("content must not be empty"));
     }
+    // Checked here rather than by the worker: once queued, a save can only be
+    // reported as failed long after the caller was told it was accepted.
+    let derived_from = distinct_sources(&body.derived_from)?;
+    if !derived_from.is_empty() {
+        let existing = existing_memory_ids(&app.runtime.store, &derived_from, Some(&body.agent_id))
+            .await
+            .map_err(ApiError::internal)?;
+        let missing = missing_sources(&derived_from, &existing);
+        if !missing.is_empty() {
+            let ids = missing.iter().map(i64::to_string).collect::<Vec<_>>().join(", ");
+            return Err(ApiError::bad_request(format!(
+                "derived_from names memories that do not exist or were deleted: {ids}"
+            )));
+        }
+    }
     // Refused before it is queued: with no embedder coming, a queued save
     // would sit in memory until the daemon stops and then be lost.
     let wait = match app.runtime.embedder_status() {
@@ -640,7 +704,7 @@ async fn save_memory(
         timestamp_ms: now_ms(),
         memory_type: body.memory_type,
         importance: body.importance,
-        derived_from: Vec::new(),
+        derived_from,
     };
 
     let (reply, report) = if wait {
@@ -750,7 +814,25 @@ async fn context(
     .await
     .map_err(ApiError::internal)?;
 
-    Ok(Json(ContextBody { prompt }))
+    // Same degradation as the regen above: a reminder that cannot be counted
+    // is a reminder skipped, not a failed request.
+    let unreviewed = unreviewed_count(&app.runtime.store, Some(&body.agent_id), project_id).await.unwrap_or_else(|e| {
+        log::warn!("unreviewed count failed: {e}");
+        0
+    });
+
+    Ok(Json(ContextBody { prompt, unreviewed }))
+}
+
+async fn synthesis(
+    State(app): State<Arc<AppCtx>>,
+    Json(body): Json<SynthesisRequest>,
+) -> ApiResult<Json<Synthesis>> {
+    let params = SynthesisParams { agent_id: body.agent_id, project_id: body.project_id, limit: body.limit };
+    synthesis_core(&app.runtime.store, params, TimestampMs::now())
+        .await
+        .map(Json)
+        .map_err(ApiError::internal)
 }
 
 async fn list_memories(
@@ -912,6 +994,28 @@ mod tests {
 
     fn chunk(id: i64, outcome: ChunkOutcome) -> SavedChunk {
         SavedChunk { id, outcome }
+    }
+
+    #[test]
+    fn sources_are_counted_once_and_sorted() {
+        assert_eq!(distinct_sources(&[9, 3, 9, 1]).unwrap(), vec![1, 3, 9]);
+        assert_eq!(distinct_sources(&[]).unwrap(), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn too_many_sources_are_refused() {
+        let at_cap: Vec<i64> = (0..MAX_SOURCES as i64).collect();
+        assert!(distinct_sources(&at_cap).is_ok());
+        let repeated: Vec<i64> = at_cap.iter().chain(at_cap.iter()).copied().collect();
+        assert!(distinct_sources(&repeated).is_ok(), "the cap counts distinct ids");
+        let over: Vec<i64> = (0..=MAX_SOURCES as i64).collect();
+        assert_eq!(distinct_sources(&over).unwrap_err().status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn missing_sources_are_the_ones_that_were_not_found() {
+        assert_eq!(missing_sources(&[1, 2, 3, 999], &[1, 3]), vec![2, 999]);
+        assert!(missing_sources(&[1, 3], &[1, 3]).is_empty());
     }
 
     #[test]

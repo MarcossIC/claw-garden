@@ -433,6 +433,7 @@ impl ClawgMcp {
                 project_id,
                 memory_type: args.memory_type,
                 importance: args.importance,
+                derived_from: Vec::new(),
             })
             .await;
         // "saved" only when the daemon confirmed the rows exist: telling a
@@ -484,7 +485,7 @@ impl ClawgMcp {
             .context(&args.query, agent_id, project_id.as_deref())
             .await
         {
-            Ok(prompt) => Self::ok(format_context(&prompt)),
+            Ok(context) => Self::ok(format_context(&context.prompt)),
             Err(e) => Self::failed(Self::explain(&e)),
         }
     }
@@ -829,6 +830,7 @@ mod tests {
                 project_id: Some(identity.legacy_id.clone()),
                 memory_type: None,
                 importance: None,
+                derived_from: Vec::new(),
             })
             .await
             .expect("seed a legacy row");
@@ -921,6 +923,7 @@ mod tests {
                 project_id: Some("proj-test".into()),
                 memory_type: None,
                 importance: None,
+                derived_from: Vec::new(),
             })
             .await
             .expect("save");
@@ -971,6 +974,7 @@ mod tests {
                 project_id: Some("proj-test".into()),
                 memory_type: None,
                 importance: None,
+                derived_from: Vec::new(),
             })
             .await
             .expect("save");

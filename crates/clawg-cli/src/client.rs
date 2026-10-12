@@ -206,6 +206,37 @@ pub struct MemoryRow {
     pub disputed_against: Option<String>,
     #[serde(default)]
     pub last_disputed_at: Option<i64>,
+    /// The memories this row is a conclusion drawn from; absent on any other
+    /// row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_from: Option<Vec<i64>>,
+}
+
+/// What `POST /v1/context` answers.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct Context {
+    pub prompt: String,
+    /// Memories of the scope that arrived since it was last reviewed for
+    /// conclusions. A daemon that predates the count omits it.
+    #[serde(default)]
+    pub unreviewed: usize,
+}
+
+/// What `POST /v1/synthesis` answers.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct Synthesis {
+    pub pending: Vec<MemoryRow>,
+    pub pending_total: usize,
+    pub conclusions: Vec<MemoryRow>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SynthesisArgs {
+    /// Absent, the review is the store owner's and covers every agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub project_id: Option<String>,
+    pub limit: Option<u32>,
 }
 
 /// One bucket of a grouping from `GET /v1/stats`. `key: None` is the NULL
@@ -244,6 +275,10 @@ pub struct SaveArgs {
     pub project_id: Option<String>,
     pub memory_type: Option<String>,
     pub importance: Option<f64>,
+    /// Left off the wire when empty, so a save that names no sources reads
+    /// the same to a daemon that predates them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub derived_from: Vec<i64>,
 }
 
 /// A row a save wrote or reinforced, as `POST /v1/memories` reports it.
@@ -452,11 +487,7 @@ impl DaemonClient {
         query: &str,
         agent_id: &str,
         project_id: Option<&str>,
-    ) -> Result<String, ClientError> {
-        #[derive(Deserialize)]
-        struct Body {
-            prompt: String,
-        }
+    ) -> Result<Context, ClientError> {
         let resp = self
             .http
             .post(self.url("/v1/context"))
@@ -469,7 +500,19 @@ impl DaemonClient {
             .send()
             .await
             .map_err(Self::map_transport)?;
-        Ok(Self::read_response::<Body>(resp).await?.prompt)
+        Self::read_response(resp).await
+    }
+
+    pub async fn synthesis(&self, args: &SynthesisArgs) -> Result<Synthesis, ClientError> {
+        let resp = self
+            .http
+            .post(self.url("/v1/synthesis"))
+            .bearer_auth(&self.token)
+            .json(args)
+            .send()
+            .await
+            .map_err(Self::map_transport)?;
+        Self::read_response(resp).await
     }
 
     pub async fn list(&self, args: ListArgs) -> Result<Vec<MemoryRow>, ClientError> {
@@ -1030,6 +1073,7 @@ pub(crate) mod tests {
             project_id: None,
             memory_type: Some("semantic_fact".into()),
             importance: Some(7.0),
+            derived_from: Vec::new(),
         })
         .await
         .expect("save");
@@ -1062,8 +1106,12 @@ pub(crate) mod tests {
             .expect("search");
         assert!(hits.iter().any(|h| h.id == id), "the saved row must be retrievable");
 
-        let prompt = c.context(content, "agent-client", None).await.expect("context");
-        let _ = prompt; // an empty prompt is a valid answer
+        let context = c.context(content, "agent-client", None).await.expect("context");
+        assert_eq!(context.unreviewed, 1, "the one saved memory has not been reviewed yet");
+
+        let synthesis = c.synthesis(&SynthesisArgs::default()).await.expect("synthesis");
+        assert_eq!(synthesis.pending.iter().map(|r| r.id).collect::<Vec<_>>(), vec![id]);
+        assert_eq!(synthesis.pending_total, 1);
 
         assert_eq!(c.set_importance("memory", id, 9.5, None).await.expect("patch"), 1);
         assert_eq!(c.delete("memory", id, None).await.expect("delete"), 1);
@@ -1113,6 +1161,7 @@ pub(crate) mod tests {
             project_id: None,
             memory_type: None,
             importance: None,
+            derived_from: Vec::new(),
         };
 
         let first = c.save(args.clone()).await.expect("save");
@@ -1412,6 +1461,7 @@ pub(crate) mod tests {
             project_id: project.map(str::to_owned),
             memory_type: Some("semantic_fact".into()),
             importance: Some(6.0),
+            derived_from: Vec::new(),
         })
         .await
         .expect("save");
