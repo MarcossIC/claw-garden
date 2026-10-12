@@ -182,7 +182,7 @@ impl MemoryStore {
             .map_err(MemoryError::Sqlite)?;
         // First, before any pragma: switching the journal mode rewrites the
         // file header, and a database this binary refuses must stay untouched.
-        check_schema(&conn).await?;
+        let plan = check_schema(&conn).await?;
         // WAL plus synchronous=NORMAL: one writer and concurrent readers
         // instead of a writer that locks readers out, at the cost of an
         // fsync per checkpoint rather than per commit. Set before the
@@ -204,6 +204,17 @@ impl MemoryStore {
             Err(e) => log::warn!("could not set memory.db journal mode: {e}; falling back to the default rollback journal"),
         }
         register_udfs(&conn).await?;
+        if let SchemaPlan::Pending { .. } = plan {
+            // Migrations only ever move forward, and a binary that applied
+            // them cannot be swapped back for the one before: this copy is
+            // the way back.
+            let backups = crate::paths::backups_dir(base_dir);
+            conn.call(move |c| -> rusqlite::Result<_> {
+                Ok(backup::snapshot_into(c, &backups, backup::Reason::PreMigration))
+            })
+            .await
+            .map_err(MemoryError::Connection)??;
+        }
         run_migrations(&conn).await?;
         // Raise SQLITE_LIMIT_VARIABLE_NUMBER from the default 999 to 32766 (SQLite hard
         // maximum). Flush batches of ≤500 rows × 3 bind vars = 1500 params would otherwise
@@ -687,6 +698,75 @@ mod tests {
         assert!(matches!(err, MemoryError::SchemaDiverged { version: 3 }), "got {err:?}");
         assert!(err.to_string().contains("clawg restore"), "{err}");
         assert_eq!(std::fs::read(dir.path().join("memory.db")).unwrap(), before);
+    }
+
+    fn history_top(db: &Path) -> i32 {
+        let c = rusqlite::Connection::open(db).unwrap();
+        c.query_row("SELECT MAX(version) FROM refinery_schema_history", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn files_in(dir: &Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|rd| rd.map(|e| e.unwrap().path()).collect())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn opening_an_older_database_snapshots_it_before_migrating() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), Some(7)).await;
+
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        let snapshots = files_in(&dir.path().join("backups"));
+        assert_eq!(snapshots.len(), 1, "{snapshots:?}");
+        let name = snapshots[0].file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(backup::parse_snapshot_name(&name), Some(backup::Reason::PreMigration));
+        assert_eq!(history_top(&snapshots[0]), 7);
+        let c = rusqlite::Connection::open(&snapshots[0]).unwrap();
+        let content: String =
+            c.query_row("SELECT content FROM memory", [], |r| r.get(0)).unwrap();
+        assert_eq!(content, "seeded on disk");
+
+        let top: i32 = store
+            .conn
+            .call(|c| c.query_row("SELECT MAX(version) FROM refinery_schema_history", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(top, 8);
+    }
+
+    #[tokio::test]
+    async fn opening_a_current_database_takes_no_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), None).await;
+
+        let _store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        assert!(files_in(&dir.path().join("backups")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_new_database_takes_no_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+        assert!(files_in(&dir.path().join("backups")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_snapshot_stops_the_migration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), Some(7)).await;
+        std::fs::write(dir.path().join("backups"), b"in the way").unwrap();
+
+        let err = MemoryStore::open(dir.path(), StoreHolder::Eval)
+            .await
+            .err()
+            .expect("no snapshot, no migration");
+
+        assert!(matches!(err, MemoryError::Backup(_)), "got {err:?}");
+        assert_eq!(history_top(&dir.path().join("memory.db")), 7);
     }
 
     /// Ensure_vec0_registered is idempotent (no panic on second call).

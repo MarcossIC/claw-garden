@@ -63,6 +63,10 @@ pub enum MemoryError {
              `clawg restore`")]
     SchemaDiverged { version: i32 },
 
+    /// A snapshot of the store could not be written.
+    #[error(transparent)]
+    Backup(#[from] crate::memory::backup::BackupError),
+
     /// The store's lock file could not be opened or locked for a reason other
     /// than contention (permissions, a read-only file system).
     #[error("memory store lock error at {path}: {source}")]
