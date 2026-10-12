@@ -349,7 +349,9 @@ pub fn restore(base_dir: &Path, from: &Path) -> Result<Restored, MemoryError> {
 /// prunes old automatic ones, and `from` may be one of them.
 fn stage(from: &Path, tmp: &Path) -> std::io::Result<()> {
     std::fs::copy(from, tmp)?;
-    std::fs::File::open(tmp)?.sync_all()
+    // Windows flushes only through a handle opened for writing; a read-only one
+    // fails with "Access is denied".
+    std::fs::OpenOptions::new().write(true).open(tmp)?.sync_all()
 }
 
 fn keep_and_replace(base_dir: &Path, db: &Path, tmp: &Path) -> Result<Restored, MemoryError> {

@@ -2,7 +2,7 @@
 
 **Código:** rama `claude/storage-sdd-xv8bd2`, un commit por tarea (más la corrección 9b y un ajuste de tests).
 **Modo:** Strict TDD (`openspec/config.yaml`: `strict_tdd: true`).
-**Estado:** verificado en Linux, con pendientes en Windows. R1 a R8 tienen sus tests en verde y se probaron de punta a punta con el binario debug. R9 (instalador) y la prueba manual en Windows quedan pendientes: este entorno no tiene PowerShell ni Windows. El cambio queda en verify hasta que pasen; los pasos para archivarlo están en `tasks.md`.
+**Estado:** verificado en Linux y en Windows; R1 a R9 pasan. En Windows, la suite mostró que `clawg restore` nunca terminaba (corregido en `1f86869`, ver "Windows"). Con eso, pasan la prueba de punta a punta en el perfil dev y la del instalador.
 
 ## Suite
 
@@ -59,7 +59,7 @@ En todos, los 10 que fallan son los mismos 10 de `main`. El conteo nunca baja.
 | R6. `clawg restore` | `restore_replaces_the_store_and_keeps_the_previous_one`, `restore_refuses_files_it_cannot_open_safely`, `restore_refuses_while_the_daemon_holds_the_store`, `a_restored_older_snapshot_migrates_on_the_next_open`, `restoring_the_oldest_kept_automatic_snapshot_survives_the_pruning`, `restore_onto_a_machine_without_a_data_directory`, `a_store_held_by_the_daemon_says_to_stop_it`, `restore_takes_a_file_and_a_profile` | ✓ |
 | R7. `clawg status` sin daemon | `a_stopped_daemon_reports_the_store_schema`, `a_store_that_would_open_carries_no_message`, `probing_a_newer_store_reads_without_writing`, `probing_without_a_store_creates_none`, `probing_a_file_that_is_not_a_store_says_unreadable`, `immutable_uris_escape_what_a_uri_cannot_hold` | ✓ |
 | R8. MCP nombra `clawg status` | `a_daemon_that_did_not_start_points_at_status`, `a_tool_call_when_the_daemon_never_comes_up_gives_the_readable_error` | ✓ |
-| R9. Instalador | manual en Windows | **pendiente** |
+| R9. Instalador | manual en Windows, con stubs en un sandbox (ver "Windows") | ✓ |
 
 ## Prueba de punta a punta (Linux, binario debug)
 
@@ -84,8 +84,43 @@ Con `HOME` apuntando a un directorio temporal del scratchpad, perfil dev. No se 
 - **Restaurar el automático más viejo** lo borraba la poda del `pre-restore` antes de copiarlo. Lo detectó la revisión del orden de D3; el archivo se copia antes del snapshot, y un test lo fija.
 - **Coordinación con project-identity (PR #9, V9):** este cambio no agrega migraciones. Los tests nuevos leen la última versión del binario (`latest_known`) en vez de suponer V8, así que no se rompen cuando entre V9. La re-key de #9 queda cubierta por el snapshot `pre-migration` si va dentro de la migración.
 
-## Pendiente (necesita Windows y autorización)
+## Windows (2026-10-12)
 
-- [ ] **R9, instalador.** Con un daemon prod que no para (o con `clawg status` devolviendo 0), `scripts/install.ps1` tiene que abortar con "is still running after 'clawg stop', so the binary was not replaced" y dejar el binario anterior en su lugar. Y con el daemon parado, instalar como siempre.
-- [ ] **Prueba manual en el perfil dev:** `clawg backup` con el daemon andando, `clawg stop`, `clawg restore` del archivo, arrancar y comparar el conteo de filas con `clawg memories stats`.
-- [ ] **Suite en Windows** (`cargo test --workspace --target-dir <otro-dir>`), para actualizar la base de `.claude/CLAUDE.md`. En particular `immutable_uris_escape_what_a_uri_cannot_hold` y el probe sobre una ruta con letra de unidad.
+Windows 11, rama `docs/archive-storage-safety-net` sobre `main` (`b950c1a`), con `--target-dir` aparte.
+
+### Suite
+
+| | Pasan | Fallan |
+|---|---|---|
+| `b950c1a` | 1682 | 9 |
+| con `1f86869` | 1686 | 5 |
+
+- **4 de `restore` fallaban en Windows** (`restore_replaces_the_store_and_keeps_the_previous_one`, `a_restored_older_snapshot_migrates_on_the_next_open`, `restoring_the_oldest_kept_automatic_snapshot_survives_the_pruning`, `restore_onto_a_machine_without_a_data_directory`), con `Access is denied` (os error 5) sobre `memory.db.restore-tmp`. `stage` hacía `sync_all` sobre un handle de sólo lectura: en Linux `fsync` lo acepta, pero en Windows `FlushFileBuffers` exige acceso de escritura. O sea que `clawg restore` nunca terminaba en Windows. `1f86869` abre el temporal para escritura y los 23 tests de `memory::backup` pasan.
+- **Los 5 que quedan no son de este cambio:** `crates/clawg-core/tests/project_root.rs` (project-identity) compara contra rutas sin el prefijo `\\?\` que `canonicalize` agrega en Windows. Quedan en los pendientes de Windows de project-identity.
+- `doctor::tests::*` y `diff::tests::*`, que fallaban en Linux, pasan en Windows.
+- `immutable_uris_escape_what_a_uri_cannot_hold` pasa, y el probe de `clawg status` funciona sobre una ruta con letra de unidad (ver abajo).
+
+### R9, instalador
+
+`scripts/install.ps1` copiado a un sandbox del scratchpad, con `-InstallDir` del sandbox y `-SkipPath`, en Windows PowerShell 5.1. El `clawg.exe` anterior era un stub de Rust con el código de salida de `status` fijo, y del `PATH` del proceso se sacó todo directorio con un `clawg.exe` real. El prod real no se tocó.
+
+| Caso | Resultado |
+|---|---|
+| `status` sale con 0 (daemon que no para) | aborta con "The clawg daemon for the prod profile is still running after 'clawg stop', so the binary was not replaced. …"; el binario anterior queda solo en el directorio |
+| `status` sale con 1 (daemon parado) | instala el nuevo y aparta el anterior como `clawg.exe.old-…` |
+
+### Prueba de punta a punta, perfil dev
+
+Binario debug con `1f86869`, sobre el `~/.clawg-dev` real (con autorización y con una copia previa de `memory.db`). No había daemon dev corriendo.
+
+| Paso | Resultado |
+|---|---|
+| `clawg status` sin daemon | `"state": "pending"`, `db_version` 8, `binary_version` 9; no aparecieron `-wal` ni `-shm` |
+| `clawg serve --port 0` | `memory-…T19-53-26.517Z-pre-migration.db` antes de aplicar la V9 |
+| `clawg memories stats` | 2 filas vivas, 8 borradas |
+| `clawg backup` con el daemon | `memory-…T19-53-37.239Z-manual.db` |
+| `clawg restore` con el daemon | "in use by the clawg daemon (pid 39504); run `clawg stop` first, then restore", salida 1 |
+| `clawg stop` | 0,4 s, salida 0 |
+| `clawg restore <manual>` | restaurado, con `memory-…T19-53-37.844Z-pre-restore.db`; no quedan temporales, `-wal` ni `-shm` |
+| `clawg status` | `"state": "up_to_date"` (V9) |
+| `clawg serve` y `clawg memories stats` | idéntico al de antes del backup |
