@@ -20,6 +20,7 @@ use clawg_cli::mcp;
 use clawg_cli::memories;
 use clawg_cli::status::status_report;
 use clawg_cli::stop::{stop_in, STOP_TIMEOUT};
+use clawg_core::memory::backup::backup_offline;
 use clawg_core::paths::data_dir;
 use clap::Parser;
 
@@ -110,6 +111,23 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                     other => other.to_string(),
                 })?;
             println!("stopped the {} daemon (pid {pid})", profile.as_str());
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Backup { profile } => {
+            let profile = profile.resolve().map_err(|e| e.to_string())?;
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            // A running daemon holds the store and its only connection, so the
+            // snapshot has to come from it; with none, no daemon is started
+            // just to copy a file.
+            let path = match probe_running(&base_dir, false).await {
+                Ok(Probe::Running(client)) => client.backup().await.map_err(|e| e.to_string())?,
+                Ok(Probe::NeedsStart) | Err(ClientError::NotRunning) => {
+                    backup_offline(&base_dir).map_err(|e| e.to_string())?
+                }
+                Err(e) => return Err(e.to_string()),
+            };
+            println!("{}", path.display());
             Ok(ExitCode::SUCCESS)
         }
 

@@ -47,6 +47,12 @@ pub enum Command {
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Write a snapshot of the memory store to `<data>/backups` and print its
+    /// path. Goes through the daemon when one is running.
+    Backup {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
     /// Report which `clawg` executables the PATH resolves to and whether this
     /// one is the one a terminal runs. Exits 1 if shadowed or duplicated.
     Doctor {
@@ -384,6 +390,18 @@ mod tests {
         assert_eq!(
             parse(&["clawg", "stop"]).command,
             Command::Stop { profile: ProfileArg { profile: None } }
+        );
+    }
+
+    #[test]
+    fn backup_takes_only_a_profile() {
+        assert_eq!(
+            parse(&["clawg", "backup"]).command,
+            Command::Backup { profile: ProfileArg { profile: None } }
+        );
+        assert_eq!(
+            parse(&["clawg", "backup", "--profile", "dev"]).command,
+            Command::Backup { profile: ProfileArg { profile: Some("dev".into()) } }
         );
     }
 

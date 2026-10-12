@@ -590,6 +590,22 @@ impl DaemonClient {
         Ok(Self::read_response::<Body>(resp).await?.deleted)
     }
 
+    /// Asks the daemon for a manual snapshot and returns where it wrote it.
+    pub async fn backup(&self) -> Result<PathBuf, ClientError> {
+        #[derive(Deserialize)]
+        struct Body {
+            path: PathBuf,
+        }
+        let resp = self
+            .http
+            .post(self.url("/v1/backup"))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(Self::map_transport)?;
+        Ok(Self::read_response::<Body>(resp).await?.path)
+    }
+
     pub async fn shutdown(&self) -> Result<(), ClientError> {
         let resp = self
             .http

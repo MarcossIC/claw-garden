@@ -25,6 +25,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::memory::access::AccessTracker;
+use crate::memory::backup::{self, Reason};
 use crate::memory::bootstrap::EmbedderStatus;
 use crate::memory::chunker::CodeChunker;
 use crate::memory::embedder::Embedder;
@@ -182,6 +183,19 @@ impl MemoryRuntime {
     /// host drops or aborts it at shutdown.
     pub fn maintenance_worker(&self) -> impl Future<Output = ()> + Send + 'static {
         maintenance_worker_future(self.store.clone())
+    }
+
+    /// Writes a snapshot of the store to `<base_dir>/backups` through the
+    /// runtime's own connection, which is the only one while it holds the
+    /// store.
+    pub async fn snapshot(&self, reason: Reason) -> Result<PathBuf, MemoryError> {
+        let dir = crate::paths::backups_dir(&self.base_dir);
+        self.store
+            .conn
+            .call(move |c| -> rusqlite::Result<_> { Ok(backup::snapshot_into(c, &dir, reason)) })
+            .await
+            .map_err(MemoryError::Connection)?
+            .map_err(MemoryError::from)
     }
 
     /// Orderly shutdown, once nothing can send new events: drains the ingest
