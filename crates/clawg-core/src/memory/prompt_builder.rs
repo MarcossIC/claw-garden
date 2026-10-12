@@ -161,17 +161,8 @@ pub async fn build_memory_prompt(
     // channel suppressed was not retrieved by it, and counting it would
     // inflate the access count that drives tier promotion.
     // Called AFTER hits are assembled — non-blocking, never awaits.
-    // `record` discards empty vecs internally so no extra guard needed.
-    // Only `memory` ids: the flush updates `memory WHERE id = ?`, and ids are
-    // per-table, so a skill or trajectory id would land on an unrelated
-    // `memory` row that happens to share the number.
     if let Some(tracker) = access_tracker {
-        tracker.record(
-            hits.iter()
-                .filter(|h| h.kind == TableKind::Memory)
-                .map(|h| h.id)
-                .collect(),
-        );
+        tracker.record_hits(&hits);
     }
 
     // Tier-1 coverage logging — the real measure of the "Tier 1 covers 80%"
@@ -1580,6 +1571,44 @@ mod tests {
         force_flush_until_counted(&store, hit).await;
 
         assert_eq!(memory_access_state(&store, hit).await.0, 1);
+    }
+
+    /// A row that only fills a slot is shown, but the query did not find it,
+    /// so it must not gain the access that resets its decay.
+    #[tokio::test(start_paused = true)]
+    async fn recall_does_not_count_zero_score_hits_as_accesses() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let embedder = Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>;
+        let agent = "agent-zero-access";
+
+        let mut like_query = vec![0.0_f32; 384];
+        like_query[0] = 1.0;
+        let mut unrelated = vec![0.0_f32; 384];
+        unrelated[1] = 1.0;
+        let witness = seed_memory(&store, agent, "witness", "chat_message", 3, 5.0, unit_bytes(&like_query)).await;
+        let filler = seed_memory(&store, agent, "filler", "chat_message", 3, 5.0, unit_bytes(&unrelated)).await;
+        let before = memory_access_state(&store, filler).await;
+
+        let tracker = AccessTracker::new(store.conn.clone());
+        let prompt = build_memory_prompt(
+            &store,
+            &wm,
+            Some(embedder),
+            agent,
+            None,
+            QueryTexts::single_shot("witness"),
+            &EmittedIds::default(),
+            Some(&tracker),
+        )
+        .await
+        .unwrap();
+        assert!(prompt.contains("filler"), "a zero-score hit still fills the prompt: {prompt}");
+
+        force_flush_until_counted(&store, witness).await;
+
+        assert_eq!(memory_access_state(&store, filler).await, before);
     }
 
     #[tokio::test]

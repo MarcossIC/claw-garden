@@ -364,6 +364,73 @@ async fn search_honours_and_caps_the_limit() {
     assert_eq!(status, 200);
 }
 
+/// Saves one row identical to the query and a few unrelated ones, so a search
+/// has a clear winner and a tail far below it.
+async fn seed_winner_and_tail(h: &Harness) {
+    h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "agent-cut" })).await;
+    for text in [
+        "the garden hose leaks at the tap",
+        "quarterly invoices are due on friday",
+        "a recipe for lentil soup with cumin",
+    ] {
+        h.post_json("/v1/memories", json!({ "content": text, "agent_id": "agent-cut" })).await;
+    }
+    h.wait_for_rows("memory", 4).await;
+}
+
+fn hit_ids(body: &Value) -> Vec<i64> {
+    body["hits"].as_array().expect("hits").iter().map(|h| h["id"].as_i64().expect("id")).collect()
+}
+
+#[tokio::test]
+async fn search_without_a_relative_cut_is_unchanged() {
+    let h = Harness::start().await;
+    seed_winner_and_tail(&h).await;
+
+    let (status, body) = h
+        .post_json("/v1/search", json!({ "query": CONTENT, "agent_id": "agent-cut" }))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(hit_ids(&body).len(), 4, "every row is returned when no cut is asked for: {body}");
+}
+
+#[tokio::test]
+async fn search_applies_the_requested_relative_cut() {
+    let h = Harness::start().await;
+    seed_winner_and_tail(&h).await;
+
+    let (_, full) = h
+        .post_json("/v1/search", json!({ "query": CONTENT, "agent_id": "agent-cut" }))
+        .await;
+    let scores: Vec<f64> =
+        full["hits"].as_array().expect("hits").iter().map(|h| h["score"].as_f64().expect("score")).collect();
+    let expected_len = clawg_cli::relevance::relevant_len(&scores, 0.6);
+    assert!(expected_len < scores.len(), "the fixture must leave a tail to cut: {full}");
+
+    let (status, cut) = h
+        .post_json(
+            "/v1/search",
+            json!({ "query": CONTENT, "agent_id": "agent-cut", "min_relative_score": 0.6 }),
+        )
+        .await;
+    assert_eq!(status, 200, "{cut}");
+    assert_eq!(hit_ids(&cut), hit_ids(&full)[..expected_len]);
+}
+
+#[tokio::test]
+async fn search_rejects_a_relative_score_outside_zero_to_one() {
+    let h = Harness::start().await;
+    for bad in [json!(1.5), json!(-0.1)] {
+        let (status, body) = h
+            .post_json(
+                "/v1/search",
+                json!({ "query": "anything", "agent_id": "a", "min_relative_score": bad }),
+            )
+            .await;
+        assert_eq!(status, 400, "{bad} must be refused: {body}");
+    }
+}
+
 /// The whole reason `/health` reports `loading`: retrieval is the one thing a
 /// pre-bootstrap daemon genuinely cannot do, and it has to say so in a way a
 /// client can branch on.

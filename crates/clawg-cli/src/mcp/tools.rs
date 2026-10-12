@@ -14,6 +14,7 @@ use std::path::Path;
 use clawg_core::paths::Profile;
 
 use crate::client::{Health, Hit, MemoryRow};
+use crate::relevance::{relevant_len, RELEVANCE_RATIO};
 
 /// How much of a hit's content a search result shows.
 ///
@@ -48,30 +49,12 @@ pub fn truncate_content(s: &str, max: usize) -> String {
     format!("{kept}…")
 }
 
-/// Share of the best hit's score another hit needs to be shown.
-///
-/// Relative, not absolute: measured on the golden set, the score of the
-/// expected memory and of the rest overlap (0.15–0.51 against up to 0.47), so
-/// no fixed floor separates them, while a clear winner can still shorten the
-/// list for free.
-pub const RELEVANCE_RATIO: f64 = 0.6;
-
-/// Hits shown regardless of score.
-pub const MIN_SHOWN_HITS: usize = 2;
-
 /// Drops the hits too far below the best one to be worth their tokens.
 ///
 /// Expects `hits` best first, which is the order search returns them in.
 pub fn relevant_hits(mut hits: Vec<Hit>) -> Vec<Hit> {
-    let Some(best) = hits.first().map(|h| h.score) else {
-        return hits;
-    };
-    let shown = hits
-        .iter()
-        .enumerate()
-        .take_while(|(i, h)| *i < MIN_SHOWN_HITS || h.score >= RELEVANCE_RATIO * best)
-        .count();
-    hits.truncate(shown);
+    let scores: Vec<f64> = hits.iter().map(|h| h.score).collect();
+    hits.truncate(relevant_len(&scores, RELEVANCE_RATIO));
     hits
 }
 
@@ -206,24 +189,9 @@ mod tests {
     }
 
     #[test]
-    fn hits_far_below_the_best_match_are_not_shown() {
+    fn relevant_hits_keeps_the_ones_the_cut_lets_through_in_order() {
         let kept = relevant_hits(scored(&[0.50, 0.40, 0.31, 0.29, 0.10]));
         assert_eq!(ids(&kept), [1, 2, 3]);
-    }
-
-    #[test]
-    fn a_hit_exactly_at_the_ratio_is_shown() {
-        let kept = relevant_hits(scored(&[0.50, 0.40, 0.30]));
-        assert_eq!(ids(&kept), [1, 2, 3]);
-    }
-
-    /// When every score is low the best one is no clear winner, and the runner
-    /// up is as likely to be the answer: measured on the golden set, a query
-    /// whose answer scored 0.04 under a best of 0.10.
-    #[test]
-    fn the_two_best_are_shown_whatever_they_score() {
-        let kept = relevant_hits(scored(&[0.10, 0.04, 0.01]));
-        assert_eq!(ids(&kept), [1, 2]);
     }
 
     #[test]
