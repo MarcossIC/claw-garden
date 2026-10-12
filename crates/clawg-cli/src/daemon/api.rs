@@ -783,7 +783,7 @@ async fn patch_importance(
     Json(body): Json<ImportanceRequest>,
 ) -> ApiResult<Json<UpdatedBody>> {
     let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
-    let updated = set_importance_core(&app.runtime.store, id, kind, body.importance)
+    let updated = set_importance_core(&app.runtime.store, id, kind, body.importance, None)
         .await
         .map_err(ApiError::internal)?;
 
@@ -801,7 +801,7 @@ async fn delete_memory(
     Path((kind, id)): Path<(String, i64)>,
 ) -> ApiResult<Json<DeletedBody>> {
     let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
-    let deleted = delete_memory_core(&app.runtime.store, id, kind)
+    let deleted = delete_memory_core(&app.runtime.store, id, kind, None)
         .await
         .map_err(ApiError::internal)?;
 
@@ -816,7 +816,7 @@ async fn resolve_dispute(
     Json(body): Json<ResolveRequest>,
 ) -> ApiResult<Json<Resolution>> {
     let outcome = if body.keep_both { Outcome::KeepBoth } else { Outcome::Supersede };
-    resolve_dispute_core(&app.runtime.store, body.keep, body.other, outcome)
+    resolve_dispute_core(&app.runtime.store, body.keep, body.other, outcome, None)
         .await
         .map(Json)
         .map_err(|e| match e {
