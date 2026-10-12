@@ -9,6 +9,6 @@ artifacts:
   design: skipped
   tasks: done
   apply: done
-  verify: partial
+  verify: done
   archive: pending
 updated: 2026-10-12
