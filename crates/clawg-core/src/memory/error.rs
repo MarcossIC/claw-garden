@@ -50,6 +50,19 @@ pub enum MemoryError {
     })]
     StoreInUse { owner: Option<StoreOwner> },
 
+    /// `memory.db` was migrated by a newer clawg. Refused before anything is
+    /// written, so going back to that version still works.
+    #[error("memory.db is at schema V{db}, newer than the V{binary} this clawg knows: \
+             it was written by a newer clawg. Nothing was changed. Install that version \
+             again, or restore a backup taken before the upgrade with `clawg restore`")]
+    SchemaNewer { db: i32, binary: i32 },
+
+    /// A migration recorded in `memory.db` differs from this binary's.
+    #[error("memory.db's migration V{version} does not match this clawg build. Nothing was \
+             changed. Use the clawg build that migrated it, or restore a backup with \
+             `clawg restore`")]
+    SchemaDiverged { version: i32 },
+
     /// The store's lock file could not be opened or locked for a reason other
     /// than contention (permissions, a read-only file system).
     #[error("memory store lock error at {path}: {source}")]

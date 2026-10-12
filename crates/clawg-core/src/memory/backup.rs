@@ -9,6 +9,43 @@ pub struct MigrationId {
     pub checksum: u64,
 }
 
+/// Reads `refinery_schema_history`, empty when the table does not exist yet.
+///
+/// Refinery stores the checksum as the decimal text of a `u64`.
+pub fn read_history(c: &rusqlite::Connection) -> rusqlite::Result<Vec<MigrationId>> {
+    let exists: bool = c.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master \
+         WHERE type = 'table' AND name = 'refinery_schema_history')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok(Vec::new());
+    }
+    let mut stmt = c.prepare("SELECT version, name, checksum FROM refinery_schema_history")?;
+    let rows = stmt.query_map([], |r| {
+        let checksum: String = r.get(2)?;
+        let checksum = checksum.parse::<u64>().map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+        Ok(MigrationId { version: r.get(0)?, name: r.get(1)?, checksum })
+    })?;
+    rows.collect()
+}
+
+/// The migrations embedded in this binary.
+pub fn known_migrations() -> Vec<MigrationId> {
+    crate::memory::migrations::runner()
+        .get_migrations()
+        .iter()
+        .map(|m| MigrationId {
+            version: m.version(),
+            name: m.name().to_string(),
+            checksum: m.checksum(),
+        })
+        .collect()
+}
+
 /// What opening a database with this binary would do to its schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaPlan {

@@ -4,6 +4,7 @@ use std::sync::{Arc, Once};
 use rusqlite::OptionalExtension;
 use tokio_rusqlite::Connection;
 
+use crate::memory::backup::{self, SchemaPlan};
 use crate::memory::embedder::Embedder;
 use crate::memory::error::MemoryError;
 use crate::memory::latency::KnnLatency;
@@ -179,6 +180,9 @@ impl MemoryStore {
         // Connection::open returns Result<_, rusqlite::Error>
         let conn = Connection::open(&path).await
             .map_err(MemoryError::Sqlite)?;
+        // First, before any pragma: switching the journal mode rewrites the
+        // file header, and a database this binary refuses must stay untouched.
+        check_schema(&conn).await?;
         // WAL plus synchronous=NORMAL: one writer and concurrent readers
         // instead of a writer that locks readers out, at the cost of an
         // fsync per checkpoint rather than per commit. Set before the
@@ -366,6 +370,20 @@ async fn register_udfs(conn: &Connection) -> Result<(), MemoryError> {
 /// "duplicate column" error on every start from then on.
 fn configured(runner: refinery::Runner) -> refinery::Runner {
     runner.set_grouped(true)
+}
+
+/// Refuses a database this binary must not migrate, and says what opening it
+/// would do otherwise.
+async fn check_schema(conn: &Connection) -> Result<SchemaPlan, MemoryError> {
+    let applied = conn
+        .call(|c| backup::read_history(c))
+        .await
+        .map_err(MemoryError::Connection)?;
+    match backup::schema_plan(&applied, &backup::known_migrations()) {
+        SchemaPlan::Newer { db, binary } => Err(MemoryError::SchemaNewer { db, binary }),
+        SchemaPlan::Diverged { version } => Err(MemoryError::SchemaDiverged { version }),
+        plan => Ok(plan),
+    }
 }
 
 async fn run_migrations(conn: &Connection) -> Result<(), MemoryError> {
@@ -594,6 +612,81 @@ mod tests {
         let after = conn.call(snapshot).await.unwrap();
         assert_eq!(before, after);
         assert_eq!(after.0, 8);
+    }
+
+    /// Builds `<dir>/memory.db` migrated up to `target` (all when `None`),
+    /// with one row, and closes it so the file stands alone.
+    async fn seed_on_disk(dir: &Path, target: Option<i32>) {
+        ensure_vec0_registered();
+        let conn = Connection::open(dir.join("memory.db")).await.unwrap();
+        register_udfs(&conn).await.unwrap();
+        conn.call(move |c| {
+            let runner = crate::memory::migrations::runner();
+            let runner = match target {
+                Some(v) => runner.set_target(refinery::Target::Version(v)),
+                None => runner,
+            };
+            runner.run(c)
+        })
+        .await
+        .unwrap();
+        conn.call(|c| {
+            c.execute(
+                "INSERT INTO memory \
+                 (scope, agent_id, content, memory_type, source, \
+                  created_at, created_by_type, created_by_ref, \
+                  last_modified_at, last_accessed_at, importance, tier, status) \
+                 VALUES ('agent', 'agent-seed', 'seeded on disk', 'chat_message', 'chat', \
+                  0, 'user', 'agent-seed', 0, 0, 5.0, 3, 'active')",
+                [],
+            )
+        })
+        .await
+        .unwrap();
+        conn.close().await.unwrap();
+    }
+
+    fn tamper(dir: &Path, sql: &str) {
+        let c = rusqlite::Connection::open(dir.join("memory.db")).unwrap();
+        c.execute_batch(sql).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_newer_database_is_refused_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), None).await;
+        tamper(
+            dir.path(),
+            "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+             VALUES (9, 'from_the_future', '2026-10-12T00:00:00Z', '1')",
+        );
+        let before = std::fs::read(dir.path().join("memory.db")).unwrap();
+
+        let err = MemoryStore::open(dir.path(), StoreHolder::Eval)
+            .await
+            .err()
+            .expect("a newer database must not open");
+
+        assert!(matches!(err, MemoryError::SchemaNewer { db: 9, binary: 8 }), "got {err:?}");
+        assert!(err.to_string().contains("clawg restore"), "{err}");
+        assert_eq!(std::fs::read(dir.path().join("memory.db")).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn a_diverged_database_is_refused_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), None).await;
+        tamper(dir.path(), "UPDATE refinery_schema_history SET checksum = '1' WHERE version = 3");
+        let before = std::fs::read(dir.path().join("memory.db")).unwrap();
+
+        let err = MemoryStore::open(dir.path(), StoreHolder::Eval)
+            .await
+            .err()
+            .expect("a diverged database must not open");
+
+        assert!(matches!(err, MemoryError::SchemaDiverged { version: 3 }), "got {err:?}");
+        assert!(err.to_string().contains("clawg restore"), "{err}");
+        assert_eq!(std::fs::read(dir.path().join("memory.db")).unwrap(), before);
     }
 
     /// Ensure_vec0_registered is idempotent (no panic on second call).
