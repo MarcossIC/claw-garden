@@ -22,11 +22,11 @@
 //! reject a perfectly good golden set because the retrieval it audits has a
 //! known defect, which inverts the whole point of having an instrument.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::Serialize;
 
-use crate::golden::CorpusRow;
+use crate::golden::{CaseStatus, CaseSubset, CorpusRow};
 use crate::report::CaseResult;
 
 /// Fraction of cases scoring a perfect recall@10 above which the set can no
@@ -48,6 +48,9 @@ const MAX_MEAN_OVERLAP: f64 = 0.35;
 /// Per-case overlap worth naming in the report so it can be rewritten.
 const MIRROR_CASE_OVERLAP: f64 = 0.50;
 
+/// How deep into a ranking a row counts as having intruded on a case.
+const INTRUDER_DEPTH: usize = 5;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
@@ -62,6 +65,18 @@ pub struct MirrorCase {
     pub query: String,
     pub expected_ref: String,
     pub overlap: f64,
+}
+
+/// The row that most often sits in a subset's top five without being what the
+/// case asked for.
+#[derive(Debug, Clone, Serialize)]
+pub struct Intruder {
+    pub subset: CaseSubset,
+    pub intruder_ref: String,
+    /// Active cases of the subset whose top five holds the row unexpected.
+    pub n_cases: usize,
+    /// `n_cases` over all active cases of the subset.
+    pub fraction: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -81,6 +96,9 @@ pub struct AuditReport {
     pub importance_rank_dominance: f64,
     pub mean_lexical_overlap: f64,
     pub mirror_cases: Vec<MirrorCase>,
+    /// Most frequent unexpected top-five row per subset. REPORTED, NEVER
+    /// GATED: it describes the corpus, not whether the set is usable.
+    pub top_intruders: Vec<Intruder>,
     pub verdict: Verdict,
     /// One line per failed gate, in the words the report prints.
     pub failures: Vec<String>,
@@ -301,6 +319,45 @@ pub fn importance_rank_dominance(cases: &[CaseResult], corpus: &[CorpusRow]) -> 
     pearson(&importance_ranks, &position_ranks)
 }
 
+/// For each subset, the unexpected row that appears in the top
+/// `INTRUDER_DEPTH` of the most active cases, ordered by subset name. A case's
+/// own expected rows never count against it, and a subset where nothing
+/// unexpected surfaces has no entry. Ties go to the smaller ref.
+pub fn top_intruders(cases: &[CaseResult]) -> Vec<Intruder> {
+    type Tally<'a> = (CaseSubset, usize, HashMap<&'a str, usize>);
+    let mut by_subset: BTreeMap<&'static str, Tally> = BTreeMap::new();
+
+    for case in cases.iter().filter(|c| c.status == CaseStatus::Active) {
+        let entry = by_subset
+            .entry(case.subset.as_str())
+            .or_insert_with(|| (case.subset, 0, HashMap::new()));
+        entry.1 += 1;
+        let unexpected: HashSet<&str> = case
+            .ranked_refs
+            .iter()
+            .take(INTRUDER_DEPTH)
+            .map(String::as_str)
+            .filter(|r| !case.expected_refs.iter().any(|e| e == r))
+            .collect();
+        for r in unexpected {
+            *entry.2.entry(r).or_insert(0) += 1;
+        }
+    }
+
+    by_subset
+        .into_values()
+        .filter_map(|(subset, total, tally)| {
+            let (intruder, n_cases) = tally.into_iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(a.0)))?;
+            Some(Intruder {
+                subset,
+                intruder_ref: intruder.to_string(),
+                n_cases,
+                fraction: n_cases as f64 / total as f64,
+            })
+        })
+        .collect()
+}
+
 /// Runs every check and decides whether the set can carry a claim.
 pub fn audit(cases: &[CaseResult], corpus: &[CorpusRow]) -> AuditReport {
     let content_by_ref: HashMap<&str, &str> =
@@ -368,6 +425,7 @@ pub fn audit(cases: &[CaseResult], corpus: &[CorpusRow]) -> AuditReport {
         importance_rank_dominance: importance_rank_dominance(cases, corpus),
         mean_lexical_overlap,
         mirror_cases,
+        top_intruders: top_intruders(cases),
         verdict,
         failures,
     }
@@ -384,6 +442,19 @@ pub fn print_report(report: &AuditReport) {
          the corpus sorted by importance)",
         report.importance_rank_dominance
     );
+
+    if !report.top_intruders.is_empty() {
+        println!("    most frequent unexpected row in the top {INTRUDER_DEPTH}, per subset (reported, never gated):");
+        for i in &report.top_intruders {
+            println!(
+                "      {:<16} {}  in {} cases ({:.1}%)",
+                i.subset.as_str(),
+                i.intruder_ref,
+                i.n_cases,
+                i.fraction * 100.0
+            );
+        }
+    }
 
     if !report.mirror_cases.is_empty() {
         println!("    queries that restate their own answer (rewrite these):");
@@ -582,6 +653,95 @@ mod tests {
         // rank 2.5 rather than imposing an arbitrary 2 and 3.
         let ranks = fractional_ranks(&[9.0, 7.0, 7.0, 4.0], true);
         assert_eq!(ranks, vec![1.0, 2.5, 2.5, 4.0]);
+    }
+
+    // --- top intruders -----------------------------------------------------
+
+    fn in_subset(subset: crate::golden::CaseSubset, expected: &str, ranked: &[&str]) -> CaseResult {
+        CaseResult {
+            expected_refs: vec![expected.to_string()],
+            subset,
+            ..case("q", ranked, 0.0, 0.0)
+        }
+    }
+
+    fn natural(expected: &str, ranked: &[&str]) -> CaseResult {
+        in_subset(crate::golden::CaseSubset::Natural, expected, ranked)
+    }
+
+    #[test]
+    fn a_row_in_the_top_five_of_half_the_cases_is_the_subsets_intruder() {
+        let cases = vec![
+            natural("c01", &["c01", "s-dis-0001", "x1"]),
+            natural("c02", &["s-dis-0001", "c02", "x2"]),
+            natural("c03", &["c03", "x3", "x4"]),
+            natural("c04", &["c04", "x5", "x6"]),
+        ];
+        let intruders = top_intruders(&cases);
+        assert_eq!(intruders.len(), 1);
+        assert_eq!(intruders[0].subset, crate::golden::CaseSubset::Natural);
+        assert_eq!(intruders[0].intruder_ref, "s-dis-0001");
+        assert_eq!(intruders[0].n_cases, 2);
+        assert!((intruders[0].fraction - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn the_expected_row_is_never_its_own_cases_intruder() {
+        let cases = vec![natural("c01", &["c01"]), natural("c02", &["c02"])];
+        assert!(top_intruders(&cases).is_empty());
+    }
+
+    #[test]
+    fn a_row_expected_by_one_case_still_intrudes_on_another() {
+        let cases = vec![natural("c01", &["c01"]), natural("c02", &["c01", "c02"])];
+        let intruders = top_intruders(&cases);
+        assert_eq!(intruders.len(), 1);
+        assert_eq!(intruders[0].intruder_ref, "c01");
+        assert!((intruders[0].fraction - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn only_the_top_five_positions_count() {
+        let cases = vec![natural("c01", &["c01", "a", "b", "c", "d", "late"])];
+        let intruders = top_intruders(&cases);
+        assert_eq!(intruders.len(), 1);
+        assert_ne!(intruders[0].intruder_ref, "late");
+    }
+
+    #[test]
+    fn subsets_come_out_by_serialized_name_and_one_without_intruders_is_absent() {
+        use crate::golden::CaseSubset::*;
+        let cases = vec![
+            in_subset(Natural, "c01", &["c01", "n1"]),
+            in_subset(Lexical, "l1", &["l1", "z"]),
+            in_subset(MultiRef, "m1", &["m1"]),
+        ];
+        let names: Vec<&str> = top_intruders(&cases).iter().map(|i| i.subset.as_str()).collect();
+        assert_eq!(names, vec!["lexical", "natural"]);
+    }
+
+    #[test]
+    fn ties_go_to_the_smaller_ref_so_the_report_is_stable() {
+        let cases = vec![natural("c01", &["c01", "b", "a"])];
+        assert_eq!(top_intruders(&cases)[0].intruder_ref, "a");
+    }
+
+    #[test]
+    fn known_red_cases_do_not_count_toward_intruders_or_the_denominator() {
+        let red = CaseResult { status: CaseStatus::KnownRed, ..natural("c09", &["c09", "s-dis-0001"]) };
+        let cases = vec![red, natural("c01", &["c01", "s-dis-0001"]), natural("c02", &["c02"])];
+        let intruders = top_intruders(&cases);
+        assert_eq!(intruders[0].n_cases, 1);
+        assert!((intruders[0].fraction - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn the_audit_carries_the_intruders_without_changing_the_verdict() {
+        let corpus = vec![row("c01", 9.0, "Removed countryId from the patchValue inside the lookup controller")];
+        let cases = vec![natural("c01", &["s-dis-0001", "c01"]), natural("c01", &["c01", "x"])];
+        let report = audit(&cases, &corpus);
+        assert_eq!(report.top_intruders.len(), 1);
+        assert_eq!(report.verdict, Verdict::Usable, "{:?}", report.failures);
     }
 
     // --- the gate ----------------------------------------------------------
