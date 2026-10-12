@@ -13,7 +13,7 @@ use std::time::Instant;
 use clawg_core::memory::bootstrap::{production_deps, run_embedder_bootstrap, LogSink};
 use clawg_core::memory::store_lock::StoreHolder;
 use clawg_core::memory::MemoryError;
-use clawg_core::paths::{data_dir, Profile};
+use clawg_core::paths::{data_dir, PathsError, Profile};
 use clawg_core::runtime::MemoryRuntime;
 
 use super::api::{router, AppCtx};
@@ -25,6 +25,8 @@ use super::lifecycle::{
 pub enum ServeError {
     #[error(transparent)]
     Lifecycle(#[from] LifecycleError),
+    #[error(transparent)]
+    Paths(#[from] PathsError),
     /// Another process (a second daemon or an evaluation run) owns the store.
     /// Its own variant because it is not a fault: the fix is the user's, and
     /// the message has to say so instead of reading like a corrupt database.
@@ -63,7 +65,7 @@ fn classify_open_error(err: MemoryError) -> ServeError {
 /// published in `daemon.json`, so clients always dial where the socket actually
 /// is.
 pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
-    let base_dir = data_dir(profile);
+    let base_dir = data_dir(profile)?;
     std::fs::create_dir_all(&base_dir).map_err(|source| ServeError::DataDir {
         path: base_dir.display().to_string(),
         source,

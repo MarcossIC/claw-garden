@@ -2,7 +2,8 @@
 //! isolation.
 //!
 //! This module MUST NOT depend on anything else in this crate and MUST NOT
-//! depend on any GUI/runtime crate — only `std` and the `dirs` crate. It is designed to be
+//! depend on any GUI/runtime crate — only `std`, the `dirs` crate and
+//! `thiserror`. It is designed to be
 //! lifted, unchanged, into this GUI-free crate.
 //!
 //! The profile is selected by the `CLAWG_PROFILE` env var (`dev` | `prod`,
@@ -143,18 +144,31 @@ impl Profile {
     }
 }
 
-/// Data directory for `profile`: `<home>/<profile.dir_name()>`, falling back
-/// to the current directory when the home directory cannot be determined.
-pub fn data_dir(profile: Profile) -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(profile.dir_name())
+/// Failure resolving the data directory.
+#[derive(Debug, thiserror::Error)]
+pub enum PathsError {
+    /// Falling back to the current directory would start against an empty
+    /// store there, and the user's memory would look gone.
+    #[error("cannot determine the home directory, which holds the clawg data directory; set HOME (USERPROFILE on Windows) and try again")]
+    NoHome,
+    #[error(transparent)]
+    Profile(#[from] ProfileError),
+}
+
+/// Pure core of [`data_dir`]: `<home>/<profile.dir_name()>`.
+pub fn data_dir_in(home: Option<PathBuf>, profile: Profile) -> Result<PathBuf, PathsError> {
+    Ok(home.ok_or(PathsError::NoHome)?.join(profile.dir_name()))
+}
+
+/// Data directory for `profile` under the user's home directory.
+pub fn data_dir(profile: Profile) -> Result<PathBuf, PathsError> {
+    data_dir_in(dirs::home_dir(), profile)
 }
 
 /// [`data_dir`] for the profile resolved from the environment via
 /// [`Profile::from_env`].
-pub fn data_dir_from_env() -> Result<PathBuf, ProfileError> {
-    Ok(data_dir(Profile::from_env()?))
+pub fn data_dir_from_env() -> Result<PathBuf, PathsError> {
+    data_dir(Profile::from_env()?)
 }
 
 /// Where the `clawg serve` daemon publishes its liveness record
@@ -389,14 +403,29 @@ mod tests {
 
     #[test]
     fn data_dir_ends_with_dev_dir_name() {
-        let dir = data_dir(Profile::Dev);
+        let dir = data_dir(Profile::Dev).unwrap();
         assert_eq!(dir.file_name().unwrap(), Profile::Dev.dir_name());
     }
 
     #[test]
     fn data_dir_ends_with_prod_dir_name() {
-        let dir = data_dir(Profile::Prod);
+        let dir = data_dir(Profile::Prod).unwrap();
         assert_eq!(dir.file_name().unwrap(), Profile::Prod.dir_name());
+    }
+
+    #[test]
+    fn data_dir_without_a_home_is_an_error() {
+        let err = data_dir_in(None, Profile::Dev).expect_err("no home must not resolve");
+        assert!(err.to_string().contains("home directory"), "{err}");
+    }
+
+    #[test]
+    fn data_dir_in_a_home_is_the_profile_directory_under_it() {
+        let home = PathBuf::from("/home/someone");
+        assert_eq!(
+            data_dir_in(Some(home.clone()), Profile::Prod).unwrap(),
+            home.join(".clawg")
+        );
     }
 
     // ── compiled_default ─────────────────────────────────────────────────

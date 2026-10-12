@@ -17,7 +17,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clawg_core::paths::{data_dir, Profile};
+use clawg_core::paths::{data_dir, PathsError, Profile};
 use rmcp::transport::async_rw::AsyncRwTransport;
 use rmcp::transport::{stdio, Transport};
 use rmcp::{RoleServer, ServiceExt};
@@ -41,6 +41,8 @@ const TOOL_READY_WAIT: Duration = Duration::from_secs(25);
 pub enum McpError {
     #[error(transparent)]
     Client(#[from] ClientError),
+    #[error(transparent)]
+    Paths(#[from] PathsError),
     #[error("the MCP stdio server failed: {0}")]
     Serve(String),
 }
@@ -48,7 +50,7 @@ pub enum McpError {
 /// Serves MCP over stdio until the host closes the stream, starting a daemon in
 /// the background if none is running.
 pub async fn run(profile: Profile, autostart: bool) -> Result<(), McpError> {
-    let base_dir = data_dir(profile);
+    let base_dir = data_dir(profile)?;
     let spawner = Arc::new(ProcessSpawner { base_dir: base_dir.clone() });
     let (stdin, stdout) = stdio();
     run_with(

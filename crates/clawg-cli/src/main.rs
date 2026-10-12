@@ -73,7 +73,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
 
         Command::Status { profile } => {
             let profile = profile.resolve().map_err(|e| e.to_string())?;
-            let base_dir = data_dir(profile);
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
             let state = read_state(&base_dir);
 
             // A state file proves only that a daemon once ran here. Liveness is
@@ -100,7 +100,8 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             // Returns only once the process has ended, so `clawg stop && clawg
             // serve` cannot lose the race for the lock, and an installer can
             // replace `clawg.exe` right after.
-            let pid = stop_in(&data_dir(profile), STOP_TIMEOUT)
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let pid = stop_in(&base_dir, STOP_TIMEOUT)
                 .await
                 .map_err(|e| match e {
                     ClientError::NotRunning => {
@@ -132,7 +133,8 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
 
             // No autostart: reading must not launch a process, and a daemon
             // the user did not ask for would also hold the store lock.
-            let client = match probe_running(&data_dir(profile), false)
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let client = match probe_running(&base_dir, false)
                 .await
                 .map_err(unavailable)?
             {
