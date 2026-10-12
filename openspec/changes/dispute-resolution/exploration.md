@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 y 5 | M | eval-golden-expansion (los pares de contradicción ya existen) | exploración (borrador) |
+| 1 y 5 | M | eval-golden-expansion (los pares de contradicción ya existen) | exploración (cerrada) |
 
 **Tesis:** las contradicciones **se detectan** y nunca **se resuelven**. Una memoria disputada queda así para siempre, o hasta que alguien la borra.
 
@@ -62,9 +62,9 @@ Aparte de cómo se resuelva, falta:
 
 ## Decisiones abiertas
 
-- [ ] ¿a, b, c o a + c?
-- [ ] ¿Se mejora la precisión del detector en este mismo cambio? Por ejemplo, exigir otro tipo de memoria o una señal léxica de negación. ¿O va en otro cambio?
-- [ ] ¿`superseded` sale del ranking del todo, o sigue visible en `list_memories` como hoy (`crates/clawg-core/src/memory/admin.rs:409-410`)?
+- [x] a: herramienta MCP `resolve_conflict`, con "una gana" y "valen las dos". b queda para knowledge-synthesis; c se descarta. Ver `proposal.md`.
+- [x] La precisión del detector va en otro cambio. Éste sólo excluye a los pedazos hermanos de un mismo save.
+- [x] `superseded` sale del ranking, del contexto y del workspace, y sigue en `list_memories`. `disputed` sigue en el workspace (ver `proposal.md`).
 
 ## Cómo se mide
 
