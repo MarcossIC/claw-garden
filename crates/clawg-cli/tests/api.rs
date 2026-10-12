@@ -39,6 +39,9 @@ enum EmbedderState {
     ReadyWithoutWorker,
     /// The embedder loaded but every embedding call fails.
     FailingEmbedder,
+    /// The embedder is ready and something takes each save off the queue but
+    /// drops its reply unanswered, as a worker spilling at shutdown does.
+    DroppingReplies,
 }
 
 /// An embedder that loaded and then fails every call, as a broken ONNX
@@ -122,6 +125,11 @@ impl Harness {
         Self::start_inner(EmbedderState::ReadyWithoutWorker).await
     }
 
+    /// Daemon whose saves are taken off the queue and never answered.
+    async fn start_dropping_replies() -> Self {
+        Self::start_inner(EmbedderState::DroppingReplies).await
+    }
+
     /// Daemon whose embedder fails every call.
     async fn start_with_failing_embedder() -> Self {
         Self::start_inner(EmbedderState::FailingEmbedder).await
@@ -176,6 +184,11 @@ impl Harness {
                 let runtime = with_empty_embedder(runtime, EmbedderStatus::Ready);
                 runtime.embedder.set(Arc::new(FailingEmbedder) as Arc<dyn Embedder>).ok();
                 tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
+                (runtime, None)
+            }
+            EmbedderState::DroppingReplies => {
+                let mut rx = rx;
+                tokio::spawn(async move { while rx.recv().await.is_some() {} });
                 (runtime, None)
             }
         };
@@ -493,6 +506,7 @@ async fn a_multi_chunk_save_returns_one_id_per_chunk() {
     assert_eq!(memories.len(), 3, "{body}");
     assert!(memories.iter().all(|m| m["outcome"] == "inserted"));
     let mut ids: Vec<i64> = memories.iter().map(|m| m["id"].as_i64().unwrap()).collect();
+    ids.sort_unstable();
     ids.dedup();
     assert_eq!(ids.len(), 3, "each chunk has its own row: {body}");
 }
@@ -536,6 +550,22 @@ async fn a_save_the_worker_does_not_confirm_in_time_answers_202_unconfirmed() {
     assert_eq!(body["status"], "queued");
     assert_eq!(body["reason"], "unconfirmed");
     assert!(started.elapsed() < Duration::from_secs(1), "took {:?}", started.elapsed());
+}
+
+#[tokio::test]
+async fn a_save_whose_reply_is_dropped_answers_202_unconfirmed() {
+    let h = Harness::start_dropping_replies().await;
+    let started = Instant::now();
+    let (status, body) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a" })).await;
+
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(body["status"], "queued");
+    assert_eq!(body["reason"], "unconfirmed");
+    assert!(
+        started.elapsed() < SAVE_CONFIRM_TIMEOUT / 2,
+        "a dropped reply must not wait out the confirmation timeout: took {:?}",
+        started.elapsed()
+    );
 }
 
 #[tokio::test]
