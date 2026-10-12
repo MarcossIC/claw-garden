@@ -655,7 +655,7 @@ mod tests {
 
         let after = conn.call(snapshot).await.unwrap();
         assert_eq!(before, after);
-        assert_eq!(after.0, 9);
+        assert_eq!(after.0, 10);
     }
 
     /// Rows written before `project` existed keep their project ids when the
@@ -728,6 +728,78 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((projects, rekeyed), (0, 0));
+    }
+
+    /// The tables that record where a memory came from and when a scope was
+    /// last reviewed arrive empty: every row a store already holds is a plain
+    /// memory nobody has drawn a conclusion from, and nothing it held moves.
+    #[tokio::test]
+    async fn a_store_from_the_previous_version_opens_with_every_row_untouched() {
+        ensure_vec0_registered();
+        let conn = Connection::open_in_memory().await.unwrap();
+        register_udfs(&conn).await.unwrap();
+        conn.call(|c| {
+            configured(crate::memory::migrations::runner())
+                .set_target(refinery::Target::Version(9))
+                .run(c)
+        })
+        .await
+        .unwrap();
+        conn.call(|c| {
+            c.execute(
+                "INSERT INTO memory \
+                 (scope, agent_id, project_id, content, memory_type, source, \
+                  created_at, created_by_type, created_by_ref, \
+                  last_modified_at, last_accessed_at, importance, tier, status) \
+                 VALUES ('agent', 'a', 'p', 'seeded at v9', 'user_preference', 'explicit', \
+                  1, 'user', 'a', 1, 1, 7.0, 1, 'active')",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO episodic_trajectory \
+                 (scope, agent_id, project_id, session_id, task, created_at, \
+                  last_modified_at, last_accessed_at) \
+                 VALUES ('agent', 'a', 'p', 's', 'fix the bug', 2, 2, 2)",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO procedural_skill \
+                 (scope, agent_id, project_id, skill_name, trigger, promoted_at, \
+                  source_trajectory_ids, created_at, last_modified_at, last_accessed_at) \
+                 VALUES ('agent', 'a', 'p', 'Fix login flow', 'when login fails', 3, '[1]', 3, 3, 3)",
+                [],
+            )?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+
+        let rows = |c: &mut rusqlite::Connection| -> Result<Vec<String>, rusqlite::Error> {
+            let mut stmt = c.prepare(
+                "SELECT json_array(id, content, memory_type, tier, importance, status) FROM memory \
+                 UNION ALL SELECT json_array(id, task, tier, status) FROM episodic_trajectory \
+                 UNION ALL SELECT json_array(id, skill_name, trigger, tier, status) FROM procedural_skill",
+            )?;
+            let rows = stmt.query_map([], |r| r.get(0))?.collect();
+            rows
+        };
+        let before = conn.call(rows).await.unwrap();
+
+        run_migrations(&conn).await.unwrap();
+
+        assert_eq!(conn.call(rows).await.unwrap(), before);
+        let (derivations, reviews): (i64, i64) = conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT (SELECT COUNT(*) FROM memory_derivation), \
+                            (SELECT COUNT(*) FROM synthesis_review)",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!((derivations, reviews), (0, 0));
     }
 
     fn tamper(dir: &Path, sql: &str) {
@@ -1202,7 +1274,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 9, "Expected exactly 9 applied migrations, got {}", count);
+        assert_eq!(count, 10, "Expected exactly 10 applied migrations, got {}", count);
     }
 
     /// V8 — a fresh store records V8 as applied and carries the FTS5 lexical
@@ -1663,7 +1735,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 9);
+        assert_eq!(migration_count, 10);
     }
 
     // -----------------------------------------------------------------------
