@@ -33,3 +33,5 @@ docs/eval/**
 
 # Release binary copied next to the install script
 /scripts/clawg.exe
+
+target-apply/**
