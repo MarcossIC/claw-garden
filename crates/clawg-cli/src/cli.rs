@@ -67,6 +67,18 @@ pub enum Command {
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Remove one stored memory for good: its text, its vector and its index
+    /// terms. There is no way back, so it needs `--yes`. The daemon must be
+    /// stopped.
+    Purge {
+        /// The memory's id, as `clawg secrets` or `clawg memories` show it.
+        id: i64,
+        /// Confirm that the memory is to be removed for good.
+        #[arg(long)]
+        yes: bool,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
     /// Report which `clawg` executables the PATH resolves to and whether this
     /// one is the one a terminal runs. Exits 1 if shadowed or duplicated.
     Doctor {
@@ -441,6 +453,20 @@ mod tests {
             parse(&["clawg", "secrets", "--profile", "dev"]).command,
             Command::Secrets { profile: ProfileArg { profile: Some("dev".into()) } }
         );
+    }
+
+    #[test]
+    fn purge_takes_an_id_a_yes_and_a_profile() {
+        assert_eq!(
+            parse(&["clawg", "purge", "57", "--yes", "--profile", "dev"]).command,
+            Command::Purge { id: 57, yes: true, profile: ProfileArg { profile: Some("dev".into()) } }
+        );
+        assert_eq!(
+            parse(&["clawg", "purge", "57"]).command,
+            Command::Purge { id: 57, yes: false, profile: ProfileArg { profile: None } }
+        );
+        assert!(Cli::try_parse_from(["clawg", "purge"]).is_err(), "the id is required");
+        assert!(Cli::try_parse_from(["clawg", "purge", "memory"]).is_err(), "the id is a number");
     }
 
     #[test]
