@@ -1,12 +1,21 @@
-//! Secrets already in the store: finding the rows that hold one.
+//! Secrets already in the store: finding the rows that hold one, and purging
+//! a row for good.
 //!
 //! New saves are masked on the way in (see [`crate::memory::redact`]); this
 //! is for what was stored before, which nothing rewrites on its own.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::memory::backup::{open_for_probe, BackupError};
+use rusqlite::OptionalExtension;
+
+use crate::memory::backup::{
+    known_migrations, open_existing, open_for_probe, parse_snapshot_name, read_history, schema_plan,
+    BackupError, SchemaPlan,
+};
+use crate::memory::clock::TimestampMs;
+use crate::memory::dispute::release_challengers;
 use crate::memory::redact::{redact, SecretKind};
+use crate::memory::store_lock::{StoreHolder, StoreLock};
 use crate::memory::MemoryError;
 
 /// A `memory` row whose content holds at least one secret. Carries what the
@@ -42,10 +51,107 @@ pub fn scan(base_dir: &Path) -> Result<Vec<Flagged>, MemoryError> {
     Ok(flagged)
 }
 
+/// Why a purge did not run.
+#[derive(Debug, thiserror::Error)]
+pub enum PurgeError {
+    #[error("there is no memory #{0}")]
+    NotFound(i64),
+    #[error("memory.db has migrations pending (V{from} to V{to}); start the daemon once so it \
+             migrates them, stop it, and purge then")]
+    Pending { from: i32, to: i32 },
+    #[error("memory.db stayed busy after the purge, so its WAL could not be emptied; \
+             make sure no other clawg is running and purge again")]
+    Busy,
+}
+
+/// What [`purge`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Purged {
+    /// Snapshots in `<data>/backups` that still hold the row, by name. None
+    /// is changed: deleting them is the user's call.
+    pub backups: Vec<PathBuf>,
+}
+
+/// Removes `memory` row `id` for good: the row, its vector and its terms in
+/// the full-text index, so its text is in neither `memory.db` nor its WAL.
+///
+/// Only on a stopped store that is up to date: the lock is taken first, and
+/// nothing is written before every check passes. No snapshot is taken first,
+/// on purpose: it would be one more copy of what is being removed.
+pub fn purge(base_dir: &Path, id: i64) -> Result<Purged, MemoryError> {
+    let path = base_dir.join("memory.db");
+    if !path.exists() {
+        return Err(BackupError::NoStore { path }.into());
+    }
+    let _lock = StoreLock::acquire(base_dir, StoreHolder::Maintenance)?;
+    let mut c = open_existing(base_dir)?;
+    match schema_plan(&read_history(&c)?, &known_migrations()) {
+        SchemaPlan::UpToDate => {}
+        SchemaPlan::Fresh => return Err(PurgeError::NotFound(id).into()),
+        SchemaPlan::Pending { from, to } => return Err(PurgeError::Pending { from, to }.into()),
+        SchemaPlan::Newer { db, binary } => return Err(MemoryError::SchemaNewer { db, binary }),
+        SchemaPlan::Diverged { version } => return Err(MemoryError::SchemaDiverged { version }),
+    }
+    let (content, live): (String, bool) = c
+        .query_row("SELECT content, deleted_at IS NULL FROM memory WHERE id = ?1", [id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()?
+        .ok_or(PurgeError::NotFound(id))?;
+
+    let tx = c.transaction()?;
+    tx.execute("DELETE FROM memory_vectors WHERE rowid = ?1", [id])?;
+    tx.execute("DELETE FROM memory WHERE id = ?1", [id])?;
+    // After the delete, so the row no longer counts as live for them.
+    if live {
+        release_challengers(&tx, id, TimestampMs::now())?;
+    }
+    tx.commit()?;
+    // FTS5 records a removal as a new entry that carries the row's terms, and
+    // keeps the old segments until a merge: both still hold the text. A full
+    // merge rewrites the index without them.
+    c.execute("INSERT INTO memory_fts(memory_fts) VALUES ('optimize')", [])?;
+    // Pages freed long before this purge (every merge of the index frees
+    // some) still hold whatever they held, and `secure_delete` only zeroes
+    // pages freed from now on. Rebuilding the file leaves no free page. It
+    // keeps the rowids vec0 addresses its chunks by: a table with an index is
+    // copied with its rowids, and every vec0 shadow table has one.
+    c.execute_batch("VACUUM")?;
+    // Older frames of the WAL can still hold the pages as they were.
+    let busy: i64 = c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+    if busy != 0 {
+        return Err(PurgeError::Busy.into());
+    }
+    drop(c);
+    Ok(Purged { backups: backups_holding(&crate::paths::backups_dir(base_dir), id, &content) })
+}
+
+/// The snapshots in `dir` with a row `id` whose content is `content`, by
+/// name. One that cannot be read is listed too: it may hold the row.
+fn backups_holding(dir: &Path, id: i64, content: &str) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut holding: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).and_then(parse_snapshot_name).is_some())
+        .filter(|p| {
+            open_for_probe(p)
+                .and_then(|c| {
+                    c.query_row(
+                        "SELECT count(*) FROM memory WHERE id = ?1 AND content = ?2",
+                        rusqlite::params![id, content],
+                        |r| r.get::<_, i64>(0),
+                    )
+                })
+                .map_or(true, |n| n > 0)
+        })
+        .collect();
+    holding.sort();
+    holding
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::store_lock::{StoreHolder, StoreLock};
     use crate::memory::MemoryStore;
 
     const INSERT_ROW: &str = "INSERT INTO memory \
@@ -128,6 +234,202 @@ mod tests {
 
         assert_eq!(found, vec![Flagged { id, kinds: vec![SecretKind::GithubToken], deleted: false }]);
         drop(store);
+    }
+
+    const SECRET: &str = "the vault passphrase is zebra-quokka-7741";
+
+    /// A closed WAL-mode store with 300 ordinary rows and the secret one,
+    /// which has a vector. Returns the secret row's id.
+    async fn store_with_a_secret(dir: &Path, deleted: bool) -> i64 {
+        let store = MemoryStore::open(dir, StoreHolder::Eval).await.unwrap();
+        for i in 0..300 {
+            let row = insert(&store, format!("ordinary row {i} about trains and buses")).await;
+            add_vector(&store, row, i).await;
+        }
+        let id = insert(&store, SECRET.to_string()).await;
+        add_vector(&store, id, 300).await;
+        if deleted {
+            soft_delete(&store, id).await;
+        }
+        store.conn.clone().close().await.unwrap();
+        drop(store);
+        id
+    }
+
+    /// A unit vector along axis `axis`, so a KNN probe along the same axis
+    /// finds exactly this row.
+    fn axis(axis: usize) -> Vec<u8> {
+        let mut v = vec![0f32; 384];
+        v[axis] = 1.0;
+        v.iter().flat_map(|f| f.to_le_bytes()).collect()
+    }
+
+    async fn add_vector(store: &MemoryStore, id: i64, n: usize) {
+        let blob = axis(n % 384);
+        store
+            .conn
+            .call(move |c| {
+                c.execute("INSERT INTO memory_vectors (rowid, embedding) VALUES (?1, ?2)", rusqlite::params![id, blob])
+            })
+            .await
+            .unwrap();
+    }
+
+    fn nearest(dir: &Path, n: usize) -> i64 {
+        crate::memory::db::ensure_vec0_registered();
+        let c = rusqlite::Connection::open(dir.join("memory.db")).unwrap();
+        c.query_row("SELECT rowid FROM memory_vectors WHERE embedding MATCH ?1 AND k = 1", [axis(n)], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn bytes_mention(dir: &Path, needle: &[u8]) -> bool {
+        ["memory.db", "memory.db-wal"].iter().any(|name| {
+            std::fs::read(dir.join(name))
+                .map(|bytes| bytes.windows(needle.len()).any(|w| w == needle))
+                .unwrap_or(false)
+        })
+    }
+
+    fn count(dir: &Path, sql: &str, id: i64) -> i64 {
+        crate::memory::db::ensure_vec0_registered();
+        let c = rusqlite::Connection::open(dir.join("memory.db")).unwrap();
+        c.query_row(sql, [id], |r| r.get(0)).unwrap()
+    }
+
+    fn assert_no_trace(dir: &Path, id: i64) {
+        assert_eq!(count(dir, "SELECT count(*) FROM memory WHERE id = ?1", id), 0);
+        assert_eq!(count(dir, "SELECT count(*) FROM memory_vectors WHERE rowid = ?1", id), 0);
+        assert_eq!(
+            count(dir, "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH 'quokka' AND rowid >= ?1", 0),
+            0
+        );
+        assert!(!bytes_mention(dir, b"quokka"), "the secret's bytes are still on disk");
+    }
+
+    #[tokio::test]
+    async fn purging_a_live_row_leaves_no_trace_of_its_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = store_with_a_secret(dir.path(), false).await;
+        assert!(bytes_mention(dir.path(), b"quokka"), "the fixture holds the secret");
+
+        purge(dir.path(), id).unwrap();
+
+        assert_no_trace(dir.path(), id);
+        assert_eq!(count(dir.path(), "SELECT count(*) FROM memory WHERE id <> ?1", id), 300);
+        assert_eq!(nearest(dir.path(), 150), id - 150, "the other rows keep their vectors");
+        StoreLock::acquire(dir.path(), StoreHolder::Daemon).expect("the lock was released");
+    }
+
+    #[tokio::test]
+    async fn purging_a_deleted_row_leaves_no_trace_of_its_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = store_with_a_secret(dir.path(), true).await;
+        assert!(bytes_mention(dir.path(), b"quokka"), "a soft delete keeps the text");
+
+        purge(dir.path(), id).unwrap();
+
+        assert_no_trace(dir.path(), id);
+    }
+
+    #[tokio::test]
+    async fn purging_releases_the_rows_that_disputed_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+        let disputed = insert(&store, "the deploy runs on fridays".to_string()).await;
+        let challenger = insert(&store, "the deploy runs on mondays".to_string()).await;
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE memory SET status = 'disputed', disputed_against = ?2 WHERE id = ?1",
+                    rusqlite::params![challenger, format!("[{disputed}]")],
+                )
+            })
+            .await
+            .unwrap();
+        store.conn.clone().close().await.unwrap();
+        drop(store);
+
+        purge(dir.path(), disputed).unwrap();
+
+        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+        let status: String =
+            c.query_row("SELECT status FROM memory WHERE id = ?1", [challenger], |r| r.get(0)).unwrap();
+        assert_eq!(status, "active");
+    }
+
+    #[tokio::test]
+    async fn purge_refuses_while_the_daemon_holds_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = store_with_a_secret(dir.path(), false).await;
+        let before = std::fs::read(dir.path().join("memory.db")).unwrap();
+        let _daemon = StoreLock::acquire(dir.path(), StoreHolder::Daemon).unwrap();
+
+        let err = purge(dir.path(), id).unwrap_err();
+
+        match err {
+            MemoryError::StoreInUse { owner: Some(o) } => assert_eq!(o.holder, StoreHolder::Daemon),
+            other => panic!("expected StoreInUse, got {other}"),
+        }
+        assert_eq!(std::fs::read(dir.path().join("memory.db")).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn purge_refuses_an_unknown_id_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        store_with_a_secret(dir.path(), false).await;
+        let before = std::fs::read(dir.path().join("memory.db")).unwrap();
+
+        let err = purge(dir.path(), 999_999).unwrap_err();
+
+        assert!(matches!(err, MemoryError::Purge(PurgeError::NotFound(999_999))), "{err}");
+        assert_eq!(err.to_string(), "there is no memory #999999");
+        assert_eq!(std::fs::read(dir.path().join("memory.db")).unwrap(), before);
+        StoreLock::acquire(dir.path(), StoreHolder::Daemon).expect("the lock was released");
+    }
+
+    #[tokio::test]
+    async fn purge_refuses_a_store_with_pending_migrations_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let older = crate::memory::backup::latest_known() - 1;
+        crate::memory::db::seed_on_disk(dir.path(), Some(older)).await;
+        let before = std::fs::read(dir.path().join("memory.db")).unwrap();
+
+        let err = purge(dir.path(), 1).unwrap_err();
+
+        assert!(matches!(err, MemoryError::Purge(PurgeError::Pending { .. })), "{err}");
+        assert!(err.to_string().contains("start the daemon once"), "{err}");
+        assert_eq!(std::fs::read(dir.path().join("memory.db")).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn purge_names_the_backups_that_still_hold_the_row() {
+        use crate::memory::backup::backup_offline;
+        let pause = || std::thread::sleep(std::time::Duration::from_millis(5));
+        let dir = tempfile::tempdir().unwrap();
+        crate::memory::db::seed_on_disk(dir.path(), None).await;
+        let without = backup_offline(dir.path()).unwrap();
+        pause();
+        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+        c.execute(INSERT_ROW, [SECRET]).unwrap();
+        let id = c.last_insert_rowid();
+        drop(c);
+        let with = backup_offline(dir.path()).unwrap();
+        pause();
+        rusqlite::Connection::open(dir.path().join("memory.db"))
+            .unwrap()
+            .execute("UPDATE memory SET deleted_at = 1 WHERE id = ?1", [id])
+            .unwrap();
+        let after_delete = backup_offline(dir.path()).unwrap();
+        let kept: Vec<Vec<u8>> =
+            [&without, &with, &after_delete].iter().map(|p| std::fs::read(p).unwrap()).collect();
+
+        let purged = purge(dir.path(), id).unwrap();
+
+        assert_eq!(purged, Purged { backups: vec![with.clone(), after_delete.clone()] });
+        let now: Vec<Vec<u8>> =
+            [&without, &with, &after_delete].iter().map(|p| std::fs::read(p).unwrap()).collect();
+        assert_eq!(now, kept, "no backup was changed");
     }
 
     #[test]

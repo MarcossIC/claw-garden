@@ -490,7 +490,7 @@ fn immutable_uri(path: &Path) -> Option<String> {
     Some(uri)
 }
 
-fn open_existing(base_dir: &Path) -> Result<rusqlite::Connection, MemoryError> {
+pub(crate) fn open_existing(base_dir: &Path) -> Result<rusqlite::Connection, MemoryError> {
     let path = base_dir.join("memory.db");
     if !path.exists() {
         return Err(BackupError::NoStore { path }.into());
