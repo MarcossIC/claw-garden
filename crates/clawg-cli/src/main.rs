@@ -21,7 +21,7 @@ use clawg_cli::memories;
 use clawg_cli::restore;
 use clawg_cli::status::status_report;
 use clawg_cli::stop::{stop_in, STOP_TIMEOUT};
-use clawg_core::memory::backup::{backup_offline, restore};
+use clawg_core::memory::backup::{backup_offline, probe, restore};
 use clawg_core::paths::data_dir;
 use clap::Parser;
 
@@ -86,7 +86,11 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             };
 
             let running = health.is_some();
-            let report = status_report(profile, &base_dir, state.as_ref(), health.as_ref());
+            // Only without a daemon: a running one has already opened the
+            // store, and its health says how that went.
+            let store = if running { None } else { Some(probe(&base_dir)) };
+            let report =
+                status_report(profile, &base_dir, state.as_ref(), health.as_ref(), store.as_ref());
             println!(
                 "{}",
                 serde_json::to_string_pretty(&report).unwrap_or_else(|_| report.to_string())

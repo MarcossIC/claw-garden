@@ -402,6 +402,77 @@ fn check_restorable(path: &Path) -> Result<(), BackupError> {
     }
 }
 
+/// What a stopped store's file says about its schema, for `clawg status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreProbe {
+    pub state: ProbeState,
+    /// The newest migration applied to the file, when it could be read.
+    pub db_version: Option<i32>,
+    /// The newest migration this binary knows.
+    pub binary_version: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeState {
+    Missing,
+    Unreadable(String),
+    Schema(SchemaPlan),
+}
+
+/// Reads the schema history of `<base_dir>/memory.db` without the lock and
+/// without writing: a probe must never stand in the way of a daemon starting
+/// at the same moment, nor create a store where there is none.
+pub fn probe(base_dir: &Path) -> StoreProbe {
+    let known = known_migrations();
+    let binary_version = known.iter().map(|m| m.version).max().unwrap_or(0);
+    let path = base_dir.join("memory.db");
+    if !path.exists() {
+        return StoreProbe { state: ProbeState::Missing, db_version: None, binary_version };
+    }
+    let read = open_for_probe(&path).and_then(|c| read_history(&c));
+    match read {
+        Ok(applied) => StoreProbe {
+            db_version: applied.iter().map(|m| m.version).max(),
+            state: ProbeState::Schema(schema_plan(&applied, &known)),
+            binary_version,
+        },
+        Err(e) => StoreProbe { state: ProbeState::Unreadable(e.to_string()), db_version: None, binary_version },
+    }
+}
+
+/// A read-only connection still creates `-wal` and `-shm` beside a WAL-mode
+/// file, and cannot delete them on close. A stopped store has neither, so it
+/// is opened `immutable` and nothing appears. With a `-wal` left by a crash,
+/// the commits in it matter, so it is read through a plain read-only open.
+fn open_for_probe(path: &Path) -> rusqlite::Result<rusqlite::Connection> {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    let read_only = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    match immutable_uri(path) {
+        Some(uri) if !Path::new(&wal).exists() => {
+            rusqlite::Connection::open_with_flags(uri, read_only | rusqlite::OpenFlags::SQLITE_OPEN_URI)
+        }
+        _ => rusqlite::Connection::open_with_flags(path, read_only),
+    }
+}
+
+/// `file:` URI for `path` with `immutable=1`; `None` when the path is not
+/// UTF-8. Backslashes become slashes and a drive letter gets the leading slash
+/// SQLite expects on Windows.
+fn immutable_uri(path: &Path) -> Option<String> {
+    let raw = path.to_str()?.replace('\\', "/");
+    let mut uri = String::from(if raw.starts_with('/') { "file://" } else { "file:///" });
+    for b in raw.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~/:".contains(&b) {
+            uri.push(b as char);
+        } else {
+            uri.push_str(&format!("%{b:02X}"));
+        }
+    }
+    uri.push_str("?immutable=1");
+    Some(uri)
+}
+
 fn open_existing(base_dir: &Path) -> Result<rusqlite::Connection, MemoryError> {
     let path = base_dir.join("memory.db");
     if !path.exists() {
@@ -779,6 +850,68 @@ mod tests {
             .collect();
         assert!(reasons.contains(&Some(Reason::PreMigration)), "{reasons:?}");
         assert!(reasons.contains(&Some(Reason::PreRestore)), "{reasons:?}");
+    }
+
+    #[tokio::test]
+    async fn probing_a_newer_store_reads_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        // Through the production open, so the file is in WAL mode and was
+        // closed the way a stopped daemon leaves it.
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+        store.conn.clone().close().await.unwrap();
+        drop(store);
+        rusqlite::Connection::open(dir.path().join("memory.db"))
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+                 VALUES (9, 'from_the_future', '2026-10-12T00:00:00Z', '1')",
+            )
+            .unwrap();
+        let files = files_in(dir.path());
+        let before = std::fs::read(dir.path().join("memory.db")).unwrap();
+
+        let probe = probe(dir.path());
+
+        assert_eq!(
+            probe,
+            StoreProbe {
+                state: ProbeState::Schema(SchemaPlan::Newer { db: 9, binary: 8 }),
+                db_version: Some(9),
+                binary_version: 8,
+            }
+        );
+        assert_eq!(std::fs::read(dir.path().join("memory.db")).unwrap(), before);
+        assert_eq!(files_in(dir.path()), files);
+    }
+
+    #[test]
+    fn immutable_uris_escape_what_a_uri_cannot_hold() {
+        assert_eq!(
+            immutable_uri(Path::new("/home/u/.clawg-dev/memory.db")).unwrap(),
+            "file:///home/u/.clawg-dev/memory.db?immutable=1"
+        );
+        assert_eq!(
+            immutable_uri(Path::new("/tmp/a b?#%/memory.db")).unwrap(),
+            "file:///tmp/a%20b%3F%23%25/memory.db?immutable=1"
+        );
+        assert_eq!(
+            immutable_uri(Path::new("C:\\Users\\José\\.clawg\\memory.db")).unwrap(),
+            "file:///C:/Users/Jos%C3%A9/.clawg/memory.db?immutable=1"
+        );
+    }
+
+    #[test]
+    fn probing_without_a_store_creates_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(probe(dir.path()).state, ProbeState::Missing);
+        assert!(files_in(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn probing_a_file_that_is_not_a_store_says_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("memory.db"), "not a database at all, just some words").unwrap();
+        assert!(matches!(probe(dir.path()).state, ProbeState::Unreadable(_)));
     }
 
     #[tokio::test]
