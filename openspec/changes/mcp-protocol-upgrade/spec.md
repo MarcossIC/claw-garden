@@ -34,6 +34,7 @@ Test: `a_discover_probe_is_answered_with_what_the_server_offers` (`handshake.rs`
 - `initialize` con `protocolVersion` `2025-06-18` MUST negociar `2025-06-18` y devolver el `serverInfo` del perfil.
 - Una sonda `server/discover` sin `_meta` MUST recibir un error con su propio id, y el puente MUST seguir vivo.
 - Antes de una sesión, una notificación o una respuesta suelta MUST descartarse sin terminar el proceso. Después de empezada, MUST llegar intacta a rmcp.
+- Una request que rmcp rechaza por falta de `_meta` MUST NOT contar como inicio de sesión: lo que llegue después se sigue tratando como antes de una sesión.
 - `initialize` MUST contestarse aunque el daemon todavía esté arrancando (ya lo exige `initialize_is_answered_while_the_daemon_is_still_starting`).
 
 #### Escenario: la apertura de Claude Code 2.1.285
@@ -41,7 +42,12 @@ Test: `a_discover_probe_is_answered_with_what_the_server_offers` (`handshake.rs`
 - WHEN el host manda la sonda sin `_meta`, la cancela con `notifications/cancelled`, manda `initialize`, `notifications/initialized` y `tools/list`
 - THEN la sonda recibe un error con id `server-discover-probe-1`, `initialize` negocia `2025-06-18` y `tools/list` trae las siete herramientas
 
-Tests: `a_bare_probe_and_its_cancellation_leave_the_legacy_handshake_working`, `the_probe_reaches_rmcp_and_its_cancellation_does_not`, `after_the_session_starts_the_guard_forwards_everything_untouched`, `a_closed_stream_before_a_session_ends_it` y los de `before_session` (`handshake.rs`); los de arranque de `mod.rs`.
+#### Escenario: una request rechazada y su cancelación
+- GIVEN un puente recién abierto
+- WHEN el host manda `tools/list` sin `_meta` ni `initialize`, la cancela y después manda `initialize`
+- THEN `tools/list` recibe un error y `initialize` se contesta: el puente sigue vivo
+
+Tests: `a_bare_probe_and_its_cancellation_leave_the_legacy_handshake_working`, `a_request_refused_for_missing_meta_does_not_start_the_session`, `the_probe_reaches_rmcp_and_its_cancellation_does_not`, `after_the_session_starts_the_guard_forwards_everything_untouched`, `a_refused_request_leaves_the_guard_on`, `a_closed_stream_before_a_session_ends_it` y los de `before_session` (`handshake.rs`); los de arranque de `mod.rs`.
 
 ## R3. Sesión sin `initialize`
 

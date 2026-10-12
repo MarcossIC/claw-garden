@@ -1,6 +1,6 @@
 # mcp-protocol-upgrade — Verificación
 
-**Estado:** parcial. Los tests pasan en Linux. Faltan el suite en Windows y la prueba con Claude Code real, las dos en la máquina de Marcos (ver [Pendiente](#pendiente-máquina-del-usuario)).
+**Estado:** parcial. En Linux el cambio no agrega fallas: siguen las 10 de entorno de la base y todos los tests nuevos pasan. Faltan el suite en Windows y la prueba con Claude Code real, las dos en la máquina de Marcos (ver [Pendiente](#pendiente-máquina-del-usuario)).
 
 ## Tests
 
@@ -11,20 +11,20 @@
 | Corrida | Pasan | Fallan |
 |---|---|---|
 | Base (`origin/main`, 1127b50) | 1.675 | 10 |
-| Con el cambio (533523d) | 1.683 | 10 |
+| Con el cambio (08dc9ba) | 1.685 | 10 |
 
-Son 8 tests más y ninguna falla nueva. Las 10 fallas son las mismas en las dos corridas y vienen del entorno, no del código:
+Son 10 tests más y ninguna falla nueva. Las 10 fallas son las mismas en las dos corridas y vienen del entorno, no del código:
 
 - 7 de `doctor::tests`: modelan un PATH de Windows con `clawg.exe`.
 - 3 de `diff::tests` en `rag-eval`: leen resultados de `docs/eval/results/`, que está en `.gitignore` y no existe en un clon limpio.
 
-De dónde salen los 8: `server.rs` cambia un test de identidad por cuatro puros y suma tres por el cable (+6), y `handshake.rs` pasa de 10 a 12 tests.
+De dónde salen los 10: `server.rs` cambia un test de identidad por cuatro puros y suma tres por el cable (+6), y `handshake.rs` pasa de 10 a 14 tests.
 
 ### Los tests nuevos fallan sin el cambio
 
 - **R1 y R3:** en `main`, la sonda con `_meta` recibe `-32601` del guardia, y una request sin `initialize` no la acepta rmcp 1.3.
 - **R4 y R5:** con rmcp 3.5.1 y la lectura de identidad de `main` (`peer_info()`), los tres tests por el cable fallan: la sesión sin `initialize` guarda y busca bajo `"mcp"`.
-- **El guardia (D1):** sin `PreInitGuard`, `a_bare_probe_and_its_cancellation_leave_the_legacy_handshake_working` falla. La cancelación de la sonda termina el puente.
+- **El guardia (D1):** sin `PreInitGuard`, `a_bare_probe_and_its_cancellation_leave_the_legacy_handshake_working` falla, porque la cancelación de la sonda termina el puente. Con el guardia que se apagaba al pasar la primera request, `a_request_refused_for_missing_meta_does_not_start_the_session` falla por la misma razón.
 
 ### rag-eval
 

@@ -15,10 +15,14 @@ rmcp 3.5.1, antes de una sesión (`src/service/server.rs:573-686`):
 | Opción | A favor | En contra |
 |---|---|---|
 | a. Borrar el guardia | Menos código | Una sonda cancelada (`notifications/cancelled`) vuelve a matar el puente: es la misma falla de `CONNECT_TIMEOUT` que el guardia arregló |
-| **b. Guardia que sólo descarta notificaciones y respuestas antes de una sesión** | Cubre lo único que rmcp no tolera; todo lo demás lo contesta rmcp, con sus códigos | Sigue habiendo un envoltorio del transporte |
-| c. Guardia que además mira las respuestas de rmcp para saber si una request sin `_meta` empezó la sesión o no | Exacto en el caso raro de una request rechazada seguida de una notificación | Más estado y más código para un host que, después de un error, igual reintenta antes de mandar otra cosa |
+| b. Guardia que descarta notificaciones y respuestas hasta que pasa la primera request que puede empezar una sesión | Simple | Si rmcp rechaza esa request por falta de `_meta`, no hay sesión pero el guardia ya se apagó: una cancelación después mata el puente (lo encontró la review del PR, y lo reproduce `a_request_refused_for_missing_meta_does_not_start_the_session`) |
+| **c. Igual que b, pero la sesión cuenta como empezada recién cuando rmcp contesta esa request con un resultado** | Exacto: un rechazo deja el guardia prendido | El guardia mira también lo que rmcp manda, con un id pendiente de estado |
 
-**Elegida b.** `before_session` es pura: `Start` para cualquier request que no sea `ping` ni `server/discover`, `Forward` para esas dos, `Discard` para notificaciones y respuestas. Comprobé que hace falta: sin el guardia, `a_bare_probe_and_its_cancellation_leave_the_legacy_handshake_working` falla.
+**Elegida c.** `before_session` es pura: `Start` para cualquier request que no sea `ping` ni `server/discover`, `Forward` para esas dos y `Discard` para notificaciones y respuestas. Con `Start` el guardia anota el id. Si rmcp contesta ese id con un resultado, el guardia se apaga. Si lo contesta con un error, sigue prendido.
+
+Costo aceptado: en una sesión 2026-07-28, una notificación que llega mientras la primera request todavía no tiene respuesta se descarta. La única que puede llegar ahí es la cancelación de esa misma request, y descartarla sólo hace que la request termine normalmente.
+
+Comprobé que el guardia hace falta: sin él, `a_bare_probe_and_its_cancellation_leave_the_legacy_handshake_working` falla.
 
 ## D2. Leer la identidad del `RequestContext`, no del `Peer`
 

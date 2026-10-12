@@ -15,6 +15,12 @@ Cada tarea es un commit atómico: primero el test que falla, después el código
 - [x] `agent_id_from(declarado, recordado, fallback)`; las herramientas leen `RequestContext::client_info()`; el servidor recuerda el último nombre declarado, también en `server/discover`.
 - Commit: `fix(mcp): name the agent from each request, not only the handshake` (`533523d`)
 
+## 3. El guardia sigue prendido después de una request rechazada (R2)
+
+- [x] Tests `a_request_refused_for_missing_meta_does_not_start_the_session` y `a_refused_request_leaves_the_guard_on` en `handshake.rs`; `after_the_session_starts_the_guard_forwards_everything_untouched` ahora contesta `initialize` antes de mandar la notificación.
+- [x] `PreInitGuard` anota el id de la request que puede empezar la sesión y se apaga recién cuando rmcp la contesta con un resultado.
+- Commit: `fix(mcp): keep the pre-session guard on after a refused request` (`08dc9ba`)
+
 ## Verify
 
 - [x] `cargo test --workspace` en Linux: sin fallas nuevas contra la base (ver `verify.md`).
