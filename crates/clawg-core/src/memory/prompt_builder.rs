@@ -194,11 +194,19 @@ pub async fn build_memory_prompt(
         crate::memory::admin::format_skill_hits(&hits)
     );
 
+    // Taken before `bucket_by_recency` consumes `hits`.
+    let shown: Vec<i64> = hits
+        .iter()
+        .filter(|h| h.kind == TableKind::Memory)
+        .map(|h| h.id)
+        .chain(emitted.memory_ids())
+        .collect();
+
     // 3. Bucket hits into RECENT vs LONG-TERM.
     let (recent, longterm) = bucket_by_recency(hits, TimestampMs::now());
 
-    // 4. Fetch conflicts (always query; CONFLICTS block emitted only when non-empty).
-    let conflicts = fetch_active_conflicts(store, agent_id).await.unwrap_or_else(|e| {
+    // 4. Fetch the conflicts on what this prompt shows; the block is emitted only when non-empty.
+    let conflicts = fetch_active_conflicts(store, agent_id, &shown).await.unwrap_or_else(|e| {
         log::warn!("fetch_active_conflicts failed: {e}; CONFLICTS block omitted");
         Vec::new()
     });
@@ -361,13 +369,21 @@ fn strip_empty_workspace_markers(raw: &str) -> String {
     }
 }
 
-/// Fetches disputed memory pairs from the DB using the CONFLICTS SQL.
-/// Returns `Ok(Vec::new())` when there are no disputed rows or on SQL error (caller logs).
+/// Fetches the disputed pairs with a side among `shown`, the `memory` ids the
+/// prompt hands the model.
+///
+/// Every other pair is left out: the block carries both rows in full, and
+/// unfiltered it grew with the store rather than with the question.
 async fn fetch_active_conflicts(
     store: &MemoryStore,
     agent_id: &str,
+    shown: &[i64],
 ) -> Result<Vec<ConflictPair>, MemoryError> {
+    if shown.is_empty() {
+        return Ok(Vec::new());
+    }
     let agent = agent_id.to_string();
+    let shown = format!("[{}]", shown.iter().map(i64::to_string).collect::<Vec<_>>().join(","));
     store
         .conn
         .call(move |c| -> Result<Vec<ConflictPair>, rusqlite::Error> {
@@ -380,10 +396,12 @@ async fn fetch_active_conflicts(
                  WHERE m_new.status = 'disputed'
                    AND m_new.agent_id = ?1
                    AND m_new.deleted_at IS NULL
-                   AND m_old.deleted_at IS NULL",
+                   AND m_old.deleted_at IS NULL
+                   AND (m_new.id IN (SELECT value FROM json_each(?2))
+                        OR m_old.id IN (SELECT value FROM json_each(?2)))",
             )?;
             let pairs: Vec<ConflictPair> = stmt
-                .query_map(rusqlite::params![agent], |row| {
+                .query_map(rusqlite::params![agent, shown], |row| {
                     Ok(ConflictPair {
                         old_id: row.get(0)?,
                         old_created_at: row.get(1)?,
@@ -628,8 +646,71 @@ mod tests {
     #[tokio::test]
     async fn conflicts_query_zero_disputed_rows() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let result = fetch_active_conflicts(&store, "agent-1").await.unwrap();
+        let result = fetch_active_conflicts(&store, "agent-1", &[1, 2]).await.unwrap();
         assert!(result.is_empty());
+    }
+
+    /// Inserts an active row and a disputed row against it for `agent`;
+    /// returns `(old_id, new_id)`.
+    async fn disputed_pair(store: &MemoryStore, agent: &'static str, old_type: &'static str, old_importance: f64) -> (i64, i64) {
+        store.conn.call(move |c| -> Result<(i64, i64), rusqlite::Error> {
+            c.execute(
+                "INSERT INTO memory (scope, agent_id, content, memory_type, source,
+                 created_at, created_by_type, created_by_ref,
+                 last_modified_at, last_accessed_at, importance, tier, status)
+                 VALUES ('agent', ?1, 'old fact', ?2, 'chat',
+                 1000, 'user', ?1, 1000, 1000, ?3, 2, 'active')",
+                rusqlite::params![agent, old_type, old_importance],
+            )?;
+            let old_id = c.last_insert_rowid();
+            c.execute(
+                "INSERT INTO memory (scope, agent_id, content, memory_type, source,
+                 created_at, created_by_type, created_by_ref,
+                 last_modified_at, last_accessed_at, importance, tier, status, disputed_against)
+                 VALUES ('agent', ?1, 'new fact', 'semantic_fact', 'chat',
+                 2000, 'user', ?1, 2000, 2000, 8.0, 2, 'disputed',
+                 json('[' || ?2 || ']'))",
+                rusqlite::params![agent, old_id],
+            )?;
+            Ok((old_id, c.last_insert_rowid()))
+        }).await.unwrap()
+    }
+
+    /// The block costs what every pair's two rows cost, on every call, however
+    /// unrelated to the question: only a pair the agent is being handed a side
+    /// of is worth reading.
+    #[tokio::test]
+    async fn a_conflict_is_fetched_only_when_one_of_its_rows_is_shown() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let (old_id, new_id) = disputed_pair(&store, "agent-1", "semantic_fact", 8.0).await;
+        let (other_old, other_new) = disputed_pair(&store, "agent-1", "semantic_fact", 8.0).await;
+
+        let by_new = fetch_active_conflicts(&store, "agent-1", &[new_id]).await.unwrap();
+        assert_eq!(by_new.iter().map(|p| p.old_id).collect::<Vec<_>>(), [old_id]);
+
+        let by_old = fetch_active_conflicts(&store, "agent-1", &[old_id]).await.unwrap();
+        assert_eq!(by_old.iter().map(|p| p.new_id).collect::<Vec<_>>(), [new_id]);
+
+        let neither = fetch_active_conflicts(&store, "agent-1", &[other_old + other_new + 100]).await.unwrap();
+        assert!(neither.is_empty());
+
+        assert!(fetch_active_conflicts(&store, "agent-1", &[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_conflict_on_a_workspace_row_reaches_the_prompt() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let (old_id, _) = disputed_pair(&store, "agent-x", "user_preference", 9.0).await;
+        store.conn.call(move |c| -> Result<(), rusqlite::Error> {
+            c.execute("UPDATE memory SET tier = 1 WHERE id = ?1", [old_id])?;
+            Ok(())
+        }).await.unwrap();
+        let emitted = wm.regenerate_auto_section("agent-x", None, &store).await.unwrap();
+
+        let result = build_memory_prompt(&store, &wm, None, "agent-x", None, QueryTexts::single_shot("query"), &emitted, None).await.unwrap();
+        assert!(result.contains(SEP_CONFLICTS), "{result}");
     }
 
     #[tokio::test]
@@ -663,7 +744,7 @@ mod tests {
             Ok(c.last_insert_rowid())
         }).await.unwrap();
 
-        let result = fetch_active_conflicts(&store, "agent-1").await.unwrap();
+        let result = fetch_active_conflicts(&store, "agent-1", &[old_id]).await.unwrap();
         assert_eq!(result.len(), 1, "expected 1 conflict pair");
         assert_eq!(result[0].old_id, old_id);
         assert_eq!(result[0].old_content, "old content");
@@ -688,7 +769,7 @@ mod tests {
         }).await.unwrap();
 
         // Should return empty, not panic or error
-        let result = fetch_active_conflicts(&store, "agent-1").await.unwrap();
+        let result = fetch_active_conflicts(&store, "agent-1", &[1]).await.unwrap();
         assert!(result.is_empty(), "json_each(NULL) should return zero rows, not error");
     }
 
@@ -763,39 +844,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disputed_pair_renders_conflicts_block() {
+    async fn a_conflict_on_rows_nobody_was_shown_is_left_out() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
-
-        let old_id: i64 = store.conn.call(|c| -> Result<i64, rusqlite::Error> {
-            c.execute(
-                "INSERT INTO memory (scope, agent_id, content, memory_type, source,
-                 created_at, created_by_type, created_by_ref,
-                 last_modified_at, last_accessed_at, importance, tier, status)
-                 VALUES ('agent', 'agent-x', 'old fact', 'semantic_fact', 'chat',
-                 1000, 'user', 'agent-x', 1000, 1000, 8.0, 2, 'active')",
-                [],
-            )?;
-            Ok(c.last_insert_rowid())
-        }).await.unwrap();
-
-        store.conn.call(move |c| -> Result<(), rusqlite::Error> {
-            c.execute(
-                "INSERT INTO memory (scope, agent_id, content, memory_type, source,
-                 created_at, created_by_type, created_by_ref,
-                 last_modified_at, last_accessed_at, importance, tier, status, disputed_against)
-                 VALUES ('agent', 'agent-x', 'new fact', 'semantic_fact', 'chat',
-                 2000, 'user', 'agent-x', 2000, 2000, 8.0, 2, 'disputed',
-                 json('[' || ?1 || ']'))",
-                rusqlite::params![old_id],
-            )?;
-            Ok(())
-        }).await.unwrap();
+        disputed_pair(&store, "agent-x", "semantic_fact", 8.0).await;
 
         let result = build_memory_prompt(&store, &wm, None, "agent-x", None, QueryTexts::single_shot("query"), &EmittedIds::default(), None).await.unwrap();
-        assert!(result.contains(SEP_CONFLICTS), "should contain CONFLICTS separator");
-        assert!(result.contains("ACTIVE CONFLICTS"));
+        assert!(!result.contains(SEP_CONFLICTS), "{result}");
     }
 
     #[tokio::test]
@@ -1588,8 +1644,10 @@ mod tests {
             Ok(())
         }).await.unwrap();
 
-        // 1 disputed row pointing to one of the chat rows
-        let old_id: i64 = store.conn.call(|c| -> Result<i64, rusqlite::Error> {
+        // 1 disputed pair whose old row is retrievable, so the prompt shows a
+        // side of it and the CONFLICTS block has something to warn about.
+        let old_bytes = fake_bytes.clone();
+        let old_id: i64 = store.conn.call(move |c| -> Result<i64, rusqlite::Error> {
             c.execute(
                 "INSERT INTO memory (scope, agent_id, content, memory_type, source,
                  created_at, created_by_type, created_by_ref,
@@ -1598,7 +1656,12 @@ mod tests {
                  500, 'user', 'e2e-agent', 500, 500, 8.0, 2, 'active')",
                 [],
             )?;
-            Ok(c.last_insert_rowid())
+            let id = c.last_insert_rowid();
+            c.execute(
+                "INSERT INTO memory_vectors (rowid, embedding) VALUES (?1, ?2)",
+                rusqlite::params![id, old_bytes],
+            )?;
+            Ok(id)
         }).await.unwrap();
 
         store.conn.call(move |c| -> Result<(), rusqlite::Error> {

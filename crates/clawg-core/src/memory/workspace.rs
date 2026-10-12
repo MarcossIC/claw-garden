@@ -165,6 +165,10 @@ impl EmittedIds {
         }
     }
 
+    pub(crate) fn memory_ids(&self) -> impl Iterator<Item = i64> + '_ {
+        self.memory.iter().copied()
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.memory.len() + self.procedural.len()
     }
