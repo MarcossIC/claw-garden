@@ -18,6 +18,10 @@ pub const DEFAULT_DISTRACTORS: usize = 500;
 
 const LEXICAL_FAMILIES: usize = 30;
 const SIBLINGS_PER_FAMILY: usize = 8;
+const MULTI_REF_TOPICS: usize = 12;
+const HIGH_IMPORTANCE_ROWS: usize = 24;
+/// Rows in a high-importance case's pool: the expected one and its successors.
+const HIGH_IMPORTANCE_POOL: usize = 4;
 
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum SynthError {
@@ -56,6 +60,14 @@ pub fn generate(base: &Golden, seed: u64, sizes: &Sizes) -> Result<Golden, Synth
     let mut out = base.clone();
     out.corpus.extend(distractors(&vocab, &mut rng, sizes.distractors));
     let (rows, cases) = lexical_families(base, &mut rng);
+    out.corpus.extend(rows);
+    out.retrieval_cases.extend(cases);
+
+    let mut names = Codenames::default();
+    let (rows, cases) = multi_ref_topics(base, &mut names, &mut rng);
+    out.corpus.extend(rows);
+    out.retrieval_cases.extend(cases);
+    let (rows, cases) = high_importance_rules(base, &mut names, &mut rng);
     out.corpus.extend(rows);
     out.retrieval_cases.extend(cases);
 
@@ -156,6 +168,111 @@ fn lexical_families(base: &Golden, rng: &mut SplitMix64) -> (Vec<Row>, Vec<Case>
             subset: Subset::Lexical,
         });
     }
+    (rows, cases)
+}
+
+/// Two-word names that tag a topic, handed out once each and never one that
+/// the base already mentions, so a question about a name has a known set of
+/// rows as its answer.
+#[derive(Default)]
+struct Codenames {
+    used: HashSet<String>,
+}
+
+impl Codenames {
+    fn next(&mut self, base: &Golden, rng: &mut SplitMix64) -> String {
+        loop {
+            let name = format!(
+                "{}-{}",
+                rng.pick(&templates::CODENAME_ADJECTIVES),
+                rng.pick(&templates::CODENAME_NOUNS)
+            );
+            if !self.used.contains(&name) && !base.corpus.iter().any(|r| r.content.contains(&name)) {
+                self.used.insert(name.clone());
+                return name;
+            }
+        }
+    }
+}
+
+/// Topics split over two or three rows, with one question whose answer is all
+/// of them: the case that gives nDCG something to rank.
+fn multi_ref_topics(base: &Golden, names: &mut Codenames, rng: &mut SplitMix64) -> (Vec<Row>, Vec<Case>) {
+    let mut rows = Vec::new();
+    let mut cases = Vec::new();
+    let mut groups: Vec<Vec<String>> = Vec::new();
+
+    for topic in 0..MULTI_REF_TOPICS {
+        let key = names.next(base, rng);
+        let spanish = topic % 2 == 1;
+        let aspects = templates::topic_aspects(spanish);
+        let take = if topic % 2 == 0 { 3 } else { 2 };
+
+        let refs: Vec<String> = (0..take).map(|k| format!("s-mr-{topic:02}-{k}")).collect();
+        for (ref_, aspect) in refs.iter().zip(aspects) {
+            rows.push(Row {
+                ref_: ref_.clone(),
+                content: templates::fill(aspect, &[("{key}", &key)]),
+                memory_type: "semantic_fact".to_string(),
+                importance: 5.0,
+                lang: Some(if spanish { "es" } else { "en" }.to_string()),
+            });
+        }
+        cases.push(Case {
+            query: templates::fill(templates::topic_query(spanish), &[("{key}", &key)]),
+            corpus_refs: refs.clone(),
+            expected_refs: refs.clone(),
+            status: Status::Active,
+            blocked_by: None,
+            history: Vec::new(),
+            subset: Subset::MultiRef,
+        });
+        groups.push(refs);
+    }
+
+    // A neighbouring topic's first row joins each pool so the pool is not
+    // made only of answers.
+    for (i, case) in cases.iter_mut().enumerate() {
+        case.corpus_refs.push(groups[(i + 1) % groups.len()][0].clone());
+    }
+    (rows, cases)
+}
+
+/// User rules of importance 8 to 10, a range the hand-written set never
+/// reaches. Importance cycles 8, 9, 10, so two thirds sit at 9 or above.
+fn high_importance_rules(base: &Golden, names: &mut Codenames, rng: &mut SplitMix64) -> (Vec<Row>, Vec<Case>) {
+    let mut rows = Vec::new();
+    let mut queries = Vec::new();
+
+    for i in 0..HIGH_IMPORTANCE_ROWS {
+        let key = names.next(base, rng);
+        let spanish = i % 2 == 1;
+        let (content, query) = templates::rule_frames(spanish)[(i / 2) % 2];
+        rows.push(Row {
+            ref_: format!("s-hi-{i:02}"),
+            content: templates::fill(content, &[("{key}", &key)]),
+            memory_type: "user_preference".to_string(),
+            importance: 8.0 + (i % 3) as f64,
+            lang: Some(if spanish { "es" } else { "en" }.to_string()),
+        });
+        queries.push(templates::fill(query, &[("{key}", &key)]));
+    }
+
+    let cases = queries
+        .into_iter()
+        .enumerate()
+        .map(|(i, query)| Case {
+            query,
+            corpus_refs: (0..HIGH_IMPORTANCE_POOL)
+                .map(|k| rows[(i + k) % rows.len()].ref_.clone())
+                .collect(),
+            expected_refs: vec![rows[i].ref_.clone()],
+            status: Status::Active,
+            blocked_by: None,
+            history: Vec::new(),
+            subset: Subset::HighImportance,
+        })
+        .collect();
     (rows, cases)
 }
 
@@ -401,10 +518,90 @@ mod tests {
     }
 
     #[test]
-    fn lexical_refs_use_their_own_prefix_and_the_base_stays_first() {
+    fn the_base_rows_stay_first_and_lexical_refs_use_their_own_prefix() {
         let base = grouped_base();
         let out = generate(&base, 7, &NONE).unwrap();
-        assert!(out.corpus[base.corpus.len()..].iter().all(|r| r.ref_.starts_with("s-lex-")));
+        assert_eq!(out.corpus[..base.corpus.len()], base.corpus[..]);
+        assert!(out.corpus.iter().any(|r| r.ref_.starts_with("s-lex-")));
+    }
+
+    fn cases_of(out: &Golden, subset: Subset) -> Vec<&Case> {
+        out.retrieval_cases.iter().filter(|c| c.subset == subset).collect()
+    }
+
+    fn synthetic_rows<'a>(out: &'a Golden, base: &Golden) -> &'a [Row] {
+        &out.corpus[base.corpus.len()..]
+    }
+
+    #[test]
+    fn there_are_at_least_ten_multi_reference_cases_at_any_size() {
+        let base = grouped_base();
+        for distractors in [0, 10, 500] {
+            let out = generate(&base, 7, &Sizes { distractors }).unwrap();
+            let multi = cases_of(&out, Subset::MultiRef);
+            assert!(multi.len() >= 10, "distractors={distractors}");
+            assert!(multi.iter().all(|c| c.expected_refs.len() > 1));
+        }
+    }
+
+    #[test]
+    fn every_multi_reference_expectation_is_in_the_pool_and_the_corpus() {
+        let out = generate(&grouped_base(), 7, &NONE).unwrap();
+        for case in cases_of(&out, Subset::MultiRef) {
+            for r in &case.expected_refs {
+                assert!(case.corpus_refs.contains(r), "{}", case.query);
+                row_of(&out, r);
+            }
+        }
+    }
+
+    #[test]
+    fn a_multi_reference_topic_key_lives_in_exactly_the_expected_rows() {
+        let out = generate(&grouped_base(), 7, &Sizes { distractors: 100 }).unwrap();
+        for case in cases_of(&out, Subset::MultiRef) {
+            let key = ident_of(row_of(&out, &case.expected_refs[0]));
+            assert!(case.query.contains(key), "{} lacks {key}", case.query);
+            let holders = out.corpus.iter().filter(|r| r.content.contains(key)).count();
+            assert_eq!(holders, case.expected_refs.len(), "{key}");
+        }
+    }
+
+    #[test]
+    fn there_are_enough_high_importance_rows_at_any_size() {
+        let base = grouped_base();
+        for distractors in [0, 10, 500] {
+            let out = generate(&base, 7, &Sizes { distractors }).unwrap();
+            let rows = synthetic_rows(&out, &base);
+            let high = rows.iter().filter(|r| (8.0..=10.0).contains(&r.importance)).count();
+            let tier_one = rows.iter().filter(|r| (9.0..=10.0).contains(&r.importance)).count();
+            assert!(high >= 20, "distractors={distractors}: {high}");
+            assert!(tier_one >= 10, "distractors={distractors}: {tier_one}");
+        }
+    }
+
+    #[test]
+    fn each_high_importance_case_expects_a_row_of_importance_eight_or_more() {
+        let out = generate(&grouped_base(), 7, &NONE).unwrap();
+        let cases = cases_of(&out, Subset::HighImportance);
+        assert!(cases.len() >= 20);
+        for case in cases {
+            assert_eq!(case.expected_refs.len(), 1);
+            let expected = row_of(&out, &case.expected_refs[0]);
+            assert!(expected.importance >= 8.0, "{}", case.query);
+            assert!(case.corpus_refs.contains(&case.expected_refs[0]));
+            let key = ident_of(expected);
+            assert!(case.query.contains(key));
+            assert_eq!(out.corpus.iter().filter(|r| r.content.contains(key)).count(), 1);
+        }
+    }
+
+    #[test]
+    fn the_synthetic_refs_keep_their_prefixes() {
+        let base = grouped_base();
+        let out = generate(&base, 7, &Sizes { distractors: 5 }).unwrap();
+        for prefix in ["s-dis-", "s-lex-", "s-mr-", "s-hi-"] {
+            assert!(synthetic_rows(&out, &base).iter().any(|r| r.ref_.starts_with(prefix)), "{prefix}");
+        }
     }
 
     fn base() -> Golden {
