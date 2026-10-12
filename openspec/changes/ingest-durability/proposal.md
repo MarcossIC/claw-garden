@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 | M | — (comparte bordes con data-preservation, ver abajo) | propuesta (borrador) |
+| 1 | M | — (comparte bordes con data-preservation, ver abajo) | propuesta |
 
 ## Problema
 
@@ -103,4 +103,4 @@ No cambia el esquema ni ningún dato guardado. Cambia el contrato HTTP del save 
 
 ## Design
 
-Hace falta un `design.md` corto para dos decisiones con alternativas: dónde vive el canal de respuesta (sobre vs. campo en el evento) y dónde vive el estado del embedder (un `watch` junto al `OnceCell` vs. reemplazar el `OnceCell`).
+Las decisiones con alternativas (canal de respuesta, estado del embedder, bucle de reintento, cola acotada) están en `design.md`.
