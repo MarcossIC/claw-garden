@@ -344,8 +344,10 @@ async fn knn_one(
     k: usize,
     scoring: &ScoringConfig,
     now: TimestampMs,
+    lexical_matches: &HashSet<i64>,
 ) -> Result<KnnOutcome, MemoryError> {
     let q = q_bytes.to_vec();
+    let lexical_matches = lexical_matches.clone();
     let agent = agent_id.to_string();
     let proj = project_id.map(str::to_owned);
     let scoring = *scoring;
@@ -368,14 +370,16 @@ async fn knn_one(
                 proj: &Option<String>,
                 k: usize,
                 passes: &mut usize,
+                lexical_matches: &HashSet<i64>,
             ) -> Result<Vec<RawHit>, rusqlite::Error> {
                 *passes += 1;
                 let mut stmt = c.prepare(table.sql)?;
                 let rows = stmt.query_map(
                     rusqlite::params![q, k as i64, agent, proj],
                     |row| {
+                        let id = row.get(0)?;
                         Ok(RawHit {
-                            id: row.get(0)?,
+                            id,
                             kind: table.kind,
                             content: row.get(1)?,
                             memory_type: row.get(2)?,
@@ -385,7 +389,7 @@ async fn knn_one(
                             created_at: row.get(6)?,
                             last_accessed_at: row.get(7)?,
                             importance: row.get(8)?,
-                            lexical_match: false,
+                            lexical_match: lexical_matches.contains(&id),
                         })
                     },
                 )?;
@@ -397,7 +401,7 @@ async fn knn_one(
             }
 
             let mut passes = 0usize;
-            let mut raw = run(c, table, &q, &agent, &proj, k, &mut passes)?;
+            let mut raw = run(c, table, &q, &agent, &proj, k, &mut passes, &lexical_matches)?;
             if raw.len() < k {
                 // Capped at k by the SQL's own LIMIT, so this is
                 // `min(k, eligible)` — the most this query could ever return.
@@ -407,7 +411,7 @@ async fn knn_one(
                     |row| row.get(0),
                 )?;
                 if raw.len() < reachable as usize {
-                    raw = run(c, table, &q, &agent, &proj, retry_window(k), &mut passes)?;
+                    raw = run(c, table, &q, &agent, &proj, retry_window(k), &mut passes, &lexical_matches)?;
                 }
             }
             let mut hits: Vec<RankedHit> = raw
@@ -625,6 +629,95 @@ async fn lexical_candidates(
         })
 }
 
+/// How many identifiers one query may require of a row. Unlike
+/// [`MAX_LEXICAL_TOKENS`] these come from the whole query, so an identifier
+/// typed at the end of a long question still counts.
+const MAX_IDENTIFIER_TOKENS: usize = 8;
+
+/// The tokens of `query_text` written the way names are written: letters
+/// with digits (`getUser4821`), an underscore (`E_AUTH_4821`) or a camelCase
+/// hump (`getEstadoLabel`). The embedder reads near-identical names as nearly
+/// the same text, so these are the tokens only an exact match can separate.
+/// A bare number is not one: years and counts are too common to single a row
+/// out.
+pub(crate) fn identifier_tokens(query_text: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    for token in fts_tokens(query_text) {
+        if out.len() == MAX_IDENTIFIER_TOKENS {
+            break;
+        }
+        if is_identifier(token) && !out.contains(&token) {
+            out.push(token);
+        }
+    }
+    out
+}
+
+fn is_identifier(token: &str) -> bool {
+    let has_letter = token.chars().any(char::is_alphabetic);
+    let has_digit = token.chars().any(char::is_numeric);
+    let has_hump = token.chars().zip(token.chars().skip(1)).any(|(a, b)| a.is_lowercase() && b.is_uppercase());
+    has_letter && (has_digit || token.contains('_') || has_hump)
+}
+
+// Rows holding every identifier of the query. Joined to `memory` so the
+// live-status and `deleted_at` predicates run before the `LIMIT`: a row the
+// caller cannot be shown must not use up the budget that decides whether
+// the identifier is rare enough to reward.
+const IDENTIFIER_MATCH_SQL: &str = "
+    SELECT memory_fts.rowid FROM memory_fts
+    JOIN memory m ON m.id = memory_fts.rowid
+    WHERE memory_fts MATCH ?1
+      AND m.status IN ('active', 'disputed')
+      AND m.deleted_at IS NULL
+      AND m.agent_id = ?2
+      AND (?3 IS NULL OR m.project_id = ?3 OR m.project_id IS NULL OR m.memory_type = 'user_preference')
+    LIMIT ?4
+";
+
+/// Ids of the `memory` rows that hold every identifier in `query_text`, or
+/// none at all when more rows than `budget` hold them: a name many rows share
+/// says nothing about which one is meant, and rewarding the first `budget`
+/// of them would be arbitrary. Fail-soft for the same reason as
+/// [`lexical_candidates`].
+async fn identifier_matches(
+    store: &MemoryStore,
+    query_text: &str,
+    agent_id: &str,
+    project_id: Option<&str>,
+    budget: usize,
+) -> HashSet<i64> {
+    let tokens = identifier_tokens(query_text);
+    if tokens.is_empty() {
+        return HashSet::new();
+    }
+    let match_expr = tokens.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(" AND ");
+    let budget = lexical_budget(budget);
+    let agent = agent_id.to_string();
+    let proj = project_id.map(str::to_owned);
+
+    let ids = store
+        .conn
+        .call(move |c| -> Result<Vec<i64>, rusqlite::Error> {
+            let mut stmt = c.prepare(IDENTIFIER_MATCH_SQL)?;
+            let rows = stmt.query_map(
+                rusqlite::params![match_expr, agent, proj, budget as i64 + 1],
+                |row| row.get::<_, i64>(0),
+            )?;
+            rows.collect()
+        })
+        .await
+        .unwrap_or_else(|e| {
+            log::warn!("identifier_matches: channel contributed nothing: {e}");
+            Vec::new()
+        });
+
+    if ids.len() > budget {
+        return HashSet::new();
+    }
+    ids.into_iter().collect()
+}
+
 // Second-stage scoring query for lexical candidates. The column list and
 // every predicate up to (not including) the `IN (...)` clause mirror
 // `SEARCH_SQL_MEMORY`, so the row-mapping closure and `compute_score` below
@@ -778,6 +871,7 @@ async fn score_lexical_candidates(
     ids: &[i64],
     scoring: &ScoringConfig,
     now: TimestampMs,
+    lexical_matches: &HashSet<i64>,
 ) -> Vec<RankedHit> {
     // A round-trip skipped, not a correctness fix: `m.id IN ()` is always
     // false on its own, so this guard exists only to avoid paying for a DB
@@ -790,6 +884,7 @@ async fn score_lexical_candidates(
     let proj = project_id.map(str::to_owned);
     let ids = ids.to_vec();
     let scoring = *scoring;
+    let lexical_matches = lexical_matches.clone();
 
     store
         .conn
@@ -805,8 +900,9 @@ async fn score_lexical_candidates(
             binds.extend(ids.iter().copied().map(rusqlite::types::Value::Integer));
 
             let rows = stmt.query_map(rusqlite::params_from_iter(binds), |row| {
+                let id = row.get(0)?;
                 Ok(RawHit {
-                    id: row.get(0)?,
+                    id,
                     kind: TableKind::Memory,
                     content: row.get(1)?,
                     memory_type: row.get(2)?,
@@ -816,7 +912,7 @@ async fn score_lexical_candidates(
                     created_at: row.get(6)?,
                     last_accessed_at: row.get(7)?,
                     importance: row.get(8)?,
-                    lexical_match: false,
+                    lexical_match: lexical_matches.contains(&id),
                 })
             })?;
 
@@ -888,22 +984,38 @@ async fn search_all_memories_inner(
     // independent per-row `strftime('%s','now')` calls could never guarantee.
     let now = TimestampMs::now();
 
+    // Run before the dense arms, not beside them: the bonus has to be in each
+    // row's score before `knn_one` trims a widened window back to k. All arms
+    // share one connection, so nothing ran in parallel to lose.
+    let lexical_matches = match (scope.lexical, query_text) {
+        (Some(k), Some(q)) => identifier_matches(store, q, agent_id, project_id, k).await,
+        _ => HashSet::new(),
+    };
+    // Ids are per table and only `memory` has a lexical index.
+    let no_matches = HashSet::new();
+
     let (mem, epi, pro, lex_ids) = tokio::try_join!(
         async {
             match scope.memory {
-                Some(k) => knn_one(store, KNN_MEMORY, &q_bytes, agent_id, project_id, k, scoring, now).await,
+                Some(k) => {
+                    knn_one(store, KNN_MEMORY, &q_bytes, agent_id, project_id, k, scoring, now, &lexical_matches).await
+                }
                 None => Ok(KnnOutcome::skipped()),
             }
         },
         async {
             match scope.episodic {
-                Some(k) => knn_one(store, KNN_EPISODIC, &q_bytes, agent_id, project_id, k, scoring, now).await,
+                Some(k) => {
+                    knn_one(store, KNN_EPISODIC, &q_bytes, agent_id, project_id, k, scoring, now, &no_matches).await
+                }
                 None => Ok(KnnOutcome::skipped()),
             }
         },
         async {
             match scope.procedural {
-                Some(k) => knn_one(store, KNN_PROCEDURAL, &q_bytes, agent_id, project_id, k, scoring, now).await,
+                Some(k) => {
+                    knn_one(store, KNN_PROCEDURAL, &q_bytes, agent_id, project_id, k, scoring, now, &no_matches).await
+                }
                 None => Ok(KnnOutcome::skipped()),
             }
         },
@@ -930,6 +1042,12 @@ async fn search_all_memories_inner(
     // against the merged pool would treat that coincidence as "already
     // found" and silently drop a legitimate lexical candidate.
     let dense_ids: HashSet<i64> = mem.hits.iter().map(|h| h.id).collect();
+    // An identifier match is a candidate even when the OR query left it out
+    // (past its first tokens, or outranked by bm25) and the dense arm missed it.
+    let mut lex_ids = lex_ids;
+    let mut extra: Vec<i64> = lexical_matches.iter().copied().filter(|id| !lex_ids.contains(id)).collect();
+    extra.sort_unstable();
+    lex_ids.extend(extra);
     let leftover: Vec<i64> = lex_ids.into_iter().filter(|id| !dense_ids.contains(id)).collect();
     let lexical_only = leftover.len();
 
@@ -945,7 +1063,7 @@ async fn search_all_memories_inner(
     let lex_hits = if leftover.is_empty() {
         Vec::new()
     } else {
-        score_lexical_candidates(store, &q_bytes, agent_id, project_id, &leftover, scoring, now).await
+        score_lexical_candidates(store, &q_bytes, agent_id, project_id, &leftover, scoring, now, &lexical_matches).await
     };
 
     // Built before the merge below consumes the per-table hits, which is also
@@ -1243,7 +1361,7 @@ mod tests {
         // coincidentally landed on 4". Calling the pool query directly, before
         // any merge or truncation, tests the scan set in isolation.
         assert_eq!(
-            knn_one(&store, KNN_MEMORY, &emb, "agent-test", None, 30, &ScoringConfig::DEFAULT, TimestampMs::now()).await.unwrap().hits.len(),
+            knn_one(&store, KNN_MEMORY, &emb, "agent-test", None, 30, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new()).await.unwrap().hits.len(),
             4,
             "the tier-1 row must survive inside the query, before any merge or truncation"
         );
@@ -1286,7 +1404,7 @@ mod tests {
 
         let q_bytes = serialize_f32_query(&to_unit(&q_vec).unwrap());
         assert_eq!(
-            knn_one(&store, KNN_PROCEDURAL, &q_bytes, "agent-skill", None, 5, &ScoringConfig::DEFAULT, TimestampMs::now())
+            knn_one(&store, KNN_PROCEDURAL, &q_bytes, "agent-skill", None, 5, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
                 .await
                 .unwrap()
                 .hits
@@ -1657,7 +1775,7 @@ mod tests {
         // pre-truncation pool size directly proves k_final is what cuts the
         // result, not a starved pool.
         assert_eq!(
-            knn_one(&store, KNN_MEMORY, &emb, agent, None, 30, &ScoringConfig::DEFAULT, TimestampMs::now()).await.unwrap().hits.len(),
+            knn_one(&store, KNN_MEMORY, &emb, agent, None, 30, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new()).await.unwrap().hits.len(),
             5,
             "all five must survive the query; k_final is what cuts the result, not the pool"
         );
@@ -2104,7 +2222,7 @@ mod tests {
             &store, agent, Some("P2"), "user_preference", "pref content", far,
         ).await;
 
-        let outcome = knn_one(&store, KNN_MEMORY, &near, agent, Some("P1"), 30, &ScoringConfig::DEFAULT, TimestampMs::now())
+        let outcome = knn_one(&store, KNN_MEMORY, &near, agent, Some("P1"), 30, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
             .await
             .unwrap();
 
@@ -2284,7 +2402,7 @@ mod tests {
         let emb = unit_basis_embedding();
         bulk_insert_memory_rows(&store, "agent-full", Some("P1"), 10, emb.clone()).await;
 
-        let outcome = knn_one(&store, KNN_MEMORY, &emb, "agent-full", Some("P1"), 5, &ScoringConfig::DEFAULT, TimestampMs::now())
+        let outcome = knn_one(&store, KNN_MEMORY, &emb, "agent-full", Some("P1"), 5, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
             .await
             .unwrap();
 
@@ -2306,7 +2424,7 @@ mod tests {
         let emb = unit_basis_embedding();
         bulk_insert_memory_rows(&store, "agent-small", Some("P1"), 8, emb.clone()).await;
 
-        let outcome = knn_one(&store, KNN_MEMORY, &emb, "agent-small", Some("P1"), 30, &ScoringConfig::DEFAULT, TimestampMs::now())
+        let outcome = knn_one(&store, KNN_MEMORY, &emb, "agent-small", Some("P1"), 30, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
             .await
             .unwrap();
 
@@ -2328,7 +2446,7 @@ mod tests {
         bulk_insert_memory_rows(&store, "agent-starved", Some("P2"), 100, near.clone()).await;
         let own = bulk_insert_memory_rows(&store, "agent-starved", Some("P1"), 5, far).await;
 
-        let outcome = knn_one(&store, KNN_MEMORY, &near, "agent-starved", Some("P1"), 30, &ScoringConfig::DEFAULT, TimestampMs::now())
+        let outcome = knn_one(&store, KNN_MEMORY, &near, "agent-starved", Some("P1"), 30, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
             .await
             .unwrap();
 
@@ -2362,7 +2480,7 @@ mod tests {
         bulk_insert_memory_rows(&store, "agent-trunc", Some("P2"), 10, near.clone()).await;
         bulk_insert_memory_rows(&store, "agent-trunc", Some("P1"), 50, far).await;
 
-        let outcome = knn_one(&store, KNN_MEMORY, &near, "agent-trunc", Some("P1"), 10, &ScoringConfig::DEFAULT, TimestampMs::now())
+        let outcome = knn_one(&store, KNN_MEMORY, &near, "agent-trunc", Some("P1"), 10, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
             .await
             .unwrap();
 
@@ -2399,7 +2517,7 @@ mod tests {
         bulk_insert_memory_rows(&store, "agent-telemetry", Some("P2"), 30, near.clone()).await;
         bulk_insert_memory_rows(&store, "agent-telemetry", Some("P1"), 40, far).await;
 
-        let mem = knn_one(&store, KNN_MEMORY, &near, "agent-telemetry", Some("P1"), k, &ScoringConfig::DEFAULT, TimestampMs::now())
+        let mem = knn_one(&store, KNN_MEMORY, &near, "agent-telemetry", Some("P1"), k, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
             .await
             .unwrap();
         assert_eq!(mem.passes, 2, "test setup: the window has to have been starved");
@@ -2497,7 +2615,7 @@ mod tests {
             soft_delete_keeping_vector(&store, *id).await;
         }
 
-        let outcome = knn_one(&store, KNN_MEMORY, &near, "agent-deleted", Some("P1"), 30, &ScoringConfig::DEFAULT, TimestampMs::now())
+        let outcome = knn_one(&store, KNN_MEMORY, &near, "agent-deleted", Some("P1"), 30, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
             .await
             .unwrap();
 
@@ -2537,7 +2655,7 @@ mod tests {
         let own = bulk_insert_memory_rows(&store, "agent-shared", Some("P1"), 3, near.clone()).await;
         bulk_insert_memory_rows(&store, "agent-shared", Some("P2"), 1000, far).await;
 
-        let outcome = knn_one(&store, KNN_MEMORY, &near, "agent-shared", Some("P1"), 30, &ScoringConfig::DEFAULT, TimestampMs::now())
+        let outcome = knn_one(&store, KNN_MEMORY, &near, "agent-shared", Some("P1"), 30, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
             .await
             .unwrap();
 
@@ -2615,7 +2733,7 @@ mod tests {
         ).await;
 
         let q_bytes = serialize_embedding(&unit_basis_vec());
-        let outcome = knn_one(&store, KNN_MEMORY, &q_bytes, agent, Some("P1"), 1, &ScoringConfig::DEFAULT, TimestampMs::now())
+        let outcome = knn_one(&store, KNN_MEMORY, &q_bytes, agent, Some("P1"), 1, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
             .await
             .unwrap();
 
@@ -2641,7 +2759,7 @@ mod tests {
         bulk_insert_memory_rows(&store, "agent-ceiling", Some("P2"), k, near.clone()).await;
         let own = bulk_insert_memory_rows(&store, "agent-ceiling", Some("P1"), 5, far).await;
 
-        let outcome = knn_one(&store, KNN_MEMORY, &near, "agent-ceiling", Some("P1"), k, &ScoringConfig::DEFAULT, TimestampMs::now())
+        let outcome = knn_one(&store, KNN_MEMORY, &near, "agent-ceiling", Some("P1"), k, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
             .await
             .expect("the widened window must stay bindable");
 
@@ -2677,7 +2795,7 @@ mod tests {
         }
 
         let q_bytes = serialize_embedding(&near);
-        let outcome = knn_one(&store, KNN_EPISODIC, &q_bytes, "agent-epi-retry", Some("P1"), 5, &ScoringConfig::DEFAULT, TimestampMs::now())
+        let outcome = knn_one(&store, KNN_EPISODIC, &q_bytes, "agent-epi-retry", Some("P1"), 5, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
             .await
             .unwrap();
 
@@ -2710,7 +2828,7 @@ mod tests {
         }
 
         let q_bytes = serialize_embedding(&near);
-        let outcome = knn_one(&store, KNN_PROCEDURAL, &q_bytes, "agent-pro-retry", Some("P1"), 5, &ScoringConfig::DEFAULT, TimestampMs::now())
+        let outcome = knn_one(&store, KNN_PROCEDURAL, &q_bytes, "agent-pro-retry", Some("P1"), 5, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
             .await
             .unwrap();
 
@@ -2738,8 +2856,8 @@ mod tests {
         insert_procedural_row_with_project(&store, "agent-x", Some("P1"), "skill-x", emb.clone()).await;
 
         let q_bytes = serialize_f32_query(&emb);
-        let epi = knn_one(&store, KNN_EPISODIC, &q_bytes, "agent-x", Some("P1"), 5, &ScoringConfig::DEFAULT, TimestampMs::now()).await.unwrap();
-        let pro = knn_one(&store, KNN_PROCEDURAL, &q_bytes, "agent-x", Some("P1"), 5, &ScoringConfig::DEFAULT, TimestampMs::now()).await.unwrap();
+        let epi = knn_one(&store, KNN_EPISODIC, &q_bytes, "agent-x", Some("P1"), 5, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new()).await.unwrap();
+        let pro = knn_one(&store, KNN_PROCEDURAL, &q_bytes, "agent-x", Some("P1"), 5, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new()).await.unwrap();
 
         assert_eq!(epi.hits.len(), 1);
         assert_eq!(pro.hits.len(), 1);
@@ -2971,7 +3089,7 @@ mod tests {
             None,
             &ids,
             &ScoringConfig::DEFAULT,
-            TimestampMs::now(),
+            TimestampMs::now(), &HashSet::new(),
         )
         .await;
         assert_eq!(
@@ -3136,12 +3254,12 @@ mod tests {
         let lexical_id = insert_memory_row(&store, agent, "lexical row", "chat_message", 3, 5.0, "active", emb.clone()).await;
 
         let now = TimestampMs::now();
-        let dense_hits = knn_one(&store, KNN_MEMORY, &emb, agent, None, 30, &ScoringConfig::DEFAULT, now)
+        let dense_hits = knn_one(&store, KNN_MEMORY, &emb, agent, None, 30, &ScoringConfig::DEFAULT, now, &HashSet::new())
             .await
             .unwrap();
         let dense_score = dense_hits.hits.iter().find(|h| h.id == dense_id).unwrap().score;
 
-        let lexical_hits = score_lexical_candidates(&store, &emb, agent, None, &[lexical_id], &ScoringConfig::DEFAULT, now)
+        let lexical_hits = score_lexical_candidates(&store, &emb, agent, None, &[lexical_id], &ScoringConfig::DEFAULT, now, &HashSet::new())
             .await;
         let lexical_score = lexical_hits.iter().find(|h| h.id == lexical_id).unwrap().score;
 
@@ -3165,7 +3283,7 @@ mod tests {
         }
         let requested = vec![ids[0], ids[2], ids[4]];
 
-        let hits = score_lexical_candidates(&store, &emb, agent, None, &requested, &ScoringConfig::DEFAULT, TimestampMs::now())
+        let hits = score_lexical_candidates(&store, &emb, agent, None, &requested, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
             .await;
 
         let mut returned: Vec<i64> = hits.iter().map(|h| h.id).collect();
@@ -3187,7 +3305,7 @@ mod tests {
         let id = insert_memory_row(&store, agent, "will be deleted", "chat_message", 3, 5.0, "active", emb.clone()).await;
         soft_delete_keeping_vector(&store, id).await;
 
-        let hits = score_lexical_candidates(&store, &emb, agent, None, &[id], &ScoringConfig::DEFAULT, TimestampMs::now())
+        let hits = score_lexical_candidates(&store, &emb, agent, None, &[id], &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
             .await;
 
         assert!(hits.is_empty(), "a soft-deleted memory must never be scored, even if its id reaches this query directly");
@@ -3210,7 +3328,7 @@ mod tests {
         .await;
 
         let hits = score_lexical_candidates(
-            &store, &emb, "agent-intruder", None, &[other], &ScoringConfig::DEFAULT, TimestampMs::now(),
+            &store, &emb, "agent-intruder", None, &[other], &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new(),
         )
         .await;
 
@@ -3228,7 +3346,7 @@ mod tests {
         .await;
 
         let hits = score_lexical_candidates(
-            &store, &emb, agent, None, &[superseded], &ScoringConfig::DEFAULT, TimestampMs::now(),
+            &store, &emb, agent, None, &[superseded], &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new(),
         )
         .await;
 
@@ -3251,7 +3369,7 @@ mod tests {
         .await;
 
         let hits = score_lexical_candidates(
-            &store, &emb, agent, Some("project-current"), &[pref], &ScoringConfig::DEFAULT, TimestampMs::now(),
+            &store, &emb, agent, Some("project-current"), &[pref], &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new(),
         )
         .await;
 
@@ -3266,7 +3384,7 @@ mod tests {
     async fn score_lexical_candidates_returns_empty_for_an_empty_id_list() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let emb = unit_basis_embedding();
-        let hits = score_lexical_candidates(&store, &emb, "agent-empty", None, &[], &ScoringConfig::DEFAULT, TimestampMs::now())
+        let hits = score_lexical_candidates(&store, &emb, "agent-empty", None, &[], &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
             .await;
         assert!(hits.is_empty());
     }
@@ -3415,7 +3533,7 @@ mod tests {
                         None,
                         &batch,
                         &ScoringConfig::DEFAULT,
-                        TimestampMs::now(),
+                        TimestampMs::now(), &HashSet::new(),
                     )
                     .await;
                     best = best.min(t.elapsed());
@@ -3549,7 +3667,7 @@ mod tests {
             None,
             &[farthest],
             &ScoringConfig::DEFAULT,
-            TimestampMs::now(),
+            TimestampMs::now(), &HashSet::new(),
         )
         .await;
 
@@ -3614,7 +3732,7 @@ mod tests {
             None,
             &ids,
             &ScoringConfig::DEFAULT,
-            TimestampMs::now(),
+            TimestampMs::now(), &HashSet::new(),
         )
         .await;
 
@@ -4199,5 +4317,234 @@ mod tests {
             telemetry.contains(&expected),
             "the wired telemetry line must contain exactly what the formatter renders for (dense=20, lex_only=1): {telemetry}"
         );
+    }
+
+    // ── exact identifiers ──
+
+    #[test]
+    fn identifier_tokens_keep_mixed_snake_and_camel_tokens_in_order() {
+        let tokens = identifier_tokens("qué hace getEstadoLabel con E_AUTH_4821 y getUser4821 en 2026");
+        assert_eq!(tokens, vec!["getEstadoLabel", "E_AUTH_4821", "getUser4821"]);
+    }
+
+    #[test]
+    fn identifier_tokens_skip_bare_numbers_and_plain_words() {
+        assert!(identifier_tokens("how do we deploy the importer").is_empty());
+        assert!(identifier_tokens("what changed in 2026 on page 3").is_empty());
+    }
+
+    #[test]
+    fn identifier_tokens_read_the_whole_query() {
+        let query = "the a of to in is it on at by be as or an we do so if up no parseLedger7731";
+        assert!(fts_tokens(query).count() > MAX_LEXICAL_TOKENS);
+        assert_eq!(identifier_tokens(query), vec!["parseLedger7731"]);
+    }
+
+    #[test]
+    fn identifier_tokens_are_distinct_and_capped() {
+        let query = (0..12).map(|i| format!("id{i} id{i}")).collect::<Vec<_>>().join(" ");
+        let tokens = identifier_tokens(&query);
+        assert_eq!(tokens.len(), MAX_IDENTIFIER_TOKENS);
+        assert_eq!(tokens[0], "id0");
+        assert_eq!(tokens[1], "id1");
+    }
+
+    fn without_bonus() -> ScoringConfig {
+        ScoringConfig { lexical_bonus: 0.0, ..ScoringConfig::DEFAULT }
+    }
+
+    /// Seven siblings that read like the query and carry identifiers a few
+    /// digits away from the queried one, plus the one row that holds it but
+    /// sits farther from the query vector. Returns that row's id.
+    async fn seed_identifier_family(store: &MemoryStore, agent: &str) -> i64 {
+        for digits in ["4812", "4821", "4128", "4281", "4813", "4811", "4218"] {
+            insert_memory_row(
+                store,
+                agent,
+                &format!("Helper `resolveLedger{digits}` retries the request twice."),
+                "code_block",
+                3,
+                5.0,
+                "active",
+                serialize_embedding(&vec_at_cosine(0.97)),
+            )
+            .await;
+        }
+        insert_memory_row(
+            store,
+            agent,
+            "The cleanup branch kept `resolveLedger4182` because the report still imports it.",
+            "code_block",
+            3,
+            5.0,
+            "active",
+            serialize_embedding(&vec_at_cosine(0.92)),
+        )
+        .await
+    }
+
+    async fn search_with(
+        store: &MemoryStore,
+        query: Option<&str>,
+        agent: &str,
+        scope: SearchScope,
+        scoring: &ScoringConfig,
+    ) -> Vec<RankedHit> {
+        search_all_memories_inner(store, &unit_basis_vec(), query, agent, scope, 10, scoring)
+            .await
+            .unwrap()
+            .0
+    }
+
+    fn scores(hits: &[RankedHit]) -> Vec<(i64, u64)> {
+        hits.iter().map(|h| (h.id, h.score.to_bits())).collect()
+    }
+
+    #[tokio::test]
+    async fn an_exact_identifier_outranks_its_closer_siblings() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let agent = "agent-identifier-family";
+        let expected = seed_identifier_family(&store, agent).await;
+        let query = Some("where is resolveLedger4182 used");
+
+        let control = search_with(&store, query, agent, SearchScope::all_default(), &without_bonus()).await;
+        assert_ne!(control[0].id, expected, "without the bonus the closer siblings must win");
+
+        let hits = search_with(&store, query, agent, SearchScope::all_default(), &ScoringConfig::DEFAULT).await;
+        assert_eq!(hits[0].id, expected, "the row holding the queried identifier must rank first");
+    }
+
+    #[tokio::test]
+    async fn an_identifier_past_the_sixteenth_token_still_reaches_its_row() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let near = unit_basis_vec();
+        let agent = "agent-late-identifier";
+        bulk_insert_memory_rows(&store, agent, None, 20, serialize_embedding(&near)).await;
+        let m_id = insert_memory_row(
+            &store,
+            agent,
+            "kept parseLedger7731 on the old path",
+            "chat_message",
+            3,
+            5.0,
+            "active",
+            serialize_embedding(&far_vec(&near)),
+        )
+        .await;
+        let query = "the a of to in is it on at by be as or an we do so if up no parseLedger7731";
+        assert!(fts_tokens(query).count() > MAX_LEXICAL_TOKENS);
+
+        let scope = SearchScope { memory: Some(20), episodic: None, procedural: None, ..SearchScope::all_default() };
+        let hits = search_all_memories_inner(&store, &near, Some(query), agent, scope, 25, &ScoringConfig::DEFAULT)
+            .await
+            .unwrap()
+            .0;
+
+        let m = hits.iter().find(|h| h.id == m_id).expect("the identifier's row must be a candidate");
+        assert!(m.score > 0.0, "a far row holding the identifier must score above zero, got {}", m.score);
+    }
+
+    #[tokio::test]
+    async fn no_bonus_without_the_lexical_channel_or_query_text() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let agent = "agent-identifier-off";
+        seed_identifier_family(&store, agent).await;
+        let query = Some("where is resolveLedger4182 used");
+        let off = SearchScope { lexical: None, ..SearchScope::all_default() };
+
+        let with = search_with(&store, query, agent, off.clone(), &ScoringConfig::DEFAULT).await;
+        let without = search_with(&store, query, agent, off, &without_bonus()).await;
+        assert_eq!(scores(&with), scores(&without), "channel off");
+
+        let with = search_with(&store, None, agent, SearchScope::all_default(), &ScoringConfig::DEFAULT).await;
+        let without = search_with(&store, None, agent, SearchScope::all_default(), &without_bonus()).await;
+        assert_eq!(scores(&with), scores(&without), "no query text");
+    }
+
+    async fn seed_shared_identifier(store: &MemoryStore, agent: &str, count: usize) {
+        for i in 0..count {
+            insert_memory_row(
+                store,
+                agent,
+                &format!("note {i} about getUser42"),
+                "chat_message",
+                3,
+                5.0,
+                "active",
+                serialize_embedding(&vec_at_cosine(0.95)),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn an_identifier_shared_by_more_rows_than_the_budget_gives_no_bonus() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let agent = "agent-shared-identifier";
+        let scope = SearchScope { lexical: Some(20), ..SearchScope::all_default() };
+
+        seed_shared_identifier(&store, agent, 20).await;
+        let with = search_with(&store, Some("getUser42"), agent, scope.clone(), &ScoringConfig::DEFAULT).await;
+        let without = search_with(&store, Some("getUser42"), agent, scope.clone(), &without_bonus()).await;
+        assert_ne!(scores(&with), scores(&without), "twenty rows still fit the budget and get the bonus");
+
+        seed_shared_identifier(&store, agent, 1).await;
+        let with = search_with(&store, Some("getUser42"), agent, scope.clone(), &ScoringConfig::DEFAULT).await;
+        let without = search_with(&store, Some("getUser42"), agent, scope, &without_bonus()).await;
+        assert_eq!(scores(&with), scores(&without), "twenty-one rows do not single anything out");
+    }
+
+    #[tokio::test]
+    async fn a_query_without_identifiers_scores_exactly_as_without_the_bonus() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let agent = "agent-natural-query";
+        seed_identifier_family(&store, agent).await;
+        let query = Some("which helper retries the request twice");
+
+        let with = search_with(&store, query, agent, SearchScope::all_default(), &ScoringConfig::DEFAULT).await;
+        let without = search_with(&store, query, agent, SearchScope::all_default(), &without_bonus()).await;
+        assert!(!with.is_empty());
+        assert_eq!(scores(&with), scores(&without));
+    }
+
+    #[tokio::test]
+    async fn rows_the_caller_cannot_see_neither_match_nor_count_against_the_budget() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed_shared_identifier(&store, "agent-other", 21).await;
+        let deleted = insert_memory_row(
+            &store, "agent-own", "deleted getUser42", "chat_message", 3, 5.0, "active",
+            serialize_embedding(&vec_at_cosine(0.95)),
+        )
+        .await;
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE memory SET status = 'superseded' WHERE id = ?1", params![deleted]))
+            .await
+            .unwrap();
+        let own = insert_memory_row(
+            &store, "agent-own", "own note about getUser42", "chat_message", 3, 5.0, "active",
+            serialize_embedding(&vec_at_cosine(0.95)),
+        )
+        .await;
+        let scope = SearchScope { lexical: Some(1), ..SearchScope::all_default() };
+
+        let with = search_with(&store, Some("getUser42"), "agent-own", scope.clone(), &ScoringConfig::DEFAULT).await;
+        let without = search_with(&store, Some("getUser42"), "agent-own", scope, &without_bonus()).await;
+        let score_of = |hits: &[RankedHit]| hits.iter().find(|h| h.id == own).map(|h| h.score).unwrap();
+        assert!(score_of(&with) > score_of(&without), "the caller's only visible match gets the bonus");
+    }
+
+    #[tokio::test]
+    async fn a_failing_identifier_query_leaves_the_search_unboosted() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let agent = "agent-identifier-failsoft";
+        seed_identifier_family(&store, agent).await;
+        store.conn.call(|c| c.execute("DROP TABLE memory_fts", [])).await.unwrap();
+        let query = Some("where is resolveLedger4182 used");
+
+        let with = search_with(&store, query, agent, SearchScope::all_default(), &ScoringConfig::DEFAULT).await;
+        let without = search_with(&store, query, agent, SearchScope::all_default(), &without_bonus()).await;
+        assert!(!with.is_empty());
+        assert_eq!(scores(&with), scores(&without));
     }
 }
