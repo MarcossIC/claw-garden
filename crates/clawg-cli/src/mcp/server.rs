@@ -475,7 +475,7 @@ impl ClawgMcp {
             Ok(c) => c,
             Err(failure) => return Ok(failure),
         };
-        match client.delete(&args.kind, args.id).await {
+        match client.delete(&args.kind, args.id, None).await {
             Ok(n) => Self::ok(format!("deleted {n}")),
             Err(e) => Self::failed(Self::explain(&e)),
         }
@@ -489,7 +489,7 @@ impl ClawgMcp {
             Ok(c) => c,
             Err(failure) => return Ok(failure),
         };
-        match client.resolve(args.keep, args.other, args.keep_both.unwrap_or(false)).await {
+        match client.resolve(args.keep, args.other, args.keep_both.unwrap_or(false), None).await {
             Ok(resolution) => Self::ok(format_resolution(&resolution)),
             Err(e) => Self::failed(Self::explain(&e)),
         }

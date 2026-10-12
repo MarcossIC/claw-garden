@@ -904,6 +904,73 @@ async fn resolve_rows_without_a_dispute_conflict() {
 }
 
 #[tokio::test]
+async fn delete_with_another_agent_is_404_and_keeps_the_row() {
+    let h = Harness::start().await;
+    h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "agent-http" })).await;
+    let id = h.wait_for_rows("memory", 1).await[0]["id"].as_i64().expect("id");
+
+    let r = h
+        .authed(h.http.delete(h.url(&format!("/v1/memories/memory/{id}?agent=agent-other"))))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(r.status(), 404, "another agent's row reads as missing");
+    let (_, row) = h.get_json(&format!("/v1/memories/memory/{id}")).await;
+    assert!(row["item"]["deleted_at"].is_null(), "{row}");
+
+    let r = h
+        .authed(h.http.delete(h.url(&format!("/v1/memories/memory/{id}?agent=agent-http"))))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(r.status(), 200, "the owner can delete it");
+}
+
+#[tokio::test]
+async fn patch_with_another_agent_is_404_and_keeps_the_importance() {
+    let h = Harness::start().await;
+    h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "agent-http" })).await;
+    let item = h.wait_for_rows("memory", 1).await.remove(0);
+    let id = item["id"].as_i64().expect("id");
+
+    let r = h
+        .authed(h.http.patch(h.url(&format!("/v1/memories/memory/{id}?agent=agent-other"))))
+        .json(&json!({ "importance": 9.5 }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(r.status(), 404);
+    let (_, row) = h.get_json(&format!("/v1/memories/memory/{id}")).await;
+    assert_eq!(row["item"]["importance"], item["importance"], "{row}");
+
+    let r = h
+        .authed(h.http.patch(h.url(&format!("/v1/memories/memory/{id}?agent=agent-http"))))
+        .json(&json!({ "importance": 9.5 }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(r.status(), 200);
+}
+
+#[tokio::test]
+async fn resolve_with_another_agent_is_404_and_changes_nothing() {
+    let h = Harness::start().await;
+    let (old, new) = seed_dispute(&h).await;
+
+    let (status, body) = h
+        .post_json("/v1/disputes/resolve", json!({ "keep": new, "other": old, "agent_id": "agent-other" }))
+        .await;
+    assert_eq!(status, 404, "{body}");
+    let (_, row) = h.get_json(&format!("/v1/memories/memory/{new}")).await;
+    assert_eq!(row["item"]["status"], "disputed", "{row}");
+
+    let (status, body) = h
+        .post_json("/v1/disputes/resolve", json!({ "keep": new, "other": old, "agent_id": "agent-http" }))
+        .await;
+    assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test]
 async fn backup_endpoint_writes_a_manual_snapshot() {
     let h = Harness::start().await;
     h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "agent-http" })).await;

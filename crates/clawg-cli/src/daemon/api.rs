@@ -348,6 +348,17 @@ pub struct StatsQuery {
     pub project: Option<String>,
 }
 
+/// Which agent a change acts for. Absent, the change is the store owner's and
+/// reaches any row; present, another agent's row is answered as missing.
+/// Strict for the same reason as [`ListQuery`]: a misspelt `agent` would
+/// quietly lift the scope.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerQuery {
+    #[serde(default)]
+    pub agent: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ImportanceRequest {
     pub importance: f64,
@@ -453,6 +464,9 @@ pub struct ResolveRequest {
     /// Both rows stand instead of `other` being superseded by `keep`.
     #[serde(default)]
     pub keep_both: bool,
+    /// Scopes the resolution to this agent's rows, as [`OwnerQuery`] does.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 // ── Router ──────────────────────────────────────────────────────────────────
@@ -780,16 +794,17 @@ async fn get_memory(
 async fn patch_importance(
     State(app): State<Arc<AppCtx>>,
     Path((kind, id)): Path<(String, i64)>,
+    Query(owner): Query<OwnerQuery>,
     Json(body): Json<ImportanceRequest>,
 ) -> ApiResult<Json<UpdatedBody>> {
     let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
-    let updated = set_importance_core(&app.runtime.store, id, kind, body.importance, None)
+    let updated = set_importance_core(&app.runtime.store, id, kind, body.importance, owner.agent.as_deref())
         .await
         .map_err(ApiError::internal)?;
 
-    // The core answers 0 for "no such row" and for "already soft-deleted"
-    // alike, and from the caller's side those are the same fact: the row it
-    // named is not there to change.
+    // The core answers 0 for "no such row", "already soft-deleted" and
+    // "another agent's" alike, and from the caller's side those are the same
+    // fact: the row it named is not there to change.
     if updated == 0 {
         return Err(ApiError::not_found(format!("no {kind:?} row with id {id}")));
     }
@@ -799,9 +814,10 @@ async fn patch_importance(
 async fn delete_memory(
     State(app): State<Arc<AppCtx>>,
     Path((kind, id)): Path<(String, i64)>,
+    Query(owner): Query<OwnerQuery>,
 ) -> ApiResult<Json<DeletedBody>> {
     let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
-    let deleted = delete_memory_core(&app.runtime.store, id, kind, None)
+    let deleted = delete_memory_core(&app.runtime.store, id, kind, owner.agent.as_deref())
         .await
         .map_err(ApiError::internal)?;
 
@@ -816,7 +832,7 @@ async fn resolve_dispute(
     Json(body): Json<ResolveRequest>,
 ) -> ApiResult<Json<Resolution>> {
     let outcome = if body.keep_both { Outcome::KeepBoth } else { Outcome::Supersede };
-    resolve_dispute_core(&app.runtime.store, body.keep, body.other, outcome, None)
+    resolve_dispute_core(&app.runtime.store, body.keep, body.other, outcome, body.agent_id.as_deref())
         .await
         .map(Json)
         .map_err(|e| match e {
