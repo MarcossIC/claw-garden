@@ -660,12 +660,27 @@ fn is_identifier(token: &str) -> bool {
     has_letter && (has_digit || token.contains('_') || has_hump)
 }
 
+/// Whether `content` holds `identifier` as written: same characters, any
+/// case, not glued to a longer name. FTS5 splits on `_`, so `"user_id"` is a
+/// phrase that also matches `user id` and `user-id`; this is the check that
+/// tells those apart.
+fn holds_identifier(content: &str, identifier: &str) -> bool {
+    let content = content.to_lowercase();
+    let identifier = identifier.to_lowercase();
+    let is_name_char = |c: char| c.is_alphanumeric() || c == '_';
+    content.match_indices(&identifier).any(|(at, _)| {
+        let before = content[..at].chars().next_back();
+        let after = content[at + identifier.len()..].chars().next();
+        !before.is_some_and(is_name_char) && !after.is_some_and(is_name_char)
+    })
+}
+
 // Rows holding every identifier of the query. Joined to `memory` so the
 // live-status and `deleted_at` predicates run before the `LIMIT`: a row the
 // caller cannot be shown must not use up the budget that decides whether
 // the identifier is rare enough to reward.
 const IDENTIFIER_MATCH_SQL: &str = "
-    SELECT memory_fts.rowid FROM memory_fts
+    SELECT memory_fts.rowid, m.content FROM memory_fts
     JOIN memory m ON m.id = memory_fts.rowid
     WHERE memory_fts MATCH ?1
       AND m.status IN ('active', 'disputed')
@@ -696,13 +711,18 @@ async fn identifier_matches(
     let agent = agent_id.to_string();
     let proj = project_id.map(str::to_owned);
 
-    let ids = store
+    // The phrase can match rows that only split the name, so the window is
+    // wider than the budget: those rows are dropped below and must not crowd
+    // out the ones that hold it. Past the window the rows cannot all be
+    // checked, and no bonus is the safe answer.
+    let window = MAX_LEXICAL_CANDIDATES;
+    let rows = store
         .conn
-        .call(move |c| -> Result<Vec<i64>, rusqlite::Error> {
+        .call(move |c| -> Result<Vec<(i64, String)>, rusqlite::Error> {
             let mut stmt = c.prepare(IDENTIFIER_MATCH_SQL)?;
             let rows = stmt.query_map(
-                rusqlite::params![match_expr, agent, proj, budget as i64 + 1],
-                |row| row.get::<_, i64>(0),
+                rusqlite::params![match_expr, agent, proj, window as i64 + 1],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )?;
             rows.collect()
         })
@@ -711,7 +731,16 @@ async fn identifier_matches(
             log::warn!("identifier_matches: channel contributed nothing: {e}");
             Vec::new()
         });
+    if rows.len() > window {
+        return HashSet::new();
+    }
 
+    let split_by_fts: Vec<&str> = tokens.into_iter().filter(|t| t.contains('_')).collect();
+    let ids: Vec<i64> = rows
+        .into_iter()
+        .filter(|(_, content)| split_by_fts.iter().all(|t| holds_identifier(content, t)))
+        .map(|(id, _)| id)
+        .collect();
     if ids.len() > budget {
         return HashSet::new();
     }
@@ -4532,6 +4561,39 @@ mod tests {
         let without = search_with(&store, Some("getUser42"), "agent-own", scope, &without_bonus()).await;
         let score_of = |hits: &[RankedHit]| hits.iter().find(|h| h.id == own).map(|h| h.score).unwrap();
         assert!(score_of(&with) > score_of(&without), "the caller's only visible match gets the bonus");
+    }
+
+    #[test]
+    fn an_underscore_identifier_is_held_only_as_written() {
+        assert!(holds_identifier("we keep `user_id` in the row", "user_id"));
+        assert!(holds_identifier("USER_ID is the key", "user_id"));
+        assert!(!holds_identifier("the user id is the key", "user_id"));
+        assert!(!holds_identifier("the user-id is the key", "user_id"));
+        assert!(!holds_identifier("the old_user_id stays", "user_id"));
+        assert!(!holds_identifier("the user_id2 stays", "user_id"));
+    }
+
+    #[tokio::test]
+    async fn words_split_like_an_underscore_identifier_neither_match_nor_use_the_budget() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let agent = "agent-snake-case";
+        for i in 0..25 {
+            let split = if i % 2 == 0 { "snake case" } else { "snake-case" };
+            let content = format!("note {i} in {split}");
+            insert_memory_row(
+                &store, agent, &content, "chat_message", 3, 5.0, "active",
+                serialize_embedding(&vec_at_cosine(0.95)),
+            )
+            .await;
+        }
+        let own = insert_memory_row(
+            &store, agent, "rename it to snake_case", "chat_message", 3, 5.0, "active",
+            serialize_embedding(&vec_at_cosine(0.95)),
+        )
+        .await;
+
+        let matches = identifier_matches(&store, "snake_case", agent, None, 20).await;
+        assert_eq!(matches, HashSet::from([own]));
     }
 
     #[tokio::test]
