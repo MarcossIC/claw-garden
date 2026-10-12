@@ -16,23 +16,44 @@ use crate::memory::chunker::{
 };
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::events::{MemoryEvent, MemorySource};
-use crate::memory::store_insert::{MemoryStoreError, NewMemoryRecord};
+use crate::memory::store_insert::NewMemoryRecord;
 use crate::memory::MemoryStore;
 
-/// Worker-internal error type. Only used for logging via `warn!`.
-/// All variants are recoverable — the worker loop never exits on error.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum MemoryWorkerError {
-    #[error("embed failed: {0}")]
-    Embed(#[from] EmbedError),
-    #[error("store insert failed: {0}")]
-    Store(#[from] MemoryStoreError),
-    /// Reserved for a future code-chunker enhancement that surfaces an
-    /// explicit "0 chunks produced" signal; currently the worker silently
-    /// continues past an empty chunk list.
-    #[allow(dead_code)]
-    #[error("chunker produced 0 chunks for non-empty content")]
-    EmptyChunks,
+/// What happened to one chunk that reached the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkOutcome {
+    /// A new row was written.
+    Inserted,
+    /// The dedup gate absorbed the chunk into an existing row.
+    Reinforced,
+}
+
+/// One chunk of an event that is in the store, with the row that holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SavedChunk {
+    pub id: i64,
+    pub outcome: ChunkOutcome,
+}
+
+/// Why an event stopped before all of its chunks reached the store. Every
+/// cause is recoverable: the worker loop never exits on one.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum IngestFailure {
+    #[error("the embedder is not available")]
+    EmbedderUnavailable,
+    #[error("{0}")]
+    Failed(String),
+}
+
+/// What one event wrote, in chunk order, and the failure that stopped it.
+///
+/// Both halves at once rather than a `Result`: a failure part-way through a
+/// multi-chunk event leaves earlier chunks written, and the caller needs
+/// their ids to clean up or retry only the rest.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IngestReport {
+    pub memories: Vec<SavedChunk>,
+    pub failure: Option<IngestFailure>,
 }
 
 /// Backlog size at which the ingest channel is worth reporting. Events are
@@ -113,8 +134,8 @@ fn collapse_duplicate_chunks(chunks: Vec<Chunk>) -> Vec<PendingChunk> {
 /// so any embed failure loses that whole event rather than the failing chunk
 /// alone: the batch API returns a single result with no per-item outcome to
 /// salvage, and the failures it reports (model session, tokenizer) apply to
-/// every text in the call anyway. An insert failure stays isolated to its own
-/// chunk and the event's remaining chunks continue.
+/// every text in the call anyway. An insert failure stops the event there, so
+/// what is stored is always a prefix of the text, never one with a hole.
 /// Exits cleanly when all `Sender`s are dropped (app shutdown).
 pub async fn memory_worker(
     mut rx: UnboundedReceiver<MemoryEvent>,
@@ -157,7 +178,7 @@ pub async fn memory_worker(
             );
             continue;
         }
-        if let Err(e) = process_event(
+        let report = process_event(
             &evt,
             &store,
             &embedder_cell,
@@ -165,10 +186,11 @@ pub async fn memory_worker(
             &code_chunker,
             &mut absorbed_duplicates,
         )
-        .await
-        {
+        .await;
+        if let Some(e) = &report.failure {
             log::warn!(
-                "ingest event dropped (agent={}, role={:?}): {e}",
+                "ingest event stopped after {} stored chunks (agent={}, role={:?}): {e}",
+                report.memories.len(),
                 evt.agent_id,
                 evt.role
             );
@@ -205,8 +227,8 @@ async fn wait_for_embedder(
     true
 }
 
-/// Runs the write-border dedup gate for one chunk hash. `true` means the
-/// chunk was absorbed into an existing row and must not be inserted.
+/// Runs the write-border dedup gate for one chunk hash. `Some(id)` means the
+/// chunk was absorbed into row `id` and must not be inserted.
 ///
 /// A repeated chunk reinforces the existing memory instead of inserting
 /// another row: `access_count += 1` promotes the tier through
@@ -227,7 +249,7 @@ async fn absorb_duplicate(
     evt: &MemoryEvent,
     content_hash: &str,
     absorbed: &mut u64,
-) -> bool {
+) -> Option<i64> {
     match store
         .reinforce_if_duplicate(&evt.agent_id, evt.project_id.as_deref(), content_hash, evt.timestamp_ms)
         .await
@@ -238,15 +260,15 @@ async fn absorb_duplicate(
                 "ingest absorbed duplicate (agent={}, memory_id={id}) absorbed_total={absorbed}",
                 evt.agent_id
             );
-            true
+            Some(id)
         }
-        Ok(None) => false,
+        Ok(None) => None,
         Err(e) => {
             // Fail open: a lookup failure degrades to embed+insert, the
             // behaviour from before the gate existed, rather than dropping
             // the chunk.
             log::warn!("dedup lookup failed (agent={}): {e}; falling through to embed", evt.agent_id);
-            false
+            None
         }
     }
 }
@@ -258,7 +280,7 @@ async fn process_event(
     chat_chunker: &Arc<ChatChunker>,
     code_chunker: &Arc<CodeChunker>,
     absorbed: &mut u64,
-) -> Result<(), MemoryWorkerError> {
+) -> IngestReport {
     // Source-first: Compaction-sourced events bypass select_chunker (and thus
     // the Role::System→Skip rule that ordinarily drops system-authored
     // content from ingestion) entirely — they always chunk via ChatChunker,
@@ -272,13 +294,13 @@ async fn process_event(
         match kind {
             ChunkerKind::Chat => chat_chunker.chunk(&evt.content, CHUNK_MAX_TOKENS),
             ChunkerKind::Code => code_chunker.chunk(&evt.content, None),
-            ChunkerKind::Skip => return Ok(()),
+            ChunkerKind::Skip => return IngestReport::default(),
         }
     };
 
     if chunks.is_empty() {
         // Content was all-whitespace or empty after chunker policy. Not an error.
-        return Ok(());
+        return IngestReport::default();
     }
 
     // `memory_worker` holds events until the embedder is loaded, so this only
@@ -291,25 +313,34 @@ async fn process_event(
             chunks.len(),
             evt.agent_id
         );
-        return Ok(());
+        return IngestReport { memories: vec![], failure: Some(IngestFailure::EmbedderUnavailable) };
     };
 
     // Stage 1 — gate. Every chunk passes the hash gate before anything is
     // embedded; a collapsed entry absorbed by the gate is charged once per
     // copy it stood for, which is what the same copies arriving one at a
     // time would have done.
-    let mut survivors: Vec<PendingChunk> = Vec::new();
-    for pending in collapse_duplicate_chunks(chunks) {
-        if absorb_duplicate(store, evt, &pending.content_hash, absorbed).await {
+    // `stored[i]` is what the i-th collapsed chunk became, so the report keeps
+    // chunk order even though absorbed chunks are settled before the rest.
+    let pending_chunks = collapse_duplicate_chunks(chunks);
+    let mut stored: Vec<Option<SavedChunk>> = vec![None; pending_chunks.len()];
+    let mut survivors: Vec<(usize, PendingChunk)> = Vec::new();
+    for (position, pending) in pending_chunks.into_iter().enumerate() {
+        if let Some(id) = absorb_duplicate(store, evt, &pending.content_hash, absorbed).await {
             for _ in 1..pending.multiplicity {
                 absorb_duplicate(store, evt, &pending.content_hash, absorbed).await;
             }
+            stored[position] = Some(SavedChunk { id, outcome: ChunkOutcome::Reinforced });
             continue;
         }
-        survivors.push(pending);
+        survivors.push((position, pending));
     }
+    let report = |stored: Vec<Option<SavedChunk>>, failure| IngestReport {
+        memories: stored.into_iter().flatten().collect(),
+        failure,
+    };
     if survivors.is_empty() {
-        return Ok(());
+        return report(stored, None);
     }
 
     // Stage 2 — one inference call for the whole event. Passage: a stored
@@ -318,27 +349,28 @@ async fn process_event(
     // with no second inference call, so both sides of `contradiction.rs`'s
     // comparison live in the same Passage space `CONTRADICTION_THRESHOLD`
     // was tuned against.
-    let texts: Vec<String> = survivors.iter().map(|p| p.chunk.text.clone()).collect();
+    let texts: Vec<String> = survivors.iter().map(|(_, p)| p.chunk.text.clone()).collect();
     let vectors = match embedder.embed_batch(&texts, EmbedRole::Passage).await {
         Ok(v) => v,
         Err(EmbedError::NotReady) | Err(EmbedError::WorkerGone) => {
-            log::warn!("embedder became unavailable (agent={}); dropping {} chunks", evt.agent_id, survivors.len());
-            return Ok(());
+            return report(stored, Some(IngestFailure::EmbedderUnavailable));
         }
         Err(e) => {
-            log::warn!("embed batch failed (agent={}): {e}; dropping {} chunks", evt.agent_id, survivors.len());
-            return Ok(());
+            return report(stored, Some(IngestFailure::Failed(format!("embed failed: {e}"))));
         }
     };
     if vectors.len() != survivors.len() {
         // Zipping a short reply would pair chunks with other chunks'
         // vectors and store the mismatch as fact. Dropping the event is
         // recoverable; a silently mislabeled memory is not.
-        log::warn!(
-            "embedder returned {} vectors for {} chunks (agent={}); dropping the event",
-            vectors.len(), survivors.len(), evt.agent_id
+        return report(
+            stored,
+            Some(IngestFailure::Failed(format!(
+                "embedder returned {} vectors for {} chunks",
+                vectors.len(),
+                survivors.len()
+            ))),
         );
-        return Ok(());
     }
 
     // Stage 3 — sequential, one chunk at a time: chunk N's contradiction
@@ -353,7 +385,7 @@ async fn process_event(
     // only a claim-bearing candidate (currently written only by the
     // extractor, one row at a time, never through this multi-chunk path)
     // would let a test observe it end-to-end.
-    for (pending, vec) in survivors.into_iter().zip(vectors) {
+    for ((position, pending), vec) in survivors.into_iter().zip(vectors) {
         let PendingChunk { chunk, content_hash, multiplicity } = pending;
         // The contradiction hook runs between embed and insert: it needs the
         // freshly computed embedding to find near-duplicate candidates via
@@ -366,17 +398,20 @@ async fn process_event(
         if !disputed.is_empty() {
             record.disputed_against = Some(disputed);
         }
-        if let Err(e) = store.insert_memory_with_vector(record, vec).await {
-            log::warn!("insert_memory_with_vector failed (agent={}): {e}", evt.agent_id);
-            continue; // nothing was written, so there is nothing to reinforce
-        }
+        let id = match store.insert_memory_with_vector(record, vec).await {
+            Ok(id) => id,
+            Err(e) => {
+                return report(stored, Some(IngestFailure::Failed(format!("store insert failed: {e}"))));
+            }
+        };
+        stored[position] = Some(SavedChunk { id, outcome: ChunkOutcome::Inserted });
         // The extra copies now find the row this iteration just wrote and
         // take the same branch a copy from a later event takes.
         for _ in 1..multiplicity {
             absorb_duplicate(store, evt, &content_hash, absorbed).await;
         }
     }
-    Ok(())
+    report(stored, None)
 }
 
 /// Resolves the shared tokenizer exactly once and builds the chat chunker
@@ -1257,17 +1292,153 @@ mod tests {
         let evt = make_event(Role::User, "counter fixture content", None, 1);
 
         process_event(&evt, &store, &cell, &chat_chunker, &code_chunker, &mut absorbed)
-            .await
-            .unwrap();
+            .await;
         assert_eq!(absorbed, 0, "the first send has no prior row to reinforce");
 
         process_event(&evt, &store, &cell, &chat_chunker, &code_chunker, &mut absorbed)
-            .await
-            .unwrap();
+            .await;
         assert_eq!(
             absorbed, 1,
             "the second identical send must be absorbed by the dedup gate, incrementing the counter"
         );
+    }
+
+    // ── The report of what an event wrote and where it stopped ──────────────
+
+    /// Embeds like `FakeEmbedder` except at one batch position, which comes
+    /// back NaN: the store rejects a non-finite vector, so the insert of
+    /// exactly that chunk fails while the chunks around it are valid.
+    struct NanAtEmbedder {
+        position: usize,
+    }
+    #[async_trait::async_trait]
+    impl Embedder for NanAtEmbedder {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+            FakeEmbedder::default().embed_with_role(text, role).await
+        }
+        async fn embed_batch(&self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
+            let mut out = FakeEmbedder::default().embed_batch(texts, role).await?;
+            if let Some(v) = out.get_mut(self.position) {
+                *v = vec![f32::NAN; 384];
+            }
+            Ok(out)
+        }
+        fn dimensions(&self) -> usize { 384 }
+        fn model_id(&self) -> &str { "nan-at" }
+        fn query_prefix(&self) -> &str { "" }
+        fn passage_prefix(&self) -> &str { "" }
+    }
+
+    /// Distinct words, so no two windows of the fallback chunker collapse.
+    fn distinct_text(words: usize) -> String {
+        (0..words).map(|i| format!("w{i:05}")).collect::<Vec<_>>().join(" ")
+    }
+
+    async fn process_with(embedder: Arc<dyn Embedder>, store: &Arc<MemoryStore>, evt: &MemoryEvent) -> IngestReport {
+        let cell: OnceCell<Arc<dyn Embedder>> = OnceCell::new();
+        cell.set(embedder).ok();
+        let chat_chunker = Arc::new(ChatChunker::with_fallback());
+        let code_chunker = Arc::new(CodeChunker::new());
+        let mut absorbed = 0;
+        process_event(evt, store, &Arc::new(cell), &chat_chunker, &code_chunker, &mut absorbed).await
+    }
+
+    fn chunk_count(content: &str) -> usize {
+        ChatChunker::with_fallback().chunk(content, CHUNK_MAX_TOKENS).len()
+    }
+
+    #[tokio::test]
+    async fn process_event_reports_the_rows_written_before_an_insert_failed() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let content = distinct_text(400);
+        assert_eq!(chunk_count(&content), 2, "fixture must split into two chunks");
+        let evt = make_event(Role::User, &content, None, 1);
+
+        let report = process_with(Arc::new(NanAtEmbedder { position: 1 }), &store, &evt).await;
+
+        assert!(matches!(report.failure, Some(IngestFailure::Failed(_))), "got {:?}", report.failure);
+        let first_id: i64 = store.conn
+            .call(|c| c.query_row("SELECT id FROM memory", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(report.memories, vec![SavedChunk { id: first_id, outcome: ChunkOutcome::Inserted }]);
+    }
+
+    #[tokio::test]
+    async fn process_event_stops_at_the_first_failed_insert() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let content = distinct_text(700);
+        assert_eq!(chunk_count(&content), 3, "fixture must split into three chunks");
+        let evt = make_event(Role::User, &content, None, 1);
+
+        let report = process_with(Arc::new(NanAtEmbedder { position: 1 }), &store, &evt).await;
+
+        assert!(report.failure.is_some());
+        assert_eq!(report.memories.len(), 1);
+        assert_eq!(count_memory(&store).await, 1, "the chunk after the failed one must not be inserted");
+    }
+
+    #[tokio::test]
+    async fn process_event_reports_reinforced_with_the_existing_id() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let evt = make_event(Role::User, "the train leaves on tuesdays", None, 1);
+
+        let first = process_with(Arc::new(FakeEmbedder::default()), &store, &evt).await;
+        let second = process_with(Arc::new(FakeEmbedder::default()), &store, &evt).await;
+
+        assert_eq!(first.failure, None);
+        assert_eq!(first.memories.len(), 1);
+        assert_eq!(first.memories[0].outcome, ChunkOutcome::Inserted);
+        assert_eq!(
+            second,
+            IngestReport {
+                memories: vec![SavedChunk { id: first.memories[0].id, outcome: ChunkOutcome::Reinforced }],
+                failure: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_embed_batch_reports_the_failure_and_no_rows() {
+        struct FailingBatch;
+        #[async_trait::async_trait]
+        impl Embedder for FailingBatch {
+            async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+                Err(EmbedError::InferenceFailed("boom".into()))
+            }
+            fn dimensions(&self) -> usize { 384 }
+            fn model_id(&self) -> &str { "failing" }
+            fn query_prefix(&self) -> &str { "" }
+            fn passage_prefix(&self) -> &str { "" }
+        }
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let evt = make_event(Role::User, "hello", None, 1);
+
+        let report = process_with(Arc::new(FailingBatch), &store, &evt).await;
+
+        assert!(report.memories.is_empty());
+        assert!(matches!(report.failure, Some(IngestFailure::Failed(ref d)) if d.contains("boom")), "got {:?}", report.failure);
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_embedder_reports_embedder_unavailable() {
+        struct Gone;
+        #[async_trait::async_trait]
+        impl Embedder for Gone {
+            async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+                Err(EmbedError::WorkerGone)
+            }
+            fn dimensions(&self) -> usize { 384 }
+            fn model_id(&self) -> &str { "gone" }
+            fn query_prefix(&self) -> &str { "" }
+            fn passage_prefix(&self) -> &str { "" }
+        }
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let evt = make_event(Role::User, "hello", None, 1);
+
+        let report = process_with(Arc::new(Gone), &store, &evt).await;
+
+        assert_eq!(report, IngestReport { memories: vec![], failure: Some(IngestFailure::EmbedderUnavailable) });
     }
 
     // ── Regression: the System→Skip guard still applies to non-Compaction events ──
@@ -1654,8 +1825,7 @@ mod tests {
         let evt = make_event(Role::User, &content, None, 1);
 
         process_event(&evt, &store, &cell, &chat_chunker, &code_chunker, &mut absorbed)
-            .await
-            .unwrap();
+            .await;
 
         let rows = count_memory(&store).await;
         assert_eq!(rows, 1, "two identical chunks in one event must insert exactly one row; got {rows}");
@@ -1687,8 +1857,7 @@ mod tests {
         let mut absorbed: u64 = 0;
         let seed_evt = make_event(Role::User, &"x".repeat(1920), None, 1);
         process_event(&seed_evt, &store, &cell, &chat_chunker, &code_chunker, &mut absorbed)
-            .await
-            .unwrap();
+            .await;
         assert_eq!(absorbed, 0, "seed insert has no prior row to reinforce");
         assert_eq!(count_memory(&store).await, 1);
 
@@ -1700,8 +1869,7 @@ mod tests {
         absorbed = 0;
         let dup_evt = make_event(Role::User, &"x".repeat(3584), None, 2);
         process_event(&dup_evt, &store, &cell, &chat_chunker, &code_chunker, &mut absorbed)
-            .await
-            .unwrap();
+            .await;
 
         assert_eq!(
             absorbed, 2,
