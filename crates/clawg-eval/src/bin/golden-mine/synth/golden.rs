@@ -57,6 +57,7 @@ pub enum Subset {
     Lexical,
     MultiRef,
     HighImportance,
+    LowImportance,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -107,6 +108,16 @@ mod tests {
         golden.retrieval_cases[0].subset = Subset::MultiRef;
         let json = serde_json::to_value(&golden).unwrap();
         assert_eq!(json["retrieval_cases"][0]["subset"], "multi_ref");
+    }
+
+    #[test]
+    fn the_low_importance_subset_round_trips_by_its_snake_case_name() {
+        let mut golden: Golden = serde_json::from_str(MINIMAL).unwrap();
+        golden.retrieval_cases[0].subset = Subset::LowImportance;
+        let text = serde_json::to_string(&golden).unwrap();
+        assert!(text.contains("\"subset\":\"low_importance\""));
+        let back: Golden = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.retrieval_cases[0].subset, Subset::LowImportance);
     }
 
     #[test]

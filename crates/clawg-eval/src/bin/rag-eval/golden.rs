@@ -83,6 +83,7 @@ pub enum CaseSubset {
     Lexical,
     MultiRef,
     HighImportance,
+    LowImportance,
 }
 
 impl CaseSubset {
@@ -94,6 +95,7 @@ impl CaseSubset {
             Self::Lexical => "lexical",
             Self::MultiRef => "multi_ref",
             Self::HighImportance => "high_importance",
+            Self::LowImportance => "low_importance",
         }
     }
 }
@@ -357,6 +359,7 @@ mod tests {
             ("lexical", CaseSubset::Lexical),
             ("multi_ref", CaseSubset::MultiRef),
             ("high_importance", CaseSubset::HighImportance),
+            ("low_importance", CaseSubset::LowImportance),
         ] {
             let golden = parse_only(&case_with(&format!(r#", "subset": "{name}""#)));
             assert_eq!(golden.retrieval_cases[0].subset, want, "{name}");
