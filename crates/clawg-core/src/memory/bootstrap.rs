@@ -13,7 +13,9 @@
 //! download failure, contract mismatch, and the progress-forwarder pipeline —
 //! is assertable in-process. [`production_deps`] builds the real three.
 
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use once_cell::sync::OnceCell;
 use tokio::sync::watch;
@@ -68,6 +70,21 @@ pub fn classify(error: &BootstrapError) -> RetryDecision {
             RetryDecision::Retry
         }
     }
+}
+
+/// Wait after the first failed attempt; each later failure doubles it.
+const RETRY_BASE_DELAY: Duration = Duration::from_secs(30);
+/// Longest wait between attempts: an offline machine still recovers within
+/// half an hour of the network coming back, without retrying every minute
+/// for days.
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(30 * 60);
+
+/// How long to wait after the `attempt`-th failed attempt (1-based):
+/// `min(30 s · 2^(attempt-1), 30 min)`, saturating instead of overflowing.
+pub fn retry_delay(attempt: u32) -> Duration {
+    2u32.checked_pow(attempt.saturating_sub(1))
+        .and_then(|factor| RETRY_BASE_DELAY.checked_mul(factor))
+        .map_or(RETRY_MAX_DELAY, |d| d.min(RETRY_MAX_DELAY))
 }
 
 /// Translate a backend [`DownloadProgress`] into the wire-shape
@@ -385,6 +402,51 @@ pub async fn run_embedder_bootstrap(
     sink.emit_event(final_event);
     status.send_replace(new_status);
     outcome
+}
+
+/// Runs [`run_embedder_bootstrap`] until it succeeds or fails for good.
+///
+/// A download, load or verification failure is retried after
+/// [`retry_delay`], forever: a machine that was offline at startup gets
+/// memory as soon as the network returns, without a restart. A contract
+/// mismatch stops the loop (see [`classify`]). `sleep` is the wait itself,
+/// injected so tests run without waiting; production passes
+/// `tokio::time::sleep`.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_embedder_bootstrap_with_retry<S, F>(
+    base_dir: std::path::PathBuf,
+    embedder_cell: Arc<OnceCell<Arc<dyn Embedder>>>,
+    status: watch::Sender<EmbedderStatus>,
+    sink: Arc<dyn EmbedderEventSink>,
+    ensure: EnsureModelFn,
+    load: LoadEmbedderFn,
+    verify: ContractVerifyFn,
+    sleep: S,
+) where
+    S: Fn(Duration) -> F,
+    F: Future<Output = ()>,
+{
+    let mut attempt: u32 = 0;
+    loop {
+        attempt = attempt.saturating_add(1);
+        let result = run_embedder_bootstrap(
+            base_dir.clone(),
+            embedder_cell.clone(),
+            status.clone(),
+            sink.clone(),
+            ensure.clone(),
+            load.clone(),
+            verify.clone(),
+        )
+        .await;
+        let Err(error) = result else { return };
+        if classify(&error) == RetryDecision::GiveUp {
+            return;
+        }
+        let delay = retry_delay(attempt);
+        log::info!("embedder bootstrap attempt {attempt} failed; retrying in {}s", delay.as_secs());
+        sleep(delay).await;
+    }
 }
 
 // ============================================================================
@@ -1178,5 +1240,105 @@ mod tests {
         assert_eq!(classify(&BootstrapError::Load("x".into())), RetryDecision::Retry);
         assert_eq!(classify(&BootstrapError::Verify("x".into())), RetryDecision::Retry);
         assert_eq!(classify(&BootstrapError::Mismatch("x".into())), RetryDecision::GiveUp);
+    }
+
+    // ---------- retry ----------
+
+    #[test]
+    fn retry_delay_doubles_from_30s_and_caps_at_30min() {
+        let secs = |n| retry_delay(n).as_secs();
+        assert_eq!(secs(1), 30);
+        assert_eq!(secs(2), 60);
+        assert_eq!(secs(3), 120);
+        assert_eq!(secs(6), 960);
+        assert_eq!(secs(7), 1800);
+        assert_eq!(secs(40), 1800);
+        assert_eq!(secs(u32::MAX), 1800);
+    }
+
+    /// Records each requested wait and the status visible during it, and
+    /// returns at once so the test does not sleep.
+    fn recording_sleep(
+        status: watch::Receiver<EmbedderStatus>,
+    ) -> (Arc<Mutex<Vec<(std::time::Duration, EmbedderStatus)>>>, impl Fn(std::time::Duration) -> futures::future::Ready<()>) {
+        let waits = Arc::new(Mutex::new(Vec::new()));
+        let recorded = waits.clone();
+        let sleep = move |d| {
+            recorded.lock().unwrap().push((d, status.borrow().clone()));
+            futures::future::ready(())
+        };
+        (waits, sleep)
+    }
+
+    #[tokio::test]
+    async fn a_failed_download_is_retried_until_it_succeeds() {
+        let cell: Arc<OnceCell<Arc<dyn Embedder>>> = Arc::new(OnceCell::new());
+        let status = watch::Sender::new(EmbedderStatus::Loading);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let ensure: EnsureModelFn = Arc::new(move |_base, _progress| {
+            let n = counted.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if n == 0 {
+                    Err(DownloadError::RetryExhausted { file: "connection refused".into(), attempts: 3 })
+                } else {
+                    Ok(empty_model_files())
+                }
+            })
+        });
+        let (waits, sleep) = recording_sleep(status.subscribe());
+
+        run_embedder_bootstrap_with_retry(
+            std::env::temp_dir(),
+            cell.clone(),
+            status.clone(),
+            Arc::new(MockSink::default()),
+            ensure,
+            fake_load(),
+            accept_contract(),
+            sleep,
+        )
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(cell.get().is_some());
+        assert_eq!(*status.borrow(), EmbedderStatus::Ready);
+        let waits = waits.lock().unwrap().clone();
+        assert_eq!(waits.len(), 1);
+        assert_eq!(waits[0].0, std::time::Duration::from_secs(30));
+        assert!(
+            matches!(waits[0].1, EmbedderStatus::Failed { retryable: true, .. }),
+            "the wait must show a retryable failure, got {:?}",
+            waits[0].1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_contract_mismatch_is_never_retried() {
+        let cell: Arc<OnceCell<Arc<dyn Embedder>>> = Arc::new(OnceCell::new());
+        let status = watch::Sender::new(EmbedderStatus::Loading);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let ensure: EnsureModelFn = Arc::new(move |_base, _progress| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(empty_model_files()) })
+        });
+        let (waits, sleep) = recording_sleep(status.subscribe());
+
+        run_embedder_bootstrap_with_retry(
+            std::env::temp_dir(),
+            cell.clone(),
+            status.clone(),
+            Arc::new(MockSink::default()),
+            ensure,
+            fake_load(),
+            mismatch_verify(),
+            sleep,
+        )
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(waits.lock().unwrap().is_empty());
+        assert!(matches!(&*status.borrow(), EmbedderStatus::Failed { retryable: false, .. }));
     }
 }
