@@ -36,6 +36,7 @@ pub mod migrations;
 pub mod project;
 pub mod model_download;
 pub mod record;
+pub mod redact;
 
 pub use db::MemoryStore;
 pub use error::MemoryError;
