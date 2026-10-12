@@ -50,6 +50,7 @@ mod tests {
             (6, "content_hash", 13406404950456231160),
             (7, "drop_all_memories_view", 13752469436407078502),
             (8, "memory_fts", 11218029035149072530),
+            (9, "project", 13889070755435575427),
         ];
         let mut actual: Vec<(i32, String, u64)> = runner()
             .get_migrations()
