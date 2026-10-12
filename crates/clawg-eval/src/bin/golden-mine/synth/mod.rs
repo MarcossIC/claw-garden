@@ -132,32 +132,39 @@ fn lexical_families(base: &Golden, rng: &mut SplitMix64) -> (Vec<Row>, Vec<Case>
             IdentKind::ErrorCode => format!("E_{}_", rng.pick(&templates::ERROR_AREAS)),
         };
 
-        let mut refs = Vec::with_capacity(SIBLINGS_PER_FAMILY);
-        let mut idents = Vec::with_capacity(SIBLINGS_PER_FAMILY);
-        for sibling in 0..SIBLINGS_PER_FAMILY {
-            let ident = loop {
-                let candidate = format!("{stem}{}", 1000 + rng.below(9000));
-                let taken = used.iter().any(|u| u.contains(&candidate) || candidate.contains(u.as_str()))
-                    || base.corpus.iter().any(|r| r.content.contains(&candidate));
-                if !taken {
-                    break candidate;
-                }
-            };
-            used.push(ident.clone());
+        let taken = |candidate: &str| {
+            used.iter().any(|u| u.contains(candidate) || candidate.contains(u.as_str()))
+                || base.corpus.iter().any(|r| r.content.contains(candidate))
+        };
+        let (seed_ident, near) = loop {
+            let digits = (1000 + rng.below(9000)).to_string();
+            let seed_ident = format!("{stem}{digits}");
+            if taken(&seed_ident) {
+                continue;
+            }
+            let near = near_identifiers(&stem, &digits, SIBLINGS_PER_FAMILY - 1, rng, &taken);
+            if near.len() == SIBLINGS_PER_FAMILY - 1 {
+                break (seed_ident, near);
+            }
+        };
+        let expected = rng.below(SIBLINGS_PER_FAMILY);
+        let mut idents = near;
+        idents.insert(expected, seed_ident);
+        used.extend(idents.iter().cloned());
 
+        let mut refs = Vec::with_capacity(SIBLINGS_PER_FAMILY);
+        for (sibling, ident) in idents.iter().enumerate() {
             let ref_ = format!("s-lex-{family:02}-{sibling}");
             rows.push(Row {
                 ref_: ref_.clone(),
-                content: templates::fill(frame.content, &[("{id}", &ident)]),
+                content: templates::fill(frame.content, &[("{id}", ident)]),
                 memory_type: frame.memory_type.to_string(),
                 importance: 5.0,
                 lang: Some(if spanish { "es" } else { "en" }.to_string()),
             });
             refs.push(ref_);
-            idents.push(ident);
         }
 
-        let expected = rng.below(SIBLINGS_PER_FAMILY);
         cases.push(Case {
             query: templates::fill(frame.query, &[("{id}", &idents[expected])]),
             corpus_refs: refs.clone(),
@@ -169,6 +176,56 @@ fn lexical_families(base: &Golden, rng: &mut SplitMix64) -> (Vec<Row>, Vec<Case>
         });
     }
     (rows, cases)
+}
+
+/// Identifiers that look like `{stem}{digits}` without being it: the same four
+/// digits in another order, or the last digit one step away. At most `n` come
+/// back, fewer when the digits have too few neighbours; `taken` rules out any
+/// candidate the corpus already holds.
+fn near_identifiers(
+    stem: &str,
+    digits: &str,
+    n: usize,
+    rng: &mut SplitMix64,
+    taken: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    let original: Vec<u8> = digits.bytes().collect();
+    let mut candidates: Vec<Vec<u8>> = Vec::new();
+    permutations(&mut original.clone(), 0, &mut candidates);
+    let last = original.len() - 1;
+    for step in [1i8, -1] {
+        let moved = original[last] as i16 - b'0' as i16 + step as i16;
+        if (0..=9).contains(&moved) {
+            let mut next = original.clone();
+            next[last] = b'0' + moved as u8;
+            candidates.push(next);
+        }
+    }
+    candidates.retain(|c| *c != original);
+    candidates.sort();
+    candidates.dedup();
+
+    for i in (1..candidates.len()).rev() {
+        candidates.swap(i, rng.below(i + 1));
+    }
+    candidates
+        .into_iter()
+        .map(|c| format!("{stem}{}", String::from_utf8_lossy(&c)))
+        .filter(|id| !taken(id))
+        .take(n)
+        .collect()
+}
+
+fn permutations(items: &mut Vec<u8>, from: usize, out: &mut Vec<Vec<u8>>) {
+    if from == items.len() {
+        out.push(items.clone());
+        return;
+    }
+    for i in from..items.len() {
+        items.swap(from, i);
+        permutations(items, from + 1, out);
+        items.swap(from, i);
+    }
 }
 
 /// Two-word names that tag a topic, handed out once each and never one that
@@ -523,6 +580,57 @@ mod tests {
         let out = generate(&base, 7, &NONE).unwrap();
         assert_eq!(out.corpus[..base.corpus.len()], base.corpus[..]);
         assert!(out.corpus.iter().any(|r| r.ref_.starts_with("s-lex-")));
+    }
+
+    fn digits_are_near(original: &str, candidate: &str) -> bool {
+        let mut a: Vec<char> = original.chars().collect();
+        let mut b: Vec<char> = candidate.chars().collect();
+        let last_step = (original.as_bytes()[3] as i32 - candidate.as_bytes()[3] as i32).abs() == 1
+            && original[..3] == candidate[..3];
+        a.sort_unstable();
+        b.sort_unstable();
+        a == b || last_step
+    }
+
+    #[test]
+    fn near_identifiers_share_the_prefix_and_keep_the_digits_close() {
+        let mut rng = SplitMix64::new(7);
+        let ids = near_identifiers("hydrateJournal", "6105", 7, &mut rng, &|_| false);
+        assert_eq!(ids.len(), 7);
+        let unique: HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), 7);
+        for id in &ids {
+            assert_ne!(id, "hydrateJournal6105");
+            let digits = id.strip_prefix("hydrateJournal").expect("same prefix");
+            assert_eq!(digits.len(), 4);
+            assert!(digits_are_near("6105", digits), "{id}");
+        }
+    }
+
+    #[test]
+    fn near_identifiers_are_deterministic_for_a_seed() {
+        let a = near_identifiers("E_CACHE_", "3698", 7, &mut SplitMix64::new(3), &|_| false);
+        let b = near_identifiers("E_CACHE_", "3698", 7, &mut SplitMix64::new(3), &|_| false);
+        let c = near_identifiers("E_CACHE_", "3698", 7, &mut SplitMix64::new(4), &|_| false);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn a_taken_identifier_is_skipped_for_the_next_candidate() {
+        let mut rng = SplitMix64::new(7);
+        let first = near_identifiers("E_CACHE_", "3698", 7, &mut rng, &|_| false);
+        let banned = first[0].clone();
+        let again = near_identifiers("E_CACHE_", "3698", 7, &mut SplitMix64::new(7), &|c| c == banned);
+        assert_eq!(again.len(), 7);
+        assert!(!again.contains(&banned));
+    }
+
+    #[test]
+    fn digits_with_few_neighbours_give_fewer_identifiers_than_asked() {
+        let ids = near_identifiers("E_CACHE_", "1111", 7, &mut SplitMix64::new(7), &|_| false);
+        let set: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        assert_eq!(set, HashSet::from(["E_CACHE_1110", "E_CACHE_1112"]));
     }
 
     fn cases_of(out: &Golden, subset: Subset) -> Vec<&Case> {
