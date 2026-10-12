@@ -64,7 +64,7 @@ MCP tools (`crates/clawg-cli/src/mcp/server.rs`): `save_memory`, `search_memory`
 cargo test --workspace
 ```
 
-Current baseline: 1566 tests, 0 failed.
+Current baseline (Windows): 1691 tests, 5 failed, all in `crates/clawg-core/tests/project_root.rs` (they expect paths without the `\\?\` prefix `canonicalize` adds on Windows).
 
 On Windows, live `clawg.exe` processes (for example the editor's MCP bridge) lock `target\debug\clawg.exe` and make the build fail. Use a separate target directory instead: `cargo test --workspace --target-dir <other-dir>`.
 

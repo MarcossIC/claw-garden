@@ -2,15 +2,15 @@ change: storage-safety-net
 objective: "cross-cutting: user data is never lost"
 scope: "parts B + C of the data-preservation exploration"
 depends_on: [data-preservation]
-phase: verify
+phase: archived
 artifacts:
-  exploration: done  # changes/archive/2026-10-12-data-preservation/exploration.md
+  exploration: done  # archive/2026-10-12-data-preservation/exploration.md
   proposal: done
   spec: done
   design: done
   tasks: done
   apply: done
-  verify: partial  # verify.md: R9 and the manual run need Windows
-  archive: pending
+  verify: done  # Linux and Windows, see verify.md
+  archive: done
 main_spec: openspec/specs/storage/spec.md
 updated: 2026-10-12
