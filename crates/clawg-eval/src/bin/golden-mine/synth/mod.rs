@@ -110,10 +110,11 @@ fn distractors(vocab: &Vocab, rng: &mut SplitMix64, count: usize) -> Vec<Row> {
         .collect()
 }
 
-/// Families of rows that differ only in one identifier, each with a question
-/// that names the identifier of one member. With eight siblings a random
-/// ranking would still miss the expected row from the top five often enough
-/// for recall to separate a lexical match from a dense guess.
+/// Families of eight rows, each with a question that names the identifier of
+/// one member. The seven siblings read like the question and carry identifiers
+/// a few digits apart from the queried one; the member that holds the queried
+/// identifier mentions it in passing, so only an exact-token match can single
+/// it out.
 fn lexical_families(base: &Golden, rng: &mut SplitMix64) -> (Vec<Row>, Vec<Case>) {
     let mut used: Vec<String> = Vec::new();
     let mut rows = Vec::new();
@@ -123,6 +124,7 @@ fn lexical_families(base: &Golden, rng: &mut SplitMix64) -> (Vec<Row>, Vec<Case>
         let kind = if family % 2 == 0 { IdentKind::Function } else { IdentKind::ErrorCode };
         let spanish = (family / 2) % 2 == 1;
         let frame = rng.pick(templates::lexical_frames(kind, spanish));
+        let mention = *rng.pick(templates::mention_frames(kind, spanish));
         let stem = match kind {
             IdentKind::Function => format!(
                 "{}{}",
@@ -155,9 +157,10 @@ fn lexical_families(base: &Golden, rng: &mut SplitMix64) -> (Vec<Row>, Vec<Case>
         let mut refs = Vec::with_capacity(SIBLINGS_PER_FAMILY);
         for (sibling, ident) in idents.iter().enumerate() {
             let ref_ = format!("s-lex-{family:02}-{sibling}");
+            let content = if sibling == expected { mention } else { frame.content };
             rows.push(Row {
                 ref_: ref_.clone(),
-                content: templates::fill(frame.content, &[("{id}", ident)]),
+                content: templates::fill(content, &[("{id}", ident)]),
                 memory_type: frame.memory_type.to_string(),
                 importance: 5.0,
                 lang: Some(if spanish { "es" } else { "en" }.to_string()),
@@ -560,16 +563,43 @@ mod tests {
     }
 
     #[test]
-    fn siblings_differ_from_the_expected_row_only_in_the_identifier() {
+    fn the_expected_row_uses_a_mention_frame_and_its_siblings_the_queried_frame() {
         let out = generate(&grouped_base(), 7, &NONE).unwrap();
+        let shape = |row: &Row| row.content.replace(ident_of(row), "{id}");
         for case in lexical_cases(&out) {
             let expected = row_of(&out, &case.expected_refs[0]);
-            let shape = expected.content.replace(ident_of(expected), "ID");
-            for r in &case.corpus_refs {
+            let spanish = expected.lang.as_deref() == Some("es");
+            let kinds = [IdentKind::Function, IdentKind::ErrorCode];
+            let in_mentions = |row: &Row| kinds.iter().any(|k| templates::mention_frames(*k, spanish).contains(&shape(row).as_str()));
+            let lexical_of = |row: &Row| -> Option<&'static templates::LexicalFrame> {
+                kinds.iter().flat_map(|k| templates::lexical_frames(*k, spanish)).find(|f| f.content == shape(row))
+            };
+            assert!(in_mentions(expected), "{}", expected.content);
+
+            let queried = lexical_of(row_of(&out, case.corpus_refs.iter().find(|r| **r != case.expected_refs[0]).unwrap()))
+                .expect("siblings use a lexical frame");
+            assert_eq!(case.query, templates::fill(queried.query, &[("{id}", ident_of(expected))]));
+            for r in case.corpus_refs.iter().filter(|r| **r != case.expected_refs[0]) {
                 let sibling = row_of(&out, r);
-                assert_eq!(sibling.content.replace(ident_of(sibling), "ID"), shape);
+                assert_eq!(shape(sibling), queried.content);
                 assert_eq!(sibling.memory_type, expected.memory_type);
                 assert_eq!(sibling.lang, expected.lang);
+            }
+        }
+    }
+
+    #[test]
+    fn siblings_carry_identifiers_near_the_queried_one() {
+        let out = generate(&grouped_base(), 7, &NONE).unwrap();
+        for case in lexical_cases(&out) {
+            let queried = ident_of(row_of(&out, &case.expected_refs[0]));
+            let split = queried.len() - 4;
+            let (stem, digits) = queried.split_at(split);
+            for r in case.corpus_refs.iter().filter(|r| **r != case.expected_refs[0]) {
+                let sibling = ident_of(row_of(&out, r));
+                assert_ne!(sibling, queried);
+                let tail = sibling.strip_prefix(stem).unwrap_or_else(|| panic!("{sibling} vs {stem}"));
+                assert!(digits_are_near(digits, tail), "{sibling} vs {queried}");
             }
         }
     }

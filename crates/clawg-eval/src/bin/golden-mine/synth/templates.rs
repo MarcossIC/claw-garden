@@ -133,6 +133,30 @@ pub fn lexical_frames(kind: IdentKind, spanish: bool) -> &'static [LexicalFrame]
     }
 }
 
+/// Sentences that mention an identifier while talking about something else,
+/// so the row that holds the queried identifier does not read like the
+/// question and a purely semantic match prefers its siblings.
+pub fn mention_frames(kind: IdentKind, spanish: bool) -> &'static [&'static str] {
+    match (kind, spanish) {
+        (IdentKind::Function, false) => &[
+            "While moving the importer behind the feature flag we left the call to `{id}` on the old path, so the nightly job still goes through it.",
+            "The cleanup branch dropped the unused exports but kept `{id}` in place, since the report generator still imports it.",
+        ],
+        (IdentKind::Function, true) => &[
+            "Al mover el importador detrás del feature flag dejamos la llamada a `{id}` en el camino viejo, así que el job nocturno sigue pasando por ahí.",
+            "La rama de limpieza eliminó las exportaciones sin uso pero conservó `{id}`, porque el generador de reportes todavía lo importa.",
+        ],
+        (IdentKind::ErrorCode, false) => &[
+            "During Tuesday's deploy the queue worker logged `{id}` twice; rolling back the schema change made it go away.",
+            "Support forwarded a screenshot of the dashboard where `{id}` showed up next to the failed export, just before the weekend freeze.",
+        ],
+        (IdentKind::ErrorCode, true) => &[
+            "En el deploy del martes el worker de la cola registró `{id}` dos veces; revertir el cambio de esquema lo hizo desaparecer.",
+            "Soporte reenvió una captura del tablero donde `{id}` aparecía junto a la exportación fallida, justo antes del congelamiento del fin de semana.",
+        ],
+    }
+}
+
 /// Aspects of one topic, each stored as its own row. A question about the
 /// topic is answered by all of them.
 pub fn topic_aspects(spanish: bool) -> &'static [&'static str] {
@@ -253,6 +277,24 @@ mod tests {
                 for frame in lexical_frames(kind, spanish) {
                     assert!(frame.content.contains("`{id}`"), "{}", frame.content);
                     assert!(frame.query.contains("{id}"), "{}", frame.query);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mention_frames_name_the_identifier_in_a_frame_no_lexical_row_uses() {
+        for kind in [IdentKind::Function, IdentKind::ErrorCode] {
+            for spanish in [false, true] {
+                let mentions = mention_frames(kind, spanish);
+                assert!(mentions.len() >= 2, "{kind:?} {spanish}");
+                for mention in mentions {
+                    assert_eq!(mention.matches("{id}").count(), 1, "{mention}");
+                    assert!(mention.contains("`{id}`"), "{mention}");
+                    assert!(
+                        lexical_frames(kind, spanish).iter().all(|f| f.content != *mention),
+                        "{mention}"
+                    );
                 }
             }
         }
