@@ -26,12 +26,13 @@ pub const MAX_PENDING_LIMIT: u32 = 100;
 pub const CONCLUSIONS_LIMIT: u32 = 20;
 
 /// A live `memory` row that is not a conclusion and that no live conclusion
-/// was drawn from. A deleted or superseded conclusion stops covering its
-/// sources, so they become pending again.
+/// of the same agent was drawn from. A deleted or superseded conclusion stops
+/// covering its sources, so they become pending again; one by another agent
+/// never covered them, since this agent cannot see it.
 const PENDING: &str = "deleted_at IS NULL AND status <> 'superseded' \
      AND NOT EXISTS (SELECT 1 FROM memory_derivation d WHERE d.memory_id = memory.id) \
      AND NOT EXISTS (SELECT 1 FROM memory_derivation d JOIN memory c ON c.id = d.memory_id \
-                     WHERE d.source_id = memory.id \
+                     WHERE d.source_id = memory.id AND c.agent_id IS memory.agent_id \
                        AND c.deleted_at IS NULL AND c.status <> 'superseded')";
 
 const CONCLUSION: &str = "deleted_at IS NULL AND status <> 'superseded' \
@@ -321,6 +322,28 @@ mod tests {
 
         assert_eq!(ids(&here.pending), vec![mine]);
         assert_eq!(ids(&everywhere.pending), vec![nobodys, theirs, mine]);
+    }
+
+    #[tokio::test]
+    async fn another_agents_conclusion_does_not_cover_a_memory() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let mine = seed_as(&store, "a", Some("p"), "mine", 1).await;
+        let theirs = seed_as(&store, "b", Some("p"), "their conclusion", 2).await;
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO memory_derivation (memory_id, source_id, created_at) VALUES (?1, ?2, 0)",
+                    [theirs, mine],
+                )
+            })
+            .await
+            .unwrap();
+        let as_a = SynthesisParams { agent_id: Some("a".into()), ..in_project("p") };
+
+        let found = synthesis_core(&store, as_a, TimestampMs::from_unix_millis(10)).await.unwrap();
+
+        assert_eq!(ids(&found.pending), vec![mine], "a conclusion the agent cannot see covers nothing for it");
     }
 
     #[tokio::test]
