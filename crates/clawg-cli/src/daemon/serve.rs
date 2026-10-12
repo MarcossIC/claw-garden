@@ -85,6 +85,7 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
     tokio::spawn(run_embedder_bootstrap(
         base_dir.clone(),
         runtime.embedder.clone(),
+        runtime.embedder_status.clone(),
         Arc::new(LogSink),
         ensure,
         load,

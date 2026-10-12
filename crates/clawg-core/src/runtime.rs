@@ -19,8 +19,10 @@ use std::sync::Arc;
 
 use once_cell::sync::OnceCell;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::watch;
 
 use crate::memory::access::AccessTracker;
+use crate::memory::bootstrap::EmbedderStatus;
 use crate::memory::chunker::CodeChunker;
 use crate::memory::embedder::Embedder;
 use crate::memory::store_lock::StoreHolder;
@@ -64,6 +66,9 @@ pub struct MemoryRuntime {
     /// safe outcome anyway: every vector already stored belongs to the old
     /// model's space and mixing the two silently corrupts similarity.
     pub embedder: Arc<OnceCell<Arc<dyn Embedder>>>,
+    /// What the bootstrap last said about the embedder. The bootstrap gets a
+    /// clone of this sender; readers use [`MemoryRuntime::embedder_status`].
+    pub embedder_status: watch::Sender<EmbedderStatus>,
     /// Shared tokenizer for query-context composition, filled by the ingest
     /// worker's setup step from the same `tokenizer.json` the chat chunker
     /// loads — so the two can never disagree about what a "token" is. Empty at
@@ -108,6 +113,7 @@ impl MemoryRuntime {
                 store,
                 memory_tx,
                 embedder: Arc::new(OnceCell::new()),
+                embedder_status: watch::Sender::new(EmbedderStatus::Loading),
                 tokenizer: Arc::new(OnceCell::new()),
                 access_tracker,
             },
@@ -163,6 +169,11 @@ impl MemoryRuntime {
         self.embedder.get().is_some()
     }
 
+    /// Whether the embedder is loading, ready or failed, and why it failed.
+    pub fn embedder_status(&self) -> EmbedderStatus {
+        self.embedder_status.borrow().clone()
+    }
+
     /// In-memory runtime for tests: no disk I/O, and the embedder cell
     /// PRE-SEEDED with `FakeEmbedder`.
     ///
@@ -211,6 +222,8 @@ impl MemoryRuntime {
                 store,
                 memory_tx,
                 embedder: Arc::new(embedder),
+                // The cell is seeded above, so the embedder is already usable.
+                embedder_status: watch::Sender::new(EmbedderStatus::Ready),
                 tokenizer: Arc::new(OnceCell::new()),
                 access_tracker,
             },
@@ -323,6 +336,7 @@ mod tests {
             .await
             .expect("open");
         assert!(!rt.embedder_ready());
+        assert_eq!(rt.embedder_status(), EmbedderStatus::Loading);
         assert!(rt.tokenizer.get().is_none());
     }
 
@@ -374,6 +388,7 @@ mod tests {
         let tmp = tmp_base();
         let (rt, _rx) = MemoryRuntime::new_for_test(tmp.path().to_path_buf()).await;
         assert!(rt.embedder_ready(), "the cell must be pre-seeded");
+        assert_eq!(rt.embedder_status(), EmbedderStatus::Ready);
         assert_eq!(
             rt.embedder.get().expect("seeded").model_id(),
             "fake-embedder"
@@ -440,6 +455,7 @@ mod tests {
             store,
             memory_tx,
             embedder,
+            embedder_status: _,
             tokenizer,
             access_tracker: _,
         } = rt;
