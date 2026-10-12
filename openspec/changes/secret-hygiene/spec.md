@@ -109,16 +109,17 @@ La lectura MUST hacerse en sólo lectura, sin el lock y sin migrar, de modo que 
 3. tomar el lock del store (titular `Maintenance`); si lo tiene el daemon, fallar diciendo que se pare con `clawg stop`;
 4. exigir que el plan de esquema sea `UpToDate`; con `Pending`, fallar diciendo que se arranque el daemon una vez para migrar; con `Newer` o `Diverged`, los errores de siempre;
 5. si la fila no existe, fallar con un error que nombra el id;
-6. con `secure_delete` activo, en una transacción: si la fila está viva, liberar las filas que la disputaban (como el delete); borrar su vector y la fila (el trigger del FTS resta sus términos si estaba viva);
+6. en una transacción: borrar su vector y la fila (el trigger del FTS resta sus términos si estaba viva) y, si estaba viva, liberar las filas que la disputaban (como el delete);
 7. compactar el índice FTS (`optimize`), para que ni la fila ni sus marcas de borrado queden en ningún segmento;
-8. `wal_checkpoint(TRUNCATE)`; si no se completa, fallar diciendo que la base está ocupada.
+8. `VACUUM`, para que ninguna página libre conserve una copia vieja;
+9. `wal_checkpoint(TRUNCATE)`; si no se completa, fallar diciendo que la base está ocupada.
 
 MUST NOT hacer snapshot previo. MUST NOT estar disponible como herramienta MCP ni por la API HTTP.
 
 #### Escenario: fila viva
 - GIVEN una base con 300 filas y una viva con `the vault passphrase is zebra-quokka-7741`
 - WHEN se purga
-- THEN la fila, su vector y su entrada del FTS no existen, una búsqueda FTS por `quokka` no devuelve nada, y los bytes `quokka` no están en `memory.db` ni en `memory.db-wal`
+- THEN la fila, su vector y su entrada del FTS no existen, una búsqueda FTS por `quokka` no devuelve nada, los bytes `quokka` no están en `memory.db` ni en `memory.db-wal`, y una búsqueda KNN sobre otra fila la sigue encontrando
 
 #### Escenario: fila ya borrada
 - GIVEN la misma fila, borrada antes con el delete

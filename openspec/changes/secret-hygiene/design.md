@@ -1,6 +1,6 @@
 # secret-hygiene — Diseño
 
-Hay design porque las cuatro decisiones abiertas de la exploración tienen alternativas reales, y la purga tiene un detalle de SQLite que no es obvio (D5).
+Hay design porque las cuatro decisiones abiertas de la exploración tienen alternativas reales, y la purga tiene detalles de SQLite que no son obvios (D5).
 
 ## D1. ¿Enmascarar o rechazar el save?
 
@@ -39,8 +39,8 @@ Hay design porque las cuatro decisiones abiertas de la exploración tienen alter
 
 | Opción | A favor | En contra |
 |---|---|---|
-| **a. Endpoint `POST /v1/purge` y comando que lo usa** | No hay que parar el daemon | Pone una operación destructiva detrás del mismo token que usa el puente MCP. El agente no tiene herramienta, pero un agente con shell puede leer `<data>/token`. Y la purga necesita `secure_delete` y un checkpoint `TRUNCATE` sobre la conexión que el worker y la búsqueda comparten |
-| **b. Comando con el daemon parado** (como `clawg restore`) | El lock lo garantiza: nada escribe mientras tanto. La conexión es propia, así que `secure_delete` no cambia el comportamiento del daemon | Hay que parar el daemon (`clawg stop`); el puente MCP lo vuelve a arrancar en la próxima herramienta |
+| **a. Endpoint `POST /v1/purge` y comando que lo usa** | No hay que parar el daemon | Pone una operación destructiva detrás del mismo token que usa el puente MCP. El agente no tiene herramienta, pero un agente con shell puede leer `<data>/token`. Y la purga necesita un `VACUUM` y un checkpoint `TRUNCATE` sobre la conexión que el worker y la búsqueda comparten |
+| **b. Comando con el daemon parado** (como `clawg restore`) | El lock lo garantiza: nada escribe mientras tanto. La conexión es propia: el `VACUUM` no frena al daemon | Hay que parar el daemon (`clawg stop`); el puente MCP lo vuelve a arrancar en la próxima herramienta |
 
 **Decisión: b.** Purgar es raro y deliberado; parar el daemon es el mismo costo que ya paga `clawg restore`. Usa `StoreLock::acquire(.., StoreHolder::Maintenance)` y la conexión directa sin migrar de `backup_offline` (`crates/clawg-core/src/memory/backup.rs:306-315`). El texto de `Maintenance` pasa a nombrar también la purga.
 
@@ -50,28 +50,26 @@ Hay design porque las cuatro decisiones abiertas de la exploración tienen alter
 
 ## D5. Purga: cómo se saca el texto del archivo
 
-Un `DELETE` no alcanza. Probado con Python sobre el mismo esquema de FTS (contenido externo y los tres triggers de V8), 300 filas y una fila con `zebra-quokka-7741`, contando los bytes `quokka` en `memory.db` + `memory.db-wal` después de un `wal_checkpoint(TRUNCATE)`:
+Un `DELETE` no alcanza: el texto queda en tres lugares más.
 
-| Pasos después del `DELETE` | Ocurrencias |
-|---|---|
-| nada | 1 |
-| `secure_delete` | 1 |
-| `optimize` del FTS | 0 |
-| `secure_delete` y `optimize` | 0 |
+- **El índice FTS.** FTS5 no borra términos en su lugar. El `'delete'` de un índice de contenido externo escribe una marca en un segmento nuevo, que lleva los términos, y los segmentos viejos siguen en `memory_fts_data` hasta un merge. `INSERT INTO memory_fts(memory_fts) VALUES('optimize')` los junta en uno y descarta lo borrado.
+- **Las páginas libres.** Cada merge del índice (y cada `DELETE`) libera páginas, que conservan sus bytes en la lista libre de SQLite. Pasa en la operación normal del daemon, mucho antes de la purga.
+- **El WAL.** Los frames viejos pueden tener la página como era.
 
-- **FTS5 no borra términos en su lugar.** El `'delete'` de un índice de contenido externo escribe una marca en un segmento nuevo, que lleva los términos. Los segmentos viejos siguen en `memory_fts_data` hasta un merge. `INSERT INTO memory_fts(memory_fts) VALUES('optimize')` los junta en uno y descarta lo borrado.
-- **`secure_delete`.** Que el `optimize` solo haya dado 0 en la prueba es suerte: SQLite reusó las páginas. Sin `secure_delete`, una página liberada conserva sus bytes en la lista libre. `PRAGMA secure_delete = ON`, sólo en la conexión de la purga, sobreescribe con ceros lo que se borra.
-- **WAL.** Los frames viejos del WAL pueden tener la página con el texto. El `wal_checkpoint(TRUNCATE)` final lleva todo a `memory.db` y deja el WAL en 0 bytes.
+Los pasos, después del `DELETE` de la fila y su vector: `optimize` del FTS, `VACUUM` y `wal_checkpoint(TRUNCATE)`. El `VACUUM` reescribe el archivo sólo con lo vivo, sin lista libre; el checkpoint lleva todo a `memory.db` y deja el WAL en 0 bytes.
+
+**Lo que mostró el test.** El primer diseño usaba `PRAGMA secure_delete = ON` en lugar de `VACUUM`. Un prototipo en Python con 300 filas parecía darle la razón, pero el test sobre una base real (`MemoryStore::open`, WAL, 300 filas con vector) encontró `quokka` en una página de la lista libre: un segmento del FTS que un merge automático había liberado al insertar, sin `secure_delete`. `secure_delete` sólo pone en cero las páginas que se liberan desde que se activa. Sin el `optimize`, o sin el `VACUUM`, `purging_a_live_row_leaves_no_trace_of_its_text` y `purging_a_deleted_row_leaves_no_trace_of_its_text` fallan; con los dos, pasan.
+
+**`VACUUM` y los rowids de vec0.** SQLite advierte que `VACUUM` puede renumerar los rowids de una tabla sin `INTEGER PRIMARY KEY`. Las tablas sombra de vec0 que guardan los vectores declaran `rowid PRIMARY KEY` sin el tipo (`sqlite-vec.c`, `SHADOW_TABLE_ROWID_QUIRK`), y vec0 las lee con `sqlite3_blob_open` por el rowid interno. `VACUUM` conserva los rowids de toda tabla con un índice, porque sus índices los referencian; renumera sólo las que no tienen ninguno (probado con SQLite 3.45: una tabla `(rowid PRIMARY KEY, v)` conserva `_rowid_` 50, 70, 1000 y 30000; una `(a, b)` sin índice pasa de 2, 9, 50 a 1, 2, 3). Todas las tablas sombra de vec0 tienen su clave primaria. El test lo fija: después de purgar, una búsqueda KNN sobre otra fila la sigue encontrando por su id. Es la misma copia que ya usan los backups (`VACUUM INTO`, `backup.rs:275`).
 
 | Alternativa | Por qué no |
 |---|---|
-| `VACUUM` en vez de `secure_delete` | Reescribe toda la base y no limpia el FTS: copia los segmentos como están. Hace falta el `optimize` igual |
+| `secure_delete` en vez de `VACUUM` | No limpia las páginas que se liberaron antes (ver arriba) |
 | `rebuild` del FTS en vez de `optimize` | Reindexa desde `memory`, incluidas las filas borradas, y rompe el invariante de V8 (sólo filas vivas, `V8__memory_fts.sql:99-104`) |
 | Reemplazar `content` por un placeholder y dejar la fila | `content` es de escritura única: no hay trigger de FTS para un `UPDATE` de `content` (`V8__memory_fts.sql:90-93`), y el hash de dedup dejaría de corresponder |
+| `VACUUM INTO` a un temporal y `rename`, como `clawg restore` | Lo mismo que `VACUUM` con más pasos que pueden fallar a mitad |
 
-**Filas relacionadas:** lo mismo que el delete. Si la fila estaba viva, `release_challengers` (`crates/clawg-core/src/memory/dispute.rs:132`) libera las que la disputaban, en la misma transacción. Una fila con `superseded_by` apuntando a la purgada queda como con el delete; la resolución de disputas ya tolera ese puntero (`dispute.rs`, `a_stale_superseded_by_on_a_live_row_does_not_link`).
-
-Un test fija todo esto sobre la base real: los bytes del secreto no están en `memory.db` ni en `memory.db-wal` después de purgar una fila viva y una borrada (R5).
+**Filas relacionadas:** lo mismo que el delete. Si la fila estaba viva, `release_challengers` (`crates/clawg-core/src/memory/dispute.rs:132`) libera las que la disputaban, en la misma transacción y después del `DELETE`: antes, la fila todavía cuenta como viva y nada se libera (lo encontró `purging_releases_the_rows_that_disputed_it`). Una fila con `superseded_by` apuntando a la purgada queda como con el delete; la resolución de disputas ya tolera ese puntero (`dispute.rs`, `a_stale_superseded_by_on_a_live_row_does_not_link`).
 
 ## D6. Purga y backups
 

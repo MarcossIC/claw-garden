@@ -69,5 +69,5 @@ Un secreto que un agente guarda por error (una API key, un token, una contraseñ
 | Falso positivo: se enmascara algo que no era secreto | Baja | Sólo prefijos con formato fijo y estructura (PEM, JWT con `eyJ` en dos partes, URL con contraseña). Las keys de forma libre (`sk-`) piden letras y dígitos. Tests negativos con hashes, UUIDs, identificadores y `${VAR}` |
 | Falso negativo: un secreto sin formato conocido (una contraseña suelta) | Media | Es el límite de no usar entropía. Para eso están `clawg purge` y la instrucción al agente de no guardar secretos |
 | La purga deja el secreto en un backup | Media | La purga lista los backups que tienen la fila. Borrarlos es decisión del usuario |
-| `optimize` del FTS en una base grande tarda | Baja | Es un comando manual, sobre un store personal. Reescribe el índice una vez |
+| `optimize` del FTS y `VACUUM` tardan en una base grande | Baja | Es un comando manual, sobre un store personal. Reescriben el índice y el archivo una vez |
 | El regex cuesta en cada save | Baja | `regex` ya está compilado en el binario (lo traen `tokenizers`, `refinery-core` y `tree-sitter`); los patrones se compilan una vez. Al lado de un embedding, es ruido |
