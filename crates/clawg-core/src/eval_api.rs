@@ -439,7 +439,7 @@ impl EvalEmbedder {
 /// drains them.
 pub struct EvalIngest {
     tx: Sender<IngestRequest>,
-    worker: JoinHandle<()>,
+    worker: JoinHandle<Vec<MemoryEvent>>,
     runtime: MemoryRuntime,
 }
 
@@ -464,6 +464,8 @@ impl EvalIngest {
         let chat_chunker = resolve_tokenizer_and_chunker(tokenizer_dir, &runtime.tokenizer);
         let worker = tokio::spawn(memory_worker(
             rx,
+            tokio::sync::watch::channel(None).1,
+            crate::memory::spill::Replay::none(),
             runtime.store.clone(),
             runtime.embedder.clone(),
             chat_chunker,

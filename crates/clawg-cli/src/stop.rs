@@ -9,9 +9,13 @@ use std::time::Duration;
 use crate::client::{ClientError, DaemonClient};
 use crate::process::{Exit, Watched};
 
-/// How long `clawg stop` waits for the daemon to end. Shutdown is a drain of
-/// the ingest queue and a WAL checkpoint, normally well under a second; this is
-/// the bound for a daemon stuck mid-embedding on a slow disk.
+/// How long `clawg stop` waits for the daemon to end. After the HTTP server
+/// stops, the daemon ingests what is still queued for up to
+/// [`clawg_core::runtime::DRAIN_DEADLINE`], writes what it could not ingest to
+/// `ingest-pending.jsonl`, flushes the access counts and checkpoints the WAL.
+/// With an idle queue that is well under a second; this bound has to cover a
+/// full drain plus the rest, so the installer never replaces the binary while
+/// the daemon is still writing.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Stops the daemon published in `base_dir` and returns its pid once the
@@ -51,6 +55,18 @@ mod tests {
     use crate::daemon::lifecycle::{write_state, write_token, DaemonState};
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    /// What shutdown does after the drain deadline: finish the event in
+    /// flight, spill the rest, flush access counts and checkpoint.
+    const AFTER_DRAIN: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn the_drain_deadline_leaves_room_inside_the_stop_timeout() {
+        assert!(
+            clawg_core::runtime::DRAIN_DEADLINE + AFTER_DRAIN <= STOP_TIMEOUT,
+            "a full drain must end before `clawg stop` gives up on the process"
+        );
+    }
 
     fn publish(dir: &Path, port: u16) {
         write_state(

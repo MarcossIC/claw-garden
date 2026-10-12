@@ -34,4 +34,33 @@ mod tests {
         // wired correctly, this returns a Runner without panic.
         let _runner = runner();
     }
+
+    /// Refinery refuses to open a database whose applied migrations no longer
+    /// match their embedded checksums, so editing a published migration would
+    /// leave every existing install without a daemon. A new migration adds its
+    /// row here in the same commit.
+    #[test]
+    fn published_migration_checksums_are_pinned() {
+        const PINNED: &[(i32, &str, u64)] = &[
+            (1, "init", 5468576289350600607),
+            (2, "vectors", 6383721682892048213),
+            (3, "view", 5093982126784145775),
+            (4, "root_cause", 11100773307424884808),
+            (5, "embedding_contract", 2430145443532491464),
+            (6, "content_hash", 13406404950456231160),
+            (7, "drop_all_memories_view", 13752469436407078502),
+            (8, "memory_fts", 11218029035149072530),
+        ];
+        let mut actual: Vec<(i32, String, u64)> = runner()
+            .get_migrations()
+            .iter()
+            .map(|m| (m.version(), m.name().to_string(), m.checksum()))
+            .collect();
+        actual.sort_by_key(|&(v, _, _)| v);
+        let pinned: Vec<(i32, String, u64)> = PINNED
+            .iter()
+            .map(|&(v, n, c)| (v, n.to_string(), c))
+            .collect();
+        assert_eq!(actual, pinned);
+    }
 }

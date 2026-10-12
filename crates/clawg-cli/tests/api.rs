@@ -152,16 +152,16 @@ impl Harness {
         };
         let (runtime, ingest_rx) = match embedder {
             EmbedderState::Ready => {
-                tokio::spawn(runtime.ingest_worker(rx));
+                tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
                 (runtime, None)
             }
             EmbedderState::NeverLoaded => {
                 let runtime = with_empty_embedder(runtime, EmbedderStatus::Loading);
-                tokio::spawn(runtime.ingest_worker(rx));
+                tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
                 (runtime, None)
             }
             EmbedderState::ServedEmpty => {
-                tokio::spawn(runtime.ingest_worker(rx));
+                tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
                 (with_empty_embedder(runtime, EmbedderStatus::Loading), None)
             }
             EmbedderState::Failed { error, retryable } => {
@@ -175,7 +175,7 @@ impl Harness {
             EmbedderState::FailingEmbedder => {
                 let runtime = with_empty_embedder(runtime, EmbedderStatus::Ready);
                 runtime.embedder.set(Arc::new(FailingEmbedder) as Arc<dyn Embedder>).ok();
-                tokio::spawn(runtime.ingest_worker(rx));
+                tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
                 (runtime, None)
             }
         };

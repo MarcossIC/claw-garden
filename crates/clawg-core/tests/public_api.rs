@@ -194,7 +194,7 @@ async fn memory_runtime_ingest_worker_drains_an_event_into_a_row() {
     let store = rt.store.clone();
     let tx = rt.memory_tx.clone();
 
-    let worker = tokio::spawn(rt.ingest_worker(rx));
+    let worker = tokio::spawn(rt.ingest_worker(rx, tokio::sync::watch::channel(None).1));
 
     tx.try_send(explicit_event("the daemon ingests on a plain tokio runtime", None, None).into())
         .expect("send");
@@ -235,7 +235,7 @@ async fn explicit_overrides_reach_the_stored_row() {
     let (rt, rx) = MemoryRuntime::new_for_test(tmp.path().to_path_buf()).await;
     let store = rt.store.clone();
     let tx = rt.memory_tx.clone();
-    let worker = tokio::spawn(rt.ingest_worker(rx));
+    let worker = tokio::spawn(rt.ingest_worker(rx, tokio::sync::watch::channel(None).1));
 
     tx.try_send(
         explicit_event(

@@ -7,9 +7,10 @@
 ///
 /// # Design decisions
 ///
-/// * `UnboundedSender<Vec<i64>>` — sender-only public surface keeps the struct
-///   `Send + Sync` without interior `Connection`/`Mutex`.  The hot path MUST
-///   NOT block; `UnboundedSender::send` never awaits.
+/// * An `UnboundedSender` — sender-only public surface keeps the struct
+///   `Send + Sync` without an interior `Connection`.  The hot path MUST
+///   NOT block; `UnboundedSender::send` never awaits, and the one `Mutex`
+///   guards the worker handle, which only `shutdown` touches.
 /// * `record` is synchronous, infallible, and zero-copy beyond the `Vec<i64>`
 ///   already owned by the caller.
 /// * Empty vectors are discarded at `record` entry — no channel traffic for
@@ -20,7 +21,9 @@
 /// [`record`]: AccessTracker::record
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::task::JoinHandle;
 use tokio_rusqlite::Connection;
 
 use crate::memory::clock::TimestampMs;
@@ -28,7 +31,18 @@ use crate::memory::{RankedHit, TableKind};
 
 /// Buffers retrieved memory IDs and forwards them to the async flush worker.
 pub struct AccessTracker {
-    tx: UnboundedSender<Vec<i64>>,
+    tx: UnboundedSender<Msg>,
+    /// Taken by the first [`AccessTracker::shutdown`]; `None` for a tracker
+    /// with no worker.
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// What travels to the flush worker. `Close` rides the same channel as the
+/// hits so it arrives after every hit recorded before it.
+#[derive(Debug, PartialEq)]
+enum Msg {
+    Hit(Vec<i64>),
+    Close,
 }
 
 // Compile-time guard — `AccessTracker` MUST be `Send + Sync` so it can live
@@ -46,11 +60,12 @@ impl AccessTracker {
     /// * the buffer reaching ≥500 entries.
     ///
     /// Flush errors are logged via `log::warn!` and the loop continues.
-    /// The worker exits cleanly when all `Sender`s are dropped.
+    /// The worker flushes what it holds and exits on [`AccessTracker::shutdown`]
+    /// or when all `Sender`s are dropped.
     pub fn new(conn: Connection) -> Self {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<i64>>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
 
-        tokio::spawn(async move {
+        let worker = tokio::spawn(async move {
             let mut buffer: Vec<i64> = Vec::new();
             // `interval_at(now + 30s, 30s)` — first tick fires 30 s after creation,
             // NOT immediately.  `interval(30s)` would fire an initial tick at t=0 which
@@ -64,10 +79,13 @@ impl AccessTracker {
 
             loop {
                 tokio::select! {
-                    maybe_ids = rx.recv() => {
-                        match maybe_ids {
-                            None => break, // all Senders dropped — graceful shutdown
-                            Some(ids) => {
+                    msg = rx.recv() => {
+                        match msg {
+                            None | Some(Msg::Close) => {
+                                flush(&conn, std::mem::take(&mut buffer)).await;
+                                break;
+                            }
+                            Some(Msg::Hit(ids)) => {
                                 buffer.extend(ids);
                                 if buffer.len() >= 500 {
                                     // Size trigger.
@@ -86,7 +104,7 @@ impl AccessTracker {
             }
         });
 
-        Self { tx }
+        Self { tx, worker: Mutex::new(Some(worker)) }
     }
 
     /// A tracker whose `record` goes nowhere: no flush worker, nothing ever
@@ -96,8 +114,8 @@ impl AccessTracker {
     pub(crate) fn inert() -> Self {
         // The receiver is dropped on purpose; `record` already ignores a send
         // error, so every call becomes a no-op.
-        let (tx, _) = tokio::sync::mpsc::unbounded_channel::<Vec<i64>>();
-        Self { tx }
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+        Self { tx, worker: Mutex::new(None) }
     }
 
     /// Record that the given memory IDs were accessed on the retrieval hot path.
@@ -108,7 +126,18 @@ impl AccessTracker {
         if ids.is_empty() {
             return;
         }
-        self.tx.send(ids).ok(); // infallible by design: error means worker exited
+        self.tx.send(Msg::Hit(ids)).ok(); // infallible by design: error means worker exited
+    }
+
+    /// Flushes every hit recorded so far and waits for the worker to exit.
+    /// Hits recorded afterwards are ignored, as after any worker exit.
+    pub async fn shutdown(&self) {
+        let worker = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let Some(worker) = worker else { return };
+        self.tx.send(Msg::Close).ok();
+        if let Err(e) = worker.await {
+            log::warn!("access tracker worker ended abnormally: {e}");
+        }
     }
 
     /// Records the hits a retrieval actually found, out of the ones it hands back.
@@ -228,9 +257,9 @@ impl AccessTracker {
     ///
     /// Does NOT spawn a worker task.  The caller is responsible for driving the
     /// receiver.
-    fn for_test() -> (Self, tokio::sync::mpsc::UnboundedReceiver<Vec<i64>>) {
+    fn for_test() -> (Self, tokio::sync::mpsc::UnboundedReceiver<Msg>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        (Self { tx }, rx)
+        (Self { tx, worker: Mutex::new(None) }, rx)
     }
 }
 
@@ -392,7 +421,7 @@ mod tests {
             ranked(4, TableKind::Memory, 0.1),
         ]);
 
-        assert_eq!(rx.try_recv().expect("a batch"), vec![1, 4]);
+        assert_eq!(rx.try_recv().expect("a batch"), Msg::Hit(vec![1, 4]));
     }
 
     #[test]
@@ -414,9 +443,53 @@ mod tests {
         tracker.record(vec![1, 2, 3]);
 
         match rx.try_recv() {
-            Ok(ids) => assert_eq!(ids, vec![1, 2, 3]),
+            Ok(msg) => assert_eq!(msg, Msg::Hit(vec![1, 2, 3])),
             Err(e) => panic!("expected a message, got error: {e:?}"),
         }
+    }
+
+    // ── shutdown ─────────────────────────────────────────────────────────────
+
+    /// Up to 30 s of hits sit in the buffer; a shutdown that skipped the final
+    /// flush would quietly lose them.
+    #[tokio::test]
+    async fn access_tracker_flushes_its_buffer_on_shutdown() {
+        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let row_id = seed_memory_row(&store.conn, "chat_message", 3, 0, 5.0).await;
+        let tracker = AccessTracker::new(store.conn.clone());
+
+        tracker.record(vec![row_id]);
+        tracker.shutdown().await;
+
+        let count: i64 = store
+            .conn
+            .call(move |c| c.query_row("SELECT access_count FROM memory WHERE id = ?", [row_id], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn access_tracker_flushes_its_buffer_when_every_sender_is_dropped() {
+        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let row_id = seed_memory_row(&store.conn, "chat_message", 3, 0, 5.0).await;
+        let tracker = AccessTracker::new(store.conn.clone());
+
+        tracker.record(vec![row_id]);
+        drop(tracker);
+
+        await_access_count(&store.conn, row_id, 1, std::time::Duration::from_secs(5))
+            .await
+            .expect("dropping the tracker must still flush what it buffered");
+    }
+
+    #[tokio::test]
+    async fn shutting_down_twice_is_harmless() {
+        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let tracker = AccessTracker::new(store.conn.clone());
+        tracker.shutdown().await;
+        tracker.shutdown().await;
+        tracker.record(vec![1]);
     }
 
     // ── timer trigger ─────────────────────────────────────────────
