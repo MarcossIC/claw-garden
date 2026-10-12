@@ -32,12 +32,13 @@ pub mod worker;
 pub mod error;
 pub mod identity;
 pub mod migrations;
+pub mod project;
 pub mod model_download;
 pub mod record;
 
 pub use db::MemoryStore;
 pub use error::MemoryError;
-pub use identity::derive_project_id;
+pub use identity::{derive_project_id, ProjectIdentity};
 pub use record::{
     EpisodicTrajectoryRow, MemoryRecord, MemoryRow, ProceduralSkillRow, Scope, TableKind,
 };

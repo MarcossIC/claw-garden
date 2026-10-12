@@ -346,7 +346,7 @@ fn resolve_project(scope: &Scope) -> Result<Option<String>, ClientError> {
         return Ok(scope.project_id(None));
     }
     let cwd = std::env::current_dir().map_err(|e| ClientError::WorkingDir(e.to_string()))?;
-    Ok(scope.project_id(Some(&cwd)))
+    Ok(scope.project_id(Some(clawg_core::memory::ProjectIdentity::resolve(&cwd).id)))
 }
 
 // ── Running ─────────────────────────────────────────────────────────────────

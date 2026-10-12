@@ -11,6 +11,7 @@
 
 use std::path::Path;
 
+use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
 
 use crate::client::{Health, Hit, MemoryRow};
@@ -132,20 +133,20 @@ pub fn format_context(prompt: &str) -> String {
 /// for the unscoped view and a caller that passed both meant the broader one;
 /// then an explicit `project_path`, which is the caller naming a project other
 /// than where the bridge happens to be running; then the bridge's own working
-/// directory.
-pub fn resolve_project_id(
-    default_project_id: Option<&str>,
+/// directory. `resolve` turns a path into its project; it is passed in so this
+/// rule stays testable without a filesystem.
+pub fn resolve_project(
+    default_project: Option<&ProjectIdentity>,
     project_path: Option<&str>,
     all_projects: bool,
-) -> Option<String> {
+    resolve: impl FnOnce(&Path) -> ProjectIdentity,
+) -> Option<ProjectIdentity> {
     if all_projects {
         return None;
     }
     match project_path {
-        // `derive_project_id` and nothing else: the store scoped every row with
-        // it, so any other spelling of "which project" simply never matches.
-        Some(p) if !p.is_empty() => Some(clawg_core::memory::derive_project_id(Path::new(p))),
-        _ => default_project_id.map(str::to_owned),
+        Some(p) if !p.is_empty() => Some(resolve(Path::new(p))),
+        _ => default_project.cloned(),
     }
 }
 
@@ -343,39 +344,42 @@ mod tests {
         assert_eq!(format_context("   \n "), "no context yet");
     }
 
-    // ── resolve_project_id ──────────────────────────────────────────────────
+    // ── resolve_project ─────────────────────────────────────────────────────
 
     #[test]
-    fn resolve_project_id_falls_back_to_the_bridges_own_project() {
-        assert_eq!(
-            resolve_project_id(Some("proj-default"), None, false),
-            Some("proj-default".to_string())
-        );
+    fn resolve_project_resolves_an_explicit_path() {
+        let default = identity("proj-default");
+        let resolved = resolve_project(Some(&default), Some("/some/other/project"), false, |p| {
+            assert_eq!(p, Path::new("/some/other/project"));
+            identity("other-1a2b")
+        })
+        .expect("an explicit path must resolve");
+        assert_eq!(resolved.id, "other-1a2b", "an explicit path must override the default");
     }
 
     #[test]
-    fn resolve_project_id_derives_an_explicit_path() {
-        let derived = resolve_project_id(Some("proj-default"), Some("/some/other/project"), false)
-            .expect("an explicit path must resolve");
-        assert_ne!(derived, "proj-default", "an explicit path must override the default");
-        assert_eq!(
-            derived,
-            clawg_core::memory::derive_project_id(Path::new("/some/other/project")),
-            "the bridge must derive ids exactly as the store does, or nothing matches"
-        );
+    fn without_a_path_the_bridges_own_project_is_used() {
+        let default = identity("proj-default");
+        let resolved = resolve_project(Some(&default), Some(""), false, |_| unreachable!());
+        assert_eq!(resolved, Some(default));
     }
 
     /// The only way to ask for the unscoped view. A caller that passed both
     /// meant the broader one — narrowing it would silently ignore the request.
     #[test]
     fn all_projects_outranks_everything() {
-        assert_eq!(resolve_project_id(Some("d"), Some("/p"), true), None);
-        assert_eq!(resolve_project_id(None, None, true), None);
+        let d = identity("d");
+        assert_eq!(resolve_project(Some(&d), Some("/p"), true, |_| unreachable!()), None);
+        assert_eq!(resolve_project(None, None, true, |_| unreachable!()), None);
     }
 
     #[test]
-    fn resolve_project_id_is_none_when_there_is_nothing_to_scope_to() {
-        assert_eq!(resolve_project_id(None, None, false), None);
+    fn resolve_project_is_none_when_there_is_nothing_to_scope_to() {
+        assert_eq!(resolve_project(None, None, false, |_| unreachable!()), None);
+    }
+
+    fn identity(id: &str) -> ProjectIdentity {
+        ProjectIdentity { id: id.into(), root: format!("/{id}").into(), legacy_id: id.into() }
     }
 
     // ── format_status ───────────────────────────────────────────────────────

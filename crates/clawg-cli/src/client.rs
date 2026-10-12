@@ -590,6 +590,33 @@ impl DaemonClient {
         Ok(Self::read_response::<Body>(resp).await?.deleted)
     }
 
+    /// Records `root` as a project and moves rows saved under `legacy_ids`
+    /// onto it. Returns the id the daemon derived and how many rows moved.
+    pub async fn register_project(
+        &self,
+        root: &std::path::Path,
+        legacy_ids: &[String],
+    ) -> Result<(String, usize), ClientError> {
+        #[derive(Deserialize)]
+        struct Body {
+            project_id: String,
+            rekeyed: usize,
+        }
+        let resp = self
+            .http
+            .post(self.url("/v1/projects"))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({
+                "root_path": root.to_string_lossy(),
+                "legacy_ids": legacy_ids,
+            }))
+            .send()
+            .await
+            .map_err(Self::map_transport)?;
+        let body = Self::read_response::<Body>(resp).await?;
+        Ok((body.project_id, body.rekeyed))
+    }
+
     pub async fn shutdown(&self) -> Result<(), ClientError> {
         let resp = self
             .http
