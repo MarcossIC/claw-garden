@@ -2,8 +2,7 @@
 //!
 //! Wires [`crate::memory::tier::demote_inactive`] (pure, previously unused)
 //! into a bulk `UPDATE` against `memory` ONLY, on a timer (`maintenance`
-//! module). 5th instance of the wrapper/core convention
-//! (worker → resolver → extractor → episodic_writer → maintenance).
+//! module).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,7 +29,7 @@ pub const MAINTENANCE_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 ///
 /// `?1` is `now_ms`, computed in Rust (see [`run_maintenance_once`]) and
 /// bound here — NEVER via `strftime`. All producers (`access.rs::flush`,
-/// `worker.rs`, `episodic_writer.rs`) store `last_accessed_at` in
+/// `worker.rs`) store `last_accessed_at` in
 /// MILLISECONDS since UNIX epoch, and this pass divides that stamp by the
 /// same millisecond day constant the retrieval queries use, so this pass
 /// and retrieval agree on the unit.
@@ -354,9 +353,16 @@ impl ReembedTable {
     }
 }
 
+/// The text a `procedural_skill` row's vector was embedded from. It is the
+/// string the skill was first written with, so a re-embed must rebuild it
+/// exactly or the new vector lands somewhere the old one never was.
+pub(crate) fn skill_embedding_text(trigger: &str, skill_name: &str) -> String {
+    format!("{trigger} {skill_name}")
+}
+
 /// One row read by [`select_reembed_batch`]: its id, the text a `ReInfer`
 /// pass would embed (for `procedural_skill` this is already
-/// [`crate::memory::miner::skill_embedding_text`]'s output — never rebuilt
+/// [`skill_embedding_text`]'s output — never rebuilt
 /// by hand here), and the raw bytes currently sitting in the matching
 /// vector row (what a `Normalize` pass renormalizes).
 struct ReembedRow {
@@ -594,10 +600,7 @@ async fn compute_new_embedding(mode: &ReembedMode, row: &ReembedRow) -> Result<V
 ///
 /// `procedural_skill` is the one table where the "text" isn't a single
 /// column: it resolves `trigger`+`skill_name` through
-/// [`crate::memory::miner::skill_embedding_text`] — the SAME function the
-/// original promotion write used — instead of concatenating them here by
-/// hand, which would silently re-embed a different string than the one the
-/// row was originally written with.
+/// [`skill_embedding_text`] instead of concatenating them here by hand.
 async fn select_reembed_batch(
     store: &MemoryStore,
     table: ReembedTable,
@@ -621,7 +624,7 @@ async fn select_reembed_batch(
                         let existing: Vec<u8> = r.get(3)?;
                         Ok(ReembedRow {
                             id,
-                            text: crate::memory::miner::skill_embedding_text(&trigger, &skill_name),
+                            text: skill_embedding_text(&trigger, &skill_name),
                             existing,
                         })
                     })?
@@ -1057,7 +1060,7 @@ mod tests {
         );
     }
 
-    /// A skill written by the miner lands at tier 1 with importance 8.0 — under
+    /// A skill as the desktop app wrote it lands at tier 1 with importance 8.0 — under
     /// the 9.0 pivotal cutoff — so the pass reaches the DEFAULT skill, not just
     /// a hand-seeded low-importance one. Without this, the test above could pass
     /// on a row shape production never writes.
@@ -1617,10 +1620,8 @@ mod tests {
         let texts: std::collections::HashSet<&str> = calls.iter().map(|(_, t)| t.as_str()).collect();
         assert!(texts.contains("hello world"), "memory.content must reach the embedder verbatim");
         assert!(texts.contains("fix the bug"), "episodic_trajectory.task must reach the embedder verbatim");
-        let expected_skill_text =
-            crate::memory::miner::skill_embedding_text("when login fails", "Fix login flow");
         assert!(
-            texts.contains(expected_skill_text.as_str()),
+            texts.contains("when login fails Fix login flow"),
             "procedural_skill must embed skill_embedding_text(trigger, skill_name), not a hand-rebuilt string"
         );
     }

@@ -1398,8 +1398,8 @@ mod tests {
 
     // `procedural_skill` rows are born at tier 1 (`compute_tier` pins that
     // type there) and nothing demotes them, so a pool that skipped tier 1
-    // returned zero skills for every query ever issued — the miner's whole
-    // output was unreachable through this channel.
+    // returned zero skills for every query ever issued — every stored skill
+    // was unreachable through this channel.
     #[tokio::test]
     async fn knn_procedural_returns_skill_rows() {
         use crate::memory::embedder::FakeEmbedder;

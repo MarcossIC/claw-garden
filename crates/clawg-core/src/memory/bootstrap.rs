@@ -164,13 +164,7 @@ impl EmbedderEventSink for LogSink {
             bytes_downloaded,
             bytes_total,
             error,
-        } = event
-        else {
-            // The sink is declared over the whole `StreamEvent` enum; the
-            // bootstrap only ever emits `EmbedderDownload`, so anything else
-            // is not this sink's business.
-            return;
-        };
+        } = event;
         match (phase.as_str(), error) {
             ("error", err) => log::warn!(
                 "embedder bootstrap failed: {}",
@@ -473,7 +467,6 @@ mod tests {
                 assert_eq!(bytes_total, Some(100));
                 assert_eq!(error, None);
             }
-            other => panic!("expected EmbedderDownload, got {other:?}"),
         }
     }
 
@@ -495,7 +488,6 @@ mod tests {
                 assert_eq!(bytes_total, Some(100));
                 assert_eq!(error, None);
             }
-            other => panic!("expected EmbedderDownload, got {other:?}"),
         }
     }
 
@@ -514,7 +506,6 @@ mod tests {
                 assert_eq!(bytes_total, None);
                 assert_eq!(error, None);
             }
-            other => panic!("expected EmbedderDownload, got {other:?}"),
         }
     }
 
@@ -533,7 +524,6 @@ mod tests {
                 assert_eq!(bytes_total, None);
                 assert_eq!(error, None);
             }
-            other => panic!("expected EmbedderDownload, got {other:?}"),
         }
     }
 
@@ -554,7 +544,6 @@ mod tests {
                 assert_eq!(bytes_total, None);
                 assert_eq!(error, Some("boom".into()));
             }
-            other => panic!("expected EmbedderDownload, got {other:?}"),
         }
     }
 
@@ -613,18 +602,16 @@ mod tests {
     fn count_done_phases(events: &[StreamEvent]) -> usize {
         events
             .iter()
-            .filter(|e| match e {
-                StreamEvent::EmbedderDownload { phase, .. } => phase == "done",
-                _ => false,
+            .filter(|e| {
+                let StreamEvent::EmbedderDownload { phase, .. } = e;
+                phase == "done"
             })
             .count()
     }
 
     fn phase_of_event(e: &StreamEvent) -> &str {
-        match e {
-            StreamEvent::EmbedderDownload { phase, .. } => phase,
-            _ => "<not-embedder>",
-        }
+        let StreamEvent::EmbedderDownload { phase, .. } = e;
+        phase
     }
 
     /// Test-only `ContractVerifyFn` that always reports a match — the
