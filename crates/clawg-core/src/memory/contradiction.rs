@@ -70,9 +70,13 @@ const _: () = assert!(NEAR_DUPLICATE_FLOOR < CONTRADICTION_THRESHOLD);
 // write path was edited. Read this table as a calibration of the distance
 // metric alone, never as an end-to-end measurement of the detector.
 
+/// Candidates the detector weighs per probe, before room for siblings.
+const CANDIDATE_POOL: usize = 5;
+
 /// Return the IDs of existing memory rows whose embedding is within the
 /// dispute band `[NEAR_DUPLICATE_FLOOR, CONTRADICTION_THRESHOLD)` of
-/// `embedding`, scoped to `agent_id` and, when given, `project_id`.
+/// `embedding`, scoped to `agent_id` and, when given, `project_id`, leaving
+/// out `siblings`: the rows the same event already inserted.
 ///
 /// Deliberately searches `memory` only. An episodic trajectory records what
 /// happened and a procedural skill records how something is done — neither
@@ -85,7 +89,7 @@ const _: () = assert!(NEAR_DUPLICATE_FLOOR < CONTRADICTION_THRESHOLD);
 /// returns `[]` without building a `SearchScope` at all, saving a search for
 /// every ingest that cannot possibly assert a claim (the overwhelming
 /// majority — every chat role maps to `ChatMessage`).
-// Only the memory pool is requested; k=5 is a candidate budget, not a result
+// Only the memory pool is requested; `pool` is a candidate budget, not a result
 // count — the threshold in `detect_contradiction` decides what actually
 // disputes.
 //
@@ -105,9 +109,9 @@ const _: () = assert!(NEAR_DUPLICATE_FLOOR < CONTRADICTION_THRESHOLD);
 // black-box test of `detect_contradiction`'s output cannot distinguish this
 // field's value from its opposite. A direct assertion on the returned
 // struct is the only way to pin it.
-fn contradiction_search_scope(project_id: Option<&str>) -> SearchScope {
+fn contradiction_search_scope(project_id: Option<&str>, pool: usize) -> SearchScope {
     SearchScope {
-        memory: Some(5),
+        memory: Some(pool),
         episodic: None,
         procedural: None,
         project_id: project_id.map(str::to_owned),
@@ -121,13 +125,18 @@ pub(crate) async fn detect_contradiction(
     agent_id: &str,
     project_id: Option<&str>,
     candidate_type: MemoryType,
+    siblings: &[i64],
 ) -> Vec<i64> {
     if !candidate_type.is_claim_bearing() {
         return Vec::new();
     }
 
-    let scope = contradiction_search_scope(project_id);
-    match search_all_memories(store, embedding, None, agent_id, scope, 5).await {
+    // Siblings sit closest of all to the chunk being probed, so the pool
+    // grows by their count: otherwise a long save fills all five slots with
+    // its own chunks and a real dispute with an older row is never seen.
+    let pool = CANDIDATE_POOL + siblings.len();
+    let scope = contradiction_search_scope(project_id, pool);
+    match search_all_memories(store, embedding, None, agent_id, scope, pool).await {
         // Two similar chat messages are not a knowledge contradiction. Only
         // types that assert something can contradict something, so the
         // detector is gated to those and skips the KNN entirely for the rest.
@@ -135,6 +144,7 @@ pub(crate) async fn detect_contradiction(
             .into_iter()
             .filter(|h| {
                 matches!(h.kind, TableKind::Memory)
+                    && !siblings.contains(&h.id)
                     && MemoryType::from_db_str(&h.memory_type).is_some_and(MemoryType::is_claim_bearing)
                     && h.distance >= NEAR_DUPLICATE_FLOOR as f64
                     && h.distance < CONTRADICTION_THRESHOLD as f64
@@ -274,7 +284,7 @@ mod tests {
 
         insert_row(&store, "agent-far", &base).await;
 
-        let ids = detect_contradiction(&store, &query, "agent-far", None, MemoryType::UserPreference).await;
+        let ids = detect_contradiction(&store, &query, "agent-far", None, MemoryType::UserPreference, &[]).await;
         assert!(ids.is_empty(), "far vectors must not be flagged; got {ids:?}");
     }
 
@@ -302,7 +312,7 @@ mod tests {
 
         let stored_id = insert_row(&store, "agent-near", &base).await;
 
-        let ids = detect_contradiction(&store, &query, "agent-near", None, MemoryType::UserPreference).await;
+        let ids = detect_contradiction(&store, &query, "agent-near", None, MemoryType::UserPreference, &[]).await;
         assert!(
             ids.contains(&stored_id),
             "stored_id={stored_id} must be in contradiction ids={ids:?}"
@@ -313,7 +323,7 @@ mod tests {
     async fn detect_contradiction_empty_db_returns_empty() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let base = base_vec(3);
-        let ids = detect_contradiction(&store, &base, "agent-empty", None, MemoryType::UserPreference).await;
+        let ids = detect_contradiction(&store, &base, "agent-empty", None, MemoryType::UserPreference, &[]).await;
         assert!(ids.is_empty(), "empty DB must yield empty contradiction ids");
     }
 
@@ -325,7 +335,7 @@ mod tests {
         insert_row(&store, "agent-a", &base).await;
         // Query with "agent-b" → different scope → empty
         let query = near(&base, 0.05);
-        let ids = detect_contradiction(&store, &query, "agent-b", None, MemoryType::UserPreference).await;
+        let ids = detect_contradiction(&store, &query, "agent-b", None, MemoryType::UserPreference, &[]).await;
         assert!(
             ids.is_empty(),
             "row from agent-a must not appear for agent-b; got {ids:?}"
@@ -373,7 +383,7 @@ mod tests {
 
         for (idx, (contradicting, _, query)) in fixtures.iter().enumerate() {
             let agent_id = format!("eval-agent-{idx}");
-            let ids = detect_contradiction(&store, query, &agent_id, None, MemoryType::UserPreference).await;
+            let ids = detect_contradiction(&store, query, &agent_id, None, MemoryType::UserPreference, &[]).await;
             let expected_id = stored_ids[idx].unwrap();
             let flagged = ids.contains(&expected_id);
 
@@ -406,7 +416,7 @@ mod tests {
     /// to catch that mutation.
     #[test]
     fn contradiction_search_scope_disables_the_lexical_channel() {
-        let scope = contradiction_search_scope(None);
+        let scope = contradiction_search_scope(None, CANDIDATE_POOL);
         assert_eq!(
             scope.lexical, None,
             "the near-duplicate detector's distance band must never be fed lexically \
@@ -446,7 +456,7 @@ mod tests {
 
         insert_row_typed(&store, "agent-gate", "user_preference", &base).await;
 
-        let ids = detect_contradiction(&store, &query, "agent-gate", None, MemoryType::ChatMessage).await;
+        let ids = detect_contradiction(&store, &query, "agent-gate", None, MemoryType::ChatMessage, &[]).await;
         assert!(
             ids.is_empty(),
             "an ineligible candidate type must short-circuit to [], got {ids:?}"
@@ -464,7 +474,7 @@ mod tests {
         let query = near(&base, 1.5); // unit-space L2 ≈ 0.10, inside the band
         insert_row_typed(&store, "agent-hitgate", "chat_message", &base).await;
 
-        let ids = detect_contradiction(&store, &query, "agent-hitgate", None, MemoryType::UserPreference).await;
+        let ids = detect_contradiction(&store, &query, "agent-hitgate", None, MemoryType::UserPreference, &[]).await;
         assert!(
             ids.is_empty(),
             "a chat_message hit must be dropped even for an eligible candidate, got {ids:?}"
@@ -492,7 +502,7 @@ mod tests {
 
         insert_row_typed(&store, "agent-floor", "user_preference", &base).await;
 
-        let ids = detect_contradiction(&store, &query, "agent-floor", None, MemoryType::UserPreference).await;
+        let ids = detect_contradiction(&store, &query, "agent-floor", None, MemoryType::UserPreference, &[]).await;
         assert!(
             ids.is_empty(),
             "a hit below NEAR_DUPLICATE_FLOOR must be skipped, not disputed; got {ids:?}"
@@ -604,7 +614,7 @@ mod tests {
             "fixture must land inside [{NEAR_DUPLICATE_FLOOR}, {CONTRADICTION_THRESHOLD}); got {dist}"
         );
 
-        let candidates = detect_contradiction(&store, &query, "agent-contra-pref", None, MemoryType::UserPreference).await;
+        let candidates = detect_contradiction(&store, &query, "agent-contra-pref", None, MemoryType::UserPreference, &[]).await;
         assert!(
             candidates.contains(&stored_id),
             "a contradictory user_preference at an in-band distance must be detected"
