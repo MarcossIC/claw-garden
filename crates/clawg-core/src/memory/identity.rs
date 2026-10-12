@@ -14,6 +14,59 @@ pub fn derive_project_id(project_path: &Path) -> String {
     format!("{}-{}", name, h)
 }
 
+/// A project as the store keys it: the root every path inside it resolves to,
+/// the id derived from that root, and the id the same path had before paths
+/// were resolved, which rows saved back then still carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectIdentity {
+    pub id: String,
+    pub root: PathBuf,
+    pub legacy_id: String,
+}
+
+impl ProjectIdentity {
+    /// Resolves `path` to its project. Reads the filesystem (see [`resolve_project_root`]).
+    pub fn resolve(path: &Path) -> Self {
+        let root = resolve_project_root(path);
+        Self { id: derive_project_id(&root), legacy_id: derive_project_id(path), root }
+    }
+}
+
+/// The root of the project `path` belongs to: the nearest ancestor of its
+/// canonical form holding a `.git` (with worktrees resolved by
+/// [`root_from_marker`]), or the canonical path itself outside git.
+///
+/// A path that does not exist cannot be canonicalized or searched for `.git`,
+/// so it is only made absolute and normalized textually.
+pub fn resolve_project_root(path: &Path) -> PathBuf {
+    let canonical = match std::fs::canonicalize(path) {
+        Ok(p) => strip_verbatim(&p),
+        Err(_) => {
+            let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+            return normalize_lexical(&absolute);
+        }
+    };
+    canonical
+        .ancestors()
+        .find_map(|dir| read_marker(dir).map(|marker| root_from_marker(dir, &marker)))
+        .unwrap_or(canonical)
+}
+
+fn read_marker(dir: &Path) -> Option<GitMarker> {
+    let dot_git = dir.join(".git");
+    let meta = std::fs::metadata(&dot_git).ok()?;
+    if meta.is_dir() {
+        return Some(GitMarker::Dir);
+    }
+    // A `.git` file git cannot follow still marks where the user put the
+    // checkout, so it ends the search at this directory.
+    let Some(gitdir) = std::fs::read_to_string(&dot_git).ok().and_then(|c| parse_gitdir(&c, dir)) else {
+        return Some(GitMarker::Link { gitdir: dot_git, commondir: None });
+    };
+    let commondir = std::fs::read_to_string(gitdir.join("commondir")).ok();
+    Some(GitMarker::Link { gitdir, commondir })
+}
+
 /// What a directory's `.git` entry says about where its project's root is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitMarker {

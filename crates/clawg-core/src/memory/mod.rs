@@ -37,7 +37,7 @@ pub mod record;
 
 pub use db::MemoryStore;
 pub use error::MemoryError;
-pub use identity::derive_project_id;
+pub use identity::{derive_project_id, ProjectIdentity};
 pub use record::{
     EpisodicTrajectoryRow, MemoryRecord, MemoryRow, ProceduralSkillRow, Scope, TableKind,
 };
