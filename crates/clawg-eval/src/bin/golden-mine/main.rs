@@ -316,7 +316,7 @@ fn run_synth(args: &SynthArgs) -> i32 {
             return EXIT_FAILURE;
         }
     };
-    let expanded = match synth::generate(&base, args.seed, args.distractors) {
+    let expanded = match synth::generate(&base, args.seed, &synth::Sizes { distractors: args.distractors }) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("failed to generate: {e}");
