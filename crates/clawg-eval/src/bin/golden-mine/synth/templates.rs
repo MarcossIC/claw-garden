@@ -189,29 +189,49 @@ pub fn mention_frames(kind: IdentKind, spanish: bool) -> &'static [&'static str]
     }
 }
 
-/// Aspects of one topic, each stored as its own row. A question about the
-/// topic is answered by all of them.
-pub fn topic_aspects(spanish: bool) -> &'static [&'static str] {
+/// What can be said about an entity, one row per aspect, each with the
+/// question that asks for exactly that aspect. Every row names `{key}`.
+pub fn aspect_catalog(spanish: bool) -> &'static [(&'static str, &'static str); 8] {
     if spanish {
         &[
-            "El módulo `{key}` es dueño de la política de reintentos y del presupuesto de tiempo.",
-            "Quien opera `{key}` entra por el panel de administración y su registro de auditoría.",
-            "El despliegue de `{key}` se hace los viernes y exige un plan de reversión.",
+            ("El módulo `{key}` define la política de reintentos: tres intentos con backoff exponencial antes de rendirse.", "cuántas veces reintenta {key} una llamada fallida"),
+            ("Las peticiones a `{key}` expiran a los 30 segundos, y ese presupuesto se comparte con quien llama.", "cuál es el timeout de las peticiones a {key}"),
+            ("`{key}` se despliega los viernes por el pipeline de releases, nunca a mano.", "cuándo se despliega {key}"),
+            ("Revertir `{key}` implica restaurar la etiqueta de imagen anterior y reaplicar el log de migraciones.", "cómo deshacemos un release malo de {key}"),
+            ("Los operadores entran a `{key}` por el panel de administración, y cada acción queda en su log de auditoría.", "cómo acceden los operadores a {key}"),
+            ("El equipo de pagos es dueño de `{key}` y atiende sus alertas en horario de oficina.", "qué equipo es responsable de {key}"),
+            ("`{key}` guarda su estado en un archivo SQLite junto al binario, no en la base compartida.", "dónde persiste {key} su estado"),
+            ("`{key}` exporta métricas de latencia y tasa de error al tablero cada minuto.", "qué telemetría publica {key}"),
         ]
     } else {
         &[
-            "The `{key}` module owns the retry policy and the timeout budget.",
-            "Operators reach `{key}` through the admin panel and its audit log.",
-            "Deployment of `{key}` happens on Fridays and needs a rollback plan.",
+            ("The `{key}` module owns the retry policy: three attempts with exponential backoff before giving up.", "how many times does {key} retry a failed call"),
+            ("Requests to `{key}` time out after 30 seconds, and that budget is shared with the caller.", "what is the request timeout of {key}"),
+            ("`{key}` ships on Fridays through the release pipeline, never by hand.", "when does {key} get deployed"),
+            ("Rolling back `{key}` means restoring the previous image tag and replaying the migration log.", "how do we undo a bad release of {key}"),
+            ("Operators reach `{key}` through the admin panel, and every action lands in its audit log.", "how do operators get into {key}"),
+            ("The payments team owns `{key}` and answers its pages during office hours.", "which team is responsible for {key}"),
+            ("`{key}` keeps its state in a SQLite file next to the binary, not in the shared database.", "where does {key} persist its state"),
+            ("`{key}` exports latency and error-rate metrics to the dashboard every minute.", "what telemetry does {key} publish"),
         ]
     }
 }
 
-pub fn topic_query(spanish: bool) -> &'static str {
+/// Questions that need several aspects at once, as indices into
+/// `aspect_catalog` plus the question text.
+pub fn multi_aspect_queries(spanish: bool) -> &'static [(&'static [usize], &'static str)] {
     if spanish {
-        "todo lo que se sabe sobre {key}"
+        &[
+            (&[2, 3], "cómo se publica {key} y cómo se deshace un release"),
+            (&[0, 1], "qué reglas de reintentos y timeout aplican a {key}"),
+            (&[4, 5, 7], "quién opera {key}, cómo se entra y qué reporta"),
+        ]
     } else {
-        "everything known about {key}"
+        &[
+            (&[2, 3], "how is {key} released and how is a release undone"),
+            (&[0, 1], "what retry and timeout rules apply to {key}"),
+            (&[4, 5, 7], "who runs {key}, how do people get in, and what does it report"),
+        ]
     }
 }
 
@@ -328,6 +348,35 @@ mod tests {
                         "{mention}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn the_aspect_catalog_has_eight_distinct_aspects_in_each_language() {
+        for spanish in [false, true] {
+            let catalog = aspect_catalog(spanish);
+            assert_eq!(catalog.len(), 8);
+            for (row, question) in catalog {
+                assert!(row.contains("`{key}`"), "{row}");
+                assert!(question.contains("{key}"), "{question}");
+            }
+            let rows: std::collections::HashSet<_> = catalog.iter().map(|(r, _)| r).collect();
+            assert_eq!(rows.len(), 8);
+        }
+    }
+
+    #[test]
+    fn multi_aspect_queries_ask_for_two_or_three_distinct_aspects_of_the_catalog() {
+        for spanish in [false, true] {
+            let queries = multi_aspect_queries(spanish);
+            assert!(queries.len() >= 2);
+            for (aspects, query) in queries {
+                assert!((2..=3).contains(&aspects.len()), "{query}");
+                assert!(aspects.iter().all(|&a| a < aspect_catalog(spanish).len()));
+                let unique: std::collections::HashSet<_> = aspects.iter().collect();
+                assert_eq!(unique.len(), aspects.len());
+                assert!(query.contains("{key}"), "{query}");
             }
         }
     }

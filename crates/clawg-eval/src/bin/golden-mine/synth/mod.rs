@@ -301,45 +301,40 @@ impl Codenames {
     }
 }
 
-/// Topics split over two or three rows, with one question whose answer is all
-/// of them: the case that gives nDCG something to rank.
+/// Entities that many rows talk about: each key gets one row per aspect
+/// (retries, timeouts, deployment, ...), and the question asks for two or
+/// three of them. The other rows name the same key, so they compete with the
+/// answers and are wrong only because they cover a different aspect.
 fn multi_ref_topics(base: &Golden, names: &mut Codenames, rng: &mut SplitMix64) -> (Vec<Row>, Vec<Case>) {
     let mut rows = Vec::new();
     let mut cases = Vec::new();
-    let mut groups: Vec<Vec<String>> = Vec::new();
 
     for topic in 0..MULTI_REF_TOPICS {
         let key = names.next(base, rng);
         let spanish = topic % 2 == 1;
-        let aspects = templates::topic_aspects(spanish);
-        let take = if topic % 2 == 0 { 3 } else { 2 };
+        let catalog = templates::aspect_catalog(spanish);
+        let queries = templates::multi_aspect_queries(spanish);
+        let (asked, query) = queries[topic % queries.len()];
 
-        let refs: Vec<String> = (0..take).map(|k| format!("s-mr-{topic:02}-{k}")).collect();
-        for (ref_, aspect) in refs.iter().zip(aspects) {
+        let refs: Vec<String> = (0..catalog.len()).map(|k| format!("s-mr-{topic:02}-{k}")).collect();
+        for (ref_, (content, _)) in refs.iter().zip(catalog) {
             rows.push(Row {
                 ref_: ref_.clone(),
-                content: templates::fill(aspect, &[("{key}", &key)]),
+                content: templates::fill(content, &[("{key}", &key)]),
                 memory_type: "semantic_fact".to_string(),
                 importance: 5.0,
                 lang: Some(if spanish { "es" } else { "en" }.to_string()),
             });
         }
         cases.push(Case {
-            query: templates::fill(templates::topic_query(spanish), &[("{key}", &key)]),
-            corpus_refs: refs.clone(),
-            expected_refs: refs.clone(),
+            query: templates::fill(query, &[("{key}", &key)]),
+            expected_refs: asked.iter().map(|&k| refs[k].clone()).collect(),
+            corpus_refs: refs,
             status: Status::Active,
             blocked_by: None,
             history: Vec::new(),
             subset: Subset::MultiRef,
         });
-        groups.push(refs);
-    }
-
-    // A neighbouring topic's first row joins each pool so the pool is not
-    // made only of answers.
-    for (i, case) in cases.iter_mut().enumerate() {
-        case.corpus_refs.push(groups[(i + 1) % groups.len()][0].clone());
     }
     (rows, cases)
 }
@@ -792,6 +787,7 @@ mod tests {
     fn every_multi_reference_expectation_is_in_the_pool_and_the_corpus() {
         let out = generate(&grouped_base(), 7, &NONE).unwrap();
         for case in cases_of(&out, Subset::MultiRef) {
+            assert!((2..=3).contains(&case.expected_refs.len()), "{}", case.query);
             for r in &case.expected_refs {
                 assert!(case.corpus_refs.contains(r), "{}", case.query);
                 row_of(&out, r);
@@ -800,13 +796,32 @@ mod tests {
     }
 
     #[test]
-    fn a_multi_reference_topic_key_lives_in_exactly_the_expected_rows() {
-        let out = generate(&grouped_base(), 7, &Sizes { distractors: 100 }).unwrap();
+    fn a_multi_reference_key_names_eight_rows_and_only_some_of_them_answer() {
+        let base = grouped_base();
+        let out = generate(&base, 7, &Sizes { distractors: 100 }).unwrap();
+        let mut keys = HashSet::new();
         for case in cases_of(&out, Subset::MultiRef) {
             let key = ident_of(row_of(&out, &case.expected_refs[0]));
             assert!(case.query.contains(key), "{} lacks {key}", case.query);
-            let holders = out.corpus.iter().filter(|r| r.content.contains(key)).count();
-            assert_eq!(holders, case.expected_refs.len(), "{key}");
+            assert!(keys.insert(key.to_string()), "{key} is reused");
+            assert!(!base.corpus.iter().any(|r| r.content.contains(key)));
+
+            let holders: Vec<&str> =
+                out.corpus.iter().filter(|r| r.content.contains(key)).map(|r| r.ref_.as_str()).collect();
+            assert_eq!(holders.len(), 8, "{key}");
+            assert_eq!(case.corpus_refs.len(), 8, "{key}");
+            assert!(holders.iter().all(|h| case.corpus_refs.iter().any(|r| r == h)), "{key}");
+            assert!(case.expected_refs.len() < holders.len());
+        }
+    }
+
+    #[test]
+    fn the_rows_of_a_multi_reference_key_cover_different_aspects() {
+        let out = generate(&grouped_base(), 7, &NONE).unwrap();
+        for case in cases_of(&out, Subset::MultiRef) {
+            let contents: HashSet<&str> =
+                case.corpus_refs.iter().map(|r| row_of(&out, r).content.as_str()).collect();
+            assert_eq!(contents.len(), 8, "{}", case.query);
         }
     }
 
