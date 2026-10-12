@@ -1,0 +1,64 @@
+[package]
+name = "clawg-core"
+description = "Claw Garden memory substrate: local-first memory for agents"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "clawg_core"
+crate-type = ["rlib"]
+
+[features]
+# Opens `eval_api` — the narrow, feature-gated door into retrieval internals
+# used by the `clawg-eval` binaries. Off by default so production builds never
+# link it.
+eval = []
+
+# Opens `MemoryStore::new_for_test()`, `FakeEmbedder` and the two cross-module
+# test helpers to OTHER crates' test builds. Never enabled by a production
+# build: only dev-dependencies turn it on.
+testing = []
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+uuid.workspace = true
+log.workspace = true
+dirs.workspace = true
+sha2.workspace = true
+unicode-normalization.workspace = true
+once_cell.workspace = true
+
+# Storage and vector search
+tokio-rusqlite.workspace = true
+rusqlite.workspace = true
+refinery.workspace = true
+sqlite-vec.workspace = true
+siphasher.workspace = true
+
+# Embedder
+fastembed.workspace = true
+fs2.workspace = true
+
+# Ingest (chunking and tokenization)
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-typescript.workspace = true
+tree-sitter-python.workspace = true
+tokenizers.workspace = true
+
+[dev-dependencies]
+# Enables tokio::time::pause() / advance() and #[tokio::test(start_paused = true)]
+# for time-controlled async tests without real sleeps.
+tokio = { workspace = true, features = ["test-util"] }
+mockito.workspace = true
+tempfile.workspace = true

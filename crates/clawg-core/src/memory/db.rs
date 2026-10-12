@@ -1,0 +1,1604 @@
+use std::path::Path;
+use std::sync::{Arc, Once};
+
+use rusqlite::OptionalExtension;
+use tokio_rusqlite::Connection;
+
+use crate::memory::embedder::Embedder;
+use crate::memory::error::MemoryError;
+use crate::memory::latency::KnnLatency;
+use crate::memory::store_lock::{StoreHolder, StoreLock};
+
+// ---------------------------------------------------------------------------
+// Embedding contract
+// ---------------------------------------------------------------------------
+
+/// The active embedder's full identity, as reported by the embedder itself —
+/// never assembled from two different sources. `model_id`/`dim`/`query_prefix`/
+/// `passage_prefix` are properties the embedder reports about itself (like
+/// `dim = 384`), not invariants the store imposes; `metric`/`normalized` stay
+/// out of this type for exactly that reason (see `ensure_embedding_contract`'s
+/// doc comment).
+///
+/// Named fields, not four positional args: two adjacent `String` prefixes
+/// would let a query/passage swap compile silently and produce a contract
+/// wrong in a way nothing would notice unless a test asserted orientation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbeddingIdentity {
+    pub model_id: String,
+    pub dim: usize,
+    pub query_prefix: String,
+    pub passage_prefix: String,
+}
+
+impl EmbeddingIdentity {
+    /// Reads all four fields off ONE embedder instance — a mismatch cannot be
+    /// assembled by pairing metadata from two different sources.
+    pub fn of(e: &dyn Embedder) -> Self {
+        Self {
+            model_id: e.model_id().to_string(),
+            dim: e.dimensions(),
+            query_prefix: e.query_prefix().to_string(),
+            passage_prefix: e.passage_prefix().to_string(),
+        }
+    }
+}
+
+/// The `embedding_contract` row as it was actually persisted. `dim` is `i64`
+/// because it came out of SQLite, not `usize` like the active embedder
+/// reports — the boundary is the point where that type change happens.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredContract {
+    pub model_id: String,
+    pub dim: i64,
+    pub query_prefix: String,
+    pub passage_prefix: String,
+}
+
+/// Outcome of comparing the active embedder's identity against the
+/// persisted `embedding_contract` row.
+///
+/// `Match` and `Initialized` are kept distinct (rather than collapsed into a
+/// single "ok" case) because "row absent -> written" and "row present ->
+/// left alone" are two different assertions callers and tests care about
+/// separately.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContractStatus {
+    /// An existing row's `model_id` + `dim` + `query_prefix` + `passage_prefix`
+    /// match the active embedder.
+    Match,
+    /// No row existed; one was just written from the active embedder's metadata.
+    Initialized,
+    /// An existing row differs from the active embedder on at least one of
+    /// `model_id` / `dim` / `query_prefix` / `passage_prefix` — the store
+    /// holds vectors from a different embedding space than the one currently
+    /// loaded.
+    Mismatch {
+        stored: StoredContract,
+        actual: EmbeddingIdentity,
+    },
+}
+
+/// One entry per field that differs between `stored` and `actual`, each
+/// naming the field and `{:?}`-quoting both sides so a one-trailing-space
+/// prefix difference is visible in a log line instead of looking identical.
+/// Pure — this is the message body, not a side-effecting log call.
+pub fn differing_fields(stored: &StoredContract, actual: &EmbeddingIdentity) -> Vec<String> {
+    let mut out = Vec::new();
+    if stored.model_id != actual.model_id {
+        out.push(format!(
+            "model_id: stored={:?} actual={:?}",
+            stored.model_id, actual.model_id
+        ));
+    }
+    if stored.dim != actual.dim as i64 {
+        out.push(format!("dim: stored={:?} actual={:?}", stored.dim, actual.dim));
+    }
+    if stored.query_prefix != actual.query_prefix {
+        out.push(format!(
+            "query_prefix: stored={:?} actual={:?}",
+            stored.query_prefix, actual.query_prefix
+        ));
+    }
+    if stored.passage_prefix != actual.passage_prefix {
+        out.push(format!(
+            "passage_prefix: stored={:?} actual={:?}",
+            stored.passage_prefix, actual.passage_prefix
+        ));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// vec0 static registration
+// ---------------------------------------------------------------------------
+
+static VEC0_REGISTERED: Once = Once::new();
+
+/// Register `sqlite-vec` with SQLite's auto-extension hook — ONCE per process.
+///
+/// Uses `sqlite3_auto_extension` so the extension is loaded for every subsequent
+/// `sqlite3_open` call, including the in-memory connections used in tests.
+///
+/// The `transmute` pattern matches the upstream `sqlite-vec` demo and is the
+/// correct approach for `rusqlite 0.37` (which still exposes the raw FFI).
+/// The `Once` guard makes this idempotent and thread-safe.
+fn ensure_vec0_registered() {
+    VEC0_REGISTERED.call_once(|| {
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// MemoryStore
+// ---------------------------------------------------------------------------
+
+/// Handle to the persistent memory SQLite database.
+///
+/// Wraps a [`tokio_rusqlite::Connection`], which is itself `Clone` (channel
+/// handle) — cloning `MemoryStore` gives another handle to the same background
+/// thread. No `Mutex` is needed.
+#[derive(Clone)]
+pub struct MemoryStore {
+    pub conn: Connection,
+    /// Shared with every clone deliberately: the handles all address one
+    /// database, so they belong to one latency series instead of each
+    /// keeping a private slice too short to mean anything.
+    knn_latency: Arc<KnnLatency>,
+    /// Exclusive ownership of `<base_dir>/memory.db`, shared with every clone.
+    ///
+    /// Never read: the guard is the value. Behind an `Arc` so the store stays
+    /// owned until the LAST clone is dropped — the runtime hands clones to the
+    /// ingest worker and the maintenance loop, and releasing the lock when the
+    /// first one goes would let a second process in under still-live writers.
+    /// `None` for the in-memory test store, which has nothing to exclude.
+    _lock: Option<Arc<StoreLock>>,
+}
+
+impl MemoryStore {
+    /// Open (or create) the memory database at `<base_dir>/memory.db`.
+    ///
+    /// Registers the `sqlite-vec` extension (process-global, idempotent) and
+    /// runs every refinery migration before returning.
+    ///
+    /// Takes exclusive ownership of the data directory FIRST — before SQLite is
+    /// touched — and keeps it for as long as any clone of the returned store
+    /// lives. A process that loses gets [`MemoryError::StoreInUse`] and has not
+    /// created, opened or migrated `memory.db`: those are the holder's alone.
+    /// `holder` says who is asking, so the loser's message can name it.
+    pub async fn open(base_dir: &Path, holder: StoreHolder) -> Result<Self, MemoryError> {
+        ensure_vec0_registered();
+        // Best-effort directory creation — we'll get a clean error on open if it fails.
+        let _ = std::fs::create_dir_all(base_dir);
+        let lock = StoreLock::acquire(base_dir, holder)?;
+        let path = base_dir.join("memory.db");
+        // Connection::open returns Result<_, rusqlite::Error>
+        let conn = Connection::open(&path).await
+            .map_err(MemoryError::Sqlite)?;
+        // WAL plus synchronous=NORMAL: one writer and concurrent readers
+        // instead of a writer that locks readers out, at the cost of an
+        // fsync per checkpoint rather than per commit. Set before the
+        // migrations so the schema build runs under it too.
+        //
+        // Read back rather than assumed, and never fatal: journal_mode
+        // returns the mode it actually landed on, and a filesystem that
+        // refuses WAL (a network-mounted home does exactly this) must leave
+        // the app slower, not unable to start.
+        match conn
+            .call(|c| -> rusqlite::Result<String> {
+                c.pragma_update(None, "synchronous", "NORMAL")?;
+                c.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+            })
+            .await
+        {
+            Ok(mode) if mode.eq_ignore_ascii_case("wal") => {}
+            Ok(mode) => log::warn!("memory.db journal_mode is {mode}, not wal; falling back to the default rollback journal"),
+            Err(e) => log::warn!("could not set memory.db journal mode: {e}; falling back to the default rollback journal"),
+        }
+        register_udfs(&conn).await?;
+        run_migrations(&conn).await?;
+        // Raise SQLITE_LIMIT_VARIABLE_NUMBER from the default 999 to 32766 (SQLite hard
+        // maximum). Flush batches of ≤500 rows × 3 bind vars = 1500 params would otherwise
+        // exceed the default limit at row 334.
+        conn.call(|c| -> rusqlite::Result<()> {
+            // SAFETY: c is the exclusive connection reference for this call.
+            unsafe {
+                rusqlite::ffi::sqlite3_limit(
+                    c.handle(),
+                    rusqlite::ffi::SQLITE_LIMIT_VARIABLE_NUMBER,
+                    32766,
+                );
+            }
+            Ok(())
+        })
+        .await
+        .map_err(MemoryError::Connection)?;
+        Ok(Self {
+            conn,
+            knn_latency: Arc::new(KnnLatency::new()),
+            _lock: Some(Arc::new(lock)),
+        })
+    }
+
+    /// In-memory database for unit tests.
+    ///
+    /// Registers vec0 (process-global) and runs all migrations. Every call in
+    /// the same process shares the process-global `Once` guard — registration
+    /// happens at most once regardless of how many test stores are created.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn new_for_test() -> Result<Self, MemoryError> {
+        ensure_vec0_registered();
+        // Connection::open_in_memory returns Result<_, rusqlite::Error>
+        let conn = Connection::open_in_memory().await
+            .map_err(MemoryError::Sqlite)?;
+        register_udfs(&conn).await?;
+        run_migrations(&conn).await?;
+        // Raise SQLITE_LIMIT_VARIABLE_NUMBER — same as open() path.
+        conn.call(|c| -> rusqlite::Result<()> {
+            // SAFETY: c is the exclusive connection reference for this call.
+            unsafe {
+                rusqlite::ffi::sqlite3_limit(
+                    c.handle(),
+                    rusqlite::ffi::SQLITE_LIMIT_VARIABLE_NUMBER,
+                    32766,
+                );
+            }
+            Ok(())
+        })
+        .await
+        .map_err(MemoryError::Connection)?;
+        Ok(Self {
+            conn,
+            knn_latency: Arc::new(KnnLatency::new()),
+            _lock: None,
+        })
+    }
+
+    /// The shared KNN latency recorder for this store's database.
+    ///
+    /// Every clone of this `MemoryStore` returns the same recorder — see the
+    /// field doc comment for why that sharing is intended, not accidental.
+    pub(crate) fn knn_latency(&self) -> &KnnLatency {
+        &self.knn_latency
+    }
+
+    /// Write-if-absent, verify-if-present bootstrap for the single-row
+    /// `embedding_contract` table.
+    ///
+    /// Compares `model_id` + `dim` + `query_prefix` + `passage_prefix`
+    /// against the stored row, byte-exact — no trim, no normalization: a
+    /// prefix is fed verbatim to the tokenizer, so `"query:"` and `"query: "`
+    /// tokenize to different sequences and a trimmed comparison would forgive
+    /// exactly the difference that matters. `metric` and `normalized` stay
+    /// OUT of the comparison for the opposite reason: they are invariants
+    /// `memory::vector::to_unit` imposes on every row in this store, not
+    /// properties the embedder itself reports — the four compared fields are
+    /// all things the embedder tells you about itself (like `dim = 384`);
+    /// `metric`/`normalized` are things this codebase decided.
+    pub async fn ensure_embedding_contract(
+        &self,
+        identity: EmbeddingIdentity,
+    ) -> Result<ContractStatus, MemoryError> {
+        self.conn
+            .call(move |c| -> rusqlite::Result<ContractStatus> {
+                let existing: Option<(String, i64, String, String)> = c
+                    .query_row(
+                        "SELECT model_id, dim, query_prefix, passage_prefix \
+                         FROM embedding_contract WHERE id = 1",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    )
+                    .optional()?;
+
+                match existing {
+                    None => {
+                        let created_at = crate::memory::clock::TimestampMs::now();
+                        c.execute(
+                            "INSERT INTO embedding_contract \
+                             (id, model_id, dim, metric, normalized, query_prefix, passage_prefix, created_at) \
+                             VALUES (1, ?1, ?2, 'l2_unit', 1, ?3, ?4, ?5)",
+                            rusqlite::params![
+                                identity.model_id,
+                                identity.dim as i64,
+                                identity.query_prefix,
+                                identity.passage_prefix,
+                                created_at
+                            ],
+                        )?;
+                        Ok(ContractStatus::Initialized)
+                    }
+                    Some((stored_model_id, stored_dim, stored_query_prefix, stored_passage_prefix)) => {
+                        let stored = StoredContract {
+                            model_id: stored_model_id,
+                            dim: stored_dim,
+                            query_prefix: stored_query_prefix,
+                            passage_prefix: stored_passage_prefix,
+                        };
+                        if stored.model_id == identity.model_id
+                            && stored.dim == identity.dim as i64
+                            && stored.query_prefix == identity.query_prefix
+                            && stored.passage_prefix == identity.passage_prefix
+                        {
+                            Ok(ContractStatus::Match)
+                        } else {
+                            Ok(ContractStatus::Mismatch { stored, actual: identity })
+                        }
+                    }
+                }
+            })
+            .await
+            .map_err(MemoryError::Connection)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UDF registration
+// ---------------------------------------------------------------------------
+
+/// Registers every Rust scalar UDF this database's SQL may call.
+///
+/// Runs BEFORE the migration runner, not after: a migration body can call
+/// these (the content-hash backfill does), and an unregistered UDF is a
+/// "no such function" error that aborts migration on cold start. Nothing
+/// here touches the schema, so running it against an unmigrated connection
+/// is safe by construction. New UDFs go inside this function — never as a
+/// separate call beside run_migrations.
+async fn register_udfs(conn: &Connection) -> Result<(), MemoryError> {
+    crate::memory::dedup::register_content_hash_udf(conn).await?;
+    crate::memory::tier::register_tier_udf(conn).await?;
+    crate::memory::tier::register_demote_udf(conn).await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration helper
+// ---------------------------------------------------------------------------
+
+async fn run_migrations(conn: &Connection) -> Result<(), MemoryError> {
+    conn.call(|c: &mut rusqlite::Connection| -> Result<refinery::Report, refinery::Error> {
+        crate::memory::migrations::runner().run(c)
+    })
+    .await
+    .map_err(|e| match e {
+        tokio_rusqlite::Error::ConnectionClosed => {
+            // Connection was closed before migrations could run — treat as SQLite error.
+            MemoryError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ffi::ErrorCode::InternalMalfunction,
+                    extended_code: 0,
+                },
+                Some("connection closed during migration".to_string()),
+            ))
+        }
+        tokio_rusqlite::Error::Close((_, db_err)) => {
+            MemoryError::Sqlite(db_err)
+        }
+        tokio_rusqlite::Error::Error(refinery_err) => {
+            MemoryError::Migration(refinery_err)
+        }
+        // non_exhaustive — catch-all for future tokio_rusqlite::Error variants
+        _ => MemoryError::Internal(
+            "unexpected tokio-rusqlite error during migration".to_string()
+        ),
+    })
+    .map(|_report| ())?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::params;
+
+    // -----------------------------------------------------------------------
+    // Helper: serialize f32 vector to bytes for vec0 (little-endian IEEE 754)
+    // -----------------------------------------------------------------------
+
+    fn serialize_f32_vec(v: &[f32]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(v.len() * 4);
+        for &f in v {
+            bytes.extend_from_slice(&f.to_le_bytes());
+        }
+        bytes
+    }
+
+    // -----------------------------------------------------------------------
+    // Vec0 registration + schema tests
+    // -----------------------------------------------------------------------
+
+    /// Vec_version() returns a non-empty string.
+    #[tokio::test]
+    async fn vec_version_returns_string() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let version: String = store
+            .conn
+            .call(|c| -> Result<String, rusqlite::Error> {
+                c.query_row("SELECT vec_version()", [], |r| r.get(0))
+            })
+            .await
+            .unwrap();
+        assert!(!version.is_empty(), "vec_version() returned empty string");
+    }
+
+    /// V6's eager backfill, exercised through the migration runner itself.
+    ///
+    /// `dedup.rs::backfilled_row_becomes_lookup_visible` covers the same
+    /// property by executing its own transcription of the UPDATE, so it says
+    /// nothing about the migration file: deleting the backfill statement from
+    /// `V6__content_hash.sql` outright left all 801 tests green
+    /// (mutation-verified). A shipped build with no backfill leaves every row
+    /// written before the upgrade at `content_hash IS NULL` — permanently
+    /// invisible to the dedup gate, which is the entire point of doing the
+    /// backfill eagerly instead of lazily.
+    ///
+    /// This is the only test that migrates in two steps: rows must exist
+    /// BEFORE V6 runs for a backfill to have anything to do, and
+    /// `new_for_test()` runs the whole chain against an empty database.
+    #[tokio::test]
+    async fn v6_migration_backfills_rows_written_before_it() {
+        ensure_vec0_registered();
+        let conn = Connection::open_in_memory().await.unwrap();
+        register_udfs(&conn).await.unwrap();
+
+        // Stop at V5: the schema has no content_hash column yet.
+        conn.call(|c| {
+            crate::memory::migrations::runner()
+                .set_target(refinery::Target::Version(5))
+                .run(c)
+        })
+        .await
+        .unwrap();
+
+        conn.call(|c| {
+            c.execute(
+                "INSERT INTO memory \
+                 (scope, agent_id, content, memory_type, source, \
+                  created_at, created_by_type, created_by_ref, \
+                  last_modified_at, last_accessed_at, importance, tier, status) \
+                 VALUES ('agent', 'agent-v6', 'pre-v6 content', 'chat_message', 'chat', \
+                  0, 'user', 'agent-v6', 0, 0, 5.0, 3, 'active')",
+                [],
+            )
+        })
+        .await
+        .unwrap();
+
+        // Now run V6 — the row above is exactly the legacy case it targets.
+        conn.call(|c| crate::memory::migrations::runner().run(c))
+            .await
+            .unwrap();
+
+        let hash: Option<String> = conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT content_hash FROM memory WHERE agent_id = 'agent-v6'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            hash.as_deref(),
+            Some(crate::memory::dedup::content_hash("pre-v6 content").as_str()),
+            "V6 must backfill content_hash for rows that predate the column, in the same hash \
+             space the runtime write path uses"
+        );
+    }
+
+    /// Ensure_vec0_registered is idempotent (no panic on second call).
+    #[tokio::test]
+    async fn ensure_vec0_idempotent() {
+        // Call registration twice in the same process — Once guard prevents double-init.
+        ensure_vec0_registered();
+        ensure_vec0_registered();
+        // If we reach here without panic, the test passes.
+    }
+
+    /// Tables present after open.
+    #[tokio::test]
+    async fn tables_exist_after_open() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tables: Vec<String> = store
+            .conn
+            .call(|c| -> Result<Vec<String>, rusqlite::Error> {
+                let mut stmt = c
+                    .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")?;
+                let names = stmt
+                    .query_map([], |r| r.get(0))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                Ok(names)
+            })
+            .await
+            .unwrap();
+        assert!(tables.contains(&"memory".to_string()), "missing 'memory' table");
+        assert!(
+            tables.contains(&"episodic_trajectory".to_string()),
+            "missing 'episodic_trajectory' table"
+        );
+        assert!(
+            tables.contains(&"procedural_skill".to_string()),
+            "missing 'procedural_skill' table"
+        );
+    }
+
+    /// Virtual tables (vec0) present after open.
+    #[tokio::test]
+    async fn virtual_tables_exist_after_open() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        // vec0 shadow tables appear in sqlite_master under various types; query by name.
+        let names: Vec<String> = store
+            .conn
+            .call(|c| -> Result<Vec<String>, rusqlite::Error> {
+                let mut stmt = c.prepare("SELECT name FROM sqlite_master ORDER BY name")?;
+                let names = stmt
+                    .query_map([], |r| r.get(0))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                Ok(names)
+            })
+            .await
+            .unwrap();
+        assert!(
+            names.contains(&"memory_vectors".to_string()),
+            "missing 'memory_vectors'"
+        );
+        assert!(
+            names.contains(&"episodic_vectors".to_string()),
+            "missing 'episodic_vectors'"
+        );
+        assert!(
+            names.contains(&"procedural_vectors".to_string()),
+            "missing 'procedural_vectors'"
+        );
+    }
+
+    /// The schema carries no views at all, and `all_memories` in particular is
+    /// gone.
+    ///
+    /// V3 created it to scan the three memory kinds in one query; nothing ever
+    /// selected from it. That was structural: flattening three tables onto one
+    /// column list drops `memory_type` and every per-kind column, so callers
+    /// read the tables directly instead. V7 drops it, and asserting the view
+    /// list is EMPTY — rather than just that this one name is absent — is what
+    /// keeps a re-created view from slipping back in unnoticed.
+    #[tokio::test]
+    async fn schema_carries_no_views_after_open() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let views: Vec<String> = store
+            .conn
+            .call(|c| -> Result<Vec<String>, rusqlite::Error> {
+                let mut stmt =
+                    c.prepare("SELECT name FROM sqlite_master WHERE type='view'")?;
+                let names = stmt
+                    .query_map([], |r| r.get(0))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                Ok(names)
+            })
+            .await
+            .unwrap();
+        assert!(
+            views.is_empty(),
+            "no view should survive the migration chain, found: {views:?}"
+        );
+    }
+
+    /// An existing database that already has the view loses it on upgrade —
+    /// the drop has to reach installed schemas, not just freshly built ones.
+    /// `new_for_test()` runs the whole chain at once and so can never show
+    /// this; the two-step run is the only shape that can.
+    #[tokio::test]
+    async fn v7_drops_the_view_from_an_already_migrated_database() {
+        ensure_vec0_registered();
+        let conn = Connection::open_in_memory().await.unwrap();
+        register_udfs(&conn).await.unwrap();
+
+        conn.call(|c| {
+            crate::memory::migrations::runner()
+                .set_target(refinery::Target::Version(3))
+                .run(c)
+        })
+        .await
+        .unwrap();
+
+        let before: i64 = conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='view' AND name='all_memories'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(before, 1, "V3 must have created the view for this test to mean anything");
+
+        conn.call(|c| crate::memory::migrations::runner().run(c))
+            .await
+            .unwrap();
+
+        let after: i64 = conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='view' AND name='all_memories'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(after, 0, "V7 must drop the view on an upgraded database");
+    }
+
+    /// Indices present after open.
+    #[tokio::test]
+    async fn indices_exist_after_open() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let indices: Vec<String> = store
+            .conn
+            .call(|c| -> Result<Vec<String>, rusqlite::Error> {
+                let mut stmt = c.prepare(
+                    "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name",
+                )?;
+                let names = stmt
+                    .query_map([], |r| r.get(0))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                Ok(names)
+            })
+            .await
+            .unwrap();
+        let expected = [
+            "idx_memory_agent_active",
+            "idx_memory_scope_project",
+            "idx_memory_last_accessed",
+            "idx_memory_superseded",
+            "idx_memory_disputed",
+            "idx_memory_tier_status",
+            "idx_epi_agent_active",
+            "idx_epi_scope_project",
+            "idx_epi_last_accessed",
+            "idx_epi_tier_status",
+            "idx_proc_agent_active",
+            "idx_proc_scope_project",
+            "idx_proc_last_accessed",
+            "idx_proc_tier_status",
+        ];
+        for name in &expected {
+            assert!(
+                indices.contains(&name.to_string()),
+                "missing index '{}'",
+                name
+            );
+        }
+    }
+
+    /// Total object count.
+    #[tokio::test]
+    async fn nine_schema_objects_exist() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let count: i64 = store
+            .conn
+            .call(|c| -> Result<i64, rusqlite::Error> {
+                c.query_row(
+                    "SELECT count(*) FROM sqlite_master \
+                     WHERE type IN ('table','view','index')",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        // A floor, not an exact count: vec0 and FTS5 each register their own shadow
+        // tables in sqlite_master alongside the ones this schema declares directly,
+        // and that shadow-table count is an extension implementation detail this
+        // test does not want to pin. No view is included — V7 dropped the one this
+        // schema used to carry, and nothing since has added one back.
+        assert!(
+            count >= 18,
+            "Expected at least 18 schema objects, got {}",
+            count
+        );
+    }
+
+    /// MemoryStore is Clone, both handles work.
+    #[tokio::test]
+    async fn memory_store_is_clone() {
+        let s1 = MemoryStore::new_for_test().await.unwrap();
+        let s2 = s1.clone();
+        let v1: String = s1
+            .conn
+            .call(|c| -> Result<String, rusqlite::Error> {
+                c.query_row("SELECT vec_version()", [], |r| r.get(0))
+            })
+            .await
+            .unwrap();
+        let v2: String = s2
+            .conn
+            .call(|c| -> Result<String, rusqlite::Error> {
+                c.query_row("SELECT vec_version()", [], |r| r.get(0))
+            })
+            .await
+            .unwrap();
+        assert_eq!(v1, v2);
+        assert!(!v1.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // SQLITE_LIMIT_VARIABLE_NUMBER must be 32766 through BOTH connection-
+    // opening paths (open() and new_for_test()) — a mismatch here would mean
+    // only one of the two ever benefits from the raised bind-parameter cap.
+    // -----------------------------------------------------------------------
+
+    /// Production open() path sets SQLITE_LIMIT_VARIABLE_NUMBER = 32766.
+    ///
+    /// Uses `sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, -1)` to query the
+    /// current value without changing it (SQLite contract: any negative new_val
+    /// is a no-op that returns the current limit).
+    #[tokio::test]
+    async fn limit_variable_number_set_in_open_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+        let limit: i32 = store
+            .conn
+            .call(|c| -> rusqlite::Result<i32> {
+                // SAFETY: c is the active handle; sqlite3_limit with -1 is a read-only query.
+                Ok(unsafe {
+                    rusqlite::ffi::sqlite3_limit(
+                        c.handle(),
+                        rusqlite::ffi::SQLITE_LIMIT_VARIABLE_NUMBER,
+                        -1,
+                    )
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(limit, 32766, "open(): expected 32766, got {limit}");
+    }
+
+    /// Test new_for_test() path sets SQLITE_LIMIT_VARIABLE_NUMBER = 32766.
+    #[tokio::test]
+    async fn limit_variable_number_set_in_new_for_test_path() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let limit: i32 = store
+            .conn
+            .call(|c| -> rusqlite::Result<i32> {
+                // SAFETY: c is the active handle; sqlite3_limit with -1 is a read-only query.
+                Ok(unsafe {
+                    rusqlite::ffi::sqlite3_limit(
+                        c.handle(),
+                        rusqlite::ffi::SQLITE_LIMIT_VARIABLE_NUMBER,
+                        -1,
+                    )
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(limit, 32766, "new_for_test(): expected 32766, got {limit}");
+    }
+
+    // -----------------------------------------------------------------------
+    // WAL durability — production open() enables journal_mode=WAL and
+    // synchronous=NORMAL; the in-memory test path is deliberately untouched.
+    // -----------------------------------------------------------------------
+
+    /// WAL-1 — production open() path reports journal_mode "wal" on read-back.
+    #[tokio::test]
+    async fn open_sets_journal_mode_wal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+        let mode: String = store
+            .conn
+            .call(|c| -> rusqlite::Result<String> { c.query_row("PRAGMA journal_mode", [], |r| r.get(0)) })
+            .await
+            .unwrap();
+        assert!(mode.eq_ignore_ascii_case("wal"), "expected journal_mode wal, got {mode}");
+    }
+
+    /// WAL-2 — production open() path sets synchronous=NORMAL (value 1).
+    #[tokio::test]
+    async fn open_sets_synchronous_normal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+        let synchronous: i64 = store
+            .conn
+            .call(|c| -> rusqlite::Result<i64> { c.query_row("PRAGMA synchronous", [], |r| r.get(0)) })
+            .await
+            .unwrap();
+        assert_eq!(synchronous, 1, "expected synchronous=NORMAL (1), got {synchronous}");
+    }
+
+    /// WAL-3 — new_for_test()'s in-memory connection is deliberately left
+    /// alone: no WAL pragma is issued, so journal_mode never becomes "wal".
+    #[tokio::test]
+    async fn new_for_test_journal_mode_is_not_wal() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let mode: String = store
+            .conn
+            .call(|c| -> rusqlite::Result<String> { c.query_row("PRAGMA journal_mode", [], |r| r.get(0)) })
+            .await
+            .unwrap();
+        assert!(!mode.eq_ignore_ascii_case("wal"), "in-memory path must not be wal, got {mode}");
+    }
+
+    /// Second new_for_test() in same process succeeds.
+    #[tokio::test]
+    async fn idempotent_migrations_second_open() {
+        let _s1 = MemoryStore::new_for_test().await.unwrap();
+        let s2 = MemoryStore::new_for_test().await.unwrap();
+        let count: i64 = s2
+            .conn
+            .call(|c| -> Result<i64, rusqlite::Error> {
+                c.query_row(
+                    "SELECT COUNT(*) FROM refinery_schema_history",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 8, "Expected exactly 8 applied migrations, got {}", count);
+    }
+
+    /// V8 — a fresh store lands on migration count 8 and carries the FTS5
+    /// lexical index alongside it, not one without the other.
+    #[tokio::test]
+    async fn v8_migration_creates_memory_fts_and_bumps_count_to_eight() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let count: i64 = store
+            .conn
+            .call(|c| -> Result<i64, rusqlite::Error> {
+                c.query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| r.get(0))
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 8, "V8 must be the 8th applied migration on a fresh store");
+
+        let fts_exists: i64 = store
+            .conn
+            .call(|c| -> Result<i64, rusqlite::Error> {
+                c.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name = 'memory_fts'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(fts_exists, 1, "V8 must create the memory_fts virtual table");
+    }
+
+    /// A store that stopped at V7 upgrades to V8 cleanly, and a second run of
+    /// the same migration set afterward is a no-op — refinery's own
+    /// idempotency, exercised against the new migration specifically rather
+    /// than assumed from the V6/V7 cases already covered above.
+    #[tokio::test]
+    async fn v7_store_upgrades_to_v8_and_a_second_run_is_a_noop() {
+        ensure_vec0_registered();
+        let conn = Connection::open_in_memory().await.unwrap();
+        register_udfs(&conn).await.unwrap();
+
+        conn.call(|c| {
+            crate::memory::migrations::runner()
+                .set_target(refinery::Target::Version(7))
+                .run(c)
+        })
+        .await
+        .unwrap();
+
+        let before: i64 = conn
+            .call(|c| c.query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(before, 7, "test setup: must actually stop at V7");
+
+        conn.call(|c| crate::memory::migrations::runner().run(c))
+            .await
+            .unwrap();
+        let after: i64 = conn
+            .call(|c| c.query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(after, 8, "V8 must apply on top of an existing V7 database");
+
+        // Re-run again: nothing left to apply, count must not move.
+        conn.call(|c| crate::memory::migrations::runner().run(c))
+            .await
+            .unwrap();
+        let after_second: i64 = conn
+            .call(|c| c.query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(after_second, 8, "a second run with nothing pending must be a no-op");
+    }
+
+    /// The migration's backfill is what makes a memory written before V8
+    /// existed lexically reachable — the three triggers only fire on writes
+    /// that happen after V8 creates them, so without the backfill this row
+    /// would be indexed nowhere.
+    #[tokio::test]
+    async fn v8_backfill_makes_a_pre_existing_row_lexically_searchable() {
+        ensure_vec0_registered();
+        let conn = Connection::open_in_memory().await.unwrap();
+        register_udfs(&conn).await.unwrap();
+
+        // Stop at V7: memory_fts does not exist yet, so this insert cannot be
+        // caught by any trigger — it is exactly the row the backfill exists for.
+        conn.call(|c| {
+            crate::memory::migrations::runner()
+                .set_target(refinery::Target::Version(7))
+                .run(c)
+        })
+        .await
+        .unwrap();
+
+        conn.call(|c| {
+            c.execute(
+                "INSERT INTO memory \
+                 (scope, agent_id, content, memory_type, source, \
+                  created_at, created_by_type, created_by_ref, \
+                  last_modified_at, last_accessed_at, importance, tier, status) \
+                 VALUES ('agent', 'agent-v8-backfill', 'pre-v8 content mentions ZQXJ77PREEXIST', \
+                  'chat_message', 'chat', 0, 'user', 'agent-v8-backfill', 0, 0, 5.0, 3, 'active')",
+                [],
+            )
+        })
+        .await
+        .unwrap();
+
+        // Now run V8 — the row above predates the FTS table and its triggers.
+        conn.call(|c| crate::memory::migrations::runner().run(c))
+            .await
+            .unwrap();
+
+        let found_rowid: Option<i64> = conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT rowid FROM memory_fts WHERE memory_fts MATCH '\"ZQXJ77PREEXIST\"'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+            })
+            .await
+            .unwrap();
+        assert!(
+            found_rowid.is_some(),
+            "the backfill must make a pre-V8 row reachable through the lexical index"
+        );
+    }
+
+    /// `agent_id`/`project_id`/`memory_type` on `memory_fts` are `UNINDEXED`:
+    /// they are filter inputs for the candidate query's scope predicates, not
+    /// search terms. If any of them were indexed instead, the literal text of
+    /// a project id would become matchable by an unrelated query, and a row
+    /// could surface for a search that never mentioned its content at all.
+    #[tokio::test]
+    async fn v8_scope_columns_do_not_contribute_searchable_tokens() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+
+        // Content carries no special token; only `project_id` does. An
+        // indexed `project_id` would make this row match a MATCH query for
+        // its own value even though the content never mentions it.
+        store
+            .conn
+            .call(|c| {
+                c.execute(
+                    "INSERT INTO memory \
+                     (scope, agent_id, project_id, content, memory_type, source, \
+                      created_at, created_by_type, created_by_ref, \
+                      last_modified_at, last_accessed_at, importance, tier, status) \
+                     VALUES ('agent', 'agent-v8-unindexed', 'PROJIDQXJ99UNIQUE', \
+                      'ordinary content, no special markers here', 'chat_message', 'chat', \
+                      0, 'user', 'agent-v8-unindexed', 0, 0, 5.0, 3, 'active')",
+                    [],
+                )
+            })
+            .await
+            .unwrap();
+
+        let found_rowid: Option<i64> = store
+            .conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT rowid FROM memory_fts WHERE memory_fts MATCH '\"PROJIDQXJ99UNIQUE\"'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+            })
+            .await
+            .unwrap();
+        assert!(
+            found_rowid.is_none(),
+            "a query for a project id's literal text must not match a row whose content \
+             never mentions it — UNINDEXED columns must not contribute searchable tokens"
+        );
+    }
+
+    /// The backfill is filtered to live rows (`WHERE deleted_at IS NULL`) —
+    /// the same invariant the three triggers maintain on every write after
+    /// V8. A row already soft-deleted before V8 ever ran must not become
+    /// lexically reachable, or the migration's index and the triggers'
+    /// index would disagree about what "live" means from the moment V8 applies.
+    #[tokio::test]
+    async fn v8_backfill_excludes_rows_already_soft_deleted_before_migration() {
+        ensure_vec0_registered();
+        let conn = Connection::open_in_memory().await.unwrap();
+        register_udfs(&conn).await.unwrap();
+
+        // Stop at V7: memory_fts does not exist yet.
+        conn.call(|c| {
+            crate::memory::migrations::runner()
+                .set_target(refinery::Target::Version(7))
+                .run(c)
+        })
+        .await
+        .unwrap();
+
+        // Insert a row that is ALREADY soft-deleted, predating V8 entirely —
+        // the backfill is the only mechanism that could ever index it.
+        conn.call(|c| {
+            c.execute(
+                "INSERT INTO memory \
+                 (scope, agent_id, content, memory_type, source, \
+                  created_at, created_by_type, created_by_ref, \
+                  last_modified_at, last_accessed_at, importance, tier, status, deleted_at) \
+                 VALUES ('agent', 'agent-v8-softdel', 'pre-v8 deleted content mentions ZQXJ88DELETED', \
+                  'chat_message', 'chat', 0, 'user', 'agent-v8-softdel', 0, 0, 5.0, 3, 'active', 12345)",
+                [],
+            )
+        })
+        .await
+        .unwrap();
+
+        conn.call(|c| crate::memory::migrations::runner().run(c))
+            .await
+            .unwrap();
+
+        let found_rowid: Option<i64> = conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT rowid FROM memory_fts WHERE memory_fts MATCH '\"ZQXJ88DELETED\"'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+            })
+            .await
+            .unwrap();
+        assert!(
+            found_rowid.is_none(),
+            "the backfill must not index a row that was already soft-deleted before V8 ran"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Vec0 KNN
+    // -----------------------------------------------------------------------
+
+    /// INSERT vector + KNN returns rowid=1.
+    #[tokio::test]
+    async fn vec0_insert_and_knn() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let embedding: Vec<f32> = vec![0.0f32; 384];
+        let bytes = serialize_f32_vec(&embedding);
+
+        store
+            .conn
+            .call(move |c| -> Result<(), rusqlite::Error> {
+                c.execute(
+                    "INSERT INTO memory_vectors(rowid, embedding) VALUES (?, ?)",
+                    params![1i64, bytes],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let query_bytes = serialize_f32_vec(&embedding);
+        let row: i64 = store
+            .conn
+            .call(move |c| -> Result<i64, rusqlite::Error> {
+                c.query_row(
+                    "SELECT rowid FROM memory_vectors \
+                     WHERE embedding MATCH ? ORDER BY distance LIMIT 1",
+                    params![query_bytes],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(row, 1i64);
+    }
+
+    // -----------------------------------------------------------------------
+    // CHECK constraints
+    // -----------------------------------------------------------------------
+
+    /// Scope='agent' with agent_id IS NULL rejected.
+    #[tokio::test]
+    async fn check_agent_scope_null_agent_id_rejected() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let result = store
+            .conn
+            .call(|c| -> Result<usize, rusqlite::Error> {
+                c.execute(
+                    "INSERT INTO memory \
+                     (scope, agent_id, content, created_at, last_modified_at, last_accessed_at) \
+                     VALUES ('agent', NULL, 'x', 0, 0, 0)",
+                    [],
+                )
+            })
+            .await;
+        assert!(result.is_err(), "Expected CHECK constraint violation");
+    }
+
+    /// Scope='project' with project_id IS NULL rejected.
+    #[tokio::test]
+    async fn check_project_scope_null_project_id_rejected() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let result = store
+            .conn
+            .call(|c| -> Result<usize, rusqlite::Error> {
+                c.execute(
+                    "INSERT INTO memory \
+                     (scope, agent_id, project_id, content, created_at, last_modified_at, last_accessed_at) \
+                     VALUES ('project', NULL, NULL, 'x', 0, 0, 0)",
+                    [],
+                )
+            })
+            .await;
+        assert!(result.is_err(), "Expected CHECK constraint violation");
+    }
+
+    /// Scope='global' with agent_id IS NOT NULL rejected.
+    #[tokio::test]
+    async fn check_global_scope_nonnull_agent_id_rejected() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let result = store
+            .conn
+            .call(|c| -> Result<usize, rusqlite::Error> {
+                c.execute(
+                    "INSERT INTO memory \
+                     (scope, agent_id, content, created_at, last_modified_at, last_accessed_at) \
+                     VALUES ('global', 'some-agent', 'x', 0, 0, 0)",
+                    [],
+                )
+            })
+            .await;
+        assert!(result.is_err(), "Expected CHECK constraint violation");
+    }
+
+    // -----------------------------------------------------------------------
+    // End-to-end integration smoke test
+    // -----------------------------------------------------------------------
+
+    /// Covers tables, vec_version, KNN, clone, CHECK constraints and migration
+    /// count in one run.
+    #[tokio::test]
+    async fn e2e_store_smoke() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+
+        // Tables
+        let tables: Vec<String> = store
+            .conn
+            .call(|c| -> Result<Vec<String>, rusqlite::Error> {
+                let mut s = c.prepare(
+                    "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+                )?;
+                let result: Vec<String> = s
+                    .query_map([], |r| r.get(0))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                Ok(result)
+            })
+            .await
+            .unwrap();
+        assert!(tables.contains(&"memory".to_string()));
+        assert!(tables.contains(&"episodic_trajectory".to_string()));
+        assert!(tables.contains(&"procedural_skill".to_string()));
+
+        // The schema defines no views — V3's `all_memories` was dropped by V7
+        // after shipping unused for its whole life.
+        let views: Vec<String> = store
+            .conn
+            .call(|c| -> Result<Vec<String>, rusqlite::Error> {
+                let mut s =
+                    c.prepare("SELECT name FROM sqlite_master WHERE type='view'")?;
+                let result: Vec<String> = s
+                    .query_map([], |r| r.get(0))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                Ok(result)
+            })
+            .await
+            .unwrap();
+        assert!(views.is_empty(), "found unexpected views: {views:?}");
+
+        // Vec_version
+        let version: String = store
+            .conn
+            .call(|c| -> Result<String, rusqlite::Error> {
+                c.query_row("SELECT vec_version()", [], |r| r.get(0))
+            })
+            .await
+            .unwrap();
+        assert!(!version.is_empty());
+
+        // KNN insert + search
+        let embedding: Vec<f32> = vec![1.0f32; 384];
+        let bytes = serialize_f32_vec(&embedding);
+        store
+            .conn
+            .call(move |c| -> Result<(), rusqlite::Error> {
+                c.execute(
+                    "INSERT INTO memory_vectors(rowid, embedding) VALUES (1, ?)",
+                    params![bytes],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let query_bytes = serialize_f32_vec(&embedding);
+        let rowid: i64 = store
+            .conn
+            .call(move |c| -> Result<i64, rusqlite::Error> {
+                c.query_row(
+                    "SELECT rowid FROM memory_vectors \
+                     WHERE embedding MATCH ? ORDER BY distance LIMIT 1",
+                    params![query_bytes],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(rowid, 1);
+
+        // Clone
+        let s2 = store.clone();
+        let v2: String = s2
+            .conn
+            .call(|c| -> Result<String, rusqlite::Error> {
+                c.query_row("SELECT vec_version()", [], |r| r.get(0))
+            })
+            .await
+            .unwrap();
+        assert!(!v2.is_empty());
+
+        // CHECK constraints
+        let bad = store
+            .conn
+            .call(|c| -> Result<usize, rusqlite::Error> {
+                c.execute(
+                    "INSERT INTO memory (scope, agent_id, content, \
+                     created_at, last_modified_at, last_accessed_at) \
+                     VALUES ('agent', NULL, 'x', 0, 0, 0)",
+                    [],
+                )
+            })
+            .await;
+        assert!(bad.is_err());
+
+        // Migration count
+        let migration_count: i64 = store
+            .conn
+            .call(|c| -> Result<i64, rusqlite::Error> {
+                c.query_row(
+                    "SELECT COUNT(*) FROM refinery_schema_history",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(migration_count, 8);
+    }
+
+    // -----------------------------------------------------------------------
+    // Embedding contract: write-if-absent, verify-if-present
+    // -----------------------------------------------------------------------
+
+    /// Test-only embedder double with configurable, independently-settable
+    /// query/passage prefixes — `FakeEmbedder` returns `""` for both, which
+    /// cannot exercise a prefix-only mismatch.
+    struct MockEmbedder {
+        model_id: String,
+        dim: usize,
+        query_prefix: String,
+        passage_prefix: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::memory::embedder::Embedder for MockEmbedder {
+        async fn embed_with_role(
+            &self,
+            _text: &str,
+            _role: crate::memory::embedder::EmbedRole,
+        ) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+            Ok(vec![0.0; self.dim])
+        }
+        fn dimensions(&self) -> usize {
+            self.dim
+        }
+        fn model_id(&self) -> &str {
+            &self.model_id
+        }
+        fn query_prefix(&self) -> &str {
+            &self.query_prefix
+        }
+        fn passage_prefix(&self) -> &str {
+            &self.passage_prefix
+        }
+    }
+
+    fn identity(model_id: &str, dim: usize, query_prefix: &str, passage_prefix: &str) -> EmbeddingIdentity {
+        EmbeddingIdentity {
+            model_id: model_id.to_string(),
+            dim,
+            query_prefix: query_prefix.to_string(),
+            passage_prefix: passage_prefix.to_string(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // EmbeddingIdentity::of — reads all 4 fields off one embedder instance
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn embedding_identity_of_reads_all_four_fields_off_one_embedder() {
+        let mock = MockEmbedder {
+            model_id: "multilingual-e5-small".to_string(),
+            dim: 384,
+            query_prefix: "query: ".to_string(),
+            passage_prefix: "passage: ".to_string(),
+        };
+        let got = EmbeddingIdentity::of(&mock);
+        assert_eq!(got.model_id, "multilingual-e5-small");
+        assert_eq!(got.dim, 384);
+        assert_eq!(got.query_prefix, "query: ");
+        assert_eq!(got.passage_prefix, "passage: ");
+    }
+
+    // -----------------------------------------------------------------------
+    // differing_fields — pure
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn differing_fields_matching_contract_is_empty() {
+        let stored = StoredContract {
+            model_id: "m".to_string(),
+            dim: 384,
+            query_prefix: "query: ".to_string(),
+            passage_prefix: "passage: ".to_string(),
+        };
+        let actual = identity("m", 384, "query: ", "passage: ");
+        assert!(differing_fields(&stored, &actual).is_empty());
+    }
+
+    #[test]
+    fn differing_fields_passage_prefix_only_names_exactly_that_field() {
+        let stored = StoredContract {
+            model_id: "m".to_string(),
+            dim: 384,
+            query_prefix: "query: ".to_string(),
+            passage_prefix: "passage:".to_string(), // missing the trailing space
+        };
+        let actual = identity("m", 384, "query: ", "passage: ");
+        let diffs = differing_fields(&stored, &actual);
+        assert_eq!(diffs.len(), 1, "expected exactly one differing field, got {diffs:?}");
+        assert!(diffs[0].contains("passage_prefix"), "got {diffs:?}");
+        assert!(diffs[0].contains("\"passage:\""), "stored value must be Debug-quoted, got {diffs:?}");
+        assert!(diffs[0].contains("\"passage: \""), "actual value must be Debug-quoted, got {diffs:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // ensure_embedding_contract — widened to compare prefixes too
+    // -----------------------------------------------------------------------
+
+    /// First call on an empty table writes the row and reports `Initialized`;
+    /// a second call with the SAME identity finds the row unchanged and
+    /// reports `Match` instead of rewriting it.
+    #[tokio::test]
+    async fn ensure_embedding_contract_initializes_then_matches() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let status1 = store
+            .ensure_embedding_contract(identity("multilingual-e5-small", 384, "query: ", "passage: "))
+            .await
+            .unwrap();
+        assert_eq!(
+            status1,
+            ContractStatus::Initialized,
+            "empty table must be initialized on first call"
+        );
+
+        let status2 = store
+            .ensure_embedding_contract(identity("multilingual-e5-small", 384, "query: ", "passage: "))
+            .await
+            .unwrap();
+        assert_eq!(
+            status2,
+            ContractStatus::Match,
+            "second call with the same identity must match, not rewrite"
+        );
+    }
+
+    /// A fresh store's INSERT writes the REAL prefixes, not `''` literals.
+    #[tokio::test]
+    async fn ensure_embedding_contract_insert_writes_real_prefixes_not_empty_string() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        store
+            .ensure_embedding_contract(identity("multilingual-e5-small", 384, "query: ", "passage: "))
+            .await
+            .unwrap();
+
+        let (query_prefix, passage_prefix): (String, String) = store
+            .conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT query_prefix, passage_prefix FROM embedding_contract WHERE id = 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(query_prefix, "query: ");
+        assert_eq!(passage_prefix, "passage: ");
+    }
+
+    /// A different `model_id` against an existing row is reported as a
+    /// mismatch carrying both sides of the comparison.
+    #[tokio::test]
+    async fn ensure_embedding_contract_reports_mismatch_on_different_model() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        store
+            .ensure_embedding_contract(identity("multilingual-e5-small", 384, "query: ", "passage: "))
+            .await
+            .unwrap();
+        let status = store
+            .ensure_embedding_contract(identity("other-model", 384, "query: ", "passage: "))
+            .await
+            .unwrap();
+        match status {
+            ContractStatus::Mismatch { stored, actual } => {
+                assert_eq!(stored.model_id, "multilingual-e5-small");
+                assert_eq!(stored.dim, 384);
+                assert_eq!(actual.model_id, "other-model");
+                assert_eq!(actual.dim, 384);
+            }
+            other => panic!("expected Mismatch, got {other:?}"),
+        }
+    }
+
+    /// A different `dim` against an existing row (same model_id, same
+    /// prefixes) is also a mismatch — model_id/dim comparison still works
+    /// standalone after the widening.
+    #[tokio::test]
+    async fn ensure_embedding_contract_reports_mismatch_on_different_dim() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        store
+            .ensure_embedding_contract(identity("multilingual-e5-small", 384, "query: ", "passage: "))
+            .await
+            .unwrap();
+        let status = store
+            .ensure_embedding_contract(identity("multilingual-e5-small", 768, "query: ", "passage: "))
+            .await
+            .unwrap();
+        assert!(
+            matches!(status, ContractStatus::Mismatch { .. }),
+            "different dim must be reported as mismatch, got {status:?}"
+        );
+    }
+
+    /// Matching model_id/dim/query_prefix but a stale `passage_prefix` — even
+    /// by one trailing space — must still be reported as a mismatch. This is
+    /// the scenario `Normalize` vs. `ReInfer`-without-completion produces.
+    #[tokio::test]
+    async fn ensure_embedding_contract_reports_mismatch_on_stale_passage_prefix_only() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        store
+            .ensure_embedding_contract(identity("multilingual-e5-small", 384, "query: ", "passage:"))
+            .await
+            .unwrap();
+        let status = store
+            .ensure_embedding_contract(identity("multilingual-e5-small", 384, "query: ", "passage: "))
+            .await
+            .unwrap();
+        match status {
+            ContractStatus::Mismatch { stored, actual } => {
+                assert_eq!(stored.model_id, actual.model_id, "model_id must still match");
+                assert_eq!(stored.dim, actual.dim as i64, "dim must still match");
+                assert_ne!(stored.passage_prefix, actual.passage_prefix);
+            }
+            other => panic!("expected Mismatch on passage_prefix alone, got {other:?}"),
+        }
+    }
+
+    /// Matching prefixes on both sides → `Match`, not a false mismatch.
+    #[tokio::test]
+    async fn ensure_embedding_contract_matches_when_prefixes_agree() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        store
+            .ensure_embedding_contract(identity("multilingual-e5-small", 384, "query: ", "passage: "))
+            .await
+            .unwrap();
+        let status = store
+            .ensure_embedding_contract(identity("multilingual-e5-small", 384, "query: ", "passage: "))
+            .await
+            .unwrap();
+        assert_eq!(status, ContractStatus::Match);
+    }
+
+    // -----------------------------------------------------------------------
+    // Exclusive ownership — the store lock is taken before SQLite is touched
+    // and lives as long as any clone of the store.
+    // -----------------------------------------------------------------------
+
+    /// A store whose lock is held elsewhere must refuse to open, and must not
+    /// have touched `memory.db` on the way out: creating or migrating the file
+    /// is exactly what the holder is entitled to do alone.
+    #[tokio::test]
+    async fn open_refuses_a_held_store_and_never_creates_memory_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _holder = StoreLock::acquire(dir.path(), StoreHolder::Daemon).expect("holder");
+
+        let err = MemoryStore::open(dir.path(), StoreHolder::Eval)
+            .await
+            .err()
+            .expect("a held store must not open");
+        match err {
+            MemoryError::StoreInUse { owner: Some(o) } => assert_eq!(o.holder, StoreHolder::Daemon),
+            other => panic!("expected StoreInUse naming the daemon, got {other:?}"),
+        }
+        assert!(
+            !dir.path().join("memory.db").exists(),
+            "the loser must never create or migrate the database"
+        );
+    }
+
+    /// `MemoryStore` is `Clone`, and the runtime hands clones to the ingest
+    /// worker and the maintenance loop: the store is only free once the LAST
+    /// clone is gone, not the first.
+    #[tokio::test]
+    async fn the_lock_lives_as_long_as_any_clone_of_the_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = MemoryStore::open(dir.path(), StoreHolder::Daemon).await.expect("open a");
+        let b = a.clone();
+
+        drop(a);
+        assert!(
+            matches!(
+                MemoryStore::open(dir.path(), StoreHolder::Eval).await.err(),
+                Some(MemoryError::StoreInUse { .. })
+            ),
+            "a clone is still alive, so the store must still be held"
+        );
+
+        drop(b);
+        MemoryStore::open(dir.path(), StoreHolder::Eval)
+            .await
+            .map(|_| ())
+            .expect("the last clone is gone, so the store is free");
+    }
+
+    /// The in-memory test store has nothing to exclude anybody from.
+    #[tokio::test]
+    async fn new_for_test_takes_no_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _t = MemoryStore::new_for_test().await.expect("test store");
+        StoreLock::acquire(dir.path(), StoreHolder::Daemon).expect("nothing to collide with");
+    }
+}

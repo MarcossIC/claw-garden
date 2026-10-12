@@ -1,0 +1,49 @@
+schema: spec-driven
+
+context: |
+  Claw Garden: local-first memory for coding agents, in Rust.
+  Workspace: crates/clawg-core (SQLite + sqlite-vec + FTS5, fastembed ONNX multilingual-e5-small,
+  ranking, background workers, exclusive lock on memory.db), crates/clawg-cli (`clawg` binary:
+  loopback HTTP daemon + stdio MCP bridge via rmcp), crates/clawg-eval (rag-eval, golden-mine,
+  linked to clawg-core through the `eval` feature only).
+  Profiles: dev (~/.clawg-dev, 27381) and prod (~/.clawg, 27380). A debug build refuses prod.
+  Product objectives (doc "Claw Garden — Cómo funciona hoy la memoria"):
+    1. Save and classify memories efficiently (type, tier, importance, dedup, contradictions, decay).
+    2. Separate memories by project and also use them globally across projects.
+    3. Index projects so the AI understands how each one works.
+    4. Be shared: several agents read and write the same brain, and the user controls what each sees.
+    5. Over time, extract conclusions: preferences, trends, guidelines, experiences.
+  Retrieval baseline (rag-eval --real, golden set of 46 cases): R@1 0.4348, R@5 0.7826,
+  R@10 0.8913, MRR 0.5979, nDCG@10 0.6693.
+  Test baseline: cargo test --workspace -> 1304 passed, 0 failed.
+
+strict_tdd: true
+
+rules:
+  general:
+    - Detail is proportional to the change. A small fix is a one-page proposal plus tasks; design.md only when there is a real architectural decision with alternatives.
+    - Every claim about current behavior cites code as path:line, verified in this repo. No claim is copied from analisis-proyecto.md without checking it.
+    - Code, comments, test names, error messages and commit messages never reference plans, phases, changes or specs.
+    - The user's database is the most important asset. No change may lose, hide or destroy stored memories. A new version either opens and serves the previous version's data, or refuses without touching it and with a documented way back.
+    - Any change to the schema, stored identifiers (project_id, agent_id), statuses or the embedding contract ships with a test that seeds data at the previous version and proves it survives and stays reachable.
+  proposal:
+    - State the problem with evidence, the objective it serves (1-5), scope and explicit non-scope.
+    - Say how success is measured (a rag-eval metric with a pre-committed threshold, or a test that fails today).
+    - Any change to stored data (project_id, schema, statuses) includes migration and rollback.
+  specs:
+    - Use Given/When/Then scenarios and RFC 2119 keywords (MUST, SHALL, SHOULD, MAY).
+    - Each requirement maps to at least one test that fails before the change.
+  design:
+    - Record decisions with the alternatives considered and their tradeoffs.
+    - Keep parsing and decision logic pure and separate from I/O (filesystem, port, database).
+    - Any ranking or retrieval change is validated with rag-eval --diff against the baseline before it becomes the default.
+    - No new dependency, visibility or abstraction without a real use.
+  tasks:
+    - Strict TDD - each implementation task is preceded by its failing test.
+    - Each task maps to one atomic conventional commit that compiles and passes the suite.
+  apply:
+    - Run tests with a separate target dir on Windows - cargo test --workspace --target-dir <dir>.
+    - No release builds, installs, or access to ~/.clawg or ~/.clawg-dev without explicit authorization.
+    - Never kill running clawg.exe processes. Stage by explicit path. No AI attribution in commits.
+  verify:
+    - Report the test count against the baseline and every rag-eval metric the change touches.

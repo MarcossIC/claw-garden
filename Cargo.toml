@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = ["crates/clawg-cli", "crates/clawg-core", "crates/clawg-eval"]
+
+[workspace.package]
+version = "0.1.0"
+authors = ["MarcossIC"]
+license = ""
+repository = ""
+edition = "2021"
+rust-version = "1.77.2"
+
+# Dependencies shared by workspace members.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "macros", "time", "rt"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures = "0.3"
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
+log = "0.4"
+dirs = "6"
+sha2 = "0.10"
+unicode-normalization = "0.1"
+rand = "0.9"
+once_cell = "1"
+
+# Storage and vector search
+tokio-rusqlite = "0.7"
+rusqlite = { version = "0.37", features = ["bundled", "load_extension", "functions"] }
+refinery = { version = "0.9", features = ["rusqlite"] }
+sqlite-vec = "0.1"
+siphasher = "1.0"
+
+# Embedder
+# fastembed v5 has no `ort-download-binaries-rustls-tls` feature; the available ORT
+# features are `ort-download-binaries` and `ort-load-dynamic`. The `-rustls-tls`
+# suffix only exists on `hf-hub-rustls-tls`, which is INTENTIONALLY dropped: the
+# download path is our own (reqwest + rustls), never fastembed's built-in hf-hub.
+# `ort-download-binaries` is the minimal config for "offline init from bytes".
+fastembed = { version = "5", default-features = false, features = ["ort-download-binaries"] }
+fs2 = "0.4"
+
+# Ingest (chunking and tokenization)
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-python = "0.25"
+tokenizers = { version = "0.22.2", default-features = false }
+
+mockito = "1"
+tempfile = "3"
+
+clawg-core = { path = "crates/clawg-core" }
+clawg-cli = { path = "crates/clawg-cli" }

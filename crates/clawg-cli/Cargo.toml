@@ -1,0 +1,73 @@
+[package]
+name = "clawg-cli"
+description = "Claw Garden command line: the `clawg` daemon and its MCP stdio bridge"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# The binary is `clawg`, not `clawg-cli`: the package name is a crate-registry
+# concern, the binary name is the product's user-facing identity.
+[[bin]]
+name = "clawg"
+path = "src/main.rs"
+
+# A library beside the binary so integration tests can drive the axum router and
+# the MCP tool functions in-process, without ever spawning the real binary (that
+# would trigger the 470 MB model download).
+[lib]
+name = "clawg_cli"
+path = "src/lib.rs"
+
+[dependencies]
+clawg-core.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+dirs.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+
+# `rt-multi-thread` for `#[tokio::main]`, `signal` for Ctrl-C-driven graceful
+# shutdown, `net` for the loopback `TcpListener`, `io-std` for the MCP stdio
+# transport. Features are additive across the workspace, so this widens the
+# shared `tokio` declaration rather than replacing it.
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "net", "io-std"] }
+
+# Not in `[workspace.dependencies]` on purpose: the root manifest reserves that
+# table for "dependencies shared by two or more workspace members", and every
+# crate below is used by this member alone.
+clap = { version = "4", features = ["derive"] }
+axum = "0.8"
+env_logger = "0.11"
+rmcp = { version = "1", features = ["server", "transport-io", "macros", "schemars"] }
+# rmcp 1.3 generates tool schemas with schemars 1.x — a 0.8 here would not
+# satisfy its `JsonSchema` bound.
+schemars = "1"
+
+# Clears the inherit flag on the bridge's own stdio before it spawns the daemon
+# (see `detach.rs`) and waits on the daemon's process handle in `clawg stop`
+# (see `process.rs`). Already in the lockfile through tokio's `mio`, so this
+# adds no crate to the build.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+# Raw reads and writes of HKCU\Environment\Path for `clawg path` (see
+# `user_path.rs`), so the value keeps its REG_EXPAND_SZ type. Already in the
+# lockfile, so this adds no crate to the build.
+winreg = "0.55"
+
+# `kill(pid, 0)` for the Unix side of `process.rs`. Already in the lockfile.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+clawg-core = { workspace = true, features = ["testing"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+# Lets a test swap a MemoryRuntime's embedder cell for an empty one, which is
+# how the pre-bootstrap 503 path is reproduced without a second core constructor.
+once_cell.workspace = true
