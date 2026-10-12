@@ -29,6 +29,7 @@ use clawg_core::memory::admin::{
     delete_memory_core, get_memory_core, list_memories_core, memory_stats_core, query_has_tokens,
     set_importance_core, ListParams, MemoryAdminRow, MemoryKind, MemoryStats, StatsParams,
 };
+use clawg_core::memory::backup::Reason;
 use clawg_core::memory::bootstrap::EmbedderStatus;
 use clawg_core::memory::embedder::EmbedRole;
 use clawg_core::memory::worker::{
@@ -455,6 +456,7 @@ pub fn router(app: Arc<AppCtx>) -> Router {
             get(get_memory).patch(patch_importance).delete(delete_memory),
         )
         .route("/stats", get(stats))
+        .route("/backup", post(backup))
         .route("/projects", post(register))
         .route("/shutdown", post(shutdown))
         .layer(axum::middleware::from_fn_with_state(app.clone(), require_bearer));
@@ -794,6 +796,16 @@ async fn delete_memory(
         return Err(ApiError::not_found(format!("no {kind:?} row with id {id}")));
     }
     Ok(Json(DeletedBody { deleted }))
+}
+
+#[derive(Debug, Serialize)]
+pub struct BackupBody {
+    pub path: String,
+}
+
+async fn backup(State(app): State<Arc<AppCtx>>) -> ApiResult<Json<BackupBody>> {
+    let path = app.runtime.snapshot(Reason::Manual).await.map_err(ApiError::internal)?;
+    Ok(Json(BackupBody { path: path.display().to_string() }))
 }
 
 #[derive(Debug, Deserialize)]

@@ -21,6 +21,7 @@
 //! [`MemoryRecord::disputed_against_ids`] parses it into `Vec<i64>`, returning
 //! `None` for NULL or malformed JSON rather than panicking.
 
+pub mod backup;
 pub mod bootstrap;
 pub mod chunker;
 pub mod db;

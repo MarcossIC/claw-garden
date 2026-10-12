@@ -590,6 +590,22 @@ impl DaemonClient {
         Ok(Self::read_response::<Body>(resp).await?.deleted)
     }
 
+    /// Asks the daemon for a manual snapshot and returns where it wrote it.
+    pub async fn backup(&self) -> Result<PathBuf, ClientError> {
+        #[derive(Deserialize)]
+        struct Body {
+            path: PathBuf,
+        }
+        let resp = self
+            .http
+            .post(self.url("/v1/backup"))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(Self::map_transport)?;
+        Ok(Self::read_response::<Body>(resp).await?.path)
+    }
+
     /// Records `root` as a project and moves rows saved under `legacy_ids`
     /// onto it. Returns the id the daemon derived and how many rows moved.
     pub async fn register_project(

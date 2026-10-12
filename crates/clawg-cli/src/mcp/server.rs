@@ -238,8 +238,16 @@ impl ClawgMcp {
     /// because the model's next move is the same either way.
     fn explain(err: &ClientError) -> String {
         match err {
-            ClientError::NotRunning | ClientError::StartTimeout(_) => {
+            ClientError::NotRunning => {
                 "no clawg daemon is running; start one with `clawg serve` and try again"
+                    .to_string()
+            }
+            // Starting it was tried, so `clawg serve` is not the advice: the
+            // reason it gave up (a store from a newer clawg, say) is what
+            // `clawg status` reports.
+            ClientError::StartTimeout(_) => {
+                "clawg tried to start its daemon and it is not up; run `clawg status` to see \
+                 why, or try again if it is still starting"
                     .to_string()
             }
             ClientError::Daemon { status: 503, message, .. } if message == "embedder_not_ready" => {
@@ -1122,6 +1130,16 @@ mod tests {
             let t = answer.unwrap();
             assert!(!t.split(|c: char| !c.is_alphanumeric()).any(|w| w == "queued"), "{t}");
         }
+    }
+
+    #[test]
+    fn a_daemon_that_did_not_start_points_at_status() {
+        let t = ClawgMcp::explain(&ClientError::StartTimeout(std::time::Duration::from_secs(30)));
+        assert!(t.contains("clawg status"), "{t}");
+        assert!(!t.contains("clawg serve"), "{t}");
+
+        let t = ClawgMcp::explain(&ClientError::NotRunning);
+        assert!(t.contains("clawg serve"), "{t}");
     }
 
     #[test]

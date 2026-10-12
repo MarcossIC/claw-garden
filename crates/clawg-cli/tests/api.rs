@@ -819,6 +819,25 @@ async fn delete_removes_the_row_and_a_second_delete_is_404() {
 }
 
 #[tokio::test]
+async fn backup_endpoint_writes_a_manual_snapshot() {
+    let h = Harness::start().await;
+    h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "agent-http" })).await;
+    h.wait_for_rows("memory", 1).await;
+
+    let unauthorized = h.http.post(h.url("/v1/backup")).send().await.expect("request");
+    assert_eq!(unauthorized.status(), 401);
+
+    let (status, body) = h.post_json("/v1/backup", json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    let path = std::path::PathBuf::from(body["path"].as_str().expect("path"));
+    assert_eq!(path.parent(), Some(h.ctx.runtime.base_dir.join("backups").as_path()));
+    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(name.ends_with("-manual.db"), "{name}");
+    let bytes = std::fs::read(&path).expect("the snapshot exists");
+    assert!(bytes.starts_with(b"SQLite format 3\0"), "a whole SQLite database");
+}
+
+#[tokio::test]
 async fn an_unknown_kind_is_a_400_everywhere_it_appears() {
     let h = Harness::start().await;
 
