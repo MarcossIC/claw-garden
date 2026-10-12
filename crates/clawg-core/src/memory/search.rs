@@ -385,6 +385,7 @@ async fn knn_one(
                             created_at: row.get(6)?,
                             last_accessed_at: row.get(7)?,
                             importance: row.get(8)?,
+                            lexical_match: false,
                         })
                     },
                 )?;
@@ -815,6 +816,7 @@ async fn score_lexical_candidates(
                     created_at: row.get(6)?,
                     last_accessed_at: row.get(7)?,
                     importance: row.get(8)?,
+                    lexical_match: false,
                 })
             })?;
 
