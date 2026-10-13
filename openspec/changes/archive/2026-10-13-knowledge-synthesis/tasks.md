@@ -59,14 +59,12 @@ Cada tarea es un commit atómico: primero el test que falla, después el código
 ## Verify
 
 - [x] `cargo test --workspace` en Linux, contra la base: sin fallas nuevas, con el conteo justificado ([`verify.md`](verify.md#linux)).
-- [ ] `cargo test --workspace --target-dir <otro-dir>` en Windows (máquina de Marcos).
-- [ ] `rag-eval --real --diff` y `--agent-view --diff` contra el baseline (máquina de Marcos; el golden set no está en el repo).
-- [ ] Prueba manual con el perfil dev en Claude Code: sintetizar, guardar una conclusión con `derived_from`, ver el recordatorio apagarse (máquina de Marcos).
+- [x] `cargo test --workspace --target-dir <otro-dir>` en Windows: 1.655 pasan, 0 fallan ([`verify.md`](verify.md#windows-2026-10-13)).
+- [x] `rag-eval --real --diff` y `--agent-view --diff` contra el baseline, en Windows: diff vacío y ninguna métrica del ancla baja ([`verify.md`](verify.md#rag-eval)).
+- [x] Prueba manual con el perfil dev en Claude Code: sintetizar, guardar una conclusión con `derived_from`, ver el recordatorio apagarse ([`verify.md`](verify.md#perfil-dev-con-claude-code-2026-10-13)).
 
 ## Archive
 
-Cuando los pendientes de Verify estén cerrados:
-
-- [ ] Crear `specs/synthesis/spec.md` con R2–R9 y sumar R1 a `specs/retrieval/spec.md`.
-- [ ] Mover la carpeta a `changes/archive/AAAA-MM-DD-knowledge-synthesis/` y poner `archive: done` en `state.yaml`.
-- [ ] Actualizar la fila 11 de `openspec/README.md` con el enlace archivado, y sacar del backlog la línea de `#[allow(dead_code)]` sólo si project-indexing ya la resolvió (este cambio no la toca).
+- [x] `specs/synthesis/spec.md` con R2–R9, y el apartado de las filas de la app en `specs/retrieval/spec.md` (R1).
+- [x] Carpeta movida a `changes/archive/2026-10-13-knowledge-synthesis/` y `archive: done` en `state.yaml`.
+- [x] Fila 11 de `openspec/README.md` con el enlace archivado. La línea de `#[allow(dead_code)]` del backlog sigue: este cambio no la toca y el chunker todavía la tiene.

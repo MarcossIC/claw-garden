@@ -5,6 +5,7 @@ Fuente de verdad del comportamiento actual de la recuperación: el corte relativ
 **Origen:**
 - [retrieval-hygiene](../../changes/archive/2026-10-12-retrieval-hygiene/proposal.md), archivado el 2026-10-12.
 - [lexical-fusion](../../changes/archive/2026-10-12-lexical-fusion/proposal.md), archivado el 2026-10-12.
+- [knowledge-synthesis](../../changes/archive/2026-10-13-knowledge-synthesis/proposal.md), archivado el 2026-10-13 (sólo el apartado de las filas que dejó la app de escritorio).
 
 ## Definiciones
 
@@ -187,6 +188,17 @@ Un match de identificador MUST cumplir los mismos predicados que el candidato l�
 Un error de la consulta de matches (FTS ausente, MATCH rechazado, conexión cerrada) MUST dejar la búsqueda como si no hubiera matches, igual que los candidatos léxicos (`search.rs:731`, junto a `:627`).
 
 **Test:** `a_failing_identifier_query_leaves_the_search_unboosted` en `search.rs`.
+
+## Las filas que dejó la app de escritorio siguen alcanzables
+
+Ningún código de producción escribe `episodic_trajectory` ni `procedural_skill`, pero una base puede traer filas de la app de escritorio. Esas filas MUST seguir alcanzables: la búsqueda MUST consultarlas (KNN de 5 + 5), el workspace MUST mostrar los skills del proyecto, y `list_memories`, `GET`, `PATCH` y `DELETE` MUST aceptarlas. El re-embed de `procedural_skill` MUST embeber `"{trigger} {skill_name}"`.
+
+#### Escenario: filas como las escribía la app de escritorio
+- GIVEN una trayectoria y un skill escritos con los mismos escritores que usaba la app (que quedan sólo para tests), y sus vectores
+- WHEN se busca con el vector del skill, se regenera el workspace del proyecto, se lista y se re-embebe
+- THEN el skill está entre los hits y en el workspace, las dos filas están en el listado, y el re-embed del skill embebe `"when login fails Fix login flow"` para `trigger = "when login fails"` y `skill_name = "Fix login flow"`
+
+**Test:** `episodic_trajectory_retrievable_by_same_agent_id` y `knn_procedural_returns_skill_rows` (`search.rs`), `regenerate_reports_the_ids_it_rendered` y `workspace_top_skills_exclude_foreign_project` (`workspace.rs`), `list_memories_kind_none_merges_all_tables_sorted_desc` (`admin.rs`) y `reembed_reinfer_uses_passage_role_and_shared_skill_embedding_text` (`maintenance.rs`, fija el texto literal). La apertura de una base en V9 con esas filas está en [`specs/synthesis`](../synthesis/spec.md) (su R9).
 
 ## Invariantes
 
