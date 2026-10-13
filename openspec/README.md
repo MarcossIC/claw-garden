@@ -24,7 +24,7 @@ exploration -> proposal -> spec (+ design si hace falta) -> tasks -> apply -> ve
 | 1b | [storage-safety-net](changes/archive/2026-10-12-storage-safety-net/proposal.md) | transversal | M (partes B + C de data-preservation) | 1 (A + F) | archivado el 2026-10-12 ([`specs/storage`](specs/storage/spec.md)); verificado en Linux y Windows ([verify](changes/archive/2026-10-12-storage-safety-net/verify.md#windows-2026-10-12)) |
 | 2 | [ingest-durability](changes/archive/2026-10-12-ingest-durability/proposal.md) | 1 | M | — | archivado el 2026-10-12 ([`specs/ingest`](specs/ingest/spec.md)) |
 | 3 | [retrieval-hygiene](changes/archive/2026-10-12-retrieval-hygiene/proposal.md) | 1 | S | — | archivado el 2026-10-12 ([`specs/retrieval`](specs/retrieval/spec.md)) |
-| 4 | [project-identity](changes/archive/2026-10-12-project-identity/proposal.md) | 2 | M | 1 (backup antes del re-key) | archivado el 2026-10-12 ([`specs/project`](specs/project/spec.md)); pruebas de Windows pendientes en su [`verify.md`](changes/archive/2026-10-12-project-identity/verify.md) |
+| 4 | [project-identity](changes/archive/2026-10-12-project-identity/proposal.md) | 2 | M | 1 (backup antes del re-key) | archivado el 2026-10-12 ([`specs/project`](specs/project/spec.md)); en Windows quedan 5 fallas en `project_root.rs` (el prefijo `\\?\`) y falta la prueba con el binario ([`verify.md`](changes/archive/2026-10-12-project-identity/verify.md#windows-2026-10-12--con-fallas)) |
 | 5 | [eval-golden-expansion](changes/archive/2026-10-12-eval-golden-expansion/proposal.md) | medición | M | — | archivado el 2026-10-12 ([`specs/eval`](specs/eval/spec.md)) |
 | 6 | [visibility-policy](changes/archive/2026-10-12-visibility-policy/proposal.md) | 2, 4 | L (partes A + B) | 4, 5 | A + B archivadas el 2026-10-12 ([`specs/visibility`](specs/visibility/spec.md)); verificado en Linux, Windows y el perfil dev con Claude Code ([verify](changes/archive/2026-10-12-visibility-policy/verify.md)); C y D siguen en 16 |
 | 7 | [lexical-fusion](changes/lexical-fusion/proposal.md) | 1, 3 | M | 5 | verify: tests en verde; falta la medición `--real` con el golden set ([`verify.md`](changes/lexical-fusion/verify.md#pendiente-máquina-del-usuario)) |
@@ -34,7 +34,7 @@ exploration -> proposal -> spec (+ design si hace falta) -> tasks -> apply -> ve
 | 11 | [knowledge-synthesis](changes/knowledge-synthesis/proposal.md) | 5 | M (limpieza + síntesis dirigida por el agente) | — | verify: tests en verde en Linux; faltan Windows, `rag-eval --real` y la prueba con el perfil dev ([`verify.md`](changes/knowledge-synthesis/verify.md#pendiente-máquina-de-marcos)) |
 | 12 | [project-indexing](changes/project-indexing/exploration.md) | 3 | decisión | 5 | exploración |
 | 13 | [secret-hygiene](changes/secret-hygiene/proposal.md) | 1, 4 | S–M | — (tiene que cerrar antes de 16) | verify: tests en verde en Linux; faltan Windows, `rag-eval --real` y el perfil dev ([`verify.md`](changes/secret-hygiene/verify.md#pendiente-máquina-del-usuario)) |
-| 14 | [context-density](changes/context-density/exploration.md) | 1 | S–M | — (se suma a 9) | exploración |
+| 14 | [context-density](changes/context-density/proposal.md) | 1 | S–M | — (se suma a 9) | spec |
 | 15 | [long-save-context](changes/long-save-context/exploration.md) | 1 | S–M | 5, después de 9 (1 si toca el esquema) | exploración |
 | 16 | [agent-sharing](changes/agent-sharing/exploration.md) | 2, 4 | L (partes C + D de visibility-policy) | 6, 13 | exploración |
 
@@ -52,8 +52,8 @@ Por qué este orden:
 - **2 y 3** son defectos con pérdida de datos o de calidad. Son independientes y chicos.
 - **4** va antes que **6**: la política de visibilidad necesita identidades estables.
 - **5** es requisito de **7** y **12**. Con el golden set actual, el canal léxico no se puede medir: todas las corridas `lex*` dan métricas idénticas.
-- **11** y **12** no tienen spec todavía. Primero hay una decisión de producto.
-- **13** se numera al final, pero tiene que cerrar antes de **6**: compartir entre agentes hace viajar un secreto guardado por error a otros clientes y proveedores. Su purga se decide junto con la parte E de **1**.
+- **12** no tiene spec todavía. Primero hay una decisión de producto.
+- **13** se numera al final, pero tiene que cerrar antes de **16**: compartir entre agentes hace viajar un secreto guardado por error a otros clientes y proveedores. Su purga se decide junto con la parte E de **1**.
 - **15 es de los últimos en probarse, por su naturaleza:** todo lo que necesita viene de antes.
   - Sin memorias largas en el golden set de **5**, y sin casos cuya respuesta quede después del corte, no se puede medir.
   - Conviene que **9** confirme o descarte antes la hipótesis de los pedazos hermanos que se disputan, que tiene la misma causa.

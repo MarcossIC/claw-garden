@@ -1,6 +1,6 @@
 # project-identity — Verificación
 
-**Estado:** Linux completo. Se archivó con dos pasos pendientes que necesitan Windows y la máquina de Marcos (abajo). Si alguno falla, el arreglo va en un cambio nuevo.
+**Estado:** Linux completo. Se archivó con dos pasos pendientes que necesitan Windows y la máquina de Marcos (abajo). Si alguno falla, el arreglo va en un cambio nuevo. El suite de Windows ya corrió y dejó 5 fallas en `project_root.rs` sin resolver; la prueba con el binario sigue pendiente.
 
 ## Tests
 
@@ -20,9 +20,10 @@ Son 33 tests nuevos y ninguna falla nueva. Las 10 fallas son las mismas en las d
 
 Tests que cambiaron de expectativa, no de propósito: los que fijaban la cantidad de migraciones aplicadas en 8 (`idempotent_migrations_second_open`, `e2e_store_smoke`, `a_v8_database_opens_unchanged_under_grouped_migrations`) ahora esperan 9. `v7_store_upgrades_to_v8_and_a_second_run_is_a_noop` migra con `Target::Version(8)` para seguir probando la subida a V8, y `v8_migration_creates_memory_fts_and_bumps_count_to_eight` pasó a llamarse `v8_migration_records_itself_and_creates_memory_fts`: comprueba que V8 figura en el historial en lugar de contar 8 filas.
 
-### Windows — pendiente
+### Windows (2026-10-12) — con fallas
 
-- [ ] `cargo test --workspace --target-dir <otro>` en la máquina de Marcos. Además de confirmar el conteo, corre `windows_spellings_of_one_directory_share_a_root` (`crates/clawg-core/tests/project_root.rs`), que no corre en Linux: fija que `canonicalize` devuelve la caja real del disco y que se quita el prefijo `\\?\`. Es la suposición del diseño que no se pudo comprobar acá. Con ese número se actualiza el baseline de `.claude/CLAUDE.md`.
+- [x] `cargo test --workspace --target-dir <otro>` en la máquina de Marcos. Se corrió durante la verificación de visibility-policy (su [`verify.md`](../2026-10-12-visibility-policy/verify.md#windows-2026-10-12)), sobre `main` (`c45b18a`, con este cambio ya mergeado): 1.648 pasan y 5 fallan. Con ese número se actualizó el baseline de `.claude/CLAUDE.md` (`d5a00e6`).
+- [ ] **Las 5 fallas son de este cambio**, todas en `crates/clawg-core/tests/project_root.rs`. El helper `canonical_tempdir` arma las rutas esperadas con `fs::canonicalize`, que en Windows deja el prefijo `\\?\`, y `resolve_project_root` lo quita: las rutas no coinciden. Falta confirmar cuáles son las 5 y si `windows_spellings_of_one_directory_share_a_root` (la suposición del diseño sobre la caja real del disco y el prefijo) está entre ellas; su `repo` también sale de `canonical_tempdir`. Si el problema es sólo del helper, el arreglo es del test; va en un cambio nuevo, como dice el estado.
 
 ## Prueba con el binario — pendiente
 
