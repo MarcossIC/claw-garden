@@ -26,16 +26,17 @@ exploration -> proposal -> spec (+ design si hace falta) -> tasks -> apply -> ve
 | 3 | [retrieval-hygiene](changes/archive/2026-10-12-retrieval-hygiene/proposal.md) | 1 | S | — | archivado el 2026-10-12 ([`specs/retrieval`](specs/retrieval/spec.md)) |
 | 4 | [project-identity](changes/archive/2026-10-12-project-identity/proposal.md) | 2 | M | 1 (backup antes del re-key) | archivado el 2026-10-12 ([`specs/project`](specs/project/spec.md)); pruebas de Windows pendientes en su [`verify.md`](changes/archive/2026-10-12-project-identity/verify.md) |
 | 5 | [eval-golden-expansion](changes/archive/2026-10-12-eval-golden-expansion/proposal.md) | medición | M | — | archivado el 2026-10-12 ([`specs/eval`](specs/eval/spec.md)) |
-| 6 | [visibility-policy](changes/visibility-policy/proposal.md) | 2, 4 | L (partes A + B; C y D siguen en la [exploración](changes/visibility-policy/exploration.md)) | 4, 5 (C: 13) | A + B en verify: tests en verde en Linux; faltan Windows y la prueba en el perfil dev ([`verify.md`](changes/visibility-policy/verify.md#pendiente-máquina-del-usuario)) |
+| 6 | [visibility-policy](changes/archive/2026-10-12-visibility-policy/proposal.md) | 2, 4 | L (partes A + B) | 4, 5 | A + B archivadas el 2026-10-12 ([`specs/visibility`](specs/visibility/spec.md)); verificado en Linux, Windows y el perfil dev con Claude Code ([verify](changes/archive/2026-10-12-visibility-policy/verify.md)); C y D siguen en 16 |
 | 7 | [lexical-fusion](changes/lexical-fusion/proposal.md) | 1, 3 | M | 5 | verify: tests en verde; falta la medición `--real` con el golden set ([`verify.md`](changes/lexical-fusion/verify.md#pendiente-máquina-del-usuario)) |
 | 8 | [memory-update-tool](changes/memory-update-tool/exploration.md) | 1 | S | 6 (scope) | exploración |
 | 9 | [dispute-resolution](changes/dispute-resolution/proposal.md) | 1, 5 | M | 5 | verificación (falta rag-eval y Windows) |
 | 10 | [mcp-protocol-upgrade](changes/mcp-protocol-upgrade/proposal.md) | 4 | M | 6 (`--agent`) | verify: tests en verde en Linux; faltan Windows y la prueba con Claude Code real ([`verify.md`](changes/mcp-protocol-upgrade/verify.md#pendiente-máquina-del-usuario)) |
 | 11 | [knowledge-synthesis](changes/knowledge-synthesis/proposal.md) | 5 | M (limpieza + síntesis dirigida por el agente) | — | verify: tests en verde en Linux; faltan Windows, `rag-eval --real` y la prueba con el perfil dev ([`verify.md`](changes/knowledge-synthesis/verify.md#pendiente-máquina-de-marcos)) |
 | 12 | [project-indexing](changes/project-indexing/exploration.md) | 3 | decisión | 5 | exploración |
-| 13 | [secret-hygiene](changes/secret-hygiene/proposal.md) | 1, 4 | S–M | — (tiene que cerrar antes de 6) | verify: tests en verde en Linux; faltan Windows, `rag-eval --real` y el perfil dev ([`verify.md`](changes/secret-hygiene/verify.md#pendiente-máquina-del-usuario)) |
+| 13 | [secret-hygiene](changes/secret-hygiene/proposal.md) | 1, 4 | S–M | — (tiene que cerrar antes de 16) | verify: tests en verde en Linux; faltan Windows, `rag-eval --real` y el perfil dev ([`verify.md`](changes/secret-hygiene/verify.md#pendiente-máquina-del-usuario)) |
 | 14 | [context-density](changes/context-density/exploration.md) | 1 | S–M | — (se suma a 9) | exploración |
 | 15 | [long-save-context](changes/long-save-context/exploration.md) | 1 | S–M | 5, después de 9 (1 si toca el esquema) | exploración |
+| 16 | [agent-sharing](changes/agent-sharing/exploration.md) | 2, 4 | L (partes C + D de visibility-policy) | 6, 13 | exploración |
 
 Objetivos del producto:
 
@@ -120,7 +121,7 @@ Ideas y afirmaciones contrastadas con el código. Las descartadas quedan con su 
 | Tokio, sqlx/diesel, patrón repositorio | **Ya hay** tokio y `tokio_rusqlite` con una sola conexión serializada. Migrar a sqlx es churn sin un problema que resolver | descartado |
 | Cifrado en reposo | **Descartado por ahora.** El robo del disco lo cubre el cifrado del sistema operativo. SQLCipher complica cargar sqlite-vec y los backups, y una clave perdida es una base perdida, que es justo el riesgo que más cuidamos. Hubo un diseño previo, nunca implementado (`Cargo.toml:32`) | descartado |
 | Inyección en consultas FTS | **Ya resuelto por construcción:** los operadores no pueden sobrevivir a la tokenización (`search.rs:489-519`) y hay tests (`search.rs:2809-2897`) | descartado |
-| Enmascarar secretos y evitar fugas de contexto entre agentes | **Necesario, y no estaba cubierto.** Un secreto guardado por error queda en claro para siempre (no hay purga) y, con el cerebro compartido, viaja a otros agentes | secret-hygiene; procedencia en visibility-policy |
+| Enmascarar secretos y evitar fugas de contexto entre agentes | **Necesario, y no estaba cubierto.** Un secreto guardado por error queda en claro para siempre (no hay purga) y, con el cerebro compartido, viaja a otros agentes | secret-hygiene; procedencia en agent-sharing |
 | Tests, docs y benchmarks | **Ya existen:** 1304 tests, golden set y `rag-eval` con latencia. Nada nuevo que agregar | descartado |
 
 ## Backlog sin spec (arreglos sueltos)
@@ -128,4 +129,5 @@ Ideas y afirmaciones contrastadas con el código. Las descartadas quedan con su 
 - **Comentario desactualizado** en `crates/clawg-core/src/memory/worker.rs:344-355`: dice que ningún chunk carga afirmaciones, y los saves explícitos sí la cargan.
 - **`#[allow(dead_code)]` en el chunker** (`ChunkerKind::Code`): viola la convención del proyecto. Se resuelve con knowledge-synthesis o project-indexing.
 - **`clawg stop` mientras carga el modelo:** el apagado ordenado termina en 1–3 s, pero el proceso sigue vivo hasta que vuelve la carga del embedder. La carga corre en `spawn_blocking` (`crates/clawg-core/src/memory/bootstrap.rs:318`), y el runtime de `#[tokio::main]` (`crates/clawg-cli/src/main.rs:30`) espera a esas tareas. Con el binario debug, una vez se pasó de `STOP_TIMEOUT` y `stop` salió con 1. Los datos no corren riesgo: el volcado y el checkpoint terminan antes. Después de "stopped", el log dice "model load task panicked: task N was cancelled" y "retrying in 30s", y eso confunde. Un arreglo posible es `shutdown_timeout` del runtime cuando `serve::run` vuelve. Detalle en el `verify.md` archivado de data-preservation.
-- **`enum Scope` sin uso** (`crates/clawg-core/src/memory/record.rs:19`): se exporta, pero el insert escribe el literal `"agent"` (`store_insert.rs:177`). Se resuelve con visibility-policy: se usa o se borra.
+- **`enum Scope` sin uso** (`crates/clawg-core/src/memory/record.rs:19`): se exporta, pero el insert escribe el literal `"agent"` (`store_insert.rs:178`). Se resuelve con agent-sharing (su pregunta 8): se usa o se borra.
+- **Warnings de código muerto** en `cargo test --workspace`: `insert_row_with_embedding` (`crates/clawg-core/src/memory/worker.rs:1247`, un helper de test sin uso) y el import `production_lexical_budget` de `rag-eval` (`crates/clawg-eval/src/bin/rag-eval/main.rs:16`). Violan la convención de no dejar código muerto.
