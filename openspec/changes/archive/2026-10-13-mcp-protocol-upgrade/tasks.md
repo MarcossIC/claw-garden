@@ -29,11 +29,11 @@ Cada tarea es un commit atómico: primero el test que falla, después el código
 ## Verify
 
 - [x] `cargo test --workspace` en Linux: sin fallas nuevas contra la base (ver `verify.md`).
-- [ ] `cargo test --workspace --target-dir <otro>` en Windows: pendiente, máquina de Marcos (ver `verify.md`).
-- [ ] Verificación manual con Claude Code real contra el perfil dev: pendiente, máquina de Marcos (ver `verify.md`).
+- [x] `cargo test --workspace --target-dir <otro>` en Windows: 1.655 pasan, 0 fallan (ver `verify.md`).
+- [x] Verificación manual con Claude Code 2.1.296 contra el perfil dev: conecta, sin `--agent` se nombra `claude-code` desde el cliente y encuentra una memoria de antes del cambio (ver `verify.md`).
 
 ## Archive (cuando esté todo lo de verify)
 
-- [ ] Crear `openspec/specs/mcp/spec.md` con R1–R5, con las líneas de `main` después del merge.
-- [ ] Mover el cambio a `openspec/changes/archive/AAAA-MM-DD-mcp-protocol-upgrade/` y poner `phase: archived` y `main_spec` en `state.yaml`.
-- [ ] Actualizar la fila 10 del mapa en `openspec/README.md`.
+- [x] Crear `openspec/specs/mcp/spec.md` con R1–R5, con las líneas de `main` después del merge (ahora son ocho herramientas: `synthesize` entró después).
+- [x] Mover el cambio a `openspec/changes/archive/AAAA-MM-DD-mcp-protocol-upgrade/` y poner `phase: archived` y `main_spec` en `state.yaml`.
+- [x] Actualizar la fila 10 del mapa en `openspec/README.md`.

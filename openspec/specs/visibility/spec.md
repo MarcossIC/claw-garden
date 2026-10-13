@@ -17,7 +17,7 @@ Fuente de verdad del comportamiento actual de la identidad del agente y de qué 
 El agente del puente MUST ser, en este orden:
 
 1. el valor de `clawg mcp --agent <nombre>`, recortado;
-2. el nombre que declara el cliente, tal como llega, si no está vacío ni es sólo espacios. De dónde sale ese nombre en cada request (y no sólo en el handshake) lo define [mcp-protocol-upgrade](../../changes/mcp-protocol-upgrade/spec.md) (su R4);
+2. el nombre que declara el cliente, tal como llega, si no está vacío ni es sólo espacios. De dónde sale ese nombre en cada request (y no sólo en el handshake) lo define [`specs/mcp`](../mcp/spec.md) (su R4);
 3. `"mcp"`.
 
 `--agent` con un valor vacío o sólo espacios MUST rechazarse al parsear la línea de comandos.
