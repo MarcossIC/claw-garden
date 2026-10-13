@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use clawg_core::eval_api::{
-    compose_query_context, model_is_cached, production_lexical_budget, query_budget_tokens,
+    compose_query_context, model_is_cached, query_budget_tokens,
     EmbedRole, EvalEmbedder, EvalScope, EvalScoringConfig, EvalTokenCounter, MIGRATION_FTS_TOKENIZER,
     EMBED_MAX_TOKENS, SPECIAL_TOKEN_RESERVE,
 };
@@ -1270,6 +1270,7 @@ fn current_date_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clawg_core::eval_api::production_lexical_budget;
 
     #[test]
     fn civil_from_days_matches_known_reference_dates() {

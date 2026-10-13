@@ -241,7 +241,6 @@ mod tests {
     fn verdict_void_when_gap_at_or_below_5_over_n() {
         let n = 46usize;
         let min_gap = 5.0 / n as f64;
-        let ceiling = 0.6;
 
         // EXACTLY at the boundary: gap == min_gap must be Void (the check is
         // strictly `>`, not `>=`). Subtracting `min_gap` from an arbitrary
