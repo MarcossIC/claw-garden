@@ -1,7 +1,7 @@
 change: dispute-resolution
 objective: "1,5"
 depends_on: [eval-golden-expansion]
-phase: verify
+phase: archived
 artifacts:
   exploration: done
   proposal: done
@@ -9,6 +9,7 @@ artifacts:
   design: done
   tasks: done
   apply: done
-  verify: in_progress  # falta rag-eval y tests en Windows (máquina de Marcos)
-  archive: pending
-updated: 2026-10-12
+  verify: done
+  archive: done
+main_spec: openspec/specs/disputes/spec.md
+updated: 2026-10-13

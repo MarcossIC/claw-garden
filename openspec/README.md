@@ -29,7 +29,7 @@ exploration -> proposal -> spec (+ design si hace falta) -> tasks -> apply -> ve
 | 6 | [visibility-policy](changes/archive/2026-10-12-visibility-policy/proposal.md) | 2, 4 | L (partes A + B) | 4, 5 | A + B archivadas el 2026-10-12 ([`specs/visibility`](specs/visibility/spec.md)); verificado en Linux, Windows y el perfil dev con Claude Code ([verify](changes/archive/2026-10-12-visibility-policy/verify.md)); C y D siguen en 16 |
 | 7 | [lexical-fusion](changes/archive/2026-10-12-lexical-fusion/proposal.md) | 1, 3 | M | 5 | archivado el 2026-10-12 ([`specs/retrieval`](specs/retrieval/spec.md)); `rag-eval --real` en Windows cumple todos los umbrales, el bono queda en 1,0 ([verify](changes/archive/2026-10-12-lexical-fusion/verify.md#medición-en-windows-2026-10-12)) |
 | 8 | [memory-update-tool](changes/memory-update-tool/exploration.md) | 1 | S | 6 (scope) | exploración |
-| 9 | [dispute-resolution](changes/dispute-resolution/proposal.md) | 1, 5 | M | 5 | verificación (falta rag-eval y Windows) |
+| 9 | [dispute-resolution](changes/archive/2026-10-13-dispute-resolution/proposal.md) | 1, 5 | M | 5 | archivado el 2026-10-13 ([`specs/disputes`](specs/disputes/spec.md)); verificado en Linux y Windows, `rag-eval --real` con diff vacío ([verify](changes/archive/2026-10-13-dispute-resolution/verify.md#rag-eval)) |
 | 10 | [mcp-protocol-upgrade](changes/mcp-protocol-upgrade/proposal.md) | 4 | M | 6 (`--agent`) | verify: tests en verde en Linux; faltan Windows y la prueba con Claude Code real ([`verify.md`](changes/mcp-protocol-upgrade/verify.md#pendiente-máquina-del-usuario)) |
 | 11 | [knowledge-synthesis](changes/knowledge-synthesis/proposal.md) | 5 | M (limpieza + síntesis dirigida por el agente) | — | verify: tests en verde en Linux; faltan Windows, `rag-eval --real` y la prueba con el perfil dev ([`verify.md`](changes/knowledge-synthesis/verify.md#pendiente-máquina-de-marcos)) |
 | 12 | [project-indexing](changes/project-indexing/exploration.md) | 3 | decisión | 5 | exploración |
@@ -56,7 +56,7 @@ Por qué este orden:
 - **13** se numera al final, pero tiene que cerrar antes de **16**: compartir entre agentes hace viajar un secreto guardado por error a otros clientes y proveedores. Su purga se decide junto con la parte E de **1**.
 - **15 es de los últimos en probarse, por su naturaleza:** todo lo que necesita viene de antes.
   - Sin memorias largas en el golden set de **5**, y sin casos cuya respuesta quede después del corte, no se puede medir.
-  - Conviene que **9** confirme o descarte antes la hipótesis de los pedazos hermanos que se disputan, que tiene la misma causa.
+  - **9** confirmó la hipótesis de los pedazos hermanos que se disputan, que tiene la misma causa, y resolvió la parte de las disputas ([verify](changes/archive/2026-10-13-dispute-resolution/verify.md#hipótesis-de-los-pedazos-hermanos-con-el-modelo-real)).
   - Si se elige el puntero entre pedazos, toca el esquema y necesita la red de **1**.
   - Se vuelve urgente con la migración desde engram: una importación trae textos largos que no siguen el "un hecho por save".
 
@@ -126,7 +126,6 @@ Ideas y afirmaciones contrastadas con el código. Las descartadas quedan con su 
 
 ## Backlog sin spec (arreglos sueltos)
 
-- **Comentario desactualizado** en `crates/clawg-core/src/memory/worker.rs:344-355`: dice que ningún chunk carga afirmaciones, y los saves explícitos sí la cargan.
 - **`#[allow(dead_code)]` en el chunker** (`ChunkerKind::Code`): viola la convención del proyecto. Se resuelve con knowledge-synthesis o project-indexing.
 - **`clawg stop` mientras carga el modelo:** el apagado ordenado termina en 1–3 s, pero el proceso sigue vivo hasta que vuelve la carga del embedder. La carga corre en `spawn_blocking` (`crates/clawg-core/src/memory/bootstrap.rs:318`), y el runtime de `#[tokio::main]` (`crates/clawg-cli/src/main.rs:30`) espera a esas tareas. Con el binario debug, una vez se pasó de `STOP_TIMEOUT` y `stop` salió con 1. Los datos no corren riesgo: el volcado y el checkpoint terminan antes. Después de "stopped", el log dice "model load task panicked: task N was cancelled" y "retrying in 30s", y eso confunde. Un arreglo posible es `shutdown_timeout` del runtime cuando `serve::run` vuelve. Detalle en el `verify.md` archivado de data-preservation.
 - **`enum Scope` sin uso** (`crates/clawg-core/src/memory/record.rs:19`): se exporta, pero el insert escribe el literal `"agent"` (`store_insert.rs:178`). Se resuelve con agent-sharing (su pregunta 8): se usa o se borra.

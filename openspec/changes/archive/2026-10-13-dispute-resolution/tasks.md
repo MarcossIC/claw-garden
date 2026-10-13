@@ -47,6 +47,6 @@ Cada tarea es un commit atómico: primero el test que falla, después el código
 
 ## Verify
 
-- [x] `cargo test --workspace` en Linux: sin fallas nuevas contra la base (ver `verify.md`). En Windows: pendiente.
-- [ ] `rag-eval --real --diff` y `--agent-view --diff` contra el baseline: pendiente, el golden set no está en el repo (ver `verify.md`).
+- [x] `cargo test --workspace` en Linux: sin fallas nuevas contra la base. En Windows: 1.655 pasan, 0 fallan (ver `verify.md`).
+- [x] `rag-eval --real --diff` y `--agent-view --diff` contra el baseline, en Windows: diff vacío y ninguna métrica del ancla baja (ver `verify.md`).
 - [x] Hipótesis de los pedazos hermanos con el modelo real: confirmada (ver `verify.md`).
