@@ -9,7 +9,8 @@
 - **Agente del puente:** el `agent_id` con el que el puente MCP lee y escribe en una llamada.
 - **Fila del agente A:** fila de `memory`, `episodic_trajectory` o `procedural_skill` con `agent_id = A`.
 - **Llamada con scope:** una llamada al daemon que nombra un agente (`agent` en la query de `DELETE`/`PATCH`, `agent_id` en el cuerpo de `POST /v1/disputes/resolve`, `agent` en `GET /v1/memories`).
-- **Segmento seguro:** un `agent_id` no vacío, distinto de `.` y `..`, sin `/`, `\`, `:`, `*`, `?`, `"`, `<`, `>`, `|`, `%` ni caracteres de control.
+- **Segmento seguro:** un `agent_id` no vacío, sin `/`, `\`, `:`, `*`, `?`, `"`, `<`, `>`, `|`, `%` ni caracteres de control, que no termina en `.` ni en espacio (lo que también excluye `.` y `..`) y que no es un nombre de dispositivo de Windows.
+- **Nombre de dispositivo de Windows:** un `agent_id` cuya parte antes del primer `.`, sin espacios finales y sin distinguir mayúsculas, es `CON`, `PRN`, `AUX`, `NUL`, o `COM`/`LPT` seguido de un dígito o de `¹`, `²`, `³`.
 
 ## R1. Identidad del agente
 
@@ -96,7 +97,8 @@ El agente del puente MUST ser, en este orden:
 
 - La ruta del workspace de un agente MUST quedar dentro de la carpeta de workspaces para todo `agent_id`.
 - Un segmento seguro MUST usarse tal cual: su ruta es la misma que hoy.
-- Un `agent_id` que no es segmento seguro MUST codificarse con `%XX` (hexadecimal en mayúsculas) por cada byte de un carácter no admitido, y de `.`/`..` completos. Dos `agent_id` distintos MUST dar segmentos distintos.
+- Un `agent_id` que no es segmento seguro MUST codificarse con `%XX` (hexadecimal en mayúsculas) por cada byte de un carácter no admitido, de cada `.` o espacio del final, y de la primera letra de un nombre de dispositivo de Windows. Dos `agent_id` distintos MUST dar segmentos distintos, también para Windows, que descarta los `.` y espacios finales.
+- La codificación MUST ser la misma en todas las plataformas.
 - Adoptar el workspace de un id de proyecto heredado MUST usar el nombre de la carpeta del agente tal como está en disco, sin volver a codificarlo.
 
 #### Escenario: nombre peligroso
@@ -104,12 +106,17 @@ El agente del puente MUST ser, en este orden:
 - WHEN se regenera su workspace
 - THEN el archivo queda bajo `<workspaces>/..%2Fescape/...`, dentro de la carpeta de workspaces
 
+#### Escenario: nombres que Windows reescribe
+- GIVEN los agentes `agent`, `agent.`, `con` y `nul.txt`
+- WHEN se escribe el workspace de cada uno
+- THEN quedan en `agent`, `agent%2E`, `%63on` y `%6Eul.txt`, cada uno con su propio archivo
+
 #### Escenario: nombre normal
 - GIVEN un `workspace.md` con sección USER escrita a mano para `claude-code`
 - WHEN se regenera
 - THEN la ruta es `<workspaces>/claude-code/<proyecto>/workspace.md` y la sección USER se conserva
 
-**Test:** `a_safe_agent_id_is_its_own_segment`, `an_unsafe_agent_id_is_encoded_inside_the_root`, `encoding_never_makes_two_agents_share_a_folder` y `adopting_a_legacy_workspace_keeps_an_encoded_folder` en `crates/clawg-core/src/memory/workspace.rs`. Los de nombres peligrosos fallan hoy.
+**Test:** `a_safe_agent_id_is_its_own_segment`, `an_unsafe_agent_id_is_encoded_inside_the_root`, `encoding_never_makes_two_agents_share_a_folder`, `adopting_a_legacy_workspace_keeps_an_encoded_folder`, `a_name_windows_would_rewrite_is_encoded` y `windows_naming_rules_keep_agents_apart_on_disk` en `crates/clawg-core/src/memory/workspace.rs`. Los de nombres peligrosos fallan hoy. Los dos últimos se agregaron al verificar en Windows: fallaban (`con` no podía escribir su workspace: "The system cannot find the path specified").
 
 ## Datos de la versión anterior
 

@@ -596,6 +596,12 @@ fn assemble_file(existing: &str, auto_section: &str) -> String {
 /// it) where it is; any other is percent-encoded byte by byte. `%` counts as
 /// unsafe so an encoded name never equals a literal one, and the empty id,
 /// which no encoding produces, gets the lone `%`.
+///
+/// Windows rewrites some names: it drops trailing dots and spaces, so `a.`
+/// would share `a`'s folder, and it maps a device name (`con`, `nul.txt`) to
+/// the device. Those trailing characters, which also cover `.` and `..`, and
+/// the first letter of a device name are encoded on every platform, so a
+/// store gives each agent the same folder wherever it runs.
 fn workspace_segment(agent_id: &str) -> Cow<'_, str> {
     fn unsafe_char(c: char) -> bool {
         matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '%') || c.is_control()
@@ -608,22 +614,36 @@ fn workspace_segment(agent_id: &str) -> Cow<'_, str> {
     if agent_id.is_empty() {
         return Cow::Borrowed("%");
     }
-    let mut out = String::new();
-    if agent_id == "." || agent_id == ".." {
-        encode(agent_id, &mut out);
-        return Cow::Owned(out);
-    }
-    if !agent_id.chars().any(unsafe_char) {
+    let trailing_from = agent_id.trim_end_matches(['.', ' ']).len();
+    let device = is_windows_device_name(agent_id);
+    if !device && trailing_from == agent_id.len() && !agent_id.chars().any(unsafe_char) {
         return Cow::Borrowed(agent_id);
     }
-    for c in agent_id.chars() {
-        if unsafe_char(c) {
+    let mut out = String::new();
+    for (i, c) in agent_id.char_indices() {
+        if unsafe_char(c) || i >= trailing_from || (device && i == 0) {
             encode(c.encode_utf8(&mut [0; 4]), &mut out);
         } else {
             out.push(c);
         }
     }
     Cow::Owned(out)
+}
+
+/// Whether Windows takes `name` for a device: its part before the first dot,
+/// without trailing spaces, is a reserved name in any case.
+fn is_windows_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or_default().trim_end_matches(' ').to_ascii_uppercase();
+    match stem.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" => true,
+        _ => match stem.strip_prefix("COM").or_else(|| stem.strip_prefix("LPT")) {
+            Some(n) => {
+                let mut chars = n.chars();
+                matches!((chars.next(), chars.next()), (Some('0'..='9' | '¹' | '²' | '³'), None))
+            }
+            None => false,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -698,8 +718,43 @@ mod tests {
     }
 
     #[test]
+    fn a_name_windows_would_rewrite_is_encoded() {
+        for (agent, segment) in [
+            ("con", "%63on"),
+            ("NUL", "%4EUL"),
+            ("aux.txt", "%61ux.txt"),
+            ("Com1", "%43om1"),
+            ("lpt9", "%6Cpt9"),
+            ("prn .md", "%70rn .md"),
+            ("agent.", "agent%2E"),
+            ("agent ", "agent%20"),
+            ("agent. .", "agent%2E%20%2E"),
+        ] {
+            assert_eq!(workspace_segment(agent), segment, "{agent:?}");
+        }
+        for agent in ["console", "com", "com10", "nulo", "a.b", " lead"] {
+            assert_eq!(workspace_segment(agent), agent, "{agent:?}");
+        }
+    }
+
+    #[test]
+    fn windows_naming_rules_keep_agents_apart_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = WorkspaceManager::new(dir.path().to_path_buf());
+        for agent in ["agent", "agent.", "agent ", "con", "nul.txt"] {
+            let path = ws.workspace_path(agent, None);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, agent).unwrap();
+        }
+        for agent in ["agent", "agent.", "agent ", "con", "nul.txt"] {
+            assert_eq!(std::fs::read_to_string(ws.workspace_path(agent, None)).unwrap(), agent, "{agent:?}");
+        }
+    }
+
+    #[test]
     fn encoding_never_makes_two_agents_share_a_folder() {
-        let agents = ["a/b", "a%2Fb", "a%252Fb", "..", "%2E%2E", ".", "%2E", "", "%"];
+        let agents =
+            ["a/b", "a%2Fb", "a%252Fb", "..", "%2E%2E", ".", "%2E", "", "%", "a", "a.", "a%2E", "con", "%63on"];
         let segments: HashSet<String> = agents.iter().map(|a| workspace_segment(a).into_owned()).collect();
         assert_eq!(segments.len(), agents.len(), "{segments:?}");
     }

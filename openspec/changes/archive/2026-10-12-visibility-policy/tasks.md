@@ -37,16 +37,22 @@ Partes A (identidad) y B (scope de lo que modifica). Cada tarea es un commit at�
 - [x] `CLAUDE.md` y `AGENTS.md`: `clawg mcp --agent`, el `agent` opcional de `DELETE`/`PATCH` y `agent_id` de resolve. `README.md`: cómo fijar la identidad.
 - Commit: `docs: document the agent flag and the agent scope on changes` (`7f04101`)
 
+## 7. Nombres que Windows reescribe (R5, encontrado en verify)
+
+- [x] Tests `a_name_windows_would_rewrite_is_encoded` y `windows_naming_rules_keep_agents_apart_on_disk` en `workspace.rs`, más `a`, `a.`, `a%2E`, `con` y `%63on` en `encoding_never_makes_two_agents_share_a_folder`. En Windows fallaban.
+- [x] `workspace_segment` codifica los `.` y espacios finales y la primera letra de un nombre de dispositivo (`is_windows_device_name`).
+- Commit: `fix(core): keep names Windows rewrites from sharing a workspace` (`d875b20`)
+
 ## Verify
 
 - [x] `cargo test --workspace` en Linux: sin fallas nuevas contra la base (ver `verify.md`).
-- [ ] `cargo test --workspace --target-dir <otro-dir>` en Windows: pendiente, máquina de Marcos.
+- [x] `cargo test --workspace --target-dir <otro-dir>` en Windows: la base de 5 fallas de `project_root.rs`, nada nuevo (ver `verify.md`).
 - [x] Prueba por stdio con el binario debug y un perfil `dev` temporal (ver `verify.md`).
-- [ ] Prueba manual en el perfil dev con Claude Code: pendiente, máquina de Marcos (ver `verify.md`).
+- [x] Prueba en el perfil dev real con Claude Code: identidad fijada con `--agent`, filas viejas visibles, y otro agente no puede borrar (ver `verify.md`).
 
-## Archive (cuando se cierre lo pendiente de verify)
+## Archive
 
-- [ ] Crear `openspec/specs/visibility/spec.md` con R1–R5 de esta spec.
-- [ ] Mover `changes/visibility-policy/` a `changes/archive/AAAA-MM-DD-visibility-policy/`; dejar en `changes/` una exploración para la parte C (compartir), con las preguntas 2, 3, 4, 7, 8 y 9 de esta exploración, y anotar la parte D.
-- [ ] `state.yaml`: `phase: archived`, `archive: done`, `main_spec`.
-- [ ] Fila 6 del mapa: archivado (A + B), con C y D pendientes; el backlog de `enum Scope` pasa a la parte C.
+- [x] Crear `openspec/specs/visibility/spec.md` con R1–R5 de esta spec.
+- [x] Mover `changes/visibility-policy/` a `changes/archive/2026-10-12-visibility-policy/`; dejar en `changes/agent-sharing/` una exploración para la parte C (compartir), con las preguntas 2, 3, 4, 7, 8 y 9 de esta exploración, y anotar la parte D.
+- [x] `state.yaml`: `phase: archived`, `archive: done`, `main_spec`.
+- [x] Fila 6 del mapa: archivado (A + B), con C y D pendientes; el backlog de `enum Scope` pasa a la parte C.

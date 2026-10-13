@@ -1,0 +1,16 @@
+change: visibility-policy
+objective: "2,4"
+depends_on: [project-identity, eval-golden-expansion]
+scope: partes A (identidad) y B (scope de lo que modifica); C (compartir) y D (prefiltro vec0) siguen en changes/agent-sharing
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done (Linux, Windows y perfil dev con Claude Code; fix de R5 en Windows)
+  archive: done
+main_spec: openspec/specs/visibility/spec.md
+updated: 2026-10-12
