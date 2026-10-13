@@ -1,14 +1,15 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use clawg_core::memory::identity::resolve_project_root;
+use clawg_core::memory::identity::{resolve_project_root, strip_verbatim};
 use clawg_core::memory::{derive_project_id, ProjectIdentity};
 
 /// A temporary directory by its canonical name, so expected roots compare
-/// equal on systems where the temp dir sits behind a link.
+/// equal on systems where the temp dir sits behind a link. Without the
+/// `\\?\` prefix, as `resolve_project_root` returns it on Windows.
 fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let path = fs::canonicalize(dir.path()).expect("canonicalize tempdir");
+    let path = strip_verbatim(&fs::canonicalize(dir.path()).expect("canonicalize tempdir"));
     (dir, path)
 }
 
