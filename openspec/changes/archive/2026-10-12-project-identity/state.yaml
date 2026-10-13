@@ -10,7 +10,7 @@ artifacts:
   design: done
   tasks: done
   apply: done
-  verify: done (Windows con 5 fallas en project_root.rs y prueba con el binario pendiente; ver verify.md)
+  verify: done (Windows en verde tras arreglar el helper de project_root.rs; prueba con el binario pendiente; ver verify.md)
   archive: done
 main_spec: openspec/specs/project/spec.md
 updated: 2026-10-12

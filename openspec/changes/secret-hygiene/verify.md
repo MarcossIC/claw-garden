@@ -67,6 +67,6 @@ Con `HOME` en un directorio temporal del scratchpad, perfil dev. No se tocó nin
 
 ## Pendiente (máquina del usuario)
 
-- [ ] `cargo test --workspace --target-dir <otro-dir>` en Windows: sin fallas nuevas contra la base de 1691 (los 5 de `project_root.rs` son anteriores). Los tests de purga usan `VACUUM` y comparan bytes de `memory.db`; conviene confirmarlos ahí.
+- [ ] `cargo test --workspace --target-dir <otro-dir>` en Windows: sin fallas nuevas contra la base de `.claude/CLAUDE.md` (los 5 de `project_root.rs` ya están arreglados). Los tests de purga usan `VACUUM` y comparan bytes de `memory.db`; conviene confirmarlos ahí.
 - [ ] `rag-eval --real --diff` contra el baseline: R@1 0,4348, R@5 0,7826, R@10 0,8913, MRR 0,5979 y nDCG@10 0,6693 idénticos.
 - [ ] Perfil dev, **con autorización** y con una copia de `memory.db` antes: un `save_memory` desde Claude Code con una key falsa (por ejemplo `ghp_` y 36 caracteres) dice `masked github_token`; `clawg secrets` sobre la base real; si hay filas, `clawg stop` y `clawg purge <ID> --yes` de una, y `clawg memories stats` igual salvo esa fila.

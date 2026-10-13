@@ -34,7 +34,7 @@ No aplica. El cambio no toca `clawg-core`, el ranking ni el golden set.
 
 ## Pendiente (máquina del usuario)
 
-1. **Windows:** `cargo test --workspace --target-dir <otro-dir>`. Se espera la línea de base de `CLAUDE.md` (5 fallas en `project_root.rs`) más los tests nuevos en verde.
+1. **Windows:** `cargo test --workspace --target-dir <otro-dir>`. Se espera la línea de base de `CLAUDE.md` (sin fallas) más los tests nuevos en verde.
 2. **Claude Code real, perfil dev.** Con el binario debug de esta rama registrado como el MCP `clawg-dev`:
    - el MCP conecta sin `CONNECT_TIMEOUT` y `/mcp` lista las siete herramientas;
    - una búsqueda encuentra una memoria guardada **antes** del cambio. Es la prueba de que Claude Code se nombra igual en el ciclo de vida nuevo que en `initialize`;
