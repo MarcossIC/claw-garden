@@ -25,10 +25,10 @@ Cada tarea es un commit atómico: primero el test que falla, después el código
 
 - [x] `cargo test --workspace`: sin fallas nuevas contra la base (ver `verify.md`).
 - [x] `rag-eval --real --diff` sobre un set sustituto, base contra cambio (ver `verify.md`).
-- [ ] `rag-eval --real --diff` sobre el set de la semilla 7 y sobre el ancla, y `--agent-view --diff`, contra el baseline: umbrales de `proposal.md`. Necesita `docs/eval/`, que está en la máquina del usuario.
+- [x] `rag-eval --real --diff` sobre el set de la semilla 7 y sobre el ancla, y `--agent-view --diff`, contra el baseline: umbrales de `proposal.md`. Medido en Windows el 2026-10-12; cumple todos (ver `verify.md`).
 
 ## Archive (después de la medición)
 
-- [ ] Anotar las cifras en `verify.md` y marcar el checklist "Pendiente".
-- [ ] Si todos los umbrales se cumplen: pasar la spec a `specs/retrieval/spec.md` (con las líneas de `main`), mover la carpeta a `changes/archive/AAAA-MM-DD-lexical-fusion/`, poner `phase: archived` en `state.yaml` y actualizar la fila 7 del README.
-- [ ] Si alguno falla: registrarlo tal cual. `ScoringConfig.lexical_bonus = 0` deja el ranking como antes, bit a bit; el ajuste va en un cambio nuevo.
+- [x] Anotar las cifras en `verify.md` y marcar el checklist "Pendiente".
+- [x] Si todos los umbrales se cumplen: pasar la spec a `specs/retrieval/spec.md` (con las líneas de `main`), mover la carpeta a `changes/archive/AAAA-MM-DD-lexical-fusion/`, poner `phase: archived` en `state.yaml` y actualizar la fila 7 del README.
+- No aplica: ningún umbral falló.
