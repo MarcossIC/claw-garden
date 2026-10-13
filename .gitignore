@@ -35,3 +35,4 @@ docs/eval/**
 /scripts/clawg.exe
 
 target-apply/**
+target-test/**
