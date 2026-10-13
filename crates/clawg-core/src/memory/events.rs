@@ -36,6 +36,11 @@ pub struct MemoryEvent {
     /// same `#[serde(default)]` contract as [`MemoryEvent::memory_type`].
     #[serde(default)]
     pub importance: Option<f64>,
+    /// Ids of the `memory` rows this one was drawn from, when a client saves a
+    /// conclusion. Honoured only for [`MemorySource::Explicit`], like the two
+    /// overrides above, and with the same `#[serde(default)]` contract.
+    #[serde(default)]
+    pub derived_from: Vec<i64>,
 }
 
 /// Where the ingest event originated (which producer).
@@ -64,6 +69,16 @@ pub enum MemorySource {
 }
 
 impl MemoryEvent {
+    /// The rows this event says it was drawn from. Only a deliberate save can
+    /// name them, for the reason only it may override type and importance.
+    pub(crate) fn sources(&self) -> &[i64] {
+        if self.source == MemorySource::Explicit {
+            &self.derived_from
+        } else {
+            &[]
+        }
+    }
+
     /// Build an event from a persisted `ChatMessage`.
     ///
     /// Returns `None` for messages we deliberately do NOT ingest:
@@ -91,6 +106,7 @@ impl MemoryEvent {
                 // docs for why a producer is not allowed to override them.
                 memory_type: None,
                 importance: None,
+                derived_from: Vec::new(),
             }),
         }
     }
@@ -128,6 +144,7 @@ mod tests {
             timestamp_ms: 123,
             memory_type: None,
             importance: None,
+            derived_from: Vec::new(),
         };
         assert!(matches!(evt.role, Role::Tool));
         assert_eq!(evt.is_error, Some(true));
@@ -175,6 +192,7 @@ mod tests {
             timestamp_ms: 7,
             memory_type: Some("user_preference".into()),
             importance: Some(9.5),
+            derived_from: Vec::new(),
         };
         let json = serde_json::to_string(&evt).expect("serialize");
         let back: MemoryEvent = serde_json::from_str(&json).expect("deserialize");
@@ -233,6 +251,7 @@ mod tests {
             timestamp_ms: 0,
             memory_type: None,
             importance: None,
+            derived_from: Vec::new(),
         });
         // Result is Err when receiver is dropped — must not panic
         let _ = result;

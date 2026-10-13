@@ -409,6 +409,7 @@ mod tests {
             timestamp_ms: 1,
             memory_type: None,
             importance: None,
+            derived_from: Vec::new(),
         }
     }
 

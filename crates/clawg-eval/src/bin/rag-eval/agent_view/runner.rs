@@ -136,7 +136,7 @@ async fn answer_cases(
             .map_err(|source| RunError::Parse { query: case.query.clone(), source })?;
 
         let started = Instant::now();
-        let prompt = session.client.context(&case.query, AGENT_ID, None).await?;
+        let prompt = session.client.context(&case.query, AGENT_ID, None).await?.prompt;
         let context_text = format_context(&prompt);
         let context_ms = elapsed_ms(started);
         let context_found = read_context(&context_text, &case.expected_refs, corpus);

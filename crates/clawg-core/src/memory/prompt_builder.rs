@@ -56,11 +56,10 @@ pub struct QueryTexts<'a> {
 }
 
 impl<'a> QueryTexts<'a> {
-    /// Both fields set to the same text — today's pre-composition behavior,
-    /// stated explicitly. Every call site that has no context to offer
-    /// (single-shot eval, most tests) uses this rather than repeating `q`
-    /// twice at the call site, which is what invited the two fields being
-    /// swapped by accident in the first place.
+    /// Both fields set to the same text, for a query with no conversation
+    /// around it. Repeating `q` at each call site is what invited the two
+    /// fields being swapped by accident.
+    #[cfg(test)]
     pub(crate) fn single_shot(q: &'a str) -> Self {
         Self { lexical: q, embedded: q }
     }

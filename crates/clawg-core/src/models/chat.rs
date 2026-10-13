@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,62 +55,10 @@ pub struct ToolFunction {
     pub arguments: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolDefinition {
-    #[serde(rename = "type")]
-    pub tool_type: String,
-    pub function: ToolFunctionDef,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolFunctionDef {
-    pub name: String,
-    pub description: String,
-    pub parameters: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatRequest {
-    pub model: String,
-    pub messages: Vec<ChatMessage>,
-    pub system_prompt: Option<String>,
-    /// Per-agent custom instructions — sent as a SEPARATE system block so the
-    /// base system prompt prefix can be shared across agents with the same role.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub custom_instructions: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<ToolDefinition>>,
-    /// Provider-specific parameters (e.g. `thinking_effort` for Anthropic).
-    /// Each provider reads only the keys it understands and ignores the rest.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub extensions: HashMap<String, serde_json::Value>,
-}
-
-/// Result of a chat stream — either text content or tool call requests.
-#[derive(Debug, Clone)]
-pub enum ChatStreamResult {
-    Text(String),
-    ToolCalls(Vec<ToolCall>),
-}
-
 /// Events sent through a streaming channel.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(tag = "kind")]
 pub enum StreamEvent {
-    #[serde(rename = "delta")]
-    Delta { delta: String },
-
-    #[serde(rename = "state")]
-    State { state: String },
-
-    #[serde(rename = "usage")]
-    Usage {
-        input_tokens: u32,
-        output_tokens: u32,
-        cache_creation_tokens: u32,
-        cache_read_tokens: u32,
-    },
-
     /// Embedder model bootstrap progress.
     ///
     /// Lifecycle on success: `start` -> `downloading` (1..N, rate-limited) ->
@@ -227,19 +173,10 @@ mod tests {
         };
         let s = serde_json::to_string(&ev).expect("serialize");
         let back: StreamEvent = serde_json::from_str(&s).expect("deserialize");
-        match back {
-            StreamEvent::EmbedderDownload {
-                phase,
-                bytes_downloaded,
-                bytes_total,
-                error,
-            } => {
-                assert_eq!(phase, "error");
-                assert_eq!(bytes_downloaded, None);
-                assert_eq!(bytes_total, None);
-                assert_eq!(error, Some("boom".into()));
-            }
-            other => panic!("expected EmbedderDownload, got {other:?}"),
-        }
+        let StreamEvent::EmbedderDownload { phase, bytes_downloaded, bytes_total, error } = back;
+        assert_eq!(phase, "error");
+        assert_eq!(bytes_downloaded, None);
+        assert_eq!(bytes_total, None);
+        assert_eq!(error, Some("boom".into()));
     }
 }

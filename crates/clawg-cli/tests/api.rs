@@ -771,6 +771,116 @@ async fn context_returns_a_prompt_string() {
 }
 
 #[tokio::test]
+async fn context_reports_unreviewed_memories() {
+    let h = Harness::start().await;
+    for content in ["the go service uses tabs", "the rust crate uses tabs"] {
+        h.post_json("/v1/memories", json!({ "content": content, "agent_id": "a", "project_id": "p" })).await;
+    }
+    let context = || h.post_json("/v1/context", json!({ "query": "tabs", "agent_id": "a", "project_id": "p" }));
+
+    let (status, body) = context().await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["unreviewed"], 2, "{body}");
+
+    let (status, body) = h.post_json("/v1/synthesis", json!({ "agent_id": "b", "project_id": "p" })).await;
+    assert_eq!(status, 200, "{body}");
+    let (_, body) = context().await;
+    assert_eq!(body["unreviewed"], 2, "another agent's review is not this one's: {body}");
+
+    h.post_json("/v1/synthesis", json!({ "agent_id": "a", "project_id": "p" })).await;
+    let (_, body) = context().await;
+    assert_eq!(body["unreviewed"], 0, "{body}");
+}
+
+// ── conclusions and synthesis ───────────────────────────────────────────────
+
+async fn save_id(h: &Harness, body: Value) -> i64 {
+    let (status, saved) = h.post_json("/v1/memories", body).await;
+    assert_eq!(status, 201, "{saved}");
+    saved["memories"][0]["id"].as_i64().expect("id")
+}
+
+#[tokio::test]
+async fn synthesis_over_http() {
+    let h = Harness::start().await;
+    let a = save_id(&h, json!({ "content": "the go service uses tabs", "agent_id": "a", "project_id": "p" })).await;
+    let b = save_id(&h, json!({ "content": "the rust crate uses tabs", "agent_id": "a", "project_id": "p" })).await;
+    let e = save_id(&h, json!({ "content": "deploys happen on fridays", "agent_id": "a", "project_id": "p" })).await;
+    let c = save_id(
+        &h,
+        json!({
+            "content": "the user indents with tabs in every language",
+            "agent_id": "a",
+            "project_id": "p",
+            "memory_type": "user_preference",
+            "derived_from": [b, a],
+        }),
+    )
+    .await;
+
+    let (status, body) = h.post_json("/v1/synthesis", json!({ "project_id": "p" })).await;
+
+    assert_eq!(status, 200, "{body}");
+    let pending: Vec<i64> = body["pending"].as_array().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    assert_eq!(pending, vec![e], "{body}");
+    assert_eq!(body["pending_total"], 1);
+    assert_eq!(body["conclusions"][0]["id"], c);
+    assert_eq!(body["conclusions"][0]["derived_from"], json!([a, b]));
+    let (_, item) = h.get_json(&format!("/v1/memories/memory/{c}")).await;
+    assert_eq!(item["item"]["derived_from"], json!([a, b]), "{item}");
+}
+
+#[tokio::test]
+async fn a_save_from_unknown_sources_is_refused() {
+    let h = Harness::start().await;
+    let a = save_id(&h, json!({ "content": "kept", "agent_id": "a" })).await;
+    let d = save_id(&h, json!({ "content": "deleted", "agent_id": "a" })).await;
+    let r = h.authed(h.http.delete(h.url(&format!("/v1/memories/memory/{d}")))).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+
+    let (status, body) = h
+        .post_json(
+            "/v1/memories",
+            json!({ "content": "a conclusion", "agent_id": "a", "derived_from": [a, d, 999999] }),
+        )
+        .await;
+
+    assert_eq!(status, 400, "{body}");
+    let message = body.to_string();
+    assert!(message.contains(&d.to_string()) && message.contains("999999"), "{message}");
+    let (_, list) = h.get_json("/v1/memories?kind=memory").await;
+    assert_eq!(list["items"].as_array().map(Vec::len), Some(1), "nothing was saved: {list}");
+}
+
+#[tokio::test]
+async fn an_agent_neither_reviews_nor_cites_another_agents_memories() {
+    let h = Harness::start().await;
+    let mine = save_id(&h, json!({ "content": "the go service uses tabs", "agent_id": "a", "project_id": "p" })).await;
+    let theirs = save_id(&h, json!({ "content": "the deploy runs on fridays", "agent_id": "b", "project_id": "p" })).await;
+
+    let (status, body) = h.post_json("/v1/synthesis", json!({ "agent_id": "a", "project_id": "p" })).await;
+    assert_eq!(status, 200, "{body}");
+    let pending: Vec<i64> = body["pending"].as_array().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    assert_eq!(pending, vec![mine], "{body}");
+
+    let (status, body) = h
+        .post_json(
+            "/v1/memories",
+            json!({ "content": "a conclusion", "agent_id": "a", "project_id": "p", "derived_from": [mine, theirs] }),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.to_string().contains(&theirs.to_string()), "{body}");
+}
+
+#[tokio::test]
+async fn a_misspelt_synthesis_field_is_refused() {
+    let h = Harness::start().await;
+    let (status, body) = h.post_json("/v1/synthesis", json!({ "agnet_id": "a" })).await;
+    assert_eq!(status, 422, "{body}");
+}
+
+#[tokio::test]
 async fn patch_importance_updates_then_404s_on_a_missing_row() {
     let h = Harness::start().await;
     h.post_json(

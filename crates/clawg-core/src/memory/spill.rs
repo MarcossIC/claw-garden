@@ -154,6 +154,7 @@ mod tests {
             timestamp_ms: 42,
             memory_type: Some("decision".into()),
             importance: Some(8.0),
+            derived_from: vec![3, 1],
         }
     }
 
@@ -173,6 +174,18 @@ mod tests {
         assert_eq!(json(&events[0]), json(&original));
         assert_eq!(events[0].memory_type.as_deref(), Some("decision"));
         assert_eq!(events[0].importance, Some(8.0));
+        assert_eq!(events[0].derived_from, vec![3, 1]);
+    }
+
+    #[test]
+    fn a_spill_without_sources_still_parses() {
+        let mut previous = json(&event("written before sources existed"));
+        previous.as_object_mut().unwrap().remove("derived_from");
+
+        let (events, rejected) = parse_lines(&format!("{previous}\n"));
+
+        assert!(rejected.is_empty());
+        assert!(events[0].derived_from.is_empty());
     }
 
     #[test]

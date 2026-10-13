@@ -390,7 +390,13 @@ async fn absorb_duplicate(
     absorbed: &mut u64,
 ) -> Option<i64> {
     match store
-        .reinforce_if_duplicate(&evt.agent_id, evt.project_id.as_deref(), content_hash, evt.timestamp_ms)
+        .reinforce_if_duplicate(
+            &evt.agent_id,
+            evt.project_id.as_deref(),
+            content_hash,
+            evt.sources(),
+            evt.timestamp_ms,
+        )
         .await
     {
         Ok(Some(id)) => {
@@ -525,8 +531,9 @@ async fn process_event(
     // carries a claim-bearing type, so a long one reaches the probe once per
     // chunk; the chunks this event already inserted are passed as siblings,
     // because two parts of one save are one claim by one author and must not
-    // dispute each other.
-    let mut siblings: Vec<i64> = Vec::new();
+    // dispute each other. The rows a conclusion was drawn from are passed the
+    // same way: it restates them, it does not contradict them.
+    let mut siblings: Vec<i64> = evt.sources().to_vec();
     for ((position, pending), vec) in survivors.into_iter().zip(vectors) {
         let PendingChunk { chunk, content_hash, multiplicity } = pending;
         // The contradiction hook runs between embed and insert: it needs the
@@ -597,6 +604,7 @@ mod tests {
             timestamp_ms: ts,
             memory_type: None,
             importance: None,
+            derived_from: Vec::new(),
         }
     }
 
@@ -611,6 +619,7 @@ mod tests {
             timestamp_ms: ts,
             memory_type: None,
             importance: None,
+            derived_from: Vec::new(),
         }
     }
 
@@ -680,6 +689,7 @@ mod tests {
             timestamp_ms: 1,
             memory_type: None,
             importance: None,
+            derived_from: Vec::new(),
         };
         // Wait: the "tool_calls" filter is in from_message, but the worker just
         // calls select_chunker(Role::Assistant, None, "") → Skip (empty content).
@@ -1038,6 +1048,7 @@ mod tests {
                 timestamp_ms: (i as u64) + 1,
                 memory_type: None,
                 importance: None,
+                derived_from: Vec::new(),
             })).unwrap();
         }
         drain_worker(tx, handle).await;
@@ -1118,6 +1129,7 @@ mod tests {
                 timestamp_ms: (i as u64) + 1,
                 memory_type: None,
                 importance: None,
+                derived_from: Vec::new(),
             })).unwrap();
         }
         drain_worker(tx2, handle2).await;
@@ -1146,6 +1158,7 @@ mod tests {
                 timestamp_ms: (i as u64) + 1,
                 memory_type: None,
                 importance: None,
+                derived_from: Vec::new(),
             })).unwrap();
         }
         drain_worker(tx3, handle3).await;
@@ -1576,6 +1589,108 @@ mod tests {
         }
     }
 
+    // ── Conclusions and their sources ───────────────────────────────────────
+
+    async fn sources_of(store: &MemoryStore, id: i64) -> Vec<i64> {
+        store
+            .conn
+            .call(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT source_id FROM memory_derivation WHERE memory_id = ?1 ORDER BY source_id",
+                )?;
+                let ids = stmt.query_map([id], |r| r.get(0))?.collect();
+                ids
+            })
+            .await
+            .unwrap()
+    }
+
+    fn conclusion(content: &str, sources: &[i64]) -> MemoryEvent {
+        MemoryEvent { derived_from: sources.to_vec(), ..explicit_fact(content) }
+    }
+
+    async fn saved(store: &Arc<MemoryStore>, evt: &MemoryEvent) -> Vec<SavedChunk> {
+        let report = process_with(Arc::new(FakeEmbedder::default()), store, evt).await;
+        assert_eq!(report.failure, None);
+        report.memories
+    }
+
+    #[tokio::test]
+    async fn a_conclusion_is_linked_to_its_sources() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let a = saved(&store, &explicit_fact("the go service is indented with tabs")).await[0].id;
+        let b = saved(&store, &explicit_fact("the rust crate is indented with tabs")).await[0].id;
+
+        let c = saved(&store, &conclusion("the user indents with tabs everywhere", &[b, a, b])).await[0].id;
+
+        assert_eq!(sources_of(&store, c).await, vec![a, b]);
+        assert!(sources_of(&store, a).await.is_empty(), "a source gains no sources of its own");
+    }
+
+    #[tokio::test]
+    async fn every_chunk_of_a_conclusion_is_linked() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let a = saved(&store, &explicit_fact("one thing the user said")).await[0].id;
+        let b = saved(&store, &explicit_fact("another thing the user said")).await[0].id;
+        let content = distinct_text(400);
+        assert_eq!(chunk_count(&content), 2, "fixture must split into two chunks");
+
+        let chunks = saved(&store, &conclusion(&content, &[a, b])).await;
+
+        assert_eq!(chunks.len(), 2);
+        for chunk in chunks {
+            assert_eq!(sources_of(&store, chunk.id).await, vec![a, b]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reinforced_conclusion_gains_the_new_sources() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let a = saved(&store, &explicit_fact("one thing the user said")).await[0].id;
+        let b = saved(&store, &explicit_fact("another thing the user said")).await[0].id;
+        let c = saved(&store, &conclusion("what both of them mean", &[a])).await[0].id;
+
+        let again = saved(&store, &conclusion("what both of them mean", &[b])).await;
+
+        assert_eq!(again, vec![SavedChunk { id: c, outcome: ChunkOutcome::Reinforced }]);
+        assert_eq!(sources_of(&store, c).await, vec![a, b]);
+    }
+
+    #[tokio::test]
+    async fn a_row_is_never_its_own_source() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let a = saved(&store, &explicit_fact("the same words twice")).await[0].id;
+        let b = saved(&store, &explicit_fact("something else entirely")).await[0].id;
+
+        let again = saved(&store, &conclusion("the same words twice", &[a, b])).await;
+
+        assert_eq!(again, vec![SavedChunk { id: a, outcome: ChunkOutcome::Reinforced }]);
+        assert_eq!(sources_of(&store, a).await, vec![b]);
+    }
+
+    #[tokio::test]
+    async fn a_conclusion_does_not_dispute_its_sources() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let place = |v: Vec<f32>| -> Arc<dyn Embedder> { Arc::new(PlacedEmbedder { vectors: vec![v] }) };
+        let source = process_with(place(turned(1, 0.2)), &store, &explicit_fact("tabs in the go service")).await;
+        let source = source.memories[0].id;
+        let other = process_with(place(turned(2, 0.2)), &store, &explicit_fact("spaces in the python app")).await;
+        let other = other.memories[0].id;
+
+        let report = process_with(
+            place(turned(1, 0.0)),
+            &store,
+            &conclusion("the user indents with tabs", &[source]),
+        )
+        .await;
+
+        assert_eq!(report.failure, None);
+        assert_eq!(
+            disputes_of(&store, report.memories[0].id).await,
+            ("disputed".to_string(), Some(format!("[{other}]")))
+        );
+    }
+
     #[tokio::test]
     async fn process_event_reports_the_rows_written_before_an_insert_failed() {
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
@@ -1769,6 +1884,7 @@ mod tests {
             timestamp_ms: 1,
             memory_type: None,
             importance: None,
+            derived_from: Vec::new(),
         })).unwrap();
         drain_worker(tx, handle).await;
 
@@ -1794,6 +1910,7 @@ mod tests {
             timestamp_ms: 1,
             memory_type: None,
             importance: None,
+            derived_from: Vec::new(),
         })).unwrap();
         drain_worker(tx, handle).await;
 

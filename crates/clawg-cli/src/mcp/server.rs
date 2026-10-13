@@ -37,10 +37,13 @@ use rmcp::{tool, tool_handler, tool_router, RoleServer, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::client::{ClientError, DaemonClient, ListArgs, SaveArgs, SaveOutcome, SearchArgs};
+use crate::client::{
+    ClientError, DaemonClient, ListArgs, SaveArgs, SaveOutcome, SearchArgs, SynthesisArgs,
+};
 use crate::mcp::startup::ClientHandle;
 use crate::mcp::tools::{
-    format_context, format_resolution, format_rows, format_search, format_status, resolve_project,
+    format_recall, format_resolution, format_rows, format_search, format_status, format_synthesis,
+    resolve_project,
 };
 
 /// Agent id used when neither `--agent` nor the MCP client named one.
@@ -106,7 +109,9 @@ Persistent memory for this user across sessions. Use `save_memory` whenever the 
 user states a durable fact, preference or decision; use `search_memory` before \
 answering anything that depends on earlier sessions, and `recall_context` once \
 when a broad task needs background. When it lists ACTIVE CONFLICTS, ask the user \
-which memory holds and record the answer with `resolve_conflict`. \
+which memory holds and record the answer with `resolve_conflict`. When \
+`recall_context` says memories are waiting for a review, or the user asks what you \
+have learned, call `synthesize` and save the conclusions it leads to. \
 Memories are scoped to the current project unless you say otherwise.";
 
 // ── Tool parameters ─────────────────────────────────────────────────────────
@@ -130,6 +135,10 @@ pub struct SaveMemoryArgs {
     /// directory this bridge was started in.
     #[serde(default)]
     pub project_path: Option<String>,
+    /// Only for a conclusion: the ids of the memories it generalizes, as
+    /// `synthesize` lists them. Omit for an ordinary memory.
+    #[serde(default)]
+    pub derived_from: Option<Vec<i64>>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -159,6 +168,21 @@ pub struct RecallContextArgs {
     /// started in.
     #[serde(default)]
     pub project_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct SynthesizeArgs {
+    /// How many memories to review, 1 to 100. Defaults to 30.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Absolute path of the project to review. Defaults to the directory this
+    /// bridge was started in.
+    #[serde(default)]
+    pub project_path: Option<String>,
+    /// Review every project at once, for conclusions about the user rather
+    /// than about one codebase.
+    #[serde(default)]
+    pub all_projects: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -468,6 +492,7 @@ impl ClawgMcp {
                 project_id,
                 memory_type: args.memory_type,
                 importance: args.importance,
+                derived_from: args.derived_from.unwrap_or_default(),
             })
             .await;
         // "saved" only when the daemon confirmed the rows exist: telling a
@@ -519,7 +544,7 @@ impl ClawgMcp {
             .context(&args.query, agent_id, project_id.as_deref())
             .await
         {
-            Ok(prompt) => Self::ok(format_context(&prompt)),
+            Ok(context) => Self::ok(format_recall(&context)),
             Err(e) => Self::failed(Self::explain(&e)),
         }
     }
@@ -580,6 +605,25 @@ impl ClawgMcp {
         };
         match client.resolve(args.keep, args.other, args.keep_both.unwrap_or(false), Some(agent_id)).await {
             Ok(resolution) => Self::ok(format_resolution(&resolution)),
+            Err(e) => Self::failed(Self::explain(&e)),
+        }
+    }
+
+    /// Only the calling agent's memories, as in `list_memories_impl`.
+    pub async fn synthesize_impl(
+        &self,
+        agent_id: &str,
+        args: SynthesizeArgs,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let client = match self.daemon().await {
+            Ok(c) => c,
+            Err(failure) => return Ok(failure),
+        };
+        let project_id = self
+            .project_for(&client, args.project_path.as_deref(), args.all_projects.unwrap_or(false))
+            .await;
+        match client.synthesis(&SynthesisArgs { agent_id: Some(agent_id.into()), project_id, limit: args.limit }).await {
+            Ok(synthesis) => Self::ok(format_synthesis(&synthesis)),
             Err(e) => Self::failed(Self::explain(&e)),
         }
     }
@@ -705,6 +749,24 @@ impl ClawgMcp {
         Parameters(args): Parameters<ResolveConflictArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         self.resolve_conflict_impl(&self.agent_id_for(Some(&ctx)), args).await
+    }
+
+    #[tool(
+        name = "synthesize",
+        description = "Review stored memories for conclusions: the memories no conclusion covers \
+                       yet, newest first, the conclusions already drawn, and how to save new \
+                       ones. A conclusion is saved with `save_memory` and `derived_from`; the \
+                       memories it rests on stay as they are. Use it when `recall_context` says \
+                       memories are waiting, at the end of a long task, or when the user asks \
+                       what you have learned. Calling it marks the memories as reviewed, even \
+                       if you save nothing."
+    )]
+    async fn synthesize(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(args): Parameters<SynthesizeArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.synthesize_impl(&self.agent_id_for(Some(&ctx)), args).await
     }
 
     #[tool(
@@ -861,7 +923,7 @@ mod tests {
     }
 
     fn save_args(content: &str) -> SaveMemoryArgs {
-        SaveMemoryArgs { content: content.into(), memory_type: None, importance: None, project_path: None }
+        SaveMemoryArgs { content: content.into(), memory_type: None, importance: None, project_path: None, derived_from: None }
     }
 
     #[tokio::test]
@@ -876,6 +938,7 @@ mod tests {
                 project_id: Some(identity.legacy_id.clone()),
                 memory_type: None,
                 importance: None,
+                derived_from: Vec::new(),
             })
             .await
             .expect("seed a legacy row");
@@ -1123,6 +1186,7 @@ mod tests {
                 project_id: Some("proj-test".into()),
                 memory_type: None,
                 importance: None,
+                derived_from: Vec::new(),
             })
             .await
             .expect("save");
@@ -1173,6 +1237,7 @@ mod tests {
                 project_id: Some("proj-test".into()),
                 memory_type: None,
                 importance: None,
+                derived_from: Vec::new(),
             })
             .await
             .expect("save");
@@ -1209,6 +1274,10 @@ mod tests {
             info.instructions.as_deref().is_some_and(|i| i.contains("save_memory")),
             "instructions must tell the model when to reach for the tools"
         );
+        assert!(
+            info.instructions.as_deref().is_some_and(|i| i.contains("synthesize")),
+            "instructions must say when to look for conclusions"
+        );
     }
 
     #[tokio::test]
@@ -1227,11 +1296,12 @@ mod tests {
             "list_memories",
             "delete_memory",
             "resolve_conflict",
+            "synthesize",
             "memory_status",
         ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}: {names:?}");
         }
-        assert_eq!(names.len(), 7, "no extra tools: {names:?}");
+        assert_eq!(names.len(), 8, "no extra tools: {names:?}");
     }
 
     /// The memory viewer (`clawg memories`) is for the person at the terminal.
@@ -1255,6 +1325,7 @@ mod tests {
                 "resolve_conflict",
                 "save_memory",
                 "search_memory",
+                "synthesize",
             ]
         );
 
@@ -1296,6 +1367,55 @@ mod tests {
         ] {
             assert!(schema.contains(value), "schema does not mention {value}: {schema}");
         }
+    }
+
+    /// A conclusion is only a conclusion if its sources reach the store, and
+    /// the schema is the only place the model learns the field exists.
+    #[tokio::test]
+    async fn the_save_memory_schema_offers_sources() {
+        let (b, _d) = bridge().await;
+        let schema = serde_json::to_string(&tool(&b, "save_memory").input_schema).expect("schema");
+        assert!(schema.contains("derived_from"), "{schema}");
+        assert!(schema.contains("synthesize"), "the field must say where its ids come from: {schema}");
+    }
+
+    #[tokio::test]
+    async fn synthesize_lists_what_no_conclusion_covers_and_recall_stops_reminding() {
+        let (b, _d) = bridge().await;
+        let foreign = b.save_memory_impl("agent-other", save_args("another agent's note about the build")).await.expect("save");
+        let foreign = text(&foreign).strip_prefix("saved #").and_then(|n| n.parse::<i64>().ok()).expect("an id");
+        let mut ids = Vec::new();
+        for i in 0..crate::mcp::tools::SYNTHESIS_NUDGE_THRESHOLD {
+            let saved = b.save_memory_impl("agent-mcp", save_args(&format!("fact number {i} about the build"))).await.expect("save");
+            ids.push(text(&saved).strip_prefix("saved #").and_then(|n| n.parse::<i64>().ok()).expect("an id"));
+        }
+        let recall = || b.recall_context_impl("agent-mcp", RecallContextArgs { query: "the build".into(), project_path: None });
+        assert!(text(&recall().await.expect("recall")).contains("`synthesize`"), "enough memories wait for a review");
+
+        let listed = text(&b.synthesize_impl("agent-mcp", SynthesizeArgs::default()).await.expect("synthesize"));
+        assert!(listed.contains(&format!("#{} ", ids[0])), "{listed}");
+        assert!(!listed.contains(&format!("#{foreign} ")), "another agent's memory is not this one's to review: {listed}");
+        assert!(!text(&recall().await.expect("recall")).contains("`synthesize`"), "the review turns the reminder off");
+
+        let conclusion = SaveMemoryArgs {
+            derived_from: Some(vec![ids[0], ids[1]]),
+            memory_type: Some("architectural_decision".into()),
+            ..save_args("the build is described by twenty separate facts")
+        };
+        let saved = b.save_memory_impl("agent-mcp", conclusion).await.expect("save");
+        assert!(!is_error(&saved), "{}", text(&saved));
+        let listed = text(&b.synthesize_impl("agent-mcp", SynthesizeArgs::default()).await.expect("synthesize"));
+        assert!(listed.contains(&format!("from=#{},#{}", ids[0], ids[1])), "{listed}");
+        assert!(!listed.contains(&format!("#{} fact", ids[0])), "a covered memory is no longer pending: {listed}");
+    }
+
+    #[tokio::test]
+    async fn a_save_from_a_missing_source_reports_the_refusal() {
+        let (b, _d) = bridge().await;
+        let args = SaveMemoryArgs { derived_from: Some(vec![424242]), ..save_args("a conclusion from nothing") };
+        let r = b.save_memory_impl("agent-mcp", args).await.expect("save");
+        assert!(is_error(&r), "{}", text(&r));
+        assert!(text(&r).contains("424242"), "{}", text(&r));
     }
 
     /// A tool with no description is a tool the model will not reach for.
@@ -1394,6 +1514,7 @@ mod tests {
                     memory_type: Some("semantic_fact".into()),
                     importance: Some(8.0),
                     project_path: None,
+                    derived_from: None,
                 },
             )
             .await
@@ -1461,6 +1582,7 @@ mod tests {
                     memory_type: None,
                     importance: None,
                     project_path: None,
+                    derived_from: None,
                 },
             )
             .await
@@ -1662,7 +1784,7 @@ mod tests {
             let saved = b
                 .save_memory_impl(
                     "agent-mcp",
-                    SaveMemoryArgs { content: content.into(), memory_type: None, importance: None, project_path: None },
+                    SaveMemoryArgs { content: content.into(), memory_type: None, importance: None, project_path: None, derived_from: None },
                 )
                 .await
                 .expect("save");
@@ -1828,6 +1950,7 @@ mod tests {
                 memory_type: None,
                 importance: None,
                 project_path: Some("/some/elsewhere".into()),
+                derived_from: None,
             },
         )
         .await
