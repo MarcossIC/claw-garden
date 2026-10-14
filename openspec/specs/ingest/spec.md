@@ -26,6 +26,8 @@ Con el embedder `ready`, `POST /v1/memories` MUST encolar el evento con un canal
 
 `kind` es siempre `"memory"`, de modo que `kind` e `id` son exactamente lo que toma `DELETE /v1/memories/{kind}/{id}`. Las copias repetidas dentro del mismo save MUST NOT generar elementos extra: cuentan como refuerzo de la fila de su primera copia (`collapse_duplicate_chunks`, `worker.rs:134`, y `process_event`, `worker.rs:408`).
 
+Si la ingesta enmascaró secretos, la respuesta lleva además `redacted` con sus tipos, y `save_memory` los nombra en su texto: ver [`specs/secrets`](../secrets/spec.md), R3.
+
 #### Escenario: inserción
 - GIVEN un daemon con el embedder listo y la base vacía
 - WHEN se guarda `el tren sale los martes`

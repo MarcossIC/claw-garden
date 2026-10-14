@@ -2,7 +2,7 @@
 
 **Código:** rama `claude/secret-hygiene-sdd-feo162`, un commit por tarea.
 **Modo:** Strict TDD (`openspec/config.yaml`: `strict_tdd: true`). Cada test se vio fallar antes de su código (por no compilar o por la aserción).
-**Estado:** verificado en Linux; R1 a R6 pasan. Quedan pendientes en la máquina del usuario la suite de Windows, `rag-eval --real` y la prueba en el perfil dev (ver «Pendiente»). No se archiva hasta entonces.
+**Estado:** verificado. R1 a R6 pasan en Linux (commit por commit) y en Windows; `rag-eval --real` da diff vacío en el ancla y en agent-view; en el perfil dev, el save enmascara y `clawg secrets` lee la base real (ver [Windows](#windows-2026-10-14), [rag-eval](#rag-eval) y [Perfil dev](#perfil-dev-con-claude-code-2026-10-14)).
 
 ## Suite
 
@@ -63,10 +63,57 @@ Con `HOME` en un directorio temporal del scratchpad, perfil dev. No se tocó nin
 - **`secure_delete` no alcanzaba para la purga.** El test de bytes sobre una base real encontró el secreto en una página de la lista libre, liberada por un merge del FTS mucho antes de purgar. La purga hace `VACUUM` (design D5). Sin `optimize` o sin `VACUUM`, los dos tests de bytes fallan.
 - **`release_challengers` antes del `DELETE` no liberaba nada:** la fila todavía contaba como viva. Lo encontró `purging_releases_the_rows_that_disputed_it`; va después.
 - **`clawg stop` con el modelo cargando** salió con 1 a los 15 s, y el proceso terminó unos segundos después. Es el problema conocido del backlog del README (la carga del embedder en `spawn_blocking`); no lo toca este cambio.
-- **`rag-eval`:** el enmascarado sólo cambia textos con un patrón de secreto. El golden set no tiene ninguno, así que no debería moverse ninguna métrica; falta medirlo.
+- **`rag-eval`:** el enmascarado sólo cambia textos con un patrón de secreto. El golden set no tiene ninguno, así que no debería moverse ninguna métrica. Medido en Windows: diff vacío (ver [rag-eval](#rag-eval)).
 
-## Pendiente (máquina del usuario)
+## Windows (2026-10-14)
 
-- [ ] `cargo test --workspace --target-dir <otro-dir>` en Windows: sin fallas nuevas contra la base de `.claude/CLAUDE.md` (los 5 de `project_root.rs` ya están arreglados). Los tests de purga usan `VACUUM` y comparan bytes de `memory.db`; conviene confirmarlos ahí.
-- [ ] `rag-eval --real --diff` contra el baseline: R@1 0,4348, R@5 0,7826, R@10 0,8913, MRR 0,5979 y nDCG@10 0,6693 idénticos.
-- [ ] Perfil dev, **con autorización** y con una copia de `memory.db` antes: un `save_memory` desde Claude Code con una key falsa (por ejemplo `ghp_` y 36 caracteres) dice `masked github_token`; `clawg secrets` sobre la base real; si hay filas, `clawg stop` y `clawg purge <ID> --yes` de una, y `clawg memories stats` igual salvo esa fila.
+`cargo test --workspace --no-fail-fast --target-dir target-test` sobre `main` en `35e448c`: **1.655 pasan, 0 fallan**. Desde `1569ea3` sólo cambió documentación, así que el código es el mismo que verificó knowledge-synthesis.
+
+- Los 29 tests de este cambio aparecen uno por uno como `ok`, incluidos los de bytes de la purga (`purging_a_live_row_leaves_no_trace_of_its_text` y `purging_a_deleted_row_leaves_no_trace_of_its_text`), que dependen del `VACUUM` y del checkpoint sobre el sistema de archivos de Windows. También pasa `purging_drops_the_links_to_and_from_the_row`, que agregó knowledge-synthesis sobre esta purga.
+- Las 10 fallas de Linux no aparecen: las 7 de `doctor::tests` modelan un PATH de Windows, y las 3 de `diff::tests` encuentran `docs/eval/results/` en esta máquina.
+- La base de `.claude/CLAUDE.md` es 1.655 y no cambia. Es menor que los 1.704 de Linux porque knowledge-synthesis borró después 133 tests del pipeline de extracción.
+- El único warning es el de `insert_row_with_embedding`, el mismo de `main` (está en el backlog del README).
+
+## rag-eval
+
+**Entorno:** Windows 11, binarios debug de `rag-eval`, modelo real (multilingual-e5-small) leído del caché de `~/.clawg-dev/models` (`--check-only` lo confirmó antes de correr, sin descargar ni escribir); los resultados van a un directorio temporal, fuera de `docs/eval/results/`.
+
+**Binarios**, cada uno compilado en su worktree:
+- Base: `c608c66` (`main` justo antes del merge de este cambio).
+- Cambio: `262f839` (el merge de este cambio).
+
+**Golden set:** `docs/eval/golden.json` (ancla, sha256 `d2d9d732…ed792a`, n = 46).
+
+**Corridas**, las mismas con los dos binarios:
+- `rag-eval --real --golden docs/eval/golden.json --tag anchor`
+- `rag-eval --real --agent-view --golden docs/eval/golden.json`
+
+El modo `--agent-view` es el que importa para este cambio: ingiere el corpus por el pipeline real de save, que es donde actúa el enmascarado.
+
+| Métrica | Base | Cambio |
+|---|---|---|
+| R@1 | 0,4348 | 0,4348 |
+| R@5 | 0,7826 | 0,7826 |
+| R@10 | 0,8913 | 0,8913 |
+| MRR | 0,5979 | 0,5979 |
+| nDCG@10 | 0,6693 | 0,6693 |
+
+- `rag-eval --diff` del ancla, base contra cambio: 0 mejoran y 0 empeoran en todas las métricas, en retrieval y en similarity.
+- `rag-eval --diff` no compara el bloque `agent_view`, así que los dos JSON se compararon campo por campo, sin fecha, tag, sha ni latencias: **0 diferencias**, en el ancla y en agent-view.
+- Agent-view, en las dos: 48 filas guardadas para un corpus de 48; `search` con hit rate 0,8913 y tokens media 851,5 y máximo 1239; `context` con hit rate 0,8913 y tokens media 3355,0 y máximo 4900.
+
+Es lo esperado: el golden set no tiene ningún texto con forma de secreto, así que el enmascarado no cambia ni un texto.
+
+## Perfil dev con Claude Code (2026-10-14)
+
+**Entorno:** el MCP `clawg-dev` de Claude Code contra el daemon dev (pid 17944), que corre `target\debug\clawg.exe` compilado el 2026-10-12 a las 21:24, después del merge de knowledge-synthesis (incluye éste). Con autorización del usuario. Antes de tocar la base: `clawg backup --profile dev` por el daemon (`memory-2026-10-14T22-24-37.854Z-manual.db`). La fila de prueba se guardó en un proyecto aparte (un directorio temporal), rotulada como fixture.
+
+| Paso | Resultado |
+|---|---|
+| `save_memory` con una key `ghp_` falsa de 36 caracteres | `saved #33; masked github_token before storing it` (R3) |
+| `search_memory` de esa fila | `… authenticates with [REDACTED:github_token] as its GitHub token.` (R2) |
+| `delete_memory` de #33 | `deleted 1`; la fila borrada sólo tiene el placeholder |
+| `clawg secrets --profile dev` con el daemon andando | `no stored memory holds a secret of a known format`, salida 0 (R4) |
+| Búsqueda de los bytes de la key falsa en `memory.db` y `memory.db-wal` | 0 en los dos |
+
+**Purga:** la base dev no tiene ninguna fila con un secreto de formato conocido, así que no hubo nada que purgar y el daemon no se paró. La purga sobre una base real con el daemon parado ya está probada de punta a punta en Linux (arriba) y, en Windows, por los tests de bytes.

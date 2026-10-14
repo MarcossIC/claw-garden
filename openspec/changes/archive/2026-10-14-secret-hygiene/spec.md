@@ -1,6 +1,6 @@
 # secret-hygiene — Especificación
 
-**Dominio destino:** `specs/secrets/spec.md`, nuevo. Al archivar, R1 a R6 pasan ahí con las rutas y líneas del código en ese momento. El contrato de `POST /v1/memories` de [`specs/ingest`](../../specs/ingest/spec.md) gana un campo (R3); al archivar se agrega una línea en su sección «Un save confirmado devuelve los ids» que apunta a R3.
+**Dominio destino:** `specs/secrets/spec.md`, nuevo. Al archivar, R1 a R6 pasan ahí con las rutas y líneas del código en ese momento. El contrato de `POST /v1/memories` de [`specs/ingest`](../../../specs/ingest/spec.md) gana un campo (R3); al archivar se agrega una línea en su sección «Un save confirmado devuelve los ids» que apunta a R3.
 
 **Alcance:** el enmascarado al ingerir, el campo `redacted` del save, `clawg secrets` y `clawg purge`. No cambia el esquema ni toca filas existentes.
 
