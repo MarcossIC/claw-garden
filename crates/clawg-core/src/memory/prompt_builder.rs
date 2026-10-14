@@ -1,5 +1,7 @@
 //! Assembles the 4-block memory prefix for the system prompt.
 
+use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::memory::{
@@ -30,6 +32,8 @@ pub(crate) const SEP_LONGTERM_TEST: &str = SEP_LONGTERM;
 
 const RECENT_WINDOW_MS: i64 = 7 * 86_400_000;
 const K_FINAL: usize = 10;
+/// Pairs the conflicts block prints; the rest are only counted.
+const MAX_CONFLICT_PAIRS: usize = 5;
 
 // ---------------------------------------------------------------------------
 // Internal data types
@@ -194,12 +198,20 @@ pub async fn build_memory_prompt(
 
     // 3. Bucket hits into RECENT vs LONG-TERM.
     let (recent, longterm) = bucket_by_recency(hits, TimestampMs::now());
+    let hit_positions: HashMap<i64, usize> = recent
+        .iter()
+        .chain(&longterm)
+        .enumerate()
+        .filter(|(_, h)| h.kind == TableKind::Memory)
+        .map(|(position, h)| (h.id, position))
+        .collect();
 
     // 4. Fetch the conflicts on what this prompt shows; the block is emitted only when non-empty.
     let conflicts = fetch_active_conflicts(store, agent_id, &shown).await.unwrap_or_else(|e| {
         log::warn!("fetch_active_conflicts failed: {e}; CONFLICTS block omitted");
         Vec::new()
     });
+    let (conflicts, omitted) = rank_conflicts(conflicts, &hit_positions, MAX_CONFLICT_PAIRS);
 
     // 5. Assemble in order: WORKSPACE → RECENT → LONG-TERM → CONFLICTS.
     let mut out = String::new();
@@ -239,10 +251,7 @@ pub async fn build_memory_prompt(
         }
         out.push_str(SEP_CONFLICTS);
         out.push('\n');
-        for p in &conflicts {
-            out.push_str(&format_conflict_pair(p));
-            out.push('\n');
-        }
+        out.push_str(&format_conflict_block(&conflicts, omitted));
     }
 
     Ok(out)
@@ -309,6 +318,38 @@ fn format_conflict_pair(p: &ConflictPair) -> String {
         p.old_content, p.old_id, p.old_importance, p.old_tier,
         p.new_content, p.new_id, p.new_importance,
     )
+}
+
+/// Orders pairs by the earliest printed hit among their sides and keeps the
+/// first `cap`, returning how many were left out. The query cannot order them:
+/// a row's position is only known once the prompt is laid out. A pair that
+/// only touches a workspace row has no position and goes last.
+fn rank_conflicts(
+    mut pairs: Vec<ConflictPair>,
+    hit_positions: &HashMap<i64, usize>,
+    cap: usize,
+) -> (Vec<ConflictPair>, usize) {
+    let rank = |p: &ConflictPair| {
+        [p.new_id, p.old_id].iter().filter_map(|id| hit_positions.get(id)).min().copied().unwrap_or(usize::MAX)
+    };
+    pairs.sort_by_key(|p| (rank(p), Reverse(p.new_id), p.old_id));
+    let omitted = pairs.len().saturating_sub(cap);
+    pairs.truncate(cap);
+    (pairs, omitted)
+}
+
+/// The conflicts block under its separator, ending with how many pairs the
+/// cap left out.
+fn format_conflict_block(pairs: &[ConflictPair], omitted: usize) -> String {
+    let mut out = String::new();
+    for p in pairs {
+        out.push_str(&format_conflict_pair(p));
+        out.push('\n');
+    }
+    if omitted > 0 {
+        out.push_str(&format!("(+{omitted} conflictos más sin mostrar)\n"));
+    }
+    out
 }
 
 /// Partitions hits into (recent, longterm) at `now - RECENT_WINDOW_MS`. A stamp
@@ -585,6 +626,66 @@ mod tests {
         let block = format_conflict_pair(&pair);
         let note = block.lines().last().expect("a note line");
         assert!(note.contains("resolve_conflict"), "{block}");
+    }
+
+    fn pair(old_id: i64, new_id: i64) -> ConflictPair {
+        ConflictPair {
+            old_id,
+            old_created_at: TimestampMs::from_unix_millis(1_690_000_000_000),
+            old_content: format!("old fact {old_id}"),
+            old_importance: 8.0,
+            old_tier: 2,
+            new_id,
+            new_created_at: TimestampMs::from_unix_millis(1_700_000_000_000),
+            new_content: format!("new fact {new_id}"),
+            new_importance: 8.0,
+        }
+    }
+
+    fn new_old(pairs: &[ConflictPair]) -> Vec<(i64, i64)> {
+        pairs.iter().map(|p| (p.new_id, p.old_id)).collect()
+    }
+
+    /// Hit ids 10, 20 and 30 printed at positions 0, 4 and 9. Every other id
+    /// stands for a workspace row, which has no position.
+    fn sample_positions() -> HashMap<i64, usize> {
+        HashMap::from([(10, 0), (20, 4), (30, 9)])
+    }
+
+    fn sample_pairs() -> Vec<ConflictPair> {
+        vec![pair(5, 98), pair(30, 99), pair(3, 20), pair(2, 20), pair(10, 1), pair(10, 8), pair(11, 8), pair(10, 7)]
+    }
+
+    /// A conflict on a standing preference would otherwise take the cap on
+    /// every call, whatever the question.
+    #[test]
+    fn conflict_pairs_rank_by_best_hit_position_workspace_only_last() {
+        let (ranked, omitted) = rank_conflicts(sample_pairs(), &sample_positions(), 10);
+        assert_eq!(omitted, 0);
+        assert_eq!(new_old(&ranked), [(8, 10), (7, 10), (1, 10), (20, 2), (20, 3), (99, 30), (98, 5), (8, 11)]);
+    }
+
+    #[test]
+    fn conflict_pair_order_ignores_input_order() {
+        let mut reversed = sample_pairs();
+        reversed.reverse();
+        let (a, _) = rank_conflicts(sample_pairs(), &sample_positions(), 10);
+        let (b, _) = rank_conflicts(reversed, &sample_positions(), 10);
+        assert_eq!(new_old(&a), new_old(&b));
+    }
+
+    #[test]
+    fn conflict_block_keeps_five_pairs_and_counts_the_rest() {
+        let eight: Vec<ConflictPair> = (1..=8).map(|i| pair(100 + i, i)).collect();
+        let (kept, omitted) = rank_conflicts(eight, &HashMap::new(), MAX_CONFLICT_PAIRS);
+        assert_eq!((kept.len(), omitted), (5, 3));
+        let block = format_conflict_block(&kept, omitted);
+        assert_eq!(block.lines().last(), Some("(+3 conflictos más sin mostrar)"), "{block}");
+
+        let five: Vec<ConflictPair> = (1..=5).map(|i| pair(100 + i, i)).collect();
+        let (kept, omitted) = rank_conflicts(five, &HashMap::new(), MAX_CONFLICT_PAIRS);
+        assert_eq!((kept.len(), omitted), (5, 0));
+        assert!(!format_conflict_block(&kept, omitted).contains("sin mostrar"));
     }
 
     #[test]
