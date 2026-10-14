@@ -655,7 +655,7 @@ mod tests {
 
         let after = conn.call(snapshot).await.unwrap();
         assert_eq!(before, after);
-        assert_eq!(after.0, 10);
+        assert_eq!(after.0, 11);
     }
 
     /// Rows written before `project` existed keep their project ids when the
@@ -800,6 +800,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((derivations, reviews), (0, 0));
+    }
+
+    /// The documentation index is derived from files on disk, so a store that
+    /// predates it opens with the index empty and every memory, conclusion and
+    /// project exactly as it was.
+    #[tokio::test]
+    async fn a_database_from_the_previous_version_opens_with_an_empty_doc_index() {
+        ensure_vec0_registered();
+        let conn = Connection::open_in_memory().await.unwrap();
+        register_udfs(&conn).await.unwrap();
+        conn.call(|c| {
+            configured(crate::memory::migrations::runner())
+                .set_target(refinery::Target::Version(10))
+                .run(c)
+        })
+        .await
+        .unwrap();
+        conn.call(|c| {
+            for (id, content) in [(1, "the daemon listens on loopback"), (2, "saves are confirmed")] {
+                c.execute(
+                    "INSERT INTO memory \
+                     (id, scope, agent_id, project_id, content, memory_type, source, \
+                      created_at, created_by_type, created_by_ref, \
+                      last_modified_at, last_accessed_at, importance, tier, status) \
+                     VALUES (?1, 'agent', 'a', 'repo-1a2b', ?2, 'semantic_fact', 'explicit', \
+                      1, 'user', 'a', 1, 1, 5.0, 2, 'active')",
+                    rusqlite::params![id, content],
+                )?;
+            }
+            c.execute("INSERT INTO memory_derivation VALUES (2, 1, 1)", [])?;
+            c.execute("INSERT INTO synthesis_review VALUES ('a', 'repo-1a2b', 1)", [])?;
+            c.execute("INSERT INTO project VALUES ('repo-1a2b', '/work/repo', 1)", [])?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+
+        let rows = |c: &mut rusqlite::Connection| -> Result<Vec<String>, rusqlite::Error> {
+            let mut stmt = c.prepare(
+                "SELECT json_array(id, project_id, content, tier, status) FROM memory \
+                 UNION ALL SELECT json_array(memory_id, source_id) FROM memory_derivation \
+                 UNION ALL SELECT json_array(agent_id, scope_key, reviewed_at) FROM synthesis_review \
+                 UNION ALL SELECT json_array(id, root_path) FROM project",
+            )?;
+            let rows = stmt.query_map([], |r| r.get(0))?.collect();
+            rows
+        };
+        let before = conn.call(rows).await.unwrap();
+
+        run_migrations(&conn).await.unwrap();
+
+        assert_eq!(conn.call(rows).await.unwrap(), before);
+        let index: (i64, i64, i64, i64) = conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT (SELECT COUNT(*) FROM project_doc_file), \
+                            (SELECT COUNT(*) FROM project_doc_chunk), \
+                            (SELECT COUNT(*) FROM project_doc_vectors), \
+                            (SELECT COUNT(*) FROM project_doc_fts)",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(index, (0, 0, 0, 0));
     }
 
     fn tamper(dir: &Path, sql: &str) {
@@ -1274,7 +1340,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 10, "Expected exactly 10 applied migrations, got {}", count);
+        assert_eq!(count, 11, "Expected exactly 11 applied migrations, got {}", count);
     }
 
     /// V8 — a fresh store records V8 as applied and carries the FTS5 lexical
@@ -1735,7 +1801,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 10);
+        assert_eq!(migration_count, 11);
     }
 
     // -----------------------------------------------------------------------
