@@ -1467,3 +1467,143 @@ async fn registering_needs_the_token() {
         .status();
     assert_eq!(status.as_u16(), 401);
 }
+
+// ── Project documentation ───────────────────────────────────────────────────
+
+/// Writes `docs` under a fresh directory and records it as a project, without
+/// the background refresh a registration starts, so the test decides when
+/// the index is built.
+async fn project_with_docs(h: &Harness, docs: &[(&str, &str)]) -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (path, text) in docs {
+        let file = dir.path().join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, text).unwrap();
+    }
+    let id = clawg_core::memory::derive_project_id(dir.path());
+    let (row_id, root) = (id.clone(), dir.path().display().to_string());
+    h.ctx
+        .runtime
+        .store
+        .conn
+        .call(move |c| c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, ?2, 0)", [row_id, root]))
+        .await
+        .unwrap();
+    (dir, id)
+}
+
+#[tokio::test]
+async fn docs_search_indexes_on_first_use_and_answers() {
+    let h = Harness::start().await;
+    let (_dir, id) = project_with_docs(
+        &h,
+        &[
+            ("README.md", "# Claw\nLocal memory for agents.\n## Profiles\nThe dev profile lives in its own directory.\n"),
+            ("docs/ops.md", "# Ops\nStop the daemon with clawg stop.\n"),
+        ],
+    )
+    .await;
+
+    let (status, body) =
+        h.post_json("/v1/projects/docs/search", json!({ "project_id": id, "query": "Local memory for agents" })).await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["docs"], 2);
+    assert_eq!(body["indexing"], false);
+    assert!(body.get("warning").is_none(), "{body}");
+    let hits = body["hits"].as_array().expect("hits");
+    assert_eq!(hits.len(), 3, "{body}");
+    assert_eq!(hits[0]["path"], "README.md");
+    assert_eq!(hits[0]["breadcrumb"], "README.md > Claw");
+    assert_eq!(hits[0]["text"], "Local memory for agents.");
+}
+
+#[tokio::test]
+async fn docs_search_takes_at_most_the_limit() {
+    let h = Harness::start().await;
+    let (_dir, id) = project_with_docs(&h, &[("a.md", "# A\na\n# B\nb\n# C\nc\n")]).await;
+
+    let (status, body) =
+        h.post_json("/v1/projects/docs/search", json!({ "project_id": id, "query": "a", "limit": 2 })).await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["hits"].as_array().map(Vec::len), Some(2));
+}
+
+#[tokio::test]
+async fn docs_search_of_an_unregistered_project_is_404() {
+    let h = Harness::start().await;
+    let (status, body) =
+        h.post_json("/v1/projects/docs/search", json!({ "project_id": "nowhere-0000", "query": "x" })).await;
+    assert_eq!(status, 404, "{body}");
+}
+
+#[tokio::test]
+async fn docs_search_with_an_empty_query_is_a_bad_request() {
+    let h = Harness::start().await;
+    let (_dir, id) = project_with_docs(&h, &[("a.md", "# A\na\n")]).await;
+    let (status, body) = h.post_json("/v1/projects/docs/search", json!({ "project_id": id, "query": "  " })).await;
+    assert_eq!(status, 400, "{body}");
+}
+
+#[tokio::test]
+async fn docs_search_waits_for_the_embedder_like_any_search() {
+    let h = Harness::start_without_embedder().await;
+    let (_dir, id) = project_with_docs(&h, &[("a.md", "# A\na\n")]).await;
+    let (status, body) = h.post_json("/v1/projects/docs/search", json!({ "project_id": id, "query": "a" })).await;
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"], "embedder_not_ready");
+}
+
+#[tokio::test]
+async fn docs_search_needs_a_token() {
+    let h = Harness::start().await;
+    let r = h
+        .http
+        .post(h.url("/v1/projects/docs/search"))
+        .json(&json!({ "project_id": "x", "query": "y" }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(r.status(), 401);
+}
+
+#[tokio::test]
+async fn a_root_that_vanished_still_answers_from_its_index() {
+    let h = Harness::start().await;
+    let (dir, id) = project_with_docs(&h, &[("a.md", "# A\nkept passage\n")]).await;
+    // Indexed outside the daemon's own bookkeeping, so the daemon still finds
+    // the project due for a refresh at the search below.
+    let elsewhere = Arc::new(clawg_core::memory::project_docs::DocIndex::default());
+    elsewhere.try_refresh(&h.ctx.runtime.store, &FakeEmbedder::default(), None, &id).await.unwrap();
+    drop(dir);
+
+    let (status, body) = h.post_json("/v1/projects/docs/search", json!({ "project_id": id, "query": "kept" })).await;
+
+    assert_eq!(status, 200, "{body}");
+    assert!(body["warning"].as_str().is_some_and(|w| w.contains("not a directory")), "{body}");
+    assert_eq!(body["hits"][0]["text"], "kept passage");
+    assert_eq!(body["docs"], 1);
+}
+
+#[tokio::test]
+async fn registering_a_root_indexes_its_docs_in_the_background() {
+    let h = Harness::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("README.md"), "# Readme\nindexed in the background\n").unwrap();
+
+    let (status, body) =
+        h.post_json("/v1/projects", json!({ "root_path": dir.path().display().to_string() })).await;
+    assert_eq!(status, 200, "{body}");
+    let id = body["project_id"].as_str().expect("project_id").to_string();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let docs = clawg_core::memory::project_docs::doc_count(&h.ctx.runtime.store, &id).await.unwrap();
+        if docs == 1 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the docs were never indexed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}

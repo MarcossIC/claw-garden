@@ -202,7 +202,7 @@ impl DocIndex {
 }
 
 /// One passage a search found.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DocHit {
     pub path: String,
     pub breadcrumb: String,
@@ -395,7 +395,8 @@ fn le_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
-async fn root_of(store: &MemoryStore, project_id: &str) -> Result<PathBuf, DocIndexError> {
+/// The root `project_id` was registered with.
+pub async fn root_of(store: &MemoryStore, project_id: &str) -> Result<PathBuf, DocIndexError> {
     let id = project_id.to_string();
     let root: Option<String> = store
         .conn
