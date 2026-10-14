@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 | S–M | — (se suma a dispute-resolution) | spec |
+| 1 | S–M | — (se suma a dispute-resolution) | verify |
 
 ## Problema
 
@@ -15,24 +15,33 @@
 - Los hits no llevan id (`format_hit_line`, `:288-296`), así que el agente no puede relacionar un conflicto con lo que leyó.
 - El comentario de `:107-108` dice que se sacan los marcadores, pero `strip_empty_workspace_markers` devuelve el archivo entero apenas hay contenido (`:331-361`). Por eso llegan al modelo los `<!-- … -->` y los encabezados vacíos (`render_rows`, `workspace.rs:445-464`).
 
+## Revisión contra `main` (2026-10-14)
+
+La spec se había cerrado el 2026-10-12. Desde entonces entraron dispute-resolution, mcp-protocol-upgrade, knowledge-synthesis, secret-hygiene y memory-update-tool. Se revisó cada referencia contra `main` en `e759d18`:
+
+- **`prompt_builder.rs`, `workspace.rs` y el parser del eval no cambiaron.** Las líneas citadas siguen valiendo, y el problema sigue igual.
+- **memory-update-tool sumó `update_memory`** (`server.rs:220-235`, `:776-791`), que también recibe `id` y `kind`. Un id que el agente ve en `recall_context` le sirve para corregir la importancia o el tipo, así que el alcance 6 la incluye.
+- **Las líneas de `server.rs`, `tools.rs` y `api.rs` se movieron** con esa tool y con el contexto de pedido de rmcp. Se actualizaron todas.
+- **La medición de base sigue valiendo.** dispute-resolution, knowledge-synthesis y secret-hygiene registraron `rag-eval --real` con diff vacío. memory-update-tool no toca el armado del prompt. Los umbrales no se mueven.
+
 ## Alcance
 
-1. **Conflictos.** El lado ya mostrado como hit se cita por `#id`, y sólo el lado no mostrado lleva el texto completo. Los dos ids de cada par se imprimen siempre, porque son los que `resolve_conflict` recibe como `keep` y `other` (`ResolveConflictArgs`, `crates/clawg-cli/src/mcp/server.rs:219-232`). Los pares que comparten la fila nueva se agrupan, así que su texto aparece una vez. La NOTE va una sola vez por bloque, con sus tres líneas. El orden es determinista: primero van los pares cuyo lado mostrado aparece más arriba entre los hits, y al final los que sólo tocan una fila del workspace. Así un conflicto sobre una preferencia no ocupa el tope en cada llamada, sea cual sea la pregunta. Hay un tope de 5 pares; si quedan pares afuera, una línea final dice cuántos.
+1. **Conflictos.** El lado ya mostrado como hit se cita por `#id`, y sólo el lado no mostrado lleva el texto completo. Los dos ids de cada par se imprimen siempre, porque son los que `resolve_conflict` recibe como `keep` y `other` (`ResolveConflictArgs`, `crates/clawg-cli/src/mcp/server.rs:237-249`). Los pares que comparten la fila nueva se agrupan, así que su texto aparece una vez. La NOTE va una sola vez por bloque, con sus tres líneas. El orden es determinista: primero van los pares cuyo lado mostrado aparece más arriba entre los hits, y al final los que sólo tocan una fila del workspace. Así un conflicto sobre una preferencia no ocupa el tope en cada llamada, sea cual sea la pregunta. Hay un tope de 5 pares; si quedan pares afuera, una línea final dice cuántos.
 2. **Hits en una línea:** `[YYYY-MM-DD #id tipo] texto`. El kind se muestra sólo si no es `memory`.
 3. **Workspace:** se sacan los marcadores, la sección USER vacía y los encabezados sin bullets **sólo en el prompt**. El archivo no cambia, porque la regeneración usa los marcadores para encontrar y preservar la sección USER (`split_existing` en `workspace.rs:492`, `assemble_file` en `:551`).
 4. **Una fila del workspace que está en un conflicto** cuenta como no mostrada y lleva su texto, porque su bullet no tiene id (`workspace.rs:451`, `:455`).
 5. **Parser del eval:** `context_segments` e `is_markup` (`crates/clawg-eval/src/bin/rag-eval/agent_view/parse.rs:78-137`) se actualizan en el mismo cambio. `found` mantiene su definición: cuenta los hits y los bullets del workspace, y el texto de un conflicto no cuenta como visible. Hoy el parser recorre todo el texto sin mirar la sección; pasa a segmentar por sección.
-6. **`delete_memory`:** la doc del argumento `id` (`server.rs:209-211`) y la descripción de la tool (`:727-728`) pasan a decir que también sirven los ids de `recall_context`, y que un hit sin kind explícito es `memory`. La tool exige `kind` (`:213-216`).
+6. **`delete_memory` y `update_memory`:** la doc del argumento `id` de las dos (`DeleteMemoryArgs`, `crates/clawg-cli/src/mcp/server.rs:210-211`; `UpdateMemoryArgs`, `:221-222`) y la descripción de `delete_memory` (`:764-766`) pasan a decir que también sirven los ids de `recall_context`, y que un hit sin kind explícito es `memory`. Las dos tools exigen `kind` (`:212-216`, `:223-225`).
 
 **Enfoque:** el orden depende de la posición de cada fila en el prompt, que la consulta no conoce. El orden y el tope se calculan con una función pura sobre los pares leídos, que se puede testear sin base.
 
 ## Fuera de alcance
 
 - Resumir o reemplazar originales.
-- Pasar el formato a JSON o YAML: el agente ya recibe texto plano (`ok`, `server.rs:328`).
-- `search_memory`, que ya recorta y corta por relevancia (`tools.rs:26`, `:57`).
-- El aviso de `synthesize` que el puente MCP agrega después del prompt (`format_recall`, `tools.rs:205-211`): no es parte del prompt, no cambia y el agent-view no lo mide.
-- El título `ACTIVE CONFLICTS (review needed)`: no cambia, porque las instrucciones del servidor (`server.rs:111`) y la doc de `resolve_conflict` (`:221`) lo nombran.
+- Pasar el formato a JSON o YAML: el agente ya recibe texto plano (`ok`, `server.rs:345-347`).
+- `search_memory`, que ya recorta y corta por relevancia (`CONTENT_PREVIEW_LIMIT`, `crates/clawg-cli/src/mcp/tools.rs:26`; `relevant_hits`, `:55-59`).
+- El aviso de `synthesize` que el puente MCP agrega después del prompt (`format_recall`, `tools.rs:216-222`): no es parte del prompt, no cambia y el agent-view no lo mide.
+- El título `ACTIVE CONFLICTS (review needed)`: no cambia, porque las instrucciones del servidor (`server.rs:111`) y la doc de `resolve_conflict` (`:238`, `:794`) lo nombran.
 - Bajar los falsos `disputed`: es dispute-resolution (9). Los dos cambios se complementan.
 - Un presupuesto global de tokens.
 
@@ -62,7 +71,7 @@ No cambia ningún dato: el cambio sólo toca cómo se arma el texto.
 
 - `fetch_active_conflicts` es un `SELECT` (`prompt_builder.rs:381-393`).
 - La lectura del workspace no escribe (`:109-118`).
-- Las escrituras que ya hay en el camino de `recall_context` quedan iguales: la regeneración del workspace (`crates/clawg-cli/src/daemon/api.rs:800-810`) y el registro de accesos (`prompt_builder.rs:159-165`).
+- Las escrituras que ya hay en el camino de `recall_context` quedan iguales: la regeneración del workspace (`crates/clawg-cli/src/daemon/api.rs:813-819`, antes de `build_memory_prompt` en `:822`) y el registro de accesos (`prompt_builder.rs:159-165`).
 
 No hace falta migración. El rollback es revertir los commits.
 
@@ -73,7 +82,7 @@ No hace falta migración. El rollback es revertir los commits.
 | Algo depende del formato `CONTENT:` / `OLD:` / `NEW:` | Baja | En el repo lo leen el parser del eval (`parse.rs:99`) y los tests de `prompt_builder.rs` (ver spec, R10); los dos entran en el alcance |
 | El agente no encuentra los ids para `resolve_conflict` | Media | R2: los dos ids de cada par se imprimen siempre, aunque el texto se omita. La NOTE nombra `keep` y `other` |
 | El texto de un conflicto se parece a un hit y el parser lo cuenta, lo que infla `found` | Media | Los hits se segmentan sólo en RECENT y LONG-TERM, y los bullets sólo en WORKSPACE. Se adapta el test `parse.rs:260-264` |
-| `delete_memory` exige `kind` (`server.rs:213-216`), y el hit lo omite cuando es `memory` | Media | Alcance 6: la doc del `id` y la de la tool lo dicen explícitamente |
+| `delete_memory` y `update_memory` exigen `kind` (`server.rs:212-216`, `:223-225`), y el hit lo omite cuando es `memory` | Media | Alcance 6: la doc del `id` de las dos y la de `delete_memory` lo dicen explícitamente |
 | Ids visibles para el agente | Baja | `search_memory` ya los muestra (`tools.rs:79`) |
 | La fila vieja de un par es de otro agente | Nula | La consulta filtra por agente sólo la fila nueva, pero el detector busca contradicciones dentro del mismo `agent_id` (`contradiction.rs:139`), así que la vieja es del mismo agente |
 

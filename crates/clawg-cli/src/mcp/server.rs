@@ -207,8 +207,9 @@ pub struct ListMemoriesArgs {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct DeleteMemoryArgs {
-    /// The id of the row to delete, as printed by `search_memory` or
-    /// `list_memories`.
+    /// The id of the row to delete, as printed by `search_memory`,
+    /// `list_memories` or `recall_context`. A `recall_context` hit with no kind
+    /// in front of its type is a memory.
     pub id: i64,
     /// Which table the id belongs to: memory, episodic or procedural. Required,
     /// because each table numbers its rows independently — id 7 exists in all
@@ -219,7 +220,8 @@ pub struct DeleteMemoryArgs {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct UpdateMemoryArgs {
     /// The id of the row to change, as printed by `save_memory`,
-    /// `search_memory` or `list_memories`.
+    /// `search_memory`, `list_memories` or `recall_context`. A `recall_context`
+    /// hit with no kind in front of its type is a memory.
     pub id: i64,
     /// Which table the id belongs to: memory, episodic or procedural.
     pub kind: String,
@@ -762,8 +764,8 @@ impl ClawgMcp {
     #[tool(
         name = "delete_memory",
         description = "Delete one stored memory by id and kind. Get the id from \
-                       `search_memory` or `list_memories` first — ids are per-kind, so the \
-                       same number exists in all three tables."
+                       `search_memory`, `list_memories` or `recall_context` first — ids are \
+                       per-kind, so the same number exists in all three tables."
     )]
     async fn delete_memory(
         &self,
@@ -1505,6 +1507,20 @@ mod tests {
         let schema = serde_json::to_string(&tool(&b, "save_memory").input_schema).expect("schema");
         assert!(schema.contains("Defaults to semantic_fact"), "schema: {schema}");
         assert!(!schema.contains("Defaults to a plain chat message"), "schema: {schema}");
+    }
+
+    /// `recall_context` prints `#id` before a `memory` hit's type and names
+    /// any other kind; the tools that take an id still require the kind.
+    #[tokio::test]
+    async fn memory_id_docs_name_recall_context_and_the_default_kind() {
+        let (b, _d) = bridge().await;
+        for name in ["delete_memory", "update_memory"] {
+            let schema = serde_json::to_string(&tool(&b, name).input_schema).expect("schema").replace("\\n", " ");
+            assert!(schema.contains("recall_context"), "{name} schema: {schema}");
+            assert!(schema.contains("no kind in front of its type is a memory"), "{name} schema: {schema}");
+        }
+        let d = description(&b, "delete_memory");
+        assert!(d.contains("recall_context"), "description: {d}");
     }
 
     /// A long save is split into chunks stored as unrelated rows, and no tool
