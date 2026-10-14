@@ -382,7 +382,7 @@ mod tests {
         send_line(&mut host, r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).await;
         let tools = next_frame(&mut lines).await;
         assert_eq!(tools["id"], 2);
-        assert_eq!(tool_names(&tools).len(), 8, "all eight memory tools are listed: {tools}");
+        assert_eq!(tool_names(&tools).len(), 9, "all nine memory tools are listed: {tools}");
     }
 
     /// rmcp refuses a request without `_meta` and keeps waiting for a session;
@@ -439,7 +439,7 @@ mod tests {
         let names = tool_names(&reply);
         let mut sorted = names.clone();
         sorted.sort();
-        assert_eq!(names.len(), 8, "{reply}");
+        assert_eq!(names.len(), 9, "{reply}");
         assert_eq!(names, sorted, "the order must not change between calls");
         let result = &reply["result"];
         assert_eq!(result["resultType"], "complete", "{reply}");

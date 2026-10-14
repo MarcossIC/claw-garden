@@ -42,7 +42,7 @@ use crate::client::{
 };
 use crate::mcp::startup::ClientHandle;
 use crate::mcp::tools::{
-    format_recall, format_resolution, format_rows, format_search, format_status, format_synthesis,
+    format_recall, format_resolution, format_rows, format_search, format_status, format_synthesis, format_update,
     resolve_project,
 };
 
@@ -214,6 +214,23 @@ pub struct DeleteMemoryArgs {
     /// because each table numbers its rows independently — id 7 exists in all
     /// three and means something different in each.
     pub kind: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct UpdateMemoryArgs {
+    /// The id of the row to change, as printed by `save_memory`,
+    /// `search_memory` or `list_memories`.
+    pub id: i64,
+    /// Which table the id belongs to: memory, episodic or procedural.
+    pub kind: String,
+    /// The new importance, 0 to 10. Omit it to leave the importance as it is.
+    #[serde(default)]
+    pub importance: Option<f64>,
+    /// The new type, only for kind memory. One of: semantic_fact,
+    /// user_preference, architectural_decision, session_summary, code_block,
+    /// chat_message, tool_error. Omit it to leave the type as it is.
+    #[serde(default)]
+    pub memory_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -395,9 +412,11 @@ impl ClawgMcp {
         match result {
             Ok(SaveOutcome::Saved { memories, redacted }) => {
                 let mut text = match memories.as_slice() {
-                    [one] if one.outcome == "reinforced" => {
-                        format!("already stored as #{}; reinforced it instead of saving a copy", one.id)
-                    }
+                    [one] if one.outcome == "reinforced" => format!(
+                        "already stored as #{}; reinforced it instead of saving a copy \
+                         (update_memory changes its importance or type)",
+                        one.id
+                    ),
                     [one] => format!("saved #{}", one.id),
                     many => format!("saved as {} pieces: {}", many.len(), ids(many)),
                 };
@@ -593,6 +612,25 @@ impl ClawgMcp {
         }
     }
 
+    /// Another agent's row is refused as missing, as in `delete_memory_impl`.
+    pub async fn update_memory_impl(
+        &self,
+        agent_id: &str,
+        args: UpdateMemoryArgs,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let client = match self.daemon().await {
+            Ok(c) => c,
+            Err(failure) => return Ok(failure),
+        };
+        match client
+            .update(&args.kind, args.id, args.importance, args.memory_type.as_deref(), Some(agent_id))
+            .await
+        {
+            Ok(updated) => Self::ok(format_update(&updated)),
+            Err(e) => Self::failed(Self::explain(&e)),
+        }
+    }
+
     /// Both rows must be the calling agent's, as in `delete_memory_impl`.
     pub async fn resolve_conflict_impl(
         &self,
@@ -661,7 +699,7 @@ impl ClawgMcp {
                        into separate pieces that are found independently and never reassembled. \
                        Write the content so it still makes sense months from now, with no \
                        conversation around it. Returns the id of each stored piece, which \
-                       delete_memory accepts, or why nothing was stored."
+                       update_memory and delete_memory accept, or why nothing was stored."
     )]
     async fn save_memory(
         &self,
@@ -733,6 +771,22 @@ impl ClawgMcp {
         Parameters(args): Parameters<DeleteMemoryArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         self.delete_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
+    }
+
+    #[tool(
+        name = "update_memory",
+        description = "Correct the importance or the type of one stored memory, by id and kind, \
+                       when the user says it matters more or less than it was saved with, or \
+                       that it is a different kind of memory. Pass only what changes. To change \
+                       what a memory says, save the new text and delete the old one instead. \
+                       Returns the memory's importance, type and tier after the change."
+    )]
+    async fn update_memory(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(args): Parameters<UpdateMemoryArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.update_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
     }
 
     #[tool(
@@ -1295,19 +1349,20 @@ mod tests {
             "recall_context",
             "list_memories",
             "delete_memory",
+            "update_memory",
             "resolve_conflict",
             "synthesize",
             "memory_status",
         ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}: {names:?}");
         }
-        assert_eq!(names.len(), 8, "no extra tools: {names:?}");
+        assert_eq!(names.len(), 9, "no extra tools: {names:?}");
     }
 
     /// The memory viewer (`clawg memories`) is for the person at the terminal.
     /// Handing a model its filters by agent and project, or its text search over
     /// every row, would let it read across agents; so the tool a model sees keeps
-    /// exactly its five arguments, and the set of tools does not grow.
+    /// exactly its five arguments, and no other tool takes the viewer's filters.
     #[tokio::test]
     async fn the_viewer_is_not_exposed_to_the_model() {
         let (b, _d) = bridge().await;
@@ -1326,6 +1381,7 @@ mod tests {
                 "save_memory",
                 "search_memory",
                 "synthesize",
+                "update_memory",
             ]
         );
 
@@ -1615,7 +1671,8 @@ mod tests {
                 memories: vec![saved(57, "reinforced")],
                 redacted: vec!["github_token".into(), "jwt".into()],
             })),
-            Ok("already stored as #57; reinforced it instead of saving a copy; \
+            Ok("already stored as #57; reinforced it instead of saving a copy \
+                (update_memory changes its importance or type); \
                 masked github_token, jwt before storing it"
                 .to_string())
         );
@@ -1637,7 +1694,9 @@ mod tests {
         );
         assert_eq!(
             text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "reinforced")], redacted: vec![] })),
-            Ok("already stored as #57; reinforced it instead of saving a copy".to_string())
+            Ok("already stored as #57; reinforced it instead of saving a copy \
+                (update_memory changes its importance or type)"
+                .to_string())
         );
         assert_eq!(
             text(Ok(SaveOutcome::Queued { reason: Some("unconfirmed".into()) })),
@@ -1882,6 +1941,39 @@ mod tests {
             .await
             .expect("call");
         assert!(!is_error(&r), "the owner deletes it: {}", text(&r));
+    }
+
+    fn update_args(id: i64, importance: Option<f64>, memory_type: Option<&str>) -> UpdateMemoryArgs {
+        UpdateMemoryArgs { id, kind: "memory".into(), importance, memory_type: memory_type.map(Into::into) }
+    }
+
+    #[tokio::test]
+    async fn update_memory_changes_an_own_memory_and_says_how_it_ended() {
+        let (b, _d) = bridge().await;
+        let id = saved_id(&b, "agent-a", "the deploy script lives in ops/deploy.sh").await;
+
+        let r = b.update_memory_impl("agent-a", update_args(id, Some(2.0), Some("user_preference"))).await.expect("call");
+
+        assert!(!is_error(&r), "{}", text(&r));
+        assert_eq!(text(&r), format!("updated #{id} memory: user_preference, importance 2.0, tier 1"));
+        let listed = text(&b.list_memories_impl("agent-a", list_all()).await.expect("list"));
+        assert!(listed.contains(&format!("#{id} memory user_preference t1 imp=2.0")), "{listed}");
+
+        let r = b.update_memory_impl("agent-a", update_args(id, Some(11.0), None)).await.expect("call");
+        assert!(is_error(&r), "{}", text(&r));
+        assert!(text(&r).contains("importance"), "{}", text(&r));
+    }
+
+    #[tokio::test]
+    async fn an_agent_cannot_update_another_agents_memory() {
+        let (b, _d) = bridge().await;
+        let id = saved_id(&b, "agent-a", "agent a reviews pull requests on mondays").await;
+
+        let r = b.update_memory_impl("agent-b", update_args(id, Some(9.5), None)).await.expect("call");
+
+        assert!(is_error(&r), "another agent's memory must not change: {}", text(&r));
+        let listed = text(&b.list_memories_impl("agent-a", list_all()).await.expect("list"));
+        assert!(listed.contains("imp=5.0"), "the row must stay as it was: {listed}");
     }
 
     #[tokio::test]
