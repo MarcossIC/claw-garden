@@ -106,7 +106,7 @@ pub async fn build_memory_prompt(
     access_tracker: Option<&AccessTracker>,
 ) -> Result<String, MemoryError> {
     // 1. Read workspace file (may be empty on fresh install or read failure).
-    // Strip structural markers — emit only the payload content to the LLM.
+    // Only its content reaches the model: no markers, no empty headings.
     let workspace_content = {
         let raw = workspace
             .read(agent_id, project_id)
@@ -115,7 +115,7 @@ pub async fn build_memory_prompt(
                 log::warn!("workspace read failed: {e}; treating as empty");
                 String::new()
             });
-        strip_empty_workspace_markers(&raw)
+        workspace_for_prompt(&raw)
     };
 
     // 2. Compute query embedding ONLY if embedder is available.
@@ -379,35 +379,51 @@ fn bucket_by_recency(hits: Vec<RankedHit>, now: TimestampMs) -> (Vec<RankedHit>,
     (recent, longterm)
 }
 
-/// Strips known empty structural markers from workspace content.
-/// Returns empty string ONLY when the workspace file was auto-generated with
-/// no payload content (has both AUTO_START/AUTO_END markers but no bullet items
-/// and no USER section content). Content that lacks the structural markers
-/// entirely (e.g., plain text files) is considered meaningful.
-fn strip_empty_workspace_markers(raw: &str) -> String {
-    if raw.is_empty() {
-        return String::new();
-    }
-    use crate::memory::workspace::{AUTO_START, USER_START, USER_END};
+/// What the model gets of the workspace file: the AUTO section without its
+/// empty headings, and the user's own text as written, both without the
+/// markers. The markers stay in the file, where regeneration needs them to
+/// find the USER section; to the model they are noise. A file without the
+/// AUTO marker was not generated, so it is handed over whole.
+fn workspace_for_prompt(raw: &str) -> String {
+    use crate::memory::workspace::{AUTO_END, AUTO_START, USER_END, USER_START};
 
-    // If the file doesn't have the AUTO-START marker, it's plain content → keep it.
-    if !raw.contains(AUTO_START) {
+    let Some(auto_start) = raw.find(AUTO_START) else {
         return raw.to_string();
-    }
-
-    // File has the structured marker framework. Check for actual payload content.
-    let has_bullets = raw.contains("\n- ");
-    let has_user_content = if let (Some(us), Some(ue)) = (raw.find(USER_START), raw.find(USER_END)) {
-        let inner = &raw[us + USER_START.len()..ue];
-        inner.chars().any(|c| !c.is_whitespace())
-    } else {
-        false
     };
+    let body = &raw[auto_start + AUTO_START.len()..];
+    let (auto, rest) = body.split_once(AUTO_END).unwrap_or((body, ""));
+    let rest = rest.replace(USER_START, "").replace(USER_END, "");
+    let auto = without_empty_headings(auto);
+    [&raw[..auto_start], auto.as_str(), rest.as_str()]
+        .into_iter()
+        .map(trim_blank_lines)
+        .filter(|piece| !piece.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
-    if has_bullets || has_user_content {
-        raw.to_string()
-    } else {
-        String::new()
+/// Drops each `## ` heading with nothing under it before the next one.
+fn without_empty_headings(section: &str) -> String {
+    let lines: Vec<&str> = section.lines().collect();
+    let mut out = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        let empty_heading = line.starts_with("## ")
+            && lines[i + 1..].iter().take_while(|l| !l.starts_with("## ")).all(|l| l.trim().is_empty());
+        if !empty_heading {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// `text` without its leading and trailing blank lines; the indentation of
+/// its first line stays.
+fn trim_blank_lines(text: &str) -> &str {
+    let text = text.trim_end();
+    match text.find(|c: char| !c.is_whitespace()) {
+        Some(first) => &text[text[..first].rfind('\n').map_or(0, |n| n + 1)..],
+        None => "",
     }
 }
 
@@ -954,6 +970,50 @@ mod tests {
         let result = build_memory_prompt(&store, &wm, None, "agent-1", None, QueryTexts::single_shot("query"), &EmittedIds::default(), None).await.unwrap();
         assert!(result.contains(SEP_WORKSPACE), "should contain WORKSPACE separator");
         assert!(!result.contains(SEP_RECENT), "no embedder → no RECENT");
+    }
+
+    /// Writes `content` as agent-1's workspace file and returns the prompt.
+    async fn prompt_over_workspace(content: &str) -> (String, std::path::PathBuf, tempfile::TempDir) {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let path = wm.workspace_path("agent-1", None);
+        tokio::fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+        tokio::fs::write(&path, content).await.unwrap();
+        let prompt = build_memory_prompt(&store, &wm, None, "agent-1", None, QueryTexts::single_shot("query"), &EmittedIds::default(), None)
+            .await
+            .unwrap();
+        (prompt, path, tmp)
+    }
+
+    #[tokio::test]
+    async fn workspace_in_prompt_has_no_markers_or_empty_headings() {
+        let file = "<!-- AUTO-START -->\n## User Preferences (always active)\n- answer in spanish\n## Architectural Decisions\n## Procedural Skills\n<!-- AUTO-END -->\n\n<!-- USER-START -->\n<!-- USER-END -->\n";
+        let (prompt, _, _tmp) = prompt_over_workspace(file).await;
+        assert_eq!(prompt, "=== WORKSPACE ===\n## User Preferences (always active)\n- answer in spanish\n");
+
+        let empty = "<!-- AUTO-START -->\n## User Preferences (always active)\n## Architectural Decisions\n## Procedural Skills\n<!-- AUTO-END -->\n\n<!-- USER-START -->\n<!-- USER-END -->\n";
+        let (prompt, _, _tmp) = prompt_over_workspace(empty).await;
+        assert_eq!(prompt, "", "nothing left, so no WORKSPACE block");
+    }
+
+    /// The USER section is the user's own text: only the markers around it go.
+    #[tokio::test]
+    async fn workspace_user_section_content_is_kept_without_markers() {
+        let file = "<!-- AUTO-START -->\n## User Preferences (always active)\n## Architectural Decisions\n- use sqlite\n## Procedural Skills\n<!-- AUTO-END -->\n\n<!-- USER-START -->\n## My notes\n\nask before force-pushing\n## Empty on purpose\n<!-- USER-END -->\n";
+        let (prompt, _, _tmp) = prompt_over_workspace(file).await;
+        assert_eq!(
+            prompt,
+            "=== WORKSPACE ===\n## Architectural Decisions\n- use sqlite\n## My notes\n\nask before force-pushing\n## Empty on purpose\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_file_bytes_are_unchanged_by_rendering_the_prompt() {
+        let file = "<!-- AUTO-START -->\n## User Preferences (always active)\n- answer in spanish\n## Procedural Skills\n<!-- AUTO-END -->\n\n<!-- USER-START -->\n  indented note\n<!-- USER-END -->\n";
+        let (prompt, path, _tmp) = prompt_over_workspace(file).await;
+        assert!(prompt.contains("indented note"), "{prompt}");
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), file.as_bytes());
     }
 
     #[tokio::test]
@@ -1893,5 +1953,6 @@ mod tests {
         assert!(conflicts_block.contains(&format!("\nOLD #{old_id}\n")), "{result}");
         assert!(conflicts_block.contains("disputed fact"), "{result}");
         assert_eq!(result.matches("original fact").count(), 1, "a shown row is printed once:\n{result}");
+        assert!(!result.contains("<!-- "), "{result}");
     }
 }
