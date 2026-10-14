@@ -5,3 +5,4 @@
 //! reads or writes a memory.
 
 pub mod corpus;
+pub mod chunk;

@@ -6,7 +6,8 @@
 //! `CHUNK_MAX_TOKENS` (headroom under the embedder's 512-token model limit)
 //! with `CHUNK_OVERLAP_TOKENS` of repeated content between adjacent chunks,
 //! so a fact spanning a cut point still lands whole in at least one chunk.
-//! No markdown-fence or AST-aware enrichment — that stays the code chunker's job.
+//! No Markdown awareness: splitting by heading is the documentation index's
+//! job (`memory::project_docs::chunk`), not a chat turn's.
 
 use std::path::Path;
 use std::sync::Arc;

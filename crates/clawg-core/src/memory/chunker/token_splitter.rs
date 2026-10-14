@@ -1,7 +1,8 @@
 //! Token-cap splitting helper with configurable overlap.
 //!
-//! Knows NOTHING about chat speakers. `ChatChunker` feeds each speaker turn
-//! through here. Decouples the cap policy from upstream semantic split.
+//! Knows NOTHING about chat speakers or Markdown. `ChatChunker` feeds each
+//! speaker turn through here, and the documentation index each section too long
+//! for one passage. Decouples the cap policy from upstream semantic split.
 
 use std::sync::Arc;
 
@@ -31,6 +32,16 @@ impl TokenSplitter {
     #[cfg(test)]
     pub(crate) fn tokenizer_ptr(&self) -> Option<*const tokenizers::Tokenizer> {
         self.tokenizer.as_deref().map(std::ptr::from_ref)
+    }
+
+    /// How many tokens `text` is, by the same measure [`TokenSplitter::split`]
+    /// caps at: the tokenizer's count, or a quarter of the bytes (rounded up)
+    /// in fallback mode.
+    pub fn count(&self, text: &str) -> usize {
+        match self.tokenizer.as_deref().map(|tok| tok.encode(text, false)) {
+            Some(Ok(enc)) => enc.get_offsets().len(),
+            _ => text.len().div_ceil(4),
+        }
     }
 
     /// Split `text` so each output `Chunk` has `<= max_tokens` tokens, with
@@ -492,6 +503,15 @@ mod tests {
         for c in &chunks {
             assert!(!c.text.is_empty());
         }
+    }
+
+    #[test]
+    fn the_fallback_count_is_a_quarter_of_the_bytes_rounded_up() {
+        let splitter = TokenSplitter::fallback();
+        assert_eq!(splitter.count(""), 0);
+        assert_eq!(splitter.count("abcd"), 1);
+        assert_eq!(splitter.count("abcde"), 2);
+        assert_eq!(splitter.count(&"x".repeat(1920)), 480);
     }
 
     #[test]
