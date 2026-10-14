@@ -1,14 +1,14 @@
 change: context-density
 objective: "1"
 depends_on: []
-phase: spec
+phase: apply
 artifacts:
   exploration: done
   proposal: done
   spec: done
   design: skipped
-  tasks: pending
+  tasks: done
   apply: pending
   verify: pending
   archive: pending
-updated: 2026-10-12
+updated: 2026-10-14

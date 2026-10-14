@@ -34,7 +34,7 @@ exploration -> proposal -> spec (+ design si hace falta) -> tasks -> apply -> ve
 | 11 | [knowledge-synthesis](changes/archive/2026-10-13-knowledge-synthesis/proposal.md) | 5 | M (limpieza + síntesis dirigida por el agente) | — | archivado el 2026-10-13 ([`specs/synthesis`](specs/synthesis/spec.md)); verificado en Linux, Windows, `rag-eval --real` con diff vacío y el perfil dev con Claude Code ([verify](changes/archive/2026-10-13-knowledge-synthesis/verify.md#perfil-dev-con-claude-code-2026-10-13)) |
 | 12 | [project-indexing](changes/project-indexing/exploration.md) | 3 | decisión | 5 | exploración |
 | 13 | [secret-hygiene](changes/archive/2026-10-14-secret-hygiene/proposal.md) | 1, 4 | S–M | — (tiene que cerrar antes de 16) | archivado el 2026-10-14 ([`specs/secrets`](specs/secrets/spec.md)); verificado en Linux, Windows, `rag-eval --real` con diff vacío y el perfil dev con Claude Code ([verify](changes/archive/2026-10-14-secret-hygiene/verify.md#perfil-dev-con-claude-code-2026-10-14)) |
-| 14 | [context-density](changes/context-density/proposal.md) | 1 | S–M | — (se suma a 9) | spec |
+| 14 | [context-density](changes/context-density/proposal.md) | 1 | S–M | — (se suma a 9) | apply: spec revisada contra `main` el 2026-10-14 ([tareas](changes/context-density/tasks.md)) |
 | 15 | [long-save-context](changes/long-save-context/exploration.md) | 1 | S–M | 5, después de 9 (1 si toca el esquema) | exploración |
 | 16 | [agent-sharing](changes/agent-sharing/exploration.md) | 2, 4 | L (partes C + D de visibility-policy) | 6, 13 | exploración |
 
