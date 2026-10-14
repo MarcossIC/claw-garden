@@ -1,14 +1,14 @@
 change: project-indexing
 objective: "3"
 depends_on: [eval-golden-expansion]
-phase: explore
+phase: tasks
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
   apply: pending
   verify: pending
   archive: pending
-updated: 2026-10-12
+updated: 2026-10-14
