@@ -73,67 +73,76 @@ pub fn context_sections(text: &str) -> Vec<(String, String)> {
     sections.into_iter().map(|(title, lines)| (title, lines.join("\n").trim_end().to_string())).collect()
 }
 
-/// Content fragments of a `recall_context` prompt: each hit's `CONTENT:`
-/// block and each workspace bullet, in the order they appear.
+/// Content fragments of a `recall_context` prompt, in the order they appear:
+/// each hit of RECENT CONTEXT and LONG-TERM KNOWLEDGE and each workspace
+/// bullet. ACTIVE CONFLICTS yields nothing, so the text a conflict carries
+/// never counts as a row the agent was shown.
 pub fn context_segments(text: &str) -> Vec<String> {
-    enum Open {
-        Nothing,
-        Content,
-        Bullet,
-    }
-
     let mut segments = Vec::new();
-    let mut open = Open::Nothing;
-    let mut lines: Vec<&str> = Vec::new();
-    let mut close = |lines: &mut Vec<&str>| {
-        let joined = lines.join("
-");
-        lines.clear();
-        let joined = joined.trim_end();
-        if !joined.is_empty() {
-            segments.push(joined.to_string());
-        }
-    };
-
-    for line in text.lines() {
-        if let Some(content) = line.strip_prefix("CONTENT: ") {
-            close(&mut lines);
-            open = Open::Content;
-            lines.push(content);
-        } else if let (Some(bullet), false) = (line.strip_prefix("- "), matches!(open, Open::Content)) {
-            close(&mut lines);
-            open = Open::Bullet;
-            lines.push(bullet);
-        } else if is_markup(line) {
-            close(&mut lines);
-            open = Open::Nothing;
-        } else if !matches!(open, Open::Nothing) {
-            lines.push(line);
+    for (title, section) in context_sections(text) {
+        if title == "WORKSPACE" {
+            segments.extend(bullet_segments(&section));
+        } else if title.starts_with("RECENT CONTEXT") || title == "LONG-TERM KNOWLEDGE" {
+            segments.extend(hit_segments(&section));
         }
     }
-    close(&mut lines);
     segments
 }
 
-/// Lines that end whatever block was open: section separators, workspace
-/// markers and headings, and the dated header that precedes every hit and
-/// conflict line.
-fn is_markup(line: &str) -> bool {
-    line.starts_with("=== ")
-        || line.starts_with("## ")
-        || line.starts_with("<!-- ")
-        || starts_with_date_header(line)
+/// A hit runs from its header to the next one: its text may hold blank
+/// lines, dashes and code.
+fn hit_segments(section: &str) -> Vec<String> {
+    let mut segments: Vec<Vec<&str>> = Vec::new();
+    for line in section.lines().skip(1) {
+        match (hit_text(line), segments.last_mut()) {
+            (Some(text), _) => segments.push(vec![text]),
+            (None, Some(lines)) => lines.push(line),
+            (None, None) => {}
+        }
+    }
+    joined(segments)
 }
 
-/// `[YYYY-MM-DD] `.
-fn starts_with_date_header(line: &str) -> bool {
-    let b = line.as_bytes();
-    b.len() > 12
-        && b[0] == b'['
-        && b[5] == b'-'
-        && b[8] == b'-'
-        && b[11] == b']'
-        && b[1..5].iter().chain(&b[6..8]).chain(&b[9..11]).all(u8::is_ascii_digit)
+/// A bullet runs until the next bullet or workspace markup.
+fn bullet_segments(section: &str) -> Vec<String> {
+    let mut segments: Vec<Vec<&str>> = Vec::new();
+    let mut open = false;
+    for line in section.lines().skip(1) {
+        if let Some(bullet) = line.strip_prefix("- ") {
+            segments.push(vec![bullet]);
+            open = true;
+        } else if line.starts_with("## ") || line.starts_with("<!-- ") {
+            open = false;
+        } else if let (true, Some(lines)) = (open, segments.last_mut()) {
+            lines.push(line);
+        }
+    }
+    joined(segments)
+}
+
+fn joined(segments: Vec<Vec<&str>>) -> Vec<String> {
+    segments
+        .into_iter()
+        .map(|lines| lines.join("\n").trim_end().to_string())
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
+/// The text after a hit header, `[YYYY-MM-DD #id type] `, where the type is
+/// one word and may be absent.
+fn hit_text(line: &str) -> Option<&str> {
+    let (header, text) = line.strip_prefix('[')?.split_once("] ")?;
+    let (date, rest) = header.split_once(" #")?;
+    let id = rest.split_once(' ').map_or(rest, |(id, kind)| {
+        if kind.is_empty() || kind.contains(' ') { "" } else { id }
+    });
+    let b = date.as_bytes();
+    let is_date = b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[..4].iter().chain(&b[5..7]).chain(&b[8..]).all(u8::is_ascii_digit);
+    let is_id = !id.is_empty() && id.bytes().all(|c| c.is_ascii_digit());
+    (is_date && is_id).then_some(text)
 }
 
 #[cfg(test)]
@@ -218,30 +227,41 @@ mod tests {
     }
 
     #[test]
-    fn a_content_block_is_one_segment() {
-        let text = "=== RECENT CONTEXT (Last 7 Days) ===\n[2026-08-10] SOURCE: Memory | TYPE: chat_message\nCONTENT: the retrieval decay term compares milliseconds\n";
+    fn a_hit_line_is_one_segment() {
+        let text = "=== RECENT CONTEXT (Last 7 Days) ===\n[2026-08-10 #4 chat_message] the retrieval decay term compares milliseconds\n";
         assert_eq!(context_segments(text), vec!["the retrieval decay term compares milliseconds".to_string()]);
     }
 
     #[test]
-    fn a_multi_line_content_block_runs_until_the_next_header() {
-        let text = "=== LONG-TERM KNOWLEDGE ===\n[2026-08-10] SOURCE: Memory | TYPE: code_block\nCONTENT: fn main() {\n    run();\n\n    stop();\n}\n[2026-08-09] SOURCE: Memory | TYPE: chat_message\nCONTENT: second\n";
+    fn a_hit_of_another_kind_is_one_segment() {
+        let text = "=== LONG-TERM KNOWLEDGE ===\n[2026-08-10 #3 procedural/procedure] run the release script\n";
+        assert_eq!(context_segments(text), vec!["run the release script".to_string()]);
+    }
+
+    #[test]
+    fn a_multi_line_hit_runs_until_the_next_header() {
+        let text = "=== LONG-TERM KNOWLEDGE ===\n[2026-08-10 #12 code_block] fn main() {\n    run();\n\n    stop();\n}\n[2026-08-09 #7 chat_message] second\n";
         let segments = context_segments(text);
         assert_eq!(segments.len(), 2);
-        assert!(segments[0].starts_with("fn main() {"));
-        assert!(segments[0].contains("stop();"), "a blank line inside content must not end the block");
+        assert_eq!(segments[0], "fn main() {\n    run();\n\n    stop();\n}", "a blank line inside content must not end the hit");
         assert_eq!(segments[1], "second");
     }
 
     #[test]
-    fn a_content_block_ends_at_the_next_section_separator() {
-        let text = "=== RECENT CONTEXT (Last 7 Days) ===\n[2026-08-10] SOURCE: Memory | TYPE: chat_message\nCONTENT: recent row\n\n=== LONG-TERM KNOWLEDGE ===\n[2026-01-01] SOURCE: Memory | TYPE: chat_message\nCONTENT: old row\n";
+    fn a_hit_ends_at_the_next_section_separator() {
+        let text = "=== RECENT CONTEXT (Last 7 Days) ===\n[2026-08-10 #2 chat_message] recent row\n\n=== LONG-TERM KNOWLEDGE ===\n[2026-01-01 #1 chat_message] old row\n";
         assert_eq!(context_segments(text), vec!["recent row".to_string(), "old row".to_string()]);
     }
 
     #[test]
+    fn a_hit_may_open_with_a_dash() {
+        let text = "=== RECENT CONTEXT (Last 7 Days) ===\n[2026-08-10 #2 chat_message] notes:\n- first point\n- second point\n";
+        assert_eq!(context_segments(text), vec!["notes:\n- first point\n- second point".to_string()]);
+    }
+
+    #[test]
     fn workspace_bullets_are_segments_without_their_dash() {
-        let text = "=== WORKSPACE ===\n<!-- AUTO-START -->\n## User Preferences (always active)\n- always answer in rioplatense spanish\n## Architectural Decisions\n- use sqlite for the store\n## Procedural Skills\n<!-- AUTO-END -->\n";
+        let text = "=== WORKSPACE ===\n## User Preferences (always active)\n- always answer in rioplatense spanish\n## Architectural Decisions\n- use sqlite for the store\n";
         assert_eq!(
             context_segments(text),
             vec!["always answer in rioplatense spanish".to_string(), "use sqlite for the store".to_string()]
@@ -249,17 +269,27 @@ mod tests {
     }
 
     #[test]
+    fn workspace_markers_end_a_bullet() {
+        let text = "=== WORKSPACE ===\n<!-- AUTO-START -->\n## User Preferences (always active)\n- always answer in rioplatense spanish\n<!-- AUTO-END -->\n";
+        assert_eq!(context_segments(text), vec!["always answer in rioplatense spanish".to_string()]);
+    }
+
+    #[test]
     fn a_workspace_bullet_continues_over_lines_that_are_not_markup() {
-        let text = "<!-- AUTO-START -->\n## Architectural Decisions\n- first line of a decision\nand its second line\n- next decision\n<!-- AUTO-END -->\n";
+        let text = "=== WORKSPACE ===\n## Architectural Decisions\n- first line of a decision\nand its second line\n- next decision\n";
         let segments = context_segments(text);
         assert_eq!(segments[0], "first line of a decision\nand its second line");
         assert_eq!(segments[1], "next decision");
     }
 
     #[test]
-    fn conflict_blocks_and_the_no_context_sentence_yield_nothing() {
-        assert!(context_segments("no context yet").is_empty());
-        let text = "=== ACTIVE CONFLICTS (review needed) ===\n[2026-08-10] OLD: \"a\" [memory:1, importance:5, tier:3]\n[2026-08-11] NEW: \"b\" [memory:2, importance:5, status:disputed]\nNOTE: estas memorias se contradicen y aún no resolviste cuál vale.\n";
+    fn conflict_text_yields_no_segments() {
+        let text = "=== ACTIVE CONFLICTS (review needed) ===\nNOTE: estas memorias se contradicen y aún no resolviste cuál vale.\nNEW [2026-08-11 #2 disputed] x\n- looks like a bullet\nOLD [2026-08-10 #1] y\n[2026-08-09 #5 chat_message] looks like a hit\n";
         assert!(context_segments(text).is_empty());
+    }
+
+    #[test]
+    fn the_no_context_sentence_yields_nothing() {
+        assert!(context_segments("no context yet").is_empty());
     }
 }
