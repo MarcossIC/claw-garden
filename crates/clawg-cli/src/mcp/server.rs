@@ -42,8 +42,8 @@ use crate::client::{
 };
 use crate::mcp::startup::ClientHandle;
 use crate::mcp::tools::{
-    format_recall, format_resolution, format_rows, format_search, format_status, format_synthesis,
-    resolve_project,
+    format_docs, format_recall, format_resolution, format_rows, format_search, format_status,
+    format_synthesis, resolve_project,
 };
 
 /// Agent id used when neither `--agent` nor the MCP client named one.
@@ -112,7 +112,9 @@ when a broad task needs background. When it lists ACTIVE CONFLICTS, ask the user
 which memory holds and record the answer with `resolve_conflict`. When \
 `recall_context` says memories are waiting for a review, or the user asks what you \
 have learned, call `synthesize` and save the conclusions it leads to. \
-Memories are scoped to the current project unless you say otherwise.";
+Memories are scoped to the current project unless you say otherwise. For how \
+this project works (its design, conventions or commands), call `search_project` \
+before opening files: it searches the project's own documentation.";
 
 // ── Tool parameters ─────────────────────────────────────────────────────────
 
@@ -164,6 +166,20 @@ pub struct RecallContextArgs {
     /// What the user is asking about. The returned block is meant to be read
     /// as background before answering, not quoted back to them.
     pub query: String,
+    /// Absolute path of the project. Defaults to the directory this bridge was
+    /// started in.
+    #[serde(default)]
+    pub project_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SearchProjectArgs {
+    /// What to find out about the project, as a natural-language question or
+    /// the name of something in it.
+    pub query: String,
+    /// How many passages to return, 1 to 20. Defaults to 5.
+    #[serde(default)]
+    pub limit: Option<usize>,
     /// Absolute path of the project. Defaults to the directory this bridge was
     /// started in.
     #[serde(default)]
@@ -609,6 +625,28 @@ impl ClawgMcp {
         }
     }
 
+    /// A project's documentation belongs to the project, not to an agent, so
+    /// no agent narrows it.
+    pub async fn search_project_impl(&self, args: SearchProjectArgs) -> Result<CallToolResult, rmcp::ErrorData> {
+        let client = match self.daemon().await {
+            Ok(c) => c,
+            Err(failure) => return Ok(failure),
+        };
+        let Some(project_id) = self.project_for(&client, args.project_path.as_deref(), false).await else {
+            return Self::failed("no project to search: pass project_path");
+        };
+        match client.search_docs(&project_id, &args.query, args.limit).await {
+            Ok(found) => Self::ok(format_docs(&found)),
+            // The daemon's own 404 names the project; a bare one is a daemon
+            // that predates the route.
+            Err(ClientError::Daemon { status: 404, message, .. }) if message.starts_with("404") => Self::failed(
+                "the running clawg daemon is older than this bridge and cannot search project docs; \
+                 restart it with `clawg stop` and call the tool again",
+            ),
+            Err(e) => Self::failed(Self::explain(&e)),
+        }
+    }
+
     /// Only the calling agent's memories, as in `list_memories_impl`.
     pub async fn synthesize_impl(
         &self,
@@ -767,6 +805,23 @@ impl ClawgMcp {
         Parameters(args): Parameters<SynthesizeArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         self.synthesize_impl(&self.agent_id_for(Some(&ctx)), args).await
+    }
+
+    #[tool(
+        name = "search_project",
+        description = "Search this project's own documentation (README, docs, CLAUDE.md, design \
+                       notes, specs and manifests) for how it works: its design, conventions, \
+                       commands and decisions. Use it before opening files when the question is \
+                       how something in the project works or why it is the way it is. Matching \
+                       is by meaning and by exact term, so pass a question or the name of the \
+                       thing. Returns numbered passages, each under the file and headings it \
+                       comes from; the index follows the files on disk."
+    )]
+    async fn search_project(
+        &self,
+        Parameters(args): Parameters<SearchProjectArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.search_project_impl(args).await
     }
 
     #[tool(
@@ -966,6 +1021,25 @@ mod tests {
         .unwrap();
 
         assert_eq!(b.registered.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn search_project_lists_each_hit_under_its_breadcrumb() {
+        let (_repo, identity) = repo_with_src();
+        let root = std::path::PathBuf::from(&identity.root);
+        std::fs::write(root.join("README.md"), "# Repo\nHow the repo is laid out.\n## Build\nRun make.\n")
+            .expect("readme");
+        let (b, _d) = bridge_at(Some(identity), |r| r).await;
+
+        let found = b
+            .search_project_impl(SearchProjectArgs { query: "How the repo is laid out".into(), limit: None, project_path: None })
+            .await
+            .unwrap();
+
+        let out = text(&found);
+        assert!(!is_error(&found), "{out}");
+        assert!(out.starts_with("[1] README.md > Repo\nHow the repo is laid out."), "{out}");
+        assert!(out.contains("[2] README.md > Repo > Build\nRun make."), "{out}");
     }
 
     #[tokio::test]
@@ -1281,6 +1355,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn instructions_say_when_to_search_the_project() {
+        let (b, _d) = bridge().await;
+        let instructions = b.get_info().instructions.expect("instructions");
+        assert!(instructions.contains("search_project"), "{instructions}");
+        assert!(instructions.contains("how"), "{instructions}");
+    }
+
+    #[tokio::test]
     async fn every_tool_is_registered_under_its_wire_name() {
         let (b, _d) = bridge().await;
         let names: Vec<String> = b
@@ -1297,11 +1379,12 @@ mod tests {
             "delete_memory",
             "resolve_conflict",
             "synthesize",
+            "search_project",
             "memory_status",
         ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}: {names:?}");
         }
-        assert_eq!(names.len(), 8, "no extra tools: {names:?}");
+        assert_eq!(names.len(), 9, "no extra tools: {names:?}");
     }
 
     /// The memory viewer (`clawg memories`) is for the person at the terminal.
@@ -1325,6 +1408,7 @@ mod tests {
                 "resolve_conflict",
                 "save_memory",
                 "search_memory",
+                "search_project",
                 "synthesize",
             ]
         );

@@ -131,6 +131,8 @@ struct Progress {
 #[derive(Debug, Default)]
 pub struct DocIndex {
     projects: Mutex<HashMap<String, Progress>>,
+    /// Woken whenever any project's refresh ends.
+    finished: tokio::sync::Notify,
 }
 
 /// Marks a project's refresh as running for as long as it lives, also when
@@ -146,6 +148,8 @@ impl Drop for RefreshGuard {
         if let Some(p) = projects.get_mut(&self.project_id) {
             p.running = false;
         }
+        drop(projects);
+        self.index.finished.notify_waiters();
     }
 }
 
@@ -171,6 +175,25 @@ impl DocIndex {
     pub fn is_due(&self, project_id: &str, now: Instant) -> bool {
         let p = self.progress(project_id);
         !p.running && needs_refresh(p.last_started, now, REFRESH_INTERVAL)
+    }
+
+    /// Waits until no refresh of the project is running, or `limit` passed.
+    /// Returns whether it is idle.
+    pub async fn wait_idle(&self, project_id: &str, limit: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            // Registered before the check, so an end that lands between the
+            // check and the await still wakes this waiter.
+            let finished = self.finished.notified();
+            tokio::pin!(finished);
+            finished.as_mut().enable();
+            if !self.is_running(project_id) {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, finished).await.is_err() {
+                return !self.is_running(project_id);
+            }
+        }
     }
 
     fn progress(&self, project_id: &str) -> Progress {
@@ -764,6 +787,23 @@ mod tests {
             index.try_refresh(&store, &Counting::new("m1"), None, "p").await.unwrap(),
             RefreshOutcome::Refreshed(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn waiting_for_a_running_refresh_ends_when_it_does() {
+        let index = Arc::new(DocIndex::default());
+        assert!(index.wait_idle("p", Duration::ZERO).await, "nothing running is idle at once");
+
+        let guard = index.begin("p").unwrap();
+        assert!(!index.wait_idle("p", Duration::from_millis(20)).await, "gives up at the limit");
+
+        let waiter = {
+            let index = index.clone();
+            tokio::spawn(async move { index.wait_idle("p", Duration::from_secs(10)).await })
+        };
+        tokio::task::yield_now().await;
+        drop(guard);
+        assert!(waiter.await.unwrap());
     }
 
     #[tokio::test]

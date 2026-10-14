@@ -16,6 +16,7 @@ use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
 
 use crate::client::{Context, Health, Hit, MemoryRow, Synthesis};
+use crate::daemon::api::DocsSearchBody;
 use crate::relevance::{relevant_len, RELEVANCE_RATIO};
 
 /// How much of a hit's content a search result shows.
@@ -184,6 +185,28 @@ pub fn format_synthesis(s: &Synthesis) -> String {
     ));
     out.extend(s.pending.iter().map(synthesis_line));
     out.join("\n")
+}
+
+/// What `search_project` hands the model: each passage in full under its
+/// breadcrumb, so the model knows which file and section to open next. A
+/// passage is already capped at one embedding window, so nothing is cut.
+pub fn format_docs(found: &DocsSearchBody) -> String {
+    let mut out: Vec<String> = Vec::new();
+    if found.indexing {
+        out.push("This project's docs are still being indexed; the results may be incomplete.".into());
+    }
+    if let Some(warning) = &found.warning {
+        out.push(format!("The index could not be refreshed ({warning}); these results are from before."));
+    }
+    if found.hits.is_empty() {
+        out.push(if found.docs == 0 && !found.indexing {
+            "No docs are indexed for this project: it has no Markdown files or manifests clawg can read.".into()
+        } else {
+            "No passage of the project's docs matches.".into()
+        });
+    }
+    out.extend(found.hits.iter().enumerate().map(|(i, hit)| format!("[{}] {}\n{}", i + 1, hit.breadcrumb, hit.text)));
+    out.join("\n\n")
 }
 
 /// Unreviewed memories from which `recall_context` reminds the model to look
@@ -464,6 +487,52 @@ mod tests {
         let out = format_synthesis(&synthesis(vec![], 0, vec![]));
         assert!(!out.contains("save_memory"), "{out}");
         assert!(out.contains("no memories"), "{out}");
+    }
+
+    fn docs(hits: &[(&str, &str)], docs: usize, indexing: bool) -> DocsSearchBody {
+        DocsSearchBody {
+            hits: hits
+                .iter()
+                .map(|(crumb, text)| clawg_core::memory::project_docs::DocHit {
+                    path: crumb.split(" > ").next().unwrap().to_string(),
+                    breadcrumb: crumb.to_string(),
+                    text: text.to_string(),
+                    score: 0.5,
+                })
+                .collect(),
+            docs,
+            indexing,
+            warning: None,
+        }
+    }
+
+    #[test]
+    fn docs_are_numbered_under_their_breadcrumbs() {
+        let out = format_docs(&docs(&[("README.md > Build", "Run make."), ("docs/a.md", "Intro.")], 2, false));
+        assert_eq!(out, "[1] README.md > Build\nRun make.\n\n[2] docs/a.md\nIntro.");
+    }
+
+    #[test]
+    fn search_project_warns_while_indexing() {
+        let out = format_docs(&docs(&[("README.md", "Partial.")], 1, true));
+        assert!(out.starts_with("This project's docs are still being indexed"), "{out}");
+        assert!(out.ends_with("[1] README.md\nPartial."), "{out}");
+    }
+
+    #[test]
+    fn an_empty_index_and_no_match_read_differently() {
+        assert!(format_docs(&docs(&[], 0, false)).contains("No docs are indexed"));
+        assert!(format_docs(&docs(&[], 3, false)).contains("No passage"));
+        assert!(format_docs(&docs(&[], 0, true)).contains("still being indexed"));
+    }
+
+    #[test]
+    fn a_failed_refresh_is_named_before_the_results() {
+        let mut found = docs(&[("a.md", "Old.")], 1, false);
+        found.warning = Some("project root /gone is not a directory".into());
+        let out = format_docs(&found);
+        assert!(out.starts_with("The index could not be refreshed (project root /gone"), "{out}");
+        assert!(out.ends_with("[1] a.md\nOld."), "{out}");
     }
 
     #[test]

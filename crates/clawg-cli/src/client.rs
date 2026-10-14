@@ -25,6 +25,7 @@ use clawg_core::memory::store_lock::{StoreHolder, StoreLock, StoreOwner};
 use clawg_core::paths::{data_dir, PathsError, Profile};
 use serde::{Deserialize, Serialize};
 
+use crate::daemon::api::DocsSearchBody;
 use crate::daemon::lifecycle::{read_state, read_token};
 use crate::relevance::RELEVANCE_RATIO;
 
@@ -512,6 +513,23 @@ impl DaemonClient {
             .post(self.url("/v1/synthesis"))
             .bearer_auth(&self.token)
             .json(args)
+            .send()
+            .await
+            .map_err(Self::map_transport)?;
+        Self::read_response(resp).await
+    }
+
+    pub async fn search_docs(
+        &self,
+        project_id: &str,
+        query: &str,
+        limit: Option<usize>,
+    ) -> Result<DocsSearchBody, ClientError> {
+        let resp = self
+            .http
+            .post(self.url("/v1/projects/docs/search"))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "project_id": project_id, "query": query, "limit": limit }))
             .send()
             .await
             .map_err(Self::map_transport)?;

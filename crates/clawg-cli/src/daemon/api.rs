@@ -1019,6 +1019,15 @@ fn spawn_doc_refresh(app: Arc<AppCtx>, project_id: String) {
     });
 }
 
+/// How long a search waits for a project's first index before answering
+/// with what there is. Longer than indexing a typical repository's docs takes,
+/// and short of what an MCP host waits for a tool.
+pub const FIRST_INDEX_WAIT: Duration = Duration::from_secs(20);
+
+async fn docs_in(store: &clawg_core::memory::MemoryStore, project_id: &str) -> ApiResult<usize> {
+    project_docs::doc_count(store, project_id).await.map_err(ApiError::internal)
+}
+
 /// Largest `limit` a documentation search honours.
 pub const MAX_DOCS_LIMIT: usize = 20;
 /// `limit` of a documentation search when the caller does not say.
@@ -1073,11 +1082,16 @@ async fn search_docs(
         if let Err(e) = index.try_refresh(store, embedder.as_ref(), tokenizer, &body.project_id).await {
             warning = Some(e.to_string());
         }
+    } else if index.is_running(&body.project_id) && docs_in(store, &body.project_id).await? == 0 {
+        // The first index of a project is usually started by the bridge's
+        // registration a moment before this search; answering from an empty
+        // index would read as "the docs say nothing".
+        index.wait_idle(&body.project_id, FIRST_INDEX_WAIT).await;
     }
     let hits = project_docs::search(store, embedder.as_ref(), &body.project_id, &body.query, clamp_docs_limit(body.limit))
         .await
         .map_err(ApiError::internal)?;
-    let docs = project_docs::doc_count(store, &body.project_id).await.map_err(ApiError::internal)?;
+    let docs = docs_in(store, &body.project_id).await?;
     Ok(Json(DocsSearchBody { hits, docs, indexing: index.is_running(&body.project_id), warning }))
 }
 
