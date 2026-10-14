@@ -20,7 +20,7 @@ El agente fija la importancia y el tipo al guardar, pero después no los puede c
 - **Tier: baja sólo lo que quitó el cambio** (pregunta al usuario en el hilo, opción recomendada). Si el campo que cambió era lo que le daba el tier a la fila, el tier vuelve al que la fila gana sin él; lo que ganó por accesos, lo que perdió por decaimiento y un tier que vino de otro lado (filas de la app de escritorio) no se tocan. Subir la importancia o pasar a un tipo de tier 1 promueve, como hoy.
 - **Scope: el de visibility-policy.** El puente manda siempre su agente, y una fila de otro agente es "no existe" (`specs/visibility` R3 y R4). El `PATCH` ya acepta `?agent=`.
 - **Re-guardar sigue sin cambiar la importancia.** El refuerzo es una señal de frecuencia; mezclarlo con una corrección haría que un agente que re-guarda por costumbre pise lo que el usuario fijó. La respuesta del refuerzo nombra `update_memory`.
-- **Promoción de scope (agente → proyecto o global): fuera.** Es la pregunta 8 de visibility-policy y vive en [agent-sharing](../agent-sharing/exploration.md).
+- **Promoción de scope (agente → proyecto o global): fuera.** Es la pregunta 8 de visibility-policy y vive en [agent-sharing](../../agent-sharing/exploration.md).
 
 ## Alcance
 
