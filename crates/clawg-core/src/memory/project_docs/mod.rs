@@ -116,7 +116,7 @@ pub fn plan_refresh(disk: &[(String, String)], stored: &[Fingerprint], model_id:
 /// Whether a project whose last refresh started at `last_started` is due for
 /// another at `now`.
 pub fn needs_refresh(last_started: Option<Instant>, now: Instant, interval: Duration) -> bool {
-    last_started.is_none_or(|t| now.saturating_duration_since(t) >= interval)
+    last_started.map_or(true, |t| now.saturating_duration_since(t) >= interval)
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -339,7 +339,7 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
         .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
 }
 
-async fn refresh(
+pub(crate) async fn refresh(
     store: &MemoryStore,
     embedder: &dyn Embedder,
     splitter: &TokenSplitter,

@@ -2,6 +2,7 @@ mod agent_view;
 mod audit;
 mod cli;
 mod diff;
+mod docs;
 mod follow_up;
 mod golden;
 mod metrics;
@@ -69,6 +70,16 @@ fn production_base_dir() -> PathBuf {
         .unwrap_or_else(|e| panic!("failed to resolve data directory: {e}"))
 }
 
+async fn load_embedder(mode: cli::Mode, base_dir: &std::path::Path) -> Result<EvalEmbedder, i32> {
+    match mode {
+        cli::Mode::Fake => Ok(EvalEmbedder::fake()),
+        cli::Mode::Real => EvalEmbedder::real(base_dir).await.map_err(|e| {
+            eprintln!("failed to load the real embedding model: {e}");
+            EXIT_RUNTIME_FAILURE
+        }),
+    }
+}
+
 /// Runs the harness end to end for an argv-shaped iterator and returns the
 /// process exit code. Split out of `main` so an integration test can drive
 /// the whole pipeline — parse, validate, seed, score, report — without a
@@ -126,6 +137,13 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
         };
     }
 
+    if cli.docs {
+        return match load_embedder(cli.mode, &base_dir).await {
+            Ok(embedder) => docs::run(&cli, &embedder, &base_dir).await,
+            Err(code) => code,
+        };
+    }
+
     let loaded_golden = match golden::load(&cli.golden_path) {
         Ok(v) => v,
         Err(e) => {
@@ -135,15 +153,9 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
     };
     let golden_set = &loaded_golden.set;
 
-    let embedder = match cli.mode {
-        cli::Mode::Fake => EvalEmbedder::fake(),
-        cli::Mode::Real => match EvalEmbedder::real(&base_dir).await {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("failed to load the real embedding model: {e}");
-                return EXIT_RUNTIME_FAILURE;
-            }
-        },
+    let embedder = match load_embedder(cli.mode, &base_dir).await {
+        Ok(e) => e,
+        Err(code) => return code,
     };
 
     // The token counter query-context composition needs, for both the

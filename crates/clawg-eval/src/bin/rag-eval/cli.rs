@@ -71,6 +71,13 @@ pub struct Cli {
     /// Mutually exclusive with `--follow-up` and every sweep flag — those vary
     /// the ranking, this measures what an agent sees of a single fixed one.
     pub agent_view: bool,
+    /// `--docs`: index a project's documentation and score the questions of
+    /// the docs golden set against it, instead of seeding memories. Mutually
+    /// exclusive with `--audit`, `--follow-up`, `--agent-view` and every
+    /// sweep flag, which all measure memory retrieval.
+    pub docs: bool,
+    /// `--root <dir>`, the project `--docs` indexes.
+    pub docs_root: PathBuf,
 }
 
 /// What a parse attempt produces. `--help` is not an error: it takes
@@ -107,6 +114,10 @@ pub enum CliError {
     FollowUpWithSweep,
     #[error("--agent-view is mutually exclusive with --follow-up and the sweep flags (--sweep-imp, --sweep-cos-floor, --sweep-lexical, --fts-tokenizer)")]
     AgentViewWithOtherMode,
+    #[error("--docs is mutually exclusive with --audit, --follow-up, --agent-view and the sweep flags (--sweep-imp, --sweep-cos-floor, --sweep-lexical, --fts-tokenizer)")]
+    DocsWithOtherMode,
+    #[error("--root is only meaningful with --docs")]
+    RootWithoutDocs,
 }
 
 pub const HELP_TEXT: &str = "\
@@ -162,12 +173,19 @@ OPTIONS:
                          visible, their token cost and their latency. Writes
                          {date}-{mode}-agent-view.json. Mutually exclusive with --follow-up
                          and every sweep flag.
+    --docs              Index a project's documentation (Markdown and manifests) into a
+                         temporary store and score the questions of the docs golden set
+                         (crates/clawg-eval/golden/project-docs.json unless --golden says
+                         otherwise): Hit@1/3/5 and MRR@10, printed. Writes no results file.
+                         Mutually exclusive with --audit, --follow-up, --agent-view and
+                         every sweep flag.
+    --root <dir>        With --docs: the project to index (default: this workspace)
     --help, -h          Print this message and exit
 
 EXIT CODES:
     0    success, or --check-only confirmed the model is ready
     1    runtime failure (I/O, embedding, database, or seeding error)
-    2    golden set failed validation
+    2    golden set failed validation (with --docs: also when it names a doc the root lacks)
     3    --real --check-only and the model is not cached
     4    a results file for this date+config already exists and --force was not given
     5    --audit and the golden set is not fit to measure against
@@ -184,6 +202,17 @@ pub fn default_golden_path() -> PathBuf {
         .join("docs")
         .join("eval")
         .join("golden.json")
+}
+
+/// The docs golden set, versioned with this crate: it asks about this
+/// repository's own public docs.
+pub fn default_docs_golden_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("golden").join("project-docs.json")
+}
+
+/// The workspace this crate belongs to, the project `--docs` indexes by default.
+pub fn default_docs_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 
 /// Default results directory, resolved the same CWD-independent way as
@@ -215,12 +244,21 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
     let mut fts_tokenizer: Option<String> = None;
     let mut follow_up = false;
     let mut agent_view = false;
+    let mut docs = false;
+    let mut docs_root: Option<PathBuf> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return Ok(ParseOutcome::Help),
             "--follow-up" => follow_up = true,
             "--agent-view" => agent_view = true,
+            "--docs" => docs = true,
+            "--root" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| CliError::MissingValue("--root".to_string()))?;
+                docs_root = Some(PathBuf::from(value));
+            }
             "--diff" => {
                 let a = args
                     .next()
@@ -325,10 +363,26 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
         return Err(CliError::AgentViewWithOtherMode);
     }
 
+    if docs
+        && (audit
+            || follow_up
+            || agent_view
+            || !sweep_imp.is_empty()
+            || !sweep_cos_floor.is_empty()
+            || !sweep_lexical.is_empty()
+            || fts_tokenizer.is_some())
+    {
+        return Err(CliError::DocsWithOtherMode);
+    }
+    if docs_root.is_some() && !docs {
+        return Err(CliError::RootWithoutDocs);
+    }
+
+    let default_golden = if docs { default_docs_golden_path } else { default_golden_path };
     Ok(ParseOutcome::Run(Cli {
         mode,
         check_only,
-        golden_path: golden_path.unwrap_or_else(default_golden_path),
+        golden_path: golden_path.unwrap_or_else(default_golden),
         out_dir: out_dir.unwrap_or_else(default_out_dir),
         force,
         audit,
@@ -339,6 +393,8 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
         fts_tokenizer,
         follow_up,
         agent_view,
+        docs,
+        docs_root: docs_root.unwrap_or_else(default_docs_root),
     }))
 }
 
@@ -733,5 +789,50 @@ mod tests {
         let cli = run_cli(&["--fake", "--check-only"]);
         assert_eq!(cli.mode, Mode::Fake);
         assert!(cli.check_only);
+    }
+
+    #[test]
+    fn docs_reads_its_own_golden_set_and_this_workspace_by_default() {
+        let cli = run_cli(&["--fake", "--docs"]);
+        assert!(cli.docs);
+        assert_eq!(cli.golden_path, default_docs_golden_path());
+        assert_eq!(cli.docs_root, default_docs_root());
+        assert!(!run_cli(&["--fake"]).docs);
+    }
+
+    #[test]
+    fn docs_takes_a_root_and_a_golden_set() {
+        let cli = run_cli(&["--real", "--docs", "--root", "/tmp/repo", "--golden", "/tmp/q.json"]);
+        assert_eq!(cli.docs_root, PathBuf::from("/tmp/repo"));
+        assert_eq!(cli.golden_path, PathBuf::from("/tmp/q.json"));
+    }
+
+    #[test]
+    fn root_without_docs_is_an_error() {
+        let err = parse(argv(&["--fake", "--root", "/tmp/repo"])).expect_err("--root needs --docs");
+        assert_eq!(err, CliError::RootWithoutDocs);
+    }
+
+    #[test]
+    fn docs_with_another_mode_is_an_error() {
+        for extra in [
+            &["--audit"][..],
+            &["--follow-up"],
+            &["--agent-view"],
+            &["--sweep-lexical", "0"],
+            &["--sweep-imp", "0.5:1.0"],
+            &["--sweep-cos-floor", "0.1"],
+            &["--fts-tokenizer", "trigram"],
+        ] {
+            let mut args = vec!["--fake", "--docs"];
+            args.extend_from_slice(extra);
+            assert_eq!(parse(argv(&args)).expect_err("must conflict"), CliError::DocsWithOtherMode, "{extra:?}");
+        }
+    }
+
+    #[test]
+    fn the_help_text_documents_docs() {
+        assert!(HELP_TEXT.contains("--docs"));
+        assert!(HELP_TEXT.contains("--root <dir>"));
     }
 }
