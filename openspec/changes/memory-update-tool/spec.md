@@ -75,7 +75,7 @@ La regla MUST ser una función pura en `tier.rs`, separada de `compute_tier`: `c
 - WHEN se sube la importancia a 9, o se cambia el tipo a `user_preference`
 - THEN queda en tier 1
 
-**Test:** `lowering_the_importance_that_gave_tier_1_takes_it_away`, `lowering_to_a_value_that_still_earns_the_tier_keeps_it`, `a_tier_earned_by_access_survives_lowering_the_importance`, `a_lost_tier_falls_only_to_what_the_rest_still_earns`, `a_type_that_gave_tier_1_takes_it_with_it`, `a_tier_the_rules_never_gave_survives_any_change` y `raising_still_promotes` en `crates/clawg-core/src/memory/tier.rs`. Fallan hoy, salvo `raising_still_promotes`, que protege lo que ya existe.
+**Test:** `lowering_the_importance_that_gave_tier_1_takes_it_away`, `lowering_to_a_value_that_still_earns_the_tier_keeps_it`, `a_tier_earned_by_access_survives_lowering_the_importance`, `a_lost_tier_falls_only_to_what_the_rest_still_earns`, `a_type_that_gave_tier_1_takes_it_with_it`, `a_tier_the_rules_never_gave_survives_any_change`, `a_tier_lost_to_inactivity_is_not_given_back_by_lowering` y `raising_still_promotes` en `crates/clawg-core/src/memory/tier.rs`. Fallan hoy, salvo `raising_still_promotes`, que protege lo que ya existe.
 
 ## R3. Qué escribe un cambio
 
@@ -95,7 +95,7 @@ Sobre una fila que no existe, borrada o de otro agente cuando el cambio tiene sc
 - WHEN se cambia a `user_preference` con importancia 8
 - THEN la fila queda `user_preference`, 8, tier 1, `update_count` 1, `last_modified_at` nuevo y sigue `disputed`
 
-**Test:** `an_update_writes_what_was_asked_and_counts_itself`, `an_update_leaves_status_accesses_and_disputes_alone`, `lowering_importance_takes_away_the_tier_it_gave` (reemplaza a `set_importance_lowering_never_demotes_tier_1`, que fijaba la regla vieja) y los que ya existen para filas inexistentes, borradas y de otro agente (`set_importance_nonexistent_id_returns_zero`, `set_importance_soft_deleted_row_is_noop`, `an_owner_mismatch_changes_no_importance`, renombrados a `update_*` donde nombran la función) en `admin.rs`.
+**Test:** `an_update_writes_what_was_asked_and_counts_itself`, `an_update_leaves_status_accesses_and_disputes_alone`, `lowering_importance_takes_away_the_tier_it_gave` (reemplaza a `set_importance_lowering_never_demotes_tier_1`, que fijaba la regla vieja) y los que ya existían con `set_importance_core`, ahora sobre `update_memory_core`: `update_with_high_importance_promotes_to_tier_1`, `update_on_episodic_has_no_type_rule_below_importance_9`, `update_on_procedural_keeps_the_tier_its_table_gives`, `update_on_a_missing_id_changes_nothing`, `update_on_a_soft_deleted_row_changes_nothing` y `an_owner_mismatch_changes_no_importance` (que ahora también mira `update_count`), en `admin.rs`.
 
 ## R4. HTTP
 
@@ -113,7 +113,7 @@ Sobre una fila que no existe, borrada o de otro agente cuando el cambio tiene sc
 - WHEN se manda `{"importance": 11}`, `{}` o `{"importanse": 3}`
 - THEN no responde 200 y la fila no cambia
 
-**Test:** `patch_changes_importance_and_type_and_reports_the_row`, `an_invalid_patch_changes_nothing` y los que ya existen (`patch_with_another_agent_is_404_and_keeps_the_importance` y el de `kind` desconocido) en `crates/clawg-cli/tests/api.rs`. Fallan hoy los dos primeros.
+**Test:** `patch_changes_importance_and_type_and_reports_the_row`, `an_invalid_patch_changes_nothing` y los que ya existen (`patch_with_another_agent_is_404_and_keeps_the_importance` y el de `kind` desconocido) en `crates/clawg-cli/tests/api.rs`. El primero falla hoy. El segundo falla en `main` (una importancia 11 se guarda) y pasa desde el commit del core, que trae la validación.
 
 ## R5. Herramienta MCP `update_memory`
 

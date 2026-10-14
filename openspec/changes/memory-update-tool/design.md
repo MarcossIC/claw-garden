@@ -63,4 +63,4 @@ La descripción del esquema de `memory_type` reusa `MEMORY_TYPE_VALUES` (`tools.
 4. MCP: la herramienta, el texto del refuerzo, la descripción de `save_memory` y los conteos.
 5. Docs: `CLAUDE.md` (herramientas y API).
 
-Cada uno compila y pasa la suite solo. El 1 no cambia comportamiento todavía: nada llama a `retier` hasta el 2.
+Cada uno compila y pasa la suite solo. Al aplicar, el 1 y el 2 quedaron en un commit: `retier` sin llamador dejaba un warning de código muerto, que la convención del proyecto no admite.
