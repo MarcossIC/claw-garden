@@ -45,6 +45,9 @@ fs2 = "0.4"
 
 # Ingest (chunking and tokenization)
 tokenizers = { version = "0.22.2", default-features = false }
+# Finds a project's documentation with git's own ignore rules, without needing
+# `git` on the PATH or a `.git` at the root.
+ignore = "0.4"
 # Secret masking at ingest. Already linked through tokenizers and refinery-core,
 # so a direct dependency adds nothing to the build.
 regex = "1"
