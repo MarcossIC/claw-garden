@@ -73,12 +73,9 @@ struct ConflictPair {
     old_id: i64,
     old_created_at: TimestampMs,
     old_content: String,
-    old_importance: f64,
-    old_tier: i64,
     new_id: i64,
     new_created_at: TimestampMs,
     new_content: String,
-    new_importance: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -251,7 +248,7 @@ pub async fn build_memory_prompt(
         }
         out.push_str(SEP_CONFLICTS);
         out.push('\n');
-        out.push_str(&format_conflict_block(&conflicts, omitted));
+        out.push_str(&format_conflict_block(&conflicts, &hit_positions, omitted));
     }
 
     Ok(out)
@@ -305,20 +302,11 @@ fn format_hit_line(hit: &RankedHit) -> String {
     format!("[{y:04}-{m:02}-{d:02} #{} {kind}{}] {}", hit.id, hit.memory_type, hit.content)
 }
 
-/// Formats a conflict pair into a 5-line block.
-fn format_conflict_pair(p: &ConflictPair) -> String {
-    let (oy, om, od) = unix_millis_to_ymd(p.old_created_at);
-    let (ny, nm, nd) = unix_millis_to_ymd(p.new_created_at);
-    format!(
-        "[{oy:04}-{om:02}-{od:02}] OLD: \"{}\" [memory:{}, importance:{:.0}, tier:{}]\n\
-         [{ny:04}-{nm:02}-{nd:02}] NEW: \"{}\" [memory:{}, importance:{:.0}, status:disputed]\n\
-         NOTE: estas memorias se contradicen y aún no resolviste cuál vale.\n\
-         Si vas a tomar una decisión que dependa de esto, preguntale al usuario.\n\
-         Con su respuesta, llamá a resolve_conflict (keep = la que vale, other = la otra).",
-        p.old_content, p.old_id, p.old_importance, p.old_tier,
-        p.new_content, p.new_id, p.new_importance,
-    )
-}
+/// Printed once above the pairs: it is the same for every one of them.
+const CONFLICT_NOTE: &str = "\
+NOTE: estas memorias se contradicen y aún no resolviste cuál vale.
+Si vas a tomar una decisión que dependa de esto, preguntale al usuario.
+Con su respuesta, llamá a resolve_conflict (keep = la que vale, other = la otra).";
 
 /// Orders pairs by the earliest printed hit among their sides and keeps the
 /// first `cap`, returning how many were left out. The query cannot order them:
@@ -338,13 +326,34 @@ fn rank_conflicts(
     (pairs, omitted)
 }
 
-/// The conflicts block under its separator, ending with how many pairs the
-/// cap left out.
-fn format_conflict_block(pairs: &[ConflictPair], omitted: usize) -> String {
-    let mut out = String::new();
+/// The conflicts block under its separator: the note, then one group per
+/// disputed row with a line for each row it disputes, then how many pairs the
+/// cap left out. A side the prompt already prints as a hit is cited by id; any
+/// other side, a workspace row included, carries its text, since a workspace
+/// bullet has no id to point at.
+fn format_conflict_block(pairs: &[ConflictPair], hit_positions: &HashMap<i64, usize>, omitted: usize) -> String {
+    let mut groups: Vec<(&ConflictPair, Vec<&ConflictPair>)> = Vec::new();
     for p in pairs {
-        out.push_str(&format_conflict_pair(p));
-        out.push('\n');
+        match groups.iter_mut().find(|(first, _)| first.new_id == p.new_id) {
+            Some((_, members)) => members.push(p),
+            None => groups.push((p, vec![p])),
+        }
+    }
+    let side = |id: i64, created_at: TimestampMs, content: &str, label: &str| {
+        if hit_positions.contains_key(&id) {
+            format!("#{id}")
+        } else {
+            let (y, m, d) = unix_millis_to_ymd(created_at);
+            format!("[{y:04}-{m:02}-{d:02} #{id}{label}] {content}")
+        }
+    };
+
+    let mut out = format!("{CONFLICT_NOTE}\n");
+    for (first, members) in groups {
+        out.push_str(&format!("NEW {}\n", side(first.new_id, first.new_created_at, &first.new_content, " disputed")));
+        for p in members {
+            out.push_str(&format!("OLD {}\n", side(p.old_id, p.old_created_at, &p.old_content, "")));
+        }
     }
     if omitted > 0 {
         out.push_str(&format!("(+{omitted} conflictos más sin mostrar)\n"));
@@ -405,8 +414,8 @@ fn strip_empty_workspace_markers(raw: &str) -> String {
 /// Fetches the disputed pairs with a side among `shown`, the `memory` ids the
 /// prompt hands the model.
 ///
-/// Every other pair is left out: the block carries both rows in full, and
-/// unfiltered it grew with the store rather than with the question.
+/// Every other pair is left out: unfiltered, the block grew with the store
+/// rather than with the question.
 async fn fetch_active_conflicts(
     store: &MemoryStore,
     agent_id: &str,
@@ -421,8 +430,8 @@ async fn fetch_active_conflicts(
         .conn
         .call(move |c| -> Result<Vec<ConflictPair>, rusqlite::Error> {
             let mut stmt = c.prepare(
-                "SELECT m_old.id, m_old.created_at, m_old.content, m_old.importance, m_old.tier,
-                        m_new.id, m_new.created_at, m_new.content, m_new.importance
+                "SELECT m_old.id, m_old.created_at, m_old.content,
+                        m_new.id, m_new.created_at, m_new.content
                  FROM memory m_new
                  JOIN memory m_old
                    ON m_old.id IN (SELECT value FROM json_each(m_new.disputed_against))
@@ -439,12 +448,9 @@ async fn fetch_active_conflicts(
                         old_id: row.get(0)?,
                         old_created_at: row.get(1)?,
                         old_content: row.get(2)?,
-                        old_importance: row.get(3)?,
-                        old_tier: row.get(4)?,
-                        new_id: row.get(5)?,
-                        new_created_at: row.get(6)?,
-                        new_content: row.get(7)?,
-                        new_importance: row.get(8)?,
+                        new_id: row.get(3)?,
+                        new_created_at: row.get(4)?,
+                        new_content: row.get(5)?,
                     })
                 })?
                 .filter_map(|r| r.ok())
@@ -581,64 +587,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn format_conflict_pair_renders_both_dates_in_sane_range() {
-        let pair = ConflictPair {
-            old_id: 1,
-            old_created_at: TimestampMs::from_unix_millis(1_690_000_000_000), // ~2023-07-22
-            old_content: "old fact".to_string(),
-            old_importance: 8.0,
-            old_tier: 2,
-            new_id: 2,
-            new_created_at: TimestampMs::from_unix_millis(1_700_000_000_000), // 2023-11-14
-            new_content: "new fact".to_string(),
-            new_importance: 8.0,
-        };
-        let line = format_conflict_pair(&pair);
-        let years: Vec<i32> = line
-            .lines()
-            .filter_map(|l| l.strip_prefix('['))
-            .filter_map(|l| l.split('-').next())
-            .filter_map(|y| y.parse::<i32>().ok())
-            .collect();
-        assert_eq!(years.len(), 2, "expected exactly 2 rendered dates, got: {line}");
-        for y in &years {
-            assert!(
-                (2020..=2100).contains(y),
-                "rendered year {y} is not a date anyone lived through: {line}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_conflict_note_names_the_tool() {
-        let pair = ConflictPair {
-            old_id: 11,
-            old_created_at: TimestampMs::from_unix_millis(1_690_000_000_000),
-            old_content: "old fact".to_string(),
-            old_importance: 8.0,
-            old_tier: 2,
-            new_id: 22,
-            new_created_at: TimestampMs::from_unix_millis(1_700_000_000_000),
-            new_content: "new fact".to_string(),
-            new_importance: 8.0,
-        };
-        let block = format_conflict_pair(&pair);
-        let note = block.lines().last().expect("a note line");
-        assert!(note.contains("resolve_conflict"), "{block}");
-    }
-
     fn pair(old_id: i64, new_id: i64) -> ConflictPair {
         ConflictPair {
             old_id,
             old_created_at: TimestampMs::from_unix_millis(1_690_000_000_000),
             old_content: format!("old fact {old_id}"),
-            old_importance: 8.0,
-            old_tier: 2,
             new_id,
             new_created_at: TimestampMs::from_unix_millis(1_700_000_000_000),
             new_content: format!("new fact {new_id}"),
-            new_importance: 8.0,
         }
     }
 
@@ -654,6 +610,65 @@ mod tests {
 
     fn sample_pairs() -> Vec<ConflictPair> {
         vec![pair(5, 98), pair(30, 99), pair(3, 20), pair(2, 20), pair(10, 1), pair(10, 8), pair(11, 8), pair(10, 7)]
+    }
+
+    #[test]
+    fn conflict_block_renders_both_dates_in_sane_range() {
+        let block = format_conflict_block(&[pair(1, 2)], &HashMap::new(), 0);
+        let years: Vec<i32> = block
+            .lines()
+            .filter_map(|l| l.split_once('[').map(|(_, rest)| rest))
+            .filter_map(|l| l.split('-').next())
+            .filter_map(|y| y.parse::<i32>().ok())
+            .collect();
+        assert_eq!(years.len(), 2, "expected exactly 2 rendered dates, got: {block}");
+        for y in &years {
+            assert!((2020..=2100).contains(y), "rendered year {y} is not a date anyone lived through: {block}");
+        }
+    }
+
+    /// `resolve_conflict` takes both ids, so each one is printed even when its
+    /// text is not.
+    #[test]
+    fn conflict_block_cites_shown_hits_by_id_and_prints_text_only_for_the_rest() {
+        let new_shown = format_conflict_block(&[pair(1, 2)], &HashMap::from([(2, 0)]), 0);
+        assert!(new_shown.contains("\nNEW #2\n"), "{new_shown}");
+        assert!(new_shown.contains("\nOLD [2023-07-22 #1] old fact 1\n"), "{new_shown}");
+        assert!(!new_shown.contains("new fact 2"), "{new_shown}");
+
+        let both_shown = format_conflict_block(&[pair(1, 2)], &HashMap::from([(1, 3), (2, 0)]), 0);
+        assert!(both_shown.contains("\nNEW #2\nOLD #1\n"), "{both_shown}");
+        assert!(!both_shown.contains("fact"), "{both_shown}");
+
+        let none_shown = format_conflict_block(&[pair(1, 2)], &HashMap::new(), 0);
+        assert!(none_shown.contains("\nNEW [2023-11-14 #2 disputed] new fact 2\nOLD [2023-07-22 #1] old fact 1\n"), "{none_shown}");
+        for dropped in ["importance", "tier", "status:"] {
+            assert!(!none_shown.contains(dropped), "{none_shown}");
+        }
+    }
+
+    #[test]
+    fn a_new_row_disputing_several_old_rows_prints_its_text_once() {
+        let block = format_conflict_block(&[pair(1, 9), pair(2, 9), pair(3, 9)], &HashMap::new(), 0);
+        assert_eq!(block.matches("new fact 9").count(), 1, "{block}");
+        let after_new: Vec<&str> = block.lines().skip_while(|l| !l.starts_with("NEW ")).skip(1).collect();
+        assert_eq!(after_new, ["OLD [2023-07-22 #1] old fact 1", "OLD [2023-07-22 #2] old fact 2", "OLD [2023-07-22 #3] old fact 3"]);
+    }
+
+    #[test]
+    fn conflict_block_has_one_note() {
+        let block = format_conflict_block(&[pair(1, 7), pair(2, 8), pair(3, 9)], &HashMap::new(), 0);
+        assert_eq!(block.matches("NOTE:").count(), 1, "{block}");
+        assert_eq!(block.matches("resolve_conflict").count(), 1, "{block}");
+        assert!(block.starts_with("NOTE:"), "the note comes before the pairs: {block}");
+        assert_eq!(block.lines().filter(|l| l.starts_with("NEW ")).count(), 3, "{block}");
+    }
+
+    #[test]
+    fn the_conflict_note_names_the_tool() {
+        let block = format_conflict_block(&[pair(11, 22)], &HashMap::new(), 0);
+        let note: Vec<&str> = block.lines().take_while(|l| !l.starts_with("NEW ")).collect();
+        assert!(note.iter().any(|l| l.contains("resolve_conflict (keep = la que vale, other = la otra)")), "{block}");
     }
 
     /// A conflict on a standing preference would otherwise take the cap on
@@ -679,13 +694,13 @@ mod tests {
         let eight: Vec<ConflictPair> = (1..=8).map(|i| pair(100 + i, i)).collect();
         let (kept, omitted) = rank_conflicts(eight, &HashMap::new(), MAX_CONFLICT_PAIRS);
         assert_eq!((kept.len(), omitted), (5, 3));
-        let block = format_conflict_block(&kept, omitted);
+        let block = format_conflict_block(&kept, &HashMap::new(), omitted);
         assert_eq!(block.lines().last(), Some("(+3 conflictos más sin mostrar)"), "{block}");
 
         let five: Vec<ConflictPair> = (1..=5).map(|i| pair(100 + i, i)).collect();
         let (kept, omitted) = rank_conflicts(five, &HashMap::new(), MAX_CONFLICT_PAIRS);
         assert_eq!((kept.len(), omitted), (5, 0));
-        assert!(!format_conflict_block(&kept, omitted).contains("sin mostrar"));
+        assert!(!format_conflict_block(&kept, &HashMap::new(), omitted).contains("sin mostrar"));
     }
 
     #[test]
@@ -1872,9 +1887,11 @@ mod tests {
             "a row the workspace already carries must not also arrive as a retrieval hit:\n{result}"
         );
 
-        // CONFLICTS block must contain the disputed pair
+        // The old side is a hit, so the block cites it by id; the disputed
+        // row is no hit, so the block carries its text.
         let conflicts_block = &result[conf_pos..];
-        assert!(conflicts_block.contains("original fact") || conflicts_block.contains("disputed fact"),
-            "CONFLICTS must reference the disputed pair");
+        assert!(conflicts_block.contains(&format!("\nOLD #{old_id}\n")), "{result}");
+        assert!(conflicts_block.contains("disputed fact"), "{result}");
+        assert_eq!(result.matches("original fact").count(), 1, "a shown row is printed once:\n{result}");
     }
 }
