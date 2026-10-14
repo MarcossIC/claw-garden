@@ -285,14 +285,15 @@ fn unix_millis_to_ymd(ts: TimestampMs) -> (i32, u32, u32) {
     unix_secs_to_ymd(ts.as_millis_i64().div_euclid(1_000))
 }
 
-/// Formats a single retrieval hit into the canonical line format.
-/// `[YYYY-MM-DD] SOURCE: {kind:?} | TYPE: {memory_type}\nCONTENT: {content}`
+/// `[YYYY-MM-DD #id type] content`. Ids are numbered per table, so any kind
+/// other than `memory` is named before the type (`procedural/procedure`).
 fn format_hit_line(hit: &RankedHit) -> String {
     let (y, m, d) = unix_millis_to_ymd(hit.created_at);
-    format!(
-        "[{y:04}-{m:02}-{d:02}] SOURCE: {:?} | TYPE: {}\nCONTENT: {}",
-        hit.kind, hit.memory_type, hit.content
-    )
+    let kind = match hit.kind {
+        TableKind::Memory => String::new(),
+        other => format!("{other:?}/").to_lowercase(),
+    };
+    format!("[{y:04}-{m:02}-{d:02} #{} {kind}{}] {}", hit.id, hit.memory_type, hit.content)
 }
 
 /// Formats a conflict pair into a 5-line block.
@@ -503,25 +504,40 @@ mod tests {
         assert_eq!(unix_millis_to_ymd(TimestampMs::from_unix_millis(-1)), (1969, 12, 31));
     }
 
-    #[test]
-    fn format_hit_line_emits_canonical_format() {
-        let hit = RankedHit {
-            id: 1,
-            kind: TableKind::Memory,
-            content: "test content".to_string(),
-            memory_type: "chat_message".to_string(),
+    fn hit_at_2023_11_14(id: i64, kind: TableKind, memory_type: &str, content: &str) -> RankedHit {
+        RankedHit {
+            id,
+            kind,
+            content: content.to_string(),
+            memory_type: memory_type.to_string(),
             tier: 2,
             status: "active".to_string(),
             score: 0.9,
             distance: 0.1,
             created_at: TimestampMs::from_unix_millis(1_700_000_000_000),
-        };
-        let line = format_hit_line(&hit);
-        assert!(
-            line.starts_with("[2023-11-14] SOURCE: Memory | TYPE: chat_message"),
-            "got: {line}"
-        );
-        assert!(line.contains("CONTENT: test content"), "got: {line}");
+        }
+    }
+
+    /// The id is what `resolve_conflict`, `update_memory` and `delete_memory`
+    /// take, and what the conflicts block cites instead of repeating a row.
+    #[test]
+    fn hit_line_is_one_header_with_id_and_text() {
+        let memory = hit_at_2023_11_14(57, TableKind::Memory, "semantic_fact", "usar sqlite");
+        assert_eq!(format_hit_line(&memory), "[2023-11-14 #57 semantic_fact] usar sqlite");
+
+        let skill = hit_at_2023_11_14(3, TableKind::Procedural, "procedure", "run the release script");
+        assert!(format_hit_line(&skill).starts_with("[2023-11-14 #3 procedural/procedure] "), "{}", format_hit_line(&skill));
+
+        let code = hit_at_2023_11_14(9, TableKind::Memory, "code_block", "fn main() {\n    run();\n\n    stop();\n}");
+        assert_eq!(format_hit_line(&code), "[2023-11-14 #9 code_block] fn main() {\n    run();\n\n    stop();\n}");
+    }
+
+    #[test]
+    fn format_hit_line_drops_the_old_labels() {
+        let line = format_hit_line(&hit_at_2023_11_14(1, TableKind::Memory, "chat_message", "test content"));
+        for label in ["SOURCE:", "TYPE:", "CONTENT:"] {
+            assert!(!line.contains(label), "got: {line}");
+        }
     }
 
     #[test]

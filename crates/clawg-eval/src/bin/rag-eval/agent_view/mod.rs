@@ -296,10 +296,10 @@ mod tests {
 
     #[test]
     fn context_section_tokens_are_counted_per_section_title() {
-        let text = "=== WORKSPACE ===\n- a rule\n\n=== LONG-TERM KNOWLEDGE ===\nCONTENT: x\n";
+        let text = "=== WORKSPACE ===\n- a rule\n\n=== LONG-TERM KNOWLEDGE ===\n[2026-01-01 #1 chat_message] x\n";
         let tokens = context_section_tokens(text, &|s: &str| s.len());
         assert_eq!(tokens.get("WORKSPACE"), Some(&"=== WORKSPACE ===\n- a rule".len()));
-        assert_eq!(tokens.get("LONG-TERM KNOWLEDGE"), Some(&"=== LONG-TERM KNOWLEDGE ===\nCONTENT: x".len()));
+        assert_eq!(tokens.get("LONG-TERM KNOWLEDGE"), Some(&"=== LONG-TERM KNOWLEDGE ===\n[2026-01-01 #1 chat_message] x".len()));
     }
 
     #[test]
@@ -368,9 +368,9 @@ mod tests {
     }
 
     #[test]
-    fn read_context_finds_rows_in_hit_blocks_and_workspace_bullets() {
+    fn read_context_finds_rows_in_hit_lines_and_workspace_bullets() {
         let text = format!(
-            "=== WORKSPACE ===\n<!-- AUTO-START -->\n## User Preferences (always active)\n- {A}\n<!-- AUTO-END -->\n\n=== LONG-TERM KNOWLEDGE ===\n[2026-01-01] SOURCE: Memory | TYPE: chat_message\nCONTENT: {B}\n"
+            "=== WORKSPACE ===\n## User Preferences (always active)\n- {A}\n\n=== LONG-TERM KNOWLEDGE ===\n[2026-01-01 #8 chat_message] {B}\n"
         );
         assert_eq!(read_context(&text, &refs(&["c1", "c2"]), &corpus()), refs(&["c1", "c2"]));
         assert_eq!(read_context(&text, &refs(&["c2"]), &corpus()), refs(&["c2"]));
