@@ -1057,6 +1057,59 @@ async fn delete_with_another_agent_is_404_and_keeps_the_row() {
 }
 
 #[tokio::test]
+async fn patch_changes_importance_and_type_and_reports_the_row() {
+    let h = Harness::start().await;
+    h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "agent-http" })).await;
+    let id = h.wait_for_rows("memory", 1).await[0]["id"].as_i64().expect("id");
+
+    let r = h
+        .authed(h.http.patch(h.url(&format!("/v1/memories/memory/{id}"))))
+        .json(&json!({ "importance": 8, "memory_type": "user_preference" }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.expect("json");
+    assert_eq!(body["updated"], 1, "{body}");
+    assert_eq!(body["importance"], 8.0, "{body}");
+    assert_eq!(body["memory_type"], "user_preference", "{body}");
+    assert_eq!(body["tier"], 1, "{body}");
+
+    let (_, row) = h.get_json(&format!("/v1/memories/memory/{id}")).await;
+    assert_eq!(row["item"]["memory_type"], "user_preference", "{row}");
+    assert_eq!(row["item"]["tier"], 1, "{row}");
+    assert_eq!(row["item"]["update_count"], 1, "{row}");
+}
+
+#[tokio::test]
+async fn an_invalid_patch_changes_nothing() {
+    let h = Harness::start().await;
+    h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "agent-http" })).await;
+    let item = h.wait_for_rows("memory", 1).await.remove(0);
+    let id = item["id"].as_i64().expect("id");
+
+    for body in [
+        json!({ "importance": 11 }),
+        json!({}),
+        json!({ "memory_type": "preference" }),
+        json!({ "importanse": 3 }),
+    ] {
+        let r = h
+            .authed(h.http.patch(h.url(&format!("/v1/memories/memory/{id}"))))
+            .json(&body)
+            .send()
+            .await
+            .expect("request");
+        assert!(matches!(r.status().as_u16(), 400 | 422), "{body}: {}", r.status());
+    }
+
+    let (_, row) = h.get_json(&format!("/v1/memories/memory/{id}")).await;
+    assert_eq!(row["item"]["importance"], item["importance"], "{row}");
+    assert_eq!(row["item"]["memory_type"], item["memory_type"], "{row}");
+    assert_eq!(row["item"]["update_count"], 0, "{row}");
+}
+
+#[tokio::test]
 async fn patch_with_another_agent_is_404_and_keeps_the_importance() {
     let h = Harness::start().await;
     h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "agent-http" })).await;
