@@ -363,6 +363,7 @@ En Windows usá la ruta completa a `clawg.exe`. Los nombres `clawg-dev` y `clawg
 - `save_memory`: guarda un hecho, preferencia o decisión para que sobreviva entre sesiones.
 - `search_memory`: busca memorias relacionadas con una consulta, con ids, tipos y puntajes de relevancia.
 - `recall_context`: devuelve un bloque de contexto listo para leer (notas del workspace, memorias recientes y de largo plazo) para una consulta.
+- `search_project`: busca en la documentación del proyecto (los Markdown y los manifiestos como `Cargo.toml` o `package.json`, respetando `.gitignore`) y devuelve cada sección con su ruta de encabezados. Sirve para preguntas sobre cómo funciona el proyecto. El índice se arma solo la primera vez que el agente abre el proyecto y se pone al día cuando cambian los archivos.
 - `list_memories`: recorre las memorias del agente, las más nuevas primero, sin buscar.
 - `delete_memory`: borra una memoria del agente por id y tipo.
 - `resolve_conflict`: cierra un conflicto de ACTIVE CONFLICTS con la respuesta del usuario: una memoria queda y la otra pasa a reemplazada, o quedan las dos.

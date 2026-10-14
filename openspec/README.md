@@ -126,7 +126,6 @@ Ideas y afirmaciones contrastadas con el código. Las descartadas quedan con su 
 
 ## Backlog sin spec (arreglos sueltos)
 
-- **`#[allow(dead_code)]` en el chunker** (`ChunkerKind::Code`): viola la convención del proyecto. Se resuelve con project-indexing.
 - **`clawg stop` mientras carga el modelo:** el apagado ordenado termina en 1–3 s, pero el proceso sigue vivo hasta que vuelve la carga del embedder. La carga corre en `spawn_blocking` (`crates/clawg-core/src/memory/bootstrap.rs:318`), y el runtime de `#[tokio::main]` (`crates/clawg-cli/src/main.rs:30`) espera a esas tareas. Con el binario debug, una vez se pasó de `STOP_TIMEOUT` y `stop` salió con 1. Los datos no corren riesgo: el volcado y el checkpoint terminan antes. Después de "stopped", el log dice "model load task panicked: task N was cancelled" y "retrying in 30s", y eso confunde. Un arreglo posible es `shutdown_timeout` del runtime cuando `serve::run` vuelve. Detalle en el `verify.md` archivado de data-preservation.
 - **`enum Scope` sin uso** (`crates/clawg-core/src/memory/record.rs:19`): se exporta, pero el insert escribe el literal `"agent"` (`store_insert.rs:178`). Se resuelve con agent-sharing (su pregunta 8): se usa o se borra.
 - **Warnings de código muerto** en `cargo test --workspace`: `insert_row_with_embedding` (`crates/clawg-core/src/memory/worker.rs:1247`, un helper de test sin uso) y el import `production_lexical_budget` de `rag-eval` (`crates/clawg-eval/src/bin/rag-eval/main.rs:16`). Violan la convención de no dejar código muerto.
