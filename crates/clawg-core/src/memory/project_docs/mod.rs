@@ -16,6 +16,7 @@ use crate::memory::chunker::token_splitter::TokenSplitter;
 use crate::memory::clock::TimestampMs;
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::redact::redact;
+use crate::memory::search::{fts_match_expression, MAX_LEXICAL_TOKENS};
 use crate::memory::vector::to_unit;
 use crate::memory::MemoryStore;
 
@@ -26,6 +27,16 @@ use corpus::{CorpusError, DocFile, DocKind};
 /// again. Long enough that a burst of searches walks the tree once; short
 /// enough that a doc edited during a session is found in its new form.
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Passages each channel of a search proposes before fusion. With a top of 20
+/// at most, 50 per channel leaves room for a passage that only one channel
+/// ranks high.
+pub const CANDIDATES_PER_CHANNEL: usize = 50;
+
+/// The constant of reciprocal rank fusion. 60 is the value the method was
+/// published with; it flattens the gap between the first ranks so that two
+/// channels agreeing on a passage outweigh one channel's favourite.
+const RRF_K: f64 = 60.0;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DocIndexError {
@@ -41,6 +52,8 @@ pub enum DocIndexError {
     },
     #[error("the embedder returned an unusable vector for {path}: {reason}")]
     Vector { path: String, reason: String },
+    #[error("embedding the query failed: {0}")]
+    Query(String),
     #[error("documentation index store error: {0}")]
     Store(#[from] tokio_rusqlite::Error),
 }
@@ -186,6 +199,93 @@ impl DocIndex {
         };
         refresh(store, embedder, &splitter, project_id, &root).await.map(RefreshOutcome::Refreshed)
     }
+}
+
+/// One passage a search found.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct DocHit {
+    pub path: String,
+    pub breadcrumb: String,
+    /// The passage's body, without the breadcrumb.
+    pub text: String,
+    pub score: f64,
+}
+
+/// Reciprocal rank fusion of two ranked id lists: each list adds
+/// `1 / (RRF_K + rank)` to an id, rank from 1. Highest total first, ties by
+/// lower id, at most `limit`.
+pub fn fuse(dense: &[i64], lexical: &[i64], limit: usize) -> Vec<(i64, f64)> {
+    let mut scores: HashMap<i64, f64> = HashMap::new();
+    for list in [dense, lexical] {
+        for (rank, id) in list.iter().enumerate() {
+            *scores.entry(*id).or_default() += 1.0 / (RRF_K + (rank + 1) as f64);
+        }
+    }
+    let mut fused: Vec<(i64, f64)> = scores.into_iter().collect();
+    fused.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    fused.truncate(limit);
+    fused
+}
+
+/// The passages of `project_id` that best answer `query`, by meaning (the
+/// nearest vectors) and by term (BM25), fused by rank.
+pub async fn search(
+    store: &MemoryStore,
+    embedder: &dyn Embedder,
+    project_id: &str,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<DocHit>, DocIndexError> {
+    let vector = embedder
+        .embed_with_role(query, EmbedRole::Query)
+        .await
+        .map_err(|e| DocIndexError::Query(e.to_string()))?;
+    let vector = to_unit(&vector).map_err(|e| DocIndexError::Query(e.to_string()))?;
+    let bytes = le_bytes(&vector);
+    let expression = fts_match_expression(query, MAX_LEXICAL_TOKENS);
+    let project_id = project_id.to_string();
+    Ok(store
+        .conn
+        .call(move |c| -> rusqlite::Result<Vec<DocHit>> {
+            let k = CANDIDATES_PER_CHANNEL as i64;
+            let dense: Vec<i64> = c
+                .prepare(
+                    "SELECT rowid FROM project_doc_vectors \
+                     WHERE embedding MATCH ?1 AND k = ?2 AND project_id = ?3 ORDER BY distance",
+                )?
+                .query_map(rusqlite::params![bytes, k, project_id], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            let lexical: Vec<i64> = match &expression {
+                Some(expression) => c
+                    .prepare(
+                        "SELECT rowid FROM project_doc_fts \
+                         WHERE project_doc_fts MATCH ?1 AND project_id = ?2 ORDER BY rank LIMIT ?3",
+                    )?
+                    .query_map(rusqlite::params![expression, project_id, k], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?,
+                None => Vec::new(),
+            };
+            let mut stmt = c.prepare("SELECT path, breadcrumb, body FROM project_doc_chunk WHERE id = ?1")?;
+            fuse(&dense, &lexical, limit)
+                .into_iter()
+                .map(|(id, score)| {
+                    stmt.query_row([id], |r| {
+                        Ok(DocHit { path: r.get(0)?, breadcrumb: r.get(1)?, text: r.get(2)?, score })
+                    })
+                })
+                .collect()
+        })
+        .await?)
+}
+
+/// How many docs the project's index holds.
+pub async fn doc_count(store: &MemoryStore, project_id: &str) -> Result<usize, DocIndexError> {
+    let id = project_id.to_string();
+    let n: i64 = store
+        .conn
+        .call(move |c| c.query_row("SELECT COUNT(*) FROM project_doc_file WHERE project_id = ?1", [id], |r| r.get(0)))
+        .await?;
+    Ok(n as usize)
 }
 
 struct ScannedDoc {
@@ -709,6 +809,161 @@ mod tests {
             .unwrap();
         assert!(indexed.iter().all(|t| !t.contains(&token)));
         assert!(bodies.iter().all(|(_, _, b)| !b.contains(&token)));
+    }
+
+    /// Places a text on one axis per topic it mentions, so a test decides
+    /// which texts mean the same thing without sharing a word.
+    struct Topical;
+
+    const TOPICS: &[&[&str]] = &[&["cola", "apagar", "paro", "saves", "pendientes"], &["port", "puerto"]];
+
+    #[async_trait::async_trait]
+    impl Embedder for Topical {
+        async fn embed_with_role(&self, text: &str, _: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+            let lower = text.to_lowercase();
+            let mut v = vec![0.0f32; 384];
+            v[383] = 0.1;
+            for (axis, words) in TOPICS.iter().enumerate() {
+                v[axis] = words.iter().filter(|w| lower.contains(*w)).count() as f32;
+            }
+            Ok(v)
+        }
+        fn dimensions(&self) -> usize { 384 }
+        fn model_id(&self) -> &str { "topical" }
+        fn query_prefix(&self) -> &str { "" }
+        fn passage_prefix(&self) -> &str { "" }
+    }
+
+    async fn indexed(docs: &[(&str, &str)]) -> (tempfile::TempDir, MemoryStore) {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, text) in docs {
+            write(dir.path(), path, text);
+        }
+        let store = store_with_project("p", dir.path()).await;
+        refreshed(&Arc::new(DocIndex::default()), &store, &Topical, "p").await;
+        (dir, store)
+    }
+
+    fn crumbs(hits: &[DocHit]) -> Vec<&str> {
+        hits.iter().map(|h| h.breadcrumb.as_str()).collect()
+    }
+
+    #[test]
+    fn fuse_adds_the_reciprocal_ranks_of_both_lists() {
+        let fused = fuse(&[1, 2, 3], &[3, 4], 10);
+        let ids: Vec<i64> = fused.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, [3, 1, 2, 4]);
+        assert!((fused[0].1 - (1.0 / 63.0 + 1.0 / 61.0)).abs() < 1e-12);
+        assert!((fused[1].1 - 1.0 / 61.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn fuse_breaks_ties_by_id_and_stops_at_the_limit() {
+        assert_eq!(fuse(&[7], &[5], 10), [(5, 1.0 / 61.0), (7, 1.0 / 61.0)]);
+        assert_eq!(fuse(&[1, 2, 3], &[], 2).len(), 2);
+        assert!(fuse(&[], &[], 5).is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_finds_a_passage_by_meaning() {
+        let (_dir, store) = indexed(&[
+            ("ops.md", "# Apagado\nAl apagar, la cola de ingesta se vuelca a disco.\n"),
+            ("net.md", "# Network\nChoosing the port number.\n"),
+        ])
+        .await;
+
+        let hits = search(&store, &Topical, "p", "¿qué pasa con los saves pendientes si paro el daemon?", 5)
+            .await
+            .unwrap();
+
+        assert_eq!(crumbs(&hits)[0], "ops.md > Apagado");
+        assert_eq!(hits[0].path, "ops.md");
+        assert_eq!(hits[0].text, "Al apagar, la cola de ingesta se vuelca a disco.");
+    }
+
+    #[tokio::test]
+    async fn search_finds_an_identifier_lexically() {
+        let (_dir, store) = indexed(&[
+            ("a.md", "# One\nnothing here\n# Two\nnor here\n# Three\nor here\n"),
+            ("chunker.md", "# Cap\nEl puerto del tope es CHUNK_MAX_TOKENS.\n"),
+        ])
+        .await;
+
+        let dense_only = search(&store, &Topical, "p", "zzz", 5).await.unwrap();
+        let hits = search(&store, &Topical, "p", "CHUNK_MAX_TOKENS", 5).await.unwrap();
+
+        assert_eq!(crumbs(&dense_only).last(), Some(&"chunker.md > Cap"), "by meaning it is the farthest");
+        assert_eq!(crumbs(&hits)[0], "chunker.md > Cap");
+    }
+
+    #[tokio::test]
+    async fn search_never_crosses_projects() {
+        let one = tempfile::tempdir().unwrap();
+        let two = tempfile::tempdir().unwrap();
+        write(one.path(), "README.md", "# Readme\nthe port is chosen at start\n");
+        write(two.path(), "README.md", "# Readme\nthe port is chosen at start\n# Elsewhere\nport port port\n");
+        let store = store_with_project("one", one.path()).await;
+        let (id, root) = ("two".to_string(), two.path().display().to_string());
+        store
+            .conn
+            .call(move |c| c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, ?2, 0)", [id, root]))
+            .await
+            .unwrap();
+        let index = Arc::new(DocIndex::default());
+        refreshed(&index, &store, &Topical, "one").await;
+        refreshed(&index, &store, &Topical, "two").await;
+
+        let hits = search(&store, &Topical, "one", "port", 10).await.unwrap();
+
+        assert_eq!(crumbs(&hits), ["README.md > Readme"]);
+        assert_eq!(doc_count(&store, "one").await.unwrap(), 1);
+        assert_eq!(doc_count(&store, "nobody").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn indexing_docs_leaves_memory_search_unchanged() {
+        use crate::memory::chunker::Chunk;
+        use crate::memory::events::{MemoryEvent, MemorySource};
+        use crate::memory::store_insert::NewMemoryRecord;
+        use crate::memory::{search_all_memories, SearchScope};
+        use crate::models::chat::Role;
+
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "README.md", "# Port\nthe daemon port is 27381\n# Shutdown\nthe daemon spills the queue\n");
+        let store = store_with_project("p", dir.path()).await;
+        for content in ["the daemon port is 27381", "the daemon spills the queue on stop"] {
+            let evt = MemoryEvent {
+                agent_id: "agent".into(),
+                project_id: Some("p".into()),
+                role: Role::User,
+                content: content.into(),
+                is_error: None,
+                source: MemorySource::Explicit,
+                timestamp_ms: 1,
+                memory_type: None,
+                importance: None,
+                derived_from: Vec::new(),
+            };
+            let chunk = Chunk { text: content.into(), token_count: 0 };
+            let vector = FakeEmbedder::default().embed_with_role(content, EmbedRole::Passage).await.unwrap();
+            store.insert_memory_with_vector(NewMemoryRecord::from_event_and_chunk(&evt, &chunk), vector).await.unwrap();
+        }
+        let query = "the daemon port is 27381";
+        let embedding = FakeEmbedder::default().embed_with_role(query, EmbedRole::Query).await.unwrap();
+        let memories = || async {
+            search_all_memories(&store, &embedding, Some(query), "agent", SearchScope::all_default().with_project(Some("p")), 10)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|h| (h.id, h.content))
+                .collect::<Vec<_>>()
+        };
+        let before = memories().await;
+
+        refreshed(&Arc::new(DocIndex::default()), &store, &FakeEmbedder::default(), "p").await;
+
+        assert!(!before.is_empty());
+        assert_eq!(memories().await, before);
     }
 
     #[tokio::test]
