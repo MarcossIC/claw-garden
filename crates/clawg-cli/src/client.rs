@@ -290,6 +290,29 @@ pub struct SavedMemory {
     pub outcome: String,
 }
 
+/// How a row ended up after `PATCH /v1/memories/{kind}/{id}`.
+///
+/// Every field but `memory_type` is required: a daemon older than the type
+/// change answers only `updated`, and reading that as success would report a
+/// tier nobody computed.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Updated {
+    pub kind: String,
+    pub id: i64,
+    pub importance: f64,
+    /// Only `memory` rows have one.
+    pub memory_type: Option<String>,
+    pub tier: i64,
+}
+
+#[derive(Serialize)]
+struct UpdateBody<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    importance: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_type: Option<&'a str>,
+}
+
 /// How the daemon answered a save that did not fail.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SaveOutcome {
@@ -607,32 +630,30 @@ impl DaemonClient {
         Self::read_response(resp).await
     }
 
-    /// `agent` scopes the change to that agent's rows; another agent's row
-    /// comes back as not found.
-    pub async fn set_importance(
+    /// Changes a row's importance, type or both; the daemon refuses an empty
+    /// or invalid change. `agent` scopes the change to that agent's rows;
+    /// another agent's row comes back as not found.
+    pub async fn update(
         &self,
         kind: &str,
         id: i64,
-        importance: f64,
+        importance: Option<f64>,
+        memory_type: Option<&str>,
         agent: Option<&str>,
-    ) -> Result<usize, ClientError> {
-        #[derive(Deserialize)]
-        struct Body {
-            updated: usize,
-        }
+    ) -> Result<Updated, ClientError> {
         let resp = self
             .http
             .patch(self.url(&format!("/v1/memories/{kind}/{id}")))
             .query(&owner_query(agent))
             .bearer_auth(&self.token)
-            .json(&serde_json::json!({ "importance": importance }))
+            .json(&UpdateBody { importance, memory_type })
             .send()
             .await
             .map_err(Self::map_transport)?;
-        Ok(Self::read_response::<Body>(resp).await?.updated)
+        Self::read_response::<Updated>(resp).await
     }
 
-    /// `agent` scopes the delete as in [`DaemonClient::set_importance`].
+    /// `agent` scopes the delete as in [`DaemonClient::update`].
     pub async fn delete(&self, kind: &str, id: i64, agent: Option<&str>) -> Result<usize, ClientError> {
         #[derive(Deserialize)]
         struct Body {
@@ -649,7 +670,7 @@ impl DaemonClient {
         Ok(Self::read_response::<Body>(resp).await?.deleted)
     }
 
-    /// `agent` scopes the resolution as in [`DaemonClient::set_importance`].
+    /// `agent` scopes the resolution as in [`DaemonClient::update`].
     pub async fn resolve(
         &self,
         keep: i64,
@@ -1116,7 +1137,7 @@ pub(crate) mod tests {
         assert_eq!(synthesis.pending.iter().map(|r| r.id).collect::<Vec<_>>(), vec![id]);
         assert_eq!(synthesis.pending_total, 1);
 
-        assert_eq!(c.set_importance("memory", id, 9.5, None).await.expect("patch"), 1);
+        assert_eq!(c.update("memory", id, Some(9.5), None, None).await.expect("patch").tier, 1);
         assert_eq!(c.delete("memory", id, None).await.expect("delete"), 1);
     }
 

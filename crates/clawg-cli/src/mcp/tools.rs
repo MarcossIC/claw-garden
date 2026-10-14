@@ -15,7 +15,7 @@ use clawg_core::memory::dispute::{Resolution, ResolvedRow};
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
 
-use crate::client::{Context, Health, Hit, MemoryRow, Synthesis};
+use crate::client::{Context, Health, Hit, MemoryRow, Synthesis, Updated};
 use crate::relevance::{relevant_len, RELEVANCE_RATIO};
 
 /// How much of a hit's content a search result shows.
@@ -97,6 +97,17 @@ pub fn format_resolution(r: &Resolution) -> String {
         _ => format!("#{} {}", row.id, row.status),
     };
     format!("{}\n{}", line(&r.keep), line(&r.other))
+}
+
+/// What `update_memory` tells the model about the row it changed. The tier is
+/// the one thing the model cannot work out from its own request, and the one
+/// that says whether the row is still in the workspace.
+pub fn format_update(u: &Updated) -> String {
+    let fields = match &u.memory_type {
+        Some(t) => format!("{t}, importance {:.1}", u.importance),
+        None => format!("importance {:.1}", u.importance),
+    };
+    format!("updated #{} {}: {fields}, tier {}", u.id, u.kind, u.tier)
 }
 
 /// Renders inventory rows as a compact one-line-per-row table.
@@ -425,6 +436,20 @@ mod tests {
         let out = format_rows(&[row(1, "memory", Some("chat_message"), &format!("{long}\nmore"))]);
         assert_eq!(out.lines().count(), 1);
         assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn format_update_names_the_fields_and_the_tier() {
+        let memory = Updated {
+            kind: "memory".into(),
+            id: 12,
+            importance: 8.0,
+            memory_type: Some("user_preference".into()),
+            tier: 1,
+        };
+        assert_eq!(format_update(&memory), "updated #12 memory: user_preference, importance 8.0, tier 1");
+        let skill = Updated { kind: "procedural".into(), id: 3, importance: 2.0, memory_type: None, tier: 1 };
+        assert_eq!(format_update(&skill), "updated #3 procedural: importance 2.0, tier 1");
     }
 
     #[test]
