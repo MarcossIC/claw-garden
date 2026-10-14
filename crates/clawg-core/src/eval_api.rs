@@ -25,7 +25,6 @@ use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 
 use crate::memory::access::AccessTracker;
-use crate::memory::chunker::CodeChunker;
 use crate::memory::db::MemoryStore;
 use crate::memory::embedder::{Embedder, FakeEmbedder, FastEmbedLocal};
 
@@ -470,7 +469,6 @@ impl EvalIngest {
             runtime.store.clone(),
             runtime.embedder.clone(),
             chat_chunker,
-            Arc::new(CodeChunker::new()),
         ));
 
         Ok(Self { tx, worker, runtime })

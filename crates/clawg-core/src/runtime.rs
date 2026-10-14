@@ -27,7 +27,6 @@ use tokio::time::Instant;
 use crate::memory::access::AccessTracker;
 use crate::memory::backup::{self, Reason};
 use crate::memory::bootstrap::EmbedderStatus;
-use crate::memory::chunker::CodeChunker;
 use crate::memory::embedder::Embedder;
 use crate::memory::events::MemoryEvent;
 use crate::memory::store_lock::StoreHolder;
@@ -342,7 +341,7 @@ async fn checkpoint(store: &MemoryStore) {
 
 /// Body of [`MemoryRuntime::ingest_worker`].
 ///
-/// Builds the two chunkers once — resolving the tokenizer as a side effect,
+/// Builds the chat chunker once — resolving the tokenizer as a side effect,
 /// which is what fills `tokenizer_cell` for the query path — then hands
 /// ownership to the worker loop.
 fn ingest_worker_future(
@@ -355,9 +354,8 @@ fn ingest_worker_future(
 ) -> impl Future<Output = Vec<MemoryEvent>> + Send + 'static {
     async move {
         let chat_chunker = resolve_tokenizer_and_chunker(&base_dir, &tokenizer);
-        let code_chunker = Arc::new(CodeChunker::new());
         let replay = spill::load(&base_dir).await;
-        memory_worker(rx, drain, replay, store, embedder, chat_chunker, code_chunker).await
+        memory_worker(rx, drain, replay, store, embedder, chat_chunker).await
     }
 }
 

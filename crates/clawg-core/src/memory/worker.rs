@@ -14,7 +14,7 @@ use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 
 use crate::memory::chunker::{
-    select_chunker, ChatChunker, Chunk, ChunkerKind, CodeChunker, CHUNK_MAX_TOKENS,
+    select_chunker, ChatChunker, Chunk, ChunkerKind, CHUNK_MAX_TOKENS,
 };
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::events::{MemoryEvent, MemorySource};
@@ -201,7 +201,6 @@ pub async fn memory_worker(
     store: Arc<MemoryStore>,
     embedder_cell: Arc<OnceCell<Arc<dyn Embedder>>>,
     chat_chunker: Arc<ChatChunker>,
-    code_chunker: Arc<CodeChunker>,
 ) -> Vec<MemoryEvent> {
     // Running count of chunks absorbed by the write-border dedup gate.
     // Plain `u64`, no atomic: `memory_worker` is the single sequential
@@ -251,7 +250,6 @@ pub async fn memory_worker(
             &store,
             &embedder_cell,
             &chat_chunker,
-            &code_chunker,
             &mut absorbed_duplicates,
         )
         .await;
@@ -423,7 +421,6 @@ async fn process_event(
     store: &Arc<MemoryStore>,
     embedder_cell: &Arc<OnceCell<Arc<dyn Embedder>>>,
     chat_chunker: &Arc<ChatChunker>,
-    code_chunker: &Arc<CodeChunker>,
     absorbed: &mut u64,
 ) -> IngestReport {
     // Masked before anything else reads the text, so the chunker, the dedup
@@ -444,7 +441,6 @@ async fn process_event(
         let kind = select_chunker(evt.role.clone(), evt.is_error, &content);
         match kind {
             ChunkerKind::Chat => chat_chunker.chunk(&content, CHUNK_MAX_TOKENS),
-            ChunkerKind::Code => code_chunker.chunk(&content, None),
             ChunkerKind::Skip => return IngestReport { redacted, ..Default::default() },
         }
     };
@@ -1442,16 +1438,15 @@ mod tests {
         cell.set(embedder).ok();
         let cell = Arc::new(cell);
         let chat_chunker = Arc::new(ChatChunker::with_fallback());
-        let code_chunker = Arc::new(CodeChunker::new());
 
         let mut absorbed: u64 = 0;
         let evt = make_event(Role::User, "counter fixture content", None, 1);
 
-        process_event(&evt, &store, &cell, &chat_chunker, &code_chunker, &mut absorbed)
+        process_event(&evt, &store, &cell, &chat_chunker, &mut absorbed)
             .await;
         assert_eq!(absorbed, 0, "the first send has no prior row to reinforce");
 
-        process_event(&evt, &store, &cell, &chat_chunker, &code_chunker, &mut absorbed)
+        process_event(&evt, &store, &cell, &chat_chunker, &mut absorbed)
             .await;
         assert_eq!(
             absorbed, 1,
@@ -1494,13 +1489,35 @@ mod tests {
         let cell: OnceCell<Arc<dyn Embedder>> = OnceCell::new();
         cell.set(embedder).ok();
         let chat_chunker = Arc::new(ChatChunker::with_fallback());
-        let code_chunker = Arc::new(CodeChunker::new());
         let mut absorbed = 0;
-        process_event(evt, store, &Arc::new(cell), &chat_chunker, &code_chunker, &mut absorbed).await
+        process_event(evt, store, &Arc::new(cell), &chat_chunker, &mut absorbed).await
     }
 
     fn chunk_count(content: &str) -> usize {
         ChatChunker::with_fallback().chunk(content, CHUNK_MAX_TOKENS).len()
+    }
+
+    #[tokio::test]
+    async fn a_code_block_save_is_chunked_like_any_other() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let code = "fn main() {\n    println!(\"hi\");\n}";
+        let mut evt = make_event(Role::User, code, None, 1);
+        evt.source = MemorySource::Explicit;
+        evt.memory_type = Some("code_block".to_string());
+
+        let report = process_with(Arc::new(FakeEmbedder::default()), &store, &evt).await;
+
+        assert_eq!(report.failure, None);
+        assert_eq!(report.memories.len(), 1);
+        let (content, memory_type): (String, String) = store
+            .conn
+            .call(|c| -> rusqlite::Result<_> {
+                c.query_row("SELECT content, memory_type FROM memory", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            })
+            .await
+            .unwrap();
+        assert_eq!(content, code);
+        assert_eq!(memory_type, "code_block");
     }
 
     /// Hands the i-th text of each batch the i-th vector, so a test decides
@@ -2148,7 +2165,7 @@ mod tests {
     // ── collapse_duplicate_chunks (pure) ─────────────────────────────────────
 
     fn make_chunk(text: &str) -> Chunk {
-        Chunk { text: text.to_string(), token_count: 0, header: None }
+        Chunk { text: text.to_string(), token_count: 0 }
     }
 
     #[test]
@@ -2241,7 +2258,6 @@ mod tests {
         cell.set(embedder).ok();
         let cell = Arc::new(cell);
         let chat_chunker = Arc::new(ChatChunker::with_fallback());
-        let code_chunker = Arc::new(CodeChunker::new());
 
         let mut absorbed: u64 = 0;
         // 3584 bytes = cap(1920) + stride(1664): the windowing produces
@@ -2251,7 +2267,7 @@ mod tests {
         let content = "x".repeat(3584);
         let evt = make_event(Role::User, &content, None, 1);
 
-        process_event(&evt, &store, &cell, &chat_chunker, &code_chunker, &mut absorbed)
+        process_event(&evt, &store, &cell, &chat_chunker, &mut absorbed)
             .await;
 
         let rows = count_memory(&store).await;
@@ -2278,12 +2294,11 @@ mod tests {
         cell.set(embedder).ok();
         let cell = Arc::new(cell);
         let chat_chunker = Arc::new(ChatChunker::with_fallback());
-        let code_chunker = Arc::new(CodeChunker::new());
 
         // Seed the store with ONE row for chunk A ("x" * 1920).
         let mut absorbed: u64 = 0;
         let seed_evt = make_event(Role::User, &"x".repeat(1920), None, 1);
-        process_event(&seed_evt, &store, &cell, &chat_chunker, &code_chunker, &mut absorbed)
+        process_event(&seed_evt, &store, &cell, &chat_chunker, &mut absorbed)
             .await;
         assert_eq!(absorbed, 0, "seed insert has no prior row to reinforce");
         assert_eq!(count_memory(&store).await, 1);
@@ -2295,7 +2310,7 @@ mod tests {
         // keeps the fixture to exactly two 1920-byte windows, both == A.
         absorbed = 0;
         let dup_evt = make_event(Role::User, &"x".repeat(3584), None, 2);
-        process_event(&dup_evt, &store, &cell, &chat_chunker, &code_chunker, &mut absorbed)
+        process_event(&dup_evt, &store, &cell, &chat_chunker, &mut absorbed)
             .await;
 
         assert_eq!(
@@ -2554,11 +2569,10 @@ mod tests {
         let cell = Arc::new(cell);
 
         let chat_chunker = Arc::new(ChatChunker::with_fallback());
-        let code_chunker = Arc::new(CodeChunker::new());
 
         let (tx, rx) = tokio::sync::mpsc::channel(crate::runtime::INGEST_QUEUE_CAPACITY);
         let handle = tokio::spawn(async move {
-            memory_worker(rx, no_drain(), Replay::none(), store, cell, chat_chunker, code_chunker).await;
+            memory_worker(rx, no_drain(), Replay::none(), store, cell, chat_chunker).await;
         });
         (tx, handle)
     }
@@ -2583,11 +2597,10 @@ mod tests {
         cell: Arc<OnceCell<Arc<dyn Embedder>>>,
     ) -> (Sender<IngestRequest>, tokio::task::JoinHandle<()>) {
         let chat_chunker = Arc::new(ChatChunker::with_fallback());
-        let code_chunker = Arc::new(CodeChunker::new());
 
         let (tx, rx) = tokio::sync::mpsc::channel(crate::runtime::INGEST_QUEUE_CAPACITY);
         let handle = tokio::spawn(async move {
-            memory_worker(rx, no_drain(), Replay::none(), store, cell, chat_chunker, code_chunker).await;
+            memory_worker(rx, no_drain(), Replay::none(), store, cell, chat_chunker).await;
         });
         (tx, handle)
     }

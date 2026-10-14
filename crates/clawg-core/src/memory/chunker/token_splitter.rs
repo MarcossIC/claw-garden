@@ -1,9 +1,7 @@
 //! Token-cap splitting helper with configurable overlap.
 //!
-//! Knows NOTHING about chat speakers OR AST. Both `ChatChunker` (after speaker
-//! boundary) and `CodeChunker` (degraded fallback for unknown languages or parse
-//! failures) feed text through here. Decouples the cap policy from upstream
-//! semantic split.
+//! Knows NOTHING about chat speakers. `ChatChunker` feeds each speaker turn
+//! through here. Decouples the cap policy from upstream semantic split.
 
 use std::sync::Arc;
 
@@ -87,7 +85,7 @@ impl TokenSplitter {
                 let end_byte = offsets[end - 1].1;
                 // Safe: tokenizers guarantees offsets land on char boundaries.
                 let slice = &text[start_byte..end_byte];
-                Chunk { text: slice.to_string(), token_count: end - start, header: None }
+                Chunk { text: slice.to_string(), token_count: end - start }
             })
             .collect()
     }
@@ -114,7 +112,7 @@ impl TokenSplitter {
                 // so emit that character whole rather than an empty window.
                 e = ceil_char_boundary(text, s + 1).min(n);
             }
-            out.push(Chunk { text: text[s..e].to_string(), token_count: 0, header: None });
+            out.push(Chunk { text: text[s..e].to_string(), token_count: 0 });
             if e == n {
                 break;
             }
@@ -498,7 +496,7 @@ mod tests {
 
     #[test]
     fn split_never_emits_an_empty_chunk_when_the_stride_rounds_past_the_tail() {
-        // With overlap 0 (what `CodeChunker` passes) the stride equals the
+        // With overlap 0 (what the rollback lever sets) the stride equals the
         // cap, so the next start is `ceil_char_boundary(s + max_b)`. When the
         // bytes left over after the cap are fewer than one whole character,
         // that ceil rounds the start onto `text.len()` itself and the window
@@ -669,11 +667,10 @@ mod tests {
 
     #[test]
     fn split_multibyte_with_zero_overlap_still_loses_no_bytes() {
-        // overlap = 0 is what `CodeChunker` passes and what the rollback lever
-        // sets. The stride then equals the cap, so the next start is the
-        // CEIL of the same index the window end was FLOORED to — the two
-        // round in opposite directions and the character between them is the
-        // one at risk of falling through the gap.
+        // overlap = 0 is what the rollback lever sets. The stride then equals
+        // the cap, so the next start is the CEIL of the same index the window
+        // end was FLOORED to — the two round in opposite directions and the
+        // character between them is the one at risk of falling through the gap.
         let splitter = TokenSplitter::fallback();
         for prefix in ["", "a", "ab", "abc"] {
             let content = unique_cjk(prefix, 2200);

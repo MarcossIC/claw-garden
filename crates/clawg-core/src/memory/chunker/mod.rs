@@ -1,11 +1,9 @@
 //! Chunker selector + shared types.
 
 pub(crate) mod chat;
-pub(crate) mod code;
 pub(crate) mod token_splitter;
 
 pub use chat::ChatChunker;
-pub use code::CodeChunker;
 
 use crate::models::chat::Role;
 
@@ -42,14 +40,6 @@ const _: () = assert!(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChunkerKind {
     Chat,
-    /// Never returned by `select_chunker` today: every event reaches the worker
-    /// through `push_and_persist`, which carries chat turns, and a chat turn is
-    /// never routed here. Reaching this variant needs a producer that ingests
-    /// files — a watcher emitting `MemorySource::CodeFile` — which does not
-    /// exist. The worker's match arm is kept so that producer can be added
-    /// without reopening the worker.
-    #[allow(dead_code)]
-    Code,
     /// Worker drops the event without inserting.
     Skip,
 }
@@ -64,24 +54,6 @@ pub struct Chunk {
     /// splitter already counted.
     #[allow(dead_code)]
     pub token_count: usize,
-    /// Optional header describing context (e.g. "fn foo (rust)") — currently
-    /// populated by code.rs. None for chat chunks.
-    pub header: Option<String>,
-}
-
-/// Error type for chunking operations.
-///
-/// Unused at runtime: the only chunker the worker reaches is the chat one,
-/// which cannot fail — it splits on speaker turns, never parses. These
-/// variants describe failures of the code path (tree-sitter parse, tokenizer
-/// init), which no producer exercises yet.
-#[allow(dead_code)]
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum ChunkerError {
-    #[error("{0}")]
-    ParseFailed(String),
-    #[error("tokenizer init failed: {0}")]
-    TokenizerInit(String),
 }
 
 /// Route an event to its chunker. Pure function — no I/O.
@@ -134,30 +106,6 @@ mod tests {
     #[test]
     fn select_chunker_system_routes_to_skip() {
         assert_eq!(select_chunker(Role::System, None, "system prompt"), ChunkerKind::Skip);
-    }
-
-    #[test]
-    fn chat_chunk_has_no_header() {
-        let c = Chunk { text: "hi".into(), token_count: 1, header: None };
-        assert_eq!(c.header, None);
-    }
-
-    #[test]
-    fn code_chunk_has_header() {
-        let c = Chunk { text: "fn foo() {}".into(), token_count: 5, header: Some("fn foo".into()) };
-        assert!(c.header.is_some());
-    }
-
-    #[test]
-    fn chunker_error_implements_error_trait() {
-        let _: Box<dyn std::error::Error> = Box::new(ChunkerError::ParseFailed("x".into()));
-    }
-
-    #[test]
-    fn chunker_error_parse_failed_displays_message() {
-        let e = ChunkerError::ParseFailed("syntax error".into());
-        let s = format!("{e}");
-        assert!(s.contains("syntax error"), "got: {s}");
     }
 
     // TokenSplitter's own behavior is covered in token_splitter.rs; these two
