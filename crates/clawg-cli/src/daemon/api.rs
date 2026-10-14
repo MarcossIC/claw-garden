@@ -27,7 +27,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clawg_core::memory::admin::{
     delete_memory_core, get_memory_core, list_memories_core, memory_stats_core, query_has_tokens,
-    set_importance_core, ListParams, MemoryAdminRow, MemoryKind, MemoryStats, StatsParams,
+    update_memory_core, ListParams, MemoryAdminRow, MemoryKind, MemoryPatch, MemoryStats, StatsParams,
 };
 use clawg_core::memory::backup::Reason;
 use clawg_core::memory::bootstrap::EmbedderStatus;
@@ -889,17 +889,15 @@ async fn patch_importance(
     Json(body): Json<ImportanceRequest>,
 ) -> ApiResult<Json<UpdatedBody>> {
     let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
-    let updated = set_importance_core(&app.runtime.store, id, kind, body.importance, owner.agent.as_deref())
-        .await
-        .map_err(ApiError::internal)?;
-
-    // The core answers 0 for "no such row", "already soft-deleted" and
+    let patch = MemoryPatch::new(kind, Some(body.importance), None).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    // The core answers `None` for "no such row", "already soft-deleted" and
     // "another agent's" alike, and from the caller's side those are the same
     // fact: the row it named is not there to change.
-    if updated == 0 {
-        return Err(ApiError::not_found(format!("no {kind:?} row with id {id}")));
-    }
-    Ok(Json(UpdatedBody { updated }))
+    update_memory_core(&app.runtime.store, id, kind, &patch, owner.agent.as_deref())
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("no {kind:?} row with id {id}")))?;
+    Ok(Json(UpdatedBody { updated: 1 }))
 }
 
 async fn delete_memory(
