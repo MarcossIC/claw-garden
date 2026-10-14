@@ -1607,3 +1607,26 @@ async fn registering_a_root_indexes_its_docs_in_the_background() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+#[tokio::test]
+async fn a_search_during_the_first_index_waits_for_it() {
+    let h = Harness::start().await;
+    let (_dir, id) = project_with_docs(&h, &[("a.md", "# A\nfound after the wait\n")]).await;
+    let running = h.ctx.runtime.project_docs.begin(&id).expect("no refresh is running yet");
+    let store = h.ctx.runtime.store.clone();
+    let project = id.clone();
+    let indexer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let elsewhere = Arc::new(clawg_core::memory::project_docs::DocIndex::default());
+        elsewhere.try_refresh(&store, &FakeEmbedder::default(), None, &project).await.unwrap();
+        drop(running);
+    });
+
+    let (status, body) = h.post_json("/v1/projects/docs/search", json!({ "project_id": id, "query": "wait" })).await;
+
+    indexer.await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["indexing"], false, "{body}");
+    assert_eq!(body["docs"], 1);
+    assert_eq!(body["hits"][0]["text"], "found after the wait");
+}
