@@ -1,14 +1,14 @@
 change: project-indexing
 objective: "3"
 depends_on: [eval-golden-expansion]
-phase: tasks
+phase: verify
 artifacts:
   exploration: done
   proposal: done
   spec: done
   design: done
   tasks: done
-  apply: pending
-  verify: pending
+  apply: done
+  verify: partial  # Linux; Windows, calibration on the golden set, rag-eval --diff and the dev profile pending, see verify.md
   archive: pending
-updated: 2026-10-14
+updated: 2026-10-15

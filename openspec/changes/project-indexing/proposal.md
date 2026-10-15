@@ -16,15 +16,17 @@ El objetivo 3, indexar proyectos para que la IA entienda cómo funciona cada uno
 
 **Qué significa "entender cómo funciona".** Poder contestar una pregunta en lenguaje natural sobre el proyecto ("¿qué pasa con los saves si paro el daemon?", "¿cómo se elige el perfil?") con el pasaje de la documentación del propio proyecto que la responde, aunque la pregunta no use sus palabras. Las 10 preguntas del golden set de docs (ver **Éxito**) son la definición operativa.
 
-**Opción b: conocimiento del proyecto, troceado por encabezado.** Se indexan los Markdown del repo (README, `docs/`, `CLAUDE.md`, ADRs, specs) y los manifiestos (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`).
+**Opciones b y a: la documentación troceada por encabezado y el código troceado con cAST** (elegida por Marcos en la tarjeta de decisión, opción "Docs + código cAST"). Se indexan los Markdown del repo (README, `docs/`, `CLAUDE.md`, ADRs, specs), los manifiestos (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`) y el código Rust, Python y TypeScript, en el mismo índice.
 
-- **a** (código crudo con cAST) queda condicionada a medir: el golden set de docs de este cambio es la base para comparar, y e5-small no está medido sobre código. Si alguna vez se elige, el algoritmo de troceo se escribe de cero (la exploración ya lo dejó dicho), así que el chunker muerto no se conserva para eso.
+- **a** se construye sin medir antes a e5-small sobre código, como dice la opción elegida. El troceo se escribe de cero con el algoritmo cAST (dividir el árbol de arriba abajo y juntar los nodos chicos vecinos hasta el tope, medido en caracteres no blancos) y una cabecera de contexto con la ruta y las firmas de los contenedores. Del chunker muerto sólo se reusan los parsers de tree-sitter, que vuelven como dependencias.
 - **c** (mapa generado por LLM) depende de un proveedor que no existe, por la misma razón que knowledge-synthesis descartó la opción b.
 - **d** (mapa de símbolos) ya está descartada en la exploración.
 
 **El índice va en tablas propias, derivadas y reconstruibles** (decisión ya cerrada en la exploración). No pasa por `save_memory`, no tiene tiers, decaimiento ni disputas, y borrarlo o reconstruirlo no toca una sola memoria.
 
 **Se sirve con una herramienta propia, `search_project`, no dentro de `recall_context`.** `search_memory` y `recall_context` no cambian, así que el índice no puede desplazar memorias de sus resultados. Sumar pasajes de docs a `recall_context` necesita un piso de relevancia calibrado para docs, y el piso de coseno actual (0,8793) está calibrado sobre memorias. Queda como seguimiento, con el golden set de docs como base para calibrarlo.
+
+**Pooling mean para todo el store.** Al medir la primera versión (Hit@3 0,20 en docs) apareció la causa: el embedder cargaba e5-small sin indicar pooling y fastembed tomaba el token CLS, mientras que e5 se entrena con mean. Todos los pasajes quedaban a 0,90–0,91 de coseno de cualquier pregunta. Antes de abrir el PR se midieron modelos más grandes y un reranker (opción "Investigar antes"); ninguno llegó al umbral y el pooling mean dio la mayor mejora por costo. Marcos eligió corregirlo para las memorias también ("Pooling en todo"), con el re-embebido de los vectores guardados al arrancar el daemon, después de un snapshot ("Solo al arrancar"). Los umbrales calibrados sobre CLS se mueven a valores provisionales y se recalibran con el golden set de memorias.
 
 **Invalidación por hash del contenido de cada archivo** (decisión ya cerrada en la exploración), con refresco al registrar la raíz y antes de buscar si pasó un intervalo.
 
@@ -35,11 +37,15 @@ El objetivo 3, indexar proyectos para que la IA entienda cómo funciona cada uno
 3. **Índice** (`clawg-core`): migración `V11__project_docs.sql` con tres tablas nuevas; refresco incremental por hash, con los secretos enmascarados antes de trocear, y búsqueda híbrida (vectores + FTS5) dentro del proyecto.
 4. **Daemon** (`clawg-cli`): el registro de una raíz lanza un refresco en segundo plano; `POST /v1/projects/docs/search` refresca si hace falta y busca.
 5. **MCP** (`clawg-cli`): herramienta `search_project`, y las instrucciones del servidor dicen cuándo usarla.
-6. **Medición** (`clawg-eval`): `rag-eval --docs`, que indexa una raíz y puntúa un golden set de preguntas sobre sus docs.
+6. **Medición** (`clawg-eval`): `rag-eval --docs`, que indexa una raíz y puntúa un golden set de preguntas sobre sus docs y su código, con números aparte para cada uno.
+7. **Código** (`clawg-core`, puro): `chunk_code` con cAST para Rust, Python, TypeScript y TSX; el corpus suma esas extensiones y el resto del índice no cambia.
+8. **Pooling** (`clawg-core`): e5-small con pooling mean y su id propio en el contrato; el bootstrap del daemon re-embebe un store de vectores CLS después de un snapshot `pre-reembed`; los umbrales de similitud pasan a valores provisionales sobre la distribución nueva.
 
 ## Fuera de alcance
 
-- Indexar código fuente (opción a) o generar mapas con LLM (opción c).
+- Generar mapas con LLM (opción c) o un mapa de símbolos (opción d).
+- Otros lenguajes de código (Go, Java, C#…). Se suman con su gramática de tree-sitter sin cambiar el esquema.
+- Un embedder de código, o cambiar de modelo. Se midieron e5-base, e5-large y un reranker (bge-reranker-v2-m3): ninguno llega al umbral y cuestan de 2 a 30 veces más (ver `verify.md`).
 - Pasajes de docs dentro de `recall_context` o de `search_memory`.
 - Un watcher del filesystem. El refresco es por demanda y por intervalo.
 - Búsqueda de docs entre proyectos (`all_projects`): un pasaje sólo tiene sentido dentro de su repo.
@@ -66,7 +72,9 @@ El objetivo 3, indexar proyectos para que la IA entienda cómo funciona cada uno
 | MRR | ≥ 0,50 |
 | Tiempo del primer indexado de este repo | se reporta, sin umbral |
 
-`rag-eval --real --diff` y `--agent-view --diff` contra el baseline de memorias: diff vacío, porque la búsqueda de memorias no cambia.
+Además, 5 preguntas sobre el código de este repo, con la ruta del archivo que las responde. Para ellas Hit@3 y MRR se reportan aparte y sin umbral: e5-small no está medido sobre código y este cambio es la primera medición.
+
+`rag-eval --real --diff` y `--agent-view --diff` contra el baseline de memorias: con el pooling mean los vectores cambian, así que el diff ya no es vacío. Después de recalibrar los umbrales (R15) ninguna métrica puede bajar:
 
 | Métrica | Hoy | Umbral |
 |---|---|---|
@@ -78,10 +86,11 @@ El objetivo 3, indexar proyectos para que la IA entienda cómo funciona cada uno
 - **Esquema:** una migración aditiva, `V11__project_docs.sql`, con `project_doc_file`, `project_doc_chunk`, `project_doc_vectors` (vec0 con `project_id` como partition key) y `project_doc_fts` (FTS5). No toca ninguna tabla existente. `MemoryStore::open` ya guarda un snapshot `pre-migration` antes de aplicarla (`specs/storage`).
 - **Identificadores y estados:** no cambian. El índice usa el `project_id` que ya deriva `ProjectIdentity::resolve` y la raíz que ya guarda `project`.
 - **Memorias:** ninguna fila de `memory`, `episodic_trajectory` ni `procedural_skill` se lee, escribe ni borra al indexar o buscar docs.
+- **Vectores de las memorias:** el primer arranque con esta versión re-embebe los tres tipos de memoria con pooling mean y cambia el `model_id` del contrato a `multilingual-e5-small/mean`. El texto y el resto de cada fila no cambian. Antes escribe un snapshot `pre-reembed`.
 - **Datos de la versión anterior:** un test siembra memorias en una base en V10, la abre con la migración nueva y prueba que siguen idénticas y alcanzables, y que las tablas del índice existen vacías.
 - **Backups:** los snapshots copian la base entera, así que incluyen el índice. Crece con el tamaño de los docs (del orden de 2 KB por pedazo más su vector de 1,5 KB).
 - **Rollback:** una versión anterior rechaza la base sin tocarla (`SchemaNewer`). Hay dos vueltas atrás documentadas:
-  - `clawg restore` del snapshot `pre-migration`: pierde lo guardado después de actualizar;
+  - `clawg restore` del snapshot `pre-migration` (o del `pre-reembed`, que ya tiene V11 pero los vectores CLS): pierde lo guardado después de actualizar;
   - sin pérdida: con el daemon parado, `DROP TABLE project_doc_fts; DROP TABLE project_doc_vectors; DROP TABLE project_doc_chunk; DROP TABLE project_doc_file; DELETE FROM refinery_schema_history WHERE version = 11;`. Ninguna memoria depende de esas tablas.
 
 ## Riesgos
@@ -93,5 +102,10 @@ El objetivo 3, indexar proyectos para que la IA entienda cómo funciona cada uno
 | El índice queda viejo mientras se edita un doc | Media | Refresco por hash antes de cada búsqueda si pasó el intervalo; un archivo sin cambios no se re-embebe |
 | Un secreto escrito en un doc entra al índice | Baja | Se enmascara con el mismo `redact` de la ingesta antes de trocear, embeber e indexar |
 | Indexar compite con los saves por CPU | Baja | Un solo refresco por proyecto a la vez, por archivos; la ingesta y la búsqueda de memorias no esperan al índice |
+| e5-small no separa bien pasajes de código, ni de docs cuando la pregunta no usa sus palabras | Alta (medido en docs: Hit@3 0,20) | El canal léxico encuentra identificadores exactos; `rag-eval --docs` reporta docs y código por separado para decidir con números si hace falta otro modelo o un reranker |
+| El código multiplica los pasajes y el primer indexado tarda | Media | Mismos topes de archivos y bytes; el refresco es incremental por hash, así que sólo el primero cuesta |
 | Otro cambio agrega una migración `V11` antes que éste | Baja | memory-update-tool no necesita esquema. Si otro llega primero, se renumera el archivo y la fila de `published_migration_checksums_are_pinned` |
+| Re-embeber un store grande deja la memoria en `loading` mucho rato en el primer arranque | Media | Pasa una sola vez; el estado lo dice y el README lo explica. En este entorno e5-small embebe unos 6,5 pasajes de hasta 480 tokens por segundo (4.312 en 657 s); las memorias son más cortas |
+| Los umbrales provisionales ordenan peor que los de CLS | Media | Salen de la misma posición en la distribución nueva; quedan marcados como provisionales y se recalibran con el golden set antes de salir del draft |
+| Un binario viejo abre un store ya re-embebido | Baja | Ve otro `model_id` y deshabilita la memoria (mismatch) sin tocar nada; volver atrás es restaurar el `pre-reembed` |
 | Un daemon viejo recibe `search_project` | Baja | `POST /v1/projects/docs/search` da 404 y el puente pide reiniciar el daemon, como con `synthesize` |

@@ -9,6 +9,7 @@ crates/clawg-core/src/memory/project_docs/
   mod.rs      DocIndex (refresco y búsqueda, con I/O), plan_refresh y fuse (puros)
   corpus.rs   classify (pura) y walk (I/O: recorre la raíz)
   chunk.rs    chunk_markdown y chunk_manifest (puras, con un TokenSplitter)
+  code.rs     chunk_code con cAST (pura, con tree-sitter y un TokenSplitter)
 crates/clawg-core/migrations/V11__project_docs.sql
 crates/clawg-cli/src/daemon/api.rs           POST /v1/projects/docs/search; el registro lanza un refresco
 crates/clawg-cli/src/client.rs               DaemonClient::search_docs
@@ -163,3 +164,45 @@ La alternativa, dejar el chunker para una futura opción a, conserva un `#[allow
 El golden set de docs se versiona en `crates/clawg-eval/golden/project-docs.json` porque pregunta sobre los docs públicos de este repo, a diferencia de `docs/eval/golden.json`, que tiene memorias reales y está en `.gitignore`. La validación rechaza un `expected` que el corpus no tiene, así un doc renombrado rompe la medición en vez de bajarla en silencio.
 
 Las preguntas se escriben sin las palabras del pasaje esperado (si la respuesta dice "volcado", la pregunta no dice "volcado"), para medir sentido y no coincidencia léxica. `verify.md` lista cada pregunta con el pasaje que la responde.
+
+## D9. Código con cAST
+
+La opción elegida suma el código al mismo índice. Se reusan las tablas, el refresco, la búsqueda y `search_project`: un pasaje de código es una fila más de `project_doc_chunk`, con su breadcrumb y su cuerpo. El tipo de archivo se deduce de la ruta (R2), así que no hace falta columna nueva ni migración.
+
+| Opción de troceo | A favor | En contra |
+|---|---|---|
+| **a. cAST: de arriba abajo, juntando hermanos chicos hasta el tope en caracteres no blancos** | Lo que mide el paper; no corta una función por la mitad si entra; los `use` y los doc comments quedan con su código | Un pasaje puede juntar varias funciones chicas |
+| b. Una definición por pasaje | El breadcrumb nombra la función | Miles de pasajes de 3 líneas; los `use`, constantes y comentarios sueltos quedan solos |
+| c. Ventana fija de tokens | Ya existe | Corta funciones por la mitad, justo lo que el chunking AST viene a evitar |
+
+**Elegida a.** Detalles:
+
+- **Tope en caracteres no blancos, 1.200.** El paper usa hasta 2.000, pero e5-small trunca a 512 tokens y el código tokeniza en pedazos chicos. Igual cada pasaje pasa después por el tope de tokens de R3, así que un pasaje que se pase se parte con solapamiento en vez de truncarse en silencio.
+- **El texto es el rango del archivo** desde el primer nodo hasta el último del pedazo, no la concatenación de nodos: así quedan los comentarios y las líneas en blanco entre ellos, y el pasaje se lee como en el editor.
+- **Cabecera de contexto = breadcrumb.** La ruta y la primera línea de cada contenedor en el que se bajó (`impl DocIndex`, `class UserService`, `mod tests`), sin el cuerpo. Es lo que el vector y el agente necesitan para saber dónde está el pedazo. No se suman los imports: alargan cada pasaje y el agente los tiene a un `read` de distancia.
+- **Lenguajes:** Rust, Python, TypeScript y TSX, las gramáticas que el chunker muerto ya traía. `tree-sitter` y sus gramáticas vuelven como dependencias, ahora con uso.
+- **Parsers:** uno por llamada. Crear un `Parser` es barato frente a embeber, y así `chunk_code` es pura y no necesita un `Mutex`.
+- **Errores de sintaxis:** tree-sitter recupera y devuelve un árbol con nodos `ERROR`; se trocea igual. Sólo si no devuelve árbol se cae al `TokenSplitter` sobre el archivo entero.
+
+## D10. Pooling mean y re-embebido al arrancar
+
+Medido sobre las 10 preguntas de docs, el mismo e5-small con pooling mean sube MRR@10 de 0,16 a 0,29 sin tocar nada más; los modelos más grandes y el reranker que se probaron antes no superan eso por lo que cuestan (ver `verify.md`). El pooling vale para todo el store, así que Marcos eligió aplicarlo también a las memorias, y re-embeberlas al arrancar.
+
+| Opción para los vectores guardados | A favor | En contra |
+|---|---|---|
+| **a. El daemon re-embebe al arrancar, después de un snapshot** | Nadie corre nada a mano; el contrato escrito al final garantiza que no se mezclan espacios | El primer arranque tarda lo que tarde re-embeber el store, con la memoria en `loading` |
+| b. Un comando `clawg reembed` | El usuario elige cuándo | Hasta correrlo la memoria queda deshabilitada |
+| c. Re-embeber en segundo plano con la memoria habilitada | Sin espera | Mezcla vectores de dos espacios durante el re-embebido |
+
+**Elegida a** (tarjeta "Solo al arrancar"). Detalles:
+
+- **El id del modelo nombra el pooling** (`multilingual-e5-small/mean`). El contrato no tiene columna de pooling y agregarla sería una migración; el id ya es lo que distingue espacios, y el índice de docs ya reindexa cuando cambia.
+- **Sólo este cambio se repara solo.** `is_pooling_upgrade` exige el id CLS guardado, el id mean actual y dimensión y prefijos iguales. Cualquier otro mismatch es un cambio que este binario no sabe nombrar y sigue siendo la parada segura de siempre.
+- **El seam de verificación recibe el embedder**, no sólo su identidad (`ContractVerifyFn = Fn(Arc<dyn Embedder>)`), porque re-embeber lo necesita. Los tests que inyectan un verificador falso no usaban el argumento.
+- **`production_deps(store, backups)`**: el snapshot va a `<data>/backups` con el motivo nuevo `pre-reembed`, que se poda como los demás automáticos.
+- **El contrato se escribe al final** (`reembed_all` ya lo hacía): si una fila falla, el contrato queda CLS, la memoria sigue deshabilitada y el próximo arranque reintenta; las filas ya hechas dan los mismos bytes.
+- **El estado queda `loading`** porque la verificación corre dentro del bootstrap, que publica `loading` antes de empezar y `ready` sólo con la celda llena.
+
+## D11. Umbrales provisionales
+
+El golden set de memorias (`docs/eval/golden.json`) no está en este entorno, así que los umbrales se movieron con un proxy medido acá y quedan marcados como provisionales en su comentario. Con el piso viejo, el 91 % de los top-10 con mean quedaría bajo 0,8793 y el término de coseno valdría 0: no moverlo rompe el ranking. Los valores salen de mantener la misma posición en la distribución (percentil 5 para el piso) o la misma separación entre clases (contradicción y casi-duplicado). La calibración real es `rag-eval --real --audit`, `--sweep-cos-floor` y el sweep de contradicciones sobre el golden set, en la máquina de Marcos.
