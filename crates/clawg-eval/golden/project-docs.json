@@ -1,0 +1,88 @@
+[
+  {
+    "id": "d01",
+    "question": "el build falla porque en la máquina conviven dos toolchains del lenguaje, ¿cómo hago que use el compilador correcto?",
+    "expected": [
+      {"path": "README.md", "heading": "Si tenés dos Rust instalados"},
+      {"path": "README.md", "heading": "Si algo falla"}
+    ]
+  },
+  {
+    "id": "d02",
+    "question": "how do I remove the program from my computer, and does that also wipe what it remembered?",
+    "expected": [{"path": "README.md", "heading": "Desinstalar"}]
+  },
+  {
+    "id": "d03",
+    "question": "el cliente pasó a presentarse con otro nombre y desaparecieron los recuerdos de antes",
+    "expected": [{"path": "README.md", "heading": "Fijar la identidad del agente"}]
+  },
+  {
+    "id": "d04",
+    "question": "¿con qué comandos reviso lo que almacenaron los agentes, sin alterar nada?",
+    "expected": [{"path": "README.md", "heading": "Ver lo que se guarda"}]
+  },
+  {
+    "id": "d05",
+    "question": "which folder and port does each environment use, and can a debug binary reach the production data?",
+    "expected": [
+      {"path": "AGENTS.md", "heading": "Data profiles"},
+      {"path": ".claude/CLAUDE.md", "heading": "Data profiles"},
+      {"path": ".gemini/GEMINI.md", "heading": "Data profiles"},
+      {"path": "README.md", "heading": "Perfiles y datos"}
+    ]
+  },
+  {
+    "id": "d06",
+    "question": "¿en qué orden se redactan los documentos de una mejora antes de programarla?",
+    "expected": [{"path": "openspec/README.md", "heading": "Cómo se trabaja un cambio"}]
+  },
+  {
+    "id": "d07",
+    "question": "two checkouts of one repository in separate folders made with git worktree: do they count as the same project?",
+    "expected": [
+      {"path": "openspec/specs/project/spec.md", "heading": "R1. Resolución de la raíz"},
+      {"path": "openspec/changes/archive/2026-10-12-project-identity/spec.md", "heading": "R1. Resolución de la raíz"}
+    ]
+  },
+  {
+    "id": "d08",
+    "question": "¿qué contesta el servidor cuando le llegan más guardados de los que puede aceptar en ese momento?",
+    "expected": [{"path": "openspec/specs/ingest/spec.md", "heading": "Cola acotada"}]
+  },
+  {
+    "id": "d09",
+    "question": "si cierro el servidor mientras todavía procesa lo recibido, ¿se pierde algo?",
+    "expected": [{"path": "openspec/specs/storage/spec.md", "heading": "Ningún evento aceptado se pierde en un apagado ordenado"}]
+  },
+  {
+    "id": "d10",
+    "question": "after updating, my editor can no longer talk to the memory server; what should I do?",
+    "expected": [{"path": "README.md", "heading": "Si algo falla"}]
+  },
+  {
+    "id": "c01",
+    "question": "¿dónde se elige el entorno de datos a partir de la línea de comandos, una variable y si el binario es de depuración?",
+    "expected": [{"path": "crates/clawg-core/src/paths.rs"}]
+  },
+  {
+    "id": "c02",
+    "question": "where are API keys and passwords hidden before text is stored?",
+    "expected": [{"path": "crates/clawg-core/src/memory/redact.rs"}, {"path": "crates/clawg-core/src/memory/secrets.rs"}]
+  },
+  {
+    "id": "c03",
+    "question": "¿qué guarda en disco lo que no alcanzó a procesarse al apagar, para retomarlo en el próximo arranque?",
+    "expected": [{"path": "crates/clawg-core/src/memory/spill.rs"}]
+  },
+  {
+    "id": "c04",
+    "question": "how does it tell that a linked checkout shares the folder of its parent repository?",
+    "expected": [{"path": "crates/clawg-core/src/memory/identity.rs"}]
+  },
+  {
+    "id": "c05",
+    "question": "¿qué código sube o baja la temperatura de un recuerdo según cuánto se usa?",
+    "expected": [{"path": "crates/clawg-core/src/memory/tier.rs"}, {"path": "crates/clawg-core/src/memory/access.rs"}]
+  }
+]

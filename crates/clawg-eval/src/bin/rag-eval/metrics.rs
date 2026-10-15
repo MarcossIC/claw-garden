@@ -87,10 +87,10 @@ pub fn ndcg_at_10(ranked: &[String], expected: &HashSet<String>) -> f64 {
     ndcg_at_k(ranked, expected, 10)
 }
 
-/// The seven L2 thresholds the contradiction sweep reports at. `0.20` is the
-/// value the production detector compares against today; the rest exist to
-/// show whether that choice sits on a plateau or a cliff.
-pub const SWEEP: [f64; 7] = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40];
+/// The seven L2 thresholds the contradiction sweep reports at, around the
+/// production detector's `CONTRADICTION_THRESHOLD` (0.42), to show whether
+/// that choice sits on a plateau or a cliff.
+pub const SWEEP: [f64; 7] = [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50];
 
 /// One row of the contradiction threshold sweep. `Serialize` is derived here
 /// (added when the results-JSON writer was wired up) rather than re-derived
@@ -439,12 +439,6 @@ mod tests {
         // Sweep uses `distance <= threshold`. Per threshold t, each column is
         // (count of bucket values <= t) / (bucket size):
         //
-        // t=0.10: contradiction {0.05<=t}            -> 1/3
-        //         no_contradiction {}                -> 0/2 = 0.0
-        //         identical {0.02<=t}                -> 1/1 = 1.0
-        // t=0.15: contradiction {0.05}                -> 1/3   (0.18, 0.30 still over)
-        //         no_contradiction {}                -> 0.0
-        //         identical {0.02}                    -> 1.0
         // t=0.20: contradiction {0.05, 0.18}          -> 2/3
         //         no_contradiction {}                -> 0.0
         //         identical {0.02}                    -> 1.0
@@ -458,23 +452,27 @@ mod tests {
         //         no_contradiction {0.25}             -> 0.5
         //         identical {0.02}                    -> 1.0
         // t=0.40: contradiction all <= t              -> 1.0
-        //         no_contradiction {0.25}             -> 0.5 (0.45 still over)
+        //         no_contradiction {0.25}             -> 0.5 (0.48 still over)
+        //         identical {0.02}                    -> 1.0
+        // t=0.45: same as 0.40
+        // t=0.50: contradiction all <= t              -> 1.0
+        //         no_contradiction {0.25, 0.48}       -> 1.0
         //         identical {0.02}                    -> 1.0
         let contradiction = vec![0.05, 0.18, 0.30];
-        let no_contradiction = vec![0.25, 0.45];
+        let no_contradiction = vec![0.25, 0.48];
         let identical = vec![0.02];
 
         let rows = threshold_curve(&contradiction, &no_contradiction, &identical);
         assert_eq!(rows.len(), 7, "one row per SWEEP threshold");
 
         let expected_rows = [
-            (0.10, 1.0 / 3.0, 0.0, 1.0),
-            (0.15, 1.0 / 3.0, 0.0, 1.0),
             (0.20, 2.0 / 3.0, 0.0, 1.0),
             (0.25, 2.0 / 3.0, 0.5, 1.0),
             (0.30, 1.0, 0.5, 1.0),
             (0.35, 1.0, 0.5, 1.0),
             (0.40, 1.0, 0.5, 1.0),
+            (0.45, 1.0, 0.5, 1.0),
+            (0.50, 1.0, 1.0, 1.0),
         ];
 
         for (row, (t, recall, fpr_no_c, fpr_identical)) in rows.iter().zip(expected_rows) {
