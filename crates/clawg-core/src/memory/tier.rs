@@ -3,9 +3,10 @@
 /// The two directions are deliberately separate functions, not one that reads
 /// a signed delta: [`compute_tier`] is **promote-only** — it never returns a
 /// tier number greater than `current` (lower numbers = higher tier) — and
-/// [`demote_inactive`] is the only thing in this codebase that lowers one. A
-/// single function would let an access event demote a row, which is exactly
-/// backwards.
+/// [`demote_inactive`] is the only thing that lowers one on its own. A single
+/// function would let an access event demote a row, which is exactly
+/// backwards. [`retier`] is the one other way down, and only on request: a
+/// correction takes away the tier the corrected field was giving.
 
 use crate::memory::MemoryError;
 
@@ -99,6 +100,32 @@ pub(crate) fn demote_inactive(
         }
         // No condition met — return current unchanged.
         _ => current_tier,
+    }
+}
+
+/// The tier a row keeps after someone changes its importance or type from
+/// `before` to `after` (each an `(importance, memory_type)` pair, with the
+/// table literal standing in for the type outside `memory`).
+///
+/// A change that takes away what the rules were awarding drops the row to
+/// what they still award, but never above a tier it already lost to
+/// inactivity. A tier better than the rules ever awarded came from somewhere
+/// else (rows the desktop app wrote), so the change did not give it and does
+/// not take it. Anything else is an ordinary promotion.
+pub(crate) fn retier(
+    current: i64,
+    access_count: i64,
+    before: (f64, &str),
+    after: (f64, &str),
+) -> i64 {
+    let earned_before = compute_tier(3, before.0, access_count, before.1);
+    let earned_after = compute_tier(3, after.0, access_count, after.1);
+    if earned_after <= earned_before {
+        compute_tier(current, after.0, access_count, after.1)
+    } else if current < earned_before {
+        current
+    } else {
+        current.max(earned_after)
     }
 }
 
@@ -264,6 +291,51 @@ mod tests {
     }
 
     // ── demote_inactive truth table ─────────────────────────────────────────
+
+    // ── retier ──
+
+    #[test]
+    fn lowering_the_importance_that_gave_tier_1_takes_it_away() {
+        assert_eq!(retier(1, 1, (9.5, "semantic_fact"), (2.0, "semantic_fact")), 3);
+    }
+
+    #[test]
+    fn lowering_to_a_value_that_still_earns_the_tier_keeps_it() {
+        assert_eq!(retier(1, 1, (9.5, "semantic_fact"), (9.0, "semantic_fact")), 1);
+    }
+
+    #[test]
+    fn a_tier_earned_by_access_survives_lowering_the_importance() {
+        assert_eq!(retier(1, 3, (9.5, "architectural_decision"), (2.0, "architectural_decision")), 1);
+    }
+
+    #[test]
+    fn a_lost_tier_falls_only_to_what_the_rest_still_earns() {
+        assert_eq!(retier(1, 1, (9.5, "architectural_decision"), (2.0, "architectural_decision")), 2);
+    }
+
+    #[test]
+    fn a_type_that_gave_tier_1_takes_it_with_it() {
+        assert_eq!(retier(1, 1, (5.0, "user_preference"), (5.0, "semantic_fact")), 3);
+    }
+
+    #[test]
+    fn a_tier_the_rules_never_gave_survives_any_change() {
+        assert_eq!(retier(1, 1, (5.0, "semantic_fact"), (3.0, "semantic_fact")), 1);
+        assert_eq!(retier(1, 1, (5.0, "semantic_fact"), (5.0, "chat_message")), 1);
+        assert_eq!(retier(2, 1, (5.0, "episodic_trajectory"), (1.0, "episodic_trajectory")), 2);
+    }
+
+    #[test]
+    fn a_tier_lost_to_inactivity_is_not_given_back_by_lowering() {
+        assert_eq!(retier(3, 1, (9.5, "architectural_decision"), (2.0, "architectural_decision")), 3);
+    }
+
+    #[test]
+    fn raising_still_promotes() {
+        assert_eq!(retier(3, 1, (5.0, "semantic_fact"), (9.0, "semantic_fact")), 1);
+        assert_eq!(retier(3, 1, (5.0, "semantic_fact"), (5.0, "user_preference")), 1);
+    }
 
     // Tier 1 → 2 when days > 90 AND importance < 9.0.
 

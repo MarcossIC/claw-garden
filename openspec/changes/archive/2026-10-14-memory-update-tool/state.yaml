@@ -1,0 +1,15 @@
+change: memory-update-tool
+objective: "1"
+depends_on: [visibility-policy]
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done
+  archive: done
+main_spec: openspec/specs/update/spec.md
+updated: 2026-10-14

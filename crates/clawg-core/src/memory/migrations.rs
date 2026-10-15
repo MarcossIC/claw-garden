@@ -52,7 +52,8 @@ mod tests {
             (8, "memory_fts", 11218029035149072530),
             (9, "project", 13889070755435575427),
             (10, "synthesis", 11323399618604098430),
-            (11, "project_docs", 14465737833642860608),
+            (11, "memory_piece", 17416414387852420399),
+            (12, "project_docs", 4316694144498173558),
         ];
         let mut actual: Vec<(i32, String, u64)> = runner()
             .get_migrations()

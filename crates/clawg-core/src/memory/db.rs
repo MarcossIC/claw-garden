@@ -655,7 +655,7 @@ mod tests {
 
         let after = conn.call(snapshot).await.unwrap();
         assert_eq!(before, after);
-        assert_eq!(after.0, 11);
+        assert_eq!(after.0, 12);
     }
 
     /// Rows written before `project` existed keep their project ids when the
@@ -812,7 +812,7 @@ mod tests {
         register_udfs(&conn).await.unwrap();
         conn.call(|c| {
             configured(crate::memory::migrations::runner())
-                .set_target(refinery::Target::Version(10))
+                .set_target(refinery::Target::Version(11))
                 .run(c)
         })
         .await
@@ -1340,7 +1340,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 11, "Expected exactly 11 applied migrations, got {}", count);
+        assert_eq!(count, 12, "Expected exactly 12 applied migrations, got {}", count);
     }
 
     /// V8 — a fresh store records V8 as applied and carries the FTS5 lexical
@@ -1801,7 +1801,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 11);
+        assert_eq!(migration_count, 12);
     }
 
     // -----------------------------------------------------------------------

@@ -52,14 +52,16 @@ Los mensajes de commit son sugeridos. No mencionan planes, fases ni specs.
 
 - [x] `cargo test --workspace --no-fail-fast` en Linux: conteo contra la base, y cada commit en un worktree limpio. Ver `verify.md`.
 - [x] Prueba de punta a punta en Linux con el binario debug y un `HOME` temporal (nunca `~/.clawg*`): `clawg secrets` con el daemon andando, `clawg stop`, `clawg purge` sin y con `--yes`, y `grep` del secreto en el directorio de datos. El save con una key no se pudo hacer con el binario (el modelo no se descarga desde este entorno); queda en los pendientes del perfil dev.
-- [ ] Suite en Windows, `rag-eval --real` y prueba en el perfil dev: pendientes en la máquina del usuario (ver `verify.md`).
+- [x] `cargo test --workspace --target-dir <otro-dir>` en Windows: 1.655 pasan, 0 fallan ([`verify.md`](verify.md#windows-2026-10-14)).
+- [x] `rag-eval --real --diff` y `--agent-view` contra el baseline, en Windows ([`verify.md`](verify.md#rag-eval)).
+- [x] Prueba en el perfil dev con Claude Code: el save con una key falsa avisa `masked github_token`, y `clawg secrets` sobre la base real no encuentra filas, así que no hubo nada que purgar ([`verify.md`](verify.md#perfil-dev-con-claude-code-2026-10-14)).
 
-## Archivo (después de los pendientes de Windows y `rag-eval`)
+## Archivo
 
-- [ ] Marcar los pendientes de `verify.md` con su resultado; si cambia la base de tests, actualizarla en `.claude/CLAUDE.md`.
-- [ ] `git mv openspec/changes/secret-hygiene openspec/changes/archive/AAAA-MM-DD-secret-hygiene`.
-- [ ] Crear `openspec/specs/secrets/spec.md` con R1 a R6 y las rutas y líneas del código en ese momento, con la línea **Origen**. En `openspec/specs/ingest/spec.md`, agregar el campo `redacted` al contrato del save, apuntando a `specs/secrets`.
-- [ ] Corregir los enlaces relativos de los archivos movidos (un nivel más: `../../../specs/`).
-- [ ] `state.yaml`: `phase: archived`, `verify: done`, `archive: done`, `main_spec: openspec/specs/secrets/spec.md`.
-- [ ] `openspec/README.md`: fila 13 como archivada, con enlace a `specs/secrets`.
-- [ ] Commit: `docs(openspec): archive secret-hygiene`
+- [x] Pendientes de `verify.md` marcados con su resultado. La base de tests de `.claude/CLAUDE.md` (1.655) no cambia.
+- [x] `git mv openspec/changes/secret-hygiene openspec/changes/archive/2026-10-14-secret-hygiene`.
+- [x] `openspec/specs/secrets/spec.md` con R1 a R6, las rutas y líneas del código y la línea **Origen**. En `openspec/specs/ingest/spec.md`, el campo `redacted` en «Un save confirmado devuelve los ids», apuntando a `specs/secrets`.
+- [x] Enlaces relativos de los archivos movidos corregidos (`../../../specs/`).
+- [x] `state.yaml`: `phase: archived`, `verify: done`, `archive: done`, `main_spec: openspec/specs/secrets/spec.md`.
+- [x] `openspec/README.md`: fila 13 como archivada, con enlace a `specs/secrets`.
+- Commit: `docs(openspec): archive secret-hygiene after its Windows, rag-eval and dev profile checks`

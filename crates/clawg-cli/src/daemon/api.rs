@@ -27,7 +27,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clawg_core::memory::admin::{
     delete_memory_core, get_memory_core, list_memories_core, memory_stats_core, query_has_tokens,
-    set_importance_core, ListParams, MemoryAdminRow, MemoryKind, MemoryStats, StatsParams,
+    update_memory_core, ListParams, MemoryAdminRow, MemoryKind, MemoryPatch, MemoryStats, StatsParams,
+    UpdatedRow,
 };
 use clawg_core::memory::backup::Reason;
 use clawg_core::memory::bootstrap::EmbedderStatus;
@@ -44,7 +45,7 @@ use clawg_core::memory::prompt_builder::{build_memory_prompt, QueryTexts};
 use clawg_core::memory::synthesis::{
     existing_memory_ids, synthesis_core, unreviewed_count, Synthesis, SynthesisParams,
 };
-use clawg_core::memory::{search_all_memories, RankedHit, SearchScope};
+use clawg_core::memory::{read_save_core, search_all_memories, RankedHit, SaveText, SearchScope};
 use clawg_core::models::chat::Role;
 use clawg_core::paths::Profile;
 use clawg_core::runtime::MemoryRuntime;
@@ -391,9 +392,16 @@ pub struct OwnerQuery {
     pub agent: Option<String>,
 }
 
+/// `deny_unknown_fields` because both fields are optional: a misspelt one
+/// would otherwise read as a request that changes nothing, and be answered
+/// as if the mistake were the empty request.
 #[derive(Debug, Deserialize)]
-pub struct ImportanceRequest {
-    pub importance: f64,
+#[serde(deny_unknown_fields)]
+pub struct UpdateRequest {
+    #[serde(default)]
+    pub importance: Option<f64>,
+    #[serde(default)]
+    pub memory_type: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -500,6 +508,8 @@ pub struct ItemBody {
 #[derive(Debug, Serialize)]
 pub struct UpdatedBody {
     pub updated: usize,
+    #[serde(flatten)]
+    pub row: UpdatedRow,
 }
 
 #[derive(Debug, Serialize)]
@@ -531,8 +541,9 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         .route("/context", post(context))
         .route(
             "/memories/{kind}/{id}",
-            get(get_memory).patch(patch_importance).delete(delete_memory),
+            get(get_memory).patch(update_memory).delete(delete_memory),
         )
+        .route("/memories/{kind}/{id}/save", get(get_save))
         .route("/disputes/resolve", post(resolve_dispute))
         .route("/synthesis", post(synthesis))
         .route("/stats", get(stats))
@@ -887,24 +898,38 @@ async fn get_memory(
     Ok(Json(ItemBody { item }))
 }
 
-async fn patch_importance(
+/// The save the row is a piece of, scoped like the other routes by id: a
+/// row that is missing, deleted or another agent's is the same 404.
+async fn get_save(
     State(app): State<Arc<AppCtx>>,
     Path((kind, id)): Path<(String, i64)>,
     Query(owner): Query<OwnerQuery>,
-    Json(body): Json<ImportanceRequest>,
+) -> ApiResult<Json<SaveText>> {
+    let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
+    let save = read_save_core(&app.runtime.store, kind, id, owner.agent.as_deref())
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("no {kind:?} row with id {id}")))?;
+    Ok(Json(save))
+}
+
+async fn update_memory(
+    State(app): State<Arc<AppCtx>>,
+    Path((kind, id)): Path<(String, i64)>,
+    Query(owner): Query<OwnerQuery>,
+    Json(body): Json<UpdateRequest>,
 ) -> ApiResult<Json<UpdatedBody>> {
     let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
-    let updated = set_importance_core(&app.runtime.store, id, kind, body.importance, owner.agent.as_deref())
-        .await
-        .map_err(ApiError::internal)?;
-
-    // The core answers 0 for "no such row", "already soft-deleted" and
+    let patch = MemoryPatch::new(kind, body.importance, body.memory_type.as_deref())
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    // The core answers `None` for "no such row", "already soft-deleted" and
     // "another agent's" alike, and from the caller's side those are the same
     // fact: the row it named is not there to change.
-    if updated == 0 {
-        return Err(ApiError::not_found(format!("no {kind:?} row with id {id}")));
-    }
-    Ok(Json(UpdatedBody { updated }))
+    let row = update_memory_core(&app.runtime.store, id, kind, &patch, owner.agent.as_deref())
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("no {kind:?} row with id {id}")))?;
+    Ok(Json(UpdatedBody { updated: 1, row }))
 }
 
 async fn delete_memory(

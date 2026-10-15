@@ -13,7 +13,15 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::token_splitter::TokenSplitter;
-use super::Chunk;
+use super::{Chunk, CHUNK_MAX_TOKENS, PIECE_MAX_TOKENS, SAVE_HEAD_TOKENS};
+
+/// How the worker stores one event: its pieces in order and, for a text that
+/// did not fit in one, the head each piece after the first is embedded with.
+#[derive(Debug, Clone)]
+pub struct SaveSplit {
+    pub pieces: Vec<Chunk>,
+    pub head: Option<String>,
+}
 
 /// Turn-based chat chunker. One call per `MemoryEvent` from the worker.
 pub struct ChatChunker {
@@ -70,6 +78,20 @@ impl ChatChunker {
             return vec![];
         }
         self.splitter.split(content, max_tokens, super::CHUNK_OVERLAP_TOKENS)
+    }
+
+    /// Splits one event's text for storing. A text that fits in one piece of
+    /// [`CHUNK_MAX_TOKENS`] comes back exactly as [`ChatChunker::chunk`] cuts
+    /// it, with no head. A longer one is cut at [`PIECE_MAX_TOKENS`], which
+    /// leaves room to embed each later piece behind the first
+    /// [`SAVE_HEAD_TOKENS`] of the text.
+    pub fn split_save(&self, content: &str) -> SaveSplit {
+        let whole = self.chunk(content, CHUNK_MAX_TOKENS);
+        if whole.len() <= 1 {
+            return SaveSplit { pieces: whole, head: None };
+        }
+        let head = self.splitter.split(content, SAVE_HEAD_TOKENS, 0).into_iter().next().map(|c| c.text);
+        SaveSplit { pieces: self.chunk(content, PIECE_MAX_TOKENS), head }
     }
 
     /// Test-only: see `TokenSplitter::tokenizer_ptr`.
@@ -137,6 +159,40 @@ mod tests {
             reconstructed, content,
             "removing each chunk's shared overlap must reconstruct the original input exactly (no gaps, no data loss)"
         );
+    }
+
+    #[test]
+    fn a_text_that_fits_one_piece_is_split_as_before() {
+        let chunker = ChatChunker::with_fallback();
+        for content in ["hello world".to_string(), "x".repeat(1920)] {
+            let split = chunker.split_save(&content);
+            assert_eq!(split.pieces.len(), 1);
+            assert_eq!(split.pieces[0].text, chunker.chunk(&content, 480)[0].text);
+            assert_eq!(split.head, None);
+        }
+    }
+
+    #[test]
+    fn a_long_text_is_split_below_the_cap_to_leave_room_for_the_head() {
+        let chunker = ChatChunker::with_fallback();
+        let content = "word ".repeat(1200);
+        let split = chunker.split_save(&content);
+        // 6000 bytes at 424 tokens (1696 bytes) with 256 of overlap is
+        // ceil((6000 - 256) / 1440) = 4 pieces; the 480 cap gives 4 as well,
+        // but each of these is shorter.
+        assert_eq!(split.pieces.len(), 4);
+        assert!(split.pieces.iter().all(|p| p.text.len() <= 1696), "a piece passed the cap");
+        let rebuilt = split.pieces[1..].iter().fold(split.pieces[0].text.clone(), |acc, p| acc + &p.text[256..]);
+        assert_eq!(rebuilt, content, "the pieces still cover the text with the same overlap");
+    }
+
+    #[test]
+    fn the_head_is_the_first_tokens_of_the_text() {
+        let chunker = ChatChunker::with_fallback();
+        let content = format!("Notes on clawg-ledger, the crate that settles balances. {}", "word ".repeat(1200));
+        let head = chunker.split_save(&content).head.expect("a long text has a head");
+        assert_eq!(head, content[..48 * 4]);
+        assert!(head.contains("clawg-ledger"));
     }
 
     #[test]

@@ -13,12 +13,13 @@
 | base (`35e448c`) | 1639 | 10 |
 | propuesta | 1639 | 10 |
 | quitar el chunker de código | 1629 | 10 |
-| tablas V11 | 1630 | 10 |
+| tablas (V11 entonces, V12 tras mergear main) | 1630 | 10 |
 | corpus | 1637 | 10 |
 | troceo | 1648 | 10 |
-| HEAD | 1716 | 10 |
+| HEAD antes de mergear main | 1716 | 10 |
+| merge de main (long-save-context, update_memory) | 1798 | 10 |
 
-Las 10 fallas son las mismas en todos y vienen del entorno, no del código: los 7 `doctor::tests` (dan por hecho rutas de Windows) y los 3 `diff::tests` de `rag-eval` (leen `docs/eval/`, que no está en este clon). El conteo baja 10 con los tests de `chunker/code.rs` y sube 87 con los nuevos.
+Las 10 fallas son las mismas en todos y vienen del entorno, no del código: los 7 `doctor::tests` (dan por hecho rutas de Windows) y los 3 `diff::tests` de `rag-eval` (leen `docs/eval/`, que no está en este clon). El conteo baja 10 con los tests de `chunker/code.rs` y sube 87 con los nuevos; el merge de main suma los suyos. Al mergear, `V11` ya era `memory_piece`, así que esta migración pasó a `V12__project_docs.sql`.
 
 ## Requisitos
 
@@ -34,7 +35,7 @@ Las 10 fallas son las mismas en todos y vienen del entorno, no del código: los 
 | R8. El registro indexa en segundo plano | `registering_a_root_indexes_its_docs_in_the_background` | ✓ |
 | R9. `search_project` | `search_project_lists_each_hit_under_its_breadcrumb`, `instructions_say_when_to_search_the_project`, `docs_are_numbered_under_their_breadcrumbs`, `search_project_warns_while_indexing`, `an_empty_index_and_no_match_read_differently`, `a_failed_refresh_is_named_before_the_results`; los de handshake cuentan 9 herramientas | ✓ |
 | R10. Indexar no cambia las memorias | `indexing_docs_leaves_memory_search_unchanged` | ✓ |
-| R11. Datos de V10 | `a_database_from_the_previous_version_opens_with_an_empty_doc_index`, `published_migration_checksums_are_pinned` | ✓ |
+| R11. Datos de V11 | `a_database_from_the_previous_version_opens_with_an_empty_doc_index`, `published_migration_checksums_are_pinned` | ✓ |
 | R12. `rag-eval --docs` | los de `docs.rs` (incluye `the_report_scores_docs_and_code_apart`), los `docs_*` de `cli.rs`, `a_doc_index_answers_from_the_root_it_indexed`, y `tests/docs_mode.rs` | ✓ |
 | R13. Código con cAST | los 7 de `project_docs/code.rs`, `classify_takes_code_by_extension`, `a_refresh_indexes_code_by_definition` | ✓ |
 | R14. Pooling mean y re-embebido | `the_e5_model_is_pooled_by_mean`, `the_model_id_names_its_pooling_apart_from_the_cls_vectors_of_before`, `only_the_cls_vectors_of_the_same_model_are_a_pooling_upgrade`, `cls_vectors_are_snapshotted_then_reembedded_by_mean`, `any_other_mismatch_is_left_as_it_is`, `a_store_that_matches_is_not_touched`, `snapshot_names_sort_in_time_order` | ✓ |

@@ -15,7 +15,7 @@ use clawg_core::memory::dispute::{Resolution, ResolvedRow};
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
 
-use crate::client::{Context, Health, Hit, MemoryRow, Synthesis};
+use crate::client::{Context, Health, Hit, MemoryRow, SavedText, Synthesis, Updated};
 use crate::daemon::api::DocsSearchBody;
 use crate::relevance::{relevant_len, RELEVANCE_RATIO};
 
@@ -76,8 +76,9 @@ fn format_hits(hits: &[Hit]) -> String {
     hits.iter()
         .enumerate()
         .map(|(i, h)| {
+            let piece = h.piece.map(|p| format!(" piece={}/{}", p.piece, p.pieces)).unwrap_or_default();
             format!(
-                "{}. #{} [{}/{}/t{} score={:.2}] {}",
+                "{}. #{} [{}/{}/t{}{piece} score={:.2}] {}",
                 i + 1,
                 h.id,
                 h.kind,
@@ -98,6 +99,33 @@ pub fn format_resolution(r: &Resolution) -> String {
         _ => format!("#{} {}", row.id, row.status),
     };
     format!("{}\n{}", line(&r.keep), line(&r.other))
+}
+
+/// What `read_memory` tells the model: which piece it asked for and every
+/// row of the save, then the whole text. A position with no row it may read
+/// is named, so the model knows the text has a gap there.
+pub fn format_save(save: &SavedText) -> String {
+    if save.pieces <= 1 {
+        return format!("#{}\n{}", save.id, save.text);
+    }
+    let ids = save
+        .ids
+        .iter()
+        .map(|id| id.map_or_else(|| "(missing)".to_string(), |id| format!("#{id}")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("#{} is piece {} of {} of one save: {ids}\n{}", save.id, save.piece, save.pieces, save.text)
+}
+
+/// What `update_memory` tells the model about the row it changed. The tier is
+/// the one thing the model cannot work out from its own request, and the one
+/// that says whether the row is still in the workspace.
+pub fn format_update(u: &Updated) -> String {
+    let fields = match &u.memory_type {
+        Some(t) => format!("{t}, importance {:.1}", u.importance),
+        None => format!("importance {:.1}", u.importance),
+    };
+    format!("updated #{} {}: {fields}, tier {}", u.id, u.kind, u.tier)
 }
 
 /// Renders inventory rows as a compact one-line-per-row table.
@@ -297,6 +325,7 @@ mod tests {
             memory_type: memory_type.into(),
             tier,
             score,
+            piece: None,
         }
     }
 
@@ -404,12 +433,43 @@ mod tests {
         assert!(out.len() < long.len(), "the preview must be shorter than the content");
     }
 
+    #[test]
+    fn format_hits_names_the_piece_of_a_long_save() {
+        let mut piece = hit(58, "Memory", "semantic_fact", 3, 0.81, "the retry budget was set");
+        piece.piece = Some(crate::client::PiecePosition { piece: 2, pieces: 4 });
+        let out = format_hits(&[piece, hit(7, "Memory", "semantic_fact", 3, 0.5, "a short one")]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "1. #58 [Memory/semantic_fact/t3 piece=2/4 score=0.81] the retry budget was set");
+        assert_eq!(lines[1], "2. #7 [Memory/semantic_fact/t3 score=0.50] a short one");
+    }
+
     /// A newline inside a memory would split one hit across two lines and make
     /// the numbering meaningless to whoever is reading it.
     #[test]
     fn format_hits_keeps_each_hit_on_one_line() {
         let out = format_hits(&[hit(1, "Memory", "chat_message", 3, 0.1, "two\nlines")]);
         assert_eq!(out.lines().count(), 1, "out was: {out:?}");
+    }
+
+    // ── format_save ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn format_save_names_the_piece_and_the_missing_ones() {
+        let save = SavedText {
+            kind: "memory".into(),
+            id: 58,
+            piece: 2,
+            pieces: 4,
+            ids: vec![Some(57), Some(58), None, Some(60)],
+            missing: vec![3],
+            text: "first and second\nfourth".into(),
+        };
+        assert_eq!(
+            format_save(&save),
+            "#58 is piece 2 of 4 of one save: #57, #58, (missing), #60\nfirst and second\nfourth"
+        );
+        let single = SavedText { piece: 1, pieces: 1, ids: vec![Some(58)], missing: vec![], text: "short".into(), ..save };
+        assert_eq!(format_save(&single), "#58\nshort");
     }
 
     // ── format_rows ─────────────────────────────────────────────────────────
@@ -448,6 +508,20 @@ mod tests {
         let out = format_rows(&[row(1, "memory", Some("chat_message"), &format!("{long}\nmore"))]);
         assert_eq!(out.lines().count(), 1);
         assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn format_update_names_the_fields_and_the_tier() {
+        let memory = Updated {
+            kind: "memory".into(),
+            id: 12,
+            importance: 8.0,
+            memory_type: Some("user_preference".into()),
+            tier: 1,
+        };
+        assert_eq!(format_update(&memory), "updated #12 memory: user_preference, importance 8.0, tier 1");
+        let skill = Updated { kind: "procedural".into(), id: 3, importance: 2.0, memory_type: None, tier: 1 };
+        assert_eq!(format_update(&skill), "updated #3 procedural: importance 2.0, tier 1");
     }
 
     #[test]

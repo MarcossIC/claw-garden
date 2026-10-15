@@ -16,8 +16,8 @@ use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::golden::CaseStatus;
-use matcher::{visible_segment, Corpus};
+use crate::golden::{CaseStatus, CaseSubset};
+use matcher::{normalize, visible_segment, Corpus};
 use parse::{context_sections, context_segments, parse_search_output, ParseError};
 use stats::{summarize, Sample, ToolStats};
 
@@ -38,6 +38,10 @@ pub struct SearchOutcome {
     /// recorded have none.
     #[serde(default)]
     pub lines: Vec<LineView>,
+    /// Lines that carry a corpus row an earlier line already carried: two
+    /// pieces of one memory spending two places of the list.
+    #[serde(default)]
+    pub repeated_rows: usize,
 }
 
 /// One printed search line, reduced to what a cut-off rule needs.
@@ -72,6 +76,51 @@ pub struct CaseView {
     pub ambiguous_refs: Vec<String>,
     pub search: SearchOutcome,
     pub context: ContextOutcome,
+    /// Results written before subsets were recorded read as `natural`.
+    #[serde(default)]
+    pub subset: CaseSubset,
+    /// Only for cases that name the fact they ask for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<AnswerView>,
+}
+
+/// Whether the fact a case asks for reached the agent, not just some fragment
+/// of the row that holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnswerView {
+    /// `search_memory` printed the answer.
+    pub search_visible: bool,
+    /// Printed, or printed once the agent reads the whole save of the first
+    /// line that carries the expected row: the second call the tool offers.
+    pub search_reachable: bool,
+    /// `recall_context` printed the answer.
+    pub context_visible: bool,
+}
+
+/// Share of cases where the answer reached the agent, per way of reaching it.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct AnswerStats {
+    pub n_cases: usize,
+    pub search_visible: f64,
+    pub search_reachable: f64,
+    pub context_visible: f64,
+}
+
+impl AnswerStats {
+    pub fn is_empty(&self) -> bool {
+        self.n_cases == 0
+    }
+}
+
+/// Active cases of one subset.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct SubsetSummary {
+    pub search: ToolStats,
+    pub context: ToolStats,
+    #[serde(default, skip_serializing_if = "AnswerStats::is_empty")]
+    pub answers: AnswerStats,
+    /// Search lines, over all the subset's cases, that repeat a row.
+    pub repeated_rows: usize,
 }
 
 /// One tool's summary, split the way `retrieval` and `blocked` are: `known_red`
@@ -99,6 +148,10 @@ pub struct AgentViewResults {
     pub unmatchable_refs: Vec<String>,
     pub search: ToolSummary,
     pub context: ToolSummary,
+    /// Active cases split by subset, keyed by its name. Results written
+    /// before the split was recorded have none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_subset: BTreeMap<String, SubsetSummary>,
     pub per_case: Vec<CaseView>,
 }
 
@@ -110,6 +163,9 @@ pub struct SearchRead {
     pub rank: Option<usize>,
     pub truncated: bool,
     pub lines: Vec<LineView>,
+    pub repeated_rows: usize,
+    /// Id of the first line carrying an expected row, for reading its save.
+    pub first_expected_id: Option<i64>,
 }
 
 /// `count_tokens` prices one printed line.
@@ -123,13 +179,17 @@ pub fn read_search(
     let mut rank = None;
     let mut truncated = false;
     let mut lines = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut repeated_rows = 0;
+    let mut first_expected_id = None;
     for line in parse_search_output(text)? {
         let shown = visible_segment(&line.content);
-        let carried: Vec<&str> = corpus
-            .refs_containing(&shown.text)
-            .into_iter()
-            .filter(|r| expected.iter().any(|e| e == r))
-            .collect();
+        let rows = corpus.refs_containing(&shown.text);
+        if rows.iter().any(|r| seen.contains(r)) {
+            repeated_rows += 1;
+        }
+        seen.extend(rows.iter().copied());
+        let carried: Vec<&str> = rows.into_iter().filter(|r| expected.iter().any(|e| e == r)).collect();
         lines.push(LineView {
             score: line.score,
             tokens: count_tokens(&line.printed),
@@ -139,10 +199,30 @@ pub fn read_search(
             continue;
         }
         rank.get_or_insert(line.rank);
+        first_expected_id.get_or_insert(line.id);
         truncated |= shown.truncated;
         found.extend(carried);
     }
-    Ok(SearchRead { found_refs: in_expected_order(expected, &found), rank, truncated, lines })
+    Ok(SearchRead {
+        found_refs: in_expected_order(expected, &found),
+        rank,
+        truncated,
+        lines,
+        repeated_rows,
+        first_expected_id,
+    })
+}
+
+/// The tool's text holds `answer`, whitespace aside.
+pub fn answer_visible(text: &str, answer: &str) -> bool {
+    normalize(text).contains(&normalize(answer))
+}
+
+/// Visible in the first answer, or in the save the agent can read next.
+/// `saved` is `None` when there was nothing to read, or the daemon offers no
+/// way to read it.
+pub fn answer_reachable(visible: bool, saved: Option<&str>, answer: &str) -> bool {
+    visible || saved.is_some_and(|text| answer_visible(text, answer))
 }
 
 /// Expected rows a `recall_context` output shows.
@@ -196,6 +276,21 @@ pub fn render_summary(results: &AgentViewResults) -> String {
             out.push_str(&tool_line(tool, "known_red", &summary.known_red));
         }
     }
+    if results.by_subset.len() > 1 {
+        for (name, subset) in &results.by_subset {
+            out.push_str(&format!(
+                "  {name} (n={}): search hit rate {:.4}, context hit rate {:.4}, repeated rows {}\n",
+                subset.search.n_cases, subset.search.hit_rate, subset.context.hit_rate, subset.repeated_rows
+            ));
+        }
+    }
+    for (name, subset) in results.by_subset.iter().filter(|(_, s)| !s.answers.is_empty()) {
+        let a = &subset.answers;
+        out.push_str(&format!(
+            "  {name} answers (n={}): search visible {:.4} reachable {:.4}, context visible {:.4}\n",
+            a.n_cases, a.search_visible, a.search_reachable, a.context_visible
+        ));
+    }
     out
 }
 
@@ -234,6 +329,30 @@ pub fn build_results(
         tokens: c.context.tokens,
         latency_ms: c.context.latency_ms,
     };
+    let mut by_subset: BTreeMap<String, SubsetSummary> = BTreeMap::new();
+    let active: Vec<&CaseView> = per_case.iter().filter(|c| c.status == CaseStatus::Active).collect();
+    let names: std::collections::BTreeSet<&str> = active.iter().map(|c| c.subset.as_str()).collect();
+    for name in names {
+        let cases: Vec<&CaseView> = active.iter().copied().filter(|c| c.subset.as_str() == name).collect();
+        let answers: Vec<AnswerView> = cases.iter().filter_map(|c| c.answer).collect();
+        let share = |pick: fn(&AnswerView) -> bool| {
+            answers.iter().filter(|a| pick(a)).count() as f64 / answers.len().max(1) as f64
+        };
+        by_subset.insert(
+            name.to_string(),
+            SubsetSummary {
+                search: summarize(&cases.iter().map(|c| search_sample(c)).collect::<Vec<_>>()),
+                context: summarize(&cases.iter().map(|c| context_sample(c)).collect::<Vec<_>>()),
+                answers: AnswerStats {
+                    n_cases: answers.len(),
+                    search_visible: share(|a| a.search_visible),
+                    search_reachable: share(|a| a.search_reachable),
+                    context_visible: share(|a| a.context_visible),
+                },
+                repeated_rows: cases.iter().map(|c| c.search.repeated_rows).sum(),
+            },
+        );
+    }
     AgentViewResults {
         corpus_size,
         stored_rows,
@@ -248,6 +367,7 @@ pub fn build_results(
             active: summary(CaseStatus::Active, context_sample),
             known_red: summary(CaseStatus::KnownRed, context_sample),
         },
+        by_subset,
         per_case,
     }
 }
@@ -296,10 +416,10 @@ mod tests {
 
     #[test]
     fn context_section_tokens_are_counted_per_section_title() {
-        let text = "=== WORKSPACE ===\n- a rule\n\n=== LONG-TERM KNOWLEDGE ===\nCONTENT: x\n";
+        let text = "=== WORKSPACE ===\n- a rule\n\n=== LONG-TERM KNOWLEDGE ===\n[2026-01-01 #1 chat_message] x\n";
         let tokens = context_section_tokens(text, &|s: &str| s.len());
         assert_eq!(tokens.get("WORKSPACE"), Some(&"=== WORKSPACE ===\n- a rule".len()));
-        assert_eq!(tokens.get("LONG-TERM KNOWLEDGE"), Some(&"=== LONG-TERM KNOWLEDGE ===\nCONTENT: x".len()));
+        assert_eq!(tokens.get("LONG-TERM KNOWLEDGE"), Some(&"=== LONG-TERM KNOWLEDGE ===\n[2026-01-01 #1 chat_message] x".len()));
     }
 
     #[test]
@@ -368,9 +488,9 @@ mod tests {
     }
 
     #[test]
-    fn read_context_finds_rows_in_hit_blocks_and_workspace_bullets() {
+    fn read_context_finds_rows_in_hit_lines_and_workspace_bullets() {
         let text = format!(
-            "=== WORKSPACE ===\n<!-- AUTO-START -->\n## User Preferences (always active)\n- {A}\n<!-- AUTO-END -->\n\n=== LONG-TERM KNOWLEDGE ===\n[2026-01-01] SOURCE: Memory | TYPE: chat_message\nCONTENT: {B}\n"
+            "=== WORKSPACE ===\n## User Preferences (always active)\n- {A}\n\n=== LONG-TERM KNOWLEDGE ===\n[2026-01-01 #8 chat_message] {B}\n"
         );
         assert_eq!(read_context(&text, &refs(&["c1", "c2"]), &corpus()), refs(&["c1", "c2"]));
         assert_eq!(read_context(&text, &refs(&["c2"]), &corpus()), refs(&["c2"]));
@@ -395,6 +515,7 @@ mod tests {
                 latency_ms: 1.0,
                 truncated: false,
                 lines: vec![],
+                repeated_rows: 0,
             },
             context: ContextOutcome {
                 found: context_found,
@@ -403,7 +524,63 @@ mod tests {
                 latency_ms: 2.0,
                 sections: BTreeMap::new(),
             },
+            subset: CaseSubset::Natural,
+            answer: None,
         }
+    }
+
+    #[test]
+    fn the_answer_counts_only_when_its_text_is_visible() {
+        let shown = "1. #57 [memory/semantic_fact/t3 score=0.80] notes on amber-falcon, the retry\n   budget was set to 7 attempts per call";
+        assert!(answer_visible(shown, "retry budget was set to 7 attempts"), "whitespace does not hide it");
+        assert!(!answer_visible("1. #57 [memory/semantic_fact/t3 score=0.80] notes on amber-falcon…", "retry budget was set to 7 attempts"));
+        assert!(!answer_visible(shown, "retry budget was set to 8 attempts"));
+    }
+
+    #[test]
+    fn a_read_save_makes_a_hidden_answer_reachable() {
+        let answer = "capped at 40 records";
+        assert!(answer_reachable(false, Some("… Batches were capped at 40 records so …"), answer));
+        assert!(!answer_reachable(false, Some("a save without the fact"), answer));
+        assert!(!answer_reachable(false, None, answer), "no save to read leaves only what was printed");
+        assert!(answer_reachable(true, None, answer));
+    }
+
+    #[test]
+    fn a_line_repeating_an_earlier_lines_row_is_counted() {
+        let long = format!("{A} and then a much longer stretch of text that follows it");
+        let rows = Corpus::new([("c1", long.as_str()), ("c2", B)]);
+        let text = [
+            format!("1. #7 [memory/chat_message/t3 piece=1/2 score=0.90] {A}"),
+            format!("2. #9 [memory/chat_message/t3 score=0.50] {B}"),
+            "3. #8 [memory/chat_message/t3 piece=2/2 score=0.40] and then a much longer stretch of text that follows it".to_string(),
+        ]
+        .join("\n");
+        let read = read_search(&text, &no_tokens, &refs(&["c1"]), &rows).unwrap();
+        assert_eq!(read.repeated_rows, 1);
+        assert_eq!(read.first_expected_id, Some(7));
+    }
+
+    #[test]
+    fn build_results_splits_active_cases_by_subset_with_their_answers() {
+        let mut long = case_view(CaseStatus::Active, true, false, 10);
+        long.subset = CaseSubset::Long;
+        long.search.repeated_rows = 2;
+        long.answer = Some(AnswerView { search_visible: false, search_reachable: true, context_visible: false });
+        let results = build_results(
+            3,
+            3,
+            &corpus(),
+            vec![case_view(CaseStatus::Active, true, true, 10), long, case_view(CaseStatus::KnownRed, false, true, 10)],
+        );
+        assert_eq!(results.by_subset.keys().collect::<Vec<_>>(), vec!["long", "natural"]);
+        let l = &results.by_subset["long"];
+        assert_eq!((l.search.n_cases, l.repeated_rows), (1, 2));
+        assert_eq!((l.answers.n_cases, l.answers.search_visible, l.answers.search_reachable), (1, 0.0, 1.0));
+        assert_eq!(results.by_subset["natural"].search.n_cases, 1, "known_red stays out");
+        assert!(results.by_subset["natural"].answers.is_empty());
+        let text = render_summary(&results);
+        assert!(text.contains("long answers (n=1): search visible 0.0000 reachable 1.0000"), "{text}");
     }
 
     #[test]

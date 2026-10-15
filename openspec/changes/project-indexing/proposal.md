@@ -34,7 +34,7 @@ El objetivo 3, indexar proyectos para que la IA entienda cómo funciona cada uno
 
 1. **Limpieza** (`clawg-core`): borrar `chunker/code.rs`, `ChunkerKind::Code`, el parámetro `code_chunker` del worker, `Chunk.header` (sólo lo escribía `code.rs`) y las cuatro dependencias de tree-sitter. `MemorySource::CodeFile` y el tipo `code_block` se quedan: son valores que una fila guardada puede tener.
 2. **Corpus y troceo** (`clawg-core`, puro): qué archivos entran, cómo se trocea un Markdown por encabezado con su breadcrumb y cómo se trocea un manifiesto.
-3. **Índice** (`clawg-core`): migración `V11__project_docs.sql` con tres tablas nuevas; refresco incremental por hash, con los secretos enmascarados antes de trocear, y búsqueda híbrida (vectores + FTS5) dentro del proyecto.
+3. **Índice** (`clawg-core`): migración `V12__project_docs.sql` con tres tablas nuevas; refresco incremental por hash, con los secretos enmascarados antes de trocear, y búsqueda híbrida (vectores + FTS5) dentro del proyecto.
 4. **Daemon** (`clawg-cli`): el registro de una raíz lanza un refresco en segundo plano; `POST /v1/projects/docs/search` refresca si hace falta y busca.
 5. **MCP** (`clawg-cli`): herramienta `search_project`, y las instrucciones del servidor dicen cuándo usarla.
 6. **Medición** (`clawg-eval`): `rag-eval --docs`, que indexa una raíz y puntúa un golden set de preguntas sobre sus docs y su código, con números aparte para cada uno.
@@ -62,7 +62,7 @@ El objetivo 3, indexar proyectos para que la IA entienda cómo funciona cada uno
 - un secreto de formato conocido en un doc no llega al índice;
 - `search_project` encuentra un pasaje por sentido (vector) y por identificador exacto (FTS5), y nunca devuelve pasajes de otro proyecto;
 - `search_memory` y `recall_context` devuelven lo mismo con y sin índice;
-- una base en V10 con memorias abre con V11 con todo intacto (dato de la versión anterior).
+- una base en V11 con memorias abre con V12 con todo intacto (dato de la versión anterior).
 
 **Golden set de docs:** `crates/clawg-eval/golden/project-docs.json`, 10 preguntas sobre la documentación de este mismo repo, escritas sin copiar las palabras del pasaje que las responde, cada una con el archivo y el encabezado esperados. Se mide con `rag-eval --real --docs --root <repo>`:
 
@@ -83,15 +83,15 @@ Además, 5 preguntas sobre el código de este repo, con la ruta del archivo que 
 
 ## Datos guardados
 
-- **Esquema:** una migración aditiva, `V11__project_docs.sql`, con `project_doc_file`, `project_doc_chunk`, `project_doc_vectors` (vec0 con `project_id` como partition key) y `project_doc_fts` (FTS5). No toca ninguna tabla existente. `MemoryStore::open` ya guarda un snapshot `pre-migration` antes de aplicarla (`specs/storage`).
+- **Esquema:** una migración aditiva, `V12__project_docs.sql`, con `project_doc_file`, `project_doc_chunk`, `project_doc_vectors` (vec0 con `project_id` como partition key) y `project_doc_fts` (FTS5). No toca ninguna tabla existente. `MemoryStore::open` ya guarda un snapshot `pre-migration` antes de aplicarla (`specs/storage`).
 - **Identificadores y estados:** no cambian. El índice usa el `project_id` que ya deriva `ProjectIdentity::resolve` y la raíz que ya guarda `project`.
 - **Memorias:** ninguna fila de `memory`, `episodic_trajectory` ni `procedural_skill` se lee, escribe ni borra al indexar o buscar docs.
 - **Vectores de las memorias:** el primer arranque con esta versión re-embebe los tres tipos de memoria con pooling mean y cambia el `model_id` del contrato a `multilingual-e5-small/mean`. El texto y el resto de cada fila no cambian. Antes escribe un snapshot `pre-reembed`.
-- **Datos de la versión anterior:** un test siembra memorias en una base en V10, la abre con la migración nueva y prueba que siguen idénticas y alcanzables, y que las tablas del índice existen vacías.
+- **Datos de la versión anterior:** un test siembra memorias en una base en V11, la abre con la migración nueva y prueba que siguen idénticas y alcanzables, y que las tablas del índice existen vacías.
 - **Backups:** los snapshots copian la base entera, así que incluyen el índice. Crece con el tamaño de los docs (del orden de 2 KB por pedazo más su vector de 1,5 KB).
 - **Rollback:** una versión anterior rechaza la base sin tocarla (`SchemaNewer`). Hay dos vueltas atrás documentadas:
-  - `clawg restore` del snapshot `pre-migration` (o del `pre-reembed`, que ya tiene V11 pero los vectores CLS): pierde lo guardado después de actualizar;
-  - sin pérdida: con el daemon parado, `DROP TABLE project_doc_fts; DROP TABLE project_doc_vectors; DROP TABLE project_doc_chunk; DROP TABLE project_doc_file; DELETE FROM refinery_schema_history WHERE version = 11;`. Ninguna memoria depende de esas tablas.
+  - `clawg restore` del snapshot `pre-migration` (o del `pre-reembed`, que ya tiene V12 pero los vectores CLS): pierde lo guardado después de actualizar;
+  - sin pérdida: con el daemon parado, `DROP TABLE project_doc_fts; DROP TABLE project_doc_vectors; DROP TABLE project_doc_chunk; DROP TABLE project_doc_file; DELETE FROM refinery_schema_history WHERE version = 12;`. Ninguna memoria depende de esas tablas.
 
 ## Riesgos
 
@@ -104,7 +104,7 @@ Además, 5 preguntas sobre el código de este repo, con la ruta del archivo que 
 | Indexar compite con los saves por CPU | Baja | Un solo refresco por proyecto a la vez, por archivos; la ingesta y la búsqueda de memorias no esperan al índice |
 | e5-small no separa bien pasajes de código, ni de docs cuando la pregunta no usa sus palabras | Alta (medido en docs: Hit@3 0,20) | El canal léxico encuentra identificadores exactos; `rag-eval --docs` reporta docs y código por separado para decidir con números si hace falta otro modelo o un reranker |
 | El código multiplica los pasajes y el primer indexado tarda | Media | Mismos topes de archivos y bytes; el refresco es incremental por hash, así que sólo el primero cuesta |
-| Otro cambio agrega una migración `V11` antes que éste | Baja | memory-update-tool no necesita esquema. Si otro llega primero, se renumera el archivo y la fila de `published_migration_checksums_are_pinned` |
+| Otro cambio agrega una migración antes que éste | Pasó | long-save-context agregó `V11__memory_piece.sql`; ésta se renumeró a V12 al mergear main, con su fila en `published_migration_checksums_are_pinned`. Si vuelve a pasar, se renumera el archivo y la fila de `published_migration_checksums_are_pinned` |
 | Re-embeber un store grande deja la memoria en `loading` mucho rato en el primer arranque | Media | Pasa una sola vez; el estado lo dice y el README lo explica. En este entorno e5-small embebe unos 6,5 pasajes de hasta 480 tokens por segundo (4.312 en 657 s); las memorias son más cortas |
 | Los umbrales provisionales ordenan peor que los de CLS | Media | Salen de la misma posición en la distribución nueva; quedan marcados como provisionales y se recalibran con el golden set antes de salir del draft |
 | Un binario viejo abre un store ya re-embebido | Baja | Ve otro `model_id` y deshabilita la memoria (mismatch) sin tocar nada; volver atrás es restaurar el `pre-reembed` |

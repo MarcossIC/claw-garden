@@ -26,6 +26,8 @@ Con el embedder `ready`, `POST /v1/memories` MUST encolar el evento con un canal
 
 `kind` es siempre `"memory"`, de modo que `kind` e `id` son exactamente lo que toma `DELETE /v1/memories/{kind}/{id}`. Las copias repetidas dentro del mismo save MUST NOT generar elementos extra: cuentan como refuerzo de la fila de su primera copia (`collapse_duplicate_chunks`, `worker.rs:134`, y `process_event`, `worker.rs:408`).
 
+Si la ingesta enmascaró secretos, la respuesta lleva además `redacted` con sus tipos, y `save_memory` los nombra en su texto: ver [`specs/secrets`](../secrets/spec.md), R3.
+
 #### Escenario: inserción
 - GIVEN un daemon con el embedder listo y la base vacía
 - WHEN se guarda `el tren sale los martes`
@@ -197,14 +199,14 @@ La espera tras el intento fallido `n` (1, 2, …) MUST ser `min(30 s · 2^(n-1),
 |---|---|---|
 | `201`, un elemento `inserted` | éxito | `saved #57` |
 | `201`, varios elementos | éxito | `saved as N pieces: #57, #58, #59` |
-| `201`, un elemento `reinforced` | éxito | `already stored as #57; reinforced it instead of saving a copy` |
+| `201`, un elemento `reinforced` | éxito | `already stored as #57; reinforced it instead of saving a copy (update_memory changes its importance or type)` |
 | `202 unconfirmed` | éxito | `accepted but not confirmed yet; check with list_memories before relying on it` |
 | `202 embedder_loading` | éxito | `accepted; it will be stored once the embedding model finishes loading` |
 | `503 embedder_failed` | error | `not saved: the embedding model failed to load (<causa>)`, más `; clawg will retry` si es reintentable |
 | `500 ingest_failed` / `503 embedder_unavailable` | error | `not saved: <detalle>`, más `; partially saved as #…` si hubo filas |
 | `503 ingest_queue_full` | error | `not saved: the ingest queue is full; try again shortly` |
 
-Los textos MUST NOT contener la palabra `queued` sola. Un save «exitoso» sólo se reporta como `saved` cuando el daemon confirmó las filas. Los ids MUST servir tal cual para `delete_memory` con `kind: "memory"`. Cualquier otro error pasa por `explain` (`server.rs:230`), que con `embedder_failed` MUST NOT prometer que la búsqueda va a funcionar en un minuto.
+Los textos MUST NOT contener la palabra `queued` sola. Un save «exitoso» sólo se reporta como `saved` cuando el daemon confirmó las filas. Los ids MUST servir tal cual para `delete_memory` y `update_memory` con `kind: "memory"` (ver [`specs/update`](../update/spec.md), R5). Cualquier otro error pasa por `explain` (`server.rs:230`), que con `embedder_failed` MUST NOT prometer que la búsqueda va a funcionar en un minuto.
 
 #### Escenario: id usable
 - GIVEN `save_memory` devolvió `saved #57`

@@ -8,10 +8,10 @@ Cada tarea es un commit atómico: primero el test que falla, después el código
 - [x] Borrar `chunker/code.rs`, `ChunkerKind::Code`, `Chunk.header`, el parámetro `code_chunker` del worker y del runtime, y las cuatro dependencias `tree-sitter*`.
 - Commit: `refactor(core): remove the unused code chunker`
 
-## 2. Migración V11 (D2, R11)
+## 2. Migración V12 (D2, R11)
 
-- [x] Fila de V11 en `published_migration_checksums_are_pinned` (falla) y `a_database_from_the_previous_version_opens_with_an_empty_doc_index` en `db.rs`.
-- [x] `V11__project_docs.sql`; se toca `migrations.rs`.
+- [x] Fila de V12 en `published_migration_checksums_are_pinned` (falla) y `a_database_from_the_previous_version_opens_with_an_empty_doc_index` en `db.rs`.
+- [x] `V12__project_docs.sql`; se toca `migrations.rs`.
 - Commit: `feat(core): add tables for a per-project index of documentation`
 
 ## 3. Corpus (D1, R2)

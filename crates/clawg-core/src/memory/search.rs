@@ -1,10 +1,11 @@
 //! KNN search across memory + episodic + procedural via tokio::try_join!,
 //! merged + ranked by the score formula computed in SQL.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::memory::clock::TimestampMs;
+use crate::memory::pieces::SaveLink;
 use crate::memory::score::{score as compute_score, RawHit, ScoringConfig};
 use crate::memory::vector::to_unit;
 use crate::memory::{MemoryError, MemoryStore, TableKind};
@@ -61,6 +62,38 @@ pub struct RankedHit {
     pub score: f64,
     pub distance: f64,   // raw KNN distance — consumed by contradiction.rs to threshold-filter near-duplicate candidates
     pub created_at: TimestampMs, // for RECENT vs LONG-TERM bucketing in prompt_builder
+    /// Which piece of a long save this row is; absent for a save of one piece.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub piece: Option<PiecePosition>,
+}
+
+/// Position `piece` (from 1) of a save stored as `pieces` rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct PiecePosition {
+    pub piece: i64,
+    pub pieces: i64,
+}
+
+/// Keeps the first, so best ranked, hit of each save and drops its other
+/// pieces, so one long text takes one slot. Only `memory` rows are pieces:
+/// the other tables number their rows independently.
+fn collapse_saves(hits: Vec<RankedHit>, links: &HashMap<i64, SaveLink>) -> Vec<RankedHit> {
+    let mut seen = HashSet::new();
+    hits.into_iter()
+        .filter_map(|mut hit| {
+            if hit.kind != TableKind::Memory {
+                return Some(hit);
+            }
+            match links.get(&hit.id) {
+                Some(link) if !seen.insert(link.save_id) => None,
+                Some(link) => {
+                    hit.piece = Some(link.position);
+                    Some(hit)
+                }
+                None => Some(hit),
+            }
+        })
+        .collect()
 }
 
 // Compile-time Send + Sync assertions
@@ -426,6 +459,7 @@ async fn knn_one(
                     status: r.status,
                     distance: r.distance,
                     created_at: r.created_at,
+                    piece: None,
                 })
                 .collect();
             // Sorted before the trim, not after: the widened window is cut
@@ -958,6 +992,7 @@ async fn score_lexical_candidates(
                     status: r.status,
                     distance: r.distance,
                     created_at: r.created_at,
+                    piece: None,
                 });
             }
             Ok(hits)
@@ -1113,6 +1148,16 @@ async fn search_all_memories_inner(
     let mut all: Vec<RankedHit> =
         mem.hits.into_iter().chain(epi.hits).chain(pro.hits).chain(lex_hits).collect();
     all.sort_by(hit_cmp);
+    let memory_ids: Vec<i64> = all.iter().filter(|h| h.kind == TableKind::Memory).map(|h| h.id).collect();
+    // Without the links the pieces stay separate hits, as before they were
+    // linked; a search never fails over them.
+    let mut all = match store.save_links(memory_ids).await {
+        Ok(links) => collapse_saves(all, &links),
+        Err(e) => {
+            log::warn!("search: reading save links failed, pieces stay separate: {e}");
+            all
+        }
+    };
     all.truncate(k_final);
 
     // Read once so the per-call number logged below and the sample fed into
@@ -1287,6 +1332,7 @@ mod tests {
             score: 0.9,
             distance: 0.1,
             created_at: TimestampMs::from_unix_millis(0),
+            piece: None,
         };
         let h2 = RankedHit {
             id: 2,
@@ -1298,6 +1344,7 @@ mod tests {
             score: 0.3,
             distance: 0.7,
             created_at: TimestampMs::from_unix_millis(0),
+            piece: None,
         };
         let mut hits = vec![h2, h1];
         hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
@@ -1324,6 +1371,7 @@ mod tests {
                 score,
                 distance: 0.0,
                 created_at: TimestampMs::from_unix_millis(0),
+                piece: None,
             }
         }
 
@@ -4610,5 +4658,123 @@ mod tests {
         let without = search_with(&store, query, agent, SearchScope::all_default(), &without_bonus()).await;
         assert!(!with.is_empty());
         assert_eq!(scores(&with), scores(&without));
+    }
+
+    // ── one hit per save ─────────────────────────────────────────────
+
+    fn memory_hit(id: i64, score: f64) -> RankedHit {
+        RankedHit {
+            id,
+            kind: TableKind::Memory,
+            content: format!("row {id}"),
+            memory_type: "chat_message".to_string(),
+            tier: 3,
+            status: "active".to_string(),
+            score,
+            distance: 0.0,
+            created_at: TimestampMs::from_unix_millis(0),
+            piece: None,
+        }
+    }
+
+    fn link(save_id: i64, piece: i64, pieces: i64) -> SaveLink {
+        SaveLink { save_id, position: PiecePosition { piece, pieces } }
+    }
+
+    fn ids_and_pieces(hits: &[RankedHit]) -> Vec<(i64, Option<(i64, i64)>)> {
+        hits.iter().map(|h| (h.id, h.piece.map(|p| (p.piece, p.pieces)))).collect()
+    }
+
+    #[test]
+    fn only_the_best_piece_of_a_save_survives() {
+        let hits = vec![memory_hit(12, 0.9), memory_hit(5, 0.8), memory_hit(11, 0.7), memory_hit(10, 0.6)];
+        let links = HashMap::from([(10, link(1, 1, 3)), (11, link(1, 2, 3)), (12, link(1, 3, 3))]);
+
+        let collapsed = collapse_saves(hits, &links);
+
+        assert_eq!(ids_and_pieces(&collapsed), vec![(12, Some((3, 3))), (5, None)]);
+    }
+
+    #[test]
+    fn rows_without_links_keep_their_place() {
+        let mut episode = memory_hit(11, 0.75);
+        episode.kind = TableKind::Episodic;
+        let hits = vec![memory_hit(3, 0.9), episode, memory_hit(2, 0.7), memory_hit(1, 0.6)];
+        // An episode shares its id with a linked memory row by coincidence;
+        // only `memory` rows are pieces.
+        let links = HashMap::from([(11, link(4, 2, 2)), (2, link(7, 1, 2))]);
+
+        let collapsed = collapse_saves(hits, &links);
+
+        assert_eq!(ids_and_pieces(&collapsed), vec![(3, None), (11, None), (2, Some((1, 2))), (1, None)]);
+        assert_eq!(collapsed[1].kind, TableKind::Episodic);
+    }
+
+    async fn seed_linked_save(store: &MemoryStore, agent: &str) -> Vec<i64> {
+        let mut ids = Vec::new();
+        for (i, cos) in [0.99_f32, 0.98, 0.97].into_iter().enumerate() {
+            ids.push(
+                insert_memory_row(
+                    store, agent, &format!("piece {i} of the ledger notes"), "chat_message", 3, 5.0, "active",
+                    serialize_embedding(&vec_at_cosine(cos)),
+                )
+                .await,
+            );
+        }
+        store
+            .link_pieces(
+                ids.iter()
+                    .map(|&memory_id| crate::memory::pieces::StoredPiece { memory_id, context: String::new() })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        ids
+    }
+
+    async fn seed_others(store: &MemoryStore, agent: &str) -> Vec<i64> {
+        let mut ids = Vec::new();
+        for (i, cos) in [0.96_f32, 0.95, 0.94].into_iter().enumerate() {
+            ids.push(
+                insert_memory_row(
+                    store, agent, &format!("unrelated memory {i}"), "chat_message", 3, 5.0, "active",
+                    serialize_embedding(&vec_at_cosine(cos)),
+                )
+                .await,
+            );
+        }
+        ids
+    }
+
+    #[tokio::test]
+    async fn freed_slots_go_to_other_memories() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let agent = "agent-one-hit-per-save";
+        let save = seed_linked_save(&store, agent).await;
+        let others = seed_others(&store, agent).await;
+
+        let (hits, _) = search_all_memories_inner(
+            &store, &unit_basis_vec(), None, agent, SearchScope::all_default(), 3, &ScoringConfig::DEFAULT,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ids_and_pieces(&hits), vec![(save[0], Some((1, 3))), (others[0], None), (others[1], None)]);
+    }
+
+    #[tokio::test]
+    async fn a_link_read_failure_leaves_hits_uncollapsed() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let agent = "agent-link-failsoft";
+        let save = seed_linked_save(&store, agent).await;
+        store.conn.call(|c| c.execute("DROP TABLE memory_piece", [])).await.unwrap();
+
+        let (hits, _) = search_all_memories_inner(
+            &store, &unit_basis_vec(), None, agent, SearchScope::all_default(), 3, &ScoringConfig::DEFAULT,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ids_and_pieces(&hits), save.iter().map(|&id| (id, None)).collect::<Vec<_>>());
     }
 }

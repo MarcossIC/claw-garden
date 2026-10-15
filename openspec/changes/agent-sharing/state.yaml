@@ -1,6 +1,6 @@
-change: memory-update-tool
-objective: "1"
-depends_on: [visibility-policy]
+change: agent-sharing
+objective: "2, 4"
+depends_on: [visibility-policy, secret-hygiene]
 phase: explore
 artifacts:
   exploration: draft
@@ -11,4 +11,4 @@ artifacts:
   apply: pending
   verify: pending
   archive: pending
-updated: 2026-10-11
+updated: 2026-10-12

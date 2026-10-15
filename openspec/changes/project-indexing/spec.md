@@ -196,9 +196,9 @@ Con un proyecto indexado, `search_all_memories`, `POST /v1/search`, `POST /v1/co
 
 ## R11. Datos de la versión anterior
 
-Una base creada por la versión anterior (migrada hasta V10), con memorias, conclusiones y proyectos, MUST abrir con V11 sin cambiar ninguna fila, y las tablas del índice MUST existir vacías.
+Una base creada por la versión anterior (migrada hasta V11), con memorias, conclusiones y proyectos, MUST abrir con V12 sin cambiar ninguna fila, y las tablas del índice MUST existir vacías.
 
-**Test:** `a_database_from_the_previous_version_opens_with_an_empty_doc_index` en `crates/clawg-core/src/memory/db.rs`, y la fila de V11 en `published_migration_checksums_are_pinned`. Fallan hoy.
+**Test:** `a_database_from_the_previous_version_opens_with_an_empty_doc_index` en `crates/clawg-core/src/memory/db.rs`, y la fila de V12 en `published_migration_checksums_are_pinned`. Fallan hoy.
 
 ## R12. Medición con `rag-eval --docs`
 

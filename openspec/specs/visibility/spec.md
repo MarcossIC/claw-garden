@@ -54,8 +54,9 @@ El agente del puente MUST ser, en este orden:
 
 - `list_memories` MUST listar sólo filas del agente del puente, de todos sus proyectos.
 - `delete_memory` sobre una fila de otro agente MUST fallar como si el id no existiera, y MUST NOT tocar la fila, su vector ni las disputas que la nombran.
+- `update_memory` sobre una fila de otro agente MUST fallar como si el id no existiera, y MUST NOT cambiar su importancia, su tipo ni su tier ([`specs/update`](../update/spec.md), R5).
 - `resolve_conflict` con alguna de las dos filas de otro agente MUST fallar como si el id no existiera, y MUST NOT cambiar ninguna de las dos.
-- Sobre filas propias, las tres se comportan igual que sin scope.
+- Sobre filas propias, las cuatro se comportan igual que sin scope.
 
 #### Escenario: borrar lo ajeno
 - GIVEN una memoria de A
@@ -72,12 +73,12 @@ El agente del puente MUST ser, en este orden:
 - WHEN B llama `resolve_conflict` sobre el par
 - THEN la respuesta es un error y las dos filas siguen igual
 
-**Test:** `an_agent_cannot_delete_another_agents_memory`, `an_agent_lists_only_its_own_memories` y `an_agent_cannot_resolve_another_agents_conflict` en `server.rs`.
+**Test:** `an_agent_cannot_delete_another_agents_memory`, `an_agent_cannot_update_another_agents_memory`, `an_agent_lists_only_its_own_memories` y `an_agent_cannot_resolve_another_agents_conflict` en `server.rs`.
 
 ## R4. Scope opcional en el daemon
 
 - `DELETE` y `PATCH /v1/memories/{kind}/{id}` MUST aceptar `agent` en la query; `POST /v1/disputes/resolve` MUST aceptar `agent_id` en el cuerpo.
-- Con scope, si la fila (o alguna de las dos, al resolver) es de otro agente, la respuesta MUST ser `404`, igual que un id inexistente, y MUST NOT cambiar nada: ni la fila, ni su vector, ni sus disputas, ni su `last_modified_at`.
+- Con scope, si la fila (o alguna de las dos, al resolver) es de otro agente, la respuesta MUST ser `404`, igual que un id inexistente, y MUST NOT cambiar nada: ni la fila, ni su vector, ni sus disputas, ni su `last_modified_at`, ni su `update_count`.
 - Sin scope, la operación MUST valer sobre cualquier fila, como antes de existir el scope.
 - La misma regla vale para las tres tablas (`memory`, `episodic`, `procedural`).
 

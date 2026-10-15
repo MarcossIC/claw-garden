@@ -10,7 +10,7 @@ crates/clawg-core/src/memory/project_docs/
   corpus.rs   classify (pura) y walk (I/O: recorre la raíz)
   chunk.rs    chunk_markdown y chunk_manifest (puras, con un TokenSplitter)
   code.rs     chunk_code con cAST (pura, con tree-sitter y un TokenSplitter)
-crates/clawg-core/migrations/V11__project_docs.sql
+crates/clawg-core/migrations/V12__project_docs.sql
 crates/clawg-cli/src/daemon/api.rs           POST /v1/projects/docs/search; el registro lanza un refresco
 crates/clawg-cli/src/client.rs               DaemonClient::search_docs
 crates/clawg-cli/src/mcp/server.rs, tools.rs search_project y su formato

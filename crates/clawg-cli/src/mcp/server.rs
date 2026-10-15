@@ -42,8 +42,8 @@ use crate::client::{
 };
 use crate::mcp::startup::ClientHandle;
 use crate::mcp::tools::{
-    format_docs, format_recall, format_resolution, format_rows, format_search, format_status,
-    format_synthesis, resolve_project,
+    format_docs, format_recall, format_resolution, format_rows, format_save, format_search, format_status,
+    format_synthesis, format_update, resolve_project,
 };
 
 /// Agent id used when neither `--agent` nor the MCP client named one.
@@ -224,13 +224,43 @@ pub struct ListMemoriesArgs {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct DeleteMemoryArgs {
-    /// The id of the row to delete, as printed by `search_memory` or
-    /// `list_memories`.
+    /// The id of the row to delete, as printed by `search_memory`,
+    /// `list_memories` or `recall_context`. A `recall_context` hit with no kind
+    /// in front of its type is a memory.
     pub id: i64,
     /// Which table the id belongs to: memory, episodic or procedural. Required,
     /// because each table numbers its rows independently — id 7 exists in all
     /// three and means something different in each.
     pub kind: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ReadMemoryArgs {
+    /// The id of any piece of the save, as printed by `search_memory`,
+    /// `list_memories`, `recall_context` or `save_memory`.
+    pub id: i64,
+    /// Which table the id belongs to: memory, episodic or procedural.
+    /// Defaults to memory, the only kind saved in pieces.
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct UpdateMemoryArgs {
+    /// The id of the row to change, as printed by `save_memory`,
+    /// `search_memory`, `list_memories` or `recall_context`. A `recall_context`
+    /// hit with no kind in front of its type is a memory.
+    pub id: i64,
+    /// Which table the id belongs to: memory, episodic or procedural.
+    pub kind: String,
+    /// The new importance, 0 to 10. Omit it to leave the importance as it is.
+    #[serde(default)]
+    pub importance: Option<f64>,
+    /// The new type, only for kind memory. One of: semantic_fact,
+    /// user_preference, architectural_decision, session_summary, code_block,
+    /// chat_message, tool_error. Omit it to leave the type as it is.
+    #[serde(default)]
+    pub memory_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -412,11 +442,17 @@ impl ClawgMcp {
         match result {
             Ok(SaveOutcome::Saved { memories, redacted }) => {
                 let mut text = match memories.as_slice() {
-                    [one] if one.outcome == "reinforced" => {
-                        format!("already stored as #{}; reinforced it instead of saving a copy", one.id)
-                    }
+                    [one] if one.outcome == "reinforced" => format!(
+                        "already stored as #{}; reinforced it instead of saving a copy \
+                         (update_memory changes its importance or type)",
+                        one.id
+                    ),
                     [one] => format!("saved #{}", one.id),
-                    many => format!("saved as {} pieces: {}", many.len(), ids(many)),
+                    many => format!(
+                        "saved as {} pieces: {}; read_memory with any of them returns the whole text",
+                        many.len(),
+                        ids(many)
+                    ),
                 };
                 if !redacted.is_empty() {
                     text.push_str(&format!("; masked {} before storing it", redacted.join(", ")));
@@ -610,6 +646,55 @@ impl ClawgMcp {
         }
     }
 
+    /// Another agent's save is refused as missing, as in `delete_memory_impl`.
+    pub async fn read_memory_impl(
+        &self,
+        agent_id: &str,
+        args: ReadMemoryArgs,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let client = match self.daemon().await {
+            Ok(c) => c,
+            Err(failure) => return Ok(failure),
+        };
+        match client.read_save(args.kind.as_deref().unwrap_or("memory"), args.id, Some(agent_id)).await {
+            Ok(save) => Self::ok(format_save(&save)),
+            Err(e) => Self::failed(Self::read_failure_text(&e)),
+        }
+    }
+
+    /// A daemon older than the save route answers its own bare 404, with no
+    /// error text of the daemon's; telling the model the row is missing would
+    /// be false.
+    fn read_failure_text(err: &ClientError) -> String {
+        match err {
+            ClientError::Daemon { status: 404, message, .. } if message == "404 Not Found" => {
+                "the running clawg daemon cannot read a save; restart it with the installed clawg \
+                 (`clawg stop`, then call again)"
+                    .to_string()
+            }
+            other => Self::explain(other),
+        }
+    }
+
+    /// Another agent's row is refused as missing, as in `delete_memory_impl`.
+    pub async fn update_memory_impl(
+        &self,
+        agent_id: &str,
+        args: UpdateMemoryArgs,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let client = match self.daemon().await {
+            Ok(c) => c,
+            Err(failure) => return Ok(failure),
+        };
+        match client
+            .update(&args.kind, args.id, args.importance, args.memory_type.as_deref(), Some(agent_id))
+            .await
+        {
+            Ok(updated) => Self::ok(format_update(&updated)),
+            Err(e) => Self::failed(Self::explain(&e)),
+        }
+    }
+
     /// Both rows must be the calling agent's, as in `delete_memory_impl`.
     pub async fn resolve_conflict_impl(
         &self,
@@ -697,10 +782,10 @@ impl ClawgMcp {
         description = "Store something worth remembering across sessions: a fact about the \
                        user or their project, a preference they stated, or a decision that was \
                        made. Save one fact per call, in a few sentences: a long text is split \
-                       into separate pieces that are found independently and never reassembled. \
-                       Write the content so it still makes sense months from now, with no \
+                       into pieces that search finds one at a time, and read_memory returns it \
+                       whole. Write the content so it still makes sense months from now, with no \
                        conversation around it. Returns the id of each stored piece, which \
-                       delete_memory accepts, or why nothing was stored."
+                       update_memory and delete_memory accept, or why nothing was stored."
     )]
     async fn save_memory(
         &self,
@@ -719,7 +804,9 @@ impl ClawgMcp {
                        numbered list of the memories close in relevance to the best match (at \
                        least two), with their ids, kinds and relevance scores; a short list \
                        means the rest scored far lower, not that nothing else is stored. \
-                       Content longer than 500 characters is truncated."
+                       Content longer than 500 characters is truncated. A hit marked piece=K/N \
+                       is the best matching piece K of a long text saved as N pieces; \
+                       read_memory with its id returns the whole text."
     )]
     async fn search_memory(
         &self,
@@ -761,10 +848,26 @@ impl ClawgMcp {
     }
 
     #[tool(
+        name = "read_memory",
+        description = "Read the whole text of a memory by id. A long text is saved as several \
+                       pieces, and search shows one of them, marked piece=K/N, cut at 500 \
+                       characters; pass its id to get every piece joined in order. Returns which \
+                       piece the id is, the ids of the save (a deleted piece shows as missing) \
+                       and the text."
+    )]
+    async fn read_memory(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(args): Parameters<ReadMemoryArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.read_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
+    }
+
+    #[tool(
         name = "delete_memory",
         description = "Delete one stored memory by id and kind. Get the id from \
-                       `search_memory` or `list_memories` first — ids are per-kind, so the \
-                       same number exists in all three tables."
+                       `search_memory`, `list_memories` or `recall_context` first — ids are \
+                       per-kind, so the same number exists in all three tables."
     )]
     async fn delete_memory(
         &self,
@@ -772,6 +875,22 @@ impl ClawgMcp {
         Parameters(args): Parameters<DeleteMemoryArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         self.delete_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
+    }
+
+    #[tool(
+        name = "update_memory",
+        description = "Correct the importance or the type of one stored memory, by id and kind, \
+                       when the user says it matters more or less than it was saved with, or \
+                       that it is a different kind of memory. Pass only what changes. To change \
+                       what a memory says, save the new text and delete the old one instead. \
+                       Returns the memory's importance, type and tier after the change."
+    )]
+    async fn update_memory(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(args): Parameters<UpdateMemoryArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.update_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
     }
 
     #[tool(
@@ -1380,20 +1499,22 @@ mod tests {
             "recall_context",
             "list_memories",
             "delete_memory",
+            "update_memory",
             "resolve_conflict",
             "synthesize",
             "search_project",
             "memory_status",
+            "read_memory",
         ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}: {names:?}");
         }
-        assert_eq!(names.len(), 9, "no extra tools: {names:?}");
+        assert_eq!(names.len(), 11, "no extra tools: {names:?}");
     }
 
     /// The memory viewer (`clawg memories`) is for the person at the terminal.
     /// Handing a model its filters by agent and project, or its text search over
     /// every row, would let it read across agents; so the tool a model sees keeps
-    /// exactly its five arguments, and the set of tools does not grow.
+    /// exactly its five arguments, and no other tool takes the viewer's filters.
     #[tokio::test]
     async fn the_viewer_is_not_exposed_to_the_model() {
         let (b, _d) = bridge().await;
@@ -1407,12 +1528,14 @@ mod tests {
                 "delete_memory",
                 "list_memories",
                 "memory_status",
+                "read_memory",
                 "recall_context",
                 "resolve_conflict",
                 "save_memory",
                 "search_memory",
                 "search_project",
                 "synthesize",
+                "update_memory",
             ]
         );
 
@@ -1538,14 +1661,38 @@ mod tests {
         assert!(!schema.contains("Defaults to a plain chat message"), "schema: {schema}");
     }
 
-    /// A long save is split into chunks stored as unrelated rows, and no tool
-    /// can put them back together; one fact per call is the only way the model
-    /// gets back what it saved.
+    /// `recall_context` prints `#id` before a `memory` hit's type and names
+    /// any other kind; the tools that take an id still require the kind.
+    #[tokio::test]
+    async fn memory_id_docs_name_recall_context_and_the_default_kind() {
+        let (b, _d) = bridge().await;
+        for name in ["delete_memory", "update_memory"] {
+            let schema = serde_json::to_string(&tool(&b, name).input_schema).expect("schema").replace("\\n", " ");
+            assert!(schema.contains("recall_context"), "{name} schema: {schema}");
+            assert!(schema.contains("no kind in front of its type is a memory"), "{name} schema: {schema}");
+        }
+        let d = description(&b, "delete_memory");
+        assert!(d.contains("recall_context"), "description: {d}");
+    }
+
+    /// A long save is split into pieces that are searched one by one; one
+    /// fact per call is still what search finds best, and `read_memory` is how
+    /// the model gets back a long text whole.
     #[tokio::test]
     async fn save_memory_asks_for_one_fact_per_call() {
         let (b, _d) = bridge().await;
         let d = description(&b, "save_memory");
         assert!(d.contains("one fact"), "description: {d}");
+        assert!(d.contains("read_memory"), "description: {d}");
+        assert!(!d.contains("never reassembled"), "description: {d}");
+    }
+
+    #[tokio::test]
+    async fn search_memory_explains_the_piece_of_a_long_save() {
+        let (b, _d) = bridge().await;
+        let d = description(&b, "search_memory");
+        assert!(d.contains("piece=K/N"), "description: {d}");
+        assert!(d.contains("read_memory"), "description: {d}");
     }
 
     /// Retrieval is semantic: measured on the golden set, keyword queries find
@@ -1702,7 +1849,8 @@ mod tests {
                 memories: vec![saved(57, "reinforced")],
                 redacted: vec!["github_token".into(), "jwt".into()],
             })),
-            Ok("already stored as #57; reinforced it instead of saving a copy; \
+            Ok("already stored as #57; reinforced it instead of saving a copy \
+                (update_memory changes its importance or type); \
                 masked github_token, jwt before storing it"
                 .to_string())
         );
@@ -1720,11 +1868,13 @@ mod tests {
                 memories: vec![saved(57, "inserted"), saved(58, "inserted"), saved(59, "reinforced")],
                 redacted: vec![],
             })),
-            Ok("saved as 3 pieces: #57, #58, #59".to_string())
+            Ok("saved as 3 pieces: #57, #58, #59; read_memory with any of them returns the whole text".to_string())
         );
         assert_eq!(
             text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "reinforced")], redacted: vec![] })),
-            Ok("already stored as #57; reinforced it instead of saving a copy".to_string())
+            Ok("already stored as #57; reinforced it instead of saving a copy \
+                (update_memory changes its importance or type)"
+                .to_string())
         );
         assert_eq!(
             text(Ok(SaveOutcome::Queued { reason: Some("unconfirmed".into()) })),
@@ -1969,6 +2119,87 @@ mod tests {
             .await
             .expect("call");
         assert!(!is_error(&r), "the owner deletes it: {}", text(&r));
+    }
+
+    fn read_args(id: i64) -> ReadMemoryArgs {
+        ReadMemoryArgs { id, kind: None }
+    }
+
+    /// The ids `save_memory` printed for a save of several pieces.
+    async fn saved_pieces(b: &ClawgMcp, agent: &str, content: &str) -> Vec<i64> {
+        let saved = text(&b.save_memory_impl(agent, save_args(content)).await.expect("save"));
+        let list = saved.split_once(": ").map(|(_, rest)| rest).unwrap_or_default();
+        let list = list.split(';').next().unwrap_or_default();
+        list.split(", ").filter_map(|id| id.trim_start_matches('#').parse().ok()).collect()
+    }
+
+    #[tokio::test]
+    async fn read_memory_returns_the_whole_save() {
+        let (b, _d) = bridge().await;
+        let content = (0..600).map(|i| format!("w{i:05}")).collect::<Vec<_>>().join(" ");
+        let ids = saved_pieces(&b, "agent-a", &content).await;
+        assert_eq!(ids.len(), 3, "the fixture is a save of three pieces");
+
+        let r = b.read_memory_impl("agent-a", read_args(ids[1])).await.expect("call");
+
+        assert!(!is_error(&r), "{}", text(&r));
+        let listed = ids.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(", ");
+        assert_eq!(text(&r), format!("#{} is piece 2 of 3 of one save: {listed}\n{content}", ids[1]));
+    }
+
+    #[tokio::test]
+    async fn an_agent_cannot_read_another_agents_save() {
+        let (b, _d) = bridge().await;
+        let id = saved_id(&b, "agent-a", "agent a keeps its release notes in the wiki").await;
+
+        let other = b.read_memory_impl("agent-b", read_args(id)).await.expect("call");
+        let missing = b.read_memory_impl("agent-b", read_args(999_999)).await.expect("call");
+
+        assert!(is_error(&other), "another agent's save must not be readable: {}", text(&other));
+        assert_eq!(text(&other).replace(&id.to_string(), "N"), text(&missing).replace("999999", "N"));
+        let own = b.read_memory_impl("agent-a", read_args(id)).await.expect("call");
+        assert_eq!(text(&own), format!("#{id}\nagent a keeps its release notes in the wiki"));
+    }
+
+    #[test]
+    fn a_daemon_without_the_save_route_is_named_as_such() {
+        let old = daemon_error(404, "404 Not Found", ErrorDetails::default());
+        assert!(ClawgMcp::read_failure_text(&old).contains("restart"), "{}", ClawgMcp::read_failure_text(&old));
+        let missing = daemon_error(404, "no Memory row with id 7", ErrorDetails::default());
+        assert_eq!(ClawgMcp::read_failure_text(&missing), ClawgMcp::explain(&missing));
+    }
+
+    fn update_args(id: i64, importance: Option<f64>, memory_type: Option<&str>) -> UpdateMemoryArgs {
+        UpdateMemoryArgs { id, kind: "memory".into(), importance, memory_type: memory_type.map(Into::into) }
+    }
+
+    #[tokio::test]
+    async fn update_memory_changes_an_own_memory_and_says_how_it_ended() {
+        let (b, _d) = bridge().await;
+        let id = saved_id(&b, "agent-a", "the deploy script lives in ops/deploy.sh").await;
+
+        let r = b.update_memory_impl("agent-a", update_args(id, Some(2.0), Some("user_preference"))).await.expect("call");
+
+        assert!(!is_error(&r), "{}", text(&r));
+        assert_eq!(text(&r), format!("updated #{id} memory: user_preference, importance 2.0, tier 1"));
+        let listed = text(&b.list_memories_impl("agent-a", list_all()).await.expect("list"));
+        assert!(listed.contains(&format!("#{id} memory user_preference t1 imp=2.0")), "{listed}");
+
+        let r = b.update_memory_impl("agent-a", update_args(id, Some(11.0), None)).await.expect("call");
+        assert!(is_error(&r), "{}", text(&r));
+        assert!(text(&r).contains("importance"), "{}", text(&r));
+    }
+
+    #[tokio::test]
+    async fn an_agent_cannot_update_another_agents_memory() {
+        let (b, _d) = bridge().await;
+        let id = saved_id(&b, "agent-a", "agent a reviews pull requests on mondays").await;
+
+        let r = b.update_memory_impl("agent-b", update_args(id, Some(9.5), None)).await.expect("call");
+
+        assert!(is_error(&r), "another agent's memory must not change: {}", text(&r));
+        let listed = text(&b.list_memories_impl("agent-a", list_all()).await.expect("list"));
+        assert!(listed.contains("imp=5.0"), "the row must stay as it was: {listed}");
     }
 
     #[tokio::test]

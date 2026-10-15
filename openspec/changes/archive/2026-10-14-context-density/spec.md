@@ -16,7 +16,7 @@
 Cada hit MUST imprimirse como un encabezado de una línea seguido del texto en la misma línea:
 
 - `kind = memory`: `[YYYY-MM-DD #id tipo] texto`
-- otro kind: `[YYYY-MM-DD #id kind/tipo] texto`, con `kind` en minúsculas (`episodic`, `procedural`).
+- otro kind: `[YYYY-MM-DD #id kind/tipo] texto`, con `kind` en minúsculas (`episodic`, `procedural`). Para esos kinds la búsqueda pone el tipo fijo `episode` o `procedure` (`crates/clawg-core/src/memory/search.rs:130`, `:145`).
 
 Si el texto tiene varias líneas, las siguientes MUST seguir tal cual (líneas en blanco y código incluidos) hasta el próximo encabezado de hit o separador `=== `. No se imprime `SOURCE:`, `TYPE:` ni `CONTENT:`.
 
@@ -26,8 +26,8 @@ Si el texto tiene varias líneas, las siguientes MUST seguir tal cual (líneas e
 - THEN contiene la línea `[2026-10-10 #57 semantic_fact] usar sqlite`
 
 #### Escenario: otro kind
-- GIVEN un hit procedural id 3, tipo `skill`
-- THEN su línea empieza con `[<fecha> #3 procedural/skill] `
+- GIVEN un hit procedural id 3, tipo `procedure`
+- THEN su línea empieza con `[<fecha> #3 procedural/procedure] `
 
 #### Escenario: texto multilínea
 - GIVEN un hit con texto `fn main() {\n    run();\n\n    stop();\n}` seguido de otro hit
@@ -38,9 +38,9 @@ Si el texto tiene varias líneas, las siguientes MUST seguir tal cual (líneas e
 
 ## R2. Referencia por id en conflictos
 
-Cada par MUST imprimir los ids de sus dos lados como `#id`: son los valores que `resolve_conflict` recibe como `keep` y `other` (`ResolveConflictArgs`, `crates/clawg-cli/src/mcp/server.rs:219-232`), y los dos son ids de `memory`.
+Cada par MUST imprimir los ids de sus dos lados como `#id`: son los valores que `resolve_conflict` recibe como `keep` y `other` (`ResolveConflictArgs`, `crates/clawg-cli/src/mcp/server.rs:237-249`), y los dos son ids de `memory`.
 
-Un lado que es hit mostrado MUST imprimirse sólo como `#id`. Un lado que no es hit mostrado (fila del workspace, o fila fuera del prompt) MUST imprimirse con su texto completo bajo el encabezado `[YYYY-MM-DD #id]`. Un par con ambos lados mostrados MUST NOT imprimir ningún texto.
+Un lado que es hit mostrado MUST imprimirse sólo como `#id`. Un lado que no es hit mostrado (fila del workspace, o fila fuera del prompt) MUST imprimirse con su texto completo bajo el encabezado `[YYYY-MM-DD #id]` la primera vez que aparece en el bloque, y sólo como `#id` las siguientes. Así el texto de una fila aparece a lo sumo una vez en el bloque aunque esté en varios pares: en una cadena de disputas, la fila del medio es nueva en un par y vieja en otro. Un par con ambos lados mostrados MUST NOT imprimir ningún texto.
 
 Formato de un grupo (R3):
 
@@ -63,7 +63,11 @@ OLD #M                      | OLD [YYYY-MM-DD #M] texto
 - GIVEN old 1 es una fila del workspace y new 2 un hit
 - THEN `OLD [<fecha> #1] <texto>` lleva el texto
 
-**Test:** `conflict_block_cites_shown_hits_by_id_and_prints_text_only_for_the_rest` en `prompt_builder.rs`. Falla hoy: `format_conflict_pair` copia ambos textos (`:299-311`).
+#### Escenario: cadena
+- GIVEN los pares (old 2, new 3), (old 1, new 3) y (old 1, new 2), ninguno con hits
+- THEN el bloque es `NEW [<fecha> #3 disputed] <texto de 3>`, `OLD [<fecha> #2] <texto de 2>`, `OLD [<fecha> #1] <texto de 1>`, `NEW #2`, `OLD #1`
+
+**Test:** `conflict_block_cites_shown_hits_by_id_and_prints_text_only_for_the_rest` en `prompt_builder.rs`. Falla hoy: `format_conflict_pair` copia ambos textos (`:299-311`). La cadena, `a_row_in_several_pairs_prints_its_text_once`: se agregó en la verificación, cuando la prueba en el perfil dev imprimió dos veces el texto de la fila del medio.
 
 ## R3. Agrupación por fila nueva
 
@@ -130,7 +134,7 @@ Tras ordenar, el bloque MUST conservar los primeros 5 pares (el tope cuenta pare
 
 ## R7. Workspace en el prompt
 
-El workspace entregado al modelo MUST NOT contener `<!-- `, ni sección USER vacía, ni encabezado `## ` sin bullets debajo. El contenido no vacío de USER MUST conservarse (sin marcadores, recortado). Un archivo sin `AUTO_START` MUST seguir entregándose entero (`:342-345`). Si no queda nada, no se emite la sección WORKSPACE. El archivo en disco MUST ser byte a byte idéntico antes y después de un recall por este camino de lectura/render. El comentario de `:107-108` MUST pasar a describir lo que hace el código.
+El workspace entregado al modelo MUST NOT contener `<!-- `, ni sección USER vacía, ni un encabezado `## ` de la sección AUTO sin bullets debajo. El contenido no vacío de USER MUST conservarse tal cual lo escribió el usuario, encabezados incluidos, sin marcadores y sin líneas en blanco al principio ni al final: la poda de encabezados sólo mira la sección AUTO, que es la que genera `render_rows` (`workspace.rs:445-464`). Un archivo sin `AUTO_START` MUST seguir entregándose entero (`:342-345`). Si no queda nada, no se emite la sección WORKSPACE. El archivo en disco MUST ser byte a byte idéntico antes y después de un recall por este camino de lectura/render. El comentario de `:107-108` MUST pasar a describir lo que hace el código.
 
 #### Escenario: sin marcadores
 - GIVEN un archivo con AUTO/USER, un bullet bajo `## User Preferences` y los otros dos encabezados vacíos
@@ -160,17 +164,17 @@ El workspace entregado al modelo MUST NOT contener `<!-- `, ni sección USER vac
 
 **Tests:** `a_multi_line_hit_runs_until_the_next_header`, `conflict_text_yields_no_segments` en `parse.rs`; `read_context_finds_rows_in_hit_lines_and_workspace_bullets` en `agent_view/mod.rs`, que reemplaza a `read_context_finds_rows_in_hit_blocks_and_workspace_bullets` (`:371`). Fallan hoy: no reconocen `#id`.
 
-## R9. Doc de `delete_memory`
+## R9. Doc de `delete_memory` y `update_memory`
 
-La doc de `DeleteMemoryArgs.id` (`server.rs:209-211`) y la descripción de la tool (`:727-728`) MUST nombrar `recall_context` además de `search_memory` y `list_memories`, y decir que un hit sin kind explícito es `memory`. `kind` sigue siendo obligatorio (`:213-216`).
+La doc de `DeleteMemoryArgs.id` (`server.rs:210-211`), la de `UpdateMemoryArgs.id` (`:221-222`) y la descripción de `delete_memory` (`:764-766`) MUST nombrar `recall_context` además de `search_memory` y `list_memories`, y decir que un hit sin kind explícito es `memory`. `kind` sigue siendo obligatorio en las dos (`:212-216`, `:223-225`).
 
-**Test:** `delete_memory_id_doc_names_recall_context_and_default_kind` en `server.rs` (mod tests): el schema de `DeleteMemoryArgs` contiene ambos textos. Falla hoy.
+**Test:** `memory_id_docs_name_recall_context_and_the_default_kind` en `server.rs` (mod tests): los schemas de `DeleteMemoryArgs` y `UpdateMemoryArgs`, y la descripción de `delete_memory`, contienen ambos textos. Falla hoy.
 
 ## R10. Sin cambios
 
-- Prompt vacío: `format_context` devuelve `no context yet` (`crates/clawg-cli/src/mcp/tools.rs:218-224`).
-- El aviso de `synthesize` que `format_recall` agrega después del prompt (`tools.rs:205-211`) no cambia. Con prompt vacío y aviso, la salida sigue siendo `no context yet` seguido del aviso.
-- Orden y separadores de secciones, y `K_FINAL`, sin cambios. El separador `=== ACTIVE CONFLICTS (review needed) ===` (`prompt_builder.rs:21`) no cambia: lo nombran las instrucciones del servidor (`server.rs:111`) y la doc de `resolve_conflict` (`:221`).
+- Prompt vacío: `format_context` devuelve `no context yet` (`crates/clawg-cli/src/mcp/tools.rs:229-235`).
+- El aviso de `synthesize` que `format_recall` agrega después del prompt (`tools.rs:216-222`) no cambia. Con prompt vacío y aviso, la salida sigue siendo `no context yet` seguido del aviso.
+- Orden y separadores de secciones, y `K_FINAL`, sin cambios. El separador `=== ACTIVE CONFLICTS (review needed) ===` (`prompt_builder.rs:21`) no cambia: lo nombran las instrucciones del servidor (`server.rs:111`) y la doc de `resolve_conflict` (`:238`, `:794`).
 - La salida de `search_memory` es idéntica.
 - No se agregan escrituras. `fetch_active_conflicts` sigue siendo un `SELECT` y sigue trayendo sólo pares con un lado mostrado.
 

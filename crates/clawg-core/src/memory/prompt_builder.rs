@@ -1,5 +1,7 @@
 //! Assembles the 4-block memory prefix for the system prompt.
 
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::memory::{
@@ -30,6 +32,8 @@ pub(crate) const SEP_LONGTERM_TEST: &str = SEP_LONGTERM;
 
 const RECENT_WINDOW_MS: i64 = 7 * 86_400_000;
 const K_FINAL: usize = 10;
+/// Pairs the conflicts block prints; the rest are only counted.
+const MAX_CONFLICT_PAIRS: usize = 5;
 
 // ---------------------------------------------------------------------------
 // Internal data types
@@ -69,12 +73,9 @@ struct ConflictPair {
     old_id: i64,
     old_created_at: TimestampMs,
     old_content: String,
-    old_importance: f64,
-    old_tier: i64,
     new_id: i64,
     new_created_at: TimestampMs,
     new_content: String,
-    new_importance: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -105,7 +106,7 @@ pub async fn build_memory_prompt(
     access_tracker: Option<&AccessTracker>,
 ) -> Result<String, MemoryError> {
     // 1. Read workspace file (may be empty on fresh install or read failure).
-    // Strip structural markers — emit only the payload content to the LLM.
+    // Only its content reaches the model: no markers, no empty headings.
     let workspace_content = {
         let raw = workspace
             .read(agent_id, project_id)
@@ -114,7 +115,7 @@ pub async fn build_memory_prompt(
                 log::warn!("workspace read failed: {e}; treating as empty");
                 String::new()
             });
-        strip_empty_workspace_markers(&raw)
+        workspace_for_prompt(&raw)
     };
 
     // 2. Compute query embedding ONLY if embedder is available.
@@ -194,12 +195,20 @@ pub async fn build_memory_prompt(
 
     // 3. Bucket hits into RECENT vs LONG-TERM.
     let (recent, longterm) = bucket_by_recency(hits, TimestampMs::now());
+    let hit_positions: HashMap<i64, usize> = recent
+        .iter()
+        .chain(&longterm)
+        .enumerate()
+        .filter(|(_, h)| h.kind == TableKind::Memory)
+        .map(|(position, h)| (h.id, position))
+        .collect();
 
     // 4. Fetch the conflicts on what this prompt shows; the block is emitted only when non-empty.
     let conflicts = fetch_active_conflicts(store, agent_id, &shown).await.unwrap_or_else(|e| {
         log::warn!("fetch_active_conflicts failed: {e}; CONFLICTS block omitted");
         Vec::new()
     });
+    let (conflicts, omitted) = rank_conflicts(conflicts, &hit_positions, MAX_CONFLICT_PAIRS);
 
     // 5. Assemble in order: WORKSPACE → RECENT → LONG-TERM → CONFLICTS.
     let mut out = String::new();
@@ -239,10 +248,7 @@ pub async fn build_memory_prompt(
         }
         out.push_str(SEP_CONFLICTS);
         out.push('\n');
-        for p in &conflicts {
-            out.push_str(&format_conflict_pair(p));
-            out.push('\n');
-        }
+        out.push_str(&format_conflict_block(&conflicts, &hit_positions, omitted));
     }
 
     Ok(out)
@@ -285,29 +291,76 @@ fn unix_millis_to_ymd(ts: TimestampMs) -> (i32, u32, u32) {
     unix_secs_to_ymd(ts.as_millis_i64().div_euclid(1_000))
 }
 
-/// Formats a single retrieval hit into the canonical line format.
-/// `[YYYY-MM-DD] SOURCE: {kind:?} | TYPE: {memory_type}\nCONTENT: {content}`
+/// `[YYYY-MM-DD #id type] content`. Ids are numbered per table, so any kind
+/// other than `memory` is named before the type (`procedural/procedure`).
 fn format_hit_line(hit: &RankedHit) -> String {
     let (y, m, d) = unix_millis_to_ymd(hit.created_at);
-    format!(
-        "[{y:04}-{m:02}-{d:02}] SOURCE: {:?} | TYPE: {}\nCONTENT: {}",
-        hit.kind, hit.memory_type, hit.content
-    )
+    let kind = match hit.kind {
+        TableKind::Memory => String::new(),
+        other => format!("{other:?}/").to_lowercase(),
+    };
+    let piece = hit.piece.map(|p| format!(" piece={}/{}", p.piece, p.pieces)).unwrap_or_default();
+    format!("[{y:04}-{m:02}-{d:02} #{} {kind}{}{piece}] {}", hit.id, hit.memory_type, hit.content)
 }
 
-/// Formats a conflict pair into a 5-line block.
-fn format_conflict_pair(p: &ConflictPair) -> String {
-    let (oy, om, od) = unix_millis_to_ymd(p.old_created_at);
-    let (ny, nm, nd) = unix_millis_to_ymd(p.new_created_at);
-    format!(
-        "[{oy:04}-{om:02}-{od:02}] OLD: \"{}\" [memory:{}, importance:{:.0}, tier:{}]\n\
-         [{ny:04}-{nm:02}-{nd:02}] NEW: \"{}\" [memory:{}, importance:{:.0}, status:disputed]\n\
-         NOTE: estas memorias se contradicen y aún no resolviste cuál vale.\n\
-         Si vas a tomar una decisión que dependa de esto, preguntale al usuario.\n\
-         Con su respuesta, llamá a resolve_conflict (keep = la que vale, other = la otra).",
-        p.old_content, p.old_id, p.old_importance, p.old_tier,
-        p.new_content, p.new_id, p.new_importance,
-    )
+/// Printed once above the pairs: it is the same for every one of them.
+const CONFLICT_NOTE: &str = "\
+NOTE: estas memorias se contradicen y aún no resolviste cuál vale.
+Si vas a tomar una decisión que dependa de esto, preguntale al usuario.
+Con su respuesta, llamá a resolve_conflict (keep = la que vale, other = la otra).";
+
+/// Orders pairs by the earliest printed hit among their sides and keeps the
+/// first `cap`, returning how many were left out. The query cannot order them:
+/// a row's position is only known once the prompt is laid out. A pair that
+/// only touches a workspace row has no position and goes last.
+fn rank_conflicts(
+    mut pairs: Vec<ConflictPair>,
+    hit_positions: &HashMap<i64, usize>,
+    cap: usize,
+) -> (Vec<ConflictPair>, usize) {
+    let rank = |p: &ConflictPair| {
+        [p.new_id, p.old_id].iter().filter_map(|id| hit_positions.get(id)).min().copied().unwrap_or(usize::MAX)
+    };
+    pairs.sort_by_key(|p| (rank(p), Reverse(p.new_id), p.old_id));
+    let omitted = pairs.len().saturating_sub(cap);
+    pairs.truncate(cap);
+    (pairs, omitted)
+}
+
+/// The conflicts block under its separator: the note, then one group per
+/// disputed row with a line for each row it disputes, then how many pairs the
+/// cap left out. A side the prompt already prints as a hit, or whose text the
+/// block already printed, is cited by id; any other side, a workspace row
+/// included, carries its text, since a workspace bullet has no id to point at.
+fn format_conflict_block(pairs: &[ConflictPair], hit_positions: &HashMap<i64, usize>, omitted: usize) -> String {
+    let mut groups: Vec<(&ConflictPair, Vec<&ConflictPair>)> = Vec::new();
+    for p in pairs {
+        match groups.iter_mut().find(|(first, _)| first.new_id == p.new_id) {
+            Some((_, members)) => members.push(p),
+            None => groups.push((p, vec![p])),
+        }
+    }
+    let mut printed: HashSet<i64> = HashSet::new();
+    let mut side = |id: i64, created_at: TimestampMs, content: &str, label: &str| {
+        if hit_positions.contains_key(&id) || !printed.insert(id) {
+            format!("#{id}")
+        } else {
+            let (y, m, d) = unix_millis_to_ymd(created_at);
+            format!("[{y:04}-{m:02}-{d:02} #{id}{label}] {content}")
+        }
+    };
+
+    let mut out = format!("{CONFLICT_NOTE}\n");
+    for (first, members) in groups {
+        out.push_str(&format!("NEW {}\n", side(first.new_id, first.new_created_at, &first.new_content, " disputed")));
+        for p in members {
+            out.push_str(&format!("OLD {}\n", side(p.old_id, p.old_created_at, &p.old_content, "")));
+        }
+    }
+    if omitted > 0 {
+        out.push_str(&format!("(+{omitted} conflictos más sin mostrar)\n"));
+    }
+    out
 }
 
 /// Partitions hits into (recent, longterm) at `now - RECENT_WINDOW_MS`. A stamp
@@ -328,43 +381,59 @@ fn bucket_by_recency(hits: Vec<RankedHit>, now: TimestampMs) -> (Vec<RankedHit>,
     (recent, longterm)
 }
 
-/// Strips known empty structural markers from workspace content.
-/// Returns empty string ONLY when the workspace file was auto-generated with
-/// no payload content (has both AUTO_START/AUTO_END markers but no bullet items
-/// and no USER section content). Content that lacks the structural markers
-/// entirely (e.g., plain text files) is considered meaningful.
-fn strip_empty_workspace_markers(raw: &str) -> String {
-    if raw.is_empty() {
-        return String::new();
-    }
-    use crate::memory::workspace::{AUTO_START, USER_START, USER_END};
+/// What the model gets of the workspace file: the AUTO section without its
+/// empty headings, and the user's own text as written, both without the
+/// markers. The markers stay in the file, where regeneration needs them to
+/// find the USER section; to the model they are noise. A file without the
+/// AUTO marker was not generated, so it is handed over whole.
+fn workspace_for_prompt(raw: &str) -> String {
+    use crate::memory::workspace::{AUTO_END, AUTO_START, USER_END, USER_START};
 
-    // If the file doesn't have the AUTO-START marker, it's plain content → keep it.
-    if !raw.contains(AUTO_START) {
+    let Some(auto_start) = raw.find(AUTO_START) else {
         return raw.to_string();
-    }
-
-    // File has the structured marker framework. Check for actual payload content.
-    let has_bullets = raw.contains("\n- ");
-    let has_user_content = if let (Some(us), Some(ue)) = (raw.find(USER_START), raw.find(USER_END)) {
-        let inner = &raw[us + USER_START.len()..ue];
-        inner.chars().any(|c| !c.is_whitespace())
-    } else {
-        false
     };
+    let body = &raw[auto_start + AUTO_START.len()..];
+    let (auto, rest) = body.split_once(AUTO_END).unwrap_or((body, ""));
+    let rest = rest.replace(USER_START, "").replace(USER_END, "");
+    let auto = without_empty_headings(auto);
+    [&raw[..auto_start], auto.as_str(), rest.as_str()]
+        .into_iter()
+        .map(trim_blank_lines)
+        .filter(|piece| !piece.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
-    if has_bullets || has_user_content {
-        raw.to_string()
-    } else {
-        String::new()
+/// Drops each `## ` heading with nothing under it before the next one.
+fn without_empty_headings(section: &str) -> String {
+    let lines: Vec<&str> = section.lines().collect();
+    let mut out = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        let empty_heading = line.starts_with("## ")
+            && lines[i + 1..].iter().take_while(|l| !l.starts_with("## ")).all(|l| l.trim().is_empty());
+        if !empty_heading {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// `text` without its leading and trailing blank lines; the indentation of
+/// its first line stays.
+fn trim_blank_lines(text: &str) -> &str {
+    let text = text.trim_end();
+    match text.find(|c: char| !c.is_whitespace()) {
+        Some(first) => &text[text[..first].rfind('\n').map_or(0, |n| n + 1)..],
+        None => "",
     }
 }
 
 /// Fetches the disputed pairs with a side among `shown`, the `memory` ids the
 /// prompt hands the model.
 ///
-/// Every other pair is left out: the block carries both rows in full, and
-/// unfiltered it grew with the store rather than with the question.
+/// Every other pair is left out: unfiltered, the block grew with the store
+/// rather than with the question.
 async fn fetch_active_conflicts(
     store: &MemoryStore,
     agent_id: &str,
@@ -379,8 +448,8 @@ async fn fetch_active_conflicts(
         .conn
         .call(move |c| -> Result<Vec<ConflictPair>, rusqlite::Error> {
             let mut stmt = c.prepare(
-                "SELECT m_old.id, m_old.created_at, m_old.content, m_old.importance, m_old.tier,
-                        m_new.id, m_new.created_at, m_new.content, m_new.importance
+                "SELECT m_old.id, m_old.created_at, m_old.content,
+                        m_new.id, m_new.created_at, m_new.content
                  FROM memory m_new
                  JOIN memory m_old
                    ON m_old.id IN (SELECT value FROM json_each(m_new.disputed_against))
@@ -397,12 +466,9 @@ async fn fetch_active_conflicts(
                         old_id: row.get(0)?,
                         old_created_at: row.get(1)?,
                         old_content: row.get(2)?,
-                        old_importance: row.get(3)?,
-                        old_tier: row.get(4)?,
-                        new_id: row.get(5)?,
-                        new_created_at: row.get(6)?,
-                        new_content: row.get(7)?,
-                        new_importance: row.get(8)?,
+                        new_id: row.get(3)?,
+                        new_created_at: row.get(4)?,
+                        new_content: row.get(5)?,
                     })
                 })?
                 .filter_map(|r| r.ok())
@@ -503,72 +569,181 @@ mod tests {
         assert_eq!(unix_millis_to_ymd(TimestampMs::from_unix_millis(-1)), (1969, 12, 31));
     }
 
-    #[test]
-    fn format_hit_line_emits_canonical_format() {
-        let hit = RankedHit {
-            id: 1,
-            kind: TableKind::Memory,
-            content: "test content".to_string(),
-            memory_type: "chat_message".to_string(),
+    fn hit_at_2023_11_14(id: i64, kind: TableKind, memory_type: &str, content: &str) -> RankedHit {
+        RankedHit {
+            id,
+            kind,
+            content: content.to_string(),
+            memory_type: memory_type.to_string(),
             tier: 2,
             status: "active".to_string(),
             score: 0.9,
             distance: 0.1,
             created_at: TimestampMs::from_unix_millis(1_700_000_000_000),
-        };
-        let line = format_hit_line(&hit);
-        assert!(
-            line.starts_with("[2023-11-14] SOURCE: Memory | TYPE: chat_message"),
-            "got: {line}"
-        );
-        assert!(line.contains("CONTENT: test content"), "got: {line}");
+            piece: None,
+        }
+    }
+
+    /// The id is what `resolve_conflict`, `update_memory` and `delete_memory`
+    /// take, and what the conflicts block cites instead of repeating a row.
+    #[test]
+    fn hit_line_is_one_header_with_id_and_text() {
+        let memory = hit_at_2023_11_14(57, TableKind::Memory, "semantic_fact", "usar sqlite");
+        assert_eq!(format_hit_line(&memory), "[2023-11-14 #57 semantic_fact] usar sqlite");
+
+        let skill = hit_at_2023_11_14(3, TableKind::Procedural, "procedure", "run the release script");
+        assert!(format_hit_line(&skill).starts_with("[2023-11-14 #3 procedural/procedure] "), "{}", format_hit_line(&skill));
+
+        let code = hit_at_2023_11_14(9, TableKind::Memory, "code_block", "fn main() {\n    run();\n\n    stop();\n}");
+        assert_eq!(format_hit_line(&code), "[2023-11-14 #9 code_block] fn main() {\n    run();\n\n    stop();\n}");
     }
 
     #[test]
-    fn format_conflict_pair_renders_both_dates_in_sane_range() {
-        let pair = ConflictPair {
-            old_id: 1,
-            old_created_at: TimestampMs::from_unix_millis(1_690_000_000_000), // ~2023-07-22
-            old_content: "old fact".to_string(),
-            old_importance: 8.0,
-            old_tier: 2,
-            new_id: 2,
-            new_created_at: TimestampMs::from_unix_millis(1_700_000_000_000), // 2023-11-14
-            new_content: "new fact".to_string(),
-            new_importance: 8.0,
-        };
-        let line = format_conflict_pair(&pair);
-        let years: Vec<i32> = line
+    fn format_hit_line_names_the_piece_of_a_long_save() {
+        let mut hit = hit_at_2023_11_14(58, TableKind::Memory, "semantic_fact", "the retry budget was set");
+        hit.piece = Some(crate::memory::search::PiecePosition { piece: 2, pieces: 4 });
+        assert_eq!(format_hit_line(&hit), "[2023-11-14 #58 semantic_fact piece=2/4] the retry budget was set");
+    }
+
+    #[test]
+    fn format_hit_line_drops_the_old_labels() {
+        let line = format_hit_line(&hit_at_2023_11_14(1, TableKind::Memory, "chat_message", "test content"));
+        for label in ["SOURCE:", "TYPE:", "CONTENT:"] {
+            assert!(!line.contains(label), "got: {line}");
+        }
+    }
+
+    fn pair(old_id: i64, new_id: i64) -> ConflictPair {
+        ConflictPair {
+            old_id,
+            old_created_at: TimestampMs::from_unix_millis(1_690_000_000_000),
+            old_content: format!("old fact {old_id}"),
+            new_id,
+            new_created_at: TimestampMs::from_unix_millis(1_700_000_000_000),
+            new_content: format!("new fact {new_id}"),
+        }
+    }
+
+    fn new_old(pairs: &[ConflictPair]) -> Vec<(i64, i64)> {
+        pairs.iter().map(|p| (p.new_id, p.old_id)).collect()
+    }
+
+    /// Hit ids 10, 20 and 30 printed at positions 0, 4 and 9. Every other id
+    /// stands for a workspace row, which has no position.
+    fn sample_positions() -> HashMap<i64, usize> {
+        HashMap::from([(10, 0), (20, 4), (30, 9)])
+    }
+
+    fn sample_pairs() -> Vec<ConflictPair> {
+        vec![pair(5, 98), pair(30, 99), pair(3, 20), pair(2, 20), pair(10, 1), pair(10, 8), pair(11, 8), pair(10, 7)]
+    }
+
+    #[test]
+    fn conflict_block_renders_both_dates_in_sane_range() {
+        let block = format_conflict_block(&[pair(1, 2)], &HashMap::new(), 0);
+        let years: Vec<i32> = block
             .lines()
-            .filter_map(|l| l.strip_prefix('['))
+            .filter_map(|l| l.split_once('[').map(|(_, rest)| rest))
             .filter_map(|l| l.split('-').next())
             .filter_map(|y| y.parse::<i32>().ok())
             .collect();
-        assert_eq!(years.len(), 2, "expected exactly 2 rendered dates, got: {line}");
+        assert_eq!(years.len(), 2, "expected exactly 2 rendered dates, got: {block}");
         for y in &years {
-            assert!(
-                (2020..=2100).contains(y),
-                "rendered year {y} is not a date anyone lived through: {line}"
-            );
+            assert!((2020..=2100).contains(y), "rendered year {y} is not a date anyone lived through: {block}");
+        }
+    }
+
+    /// `resolve_conflict` takes both ids, so each one is printed even when its
+    /// text is not.
+    #[test]
+    fn conflict_block_cites_shown_hits_by_id_and_prints_text_only_for_the_rest() {
+        let new_shown = format_conflict_block(&[pair(1, 2)], &HashMap::from([(2, 0)]), 0);
+        assert!(new_shown.contains("\nNEW #2\n"), "{new_shown}");
+        assert!(new_shown.contains("\nOLD [2023-07-22 #1] old fact 1\n"), "{new_shown}");
+        assert!(!new_shown.contains("new fact 2"), "{new_shown}");
+
+        let both_shown = format_conflict_block(&[pair(1, 2)], &HashMap::from([(1, 3), (2, 0)]), 0);
+        assert!(both_shown.contains("\nNEW #2\nOLD #1\n"), "{both_shown}");
+        assert!(!both_shown.contains("fact"), "{both_shown}");
+
+        let none_shown = format_conflict_block(&[pair(1, 2)], &HashMap::new(), 0);
+        assert!(none_shown.contains("\nNEW [2023-11-14 #2 disputed] new fact 2\nOLD [2023-07-22 #1] old fact 1\n"), "{none_shown}");
+        for dropped in ["importance", "tier", "status:"] {
+            assert!(!none_shown.contains(dropped), "{none_shown}");
         }
     }
 
     #[test]
-    fn the_conflict_note_names_the_tool() {
-        let pair = ConflictPair {
-            old_id: 11,
-            old_created_at: TimestampMs::from_unix_millis(1_690_000_000_000),
-            old_content: "old fact".to_string(),
-            old_importance: 8.0,
-            old_tier: 2,
-            new_id: 22,
-            new_created_at: TimestampMs::from_unix_millis(1_700_000_000_000),
-            new_content: "new fact".to_string(),
-            new_importance: 8.0,
+    fn a_new_row_disputing_several_old_rows_prints_its_text_once() {
+        let block = format_conflict_block(&[pair(1, 9), pair(2, 9), pair(3, 9)], &HashMap::new(), 0);
+        assert_eq!(block.matches("new fact 9").count(), 1, "{block}");
+        let after_new: Vec<&str> = block.lines().skip_while(|l| !l.starts_with("NEW ")).skip(1).collect();
+        assert_eq!(after_new, ["OLD [2023-07-22 #1] old fact 1", "OLD [2023-07-22 #2] old fact 2", "OLD [2023-07-22 #3] old fact 3"]);
+    }
+
+    /// In a chain of disputes the middle row is new in one pair and old in
+    /// another, and the oldest one is disputed twice.
+    #[test]
+    fn a_row_in_several_pairs_prints_its_text_once() {
+        let same_text = |p: ConflictPair| ConflictPair {
+            old_content: format!("fact {}", p.old_id),
+            new_content: format!("fact {}", p.new_id),
+            ..p
         };
-        let block = format_conflict_pair(&pair);
-        let note = block.lines().last().expect("a note line");
-        assert!(note.contains("resolve_conflict"), "{block}");
+        let block = format_conflict_block(&[same_text(pair(2, 3)), same_text(pair(1, 3)), same_text(pair(1, 2))], &HashMap::new(), 0);
+        let after_note: Vec<&str> = block.lines().skip_while(|l| !l.starts_with("NEW ")).collect();
+        assert_eq!(
+            after_note,
+            ["NEW [2023-11-14 #3 disputed] fact 3", "OLD [2023-07-22 #2] fact 2", "OLD [2023-07-22 #1] fact 1", "NEW #2", "OLD #1"]
+        );
+    }
+
+    #[test]
+    fn conflict_block_has_one_note() {
+        let block = format_conflict_block(&[pair(1, 7), pair(2, 8), pair(3, 9)], &HashMap::new(), 0);
+        assert_eq!(block.matches("NOTE:").count(), 1, "{block}");
+        assert_eq!(block.matches("resolve_conflict").count(), 1, "{block}");
+        assert!(block.starts_with("NOTE:"), "the note comes before the pairs: {block}");
+        assert_eq!(block.lines().filter(|l| l.starts_with("NEW ")).count(), 3, "{block}");
+    }
+
+    #[test]
+    fn the_conflict_note_names_the_tool() {
+        let block = format_conflict_block(&[pair(11, 22)], &HashMap::new(), 0);
+        let note: Vec<&str> = block.lines().take_while(|l| !l.starts_with("NEW ")).collect();
+        assert!(note.iter().any(|l| l.contains("resolve_conflict (keep = la que vale, other = la otra)")), "{block}");
+    }
+
+    /// A conflict on a standing preference would otherwise take the cap on
+    /// every call, whatever the question.
+    #[test]
+    fn conflict_pairs_rank_by_best_hit_position_workspace_only_last() {
+        let (ranked, omitted) = rank_conflicts(sample_pairs(), &sample_positions(), 10);
+        assert_eq!(omitted, 0);
+        assert_eq!(new_old(&ranked), [(8, 10), (7, 10), (1, 10), (20, 2), (20, 3), (99, 30), (98, 5), (8, 11)]);
+    }
+
+    #[test]
+    fn conflict_pair_order_ignores_input_order() {
+        let mut reversed = sample_pairs();
+        reversed.reverse();
+        let (a, _) = rank_conflicts(sample_pairs(), &sample_positions(), 10);
+        let (b, _) = rank_conflicts(reversed, &sample_positions(), 10);
+        assert_eq!(new_old(&a), new_old(&b));
+    }
+
+    #[test]
+    fn conflict_block_keeps_five_pairs_and_counts_the_rest() {
+        let eight: Vec<ConflictPair> = (1..=8).map(|i| pair(100 + i, i)).collect();
+        let (kept, omitted) = rank_conflicts(eight, &HashMap::new(), MAX_CONFLICT_PAIRS);
+        assert_eq!((kept.len(), omitted), (5, 3));
+        let block = format_conflict_block(&kept, &HashMap::new(), omitted);
+        assert_eq!(block.lines().last(), Some("(+3 conflictos más sin mostrar)"), "{block}");
+
+        let five: Vec<ConflictPair> = (1..=5).map(|i| pair(100 + i, i)).collect();
+        let (kept, omitted) = rank_conflicts(five, &HashMap::new(), MAX_CONFLICT_PAIRS);
+        assert_eq!((kept.len(), omitted), (5, 0));
+        assert!(!format_conflict_block(&kept, &HashMap::new(), omitted).contains("sin mostrar"));
     }
 
     #[test]
@@ -587,6 +762,7 @@ mod tests {
             score: 0.5,
             distance: 0.5,
             created_at: TimestampMs::from_unix_millis(ts),
+            piece: None,
         };
 
         let hits = vec![make_hit(recent_ts), make_hit(recent_ts), make_hit(old_ts)];
@@ -607,6 +783,7 @@ mod tests {
             score: 0.5,
             distance: 0.5,
             created_at: TimestampMs::from_unix_millis(0),
+            piece: None,
         };
         let now_ms: i64 = 1_700_000_000_000;
         let (recent, longterm) = bucket_by_recency(vec![hit], TimestampMs::from_unix_millis(now_ms));
@@ -626,6 +803,7 @@ mod tests {
             score: 0.5,
             distance: 0.5,
             created_at: TimestampMs::from_unix_millis(-86_400_000),
+            piece: None,
         };
         let now_ms: i64 = 1_700_000_000_000;
         let (recent, longterm) = bucket_by_recency(vec![hit], TimestampMs::from_unix_millis(now_ms));
@@ -646,6 +824,7 @@ mod tests {
             score: 0.5,
             distance: 0.5,
             created_at: TimestampMs::from_unix_millis(now_ms + 86_400_000),
+            piece: None,
         };
         let (recent, longterm) = bucket_by_recency(vec![hit], TimestampMs::from_unix_millis(now_ms));
         assert_eq!(recent.len(), 1, "a future timestamp counts as recent rather than being clamped");
@@ -824,6 +1003,50 @@ mod tests {
         assert!(!result.contains(SEP_RECENT), "no embedder → no RECENT");
     }
 
+    /// Writes `content` as agent-1's workspace file and returns the prompt.
+    async fn prompt_over_workspace(content: &str) -> (String, std::path::PathBuf, tempfile::TempDir) {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let path = wm.workspace_path("agent-1", None);
+        tokio::fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+        tokio::fs::write(&path, content).await.unwrap();
+        let prompt = build_memory_prompt(&store, &wm, None, "agent-1", None, QueryTexts::single_shot("query"), &EmittedIds::default(), None)
+            .await
+            .unwrap();
+        (prompt, path, tmp)
+    }
+
+    #[tokio::test]
+    async fn workspace_in_prompt_has_no_markers_or_empty_headings() {
+        let file = "<!-- AUTO-START -->\n## User Preferences (always active)\n- answer in spanish\n## Architectural Decisions\n## Procedural Skills\n<!-- AUTO-END -->\n\n<!-- USER-START -->\n<!-- USER-END -->\n";
+        let (prompt, _, _tmp) = prompt_over_workspace(file).await;
+        assert_eq!(prompt, "=== WORKSPACE ===\n## User Preferences (always active)\n- answer in spanish\n");
+
+        let empty = "<!-- AUTO-START -->\n## User Preferences (always active)\n## Architectural Decisions\n## Procedural Skills\n<!-- AUTO-END -->\n\n<!-- USER-START -->\n<!-- USER-END -->\n";
+        let (prompt, _, _tmp) = prompt_over_workspace(empty).await;
+        assert_eq!(prompt, "", "nothing left, so no WORKSPACE block");
+    }
+
+    /// The USER section is the user's own text: only the markers around it go.
+    #[tokio::test]
+    async fn workspace_user_section_content_is_kept_without_markers() {
+        let file = "<!-- AUTO-START -->\n## User Preferences (always active)\n## Architectural Decisions\n- use sqlite\n## Procedural Skills\n<!-- AUTO-END -->\n\n<!-- USER-START -->\n## My notes\n\nask before force-pushing\n## Empty on purpose\n<!-- USER-END -->\n";
+        let (prompt, _, _tmp) = prompt_over_workspace(file).await;
+        assert_eq!(
+            prompt,
+            "=== WORKSPACE ===\n## Architectural Decisions\n- use sqlite\n## My notes\n\nask before force-pushing\n## Empty on purpose\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_file_bytes_are_unchanged_by_rendering_the_prompt() {
+        let file = "<!-- AUTO-START -->\n## User Preferences (always active)\n- answer in spanish\n## Procedural Skills\n<!-- AUTO-END -->\n\n<!-- USER-START -->\n  indented note\n<!-- USER-END -->\n";
+        let (prompt, path, _tmp) = prompt_over_workspace(file).await;
+        assert!(prompt.contains("indented note"), "{prompt}");
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), file.as_bytes());
+    }
+
     #[tokio::test]
     async fn embedder_none_skips_retrieval_no_panic() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -938,10 +1161,10 @@ mod tests {
     async fn recent_longterm_split_by_7day_window() {
         let now_ms: i64 = 1_700_000_000_000;
         let recent = vec![
-            RankedHit { id: 1, kind: TableKind::Memory, content: "r".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000) },
+            RankedHit { id: 1, kind: TableKind::Memory, content: "r".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000), piece: None },
         ];
         let old = vec![
-            RankedHit { id: 2, kind: TableKind::Memory, content: "o".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 8 * 86_400_000) },
+            RankedHit { id: 2, kind: TableKind::Memory, content: "o".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 8 * 86_400_000), piece: None },
         ];
         let (r, l) = bucket_by_recency(recent.into_iter().chain(old).collect(), TimestampMs::from_unix_millis(now_ms));
         assert_eq!(r.len(), 1);
@@ -952,8 +1175,8 @@ mod tests {
     async fn all_old_hits_go_to_longterm_only() {
         let now_ms: i64 = 1_700_000_000_000;
         let hits = vec![
-            RankedHit { id: 1, kind: TableKind::Memory, content: "a".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 30 * 86_400_000) },
-            RankedHit { id: 2, kind: TableKind::Memory, content: "b".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 20 * 86_400_000) },
+            RankedHit { id: 1, kind: TableKind::Memory, content: "a".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 30 * 86_400_000), piece: None },
+            RankedHit { id: 2, kind: TableKind::Memory, content: "b".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 20 * 86_400_000), piece: None },
         ];
         let (r, l) = bucket_by_recency(hits, TimestampMs::from_unix_millis(now_ms));
         assert_eq!(r.len(), 0);
@@ -964,8 +1187,8 @@ mod tests {
     async fn all_recent_hits_go_to_recent_only() {
         let now_ms: i64 = 1_700_000_000_000;
         let hits = vec![
-            RankedHit { id: 1, kind: TableKind::Memory, content: "a".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000) },
-            RankedHit { id: 2, kind: TableKind::Memory, content: "b".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 2 * 86_400_000) },
+            RankedHit { id: 1, kind: TableKind::Memory, content: "a".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000), piece: None },
+            RankedHit { id: 2, kind: TableKind::Memory, content: "b".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 2 * 86_400_000), piece: None },
         ];
         let (r, l) = bucket_by_recency(hits, TimestampMs::from_unix_millis(now_ms));
         assert_eq!(r.len(), 2);
@@ -1755,9 +1978,12 @@ mod tests {
             "a row the workspace already carries must not also arrive as a retrieval hit:\n{result}"
         );
 
-        // CONFLICTS block must contain the disputed pair
+        // The old side is a hit, so the block cites it by id; the disputed
+        // row is no hit, so the block carries its text.
         let conflicts_block = &result[conf_pos..];
-        assert!(conflicts_block.contains("original fact") || conflicts_block.contains("disputed fact"),
-            "CONFLICTS must reference the disputed pair");
+        assert!(conflicts_block.contains(&format!("\nOLD #{old_id}\n")), "{result}");
+        assert!(conflicts_block.contains("disputed fact"), "{result}");
+        assert_eq!(result.matches("original fact").count(), 1, "a shown row is printed once:\n{result}");
+        assert!(!result.contains("<!-- "), "{result}");
     }
 }

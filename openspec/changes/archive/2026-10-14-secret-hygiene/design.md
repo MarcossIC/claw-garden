@@ -10,7 +10,7 @@ Hay design porque las cuatro decisiones abiertas de la exploración tienen alter
 | **b. Enmascarar** | El resto del contenido se guarda. Un falso positivo pierde sólo el fragmento, no la memoria | El agente puede no enterarse |
 | **c. Enmascarar y avisar** | Lo de b, y el agente sabe qué pasó | Un campo más en la respuesta |
 
-**Decisión: c.** El aviso es posible porque el save ya espera el reporte del worker ([`specs/ingest`](../../specs/ingest/spec.md), «Un save confirmado devuelve los ids»). En un `202` no hay aviso: el worker todavía no vio el evento. No hace falta: lo que se guarda sale enmascarado igual.
+**Decisión: c.** El aviso es posible porque el save ya espera el reporte del worker ([`specs/ingest`](../../../specs/ingest/spec.md), «Un save confirmado devuelve los ids»). En un `202` no hay aviso: el worker todavía no vio el evento. No hace falta: lo que se guarda sale enmascarado igual.
 
 ## D2. Dónde se enmascara
 

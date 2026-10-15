@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::memory::chunker::embedding_text;
 use crate::memory::clock::TimestampMs;
 use crate::memory::db::{EmbeddingIdentity, MemoryStore};
 use crate::memory::dispute::settle_disputed;
@@ -630,18 +631,36 @@ async fn select_reembed_batch(
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                     Ok(rows)
                 }
-                ReembedTable::Memory | ReembedTable::Episodic => {
-                    let (parent, vectors, text_col) = match table {
-                        ReembedTable::Memory => ("memory", "memory_vectors", "content"),
-                        ReembedTable::Episodic => ("episodic_trajectory", "episodic_vectors", "task"),
-                        ReembedTable::Procedural => unreachable!(),
-                    };
-                    let sql = format!(
-                        "SELECT p.id, p.{text_col}, v.embedding FROM {parent} p \
-                         JOIN {vectors} v ON v.rowid = p.id \
-                         WHERE p.deleted_at IS NULL AND p.id > ?1 ORDER BY p.id LIMIT ?2"
-                    );
-                    let mut stmt = c.prepare(&sql)?;
+                ReembedTable::Memory => {
+                    // A piece of a long save was embedded behind the save's
+                    // head; its link keeps that head so the vector rebuilt
+                    // here is the one the piece was saved with.
+                    let mut stmt = c.prepare(
+                        "SELECT p.id, p.content, v.embedding, \
+                                (SELECT mp.context FROM memory_piece mp \
+                                 WHERE mp.memory_id = p.id AND mp.context <> '' \
+                                 ORDER BY mp.save_id LIMIT 1) \
+                         FROM memory p JOIN memory_vectors v ON v.rowid = p.id \
+                         WHERE p.deleted_at IS NULL AND p.id > ?1 ORDER BY p.id LIMIT ?2",
+                    )?;
+                    let rows = stmt
+                        .query_map(rusqlite::params![after_id, limit], |r| {
+                            let id: i64 = r.get(0)?;
+                            let content: String = r.get(1)?;
+                            let existing: Vec<u8> = r.get(2)?;
+                            let context: Option<String> = r.get(3)?;
+                            let text = embedding_text(context.as_deref().unwrap_or(""), &content).into_owned();
+                            Ok(ReembedRow { id, text, existing })
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(rows)
+                }
+                ReembedTable::Episodic => {
+                    let mut stmt = c.prepare(
+                        "SELECT p.id, p.task, v.embedding FROM episodic_trajectory p \
+                         JOIN episodic_vectors v ON v.rowid = p.id \
+                         WHERE p.deleted_at IS NULL AND p.id > ?1 ORDER BY p.id LIMIT ?2",
+                    )?;
                     let rows = stmt
                         .query_map(rusqlite::params![after_id, limit], |r| {
                             let id: i64 = r.get(0)?;
@@ -1596,6 +1615,37 @@ mod tests {
         super::reembed_all(&store, super::ReembedMode::Normalize).await;
         let twice = read_vector_bytes(&store, "memory_vectors", id).await;
         assert_eq!(once, twice, "a second Normalize pass must write byte-identical bytes (idempotent)");
+    }
+
+    #[tokio::test]
+    async fn reembed_rebuilds_a_pieces_context() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let first = seed_reembed_memory(&store, "Notes on clawg-ledger. The first piece", vec![0.3; 384]).await;
+        let second = seed_reembed_memory(&store, "the second piece", vec![0.3; 384]).await;
+        let absorbed = seed_reembed_memory(&store, "a row an earlier save held", vec![0.3; 384]).await;
+        store
+            .link_pieces(vec![
+                crate::memory::pieces::StoredPiece { memory_id: first, context: String::new() },
+                crate::memory::pieces::StoredPiece { memory_id: second, context: "Notes on clawg-ledger.".into() },
+                crate::memory::pieces::StoredPiece { memory_id: absorbed, context: String::new() },
+            ])
+            .await
+            .unwrap();
+
+        let recorder = std::sync::Arc::new(RecordingEmbedder::new());
+        let embedder: std::sync::Arc<dyn Embedder> = recorder.clone();
+        super::reembed_all(&store, super::ReembedMode::ReInfer(super::ReInferPlan::new(embedder))).await;
+
+        let calls = recorder.calls.lock().unwrap();
+        let texts: Vec<&str> = calls.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "Notes on clawg-ledger. The first piece",
+                "Notes on clawg-ledger.\n…\nthe second piece",
+                "a row an earlier save held",
+            ]
+        );
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 | S | visibility-policy (scope); ingest-durability (ids), deseable | exploración (borrador) |
+| 1 | S | visibility-policy (scope); ingest-durability (ids), deseable | cerrada: las decisiones están en la [propuesta](proposal.md#decisiones-cierran-las-abiertas-de-la-exploración) |
 
 **Tesis:** el agente puede fijar la importancia al guardar, pero después no la puede corregir. Re-guardar el mismo contenido tampoco sirve.
 

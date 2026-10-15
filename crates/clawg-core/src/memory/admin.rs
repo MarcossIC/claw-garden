@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use crate::memory::clock::TimestampMs;
 use crate::memory::dispute::release_challengers;
 use crate::memory::search::{viewer_match_expression, RankedHit};
+use crate::memory::store_insert::MemoryType;
+use crate::memory::tier::retier;
 use crate::memory::TableKind;
 use crate::memory::{MemoryError, MemoryStore};
 
@@ -117,78 +119,142 @@ pub fn format_channel_attribution(dense: usize, lexical_only: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// set_importance — one UPDATE per table, with the tier recomputed inside the
-// same statement rather than read-modify-written from Rust: importance and
-// tier are derived from each other, and splitting them into two statements
-// would leave a window where a concurrent reader sees one updated and the
-// other stale.
+// update_memory — a correction of importance and/or type. The row is read and
+// written inside one transaction on the store's single connection: the new
+// tier depends on the old values (`tier::retier`), and no reader can see the
+// two statements apart.
 //
-// The 4th argument to `compute_tier` is the `memory_type` COLUMN on `memory`
-// but a hardcoded literal on the other two, because those tables have no such
-// column — the literal is the same value `store_insert.rs` writes at INSERT
-// time, so a tier recomputed here matches the one computed at ingest.
+// Outside `memory` the type is the table literal `store_insert.rs` writes at
+// INSERT time, so a tier recomputed here matches the one computed at ingest.
 //
-// `importance` is set unconditionally; `tier` can only ever move up, because
-// `compute_tier` itself is promote-only (see `tier.rs`) — lowering importance
-// must not silently discard a tier a row earned through access.
-//
-// `deleted_at IS NULL` makes this a 0-row no-op on an already-deleted row,
-// deliberately, not an error: the caller is adjusting metadata on a row that
-// no longer participates in retrieval, and nothing it could do with an error
-// differs from what it does with a 0.
+// Only a live row is changed: a deleted one no longer participates in
+// retrieval, and "missing", "deleted" and "another agent's" are one answer.
 // ---------------------------------------------------------------------------
 
-const SET_IMPORTANCE_SQL_MEMORY: &str = "\
-    UPDATE memory \
-    SET importance = ?1, \
-        tier = compute_tier(tier, ?1, access_count, memory_type), \
-        last_modified_at = ?2 \
-    WHERE id = ?3 AND deleted_at IS NULL AND (?4 IS NULL OR agent_id = ?4)";
+/// Why a requested change was refused before touching the store.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum PatchError {
+    #[error("nothing to change: pass importance, memory_type or both")]
+    Empty,
+    #[error("importance must be a number from 0 to 10, got {0}")]
+    ImportanceOutOfScale(f64),
+    #[error("unknown memory_type {0:?}; expected one of semantic_fact, user_preference, architectural_decision, session_summary, code_block, chat_message, tool_error")]
+    UnknownType(String),
+    #[error("memory_type can only be changed on memory rows, not on {0:?} rows")]
+    TypeOnlyOnMemory(MemoryKind),
+}
 
-const SET_IMPORTANCE_SQL_EPISODIC: &str = "\
-    UPDATE episodic_trajectory \
-    SET importance = ?1, \
-        tier = compute_tier(tier, ?1, access_count, 'episodic_trajectory'), \
-        last_modified_at = ?2 \
-    WHERE id = ?3 AND deleted_at IS NULL AND (?4 IS NULL OR agent_id = ?4)";
+/// A valid change to one row: at least one field, importance on the store's
+/// scale, and a type only where the table has one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryPatch {
+    importance: Option<f64>,
+    memory_type: Option<MemoryType>,
+}
 
-const SET_IMPORTANCE_SQL_PROCEDURAL: &str = "\
-    UPDATE procedural_skill \
-    SET importance = ?1, \
-        tier = compute_tier(tier, ?1, access_count, 'procedural_skill'), \
-        last_modified_at = ?2 \
-    WHERE id = ?3 AND deleted_at IS NULL AND (?4 IS NULL OR agent_id = ?4)";
+impl MemoryPatch {
+    /// Unlike a save, which clamps the estimate an agent makes in passing,
+    /// an out-of-scale importance here is refused: a correction is explicit,
+    /// and clamping it would report a value nobody asked for as done.
+    pub fn new(kind: MemoryKind, importance: Option<f64>, memory_type: Option<&str>) -> Result<Self, PatchError> {
+        if importance.is_none() && memory_type.is_none() {
+            return Err(PatchError::Empty);
+        }
+        if let Some(v) = importance {
+            if !(0.0..=10.0).contains(&v) {
+                return Err(PatchError::ImportanceOutOfScale(v));
+            }
+        }
+        let memory_type = match memory_type {
+            None => None,
+            Some(_) if kind != MemoryKind::Memory => return Err(PatchError::TypeOnlyOnMemory(kind)),
+            Some(raw) => Some(MemoryType::from_db_str(raw).ok_or_else(|| PatchError::UnknownType(raw.to_string()))?),
+        };
+        Ok(Self { importance, memory_type })
+    }
+}
 
-/// Sets `importance` and atomically recomputes `tier` (promote-only) for the
-/// row `id` in the table selected by `kind`. Returns the number of rows
-/// affected (`0` when `id` doesn't exist, the row is soft-deleted, or `owner`
-/// names an agent other than the row's).
-pub async fn set_importance_core(
+/// How a changed row ended up.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UpdatedRow {
+    pub id: i64,
+    pub kind: MemoryKind,
+    pub importance: f64,
+    /// `Some` only for `kind == Memory`.
+    pub memory_type: Option<String>,
+    pub tier: i64,
+}
+
+const UPDATE_READ_MEMORY: &str = "SELECT tier, importance, memory_type, access_count FROM memory \
+     WHERE id = ?1 AND deleted_at IS NULL AND (?2 IS NULL OR agent_id = ?2)";
+const UPDATE_READ_EPISODIC: &str = "SELECT tier, importance, 'episodic_trajectory', access_count \
+     FROM episodic_trajectory WHERE id = ?1 AND deleted_at IS NULL AND (?2 IS NULL OR agent_id = ?2)";
+const UPDATE_READ_PROCEDURAL: &str = "SELECT tier, importance, 'procedural_skill', access_count \
+     FROM procedural_skill WHERE id = ?1 AND deleted_at IS NULL AND (?2 IS NULL OR agent_id = ?2)";
+
+const UPDATE_WRITE_MEMORY: &str = "UPDATE memory \
+     SET importance = ?1, memory_type = ?2, tier = ?3, last_modified_at = ?4, update_count = update_count + 1 \
+     WHERE id = ?5";
+const UPDATE_WRITE_EPISODIC: &str = "UPDATE episodic_trajectory \
+     SET importance = ?1, tier = ?3, last_modified_at = ?4, update_count = update_count + 1 \
+     WHERE id = ?5";
+const UPDATE_WRITE_PROCEDURAL: &str = "UPDATE procedural_skill \
+     SET importance = ?1, tier = ?3, last_modified_at = ?4, update_count = update_count + 1 \
+     WHERE id = ?5";
+
+/// Applies `patch` to the live row `id` of `kind` and returns how it ended
+/// up, or `None` when there is no such live row (or, with `owner`, it is
+/// another agent's) — in which case nothing is written.
+pub async fn update_memory_core(
     store: &MemoryStore,
     id: i64,
     kind: MemoryKind,
-    importance: f64,
+    patch: &MemoryPatch,
     owner: Option<&str>,
-) -> Result<usize, MemoryError> {
+) -> Result<Option<UpdatedRow>, MemoryError> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64;
-    let sql = match kind {
-        MemoryKind::Memory => SET_IMPORTANCE_SQL_MEMORY,
-        MemoryKind::Episodic => SET_IMPORTANCE_SQL_EPISODIC,
-        MemoryKind::Procedural => SET_IMPORTANCE_SQL_PROCEDURAL,
+    let (read_sql, write_sql) = match kind {
+        MemoryKind::Memory => (UPDATE_READ_MEMORY, UPDATE_WRITE_MEMORY),
+        MemoryKind::Episodic => (UPDATE_READ_EPISODIC, UPDATE_WRITE_EPISODIC),
+        MemoryKind::Procedural => (UPDATE_READ_PROCEDURAL, UPDATE_WRITE_PROCEDURAL),
     };
-
+    let patch = patch.clone();
     let owner = owner.map(str::to_owned);
+
     store
         .conn
-        .call(move |c| c.execute(sql, rusqlite::params![importance, now_ms, id, owner]))
+        .call(move |c| {
+            use rusqlite::OptionalExtension;
+            let tx = c.transaction()?;
+            let current: Option<(i64, f64, String, i64)> = tx
+                .query_row(read_sql, rusqlite::params![id, owner], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })
+                .optional()?;
+            let Some((tier, importance, memory_type, access_count)) = current else {
+                return Ok(None);
+            };
+            let new_importance = patch.importance.unwrap_or(importance);
+            let new_type = patch.memory_type.map_or(memory_type.clone(), |t| t.as_str().to_string());
+            let new_tier = retier(tier, access_count, (importance, &memory_type), (new_importance, &new_type));
+            tx.execute(write_sql, rusqlite::params![new_importance, new_type, new_tier, now_ms, id])?;
+            tx.commit()?;
+            Ok(Some(UpdatedRow {
+                id,
+                kind,
+                importance: new_importance,
+                memory_type: (kind == MemoryKind::Memory).then_some(new_type),
+                tier: new_tier,
+            }))
+        })
         .await
         .map_err(|e| match e {
             tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
             tokio_rusqlite::Error::ConnectionClosed => {
-                MemoryError::Backend("connection closed during set_importance_core".into())
+                MemoryError::Backend("connection closed during update_memory_core".into())
             }
             other => MemoryError::Backend(other.to_string()),
         })
@@ -936,6 +1002,7 @@ mod tests {
             score: 0.0,
             distance: 0.0,
             created_at: TimestampMs::from_unix_millis(0),
+            piece: None,
         }
     }
 
@@ -1018,7 +1085,7 @@ mod tests {
         assert_eq!(format_channel_attribution(30, 0), "chan=(dense=30,lex_only=0)");
     }
 
-    // ── set_importance_core ──────────────────────────────────────────────────
+    // ── update_memory_core ───────────────────────────────────────────────────
     //
     // Seed helpers mirror `memory/maintenance.rs`'s `seed_row` pattern: a
     // monotonic NONCE keeps `episodic_trajectory.session_id` /
@@ -1138,94 +1205,206 @@ mod tests {
             .unwrap()
     }
 
-    // Memory tier=3 imp=5 architectural_decision, set 9 → tier=1 (Rule 1).
+    fn importance(v: f64) -> MemoryPatch {
+        MemoryPatch::new(MemoryKind::Memory, Some(v), None).unwrap()
+    }
+
+    async fn memory_columns(store: &MemoryStore, id: i64) -> (String, i64, i64, String, i64, i64) {
+        store
+            .conn
+            .call(move |c| {
+                c.query_row(
+                    "SELECT memory_type, update_count, last_modified_at, status, access_count, last_accessed_at \
+                     FROM memory WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                )
+            })
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn a_change_needs_at_least_one_field() {
+        assert_eq!(MemoryPatch::new(MemoryKind::Memory, None, None), Err(PatchError::Empty));
+    }
+
+    #[test]
+    fn importance_outside_the_scale_is_refused() {
+        for v in [-0.5, 10.5, 50.0, f64::NAN, f64::INFINITY] {
+            let err = MemoryPatch::new(MemoryKind::Memory, Some(v), None).unwrap_err();
+            assert!(matches!(err, PatchError::ImportanceOutOfScale(_)), "{v}: {err:?}");
+            assert!(err.to_string().contains("importance"), "{err}");
+        }
+        for v in [0.0, 10.0, 7.5] {
+            assert!(MemoryPatch::new(MemoryKind::Memory, Some(v), None).is_ok(), "{v}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_memory_type_is_refused() {
+        let err = MemoryPatch::new(MemoryKind::Memory, None, Some("preference")).unwrap_err();
+        assert_eq!(err, PatchError::UnknownType("preference".into()));
+        assert!(err.to_string().contains("memory_type"), "{err}");
+        assert!(MemoryPatch::new(MemoryKind::Memory, None, Some("user_preference")).is_ok());
+    }
+
+    #[test]
+    fn only_memory_rows_have_a_type_to_change() {
+        for kind in [MemoryKind::Episodic, MemoryKind::Procedural] {
+            let err = MemoryPatch::new(kind, Some(5.0), Some("user_preference")).unwrap_err();
+            assert_eq!(err, PatchError::TypeOnlyOnMemory(kind));
+            assert!(err.to_string().contains("memory_type"), "{err}");
+            assert!(MemoryPatch::new(kind, Some(5.0), None).is_ok());
+        }
+    }
+
     #[tokio::test]
-    async fn set_importance_memory_high_importance_promotes_to_tier_1() {
+    async fn update_with_high_importance_promotes_to_tier_1() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let id = seed_memory_row(&store, "architectural_decision", 3, 5.0, false).await;
 
-        let affected = set_importance_core(&store, id, MemoryKind::Memory, 9.0, None)
+        let row = update_memory_core(&store, id, MemoryKind::Memory, &importance(9.0), None)
             .await
-            .unwrap();
+            .unwrap()
+            .expect("updated");
 
-        assert_eq!(affected, 1);
-        let (tier, importance) = memory_tier_importance(&store, id).await;
-        assert_eq!(tier, 1, "importance >= 9.0 must promote to tier 1");
-        assert!((importance - 9.0).abs() < 1e-9);
+        assert_eq!(row.tier, 1, "importance >= 9.0 must promote to tier 1");
+        assert_eq!(memory_tier_importance(&store, id).await, (1, 9.0));
     }
 
-    // Memory tier=1 imp=9.5, set 2.0 → tier stays 1 (promote-only), importance=2.0.
     #[tokio::test]
-    async fn set_importance_lowering_never_demotes_tier_1() {
+    async fn lowering_importance_takes_away_the_tier_it_gave() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let id = seed_memory_row(&store, "chat_message", 1, 9.5, false).await;
 
-        let affected = set_importance_core(&store, id, MemoryKind::Memory, 2.0, None)
+        let row = update_memory_core(&store, id, MemoryKind::Memory, &importance(2.0), None)
             .await
-            .unwrap();
+            .unwrap()
+            .expect("updated");
 
-        assert_eq!(affected, 1);
-        let (tier, importance) = memory_tier_importance(&store, id).await;
-        assert_eq!(tier, 1, "promote-only: lowering importance must never demote tier");
-        assert!((importance - 2.0).abs() < 1e-9);
+        assert_eq!(row.tier, 3, "the importance was all that held tier 1");
+        assert_eq!(memory_tier_importance(&store, id).await, (3, 2.0));
     }
 
-    // Episodic tier=3, set 7 → tier stays 3 (no compute_tier rule for
-    // the 'episodic_trajectory' literal), importance=7.
     #[tokio::test]
-    async fn set_importance_episodic_no_type_rule_only_rule_1() {
+    async fn an_update_writes_what_was_asked_and_counts_itself() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let id = seed_memory_row(&store, "semantic_fact", 3, 5.0, false).await;
+        let patch = MemoryPatch::new(MemoryKind::Memory, Some(8.0), Some("user_preference")).unwrap();
+
+        let row = update_memory_core(&store, id, MemoryKind::Memory, &patch, None).await.unwrap();
+
+        assert_eq!(
+            row,
+            Some(UpdatedRow {
+                id,
+                kind: MemoryKind::Memory,
+                importance: 8.0,
+                memory_type: Some("user_preference".into()),
+                tier: 1,
+            })
+        );
+        let (memory_type, update_count, last_modified_at, ..) = memory_columns(&store, id).await;
+        assert_eq!((memory_type.as_str(), update_count), ("user_preference", 1));
+        assert!(last_modified_at > 0, "the seed wrote 0");
+
+        let type_only = MemoryPatch::new(MemoryKind::Memory, None, Some("semantic_fact")).unwrap();
+        let row = update_memory_core(&store, id, MemoryKind::Memory, &type_only, None).await.unwrap().unwrap();
+        assert_eq!(row.importance, 8.0, "a field not asked for stays as it was");
+        assert_eq!(memory_columns(&store, id).await.1, 2);
+    }
+
+    #[tokio::test]
+    async fn an_update_leaves_status_accesses_and_disputes_alone() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let old = seed_memory_scoped(&store, "old", "a", None, "active").await;
+        let id = seed_disputing(&store, &[old]).await;
+        let before = memory_columns(&store, id).await;
+        async fn disputed_against(store: &MemoryStore, id: i64) -> Option<String> {
+            store
+                .conn
+                .call(move |c| {
+                    c.query_row("SELECT disputed_against FROM memory WHERE id = ?1", [id], |r| r.get(0))
+                })
+                .await
+                .unwrap()
+        }
+        let disputes_before = disputed_against(&store, id).await;
+
+        update_memory_core(&store, id, MemoryKind::Memory, &importance(7.0), None).await.unwrap().unwrap();
+
+        let after = memory_columns(&store, id).await;
+        assert_eq!(after.3, before.3, "status");
+        assert_eq!((after.4, after.5), (before.4, before.5), "accesses");
+        assert!(disputes_before.is_some(), "the seed disputes a row");
+        assert_eq!(disputed_against(&store, id).await, disputes_before);
+    }
+
+    #[tokio::test]
+    async fn update_on_episodic_has_no_type_rule_below_importance_9() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let id = seed_episodic_row(&store, 3, 5.0).await;
+        let patch = MemoryPatch::new(MemoryKind::Episodic, Some(7.0), None).unwrap();
 
-        let affected = set_importance_core(&store, id, MemoryKind::Episodic, 7.0, None)
-            .await
-            .unwrap();
+        let row = update_memory_core(&store, id, MemoryKind::Episodic, &patch, None).await.unwrap().unwrap();
 
-        assert_eq!(affected, 1);
-        let (tier, importance) = episodic_tier_importance(&store, id).await;
-        assert_eq!(tier, 3, "episodic has no type-rule below importance 9.0");
-        assert!((importance - 7.0).abs() < 1e-9);
+        assert_eq!((row.tier, row.memory_type), (3, None));
+        assert_eq!(episodic_tier_importance(&store, id).await, (3, 7.0));
     }
 
-    // Procedural tier=1, set 3.0 → tier stays 1 (Rule 2, benign no-op), importance=3.0.
     #[tokio::test]
-    async fn set_importance_procedural_recompute_is_benign_noop() {
+    async fn update_on_procedural_keeps_the_tier_its_table_gives() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let id = seed_procedural_row(&store, 1, 8.0).await;
+        let patch = MemoryPatch::new(MemoryKind::Procedural, Some(3.0), None).unwrap();
 
-        let affected = set_importance_core(&store, id, MemoryKind::Procedural, 3.0, None)
-            .await
-            .unwrap();
+        update_memory_core(&store, id, MemoryKind::Procedural, &patch, None).await.unwrap().unwrap();
 
-        assert_eq!(affected, 1);
-        let (tier, importance) = procedural_tier_importance(&store, id).await;
-        assert_eq!(tier, 1, "procedural_skill always recomputes to min(1)");
-        assert!((importance - 3.0).abs() < 1e-9);
+        assert_eq!(procedural_tier_importance(&store, id).await, (1, 3.0));
     }
 
-    // Id inexistente → Ok(0).
     #[tokio::test]
-    async fn set_importance_nonexistent_id_returns_zero() {
+    async fn update_on_a_missing_id_changes_nothing() {
         let store = MemoryStore::new_for_test().await.unwrap();
 
-        let affected = set_importance_core(&store, 999_999, MemoryKind::Memory, 9.0, None)
-            .await
-            .unwrap();
+        let row = update_memory_core(&store, 999_999, MemoryKind::Memory, &importance(9.0), None).await.unwrap();
 
-        assert_eq!(affected, 0);
+        assert_eq!(row, None);
     }
 
-    // Deleted_at set → returns 0, no-op (no-op, not error).
     #[tokio::test]
-    async fn set_importance_soft_deleted_row_is_noop() {
+    async fn update_on_a_soft_deleted_row_changes_nothing() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let id = seed_memory_row(&store, "chat_message", 3, 5.0, true).await;
 
-        let affected = set_importance_core(&store, id, MemoryKind::Memory, 9.0, None)
-            .await
-            .unwrap();
+        let row = update_memory_core(&store, id, MemoryKind::Memory, &importance(9.0), None).await.unwrap();
 
-        assert_eq!(affected, 0, "deleted rows must not be updated");
+        assert_eq!(row, None, "deleted rows must not be updated");
+        assert_eq!(memory_tier_importance(&store, id).await, (3, 5.0));
+        assert_eq!(memory_columns(&store, id).await.1, 0, "update_count");
+    }
+
+    // Rows as the current version writes them, and as the desktop app left
+    // them: tiers no rule of today awards, which a change must not take.
+    #[tokio::test]
+    async fn rows_from_the_previous_version_can_be_updated() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let earned = seed_memory_row(&store, "semantic_fact", 1, 9.5, false).await;
+        let foreign = seed_memory_row(&store, "semantic_fact", 1, 5.0, false).await;
+        let epi = seed_episodic_row(&store, 1, 5.0).await;
+        let pro = seed_procedural_row(&store, 2, 5.0).await;
+
+        let lower = |kind| MemoryPatch::new(kind, Some(2.0), None).unwrap();
+        let tier_of = |row: Option<UpdatedRow>| row.expect("updated").tier;
+        assert_eq!(tier_of(update_memory_core(&store, earned, MemoryKind::Memory, &lower(MemoryKind::Memory), None).await.unwrap()), 3);
+        assert_eq!(tier_of(update_memory_core(&store, foreign, MemoryKind::Memory, &lower(MemoryKind::Memory), None).await.unwrap()), 1);
+        assert_eq!(tier_of(update_memory_core(&store, epi, MemoryKind::Episodic, &lower(MemoryKind::Episodic), None).await.unwrap()), 1);
+        assert_eq!(tier_of(update_memory_core(&store, pro, MemoryKind::Procedural, &lower(MemoryKind::Procedural), None).await.unwrap()), 1);
+
+        assert_eq!(memory_tier_importance(&store, foreign).await, (1, 2.0));
+        assert_eq!(episodic_tier_importance(&store, epi).await, (1, 2.0));
+        assert_eq!(procedural_tier_importance(&store, pro).await, (1, 2.0));
     }
 
     // ── delete_memory_core ──────────────────────────
@@ -1354,15 +1533,17 @@ mod tests {
         let pro = seed_procedural_row(&store, 3, 5.0).await;
 
         for (id, kind) in [(mem, MemoryKind::Memory), (epi, MemoryKind::Episodic), (pro, MemoryKind::Procedural)] {
-            assert_eq!(set_importance_core(&store, id, kind, 9.5, Some("other-agent")).await.unwrap(), 0);
+            let patch = MemoryPatch::new(kind, Some(9.5), None).unwrap();
+            assert_eq!(update_memory_core(&store, id, kind, &patch, Some("other-agent")).await.unwrap(), None);
         }
 
         assert_eq!(memory_tier_importance(&store, mem).await, (3, 5.0));
         assert_eq!(episodic_tier_importance(&store, epi).await, (3, 5.0));
         assert_eq!(procedural_tier_importance(&store, pro).await, (3, 5.0));
+        assert_eq!(memory_columns(&store, mem).await.1, 0, "update_count");
 
-        assert_eq!(set_importance_core(&store, mem, MemoryKind::Memory, 9.5, Some("test-agent")).await.unwrap(), 1);
-        assert_eq!(memory_tier_importance(&store, mem).await.1, 9.5);
+        let row = update_memory_core(&store, mem, MemoryKind::Memory, &importance(9.5), Some("test-agent")).await.unwrap();
+        assert_eq!(row.map(|r| r.importance), Some(9.5));
     }
 
     #[tokio::test]
@@ -1662,6 +1843,7 @@ mod tests {
             score: 0.0,
             distance: 0.0,
             created_at: TimestampMs::from_unix_millis(0),
+            piece: None,
         }
     }
 
@@ -2485,6 +2667,7 @@ mod tests {
             score: 0.0,
             distance: 0.0,
             created_at: TimestampMs::from_unix_millis(0),
+            piece: None,
         }];
 
         assert_eq!(format_skill_hits(&hits), "skill_hits=1");

@@ -73,6 +73,11 @@ pub struct RetrievalCase {
     /// `golden.json` parsing unchanged.
     #[serde(default)]
     pub subset: CaseSubset,
+    /// The fact the case asks for, exactly as its expected row states it. Only
+    /// cases about long memories carry one: a fragment of such a row can be
+    /// visible without the part that answers.
+    #[serde(default)]
+    pub answer: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -84,6 +89,7 @@ pub enum CaseSubset {
     MultiRef,
     HighImportance,
     LowImportance,
+    Long,
 }
 
 impl CaseSubset {
@@ -96,6 +102,7 @@ impl CaseSubset {
             Self::MultiRef => "multi_ref",
             Self::HighImportance => "high_importance",
             Self::LowImportance => "low_importance",
+            Self::Long => "long",
         }
     }
 }
@@ -360,10 +367,19 @@ mod tests {
             ("multi_ref", CaseSubset::MultiRef),
             ("high_importance", CaseSubset::HighImportance),
             ("low_importance", CaseSubset::LowImportance),
+            ("long", CaseSubset::Long),
         ] {
             let golden = parse_only(&case_with(&format!(r#", "subset": "{name}""#)));
             assert_eq!(golden.retrieval_cases[0].subset, want, "{name}");
         }
+    }
+
+    #[test]
+    fn an_answer_and_the_long_subset_parse() {
+        let golden = parse_only(&case_with(r#", "subset": "long", "answer": "capped at 40 records""#));
+        assert_eq!(golden.retrieval_cases[0].subset, CaseSubset::Long);
+        assert_eq!(golden.retrieval_cases[0].answer.as_deref(), Some("capped at 40 records"));
+        assert_eq!(parse_only(VALID_MINIMAL).retrieval_cases[0].answer, None);
     }
 
     #[test]

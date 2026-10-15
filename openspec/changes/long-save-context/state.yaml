@@ -1,14 +1,14 @@
 change: long-save-context
 objective: "1"
-depends_on: [eval-golden-expansion]
-phase: explore
+depends_on: [eval-golden-expansion, data-preservation, dispute-resolution]
+phase: verify
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
-  apply: pending
-  verify: pending
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: in_progress
   archive: pending
-updated: 2026-10-12
+updated: 2026-10-15
