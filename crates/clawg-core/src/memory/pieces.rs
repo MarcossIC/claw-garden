@@ -393,6 +393,61 @@ mod tests {
         v.iter().flat_map(|x| x.to_le_bytes()).collect()
     }
 
+    /// Stores `pieces` as one linked save, each with a vector turned slightly
+    /// from the first axis toward `axis`, the way the worker leaves them.
+    async fn store_save(store: &MemoryStore, pieces: &[String], head: &str, axis: usize) -> Vec<i64> {
+        let mut stored = Vec::new();
+        for (i, text) in pieces.iter().enumerate() {
+            let id = insert_row(store, "agent-a", text).await;
+            let angle = 0.01 * i as f32;
+            let mut v = vec![0.0_f32; 384];
+            v[0] = angle.cos();
+            v[axis] = angle.sin();
+            let bytes = vector_bytes(&v);
+            store
+                .conn
+                .call(move |c| {
+                    c.execute("INSERT INTO memory_vectors(rowid, embedding) VALUES (?1, ?2)", rusqlite::params![id, bytes])
+                })
+                .await
+                .unwrap();
+            stored.push(piece(id, if i == 0 { "" } else { head }));
+        }
+        let ids = stored.iter().map(|p| p.memory_id).collect();
+        store.link_pieces(stored).await.unwrap();
+        ids
+    }
+
+    #[tokio::test]
+    async fn a_save_split_at_the_old_cap_is_still_found_and_read() {
+        use crate::memory::search::{search_all_memories, SearchScope};
+
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let chunker = crate::memory::chunker::ChatChunker::with_fallback();
+        let old_text: String = (0..500).map(|i| format!("old{i} ")).collect();
+        // Cut the way the previous version cut a long save: 424 tokens with
+        // the 64 of a chunk.
+        let old_pieces: Vec<String> = chunker.chunk(&old_text, 424).into_iter().map(|c| c.text).collect();
+        let new_text: String = (0..300).map(|i| format!("new{i} ")).collect();
+        let new_split = chunker.split_save(&new_text);
+        let new_pieces: Vec<String> = new_split.pieces.into_iter().map(|c| c.text).collect();
+        assert!(old_pieces.len() >= 2 && new_pieces.len() > old_pieces.len(), "both fixtures are long saves");
+
+        let old_ids = store_save(&store, &old_pieces, &old_pieces[0][..192], 1).await;
+        let new_ids = store_save(&store, &new_pieces, &new_split.head.unwrap(), 2).await;
+
+        let mut query = vec![0.0_f32; 384];
+        query[0] = 1.0;
+        let hits = search_all_memories(&store, &query, None, "agent-a", SearchScope::all_default(), 10).await.unwrap();
+
+        let found: Vec<(i64, i64)> = hits.iter().map(|h| (h.id, h.piece.expect("a linked row").pieces)).collect();
+        assert_eq!(found, vec![(old_ids[0], old_pieces.len() as i64), (new_ids[0], new_pieces.len() as i64)]);
+        for (ids, text) in [(&old_ids, &old_text), (&new_ids, &new_text)] {
+            let save = read_save_core(&store, MemoryKind::Memory, ids[1], Some("agent-a")).await.unwrap().unwrap();
+            assert_eq!(&save.text, text, "the save reads back whole, its overlap once");
+        }
+    }
+
     /// A store left by the previous version holds a long save as unrelated
     /// rows. Opening it adds the table and links nothing; every row is still
     /// found, listed, read as a save of one piece and re-embedded from its
