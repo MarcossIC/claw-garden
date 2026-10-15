@@ -213,6 +213,12 @@ pub fn backups_dir(base_dir: &std::path::Path) -> PathBuf {
     base_dir.join("backups")
 }
 
+/// Which agents may read which agents' memories (`<base_dir>/sharing.json`).
+/// The user edits it, never an agent, which is what makes it the user's control.
+pub fn sharing_file(base_dir: &std::path::Path) -> PathBuf {
+    base_dir.join("sharing.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

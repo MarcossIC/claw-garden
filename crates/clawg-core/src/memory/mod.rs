@@ -38,6 +38,7 @@ pub mod model_download;
 pub mod record;
 pub mod redact;
 pub mod secrets;
+pub mod sharing;
 
 pub use db::MemoryStore;
 pub use error::MemoryError;
