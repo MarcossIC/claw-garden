@@ -1772,3 +1772,90 @@ async fn a_search_during_the_first_index_waits_for_it() {
     assert_eq!(body["docs"], 1);
     assert_eq!(body["hits"][0]["text"], "found after the wait");
 }
+
+// ── restore ─────────────────────────────────────────────────────────────────
+
+impl Harness {
+    async fn send(&self, req: reqwest::RequestBuilder) -> (u16, Value) {
+        let r = self.authed(req).send().await.expect("request");
+        let status = r.status().as_u16();
+        (status, r.json().await.unwrap_or(Value::Null))
+    }
+
+    async fn delete_row(&self, id: i64) {
+        let (status, body) = self.send(self.http.delete(self.url(&format!("/v1/memories/memory/{id}")))).await;
+        assert_eq!(status, 200, "{body}");
+    }
+
+    async fn restore(&self, kind: &str, id: i64, agent: Option<&str>) -> (u16, Value) {
+        let query = agent.map(|a| format!("?agent={a}")).unwrap_or_default();
+        self.send(self.http.post(self.url(&format!("/v1/memories/{kind}/{id}/restore{query}")))).await
+    }
+}
+
+#[tokio::test]
+async fn restore_brings_a_deleted_memory_back_for_its_owner() {
+    let h = Harness::start().await;
+    let id = save_id(&h, json!({ "content": CONTENT, "agent_id": "a" })).await;
+    h.delete_row(id).await;
+    assert!(!finds(&h, "a", id).await);
+
+    let (status, body) = h.restore("memory", id, Some("b")).await;
+    assert_eq!(status, 404, "another agent's row reads as missing: {body}");
+    assert!(!finds(&h, "a", id).await);
+
+    let (status, body) = h.restore("memory", id, Some("a")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, json!({ "restored": 1, "id": id, "status": "active", "superseded_by": null }));
+    assert!(finds(&h, "a", id).await, "it is found again");
+    let (_, item) = h.get_json(&format!("/v1/memories/memory/{id}")).await;
+    assert_eq!(item["item"]["deleted_at"], Value::Null, "{item}");
+    assert_eq!(item["item"]["update_count"], 1, "{item}");
+}
+
+#[tokio::test]
+async fn restore_answers_each_refusal_with_its_status() {
+    let h = Harness::start().await;
+    let twin = save_id(&h, json!({ "content": CONTENT, "agent_id": "a" })).await;
+    h.delete_row(twin).await;
+    let live = save_id(&h, json!({ "content": CONTENT, "agent_id": "a" })).await;
+
+    let (status, body) = h.restore("memory", twin, None).await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body["error"].as_str().unwrap().contains(&format!("#{live}")), "{body}");
+
+    let (status, body) = h.restore("memory", live, None).await;
+    assert_eq!(status, 404, "a live row is not deleted: {body}");
+    let (status, body) = h.restore("episodic", 1, None).await;
+    assert_eq!(status, 400, "{body}");
+    let (status, body) = h.restore("bogus", 1, None).await;
+    assert_eq!(status, 400, "{body}");
+
+    let without = Harness::start_without_embedder().await;
+    let (status, body) = without.restore("memory", 1, None).await;
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"], "embedder_not_ready");
+}
+
+#[tokio::test]
+async fn listing_deleted_rows_shows_only_them_newest_deletion_first() {
+    let h = Harness::start().await;
+    let kept = save_id(&h, json!({ "content": "the go service uses tabs", "agent_id": "a" })).await;
+    let first = save_id(&h, json!({ "content": "the rust crate uses tabs", "agent_id": "a" })).await;
+    let second = save_id(&h, json!({ "content": "deploys happen on fridays", "agent_id": "a" })).await;
+    h.delete_row(second).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    h.delete_row(first).await;
+
+    let ids = |body: &Value| -> Vec<i64> {
+        body["items"].as_array().expect("items").iter().map(|r| r["id"].as_i64().unwrap()).collect()
+    };
+    let (status, deleted) = h.get_json("/v1/memories?deleted=true").await;
+    assert_eq!(status, 200, "{deleted}");
+    assert_eq!(ids(&deleted), vec![first, second]);
+    assert!(deleted["items"][0]["deleted_at"].is_i64(), "{deleted}");
+    let (_, live) = h.get_json("/v1/memories").await;
+    assert_eq!(ids(&live), vec![kept]);
+    let (status, body) = h.get_json("/v1/memories?deleted=true&q=tabs").await;
+    assert_eq!(status, 400, "{body}");
+}
