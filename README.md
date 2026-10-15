@@ -386,7 +386,7 @@ En Windows usá la ruta completa a `clawg.exe`. Los nombres `clawg-dev` y `clawg
 - `recall_context`: devuelve un bloque de contexto listo para leer (notas del workspace, memorias recientes y de largo plazo) para una consulta.
 - `search_project`: busca en la documentación del proyecto (los Markdown y los manifiestos como `Cargo.toml` o `package.json`, respetando `.gitignore`) y en su código Rust, Python y TypeScript, partido por definición, y devuelve cada pasaje con su ruta de encabezados o de definiciones. Sirve para preguntas sobre cómo funciona el proyecto. El índice se arma solo la primera vez que el agente abre el proyecto y se pone al día cuando cambian los archivos.
 - `list_memories`: recorre las memorias del agente, las más nuevas primero, sin buscar.
-- `read_memory`: devuelve entero un texto largo que se guardó en varios pedazos, a partir del id de cualquiera de ellos; `search_memory` marca esos pedazos con `piece=K/N`.
+- `read_memory`: devuelve entero un texto largo que se guardó en varios pedazos, a partir del id de cualquiera de ellos; `search_memory` marca esos pedazos con `piece=K/N`. Lee también lo que guardó otro agente, marcado `by <agente>`, salvo que esté excluido.
 - `delete_memory`: borra una memoria del agente por id y tipo.
 - `update_memory`: corrige la importancia o el tipo de una memoria del agente. Si el campo que cambia era lo que la tenía en tier 1, la saca; lo que ganó por uso se queda.
 - `resolve_conflict`: cierra un conflicto de ACTIVE CONFLICTS con la respuesta del usuario: una memoria queda y la otra pasa a reemplazada, o quedan las dos.
