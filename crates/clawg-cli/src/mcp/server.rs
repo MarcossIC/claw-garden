@@ -647,7 +647,8 @@ impl ClawgMcp {
         }
     }
 
-    /// Another agent's save is refused as missing, as in `delete_memory_impl`.
+    /// A save out of the agent's reach is refused as missing, as in
+    /// `delete_memory_impl`; another agent's save within reach is marked.
     pub async fn read_memory_impl(
         &self,
         agent_id: &str,
@@ -658,7 +659,7 @@ impl ClawgMcp {
             Err(failure) => return Ok(failure),
         };
         match client.read_save(args.kind.as_deref().unwrap_or("memory"), args.id, Some(agent_id)).await {
-            Ok(save) => Self::ok(format_save(&save)),
+            Ok(save) => Self::ok(format_save(&save, agent_id)),
             Err(e) => Self::failed(Self::read_failure_text(&e)),
         }
     }
@@ -2157,17 +2158,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_agent_cannot_read_another_agents_save() {
-        let (b, _d) = bridge().await;
-        let id = saved_id(&b, "agent-a", "agent a keeps its release notes in the wiki").await;
+    async fn another_agents_save_is_read_as_shared_unless_hidden() {
+        let (b, d) = bridge().await;
+        let content = "agent a keeps its release notes in the wiki";
+        let id = saved_id(&b, "agent-a", content).await;
 
-        let other = b.read_memory_impl("agent-b", read_args(id)).await.expect("call");
-        let missing = b.read_memory_impl("agent-b", read_args(999_999)).await.expect("call");
-
-        assert!(is_error(&other), "another agent's save must not be readable: {}", text(&other));
-        assert_eq!(text(&other).replace(&id.to_string(), "N"), text(&missing).replace("999999", "N"));
+        let shared = b.read_memory_impl("agent-b", read_args(id)).await.expect("call");
+        assert_eq!(text(&shared), format!("#{id} by agent-a\n{content}\n{}", clawg_core::memory::prompt_builder::SHARED_NOTE));
         let own = b.read_memory_impl("agent-a", read_args(id)).await.expect("call");
-        assert_eq!(text(&own), format!("#{id}\nagent a keeps its release notes in the wiki"));
+        assert_eq!(text(&own), format!("#{id}\n{content}"));
+
+        hide(&d, "agent-b", "agent-a");
+        let hidden = b.read_memory_impl("agent-b", read_args(id)).await.expect("call");
+        let missing = b.read_memory_impl("agent-b", read_args(999_999)).await.expect("call");
+        assert!(is_error(&hidden), "a hidden author's save must not be readable: {}", text(&hidden));
+        assert_eq!(text(&hidden).replace(&id.to_string(), "N"), text(&missing).replace("999999", "N"));
     }
 
     #[test]

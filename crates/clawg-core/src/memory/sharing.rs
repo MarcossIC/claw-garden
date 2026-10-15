@@ -45,6 +45,17 @@ pub enum Reach {
     AllBut(Vec<String>),
 }
 
+impl Reach {
+    /// Whether a row `author` saved is within reach. Says nothing about the
+    /// reader's own rows, which are always readable.
+    pub fn allows(&self, author: &str) -> bool {
+        match self {
+            Reach::Own => false,
+            Reach::AllBut(hidden) => !hidden.iter().any(|h| h == author),
+        }
+    }
+}
+
 /// The file as written. `deny_unknown_fields` because a misspelled key
 /// (`"hide"`) would otherwise parse as an empty policy, and a user who meant to
 /// hide something would see it shared with no word about why.
@@ -231,6 +242,13 @@ mod tests {
         let e = SharingPolicy::parse(r#"{"version":2,"hides":{}}"#).unwrap_err();
         assert!(matches!(e, SharingError::Version(2)), "{e}");
         assert!(e.to_string().contains("version 2"), "{e}");
+    }
+
+    #[test]
+    fn a_reach_allows_every_author_but_the_hidden() {
+        assert!(Reach::AllBut(vec!["codex".into()]).allows("cursor"));
+        assert!(!Reach::AllBut(vec!["codex".into()]).allows("codex"));
+        assert!(!Reach::Own.allows("cursor"));
     }
 
     #[test]

@@ -925,7 +925,10 @@ async fn get_save(
     Query(owner): Query<OwnerQuery>,
 ) -> ApiResult<Json<SaveText>> {
     let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
-    let save = read_save_core(&app.runtime.store, kind, id, owner.agent.as_deref())
+    // A save is read like a search hit: the caller's own rows and the rows of
+    // the agents the policy lets it read.
+    let reach = owner.agent.as_deref().map_or(Reach::Own, |reader| reach(&app, reader));
+    let save = read_save_core(&app.runtime.store, kind, id, owner.agent.as_deref(), &reach)
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("no {kind:?} row with id {id}")))?;

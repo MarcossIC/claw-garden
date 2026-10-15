@@ -120,17 +120,26 @@ pub fn format_resolution(r: &Resolution) -> String {
 /// What `read_memory` tells the model: which piece it asked for and every
 /// row of the save, then the whole text. A position with no row it may read
 /// is named, so the model knows the text has a gap there.
-pub fn format_save(save: &SavedText) -> String {
-    if save.pieces <= 1 {
-        return format!("#{}\n{}", save.id, save.text);
+/// A save another agent wrote names it, and ends with the note on how to read
+/// it, as a shared search hit does.
+pub fn format_save(save: &SavedText, reader: &str) -> String {
+    let author = save.agent_id.as_deref().filter(|a| *a != reader);
+    let by = author.map(|a| format!(" by {a}")).unwrap_or_default();
+    let body = if save.pieces <= 1 {
+        format!("#{}{by}\n{}", save.id, save.text)
+    } else {
+        let ids = save
+            .ids
+            .iter()
+            .map(|id| id.map_or_else(|| "(missing)".to_string(), |id| format!("#{id}")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("#{} is piece {} of {} of one save{by}: {ids}\n{}", save.id, save.piece, save.pieces, save.text)
+    };
+    match author {
+        Some(_) => format!("{body}\n{SHARED_NOTE}"),
+        None => body,
     }
-    let ids = save
-        .ids
-        .iter()
-        .map(|id| id.map_or_else(|| "(missing)".to_string(), |id| format!("#{id}")))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("#{} is piece {} of {} of one save: {ids}\n{}", save.id, save.piece, save.pieces, save.text)
 }
 
 /// What `update_memory` tells the model about the row it changed. The tier is
@@ -499,13 +508,35 @@ mod tests {
             ids: vec![Some(57), Some(58), None, Some(60)],
             missing: vec![3],
             text: "first and second\nfourth".into(),
+            agent_id: None,
         };
         assert_eq!(
-            format_save(&save),
+            format_save(&save, "a"),
             "#58 is piece 2 of 4 of one save: #57, #58, (missing), #60\nfirst and second\nfourth"
         );
         let single = SavedText { piece: 1, pieces: 1, ids: vec![Some(58)], missing: vec![], text: "short".into(), ..save };
-        assert_eq!(format_save(&single), "#58\nshort");
+        assert_eq!(format_save(&single, "a"), "#58\nshort");
+    }
+
+    #[test]
+    fn format_save_names_the_author_of_a_shared_save() {
+        let save = SavedText {
+            kind: "memory".into(),
+            id: 58,
+            piece: 2,
+            pieces: 2,
+            ids: vec![Some(57), Some(58)],
+            missing: vec![],
+            text: "the whole text".into(),
+            agent_id: Some("claude-code".into()),
+        };
+        assert_eq!(
+            format_save(&save, "cursor"),
+            format!("#58 is piece 2 of 2 of one save by claude-code: #57, #58\nthe whole text\n{SHARED_NOTE}")
+        );
+        let single = SavedText { piece: 1, pieces: 1, ids: vec![Some(58)], ..save.clone() };
+        assert_eq!(format_save(&single, "cursor"), format!("#58 by claude-code\nthe whole text\n{SHARED_NOTE}"));
+        assert_eq!(format_save(&save, "claude-code"), "#58 is piece 2 of 2 of one save: #57, #58\nthe whole text");
     }
 
     // ── format_rows ─────────────────────────────────────────────────────────

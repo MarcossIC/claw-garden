@@ -337,6 +337,10 @@ pub struct SavedText {
     /// Positions, from 1, with no row to show.
     pub missing: Vec<i64>,
     pub text: String,
+    /// Who saved it. A daemon older than sharing does not send it, and it
+    /// only ever returned the caller's own saves.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 #[derive(Serialize)]

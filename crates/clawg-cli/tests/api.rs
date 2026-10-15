@@ -550,13 +550,17 @@ async fn get_save_returns_the_whole_text() {
 }
 
 #[tokio::test]
-async fn get_save_of_another_agent_is_404() {
+async fn get_save_of_another_agent_follows_the_sharing_policy() {
     let h = Harness::start().await;
     let (_, body) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "agent-http" })).await;
     let id = body["memories"][0]["id"].as_i64().expect("id");
 
+    let (status, save) = h.get_json(&format!("/v1/memories/memory/{id}/save?agent=agent-other")).await;
+    assert_eq!(status, 200, "another agent's save is shared without a policy: {save}");
+    assert_eq!(save["agent_id"], "agent-http", "{save}");
+    write_policy(&h, r#"{"version":1,"hides":{"agent-other":["agent-http"]}}"#);
     let (status, _) = h.get_json(&format!("/v1/memories/memory/{id}/save?agent=agent-other")).await;
-    assert_eq!(status, 404, "another agent's save reads as missing");
+    assert_eq!(status, 404, "a hidden author's save reads as missing");
     let (status, _) = h.get_json("/v1/memories/memory/999999/save?agent=agent-http").await;
     assert_eq!(status, 404);
     let (status, save) = h.get_json(&format!("/v1/memories/memory/{id}/save?agent=agent-http")).await;
