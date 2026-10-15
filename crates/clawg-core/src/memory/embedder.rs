@@ -133,6 +133,13 @@ fn e5_model(onnx: Vec<u8>, tokenizer: TokenizerFiles) -> UserDefinedEmbeddingMod
 /// implicit in a library default can silently drift out of sync with it.
 pub const EMBED_MAX_TOKENS: usize = 512;
 
+/// The most texts one inference run embeds. A run pads every text to the
+/// longest one, and its attention grows with texts × tokens², so the 248
+/// passages of one large source file at up to 512 tokens took gigabytes in a
+/// single run, which the process then kept. At 16 the peak stays in the
+/// hundreds of megabytes and indexing runs as fast as with one big batch.
+pub const EMBED_BATCH: usize = 16;
+
 /// Tokens the composer's budget reserves for what the model adds around the
 /// text itself: `<s>`/`</s>` (2) plus slack for a BPE merge that can span the
 /// prefix/text boundary and tokenize slightly differently than summing
@@ -194,23 +201,27 @@ pub struct FastEmbedLocal {
 #[async_trait]
 impl Embedder for FastEmbedLocal {
     async fn embed_batch(&self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
-        let prefixed: Vec<String> = texts.iter()
-            .map(|t| apply_role_prefix(role, t, self.query_prefix(), self.passage_prefix()))
-            .collect();
-        let expected = prefixed.len();
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.req_tx.send(EmbedRequest { texts: prefixed, resp: resp_tx })
-            .map_err(|_| EmbedError::WorkerGone)?;
-        // Map the oneshot RecvError (sender dropped) to WorkerGone; otherwise
-        // unwrap the inner Result the worker placed inside.
-        let vectors = resp_rx.await.map_err(|_| EmbedError::WorkerGone)??;
-        if vectors.len() != expected {
-            // Reported as an inference failure rather than trusted: the
-            // caller pairs these positionally, so a wrong count means the
-            // pairing is already meaningless.
-            return Err(EmbedError::InferenceFailed(format!(
-                "model returned {} vectors for {expected} texts", vectors.len()
-            )));
+        let mut vectors = Vec::with_capacity(texts.len());
+        for batch in texts.chunks(EMBED_BATCH) {
+            let prefixed: Vec<String> = batch.iter()
+                .map(|t| apply_role_prefix(role, t, self.query_prefix(), self.passage_prefix()))
+                .collect();
+            let expected = prefixed.len();
+            let (resp_tx, resp_rx) = oneshot::channel();
+            self.req_tx.send(EmbedRequest { texts: prefixed, resp: resp_tx })
+                .map_err(|_| EmbedError::WorkerGone)?;
+            // Map the oneshot RecvError (sender dropped) to WorkerGone; otherwise
+            // unwrap the inner Result the worker placed inside.
+            let reply = resp_rx.await.map_err(|_| EmbedError::WorkerGone)??;
+            if reply.len() != expected {
+                // Reported as an inference failure rather than trusted: the
+                // caller pairs these positionally, so a wrong count means the
+                // pairing is already meaningless.
+                return Err(EmbedError::InferenceFailed(format!(
+                    "model returned {} vectors for {expected} texts", reply.len()
+                )));
+            }
+            vectors.extend(reply);
         }
         Ok(vectors)
     }
@@ -653,6 +664,40 @@ mod tests {
             vec!["query: chunk-a".to_string(), "query: chunk-b".to_string()],
             "every text must be prefixed per role before crossing the channel"
         );
+    }
+
+    /// A batch longer than `EMBED_BATCH` crosses the channel as requests of at
+    /// most `EMBED_BATCH` texts, and its vectors come back in input order.
+    #[tokio::test]
+    async fn fast_embed_local_sends_at_most_embed_batch_texts_per_request() {
+        use std::sync::{Arc, Mutex};
+
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel::<EmbedRequest>();
+        let sizes: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let sizes_for_worker = sizes.clone();
+        std::thread::spawn(move || {
+            while let Some(EmbedRequest { texts, resp }) =
+                futures::executor::block_on(req_rx.recv())
+            {
+                sizes_for_worker.lock().unwrap().push(texts.len());
+                // Each vector carries the number its text ends with, so the
+                // order of the joined reply can be checked.
+                let reply: Vec<Vec<f32>> = texts
+                    .iter()
+                    .map(|t| vec![t.rsplit('-').next().unwrap().parse::<f32>().unwrap(); 384])
+                    .collect();
+                let _ = resp.send(Ok(reply));
+            }
+        });
+
+        let local = FastEmbedLocal::from_mock_worker(req_tx);
+        let n = 2 * EMBED_BATCH + 3;
+        let texts: Vec<String> = (0..n).map(|i| format!("chunk-{i}")).collect();
+        let out = local.embed_batch(&texts, EmbedRole::Passage).await.unwrap();
+
+        assert_eq!(*sizes.lock().unwrap(), vec![EMBED_BATCH, EMBED_BATCH, 3]);
+        let order: Vec<f32> = out.iter().map(|v| v[0]).collect();
+        assert_eq!(order, (0..n).map(|i| i as f32).collect::<Vec<_>>());
     }
 
     /// A reply with fewer (or more) vectors than texts submitted must be
