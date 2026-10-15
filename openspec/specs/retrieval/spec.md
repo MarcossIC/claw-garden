@@ -1,11 +1,12 @@
 # retrieval — Especificación
 
-Fuente de verdad del comportamiento actual de la recuperación: el corte relativo de `POST /v1/search` y de la herramienta `search_memory`, qué hits cuentan como acceso en `search` y en `recall_context`, y el bono que lleva una fila con el identificador exacto de la consulta.
+Fuente de verdad del comportamiento actual de la recuperación: el corte relativo de `POST /v1/search` y de la herramienta `search_memory`, qué hits cuentan como acceso en `search` y en `recall_context`, el bono que lleva una fila con el identificador exacto de la consulta, y el texto que arma `recall_context` (hits, conflictos y workspace) junto con el parser que lo lee en `rag-eval`.
 
 **Origen:**
 - [retrieval-hygiene](../../changes/archive/2026-10-12-retrieval-hygiene/proposal.md), archivado el 2026-10-12.
 - [lexical-fusion](../../changes/archive/2026-10-12-lexical-fusion/proposal.md), archivado el 2026-10-12.
 - [knowledge-synthesis](../../changes/archive/2026-10-13-knowledge-synthesis/proposal.md), archivado el 2026-10-13 (sólo el apartado de las filas que dejó la app de escritorio).
+- [context-density](../../changes/archive/2026-10-14-context-density/proposal.md), archivado el 2026-10-14 (desde "Línea de hit en `recall_context`" hasta "Medición del contexto").
 
 ## Definiciones
 
@@ -24,6 +25,10 @@ Fuente de verdad del comportamiento actual de la recuperación: el corte relativ
 - **Match de identificador (`identifier_matches`, `search.rs:698`):** fila de `memory` visible para el llamador (mismos predicados de agente, proyecto, estado y `deleted_at` que el canal léxico) cuyo contenido tiene **todos** los identificadores de la consulta, según FTS5 (`"t1" AND "t2" …`). FTS5 separa en `_`, así que `"user_id"` es una frase que también matchea `user id` y `user-id`: para los identificadores con `_` el contenido MUST tenerlos escritos tal cual, sin distinguir mayúsculas y sin pegarse a otro nombre (`holds_identifier`, `search.rs:667`). Las filas que no los tienen así no reciben bono ni cuentan para el presupuesto.
 - **Presupuesto léxico:** `SearchScope.lexical`, 20 por defecto (`search.rs:38`).
 - **Bono léxico:** `ScoringConfig.lexical_bonus`, 1,0 por defecto (`crates/clawg-core/src/memory/score.rs:183`).
+- **Hit mostrado:** hit de `kind = memory` presente en RECENT o LONG-TERM del prompt de `recall_context` (`build_memory_prompt`, `crates/clawg-core/src/memory/prompt_builder.rs:98`). Los ids son por tabla (`shown`, `prompt_builder.rs:189`, sólo toma `TableKind::Memory`), así que un hit episodic o procedural nunca cuenta.
+- **Fila del workspace:** id en `EmittedIds` (`crates/clawg-core/src/memory/workspace.rs:201`), que también se suma a `shown`. Su bullet no tiene id. **No** es un hit mostrado.
+- **Posición de un hit:** índice 0-based en el orden impreso: RECENT y luego LONG-TERM.
+- **Par de conflicto:** fila nueva (`disputed`) contra una fila vieja. `fetch_active_conflicts` (`prompt_builder.rs:436`) sólo trae pares con al menos un lado que es hit mostrado o fila del workspace; el otro lado puede estar fuera del prompt.
 
 El corte vive en `clawg-cli` y no en el core: `search_all_memories` devuelve siempre la lista completa ordenada, y las métricas de `rag-eval` se miden sobre esa lista (`rag-eval` llama a `store.search` directo).
 
@@ -200,14 +205,180 @@ Ningún código de producción escribe `episodic_trajectory` ni `procedural_skil
 
 **Test:** `episodic_trajectory_retrievable_by_same_agent_id` y `knn_procedural_returns_skill_rows` (`search.rs`), `regenerate_reports_the_ids_it_rendered` y `workspace_top_skills_exclude_foreign_project` (`workspace.rs`), `list_memories_kind_none_merges_all_tables_sorted_desc` (`admin.rs`) y `reembed_reinfer_uses_passage_role_and_shared_skill_embedding_text` (`maintenance.rs`, fija el texto literal). La apertura de una base en V9 con esas filas está en [`specs/synthesis`](../synthesis/spec.md) (su R9).
 
+## Línea de hit en `recall_context`
+
+Cada hit MUST imprimirse como un encabezado de una línea seguido del texto en la misma línea (`format_hit_line`, `prompt_builder.rs:296`):
+
+- `kind = memory`: `[YYYY-MM-DD #id tipo] texto`
+- otro kind: `[YYYY-MM-DD #id kind/tipo] texto`, con `kind` en minúsculas (`episodic`, `procedural`). Para esos kinds la búsqueda pone el tipo fijo `episode` o `procedure`.
+
+Si el texto tiene varias líneas, las siguientes MUST seguir tal cual (líneas en blanco y código incluidos) hasta el próximo encabezado de hit o separador `=== `. No se imprime `SOURCE:`, `TYPE:` ni `CONTENT:`. El `#id` es el que aceptan `delete_memory` y `update_memory`, con el kind de la línea (`memory` si no tiene).
+
+#### Escenario: memory
+- GIVEN un hit memory id 57, tipo `semantic_fact`, creado el 2026-10-10, texto `usar sqlite`
+- THEN el prompt contiene la línea `[2026-10-10 #57 semantic_fact] usar sqlite`
+
+#### Escenario: otro kind
+- GIVEN un hit procedural id 3, tipo `procedure`
+- THEN su línea empieza con `[<fecha> #3 procedural/procedure] `
+
+#### Escenario: texto multilínea
+- GIVEN un hit con texto `fn main() {\n    run();\n\n    stop();\n}` seguido de otro hit
+- THEN las 5 líneas, la vacía incluida, siguen al encabezado y el segundo encabezado las cierra
+
+**Test:** `hit_line_is_one_header_with_id_and_text` y `format_hit_line_drops_the_old_labels` en `prompt_builder.rs`.
+
+## Conflictos por referencia
+
+Cada par MUST imprimir los ids de sus dos lados como `#id`: son los valores que `resolve_conflict` recibe como `keep` y `other` (`ResolveConflictArgs`, `crates/clawg-cli/src/mcp/server.rs:239`), y los dos son ids de `memory`.
+
+Un lado que es hit mostrado MUST imprimirse sólo como `#id`. Un lado que no es hit mostrado (fila del workspace, o fila fuera del prompt) MUST imprimirse con su texto completo bajo el encabezado `[YYYY-MM-DD #id]` la primera vez que aparece en el bloque, y sólo como `#id` las siguientes (`format_conflict_block`, `prompt_builder.rs:334`). Así el texto de una fila aparece a lo sumo una vez en el bloque aunque esté en varios pares: en una cadena de disputas, la fila del medio es nueva en un par y vieja en otro. Un par con ambos lados mostrados MUST NOT imprimir ningún texto. `importance`, `tier` y `status` no se imprimen.
+
+Formato de un grupo:
+
+```
+NEW #N                      | NEW [YYYY-MM-DD #N disputed] texto
+OLD #M                      | OLD [YYYY-MM-DD #M] texto
+```
+
+#### Escenario: lado mostrado
+- GIVEN el par (old 1, new 2), con 2 como hit en RECENT y 1 sin mostrar
+- THEN el bloque contiene `NEW #2` y `OLD [<fecha> #1] <texto de 1>`, y el texto de 2 aparece una sola vez en todo el prompt
+
+#### Escenario: ambos mostrados
+- GIVEN old 1 y new 2 como hits
+- THEN el bloque tiene `NEW #2` y `OLD #1` y ninguno de los dos textos se repite
+
+#### Escenario: workspace
+- GIVEN old 1 es una fila del workspace y new 2 un hit
+- THEN `OLD [<fecha> #1] <texto>` lleva el texto, aunque el bullet del workspace ya lo muestre: el bullet no tiene id
+
+#### Escenario: cadena
+- GIVEN los pares (old 2, new 3), (old 1, new 3) y (old 1, new 2), ninguno con hits
+- THEN el bloque es `NEW [<fecha> #3 disputed] <texto de 3>`, `OLD [<fecha> #2] <texto de 2>`, `OLD [<fecha> #1] <texto de 1>`, `NEW #2`, `OLD #1`
+
+**Test:** `conflict_block_cites_shown_hits_by_id_and_prints_text_only_for_the_rest`, `a_row_in_several_pairs_prints_its_text_once` y `e2e_full_4_block_output` (la fila mostrada aparece una vez y el bloque la cita como `OLD #id`) en `prompt_builder.rs`.
+
+## Conflictos agrupados por fila nueva
+
+Los pares que comparten `new_id` MUST formar un grupo: una línea `NEW`, y una línea `OLD` por cada vieja. El texto de la nueva MUST aparecer a lo sumo una vez en el bloque.
+
+#### Escenario
+- GIVEN new 9 disputa a las viejas 1, 2 y 3, y 9 no es hit
+- THEN `[<fecha> #9 disputed] <texto>` aparece una vez, seguido de tres líneas `OLD`
+
+**Test:** `a_new_row_disputing_several_old_rows_prints_its_text_once` y `a_row_in_several_pairs_prints_its_text_once` en `prompt_builder.rs`.
+
+## Una NOTE por bloque de conflictos
+
+La NOTE MUST imprimirse una sola vez por bloque, justo bajo el separador y antes de los grupos (`CONFLICT_NOTE`, `prompt_builder.rs:306`):
+
+```
+NOTE: estas memorias se contradicen y aún no resolviste cuál vale.
+Si vas a tomar una decisión que dependa de esto, preguntale al usuario.
+Con su respuesta, llamá a resolve_conflict (keep = la que vale, other = la otra).
+```
+
+#### Escenario
+- GIVEN 3 grupos
+- THEN `NOTE:` aparece exactamente una vez, y `resolve_conflict` también
+
+**Test:** `conflict_block_has_one_note` y `the_conflict_note_names_the_tool` en `prompt_builder.rs`.
+
+## Orden y tope de los conflictos
+
+Una función pura sobre los pares leídos (`rank_conflicts`, `prompt_builder.rs:315`) MUST ordenarlos por clave `(rank, new_id desc, old_id asc)`:
+
+- `rank` = menor posición de hit entre sus lados que son hits mostrados;
+- los pares sin ningún hit mostrado (sólo tocan una fila del workspace) MUST ir al final, con `rank` = infinito.
+
+El resultado MUST NOT depender del orden de entrada. Los grupos salen en orden de su primer par.
+
+Tras ordenar, el bloque MUST conservar los primeros 5 pares (`MAX_CONFLICT_PAIRS`, `prompt_builder.rs:36`; el tope cuenta pares, antes de agrupar). Si quedan N > 0 afuera, la última línea del bloque MUST ser `(+N conflictos más sin mostrar)`. Con N = 0 MUST NOT haber esa línea.
+
+#### Escenario: posición
+- GIVEN un par cuyo hit está en posición 0 y otro en posición 4
+- THEN el primero va antes, aunque su `new_id` sea menor
+
+#### Escenario: sólo workspace
+- GIVEN un par sólo de workspace con `new_id` 99 y otro con un hit en posición 9
+- THEN el de workspace va último
+
+#### Escenario: estable
+- GIVEN los mismos pares en dos permutaciones de entrada
+- THEN la salida es idéntica
+
+#### Escenario: tope
+- GIVEN 8 pares
+- THEN hay 5 pares impresos y la línea `(+3 conflictos más sin mostrar)`; con 5 pares no hay línea de omitidos
+
+**Test:** `conflict_pairs_rank_by_best_hit_position_workspace_only_last`, `conflict_pair_order_ignores_input_order` y `conflict_block_keeps_five_pairs_and_counts_the_rest` en `prompt_builder.rs`.
+
+## Workspace en el prompt
+
+El workspace entregado al modelo (`workspace_for_prompt`, `prompt_builder.rs:388`) MUST NOT contener `<!-- `, ni sección USER vacía, ni un encabezado `## ` de la sección AUTO sin bullets debajo. El contenido no vacío de USER MUST conservarse tal cual lo escribió el usuario, encabezados incluidos, sin marcadores y sin líneas en blanco al principio ni al final: la poda de encabezados sólo mira la sección AUTO, que es la que genera `render_rows` (`workspace.rs:445`). Un archivo sin `AUTO_START` MUST entregarse entero; uno con AUTO pero sin `AUTO-END` se toma como AUTO hasta el final, y el texto antes de `AUTO-START` se entrega. Si no queda nada, no se emite la sección WORKSPACE. El archivo en disco MUST ser byte a byte idéntico antes y después de un recall.
+
+#### Escenario: sin marcadores
+- GIVEN un archivo con AUTO/USER, un bullet bajo `## User Preferences` y los otros dos encabezados vacíos
+- THEN el prompt contiene el bullet y su encabezado, y ni `<!--` ni los otros encabezados
+
+#### Escenario: USER con contenido
+- GIVEN texto del usuario entre USER-START y USER-END
+- THEN aparece en el prompt sin marcadores
+
+#### Escenario: archivo plano
+- GIVEN un archivo sin marcadores
+- THEN se entrega tal cual
+
+**Test:** `workspace_in_prompt_has_no_markers_or_empty_headings`, `workspace_user_section_content_is_kept_without_markers` y `workspace_file_bytes_are_unchanged_by_rendering_the_prompt` en `prompt_builder.rs`; el archivo plano, `embedder_none_emits_workspace_only_if_present`.
+
+## El parser de `rag-eval --agent-view`
+
+`context_segments` (`crates/clawg-eval/src/bin/rag-eval/agent_view/parse.rs:80`) MUST segmentar por sección (`context_sections`, `parse.rs:63`): los segmentos de hit salen sólo de RECENT CONTEXT y LONG-TERM KNOWLEDGE; los bullets, sólo de WORKSPACE; el texto de ACTIVE CONFLICTS MUST NOT contar para `found`. Encabezado de hit = línea que cumple `[` + `YYYY-MM-DD` + ` #` + dígitos + (` ` + palabra sin espacios)? + `]` + ` ` (`hit_text`, `parse.rs:133`); el texto es lo que sigue en la misma línea, y el segmento corre hasta el próximo encabezado o separador. Un marcador `<!--` cierra un bullet.
+
+#### Escenario: multilínea
+- GIVEN dos hits, el primero con código y línea en blanco
+- THEN hay 2 segmentos, el primero completo
+
+#### Escenario: conflictos
+- GIVEN una sección ACTIVE CONFLICTS con `NEW [..#2 disputed] x` y `OLD [..#1] y`
+- THEN no se genera ningún segmento
+
+**Test:** `a_hit_line_is_one_segment`, `a_hit_of_another_kind_is_one_segment`, `a_multi_line_hit_runs_until_the_next_header`, `a_hit_ends_at_the_next_section_separator`, `a_hit_may_open_with_a_dash`, `conflict_text_yields_no_segments` y `workspace_markers_end_a_bullet` en `parse.rs`; `read_context_finds_rows_in_hit_lines_and_workspace_bullets` en `agent_view/mod.rs`. El punta a punta del agent-view (`runner.rs`) arma un prompt real y lo lee con este parser.
+
+## Los ids de `recall_context` en `delete_memory` y `update_memory`
+
+La doc de `DeleteMemoryArgs.id` (`server.rs:209`), la de `UpdateMemoryArgs.id` (`server.rs:221`) y la descripción de `delete_memory` (`server.rs:765`) MUST nombrar `recall_context` además de `search_memory` y `list_memories`, y decir que un hit sin kind explícito es `memory`. `kind` sigue siendo obligatorio en las dos.
+
+**Test:** `memory_id_docs_name_recall_context_and_the_default_kind` en `server.rs`.
+
+## Medición del contexto
+
+`rag-eval --real --agent-view` sobre `docs/eval/golden.json` (sha256 `d2d9d732…ed792a`, n = 46), medido en Windows el 2026-10-14 sobre `d175348`. Es la referencia contra la que un cambio que toque el prompt compara con `--diff` y por sección:
+
+| Métrica | Antes de context-density (`d28fe90`) | Desde context-density |
+|---|---|---|
+| `found` | 41/46 | 41/46 |
+| `search_memory`, media / máximo | 851,5 / 1.239 | 851,5 / 1.239 |
+| ACTIVE CONFLICTS, media cuando aparece (45 casos) | 2.273,8 | 403,7 |
+| `recall_context`, media / máximo | 3.355,0 / 4.900 | 1.405,0 / 1.738 |
+| RECENT CONTEXT, media | 1.129,6 | 1.009,0 |
+
+Detalle de las corridas en el [`verify.md`](../../changes/archive/2026-10-14-context-density/verify.md#r11-rag-eval) de context-density.
+
 ## Invariantes
 
 - El ranking del core (`search_all_memories`, `hit_cmp`) no depende del corte: el corte sólo decide cuánto de la lista recibe quien llama.
 - Las corridas de eval no registran accesos (`AccessTracker::inert`, `crates/clawg-core/src/eval_api.rs:461`).
 - Con `lexical_bonus = 0` el ranking es bit a bit el de antes del bono: es la forma de apagarlo sin tocar el canal léxico.
 - Los contadores ya guardados no se reescriben. Los accesos que se contaron de más antes de este comportamiento quedan como estaban.
+- El formato del prompt de `recall_context` no toca la búsqueda: la salida de `search_memory` es la misma, y el orden y los separadores de las secciones (`prompt_builder.rs:20-23`) y `K_FINAL` (`:34`) no dependen de él. El separador `=== ACTIVE CONFLICTS (review needed) ===` lo nombran las instrucciones del servidor y la doc de `resolve_conflict`.
+- Un prompt vacío se entrega como `no context yet` (`format_context`, `crates/clawg-cli/src/mcp/tools.rs:229`), y el aviso de `synthesize` va después del prompt (`format_recall`, `tools.rs:216`), fuera de lo que mide `rag-eval`.
+- Armar el prompt no escribe: `fetch_active_conflicts` es un `SELECT`, y el archivo del workspace no cambia.
 
 ## Fuera de esta spec
 
 - El orden entre hits con score 0: `hit_cmp` desempata por `(kind, id)` ascendente (`crates/clawg-core/src/memory/search.rs:78`). Desde lexical-fusion, un match de identificador ya no depende de ese desempate para llegar al top 10: el bono lo deja con score > 0 aunque su coseno quede bajo el piso.
 - Un bono parcial (la fila tiene sólo algunos identificadores de la consulta), números solos como identificadores y FTS para `episodic` y `procedural`.
+- Qué pares se disputan y cómo se resuelven: [`specs/disputes`](../disputes/spec.md). Acá sólo está cómo se imprimen.
+- Un id en los bullets del workspace. Hoy no lo tienen, y por eso una fila del workspace que está en un conflicto lleva su texto también en el bloque.
