@@ -1,14 +1,14 @@
 change: recoverable-delete
 objective: "1"
-depends_on: []
-phase: explore
+depends_on: [visibility-policy, agent-sharing, long-save-context]
+phase: apply
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
-  apply: pending
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: in-progress
   verify: pending
   archive: pending
-updated: 2026-10-14
+updated: 2026-10-15
