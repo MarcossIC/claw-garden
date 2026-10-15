@@ -1,6 +1,6 @@
 # retrieval — Especificación
 
-Fuente de verdad del comportamiento actual de la recuperación: el corte relativo de `POST /v1/search` y de la herramienta `search_memory`, qué hits cuentan como acceso en `search` y en `recall_context`, el bono que lleva una fila con el identificador exacto de la consulta, y el texto que arma `recall_context` (hits, conflictos y workspace) junto con el parser que lo lee en `rag-eval`. A qué filas de otros agentes llegan la búsqueda y el contexto lo define [`specs/sharing`](../sharing/spec.md); acá está cómo se muestra un hit ajeno.
+Fuente de verdad del comportamiento actual de la recuperación: el corte relativo de `POST /v1/search` y de la herramienta `search_memory`, qué hits cuentan como acceso en `search` y en `recall_context`, el bono que lleva una fila con el identificador exacto de la consulta, y el texto que arma `recall_context` (hits, conflictos y workspace) junto con el parser que lo lee en `rag-eval`. A qué filas de otros agentes llegan la búsqueda y el contexto lo define [`specs/sharing`](../sharing/spec.md); acá está cómo se muestra un hit ajeno. La búsqueda en la documentación y el código de un proyecto es otra cosa y está en [`specs/project-docs`](../project-docs/spec.md).
 
 **Origen:**
 - [retrieval-hygiene](../../changes/archive/2026-10-12-retrieval-hygiene/proposal.md), archivado el 2026-10-12.
@@ -8,12 +8,13 @@ Fuente de verdad del comportamiento actual de la recuperación: el corte relativ
 - [knowledge-synthesis](../../changes/archive/2026-10-13-knowledge-synthesis/proposal.md), archivado el 2026-10-13 (sólo el apartado de las filas que dejó la app de escritorio).
 - [context-density](../../changes/archive/2026-10-14-context-density/proposal.md), archivado el 2026-10-14 (desde "Línea de hit en `recall_context`" hasta "Medición del contexto").
 - [agent-sharing](../../changes/archive/2026-10-14-agent-sharing/proposal.md), archivado el 2026-10-14 (sólo "Hits de otros agentes" y los cambios de agente en "El bono respeta el scope" y en "Línea de hit en `recall_context`").
+- [project-indexing](../../changes/archive/2026-10-15-project-indexing/proposal.md), archivado el 2026-10-15 (sólo "El piso de coseno", "Indexar un proyecto no cambia la búsqueda de memorias", el valor de `RELEVANCE_RATIO` y la medición con pooling mean en "Medición del contexto").
 
 ## Definiciones
 
-- **Corte relativo con ratio r (`relevant_len`, `crates/clawg-cli/src/relevance.rs:20`):** sobre scores ordenados mejor primero, se conservan los primeros mientras la posición sea menor que `MIN_SHOWN_HITS` o el score sea `>= r × mejor`. Sin scores, no queda ninguno.
-- **`RELEVANCE_RATIO` (`relevance.rs:14`):** 0,6. El ratio que usa el puente MCP y que pide el cliente HTTP.
-- **`MIN_SHOWN_HITS` (`relevance.rs:17`):** 2. Hits que pasan el corte sea cual sea su score.
+- **Corte relativo con ratio r (`relevant_len`, `crates/clawg-cli/src/relevance.rs:25`):** sobre scores ordenados mejor primero, se conservan los primeros mientras la posición sea menor que `MIN_SHOWN_HITS` o el score sea `>= r × mejor`. Sin scores, no queda ninguno.
+- **`RELEVANCE_RATIO` (`relevance.rs:19`):** 0,35. El ratio que usa el puente MCP y que pide el cliente HTTP. Medido con `rag-eval --real --agent-view` sobre vectores con pooling mean, cuyo mejor score tiene mediana 0,19: con 0,35 `search_memory` muestra el recuerdo esperado en 36 de 46 consultas con 764 tokens de media; con 0,6 eran 30 con 455 y con 0,2 son 37 con 894. El score del esperado (0,03–0,41) y el del resto (hasta 0,38) se superponen, por eso el corte es relativo.
+- **`MIN_SHOWN_HITS` (`relevance.rs:22`):** 2. Hits que pasan el corte sea cual sea su score.
 - **Acceso:** un id que llega al access tracker. En el flush suma `access_count`, lleva `last_accessed_at` al máximo entre el actual y el del flush, y recalcula el tier en la misma sentencia (`flush`, `crates/clawg-core/src/memory/access.rs:175`; el `UPDATE` en `:204-209`). El flush corre cada 30 s o al juntar 500 ids (`access.rs:76-78` y `:90`).
 - **Hit contable:** hit de `kind = memory` con `score > 0` (`AccessTracker::record_hits`, `access.rs:151`). Sólo cuentan los de `memory` porque los ids son por tabla y el flush sólo actualiza `memory`. Un hit con score 0 está bajo el piso de similitud y ocupa un lugar de relleno.
 - **Token:** cada tramo de `char::is_alphanumeric() || '_'` de la consulta, como los parte `fts_tokens` (`crates/clawg-core/src/memory/search.rs:576`).
@@ -55,7 +56,7 @@ El corte vive en `clawg-cli` y no en el core: `search_all_memories` devuelve sie
 - WHEN se busca con `min_relative_score = 1.5` o `-0.1`
 - THEN la respuesta es `400`
 
-**Tests:** `search_without_a_relative_cut_is_unchanged`, `search_applies_the_requested_relative_cut` y `search_rejects_a_relative_score_outside_zero_to_one` (`crates/clawg-cli/tests/api.rs`); `a_relative_score_inside_zero_to_one_passes_through` y `a_relative_score_outside_zero_to_one_is_a_bad_request`, que incluye `NaN` e infinito (`api.rs`, mod tests); `hits_far_below_the_best_match_are_not_shown`, `a_hit_exactly_at_the_ratio_is_shown`, `the_two_best_are_shown_whatever_they_score` y `no_scores_keep_nothing` (`relevance.rs`).
+**Tests:** `search_without_a_relative_cut_is_unchanged`, `search_applies_the_requested_relative_cut` y `search_rejects_a_relative_score_outside_zero_to_one` (`crates/clawg-cli/tests/api.rs`); `a_relative_score_inside_zero_to_one_passes_through` y `a_relative_score_outside_zero_to_one_is_a_bad_request`, que incluye `NaN` e infinito (`api.rs`, mod tests); `relevance_ratio_pins_the_shipped_value`, `hits_far_below_the_best_match_are_not_shown`, `a_hit_exactly_at_the_ratio_is_shown`, `the_two_best_are_shown_whatever_they_score` y `no_scores_keep_nothing` (`relevance.rs`).
 
 ## `search` registra sólo lo que devuelve
 
@@ -95,7 +96,7 @@ El handler `search` MUST registrar como acceso exactamente los hits contables de
 
 #### Escenario: cuerpo del pedido
 - WHEN el cliente arma el cuerpo de una búsqueda
-- THEN el cuerpo contiene `"min_relative_score": 0.6` además de los campos de `SearchArgs`
+- THEN el cuerpo contiene `"min_relative_score": 0.35` además de los campos de `SearchArgs`
 
 #### Escenario: render
 - GIVEN hits con scores 0,50, 0,10 y 0,05
@@ -135,6 +136,16 @@ Para un hit marcado como match de identificador (`RawHit.lexical_match`, `score.
 - THEN el score es 0
 
 **Test:** `a_lexical_match_adds_the_bonus_after_the_floor`, `without_a_match_the_score_is_unchanged` y `a_match_outranks_a_closer_row_with_the_same_decay_and_importance` en `score.rs`; el literal, en `scoring_config_default_pins_the_shipped_ranking_literals`.
+
+## El piso de coseno
+
+El coseno de cada hit MUST re-escalarse contra `ScoringConfig::DEFAULT.cosine_floor`, que vale 0,79 (`score.rs:181`): `cos' = clamp((cos − piso) / (1 − piso), 0, 1)` (`rescale_cosine`, `score.rs:214`; aplicado en `score()`, `score.rs:270`). Un coseno bajo el piso vale 0 y el piso es el cero del término de similitud; sin la re-escala, todos los cosenos caerían en una banda angosta y la similitud casi no pesaría frente a la importancia.
+
+El valor está atado a la distribución de cosenos del embedder: al pooling mean del modelo (`multilingual-e5-small/mean`, [`specs/storage`](../storage/spec.md)) y a los prefijos de consulta y pasaje que el daemon manda hoy. Cambiar cualquiera de los dos mueve toda la distribución y obliga a medirlo de nuevo.
+
+**Cómo se midió.** Sobre el golden set de memorias (`docs/eval/golden.json`, 46 casos), con pooling mean, el 2026-10-15: un barrido del piso de 0,70 a 0,83 da el mejor MRR (0,5524), nDCG@10 (0,6215) y R@10 (0,8478) en 0,79, así que 0,79 queda.
+
+**Tests:** `scoring_config_default_pins_the_shipped_ranking_literals` (fija el literal 0,79; `score.rs`), y `rescale_cosine_maps_the_floor_to_zero`, `rescale_cosine_maps_one_to_one_regardless_of_floor`, `rescale_cosine_clamps_a_cosine_below_the_floor_to_zero` y `rescale_cosine_is_monotone_non_decreasing_for_any_floor` (`score.rs`).
 
 ## La búsqueda premia el identificador exacto
 
@@ -377,6 +388,19 @@ La doc de `DeleteMemoryArgs.id` (`server.rs:228`), la de `UpdateMemoryArgs.id` (
 | RECENT CONTEXT, media | 1.129,6 | 1.009,0 |
 
 Detalle de las corridas en el [`verify.md`](../../changes/archive/2026-10-14-context-density/verify.md#r11-rag-eval) de context-density.
+
+Esas cifras son con pooling CLS. Desde project-indexing (pooling mean, `RELEVANCE_RATIO` 0,35), medido en Windows el 2026-10-15 con el mismo golden set: `search_memory` encuentra 36/46 con 764,0 / 1.206 tokens (media / máximo) y `recall_context` 39/46 con 1.086,4 / 1.408. Los casos que se pierden contra CLS (c02, c09, c11, c18, c26 y c41) no vuelven aunque el corte baje a 0,2: la pérdida es del pooling, sobre todo en las consultas en inglés. Detalle en el [`verify.md`](../../changes/archive/2026-10-15-project-indexing/verify.md) de project-indexing.
+
+## Indexar un proyecto no cambia la búsqueda de memorias
+
+Con un proyecto indexado ([`specs/project-docs`](../project-docs/spec.md)), `search_all_memories`, `POST /v1/search`, `POST /v1/context`, `search_memory` y `recall_context` MUST devolver exactamente lo mismo que sin índice: el índice vive en tablas propias (`project_doc_*`) que ninguna de esas rutas consulta, y el refresco no escribe `memory` ni sus vectores, su FTS o el access tracker.
+
+#### Escenario
+- GIVEN un agente con memorias en un proyecto
+- WHEN se busca antes y después de indexar docs del mismo proyecto con textos casi iguales a esas memorias
+- THEN los resultados son idénticos
+
+**Tests:** `indexing_docs_leaves_memory_search_unchanged` (`search_all_memories`, con un canal léxico y un proyecto) y `refreshing_never_touches_memories` (filas, vectores y FTS de `memory` byte a byte) en `crates/clawg-core/src/memory/project_docs/mod.rs`. Los otros caminos de la lista no tienen un test propio: no leen las tablas del índice.
 
 ## Invariantes
 

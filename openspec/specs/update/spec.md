@@ -130,7 +130,7 @@ El puente MUST exponer `update_memory` con `kind`, `id`, `importance` (opcional)
 
 `save_memory` MUST nombrar `update_memory`: en su descripción, junto a `delete_memory` (`server.rs:702`), y en la respuesta de un refuerzo, que ya dice el id (`save_outcome_text`, `server.rs:416-417`).
 
-`tools/list` MUST listar nueve herramientas.
+`tools/list` MUST listar `update_memory` entre sus herramientas; el conteo vigente, once, y la lista completa están en [`specs/mcp`](../mcp/spec.md).
 
 #### Escenario: lo propio
 - GIVEN una memoria del agente A con importancia 5

@@ -13,9 +13,12 @@ context: |
     3. Index projects so the AI understands how each one works.
     4. Be shared: several agents read and write the same brain, and the user controls what each sees.
     5. Over time, extract conclusions: preferences, trends, guidelines, experiences.
-  Retrieval baseline (rag-eval --real, golden set of 46 cases): R@1 0.4348, R@5 0.7826,
-  R@10 0.8913, MRR 0.5979, nDCG@10 0.6693.
-  Test baseline: cargo test --workspace -> 1304 passed, 0 failed.
+  Retrieval baseline (rag-eval --real, golden set of 46 cases, mean pooling, cosine floor 0.79):
+  R@1 0.4348, R@5 0.6522, R@10 0.8478, MRR 0.5524, nDCG@10 0.6215
+  (docs/eval/results/2026-10-15-real-project-indexing-tip-anchor.json).
+  Agent-view baseline (RELEVANCE_RATIO 0.35): search_memory 36/46 at 764.0 mean tokens,
+  recall_context 39/46 at 1086.4 (docs/eval/results/2026-10-15-real-project-indexing-relcut-agent-view.json).
+  Test baseline: cargo test --workspace -> 1864 passed, 0 failed.
 
 strict_tdd: true
 

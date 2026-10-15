@@ -265,15 +265,15 @@ Todo lo demás (huella, refresco, secretos, búsqueda, `search_project`) es igua
 
 ## R15. Umbrales sobre la distribución mean
 
-Los umbrales de similitud estaban medidos sobre vectores CLS. Con pooling mean MUST valer, de forma provisional hasta medirlos sobre el golden set de memorias:
+Los umbrales de similitud estaban medidos sobre vectores CLS. Con pooling mean MUST valer, medidos sobre el golden set de memorias el 2026-10-15 (`verify.md`, «Windows»):
 
-| Umbral | CLS | Mean (provisional) | De dónde sale |
+| Umbral | CLS | Mean | De dónde sale |
 |---|---|---|---|
-| `ScoringConfig::DEFAULT.cosine_floor` | 0,8793 | 0,79 | Percentil 5 del coseno pregunta–pasaje sobre los docs de este repo (0,7904). Con 0,8793, el 91 % de los top-10 quedaría bajo el piso |
-| `CONTRADICTION_THRESHOLD` (L2) | 0,35 | 0,42 | 10 pares que se contradicen y 10 compatibles: separan en (0,276; 0,328] con CLS, como el golden set en (0,30; 0,35], y en (0,350; 0,469] con mean |
+| `ScoringConfig::DEFAULT.cosine_floor` | 0,8793 | 0,79 | Percentil 5 del coseno pregunta–pasaje sobre los docs de este repo (0,7904). Con 0,8793, el 91 % de los top-10 quedaría bajo el piso. `--sweep-cos-floor` de 0,70 a 0,83: el mejor MRR, nDCG@10 y R@10 |
+| `CONTRADICTION_THRESHOLD` (L2) | 0,35 | 0,42 | 10 pares que se contradicen y 10 compatibles: separan en (0,276; 0,328] con CLS, como el golden set en (0,30; 0,35], y en (0,350; 0,469] con mean. En el golden set con mean, ningún compatible bajo 0,50; recall 0,8 a 0,40 y 0,9 a 0,45 |
 | `NEAR_DUPLICATE_FLOOR` (L2) | 0,05 | 0,10 | El par a 0,047 con CLS (doble espacio) queda a 0,097 con mean |
-| `RELEVANCE_RATIO` | 0,6 | 0,6 | Es relativo al mejor puntaje; se revisa con el resto |
+| `RELEVANCE_RATIO` | 0,6 | 0,35 | Barrido de agent-view de 0,6 a 0,2: con 0,6 `search_memory` encontraba 30/46 (455 tokens); con 0,35, 36/46 (764 tokens), el más alto del plateau y por debajo de los 852 de CLS |
 
 El sweep de contradicciones de `rag-eval` MUST cubrir 0,20–0,50 alrededor del umbral nuevo.
 
-**Tests:** los literales fijados en `scoring_config_default_pins_the_shipped_ranking_literals`, `contradiction_threshold_pins_the_shipped_value` y `near_duplicate_floor_pins_the_shipped_value`; `threshold_curve_*` en `metrics.rs`.
+**Tests:** los literales fijados en `scoring_config_default_pins_the_shipped_ranking_literals`, `contradiction_threshold_pins_the_shipped_value`, `near_duplicate_floor_pins_the_shipped_value` y `relevance_ratio_pins_the_shipped_value`; `threshold_curve_*` en `metrics.rs`.

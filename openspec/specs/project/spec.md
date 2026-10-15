@@ -85,6 +85,7 @@ El puente MCP (cwd y `project_path`) y `clawg memories --here` MUST derivar el i
 - Por cada fila movida, MUST escribir en `project_rekey` la tabla, el id de la fila, el id viejo, el id nuevo y la fecha, en la misma transacción.
 - Un id viejo con formato inválido (fuera de `{basename}-[0-9a-f]{4}`) MUST dar 400 sin mover nada.
 - La operación MUST ser idempotente: repetirla no mueve filas ni agrega entradas a `project_rekey`.
+- Un registro que tiene éxito (nuevo o ya conocido) también lanza, en segundo plano y sin que la respuesta lo espere, el refresco del índice de documentación del proyecto: [`specs/project-docs`](../project-docs/spec.md), «El registro indexa en segundo plano». Uno que falla (400, 409) no lo lanza.
 
 #### Escenario: filas viejas visibles bajo el id nuevo
 - GIVEN una base con 2 memorias, 1 trayectoria y 1 skill en el id viejo `src-1a2b`, y 1 memoria en otro proyecto

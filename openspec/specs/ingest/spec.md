@@ -1,8 +1,10 @@
 # ingest — Especificación
 
-Fuente de verdad del comportamiento actual de la ingesta: el contrato de `POST /v1/memories` y de la herramienta `save_memory`, el estado del embedder que publica `/health`, el reintento del bootstrap del modelo y la capacidad de la cola.
+Fuente de verdad del comportamiento actual de la ingesta: el contrato de `POST /v1/memories` y de la herramienta `save_memory`, el estado del embedder que publica `/health`, el reintento del bootstrap del modelo, la capacidad de la cola y qué chunker trocea un save. El índice de la documentación y el código de un proyecto, que se trocea aparte, está en [`specs/project-docs`](../project-docs/spec.md).
 
-**Origen:** [ingest-durability](../../changes/archive/2026-10-12-ingest-durability/proposal.md), archivado el 2026-10-12.
+**Origen:**
+- [ingest-durability](../../changes/archive/2026-10-12-ingest-durability/proposal.md), archivado el 2026-10-12.
+- [project-indexing](../../changes/archive/2026-10-15-project-indexing/proposal.md), archivado el 2026-10-15 (sólo "Troceo del save").
 
 ## Definiciones
 
@@ -224,6 +226,21 @@ Los textos MUST NOT contener la palabra `queued` sola. Un save «exitoso» sólo
 `DaemonClient::save` (`client.rs:403`) MUST devolver `SaveOutcome` (`Saved { memories }` o `Queued { reason }`), no `()`. Los errores son `ClientError::Daemon { status, message, details }`, y `details` (`ErrorDetails`, `client.rs:81`) MUST conservar `detail`, `retryable` y `memories` del cuerpo de error para que la herramienta los muestre.
 
 **Test:** `save_returns_the_ids_the_daemon_reported` (`client.rs`, mod tests).
+
+## Troceo del save
+
+### Hay un solo chunker, también para el código
+
+El worker MUST trocear el contenido de cada save con el chunker de chat (`ChatChunker::split_save`, `crates/clawg-core/src/memory/chunker/chat.rs:88`), sea cual sea su `memory_type` y su `source`, incluido `code_block`. Lo único que la elección por evento decide es si el evento se descarta: `select_chunker` (`crates/clawg-core/src/memory/chunker/mod.rs:95`) devuelve `ChunkerKind::Skip` para un contenido vacío y para el rol `System`, y `ChunkerKind::Chat` para el resto (`process_event`, `worker.rs:442`); un evento de fuente `Compaction` ni consulta la elección y siempre va al chat chunker. No hay chunker de código en la ingesta: el código de un proyecto se trocea para su propio índice, que no es `memory` ([`specs/project-docs`](../project-docs/spec.md)).
+
+Una fila guardada con `source = 'code_file'` o `memory_type = 'code_block'` MUST seguir leyéndose y listándose como cualquier otra (`MemorySource::CodeFile`, `events.rs:58`; `MemoryType::CodeBlock`, `store_insert.rs:22`).
+
+#### Escenario: un save de código
+- GIVEN un `save_memory` con `memory_type = "code_block"` y un bloque de Rust de 3 líneas
+- WHEN lo procesa el worker
+- THEN queda una fila con ese contenido tal cual y ese tipo
+
+**Test:** `a_code_block_save_is_chunked_like_any_other` en `crates/clawg-core/src/memory/worker.rs`.
 
 ## Invariantes
 

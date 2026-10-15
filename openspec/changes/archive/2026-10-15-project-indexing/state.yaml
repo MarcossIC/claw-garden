@@ -1,7 +1,7 @@
 change: project-indexing
 objective: "3"
 depends_on: [eval-golden-expansion]
-phase: verify
+phase: archived
 artifacts:
   exploration: done
   proposal: done
@@ -9,6 +9,7 @@ artifacts:
   design: done
   tasks: done
   apply: done
-  verify: partial  # Linux; Windows, calibration on the golden set, rag-eval --diff and the dev profile pending, see verify.md
-  archive: pending
+  verify: done  # Linux and Windows; docs Hit@3 0.27 < 0.70 and the mean-pooling anchor drop accepted, see verify.md
+  archive: done
+main_spec: openspec/specs/project-docs/spec.md
 updated: 2026-10-15

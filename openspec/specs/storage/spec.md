@@ -1,10 +1,11 @@
 # storage — Especificación
 
-Fuente de verdad del comportamiento actual del almacenamiento: el apagado del daemon, el volcado y la reinyección de eventos sin ingerir, la resolución del directorio de datos, el runner de migraciones y la verificación del esquema, los snapshots, `clawg backup` y `clawg restore`, la escritura de `workspace.md`, y lo que `clawg status`, MCP y el instalador dicen cuando la base no se puede abrir.
+Fuente de verdad del comportamiento actual del almacenamiento: el apagado del daemon, el volcado y la reinyección de eventos sin ingerir, la resolución del directorio de datos, el runner de migraciones y la verificación del esquema, el pooling del modelo y el re-embebido de un store CLS al arrancar, los snapshots, `clawg backup` y `clawg restore`, la escritura de `workspace.md`, y lo que `clawg status`, MCP y el instalador dicen cuando la base no se puede abrir.
 
 **Origen:**
 - [data-preservation](../../changes/archive/2026-10-12-data-preservation/proposal.md) (partes A + F), archivado el 2026-10-12.
 - [storage-safety-net](../../changes/archive/2026-10-12-storage-safety-net/proposal.md) (partes B + C de data-preservation), archivado el 2026-10-12.
+- [project-indexing](../../changes/archive/2026-10-15-project-indexing/proposal.md), archivado el 2026-10-15 (sólo "Contrato de embedding y pooling", el motivo `pre-reembed` y la fila de V12).
 
 ## Definiciones
 
@@ -14,7 +15,7 @@ Fuente de verdad del comportamiento actual del almacenamiento: el apagado del da
 - **Volcado:** el archivo `<data>/ingest-pending.jsonl` (`SPILL_FILE`, `crates/clawg-core/src/memory/spill.rs:14`), un `MemoryEvent` en JSON por línea.
 - **Directorio de backups:** `<data>/backups/` (`backups_dir`, `crates/clawg-core/src/paths.rs`).
 - **Snapshot:** una copia completa y autónoma de `memory.db` hecha con `VACUUM INTO`. Incluye lo commiteado en el WAL y no tiene archivo WAL propio.
-- **Motivo** de un snapshot (`Reason`, `crates/clawg-core/src/memory/backup.rs:119`): `pre-migration` y `pre-restore` son **automáticos**; `manual` es el de `clawg backup`.
+- **Motivo** de un snapshot (`Reason`, `crates/clawg-core/src/memory/backup.rs:119`): `pre-migration`, `pre-restore` y `pre-reembed` son **automáticos**; `manual` es el de `clawg backup`.
 - **Plan de esquema** (`SchemaPlan`, `backup.rs:63`): la comparación entre el historial de `refinery_schema_history` y las migraciones embebidas en el binario. `Fresh` (sin historial), `UpToDate`, `Pending { from, to }` (un prefijo; faltan de `from + 1` a `to`), `Newer { db, binary }` (una versión aplicada mayor que la última del binario) o `Diverged { version }` (otro nombre o checksum, o un hueco).
 
 ## Apagado sin pérdida
@@ -140,7 +141,7 @@ Las migraciones pendientes de un arranque MUST aplicarse en una sola transacció
 
 ### Checksums fijados
 
-Los checksums de las migraciones publicadas (V1–V8) MUST coincidir con una lista fija en el código (`PINNED`, `crates/clawg-core/src/memory/migrations.rs:44`). Cambiar una migración publicada MUST romper un test. Una migración nueva agrega su fila a la lista en el mismo commit.
+Los checksums de las migraciones publicadas (hoy V1–V12) MUST coincidir con una lista fija en el código (`PINNED`, `crates/clawg-core/src/memory/migrations.rs:44`). Cambiar una migración publicada MUST romper un test. Una migración nueva agrega su fila a la lista en el mismo commit.
 
 **Test:** `published_migration_checksums_are_pinned` (`migrations.rs`).
 
@@ -149,7 +150,7 @@ Los checksums de las migraciones publicadas (V1–V8) MUST coincidir con una lis
 La decisión es pura (`schema_plan`, `backup.rs:83`). `MemoryStore::open` MUST calcularla antes de cualquier pragma y antes del runner (`check_schema`, `crates/clawg-core/src/memory/db.rs:388`, llamada en `db.rs:185`). Con `Newer` o `Diverged`, `open` MUST devolver `MemoryError::SchemaNewer` o `MemoryError::SchemaDiverged` (`crates/clawg-core/src/memory/error.rs:58` y `:64`) y MUST NOT escribir nada en `memory.db`. Los mensajes MUST decir las versiones, que nada cambió, y qué hacer: instalar la versión que la escribió o `clawg restore` de un backup anterior.
 
 #### Escenario: base más nueva
-- GIVEN una base en la última versión del binario, N (hoy V9), con una fila N + 1 agregada en `refinery_schema_history`
+- GIVEN una base en la última versión del binario, N (hoy V12), con una fila N + 1 agregada en `refinery_schema_history`
 - WHEN se abre
 - THEN el error es `SchemaNewer { db: N + 1, binary: N }`, nombra `clawg restore`, y `memory.db` es byte a byte igual
 
@@ -169,6 +170,45 @@ Con plan `Pending`, `open` MUST hacer un snapshot `pre-migration` antes de aplic
 - THEN `backups/` tiene un snapshot `pre-migration` en V7 con esas filas, y la base quedó en la última versión
 
 **Tests:** `opening_an_older_database_snapshots_it_before_migrating`, `opening_a_current_database_takes_no_snapshot`, `a_new_database_takes_no_snapshot` y `a_failed_snapshot_stops_the_migration` (`db.rs`).
+
+## Contrato de embedding y pooling
+
+### El modelo se carga con pooling mean
+
+`FastEmbedLocal` MUST cargar multilingual-e5-small con pooling mean, el de su entrenamiento (`e5_model`, `crates/clawg-core/src/memory/embedder.rs:125`). Sin indicarlo, fastembed toma el token CLS de un modelo definido por el usuario, y entonces todos los pasajes de un corpus quedan a 0,90–0,91 de coseno de cualquier pregunta.
+
+El id del modelo en el contrato de embedding MUST ser `multilingual-e5-small/mean` (`E5_MODEL_ID`, `embedder.rs:115`). El id anterior, `multilingual-e5-small` (`LEGACY_CLS_MODEL_ID`, `embedder.rs:120`), nombra los vectores CLS: el archivo del modelo es el mismo, el espacio no. El contrato no tiene una columna de pooling; el id es lo que distingue espacios, y el índice de documentación de los proyectos, que guarda el `model_id` de cada doc, se reindexa solo cuando cambia ([`specs/project-docs`](../project-docs/spec.md)).
+
+**Test:** `the_e5_model_is_pooled_by_mean` y `the_model_id_names_its_pooling_apart_from_the_cls_vectors_of_before` en `embedder.rs`.
+
+### Re-embebido de un store CLS al arrancar
+
+Al arrancar, después de cargar el modelo y dentro del bootstrap del embedder, el daemon verifica el contrato (`verify_or_reembed`, `crates/clawg-core/src/memory/bootstrap.rs:269`, cableado en `production_deps`, `bootstrap.rs:231`, y `crates/clawg-cli/src/daemon/serve.rs:88`). Si el contrato guardado tiene `LEGACY_CLS_MODEL_ID` y el embedder cargado tiene `E5_MODEL_ID`, con la misma dimensión y los mismos prefijos (`is_pooling_upgrade`, `bootstrap.rs:255`, pura), MUST:
+
+1. escribir un snapshot `pre-reembed` en `<data>/backups`; si falla, no re-embebe, y el intento termina como un fallo de verificación, que se reintenta con la espera de siempre ([`specs/ingest`](../ingest/spec.md), «Reintento del bootstrap»);
+2. re-embeber `memory`, `episodic_trajectory` y `procedural_skill` con el embedder cargado (`reembed_all` en modo `ReInfer`, `crates/clawg-core/src/memory/maintenance.rs:467`);
+3. habilitar la memoria sólo si las tres tablas terminaron sin fallas, que es cuando `reembed_all` escribe el contrato nuevo. Si no, el contrato queda como estaba, la memoria sigue deshabilitada y el estado es el de un contrato que no coincide: ese bootstrap no se reintenta, pero el próximo arranque vuelve a empezar, y las filas ya hechas dan los mismos bytes.
+
+Mientras el snapshot y el re-embebido corren, el estado del embedder MUST ser `loading`: el bootstrap publica `loading` antes de empezar y `ready` sólo cuando el embedder entró a su celda. Un save de ese lapso espera en la cola como con cualquier carga ([`specs/ingest`](../ingest/spec.md), «Embedder cargando»).
+
+Cualquier otro contrato que no coincide (otro modelo, otra dimensión, otros prefijos, o el mismo CLS con un embedder que no es el mean) MUST seguir siendo la parada de siempre: memoria deshabilitada, sin snapshot y sin re-embeber.
+
+#### Escenario: un store de vectores CLS
+- GIVEN un store con contrato `multilingual-e5-small`, dim 384, y una memoria
+- WHEN arranca con el embedder mean
+- THEN queda un snapshot `…-pre-reembed.db`, el contrato pasa a `multilingual-e5-small/mean` y la verificación da `Match`
+
+#### Escenario: otro modelo
+- GIVEN un store con contrato de otro modelo
+- WHEN arranca con el embedder mean
+- THEN no hay snapshot, el contrato no cambia y la verificación da `Mismatch`
+
+#### Escenario: un store que ya coincide
+- GIVEN un store con contrato `multilingual-e5-small/mean`
+- WHEN arranca con el embedder mean
+- THEN no hay snapshot ni re-embebido
+
+**Tests:** `only_the_cls_vectors_of_the_same_model_are_a_pooling_upgrade`, `cls_vectors_are_snapshotted_then_reembedded_by_mean`, `any_other_mismatch_is_left_as_it_is` y `a_store_that_matches_is_not_touched` en `crates/clawg-core/src/memory/bootstrap.rs`; el nombre `pre-reembed` en `snapshot_names_sort_in_time_order` (`backup.rs`). La regla de que el contrato se escribe al final está en los tests de `reembed_all` de `maintenance.rs`.
 
 ## Snapshots
 

@@ -121,7 +121,7 @@ Quitar el solapamiento es `join_pieces` (`pieces.rs:58`), una función pura: ent
 
 El puente MUST exponer `read_memory(id, kind?)` (`crates/clawg-cli/src/mcp/server.rs:863`, `read_memory_impl`, `server.rs:651`), con `kind = memory` por defecto y el agente que llama. La respuesta (`format_save`, `crates/clawg-cli/src/mcp/tools.rs:123`) MUST abrir con una línea que dice qué pedazo es y de cuántos, los ids del save y los que faltan, y seguir con `text`. Sobre una fila ajena MUST fallar como si no existiera.
 
-`save_memory` MUST nombrar `read_memory` en su descripción (`server.rs:787`) y en la respuesta de un save largo (`saved as N pieces: …; read_memory with any of them returns the whole text`). `search_memory` MUST explicar `piece=K/N` en su descripción (`server.rs:805`). `tools/list` MUST listar diez herramientas.
+`save_memory` MUST nombrar `read_memory` en su descripción (`server.rs:787`) y en la respuesta de un save largo (`saved as N pieces: …; read_memory with any of them returns the whole text`). `search_memory` MUST explicar `piece=K/N` en su descripción (`server.rs:805`). `tools/list` MUST listar `read_memory` entre sus herramientas; el conteo vigente, once, y la lista completa están en [`specs/mcp`](../mcp/spec.md).
 
 Contra un daemon que no tiene la ruta, su 404 no trae el error JSON del daemon: `read_failure_text` (`server.rs:669`) MUST decir que hay que reiniciar el daemon, no que la fila no existe.
 
@@ -135,7 +135,7 @@ Contra un daemon que no tiene la ruta, su 404 no trae el error JSON del daemon: 
 - WHEN B llama `read_memory` con uno de sus ids
 - THEN la respuesta es un error, igual que con un id que no existe
 
-**Test:** `join_pieces_drops_the_overlap_once`, `join_pieces_keeps_both_sides_when_nothing_overlaps`, `the_pieces_of_a_split_save_join_back_into_its_text` y `read_save_lists_missing_pieces_and_skips_other_agents` (`pieces.rs`); `get_save_returns_the_whole_text` y `get_save_of_another_agent_is_404` (`crates/clawg-cli/tests/api.rs`); `read_memory_returns_the_whole_save`, `an_agent_cannot_read_another_agents_save`, `a_daemon_without_the_save_route_is_named_as_such`, `save_memory_asks_for_one_fact_per_call`, `search_memory_explains_the_piece_of_a_long_save` y `save_outcome_text_covers_every_daemon_answer` (`server.rs`); `format_save_names_the_piece_and_the_missing_ones` (`tools.rs`); el conteo de diez herramientas en `server.rs` y `handshake.rs`.
+**Test:** `join_pieces_drops_the_overlap_once`, `join_pieces_keeps_both_sides_when_nothing_overlaps`, `the_pieces_of_a_split_save_join_back_into_its_text` y `read_save_lists_missing_pieces_and_skips_other_agents` (`pieces.rs`); `get_save_returns_the_whole_text` y `get_save_of_another_agent_is_404` (`crates/clawg-cli/tests/api.rs`); `read_memory_returns_the_whole_save`, `an_agent_cannot_read_another_agents_save`, `a_daemon_without_the_save_route_is_named_as_such`, `save_memory_asks_for_one_fact_per_call`, `search_memory_explains_the_piece_of_a_long_save` y `save_outcome_text_covers_every_daemon_answer` (`server.rs`); `format_save_names_the_piece_and_the_missing_ones` (`tools.rs`); el conteo de herramientas en `server.rs` y `handshake.rs`.
 
 ## R7. El re-embed reconstruye el contexto
 

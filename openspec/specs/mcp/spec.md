@@ -1,10 +1,11 @@
 # mcp — Especificación
 
-Fuente de verdad del comportamiento actual del puente `clawg mcp`: cómo abre una sesión por stdio, en el ciclo legacy (`initialize`) y en el 2026-07-28 (`_meta` en cada request), y de qué nombre saca el `agent_id` de cada request. Qué filas modifica y lista cada agente está en [`specs/visibility`](../visibility/spec.md), y qué filas de otros agentes lee en [`specs/sharing`](../sharing/spec.md); este dominio sólo decide qué nombre entra como `client` en `resolve_agent` y cómo las herramientas muestran lo compartido (último apartado).
+Fuente de verdad del comportamiento actual del puente `clawg mcp`: cómo abre una sesión por stdio, en el ciclo legacy (`initialize`) y en el 2026-07-28 (`_meta` en cada request), y de qué nombre saca el `agent_id` de cada request. Qué filas modifica y lista cada agente está en [`specs/visibility`](../visibility/spec.md), y qué filas de otros agentes lee en [`specs/sharing`](../sharing/spec.md); este dominio sólo decide qué nombre entra como `client` en `resolve_agent` y cómo las herramientas muestran lo compartido (último apartado). La herramienta `search_project`, que busca en la documentación y el código del proyecto, está en [`specs/project-docs`](../project-docs/spec.md); acá sólo se la cuenta entre las herramientas que lista el puente.
 
 **Origen:**
 - [mcp-protocol-upgrade](../../changes/archive/2026-10-13-mcp-protocol-upgrade/proposal.md), archivado el 2026-10-13.
 - [agent-sharing](../../changes/archive/2026-10-14-agent-sharing/proposal.md), archivado el 2026-10-14 (sólo "Lo compartido en las herramientas").
+- [project-indexing](../../changes/archive/2026-10-15-project-indexing/proposal.md), archivado el 2026-10-15 (sólo el conteo y la lista de herramientas).
 
 ## Definiciones
 
@@ -42,7 +43,7 @@ Test: `a_discover_probe_is_answered_with_what_the_server_offers` (`handshake.rs`
 #### Escenario: la apertura de Claude Code 2.1.285
 - GIVEN un puente recién abierto
 - WHEN el host manda la sonda sin `_meta`, la cancela con `notifications/cancelled`, manda `initialize`, `notifications/initialized` y `tools/list`
-- THEN la sonda recibe un error con id `server-discover-probe-1`, `initialize` negocia `2025-06-18` y `tools/list` trae las diez herramientas
+- THEN la sonda recibe un error con id `server-discover-probe-1`, `initialize` negocia `2025-06-18` y `tools/list` trae las once herramientas
 
 #### Escenario: una request rechazada y su cancelación
 - GIVEN un puente recién abierto
@@ -55,15 +56,15 @@ Tests: `a_bare_probe_and_its_cancellation_leave_the_legacy_handshake_working`, `
 
 Una request con `_meta` 2026-07-28 completo MUST atenderse sin `initialize` previo. `tools/list` en esa sesión MUST:
 
-- listar las diez herramientas ordenadas por nombre, el mismo orden en cada llamada: `delete_memory`, `list_memories`, `memory_status`, `read_memory`, `recall_context`, `resolve_conflict`, `save_memory`, `search_memory`, `synthesize` y `update_memory` (la décima está en [`specs/update`](../update/spec.md), R5; `read_memory` en [`specs/pieces`](../pieces/spec.md), R6);
+- listar las once herramientas ordenadas por nombre, el mismo orden en cada llamada: `delete_memory`, `list_memories`, `memory_status`, `read_memory`, `recall_context`, `resolve_conflict`, `save_memory`, `search_memory`, `search_project`, `synthesize` y `update_memory` (`update_memory` está en [`specs/update`](../update/spec.md), R5; `read_memory`, en [`specs/pieces`](../pieces/spec.md), R6; `search_project`, en [`specs/project-docs`](../project-docs/spec.md)); el conteo y la lista los fija `every_tool_is_registered_under_its_wire_name` (`server.rs`);
 - traer `resultType`, `ttlMs` y `cacheScope`.
 
 #### Escenario: listar sin handshake
 - GIVEN un puente al que sólo le llegó `server/discover`
 - WHEN el host manda `tools/list` con `_meta`
-- THEN vuelven diez herramientas en orden alfabético, con `resultType: "complete"`, un `ttlMs` numérico y un `cacheScope`
+- THEN vuelven once herramientas en orden alfabético, con `resultType: "complete"`, un `ttlMs` numérico y un `cacheScope`
 
-Test: `a_session_without_initialize_lists_the_tools_in_name_order` (`handshake.rs`).
+Tests: `a_session_without_initialize_lists_the_tools_in_name_order` (`handshake.rs`) y `the_viewer_is_not_exposed_to_the_model` (`server.rs`, que compara la lista ordenada).
 
 ## R4. De dónde sale el `agent_id`
 

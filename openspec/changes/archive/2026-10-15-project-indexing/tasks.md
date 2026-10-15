@@ -88,18 +88,25 @@ Cada tarea es un commit atómico: primero el test que falla, después el código
 - [x] Literales fijados en sus tests; fixtures de contradicción a L2 ≈ 0,26 para que queden dentro de la banda nueva; sweep de `rag-eval` en 0,20–0,50.
 - Commit: `fix(core): move the similarity thresholds to the mean-pooled distribution`
 
+## 16. Recalibrar `RELEVANCE_RATIO` (R15)
+
+- [x] Barrido de agent-view de 0,6 a 0,2 (`verify.md`, «Windows»): 0,35.
+- [x] `relevance_ratio_pins_the_shipped_value` y fixtures de `relevance.rs` y `mcp/tools.rs` en la escala de mean.
+- [x] `RELEVANCE_RATIO` a 0,35; los comentarios de `cosine_floor` y `CONTRADICTION_THRESHOLD` dicen cómo se midieron.
+- Commit: `fix(cli): lower the relevance cut to the mean-pooled score distribution`
+
 ## Verify
 
 - [x] `cargo test --workspace` en Linux, contra la base: sin fallas nuevas, con el conteo justificado (`verify.md`).
-- [ ] `cargo test --workspace --target-dir <otro-dir>` en Windows (máquina de Marcos).
-- [ ] `rag-eval --real --docs` con los umbrales de la propuesta: Hit@3 ≥ 0,70 y MRR ≥ 0,50 (máquina de Marcos: necesita el modelo real).
-- [ ] `rag-eval --real --audit`, `--sweep-cos-floor` y el sweep de contradicciones sobre el golden set de memorias, para fijar los umbrales de R15 (máquina de Marcos).
-- [ ] `rag-eval --real --diff` y `--agent-view --diff` contra el baseline de memorias, con los umbrales recalibrados: ninguna métrica baja (máquina de Marcos).
-- [ ] Arrancar el daemon dev sobre una copia de un store CLS: snapshot `pre-reembed`, `loading` mientras re-embebe, y `ready` con el contrato mean (máquina de Marcos).
-- [ ] Prueba manual con el perfil dev en Claude Code: abrir una sesión en este repo, preguntar algo de los docs, ver que el agente usa `search_project` y que editar un doc cambia el resultado (máquina de Marcos).
+- [x] `cargo test --workspace --target-dir <otro-dir>` en Windows: 1.864 pasan, 0 fallan.
+- [x] `rag-eval --real --docs` con los umbrales de la propuesta: Hit@3 ≥ 0,70 y MRR ≥ 0,50. **No se cumple** (0,27 y 0,29); aceptado al archivar.
+- [x] `rag-eval --real --audit`, `--sweep-cos-floor` y el sweep de contradicciones sobre el golden set de memorias: 0,79 y 0,42 quedan; `RELEVANCE_RATIO` pasa a 0,35 (tarea 16).
+- [x] `rag-eval --real --diff` y `--agent-view --diff` contra el baseline de memorias, con los umbrales recalibrados: ninguna métrica baja. **No se cumple**: el ancla baja por el pooling (R@5 0,7826 → 0,6522, en inglés) y `search_memory` queda en 36/46 contra 41/46; aceptado al archivar.
+- [x] Re-embebido de un store CLS al arrancar: los snapshots `pre-reembed` de dev y de prod, y `ready` (evidencia de la prueba de agent-sharing y de la instalación de 0.3.0).
+- [x] `search_project` desde Claude Code (perfil prod, 0.3.0) y un doc editado que cambia el resultado.
 
 ## Archive
 
-- [ ] `specs/project-docs/spec.md` con R1–R9 y R11; R10 en `specs/retrieval/spec.md`; R12 en `specs/eval/spec.md`.
-- [ ] Carpeta movida a `changes/archive/AAAA-MM-DD-project-indexing/` y `archive: done` en `state.yaml`.
-- [ ] Fila 12 de `openspec/README.md` con el enlace archivado.
+- [x] `specs/project-docs/spec.md` con R2–R9, R11 y R13; R1 en `specs/ingest`; R10, `cosine_floor` y `RELEVANCE_RATIO` en `specs/retrieval`; R12 y el barrido de contradicciones en `specs/eval`; R14 en `specs/storage`; `CONTRADICTION_THRESHOLD` y `NEAR_DUPLICATE_FLOOR` en `specs/disputes`; `search_project` en `specs/mcp`.
+- [x] Carpeta movida a `changes/archive/2026-10-15-project-indexing/` y `archive: done` en `state.yaml`.
+- [x] Fila 12 de `openspec/README.md` con el enlace archivado.

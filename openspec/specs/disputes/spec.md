@@ -1,8 +1,10 @@
 # disputes — Especificación
 
-Fuente de verdad del comportamiento actual de las disputas entre memorias: cómo sale una fila de `disputed`, qué pasa con las disputas cuando una de sus filas se borra o se reemplaza, la herramienta que usa el agente, el estado que ve el workspace y la exclusión de pedazos hermanos en el detector. El umbral, la banda y el filtro de tipo del detector no están acá: no cambiaron y se miden con los pares de contradicción del golden set ([`specs/eval`](../eval/spec.md)). Qué agente puede resolver qué par está en [`specs/visibility`](../visibility/spec.md) (su R3 y R4).
+Fuente de verdad del comportamiento actual de las disputas entre memorias: cómo sale una fila de `disputed`, qué pasa con las disputas cuando una de sus filas se borra o se reemplaza, la herramienta que usa el agente, el estado que ve el workspace y la exclusión de pedazos hermanos en el detector. El umbral y la banda del detector están en «Umbral y banda del detector» y se miden con los pares de contradicción del golden set ([`specs/eval`](../eval/spec.md)); el filtro de tipo no está acá. Qué agente puede resolver qué par está en [`specs/visibility`](../visibility/spec.md) (su R3 y R4).
 
-**Origen:** [dispute-resolution](../../changes/archive/2026-10-13-dispute-resolution/proposal.md), archivado el 2026-10-13.
+**Origen:**
+- [dispute-resolution](../../changes/archive/2026-10-13-dispute-resolution/proposal.md), archivado el 2026-10-13.
+- [project-indexing](../../changes/archive/2026-10-15-project-indexing/proposal.md), archivado el 2026-10-15 (sólo "Umbral y banda del detector").
 
 ## Definiciones
 
@@ -161,6 +163,23 @@ Desde [long-save-context](../../changes/archive/2026-10-14-long-save-context/pro
 - THEN el segundo pedazo queda `disputed` contra la fila vieja, y no contra su hermano
 
 **Test:** `sibling_chunks_of_one_save_do_not_dispute_each_other` y `a_chunk_still_disputes_an_older_row` en `crates/clawg-core/src/memory/worker.rs`.
+
+## Umbral y banda del detector
+
+El detector (`detect_contradiction`, `crates/clawg-core/src/memory/contradiction.rs:135`) MUST devolver como candidata a disputa una fila de `memory`, del mismo agente y de un tipo que afirma algo, cuya distancia L2 al vector nuevo (ambos unitarios) cae en la banda `[NEAR_DUPLICATE_FLOOR, CONTRADICTION_THRESHOLD)` (`contradiction.rs:162-163`):
+
+| Constante | Valor | Qué separa |
+|---|---|---|
+| `CONTRADICTION_THRESHOLD` (`contradiction.rs:56`) | 0,42 | Por debajo, dos textos dicen casi lo mismo y pueden contradecirse; por encima, son compatibles |
+| `NEAR_DUPLICATE_FLOOR` (`contradiction.rs:64`) | 0,10 | Por debajo, son la misma afirmación (mayúsculas, espacios interiores, una edición mínima) que el hash de contenido no atrapó: no se disputa |
+
+Los dos valores son de L2 sobre vectores del pooling mean del modelo ([`specs/storage`](../storage/spec.md)); cambiar el pooling los mueve. Una cota en compilación exige `NEAR_DUPLICATE_FLOOR < CONTRADICTION_THRESHOLD`.
+
+**Cómo se midieron.** Con el golden set de memorias (`docs/eval/golden.json`, 46 casos, 28 pares de contradicción), con pooling mean, el 2026-10-15: la curva del barrido de [`specs/eval`](../eval/spec.md) da 0 falsos positivos sobre los pares no contradictorios hasta L2 0,50, recall 0,8 en 0,40 y 0,9 en 0,45. Los pares escritos a mano como proxy (diez que se contradicen y diez compatibles) ponen el primer par compatible en 0,469, así que 0,42 queda con margen por debajo de él. `NEAR_DUPLICATE_FLOOR` sale del mismo proxy: el par de una oración y ella misma con un doble espacio queda a L2 0,097, y el piso lo deja justo por encima.
+
+El detector sigue viendo sólo las filas del que guarda (`Reach::Own`, `contradiction.rs:131`, [`specs/sharing`](../sharing/spec.md)) y no consulta el canal léxico (`lexical: None`).
+
+**Tests:** `contradiction_threshold_pins_the_shipped_value` y `near_duplicate_floor_pins_the_shipped_value` (fijan los literales), `hit_below_near_duplicate_floor_is_excluded`, `detect_contradiction_near_vector_returns_stored_id`, `detect_contradiction_far_vectors_returns_empty` y `user_preference_contradiction_detected_at_in_band_distance` en `crates/clawg-core/src/memory/contradiction.rs`.
 
 ## Datos de la versión anterior
 
