@@ -20,8 +20,10 @@ use std::time::Duration;
 use once_cell::sync::OnceCell;
 use tokio::sync::watch;
 
-use crate::memory::db::{ContractStatus, EmbeddingIdentity};
-use crate::memory::embedder::{Embedder, FastEmbedLocal};
+use crate::memory::backup::{self, Reason};
+use crate::memory::db::{ContractStatus, EmbeddingIdentity, StoredContract};
+use crate::memory::embedder::{Embedder, FastEmbedLocal, E5_MODEL_ID, LEGACY_CLS_MODEL_ID};
+use crate::memory::maintenance::{reembed_all, ReInferPlan, ReembedMode};
 use crate::memory::model_download::{ensure_model, DownloadProgress};
 use crate::memory::MemoryStore;
 use crate::models::chat::StreamEvent;
@@ -207,12 +209,10 @@ pub type LoadEmbedderFn = Arc<
 
 /// Type alias for the injectable embedding-contract verification seam.
 ///
-/// Owned `EmbeddingIdentity` rather than `&dyn Embedder`: a borrow cannot
-/// live inside a `'static` future, and the owned struct also makes "compare
-/// model_id + dim + query_prefix + passage_prefix" structural in the
-/// signature itself instead of a convention callers have to remember.
+/// It takes the loaded embedder itself, not only its identity: on a pooling
+/// upgrade the check re-embeds the store with it (see [`verify_or_reembed`]).
 pub type ContractVerifyFn = Arc<
-    dyn Fn(EmbeddingIdentity) -> futures::future::BoxFuture<'static, Result<ContractStatus, String>>
+    dyn Fn(Arc<dyn Embedder>) -> futures::future::BoxFuture<'static, Result<ContractStatus, String>>
         + Send
         + Sync,
 >;
@@ -226,8 +226,11 @@ pub type ContractVerifyFn = Arc<
 /// the verifier closes over. Keeping the closures here rather than at each
 /// call site means no two hosts can drift into verifying the
 /// contract against different stores or loading the model two different ways.
+///
+/// `backups` is where the snapshot taken before a pooling upgrade goes.
 pub fn production_deps(
     store: Arc<MemoryStore>,
+    backups: std::path::PathBuf,
 ) -> (EnsureModelFn, LoadEmbedderFn, ContractVerifyFn) {
     let ensure: EnsureModelFn = Arc::new(|base_dir, progress| {
         Box::pin(async move { ensure_model(&base_dir, progress).await })
@@ -239,16 +242,68 @@ pub fn production_deps(
     });
     // The store is the only host-supplied ingredient — `run_embedder_bootstrap`
     // itself stays store-agnostic and testable without a `MemoryStore` at all.
-    let verify: ContractVerifyFn = Arc::new(move |identity| {
-        let store = store.clone();
-        Box::pin(async move {
-            store
-                .ensure_embedding_contract(identity)
-                .await
-                .map_err(|e| e.to_string())
-        })
+    let verify: ContractVerifyFn = Arc::new(move |embedder| {
+        let (store, backups) = (store.clone(), backups.clone());
+        Box::pin(async move { verify_or_reembed(&store, embedder, backups).await })
     });
     (ensure, load, verify)
+}
+
+/// Whether `stored` describes the vectors this same model made before it
+/// pooled by mean: only the pooling differs, so every vector can be remade
+/// from its text and nothing else about the store has to change.
+pub fn is_pooling_upgrade(stored: &StoredContract, actual: &EmbeddingIdentity) -> bool {
+    stored.model_id == LEGACY_CLS_MODEL_ID
+        && actual.model_id == E5_MODEL_ID
+        && stored.dim == actual.dim as i64
+        && stored.query_prefix == actual.query_prefix
+        && stored.passage_prefix == actual.passage_prefix
+}
+
+/// Checks `embedder` against the store's embedding contract. A pooling
+/// upgrade (see [`is_pooling_upgrade`]) is the one mismatch repaired here:
+/// the store is snapshotted into `backups` and every vector re-embedded, and
+/// the contract only changes once all of them were redone, so a pass that
+/// fails part-way still reports the mismatch and the next start tries again.
+/// Every other mismatch is returned as it is.
+pub async fn verify_or_reembed(
+    store: &MemoryStore,
+    embedder: Arc<dyn Embedder>,
+    backups: std::path::PathBuf,
+) -> Result<ContractStatus, String> {
+    let status = store
+        .ensure_embedding_contract(EmbeddingIdentity::of(embedder.as_ref()))
+        .await
+        .map_err(|e| e.to_string())?;
+    let (stored, actual) = match status {
+        ContractStatus::Mismatch { stored, actual } if is_pooling_upgrade(&stored, &actual) => {
+            (stored, actual)
+        }
+        other => return Ok(other),
+    };
+    log::info!(
+        "the stored vectors were pooled by CLS; re-embedding them by mean, after a snapshot"
+    );
+    let snapshot = store
+        .conn
+        .call(move |c| -> rusqlite::Result<_> {
+            Ok(backup::snapshot_into(c, &backups, Reason::PreReembed))
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("no snapshot before re-embedding: {e}"))?;
+    log::info!("snapshot before re-embedding: {}", snapshot.display());
+    let report = reembed_all(store, ReembedMode::ReInfer(ReInferPlan::new(embedder))).await;
+    if report.contract_updated {
+        log::info!("re-embedded the stored vectors: {:?}", report.per_table);
+        Ok(ContractStatus::Match)
+    } else {
+        log::warn!(
+            "re-embedding did not finish ({:?}); the store keeps its previous contract",
+            report.per_table
+        );
+        Ok(ContractStatus::Mismatch { stored, actual })
+    }
 }
 
 /// One bootstrap attempt, parametric in the event sink + dependency closures.
@@ -320,8 +375,7 @@ pub async fn run_embedder_bootstrap(
                 // contract's outcome; a wasted download on a genuine
                 // mismatch is an accepted, named cost of this ordering.
                 Ok(Ok(arc)) => {
-                    let identity = EmbeddingIdentity::of(arc.as_ref());
-                    match verify(identity).await {
+                    match verify(arc.clone()).await {
                         Ok(ContractStatus::Match) | Ok(ContractStatus::Initialized) => {
                             // `.set` returns Err only if the cell is already filled —
                             // survivable race; treat both outcomes as success.
@@ -619,7 +673,7 @@ mod tests {
     /// so each one that reaches the seam gets a one-line "accept whatever
     /// arrives" verifier instead of repeating the closure inline.
     fn accept_contract() -> ContractVerifyFn {
-        Arc::new(|_identity| Box::pin(async { Ok(ContractStatus::Match) }))
+        Arc::new(|_embedder| Box::pin(async { Ok(ContractStatus::Match) }))
     }
 
     #[tokio::test]
@@ -893,7 +947,7 @@ mod tests {
             Arc::new(move |_base, _progress| Box::pin(async move { Ok(empty_model_files()) }));
         let load: LoadEmbedderFn =
             Arc::new(move |_files| Ok(Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>));
-        let verify: ContractVerifyFn = Arc::new(|_identity| {
+        let verify: ContractVerifyFn = Arc::new(|_embedder| {
             Box::pin(async move {
                 Ok(ContractStatus::Mismatch {
                     stored: crate::memory::db::StoredContract {
@@ -970,7 +1024,7 @@ mod tests {
             Arc::new(move |_base, _progress| Box::pin(async move { Ok(empty_model_files()) }));
         let load: LoadEmbedderFn =
             Arc::new(move |_files| Ok(Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>));
-        let verify: ContractVerifyFn = Arc::new(|_identity| {
+        let verify: ContractVerifyFn = Arc::new(|_embedder| {
             Box::pin(async move {
                 Ok(ContractStatus::Mismatch {
                     stored: crate::memory::db::StoredContract {
@@ -1083,7 +1137,7 @@ mod tests {
     #[tokio::test]
     async fn production_deps_builds_all_three_closures_from_a_store() {
         let store = Arc::new(MemoryStore::new_for_test().await.expect("test store"));
-        let (_ensure, load, verify) = production_deps(store);
+        let (_ensure, load, verify) = production_deps(store, std::env::temp_dir());
 
         // `load` is pure: hand it empty model bytes and it must report a
         // load failure rather than panicking or hanging.
@@ -1094,12 +1148,7 @@ mod tests {
 
         // `verify` must reach the real store: a fresh store has no contract
         // row, so the first identity initializes it.
-        let status = verify(EmbeddingIdentity {
-            model_id: "fake-embedder".into(),
-            dim: 384,
-            query_prefix: "query: ".into(),
-            passage_prefix: "passage: ".into(),
-        })
+        let status = verify(Arc::new(FakeEmbedder::default()))
         .await
         .expect("contract check must reach the store");
         assert!(matches!(status, ContractStatus::Initialized));
@@ -1108,7 +1157,7 @@ mod tests {
     // ---------- embedder status ----------
 
     fn mismatch_verify() -> ContractVerifyFn {
-        Arc::new(|_identity| {
+        Arc::new(|_embedder| {
             Box::pin(async move {
                 Ok(ContractStatus::Mismatch {
                     stored: crate::memory::db::StoredContract {
@@ -1327,5 +1376,168 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(waits.lock().unwrap().is_empty());
         assert!(matches!(&*status.borrow(), EmbedderStatus::Failed { retryable: false, .. }));
+    }
+
+    // ---------- pooling upgrade ----------
+
+    fn contract(model_id: &str, dim: i64, prefix: &str) -> crate::memory::db::StoredContract {
+        crate::memory::db::StoredContract {
+            model_id: model_id.into(),
+            dim,
+            query_prefix: prefix.into(),
+            passage_prefix: prefix.into(),
+        }
+    }
+
+    fn identity(model_id: &str, dim: usize, prefix: &str) -> EmbeddingIdentity {
+        EmbeddingIdentity {
+            model_id: model_id.into(),
+            dim,
+            query_prefix: prefix.into(),
+            passage_prefix: prefix.into(),
+        }
+    }
+
+    #[test]
+    fn only_the_cls_vectors_of_the_same_model_are_a_pooling_upgrade() {
+        let mean = identity(E5_MODEL_ID, 384, "query: ");
+
+        assert!(is_pooling_upgrade(&contract(LEGACY_CLS_MODEL_ID, 384, "query: "), &mean));
+        assert!(!is_pooling_upgrade(&contract(LEGACY_CLS_MODEL_ID, 768, "query: "), &mean));
+        assert!(!is_pooling_upgrade(&contract(LEGACY_CLS_MODEL_ID, 384, "passage: "), &mean));
+        assert!(!is_pooling_upgrade(&contract("another-model", 384, "query: "), &mean));
+        assert!(!is_pooling_upgrade(
+            &contract(LEGACY_CLS_MODEL_ID, 384, "query: "),
+            &identity("another-model", 384, "query: ")
+        ));
+    }
+
+    /// [`FakeEmbedder`]'s vectors under the mean-pooled model's name.
+    struct MeanPooled(FakeEmbedder);
+
+    #[async_trait::async_trait]
+    impl Embedder for MeanPooled {
+        async fn embed_with_role(
+            &self,
+            text: &str,
+            role: crate::memory::embedder::EmbedRole,
+        ) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+            self.0.embed_with_role(text, role).await
+        }
+        fn dimensions(&self) -> usize {
+            self.0.dimensions()
+        }
+        fn model_id(&self) -> &str {
+            E5_MODEL_ID
+        }
+        fn query_prefix(&self) -> &str {
+            ""
+        }
+        fn passage_prefix(&self) -> &str {
+            ""
+        }
+    }
+
+    async fn store_with_contract(model_id: &'static str, dim: i64) -> MemoryStore {
+        let store = MemoryStore::new_for_test().await.expect("test store");
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<()> {
+                c.execute(
+                    "INSERT INTO embedding_contract \
+                     (id, model_id, dim, metric, normalized, query_prefix, passage_prefix, created_at) \
+                     VALUES (1, ?1, ?2, 'l2_unit', 1, '', '', 0)",
+                    rusqlite::params![model_id, dim],
+                )?;
+                c.execute(
+                    "INSERT INTO memory \
+                     (scope, agent_id, content, memory_type, tier, importance, \
+                      created_at, last_modified_at, last_accessed_at, \
+                      created_by_type, created_by_ref) \
+                     VALUES ('agent', 'a', 'the build uses the pinned toolchain', 'chat_message', \
+                             3, 5.0, 0, 0, 0, 'agent', '')",
+                    [],
+                )?;
+                let vector: Vec<u8> = [1.0f32; 384].iter().flat_map(|f| f.to_le_bytes()).collect();
+                c.execute(
+                    "INSERT INTO memory_vectors(rowid, embedding) VALUES (?1, ?2)",
+                    rusqlite::params![c.last_insert_rowid(), vector],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("seed the store");
+        store
+    }
+
+    async fn stored_model_id(store: &MemoryStore) -> String {
+        store
+            .conn
+            .call(|c| c.query_row("SELECT model_id FROM embedding_contract", [], |r| r.get(0)))
+            .await
+            .expect("contract row")
+    }
+
+    fn files_in(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries.map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn cls_vectors_are_snapshotted_then_reembedded_by_mean() {
+        let store = store_with_contract(LEGACY_CLS_MODEL_ID, 384).await;
+        let backups = tempfile::tempdir().unwrap();
+
+        let status = verify_or_reembed(
+            &store,
+            Arc::new(MeanPooled(FakeEmbedder::default())),
+            backups.path().to_path_buf(),
+        )
+        .await
+        .expect("verify");
+
+        assert!(matches!(status, ContractStatus::Match), "{status:?}");
+        assert_eq!(stored_model_id(&store).await, E5_MODEL_ID);
+        let snapshots = files_in(backups.path());
+        assert_eq!(snapshots.len(), 1, "{snapshots:?}");
+        assert!(snapshots[0].ends_with("-pre-reembed.db"), "{snapshots:?}");
+    }
+
+    #[tokio::test]
+    async fn any_other_mismatch_is_left_as_it_is() {
+        let store = store_with_contract("another-model", 384).await;
+        let backups = tempfile::tempdir().unwrap();
+
+        let status = verify_or_reembed(
+            &store,
+            Arc::new(MeanPooled(FakeEmbedder::default())),
+            backups.path().to_path_buf(),
+        )
+        .await
+        .expect("verify");
+
+        assert!(matches!(status, ContractStatus::Mismatch { .. }), "{status:?}");
+        assert_eq!(stored_model_id(&store).await, "another-model");
+        assert!(files_in(backups.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_store_that_matches_is_not_touched() {
+        let store = store_with_contract(E5_MODEL_ID, 384).await;
+        let backups = tempfile::tempdir().unwrap();
+
+        let status = verify_or_reembed(
+            &store,
+            Arc::new(MeanPooled(FakeEmbedder::default())),
+            backups.path().to_path_buf(),
+        )
+        .await
+        .expect("verify");
+
+        assert!(matches!(status, ContractStatus::Match), "{status:?}");
+        assert!(files_in(backups.path()).is_empty());
     }
 }

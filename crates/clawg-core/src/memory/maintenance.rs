@@ -437,13 +437,12 @@ pub struct ReembedReport {
     pub(crate) contract_updated: bool,
 }
 
-/// Operator-invoked backfill for the three vector tables — never wired to
-/// run automatically. Auto-running full-corpus ONNX inference at startup
-/// because a config changed would turn the embedding contract's loud, safe
-/// stop (an empty cell, an `error` event, chat still working) into a
-/// silent, unbounded, CPU-heavy migration nobody asked for; this function
-/// exists so an operator CAN run that migration on purpose, not so the app
-/// runs it for them.
+/// Backfill for the three vector tables. The only automatic caller is the
+/// pooling upgrade in [`crate::memory::bootstrap::verify_or_reembed`], a
+/// mismatch this binary itself introduced and can name exactly; any other
+/// mismatch stays the embedding contract's loud, safe stop (an empty cell,
+/// an `error` event), because re-inferring the whole store whenever a config
+/// changed would be a CPU-heavy migration nobody asked for.
 ///
 /// Never returns `Err` — fail-soft like [`sweep_orphaned_vectors`]. Each
 /// table is walked independently; a failure in one (a batch's `UPDATE`

@@ -27,11 +27,11 @@ use tokio::time::Instant;
 use crate::memory::access::AccessTracker;
 use crate::memory::backup::{self, Reason};
 use crate::memory::bootstrap::EmbedderStatus;
-use crate::memory::chunker::CodeChunker;
 use crate::memory::embedder::Embedder;
 use crate::memory::events::MemoryEvent;
 use crate::memory::store_lock::StoreHolder;
 use crate::memory::maintenance::{run_maintenance_loop, MAINTENANCE_PERIOD, STARTUP_DELAY};
+use crate::memory::project_docs::DocIndex;
 use crate::memory::spill;
 use crate::memory::worker::{memory_worker, resolve_tokenizer_and_chunker, IngestRequest};
 use crate::memory::workspace::WorkspaceManager;
@@ -103,6 +103,9 @@ pub struct MemoryRuntime {
     /// worker is already spawned by the time this struct exists — see
     /// [`MemoryRuntime::open`]'s note about needing a tokio context.
     pub access_tracker: Arc<AccessTracker>,
+    /// Which projects' documentation indexes are being refreshed, and when
+    /// each last was, so the daemon never refreshes one project twice at once.
+    pub project_docs: Arc<DocIndex>,
 }
 
 impl MemoryRuntime {
@@ -140,6 +143,7 @@ impl MemoryRuntime {
                 embedder_status: watch::Sender::new(EmbedderStatus::Loading),
                 tokenizer: Arc::new(OnceCell::new()),
                 access_tracker,
+                project_docs: Arc::default(),
             },
             memory_rx,
         ))
@@ -312,6 +316,7 @@ impl MemoryRuntime {
                 embedder_status: watch::Sender::new(EmbedderStatus::Ready),
                 tokenizer: Arc::new(OnceCell::new()),
                 access_tracker,
+                project_docs: Arc::default(),
             },
             memory_rx,
         )
@@ -342,7 +347,7 @@ async fn checkpoint(store: &MemoryStore) {
 
 /// Body of [`MemoryRuntime::ingest_worker`].
 ///
-/// Builds the two chunkers once — resolving the tokenizer as a side effect,
+/// Builds the chat chunker once — resolving the tokenizer as a side effect,
 /// which is what fills `tokenizer_cell` for the query path — then hands
 /// ownership to the worker loop.
 fn ingest_worker_future(
@@ -355,9 +360,8 @@ fn ingest_worker_future(
 ) -> impl Future<Output = Vec<MemoryEvent>> + Send + 'static {
     async move {
         let chat_chunker = resolve_tokenizer_and_chunker(&base_dir, &tokenizer);
-        let code_chunker = Arc::new(CodeChunker::new());
         let replay = spill::load(&base_dir).await;
-        memory_worker(rx, drain, replay, store, embedder, chat_chunker, code_chunker).await
+        memory_worker(rx, drain, replay, store, embedder, chat_chunker).await
     }
 }
 
@@ -570,6 +574,7 @@ mod tests {
             embedder_status: _,
             tokenizer,
             access_tracker: _,
+            project_docs: _,
         } = rt;
 
         let worker = tokio::spawn(ingest_worker_future(

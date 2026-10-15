@@ -25,8 +25,8 @@ use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 
 use crate::memory::access::AccessTracker;
-use crate::memory::chunker::CodeChunker;
 use crate::memory::db::MemoryStore;
+use crate::memory::chunker::token_splitter::TokenSplitter;
 use crate::memory::embedder::{Embedder, FakeEmbedder, FastEmbedLocal};
 
 /// Re-exported so the `rag-eval` and `golden-mine` binaries can name a role
@@ -34,6 +34,7 @@ use crate::memory::embedder::{Embedder, FakeEmbedder, FastEmbedLocal};
 pub use crate::memory::embedder::EmbedRole;
 use crate::memory::events::{MemoryEvent, MemorySource};
 use crate::memory::model_download;
+use crate::memory::project_docs;
 use crate::memory::score::{ImportanceFactor, ScoringConfig};
 use crate::memory::search::{search_all_memories_with_scoring, SearchScope};
 use crate::memory::store_insert::{CreatedByType, MemoryType, NewMemoryRecord};
@@ -483,7 +484,6 @@ impl EvalIngest {
             runtime.store.clone(),
             runtime.embedder.clone(),
             chat_chunker,
-            Arc::new(CodeChunker::new()),
         ));
 
         Ok(Self { tx, worker, runtime })
@@ -653,6 +653,72 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
         return 0.0;
     }
     dot / (norm_a.sqrt() * norm_b.sqrt())
+}
+
+/// A project's documentation index over a store of its own, with no daemon
+/// and no registered project: it measures the index, not the plumbing.
+pub struct EvalDocIndex {
+    store: MemoryStore,
+    embedder: Arc<dyn Embedder>,
+    splitter: TokenSplitter,
+}
+
+/// What indexing a root found and wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct EvalDocReport {
+    pub docs: usize,
+    pub passages: usize,
+    pub skipped: usize,
+}
+
+/// One passage a doc search returned, ranked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalDocHit {
+    pub path: String,
+    pub breadcrumb: String,
+}
+
+const EVAL_DOCS_PROJECT: &str = "rag-eval-docs";
+
+impl EvalDocIndex {
+    /// Opens a store rooted at `base_dir`. `tokenizer_dir` plays the same
+    /// part as in [`EvalIngest::open`]: passages are capped by the real
+    /// tokenizer when it holds one, by bytes otherwise.
+    pub async fn open(base_dir: &Path, embedder: &EvalEmbedder, tokenizer_dir: &Path) -> Result<Self, EvalError> {
+        let store = MemoryStore::open(base_dir, StoreHolder::Eval)
+            .await
+            .map_err(|e| EvalError::Open(e.to_string()))?;
+        let splitter = match model_download::load_tokenizer(tokenizer_dir) {
+            Some(tok) => TokenSplitter::with_tokenizer(tok),
+            None => TokenSplitter::fallback(),
+        };
+        Ok(Self { store, embedder: embedder.0.clone(), splitter })
+    }
+
+    pub async fn index(&self, root: &Path) -> Result<EvalDocReport, EvalError> {
+        let r = project_docs::refresh(&self.store, self.embedder.as_ref(), &self.splitter, EVAL_DOCS_PROJECT, root)
+            .await
+            .map_err(|e| EvalError::Insert(e.to_string()))?;
+        Ok(EvalDocReport { docs: r.docs, passages: r.passages, skipped: r.skipped })
+    }
+
+    pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<EvalDocHit>, EvalError> {
+        let hits = project_docs::search(&self.store, self.embedder.as_ref(), EVAL_DOCS_PROJECT, query, limit)
+            .await
+            .map_err(|e| EvalError::Search(e.to_string()))?;
+        Ok(hits.into_iter().map(|h| EvalDocHit { path: h.path, breadcrumb: h.breadcrumb }).collect())
+    }
+}
+
+/// Whether the index takes the file at `path` as source code.
+pub fn is_code_path(path: &str) -> bool {
+    matches!(project_docs::corpus::classify(path), Some(project_docs::corpus::DocKind::Code(_)))
+}
+
+/// The relative paths of the docs `root` holds, as the index would take them.
+pub fn doc_paths(root: &Path) -> Result<Vec<String>, EvalError> {
+    let walk = project_docs::corpus::walk(root).map_err(|e| EvalError::Open(e.to_string()))?;
+    Ok(walk.docs.into_iter().map(|d| d.path).collect())
 }
 
 /// Hex-lowercase SHA-256 of `bytes`. Shared by every binary that needs to
@@ -1108,5 +1174,21 @@ mod tests {
             "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
         );
     }
-}
 
+    #[tokio::test]
+    async fn a_doc_index_answers_from_the_root_it_indexed() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("README.md"), "# Guía\n## Instalación\nCompilá con cargo build.\n## Uso\nArrancá el daemon.\n").unwrap();
+        std::fs::write(root.path().join("notes.txt"), "not a doc").unwrap();
+
+        let index = EvalDocIndex::open(store_dir.path(), &EvalEmbedder::fake(), store_dir.path()).await.unwrap();
+        let report = index.index(root.path()).await.unwrap();
+        let hits = index.search("daemon", 5).await.unwrap();
+
+        assert_eq!(report, EvalDocReport { docs: 1, passages: 2, skipped: 0 });
+        assert_eq!(doc_paths(root.path()).unwrap(), ["README.md"]);
+        assert!(is_code_path("src/lib.rs") && !is_code_path("README.md"));
+        assert_eq!(hits[0], EvalDocHit { path: "README.md".into(), breadcrumb: "README.md > Guía > Uso".into() });
+    }
+}
