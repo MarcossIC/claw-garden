@@ -667,7 +667,7 @@ impl ClawgMcp {
         };
         match client.restore(&args.kind, args.id, Some(agent_id)).await {
             Ok(restored) => Self::ok(format_restore(&restored)),
-            Err(e) => Self::failed(Self::explain(&e)),
+            Err(e) => Self::failed(Self::route_failure_text(&e, "restore a memory")),
         }
     }
 
@@ -683,19 +683,20 @@ impl ClawgMcp {
         };
         match client.read_save(args.kind.as_deref().unwrap_or("memory"), args.id, Some(agent_id)).await {
             Ok(save) => Self::ok(format_save(&save)),
-            Err(e) => Self::failed(Self::read_failure_text(&e)),
+            Err(e) => Self::failed(Self::route_failure_text(&e, "read a save")),
         }
     }
 
-    /// A daemon older than the save route answers its own bare 404, with no
-    /// error text of the daemon's; telling the model the row is missing would
-    /// be false.
-    fn read_failure_text(err: &ClientError) -> String {
+    /// A daemon older than the route answers its own bare 404, with no error
+    /// text of the daemon's; telling the model the row is missing would be
+    /// false.
+    fn route_failure_text(err: &ClientError, what: &str) -> String {
         match err {
             ClientError::Daemon { status: 404, message, .. } if message == "404 Not Found" => {
-                "the running clawg daemon cannot read a save; restart it with the installed clawg \
-                 (`clawg stop`, then call again)"
-                    .to_string()
+                format!(
+                    "the running clawg daemon cannot {what}; restart it with the installed clawg \
+                     (`clawg stop`, then call again)"
+                )
             }
             other => Self::explain(other),
         }
@@ -2258,11 +2259,21 @@ mod tests {
     }
 
     #[test]
+    fn a_daemon_without_the_restore_route_is_named_as_such() {
+        let old = daemon_error(404, "404 Not Found", ErrorDetails::default());
+        let text = ClawgMcp::route_failure_text(&old, "restore a memory");
+        assert!(text.contains("cannot restore a memory") && text.contains("restart"), "{text}");
+        let missing = daemon_error(404, "no Memory row with id 7", ErrorDetails::default());
+        assert_eq!(ClawgMcp::route_failure_text(&missing, "restore a memory"), ClawgMcp::explain(&missing));
+    }
+
+    #[test]
     fn a_daemon_without_the_save_route_is_named_as_such() {
         let old = daemon_error(404, "404 Not Found", ErrorDetails::default());
-        assert!(ClawgMcp::read_failure_text(&old).contains("restart"), "{}", ClawgMcp::read_failure_text(&old));
+        let text = ClawgMcp::route_failure_text(&old, "read a save");
+        assert!(text.contains("cannot read a save") && text.contains("restart"), "{text}");
         let missing = daemon_error(404, "no Memory row with id 7", ErrorDetails::default());
-        assert_eq!(ClawgMcp::read_failure_text(&missing), ClawgMcp::explain(&missing));
+        assert_eq!(ClawgMcp::route_failure_text(&missing, "read a save"), ClawgMcp::explain(&missing));
     }
 
     fn update_args(id: i64, importance: Option<f64>, memory_type: Option<&str>) -> UpdateMemoryArgs {

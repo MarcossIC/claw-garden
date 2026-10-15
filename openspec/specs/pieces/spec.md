@@ -123,7 +123,7 @@ El puente MUST exponer `read_memory(id, kind?)` (`crates/clawg-cli/src/mcp/serve
 
 `save_memory` MUST nombrar `read_memory` en su descripción (`server.rs:787`) y en la respuesta de un save largo (`saved as N pieces: …; read_memory with any of them returns the whole text`). `search_memory` MUST explicar `piece=K/N` en su descripción (`server.rs:805`). `tools/list` MUST listar `read_memory` entre sus herramientas; el conteo vigente, once, y la lista completa están en [`specs/mcp`](../mcp/spec.md).
 
-Contra un daemon que no tiene la ruta, su 404 no trae el error JSON del daemon: `read_failure_text` (`server.rs:669`) MUST decir que hay que reiniciar el daemon, no que la fila no existe.
+Contra un daemon que no tiene la ruta, su 404 no trae el error JSON del daemon: `route_failure_text` (`crates/clawg-cli/src/mcp/server.rs`) MUST decir que hay que reiniciar el daemon, no que la fila no existe.
 
 #### Escenario: lo propio, con un pedazo borrado
 - GIVEN un save de 4 pedazos del agente A, con el pedazo 3 borrado
