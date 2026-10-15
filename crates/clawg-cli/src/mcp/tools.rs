@@ -15,7 +15,7 @@ use clawg_core::memory::dispute::{Resolution, ResolvedRow};
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
 
-use crate::client::{Context, Health, Hit, MemoryRow, Synthesis, Updated};
+use crate::client::{Context, Health, Hit, MemoryRow, SavedText, Synthesis, Updated};
 use crate::relevance::{relevant_len, RELEVANCE_RATIO};
 
 /// How much of a hit's content a search result shows.
@@ -98,6 +98,22 @@ pub fn format_resolution(r: &Resolution) -> String {
         _ => format!("#{} {}", row.id, row.status),
     };
     format!("{}\n{}", line(&r.keep), line(&r.other))
+}
+
+/// What `read_memory` tells the model: which piece it asked for and every
+/// row of the save, then the whole text. A position with no row it may read
+/// is named, so the model knows the text has a gap there.
+pub fn format_save(save: &SavedText) -> String {
+    if save.pieces <= 1 {
+        return format!("#{}\n{}", save.id, save.text);
+    }
+    let ids = save
+        .ids
+        .iter()
+        .map(|id| id.map_or_else(|| "(missing)".to_string(), |id| format!("#{id}")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("#{} is piece {} of {} of one save: {ids}\n{}", save.id, save.piece, save.pieces, save.text)
 }
 
 /// What `update_memory` tells the model about the row it changed. The tier is
@@ -410,6 +426,27 @@ mod tests {
     fn format_hits_keeps_each_hit_on_one_line() {
         let out = format_hits(&[hit(1, "Memory", "chat_message", 3, 0.1, "two\nlines")]);
         assert_eq!(out.lines().count(), 1, "out was: {out:?}");
+    }
+
+    // ── format_save ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn format_save_names_the_piece_and_the_missing_ones() {
+        let save = SavedText {
+            kind: "memory".into(),
+            id: 58,
+            piece: 2,
+            pieces: 4,
+            ids: vec![Some(57), Some(58), None, Some(60)],
+            missing: vec![3],
+            text: "first and second\nfourth".into(),
+        };
+        assert_eq!(
+            format_save(&save),
+            "#58 is piece 2 of 4 of one save: #57, #58, (missing), #60\nfirst and second\nfourth"
+        );
+        let single = SavedText { piece: 1, pieces: 1, ids: vec![Some(58)], missing: vec![], text: "short".into(), ..save };
+        assert_eq!(format_save(&single), "#58\nshort");
     }
 
     // ── format_rows ─────────────────────────────────────────────────────────

@@ -44,7 +44,7 @@ use clawg_core::memory::prompt_builder::{build_memory_prompt, QueryTexts};
 use clawg_core::memory::synthesis::{
     existing_memory_ids, synthesis_core, unreviewed_count, Synthesis, SynthesisParams,
 };
-use clawg_core::memory::{search_all_memories, RankedHit, SearchScope};
+use clawg_core::memory::{read_save_core, search_all_memories, RankedHit, SaveText, SearchScope};
 use clawg_core::models::chat::Role;
 use clawg_core::paths::Profile;
 use clawg_core::runtime::MemoryRuntime;
@@ -542,6 +542,7 @@ pub fn router(app: Arc<AppCtx>) -> Router {
             "/memories/{kind}/{id}",
             get(get_memory).patch(update_memory).delete(delete_memory),
         )
+        .route("/memories/{kind}/{id}/save", get(get_save))
         .route("/disputes/resolve", post(resolve_dispute))
         .route("/synthesis", post(synthesis))
         .route("/stats", get(stats))
@@ -890,6 +891,21 @@ async fn get_memory(
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("no {kind:?} row with id {id}")))?;
     Ok(Json(ItemBody { item }))
+}
+
+/// The save the row is a piece of, scoped like the other routes by id: a
+/// row that is missing, deleted or another agent's is the same 404.
+async fn get_save(
+    State(app): State<Arc<AppCtx>>,
+    Path((kind, id)): Path<(String, i64)>,
+    Query(owner): Query<OwnerQuery>,
+) -> ApiResult<Json<SaveText>> {
+    let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
+    let save = read_save_core(&app.runtime.store, kind, id, owner.agent.as_deref())
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("no {kind:?} row with id {id}")))?;
+    Ok(Json(save))
 }
 
 async fn update_memory(

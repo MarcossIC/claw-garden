@@ -322,7 +322,9 @@ pub struct Updated {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SavedText {
     pub kind: String,
+    /// The row asked for, and its position (from 1) in the save.
     pub id: i64,
+    pub piece: i64,
     pub pieces: i64,
     /// The row at each position, `None` where it is deleted or not the
     /// caller's to read.

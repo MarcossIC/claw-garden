@@ -532,6 +532,39 @@ async fn a_multi_chunk_save_returns_one_id_per_chunk() {
 }
 
 #[tokio::test]
+async fn get_save_returns_the_whole_text() {
+    let h = Harness::start().await;
+    let content = (0..600).map(|i| format!("w{i:05}")).collect::<Vec<_>>().join(" ");
+    let (_, body) = h.post_json("/v1/memories", json!({ "content": content, "agent_id": "a" })).await;
+    let ids: Vec<i64> = body["memories"].as_array().expect("memories").iter().map(|m| m["id"].as_i64().unwrap()).collect();
+
+    let (status, save) = h.get_json(&format!("/v1/memories/memory/{}/save?agent=a", ids[1])).await;
+
+    assert_eq!(status, 200, "{save}");
+    assert_eq!(save["id"], ids[1]);
+    assert_eq!(save["piece"], 2);
+    assert_eq!(save["pieces"], 3);
+    assert_eq!(save["ids"], json!(ids));
+    assert_eq!(save["missing"], json!([]));
+    assert_eq!(save["text"], content);
+}
+
+#[tokio::test]
+async fn get_save_of_another_agent_is_404() {
+    let h = Harness::start().await;
+    let (_, body) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "agent-http" })).await;
+    let id = body["memories"][0]["id"].as_i64().expect("id");
+
+    let (status, _) = h.get_json(&format!("/v1/memories/memory/{id}/save?agent=agent-other")).await;
+    assert_eq!(status, 404, "another agent's save reads as missing");
+    let (status, _) = h.get_json("/v1/memories/memory/999999/save?agent=agent-http").await;
+    assert_eq!(status, 404);
+    let (status, save) = h.get_json(&format!("/v1/memories/memory/{id}/save?agent=agent-http")).await;
+    assert_eq!(status, 200, "{save}");
+    assert_eq!((save["pieces"].as_i64(), save["text"].as_str()), (Some(1), Some(CONTENT)));
+}
+
+#[tokio::test]
 async fn saving_the_same_text_twice_returns_the_same_id_as_reinforced() {
     let h = Harness::start().await;
     let save = || h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a" }));
