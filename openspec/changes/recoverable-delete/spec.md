@@ -107,18 +107,19 @@ El puente MUST exponer `restore_memory` con `kind` e `id`, y MUST mandar siempre
 - Sobre una borrada propia, MUST devolver un texto que nombra el id; si sigue `superseded`, MUST decir por cuál y que la búsqueda no la muestra.
 - Sobre una de otro agente MUST fallar como si el id no existiera, y la fila MUST NOT cambiar.
 - Una gemela viva o un secreto MUST fallar con el mensaje del daemon.
+- Contra un daemon que no tiene la ruta, su 404 sin el error JSON del daemon MUST decir que hay que reiniciar el daemon, no que la fila no existe.
 - La descripción MUST decir que deshace un `delete_memory` del propio agente, con el id y el kind que se borraron.
 
 `delete_memory` MUST nombrar `restore_memory` en su respuesta y en su descripción. `tools/list` MUST listar doce herramientas.
 
-**Test:** `restore_memory_undoes_an_own_delete`, `an_agent_cannot_restore_another_agents_memory`, `delete_memory_names_the_way_back` y `restore_memory` en `tool_descriptions_say_shared_memories_are_read_only` en `crates/clawg-cli/src/mcp/server.rs`; `format_restore_says_when_the_row_is_still_superseded` en `crates/clawg-cli/src/mcp/tools.rs`; los conteos de `every_tool_is_registered_under_its_wire_name`, `the_viewer_is_not_exposed_to_the_model` (`server.rs`) y `a_session_without_initialize_lists_the_tools_in_name_order` (`handshake.rs`). Fallan hoy.
+**Test:** `restore_memory_undoes_an_own_delete`, `an_agent_cannot_restore_another_agents_memory`, `delete_memory_names_the_way_back` y `restore_memory` en `tool_descriptions_say_shared_memories_are_read_only` en `crates/clawg-cli/src/mcp/server.rs`; `a_daemon_without_the_restore_route_is_named_as_such` en `server.rs`; `format_restore_says_when_the_row_is_still_superseded` en `crates/clawg-cli/src/mcp/tools.rs`; los conteos de `every_tool_is_registered_under_its_wire_name`, `the_viewer_is_not_exposed_to_the_model` (`server.rs`) y `a_session_without_initialize_lists_the_tools_in_name_order` (`handshake.rs`). Fallan hoy.
 
 ## R6. CLI
 
 - `clawg undelete <ID> [--profile P]` MUST restaurar la fila `<ID>` de `memory` por el daemon, sin scope, e imprimir el resultado. Sin daemon corriendo MUST fallar diciendo cómo arrancarlo, sin abrir la base: el vector lo calcula el embedder del daemon.
-- `clawg memories list --deleted` MUST listar las borradas con su momento de borrado. `clawg memories` sigue sin escribir.
+- `clawg memories list --deleted` MUST listar las borradas con su momento de borrado, y nombrar `clawg undelete` sólo si hay alguna fila de `memory` en la lista. `clawg memories` sigue sin escribir.
 
-**Test:** `undelete_takes_an_id_and_a_profile` y el `--deleted` de `memories_list_defaults` en `crates/clawg-cli/src/cli.rs`; `undelete_restores_through_the_daemon` y `report_names_the_row_and_a_replacement` en `crates/clawg-cli/src/undelete.rs`; `list_deleted_shows_when_each_row_was_deleted` y `list_args_ask_for_deleted_rows_only_with_the_flag` en `crates/clawg-cli/src/memories.rs`. Fallan hoy.
+**Test:** `undelete_takes_an_id_and_a_profile` y el `--deleted` de `memories_list_defaults` en `crates/clawg-cli/src/cli.rs`; `undelete_restores_through_the_daemon` y `report_names_the_row_and_a_replacement` en `crates/clawg-cli/src/undelete.rs`; `list_deleted_shows_when_each_row_was_deleted` y `list_args_ask_for_deleted_rows_only_with_the_flag` y `deleted_episodes_alone_are_not_offered_an_undelete` en `crates/clawg-cli/src/memories.rs`. Fallan hoy.
 
 ## R7. Datos de la versión anterior
 

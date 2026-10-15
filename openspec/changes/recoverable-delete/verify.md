@@ -19,6 +19,8 @@
 | `feat(cli): undelete a memory and list deleted ones` (241f9ed) | 1.876 | 10 |
 | `docs: describe restoring a deleted memory` (0248f25) | 1.876 | 10 |
 | `test(core): restore over a vector an earlier model wrote` (bdaccf9) | 1.876 | 10 |
+| `fix(mcp): name a daemon without the restore route as stale` | 1.877 | 10 |
+| `fix(cli): offer undelete only for deleted memory rows` | 1.878 | 10 |
 
 Los commits de docs y el de `Cargo.lock` (que sólo pasa las versiones del workspace a 0.3.0, como ya dice `Cargo.toml` en `main`) no tocan código.
 
@@ -29,7 +31,7 @@ Todos los commits compilan. Las 10 fallas son las mismas en todos, y en `main`, 
 
 Una vez, en una corrida de `cargo test -p clawg-core`, falló `search::tests::disputed_status_does_not_change_score` y pasó en las cinco siguientes. Calcula la recencia con `strftime('now')` en dos inserts separados, así que depende del reloj; no es de este cambio.
 
-**Conteo:** 28 tests nuevos, ninguno borrado. En `admin.rs`, 12 del restore y 2 del listado; 1 en `synthesis.rs`; 3 HTTP en `tests/api.rs` y 1 en `daemon/api.rs`; 3 del puente en `server.rs` y 1 en `tools.rs`; 1 en `cli.rs`, 2 en `memories.rs` y 2 en `undelete.rs`. Cambiaron los conteos de herramientas (de 11 a 12) en `server.rs` y `handshake.rs`, y los literales de `ListOpts` en `cli.rs` y `memories.rs`.
+**Conteo:** 30 tests nuevos, ninguno borrado. En `admin.rs`, 12 del restore y 2 del listado; 1 en `synthesis.rs`; 3 HTTP en `tests/api.rs` y 1 en `daemon/api.rs`; 4 del puente en `server.rs` y 1 en `tools.rs`; 1 en `cli.rs`, 3 en `memories.rs` y 2 en `undelete.rs`. Cambiaron los conteos de herramientas (de 11 a 12) en `server.rs` y `handshake.rs`, y los literales de `ListOpts` en `cli.rs` y `memories.rs`.
 
 Los warnings de compilación no cambian.
 
@@ -41,8 +43,8 @@ Los warnings de compilación no cambian.
 | R2 qué escribe | `a_restored_row_is_found_again`, `delete_restore_delete_keeps_the_text_index_whole`, `a_stale_vector_does_not_stop_a_restore`, `a_restored_row_settles_its_own_dispute`, `restoring_leaves_the_rest_of_the_row_alone` |
 | R3 pedazos y conclusiones | `a_restored_piece_is_embedded_behind_its_head_again`, `a_stale_vector_does_not_stop_a_restore`, `a_restored_conclusion_covers_its_sources_again` |
 | R4 HTTP | `restore_brings_a_deleted_memory_back_for_its_owner`, `restore_answers_each_refusal_with_its_status`, `listing_deleted_rows_shows_only_them_newest_deletion_first`, `deleted_listing_refuses_a_text_query`; en el core, `deleted_rows_are_listed_only_when_asked` y `deleted_rows_list_newest_deletion_first` |
-| R5 MCP | `restore_memory_undoes_an_own_delete`, `an_agent_cannot_restore_another_agents_memory`, `delete_memory_names_the_way_back`, `format_restore_says_when_the_row_is_still_superseded`, los conteos de herramientas |
-| R6 CLI | `undelete_takes_an_id_and_a_profile`, `undelete_restores_through_the_daemon`, `report_names_the_row_and_a_replacement`, `list_deleted_shows_when_each_row_was_deleted`, `list_args_ask_for_deleted_rows_only_with_the_flag` |
+| R5 MCP | `restore_memory_undoes_an_own_delete`, `an_agent_cannot_restore_another_agents_memory`, `delete_memory_names_the_way_back`, `format_restore_says_when_the_row_is_still_superseded`, `a_daemon_without_the_restore_route_is_named_as_such`, los conteos de herramientas |
+| R6 CLI | `undelete_takes_an_id_and_a_profile`, `undelete_restores_through_the_daemon`, `report_names_the_row_and_a_replacement`, `list_deleted_shows_when_each_row_was_deleted`, `list_args_ask_for_deleted_rows_only_with_the_flag`, `deleted_episodes_alone_are_not_offered_an_undelete` |
 | R7 datos anteriores | `rows_deleted_by_the_previous_version_can_be_restored` |
 
 ### Cómo se comprobó el índice léxico
@@ -55,7 +57,7 @@ No corrido en Linux: necesita el modelo real. El cambio no toca la búsqueda, el
 
 ## Pendiente (máquina de Marcos)
 
-1. **Suite en Windows:** `cargo test --workspace --no-fail-fast --target-dir target-test` en la punta de la rama. Se esperan 1.864 + 28 = **1.892 pasan, 0 fallan**.
+1. **Suite en Windows:** `cargo test --workspace --no-fail-fast --target-dir target-test` en la punta de la rama. Se esperan 1.864 + 30 = **1.894 pasan, 0 fallan**.
 2. **rag-eval:** `rag-eval --real --diff` contra `main`, en el ancla y en `--agent-view`. Se espera diff vacío.
 3. **Perfil dev con Claude Code.** Abrir el perfil con este binario no migra nada (no hay migración).
    - Guardar una memoria, borrarla con `delete_memory` y pedir que la deshaga: `restore_memory` la devuelve y `search_memory` la encuentra.
