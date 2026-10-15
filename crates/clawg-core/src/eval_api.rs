@@ -65,7 +65,8 @@ pub fn production_lexical_budget() -> Option<usize> {
 /// real tokenizer, whose tokens average fewer bytes.
 pub fn fallback_pieces(text: &str) -> Vec<String> {
     crate::memory::chunker::ChatChunker::from_tokenizer(None)
-        .chunk(text, crate::memory::chunker::CHUNK_MAX_TOKENS)
+        .split_save(text)
+        .pieces
         .into_iter()
         .map(|c| c.text)
         .collect()

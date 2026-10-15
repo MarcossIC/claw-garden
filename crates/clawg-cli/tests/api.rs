@@ -518,7 +518,7 @@ async fn a_save_reports_the_secrets_it_masked() {
 async fn a_multi_chunk_save_returns_one_id_per_chunk() {
     let h = Harness::start().await;
     // Distinct words, long enough for three windows of the fallback chunker.
-    let content = (0..700).map(|i| format!("w{i:05}")).collect::<Vec<_>>().join(" ");
+    let content = (0..600).map(|i| format!("w{i:05}")).collect::<Vec<_>>().join(" ");
     let (status, body) = h.post_json("/v1/memories", json!({ "content": content, "agent_id": "a" })).await;
 
     assert_eq!(status, 201, "{body}");
