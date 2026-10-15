@@ -187,8 +187,8 @@ fn render_rows(rows: &[MemoryRow], now_ms: i64, limit: u32, offset: u32, listing
     if shown >= u64::from(limit) {
         let _ = write!(out, " More: --offset {}", u64::from(offset) + shown);
     }
-    if let Listing::Deleted = listing {
-        out.push_str(" Undo one with 'clawg undelete <ID>'.");
+    if matches!(listing, Listing::Deleted) && rows.iter().any(|r| r.kind == "memory") {
+        out.push_str(" Undo a memory row with 'clawg undelete <ID>'.");
     }
     out
 }
@@ -498,8 +498,17 @@ mod tests {
         assert!(!lines[0].contains(" AGE "), "{out}");
         assert!(lines[1].contains(" 2m ") && lines[1].contains("fridays"), "{out}");
         assert!(lines[2].contains(" 3d ") && lines[2].contains("tabs in go"), "{out}");
-        assert!(out.ends_with("2 rows, most recently deleted first. Undo one with 'clawg undelete <ID>'."), "{out}");
+        assert!(out.ends_with("2 rows, most recently deleted first. Undo a memory row with 'clawg undelete <ID>'."), "{out}");
         assert_eq!(render_deleted_table(&[], NOW, 20, 0), "no deleted memories match");
+    }
+
+    #[test]
+    fn deleted_episodes_alone_are_not_offered_an_undelete() {
+        let episode = MemoryRow { deleted_at: Some(NOW - 60_000), ..row(4, "episodic", "ran the migration") };
+
+        let out = render_deleted_table(&[episode], NOW, 20, 0);
+
+        assert!(out.ends_with("1 row, most recently deleted first."), "{out}");
     }
 
     #[test]
