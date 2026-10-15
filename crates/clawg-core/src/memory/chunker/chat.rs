@@ -13,7 +13,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::token_splitter::TokenSplitter;
-use super::{Chunk, CHUNK_MAX_TOKENS, PIECE_MAX_TOKENS, SAVE_HEAD_TOKENS};
+use super::{Chunk, CHUNK_MAX_TOKENS, PIECE_MAX_TOKENS, PIECE_OVERLAP_TOKENS, SAVE_HEAD_TOKENS};
 
 /// How the worker stores one event: its pieces in order and, for a text that
 /// did not fit in one, the head each piece after the first is embedded with.
@@ -82,16 +82,16 @@ impl ChatChunker {
 
     /// Splits one event's text for storing. A text that fits in one piece of
     /// [`CHUNK_MAX_TOKENS`] comes back exactly as [`ChatChunker::chunk`] cuts
-    /// it, with no head. A longer one is cut at [`PIECE_MAX_TOKENS`], which
-    /// leaves room to embed each later piece behind the first
-    /// [`SAVE_HEAD_TOKENS`] of the text.
+    /// it, with no head. A longer one is cut into pieces of
+    /// [`PIECE_MAX_TOKENS`] sharing [`PIECE_OVERLAP_TOKENS`], each later one
+    /// embedded behind the first [`SAVE_HEAD_TOKENS`] of the text.
     pub fn split_save(&self, content: &str) -> SaveSplit {
         let whole = self.chunk(content, CHUNK_MAX_TOKENS);
         if whole.len() <= 1 {
             return SaveSplit { pieces: whole, head: None };
         }
         let head = self.splitter.split(content, SAVE_HEAD_TOKENS, 0).into_iter().next().map(|c| c.text);
-        SaveSplit { pieces: self.chunk(content, PIECE_MAX_TOKENS), head }
+        SaveSplit { pieces: self.splitter.split(content, PIECE_MAX_TOKENS, PIECE_OVERLAP_TOKENS), head }
     }
 
     /// Test-only: see `TokenSplitter::tokenizer_ptr`.
@@ -173,17 +173,23 @@ mod tests {
     }
 
     #[test]
-    fn a_long_text_is_split_below_the_cap_to_leave_room_for_the_head() {
+    fn a_long_text_is_split_into_small_pieces() {
         let chunker = ChatChunker::with_fallback();
         let content = "word ".repeat(1200);
         let split = chunker.split_save(&content);
-        // 6000 bytes at 424 tokens (1696 bytes) with 256 of overlap is
-        // ceil((6000 - 256) / 1440) = 4 pieces; the 480 cap gives 4 as well,
-        // but each of these is shorter.
-        assert_eq!(split.pieces.len(), 4);
-        assert!(split.pieces.iter().all(|p| p.text.len() <= 1696), "a piece passed the cap");
-        let rebuilt = split.pieces[1..].iter().fold(split.pieces[0].text.clone(), |acc, p| acc + &p.text[256..]);
-        assert_eq!(rebuilt, content, "the pieces still cover the text with the same overlap");
+        // 6000 bytes at 96 tokens (384 bytes) with 96 bytes of overlap is
+        // ceil((6000 - 96) / 288) = 21 pieces, where the 480 cap gives 4.
+        assert_eq!(split.pieces.len(), 21);
+        assert!(split.pieces.iter().all(|p| p.text.len() <= 384), "a piece passed the cap");
+    }
+
+    #[test]
+    fn small_pieces_share_their_own_overlap() {
+        let chunker = ChatChunker::with_fallback();
+        let content = "word ".repeat(1200);
+        let split = chunker.split_save(&content);
+        let rebuilt = split.pieces[1..].iter().fold(split.pieces[0].text.clone(), |acc, p| acc + &p.text[96..]);
+        assert_eq!(rebuilt, content, "neighbours share 24 tokens, not the 64 of a chunk");
     }
 
     #[test]

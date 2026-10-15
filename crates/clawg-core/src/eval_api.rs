@@ -60,14 +60,15 @@ pub fn production_lexical_budget() -> Option<usize> {
     SearchScope::all_default().lexical
 }
 
-/// The pieces the worker cuts `text` into when no tokenizer is loaded (four
-/// bytes per token). It is the coarsest count production gives, so a text
-/// that reaches some number of pieces here reaches at least as many with the
-/// real tokenizer, whose tokens average fewer bytes.
-pub fn fallback_pieces(text: &str) -> Vec<String> {
+/// The pieces of at most `max_tokens` the chunker cuts `text` into when no
+/// tokenizer is loaded (four bytes per token). It is the coarsest count a
+/// cap gives, so a text that reaches some number of pieces here reaches at
+/// least as many with the real tokenizer, whose tokens average fewer bytes.
+/// The cap is the caller's: a golden set sized against one must not change
+/// when production splits at another.
+pub fn fallback_pieces(text: &str, max_tokens: usize) -> Vec<String> {
     crate::memory::chunker::ChatChunker::from_tokenizer(None)
-        .split_save(text)
-        .pieces
+        .chunk(text, max_tokens)
         .into_iter()
         .map(|c| c.text)
         .collect()

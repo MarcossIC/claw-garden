@@ -120,6 +120,32 @@ fn collapse_saves(hits: Vec<RankedHit>, links: &HashMap<i64, SaveLink>) -> Vec<R
         .collect()
 }
 
+/// The save a row stands for: its link's, or the row alone when it has none.
+fn save_of(id: i64, links: &HashMap<i64, SaveLink>) -> (bool, i64) {
+    match links.get(&id) {
+        Some(link) => (true, link.save_id),
+        None => (false, id),
+    }
+}
+
+/// How many saves the rows `ids` belong to.
+fn distinct_saves(ids: impl Iterator<Item = i64>, links: &HashMap<i64, SaveLink>) -> usize {
+    ids.map(|id| save_of(id, links)).collect::<HashSet<_>>().len()
+}
+
+/// The rows of `hits`, best first, up to the one that completes `k` saves.
+/// Siblings of a save already in stay, for `collapse_saves` to drop; what a
+/// pool budgets is how many saves it can offer, not how many rows.
+fn trim_to_saves(hits: Vec<RankedHit>, links: &HashMap<i64, SaveLink>, k: usize) -> Vec<RankedHit> {
+    let mut seen = HashSet::new();
+    hits.into_iter()
+        .filter(|hit| {
+            let save = save_of(hit.id, links);
+            seen.contains(&save) || (seen.len() < k && seen.insert(save))
+        })
+        .collect()
+}
+
 // Compile-time Send + Sync assertions
 const _: fn() = || {
     fn _ss<T: Send + Sync>() {}
@@ -334,7 +360,13 @@ fn retry_window(k: usize) -> usize {
 }
 
 /// Runs one table's KNN query, recovering once from a window that the WHERE
-/// clause emptied out.
+/// clause emptied out, or that the pieces of one save filled.
+///
+/// The second case is a full window that offers fewer than k memories: the
+/// pieces of a long save share its head, so a query about it finds them all
+/// before anything else, and the collapse to one hit per save runs after the
+/// pool is cut. The same single wider pass reaches the rows behind them, and
+/// the result is cut at k saves rather than k rows.
 ///
 /// vec0 hands the join exactly `min(k, live vectors)` rows, and every predicate
 /// in the SQL above is applied after that cut, so a short result has two very
@@ -454,9 +486,23 @@ async fn knn_one(
                 Ok(hits)
             }
 
+            // Only `memory` rows are pieces of a save. Without the links the
+            // pool counts rows, as it did before saves were linked.
+            let links_of = |raw: &[RawHit]| {
+                if table.kind != TableKind::Memory {
+                    return HashMap::new();
+                }
+                let ids: Vec<i64> = raw.iter().map(|r| r.id).collect();
+                crate::memory::pieces::read_links(c, &ids).unwrap_or_else(|e| {
+                    log::warn!("knn: reading save links failed, the pool counts rows: {e}");
+                    HashMap::new()
+                })
+            };
+
             let mut passes = 0usize;
             let mut raw = run(c, table, &q, &agent, &proj, k, &mut passes, &lexical_matches)?;
-            if raw.len() < k {
+            let mut links = links_of(&raw);
+            let widen = if raw.len() < k {
                 // Capped at k by the SQL's own LIMIT, so this is
                 // `min(k, eligible)` — the most this query could ever return.
                 let reachable: i64 = c.query_row(
@@ -464,9 +510,15 @@ async fn knn_one(
                     rusqlite::params![k as i64, &agent, &proj],
                     |row| row.get(0),
                 )?;
-                if raw.len() < reachable as usize {
-                    raw = run(c, table, &q, &agent, &proj, retry_window(k), &mut passes, &lexical_matches)?;
-                }
+                raw.len() < reachable as usize
+            } else {
+                // A full window of one save's pieces offers one memory: the
+                // rows past it hold the others.
+                distinct_saves(raw.iter().map(|r| r.id), &links) < k
+            };
+            if widen {
+                raw = run(c, table, &q, &agent, &proj, retry_window(k), &mut passes, &lexical_matches)?;
+                links = links_of(&raw);
             }
             let mut hits: Vec<RankedHit> = raw
                 .into_iter()
@@ -491,7 +543,7 @@ async fn knn_one(
             // score, so the cut would otherwise keep whichever k rows the
             // join happened to emit first.
             hits.sort_by(hit_cmp);
-            hits.truncate(k);
+            let hits = trim_to_saves(hits, &links, k);
             Ok(KnnOutcome { hits, passes })
         })
         .await
@@ -4961,6 +5013,81 @@ mod tests {
         .unwrap();
 
         assert_eq!(ids_and_pieces(&hits), vec![(save[0], Some((1, 3))), (others[0], None), (others[1], None)]);
+    }
+
+    #[test]
+    fn distinct_saves_counts_unlinked_rows_as_their_own() {
+        let links = HashMap::from([(10, link(1, 1, 3)), (11, link(1, 2, 3)), (20, link(2, 1, 2))]);
+
+        assert_eq!(distinct_saves([10, 11, 5, 20, 6].into_iter(), &links), 4);
+        assert_eq!(distinct_saves([10, 11].into_iter(), &links), 1);
+        assert_eq!(distinct_saves(std::iter::empty(), &links), 0);
+    }
+
+    #[test]
+    fn trim_to_saves_keeps_the_rows_up_to_k_saves() {
+        let hits = vec![
+            memory_hit(10, 0.9),
+            memory_hit(11, 0.8),
+            memory_hit(5, 0.7),
+            memory_hit(12, 0.6),
+            memory_hit(6, 0.5),
+            memory_hit(7, 0.4),
+        ];
+        let links = HashMap::from([(10, link(1, 1, 3)), (11, link(1, 2, 3)), (12, link(1, 3, 3))]);
+
+        let trimmed = trim_to_saves(hits.clone(), &links, 3);
+        let none = trim_to_saves(hits, &HashMap::new(), 3);
+
+        assert_eq!(trimmed.iter().map(|h| h.id).collect::<Vec<_>>(), vec![10, 11, 5, 12, 6]);
+        assert_eq!(none.iter().map(|h| h.id).collect::<Vec<_>>(), vec![10, 11, 5], "without links, k rows");
+    }
+
+    #[tokio::test]
+    async fn a_save_with_more_pieces_than_the_pool_leaves_room_for_other_memories() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let agent = "agent-crowded-pool";
+        let mut pieces = Vec::new();
+        for i in 0..40 {
+            let cos = 0.999 - 0.0001 * i as f32;
+            pieces.push(
+                insert_memory_row(
+                    &store, agent, &format!("piece {i} of a long import"), "chat_message", 3, 5.0, "active",
+                    serialize_embedding(&vec_at_cosine(cos)),
+                )
+                .await,
+            );
+        }
+        store
+            .link_pieces(
+                pieces
+                    .iter()
+                    .map(|&memory_id| crate::memory::pieces::StoredPiece { memory_id, context: String::new() })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        let mut others = Vec::new();
+        for i in 0..10 {
+            let cos = 0.95 - 0.001 * i as f32;
+            others.push(
+                insert_memory_row(
+                    &store, agent, &format!("another memory {i}"), "chat_message", 3, 5.0, "active",
+                    serialize_embedding(&vec_at_cosine(cos)),
+                )
+                .await,
+            );
+        }
+
+        let (hits, _) = search_all_memories_inner(
+            &store, &unit_basis_vec(), None, agent, SearchScope::all_default(), 10, &ScoringConfig::DEFAULT,
+        )
+        .await
+        .unwrap();
+
+        let mut expected = vec![(pieces[0], Some((1, 40)))];
+        expected.extend(others[..9].iter().map(|&id| (id, None)));
+        assert_eq!(ids_and_pieces(&hits), expected);
     }
 
     #[tokio::test]

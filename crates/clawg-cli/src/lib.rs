@@ -39,4 +39,5 @@ pub mod secrets;
 pub mod sharing;
 pub mod status;
 pub mod stop;
+pub mod undelete;
 pub mod user_path;

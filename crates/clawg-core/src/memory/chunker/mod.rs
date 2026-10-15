@@ -32,13 +32,20 @@ pub(crate) const SAVE_HEAD_TOKENS: usize = 48;
 /// texts are joined: token counts are not additive across the seam.
 const HEAD_JOIN_RESERVE: usize = 8;
 
-/// Cap of each piece of a text that does not fit in one, so that head,
-/// separator and piece together still fit under [`CHUNK_MAX_TOKENS`].
-pub(crate) const PIECE_MAX_TOKENS: usize = CHUNK_MAX_TOKENS - SAVE_HEAD_TOKENS - HEAD_JOIN_RESERVE;
+/// Cap of each piece of a text that does not fit in one. Far below what the
+/// embedder takes: a vector averages its whole text, and a fact that is one
+/// sentence among 424 tokens loses to short memories on the same topic, while
+/// the same sentence in 96 tokens behind the head ranks first.
+pub(crate) const PIECE_MAX_TOKENS: usize = 96;
+
+/// Tokens two neighbouring pieces share. A quarter of the piece, so a sentence
+/// cut at the boundary is whole in one of them; the 64 of a chunk would make
+/// every piece two thirds repeat.
+pub(crate) const PIECE_OVERLAP_TOKENS: usize = 24;
 
 const HEAD_SEPARATOR: &str = "\n…\n";
 
-const _: () = assert!(CHUNK_OVERLAP_TOKENS < PIECE_MAX_TOKENS);
+const _: () = assert!(PIECE_OVERLAP_TOKENS < PIECE_MAX_TOKENS);
 const _: () = assert!(SAVE_HEAD_TOKENS + HEAD_JOIN_RESERVE + PIECE_MAX_TOKENS <= CHUNK_MAX_TOKENS);
 
 /// The text a piece is embedded with: the piece alone, or the save's head,

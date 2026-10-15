@@ -95,6 +95,14 @@ pub enum Command {
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Bring back a memory that was deleted, with its id as `clawg memories
+    /// list --deleted` shows it. Needs a running daemon, which embeds it again.
+    Undelete {
+        /// The memory's id.
+        id: i64,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
     /// Show which agents do not read which agents' memories, or change it with
     /// `hide` and `unhide`. Every agent reads every other agent until hidden;
     /// a change counts from the next search, with the daemon running. A shared
@@ -297,6 +305,9 @@ pub struct ListOpts {
     /// Print JSON instead of a table.
     #[arg(long)]
     pub json: bool,
+    /// List the deleted rows instead, most recently deleted first.
+    #[arg(long)]
+    pub deleted: bool,
     #[command(flatten)]
     pub profile: ProfileArg,
 }
@@ -616,6 +627,20 @@ mod tests {
     }
 
     #[test]
+    fn undelete_takes_an_id_and_a_profile() {
+        assert_eq!(
+            parse(&["clawg", "undelete", "57", "--profile", "dev"]).command,
+            Command::Undelete { id: 57, profile: ProfileArg { profile: Some("dev".into()) } }
+        );
+        assert_eq!(
+            parse(&["clawg", "undelete", "57"]).command,
+            Command::Undelete { id: 57, profile: ProfileArg { profile: None } }
+        );
+        assert!(Cli::try_parse_from(["clawg", "undelete"]).is_err(), "the id is required");
+        assert!(Cli::try_parse_from(["clawg", "undelete", "memory"]).is_err(), "the id is a number");
+    }
+
+    #[test]
     fn purge_takes_an_id_a_yes_and_a_profile() {
         assert_eq!(
             parse(&["clawg", "purge", "57", "--yes", "--profile", "dev"]).command,
@@ -720,9 +745,14 @@ mod tests {
                 limit: 20,
                 offset: 0,
                 json: false,
+                deleted: false,
                 profile: ProfileArg { profile: None },
             })
         );
+        match memories(&["list", "--deleted"]) {
+            MemoriesAction::List(opts) => assert!(opts.deleted),
+            other => panic!("expected list, got {other:?}"),
+        }
     }
 
     #[test]
@@ -749,6 +779,7 @@ mod tests {
                 limit: 5,
                 offset: 10,
                 json: true,
+                deleted: false,
                 profile: ProfileArg { profile: Some("dev".into()) },
             })
         );

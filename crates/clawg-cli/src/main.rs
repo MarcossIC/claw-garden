@@ -23,6 +23,7 @@ use clawg_cli::secrets;
 use clawg_cli::sharing;
 use clawg_cli::status::status_report;
 use clawg_cli::stop::{stop_in, STOP_TIMEOUT};
+use clawg_cli::undelete;
 use clawg_core::memory::backup::{backup_offline, probe, restore};
 use clawg_core::memory::secrets::{purge, scan};
 use clawg_core::paths::data_dir;
@@ -161,6 +162,20 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
             let purged = purge(&base_dir, id).map_err(secrets::explain)?;
             println!("{}", secrets::purge_report(id, &purged));
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Undelete { id, profile } => {
+            let profile = profile.resolve().map_err(|e| e.to_string())?;
+            let unavailable = |e: ClientError| memories::explain_unavailable(&e, profile);
+            // The model that embeds the row again lives in the daemon; with
+            // none running, nothing is started and the store is not opened.
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let client = match probe_running(&base_dir, false).await.map_err(unavailable)? {
+                Probe::Running(client) => client,
+                Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
+            };
+            println!("{}", undelete::run(&client, id).await.map_err(unavailable)?);
             Ok(ExitCode::SUCCESS)
         }
 

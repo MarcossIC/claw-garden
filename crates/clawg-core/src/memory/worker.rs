@@ -1609,8 +1609,10 @@ mod tests {
     async fn sibling_chunks_of_one_save_do_not_dispute_each_other() {
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
         let content = distinct_text(400);
-        assert_eq!(chunk_count(&content), 2, "fixture must split into two chunks");
-        let in_band = PlacedEmbedder { vectors: vec![turned(1, 0.0), turned(1, 0.2)] };
+        let chunks = chunk_count(&content);
+        assert!(chunks >= 2, "fixture must split into several chunks, got {chunks}");
+        // Every other sibling sits in the dispute band of its neighbours.
+        let in_band = PlacedEmbedder { vectors: (0..chunks).map(|i| turned(1, 0.2 * (i % 2) as f32)).collect() };
 
         let report = process_with(Arc::new(in_band), &store, &explicit_fact(&content)).await;
 
@@ -1629,7 +1631,7 @@ mod tests {
 
         // Every sibling sits closer to the last chunk than the older row
         // does, so without room for them they fill the whole candidate pool.
-        let content = distinct_text(1600);
+        let content = distinct_text(400);
         let chunks = chunk_count(&content);
         assert!(chunks >= 7, "fixture must split into at least seven chunks, got {chunks}");
         let siblings = PlacedEmbedder { vectors: (0..chunks).map(|i| turned(1, 0.01 * i as f32)).collect() };
@@ -1827,11 +1829,12 @@ mod tests {
         let a = saved(&store, &explicit_fact("one thing the user said")).await[0].id;
         let b = saved(&store, &explicit_fact("another thing the user said")).await[0].id;
         let content = distinct_text(400);
-        assert_eq!(chunk_count(&content), 2, "fixture must split into two chunks");
+        let pieces = chunk_count(&content);
+        assert!(pieces >= 2, "fixture must split into several chunks, got {pieces}");
 
         let chunks = saved(&store, &conclusion(&content, &[a, b])).await;
 
-        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks.len(), pieces);
         for chunk in chunks {
             assert_eq!(sources_of(&store, chunk.id).await, vec![a, b]);
         }
@@ -1889,7 +1892,7 @@ mod tests {
     async fn process_event_reports_the_rows_written_before_an_insert_failed() {
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
         let content = distinct_text(400);
-        assert_eq!(chunk_count(&content), 2, "fixture must split into two chunks");
+        assert!(chunk_count(&content) >= 2, "fixture must split into several chunks");
         let evt = make_event(Role::User, &content, None, 1);
 
         let report = process_with(Arc::new(NanAtEmbedder { position: 1 }), &store, &evt).await;
@@ -1905,8 +1908,8 @@ mod tests {
     #[tokio::test]
     async fn process_event_stops_at_the_first_failed_insert() {
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
-        let content = distinct_text(600);
-        assert_eq!(chunk_count(&content), 3, "fixture must split into three chunks");
+        let content = distinct_text(400);
+        assert!(chunk_count(&content) >= 3, "fixture must leave a chunk after the failed one");
         let evt = make_event(Role::User, &content, None, 1);
 
         let report = process_with(Arc::new(NanAtEmbedder { position: 1 }), &store, &evt).await;
@@ -2408,23 +2411,21 @@ mod tests {
             Arc::new(BatchRecordingEmbedder { batch_calls: batch_calls.clone() });
         let (tx, handle) = spawn_test_worker(Arc::clone(&store), embedder).await;
 
-        // 5760 bytes at the byte-fallback cap (1920B) with 256B overlap
-        // (stride 1664B) splits into 4 windows — [0,1920) [1664,3584)
-        // [3328,5248) [4992,5760) — all distinct strings (the source is
-        // three DIFFERENT repeated letters), so none absorb each other and
-        // all 4 survive to the embed stage.
-        let content = format!("{}{}{}", "a".repeat(1920), "b".repeat(1920), "c".repeat(1920));
+        // Every word differs, so no chunk absorbs another and all of them
+        // survive to the embed stage.
+        let content = distinct_text(400);
+        let chunks = chunk_count(&content);
         tx.try_send(IngestRequest::from(make_event(Role::User, &content, None, 1))).unwrap();
         drain_worker(tx, handle).await;
 
         let calls = batch_calls.lock().unwrap().clone();
         assert_eq!(calls.len(), 1, "expected exactly one embed_batch call for the whole event, got {calls:?}");
-        assert_eq!(calls[0], 4, "expected the single call to carry all 4 surviving chunks, got {calls:?}");
+        assert_eq!(calls[0], chunks, "expected the single call to carry all {chunks} chunks, got {calls:?}");
     }
 
-    /// Event `[A, A]`, neither present in the store: stage 1 collapses to one
-    /// survivor with multiplicity 2, stage 3 inserts it once then replays the
-    /// reinforce path once more — 1 row, access_count=2, absorbed=1. Same
+    /// Event `[A, …, A]`, not present in the store: stage 1 collapses to one
+    /// survivor with multiplicity n, stage 3 inserts it once then replays the
+    /// reinforce path n-1 times — 1 row, access_count=n, absorbed=n-1. Same
     /// externally observable outcome as two identical chunks arriving in
     /// separate events.
     #[tokio::test]
@@ -2437,32 +2438,33 @@ mod tests {
         let chat_chunker = Arc::new(ChatChunker::with_fallback());
 
         let mut absorbed: u64 = 0;
-        // Too long for one piece, so it is cut at the piece cap: 3136 bytes =
-        // cap(1696) + stride(1440) gives exactly two windows, [0,1696) and
-        // [1440,3136), both 1696 bytes of the same repeated char — i.e. two
-        // byte-identical chunks, no third partial one.
-        let content = "x".repeat(3136);
+        // Too long for one piece, so it is cut at the piece cap: 2112 bytes =
+        // cap(384) + 6 strides(288) gives exactly seven windows, all 384
+        // bytes of the same repeated char — i.e. seven byte-identical chunks,
+        // no partial one.
+        let content = "x".repeat(2112);
+        assert_eq!(chunk_count(&content), 7);
         let evt = make_event(Role::User, &content, None, 1);
 
         process_event(&evt, &store, &cell, &chat_chunker, &mut absorbed)
             .await;
 
         let rows = count_memory(&store).await;
-        assert_eq!(rows, 1, "two identical chunks in one event must insert exactly one row; got {rows}");
-        assert_eq!(absorbed, 1, "one duplicate copy absorbed within the event");
+        assert_eq!(rows, 1, "identical chunks in one event must insert exactly one row; got {rows}");
+        assert_eq!(absorbed, 6, "every other copy absorbed within the event");
 
         let access_count: i64 = store.conn
             .call(|c| c.query_row("SELECT access_count FROM memory LIMIT 1", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(access_count, 2, "access_count must be insert(1) + intra-event reinforce replay(1) = 2");
+        assert_eq!(access_count, 7, "access_count must be insert(1) + intra-event reinforce replays(6) = 7");
     }
 
-    /// Event `[A, A]` where `A` is ALREADY in the store (from a prior event):
+    /// Event `[A, …, A]` where `A` is ALREADY in the store (from a prior event):
     /// collapsing first and gating once per survivor would under-count —
     /// today's per-chunk loop hits the gate twice for this input. Both copies
     /// must be replayed through `absorb_duplicate`, so `absorbed` must move
-    /// by 2, not 1.
+    /// by the number of copies, not 1.
     #[tokio::test]
     async fn existing_duplicate_chunks_absorb_once_per_copy_not_once_per_event() {
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
@@ -2472,28 +2474,28 @@ mod tests {
         let cell = Arc::new(cell);
         let chat_chunker = Arc::new(ChatChunker::with_fallback());
 
-        // Seed the store with ONE row for chunk A ("x" * 1696), which fits
+        // Seed the store with ONE row for chunk A ("x" * 384), which fits
         // in one piece and is stored whole.
         let mut absorbed: u64 = 0;
-        let seed_evt = make_event(Role::User, &"x".repeat(1696), None, 1);
+        let seed_evt = make_event(Role::User, &"x".repeat(384), None, 1);
         process_event(&seed_evt, &store, &cell, &chat_chunker, &mut absorbed)
             .await;
         assert_eq!(absorbed, 0, "seed insert has no prior row to reinforce");
         assert_eq!(count_memory(&store).await, 1);
 
-        // Now send an event carrying TWO copies of the already-stored chunk A.
-        // 3136 bytes (piece cap + stride), not more: with overlap a longer
-        // run would produce a third, shorter window distinct from A — a
-        // brand-new chunk this test isn't about. 3136 keeps the fixture to
-        // exactly two 1696-byte windows, both == A.
+        // Now send an event carrying seven copies of the already-stored chunk
+        // A. 2112 bytes (piece cap + 6 strides), not a byte more: with
+        // overlap a longer run would produce a shorter window distinct from
+        // A — a brand-new chunk this test isn't about. 2112 keeps the fixture
+        // to exactly seven 384-byte windows, all == A.
         absorbed = 0;
-        let dup_evt = make_event(Role::User, &"x".repeat(3136), None, 2);
+        let dup_evt = make_event(Role::User, &"x".repeat(2112), None, 2);
         process_event(&dup_evt, &store, &cell, &chat_chunker, &mut absorbed)
             .await;
 
         assert_eq!(
-            absorbed, 2,
-            "both copies of an already-stored chunk must be absorbed individually, not collapsed into one absorb"
+            absorbed, 7,
+            "every copy of an already-stored chunk must be absorbed individually, not collapsed into one absorb"
         );
         assert_eq!(count_memory(&store).await, 1, "no new row inserted for an already-present chunk");
 
@@ -2501,7 +2503,7 @@ mod tests {
             .call(|c| c.query_row("SELECT access_count FROM memory LIMIT 1", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(access_count, 3, "seed insert(1) + two reinforce hits(+2) = 3");
+        assert_eq!(access_count, 8, "seed insert(1) + seven reinforce hits(+7) = 8");
     }
 
     /// Integration-level counterpart of the unit-level boundary test in
