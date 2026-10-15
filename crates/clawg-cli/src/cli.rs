@@ -94,6 +94,16 @@ pub enum Command {
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Show which agents may read which agents' memories, or change it with
+    /// `grant` and `revoke`. Nothing is shared until granted; a change counts
+    /// from the next search, with the daemon running. Check `clawg secrets`
+    /// before granting: a shared memory reaches the other agent's provider.
+    Sharing {
+        #[command(subcommand)]
+        action: Option<SharingAction>,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
     /// Report which `clawg` executables the PATH resolves to and whether this
     /// one is the one a terminal runs. Exits 1 if shadowed or duplicated.
     Doctor {
@@ -111,6 +121,47 @@ pub enum Command {
         #[command(subcommand)]
         action: PathAction,
     },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum SharingAction {
+    /// Let READER read the memories AUTHOR saves. Only that way round.
+    Grant(Grant),
+    /// Take a grant away.
+    Revoke(Grant),
+}
+
+impl SharingAction {
+    /// The `--profile` the action was given, if any.
+    pub fn profile(&self) -> &ProfileArg {
+        match self {
+            SharingAction::Grant(g) | SharingAction::Revoke(g) => &g.profile,
+        }
+    }
+}
+
+/// One directed grant: READER may read what AUTHOR saved.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct Grant {
+    /// The agent that reads, as `memory_status` names it.
+    #[arg(value_parser = parse_agent)]
+    pub reader: String,
+    /// The agent whose memories it reads.
+    #[arg(value_parser = parse_agent)]
+    pub author: String,
+    #[command(flatten)]
+    pub profile: ProfileArg,
+}
+
+impl Grant {
+    /// Refuses a grant to oneself: an agent always reads its own memories, and
+    /// accepting it would tell the user something changed when nothing did.
+    pub fn check(&self) -> Result<(), String> {
+        if self.reader == self.author {
+            return Err(format!("{} always reads its own memories", self.reader));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -435,6 +486,35 @@ mod tests {
                 agent: Some("claude-code".into()),
             }
         );
+    }
+
+    #[test]
+    fn sharing_shows_grants_and_revokes() {
+        assert_eq!(
+            parse(&["clawg", "sharing"]).command,
+            Command::Sharing { action: None, profile: ProfileArg { profile: None } }
+        );
+        let grant = Grant { reader: "cursor".into(), author: "claude-code".into(), profile: ProfileArg { profile: Some("dev".into()) } };
+        assert_eq!(
+            parse(&["clawg", "sharing", "grant", " cursor ", "claude-code", "--profile", "dev"]).command,
+            Command::Sharing { action: Some(SharingAction::Grant(grant.clone())), profile: ProfileArg { profile: None } }
+        );
+        assert_eq!(
+            parse(&["clawg", "sharing", "revoke", "cursor", "claude-code", "--profile", "dev"]).command,
+            Command::Sharing { action: Some(SharingAction::Revoke(grant)), profile: ProfileArg { profile: None } }
+        );
+    }
+
+    #[test]
+    fn sharing_rejects_a_blank_or_self_grant() {
+        assert!(Cli::try_parse_from(["clawg", "sharing", "grant", " ", "claude-code"]).is_err());
+        assert!(Cli::try_parse_from(["clawg", "sharing", "grant", "cursor"]).is_err(), "both agents are needed");
+        let Command::Sharing { action: Some(SharingAction::Grant(g)), .. } =
+            parse(&["clawg", "sharing", "grant", "cursor", "cursor"]).command
+        else {
+            panic!("expected a grant");
+        };
+        assert_eq!(g.check(), Err("cursor always reads its own memories".to_string()));
     }
 
     #[test]
