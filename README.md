@@ -51,53 +51,53 @@ cd claw-garden
 
 ### Paso 3. Compilar
 
-```powershell
-rustup run stable-x86_64-pc-windows-msvc cargo build --release -p clawg-cli
-```
-
-Tarda unos minutos la primera vez y necesita internet. Al terminar existe el archivo `target\release\clawg.exe`.
-
-Se usa `rustup run stable-x86_64-pc-windows-msvc` a propósito: elige el `cargo` del toolchain MSVC. Pero **no alcanza si tenés otro Rust instalado**: ese `cargo` busca `rustc` en el PATH y usa el primero que encuentra.
-
-**Antes de compilar, comprobá cuántos `rustc` tenés:**
+Primero comprobá qué `rustc` encuentra tu PATH:
 
 ```powershell
 Get-Command rustc -All
 ```
 
-- **Si aparece una sola línea**, o la primera es `C:\Users\<tu-usuario>\.cargo\bin\rustc.exe`, usá el comando de arriba tal cual.
-- **Si la primera es otra**, por ejemplo `C:\msys64\mingw64\bin\rustc.exe`, tenés dos Rust instalados. Compilá como dice la sección siguiente.
+- **Si la primera línea es `C:\Users\<tu-usuario>\.cargo\bin\rustc.exe`** (el de `rustup`), compilá:
+
+  ```powershell
+  rustup run stable-x86_64-pc-windows-msvc cargo build --release -p clawg-cli
+  ```
+
+- **Si la primera es otra**, por ejemplo `C:\msys64\mingw64\bin\rustc.exe`, hay otro Rust delante del de `rustup`. Seguí [Si tenés dos Rust instalados](#si-tenés-dos-rust-instalados).
+
+Tarda unos minutos la primera vez y necesita internet. Al terminar existe el archivo `target\release\clawg.exe`.
+
+`rustup run stable-x86_64-pc-windows-msvc` compila con el toolchain MSVC aunque tu toolchain por defecto sea otro, y sin cambiarlo. Lo que no hace es esquivar el PATH: el `cargo` que lanza busca `rustc` en el PATH y usa el primero que encuentra. Por eso la comprobación va antes.
 
 #### Si tenés dos Rust instalados
 
-Pasa cuando además de `rustup` tenés el Rust de MSYS2 (u otro) antes en el PATH. Ese `rustc` es GNU: compila las dependencias con el compilador equivocado y la compilación falla con alguno de estos errores:
+Pasa cuando otro Rust, normalmente el de MSYS2, está antes que `rustup` en el PATH. Ese `rustc` es GNU, y la compilación falla con alguno de estos errores:
 
 - ``could not find native static library `onnxruntime`, perhaps an -L flag is missing?``
 - `E0514` / `compiled by an incompatible version of rustc`
 
-Los dos pueden decir `rustc 1.91.1`, pero son compiladores distintos. Para verlo, corré `rustc -vV`: si dice `Built by MSYS2 project` o `host: x86_64-pc-windows-gnu`, es el de MSYS2.
+`rustc -vV` lo confirma: dice `Built by MSYS2 project` o `host: x86_64-pc-windows-gnu`. Un `cargo clean` solo no lo arregla, porque la próxima compilación vuelve a usar el mismo `rustc`.
 
-**`cargo clean` solo no lo arregla.** Borra lo compilado, pero la próxima compilación vuelve a usar el mismo `rustc` equivocado.
+**Si no usás el Rust de MSYS2 para otra cosa**, desinstalalo desde la terminal de MSYS2:
 
-La solución es decirle a `cargo` exactamente qué `rustc` usar con la variable `RUSTC`. No hace falta buscar la ruta a mano, `rustup` te la da:
-
-```powershell
-rustup which rustc --toolchain stable-x86_64-pc-windows-msvc
+```bash
+pacman -R mingw-w64-x86_64-rust
 ```
 
-Imprime algo como `C:\Users\<tu-usuario>\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\rustc.exe`.
+Después abrí una PowerShell nueva y comprobá que `Get-Command rustc -All` muestre sólo el de `.cargo\bin`. Antes de compilar, borrá lo que haya quedado compilado con el otro `rustc`:
 
-**Todo en una sola línea** (fija `RUSTC`, borra los restos del intento anterior y compila):
+```powershell
+rustup run stable-x86_64-pc-windows-msvc cargo clean --release
+rustup run stable-x86_64-pc-windows-msvc cargo build --release -p clawg-cli
+```
+
+**Si lo necesitás**, decile a `cargo` qué `rustc` usar con la variable `RUSTC`, que tiene prioridad sobre el PATH. Todo en una línea:
 
 ```powershell
 $env:RUSTC = rustup which rustc --toolchain stable-x86_64-pc-windows-msvc; rustup run stable-x86_64-pc-windows-msvc cargo clean --release; rustup run stable-x86_64-pc-windows-msvc cargo build --release -p clawg-cli
 ```
 
-- `$env:RUSTC = ...` guarda en `RUSTC` la ruta que imprime `rustup which`. `cargo` usa esa variable antes que el PATH.
-- `cargo clean --release` borra `target\release`, que puede tener restos compilados con el otro `rustc`. Mezclarlos rompe la compilación.
-- La variable vale **sólo para esa ventana de PowerShell**. Si abrís otra para volver a compilar, repetí la línea.
-
-Para no tener que repetirla: si no usás el Rust de MSYS2 para otra cosa, desinstalalo desde la terminal de MSYS2 con `pacman -R mingw-w64-x86_64-rust`. Después `Get-Command rustc -All` muestra un solo `rustc` y alcanza con el comando normal.
+La variable vale sólo para esa ventana de PowerShell: si compilás desde otra, repetí la línea.
 
 ### Paso 4. Instalar
 
@@ -107,7 +107,7 @@ El script de instalación busca `clawg.exe` **al lado de sí mismo**, así que p
 Copy-Item target\release\clawg.exe scripts\clawg.exe; powershell -ExecutionPolicy Bypass -File scripts\install.ps1
 ```
 
-Al terminar muestra `clawg 0.1.0` e `Installed to ...`.
+Al terminar muestra la versión (por ejemplo `clawg 0.2.0`) e `Installed to ...`.
 
 El script:
 
@@ -140,7 +140,7 @@ En la terminal nueva, corré estos tres comandos uno por uno.
 clawg --version
 ```
 
-Imprime `clawg 0.1.0` (o la versión actual). Si dice que no reconoce el comando, no abriste una terminal nueva o el PATH no se actualizó.
+Imprime la versión, por ejemplo `clawg 0.2.0`. Si dice que no reconoce el comando, no abriste una terminal nueva o el PATH no se actualizó.
 
 **2. El diagnóstico del PATH**
 
@@ -266,7 +266,7 @@ Desde la próxima búsqueda, `cursor` deja de encontrar lo que guardó `claude-c
 - Una memoria compartida llega al proveedor del otro agente. `clawg secrets` lista las que guardan un secreto que el enmascarado reconoce.
 - Si `sharing.json` queda inválido, ningún agente lee a otro hasta que lo arregles, y `memory_status` dice por qué.
 
-El agente dispone de seis herramientas (ver [Herramientas MCP](#herramientas-mcp)).
+Las herramientas que recibe el agente están en [Herramientas MCP](#herramientas-mcp).
 
 ## Otros clientes MCP
 
@@ -290,21 +290,11 @@ El camino probado hoy es Claude Code. La configuración de otros clientes sigue 
 **Al compilar: `ort does not provide prebuilt binaries for the target x86_64-pc-windows-gnu`.**
 Estás compilando con el toolchain GNU. Usá el comando del paso 3 tal cual, con `rustup run stable-x86_64-pc-windows-msvc`. Si tampoco anda, tenés dos Rust instalados: seguí [Si tenés dos Rust instalados](#si-tenés-dos-rust-instalados).
 
-**Al compilar: ``could not find native static library `onnxruntime`, perhaps an -L flag is missing?``.**
-El `rustc` que usa `cargo` es el de MSYS2 (u otro GNU), no el de `rustup`. Volver a correr `cargo clean` no lo arregla. Compilá con la línea de [Si tenés dos Rust instalados](#si-tenés-dos-rust-instalados).
+**Al compilar: ``could not find native static library `onnxruntime` `` o errores `E0514` / `compiled by an incompatible version of rustc`.**
+`cargo` usó el `rustc` de otro Rust (normalmente MSYS2) en vez del de `rustup`. Seguí [Si tenés dos Rust instalados](#si-tenés-dos-rust-instalados). Si ya lo sacaste del PATH y el error sigue, quedan restos compilados por él: corré los dos comandos de esa sección, `cargo clean --release` y la compilación.
 
-**Al compilar: cientos de errores en `tokio` u otras dependencias, con `E0514` o `compiled by an incompatible version of rustc`.**
-Hay restos compilados por otro `rustc` en `target\release`, normalmente de un intento anterior con el toolchain GNU o con el Rust de MSYS2. Aunque ambos digan `rustc 1.91.1`, son compiladores distintos. Si `Get-Command rustc -All` muestra un solo `rustc`, alcanza con borrar y compilar de nuevo:
-
-```powershell
-rustup run stable-x86_64-pc-windows-msvc cargo clean --release
-rustup run stable-x86_64-pc-windows-msvc cargo build --release -p clawg-cli
-```
-
-Si muestra más de uno, esos dos comandos vuelven a fallar porque se compila otra vez con el `rustc` equivocado. Usá la línea de [Si tenés dos Rust instalados](#si-tenés-dos-rust-instalados).
-
-**Al compilar: `rustup toolchain install` falla con `detected conflict: 'bin\cargo.exe'`.**
-Significa que el toolchain MSVC **ya estaba instalado** y rustup intentó actualizarlo. No hace falta reinstalarlo: saltá al paso 3.
+**Al instalar el toolchain: `rustup toolchain install` falla con `detected conflict: 'bin\cargo.exe'`.**
+Significa que el toolchain MSVC **ya estaba instalado** y rustup intentó actualizarlo. No hace falta reinstalarlo: seguí con el paso 2.
 
 **Al compilar: error de `link.exe` o del linker.**
 Faltan las Build Tools de Visual Studio con el componente de C++ (paso 1, punto 3).
@@ -390,6 +380,7 @@ En Windows usá la ruta completa a `clawg.exe`. Los nombres `clawg-dev` y `clawg
 - `delete_memory`: borra una memoria del agente por id y tipo.
 - `update_memory`: corrige la importancia o el tipo de una memoria del agente. Si el campo que cambia era lo que la tenía en tier 1, la saca; lo que ganó por uso se queda.
 - `resolve_conflict`: cierra un conflicto de ACTIVE CONFLICTS con la respuesta del usuario: una memoria queda y la otra pasa a reemplazada, o quedan las dos.
+- `synthesize`: repasa las memorias en busca de conclusiones. Devuelve las que ninguna conclusión cubre todavía, las conclusiones ya sacadas y cómo guardar una nueva (con `save_memory` y `derived_from`). Las memorias en que se apoya una conclusión no cambian, y quedan marcadas como revisadas aunque no se guarde nada.
 - `memory_status`: informa si el daemon está corriendo, su perfil y su directorio de datos, si el modelo de embeddings ya cargó, con qué agente guarda y busca, y a qué otros agentes lee.
 
 ### Perfiles y datos
