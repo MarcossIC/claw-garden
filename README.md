@@ -238,7 +238,7 @@ Después **abrí una sesión nueva** de Claude Code. Adentro:
 
 ### Fijar la identidad del agente
 
-Cada agente es dueño de sus memorias: las lista, las cambia, las borra y resuelve sus conflictos, pero no los de otro. Al buscar, también encuentra lo que guardaron los demás (ver [Compartir memorias entre agentes](#compartir-memorias-entre-agentes)). Sin configurar nada, el agente es el nombre que reporta el cliente MCP. Si el cliente cambia ese nombre, o deja de mandarlo (la versión nueva del protocolo lo vuelve opcional), lo guardado antes deja de verse.
+Cada agente es dueño de sus memorias: las lista, las cambia, las borra y resuelve sus conflictos, pero no los de otro. Al buscar, también encuentra lo que guardaron los demás (ver [Compartir memorias entre agentes](#compartir-memorias-entre-agentes)). Sin configurar nada, el agente es el nombre que reporta el cliente MCP. Si el cliente cambia ese nombre, o deja de mandarlo (la versión nueva del protocolo lo vuelve opcional), lo guardado antes queda a nombre del agente viejo: la búsqueda lo sigue encontrando, marcado como de otro agente, pero el nuevo no lo puede listar, cambiar, borrar ni resolver como propio.
 
 Para que no pase, fijalo con `--agent` al registrar el servidor:
 
