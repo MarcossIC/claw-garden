@@ -8,10 +8,15 @@
 /// Share of the best hit's score another hit needs to be shown.
 ///
 /// Relative, not absolute: measured on the golden set, the score of the
-/// expected memory and of the rest overlap (0.15–0.51 against up to 0.47), so
+/// expected memory and of the rest overlap (0.03–0.41 against up to 0.38), so
 /// no fixed floor separates them, while a clear winner can still shorten the
 /// list for free.
-pub const RELEVANCE_RATIO: f64 = 0.6;
+///
+/// Measured with `rag-eval --agent-view` on mean-pooled vectors, whose best
+/// score has a median of 0.19: 0.35 shows the expected memory in 36 of 46
+/// queries at 764 tokens on average, where 0.6 showed 30 at 455 and 0.2
+/// shows 37 at 894.
+pub const RELEVANCE_RATIO: f64 = 0.35;
 
 /// Hits shown regardless of score.
 pub const MIN_SHOWN_HITS: usize = 2;
@@ -33,13 +38,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn relevance_ratio_pins_the_shipped_value() {
+        assert_eq!(RELEVANCE_RATIO, 0.35);
+    }
+
+    #[test]
     fn hits_far_below_the_best_match_are_not_shown() {
-        assert_eq!(relevant_len(&[0.50, 0.40, 0.31, 0.29, 0.10], RELEVANCE_RATIO), 3);
+        assert_eq!(relevant_len(&[0.20, 0.15, 0.08, 0.06, 0.02], RELEVANCE_RATIO), 3);
     }
 
     #[test]
     fn a_hit_exactly_at_the_ratio_is_shown() {
-        assert_eq!(relevant_len(&[0.50, 0.40, 0.30], RELEVANCE_RATIO), 3);
+        let best = 0.40;
+        assert_eq!(relevant_len(&[best, 0.30, RELEVANCE_RATIO * best], RELEVANCE_RATIO), 3);
     }
 
     /// When every score is low the best one is no clear winner, and the runner
@@ -47,7 +58,7 @@ mod tests {
     /// whose answer scored 0.04 under a best of 0.10.
     #[test]
     fn the_two_best_are_shown_whatever_they_score() {
-        assert_eq!(relevant_len(&[0.10, 0.04, 0.01], RELEVANCE_RATIO), 2);
+        assert_eq!(relevant_len(&[0.10, 0.02, 0.01], RELEVANCE_RATIO), 2);
     }
 
     #[test]

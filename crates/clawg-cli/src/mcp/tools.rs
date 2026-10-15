@@ -375,7 +375,7 @@ mod tests {
 
     #[test]
     fn relevant_hits_keeps_the_ones_the_cut_lets_through_in_order() {
-        let kept = relevant_hits(scored(&[0.50, 0.40, 0.31, 0.29, 0.10]));
+        let kept = relevant_hits(scored(&[0.20, 0.15, 0.08, 0.06, 0.02]));
         assert_eq!(ids(&kept), [1, 2, 3]);
     }
 
