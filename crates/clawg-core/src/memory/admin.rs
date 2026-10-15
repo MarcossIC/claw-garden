@@ -1002,6 +1002,7 @@ mod tests {
             score: 0.0,
             distance: 0.0,
             created_at: TimestampMs::from_unix_millis(0),
+            agent_id: None,
             piece: None,
         }
     }
@@ -1843,6 +1844,7 @@ mod tests {
             score: 0.0,
             distance: 0.0,
             created_at: TimestampMs::from_unix_millis(0),
+            agent_id: None,
             piece: None,
         }
     }
@@ -2667,6 +2669,7 @@ mod tests {
             score: 0.0,
             distance: 0.0,
             created_at: TimestampMs::from_unix_millis(0),
+            agent_id: None,
             piece: None,
         }];
 

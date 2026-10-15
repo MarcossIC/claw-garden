@@ -12,6 +12,8 @@
 use std::path::Path;
 
 use clawg_core::memory::dispute::{Resolution, ResolvedRow};
+use clawg_core::memory::prompt_builder::SHARED_NOTE;
+use clawg_core::memory::sharing::{Reach, SharingError, SharingPolicy};
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
 
@@ -61,24 +63,35 @@ pub fn relevant_hits(mut hits: Vec<Hit>) -> Vec<Hit> {
     hits
 }
 
-/// What `search_memory` hands the model for a search's hits.
-pub fn format_search(hits: Vec<Hit>) -> String {
-    format_hits(&relevant_hits(hits))
+/// What `search_memory` hands the model for a search's hits, as `reader`.
+pub fn format_search(hits: Vec<Hit>, reader: &str) -> String {
+    format_hits(&relevant_hits(hits), reader)
 }
 
-/// Renders search hits as a numbered list, or says plainly that there were none.
-fn format_hits(hits: &[Hit]) -> String {
+/// The author of a hit `reader` did not save, if any. A hit without an author
+/// comes from a daemon that predates sharing, where every hit was the
+/// reader's own.
+fn shared_author<'a>(hit: &'a Hit, reader: &str) -> Option<&'a str> {
+    hit.agent_id.as_deref().filter(|a| *a != reader)
+}
+
+/// Renders search hits as a numbered list, or says plainly that there were
+/// none. A hit another agent saved names it, and the list then ends with the
+/// note on how to read such hits.
+fn format_hits(hits: &[Hit], reader: &str) -> String {
     if hits.is_empty() {
         // A sentence, not an empty string: a model reading `""` cannot tell a
         // successful empty search from a broken tool.
         return "no memories found".to_string();
     }
-    hits.iter()
+    let mut lines: Vec<String> = hits
+        .iter()
         .enumerate()
         .map(|(i, h)| {
             let piece = h.piece.map(|p| format!(" piece={}/{}", p.piece, p.pieces)).unwrap_or_default();
+            let by = shared_author(h, reader).map(|a| format!(" by {a}")).unwrap_or_default();
             format!(
-                "{}. #{} [{}/{}/t{}{piece} score={:.2}] {}",
+                "{}. #{} [{}/{}/t{}{piece} score={:.2}{by}] {}",
                 i + 1,
                 h.id,
                 h.kind,
@@ -88,8 +101,11 @@ fn format_hits(hits: &[Hit]) -> String {
                 truncate_content(&h.content, CONTENT_PREVIEW_LIMIT)
             )
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+    if hits.iter().any(|h| shared_author(h, reader).is_some()) {
+        lines.push(SHARED_NOTE.to_string());
+    }
+    lines.join("\n")
 }
 
 /// One line per side of a resolved dispute, the kept row first.
@@ -297,17 +313,36 @@ pub fn resolve_project(
     }
 }
 
-/// Renders `memory_status`: the daemon's health as pretty JSON, plus the two
-/// facts health cannot carry — which data directory and which profile this
-/// bridge is attached to.
-pub fn format_status(health: &Health, profile: Profile, base_dir: &Path, agent: &str, origin: &str) -> String {
+/// The `memory_status` line on whose memories `reader` reads besides its own.
+pub fn format_sharing(policy: &Result<SharingPolicy, SharingError>, reader: &str) -> String {
+    match policy {
+        Ok(p) => match p.reach_for(reader) {
+            Reach::Own => "shared: none (reads only its own)".to_string(),
+            Reach::AllBut(hidden) if hidden.is_empty() => "shared: reads every agent".to_string(),
+            Reach::AllBut(hidden) => format!("shared: reads every agent but {}", hidden.join(", ")),
+        },
+        Err(e) => format!("shared: none ({e})"),
+    }
+}
+
+/// Renders `memory_status`: the daemon's health as pretty JSON, plus the
+/// facts health cannot carry — which data directory, profile and agent this
+/// bridge is attached to, and whose memories the agent reads.
+pub fn format_status(
+    health: &Health,
+    profile: Profile,
+    base_dir: &Path,
+    agent: &str,
+    origin: &str,
+    sharing: &str,
+) -> String {
     // `to_string_pretty` on a struct that always serializes cannot fail; the
     // fallback exists so this function has no panic in it rather than because
     // the branch is reachable.
     let json = serde_json::to_string_pretty(health)
         .unwrap_or_else(|_| format!("{{\"status\":\"{}\"}}", health.status));
     format!(
-        "{json}\n\nprofile: {}\ndata dir: {}\nagent: {agent} ({origin})",
+        "{json}\n\nprofile: {}\ndata dir: {}\nagent: {agent} ({origin})\n{sharing}",
         profile.as_str(),
         base_dir.display()
     )
@@ -325,6 +360,7 @@ mod tests {
             memory_type: memory_type.into(),
             tier,
             score,
+            agent_id: None,
             piece: None,
         }
     }
@@ -345,7 +381,7 @@ mod tests {
 
     #[test]
     fn the_search_output_shows_only_the_relevant_hits() {
-        let text = format_search(scored(&[0.50, 0.10, 0.05]));
+        let text = format_search(scored(&[0.50, 0.10, 0.05]), "a");
         assert!(text.contains("#1 ") && text.contains("#2 "), "{text}");
         assert!(!text.contains("#3 "), "{text}");
     }
@@ -402,7 +438,7 @@ mod tests {
 
     #[test]
     fn format_hits_says_so_when_there_are_none() {
-        assert_eq!(format_hits(&[]), "no memories found");
+        assert_eq!(format_hits(&[], "a"), "no memories found");
     }
 
     #[test]
@@ -410,7 +446,7 @@ mod tests {
         let out = format_hits(&[
             hit(42, "Memory", "semantic_fact", 2, 0.876, "first"),
             hit(7, "Procedural", "procedural_skill", 1, 0.5, "second"),
-        ]);
+        ], "a");
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("1. #42 "), "line was: {}", lines[0]);
@@ -419,7 +455,7 @@ mod tests {
 
     #[test]
     fn format_hits_carries_kind_type_tier_and_score() {
-        let out = format_hits(&[hit(42, "Memory", "semantic_fact", 2, 0.876, "content here")]);
+        let out = format_hits(&[hit(42, "Memory", "semantic_fact", 2, 0.876, "content here")], "a");
         assert!(out.contains("Memory/semantic_fact/t2"), "out was: {out}");
         assert!(out.contains("score=0.88"), "score must be readable, not raw f64: {out}");
         assert!(out.contains("content here"), "out was: {out}");
@@ -428,7 +464,7 @@ mod tests {
     #[test]
     fn format_hits_truncates_long_content() {
         let long = "x".repeat(CONTENT_PREVIEW_LIMIT + 100);
-        let out = format_hits(&[hit(1, "Memory", "chat_message", 3, 0.1, &long)]);
+        let out = format_hits(&[hit(1, "Memory", "chat_message", 3, 0.1, &long)], "a");
         assert!(out.ends_with('…'), "out ended: {:?}", &out[out.len().saturating_sub(20)..]);
         assert!(out.len() < long.len(), "the preview must be shorter than the content");
     }
@@ -437,7 +473,7 @@ mod tests {
     fn format_hits_names_the_piece_of_a_long_save() {
         let mut piece = hit(58, "Memory", "semantic_fact", 3, 0.81, "the retry budget was set");
         piece.piece = Some(crate::client::PiecePosition { piece: 2, pieces: 4 });
-        let out = format_hits(&[piece, hit(7, "Memory", "semantic_fact", 3, 0.5, "a short one")]);
+        let out = format_hits(&[piece, hit(7, "Memory", "semantic_fact", 3, 0.5, "a short one")], "a");
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "1. #58 [Memory/semantic_fact/t3 piece=2/4 score=0.81] the retry budget was set");
         assert_eq!(lines[1], "2. #7 [Memory/semantic_fact/t3 score=0.50] a short one");
@@ -447,7 +483,7 @@ mod tests {
     /// the numbering meaningless to whoever is reading it.
     #[test]
     fn format_hits_keeps_each_hit_on_one_line() {
-        let out = format_hits(&[hit(1, "Memory", "chat_message", 3, 0.1, "two\nlines")]);
+        let out = format_hits(&[hit(1, "Memory", "chat_message", 3, 0.1, "two\nlines")], "a");
         assert_eq!(out.lines().count(), 1, "out was: {out:?}");
     }
 
@@ -713,7 +749,7 @@ mod tests {
 
     #[test]
     fn format_status_includes_the_health_json_the_data_dir_and_the_profile() {
-        let out = format_status(&health(), Profile::Dev, Path::new("/home/u/.clawg-dev"), "a", "from --agent");
+        let out = format_status(&health(), Profile::Dev, Path::new("/home/u/.clawg-dev"), "a", "from --agent", "shared: none");
         assert!(out.contains("\"pid\": 4242"), "health must be pretty JSON: {out}");
         assert!(out.contains("loading"), "out was: {out}");
         assert!(out.contains(".clawg-dev"), "the data dir must be named: {out}");
@@ -722,7 +758,49 @@ mod tests {
 
     #[test]
     fn format_status_names_the_agent() {
-        let out = format_status(&health(), Profile::Dev, Path::new("/d"), "claude-code", "from --agent");
-        assert!(out.ends_with("agent: claude-code (from --agent)"), "out was: {out}");
+        let out = format_status(&health(), Profile::Dev, Path::new("/d"), "claude-code", "from --agent", "shared: none");
+        assert!(out.contains("\nagent: claude-code (from --agent)\n"), "out was: {out}");
+    }
+
+    #[test]
+    fn format_status_says_whom_the_agent_reads() {
+        let policy = SharingPolicy::parse(r#"{"version":1,"hides":{"cursor":["codex","claude-code"],"aider":["*"]}}"#);
+        assert_eq!(format_sharing(&policy, "cursor"), "shared: reads every agent but claude-code, codex");
+        assert_eq!(format_sharing(&policy, "codex"), "shared: reads every agent");
+        assert_eq!(format_sharing(&policy, "aider"), "shared: none (reads only its own)");
+        let broken = SharingPolicy::parse(r#"{"version":2}"#);
+        let line = format_sharing(&broken, "cursor");
+        assert!(line.starts_with("shared: none (") && line.contains("version 2"), "{line}");
+
+        let out = format_status(&health(), Profile::Dev, Path::new("/d"), "cursor", "from --agent", &format_sharing(&policy, "cursor"));
+        assert!(out.ends_with("\nshared: reads every agent but claude-code, codex"), "out was: {out}");
+    }
+
+    fn by(mut h: Hit, author: &str) -> Hit {
+        h.agent_id = Some(author.into());
+        h
+    }
+
+    #[test]
+    fn format_search_marks_shared_hits_and_adds_the_note() {
+        let hits = vec![
+            by(hit(1, "Memory", "semantic_fact", 2, 0.80, "propia"), "cursor"),
+            by(hit(2, "Memory", "semantic_fact", 3, 0.70, "ajena"), "claude-code"),
+        ];
+        let out = format_search(hits, "cursor");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "1. #1 [Memory/semantic_fact/t2 score=0.80] propia");
+        assert_eq!(lines[1], "2. #2 [Memory/semantic_fact/t3 score=0.70 by claude-code] ajena");
+        assert_eq!(lines[2], SHARED_NOTE);
+        assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn format_search_leaves_own_hits_alone() {
+        let own = vec![by(hit(1, "Memory", "semantic_fact", 2, 0.80, "propia"), "cursor"), hit(2, "Memory", "semantic_fact", 3, 0.70, "vieja")];
+        assert_eq!(
+            format_search(own, "cursor"),
+            "1. #1 [Memory/semantic_fact/t2 score=0.80] propia\n2. #2 [Memory/semantic_fact/t3 score=0.70] vieja"
+        );
     }
 }

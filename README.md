@@ -238,7 +238,7 @@ Después **abrí una sesión nueva** de Claude Code. Adentro:
 
 ### Fijar la identidad del agente
 
-Cada agente ve sólo sus propias memorias: las busca, las lista, las borra y resuelve sus conflictos, pero no los de otro. Sin configurar nada, el agente es el nombre que reporta el cliente MCP. Si el cliente cambia ese nombre, o deja de mandarlo (la versión nueva del protocolo lo vuelve opcional), lo guardado antes deja de verse.
+Cada agente es dueño de sus memorias: las lista, las cambia, las borra y resuelve sus conflictos, pero no los de otro. Al buscar, también encuentra lo que guardaron los demás (ver [Compartir memorias entre agentes](#compartir-memorias-entre-agentes)). Sin configurar nada, el agente es el nombre que reporta el cliente MCP. Si el cliente cambia ese nombre, o deja de mandarlo (la versión nueva del protocolo lo vuelve opcional), lo guardado antes queda a nombre del agente viejo: la búsqueda lo sigue encontrando, marcado como de otro agente, pero el nuevo no lo puede listar, cambiar, borrar ni resolver como propio.
 
 Para que no pase, fijalo con `--agent` al registrar el servidor:
 
@@ -247,6 +247,24 @@ claude mcp add --scope user clawg -- "$env:LOCALAPPDATA\Programs\clawg\clawg.exe
 ```
 
 Usá el mismo nombre con el que ya venías guardando, o lo anterior queda con el nombre viejo: `memory_status` dice qué agente está en uso y de dónde salió, y `clawg memories stats` cuenta las memorias por agente. Nada se borra al cambiarlo; vuelve a verse con el nombre anterior.
+
+### Compartir memorias entre agentes
+
+Todos los agentes leen lo que guardaron los demás: lo que Claude Code aprendió de vos le sirve a Cursor cuando busca. Lo compartido le llega al agente marcado `by claude-code`, como información para verificar y no como instrucciones, y es de sólo lectura: sólo su autor puede cambiarlo o borrarlo. El workspace y los conflictos de cada agente siguen siendo suyos.
+
+Para que un agente no lea a otro, excluilo desde una terminal:
+
+```powershell
+clawg sharing hide cursor claude-code --profile prod
+```
+
+Desde la próxima búsqueda, `cursor` deja de encontrar lo que guardó `claude-code`, sin reiniciar nada. La exclusión va en una sola dirección: `claude-code` sigue leyendo a `cursor`. `*` vale por cualquier agente: `hide '*' codex` hace que nadie lea a `codex`, `hide codex '*'` que `codex` no lea a nadie, y `hide '*' '*'` vuelve a dejar a cada agente con lo suyo.
+
+- `clawg sharing` muestra las exclusiones; `clawg sharing unhide cursor claude-code` quita una.
+- `memory_status` dice a quién lee el agente.
+- Los nombres son los que muestra `memory_status`, con las mismas mayúsculas.
+- Una memoria compartida llega al proveedor del otro agente. `clawg secrets` lista las que guardan un secreto que el enmascarado reconoce.
+- Si `sharing.json` queda inválido, ningún agente lee a otro hasta que lo arregles, y `memory_status` dice por qué.
 
 El agente dispone de seis herramientas (ver [Herramientas MCP](#herramientas-mcp)).
 
@@ -364,7 +382,7 @@ En Windows usá la ruta completa a `clawg.exe`. Los nombres `clawg-dev` y `clawg
 ### Herramientas MCP
 
 - `save_memory`: guarda un hecho, preferencia o decisión para que sobreviva entre sesiones.
-- `search_memory`: busca memorias relacionadas con una consulta, con ids, tipos y puntajes de relevancia.
+- `search_memory`: busca memorias relacionadas con una consulta, con ids, tipos y puntajes de relevancia. Lo que guardó otro agente va marcado `by <agente>`.
 - `recall_context`: devuelve un bloque de contexto listo para leer (notas del workspace, memorias recientes y de largo plazo) para una consulta.
 - `search_project`: busca en la documentación del proyecto (los Markdown y los manifiestos como `Cargo.toml` o `package.json`, respetando `.gitignore`) y en su código Rust, Python y TypeScript, partido por definición, y devuelve cada pasaje con su ruta de encabezados o de definiciones. Sirve para preguntas sobre cómo funciona el proyecto. El índice se arma solo la primera vez que el agente abre el proyecto y se pone al día cuando cambian los archivos.
 - `list_memories`: recorre las memorias del agente, las más nuevas primero, sin buscar.
@@ -372,7 +390,7 @@ En Windows usá la ruta completa a `clawg.exe`. Los nombres `clawg-dev` y `clawg
 - `delete_memory`: borra una memoria del agente por id y tipo.
 - `update_memory`: corrige la importancia o el tipo de una memoria del agente. Si el campo que cambia era lo que la tenía en tier 1, la saca; lo que ganó por uso se queda.
 - `resolve_conflict`: cierra un conflicto de ACTIVE CONFLICTS con la respuesta del usuario: una memoria queda y la otra pasa a reemplazada, o quedan las dos.
-- `memory_status`: informa si el daemon está corriendo, su perfil y su directorio de datos, si el modelo de embeddings ya cargó, y con qué agente guarda y busca.
+- `memory_status`: informa si el daemon está corriendo, su perfil y su directorio de datos, si el modelo de embeddings ya cargó, con qué agente guarda y busca, y a qué otros agentes lee.
 
 ### Perfiles y datos
 
@@ -381,7 +399,7 @@ En Windows usá la ruta completa a `clawg.exe`. Los nombres `clawg-dev` y `clawg
 
 El perfil sale de `--profile dev|prod`, luego de la variable de entorno `CLAWG_PROFILE`, y por último del tipo de build (debug es `dev`, release es `prod`). Un build debug rechaza `prod`, así que nunca puede tocar `~/.clawg`. El daemon escucha sólo en 127.0.0.1; los endpoints `/v1` exigen un token bearer guardado en el directorio de datos.
 
-Cada directorio de datos contiene la base SQLite de memoria, `daemon.json` (pid, puerto, versión), `token`, y `memory.lock` / `memory.owner`, que garantizan que un único proceso sea dueño del almacén.
+Cada directorio de datos contiene la base SQLite de memoria, `daemon.json` (pid, puerto, versión), `token`, y `memory.lock` / `memory.owner`, que garantizan que un único proceso sea dueño del almacén. Si se excluyó algo con `clawg sharing`, también `sharing.json`.
 
 ### Workspace
 

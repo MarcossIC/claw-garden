@@ -40,12 +40,13 @@ pub mod model_download;
 pub mod record;
 pub mod redact;
 pub mod secrets;
+pub mod sharing;
 
 pub use db::MemoryStore;
 pub use error::MemoryError;
 pub use identity::{derive_project_id, ProjectIdentity};
 pub use record::{
-    EpisodicTrajectoryRow, MemoryRecord, MemoryRow, ProceduralSkillRow, Scope, TableKind,
+    EpisodicTrajectoryRow, MemoryRecord, MemoryRow, ProceduralSkillRow, TableKind,
 };
 /// Re-exported at the `memory` root because structured retrieval is now an
 /// entry point in its own right: the `clawg serve` daemon and the `clawg mcp`

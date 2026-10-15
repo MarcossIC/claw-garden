@@ -25,6 +25,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use clawg_core::memory::sharing;
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -42,8 +43,8 @@ use crate::client::{
 };
 use crate::mcp::startup::ClientHandle;
 use crate::mcp::tools::{
-    format_docs, format_recall, format_resolution, format_rows, format_save, format_search, format_status,
-    format_synthesis, format_update, resolve_project,
+    format_docs, format_recall, format_resolution, format_rows, format_save, format_search, format_sharing,
+    format_status, format_synthesis, format_update, resolve_project,
 };
 
 /// Agent id used when neither `--agent` nor the MCP client named one.
@@ -578,7 +579,7 @@ impl ClawgMcp {
             })
             .await
         {
-            Ok(hits) => Self::ok(format_search(hits)),
+            Ok(hits) => Self::ok(format_search(hits, agent_id)),
             Err(e) => Self::failed(Self::explain(&e)),
         }
     }
@@ -760,6 +761,9 @@ impl ClawgMcp {
             Ok(c) => c,
             Err(failure) => return Ok(failure),
         };
+        // Read here rather than asked of the daemon: both read the same file
+        // in the same data directory, so this is what the next search will use.
+        let sharing = format_sharing(&sharing::load(client.base_dir()), &agent_id);
         match client.health().await {
             Ok(health) => Self::ok(format_status(
                 &health,
@@ -767,6 +771,7 @@ impl ClawgMcp {
                 client.base_dir(),
                 &agent_id,
                 source.describe(),
+                &sharing,
             )),
             Err(e) => Self::failed(Self::explain(&e)),
         }
@@ -867,7 +872,9 @@ impl ClawgMcp {
         name = "delete_memory",
         description = "Delete one stored memory by id and kind. Get the id from \
                        `search_memory`, `list_memories` or `recall_context` first — ids are \
-                       per-kind, so the same number exists in all three tables."
+                       per-kind, so the same number exists in all three tables. Only your own \
+                       memories: one marked `by <agent>` was saved by another agent and is \
+                       read-only."
     )]
     async fn delete_memory(
         &self,
@@ -883,7 +890,8 @@ impl ClawgMcp {
                        when the user says it matters more or less than it was saved with, or \
                        that it is a different kind of memory. Pass only what changes. To change \
                        what a memory says, save the new text and delete the old one instead. \
-                       Returns the memory's importance, type and tier after the change."
+                       Returns the memory's importance, type and tier after the change. Only \
+                       your own memories: one marked `by <agent>` is read-only."
     )]
     async fn update_memory(
         &self,
@@ -899,7 +907,8 @@ impl ClawgMcp {
                        the user has said which memory is right. `keep` stays; `other` is \
                        superseded by it and stops being retrieved, but is still listed and comes \
                        back if you resolve the pair the other way. Pass keep_both when the two \
-                       do not really contradict each other. Returns the status of both memories."
+                       do not really contradict each other. Returns the status of both memories. \
+                       Only your own memories: one marked `by <agent>` is read-only."
     )]
     async fn resolve_conflict(
         &self,
@@ -2314,5 +2323,175 @@ mod tests {
             "a project-scoped search must not leak another project's memory: {}",
             text(&scoped)
         );
+    }
+
+    // ── sharing between agents ──
+
+    fn hide(dir: &tempfile::TempDir, reader: &str, author: &str) {
+        let mut policy = sharing::load(dir.path()).expect("policy");
+        policy.hide(reader, author);
+        sharing::save(dir.path(), &policy).expect("save policy");
+    }
+
+    fn search_args(query: &str) -> SearchMemoryArgs {
+        SearchMemoryArgs { query: query.into(), limit: None, project_path: None, all_projects: None }
+    }
+
+    #[tokio::test]
+    async fn search_memory_shows_another_agents_memory_with_its_author() {
+        let (b, d) = bridge().await;
+        let content = "claude-code learned that the release branch is cut on thursdays";
+        let id = saved_id(&b, "claude-code", content).await;
+
+        let shared = text(&b.search_memory_impl("cursor", search_args(content)).await.expect("search"));
+        assert!(shared.contains(&format!("#{id} [Memory/")), "{shared}");
+        assert!(shared.contains(&format!(" by claude-code] {content}")), "shared without a policy: {shared}");
+        assert!(shared.ends_with(clawg_core::memory::prompt_builder::SHARED_NOTE), "{shared}");
+
+        let own = text(&b.search_memory_impl("claude-code", search_args(content)).await.expect("search"));
+        assert!(!own.contains(" by "), "the author's own view is unchanged: {own}");
+
+        hide(&d, "cursor", "claude-code");
+        let hidden = text(&b.search_memory_impl("cursor", search_args(content)).await.expect("search"));
+        assert!(!hidden.contains(content), "hidden from cursor: {hidden}");
+    }
+
+    #[tokio::test]
+    async fn recall_context_shows_another_agents_memory_with_its_author() {
+        let (b, d) = bridge().await;
+        let content = "claude-code learned that the staging database is rebuilt every night";
+        saved_id(&b, "claude-code", content).await;
+        let recall = || {
+            let b = &b;
+            async move {
+                text(&b.recall_context_impl("cursor", RecallContextArgs { query: content.into(), project_path: None }).await.expect("recall"))
+            }
+        };
+
+        let t = recall().await;
+        assert!(t.contains(&format!(" by claude-code] {content}")), "{t}");
+        assert!(t.contains("=== SHARED ==="), "{t}");
+
+        hide(&d, "*", "claude-code");
+        assert!(!recall().await.contains(content), "no agent reads claude-code");
+    }
+
+    #[tokio::test]
+    async fn a_shared_memory_is_read_only() {
+        let (b, _d) = bridge().await;
+        let content = "claude-code keeps the incident runbook in docs/runbook.md";
+        let id = saved_id(&b, "claude-code", content).await;
+        assert!(text(&b.search_memory_impl("cursor", search_args(content)).await.expect("search")).contains(content));
+
+        let r = b.delete_memory_impl("cursor", DeleteMemoryArgs { id, kind: "memory".into() }).await.expect("call");
+        assert!(is_error(&r), "a shared memory must not be deletable by its reader: {}", text(&r));
+        let r = b.update_memory_impl("cursor", update_args(id, Some(9.5), None)).await.expect("call");
+        assert!(is_error(&r), "nor changed: {}", text(&r));
+
+        let listed = text(&b.list_memories_impl("claude-code", list_all()).await.expect("list"));
+        assert!(listed.contains("imp=5.0") && listed.contains(&format!("#{id} ")), "the row stays as it was: {listed}");
+        assert!(!text(&b.list_memories_impl("cursor", list_all()).await.expect("list")).contains(content), "and is not listed as cursor's");
+    }
+
+    #[tokio::test]
+    async fn tool_descriptions_say_shared_memories_are_read_only() {
+        let (b, _d) = bridge().await;
+        for name in ["delete_memory", "update_memory", "resolve_conflict"] {
+            let tool = b.tool_router.list_all().into_iter().find(|t| t.name == name).expect(name);
+            let description = tool.description.as_deref().unwrap_or_default();
+            assert!(description.contains("Only your own memories") && description.contains("read-only"), "{name}: {description}");
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_status_reports_the_sharing_of_the_agent() {
+        let (b, d) = bridge().await;
+        let status = |agent: &'static str| {
+            let b = &b;
+            async move { text(&b.memory_status_impl((agent.to_string(), AgentSource::Flag)).await.expect("status")) }
+        };
+        assert!(status("cursor").await.ends_with("shared: reads every agent"));
+        hide(&d, "cursor", "claude-code");
+        hide(&d, "cursor", "codex");
+        assert!(status("cursor").await.ends_with("shared: reads every agent but claude-code, codex"));
+        hide(&d, "cursor", "*");
+        assert!(status("cursor").await.ends_with("shared: none (reads only its own)"));
+        std::fs::write(clawg_core::paths::sharing_file(d.path()), "{").unwrap();
+        let t = status("cursor").await;
+        assert!(t.contains("shared: none (sharing.json is not valid"), "{t}");
+    }
+
+    /// Rows written the way the previous version writes them — `scope =
+    /// 'agent'`, the author in `agent_id` — are shared by the policy alone,
+    /// and come out of hiding and unhiding exactly as they went in.
+    #[tokio::test]
+    async fn rows_of_the_previous_version_are_shared_untouched() {
+        use clawg_core::memory::embedder::{EmbedRole, Embedder, FakeEmbedder};
+        let mut store = None;
+        let (b, d) = bridge_with(|runtime| {
+            store = Some(runtime.store.clone());
+            runtime
+        })
+        .await;
+        let store = store.expect("store");
+        let content = "the previous version saved that payments run on stripe";
+        let embedding = FakeEmbedder::default().embed_with_role(content, EmbedRole::Passage).await.expect("embed");
+        let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let snapshot = |store: Arc<clawg_core::memory::MemoryStore>| async move {
+            store
+                .conn
+                .call(|c| {
+                    let mut stmt = c.prepare("SELECT id, scope, agent_id, project_id, status, content FROM memory ORDER BY id")?;
+                    let rows = stmt.query_map([], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, String>(5)?,
+                        ))
+                    })?;
+                    rows.collect::<Result<Vec<_>, _>>()
+                })
+                .await
+                .expect("snapshot")
+        };
+        for (agent, row_text) in [("claude-code", content), ("cursor", "cursor keeps its own notes")] {
+            let (agent, row_text, bytes) = (agent.to_string(), row_text.to_string(), bytes.clone());
+            store
+                .conn
+                .call(move |c| {
+                    c.execute(
+                        "INSERT INTO memory (scope, agent_id, content, memory_type, source, created_at, created_by_type, \
+                         created_by_ref, last_modified_at, last_accessed_at, importance, tier, status) \
+                         VALUES ('agent', ?1, ?2, 'semantic_fact', 'chat', 0, 'user', ?1, 0, 0, 5.0, 3, 'active')",
+                        (&agent, &row_text),
+                    )
+                    .and_then(|_| {
+                        c.execute(
+                            "INSERT INTO memory_vectors(rowid, embedding) VALUES ((SELECT max(id) FROM memory), ?1)",
+                            (&bytes,),
+                        )
+                    })
+                })
+                .await
+                .expect("seed");
+        }
+        let before = snapshot(store.clone()).await;
+
+        let finds = || {
+            let b = &b;
+            async move { text(&b.search_memory_impl("cursor", search_args(content)).await.expect("search")) }
+        };
+        assert!(finds().await.contains(&format!(" by claude-code] {content}")), "shared with its author without a policy");
+        hide(&d, "cursor", "claude-code");
+        assert!(!finds().await.contains(content), "hidden");
+        let mut policy = sharing::load(d.path()).unwrap();
+        policy.unhide("cursor", "claude-code");
+        sharing::save(d.path(), &policy).unwrap();
+        assert!(finds().await.contains(content), "unhidden");
+
+        assert_eq!(snapshot(store).await, before, "no row was rewritten by hiding or unhiding");
     }
 }

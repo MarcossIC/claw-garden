@@ -11,7 +11,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use clawg_cli::cli::{Cli, Command, PathAction};
+use clawg_cli::cli::{sharing_profile, Cli, Command, PathAction};
 use clawg_cli::client::{probe_running, ClientError, DaemonClient, Probe};
 use clawg_cli::daemon::lifecycle::{now_ms, read_state};
 use clawg_cli::daemon::serve;
@@ -20,6 +20,7 @@ use clawg_cli::mcp;
 use clawg_cli::memories;
 use clawg_cli::restore;
 use clawg_cli::secrets;
+use clawg_cli::sharing;
 use clawg_cli::status::status_report;
 use clawg_cli::stop::{stop_in, STOP_TIMEOUT};
 use clawg_core::memory::backup::{backup_offline, probe, restore};
@@ -160,6 +161,13 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
             let purged = purge(&base_dir, id).map_err(secrets::explain)?;
             println!("{}", secrets::purge_report(id, &purged));
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Sharing { action, profile } => {
+            let profile = sharing_profile(action.as_ref(), &profile).resolve().map_err(|e| e.to_string())?;
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            println!("{}", sharing::run(&base_dir, action.as_ref())?);
             Ok(ExitCode::SUCCESS)
         }
 
