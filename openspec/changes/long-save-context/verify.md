@@ -17,6 +17,7 @@
 | `3d08a5f` feat(core): show one hit per save and say which piece it is | 1709 | 10 |
 | `92aea43` feat(mcp): let the agent read a long save as one text | 1720 | 10 |
 | `fab517e` docs: list the read_memory tool | 1720 | 10 |
+| merge de `main` en `3c84cc9` (trae el arreglo de context-density en `prompt_builder.rs`) | 1721 | 10 |
 
 - **+46 tests.** El conteo nunca baja: los fixtures que dependían de las ventanas de 480 tokens se ajustaron en el mismo commit que baja el tope a 424.
 - **Los 10 que fallan son los mismos 10 de `main`** en todos los commits (comparados por nombre): `doctor::tests::*` (7, sólo pasan en Windows) y `rag-eval` `diff::tests::*` (3, leen `docs/eval/results/`, que `.gitignore` deja afuera).
@@ -67,7 +68,7 @@ Notes on clawg-ledger: … the retry budget was set to three attempts …
 
 ## Pendiente (máquina de Marcos)
 
-1. **Suite en Windows:** `cargo test --workspace --target-dir <otro-dir>`. Espero la base de Windows más los tests nuevos (1.675 + 46 = 1.721 si la base sigue en 1.675) y 0 fallas.
+1. **Suite en Windows:** `cargo test --workspace --target-dir <otro-dir>`. Espero la base de Windows más los tests nuevos (1.691 + 46 = 1.737 si la base sigue en 1.691) y 0 fallas.
 2. **U1, el ancla:** `rag-eval --real --diff <último resultado de main>` y `rag-eval --real --agent-view`, con `docs/eval/golden.json`. Diff vacío en retrieval y similarity, y el bloque `agent_view` igual campo por campo: el ancla no tiene filas de más de un pedazo.
 3. **U2, U3 y U4:** `golden-mine synth --base docs/eval/golden.json --out <set> --seed 7` y `rag-eval --real --agent-view --golden <set>` dos veces: con el binario de `db0c6a1` (la base: entiende `long` pero guarda y busca como `main`) y con el de la punta. Umbrales, fijados en la propuesta y sin mover:
 
