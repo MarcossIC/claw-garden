@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use crate::memory::clock::TimestampMs;
 use crate::memory::score::{score as compute_score, RawHit, ScoringConfig};
+use crate::memory::sharing::Reach;
 use crate::memory::vector::to_unit;
 use crate::memory::{MemoryError, MemoryStore, TableKind};
 
@@ -26,9 +27,9 @@ pub struct SearchScope {
     /// Candidate budget for the lexical (FTS5) channel — `None` keeps the
     /// channel off entirely: no MATCH query and no scoring query are issued.
     pub lexical: Option<usize>,
-    /// Agents whose rows the searching agent was granted, besides its own.
-    /// Empty — the default — searches the agent's own rows only.
-    pub shared_from: Vec<String>,
+    /// Whose rows besides its own the searching agent may read. `Own` — the
+    /// default here — searches the agent's own rows only.
+    pub reach: Reach,
 }
 
 impl SearchScope {
@@ -39,7 +40,7 @@ impl SearchScope {
             procedural: Some(5),
             project_id: None,
             lexical: Some(20),
-            shared_from: Vec::new(),
+            reach: Reach::Own,
         }
     }
     /// Scopes this query to `project_id`, owning a copy of it. `None` keeps
@@ -48,21 +49,22 @@ impl SearchScope {
         self.project_id = project_id.map(str::to_owned);
         self
     }
-    /// Lets this query reach the rows of `authors` as well as the agent's own.
-    pub fn with_shared(mut self, authors: Vec<String>) -> Self {
-        self.shared_from = authors;
+    /// Lets this query read the rows `reach` allows besides the agent's own.
+    pub fn with_reach(mut self, reach: Reach) -> Self {
+        self.reach = reach;
         self
     }
 }
 
-/// The agents a search may read, as the JSON array every query below binds
-/// and unpacks with `json_each`: one parameter however many agents there are,
-/// so no placeholder numbering moves when a grant is added.
-fn visible_agents(agent_id: &str, shared_from: &[String]) -> String {
-    let mut agents = vec![agent_id];
-    agents.extend(shared_from.iter().map(String::as_str).filter(|a| *a != agent_id));
-    // A list of strings always serializes.
-    serde_json::to_string(&agents).unwrap_or_default()
+/// Who a search may read, as the JSON object every query below binds once:
+/// `reader` always, and `hidden` only when other agents are readable. One
+/// parameter whatever the policy, so no placeholder numbering moves.
+fn reach_bind(agent_id: &str, reach: &Reach) -> String {
+    let value = match reach {
+        Reach::Own => serde_json::json!({ "reader": agent_id }),
+        Reach::AllBut(hidden) => serde_json::json!({ "reader": agent_id, "hidden": hidden }),
+    };
+    value.to_string()
 }
 
 /// One result row after the score formula has been applied SQL-side.
@@ -140,7 +142,7 @@ const SEARCH_SQL_MEMORY: &str = "
       AND knn.k = ?2
       AND m.status IN ('active', 'disputed')
       AND m.deleted_at IS NULL
-      AND m.agent_id IN (SELECT value FROM json_each(?3))
+      AND (m.agent_id = (?3 ->> '$.reader') OR ((?3 ->> '$.hidden') IS NOT NULL AND m.agent_id NOT IN (SELECT value FROM json_each(?3, '$.hidden'))))
       AND (?4 IS NULL OR m.project_id = ?4 OR m.project_id IS NULL OR m.memory_type = 'user_preference')
 ";
 
@@ -157,7 +159,7 @@ const SEARCH_SQL_EPISODIC: &str = "
       AND knn.k = ?2
       AND epi.status IN ('active', 'disputed')
       AND epi.deleted_at IS NULL
-      AND epi.agent_id IN (SELECT value FROM json_each(?3))
+      AND (epi.agent_id = (?3 ->> '$.reader') OR ((?3 ->> '$.hidden') IS NOT NULL AND epi.agent_id NOT IN (SELECT value FROM json_each(?3, '$.hidden'))))
       AND (?4 IS NULL OR epi.project_id = ?4 OR epi.project_id IS NULL)
 ";
 
@@ -172,7 +174,7 @@ const SEARCH_SQL_PROCEDURAL: &str = "
       AND knn.k = ?2
       AND pro.status IN ('active', 'disputed')
       AND pro.deleted_at IS NULL
-      AND pro.agent_id IN (SELECT value FROM json_each(?3))
+      AND (pro.agent_id = (?3 ->> '$.reader') OR ((?3 ->> '$.hidden') IS NOT NULL AND pro.agent_id NOT IN (SELECT value FROM json_each(?3, '$.hidden'))))
       AND (?4 IS NULL OR pro.project_id = ?4 OR pro.project_id IS NULL)
 ";
 
@@ -187,18 +189,14 @@ const SEARCH_SQL_PROCEDURAL: &str = "
 // These predicates are the same ones the KNN query applies after vec0's cut,
 // so the number they produce is the ceiling on what any window could return.
 //
-// `agent_id IN (… json_each(?2))` plus `deleted_at IS NULL` is exactly the
-// leading column and the partial predicate of each table's own index —
-// `idx_memory_agent_active`, `idx_epi_agent_active`, `idx_proc_agent_active`
-// (`V1__init.sql:37`, `:96`, `:147`) — so the count rides the matching index for whichever table this
-// constant serves, and the LIMIT stops it at k rather than walking the
-// agent's whole history.
+// The LIMIT stops the count at k rather than walking every row the caller
+// may read.
 const ELIGIBLE_SQL_MEMORY: &str = "
     SELECT COUNT(*) FROM (
         SELECT m.id FROM memory m
         WHERE m.status IN ('active', 'disputed')
           AND m.deleted_at IS NULL
-          AND m.agent_id IN (SELECT value FROM json_each(?2))
+          AND (m.agent_id = (?2 ->> '$.reader') OR ((?2 ->> '$.hidden') IS NOT NULL AND m.agent_id NOT IN (SELECT value FROM json_each(?2, '$.hidden'))))
           AND (?3 IS NULL OR m.project_id = ?3 OR m.project_id IS NULL OR m.memory_type = 'user_preference')
         LIMIT ?1
     )
@@ -209,7 +207,7 @@ const ELIGIBLE_SQL_EPISODIC: &str = "
         SELECT epi.id FROM episodic_trajectory epi
         WHERE epi.status IN ('active', 'disputed')
           AND epi.deleted_at IS NULL
-          AND epi.agent_id IN (SELECT value FROM json_each(?2))
+          AND (epi.agent_id = (?2 ->> '$.reader') OR ((?2 ->> '$.hidden') IS NOT NULL AND epi.agent_id NOT IN (SELECT value FROM json_each(?2, '$.hidden'))))
           AND (?3 IS NULL OR epi.project_id = ?3 OR epi.project_id IS NULL)
         LIMIT ?1
     )
@@ -220,7 +218,7 @@ const ELIGIBLE_SQL_PROCEDURAL: &str = "
         SELECT pro.id FROM procedural_skill pro
         WHERE pro.status IN ('active', 'disputed')
           AND pro.deleted_at IS NULL
-          AND pro.agent_id IN (SELECT value FROM json_each(?2))
+          AND (pro.agent_id = (?2 ->> '$.reader') OR ((?2 ->> '$.hidden') IS NOT NULL AND pro.agent_id NOT IN (SELECT value FROM json_each(?2, '$.hidden'))))
           AND (?3 IS NULL OR pro.project_id = ?3 OR pro.project_id IS NULL)
         LIMIT ?1
     )
@@ -579,7 +577,7 @@ pub(crate) fn viewer_match_expression(query_text: &str) -> Option<String> {
 const LEXICAL_CANDIDATE_SQL: &str = "
     SELECT rowid FROM memory_fts
     WHERE memory_fts MATCH ?1
-      AND agent_id IN (SELECT value FROM json_each(?2))
+      AND (agent_id = (?2 ->> '$.reader') OR ((?2 ->> '$.hidden') IS NOT NULL AND agent_id NOT IN (SELECT value FROM json_each(?2, '$.hidden'))))
       AND (?3 IS NULL OR project_id = ?3 OR project_id IS NULL OR memory_type = 'user_preference')
     ORDER BY bm25(memory_fts)
     LIMIT ?4
@@ -709,7 +707,7 @@ const IDENTIFIER_MATCH_SQL: &str = "
     WHERE memory_fts MATCH ?1
       AND m.status IN ('active', 'disputed')
       AND m.deleted_at IS NULL
-      AND m.agent_id IN (SELECT value FROM json_each(?2))
+      AND (m.agent_id = (?2 ->> '$.reader') OR ((?2 ->> '$.hidden') IS NOT NULL AND m.agent_id NOT IN (SELECT value FROM json_each(?2, '$.hidden'))))
       AND (?3 IS NULL OR m.project_id = ?3 OR m.project_id IS NULL OR m.memory_type = 'user_preference')
     LIMIT ?4
 ";
@@ -863,7 +861,7 @@ const LEXICAL_SCORE_SQL_PREFIX: &str = "
     JOIN memory m NOT INDEXED ON m.id = v.rowid
     WHERE m.status IN ('active', 'disputed')
       AND m.deleted_at IS NULL
-      AND m.agent_id IN (SELECT value FROM json_each(?2))
+      AND (m.agent_id = (?2 ->> '$.reader') OR ((?2 ->> '$.hidden') IS NOT NULL AND m.agent_id NOT IN (SELECT value FROM json_each(?2, '$.hidden'))))
       AND (?3 IS NULL OR m.project_id = ?3 OR m.project_id IS NULL OR m.memory_type = 'user_preference')
 ";
 
@@ -1034,7 +1032,7 @@ async fn search_all_memories_inner(
     // reference — `scope` itself is never moved out of, so this reads fine
     // even though the struct dropped `Copy` when `project_id` was added.
     let project_id = scope.project_id.as_deref();
-    let agents = visible_agents(agent_id, &scope.shared_from);
+    let agents = reach_bind(agent_id, &scope.reach);
     let agents = agents.as_str();
     // Read once and shared by every table: no two rows scored by this search
     // may have their decay computed against a different instant, which three
@@ -1215,7 +1213,7 @@ mod tests {
 
     /// The bind every agent-filtered query takes, for an agent with no grants.
     fn only(agent: &str) -> String {
-        visible_agents(agent, &[])
+        reach_bind(agent, &Reach::Own)
     }
 
     fn serialize_embedding(v: &[f32]) -> Vec<u8> {
@@ -1797,7 +1795,7 @@ mod tests {
     async fn search_respects_scope_none_skips_table() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let q_vec = unit_basis_vec();
-        let scope = SearchScope { memory: None, episodic: None, procedural: None, project_id: None, lexical: None, shared_from: Vec::new() };
+        let scope = SearchScope { memory: None, episodic: None, procedural: None, project_id: None, lexical: None, reach: Reach::Own };
         let hits = search_all_memories(&store, &q_vec, None, "agent-x", scope, 10)
             .await.unwrap();
         assert!(hits.is_empty(), "all scopes None → empty results");
@@ -2575,7 +2573,7 @@ mod tests {
             procedural: None,
             project_id: Some("P1".to_string()),
             lexical: None,
-            shared_from: Vec::new(),
+            reach: Reach::Own,
         };
         let k = scope.memory.unwrap();
         // 30 foreign rows fill the first window exactly; 40 eligible rows sit
@@ -2623,7 +2621,7 @@ mod tests {
             procedural: None,
             project_id: Some("P1".to_string()),
             lexical: None,
-            shared_from: Vec::new(),
+            reach: Reach::Own,
         };
         bulk_insert_memory_rows(&store, "agent-telemetry-wired", Some("P2"), 30, serialize_embedding(&near)).await;
         bulk_insert_memory_rows(&store, "agent-telemetry-wired", Some("P1"), 40, serialize_embedding(&far)).await;
@@ -3873,7 +3871,7 @@ mod tests {
             procedural: None,
             project_id: None,
             lexical: Some(20),
-            shared_from: Vec::new(),
+            reach: Reach::Own,
         };
         let (hits, _telemetry) = search_all_memories_inner(
             &store,
@@ -3975,7 +3973,7 @@ mod tests {
             procedural: None,
             project_id: None,
             lexical: Some(20),
-            shared_from: Vec::new(),
+            reach: Reach::Own,
         };
         let (hits, telemetry) = search_all_memories_inner(
             &store,
@@ -4091,7 +4089,7 @@ mod tests {
             procedural: None,
             project_id: None,
             lexical: Some(20),
-            shared_from: Vec::new(),
+            reach: Reach::Own,
         };
 
         let (hits, telemetry) = search_all_memories_inner(
@@ -4218,7 +4216,7 @@ mod tests {
             procedural: None,
             project_id: None,
             lexical: None,
-            shared_from: Vec::new(),
+            reach: Reach::Own,
         };
 
         let (hits_present, _t1) = search_all_memories_inner(
@@ -4372,7 +4370,7 @@ mod tests {
             procedural: None,
             project_id: None,
             lexical: Some(20),
-            shared_from: Vec::new(),
+            reach: Reach::Own,
         };
         let (_hits, telemetry) = search_all_memories_inner(
             &store,
@@ -4675,40 +4673,70 @@ mod tests {
         hits.iter().map(|h| h.id).collect()
     }
 
+    fn everyone() -> Reach {
+        Reach::AllBut(Vec::new())
+    }
+
     #[tokio::test]
-    async fn a_granted_author_is_found_in_every_channel() {
+    async fn another_agents_row_is_found_in_every_channel() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let theirs =
             insert_memory_row(&store, "a", "el deploy usa flyio_4821", "semantic_fact", 3, 5.0, "active", serialize_embedding(&axis(0)))
                 .await;
         let query = "flyio_4821";
-        let granted = || vec!["a".to_string()];
 
         for (channel, scope) in [("dense", dense_only()), ("lexical", lexical_only())] {
             let alone = search_all_memories(&store, &axis(0), Some(query), "b", scope.clone(), 10).await.unwrap();
-            assert!(!ids_of(&alone).contains(&theirs), "{channel}: without a grant b must not see a's row");
+            assert!(!ids_of(&alone).contains(&theirs), "{channel}: reaching only its own, b must not see a's row");
 
-            let shared = search_all_memories(&store, &axis(0), Some(query), "b", scope.with_shared(granted()), 10).await.unwrap();
-            assert!(ids_of(&shared).contains(&theirs), "{channel}: with a grant b must find a's row");
+            let shared = search_all_memories(&store, &axis(0), Some(query), "b", scope.with_reach(everyone()), 10).await.unwrap();
+            assert!(ids_of(&shared).contains(&theirs), "{channel}: reaching every agent, b must find a's row");
         }
     }
 
     #[tokio::test]
-    async fn a_grant_does_not_work_backwards() {
+    async fn a_hidden_author_stays_out_in_every_channel() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let theirs =
+            insert_memory_row(&store, "a", "el deploy usa flyio_4821", "semantic_fact", 3, 5.0, "active", serialize_embedding(&axis(0)))
+                .await;
+        let other =
+            insert_memory_row(&store, "c", "el deploy usa flyio_4821 también", "semantic_fact", 3, 5.0, "active", serialize_embedding(&axis(0)))
+                .await;
+
+        for (channel, scope) in [("dense", dense_only()), ("lexical", lexical_only())] {
+            let reach = Reach::AllBut(vec!["a".to_string()]);
+            let hits = ids_of(&search_all_memories(&store, &axis(0), Some("flyio_4821"), "b", scope.with_reach(reach), 10).await.unwrap());
+            assert!(!hits.contains(&theirs), "{channel}: a is hidden from b");
+            assert!(hits.contains(&other), "{channel}: c is not");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exclusion_does_not_work_backwards() {
         use crate::memory::sharing::SharingPolicy;
         let store = MemoryStore::new_for_test().await.unwrap();
         let mine = insert_memory_row(&store, "a", "fila de a", "semantic_fact", 3, 5.0, "active", serialize_embedding(&axis(0))).await;
         let yours = insert_memory_row(&store, "b", "fila de b", "semantic_fact", 3, 5.0, "active", serialize_embedding(&axis(0))).await;
-        let policy = SharingPolicy::parse(r#"{"version":1,"reads":{"b":["a"]}}"#).unwrap();
+        let policy = SharingPolicy::parse(r#"{"version":1,"hides":{"b":["a"]}}"#).unwrap();
 
-        let for_a = SearchScope::all_default().with_shared(policy.authors_for("a"));
-        let hits = ids_of(&search_all_memories(&store, &axis(0), None, "a", for_a, 10).await.unwrap());
-        assert_eq!(hits, [mine], "a was granted nothing");
+        let for_b = SearchScope::all_default().with_reach(policy.reach_for("b"));
+        let hits = ids_of(&search_all_memories(&store, &axis(0), None, "b", for_b, 10).await.unwrap());
+        assert_eq!(hits, [yours], "b does not read a");
 
-        let for_b = SearchScope::all_default().with_shared(policy.authors_for("b"));
-        let mut hits = ids_of(&search_all_memories(&store, &axis(0), None, "b", for_b, 10).await.unwrap());
+        let for_a = SearchScope::all_default().with_reach(policy.reach_for("a"));
+        let mut hits = ids_of(&search_all_memories(&store, &axis(0), None, "a", for_a, 10).await.unwrap());
         hits.sort_unstable();
-        assert_eq!(hits, [mine, yours]);
+        assert_eq!(hits, [mine, yours], "a still reads b");
+    }
+
+    #[tokio::test]
+    async fn an_agent_never_hides_its_own_rows() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let mine = insert_memory_row(&store, "b", "propia", "semantic_fact", 3, 5.0, "active", serialize_embedding(&axis(0))).await;
+        let scope = SearchScope::all_default().with_reach(Reach::AllBut(vec!["b".to_string()]));
+        let hits = ids_of(&search_all_memories(&store, &axis(0), None, "b", scope, 10).await.unwrap());
+        assert_eq!(hits, [mine]);
     }
 
     #[tokio::test]
@@ -4719,21 +4747,23 @@ mod tests {
         let pref = insert_memory_row_with_project(&store, "a", Some("P1"), "user_preference", "prefiere tabs", emb.clone()).await;
         let unscoped = insert_memory_row_with_project(&store, "a", None, "semantic_fact", "dato sin proyecto", emb).await;
 
-        let scope = SearchScope::all_default().with_project(Some("P2")).with_shared(vec!["a".into()]);
+        let scope = SearchScope::all_default().with_project(Some("P2")).with_reach(everyone());
         let mut hits = ids_of(&search_all_memories(&store, &axis(0), None, "b", scope, 10).await.unwrap());
         hits.sort_unstable();
         assert_eq!(hits, [pref, unscoped], "a's P1 fact stays out of P2; its preference and unscoped row come through");
     }
 
     #[tokio::test]
-    async fn the_eligible_count_includes_granted_authors() {
+    async fn the_eligible_count_follows_the_reach() {
         let store = MemoryStore::new_for_test().await.unwrap();
         for i in 0..3 {
             insert_memory_row(&store, "a", &format!("fila {i}"), "semantic_fact", 3, 5.0, "active", serialize_embedding(&axis(i))).await;
         }
-        let count = |agents: String| {
+        insert_memory_row(&store, "c", "fila de c", "semantic_fact", 3, 5.0, "active", serialize_embedding(&axis(3))).await;
+        let count = |reach: Reach| {
             let store = &store;
             async move {
+                let agents = reach_bind("b", &reach);
                 store
                     .conn
                     .call(move |c| -> Result<i64, rusqlite::Error> {
@@ -4743,36 +4773,16 @@ mod tests {
                     .unwrap()
             }
         };
-        assert_eq!(count(only("b")).await, 0);
-        assert_eq!(count(visible_agents("b", &["a".to_string()])).await, 3);
-    }
-
-    /// The agent predicate unpacks a JSON array, and the count has to keep
-    /// riding the agent index through it: the result cannot tell an index
-    /// lookup from a scan of every row in the table.
-    #[tokio::test]
-    async fn the_eligible_count_still_rides_the_agent_index() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-        let plan = store
-            .conn
-            .call(|c| -> Result<Vec<String>, rusqlite::Error> {
-                let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {ELIGIBLE_SQL_MEMORY}"))?;
-                let rows = stmt.query_map(params![30_i64, visible_agents("b", &["a".to_string()]), Option::<String>::None], |r| {
-                    r.get::<_, String>(3)
-                })?;
-                rows.collect()
-            })
-            .await
-            .unwrap();
-        assert!(plan.iter().any(|l| l.contains("USING INDEX idx_memory_agent_active")), "{plan:?}");
+        assert_eq!(count(Reach::Own).await, 0);
+        assert_eq!(count(everyone()).await, 4);
+        assert_eq!(count(Reach::AllBut(vec!["a".to_string()])).await, 1);
     }
 
     #[tokio::test]
-    async fn without_grants_the_search_is_unchanged() {
+    async fn reaching_only_its_own_leaves_the_search_unchanged() {
         let store = MemoryStore::new_for_test().await.unwrap();
         for i in 0..4 {
             insert_memory_row(&store, "b", &format!("propia {i}"), "semantic_fact", 3, 5.0, "active", serialize_embedding(&axis(i))).await;
-            insert_memory_row(&store, "a", &format!("ajena {i}"), "semantic_fact", 3, 5.0, "active", serialize_embedding(&axis(i))).await;
         }
         let run = |scope: SearchScope| {
             let store = &store;
@@ -4787,8 +4797,7 @@ mod tests {
         };
         let plain = run(SearchScope::all_default()).await;
         assert_eq!(plain.len(), 4);
-        assert_eq!(run(SearchScope::all_default().with_shared(Vec::new())).await, plain);
-        assert_eq!(run(SearchScope::all_default().with_shared(vec!["b".into()])).await, plain, "granting oneself adds nothing");
+        assert_eq!(run(SearchScope::all_default().with_reach(everyone())).await, plain, "with no one else's rows, reaching everyone adds nothing");
     }
 
     #[tokio::test]
@@ -4796,7 +4805,7 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         let mine = insert_memory_row(&store, "b", "propia", "semantic_fact", 3, 5.0, "active", serialize_embedding(&axis(0))).await;
         let theirs = insert_memory_row(&store, "a", "ajena", "semantic_fact", 3, 5.0, "active", serialize_embedding(&axis(0))).await;
-        let scope = SearchScope::all_default().with_shared(vec!["a".into()]);
+        let scope = SearchScope::all_default().with_reach(everyone());
         let hits = search_all_memories(&store, &axis(0), Some("ajena"), "b", scope, 10).await.unwrap();
         let author = |id: i64| hits.iter().find(|h| h.id == id).and_then(|h| h.agent_id.clone());
         assert_eq!(author(mine).as_deref(), Some("b"));

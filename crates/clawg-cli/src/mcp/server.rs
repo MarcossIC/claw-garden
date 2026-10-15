@@ -2117,9 +2117,9 @@ mod tests {
 
     // ── sharing between agents ──
 
-    fn grant(dir: &tempfile::TempDir, reader: &str, author: &str) {
+    fn hide(dir: &tempfile::TempDir, reader: &str, author: &str) {
         let mut policy = sharing::load(dir.path()).expect("policy");
-        policy.grant(reader, author);
+        policy.hide(reader, author);
         sharing::save(dir.path(), &policy).expect("save policy");
     }
 
@@ -2128,43 +2128,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_memory_shows_a_granted_memory_with_its_author() {
+    async fn search_memory_shows_another_agents_memory_with_its_author() {
         let (b, d) = bridge().await;
         let content = "claude-code learned that the release branch is cut on thursdays";
         let id = saved_id(&b, "claude-code", content).await;
 
-        let alone = text(&b.search_memory_impl("cursor", search_args(content)).await.expect("search"));
-        assert!(!alone.contains(content), "nothing is shared yet: {alone}");
-
-        grant(&d, "cursor", "claude-code");
         let shared = text(&b.search_memory_impl("cursor", search_args(content)).await.expect("search"));
         assert!(shared.contains(&format!("#{id} [Memory/")), "{shared}");
-        assert!(shared.contains(&format!(" by claude-code] {content}")), "{shared}");
+        assert!(shared.contains(&format!(" by claude-code] {content}")), "shared without a policy: {shared}");
         assert!(shared.ends_with(clawg_core::memory::prompt_builder::SHARED_NOTE), "{shared}");
 
         let own = text(&b.search_memory_impl("claude-code", search_args(content)).await.expect("search"));
         assert!(!own.contains(" by "), "the author's own view is unchanged: {own}");
+
+        hide(&d, "cursor", "claude-code");
+        let hidden = text(&b.search_memory_impl("cursor", search_args(content)).await.expect("search"));
+        assert!(!hidden.contains(content), "hidden from cursor: {hidden}");
     }
 
     #[tokio::test]
-    async fn recall_context_shows_a_granted_memory_with_its_author() {
+    async fn recall_context_shows_another_agents_memory_with_its_author() {
         let (b, d) = bridge().await;
         let content = "claude-code learned that the staging database is rebuilt every night";
         saved_id(&b, "claude-code", content).await;
-        grant(&d, "cursor", "claude-code");
+        let recall = || {
+            let b = &b;
+            async move {
+                text(&b.recall_context_impl("cursor", RecallContextArgs { query: content.into(), project_path: None }).await.expect("recall"))
+            }
+        };
 
-        let r = b.recall_context_impl("cursor", RecallContextArgs { query: content.into(), project_path: None }).await.expect("recall");
-        let t = text(&r);
+        let t = recall().await;
         assert!(t.contains(&format!(" by claude-code] {content}")), "{t}");
         assert!(t.contains("=== SHARED ==="), "{t}");
+
+        hide(&d, "*", "claude-code");
+        assert!(!recall().await.contains(content), "no agent reads claude-code");
     }
 
     #[tokio::test]
     async fn a_shared_memory_is_read_only() {
-        let (b, d) = bridge().await;
+        let (b, _d) = bridge().await;
         let content = "claude-code keeps the incident runbook in docs/runbook.md";
         let id = saved_id(&b, "claude-code", content).await;
-        grant(&d, "cursor", "claude-code");
         assert!(text(&b.search_memory_impl("cursor", search_args(content)).await.expect("search")).contains(content));
 
         let r = b.delete_memory_impl("cursor", DeleteMemoryArgs { id, kind: "memory".into() }).await.expect("call");
@@ -2194,10 +2200,12 @@ mod tests {
             let b = &b;
             async move { text(&b.memory_status_impl((agent.to_string(), AgentSource::Flag)).await.expect("status")) }
         };
-        assert!(status("cursor").await.ends_with("shared: none"));
-        grant(&d, "cursor", "claude-code");
-        grant(&d, "cursor", "codex");
-        assert!(status("cursor").await.ends_with("shared: reads claude-code, codex"));
+        assert!(status("cursor").await.ends_with("shared: reads every agent"));
+        hide(&d, "cursor", "claude-code");
+        hide(&d, "cursor", "codex");
+        assert!(status("cursor").await.ends_with("shared: reads every agent but claude-code, codex"));
+        hide(&d, "cursor", "*");
+        assert!(status("cursor").await.ends_with("shared: none (reads only its own)"));
         std::fs::write(clawg_core::paths::sharing_file(d.path()), "{").unwrap();
         let t = status("cursor").await;
         assert!(t.contains("shared: none (sharing.json is not valid"), "{t}");
@@ -2205,7 +2213,7 @@ mod tests {
 
     /// Rows written the way the previous version writes them — `scope =
     /// 'agent'`, the author in `agent_id` — are shared by the policy alone,
-    /// and come out of a grant and a revoke exactly as they went in.
+    /// and come out of hiding and unhiding exactly as they went in.
     #[tokio::test]
     async fn rows_of_the_previous_version_are_shared_untouched() {
         use clawg_core::memory::embedder::{EmbedRole, Embedder, FakeEmbedder};
@@ -2266,14 +2274,14 @@ mod tests {
             let b = &b;
             async move { text(&b.search_memory_impl("cursor", search_args(content)).await.expect("search")) }
         };
-        assert!(!finds().await.contains(content), "nothing shared without a policy");
-        grant(&d, "cursor", "claude-code");
-        assert!(finds().await.contains(&format!(" by claude-code] {content}")), "shared with its author");
+        assert!(finds().await.contains(&format!(" by claude-code] {content}")), "shared with its author without a policy");
+        hide(&d, "cursor", "claude-code");
+        assert!(!finds().await.contains(content), "hidden");
         let mut policy = sharing::load(d.path()).unwrap();
-        policy.revoke("cursor", "claude-code");
+        policy.unhide("cursor", "claude-code");
         sharing::save(d.path(), &policy).unwrap();
-        assert!(!finds().await.contains(content), "revoked");
+        assert!(finds().await.contains(content), "unhidden");
 
-        assert_eq!(snapshot(store).await, before, "no row was rewritten by a grant or a revoke");
+        assert_eq!(snapshot(store).await, before, "no row was rewritten by hiding or unhiding");
     }
 }

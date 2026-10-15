@@ -1,9 +1,9 @@
-//! Which agents may read which agents' memories.
+//! Which agents read which agents' memories.
 //!
-//! The policy is a set of directed grants — "cursor reads claude-code" — kept
-//! in `<data>/sharing.json`. Without the file nothing is shared, so an upgrade
-//! never changes what an agent sees. Parsing and resolving are pure; only
-//! [`load`] and [`save`] touch the filesystem.
+//! Every agent reads every other agent's memories unless the user hides them:
+//! a set of directed exclusions — "cursor does not read codex" — kept in
+//! `<data>/sharing.json`, where `*` stands for every agent. Parsing and
+//! resolving are pure; only [`load`] and [`save`] touch the filesystem.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -15,8 +15,12 @@ use crate::paths::sharing_file;
 /// The only file format this build reads and writes.
 const VERSION: u32 = 1;
 
+/// Every agent, on either side of an exclusion.
+pub const EVERY_AGENT: &str = "*";
+
 /// Why `sharing.json` could not be used. Every caller treats it as "nothing is
-/// shared"; the message is what the user is shown so they can fix the file.
+/// shared": an exclusion the user wrote must not be lost to a typo. The
+/// message is what the user is shown so they can fix the file.
 #[derive(Debug, thiserror::Error)]
 pub enum SharingError {
     #[error("cannot read sharing.json: {0}")]
@@ -31,22 +35,32 @@ pub enum SharingError {
     BlankName,
 }
 
+/// What one agent's search reaches besides its own rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Reach {
+    /// Its own rows only.
+    #[default]
+    Own,
+    /// Every agent's rows except these authors'.
+    AllBut(Vec<String>),
+}
+
 /// The file as written. `deny_unknown_fields` because a misspelled key
-/// (`"read"`) would otherwise parse as an empty policy, and a user who meant to
-/// grant something would be told nothing about why it does not work.
+/// (`"hide"`) would otherwise parse as an empty policy, and a user who meant to
+/// hide something would see it shared with no word about why.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct OnDisk {
     version: u32,
     #[serde(default)]
-    reads: BTreeMap<String, Vec<String>>,
+    hides: BTreeMap<String, Vec<String>>,
 }
 
-/// Reader to the authors it may read. Ordered maps so the same policy always
-/// renders and saves the same way.
+/// Reader to the authors hidden from it. Ordered maps so the same policy
+/// always renders and saves the same way.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SharingPolicy {
-    reads: BTreeMap<String, BTreeSet<String>>,
+    hides: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl SharingPolicy {
@@ -58,7 +72,7 @@ impl SharingPolicy {
             return Err(SharingError::Version(on_disk.version));
         }
         let mut policy = Self::default();
-        for (reader, authors) in on_disk.reads {
+        for (reader, authors) in on_disk.hides {
             if reader.trim().is_empty() {
                 return Err(SharingError::BlankName);
             }
@@ -66,7 +80,7 @@ impl SharingPolicy {
                 if author.trim().is_empty() {
                     return Err(SharingError::BlankName);
                 }
-                policy.grant(&reader, &author);
+                policy.hide(&reader, &author);
             }
         }
         Ok(policy)
@@ -75,7 +89,7 @@ impl SharingPolicy {
     pub fn to_json(&self) -> String {
         let on_disk = OnDisk {
             version: VERSION,
-            reads: self.reads.iter().map(|(r, a)| (r.clone(), a.iter().cloned().collect())).collect(),
+            hides: self.hides.iter().map(|(r, a)| (r.clone(), a.iter().cloned().collect())).collect(),
         };
         // A map of strings to string lists always serializes.
         let mut json = serde_json::to_string_pretty(&on_disk).unwrap_or_default();
@@ -83,46 +97,60 @@ impl SharingPolicy {
         json
     }
 
-    /// The other agents whose memories `reader` may read, in order. An agent
-    /// always reads its own, so it is never in the list.
-    pub fn authors_for(&self, reader: &str) -> Vec<String> {
-        self.reads.get(reader).map(|a| a.iter().cloned().collect()).unwrap_or_default()
+    /// What `reader`'s searches reach: every other agent but the ones hidden
+    /// from it, by name or through `*`.
+    pub fn reach_for(&self, reader: &str) -> Reach {
+        let named = self.hides.get(reader).into_iter().flatten();
+        let everyone = self.hides.get(EVERY_AGENT).into_iter().flatten();
+        let hidden: BTreeSet<&String> = named.chain(everyone).collect();
+        if hidden.iter().any(|a| *a == EVERY_AGENT) {
+            return Reach::Own;
+        }
+        Reach::AllBut(hidden.into_iter().filter(|a| *a != reader).cloned().collect())
     }
 
-    /// Lets `reader` read `author`. A grant to oneself means nothing and is
-    /// dropped; granting twice is the same as once.
-    pub fn grant(&mut self, reader: &str, author: &str) {
-        if reader != author {
-            self.reads.entry(reader.to_owned()).or_default().insert(author.to_owned());
+    /// Stops `reader` from reading `author`. Hiding an agent from itself
+    /// means nothing and is dropped; hiding twice is the same as once.
+    pub fn hide(&mut self, reader: &str, author: &str) {
+        if reader != author || reader == EVERY_AGENT {
+            self.hides.entry(reader.to_owned()).or_default().insert(author.to_owned());
         }
     }
 
-    /// Takes the grant away, if there was one.
-    pub fn revoke(&mut self, reader: &str, author: &str) {
-        if let Some(authors) = self.reads.get_mut(reader) {
+    /// Takes an exclusion away, if there was one.
+    pub fn unhide(&mut self, reader: &str, author: &str) {
+        if let Some(authors) = self.hides.get_mut(reader) {
             authors.remove(author);
             if authors.is_empty() {
-                self.reads.remove(reader);
+                self.hides.remove(reader);
             }
         }
     }
 
-    /// One line per grant, `<reader> reads <author>`.
+    /// One line per exclusion, or that everything is shared.
     pub fn render(&self) -> String {
         let lines: Vec<String> = self
-            .reads
+            .hides
             .iter()
-            .flat_map(|(r, authors)| authors.iter().map(move |a| format!("{r} reads {a}")))
+            .flat_map(|(r, authors)| {
+                authors.iter().map(move |a| match (r.as_str(), a.as_str()) {
+                    (EVERY_AGENT, EVERY_AGENT) => "no agent reads another".to_owned(),
+                    (EVERY_AGENT, a) => format!("no agent reads {a}"),
+                    (r, EVERY_AGENT) => format!("{r} reads no other agent"),
+                    (r, a) => format!("{r} does not read {a}"),
+                })
+            })
             .collect();
         if lines.is_empty() {
-            return "nothing is shared".to_owned();
+            return "every agent reads every other agent".to_owned();
         }
         lines.join("\n")
     }
 }
 
-/// The policy in `base_dir`. A missing file is the empty policy; anything else
-/// that cannot be read is an error the caller decides how to show.
+/// The policy in `base_dir`. A missing file is the empty policy, which shares
+/// everything; anything else that cannot be read is an error the caller
+/// decides how to show.
 pub fn load(base_dir: &Path) -> Result<SharingPolicy, SharingError> {
     match std::fs::read_to_string(sharing_file(base_dir)) {
         Ok(text) => SharingPolicy::parse(&text),
@@ -133,8 +161,8 @@ pub fn load(base_dir: &Path) -> Result<SharingPolicy, SharingError> {
 
 /// Writes the policy through a temporary file and a rename, so the daemon
 /// reading it on every search sees the old policy or the new one, never half.
-/// Creates the data directory when nothing has run in it yet, so a grant can
-/// be the first thing a user does.
+/// Creates the data directory when nothing has run in it yet, so an exclusion
+/// can be the first thing a user does.
 pub fn save(base_dir: &Path, policy: &SharingPolicy) -> Result<(), SharingError> {
     let path = sharing_file(base_dir);
     let tmp = path.with_extension("json.tmp");
@@ -152,96 +180,114 @@ mod tests {
         SharingPolicy::parse(text).expect("valid policy")
     }
 
-    #[test]
-    fn a_missing_policy_shares_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = load(dir.path()).unwrap();
-        assert_eq!(p, SharingPolicy::default());
-        assert!(p.authors_for("cursor").is_empty());
+    fn all_but(names: &[&str]) -> Reach {
+        Reach::AllBut(names.iter().map(|n| n.to_string()).collect())
     }
 
     #[test]
-    fn a_grant_has_a_direction() {
-        let p = policy(r#"{"version":1,"reads":{"cursor":["claude-code"]}}"#);
-        assert_eq!(p.authors_for("cursor"), ["claude-code"]);
-        assert!(p.authors_for("claude-code").is_empty());
+    fn a_missing_policy_shares_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = load(dir.path()).unwrap();
+        assert_eq!(p, SharingPolicy::default());
+        assert_eq!(p.reach_for("cursor"), all_but(&[]));
+    }
+
+    #[test]
+    fn an_exclusion_has_a_direction() {
+        let p = policy(r#"{"version":1,"hides":{"cursor":["claude-code"]}}"#);
+        assert_eq!(p.reach_for("cursor"), all_but(&["claude-code"]));
+        assert_eq!(p.reach_for("claude-code"), all_but(&[]));
+    }
+
+    #[test]
+    fn every_agent_stands_for_either_side() {
+        let p = policy(r#"{"version":1,"hides":{"*":["codex"],"cursor":["claude-code"]}}"#);
+        assert_eq!(p.reach_for("cursor"), all_but(&["claude-code", "codex"]), "nobody reads codex");
+        assert_eq!(p.reach_for("codex"), all_but(&[]), "codex still reads the others");
+
+        let p = policy(r#"{"version":1,"hides":{"cursor":["*"]}}"#);
+        assert_eq!(p.reach_for("cursor"), Reach::Own);
+        assert_eq!(p.reach_for("codex"), all_but(&[]));
+
+        let p = policy(r#"{"version":1,"hides":{"*":["*"]}}"#);
+        assert_eq!(p.reach_for("cursor"), Reach::Own, "nothing is shared");
     }
 
     #[test]
     fn names_match_exactly() {
-        let p = policy(r#"{"version":1,"reads":{"cursor":["claude-code"]}}"#);
-        assert!(p.authors_for("Cursor").is_empty());
-        assert!(p.authors_for(" cursor").is_empty());
+        let p = policy(r#"{"version":1,"hides":{"cursor":["claude-code"]}}"#);
+        assert_eq!(p.reach_for("Cursor"), all_but(&[]));
+        assert_eq!(p.reach_for(" cursor"), all_but(&[]));
     }
 
     #[test]
-    fn self_grants_and_repeats_are_ignored() {
-        let p = policy(r#"{"version":1,"reads":{"cursor":["cursor","codex","claude-code","codex"]}}"#);
-        assert_eq!(p.authors_for("cursor"), ["claude-code", "codex"]);
+    fn self_exclusions_and_repeats_are_ignored() {
+        let p = policy(r#"{"version":1,"hides":{"cursor":["cursor","codex","claude-code","codex"]}}"#);
+        assert_eq!(p.reach_for("cursor"), all_but(&["claude-code", "codex"]));
     }
 
     #[test]
     fn an_unknown_version_is_invalid() {
-        let e = SharingPolicy::parse(r#"{"version":2,"reads":{}}"#).unwrap_err();
+        let e = SharingPolicy::parse(r#"{"version":2,"hides":{}}"#).unwrap_err();
         assert!(matches!(e, SharingError::Version(2)), "{e}");
         assert!(e.to_string().contains("version 2"), "{e}");
     }
 
     #[test]
     fn an_unknown_field_is_invalid() {
-        let e = SharingPolicy::parse(r#"{"version":1,"read":{"cursor":["codex"]}}"#).unwrap_err();
+        let e = SharingPolicy::parse(r#"{"version":1,"hide":{"cursor":["codex"]}}"#).unwrap_err();
         assert!(matches!(e, SharingError::Json(_)), "{e}");
-        assert!(e.to_string().contains("read"), "the message must name the field: {e}");
+        assert!(e.to_string().contains("hide"), "the message must name the field: {e}");
     }
 
     #[test]
     fn a_blank_name_is_invalid() {
-        for text in [r#"{"version":1,"reads":{" ":["codex"]}}"#, r#"{"version":1,"reads":{"cursor":[""]}}"#] {
+        for text in [r#"{"version":1,"hides":{" ":["codex"]}}"#, r#"{"version":1,"hides":{"cursor":[""]}}"#] {
             assert!(matches!(SharingPolicy::parse(text), Err(SharingError::BlankName)), "{text}");
         }
     }
 
     #[test]
-    fn an_unreadable_policy_shares_nothing() {
+    fn an_unreadable_policy_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(sharing_file(dir.path()), "{ not json").unwrap();
         assert!(matches!(load(dir.path()), Err(SharingError::Json(_))));
     }
 
     #[test]
-    fn grant_and_revoke_rewrite_the_policy() {
+    fn hide_and_unhide_rewrite_the_policy() {
         let dir = tempfile::tempdir().unwrap();
         let mut p = load(dir.path()).unwrap();
-        p.grant("cursor", "claude-code");
+        p.hide("cursor", "claude-code");
         save(dir.path(), &p).unwrap();
-        assert_eq!(load(dir.path()).unwrap().authors_for("cursor"), ["claude-code"]);
+        assert_eq!(load(dir.path()).unwrap().reach_for("cursor"), all_but(&["claude-code"]));
         assert!(!sharing_file(dir.path()).with_extension("json.tmp").exists(), "no temporary file is left behind");
 
         let mut p = load(dir.path()).unwrap();
-        p.revoke("cursor", "claude-code");
+        p.unhide("cursor", "claude-code");
         save(dir.path(), &p).unwrap();
         assert_eq!(load(dir.path()).unwrap(), SharingPolicy::default());
     }
 
     #[test]
-    fn a_grant_can_come_before_the_data_directory_exists() {
+    fn an_exclusion_can_come_before_the_data_directory_exists() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join(".clawg-dev");
         let mut p = SharingPolicy::default();
-        p.grant("cursor", "claude-code");
+        p.hide("cursor", "claude-code");
         save(&base, &p).unwrap();
         assert_eq!(load(&base).unwrap(), p);
     }
 
     #[test]
-    fn granting_twice_and_revoking_nothing_are_fine() {
+    fn hiding_twice_and_unhiding_nothing_are_fine() {
         let mut p = SharingPolicy::default();
-        p.grant("cursor", "codex");
-        p.grant("cursor", "codex");
-        assert_eq!(p.authors_for("cursor"), ["codex"]);
-        p.revoke("cursor", "claude-code");
-        p.revoke("nobody", "codex");
-        assert_eq!(p.authors_for("cursor"), ["codex"]);
+        p.hide("cursor", "codex");
+        p.hide("cursor", "codex");
+        assert_eq!(p.reach_for("cursor"), all_but(&["codex"]));
+        p.unhide("cursor", "claude-code");
+        p.unhide("nobody", "codex");
+        assert_eq!(p.reach_for("cursor"), all_but(&["codex"]));
     }
 
     #[test]
@@ -250,7 +296,7 @@ mod tests {
         // change and save. This pins that `load` does fail rather than
         // handing back an empty policy that a save would then write out.
         let dir = tempfile::tempdir().unwrap();
-        let hand_edit = r#"{"version":1,"reads":{"cursor":["claude-code",]}}"#;
+        let hand_edit = r#"{"version":1,"hides":{"cursor":["claude-code",]}}"#;
         std::fs::write(sharing_file(dir.path()), hand_edit).unwrap();
         assert!(load(dir.path()).is_err());
         assert_eq!(std::fs::read_to_string(sharing_file(dir.path())).unwrap(), hand_edit);
@@ -259,19 +305,22 @@ mod tests {
     #[test]
     fn the_saved_file_parses_back_to_the_same_policy() {
         let mut p = SharingPolicy::default();
-        p.grant("codex", "cursor");
-        p.grant("codex", "claude-code");
-        p.grant("cursor", "claude-code");
+        p.hide("codex", "cursor");
+        p.hide("*", "claude-code");
+        p.hide("cursor", "*");
         assert_eq!(SharingPolicy::parse(&p.to_json()).unwrap(), p);
     }
 
     #[test]
-    fn render_lists_one_grant_per_line() {
+    fn render_lists_one_exclusion_per_line() {
         let mut p = SharingPolicy::default();
-        assert_eq!(p.render(), "nothing is shared");
-        p.grant("cursor", "codex");
-        p.grant("cursor", "claude-code");
-        p.grant("codex", "claude-code");
-        assert_eq!(p.render(), "codex reads claude-code\ncursor reads claude-code\ncursor reads codex");
+        assert_eq!(p.render(), "every agent reads every other agent");
+        p.hide("cursor", "codex");
+        p.hide("*", "claude-code");
+        p.hide("codex", "*");
+        assert_eq!(p.render(), "no agent reads claude-code\ncodex reads no other agent\ncursor does not read codex");
+        let mut off = SharingPolicy::default();
+        off.hide("*", "*");
+        assert_eq!(off.render(), "no agent reads another");
     }
 }

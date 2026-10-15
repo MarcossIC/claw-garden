@@ -13,7 +13,7 @@ use std::path::Path;
 
 use clawg_core::memory::dispute::{Resolution, ResolvedRow};
 use clawg_core::memory::prompt_builder::SHARED_NOTE;
-use clawg_core::memory::sharing::{SharingError, SharingPolicy};
+use clawg_core::memory::sharing::{Reach, SharingError, SharingPolicy};
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
 
@@ -273,20 +273,21 @@ pub fn resolve_project(
     }
 }
 
-/// Renders `memory_status`: the daemon's health as pretty JSON, plus the two
-/// facts health cannot carry — which data directory and which profile this
-/// bridge is attached to.
 /// The `memory_status` line on whose memories `reader` reads besides its own.
 pub fn format_sharing(policy: &Result<SharingPolicy, SharingError>, reader: &str) -> String {
     match policy {
-        Ok(p) => match p.authors_for(reader) {
-            authors if authors.is_empty() => "shared: none".to_string(),
-            authors => format!("shared: reads {}", authors.join(", ")),
+        Ok(p) => match p.reach_for(reader) {
+            Reach::Own => "shared: none (reads only its own)".to_string(),
+            Reach::AllBut(hidden) if hidden.is_empty() => "shared: reads every agent".to_string(),
+            Reach::AllBut(hidden) => format!("shared: reads every agent but {}", hidden.join(", ")),
         },
         Err(e) => format!("shared: none ({e})"),
     }
 }
 
+/// Renders `memory_status`: the daemon's health as pretty JSON, plus the
+/// facts health cannot carry — which data directory, profile and agent this
+/// bridge is attached to, and whose memories the agent reads.
 pub fn format_status(
     health: &Health,
     profile: Profile,
@@ -645,15 +646,16 @@ mod tests {
 
     #[test]
     fn format_status_says_whom_the_agent_reads() {
-        let policy = SharingPolicy::parse(r#"{"version":1,"reads":{"cursor":["codex","claude-code"]}}"#);
-        assert_eq!(format_sharing(&policy, "cursor"), "shared: reads claude-code, codex");
-        assert_eq!(format_sharing(&policy, "codex"), "shared: none");
+        let policy = SharingPolicy::parse(r#"{"version":1,"hides":{"cursor":["codex","claude-code"],"aider":["*"]}}"#);
+        assert_eq!(format_sharing(&policy, "cursor"), "shared: reads every agent but claude-code, codex");
+        assert_eq!(format_sharing(&policy, "codex"), "shared: reads every agent");
+        assert_eq!(format_sharing(&policy, "aider"), "shared: none (reads only its own)");
         let broken = SharingPolicy::parse(r#"{"version":2}"#);
         let line = format_sharing(&broken, "cursor");
         assert!(line.starts_with("shared: none (") && line.contains("version 2"), "{line}");
 
         let out = format_status(&health(), Profile::Dev, Path::new("/d"), "cursor", "from --agent", &format_sharing(&policy, "cursor"));
-        assert!(out.ends_with("\nshared: reads claude-code, codex"), "out was: {out}");
+        assert!(out.ends_with("\nshared: reads every agent but claude-code, codex"), "out was: {out}");
     }
 
     fn by(mut h: Hit, author: &str) -> Hit {

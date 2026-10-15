@@ -93,7 +93,7 @@ impl EvalScope {
             project_id: None,
             lexical: self.lexical,
             // One agent's corpus: nothing to share.
-            shared_from: Vec::new(),
+            reach: crate::memory::sharing::Reach::Own,
         }
     }
 }

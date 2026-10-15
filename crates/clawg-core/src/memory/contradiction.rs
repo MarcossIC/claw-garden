@@ -116,9 +116,9 @@ fn contradiction_search_scope(project_id: Option<&str>, pool: usize) -> SearchSc
         procedural: None,
         project_id: project_id.map(str::to_owned),
         lexical: None,
-        // A save disputes only the saver's own rows: a grant lets an agent
+        // A save disputes only the saver's own rows: sharing lets an agent
         // read another's memories, never mark them disputed.
-        shared_from: Vec::new(),
+        reach: crate::memory::sharing::Reach::Own,
     }
 }
 
@@ -427,12 +427,12 @@ mod tests {
         );
     }
 
-    /// The detector runs with no grants whatever the policy says: a save may
-    /// dispute the saver's own rows, never ones it was only allowed to read.
+    /// The detector reaches the saver's own rows whatever the sharing policy
+    /// says: a save may dispute those, never rows it is only allowed to read.
     #[test]
-    fn contradiction_probe_ignores_granted_authors() {
+    fn contradiction_probe_ignores_shared_authors() {
         let scope = contradiction_search_scope(Some("proj"), CANDIDATE_POOL);
-        assert!(scope.shared_from.is_empty(), "{:?}", scope.shared_from);
+        assert_eq!(scope.reach, crate::memory::sharing::Reach::Own);
     }
 
     // ── Type gate: candidate side ───────────────────────────────────────────

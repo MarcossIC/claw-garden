@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use clawg_core::memory::sharing;
 use clawg_core::paths::{Profile, ProfileError};
 
 /// `clawg` — local-first memory for coding agents.
@@ -94,10 +95,11 @@ pub enum Command {
         #[command(flatten)]
         profile: ProfileArg,
     },
-    /// Show which agents may read which agents' memories, or change it with
-    /// `grant` and `revoke`. Nothing is shared until granted; a change counts
-    /// from the next search, with the daemon running. Check `clawg secrets`
-    /// before granting: a shared memory reaches the other agent's provider.
+    /// Show which agents do not read which agents' memories, or change it with
+    /// `hide` and `unhide`. Every agent reads every other agent until hidden;
+    /// a change counts from the next search, with the daemon running. A shared
+    /// memory reaches the other agent's provider: `clawg secrets` lists the
+    /// rows that hold a secret.
     Sharing {
         #[command(subcommand)]
         action: Option<SharingAction>,
@@ -125,39 +127,41 @@ pub enum Command {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum SharingAction {
-    /// Let READER read the memories AUTHOR saves. Only that way round.
-    Grant(Grant),
-    /// Take a grant away.
-    Revoke(Grant),
+    /// Stop READER from reading the memories AUTHOR saves. Only that way
+    /// round; `*` on either side stands for every agent.
+    Hide(Exclusion),
+    /// Take an exclusion away.
+    Unhide(Exclusion),
 }
 
 impl SharingAction {
     /// The `--profile` the action was given, if any.
     pub fn profile(&self) -> &ProfileArg {
         match self {
-            SharingAction::Grant(g) | SharingAction::Revoke(g) => &g.profile,
+            SharingAction::Hide(e) | SharingAction::Unhide(e) => &e.profile,
         }
     }
 }
 
-/// One directed grant: READER may read what AUTHOR saved.
+/// One directed exclusion: READER does not read what AUTHOR saved.
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
-pub struct Grant {
-    /// The agent that reads, as `memory_status` names it.
+pub struct Exclusion {
+    /// The agent that reads, as `memory_status` names it, or `*`.
     #[arg(value_parser = parse_agent)]
     pub reader: String,
-    /// The agent whose memories it reads.
+    /// The agent whose memories it does not read, or `*`.
     #[arg(value_parser = parse_agent)]
     pub author: String,
     #[command(flatten)]
     pub profile: ProfileArg,
 }
 
-impl Grant {
-    /// Refuses a grant to oneself: an agent always reads its own memories, and
-    /// accepting it would tell the user something changed when nothing did.
+impl Exclusion {
+    /// Refuses hiding an agent from itself: an agent always reads its own
+    /// memories, and accepting it would tell the user something changed when
+    /// nothing did. `* *` is not that: it means no agent reads another.
     pub fn check(&self) -> Result<(), String> {
-        if self.reader == self.author {
+        if self.reader == self.author && self.reader != sharing::EVERY_AGENT {
             return Err(format!("{} always reads its own memories", self.reader));
         }
         Ok(())
@@ -489,32 +493,43 @@ mod tests {
     }
 
     #[test]
-    fn sharing_shows_grants_and_revokes() {
+    fn sharing_shows_hides_and_unhides() {
         assert_eq!(
             parse(&["clawg", "sharing"]).command,
             Command::Sharing { action: None, profile: ProfileArg { profile: None } }
         );
-        let grant = Grant { reader: "cursor".into(), author: "claude-code".into(), profile: ProfileArg { profile: Some("dev".into()) } };
+        let e = Exclusion { reader: "cursor".into(), author: "claude-code".into(), profile: ProfileArg { profile: Some("dev".into()) } };
         assert_eq!(
-            parse(&["clawg", "sharing", "grant", " cursor ", "claude-code", "--profile", "dev"]).command,
-            Command::Sharing { action: Some(SharingAction::Grant(grant.clone())), profile: ProfileArg { profile: None } }
+            parse(&["clawg", "sharing", "hide", " cursor ", "claude-code", "--profile", "dev"]).command,
+            Command::Sharing { action: Some(SharingAction::Hide(e.clone())), profile: ProfileArg { profile: None } }
         );
         assert_eq!(
-            parse(&["clawg", "sharing", "revoke", "cursor", "claude-code", "--profile", "dev"]).command,
-            Command::Sharing { action: Some(SharingAction::Revoke(grant)), profile: ProfileArg { profile: None } }
+            parse(&["clawg", "sharing", "unhide", "cursor", "claude-code", "--profile", "dev"]).command,
+            Command::Sharing { action: Some(SharingAction::Unhide(e)), profile: ProfileArg { profile: None } }
         );
     }
 
-    #[test]
-    fn sharing_rejects_a_blank_or_self_grant() {
-        assert!(Cli::try_parse_from(["clawg", "sharing", "grant", " ", "claude-code"]).is_err());
-        assert!(Cli::try_parse_from(["clawg", "sharing", "grant", "cursor"]).is_err(), "both agents are needed");
-        let Command::Sharing { action: Some(SharingAction::Grant(g)), .. } =
-            parse(&["clawg", "sharing", "grant", "cursor", "cursor"]).command
-        else {
-            panic!("expected a grant");
+    fn hide_of(args: &[&str]) -> Exclusion {
+        let Command::Sharing { action: Some(SharingAction::Hide(e)), .. } = parse(args).command else {
+            panic!("expected a hide");
         };
-        assert_eq!(g.check(), Err("cursor always reads its own memories".to_string()));
+        e
+    }
+
+    #[test]
+    fn sharing_rejects_a_blank_or_self_exclusion() {
+        assert!(Cli::try_parse_from(["clawg", "sharing", "hide", " ", "claude-code"]).is_err());
+        assert!(Cli::try_parse_from(["clawg", "sharing", "hide", "cursor"]).is_err(), "both agents are needed");
+        let e = hide_of(&["clawg", "sharing", "hide", "cursor", "cursor"]);
+        assert_eq!(e.check(), Err("cursor always reads its own memories".to_string()));
+    }
+
+    #[test]
+    fn every_agent_is_accepted_on_either_side() {
+        for args in [["*", "codex"], ["cursor", "*"], ["*", "*"]] {
+            let e = hide_of(&["clawg", "sharing", "hide", args[0], args[1]]);
+            assert_eq!(e.check(), Ok(()), "{args:?}");
+        }
     }
 
     #[test]

@@ -671,10 +671,7 @@ async fn finds(h: &Harness, agent: &str, id: i64) -> bool {
 async fn search_and_context_follow_the_sharing_policy_from_the_next_call() {
     let h = Harness::start().await;
     let saved = save_id(&h, json!({ "content": CONTENT, "agent_id": "a" })).await;
-    assert!(!finds(&h, "b", saved).await, "nothing is shared without a policy");
-
-    write_policy(&h, r#"{"version":1,"reads":{"b":["a"]}}"#);
-    assert!(finds(&h, "b", saved).await, "the grant counts without a restart");
+    assert!(finds(&h, "b", saved).await, "everything is shared without a policy");
     let (_, body) = h.post_json("/v1/search", json!({ "query": CONTENT, "agent_id": "b" })).await;
     let hit = body["hits"].as_array().unwrap().iter().find(|hit| hit["id"].as_i64() == Some(saved)).cloned().unwrap();
     assert_eq!(hit["agent_id"], "a", "{body}");
@@ -682,10 +679,14 @@ async fn search_and_context_follow_the_sharing_policy_from_the_next_call() {
     assert_eq!(status, 200, "{body}");
     assert!(body["prompt"].as_str().unwrap().contains(" by a] "), "{body}");
 
-    write_policy(&h, r#"{"version":1,"reads":{}}"#);
-    assert!(!finds(&h, "b", saved).await, "the revoke counts without a restart");
+    write_policy(&h, r#"{"version":1,"hides":{"b":["a"]}}"#);
+    assert!(!finds(&h, "b", saved).await, "hiding counts without a restart");
     let (_, body) = h.post_json("/v1/context", json!({ "query": CONTENT, "agent_id": "b" })).await;
     assert!(!body["prompt"].as_str().unwrap().contains(CONTENT), "{body}");
+    assert!(finds(&h, "c", saved).await, "only b was told not to read a");
+
+    write_policy(&h, r#"{"version":1,"hides":{}}"#);
+    assert!(finds(&h, "b", saved).await, "unhiding counts without a restart");
 }
 
 #[tokio::test]
@@ -693,7 +694,7 @@ async fn an_unreadable_policy_shares_nothing_over_http() {
     let h = Harness::start().await;
     let theirs = save_id(&h, json!({ "content": CONTENT, "agent_id": "a" })).await;
     let mine = save_id(&h, json!({ "content": format!("{CONTENT} too"), "agent_id": "b" })).await;
-    write_policy(&h, r#"{"version":2,"reads":{"b":["a"]}}"#);
+    write_policy(&h, r#"{"version":2,"hides":{}}"#);
     assert!(!finds(&h, "b", theirs).await);
     assert!(finds(&h, "b", mine).await, "an agent keeps its own memories");
 }
