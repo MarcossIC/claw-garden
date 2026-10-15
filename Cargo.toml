@@ -41,6 +41,10 @@ siphasher = "1.0"
 # download path is our own (reqwest + rustls), never fastembed's built-in hf-hub.
 # `ort-download-binaries` is the minimal config for "offline init from bytes".
 fastembed = { version = "5", default-features = false, features = ["ort-download-binaries"] }
+# Only to configure the CPU provider fastembed runs on. Pinned to the exact ort
+# release fastembed resolves to, so both name the same crate; raise it with
+# fastembed.
+ort = { version = "=2.0.0-rc.12", default-features = false }
 fs2 = "0.4"
 
 # Ingest (chunking and tokenization)

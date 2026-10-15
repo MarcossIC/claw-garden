@@ -370,6 +370,7 @@ dependencies = [
  "log",
  "mockito",
  "once_cell",
+ "ort",
  "refinery",
  "regex",
  "reqwest",

@@ -126,6 +126,14 @@ fn e5_model(onnx: Vec<u8>, tokenizer: TokenizerFiles) -> UserDefinedEmbeddingMod
     UserDefinedEmbeddingModel::new(onnx, tokenizer).with_pooling(Pooling::Mean)
 }
 
+/// ONNX Runtime's CPU provider with its arena off. The arena keeps the largest
+/// block an inference run ever asked for and never gives it back, so the
+/// daemon would hold its indexing peak while idle. Without it the memory goes
+/// back after each run.
+fn cpu_provider() -> ort::ep::CPU {
+    ort::ep::CPU::default().with_arena_allocator(false)
+}
+
 /// The token window fastembed truncates the model input to. Pinned as an
 /// explicit constant rather than left at fastembed's own default: the query
 /// composer's budget (`memory::query_context::query_budget_tokens`) has to
@@ -269,7 +277,9 @@ impl FastEmbedLocal {
         // Pinned explicitly so the composer's budget and the embedder's own
         // truncation point are provably the same number, not two constants
         // that happen to agree today.
-        let init_opts = InitOptionsUserDefined::new().with_max_length(EMBED_MAX_TOKENS);
+        let init_opts = InitOptionsUserDefined::new()
+            .with_max_length(EMBED_MAX_TOKENS)
+            .with_execution_providers(vec![cpu_provider().build()]);
 
         // Synchronous load on the calling thread: surface load errors immediately.
         // `embed()` takes `&mut self` in fastembed v5 (interior session state).
@@ -664,6 +674,11 @@ mod tests {
             vec!["query: chunk-a".to_string(), "query: chunk-b".to_string()],
             "every text must be prefixed per role before crossing the channel"
         );
+    }
+
+    #[test]
+    fn the_cpu_provider_turns_its_arena_off() {
+        assert_eq!(format!("{:?}", cpu_provider()), "CPU { use_arena: false }");
     }
 
     /// A batch longer than `EMBED_BATCH` crosses the channel as requests of at

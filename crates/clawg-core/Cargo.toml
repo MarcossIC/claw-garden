@@ -47,6 +47,7 @@ siphasher.workspace = true
 
 # Embedder
 fastembed.workspace = true
+ort.workspace = true
 fs2.workspace = true
 
 # Ingest (chunking and tokenization)
