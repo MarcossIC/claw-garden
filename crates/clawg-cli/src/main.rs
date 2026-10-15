@@ -11,7 +11,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use clawg_cli::cli::{Cli, Command, PathAction};
+use clawg_cli::cli::{sharing_profile, Cli, Command, PathAction};
 use clawg_cli::client::{probe_running, ClientError, DaemonClient, Probe};
 use clawg_cli::daemon::lifecycle::{now_ms, read_state};
 use clawg_cli::daemon::serve;
@@ -165,7 +165,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         }
 
         Command::Sharing { action, profile } => {
-            let profile = action.as_ref().map_or(&profile, |a| a.profile()).resolve().map_err(|e| e.to_string())?;
+            let profile = sharing_profile(action.as_ref(), &profile).resolve().map_err(|e| e.to_string())?;
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
             println!("{}", sharing::run(&base_dir, action.as_ref())?);
             Ok(ExitCode::SUCCESS)

@@ -143,6 +143,14 @@ impl SharingAction {
     }
 }
 
+/// The `--profile` a `clawg sharing` run uses: the action's when it was given
+/// after the subcommand, else the one given before it. Both spellings are
+/// accepted, and an exclusion written to another profile's data directory
+/// would leave the daemon sharing what the user believes is hidden.
+pub fn sharing_profile<'a>(action: Option<&'a SharingAction>, own: &'a ProfileArg) -> &'a ProfileArg {
+    action.map(SharingAction::profile).filter(|p| p.profile.is_some()).unwrap_or(own)
+}
+
 /// One directed exclusion: READER does not read what AUTHOR saved.
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
 pub struct Exclusion {
@@ -522,6 +530,23 @@ mod tests {
         assert!(Cli::try_parse_from(["clawg", "sharing", "hide", "cursor"]).is_err(), "both agents are needed");
         let e = hide_of(&["clawg", "sharing", "hide", "cursor", "cursor"]);
         assert_eq!(e.check(), Err("cursor always reads its own memories".to_string()));
+    }
+
+    #[test]
+    fn sharing_takes_the_profile_from_either_side_of_the_action() {
+        for args in [
+            ["clawg", "sharing", "--profile", "dev", "hide", "cursor", "codex"],
+            ["clawg", "sharing", "hide", "cursor", "codex", "--profile", "dev"],
+        ] {
+            let Command::Sharing { action, profile } = parse(&args).command else {
+                panic!("expected sharing");
+            };
+            assert_eq!(sharing_profile(action.as_ref(), &profile).profile.as_deref(), Some("dev"), "{args:?}");
+        }
+        let Command::Sharing { action, profile } = parse(&["clawg", "sharing", "hide", "cursor", "codex"]).command else {
+            panic!("expected sharing");
+        };
+        assert_eq!(sharing_profile(action.as_ref(), &profile).profile, None);
     }
 
     #[test]
