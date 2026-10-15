@@ -33,6 +33,10 @@ const LONG_CASES: usize = 12;
 /// set promises, so the fact placed two thirds in stays past the first piece
 /// even where the real tokenizer packs more text into a piece.
 const LONG_MIN_PIECES: usize = 4;
+/// The piece cap the long rows are sized against: the one production split a
+/// long save at when the subset was defined. Production's cap can move; the
+/// rows that measure it must not move with it.
+const LONG_PIECE_TOKENS: usize = 424;
 
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum SynthError {
@@ -427,7 +431,7 @@ fn long_saves(base: &Golden, names: &mut Codenames, rng: &mut SplitMix64) -> (Ve
         let opening = templates::fill(rng.pick(templates::long_openings(spanish)), &[("{key}", &key)]);
 
         let mut sentences = vec![opening];
-        while clawg_core::eval_api::fallback_pieces(&sentences.join(" ")).len() < LONG_MIN_PIECES {
+        while clawg_core::eval_api::fallback_pieces(&sentences.join(" "), LONG_PIECE_TOKENS).len() < LONG_MIN_PIECES {
             let frame = *rng.pick(templates::long_filler(spanish));
             let count = (2 + rng.below(98)).to_string();
             let topic = *rng.pick(templates::long_topics(spanish));
@@ -1033,7 +1037,7 @@ mod tests {
             assert_eq!(row.content.matches(answer).count(), 1, "{answer}");
             let at = row.content.find(answer).unwrap();
             assert!(at > row.content.len() / 3, "{answer} sits at byte {at} of {}", row.content.len());
-            let first = &clawg_core::eval_api::fallback_pieces(&row.content)[0];
+            let first = &clawg_core::eval_api::fallback_pieces(&row.content, LONG_PIECE_TOKENS)[0];
             assert!(!first.contains(answer), "{answer} is already in the first piece");
             assert_eq!(out.corpus.iter().filter(|r| r.content.contains(answer)).count(), 1, "{answer}");
             assert!(answers.insert(answer.to_string()), "{answer} repeats");
@@ -1045,7 +1049,7 @@ mod tests {
         let out = generate(&grouped_base(), 7, &NONE).unwrap();
         let mut pieces = HashSet::new();
         for (_, row) in long_cases(&out) {
-            let split = clawg_core::eval_api::fallback_pieces(&row.content);
+            let split = clawg_core::eval_api::fallback_pieces(&row.content, LONG_PIECE_TOKENS);
             assert!(split.len() >= 3, "{} has {} pieces", row.ref_, split.len());
             for piece in split {
                 assert!(pieces.insert(piece), "{} shares a piece with another long row", row.ref_);
@@ -1068,6 +1072,16 @@ mod tests {
         out.retrieval_cases.retain(|c| c.subset != Subset::Long);
         let digest = clawg_core::eval_api::sha256_hex(serde_json::to_string(&out).unwrap().as_bytes());
         assert_eq!(digest, "f05a66281b5db6008277aee3fec78691b881f58f02b14102e37d401f5ebc1d27");
+    }
+
+    /// The long rows seed 7 gives, pinned so that moving the cap production
+    /// splits a save at does not move the set that measures it.
+    #[test]
+    fn long_rows_do_not_depend_on_the_piece_cap() {
+        let out = generate(&grouped_base(), 7, &NONE).unwrap();
+        let long: Vec<&Row> = out.corpus.iter().filter(|r| r.ref_.starts_with("s-long-")).collect();
+        let digest = clawg_core::eval_api::sha256_hex(serde_json::to_string(&long).unwrap().as_bytes());
+        assert_eq!(digest, "ea1ac4ed4ce564b3632e6b1593ba7ef9d32b099b2e98b8329325f6fbf85beff9");
     }
 
     fn base() -> Golden {
