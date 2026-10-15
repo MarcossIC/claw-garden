@@ -208,28 +208,35 @@ impl MemoryStore {
             return Ok(HashMap::new());
         }
         self.conn
-            .call(move |c| -> rusqlite::Result<HashMap<i64, SaveLink>> {
-                let placeholders = vec!["?"; memory_ids.len()].join(", ");
-                let sql = format!(
-                    "SELECT p.memory_id, p.save_id, p.piece, \
-                            (SELECT COUNT(*) FROM memory_piece q WHERE q.save_id = p.save_id) \
-                     FROM memory_piece p WHERE p.memory_id IN ({placeholders}) \
-                     ORDER BY p.memory_id, p.save_id, p.piece"
-                );
-                let mut stmt = c.prepare(&sql)?;
-                let rows = stmt.query_map(rusqlite::params_from_iter(memory_ids.iter()), |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-                })?;
-                let mut links = HashMap::new();
-                for row in rows {
-                    let (memory_id, save_id, piece, pieces) = row?;
-                    links.entry(memory_id).or_insert(SaveLink { save_id, position: PiecePosition { piece, pieces } });
-                }
-                Ok(links)
-            })
+            .call(move |c| read_links(c, &memory_ids))
             .await
             .map_err(backend("save_links"))
     }
+}
+
+/// [`MemoryStore::save_links`] on a connection already in hand, for a caller
+/// that is itself running on the database thread.
+pub(crate) fn read_links(c: &rusqlite::Connection, memory_ids: &[i64]) -> rusqlite::Result<HashMap<i64, SaveLink>> {
+    if memory_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = vec!["?"; memory_ids.len()].join(", ");
+    let sql = format!(
+        "SELECT p.memory_id, p.save_id, p.piece, \
+                (SELECT COUNT(*) FROM memory_piece q WHERE q.save_id = p.save_id) \
+         FROM memory_piece p WHERE p.memory_id IN ({placeholders}) \
+         ORDER BY p.memory_id, p.save_id, p.piece"
+    );
+    let mut stmt = c.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(memory_ids.iter()), |r| {
+        Ok((r.get::<_, i64>(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+    })?;
+    let mut links = HashMap::new();
+    for row in rows {
+        let (memory_id, save_id, piece, pieces) = row?;
+        links.entry(memory_id).or_insert(SaveLink { save_id, position: PiecePosition { piece, pieces } });
+    }
+    Ok(links)
 }
 
 /// The save, if any, that already links exactly these rows in this order.
