@@ -14,8 +14,9 @@ use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 
 use crate::memory::chunker::{
-    select_chunker, ChatChunker, Chunk, ChunkerKind, CodeChunker, CHUNK_MAX_TOKENS,
+    embedding_text, select_chunker, ChatChunker, Chunk, ChunkerKind, CodeChunker, SaveSplit,
 };
+use crate::memory::pieces::StoredPiece;
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::events::{MemoryEvent, MemorySource};
 use crate::memory::redact::{redact, SecretKind};
@@ -438,13 +439,13 @@ async fn process_event(
     // because a compaction summary is deliberately synthesized content worth
     // keeping regardless of which role produced the text it summarizes. All
     // other sources keep the existing role-based routing.
-    let chunks = if evt.source == MemorySource::Compaction {
-        chat_chunker.chunk(&content, CHUNK_MAX_TOKENS)
+    let SaveSplit { pieces: chunks, head } = if evt.source == MemorySource::Compaction {
+        chat_chunker.split_save(&content)
     } else {
         let kind = select_chunker(evt.role.clone(), evt.is_error, &content);
         match kind {
-            ChunkerKind::Chat => chat_chunker.chunk(&content, CHUNK_MAX_TOKENS),
-            ChunkerKind::Code => code_chunker.chunk(&content, None),
+            ChunkerKind::Chat => chat_chunker.split_save(&content),
+            ChunkerKind::Code => SaveSplit { pieces: code_chunker.chunk(&content, None), head: None },
             ChunkerKind::Skip => return IngestReport { redacted, ..Default::default() },
         }
     };
@@ -474,6 +475,12 @@ async fn process_event(
     // `stored[i]` is what the i-th collapsed chunk became, so the report keeps
     // chunk order even though absorbed chunks are settled before the rest.
     let pending_chunks = collapse_duplicate_chunks(chunks);
+    // The head goes into the embedder with every piece after the first; the
+    // first already starts with it.
+    let context = |position: usize| match &head {
+        Some(head) if position > 0 => head.as_str(),
+        _ => "",
+    };
     let mut stored: Vec<Option<SavedChunk>> = vec![None; pending_chunks.len()];
     let mut survivors: Vec<(usize, PendingChunk)> = Vec::new();
     for (position, pending) in pending_chunks.into_iter().enumerate() {
@@ -492,6 +499,7 @@ async fn process_event(
         redacted: redacted.clone(),
     };
     if survivors.is_empty() {
+        link_save(store, &stored, &[]).await;
         return report(stored, None);
     }
 
@@ -501,7 +509,8 @@ async fn process_event(
     // with no second inference call, so both sides of `contradiction.rs`'s
     // comparison live in the same Passage space `CONTRADICTION_THRESHOLD`
     // was tuned against.
-    let texts: Vec<String> = survivors.iter().map(|(_, p)| p.chunk.text.clone()).collect();
+    let texts: Vec<String> =
+        survivors.iter().map(|(position, p)| embedding_text(context(*position), &p.chunk.text).into_owned()).collect();
     let vectors = match embedder.embed_batch(&texts, EmbedRole::Passage).await {
         Ok(v) => v,
         Err(EmbedError::NotReady) | Err(EmbedError::WorkerGone) => {
@@ -534,6 +543,7 @@ async fn process_event(
     // dispute each other. The rows a conclusion was drawn from are passed the
     // same way: it restates them, it does not contradict them.
     let mut siblings: Vec<i64> = evt.sources().to_vec();
+    let mut embedded_with: Vec<(usize, String)> = Vec::new();
     for ((position, pending), vec) in survivors.into_iter().zip(vectors) {
         let PendingChunk { chunk, content_hash, multiplicity } = pending;
         // The contradiction hook runs between embed and insert: it needs the
@@ -554,6 +564,7 @@ async fn process_event(
             }
         };
         stored[position] = Some(SavedChunk { id, outcome: ChunkOutcome::Inserted });
+        embedded_with.push((position, context(position).to_string()));
         siblings.push(id);
         // The extra copies now find the row this iteration just wrote and
         // take the same branch a copy from a later event takes.
@@ -561,7 +572,33 @@ async fn process_event(
             absorb_duplicate(store, evt, &content_hash, absorbed).await;
         }
     }
+    link_save(store, &stored, &embedded_with).await;
     report(stored, None)
+}
+
+/// Links the pieces of a finished save of two or more. `embedded_with` names
+/// the positions this event inserted and the head each was embedded behind;
+/// a position it absorbed into an existing row keeps that row's vector, made
+/// without this head, so its link carries none.
+///
+/// A failure here leaves the rows unlinked, which is how every save was stored
+/// before links existed; the save itself did not fail and is not reported as
+/// failed.
+async fn link_save(store: &Arc<MemoryStore>, stored: &[Option<SavedChunk>], embedded_with: &[(usize, String)]) {
+    if stored.len() < 2 {
+        return;
+    }
+    let pieces: Vec<StoredPiece> = stored
+        .iter()
+        .enumerate()
+        .filter_map(|(position, saved)| {
+            let context = embedded_with.iter().find(|(p, _)| *p == position).map(|(_, c)| c.clone());
+            saved.map(|s| StoredPiece { memory_id: s.id, context: context.unwrap_or_default() })
+        })
+        .collect();
+    if let Err(e) = store.link_pieces(pieces).await {
+        log::warn!("could not link the {} pieces of a save: {e}; they stay unlinked", stored.len());
+    }
 }
 
 /// Resolves the shared tokenizer exactly once and builds the chat chunker
@@ -1500,7 +1537,7 @@ mod tests {
     }
 
     fn chunk_count(content: &str) -> usize {
-        ChatChunker::with_fallback().chunk(content, CHUNK_MAX_TOKENS).len()
+        ChatChunker::with_fallback().split_save(content).pieces.len()
     }
 
     /// Hands the i-th text of each batch the i-th vector, so a test decides
@@ -1587,6 +1624,146 @@ mod tests {
         for saved in &report.memories {
             assert_eq!(disputes_of(&store, saved.id).await, ("disputed".to_string(), Some(format!("[{older}]"))));
         }
+    }
+
+    // ── The pieces of a long save ───────────────────────────────────────────
+
+    /// `FakeEmbedder`, keeping every text it was handed.
+    struct TextRecorder {
+        texts: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl Embedder for TextRecorder {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+            self.texts.lock().unwrap().push(text.to_string());
+            FakeEmbedder::default().embed_with_role(text, role).await
+        }
+        fn dimensions(&self) -> usize { 384 }
+        fn model_id(&self) -> &str { "text-recorder" }
+        fn query_prefix(&self) -> &str { "" }
+        fn passage_prefix(&self) -> &str { "" }
+    }
+
+    fn recorder() -> (Arc<dyn Embedder>, Arc<std::sync::Mutex<Vec<String>>>) {
+        let texts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        (Arc::new(TextRecorder { texts: texts.clone() }), texts)
+    }
+
+    async fn piece_links(store: &MemoryStore) -> Vec<(i64, i64, i64, String)> {
+        store
+            .conn
+            .call(|c| {
+                let mut stmt =
+                    c.prepare("SELECT save_id, piece, memory_id, context FROM memory_piece ORDER BY save_id, piece")?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn content_of(store: &MemoryStore, id: i64) -> String {
+        store
+            .conn
+            .call(move |c| c.query_row("SELECT content FROM memory WHERE id = ?1", [id], |r| r.get(0)))
+            .await
+            .unwrap()
+    }
+
+    fn long_save() -> String {
+        format!("Notes on clawg-ledger, the crate that settles balances. {}", distinct_text(1000))
+    }
+
+    #[tokio::test]
+    async fn a_single_piece_save_embeds_its_text_and_leaves_no_link() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let (embedder, texts) = recorder();
+
+        let report = process_with(embedder, &store, &explicit_fact("the build uses cargo")).await;
+
+        assert_eq!(report.memories.len(), 1);
+        assert_eq!(*texts.lock().unwrap(), vec!["the build uses cargo".to_string()]);
+        assert!(piece_links(&store).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn later_pieces_are_embedded_with_the_head_and_stored_without_it() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let content = long_save();
+        let SaveSplit { pieces, head } = ChatChunker::with_fallback().split_save(&content);
+        let head = head.expect("the fixture is long");
+        assert!(pieces.len() >= 3, "fixture must split into at least three pieces");
+        let (embedder, texts) = recorder();
+
+        let report = process_with(embedder, &store, &explicit_fact(&content)).await;
+
+        assert_eq!(report.failure, None);
+        let mut expected = vec![pieces[0].text.clone()];
+        expected.extend(pieces[1..].iter().map(|p| format!("{head}\n…\n{}", p.text)));
+        assert_eq!(*texts.lock().unwrap(), expected);
+        for (saved, piece) in report.memories.iter().zip(&pieces) {
+            assert_eq!(content_of(&store, saved.id).await, piece.text, "a stored row keeps only its piece");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_long_save_links_its_pieces_in_order() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let content = long_save();
+        let head = ChatChunker::with_fallback().split_save(&content).head.unwrap();
+
+        let report = process_with(Arc::new(FakeEmbedder::default()), &store, &explicit_fact(&content)).await;
+
+        let expected: Vec<(i64, i64, i64, String)> = report
+            .memories
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (1, i as i64 + 1, m.id, if i == 0 { String::new() } else { head.clone() }))
+            .collect();
+        assert_eq!(piece_links(&store).await, expected);
+    }
+
+    #[tokio::test]
+    async fn an_absorbed_piece_is_linked_without_context() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let content = long_save();
+        let SaveSplit { pieces, head } = ChatChunker::with_fallback().split_save(&content);
+        let held = saved(&store, &explicit_fact(&pieces[1].text)).await[0].id;
+
+        let report = process_with(Arc::new(FakeEmbedder::default()), &store, &explicit_fact(&content)).await;
+
+        assert_eq!(report.memories[1], SavedChunk { id: held, outcome: ChunkOutcome::Reinforced });
+        let links = piece_links(&store).await;
+        assert_eq!(links[1], (1, 2, held, String::new()));
+        assert_eq!(links[2].3, head.unwrap(), "an inserted piece still records its head");
+    }
+
+    #[tokio::test]
+    async fn a_save_cut_short_leaves_no_link() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+
+        let report = process_with(Arc::new(NanAtEmbedder { position: 1 }), &store, &explicit_fact(&long_save())).await;
+
+        assert!(report.failure.is_some());
+        assert!(piece_links(&store).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_same_long_save_again_links_the_rows_it_left() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let content = long_save();
+        let head = ChatChunker::with_fallback().split_save(&content).head.unwrap();
+        let cut = process_with(Arc::new(NanAtEmbedder { position: 2 }), &store, &explicit_fact(&content)).await;
+        assert_eq!(cut.memories.len(), 2, "the first two pieces were stored before the failure");
+
+        let report = process_with(Arc::new(FakeEmbedder::default()), &store, &explicit_fact(&content)).await;
+        process_with(Arc::new(FakeEmbedder::default()), &store, &explicit_fact(&content)).await;
+
+        assert_eq!(report.failure, None);
+        let links = piece_links(&store).await;
+        assert_eq!(links.len(), report.memories.len(), "saving it a third time links nothing new");
+        assert_eq!((links[0].2, links[1].2), (cut.memories[0].id, cut.memories[1].id));
+        assert_eq!((links[1].3.as_str(), links[2].3.as_str()), ("", head.as_str()));
     }
 
     // ── Conclusions and their sources ───────────────────────────────────────
@@ -1711,7 +1888,7 @@ mod tests {
     #[tokio::test]
     async fn process_event_stops_at_the_first_failed_insert() {
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
-        let content = distinct_text(700);
+        let content = distinct_text(600);
         assert_eq!(chunk_count(&content), 3, "fixture must split into three chunks");
         let evt = make_event(Role::User, &content, None, 1);
 
@@ -2244,11 +2421,11 @@ mod tests {
         let code_chunker = Arc::new(CodeChunker::new());
 
         let mut absorbed: u64 = 0;
-        // 3584 bytes = cap(1920) + stride(1664): the windowing produces
-        // exactly two windows, [0,1920) and [1664,3584), both 1920 bytes of
-        // the same repeated char — i.e. two byte-identical chunks, no
-        // third partial one.
-        let content = "x".repeat(3584);
+        // Too long for one piece, so it is cut at the piece cap: 3136 bytes =
+        // cap(1696) + stride(1440) gives exactly two windows, [0,1696) and
+        // [1440,3136), both 1696 bytes of the same repeated char — i.e. two
+        // byte-identical chunks, no third partial one.
+        let content = "x".repeat(3136);
         let evt = make_event(Role::User, &content, None, 1);
 
         process_event(&evt, &store, &cell, &chat_chunker, &code_chunker, &mut absorbed)
@@ -2280,21 +2457,22 @@ mod tests {
         let chat_chunker = Arc::new(ChatChunker::with_fallback());
         let code_chunker = Arc::new(CodeChunker::new());
 
-        // Seed the store with ONE row for chunk A ("x" * 1920).
+        // Seed the store with ONE row for chunk A ("x" * 1696), which fits
+        // in one piece and is stored whole.
         let mut absorbed: u64 = 0;
-        let seed_evt = make_event(Role::User, &"x".repeat(1920), None, 1);
+        let seed_evt = make_event(Role::User, &"x".repeat(1696), None, 1);
         process_event(&seed_evt, &store, &cell, &chat_chunker, &code_chunker, &mut absorbed)
             .await;
         assert_eq!(absorbed, 0, "seed insert has no prior row to reinforce");
         assert_eq!(count_memory(&store).await, 1);
 
         // Now send an event carrying TWO copies of the already-stored chunk A.
-        // 3584 bytes (cap + stride), not 3840: with overlap the windowing
-        // over "x"*3840 would produce a third, shorter (512-byte) window
-        // distinct from A — a brand-new chunk this test isn't about. 3584
-        // keeps the fixture to exactly two 1920-byte windows, both == A.
+        // 3136 bytes (piece cap + stride), not more: with overlap a longer
+        // run would produce a third, shorter window distinct from A — a
+        // brand-new chunk this test isn't about. 3136 keeps the fixture to
+        // exactly two 1696-byte windows, both == A.
         absorbed = 0;
-        let dup_evt = make_event(Role::User, &"x".repeat(3584), None, 2);
+        let dup_evt = make_event(Role::User, &"x".repeat(3136), None, 2);
         process_event(&dup_evt, &store, &cell, &chat_chunker, &code_chunker, &mut absorbed)
             .await;
 

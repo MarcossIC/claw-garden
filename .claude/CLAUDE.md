@@ -41,11 +41,13 @@ Design documents live in `docs/`.
 - `clawg doctor [--profile P]`: print as JSON which `clawg.exe` files the PATH resolves to; exit 1 if the first is not the running binary or a second copy exists. Does not open the store.
 - `clawg path add|remove [--dir D]`: edit the user PATH (Windows).
 
-Daemon HTTP API: `GET /health` (open) and, behind the bearer token, `POST/GET /v1/memories`, `POST /v1/search`, `POST /v1/context` (both also reach other agents' memories unless `sharing.json` hides them from the caller; each search hit carries its `agent_id`), `PATCH/DELETE /v1/memories/{kind}/{id}` (`PATCH` takes `importance`, `memory_type` or both; `?agent=` limits them to that agent's rows), `POST /v1/projects` (record a project root and move rows saved under its legacy ids), `POST /v1/backup`, `POST /v1/disputes/resolve` (optional `agent_id`, same scope), `POST /v1/synthesis` (memories no conclusion covers yet, and the conclusions already drawn; optional `agent_id`, same scope), `POST /v1/shutdown`.
+Daemon HTTP API: `GET /health` (open) and, behind the bearer token, `POST/GET /v1/memories`, `POST /v1/search`, `POST /v1/context` (both also reach other agents' memories unless `sharing.json` hides them from the caller; each search hit carries its `agent_id`), `PATCH/DELETE /v1/memories/{kind}/{id}` (`PATCH` takes `importance`, `memory_type` or both; `?agent=` limits them to that agent's rows), `GET /v1/memories/{kind}/{id}/save` (the save the row is a piece of, its pieces joined; same `?agent=` scope), `POST /v1/projects` (record a project root and move rows saved under its legacy ids), `POST /v1/backup`, `POST /v1/disputes/resolve` (optional `agent_id`, same scope), `POST /v1/synthesis` (memories no conclusion covers yet, and the conclusions already drawn; optional `agent_id`, same scope), `POST /v1/shutdown`.
 
 Ingest masks secrets of known formats (`crates/clawg-core/src/memory/redact.rs`) before a save is chunked, hashed or embedded; a confirmed save lists the masked kinds in `redacted`.
 
-MCP tools (`crates/clawg-cli/src/mcp/server.rs`): `save_memory`, `search_memory`, `recall_context`, `list_memories`, `update_memory`, `delete_memory`, `resolve_conflict`, `synthesize`, `memory_status`.
+A save longer than one piece is split at a smaller cap; every piece after the first is embedded behind the save's opening tokens, and `memory_piece` links the pieces (`crates/clawg-core/src/memory/pieces.rs`). Search keeps the best piece of each save and labels it `piece=K/N`.
+
+MCP tools (`crates/clawg-cli/src/mcp/server.rs`): `save_memory`, `search_memory`, `recall_context`, `list_memories`, `read_memory`, `update_memory`, `delete_memory`, `resolve_conflict`, `synthesize`, `memory_status`.
 
 ## Code conventions
 
@@ -70,7 +72,7 @@ MCP tools (`crates/clawg-cli/src/mcp/server.rs`): `save_memory`, `search_memory`
 cargo test --workspace
 ```
 
-Current baseline (Windows): 1675 tests, all passing.
+Current baseline (Windows): 1691 tests, all passing.
 
 On Windows, live `clawg.exe` processes (for example the editor's MCP bridge) lock `target\debug\clawg.exe` and make the build fail. Use a separate target directory instead: `cargo test --workspace --target-dir <other-dir>`.
 

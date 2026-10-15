@@ -1,5 +1,5 @@
 change: agent-sharing
-objective: "4"
+objective: "2, 4"
 depends_on: [visibility-policy, secret-hygiene]
 phase: verify
 artifacts:

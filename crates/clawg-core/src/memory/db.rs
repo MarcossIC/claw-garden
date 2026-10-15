@@ -655,7 +655,7 @@ mod tests {
 
         let after = conn.call(snapshot).await.unwrap();
         assert_eq!(before, after);
-        assert_eq!(after.0, 10);
+        assert_eq!(after.0, 11);
     }
 
     /// Rows written before `project` existed keep their project ids when the
@@ -1274,7 +1274,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 10, "Expected exactly 10 applied migrations, got {}", count);
+        assert_eq!(count, 11, "Expected exactly 11 applied migrations, got {}", count);
     }
 
     /// V8 — a fresh store records V8 as applied and carries the FTS5 lexical
@@ -1735,7 +1735,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 10);
+        assert_eq!(migration_count, 11);
     }
 
     // -----------------------------------------------------------------------

@@ -151,6 +151,17 @@ pub struct Hit {
     /// hit it returns is the caller's own.
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// Which piece of a long save the hit is; absent for a save of one piece
+    /// and from a daemon that does not link pieces.
+    #[serde(default)]
+    pub piece: Option<PiecePosition>,
+}
+
+/// Position `piece` (from 1) of a save stored as `pieces` rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct PiecePosition {
+    pub piece: i64,
+    pub pieces: i64,
 }
 
 /// One inventory row from `GET /v1/memories`.
@@ -307,6 +318,24 @@ pub struct Updated {
     /// Only `memory` rows have one.
     pub memory_type: Option<String>,
     pub tier: i64,
+}
+
+/// The save a row belongs to, from `GET /v1/memories/{kind}/{id}/save`: a
+/// piece of a long save comes back with the whole text, any other row as a
+/// save of one piece.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SavedText {
+    pub kind: String,
+    /// The row asked for, and its position (from 1) in the save.
+    pub id: i64,
+    pub piece: i64,
+    pub pieces: i64,
+    /// The row at each position, `None` where it is deleted or not the
+    /// caller's to read.
+    pub ids: Vec<Option<i64>>,
+    /// Positions, from 1, with no row to show.
+    pub missing: Vec<i64>,
+    pub text: String,
 }
 
 #[derive(Serialize)]
@@ -608,6 +637,21 @@ impl DaemonClient {
             .await
             .map_err(Self::map_transport)?;
         Ok(Self::read_response::<Body>(resp).await?.item)
+    }
+
+    /// The save `id` belongs to. `agent` scopes it to that agent's rows:
+    /// another agent's row is the daemon's 404, like a missing one.
+    pub async fn read_save(&self, kind: &str, id: i64, agent: Option<&str>) -> Result<SavedText, ClientError> {
+        let query: Vec<(&str, &str)> = agent.map(|a| ("agent", a)).into_iter().collect();
+        let resp = self
+            .http
+            .get(self.url(&format!("/v1/memories/{kind}/{id}/save")))
+            .bearer_auth(&self.token)
+            .query(&query)
+            .send()
+            .await
+            .map_err(Self::map_transport)?;
+        Self::read_response(resp).await
     }
 
     /// Counts of what is stored, optionally narrowed to an agent and/or project.

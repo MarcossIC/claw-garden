@@ -33,6 +33,7 @@ pub mod worker;
 pub mod error;
 pub mod identity;
 pub mod migrations;
+pub(crate) mod pieces;
 pub mod project;
 pub mod model_download;
 pub mod record;
@@ -51,7 +52,8 @@ pub use record::{
 /// bridge call it directly, without the chat pipeline that used to be the only
 /// caller. Keeping the import path one level shorter than `memory::search::…`
 /// mirrors how [`MemoryStore`] is already re-exported out of `db`.
-pub use search::{search_all_memories, RankedHit, SearchScope};
+pub use pieces::{read_save_core, SaveText};
+pub use search::{search_all_memories, PiecePosition, RankedHit, SearchScope};
 
 pub mod clock;
 pub(crate) mod latency;

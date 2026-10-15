@@ -4,8 +4,10 @@ pub(crate) mod chat;
 pub(crate) mod code;
 pub(crate) mod token_splitter;
 
-pub use chat::ChatChunker;
+pub use chat::{ChatChunker, SaveSplit};
 pub use code::CodeChunker;
+
+use std::borrow::Cow;
 
 use crate::models::chat::Role;
 
@@ -19,6 +21,39 @@ pub(crate) const CHUNK_MAX_TOKENS: usize = 480;
 /// single vector represents it, so it is unretrievable. 64 (~13% of the cap)
 /// buys back that coverage at a proportional embedding-cost increase.
 pub(crate) const CHUNK_OVERLAP_TOKENS: usize = 64;
+
+/// Leading tokens of a save that go into the embedder with each piece after
+/// the first. A piece cut from the middle of a long text loses whatever the
+/// text named at its start (the crate, the decision, the bug), and so does
+/// its vector; the head puts that topic back. 48 tokens is a sentence or two:
+/// enough to carry a subject line, small enough to leave most of the window
+/// to the piece's own text.
+pub(crate) const SAVE_HEAD_TOKENS: usize = 48;
+
+/// Room for the separator, and for the tokens a tokenizer can add where two
+/// texts are joined: token counts are not additive across the seam.
+const HEAD_JOIN_RESERVE: usize = 8;
+
+/// Cap of each piece of a text that does not fit in one, so that head,
+/// separator and piece together still fit under [`CHUNK_MAX_TOKENS`].
+pub(crate) const PIECE_MAX_TOKENS: usize = CHUNK_MAX_TOKENS - SAVE_HEAD_TOKENS - HEAD_JOIN_RESERVE;
+
+const HEAD_SEPARATOR: &str = "\n…\n";
+
+const _: () = assert!(CHUNK_OVERLAP_TOKENS < PIECE_MAX_TOKENS);
+const _: () = assert!(SAVE_HEAD_TOKENS + HEAD_JOIN_RESERVE + PIECE_MAX_TOKENS <= CHUNK_MAX_TOKENS);
+
+/// The text a piece is embedded with: the piece alone, or the save's head,
+/// the separator and the piece when it was stored with a context. The worker
+/// and the re-embed both build it here, so a re-embedded piece gets the same
+/// vector it was saved with.
+pub(crate) fn embedding_text<'a>(context: &str, piece: &'a str) -> Cow<'a, str> {
+    if context.is_empty() {
+        Cow::Borrowed(piece)
+    } else {
+        Cow::Owned(format!("{context}{HEAD_SEPARATOR}{piece}"))
+    }
+}
 
 // overlap >= max collapses the stride to zero and the split loop never
 // advances — catch that at compile time for the constants above (callers
@@ -186,6 +221,16 @@ mod tests {
         let splitter = TokenSplitter::fallback();
         let segments = splitter.split("hello world", CHUNK_MAX_TOKENS, CHUNK_OVERLAP_TOKENS);
         assert_eq!(segments.len(), 1, "short input should produce exactly 1 segment");
+    }
+
+    #[test]
+    fn a_piece_without_context_is_embedded_as_stored() {
+        assert_eq!(embedding_text("", "the piece"), "the piece");
+    }
+
+    #[test]
+    fn a_piece_with_context_is_embedded_after_the_head() {
+        assert_eq!(embedding_text("Notes on clawg-ledger", "the piece"), "Notes on clawg-ledger\n…\nthe piece");
     }
 
     #[test]

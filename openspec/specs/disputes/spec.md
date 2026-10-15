@@ -122,7 +122,7 @@ Cubre las huérfanas que dejaron las versiones que borraban sin liberar.
 | Una fila no existe o está borrada (o, con `agent_id`, es de otro agente) | `404` |
 | Par no enlazado, o una reemplazada por una tercera | `409` |
 
-El puente MCP MUST exponer `resolve_conflict` con los mismos argumentos (el agente es el del puente) y devolver el resultado o el error como texto. Cada par del bloque ACTIVE CONFLICTS de `recall_context` y las instrucciones del servidor MUST nombrar `resolve_conflict` como el paso que sigue a la respuesta del usuario.
+El puente MCP MUST exponer `resolve_conflict` con los mismos argumentos (el agente es el del puente) y devolver el resultado o el error como texto. El bloque ACTIVE CONFLICTS de `recall_context` (una vez, en su NOTE) y las instrucciones del servidor MUST nombrar `resolve_conflict` como el paso que sigue a la respuesta del usuario. Cada par del bloque imprime los ids de sus dos lados, que son los que recibe `resolve_conflict` (cómo se imprime el bloque: [`specs/retrieval`](../retrieval/spec.md)).
 
 #### Escenario
 - GIVEN O activa y N `disputed` contra O

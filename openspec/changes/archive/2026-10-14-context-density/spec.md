@@ -40,7 +40,7 @@ Si el texto tiene varias líneas, las siguientes MUST seguir tal cual (líneas e
 
 Cada par MUST imprimir los ids de sus dos lados como `#id`: son los valores que `resolve_conflict` recibe como `keep` y `other` (`ResolveConflictArgs`, `crates/clawg-cli/src/mcp/server.rs:237-249`), y los dos son ids de `memory`.
 
-Un lado que es hit mostrado MUST imprimirse sólo como `#id`. Un lado que no es hit mostrado (fila del workspace, o fila fuera del prompt) MUST imprimirse con su texto completo bajo el encabezado `[YYYY-MM-DD #id]`. Un par con ambos lados mostrados MUST NOT imprimir ningún texto.
+Un lado que es hit mostrado MUST imprimirse sólo como `#id`. Un lado que no es hit mostrado (fila del workspace, o fila fuera del prompt) MUST imprimirse con su texto completo bajo el encabezado `[YYYY-MM-DD #id]` la primera vez que aparece en el bloque, y sólo como `#id` las siguientes. Así el texto de una fila aparece a lo sumo una vez en el bloque aunque esté en varios pares: en una cadena de disputas, la fila del medio es nueva en un par y vieja en otro. Un par con ambos lados mostrados MUST NOT imprimir ningún texto.
 
 Formato de un grupo (R3):
 
@@ -63,7 +63,11 @@ OLD #M                      | OLD [YYYY-MM-DD #M] texto
 - GIVEN old 1 es una fila del workspace y new 2 un hit
 - THEN `OLD [<fecha> #1] <texto>` lleva el texto
 
-**Test:** `conflict_block_cites_shown_hits_by_id_and_prints_text_only_for_the_rest` en `prompt_builder.rs`. Falla hoy: `format_conflict_pair` copia ambos textos (`:299-311`).
+#### Escenario: cadena
+- GIVEN los pares (old 2, new 3), (old 1, new 3) y (old 1, new 2), ninguno con hits
+- THEN el bloque es `NEW [<fecha> #3 disputed] <texto de 3>`, `OLD [<fecha> #2] <texto de 2>`, `OLD [<fecha> #1] <texto de 1>`, `NEW #2`, `OLD #1`
+
+**Test:** `conflict_block_cites_shown_hits_by_id_and_prints_text_only_for_the_rest` en `prompt_builder.rs`. Falla hoy: `format_conflict_pair` copia ambos textos (`:299-311`). La cadena, `a_row_in_several_pairs_prints_its_text_once`: se agregó en la verificación, cuando la prueba en el perfil dev imprimió dos veces el texto de la fila del medio.
 
 ## R3. Agrupación por fila nueva
 

@@ -71,7 +71,7 @@ El detector de contradicciones MUST excluir de sus candidatos las fuentes del sa
 
 Borrar una conclusión MUST NOT tocar sus fuentes ni sus filas de `memory_derivation`. Borrar una fuente MUST NOT tocar la conclusión. Una conclusión borrada o reemplazada MUST dejar de contar para decidir qué memorias están pendientes.
 
-Purgar una fila (`clawg purge`) sí la borra de verdad, y su id puede volver a usarse: MUST borrar en la misma transacción sus filas de `memory_derivation`, como conclusión y como fuente, para que una fila nueva con ese id no herede la procedencia.
+Purgar una fila (`clawg purge`) sí la borra de verdad: MUST borrar en la misma transacción sus filas de `memory_derivation`, como conclusión y como fuente. La tabla no tiene claves foráneas (`crates/clawg-core/migrations/V10__synthesis.sql:8-13`), así que nada más las borra, y sin esto quedarían vínculos hacia una fila que ya no existe. El id purgado no se vuelve a usar: `memory.id` es `AUTOINCREMENT` (`crates/clawg-core/migrations/V1__init.sql:5`).
 
 **Test:** `deleting_a_conclusion_makes_its_sources_pending_again` (R7) y `purging_drops_the_links_to_and_from_the_row` en `crates/clawg-core/src/memory/secrets.rs`.
 

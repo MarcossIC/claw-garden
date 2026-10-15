@@ -1003,6 +1003,7 @@ mod tests {
             distance: 0.0,
             created_at: TimestampMs::from_unix_millis(0),
             agent_id: None,
+            piece: None,
         }
     }
 
@@ -1844,6 +1845,7 @@ mod tests {
             distance: 0.0,
             created_at: TimestampMs::from_unix_millis(0),
             agent_id: None,
+            piece: None,
         }
     }
 
@@ -2668,6 +2670,7 @@ mod tests {
             distance: 0.0,
             created_at: TimestampMs::from_unix_millis(0),
             agent_id: None,
+            piece: None,
         }];
 
         assert_eq!(format_skill_hits(&hits), "skill_hits=1");

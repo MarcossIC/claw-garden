@@ -43,8 +43,8 @@ use crate::client::{
 };
 use crate::mcp::startup::ClientHandle;
 use crate::mcp::tools::{
-    format_recall, format_resolution, format_rows, format_search, format_sharing, format_status, format_synthesis,
-    format_update, resolve_project,
+    format_recall, format_resolution, format_rows, format_save, format_search, format_sharing, format_status,
+    format_synthesis, format_update, resolve_project,
 };
 
 /// Agent id used when neither `--agent` nor the MCP client named one.
@@ -216,6 +216,17 @@ pub struct DeleteMemoryArgs {
     /// because each table numbers its rows independently — id 7 exists in all
     /// three and means something different in each.
     pub kind: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ReadMemoryArgs {
+    /// The id of any piece of the save, as printed by `search_memory`,
+    /// `list_memories`, `recall_context` or `save_memory`.
+    pub id: i64,
+    /// Which table the id belongs to: memory, episodic or procedural.
+    /// Defaults to memory, the only kind saved in pieces.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -421,7 +432,11 @@ impl ClawgMcp {
                         one.id
                     ),
                     [one] => format!("saved #{}", one.id),
-                    many => format!("saved as {} pieces: {}", many.len(), ids(many)),
+                    many => format!(
+                        "saved as {} pieces: {}; read_memory with any of them returns the whole text",
+                        many.len(),
+                        ids(many)
+                    ),
                 };
                 if !redacted.is_empty() {
                     text.push_str(&format!("; masked {} before storing it", redacted.join(", ")));
@@ -615,6 +630,36 @@ impl ClawgMcp {
         }
     }
 
+    /// Another agent's save is refused as missing, as in `delete_memory_impl`.
+    pub async fn read_memory_impl(
+        &self,
+        agent_id: &str,
+        args: ReadMemoryArgs,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let client = match self.daemon().await {
+            Ok(c) => c,
+            Err(failure) => return Ok(failure),
+        };
+        match client.read_save(args.kind.as_deref().unwrap_or("memory"), args.id, Some(agent_id)).await {
+            Ok(save) => Self::ok(format_save(&save)),
+            Err(e) => Self::failed(Self::read_failure_text(&e)),
+        }
+    }
+
+    /// A daemon older than the save route answers its own bare 404, with no
+    /// error text of the daemon's; telling the model the row is missing would
+    /// be false.
+    fn read_failure_text(err: &ClientError) -> String {
+        match err {
+            ClientError::Daemon { status: 404, message, .. } if message == "404 Not Found" => {
+                "the running clawg daemon cannot read a save; restart it with the installed clawg \
+                 (`clawg stop`, then call again)"
+                    .to_string()
+            }
+            other => Self::explain(other),
+        }
+    }
+
     /// Another agent's row is refused as missing, as in `delete_memory_impl`.
     pub async fn update_memory_impl(
         &self,
@@ -703,8 +748,8 @@ impl ClawgMcp {
         description = "Store something worth remembering across sessions: a fact about the \
                        user or their project, a preference they stated, or a decision that was \
                        made. Save one fact per call, in a few sentences: a long text is split \
-                       into separate pieces that are found independently and never reassembled. \
-                       Write the content so it still makes sense months from now, with no \
+                       into pieces that search finds one at a time, and read_memory returns it \
+                       whole. Write the content so it still makes sense months from now, with no \
                        conversation around it. Returns the id of each stored piece, which \
                        update_memory and delete_memory accept, or why nothing was stored."
     )]
@@ -725,7 +770,9 @@ impl ClawgMcp {
                        numbered list of the memories close in relevance to the best match (at \
                        least two), with their ids, kinds and relevance scores; a short list \
                        means the rest scored far lower, not that nothing else is stored. \
-                       Content longer than 500 characters is truncated."
+                       Content longer than 500 characters is truncated. A hit marked piece=K/N \
+                       is the best matching piece K of a long text saved as N pieces; \
+                       read_memory with its id returns the whole text."
     )]
     async fn search_memory(
         &self,
@@ -764,6 +811,22 @@ impl ClawgMcp {
         Parameters(args): Parameters<ListMemoriesArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         self.list_memories_impl(&self.agent_id_for(Some(&ctx)), args).await
+    }
+
+    #[tool(
+        name = "read_memory",
+        description = "Read the whole text of a memory by id. A long text is saved as several \
+                       pieces, and search shows one of them, marked piece=K/N, cut at 500 \
+                       characters; pass its id to get every piece joined in order. Returns which \
+                       piece the id is, the ids of the save (a deleted piece shows as missing) \
+                       and the text."
+    )]
+    async fn read_memory(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(args): Parameters<ReadMemoryArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.read_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
     }
 
     #[tool(
@@ -1364,10 +1427,11 @@ mod tests {
             "resolve_conflict",
             "synthesize",
             "memory_status",
+            "read_memory",
         ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}: {names:?}");
         }
-        assert_eq!(names.len(), 9, "no extra tools: {names:?}");
+        assert_eq!(names.len(), 10, "no extra tools: {names:?}");
     }
 
     /// The memory viewer (`clawg memories`) is for the person at the terminal.
@@ -1387,6 +1451,7 @@ mod tests {
                 "delete_memory",
                 "list_memories",
                 "memory_status",
+                "read_memory",
                 "recall_context",
                 "resolve_conflict",
                 "save_memory",
@@ -1532,14 +1597,24 @@ mod tests {
         assert!(d.contains("recall_context"), "description: {d}");
     }
 
-    /// A long save is split into chunks stored as unrelated rows, and no tool
-    /// can put them back together; one fact per call is the only way the model
-    /// gets back what it saved.
+    /// A long save is split into pieces that are searched one by one; one
+    /// fact per call is still what search finds best, and `read_memory` is how
+    /// the model gets back a long text whole.
     #[tokio::test]
     async fn save_memory_asks_for_one_fact_per_call() {
         let (b, _d) = bridge().await;
         let d = description(&b, "save_memory");
         assert!(d.contains("one fact"), "description: {d}");
+        assert!(d.contains("read_memory"), "description: {d}");
+        assert!(!d.contains("never reassembled"), "description: {d}");
+    }
+
+    #[tokio::test]
+    async fn search_memory_explains_the_piece_of_a_long_save() {
+        let (b, _d) = bridge().await;
+        let d = description(&b, "search_memory");
+        assert!(d.contains("piece=K/N"), "description: {d}");
+        assert!(d.contains("read_memory"), "description: {d}");
     }
 
     /// Retrieval is semantic: measured on the golden set, keyword queries find
@@ -1715,7 +1790,7 @@ mod tests {
                 memories: vec![saved(57, "inserted"), saved(58, "inserted"), saved(59, "reinforced")],
                 redacted: vec![],
             })),
-            Ok("saved as 3 pieces: #57, #58, #59".to_string())
+            Ok("saved as 3 pieces: #57, #58, #59; read_memory with any of them returns the whole text".to_string())
         );
         assert_eq!(
             text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "reinforced")], redacted: vec![] })),
@@ -1966,6 +2041,54 @@ mod tests {
             .await
             .expect("call");
         assert!(!is_error(&r), "the owner deletes it: {}", text(&r));
+    }
+
+    fn read_args(id: i64) -> ReadMemoryArgs {
+        ReadMemoryArgs { id, kind: None }
+    }
+
+    /// The ids `save_memory` printed for a save of several pieces.
+    async fn saved_pieces(b: &ClawgMcp, agent: &str, content: &str) -> Vec<i64> {
+        let saved = text(&b.save_memory_impl(agent, save_args(content)).await.expect("save"));
+        let list = saved.split_once(": ").map(|(_, rest)| rest).unwrap_or_default();
+        let list = list.split(';').next().unwrap_or_default();
+        list.split(", ").filter_map(|id| id.trim_start_matches('#').parse().ok()).collect()
+    }
+
+    #[tokio::test]
+    async fn read_memory_returns_the_whole_save() {
+        let (b, _d) = bridge().await;
+        let content = (0..600).map(|i| format!("w{i:05}")).collect::<Vec<_>>().join(" ");
+        let ids = saved_pieces(&b, "agent-a", &content).await;
+        assert_eq!(ids.len(), 3, "the fixture is a save of three pieces");
+
+        let r = b.read_memory_impl("agent-a", read_args(ids[1])).await.expect("call");
+
+        assert!(!is_error(&r), "{}", text(&r));
+        let listed = ids.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(", ");
+        assert_eq!(text(&r), format!("#{} is piece 2 of 3 of one save: {listed}\n{content}", ids[1]));
+    }
+
+    #[tokio::test]
+    async fn an_agent_cannot_read_another_agents_save() {
+        let (b, _d) = bridge().await;
+        let id = saved_id(&b, "agent-a", "agent a keeps its release notes in the wiki").await;
+
+        let other = b.read_memory_impl("agent-b", read_args(id)).await.expect("call");
+        let missing = b.read_memory_impl("agent-b", read_args(999_999)).await.expect("call");
+
+        assert!(is_error(&other), "another agent's save must not be readable: {}", text(&other));
+        assert_eq!(text(&other).replace(&id.to_string(), "N"), text(&missing).replace("999999", "N"));
+        let own = b.read_memory_impl("agent-a", read_args(id)).await.expect("call");
+        assert_eq!(text(&own), format!("#{id}\nagent a keeps its release notes in the wiki"));
+    }
+
+    #[test]
+    fn a_daemon_without_the_save_route_is_named_as_such() {
+        let old = daemon_error(404, "404 Not Found", ErrorDetails::default());
+        assert!(ClawgMcp::read_failure_text(&old).contains("restart"), "{}", ClawgMcp::read_failure_text(&old));
+        let missing = daemon_error(404, "no Memory row with id 7", ErrorDetails::default());
+        assert_eq!(ClawgMcp::read_failure_text(&missing), ClawgMcp::explain(&missing));
     }
 
     fn update_args(id: i64, importance: Option<f64>, memory_type: Option<&str>) -> UpdateMemoryArgs {

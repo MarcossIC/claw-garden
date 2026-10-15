@@ -36,13 +36,25 @@ El formato de los hits y el parser del eval van en el mismo commit: el test de p
 - [x] GREEN: la doc del `id` de `DeleteMemoryArgs` y `UpdateMemoryArgs`, y la descripción de `delete_memory`.
 - [x] Commit: `docs(mcp): say that recall_context ids work in delete_memory and update_memory` (`41a0873`)
 
+## 6. Texto de una fila una sola vez en el bloque — R2, R3
+
+La encontró la prueba en el perfil dev: en una cadena de disputas (36 ← 37 ← 38, con 37 fuera de los hits), el texto de 37 salía como `OLD` en el grupo de 38 y otra vez como `NEW` de su propio grupo, contra el MUST de R3.
+
+- [x] RED: `a_row_in_several_pairs_prints_its_text_once` en `prompt_builder.rs`, con la cadena (old 2, new 3), (old 1, new 3), (old 1, new 2) y sin hits. Falló con el texto de 2 y el de 1 impresos dos veces.
+- [x] GREEN: `format_conflict_block` recuerda qué ids ya imprimió con texto y cita por `#id` las menciones siguientes. R2 lo dice así desde la verificación.
+- [x] Commit: `fix(core): print a conflict row's text once when it sits in several pairs` (`d175348`)
+
 ## Verificación
 
 - [x] `cargo test --workspace --no-fail-fast` en Linux: conteo contra la base, y cada commit en un worktree limpio. Ver `verify.md`.
-- [ ] `cargo test --workspace --target-dir <otro-dir>` en Windows, contra la base de 1.655.
-- [ ] `rag-eval --real --agent-view --diff` contra `2026-10-13-real-lexical-fusion-main-agent-view.json`, con los umbrales de R11 (en Windows: el golden set y los resultados no están en el repo).
-- [ ] Prueba en el perfil dev con Claude Code: `recall_context` muestra los hits con id, el bloque de conflictos cita por `#id`, y `resolve_conflict` y `delete_memory` aceptan esos ids.
+- [x] `cargo test --workspace --target-dir <otro-dir>` en Windows: 1.690 pasan sobre el merge (`9c3ff19`) y 1.691 sobre el fix (`d175348`), 0 fallan ([`verify.md`](verify.md#windows-2026-10-14)).
+- [x] `rag-eval --real --agent-view --diff` contra `2026-10-13-real-lexical-fusion-main-agent-view.json`: los cinco umbrales de R11 se cumplen, en el merge y en el fix ([`verify.md`](verify.md#r11-rag-eval)).
+- [x] Prueba en el perfil dev: `recall_context` muestra los hits con id y el workspace sin marcadores, el bloque de conflictos cita por `#id`, y `resolve_conflict`, `update_memory` y `delete_memory` aceptan esos ids ([`verify.md`](verify.md#perfil-dev-2026-10-14)).
 
 ## Archivo
 
-- [ ] Sumar R1 a R11 a `openspec/specs/retrieval/spec.md`, mover la carpeta a `changes/archive/AAAA-MM-DD-context-density/` y marcar la fila 14 del README.
+- [x] `openspec/specs/retrieval/spec.md`: R1 a R9 como apartados nuevos, R10 en los invariantes, R11 como medición de referencia, las definiciones y la línea **Origen**.
+- [x] `specs/disputes`: la NOTE que nombra `resolve_conflict` va una vez por bloque, no por par.
+- [x] `git mv openspec/changes/context-density openspec/changes/archive/2026-10-14-context-density`; `state.yaml` con `phase: archived`, `archive: done` y `main_spec`.
+- [x] `openspec/README.md`: fila 14 como archivada. La base de tests de `.claude/CLAUDE.md` pasa a 1.691.
+- Commit: `docs(openspec): archive context-density after its Windows, rag-eval and dev profile checks`
