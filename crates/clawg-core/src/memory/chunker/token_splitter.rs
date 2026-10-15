@@ -1,9 +1,8 @@
 //! Token-cap splitting helper with configurable overlap.
 //!
-//! Knows NOTHING about chat speakers OR AST. Both `ChatChunker` (after speaker
-//! boundary) and `CodeChunker` (degraded fallback for unknown languages or parse
-//! failures) feed text through here. Decouples the cap policy from upstream
-//! semantic split.
+//! Knows NOTHING about chat speakers or Markdown. `ChatChunker` feeds each
+//! speaker turn through here, and the documentation index each section too long
+//! for one passage. Decouples the cap policy from upstream semantic split.
 
 use std::sync::Arc;
 
@@ -33,6 +32,16 @@ impl TokenSplitter {
     #[cfg(test)]
     pub(crate) fn tokenizer_ptr(&self) -> Option<*const tokenizers::Tokenizer> {
         self.tokenizer.as_deref().map(std::ptr::from_ref)
+    }
+
+    /// How many tokens `text` is, by the same measure [`TokenSplitter::split`]
+    /// caps at: the tokenizer's count, or a quarter of the bytes (rounded up)
+    /// in fallback mode.
+    pub fn count(&self, text: &str) -> usize {
+        match self.tokenizer.as_deref().map(|tok| tok.encode(text, false)) {
+            Some(Ok(enc)) => enc.get_offsets().len(),
+            _ => text.len().div_ceil(4),
+        }
     }
 
     /// Split `text` so each output `Chunk` has `<= max_tokens` tokens, with
@@ -87,7 +96,7 @@ impl TokenSplitter {
                 let end_byte = offsets[end - 1].1;
                 // Safe: tokenizers guarantees offsets land on char boundaries.
                 let slice = &text[start_byte..end_byte];
-                Chunk { text: slice.to_string(), token_count: end - start, header: None }
+                Chunk { text: slice.to_string(), token_count: end - start }
             })
             .collect()
     }
@@ -114,7 +123,7 @@ impl TokenSplitter {
                 // so emit that character whole rather than an empty window.
                 e = ceil_char_boundary(text, s + 1).min(n);
             }
-            out.push(Chunk { text: text[s..e].to_string(), token_count: 0, header: None });
+            out.push(Chunk { text: text[s..e].to_string(), token_count: 0 });
             if e == n {
                 break;
             }
@@ -497,8 +506,17 @@ mod tests {
     }
 
     #[test]
+    fn the_fallback_count_is_a_quarter_of_the_bytes_rounded_up() {
+        let splitter = TokenSplitter::fallback();
+        assert_eq!(splitter.count(""), 0);
+        assert_eq!(splitter.count("abcd"), 1);
+        assert_eq!(splitter.count("abcde"), 2);
+        assert_eq!(splitter.count(&"x".repeat(1920)), 480);
+    }
+
+    #[test]
     fn split_never_emits_an_empty_chunk_when_the_stride_rounds_past_the_tail() {
-        // With overlap 0 (what `CodeChunker` passes) the stride equals the
+        // With overlap 0 (what the rollback lever sets) the stride equals the
         // cap, so the next start is `ceil_char_boundary(s + max_b)`. When the
         // bytes left over after the cap are fewer than one whole character,
         // that ceil rounds the start onto `text.len()` itself and the window
@@ -669,11 +687,10 @@ mod tests {
 
     #[test]
     fn split_multibyte_with_zero_overlap_still_loses_no_bytes() {
-        // overlap = 0 is what `CodeChunker` passes and what the rollback lever
-        // sets. The stride then equals the cap, so the next start is the
-        // CEIL of the same index the window end was FLOORED to — the two
-        // round in opposite directions and the character between them is the
-        // one at risk of falling through the gap.
+        // overlap = 0 is what the rollback lever sets. The stride then equals
+        // the cap, so the next start is the CEIL of the same index the window
+        // end was FLOORED to — the two round in opposite directions and the
+        // character between them is the one at risk of falling through the gap.
         let splitter = TokenSplitter::fallback();
         for prefix in ["", "a", "ab", "abc"] {
             let content = unique_cjk(prefix, 2200);

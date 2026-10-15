@@ -158,17 +158,17 @@ impl ScoringConfig {
             clamp_lo: 1.0,
             clamp_hi: 10.0,
         },
-        // Re-scales cosine similarity against 0.8793, the 5th percentile of
-        // the cosine-similarity distribution measured over the evaluation
-        // corpus (the full observed range across that corpus was
-        // 0.8625-0.9470). Left unscaled, every hit's cosine term falls
-        // inside that same narrow band, so it barely moves relative to the
-        // importance factor's own range and has almost no say in the final
-        // ranking. Re-scaling against this floor stretches that band back
-        // out: the similarity term's swing across the corpus widens from
-        // roughly 1.04x to roughly 3.32x, which is what lets it compete
-        // with importance in the product instead of being drowned out by
-        // it.
+        // Re-scales cosine similarity against 0.79, the 5th percentile of
+        // the query-to-passage cosines of this repository's documentation
+        // under mean pooling (0.7904; the CLS-pooled 0.8793 it replaces sat
+        // at the same percentile of that corpus and would now put 91% of the
+        // top-10 hits under the floor). Provisional until it is re-measured
+        // over the evaluation corpus with `rag-eval --sweep-cos-floor`. Left
+        // unscaled, every hit's cosine term falls inside a narrow band, so it
+        // barely moves relative to the importance factor's own range and has
+        // almost no say in the final ranking; re-scaling against this floor
+        // stretches that band back out so similarity can compete with
+        // importance in the product.
         //
         // This number is bound to the embedding prefix configuration in
         // effect when it was measured — the query and passage prefixes
@@ -178,7 +178,7 @@ impl ScoringConfig {
         // invalidates this floor. There is no way to detect that from the
         // code path itself: if either prefix ever changes, this floor must
         // be re-measured against the new distribution, not carried over.
-        cosine_floor: Some(0.8793),
+        cosine_floor: Some(0.79),
         // As much as a perfect cosine: with equal decay and importance an
         // exact identifier always ranks above a row that only reads alike,
         // while decay and importance keep multiplying both.
@@ -373,9 +373,8 @@ mod tests {
     // a tautology about.
     //
     // `cosine_floor`'s value is the 5th percentile of the cosine-similarity
-    // distribution measured over the evaluation corpus (full observed range
-    // 0.8625-0.9470), and it is valid only for the embedding prefixes
-    // production sends today — changing either the query or passage prefix
+    // distribution under mean pooling, and it is valid only for the pooling
+    // and the embedding prefixes production sends today — changing either the query or passage prefix
     // shifts that whole distribution and invalidates this number; it would
     // need to be re-measured, not carried over.
     #[test]
@@ -404,7 +403,7 @@ mod tests {
             "ScoringConfig::DEFAULT.importance.clamp_hi changed from its shipped value: {REEVAL_NOTE}"
         );
         assert_eq!(
-            ScoringConfig::DEFAULT.cosine_floor, Some(0.8793),
+            ScoringConfig::DEFAULT.cosine_floor, Some(0.79),
             "ScoringConfig::DEFAULT.cosine_floor changed from its shipped value (or the cosine \
              re-scale was turned off): {REEVAL_NOTE} This floor specifically is the 5th \
              percentile of the cosine-similarity distribution measured over the evaluation \

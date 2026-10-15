@@ -33,7 +33,8 @@ use clawg_core::memory::admin::{
 use clawg_core::memory::backup::Reason;
 use clawg_core::memory::bootstrap::EmbedderStatus;
 use clawg_core::memory::dispute::{resolve_dispute_core, Outcome, Resolution, ResolveError};
-use clawg_core::memory::embedder::EmbedRole;
+use clawg_core::memory::embedder::{EmbedRole, Embedder};
+use clawg_core::memory::project_docs::{self, DocHit, DocIndexError, RefreshOutcome};
 use clawg_core::memory::worker::{
     ChunkOutcome, IngestFailure, IngestReport, IngestRequest, SavedChunk,
 };
@@ -549,6 +550,7 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         .route("/stats", get(stats))
         .route("/backup", post(backup))
         .route("/projects", post(register))
+        .route("/projects/docs/search", post(search_docs))
         .route("/shutdown", post(shutdown))
         .layer(axum::middleware::from_fn_with_state(app.clone(), require_bearer));
 
@@ -750,6 +752,16 @@ async fn save_memory(
     save_response(confirmation).map(|(status, body)| (status, Json(body)))
 }
 
+/// The loaded embedder, or the 503 a search answers while there is none.
+fn ready_embedder(app: &AppCtx) -> ApiResult<Arc<dyn Embedder>> {
+    app.runtime.embedder.get().cloned().ok_or_else(|| match app.runtime.embedder_status() {
+        EmbedderStatus::Failed { error, retryable } => ApiError::embedder_failed(error, retryable),
+        EmbedderStatus::Loading | EmbedderStatus::Ready => {
+            ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "embedder_not_ready")
+        }
+    })
+}
+
 async fn search(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<SearchRequest>,
@@ -757,14 +769,7 @@ async fn search(
     // A distinct status rather than empty results: "nothing matched" and "I
     // cannot search yet" are different answers, and a client that conflated
     // them would cache an empty corpus for the life of the model download.
-    let Some(embedder) = app.runtime.embedder.get().cloned() else {
-        return Err(match app.runtime.embedder_status() {
-            EmbedderStatus::Failed { error, retryable } => ApiError::embedder_failed(error, retryable),
-            EmbedderStatus::Loading | EmbedderStatus::Ready => {
-                ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "embedder_not_ready")
-            }
-        });
-    };
+    let embedder = ready_embedder(&app)?;
 
     let limit = clamp_search_limit(body.limit);
     let min_relative_score = check_relative_score(body.min_relative_score)?;
@@ -1028,7 +1033,110 @@ async fn register(
         RegisterError::RootCollision { .. } => ApiError::conflict(e.to_string()),
         RegisterError::Store(_) => ApiError::internal(e),
     })?;
+    spawn_doc_refresh(app.clone(), outcome.project_id.clone());
     Ok(Json(RegisteredBody { project_id: outcome.project_id, rekeyed: outcome.rekeyed }))
+}
+
+/// Refreshes the project's documentation index in the background, once the
+/// embedder has loaded: the bridge registers a root as its session starts,
+/// usually before the model is ready. Nobody waits on it, so a failure is
+/// logged and the next search tries again.
+fn spawn_doc_refresh(app: Arc<AppCtx>, project_id: String) {
+    tokio::spawn(async move {
+        let mut status = app.runtime.embedder_status.subscribe();
+        // A closed channel means the daemon is going away; the cell check
+        // below then finds no embedder and gives up.
+        let _ = status.wait_for(|s| !matches!(s, EmbedderStatus::Loading)).await.map(|_| ());
+        let Some(embedder) = app.runtime.embedder.get().cloned() else {
+            log::warn!("not indexing the docs of {project_id}: the embedder did not load");
+            return;
+        };
+        let tokenizer = app.runtime.tokenizer.get().cloned();
+        match app.runtime.project_docs.try_refresh(&app.runtime.store, embedder.as_ref(), tokenizer, &project_id).await {
+            Ok(RefreshOutcome::Refreshed(r)) => log::info!(
+                "indexed the docs of {project_id}: {} docs, {} reindexed, {} removed, {} skipped, {} passages",
+                r.docs, r.indexed, r.removed, r.skipped, r.passages
+            ),
+            Ok(RefreshOutcome::AlreadyRunning) => {}
+            Err(e) => log::warn!("could not index the docs of {project_id}: {e}"),
+        }
+    });
+}
+
+/// How long a search waits for a project's first index before answering
+/// with what there is. Longer than indexing a typical repository's docs takes,
+/// and short of what an MCP host waits for a tool.
+pub const FIRST_INDEX_WAIT: Duration = Duration::from_secs(20);
+
+async fn docs_in(store: &clawg_core::memory::MemoryStore, project_id: &str) -> ApiResult<usize> {
+    project_docs::doc_count(store, project_id).await.map_err(ApiError::internal)
+}
+
+/// Largest `limit` a documentation search honours.
+pub const MAX_DOCS_LIMIT: usize = 20;
+/// `limit` of a documentation search when the caller does not say.
+pub const DEFAULT_DOCS_LIMIT: usize = 5;
+
+pub fn clamp_docs_limit(limit: Option<usize>) -> usize {
+    limit.unwrap_or(DEFAULT_DOCS_LIMIT).clamp(1, MAX_DOCS_LIMIT)
+}
+
+/// Strict for the same reason as [`OwnerQuery`].
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocsSearchRequest {
+    pub project_id: String,
+    pub query: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DocsSearchBody {
+    pub hits: Vec<DocHit>,
+    /// Docs the project's index holds.
+    pub docs: usize,
+    /// A refresh of the project is still running, so the hits may be partial.
+    pub indexing: bool,
+    /// Why the refresh before this search failed; the hits come from what was
+    /// already indexed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+/// Searches a registered project's documentation, refreshing its index first
+/// when the last refresh is older than [`project_docs::REFRESH_INTERVAL`].
+async fn search_docs(
+    State(app): State<Arc<AppCtx>>,
+    Json(body): Json<DocsSearchRequest>,
+) -> ApiResult<Json<DocsSearchBody>> {
+    if body.query.trim().is_empty() {
+        return Err(ApiError::bad_request("query must not be empty"));
+    }
+    let store = &app.runtime.store;
+    project_docs::root_of(store, &body.project_id).await.map_err(|e| match e {
+        DocIndexError::UnknownProject(_) => ApiError::not_found(e.to_string()),
+        other => ApiError::internal(other),
+    })?;
+    let embedder = ready_embedder(&app)?;
+    let index = &app.runtime.project_docs;
+    let mut warning = None;
+    if index.is_due(&body.project_id, Instant::now()) {
+        let tokenizer = app.runtime.tokenizer.get().cloned();
+        if let Err(e) = index.try_refresh(store, embedder.as_ref(), tokenizer, &body.project_id).await {
+            warning = Some(e.to_string());
+        }
+    } else if index.is_running(&body.project_id) && docs_in(store, &body.project_id).await? == 0 {
+        // The first index of a project is usually started by the bridge's
+        // registration a moment before this search; answering from an empty
+        // index would read as "the docs say nothing".
+        index.wait_idle(&body.project_id, FIRST_INDEX_WAIT).await;
+    }
+    let hits = project_docs::search(store, embedder.as_ref(), &body.project_id, &body.query, clamp_docs_limit(body.limit))
+        .await
+        .map_err(ApiError::internal)?;
+    let docs = docs_in(store, &body.project_id).await?;
+    Ok(Json(DocsSearchBody { hits, docs, indexing: index.is_running(&body.project_id), warning }))
 }
 
 async fn shutdown(State(app): State<Arc<AppCtx>>) -> (StatusCode, Json<QueuedBody>) {
@@ -1046,6 +1154,14 @@ mod tests {
 
     fn chunk(id: i64, outcome: ChunkOutcome) -> SavedChunk {
         SavedChunk { id, outcome }
+    }
+
+    #[test]
+    fn a_docs_search_returns_five_by_default_and_never_more_than_twenty() {
+        assert_eq!(clamp_docs_limit(None), 5);
+        assert_eq!(clamp_docs_limit(Some(0)), 1);
+        assert_eq!(clamp_docs_limit(Some(12)), 12);
+        assert_eq!(clamp_docs_limit(Some(500)), 20);
     }
 
     #[test]

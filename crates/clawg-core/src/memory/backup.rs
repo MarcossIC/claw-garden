@@ -123,16 +123,20 @@ pub enum Reason {
     PreRestore,
     /// `clawg backup`.
     Manual,
+    /// Before the daemon re-embedded every stored vector with its model.
+    PreReembed,
 }
 
 impl Reason {
-    const ALL: [Reason; 3] = [Reason::PreMigration, Reason::PreRestore, Reason::Manual];
+    const ALL: [Reason; 4] =
+        [Reason::PreMigration, Reason::PreRestore, Reason::Manual, Reason::PreReembed];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Reason::PreMigration => "pre-migration",
             Reason::PreRestore => "pre-restore",
             Reason::Manual => "manual",
+            Reason::PreReembed => "pre-reembed",
         }
     }
 
@@ -554,6 +558,10 @@ mod tests {
         assert_eq!(
             snapshot_name(1_709_164_800_000, Reason::PreRestore),
             "memory-2024-02-29T00-00-00.000Z-pre-restore.db"
+        );
+        assert_eq!(
+            snapshot_name(0, Reason::PreReembed),
+            "memory-1970-01-01T00-00-00.000Z-pre-reembed.db"
         );
 
         let stamps = [0, 999, 86_399_999, 1_709_164_800_000, 1_791_827_476_123, 4_102_444_800_000];

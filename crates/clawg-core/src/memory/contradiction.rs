@@ -14,9 +14,17 @@ use crate::memory::vector::to_unit;
 
 /// L2 distance below which two embeddings are considered contradictory.
 ///
-/// Measured against `multilingual-e5-small`, over the 20 non-identical
-/// labelled pairs (10 contradiction / 10 non-contradiction) from the
-/// domain golden set. The 8 identical pairs in that set are excluded from
+/// Provisional under mean pooling. Ten contradicting and ten compatible pairs
+/// of project facts (`El proyecto usa PostgreSQL` / `… SQLite`, against
+/// `… SQLite` / `Las migraciones se aplican con refinery`) separate at
+/// (0.276, 0.328] under CLS pooling, where the golden set put its gap at
+/// (0.30, 0.35], and at (0.350, 0.469] under mean pooling. 0.42 keeps 0.07
+/// above the last contradiction and 0.05 below the first compatible pair,
+/// until the sweep below is redone on the golden set with mean vectors.
+///
+/// The CLS-pooled calibration it replaces was measured against
+/// `multilingual-e5-small`, over the 20 non-identical labelled pairs
+/// (10 contradiction / 10 non-contradiction) from the domain golden set. The 8 identical pairs in that set are excluded from
 /// this calibration on purpose: the write-border dedup gate intercepts an
 /// identical resend by content hash before it ever reaches this detector,
 /// so a pair the detector will structurally never see must not move the
@@ -45,13 +53,15 @@ use crate::memory::vector::to_unit;
 /// That headroom is not unlimited above 0.35 either: at 0.40 fpr_no_contradiction
 /// rises to 0.200. 0.35 is the point that costs no recall or precision for
 /// real margin below it, not a value with room to spare in either direction.
-pub(crate) const CONTRADICTION_THRESHOLD: f32 = 0.35;
+pub(crate) const CONTRADICTION_THRESHOLD: f32 = 0.42;
 
 /// Below this L2 distance the two texts are the same claim, not two claims
 /// that disagree — a near-duplicate the content hash could not catch because
 /// the difference is casing, interior whitespace, or a trivial edit rather
 /// than the surrounding whitespace and NFC form the hash normalizes away.
-pub(crate) const NEAR_DUPLICATE_FLOOR: f32 = 0.05;
+/// Twice its CLS-pooled 0.05: the pair that sat at 0.047 under CLS (a
+/// sentence and itself with a doubled space) sits at 0.097 under mean.
+pub(crate) const NEAR_DUPLICATE_FLOOR: f32 = 0.10;
 
 // If a future threshold sweep ever lands a value below the floor, the
 // contradiction band [floor, threshold) becomes empty or inverted — fail the
@@ -234,11 +244,9 @@ mod tests {
     #[test]
     fn contradiction_threshold_pins_the_shipped_value() {
         assert_eq!(
-            CONTRADICTION_THRESHOLD, 0.35,
-            "CONTRADICTION_THRESHOLD changed from its shipped, data-calibrated value. Measured \
-             over the domain golden set's 20 non-identical labelled pairs, the inter-class gap \
-             is (0.30, 0.35]: all 10 contradiction pairs sit at distance <= 0.30, all 10 \
-             non-contradiction pairs sit at distance > 0.35. If this changed on purpose, re-derive \
+            CONTRADICTION_THRESHOLD, 0.42,
+            "CONTRADICTION_THRESHOLD changed from its shipped value. Under mean pooling the \
+             measured inter-class gap is (0.350, 0.469]. If this changed on purpose, re-derive \
              it from a fresh sweep before re-pinning here — do not just update this literal."
         );
     }
@@ -247,13 +255,13 @@ mod tests {
     /// test above pins the threshold: every other test that names this
     /// constant measures its own fixture against the constant itself. The
     /// floor test's fixture sits at unit-space L2 ≈ 0.009 and the near-band
-    /// test's at ≈ 0.10, so the pair of them only bounds the floor to the open
-    /// range (0.009, 0.10] — mutating 0.05 to 0.01 left all 801 tests green.
+    /// test's at ≈ 0.26, so the pair of them only bounds the floor to the open
+    /// range (0.009, 0.26] — mutating the floor to 0.01 left every test green.
     /// A 10x window is not a pin.
     #[test]
     fn near_duplicate_floor_pins_the_shipped_value() {
         assert_eq!(
-            NEAR_DUPLICATE_FLOOR, 0.05,
+            NEAR_DUPLICATE_FLOOR, 0.10,
             "NEAR_DUPLICATE_FLOOR changed from its shipped value. This floor is what keeps a \
              near-exact duplicate the content hash could not catch (casing, interior whitespace, \
              a trivial edit) from being filed as a contradiction and burning an LLM adjudication \
@@ -301,7 +309,7 @@ mod tests {
         // eps=1.5 measured (not assumed) to land unit-space L2 inside the
         // dispute band — see the eps→unit-space-distance table in this
         // module's doc comment on `near()`.
-        let query = near(&base, 1.5);
+        let query = near(&base, 3.0);
 
         // Defensive: verify the distance `detect_contradiction` actually
         // compares (post-normalization, unit space), not the raw pre-norm one.
@@ -346,8 +354,8 @@ mod tests {
     }
 
     /// Manufactures ≥20 labeled (contradicting, stored, query) pairs.
-    /// Contradicting pairs: stored=base_i, query=near(base_i, 1.5) → unit-space
-    /// L2 ≈ 0.10, inside `[NEAR_DUPLICATE_FLOOR, CONTRADICTION_THRESHOLD)`.
+    /// Contradicting pairs: stored=base_i, query=near(base_i, 3.0) → unit-space
+    /// L2 ≈ 0.26, inside `[NEAR_DUPLICATE_FLOOR, CONTRADICTION_THRESHOLD)`.
     /// Non-contradicting:   stored=far(base_i), query=base_i → antipodal after
     /// normalization, unit-space L2 = 2.0, far outside the dispute band.
     ///
@@ -363,7 +371,7 @@ mod tests {
 
         for i in 0..N_PAIRS {
             let base = base_vec(i as u64 + 100); // seed offset avoids seed=0 edge case
-            let q = near(&base, 1.5);
+            let q = near(&base, 3.0);
             fixtures.push((true, base, q));
         }
         for i in 0..N_PAIRS {
@@ -452,7 +460,7 @@ mod tests {
     async fn ineligible_candidate_type_returns_empty_without_knn() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let base = base_vec(10);
-        let query = near(&base, 1.5);
+        let query = near(&base, 3.0);
 
         // Defensive: without this, a fixture drifting out of the band would
         // turn this back into the vacuous test it just stopped being.
@@ -482,7 +490,7 @@ mod tests {
     async fn eligible_candidate_ineligible_hit_is_dropped() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let base = base_vec(11);
-        let query = near(&base, 1.5); // unit-space L2 ≈ 0.10, inside the band
+        let query = near(&base, 3.0); // unit-space L2 ≈ 0.26, inside the band
         insert_row_typed(&store, "agent-hitgate", "chat_message", &base).await;
 
         let ids = detect_contradiction(&store, &query, "agent-hitgate", None, MemoryType::UserPreference, &[]).await;

@@ -540,7 +540,7 @@ fn format_pool_line(
 /// deterministic (front-of-string) rather than picked by rarity — ranking
 /// tokens by how rare they are is an IDF question this function does not
 /// answer.
-const MAX_LEXICAL_TOKENS: usize = 16;
+pub(crate) const MAX_LEXICAL_TOKENS: usize = 16;
 
 /// The FTS5 MATCH expression for `query_text`, or `None` when there is
 /// nothing to match on. `None` means no MATCH statement is issued at all:
@@ -560,7 +560,7 @@ const MAX_LEXICAL_TOKENS: usize = 16;
 /// `NOT`) is not recognized as one here — it is just another token, quoted
 /// like any other, so it can only ever be searched for literally, never
 /// interpreted as the operator.
-fn fts_match_expression(query_text: &str, max_tokens: usize) -> Option<String> {
+pub(crate) fn fts_match_expression(query_text: &str, max_tokens: usize) -> Option<String> {
     let tokens: Vec<&str> = fts_tokens(query_text).take(max_tokens).collect();
 
     if tokens.is_empty() {

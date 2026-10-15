@@ -35,6 +35,7 @@ pub mod identity;
 pub mod migrations;
 pub(crate) mod pieces;
 pub mod project;
+pub mod project_docs;
 pub mod model_download;
 pub mod record;
 pub mod redact;
