@@ -32,7 +32,7 @@ Con pedazos de 96, un save de 5.000 tokens tiene unos 70 pedazos que comparten c
 
 `golden-mine synth` alarga cada fila `long` hasta que `eval_api::fallback_pieces` (`crates/clawg-core/src/eval_api.rs:67`) da 4 pedazos, y `fallback_pieces` usa el tope de producción. Con 96, las filas saldrían de unos 1.000 bytes, entrarían en un pedazo de 480 y dejarían de ser largas.
 
-`fallback_pieces` pasa a recibir el tope y el solapamiento con los que contar, y el generador le pasa 424/64 como constantes propias, nombradas por lo que significan: el largo con el que se definió el set. Las filas `long` quedan idénticas a las de hoy (R4), y la punta y la base miden el mismo set.
+`fallback_pieces` pasa a recibir el tope con el que contar y corta como `ChatChunker::chunk`, con el solapamiento de 64 de un chunk. El generador le pasa 424 como constante propia (`LONG_PIECE_TOKENS`), nombrada por lo que significa: el largo con el que se definió el set. Con 424/64 es exactamente el corte que hacía `split_save` antes de este cambio. Las filas `long` quedan idénticas a las de hoy (R4), y la punta y la base miden el mismo set.
 
 ## D4. Sin cambios de datos
 
