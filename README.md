@@ -197,6 +197,8 @@ clawg memories show 12 --profile prod              # una memoria completa, con t
 
 El número de `show` es el `id` que aparece en `list` y `search`.
 
+`clawg memories list --deleted` lista las memorias borradas, la última borrada primero. Una borrada vuelve con `clawg undelete <id> --profile prod`, también con el daemon corriendo: se busca de nuevo como antes de borrarla. No vuelve si después se guardó el mismo texto (ya está esa copia) ni si tiene un secreto (`clawg secrets` la lista y `clawg purge` la borra del todo).
+
 Se pueden agregar estos filtros a `list` y `search`:
 
 - `--here`: sólo las memorias del proyecto del directorio actual.
@@ -354,7 +356,8 @@ clawg mcp --profile dev       # puente MCP por stdio; arranca un daemon si no ha
 clawg status --profile dev    # estado y salud del daemon en JSON (sale con 1 si no está corriendo)
 clawg stop --profile dev      # detiene el daemon
 clawg doctor                  # a qué clawg resuelve el PATH (sale con 1 si hay uno que tapa o está duplicado)
-clawg memories list|search|show|stats   # visor de sólo lectura
+clawg memories list|search|show|stats   # visor de sólo lectura (list --deleted: las borradas)
+clawg undelete 12 --profile dev         # devuelve una memoria borrada (con el daemon corriendo)
 ```
 
 `clawg mcp --no-autostart` falla en vez de arrancar un daemon, y `clawg mcp --agent <nombre>` fija el agente con el que guarda y busca. `clawg serve --port <n>` cambia el puerto por defecto (`0` elige uno libre). `clawg path add|remove [--dir <dir>]` edita el PATH del usuario en Windows.
@@ -378,6 +381,7 @@ En Windows usá la ruta completa a `clawg.exe`. Los nombres `clawg-dev` y `clawg
 - `list_memories`: recorre las memorias del agente, las más nuevas primero, sin buscar.
 - `read_memory`: devuelve entero un texto largo que se guardó en varios pedazos, a partir del id de cualquiera de ellos; `search_memory` marca esos pedazos con `piece=K/N`.
 - `delete_memory`: borra una memoria del agente por id y tipo.
+- `restore_memory`: deshace un `delete_memory` del agente, con el mismo id y tipo.
 - `update_memory`: corrige la importancia o el tipo de una memoria del agente. Si el campo que cambia era lo que la tenía en tier 1, la saca; lo que ganó por uso se queda.
 - `resolve_conflict`: cierra un conflicto de ACTIVE CONFLICTS con la respuesta del usuario: una memoria queda y la otra pasa a reemplazada, o quedan las dos.
 - `synthesize`: repasa las memorias en busca de conclusiones. Devuelve las que ninguna conclusión cubre todavía, las conclusiones ya sacadas y cómo guardar una nueva (con `save_memory` y `derived_from`). Las memorias en que se apoya una conclusión no cambian, y quedan marcadas como revisadas aunque no se guarde nada.
