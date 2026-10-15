@@ -42,6 +42,7 @@ use clawg_core::memory::events::{MemoryEvent, MemorySource};
 use clawg_core::memory::clock::TimestampMs;
 use clawg_core::memory::project::{register_project, RegisterError};
 use clawg_core::memory::prompt_builder::{build_memory_prompt, QueryTexts};
+use clawg_core::memory::sharing::{self, Reach};
 use clawg_core::memory::synthesis::{
     existing_memory_ids, synthesis_core, unreviewed_count, Synthesis, SynthesisParams,
 };
@@ -777,7 +778,9 @@ async fn search(
         .await
         .map_err(ApiError::internal)?;
 
-    let scope = SearchScope::all_default().with_project(body.project_id.as_deref());
+    let scope = SearchScope::all_default()
+        .with_project(body.project_id.as_deref())
+        .with_reach(reach(&app, &body.agent_id));
     let mut hits = search_all_memories(
         &app.runtime.store,
         &embedding,
@@ -800,6 +803,21 @@ async fn search(
     app.runtime.access_tracker.record_hits(&hits);
 
     Ok(Json(SearchBody { hits }))
+}
+
+/// Whose memories `reader` may read, from the policy in the data directory,
+/// read on every call so a change counts from the next request on. A policy
+/// that cannot be read shares nothing, so an exclusion the user wrote is never
+/// lost to a typo: the agent keeps its own memories and the user finds the
+/// reason here and in `memory_status`.
+fn reach(app: &AppCtx, reader: &str) -> Reach {
+    match sharing::load(&app.runtime.base_dir) {
+        Ok(policy) => policy.reach_for(reader),
+        Err(e) => {
+            log::warn!("{e}; nothing is shared");
+            Reach::Own
+        }
+    }
 }
 
 /// Builds the 4-block memory prefix for a query.
@@ -831,6 +849,7 @@ async fn context(
         app.runtime.embedder.get().cloned(),
         &body.agent_id,
         project_id,
+        &reach(&app, &body.agent_id),
         QueryTexts { lexical: &body.query, embedded: &body.query },
         &emitted,
         Some(app.runtime.access_tracker.as_ref()),

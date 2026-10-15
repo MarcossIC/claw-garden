@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use clawg_core::memory::sharing;
 use clawg_core::paths::{Profile, ProfileError};
 
 /// `clawg` — local-first memory for coding agents.
@@ -94,6 +95,17 @@ pub enum Command {
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Show which agents do not read which agents' memories, or change it with
+    /// `hide` and `unhide`. Every agent reads every other agent until hidden;
+    /// a change counts from the next search, with the daemon running. A shared
+    /// memory reaches the other agent's provider: `clawg secrets` lists the
+    /// rows that hold a secret.
+    Sharing {
+        #[command(subcommand)]
+        action: Option<SharingAction>,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
     /// Report which `clawg` executables the PATH resolves to and whether this
     /// one is the one a terminal runs. Exits 1 if shadowed or duplicated.
     Doctor {
@@ -111,6 +123,57 @@ pub enum Command {
         #[command(subcommand)]
         action: PathAction,
     },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum SharingAction {
+    /// Stop READER from reading the memories AUTHOR saves. Only that way
+    /// round; `*` on either side stands for every agent.
+    Hide(Exclusion),
+    /// Take an exclusion away.
+    Unhide(Exclusion),
+}
+
+impl SharingAction {
+    /// The `--profile` the action was given, if any.
+    pub fn profile(&self) -> &ProfileArg {
+        match self {
+            SharingAction::Hide(e) | SharingAction::Unhide(e) => &e.profile,
+        }
+    }
+}
+
+/// The `--profile` a `clawg sharing` run uses: the action's when it was given
+/// after the subcommand, else the one given before it. Both spellings are
+/// accepted, and an exclusion written to another profile's data directory
+/// would leave the daemon sharing what the user believes is hidden.
+pub fn sharing_profile<'a>(action: Option<&'a SharingAction>, own: &'a ProfileArg) -> &'a ProfileArg {
+    action.map(SharingAction::profile).filter(|p| p.profile.is_some()).unwrap_or(own)
+}
+
+/// One directed exclusion: READER does not read what AUTHOR saved.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct Exclusion {
+    /// The agent that reads, as `memory_status` names it, or `*`.
+    #[arg(value_parser = parse_agent)]
+    pub reader: String,
+    /// The agent whose memories it does not read, or `*`.
+    #[arg(value_parser = parse_agent)]
+    pub author: String,
+    #[command(flatten)]
+    pub profile: ProfileArg,
+}
+
+impl Exclusion {
+    /// Refuses hiding an agent from itself: an agent always reads its own
+    /// memories, and accepting it would tell the user something changed when
+    /// nothing did. `* *` is not that: it means no agent reads another.
+    pub fn check(&self) -> Result<(), String> {
+        if self.reader == self.author && self.reader != sharing::EVERY_AGENT {
+            return Err(format!("{} always reads its own memories", self.reader));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -435,6 +498,63 @@ mod tests {
                 agent: Some("claude-code".into()),
             }
         );
+    }
+
+    #[test]
+    fn sharing_shows_hides_and_unhides() {
+        assert_eq!(
+            parse(&["clawg", "sharing"]).command,
+            Command::Sharing { action: None, profile: ProfileArg { profile: None } }
+        );
+        let e = Exclusion { reader: "cursor".into(), author: "claude-code".into(), profile: ProfileArg { profile: Some("dev".into()) } };
+        assert_eq!(
+            parse(&["clawg", "sharing", "hide", " cursor ", "claude-code", "--profile", "dev"]).command,
+            Command::Sharing { action: Some(SharingAction::Hide(e.clone())), profile: ProfileArg { profile: None } }
+        );
+        assert_eq!(
+            parse(&["clawg", "sharing", "unhide", "cursor", "claude-code", "--profile", "dev"]).command,
+            Command::Sharing { action: Some(SharingAction::Unhide(e)), profile: ProfileArg { profile: None } }
+        );
+    }
+
+    fn hide_of(args: &[&str]) -> Exclusion {
+        let Command::Sharing { action: Some(SharingAction::Hide(e)), .. } = parse(args).command else {
+            panic!("expected a hide");
+        };
+        e
+    }
+
+    #[test]
+    fn sharing_rejects_a_blank_or_self_exclusion() {
+        assert!(Cli::try_parse_from(["clawg", "sharing", "hide", " ", "claude-code"]).is_err());
+        assert!(Cli::try_parse_from(["clawg", "sharing", "hide", "cursor"]).is_err(), "both agents are needed");
+        let e = hide_of(&["clawg", "sharing", "hide", "cursor", "cursor"]);
+        assert_eq!(e.check(), Err("cursor always reads its own memories".to_string()));
+    }
+
+    #[test]
+    fn sharing_takes_the_profile_from_either_side_of_the_action() {
+        for args in [
+            ["clawg", "sharing", "--profile", "dev", "hide", "cursor", "codex"],
+            ["clawg", "sharing", "hide", "cursor", "codex", "--profile", "dev"],
+        ] {
+            let Command::Sharing { action, profile } = parse(&args).command else {
+                panic!("expected sharing");
+            };
+            assert_eq!(sharing_profile(action.as_ref(), &profile).profile.as_deref(), Some("dev"), "{args:?}");
+        }
+        let Command::Sharing { action, profile } = parse(&["clawg", "sharing", "hide", "cursor", "codex"]).command else {
+            panic!("expected sharing");
+        };
+        assert_eq!(sharing_profile(action.as_ref(), &profile).profile, None);
+    }
+
+    #[test]
+    fn every_agent_is_accepted_on_either_side() {
+        for args in [["*", "codex"], ["cursor", "*"], ["*", "*"]] {
+            let e = hide_of(&["clawg", "sharing", "hide", args[0], args[1]]);
+            assert_eq!(e.check(), Ok(()), "{args:?}");
+        }
     }
 
     #[test]

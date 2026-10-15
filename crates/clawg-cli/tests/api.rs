@@ -677,6 +677,62 @@ async fn search_finds_a_saved_memory() {
 }
 
 #[tokio::test]
+async fn search_returns_the_author_of_each_hit() {
+    let h = Harness::start().await;
+    h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "agent-http" })).await;
+    h.wait_for_rows("memory", 1).await;
+
+    let (status, body) = h.post_json("/v1/search", json!({ "query": CONTENT, "agent_id": "agent-http" })).await;
+    assert_eq!(status, 200, "{body}");
+    let hits = body["hits"].as_array().expect("hits array");
+    assert!(!hits.is_empty(), "{body}");
+    assert!(hits.iter().all(|hit| hit["agent_id"] == "agent-http"), "{body}");
+}
+
+/// Writes `<data>/sharing.json` the way `clawg sharing` would leave it.
+fn write_policy(h: &Harness, text: &str) {
+    std::fs::write(clawg_core::paths::sharing_file(&h.ctx.runtime.base_dir), text).expect("write sharing.json");
+}
+
+async fn finds(h: &Harness, agent: &str, id: i64) -> bool {
+    let (status, body) = h.post_json("/v1/search", json!({ "query": CONTENT, "agent_id": agent })).await;
+    assert_eq!(status, 200, "{body}");
+    body["hits"].as_array().expect("hits array").iter().any(|hit| hit["id"].as_i64() == Some(id))
+}
+
+#[tokio::test]
+async fn search_and_context_follow_the_sharing_policy_from_the_next_call() {
+    let h = Harness::start().await;
+    let saved = save_id(&h, json!({ "content": CONTENT, "agent_id": "a" })).await;
+    assert!(finds(&h, "b", saved).await, "everything is shared without a policy");
+    let (_, body) = h.post_json("/v1/search", json!({ "query": CONTENT, "agent_id": "b" })).await;
+    let hit = body["hits"].as_array().unwrap().iter().find(|hit| hit["id"].as_i64() == Some(saved)).cloned().unwrap();
+    assert_eq!(hit["agent_id"], "a", "{body}");
+    let (status, body) = h.post_json("/v1/context", json!({ "query": CONTENT, "agent_id": "b" })).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["prompt"].as_str().unwrap().contains(" by a] "), "{body}");
+
+    write_policy(&h, r#"{"version":1,"hides":{"b":["a"]}}"#);
+    assert!(!finds(&h, "b", saved).await, "hiding counts without a restart");
+    let (_, body) = h.post_json("/v1/context", json!({ "query": CONTENT, "agent_id": "b" })).await;
+    assert!(!body["prompt"].as_str().unwrap().contains(CONTENT), "{body}");
+    assert!(finds(&h, "c", saved).await, "only b was told not to read a");
+
+    write_policy(&h, r#"{"version":1,"hides":{}}"#);
+    assert!(finds(&h, "b", saved).await, "unhiding counts without a restart");
+}
+
+#[tokio::test]
+async fn an_unreadable_policy_shares_nothing_over_http() {
+    let h = Harness::start().await;
+    let theirs = save_id(&h, json!({ "content": CONTENT, "agent_id": "a" })).await;
+    let mine = save_id(&h, json!({ "content": format!("{CONTENT} too"), "agent_id": "b" })).await;
+    write_policy(&h, r#"{"version":2,"hides":{}}"#);
+    assert!(!finds(&h, "b", theirs).await);
+    assert!(finds(&h, "b", mine).await, "an agent keeps its own memories");
+}
+
+#[tokio::test]
 async fn search_honours_and_caps_the_limit() {
     let h = Harness::start().await;
     for n in 0..3 {

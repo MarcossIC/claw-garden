@@ -13,15 +13,6 @@ pub enum TableKind {
     Procedural,
 }
 
-/// The three visibility scopes for memory records.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Scope {
-    Agent,
-    Project,
-    Global,
-}
-
 /// Common interface for all three memory record types.
 ///
 /// Every implementor provides access to the 12 shared fields defined by the
