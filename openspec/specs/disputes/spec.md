@@ -148,6 +148,8 @@ El detector (`detect_contradiction`, `crates/clawg-core/src/memory/contradiction
 
 Con el modelo real, antes de esta regla 220 de 263 pedazos de 40 saves largos quedaban `disputed` contra sus hermanos; con ella, ninguno ([verify](../../changes/archive/2026-10-13-dispute-resolution/verify.md#hipótesis-de-los-pedazos-hermanos-con-el-modelo-real)).
 
+Desde [long-save-context](../../changes/archive/2026-10-14-long-save-context/proposal.md), los pedazos hermanos también quedan vinculados en `memory_piece`, al final del evento, con su posición en el save ([`specs/pieces`](../pieces/spec.md) R3). La exclusión no lee ese vínculo: sigue siendo la de las filas que inserta el mismo evento. Un save es una sola afirmación de su autor, y por eso la búsqueda, `recall_context` y el detector ven un pedazo por save ([`specs/pieces`](../pieces/spec.md) R4).
+
 #### Escenario
 - GIVEN un save explícito `semantic_fact` que se parte en dos pedazos cuyos vectores están en la banda del detector
 - WHEN se ingiere

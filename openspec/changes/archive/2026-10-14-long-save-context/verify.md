@@ -2,7 +2,7 @@
 
 **Código:** rama `claude/project-thread-0dd4jr`, un commit por tarea, sobre `main` en `9c3ff19`.
 **Modo:** Strict TDD (`openspec/config.yaml`: `strict_tdd: true`). Los tests de cada tarea se escribieron antes que su código y fallaron por no compilar (tipos, funciones o la tabla que todavía no existían) o por la aserción.
-**Estado:** R1 a R8 y la parte de R9 que se prueba sin modelo pasan en Linux, commit por commit. Faltan la suite en Windows, las mediciones U1 a U4 y la prueba con el perfil dev, que necesitan la máquina de Marcos ([pendiente](#pendiente-máquina-de-marcos)).
+**Estado:** R1 a R8 y la parte de R9 que se prueba sin modelo pasan en Linux, commit por commit, y en Windows sobre `main` en `f060593` (1.737 pasan, 0 fallan). U1, U3 y U4 se cumplen. **U2 no se cumple:** la respuesta de un save `long` es alcanzable en 0,333 de los casos (base 0,000; el umbral es 0,75). La prueba con el perfil dev pasa. Detalle en [Windows](#windows).
 
 ## Suite
 
@@ -66,19 +66,60 @@ Notes on clawg-ledger: … the retry budget was set to three attempts …
 - **R9, relleno.** El relleno de una fila `long` no repite 6 palabras seguidas de ninguna fila de la base. Entre filas `long` lo que se exige es que no compartan ningún pedazo, porque salen de las mismas plantillas.
 - **El `kind` en `search_memory`** sale como lo serializa el daemon (`Memory`), no en minúscula como decía el ejemplo de la spec. Los parsers del eval aceptan los dos.
 
-## Pendiente (máquina de Marcos)
+## Windows
 
-1. **Suite en Windows:** `cargo test --workspace --target-dir <otro-dir>`. Espero la base de Windows más los tests nuevos (1.691 + 46 = 1.737 si la base sigue en 1.691) y 0 fallas.
-2. **U1, el ancla:** `rag-eval --real --diff <último resultado de main>` y `rag-eval --real --agent-view`, con `docs/eval/golden.json`. Diff vacío en retrieval y similarity, y el bloque `agent_view` igual campo por campo: el ancla no tiene filas de más de un pedazo.
-3. **U2, U3 y U4:** `golden-mine synth --base docs/eval/golden.json --out <set> --seed 7` y `rag-eval --real --agent-view --golden <set>` dos veces: con el binario de `db0c6a1` (la base: entiende `long` pero guarda y busca como `main`) y con el de la punta. Umbrales, fijados en la propuesta y sin mover:
+Todo sobre `main` en `f060593` (el merge de la rama), Windows 11, binarios debug.
 
-   | # | Condición |
-   |---|---|
-   | U2 | `long`: `by_subset.long.answers.search_reachable` ≥ 0,75 y al menos 0,25 por encima de la base |
-   | U3 | `long`: `by_subset.long.repeated_rows` = 0 (ningún `search_memory` muestra dos pedazos del mismo save) |
-   | U4 | los otros cinco subconjuntos: ninguna métrica de agent-view baja más de 0,02 |
+### Suite
 
-   Si una condición no se cumple, se registra tal cual.
-4. **Perfil dev con Claude Code:** guardar un texto largo (varios párrafos que nombran el tema sólo al principio), buscar por el tema y ver un solo hit con `piece=K/N`, leerlo con `read_memory`, borrar un pedazo con `delete_memory` y volver a leerlo (aparece `(missing)`), y leerlo con otro `--agent` (error, como un id que no existe). Abrir el perfil dev con este binario aplica V11 y deja un snapshot `pre-migration` en `~/.clawg-dev/backups`.
+`cargo test --workspace --no-fail-fast --target-dir target-test`: **1.737 pasan, 0 fallan.** Es la base de Windows (1.691) más los 46 tests nuevos. Los 10 que fallan en Linux por el entorno pasan acá.
 
-Cuando estén, se archiva con los pasos de `tasks.md`.
+### U1, el ancla
+
+La base es la última corrida de `main`: `2026-10-15-real-context-density-fix-anchor.json` y `-agent-view.json`, de `d175348`. Entre `d175348` y `3c84cc9` (el padre del merge en `main`) sólo cambiaron docs, y `golden.json` sigue en `d2d9d732…ed792a`. La punta corrió `rag-eval --real --tag long-save-context-tip-anchor` y `rag-eval --real --agent-view --tag long-save-context-tip`.
+
+- `rag-eval --diff`: 0 mejores y 0 peores en las cinco métricas de retrieval y de similarity. El ancla queda en R@1 0,4348, R@5 0,7826, R@10 0,8913, MRR 0,5979 y nDCG@10 0,6693.
+- Bloque `agent_view`, campo por campo y sin contar latencias: 0 diferencias en los campos que ya existían. Los únicos campos nuevos son los de este change: `by_subset`, `per_case[].subset` y `per_case[].search.repeated_rows`. Se mantienen 41 de 46 encontrados, `search_memory` con media de 851,5 tokens (máx. 1.239) y `recall_context` con 1.405,0 (máx. 1.738).
+
+**✓**
+
+### U2, U3 y U4
+
+El set es `golden-mine synth --base docs/eval/golden.json --seed 7`, generado con el binario de la punta (1.040 filas, 124 casos, 12 `long`). El `golden-mine` de `db0c6a1` genera otras filas `long`, porque el generador cambió después de ese commit: difieren 12 filas y 11 casos, todos `long`, y el resto es idéntico. Las dos corridas usan el set de la punta. `rag-eval --real --agent-view --golden <set>`: la base con el binario compilado en `db0c6a1` (`--tag long-save-context-base-seed7`) y la punta con el de `f060593` (`--tag long-save-context-tip-seed7`).
+
+El `git_sha` del archivo de la base dice `f060593`, porque `rag-eval` lee el `HEAD` del directorio desde donde corre, no el commit del binario. Que el binario es el de `db0c6a1` se ve en dos cosas: escribió sus resultados en el `docs/eval/results` del worktree donde se compiló, y se comporta distinto (3 filas repetidas en `natural`, contra 0 de la punta).
+
+| Subconjunto | Métrica | Base | Punta | Δ |
+|---|---|---|---|---|
+| `long` | `answers.search_reachable` | 0,000 | 0,333 | +0,333 |
+| `long` | `answers.context_visible` | 0,000 | 0,250 | +0,250 |
+| `long` | `answers.search_visible` | 0,000 | 0,000 | 0 |
+| `long` | `search.hit_rate` | 0,083 | 0,333 | +0,250 |
+| `long` | `context.hit_rate` | 0,083 | 0,500 | +0,417 |
+| `long` | `repeated_rows` | 0 | 0 | 0 |
+| `natural` | `search.hit_rate` / `context.hit_rate` | 0,4348 / 0,4348 | 0,4348 / 0,4348 | 0 |
+| `natural` | `search.mean_tokens` / `context.mean_tokens` | 873,1 / 3.397,9 | 845,5 / 3.227,3 | −27,6 / −170,5 |
+| `natural` | `repeated_rows` | 3 | 0 | −3 |
+| `high_importance`, `low_importance`, `lexical`, `multi_ref` | todas | — | — | 0 |
+
+| # | Condición | Resultado |
+|---|---|---|
+| U2 | `long`: `search_reachable` ≥ 0,75 y al menos 0,25 por encima de la base | **✗** 0,333: sube 0,333 sobre la base, pero no llega a 0,75 |
+| U3 | `long`: `repeated_rows` = 0 | ✓ 0 (y `natural` baja de 3 a 0) |
+| U4 | los otros cinco: ninguna métrica de agent-view baja más de 0,02 | ✓ los hit rates no cambian; los tokens quedan iguales o bajan |
+
+**Por qué falla U2.** En los 4 casos donde el save aparece en `search_memory`, su respuesta es alcanzable con `read_memory`: el vínculo y la lectura hacen su parte. El límite está antes, en el ranking. Cuando el save aparece, lo hace en el puesto 7, 8 o 9 de 10, con un score pegado al último de la lista (por ejemplo 0,24 contra un tope de 0,32). En los otros 8 casos queda fuera de los 10. Las filas cortas del set, densas en las palabras del tema (`retry budget`, `timeout`, `cache`), le ganan a un pedazo de hasta 424 tokens donde la respuesta es una frase entre muchas. La cabecera hace que un pedazo posterior se encuentre por su clave (de 1 a 4 casos en búsqueda y de 1 a 6 en contexto), pero no lo sube lo suficiente. Se registra tal cual; el umbral no se mueve.
+
+### Perfil dev
+
+Con autorización para tocar `~/.clawg-dev`. Antes, `clawg backup --profile dev` (`memory-2026-10-15T01-05-23.413Z-manual.db`) y `clawg stop --profile dev`. Después se recompiló `target\debug\clawg.exe`, cuya imagen vieja quedó renombrada a `clawg.exe.old-2026-10-14` porque la tenía abierta el bridge del editor. Un bridge nuevo (`clawg mcp --profile dev --agent claude-code`, por JSON-RPC) levantó el daemon. Ese daemon aplicó V11 (`memory_piece`) y dejó `memory-2026-10-15T01-06-48.866Z-pre-migration.db`. El bridge lista diez herramientas, entre ellas `read_memory`.
+
+1. `save_memory` de un texto de 12 párrafos (3.645 caracteres) que nombra `clawg-ledger` sólo en la primera oración. El daemon todavía cargaba el modelo y respondió `accepted; it will be stored once the embedding model finishes loading`. Quedó en tres pedazos, `#39`, `#40` y `#41`, vinculados en `memory_piece` como el save 1, y los pedazos 2 y 3 con la cabecera como contexto.
+2. `search_memory` por el tema: un solo hit por save, `#39 [Memory/semantic_fact/t3 piece=1/3 score=0.48]` en una consulta y `#41 … piece=3/3 …` en otra. `list_memories` sigue mostrando las tres filas.
+3. `read_memory` con `id: 40`: `#40 is piece 2 of 3 of one save: #39, #40, #41`, y el texto unido es idéntico al guardado.
+4. `delete_memory` de `#40` y `read_memory` con `id: 41`: `#41 is piece 3 of 3 of one save: #39, (missing), #41`, con los dos tramos visibles separados por un salto de línea.
+5. Con `--agent otro`, `read_memory` de `#39` y de `#41` responde `daemon returned 404: no Memory row with id 39` (y `… 41`), lo mismo que un id que no existe (`999999`).
+
+Al final se borraron `#39` y `#41`. **✓**
+
+**Para el editor:** el bridge `clawg-dev` que ya estaba abierto tiene el token del daemon anterior y no responde hasta reconectarlo (`/mcp`) o reiniciar Claude Code. Cuando se cierre, se puede borrar `target\debug\clawg.exe.old-2026-10-14`.

@@ -8,7 +8,7 @@ Fuente de verdad del comportamiento actual de la identidad del agente y de qué 
 
 - **Agente del puente:** el `agent_id` con el que el puente MCP lee y escribe en una llamada.
 - **Fila del agente A:** fila de `memory`, `episodic_trajectory` o `procedural_skill` con `agent_id = A`.
-- **Llamada con scope:** una llamada al daemon que nombra un agente (`agent` en la query de `DELETE`/`PATCH`, `agent_id` en el cuerpo de `POST /v1/disputes/resolve`, `agent` en `GET /v1/memories`).
+- **Llamada con scope:** una llamada al daemon que nombra un agente (`agent` en la query de `DELETE`/`PATCH` y de `GET /v1/memories/{kind}/{id}/save`, `agent_id` en el cuerpo de `POST /v1/disputes/resolve`, `agent` en `GET /v1/memories`).
 - **Segmento seguro:** un `agent_id` no vacío, sin `/`, `\`, `:`, `*`, `?`, `"`, `<`, `>`, `|`, `%` ni caracteres de control, que no termina en `.` ni en espacio (lo que también excluye `.` y `..`) y que no es un nombre de dispositivo de Windows.
 - **Nombre de dispositivo de Windows:** un `agent_id` cuya parte antes del primer `.`, sin espacios finales y sin distinguir mayúsculas, es `CON`, `PRN`, `AUX`, `NUL`, o `COM`/`LPT` seguido de un dígito o de `¹`, `²`, `³`.
 
@@ -56,7 +56,8 @@ El agente del puente MUST ser, en este orden:
 - `delete_memory` sobre una fila de otro agente MUST fallar como si el id no existiera, y MUST NOT tocar la fila, su vector ni las disputas que la nombran.
 - `update_memory` sobre una fila de otro agente MUST fallar como si el id no existiera, y MUST NOT cambiar su importancia, su tipo ni su tier ([`specs/update`](../update/spec.md), R5).
 - `resolve_conflict` con alguna de las dos filas de otro agente MUST fallar como si el id no existiera, y MUST NOT cambiar ninguna de las dos.
-- Sobre filas propias, las cuatro se comportan igual que sin scope.
+- `read_memory` sobre una fila de otro agente, o sobre el save de una fila de otro agente, MUST fallar como si el id no existiera ([`specs/pieces`](../pieces/spec.md), R6). Su ruta de daemon, `GET /v1/memories/{kind}/{id}/save`, responde `404` con el mismo "no existe" (R4).
+- Sobre filas propias, las cinco se comportan igual que sin scope.
 
 #### Escenario: borrar lo ajeno
 - GIVEN una memoria de A
@@ -73,12 +74,12 @@ El agente del puente MUST ser, en este orden:
 - WHEN B llama `resolve_conflict` sobre el par
 - THEN la respuesta es un error y las dos filas siguen igual
 
-**Test:** `an_agent_cannot_delete_another_agents_memory`, `an_agent_cannot_update_another_agents_memory`, `an_agent_lists_only_its_own_memories` y `an_agent_cannot_resolve_another_agents_conflict` en `server.rs`.
+**Test:** `an_agent_cannot_delete_another_agents_memory`, `an_agent_cannot_update_another_agents_memory`, `an_agent_lists_only_its_own_memories`, `an_agent_cannot_resolve_another_agents_conflict` y `an_agent_cannot_read_another_agents_save` en `server.rs`.
 
 ## R4. Scope opcional en el daemon
 
-- `DELETE` y `PATCH /v1/memories/{kind}/{id}` MUST aceptar `agent` en la query; `POST /v1/disputes/resolve` MUST aceptar `agent_id` en el cuerpo.
-- Con scope, si la fila (o alguna de las dos, al resolver) es de otro agente, la respuesta MUST ser `404`, igual que un id inexistente, y MUST NOT cambiar nada: ni la fila, ni su vector, ni sus disputas, ni su `last_modified_at`, ni su `update_count`.
+- `DELETE` y `PATCH /v1/memories/{kind}/{id}` MUST aceptar `agent` en la query; `GET /v1/memories/{kind}/{id}/save` MUST aceptar lo mismo; `POST /v1/disputes/resolve` MUST aceptar `agent_id` en el cuerpo.
+- Con scope, si la fila (o alguna de las dos, al resolver) es de otro agente, la respuesta MUST ser `404`, igual que un id inexistente, y MUST NOT cambiar nada: ni la fila, ni su vector, ni sus disputas, ni su `last_modified_at`, ni su `update_count`. En el `GET` del save, el scope se aplica a la fila pedida (si es ajena, 404) y a cada posición del save: un pedazo de otro agente, que el dedup dejó dentro de un save propio, figura como faltante con `ids` en `null` ([`specs/pieces`](../pieces/spec.md), R6).
 - Sin scope, la operación MUST valer sobre cualquier fila, como antes de existir el scope.
 - La misma regla vale para las tres tablas (`memory`, `episodic`, `procedural`).
 
@@ -92,7 +93,7 @@ El agente del puente MUST ser, en este orden:
 - WHEN se llama `DELETE /v1/memories/memory/{id}` sin `agent`
 - THEN responde `200` con `deleted = 1`
 
-**Test:** `delete_with_another_agent_is_404_and_keeps_the_row`, `patch_with_another_agent_is_404_and_keeps_the_importance` y `resolve_with_another_agent_is_404_and_changes_nothing` en `crates/clawg-cli/tests/api.rs`; `an_owner_mismatch_deletes_nothing`, `an_owner_mismatch_changes_no_importance` en `crates/clawg-core/src/memory/admin.rs` y `a_pair_of_another_agent_is_not_found` en `crates/clawg-core/src/memory/dispute.rs`.
+**Test:** `delete_with_another_agent_is_404_and_keeps_the_row`, `patch_with_another_agent_is_404_and_keeps_the_importance`, `resolve_with_another_agent_is_404_and_changes_nothing` y `get_save_of_another_agent_is_404` en `crates/clawg-cli/tests/api.rs`; `an_owner_mismatch_deletes_nothing`, `an_owner_mismatch_changes_no_importance` en `crates/clawg-core/src/memory/admin.rs` y `a_pair_of_another_agent_is_not_found` en `crates/clawg-core/src/memory/dispute.rs`.
 
 ## R5. Ruta del workspace
 

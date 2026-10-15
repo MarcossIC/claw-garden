@@ -14,7 +14,7 @@ Un texto largo se guarda como pedazos sueltos. Cada pedazo se busca solo, sin sa
 
 Ya no son problema, y quedan fuera:
 
-- **Los hermanos ya no se disputan.** dispute-resolution los excluye del detector (`worker.rs:528-557`, `contradiction.rs:128-147`; [`specs/disputes`](../../specs/disputes/spec.md) R8). Con el modelo real, antes quedaban `disputed` 220 de 263 pedazos de 40 saves largos.
+- **Los hermanos ya no se disputan.** dispute-resolution los excluye del detector (`worker.rs:528-557`, `contradiction.rs:128-147`; [`specs/disputes`](../../../specs/disputes/spec.md) R8). Con el modelo real, antes quedaban `disputed` 220 de 263 pedazos de 40 saves largos.
 - **El agente ya sabe en cuántos pedazos se partió.** El save es síncrono desde ingest-durability, y la respuesta dice `saved as 3 pieces: #57, #58, #59` (`server.rs:416-424`). Era la opción c de la exploración.
 
 ## Decisión (cierra las abiertas de la exploración)
@@ -64,13 +64,13 @@ Ya no son problema, y quedan fuera:
 | U3 | `long`: ningún resultado de `search_memory` muestra dos pedazos del mismo save | `--real --agent-view` |
 | U4 | Los otros cinco subconjuntos del set de la semilla 7: ninguna métrica de agent-view baja más de 0,02 | `--real --agent-view` |
 
-La base de U2 y U4 es el commit del eval, el primero de la rama: ya entiende el subconjunto `long`, pero todavía guarda y busca como `main`. Un binario de `main` no puede leer el set nuevo, porque el parseo rechaza claves desconocidas (`crates/clawg-eval/src/bin/rag-eval/golden.rs:31`). Si una condición no se cumple, se registra tal cual y no se mueven los umbrales (regla de [`specs/eval`](../../specs/eval/spec.md#criterio-de-salida)).
+La base de U2 y U4 es el commit del eval, el primero de la rama: ya entiende el subconjunto `long`, pero todavía guarda y busca como `main`. Un binario de `main` no puede leer el set nuevo, porque el parseo rechaza claves desconocidas (`crates/clawg-eval/src/bin/rag-eval/golden.rs:31`). Si una condición no se cumple, se registra tal cual y no se mueven los umbrales (regla de [`specs/eval`](../../../specs/eval/spec.md#criterio-de-salida)).
 
 `rag-eval --real` sin `--agent-view` no sirve para `long`: siembra cada fila entera, sin partirla (`crates/clawg-eval/src/bin/rag-eval/seed.rs:71-82`), y el embedder la trunca a 512 tokens. El subconjunto aparece en ese reporte, pero no tiene umbral.
 
 ## Datos guardados
 
-- **Esquema:** una migración aditiva, `V11__memory_piece.sql`, con una tabla nueva: `memory_piece (save_id, piece, memory_id, context)`. No toca ninguna tabla existente. `MemoryStore::open` ya guarda un snapshot `pre-migration` en `<data>/backups` antes de aplicarla ([`specs/storage`](../../specs/storage/spec.md)).
+- **Esquema:** una migración aditiva, `V11__memory_piece.sql`, con una tabla nueva: `memory_piece (save_id, piece, memory_id, context)`. No toca ninguna tabla existente. `MemoryStore::open` ya guarda un snapshot `pre-migration` en `<data>/backups` antes de aplicarla ([`specs/storage`](../../../specs/storage/spec.md)).
 - **Contenido, hash, FTS, estados e identificadores:** no cambian. Lo único distinto en una fila nueva es el vector de los pedazos desde el segundo.
 - **Contrato de embedding:** el modelo, la dimensión y el prefijo `passage:` no cambian (`V5__embedding_contract.sql`). El contexto es parte del texto embebido, como el `trigger` + `skill_name` de `procedural_skill` (`maintenance.rs:604-628`).
 - **Datos de la versión anterior:** un test siembra en V10, con SQL directo, filas de `memory` (también un save largo como lo deja `main`: pedazos sueltos) con sus vectores, abre la base con la migración nueva y prueba que se buscan, se listan, se leen con `read_memory` (como saves de un pedazo) y se re-embeben sin contexto.

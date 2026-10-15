@@ -15,7 +15,7 @@ La exploración es del 2026-10-12. Desde entonces entraron ingest-durability, di
 - **Los secretos se enmascaran antes de trocear** (`worker.rs:429-434`). La cabecera sale del texto enmascarado.
 - **Las líneas se movieron.** El embebido está en `worker.rs:504`, la descripción de `save_memory` en `server.rs:696-704` y su test en `server.rs:1526-1534`. `K_FINAL` está en `prompt_builder.rs:34`. Los hits de `recall_context` llevan id desde context-density (`prompt_builder.rs:296-303`).
 - **El save entra por `api.rs:711-726`**, con `Role::User` y `MemorySource::Explicit`; `runtime.rs:262` ya no es ese camino.
-- **eval-golden-expansion no agregó memorias largas.** Su generador suma distractores, `lexical`, `multi_ref` y los de importancia ([`specs/eval`](../../specs/eval/spec.md)); ninguna fila llega al corte y ningún caso tiene la respuesta después de él. La medición tiene que venir con este cambio (R9 de la spec).
+- **eval-golden-expansion no agregó memorias largas.** Su generador suma distractores, `lexical`, `multi_ref` y los de importancia ([`specs/eval`](../../../specs/eval/spec.md)); ninguna fila llega al corte y ningún caso tiene la respuesta después de él. La medición tiene que venir con este cambio (R9 de la spec).
 - **Siguen igual:** el chunker (`chunker/mod.rs:15, 21`, `chat.rs:67-72`), una fila por pedazo sin vínculo (ninguna migración hasta V10 lo agrega), los 500 caracteres de `search_memory` (`tools.rs:26`), `seed.rs:71-82` sin trocear y el criterio de `found` del agent-view (`agent_view/mod.rs:116-146`).
 
 Las líneas de abajo son las del 2026-10-12.

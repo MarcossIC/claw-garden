@@ -40,7 +40,7 @@ Test: `a_discover_probe_is_answered_with_what_the_server_offers` (`handshake.rs`
 #### Escenario: la apertura de Claude Code 2.1.285
 - GIVEN un puente recién abierto
 - WHEN el host manda la sonda sin `_meta`, la cancela con `notifications/cancelled`, manda `initialize`, `notifications/initialized` y `tools/list`
-- THEN la sonda recibe un error con id `server-discover-probe-1`, `initialize` negocia `2025-06-18` y `tools/list` trae las nueve herramientas
+- THEN la sonda recibe un error con id `server-discover-probe-1`, `initialize` negocia `2025-06-18` y `tools/list` trae las diez herramientas
 
 #### Escenario: una request rechazada y su cancelación
 - GIVEN un puente recién abierto
@@ -53,13 +53,13 @@ Tests: `a_bare_probe_and_its_cancellation_leave_the_legacy_handshake_working`, `
 
 Una request con `_meta` 2026-07-28 completo MUST atenderse sin `initialize` previo. `tools/list` en esa sesión MUST:
 
-- listar las nueve herramientas ordenadas por nombre, el mismo orden en cada llamada (la novena, `update_memory`, está en [`specs/update`](../update/spec.md), R5);
+- listar las diez herramientas ordenadas por nombre, el mismo orden en cada llamada: `delete_memory`, `list_memories`, `memory_status`, `read_memory`, `recall_context`, `resolve_conflict`, `save_memory`, `search_memory`, `synthesize` y `update_memory` (la décima está en [`specs/update`](../update/spec.md), R5; `read_memory` en [`specs/pieces`](../pieces/spec.md), R6);
 - traer `resultType`, `ttlMs` y `cacheScope`.
 
 #### Escenario: listar sin handshake
 - GIVEN un puente al que sólo le llegó `server/discover`
 - WHEN el host manda `tools/list` con `_meta`
-- THEN vuelven nueve herramientas en orden alfabético, con `resultType: "complete"`, un `ttlMs` numérico y un `cacheScope`
+- THEN vuelven diez herramientas en orden alfabético, con `resultType: "complete"`, un `ttlMs` numérico y un `cacheScope`
 
 Test: `a_session_without_initialize_lists_the_tools_in_name_order` (`handshake.rs`).
 

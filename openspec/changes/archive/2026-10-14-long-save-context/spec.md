@@ -1,6 +1,6 @@
 # long-save-context — Especificación
 
-**Dominio destino:** `specs/pieces/spec.md` (nuevo; se crea al archivar). Al archivar, también:
+**Dominio destino:** `specs/pieces/spec.md` (creado al archivar). Al archivar, también:
 
 - `specs/mcp` R2 y R3: las herramientas pasan de nueve a diez;
 - `specs/disputes` R8: los pedazos hermanos, además de no disputarse, quedan vinculados (R3 de acá);
@@ -11,7 +11,7 @@
 
 ## Definiciones
 
-- **Save:** un evento de ingesta (`MemoryEvent`): un `save_memory` o un turno de chat. Es la misma unidad que los "pedazos hermanos" de [`specs/disputes`](../../specs/disputes/spec.md).
+- **Save:** un evento de ingesta (`MemoryEvent`): un `save_memory` o un turno de chat. Es la misma unidad que los "pedazos hermanos" de [`specs/disputes`](../../../specs/disputes/spec.md).
 - **Texto del save:** el contenido del evento después de enmascarar secretos (`redact`, `crates/clawg-core/src/memory/worker.rs:429-434`). Todo lo de abajo trabaja sobre ese texto.
 - **Pedazo:** cada ventana que deja el chunker, después de colapsar los repetidos dentro del mismo evento (`collapse_duplicate_chunks`, `worker.rs:137`). Su posición es 1, 2, … en ese orden.
 - **Save largo:** un save con dos pedazos o más.

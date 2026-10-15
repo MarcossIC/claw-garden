@@ -41,13 +41,13 @@ Los mensajes de commit son sugeridos. No mencionan planes, fases ni specs.
 ## Verify
 
 - [x] `cargo test --workspace` en Linux en cada commit, contra la base (1.674 pasan, 10 fallas de entorno). Detalle en [`verify.md`](verify.md).
-- [ ] `cargo test --workspace --target-dir <otro-dir>` en Windows.
-- [ ] `rag-eval --real --diff` y `--agent-view` sobre el ancla: U1.
-- [ ] `golden-mine synth --seed 7` y `rag-eval --real --agent-view` con el binario del commit 1 y con el de la punta: U2, U3 y U4.
-- [ ] Prueba manual con el perfil dev: guardar un texto largo, buscar por su tema, leerlo con `read_memory`, borrar un pedazo y volver a leerlo, intentar leerlo desde otro agente.
+- [x] `cargo test --workspace --target-dir <otro-dir>` en Windows: 1.737 pasan, 0 fallan.
+- [x] `rag-eval --real --diff` y `--agent-view` sobre el ancla: U1 ✓.
+- [x] `golden-mine synth --seed 7` y `rag-eval --real --agent-view` con el binario del commit 1 y con el de la punta: U3 ✓, U4 ✓, **U2 ✗** (0,333 contra 0,75).
+- [x] Prueba manual con el perfil dev: guardar un texto largo, buscar por su tema, leerlo con `read_memory`, borrar un pedazo y volver a leerlo, intentar leerlo desde otro agente.
 
 ## Archive
 
-- [ ] `openspec/specs/pieces/spec.md` con R1–R8, las rutas y líneas del código y la línea **Origen**; R9 a `specs/eval`.
-- [ ] `specs/mcp` (diez herramientas), `specs/disputes` R8 (los hermanos quedan vinculados), `specs/visibility` R3 y R4 (`read_memory` y su ruta).
-- [ ] `git mv openspec/changes/long-save-context openspec/changes/archive/AAAA-MM-DD-long-save-context`; `state.yaml` archivado; fila 15 del `README.md` de openspec; base de tests de `.claude/CLAUDE.md`.
+- [x] `openspec/specs/pieces/spec.md` con R1–R8, las rutas y líneas del código y la línea **Origen**; R9 a `specs/eval`.
+- [x] `specs/mcp` (diez herramientas), `specs/disputes` R8 (los hermanos quedan vinculados), `specs/visibility` R3 y R4 (`read_memory` y su ruta).
+- [x] `git mv openspec/changes/long-save-context openspec/changes/archive/2026-10-14-long-save-context`; `state.yaml` archivado; fila 15 del `README.md` de openspec; base de tests de `.claude/CLAUDE.md`.
