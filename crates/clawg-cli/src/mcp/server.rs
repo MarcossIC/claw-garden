@@ -44,7 +44,7 @@ use crate::client::{
 use crate::mcp::startup::ClientHandle;
 use crate::mcp::tools::{
     format_docs, format_recall, format_resolution, format_rows, format_save, format_search, format_sharing,
-    format_status, format_synthesis, format_update, resolve_project,
+    format_restore, format_status, format_synthesis, format_update, resolve_project,
 };
 
 /// Agent id used when neither `--agent` nor the MCP client named one.
@@ -221,6 +221,14 @@ pub struct ListMemoriesArgs {
     /// How many rows to skip, for paging through a long list. Defaults to 0.
     #[serde(default)]
     pub offset: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RestoreMemoryArgs {
+    /// The id `delete_memory` was given.
+    pub id: i64,
+    /// The kind `delete_memory` was given. Only memory rows can be restored.
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -642,7 +650,23 @@ impl ClawgMcp {
             Err(failure) => return Ok(failure),
         };
         match client.delete(&args.kind, args.id, Some(agent_id)).await {
-            Ok(n) => Self::ok(format!("deleted {n}")),
+            Ok(n) => Self::ok(format!("deleted {n}; restore_memory with the same id and kind undoes it")),
+            Err(e) => Self::failed(Self::explain(&e)),
+        }
+    }
+
+    /// Another agent's row is refused as missing, as in `delete_memory_impl`.
+    pub async fn restore_memory_impl(
+        &self,
+        agent_id: &str,
+        args: RestoreMemoryArgs,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let client = match self.daemon().await {
+            Ok(c) => c,
+            Err(failure) => return Ok(failure),
+        };
+        match client.restore(&args.kind, args.id, Some(agent_id)).await {
+            Ok(restored) => Self::ok(format_restore(&restored)),
             Err(e) => Self::failed(Self::explain(&e)),
         }
     }
@@ -874,7 +898,7 @@ impl ClawgMcp {
                        `search_memory`, `list_memories` or `recall_context` first — ids are \
                        per-kind, so the same number exists in all three tables. Only your own \
                        memories: one marked `by <agent>` was saved by another agent and is \
-                       read-only."
+                       read-only. `restore_memory` undoes it."
     )]
     async fn delete_memory(
         &self,
@@ -882,6 +906,21 @@ impl ClawgMcp {
         Parameters(args): Parameters<DeleteMemoryArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         self.delete_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
+    }
+
+    #[tool(
+        name = "restore_memory",
+        description = "Undo a `delete_memory`: bring a memory you deleted back, with the id and \
+                       kind you deleted it with, when the user says the delete was a mistake. \
+                       Refused when the same text was saved again since, or when the memory holds \
+                       a secret. Only your own memories: one marked `by <agent>` is read-only."
+    )]
+    async fn restore_memory(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(args): Parameters<RestoreMemoryArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.restore_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
     }
 
     #[tool(
@@ -1514,10 +1553,11 @@ mod tests {
             "search_project",
             "memory_status",
             "read_memory",
+            "restore_memory",
         ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}: {names:?}");
         }
-        assert_eq!(names.len(), 11, "no extra tools: {names:?}");
+        assert_eq!(names.len(), 12, "no extra tools: {names:?}");
     }
 
     /// The memory viewer (`clawg memories`) is for the person at the terminal.
@@ -1540,6 +1580,7 @@ mod tests {
                 "read_memory",
                 "recall_context",
                 "resolve_conflict",
+                "restore_memory",
                 "save_memory",
                 "search_memory",
                 "search_project",
@@ -2130,6 +2171,52 @@ mod tests {
         assert!(!is_error(&r), "the owner deletes it: {}", text(&r));
     }
 
+    fn restore_args(id: i64) -> RestoreMemoryArgs {
+        RestoreMemoryArgs { id, kind: "memory".into() }
+    }
+
+    #[tokio::test]
+    async fn restore_memory_undoes_an_own_delete() {
+        let (b, _d) = bridge().await;
+        let content = "agent a keeps its release notes in the wiki";
+        let id = saved_id(&b, "agent-a", content).await;
+
+        let deleted = b.delete_memory_impl("agent-a", DeleteMemoryArgs { id, kind: "memory".into() }).await.expect("call");
+        assert!(text(&deleted).contains("restore_memory"), "the delete says how to undo it: {}", text(&deleted));
+        assert!(!text(&b.list_memories_impl("agent-a", list_all()).await.expect("list")).contains(content));
+
+        let r = b.restore_memory_impl("agent-a", restore_args(id)).await.expect("call");
+        assert!(!is_error(&r), "{}", text(&r));
+        assert!(text(&r).contains(&format!("#{id}")), "{}", text(&r));
+        let listed = b.list_memories_impl("agent-a", list_all()).await.expect("list");
+        assert!(text(&listed).contains(content), "it is back: {}", text(&listed));
+
+        let again = b.restore_memory_impl("agent-a", restore_args(id)).await.expect("call");
+        assert!(is_error(&again), "a live row has nothing to restore: {}", text(&again));
+    }
+
+    #[tokio::test]
+    async fn an_agent_cannot_restore_another_agents_memory() {
+        let (b, _d) = bridge().await;
+        let content = "agent a keeps its release notes in the wiki";
+        let id = saved_id(&b, "agent-a", content).await;
+        b.delete_memory_impl("agent-a", DeleteMemoryArgs { id, kind: "memory".into() }).await.expect("call");
+
+        let r = b.restore_memory_impl("agent-b", restore_args(id)).await.expect("call");
+
+        assert!(is_error(&r), "another agent's memory must not be restorable: {}", text(&r));
+        assert!(!text(&b.list_memories_impl("agent-a", list_all()).await.expect("list")).contains(content));
+        let r = b.restore_memory_impl("agent-a", restore_args(id)).await.expect("call");
+        assert!(!is_error(&r), "the owner restores it: {}", text(&r));
+    }
+
+    #[tokio::test]
+    async fn delete_memory_names_the_way_back() {
+        let (b, _d) = bridge().await;
+        let d = description(&b, "delete_memory");
+        assert!(d.contains("restore_memory"), "description: {d}");
+    }
+
     fn read_args(id: i64) -> ReadMemoryArgs {
         ReadMemoryArgs { id, kind: None }
     }
@@ -2396,7 +2483,7 @@ mod tests {
     #[tokio::test]
     async fn tool_descriptions_say_shared_memories_are_read_only() {
         let (b, _d) = bridge().await;
-        for name in ["delete_memory", "update_memory", "resolve_conflict"] {
+        for name in ["delete_memory", "update_memory", "resolve_conflict", "restore_memory"] {
             let tool = b.tool_router.list_all().into_iter().find(|t| t.name == name).expect(name);
             let description = tool.description.as_deref().unwrap_or_default();
             assert!(description.contains("Only your own memories") && description.contains("read-only"), "{name}: {description}");
