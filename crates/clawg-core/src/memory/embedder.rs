@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 use fastembed::{
-    InitOptionsUserDefined, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
+    InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -107,6 +107,23 @@ const E5_QUERY_PREFIX: &str = "query: ";
 /// standalone documents), this constant is the one line to move back to
 /// `"passage: "`.
 const E5_PASSAGE_PREFIX: &str = "query: ";
+
+/// The id the embedding contract records for this embedder's vectors. It names
+/// the pooling because the model file does not decide it, and vectors pooled
+/// differently live in different spaces.
+pub const E5_MODEL_ID: &str = "multilingual-e5-small/mean";
+
+/// The id earlier versions recorded for the same weights pooled by CLS, the
+/// default fastembed applies to a user-defined model. A store under this id
+/// holds vectors that must be re-embedded, never mixed with new ones.
+pub const LEGACY_CLS_MODEL_ID: &str = "multilingual-e5-small";
+
+/// e5 is trained with mean pooling. Left unset, fastembed pools a
+/// user-defined model by its first token, which gave every passage of a corpus
+/// nearly the same vector.
+fn e5_model(onnx: Vec<u8>, tokenizer: TokenizerFiles) -> UserDefinedEmbeddingModel {
+    UserDefinedEmbeddingModel::new(onnx, tokenizer).with_pooling(Pooling::Mean)
+}
 
 /// The token window fastembed truncates the model input to. Pinned as an
 /// explicit constant rather than left at fastembed's own default: the query
@@ -236,7 +253,7 @@ impl FastEmbedLocal {
     pub fn from_bytes(onnx: Vec<u8>, tokenizer: TokenizerFiles) -> Result<Self, EmbedError> {
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<EmbedRequest>();
 
-        let user_model = UserDefinedEmbeddingModel::new(onnx, tokenizer);
+        let user_model = e5_model(onnx, tokenizer);
         // Pinned explicitly so the composer's budget and the embedder's own
         // truncation point are provably the same number, not two constants
         // that happen to agree today.
@@ -266,7 +283,7 @@ impl FastEmbedLocal {
         Ok(Self {
             req_tx,
             dimensions: 384,
-            model_id: "multilingual-e5-small",
+            model_id: E5_MODEL_ID,
         })
     }
 }
@@ -449,6 +466,23 @@ impl Embedder for FakeEmbedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_e5_model_is_pooled_by_mean() {
+        let tokenizer = TokenizerFiles {
+            tokenizer_file: Vec::new(),
+            config_file: Vec::new(),
+            special_tokens_map_file: Vec::new(),
+            tokenizer_config_file: Vec::new(),
+        };
+        assert_eq!(e5_model(Vec::new(), tokenizer).pooling, Some(Pooling::Mean));
+    }
+
+    #[test]
+    fn the_model_id_names_its_pooling_apart_from_the_cls_vectors_of_before() {
+        assert_eq!(E5_MODEL_ID, "multilingual-e5-small/mean");
+        assert_eq!(LEGACY_CLS_MODEL_ID, "multilingual-e5-small");
+    }
 
     // ---------- Embedder trait + FakeEmbedder ----------
 

@@ -84,7 +84,8 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
     // Background, never awaited: the model may not be on disk yet, and the
     // daemon must answer `/health` and accept saves throughout the download.
     // A failed download is retried until the network comes back.
-    let (ensure, load, verify) = production_deps(runtime.store.clone());
+    let (ensure, load, verify) =
+        production_deps(runtime.store.clone(), clawg_core::paths::backups_dir(&base_dir));
     tokio::spawn(run_embedder_bootstrap_with_retry(
         base_dir.clone(),
         runtime.embedder.clone(),
