@@ -1,14 +1,14 @@
 change: agent-sharing
 objective: "4"
 depends_on: [visibility-policy, secret-hygiene]
-phase: apply
+phase: verify
 artifacts:
   exploration: done
   proposal: done
   spec: done
   design: done
   tasks: done
-  apply: in_progress
-  verify: pending
+  apply: done
+  verify: in_progress
   archive: pending
 updated: 2026-10-15
