@@ -102,7 +102,8 @@ const E5_QUERY_PREFIX: &str = "query: ";
 /// This was measured, not assumed: giving passages their own `"passage: "`
 /// prefix scored WORSE on the domain golden set than the symmetric split —
 /// sim recall@10 dropped from 0.8261 to 0.6957 (95% CI excluding 0) — while
-/// doc-to-doc structure was essentially unchanged. If this corpus later
+/// doc-to-doc structure was essentially unchanged. That was measured with
+/// CLS pooling and has not been re-measured under mean. If this corpus later
 /// gains a genuinely asymmetric shape (e.g. short queries against long
 /// standalone documents), this constant is the one line to move back to
 /// `"passage: "`.

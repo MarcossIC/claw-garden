@@ -1239,7 +1239,7 @@ fn known_bugs_live(mode: cli::Mode) -> Vec<String> {
         // FakeEmbedder fills 384 floats uniformly in [-1, 1] with no
         // normalization (‖v‖ ≈ 11.3 rather than 1.0), so distances measured
         // against it are not on the scale the contradiction sweep's
-        // 0.10..0.40 thresholds assume. Every fake pair sits far outside
+        // 0.20..0.50 thresholds assume. Every fake pair sits far outside
         // that range, so the curve is degenerate under --fake: recall = 0
         // and both false-positive rates = 0 at every threshold.
         bugs.push("fake-embedder-unnormalized-contradiction-sweep-degenerate".to_string());
