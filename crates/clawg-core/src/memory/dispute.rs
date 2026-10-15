@@ -136,6 +136,12 @@ pub(crate) fn release_challengers(c: &Connection, id: i64, now: TimestampMs) -> 
     c.execute(&sql, rusqlite::params![now, id])
 }
 
+/// Settles row `id` alone. A row coming back from deletion may name rows
+/// that were deleted or superseded while it was gone.
+pub(crate) fn settle_row(c: &Connection, id: i64, now: TimestampMs) -> rusqlite::Result<usize> {
+    c.execute(&settle_sql("id = ?2"), rusqlite::params![now, id])
+}
+
 /// Settles every `disputed` row. A delete that ran before deletes released
 /// their challengers left those rows `disputed` with nothing to be resolved
 /// against; this is the backfill for them.
