@@ -21,7 +21,7 @@ Las decisiones de producto (puntero y contexto, la cabecera sólo embebida, las 
 | **a. Un tope para todos los pedazos de un save largo** | El splitter ya parte con un tope uniforme (`TokenSplitter::split`, `chunker/token_splitter.rs:40`) | El pedazo 1 queda 56 tokens más corto de lo que podría |
 | b. 480 para el pedazo 1 y 424 para el resto | Un pedazo menos en algún save | Hay que partir en dos pasadas y volver a calcular el solapamiento en el borde |
 
-**Elegida a.** La decisión de partir sigue siendo la de hoy: si `split(texto, 480, 64)` da un pedazo, ése es el resultado (spec R1). Si no, `split(texto, 424, 64)`. La cabecera es `split(texto, 48, 0)[0]`. Las tres son funciones puras de `ChatChunker`, que devuelve los pedazos y la cabecera juntos (`LongSplit { pieces, head: Option<String> }`), así el worker no vuelve a tokenizar.
+**Elegida a.** La decisión de partir sigue siendo la de hoy: si `split(texto, 480, 64)` da un pedazo, ése es el resultado (spec R1). Si no, `split(texto, 424, 64)`. La cabecera es `split(texto, 48, 0)[0]`. Las tres son funciones puras de `ChatChunker`, que devuelve los pedazos y la cabecera juntos (`ChatChunker::split_save` → `SaveSplit { pieces, head: Option<String> }`), así el worker no vuelve a tokenizar.
 
 `embedding_text(context: &str, piece: &str) -> Cow<str>` vive en `chunker/mod.rs`: devuelve el pedazo si `context` está vacío, y `context + "\n…\n" + piece` si no. La usan el worker y `reembed_all` (spec R7).
 
@@ -54,7 +54,7 @@ CREATE INDEX IF NOT EXISTS idx_memory_piece_memory ON memory_piece (memory_id);
 | a. En la transacción de cada insert | El vínculo nunca falta para una fila insertada | El `save_id` hace falta antes del primer insert, los pedazos absorbidos no pasan por un insert, y un save cortado deja un grupo a medias |
 | **b. Al final del evento, en una transacción** | Un save completo o ningún vínculo; los absorbidos entran igual | Si el proceso muere entre el último insert y el vínculo, las filas quedan sueltas |
 
-**Elegida b.** Lo que queda sin vínculo es exactamente el estado de hoy, y guardar el mismo texto de nuevo lo arregla: todos los pedazos se absorben por hash y el vínculo se escribe (spec R3). El método es `MemoryStore::link_pieces(&[(piece, memory_id, context)])` en `pieces.rs`, y el worker lo llama con lo que ya tiene en `stored` (`worker.rs:477`) y las cabeceras de las filas que insertó.
+**Elegida b.** Lo que queda sin vínculo es exactamente el estado de hoy, y guardar el mismo texto de nuevo lo arregla: todos los pedazos se absorben por hash y el vínculo se escribe (spec R3). El método es `MemoryStore::link_pieces(Vec<StoredPiece { memory_id, context }>)` en `pieces.rs` (la posición es el orden de la lista), y el worker lo llama con lo que ya tiene en `stored` y la cabecera con la que embebió cada fila que insertó. Si las mismas filas, en el mismo orden, ya forman un save, devuelve ese `save_id` sin escribir: guardar dos veces el mismo texto no duplica el vínculo.
 
 ## D5. El colapso, en la búsqueda misma
 
@@ -74,7 +74,7 @@ CREATE INDEX IF NOT EXISTS idx_memory_piece_memory ON memory_piece (memory_id);
 | a. Ampliar `GET /v1/memories/{kind}/{id}` (`api.rs:883-893`) | Una ruta menos | Hoy no tiene scope por agente; sumárselo cambia lo que ve quien ya la usa, y cada lectura pagaría el armado del save |
 | **b. `GET /v1/memories/{kind}/{id}/save?agent=`** | El scope de visibility-policy desde el principio; la ruta vieja no cambia | Una ruta más |
 
-**Elegida b.** `read_save_core(store, kind, id, owner) -> Option<SaveText>` en `pieces.rs`, con `SaveText { id, kind, pieces, ids: Vec<Option<i64>>, missing: Vec<i64>, text }`. `join_pieces(&[&str]) -> String` es pura (spec R6). Los pedazos de un save los inserta el agente del evento, pero uno absorbido puede ser de otra fila del mismo agente con otro proyecto; el filtro por `agent_id` y `deleted_at IS NULL` se aplica a cada posición, y lo que no pasa queda en `missing`.
+**Elegida b.** `read_save_core(store, kind, id, owner) -> Option<SaveText>` en `pieces.rs`, con `SaveText { kind, id, piece, pieces, ids: Vec<Option<i64>>, missing: Vec<i64>, text }`. `piece` es la posición de la fila pedida: con un pedazo repetido dentro del mismo save, el id solo no la determina. `join_pieces(&[&str]) -> String` es pura (spec R6). `read_save_core` la aplica a cada tramo de pedazos visibles consecutivos y une los tramos con un salto de línea, así nunca busca solapamiento entre dos pedazos que no eran vecinos. Los pedazos de un save los inserta el agente del evento, pero uno absorbido puede ser de otra fila del mismo agente con otro proyecto; el filtro por `agent_id` y `deleted_at IS NULL` se aplica a cada posición, y lo que no pasa queda en `missing`.
 
 `format_save(&SaveText) -> String` en `tools.rs`: `#58 is piece 2 of 4 of one save: #57, #58, (missing), #60` en la primera línea, y el texto debajo. Para una fila sin vínculos: `#58` y su contenido.
 
@@ -82,17 +82,17 @@ CREATE INDEX IF NOT EXISTS idx_memory_piece_memory ON memory_piece (memory_id);
 
 - **El subconjunto va al final de `generate`** (`synth/mod.rs:59-82`). Consume la semilla después de todo lo demás, así que las filas y los casos de hoy salen idénticos (spec R9); el sha del set de la semilla 7 cambia porque el archivo crece.
 - **El relleno se arma con plantillas propias** (`templates::long_filler`), sin la clave, con números y palabras sorteados por fila para que dos filas `long` no compartan pedazos (el dedup los absorbería y el caso mediría otra cosa) y para que ninguna repita 6 palabras de la base (`shares_word_run`, el chequeo de los distractores).
-- **El largo** se asegura con `ChatChunker::with_fallback` sobre el texto final: 3 pedazos con el tope de producción en modo sin tokenizer, que es el más conservador (4 bytes por token). Con el tokenizer real salen más.
+- **El largo** se asegura con `eval_api::fallback_pieces` (que usa `split_save` sin tokenizer) sobre el texto: el generador agrega relleno hasta 4 pedazos y el test exige al menos 3. Con el tokenizer real salen más.
+- **El relleno** sólo se compara con la base (`shares_word_run`); entre filas `long` se exige que no compartan pedazos, porque salen de las mismas plantillas.
 - **Agent-view** lee `answer` y lo busca en el texto que el agente recibe. Para la respuesta alcanzable, el runner llama `GET .../save` con el id de la primera línea de búsqueda que carga la fila esperada (`SearchLine` gana `id`); si la ruta da 404 por no existir, cuenta lo visible.
 - **La base** es el commit del eval: tiene el parser y el subconjunto, y guarda y busca como `main`.
 
 ## D8. Orden de los commits
 
 1. Medición: `long`, `answer` y las métricas de agent-view, con el parser aceptando `piece=K/N` (todavía nadie lo imprime).
-2. `V11__memory_piece.sql`, `pieces.rs` con `link_pieces`, `read_save_core` y `join_pieces`, y el test de datos de V10.
-3. Chunker y worker: el tope, la cabecera, el texto embebido y el vínculo al final del evento; el re-embed con contexto.
-4. Búsqueda: `PiecePosition`, el colapso y `piece=K/N` en los dos formatos.
-5. HTTP y MCP: la ruta `/save`, `read_memory`, las descripciones y los conteos.
-6. Docs: `.claude/CLAUDE.md` (herramienta y ruta) y la lista del `README.md`.
+2. `V11__memory_piece.sql`, `link_pieces`, el chunker y el worker: el tope, la cabecera, el texto embebido y el vínculo al final del evento; el re-embed con contexto; el test de datos de V10.
+3. Búsqueda: `PiecePosition`, el colapso y `piece=K/N` en los dos formatos.
+4. HTTP y MCP: `read_save_core` y `join_pieces`, la ruta `/save`, `read_memory`, las descripciones y los conteos.
+5. Docs: `.claude/CLAUDE.md` (herramienta y ruta) y la lista del `README.md`.
 
-Cada uno compila y pasa la suite solo. Si una pieza queda sin llamador hasta el commit siguiente (y el compilador avisa código muerto), se junta con ése, como en memory-update-tool.
+Cada uno compila y pasa la suite solo. El plan tenía la tabla sola en un commit, pero `link_pieces` no tenía llamador hasta el worker (código muerto), así que se juntó con él, y `read_save_core` y `join_pieces` pasaron al commit de la ruta que los usa, como en memory-update-tool.

@@ -35,7 +35,7 @@ exploration -> proposal -> spec (+ design si hace falta) -> tasks -> apply -> ve
 | 12 | [project-indexing](changes/project-indexing/exploration.md) | 3 | decisión | 5 | exploración |
 | 13 | [secret-hygiene](changes/archive/2026-10-14-secret-hygiene/proposal.md) | 1, 4 | S–M | — (tiene que cerrar antes de 16) | archivado el 2026-10-14 ([`specs/secrets`](specs/secrets/spec.md)); verificado en Linux, Windows, `rag-eval --real` con diff vacío y el perfil dev con Claude Code ([verify](changes/archive/2026-10-14-secret-hygiene/verify.md#perfil-dev-con-claude-code-2026-10-14)) |
 | 14 | [context-density](changes/context-density/proposal.md) | 1 | S–M | — (se suma a 9) | verify: tests en verde en Linux; faltan Windows, `rag-eval --real --agent-view` y el perfil dev ([`verify.md`](changes/context-density/verify.md#pendiente-máquina-de-marcos)) |
-| 15 | [long-save-context](changes/long-save-context/proposal.md) | 1 | M | 5, 9, 1 (toca el esquema: V11) | apply |
+| 15 | [long-save-context](changes/long-save-context/proposal.md) | 1 | M | 5, 9, 1 (toca el esquema: V11) | verify: tests en verde en Linux; faltan Windows, `rag-eval --real --agent-view` (U1–U4) y el perfil dev ([`verify.md`](changes/long-save-context/verify.md#pendiente-máquina-de-marcos)) |
 | 16 | [agent-sharing](changes/agent-sharing/exploration.md) | 2, 4 | L (partes C + D de visibility-policy) | 6, 13 | exploración |
 
 Objetivos del producto:

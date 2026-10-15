@@ -46,7 +46,7 @@ El armado del texto embebido MUST ser una función pura, la misma que usa el re-
 - AND el embedder recibe el pedazo 2 precedido de una cabecera que contiene `clawg-ledger`
 - AND la fila del pedazo 2 guarda el pedazo sin la cabecera
 
-**Test:** `a_long_text_is_split_below_the_cap_to_leave_room_for_the_head`, `the_head_is_the_first_tokens_of_the_text` y `only_pieces_after_the_first_carry_the_head` en `chat.rs`; `later_pieces_are_embedded_with_the_head_and_stored_without_it` en `worker.rs`. Fallan hoy.
+**Test:** `a_long_text_is_split_below_the_cap_to_leave_room_for_the_head` y `the_head_is_the_first_tokens_of_the_text` en `chat.rs`; `a_piece_without_context_is_embedded_as_stored` y `a_piece_with_context_is_embedded_after_the_head` en `chunker/mod.rs`; `later_pieces_are_embedded_with_the_head_and_stored_without_it` en `worker.rs`, que también prueba que el pedazo 1 se embebe sin cabecera. Fallan hoy.
 
 ## R3. El save deja su vínculo
 
@@ -72,7 +72,9 @@ Si escribir el vínculo falla, el save MUST seguir informándose como guardado: 
 - WHEN se guarda
 - THEN `memory_piece` no cambia
 
-**Test:** `a_long_save_links_its_pieces_in_order`, `an_absorbed_piece_is_linked_without_context`, `a_save_cut_short_leaves_no_link` y `the_same_long_save_again_links_the_rows_it_left` en `worker.rs`. Fallan hoy.
+Guardar otra vez exactamente las mismas filas, en el mismo orden, MUST devolver el `save_id` que ya forman y no escribir nada: el mismo save no se vincula dos veces.
+
+**Test:** `a_long_save_links_its_pieces_in_order`, `an_absorbed_piece_is_linked_without_context`, `a_save_cut_short_leaves_no_link` y `the_same_long_save_again_links_the_rows_it_left` en `worker.rs`; `link_pieces_numbers_saves_in_order` y `linking_the_same_rows_again_answers_the_save_they_already_form` en `pieces.rs`. Fallan hoy.
 
 ## R4. Un hit por save
 
@@ -102,7 +104,7 @@ Los parsers del agent-view (`crates/clawg-eval/src/bin/rag-eval/agent_view/parse
 
 #### Escenario
 - GIVEN un hit del pedazo 2 de 4, id 58
-- THEN `search_memory` imprime `1. #58 [memory/semantic_fact/t3 piece=2/4 score=0.81] …`
+- THEN `search_memory` imprime `1. #58 [Memory/semantic_fact/t3 piece=2/4 score=0.81] …` (el `kind` sale como lo serializa el daemon, `Memory`)
 - AND `recall_context` imprime `[2026-10-15 #58 semantic_fact piece=2/4] …`
 
 **Test:** `format_hits_names_the_piece_of_a_long_save` en `crates/clawg-cli/src/mcp/tools.rs`; `format_hit_line_names_the_piece_of_a_long_save` en `crates/clawg-core/src/memory/prompt_builder.rs`; `a_hit_line_with_a_piece_yields_its_id_score_and_content` y `a_context_hit_with_a_piece_is_one_segment` en `parse.rs`. Fallan hoy.
@@ -111,7 +113,7 @@ Los parsers del agent-view (`crates/clawg-eval/src/bin/rag-eval/agent_view/parse
 
 `GET /v1/memories/{kind}/{id}/save` con la query `agent` MUST devolver el save de la fila:
 
-- `id`, `kind`, `pieces` (el total) e `ids`: el id de cada posición, o `null` si esa fila está borrada o es de otro agente;
+- `id`, `kind`, `piece` (la posición de la fila pedida), `pieces` (el total) e `ids`: el id de cada posición, o `null` si esa fila está borrada o es de otro agente;
 - `missing`: las posiciones sin fila visible;
 - `text`: los pedazos visibles en orden, sin el solapamiento entre vecinos.
 
@@ -133,7 +135,9 @@ El puente MUST exponer `read_memory(id, kind?)`, con `kind = memory` por defecto
 - WHEN B llama `read_memory` con uno de sus ids
 - THEN la respuesta es un error, igual que con un id que no existe
 
-**Test:** `join_pieces_drops_the_overlap_once`, `join_pieces_keeps_both_sides_when_nothing_overlaps` y `read_save_lists_missing_pieces_and_skips_other_agents` en el core (`crates/clawg-core/src/memory/pieces.rs`); `get_save_returns_the_whole_text` y `get_save_of_another_agent_is_404` en `crates/clawg-cli/tests/api.rs`; `read_memory_returns_the_whole_save`, `an_agent_cannot_read_another_agents_save` y los conteos de herramientas en `crates/clawg-cli/src/mcp/server.rs` y `handshake.rs`; la respuesta de un save largo en `save_outcome_text_covers_every_daemon_answer`. Fallan hoy.
+Contra un daemon que no tiene la ruta (su 404 no trae el error del daemon), `read_memory` MUST decir que hay que reiniciar el daemon, no que la fila no existe.
+
+**Test:** `join_pieces_drops_the_overlap_once`, `join_pieces_keeps_both_sides_when_nothing_overlaps`, `the_pieces_of_a_split_save_join_back_into_its_text` y `read_save_lists_missing_pieces_and_skips_other_agents` en el core (`crates/clawg-core/src/memory/pieces.rs`); `get_save_returns_the_whole_text` y `get_save_of_another_agent_is_404` en `crates/clawg-cli/tests/api.rs`; `read_memory_returns_the_whole_save`, `an_agent_cannot_read_another_agents_save`, `a_daemon_without_the_save_route_is_named_as_such`, `save_memory_asks_for_one_fact_per_call`, `search_memory_explains_the_piece_of_a_long_save` y los conteos de herramientas en `crates/clawg-cli/src/mcp/server.rs` y `handshake.rs`; `format_save_names_the_piece_and_the_missing_ones` en `tools.rs`; la respuesta de un save largo en `save_outcome_text_covers_every_daemon_answer`. Fallan hoy.
 
 ## R7. El re-embed reconstruye el contexto
 
@@ -158,7 +162,7 @@ Una base en V10 con filas de `memory` y sus vectores, sembradas con SQL directo 
 
 - cada caso tiene una fila propia de al menos 3 pedazos con el chunker de producción, aun en modo sin tokenizer;
 - la fila nombra la clave del caso sólo en su primera oración, y el dato que responde la consulta aparece una sola vez, después del primer tercio del texto;
-- el relleno entre los dos no nombra la clave y no repite una secuencia de 6 palabras de otra fila del corpus;
+- el relleno entre los dos no nombra la clave y no repite una secuencia de 6 palabras de una fila de la base; entre dos filas `long` lo que se exige es que no compartan ningún pedazo (el dedup los absorbería y el caso mediría otra cosa). Las filas `long` salen de las mismas plantillas de relleno, así que entre ellas sí pueden repetirse frases cortas;
 - el caso lleva la clave nueva `answer`: el dato tal como aparece en la fila.
 
 Con la misma base y la misma semilla, las filas y los casos que el generador agrega hoy MUST salir idénticos.
@@ -169,10 +173,11 @@ Con la misma base y la misma semilla, las filas y los casos que el generador agr
 
 - **respuesta visible:** el texto que devolvió la herramienta contiene `answer`, comparado con los espacios normalizados (`normalize`, `agent_view/matcher.rs:22`);
 - **respuesta alcanzable** (sólo `search_memory`): visible, o visible en el save que devuelve `GET /v1/memories/memory/{id}/save` para la primera línea que carga la fila esperada. Contra un daemon sin esa ruta, alcanzable es igual a visible;
-- **pedazos repetidos:** cuántas respuestas de `search_memory` muestran dos líneas del mismo save.
+- **pedazos repetidos:** cuántas respuestas de `search_memory` muestran dos líneas del mismo save (dos líneas con el mismo id, o con filas del mismo caso);
+- **por subconjunto:** las métricas de agent-view separadas por `subset` (`by_subset`), así `long` y los otros cinco se comparan por separado (U2 y U4).
 
 #### Escenario: el dato después del corte
 - GIVEN un caso `long` con clave `amber-falcon` y `answer` `"retry budget of 7 attempts"`
 - THEN su fila nombra `amber-falcon` sólo en la primera oración, `retry budget of 7 attempts` aparece una vez después del primer tercio, y la fila se parte en 3 pedazos o más
 
-**Test:** `there_are_twelve_long_cases_at_any_size`, `a_long_row_names_its_key_only_in_its_first_sentence`, `the_answer_appears_once_after_the_first_third`, `a_long_row_splits_into_at_least_three_pieces` y `adding_long_cases_leaves_the_rest_of_the_set_unchanged` en `crates/clawg-eval/src/bin/golden-mine/synth/mod.rs`; `an_answer_and_the_long_subset_parse` en `rag-eval/golden.rs`; `the_answer_counts_only_when_its_text_is_visible` y `a_read_save_makes_a_hidden_answer_reachable` en `agent_view/mod.rs`. Fallan hoy.
+**Test:** `there_are_twelve_long_cases_at_any_size`, `a_long_row_names_its_key_only_in_its_first_sentence`, `the_answer_appears_once_after_the_first_third`, `a_long_row_splits_into_at_least_three_pieces` y `adding_long_cases_leaves_the_rest_of_the_set_unchanged` en `crates/clawg-eval/src/bin/golden-mine/synth/mod.rs`; `an_answer_and_the_long_subset_parse` en `rag-eval/golden.rs`; `a_long_case_writes_its_subset_and_answer` en `golden-mine/synth/golden.rs`; `the_answer_counts_only_when_its_text_is_visible`, `a_read_save_makes_a_hidden_answer_reachable`, `a_line_repeating_an_earlier_lines_row_is_counted` y `build_results_splits_active_cases_by_subset_with_their_answers` en `agent_view/mod.rs`; `a_case_that_names_its_answer_reports_whether_the_answer_reached_the_agent` en `agent_view/runner.rs`. Fallan hoy.
