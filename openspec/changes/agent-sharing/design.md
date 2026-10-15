@@ -20,8 +20,8 @@ En `crates/clawg-core/src/memory/`:
 
 - `SharingPolicy` (un `BTreeMap<String, BTreeSet<String>>` de lector a autores): `parse(&str) -> Result<_, SharingError>`, `to_json()`, `authors_for(reader) -> Vec<String>` (orden alfabético, sin el lector), `grant(reader, author)`, `revoke(reader, author)`, `grants()` para mostrar. Todo puro.
 - La forma en disco es un struct aparte con `#[serde(deny_unknown_fields)]` y `version`, que `parse` valida (R1). `BTreeMap`/`BTreeSet` hacen que la salida sea estable: la misma política siempre escribe el mismo archivo.
-- `SharingError` con `thiserror`: `Io`, `Json`, `Version(u32)`, `BlankName`. Su `Display` es el motivo que muestran `memory_status` y `clawg sharing`.
-- I/O fino aparte: `load(base_dir) -> Result<SharingPolicy, SharingError>` (archivo ausente = política vacía) y `save(base_dir, &policy)`, que escribe `sharing.json.tmp` y lo renombra.
+- `SharingError` con `thiserror`: `Io` (leer), `Write`, `Json`, `Version(u32)`, `BlankName`. Su `Display` es el motivo que muestran `memory_status` y `clawg sharing`.
+- I/O fino aparte: `load(base_dir) -> Result<SharingPolicy, SharingError>` (archivo ausente = política vacía) y `save(base_dir, &policy)`, que crea el directorio de datos si falta, escribe `sharing.json.tmp` y lo renombra.
 
 Un archivo inválido no se "arregla" al cargar: `load` devuelve el error y cada llamador decide. El daemon usa política vacía y lo loguea; el puente lo muestra; la CLI sale con 1 y no reescribe.
 
@@ -65,7 +65,7 @@ El daemon serializa el campo tal cual. El cliente lo lee con `#[serde(default)]`
 ## D7. `memory_status` y la CLI
 
 - El puente ya conoce el directorio de datos (`client.base_dir()`, `crates/clawg-cli/src/mcp/server.rs:683`) y llama `sharing::load` él mismo. No hace falta un endpoint: el daemon y el puente leen el mismo archivo. `format_status` recibe una línea ya armada por `format_sharing(Result<Vec<String>, SharingError>)`, pura.
-- `Command::Sharing { action: Option<SharingAction>, profile }` en `crates/clawg-cli/src/cli.rs` con `Grant { reader, author }` y `Revoke { reader, author }`, los dos con `parse_agent` (`cli.rs:22-28`). Lector igual a autor se rechaza al parsear. La ejecución (`sharing.rs` de la CLI) es `load`, la operación pura, `save` e imprimir; no abre la base ni habla con el daemon.
+- `Command::Sharing { action: Option<SharingAction>, profile }` en `crates/clawg-cli/src/cli.rs` con `Grant { reader, author }` y `Revoke { reader, author }`, los dos con `parse_agent` (`cli.rs:22-28`). Lector igual a autor lo rechaza `Grant::check` antes de leer el archivo: clap no valida un argumento contra otro sin código propio. La ejecución (`sharing.rs` de la CLI) es `check`, `load`, la operación pura, `save` e imprimir; no abre la base ni habla con el daemon.
 
 ## D8. Orden de los commits
 

@@ -43,7 +43,7 @@
 - WHEN `cursor` busca
 - THEN encuentra sólo lo suyo, y `memory_status` dice que `sharing.json` es inválido y por qué
 
-**Test:** `a_missing_policy_shares_nothing`, `a_grant_has_a_direction`, `names_match_exactly`, `self_grants_and_repeats_are_ignored`, `an_unknown_version_is_invalid`, `an_unknown_field_is_invalid`, `a_blank_name_is_invalid` en `crates/clawg-core/src/memory/sharing.rs`; `an_unreadable_policy_shares_nothing` en el mismo módulo, sobre un directorio temporal. Fallan hoy: el módulo no existe.
+**Test:** `a_missing_policy_shares_nothing`, `a_grant_has_a_direction`, `names_match_exactly`, `self_grants_and_repeats_are_ignored`, `an_unknown_version_is_invalid`, `an_unknown_field_is_invalid`, `a_blank_name_is_invalid` y `an_unreadable_policy_shares_nothing` (sobre un directorio temporal) en `crates/clawg-core/src/memory/sharing.rs`; `search_and_context_follow_the_sharing_policy_from_the_next_call` y `an_unreadable_policy_shares_nothing_over_http` en `crates/clawg-cli/tests/api.rs`. Fallan hoy: el módulo no existe y el daemon no lee ninguna política.
 
 ## R2. Búsqueda con lo concedido
 
@@ -69,7 +69,7 @@
 - WHEN B busca dentro del proyecto P2
 - THEN la fila no aparece; si es `user_preference`, sí
 
-**Test:** `a_granted_author_is_found_in_every_channel`, `a_grant_does_not_work_backwards`, `shared_rows_obey_the_project_filter`, `the_eligible_count_includes_granted_authors` y `without_grants_the_search_is_unchanged` en `crates/clawg-core/src/memory/search.rs`; `contradiction_probe_ignores_granted_authors` en `crates/clawg-core/src/memory/contradiction.rs`. Fallan hoy (salvo el de política vacía y el del detector, que fijan lo que no cambia): `SearchScope` no tiene autores concedidos.
+**Test:** `a_granted_author_is_found_in_every_channel`, `a_grant_does_not_work_backwards`, `shared_rows_obey_the_project_filter`, `the_eligible_count_includes_granted_authors`, `the_eligible_count_still_rides_the_agent_index` y `without_grants_the_search_is_unchanged` en `crates/clawg-core/src/memory/search.rs`; `contradiction_probe_ignores_granted_authors` en `crates/clawg-core/src/memory/contradiction.rs`. Fallan hoy (salvo el de política vacía y el del detector, que fijan lo que no cambia): `SearchScope` no tiene autores concedidos.
 
 ## R3. Cada hit dice su autor
 
@@ -119,7 +119,7 @@ En `search_memory`:
 - WHEN B llama `recall_context`
 - THEN la fila no está en el bloque WORKSPACE de B
 
-**Test:** `a_shared_memory_is_read_only` y `the_workspace_and_conflicts_stay_own` en `server.rs`; `tool_descriptions_say_shared_memories_are_read_only` en `server.rs`.
+**Test:** `a_shared_memory_is_read_only` y `tool_descriptions_say_shared_memories_are_read_only` en `server.rs`; `the_workspace_and_conflicts_stay_own` en `prompt_builder.rs`, con una disputa de A entre los hits de B; `contradiction_probe_ignores_granted_authors` (R2) cubre el detector. `list_memories` y `synthesize` no cambian de código: siguen pasando sólo el agente (`an_agent_lists_only_its_own_memories`, `an_agent_neither_reviews_nor_cites_another_agents_memories`).
 
 ## R6. `memory_status` dice de quién lee el agente
 
@@ -127,7 +127,7 @@ En `search_memory`:
 
 - `shared: reads <autor>, <autor>` (orden alfabético) con permisos;
 - `shared: none` sin permisos o sin archivo;
-- `shared: none (sharing.json is invalid: <motivo>)` con un archivo inválido.
+- `shared: none (<motivo>)` con un archivo inválido o ilegible, donde el motivo es el mensaje del error (por ejemplo `sharing.json is not valid: …`).
 
 **Test:** `format_status_says_whom_the_agent_reads` en `tools.rs`; `memory_status_reports_the_sharing_of_the_agent` en `server.rs`.
 
@@ -135,12 +135,12 @@ En `search_memory`:
 
 - `clawg sharing [--profile P]` MUST imprimir la política, un permiso por línea (`<lector> reads <autor>`), o `nothing is shared`. Con un archivo inválido MUST imprimir el error y salir con 1.
 - `clawg sharing grant <LECTOR> <AUTOR> [--profile P]` MUST agregar el permiso y `clawg sharing revoke <LECTOR> <AUTOR>` MUST quitarlo. Los dos imprimen la política resultante. Conceder lo que ya existe o revocar lo que no existe MUST NOT fallar.
-- Los nombres MUST recortarse y no pueden quedar vacíos, igual que `--agent`. Lector igual a autor MUST rechazarse al parsear: un agente siempre lee lo suyo.
+- Los nombres MUST recortarse y no pueden quedar vacíos, igual que `--agent` (al parsear). Lector igual a autor MUST rechazarse antes de leer o escribir el archivo: un agente siempre lee lo suyo.
 - Sobre un archivo inválido, `grant` y `revoke` MUST fallar sin reescribirlo: puede ser una edición a mano a medio hacer.
-- La escritura MUST ser atómica (archivo temporal y `rename`): un lector concurrente ve la política vieja o la nueva, nunca una a medias.
+- La escritura MUST ser atómica (archivo temporal y `rename`): un lector concurrente ve la política vieja o la nueva, nunca una a medias. Si el directorio de datos todavía no existe, MUST crearse: conceder puede ser lo primero que hace el usuario.
 - MUST funcionar con el daemon corriendo y sin abrir la base.
 
-**Test:** `sharing_shows_grants_and_revokes`, `sharing_rejects_a_blank_or_self_grant` en `crates/clawg-cli/src/cli.rs`; `grant_and_revoke_rewrite_the_policy`, `granting_twice_and_revoking_nothing_are_fine`, `an_invalid_policy_is_never_rewritten` y `render_lists_one_grant_per_line` en `crates/clawg-core/src/memory/sharing.rs`.
+**Test:** `sharing_shows_grants_and_revokes`, `sharing_rejects_a_blank_or_self_grant` en `crates/clawg-cli/src/cli.rs`; `grant_and_revoke_print_the_policy_they_leave`, `a_change_on_an_invalid_policy_leaves_it_alone` y `a_self_grant_writes_nothing` en `crates/clawg-cli/src/sharing.rs`; `grant_and_revoke_rewrite_the_policy`, `granting_twice_and_revoking_nothing_are_fine`, `an_invalid_policy_is_never_rewritten`, `a_grant_can_come_before_the_data_directory_exists`, `the_saved_file_parses_back_to_the_same_policy` y `render_lists_one_grant_per_line` en `crates/clawg-core/src/memory/sharing.rs`.
 
 ## R8. Datos de la versión anterior
 
