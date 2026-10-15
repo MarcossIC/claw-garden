@@ -90,7 +90,7 @@ Cada tarea es un commit atómico: primero el test que falla, después el código
 
 ## Verify
 
-- [ ] `cargo test --workspace` en Linux, contra la base: sin fallas nuevas, con el conteo justificado (`verify.md`).
+- [x] `cargo test --workspace` en Linux, contra la base: sin fallas nuevas, con el conteo justificado (`verify.md`).
 - [ ] `cargo test --workspace --target-dir <otro-dir>` en Windows (máquina de Marcos).
 - [ ] `rag-eval --real --docs` con los umbrales de la propuesta: Hit@3 ≥ 0,70 y MRR ≥ 0,50 (máquina de Marcos: necesita el modelo real).
 - [ ] `rag-eval --real --audit`, `--sweep-cos-floor` y el sweep de contradicciones sobre el golden set de memorias, para fijar los umbrales de R15 (máquina de Marcos).
