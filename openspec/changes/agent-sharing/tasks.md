@@ -58,6 +58,12 @@ Las tareas 1 a 8 se hicieron con la primera versión de la propuesta (nada compa
 - [x] `README.md` ("Compartir memorias entre agentes" y la introducción de la identidad del agente) y `.claude/CLAUDE.md`.
 - Commit: `docs: describe sharing by default and how to hide an agent`
 
+## 11. Revisión
+
+- [x] `--profile` antes de `hide`/`unhide` se ignoraba y la exclusión iba al perfil por defecto: `sharing_profile` y su test.
+- [x] README: un agente renombrado sigue encontrando lo viejo en la búsqueda, pero ya no es suyo.
+- Commits: `fix(cli): honour a --profile given before the sharing action`, `docs: say a renamed agent still finds its old memories but no longer owns them`
+
 ## Verify
 
 - [x] `cargo test --workspace` en Linux en cada commit, contra la base (1.674 pasan, 10 fallas de entorno). Ver [`verify.md`](verify.md).
