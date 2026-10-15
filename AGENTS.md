@@ -55,6 +55,13 @@ MCP tools (`crates/clawg-cli/src/mcp/server.rs`): `save_memory`, `search_memory`
 - Do not run release builds, installs, or touch the real data profiles (`~/.clawg*`) without explicit authorization.
 - Do not kill running `clawg.exe` processes; they may be the editor's own MCP.
 
+## Versioning
+
+- The version lives only in `[workspace.package] version` of the root `Cargo.toml`; every crate inherits it with `version.workspace = true`. Never set a version in a crate's own `Cargo.toml`.
+- Bump it when work closes: an archived openspec change raises the minor (`0.4.0` → `0.5.0`), a fix outside openspec raises the patch (`0.4.0` → `0.4.1`).
+- After the edit, run `cargo update --workspace`: it writes the new version into `Cargo.lock` without touching any dependency and without building. Commit both files together as `chore: bump version to X.Y.Z`; otherwise the lock trails one version behind and leaks into the next commit.
+- The version is not cosmetic: `clawg --version`, `GET /health`, the MCP `serverInfo` and `clawg doctor` report it, and `version_warning` (`crates/clawg-cli/src/memories.rs`) compares the running daemon's version with the CLI's to detect a stale daemon.
+
 ## Testing
 
 ```

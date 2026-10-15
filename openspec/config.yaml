@@ -50,3 +50,5 @@ rules:
     - Never kill running clawg.exe processes. Stage by explicit path. No AI attribution in commits.
   verify:
     - Report the test count against the baseline and every rag-eval metric the change touches.
+  archive:
+    - "After archiving, raise the minor of [workspace.package] version in the root Cargo.toml (the crates inherit it; never edit a crate's version), run cargo update --workspace to carry it into Cargo.lock, and commit both files as `chore: bump version to X.Y.Z`."

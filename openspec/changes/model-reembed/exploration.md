@@ -15,7 +15,7 @@ Esta es la parte D de [data-preservation](../archive/2026-10-12-data-preservatio
 | «Los saves siguen respondiendo `queued`, quedan retenidos y se descartan al parar» (riesgo 2) | **Falso.** Con el embedder `failed` el save responde `503 embedder_failed` sin encolar (`crates/clawg-cli/src/daemon/api.rs:702-707`). Un contrato distinto es un `failed` no reintentable (`crates/clawg-core/src/memory/bootstrap.rs:48-52`). El MCP dice `not saved` (`crates/clawg-cli/src/mcp/server.rs:391-402`). Spec: `specs/ingest`, «Embedder fallido». |
 | «No hay snapshot, ni backup, ni restore» (riesgo 3) | **Falso.** Existen `clawg backup`, `clawg restore`, el snapshot previo a migrar y la retención (`specs/storage`). |
 | El mensaje del contrato promete «search will work in a minute» (riesgo 6) | **Corregido.** `embedder_failed` tiene su propio texto (`server.rs:391-402`). Pero sigue sin decir **cómo** se arregla: no hay ningún comando que nombrar. |
-| «`reembed_all` (`maintenance.rs:442`) no tiene llamador» | **Sigue siendo cierto.** Ahora está en `crates/clawg-core/src/memory/maintenance.rs:467`. Sólo lo llaman sus tests (`:1577-1764`). |
+| «`reembed_all` (`maintenance.rs:442`) no tiene llamador» | **Ya no es cierto.** Está en `crates/clawg-core/src/memory/maintenance.rs:467` y lo llama `verify_or_reembed` en el arranque (`crates/clawg-core/src/memory/bootstrap.rs:296`), pero sólo para el caso de un cambio de pooling (ver «Qué repara hoy el arranque»). Para cualquier otro cambio de contrato, incluido un prefijo, sigue sin llamador. Sus tests están en `:1577-1764`. |
 | «V2 fija `float[384]`» | **Sigue siendo cierto** (`crates/clawg-core/migrations/V2__vectors.sql:7,10,13`). |
 | Prefijos e5 en `embedder.rs:109` | **Sigue siendo cierto.** `E5_PASSAGE_PREFIX = "query: "` (`crates/clawg-core/src/memory/embedder.rs:109`), igual que el de query (`:89`). |
 | «`reembed_all` era un comando de Tauri y se borró en `5678ded`» | No lo reverifiqué. No cambia nada de lo que sigue. |
@@ -35,7 +35,13 @@ Un punto que ese texto no cubría: la memoria apagada no es «vacía» para todo
   - MCP: `search_memory` y `save_memory` fallan con «could not load its embedding model (…); search and saving are unavailable until the cause is fixed».
   - **Nada dice qué hacer.** No hay `clawg reembed`, ni una vuelta atrás documentada. La salida real es restaurar un snapshot y volver al binario anterior.
 
-### `reembed_all` existe, está probado y no tiene dueño
+### Qué repara hoy el arranque
+
+- Al arrancar, `verify_or_reembed` compara el contrato y repara automáticamente **un solo** mismatch: el cambio de pooling, es decir el mismo modelo con vectores hechos por CLS y ahora por promedio, con misma dimensión y mismos prefijos (`is_pooling_upgrade`, `bootstrap.rs:255-261`; `verify_or_reembed`, `bootstrap.rs:269-307`). Antes toma un snapshot `pre-reembed` (`bootstrap.rs:287-294`), re-embebe con `reembed_all` y sólo entonces deja el contrato en `Match`; si no termina, devuelve el mismatch y el próximo arranque reintenta (`bootstrap.rs:296-306`).
+- **Cualquier otro mismatch** (otro modelo, otra dimensión, **un cambio de prefijo**) se devuelve tal cual (`bootstrap.rs:282`) y apaga la memoria como describe el resto de esta exploración.
+- Consecuencia: la parte «re-embeber en el arranque» ya existe para un caso. Si english-recall (21) confirma que un prefijo `passage: ` para los textos guardados rinde mejor con vectores promediados (hoy `E5_PASSAGE_PREFIX` es `"query: "`, `embedder.rs:110`), hay dos caminos: generalizar esa reparación de arranque a «mismo modelo y misma dimensión, distinto prefijo» (con el mismo snapshot previo), o la opción B de este cambio (`clawg reembed`). Eso es lo que subiría la urgencia de este cambio (ver «Urgencia»).
+
+### `reembed_all` existe, está probado y tiene un solo dueño
 
 - Dos modos: `Normalize` (renormaliza los vectores guardados, sin embedder) y `ReInfer(ReInferPlan)` (re-infiere con el embedder). Sólo `ReInfer` escribe el contrato (`maintenance.rs:467-497`).
 - **Qué filas recorre:** las tres tablas, y sólo las que tienen fila en la vec0 (`JOIN … ON v.rowid = p.id`) **y** `deleted_at IS NULL` (`select_reembed_batch`, `maintenance.rs:604`).
@@ -87,8 +93,8 @@ Un punto que ese texto no cubría: la memoria apagada no es «vacía» para todo
 
 ### Lo que se puede reusar para el snapshot previo
 
-- `snapshot_into(conn, dir, reason)` y `Reason` (`backup.rs:119`). Habría que agregar `PreReembed`: el nombre del archivo lo lleva, `Reason::ALL` y `is_automatic` lo cubren, y los tests de nombres (`snapshot_names_parse_back_to_their_reason`) se amplían.
-- La retención automática conserva las últimas 5 (`AUTO_KEEP`, `to_prune`, `backup.rs:231`). **Cuidado:** varios reintentos de un re-embed podrían sacar de la ventana al snapshot sano. Va a decisiones abiertas.
+- `snapshot_into(conn, dir, reason)` y `Reason` (`backup.rs:119`). `PreReembed` **ya existe** (`backup.rs:119-139`): el nombre del archivo lo lleva, `Reason::ALL` y `is_automatic` lo cubren, y el arranque ya lo usa para la reparación del pooling (`bootstrap.rs:290`). Un `clawg reembed` lo reutilizaría; lo que faltaría es, a lo sumo, ampliar los tests de nombres (`snapshot_names_parse_back_to_their_reason`) si cambia algo.
+- La retención automática conserva las últimas 5 (`AUTO_KEEP`, `to_prune`, `backup.rs:227-243`), y `pre-reembed` comparte ese presupuesto con `pre-migration` y `pre-restore` (`is_automatic` es «todo menos `Manual`», `backup.rs:143-145`): un re-embed con varios reintentos puede sacar de la ventana un `pre-migration` sano, además del propio `pre-reembed`. **Cuidado:** varios reintentos de un re-embed podrían sacar de la ventana al snapshot sano. Va a decisiones abiertas.
 - `StoreLock::acquire(…, StoreHolder::Maintenance)` y `open_existing` (`backup.rs:493`). El patrón de `purge` (`crates/clawg-core/src/memory/secrets.rs:81`) es el modelo: lock, abrir sin migrar, verificar `schema_plan` y operar.
 
 ## Enfoques posibles
@@ -134,7 +140,7 @@ Si el usuario elige B, además:
 **No-alcance:**
 - Elegir o integrar un modelo nuevo (manifiesto de descarga, clase de embedder, ventana de tokens).
 - Cambio de dimensión (C), salvo que se decida explícitamente.
-- Re-embeber automáticamente al arrancar. El propio `reembed_all` lo descarta por diseño (doc de `reembed_all`, `maintenance.rs`): una migración de CPU que nadie pidió es peor que una parada ruidosa.
+- Generalizar el re-embed automático de arranque más allá del cambio de pooling (hoy el único que repara, `bootstrap.rs:255-261`), salvo que english-recall (21) pida un cambio de prefijo y se decida por esa vía en lugar de B. Para el resto, no re-embeber automáticamente al arrancar. El propio `reembed_all` lo descarta por diseño (doc de `reembed_all`, `maintenance.rs`): una migración de CPU que nadie pidió es peor que una parada ruidosa.
 - Reconstruir vectores de filas borradas. Su texto queda pero sin vector; eso es la parte E (borrado recuperable).
 - Cambiar el ranking. Si algo toca modelo o prefijos, se valida con `rag-eval --diff` (ver abajo).
 
@@ -144,7 +150,7 @@ Si el usuario elige B, además:
 - **El riesgo ya no es de pérdida.** Con los snapshots y los 503 limpios, un cambio de modelo hoy es una **parada**, no una pérdida: los datos quedan, el usuario ve que falló y puede volver con `clawg restore` y el binario anterior.
 - **Qué sí es barato y vale ahora:** A. Fija el contrato de producción, que hoy no está fijado (modelo y dimensión), y cuesta poco.
 - **Qué conviene esperar:** B y C. Escribir `clawg reembed` sin un modelo real para probarlo es construir a ciegas. C además toca una migración sobre las tres vec0 sin saber la dimensión de destino.
-- **Qué cambiaría el juicio:** que el usuario quiera probar un modelo distinto, o un prefijo `passage: `, sobre su base real. Ahí B pasa a ser el camino, porque `rag-eval` mide sobre una base aparte y no sobre la del usuario.
+- **Qué cambiaría el juicio:** que el usuario quiera probar un modelo distinto, o un prefijo `passage: `, sobre su base real. En particular, si english-recall (21) confirma que `passage: ` para los textos guardados es mejor con vectores promediados, hace falta una forma de rehacer todos los vectores con otro prefijo: generalizar la reparación de arranque (`bootstrap.rs:255-261`, hoy sólo para pooling) o la opción B. Eso sube la urgencia de este cambio de «esperar» a «necesario antes de aplicar 21». Ahí B pasa a ser el camino, porque `rag-eval` mide sobre una base aparte y no sobre la del usuario.
 
 ## Decisiones abiertas
 
