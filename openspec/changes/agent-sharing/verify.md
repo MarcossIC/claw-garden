@@ -25,13 +25,17 @@
 | `docs: describe sharing by default and how to hide an agent` (8de8dc6) | 1.722 | 10 |
 | `fix(cli): honour a --profile given before the sharing action` (9556225) | 1.723 | 10 |
 | `docs: say a renamed agent still finds its old memories but no longer owns them` (3852e14) | 1.723 | 10 |
+| `merge: bring main into agent-sharing` (103b781, trae long-save-context) | 1.770 | 10 |
+| `merge: bring project-indexing from main into agent-sharing` (c9a8d12) | 1.847 | 10 |
+| `feat: let read_memory read a memory another agent shares` (aad1d0b) | 1.850 | 10 |
+| `docs: say read_memory reads shared memories too` (da6c474) | 1.850 | 10 |
 
 Todos los commits compilan, y las 10 fallas son las mismas en todos y vienen del entorno, como en los cambios anteriores:
 
 - 7 de `doctor::tests`: modelan un PATH de Windows con `clawg.exe`.
 - 3 de `diff::tests` en `rag-eval`: leen `docs/eval/results/`, que está en `.gitignore` y no existe en un clon limpio.
 
-**Conteo:** 49 tests nuevos sobre la base. En el commit de "todo compartido" se reescribieron los tests de la política, de la búsqueda, del daemon, del puente y de la CLI para la semántica final, y salió `the_eligible_count_still_rides_the_agent_index`: con el predicado de exclusiones el conteo recorre el índice parcial en lugar de buscar por agente, y eso es lo esperado (design D3).
+**Conteo:** 52 tests nuevos de este cambio (49 antes de traer `main` y 3 de `read_memory`); el resto de la diferencia entre la base y 1.850 son los tests que trajeron long-save-context y project-indexing con los merges. En el commit de "todo compartido" se reescribieron los tests de la política, de la búsqueda, del daemon, del puente y de la CLI para la semántica final, y salió `the_eligible_count_still_rides_the_agent_index`: con el predicado de exclusiones el conteo recorre el índice parcial en lugar de buscar por agente, y eso es lo esperado (design D3).
 
 El único warning es el de `insert_row_with_embedding`, el mismo de `main`.
 
@@ -55,7 +59,7 @@ No corrido en Linux: necesita el modelo real. Se espera diff vacío en el ancla 
 
 ## Pendiente (máquina de Marcos)
 
-1. `cargo test --workspace --no-fail-fast --target-dir target-test` en Windows. Lo esperado: 1.675 + 49 = **1.724 pasan, 0 fallan**.
+1. `cargo test --workspace --no-fail-fast --target-dir target-test` en Windows. Lo esperado: la cuenta de `main` en Windows más 52, y 0 fallan.
 2. `rag-eval --real` con el binario de `main` y con el de esta rama (ancla y `--agent-view`), y `rag-eval --diff` entre los dos. Lo esperado: 0 mejoran, 0 empeoran y el bloque `agent_view` igual campo por campo.
 3. Perfil dev, con autorización y un `clawg backup --profile dev` antes, en un proyecto aparte. El backup no incluye `sharing.json`: si ya existe en `~/.clawg-dev`, copialo aparte y sacalo para la prueba.
    - `clawg mcp --profile dev --agent a` guarda una memoria rotulada como fixture.

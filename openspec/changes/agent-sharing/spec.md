@@ -156,6 +156,13 @@ En `search_memory`:
 
 **Test:** `rows_of_the_previous_version_are_shared_untouched` en `server.rs`: siembra con SQL directo filas de `memory` de dos agentes (`scope = 'agent'`, como las escribe el insert) y su vector. Sin `sharing.json`, B las encuentra con el autor A. Con "B no lee a A", deja de encontrarlas. Al quitar la exclusión, las vuelve a encontrar. Al final, cada fila conserva su `scope`, `agent_id`, `project_id`, `status` y contenido.
 
+## R10. `read_memory` lee lo compartido
+
+- `read_memory` (y `GET /v1/memories/{kind}/{id}/save?agent=L`) MUST leer con el alcance de L, como la búsqueda: lo propio y lo de los autores que la política le deja leer. Una fila fuera de alcance MUST seguir siendo "no existe".
+- Una lectura de lo ajeno MUST llevar `by <autor>` en la primera línea y terminar con la nota de R4. La respuesta HTTP MUST llevar el autor en `agent_id`; un daemon viejo no lo manda y la lectura se trata como propia.
+
+**Test:** `another_agents_save_is_read_within_the_reach` en `crates/clawg-core/src/memory/pieces.rs`; `a_reach_allows_every_author_but_the_hidden` en `memory/sharing.rs`; `format_save_names_the_author_of_a_shared_save` en `tools.rs`; `another_agents_save_is_read_as_shared_unless_hidden` en `server.rs`; `get_save_of_another_agent_follows_the_sharing_policy` en `crates/clawg-cli/tests/api.rs`.
+
 ## R9. `enum Scope` se borra
 
 `enum Scope` (`record.rs`) y su reexport MUST desaparecer. La columna `scope` y su CHECK quedan como están; el insert sigue escribiendo `'agent'`.
