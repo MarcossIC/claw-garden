@@ -147,6 +147,10 @@ pub struct Hit {
     pub memory_type: String,
     pub tier: i64,
     pub score: f64,
+    /// Who saved it. A daemon older than sharing does not send it, and every
+    /// hit it returns is the caller's own.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// One inventory row from `GET /v1/memories`.
@@ -1618,5 +1622,14 @@ pub(crate) mod tests {
         assert_eq!(row.created_at, None);
         assert_eq!(row.update_count, None);
         assert_eq!(row.agent_id, None);
+    }
+
+    #[test]
+    fn a_hit_from_an_old_daemon_reads_as_own() {
+        let old = serde_json::json!({
+            "id": 3, "kind": "Memory", "content": "x", "memory_type": "semantic_fact", "tier": 3, "score": 0.5
+        });
+        let hit: Hit = serde_json::from_value(old).expect("old shape still parses");
+        assert_eq!(hit.agent_id, None);
     }
 }

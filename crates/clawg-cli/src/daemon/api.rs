@@ -41,6 +41,7 @@ use clawg_core::memory::events::{MemoryEvent, MemorySource};
 use clawg_core::memory::clock::TimestampMs;
 use clawg_core::memory::project::{register_project, RegisterError};
 use clawg_core::memory::prompt_builder::{build_memory_prompt, QueryTexts};
+use clawg_core::memory::sharing;
 use clawg_core::memory::synthesis::{
     existing_memory_ids, synthesis_core, unreviewed_count, Synthesis, SynthesisParams,
 };
@@ -771,7 +772,9 @@ async fn search(
         .await
         .map_err(ApiError::internal)?;
 
-    let scope = SearchScope::all_default().with_project(body.project_id.as_deref());
+    let scope = SearchScope::all_default()
+        .with_project(body.project_id.as_deref())
+        .with_shared(shared_from(&app, &body.agent_id));
     let mut hits = search_all_memories(
         &app.runtime.store,
         &embedding,
@@ -794,6 +797,20 @@ async fn search(
     app.runtime.access_tracker.record_hits(&hits);
 
     Ok(Json(SearchBody { hits }))
+}
+
+/// The agents `reader` was granted, read from the data directory on every
+/// call so a grant or a revoke counts from the next request on. A policy that
+/// cannot be read shares nothing: the agent keeps its own memories and the
+/// user finds the reason here and in `memory_status`.
+fn shared_from(app: &AppCtx, reader: &str) -> Vec<String> {
+    match sharing::load(&app.runtime.base_dir) {
+        Ok(policy) => policy.authors_for(reader),
+        Err(e) => {
+            log::warn!("{e}; nothing is shared");
+            Vec::new()
+        }
+    }
 }
 
 /// Builds the 4-block memory prefix for a query.
@@ -825,7 +842,7 @@ async fn context(
         app.runtime.embedder.get().cloned(),
         &body.agent_id,
         project_id,
-        &[],
+        &shared_from(&app, &body.agent_id),
         QueryTexts { lexical: &body.query, embedded: &body.query },
         &emitted,
         Some(app.runtime.access_tracker.as_ref()),

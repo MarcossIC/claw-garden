@@ -285,6 +285,7 @@ mod tests {
             memory_type: memory_type.into(),
             tier,
             score,
+            agent_id: None,
         }
     }
 
