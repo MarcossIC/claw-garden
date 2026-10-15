@@ -106,15 +106,40 @@ pub fn render_table(rows: &[MemoryRow], now_ms: i64, limit: u32, offset: u32) ->
     if rows.is_empty() {
         return "no memories match".to_string();
     }
+    render_rows(rows, now_ms, limit, offset, Listing::Live)
+}
 
+/// The listing of deleted rows: the age column says how long ago each was
+/// deleted, and the footer how to bring one back.
+pub fn render_deleted_table(rows: &[MemoryRow], now_ms: i64, limit: u32, offset: u32) -> String {
+    if rows.is_empty() {
+        return "no deleted memories match".to_string();
+    }
+    render_rows(rows, now_ms, limit, offset, Listing::Deleted)
+}
+
+#[derive(Clone, Copy)]
+enum Listing {
+    Live,
+    Deleted,
+}
+
+fn render_rows(rows: &[MemoryRow], now_ms: i64, limit: u32, offset: u32, listing: Listing) -> String {
+    let mut header = COLUMNS.map(str::to_owned);
+    if let Listing::Deleted = listing {
+        header[2] = "DELETED".to_owned();
+    }
     let mut cells: Vec<[String; 10]> = Vec::with_capacity(rows.len() + 1);
-    cells.push(COLUMNS.map(str::to_owned));
+    cells.push(header);
     for r in rows {
+        let moment = match listing {
+            Listing::Live => r.created_at,
+            Listing::Deleted => r.deleted_at,
+        };
         cells.push([
             r.kind.clone(),
             r.id.to_string(),
-            r.created_at
-                .map_or_else(|| "-".to_string(), |t| format_age(now_ms, t)),
+            moment.map_or_else(|| "-".to_string(), |t| format_age(now_ms, t)),
             r.tier.to_string(),
             format!("{:.1}", r.importance),
             or_dash(&r.memory_type),
@@ -154,9 +179,16 @@ pub fn render_table(rows: &[MemoryRow], now_ms: i64, limit: u32, offset: u32) ->
     }
 
     let shown = rows.len() as u64;
-    let _ = write!(out, "{}, newest first.", plural(shown, "row", "rows"));
+    let order = match listing {
+        Listing::Live => "newest first",
+        Listing::Deleted => "most recently deleted first",
+    };
+    let _ = write!(out, "{}, {order}.", plural(shown, "row", "rows"));
     if shown >= u64::from(limit) {
         let _ = write!(out, " More: --offset {}", u64::from(offset) + shown);
+    }
+    if let Listing::Deleted = listing {
+        out.push_str(" Undo one with 'clawg undelete <ID>'.");
     }
     out
 }
@@ -326,6 +358,7 @@ pub fn list_args(opts: &ListOpts, project: Option<String>) -> ListArgs {
         kind: opts.kind.map(|k| k.as_str().to_owned()),
         limit: Some(opts.limit),
         offset: Some(opts.offset),
+        deleted: opts.deleted,
         ..filter_args(&opts.filters, project)
     }
 }
@@ -372,6 +405,8 @@ pub async fn run(
             let rows = client.list(args).await?;
             Ok(if opts.json {
                 rows_json(&rows)
+            } else if opts.deleted {
+                render_deleted_table(&rows, now_ms, opts.limit, opts.offset)
             } else {
                 render_table(&rows, now_ms, opts.limit, opts.offset)
             })
@@ -450,6 +485,22 @@ mod tests {
     }
 
     // ── table ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn list_deleted_shows_when_each_row_was_deleted() {
+        let recent = MemoryRow { deleted_at: Some(NOW - 120_000), ..row(7, "memory", "the deploy runs on fridays") };
+        let older = MemoryRow { deleted_at: Some(NOW - 3 * 86_400_000), ..row(3, "memory", "tabs in go") };
+
+        let out = render_deleted_table(&[recent, older], NOW, 20, 0);
+
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].starts_with("KIND") && lines[0].contains("DELETED"), "{out}");
+        assert!(!lines[0].contains(" AGE "), "{out}");
+        assert!(lines[1].contains(" 2m ") && lines[1].contains("fridays"), "{out}");
+        assert!(lines[2].contains(" 3d ") && lines[2].contains("tabs in go"), "{out}");
+        assert!(out.ends_with("2 rows, most recently deleted first. Undo one with 'clawg undelete <ID>'."), "{out}");
+        assert_eq!(render_deleted_table(&[], NOW, 20, 0), "no deleted memories match");
+    }
 
     #[test]
     fn table_one_line_per_row_plus_header() {
@@ -879,8 +930,15 @@ mod tests {
             limit: 20,
             offset: 0,
             json: false,
+            deleted: false,
             profile: ProfileArg { profile: None },
         }
+    }
+
+    #[test]
+    fn list_args_ask_for_deleted_rows_only_with_the_flag() {
+        assert!(!list_args(&list_opts(), None).deleted);
+        assert!(list_args(&ListOpts { deleted: true, ..list_opts() }, None).deleted);
     }
 
     #[test]
