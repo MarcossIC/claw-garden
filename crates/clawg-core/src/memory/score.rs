@@ -28,6 +28,8 @@ pub(crate) struct RawHit {
     /// The row holds every identifier the query names, and that identifier
     /// is rare enough to single it out (`search::identifier_matches`).
     pub lexical_match: bool,
+    /// Who saved the row: the reader, or an agent it was granted.
+    pub agent_id: Option<String>,
 }
 
 /// Tier-floor decay minimums — `MAX(tier_floor, exp_decay(...))` never lets a
@@ -329,6 +331,7 @@ mod tests {
             last_accessed_at,
             importance,
             lexical_match: false,
+            agent_id: None,
         }
     }
 

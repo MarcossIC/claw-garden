@@ -92,6 +92,8 @@ impl EvalScope {
             // retrieval before project scoping existed.
             project_id: None,
             lexical: self.lexical,
+            // One agent's corpus: nothing to share.
+            shared_from: Vec::new(),
         }
     }
 }

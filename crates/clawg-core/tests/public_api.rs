@@ -70,6 +70,7 @@ fn ranked_hit_serializes_to_json() {
         score: 0.75,
         distance: 0.25,
         created_at: TimestampMs::now(),
+        agent_id: None,
     };
     let json = serde_json::to_value(&hit).expect("RankedHit must be Serialize");
     assert_eq!(json["id"], 7);

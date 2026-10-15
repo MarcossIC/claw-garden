@@ -116,6 +116,9 @@ fn contradiction_search_scope(project_id: Option<&str>, pool: usize) -> SearchSc
         procedural: None,
         project_id: project_id.map(str::to_owned),
         lexical: None,
+        // A save disputes only the saver's own rows: a grant lets an agent
+        // read another's memories, never mark them disputed.
+        shared_from: Vec::new(),
     }
 }
 
@@ -422,6 +425,14 @@ mod tests {
             "the near-duplicate detector's distance band must never be fed lexically \
              promoted candidates — see the doc comment on contradiction_search_scope"
         );
+    }
+
+    /// The detector runs with no grants whatever the policy says: a save may
+    /// dispute the saver's own rows, never ones it was only allowed to read.
+    #[test]
+    fn contradiction_probe_ignores_granted_authors() {
+        let scope = contradiction_search_scope(Some("proj"), CANDIDATE_POOL);
+        assert!(scope.shared_from.is_empty(), "{:?}", scope.shared_from);
     }
 
     // ── Type gate: candidate side ───────────────────────────────────────────

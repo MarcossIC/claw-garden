@@ -406,6 +406,7 @@ mod tests {
             score,
             distance: 0.5,
             created_at: TimestampMs::from_unix_millis(0),
+            agent_id: None,
         }
     }
 
