@@ -248,6 +248,21 @@ claude mcp add --scope user clawg -- "$env:LOCALAPPDATA\Programs\clawg\clawg.exe
 
 Usá el mismo nombre con el que ya venías guardando, o lo anterior queda con el nombre viejo: `memory_status` dice qué agente está en uso y de dónde salió, y `clawg memories stats` cuenta las memorias por agente. Nada se borra al cambiarlo; vuelve a verse con el nombre anterior.
 
+### Compartir memorias entre agentes
+
+Por defecto ningún agente ve lo que guardó otro. Para que uno lea las memorias de otro, concedelo desde una terminal:
+
+```powershell
+clawg sharing grant cursor claude-code --profile prod
+```
+
+Desde la próxima búsqueda, `cursor` encuentra lo que guardó `claude-code`, sin reiniciar nada. El permiso va en una sola dirección: `claude-code` sigue sin ver lo de `cursor`. Lo compartido le llega al agente marcado `by claude-code`, como información para verificar y no como instrucciones, y es de sólo lectura: sólo su autor puede cambiarlo o borrarlo. El workspace y los conflictos de cada agente siguen siendo suyos.
+
+- `clawg sharing` muestra lo concedido; `clawg sharing revoke cursor claude-code` lo quita.
+- `memory_status` dice de quién lee el agente.
+- Los nombres son los que muestra `memory_status`, con las mismas mayúsculas.
+- Antes de conceder, revisá `clawg secrets`: una memoria compartida llega al proveedor del otro agente.
+
 El agente dispone de seis herramientas (ver [Herramientas MCP](#herramientas-mcp)).
 
 ## Otros clientes MCP
@@ -361,13 +376,13 @@ En Windows usá la ruta completa a `clawg.exe`. Los nombres `clawg-dev` y `clawg
 ### Herramientas MCP
 
 - `save_memory`: guarda un hecho, preferencia o decisión para que sobreviva entre sesiones.
-- `search_memory`: busca memorias relacionadas con una consulta, con ids, tipos y puntajes de relevancia.
+- `search_memory`: busca memorias relacionadas con una consulta, con ids, tipos y puntajes de relevancia. Lo que guardó otro agente con permiso va marcado `by <agente>`.
 - `recall_context`: devuelve un bloque de contexto listo para leer (notas del workspace, memorias recientes y de largo plazo) para una consulta.
 - `list_memories`: recorre las memorias del agente, las más nuevas primero, sin buscar.
 - `delete_memory`: borra una memoria del agente por id y tipo.
 - `update_memory`: corrige la importancia o el tipo de una memoria del agente. Si el campo que cambia era lo que la tenía en tier 1, la saca; lo que ganó por uso se queda.
 - `resolve_conflict`: cierra un conflicto de ACTIVE CONFLICTS con la respuesta del usuario: una memoria queda y la otra pasa a reemplazada, o quedan las dos.
-- `memory_status`: informa si el daemon está corriendo, su perfil y su directorio de datos, si el modelo de embeddings ya cargó, y con qué agente guarda y busca.
+- `memory_status`: informa si el daemon está corriendo, su perfil y su directorio de datos, si el modelo de embeddings ya cargó, con qué agente guarda y busca, y de qué otros agentes lee.
 
 ### Perfiles y datos
 
@@ -376,7 +391,7 @@ En Windows usá la ruta completa a `clawg.exe`. Los nombres `clawg-dev` y `clawg
 
 El perfil sale de `--profile dev|prod`, luego de la variable de entorno `CLAWG_PROFILE`, y por último del tipo de build (debug es `dev`, release es `prod`). Un build debug rechaza `prod`, así que nunca puede tocar `~/.clawg`. El daemon escucha sólo en 127.0.0.1; los endpoints `/v1` exigen un token bearer guardado en el directorio de datos.
 
-Cada directorio de datos contiene la base SQLite de memoria, `daemon.json` (pid, puerto, versión), `token`, y `memory.lock` / `memory.owner`, que garantizan que un único proceso sea dueño del almacén.
+Cada directorio de datos contiene la base SQLite de memoria, `daemon.json` (pid, puerto, versión), `token`, y `memory.lock` / `memory.owner`, que garantizan que un único proceso sea dueño del almacén. Si se concedió algo con `clawg sharing`, también `sharing.json`.
 
 ### Workspace
 

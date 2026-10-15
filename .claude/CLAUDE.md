@@ -25,6 +25,7 @@ Design documents live in `docs/`.
 - A debug build refuses `prod`, from both the flag and the env var. A debug binary must never open `~/.clawg`.
 - Opening a store that has pending migrations first writes a `pre-migration` snapshot to `<data>/backups`; a store from a newer clawg, or with a diverged migration, is refused untouched.
 - One process owns a profile's store at a time (exclusive lock on `memory.lock`; `memory.owner` records who holds it). The daemon also writes `daemon.json` and a bearer `token` in the data directory.
+- `sharing.json` in the data directory holds which agents may read which agents' memories (`crates/clawg-core/src/memory/sharing.rs`). Missing means nothing is shared; an invalid file shares nothing. The daemon reads it on every search and context call.
 
 ## Commands
 
@@ -36,10 +37,11 @@ Design documents live in `docs/`.
 - `clawg restore <FILE> [--profile P]`: replace `memory.db` with a snapshot. The daemon must be stopped; the replaced store is snapshotted first.
 - `clawg secrets [--profile P]`: list the `memory` rows, live or deleted, that hold a secret of a known format, by id and kind and never the secret. Read-only; works with the daemon running.
 - `clawg purge <ID> --yes [--profile P]`: remove one `memory` row for good (text, vector, index terms, free pages and WAL) and name the backups that still hold it. The daemon must be stopped; no snapshot is taken.
+- `clawg sharing [grant|revoke <READER> <AUTHOR>] [--profile P]`: show or change the sharing policy. A grant lets READER's searches reach AUTHOR's memories, marked `by <author>` and read-only; it works with the daemon running and never opens the store.
 - `clawg doctor [--profile P]`: print as JSON which `clawg.exe` files the PATH resolves to; exit 1 if the first is not the running binary or a second copy exists. Does not open the store.
 - `clawg path add|remove [--dir D]`: edit the user PATH (Windows).
 
-Daemon HTTP API: `GET /health` (open) and, behind the bearer token, `POST/GET /v1/memories`, `POST /v1/search`, `POST /v1/context`, `PATCH/DELETE /v1/memories/{kind}/{id}` (`PATCH` takes `importance`, `memory_type` or both; `?agent=` limits them to that agent's rows), `POST /v1/projects` (record a project root and move rows saved under its legacy ids), `POST /v1/backup`, `POST /v1/disputes/resolve` (optional `agent_id`, same scope), `POST /v1/synthesis` (memories no conclusion covers yet, and the conclusions already drawn; optional `agent_id`, same scope), `POST /v1/shutdown`.
+Daemon HTTP API: `GET /health` (open) and, behind the bearer token, `POST/GET /v1/memories`, `POST /v1/search`, `POST /v1/context` (both also reach the memories of agents the caller was granted in `sharing.json`; each search hit carries its `agent_id`), `PATCH/DELETE /v1/memories/{kind}/{id}` (`PATCH` takes `importance`, `memory_type` or both; `?agent=` limits them to that agent's rows), `POST /v1/projects` (record a project root and move rows saved under its legacy ids), `POST /v1/backup`, `POST /v1/disputes/resolve` (optional `agent_id`, same scope), `POST /v1/synthesis` (memories no conclusion covers yet, and the conclusions already drawn; optional `agent_id`, same scope), `POST /v1/shutdown`.
 
 Ingest masks secrets of known formats (`crates/clawg-core/src/memory/redact.rs`) before a save is chunked, hashed or embedded; a confirmed save lists the masked kinds in `redacted`.
 
