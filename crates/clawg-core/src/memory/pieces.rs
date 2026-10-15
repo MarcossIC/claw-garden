@@ -208,28 +208,35 @@ impl MemoryStore {
             return Ok(HashMap::new());
         }
         self.conn
-            .call(move |c| -> rusqlite::Result<HashMap<i64, SaveLink>> {
-                let placeholders = vec!["?"; memory_ids.len()].join(", ");
-                let sql = format!(
-                    "SELECT p.memory_id, p.save_id, p.piece, \
-                            (SELECT COUNT(*) FROM memory_piece q WHERE q.save_id = p.save_id) \
-                     FROM memory_piece p WHERE p.memory_id IN ({placeholders}) \
-                     ORDER BY p.memory_id, p.save_id, p.piece"
-                );
-                let mut stmt = c.prepare(&sql)?;
-                let rows = stmt.query_map(rusqlite::params_from_iter(memory_ids.iter()), |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-                })?;
-                let mut links = HashMap::new();
-                for row in rows {
-                    let (memory_id, save_id, piece, pieces) = row?;
-                    links.entry(memory_id).or_insert(SaveLink { save_id, position: PiecePosition { piece, pieces } });
-                }
-                Ok(links)
-            })
+            .call(move |c| read_links(c, &memory_ids))
             .await
             .map_err(backend("save_links"))
     }
+}
+
+/// [`MemoryStore::save_links`] on a connection already in hand, for a caller
+/// that is itself running on the database thread.
+pub(crate) fn read_links(c: &rusqlite::Connection, memory_ids: &[i64]) -> rusqlite::Result<HashMap<i64, SaveLink>> {
+    if memory_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = vec!["?"; memory_ids.len()].join(", ");
+    let sql = format!(
+        "SELECT p.memory_id, p.save_id, p.piece, \
+                (SELECT COUNT(*) FROM memory_piece q WHERE q.save_id = p.save_id) \
+         FROM memory_piece p WHERE p.memory_id IN ({placeholders}) \
+         ORDER BY p.memory_id, p.save_id, p.piece"
+    );
+    let mut stmt = c.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(memory_ids.iter()), |r| {
+        Ok((r.get::<_, i64>(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+    })?;
+    let mut links = HashMap::new();
+    for row in rows {
+        let (memory_id, save_id, piece, pieces) = row?;
+        links.entry(memory_id).or_insert(SaveLink { save_id, position: PiecePosition { piece, pieces } });
+    }
+    Ok(links)
 }
 
 /// The save, if any, that already links exactly these rows in this order.
@@ -391,6 +398,61 @@ mod tests {
 
     fn vector_bytes(v: &[f32]) -> Vec<u8> {
         v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    /// Stores `pieces` as one linked save, each with a vector turned slightly
+    /// from the first axis toward `axis`, the way the worker leaves them.
+    async fn store_save(store: &MemoryStore, pieces: &[String], head: &str, axis: usize) -> Vec<i64> {
+        let mut stored = Vec::new();
+        for (i, text) in pieces.iter().enumerate() {
+            let id = insert_row(store, "agent-a", text).await;
+            let angle = 0.01 * i as f32;
+            let mut v = vec![0.0_f32; 384];
+            v[0] = angle.cos();
+            v[axis] = angle.sin();
+            let bytes = vector_bytes(&v);
+            store
+                .conn
+                .call(move |c| {
+                    c.execute("INSERT INTO memory_vectors(rowid, embedding) VALUES (?1, ?2)", rusqlite::params![id, bytes])
+                })
+                .await
+                .unwrap();
+            stored.push(piece(id, if i == 0 { "" } else { head }));
+        }
+        let ids = stored.iter().map(|p| p.memory_id).collect();
+        store.link_pieces(stored).await.unwrap();
+        ids
+    }
+
+    #[tokio::test]
+    async fn a_save_split_at_the_old_cap_is_still_found_and_read() {
+        use crate::memory::search::{search_all_memories, SearchScope};
+
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let chunker = crate::memory::chunker::ChatChunker::with_fallback();
+        let old_text: String = (0..500).map(|i| format!("old{i} ")).collect();
+        // Cut the way the previous version cut a long save: 424 tokens with
+        // the 64 of a chunk.
+        let old_pieces: Vec<String> = chunker.chunk(&old_text, 424).into_iter().map(|c| c.text).collect();
+        let new_text: String = (0..300).map(|i| format!("new{i} ")).collect();
+        let new_split = chunker.split_save(&new_text);
+        let new_pieces: Vec<String> = new_split.pieces.into_iter().map(|c| c.text).collect();
+        assert!(old_pieces.len() >= 2 && new_pieces.len() > old_pieces.len(), "both fixtures are long saves");
+
+        let old_ids = store_save(&store, &old_pieces, &old_pieces[0][..192], 1).await;
+        let new_ids = store_save(&store, &new_pieces, &new_split.head.unwrap(), 2).await;
+
+        let mut query = vec![0.0_f32; 384];
+        query[0] = 1.0;
+        let hits = search_all_memories(&store, &query, None, "agent-a", SearchScope::all_default(), 10).await.unwrap();
+
+        let found: Vec<(i64, i64)> = hits.iter().map(|h| (h.id, h.piece.expect("a linked row").pieces)).collect();
+        assert_eq!(found, vec![(old_ids[0], old_pieces.len() as i64), (new_ids[0], new_pieces.len() as i64)]);
+        for (ids, text) in [(&old_ids, &old_text), (&new_ids, &new_text)] {
+            let save = read_save_core(&store, MemoryKind::Memory, ids[1], Some("agent-a")).await.unwrap().unwrap();
+            assert_eq!(&save.text, text, "the save reads back whole, its overlap once");
+        }
     }
 
     /// A store left by the previous version holds a long save as unrelated

@@ -49,7 +49,7 @@ A project's docs index (`crates/clawg-core/src/memory/project_docs/`) holds its 
 
 Ingest masks secrets of known formats (`crates/clawg-core/src/memory/redact.rs`) before a save is chunked, hashed or embedded; a confirmed save lists the masked kinds in `redacted`.
 
-A save longer than one piece is split at a smaller cap; every piece after the first is embedded behind the save's opening tokens, and `memory_piece` links the pieces (`crates/clawg-core/src/memory/pieces.rs`). Search keeps the best piece of each save and labels it `piece=K/N`.
+A save longer than one piece (480 tokens) is split into pieces of 96 tokens, neighbours sharing 24, so one sentence is not averaged away in a long vector; every piece after the first is embedded behind the save's opening tokens, and `memory_piece` links the pieces (`crates/clawg-core/src/memory/pieces.rs`). Saves split before at 424 tokens keep their pieces. Search fills its KNN pool with distinct saves, keeps the best piece of each and labels it `piece=K/N`.
 
 MCP tools (`crates/clawg-cli/src/mcp/server.rs`): `save_memory`, `search_memory`, `recall_context`, `search_project`, `list_memories`, `read_memory`, `update_memory`, `delete_memory`, `restore_memory`, `resolve_conflict`, `synthesize`, `memory_status`.
 

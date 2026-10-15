@@ -2235,13 +2235,13 @@ mod tests {
         let (b, _d) = bridge().await;
         let content = (0..600).map(|i| format!("w{i:05}")).collect::<Vec<_>>().join(" ");
         let ids = saved_pieces(&b, "agent-a", &content).await;
-        assert_eq!(ids.len(), 3, "the fixture is a save of three pieces");
+        assert_eq!(ids.len(), 15, "the fixture is a save of fifteen pieces");
 
         let r = b.read_memory_impl("agent-a", read_args(ids[1])).await.expect("call");
 
         assert!(!is_error(&r), "{}", text(&r));
         let listed = ids.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(", ");
-        assert_eq!(text(&r), format!("#{} is piece 2 of 3 of one save: {listed}\n{content}", ids[1]));
+        assert_eq!(text(&r), format!("#{} is piece 2 of 15 of one save: {listed}\n{content}", ids[1]));
     }
 
     #[tokio::test]

@@ -517,18 +517,18 @@ async fn a_save_reports_the_secrets_it_masked() {
 #[tokio::test]
 async fn a_multi_chunk_save_returns_one_id_per_chunk() {
     let h = Harness::start().await;
-    // Distinct words, long enough for three windows of the fallback chunker.
+    // Distinct words, long enough for fifteen pieces of the fallback chunker.
     let content = (0..600).map(|i| format!("w{i:05}")).collect::<Vec<_>>().join(" ");
     let (status, body) = h.post_json("/v1/memories", json!({ "content": content, "agent_id": "a" })).await;
 
     assert_eq!(status, 201, "{body}");
     let memories = body["memories"].as_array().expect("memories");
-    assert_eq!(memories.len(), 3, "{body}");
+    assert_eq!(memories.len(), 15, "{body}");
     assert!(memories.iter().all(|m| m["outcome"] == "inserted"));
     let mut ids: Vec<i64> = memories.iter().map(|m| m["id"].as_i64().unwrap()).collect();
     ids.sort_unstable();
     ids.dedup();
-    assert_eq!(ids.len(), 3, "each chunk has its own row: {body}");
+    assert_eq!(ids.len(), 15, "each chunk has its own row: {body}");
 }
 
 #[tokio::test]
@@ -543,7 +543,7 @@ async fn get_save_returns_the_whole_text() {
     assert_eq!(status, 200, "{save}");
     assert_eq!(save["id"], ids[1]);
     assert_eq!(save["piece"], 2);
-    assert_eq!(save["pieces"], 3);
+    assert_eq!(save["pieces"], 15);
     assert_eq!(save["ids"], json!(ids));
     assert_eq!(save["missing"], json!([]));
     assert_eq!(save["text"], content);
