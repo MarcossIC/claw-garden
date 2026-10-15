@@ -1,6 +1,6 @@
 # long-save-ranking — Especificación
 
-Cambia cómo se parte un save largo y cómo la búsqueda junta sus candidatos. Modifica R2 de [`specs/pieces`](../../specs/pieces/spec.md) (el tope de los pedazos) y agrega dos requisitos: el pozo de KNN cuenta saves, y el set `long` no depende del tope. Las definiciones (save, pedazo, cabecera, vínculo) son las de [`specs/pieces`](../../specs/pieces/spec.md#definiciones).
+Cambia cómo se parte un save largo y cómo la búsqueda junta sus candidatos. Modifica R2 de [`specs/pieces`](../../../specs/pieces/spec.md) (el tope de los pedazos) y agrega dos requisitos: el pozo de KNN cuenta saves, y el set `long` no depende del tope. Las definiciones (save, pedazo, cabecera, vínculo) son las de [`specs/pieces`](../../../specs/pieces/spec.md#definiciones).
 
 ## R1. Un save largo se parte en pedazos chicos
 
@@ -64,7 +64,7 @@ Contar saves y recortar MUST ser funciones puras sobre los hits y los vínculos.
 - WHEN se genera el set con el tope nuevo
 - THEN las 12 filas `long` son idénticas, byte a byte, a las que generaba el tope anterior
 
-**Test:** `long_rows_do_not_depend_on_the_piece_cap` (`synth/mod.rs`); los de R9 de [`specs/eval`](../../specs/eval/spec.md) siguen pasando.
+**Test:** `long_rows_do_not_depend_on_the_piece_cap` (`synth/mod.rs`); los de R9 de [`specs/eval`](../../../specs/eval/spec.md) siguen pasando.
 
 ## R5. Medición
 

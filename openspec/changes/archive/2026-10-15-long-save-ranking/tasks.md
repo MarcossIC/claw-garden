@@ -41,4 +41,10 @@ Si el test pasa sin código nuevo (lo esperado), el commit es sólo el test: fij
 
 - [x] `cargo test --workspace` en cada commit; conteo contra la base.
 - [x] `verify.md` con los pasos de Marcos: U0 a U3 sobre su set real, y la suite en Windows.
-- [ ] Correr esos pasos (máquina de Marcos).
+- [x] Correr esos pasos (máquina de Marcos): suite 1.900/0, U0 a U3 ✓ y perfil dev ✓.
+
+## 7. Archive
+
+- [x] `openspec/specs/pieces/spec.md`: R2 con el tope de 96/24 y los saves partidos con el tope anterior, R9 (el pozo cuenta saves), las líneas de R4 y la línea **Origen**.
+- [x] `openspec/specs/eval/spec.md`: las filas `long` contra su propio tope (R4 de acá) y la medición de U0 a U3.
+- [x] `git mv openspec/changes/long-save-ranking openspec/changes/archive/2026-10-15-long-save-ranking`; `state.yaml` archivado; fila 19 del `README.md` de openspec, que sale del orden de lo pendiente; base de tests de `.claude/CLAUDE.md` y de `openspec/config.yaml`.

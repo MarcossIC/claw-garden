@@ -1,7 +1,7 @@
 change: long-save-ranking
 objective: "1"
 depends_on: [long-save-context, eval-golden-expansion]
-phase: verify
+phase: archived
 artifacts:
   exploration: done
   proposal: done
@@ -9,6 +9,7 @@ artifacts:
   design: done
   tasks: done
   apply: done
-  verify: partial
-  archive: pending
+  verify: done  # Linux and Windows; U0-U3 met on the real seed-7 set, dev profile checked, see verify.md
+  archive: done
+main_spec: openspec/specs/pieces/spec.md
 updated: 2026-10-15

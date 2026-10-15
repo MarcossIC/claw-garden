@@ -2,7 +2,7 @@
 
 Fuente de verdad del comportamiento actual de un save que no entra en un pedazo: cómo se parte y se embebe (con la cabecera del save), cómo se vinculan sus pedazos en `memory_piece`, cómo aparece en la búsqueda (un hit por save, con `piece=K/N`), cómo se lee el save entero y qué pasa con las filas de la versión anterior. Los textos de un pedazo, el ranking de filas sueltas, el detector de contradicciones y el workspace no cambian: siguen en [`specs/retrieval`](../retrieval/spec.md), [`specs/disputes`](../disputes/spec.md) y [`specs/update`](../update/spec.md). La medición (subconjunto `long`, `answer`, métricas de agent-view) está en [`specs/eval`](../eval/spec.md). Qué agente puede leer qué save está en [`specs/visibility`](../visibility/spec.md) (R3 y R4).
 
-**Origen:** [long-save-context](../../changes/archive/2026-10-14-long-save-context/proposal.md), archivado el 2026-10-14. Los ids de requisito son los de esa spec, salvo R9, que pasó a [`specs/eval`](../eval/spec.md).
+**Origen:** [long-save-context](../../changes/archive/2026-10-14-long-save-context/proposal.md), archivado el 2026-10-14. Los ids de requisito son los de esa spec, salvo R9, que pasó a [`specs/eval`](../eval/spec.md). [long-save-ranking](../../changes/archive/2026-10-15-long-save-ranking/proposal.md), archivado el 2026-10-15, cambió el tope de R2 (de 424/64 a 96/24), sumó a R2 los saves partidos con el tope anterior y agregó R9 (el pozo de KNN cuenta saves); su R4 pasó a [`specs/eval`](../eval/spec.md).
 
 ## Definiciones
 
@@ -28,22 +28,32 @@ Un texto del save que el chunker deja en un pedazo con el tope de `CHUNK_MAX_TOK
 
 ## R2. Un save largo se parte con lugar para la cabecera
 
-Un texto del save que no entra en un pedazo de 480 tokens MUST partirse en pedazos de a lo sumo `PIECE_MAX_TOKENS` = 424 tokens (`chunker/mod.rs:37`), con solapamiento de `CHUNK_OVERLAP_TOKENS` = 64 (`chunker/mod.rs:21`). `PIECE_MAX_TOKENS = CHUNK_MAX_TOKENS - SAVE_HEAD_TOKENS - HEAD_JOIN_RESERVE` (48 y 8 tokens de reserva para el separador `"\n…\n"` y la suma de tokens en el borde). Dos `const _: () = assert!(...)` (`chunker/mod.rs:41-42`) comprueban en compilación que `SAVE_HEAD_TOKENS + HEAD_JOIN_RESERVE + PIECE_MAX_TOKENS <= CHUNK_MAX_TOKENS`, así el texto embebido nunca pasa el límite que el embedder trunca en silencio.
+Un texto del save que no entra en un pedazo de `CHUNK_MAX_TOKENS` = 480 tokens (`chunker/mod.rs:15`) MUST partirse en pedazos de a lo sumo `PIECE_MAX_TOKENS` = 96 tokens (`chunker/mod.rs:39`), con `PIECE_OVERLAP_TOKENS` = 24 de solapamiento entre vecinos (`chunker/mod.rs:44`; `ChatChunker::split_save`, `chunker/chat.rs:88`). Un pedazo chico deja la respuesta de un save largo como una parte grande de su vector, en lugar de una frase promediada entre muchas. `ChatChunker::chunk` (`chunker/chat.rs:76`), que usan los demás caminos, MUST seguir cortando con `CHUNK_OVERLAP_TOKENS` = 64 (`chunker/mod.rs:21`).
+
+Dos `const _: () = assert!(...)` (`chunker/mod.rs:48-49`) comprueban en compilación que `PIECE_OVERLAP_TOKENS < PIECE_MAX_TOKENS` y que `SAVE_HEAD_TOKENS + HEAD_JOIN_RESERVE + PIECE_MAX_TOKENS <= CHUNK_MAX_TOKENS` (48 y 8 tokens de reserva para el separador `"\n…\n"` y la suma de tokens en el borde), así el texto embebido nunca pasa el límite que el embedder trunca en silencio.
 
 Cada pedazo desde el segundo MUST embeberse con contexto (la cabecera). El primero se embebe sin él, porque ya empieza con la cabecera. La fila MUST guardar sólo el pedazo: el contenido, el hash de dedup y el FTS no llevan la cabecera.
 
-El armado del texto embebido es `embedding_text(context, piece)` (`chunker/mod.rs:48`), una función pura que usan el worker (`worker.rs:509`) y el re-embed (R7).
+El armado del texto embebido es `embedding_text(context, piece)` (`chunker/mod.rs:55`), una función pura que usan el worker (`worker.rs:509`) y el re-embed (R7).
 
-Un save de un pedazo de hasta 480 tokens no se parte con este tope: el tope de 424 sólo aplica si el de 480 no alcanza.
+Un save de un pedazo de hasta 480 tokens no se parte con este tope: el tope de 96 sólo aplica si el de 480 no alcanza. El save más corto que se parte (más de 480 tokens) da al menos 7 pedazos.
+
+**Saves partidos con el tope anterior.** Las filas, vínculos y vectores de un save partido antes con 424 tokens y 64 de solapamiento MUST seguir apareciendo como un hit por save con `piece=K/N` (R4 y R5), leyéndose enteros con `read_save_core` (R6) y re-embebiéndose con su contexto (R7). Ningún camino MUST volver a partir una fila guardada. `join_pieces` (`pieces.rs:58`) MUST unir sin repetir el solapamiento tanto pedazos de 424/64 como de 96/24.
 
 #### Escenario: el tema llega al vector del pedazo 2
 - GIVEN un save de 1.200 tokens que nombra `clawg-ledger` sólo en su primera oración
 - WHEN se guarda
-- THEN queda en 3 pedazos o más
-- AND el embedder recibe el pedazo 2 precedido de una cabecera que contiene `clawg-ledger`
+- THEN cada pedazo tiene a lo sumo 96 tokens y dos pedazos vecinos comparten 24
+- AND el embedder recibe el pedazo 2 precedido de una cabecera (los primeros 48 tokens del texto) que contiene `clawg-ledger`
 - AND la fila del pedazo 2 guarda el pedazo sin la cabecera
 
-**Test:** `a_long_text_is_split_below_the_cap_to_leave_room_for_the_head` y `the_head_is_the_first_tokens_of_the_text` (`chunker/chat.rs`); `a_piece_without_context_is_embedded_as_stored` y `a_piece_with_context_is_embedded_after_the_head` (`chunker/mod.rs`); `later_pieces_are_embedded_with_the_head_and_stored_without_it` (`worker.rs`).
+#### Escenario: un save del tope anterior
+- GIVEN un save de 3 pedazos de 424 tokens, guardado y vinculado como lo dejaba la versión anterior
+- AND un save de 12 pedazos de 96 tokens guardado con esta versión
+- WHEN se busca por el tema de cada uno y se lee cada uno con `read_save_core`
+- THEN cada save aparece en un solo hit y su texto se lee entero, sin solapamiento repetido
+
+**Test:** `a_long_text_is_split_into_small_pieces`, `small_pieces_share_their_own_overlap` y `the_head_is_the_first_tokens_of_the_text` (`chunker/chat.rs`); `a_piece_without_context_is_embedded_as_stored` y `a_piece_with_context_is_embedded_after_the_head` (`chunker/mod.rs`); `later_pieces_are_embedded_with_the_head_and_stored_without_it` (`worker.rs`); `a_save_split_at_the_old_cap_is_still_found_and_read` y `the_pieces_of_a_split_save_join_back_into_its_text` (`pieces.rs`).
 
 ## R3. El save deja su vínculo
 
@@ -75,11 +85,11 @@ Guardar otra vez exactamente las mismas filas, en el mismo orden, MUST devolver 
 
 ## R4. Un hit por save
 
-La búsqueda (`search_all_memories_inner`, `crates/clawg-core/src/memory/search.rs:1038`) MUST, después de ordenar y antes de cortar en `k`, quedarse con el primer hit de cada save y descartar los demás pedazos de ese save (`collapse_saves`, `search.rs:104`, llamado en `search.rs:1181`; el corte es `search.rs:1187`). Un hit de una fila sin vínculos, o de `episodic_trajectory` o `procedural_skill`, MUST quedar donde está.
+La búsqueda (`search_all_memories_inner`, `crates/clawg-core/src/memory/search.rs:1090`) MUST, después de ordenar y antes de cortar en `k`, quedarse con el primer hit de cada save y descartar los demás pedazos de ese save (`collapse_saves`, `search.rs:104`, llamado en `search.rs:1233`; el corte es `search.rs:1239`). Un hit de una fila sin vínculos, o de `episodic_trajectory` o `procedural_skill`, MUST quedar donde está.
 
 Cada hit de una fila con vínculos MUST llevar su posición y el total de pedazos del save (`RankedHit.piece: Option<PiecePosition>`, `search.rs:89-91`; `PiecePosition`, `search.rs:96`). El descarte corre antes del corte: los lugares que liberan los hermanos los ocupan otras memorias.
 
-El descarte es una función pura sobre los hits y los vínculos de sus filas. Si leer los vínculos falla, la búsqueda MUST devolver los hits sin colapsar y dejar un aviso en el log (`search.rs:1182-1185`): es lo de antes, no un error.
+El descarte es una función pura sobre los hits y los vínculos de sus filas. Si leer los vínculos falla, la búsqueda MUST devolver los hits sin colapsar y dejar un aviso en el log (`search.rs:1234-1237`): es lo de antes, no un error.
 
 #### Escenario: los hermanos no ocupan el top
 - GIVEN un save de 4 pedazos que puntúan 1.º, 2.º, 4.º y 5.º para una consulta, y 10 filas sueltas
@@ -153,6 +163,21 @@ Contra un daemon que no tiene la ruta, su 404 no trae el error JSON del daemon: 
 La migración `V11__memory_piece.sql` (`crates/clawg-core/migrations/`) crea `memory_piece` con `CREATE TABLE IF NOT EXISTS` y su índice por `memory_id`, y no escribe filas: MUST NOT escribir vínculos para filas existentes. Una base en V10 se abre con V11 después del snapshot `pre-migration` (la regla de [`specs/storage`](../storage/spec.md)). Sus filas, también las de un save largo guardado antes (pedazos sueltos, sin vínculo), MUST seguir alcanzables por búsqueda, listado, `read_memory` (como saves de un pedazo) y re-embed (sin contexto).
 
 **Test:** `rows_from_v10_survive_the_piece_table` (`pieces.rs`): siembra V10 con SQL directo, abre en V11 y comprueba que no hay vínculos, que las filas se buscan, se listan, se leen como saves de un pedazo y se re-embeben con su propio texto.
+
+## R9. El pozo de KNN cuenta saves
+
+La consulta KNN de `memory` (`knn_one`, `crates/clawg-core/src/memory/search.rs:423`) pide `k` vecinos (30 en `SearchScope::all_default`, `search.rs:37`). Cuando esa ventana vuelve llena y sus filas forman menos de `k` saves distintos (`distinct_saves`, `search.rs:132`, que cuenta una fila sin vínculo como su propio save), la consulta MUST repetirse una vez con la ventana ampliada (`retry_window`, `search.rs:358`), y el resultado MUST recortarse, en orden de puntaje, a las filas que alcanzan `k` saves distintos (`trim_to_saves`, `search.rs:139`, llamado en `search.rs:546`). Sin esto, un save con más pedazos cerca de la consulta que el tamaño del pozo lo llena de hermanos, y R4 los colapsa en un solo hit.
+
+Sigue habiendo a lo sumo una segunda pasada por búsqueda: la que pide un pozo vaciado por filas no elegibles y la que pide uno lleno de hermanos son la misma (`search.rs:503-521`). Los vínculos se leen en la misma conexión (`pieces::read_links`, `pieces.rs:219`). Si esa lectura falla, el pozo MUST contar filas, como antes, y dejar un aviso en el log (`search.rs:496-499`). Una tabla que no es `memory` no tiene vínculos y cuenta filas.
+
+`distinct_saves` y `trim_to_saves` son funciones puras sobre los hits y los vínculos.
+
+#### Escenario
+- GIVEN un save de 40 pedazos casi iguales a la consulta y 10 filas sueltas un poco más lejos
+- WHEN se busca con un pozo de 30 y `k = 10`
+- THEN el resultado tiene 10 hits: el mejor pedazo del save y las 9 mejores filas sueltas
+
+**Test:** `distinct_saves_counts_unlinked_rows_as_their_own`, `trim_to_saves_keeps_the_rows_up_to_k_saves` y `a_save_with_more_pieces_than_the_pool_leaves_room_for_other_memories` (`search.rs`).
 
 ## Tabla
 

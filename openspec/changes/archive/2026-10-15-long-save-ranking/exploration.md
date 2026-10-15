@@ -8,7 +8,7 @@
 
 ## De dónde sale
 
-U2 de long-save-context no se cumplió: la respuesta de un save `long` era alcanzable en 0,333 de los casos, contra un umbral de 0,75 ([verify](../archive/2026-10-14-long-save-context/verify.md#u2-u3-y-u4)). Cuando el save aparecía, lo hacía en el puesto 7 a 9; en 8 de 12 casos quedaba fuera de los 10.
+U2 de long-save-context no se cumplió: la respuesta de un save `long` era alcanzable en 0,333 de los casos, contra un umbral de 0,75 ([verify](../2026-10-14-long-save-context/verify.md#u2-u3-y-u4)). Cuando el save aparecía, lo hacía en el puesto 7 a 9; en 8 de 12 casos quedaba fuera de los 10.
 
 **Esa medición ya no describe `main`.** Se hizo con vectores de pooling CLS y `RELEVANCE_RATIO` 0,6. Después, project-indexing pasó el embedder a pooling mean, re-embebió toda la base, bajó el piso del coseno a 0,79 (`crates/clawg-core/src/memory/score.rs:161-182`) y el corte de relevancia a 0,35 (`crates/clawg-cli/src/relevance.rs:19`). U2 hay que volver a medirlo sobre `main` antes de dar por bueno cualquier número.
 
@@ -69,7 +69,7 @@ Sólo cambiando el tope y el solapamiento de los pedazos de un save largo (proto
 | 96 / 24 | 1.175 | 1,0 | 1,0 | 0,917 | 0,917 | 1,0 |
 
 - Con 96 o 128 tokens aparecen los 12 saves, y la respuesta se ve en `search_memory` sin pedir `read_memory` en 9 a 11 casos, porque el pedazo entero entra en los 500 caracteres.
-- Los otros subconjuntos no se mueven: sus filas entran en un pedazo de 480 y no se parten distinto (R1 de [`specs/pieces`](../../specs/pieces/spec.md)).
+- Los otros subconjuntos no se mueven: sus filas entran en un pedazo de 480 y no se parten distinto (R1 de [`specs/pieces`](../../../specs/pieces/spec.md)).
 - Tokens medios de `search_memory` y `recall_context`: iguales o un poco menores (358–364 y 4.042–4.093 contra 366 y 4.178).
 - El costo son filas: un save de unos 1.200 tokens pasa de 3 a unas 13 filas con 96/24.
 
