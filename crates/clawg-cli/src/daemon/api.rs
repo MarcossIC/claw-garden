@@ -825,6 +825,7 @@ async fn context(
         app.runtime.embedder.get().cloned(),
         &body.agent_id,
         project_id,
+        &[],
         QueryTexts { lexical: &body.query, embedded: &body.query },
         &emitted,
         Some(app.runtime.access_tracker.as_ref()),
