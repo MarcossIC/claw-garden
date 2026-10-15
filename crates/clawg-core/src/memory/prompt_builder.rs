@@ -1,7 +1,7 @@
 //! Assembles the 4-block memory prefix for the system prompt.
 
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::memory::{
@@ -329,9 +329,9 @@ fn rank_conflicts(
 
 /// The conflicts block under its separator: the note, then one group per
 /// disputed row with a line for each row it disputes, then how many pairs the
-/// cap left out. A side the prompt already prints as a hit is cited by id; any
-/// other side, a workspace row included, carries its text, since a workspace
-/// bullet has no id to point at.
+/// cap left out. A side the prompt already prints as a hit, or whose text the
+/// block already printed, is cited by id; any other side, a workspace row
+/// included, carries its text, since a workspace bullet has no id to point at.
 fn format_conflict_block(pairs: &[ConflictPair], hit_positions: &HashMap<i64, usize>, omitted: usize) -> String {
     let mut groups: Vec<(&ConflictPair, Vec<&ConflictPair>)> = Vec::new();
     for p in pairs {
@@ -340,8 +340,9 @@ fn format_conflict_block(pairs: &[ConflictPair], hit_positions: &HashMap<i64, us
             None => groups.push((p, vec![p])),
         }
     }
-    let side = |id: i64, created_at: TimestampMs, content: &str, label: &str| {
-        if hit_positions.contains_key(&id) {
+    let mut printed: HashSet<i64> = HashSet::new();
+    let mut side = |id: i64, created_at: TimestampMs, content: &str, label: &str| {
+        if hit_positions.contains_key(&id) || !printed.insert(id) {
             format!("#{id}")
         } else {
             let (y, m, d) = unix_millis_to_ymd(created_at);
@@ -678,6 +679,23 @@ mod tests {
         assert_eq!(block.matches("new fact 9").count(), 1, "{block}");
         let after_new: Vec<&str> = block.lines().skip_while(|l| !l.starts_with("NEW ")).skip(1).collect();
         assert_eq!(after_new, ["OLD [2023-07-22 #1] old fact 1", "OLD [2023-07-22 #2] old fact 2", "OLD [2023-07-22 #3] old fact 3"]);
+    }
+
+    /// In a chain of disputes the middle row is new in one pair and old in
+    /// another, and the oldest one is disputed twice.
+    #[test]
+    fn a_row_in_several_pairs_prints_its_text_once() {
+        let same_text = |p: ConflictPair| ConflictPair {
+            old_content: format!("fact {}", p.old_id),
+            new_content: format!("fact {}", p.new_id),
+            ..p
+        };
+        let block = format_conflict_block(&[same_text(pair(2, 3)), same_text(pair(1, 3)), same_text(pair(1, 2))], &HashMap::new(), 0);
+        let after_note: Vec<&str> = block.lines().skip_while(|l| !l.starts_with("NEW ")).collect();
+        assert_eq!(
+            after_note,
+            ["NEW [2023-11-14 #3 disputed] fact 3", "OLD [2023-07-22 #2] fact 2", "OLD [2023-07-22 #1] fact 1", "NEW #2", "OLD #1"]
+        );
     }
 
     #[test]
