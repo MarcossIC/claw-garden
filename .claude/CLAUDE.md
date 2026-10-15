@@ -23,7 +23,7 @@ Design documents live in `docs/`.
 
 - Selection order: `--profile dev|prod`, then `CLAWG_PROFILE`, then the build type (`dev` for debug, `prod` for release).
 - A debug build refuses `prod`, from both the flag and the env var. A debug binary must never open `~/.clawg`.
-- Opening a store that has pending migrations first writes a `pre-migration` snapshot to `<data>/backups`; a store from a newer clawg, or with a diverged migration, is refused untouched.
+- Opening a store that has pending migrations first writes a `pre-migration` snapshot to `<data>/backups`; a store whose vectors were pooled by CLS (embedding contract `multilingual-e5-small`) gets a `pre-reembed` snapshot and is re-embedded by mean before memory is enabled, with the embedder status `loading` meanwhile; a store from a newer clawg, or with a diverged migration, is refused untouched.
 - One process owns a profile's store at a time (exclusive lock on `memory.lock`; `memory.owner` records who holds it). The daemon also writes `daemon.json` and a bearer `token` in the data directory.
 
 ## Commands
@@ -39,9 +39,9 @@ Design documents live in `docs/`.
 - `clawg doctor [--profile P]`: print as JSON which `clawg.exe` files the PATH resolves to; exit 1 if the first is not the running binary or a second copy exists. Does not open the store.
 - `clawg path add|remove [--dir D]`: edit the user PATH (Windows).
 
-Daemon HTTP API: `GET /health` (open) and, behind the bearer token, `POST/GET /v1/memories`, `POST /v1/search`, `POST /v1/context`, `PATCH/DELETE /v1/memories/{kind}/{id}` (`?agent=` limits them to that agent's rows), `POST /v1/projects` (record a project root and move rows saved under its legacy ids; also indexes the root's docs in the background), `POST /v1/projects/docs/search` (a project's docs by meaning and by term; refreshes the index first when it is over a minute old), `POST /v1/backup`, `POST /v1/disputes/resolve` (optional `agent_id`, same scope), `POST /v1/synthesis` (memories no conclusion covers yet, and the conclusions already drawn; optional `agent_id`, same scope), `POST /v1/shutdown`.
+Daemon HTTP API: `GET /health` (open) and, behind the bearer token, `POST/GET /v1/memories`, `POST /v1/search`, `POST /v1/context`, `PATCH/DELETE /v1/memories/{kind}/{id}` (`?agent=` limits them to that agent's rows), `POST /v1/projects` (record a project root and move rows saved under its legacy ids; also indexes the root's docs in the background), `POST /v1/projects/docs/search` (a project's docs and code by meaning and by term; refreshes the index first when it is over a minute old), `POST /v1/backup`, `POST /v1/disputes/resolve` (optional `agent_id`, same scope), `POST /v1/synthesis` (memories no conclusion covers yet, and the conclusions already drawn; optional `agent_id`, same scope), `POST /v1/shutdown`.
 
-A project's docs index (`crates/clawg-core/src/memory/project_docs/`) holds its Markdown and manifests (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`) as passages split by heading, each under its breadcrumb (`path > heading > subheading`). It honours `.gitignore`, is derived from disk in its own tables and never touches `memory`; a file is re-read when its sha256 or the model changes.
+A project's docs index (`crates/clawg-core/src/memory/project_docs/`) holds its Markdown and manifests (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`) as passages split by heading, each under its breadcrumb (`path > heading > subheading`), and its Rust, Python and TypeScript code split along the syntax tree (tree-sitter), each piece under its path and the headers of the definitions that contain it (`path > impl Store`). It honours `.gitignore`, is derived from disk in its own tables and never touches `memory`; a file is re-read when its sha256 or the model changes.
 
 Ingest masks secrets of known formats (`crates/clawg-core/src/memory/redact.rs`) before a save is chunked, hashed or embedded; a confirmed save lists the masked kinds in `redacted`.
 

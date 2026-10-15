@@ -309,6 +309,9 @@ El visor no lo arranca solo. Corré `clawg serve --profile prod` en otra termina
 **Después de `clawg stop` o de actualizar, el agente no encuentra el servidor.**
 El puente no se reconecta solo. En Claude Code, escribí `/mcp` y reconectalo.
 
+**Después de actualizar, `memory_status` dice `loading` un rato.**
+Las versiones anteriores calculaban los vectores de las memorias de una forma que las dejaba casi todas igual de parecidas a cualquier pregunta. La primera vez que arranca esta versión guarda una copia en `~/.clawg/backups` (`…-pre-reembed.db`) y vuelve a calcular el vector de cada memoria; hasta que termina, la búsqueda por sentido no está disponible.
+
 **`clawg doctor` termina con código 1.**
 Hay otro `clawg.exe` en el PATH que gana, o una copia duplicada. El JSON que imprime dice cuál.
 
@@ -363,7 +366,7 @@ En Windows usá la ruta completa a `clawg.exe`. Los nombres `clawg-dev` y `clawg
 - `save_memory`: guarda un hecho, preferencia o decisión para que sobreviva entre sesiones.
 - `search_memory`: busca memorias relacionadas con una consulta, con ids, tipos y puntajes de relevancia.
 - `recall_context`: devuelve un bloque de contexto listo para leer (notas del workspace, memorias recientes y de largo plazo) para una consulta.
-- `search_project`: busca en la documentación del proyecto (los Markdown y los manifiestos como `Cargo.toml` o `package.json`, respetando `.gitignore`) y devuelve cada sección con su ruta de encabezados. Sirve para preguntas sobre cómo funciona el proyecto. El índice se arma solo la primera vez que el agente abre el proyecto y se pone al día cuando cambian los archivos.
+- `search_project`: busca en la documentación del proyecto (los Markdown y los manifiestos como `Cargo.toml` o `package.json`, respetando `.gitignore`) y en su código Rust, Python y TypeScript, partido por definición, y devuelve cada pasaje con su ruta de encabezados o de definiciones. Sirve para preguntas sobre cómo funciona el proyecto. El índice se arma solo la primera vez que el agente abre el proyecto y se pone al día cuando cambian los archivos.
 - `list_memories`: recorre las memorias del agente, las más nuevas primero, sin buscar.
 - `delete_memory`: borra una memoria del agente por id y tipo.
 - `resolve_conflict`: cierra un conflicto de ACTIVE CONFLICTS con la respuesta del usuario: una memoria queda y la otra pasa a reemplazada, o quedan las dos.
