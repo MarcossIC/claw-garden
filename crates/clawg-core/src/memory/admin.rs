@@ -3185,17 +3185,26 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         let content = "a row deleted before deletes pruned vectors";
         let id = save(&store, "a", content).await;
-        // Marked by hand, as the delete of an older version did: the vector stays.
+        // Marked by hand, as the delete of an older version did: the vector
+        // stays, and it is one an earlier model wrote.
+        let earlier_model: Vec<u8> = crate::memory::vector::to_unit(&[0.3; 384])
+            .unwrap()
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
         store
             .conn
-            .call(move |c| c.execute("UPDATE memory SET deleted_at = 1 WHERE id = ?1", [id]))
+            .call(move |c| {
+                c.execute("UPDATE memory_vectors SET embedding = ?2 WHERE rowid = ?1", rusqlite::params![id, earlier_model])?;
+                c.execute("UPDATE memory SET deleted_at = 1 WHERE id = ?1", [id])
+            })
             .await
             .unwrap();
 
         restore(&store, id, None).await.unwrap();
 
         let expected = crate::memory::vector::to_unit(&passage(content).await).unwrap();
-        assert_eq!(stored_vector(&store, id).await, Some(expected));
+        assert_eq!(stored_vector(&store, id).await, Some(expected), "embedded by the current model, never kept");
     }
 
     #[tokio::test]
