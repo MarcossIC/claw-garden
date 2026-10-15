@@ -305,6 +305,22 @@ pub struct Updated {
     pub tier: i64,
 }
 
+/// The save a row belongs to, from `GET /v1/memories/{kind}/{id}/save`: a
+/// piece of a long save comes back with the whole text, any other row as a
+/// save of one piece.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SavedText {
+    pub kind: String,
+    pub id: i64,
+    pub pieces: i64,
+    /// The row at each position, `None` where it is deleted or not the
+    /// caller's to read.
+    pub ids: Vec<Option<i64>>,
+    /// Positions, from 1, with no row to show.
+    pub missing: Vec<i64>,
+    pub text: String,
+}
+
 #[derive(Serialize)]
 struct UpdateBody<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -604,6 +620,21 @@ impl DaemonClient {
             .await
             .map_err(Self::map_transport)?;
         Ok(Self::read_response::<Body>(resp).await?.item)
+    }
+
+    /// The save `id` belongs to. `agent` scopes it to that agent's rows:
+    /// another agent's row is the daemon's 404, like a missing one.
+    pub async fn read_save(&self, kind: &str, id: i64, agent: Option<&str>) -> Result<SavedText, ClientError> {
+        let query: Vec<(&str, &str)> = agent.map(|a| ("agent", a)).into_iter().collect();
+        let resp = self
+            .http
+            .get(self.url(&format!("/v1/memories/{kind}/{id}/save")))
+            .bearer_auth(&self.token)
+            .query(&query)
+            .send()
+            .await
+            .map_err(Self::map_transport)?;
+        Self::read_response(resp).await
     }
 
     /// Counts of what is stored, optionally narrowed to an agent and/or project.

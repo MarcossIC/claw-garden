@@ -27,6 +27,12 @@ const MULTI_REF_TOPICS: usize = 12;
 const CONTESTED_CASES: usize = 12;
 /// Rows that name the same entity in a contested case: the answer and five rivals.
 const CONTESTED_POOL: usize = 6;
+/// Cases with one long memory each, half of them in Spanish.
+const LONG_CASES: usize = 12;
+/// Pieces a long row reaches without a tokenizer. One more than the three the
+/// set promises, so the fact placed two thirds in stays past the first piece
+/// even where the real tokenizer packs more text into a piece.
+const LONG_MIN_PIECES: usize = 4;
 
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum SynthError {
@@ -75,6 +81,11 @@ pub fn generate(base: &Golden, seed: u64, sizes: &Sizes) -> Result<Golden, Synth
     out.corpus.extend(rows);
     out.retrieval_cases.extend(cases);
     let (rows, cases) = contested_importance(base, &mut names, &mut rng);
+    out.corpus.extend(rows);
+    out.retrieval_cases.extend(cases);
+    // Last, so the draws above, and everything they generate, stay as they
+    // were before long cases existed.
+    let (rows, cases) = long_saves(base, &mut names, &mut rng);
     out.corpus.extend(rows);
     out.retrieval_cases.extend(cases);
 
@@ -223,6 +234,7 @@ fn lexical_families(base: &Golden, rng: &mut SplitMix64) -> (Vec<Row>, Vec<Case>
             blocked_by: None,
             history: Vec::new(),
             subset: Subset::Lexical,
+            answer: None,
         });
     }
     (rows, cases)
@@ -335,6 +347,7 @@ fn multi_ref_topics(base: &Golden, names: &mut Codenames, rng: &mut SplitMix64) 
             blocked_by: None,
             history: Vec::new(),
             subset: Subset::MultiRef,
+            answer: None,
         });
     }
     (rows, cases)
@@ -390,8 +403,57 @@ fn contested_importance(base: &Golden, names: &mut Codenames, rng: &mut SplitMix
                 blocked_by: None,
                 history: Vec::new(),
                 subset,
+                answer: None,
             });
         }
+    }
+    (rows, cases)
+}
+
+/// Memories long enough that production cuts them into several pieces, each
+/// asked about a fact placed well past the first piece while only the opening
+/// sentence names the key. Whether the agent gets the answer then depends on
+/// how the later pieces are found and put back together.
+fn long_saves(base: &Golden, names: &mut Codenames, rng: &mut SplitMix64) -> (Vec<Row>, Vec<Case>) {
+    let mut rows = Vec::new();
+    let mut cases = Vec::new();
+
+    for n in 0..LONG_CASES {
+        let key = names.next(base, rng);
+        let spanish = n % 2 == 1;
+        let facts = templates::long_facts(spanish);
+        let (sentence, answer, query) = facts[(n / 2) % facts.len()];
+        let number = (10 + rng.below(90)).to_string();
+        let opening = templates::fill(rng.pick(templates::long_openings(spanish)), &[("{key}", &key)]);
+
+        let mut sentences = vec![opening];
+        while clawg_core::eval_api::fallback_pieces(&sentences.join(" ")).len() < LONG_MIN_PIECES {
+            let frame = *rng.pick(templates::long_filler(spanish));
+            let count = (2 + rng.below(98)).to_string();
+            let topic = *rng.pick(templates::long_topics(spanish));
+            sentences.push(templates::fill(frame, &[("{n}", &count), ("{w}", topic)]));
+        }
+        let at = (sentences.len() * 2).div_ceil(3);
+        sentences.insert(at, templates::fill(sentence, &[("{n}", &number)]));
+
+        let ref_ = format!("s-long-{n:02}");
+        rows.push(Row {
+            ref_: ref_.clone(),
+            content: sentences.join(" "),
+            memory_type: "semantic_fact".to_string(),
+            importance: 5.0,
+            lang: Some(if spanish { "es" } else { "en" }.to_string()),
+        });
+        cases.push(Case {
+            query: templates::fill(query, &[("{key}", &key)]),
+            corpus_refs: vec![ref_.clone()],
+            expected_refs: vec![ref_],
+            status: Status::Active,
+            blocked_by: None,
+            history: Vec::new(),
+            subset: Subset::Long,
+            answer: Some(templates::fill(answer, &[("{n}", &number)])),
+        });
     }
     (rows, cases)
 }
@@ -458,6 +520,7 @@ mod tests {
             blocked_by: None,
             history: vec![],
             subset: Subset::Natural,
+            answer: None,
         }
     }
 
@@ -921,9 +984,90 @@ mod tests {
     fn the_synthetic_refs_keep_their_prefixes() {
         let base = grouped_base();
         let out = generate(&base, 7, &Sizes { distractors: 5 }).unwrap();
-        for prefix in ["s-dis-", "s-lex-", "s-mr-", "s-hi-", "s-lo-"] {
+        for prefix in ["s-dis-", "s-lex-", "s-mr-", "s-hi-", "s-lo-", "s-long-"] {
             assert!(synthetic_rows(&out, &base).iter().any(|r| r.ref_.starts_with(prefix)), "{prefix}");
         }
+    }
+
+    fn long_cases(out: &Golden) -> Vec<(&Case, &Row)> {
+        cases_of(out, Subset::Long).into_iter().map(|c| (c, row_of(out, &c.expected_refs[0]))).collect()
+    }
+
+    fn key_of(row: &Row) -> &str {
+        row.content.split('`').nth(1).expect("a long row names its key in backticks")
+    }
+
+    #[test]
+    fn there_are_twelve_long_cases_at_any_size() {
+        for distractors in [0, 40] {
+            let out = generate(&grouped_base(), 7, &Sizes { distractors }).unwrap();
+            let long = long_cases(&out);
+            assert_eq!(long.len(), 12);
+            assert_eq!(long.iter().filter(|(_, r)| r.lang.as_deref() == Some("es")).count(), 6);
+            for (case, row) in long {
+                assert_eq!(case.expected_refs, vec![row.ref_.clone()]);
+                assert!(case.answer.is_some(), "{case:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_row_names_its_key_only_in_its_first_sentence() {
+        let out = generate(&grouped_base(), 7, &NONE).unwrap();
+        for (case, row) in long_cases(&out) {
+            let key = key_of(row);
+            assert!(case.query.contains(key), "{case:?}");
+            let first_end = row.content.find(". ").expect("a long row has more than one sentence") + 1;
+            assert_eq!(row.content.matches(key).count(), 1, "{key}");
+            assert!(row.content[..first_end].contains(key), "{key}");
+            assert_eq!(out.corpus.iter().filter(|r| r.content.contains(key)).count(), 1, "{key} is shared");
+        }
+    }
+
+    #[test]
+    fn the_answer_appears_once_after_the_first_third() {
+        let out = generate(&grouped_base(), 7, &NONE).unwrap();
+        let mut answers = HashSet::new();
+        for (case, row) in long_cases(&out) {
+            let answer = case.answer.as_deref().unwrap();
+            assert_eq!(row.content.matches(answer).count(), 1, "{answer}");
+            let at = row.content.find(answer).unwrap();
+            assert!(at > row.content.len() / 3, "{answer} sits at byte {at} of {}", row.content.len());
+            let first = &clawg_core::eval_api::fallback_pieces(&row.content)[0];
+            assert!(!first.contains(answer), "{answer} is already in the first piece");
+            assert_eq!(out.corpus.iter().filter(|r| r.content.contains(answer)).count(), 1, "{answer}");
+            assert!(answers.insert(answer.to_string()), "{answer} repeats");
+        }
+    }
+
+    #[test]
+    fn a_long_row_splits_into_at_least_three_pieces() {
+        let out = generate(&grouped_base(), 7, &NONE).unwrap();
+        let mut pieces = HashSet::new();
+        for (_, row) in long_cases(&out) {
+            let split = clawg_core::eval_api::fallback_pieces(&row.content);
+            assert!(split.len() >= 3, "{} has {} pieces", row.ref_, split.len());
+            for piece in split {
+                assert!(pieces.insert(piece), "{} shares a piece with another long row", row.ref_);
+            }
+        }
+        let base = grouped_base();
+        let windows: HashSet<String> = base.corpus.iter().flat_map(|r| word_windows(&r.content)).collect();
+        for (_, row) in long_cases(&out) {
+            assert!(!shares_word_run(&row.content, &windows), "{}", row.ref_);
+        }
+    }
+
+    /// The digest of the set seed 7 gave before long cases existed. Long cases
+    /// draw from the generator after everything else, so removing them must
+    /// give back that exact set, byte for byte.
+    #[test]
+    fn adding_long_cases_leaves_the_rest_of_the_set_unchanged() {
+        let mut out = generate(&grouped_base(), 7, &Sizes { distractors: 40 }).unwrap();
+        out.corpus.retain(|r| !r.ref_.starts_with("s-long-"));
+        out.retrieval_cases.retain(|c| c.subset != Subset::Long);
+        let digest = clawg_core::eval_api::sha256_hex(serde_json::to_string(&out).unwrap().as_bytes());
+        assert_eq!(digest, "f05a66281b5db6008277aee3fec78691b881f58f02b14102e37d401f5ebc1d27");
     }
 
     fn base() -> Golden {

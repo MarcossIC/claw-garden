@@ -59,6 +59,18 @@ pub fn production_lexical_budget() -> Option<usize> {
     SearchScope::all_default().lexical
 }
 
+/// The pieces the worker cuts `text` into when no tokenizer is loaded (four
+/// bytes per token). It is the coarsest count production gives, so a text
+/// that reaches some number of pieces here reaches at least as many with the
+/// real tokenizer, whose tokens average fewer bytes.
+pub fn fallback_pieces(text: &str) -> Vec<String> {
+    crate::memory::chunker::ChatChunker::from_tokenizer(None)
+        .chunk(text, crate::memory::chunker::CHUNK_MAX_TOKENS)
+        .into_iter()
+        .map(|c| c.text)
+        .collect()
+}
+
 /// The tokenizer `memory_fts` carries when nothing swaps it — the value the
 /// migration itself writes. Named here so a run that never passed
 /// `--fts-tokenizer` can still record which tokenizer produced its numbers,
