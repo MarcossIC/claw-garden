@@ -113,8 +113,9 @@ which memory holds and record the answer with `resolve_conflict`. When \
 `recall_context` says memories are waiting for a review, or the user asks what you \
 have learned, call `synthesize` and save the conclusions it leads to. \
 Memories are scoped to the current project unless you say otherwise. For how \
-this project works (its design, conventions or commands), call `search_project` \
-before opening files: it searches the project's own documentation.";
+this project works (its design, conventions, commands or where something is \
+implemented), call `search_project` before opening files: it searches the \
+project's own documentation and code.";
 
 // ── Tool parameters ─────────────────────────────────────────────────────────
 
@@ -810,12 +811,13 @@ impl ClawgMcp {
     #[tool(
         name = "search_project",
         description = "Search this project's own documentation (README, docs, CLAUDE.md, design \
-                       notes, specs and manifests) for how it works: its design, conventions, \
-                       commands and decisions. Use it before opening files when the question is \
-                       how something in the project works or why it is the way it is. Matching \
-                       is by meaning and by exact term, so pass a question or the name of the \
-                       thing. Returns numbered passages, each under the file and headings it \
-                       comes from; the index follows the files on disk."
+                       notes, specs and manifests) and its Rust, Python and TypeScript code for \
+                       how it works: its design, conventions, commands, decisions and where \
+                       something is implemented. Use it before opening files when the question \
+                       is how something in the project works or why it is the way it is. \
+                       Matching is by meaning and by exact term, so pass a question or the name \
+                       of the thing. Returns numbered passages, each under the file and the \
+                       headings or definitions it comes from; the index follows the files on disk."
     )]
     async fn search_project(
         &self,
@@ -1360,6 +1362,7 @@ mod tests {
         let instructions = b.get_info().instructions.expect("instructions");
         assert!(instructions.contains("search_project"), "{instructions}");
         assert!(instructions.contains("how"), "{instructions}");
+        assert!(instructions.contains("documentation and code"), "{instructions}");
     }
 
     #[tokio::test]
