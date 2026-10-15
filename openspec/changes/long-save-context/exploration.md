@@ -2,11 +2,25 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 | S–M | eval-golden-expansion; data-preservation si toca el esquema | exploración (borrador) |
+| 1 | S–M | eval-golden-expansion; data-preservation si toca el esquema | cerrada: sigue en la [propuesta](proposal.md) |
 
 **Tesis:** un save largo se guarda como pedazos sueltos, y cada uno se busca solo, sin saber de qué save viene. El pedazo que se queda con la segunda mitad del texto pierde el tema, y su vector también.
 
-## Estado actual (verificado)
+## Revisión contra `main` (2026-10-15)
+
+La exploración es del 2026-10-12. Desde entonces entraron ingest-durability, dispute-resolution, knowledge-synthesis, secret-hygiene, memory-update-tool y context-density. Se revisó cada referencia contra `main` en `9c3ff19`:
+
+- **Los hermanos ya no se disputan.** dispute-resolution confirmó la hipótesis con el modelo real (220 de 263 pedazos quedaban `disputed`) y los excluye del detector (`worker.rs:528-557`, `contradiction.rs:128-147`). Esa parte sale del alcance.
+- **El save ya no responde "queued" antes de trocear.** Es síncrono desde ingest-durability, y `save_memory` dice `saved as 3 pieces: #57, #58, #59` (`crates/clawg-cli/src/mcp/server.rs:416-424`). La opción c quedó hecha.
+- **Los secretos se enmascaran antes de trocear** (`worker.rs:429-434`). La cabecera sale del texto enmascarado.
+- **Las líneas se movieron.** El embebido está en `worker.rs:504`, la descripción de `save_memory` en `server.rs:696-704` y su test en `server.rs:1526-1534`. `K_FINAL` está en `prompt_builder.rs:34`. Los hits de `recall_context` llevan id desde context-density (`prompt_builder.rs:296-303`).
+- **El save entra por `api.rs:711-726`**, con `Role::User` y `MemorySource::Explicit`; `runtime.rs:262` ya no es ese camino.
+- **eval-golden-expansion no agregó memorias largas.** Su generador suma distractores, `lexical`, `multi_ref` y los de importancia ([`specs/eval`](../../specs/eval/spec.md)); ninguna fila llega al corte y ningún caso tiene la respuesta después de él. La medición tiene que venir con este cambio (R9 de la spec).
+- **Siguen igual:** el chunker (`chunker/mod.rs:15, 21`, `chat.rs:67-72`), una fila por pedazo sin vínculo (ninguna migración hasta V10 lo agrega), los 500 caracteres de `search_memory` (`tools.rs:26`), `seed.rs:71-82` sin trocear y el criterio de `found` del agent-view (`agent_view/mod.rs:116-146`).
+
+Las líneas de abajo son las del 2026-10-12.
+
+## Estado actual (verificado el 2026-10-12)
 
 ### Cómo se parte un save
 
