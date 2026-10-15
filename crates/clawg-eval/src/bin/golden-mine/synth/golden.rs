@@ -39,6 +39,8 @@ pub struct Case {
     pub history: Vec<String>,
     #[serde(default, skip_serializing_if = "is_default")]
     pub subset: Subset,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -58,6 +60,7 @@ pub enum Subset {
     MultiRef,
     HighImportance,
     LowImportance,
+    Long,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -96,7 +99,7 @@ mod tests {
         let golden: Golden = serde_json::from_str(MINIMAL).unwrap();
         let json = serde_json::to_value(&golden).unwrap();
         let case = json["retrieval_cases"][0].as_object().unwrap();
-        for key in ["status", "blocked_by", "history", "subset"] {
+        for key in ["status", "blocked_by", "history", "subset", "answer"] {
             assert!(!case.contains_key(key), "{key} must be omitted at its default");
         }
         assert!(!json["corpus"][0].as_object().unwrap().contains_key("lang"));
@@ -118,6 +121,18 @@ mod tests {
         assert!(text.contains("\"subset\":\"low_importance\""));
         let back: Golden = serde_json::from_str(&text).unwrap();
         assert_eq!(back.retrieval_cases[0].subset, Subset::LowImportance);
+    }
+
+    #[test]
+    fn a_long_case_writes_its_subset_and_answer() {
+        let mut golden: Golden = serde_json::from_str(MINIMAL).unwrap();
+        golden.retrieval_cases[0].subset = Subset::Long;
+        golden.retrieval_cases[0].answer = Some("capped at 40 records".into());
+        let json = serde_json::to_value(&golden).unwrap();
+        assert_eq!(json["retrieval_cases"][0]["subset"], "long");
+        assert_eq!(json["retrieval_cases"][0]["answer"], "capped at 40 records");
+        let back: Golden = serde_json::from_value(json).unwrap();
+        assert_eq!(back, golden);
     }
 
     #[test]

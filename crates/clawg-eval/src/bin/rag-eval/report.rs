@@ -947,6 +947,7 @@ mod tests {
             unmatchable_refs: vec!["c3".to_string()],
             search: Default::default(),
             context: Default::default(),
+            by_subset: Default::default(),
             per_case: vec![],
         }
     }

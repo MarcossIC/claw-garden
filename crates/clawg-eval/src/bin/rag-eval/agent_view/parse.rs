@@ -11,6 +11,8 @@
 pub struct SearchLine {
     /// The 1-based position the tool printed.
     pub rank: usize,
+    /// The row id the line leads with.
+    pub id: i64,
     pub score: f64,
     /// The whole line, which is what it costs the agent.
     pub printed: String,
@@ -38,9 +40,10 @@ pub fn parse_search_output(text: &str) -> Result<Vec<SearchLine>, ParseError> {
         .collect()
 }
 
-/// `{rank}. #{id} [{kind}/{type}/t{tier} score={score}] {content}`. The first
-/// `]` closes the metadata because nothing inside it can contain one; content
-/// is free to.
+/// `{rank}. #{id} [{kind}/{type}/t{tier} score={score}] {content}`, with
+/// `piece={k}/{n}` before the score for a piece of a long save. The first `]`
+/// closes the metadata because nothing inside it can contain one; content is
+/// free to.
 fn parse_search_line(line: &str) -> Option<SearchLine> {
     let (rank, rest) = line.split_once(". #")?;
     let rank = rank.parse().ok()?;
@@ -48,6 +51,7 @@ fn parse_search_line(line: &str) -> Option<SearchLine> {
     if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
+    let id = id.parse().ok()?;
     let (meta, after) = rest.split_once(']')?;
     let score = meta.split_once(" score=")?.1.parse().ok()?;
     let content = match after.strip_prefix(' ') {
@@ -55,7 +59,7 @@ fn parse_search_line(line: &str) -> Option<SearchLine> {
         None if after.is_empty() => after,
         None => return None,
     };
-    Some(SearchLine { rank, score, printed: line.to_string(), content: content.to_string() })
+    Some(SearchLine { rank, id, score, printed: line.to_string(), content: content.to_string() })
 }
 
 /// A `recall_context` prompt cut at its `=== TITLE ===` lines, as
@@ -129,9 +133,10 @@ fn joined(segments: Vec<Vec<&str>>) -> Vec<String> {
 }
 
 /// The text after a hit header, `[YYYY-MM-DD #id type] `, where the type is
-/// one word and may be absent.
+/// one word and may be absent, and a piece of a long save adds `piece={k}/{n}`.
 fn hit_text(line: &str) -> Option<&str> {
     let (header, text) = line.strip_prefix('[')?.split_once("] ")?;
+    let header = without_piece(header);
     let (date, rest) = header.split_once(" #")?;
     let id = rest.split_once(' ').map_or(rest, |(id, kind)| {
         if kind.is_empty() || kind.contains(' ') { "" } else { id }
@@ -143,6 +148,18 @@ fn hit_text(line: &str) -> Option<&str> {
         && b[..4].iter().chain(&b[5..7]).chain(&b[8..]).all(u8::is_ascii_digit);
     let is_id = !id.is_empty() && id.bytes().all(|c| c.is_ascii_digit());
     (is_date && is_id).then_some(text)
+}
+
+/// `header` without a trailing ` piece={k}/{n}`, or as it came.
+fn without_piece(header: &str) -> &str {
+    let Some((before, piece)) = header.rsplit_once(" piece=") else {
+        return header;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    match piece.split_once('/') {
+        Some((k, n)) if digits(k) && digits(n) => before,
+        _ => header,
+    }
 }
 
 #[cfg(test)]
@@ -160,6 +177,14 @@ mod tests {
         let line = &parse_search_output(text).unwrap()[0];
         assert_eq!(line.score, 0.87);
         assert_eq!(line.printed, text);
+    }
+
+    #[test]
+    fn a_hit_line_with_a_piece_yields_its_id_score_and_content() {
+        let text = "1. #58 [memory/semantic_fact/t3 piece=2/4 score=0.81] the retry budget was set";
+        let line = &parse_search_output(text).unwrap()[0];
+        assert_eq!((line.rank, line.id, line.score), (1, 58, 0.81));
+        assert_eq!(line.content, "the retry budget was set");
     }
 
     #[test]
@@ -230,6 +255,12 @@ mod tests {
     fn a_hit_line_is_one_segment() {
         let text = "=== RECENT CONTEXT (Last 7 Days) ===\n[2026-08-10 #4 chat_message] the retrieval decay term compares milliseconds\n";
         assert_eq!(context_segments(text), vec!["the retrieval decay term compares milliseconds".to_string()]);
+    }
+
+    #[test]
+    fn a_context_hit_with_a_piece_is_one_segment() {
+        let text = "=== LONG-TERM KNOWLEDGE ===\n[2026-10-15 #58 semantic_fact piece=2/4] the retry budget was set\n";
+        assert_eq!(context_segments(text), vec!["the retry budget was set".to_string()]);
     }
 
     #[test]

@@ -235,6 +235,103 @@ pub fn multi_aspect_queries(spanish: bool) -> &'static [(&'static [usize], &'sta
     }
 }
 
+/// How a long memory opens: the only sentence that names `{key}`.
+pub fn long_openings(spanish: bool) -> &'static [&'static str] {
+    if spanish {
+        &[
+            "Estas son las notas de trabajo sobre `{key}`, el componente que está entre la cola de ingesta y la capa de almacenamiento.",
+            "Resumen largo de lo que pasó con `{key}` durante el último trimestre, escrito para quien lo herede.",
+            "Todo lo que conviene saber de `{key}` antes de tocarlo, juntado a partir de varias reuniones.",
+        ]
+    } else {
+        &[
+            "These are the working notes on `{key}`, the component that sits between the ingestion queue and the storage layer.",
+            "A long write-up of what happened with `{key}` over the last quarter, kept for whoever inherits it.",
+            "Everything worth knowing about `{key}` before changing it, gathered from several meetings.",
+        ]
+    }
+}
+
+/// One fact a long memory buries past its first piece: the sentence that
+/// carries it, the answer as it appears in that sentence, and the question.
+/// `{n}` is a number drawn per row; the question names `{key}`, the sentence
+/// does not.
+pub fn long_facts(spanish: bool) -> &'static [(&'static str, &'static str, &'static str); 6] {
+    if spanish {
+        &[
+            ("Después de revisar el incidente, el presupuesto de reintentos quedó en {n} intentos por llamada.", "presupuesto de reintentos quedó en {n} intentos", "qué presupuesto de reintentos acordamos para {key}"),
+            ("Al final el timeout de las peticiones quedó fijo en {n} segundos para todos los clientes.", "timeout de las peticiones quedó fijo en {n} segundos", "qué timeout fijamos para las peticiones de {key}"),
+            ("El servicio pasó a escuchar en el puerto 70{n} detrás del proxy interno.", "escuchar en el puerto 70{n}", "en qué puerto escucha {key}"),
+            ("Las entradas de la caché ahora vencen a los {n} minutos en lugar del valor anterior.", "vencen a los {n} minutos", "cuánto duran las entradas de la caché de {key}"),
+            ("El congelamiento de despliegues dura {n} días al final de cada trimestre.", "congelamiento de despliegues dura {n} días", "cuánto dura el congelamiento de despliegues de {key}"),
+            ("Los lotes quedaron limitados a {n} registros para que un volcado nunca trabe la cola.", "limitados a {n} registros", "cuál es el límite de registros por lote de {key}"),
+        ]
+    } else {
+        &[
+            ("After the incident review, the retry budget was set to {n} attempts per call.", "retry budget was set to {n} attempts", "what retry budget did we settle on for {key}"),
+            ("In the end the request timeout was fixed at {n} seconds for every client.", "request timeout was fixed at {n} seconds", "what request timeout did we fix for {key}"),
+            ("The service was moved to listen on port 70{n} behind the internal proxy.", "listen on port 70{n}", "which port does {key} listen on"),
+            ("Cached entries now expire after {n} minutes instead of the old default.", "expire after {n} minutes", "how long do cached entries of {key} live"),
+            ("The deploy freeze lasts {n} days at the end of each quarter.", "deploy freeze lasts {n} days", "how long is the deploy freeze for {key}"),
+            ("Batches were capped at {n} records so a single flush never stalls the queue.", "capped at {n} records", "what is the batch size limit of {key}"),
+        ]
+    }
+}
+
+/// Sentences that pad a long memory between its opening and its fact. None
+/// names the key or any fact of `long_facts`; `{n}` and `{w}` are drawn per
+/// sentence, so two long rows never share a piece.
+pub fn long_filler(spanish: bool) -> &'static [&'static str] {
+    if spanish {
+        &[
+            "En la semana {n} el equipo repasó los tableros de {w} y no encontró nada que pidiera acción.",
+            "Una reunión de seguimiento trató cómo se enrutan las alertas de {w} y quién las mira primero.",
+            "Alguien propuso reescribir el módulo de {w}, pero la idea quedó en pausa hasta tener más datos.",
+            "La prueba de carga corrió {n} horas y los gráficos de {w} se mantuvieron planos todo el tiempo.",
+            "Casi toda la charla fue sobre nombres, documentación y cómo mantener al día las notas de {w}.",
+            "Hubo un desvío corto hacia la actualización de la biblioteca de {w}, que se sigue en otro lado.",
+            "Dos personas señalaron que el manual de {w} todavía describe la configuración del año pasado.",
+            "El entorno de pruebas se reconstruyó {n} veces persiguiendo una advertencia de {w} sin relación.",
+            "Nadie pudo reproducir el pico de {w} del martes anterior, así que el ticket se cerró.",
+            "La rotación de guardias se ajustó para que las preguntas de {w} lleguen a alguien en menos de una hora.",
+            "Se compartió un borrador del diagrama de {w}, con {n} cajas y demasiadas flechas.",
+            "El grupo acordó revisar el presupuesto de {w} después del próximo ciclo de planificación.",
+            "Los registros de los trabajos de {w} se recortaron para mantener controlada la factura de almacenamiento.",
+            "Una pasante preguntó por qué las pruebas de {w} tardan tanto, y eso llevó a una hora útil de perfilado.",
+            "El proveedor confirmó que el contrato de {w} se renueva solo en {n} semanas.",
+            "Las dudas sobre la migración de {w} se juntaron en un documento compartido para más adelante.",
+        ]
+    } else {
+        &[
+            "During week {n} the team went through the {w} dashboards and found nothing that needed action.",
+            "A follow-up meeting covered how the {w} alerts are routed and who looks at them first.",
+            "Someone proposed rewriting the {w} module, but the idea was parked until there is more data.",
+            "The load test ran for {n} hours and the {w} graphs stayed flat the whole time.",
+            "Most of the discussion was about naming, documentation and how to keep the {w} notes current.",
+            "There was a short detour into the {w} library upgrade, which is tracked somewhere else.",
+            "Two people pointed out that the {w} runbook still describes the setup from last year.",
+            "The staging environment was rebuilt {n} times while chasing an unrelated {w} warning.",
+            "Nobody could reproduce the {w} spike from the previous Tuesday, so the ticket was closed.",
+            "The on-call rotation was adjusted so that {w} questions reach someone within the hour.",
+            "A draft diagram of the {w} flow was shared, with {n} boxes and far too many arrows.",
+            "The group agreed to revisit the {w} budget after the next planning cycle.",
+            "Logs from the {w} jobs were trimmed to keep the storage bill under control.",
+            "An intern asked why the {w} tests take so long, which led to a useful hour of profiling.",
+            "The vendor confirmed that the {w} contract renews automatically in {n} weeks.",
+            "Questions about the {w} migration were collected in a shared document for later.",
+        ]
+    }
+}
+
+/// What a filler sentence is about.
+pub fn long_topics(spanish: bool) -> &'static [&'static str] {
+    if spanish {
+        &["latencia", "facturación", "registros", "búsqueda", "incorporación", "planificador", "métricas", "respaldos", "red", "seguridad", "reportes", "colas"]
+    } else {
+        &["latency", "billing", "logging", "search", "onboarding", "scheduler", "metrics", "backup", "network", "security", "reporting", "queueing"]
+    }
+}
+
 pub const CODENAME_ADJECTIVES: [&str; 10] =
     ["amber", "cobalt", "crimson", "ivory", "jade", "onyx", "scarlet", "teal", "umber", "violet"];
 pub const CODENAME_NOUNS: [&str; 10] =

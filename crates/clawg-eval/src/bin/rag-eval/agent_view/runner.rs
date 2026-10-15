@@ -15,7 +15,10 @@ use clawg_core::paths::Profile;
 
 use super::matcher::Corpus;
 use super::parse::ParseError;
-use super::{build_results, context_section_tokens, read_context, read_search, AgentViewResults, CaseView, ContextOutcome, SearchOutcome};
+use super::{
+    answer_reachable, answer_visible, build_results, context_section_tokens, read_context, read_search, AgentViewResults,
+    AnswerView, CaseView, ContextOutcome, SearchOutcome,
+};
 use crate::golden::GoldenSet;
 use crate::seed::AGENT_ID;
 
@@ -141,6 +144,22 @@ async fn answer_cases(
         let context_ms = elapsed_ms(started);
         let context_found = read_context(&context_text, &case.expected_refs, corpus);
 
+        let answer = match case.answer.as_deref() {
+            None => None,
+            Some(answer) => {
+                let search_visible = answer_visible(&search_text, answer);
+                let saved = match search_read.first_expected_id {
+                    Some(id) if !search_visible => read_save_text(&session.client, id).await?,
+                    _ => None,
+                };
+                Some(AnswerView {
+                    search_visible,
+                    search_reachable: answer_reachable(search_visible, saved.as_deref(), answer),
+                    context_visible: answer_visible(&context_text, answer),
+                })
+            }
+        };
+
         views.push(CaseView {
             query: case.query.clone(),
             expected_refs: case.expected_refs.clone(),
@@ -159,6 +178,7 @@ async fn answer_cases(
                 latency_ms: search_ms,
                 truncated: search_read.truncated,
                 lines: search_read.lines,
+                repeated_rows: search_read.repeated_rows,
             },
             context: ContextOutcome {
                 found: !context_found.is_empty(),
@@ -167,9 +187,21 @@ async fn answer_cases(
                 latency_ms: context_ms,
                 sections: context_section_tokens(&context_text, &count_tokens),
             },
+            subset: case.subset,
+            answer,
         });
     }
     Ok(views)
+}
+
+/// The whole save of row `id`, or `None` when the daemon has no way to read
+/// one: a daemon from before saves were linked answers 404 for the route.
+async fn read_save_text(client: &DaemonClient, id: i64) -> Result<Option<String>, RunError> {
+    match client.read_save("memory", id, Some(AGENT_ID)).await {
+        Ok(saved) => Ok(Some(saved.text)),
+        Err(ClientError::Daemon { status: 404, .. }) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Stops the server, waits until it has let go of the store, and removes the
@@ -339,6 +371,38 @@ mod tests {
             results.per_case[2].context.found,
             "a tier-1 preference reaches the agent through the workspace block"
         );
+    }
+
+    /// The answer sits in the last piece of a row the worker splits, so a
+    /// fragment of the row being visible says nothing about it.
+    #[tokio::test]
+    async fn a_case_that_names_its_answer_reports_whether_the_answer_reached_the_agent() {
+        let filler = "The team reviewed the dashboards and found nothing that needed action. ".repeat(80);
+        let content = format!("Notes on amber-falcon. {filler}Batches were capped at 40 records in the end.");
+        let golden: GoldenSet = serde_json::from_value(serde_json::json!({
+            "corpus": [{"ref": "l1", "content": content, "memory_type": "semantic_fact", "importance": 5.0}],
+            "retrieval_cases": [{
+                "query": "what is the batch size limit of amber-falcon",
+                "corpus_refs": ["l1"], "expected_refs": ["l1"],
+                "subset": "long", "answer": "capped at 40 records"
+            }],
+            "contradiction_pairs": []
+        }))
+        .expect("golden fixture must deserialize");
+        let scratch = scratch();
+        let input = AgentViewInput {
+            golden_set: &golden,
+            embedder: &EvalEmbedder::fake(),
+            counter: &EvalTokenCounter::fake(),
+            tokenizer_dir: &scratch,
+        };
+
+        let results = run(&input, &scratch).await.expect("the run must succeed");
+
+        assert!(results.stored_rows > 1, "the row must be split for the case to mean anything");
+        let answer = results.per_case[0].answer.expect("a case with an answer is scored on it");
+        assert!(answer.search_reachable || !answer.search_visible, "visible implies reachable");
+        assert_eq!(results.by_subset["long"].answers.n_cases, 1);
     }
 
     /// 40 passes over three cases record well over the tracker's 500-id size
