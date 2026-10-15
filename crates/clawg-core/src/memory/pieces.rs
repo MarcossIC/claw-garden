@@ -6,7 +6,10 @@
 //! A row with no link is a save of one piece, as every row written before the
 //! table existed is.
 
+use std::collections::HashMap;
+
 use crate::memory::error::MemoryError;
+use crate::memory::search::PiecePosition;
 use crate::memory::MemoryStore;
 
 /// One piece the worker stored: the row that holds it and the head its
@@ -15,6 +18,13 @@ use crate::memory::MemoryStore;
 pub(crate) struct StoredPiece {
     pub memory_id: i64,
     pub context: String,
+}
+
+/// The save a row is a piece of, and where in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SaveLink {
+    pub save_id: i64,
+    pub position: PiecePosition,
 }
 
 fn backend(context: &'static str) -> impl Fn(tokio_rusqlite::Error) -> MemoryError {
@@ -52,6 +62,36 @@ impl MemoryStore {
             })
             .await
             .map_err(backend("link_pieces"))
+    }
+
+    /// The save each of `memory_ids` is a piece of. A row linked in several
+    /// saves (a piece the dedup absorbed) answers the oldest one.
+    pub(crate) async fn save_links(&self, memory_ids: Vec<i64>) -> Result<HashMap<i64, SaveLink>, MemoryError> {
+        if memory_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        self.conn
+            .call(move |c| -> rusqlite::Result<HashMap<i64, SaveLink>> {
+                let placeholders = vec!["?"; memory_ids.len()].join(", ");
+                let sql = format!(
+                    "SELECT p.memory_id, p.save_id, p.piece, \
+                            (SELECT COUNT(*) FROM memory_piece q WHERE q.save_id = p.save_id) \
+                     FROM memory_piece p WHERE p.memory_id IN ({placeholders}) \
+                     ORDER BY p.memory_id, p.save_id, p.piece"
+                );
+                let mut stmt = c.prepare(&sql)?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(memory_ids.iter()), |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })?;
+                let mut links = HashMap::new();
+                for row in rows {
+                    let (memory_id, save_id, piece, pieces) = row?;
+                    links.entry(memory_id).or_insert(SaveLink { save_id, position: PiecePosition { piece, pieces } });
+                }
+                Ok(links)
+            })
+            .await
+            .map_err(backend("save_links"))
     }
 }
 

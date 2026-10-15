@@ -75,8 +75,9 @@ fn format_hits(hits: &[Hit]) -> String {
     hits.iter()
         .enumerate()
         .map(|(i, h)| {
+            let piece = h.piece.map(|p| format!(" piece={}/{}", p.piece, p.pieces)).unwrap_or_default();
             format!(
-                "{}. #{} [{}/{}/t{} score={:.2}] {}",
+                "{}. #{} [{}/{}/t{}{piece} score={:.2}] {}",
                 i + 1,
                 h.id,
                 h.kind,
@@ -285,6 +286,7 @@ mod tests {
             memory_type: memory_type.into(),
             tier,
             score,
+            piece: None,
         }
     }
 
@@ -390,6 +392,16 @@ mod tests {
         let out = format_hits(&[hit(1, "Memory", "chat_message", 3, 0.1, &long)]);
         assert!(out.ends_with('…'), "out ended: {:?}", &out[out.len().saturating_sub(20)..]);
         assert!(out.len() < long.len(), "the preview must be shorter than the content");
+    }
+
+    #[test]
+    fn format_hits_names_the_piece_of_a_long_save() {
+        let mut piece = hit(58, "Memory", "semantic_fact", 3, 0.81, "the retry budget was set");
+        piece.piece = Some(crate::client::PiecePosition { piece: 2, pieces: 4 });
+        let out = format_hits(&[piece, hit(7, "Memory", "semantic_fact", 3, 0.5, "a short one")]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "1. #58 [Memory/semantic_fact/t3 piece=2/4 score=0.81] the retry budget was set");
+        assert_eq!(lines[1], "2. #7 [Memory/semantic_fact/t3 score=0.50] a short one");
     }
 
     /// A newline inside a memory would split one hit across two lines and make

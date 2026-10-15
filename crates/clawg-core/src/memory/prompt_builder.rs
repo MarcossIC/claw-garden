@@ -299,7 +299,8 @@ fn format_hit_line(hit: &RankedHit) -> String {
         TableKind::Memory => String::new(),
         other => format!("{other:?}/").to_lowercase(),
     };
-    format!("[{y:04}-{m:02}-{d:02} #{} {kind}{}] {}", hit.id, hit.memory_type, hit.content)
+    let piece = hit.piece.map(|p| format!(" piece={}/{}", p.piece, p.pieces)).unwrap_or_default();
+    format!("[{y:04}-{m:02}-{d:02} #{} {kind}{}{piece}] {}", hit.id, hit.memory_type, hit.content)
 }
 
 /// Printed once above the pairs: it is the same for every one of them.
@@ -578,6 +579,7 @@ mod tests {
             score: 0.9,
             distance: 0.1,
             created_at: TimestampMs::from_unix_millis(1_700_000_000_000),
+            piece: None,
         }
     }
 
@@ -593,6 +595,13 @@ mod tests {
 
         let code = hit_at_2023_11_14(9, TableKind::Memory, "code_block", "fn main() {\n    run();\n\n    stop();\n}");
         assert_eq!(format_hit_line(&code), "[2023-11-14 #9 code_block] fn main() {\n    run();\n\n    stop();\n}");
+    }
+
+    #[test]
+    fn format_hit_line_names_the_piece_of_a_long_save() {
+        let mut hit = hit_at_2023_11_14(58, TableKind::Memory, "semantic_fact", "the retry budget was set");
+        hit.piece = Some(crate::memory::search::PiecePosition { piece: 2, pieces: 4 });
+        assert_eq!(format_hit_line(&hit), "[2023-11-14 #58 semantic_fact piece=2/4] the retry budget was set");
     }
 
     #[test]
@@ -735,6 +744,7 @@ mod tests {
             score: 0.5,
             distance: 0.5,
             created_at: TimestampMs::from_unix_millis(ts),
+            piece: None,
         };
 
         let hits = vec![make_hit(recent_ts), make_hit(recent_ts), make_hit(old_ts)];
@@ -755,6 +765,7 @@ mod tests {
             score: 0.5,
             distance: 0.5,
             created_at: TimestampMs::from_unix_millis(0),
+            piece: None,
         };
         let now_ms: i64 = 1_700_000_000_000;
         let (recent, longterm) = bucket_by_recency(vec![hit], TimestampMs::from_unix_millis(now_ms));
@@ -774,6 +785,7 @@ mod tests {
             score: 0.5,
             distance: 0.5,
             created_at: TimestampMs::from_unix_millis(-86_400_000),
+            piece: None,
         };
         let now_ms: i64 = 1_700_000_000_000;
         let (recent, longterm) = bucket_by_recency(vec![hit], TimestampMs::from_unix_millis(now_ms));
@@ -794,6 +806,7 @@ mod tests {
             score: 0.5,
             distance: 0.5,
             created_at: TimestampMs::from_unix_millis(now_ms + 86_400_000),
+            piece: None,
         };
         let (recent, longterm) = bucket_by_recency(vec![hit], TimestampMs::from_unix_millis(now_ms));
         assert_eq!(recent.len(), 1, "a future timestamp counts as recent rather than being clamped");
@@ -1130,10 +1143,10 @@ mod tests {
     async fn recent_longterm_split_by_7day_window() {
         let now_ms: i64 = 1_700_000_000_000;
         let recent = vec![
-            RankedHit { id: 1, kind: TableKind::Memory, content: "r".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000) },
+            RankedHit { id: 1, kind: TableKind::Memory, content: "r".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000), piece: None },
         ];
         let old = vec![
-            RankedHit { id: 2, kind: TableKind::Memory, content: "o".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 8 * 86_400_000) },
+            RankedHit { id: 2, kind: TableKind::Memory, content: "o".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 8 * 86_400_000), piece: None },
         ];
         let (r, l) = bucket_by_recency(recent.into_iter().chain(old).collect(), TimestampMs::from_unix_millis(now_ms));
         assert_eq!(r.len(), 1);
@@ -1144,8 +1157,8 @@ mod tests {
     async fn all_old_hits_go_to_longterm_only() {
         let now_ms: i64 = 1_700_000_000_000;
         let hits = vec![
-            RankedHit { id: 1, kind: TableKind::Memory, content: "a".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 30 * 86_400_000) },
-            RankedHit { id: 2, kind: TableKind::Memory, content: "b".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 20 * 86_400_000) },
+            RankedHit { id: 1, kind: TableKind::Memory, content: "a".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 30 * 86_400_000), piece: None },
+            RankedHit { id: 2, kind: TableKind::Memory, content: "b".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 20 * 86_400_000), piece: None },
         ];
         let (r, l) = bucket_by_recency(hits, TimestampMs::from_unix_millis(now_ms));
         assert_eq!(r.len(), 0);
@@ -1156,8 +1169,8 @@ mod tests {
     async fn all_recent_hits_go_to_recent_only() {
         let now_ms: i64 = 1_700_000_000_000;
         let hits = vec![
-            RankedHit { id: 1, kind: TableKind::Memory, content: "a".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000) },
-            RankedHit { id: 2, kind: TableKind::Memory, content: "b".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 2 * 86_400_000) },
+            RankedHit { id: 1, kind: TableKind::Memory, content: "a".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000), piece: None },
+            RankedHit { id: 2, kind: TableKind::Memory, content: "b".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 2 * 86_400_000), piece: None },
         ];
         let (r, l) = bucket_by_recency(hits, TimestampMs::from_unix_millis(now_ms));
         assert_eq!(r.len(), 2);

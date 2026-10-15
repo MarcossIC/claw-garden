@@ -1002,6 +1002,7 @@ mod tests {
             score: 0.0,
             distance: 0.0,
             created_at: TimestampMs::from_unix_millis(0),
+            piece: None,
         }
     }
 
@@ -1842,6 +1843,7 @@ mod tests {
             score: 0.0,
             distance: 0.0,
             created_at: TimestampMs::from_unix_millis(0),
+            piece: None,
         }
     }
 
@@ -2665,6 +2667,7 @@ mod tests {
             score: 0.0,
             distance: 0.0,
             created_at: TimestampMs::from_unix_millis(0),
+            piece: None,
         }];
 
         assert_eq!(format_skill_hits(&hits), "skill_hits=1");

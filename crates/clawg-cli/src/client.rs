@@ -147,6 +147,17 @@ pub struct Hit {
     pub memory_type: String,
     pub tier: i64,
     pub score: f64,
+    /// Which piece of a long save the hit is; absent for a save of one piece
+    /// and from a daemon that does not link pieces.
+    #[serde(default)]
+    pub piece: Option<PiecePosition>,
+}
+
+/// Position `piece` (from 1) of a save stored as `pieces` rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct PiecePosition {
+    pub piece: i64,
+    pub pieces: i64,
 }
 
 /// One inventory row from `GET /v1/memories`.
