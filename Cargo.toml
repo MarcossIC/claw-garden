@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/clawg-cli", "crates/clawg-core", "crates/clawg-eval"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 authors = ["MarcossIC"]
 license = ""
 repository = ""
