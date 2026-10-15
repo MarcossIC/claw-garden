@@ -321,6 +321,15 @@ pub struct Updated {
     pub tier: i64,
 }
 
+/// How a restored row ended up. A `superseded` one is live but still left out
+/// of searches.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Restored {
+    pub id: i64,
+    pub status: String,
+    pub superseded_by: Option<i64>,
+}
+
 /// The save a row belongs to, from `GET /v1/memories/{kind}/{id}/save`: a
 /// piece of a long save comes back with the whole text, any other row as a
 /// save of one piece.
@@ -395,6 +404,8 @@ pub struct ListArgs {
     pub q: Option<String>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+    /// Lists the deleted rows instead of the live ones.
+    pub deleted: bool,
 }
 
 /// The query of a scoped change: no pair at all when unscoped, because
@@ -628,6 +639,9 @@ impl DaemonClient {
         if let Some(o) = args.offset {
             query.push(("offset", o.to_string()));
         }
+        if args.deleted {
+            query.push(("deleted", "true".into()));
+        }
 
         let resp = self
             .http
@@ -734,6 +748,20 @@ impl DaemonClient {
             .await
             .map_err(Self::map_transport)?;
         Ok(Self::read_response::<Body>(resp).await?.deleted)
+    }
+
+    /// Brings back a deleted `memory` row. `agent` scopes it as in
+    /// [`DaemonClient::update`].
+    pub async fn restore(&self, kind: &str, id: i64, agent: Option<&str>) -> Result<Restored, ClientError> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/v1/memories/{kind}/{id}/restore")))
+            .query(&owner_query(agent))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(Self::map_transport)?;
+        Self::read_response::<Restored>(resp).await
     }
 
     /// `agent` scopes the resolution as in [`DaemonClient::update`].

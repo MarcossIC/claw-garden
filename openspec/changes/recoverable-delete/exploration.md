@@ -2,9 +2,24 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 | S–M | — (todo lo previo está archivado; se coordina con agent-sharing) | exploración (borrador) |
+| 1 | M | — (todo lo previo está archivado) | cerrada: sigue en la [propuesta](proposal.md) |
 
 **Tesis:** borrar una memoria es un error que hoy no se puede deshacer, y es el único que queda sin salida. El texto sigue en la base, pero la fila quedó fuera del índice de búsqueda, del índice léxico y de la tabla de vectores. Nadie sabe volver a ponerla. Es la parte E de data-preservation (`openspec/changes/archive/2026-10-12-data-preservation/exploration.md:96`), que se archivó sin cambio propio.
+
+## Revisión contra main (2026-10-15)
+
+Revisada contra `main` (9aa1012), después de que se archivaran long-save-context, agent-sharing y project-indexing. Las líneas citadas abajo son de 2026-10-14; las de la propuesta, la spec y el diseño son las de hoy.
+
+| Lo de abajo | Hoy |
+|---|---|
+| "Un chunk es una fila. Restaurar no re-trocea nada: es una fila, un texto, un vector" | Sigue siendo una fila, pero un pedazo de un save largo se embebió detrás de la cabecera del save, guardada en `memory_piece.context` (V11, [`specs/pieces`](../../specs/pieces/spec.md)). Restaurarlo tiene que usar ese texto, como el re-embed (`maintenance.rs:635-652`). `read_memory` nombra el pedazo borrado como faltante. |
+| Nueve herramientas MCP (`server.rs:1361`) | Son once (`read_memory` y `search_project` se sumaron): `restore_memory` sería la duodécima (`server.rs:1520`, `handshake.rs:442`). |
+| Conflicto 9: "¿el id purgado se reusa?" | **Resuelto:** `specs/synthesis` R6 ya dice que no se vuelve a usar, por `AUTOINCREMENT`. |
+| Conflicto 5: `superseded` | Sigue, y ahora es real: `resolve_conflict` escribe `superseded` (`dispute.rs:192`). |
+| Scope de filas compartidas | agent-sharing se archivó con "todo compartido": un agente ve lo de otros, pero borrar, cambiar y resolver siguen siendo de su autor (`specs/sharing` R5). Restaurar va con la misma regla. Además, un secreto en una fila restaurada viaja a otros agentes por la búsqueda: es más razón para rechazarlo. |
+| Embedding | El contrato pasó a mean pooling (project-indexing). No cambia nada: el restore embebe con el embedder vigente. |
+| `admin.rs` | `delete_memory_core` está en `admin.rs:300-348`; el listado filtra en `admin.rs:633, 697, 752`; `update_memory` (antes `PATCH` de importancia) contesta 404 a una borrada (`admin.rs:189`). |
+| Backlog: `purge` deja el vínculo de pedazo | No afecta: un id purgado no se restaura. |
 
 ## Qué dice el texto de 2026-10-12 y qué ya no es cierto
 

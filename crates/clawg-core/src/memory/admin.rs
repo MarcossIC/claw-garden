@@ -7,7 +7,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::memory::clock::TimestampMs;
-use crate::memory::dispute::release_challengers;
+use crate::memory::chunker::embedding_text;
+use crate::memory::dispute::{release_challengers, settle_row};
+use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::search::{viewer_match_expression, RankedHit};
 use crate::memory::store_insert::MemoryType;
 use crate::memory::tier::retier;
@@ -348,6 +350,169 @@ pub async fn delete_memory_core(
 }
 
 // ---------------------------------------------------------------------------
+// restore_memory — the way back from `delete_memory`, for `memory` rows: the
+// only table production writes, and the only one with a text index, pieces
+// and a dedup to keep whole.
+// ---------------------------------------------------------------------------
+
+/// Why a row was not restored. Nothing is written in any of these cases.
+#[derive(Debug, thiserror::Error)]
+pub enum RestoreError {
+    #[error("only memory rows can be restored, not {0:?} rows")]
+    OnlyMemory(MemoryKind),
+    /// Missing, live, purged or, with an owner, another agent's: a scoped
+    /// caller learns nothing about ids it does not own.
+    #[error("no deleted memory row with id {0}")]
+    NotFound(i64),
+    #[error("memory #{id} was saved again as #{twin}, which is live; #{id} stays deleted so the text is not stored twice")]
+    LiveTwin { id: i64, twin: i64 },
+    #[error(
+        "memory #{id} holds a secret ({}), so it stays deleted: restored, it would reach searches and other agents. \
+         `clawg purge {id} --yes` removes it for good",
+        .kinds.join(", ")
+    )]
+    HoldsSecret { id: i64, kinds: Vec<&'static str> },
+    #[error("could not embed memory #{0}: {1}")]
+    Embed(i64, #[source] EmbedError),
+    #[error(transparent)]
+    Store(#[from] MemoryError),
+}
+
+/// How a restored row ended up. A `superseded` row is live again but still
+/// replaced: searches leave it out until the dispute is resolved otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RestoredRow {
+    pub id: i64,
+    pub status: String,
+    pub superseded_by: Option<i64>,
+}
+
+/// The deleted row, scoped like the update read, with the head its vector was
+/// embedded behind when it is a piece of a long save (as `select_reembed_batch`
+/// reads it), so the restored vector is the one the row was saved with.
+const RESTORE_READ: &str = "SELECT m.content, \
+     (SELECT mp.context FROM memory_piece mp WHERE mp.memory_id = m.id AND mp.context <> '' \
+      ORDER BY mp.save_id LIMIT 1) \
+     FROM memory m WHERE m.id = ?1 AND m.deleted_at IS NOT NULL AND (?2 IS NULL OR m.agent_id = ?2)";
+
+/// The live row a save of the same text would reinforce instead of storing
+/// it again (`REINFORCE_LOOKUP_SQL` in `store_insert.rs`).
+const RESTORE_TWIN: &str = "SELECT t.id FROM memory m JOIN memory t \
+     ON t.agent_id IS m.agent_id AND COALESCE(t.project_id, '') = COALESCE(m.project_id, '') \
+     AND t.content_hash = m.content_hash \
+     WHERE m.id = ?1 AND m.content_hash IS NOT NULL AND t.id <> m.id \
+     AND t.deleted_at IS NULL AND t.status IN ('active', 'disputed') \
+     ORDER BY t.created_at ASC LIMIT 1";
+
+const RESTORE_ROW: &str = "UPDATE memory SET deleted_at = NULL, last_modified_at = ?2, \
+     update_count = update_count + 1 WHERE id = ?1 AND deleted_at IS NOT NULL";
+
+/// The row's text index entry, added back in the shape of the insert trigger
+/// of V8. V8 has no trigger for this transition because, when it was written,
+/// nothing undeleted a row; this statement is that missing half, and it runs
+/// only right after `RESTORE_ROW` turned a deleted row live, so every live row
+/// stays indexed exactly once.
+const RESTORE_TEXT_INDEX: &str = "INSERT INTO memory_fts(rowid, content, agent_id, project_id, memory_type) \
+     SELECT id, content, agent_id, project_id, memory_type FROM memory WHERE id = ?1";
+
+/// Brings back the deleted `memory` row `id` with its vector and text index
+/// entry. With `owner`, another agent's row is answered as missing.
+///
+/// The vector is computed before the transaction, from the current embedder;
+/// inside it the row is read again, so a restore or a save that landed in
+/// between is seen. The row's own dispute is settled against what is live
+/// now; the disputes its deletion released stay released.
+pub async fn restore_memory_core(
+    store: &MemoryStore,
+    embedder: &dyn Embedder,
+    kind: MemoryKind,
+    id: i64,
+    owner: Option<&str>,
+) -> Result<RestoredRow, RestoreError> {
+    if kind != MemoryKind::Memory {
+        return Err(RestoreError::OnlyMemory(kind));
+    }
+    let owner = owner.map(str::to_owned);
+    let read_owner = owner.clone();
+    let found = store
+        .conn
+        .call(move |c| {
+            use rusqlite::OptionalExtension;
+            c.query_row(RESTORE_READ, rusqlite::params![id, read_owner], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })
+            .optional()
+        })
+        .await
+        .map_err(backend("restore_memory_core"))?;
+    let Some((content, context)) = found else {
+        return Err(RestoreError::NotFound(id));
+    };
+
+    let kinds: Vec<&'static str> = crate::memory::redact::redact(&content).kinds.iter().map(|k| k.as_str()).collect();
+    if !kinds.is_empty() {
+        return Err(RestoreError::HoldsSecret { id, kinds });
+    }
+
+    let text = embedding_text(context.as_deref().unwrap_or(""), &content);
+    let vector = embedder
+        .embed_with_role(&text, EmbedRole::Passage)
+        .await
+        .map_err(|e| RestoreError::Embed(id, e))?;
+    let unit = crate::memory::vector::to_unit(&vector)
+        .map_err(|e| RestoreError::Embed(id, EmbedError::InferenceFailed(e.to_string())))?;
+    let bytes: Vec<u8> = unit.iter().flat_map(|f| f.to_le_bytes()).collect();
+    let now = TimestampMs::now();
+
+    enum Outcome {
+        Restored(RestoredRow),
+        Gone,
+        Twin(i64),
+    }
+    let outcome = store
+        .conn
+        .call(move |c| {
+            use rusqlite::OptionalExtension;
+            let tx = c.transaction()?;
+            let still_deleted = tx
+                .query_row(RESTORE_READ, rusqlite::params![id, owner], |_| Ok(()))
+                .optional()?
+                .is_some();
+            if !still_deleted {
+                return Ok(Outcome::Gone);
+            }
+            if let Some(twin) = tx.query_row(RESTORE_TWIN, [id], |r| r.get(0)).optional()? {
+                return Ok(Outcome::Twin(twin));
+            }
+            tx.execute(RESTORE_ROW, rusqlite::params![id, now])?;
+            tx.execute(DELETE_VEC_MEMORY, [id])?;
+            tx.execute("INSERT INTO memory_vectors(rowid, embedding) VALUES (?1, ?2)", rusqlite::params![id, bytes])?;
+            tx.execute(RESTORE_TEXT_INDEX, [id])?;
+            settle_row(&tx, id, now)?;
+            let row = tx.query_row("SELECT status, superseded_by FROM memory WHERE id = ?1", [id], |r| {
+                Ok(RestoredRow { id, status: r.get(0)?, superseded_by: r.get(1)? })
+            })?;
+            tx.commit()?;
+            Ok(Outcome::Restored(row))
+        })
+        .await
+        .map_err(backend("restore_memory_core"))?;
+    match outcome {
+        Outcome::Restored(row) => Ok(row),
+        Outcome::Gone => Err(RestoreError::NotFound(id)),
+        Outcome::Twin(twin) => Err(RestoreError::LiveTwin { id, twin }),
+    }
+}
+
+fn backend(context: &'static str) -> impl Fn(tokio_rusqlite::Error) -> MemoryError {
+    move |e| match e {
+        tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
+        tokio_rusqlite::Error::ConnectionClosed => MemoryError::Backend(format!("connection closed during {context}")),
+        other => MemoryError::Backend(other.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // list_memories — one query per physical table. A UNION view over the three
 // would have to flatten them onto one column list, which drops `memory_type`
 // (only `memory` has one) — and filtering by memory type is something this
@@ -431,6 +596,9 @@ pub struct ListParams {
     pub query: Option<String>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+    /// Lists the deleted rows instead of the live ones, the most recently
+    /// deleted first, so a delete can be found and undone.
+    pub deleted: bool,
 }
 
 /// Whether `query` holds anything `ListParams::query` can search for. A query
@@ -450,6 +618,18 @@ struct RowFilter {
     project_id: Option<String>,
     status: Option<String>,
     match_expr: Option<String>,
+    deleted: bool,
+}
+
+impl RowFilter {
+    /// The `WHERE` that picks live or deleted rows, and the order they list in.
+    fn lifecycle(&self) -> (&'static str, &'static str) {
+        if self.deleted {
+            (" WHERE deleted_at IS NOT NULL", " ORDER BY deleted_at DESC, id DESC LIMIT ? OFFSET ?")
+        } else {
+            (" WHERE deleted_at IS NULL", " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?")
+        }
+    }
 }
 
 /// Appends the filters every table understands, then the `memory`-only ones
@@ -495,9 +675,10 @@ fn push_filters(
 
 /// Lists rows from `memory` / `episodic_trajectory` / `procedural_skill`
 /// directly. `kind: None` runs all 3 per-table queries inside the
-/// SAME `conn.call` and merges + sorts (`created_at DESC`) + paginates in
-/// Rust; `kind: Some(_)` pushes `LIMIT`/`OFFSET` down to SQL directly.
-/// `deleted_at IS NULL` is always applied; `status` is only filtered when
+/// SAME `conn.call` and merges + sorts (`created_at DESC`, or `deleted_at
+/// DESC` for deleted rows) + paginates in Rust; `kind: Some(_)` pushes
+/// `LIMIT`/`OFFSET` down to SQL directly. Only live rows are listed unless
+/// `deleted` asks for the deleted ones instead; `status` is only filtered when
 /// asked — `superseded` rows stay visible by default (inspection is an active
 /// inventory with superseded shown, distinct from retrieval's stricter filter).
 pub async fn list_memories_core(
@@ -514,7 +695,9 @@ pub async fn list_memories_core(
         project_id: params.project_id,
         status: params.status,
         match_expr: params.query.as_deref().and_then(viewer_match_expression),
+        deleted: params.deleted,
     };
+    let deleted = params.deleted;
 
     store
         .conn
@@ -543,9 +726,11 @@ pub async fn list_memories_core(
             }
 
             if is_merge {
-                rows.sort_by(|a, b| {
-                    b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id))
-                });
+                if deleted {
+                    rows.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at).then_with(|| b.id.cmp(&a.id)));
+                } else {
+                    rows.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+                }
                 rows = rows
                     .into_iter()
                     .skip(offset as usize)
@@ -630,10 +815,11 @@ fn query_memory_rows(
     limit: i64,
     offset: i64,
 ) -> rusqlite::Result<Vec<MemoryAdminRow>> {
-    let mut sql = format!("{SELECT_MEMORY} WHERE deleted_at IS NULL");
+    let (lifecycle, order) = filter.lifecycle();
+    let mut sql = format!("{SELECT_MEMORY}{lifecycle}");
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
     push_filters(&mut sql, &mut params, filter, true);
-    sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?");
+    sql.push_str(order);
     params.push(rusqlite::types::Value::Integer(limit));
     params.push(rusqlite::types::Value::Integer(offset));
 
@@ -694,10 +880,11 @@ fn query_episodic_rows(
     limit: i64,
     offset: i64,
 ) -> rusqlite::Result<Vec<MemoryAdminRow>> {
-    let mut sql = format!("{SELECT_EPISODIC} WHERE deleted_at IS NULL");
+    let (lifecycle, order) = filter.lifecycle();
+    let mut sql = format!("{SELECT_EPISODIC}{lifecycle}");
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
     push_filters(&mut sql, &mut params, filter, false);
-    sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?");
+    sql.push_str(order);
     params.push(rusqlite::types::Value::Integer(limit));
     params.push(rusqlite::types::Value::Integer(offset));
 
@@ -749,10 +936,11 @@ fn query_procedural_rows(
     limit: i64,
     offset: i64,
 ) -> rusqlite::Result<Vec<MemoryAdminRow>> {
-    let mut sql = format!("{SELECT_PROCEDURAL} WHERE deleted_at IS NULL");
+    let (lifecycle, order) = filter.lifecycle();
+    let mut sql = format!("{SELECT_PROCEDURAL}{lifecycle}");
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
     push_filters(&mut sql, &mut params, filter, false);
-    sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?");
+    sql.push_str(order);
     params.push(rusqlite::types::Value::Integer(limit));
     params.push(rusqlite::types::Value::Integer(offset));
 
@@ -1911,6 +2099,56 @@ mod tests {
             .unwrap();
     }
 
+    async fn mark_deleted(store: &MemoryStore, id: i64, at: i64) {
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE memory SET deleted_at = ?2 WHERE id = ?1", [id, at]))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn deleted_rows_are_listed_only_when_asked() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let live = seed_memory_full(&store, "semantic_fact", 3, "active", false, 1).await;
+        let gone = seed_memory_full(&store, "semantic_fact", 3, "active", false, 2).await;
+        mark_deleted(&store, gone, 50).await;
+        let epi = seed_episodic_row(&store, 3, 5.0).await;
+        delete_memory_core(&store, epi, MemoryKind::Episodic, None).await.unwrap();
+
+        let listed = |rows: Vec<MemoryAdminRow>| rows.iter().map(|r| (r.kind, r.id)).collect::<Vec<_>>();
+        let default = list_memories_core(&store, ListParams::default()).await.unwrap();
+        let deleted = list_memories_core(&store, ListParams { deleted: true, ..Default::default() }).await.unwrap();
+
+        assert_eq!(listed(default), vec![(MemoryKind::Memory, live)]);
+        let deleted = listed(deleted);
+        assert_eq!(deleted.len(), 2, "{deleted:?}");
+        assert!(deleted.contains(&(MemoryKind::Memory, gone)) && deleted.contains(&(MemoryKind::Episodic, epi)));
+    }
+
+    #[tokio::test]
+    async fn deleted_rows_list_newest_deletion_first() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let old_save = seed_memory_full(&store, "semantic_fact", 3, "active", false, 1).await;
+        let new_save = seed_memory_full(&store, "semantic_fact", 3, "active", false, 2).await;
+        let middle = seed_memory_full(&store, "user_preference", 1, "active", false, 3).await;
+        mark_deleted(&store, new_save, 10).await;
+        mark_deleted(&store, middle, 20).await;
+        mark_deleted(&store, old_save, 30).await;
+
+        let rows = list_memories_core(&store, ListParams { deleted: true, ..Default::default() }).await.unwrap();
+        let only_memory = list_memories_core(
+            &store,
+            ListParams { deleted: true, kind: Some(MemoryKind::Memory), memory_type: Some("semantic_fact".into()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), vec![old_save, middle, new_save]);
+        assert_eq!(rows[0].deleted_at, Some(30));
+        assert_eq!(only_memory.iter().map(|r| r.id).collect::<Vec<_>>(), vec![old_save, new_save]);
+    }
+
     #[tokio::test]
     async fn the_listing_names_the_sources_of_a_conclusion() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -2691,5 +2929,428 @@ mod tests {
             access_count, 0,
             "format_skill_hits must never write to AccessTracker/DB; access_count must stay 0"
         );
+    }
+
+    // ── restore_memory_core ──────────────────────────────────────────────────
+
+    use crate::memory::embedder::{EmbedError, EmbedRole, Embedder, FakeEmbedder};
+
+    struct BrokenEmbedder;
+
+    #[async_trait::async_trait]
+    impl Embedder for BrokenEmbedder {
+        async fn embed_with_role(&self, _: &str, _: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+            Err(EmbedError::NotReady)
+        }
+        fn dimensions(&self) -> usize {
+            384
+        }
+        fn model_id(&self) -> &str {
+            "broken"
+        }
+        fn query_prefix(&self) -> &str {
+            ""
+        }
+        fn passage_prefix(&self) -> &str {
+            ""
+        }
+    }
+
+    async fn passage(text: &str) -> Vec<f32> {
+        FakeEmbedder::default().embed_with_role(text, EmbedRole::Passage).await.unwrap()
+    }
+
+    /// A live row as a save leaves it: hash, vector and text index entry.
+    async fn save(store: &MemoryStore, agent: &str, content: &str) -> i64 {
+        let unit = crate::memory::vector::to_unit(&passage(content).await).unwrap();
+        let bytes: Vec<u8> = unit.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let hash = crate::memory::dedup::content_hash(content);
+        let (agent, content) = (agent.to_owned(), content.to_owned());
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<i64> {
+                let tx = c.transaction()?;
+                tx.execute(
+                    "INSERT INTO memory (scope, agent_id, project_id, content, content_hash, memory_type, \
+                     source, created_at, created_by_type, created_by_ref, last_modified_at, \
+                     last_accessed_at, importance, tier, status) \
+                     VALUES ('agent', ?1, 'p', ?2, ?3, 'semantic_fact', 'explicit', 1, 'user', ?1, 1, 1, \
+                     5.0, 3, 'active')",
+                    rusqlite::params![agent, content, hash],
+                )?;
+                let id = tx.last_insert_rowid();
+                tx.execute("INSERT INTO memory_vectors(rowid, embedding) VALUES (?1, ?2)", rusqlite::params![id, bytes])?;
+                tx.commit()?;
+                Ok(id)
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn restore(store: &MemoryStore, id: i64, owner: Option<&str>) -> Result<RestoredRow, RestoreError> {
+        restore_memory_core(store, &FakeEmbedder::default(), MemoryKind::Memory, id, owner).await
+    }
+
+    async fn stored_vector(store: &MemoryStore, id: i64) -> Option<Vec<f32>> {
+        store
+            .conn
+            .call(move |c| {
+                use rusqlite::OptionalExtension;
+                c.query_row("SELECT embedding FROM memory_vectors WHERE rowid = ?1", [id], |r| r.get::<_, Vec<u8>>(0))
+                    .optional()
+            })
+            .await
+            .unwrap()
+            .map(|b| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+    }
+
+    async fn text_matches(store: &MemoryStore, word: &str) -> Vec<i64> {
+        let word = word.to_owned();
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<Vec<i64>> {
+                let mut stmt = c.prepare("SELECT rowid FROM memory_fts WHERE memory_fts MATCH ?1 ORDER BY rowid")?;
+                let rows = stmt.query_map([word], |r| r.get(0))?;
+                rows.collect()
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Whether the text index holds exactly the postings of the live rows: a
+    /// live row the index lacks, or a subtraction of postings that were not
+    /// there, shows up as a difference against an index rebuilt from scratch.
+    /// FTS5's own check against the content table cannot say this, because
+    /// that table keeps its deleted rows.
+    async fn text_index_is_whole(store: &MemoryStore) -> bool {
+        store
+            .conn
+            .call(|c| -> rusqlite::Result<bool> {
+                c.execute_batch(
+                    "DROP TABLE IF EXISTS temp.expected_fts; DROP TABLE IF EXISTS temp.got_terms; \
+                     DROP TABLE IF EXISTS temp.expected_terms; \
+                     CREATE VIRTUAL TABLE temp.expected_fts USING fts5(content, tokenize='unicode61 remove_diacritics 2'); \
+                     INSERT INTO temp.expected_fts(rowid, content) SELECT id, content FROM memory WHERE deleted_at IS NULL; \
+                     CREATE VIRTUAL TABLE temp.got_terms USING fts5vocab(main, memory_fts, instance); \
+                     CREATE VIRTUAL TABLE temp.expected_terms USING fts5vocab(temp, expected_fts, instance);",
+                )?;
+                c.execute("INSERT INTO memory_fts(memory_fts) VALUES('integrity-check')", [])?;
+                let differences: i64 = c.query_row(
+                    "WITH got AS (SELECT term, doc, offset, COUNT(*) n FROM temp.got_terms \
+                                  WHERE col = 'content' GROUP BY term, doc, offset), \
+                          expected AS (SELECT term, doc, offset, COUNT(*) n FROM temp.expected_terms \
+                                       GROUP BY term, doc, offset) \
+                     SELECT (SELECT COUNT(*) FROM (SELECT * FROM got EXCEPT SELECT * FROM expected)) \
+                          + (SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT SELECT * FROM got))",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok(differences == 0)
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn columns(store: &MemoryStore, id: i64) -> (Option<i64>, String, i64, i64, i64, i64) {
+        store
+            .conn
+            .call(move |c| {
+                c.query_row(
+                    "SELECT deleted_at, status, update_count, access_count, last_accessed_at, tier \
+                     FROM memory WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                )
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn delete(store: &MemoryStore, id: i64) {
+        assert_eq!(delete_memory_core(store, id, MemoryKind::Memory, None).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_restored_row_is_found_again() {
+        use crate::memory::search::{search_all_memories, SearchScope};
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let content = "the build cache lives on the zircon volume";
+        let id = save(&store, "a", content).await;
+        delete(&store, id).await;
+
+        let row = restore(&store, id, Some("a")).await.unwrap();
+
+        assert_eq!(row, RestoredRow { id, status: "active".into(), superseded_by: None });
+        let query = passage(content).await;
+        let hits = search_all_memories(&store, &query, None, "a", SearchScope::all_default(), 10).await.unwrap();
+        assert!(hits.iter().any(|h| h.id == id), "the vector search finds it again");
+        assert_eq!(text_matches(&store, "zircon").await, vec![id], "the text index finds it again");
+        let (deleted_at, _, update_count, ..) = columns(&store, id).await;
+        assert_eq!((deleted_at, update_count), (None, 1));
+    }
+
+    #[tokio::test]
+    async fn delete_restore_delete_keeps_the_text_index_whole() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let id = save(&store, "a", "zircon holds the cache").await;
+        let other = save(&store, "a", "zircon also names a mineral").await;
+
+        delete(&store, id).await;
+        restore(&store, id, None).await.unwrap();
+        assert!(text_index_is_whole(&store).await);
+        delete(&store, id).await;
+
+        assert!(text_index_is_whole(&store).await);
+        assert_eq!(text_matches(&store, "zircon").await, vec![other]);
+        assert_eq!(text_matches(&store, "cache").await, Vec::<i64>::new());
+    }
+
+    #[tokio::test]
+    async fn restoring_needs_a_deleted_row_of_the_owner() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let live = save(&store, "a", "a live row").await;
+        let theirs = save(&store, "b", "another agent's row").await;
+        delete(&store, theirs).await;
+        let before = columns(&store, theirs).await;
+
+        for (id, owner) in [(live, Some("a")), (theirs, Some("a")), (999_999, None), (live, None)] {
+            let err = restore(&store, id, owner).await.unwrap_err();
+            assert!(matches!(err, RestoreError::NotFound(n) if n == id), "{id}: {err:?}");
+        }
+        assert_eq!(columns(&store, theirs).await, before, "another agent's row is untouched");
+        assert_eq!(stored_vector(&store, theirs).await, None);
+        assert!(text_index_is_whole(&store).await);
+    }
+
+    #[tokio::test]
+    async fn only_memory_rows_are_restored() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let epi = seed_episodic_row_with_vector(&store).await;
+        delete_memory_core(&store, epi, MemoryKind::Episodic, None).await.unwrap();
+
+        let err = restore_memory_core(&store, &FakeEmbedder::default(), MemoryKind::Episodic, epi, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, RestoreError::OnlyMemory(MemoryKind::Episodic)), "{err:?}");
+        assert!(episodic_deleted_at(&store, epi).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_live_twin_blocks_the_restore() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let first = save(&store, "a", "deploys go out on fridays").await;
+        delete(&store, first).await;
+        let twin = save(&store, "a", "deploys go out on fridays").await;
+
+        let err = restore(&store, first, Some("a")).await.unwrap_err();
+
+        assert!(matches!(err, RestoreError::LiveTwin { id, twin: t } if id == first && t == twin), "{err:?}");
+        assert!(err.to_string().contains(&format!("#{twin}")), "{err}");
+        assert!(columns(&store, first).await.0.is_some(), "the row stays deleted");
+        assert_eq!(stored_vector(&store, first).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_row_holding_a_secret_stays_deleted() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let id = save(&store, "a", "the key is sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123").await;
+        delete(&store, id).await;
+
+        let err = restore(&store, id, Some("a")).await.unwrap_err();
+
+        assert!(matches!(&err, RestoreError::HoldsSecret { kinds, .. } if kinds == &["anthropic_key"]), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains("anthropic_key") && message.contains("clawg purge"), "{message}");
+        assert!(!message.contains("sk-ant"), "the message never carries the secret: {message}");
+        assert!(columns(&store, id).await.0.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_failed_embedding_restores_nothing() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let id = save(&store, "a", "a fact the embedder cannot reach").await;
+        delete(&store, id).await;
+        let before = columns(&store, id).await;
+
+        let err = restore_memory_core(&store, &BrokenEmbedder, MemoryKind::Memory, id, None).await.unwrap_err();
+
+        assert!(matches!(err, RestoreError::Embed(_, EmbedError::NotReady)), "{err:?}");
+        assert_eq!(columns(&store, id).await, before);
+        assert_eq!(stored_vector(&store, id).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_stale_vector_does_not_stop_a_restore() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let content = "a row deleted before deletes pruned vectors";
+        let id = save(&store, "a", content).await;
+        // Marked by hand, as the delete of an older version did: the vector
+        // stays, and it is one an earlier model wrote.
+        let earlier_model: Vec<u8> = crate::memory::vector::to_unit(&[0.3; 384])
+            .unwrap()
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        store
+            .conn
+            .call(move |c| {
+                c.execute("UPDATE memory_vectors SET embedding = ?2 WHERE rowid = ?1", rusqlite::params![id, earlier_model])?;
+                c.execute("UPDATE memory SET deleted_at = 1 WHERE id = ?1", [id])
+            })
+            .await
+            .unwrap();
+
+        restore(&store, id, None).await.unwrap();
+
+        let expected = crate::memory::vector::to_unit(&passage(content).await).unwrap();
+        assert_eq!(stored_vector(&store, id).await, Some(expected), "embedded by the current model, never kept");
+    }
+
+    #[tokio::test]
+    async fn a_restored_row_settles_its_own_dispute() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let old = save(&store, "a", "the api listens on 8080").await;
+        let other = save(&store, "a", "the api listens on 9090").await;
+        let new = save(&store, "a", "the api listens on 7070").await;
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE memory SET status = 'disputed', disputed_against = ?2 WHERE id = ?1",
+                    rusqlite::params![new, format!("[{old}]")],
+                )?;
+                c.execute(
+                    "UPDATE memory SET status = 'disputed', disputed_against = ?2 WHERE id = ?1",
+                    rusqlite::params![other, format!("[{old},{new}]")],
+                )
+            })
+            .await
+            .unwrap();
+        delete(&store, new).await;
+        delete(&store, old).await;
+        assert_eq!(memory_status(&store, other).await, "active", "both deletes released it");
+
+        let row = restore(&store, new, None).await.unwrap();
+
+        assert_eq!(row.status, "active", "the row it disputed is still deleted");
+        assert_eq!(memory_status(&store, other).await, "active", "released disputes stay released");
+    }
+
+    #[tokio::test]
+    async fn restoring_leaves_the_rest_of_the_row_alone() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let keep = save(&store, "a", "the newer claim").await;
+        let id = save(&store, "a", "an older claim").await;
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE memory SET status = 'superseded', superseded_by = ?2, tier = 2, \
+                     importance = 7.5, access_count = 4, last_accessed_at = 33 WHERE id = ?1",
+                    [id, keep],
+                )
+            })
+            .await
+            .unwrap();
+        delete(&store, id).await;
+
+        let row = restore(&store, id, None).await.unwrap();
+
+        assert_eq!(row, RestoredRow { id, status: "superseded".into(), superseded_by: Some(keep) });
+        let (deleted_at, status, update_count, access_count, last_accessed_at, tier) = columns(&store, id).await;
+        assert_eq!(
+            (deleted_at, status.as_str(), update_count, access_count, last_accessed_at, tier),
+            (None, "superseded", 1, 4, 33, 2)
+        );
+        assert_eq!(memory_tier_importance(&store, id).await, (2, 7.5));
+        assert_eq!(columns(&store, keep).await.2, 0, "no other row is written");
+    }
+
+    async fn link_save(store: &MemoryStore, pieces: Vec<(i64, &str)>) {
+        use crate::memory::pieces::StoredPiece;
+        let pieces = pieces
+            .into_iter()
+            .map(|(memory_id, context)| StoredPiece { memory_id, context: context.to_owned() })
+            .collect();
+        store.link_pieces(pieces).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_restored_piece_is_embedded_behind_its_head_again() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let first = save(&store, "a", "Notes on clawg-ledger. The first piece of a long save").await;
+        let second = save(&store, "a", "the second piece of a long save").await;
+        let third = save(&store, "a", "the third piece of a long save").await;
+        link_save(&store, vec![(first, ""), (second, "Notes on clawg-ledger."), (third, "Notes on clawg-ledger.")]).await;
+        delete(&store, second).await;
+        let gap = crate::memory::read_save_core(&store, MemoryKind::Memory, first, None).await.unwrap().unwrap();
+        assert_eq!(gap.missing, vec![2]);
+
+        restore(&store, second, Some("a")).await.unwrap();
+
+        let behind = crate::memory::chunker::embedding_text("Notes on clawg-ledger.", "the second piece of a long save");
+        let expected = crate::memory::vector::to_unit(&passage(&behind).await).unwrap();
+        assert_eq!(stored_vector(&store, second).await, Some(expected));
+        let whole = crate::memory::read_save_core(&store, MemoryKind::Memory, first, None).await.unwrap().unwrap();
+        assert!(whole.missing.is_empty(), "{whole:?}");
+        assert_eq!(whole.ids, vec![Some(first), Some(second), Some(third)]);
+    }
+
+    /// Seeds a row the way the previous version leaves a deleted one: the
+    /// insert indexes it, the delete's trigger subtracts it again, and the
+    /// delete prunes its vector. Raw SQL only, so nothing of this version's
+    /// code shapes it.
+    async fn seed_deleted_by_previous_version(store: &MemoryStore, content: &str, vector: &[f32]) -> i64 {
+        let bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let hash = crate::memory::dedup::content_hash(content);
+        let content = content.to_owned();
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<i64> {
+                c.execute(
+                    "INSERT INTO memory (scope, agent_id, project_id, content, content_hash, memory_type, \
+                     source, created_at, created_by_type, created_by_ref, last_modified_at, \
+                     last_accessed_at, importance, tier, status) \
+                     VALUES ('agent', 'a', 'p', ?1, ?2, 'semantic_fact', 'explicit', 1, 'user', 'a', 1, 1, \
+                     5.0, 3, 'active')",
+                    rusqlite::params![content, hash],
+                )?;
+                let id = c.last_insert_rowid();
+                c.execute("INSERT INTO memory_vectors(rowid, embedding) VALUES (?1, ?2)", rusqlite::params![id, bytes])?;
+                c.execute("UPDATE memory SET deleted_at = 5 WHERE id = ?1", [id])?;
+                c.execute("DELETE FROM memory_vectors WHERE rowid = ?1", [id])?;
+                Ok(id)
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rows_deleted_by_the_previous_version_can_be_restored() {
+        use crate::memory::search::{search_all_memories, SearchScope};
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let alone = "the release notes live in the obsidian vault";
+        let head = "Notes on clawg-ledger. The first piece";
+        let piece = "the second piece mentions the quartz bucket";
+        let alone_id = seed_deleted_by_previous_version(&store, alone, &passage(alone).await).await;
+        let head_id = save(&store, "a", head).await;
+        let behind = crate::memory::chunker::embedding_text("Notes on clawg-ledger.", piece).into_owned();
+        let piece_id = seed_deleted_by_previous_version(&store, piece, &passage(&behind).await).await;
+        link_save(&store, vec![(head_id, ""), (piece_id, "Notes on clawg-ledger.")]).await;
+        assert!(text_matches(&store, "obsidian").await.is_empty());
+
+        restore(&store, alone_id, Some("a")).await.unwrap();
+        restore(&store, piece_id, Some("a")).await.unwrap();
+
+        assert_eq!(text_matches(&store, "obsidian").await, vec![alone_id]);
+        assert_eq!(text_matches(&store, "quartz").await, vec![piece_id]);
+        assert!(text_index_is_whole(&store).await);
+        for (id, text) in [(alone_id, alone.to_owned()), (piece_id, behind)] {
+            let hits = search_all_memories(&store, &passage(&text).await, None, "a", SearchScope::all_default(), 10)
+                .await
+                .unwrap();
+            assert!(hits.iter().any(|h| h.id == id), "{id} is reachable by its vector");
+        }
     }
 }

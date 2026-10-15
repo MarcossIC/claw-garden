@@ -17,7 +17,7 @@ use clawg_core::memory::sharing::{Reach, SharingError, SharingPolicy};
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
 
-use crate::client::{Context, Health, Hit, MemoryRow, SavedText, Synthesis, Updated};
+use crate::client::{Context, Health, Hit, MemoryRow, Restored, SavedText, Synthesis, Updated};
 use crate::daemon::api::DocsSearchBody;
 use crate::relevance::{relevant_len, RELEVANCE_RATIO};
 
@@ -142,6 +142,19 @@ pub fn format_update(u: &Updated) -> String {
         None => format!("importance {:.1}", u.importance),
     };
     format!("updated #{} {}: {fields}, tier {}", u.id, u.kind, u.tier)
+}
+
+/// What `restore_memory` tells the model. A row that was superseded before it
+/// was deleted comes back superseded, and searching for it would find nothing.
+pub fn format_restore(r: &Restored) -> String {
+    match r.superseded_by {
+        Some(by) if r.status == "superseded" => format!(
+            "restored #{}; it is still superseded by #{by}, so searches leave it out until \
+             resolve_conflict keeps it",
+            r.id
+        ),
+        _ => format!("restored #{}", r.id),
+    }
 }
 
 /// Renders inventory rows as a compact one-line-per-row table.
@@ -558,6 +571,18 @@ mod tests {
         assert_eq!(format_update(&memory), "updated #12 memory: user_preference, importance 8.0, tier 1");
         let skill = Updated { kind: "procedural".into(), id: 3, importance: 2.0, memory_type: None, tier: 1 };
         assert_eq!(format_update(&skill), "updated #3 procedural: importance 2.0, tier 1");
+    }
+
+    #[test]
+    fn format_restore_says_when_the_row_is_still_superseded() {
+        let active = Restored { id: 12, status: "active".into(), superseded_by: None };
+        assert_eq!(format_restore(&active), "restored #12");
+        let replaced = Restored { id: 12, status: "superseded".into(), superseded_by: Some(15) };
+        assert_eq!(
+            format_restore(&replaced),
+            "restored #12; it is still superseded by #15, so searches leave it out until \
+             resolve_conflict keeps it"
+        );
     }
 
     #[test]

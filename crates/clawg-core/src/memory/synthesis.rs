@@ -310,6 +310,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_restored_conclusion_covers_its_sources_again() {
+        use crate::memory::admin::restore_memory_core;
+        use crate::memory::embedder::FakeEmbedder;
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let a = seed(&store, Some("p"), "tabs in go", 1).await;
+        let b = seed(&store, Some("p"), "tabs in rust", 2).await;
+        let c = conclude(&store, Some("p"), &[a, b], 3).await;
+        let lone = seed(&store, Some("p"), "the deploy runs on fridays", 4).await;
+        delete_memory_core(&store, c, MemoryKind::Memory, None).await.unwrap();
+        delete_memory_core(&store, a, MemoryKind::Memory, None).await.unwrap();
+        delete_memory_core(&store, lone, MemoryKind::Memory, None).await.unwrap();
+
+        for id in [c, a, lone] {
+            restore_memory_core(&store, &FakeEmbedder::default(), MemoryKind::Memory, id, None).await.unwrap();
+        }
+        let found = synthesis_core(&store, in_project("p"), TimestampMs::from_unix_millis(10)).await.unwrap();
+
+        assert_eq!(ids(&found.conclusions), vec![c]);
+        assert_eq!(found.conclusions[0].derived_from, Some(vec![a, b]));
+        assert_eq!(ids(&found.pending), vec![lone], "the restored source is covered, the lone one is pending");
+    }
+
+    #[tokio::test]
     async fn synthesis_stays_in_its_project() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let mine = seed(&store, Some("p"), "mine", 1).await;
