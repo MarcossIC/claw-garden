@@ -1,10 +1,12 @@
-//! An index of each registered project's documentation: its Markdown files and
-//! manifests, split by heading, embedded and searchable by meaning and by term.
+//! An index of each registered project's documentation and code: its Markdown
+//! files and manifests split by heading, its source split along its syntax
+//! tree, embedded and searchable by meaning and by term.
 //!
 //! Derived from the files on disk and rebuilt from them at will. Nothing here
 //! reads or writes a memory.
 
 pub mod chunk;
+pub mod code;
 pub mod corpus;
 
 use std::collections::{HashMap, HashSet};
@@ -21,6 +23,7 @@ use crate::memory::vector::to_unit;
 use crate::memory::MemoryStore;
 
 use chunk::{chunk_manifest, chunk_markdown, Passage};
+use code::chunk_code;
 use corpus::{CorpusError, DocFile, DocKind};
 
 /// How old the last refresh of a project may be before a search refreshes it
@@ -376,6 +379,7 @@ pub(crate) async fn refresh(
         let passages = match kind {
             DocKind::Markdown => chunk_markdown(path, &masked, splitter),
             DocKind::Manifest => chunk_manifest(path, &masked, splitter),
+            DocKind::Code(lang) => chunk_code(path, &masked, lang, splitter),
         };
         let vectors = embed_passages(embedder, path, &passages).await?;
         report.passages += passages.len();
@@ -935,6 +939,24 @@ mod tests {
 
         assert_eq!(crumbs(&dense_only).last(), Some(&"chunker.md > Cap"), "by meaning it is the farthest");
         assert_eq!(crumbs(&hits)[0], "chunker.md > Cap");
+    }
+
+    #[tokio::test]
+    async fn a_refresh_indexes_code_by_definition() {
+        let (_dir, store) = indexed(&[
+            ("README.md", "# Readme\nhello\n"),
+            ("src/profile.rs", "/// Reads the profile flag.\npub fn parse_profile(raw: &str) -> Option<Profile> {\n    raw.parse().ok()\n}\n"),
+            ("src/notes.txt", "parse_profile is not code here"),
+        ])
+        .await;
+
+        let rows = passages(&store, "p").await;
+        let hits = search(&store, &Topical, "p", "parse_profile", 5).await.unwrap();
+
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[1].1, "src/profile.rs");
+        assert!(rows[1].2.starts_with("/// Reads the profile flag.\npub fn parse_profile"), "{}", rows[1].2);
+        assert_eq!(hits[0].path, "src/profile.rs");
     }
 
     #[tokio::test]

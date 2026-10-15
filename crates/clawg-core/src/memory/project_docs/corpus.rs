@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 
 use sha2::Digest;
 
+use super::code::CodeLang;
+
 /// A file larger than this is skipped: past it a "doc" is generated output or
 /// a data dump, and its passages would crowd out the prose around them.
 pub const MAX_DOC_BYTES: u64 = 256 * 1024;
@@ -20,10 +22,11 @@ const MANIFESTS: &[&str] = &["Cargo.toml", "package.json", "pyproject.toml", "go
 pub enum DocKind {
     Markdown,
     Manifest,
+    Code(CodeLang),
 }
 
 /// Whether the file at `rel_path` (relative to the project root, `/`-separated)
-/// is documentation, and of which kind.
+/// is indexed, and as which kind.
 pub fn classify(rel_path: &str) -> Option<DocKind> {
     let name = rel_path.rsplit('/').next()?;
     if MANIFESTS.contains(&name) {
@@ -32,7 +35,7 @@ pub fn classify(rel_path: &str) -> Option<DocKind> {
     let (_, ext) = name.rsplit_once('.')?;
     match ext.to_ascii_lowercase().as_str() {
         "md" | "mdx" | "markdown" => Some(DocKind::Markdown),
-        _ => None,
+        _ => CodeLang::from_extension(ext).map(DocKind::Code),
     }
 }
 
@@ -146,8 +149,17 @@ mod tests {
     }
 
     #[test]
+    fn classify_takes_code_by_extension() {
+        assert_eq!(classify("src/main.rs"), Some(DocKind::Code(CodeLang::Rust)));
+        assert_eq!(classify("app/models.PY"), Some(DocKind::Code(CodeLang::Python)));
+        assert_eq!(classify("web/api.ts"), Some(DocKind::Code(CodeLang::TypeScript)));
+        assert_eq!(classify("web/App.tsx"), Some(DocKind::Code(CodeLang::Tsx)));
+        assert_eq!(classify("web/app.js"), None);
+    }
+
+    #[test]
     fn classify_leaves_out_everything_else() {
-        assert_eq!(classify("src/main.rs"), None);
+        assert_eq!(classify("src/main.c"), None);
         assert_eq!(classify("README"), None);
         assert_eq!(classify("docs/md"), None);
         assert_eq!(classify("image.md.png"), None);
@@ -179,7 +191,7 @@ mod tests {
 
         let walk = walk(root).unwrap();
 
-        assert_eq!(paths(&walk), [".claude/CLAUDE.md", "README.md", "crates/a/Cargo.toml", "docs/guia.MD"]);
+        assert_eq!(paths(&walk), [".claude/CLAUDE.md", "README.md", "crates/a/Cargo.toml", "docs/guia.MD", "src/main.rs"]);
         assert_eq!(walk.docs[2].kind, DocKind::Manifest);
         assert_eq!(walk.skipped, 0);
     }

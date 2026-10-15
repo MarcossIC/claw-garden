@@ -46,7 +46,7 @@ fn docs_mode_runs_end_to_end_with_the_fake_embedder() {
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "stdout: {stdout}\nstderr: {}", String::from_utf8_lossy(&out.stderr));
-    assert!(stdout.starts_with("indexed 3 docs into 4 passages (0 skipped)"), "{stdout}");
+    assert!(stdout.starts_with("indexed 4 docs into 5 passages (0 skipped)"), "{stdout}");
     assert!(stdout.contains("Hit@1 1.00  Hit@3 1.00  Hit@5 1.00  MRR@10 1.00  over 2 questions"), "{stdout}");
 }
 

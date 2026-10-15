@@ -101,8 +101,14 @@ fn closes_fence(line: &str, ch: char, len: usize) -> bool {
 }
 
 fn breadcrumb(path: &str, headings: &[(usize, String)]) -> String {
+    let titles: Vec<String> = headings.iter().map(|(_, t)| t.clone()).collect();
+    breadcrumb_of(path, &titles)
+}
+
+/// `path` followed by the non-empty `labels`, joined with ` > ` and capped.
+pub(super) fn breadcrumb_of(path: &str, labels: &[String]) -> String {
     let mut parts = vec![path];
-    parts.extend(headings.iter().map(|(_, t)| t.as_str()).filter(|t| !t.is_empty()));
+    parts.extend(labels.iter().map(String::as_str).filter(|t| !t.is_empty()));
     cap_breadcrumb(parts.join(" > "))
 }
 
@@ -118,7 +124,7 @@ fn cap_breadcrumb(crumb: String) -> String {
     format!("{ellipsis}{}", &crumb[start..])
 }
 
-fn emit(out: &mut Vec<Passage>, breadcrumb: &str, body: &str, splitter: &TokenSplitter) {
+pub(super) fn emit(out: &mut Vec<Passage>, breadcrumb: &str, body: &str, splitter: &TokenSplitter) {
     let body = body.trim();
     if body.is_empty() {
         return;
