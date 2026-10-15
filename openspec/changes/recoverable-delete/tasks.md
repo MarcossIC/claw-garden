@@ -45,7 +45,7 @@ Cada tarea es un commit atómico: primero el test que falla, después el código
 
 ## Verify
 
-- [ ] `cargo test --workspace` en Linux en cada commit, contra la base: sin fallas nuevas.
+- [x] `cargo test --workspace` en Linux en cada commit, contra la base: sin fallas nuevas ([`verify.md`](verify.md#linux)).
 - [ ] `cargo test --workspace --target-dir <otro-dir>` en Windows (máquina de Marcos).
 - [ ] `rag-eval --real --diff` contra el baseline: se espera diff vacío (máquina de Marcos).
 - [ ] Prueba manual con el perfil dev: borrar y restaurar desde Claude Code, listar con `clawg memories list --deleted`, restaurar con `clawg undelete`, intentar restaurar una de otro agente.
