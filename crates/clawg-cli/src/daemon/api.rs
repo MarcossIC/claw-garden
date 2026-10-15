@@ -28,7 +28,7 @@ use axum::{Json, Router};
 use clawg_core::memory::admin::{
     delete_memory_core, get_memory_core, list_memories_core, memory_stats_core, query_has_tokens,
     update_memory_core, ListParams, MemoryAdminRow, MemoryKind, MemoryPatch, MemoryStats, StatsParams,
-    UpdatedRow,
+    UpdatedRow, restore_memory_core, RestoreError, RestoredRow,
 };
 use clawg_core::memory::backup::Reason;
 use clawg_core::memory::bootstrap::EmbedderStatus;
@@ -209,6 +209,13 @@ pub fn list_params_from_query(q: ListQuery) -> ApiResult<ListParams> {
         }
     }
 
+    let deleted = q.deleted.unwrap_or(false);
+    if deleted && q.q.is_some() {
+        return Err(ApiError::bad_request(
+            "q cannot search deleted rows: deleting a memory takes it out of the text index",
+        ));
+    }
+
     if let Some(text) = q.q.as_deref() {
         // Only `memory` has a text index; another kind would silently ignore
         // the query and list every row.
@@ -238,7 +245,7 @@ pub fn list_params_from_query(q: ListQuery) -> ApiResult<ListParams> {
         query: q.q,
         limit: q.limit,
         offset: q.offset,
-        deleted: false,
+        deleted,
     })
 }
 
@@ -370,6 +377,9 @@ pub struct ListQuery {
     pub limit: Option<u32>,
     #[serde(default)]
     pub offset: Option<u32>,
+    /// `true` lists the deleted rows instead of the live ones.
+    #[serde(default)]
+    pub deleted: Option<bool>,
 }
 
 /// Strict for the same reason as [`ListQuery`]: a misspelt filter would answer
@@ -519,6 +529,13 @@ pub struct DeletedBody {
     pub deleted: usize,
 }
 
+#[derive(Debug, Serialize)]
+pub struct RestoredBody {
+    pub restored: usize,
+    #[serde(flatten)]
+    pub row: RestoredRow,
+}
+
 /// Closes the dispute between two `memory` rows. Disputes only ever pair
 /// `memory` rows, so there is no `kind`.
 #[derive(Debug, Deserialize)]
@@ -546,6 +563,7 @@ pub fn router(app: Arc<AppCtx>) -> Router {
             get(get_memory).patch(update_memory).delete(delete_memory),
         )
         .route("/memories/{kind}/{id}/save", get(get_save))
+        .route("/memories/{kind}/{id}/restore", post(restore_memory))
         .route("/disputes/resolve", post(resolve_dispute))
         .route("/synthesis", post(synthesis))
         .route("/stats", get(stats))
@@ -966,6 +984,30 @@ async fn delete_memory(
         return Err(ApiError::not_found(format!("no {kind:?} row with id {id}")));
     }
     Ok(Json(DeletedBody { deleted }))
+}
+
+/// Brings back a deleted `memory` row, scoped like `DELETE`. The kind is
+/// checked before the embedder, so a request that could never succeed says so
+/// even while the model loads.
+async fn restore_memory(
+    State(app): State<Arc<AppCtx>>,
+    Path((kind, id)): Path<(String, i64)>,
+    Query(owner): Query<OwnerQuery>,
+) -> ApiResult<Json<RestoredBody>> {
+    let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
+    if kind != MemoryKind::Memory {
+        return Err(ApiError::bad_request(RestoreError::OnlyMemory(kind).to_string()));
+    }
+    let embedder = ready_embedder(&app)?;
+    match restore_memory_core(&app.runtime.store, embedder.as_ref(), kind, id, owner.agent.as_deref()).await {
+        Ok(row) => Ok(Json(RestoredBody { restored: 1, row })),
+        Err(e @ RestoreError::OnlyMemory(_)) => Err(ApiError::bad_request(e.to_string())),
+        Err(RestoreError::NotFound(_)) => Err(ApiError::not_found(format!("no deleted {kind:?} row with id {id}"))),
+        Err(e @ (RestoreError::LiveTwin { .. } | RestoreError::HoldsSecret { .. })) => {
+            Err(ApiError::conflict(e.to_string()))
+        }
+        Err(e) => Err(ApiError::internal(e)),
+    }
 }
 
 async fn resolve_dispute(
@@ -1404,6 +1446,20 @@ mod tests {
             .expect_err("invalid");
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert!(err.message.contains("bogus"), "{}", err.message);
+    }
+
+    #[test]
+    fn deleted_listing_refuses_a_text_query() {
+        let err = list_params_from_query(query(|q| {
+            q.deleted = Some(true);
+            q.q = Some("deploy".into());
+        }))
+        .expect_err("deleted rows have no text index");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("deleted"), "{}", err.message);
+
+        assert!(list_params_from_query(query(|q| q.deleted = Some(true))).expect("valid").deleted);
+        assert!(!list_params_from_query(query(|_| {})).expect("valid").deleted);
     }
 
     #[test]
