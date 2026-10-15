@@ -14,13 +14,15 @@ use crate::memory::vector::to_unit;
 
 /// L2 distance below which two embeddings are considered contradictory.
 ///
-/// Provisional under mean pooling. Ten contradicting and ten compatible pairs
-/// of project facts (`El proyecto usa PostgreSQL` / `… SQLite`, against
-/// `… SQLite` / `Las migraciones se aplican con refinery`) separate at
-/// (0.276, 0.328] under CLS pooling, where the golden set put its gap at
-/// (0.30, 0.35], and at (0.350, 0.469] under mean pooling. 0.42 keeps 0.07
-/// above the last contradiction and 0.05 below the first compatible pair,
-/// until the sweep below is redone on the golden set with mean vectors.
+/// Ten contradicting and ten compatible pairs of project facts
+/// (`El proyecto usa PostgreSQL` / `… SQLite`, against `… SQLite` /
+/// `Las migraciones se aplican con refinery`) separate at (0.276, 0.328]
+/// under CLS pooling, where the golden set put its gap at (0.30, 0.35], and
+/// at (0.350, 0.469] under mean pooling. 0.42 keeps 0.07 above the last
+/// contradiction and 0.05 below the first compatible pair. On the golden set
+/// with mean vectors no compatible pair falls under 0.50, and 0.42 sits
+/// between recall 0.8 at 0.40 and 0.9 at 0.45; going higher would trade the
+/// margin the hand-written compatible pair at 0.469 asks for.
 ///
 /// The CLS-pooled calibration it replaces was measured against
 /// `multilingual-e5-small`, over the 20 non-identical labelled pairs

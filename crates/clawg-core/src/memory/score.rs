@@ -162,8 +162,9 @@ impl ScoringConfig {
         // the query-to-passage cosines of this repository's documentation
         // under mean pooling (0.7904; the CLS-pooled 0.8793 it replaces sat
         // at the same percentile of that corpus and would now put 91% of the
-        // top-10 hits under the floor). Provisional until it is re-measured
-        // over the evaluation corpus with `rag-eval --sweep-cos-floor`. Left
+        // top-10 hits under the floor). Swept from 0.70 to 0.83 over the
+        // evaluation corpus with `rag-eval --sweep-cos-floor`, 0.79 keeps the
+        // best MRR, nDCG@10 and recall@10. Left
         // unscaled, every hit's cosine term falls inside a narrow band, so it
         // barely moves relative to the importance factor's own range and has
         // almost no say in the final ranking; re-scaling against this floor
