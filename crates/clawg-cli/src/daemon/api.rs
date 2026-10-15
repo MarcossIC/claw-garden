@@ -238,6 +238,7 @@ pub fn list_params_from_query(q: ListQuery) -> ApiResult<ListParams> {
         query: q.q,
         limit: q.limit,
         offset: q.offset,
+        deleted: false,
     })
 }
 

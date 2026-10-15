@@ -596,6 +596,9 @@ pub struct ListParams {
     pub query: Option<String>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+    /// Lists the deleted rows instead of the live ones, the most recently
+    /// deleted first, so a delete can be found and undone.
+    pub deleted: bool,
 }
 
 /// Whether `query` holds anything `ListParams::query` can search for. A query
@@ -615,6 +618,18 @@ struct RowFilter {
     project_id: Option<String>,
     status: Option<String>,
     match_expr: Option<String>,
+    deleted: bool,
+}
+
+impl RowFilter {
+    /// The `WHERE` that picks live or deleted rows, and the order they list in.
+    fn lifecycle(&self) -> (&'static str, &'static str) {
+        if self.deleted {
+            (" WHERE deleted_at IS NOT NULL", " ORDER BY deleted_at DESC, id DESC LIMIT ? OFFSET ?")
+        } else {
+            (" WHERE deleted_at IS NULL", " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?")
+        }
+    }
 }
 
 /// Appends the filters every table understands, then the `memory`-only ones
@@ -660,9 +675,10 @@ fn push_filters(
 
 /// Lists rows from `memory` / `episodic_trajectory` / `procedural_skill`
 /// directly. `kind: None` runs all 3 per-table queries inside the
-/// SAME `conn.call` and merges + sorts (`created_at DESC`) + paginates in
-/// Rust; `kind: Some(_)` pushes `LIMIT`/`OFFSET` down to SQL directly.
-/// `deleted_at IS NULL` is always applied; `status` is only filtered when
+/// SAME `conn.call` and merges + sorts (`created_at DESC`, or `deleted_at
+/// DESC` for deleted rows) + paginates in Rust; `kind: Some(_)` pushes
+/// `LIMIT`/`OFFSET` down to SQL directly. Only live rows are listed unless
+/// `deleted` asks for the deleted ones instead; `status` is only filtered when
 /// asked — `superseded` rows stay visible by default (inspection is an active
 /// inventory with superseded shown, distinct from retrieval's stricter filter).
 pub async fn list_memories_core(
@@ -679,7 +695,9 @@ pub async fn list_memories_core(
         project_id: params.project_id,
         status: params.status,
         match_expr: params.query.as_deref().and_then(viewer_match_expression),
+        deleted: params.deleted,
     };
+    let deleted = params.deleted;
 
     store
         .conn
@@ -708,9 +726,11 @@ pub async fn list_memories_core(
             }
 
             if is_merge {
-                rows.sort_by(|a, b| {
-                    b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id))
-                });
+                if deleted {
+                    rows.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at).then_with(|| b.id.cmp(&a.id)));
+                } else {
+                    rows.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+                }
                 rows = rows
                     .into_iter()
                     .skip(offset as usize)
@@ -795,10 +815,11 @@ fn query_memory_rows(
     limit: i64,
     offset: i64,
 ) -> rusqlite::Result<Vec<MemoryAdminRow>> {
-    let mut sql = format!("{SELECT_MEMORY} WHERE deleted_at IS NULL");
+    let (lifecycle, order) = filter.lifecycle();
+    let mut sql = format!("{SELECT_MEMORY}{lifecycle}");
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
     push_filters(&mut sql, &mut params, filter, true);
-    sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?");
+    sql.push_str(order);
     params.push(rusqlite::types::Value::Integer(limit));
     params.push(rusqlite::types::Value::Integer(offset));
 
@@ -859,10 +880,11 @@ fn query_episodic_rows(
     limit: i64,
     offset: i64,
 ) -> rusqlite::Result<Vec<MemoryAdminRow>> {
-    let mut sql = format!("{SELECT_EPISODIC} WHERE deleted_at IS NULL");
+    let (lifecycle, order) = filter.lifecycle();
+    let mut sql = format!("{SELECT_EPISODIC}{lifecycle}");
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
     push_filters(&mut sql, &mut params, filter, false);
-    sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?");
+    sql.push_str(order);
     params.push(rusqlite::types::Value::Integer(limit));
     params.push(rusqlite::types::Value::Integer(offset));
 
@@ -914,10 +936,11 @@ fn query_procedural_rows(
     limit: i64,
     offset: i64,
 ) -> rusqlite::Result<Vec<MemoryAdminRow>> {
-    let mut sql = format!("{SELECT_PROCEDURAL} WHERE deleted_at IS NULL");
+    let (lifecycle, order) = filter.lifecycle();
+    let mut sql = format!("{SELECT_PROCEDURAL}{lifecycle}");
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
     push_filters(&mut sql, &mut params, filter, false);
-    sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?");
+    sql.push_str(order);
     params.push(rusqlite::types::Value::Integer(limit));
     params.push(rusqlite::types::Value::Integer(offset));
 
@@ -2074,6 +2097,56 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    async fn mark_deleted(store: &MemoryStore, id: i64, at: i64) {
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE memory SET deleted_at = ?2 WHERE id = ?1", [id, at]))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn deleted_rows_are_listed_only_when_asked() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let live = seed_memory_full(&store, "semantic_fact", 3, "active", false, 1).await;
+        let gone = seed_memory_full(&store, "semantic_fact", 3, "active", false, 2).await;
+        mark_deleted(&store, gone, 50).await;
+        let epi = seed_episodic_row(&store, 3, 5.0).await;
+        delete_memory_core(&store, epi, MemoryKind::Episodic, None).await.unwrap();
+
+        let listed = |rows: Vec<MemoryAdminRow>| rows.iter().map(|r| (r.kind, r.id)).collect::<Vec<_>>();
+        let default = list_memories_core(&store, ListParams::default()).await.unwrap();
+        let deleted = list_memories_core(&store, ListParams { deleted: true, ..Default::default() }).await.unwrap();
+
+        assert_eq!(listed(default), vec![(MemoryKind::Memory, live)]);
+        let deleted = listed(deleted);
+        assert_eq!(deleted.len(), 2, "{deleted:?}");
+        assert!(deleted.contains(&(MemoryKind::Memory, gone)) && deleted.contains(&(MemoryKind::Episodic, epi)));
+    }
+
+    #[tokio::test]
+    async fn deleted_rows_list_newest_deletion_first() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let old_save = seed_memory_full(&store, "semantic_fact", 3, "active", false, 1).await;
+        let new_save = seed_memory_full(&store, "semantic_fact", 3, "active", false, 2).await;
+        let middle = seed_memory_full(&store, "user_preference", 1, "active", false, 3).await;
+        mark_deleted(&store, new_save, 10).await;
+        mark_deleted(&store, middle, 20).await;
+        mark_deleted(&store, old_save, 30).await;
+
+        let rows = list_memories_core(&store, ListParams { deleted: true, ..Default::default() }).await.unwrap();
+        let only_memory = list_memories_core(
+            &store,
+            ListParams { deleted: true, kind: Some(MemoryKind::Memory), memory_type: Some("semantic_fact".into()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), vec![old_save, middle, new_save]);
+        assert_eq!(rows[0].deleted_at, Some(30));
+        assert_eq!(only_memory.iter().map(|r| r.id).collect::<Vec<_>>(), vec![old_save, new_save]);
     }
 
     #[tokio::test]
