@@ -9,7 +9,7 @@ Fuente de verdad del comportamiento actual de la síntesis dirigida por el agent
 - **Fila viva:** fila de `memory` con `deleted_at IS NULL` y `status <> 'superseded'` (la misma definición que usa [`specs/disputes`](../disputes/spec.md)).
 - **Conclusión:** fila de `memory` con al menos una fila en `memory_derivation` que la nombra como `memory_id`.
 - **Fuentes de una conclusión:** los `source_id` de sus filas en `memory_derivation`.
-- **Alcance:** un agente y un `project_id`, o todo el store cuando se pide sin proyecto. Como en la búsqueda y en visibility, un agente sólo ve sus filas; sin agente el pedido es del dueño de la base (el visor, `curl`) y ve las de todos. Su clave en `synthesis_review` es `(agent_id, scope_key)`: el agente o `''` para el dueño, y el `project_id` o `''` para todo el store.
+- **Alcance:** un agente y un `project_id`, o todo el store cuando se pide sin proyecto. Como en visibility (y a diferencia de la búsqueda, que alcanza lo que [`specs/sharing`](../sharing/spec.md) comparte), un agente sólo ve sus filas; sin agente el pedido es del dueño de la base (el visor, `curl`) y ve las de todos. Su clave en `synthesis_review` es `(agent_id, scope_key)`: el agente o `''` para el dueño, y el `project_id` o `''` para todo el store.
 - **Memoria pendiente de un alcance:** fila viva del alcance que no es conclusión y que no es fuente de ninguna conclusión viva **del mismo agente** (`PENDING`, `crates/clawg-core/src/memory/synthesis.rs`). La conclusión de otro agente no cubre la memoria, porque este agente no la ve.
 - **Memoria sin revisar de un alcance:** memoria pendiente con `created_at` mayor que el `reviewed_at` del alcance, o cualquier pendiente si el alcance nunca se revisó.
 

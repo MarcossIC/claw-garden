@@ -13,7 +13,7 @@ El objetivo 4 pide que varios agentes lean y escriban el mismo cerebro, **con co
 3. **Un hit no dice quién lo guardó.** La línea de `recall_context` es `[fecha #id tipo] contenido` (`crates/clawg-core/src/memory/prompt_builder.rs:294-303`) y la de `search_memory`, `N. #id [kind/tipo/tier score] contenido` (`crates/clawg-cli/src/mcp/tools.rs:69-88`). `RankedHit` no lleva el autor (`search.rs:54-64`). Mientras todo es propio no importa; en cuanto se comparta, el agente no puede distinguir lo suyo de lo ajeno ni tratar lo ajeno como dato y no como orden.
 4. **`enum Scope` sigue sin uso** (`crates/clawg-core/src/memory/record.rs:16-23`, reexportado en `crates/clawg-core/src/memory/mod.rs:46`). El insert escribe el literal `"agent"` (`crates/clawg-core/src/memory/store_insert.rs:178`). Está en el backlog del mapa y su destino se decide acá.
 
-Lo que la exploración daba por pendiente y ya no lo está: secret-hygiene se archivó el 2026-10-14 ([`specs/secrets`](../../specs/secrets/spec.md)), así que la condición del mapa ("tiene que cerrar antes de 16") se cumple.
+Lo que la exploración daba por pendiente y ya no lo está: secret-hygiene se archivó el 2026-10-14 ([`specs/secrets`](../../../specs/secrets/spec.md)), así que la condición del mapa ("tiene que cerrar antes de 16") se cumple.
 
 ## Decisiones (cierran las preguntas de la exploración)
 

@@ -4,7 +4,7 @@
 |---|---|---|---|
 | 2 y 4 | L | visibility-policy (A + B), secret-hygiene | exploración (borrador) |
 
-**Origen:** las partes C (compartir) y D (prefiltro en vec0) de [visibility-policy](../archive/2026-10-12-visibility-policy/exploration.md). Las partes A (identidad) y B (scope de lo que modifica) están archivadas en [`specs/visibility`](../../specs/visibility/spec.md).
+**Origen:** las partes C (compartir) y D (prefiltro en vec0) de [visibility-policy](../2026-10-12-visibility-policy/exploration.md). Las partes A (identidad) y B (scope de lo que modifica) están archivadas en [`specs/visibility`](../../../specs/visibility/spec.md).
 
 **Tesis:** el objetivo 4 pide un cerebro compartido **con control del usuario sobre qué ve cada agente**. Después de A y B, cada agente tiene una identidad estable (`clawg mcp --agent`) y sólo lista, borra, cambia o resuelve lo propio. La lectura sigue aislada del todo: search y recall filtran por `agent_id`. Falta decidir **qué** se comparte, **cómo lo controla el usuario** y **cómo llega lo ajeno** al contexto de otro agente.
 

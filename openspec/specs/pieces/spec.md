@@ -7,7 +7,7 @@ Fuente de verdad del comportamiento actual de un save que no entra en un pedazo:
 ## Definiciones
 
 - **Save:** un evento de ingesta (`MemoryEvent`): un `save_memory` o un turno de chat. Es la misma unidad que los pedazos hermanos de [`specs/disputes`](../disputes/spec.md) R8.
-- **Texto del save:** el contenido del evento después de enmascarar secretos (`redact`, `crates/clawg-core/src/memory/worker.rs:433`). Todo lo de abajo trabaja sobre ese texto.
+- **Texto del save:** el contenido del evento después de enmascarar secretos (`redact`, `crates/clawg-core/src/memory/worker.rs:430`). Todo lo de abajo trabaja sobre ese texto.
 - **Pedazo:** cada ventana que deja el chunker, después de colapsar los repetidos dentro del mismo evento (`collapse_duplicate_chunks`, `worker.rs:138`). Su posición es 1, 2, … en ese orden.
 - **Save largo:** un save con dos pedazos o más.
 - **Cabecera:** los primeros `SAVE_HEAD_TOKENS` = 48 tokens del texto del save, contados con el mismo splitter del chunker (en modo sin tokenizer, 4 bytes por token).
@@ -17,7 +17,7 @@ Fuente de verdad del comportamiento actual de un save que no entra en un pedazo:
 
 ## R1. Un texto que entra en un pedazo no cambia
 
-Un texto del save que el chunker deja en un pedazo con el tope de `CHUNK_MAX_TOKENS` = 480 (`chunker/mod.rs:17`) MUST partirse, embeberse y guardarse como siempre: el mismo texto, el mismo vector y ningún vínculo. `ChatChunker::split_save` (`chunker/chat.rs:87`) devuelve ese pedazo sin cabecera.
+Un texto del save que el chunker deja en un pedazo con el tope de `CHUNK_MAX_TOKENS` = 480 (`chunker/mod.rs:15`) MUST partirse, embeberse y guardarse como siempre: el mismo texto, el mismo vector y ningún vínculo. `ChatChunker::split_save` (`chunker/chat.rs:88`) devuelve ese pedazo sin cabecera.
 
 #### Escenario
 - GIVEN un save de 300 tokens
@@ -28,11 +28,11 @@ Un texto del save que el chunker deja en un pedazo con el tope de `CHUNK_MAX_TOK
 
 ## R2. Un save largo se parte con lugar para la cabecera
 
-Un texto del save que no entra en un pedazo de 480 tokens MUST partirse en pedazos de a lo sumo `PIECE_MAX_TOKENS` = 424 tokens (`chunker/mod.rs:39`), con solapamiento de `CHUNK_OVERLAP_TOKENS` = 64 (`chunker/mod.rs:23`). `PIECE_MAX_TOKENS = CHUNK_MAX_TOKENS - SAVE_HEAD_TOKENS - HEAD_JOIN_RESERVE` (48 y 8 tokens de reserva para el separador `"\n…\n"` y la suma de tokens en el borde). Dos `const _: () = assert!(...)` (`chunker/mod.rs:43-44`) comprueban en compilación que `SAVE_HEAD_TOKENS + HEAD_JOIN_RESERVE + PIECE_MAX_TOKENS <= CHUNK_MAX_TOKENS`, así el texto embebido nunca pasa el límite que el embedder trunca en silencio.
+Un texto del save que no entra en un pedazo de 480 tokens MUST partirse en pedazos de a lo sumo `PIECE_MAX_TOKENS` = 424 tokens (`chunker/mod.rs:37`), con solapamiento de `CHUNK_OVERLAP_TOKENS` = 64 (`chunker/mod.rs:21`). `PIECE_MAX_TOKENS = CHUNK_MAX_TOKENS - SAVE_HEAD_TOKENS - HEAD_JOIN_RESERVE` (48 y 8 tokens de reserva para el separador `"\n…\n"` y la suma de tokens en el borde). Dos `const _: () = assert!(...)` (`chunker/mod.rs:41-42`) comprueban en compilación que `SAVE_HEAD_TOKENS + HEAD_JOIN_RESERVE + PIECE_MAX_TOKENS <= CHUNK_MAX_TOKENS`, así el texto embebido nunca pasa el límite que el embedder trunca en silencio.
 
 Cada pedazo desde el segundo MUST embeberse con contexto (la cabecera). El primero se embebe sin él, porque ya empieza con la cabecera. La fila MUST guardar sólo el pedazo: el contenido, el hash de dedup y el FTS no llevan la cabecera.
 
-El armado del texto embebido es `embedding_text(context, piece)` (`chunker/mod.rs:50`), una función pura que usan el worker (`worker.rs:513`) y el re-embed (R7).
+El armado del texto embebido es `embedding_text(context, piece)` (`chunker/mod.rs:48`), una función pura que usan el worker (`worker.rs:509`) y el re-embed (R7).
 
 Un save de un pedazo de hasta 480 tokens no se parte con este tope: el tope de 424 sólo aplica si el de 480 no alcanza.
 
@@ -47,16 +47,16 @@ Un save de un pedazo de hasta 480 tokens no se parte con este tope: el tope de 4
 
 ## R3. El save deja su vínculo
 
-Cuando un save largo termina sin falla, el worker MUST escribir, en una sola transacción, un vínculo por pedazo (`link_save`, `worker.rs:587`, llamado al final de `process_event`; `MemoryStore::link_pieces`, `crates/clawg-core/src/memory/pieces.rs:180`):
+Cuando un save largo termina sin falla, el worker MUST escribir, en una sola transacción, un vínculo por pedazo (`link_save`, `worker.rs:583`, llamado al final de `process_event`; `MemoryStore::link_pieces`, `crates/clawg-core/src/memory/pieces.rs:180`):
 
 - `save_id`: un número nuevo, uno más que el mayor de la tabla;
 - `piece`: la posición del pedazo, desde 1;
-- `memory_id`: la fila que lo guarda, insertada por este evento o absorbida por el dedup (`absorb_duplicate`, `worker.rs:387`);
+- `memory_id`: la fila que lo guarda, insertada por este evento o absorbida por el dedup (`absorb_duplicate`, `worker.rs:385`);
 - `context`: la cabecera con la que se embebió la fila si este evento la insertó con contexto; si no, vacío. Una fila absorbida conserva el vector que ya tenía, así que su vínculo no dice que lo embebió con contexto.
 
-Un save de un pedazo MUST NOT dejar vínculos. Un save que se corta a mitad de camino (`IngestReport.failure`, `worker.rs:563`) MUST NOT dejar vínculos: sus filas quedan sueltas, como antes de la tabla. Al guardarlo de nuevo, los pedazos se absorben y el vínculo se escribe entonces.
+Un save de un pedazo MUST NOT dejar vínculos. Un save que se corta a mitad de camino (`IngestReport.failure`, `worker.rs:559`) MUST NOT dejar vínculos: sus filas quedan sueltas, como antes de la tabla. Al guardarlo de nuevo, los pedazos se absorben y el vínculo se escribe entonces.
 
-Si escribir el vínculo falla, el save MUST seguir informándose como guardado: sus filas ya están y se encuentran igual. La falla va al log (`worker.rs:600`).
+Si escribir el vínculo falla, el save MUST seguir informándose como guardado: sus filas ya están y se encuentran igual. La falla va al log (`worker.rs:596`).
 
 Guardar otra vez exactamente las mismas filas, en el mismo orden, MUST devolver el `save_id` que ya forman (`existing_save`, `pieces.rs:236`) y no escribir nada: el mismo save no se vincula dos veces.
 
@@ -75,11 +75,11 @@ Guardar otra vez exactamente las mismas filas, en el mismo orden, MUST devolver 
 
 ## R4. Un hit por save
 
-La búsqueda (`search_all_memories_inner`, `crates/clawg-core/src/memory/search.rs:1014`) MUST, después de ordenar y antes de cortar en `k`, quedarse con el primer hit de cada save y descartar los demás pedazos de ese save (`collapse_saves`, `search.rs:80`, llamado en `search.rs:1154`; el corte es `search.rs:1161`). Un hit de una fila sin vínculos, o de `episodic_trajectory` o `procedural_skill`, MUST quedar donde está.
+La búsqueda (`search_all_memories_inner`, `crates/clawg-core/src/memory/search.rs:1038`) MUST, después de ordenar y antes de cortar en `k`, quedarse con el primer hit de cada save y descartar los demás pedazos de ese save (`collapse_saves`, `search.rs:104`, llamado en `search.rs:1181`; el corte es `search.rs:1187`). Un hit de una fila sin vínculos, o de `episodic_trajectory` o `procedural_skill`, MUST quedar donde está.
 
-Cada hit de una fila con vínculos MUST llevar su posición y el total de pedazos del save (`RankedHit.piece: Option<PiecePosition>`, `search.rs:65-67`; `PiecePosition`, `search.rs:72`). El descarte corre antes del corte: los lugares que liberan los hermanos los ocupan otras memorias.
+Cada hit de una fila con vínculos MUST llevar su posición y el total de pedazos del save (`RankedHit.piece: Option<PiecePosition>`, `search.rs:89-91`; `PiecePosition`, `search.rs:96`). El descarte corre antes del corte: los lugares que liberan los hermanos los ocupan otras memorias.
 
-El descarte es una función pura sobre los hits y los vínculos de sus filas. Si leer los vínculos falla, la búsqueda MUST devolver los hits sin colapsar y dejar un aviso en el log (`search.rs:1156-1159`): es lo de antes, no un error.
+El descarte es una función pura sobre los hits y los vínculos de sus filas. Si leer los vínculos falla, la búsqueda MUST devolver los hits sin colapsar y dejar un aviso en el log (`search.rs:1182-1185`): es lo de antes, no un error.
 
 #### Escenario: los hermanos no ocupan el top
 - GIVEN un save de 4 pedazos que puntúan 1.º, 2.º, 4.º y 5.º para una consulta, y 10 filas sueltas
@@ -92,10 +92,11 @@ El descarte es una función pura sobre los hits y los vínculos de sus filas. Si
 
 Un hit con vínculo MUST mostrar `piece=K/N` en su metadato:
 
-- `search_memory` (`crates/clawg-cli/src/mcp/tools.rs:78`): `{rank}. #{id} [{kind}/{type}/t{tier} piece={K}/{N} score={score}] {contenido}`;
-- `recall_context` (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:296-303`): `[YYYY-MM-DD #{id} {type} piece={K}/{N}] {contenido}` para `memory`; las otras tablas llevan su kind antes del tipo, como ya hacían.
+- `search_memory` (`crates/clawg-cli/src/mcp/tools.rs:81`): `{rank}. #{id} [{kind}/{type}/t{tier} piece={K}/{N} score={score}] {contenido}`;
+- `recall_context` (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:333-345`): `[YYYY-MM-DD #{id} {type} piece={K}/{N}] {contenido}` para `memory`; las otras tablas llevan su kind antes del tipo, como ya hacían.
+- un hit de otro agente suma ` by <autor>` antes del `]` en los dos ([`specs/sharing`](../sharing/spec.md) R4).
 
-Un hit sin vínculo MUST seguir con el formato de antes. `Hit` en el cliente (`crates/clawg-cli/src/client.rs:141`) MUST leer `piece` con `#[serde(default)]` (`client.rs:152`), así un daemon viejo sigue respondiendo.
+Un hit sin vínculo MUST seguir con el formato de antes. `Hit` en el cliente (`crates/clawg-cli/src/client.rs:142`) MUST leer `piece` con `#[serde(default)]` (`client.rs:157`), así un daemon viejo sigue respondiendo.
 
 Los parsers del eval (`crates/clawg-eval/src/bin/rag-eval/agent_view/parse.rs`) MUST leer los dos formatos y devolver el id de cada línea de búsqueda.
 
@@ -108,7 +109,7 @@ Los parsers del eval (`crates/clawg-eval/src/bin/rag-eval/agent_view/parse.rs`) 
 
 ## R6. El save entero
 
-`GET /v1/memories/{kind}/{id}/save` (`crates/clawg-cli/src/daemon/api.rs:545`, handler `get_save`, `api.rs:898`) con la query `agent` MUST devolver el save de la fila (`read_save_core`, `crates/clawg-core/src/memory/pieces.rs:95`):
+`GET /v1/memories/{kind}/{id}/save` (`crates/clawg-cli/src/daemon/api.rs:547`, handler `get_save`, `api.rs:922`) con la query `agent` MUST devolver el save de la fila (`read_save_core`, `crates/clawg-core/src/memory/pieces.rs:95`):
 
 - `id`, `kind`, `piece` (la posición de la fila pedida), `pieces` (el total) e `ids`: el id de cada posición, o `null` si esa fila está borrada o es de otro agente;
 - `missing`: las posiciones sin fila visible;
@@ -118,11 +119,11 @@ Una fila sin vínculos MUST devolverse como save de un pedazo, con su contenido 
 
 Quitar el solapamiento es `join_pieces` (`pieces.rs:58`), una función pura: entre dos pedazos vecinos busca el sufijo más largo del primero que es prefijo del segundo, de al menos 16 caracteres (`MIN_OVERLAP_CHARS`, `pieces.rs:50`) y dentro de los últimos 2.048 bytes (`MAX_OVERLAP_BYTES`, `pieces.rs:53`), y lo deja una sola vez (`overlap`, `pieces.rs:78`). Si no lo encuentra, une con un salto de línea y no recorta nada. `read_save_core` aplica `join_pieces` a cada tramo de pedazos visibles consecutivos y une los tramos con un salto de línea: nunca compara dos pedazos que no eran vecinos.
 
-El puente MUST exponer `read_memory(id, kind?)` (`crates/clawg-cli/src/mcp/server.rs:813`, `read_memory_impl`, `server.rs:634`), con `kind = memory` por defecto y el agente que llama. La respuesta (`format_save`, `crates/clawg-cli/src/mcp/tools.rs:106`) MUST abrir con una línea que dice qué pedazo es y de cuántos, los ids del save y los que faltan, y seguir con `text`. Sobre una fila ajena MUST fallar como si no existiera.
+El puente MUST exponer `read_memory(id, kind?)` (`crates/clawg-cli/src/mcp/server.rs:863`, `read_memory_impl`, `server.rs:651`), con `kind = memory` por defecto y el agente que llama. La respuesta (`format_save`, `crates/clawg-cli/src/mcp/tools.rs:123`) MUST abrir con una línea que dice qué pedazo es y de cuántos, los ids del save y los que faltan, y seguir con `text`. Sobre una fila ajena MUST fallar como si no existiera.
 
-`save_memory` MUST nombrar `read_memory` en su descripción (`server.rs:743`) y en la respuesta de un save largo (`saved as N pieces: …; read_memory with any of them returns the whole text`). `search_memory` MUST explicar `piece=K/N` en su descripción (`server.rs:761`). `tools/list` MUST listar diez herramientas.
+`save_memory` MUST nombrar `read_memory` en su descripción (`server.rs:787`) y en la respuesta de un save largo (`saved as N pieces: …; read_memory with any of them returns the whole text`). `search_memory` MUST explicar `piece=K/N` en su descripción (`server.rs:805`). `tools/list` MUST listar diez herramientas.
 
-Contra un daemon que no tiene la ruta, su 404 no trae el error JSON del daemon: `read_failure_text` (`server.rs:652`) MUST decir que hay que reiniciar el daemon, no que la fila no existe.
+Contra un daemon que no tiene la ruta, su 404 no trae el error JSON del daemon: `read_failure_text` (`server.rs:669`) MUST decir que hay que reiniciar el daemon, no que la fila no existe.
 
 #### Escenario: lo propio, con un pedazo borrado
 - GIVEN un save de 4 pedazos del agente A, con el pedazo 3 borrado
@@ -138,7 +139,7 @@ Contra un daemon que no tiene la ruta, su 404 no trae el error JSON del daemon: 
 
 ## R7. El re-embed reconstruye el contexto
 
-`reembed_all` (`crates/clawg-core/src/memory/maintenance.rs:468`) MUST re-embeber una fila de `memory` que tiene un vínculo con `context` no vacío con el mismo texto embebido de R2, armado con `embedding_text`. La consulta del lote (`select_reembed_batch`, `maintenance.rs:605`) trae ese `context` con una subconsulta sobre `memory_piece` (`maintenance.rs:641-643`). Una fila sin vínculos, o con `context` vacío, MUST re-embeberse con su contenido, como antes.
+`reembed_all` (`crates/clawg-core/src/memory/maintenance.rs:467`) MUST re-embeber una fila de `memory` que tiene un vínculo con `context` no vacío con el mismo texto embebido de R2, armado con `embedding_text`. La consulta del lote (`select_reembed_batch`, `maintenance.rs:604`) trae ese `context` con una subconsulta sobre `memory_piece` (`maintenance.rs:640-642`). Una fila sin vínculos, o con `context` vacío, MUST re-embeberse con su contenido, como antes.
 
 #### Escenario
 - GIVEN el pedazo 2 de un save largo, guardado con contexto

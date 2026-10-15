@@ -1,8 +1,10 @@
 # visibility — Especificación
 
-Fuente de verdad del comportamiento actual de la identidad del agente y de qué filas puede listar, borrar, cambiar o resolver cada agente. También define la ruta en disco del workspace de cada agente. La búsqueda y `recall_context` siguen filtrando por agente como siempre: compartir entre agentes (parte C) y el prefiltro en vec0 (parte D) son [agent-sharing](../../changes/agent-sharing/exploration.md).
+Fuente de verdad del comportamiento actual de la identidad del agente y de qué filas puede listar, borrar, cambiar o resolver cada agente. También define la ruta en disco del workspace de cada agente. Lo que la búsqueda y `recall_context` leen de otros agentes (por defecto todo, salvo lo que el usuario oculta en `sharing.json`) está en [`specs/sharing`](../sharing/spec.md): leer lo ajeno no da derecho a modificarlo, y para borrar, cambiar, resolver o leer un save, una fila ajena sigue siendo "no existe" (R3 y R4).
 
-**Origen:** [visibility-policy](../../changes/archive/2026-10-12-visibility-policy/proposal.md), partes A y B, archivado el 2026-10-12.
+**Origen:**
+- [visibility-policy](../../changes/archive/2026-10-12-visibility-policy/proposal.md), partes A y B, archivado el 2026-10-12.
+- [agent-sharing](../../changes/archive/2026-10-14-agent-sharing/proposal.md), archivado el 2026-10-14 (sólo lo que dice de lo ajeno compartido en R3 y R4).
 
 ## Definiciones
 
@@ -58,11 +60,17 @@ El agente del puente MUST ser, en este orden:
 - `resolve_conflict` con alguna de las dos filas de otro agente MUST fallar como si el id no existiera, y MUST NOT cambiar ninguna de las dos.
 - `read_memory` sobre una fila de otro agente, o sobre el save de una fila de otro agente, MUST fallar como si el id no existiera ([`specs/pieces`](../pieces/spec.md), R6). Su ruta de daemon, `GET /v1/memories/{kind}/{id}/save`, responde `404` con el mismo "no existe" (R4).
 - Sobre filas propias, las cinco se comportan igual que sin scope.
+- Que una fila ajena llegue al agente por `search_memory` o `recall_context` porque `specs/sharing` la comparte (marcada `by <autor>`) no cambia nada de lo anterior: para el agente que no es su autor, modificarla, resolverla o leer su save sigue siendo "no existe", y la fila queda intacta.
 
 #### Escenario: borrar lo ajeno
 - GIVEN una memoria de A
 - WHEN B llama `delete_memory` con su id
 - THEN la respuesta es un error, la fila sigue viva, y A la sigue encontrando con `search_memory`
+
+#### Escenario: borrar lo compartido
+- GIVEN una memoria de A que B acaba de ver en `search_memory` marcada `by A`
+- WHEN B llama `delete_memory` con su id
+- THEN la respuesta es un error, la fila sigue viva y A la sigue encontrando ([`specs/sharing`](../sharing/spec.md) R5)
 
 #### Escenario: listar
 - GIVEN una memoria de A y una de B
@@ -74,12 +82,13 @@ El agente del puente MUST ser, en este orden:
 - WHEN B llama `resolve_conflict` sobre el par
 - THEN la respuesta es un error y las dos filas siguen igual
 
-**Test:** `an_agent_cannot_delete_another_agents_memory`, `an_agent_cannot_update_another_agents_memory`, `an_agent_lists_only_its_own_memories`, `an_agent_cannot_resolve_another_agents_conflict` y `an_agent_cannot_read_another_agents_save` en `server.rs`.
+**Test:** `an_agent_cannot_delete_another_agents_memory`, `an_agent_cannot_update_another_agents_memory`, `an_agent_lists_only_its_own_memories`, `an_agent_cannot_resolve_another_agents_conflict` y `an_agent_cannot_read_another_agents_save` en `server.rs`; `a_shared_memory_is_read_only` en `server.rs` para lo compartido.
 
 ## R4. Scope opcional en el daemon
 
 - `DELETE` y `PATCH /v1/memories/{kind}/{id}` MUST aceptar `agent` en la query; `GET /v1/memories/{kind}/{id}/save` MUST aceptar lo mismo; `POST /v1/disputes/resolve` MUST aceptar `agent_id` en el cuerpo.
 - Con scope, si la fila (o alguna de las dos, al resolver) es de otro agente, la respuesta MUST ser `404`, igual que un id inexistente, y MUST NOT cambiar nada: ni la fila, ni su vector, ni sus disputas, ni su `last_modified_at`, ni su `update_count`. En el `GET` del save, el scope se aplica a la fila pedida (si es ajena, 404) y a cada posición del save: un pedazo de otro agente, que el dedup dejó dentro de un save propio, figura como faltante con `ids` en `null` ([`specs/pieces`](../pieces/spec.md), R6).
+- La regla no depende de lo que el agente ve: una fila que `specs/sharing` le muestra en una búsqueda es igual de ajena para el scope. Lo mismo vale para `POST /v1/synthesis`, que con `agent_id` sólo mira filas de ese agente.
 - Sin scope, la operación MUST valer sobre cualquier fila, como antes de existir el scope.
 - La misma regla vale para las tres tablas (`memory`, `episodic`, `procedural`).
 

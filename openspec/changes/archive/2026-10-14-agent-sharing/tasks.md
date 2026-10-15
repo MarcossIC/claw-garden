@@ -67,15 +67,15 @@ Las tareas 1 a 8 se hicieron con la primera versión de la propuesta (nada compa
 ## Verify
 
 - [x] `cargo test --workspace` en Linux en cada commit, contra la base (1.674 pasan, 10 fallas de entorno). Ver [`verify.md`](verify.md).
-- [ ] `cargo test --workspace --target-dir <otro-dir>` en Windows.
-- [ ] `rag-eval --real --diff` contra el baseline: diff vacío en el ancla y en agent-view.
-- [ ] Prueba manual con el perfil dev y dos agentes (`clawg mcp --agent a` y `--agent b`): sin política B ve lo de A con `by a`; B no lo puede borrar; `clawg sharing hide b a` y deja de verlo, sin reiniciar el daemon; `clawg sharing unhide b a` y vuelve.
+- [x] `cargo test --workspace --target-dir <otro-dir>` en Windows: 1.863 pasan, 0 fallan sobre `main` 9bbc78f.
+- [x] `rag-eval --real --diff` entre `01eec91` y `9bbc78f`: diff vacío en el ancla y en agent-view.
+- [x] Prueba manual con el perfil dev y dos agentes (`clawg mcp --agent a` y `--agent b`): sin política B ve lo de A con `by a`; B no lo puede borrar; `clawg sharing hide b a` y deja de verlo, sin reiniciar el daemon; `clawg sharing unhide b a` y vuelve.
 
 ## Archive
 
-- [ ] `openspec/specs/sharing/spec.md` con R1–R9, las rutas y líneas del código y la línea **Origen**.
-- [ ] `specs/visibility`: la introducción enlaza a `specs/sharing`; R3 dice que lo compartido sigue siendo "no existe" para modificar.
-- [ ] `specs/retrieval` y `specs/mcp`: el autor en cada hit y la línea `shared:` de `memory_status`.
-- [ ] `git mv openspec/changes/agent-sharing openspec/changes/archive/AAAA-MM-DD-agent-sharing`.
-- [ ] `state.yaml`: `phase: archived`, `archive: done`, `main_spec: openspec/specs/sharing/spec.md`.
-- [ ] `openspec/README.md`: fila 16 como archivada (parte C), con la parte D pendiente.
+- [x] `openspec/specs/sharing/spec.md` con R1–R9, las rutas y líneas del código y la línea **Origen**.
+- [x] `specs/visibility`: la introducción enlaza a `specs/sharing`; R3 dice que lo compartido sigue siendo "no existe" para modificar.
+- [x] `specs/retrieval` y `specs/mcp`: el autor en cada hit y la línea `shared:` de `memory_status`. También `specs/pieces` (R5) y `specs/synthesis` (la frase del alcance).
+- [x] `git mv openspec/changes/agent-sharing openspec/changes/archive/2026-10-14-agent-sharing`.
+- [x] `state.yaml`: `phase: archived`, `archive: done`, `main_spec: openspec/specs/sharing/spec.md`.
+- [x] `openspec/README.md`: fila 16 como archivada (parte C), con la parte D pendiente.

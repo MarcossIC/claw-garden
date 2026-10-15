@@ -173,7 +173,7 @@ Son del usuario.
 - [ ] **Filas `superseded`.** ¿Se restauran y se avisa que siguen reemplazadas, o se rechazan?
 - [ ] **Recencia y tier.** ¿Se conservan `last_accessed_at` y tier, o el restore cuenta como acceso (`last_accessed_at = ahora`)? Sin eso, una fila restaurada hace meses puede quedar viva e inalcanzable.
 - [ ] **Descubrimiento por MCP.** ¿`list_memories` aprende `deleted`, o el agente se limita a ids que ya tiene? Mientras se mantenga el test de los cinco argumentos, la respuesta por defecto es no.
-- [ ] **Scope.** Con scope (MCP, `?agent=`), ¿sólo las propias, como `delete_memory`? ¿Se espera a lo que decida agent-sharing sobre quién modifica filas compartidas (`openspec/changes/agent-sharing/exploration.md:46`)?
+- [ ] **Scope.** Con scope (MCP, `?agent=`), ¿sólo las propias, como `delete_memory`? agent-sharing ya decidió quién modifica filas compartidas: sólo su autor; para los demás son de sólo lectura ([`specs/sharing`](../../specs/sharing/spec.md), R5).
 - [ ] **Papelera con retención.** Hoy una borrada se queda para siempre salvo `purge`. ¿Se queda así (recomendado: la purga ya existe y borrar datos solos viola la regla de no destruir la base del usuario), o se agrega un vaciado automático?
 - [ ] **Borrado por proyecto.** ¿Cambio aparte, después de éste, sólo CLI?
 
