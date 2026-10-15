@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use clawg_core::eval_api::{doc_paths, EvalDocHit, EvalDocIndex, EvalDocReport, EvalEmbedder};
+use clawg_core::eval_api::{doc_paths, is_code_path, EvalDocHit, EvalDocIndex, EvalDocReport, EvalEmbedder};
 use serde::Deserialize;
 
 use crate::cli::{Cli, Mode};
@@ -118,24 +118,39 @@ pub struct CaseResult<'a> {
     pub rank: Option<usize>,
     /// The breadcrumb of the top hit, to show what was found instead.
     pub top: Option<String>,
+    /// Whether the question is about code, by the first path it expects.
+    pub code: bool,
 }
 
-pub fn render(report: &EvalDocReport, took: Duration, results: &[CaseResult<'_>]) -> String {
+fn score_line(results: &[&CaseResult<'_>]) -> String {
     let ranks: Vec<Option<usize>> = results.iter().map(|r| r.rank).collect();
     let s = score(&ranks);
-    let mut out = format!(
-        "indexed {} docs into {} passages ({} skipped) in {:.1} s\n\
-         Hit@1 {:.2}  Hit@3 {:.2}  Hit@5 {:.2}  MRR@{RANKED} {:.2}  over {} questions\n\n",
-        report.docs,
-        report.passages,
-        report.skipped,
-        took.as_secs_f64(),
+    format!(
+        "Hit@1 {:.2}  Hit@3 {:.2}  Hit@5 {:.2}  MRR@{RANKED} {:.2}  over {} questions\n",
         s.hit_at_1,
         s.hit_at_3,
         s.hit_at_5,
         s.mrr,
         results.len(),
+    )
+}
+
+pub fn render(report: &EvalDocReport, took: Duration, results: &[CaseResult<'_>]) -> String {
+    let all: Vec<&CaseResult<'_>> = results.iter().collect();
+    let mut out = format!(
+        "indexed {} docs into {} passages ({} skipped) in {:.1} s\n{}",
+        report.docs,
+        report.passages,
+        report.skipped,
+        took.as_secs_f64(),
+        score_line(&all),
     );
+    let (code, docs): (Vec<_>, Vec<_>) = all.iter().partition(|r| r.code);
+    if !code.is_empty() && !docs.is_empty() {
+        out.push_str(&format!("  docs  {}", score_line(&docs)));
+        out.push_str(&format!("  code  {}", score_line(&code)));
+    }
+    out.push('\n');
     for r in results {
         let rank = r.rank.map_or("-".to_string(), |n| n.to_string());
         out.push_str(&format!("{rank:>3}  {}  {}\n", r.case.id, r.case.question));
@@ -227,6 +242,7 @@ async fn measure(cli: &Cli, embedder: &EvalEmbedder, base_dir: &Path, cases: &[D
             case,
             rank: first_rank(&hits, &case.expected),
             top: hits.first().map(|h| h.breadcrumb.clone()),
+            code: is_code_path(&case.expected[0].path),
         });
     }
     print!("{}", render(&report, took, &results));
@@ -312,8 +328,8 @@ mod tests {
         )
         .unwrap();
         let results = [
-            CaseResult { case: &cases[0], rank: Some(1), top: Some("a.md".into()) },
-            CaseResult { case: &cases[1], rank: None, top: Some("a.md > Otro".into()) },
+            CaseResult { case: &cases[0], rank: Some(1), top: Some("a.md".into()), code: false },
+            CaseResult { case: &cases[1], rank: None, top: Some("a.md > Otro".into()), code: false },
         ];
         let report = EvalDocReport { docs: 2, passages: 7, skipped: 1 };
 
@@ -322,6 +338,27 @@ mod tests {
         assert!(text.starts_with("indexed 2 docs into 7 passages (1 skipped) in 1.5 s\n"), "{text}");
         assert!(text.contains("Hit@1 0.50  Hit@3 0.50  Hit@5 0.50  MRR@10 0.50  over 2 questions"), "{text}");
         assert!(text.contains("  1  q1  first?\n  -  q2  second?\n     expected b.md > … > Uso\n     top      a.md > Otro\n"), "{text}");
+        assert!(!text.contains("  docs "), "with no code questions there is nothing to split: {text}");
+    }
+
+    #[test]
+    fn the_report_scores_docs_and_code_apart() {
+        let cases = parse(
+            r#"[{"id": "q1", "question": "a?", "expected": [{"path": "a.md"}]},
+                {"id": "q2", "question": "b?", "expected": [{"path": "src/b.rs"}]},
+                {"id": "q3", "question": "c?", "expected": [{"path": "src/c.rs"}]}]"#,
+        )
+        .unwrap();
+        let results = [
+            CaseResult { case: &cases[0], rank: None, top: None, code: false },
+            CaseResult { case: &cases[1], rank: Some(1), top: None, code: true },
+            CaseResult { case: &cases[2], rank: Some(2), top: None, code: true },
+        ];
+
+        let text = render(&EvalDocReport { docs: 3, passages: 3, skipped: 0 }, Duration::ZERO, &results);
+
+        assert!(text.contains("  docs  Hit@1 0.00  Hit@3 0.00  Hit@5 0.00  MRR@10 0.00  over 1 questions\n"), "{text}");
+        assert!(text.contains("  code  Hit@1 0.50  Hit@3 1.00  Hit@5 1.00  MRR@10 0.75  over 2 questions\n"), "{text}");
     }
 
     #[test]
@@ -330,6 +367,6 @@ mod tests {
         let cases = parse(&text).unwrap();
         let corpus = doc_paths(&crate::cli::default_docs_root()).unwrap();
         check_corpus(&cases, &corpus).unwrap();
-        assert_eq!(cases.len(), 10);
+        assert_eq!(cases.len(), 15);
     }
 }

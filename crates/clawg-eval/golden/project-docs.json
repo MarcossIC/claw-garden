@@ -59,5 +59,30 @@
     "id": "d10",
     "question": "after updating, my editor can no longer talk to the memory server; what should I do?",
     "expected": [{"path": "README.md", "heading": "Si algo falla"}]
+  },
+  {
+    "id": "c01",
+    "question": "¿dónde se elige el entorno de datos a partir de la línea de comandos, una variable y si el binario es de depuración?",
+    "expected": [{"path": "crates/clawg-core/src/paths.rs"}]
+  },
+  {
+    "id": "c02",
+    "question": "where are API keys and passwords hidden before text is stored?",
+    "expected": [{"path": "crates/clawg-core/src/memory/redact.rs"}, {"path": "crates/clawg-core/src/memory/secrets.rs"}]
+  },
+  {
+    "id": "c03",
+    "question": "¿qué guarda en disco lo que no alcanzó a procesarse al apagar, para retomarlo en el próximo arranque?",
+    "expected": [{"path": "crates/clawg-core/src/memory/spill.rs"}]
+  },
+  {
+    "id": "c04",
+    "question": "how does it tell that a linked checkout shares the folder of its parent repository?",
+    "expected": [{"path": "crates/clawg-core/src/memory/identity.rs"}]
+  },
+  {
+    "id": "c05",
+    "question": "¿qué código sube o baja la temperatura de un recuerdo según cuánto se usa?",
+    "expected": [{"path": "crates/clawg-core/src/memory/tier.rs"}, {"path": "crates/clawg-core/src/memory/access.rs"}]
   }
 ]

@@ -697,6 +697,11 @@ impl EvalDocIndex {
     }
 }
 
+/// Whether the index takes the file at `path` as source code.
+pub fn is_code_path(path: &str) -> bool {
+    matches!(project_docs::corpus::classify(path), Some(project_docs::corpus::DocKind::Code(_)))
+}
+
 /// The relative paths of the docs `root` holds, as the index would take them.
 pub fn doc_paths(root: &Path) -> Result<Vec<String>, EvalError> {
     let walk = project_docs::corpus::walk(root).map_err(|e| EvalError::Open(e.to_string()))?;
@@ -1170,6 +1175,7 @@ mod tests {
 
         assert_eq!(report, EvalDocReport { docs: 1, passages: 2, skipped: 0 });
         assert_eq!(doc_paths(root.path()).unwrap(), ["README.md"]);
+        assert!(is_code_path("src/lib.rs") && !is_code_path("README.md"));
         assert_eq!(hits[0], EvalDocHit { path: "README.md".into(), breadcrumb: "README.md > Guía > Uso".into() });
     }
 }
