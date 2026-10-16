@@ -91,9 +91,9 @@ Las piezas puras y el cambio van en **un solo commit**. Por separado, las piezas
 
 ## 9. Docs
 
-- [ ] `.claude/CLAUDE.md:9` dice «ONNX embeddings (fastembed)»: pasa a «ONNX embeddings (ONNX Runtime)». Lo mismo en `.cursor/rules/cursor.mdc:15` y `.gemini/GEMINI.md:9`.
-- [ ] `openspec/README.md`: la fila de este cambio (líneas 72 y 101) y la de `:177` («Embeddings locales con fastembed-rs», que sigue siendo un descarte: sólo se corrige el nombre de la herramienta).
-- [ ] `openspec/config.yaml:5` menciona «fastembed ONNX multilingual-e5-small».
+- [x] `.claude/CLAUDE.md:9` dice «ONNX embeddings (fastembed)»: pasa a «ONNX embeddings (ONNX Runtime)». Lo mismo en `.cursor/rules/cursor.mdc:15` y `.gemini/GEMINI.md:9`.
+- [x] `openspec/README.md`: la fila de este cambio (línea 72; la de orden, 101, sigue valiendo) y la de `:177` («Embeddings locales con fastembed-rs», que sigue siendo un descarte: sólo se corrige el nombre de la herramienta, y su cita pasa a `model_download.rs:26`).
+- [x] `openspec/config.yaml:5` menciona «fastembed ONNX multilingual-e5-small».
 - [ ] Este cambio: `design.md` ya trae D5; completar `verify.md` con los resultados de la sección 10 cuando existan.
 - Commit: `docs: describe the embedding model running on ONNX Runtime with one shared tokenizer`
 

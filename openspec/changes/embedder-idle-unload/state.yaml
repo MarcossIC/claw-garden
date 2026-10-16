@@ -1,14 +1,14 @@
 change: embedder-idle-unload
 objective: "transversal"
 depends_on: []
-phase: apply
+phase: verify
 artifacts:
   exploration: done
   proposal: done  # revisada por D5
   spec: done  # R7 reescrito; R8 y R9 nuevos
   design: done  # D5: un solo tokenizer por proceso
   tasks: done  # secciones 6 a 10 para D5
-  apply: partial  # secciones 1 a 5 hechas; 6 a 9 pendientes
-  verify: partial  # Linux, CI y Windows de la primera implementación; R7 falla en Windows, ver verify.md
+  apply: done  # secciones 1 a 9
+  verify: pending  # sección 10: suite, CI, test dorado, rag-eval y R7 en el daemon en Windows y Linux
   archive: pending
 updated: 2026-10-16

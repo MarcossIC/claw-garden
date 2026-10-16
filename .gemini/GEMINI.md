@@ -6,7 +6,7 @@ Local-first memory for coding agents, written in Rust. It stores, classifies and
 
 | Crate | Role |
 | --- | --- |
-| `crates/clawg-core` | Memory engine: SQLite storage, ONNX embeddings (fastembed), ranking, background workers, and the exclusive lock on `memory.db`. Library `clawg_core`. |
+| `crates/clawg-core` | Memory engine: SQLite storage, ONNX embeddings (ONNX Runtime), ranking, background workers, and the exclusive lock on `memory.db`. Library `clawg_core`. |
 | `crates/clawg-cli` | The `clawg` binary: `serve`, `mcp`, `status`, `stop`, `doctor`, `path`. Also a library `clawg_cli`. |
 | `crates/clawg-eval` | Evaluation tools: `rag-eval` (retrieval metrics over a golden set) and `golden-mine` (golden-set miner). They use `clawg-core` through its `eval` feature (`eval_api`), which production builds never link. |
 

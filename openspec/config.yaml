@@ -2,7 +2,7 @@ schema: spec-driven
 
 context: |
   Claw Garden: local-first memory for coding agents, in Rust.
-  Workspace: crates/clawg-core (SQLite + sqlite-vec + FTS5, fastembed ONNX multilingual-e5-small,
+  Workspace: crates/clawg-core (SQLite + sqlite-vec + FTS5, ONNX Runtime multilingual-e5-small,
   ranking, background workers, exclusive lock on memory.db), crates/clawg-cli (`clawg` binary:
   loopback HTTP daemon + stdio MCP bridge via rmcp), crates/clawg-eval (rag-eval, golden-mine,
   linked to clawg-core through the `eval` feature only).
