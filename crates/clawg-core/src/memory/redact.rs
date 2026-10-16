@@ -447,8 +447,12 @@ mod tests {
             text.push('\n');
         }
         text.push_str("mysql://root:hunter2@localhost/db\n");
+        text.push_str("DB_PASSWORD=s3cr3t!x\nAuthorization: Bearer a1b2c3d4e5f6g7h8\n");
+        text.push_str("<private>the vault code</private> and <private>an open mark\n");
         let once = redact(&text);
-        assert!(!once.kinds.is_empty());
+        for kind in [SecretKind::UrlPassword, SecretKind::Password, SecretKind::AuthHeader, SecretKind::Private] {
+            assert!(once.kinds.contains(&kind), "{kind:?} in {:?}", once.kinds);
+        }
         let twice = redact(&once.text);
         assert_eq!(twice.text, once.text);
         assert!(twice.kinds.is_empty(), "{:?}", twice.kinds);
