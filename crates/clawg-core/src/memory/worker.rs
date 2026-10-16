@@ -805,15 +805,20 @@ async fn link_save(store: &Arc<MemoryStore>, pieces: Vec<StoredPiece>) {
 /// from that SAME value: `tokenizer_cell` and the returned chunker can never
 /// disagree about which parse of `tokenizer.json` they got, and the file is
 /// never read twice for one process. Pulled out of the worker's setup so this
-/// wiring is unit-testable on its own.
-pub fn resolve_tokenizer_and_chunker(
+/// wiring is unit-testable on its own. The loader is a parameter so the daemon
+/// can pass the one that checks the file's hash and tests can pass their own.
+pub fn resolve_tokenizer_and_chunker<L>(
     base_dir: &std::path::Path,
     tokenizer_cell: &OnceCell<Arc<tokenizers::Tokenizer>>,
-) -> Arc<ChatChunker> {
-    let tok = crate::memory::model_download::load_tokenizer(base_dir);
-    if let Some(t) = &tok {
-        let _ = tokenizer_cell.set(t.clone());
-    }
+    load: L,
+) -> Arc<ChatChunker>
+where
+    L: FnOnce(&std::path::Path) -> Option<Arc<tokenizers::Tokenizer>>,
+{
+    let tok = tokenizer_cell
+        .get_or_try_init(|| load(base_dir).ok_or(()))
+        .ok()
+        .cloned();
     Arc::new(ChatChunker::from_tokenizer(tok))
 }
 
@@ -2850,7 +2855,7 @@ mod tests {
         write_minimal_tokenizer_fixture(&base_dir);
 
         let cell: OnceCell<Arc<tokenizers::Tokenizer>> = OnceCell::new();
-        let chunker = resolve_tokenizer_and_chunker(&base_dir, &cell);
+        let chunker = resolve_tokenizer_and_chunker(&base_dir, &cell, crate::memory::model_download::load_tokenizer);
 
         let cell_tok = cell.get().expect("cell must be filled when tokenizer.json is present");
         let cell_ptr: *const tokenizers::Tokenizer = Arc::as_ptr(cell_tok);
@@ -2873,9 +2878,30 @@ mod tests {
     fn resolve_tokenizer_and_chunker_leaves_the_cell_empty_when_the_file_is_absent() {
         let base_dir = unique_temp_dir("resolve-tok-absent");
         let cell: OnceCell<Arc<tokenizers::Tokenizer>> = OnceCell::new();
-        let chunker = resolve_tokenizer_and_chunker(&base_dir, &cell);
+        let chunker = resolve_tokenizer_and_chunker(&base_dir, &cell, crate::memory::model_download::load_tokenizer);
 
         assert!(cell.get().is_none(), "no tokenizer.json on disk must leave the cell empty");
+        assert!(chunker.tokenizer_ptr().is_none(), "the chunker must be running the byte fallback");
+
+        std::fs::remove_dir_all(&base_dir).ok();
+    }
+
+    #[test]
+    fn a_tokenizer_file_with_another_sha256_is_not_parsed() {
+        let base_dir = unique_temp_dir("resolve-tok-other-sha");
+        write_minimal_tokenizer_fixture(&base_dir);
+
+        let parses = std::cell::Cell::new(0u32);
+        let cell: OnceCell<Arc<tokenizers::Tokenizer>> = OnceCell::new();
+        let chunker = resolve_tokenizer_and_chunker(&base_dir, &cell, |dir| {
+            crate::memory::model_download::load_verified_tokenizer_with(dir, |bytes| {
+                parses.set(parses.get() + 1);
+                tokenizers::Tokenizer::from_bytes(bytes).ok()
+            })
+        });
+
+        assert_eq!(parses.get(), 0, "a file that is not the pinned one must never reach the parser");
+        assert!(cell.get().is_none(), "the cell must stay empty");
         assert!(chunker.tokenizer_ptr().is_none(), "the chunker must be running the byte fallback");
 
         std::fs::remove_dir_all(&base_dir).ok();

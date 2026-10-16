@@ -141,6 +141,41 @@ pub fn load_tokenizer(base_dir: &Path) -> Option<Arc<tokenizers::Tokenizer>> {
     }
 }
 
+/// Loads `tokenizer.json` only when its bytes are the pinned ones: the file is
+/// read, its SHA-256 compared with [`TOKENIZER_JSON_SHA256`], and only then
+/// parsed. A missing, altered or unparsable file gives `None` and a warning;
+/// the caller degrades to byte chunking.
+pub(crate) fn load_verified_tokenizer(base_dir: &Path) -> Option<Arc<tokenizers::Tokenizer>> {
+    load_verified_tokenizer_with(base_dir, |bytes| tokenizers::Tokenizer::from_bytes(bytes).ok())
+}
+
+/// [`load_verified_tokenizer`] with the parser as a parameter, so a test can
+/// count how many times a file reaches it.
+pub(crate) fn load_verified_tokenizer_with<P>(base_dir: &Path, parse: P) -> Option<Arc<tokenizers::Tokenizer>>
+where
+    P: FnOnce(&[u8]) -> Option<tokenizers::Tokenizer>,
+{
+    let path = tokenizer_path(base_dir);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            log::warn!("tokenizer.json not readable at {} ({e}); chunking by bytes", path.display());
+            return None;
+        }
+    };
+    if sha256_hex(&bytes) != TOKENIZER_JSON_SHA256 {
+        log::warn!("tokenizer.json at {} is not the pinned file; chunking by bytes", path.display());
+        return None;
+    }
+    let started = std::time::Instant::now();
+    let Some(tokenizer) = parse(&bytes) else {
+        log::warn!("tokenizer.json at {} does not parse; chunking by bytes", path.display());
+        return None;
+    };
+    log::info!("tokenizer.json parsed in {} ms", started.elapsed().as_millis());
+    Some(Arc::new(tokenizer))
+}
+
 /// Returns the base URL for HF resolve requests. Honors the
 /// `CLAWG_HF_BASE_URL` env var to enable mockito-driven tests.
 pub(super) fn base_url() -> String {

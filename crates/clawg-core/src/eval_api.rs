@@ -498,7 +498,7 @@ impl EvalIngest {
         runtime.access_tracker = Arc::new(AccessTracker::inert());
 
         let (tx, rx) = tokio::sync::mpsc::channel(INGEST_QUEUE_CAPACITY);
-        let chat_chunker = resolve_tokenizer_and_chunker(tokenizer_dir, &runtime.tokenizer);
+        let chat_chunker = resolve_tokenizer_and_chunker(tokenizer_dir, &runtime.tokenizer, model_download::load_tokenizer);
         let worker = tokio::spawn(memory_worker(
             rx,
             tokio::sync::watch::channel(None).1,

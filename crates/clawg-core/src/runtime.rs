@@ -407,7 +407,11 @@ fn ingest_worker_future(
     drain: watch::Receiver<Option<Instant>>,
 ) -> impl Future<Output = Vec<MemoryEvent>> + Send + 'static {
     async move {
-        let chat_chunker = resolve_tokenizer_and_chunker(&base_dir, &tokenizer);
+        let chat_chunker = resolve_tokenizer_and_chunker(
+            &base_dir,
+            &tokenizer,
+            crate::memory::model_download::load_verified_tokenizer,
+        );
         import_spill(&base_dir, &store).await;
         let replay = match store.outbox_pending().await {
             Ok(rows) => {

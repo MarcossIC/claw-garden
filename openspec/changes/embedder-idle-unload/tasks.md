@@ -56,9 +56,9 @@ El test sólo puede usar una puerta que exista antes y después del cambio y no 
 
 Antes del cambio de inferencia sólo se puede hacer la mitad del worker: la carga del modelo sigue siendo de fastembed, que parsea por su cuenta y no puede tomar la celda. La mitad del modelo y `the_worker_and_the_model_load_share_one_parse` van en la sección 8.
 
-- [ ] Test primero, en `worker.rs`: `a_tokenizer_file_with_another_sha256_is_not_parsed` (un `tokenizer.json` con otro SHA-256: no se parsea y la celda queda vacía; se ve con un contador, no con el log).
-- [ ] `model_download.rs`: la carga verificada de `tokenizer.json` (lee, compara con `TOKENIZER_JSON_SHA256`, parsea y deja `tokenizer.json parsed in N ms` en el log). `load_tokenizer` queda como está para las herramientas de evaluación.
-- [ ] `resolve_tokenizer_and_chunker` (`worker.rs`) recibe el cargador como parámetro; los dos tests que existen (`resolve_tokenizer_and_chunker_fills_the_cell_and_shares_the_identical_arc` y el de la celda vacía) pasan un cargador propio. El daemon (`serve.rs`) le pasa el verificado. La celda (`MemoryRuntime::tokenizer`, `runtime.rs`) se llena con `get_or_try_init`.
+- [x] Test primero, en `worker.rs`: `a_tokenizer_file_with_another_sha256_is_not_parsed` (un `tokenizer.json` con otro SHA-256: no se parsea y la celda queda vacía; se ve con un contador, no con el log).
+- [x] `model_download.rs`: la carga verificada de `tokenizer.json` (lee, compara con `TOKENIZER_JSON_SHA256`, parsea y deja `tokenizer.json parsed in N ms` en el log). `load_tokenizer` queda como está para las herramientas de evaluación.
+- [x] `resolve_tokenizer_and_chunker` (`worker.rs`) recibe el cargador como parámetro; los dos tests que existen (`resolve_tokenizer_and_chunker_fills_the_cell_and_shares_the_identical_arc` y el de la celda vacía) pasan un cargador propio. El daemon (`serve.rs`) le pasa el verificado. La celda (`MemoryRuntime::tokenizer`, `runtime.rs`) se llena con `get_or_try_init`.
 - Commit: `fix(core): check the tokenizer file against its hash before the worker parses it`
 
 ## 8. La inferencia la arma clawg (R7, R8, R9, D5)
