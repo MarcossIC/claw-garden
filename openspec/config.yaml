@@ -30,6 +30,7 @@ rules:
     - Detail is proportional to the change. A small fix is a one-page proposal plus tasks; design.md only when there is a real architectural decision with alternatives.
     - Every claim about current behavior cites code as path:line, verified in this repo. No claim from an outside source is copied without checking it against the code.
     - Code, comments, test names, error messages and commit messages never reference plans, phases, changes or specs.
+    - Artifacts are written for whoever clones the repository. A step says what it needs to run (an OS, the real model, the gitignored golden set in docs/eval/, a data profile), not whose machine it runs on; a decision says what was chosen and why, not who chose it. No person's name, username or home path.
     - The user's database is the most important asset. No change may lose, hide or destroy stored memories. A new version either opens and serves the previous version's data, or refuses without touching it and with a documented way back.
     - Any change to the schema, stored identifiers (project_id, agent_id), statuses or the embedding contract ships with a test that seeds data at the previous version and proves it survives and stays reachable.
   proposal:

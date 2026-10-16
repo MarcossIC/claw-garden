@@ -85,7 +85,7 @@ Reconocer el atributo en una línea MUST ser una función pura (`hides_dead_code
 ## R6. Los docs dicen dónde están las convenciones y cómo se chequean
 
 - `AGENTS.md` MUST mandar a `.claude/CLAUDE.md` y MUST NOT repetir su contenido; `README.md` MUST mandar a `.claude/CLAUDE.md` para las convenciones (`README.md:412`).
-- `.claude/CLAUDE.md`, sección Testing, MUST dar el comando de `clippy` que hace fallar los warnings del compilador, `dead_code` y `unused` incluidos (`.claude/CLAUDE.md:98`), y cómo bendecir el contrato (`.claude/CLAUDE.md:106`). Ese comando MUST terminar con código 0:
+- `.claude/CLAUDE.md`, sección Testing, MUST dar el comando de `clippy` que hace fallar los warnings del compilador, `dead_code` y `unused` incluidos (`.claude/CLAUDE.md:99`), y cómo bendecir el contrato (`.claude/CLAUDE.md:107`). Ese comando MUST terminar con código 0:
 
   ```
   cargo clippy --workspace --all-targets -- -A clippy::all -D warnings
