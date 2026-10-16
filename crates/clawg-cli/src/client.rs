@@ -1133,6 +1133,20 @@ pub(crate) mod tests {
 
     // ── from_data_dir ───────────────────────────────────────────────────────
 
+    /// The MCP bridge repeats a call that failed with `NotRunning` (see
+    /// `mcp::startup::on_failure`). That is safe only while `NotRunning` means
+    /// the connection never opened, which a request timeout would break: a
+    /// timed-out save may already have reached the daemon.
+    #[test]
+    fn only_health_sets_a_timeout() {
+        let source = include_str!("client.rs");
+        let code = &source[..source.find("#[cfg(test)]").expect("test module")];
+        let timeouts: Vec<&str> = code.lines().filter(|l| l.contains(".timeout(")).collect();
+        assert_eq!(timeouts, ["            .timeout(HEALTH_TIMEOUT)"], "{timeouts:?}");
+        let health = &code[code.find("pub async fn health").expect("health")..];
+        assert!(health[..health.find("\n    }").expect("end")].contains(".timeout(HEALTH_TIMEOUT)"));
+    }
+
     #[tokio::test]
     async fn from_data_dir_is_none_without_lifecycle_files() {
         let dir = tempfile::tempdir().expect("tempdir");

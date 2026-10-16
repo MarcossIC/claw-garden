@@ -22,6 +22,7 @@
 //! a test can drive it against an in-process daemon.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -41,7 +42,7 @@ use serde::Deserialize;
 use crate::client::{
     ClientError, DaemonClient, ListArgs, SaveArgs, SaveOutcome, SearchArgs, SynthesisArgs,
 };
-use crate::mcp::startup::ClientHandle;
+use crate::mcp::startup::{on_failure, ClientHandle, Next};
 use crate::mcp::tools::{
     format_docs, format_recall, format_resolution, format_rows, format_save, format_search, format_sharing,
     format_restore, format_status, format_synthesis, format_update, resolve_project,
@@ -389,14 +390,37 @@ impl ClawgMcp {
         Ok(CallToolResult::error(vec![ContentBlock::text(text.into())]))
     }
 
-    /// The daemon client, once the background start has produced one.
+    /// Runs `op` against the daemon, looking the daemon up again and running
+    /// `op` once more when the first failure is one that can fix (see
+    /// [`on_failure`]): a restarted daemon has a new token and maybe a new
+    /// port, and a start that gave up may have finished since.
     ///
-    /// The failure is already the sentence the model should read, so each tool
-    /// returns it as its own result instead of hanging or dropping the bridge.
-    async fn daemon(&self) -> Result<DaemonClient, CallToolResult> {
-        self.client.get().await.map_err(|e| {
-            CallToolResult::error(vec![ContentBlock::text(Self::explain(&e))])
-        })
+    /// `Err` is a client that could not be had at all, already the sentence
+    /// the model should read; `Ok` is what `op` returned, for the tool to
+    /// render as it always has.
+    async fn call<T, F, Fut>(&self, op: F) -> Result<Result<T, ClientError>, CallToolResult>
+    where
+        F: Fn(DaemonClient) -> Fut,
+        Fut: Future<Output = Result<T, ClientError>>,
+    {
+        let unavailable = |e: &ClientError| CallToolResult::error(vec![ContentBlock::text(Self::explain(e))]);
+        let (client, reresolved) = match self.client.get().await {
+            Ok(client) => (client, false),
+            Err(start) if on_failure(&start) == Next::Reresolve => match self.client.reresolve().await {
+                Ok(client) => (client, true),
+                Err(e @ ClientError::StoreHeld(_)) => return Err(unavailable(&e)),
+                // What failed was the start, so its reason is the answer.
+                Err(_) => return Err(unavailable(&start)),
+            },
+            Err(start) => return Err(unavailable(&start)),
+        };
+        match op(client).await {
+            Err(e) if !reresolved && on_failure(&e) == Next::Reresolve => match self.client.reresolve().await {
+                Ok(client) => Ok(op(client).await),
+                Err(again) => Ok(Err(again)),
+            },
+            done => Ok(done),
+        }
     }
 
     /// Turns a client failure into the sentence a model should act on.
@@ -408,8 +432,20 @@ impl ClawgMcp {
     /// because the model's next move is the same either way.
     fn explain(err: &ClientError) -> String {
         match err {
+            // Reached only after the daemon's files were read again, so the
+            // daemon is truly gone, and this bridge does not bring it back
+            // (see `ClientHandle::reresolve`).
             ClientError::NotRunning => {
-                "no clawg daemon is running; start one with `clawg serve` and try again"
+                "the clawg daemon is not running (it may have been stopped or updated); start it \
+                 with `clawg serve`, or reconnect clawg in your MCP client, then call again"
+                    .to_string()
+            }
+            // Also only after a fresh read: the client's own text, which says
+            // to delete the token, would not give this bridge a valid one.
+            ClientError::Unauthorized => {
+                "the clawg daemon rejected the token in its data directory even after re-reading it, \
+                 so the token file no longer matches the running daemon; restart the daemon \
+                 (`clawg status` shows its pid) and call again"
                     .to_string()
             }
             // Starting it was tried, so `clawg serve` is not the advice: the
@@ -507,6 +543,8 @@ impl ClawgMcp {
     /// Each root and legacy id is sent once per process, even when the call
     /// fails: a daemon that cannot register (an older version, say) must not
     /// cost every tool call a round trip, and the scope is the same either way.
+    /// The exception is a call the daemon never got (a refused token or
+    /// connection), which is sent again.
     async fn project_for(
         &self,
         client: &DaemonClient,
@@ -525,6 +563,11 @@ impl ClawgMcp {
                 Some(project.legacy_id.clone()).filter(|l| *l != project.id).into_iter().collect();
             if let Err(e) = client.register_project(&project.root, &legacy).await {
                 log::warn!("could not register project {}: {e}", project.root.display());
+                // The daemon never saw it, so the one found after reading the
+                // files again must get it.
+                if on_failure(&e) == Next::Reresolve {
+                    registered.remove(&(project.root.clone(), project.legacy_id.clone()));
+                }
             }
         }
         Some(project.id)
@@ -540,23 +583,29 @@ impl ClawgMcp {
         if args.content.trim().is_empty() {
             return Self::failed("content must not be empty");
         }
-        let client = match self.daemon().await {
-            Ok(c) => c,
-            Err(failure) => return Ok(failure),
-        };
-        // A save is never "all projects": a memory belongs somewhere, and an
-        // unscoped write would be invisible to every project-scoped search.
-        let project_id = self.project_for(&client, args.project_path.as_deref(), false).await;
-        let result = client
-            .save(SaveArgs {
-                content: args.content,
-                agent_id: agent_id.to_string(),
-                project_id,
-                memory_type: args.memory_type,
-                importance: args.importance,
-                derived_from: args.derived_from.unwrap_or_default(),
+        let args = &args;
+        let result = self
+            .call(|client| async move {
+                // A save is never "all projects": a memory belongs somewhere, and
+                // an unscoped write would be invisible to every project-scoped
+                // search.
+                let project_id = self.project_for(&client, args.project_path.as_deref(), false).await;
+                client
+                    .save(SaveArgs {
+                        content: args.content.clone(),
+                        agent_id: agent_id.to_string(),
+                        project_id,
+                        memory_type: args.memory_type.clone(),
+                        importance: args.importance,
+                        derived_from: args.derived_from.clone().unwrap_or_default(),
+                    })
+                    .await
             })
             .await;
+        let result = match result {
+            Ok(r) => r,
+            Err(failure) => return Ok(failure),
+        };
         // "saved" only when the daemon confirmed the rows exist: telling a
         // model otherwise invites it to search for something still in a
         // channel.
@@ -571,24 +620,26 @@ impl ClawgMcp {
         agent_id: &str,
         args: SearchMemoryArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let client = match self.daemon().await {
-            Ok(c) => c,
-            Err(failure) => return Ok(failure),
-        };
-        let project_id = self
-            .project_for(&client, args.project_path.as_deref(), args.all_projects.unwrap_or(false))
-            .await;
-        match client
-            .search(SearchArgs {
-                query: args.query,
-                agent_id: agent_id.to_string(),
-                project_id,
-                limit: args.limit,
+        let args = &args;
+        let result = self
+            .call(|client| async move {
+                let project_id = self
+                    .project_for(&client, args.project_path.as_deref(), args.all_projects.unwrap_or(false))
+                    .await;
+                client
+                    .search(SearchArgs {
+                        query: args.query.clone(),
+                        agent_id: agent_id.to_string(),
+                        project_id,
+                        limit: args.limit,
+                    })
+                    .await
             })
-            .await
-        {
-            Ok(hits) => Self::ok(format_search(hits, agent_id)),
-            Err(e) => Self::failed(Self::explain(&e)),
+            .await;
+        match result {
+            Ok(Ok(hits)) => Self::ok(format_search(hits, agent_id)),
+            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Err(failure) => Ok(failure),
         }
     }
 
@@ -597,17 +648,17 @@ impl ClawgMcp {
         agent_id: &str,
         args: RecallContextArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let client = match self.daemon().await {
-            Ok(c) => c,
-            Err(failure) => return Ok(failure),
-        };
-        let project_id = self.project_for(&client, args.project_path.as_deref(), false).await;
-        match client
-            .context(&args.query, agent_id, project_id.as_deref())
-            .await
-        {
-            Ok(context) => Self::ok(format_recall(&context)),
-            Err(e) => Self::failed(Self::explain(&e)),
+        let args = &args;
+        let result = self
+            .call(|client| async move {
+                let project_id = self.project_for(&client, args.project_path.as_deref(), false).await;
+                client.context(&args.query, agent_id, project_id.as_deref()).await
+            })
+            .await;
+        match result {
+            Ok(Ok(context)) => Self::ok(format_recall(&context)),
+            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Err(failure) => Ok(failure),
         }
     }
 
@@ -618,24 +669,26 @@ impl ClawgMcp {
         agent_id: &str,
         args: ListMemoriesArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let client = match self.daemon().await {
-            Ok(c) => c,
-            Err(failure) => return Ok(failure),
-        };
-        match client
-            .list(ListArgs {
-                kind: args.kind,
-                tier: args.tier,
-                memory_type: args.memory_type,
-                limit: args.limit,
-                offset: args.offset,
-                agent: Some(agent_id.to_string()),
-                ..Default::default()
+        let args = &args;
+        let result = self
+            .call(|client| async move {
+                client
+                    .list(ListArgs {
+                        kind: args.kind.clone(),
+                        tier: args.tier,
+                        memory_type: args.memory_type.clone(),
+                        limit: args.limit,
+                        offset: args.offset,
+                        agent: Some(agent_id.to_string()),
+                        ..Default::default()
+                    })
+                    .await
             })
-            .await
-        {
-            Ok(rows) => Self::ok(format_rows(&rows)),
-            Err(e) => Self::failed(Self::explain(&e)),
+            .await;
+        match result {
+            Ok(Ok(rows)) => Self::ok(format_rows(&rows)),
+            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Err(failure) => Ok(failure),
         }
     }
 
@@ -645,13 +698,14 @@ impl ClawgMcp {
         agent_id: &str,
         args: DeleteMemoryArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let client = match self.daemon().await {
-            Ok(c) => c,
-            Err(failure) => return Ok(failure),
-        };
-        match client.delete(&args.kind, args.id, Some(agent_id)).await {
-            Ok(n) => Self::ok(format!("deleted {n}; restore_memory with the same id and kind undoes it")),
-            Err(e) => Self::failed(Self::explain(&e)),
+        let args = &args;
+        let result = self
+            .call(|client| async move { client.delete(&args.kind, args.id, Some(agent_id)).await })
+            .await;
+        match result {
+            Ok(Ok(n)) => Self::ok(format!("deleted {n}; restore_memory with the same id and kind undoes it")),
+            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Err(failure) => Ok(failure),
         }
     }
 
@@ -661,13 +715,14 @@ impl ClawgMcp {
         agent_id: &str,
         args: RestoreMemoryArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let client = match self.daemon().await {
-            Ok(c) => c,
-            Err(failure) => return Ok(failure),
-        };
-        match client.restore(&args.kind, args.id, Some(agent_id)).await {
-            Ok(restored) => Self::ok(format_restore(&restored)),
-            Err(e) => Self::failed(Self::route_failure_text(&e, "restore a memory")),
+        let args = &args;
+        let result = self
+            .call(|client| async move { client.restore(&args.kind, args.id, Some(agent_id)).await })
+            .await;
+        match result {
+            Ok(Ok(restored)) => Self::ok(format_restore(&restored)),
+            Ok(Err(e)) => Self::failed(Self::route_failure_text(&e, "restore a memory")),
+            Err(failure) => Ok(failure),
         }
     }
 
@@ -677,13 +732,16 @@ impl ClawgMcp {
         agent_id: &str,
         args: ReadMemoryArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let client = match self.daemon().await {
-            Ok(c) => c,
-            Err(failure) => return Ok(failure),
-        };
-        match client.read_save(args.kind.as_deref().unwrap_or("memory"), args.id, Some(agent_id)).await {
-            Ok(save) => Self::ok(format_save(&save)),
-            Err(e) => Self::failed(Self::route_failure_text(&e, "read a save")),
+        let args = &args;
+        let result = self
+            .call(|client| async move {
+                client.read_save(args.kind.as_deref().unwrap_or("memory"), args.id, Some(agent_id)).await
+            })
+            .await;
+        match result {
+            Ok(Ok(save)) => Self::ok(format_save(&save)),
+            Ok(Err(e)) => Self::failed(Self::route_failure_text(&e, "read a save")),
+            Err(failure) => Ok(failure),
         }
     }
 
@@ -708,16 +766,18 @@ impl ClawgMcp {
         agent_id: &str,
         args: UpdateMemoryArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let client = match self.daemon().await {
-            Ok(c) => c,
-            Err(failure) => return Ok(failure),
-        };
-        match client
-            .update(&args.kind, args.id, args.importance, args.memory_type.as_deref(), Some(agent_id))
-            .await
-        {
-            Ok(updated) => Self::ok(format_update(&updated)),
-            Err(e) => Self::failed(Self::explain(&e)),
+        let args = &args;
+        let result = self
+            .call(|client| async move {
+                client
+                    .update(&args.kind, args.id, args.importance, args.memory_type.as_deref(), Some(agent_id))
+                    .await
+            })
+            .await;
+        match result {
+            Ok(Ok(updated)) => Self::ok(format_update(&updated)),
+            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Err(failure) => Ok(failure),
         }
     }
 
@@ -727,35 +787,42 @@ impl ClawgMcp {
         agent_id: &str,
         args: ResolveConflictArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let client = match self.daemon().await {
-            Ok(c) => c,
-            Err(failure) => return Ok(failure),
-        };
-        match client.resolve(args.keep, args.other, args.keep_both.unwrap_or(false), Some(agent_id)).await {
-            Ok(resolution) => Self::ok(format_resolution(&resolution)),
-            Err(e) => Self::failed(Self::explain(&e)),
+        let args = &args;
+        let result = self
+            .call(|client| async move {
+                client.resolve(args.keep, args.other, args.keep_both.unwrap_or(false), Some(agent_id)).await
+            })
+            .await;
+        match result {
+            Ok(Ok(resolution)) => Self::ok(format_resolution(&resolution)),
+            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Err(failure) => Ok(failure),
         }
     }
 
     /// A project's documentation belongs to the project, not to an agent, so
     /// no agent narrows it.
     pub async fn search_project_impl(&self, args: SearchProjectArgs) -> Result<CallToolResult, rmcp::ErrorData> {
-        let client = match self.daemon().await {
-            Ok(c) => c,
-            Err(failure) => return Ok(failure),
-        };
-        let Some(project_id) = self.project_for(&client, args.project_path.as_deref(), false).await else {
-            return Self::failed("no project to search: pass project_path");
-        };
-        match client.search_docs(&project_id, &args.query, args.limit).await {
-            Ok(found) => Self::ok(format_docs(&found)),
+        let args = &args;
+        let result = self
+            .call(|client| async move {
+                let Some(project_id) = self.project_for(&client, args.project_path.as_deref(), false).await else {
+                    return Ok(None);
+                };
+                client.search_docs(&project_id, &args.query, args.limit).await.map(Some)
+            })
+            .await;
+        match result {
+            Ok(Ok(Some(found))) => Self::ok(format_docs(&found)),
+            Ok(Ok(None)) => Self::failed("no project to search: pass project_path"),
             // The daemon's own 404 names the project; a bare one is a daemon
             // that predates the route.
-            Err(ClientError::Daemon { status: 404, message, .. }) if message.starts_with("404") => Self::failed(
+            Ok(Err(ClientError::Daemon { status: 404, message, .. })) if message.starts_with("404") => Self::failed(
                 "the running clawg daemon is older than this bridge and cannot search project docs; \
                  restart it with `clawg stop` and call the tool again",
             ),
-            Err(e) => Self::failed(Self::explain(&e)),
+            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Err(failure) => Ok(failure),
         }
     }
 
@@ -765,16 +832,21 @@ impl ClawgMcp {
         agent_id: &str,
         args: SynthesizeArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let client = match self.daemon().await {
-            Ok(c) => c,
-            Err(failure) => return Ok(failure),
-        };
-        let project_id = self
-            .project_for(&client, args.project_path.as_deref(), args.all_projects.unwrap_or(false))
+        let args = &args;
+        let result = self
+            .call(|client| async move {
+                let project_id = self
+                    .project_for(&client, args.project_path.as_deref(), args.all_projects.unwrap_or(false))
+                    .await;
+                client
+                    .synthesis(&SynthesisArgs { agent_id: Some(agent_id.into()), project_id, limit: args.limit })
+                    .await
+            })
             .await;
-        match client.synthesis(&SynthesisArgs { agent_id: Some(agent_id.into()), project_id, limit: args.limit }).await {
-            Ok(synthesis) => Self::ok(format_synthesis(&synthesis)),
-            Err(e) => Self::failed(Self::explain(&e)),
+        match result {
+            Ok(Ok(synthesis)) => Self::ok(format_synthesis(&synthesis)),
+            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Err(failure) => Ok(failure),
         }
     }
 
@@ -782,23 +854,24 @@ impl ClawgMcp {
         &self,
         (agent_id, source): (String, AgentSource),
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let client = match self.daemon().await {
-            Ok(c) => c,
-            Err(failure) => return Ok(failure),
-        };
-        // Read here rather than asked of the daemon: both read the same file
-        // in the same data directory, so this is what the next search will use.
-        let sharing = format_sharing(&sharing::load(client.base_dir()), &agent_id);
-        match client.health().await {
-            Ok(health) => Self::ok(format_status(
-                &health,
-                self.profile,
-                client.base_dir(),
-                &agent_id,
-                source.describe(),
-                &sharing,
-            )),
-            Err(e) => Self::failed(Self::explain(&e)),
+        let result = self.call(|client| async move { client.health().await.map(|health| (client, health)) }).await;
+        match result {
+            Ok(Ok((client, health))) => {
+                // Read here rather than asked of the daemon: both read the same
+                // file in the same data directory, so this is what the next
+                // search will use.
+                let sharing = format_sharing(&sharing::load(client.base_dir()), &agent_id);
+                Self::ok(format_status(
+                    &health,
+                    self.profile,
+                    client.base_dir(),
+                    &agent_id,
+                    source.describe(),
+                    &sharing,
+                ))
+            }
+            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Err(failure) => Ok(failure),
         }
     }
 }
@@ -1139,7 +1212,7 @@ mod tests {
     }
 
     async fn rows_in(b: &ClawgMcp, project: &str) -> usize {
-        let client = b.daemon().await.expect("daemon");
+        let client = b.client.get().await.expect("daemon");
         client
             .list(ListArgs { kind: Some("memory".into()), project: Some(project.into()), ..Default::default() })
             .await
@@ -1155,7 +1228,7 @@ mod tests {
     async fn a_bridge_in_a_subdirectory_brings_what_was_saved_there_to_the_root() {
         let (_repo, identity) = repo_with_src();
         let (b, _d) = bridge_at(Some(identity.clone()), |r| r).await;
-        let client = b.daemon().await.expect("daemon");
+        let client = b.client.get().await.expect("daemon");
         client
             .save(SaveArgs {
                 content: "saved before paths were resolved".into(),
@@ -1348,7 +1421,7 @@ mod tests {
     }
 
     async fn rows_of(b: &ClawgMcp, agent: &str) -> usize {
-        let client = b.daemon().await.expect("daemon");
+        let client = b.client.get().await.expect("daemon");
         client
             .list(ListArgs { kind: Some("memory".into()), agent: Some(agent.into()), ..Default::default() })
             .await
@@ -1422,7 +1495,7 @@ mod tests {
         let (b, _d) = bridge().await;
         let b = b.with_agent(Some("claude-code".into()));
         let content = "the staging database is refreshed every sunday night";
-        let client = b.daemon().await.expect("daemon");
+        let client = b.client.get().await.expect("daemon");
         client
             .save(SaveArgs {
                 content: content.into(),
@@ -1473,7 +1546,7 @@ mod tests {
         .await;
         let workspaces = workspaces.expect("runtime");
         let b = b.with_agent(Some("claude-code".into()));
-        let client = b.daemon().await.expect("daemon");
+        let client = b.client.get().await.expect("daemon");
         client
             .save(SaveArgs {
                 content: "the release branch is cut on the first monday".into(),
@@ -2529,7 +2602,7 @@ mod tests {
             .expect("call");
 
         assert!(is_error(&r), "another agent's conflict must not be resolvable: {}", text(&r));
-        let client = b.daemon().await.expect("daemon");
+        let client = b.client.get().await.expect("daemon");
         let mut rows = client
             .list(ListArgs { kind: Some("memory".into()), ..Default::default() })
             .await
@@ -2771,5 +2844,244 @@ mod tests {
         assert!(finds().await.contains(content), "unhidden");
 
         assert_eq!(snapshot(store).await, before, "no row was rewritten by hiding or unhiding");
+    }
+
+    // ── reaching a restarted daemon ─────────────────────────────────────────
+
+    /// An in-process daemon over a store of its own that publishes its port
+    /// and token into `data_dir`, as `clawg serve` does, and can be stopped.
+    struct Published {
+        _store: tempfile::TempDir,
+        stop: Option<tokio::sync::oneshot::Sender<()>>,
+        served: tokio::task::JoinHandle<()>,
+    }
+
+    impl Published {
+        async fn start(data_dir: &std::path::Path, token: &str) -> Self {
+            Self::start_with(data_dir, token, |app| app).await
+        }
+
+        /// [`Published::start`] with its router wrapped by `wrap` first.
+        async fn start_with(
+            data_dir: &std::path::Path,
+            token: &str,
+            wrap: impl FnOnce(axum::Router) -> axum::Router,
+        ) -> Self {
+            let store = tempfile::tempdir().expect("tempdir");
+            let (runtime, rx) = MemoryRuntime::new_for_test(store.path().to_path_buf()).await;
+            tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
+            let (shutdown, _rx) = tokio::sync::watch::channel(false);
+            let ctx = Arc::new(AppCtx {
+                runtime,
+                token: token.to_string(),
+                profile: Profile::Dev,
+                started_at: Instant::now(),
+                shutdown,
+                save_timeout: SAVE_CONFIRM_TIMEOUT,
+            });
+            Self::serve(data_dir, token, wrap(router(ctx))).await.with_store(store)
+        }
+
+        /// Serves `app` and publishes it, for a stub that is not a daemon.
+        async fn serve(data_dir: &std::path::Path, token: &str, app: axum::Router) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+            let served = tokio::spawn(async move {
+                let _ = axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = stopped.await;
+                    })
+                    .await;
+            });
+            crate::daemon::lifecycle::write_state(
+                data_dir,
+                &crate::daemon::lifecycle::DaemonState {
+                    pid: std::process::id(),
+                    port,
+                    profile: "dev".into(),
+                    version: env!("CARGO_PKG_VERSION").into(),
+                    started_at_ms: 0,
+                },
+            )
+            .expect("write state");
+            crate::daemon::lifecycle::write_token(data_dir, token).expect("write token");
+            Self { _store: tempfile::tempdir().expect("tempdir"), stop: Some(stop), served }
+        }
+
+        fn with_store(mut self, store: tempfile::TempDir) -> Self {
+            self._store = store;
+            self
+        }
+
+        /// Returns once the port is closed and every connection to it is gone.
+        async fn stop(mut self) {
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+            let _ = (&mut self.served).await;
+        }
+    }
+
+    /// A bridge that found its daemon through the files in `data_dir`.
+    fn bridge_from(data_dir: &std::path::Path) -> ClawgMcp {
+        let client = DaemonClient::from_data_dir(data_dir).expect("published daemon");
+        ClawgMcp::with_project(client, Profile::Dev, None)
+    }
+
+    /// A stub that answers `/health` like a daemon and every other route with
+    /// `status`, counting the requests each path got.
+    fn counting_stub(
+        status: axum::http::StatusCode,
+    ) -> (axum::Router, Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>) {
+        let hits: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>> = Arc::default();
+        let counted = Arc::clone(&hits);
+        let app = axum::Router::new()
+            .route(
+                "/health",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({
+                        "status": "ok", "version": env!("CARGO_PKG_VERSION"), "profile": "dev",
+                        "pid": 1, "embedder": "ready", "uptime_s": 0
+                    }))
+                }),
+            )
+            .fallback(move |uri: axum::http::Uri| {
+                let counted = Arc::clone(&counted);
+                async move {
+                    *counted.lock().unwrap().entry(uri.path().to_string()).or_default() += 1;
+                    (status, axum::Json(serde_json::json!({ "error": "stub" })))
+                }
+            });
+        (app, hits)
+    }
+
+    #[tokio::test]
+    async fn a_restarted_daemon_is_reached_with_its_new_token() {
+        let data = tempfile::tempdir().expect("tempdir");
+        let a = Published::start(data.path(), "token-of-a").await;
+        let b = bridge_from(data.path());
+        assert!(!is_error(&b.save_memory_impl("agent", save_args("before the restart")).await.unwrap()));
+
+        a.stop().await;
+        let _b_daemon = Published::start(data.path(), "token-of-b").await;
+
+        let saved = b.save_memory_impl("agent", save_args("the deploy runs on fridays")).await.unwrap();
+        assert!(!is_error(&saved), "{}", text(&saved));
+        let found = b.search_memory_impl("agent", search_args("the deploy runs on fridays")).await.unwrap();
+        assert!(!is_error(&found), "{}", text(&found));
+        assert!(text(&found).contains("the deploy runs on fridays"), "{}", text(&found));
+    }
+
+    #[tokio::test]
+    async fn memory_status_after_a_restart_reports_the_new_daemon() {
+        let data = tempfile::tempdir().expect("tempdir");
+        let a = Published::start(data.path(), "token-of-a").await;
+        let b = bridge_from(data.path());
+        a.stop().await;
+        let _b_daemon = Published::start(data.path(), "token-of-b").await;
+
+        let status = b.memory_status_impl(("agent".into(), AgentSource::Flag)).await.unwrap();
+        assert!(!is_error(&status), "{}", text(&status));
+        assert!(text(&status).contains("\"status\": \"ok\""), "{}", text(&status));
+    }
+
+    #[tokio::test]
+    async fn a_refused_token_is_reread_once() {
+        let data = tempfile::tempdir().expect("tempdir");
+        let (app, hits) = counting_stub(axum::http::StatusCode::UNAUTHORIZED);
+        let _stub = Published::serve(data.path(), "any", app).await;
+        let b = bridge_from(data.path());
+
+        let saved = b.save_memory_impl("agent", save_args("refused twice")).await.unwrap();
+        assert!(is_error(&saved));
+        let hits = hits.lock().unwrap().clone();
+        assert_eq!(hits.get("/v1/memories"), Some(&2), "{hits:?}");
+    }
+
+    #[tokio::test]
+    async fn an_error_the_daemon_answered_reaches_it_once() {
+        let data = tempfile::tempdir().expect("tempdir");
+        let (app, hits) = counting_stub(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        let _stub = Published::serve(data.path(), "any", app).await;
+        let b = bridge_from(data.path());
+
+        let saved = b.save_memory_impl("agent", save_args("failed once")).await.unwrap();
+        assert!(is_error(&saved));
+        let hits = hits.lock().unwrap().clone();
+        assert_eq!(hits.get("/v1/memories"), Some(&1), "{hits:?}");
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_comes_up_after_the_start_gave_up_is_used() {
+        let data = tempfile::tempdir().expect("tempdir");
+        let (outcome, handle) = ClientHandle::pending(Duration::from_millis(50), data.path().to_path_buf());
+        let b = ClawgMcp::with_handle(handle, Profile::Dev, None);
+        outcome
+            .send(crate::mcp::startup::Startup::Failed(Arc::new(ClientError::StartTimeout(Duration::from_secs(60)))))
+            .ok();
+        let gave_up = b.memory_status_impl(("agent".into(), AgentSource::Flag)).await.unwrap();
+        assert!(text(&gave_up).contains("clawg status"), "{}", text(&gave_up));
+
+        let _late = Published::start(data.path(), "late-token").await;
+        let status = b.memory_status_impl(("agent".into(), AgentSource::Flag)).await.unwrap();
+        assert!(!is_error(&status), "{}", text(&status));
+    }
+
+    #[tokio::test]
+    async fn a_daemon_stopped_mid_session_is_reported_without_starting_one() {
+        let data = tempfile::tempdir().expect("tempdir");
+        let a = Published::start(data.path(), "token-of-a").await;
+        let b = bridge_from(data.path());
+        a.stop().await;
+
+        let saved = b.save_memory_impl("agent", save_args("nobody hears this")).await.unwrap();
+        assert!(is_error(&saved));
+        let t = text(&saved);
+        assert!(t.contains("may have been stopped or updated") && t.contains("clawg serve"), "{t}");
+        let left = DaemonClient::from_data_dir(data.path()).expect("files");
+        assert!(left.health().await.is_err(), "no daemon was started");
+    }
+
+    #[tokio::test]
+    async fn the_refused_token_text_does_not_say_to_delete_it() {
+        let data = tempfile::tempdir().expect("tempdir");
+        let (app, _hits) = counting_stub(axum::http::StatusCode::UNAUTHORIZED);
+        let _stub = Published::serve(data.path(), "any", app).await;
+        let b = bridge_from(data.path());
+
+        let t = text(&b.list_memories_impl("agent", list_all()).await.unwrap());
+        assert!(!t.contains("delete the token file"), "{t}");
+        assert!(t.contains("even after re-reading it"), "{t}");
+    }
+
+    #[tokio::test]
+    async fn a_project_registration_the_old_daemon_refused_is_sent_to_the_new_one() {
+        let data = tempfile::tempdir().expect("tempdir");
+        let registered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&registered);
+        let _daemon = Published::start_with(data.path(), "token-of-the-new-daemon", move |app| {
+            app.layer(axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let counted = Arc::clone(&counted);
+                async move {
+                    let projects = req.uri().path() == "/v1/projects";
+                    let response = next.run(req).await;
+                    if projects && response.status().is_success() {
+                        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    response
+                }
+            }))
+        })
+        .await;
+        // What a bridge holds after its daemon restarted: the right address,
+        // the old token.
+        let current = DaemonClient::from_data_dir(data.path()).expect("files");
+        let stale = DaemonClient::new(current.base_url(), "token-of-the-old-daemon", data.path().to_path_buf());
+        let b = ClawgMcp::with_project(stale, Profile::Dev, Some(test_project()));
+
+        let saved = b.save_memory_impl("agent", save_args("registered after all")).await.unwrap();
+        assert!(!is_error(&saved), "{}", text(&saved));
+        assert_eq!(registered.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

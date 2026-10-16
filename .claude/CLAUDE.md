@@ -30,7 +30,7 @@ Design documents live in `docs/`.
 ## Commands
 
 - `clawg serve [--profile P] [--port N]`: run the daemon (`--port 0` binds an ephemeral port).
-- `clawg mcp [--profile P] [--no-autostart] [--agent NAME]`: stdio MCP bridge to the daemon; starts one if none is running unless `--no-autostart`. The agent id is `--agent`, else the client's `clientInfo.name`, else `mcp`.
+- `clawg mcp [--profile P] [--no-autostart] [--agent NAME]`: stdio MCP bridge to the daemon; starts one if none is running unless `--no-autostart`. When a call is refused (401 or connection refused) or the start gave up, it reads `daemon.json` and `token` again and repeats the call once, but never starts a daemon mid-session (`crates/clawg-cli/src/mcp/startup.rs`). The agent id is `--agent`, else the client's `clientInfo.name`, else `mcp`.
 - `clawg status [--profile P]`: print daemon state and health as JSON; exit 1 if not running.
 - `clawg stop [--profile P]`: stop the daemon and wait for the process to exit.
 - `clawg backup [--profile P]`: write a snapshot of `memory.db` to `<data>/backups` and print its path; goes through the daemon when one is running.

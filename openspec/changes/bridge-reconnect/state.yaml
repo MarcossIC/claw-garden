@@ -1,14 +1,14 @@
 change: bridge-reconnect
 objective: "4"
 depends_on: []
-phase: explore
+phase: verify
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
-  apply: pending
-  verify: pending
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: in_progress  # Linux and the real binary done; Windows and the dev profile with Claude Code pending, see verify.md
   archive: pending
-updated: 2026-10-15
+updated: 2026-10-16
