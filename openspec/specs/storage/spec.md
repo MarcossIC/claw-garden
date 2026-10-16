@@ -222,7 +222,7 @@ El nombre MUST ser `memory-<AAAA-MM-DD>T<hh-mm-ss.mmm>Z-<motivo>.db` en UTC, de 
 
 ### Retención
 
-Después de cada snapshot automático, el directorio de backups MUST conservar los 5 automáticos más nuevos (`AUTO_KEEP`, `backup.rs:226`) y borrar los demás automáticos. Los `manual` MUST NOT borrarse nunca, y un archivo con otro nombre MUST NOT tocarse. La elección es pura (`to_prune`, `backup.rs:231`); el borrado es best-effort.
+Después de cada snapshot automático, el directorio de backups MUST conservar los 5 automáticos más nuevos (`AUTO_KEEP`, `backup.rs:231`) y borrar los demás automáticos. Los `manual` MUST NOT borrarse nunca, y un archivo con otro nombre MUST NOT tocarse. La elección es pura (`to_prune`, `backup.rs:236`); el borrado es best-effort.
 
 #### Escenario
 - GIVEN 7 snapshots automáticos, 2 manuales y un `notas.txt`

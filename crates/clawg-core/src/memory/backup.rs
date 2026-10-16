@@ -224,9 +224,10 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
-/// How many automatic snapshots (`pre-migration`, `pre-restore`) are kept.
-/// One is taken per upgrade that migrates or per restore, so five cover
-/// several in a row. A starting value, not measured.
+/// How many automatic snapshots (`pre-migration`, `pre-restore`,
+/// `pre-reembed`) are kept. One is taken per upgrade that migrates, per
+/// restore or per re-embed, so five cover several in a row. A starting
+/// value, not measured.
 pub const AUTO_KEEP: usize = 5;
 
 /// The automatic snapshots among `names` that fall outside the newest

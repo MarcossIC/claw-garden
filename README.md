@@ -107,7 +107,7 @@ El script de instalación busca `clawg.exe` **al lado de sí mismo**, así que p
 Copy-Item target\release\clawg.exe scripts\clawg.exe; powershell -ExecutionPolicy Bypass -File scripts\install.ps1
 ```
 
-Al terminar muestra la versión (por ejemplo `clawg 0.2.0`) e `Installed to ...`.
+Al terminar muestra la versión instalada (`clawg` y el número) e `Installed to ...`.
 
 El script:
 
@@ -140,7 +140,7 @@ En la terminal nueva, corré estos tres comandos uno por uno.
 clawg --version
 ```
 
-Imprime la versión, por ejemplo `clawg 0.2.0`. Si dice que no reconoce el comando, no abriste una terminal nueva o el PATH no se actualizó.
+Imprime `clawg` y la versión instalada. Si dice que no reconoce el comando, no abriste una terminal nueva o el PATH no se actualizó.
 
 **2. El diagnóstico del PATH**
 
@@ -409,4 +409,4 @@ Cada directorio de datos contiene la base SQLite de memoria, `daemon.json` (pid,
 cargo test --workspace
 ```
 
-Mirá `AGENTS.md` para las convenciones de contribución y de agentes.
+Mirá [`.claude/CLAUDE.md`](.claude/CLAUDE.md) para las convenciones de contribución y de agentes.
