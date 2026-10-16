@@ -15,10 +15,16 @@ context: |
     5. Over time, extract conclusions: preferences, trends, guidelines, experiences.
   Retrieval baseline (rag-eval --real, golden set of 46 cases, mean pooling, cosine floor 0.79):
   R@1 0.4348, R@5 0.6522, R@10 0.8478, MRR 0.5524, nDCG@10 0.6215
-  (docs/eval/results/2026-10-15-real-project-indexing-tip-anchor.json).
+  (docs/eval/results/2026-10-15-real-project-indexing-tip-anchor.json; reproduced with no case moving in
+  docs/eval/results/2026-10-16-real-eval-rigor-tip-anchor.json, which also carries hits and by_split).
+  Lexical-only floor (rag-eval --real --lexical-only): R@1 0.3478, R@5 0.5000, R@10 0.5000, MRR 0.4040
+  (docs/eval/results/2026-10-16-real-lexical-only.json).
+  Compare two runs with rag-eval --diff: a conclusion needs at least 6 cases moving one way (p < 0.05).
   Agent-view baseline (RELEVANCE_RATIO 0.35): search_memory 36/46 at 764.0 mean tokens,
   recall_context 39/46 at 1086.4 (docs/eval/results/2026-10-15-real-project-indexing-relcut-agent-view.json).
-  Test baseline: cargo test --workspace -> 1918 passed, 0 failed.
+  Test baseline (Windows): cargo test --workspace -> 1983 passed, 1 failed. The failure,
+  projects::tests::adding_a_project_lets_its_docs_be_searched, is a test bug: it registers a root
+  with the \\?\ prefix that ProjectIdentity::resolve strips.
 
 strict_tdd: true
 
