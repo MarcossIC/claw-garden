@@ -74,6 +74,11 @@ pub struct CaseResult {
     #[serde(rename = "ndcg@10")]
     pub ndcg_10: f64,
     pub status: CaseStatus,
+    /// The language of the query, as the golden case names it. Left out of
+    /// the file when the case names none, which also keeps a file written
+    /// before it existed readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_lang: Option<String>,
     /// The language this case is written in, when its expected corpus rows
     /// agree on one. `None` for a case whose expected rows declare no `lang`
     /// or disagree about it — such a case still counts toward the headline
@@ -932,6 +937,7 @@ mod tests {
             mrr: recall_10,
             ndcg_10: recall_10,
             status,
+            query_lang: None,
             lang: None,
             subset: CaseSubset::Natural,
             abstained: None,
@@ -1054,6 +1060,20 @@ mod tests {
         json.as_object_mut().unwrap().remove("subset");
         let back: CaseResult = serde_json::from_value(json).unwrap();
         assert_eq!(back.subset, CaseSubset::Natural);
+    }
+
+    #[test]
+    fn a_case_result_without_query_lang_neither_writes_nor_requires_it() {
+        let json = serde_json::to_value(case("q", 1.0, CaseStatus::Active)).unwrap();
+        assert!(json.get("query_lang").is_none(), "{json}");
+        let back: CaseResult = serde_json::from_value(json).unwrap();
+        assert_eq!(back.query_lang, None);
+
+        let labelled = CaseResult { query_lang: Some("es".to_string()), ..case("q", 1.0, CaseStatus::Active) };
+        let json = serde_json::to_value(&labelled).unwrap();
+        assert_eq!(json["query_lang"], "es");
+        let back: CaseResult = serde_json::from_value(json).unwrap();
+        assert_eq!(back.query_lang.as_deref(), Some("es"));
     }
 
     #[test]

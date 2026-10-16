@@ -242,6 +242,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             expected_refs: case.expected_refs.clone(),
             corpus_refs: case.corpus_refs.clone(),
             status: case.status,
+            query_lang: case.query_lang.clone(),
             lang: case_lang(&case.expected_refs, &lang_by_ref),
             subset: case.subset,
             stale_refs: case.stale_refs.clone(),
@@ -264,6 +265,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
                 expected_refs: c.expected_refs.clone(),
                 corpus_refs: c.corpus_refs.clone(),
                 query_vector: c.embedding.clone(),
+                query_lang: c.query_lang.clone(),
                 lang: c.lang.clone(),
                 subset: c.subset,
             })
@@ -453,6 +455,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
                 mrr,
                 ndcg_10,
                 status: ec.status,
+                query_lang: ec.query_lang.clone(),
                 lang: ec.lang.clone(),
                 subset: ec.subset,
                 abstained,
@@ -868,6 +871,7 @@ async fn score_follow_up_arm<'a>(
             mrr,
             ndcg_10,
             status: case.status,
+            query_lang: case.query_lang.clone(),
             lang: case_lang(&case.expected_refs, ctx.lang_by_ref),
             subset: case.subset,
             abstained: None,
@@ -951,6 +955,7 @@ struct EmbeddedCase {
     expected_refs: Vec<String>,
     corpus_refs: Vec<String>,
     status: CaseStatus,
+    query_lang: Option<String>,
     lang: Option<String>,
     subset: CaseSubset,
     stale_refs: Vec<String>,
@@ -1098,6 +1103,7 @@ struct SimCaseSource {
     expected_refs: Vec<String>,
     corpus_refs: Vec<String>,
     query_vector: Vec<f32>,
+    query_lang: Option<String>,
     lang: Option<String>,
     subset: CaseSubset,
 }
@@ -1148,6 +1154,7 @@ fn build_similarity_results(
             mrr,
             ndcg_10,
             status: CaseStatus::Active,
+            query_lang: src.query_lang.clone(),
             lang: src.lang.clone(),
             subset: src.subset,
             abstained: None,
@@ -1620,6 +1627,33 @@ mod tests {
         let ranked_ndcg = metrics::ndcg_at_10(&ranked_refs, &expected);
         let sim_ndcg = metrics::ndcg_at_10(&sim_ranked_refs, &expected);
         assert_eq!(ranked_ndcg, sim_ndcg);
+    }
+
+    #[tokio::test]
+    async fn the_query_language_reaches_the_retrieval_and_similarity_cases() {
+        let golden = sweep_golden_json().replacen(
+            r#""expected_refs": ["c1"]}"#,
+            r#""expected_refs": ["c1"], "query_lang": "es"}"#,
+            1,
+        );
+        let json = run_fake(&golden, "query-lang").await;
+        let per_case = &json["retrieval"]["per_case"];
+        assert_eq!(per_case[0]["query_lang"], "es");
+        assert_eq!(per_case[0]["lang"], "en");
+        assert!(per_case[1].get("query_lang").is_none(), "an unlabelled case writes no key: {}", per_case[1]);
+
+        let source = SimCaseSource {
+            query: "q".to_string(),
+            expected_refs: vec!["c1".to_string()],
+            corpus_refs: vec!["c1".to_string()],
+            query_vector: vec![1.0, 0.0],
+            query_lang: Some("es".to_string()),
+            lang: Some("en".to_string()),
+            subset: CaseSubset::Natural,
+        };
+        let sim = build_similarity_results(&[source], &[("c1".to_string(), vec![1.0, 0.0])], K_FINAL, "", "");
+        assert_eq!(sim.per_case[0].query_lang.as_deref(), Some("es"));
+        assert_eq!(sim.per_case[0].lang.as_deref(), Some("en"));
     }
 
     #[test]

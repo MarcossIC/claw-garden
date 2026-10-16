@@ -491,6 +491,7 @@ mod tests {
             mrr: recall_1,
             ndcg_10: recall_10,
             status: CaseStatus::Active,
+            query_lang: None,
             lang: None,
             subset: crate::golden::CaseSubset::Natural,
             abstained: None,

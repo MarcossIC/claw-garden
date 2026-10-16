@@ -87,6 +87,10 @@ pub struct RetrievalCase {
     /// expected row restates.
     #[serde(default)]
     pub stale_refs: Vec<String>,
+    /// The language the query is written in, which need not be that of the
+    /// rows it expects. A label for the report: never seeded nor embedded.
+    #[serde(default)]
+    pub query_lang: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -528,6 +532,28 @@ mod tests {
     #[test]
     fn a_misspelled_subset_key_fails_to_parse() {
         let raw = case_with(r#", "subsett": "lexical""#);
+        assert!(serde_json::from_str::<GoldenSet>(&raw).is_err());
+    }
+
+    // --- query language ------------------------------------------------------
+
+    #[test]
+    fn a_case_may_name_the_language_of_its_query() {
+        let golden = parse_only(&case_with(r#", "query_lang": "es""#));
+        assert_eq!(golden.retrieval_cases[0].query_lang.as_deref(), Some("es"));
+        validate(&golden).expect("a labelled case validates like any other");
+    }
+
+    #[test]
+    fn a_case_without_query_lang_has_none() {
+        let golden = parse_only(VALID_MINIMAL);
+        assert_eq!(golden.retrieval_cases[0].query_lang, None);
+        validate(&golden).expect("an unlabelled case validates as before");
+    }
+
+    #[test]
+    fn a_misspelled_query_lang_key_fails_to_parse() {
+        let raw = case_with(r#", "query_lnag": "es""#);
         assert!(serde_json::from_str::<GoldenSet>(&raw).is_err());
     }
 
