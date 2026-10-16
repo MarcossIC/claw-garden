@@ -181,24 +181,29 @@ fn print_metric(name: &str, m: &MetricDiff) {
 mod tests {
     use super::*;
 
-    /// The reference results file this stage's tests measure against —
-    /// resolved the same CWD-independent way as `cli::default_golden_path`,
-    /// since `cargo test` may run from a different working directory than
-    /// this crate's manifest.
-    fn reference_results_path() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("docs")
-            .join("eval")
-            .join("results")
-            .join("2026-08-16-real-symmetric.json")
+    /// A results file small enough to read at a glance: two cases in each
+    /// block, the first one recalled at rank 1. Inline rather than read from
+    /// `docs/eval/results/`, which git ignores, so the test runs on any machine.
+    fn reference_value() -> Value {
+        let case = |query: &str, expected: &str, ranked: [&str; 2], hit: f64| {
+            serde_json::json!({
+                "query": query, "expected_refs": [expected], "ranked_refs": ranked,
+                "recall@1": hit, "recall@5": 1.0, "recall@10": 1.0, "mrr": if hit == 1.0 { 1.0 } else { 0.5 },
+                "ndcg@10": if hit == 1.0 { 1.0 } else { 0.6309 }, "status": "active", "lang": "en"
+            })
+        };
+        let cases = serde_json::json!([
+            case("where is the cache", "c1", ["c1", "c2"], 1.0),
+            case("which port does it use", "c2", ["c1", "c2"], 0.0),
+        ]);
+        serde_json::json!({
+            "retrieval": { "per_case": cases.clone() },
+            "similarity": { "per_case": cases },
+        })
     }
 
-    fn reference_value() -> Value {
-        let text = std::fs::read_to_string(reference_results_path())
-            .expect("reference results file must exist");
-        serde_json::from_str(&text).expect("reference results file must be valid JSON")
+    fn reference_results_path() -> std::path::PathBuf {
+        std::path::PathBuf::from("reference.json")
     }
 
     fn assert_block_is_a_no_op(block: &BlockDiff, label: &str) {
@@ -294,7 +299,9 @@ mod tests {
 
     #[test]
     fn diff_files_reads_both_paths_and_produces_the_same_result_as_diff_values() {
-        let path = reference_results_path();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("reference.json");
+        std::fs::write(&path, reference_value().to_string()).expect("write the fixture");
         let diff = diff_files(&path, &path).expect("diffing the reference file against itself must succeed");
         assert_block_is_a_no_op(&diff.retrieval, "retrieval");
         assert_block_is_a_no_op(&diff.similarity, "similarity");
@@ -303,8 +310,7 @@ mod tests {
     #[test]
     fn diff_files_reports_which_path_failed_to_read() {
         let missing = std::path::PathBuf::from("this-file-does-not-exist-anywhere.json");
-        let path = reference_results_path();
-        let err = diff_files(&missing, &path).expect_err("a missing file must be an error");
+        let err = diff_files(&missing, &reference_results_path()).expect_err("a missing file must be an error");
         match err {
             DiffError::Read { path: p, .. } => assert_eq!(p, missing),
             other => panic!("expected DiffError::Read, got {other:?}"),
