@@ -1045,6 +1045,10 @@ pub struct RegisterRequest {
     /// Ids the same project was saved under before paths were resolved.
     #[serde(default)]
     pub legacy_ids: Vec<String>,
+    /// Whether the daemon may read the root's files. False when missing, so a
+    /// caller that does not say only labels memories with the root.
+    #[serde(default)]
+    pub index_docs: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1064,12 +1068,16 @@ async fn register(
     if body.root_path.trim().is_empty() {
         return Err(ApiError::bad_request("root_path must not be empty"));
     }
+    let root = std::path::Path::new(&body.root_path);
+    if body.index_docs && !root.is_dir() {
+        return Err(ApiError::bad_request(format!("{} is not a directory, so it has no files to index", body.root_path)));
+    }
     let outcome = register_project(
         &app.runtime.store,
         &app.runtime.workspaces(),
-        std::path::Path::new(&body.root_path),
+        root,
         &body.legacy_ids,
-        true,
+        body.index_docs,
     )
     .await
     .map_err(|e| match e {
@@ -1077,7 +1085,9 @@ async fn register(
         RegisterError::RootCollision { .. } => ApiError::conflict(e.to_string()),
         RegisterError::Store(_) => ApiError::internal(e),
     })?;
-    spawn_doc_refresh(app.clone(), outcome.project_id.clone());
+    if outcome.index_docs {
+        spawn_doc_refresh(app.clone(), outcome.project_id.clone());
+    }
     Ok(Json(RegisteredBody { project_id: outcome.project_id, rekeyed: outcome.rekeyed }))
 }
 
@@ -1148,6 +1158,23 @@ pub struct DocsSearchBody {
     pub warning: Option<String>,
 }
 
+/// Why a project's docs are not searched, and the one command that changes it.
+///
+/// The user runs it, not the model: a tool argument the model could send on
+/// its own would not be a choice the user made.
+fn not_accepted(root: &std::path::Path, profile: Profile) -> String {
+    let flag = match profile {
+        Profile::Prod => String::new(),
+        other => format!(" --profile {}", other.as_str()),
+    };
+    format!(
+        "clawg reads the files of the project a bridge was started in, and of the ones the user \
+         added; {root} is neither. Ask the user to run `clawg projects add \"{root}\"{flag}` if \
+         they want it searched, then call again",
+        root = root.display()
+    )
+}
+
 /// Searches a registered project's documentation, refreshing its index first
 /// when the last refresh is older than [`project_docs::REFRESH_INTERVAL`].
 async fn search_docs(
@@ -1160,6 +1187,7 @@ async fn search_docs(
     let store = &app.runtime.store;
     project_docs::root_of(store, &body.project_id).await.map_err(|e| match e {
         DocIndexError::UnknownProject(_) => ApiError::not_found(e.to_string()),
+        DocIndexError::NotAccepted(root) => ApiError::new(StatusCode::FORBIDDEN, not_accepted(&root, app.profile)),
         other => ApiError::internal(other),
     })?;
     let embedder = ready_embedder(&app)?;
@@ -1198,6 +1226,13 @@ mod tests {
 
     fn chunk(id: i64, outcome: ChunkOutcome) -> SavedChunk {
         SavedChunk { id, outcome }
+    }
+
+    #[test]
+    fn the_refusal_names_the_command_for_the_daemons_profile() {
+        let root = std::path::Path::new("/work/other");
+        assert!(not_accepted(root, Profile::Prod).contains("`clawg projects add \"/work/other\"`"));
+        assert!(not_accepted(root, Profile::Dev).contains("`clawg projects add \"/work/other\" --profile dev`"));
     }
 
     #[test]

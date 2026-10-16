@@ -800,11 +800,13 @@ impl DaemonClient {
     }
 
     /// Records `root` as a project and moves rows saved under `legacy_ids`
-    /// onto it. Returns the id the daemon derived and how many rows moved.
+    /// onto it, letting the daemon read its files when `index_docs`. Returns
+    /// the id the daemon derived and how many rows moved.
     pub async fn register_project(
         &self,
         root: &std::path::Path,
         legacy_ids: &[String],
+        index_docs: bool,
     ) -> Result<(String, usize), ClientError> {
         #[derive(Deserialize)]
         struct Body {
@@ -818,6 +820,7 @@ impl DaemonClient {
             .json(&serde_json::json!({
                 "root_path": root.to_string_lossy(),
                 "legacy_ids": legacy_ids,
+                "index_docs": index_docs,
             }))
             .send()
             .await

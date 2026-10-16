@@ -1734,20 +1734,91 @@ async fn registering_a_root_indexes_its_docs_in_the_background() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(dir.path().join("README.md"), "# Readme\nindexed in the background\n").unwrap();
 
-    let (status, body) =
-        h.post_json("/v1/projects", json!({ "root_path": dir.path().display().to_string() })).await;
+    let (status, body) = h
+        .post_json("/v1/projects", json!({ "root_path": dir.path().display().to_string(), "index_docs": true }))
+        .await;
     assert_eq!(status, 200, "{body}");
     let id = body["project_id"].as_str().expect("project_id").to_string();
 
+    wait_for_docs(&h, &id, 1).await;
+}
+
+async fn wait_for_docs(h: &Harness, id: &str, expected: usize) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let docs = clawg_core::memory::project_docs::doc_count(&h.ctx.runtime.store, &id).await.unwrap();
-        if docs == 1 {
+        let docs = clawg_core::memory::project_docs::doc_count(&h.ctx.runtime.store, id).await.unwrap();
+        if docs == expected {
             break;
         }
         assert!(Instant::now() < deadline, "the docs were never indexed");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+async fn index_docs_of(h: &Harness, id: &str) -> Option<i64> {
+    let id = id.to_string();
+    h.ctx
+        .runtime
+        .store
+        .conn
+        .call(move |c| c.query_row("SELECT (SELECT index_docs FROM project WHERE id = ?1)", [id], |r| r.get(0)))
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_root_registered_without_its_docs_is_not_indexed() {
+    let h = Harness::start().await;
+    let label = tempfile::tempdir().expect("tempdir");
+    std::fs::write(label.path().join("README.md"), "# Readme\nnever read\n").unwrap();
+    let accepted = tempfile::tempdir().expect("tempdir");
+    std::fs::write(accepted.path().join("README.md"), "# Readme\nread\n").unwrap();
+
+    let (status, body) = h.post_json("/v1/projects", json!({ "root_path": label.path().display().to_string() })).await;
+    assert_eq!(status, 200, "{body}");
+    let label_id = body["project_id"].as_str().expect("project_id").to_string();
+    // Registered after, so once its docs are in, the first root's refresh
+    // would have run too if it had been started.
+    let (_, body) = h
+        .post_json("/v1/projects", json!({ "root_path": accepted.path().display().to_string(), "index_docs": true }))
+        .await;
+    wait_for_docs(&h, body["project_id"].as_str().expect("project_id"), 1).await;
+
+    assert_eq!(index_docs_of(&h, &label_id).await, Some(0));
+    assert_eq!(clawg_core::memory::project_docs::doc_count(&h.ctx.runtime.store, &label_id).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn searching_the_docs_of_a_root_that_was_not_accepted_is_forbidden() {
+    let h = Harness::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("README.md"), "# Readme\nnever read\n").unwrap();
+    let root = dir.path().display().to_string();
+    let (_, body) = h.post_json("/v1/projects", json!({ "root_path": root })).await;
+    let id = body["project_id"].as_str().expect("project_id").to_string();
+
+    let (status, body) = h.post_json("/v1/projects/docs/search", json!({ "project_id": id, "query": "never read" })).await;
+
+    assert_eq!(status, 403, "{body}");
+    let error = body["error"].as_str().expect("error");
+    assert!(error.contains(&format!("clawg projects add \"{root}\" --profile dev")), "{error}");
+    assert_eq!(clawg_core::memory::project_docs::doc_count(&h.ctx.runtime.store, &id).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn registering_a_missing_root_to_index_it_is_a_bad_request() {
+    let h = Harness::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("gone").display().to_string();
+
+    let (status, body) = h.post_json("/v1/projects", json!({ "root_path": missing, "index_docs": true })).await;
+    assert_eq!(status, 400, "{body}");
+    let id = clawg_core::memory::derive_project_id(std::path::Path::new(&missing));
+    assert_eq!(index_docs_of(&h, &id).await, None);
+
+    // As a label for memories it is still taken, as it always was.
+    let (status, body) = h.post_json("/v1/projects", json!({ "root_path": missing })).await;
+    assert_eq!(status, 200, "{body}");
 }
 
 #[tokio::test]

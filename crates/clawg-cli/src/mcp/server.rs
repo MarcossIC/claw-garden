@@ -561,7 +561,7 @@ impl ClawgMcp {
         if registered.insert((project.root.clone(), project.legacy_id.clone())) {
             let legacy: Vec<String> =
                 Some(project.legacy_id.clone()).filter(|l| *l != project.id).into_iter().collect();
-            if let Err(e) = client.register_project(&project.root, &legacy).await {
+            if let Err(e) = client.register_project(&project.root, &legacy, true).await {
                 log::warn!("could not register project {}: {e}", project.root.display());
                 // The daemon never saw it, so the one found after reading the
                 // files again must get it.
@@ -3078,7 +3078,10 @@ mod tests {
         // the old token.
         let current = DaemonClient::from_data_dir(data.path()).expect("files");
         let stale = DaemonClient::new(current.base_url(), "token-of-the-old-daemon", data.path().to_path_buf());
-        let b = ClawgMcp::with_project(stale, Profile::Dev, Some(test_project()));
+        // A root on disk: the bridge's own root is registered to be indexed,
+        // and the daemon refuses that for a directory that does not exist.
+        let repo = tempfile::tempdir().expect("tempdir");
+        let b = ClawgMcp::with_project(stale, Profile::Dev, Some(ProjectIdentity::resolve(repo.path())));
 
         let saved = b.save_memory_impl("agent", save_args("registered after all")).await.unwrap();
         assert!(!is_error(&saved), "{}", text(&saved));
