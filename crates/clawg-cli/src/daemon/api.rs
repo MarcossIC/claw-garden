@@ -33,7 +33,7 @@ use clawg_core::memory::admin::{
 use clawg_core::memory::backup::Reason;
 use clawg_core::memory::bootstrap::EmbedderStatus;
 use clawg_core::memory::dispute::{resolve_dispute_core, Outcome, Resolution, ResolveError};
-use clawg_core::memory::embedder::{EmbedRole, Embedder};
+use clawg_core::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use clawg_core::memory::project_docs::{self, DocHit, DocIndexError, RefreshOutcome};
 use clawg_core::memory::worker::{
     ChunkOutcome, IngestFailure, IngestReport, SavedChunk,
@@ -439,6 +439,10 @@ pub struct HealthBody {
     /// Whether the daemon retries the failed load by itself; `null` unless
     /// `embedder` is `"failed"`.
     pub embedder_retryable: Option<bool>,
+    /// Whether the model is in memory now. `false` means a `"ready"` daemon
+    /// let it go for being idle and the next request that needs it waits for
+    /// it to load again; `null` until the bootstrap loaded it once.
+    pub embedder_resident: Option<bool>,
     pub uptime_s: u64,
     /// Saves accepted and not yet stored, and those that failed after the
     /// caller was answered. Left out when the store did not answer in time:
@@ -681,6 +685,7 @@ async fn health(State(app): State<Arc<AppCtx>>) -> Json<HealthBody> {
         embedder,
         embedder_error,
         embedder_retryable,
+        embedder_resident: app.runtime.embedder.get().map(|e| e.resident()),
         uptime_s: app.started_at.elapsed().as_secs(),
         ingest,
     })
@@ -850,6 +855,15 @@ async fn save_memory(
     save_response(confirmation, operation_id, &masked).map(|(status, body)| (status, Json(body)))
 }
 
+/// A model that was let go for being idle and could not load again is not
+/// ready, the same answer as before the first load: the next call retries.
+fn embed_failure(e: EmbedError) -> ApiError {
+    match e {
+        EmbedError::NotReady => ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "embedder_not_ready"),
+        other => ApiError::internal(other),
+    }
+}
+
 /// The loaded embedder, or the 503 a search answers while there is none.
 fn ready_embedder(app: &AppCtx) -> ApiResult<Arc<dyn Embedder>> {
     app.runtime.embedder.get().cloned().ok_or_else(|| match app.runtime.embedder_status() {
@@ -874,7 +888,7 @@ async fn search(
     let embedding = embedder
         .embed_with_role(&body.query, EmbedRole::Query)
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(embed_failure)?;
 
     let scope = SearchScope::all_default()
         .with_project(body.project_id.as_deref())
@@ -1085,6 +1099,7 @@ async fn restore_memory(
         Err(e @ (RestoreError::LiveTwin { .. } | RestoreError::HoldsSecret { .. })) => {
             Err(ApiError::conflict(e.to_string()))
         }
+        Err(RestoreError::Embed(_, e)) => Err(embed_failure(e)),
         Err(e) => Err(ApiError::internal(e)),
     }
 }
@@ -1167,6 +1182,11 @@ async fn register(
         },
         RegisterError::Store(_) => ApiError::internal(e),
     })?;
+    // A bridge registers its root as its session starts, so the model that
+    // went away while nobody worked starts loading before the first search.
+    if let Some(embedder) = app.runtime.embedder.get() {
+        embedder.wake();
+    }
     if outcome.index_docs {
         spawn_doc_refresh(app.clone(), outcome.project_id.clone());
     }

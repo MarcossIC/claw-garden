@@ -27,6 +27,7 @@ pub mod chunker;
 pub mod db;
 pub mod embedder;
 pub mod events;
+pub mod idle_embedder;
 pub mod store_insert;
 pub mod store_lock;
 pub mod worker;
