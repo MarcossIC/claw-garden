@@ -1,16 +1,21 @@
-//! The [`Embedder`] trait and its concrete implementations: [`FastEmbedLocal`]
-//! (the production embedder, backed by `multilingual-e5-small` via
-//! fastembed-rs), [`OllamaEmbedder`]/[`OpenAIEmbedder`] (unimplemented stubs
-//! reserved for future backends), and `FakeEmbedder` (a deterministic test
-//! double). Every embed call carries an explicit [`EmbedRole`] so a caller
-//! can never forget which side of the query/passage distinction it is on —
-//! see [`EmbedRole`] below for why that distinction matters.
+//! The [`Embedder`] trait and its concrete implementations: [`E5Embedder`]
+//! (the production embedder: `multilingual-e5-small` on an ONNX Runtime session
+//! of our own, with the process's shared tokenizer),
+//! [`OllamaEmbedder`]/[`OpenAIEmbedder`] (unimplemented stubs reserved for
+//! future backends), and `FakeEmbedder` (a deterministic test double). Every
+//! embed call carries an explicit [`EmbedRole`] so a caller can never forget
+//! which side of the query/passage distinction it is on — see [`EmbedRole`]
+//! below for why that distinction matters.
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use fastembed::{
-    InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
-};
+use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::value::Tensor;
 use tokio::sync::{mpsc, oneshot};
+
+use crate::memory::model_download::TokenizerFiles;
+use tokenizers::{Encoding, Tokenizer};
 
 /// Which side of an asymmetric embedding model a text plays: the thing being
 /// searched FOR, or the thing being searched THROUGH. E5-family models were
@@ -127,17 +132,11 @@ const E5_PASSAGE_PREFIX: &str = "query: ";
 /// differently live in different spaces.
 pub const E5_MODEL_ID: &str = "multilingual-e5-small/mean";
 
-/// The id earlier versions recorded for the same weights pooled by CLS, the
-/// default fastembed applies to a user-defined model. A store under this id
-/// holds vectors that must be re-embedded, never mixed with new ones.
+/// The id earlier versions recorded for the same weights pooled by their first
+/// token (CLS), which gave every passage of a corpus nearly the same vector,
+/// since e5 is trained with mean pooling. A store under this id holds vectors
+/// that must be re-embedded, never mixed with new ones.
 pub const LEGACY_CLS_MODEL_ID: &str = "multilingual-e5-small";
-
-/// e5 is trained with mean pooling. Left unset, fastembed pools a
-/// user-defined model by its first token, which gave every passage of a corpus
-/// nearly the same vector.
-fn e5_model(onnx: Vec<u8>, tokenizer: TokenizerFiles) -> UserDefinedEmbeddingModel {
-    UserDefinedEmbeddingModel::new(onnx, tokenizer).with_pooling(Pooling::Mean)
-}
 
 /// ONNX Runtime's CPU provider with its arena off. The arena keeps the largest
 /// block an inference run ever asked for and never gives it back, so the
@@ -147,11 +146,10 @@ fn cpu_provider() -> ort::ep::CPU {
     ort::ep::CPU::default().with_arena_allocator(false)
 }
 
-/// The token window fastembed truncates the model input to. Pinned as an
-/// explicit constant rather than left at fastembed's own default: the query
-/// composer's budget (`memory::query_context::query_budget_tokens`) has to
-/// read the SAME number the embedder actually enforces, and a value only
-/// implicit in a library default can silently drift out of sync with it.
+/// The token window the model input is cut to, `<s>` and `</s>` included. One
+/// constant, because the query composer's budget
+/// (`memory::query_context::query_budget_tokens`) has to read the SAME number
+/// the embedder actually enforces.
 pub const EMBED_MAX_TOKENS: usize = 512;
 
 /// The most texts one inference run embeds. A run pads every text to the
@@ -197,14 +195,197 @@ pub enum EmbedError {
     LoadFailed(String),
 }
 
+/// A request's encodings laid out as the model takes them: `rows` texts of
+/// `len` tokens each, row after row.
+pub(crate) struct PaddedBatch {
+    pub(crate) rows: usize,
+    pub(crate) len: usize,
+    pub(crate) ids: Vec<i64>,
+    pub(crate) mask: Vec<i64>,
+    pub(crate) type_ids: Vec<i64>,
+}
+
+/// The model's input for each text: the tokenizer's encoding cut to
+/// [`EMBED_MAX_TOKENS`] counting the `<s>` and `</s>` the post-processor adds,
+/// so `</s>` stays at the end of a cut text.
+///
+/// The cut is made here, on a text encoded without special tokens, and not by
+/// setting a truncation on the tokenizer: that one is shared with the chunker,
+/// which counts untruncated tokens with it. These are the three steps the
+/// tokenizer's own `post_process` takes when it has a truncation set.
+pub(crate) fn window_encodings(tokenizer: &Tokenizer, texts: &[&str]) -> Result<Vec<Encoding>, EmbedError> {
+    use tokenizers::{PostProcessor, TruncationDirection};
+
+    let added = tokenizer.get_post_processor().map_or(0, |p| p.added_tokens(false));
+    let keep = EMBED_MAX_TOKENS.saturating_sub(added);
+    let failed = |e: tokenizers::Error| EmbedError::InferenceFailed(format!("tokenization failed: {e}"));
+    tokenizer
+        .encode_batch(texts.to_vec(), false)
+        .map_err(failed)?
+        .into_iter()
+        .map(|mut encoding| {
+            encoding.truncate(keep, 0, TruncationDirection::Right);
+            tokenizer.post_process(encoding, None, true).map_err(failed)
+        })
+        .collect()
+}
+
+/// Lays the encodings out as one rectangle, padding every text on the right to
+/// the longest with `pad_id`, attention mask 0 and token type 0.
+pub(crate) fn pad_right(encodings: &[Encoding], pad_id: u32) -> PaddedBatch {
+    let rows = encodings.len();
+    let len = encodings.iter().map(Encoding::len).max().unwrap_or(0);
+    let mut batch = PaddedBatch {
+        rows,
+        len,
+        ids: Vec::with_capacity(rows * len),
+        mask: Vec::with_capacity(rows * len),
+        type_ids: Vec::with_capacity(rows * len),
+    };
+    for encoding in encodings {
+        let padding = len - encoding.len();
+        batch.ids.extend(encoding.get_ids().iter().map(|x| *x as i64));
+        batch.ids.extend(std::iter::repeat(pad_id as i64).take(padding));
+        batch.mask.extend(encoding.get_attention_mask().iter().map(|x| *x as i64));
+        batch.mask.extend(std::iter::repeat(0).take(padding));
+        batch.type_ids.extend(encoding.get_type_ids().iter().map(|x| *x as i64));
+        batch.type_ids.extend(std::iter::repeat(0).take(padding));
+    }
+    batch
+}
+
+/// Which of the model's outputs holds the embeddings: the only one, else the
+/// first of `text_embeds`, `last_hidden_state` and `sentence_embedding` the
+/// model has. Returns its index in `names`.
+pub(crate) fn pick_output(names: &[&str]) -> Result<usize, EmbedError> {
+    if names.len() == 1 {
+        return Ok(0);
+    }
+    ["text_embeds", "last_hidden_state", "sentence_embedding"]
+        .iter()
+        .find_map(|wanted| names.iter().position(|name| name == wanted))
+        .ok_or_else(|| EmbedError::LoadFailed(format!("no usable output among {names:?}")))
+}
+
+/// Mean pooling over the attention mask, then L2 normalization, in the exact
+/// order of floating-point operations fastembed uses, so the vectors are the
+/// same bit for bit: each coordinate is the sum over the tokens in token order
+/// of `mask * state` (padded positions included, they add zero), divided by the
+/// sum of the mask, and then every coordinate is divided by `norm + 1e-12`.
+///
+/// A two-dimensional output is already pooled and is only normalized.
+pub(crate) fn pool_and_normalize(hidden: &[f32], shape: &[i64], mask: &[i64]) -> Result<Vec<Vec<f32>>, EmbedError> {
+    let wrong = |why: String| EmbedError::InferenceFailed(why);
+    let pooled: Vec<Vec<f32>> = match *shape {
+        [rows, dim] => {
+            let (rows, dim) = (rows as usize, dim as usize);
+            if hidden.len() != rows * dim {
+                return Err(wrong(format!("output of {} values for shape {shape:?}", hidden.len())));
+            }
+            hidden.chunks(dim.max(1)).take(rows).map(<[f32]>::to_vec).collect()
+        }
+        [rows, len, dim] => {
+            let (rows, len, dim) = (rows as usize, len as usize, dim as usize);
+            if hidden.len() != rows * len * dim || mask.len() != rows * len {
+                return Err(wrong(format!(
+                    "output of {} values and mask of {} for shape {shape:?}",
+                    hidden.len(),
+                    mask.len()
+                )));
+            }
+            (0..rows)
+                .map(|row| {
+                    let mut sum = vec![0f32; dim];
+                    let mut mask_sum = 0f32;
+                    for token in 0..len {
+                        let m = mask[row * len + token] as f32;
+                        let states = &hidden[(row * len + token) * dim..][..dim];
+                        for (acc, x) in sum.iter_mut().zip(states) {
+                            *acc += m * x;
+                        }
+                        mask_sum += m;
+                    }
+                    let mask_sum = if mask_sum == 0f32 { 1.0 } else { mask_sum };
+                    sum.iter().map(|x| x / mask_sum).collect()
+                })
+                .collect()
+        }
+        _ => return Err(wrong(format!("invalid output shape {shape:?}; expected 2D or 3D"))),
+    };
+    Ok(pooled.into_iter().map(|v| normalize(&v)).collect())
+}
+
+fn normalize(v: &[f32]) -> Vec<f32> {
+    let norm = (v.iter().map(|val| val * val).sum::<f32>()).sqrt();
+    let epsilon = 1e-12;
+    v.iter().map(|&val| val / (norm + epsilon)).collect()
+}
+
+/// What the load checks before it trusts a tokenizer to encode like
+/// fastembed's did, and the id to pad with (`pad_token_id` of `config.json`,
+/// 0 when it has none). Refuses:
+///
+/// - a tokenizer with a truncation or a padding of its own, whose `encode`
+///   would cut or pad before the window and the padding applied here;
+/// - a token of `special_tokens_map.json` that the tokenizer does not hold as
+///   special: fastembed added those as special tokens, which changes nothing
+///   only for a token that already is;
+/// - a `model_max_length` shorter than [`EMBED_MAX_TOKENS`], which fastembed
+///   would have cut to.
+pub(crate) fn check_tokenizer(tokenizer: &Tokenizer, files: &TokenizerFiles) -> Result<u32, EmbedError> {
+    let refuse = |why: String| EmbedError::LoadFailed(why);
+    let json = |bytes: &[u8], name: &str| {
+        serde_json::from_slice::<serde_json::Value>(bytes)
+            .map_err(|e| refuse(format!("{name} is not valid JSON: {e}")))
+    };
+    let config = json(&files.config_file, "config.json")?;
+    let special_tokens_map = json(&files.special_tokens_map_file, "special_tokens_map.json")?;
+    let tokenizer_config = json(&files.tokenizer_config_file, "tokenizer_config.json")?;
+
+    if tokenizer.get_truncation().is_some() {
+        return Err(refuse("tokenizer.json sets a truncation of its own".into()));
+    }
+    if tokenizer.get_padding().is_some() {
+        return Err(refuse("tokenizer.json sets a padding of its own".into()));
+    }
+    let max_length = tokenizer_config["model_max_length"]
+        .as_f64()
+        .ok_or_else(|| refuse("tokenizer_config.json has no model_max_length".into()))?;
+    if max_length < EMBED_MAX_TOKENS as f64 {
+        return Err(refuse(format!(
+            "model_max_length {max_length} of tokenizer_config.json is shorter than the {EMBED_MAX_TOKENS} tokens embedded"
+        )));
+    }
+    let special: Vec<String> = tokenizer
+        .get_added_tokens_decoder()
+        .into_values()
+        .filter(|token| token.special)
+        .map(|token| token.content)
+        .collect();
+    for value in special_tokens_map.as_object().into_iter().flat_map(|map| map.values()) {
+        let content = match value {
+            serde_json::Value::String(content) => Some(content.as_str()),
+            serde_json::Value::Object(_) => value["content"].as_str(),
+            _ => None,
+        };
+        if let Some(content) = content {
+            if !special.iter().any(|token| token == content) {
+                return Err(refuse(format!(
+                    "special_tokens_map.json names {content:?}, which tokenizer.json does not hold as a special token"
+                )));
+            }
+        }
+    }
+    Ok(config["pad_token_id"].as_u64().unwrap_or(0) as u32)
+}
+
 // ============================================================================
-// FastEmbedLocal — fastembed-rs backed embedder, confined to a single owning
-// thread via a tokio::mpsc request/oneshot channel.
+// E5Embedder — the ONNX Runtime session of `multilingual-e5-small`, confined to
+// a single owning thread via a tokio::mpsc request/oneshot channel.
 //
-// The inner `fastembed::TextEmbedding` is NOT guaranteed `Send`, so it lives
-// on one dedicated `std::thread` for its entire life. The public struct holds
-// only channel senders + primitives, which keeps it `Send + Sync` — verified
-// by the const-block at the bottom of this file.
+// The session lives on one dedicated `std::thread` for its entire life. The
+// public struct holds only channel senders + primitives, which keeps it
+// `Send + Sync` — verified by the const-block at the bottom of this file.
 // ============================================================================
 
 /// Internal request crossing the channel: texts to embed + oneshot reply slot.
@@ -213,14 +394,14 @@ pub(crate) struct EmbedRequest {
     pub(crate) resp: oneshot::Sender<Result<Vec<Vec<f32>>, EmbedError>>,
 }
 
-pub struct FastEmbedLocal {
+pub struct E5Embedder {
     req_tx: mpsc::UnboundedSender<EmbedRequest>,
     dimensions: usize,
     model_id: &'static str,
 }
 
 #[async_trait]
-impl Embedder for FastEmbedLocal {
+impl Embedder for E5Embedder {
     async fn embed_batch(&self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
         let mut vectors = Vec::with_capacity(texts.len());
         for batch in texts.chunks(EMBED_BATCH) {
@@ -270,49 +451,107 @@ impl Embedder for FastEmbedLocal {
     }
 }
 
-impl FastEmbedLocal {
-    /// Construct from already-downloaded model bytes + tokenizer files.
+/// What the worker thread owns: the session and everything a request needs to
+/// become vectors, so the pieces around the session stay the pure functions
+/// above.
+struct Inference {
+    session: Session,
+    tokenizer: Arc<Tokenizer>,
+    pad_id: u32,
+    /// Whether the model declares a `token_type_ids` input.
+    wants_token_type_ids: bool,
+    /// The output holding the embeddings, picked when the session was built.
+    output: String,
+}
+
+impl Inference {
+    /// One inference run over `texts`, already prefixed: the window, the
+    /// padding, the session, then pooling and normalization.
+    fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let failed = |e: ort::Error| EmbedError::InferenceFailed(e.to_string());
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let encodings = window_encodings(&self.tokenizer, &refs)?;
+        let batch = pad_right(&encodings, self.pad_id);
+        let shape = [batch.rows, batch.len];
+
+        let mut inputs = ort::inputs![
+            "input_ids" => Tensor::from_array((shape, batch.ids)).map_err(failed)?,
+            "attention_mask" => Tensor::from_array((shape, batch.mask.clone())).map_err(failed)?,
+        ];
+        if self.wants_token_type_ids {
+            inputs.push((
+                "token_type_ids".into(),
+                Tensor::from_array((shape, batch.type_ids)).map_err(failed)?.into(),
+            ));
+        }
+        let outputs = self.session.run(inputs).map_err(failed)?;
+        let (output_shape, hidden) = outputs[self.output.as_str()]
+            .try_extract_tensor::<f32>()
+            .map_err(failed)?;
+        pool_and_normalize(hidden, output_shape, &batch.mask)
+    }
+}
+
+/// The session options the embeddings were always made with: the CPU provider
+/// without its arena, graph optimization level 3 and as many intra-op threads
+/// as the machine has. The thread count is not a detail: it sets how ONNX
+/// Runtime splits and sums the work, so another one could move the last bits
+/// of a vector.
+fn build_session(onnx: &[u8]) -> Result<Session, EmbedError> {
+    let failed = |e: String| EmbedError::LoadFailed(e);
+    let threads = std::thread::available_parallelism().map_err(|e| failed(e.to_string()))?.get();
+    Session::builder()
+        .map_err(|e| failed(e.to_string()))?
+        .with_execution_providers(vec![cpu_provider().build()])
+        .map_err(|e| failed(e.to_string()))?
+        .with_optimization_level(GraphOptimizationLevel::Level3)
+        .map_err(|e| failed(e.to_string()))?
+        .with_intra_threads(threads)
+        .map_err(|e| failed(e.to_string()))?
+        .commit_from_memory(onnx)
+        .map_err(|e| failed(e.to_string()))
+}
+
+impl E5Embedder {
+    /// Construct from the model bytes, the shared tokenizer and the model's
+    /// small JSON files.
     ///
     /// CPU-bound (~100 ms warm-up for `multilingual-e5-small`); callers SHOULD
-    /// wrap this in `tokio::task::spawn_blocking`. The model itself loads on
-    /// the CALLING thread first — this surfaces load errors as
+    /// wrap this in `tokio::task::spawn_blocking`. The checks and the session
+    /// are made on the CALLING thread first — this surfaces load errors as
     /// `EmbedError::LoadFailed` synchronously before the worker thread is
-    /// spawned, which keeps error handling simple.
+    /// spawned, which keeps error handling simple. `files.tokenizer_file` is
+    /// not read: the tokenizer arrives already parsed, and is never
+    /// reconfigured here because the chunker counts tokens with the same one.
     ///
-    /// After load succeeds, a single `std::thread` named `"fastembed-worker"`
-    /// takes ownership of the `TextEmbedding` for its entire lifetime. All
-    /// callers route through the request channel; `TextEmbedding` never crosses
-    /// threads, so its `Send`/`Sync` bounds are irrelevant to us.
-    pub fn from_bytes(onnx: Vec<u8>, tokenizer: TokenizerFiles) -> Result<Self, EmbedError> {
+    /// After load succeeds, a single `std::thread` named `"embedder-worker"`
+    /// takes ownership of the session for its entire lifetime. All callers
+    /// route through the request channel; the session never crosses threads.
+    pub fn from_parts(
+        onnx: &[u8],
+        tokenizer: Arc<Tokenizer>,
+        files: &TokenizerFiles,
+    ) -> Result<Self, EmbedError> {
+        let pad_id = check_tokenizer(&tokenizer, files)?;
+        let session = build_session(onnx)?;
+        let wants_token_type_ids = session.inputs().iter().any(|input| input.name() == "token_type_ids");
+        let names: Vec<&str> = session.outputs().iter().map(|output| output.name()).collect();
+        let output = names[pick_output(&names)?].to_string();
+        let mut inference = Inference { session, tokenizer, pad_id, wants_token_type_ids, output };
+
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<EmbedRequest>();
-
-        let user_model = e5_model(onnx, tokenizer);
-        // Pinned explicitly so the composer's budget and the embedder's own
-        // truncation point are provably the same number, not two constants
-        // that happen to agree today.
-        let init_opts = InitOptionsUserDefined::new()
-            .with_max_length(EMBED_MAX_TOKENS)
-            .with_execution_providers(vec![cpu_provider().build()]);
-
-        // Synchronous load on the calling thread: surface load errors immediately.
-        // `embed()` takes `&mut self` in fastembed v5 (interior session state).
-        let mut model = TextEmbedding::try_new_from_user_defined(user_model, init_opts)
-            .map_err(|e| EmbedError::LoadFailed(e.to_string()))?;
-
         std::thread::Builder::new()
-            .name("fastembed-worker".into())
+            .name("embedder-worker".into())
             .spawn(move || {
                 // futures::executor::block_on bridges tokio's mpsc receiver into
                 // a non-tokio thread. Loop exits naturally when all senders drop.
                 while let Some(EmbedRequest { texts, resp }) =
                     futures::executor::block_on(req_rx.recv())
                 {
-                    let out = model.embed(texts, None)
-                        .map_err(|e| EmbedError::InferenceFailed(e.to_string()));
                     // Dropped oneshot receiver = caller gave up; ignore the send error.
-                    let _ = resp.send(out);
+                    let _ = resp.send(inference.embed(&texts));
                 }
-                drop(model);
+                drop(inference.session);
                 return_freed_memory();
             })
             .map_err(|e| EmbedError::LoadFailed(format!("spawn worker: {e}")))?;
@@ -344,9 +583,9 @@ fn return_freed_memory() {
 fn return_freed_memory() {}
 
 #[cfg(test)]
-impl FastEmbedLocal {
+impl E5Embedder {
     /// Test-only constructor: take a pre-wired request sender connected to a
-    /// hand-rolled mock worker. The real `from_bytes` downloads and loads an
+    /// hand-rolled mock worker. The real `from_parts` builds a session of an
     /// actual ~470 MB model, which this suite never does automatically —
     /// exercising it means running the app once and confirming embeddings
     /// come back, not something a fast unit test can assert on cheaply.
@@ -365,14 +604,14 @@ impl FastEmbedLocal {
 // The assertion IS the test — if any of these types regress to !Send or !Sync
 // the crate will fail to compile. No #[test] fn needed.
 //
-// `FastEmbedLocal` holds only `mpsc::UnboundedSender` (Send + Sync), a `usize`,
+// `E5Embedder` holds only `mpsc::UnboundedSender` (Send + Sync), a `usize`,
 // and a `&'static str` — provably Send + Sync without `unsafe`.
 // ============================================================================
 const _: fn() = || {
     fn _assert_send<T: Send>() {}
     fn _assert_sync<T: Sync>() {}
-    _assert_send::<FastEmbedLocal>();
-    _assert_sync::<FastEmbedLocal>();
+    _assert_send::<E5Embedder>();
+    _assert_sync::<E5Embedder>();
     _assert_send::<std::sync::Arc<dyn Embedder>>();
     _assert_sync::<std::sync::Arc<dyn Embedder>>();
 };
@@ -522,15 +761,290 @@ impl Embedder for FakeEmbedder {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_e5_model_is_pooled_by_mean() {
-        let tokenizer = TokenizerFiles {
-            tokenizer_file: Vec::new(),
-            config_file: Vec::new(),
-            special_tokens_map_file: Vec::new(),
-            tokenizer_config_file: Vec::new(),
+    // ---------- inference pieces, against fastembed's own formulas ----------
+
+    const WORDS: [&str; 7] = ["<s>", "<pad>", "</s>", "<unk>", "uno", "dos", "tres"];
+
+    /// A tokenizer built in code with the shape of the model's: word-level
+    /// ids, `<s>`/`</s>` added by a Roberta post-processor, no truncation and
+    /// no padding.
+    fn test_tokenizer() -> Tokenizer {
+        use tokenizers::models::wordlevel::WordLevel;
+        use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
+        use tokenizers::processors::roberta::RobertaProcessing;
+        use tokenizers::AddedToken;
+
+        let vocab = WORDS.iter().enumerate().map(|(i, w)| (w.to_string(), i as u32)).collect();
+        let model = WordLevel::builder().vocab(vocab).unk_token("<unk>".into()).build().unwrap();
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(WhitespaceSplit));
+        tokenizer.with_post_processor(Some(RobertaProcessing::new(
+            ("</s>".into(), 2),
+            ("<s>".into(), 0),
+        )));
+        let specials: Vec<AddedToken> =
+            WORDS[..4].iter().map(|w| AddedToken::from(*w, true)).collect();
+        tokenizer.add_special_tokens(&specials);
+        tokenizer
+    }
+
+    /// The tokenizer as fastembed configures its own copy
+    /// (`fastembed-5.13.4/src/common.rs`): padding to the longest text with
+    /// `pad_id` and truncation to the window.
+    fn configured_like_fastembed(base: &Tokenizer, pad_id: u32) -> Tokenizer {
+        use tokenizers::{PaddingParams, PaddingStrategy, TruncationParams};
+        let mut tokenizer = base.clone();
+        tokenizer
+            .with_padding(Some(PaddingParams {
+                strategy: PaddingStrategy::BatchLongest,
+                pad_token: "<pad>".into(),
+                pad_id,
+                ..Default::default()
+            }))
+            .with_truncation(Some(TruncationParams {
+                max_length: EMBED_MAX_TOKENS,
+                ..Default::default()
+            }))
+            .unwrap();
+        tokenizer
+    }
+
+    fn text_of(words: usize) -> String {
+        (0..words).map(|i| WORDS[4 + i % 3]).collect::<Vec<_>>().join(" ")
+    }
+
+    fn flatten(encodings: &[Encoding]) -> (usize, Vec<i64>, Vec<i64>, Vec<i64>) {
+        let len = encodings[0].len();
+        let widen = |f: &dyn Fn(&Encoding) -> &[u32]| -> Vec<i64> {
+            encodings.iter().flat_map(|e| f(e).iter().map(|x| *x as i64)).collect()
         };
-        assert_eq!(e5_model(Vec::new(), tokenizer).pooling, Some(Pooling::Mean));
+        (
+            len,
+            widen(&|e| e.get_ids()),
+            widen(&|e| e.get_attention_mask()),
+            widen(&|e| e.get_type_ids()),
+        )
+    }
+
+    #[test]
+    fn an_encoding_matches_the_tokenizer_configured_like_fastembed() {
+        let ours = test_tokenizer();
+        let pad_id = 0;
+        let theirs = configured_like_fastembed(&ours, pad_id);
+        let at_the_edge = EMBED_MAX_TOKENS - 2;
+        let batches: Vec<Vec<String>> = vec![
+            vec![text_of(3)],
+            vec![String::new(), text_of(1), text_of(5)],
+            vec![text_of(at_the_edge - 1), text_of(at_the_edge), text_of(at_the_edge + 1)],
+            vec![text_of(2), text_of(EMBED_MAX_TOKENS + 90), text_of(40)],
+            vec![text_of(at_the_edge), text_of(4), text_of(at_the_edge + 7), text_of(0)],
+        ];
+        for batch in batches {
+            let refs: Vec<&str> = batch.iter().map(String::as_str).collect();
+            let expected = theirs.encode_batch(refs.clone(), true).unwrap();
+            let (len, ids, mask, type_ids) = flatten(&expected);
+
+            let padded = pad_right(&window_encodings(&ours, &refs).unwrap(), pad_id);
+
+            assert_eq!(padded.rows, refs.len());
+            assert_eq!(padded.len, len, "the padded length");
+            assert_eq!(padded.ids, ids);
+            assert_eq!(padded.mask, mask);
+            assert_eq!(padded.type_ids, type_ids);
+        }
+    }
+
+    #[test]
+    fn a_long_text_is_cut_to_the_window_and_keeps_its_closing_token() {
+        let tokenizer = test_tokenizer();
+        let long = text_of(EMBED_MAX_TOKENS + 100);
+        let encodings = window_encodings(&tokenizer, &[long.as_str()]).unwrap();
+        let ids = encodings[0].get_ids();
+        assert_eq!(ids.len(), EMBED_MAX_TOKENS);
+        assert_eq!(ids[0], 0, "opening <s>");
+        assert_eq!(ids[EMBED_MAX_TOKENS - 1], 2, "closing </s>");
+        let untruncated = tokenizer.encode(long.as_str(), false).unwrap();
+        assert_eq!(&ids[1..EMBED_MAX_TOKENS - 1], &untruncated.get_ids()[..EMBED_MAX_TOKENS - 2]);
+        assert_eq!(
+            untruncated.len(),
+            EMBED_MAX_TOKENS + 100,
+            "the tokenizer it was cut with is left untruncated"
+        );
+    }
+
+    /// Random hidden states from a fixed seed, with exponents from 2^-6 to 2^2.
+    fn hidden_states(count: usize) -> Vec<f32> {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        (0..count)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let mantissa = ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0;
+                let exponent = ((state >> 20) % 9) as i32 - 6;
+                mantissa * 2f32.powi(exponent) * 3.0
+            })
+            .collect()
+    }
+
+    /// `pooling::mean` and `common::normalize` of fastembed-5.13.4, written
+    /// with ndarray as they are there.
+    fn fastembed_pooling(hidden: &[f32], shape: [usize; 3], mask: &[i64]) -> Vec<Vec<f32>> {
+        use ndarray::{Array2, ArrayView3, Axis};
+        let [rows, len, _] = shape;
+        let token_embeddings = ArrayView3::from_shape(shape, hidden).unwrap();
+        let attention_mask = Array2::from_shape_vec((rows, len), mask.to_vec())
+            .unwrap()
+            .insert_axis(Axis(2))
+            .broadcast(token_embeddings.dim())
+            .unwrap()
+            .mapv(|x| x as f32);
+        let masked_tensor = &attention_mask * &token_embeddings;
+        let sum = masked_tensor.sum_axis(Axis(1));
+        let mask_sum = attention_mask.sum_axis(Axis(1));
+        let mask_sum = mask_sum.mapv(|x| if x == 0f32 { 1.0 } else { x });
+        let pooled = &sum / &mask_sum;
+        pooled
+            .rows()
+            .into_iter()
+            .map(|row| {
+                let v = row.as_slice().unwrap();
+                let norm = (v.iter().map(|val| val * val).sum::<f32>()).sqrt();
+                let epsilon = 1e-12;
+                v.iter().map(|&val| val / (norm + epsilon)).collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mean_pooling_matches_fastembeds_formula_bit_for_bit() {
+        let (rows, len, dim) = (4, 9, 24);
+        let hidden = hidden_states(rows * len * dim);
+        let mut mask = vec![1i64; rows * len];
+        // Right padding of different widths, and a row with nothing but padding.
+        for (row, keep) in [(0, 5), (1, 9), (2, 2), (3, 0)] {
+            for t in keep..len {
+                mask[row * len + t] = 0;
+            }
+        }
+        let expected = fastembed_pooling(&hidden, [rows, len, dim], &mask);
+        let ours = pool_and_normalize(&hidden, &[rows as i64, len as i64, dim as i64], &mask).unwrap();
+
+        assert_eq!(ours.len(), rows);
+        for (row, (a, b)) in ours.iter().zip(&expected).enumerate() {
+            let a: Vec<u32> = a.iter().map(|x| x.to_bits()).collect();
+            let b: Vec<u32> = b.iter().map(|x| x.to_bits()).collect();
+            assert_eq!(a, b, "row {row}");
+        }
+    }
+
+    #[test]
+    fn a_two_dimensional_output_is_taken_as_pooled_and_normalized() {
+        let ours = pool_and_normalize(&[3.0, 4.0, 0.0, 2.0], &[2, 2], &[1, 1, 1, 1]).unwrap();
+        assert_eq!(ours.len(), 2);
+        assert!((ours[0][0] - 0.6).abs() < 1e-6 && (ours[0][1] - 0.8).abs() < 1e-6);
+        assert!((ours[1][1] - 1.0).abs() < 1e-6);
+        assert!(matches!(
+            pool_and_normalize(&[1.0], &[1], &[1]),
+            Err(EmbedError::InferenceFailed(_))
+        ));
+    }
+
+    #[test]
+    fn the_output_is_picked_like_fastembed() {
+        assert_eq!(pick_output(&["anything"]).unwrap(), 0, "the only output");
+        assert_eq!(
+            pick_output(&["sentence_embedding", "last_hidden_state", "text_embeds"]).unwrap(),
+            2,
+            "text_embeds first, whatever the order the model lists them in"
+        );
+        assert_eq!(pick_output(&["x", "sentence_embedding", "last_hidden_state"]).unwrap(), 2);
+        assert_eq!(pick_output(&["sentence_embedding", "other"]).unwrap(), 0);
+        assert!(matches!(pick_output(&["a", "b"]), Err(EmbedError::LoadFailed(_))));
+        assert!(matches!(pick_output(&[]), Err(EmbedError::LoadFailed(_))));
+    }
+
+    const SPECIAL_TOKENS_MAP: &str = r#"{
+        "bos_token": {"content": "<s>", "lstrip": false, "normalized": false, "rstrip": false, "single_word": false},
+        "eos_token": "</s>",
+        "pad_token": "<pad>",
+        "unk_token": "<unk>"
+    }"#;
+
+    fn files(config: &str, special_tokens_map: &str, tokenizer_config: &str) -> TokenizerFiles {
+        TokenizerFiles {
+            tokenizer_file: Vec::new(),
+            config_file: config.as_bytes().to_vec(),
+            special_tokens_map_file: special_tokens_map.as_bytes().to_vec(),
+            tokenizer_config_file: tokenizer_config.as_bytes().to_vec(),
+        }
+    }
+
+    fn model_files() -> TokenizerFiles {
+        files(r#"{"pad_token_id": 0}"#, SPECIAL_TOKENS_MAP, r#"{"model_max_length": 512}"#)
+    }
+
+    fn load_error(result: Result<u32, EmbedError>) -> String {
+        match result {
+            Err(EmbedError::LoadFailed(why)) => why,
+            other => panic!("expected LoadFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_load_accepts_the_files_of_the_model() {
+        assert_eq!(check_tokenizer(&test_tokenizer(), &model_files()).unwrap(), 0);
+    }
+
+    #[test]
+    fn the_pad_id_comes_from_config_json_and_defaults_to_zero() {
+        let with = files(r#"{"pad_token_id": 7}"#, SPECIAL_TOKENS_MAP, r#"{"model_max_length": 512}"#);
+        assert_eq!(check_tokenizer(&test_tokenizer(), &with).unwrap(), 7);
+        let without = files("{}", SPECIAL_TOKENS_MAP, r#"{"model_max_length": 512}"#);
+        assert_eq!(check_tokenizer(&test_tokenizer(), &without).unwrap(), 0);
+        let broken = files("not json", SPECIAL_TOKENS_MAP, r#"{"model_max_length": 512}"#);
+        assert!(matches!(check_tokenizer(&test_tokenizer(), &broken), Err(EmbedError::LoadFailed(_))));
+    }
+
+    #[test]
+    fn the_load_refuses_a_tokenizer_with_its_own_truncation_or_padding() {
+        use tokenizers::{PaddingParams, TruncationParams};
+        let mut truncating = test_tokenizer();
+        truncating.with_truncation(Some(TruncationParams::default())).unwrap();
+        assert!(load_error(check_tokenizer(&truncating, &model_files())).contains("truncation"));
+
+        let mut padding = test_tokenizer();
+        padding.with_padding(Some(PaddingParams::default()));
+        assert!(load_error(check_tokenizer(&padding, &model_files())).contains("padding"));
+    }
+
+    #[test]
+    fn the_load_refuses_a_special_token_the_tokenizer_does_not_treat_as_special() {
+        let map_with_mask = files(
+            r#"{"pad_token_id": 0}"#,
+            r#"{"eos_token": "</s>", "mask_token": {"content": "<mask>", "lstrip": true, "normalized": true, "rstrip": false, "single_word": false}}"#,
+            r#"{"model_max_length": 512}"#,
+        );
+        // Not known to the tokenizer at all.
+        assert!(load_error(check_tokenizer(&test_tokenizer(), &map_with_mask)).contains("<mask>"));
+
+        // Known, but added as an ordinary token.
+        let mut ordinary = test_tokenizer();
+        ordinary.add_tokens(&[tokenizers::AddedToken::from("<mask>", false)]);
+        assert!(load_error(check_tokenizer(&ordinary, &map_with_mask)).contains("<mask>"));
+
+        // Added as special, it passes.
+        let mut special = test_tokenizer();
+        special.add_special_tokens(&[tokenizers::AddedToken::from("<mask>", true)]);
+        assert!(check_tokenizer(&special, &map_with_mask).is_ok());
+    }
+
+    #[test]
+    fn the_load_refuses_a_model_window_shorter_than_embed_max_tokens() {
+        let short = files(r#"{}"#, SPECIAL_TOKENS_MAP, r#"{"model_max_length": 128}"#);
+        assert!(load_error(check_tokenizer(&test_tokenizer(), &short)).contains("model_max_length"));
+        let missing = files(r#"{}"#, SPECIAL_TOKENS_MAP, r#"{}"#);
+        assert!(load_error(check_tokenizer(&test_tokenizer(), &missing)).contains("model_max_length"));
+        let unbounded = files(r#"{}"#, SPECIAL_TOKENS_MAP, r#"{"model_max_length": 1e30}"#);
+        assert!(check_tokenizer(&test_tokenizer(), &unbounded).is_ok());
     }
 
     #[test]
@@ -588,12 +1102,8 @@ mod tests {
 
     // ---------- Embedder window pin ----------
 
-    /// Pins the two constants the query composer's budget depends on. This
-    /// is the only place that can catch `.with_max_length(EMBED_MAX_TOKENS)`
-    /// being deleted from `from_bytes` — `TextEmbedding` exposes no getter
-    /// for its effective max length, so that deletion is otherwise
-    /// unobservable from a unit test; a real-model control run is the other
-    /// half of that coverage, out of this test's reach.
+    /// Pins the two constants the query composer's budget depends on, so a
+    /// change to either is a decision and not a side effect.
     #[test]
     fn embed_max_tokens_and_special_token_reserve_are_pinned() {
         assert_eq!(EMBED_MAX_TOKENS, 512);
@@ -653,7 +1163,7 @@ mod tests {
         assert!(batch.is_empty(), "expected empty output for empty input, got {batch:?}");
     }
 
-    // ---------- FastEmbedLocal worker plumbing ----------
+    // ---------- E5Embedder worker plumbing ----------
 
     #[tokio::test]
     async fn embed_request_round_trip_through_channel() {
@@ -670,16 +1180,16 @@ mod tests {
             }
         });
 
-        let local = FastEmbedLocal::from_mock_worker(req_tx);
+        let local = E5Embedder::from_mock_worker(req_tx);
         let out = local.embed_with_role("anything", EmbedRole::Passage).await.unwrap();
         assert_eq!(out.len(), 384);
         assert_eq!(out, canned, "worker reply must flow back unchanged");
     }
 
-    /// `FastEmbedLocal::embed_batch` must send exactly one channel request
+    /// `E5Embedder::embed_batch` must send exactly one channel request
     /// carrying every text, each already prefixed per `role`.
     #[tokio::test]
-    async fn fast_embed_local_sends_one_request_with_all_prefixed_texts() {
+    async fn e5_embedder_sends_one_request_with_all_prefixed_texts() {
         use std::sync::{Arc, Mutex};
 
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<EmbedRequest>();
@@ -695,7 +1205,7 @@ mod tests {
             }
         });
 
-        let local = FastEmbedLocal::from_mock_worker(req_tx);
+        let local = E5Embedder::from_mock_worker(req_tx);
         let texts = vec!["chunk-a".to_string(), "chunk-b".to_string()];
         let out = local.embed_batch(&texts, EmbedRole::Passage).await.unwrap();
         assert_eq!(out.len(), 2);
@@ -717,7 +1227,7 @@ mod tests {
     /// A batch longer than `EMBED_BATCH` crosses the channel as requests of at
     /// most `EMBED_BATCH` texts, and its vectors come back in input order.
     #[tokio::test]
-    async fn fast_embed_local_sends_at_most_embed_batch_texts_per_request() {
+    async fn e5_embedder_sends_at_most_embed_batch_texts_per_request() {
         use std::sync::{Arc, Mutex};
 
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<EmbedRequest>();
@@ -738,7 +1248,7 @@ mod tests {
             }
         });
 
-        let local = FastEmbedLocal::from_mock_worker(req_tx);
+        let local = E5Embedder::from_mock_worker(req_tx);
         let n = 2 * EMBED_BATCH + 3;
         let texts: Vec<String> = (0..n).map(|i| format!("chunk-{i}")).collect();
         let out = local.embed_batch(&texts, EmbedRole::Passage).await.unwrap();
@@ -751,7 +1261,7 @@ mod tests {
     /// A reply with fewer (or more) vectors than texts submitted must be
     /// reported as InferenceFailed, never trusted positionally.
     #[tokio::test]
-    async fn fast_embed_local_rejects_reply_with_wrong_vector_count() {
+    async fn e5_embedder_rejects_reply_with_wrong_vector_count() {
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<EmbedRequest>();
         std::thread::spawn(move || {
             while let Some(EmbedRequest { texts: _, resp }) =
@@ -762,7 +1272,7 @@ mod tests {
             }
         });
 
-        let local = FastEmbedLocal::from_mock_worker(req_tx);
+        let local = E5Embedder::from_mock_worker(req_tx);
         let texts = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let err = local.embed_batch(&texts, EmbedRole::Passage).await.unwrap_err();
         assert!(
@@ -776,7 +1286,7 @@ mod tests {
         let (req_tx, req_rx) = mpsc::unbounded_channel::<EmbedRequest>();
         // Drop receiver immediately to simulate the worker thread exiting.
         drop(req_rx);
-        let local = FastEmbedLocal::from_mock_worker(req_tx);
+        let local = E5Embedder::from_mock_worker(req_tx);
         let err = local.embed_with_role("anything", EmbedRole::Passage).await.unwrap_err();
         assert!(
             matches!(err, EmbedError::WorkerGone),
@@ -784,7 +1294,7 @@ mod tests {
         );
     }
 
-    /// `FastEmbedLocal::embed_with_role` must apply the E5 prefix BEFORE the
+    /// `E5Embedder::embed_with_role` must apply the E5 prefix BEFORE the
     /// text crosses the channel to the model thread — asserted on the exact
     /// string the mock worker receives, not on the (prefix-insensitive)
     /// output vector.
@@ -804,7 +1314,7 @@ mod tests {
             }
         });
 
-        let local = FastEmbedLocal::from_mock_worker(req_tx);
+        let local = E5Embedder::from_mock_worker(req_tx);
         local
             .embed_with_role("chunk", EmbedRole::Passage)
             .await

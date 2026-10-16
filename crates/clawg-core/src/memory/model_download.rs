@@ -14,7 +14,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
-use fastembed::TokenizerFiles;
+/// The four tokenizer-side files of the model, as the bytes read from disk.
+pub struct TokenizerFiles {
+    pub tokenizer_file: Vec<u8>,
+    pub config_file: Vec<u8>,
+    pub special_tokens_map_file: Vec<u8>,
+    pub tokenizer_config_file: Vec<u8>,
+}
 
 /// Hard-coded HuggingFace base URL (production). Tests override via `base_url()`.
 pub(super) const HF_BASE_URL: &str =
@@ -149,6 +155,16 @@ pub(crate) fn load_verified_tokenizer(base_dir: &Path) -> Option<Arc<tokenizers:
     load_verified_tokenizer_with(base_dir, |bytes| tokenizers::Tokenizer::from_bytes(bytes).ok())
 }
 
+/// Parses the bytes of a `tokenizer.json` already checked against
+/// [`TOKENIZER_JSON_SHA256`]. The one place the model load parses it, and the
+/// line it logs is what counts the parses of a process.
+pub(crate) fn parse_verified_tokenizer(bytes: &[u8]) -> Result<tokenizers::Tokenizer, String> {
+    let started = std::time::Instant::now();
+    let tokenizer = tokenizers::Tokenizer::from_bytes(bytes).map_err(|e| format!("tokenizer.json does not parse: {e}"))?;
+    log::info!("tokenizer.json parsed in {} ms", started.elapsed().as_millis());
+    Ok(tokenizer)
+}
+
 /// [`load_verified_tokenizer`] with the parser as a parameter, so a test can
 /// count how many times a file reaches it.
 pub(crate) fn load_verified_tokenizer_with<P>(base_dir: &Path, parse: P) -> Option<Arc<tokenizers::Tokenizer>>
@@ -266,8 +282,7 @@ pub struct ModelFiles {
 }
 
 impl std::fmt::Debug for ModelFiles {
-    // `TokenizerFiles` from fastembed does NOT impl Debug. We summarize sizes
-    // instead of the byte contents so test failure output stays readable.
+    // Sizes instead of the byte contents, so test failure output stays readable.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ModelFiles")
             .field("onnx_len", &self.onnx.len())
@@ -466,7 +481,7 @@ async fn ensure_model_with_oracle_spec_inner(
     // Emit `Verify` here, but DO NOT emit `Done`.
     // The semantic `Done` event means "the embedder is ready to use" and that
     // is only true after the bootstrap layer (`memory::bootstrap`) has called
-    // `FastEmbedLocal::from_bytes` + filled the OnceCell. Emitting `Done` here
+    // the model load + filled the OnceCell. Emitting `Done` here
     // as well would deliver TWO `done` events on the happy path. On disk the model
     // is already valid by the time we return Ok — the `ModelFiles` return value
     // is the contract, the wire event is not.
@@ -1419,7 +1434,7 @@ mod tests {
         // `ensure_model` MUST emit `start → chunk(s)
         // → verify` and STOP there. The semantic terminal `done` event means
         // "embedder is ready to use" — that is the bootstrap's responsibility
-        // to emit AFTER `FastEmbedLocal::from_bytes` + `OnceCell::set` succeed.
+        // to emit AFTER the model load + `OnceCell::set` succeed.
         // If `ensure_model` also emitted `Done`, the forwarder→sink path in
         // `memory::bootstrap` would deliver TWO `done` events on the happy
         // path.

@@ -1,6 +1,6 @@
 # embedder-idle-unload — Especificación
 
-Al archivar, estos requisitos se suman a `specs/storage` (ciclo de vida del embedder) y `specs/mcp` (el campo de `/health`). R8 y R9 también van a `specs/storage`, y el requisito de pooling de `specs/storage` que hoy nombra `FastEmbedLocal` y fastembed pasa a nombrar `E5Embedder`.
+Al archivar, estos requisitos se suman a `specs/storage` (ciclo de vida del embedder) y `specs/mcp` (el campo de `/health`). R8 y R9 también van a `specs/storage`, y el requisito de pooling de `specs/storage` que hoy nombra `FastEmbedLocal` y fastembed pasa a nombrar `E5Embedder`; su test `the_e5_model_is_pooled_by_mean`, que miraba la configuración de fastembed, ya no existe y lo reemplaza `mean_pooling_matches_fastembeds_formula_bit_for_bit`.
 
 ## Definiciones
 

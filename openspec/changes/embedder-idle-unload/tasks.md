@@ -67,26 +67,26 @@ Las piezas puras y el cambio van en **un solo commit**. Por separado, las piezas
 
 ### 8.1 Las piezas puras (test primero, en `embedder.rs`)
 
-- [ ] `an_encoding_matches_the_tokenizer_configured_like_fastembed`: un tokenizer armado en código (`WordLevel` con `RobertaProcessing`) y un clon configurado como lo configura fastembed (`common.rs:98-111`); para textos bajo, en y sobre la ventana y en lotes de largos mezclados, los mismos ids, máscara y tipos. Cubre el relleno (`BatchLongest`, `pad_token_id`, tipo 0, a la derecha).
-- [ ] `a_long_text_is_cut_to_the_window_and_keeps_its_closing_token`: `encode(t, false)`, `Encoding::truncate(EMBED_MAX_TOKENS − added_tokens(false), 0, Right)` y `post_process(enc, None, true)`; `</s>` queda al final.
-- [ ] `mean_pooling_matches_fastembeds_formula_bit_for_bit`: estados ocultos al azar con una máscara con relleno contra la fórmula de fastembed escrita con ndarray; mismos `to_bits`. Pide `ndarray = { version = "0.17.2", default-features = false }` en `[dev-dependencies]` de `clawg-core`.
-- [ ] `the_output_is_picked_like_fastembed`: la única, o la primera de `text_embeds`, `last_hidden_state`, `sentence_embedding`; sin ninguna, `LoadFailed`.
-- [ ] `the_load_refuses_a_tokenizer_with_its_own_truncation_or_padding`.
-- [ ] `the_load_refuses_a_special_token_the_tokenizer_does_not_treat_as_special`.
-- [ ] `the_load_refuses_a_model_window_shorter_than_embed_max_tokens` (`model_max_length` de `tokenizer_config.json`).
-- [ ] Las funciones puras (ventana, relleno, pooling con L2, elección de la salida, controles de la carga) separadas de la sesión, para que los tests no necesiten el modelo; errores de carga con `thiserror`.
+- [x] `an_encoding_matches_the_tokenizer_configured_like_fastembed`: un tokenizer armado en código (`WordLevel` con `RobertaProcessing`) y un clon configurado como lo configura fastembed (`common.rs:98-111`); para textos bajo, en y sobre la ventana y en lotes de largos mezclados, los mismos ids, máscara y tipos. Cubre el relleno (`BatchLongest`, `pad_token_id`, tipo 0, a la derecha).
+- [x] `a_long_text_is_cut_to_the_window_and_keeps_its_closing_token`: `encode(t, false)`, `Encoding::truncate(EMBED_MAX_TOKENS − added_tokens(false), 0, Right)` y `post_process(enc, None, true)`; `</s>` queda al final.
+- [x] `mean_pooling_matches_fastembeds_formula_bit_for_bit`: estados ocultos al azar con una máscara con relleno contra la fórmula de fastembed escrita con ndarray; mismos `to_bits`. Pide `ndarray = { version = "0.17.2", default-features = false }` en `[dev-dependencies]` de `clawg-core`.
+- [x] `the_output_is_picked_like_fastembed`: la única, o la primera de `text_embeds`, `last_hidden_state`, `sentence_embedding`; sin ninguna, `LoadFailed`.
+- [x] `the_load_refuses_a_tokenizer_with_its_own_truncation_or_padding`.
+- [x] `the_load_refuses_a_special_token_the_tokenizer_does_not_treat_as_special`.
+- [x] `the_load_refuses_a_model_window_shorter_than_embed_max_tokens` (`model_max_length` de `tokenizer_config.json`).
+- [x] Las funciones puras (ventana, relleno, pooling con L2, elección de la salida, controles de la carga) separadas de la sesión, para que los tests no necesiten el modelo; errores de carga con `thiserror`.
 
 ### 8.2 El cambio
 
-- [ ] `E5Embedder` reemplaza a `FastEmbedLocal` en `embedder.rs`: sesión con las opciones de hoy (`cpu_provider` sin arena, nivel 3, `available_parallelism` hilos intra-op, `commit_from_memory`), hilo `embedder-worker` con `encode_batch(textos, false)`, corrida y pooling; al cerrarse el canal, `drop(session)` y después `return_freed_memory`. Los tests del canal existentes no cambian.
-- [ ] `TokenizerFiles` propio en `model_download.rs` (los mismos cuatro campos); `bootstrap.rs` (`production_deps`, el `TokenizerFiles` de `:298` y los tests de `:741`) y `eval_api.rs` (`EvalEmbedder::real`, que parsea su propia copia) dejan de nombrar fastembed.
-- [ ] La celda llega a la carga: `production_deps` y `serve_deps` reciben `runtime.tokenizer` (`serve.rs`); la carga la toma o la llena con los bytes que `ensure_model` verificó, con `get_or_try_init`. Test: `the_worker_and_the_model_load_share_one_parse` (un cargador que cuenta; en cualquier orden, 1 parse y el mismo `Arc`).
-- [ ] La recarga arma sólo la sesión y descarta sin parsear los bytes de `tokenizer.json`; los dos JSON chicos se leen otra vez para `pad_token_id` y los rechazos. Test: `a_reload_does_not_parse_the_tokenizer_again` (`bootstrap.rs`, con el cargador que cuenta).
-- [ ] `Cargo.toml` y `crates/clawg-core/Cargo.toml`: fuera `fastembed`. `ort = "=2.0.0-rc.12"` con `default-features = false` y `features = ["std", "ndarray", "api-24", "download-binaries", "tls-native"]`; `tokenizers = "0.22.2"` con `default-features = false` y `features = ["onig"]`. El comentario de `ort` en `Cargo.toml` deja de decir «subirlo con fastembed» (y los de `Cargo.toml:38-41` ya no hablan de fastembed).
-- [ ] `cargo update --workspace` y revisar el diff del lock: pierde `fastembed` y `safetensors` y no suma ni cambia nada más.
-- [ ] El commit no toca `crates/clawg-core/tests/e5_golden.rs` ni el fixture (`git diff --stat` lo confirma antes de commitear).
-- [ ] Comentarios de `chunker/mod.rs:13` e `idle_embedder.rs:9` y el doc del módulo `embedder.rs` sin fastembed.
-- [ ] Suite y clippy completos antes de commitear.
+- [x] `E5Embedder` reemplaza a `FastEmbedLocal` en `embedder.rs`: sesión con las opciones de hoy (`cpu_provider` sin arena, nivel 3, `available_parallelism` hilos intra-op, `commit_from_memory`), hilo `embedder-worker` con `encode_batch(textos, false)`, corrida y pooling; al cerrarse el canal, `drop(session)` y después `return_freed_memory`. Los tests del canal existentes no cambian.
+- [x] `TokenizerFiles` propio en `model_download.rs` (los mismos cuatro campos); `bootstrap.rs` (`production_deps`, el `TokenizerFiles` de `:298` y los tests de `:741`) y `eval_api.rs` (`EvalEmbedder::real`, que parsea su propia copia) dejan de nombrar fastembed.
+- [x] La celda llega a la carga: `production_deps` y `serve_deps` reciben `runtime.tokenizer` (`serve.rs`); la carga la toma o la llena con los bytes que `ensure_model` verificó, con `get_or_try_init`. Test: `the_worker_and_the_model_load_share_one_parse` (un cargador que cuenta; en cualquier orden, 1 parse y el mismo `Arc`).
+- [x] La recarga arma sólo la sesión y descarta sin parsear los bytes de `tokenizer.json`; los dos JSON chicos se leen otra vez para `pad_token_id` y los rechazos. Test: `a_reload_does_not_parse_the_tokenizer_again` (`bootstrap.rs`, con el cargador que cuenta).
+- [x] `Cargo.toml` y `crates/clawg-core/Cargo.toml`: fuera `fastembed`. `ort = "=2.0.0-rc.12"` con `default-features = false` y `features = ["std", "ndarray", "api-24", "download-binaries", "tls-native"]`; `tokenizers = "0.22.2"` con `default-features = false` y `features = ["onig"]`. El comentario de `ort` en `Cargo.toml` deja de decir «subirlo con fastembed» (y los de `Cargo.toml:38-41` ya no hablan de fastembed).
+- [x] `cargo update --workspace` y revisar el diff del lock: pierde `fastembed` y `safetensors` y no suma ni cambia nada más.
+- [x] El commit no toca `crates/clawg-core/tests/e5_golden.rs` ni el fixture (`git diff --stat` lo confirma antes de commitear).
+- [x] Comentarios de `chunker/mod.rs:13` e `idle_embedder.rs:9` y el doc del módulo `embedder.rs` sin fastembed.
+- [x] Suite y clippy completos antes de commitear.
 - Commit: `feat(core): run the embedding model on our own session and one shared tokenizer, dropping fastembed`
 
 ## 9. Docs

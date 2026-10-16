@@ -22,10 +22,12 @@ use tokio::sync::watch;
 
 use crate::memory::backup::{self, Reason};
 use crate::memory::db::{ContractStatus, EmbeddingIdentity, StoredContract};
-use crate::memory::embedder::{Embedder, FastEmbedLocal, E5_MODEL_ID, LEGACY_CLS_MODEL_ID};
+use crate::memory::embedder::{E5Embedder, Embedder, E5_MODEL_ID, LEGACY_CLS_MODEL_ID};
 use crate::memory::idle_embedder::{IdleEmbedder, ReloadFn};
 use crate::memory::maintenance::{reembed_all, ReInferPlan, ReembedMode};
-use crate::memory::model_download::{ensure_model, DownloadProgress};
+use crate::memory::model_download::{
+    ensure_model, parse_verified_tokenizer, DownloadProgress, TokenizerFiles,
+};
 use crate::memory::MemoryStore;
 use crate::models::chat::StreamEvent;
 
@@ -201,7 +203,7 @@ pub type EnsureModelFn = Arc<
 >;
 
 /// Type alias for the injectable model-load seam (replaces
-/// `FastEmbedLocal::from_bytes` in tests).
+/// [`E5Embedder::from_parts`] in tests).
 pub type LoadEmbedderFn = Arc<
     dyn Fn(crate::memory::model_download::ModelFiles) -> Result<Arc<dyn Embedder>, String>
         + Send
@@ -218,36 +220,69 @@ pub type ContractVerifyFn = Arc<
         + Sync,
 >;
 
+/// The model load: takes the process's tokenizer from `tokenizer`, or fills it
+/// by parsing the bytes of the files it was handed, and builds the embedder
+/// around that one tokenizer. With the cell already full, a reload parses
+/// nothing and drops the `tokenizer.json` bytes it was given. `parse` and
+/// `build` are parameters so a test can count the parses and skip the session.
+pub(crate) fn model_loader<P, B>(
+    tokenizer: Arc<OnceCell<Arc<tokenizers::Tokenizer>>>,
+    parse: P,
+    build: B,
+) -> LoadEmbedderFn
+where
+    P: Fn(&[u8]) -> Result<tokenizers::Tokenizer, String> + Send + Sync + 'static,
+    B: Fn(&[u8], Arc<tokenizers::Tokenizer>, &TokenizerFiles) -> Result<Arc<dyn Embedder>, String>
+        + Send
+        + Sync
+        + 'static,
+{
+    Arc::new(move |files| {
+        let shared = tokenizer
+            .get_or_try_init(|| parse(&files.tokenizer.tokenizer_file).map(Arc::new))?
+            .clone();
+        build(&files.onnx, shared, &files.tokenizer)
+    })
+}
+
+/// The contract check against `store`: the one dependency every host shares,
+/// whichever model it loads.
+fn contract_verifier(store: Arc<MemoryStore>, backups: std::path::PathBuf) -> ContractVerifyFn {
+    // The store is the only host-supplied ingredient — `run_embedder_bootstrap`
+    // itself stays store-agnostic and testable without a `MemoryStore` at all.
+    Arc::new(move |embedder| {
+        let (store, backups) = (store.clone(), backups.clone());
+        Box::pin(async move { verify_or_reembed(&store, embedder, backups).await })
+    })
+}
+
 /// The three real dependencies [`run_embedder_bootstrap`] runs against in
 /// production: the HTTP download, the ONNX load, and the store's contract
 /// check.
 ///
 /// Exposed as one function because the trio is a unit — every host needs all
-/// three, and the only host-specific ingredient is the open [`MemoryStore`]
-/// the verifier closes over. Keeping the closures here rather than at each
-/// call site means no two hosts can drift into verifying the
-/// contract against different stores or loading the model two different ways.
+/// three, and the host-specific ingredients are the open [`MemoryStore`] the
+/// verifier closes over and the cell holding the process's tokenizer, which
+/// the load shares with whoever else needs it. Keeping the closures here
+/// rather than at each call site means no two hosts can drift into verifying
+/// the contract against different stores or loading the model two different
+/// ways.
 ///
 /// `backups` is where the snapshot taken before a pooling upgrade goes.
 pub fn production_deps(
     store: Arc<MemoryStore>,
     backups: std::path::PathBuf,
+    tokenizer: Arc<OnceCell<Arc<tokenizers::Tokenizer>>>,
 ) -> (EnsureModelFn, LoadEmbedderFn, ContractVerifyFn) {
     let ensure: EnsureModelFn = Arc::new(|base_dir, progress| {
         Box::pin(async move { ensure_model(&base_dir, progress).await })
     });
-    let load: LoadEmbedderFn = Arc::new(|files| {
-        FastEmbedLocal::from_bytes(files.onnx, files.tokenizer)
-            .map(|local| Arc::new(local) as Arc<dyn Embedder>)
+    let load = model_loader(tokenizer, parse_verified_tokenizer, |onnx, tokenizer, files| {
+        E5Embedder::from_parts(onnx, tokenizer, files)
+            .map(|embedder| Arc::new(embedder) as Arc<dyn Embedder>)
             .map_err(|e| e.to_string())
     });
-    // The store is the only host-supplied ingredient — `run_embedder_bootstrap`
-    // itself stays store-agnostic and testable without a `MemoryStore` at all.
-    let verify: ContractVerifyFn = Arc::new(move |embedder| {
-        let (store, backups) = (store.clone(), backups.clone());
-        Box::pin(async move { verify_or_reembed(&store, embedder, backups).await })
-    });
-    (ensure, load, verify)
+    (ensure, load, contract_verifier(store, backups))
 }
 
 /// Env var that, in a build with the `testing` feature, replaces the model
@@ -289,13 +324,13 @@ impl TestEmbedder {
         store: Arc<MemoryStore>,
         backups: std::path::PathBuf,
     ) -> (EnsureModelFn, LoadEmbedderFn, ContractVerifyFn) {
-        let (_, _, verify) = production_deps(store, backups);
+        let verify = contract_verifier(store, backups);
         let ensure: EnsureModelFn = match self {
             Self::Fake => Arc::new(|_base_dir, _progress| {
                 Box::pin(async {
                     Ok(crate::memory::model_download::ModelFiles {
                         onnx: Vec::new(),
-                        tokenizer: fastembed::TokenizerFiles {
+                        tokenizer: crate::memory::model_download::TokenizerFiles {
                             tokenizer_file: Vec::new(),
                             config_file: Vec::new(),
                             special_tokens_map_file: Vec::new(),
@@ -319,11 +354,12 @@ impl TestEmbedder {
 pub fn serve_deps(
     store: Arc<MemoryStore>,
     backups: std::path::PathBuf,
+    tokenizer: Arc<OnceCell<Arc<tokenizers::Tokenizer>>>,
 ) -> Result<(EnsureModelFn, LoadEmbedderFn, ContractVerifyFn), String> {
     let raw = std::env::var(TEST_EMBEDDER_VAR).ok();
     Ok(match TestEmbedder::parse(raw.as_deref())? {
         Some(stand_in) => stand_in.deps(store, backups),
-        None => production_deps(store, backups),
+        None => production_deps(store, backups, tokenizer),
     })
 }
 
@@ -332,8 +368,9 @@ pub fn serve_deps(
 pub fn serve_deps(
     store: Arc<MemoryStore>,
     backups: std::path::PathBuf,
+    tokenizer: Arc<OnceCell<Arc<tokenizers::Tokenizer>>>,
 ) -> Result<(EnsureModelFn, LoadEmbedderFn, ContractVerifyFn), String> {
-    Ok(production_deps(store, backups))
+    Ok(production_deps(store, backups, tokenizer))
 }
 
 /// `load`, with every embedder it builds wrapped in an [`IdleEmbedder`] that
@@ -738,7 +775,7 @@ mod tests {
 
     use crate::memory::embedder::FakeEmbedder;
     use crate::memory::model_download::{DownloadError, ModelFiles};
-    use fastembed::TokenizerFiles;
+    use crate::memory::model_download::TokenizerFiles;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -836,6 +873,107 @@ mod tests {
         embedder.embed_with_role("again", crate::memory::embedder::EmbedRole::Query).await.expect("reload");
         assert!(embedder.resident());
         assert_eq!((ensure_calls.load(Ordering::SeqCst), load_calls.load(Ordering::SeqCst)), (1, 2));
+    }
+
+    fn tiny_tokenizer() -> tokenizers::Tokenizer {
+        use tokenizers::models::wordlevel::WordLevel;
+        let vocab = [("uno".to_string(), 0u32)].into_iter().collect();
+        let model = WordLevel::builder().vocab(vocab).build().expect("a word-level model");
+        tokenizers::Tokenizer::new(model)
+    }
+
+    /// A parser that counts how often a `tokenizer.json` reaches it.
+    fn counting_parse(
+        parses: Arc<AtomicUsize>,
+    ) -> impl Fn(&[u8]) -> Result<tokenizers::Tokenizer, String> + Send + Sync + 'static {
+        move |_bytes| {
+            parses.fetch_add(1, Ordering::SeqCst);
+            Ok(tiny_tokenizer())
+        }
+    }
+
+    /// The `build` of a model load that makes a fake embedder and records the
+    /// tokenizer it was handed.
+    fn recording_build(
+        seen: Arc<Mutex<Vec<Arc<tokenizers::Tokenizer>>>>,
+    ) -> impl Fn(&[u8], Arc<tokenizers::Tokenizer>, &TokenizerFiles) -> Result<Arc<dyn Embedder>, String>
+           + Send
+           + Sync
+           + 'static {
+        move |_onnx, tokenizer, _files| {
+            seen.lock().unwrap().push(tokenizer);
+            Ok(Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>)
+        }
+    }
+
+    #[test]
+    fn the_worker_and_the_model_load_share_one_parse() {
+        for worker_first in [true, false] {
+            let cell: Arc<OnceCell<Arc<tokenizers::Tokenizer>>> = Arc::new(OnceCell::new());
+            let parses = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let load = model_loader(cell.clone(), counting_parse(parses.clone()), recording_build(seen.clone()));
+            let worker = || {
+                let parses = parses.clone();
+                crate::memory::worker::resolve_tokenizer_and_chunker(
+                    std::path::Path::new("unused"),
+                    &cell,
+                    move |_dir| {
+                        parses.fetch_add(1, Ordering::SeqCst);
+                        Some(Arc::new(tiny_tokenizer()))
+                    },
+                )
+            };
+
+            let chunker = if worker_first {
+                let chunker = worker();
+                load(empty_model_files()).expect("the model load");
+                chunker
+            } else {
+                load(empty_model_files()).expect("the model load");
+                worker()
+            };
+
+            assert_eq!(parses.load(Ordering::SeqCst), 1, "worker first: {worker_first}");
+            let shared = cell.get().expect("the cell is filled");
+            let loaded = seen.lock().unwrap();
+            assert_eq!(loaded.len(), 1);
+            assert!(Arc::ptr_eq(shared, &loaded[0]), "the model load got the cell's tokenizer");
+            assert_eq!(
+                chunker.tokenizer_ptr(),
+                Some(Arc::as_ptr(shared)),
+                "the chunker got the cell's tokenizer"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reload_does_not_parse_the_tokenizer_again() {
+        let cell: Arc<OnceCell<Arc<tokenizers::Tokenizer>>> = Arc::new(OnceCell::new());
+        let parses = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let ensure: EnsureModelFn = Arc::new(|_base, _progress| Box::pin(async { Ok(empty_model_files()) }));
+        let load = model_loader(cell.clone(), counting_parse(parses.clone()), recording_build(seen.clone()));
+        let wrapped = unloading_when_idle(
+            ensure,
+            load,
+            std::path::PathBuf::from("unused"),
+            Duration::from_secs(600),
+            tokio::runtime::Handle::current(),
+        );
+
+        let embedder = wrapped(empty_model_files()).expect("first load");
+        assert_eq!(parses.load(Ordering::SeqCst), 1);
+
+        tokio::time::sleep(Duration::from_secs(1200)).await;
+        assert!(!embedder.resident());
+        embedder.embed_with_role("again", crate::memory::embedder::EmbedRole::Query).await.expect("reload");
+
+        assert!(embedder.resident());
+        assert_eq!(parses.load(Ordering::SeqCst), 1, "the reload built a session and parsed nothing");
+        let loaded = seen.lock().unwrap();
+        assert_eq!(loaded.len(), 2, "the model was built again");
+        assert!(Arc::ptr_eq(&loaded[0], &loaded[1]), "both builds got the same tokenizer");
     }
 
     #[tokio::test]
@@ -1299,7 +1437,8 @@ mod tests {
     #[tokio::test]
     async fn production_deps_builds_all_three_closures_from_a_store() {
         let store = Arc::new(MemoryStore::new_for_test().await.expect("test store"));
-        let (_ensure, load, verify) = production_deps(store, std::env::temp_dir());
+        let (_ensure, load, verify) =
+            production_deps(store, std::env::temp_dir(), Arc::new(OnceCell::new()));
 
         // `load` is pure: hand it empty model bytes and it must report a
         // load failure rather than panicking or hanging.

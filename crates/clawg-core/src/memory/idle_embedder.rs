@@ -6,7 +6,7 @@
 //! one asking for a vector. [`IdleEmbedder`] sits in the embedder cell for
 //! the whole life of the process, so every reader of the cell keeps working
 //! unchanged; only the model behind it comes and goes. Dropping the inner
-//! embedder is what unloads it: for `FastEmbedLocal` the last `Arc` takes the
+//! embedder is what unloads it: for `E5Embedder` the last `Arc` takes the
 //! request channel with it and the owning thread drops the session.
 
 use std::sync::atomic::{AtomicBool, Ordering};

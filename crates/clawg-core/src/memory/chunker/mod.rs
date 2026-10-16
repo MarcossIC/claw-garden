@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use crate::models::chat::Role;
 
 /// Upper bound on a chunk's token count. Stays under the embedder's 512-token
-/// model limit with a safety margin (fastembed truncates silently past that,
+/// model limit with a safety margin (the embedder truncates silently past that,
 /// and a truncated chunk's stored text would no longer match its own vector).
 pub(crate) const CHUNK_MAX_TOKENS: usize = 480;
 

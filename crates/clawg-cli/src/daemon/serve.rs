@@ -91,8 +91,12 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
     // daemon must answer `/health` and accept saves throughout the download.
     // A failed download is retried until the network comes back.
     let (ensure, load, verify) =
-        serve_deps(runtime.store.clone(), clawg_core::paths::backups_dir(&base_dir))
-            .map_err(ServeError::Embedder)?;
+        serve_deps(
+            runtime.store.clone(),
+            clawg_core::paths::backups_dir(&base_dir),
+            runtime.tokenizer.clone(),
+        )
+        .map_err(ServeError::Embedder)?;
     // A wrong value must not keep the daemon from starting under an editor
     // that spawned it; the default is what the user had before setting it.
     let idle = idle_after(std::env::var(IDLE_MINUTES_VAR).ok().as_deref()).unwrap_or_else(|e| {

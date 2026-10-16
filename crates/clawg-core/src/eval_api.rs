@@ -27,7 +27,7 @@ use tokio::task::JoinHandle;
 use crate::memory::access::AccessTracker;
 use crate::memory::db::MemoryStore;
 use crate::memory::chunker::token_splitter::TokenSplitter;
-use crate::memory::embedder::{Embedder, FakeEmbedder, FastEmbedLocal};
+use crate::memory::embedder::{E5Embedder, Embedder, FakeEmbedder};
 
 /// Re-exported so the `rag-eval` and `golden-mine` binaries can name a role
 /// without reaching into the private `memory` module tree.
@@ -428,7 +428,10 @@ impl EvalEmbedder {
         let files = model_download::ensure_model(base_dir, None)
             .await
             .map_err(|e| EvalError::ModelLoad(e.to_string()))?;
-        let inner = FastEmbedLocal::from_bytes(files.onnx, files.tokenizer)
+        // The evaluation tools are not the daemon: they parse their own copy.
+        let tokenizer = model_download::parse_verified_tokenizer(&files.tokenizer.tokenizer_file)
+            .map_err(EvalError::ModelLoad)?;
+        let inner = E5Embedder::from_parts(&files.onnx, Arc::new(tokenizer), &files.tokenizer)
             .map_err(|e| EvalError::ModelLoad(e.to_string()))?;
         Ok(EvalEmbedder(Arc::new(inner)))
     }

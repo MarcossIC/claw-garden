@@ -35,16 +35,12 @@ sqlite-vec = "0.1"
 siphasher = "1.0"
 
 # Embedder
-# fastembed v5 has no `ort-download-binaries-rustls-tls` feature; the available ORT
-# features are `ort-download-binaries` and `ort-load-dynamic`. The `-rustls-tls`
-# suffix only exists on `hf-hub-rustls-tls`, which is INTENTIONALLY dropped: the
-# download path is our own (reqwest + rustls), never fastembed's built-in hf-hub.
-# `ort-download-binaries` is the minimal config for "offline init from bytes".
-fastembed = { version = "5", default-features = false, features = ["ort-download-binaries"] }
-# Only to configure the CPU provider fastembed runs on. Pinned to the exact ort
-# release fastembed resolves to, so both name the same crate; raise it with
-# fastembed.
-ort = { version = "=2.0.0-rc.12", default-features = false }
+# ONNX Runtime, for the session the embedder runs the model on. Pinned to an exact
+# release: the vectors are tied to what its CPU kernels compute, so raising it is a
+# decision of its own, checked against the golden vectors of
+# `crates/clawg-core/tests/e5_golden.rs`. `ndarray` stays on because `std` already
+# brings it in; dropping it would only rebuild ort.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "api-24", "download-binaries", "tls-native"] }
 fs2 = "0.4"
 
 # Ingest (chunking and tokenization)
@@ -52,7 +48,8 @@ tree-sitter = "0.26"
 tree-sitter-rust = "0.24"
 tree-sitter-typescript = "0.23"
 tree-sitter-python = "0.25"
-tokenizers = { version = "0.22.2", default-features = false }
+# `onig` is the regex engine tokenizers needs to compile at all without its defaults.
+tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
 # Finds a project's documentation with git's own ignore rules, without needing
 # `git` on the PATH or a `.git` at the root.
 ignore = "0.4"
@@ -60,6 +57,7 @@ ignore = "0.4"
 # tree-sitter, so a direct dependency adds nothing to the build.
 regex = "1"
 
+ndarray = { version = "0.17.2", default-features = false }
 mockito = "1"
 tempfile = "3"
 

@@ -47,7 +47,6 @@ sqlite-vec.workspace = true
 siphasher.workspace = true
 
 # Embedder
-fastembed.workspace = true
 ort.workspace = true
 fs2.workspace = true
 
@@ -70,3 +69,5 @@ required-features = ["eval"]
 tokio = { workspace = true, features = ["test-util"] }
 mockito.workspace = true
 tempfile.workspace = true
+# Only for the test that checks the pooling against the formula ndarray gives it.
+ndarray.workspace = true
