@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| transversal (el daemon es de todos los objetivos) | M | — (después del arreglo del arena de ORT, que fija el piso de partida; se coordina con 36 y 25; ver «Interacciones») | exploración (borrador) |
+| transversal (el daemon es de todos los objetivos) | M | — (después del arreglo del arena de ORT, que fija el piso de partida; se coordina con 36 y 25; ver «Interacciones») | exploración cerrada; sigue en la [propuesta](proposal.md) |
 
 **Tesis:** el daemon es un proceso sin interfaz que corre todo el día, y durante casi todo ese tiempo nadie le pide un embedding. Aun así mantiene el modelo (`multilingual-e5-small`, fp32, `model.onnx` de 470 MB) cargado durante toda su vida, y ese modelo cargado es el piso de memoria: cerca de 1 GB de bytes privados, con el arreglo del arena ya aplicado. Cualquier cosa que se haga con el arena, el lote o el troceo no baja de ahí, porque el piso **es** el modelo. Entonces la palanca que falta es soltar el modelo cuando el daemon está ocioso y volver a cargarlo cuando alguien lo necesita, de modo que un daemon ocioso quede en decenas de MB en lugar de ~1 GB. El costo es real y está medido en el log: una carga tarda entre 9 y 16 s en el perfil dev, así que la primera petición después de un rato ocioso la paga, salvo que el daemon se entere antes de que va a hacer falta.
 

@@ -1,14 +1,14 @@
 change: embedder-idle-unload
 objective: "transversal"
 depends_on: []
-phase: explore
+phase: verify
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
-  apply: pending
-  verify: pending
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: partial  # Linux; falta el CI y la medición en Windows, ver verify.md
   archive: pending
-updated: 2026-10-15
+updated: 2026-10-16
