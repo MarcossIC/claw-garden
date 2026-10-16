@@ -241,8 +241,9 @@ mod tests {
         use winreg::enums::{RegType, HKEY_CURRENT_USER, REG_EXPAND_SZ};
         use winreg::{RegKey, RegValue};
 
-        /// A key under `HKCU\Software` that exists for one test and is deleted
-        /// after it — the real `Environment` key is never touched by a test.
+        /// A key directly under `HKCU\Software` that exists for one test and is
+        /// deleted after it — the real `Environment` key is never touched by a
+        /// test, and no two tests share a parent one of them could delete.
         struct ScratchKey(String);
 
         impl ScratchKey {
@@ -251,7 +252,7 @@ mod tests {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos())
                     .unwrap_or_default();
-                let path = format!(r"Software\clawg-test\{tag}-{}-{nanos}", std::process::id());
+                let path = format!(r"Software\clawg-test-{tag}-{}-{nanos}", std::process::id());
                 RegKey::predef(HKEY_CURRENT_USER).create_subkey(&path).expect("create scratch key");
                 Self(path)
             }
@@ -282,12 +283,20 @@ mod tests {
 
         impl Drop for ScratchKey {
             fn drop(&mut self) {
-                let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-                let _ = hkcu.delete_subkey_all(&self.0);
-                // Fails while a parallel test still has its key in there, so
-                // whichever finishes last leaves no residue.
-                let _ = hkcu.delete_subkey(r"Software\clawg-test");
+                let _ = RegKey::predef(HKEY_CURRENT_USER).delete_subkey_all(&self.0);
             }
+        }
+
+        /// Windows deletes a key that another handle still has open, and that
+        /// handle then fails every call: a test that removed the key above its
+        /// own would break a parallel test creating its key there.
+        #[test]
+        fn a_finished_test_never_deletes_the_key_above_its_own() {
+            let first = ScratchKey::new("first");
+            let (parent, _) = first.0.rsplit_once('\\').expect("a key under a parent");
+            let held = RegKey::predef(HKEY_CURRENT_USER).open_subkey(parent).expect("open parent");
+            drop(first);
+            held.query_info().expect("the parent outlives a finished test");
         }
 
         #[test]
