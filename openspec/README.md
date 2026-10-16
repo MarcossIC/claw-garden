@@ -105,27 +105,28 @@ La idea que lo ordena: primero poder medir, después que lo que se recupera y se
 | 5 | 42 | redaction-precision | Es chico, y cada falso positivo destruye texto del usuario antes de guardarlo. Va antes de 36, que empieza a enmascarar en el handler, y mucho antes de 44, que pasa miles de textos por el mismo filtro |
 | 6 | 36 | ingest-outbox | Por regla de producto, lo aceptado no se pierde. Tiene que cerrar antes de 25: los hooks empujan saves al arrancar la sesión, mientras carga el modelo, que es justo cuando un save queda sólo en RAM |
 | 7 | 40 | install-smoke | Después de 36 y 39, que son los primeros en ganar una prueba de proceso real (kill duro, reinicio con el puente abierto). Toma la decisión de CI que 32 dejó abierta |
-| 8 | 21 | english-recall | Diagnóstico con la prueba pareada y el piso léxico de 33. Va antes de 34 para mover un factor por vez. Si confirma el prefijo `passage:`, 17 sube a este lugar: hoy el arranque sólo repara un cambio de pooling y cualquier otro apaga la memoria |
-| 9 | 34 | memory-rank-fusion | Antes de 22: el protocolo pide escribir identificadores, y con el corte actual cada identificador que acierta esconde las filas relacionadas que no lo tienen |
-| 10 | 22 | memory-protocol | Mejora cada save desde el primer día, hace cumplir el tipo (que hoy cae en `semantic_fact` sin aviso) y dice que lo recuperado es evidencia, no instrucciones. Es el texto que entregan 25 y 26 |
-| 11 | 23 | context-budget | 25 necesita un tamaño predecible (el host acota lo que inyecta un hook), un aviso honesto mientras el modelo carga y saber por id qué quedó afuera. El aviso es la parte más barata: si molesta antes, sale como arreglo suelto |
-| 12 | 24 | conflict-candidates | Tiene que cerrar antes de 25: si no, cada inicio de sesión trae pares que no son contradicciones y le pide al agente que le pregunte al usuario |
-| 13 | 41 | memory-provenance | Después de 24, que es su consumidor (el origen ordena los pares), y de 22, que dice cuándo declarar una cita del usuario. Antes de 44, que sella lo importado |
-| 14 | 27 | topic-revisions | Sube desde después de 28: dos versiones vivas de la misma decisión inyectadas en cada sesión por 25 son justo el contexto malo que este orden quiere evitar. Después de 24, porque comparte con él cómo se declara un reemplazo y una revisión cierra los pares pendientes de la fila que reemplaza. Antes de 44, que trae claves de tema |
-| 15 | 35 | search-abstention | Después de 34, que cambia la escala del puntaje, y antes de 25: lo que se inyecta en cada sesión no debería rellenarse con filas que no tienen nada que ver |
-| 16 | 25 | agent-lifecycle-hooks | El salto más grande para los objetivos 1 y 5. Todo lo anterior es su base |
-| 17 | 26 | client-setup | Instala 22 y 25 y fija la identidad del agente, que el hook también necesita. El registro con `--agent` puede adelantarse si hace falta |
-| 18 | 28 | session-handoff | Necesita el id de sesión, que sólo conoce el hook, y un lugar en el presupuesto de 23 |
-| 19 | 18 | recoverable-delete | Después de 24 y 27: restaurar una fila tiene que conocer las candidatas y las revisiones |
-| 20 | 43 | memory-portability | Después de los cambios de esquema pendientes (24, 27, 36, 18), para no versionar el formato de export varias veces |
-| 21 | 44 | history-import | Necesita el camino de 43, y que 42, 24, 27 y 19 ya estén: si no, la importación multiplica falsos positivos del enmascarado, abre pares entre notas del mismo tema, pierde las claves de tema y entierra las notas largas. 28 y 41 la completan |
-| 22 | 45 | conclusion-upkeep | Gana casos reales con 27 (fuentes `superseded`) y 18 (fuentes borradas y restauradas) |
-| 23 | 30 | project-clone-identity | Hace re-key de datos. Va después de 29, que define qué es una colisión; si 29 elige fallar cerrado, 30 tiene que traer un id más ancho o asignado por el registro. Antes conviene el arreglo de la poda de snapshots (backlog) |
-| 24 | 38 | daemon-hardening | Chico e independiente: se puede adelantar junto a 29 |
-| 25 | 31 | doctor-checks | Chequea estados que introducen 24, 26, 29 y 36 |
-| 26 | 20 | docs-search-quality | El primer paso (sacar del corpus lo que cita las preguntas) no depende de nada. El resto necesita 33 y conviene después de 34, porque hoy docs y memorias comparten la expresión léxica. Sube de prioridad cuando 22 empuje más a `search_project` |
-| 27 | 37 | knn-prefilter | Sólo si el corpus multiagente y multiproyecto de 33 muestra crowding |
-| 28 | 17 | model-reembed | Urgencia baja salvo que 21 confirme el prefijo `passage:` |
+| 8 | 46 | embedder-idle-unload | Después de 36, que vuelve seguro el `202` que se hace frecuente cuando un save llega con el modelo suelto, y de 40, cuya prueba con el binario real es donde se miden los bytes privados ociosos y la recarga. No toca el ranking (los vectores son los mismos), así que no se mezcla con 21, 34 y 35. Va antes de 23 y 25 para que el aviso de `recall_context` y el hook de inicio de sesión, que no puede esperar una recarga de ~10 s, se diseñen contra el ciclo de vida final del modelo y usen el despertar de `POST /v1/projects`. El paso 0 (la medición que decide entre soltar el modelo en el proceso o un proceso hijo) no depende de nada y se puede adelantar |
+| 9 | 21 | english-recall | Diagnóstico con la prueba pareada y el piso léxico de 33. Va antes de 34 para mover un factor por vez. Si confirma el prefijo `passage:`, 17 sube a este lugar: hoy el arranque sólo repara un cambio de pooling y cualquier otro apaga la memoria |
+| 10 | 34 | memory-rank-fusion | Antes de 22: el protocolo pide escribir identificadores, y con el corte actual cada identificador que acierta esconde las filas relacionadas que no lo tienen |
+| 11 | 22 | memory-protocol | Mejora cada save desde el primer día, hace cumplir el tipo (que hoy cae en `semantic_fact` sin aviso) y dice que lo recuperado es evidencia, no instrucciones. Es el texto que entregan 25 y 26 |
+| 12 | 23 | context-budget | 25 necesita un tamaño predecible (el host acota lo que inyecta un hook), un aviso honesto mientras el modelo carga y saber por id qué quedó afuera. El aviso es la parte más barata: si molesta antes, sale como arreglo suelto |
+| 13 | 24 | conflict-candidates | Tiene que cerrar antes de 25: si no, cada inicio de sesión trae pares que no son contradicciones y le pide al agente que le pregunte al usuario |
+| 14 | 41 | memory-provenance | Después de 24, que es su consumidor (el origen ordena los pares), y de 22, que dice cuándo declarar una cita del usuario. Antes de 44, que sella lo importado |
+| 15 | 27 | topic-revisions | Sube desde después de 28: dos versiones vivas de la misma decisión inyectadas en cada sesión por 25 son justo el contexto malo que este orden quiere evitar. Después de 24, porque comparte con él cómo se declara un reemplazo y una revisión cierra los pares pendientes de la fila que reemplaza. Antes de 44, que trae claves de tema |
+| 16 | 35 | search-abstention | Después de 34, que cambia la escala del puntaje, y antes de 25: lo que se inyecta en cada sesión no debería rellenarse con filas que no tienen nada que ver |
+| 17 | 25 | agent-lifecycle-hooks | El salto más grande para los objetivos 1 y 5. Todo lo anterior es su base |
+| 18 | 26 | client-setup | Instala 22 y 25 y fija la identidad del agente, que el hook también necesita. El registro con `--agent` puede adelantarse si hace falta |
+| 19 | 28 | session-handoff | Necesita el id de sesión, que sólo conoce el hook, y un lugar en el presupuesto de 23 |
+| 20 | 18 | recoverable-delete | Después de 24 y 27: restaurar una fila tiene que conocer las candidatas y las revisiones |
+| 21 | 43 | memory-portability | Después de los cambios de esquema pendientes (24, 27, 36, 18), para no versionar el formato de export varias veces |
+| 22 | 44 | history-import | Necesita el camino de 43, y que 42, 24, 27 y 19 ya estén: si no, la importación multiplica falsos positivos del enmascarado, abre pares entre notas del mismo tema, pierde las claves de tema y entierra las notas largas. 28 y 41 la completan |
+| 23 | 45 | conclusion-upkeep | Gana casos reales con 27 (fuentes `superseded`) y 18 (fuentes borradas y restauradas) |
+| 24 | 30 | project-clone-identity | Hace re-key de datos. Va después de 29, que define qué es una colisión; si 29 elige fallar cerrado, 30 tiene que traer un id más ancho o asignado por el registro. Antes conviene el arreglo de la poda de snapshots (backlog) |
+| 25 | 38 | daemon-hardening | Chico e independiente: se puede adelantar junto a 29 |
+| 26 | 31 | doctor-checks | Chequea estados que introducen 24, 26, 29 y 36 |
+| 27 | 20 | docs-search-quality | El primer paso (sacar del corpus lo que cita las preguntas) no depende de nada. El resto necesita 33 y conviene después de 34, porque hoy docs y memorias comparten la expresión léxica. Sube de prioridad cuando 22 empuje más a `search_project` |
+| 28 | 37 | knn-prefilter | Sólo si el corpus multiagente y multiproyecto de 33 muestra crowding |
+| 29 | 17 | model-reembed | Urgencia baja salvo que 21 confirme el prefijo `passage:` |
 
 ## Ideas evaluadas
 
