@@ -22,7 +22,6 @@ context: |
   Compare two runs with rag-eval --diff: a conclusion needs at least 6 cases moving one way (p < 0.05).
   Agent-view baseline (RELEVANCE_RATIO 0.35): search_memory 36/46 at 764.0 mean tokens,
   recall_context 39/46 at 1086.4 (docs/eval/results/2026-10-15-real-project-indexing-relcut-agent-view.json).
-  Test baseline (Windows): cargo test --workspace -> 2050 passed, 0 failed.
 
 strict_tdd: true
 
@@ -53,6 +52,6 @@ rules:
     - No release builds, installs, or access to ~/.clawg or ~/.clawg-dev without explicit authorization.
     - Never kill running clawg.exe processes. Stage by explicit path. No AI attribution in commits.
   verify:
-    - Report the test count against the baseline and every rag-eval metric the change touches.
+    - Report that the suite passes (never a test count) and every rag-eval metric the change touches.
   archive:
     - "After archiving, raise the minor of [workspace.package] version in the root Cargo.toml (the crates inherit it; never edit a crate's version), run cargo update --workspace to carry it into Cargo.lock, and commit both files as `chore: bump version to X.Y.Z`."
