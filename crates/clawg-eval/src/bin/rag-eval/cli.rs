@@ -172,9 +172,13 @@ OPTIONS:
                          and the exact paired p-value per metric per block (with a bootstrap
                          interval of the mean change for mrr and ndcg@10). When both files
                          come from --agent-view, also search.found, context.found and the
-                         tokens of each tool. Ends with whether each primary metric
-                         (recall@5, search.found) moved distinguishably at p < 0.05. Needs
-                         neither --fake/--real nor a golden set; short-circuits like --help.
+                         tokens of each tool. When the cases carry query_lang, each block is
+                         also cut by the language pair of query and row (such as es>en),
+                         over the cases with that pair in both files; the pair rows are
+                         informative and never enter primary: nor --fail-on-regression.
+                         Ends with whether each primary metric (recall@5, search.found)
+                         moved distinguishably at p < 0.05. Needs neither --fake/--real nor
+                         a golden set; short-circuits like --help.
     --fail-on-regression With --diff, on either side of it: exit 6 when a primary metric
                          (retrieval recall@5, agent_view search.found) gets worse with
                          p < 0.05. The informative metrics never fail the run.
@@ -864,6 +868,18 @@ mod tests {
     #[test]
     fn the_help_text_documents_agent_view() {
         assert!(HELP_TEXT.contains("--agent-view"));
+    }
+
+    #[test]
+    fn the_diff_help_describes_the_pair_cut() {
+        let diff_help = HELP_TEXT
+            .split("--diff <a.json> <b.json>")
+            .nth(1)
+            .and_then(|rest| rest.split("--fail-on-regression With").next())
+            .expect("a --diff entry");
+        assert!(diff_help.contains("query_lang"), "{diff_help}");
+        assert!(diff_help.contains("language pair of query and row"), "{diff_help}");
+        assert!(diff_help.contains("never enter primary: nor --fail-on-regression"), "{diff_help}");
     }
 
     #[test]
