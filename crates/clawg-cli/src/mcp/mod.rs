@@ -97,7 +97,7 @@ where
             ClientHandle::ready(client)
         }
         Probe::NeedsStart => {
-            let (outcome, handle) = ClientHandle::pending(tool_wait);
+            let (outcome, handle) = ClientHandle::pending(tool_wait, base_dir.to_path_buf());
             let base_dir = base_dir.to_path_buf();
             tokio::spawn(async move {
                 let state = match start_daemon(&base_dir, profile, &*spawner, start_timeout).await {
