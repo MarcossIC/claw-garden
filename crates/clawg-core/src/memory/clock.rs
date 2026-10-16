@@ -86,23 +86,6 @@ impl TimestampMs {
     pub fn as_millis_i64(self) -> i64 {
         self.0
     }
-
-    /// Days elapsed between `self` and `now`.
-    ///
-    /// Returns a NEGATIVE number when `self` is later than `now`, deliberately.
-    /// Clamping to zero would make "this row is stamped in the future" read
-    /// identically to "this row was written a moment ago", and a future stamp
-    /// is precisely the corruption worth seeing — a database copied between
-    /// machines with skewed clocks produces it. Consumers that treat age as a
-    /// decay input already read a negative as "as fresh as possible", which is
-    /// the same outcome clamping would give, minus the lost signal.
-    #[allow(dead_code)] // Kept ahead of its caller: the demotion pass computes its
-    // day count inside SQL today, and this is the Rust-side replacement for that
-    // expression when the arithmetic moves out of the query. Removing it now means
-    // re-deriving the epoch-to-days conversion the day the pass moves.
-    pub(crate) fn age_days_from(self, now: TimestampMs) -> f64 {
-        now.0.saturating_sub(self.0) as f64 / 86_400_000.0
-    }
 }
 
 impl ToSql for TimestampMs {
@@ -163,22 +146,9 @@ mod tests {
     fn now_reads_a_plausible_present_instant() {
         let a = TimestampMs::now();
         let b = TimestampMs::now();
-        let age = a.age_days_from(b);
-        assert!(age >= 0.0 && age < 1e-6, "age was {age}");
-    }
-
-    #[test]
-    fn ninety_days_apart_is_ninety_days() {
-        let earlier = TimestampMs::from_unix_millis(0);
-        let later = TimestampMs::from_unix_millis(90 * 86_400_000);
-        assert_eq!(earlier.age_days_from(later), 90.0);
-    }
-
-    #[test]
-    fn an_instant_after_now_reports_a_negative_age() {
-        let earlier_now = TimestampMs::from_unix_millis(0);
-        let future = TimestampMs::from_unix_millis(86_400_000);
-        assert!(future.age_days_from(earlier_now) < 0.0);
+        let gap = b.as_millis_i64() - a.as_millis_i64();
+        assert!(a.as_millis_i64() > 1_600_000_000_000, "{a:?} is before 2020");
+        assert!((0..100).contains(&gap), "two reads {gap} ms apart");
     }
 
     #[test]
