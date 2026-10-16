@@ -86,6 +86,9 @@ pub struct CaseResult {
     /// Only on `unanswerable` cases: the search returned nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abstained: Option<bool>,
+    /// Only on `update` cases: the newer row came before every stale one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_first: Option<bool>,
 }
 
 /// Retrieval quality restricted to the cases of one language. The embedding
@@ -201,6 +204,9 @@ pub struct RetrievalResults {
     /// when the set has none, so no file reads as having measured it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub abstention: Option<Rate>,
+    /// Share of `update` cases whose newer row came first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<Rate>,
 }
 
 /// The threshold sweep restricted to the pairs of one language. A distance
@@ -428,6 +434,9 @@ impl RetrievalResults {
         let abstention = (!unanswerable.is_empty()).then(|| {
             Rate::of(unanswerable.iter().filter(|c| c.abstained == Some(true)).count(), unanswerable.len())
         });
+        let fresh: Vec<bool> = per_case.iter().filter_map(|c| c.fresh_first).collect();
+        let freshness =
+            (!fresh.is_empty()).then(|| Rate::of(fresh.iter().filter(|f| **f).count(), fresh.len()));
         Self {
             aggregate: aggregate(&per_case),
             hits: hits(&per_case),
@@ -438,6 +447,7 @@ impl RetrievalResults {
             blocked,
             unanswerable,
             abstention,
+            freshness,
         }
     }
 }
@@ -799,6 +809,12 @@ pub fn print_stdout(results: &RunResults) {
             );
         }
     }
+    if let Some(f) = &results.retrieval.freshness {
+        println!(
+            "  freshness (update cases with the newer row first): {}/{} = {:.4} [{:.3}, {:.3}]",
+            f.hits, f.n_cases, f.rate, f.lo, f.hi
+        );
+    }
     if let Some(a) = &results.retrieval.abstention {
         println!(
             "  abstention (unanswerable cases with an empty result): {}/{} = {:.4} [{:.3}, {:.3}]",
@@ -919,6 +935,7 @@ mod tests {
             lang: None,
             subset: CaseSubset::Natural,
             abstained: None,
+            fresh_first: None,
         }
     }
 
@@ -994,6 +1011,18 @@ mod tests {
         }
         assert_eq!(results.by_subset[0].hits.at_5.partial.hits, 30);
         assert_eq!(results.hits.at_5.partial.n_cases, 30);
+    }
+
+    #[test]
+    fn freshness_counts_only_update_cases() {
+        let plain = case("q", 1.0, CaseStatus::Active);
+        let results = RetrievalResults::from_cases(vec![plain.clone()], vec![], vec![]);
+        assert_eq!(results.freshness, None);
+        let update = |fresh: bool| CaseResult { fresh_first: Some(fresh), subset: CaseSubset::Update, ..plain.clone() };
+        let results = RetrievalResults::from_cases(vec![plain.clone(), update(true), update(false), update(true)], vec![], vec![]);
+        let f = results.freshness.expect("measured");
+        assert_eq!((f.hits, f.n_cases), (2, 3));
+        assert_eq!(results.per_case.len(), 4, "update cases stay in the ranked metrics");
     }
 
     #[test]

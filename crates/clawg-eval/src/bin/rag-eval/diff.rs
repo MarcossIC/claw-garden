@@ -103,6 +103,8 @@ pub struct RunDiff {
     pub agent_view: Option<AgentViewDiff>,
     /// `retrieval.unanswerable[].abstained`, when both files have such cases.
     pub abstention: Option<MetricDiff>,
+    /// `fresh_first` of the `update` cases both files scored.
+    pub freshness: Option<MetricDiff>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -199,9 +201,24 @@ pub fn diff_values(a: &Value, a_path: &Path, b: &Value, b_path: &Path) -> Result
     Ok(RunDiff {
         retrieval: diff_block(&a_retrieval, &b_retrieval),
         similarity: diff_block(&a_similarity, &b_similarity),
+        freshness: diff_freshness(&a_retrieval, &b_retrieval),
         agent_view,
         abstention,
     })
+}
+
+fn diff_freshness(a: &[CaseResult], b: &[CaseResult]) -> Option<MetricDiff> {
+    let b_by_query: HashMap<&str, &CaseResult> = b.iter().map(|c| (c.query.as_str(), c)).collect();
+    let mut m = MetricDiff::default();
+    let mut paired = 0;
+    for a_case in a {
+        let Some(b_case) = b_by_query.get(a_case.query.as_str()) else { continue };
+        if let (Some(a_fresh), Some(b_fresh)) = (a_case.fresh_first, b_case.fresh_first) {
+            accumulate(&mut m, flag(a_fresh), flag(b_fresh));
+            paired += 1;
+        }
+    }
+    (paired > 0).then_some(m)
 }
 
 /// `value.retrieval.unanswerable`, or `None` when the set had no such case.
@@ -321,6 +338,10 @@ pub fn print_stdout(diff: &RunDiff) {
         if av.search_abstained.better + av.search_abstained.worse > 0 {
             print_metric("search.abstain", &av.search_abstained);
         }
+    }
+    if let Some(m) = &diff.freshness {
+        println!("  update (the newer row first):");
+        print_metric("fresh_first", m);
     }
     if let Some(m) = &diff.abstention {
         println!("  unanswerable (the search returned nothing):");
@@ -564,6 +585,20 @@ mod tests {
             .unwrap();
         assert_eq!((av.search_abstained.better, av.search_abstained.worse), (1, 0));
         assert_eq!(av.search_found.better + av.search_found.worse, 0, "an unanswerable case has no found to move");
+    }
+
+    #[test]
+    fn freshness_is_diffed_when_both_files_have_update_cases() {
+        let a = reference_value();
+        let mut b = a.clone();
+        let path = reference_results_path();
+        assert_eq!(diff_values(&a, &path, &b, &path).unwrap().freshness, None);
+
+        let mut a = a;
+        a["retrieval"]["per_case"][0]["fresh_first"] = serde_json::json!(false);
+        b["retrieval"]["per_case"][0]["fresh_first"] = serde_json::json!(true);
+        let m = diff_values(&a, &path, &b, &path).unwrap().freshness.expect("both scored the update case");
+        assert_eq!((m.better, m.worse), (1, 0));
     }
 
     #[test]

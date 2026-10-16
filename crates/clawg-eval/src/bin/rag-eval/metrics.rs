@@ -36,6 +36,14 @@ pub fn recall_at_k(ranked: &[String], expected: &HashSet<String>, k: usize) -> f
     hits as f64 / expected.len() as f64
 }
 
+/// The newer row of an `update` case came first: it is in the ranking, and no
+/// stale row sits above it. A stale row that was not returned at all cannot
+/// outrank it.
+pub fn fresh_first(ranked: &[String], expected: &str, stale: &[String]) -> bool {
+    let Some(at) = ranked.iter().position(|r| r == expected) else { return false };
+    !ranked[..at].iter().any(|r| stale.contains(r))
+}
+
 /// Reciprocal of the 1-indexed rank of the first relevant hit, `0.0` if none
 /// of `ranked` is in `expected`. The rank runs over the WHOLE list, never
 /// capped at a `k` — capping would turn a correct-but-late hit into a miss,
@@ -499,5 +507,15 @@ mod tests {
         let rows = threshold_curve(&[], &[], &[]);
         let thresholds: Vec<f64> = rows.iter().map(|r| r.threshold).collect();
         assert_eq!(thresholds, SWEEP.to_vec());
+    }
+
+    #[test]
+    fn fresh_first_needs_the_expected_row_before_every_stale_one() {
+        let r = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let stale = r(&["old"]);
+        assert!(fresh_first(&r(&["x", "new", "y", "old"]), "new", &stale));
+        assert!(!fresh_first(&r(&["old", "x", "new"]), "new", &stale));
+        assert!(fresh_first(&r(&["new"]), "new", &stale), "a stale row not returned cannot outrank");
+        assert!(!fresh_first(&r(&["old", "x"]), "new", &stale), "the newer row has to be there");
     }
 }

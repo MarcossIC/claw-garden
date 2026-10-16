@@ -266,6 +266,8 @@ impl EvalStore {
     /// (`"chat_message"`, `"user_preference"`, …); an unrecognized value is
     /// an error rather than a silent fallback, because a typo'd golden-set
     /// row must not seed a row the tier gate never meant to accept.
+    /// `age_ms` backdates the row from now, so a set can say which of two
+    /// rows is older without pinning a date that ages with the set.
     pub async fn insert(
         &self,
         agent_id: &str,
@@ -273,12 +275,14 @@ impl EvalStore {
         memory_type: &str,
         importance: f64,
         embedding: Vec<f32>,
+        age_ms: u64,
     ) -> Result<i64, EvalError> {
         let memory_type = parse_memory_type(memory_type)?;
         let created_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .saturating_sub(age_ms);
         let record = NewMemoryRecord {
             scope: "agent",
             agent_id: Some(agent_id.to_string()),
@@ -790,7 +794,7 @@ mod tests {
 
         for i in 0..30 {
             store
-                .insert(agent, &format!("filler row {i}"), "chat_message", 1.0, on_axis.clone())
+                .insert(agent, &format!("filler row {i}"), "chat_message", 1.0, on_axis.clone(), 0)
                 .await
                 .unwrap();
         }
@@ -801,6 +805,7 @@ mod tests {
                 "chat_message",
                 10.0,
                 off_axis,
+                0,
             )
             .await
             .unwrap();
@@ -895,7 +900,7 @@ mod tests {
         let mut embedding = vec![0.0; 384];
         embedding[0] = 1.0;
         let id = store
-            .insert("agent-1", "unique_token_after_tokenizer_swap", "chat_message", 3.0, embedding)
+            .insert("agent-1", "unique_token_after_tokenizer_swap", "chat_message", 3.0, embedding, 0)
             .await
             .expect("insert must succeed");
 
@@ -1193,5 +1198,30 @@ mod tests {
         assert_eq!(doc_paths(root.path()).unwrap(), ["README.md"]);
         assert!(is_code_path("src/lib.rs") && !is_code_path("README.md"));
         assert_eq!(hits[0], EvalDocHit { path: "README.md".into(), breadcrumb: "README.md > Guía > Uso".into() });
+    }
+
+    #[tokio::test]
+    async fn eval_insert_backdates_created_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EvalStore::open(dir.path()).await.expect("open must succeed");
+        let mut embedding = vec![0.0; 384];
+        embedding[0] = 1.0;
+        const DAY_MS: u64 = 86_400_000;
+        let fresh = store.insert("a", "fresh row", "chat_message", 3.0, embedding.clone(), 0).await.unwrap();
+        let old = store.insert("a", "old row", "chat_message", 3.0, embedding, 30 * DAY_MS).await.unwrap();
+
+        let created = |id: i64| {
+            let store = &store;
+            async move {
+                store
+                    .0
+                    .conn
+                    .call(move |c| c.query_row("SELECT created_at FROM memory WHERE id = ?1", [id], |r| r.get::<_, i64>(0)))
+                    .await
+                    .unwrap()
+            }
+        };
+        let gap = created(fresh).await - created(old).await;
+        assert!((gap - (30 * DAY_MS) as i64).abs() < 60_000, "gap was {gap} ms");
     }
 }

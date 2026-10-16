@@ -76,7 +76,7 @@ pub async fn seed(
         norms.push(l2_norm(&embedding));
         vectors.push((row.ref_.clone(), embedding.clone()));
         let id = store
-            .insert(AGENT_ID, &row.content, &row.memory_type, row.importance, embedding)
+            .insert(AGENT_ID, &row.content, &row.memory_type, row.importance, embedding, age_ms(row.age_days))
             .await?;
         refs.insert(row.ref_.clone(), id);
     }
@@ -84,6 +84,13 @@ pub async fn seed(
     let (mean_norm, max_norm_deviation) = norm_stats(&norms);
 
     Ok(SeedResult { store, refs, store_path, mean_norm, max_norm_deviation, vectors })
+}
+
+const DAY_MS: f64 = 86_400_000.0;
+
+/// A row's `age_days` as the whole milliseconds the store backdates it by.
+fn age_ms(age_days: f64) -> u64 {
+    (age_days * DAY_MS).round() as u64
 }
 
 /// A path under the system temp directory, unique per run. Not cleaned up
@@ -120,6 +127,13 @@ fn norm_stats(norms: &[f64]) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn age_days_converts_to_whole_milliseconds() {
+        assert_eq!(age_ms(0.0), 0);
+        assert_eq!(age_ms(30.0), 2_592_000_000);
+        assert_eq!(age_ms(0.5), 43_200_000);
+    }
 
     fn row(r: &str, content: &str, memory_type: &str, importance: f64) -> CorpusRow {
         // `CorpusRow`'s fields are all `pub` within the crate; constructed

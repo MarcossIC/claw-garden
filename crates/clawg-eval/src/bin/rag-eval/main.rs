@@ -241,6 +241,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             status: case.status,
             lang: case_lang(&case.expected_refs, &lang_by_ref),
             subset: case.subset,
+            stale_refs: case.stale_refs.clone(),
             embedding,
         });
     }
@@ -436,6 +437,8 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             let ndcg_10 = metrics::ndcg_at_10(&ranked_refs, &expected);
 
             let abstained = (ec.subset == CaseSubset::Unanswerable).then_some(ranked_refs.is_empty());
+            let fresh_first = (ec.subset == CaseSubset::Update)
+                .then(|| metrics::fresh_first(&ranked_refs, &ec.expected_refs[0], &ec.stale_refs));
             let result = report::CaseResult {
                 query: ec.query.clone(),
                 expected_refs: ec.expected_refs.clone(),
@@ -449,6 +452,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
                 lang: ec.lang.clone(),
                 subset: ec.subset,
                 abstained,
+                fresh_first,
             };
 
             if abstained.is_some() {
@@ -858,6 +862,7 @@ async fn score_follow_up_arm<'a>(
             lang: case_lang(&case.expected_refs, ctx.lang_by_ref),
             subset: case.subset,
             abstained: None,
+            fresh_first: None,
         });
     }
     Ok(per_case)
@@ -939,6 +944,7 @@ struct EmbeddedCase {
     status: CaseStatus,
     lang: Option<String>,
     subset: CaseSubset,
+    stale_refs: Vec<String>,
     embedding: Vec<f32>,
 }
 
@@ -1136,6 +1142,7 @@ fn build_similarity_results(
             lang: src.lang.clone(),
             subset: src.subset,
             abstained: None,
+            fresh_first: None,
         });
 
         // Query-anchored rivals: every OTHER corpus vector, not just this
@@ -1371,6 +1378,22 @@ mod tests {
         assert_eq!(unanswerable[0]["abstained"], false, "the search returns rows for any query today");
         assert_eq!(after["abstention"]["hits"], 0);
         assert_eq!(after["abstention"]["n_cases"], 1);
+    }
+
+    #[tokio::test]
+    async fn an_update_case_is_scored_and_reports_freshness() {
+        let golden = with_extra_case(
+            sweep_golden_json(),
+            r#"{"query": "the retrieval decay term compares milliseconds against seconds", "corpus_refs": ["c1","c3"], "expected_refs": ["c1"], "stale_refs": ["c3"], "subset": "update"}"#,
+        )
+        .replacen(r#""importance": 3.0}"#, r#""importance": 3.0, "age_days": 10}"#, 1);
+        let json = run_fake(&golden, "update").await;
+
+        let retrieval = &json["retrieval"];
+        assert_eq!(retrieval["per_case"].as_array().unwrap().len(), 3, "an update case stays in the ranked metrics");
+        assert_eq!(retrieval["per_case"][0]["fresh_first"], true, "its query is the newer row's own text");
+        assert_eq!(retrieval["freshness"]["hits"], 1);
+        assert_eq!(retrieval["freshness"]["n_cases"], 1);
     }
 
     #[tokio::test]

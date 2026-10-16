@@ -494,6 +494,7 @@ mod tests {
             lang: None,
             subset: crate::golden::CaseSubset::Natural,
             abstained: None,
+            fresh_first: None,
         }
     }
 
@@ -504,6 +505,7 @@ mod tests {
             memory_type: "semantic_fact".to_string(),
             importance,
             lang: Some("en".to_string()),
+            age_days: 0.0,
         }
     }
 
