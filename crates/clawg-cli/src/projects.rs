@@ -44,8 +44,8 @@ mod tests {
         publish(&d);
         let c = DaemonClient::from_data_dir(d.dir.path()).expect("client");
         let repo = tempfile::tempdir().expect("tempdir");
-        let root = std::fs::canonicalize(repo.path()).expect("canonicalize");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        let root = ProjectIdentity::resolve(repo.path()).root;
         std::fs::create_dir_all(root.join("docs")).unwrap();
         std::fs::write(root.join("README.md"), "# Other\nHow the other project ships.\n").unwrap();
         let (id, _) = c.register_project(&root, &[], false).await.expect("register as a label");
