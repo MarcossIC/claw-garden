@@ -10,7 +10,7 @@ Cierra qué raíces lee el daemon por pedido del modelo y vuelve ruidosa una col
 
 ## R1. Sólo se indexa una raíz aceptada
 
-El refresco del índice de docs de un proyecto (`ProjectDocIndex::try_refresh`, `crates/clawg-core/src/memory/project_docs/mod.rs:210`) MUST NOT leer el disco de una raíz sólo registrada: MUST fallar con un error propio, distinto de `UnknownProject`, antes de recorrerla.
+El refresco del índice de docs de un proyecto (`DocIndex::try_refresh`, `crates/clawg-core/src/memory/project_docs/mod.rs:215`) MUST NOT leer el disco de una raíz sólo registrada: MUST fallar con un error propio, distinto de `UnknownProject`, antes de recorrerla.
 
 `POST /v1/projects` MUST lanzar el refresco en segundo plano sólo cuando, después del registro, la raíz está aceptada.
 
@@ -63,7 +63,7 @@ La descripción de `project_path` en `SearchProjectArgs` MUST decir que sólo se
 - WHEN `search_project` recibe la consulta sin `project_path`
 - THEN responde con el pasaje del `README.md`, como hoy
 
-**Tests:** `searching_the_docs_of_a_root_that_was_not_accepted_is_forbidden` en `crates/clawg-cli/tests/api.rs`; `search_project_does_not_read_a_root_the_user_did_not_add` y `search_project_lists_each_hit_under_its_breadcrumb` (el que ya existe) en `crates/clawg-cli/src/mcp/server.rs`.
+**Tests:** `searching_the_docs_of_a_root_that_was_not_accepted_is_forbidden` en `crates/clawg-cli/tests/api.rs`; el puro `the_refusal_names_the_command_for_the_daemons_profile` en `crates/clawg-cli/src/daemon/api.rs`; `search_project_does_not_read_a_root_the_user_did_not_add` y `search_project_lists_each_hit_under_its_breadcrumb` (el que ya existe) en `crates/clawg-cli/src/mcp/server.rs`.
 
 ## R4. `clawg projects add`
 
@@ -91,7 +91,7 @@ El daemon MUST responder 400 a un registro con `index_docs: true` cuya raíz no 
 
 ## R6. Una colisión es un error en cada llamada
 
-Si `POST /v1/projects` responde 409, la herramienta MUST fallar sin guardar ni buscar, con un texto que diga que la raíz no se puede usar porque su `project_id` ya pertenece a otra raíz, nombre las dos, y diga que `all_projects` sigue buscando en todo. MUST NOT recordar la raíz como registrada, así la llamada siguiente vuelve a preguntar y vuelve a fallar mientras el choque siga.
+Si `POST /v1/projects` responde 409 (`error: "project_root_collision"`, con las dos raíces en `detail`), la herramienta MUST fallar sin guardar ni buscar, con un texto que diga que la raíz no se puede usar porque su `project_id` ya pertenece a otra raíz, nombre las dos, y diga que `all_projects` sigue buscando en todo. MUST NOT recordar la raíz como registrada, así la llamada siguiente vuelve a preguntar y vuelve a fallar mientras el choque siga.
 
 Vale para las cinco herramientas con proyecto: `save_memory`, `search_memory`, `recall_context`, `search_project` y `synthesize`. Con `all_projects: true` no hay proyecto y no hay registro, así que no fallan.
 
