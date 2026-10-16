@@ -1,0 +1,15 @@
+change: ingest-outbox
+objective: "1"
+depends_on: []
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # Linux, Windows and save latency on the dev profile; the real store opens V14 with the first install after it, see verify.md
+  archive: done
+main_spec: openspec/specs/ingest/spec.md, openspec/specs/storage/spec.md, openspec/specs/secrets/spec.md, openspec/specs/mcp/spec.md
+updated: 2026-10-15

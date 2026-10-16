@@ -140,6 +140,6 @@ Las instrucciones del servidor MCP MUST nombrar `synthesize`.
 
 ## R9. Datos de la versión anterior
 
-Una base en V9 MUST abrirse con esta versión aplicando V10 (`memory_derivation` y `synthesis_review`, dos tablas nuevas) sin cambiar ninguna fila existente, y todas sus memorias MUST quedar pendientes y sin revisar. Un volcado de la cola escrito sin `derived_from` MUST leerse con `derived_from` vacío.
+Una base en V9 MUST abrirse con esta versión aplicando V10 (`memory_derivation` y `synthesis_review`, dos tablas nuevas) sin cambiar ninguna fila existente, y todas sus memorias MUST quedar pendientes y sin revisar. Un volcado de la cola que una versión anterior escribió sin `derived_from` MUST leerse con `derived_from` vacío.
 
 **Test:** `a_store_from_the_previous_version_opens_with_every_row_untouched` en `crates/clawg-core/src/memory/db.rs` (siembra en V9 una memoria, una trayectoria y un skill), `a_spill_without_sources_still_parses` en `crates/clawg-core/src/memory/spill.rs` y la fila de V10 en `published_migration_checksums_are_pinned`.

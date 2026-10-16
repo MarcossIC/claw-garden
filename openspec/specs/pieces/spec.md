@@ -7,8 +7,8 @@ Fuente de verdad del comportamiento actual de un save que no entra en un pedazo:
 ## Definiciones
 
 - **Save:** un evento de ingesta (`MemoryEvent`): un `save_memory` o un turno de chat. Es la misma unidad que los pedazos hermanos de [`specs/disputes`](../disputes/spec.md) R8.
-- **Texto del save:** el contenido del evento después de enmascarar secretos (`redact`, `crates/clawg-core/src/memory/worker.rs:430`). Todo lo de abajo trabaja sobre ese texto.
-- **Pedazo:** cada ventana que deja el chunker, después de colapsar los repetidos dentro del mismo evento (`collapse_duplicate_chunks`, `worker.rs:138`). Su posición es 1, 2, … en ese orden.
+- **Texto del save:** el contenido del evento después de enmascarar secretos (`redact`, en `ingest_pieces`, `crates/clawg-core/src/memory/worker.rs:591`). Todo lo de abajo trabaja sobre ese texto.
+- **Pedazo:** cada ventana que deja el chunker, después de colapsar los repetidos dentro del mismo evento (`collapse_duplicate_chunks`, `worker.rs:142`). Su posición es 1, 2, … en ese orden.
 - **Save largo:** un save con dos pedazos o más.
 - **Cabecera:** los primeros `SAVE_HEAD_TOKENS` = 48 tokens del texto del save, contados con el mismo splitter del chunker (en modo sin tokenizer, 4 bytes por token).
 - **Texto embebido de un pedazo:** el pedazo, o `cabecera + "\n…\n" + pedazo` cuando tiene contexto.
@@ -34,7 +34,7 @@ Dos `const _: () = assert!(...)` (`chunker/mod.rs:48-49`) comprueban en compilac
 
 Cada pedazo desde el segundo MUST embeberse con contexto (la cabecera). El primero se embebe sin él, porque ya empieza con la cabecera. La fila MUST guardar sólo el pedazo: el contenido, el hash de dedup y el FTS no llevan la cabecera.
 
-El armado del texto embebido es `embedding_text(context, piece)` (`chunker/mod.rs:55`), una función pura que usan el worker (`worker.rs:509`) y el re-embed (R7).
+El armado del texto embebido es `embedding_text(context, piece)` (`chunker/mod.rs:55`), una función pura que usan el worker (`worker.rs:713`) y el re-embed (R7).
 
 Un save de un pedazo de hasta 480 tokens no se parte con este tope: el tope de 96 sólo aplica si el de 480 no alcanza. El save más corto que se parte (más de 480 tokens) da al menos 7 pedazos.
 
@@ -57,18 +57,18 @@ Un save de un pedazo de hasta 480 tokens no se parte con este tope: el tope de 9
 
 ## R3. El save deja su vínculo
 
-Cuando un save largo termina sin falla, el worker MUST escribir, en una sola transacción, un vínculo por pedazo (`link_save`, `worker.rs:583`, llamado al final de `process_event`; `MemoryStore::link_pieces`, `crates/clawg-core/src/memory/pieces.rs:180`):
+Cuando un save largo termina sin falla, el worker MUST escribir, en una sola transacción, un vínculo por pedazo (`link_in`, `crates/clawg-core/src/memory/pieces.rs:207`). Si el save tiene una fila del outbox, el vínculo y el borrado de la fila van en la misma transacción (`outbox_finish`, `crates/clawg-core/src/memory/outbox.rs:329`, llamado por `process_tracked`, `worker.rs:550`; [`specs/storage`](../storage/spec.md), «Un save aceptado está en el outbox hasta que termina»); un evento sin fila lo vincula `link_save` (`worker.rs:794`, por `MemoryStore::link_pieces`, `pieces.rs:180`):
 
 - `save_id`: un número nuevo, uno más que el mayor de la tabla;
 - `piece`: la posición del pedazo, desde 1;
-- `memory_id`: la fila que lo guarda, insertada por este evento o absorbida por el dedup (`absorb_duplicate`, `worker.rs:385`);
+- `memory_id`: la fila que lo guarda, insertada por este evento o absorbida por el dedup (`absorb_duplicate`, `worker.rs:470`);
 - `context`: la cabecera con la que se embebió la fila si este evento la insertó con contexto; si no, vacío. Una fila absorbida conserva el vector que ya tenía, así que su vínculo no dice que lo embebió con contexto.
 
-Un save de un pedazo MUST NOT dejar vínculos. Un save que se corta a mitad de camino (`IngestReport.failure`, `worker.rs:559`) MUST NOT dejar vínculos: sus filas quedan sueltas, como antes de la tabla. Al guardarlo de nuevo, los pedazos se absorben y el vínculo se escribe entonces.
+Un save de un pedazo MUST NOT dejar vínculos. Un save que se corta a mitad de camino (`IngestReport.failure`, `worker.rs:81`) MUST NOT dejar vínculos: sus filas quedan sueltas, como antes de la tabla. Si tiene fila en el outbox, el siguiente arranque retoma después de las piezas ya guardadas y escribe el vínculo al terminar ([`specs/storage`](../storage/spec.md), «Un replay retoma donde quedó»); si no, al guardarlo de nuevo los pedazos se absorben y el vínculo se escribe entonces.
 
-Si escribir el vínculo falla, el save MUST seguir informándose como guardado: sus filas ya están y se encuentran igual. La falla va al log (`worker.rs:596`).
+Si escribir el vínculo falla, el save MUST seguir informándose como guardado: sus filas ya están y se encuentran igual. La falla va al log (`worker.rs:800`, y `worker.rs:568` con una fila en el outbox, que entonces queda para que el próximo arranque la termine).
 
-Guardar otra vez exactamente las mismas filas, en el mismo orden, MUST devolver el `save_id` que ya forman (`existing_save`, `pieces.rs:236`) y no escribir nada: el mismo save no se vincula dos veces.
+Guardar otra vez exactamente las mismas filas, en el mismo orden, MUST devolver el `save_id` que ya forman (`existing_save`, `pieces.rs:246`) y no escribir nada: el mismo save no se vincula dos veces.
 
 #### Escenario: pedazos absorbidos
 - GIVEN una fila guardada con el texto exacto del pedazo 2 de un save

@@ -1,6 +1,6 @@
 # ingest-outbox — Especificación
 
-Un save aceptado queda en `memory.db` antes de que el daemon conteste, y termina guardado o a la vista como fallido. Al archivar, R1, R6 y R7 van a [`specs/ingest`](../../specs/ingest/spec.md) (reemplazan los párrafos de «Timeout de confirmación», «Embedder cargando» y «Cola acotada» que hablan del volcado, y suman el `operation_id` y el bloque `ingest`), R2–R5 y R8 a [`specs/storage`](../../specs/storage/spec.md) (reemplazan «Ningún evento aceptado se pierde en un apagado ordenado», «Reinyección al arrancar» y «Formato del volcado»), R9 a [`specs/secrets`](../../specs/secrets/spec.md) y R10 a `specs/storage`, «Migraciones».
+Un save aceptado queda en `memory.db` antes de que el daemon conteste, y termina guardado o a la vista como fallido. Al archivar, R1, R6 y R7 van a [`specs/ingest`](../../../specs/ingest/spec.md) (reemplazan los párrafos de «Timeout de confirmación», «Embedder cargando» y «Cola acotada» que hablan del volcado, y suman el `operation_id` y el bloque `ingest`), R2–R5 y R8 a [`specs/storage`](../../../specs/storage/spec.md) (reemplazan «Ningún evento aceptado se pierde en un apagado ordenado», «Reinyección al arrancar» y «Formato del volcado»), R9 a [`specs/secrets`](../../../specs/secrets/spec.md) y R10 a `specs/storage`, «Migraciones».
 
 ## Definiciones
 

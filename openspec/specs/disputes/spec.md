@@ -12,7 +12,7 @@ Fuente de verdad del comportamiento actual de las disputas entre memorias: cómo
 - **Disputa pendiente entre A y B:** A está `disputed`, su `disputed_against` nombra a B y B está viva (o al revés).
 - **Par enlazado:** dos filas tales que el `disputed_against` de una nombra a la otra, o que una está `superseded` con `superseded_by` apuntando a la otra (`check_pair`, `crates/clawg-core/src/memory/dispute.rs`).
 - **Estado de reposo de una fila no reemplazada:** `disputed` si su `disputed_against` nombra al menos una fila viva; `active` si no.
-- **Pedazos hermanos:** las filas que inserta un mismo evento de ingesta (un mismo save), una por pedazo (`process_event`, `crates/clawg-core/src/memory/worker.rs`).
+- **Pedazos hermanos:** las filas que inserta un mismo evento de ingesta (un mismo save), una por pedazo (`ingest_pieces`, `crates/clawg-core/src/memory/worker.rs:578`).
 
 `disputed_against` significa "disputas pendientes": cerrar una disputa saca el id de la otra fila. `last_disputed_at` no cambia al resolver. `superseded_by` guarda quién reemplazó a quién. El esquema es el de V1 (`crates/clawg-core/migrations/V1__init.sql`); no hay columnas propias de este dominio.
 

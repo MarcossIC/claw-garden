@@ -134,7 +134,7 @@ En `search_memory` (`format_hits`, `crates/clawg-cli/src/mcp/tools.rs:81`; `shar
 
 ## R6. `memory_status` dice a quién lee el agente
 
-`memory_status` MUST terminar con una línea `shared:` (`format_sharing`, `crates/clawg-cli/src/mcp/tools.rs:317`; el puente lee el mismo archivo que el daemon, en `memory_status_impl`, `server.rs:766`):
+`memory_status` MUST terminar con una línea `shared:` (`format_sharing`, `crates/clawg-cli/src/mcp/tools.rs:338`; el puente lee el mismo archivo que el daemon, en `memory_status_impl`, `server.rs:889`):
 
 - `shared: reads every agent` sin exclusiones para el agente (o sin archivo);
 - `shared: reads every agent but <autor>, <autor>` (orden alfabético) con exclusiones;

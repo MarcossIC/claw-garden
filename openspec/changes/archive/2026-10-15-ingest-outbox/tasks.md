@@ -58,4 +58,4 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 ## 10. Verificación
 
 - [x] `cargo test --workspace` una vez sobre el último commit (durante el desarrollo, sólo los tests afectados), clippy con `-A clippy::all -D warnings`, `verify.md` con el conteo contra la base.
-- [ ] Pendiente en Windows (máquina de Marcos): la suite, clippy y la latencia del save antes y después.
+- [x] En Windows: la suite (2.034 pasan, 0 fallan), clippy con código 0 y la latencia del save antes y después en el perfil dev (p95 corto +4,4 a +9,7 ms, dentro del tope de 20) ([verify](verify.md#windows)).

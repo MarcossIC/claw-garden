@@ -4,6 +4,7 @@ Fuente de verdad del comportamiento actual con secretos: el detector (formatos c
 
 **Origen:**
 - [secret-hygiene](../../changes/archive/2026-10-14-secret-hygiene/proposal.md), archivado el 2026-10-14. Los ids de requisito son los de esa spec.
+- [ingest-outbox](../../changes/archive/2026-10-15-ingest-outbox/proposal.md), archivado el 2026-10-15 (R2 y R3: el enmascarado ocurre antes de escribir la fila del outbox; R5 y R6: `purge` y los backups cubren el outbox).
 - [redaction-precision](../../changes/archive/2026-10-15-redaction-precision/proposal.md), archivado el 2026-10-15 (`sk-` con la forma de una clave, la marca privada, los patrones por contexto y cuatro formatos nuevos en R1; lo guardado antes de una regla nueva en R4).
 
 ## Definiciones
@@ -119,7 +120,9 @@ Dos matches que se superponen MUST resolverse a favor del que empieza antes y, s
 
 ### R2. La ingesta enmascara antes de trocear
 
-El worker MUST aplicar `redact` al contenido de cada evento, de cualquier fuente, antes de elegir el chunker y de trocear (`process_event`, `crates/clawg-core/src/memory/worker.rs:432`). El hash de dedup, el embedding, el FTS y `memory.content` MUST calcularse sobre el texto enmascarado. `IngestReport.redacted` (`worker.rs:78`) MUST llevar los tipos enmascarados del evento en todos los caminos de salida, también cuando el evento falla después.
+El daemon MUST enmascarar el contenido de un save antes de escribir su fila en el outbox (`MemoryRuntime::accept`, `crates/clawg-core/src/runtime.rs:220`): la fila vive en `memory.db` y en cada snapshot mientras el save espera o queda `failed`, y guarda sólo el texto ya enmascarado ([`specs/ingest`](../ingest/spec.md), «Aceptar es durable»). El volcado de una versión anterior, que sí guardaba texto crudo, se enmascara al importarlo (`import_spill`, `runtime.rs:441`).
+
+El worker MUST seguir aplicando `redact` al contenido de cada evento, de cualquier fuente, antes de elegir el chunker y de trocear (`ingest_pieces`, `crates/clawg-core/src/memory/worker.rs:591`): sobre el texto de una fila del outbox ya no encuentra nada, porque `redact` es idempotente (R1), y es la pasada que enmascara un evento que ninguna fila respalda (los caminos en proceso de tests y evaluación). El hash de dedup, el embedding, el FTS y `memory.content` MUST calcularse sobre el texto enmascarado. `IngestReport.redacted` (`worker.rs:83`) MUST llevar los tipos que el worker enmascaró del evento en todos los caminos de salida, también cuando el evento falla después.
 
 #### Escenario: el secreto no llega a la base
 - GIVEN un save `deploy uses ghp_<36 caracteres>`
@@ -131,24 +134,29 @@ El worker MUST aplicar `redact` al contenido de cada evento, de cualquier fuente
 - WHEN se guarda el mismo texto con otra key AWS
 - THEN el segundo resultado es `reinforced`, con el id del primero, y la tabla tiene una fila
 
-**Tests:** `a_saved_secret_is_stored_masked_and_not_searchable`, `saves_that_differ_only_in_a_masked_secret_are_one_memory` y `the_report_names_what_was_masked_even_when_the_save_fails` (`worker.rs`, mod tests).
+#### Escenario: el secreto no llega al outbox
+- GIVEN un save `the token is ghp_<36 caracteres>`
+- WHEN el daemon lo acepta
+- THEN la fila del outbox tiene `content = the token is [REDACTED:github_token]` y el evento encolado lleva el mismo texto
+
+**Tests:** `a_saved_secret_is_stored_masked_and_not_searchable`, `saves_that_differ_only_in_a_masked_secret_are_one_memory` y `the_report_names_what_was_masked_even_when_the_save_fails` (`worker.rs`, mod tests); `accept_writes_the_row_before_it_queues_the_event` (`runtime.rs`, mod tests); `an_old_spill_is_imported_masked_and_removed` (`crates/clawg-core/tests/shutdown.rs`).
 
 ### R3. El save dice qué se enmascaró
 
-Una respuesta `201` de `POST /v1/memories` MUST incluir `redacted`, la lista de tipos del reporte, cuando no está vacía, y MUST omitirlo cuando lo está (`SaveBody.redacted`, `crates/clawg-cli/src/daemon/api.rs:434`; `save_response`, `api.rs:624`):
+Una respuesta `201` de `POST /v1/memories` MUST incluir `redacted`, cada tipo una vez y en el orden en que se enmascaró, cuando no está vacía, y MUST omitirlo cuando lo está (`SaveBody.redacted`, `crates/clawg-cli/src/daemon/api.rs:466`; `save_response`, `api.rs:701`). La lista une lo que el daemon enmascaró al aceptar el save con lo que el reporte del worker agrega (`masked_kinds`, `api.rs:737`; sólo un evento sin fila puede sumar algo en el worker):
 
 ```json
 {"status": "saved", "memories": [{"kind": "memory", "id": 57, "outcome": "inserted"}], "redacted": ["github_token"]}
 ```
 
-`DaemonClient` MUST leerlo en `SaveOutcome::Saved.redacted` (`crates/clawg-cli/src/client.rs:298`), vacío si un daemon anterior no lo manda. `save_memory` MUST agregar al texto de éxito `; masked <tipos> before storing it` (`save_outcome_text`, `crates/clawg-cli/src/mcp/server.rs:391`). Las respuestas `202` no lo llevan: el worker todavía no vio el evento.
+`DaemonClient` MUST leerlo en `SaveOutcome::Saved.redacted` (`crates/clawg-cli/src/client.rs:370`), vacío si un daemon anterior no lo manda. `save_memory` MUST agregar al texto de éxito `; masked <tipos> before storing it` (`save_outcome_text`, `crates/clawg-cli/src/mcp/server.rs:495`). Las respuestas `202` no lo llevan, aunque el daemon ya haya enmascarado: su cuerpo es `status`, `reason` y `operation_id` (`SaveBody::queued`, `api.rs:472`).
 
 #### Escenario
 - GIVEN un daemon con el embedder listo
 - WHEN se guarda un texto con una key de Slack
 - THEN la respuesta es `201` con `redacted: ["slack_token"]`, y el texto de `save_memory` nombra `slack_token`
 
-**Tests:** `a_save_reports_the_secrets_it_masked` (`crates/clawg-cli/tests/api.rs`), `a_confirmed_save_lists_the_kinds_it_masked` (`api.rs`, mod tests) y `a_masked_save_tells_the_agent_what_was_masked` (`server.rs`, mod tests).
+**Tests:** `a_save_reports_the_secrets_it_masked` (`crates/clawg-cli/tests/api.rs`), `a_confirmed_save_lists_the_kinds_it_masked` (`api.rs`, mod tests) `a_masked_save_tells_the_agent_what_was_masked` (`server.rs`, mod tests) y `a_confirmed_save_names_its_operation_and_what_was_masked_before_it_was_recorded` (`api.rs`, mod tests).
 
 ## Lo ya guardado
 
@@ -174,17 +182,17 @@ La lectura MUST hacerse en sólo lectura, sin el lock y sin migrar (`scan`, `sec
 
 ### R5. `clawg purge` saca una fila para siempre
 
-`clawg purge <ID> --yes [--profile P]` (`Command::Purge`, `cli.rs:88`; `main.rs:157`; `purge`, `crates/clawg-core/src/memory/secrets.rs:81`) MUST, en este orden:
+`clawg purge <ID> --yes [--profile P]` (`Command::Purge`, `cli.rs:89`; `main.rs:160`; `purge`, `crates/clawg-core/src/memory/secrets.rs:82`) MUST, en este orden:
 
 1. sin `--yes`, negarse sin abrir nada, con un mensaje que dice que no hay vuelta atrás y cómo confirmarlo (`confirm`, `crates/clawg-cli/src/secrets.rs:42`);
 2. si no existe `memory.db`, fallar diciendo que no hay base;
 3. tomar el lock del store (titular `StoreHolder::Maintenance`, `crates/clawg-core/src/memory/store_lock.rs:59`); si lo tiene el daemon, fallar diciendo que se pare con `clawg stop` (`explain`, `crates/clawg-cli/src/secrets.rs:66`);
 4. exigir que el plan de esquema sea `UpToDate`; con `Pending`, fallar diciendo que se arranque el daemon una vez para migrar; con `Newer` o `Diverged`, los errores de siempre;
-5. si la fila no existe, fallar con un error que nombra el id (`PurgeError::NotFound`, `secrets.rs:56`);
-6. en una transacción: borrar su vector y la fila (el trigger del FTS resta sus términos si estaba viva), sus enlaces de `memory_derivation` y, si estaba viva, liberar las filas que la disputaban, después del `DELETE` para que la fila ya no cuente como viva (`secrets.rs:102`);
-7. compactar el índice FTS (`optimize`, `secrets.rs:116`), para que ni la fila ni sus marcas de borrado queden en ningún segmento;
-8. `VACUUM` (`secrets.rs:122`), para que ninguna página libre conserve una copia vieja. `secure_delete` no alcanza: sólo pone en cero las páginas que se liberan de ahí en más, y un merge del FTS anterior puede haber dejado el texto en una página libre;
-9. `wal_checkpoint(TRUNCATE)` (`secrets.rs:124`); si no se completa, fallar diciendo que la base está ocupada (`PurgeError::Busy`).
+5. si la fila no existe, fallar con un error que nombra el id (`PurgeError::NotFound`, `secrets.rs:58`);
+6. en una transacción: borrar su vector y la fila (el trigger del FTS resta sus términos si estaba viva), sus enlaces de `memory_derivation`, las filas del outbox cuyo `content` contiene el texto de la fila (`instr(content, ?) > 0`) y, si estaba viva, liberar las filas que la disputaban, después del `DELETE` para que la fila ya no cuente como viva (`secrets.rs:103-115`). Un save que todavía no terminó de guardarse, o que quedó `failed`, tiene su texto en el outbox, y una fila guardada de un save largo es una de sus piezas: sin este paso el texto seguiría en `memory.db` y en el WAL;
+7. compactar el índice FTS (`optimize`, `secrets.rs:120`), para que ni la fila ni sus marcas de borrado queden en ningún segmento;
+8. `VACUUM` (`secrets.rs:126`), para que ninguna página libre conserve una copia vieja. `secure_delete` no alcanza: sólo pone en cero las páginas que se liberan de ahí en más, y un merge del FTS anterior puede haber dejado el texto en una página libre;
+9. `wal_checkpoint(TRUNCATE)` (`secrets.rs:128`); si no se completa, fallar diciendo que la base está ocupada (`PurgeError::Busy`).
 
 MUST NOT hacer snapshot previo: sería una copia más de lo que se quiere sacar. MUST NOT estar disponible como herramienta MCP ni por la API HTTP.
 
@@ -208,11 +216,16 @@ MUST NOT hacer snapshot previo: sería una copia más de lo que se quiere sacar.
 - WHEN se purga A
 - THEN B queda `active`
 
-**Tests:** `purging_a_live_row_leaves_no_trace_of_its_text`, `purging_a_deleted_row_leaves_no_trace_of_its_text`, `purging_releases_the_rows_that_disputed_it`, `purge_refuses_while_the_daemon_holds_the_store`, `purge_refuses_an_unknown_id_untouched` y `purge_refuses_a_store_with_pending_migrations_untouched` (`crates/clawg-core/src/memory/secrets.rs`); `purge_needs_yes_before_it_opens_anything` y `a_purge_refused_by_the_daemon_says_to_stop_it` (`crates/clawg-cli/src/secrets.rs`) y `purge_takes_an_id_a_yes_and_a_profile` (`cli.rs`).
+#### Escenario: el texto está también en el outbox
+- GIVEN una fila de `memory` y una fila del outbox con el mismo texto, y otra fila del outbox con otro texto
+- WHEN se purga la de `memory`
+- THEN el outbox conserva sólo la fila con el otro texto
+
+**Tests:** `purging_a_live_row_leaves_no_trace_of_its_text`, `purging_a_deleted_row_leaves_no_trace_of_its_text`, `purging_releases_the_rows_that_disputed_it`, `purge_refuses_while_the_daemon_holds_the_store`, `purge_refuses_an_unknown_id_untouched`, `purge_refuses_a_store_with_pending_migrations_untouched` y `purge_removes_the_text_from_the_outbox` (`crates/clawg-core/src/memory/secrets.rs`); `purge_needs_yes_before_it_opens_anything` y `a_purge_refused_by_the_daemon_says_to_stop_it` (`crates/clawg-cli/src/secrets.rs`) y `purge_takes_an_id_a_yes_and_a_profile` (`cli.rs`).
 
 ### R6. La purga nombra los backups que todavía tienen la fila
 
-Después de purgar, MUST revisar cada snapshot de `<data>/backups/` (los archivos con nombre de snapshot) y devolver los que tienen una fila con ese id y el mismo `content`, ordenados por nombre (`backups_holding`, `secrets.rs:134`; `Purged.backups`, `secrets.rs:69`). Uno que no se puede leer MUST listarse también: puede tenerla. MUST NOT modificar ni borrar ningún backup. La salida MUST decir que esos archivos todavía tienen el texto y que borrarlos es decisión del usuario.
+Después de purgar, MUST revisar cada snapshot de `<data>/backups/` (los archivos con nombre de snapshot) y devolver los que tienen una fila con ese id y el mismo `content`, o una fila del outbox que contiene ese texto, ordenados por nombre (`backups_holding`, `secrets.rs:139`; `Purged.backups`, `secrets.rs:72`). Un snapshot anterior a V14 no tiene la tabla del outbox, y eso MUST NOT contar como «puede tenerla» (`outbox_holds`, `secrets.rs:162`). Uno que no se puede leer MUST listarse también: puede tenerla. MUST NOT modificar ni borrar ningún backup. La salida MUST decir que esos archivos todavía tienen el texto y que borrarlos es decisión del usuario.
 
 #### Escenario
 - GIVEN un backup manual tomado con la fila y otro tomado después de borrarla con el delete
@@ -222,4 +235,10 @@ Después de purgar, MUST revisar cada snapshot de `<data>/backups/` (los archivo
 - GIVEN un backup tomado antes de guardar la fila
 - THEN no se lista
 
-**Tests:** `purge_names_the_backups_that_still_hold_the_row` (`crates/clawg-core/src/memory/secrets.rs`) y `the_purge_report_names_backups_to_delete_by_hand` (`crates/clawg-cli/src/secrets.rs`).
+- GIVEN un backup tomado con el texto en una fila del outbox, sin fila de `memory` con ese id
+- THEN se lista
+
+- GIVEN un backup tomado antes de que existiera el outbox
+- THEN no se lista por no tener la tabla
+
+**Tests:** `purge_names_the_backups_that_still_hold_the_row`, `purge_removes_the_text_from_the_outbox` (el backup que sólo tiene el texto en el outbox) y `a_backup_from_before_the_outbox_is_not_named_for_it` (`crates/clawg-core/src/memory/secrets.rs`) y `the_purge_report_names_backups_to_delete_by_hand` (`crates/clawg-cli/src/secrets.rs`).

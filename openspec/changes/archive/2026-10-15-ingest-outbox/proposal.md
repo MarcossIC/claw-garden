@@ -74,4 +74,4 @@ Tests que fallan hoy (detalle en la [spec](spec.md)):
 - `purge` saca el texto también del outbox;
 - la base de la versión anterior abre con todo igual.
 
-Latencia del save, por agregar escrituras al camino caliente: el procedimiento de [ingest-durability](../archive/2026-10-12-ingest-durability/verify.md) antes y después (100 saves secuenciales, corto y largo, perfil dev, modelo real). Umbral pre-comprometido: el p95 de un save corto no crece más de 20 ms (línea base: 32 ms p50 y 51 ms p99 corto; 546 ms y 702 ms largo, build debug). Se mide en la máquina de Marcos. `verify.md` da además el conteo de tests contra la base.
+Latencia del save, por agregar escrituras al camino caliente: el procedimiento de [ingest-durability](../2026-10-12-ingest-durability/verify.md) antes y después (100 saves secuenciales, corto y largo, perfil dev, modelo real). Umbral pre-comprometido: el p95 de un save corto no crece más de 20 ms (línea base: 32 ms p50 y 51 ms p99 corto; 546 ms y 702 ms largo, build debug). Se mide en la máquina de Marcos. `verify.md` da además el conteo de tests contra la base.
