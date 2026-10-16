@@ -1594,6 +1594,9 @@ async fn registering_a_root_whose_id_is_taken_by_another_is_a_conflict() {
 
     let (status, body) = h.post_json("/v1/projects", json!({ "root_path": root })).await;
     assert_eq!(status, 409, "{body}");
+    assert_eq!(body["error"], "project_root_collision", "{body}");
+    let detail = body["detail"].as_str().expect("detail");
+    assert!(detail.contains(root) && detail.contains("/elsewhere/repo"), "{detail}");
 }
 
 #[tokio::test]
