@@ -22,9 +22,7 @@ context: |
   Compare two runs with rag-eval --diff: a conclusion needs at least 6 cases moving one way (p < 0.05).
   Agent-view baseline (RELEVANCE_RATIO 0.35): search_memory 36/46 at 764.0 mean tokens,
   recall_context 39/46 at 1086.4 (docs/eval/results/2026-10-15-real-project-indexing-relcut-agent-view.json).
-  Test baseline (Windows): cargo test --workspace -> 1983 passed, 1 failed. The failure,
-  projects::tests::adding_a_project_lets_its_docs_be_searched, is a test bug: it registers a root
-  with the \\?\ prefix that ProjectIdentity::resolve strips.
+  Test baseline (Windows): cargo test --workspace -> 1984 passed, 0 failed.
 
 strict_tdd: true
 

@@ -1,0 +1,15 @@
+change: project-root-guard
+objective: "2, 3"
+depends_on: []
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # Linux and Windows; the real store opens V13 with the first install after 0.8.0, see verify.md
+  archive: done
+main_spec: openspec/specs/project-docs/spec.md, openspec/specs/project/spec.md
+updated: 2026-10-15

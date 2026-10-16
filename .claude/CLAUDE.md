@@ -84,7 +84,7 @@ MCP tools (`crates/clawg-cli/src/mcp/server.rs`): `save_memory`, `search_memory`
 cargo test --workspace
 ```
 
-Current baseline (Windows): 1984 tests. 1983 pass. `projects::tests::adding_a_project_lets_its_docs_be_searched` fails because the test registers its root with the `\\?\` prefix, which `ProjectIdentity::resolve` strips.
+Current baseline (Windows): 1984 tests, all passing.
 
 On Windows, live `clawg.exe` processes (for example the editor's MCP bridge) lock `target\debug\clawg.exe` and make the build fail. Use a separate target directory instead: `cargo test --workspace --target-dir <other-dir>`.
 
