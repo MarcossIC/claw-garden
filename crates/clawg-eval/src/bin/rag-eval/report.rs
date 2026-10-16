@@ -109,6 +109,64 @@ pub struct SubsetAggregate {
     pub hits: Hits,
 }
 
+/// Which part of the golden set a case belongs to: the cases constants are
+/// chosen on, or the ones the chosen value is reported on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Split {
+    Calibration,
+    Test,
+}
+
+impl Split {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Calibration => "calibration",
+            Self::Test => "test",
+        }
+    }
+}
+
+/// Out of every 10 buckets of the query hash, how many calibrate.
+const CALIBRATION_BUCKETS: u64 = 7;
+
+/// A case's partition, from the first 8 bytes of the sha256 of its query.
+/// Needs no seed and reads no other case, so adding cases never moves one
+/// that is already there to the other side.
+pub fn split_of(query: &str) -> Split {
+    let hex = clawg_core::eval_api::sha256_hex(query.as_bytes());
+    let head = u64::from_str_radix(&hex[..16], 16).expect("sha256_hex is lowercase hex");
+    if head % 10 < CALIBRATION_BUCKETS {
+        Split::Calibration
+    } else {
+        Split::Test
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SplitAggregate {
+    pub split: Split,
+    pub n_cases: usize,
+    pub aggregate: Aggregate,
+    pub hits: Hits,
+}
+
+/// Aggregates each partition present on its own cases, calibration first.
+pub fn aggregate_by_split(cases: &[CaseResult]) -> Vec<SplitAggregate> {
+    [Split::Calibration, Split::Test]
+        .into_iter()
+        .filter_map(|split| {
+            let group: Vec<CaseResult> = cases.iter().filter(|c| split_of(&c.query) == split).cloned().collect();
+            (!group.is_empty()).then(|| SplitAggregate {
+                split,
+                n_cases: group.len(),
+                aggregate: aggregate(&group),
+                hits: hits(&group),
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RetrievalResults {
     pub aggregate: Aggregate,
@@ -123,6 +181,10 @@ pub struct RetrievalResults {
     /// Per-subset split of `aggregate`, over the same active cases. Only the
     /// subsets present appear; the counts sum to the number of active cases.
     pub by_subset: Vec<SubsetAggregate>,
+    /// Per-partition split of `aggregate`: a new constant is chosen reading
+    /// `calibration` and reported from `test`, so the number quoted is not
+    /// the one the choice was fitted to.
+    pub by_split: Vec<SplitAggregate>,
     pub per_case: Vec<CaseResult>,
     /// `known_red` cases: scored and recorded, but never folded into
     /// `aggregate` — a structural impossibility (a row seeded at a tier the
@@ -357,6 +419,7 @@ impl RetrievalResults {
             hits: hits(&per_case),
             by_lang: aggregate_by_lang(&per_case),
             by_subset: aggregate_by_subset(&per_case),
+            by_split: aggregate_by_split(&per_case),
             per_case,
             blocked,
         }
@@ -707,6 +770,19 @@ pub fn print_stdout(results: &RunResults) {
         println!("  retrieval by subset:");
         print!("{}", format_subset_table(&results.retrieval.by_subset));
     }
+    if !results.retrieval.by_split.is_empty() {
+        println!("  retrieval by split (choose on calibration, report test):");
+        for s in &results.retrieval.by_split {
+            println!(
+                "    {:<11} n={:>3}  recall@5={:.4}  mrr={:.4}  {}",
+                s.split.as_str(),
+                s.n_cases,
+                s.aggregate.recall_5,
+                s.aggregate.mrr,
+                format_hit("hits@5", &s.hits.at_5)
+            );
+        }
+    }
     if !results.retrieval.blocked.is_empty() {
         println!(
             "  blocked (known_red, excluded from aggregate, n={}):",
@@ -850,6 +926,51 @@ mod tests {
         assert!((r.lo - 0.644).abs() < 0.001 && (r.hi - 0.877).abs() < 0.001, "{r:?}");
         let lang = &RetrievalResults::from_cases(cases.clone(), vec![]).by_subset[0];
         assert_eq!(lang.hits.at_5.strict, r, "every split block carries its own hits");
+    }
+
+    fn queries(range: std::ops::Range<usize>) -> Vec<String> {
+        range.map(|i| format!("where did we put the config number {i}")).collect()
+    }
+
+    #[test]
+    fn split_of_is_stable_when_cases_are_added() {
+        let first: Vec<Split> = queries(0..40).iter().map(|q| split_of(q)).collect();
+        let cases: Vec<CaseResult> =
+            queries(0..60).iter().map(|q| case(q, 1.0, CaseStatus::Active)).collect();
+        let by_split = aggregate_by_split(&cases);
+        assert_eq!(by_split.iter().map(|s| s.n_cases).sum::<usize>(), 60);
+        let again: Vec<Split> = queries(0..40).iter().map(|q| split_of(q)).collect();
+        assert_eq!(first, again);
+    }
+
+    #[test]
+    fn about_seventy_percent_of_queries_calibrate() {
+        let n = queries(0..1000).iter().filter(|q| split_of(q) == Split::Calibration).count();
+        assert!((650..=750).contains(&n), "{n} of 1000 calibrate");
+    }
+
+    #[test]
+    fn aggregate_by_split_scores_each_split_on_its_own_cases() {
+        let cases: Vec<CaseResult> = queries(0..30)
+            .iter()
+            .map(|q| case_of(q, if split_of(q) == Split::Test { 1.0 } else { 0.0 }, CaseSubset::Natural))
+            .collect();
+        let by_split = aggregate_by_split(&cases);
+        assert_eq!(by_split.iter().map(|s| s.split).collect::<Vec<_>>(), vec![Split::Calibration, Split::Test]);
+        assert_eq!(by_split[0].aggregate.recall_5, 0.0);
+        assert_eq!(by_split[1].aggregate.recall_5, 1.0);
+    }
+
+    #[test]
+    fn every_split_block_carries_its_hits() {
+        let cases: Vec<CaseResult> = queries(0..30).iter().map(|q| multi(q, 0.5)).collect();
+        let results = RetrievalResults::from_cases(cases, vec![]);
+        for s in &results.by_split {
+            assert_eq!(s.hits.at_5.partial.hits, s.n_cases);
+            assert_eq!(s.hits.at_5.strict.hits, 0);
+        }
+        assert_eq!(results.by_subset[0].hits.at_5.partial.hits, 30);
+        assert_eq!(results.hits.at_5.partial.n_cases, 30);
     }
 
     #[test]
