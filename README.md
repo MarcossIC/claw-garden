@@ -316,8 +316,8 @@ Algún programa tiene el binario viejo abierto sin permitir que se renombre. No 
 **`clawg memories ...` dice que no hay daemon.**
 El visor no lo arranca solo. Corré `clawg serve --profile prod` en otra terminal, o abrí una sesión de Claude Code con el servidor registrado.
 
-**Después de `clawg stop` o de actualizar, el agente no encuentra el servidor.**
-El puente no se reconecta solo. En Claude Code, escribí `/mcp` y reconectalo.
+**Después de `clawg stop` o de actualizar, el agente dice que el daemon no está corriendo.**
+El puente busca solo al daemon nuevo en cuanto vuelve a arrancar, pero no lo arranca él: así un `clawg stop` hecho a propósito (para `restore` o `purge`) se respeta. Corré `clawg serve --profile prod`, o en Claude Code escribí `/mcp` y reconectalo, que arranca uno con el binario instalado.
 
 **Después de actualizar, `memory_status` dice `loading` un rato.**
 Las versiones anteriores calculaban los vectores de las memorias de una forma que las dejaba casi todas igual de parecidas a cualquier pregunta. La primera vez que arranca esta versión guarda una copia en `~/.clawg/backups` (`…-pre-reembed.db`) y vuelve a calcular el vector de cada memoria; hasta que termina, la búsqueda por sentido no está disponible.
