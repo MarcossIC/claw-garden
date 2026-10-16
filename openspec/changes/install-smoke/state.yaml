@@ -1,7 +1,7 @@
 change: install-smoke
 objective: "transversal"
 depends_on: []
-phase: apply
+phase: verify
 artifacts:
   exploration: done
   proposal: done
@@ -9,6 +9,6 @@ artifacts:
   design: done
   tasks: done
   apply: done
-  verify: pending
+  verify: partial  # Linux; CI y Windows pendientes, ver verify.md
   archive: pending
 updated: 2026-10-16
