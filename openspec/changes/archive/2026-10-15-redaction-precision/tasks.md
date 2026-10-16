@@ -40,4 +40,15 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 ## 7. Verificación
 
 - [x] `cargo test --workspace` sobre el último commit, clippy con `-A clippy::all -D warnings`, `verify.md` con el conteo contra la base.
-- [ ] Pendiente en Windows (máquina de Marcos): la suite, clippy y `clawg secrets` sobre el perfil dev.
+- [x] Pendiente en Windows (máquina de Marcos): la suite, clippy y `clawg secrets` sobre el perfil dev. En `2b1b08a` pasan 1.995 (la base de 1.984 más los 11 de este cambio) y no falla ninguno; `clippy` con código 0; `clawg secrets --profile dev` no lista ninguna fila.
+
+## 8. El separador `::` (R4)
+
+- [x] `use crate::auth::password::rules::check;`, `use crate::password::hash_v2;` y `algo: Password::Argon2id` en `code_and_placeholders_after_a_password_key_are_left_alone`, y `password==s3cr3t9` en `a_literal_password_is_masked_and_its_key_kept` (`redact.rs`): fallaba porque `[:=]{1,2}` también toma `::`.
+- [x] El separador pasa a ser `==`, `:=`, `=` o `:`, y un valor no empieza con `:`.
+- Commit: `fix(core): leave a path through a module named password unmasked` (`54478a1`)
+
+## 9. Archive
+
+- [x] [`specs/secrets`](../../../specs/secrets/spec.md) con R1 rehecho (formatos, patrones por contexto, marca privada, solapamientos) y R4 con lo guardado antes de una regla nueva, la línea **Origen** y los `ruta:línea` de R1 y R4 revisados contra `main`; la cita de `redact` en [`specs/project-docs`](../../../specs/project-docs/spec.md).
+- [x] `git mv` a `changes/archive/2026-10-15-redaction-precision`; `state.yaml` archivado; fila 42 y orden de ejecución del `README.md` de openspec; base de tests de `.claude/CLAUDE.md` y `openspec/config.yaml`; subir el minor.

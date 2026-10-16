@@ -177,7 +177,7 @@ Sólo MUST correr un refresco por proyecto a la vez: un pedido de refresco mient
 
 ## Secretos
 
-El texto de un doc MUST pasar por `redact` (`crates/clawg-core/src/memory/redact.rs:131`) antes de trocearse. Ningún pasaje, vector ni entrada léxica MUST contener un secreto de formato conocido. La huella usa los bytes del disco, sin enmascarar.
+El texto de un doc MUST pasar entero por `redact` (`crates/clawg-core/src/memory/redact.rs:207`; `project_docs/mod.rs:382`) antes de trocearse. Ningún pasaje, vector ni entrada léxica MUST contener un secreto que reconozca el detector de [`specs/secrets`](../secrets/spec.md) (R1); una marca privada abierta en un doc enmascara, en el índice, hasta el próximo cierre o el final del archivo. La huella usa los bytes del disco, sin enmascarar.
 
 #### Escenario
 - GIVEN `docs/setup.md` con una clave `sk-ant-…` de formato válido
