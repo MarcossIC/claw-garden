@@ -205,11 +205,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
     // uuid directory nobody was told about is not a forensic trace.
     println!("seeded {} rows into {}", golden_set.corpus.len(), seeded.store_path.display());
 
-    let lang_by_ref: HashMap<&str, &str> = golden_set
-        .corpus
-        .iter()
-        .filter_map(|row| row.lang.as_deref().map(|lang| (row.ref_.as_str(), lang)))
-        .collect();
+    let lang_by_ref = row_langs(&golden_set.corpus);
 
     // Every query embedded exactly once, up front — shared unchanged across
     // every grid point's search below, so an N-point sweep never re-embeds
@@ -1215,6 +1211,12 @@ fn build_similarity_results(
         query_prefix: query_prefix.to_string(),
         passage_prefix: passage_prefix.to_string(),
     }
+}
+
+/// Each corpus row's declared `lang`, by ref. A row that declares none is left
+/// out, which is what `case_lang` reads as unknown.
+fn row_langs(corpus: &[golden::CorpusRow]) -> HashMap<&str, &str> {
+    corpus.iter().filter_map(|row| row.lang.as_deref().map(|lang| (row.ref_.as_str(), lang))).collect()
 }
 
 /// The language to attribute a retrieval case to: the `lang` its expected
@@ -2363,6 +2365,30 @@ mod tests {
             Some(0),
             "the store's own ranking is not scored in this mode"
         );
+
+        std::fs::remove_file(&golden_path).ok();
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_agent_view_run_labels_each_case_with_its_pair() {
+        let golden = agent_view_golden_json()
+            .replacen(r#""importance": 3.0}"#, r#""importance": 3.0, "lang": "en"}"#, 1)
+            .replacen(r#""expected_refs": ["c1"]}"#, r#""expected_refs": ["c1"], "query_lang": "es"}"#, 1);
+        let golden_path = temp_path("agent-view-pair-golden.json");
+        std::fs::write(&golden_path, golden).expect("write golden fixture");
+        let out_dir = temp_path("agent-view-pair-out");
+
+        assert_eq!(run(agent_view_args(&golden_path, &out_dir, &[]).into_iter()).await, EXIT_OK);
+
+        let path = out_dir.join(format!("{}-fake-agent-view.json", current_date_string()));
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("results file")).expect("valid JSON");
+        let per_case = &json["agent_view"]["per_case"];
+        assert_eq!(per_case[0]["query_lang"], "es");
+        assert_eq!(per_case[0]["row_lang"], "en");
+        assert!(per_case[1].get("query_lang").is_none() && per_case[1].get("row_lang").is_none(), "{}", per_case[1]);
+        assert_eq!(json["agent_view"]["by_pair"]["es>en"]["search"]["n_cases"], 1);
 
         std::fs::remove_file(&golden_path).ok();
         std::fs::remove_dir_all(&out_dir).ok();

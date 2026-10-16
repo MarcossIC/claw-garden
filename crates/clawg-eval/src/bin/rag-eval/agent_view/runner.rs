@@ -120,6 +120,7 @@ async fn answer_cases(
     corpus: &Corpus,
 ) -> Result<Vec<CaseView>, RunError> {
     let ambiguous = corpus.ambiguous_refs();
+    let lang_by_ref = crate::row_langs(&input.golden_set.corpus);
     let mut views = Vec::with_capacity(input.golden_set.retrieval_cases.len());
     for case in &input.golden_set.retrieval_cases {
         let started = Instant::now();
@@ -191,6 +192,8 @@ async fn answer_cases(
             subset: case.subset,
             answer,
             abstained: (case.subset == CaseSubset::Unanswerable).then_some(search_lines_printed == 0),
+            query_lang: case.query_lang.clone(),
+            row_lang: crate::case_lang(&case.expected_refs, &lang_by_ref),
         });
     }
     Ok(views)

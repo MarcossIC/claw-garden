@@ -129,6 +129,13 @@ pub struct Pair {
     pub lang: String,
 }
 
+/// Written `query>row`, the label every report gives a pair.
+impl std::fmt::Display for Pair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}>{}", self.query_lang, self.lang)
+    }
+}
+
 /// A case's pair, only when both languages are known: a case missing either
 /// is left out of every pair, as `aggregate_by_lang` leaves out a case
 /// without a unanimous language.
@@ -1450,6 +1457,7 @@ mod tests {
             search: Default::default(),
             context: Default::default(),
             by_subset: Default::default(),
+            by_pair: Default::default(),
             abstention: None,
             per_case: vec![],
         }

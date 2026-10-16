@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::golden::{CaseStatus, CaseSubset};
-use crate::report::Rate;
+use crate::report::{pair_of, Rate};
 use matcher::{normalize, visible_segment, Corpus};
 use parse::{context_sections, context_segments, parse_search_output, ParseError};
 use stats::{summarize, Sample, ToolStats};
@@ -86,6 +86,12 @@ pub struct CaseView {
     /// Only on `unanswerable` cases: `search_memory` printed no line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abstained: Option<bool>,
+    /// The language of the query, as the golden case names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_lang: Option<String>,
+    /// The language the expected rows agree on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_lang: Option<String>,
 }
 
 /// Whether the fact a case asks for reached the agent, not just some fragment
@@ -156,6 +162,11 @@ pub struct AgentViewResults {
     /// before the split was recorded have none.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub by_subset: BTreeMap<String, SubsetSummary>,
+    /// The cases `by_subset` splits, split instead by query–row language
+    /// pair and keyed `query>row`. A case missing either language is in no
+    /// pair; left out when no case has one.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_pair: BTreeMap<String, SubsetSummary>,
     /// Share of active `unanswerable` cases whose search printed nothing.
     /// Those cases stay out of every hit rate: there is nothing to find.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -292,6 +303,12 @@ pub fn render_summary(results: &AgentViewResults) -> String {
             ));
         }
     }
+    for (pair, summary) in &results.by_pair {
+        out.push_str(&format!(
+            "  {pair} (n={}): search hit rate {:.4}, context hit rate {:.4}\n",
+            summary.search.n_cases, summary.search.hit_rate, summary.context.hit_rate
+        ));
+    }
     if let Some(a) = &results.abstention {
         out.push_str(&format!(
             "  unanswerable (n={}): search printed nothing in {} [{:.3}, {:.3}]\n",
@@ -344,7 +361,23 @@ pub fn build_results(
         tokens: c.context.tokens,
         latency_ms: c.context.latency_ms,
     };
-    let mut by_subset: BTreeMap<String, SubsetSummary> = BTreeMap::new();
+    let group_summary = |cases: &[&CaseView]| {
+        let answers: Vec<AnswerView> = cases.iter().filter_map(|c| c.answer).collect();
+        let share = |pick: fn(&AnswerView) -> bool| {
+            answers.iter().filter(|a| pick(a)).count() as f64 / answers.len().max(1) as f64
+        };
+        SubsetSummary {
+            search: summarize(&cases.iter().map(|c| search_sample(c)).collect::<Vec<_>>()),
+            context: summarize(&cases.iter().map(|c| context_sample(c)).collect::<Vec<_>>()),
+            answers: AnswerStats {
+                n_cases: answers.len(),
+                search_visible: share(|a| a.search_visible),
+                search_reachable: share(|a| a.search_reachable),
+                context_visible: share(|a| a.context_visible),
+            },
+            repeated_rows: cases.iter().map(|c| c.search.repeated_rows).sum(),
+        }
+    };
     let active: Vec<&CaseView> =
         per_case.iter().filter(answerable).filter(|c| c.status == CaseStatus::Active).collect();
     let unanswerable: Vec<bool> = per_case
@@ -354,28 +387,19 @@ pub fn build_results(
         .collect();
     let abstention = (!unanswerable.is_empty())
         .then(|| Rate::of(unanswerable.iter().filter(|a| **a).count(), unanswerable.len()));
-    let names: std::collections::BTreeSet<&str> = active.iter().map(|c| c.subset.as_str()).collect();
-    for name in names {
-        let cases: Vec<&CaseView> = active.iter().copied().filter(|c| c.subset.as_str() == name).collect();
-        let answers: Vec<AnswerView> = cases.iter().filter_map(|c| c.answer).collect();
-        let share = |pick: fn(&AnswerView) -> bool| {
-            answers.iter().filter(|a| pick(a)).count() as f64 / answers.len().max(1) as f64
-        };
-        by_subset.insert(
-            name.to_string(),
-            SubsetSummary {
-                search: summarize(&cases.iter().map(|c| search_sample(c)).collect::<Vec<_>>()),
-                context: summarize(&cases.iter().map(|c| context_sample(c)).collect::<Vec<_>>()),
-                answers: AnswerStats {
-                    n_cases: answers.len(),
-                    search_visible: share(|a| a.search_visible),
-                    search_reachable: share(|a| a.search_reachable),
-                    context_visible: share(|a| a.context_visible),
-                },
-                repeated_rows: cases.iter().map(|c| c.search.repeated_rows).sum(),
-            },
-        );
+    let mut subsets: BTreeMap<String, Vec<&CaseView>> = BTreeMap::new();
+    let mut pairs: BTreeMap<String, Vec<&CaseView>> = BTreeMap::new();
+    for case in active.iter().copied() {
+        subsets.entry(case.subset.as_str().to_string()).or_default().push(case);
+        if let Some(pair) = pair_of(case.query_lang.as_deref(), case.row_lang.as_deref()) {
+            pairs.entry(pair.to_string()).or_default().push(case);
+        }
     }
+    let summarize_groups = |groups: BTreeMap<String, Vec<&CaseView>>| -> BTreeMap<String, SubsetSummary> {
+        groups.into_iter().map(|(key, cases)| (key, group_summary(&cases))).collect()
+    };
+    let by_subset = summarize_groups(subsets);
+    let by_pair = summarize_groups(pairs);
     AgentViewResults {
         corpus_size,
         stored_rows,
@@ -391,6 +415,7 @@ pub fn build_results(
             known_red: summary(CaseStatus::KnownRed, context_sample),
         },
         by_subset,
+        by_pair,
         abstention,
         per_case,
     }
@@ -551,6 +576,8 @@ mod tests {
             subset: CaseSubset::Natural,
             answer: None,
             abstained: None,
+            query_lang: None,
+            row_lang: None,
         }
     }
 
@@ -629,6 +656,71 @@ mod tests {
         assert_eq!((a.hits, a.n_cases), (1, 2));
         assert!(render_summary(&results).contains("unanswerable (n=2): search printed nothing in 1"));
         assert_eq!(build_results(3, 3, &corpus(), vec![case_view(CaseStatus::Active, true, true, 1)]).abstention, None);
+    }
+
+    fn in_pair(query_lang: &str, row_lang: &str, search_found: bool) -> CaseView {
+        CaseView {
+            query_lang: Some(query_lang.to_string()),
+            row_lang: Some(row_lang.to_string()),
+            ..case_view(CaseStatus::Active, search_found, true, 10)
+        }
+    }
+
+    #[test]
+    fn build_results_splits_active_cases_by_pair() {
+        let results = build_results(
+            3,
+            3,
+            &corpus(),
+            vec![
+                in_pair("es", "en", true),
+                in_pair("es", "en", false),
+                in_pair("en", "en", true),
+                case_view(CaseStatus::Active, false, false, 10),
+            ],
+        );
+        assert_eq!(results.by_pair.keys().collect::<Vec<_>>(), vec!["en>en", "es>en"]);
+        let es_en = &results.by_pair["es>en"];
+        assert_eq!((es_en.search.n_cases, es_en.search.hit_rate), (2, 0.5));
+        assert_eq!((es_en.context.n_cases, es_en.context.hit_rate), (2, 1.0));
+        assert_eq!(results.by_pair["en>en"].search.n_cases, 1);
+        assert_eq!(results.search.active.n_cases, 4, "a case without a pair still counts");
+        assert_eq!(results.by_subset["natural"].search.n_cases, 4);
+        let text = render_summary(&results);
+        assert!(text.contains("es>en (n=2): search hit rate 0.5000, context hit rate 1.0000"), "{text}");
+    }
+
+    #[test]
+    fn agent_view_pairs_leave_out_known_red_and_unanswerable() {
+        let known_red = CaseView { status: CaseStatus::KnownRed, ..in_pair("es", "en", true) };
+        let unanswerable = CaseView {
+            subset: CaseSubset::Unanswerable,
+            expected_refs: vec![],
+            abstained: Some(true),
+            ..in_pair("es", "en", false)
+        };
+        let results = build_results(3, 3, &corpus(), vec![in_pair("es", "en", false), known_red, unanswerable]);
+        assert_eq!(results.by_pair.keys().collect::<Vec<_>>(), vec!["es>en"]);
+        assert_eq!(results.by_pair["es>en"].search.n_cases, 1);
+        assert_eq!(results.by_pair["es>en"].search.hit_rate, 0.0);
+    }
+
+    #[test]
+    fn a_case_view_without_languages_reads_back_and_writes_none() {
+        let view = case_view(CaseStatus::Active, true, true, 10);
+        let json = serde_json::to_value(&view).unwrap();
+        assert!(json.get("query_lang").is_none() && json.get("row_lang").is_none(), "{json}");
+        let back: CaseView = serde_json::from_value(json).unwrap();
+        assert_eq!((back.query_lang, back.row_lang), (None, None));
+
+        let results = build_results(3, 3, &corpus(), vec![view]);
+        assert!(results.by_pair.is_empty());
+        let json = serde_json::to_value(&results).unwrap();
+        assert!(json.get("by_pair").is_none(), "{json}");
+        assert_eq!(serde_json::from_value::<AgentViewResults>(json).unwrap(), results);
+
+        let labelled = serde_json::to_value(in_pair("es", "en", true)).unwrap();
+        assert_eq!((&labelled["query_lang"], &labelled["row_lang"]), (&serde_json::json!("es"), &serde_json::json!("en")));
     }
 
     #[test]
