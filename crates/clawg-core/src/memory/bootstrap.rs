@@ -23,6 +23,7 @@ use tokio::sync::watch;
 use crate::memory::backup::{self, Reason};
 use crate::memory::db::{ContractStatus, EmbeddingIdentity, StoredContract};
 use crate::memory::embedder::{Embedder, FastEmbedLocal, E5_MODEL_ID, LEGACY_CLS_MODEL_ID};
+use crate::memory::idle_embedder::{IdleEmbedder, ReloadFn};
 use crate::memory::maintenance::{reembed_all, ReInferPlan, ReembedMode};
 use crate::memory::model_download::{ensure_model, DownloadProgress};
 use crate::memory::MemoryStore;
@@ -333,6 +334,44 @@ pub fn serve_deps(
     backups: std::path::PathBuf,
 ) -> Result<(EnsureModelFn, LoadEmbedderFn, ContractVerifyFn), String> {
     Ok(production_deps(store, backups))
+}
+
+/// `load`, with every embedder it builds wrapped in an [`IdleEmbedder`] that
+/// lets the model go after `idle` without use. A reload goes through `ensure`
+/// and `load` again, so it reads and checks the same files the bootstrap did;
+/// the contract is not checked again, because the reload refuses a model with
+/// another identity. The sweeper runs on `runtime`.
+pub fn unloading_when_idle(
+    ensure: EnsureModelFn,
+    load: LoadEmbedderFn,
+    base_dir: std::path::PathBuf,
+    idle: Duration,
+    runtime: tokio::runtime::Handle,
+) -> LoadEmbedderFn {
+    let reload: ReloadFn = {
+        let load = load.clone();
+        Arc::new(move || {
+            let (ensure, load, base_dir) = (ensure.clone(), load.clone(), base_dir.clone());
+            Box::pin(async move {
+                let started = std::time::Instant::now();
+                let files = ensure(base_dir, None).await.map_err(|e| e.to_string())?;
+                let read = started.elapsed();
+                let model = tokio::task::spawn_blocking(move || load(files))
+                    .await
+                    .map_err(|e| format!("model load task panicked: {e}"))??;
+                log::info!(
+                    "embedding model files read and checked in {} ms, session built in {} ms",
+                    read.as_millis(),
+                    (started.elapsed() - read).as_millis()
+                );
+                Ok(model)
+            })
+        })
+    };
+    Arc::new(move |files| {
+        let loaded = load(files)?;
+        Ok(Arc::new(IdleEmbedder::new(loaded, reload.clone(), idle, &runtime)) as Arc<dyn Embedder>)
+    })
 }
 
 /// Whether `stored` describes the vectors this same model made before it
@@ -760,6 +799,43 @@ mod tests {
     /// arrives" verifier instead of repeating the closure inline.
     fn accept_contract() -> ContractVerifyFn {
         Arc::new(|_embedder| Box::pin(async { Ok(ContractStatus::Match) }))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_unloading_embedder_reloads_through_the_same_files_and_load() {
+        let (ensure_calls, load_calls) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let ensure: EnsureModelFn = {
+            let calls = ensure_calls.clone();
+            Arc::new(move |_base, progress| {
+                assert!(progress.is_none(), "a reload reports no download progress");
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(empty_model_files()) })
+            })
+        };
+        let load: LoadEmbedderFn = {
+            let calls = load_calls.clone();
+            Arc::new(move |_files| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>)
+            })
+        };
+        let wrapped = unloading_when_idle(
+            ensure,
+            load,
+            std::path::PathBuf::from("unused"),
+            Duration::from_secs(600),
+            tokio::runtime::Handle::current(),
+        );
+
+        let embedder = wrapped(empty_model_files()).expect("first load");
+        assert!(embedder.resident());
+        assert_eq!((ensure_calls.load(Ordering::SeqCst), load_calls.load(Ordering::SeqCst)), (0, 1));
+
+        tokio::time::sleep(Duration::from_secs(1200)).await;
+        assert!(!embedder.resident());
+        embedder.embed_with_role("again", crate::memory::embedder::EmbedRole::Query).await.expect("reload");
+        assert!(embedder.resident());
+        assert_eq!((ensure_calls.load(Ordering::SeqCst), load_calls.load(Ordering::SeqCst)), (1, 2));
     }
 
     #[tokio::test]

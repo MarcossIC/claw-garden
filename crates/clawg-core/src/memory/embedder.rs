@@ -80,6 +80,19 @@ pub trait Embedder: Send + Sync {
 
     /// The literal string prepended to text embedded with [`EmbedRole::Passage`].
     fn passage_prefix(&self) -> &str;
+
+    /// Whether the model is in memory now, so the next call needs no load.
+    /// Only an embedder that can let its model go (see
+    /// [`IdleEmbedder`](crate::memory::idle_embedder::IdleEmbedder)) ever
+    /// answers `false`.
+    fn resident(&self) -> bool {
+        true
+    }
+
+    /// Start bringing the model back into memory without waiting for it, for
+    /// a caller that knows a request is coming. A resident model has nothing
+    /// to do.
+    fn wake(&self) {}
 }
 
 /// E5-family prefix for [`EmbedRole::Query`] text. The trailing space is
