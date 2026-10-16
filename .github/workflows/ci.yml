@@ -1,9 +1,29 @@
 name: CI
 
+# the_claude_md_tool_list_is_the_registered_one reads `.claude/CLAUDE.md`, so a
+# push that changes only that file is checked by the next run.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'openspec/**'
+      - '.claude/**'
+      - '.cursor/**'
+      - '.gemini/**'
+      - 'scripts/**'
+      - 'README.md'
+      - 'AGENTS.md'
   pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - 'openspec/**'
+      - '.claude/**'
+      - '.cursor/**'
+      - '.gemini/**'
+      - 'scripts/**'
+      - 'README.md'
+      - 'AGENTS.md'
 
 permissions:
   contents: read
