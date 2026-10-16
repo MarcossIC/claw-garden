@@ -1,14 +1,14 @@
 change: english-recall
 objective: "1"
 depends_on: [eval-rigor]
-phase: explore
+phase: apply
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
-  apply: pending
-  verify: pending
+  exploration: done
+  proposal: done
+  spec: done
+  design: skipped  # the spec settles the pair type (report.rs), by_pair shapes and the diff cut with the existing by_lang/by_subset patterns; no open alternative
+  tasks: done
+  apply: in-progress  # tasks 1-8 done (code, labels, control goldens); 9-12 need the real model
+  verify: pending  # also holds the diagnosis record
   archive: pending
-updated: 2026-10-15
+updated: 2026-10-16

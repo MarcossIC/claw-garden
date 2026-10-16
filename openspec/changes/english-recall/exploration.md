@@ -2,7 +2,9 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 | S–M | project-indexing (12, archivado); eval-rigor (33, planeado: la prueba pareada y los intervalos) | exploración (borrador) |
+| 1 | S–M | project-indexing (12, archivado); eval-rigor (33, archivado el 2026-10-15: la prueba pareada y los intervalos) | exploración cerrada; decisiones del 2026-10-16 |
+
+> **Citas.** Las líneas de código se tomaron antes de `49bd269`. En `main` `49bd269` se movieron: los prefijos están en `embedder.rs:102` y `:123`, su comentario en `:104-122`, el de CLS en `:135-137`, `E5_MODEL_ID` en `:128` y el test que fija los prefijos en `:851-866`; `is_pooling_upgrade` y `verify_or_reembed` en `bootstrap.rs:380` y `:394`; `aggregate_by_lang` en `report.rs:535`. La propuesta vuelve a citar contra `main`.
 
 **Tesis:** la caída de R@5 de 0,68 a 0,45 al pasar a pooling mean no es «del inglés». El set agrupa por el idioma de la **fila** esperada, no por el de la **consulta**: 15 de los 22 casos «en inglés» son consultas en español sobre memorias escritas en inglés, y con cuatro casos «es» sobre filas en inglés suman 19 cruces. Separados por pareja consulta–fila, español–español no cambia, inglés–inglés mejora, y español–inglés pierde 7 casos y gana 0 incluso con coseno puro, sin piso, decaimiento ni importancia. Así que ni el piso de coseno, ni el corte, ni el canal léxico lo explican: está en los vectores. El cambio es **primero un diagnóstico** (qué parte es el prefijo, qué parte el pooling, qué parte el contenido) y recién después, si hace falta, un arreglo. El nombre de la carpeta se conserva; la tesis lo corrige.
 
@@ -110,7 +112,7 @@ Pasar `E5_PASSAGE_PREFIX` a `"passage: "`, o los dos, según qué brazo gane. Lo
 
 ### D. Aceptar la brecha
 
-Si los brazos muestran que es una propiedad del modelo con este contenido y que ningún prefijo la cierra, se registra y se sigue. Criterio propuesto: un brazo cuenta como mejora si gana al menos 6 de los 19 casos del cruce sin perder ninguno (la prueba de signos da p < 0,05) o lo que diga la prueba pareada de 33. Con n = 19, cada caso vale 5 puntos y menos de 3 casos son ruido.
+Si los brazos muestran que es una propiedad del modelo con este contenido y que ningún prefijo la cierra, se registra y se sigue. Criterio (decidido): un brazo cuenta como mejora del cruce si McNemar exacto sobre los casos de esa pareja da p < 0,05, lo que con 0 pérdidas pide 6 casos ganados (p = 0,031); con pérdidas, la cuenta neta sube. Con n = 19, cada caso vale 5 puntos.
 
 **Recomendación:** A. Y de ahí D o C, según lo que midan (b) y (e). B queda descartada.
 
@@ -126,7 +128,7 @@ Si los brazos muestran que es una propiedad del modelo con este contenido y que 
 
 ## Interacciones
 
-- **eval-rigor (33).** La prueba pareada y los intervalos son lo que separa 7 de 0 de ruido. Sin ella, esta exploración usa conteos y la prueba de signos exacta.
+- **eval-rigor (33).** Archivado el 2026-10-15. `--diff` ya da McNemar exacto caso por caso sobre `retrieval` y `similarity` (`diff.rs:96-203`), pero sobre los 46 casos juntos: no corta por pareja consulta–fila. Para probar el criterio sobre los 19 del cruce hace falta ese corte, en el reporte y en el diff, o un golden que sólo tenga esa pareja; lo decide la propuesta. Esta exploración usó conteos y la prueba de signos exacta.
 - **memory-rank-fusion (34).** Se miden por separado. Si 34 aterriza antes, esta base es la nueva.
 - **model-reembed (17).** Es el camino de C. Su urgencia sube sólo si (b) gana.
 - **docs-search-quality (20).** La búsqueda de docs usa el mismo embedder: un cambio de prefijo la afecta (ver C), aunque sus preguntas se midieron por separado.
@@ -137,9 +139,10 @@ Si los brazos muestran que es una propiedad del modelo con este contenido y que 
 
 1. Eje por idioma de la consulta en el set y el reporte (`query_lang`, `row_lang`, por pareja), con compatibilidad para sets viejos (campo opcional).
 2. Corregir las etiquetas del set propio (c01, c08, c09, c35), que viven fuera de git.
-3. Los brazos (a) a (f), con el bloque `similarity` y el agent-view.
-4. El registro del diagnóstico (en el `verify.md` del cambio o su `proposal.md`).
-5. Sólo si (b) o (c) lo piden: la propuesta de un cambio de prefijo, a evaluar por separado.
+3. Un golden aparte para el cruce (`--golden`, fuera de git como el resto de `docs/eval`): casos inglés→español sobre filas que ya existen (hoy n = 0) y más casos español→inglés. `golden.json`, el ancla de 46 casos, no cambia.
+4. Los brazos (a) a (f), con el bloque `similarity` y el agent-view. Los de prefijo (b) se compilan en un worktree descartable por brazo, con `--tag` propio; no se agrega un constructor ni un flag de prefijo.
+5. El registro del diagnóstico (en el `verify.md` del cambio o su `proposal.md`).
+6. Sólo si (b) o (c) lo piden: la propuesta de un cambio de prefijo, como cambio aparte.
 
 ### No-alcance
 
@@ -148,17 +151,15 @@ Si los brazos muestran que es una propiedad del modelo con este contenido y que 
 - Agregar casos al set más allá de etiquetar mejor y de sumar un subconjunto cruzado.
 - Mezclar el trabajo con 34.
 
-## Decisiones abiertas
+## Decisiones (2026-10-16)
 
-Son del usuario.
-
-- [ ] **Alcance.** ¿Sólo A (diagnóstico) en este cambio, o A y la propuesta de C si (b) gana? Recomendado: A, y C como cambio aparte.
-- [ ] **¿Cómo se varía el prefijo?** Worktree descartable (no suma código) o un constructor sólo de evaluación (suma una superficie que hoy no existe).
-- [ ] **Criterio de mejora.** ¿6 de 19 sin pérdidas (propuesto) u otro?
-- [ ] **Subconjunto cruzado.** El n = 19 es chico. ¿Se amplía el set con más casos español–inglés e inglés–español, o se espera a 33?
-- [ ] **Qué es «escribir bien» en cada idioma.** ¿memory-protocol (22) debe recomendar un idioma para los saves?
-- [ ] **Dirección inversa.** Hoy no hay ningún caso inglés→español en el set (n = 0). ¿Se agrega?
-- [ ] **Etiquetas.** ¿El campo `lang` de la fila se vuelve el idioma real del contenido?
+- [x] **Alcance.** Sólo A, el diagnóstico. Si (b) gana, el cambio de prefijo (C) se propone como cambio aparte: arrastra re-embebido (17) y volver a medir el piso, el corte y la banda de contradicciones.
+- [x] **¿Cómo se varía el prefijo?** Worktree descartable, una compilación de `rag-eval` por brazo con `--tag` propio. No se agrega un constructor sólo de evaluación.
+- [x] **Criterio de mejora.** McNemar exacto p < 0,05 sobre los casos de la pareja (6 ganados con 0 perdidos), sin que bajen las otras parejas ni el ancla global. Reemplaza el «ganar 4 casos» de la tabla de umbrales, que daba p = 0,125.
+- [x] **Subconjunto cruzado.** Se amplía en un golden aparte, sin tocar `golden.json`.
+- [x] **Dirección inversa.** Entra en ese golden aparte: consultas en inglés sobre filas en español que ya existen.
+- [x] **Etiquetas.** El `lang` de la fila pasa a ser el idioma real del contenido; se corrigen c01, c08, c09 y c35.
+- [x] **Qué es «escribir bien» en cada idioma.** No se decide acá: este cambio le pasa los números a memory-protocol (22).
 
 ## Cómo se mide
 
@@ -176,8 +177,8 @@ Estas son las cifras de base; ninguna requiere código nuevo, se leen de los res
 
 | Métrica | Base | Umbral |
 |---|---|---|
-| español → inglés, R@5 (n = 19) | 0,32 | `>= 0,53` (ganar 4 casos o más), con 0 pérdidas, o p < 0,05 en la prueba pareada |
-| español → inglés, R@10 | 0,68 | `>= 0,79` |
+| español → inglés, R@5 (n = 19) | 0,32 | McNemar exacto p < 0,05 sobre los casos de la pareja (con 0 pérdidas, 6 ganados: `>= 0,63`) |
+| español → inglés, R@10 | 0,68 | sin bajar |
 | español → español, R@5 y R@10 | 0,90 / 0,95 | sin bajar |
 | inglés → inglés, R@5 y R@10 | 0,86 / 1,00 | sin bajar |
 | Ancla global, R@1 / R@5 / R@10 / MRR / nDCG@10 | 0,4348 / 0,6522 / 0,8478 / 0,5524 / 0,6215 | ninguna baja |
