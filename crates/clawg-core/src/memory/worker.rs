@@ -251,14 +251,16 @@ pub async fn memory_worker(
     let mut drain = Some(drain);
     let mut deadline: Option<Instant> = None;
     // The outbox rows taken in this run. A row the start-up read found can
-    // also arrive on the channel; the second delivery is skipped.
+    // also arrive on the channel; the second delivery is skipped, and its
+    // caller, who may be waiting, gets the report of the first.
     let mut taken: HashSet<i64> = HashSet::new();
+    let mut replayed: HashMap<i64, IngestReport> = HashMap::new();
     loop {
         observe_drain(&mut rx, &mut drain, &mut deadline);
-        let IngestRequest { event: evt, reply, outbox } = match replay.next() {
-            Some(request) => request,
+        let (IngestRequest { event: evt, reply, outbox }, from_replay) = match replay.next() {
+            Some(request) => (request, true),
             None => match next_event(&mut rx, &mut drain, &mut deadline).await {
-                Some(request) => request,
+                Some(request) => (request, false),
                 None => break,
             },
         };
@@ -284,9 +286,13 @@ pub async fn memory_worker(
             None => None,
             Some(row) => match take_row(&store, row, &mut taken).await {
                 Some(progress) => Some(Track { row, progress }),
-                // A dropped reply reads as unconfirmed: the row is someone
-                // else's to finish, or already finished.
-                None => continue,
+                None => {
+                    // A dropped reply reads as unconfirmed.
+                    if let (Some(reply), Some(report)) = (reply, replayed.remove(&row)) {
+                        let _ = reply.send(report);
+                    }
+                    continue;
+                }
             },
         };
         let report = process_tracked(
@@ -316,8 +322,14 @@ pub async fn memory_worker(
             let kinds: Vec<&str> = report.redacted.iter().map(|k| k.as_str()).collect();
             log::info!("ingest masked {} (agent={})", kinds.join(", "), evt.agent_id);
         }
-        if let Some(reply) = reply {
-            let _ = reply.send(report);
+        match (reply, outbox) {
+            (Some(reply), _) => {
+                let _ = reply.send(report);
+            }
+            (None, Some(row)) if from_replay => {
+                replayed.insert(row, report);
+            }
+            _ => {}
         }
     }
     log::info!("memory_worker shutting down — channel closed");

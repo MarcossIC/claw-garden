@@ -363,8 +363,9 @@ pub enum SaveOutcome {
     /// masked out before storing; a daemon that predates masking sends none.
     Saved { memories: Vec<SavedMemory>, redacted: Vec<String> },
     /// Accepted but not confirmed; `reason` says why (`"unconfirmed"`,
-    /// `"embedder_loading"`).
-    Queued { reason: Option<String> },
+    /// `"embedder_loading"`, `"already_queued"`), and `operation_id` is what
+    /// it waits under; a daemon that predates the outbox sends none.
+    Queued { reason: Option<String>, operation_id: Option<String> },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -521,6 +522,8 @@ impl DaemonClient {
             memories: Vec<SavedMemory>,
             #[serde(default)]
             redacted: Vec<String>,
+            #[serde(default)]
+            operation_id: Option<String>,
         }
         let resp = self
             .http
@@ -533,7 +536,7 @@ impl DaemonClient {
         let body: Body = Self::read_response(resp).await?;
         Ok(match body.status.as_str() {
             "saved" => SaveOutcome::Saved { memories: body.memories, redacted: body.redacted },
-            _ => SaveOutcome::Queued { reason: body.reason },
+            _ => SaveOutcome::Queued { reason: body.reason, operation_id: body.operation_id },
         })
     }
 

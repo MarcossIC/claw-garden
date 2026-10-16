@@ -621,6 +621,104 @@ async fn a_save_whose_reply_is_dropped_answers_202_unconfirmed() {
     );
 }
 
+// ── The outbox: an accepted save is recorded before the answer ──────────────
+
+/// `(state, content, last_error)` of every outbox row, oldest first.
+async fn outbox(h: &Harness) -> Vec<(String, String, Option<String>)> {
+    h.ctx
+        .runtime
+        .store
+        .conn
+        .call(|c| {
+            let mut stmt = c.prepare("SELECT state, content, last_error FROM ingest_outbox ORDER BY id")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .await
+        .expect("outbox")
+}
+
+#[tokio::test]
+async fn a_save_accepted_while_the_model_loads_is_in_the_outbox_before_the_answer() {
+    let h = Harness::start_without_embedder().await;
+    let (status, body) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a" })).await;
+
+    assert_eq!(status, 202, "{body}");
+    assert!(body["operation_id"].as_str().is_some_and(|id| !id.is_empty()), "{body}");
+    assert_eq!(outbox(&h).await, vec![("pending".into(), CONTENT.into(), None)]);
+}
+
+#[tokio::test]
+async fn an_unconfirmed_save_is_in_the_outbox() {
+    let h = Harness::start_without_worker().await;
+    let (status, body) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a" })).await;
+
+    assert_eq!((status, body["reason"].as_str()), (202, Some("unconfirmed")), "{body}");
+    assert_eq!(outbox(&h).await, vec![("pending".into(), CONTENT.into(), None)]);
+}
+
+#[tokio::test]
+async fn a_save_into_a_full_queue_leaves_no_outbox_row() {
+    let h = Harness::start_loading_with_queue(2).await;
+    for n in 1..=3 {
+        h.post_json("/v1/memories", json!({ "content": format!("save {n}"), "agent_id": "a" })).await;
+    }
+
+    let contents: Vec<String> = outbox(&h).await.into_iter().map(|(_, c, _)| c).collect();
+    assert_eq!(contents, vec!["save 1", "save 2"]);
+}
+
+#[tokio::test]
+async fn a_confirmed_save_leaves_no_outbox_row() {
+    let h = Harness::start().await;
+    let long = (0..600).map(|i| format!("w{i:05}")).collect::<Vec<_>>().join(" ");
+    for content in [CONTENT.to_string(), long] {
+        let (status, body) = h.post_json("/v1/memories", json!({ "content": content, "agent_id": "a" })).await;
+        assert_eq!(status, 201, "{body}");
+    }
+
+    assert!(outbox(&h).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_failure_the_caller_was_told_leaves_no_outbox_row() {
+    let h = Harness::start_with_failing_embedder().await;
+    let (status, body) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a" })).await;
+
+    assert_eq!(status, 500, "{body}");
+    assert!(outbox(&h).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_save_answers_with_an_operation_id() {
+    let h = Harness::start().await;
+    let (_, made_up) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a" })).await;
+    let (status, given) = h
+        .post_json("/v1/memories", json!({ "content": "another fact", "agent_id": "a", "operation_id": "hook-1" }))
+        .await;
+
+    let id = made_up["operation_id"].as_str().expect("an operation id on a 201");
+    assert_eq!((id.len(), id.chars().nth(14)), (36, Some('4')), "a UUID v4: {made_up}");
+    assert_eq!((status, given["operation_id"].as_str()), (201, Some("hook-1")), "{given}");
+    let (status, bad) = h
+        .post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a", "operation_id": "has space" }))
+        .await;
+    assert_eq!(status, 400, "{bad}");
+}
+
+#[tokio::test]
+async fn an_operation_id_sent_twice_keeps_one_row() {
+    let h = Harness::start_loading_with_queue(4).await;
+    let save = || h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a", "operation_id": "op-1" }));
+
+    let (_, first) = save().await;
+    let (status, again) = save().await;
+
+    assert_eq!(first["reason"], "embedder_loading");
+    assert_eq!((status, again["reason"].as_str(), again["operation_id"].as_str()), (202, Some("already_queued"), Some("op-1")));
+    assert_eq!(outbox(&h).await.len(), 1);
+}
+
 #[tokio::test]
 async fn saving_empty_content_is_rejected_before_it_reaches_the_queue() {
     let h = Harness::start().await;
