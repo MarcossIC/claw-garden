@@ -63,10 +63,26 @@ Un arnés descartable, fuera del repo, carga el modelo con `FastEmbedLocal::from
 - **Crece sin cota a la vista.** La memoria privada tras soltar el modelo alterna entre ~55-60 MB y saltos de ~300 MB que siguen a lo comprometido; en la vuelta 40 está en 518 MB y sigue subiendo.
 - **`HeapCompact` no lo arregla**, ni sobre el heap del proceso ni sobre todos los heaps: termina en 506 y 478 MB contra 518, y devuelve 1-2,5 MB como mucho. Con mimalloc como asignador de Rust (una corrida de 30 vueltas), la memoria tras soltar queda plana, pero entre 280 y 430 MB.
 
-Abierto:
+**Lo que crece es el tokenizer.** Mismo arnés, cada variante en un proceso nuevo:
 
-- **El piso del daemon.** El arnés queda en 27 MB tras la primera descarga y el daemon en 287 MB. No se midió el daemon sin el modelo, ni si la lectura con hash y `spawn_blocking` dejan memoria retenida. En Linux, R7 se midió en el arnés del paso 0 y tampoco en el daemon.
-- **Qué asignación de Rust deja el heap así.** Puede ser el tokenizer, que se parsea de un `tokenizer.json` de 16 MB en cada carga, o los buffers de fastembed. Es una inferencia, no una medición.
+| Variante | Privados tras soltar | ¿Crece? |
+|---|---|---|
+| T: sólo el tokenizer, armado como lo arma fastembed, 40 vueltas | 12,5 → 481 MB, con el mismo patrón de saltos | Sí |
+| S: sólo la sesión de ONNX Runtime, con las opciones de clawg, 40 vueltas | 19-25 MB | No |
+| K: el tokenizer se parsea una vez y queda; la sesión se arma y se suelta en cada vuelta, 40 vueltas | 330-384 MB | No |
+| M: mimalloc como asignador de Rust y `mi_collect(true)` tras soltar, 30 vueltas | 117-132 MB | No |
+| E: el camino de recarga del daemon (`ensure_model` con SHA-256 y `spawn_blocking`), 15 vueltas | igual que la carga completa | Sí |
+
+Cada parse del tokenizer son ~1,2 millones de asignaciones chicas, y lo que dejan libre el heap de Windows no lo devuelve. En K el vector es idéntico al de fastembed (diferencia máxima 0,0), aunque la inferencia la arma el arnés: fastembed no deja construir un `TextEmbedding` con un tokenizer ya parseado.
+
+**El piso del daemon es otro tokenizer.** El daemon tiene un tokenizer propio para el chunker y para contar los tokens de las consultas (`resolve_tokenizer_and_chunker`, `crates/clawg-core/src/memory/worker.rs:809`, que carga `load_tokenizer`, `crates/clawg-core/src/memory/model_download.rs:133`), y lo guarda en una `OnceCell` durante toda la vida del proceso. Es otro parse del mismo `tokenizer.json`, aparte del que fastembed arma adentro del modelo. Con el embedder falso, en un home temporal:
+
+| Daemon | Privados |
+|---|---|
+| Sin `tokenizer.json` | 6-9 MB |
+| Sólo con `tokenizer.json` | 262-265 MB |
+
+Los 287 MB tras la primera descarga son ese tokenizer más ~20 MB. R7 pide menos de 300 MB tomando la medición de un arnés que no tiene ese tokenizer: en el daemon, en cualquier plataforma, el piso con el modelo suelto ronda los 265 MB en este build. Con el modelo cargado, el daemon tiene dos parses del mismo tokenizer.
 
 ## Diferencias entre los docs del cambio y el código
 
