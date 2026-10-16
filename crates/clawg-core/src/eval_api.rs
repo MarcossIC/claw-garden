@@ -440,6 +440,15 @@ impl EvalEmbedder {
             .map_err(|e| EvalError::Embed(e.to_string()))
     }
 
+    /// One vector per text, in input order, through the embedder's batch path:
+    /// a real model cuts the texts into the batches production cuts.
+    pub async fn embed_batch(&self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, EvalError> {
+        self.0
+            .embed_batch(texts, role)
+            .await
+            .map_err(|e| EvalError::Embed(e.to_string()))
+    }
+
     pub fn dimensions(&self) -> usize {
         self.0.dimensions()
     }
@@ -976,6 +985,27 @@ mod tests {
             "FakeEmbedder ignores role deterministically; both roles must pass through identically"
         );
         assert_eq!(q.len(), e.dimensions());
+    }
+
+    #[tokio::test]
+    async fn embed_batch_returns_one_vector_per_text_in_input_order() {
+        let e = EvalEmbedder::fake();
+        let texts: Vec<String> = (0..2 * crate::memory::embedder::EMBED_BATCH + 1)
+            .map(|i| format!("text number {i}"))
+            .collect();
+
+        let batch = e.embed_batch(&texts, EmbedRole::Passage).await.unwrap();
+
+        assert_eq!(batch.len(), texts.len());
+        for (text, vector) in texts.iter().zip(&batch) {
+            assert_eq!(vector, &e.embed_with_role(text, EmbedRole::Passage).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn embed_batch_of_nothing_is_nothing() {
+        let e = EvalEmbedder::fake();
+        assert!(e.embed_batch(&[], EmbedRole::Query).await.unwrap().is_empty());
     }
 
     // --- compose_query_context / query_budget_tokens: delegation, not reimplementation ---

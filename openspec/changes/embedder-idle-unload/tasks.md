@@ -40,16 +40,16 @@ La verificación en Windows mostró que D1 no alcanza ([verify](verify.md#result
 
 El test sólo puede usar una puerta que exista antes y después del cambio y no cambie de forma: `eval_api` (feature `eval`) y su `EvalEmbedder::real`, que hoy arma `FastEmbedLocal` y después armará `E5Embedder`. Así el commit del cambio no toca ni el test ni el fixture.
 
-- [ ] `EvalEmbedder::embed_batch` en `crates/clawg-core/src/eval_api.rs` (hoy sólo tiene `embed_with_role`): el lote de 17 y el corte por `EMBED_BATCH` tienen que pasar por el camino de lote. Lo usa el test, así que no es código muerto; test primero (con `FakeEmbedder`: el lote vuelve en el orden de entrada y vacío da vacío).
-- [ ] `crates/clawg-core/tests/e5_golden.rs`, con `required-features = ["eval"]` en un `[[test]]` de `crates/clawg-core/Cargo.toml` (en `cargo test --workspace` la feature la enciende `clawg-eval`; sola, `-p clawg-core --test e5_golden` necesita `--features eval`). El test primero, antes de que exista el fixture:
+- [x] `EvalEmbedder::embed_batch` en `crates/clawg-core/src/eval_api.rs` (hoy sólo tiene `embed_with_role`): el lote de 17 y el corte por `EMBED_BATCH` tienen que pasar por el camino de lote. Lo usa el test, así que no es código muerto; test primero (con `FakeEmbedder`: el lote vuelve en el orden de entrada y vacío da vacío).
+- [x] `crates/clawg-core/tests/e5_golden.rs`, con `required-features = ["eval"]` en un `[[test]]` de `crates/clawg-core/Cargo.toml` (en `cargo test --workspace` la feature la enciende `clawg-eval`; sola, `-p clawg-core --test e5_golden` necesita `--features eval`). El test primero, antes de que exista el fixture:
   - Textos de D5: consultas cortas, español, CJK y emoji, uno de ~2.000 tokens, tres con 509, 510 y 511 tokens de contenido, `<s> </s> <pad> <unk> <mask>` literales, uno vacío y un lote de 17.
   - `#[ignore = "<razón: necesita el modelo real en CLAWG_E5_MODEL_DIR>"]` (el primero del repo: la suite va a decir 1 ignorado, y es éste).
   - Lee `CLAWG_E5_MODEL_DIR`; con `--ignored` y sin la variable, falla (no se salta). Esa falla es el primer rojo.
   - Compara bits si la CPU coincide con la del fixture (arquitectura, AVX2, AVX-512, FMA, con `is_x86_feature_detected!`); si no, diferencia máxima de 1e-6, y el test dice cuál de las dos comparó.
   - La decisión bits/tolerancia es una función pura (`comparison_for(fixture_cpu, this_cpu)`) con su test, sin modelo.
-- [ ] Generar el fixture (`crates/clawg-core/tests/fixtures/e5_golden.json`) con el fastembed de hoy: `CLAWG_BLESS=1 CLAWG_E5_MODEL_DIR=<dir> cargo test -p clawg-core --features eval --test e5_golden -- --ignored`, igual que el contrato del agente (reescribe y falla; se revisa el diff y se corre otra vez sin `CLAWG_BLESS`, en verde). Lleva la huella de la CPU donde se generó (arquitectura, AVX2, AVX-512, FMA) y los vectores como bits de `f32` (`to_bits`).
-- [ ] Hacerlo en una máquina con el modelo. El fixture no se regenera después de este commit: si la sección 8 lo pidiera, el cambio ya no es «los mismos vectores».
-- [ ] `cargo test --workspace` en verde (1 ignorado) y clippy.
+- [x] Generar el fixture (`crates/clawg-core/tests/fixtures/e5_golden.json`) con el fastembed de hoy: `CLAWG_BLESS=1 CLAWG_E5_MODEL_DIR=<dir> cargo test -p clawg-core --features eval --test e5_golden -- --ignored`, igual que el contrato del agente (reescribe y falla; se revisa el diff y se corre otra vez sin `CLAWG_BLESS`, en verde). Lleva la huella de la CPU donde se generó (arquitectura, AVX2, AVX-512, FMA) y los vectores como bits de `f32` (`to_bits`).
+- [x] Hacerlo en una máquina con el modelo. El fixture no se regenera después de este commit: si la sección 8 lo pidiera, el cambio ya no es «los mismos vectores».
+- [x] `cargo test --workspace` en verde (1 ignorado) y clippy.
 - Commit: `test(core): pin the vectors of the embedding model in a golden fixture`
 
 ## 7. Un solo dueño del tokenizer, lado del worker (R8, D5 «Un dueño del tokenizer»)

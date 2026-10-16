@@ -60,6 +60,10 @@ tokenizers.workspace = true
 ignore.workspace = true
 regex.workspace = true
 
+[[test]]
+name = "e5_golden"
+required-features = ["eval"]
+
 [dev-dependencies]
 # Enables tokio::time::pause() / advance() and #[tokio::test(start_paused = true)]
 # for time-controlled async tests without real sleeps.
