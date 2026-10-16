@@ -9,7 +9,7 @@ Fuente de verdad de cómo la suite prueba el binario `clawg` mismo: el build de 
 - **Feature `testing`:** la feature de clawg-core que compila los sustitutos de prueba (`crates/clawg-core/Cargo.toml:25`).
 - **Build de test:** un binario compilado con `testing`. Es el que cargo arma para los tests de integración de clawg-cli (`CARGO_BIN_EXE_clawg`, `crates/clawg-cli/tests/binary.rs:23`), porque clawg-cli enciende la feature en sus `[dev-dependencies]` (`crates/clawg-cli/Cargo.toml:68`). `cargo build --release` no compila las dev-dependencies, así que el binario que se entrega no la tiene. Efecto aceptado: después de un `cargo test`, `target/debug/clawg` es un build de test. Sólo lee las variables si están puestas, y como build debug ya está limitado al perfil dev.
 - **Home de prueba:** el valor no vacío de `CLAWG_TEST_HOME` (`TEST_HOME_VAR`, `crates/clawg-core/src/paths.rs:169`).
-- **Embedder de prueba:** el valor de `CLAWG_TEST_EMBEDDER` (`TEST_EMBEDDER_VAR`, `crates/clawg-core/src/memory/bootstrap.rs:259`), `fake` o `stalled` (`TestEmbedder`, `bootstrap.rs:264`).
+- **Embedder de prueba:** el valor de `CLAWG_TEST_EMBEDDER` (`TEST_EMBEDDER_VAR`, `crates/clawg-core/src/memory/bootstrap.rs:260`), `fake` o `stalled` (`TestEmbedder`, `bootstrap.rs:265`).
 
 ## El home de prueba
 
@@ -33,16 +33,16 @@ Se reemplaza el home y no el directorio de datos para que el perfil siga eligien
 
 ## El embedder de prueba
 
-`clawg serve` arma el bootstrap del embedder con `serve_deps` (`bootstrap.rs:318`, llamado en `crates/clawg-cli/src/daemon/serve.rs:91`). En un build de test, según el embedder de prueba:
+`clawg serve` arma el bootstrap del embedder con `serve_deps` (`bootstrap.rs:319`, llamado en `crates/clawg-cli/src/daemon/serve.rs:94`). En un build de test, según el embedder de prueba:
 
 - con `fake`, MUST cargar `FakeEmbedder` sin descargar nada: la «descarga» devuelve archivos vacíos al instante y la carga devuelve el falso, con `model_id` `fake-embedder`;
 - con `stalled`, la descarga MUST NOT terminar nunca, así que el embedder queda en `loading` y cada save responde `202`;
-- sin la variable, o con un valor vacío o de sólo espacios, MUST usar el modelo real (`production_deps`, `bootstrap.rs:231`);
-- con cualquier otro valor, MUST negarse a arrancar con un error que nombra la variable y los valores aceptados (`TestEmbedder::parse`, `bootstrap.rs:273`; `ServeError::Embedder`, `serve.rs:92`). Un typo en un test no puede disparar la descarga de 470 MB.
+- sin la variable, o con un valor vacío o de sólo espacios, MUST usar el modelo real (`production_deps`, `bootstrap.rs:232`);
+- con cualquier otro valor, MUST negarse a arrancar con un error que nombra la variable y los valores aceptados (`TestEmbedder::parse`, `bootstrap.rs:274`; `ServeError::Embedder`, `serve.rs:95`). Un typo en un test no puede disparar la descarga de 470 MB.
 
-Un build sin `testing` MUST usar siempre el modelo real (`serve_deps`, `bootstrap.rs:331`).
+Un build sin `testing` MUST usar siempre el modelo real (`serve_deps`, `bootstrap.rs:332`).
 
-En los dos sustitutos, la verificación del contrato de embedding MUST ser la real: `TestEmbedder::deps` (`bootstrap.rs:286`) usa la de `production_deps`. Un store de prueba registra el contrato de `fake-embedder` y lo verifica al reiniciar, por el mismo camino que recorre el modelo real.
+En los dos sustitutos, la verificación del contrato de embedding MUST ser la real: `TestEmbedder::deps` (`bootstrap.rs:287`) usa la de `production_deps`. Un store de prueba registra el contrato de `fake-embedder` y lo verifica al reiniciar, por el mismo camino que recorre el modelo real.
 
 #### Escenario: fake
 - WHEN el bootstrap corre con `fake`
@@ -108,7 +108,7 @@ El test MUST fallar con `manifiesto:línea` de cada hallazgo. Reconocerlos es la
 
 **Tests:** `a_save_accepted_before_a_hard_kill_is_stored_after_the_restart` (`binary.rs:372`), `a_second_daemon_on_the_same_data_directory_is_refused_and_names_the_first` (`binary.rs:402`), `status_and_stop_follow_the_daemon_process` (`binary.rs:418`), `a_restored_backup_brings_back_its_rows_and_keeps_the_replaced_store` (`binary.rs:454`), `a_bridge_on_real_stdio_answers_initialize_and_the_tools_reach_the_daemon` (`binary.rs:491`), `a_bridge_on_real_stdio_serves_a_host_that_never_initializes` (`binary.rs:515`) y `a_bridge_left_open_reaches_the_daemon_after_a_restart` (`binary.rs:535`).
 
-**Límite conocido:** el autoarranque del puente no se prueba a través del binario. El daemon que lanza el puente usa el puerto fijo del perfil (`crates/clawg-cli/src/client.rs:895-898`), así que en la máquina del usuario chocaría con su daemon dev. Lo cubren los tests en proceso de `crates/clawg-cli/src/mcp/mod.rs`. Probarlo a través del binario pide antes poder elegir ese puerto, y eso es superficie de producto.
+**Límite conocido:** el autoarranque del puente no se prueba a través del binario. El daemon que lanza el puente usa el puerto fijo del perfil (`crates/clawg-cli/src/client.rs:900-903`), así que en la máquina del usuario chocaría con su daemon dev. Lo cubren los tests en proceso de `crates/clawg-cli/src/mcp/mod.rs`. Probarlo a través del binario pide antes poder elegir ese puerto, y eso es superficie de producto.
 
 ## Ningún hijo sobrevive a su prueba
 

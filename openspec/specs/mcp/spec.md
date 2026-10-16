@@ -107,7 +107,7 @@ Test: `memories_saved_through_initialize_stay_visible_without_it` (`server.rs`).
 
 El puente no se queda con el daemon que encontró al abrir. Cuando una llamada falla porque el daemon cambió (token nuevo, puerto nuevo) o porque su arranque no terminó a tiempo, vuelve a leer `daemon.json` y `token` del directorio de datos y repite la llamada una vez. Nunca lanza un daemon: un `clawg stop` hecho a propósito se respeta. No cambia ninguna herramienta, ni sus argumentos, ni lo que contesta cuando el daemon responde.
 
-**Releer** es sondear el daemon como lo hace `probe_running(base_dir, false)` (`crates/clawg-cli/src/client.rs:968`): leer `daemon.json` y `token` y pedir `/health`. Lo hace `ClientHandle::reresolve` (`crates/clawg-cli/src/mcp/startup.rs:102`). Sin daemon que conteste devuelve `NotRunning` (`client.rs:993`); si el almacén lo tiene otro proceso que no es un daemon, devuelve `StoreHeld`.
+**Releer** es sondear el daemon como lo hace `probe_running(base_dir, false)` (`crates/clawg-cli/src/client.rs:982`): leer `daemon.json` y `token` y pedir `/health`. Lo hace `ClientHandle::reresolve` (`crates/clawg-cli/src/mcp/startup.rs:102`). Sin daemon que conteste devuelve `NotRunning` (`client.rs:1007`); si el almacén lo tiene otro proceso que no es un daemon, devuelve `StoreHeld`.
 
 **Falla que se resuelve releyendo:** `ClientError::Unauthorized` (el daemon contestó 401), `ClientError::NotRunning` (la conexión no se abrió) o `ClientError::StartTimeout` (el arranque no terminó a tiempo). La decisión es la función pura `on_failure` (`startup.rs:39`): da `Next::Reresolve` para esas tres y `Next::Report` para cualquier otra, entre ellas `StoreHeld`, `Spawn`, `Daemon` y `Http`.
 
@@ -126,7 +126,7 @@ El puente no se queda con el daemon que encontró al abrir. Cuando una llamada f
 
 Al encontrar un daemon releyendo, el puente deja en el log su dirección, la versión del daemon y la propia (`startup.rs:109-115`; si `/health` falla en ese momento, sólo la dirección) y MUST NOT cambiar por eso lo que contesta la herramienta. `version_warning` (`crates/clawg-cli/src/memories.rs:332`) no se usa en el puente: aconseja `clawg stop`, y después de una actualización lo viejo es el puente, no el daemon.
 
-Repetir MUST NOT llegar dos veces al handler del daemon: un 401 lo corta `require_bearer` antes del handler (`crates/clawg-cli/src/daemon/api.rs:607-625`), y una conexión rechazada no llegó. Por eso la única llamada del cliente con timeout es `/health` (`crates/clawg-cli/src/client.rs:505`, `HEALTH_TIMEOUT` en `client.rs:44`), y en una herramienta que escribe `NotRunning` sólo significa una conexión que no se abrió. `map_transport` (`client.rs:489`) mapea a `NotRunning` lo que es `is_connect` o `is_timeout`.
+Repetir MUST NOT llegar dos veces al handler del daemon: un 401 lo corta `require_bearer` antes del handler (`crates/clawg-cli/src/daemon/api.rs:641-659`), y una conexión rechazada no llegó. Por eso la única llamada del cliente con timeout es `/health` (`crates/clawg-cli/src/client.rs:517`, `HEALTH_TIMEOUT` en `client.rs:45`), y en una herramienta que escribe `NotRunning` sólo significa una conexión que no se abrió. `map_transport` (`client.rs:501`) mapea a `NotRunning` lo que es `is_connect` o `is_timeout`.
 
 #### Escenario: el daemon se reinició
 - GIVEN un puente contra el daemon A, con su puerto y su token
@@ -152,7 +152,7 @@ Repetir MUST NOT llegar dos veces al handler del daemon: un 401 lo corta `requir
 
 **Tests:** `an_error_the_daemon_answered_reaches_it_once` (`mcp/server.rs`); `only_health_sets_a_timeout` (`client.rs`).
 
-**Arranque que no terminó.** El arranque en segundo plano del puente (`crates/clawg-cli/src/mcp/mod.rs:99-114`) deja su resultado en un `ClientHandle`. `ClientHandle::get` (`startup.rs:75`) espera el resultado el tiempo de la herramienta: si el arranque falló, devuelve su error (`startup.rs:88`), que es `StartTimeout` cuando `start_daemon` se rindió esperando al daemon (`crates/clawg-cli/src/client.rs:1025`); si el arranque sigue sin terminar al vencer la espera, `StartTimeout` (`startup.rs:89` y `startup.rs:92`); si el emisor se soltó sin resolver, `NotRunning` (`startup.rs:91`). La herramienta siguiente relee, como arriba. Si el daemon contesta, se usa y se guarda; si no, se informa el texto de `StartTimeout` (`crates/clawg-cli/src/mcp/server.rs:460-464`), no el de un daemon detenido, porque lo que falló fue el arranque.
+**Arranque que no terminó.** El arranque en segundo plano del puente (`crates/clawg-cli/src/mcp/mod.rs:99-114`) deja su resultado en un `ClientHandle`. `ClientHandle::get` (`startup.rs:75`) espera el resultado el tiempo de la herramienta: si el arranque falló, devuelve su error (`startup.rs:88`), que es `StartTimeout` cuando `start_daemon` se rindió esperando al daemon (`crates/clawg-cli/src/client.rs:1014`); si el arranque sigue sin terminar al vencer la espera, `StartTimeout` (`startup.rs:89` y `startup.rs:92`); si el emisor se soltó sin resolver, `NotRunning` (`startup.rs:91`). La herramienta siguiente relee, como arriba. Si el daemon contesta, se usa y se guarda; si no, se informa el texto de `StartTimeout` (`crates/clawg-cli/src/mcp/server.rs:460-464`), no el de un daemon detenido, porque lo que falló fue el arranque.
 
 #### Escenario: el daemon termina de arrancar después
 - GIVEN un puente cuyo arranque venció
@@ -167,7 +167,7 @@ Repetir MUST NOT llegar dos veces al handler del daemon: un 401 lo corta `requir
 - `Unauthorized` (`server.rs:451-456`): "the clawg daemon rejected the token in its data directory even after re-reading it, so the token file no longer matches the running daemon; restart the daemon (`clawg status` shows its pid) and call again".
 - `StartTimeout` (`server.rs:460-464`): "clawg tried to start its daemon and it is not up; run `clawg status` to see why, or try again if it is still starting".
 
-El texto de `ClientError::Unauthorized` de la CLI (`crates/clawg-cli/src/client.rs:51`) no cambia: los comandos releen los archivos en cada corrida, y para ellos el consejo de borrar el token sí vale.
+El texto de `ClientError::Unauthorized` de la CLI (`crates/clawg-cli/src/client.rs:53`) no cambia: los comandos releen los archivos en cada corrida, y para ellos el consejo de borrar el token sí vale.
 
 #### Escenario: un daemon detenido no se reemplaza por uno lanzado
 - GIVEN un puente cuyo daemon se detuvo y no volvió
@@ -186,7 +186,7 @@ El texto de `ClientError::Unauthorized` de la CLI (`crates/clawg-cli/src/client.
 
 **Test:** `a_project_registration_the_old_daemon_refused_is_sent_to_the_new_one` (`mcp/server.rs`).
 
-**`memory_status`.** `memory_status_impl` (`crates/clawg-cli/src/mcp/server.rs:889`) pasa por `call` como las demás herramientas. Su `/health` no lleva token (`DaemonClient::health`, `client.rs:508`; ruta abierta en `crates/clawg-cli/src/daemon/api.rs:607`), así que después de un reinicio muestra el daemon nuevo.
+**`memory_status`.** `memory_status_impl` (`crates/clawg-cli/src/mcp/server.rs:889`) pasa por `call` como las demás herramientas. Su `/health` no lleva token (`DaemonClient::health`, `client.rs:513`; ruta abierta en `crates/clawg-cli/src/daemon/api.rs:611`), así que después de un reinicio muestra el daemon nuevo.
 
 #### Escenario: `memory_status` después de un reinicio
 - GIVEN un puente contra el daemon A que se detuvo, y el daemon B arrancado
@@ -195,7 +195,7 @@ El texto de `ClientError::Unauthorized` de la CLI (`crates/clawg-cli/src/client.
 
 **Test:** `memory_status_after_a_restart_reports_the_new_daemon` (`mcp/server.rs`).
 
-**Saves que esperan o fallaron.** `memory_status` MUST mostrar el bloque `ingest` del `/health` del daemon (`pending`, `failed`, `oldest_pending_s` y los `problems`, cada uno con su `operation_id` y su causa) porque imprime el `Health` entero como JSON (`format_status`, `crates/clawg-cli/src/mcp/tools.rs:352`; `Health.ingest`, `client.rs:135`). Contra un daemon que no lo trae, o que no contestó a tiempo, el bloque no aparece ([`specs/ingest`](../ingest/spec.md), «Estado del outbox en `/health`»). Es el lugar donde el agente se entera de un save aceptado con un `202` que después falló: los textos de `save_memory` ante un `202` nombran el `operation_id` y dicen que un fallo aparece en `memory_status` ([`specs/ingest`](../ingest/spec.md), «Texto que ve el modelo»). `save_memory` no tiene un argumento `operation_id`, y por eso `agent_contract.json` no cambió con el outbox.
+**Saves que esperan o fallaron.** `memory_status` MUST mostrar el bloque `ingest` del `/health` del daemon (`pending`, `failed`, `oldest_pending_s` y los `problems`, cada uno con su `operation_id` y su causa) porque imprime el `Health` entero como JSON (`format_status`, `crates/clawg-cli/src/mcp/tools.rs:352`; `Health.ingest`, `client.rs:140`). Contra un daemon que no lo trae, o que no contestó a tiempo, el bloque no aparece ([`specs/ingest`](../ingest/spec.md), «Estado del outbox en `/health`»). Es el lugar donde el agente se entera de un save aceptado con un `202` que después falló: los textos de `save_memory` ante un `202` nombran el `operation_id` y dicen que un fallo aparece en `memory_status` ([`specs/ingest`](../ingest/spec.md), «Texto que ve el modelo»). `save_memory` no tiene un argumento `operation_id`, y por eso `agent_contract.json` no cambió con el outbox.
 
 #### Escenario: un save que falló después de contestar
 - GIVEN una fila `failed` en el outbox

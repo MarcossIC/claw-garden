@@ -36,11 +36,11 @@ El corte vive en `clawg-cli` y no en el core: `search_all_memories` devuelve sie
 
 ## Corte relativo en `POST /v1/search`
 
-`POST /v1/search` MUST aceptar el campo opcional `min_relative_score` (`SearchRequest`, `crates/clawg-cli/src/daemon/api.rs:325-337`).
+`POST /v1/search` MUST aceptar el campo opcional `min_relative_score` (`SearchRequest`, `crates/clawg-cli/src/daemon/api.rs:340-350`).
 
 - Ausente: la respuesta MUST traer todos los hits ordenados hasta `limit`, sin corte.
-- Presente con un valor en `[0, 1]`: el daemon MUST devolver sólo los hits que pasan el corte relativo con ese ratio, en el mismo orden (`search`, `api.rs:765`; el corte en `:799-802`).
-- Presente fuera de `[0, 1]`, o no finito: MUST responder `400` sin buscar ni registrar accesos (`check_relative_score`, `api.rs:299`). La validación corre después de comprobar el embedder: sin embedder listo, la respuesta es la de esa condición (`503`).
+- Presente con un valor en `[0, 1]`: el daemon MUST devolver sólo los hits que pasan el corte relativo con ese ratio, en el mismo orden (`search`, `api.rs:877`; el corte en `:799-802`).
+- Presente fuera de `[0, 1]`, o no finito: MUST responder `400` sin buscar ni registrar accesos (`check_relative_score`, `api.rs:308`). La validación corre después de comprobar el embedder: sin embedder listo, la respuesta es la de esa condición (`503`).
 
 #### Escenario: sin campo
 - GIVEN una fila igual a la consulta y tres sin relación
@@ -60,7 +60,7 @@ El corte vive en `clawg-cli` y no en el core: `search_all_memories` devuelve sie
 
 ## `search` registra sólo lo que devuelve
 
-El handler `search` MUST registrar como acceso exactamente los hits contables de la respuesta que envía, después del corte (`api.rs:803`). Un hit cortado, o con score 0, MUST NOT cambiar `access_count` ni `last_accessed_at`.
+El handler `search` MUST registrar como acceso exactamente los hits contables de la respuesta que envía, después del corte (`api.rs:915`). Un hit cortado, o con score 0, MUST NOT cambiar `access_count` ni `last_accessed_at`.
 
 #### Escenario: hit cortado
 - GIVEN una fila A con score alto y una fila B bajo el corte de 0,6 en posición ≥ 2
@@ -92,7 +92,7 @@ El handler `search` MUST registrar como acceso exactamente los hits contables de
 
 ## Cliente HTTP y herramienta `search_memory`
 
-`DaemonClient::search` MUST mandar `min_relative_score = RELEVANCE_RATIO` junto con los campos de `SearchArgs` (`search_request`, `crates/clawg-cli/src/client.rs:382`; uso en `:538`). El puente MUST volver a aplicar el corte al renderizar `search_memory` (`relevant_hits` y `format_search`, `crates/clawg-cli/src/mcp/tools.rs:60` y `:67`). Aplicar el corte dos veces da el mismo resultado, y contra un daemon que ignora el campo el agente ve lo mismo.
+`DaemonClient::search` MUST mandar `min_relative_score = RELEVANCE_RATIO` junto con los campos de `SearchArgs` (`search_request`, `crates/clawg-cli/src/client.rs:403`; uso en `:538`). El puente MUST volver a aplicar el corte al renderizar `search_memory` (`relevant_hits` y `format_search`, `crates/clawg-cli/src/mcp/tools.rs:60` y `:67`). Aplicar el corte dos veces da el mismo resultado, y contra un daemon que ignora el campo el agente ve lo mismo.
 
 #### Escenario: cuerpo del pedido
 - WHEN el cliente arma el cuerpo de una búsqueda
@@ -219,11 +219,11 @@ Ningún código de producción escribe `episodic_trajectory` ni `procedural_skil
 
 ## Hits de otros agentes
 
-La búsqueda y el contexto traen, además de lo propio, las filas de los autores que la política de [`specs/sharing`](../sharing/spec.md) deja leer al llamador: `POST /v1/search` y `POST /v1/context` resuelven el alcance del agente del pedido en cada llamada (`reach`, `api.rs:813`; usos en `api.rs:783` y `:852`). Sobre eso:
+La búsqueda y el contexto traen, además de lo propio, las filas de los autores que la política de [`specs/sharing`](../sharing/spec.md) deja leer al llamador: `POST /v1/search` y `POST /v1/context` resuelven el alcance del agente del pedido en cada llamada (`reach`, `api.rs:925`; usos en `api.rs:895` y `:964`). Sobre eso:
 
-- Cada hit de `POST /v1/search` MUST llevar su autor como `agent_id` (`RankedHit.agent_id`, `search.rs:88`); el cliente lo lee con `#[serde(default)]` y un hit sin autor cuenta como propio (`client.rs:153`).
+- Cada hit de `POST /v1/search` MUST llevar su autor como `agent_id` (`RankedHit.agent_id`, `search.rs:88`); el cliente lo lee con `#[serde(default)]` y un hit sin autor cuenta como propio (`client.rs:165`).
 - El workspace, ACTIVE CONFLICTS, el listado, la síntesis y el detector de contradicciones al guardar MUST seguir viendo sólo lo del agente: sólo los hits de búsqueda llegan a filas ajenas.
-- Un hit ajeno MUST contar como acceso igual que uno propio (`api.rs:803`).
+- Un hit ajeno MUST contar como acceso igual que uno propio (`api.rs:915`).
 
 **Test:** `a_hit_carries_its_author` (`search.rs`), `search_returns_the_author_of_each_hit` y `search_and_context_follow_the_sharing_policy_from_the_next_call` (`crates/clawg-cli/tests/api.rs`), `the_workspace_and_conflicts_stay_own` (`prompt_builder.rs`) y `contradiction_probe_ignores_shared_authors` (`contradiction.rs`).
 
@@ -409,7 +409,7 @@ Con un proyecto indexado ([`specs/project-docs`](../project-docs/spec.md)), `sea
 - Con `lexical_bonus = 0` el ranking es bit a bit el de antes del bono: es la forma de apagarlo sin tocar el canal léxico.
 - Los contadores ya guardados no se reescriben. Los accesos que se contaron de más antes de este comportamiento quedan como estaban.
 - El formato del prompt de `recall_context` no toca la búsqueda: la salida de `search_memory` es la misma, y el orden y los separadores de las secciones (`prompt_builder.rs:21-24`) y `K_FINAL` (`:42`) no dependen de él. El separador `=== ACTIVE CONFLICTS (review needed) ===` lo nombran las instrucciones del servidor y la doc de `resolve_conflict`.
-- Un prompt vacío se entrega como `no context yet` (`format_context`, `crates/clawg-cli/src/mcp/tools.rs:285`), y el aviso de `synthesize` va después del prompt (`format_recall`, `tools.rs:272`), fuera de lo que mide `rag-eval`.
+- Un prompt vacío se entrega como `no context yet` (`format_context`, `crates/clawg-cli/src/mcp/tools.rs:298`), y el aviso de `synthesize` va después del prompt (`format_recall`, `tools.rs:285`), fuera de lo que mide `rag-eval`.
 - Armar el prompt no escribe: `fetch_active_conflicts` es un `SELECT`, y el archivo del workspace no cambia.
 
 ## Fuera de esta spec
