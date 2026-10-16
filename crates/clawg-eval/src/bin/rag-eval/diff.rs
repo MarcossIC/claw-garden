@@ -12,6 +12,8 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use crate::agent_view::CaseView;
+use crate::golden::CaseStatus;
 use crate::report::CaseResult;
 use crate::stats::{paired_bootstrap_ci, Interval, BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED};
 
@@ -71,12 +73,25 @@ pub struct BlockDiff {
     pub ndcg_10: MetricDiff,
 }
 
+/// What the agent received, case by case, from two `--agent-view` runs.
+/// Fewer tokens counts as better; the interval of a token row is still the
+/// raw change, second run minus first.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct AgentViewDiff {
+    pub search_found: MetricDiff,
+    pub context_found: MetricDiff,
+    pub search_tokens: MetricDiff,
+    pub context_tokens: MetricDiff,
+}
+
 /// The whole paired diff: `retrieval` and `similarity`, computed the same
 /// way but never combined — see the module doc comment for why.
+/// `agent_view` is there only when both files measured it.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct RunDiff {
     pub retrieval: BlockDiff,
     pub similarity: BlockDiff,
+    pub agent_view: Option<AgentViewDiff>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -133,6 +148,18 @@ fn per_case(value: &Value, path: &Path, block: &'static str) -> Result<Vec<CaseR
     }
 }
 
+/// `value.agent_view.per_case`, or `None` when the run did not measure what
+/// the agent receives. Same rule as [`per_case`] otherwise: present but
+/// malformed is an error.
+fn agent_view_cases(value: &Value, path: &Path) -> Result<Option<Vec<CaseView>>, DiffError> {
+    match value.pointer("/agent_view/per_case") {
+        None => Ok(None),
+        Some(cases) => serde_json::from_value(cases.clone())
+            .map(Some)
+            .map_err(|e| DiffError::Cases { path: path.to_path_buf(), block: "agent_view", source: e }),
+    }
+}
+
 /// The pure join-and-diff: two already-parsed results values, diffed on
 /// `retrieval.per_case` and `similarity.per_case` independently. `a_path`/
 /// `b_path` are used only to label a [`DiffError::Cases`] with which file was
@@ -143,10 +170,42 @@ pub fn diff_values(a: &Value, a_path: &Path, b: &Value, b_path: &Path) -> Result
     let a_similarity = per_case(a, a_path, "similarity")?;
     let b_similarity = per_case(b, b_path, "similarity")?;
 
+    let agent_view = match (agent_view_cases(a, a_path)?, agent_view_cases(b, b_path)?) {
+        (Some(a_cases), Some(b_cases)) => Some(diff_agent_view(&a_cases, &b_cases)),
+        _ => None,
+    };
+
     Ok(RunDiff {
         retrieval: diff_block(&a_retrieval, &b_retrieval),
         similarity: diff_block(&a_similarity, &b_similarity),
+        agent_view,
     })
+}
+
+/// Joins the active cases of two agent-view runs on `query`. `known_red`
+/// cases are left out for the same reason the summaries leave them out: they
+/// expect rows the search structurally cannot return.
+fn diff_agent_view(a: &[CaseView], b: &[CaseView]) -> AgentViewDiff {
+    let b_by_query: HashMap<&str, &CaseView> =
+        b.iter().filter(|c| c.status == CaseStatus::Active).map(|c| (c.query.as_str(), c)).collect();
+    let mut diff = AgentViewDiff::default();
+    let mut search_tokens = Vec::new();
+    let mut context_tokens = Vec::new();
+    for a_case in a.iter().filter(|c| c.status == CaseStatus::Active) {
+        let Some(b_case) = b_by_query.get(a_case.query.as_str()) else { continue };
+        let found = |f: bool| if f { 1.0 } else { 0.0 };
+        accumulate(&mut diff.search_found, found(a_case.search.found), found(b_case.search.found));
+        accumulate(&mut diff.context_found, found(a_case.context.found), found(b_case.context.found));
+        let (a_s, b_s) = (a_case.search.tokens as f64, b_case.search.tokens as f64);
+        let (a_c, b_c) = (a_case.context.tokens as f64, b_case.context.tokens as f64);
+        accumulate(&mut diff.search_tokens, -a_s, -b_s);
+        accumulate(&mut diff.context_tokens, -a_c, -b_c);
+        search_tokens.push(b_s - a_s);
+        context_tokens.push(b_c - a_c);
+    }
+    diff.search_tokens.ci = Some(bootstrap(&search_tokens));
+    diff.context_tokens.ci = Some(bootstrap(&context_tokens));
+    diff
 }
 
 /// Joins `a` and `b` on `query` and diffs each of the five metrics over the
@@ -203,13 +262,24 @@ pub fn print_stdout(diff: &RunDiff) {
     println!("rag-eval diff");
     print_block("retrieval", &diff.retrieval);
     print_block("similarity", &diff.similarity);
+    if let Some(av) = &diff.agent_view {
+        println!("  agent_view (fewer tokens is better; the mean is second run minus first):");
+        println!("    metric          better  worse     net       p");
+        print_metric("search.found", &av.search_found);
+        print_metric("context.found", &av.context_found);
+        print_metric("search.tokens", &av.search_tokens);
+        print_metric("context.tokens", &av.context_tokens);
+    }
     println!("  primary:");
     println!("    {}", verdict("retrieval recall@5", &diff.retrieval.recall_5));
+    if let Some(av) = &diff.agent_view {
+        println!("    {}", verdict("agent_view search.found", &av.search_found));
+    }
 }
 
 fn print_block(name: &str, block: &BlockDiff) {
     println!("  {name}:");
-    println!("    metric      better  worse     net       p");
+    println!("    metric          better  worse     net       p");
     print_metric("recall@1", &block.recall_1);
     print_metric("recall@5", &block.recall_5);
     print_metric("recall@10", &block.recall_10);
@@ -222,7 +292,7 @@ fn print_metric(name: &str, m: &MetricDiff) {
         .ci
         .map(|c| format!("  mean {:+.4} [{:+.4}, {:+.4}]", c.mean, c.lo, c.hi))
         .unwrap_or_default();
-    println!("    {:<10}  {:>6}  {:>5}  {:>6}  {:>6.4}{ci}", name, m.better, m.worse, m.net, m.p_value());
+    println!("    {:<14}  {:>6}  {:>5}  {:>6}  {:>6.4}{ci}", name, m.better, m.worse, m.net, m.p_value());
 }
 
 #[cfg(test)]
@@ -314,6 +384,69 @@ mod tests {
         assert!((ci.mean - 0.25).abs() < 1e-9, "{ci:?}");
         assert!(ci.lo <= ci.mean && ci.mean <= ci.hi, "{ci:?}");
         assert_eq!(diff.retrieval.recall_5.ci, None, "a recall carries no interval");
+    }
+
+    fn view(query: &str, status: &str, search_found: bool, search_tokens: usize, context_found: bool) -> Value {
+        serde_json::json!({
+            "query": query, "expected_refs": ["c1"], "status": status, "ambiguous_refs": [],
+            "search": { "found": search_found, "found_refs": [], "rank": null, "tokens": search_tokens,
+                        "latency_ms": 1.0, "truncated": false },
+            "context": { "found": context_found, "found_refs": [], "tokens": 300, "latency_ms": 1.0 },
+        })
+    }
+
+    fn agent_view_file(cases: Vec<Value>) -> Value {
+        serde_json::json!({ "retrieval": { "per_case": [] }, "agent_view": { "per_case": cases } })
+    }
+
+    #[test]
+    fn a_found_flip_in_agent_view_shows_up() {
+        let a = agent_view_file(vec![view("q1", "active", false, 100, true), view("q2", "active", true, 100, true)]);
+        let b = agent_view_file(vec![view("q1", "active", true, 100, true), view("q2", "active", true, 100, true)]);
+        let path = reference_results_path();
+
+        let diff = diff_values(&a, &path, &b, &path).expect("diffing must succeed");
+
+        let av = diff.agent_view.expect("both files measured the agent view");
+        assert_eq!((av.search_found.better, av.search_found.worse), (1, 0));
+        assert_eq!((av.context_found.better, av.context_found.worse), (0, 0));
+        assert_block_is_a_no_op(&diff.retrieval, "retrieval");
+    }
+
+    #[test]
+    fn fewer_tokens_count_as_better() {
+        let a = agent_view_file(vec![view("q1", "active", true, 100, true)]);
+        let b = agent_view_file(vec![view("q1", "active", true, 80, true)]);
+        let path = reference_results_path();
+
+        let av = diff_values(&a, &path, &b, &path).expect("diffing must succeed").agent_view.expect("block");
+
+        assert_eq!((av.search_tokens.better, av.search_tokens.worse), (1, 0));
+        let ci = av.search_tokens.ci.expect("tokens carry an interval");
+        assert_eq!(ci.mean, -20.0, "the interval is the raw change: {ci:?}");
+    }
+
+    #[test]
+    fn agent_view_joins_on_query_and_skips_known_red() {
+        let a = agent_view_file(vec![view("q1", "known_red", false, 100, false), view("only a", "active", false, 1, false)]);
+        let b = agent_view_file(vec![view("q1", "known_red", true, 100, true), view("only b", "active", true, 1, true)]);
+        let path = reference_results_path();
+
+        let av = diff_values(&a, &path, &b, &path).expect("diffing must succeed").agent_view.expect("block");
+
+        assert_eq!(av.search_found, MetricDiff { ci: None, ..MetricDiff::default() });
+        assert_eq!((av.context_found.better, av.context_found.worse), (0, 0));
+    }
+
+    #[test]
+    fn a_file_without_agent_view_diffs_without_the_block() {
+        let a = reference_value();
+        let b = agent_view_file(vec![view("q1", "active", true, 100, true)]);
+        let path = reference_results_path();
+
+        let diff = diff_values(&a, &path, &b, &path).expect("an older file must still diff");
+        assert_eq!(diff.agent_view, None);
+        assert_eq!(diff_values(&a, &path, &a, &path).expect("self-diff").agent_view, None);
     }
 
     #[test]
