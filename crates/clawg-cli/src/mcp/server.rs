@@ -432,8 +432,20 @@ impl ClawgMcp {
     /// because the model's next move is the same either way.
     fn explain(err: &ClientError) -> String {
         match err {
+            // Reached only after the daemon's files were read again, so the
+            // daemon is truly gone, and this bridge does not bring it back
+            // (see `ClientHandle::reresolve`).
             ClientError::NotRunning => {
-                "no clawg daemon is running; start one with `clawg serve` and try again"
+                "the clawg daemon is not running (it may have been stopped or updated); start it \
+                 with `clawg serve`, or reconnect clawg in your MCP client, then call again"
+                    .to_string()
+            }
+            // Also only after a fresh read: the client's own text, which says
+            // to delete the token, would not give this bridge a valid one.
+            ClientError::Unauthorized => {
+                "the clawg daemon rejected the token in its data directory even after re-reading it, \
+                 so the token file no longer matches the running daemon; restart the daemon \
+                 (`clawg status` shows its pid) and call again"
                     .to_string()
             }
             // Starting it was tried, so `clawg serve` is not the advice: the
@@ -2818,5 +2830,32 @@ mod tests {
         let _late = Published::start(data.path(), "late-token").await;
         let status = b.memory_status_impl(("agent".into(), AgentSource::Flag)).await.unwrap();
         assert!(!is_error(&status), "{}", text(&status));
+    }
+
+    #[tokio::test]
+    async fn a_daemon_stopped_mid_session_is_reported_without_starting_one() {
+        let data = tempfile::tempdir().expect("tempdir");
+        let a = Published::start(data.path(), "token-of-a").await;
+        let b = bridge_from(data.path());
+        a.stop().await;
+
+        let saved = b.save_memory_impl("agent", save_args("nobody hears this")).await.unwrap();
+        assert!(is_error(&saved));
+        let t = text(&saved);
+        assert!(t.contains("may have been stopped or updated") && t.contains("clawg serve"), "{t}");
+        let left = DaemonClient::from_data_dir(data.path()).expect("files");
+        assert!(left.health().await.is_err(), "no daemon was started");
+    }
+
+    #[tokio::test]
+    async fn the_refused_token_text_does_not_say_to_delete_it() {
+        let data = tempfile::tempdir().expect("tempdir");
+        let (app, _hits) = counting_stub(axum::http::StatusCode::UNAUTHORIZED);
+        let _stub = Published::serve(data.path(), "any", app).await;
+        let b = bridge_from(data.path());
+
+        let t = text(&b.list_memories_impl("agent", list_all()).await.unwrap());
+        assert!(!t.contains("delete the token file"), "{t}");
+        assert!(t.contains("even after re-reading it"), "{t}");
     }
 }
