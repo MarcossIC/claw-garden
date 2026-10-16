@@ -1275,36 +1275,6 @@ mod tests {
 
     // ── Worker contradiction hook: disputed_against set on match, left None otherwise ──
 
-    /// Helper: insert a memory row with a given embedding directly into the store.
-    /// Uses tier=3, status='active' so it is visible to search.
-    async fn insert_row_with_embedding(store: &MemoryStore, agent_id: &str, embedding: &[f32]) -> i64 {
-        let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let agent = agent_id.to_string();
-        store
-            .conn
-            .call(move |c| -> Result<i64, rusqlite::Error> {
-                let tx = c.transaction()?;
-                tx.execute(
-                    "INSERT INTO memory \
-                     (scope, agent_id, content, memory_type, source, \
-                      created_at, created_by_type, created_by_ref, \
-                      last_modified_at, last_accessed_at, importance, tier, status) \
-                     VALUES ('agent', ?1, 'pre content', 'chat_message', 'chat', \
-                      0, 'user', ?1, 0, 0, 5.0, 3, 'active')",
-                    rusqlite::params![agent],
-                )?;
-                let id = tx.last_insert_rowid();
-                tx.execute(
-                    "INSERT INTO memory_vectors(rowid, embedding) VALUES (?, ?)",
-                    rusqlite::params![id, bytes],
-                )?;
-                tx.commit()?;
-                Ok(id)
-            })
-            .await
-            .unwrap()
-    }
-
     /// Two identical-content events must REINFORCE, not dispute: the
     /// write-border dedup gate hashes the second chunk, finds the first row
     /// by `(agent_id, project_id, content_hash)`, and increments its
