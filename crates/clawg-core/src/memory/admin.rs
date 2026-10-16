@@ -2334,7 +2334,7 @@ mod tests {
                       update_count, last_accessed_at, dispute_count, disputed_against, \
                       last_disputed_at, status) \
                      VALUES ('agent', 'a1', 'body', 'observation', 'explicit', 'sess-9', \
-                             10, 'user', 'marco', 20, 3, 30, 2, '[7,8]', 40, 'disputed')",
+                             10, 'user', 'someone', 20, 3, 30, 2, '[7,8]', 40, 'disputed')",
                     [],
                 )
             })
@@ -2348,7 +2348,7 @@ mod tests {
         assert_eq!(row.source.as_deref(), Some("explicit"));
         assert_eq!(row.source_session_id.as_deref(), Some("sess-9"));
         assert_eq!(row.created_by_type.as_deref(), Some("user"));
-        assert_eq!(row.created_by_ref.as_deref(), Some("marco"));
+        assert_eq!(row.created_by_ref.as_deref(), Some("someone"));
         assert_eq!(row.last_modified_at, Some(20));
         assert_eq!(row.update_count, Some(3));
         assert_eq!(row.dispute_count, Some(2));

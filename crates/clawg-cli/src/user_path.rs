@@ -167,7 +167,7 @@ pub mod registry {
 mod tests {
     use super::*;
 
-    const DIR: &str = r"C:\Users\marco\AppData\Local\Claw Garden";
+    const DIR: &str = r"C:\Users\dev\AppData\Local\Claw Garden";
 
     // ── with_entry ──────────────────────────────────────────────────────────
 
@@ -180,7 +180,7 @@ mod tests {
     fn the_directory_is_appended_after_a_separator() {
         assert_eq!(
             with_entry(r"%USERPROFILE%\bin;C:\tools", DIR).as_deref(),
-            Some(r"%USERPROFILE%\bin;C:\tools;C:\Users\marco\AppData\Local\Claw Garden")
+            Some(r"%USERPROFILE%\bin;C:\tools;C:\Users\dev\AppData\Local\Claw Garden")
         );
     }
 
@@ -188,14 +188,14 @@ mod tests {
     fn a_trailing_separator_is_not_doubled() {
         assert_eq!(
             with_entry(r"C:\tools;", DIR).as_deref(),
-            Some(r"C:\tools;C:\Users\marco\AppData\Local\Claw Garden")
+            Some(r"C:\tools;C:\Users\dev\AppData\Local\Claw Garden")
         );
     }
 
     #[test]
     fn an_equivalent_entry_is_not_added_twice() {
         // Windows paths ignore case, a trailing backslash and surrounding quotes.
-        let path = r#"C:\tools;"c:\users\MARCO\appdata\local\claw garden\""#;
+        let path = r#"C:\tools;"c:\users\DEV\appdata\local\claw garden\""#;
         assert_eq!(with_entry(path, DIR), None);
     }
 
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn removing_keeps_every_other_entry_untouched() {
-        let path = r"%USERPROFILE%\bin;c:\users\marco\appdata\local\claw garden\;D:\x y";
+        let path = r"%USERPROFILE%\bin;c:\users\dev\appdata\local\claw garden\;D:\x y";
         assert_eq!(
             without_entry(path, DIR).as_deref(),
             Some(r"%USERPROFILE%\bin;D:\x y")
