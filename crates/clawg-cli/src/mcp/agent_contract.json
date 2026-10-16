@@ -307,7 +307,7 @@
           },
           "project_path": {
             "default": null,
-            "description": "Absolute path of the project. Defaults to the directory this bridge was\nstarted in.",
+            "description": "Absolute path of the project. Defaults to the directory this bridge was\nstarted in. Another project's files are searched only once the user\nhas added it with `clawg projects add`.",
             "type": [
               "string",
               "null"

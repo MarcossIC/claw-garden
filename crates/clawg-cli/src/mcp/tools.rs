@@ -326,6 +326,14 @@ pub fn resolve_project(
     }
 }
 
+/// Whether registering `project` lets the daemon read its files: only when it
+/// is the root the bridge was started in, the one project the user opened.
+/// Any other root the model names is a label for memories until the user adds
+/// it. Roots are compared, not ids, because two roots that collide share one.
+pub fn indexes_docs(project: &ProjectIdentity, bridge: Option<&ProjectIdentity>) -> bool {
+    bridge.is_some_and(|own| own.root == project.root)
+}
+
 /// The `memory_status` line on whose memories `reader` reads besides its own.
 pub fn format_sharing(policy: &Result<SharingPolicy, SharingError>, reader: &str) -> String {
     match policy {
@@ -755,6 +763,17 @@ mod tests {
 
     fn identity(id: &str) -> ProjectIdentity {
         ProjectIdentity { id: id.into(), root: format!("/{id}").into(), legacy_id: id.into() }
+    }
+
+    #[test]
+    fn only_the_bridges_own_root_is_indexed() {
+        let own = identity("repo-1a2b");
+        assert!(indexes_docs(&own, Some(&own)));
+        assert!(!indexes_docs(&identity("other-3c4d"), Some(&own)));
+        assert!(!indexes_docs(&own, None), "a bridge with no project of its own indexes nothing");
+        // Two roots that collide share an id; only the root says which is the bridge's.
+        let twin = ProjectIdentity { root: "/elsewhere/repo-1a2b".into(), ..own.clone() };
+        assert!(!indexes_docs(&twin, Some(&own)));
     }
 
     // ── format_status ───────────────────────────────────────────────────────
