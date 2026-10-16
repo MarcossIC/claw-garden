@@ -83,6 +83,12 @@ pub struct CaseResult {
     /// still reads back in `--diff`.
     #[serde(default)]
     pub subset: CaseSubset,
+    /// Only on `unanswerable` cases: the search returned nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abstained: Option<bool>,
+    /// Only on `update` cases: the newer row came before every stale one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_first: Option<bool>,
 }
 
 /// Retrieval quality restricted to the cases of one language. The embedding
@@ -95,6 +101,7 @@ pub struct LangAggregate {
     pub lang: String,
     pub n_cases: usize,
     pub aggregate: Aggregate,
+    pub hits: Hits,
 }
 
 /// Retrieval quality restricted to the cases of one subset. The language split
@@ -105,11 +112,74 @@ pub struct SubsetAggregate {
     pub subset: CaseSubset,
     pub n_cases: usize,
     pub aggregate: Aggregate,
+    pub hits: Hits,
+}
+
+/// Which part of the golden set a case belongs to: the cases constants are
+/// chosen on, or the ones the chosen value is reported on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Split {
+    Calibration,
+    Test,
+}
+
+impl Split {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Calibration => "calibration",
+            Self::Test => "test",
+        }
+    }
+}
+
+/// Out of every 10 buckets of the query hash, how many calibrate.
+const CALIBRATION_BUCKETS: u64 = 7;
+
+/// A case's partition, from the first 8 bytes of the sha256 of its query.
+/// Needs no seed and reads no other case, so adding cases never moves one
+/// that is already there to the other side.
+pub fn split_of(query: &str) -> Split {
+    let hex = clawg_core::eval_api::sha256_hex(query.as_bytes());
+    let head = u64::from_str_radix(&hex[..16], 16).expect("sha256_hex is lowercase hex");
+    if head % 10 < CALIBRATION_BUCKETS {
+        Split::Calibration
+    } else {
+        Split::Test
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SplitAggregate {
+    pub split: Split,
+    pub n_cases: usize,
+    pub aggregate: Aggregate,
+    pub hits: Hits,
+}
+
+/// Aggregates each partition present on its own cases, calibration first.
+pub fn aggregate_by_split(cases: &[CaseResult]) -> Vec<SplitAggregate> {
+    [Split::Calibration, Split::Test]
+        .into_iter()
+        .filter_map(|split| {
+            let group: Vec<CaseResult> = cases.iter().filter(|c| split_of(&c.query) == split).cloned().collect();
+            (!group.is_empty()).then(|| SplitAggregate {
+                split,
+                n_cases: group.len(),
+                aggregate: aggregate(&group),
+                hits: hits(&group),
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RetrievalResults {
     pub aggregate: Aggregate,
+    /// How many cases found every expected row (strict) and at least one
+    /// (partial) in the top 1, 5 and 10, with their Wilson intervals: the
+    /// fractional recall in `aggregate` cannot say how many cases it is made of.
+    pub hits: Hits,
     /// Per-language split of `aggregate`, over the same active cases. Cases
     /// with no unanimous language are absent here but present in `aggregate`,
     /// so these sub-counts need not sum to `per_case.len()`.
@@ -117,11 +187,26 @@ pub struct RetrievalResults {
     /// Per-subset split of `aggregate`, over the same active cases. Only the
     /// subsets present appear; the counts sum to the number of active cases.
     pub by_subset: Vec<SubsetAggregate>,
+    /// Per-partition split of `aggregate`: a new constant is chosen reading
+    /// `calibration` and reported from `test`, so the number quoted is not
+    /// the one the choice was fitted to.
+    pub by_split: Vec<SplitAggregate>,
     pub per_case: Vec<CaseResult>,
     /// `known_red` cases: scored and recorded, but never folded into
     /// `aggregate` — a structural impossibility (a row seeded at a tier the
     /// KNN pool never scans) must not be misread as a ranking regression.
     pub blocked: Vec<CaseResult>,
+    /// `unanswerable` cases, kept apart like `blocked`: with nothing to find,
+    /// a ranked metric could only count them as misses.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unanswerable: Vec<CaseResult>,
+    /// Share of `unanswerable` cases whose search returned nothing. Absent
+    /// when the set has none, so no file reads as having measured it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abstention: Option<Rate>,
+    /// Share of `update` cases whose newer row came first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<Rate>,
 }
 
 /// The threshold sweep restricted to the pairs of one language. A distance
@@ -168,6 +253,9 @@ pub struct GoldenSetProvenance {
     /// an eyeballed guess: two results files with different hashes here were
     /// never comparable, whether or not anything else about them looks alike.
     pub content_sha256: String,
+    /// Fewest cases that must move one way, none the other, for a paired
+    /// comparison of two runs on this set to reach p < 0.05.
+    pub min_one_way_cases: usize,
 }
 
 /// Case and pair counts below which a golden set cannot carry a claim. Sized
@@ -188,6 +276,16 @@ impl GoldenSetProvenance {
     /// would ever contradict it. Computing it from the counts means the claim
     /// cannot outlive the condition it describes.
     pub fn derive(n_cases: usize, n_pairs: usize, content_sha256: String) -> Self {
+        let min_one_way_cases = crate::stats::min_one_way_significant();
+        let power = if n_cases == 0 {
+            format!("a paired comparison needs at least {min_one_way_cases} cases moving one way")
+        } else {
+            format!(
+                "a paired comparison needs at least {min_one_way_cases} cases moving one way \
+                 ({:.1} points of {n_cases})",
+                100.0 * min_one_way_cases as f64 / n_cases as f64
+            )
+        };
         let short_on_cases = n_cases < DOMAIN_SET_MIN_CASES;
         let short_on_pairs = n_pairs < DOMAIN_SET_MIN_PAIRS;
         let lacking = match (short_on_cases, short_on_pairs) {
@@ -198,9 +296,10 @@ impl GoldenSetProvenance {
                     provisional: false,
                     note: format!(
                         "domain golden set: {n_cases} retrieval cases, \
-                         {n_pairs} contradiction pairs"
+                         {n_pairs} contradiction pairs; {power}"
                     ),
                     content_sha256,
+                    min_one_way_cases,
                 }
             }
             (true, true) => format!(
@@ -218,9 +317,10 @@ impl GoldenSetProvenance {
             provisional: true,
             note: format!(
                 "{lacking}; a later run against a fuller golden set will move every metric \
-                 for reasons that have nothing to do with retrieval quality"
+                 for reasons that have nothing to do with retrieval quality; {power}"
             ),
             content_sha256,
+            min_one_way_cases,
         }
     }
 }
@@ -327,6 +427,76 @@ pub struct RunResults {
     pub agent_view: Option<crate::agent_view::AgentViewResults>,
 }
 
+impl RetrievalResults {
+    /// Scores the active cases and keeps the blocked ones beside them, every
+    /// split computed from the same `per_case`.
+    pub fn from_cases(per_case: Vec<CaseResult>, blocked: Vec<CaseResult>, unanswerable: Vec<CaseResult>) -> Self {
+        let abstention = (!unanswerable.is_empty()).then(|| {
+            Rate::of(unanswerable.iter().filter(|c| c.abstained == Some(true)).count(), unanswerable.len())
+        });
+        let fresh: Vec<bool> = per_case.iter().filter_map(|c| c.fresh_first).collect();
+        let freshness =
+            (!fresh.is_empty()).then(|| Rate::of(fresh.iter().filter(|f| **f).count(), fresh.len()));
+        Self {
+            aggregate: aggregate(&per_case),
+            hits: hits(&per_case),
+            by_lang: aggregate_by_lang(&per_case),
+            by_subset: aggregate_by_subset(&per_case),
+            by_split: aggregate_by_split(&per_case),
+            per_case,
+            blocked,
+            unanswerable,
+            abstention,
+            freshness,
+        }
+    }
+}
+
+/// A count of cases out of `n_cases` and its 95 % Wilson interval.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct Rate {
+    pub hits: usize,
+    pub n_cases: usize,
+    pub rate: f64,
+    pub lo: f64,
+    pub hi: f64,
+}
+
+impl Rate {
+    pub fn of(hits: usize, n_cases: usize) -> Self {
+        let (lo, hi) = crate::stats::wilson(hits, n_cases);
+        let rate = if n_cases == 0 { 0.0 } else { hits as f64 / n_cases as f64 };
+        Self { hits, n_cases, rate, lo, hi }
+    }
+}
+
+/// Hits at one cutoff. With a single expected row the two are the same; with
+/// several, `partial` is the share that found any of them and `strict` the
+/// share that found all.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize)]
+pub struct Hit {
+    pub strict: Rate,
+    pub partial: Rate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize)]
+pub struct Hits {
+    pub at_1: Hit,
+    pub at_5: Hit,
+    pub at_10: Hit,
+}
+
+/// Counts hits from each case's `recall@k`: the share of its expected rows in
+/// the top k, so 1 means all of them and anything above 0 at least one.
+pub fn hits(cases: &[CaseResult]) -> Hits {
+    let n = cases.len();
+    let at = |recall: fn(&CaseResult) -> f64| Hit {
+        strict: Rate::of(cases.iter().filter(|c| recall(c) >= 1.0).count(), n),
+        partial: Rate::of(cases.iter().filter(|c| recall(c) > 0.0).count(), n),
+    };
+    Hits { at_1: at(|c| c.recall_1), at_5: at(|c| c.recall_5), at_10: at(|c| c.recall_10) }
+}
+
 /// Averages the five per-case metrics across `cases`. Callers decide which
 /// cases belong in the average by choosing what to pass in — this function
 /// has no notion of `known_red`/`active` at all, so a caller that
@@ -375,6 +545,7 @@ pub fn aggregate_by_lang(cases: &[CaseResult]) -> Vec<LangAggregate> {
             lang: lang.to_string(),
             n_cases: group.len(),
             aggregate: aggregate(&group),
+            hits: hits(&group),
         })
         .collect()
 }
@@ -393,8 +564,18 @@ pub fn aggregate_by_subset(cases: &[CaseResult]) -> Vec<SubsetAggregate> {
     }
     grouped
         .into_values()
-        .map(|(subset, group)| SubsetAggregate { subset, n_cases: group.len(), aggregate: aggregate(&group) })
+        .map(|(subset, group)| SubsetAggregate {
+            subset,
+            n_cases: group.len(),
+            aggregate: aggregate(&group),
+            hits: hits(&group),
+        })
         .collect()
+}
+
+fn format_hit(name: &str, hit: &Hit) -> String {
+    let rate = |r: &Rate| format!("{}/{} = {:.4} [{:.3}, {:.3}]", r.hits, r.n_cases, r.rate, r.lo, r.hi);
+    format!("{name} strict {}  partial {}", rate(&hit.strict), rate(&hit.partial))
 }
 
 fn format_subset_table(split: &[SubsetAggregate]) -> String {
@@ -593,6 +774,8 @@ pub fn print_stdout(results: &RunResults) {
     println!("    recall@10 = {:.4}", results.retrieval.aggregate.recall_10);
     println!("    mrr       = {:.4}", results.retrieval.aggregate.mrr);
     println!("    ndcg@10   = {:.4}", results.retrieval.aggregate.ndcg_10);
+    println!("    {}", format_hit("hits@5", &results.retrieval.hits.at_5));
+    println!("  {}", results.golden_set.note);
     if !results.retrieval.by_lang.is_empty() {
         println!("  retrieval by language:");
         println!("    lang    n   recall@1  recall@5  recall@10     mrr   ndcg@10");
@@ -612,6 +795,31 @@ pub fn print_stdout(results: &RunResults) {
     if !results.retrieval.by_subset.is_empty() {
         println!("  retrieval by subset:");
         print!("{}", format_subset_table(&results.retrieval.by_subset));
+    }
+    if !results.retrieval.by_split.is_empty() {
+        println!("  retrieval by split (choose on calibration, report test):");
+        for s in &results.retrieval.by_split {
+            println!(
+                "    {:<11} n={:>3}  recall@5={:.4}  mrr={:.4}  {}",
+                s.split.as_str(),
+                s.n_cases,
+                s.aggregate.recall_5,
+                s.aggregate.mrr,
+                format_hit("hits@5", &s.hits.at_5)
+            );
+        }
+    }
+    if let Some(f) = &results.retrieval.freshness {
+        println!(
+            "  freshness (update cases with the newer row first): {}/{} = {:.4} [{:.3}, {:.3}]",
+            f.hits, f.n_cases, f.rate, f.lo, f.hi
+        );
+    }
+    if let Some(a) = &results.retrieval.abstention {
+        println!(
+            "  abstention (unanswerable cases with an empty result): {}/{} = {:.4} [{:.3}, {:.3}]",
+            a.hits, a.n_cases, a.rate, a.lo, a.hi
+        );
     }
     if !results.retrieval.blocked.is_empty() {
         println!(
@@ -726,11 +934,118 @@ mod tests {
             status,
             lang: None,
             subset: CaseSubset::Natural,
+            abstained: None,
+            fresh_first: None,
         }
     }
 
     fn case_in(query: &str, recall_10: f64, lang: Option<&str>) -> CaseResult {
         CaseResult { lang: lang.map(str::to_string), ..case(query, recall_10, CaseStatus::Active) }
+    }
+
+    fn multi(query: &str, recall_5: f64) -> CaseResult {
+        let mut c = case(query, recall_5, CaseStatus::Active);
+        c.recall_5 = recall_5;
+        c.expected_refs = vec!["a".to_string(), "b".to_string()];
+        c
+    }
+
+    #[test]
+    fn a_case_with_one_of_two_expected_rows_is_a_partial_but_not_a_strict_hit() {
+        let h = hits(&[multi("q", 0.5)]);
+        assert_eq!((h.at_5.strict.hits, h.at_5.partial.hits), (0, 1));
+        assert_eq!(aggregate(&[multi("q", 0.5)]).recall_5, 0.5, "the fractional recall is unchanged");
+    }
+
+    #[test]
+    fn hits_carry_the_wilson_interval_of_their_count() {
+        let cases: Vec<CaseResult> =
+            (0..46).map(|i| multi(&format!("q{i}"), if i < 36 { 1.0 } else { 0.0 })).collect();
+        let r = hits(&cases).at_5.strict;
+        assert_eq!((r.hits, r.n_cases), (36, 46));
+        assert!((r.lo - 0.644).abs() < 0.001 && (r.hi - 0.877).abs() < 0.001, "{r:?}");
+        let lang = &RetrievalResults::from_cases(cases.clone(), vec![], vec![]).by_subset[0];
+        assert_eq!(lang.hits.at_5.strict, r, "every split block carries its own hits");
+    }
+
+    fn queries(range: std::ops::Range<usize>) -> Vec<String> {
+        range.map(|i| format!("where did we put the config number {i}")).collect()
+    }
+
+    #[test]
+    fn split_of_is_stable_when_cases_are_added() {
+        let first: Vec<Split> = queries(0..40).iter().map(|q| split_of(q)).collect();
+        let cases: Vec<CaseResult> =
+            queries(0..60).iter().map(|q| case(q, 1.0, CaseStatus::Active)).collect();
+        let by_split = aggregate_by_split(&cases);
+        assert_eq!(by_split.iter().map(|s| s.n_cases).sum::<usize>(), 60);
+        let again: Vec<Split> = queries(0..40).iter().map(|q| split_of(q)).collect();
+        assert_eq!(first, again);
+    }
+
+    #[test]
+    fn about_seventy_percent_of_queries_calibrate() {
+        let n = queries(0..1000).iter().filter(|q| split_of(q) == Split::Calibration).count();
+        assert!((650..=750).contains(&n), "{n} of 1000 calibrate");
+    }
+
+    #[test]
+    fn aggregate_by_split_scores_each_split_on_its_own_cases() {
+        let cases: Vec<CaseResult> = queries(0..30)
+            .iter()
+            .map(|q| case_of(q, if split_of(q) == Split::Test { 1.0 } else { 0.0 }, CaseSubset::Natural))
+            .collect();
+        let by_split = aggregate_by_split(&cases);
+        assert_eq!(by_split.iter().map(|s| s.split).collect::<Vec<_>>(), vec![Split::Calibration, Split::Test]);
+        assert_eq!(by_split[0].aggregate.recall_5, 0.0);
+        assert_eq!(by_split[1].aggregate.recall_5, 1.0);
+    }
+
+    #[test]
+    fn every_split_block_carries_its_hits() {
+        let cases: Vec<CaseResult> = queries(0..30).iter().map(|q| multi(q, 0.5)).collect();
+        let results = RetrievalResults::from_cases(cases, vec![], vec![]);
+        for s in &results.by_split {
+            assert_eq!(s.hits.at_5.partial.hits, s.n_cases);
+            assert_eq!(s.hits.at_5.strict.hits, 0);
+        }
+        assert_eq!(results.by_subset[0].hits.at_5.partial.hits, 30);
+        assert_eq!(results.hits.at_5.partial.n_cases, 30);
+    }
+
+    #[test]
+    fn freshness_counts_only_update_cases() {
+        let plain = case("q", 1.0, CaseStatus::Active);
+        let results = RetrievalResults::from_cases(vec![plain.clone()], vec![], vec![]);
+        assert_eq!(results.freshness, None);
+        let update = |fresh: bool| CaseResult { fresh_first: Some(fresh), subset: CaseSubset::Update, ..plain.clone() };
+        let results = RetrievalResults::from_cases(vec![plain.clone(), update(true), update(false), update(true)], vec![], vec![]);
+        let f = results.freshness.expect("measured");
+        assert_eq!((f.hits, f.n_cases), (2, 3));
+        assert_eq!(results.per_case.len(), 4, "update cases stay in the ranked metrics");
+    }
+
+    #[test]
+    fn abstention_is_absent_without_unanswerable_cases() {
+        let results = RetrievalResults::from_cases(vec![case("q", 1.0, CaseStatus::Active)], vec![], vec![]);
+        assert_eq!(results.abstention, None);
+        let json = serde_json::to_value(&results).unwrap();
+        assert!(json.get("abstention").is_none() && json.get("unanswerable").is_none(), "{json}");
+
+        let none = CaseResult { abstained: Some(false), subset: CaseSubset::Unanswerable, ..case("u1", 0.0, CaseStatus::Active) };
+        let some = CaseResult { abstained: Some(true), ..none.clone() };
+        let results = RetrievalResults::from_cases(vec![], vec![], vec![none, some]);
+        let a = results.abstention.expect("measured");
+        assert_eq!((a.hits, a.n_cases), (1, 2));
+    }
+
+    #[test]
+    fn the_note_says_how_many_one_way_cases_a_conclusion_needs() {
+        let p = GoldenSetProvenance::derive(46, 28, "h".to_string());
+        assert_eq!(p.min_one_way_cases, 6);
+        assert!(p.note.contains("at least 6 cases moving one way (13.0 points of 46)"), "{}", p.note);
+        assert!(!p.provisional, "the shape check does not change");
+        assert!(GoldenSetProvenance::derive(0, 0, "h".to_string()).note.contains("at least 6 cases"));
     }
 
     #[test]
@@ -923,13 +1238,7 @@ mod tests {
             scoring_config: EvalScoringConfig::default(),
             known_bugs_live: vec!["fake-embedder-unnormalized-contradiction-sweep-degenerate".to_string()],
             golden_set: GoldenSetProvenance::derive(1, 0, "h".to_string()),
-            retrieval: RetrievalResults {
-                aggregate: Aggregate::default(),
-                by_lang: vec![],
-                by_subset: vec![],
-                per_case: vec![],
-                blocked: vec![],
-            },
+            retrieval: RetrievalResults::from_cases(vec![], vec![], vec![]),
             contradiction: ContradictionResults { curve: vec![], by_lang: vec![] },
             norm_check: NormCheck { asserted: false, mean_norm: 11.3, max_deviation: 10.3 },
             audit: None,
@@ -948,6 +1257,7 @@ mod tests {
             search: Default::default(),
             context: Default::default(),
             by_subset: Default::default(),
+            abstention: None,
             per_case: vec![],
         }
     }

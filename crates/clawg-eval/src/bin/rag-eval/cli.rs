@@ -78,6 +78,10 @@ pub struct Cli {
     pub docs: bool,
     /// `--root <dir>`, the project `--docs` indexes.
     pub docs_root: PathBuf,
+    /// `--lexical-only`: rank every case by the lexical channel alone (bm25,
+    /// no vectors), as a floor the full ranking has to beat. Mutually
+    /// exclusive with the other arms and every sweep flag.
+    pub lexical_only: bool,
 }
 
 /// What a parse attempt produces. `--help` is not an error: it takes
@@ -91,7 +95,7 @@ pub struct Cli {
 pub enum ParseOutcome {
     Help,
     Run(Cli),
-    Diff(PathBuf, PathBuf),
+    Diff { a: PathBuf, b: PathBuf, fail_on_regression: bool },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -118,6 +122,10 @@ pub enum CliError {
     DocsWithOtherMode,
     #[error("--root is only meaningful with --docs")]
     RootWithoutDocs,
+    #[error("--lexical-only is mutually exclusive with --agent-view, --follow-up, --docs and the sweep flags (--sweep-imp, --sweep-cos-floor, --sweep-lexical, --fts-tokenizer)")]
+    LexicalOnlyWithOtherMode,
+    #[error("--fail-on-regression is only meaningful with --diff")]
+    FailOnRegressionWithoutDiff,
 }
 
 pub const HELP_TEXT: &str = "\
@@ -161,8 +169,15 @@ OPTIONS:
     --diff <a.json> <b.json>
                          Compare two existing results files' retrieval.per_case and
                          similarity.per_case, joined on query, reporting better/worse/net
-                         per metric per block. Needs neither --fake/--real nor a golden set;
-                         short-circuits like --help.
+                         and the exact paired p-value per metric per block (with a bootstrap
+                         interval of the mean change for mrr and ndcg@10). When both files
+                         come from --agent-view, also search.found, context.found and the
+                         tokens of each tool. Ends with whether each primary metric
+                         (recall@5, search.found) moved distinguishably at p < 0.05. Needs
+                         neither --fake/--real nor a golden set; short-circuits like --help.
+    --fail-on-regression With --diff, on either side of it: exit 6 when a primary metric
+                         (retrieval recall@5, agent_view search.found) gets worse with
+                         p < 0.05. The informative metrics never fail the run.
     --follow-up          Run the synthetic Ceiling/Floor/Treatment arms instead of the
                          normal single-arm pass, measuring whether conversational context
                          helps a content-free follow-up retrieve the right document.
@@ -180,6 +195,11 @@ OPTIONS:
                          Mutually exclusive with --audit, --follow-up, --agent-view and
                          every sweep flag.
     --root <dir>        With --docs: the project to index (default: this workspace)
+    --lexical-only      Rank every case by the lexical channel alone: the same FTS5 match and
+                         bm25 order the full search uses, with no vectors and no scoring. A
+                         floor for the full ranking; writes {date}-{mode}-lexical-only.json,
+                         which --diff compares with any other run. Mutually exclusive with
+                         --agent-view, --follow-up, --docs and every sweep flag.
     --help, -h          Print this message and exit
 
 EXIT CODES:
@@ -189,6 +209,7 @@ EXIT CODES:
     3    --real --check-only and the model is not cached
     4    a results file for this date+config already exists and --force was not given
     5    --audit and the golden set is not fit to measure against
+    6    --diff --fail-on-regression and a primary metric got worse with p < 0.05
 ";
 
 /// Default golden-set path, resolved relative to this crate's own manifest
@@ -246,6 +267,8 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
     let mut agent_view = false;
     let mut docs = false;
     let mut docs_root: Option<PathBuf> = None;
+    let mut fail_on_regression = false;
+    let mut lexical_only = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -253,6 +276,8 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
             "--follow-up" => follow_up = true,
             "--agent-view" => agent_view = true,
             "--docs" => docs = true,
+            "--fail-on-regression" => fail_on_regression = true,
+            "--lexical-only" => lexical_only = true,
             "--root" => {
                 let value = args
                     .next()
@@ -266,7 +291,8 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
                 let b = args
                     .next()
                     .ok_or_else(|| CliError::MissingValue("--diff".to_string()))?;
-                return Ok(ParseOutcome::Diff(PathBuf::from(a), PathBuf::from(b)));
+                let fail_on_regression = fail_on_regression || args.any(|rest| rest == "--fail-on-regression");
+                return Ok(ParseOutcome::Diff { a: PathBuf::from(a), b: PathBuf::from(b), fail_on_regression });
             }
             "--fake" => {
                 if matches!(mode, Some(Mode::Real)) {
@@ -374,6 +400,20 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
     {
         return Err(CliError::DocsWithOtherMode);
     }
+    if lexical_only
+        && (follow_up
+            || agent_view
+            || docs
+            || !sweep_imp.is_empty()
+            || !sweep_cos_floor.is_empty()
+            || !sweep_lexical.is_empty()
+            || fts_tokenizer.is_some())
+    {
+        return Err(CliError::LexicalOnlyWithOtherMode);
+    }
+    if fail_on_regression {
+        return Err(CliError::FailOnRegressionWithoutDiff);
+    }
     if docs_root.is_some() && !docs {
         return Err(CliError::RootWithoutDocs);
     }
@@ -395,6 +435,7 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
         agent_view,
         docs,
         docs_root: docs_root.unwrap_or_else(default_docs_root),
+        lexical_only,
     }))
 }
 
@@ -413,7 +454,7 @@ mod tests {
         match parse(argv(items)).expect("parse must succeed") {
             ParseOutcome::Run(cli) => cli,
             ParseOutcome::Help => panic!("expected Run, got Help"),
-            ParseOutcome::Diff(a, b) => panic!("expected Run, got Diff({a:?}, {b:?})"),
+            ParseOutcome::Diff { a, b, .. } => panic!("expected Run, got Diff({a:?}, {b:?})"),
         }
     }
 
@@ -543,7 +584,7 @@ mod tests {
         // MissingMode, because comparing two results files needs neither.
         assert_eq!(
             parse(argv(&["--diff", "/tmp/a.json", "/tmp/b.json"])).unwrap(),
-            ParseOutcome::Diff(PathBuf::from("/tmp/a.json"), PathBuf::from("/tmp/b.json"))
+            diff_of("/tmp/a.json", "/tmp/b.json", false)
         );
     }
 
@@ -551,8 +592,52 @@ mod tests {
     fn diff_short_circuits_before_a_later_conflict_would_fire() {
         assert_eq!(
             parse(argv(&["--fake", "--diff", "/tmp/a.json", "/tmp/b.json", "--real"])).unwrap(),
-            ParseOutcome::Diff(PathBuf::from("/tmp/a.json"), PathBuf::from("/tmp/b.json"))
+            diff_of("/tmp/a.json", "/tmp/b.json", false)
         );
+    }
+
+    fn diff_of(a: &str, b: &str, fail_on_regression: bool) -> ParseOutcome {
+        ParseOutcome::Diff { a: PathBuf::from(a), b: PathBuf::from(b), fail_on_regression }
+    }
+
+    #[test]
+    fn fail_on_regression_parses_on_either_side_of_diff() {
+        assert_eq!(
+            parse(argv(&["--diff", "/tmp/a.json", "/tmp/b.json", "--fail-on-regression"])).unwrap(),
+            diff_of("/tmp/a.json", "/tmp/b.json", true)
+        );
+        assert_eq!(
+            parse(argv(&["--fail-on-regression", "--diff", "/tmp/a.json", "/tmp/b.json"])).unwrap(),
+            diff_of("/tmp/a.json", "/tmp/b.json", true)
+        );
+    }
+
+    #[test]
+    fn lexical_only_conflicts_with_the_other_arms() {
+        assert!(run_cli(&["--fake", "--lexical-only"]).lexical_only);
+        assert!(!run_cli(&["--fake"]).lexical_only);
+        for other in [
+            &["--agent-view"][..],
+            &["--follow-up"],
+            &["--docs"],
+            &["--sweep-imp", "0.5:1.0"],
+            &["--sweep-cos-floor", "0.8"],
+            &["--sweep-lexical", "0"],
+            &["--fts-tokenizer", "trigram"],
+        ] {
+            let args: Vec<&str> = ["--fake", "--lexical-only"].iter().chain(other).copied().collect();
+            let err = parse(argv(&args)).expect_err("--lexical-only is an arm of its own");
+            assert!(
+                matches!(err, CliError::LexicalOnlyWithOtherMode | CliError::DocsWithOtherMode | CliError::AgentViewWithOtherMode),
+                "{other:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fail_on_regression_without_diff_is_an_error() {
+        let err = parse(argv(&["--fake", "--fail-on-regression"])).expect_err("the flag needs --diff");
+        assert_eq!(err, CliError::FailOnRegressionWithoutDiff);
     }
 
     #[test]

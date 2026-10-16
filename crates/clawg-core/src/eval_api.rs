@@ -36,7 +36,7 @@ use crate::memory::events::{MemoryEvent, MemorySource};
 use crate::memory::model_download;
 use crate::memory::project_docs;
 use crate::memory::score::{ImportanceFactor, ScoringConfig};
-use crate::memory::search::{search_all_memories_with_scoring, SearchScope};
+use crate::memory::search::{lexical_channel_only, search_all_memories_with_scoring, SearchScope};
 use crate::memory::store_insert::{CreatedByType, MemoryType, NewMemoryRecord};
 use crate::memory::store_lock::StoreHolder;
 use crate::memory::worker::{memory_worker, resolve_tokenizer_and_chunker, IngestRequest};
@@ -266,6 +266,8 @@ impl EvalStore {
     /// (`"chat_message"`, `"user_preference"`, …); an unrecognized value is
     /// an error rather than a silent fallback, because a typo'd golden-set
     /// row must not seed a row the tier gate never meant to accept.
+    /// `age_ms` backdates the row from now, so a set can say which of two
+    /// rows is older without pinning a date that ages with the set.
     pub async fn insert(
         &self,
         agent_id: &str,
@@ -273,12 +275,14 @@ impl EvalStore {
         memory_type: &str,
         importance: f64,
         embedding: Vec<f32>,
+        age_ms: u64,
     ) -> Result<i64, EvalError> {
         let memory_type = parse_memory_type(memory_type)?;
         let created_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .saturating_sub(age_ms);
         let record = NewMemoryRecord {
             scope: "agent",
             agent_id: Some(agent_id.to_string()),
@@ -334,6 +338,12 @@ impl EvalStore {
                 distance: h.distance,
             })
             .collect())
+    }
+
+    /// Row ids for `query_text` ranked by the lexical channel alone (bm25 over
+    /// `memory_fts`), never consulting a vector. Empty when no row matches.
+    pub async fn lexical_search(&self, query_text: &str, agent_id: &str, k: usize) -> Vec<i64> {
+        lexical_channel_only(&self.0, query_text, agent_id, k).await
     }
 
     /// Drops and recreates `memory_fts` with a different tokenizer. Eval-only
@@ -790,7 +800,7 @@ mod tests {
 
         for i in 0..30 {
             store
-                .insert(agent, &format!("filler row {i}"), "chat_message", 1.0, on_axis.clone())
+                .insert(agent, &format!("filler row {i}"), "chat_message", 1.0, on_axis.clone(), 0)
                 .await
                 .unwrap();
         }
@@ -801,6 +811,7 @@ mod tests {
                 "chat_message",
                 10.0,
                 off_axis,
+                0,
             )
             .await
             .unwrap();
@@ -895,7 +906,7 @@ mod tests {
         let mut embedding = vec![0.0; 384];
         embedding[0] = 1.0;
         let id = store
-            .insert("agent-1", "unique_token_after_tokenizer_swap", "chat_message", 3.0, embedding)
+            .insert("agent-1", "unique_token_after_tokenizer_swap", "chat_message", 3.0, embedding, 0)
             .await
             .expect("insert must succeed");
 
@@ -1193,5 +1204,48 @@ mod tests {
         assert_eq!(doc_paths(root.path()).unwrap(), ["README.md"]);
         assert!(is_code_path("src/lib.rs") && !is_code_path("README.md"));
         assert_eq!(hits[0], EvalDocHit { path: "README.md".into(), breadcrumb: "README.md > Guía > Uso".into() });
+    }
+
+    #[tokio::test]
+    async fn eval_insert_backdates_created_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EvalStore::open(dir.path()).await.expect("open must succeed");
+        let mut embedding = vec![0.0; 384];
+        embedding[0] = 1.0;
+        const DAY_MS: u64 = 86_400_000;
+        let fresh = store.insert("a", "fresh row", "chat_message", 3.0, embedding.clone(), 0).await.unwrap();
+        let old = store.insert("a", "old row", "chat_message", 3.0, embedding, 30 * DAY_MS).await.unwrap();
+
+        let created = |id: i64| {
+            let store = &store;
+            async move {
+                store
+                    .0
+                    .conn
+                    .call(move |c| c.query_row("SELECT created_at FROM memory WHERE id = ?1", [id], |r| r.get::<_, i64>(0)))
+                    .await
+                    .unwrap()
+            }
+        };
+        let gap = created(fresh).await - created(old).await;
+        assert!((gap - (30 * DAY_MS) as i64).abs() < 60_000, "gap was {gap} ms");
+    }
+
+    #[tokio::test]
+    async fn lexical_search_ranks_by_bm25_without_vectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EvalStore::open(dir.path()).await.expect("open must succeed");
+        let mut query = vec![0.0_f32; 384];
+        query[0] = 1.0;
+        let mut far = vec![0.0_f32; 384];
+        far[1] = 1.0;
+        let word = store.insert("a", "the ferry schedule for zanzibar", "chat_message", 3.0, far, 0).await.unwrap();
+        let near = store.insert("a", "the ferry schedule for the island", "chat_message", 3.0, query.clone(), 0).await.unwrap();
+
+        assert_eq!(store.lexical_search("zanzibar", "a", 10).await, vec![word]);
+        let both = store.lexical_search("ferry schedule", "a", 10).await;
+        assert_eq!(both.len(), 2, "{both:?}");
+        assert!(both.contains(&near));
+        assert!(store.lexical_search("zanzibar", "someone-else", 10).await.is_empty());
     }
 }

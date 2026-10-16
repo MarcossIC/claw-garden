@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| medición | M | — (condiciona a english-recall 21, memory-rank-fusion 34, search-abstention 35, knn-prefilter 37, docs-search-quality 20 y a la medición previa de conflict-candidates 24) | exploración (borrador) |
+| medición | M | — (condiciona a english-recall 21, memory-rank-fusion 34, search-abstention 35, knn-prefilter 37, docs-search-quality 20 y a la medición previa de conflict-candidates 24) | ver [`state.yaml`](state.yaml) |
 
 **Tesis:** las constantes que deciden la calidad de la recuperación (el piso de coseno, `RELEVANCE_RATIO`, el umbral de contradicción) se eligieron barriendo sobre el mismo golden set chico en el que después se reportan, y el arnés no puede decir si una diferencia es real o ruido. Con 46 casos, un caso son 2,2 puntos y las diferencias que se usaron para elegir son de 1 a 3 casos. Antes de que más cambios de ranking (21, 34, 35, 37, 20) se apoyen en esta medición, hay que hacerla confiable: una prueba pareada con intervalo, un `--diff` que vea también lo que el agente recibe, una parte del set que no se use para elegir y casos que hoy el esquema no puede expresar (sin respuesta, versión nueva contra vieja).
 

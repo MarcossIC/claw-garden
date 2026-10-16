@@ -1282,6 +1282,14 @@ pub async fn search_all_memories(
     Ok(hits)
 }
 
+/// The lexical channel on its own: `agent_id`'s rowids best-first by bm25,
+/// with no vector read and nothing scored. A floor to compare the full
+/// ranking against, so it uses the same `MATCH` expression and order.
+#[cfg(feature = "eval")]
+pub(crate) async fn lexical_channel_only(store: &MemoryStore, query_text: &str, agent_id: &str, k: usize) -> Vec<i64> {
+    lexical_candidates(store, query_text, &reach_bind(agent_id, &Reach::Own), None, k).await
+}
+
 /// Same orchestration as [`search_all_memories`], with the scoring config
 /// exposed to the caller instead of pinned to `ScoringConfig::DEFAULT`. Every
 /// production call site keeps using the unparameterized wrapper above — this

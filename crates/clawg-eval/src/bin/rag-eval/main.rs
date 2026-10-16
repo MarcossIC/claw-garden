@@ -9,6 +9,7 @@ mod metrics;
 mod report;
 mod seed;
 mod similarity;
+mod stats;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -41,6 +42,9 @@ const K_POOL: EvalScope = EvalScope { memory: Some(30), episodic: Some(5), proce
 /// change what those two field names mean.
 const K_FINAL: usize = 10;
 
+/// Tag of a `--lexical-only` results file.
+const LEXICAL_ONLY_SLUG: &str = "lexical-only";
+
 const EXIT_OK: i32 = 0;
 const EXIT_RUNTIME_FAILURE: i32 = 1;
 const EXIT_GOLDEN_INVALID: i32 = 2;
@@ -50,6 +54,8 @@ const EXIT_RESULTS_EXISTS: i32 = 4;
 /// claim. Distinct from `EXIT_GOLDEN_INVALID`, which means the file is
 /// structurally broken: this one means the file is well-formed and useless.
 const EXIT_GOLDEN_UNFIT: i32 = 5;
+/// `--diff --fail-on-regression` found a primary metric worse at p < 0.05.
+const EXIT_REGRESSION: i32 = 6;
 
 // Single-threaded runtime: the crate's declared tokio features (sync, macros,
 // time, rt, process, io-util) do not include `rt-multi-thread`, so the
@@ -97,7 +103,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             println!("{}", cli::HELP_TEXT);
             return EXIT_OK;
         }
-        Ok(cli::ParseOutcome::Diff(a, b)) => return run_diff(&a, &b),
+        Ok(cli::ParseOutcome::Diff { a, b, fail_on_regression }) => return run_diff(&a, &b, fail_on_regression),
         Ok(cli::ParseOutcome::Run(cli)) => cli,
         Err(e) => {
             // Not one of the dedicated exit codes (0/2/3/4): a usage
@@ -238,6 +244,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             status: case.status,
             lang: case_lang(&case.expected_refs, &lang_by_ref),
             subset: case.subset,
+            stale_refs: case.stale_refs.clone(),
             embedding,
         });
     }
@@ -251,7 +258,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
     let similarity_results = if cli.mode == cli::Mode::Real {
         let sim_sources: Vec<SimCaseSource> = embedded_cases
             .iter()
-            .filter(|c| c.status != CaseStatus::KnownRed)
+            .filter(|c| c.status != CaseStatus::KnownRed && c.subset != CaseSubset::Unanswerable)
             .map(|c| SimCaseSource {
                 query: c.query.clone(),
                 expected_refs: c.expected_refs.clone(),
@@ -406,23 +413,25 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
 
         let mut per_case = Vec::new();
         let mut blocked = Vec::new();
+        let mut unanswerable = Vec::new();
         for ec in &embedded_cases {
-            let hits = match seeded
-                .store
-                .search(&ec.embedding, seed::AGENT_ID, scope, K_FINAL, point.scoring, Some(&ec.query))
-                .await
-            {
-                Ok(h) => h,
-                Err(e) => {
-                    eprintln!("search failed for query '{}': {e}", ec.query);
-                    return EXIT_RUNTIME_FAILURE;
+            let ids: Vec<i64> = if cli.lexical_only {
+                seeded.store.lexical_search(&ec.query, seed::AGENT_ID, K_FINAL).await
+            } else {
+                match seeded
+                    .store
+                    .search(&ec.embedding, seed::AGENT_ID, scope, K_FINAL, point.scoring, Some(&ec.query))
+                    .await
+                {
+                    Ok(h) => h.iter().map(|h| h.id).collect(),
+                    Err(e) => {
+                        eprintln!("search failed for query '{}': {e}", ec.query);
+                        return EXIT_RUNTIME_FAILURE;
+                    }
                 }
             };
-            let ranked_refs: Vec<String> = hits
-                .iter()
-                .filter_map(|h| seeded.refs.ref_of(h.id))
-                .map(|r| r.to_string())
-                .collect();
+            let ranked_refs: Vec<String> =
+                ids.iter().filter_map(|id| seeded.refs.ref_of(*id)).map(|r| r.to_string()).collect();
             let expected: HashSet<String> = ec.expected_refs.iter().cloned().collect();
 
             let recall_1 = metrics::recall_at_k(&ranked_refs, &expected, 1);
@@ -431,6 +440,9 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             let mrr = metrics::mrr_contribution(&ranked_refs, &expected);
             let ndcg_10 = metrics::ndcg_at_10(&ranked_refs, &expected);
 
+            let abstained = (ec.subset == CaseSubset::Unanswerable).then_some(ranked_refs.is_empty());
+            let fresh_first = (ec.subset == CaseSubset::Update)
+                .then(|| metrics::fresh_first(&ranked_refs, &ec.expected_refs[0], &ec.stale_refs));
             let result = report::CaseResult {
                 query: ec.query.clone(),
                 expected_refs: ec.expected_refs.clone(),
@@ -443,9 +455,13 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
                 status: ec.status,
                 lang: ec.lang.clone(),
                 subset: ec.subset,
+                abstained,
+                fresh_first,
             };
 
-            if ec.status == CaseStatus::KnownRed {
+            if abstained.is_some() {
+                unanswerable.push(result);
+            } else if ec.status == CaseStatus::KnownRed {
                 // The concrete, code-free signal that the tier-1 exclusion
                 // this case is blocked on has been lifted: a case that
                 // structurally could not score now scores.
@@ -458,24 +474,25 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             }
         }
 
-        let aggregate = report::aggregate(&per_case);
-        let by_lang_aggregate = report::aggregate_by_lang(&per_case);
-        let by_subset_aggregate = report::aggregate_by_subset(&per_case);
+        let retrieval = report::RetrievalResults::from_cases(per_case, blocked, unanswerable);
+        let aggregate = retrieval.aggregate;
+        let per_case = &retrieval.per_case;
         // Computed unconditionally, not gated behind `cli.audit`: a sweep's
         // SweepPoint carries these two numbers regardless of whether the
         // full AuditReport (saturation/mirror-case gating) was asked for —
         // the gate that reads them needs every point's value, not just the
         // ones a human happened to also request `--audit` for.
-        let dominance = audit::importance_rank_dominance(&per_case, &golden_set.corpus);
-        let modal = audit::modal_rank_agreement(&per_case);
+        let dominance = audit::importance_rank_dominance(per_case, &golden_set.corpus);
+        let modal = audit::modal_rank_agreement(per_case);
 
         // Audited over the active cases only, matching what `aggregate`
         // reports: a `known_red` case is blocked by a change that does not
         // exist yet, so its ranking says nothing about whether the golden
         // set can discriminate.
-        let audit_report = cli.audit.then(|| audit::audit(&per_case, &golden_set.corpus));
+        let audit_report = cli.audit.then(|| audit::audit(per_case, &golden_set.corpus));
 
-        let tag = fold_tag(run_tag.as_deref(), point_slug(point).as_deref());
+        let arm = if cli.lexical_only { Some(LEXICAL_ONLY_SLUG.to_string()) } else { point_slug(point) };
+        let tag = fold_tag(run_tag.as_deref(), arm.as_deref());
 
         let results = report::RunResults {
             date: date.clone(),
@@ -483,7 +500,11 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             tag,
             model_id: model_id.clone(),
             git_sha: git_sha.clone(),
-            k_pool: report::KPool { memory: 30, episodic: 5, procedural: 5, lexical: scope.lexical },
+            k_pool: if cli.lexical_only {
+                report::KPool { memory: 0, episodic: 0, procedural: 0, lexical: Some(K_FINAL) }
+            } else {
+                report::KPool { memory: 30, episodic: 5, procedural: 5, lexical: scope.lexical }
+            },
             fts_tokenizer: fts_tokenizer.clone(),
             k_final: K_FINAL,
             corpus_size: golden_set.corpus.len(),
@@ -492,13 +513,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             known_bugs_live: known_bugs.clone(),
             golden_set: golden_provenance.clone(),
             scoring_config: point.scoring,
-            retrieval: report::RetrievalResults {
-                aggregate,
-                by_lang: by_lang_aggregate,
-                by_subset: by_subset_aggregate,
-                per_case,
-                blocked,
-            },
+            retrieval,
             contradiction: report::ContradictionResults { curve: curve.clone(), by_lang: curve_by_lang.clone() },
             norm_check: report::NormCheck {
                 asserted: cli.mode == cli::Mode::Real,
@@ -666,13 +681,7 @@ fn build_agent_view_run_results(
             loaded_golden.content_sha256.clone(),
         ),
         scoring_config: EvalScoringConfig::default(),
-        retrieval: report::RetrievalResults {
-            aggregate: report::Aggregate::default(),
-            by_lang: vec![],
-            by_subset: vec![],
-            per_case: vec![],
-            blocked: vec![],
-        },
+        retrieval: report::RetrievalResults::from_cases(vec![], vec![], vec![]),
         contradiction: report::ContradictionResults { curve: vec![], by_lang: vec![] },
         norm_check: report::NormCheck { asserted: false, mean_norm: 0.0, max_deviation: 0.0 },
         audit: None,
@@ -687,11 +696,16 @@ fn build_agent_view_run_results(
 /// CLI usage error, this happens before any golden set, model, or database is
 /// touched, so a failure here is reported as a generic runtime failure rather
 /// than overloading a more specific code with a meaning it does not have.
-fn run_diff(a_path: &std::path::Path, b_path: &std::path::Path) -> i32 {
+fn run_diff(a_path: &std::path::Path, b_path: &std::path::Path, fail_on_regression: bool) -> i32 {
     match diff::diff_files(a_path, b_path) {
         Ok(d) => {
             diff::print_stdout(&d);
-            EXIT_OK
+            if fail_on_regression && diff::regressed(&d) {
+                eprintln!("a primary metric got worse with p < 0.05");
+                EXIT_REGRESSION
+            } else {
+                EXIT_OK
+            }
         }
         Err(e) => {
             eprintln!("error: {e}");
@@ -738,7 +752,7 @@ async fn run_follow_up(ctx: FollowUpRunContext<'_>) -> i32 {
         .golden_set
         .retrieval_cases
         .iter()
-        .filter(|c| c.status == CaseStatus::Active)
+        .filter(|c| c.status == CaseStatus::Active && c.subset != CaseSubset::Unanswerable)
         .collect();
     let n_active = active_cases.len();
 
@@ -772,8 +786,8 @@ async fn run_follow_up(ctx: FollowUpRunContext<'_>) -> i32 {
         ceiling_agg.recall_10, floor_agg.recall_10
     );
 
-    let ceiling_results = build_follow_up_run_results(&ctx, "ceiling", ceiling_per_case, ceiling_agg);
-    let floor_results = build_follow_up_run_results(&ctx, "floor", floor_per_case, floor_agg);
+    let ceiling_results = build_follow_up_run_results(&ctx, "ceiling", ceiling_per_case);
+    let floor_results = build_follow_up_run_results(&ctx, "floor", floor_per_case);
     for results in [&ceiling_results, &floor_results] {
         report::print_stdout(results);
         if let Err(e) = write_follow_up_arm_results(results, ctx.out_dir, ctx.force) {
@@ -794,9 +808,7 @@ async fn run_follow_up(ctx: FollowUpRunContext<'_>) -> i32 {
             Ok(v) => v,
             Err(code) => return code,
         };
-    let treatment_agg = report::aggregate(&treatment_per_case);
-    let treatment_results =
-        build_follow_up_run_results(&ctx, "treatment", treatment_per_case, treatment_agg);
+    let treatment_results = build_follow_up_run_results(&ctx, "treatment", treatment_per_case);
     report::print_stdout(&treatment_results);
     if let Err(e) = write_follow_up_arm_results(&treatment_results, ctx.out_dir, ctx.force) {
         return e;
@@ -858,6 +870,8 @@ async fn score_follow_up_arm<'a>(
             status: case.status,
             lang: case_lang(&case.expected_refs, ctx.lang_by_ref),
             subset: case.subset,
+            abstained: None,
+            fresh_first: None,
         });
     }
     Ok(per_case)
@@ -871,10 +885,7 @@ fn build_follow_up_run_results(
     ctx: &FollowUpRunContext<'_>,
     arm_name: &str,
     per_case: Vec<report::CaseResult>,
-    aggregate: report::Aggregate,
 ) -> report::RunResults {
-    let by_lang_aggregate = report::aggregate_by_lang(&per_case);
-    let by_subset_aggregate = report::aggregate_by_subset(&per_case);
     report::RunResults {
         date: ctx.date.clone(),
         mode: ctx.mode,
@@ -890,13 +901,7 @@ fn build_follow_up_run_results(
         known_bugs_live: ctx.known_bugs.clone(),
         golden_set: ctx.golden_provenance.clone(),
         scoring_config: EvalScoringConfig::default(),
-        retrieval: report::RetrievalResults {
-            aggregate,
-            by_lang: by_lang_aggregate,
-            by_subset: by_subset_aggregate,
-            per_case,
-            blocked: vec![],
-        },
+        retrieval: report::RetrievalResults::from_cases(per_case, vec![], vec![]),
         contradiction: report::ContradictionResults {
             curve: ctx.contradiction_curve.clone(),
             by_lang: ctx.contradiction_curve_by_lang.clone(),
@@ -948,6 +953,7 @@ struct EmbeddedCase {
     status: CaseStatus,
     lang: Option<String>,
     subset: CaseSubset,
+    stale_refs: Vec<String>,
     embedding: Vec<f32>,
 }
 
@@ -1144,6 +1150,8 @@ fn build_similarity_results(
             status: CaseStatus::Active,
             lang: src.lang.clone(),
             subset: src.subset,
+            abstained: None,
+            fresh_first: None,
         });
 
         // Query-anchored rivals: every OTHER corpus vector, not just this
@@ -1320,6 +1328,139 @@ mod tests {
 
     fn temp_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("rag-eval-main-test-{tag}-{}", uuid::Uuid::new_v4()))
+    }
+
+    /// Runs `--fake` on `golden_json` under `tag` and returns the results file.
+    async fn run_fake(golden_json: &str, tag: &str) -> serde_json::Value {
+        let golden_path = temp_path(&format!("{tag}-golden.json"));
+        std::fs::write(&golden_path, golden_json).expect("write golden fixture");
+        let out_dir = temp_path(&format!("{tag}-out"));
+        let args = [
+            "rag-eval",
+            "--fake",
+            "--golden",
+            &golden_path.to_string_lossy(),
+            "--out",
+            &out_dir.to_string_lossy(),
+            "--tag",
+            tag,
+        ]
+        .map(str::to_string);
+        assert_eq!(run(args.into_iter()).await, EXIT_OK);
+        let results = read_results(&out_dir, tag);
+        std::fs::remove_file(&golden_path).ok();
+        std::fs::remove_dir_all(&out_dir).ok();
+        results
+    }
+
+    fn with_extra_case(golden: &str, case: &str) -> String {
+        golden.replacen(r#""retrieval_cases": ["#, &format!(r#""retrieval_cases": [{case},"#), 1)
+    }
+
+    #[tokio::test]
+    async fn a_golden_without_the_new_classes_measures_exactly_as_before() {
+        let json = run_fake(sweep_golden_json(), "plain").await;
+        let retrieval = &json["retrieval"];
+        for key in ["unanswerable", "abstention", "freshness"] {
+            assert!(retrieval.get(key).is_none(), "{key} must be absent: {retrieval}");
+        }
+        assert_eq!(retrieval["per_case"].as_array().unwrap().len(), 2);
+        assert_eq!(retrieval["aggregate"]["recall@1"], 1.0);
+        assert_eq!(retrieval["hits"]["at_1"]["strict"]["hits"], 2);
+        assert!(retrieval["per_case"][0].get("abstained").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unanswerable_case_stays_out_of_the_ranked_metrics_and_reports_abstention() {
+        let plain = run_fake(sweep_golden_json(), "without-unanswerable").await;
+        let golden = with_extra_case(
+            sweep_golden_json(),
+            r#"{"query": "a question nobody ever saved an answer to", "corpus_refs": ["c1"], "expected_refs": [], "subset": "unanswerable"}"#,
+        );
+        let json = run_fake(&golden, "with-unanswerable").await;
+
+        let (before, after) = (&plain["retrieval"], &json["retrieval"]);
+        assert_eq!(before["per_case"], after["per_case"]);
+        assert_eq!(before["aggregate"], after["aggregate"]);
+        let unanswerable = after["unanswerable"].as_array().expect("its own list");
+        assert_eq!(unanswerable.len(), 1);
+        assert_eq!(unanswerable[0]["abstained"], false, "the search returns rows for any query today");
+        assert_eq!(after["abstention"]["hits"], 0);
+        assert_eq!(after["abstention"]["n_cases"], 1);
+    }
+
+    #[tokio::test]
+    async fn an_update_case_is_scored_and_reports_freshness() {
+        let golden = with_extra_case(
+            sweep_golden_json(),
+            r#"{"query": "the retrieval decay term compares milliseconds against seconds", "corpus_refs": ["c1","c3"], "expected_refs": ["c1"], "stale_refs": ["c3"], "subset": "update"}"#,
+        )
+        .replacen(r#""importance": 3.0}"#, r#""importance": 3.0, "age_days": 10}"#, 1);
+        let json = run_fake(&golden, "update").await;
+
+        let retrieval = &json["retrieval"];
+        assert_eq!(retrieval["per_case"].as_array().unwrap().len(), 3, "an update case stays in the ranked metrics");
+        assert_eq!(retrieval["per_case"][0]["fresh_first"], true, "its query is the newer row's own text");
+        assert_eq!(retrieval["freshness"]["hits"], 1);
+        assert_eq!(retrieval["freshness"]["n_cases"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_lexical_only_run_writes_a_tagged_file_that_diffs() {
+        let golden_path = temp_path("lexical-only-golden.json");
+        std::fs::write(&golden_path, lexical_wiring_golden_json()).expect("write golden fixture");
+        let out_dir = temp_path("lexical-only-out");
+        let args = |extra: &[&str]| {
+            ["rag-eval", "--fake", "--golden", &golden_path.to_string_lossy(), "--out", &out_dir.to_string_lossy()]
+                .iter()
+                .map(|s| s.to_string())
+                .chain(extra.iter().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(run(args(&["--lexical-only"]).into_iter()).await, EXIT_OK);
+        assert_eq!(run(args(&["--tag", "full"]).into_iter()).await, EXIT_OK);
+
+        let lexical = read_results(&out_dir, LEXICAL_ONLY_SLUG);
+        assert_eq!(lexical["tag"], LEXICAL_ONLY_SLUG);
+        assert_eq!(lexical["k_pool"]["memory"], 0);
+        let ranked: Vec<&str> = lexical["retrieval"]["per_case"][0]["ranked_refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(ranked.len(), 5, "only the five rows carrying the token match: {ranked:?}");
+        assert!(ranked.iter().all(|r| ["c1", "c2", "c3", "c4", "c5"].contains(r)), "{ranked:?}");
+
+        let full_path = out_dir.join(format!("{}-fake-full.json", current_date_string()));
+        let lexical_path = out_dir.join(format!("{}-fake-{LEXICAL_ONLY_SLUG}.json", current_date_string()));
+        diff::diff_files(&lexical_path, &full_path).expect("the two arms compare");
+
+        std::fs::remove_file(&golden_path).ok();
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn diff_exits_six_on_a_significant_regression_only_with_the_flag() {
+        let case = |i: usize, hit: f64| {
+            serde_json::json!({
+                "query": format!("q{i}"), "expected_refs": ["c1"], "ranked_refs": ["c1"],
+                "recall@1": hit, "recall@5": hit, "recall@10": hit, "mrr": hit, "ndcg@10": hit,
+                "status": "active", "lang": null
+            })
+        };
+        let file = |hit: f64| serde_json::json!({ "retrieval": { "per_case": (0..6).map(|i| case(i, hit)).collect::<Vec<_>>() } });
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (a, b) = (dir.path().join("a.json"), dir.path().join("b.json"));
+        std::fs::write(&a, file(1.0).to_string()).expect("write a");
+        std::fs::write(&b, file(0.0).to_string()).expect("write b");
+        let (a, b) = (a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned());
+        let argv = |extra: &[&str]| {
+            ["rag-eval", "--diff", a.as_str(), b.as_str()].iter().chain(extra).map(|s| s.to_string()).collect::<Vec<_>>()
+        };
+
+        assert_eq!(run(argv(&[]).into_iter()).await, EXIT_OK);
+        assert_eq!(run(argv(&["--fail-on-regression"]).into_iter()).await, EXIT_REGRESSION);
     }
 
     #[tokio::test]

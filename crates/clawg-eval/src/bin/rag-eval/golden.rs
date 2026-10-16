@@ -48,6 +48,11 @@ pub struct CorpusRow {
     pub importance: f64,
     #[serde(default)]
     pub lang: Option<String>,
+    /// How many days before the run the row was saved. Relative, so a set
+    /// written today does not age: a fixed date would let decay move the
+    /// numbers from one month to the next.
+    #[serde(default)]
+    pub age_days: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +83,10 @@ pub struct RetrievalCase {
     /// visible without the part that answers.
     #[serde(default)]
     pub answer: Option<String>,
+    /// Only in an `update` case: older rows stating the same fact the
+    /// expected row restates.
+    #[serde(default)]
+    pub stale_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -90,6 +99,11 @@ pub enum CaseSubset {
     HighImportance,
     LowImportance,
     Long,
+    /// A newer row restates a fact older rows also state; it should come first.
+    Update,
+    /// No row answers the query: what is measured is whether the search
+    /// returns nothing, so the case stays out of every ranked metric.
+    Unanswerable,
 }
 
 impl CaseSubset {
@@ -103,6 +117,8 @@ impl CaseSubset {
             Self::HighImportance => "high_importance",
             Self::LowImportance => "low_importance",
             Self::Long => "long",
+            Self::Update => "update",
+            Self::Unanswerable => "unanswerable",
         }
     }
 }
@@ -213,6 +229,27 @@ pub enum GoldenError {
 
     #[error("E_MISSING_BLOCKED_BY: retrieval_case '{0}' is marked known_red but has no blocked_by")]
     MissingBlockedBy(String),
+
+    #[error("E_NO_EXPECTED: retrieval_case '{0}' expects no row; only an unanswerable case may")]
+    NoExpected(String),
+
+    #[error("E_UNANSWERABLE_EXPECTS: retrieval_case '{0}' is unanswerable but lists expected_refs")]
+    UnanswerableExpects(String),
+
+    #[error("E_NEGATIVE_AGE: corpus ref '{0}' has a negative age_days")]
+    NegativeAge(String),
+
+    #[error("E_STALE_OUTSIDE_UPDATE: retrieval_case '{0}' lists stale_refs but is not an update case")]
+    StaleOutsideUpdate(String),
+
+    #[error(
+        "E_UPDATE_SHAPE: update case '{0}' needs exactly one expected_ref and at least one stale_ref, \
+         all in corpus_refs, the expected one not among the stale"
+    )]
+    UpdateShape(String),
+
+    #[error("E_UPDATE_NOT_NEWER: update case '{query}' expects a row no newer than its stale row '{stale_ref}'")]
+    UpdateNotNewer { query: String, stale_ref: String },
 }
 
 /// A validated golden set paired with the SHA-256 of the exact bytes it was
@@ -271,6 +308,12 @@ pub fn validate(golden: &GoldenSet) -> Result<(), GoldenError> {
         }
     }
 
+    for row in &golden.corpus {
+        if row.age_days < 0.0 {
+            return Err(GoldenError::NegativeAge(row.ref_.clone()));
+        }
+    }
+
     let corpus_by_ref: HashMap<&str, &CorpusRow> =
         golden.corpus.iter().map(|r| (r.ref_.as_str(), r)).collect();
 
@@ -294,12 +337,50 @@ pub fn validate(golden: &GoldenSet) -> Result<(), GoldenError> {
             }
         }
 
+        // `recall_at_k` scores an empty expectation as a total miss, so a case
+        // without one would drag every aggregate down; only the class that
+        // stays out of them may have it.
+        match (case.subset == CaseSubset::Unanswerable, case.expected_refs.is_empty()) {
+            (true, false) => return Err(GoldenError::UnanswerableExpects(case.query.clone())),
+            (false, true) => return Err(GoldenError::NoExpected(case.query.clone())),
+            _ => {}
+        }
+
+        validate_update(case, &pool, &corpus_by_ref)?;
+
         if case.status == CaseStatus::KnownRed && case.blocked_by.is_none() {
             return Err(GoldenError::MissingBlockedBy(case.query.clone()));
         }
     }
 
     Ok(())
+}
+
+/// An `update` case names one newer row and the older rows it restates; no
+/// other case names stale rows.
+fn validate_update(
+    case: &RetrievalCase,
+    pool: &HashSet<&str>,
+    corpus_by_ref: &HashMap<&str, &CorpusRow>,
+) -> Result<(), GoldenError> {
+    if case.subset != CaseSubset::Update {
+        if !case.stale_refs.is_empty() {
+            return Err(GoldenError::StaleOutsideUpdate(case.query.clone()));
+        }
+        return Ok(());
+    }
+    let shape_ok = case.expected_refs.len() == 1
+        && !case.stale_refs.is_empty()
+        && case.stale_refs.iter().all(|s| pool.contains(s.as_str()) && *s != case.expected_refs[0]);
+    if !shape_ok {
+        return Err(GoldenError::UpdateShape(case.query.clone()));
+    }
+    let age = |r: &str| corpus_by_ref[r].age_days;
+    let expected_age = age(&case.expected_refs[0]);
+    match case.stale_refs.iter().find(|s| age(s) <= expected_age) {
+        Some(stale) => Err(GoldenError::UpdateNotNewer { query: case.query.clone(), stale_ref: stale.clone() }),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -322,6 +403,68 @@ mod tests {
 
     fn parse_only(raw: &str) -> GoldenSet {
         serde_json::from_str(raw).expect("fixture must parse")
+    }
+
+    // --- unanswerable cases ----------------------------------------------
+
+    fn with_case(case: &str) -> GoldenSet {
+        parse_only(&VALID_MINIMAL.replace(
+            r#"{"query": "q1", "corpus_refs": ["c1"], "expected_refs": ["c1"]}"#,
+            case,
+        ))
+    }
+
+    #[test]
+    fn an_unanswerable_case_must_expect_nothing() {
+        let ok = with_case(r#"{"query": "q1", "corpus_refs": ["c1"], "expected_refs": [], "subset": "unanswerable"}"#);
+        assert!(validate(&ok).is_ok());
+        let bad = with_case(r#"{"query": "q1", "corpus_refs": ["c1"], "expected_refs": ["c1"], "subset": "unanswerable"}"#);
+        assert!(matches!(validate(&bad), Err(GoldenError::UnanswerableExpects(q)) if q == "q1"));
+    }
+
+    #[test]
+    fn only_an_unanswerable_case_may_expect_nothing() {
+        let bad = with_case(r#"{"query": "q1", "corpus_refs": ["c1"], "expected_refs": []}"#);
+        assert!(matches!(validate(&bad), Err(GoldenError::NoExpected(q)) if q == "q1"));
+    }
+
+    // --- update cases ----------------------------------------------------
+
+    const UPDATE: &str = r#"{
+        "corpus": [
+            {"ref": "new", "content": "the cache lives in redis now", "memory_type": "semantic_fact", "importance": 5.0, "age_days": 1},
+            {"ref": "old", "content": "the cache lives in memcached", "memory_type": "semantic_fact", "importance": 5.0, "age_days": 30}
+        ],
+        "retrieval_cases": [
+            {"query": "where does the cache live", "corpus_refs": ["new", "old"], "expected_refs": ["new"], "stale_refs": ["old"], "subset": "update"}
+        ],
+        "contradiction_pairs": []
+    }"#;
+
+    #[test]
+    fn an_update_case_needs_one_expected_and_older_stale_rows() {
+        assert!(validate(&parse_only(UPDATE)).is_ok());
+        let reversed = UPDATE.replace(r#""age_days": 1}"#, r#""age_days": 60}"#);
+        assert!(matches!(
+            validate(&parse_only(&reversed)),
+            Err(GoldenError::UpdateNotNewer { stale_ref, .. }) if stale_ref == "old"
+        ));
+        let no_stale = UPDATE.replace(r#""stale_refs": ["old"], "#, "");
+        assert!(matches!(validate(&parse_only(&no_stale)), Err(GoldenError::UpdateShape(_))));
+        let stale_is_expected = UPDATE.replace(r#""stale_refs": ["old"]"#, r#""stale_refs": ["new"]"#);
+        assert!(matches!(validate(&parse_only(&stale_is_expected)), Err(GoldenError::UpdateShape(_))));
+    }
+
+    #[test]
+    fn stale_refs_outside_an_update_case_fail() {
+        let natural = UPDATE.replace(r#", "subset": "update""#, "");
+        assert!(matches!(validate(&parse_only(&natural)), Err(GoldenError::StaleOutsideUpdate(_))));
+    }
+
+    #[test]
+    fn a_negative_age_fails() {
+        let negative = UPDATE.replace(r#""age_days": 30}"#, r#""age_days": -2}"#);
+        assert!(matches!(validate(&parse_only(&negative)), Err(GoldenError::NegativeAge(r)) if r == "old"));
     }
 
     // --- valid file ------------------------------------------------------

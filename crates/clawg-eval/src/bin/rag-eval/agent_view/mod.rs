@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::golden::{CaseStatus, CaseSubset};
+use crate::report::Rate;
 use matcher::{normalize, visible_segment, Corpus};
 use parse::{context_sections, context_segments, parse_search_output, ParseError};
 use stats::{summarize, Sample, ToolStats};
@@ -82,6 +83,9 @@ pub struct CaseView {
     /// Only for cases that name the fact they ask for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer: Option<AnswerView>,
+    /// Only on `unanswerable` cases: `search_memory` printed no line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abstained: Option<bool>,
 }
 
 /// Whether the fact a case asks for reached the agent, not just some fragment
@@ -152,6 +156,10 @@ pub struct AgentViewResults {
     /// before the split was recorded have none.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub by_subset: BTreeMap<String, SubsetSummary>,
+    /// Share of active `unanswerable` cases whose search printed nothing.
+    /// Those cases stay out of every hit rate: there is nothing to find.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abstention: Option<Rate>,
     pub per_case: Vec<CaseView>,
 }
 
@@ -284,6 +292,12 @@ pub fn render_summary(results: &AgentViewResults) -> String {
             ));
         }
     }
+    if let Some(a) = &results.abstention {
+        out.push_str(&format!(
+            "  unanswerable (n={}): search printed nothing in {} [{:.3}, {:.3}]\n",
+            a.n_cases, a.hits, a.lo, a.hi
+        ));
+    }
     for (name, subset) in results.by_subset.iter().filter(|(_, s)| !s.answers.is_empty()) {
         let a = &subset.answers;
         out.push_str(&format!(
@@ -314,9 +328,10 @@ pub fn build_results(
     corpus: &Corpus,
     per_case: Vec<CaseView>,
 ) -> AgentViewResults {
+    let answerable = |c: &&CaseView| c.abstained.is_none();
     let summary = |status: CaseStatus, sample: fn(&CaseView) -> Sample| {
         let samples: Vec<Sample> =
-            per_case.iter().filter(|c| c.status == status).map(sample).collect();
+            per_case.iter().filter(answerable).filter(|c| c.status == status).map(sample).collect();
         summarize(&samples)
     };
     let search_sample = |c: &CaseView| Sample {
@@ -330,7 +345,15 @@ pub fn build_results(
         latency_ms: c.context.latency_ms,
     };
     let mut by_subset: BTreeMap<String, SubsetSummary> = BTreeMap::new();
-    let active: Vec<&CaseView> = per_case.iter().filter(|c| c.status == CaseStatus::Active).collect();
+    let active: Vec<&CaseView> =
+        per_case.iter().filter(answerable).filter(|c| c.status == CaseStatus::Active).collect();
+    let unanswerable: Vec<bool> = per_case
+        .iter()
+        .filter(|c| c.status == CaseStatus::Active)
+        .filter_map(|c| c.abstained)
+        .collect();
+    let abstention = (!unanswerable.is_empty())
+        .then(|| Rate::of(unanswerable.iter().filter(|a| **a).count(), unanswerable.len()));
     let names: std::collections::BTreeSet<&str> = active.iter().map(|c| c.subset.as_str()).collect();
     for name in names {
         let cases: Vec<&CaseView> = active.iter().copied().filter(|c| c.subset.as_str() == name).collect();
@@ -368,6 +391,7 @@ pub fn build_results(
             known_red: summary(CaseStatus::KnownRed, context_sample),
         },
         by_subset,
+        abstention,
         per_case,
     }
 }
@@ -526,6 +550,7 @@ mod tests {
             },
             subset: CaseSubset::Natural,
             answer: None,
+            abstained: None,
         }
     }
 
@@ -581,6 +606,29 @@ mod tests {
         assert!(results.by_subset["natural"].answers.is_empty());
         let text = render_summary(&results);
         assert!(text.contains("long answers (n=1): search visible 0.0000 reachable 1.0000"), "{text}");
+    }
+
+    #[test]
+    fn an_unanswerable_case_stays_out_of_hit_rate_and_reports_whether_search_abstained() {
+        let unanswerable = |abstained: bool| CaseView {
+            subset: CaseSubset::Unanswerable,
+            expected_refs: vec![],
+            abstained: Some(abstained),
+            ..case_view(CaseStatus::Active, false, false, 10)
+        };
+        let results = build_results(
+            3,
+            3,
+            &corpus(),
+            vec![case_view(CaseStatus::Active, true, true, 100), unanswerable(true), unanswerable(false)],
+        );
+        assert_eq!(results.search.active.n_cases, 1);
+        assert_eq!(results.search.active.hit_rate, 1.0);
+        assert!(!results.by_subset.contains_key("unanswerable"));
+        let a = results.abstention.expect("measured");
+        assert_eq!((a.hits, a.n_cases), (1, 2));
+        assert!(render_summary(&results).contains("unanswerable (n=2): search printed nothing in 1"));
+        assert_eq!(build_results(3, 3, &corpus(), vec![case_view(CaseStatus::Active, true, true, 1)]).abstention, None);
     }
 
     #[test]
