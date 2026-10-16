@@ -11,13 +11,14 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use clawg_cli::cli::{sharing_profile, Cli, Command, PathAction};
+use clawg_cli::cli::{sharing_profile, Cli, Command, PathAction, ProjectsAction};
 use clawg_cli::client::{probe_running, ClientError, DaemonClient, Probe};
 use clawg_cli::daemon::lifecycle::{now_ms, read_state};
 use clawg_cli::daemon::serve;
 use clawg_cli::doctor;
 use clawg_cli::mcp;
 use clawg_cli::memories;
+use clawg_cli::projects;
 use clawg_cli::restore;
 use clawg_cli::secrets;
 use clawg_cli::sharing;
@@ -198,6 +199,24 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             } else {
                 ExitCode::from(EXIT_FAILURE)
             })
+        }
+
+        Command::Projects { action: ProjectsAction::Add { path, profile } } => {
+            let profile = profile.resolve().map_err(|e| e.to_string())?;
+            let unavailable = |e: ClientError| memories::explain_unavailable(&e, profile);
+            // The daemon owns the store and does the indexing; with none
+            // running, nothing is started and the store is not opened.
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let client = match probe_running(&base_dir, false).await.map_err(unavailable)? {
+                Probe::Running(client) => client,
+                Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
+            };
+            let added = projects::add(&client, &path).await.map_err(|e| match e {
+                projects::AddError::Client(e) => unavailable(e),
+                other => other.to_string(),
+            })?;
+            println!("{added}");
+            Ok(ExitCode::SUCCESS)
         }
 
         Command::Memories { action } => {

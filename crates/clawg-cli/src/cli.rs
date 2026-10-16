@@ -120,6 +120,12 @@ pub enum Command {
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Let the daemon read a project's files besides the one each bridge is
+    /// started in. Needs a running daemon.
+    Projects {
+        #[command(subcommand)]
+        action: ProjectsAction,
+    },
     /// Browse what the daemon has stored. Read-only; needs a running daemon.
     Memories {
         #[command(subcommand)]
@@ -130,6 +136,18 @@ pub enum Command {
     Path {
         #[command(subcommand)]
         action: PathAction,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum ProjectsAction {
+    /// Index the docs and code of the project PATH is in, so `search_project`
+    /// can search it from a bridge started anywhere.
+    Add {
+        /// A directory of the project; its root is found as for a bridge.
+        path: PathBuf,
+        #[command(flatten)]
+        profile: ProfileArg,
     },
 }
 
@@ -624,6 +642,20 @@ mod tests {
             parse(&["clawg", "secrets", "--profile", "dev"]).command,
             Command::Secrets { profile: ProfileArg { profile: Some("dev".into()) } }
         );
+    }
+
+    #[test]
+    fn projects_add_takes_a_path_and_a_profile() {
+        assert_eq!(
+            parse(&["clawg", "projects", "add", "/work/other", "--profile", "dev"]).command,
+            Command::Projects {
+                action: ProjectsAction::Add {
+                    path: "/work/other".into(),
+                    profile: ProfileArg { profile: Some("dev".into()) }
+                }
+            }
+        );
+        assert!(Cli::try_parse_from(["clawg", "projects", "add"]).is_err(), "the path is required");
     }
 
     #[test]
