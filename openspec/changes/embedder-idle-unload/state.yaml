@@ -9,6 +9,6 @@ artifacts:
   design: done
   tasks: done
   apply: done
-  verify: partial  # Linux; falta el CI y la medición en Windows, ver verify.md
+  verify: partial  # Linux, CI y Windows; R7 falla en Windows (la memoria crece en cada recarga), ver verify.md
   archive: pending
 updated: 2026-10-16

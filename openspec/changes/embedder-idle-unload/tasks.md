@@ -31,5 +31,5 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 ## 5. Verificación
 
 - [x] Suite y clippy en Linux sobre el último commit (2.065 pasan; clippy con código 0).
-- [ ] El CI en verde en Linux y Windows.
-- [ ] Bytes privados del daemon dev en Windows antes y después del tiempo de ocio (máquina de Marcos).
+- [x] El CI en verde en Linux y Windows.
+- [ ] Bytes privados del daemon dev en Windows antes y después del tiempo de ocio: medidos, no cumplen R7 (ver [verify](verify.md#resultado)).
