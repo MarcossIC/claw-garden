@@ -322,6 +322,33 @@ async fn health_reports_a_contract_mismatch_as_not_retryable() {
     assert_eq!(body["embedder_retryable"], false);
 }
 
+#[tokio::test]
+async fn health_reports_a_failed_save_with_its_operation_id() {
+    let h = Harness::start().await;
+    h.ctx
+        .runtime
+        .store
+        .conn
+        .call(|c| {
+            c.execute(
+                "INSERT INTO ingest_outbox (operation_id, agent_id, content, event, state, attempts, last_error, created_at, updated_at) \
+                 VALUES ('op-1', 'claude-code', 'x', '{}', 'failed', 3, 'the daemon stopped 3 times while ingesting this save', 1, 1)",
+                [],
+            )
+        })
+        .await
+        .expect("seed");
+
+    let body: Value = h.http.get(h.url("/health")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(body["ingest"]["pending"], 0, "got {body}");
+    assert_eq!(body["ingest"]["failed"], 1, "got {body}");
+    let problem = &body["ingest"]["problems"][0];
+    assert_eq!(problem["operation_id"], "op-1");
+    assert_eq!(problem["agent_id"], "claude-code");
+    assert!(problem["error"].as_str().is_some_and(|e| e.contains("stopped 3 times")), "got {body}");
+    assert!(problem.get("content").is_none(), "health must not carry the text: {body}");
+}
+
 // ── Auth ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]

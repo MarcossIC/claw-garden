@@ -49,7 +49,7 @@ use clawg_core::memory::synthesis::{
 use clawg_core::memory::{read_save_core, search_all_memories, RankedHit, SaveText, SearchScope};
 use clawg_core::models::chat::Role;
 use clawg_core::paths::Profile;
-use clawg_core::memory::outbox::OutboxState;
+use clawg_core::memory::outbox::{OutboxState, OutboxSummary};
 use clawg_core::memory::redact::SecretKind;
 use clawg_core::runtime::{AcceptError, Accepted, MemoryRuntime};
 use serde::{Deserialize, Serialize};
@@ -440,6 +440,11 @@ pub struct HealthBody {
     /// `embedder` is `"failed"`.
     pub embedder_retryable: Option<bool>,
     pub uptime_s: u64,
+    /// Saves accepted and not yet stored, and those that failed after the
+    /// caller was answered. Left out when the store did not answer in time:
+    /// health must not hang behind a busy writer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingest: Option<OutboxSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -651,11 +656,22 @@ async fn require_bearer(
 
 // ── Handlers ────────────────────────────────────────────────────────────────
 
+/// How long health waits for the outbox counts before answering without them.
+const HEALTH_INGEST_WAIT: Duration = Duration::from_millis(250);
+
 async fn health(State(app): State<Arc<AppCtx>>) -> Json<HealthBody> {
     let (embedder, embedder_error, embedder_retryable) = match app.runtime.embedder_status() {
         EmbedderStatus::Loading => ("loading", None, None),
         EmbedderStatus::Ready => ("ready", None, None),
         EmbedderStatus::Failed { error, retryable } => ("failed", Some(error), Some(retryable)),
+    };
+    let ingest = match tokio::time::timeout(HEALTH_INGEST_WAIT, app.runtime.store.outbox_summary()).await {
+        Ok(Ok(summary)) => Some(summary),
+        Ok(Err(e)) => {
+            log::warn!("health could not read the ingest outbox: {e}");
+            None
+        }
+        Err(_) => None,
     };
     Json(HealthBody {
         status: "ok",
@@ -666,6 +682,7 @@ async fn health(State(app): State<Arc<AppCtx>>) -> Json<HealthBody> {
         embedder_error,
         embedder_retryable,
         uptime_s: app.started_at.elapsed().as_secs(),
+        ingest,
     })
 }
 

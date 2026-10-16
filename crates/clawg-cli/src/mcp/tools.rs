@@ -372,6 +372,7 @@ pub fn format_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clawg_core::memory::outbox::{OutboxProblem, OutboxState, OutboxSummary};
 
     fn hit(id: i64, kind: &str, memory_type: &str, tier: i64, score: f64, content: &str) -> Hit {
         Hit {
@@ -788,6 +789,7 @@ mod tests {
             embedder_error: None,
             embedder_retryable: None,
             uptime_s: 12,
+            ingest: None,
         }
     }
 
@@ -798,6 +800,28 @@ mod tests {
         assert!(out.contains("loading"), "out was: {out}");
         assert!(out.contains(".clawg-dev"), "the data dir must be named: {out}");
         assert!(out.contains("dev"), "out was: {out}");
+    }
+
+    #[test]
+    fn format_status_shows_the_ingest_block() {
+        let h = Health {
+            ingest: Some(OutboxSummary {
+                pending: 0,
+                failed: 1,
+                oldest_pending_s: None,
+                problems: vec![OutboxProblem {
+                    operation_id: "op-1".into(),
+                    agent_id: "a".into(),
+                    state: OutboxState::Failed,
+                    attempts: 3,
+                    error: "the daemon stopped 3 times while ingesting this save".into(),
+                }],
+            }),
+            ..health()
+        };
+        let out = format_status(&h, Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none");
+        assert!(out.contains("\"failed\": 1"), "out was: {out}");
+        assert!(out.contains("\"operation_id\": \"op-1\""), "out was: {out}");
     }
 
     #[test]

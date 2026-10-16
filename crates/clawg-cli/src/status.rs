@@ -93,6 +93,7 @@ mod tests {
             embedder_error: None,
             embedder_retryable: None,
             uptime_s: 12,
+            ingest: None,
         }
     }
 
