@@ -176,6 +176,22 @@ fn event_json(event: &MemoryEvent) -> String {
     serde_json::to_string(&rest).expect("MemoryEvent serializes")
 }
 
+/// Runs `write` with `synchronous = FULL`, then puts the connection's own
+/// setting back. An accepted save must outlive a power cut, while the rest of
+/// the store keeps NORMAL and skips the fsync per commit.
+fn durably<T>(
+    c: &rusqlite::Connection,
+    write: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    let previous: i64 = c.query_row("PRAGMA synchronous", [], |r| r.get(0))?;
+    c.pragma_update(None, "synchronous", "FULL")?;
+    let written = write(c);
+    let restored = c.pragma_update(None, "synchronous", previous);
+    let value = written?;
+    restored?;
+    Ok(value)
+}
+
 fn insert_row(c: &rusqlite::Connection, operation_id: &str, event: &MemoryEvent, now: TimestampMs) -> rusqlite::Result<i64> {
     c.execute(
         "INSERT INTO ingest_outbox (operation_id, agent_id, content, event, created_at, updated_at) \
@@ -192,20 +208,22 @@ impl MemoryStore {
         let now = TimestampMs::now();
         self.conn
             .call(move |c| -> rusqlite::Result<Recorded> {
-                let tx = c.transaction()?;
-                let existing = tx
-                    .query_row(
-                        "SELECT id, state, last_error FROM ingest_outbox WHERE agent_id = ?1 AND operation_id = ?2",
-                        rusqlite::params![event.agent_id, operation_id],
-                        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?)),
-                    )
-                    .optional()?;
-                if let Some((row, state, last_error)) = existing {
-                    return Ok(Recorded::Existing { row, state: OutboxState::parse(&state), last_error });
-                }
-                let row = insert_row(&tx, &operation_id, &event, now)?;
-                tx.commit()?;
-                Ok(Recorded::New { row })
+                durably(c, |c| {
+                    let tx = c.unchecked_transaction()?;
+                    let existing = tx
+                        .query_row(
+                            "SELECT id, state, last_error FROM ingest_outbox WHERE agent_id = ?1 AND operation_id = ?2",
+                            rusqlite::params![event.agent_id, operation_id],
+                            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?)),
+                        )
+                        .optional()?;
+                    if let Some((row, state, last_error)) = existing {
+                        return Ok(Recorded::Existing { row, state: OutboxState::parse(&state), last_error });
+                    }
+                    let row = insert_row(&tx, &operation_id, &event, now)?;
+                    tx.commit()?;
+                    Ok(Recorded::New { row })
+                })
             })
             .await
             .map_err(backend("outbox_record"))
@@ -217,11 +235,13 @@ impl MemoryStore {
         let now = TimestampMs::now();
         self.conn
             .call(move |c| -> rusqlite::Result<()> {
-                let tx = c.transaction()?;
-                for event in &events {
-                    insert_row(&tx, &uuid::Uuid::new_v4().to_string(), event, now)?;
-                }
-                tx.commit()
+                durably(c, |c| {
+                    let tx = c.unchecked_transaction()?;
+                    for event in &events {
+                        insert_row(&tx, &uuid::Uuid::new_v4().to_string(), event, now)?;
+                    }
+                    tx.commit()
+                })
             })
             .await
             .map_err(backend("outbox_import"))
@@ -441,6 +461,33 @@ mod tests {
             })
             .await
             .unwrap()
+    }
+
+    fn synchronous(c: &rusqlite::Connection) -> i64 {
+        c.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn durably_writes_under_full_and_puts_the_setting_back() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.pragma_update(None, "synchronous", "NORMAL").unwrap();
+
+        let inside = durably(&c, |c| Ok(synchronous(c))).unwrap();
+        assert_eq!(inside, 2, "FULL while the row is written");
+        assert_eq!(synchronous(&c), 1);
+
+        let failed: rusqlite::Result<()> = durably(&c, |_| Err(rusqlite::Error::InvalidQuery));
+        assert!(failed.is_err());
+        assert_eq!(synchronous(&c), 1, "put back after a failure too");
+    }
+
+    #[tokio::test]
+    async fn recording_a_row_leaves_the_store_on_normal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path(), crate::memory::store_lock::StoreHolder::Eval).await.unwrap();
+        new_row(&store, "op-1", "a save").await;
+        store.outbox_import(vec![event("a", "an old one")]).await.unwrap();
+        assert_eq!(store.conn.call(|c| Ok::<_, rusqlite::Error>(synchronous(c))).await.unwrap(), 1);
     }
 
     #[test]
