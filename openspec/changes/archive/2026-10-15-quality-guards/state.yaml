@@ -1,7 +1,7 @@
 change: quality-guards
 objective: "transversal"
 depends_on: []
-phase: verify
+phase: archived
 artifacts:
   exploration: done
   proposal: done
@@ -9,6 +9,7 @@ artifacts:
   design: done
   tasks: done
   apply: done
-  verify: partial  # Linux; Windows pending, see verify.md
-  archive: pending
-updated: 2026-10-16
+  verify: done  # Linux and Windows, see verify.md
+  archive: done
+main_spec: openspec/specs/quality/spec.md
+updated: 2026-10-15

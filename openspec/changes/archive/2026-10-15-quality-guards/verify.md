@@ -1,6 +1,6 @@
 # quality-guards — Verificación
 
-**Estado:** verificado en Linux, commit por commit. Falta la suite y el `clippy` en Windows ([pendiente](#pendiente-máquina-de-marcos)).
+**Estado:** verificado en Linux, commit por commit, y en Windows sobre `main` ([Windows](#windows)).
 
 ## Tests
 
@@ -26,6 +26,17 @@ Todos los commits compilan. Las 10 fallas son las mismas en todos y en `main`, y
 
 **Conteo:** 8 tests nuevos y 2 borrados con `age_days_from` (`ninety_days_apart_is_ninety_days`, `an_instant_after_now_reports_a_negative_age`); `now_reads_a_plausible_present_instant` se quedó y ahora compara milisegundos. Nuevos: 2 en `crates/clawg-cli/tests/conventions.rs`, 4 del contrato y 2 del inventario en `server.rs`. Neto: +6.
 
+### Windows
+
+`cargo test --workspace --no-fail-fast --target-dir target-test`:
+
+| Commit | Pasan | Fallan | Ignorados | Warnings del workspace |
+|---|---|---|---|---|
+| `main` en `f8a361e` (este cambio y bridge-reconnect ya mergeados) | 1.918 | 0 | 0 | — |
+| `main` en `61f20d4` (`chore: bump version to 0.6.0`) | 1.918 | 0 | 0 | 0 |
+
+1.918 es la base de 1.902, más los 6 de este cambio y los 10 de bridge-reconnect. Los 10 que fallan en Linux pasan en Windows, como en `main`. La segunda corrida prueba el escenario «sube la versión» de R1 con un bump real: entre las dos, la versión pasó de 0.5.1 a 0.6.0 y `the_agent_contract_matches_its_file` siguió pasando sin bendecir.
+
 ### Qué cubre cada requisito
 
 | Requisito | Tests o comprobación |
@@ -44,12 +55,16 @@ El archivo inicial del contrato (`crates/clawg-cli/src/mcp/agent_contract.json`,
 - `cargo clippy --workspace --all-targets -- -D warnings` en `main`: no pasa. Sin `-D` da 30 hallazgos, 29 de `clippy` y uno de `rustc`.
 - En la punta, sin `-D`: 28 de `clippy` (uno estaba en código borrado), anotados en el backlog del README de openspec.
 - `cargo clippy --workspace --all-targets -- -A clippy::all -D warnings`, el comando documentado: **código 0** en la punta.
+- En Windows, `cargo clippy --workspace --all-targets --target-dir target-test -- -A clippy::all -D warnings` sobre `main` en `61f20d4`: **código 0**, sin ningún warning, tampoco en el código bajo `cfg(windows)`.
 
 ## rag-eval
 
 No aplica: no cambia búsqueda, puntaje ni prompt. Lo que el modelo ve es el mismo texto que en `main`, ahora fijado.
 
-## Pendiente (máquina de Marcos)
+## Diferencias entre la spec del cambio y el código
 
-1. **Suite en Windows:** `cargo test --workspace --no-fail-fast --target-dir target-test` en la punta. Se esperan 1.902 + 6 = **1.908 pasan, 0 fallan**. Si `the_agent_contract_matches_its_file` falla en Windows, el mensaje dice qué herramienta difiere; lo esperable es que no, porque las descripciones vienen de los doc comments y no dependen del sistema.
-2. **`clippy` en Windows:** `cargo clippy --workspace --all-targets --target-dir target-test -- -A clippy::all -D warnings` termina con código 0. Puede haber un warning sólo de Windows en código con `cfg(windows)`, que Linux no compila.
+Encontradas al consolidar en [`specs/quality`](../../../specs/quality/spec.md), que describe el código:
+
+1. **R1, archivo ausente:** la spec no dice qué pasa sin el archivo del contrato. El test falla y dice cómo crearlo (`server.rs:1947`); la spec consolidada lo pide.
+2. **R3, dónde empieza la lista:** la spec dice «después del `:`»; `tool_names_in_doc` corta en el primer `): ` de la primera línea que empieza con `MCP tools (` (`server.rs:1904`). En la línea de hoy es lo mismo; si la ruta entre paréntesis tuviera `): `, no.
+3. **R4, línea por línea:** la spec dice que ninguna fuente MUST tener el atributo, pero el chequeo examina cada línea por separado (`conventions.rs:74`). Un atributo partido en varias líneas (`#[allow(` y `dead_code` en la siguiente) no se reconoce, y una línea dentro de un comentario de bloque o de un string de varias líneas que empiece con `#[allow(dead_code)]` sí cuenta. Hoy no hay ninguno de los dos casos. La spec consolidada dice lo que hace.
