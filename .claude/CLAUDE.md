@@ -86,7 +86,7 @@ MCP tools (`crates/clawg-cli/src/mcp/server.rs`): `save_memory`, `search_memory`
 cargo test --workspace
 ```
 
-Current baseline (Windows): 2034 tests, all passing.
+Current baseline (Windows): 2050 tests, all passing.
 
 `crates/clawg-cli/tests/binary.rs` runs the built `clawg` itself: a hard kill with a save still pending, two daemons on one store, `status`/`stop`, `backup`/`restore`, MCP over real stdio and a daemon restart under an open bridge. Each test gets a temporary home through `CLAWG_TEST_HOME` and the fake model through `CLAWG_TEST_EMBEDDER=fake|stalled`; only a build with clawg-core's `testing` feature (its dev-dependencies) reads them, never a release build, and `tests/conventions.rs` fails when a manifest enables `testing` outside `[dev-dependencies]`. Every daemon binds `--port 0`, and each child is ended by its own handle, never by name. It takes about a second.
 

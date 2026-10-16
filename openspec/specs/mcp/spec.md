@@ -135,7 +135,7 @@ Repetir MUST NOT llegar dos veces al handler del daemon: un 401 lo corta `requir
 - THEN el save se guarda en B y la búsqueda lo encuentra
 - AND ninguna de las dos respuestas es un error
 
-**Test:** `a_restarted_daemon_is_reached_with_its_new_token` (`mcp/server.rs`).
+**Tests:** `a_restarted_daemon_is_reached_with_its_new_token` (`mcp/server.rs`); con el binario, un `clawg stop` y otro `clawg serve`, `a_bridge_left_open_reaches_the_daemon_after_a_restart` (`crates/clawg-cli/tests/binary.rs`, ver [`specs/install`](../install/spec.md)).
 
 #### Escenario: el token se relee una sola vez
 - GIVEN un daemon que contesta 401 a toda ruta con token

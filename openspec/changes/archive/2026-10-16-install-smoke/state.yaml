@@ -1,7 +1,7 @@
 change: install-smoke
 objective: "transversal"
 depends_on: []
-phase: verify
+phase: archived
 artifacts:
   exploration: done
   proposal: done
@@ -9,6 +9,7 @@ artifacts:
   design: done
   tasks: done
   apply: done
-  verify: partial  # Linux y CI; falta Windows local, ver verify.md
-  archive: pending
+  verify: done  # Linux, the CI on Linux and Windows, and Windows on Marcos's machine, see verify.md
+  archive: done
+main_spec: openspec/specs/install/spec.md
 updated: 2026-10-16

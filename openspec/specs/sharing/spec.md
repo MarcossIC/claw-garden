@@ -9,7 +9,7 @@ Fuente de verdad del comportamiento actual de qué agentes leen las memorias de 
 - **Lector:** el agente que busca: el agente del puente ([`specs/visibility`](../visibility/spec.md) R1) o el `agent_id` del cuerpo de `POST /v1/search` y `POST /v1/context`.
 - **Autor de una fila:** su `agent_id`.
 - **Exclusión:** un par dirigido (lector, autor): "cursor no lee a claude-code". `*` en cualquiera de los dos lados vale por todo agente.
-- **Política:** el conjunto de exclusiones, guardado en `<data>/sharing.json` (`sharing_file`, `crates/clawg-core/src/paths.rs:218`).
+- **Política:** el conjunto de exclusiones, guardado en `<data>/sharing.json` (`sharing_file`, `crates/clawg-core/src/paths.rs:246`).
 - **Alcance de L (`Reach`, `crates/clawg-core/src/memory/sharing.rs:40`):** lo que la búsqueda de L trae además de lo propio. `AllBut(autores)`, todo menos un conjunto de autores ocultos, u `Own`, sólo lo propio.
 - **Fila ajena para L:** una fila cuyo autor no es L.
 
