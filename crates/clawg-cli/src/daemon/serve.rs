@@ -10,7 +10,10 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use clawg_core::memory::bootstrap::{run_embedder_bootstrap_with_retry, serve_deps, LogSink};
+use clawg_core::memory::bootstrap::{
+    run_embedder_bootstrap_with_retry, serve_deps, unloading_when_idle, LogSink,
+};
+use clawg_core::memory::idle_embedder::{idle_after, DEFAULT_IDLE, IDLE_MINUTES_VAR};
 use clawg_core::memory::store_lock::StoreHolder;
 use clawg_core::memory::MemoryError;
 use clawg_core::paths::{data_dir, PathsError, Profile};
@@ -90,6 +93,22 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
     let (ensure, load, verify) =
         serve_deps(runtime.store.clone(), clawg_core::paths::backups_dir(&base_dir))
             .map_err(ServeError::Embedder)?;
+    // A wrong value must not keep the daemon from starting under an editor
+    // that spawned it; the default is what the user had before setting it.
+    let idle = idle_after(std::env::var(IDLE_MINUTES_VAR).ok().as_deref()).unwrap_or_else(|e| {
+        log::warn!("{e}; the model is let go after {} minutes without use", DEFAULT_IDLE.as_secs() / 60);
+        Some(DEFAULT_IDLE)
+    });
+    let load = match idle {
+        Some(idle) => unloading_when_idle(
+            ensure.clone(),
+            load,
+            base_dir.clone(),
+            idle,
+            tokio::runtime::Handle::current(),
+        ),
+        None => load,
+    };
     tokio::spawn(run_embedder_bootstrap_with_retry(
         base_dir.clone(),
         runtime.embedder.clone(),

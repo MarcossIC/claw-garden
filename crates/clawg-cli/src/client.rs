@@ -127,6 +127,11 @@ pub struct Health {
     /// Whether the daemon will retry the failed load on its own.
     #[serde(default)]
     pub embedder_retryable: Option<bool>,
+    /// Whether the model is in memory now; `false` when the daemon let it go
+    /// for being idle. `None` before the first load, or from a daemon that
+    /// always keeps it.
+    #[serde(default)]
+    pub embedder_resident: Option<bool>,
     pub uptime_s: u64,
     /// Saves accepted and not stored yet, and those that failed after the
     /// answer. `None` from a daemon before the outbox, or when the store did
@@ -1057,6 +1062,13 @@ pub(crate) mod tests {
         let old = r#"{"status":"ok","version":"0.5.0","profile":"dev","pid":1,"embedder":"ready","uptime_s":3}"#;
         let h: Health = serde_json::from_str(old).expect("a daemon from before the outbox");
         assert!(h.ingest.is_none());
+    }
+
+    #[test]
+    fn a_health_without_residency_still_parses() {
+        let old = r#"{"status":"ok","version":"0.11.0","profile":"dev","pid":1,"embedder":"ready","uptime_s":3}"#;
+        let h: Health = serde_json::from_str(old).expect("a daemon that always keeps its model");
+        assert_eq!(h.embedder_resident, None);
     }
 
     /// An in-process daemon plus the tempdir holding its lifecycle files.

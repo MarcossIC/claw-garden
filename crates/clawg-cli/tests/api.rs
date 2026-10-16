@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 use clawg_cli::daemon::api::{router, AppCtx, SAVE_CONFIRM_TIMEOUT};
 use clawg_core::memory::bootstrap::EmbedderStatus;
 use clawg_core::memory::embedder::{EmbedError, EmbedRole, Embedder, FakeEmbedder};
+use clawg_core::memory::idle_embedder::{IdleEmbedder, ReloadFn};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use clawg_core::memory::worker::IngestRequest;
 use clawg_core::paths::Profile;
 use clawg_core::runtime::{MemoryRuntime, INGEST_QUEUE_CAPACITY};
@@ -42,6 +44,8 @@ enum EmbedderState {
     /// The embedder is ready and something takes each save off the queue but
     /// drops its reply unanswered, as a worker spilling at shutdown does.
     DroppingReplies,
+    /// The model was let go for being idle; loading it again works or fails.
+    Unloaded { reload_fails: bool },
 }
 
 /// An embedder that loaded and then fails every call, as a broken ONNX
@@ -88,6 +92,8 @@ struct Harness {
     token: String,
     http: reqwest::Client,
     ctx: Arc<AppCtx>,
+    /// How many times an unloaded model was loaded again.
+    reloads: Arc<AtomicUsize>,
     /// The queue's consumer end when no worker drains it, held so the queue
     /// stays open.
     _ingest_rx: Option<Receiver<IngestRequest>>,
@@ -135,6 +141,11 @@ impl Harness {
         Self::start_inner(EmbedderState::FailingEmbedder).await
     }
 
+    /// Daemon whose model was let go for being idle.
+    async fn start_unloaded(reload_fails: bool) -> Self {
+        Self::start_inner(EmbedderState::Unloaded { reload_fails }).await
+    }
+
     /// Daemon whose model is loading, with an undrained queue of `capacity`.
     async fn start_loading_with_queue(capacity: usize) -> Self {
         Self::start_with(EmbedderState::LoadingWithoutWorker, capacity).await
@@ -158,7 +169,34 @@ impl Harness {
             EmbedderState::ReadyWithoutWorker => SHORT_CONFIRM_TIMEOUT,
             _ => SAVE_CONFIRM_TIMEOUT,
         };
+        let reloads = Arc::new(AtomicUsize::new(0));
         let (runtime, ingest_rx) = match embedder {
+            EmbedderState::Unloaded { reload_fails } => {
+                let runtime = with_empty_embedder(runtime, EmbedderStatus::Ready);
+                let reload: ReloadFn = {
+                    let reloads = reloads.clone();
+                    Arc::new(move || {
+                        reloads.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async move {
+                            if reload_fails {
+                                Err("the model files are gone".to_string())
+                            } else {
+                                Ok(Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>)
+                            }
+                        })
+                    })
+                };
+                let idle = IdleEmbedder::new(
+                    Arc::new(FakeEmbedder::default()),
+                    reload,
+                    Duration::from_secs(600),
+                    &tokio::runtime::Handle::current(),
+                );
+                idle.unload().await;
+                runtime.embedder.set(Arc::new(idle) as Arc<dyn Embedder>).ok();
+                tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
+                (runtime, None)
+            }
             EmbedderState::Ready => {
                 tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
                 (runtime, None)
@@ -213,7 +251,7 @@ impl Harness {
             let _ = axum::serve(listener, app).await;
         });
 
-        Self { addr, token, http: reqwest::Client::new(), ctx, _ingest_rx: ingest_rx, _dir: dir }
+        Self { addr, token, http: reqwest::Client::new(), ctx, reloads, _ingest_rx: ingest_rx, _dir: dir }
     }
 
     fn url(&self, path: &str) -> String {
@@ -2057,4 +2095,64 @@ async fn listing_deleted_rows_shows_only_them_newest_deletion_first() {
     assert_eq!(ids(&live), vec![kept]);
     let (status, body) = h.get_json("/v1/memories?deleted=true&q=tabs").await;
     assert_eq!(status, 400, "{body}");
+}
+
+#[tokio::test]
+async fn health_says_whether_the_model_is_in_memory() {
+    let (_, loaded) = Harness::start().await.get_json("/health").await;
+    assert_eq!(loaded["embedder_resident"], true, "{loaded}");
+
+    let (_, unloaded) = Harness::start_unloaded(false).await.get_json("/health").await;
+    assert_eq!(unloaded["embedder"], "ready", "an unloaded model is still usable: {unloaded}");
+    assert_eq!(unloaded["embedder_resident"], false, "{unloaded}");
+
+    let (_, loading) = Harness::start_without_embedder().await.get_json("/health").await;
+    assert!(loading["embedder_resident"].is_null(), "{loading}");
+}
+
+#[tokio::test]
+async fn a_search_with_the_model_unloaded_loads_it_and_answers() {
+    let h = Harness::start_unloaded(false).await;
+    let (status, body) = h.post_json("/v1/search", json!({ "query": "anything", "agent_id": "a" })).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(h.reloads.load(Ordering::SeqCst), 1);
+    let (_, health) = h.get_json("/health").await;
+    assert_eq!(health["embedder_resident"], true, "{health}");
+}
+
+#[tokio::test]
+async fn a_save_with_the_model_unloaded_is_stored() {
+    let h = Harness::start_unloaded(false).await;
+    let (status, body) = h
+        .post_json("/v1/memories", json!({ "content": "saved while the model was away", "agent_id": "a" }))
+        .await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(h.reloads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_search_whose_model_cannot_load_again_answers_not_ready() {
+    let h = Harness::start_unloaded(true).await;
+    let (status, body) = h.post_json("/v1/search", json!({ "query": "anything", "agent_id": "a" })).await;
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"], "embedder_not_ready", "{body}");
+}
+
+#[tokio::test]
+async fn registering_a_project_wakes_an_unloaded_model_without_waiting_for_it() {
+    let h = Harness::start_unloaded(false).await;
+    let root = tempfile::tempdir().expect("root");
+    let (status, body) =
+        h.post_json("/v1/projects", json!({ "root_path": root.path().to_string_lossy() })).await;
+    assert_eq!(status, 200, "{body}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, health) = h.get_json("/health").await;
+        if health["embedder_resident"] == true {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the model never came back: {health}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(h.reloads.load(Ordering::SeqCst), 1);
 }

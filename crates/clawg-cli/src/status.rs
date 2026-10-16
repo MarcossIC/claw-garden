@@ -92,6 +92,7 @@ mod tests {
             embedder: "ready".into(),
             embedder_error: None,
             embedder_retryable: None,
+            embedder_resident: None,
             uptime_s: 12,
             ingest: None,
         }
