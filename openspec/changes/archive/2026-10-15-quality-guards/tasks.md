@@ -58,9 +58,9 @@ Al correr `cargo test -p clawg-core` solo apareció otro warning, `search_all_me
 - [x] El comando de `clippy` de D7 termina con código 0.
 - [x] Bendecir a mano (R2): con `CLAWG_BLESS=1` reescribe y falla; la siguiente pasa; dos bendiciones dan los mismos bytes.
 - [x] `verify.md` con los pasos de Marcos: la suite y el `clippy` en Windows.
-- [ ] Correr esos pasos (máquina de Marcos).
+- [x] Correr esos pasos (máquina de Marcos): 1.918 pasan y 0 fallan, `clippy` con código 0.
 
 ## 10. Archive
 
-- [ ] Spec nueva `openspec/specs/quality/spec.md` con R1 a R4 y R6, y la línea **Origen**.
-- [ ] `git mv` a `changes/archive/AAAA-MM-DD-quality-guards`; `state.yaml` archivado; fila 32 del `README.md` de openspec; base de tests de `.claude/CLAUDE.md` y `openspec/config.yaml`; subir el minor.
+- [x] Spec nueva `openspec/specs/quality/spec.md` con R1 a R4 y R6, y la línea **Origen**.
+- [x] `git mv` a `changes/archive/2026-10-15-quality-guards`; `state.yaml` archivado; fila 32 del `README.md` de openspec; base de tests de `.claude/CLAUDE.md` y `openspec/config.yaml` (ya en 1.918, que incluye este cambio); subir el minor.
