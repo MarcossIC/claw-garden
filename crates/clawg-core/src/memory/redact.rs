@@ -85,12 +85,15 @@ static PATTERNS: Lazy<Vec<(SecretKind, Regex)>> = Lazy::new(|| {
 /// part that would be masked.
 fn accepts(kind: SecretKind, secret: &str) -> bool {
     match kind {
-        // `sk-` alone is a common prefix in hyphenated words. A real key is
-        // random, so it has letters and digits; `sk-ant-` is Anthropic's.
+        // `sk-` alone is a common prefix in identifiers, paths and package
+        // names, which are almost never mixed case. A real key is random
+        // base62 or base64url, so it has upper and lower case letters and
+        // digits; `sk-ant-` is Anthropic's.
         SecretKind::OpenaiKey => {
             !secret.starts_with("ant-")
                 && secret.bytes().any(|b| b.is_ascii_digit())
-                && secret.bytes().any(|b| b.is_ascii_alphabetic())
+                && secret.bytes().any(|b| b.is_ascii_uppercase())
+                && secret.bytes().any(|b| b.is_ascii_lowercase())
         }
         // A variable, a template slot, an earlier placeholder or a masked
         // value: none of them is the password.
@@ -211,6 +214,28 @@ mod tests {
         let out = redact(text);
         assert_eq!(out.text, text);
         assert!(out.kinds.is_empty(), "{:?}", out.kinds);
+    }
+
+    #[test]
+    fn a_hyphenated_identifier_after_sk_is_left_alone() {
+        let text = "the sk-learn-pipeline-for-text-classification-v2-2026-model and \
+                    scripts/sk-build-2026-release-candidate-01";
+        let out = redact(text);
+        assert_eq!(out.text, text);
+        assert!(out.kinds.is_empty(), "{:?}", out.kinds);
+    }
+
+    #[test]
+    fn every_form_of_an_openai_key_is_masked() {
+        for key in [
+            format!("sk-{}", repeat("T3Bl9bkFJ", 48)),
+            format!("sk-proj-{}", repeat("aZ0_-9xQ", 156)),
+            format!("sk-svcacct-{}", repeat("Qw8-eR7_", 120)),
+            format!("sk-admin-{}", repeat("m4N_b5V-", 120)),
+        ] {
+            let out = redact(&format!("key {key} end"));
+            assert_eq!(out.text, "key [REDACTED:openai_key] end", "{key}");
+        }
     }
 
     #[test]
