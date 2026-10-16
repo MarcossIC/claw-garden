@@ -1007,7 +1007,7 @@ mod tests {
                 importance: None,
                 derived_from: Vec::new(),
             };
-            let chunk = Chunk { text: content.into(), token_count: 0 };
+            let chunk = Chunk { text: content.into() };
             let vector = FakeEmbedder::default().embed_with_role(content, EmbedRole::Passage).await.unwrap();
             store.insert_memory_with_vector(NewMemoryRecord::from_event_and_chunk(&evt, &chunk), vector).await.unwrap();
         }
@@ -1051,7 +1051,7 @@ mod tests {
             importance: None,
             derived_from: Vec::new(),
         };
-        let chunk = Chunk { text: evt.content.clone(), token_count: 0 };
+        let chunk = Chunk { text: evt.content.clone() };
         let vector = FakeEmbedder::default().embed_with_role(&evt.content, EmbedRole::Passage).await.unwrap();
         store.insert_memory_with_vector(NewMemoryRecord::from_event_and_chunk(&evt, &chunk), vector).await.unwrap();
         let memories = |c: &mut rusqlite::Connection| -> rusqlite::Result<String> {

@@ -1701,6 +1701,186 @@ mod tests {
         tool(b, name).description.map(|d| d.to_string()).unwrap_or_default()
     }
 
+    // ── Agent contract ──────────────────────────────────────────────────────
+    //
+    // What the client hands the model to decide which tool to call: every
+    // tool as `tools/list` sends it, and the instructions. `serverInfo` stays
+    // out, since its name follows the profile and its version every bump.
+
+    const CONTRACT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp/agent_contract.json");
+    const BLESS: &str = "CLAWG_BLESS=1 cargo test -p clawg-cli the_agent_contract_matches_its_file";
+
+    fn agent_contract(b: &ClawgMcp) -> serde_json::Value {
+        let tools: serde_json::Map<String, serde_json::Value> = b
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| (t.name.to_string(), serde_json::to_value(&t).expect("a tool serializes")))
+            .collect();
+        serde_json::json!({ "instructions": b.get_info().instructions, "tools": tools })
+    }
+
+    fn contract_tools(contract: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        contract.get("tools").and_then(serde_json::Value::as_object).cloned().unwrap_or_default()
+    }
+
+    /// One line per tool that changed, appeared or disappeared, naming the
+    /// fields that changed, and one if the instructions changed.
+    fn contract_diff(expected: &serde_json::Value, actual: &serde_json::Value) -> Vec<String> {
+        let mut lines = Vec::new();
+        if expected.get("instructions") != actual.get("instructions") {
+            lines.push("the instructions changed".to_string());
+        }
+        let (before, after) = (contract_tools(expected), contract_tools(actual));
+        for (name, tool) in &after {
+            match before.get(name) {
+                None => lines.push(format!("{name} is new")),
+                Some(old) if old != tool => {
+                    let field = |t: &serde_json::Value, k: &str| t.get(k).cloned();
+                    let mut keys: Vec<&String> = old
+                        .as_object()
+                        .into_iter()
+                        .chain(tool.as_object())
+                        .flat_map(|o| o.keys())
+                        .filter(|k| field(old, k) != field(tool, k))
+                        .collect();
+                    keys.sort();
+                    keys.dedup();
+                    let keys: Vec<&str> = keys.into_iter().map(String::as_str).collect();
+                    lines.push(format!("{name} changed: {}", keys.join(", ")));
+                }
+                Some(_) => {}
+            }
+        }
+        lines.extend(before.keys().filter(|name| !after.contains_key(*name)).map(|name| format!("{name} is gone")));
+        lines
+    }
+
+    fn sorted_keys(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                serde_json::Value::Object(keys.into_iter().map(|k| (k.clone(), sorted_keys(&map[k]))).collect())
+            }
+            serde_json::Value::Array(items) => serde_json::Value::Array(items.iter().map(sorted_keys).collect()),
+            other => other.clone(),
+        }
+    }
+
+    /// The file's bytes: every object's keys sorted, so a blessing of the
+    /// same contract writes the same file whatever order `schemars` emits.
+    fn render_contract(contract: &serde_json::Value) -> String {
+        let mut text = serde_json::to_string_pretty(&sorted_keys(contract)).expect("the contract serializes");
+        text.push('\n');
+        text
+    }
+
+    #[test]
+    fn contract_diff_names_the_changed_tool() {
+        let expected = serde_json::json!({
+            "instructions": "use the tools",
+            "tools": {
+                "keep": { "name": "keep", "description": "same" },
+                "edit": { "name": "edit", "description": "before", "inputSchema": { "type": "object" } },
+                "gone": { "name": "gone" },
+            },
+        });
+        let actual = serde_json::json!({
+            "instructions": "use the tools often",
+            "tools": {
+                "keep": { "name": "keep", "description": "same" },
+                "edit": { "name": "edit", "description": "after", "inputSchema": { "type": "object" } },
+                "new": { "name": "new" },
+            },
+        });
+        let mut diff = contract_diff(&expected, &actual);
+        diff.sort();
+        assert_eq!(diff, ["edit changed: description", "gone is gone", "new is new", "the instructions changed"]);
+        assert!(contract_diff(&expected, &expected).is_empty());
+    }
+
+    #[test]
+    fn contract_diff_ignores_key_order() {
+        let a: serde_json::Value =
+            serde_json::from_str(r#"{"tools":{"x":{"name":"x","inputSchema":{"type":"object","required":["q"]}}},"instructions":"i"}"#)
+                .expect("json");
+        let b: serde_json::Value =
+            serde_json::from_str(r#"{"instructions":"i","tools":{"x":{"inputSchema":{"required":["q"],"type":"object"},"name":"x"}}}"#)
+                .expect("json");
+        assert!(contract_diff(&a, &b).is_empty(), "{:?}", contract_diff(&a, &b));
+    }
+
+    #[test]
+    fn render_contract_is_stable_and_sorted() {
+        let contract: serde_json::Value =
+            serde_json::from_str(r#"{"tools":{"b":{"name":"b"},"a":{"name":"a","description":"d"}},"instructions":"i"}"#)
+                .expect("json");
+        let rendered = render_contract(&contract);
+        assert_eq!(
+            rendered,
+            "{\n  \"instructions\": \"i\",\n  \"tools\": {\n    \"a\": {\n      \"description\": \"d\",\n      \"name\": \"a\"\n    },\n    \"b\": {\n      \"name\": \"b\"\n    }\n  }\n}\n"
+        );
+        let reread: serde_json::Value = serde_json::from_str(&rendered).expect("json");
+        assert_eq!(render_contract(&reread), rendered);
+    }
+
+    /// The names in backticks after the `):` of the line that opens with
+    /// `MCP tools (`, or `None` when no such line exists.
+    fn tool_names_in_doc(doc: &str) -> Option<std::collections::BTreeSet<String>> {
+        let line = doc.lines().find(|l| l.starts_with("MCP tools ("))?;
+        let (_, list) = line.split_once("): ")?;
+        Some(list.split('`').skip(1).step_by(2).map(str::to_string).collect())
+    }
+
+    #[test]
+    fn tool_names_in_doc_reads_the_mcp_tools_line() {
+        let doc = "# Title\n\nSee `server.rs`.\n\nMCP tools (`crates/x/server.rs`): `save_memory`, `search_memory`.\n\nMore `text`.\n";
+        let names = tool_names_in_doc(doc).expect("the line is there");
+        assert_eq!(names.into_iter().collect::<Vec<_>>(), ["save_memory", "search_memory"]);
+        assert_eq!(tool_names_in_doc("no list here\n"), None);
+    }
+
+    /// `.claude/CLAUDE.md` is what an agent working on this repo reads to learn
+    /// the tools; a tool added or dropped without it leaves that list stale.
+    #[tokio::test]
+    async fn the_claude_md_tool_list_is_the_registered_one() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.claude/CLAUDE.md");
+        let doc = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let documented = tool_names_in_doc(&doc).unwrap_or_else(|| panic!("{path} has no `MCP tools (...)` line"));
+        let (b, _d) = bridge().await;
+        let registered: std::collections::BTreeSet<String> =
+            b.tool_router.list_all().into_iter().map(|t| t.name.to_string()).collect();
+        let missing: Vec<&String> = registered.difference(&documented).collect();
+        let unknown: Vec<&String> = documented.difference(&registered).collect();
+        assert!(
+            missing.is_empty() && unknown.is_empty(),
+            "the MCP tools line of {path} is stale: missing {missing:?}, not registered {unknown:?}"
+        );
+    }
+
+    /// The descriptions, schemas and instructions are what the model reads
+    /// in every session; a change to them, ours or a dependency's, has to
+    /// show up as a diff of the contract file.
+    #[tokio::test]
+    async fn the_agent_contract_matches_its_file() {
+        let (b, _d) = bridge().await;
+        let actual = agent_contract(&b);
+        if std::env::var_os("CLAWG_BLESS").is_some_and(|v| v == "1") {
+            std::fs::write(CONTRACT_PATH, render_contract(&actual)).expect("write the contract file");
+            panic!("agent contract updated: review the diff of {CONTRACT_PATH} and run the tests again");
+        }
+        let text = std::fs::read_to_string(CONTRACT_PATH)
+            .unwrap_or_else(|e| panic!("read {CONTRACT_PATH}: {e}; create it with {BLESS}"));
+        let expected: serde_json::Value = serde_json::from_str(&text).expect("the contract file is JSON");
+        let diff = contract_diff(&expected, &actual);
+        assert!(
+            diff.is_empty(),
+            "what the model sees changed:\n{}\nif that is intended, run {BLESS} and review the diff",
+            diff.join("\n")
+        );
+    }
+
     /// An explicit save with no type is stored as `semantic_fact`
     /// (`NewMemoryRecord::from_event_and_chunk`). A schema that names another
     /// default teaches the model to pass a type it did not mean.

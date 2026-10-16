@@ -87,6 +87,16 @@ Current baseline (Windows): 1902 tests, all passing.
 
 On Windows, live `clawg.exe` processes (for example the editor's MCP bridge) lock `target\debug\clawg.exe` and make the build fail. Use a separate target directory instead: `cargo test --workspace --target-dir <other-dir>`.
 
+Compiler warnings, `dead_code` and `unused` among them, are errors here (clippy's own lints are not enforced yet):
+
+```
+cargo clippy --workspace --all-targets -- -A clippy::all -D warnings
+```
+
+`tests/conventions.rs` in `clawg-cli` fails when a source hides dead code behind an `allow`.
+
+What the model sees of the MCP server (each tool's name, description and input schema, and the instructions) is pinned in `crates/clawg-cli/src/mcp/agent_contract.json`. When a change to it is intended, run `CLAWG_BLESS=1 cargo test -p clawg-cli the_agent_contract_matches_its_file`: it rewrites the file and fails, so review the diff and run the tests again. The `MCP tools` line above is checked against the registered tools.
+
 ## Claude Code
 
 - Prefer `rg` for searching and the Read/Edit/Write tools over shell text utilities.

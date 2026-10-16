@@ -870,7 +870,7 @@ mod tests {
             importance: None,
             derived_from: Vec::new(),
         };
-        let chunk = Chunk { text: "hello".to_string(), token_count: 1 };
+        let chunk = Chunk { text: "hello".to_string() };
         let rec = NewMemoryRecord::from_event_and_chunk(&evt, &chunk);
         assert!(rec.disputed_against.is_none(),
             "from_event_and_chunk must default disputed_against=None");
@@ -895,7 +895,7 @@ mod tests {
             importance: None,
             derived_from: Vec::new(),
         };
-        let chunk = Chunk { text: "delta summary text".to_string(), token_count: 3 };
+        let chunk = Chunk { text: "delta summary text".to_string() };
         let rec = NewMemoryRecord::from_event_and_chunk(&evt, &chunk);
         assert_eq!(rec.memory_type, MemoryType::SessionSummary, "Compaction source must map to SessionSummary");
         assert_eq!(rec.created_by_type, CreatedByType::System, "Compaction source must map to System creator");
@@ -925,7 +925,7 @@ mod tests {
     }
 
     fn chunk_of(text: &str) -> crate::memory::chunker::Chunk {
-        crate::memory::chunker::Chunk { text: text.to_string(), token_count: 4 }
+        crate::memory::chunker::Chunk { text: text.to_string() }
     }
 
     #[test]

@@ -1,0 +1,405 @@
+{
+  "instructions": "Persistent memory for this user across sessions. Use `save_memory` whenever the user states a durable fact, preference or decision; use `search_memory` before answering anything that depends on earlier sessions, and `recall_context` once when a broad task needs background. When it lists ACTIVE CONFLICTS, ask the user which memory holds and record the answer with `resolve_conflict`. When `recall_context` says memories are waiting for a review, or the user asks what you have learned, call `synthesize` and save the conclusions it leads to. Memories are scoped to the current project unless you say otherwise. For how this project works (its design, conventions, commands or where something is implemented), call `search_project` before opening files: it searches the project's own documentation and code.",
+  "tools": {
+    "delete_memory": {
+      "description": "Delete one stored memory by id and kind. Get the id from `search_memory`, `list_memories` or `recall_context` first — ids are per-kind, so the same number exists in all three tables. Only your own memories: one marked `by <agent>` was saved by another agent and is read-only. `restore_memory` undoes it.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "id": {
+            "description": "The id of the row to delete, as printed by `search_memory`,\n`list_memories` or `recall_context`. A `recall_context` hit with no kind\nin front of its type is a memory.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "kind": {
+            "description": "Which table the id belongs to: memory, episodic or procedural. Required,\nbecause each table numbers its rows independently — id 7 exists in all\nthree and means something different in each.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "name": "delete_memory"
+    },
+    "list_memories": {
+      "description": "Browse what is stored, newest first, without searching. Use this to show the user their memory inventory or to find an id to delete. Returns one line per row: id, kind, type, tier, importance, access count, status and a truncated summary.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "kind": {
+            "default": null,
+            "description": "Which table to list: memory, episodic or procedural. Lists all three\nwhen omitted.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "default": null,
+            "description": "How many rows to return, 1 to 100. Defaults to 50.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memory_type": {
+            "default": null,
+            "description": "Only rows of this memory type. Applies to `memory` rows only.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "offset": {
+            "default": null,
+            "description": "How many rows to skip, for paging through a long list. Defaults to 0.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "tier": {
+            "default": null,
+            "description": "Only rows in this tier: 1 (hot), 2 (warm) or 3 (cold).",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "name": "list_memories"
+    },
+    "memory_status": {
+      "description": "Report whether the memory daemon is running, which profile and data directory it is using, and whether its embedding model has finished loading. Use this when a memory tool fails and you need to tell the user why.",
+      "inputSchema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "memory_status"
+    },
+    "read_memory": {
+      "description": "Read the whole text of a memory by id. A long text is saved as several pieces, and search shows one of them, marked piece=K/N, cut at 500 characters; pass its id to get every piece joined in order. Returns which piece the id is, the ids of the save (a deleted piece shows as missing) and the text.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "id": {
+            "description": "The id of any piece of the save, as printed by `search_memory`,\n`list_memories`, `recall_context` or `save_memory`.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "kind": {
+            "default": null,
+            "description": "Which table the id belongs to: memory, episodic or procedural.\nDefaults to memory, the only kind saved in pieces.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "read_memory"
+    },
+    "recall_context": {
+      "description": "Get a ready-to-read background block for a query: the user's workspace notes, recent memories and long-term memories, already assembled and deduplicated, with full content. It costs several times the tokens of `search_memory`, so use it once when starting a broad task that needs background, and `search_memory` for specific questions.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "project_path": {
+            "default": null,
+            "description": "Absolute path of the project. Defaults to the directory this bridge was\nstarted in.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "query": {
+            "description": "What the user is asking about. The returned block is meant to be read\nas background before answering, not quoted back to them.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "recall_context"
+    },
+    "resolve_conflict": {
+      "description": "Settle a conflict listed under ACTIVE CONFLICTS by `recall_context`, once the user has said which memory is right. `keep` stays; `other` is superseded by it and stops being retrieved, but is still listed and comes back if you resolve the pair the other way. Pass keep_both when the two do not really contradict each other. Returns the status of both memories. Only your own memories: one marked `by <agent>` is read-only.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "keep": {
+            "description": "The memory id that stays, as shown in the ACTIVE CONFLICTS block.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "keep_both": {
+            "default": null,
+            "description": "Set to true when the two memories do not actually contradict each\nother: both stay and the conflict is closed. Defaults to false.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "other": {
+            "description": "The other memory id of the same conflict. It is superseded by `keep`:\nno longer retrieved, still listed, and restored by resolving the pair\nthe other way round.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "keep",
+          "other"
+        ],
+        "type": "object"
+      },
+      "name": "resolve_conflict"
+    },
+    "restore_memory": {
+      "description": "Undo a `delete_memory`: bring a memory you deleted back, with the id and kind you deleted it with, when the user says the delete was a mistake. Refused when the same text was saved again since, or when the memory holds a secret. Only your own memories: one marked `by <agent>` is read-only.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "id": {
+            "description": "The id `delete_memory` was given.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "kind": {
+            "description": "The kind `delete_memory` was given. Only memory rows can be restored.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "name": "restore_memory"
+    },
+    "save_memory": {
+      "description": "Store something worth remembering across sessions: a fact about the user or their project, a preference they stated, or a decision that was made. Save one fact per call, in a few sentences: a long text is split into pieces that search finds one at a time, and read_memory returns it whole. Write the content so it still makes sense months from now, with no conversation around it. Returns the id of each stored piece, which update_memory and delete_memory accept, or why nothing was stored.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "content": {
+            "description": "The memory to store, written as a self-contained statement — it will be\nread back in a future session with none of this conversation around it.",
+            "type": "string"
+          },
+          "derived_from": {
+            "default": null,
+            "description": "Only for a conclusion: the ids of the memories it generalizes, as\n`synthesize` lists them. Omit for an ordinary memory.",
+            "items": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "importance": {
+            "default": null,
+            "description": "How much this matters, 0 to 10. Higher values survive longer and are\nretrieved sooner. Defaults to 5.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "memory_type": {
+            "default": null,
+            "description": "What kind of memory this is. One of: semantic_fact, user_preference,\narchitectural_decision, session_summary, code_block, chat_message,\ntool_error.\nDefaults to semantic_fact when omitted.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_path": {
+            "default": null,
+            "description": "Absolute path of the project this memory belongs to. Defaults to the\ndirectory this bridge was started in.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "type": "object"
+      },
+      "name": "save_memory"
+    },
+    "search_memory": {
+      "description": "Find stored memories related to a query. Use this first, before answering anything that depends on an earlier session. Matching is by meaning, so pass a full natural-language question, not keywords; it finds memories written in other words or in another language. Returns a numbered list of the memories close in relevance to the best match (at least two), with their ids, kinds and relevance scores; a short list means the rest scored far lower, not that nothing else is stored. Content longer than 500 characters is truncated. A hit marked piece=K/N is the best matching piece K of a long text saved as N pieces; read_memory with its id returns the whole text.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "all_projects": {
+            "default": null,
+            "description": "Search every project instead of just one. Use when the user asks about\nsomething that is not tied to the code in front of them.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "limit": {
+            "default": null,
+            "description": "How many memories to return, 1 to 50. Defaults to 10.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project_path": {
+            "default": null,
+            "description": "Absolute path of the project to search in. Defaults to the directory\nthis bridge was started in.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "query": {
+            "description": "What to look for, in natural language. Full sentences retrieve better\nthan keywords.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "search_memory"
+    },
+    "search_project": {
+      "description": "Search this project's own documentation (README, docs, CLAUDE.md, design notes, specs and manifests) and its Rust, Python and TypeScript code for how it works: its design, conventions, commands, decisions and where something is implemented. Use it before opening files when the question is how something in the project works or why it is the way it is. Matching is by meaning and by exact term, so pass a question or the name of the thing. Returns numbered passages, each under the file and the headings or definitions it comes from; the index follows the files on disk.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "limit": {
+            "default": null,
+            "description": "How many passages to return, 1 to 20. Defaults to 5.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project_path": {
+            "default": null,
+            "description": "Absolute path of the project. Defaults to the directory this bridge was\nstarted in.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "query": {
+            "description": "What to find out about the project, as a natural-language question or\nthe name of something in it.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "search_project"
+    },
+    "synthesize": {
+      "description": "Review stored memories for conclusions: the memories no conclusion covers yet, newest first, the conclusions already drawn, and how to save new ones. A conclusion is saved with `save_memory` and `derived_from`; the memories it rests on stay as they are. Use it when `recall_context` says memories are waiting, at the end of a long task, or when the user asks what you have learned. Calling it marks the memories as reviewed, even if you save nothing.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "all_projects": {
+            "default": null,
+            "description": "Review every project at once, for conclusions about the user rather\nthan about one codebase.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "limit": {
+            "default": null,
+            "description": "How many memories to review, 1 to 100. Defaults to 30.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project_path": {
+            "default": null,
+            "description": "Absolute path of the project to review. Defaults to the directory this\nbridge was started in.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "name": "synthesize"
+    },
+    "update_memory": {
+      "description": "Correct the importance or the type of one stored memory, by id and kind, when the user says it matters more or less than it was saved with, or that it is a different kind of memory. Pass only what changes. To change what a memory says, save the new text and delete the old one instead. Returns the memory's importance, type and tier after the change. Only your own memories: one marked `by <agent>` is read-only.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "id": {
+            "description": "The id of the row to change, as printed by `save_memory`,\n`search_memory`, `list_memories` or `recall_context`. A `recall_context`\nhit with no kind in front of its type is a memory.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "importance": {
+            "default": null,
+            "description": "The new importance, 0 to 10. Omit it to leave the importance as it is.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "kind": {
+            "description": "Which table the id belongs to: memory, episodic or procedural.",
+            "type": "string"
+          },
+          "memory_type": {
+            "default": null,
+            "description": "The new type, only for kind memory. One of: semantic_fact,\nuser_preference, architectural_decision, session_summary, code_block,\nchat_message, tool_error. Omit it to leave the type as it is.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "name": "update_memory"
+    }
+  }
+}

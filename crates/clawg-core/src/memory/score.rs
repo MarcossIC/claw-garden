@@ -244,11 +244,7 @@ pub(crate) fn lambda_for(cfg: &ScoringConfig, kind: TableKind, memory_type: &str
 // whole-second value, and both divisions truncate toward zero, so a stamp in
 // the future still yields the negative age that says the clock is wrong.
 //
-// `TimestampMs::age_days_from` is NOT used here even though it computes a
-// superficially similar quantity: it works directly in fractional
-// milliseconds-per-day with no truncation at either step, which is a
-// different number from the one this formula has always been fed. `/` is
-// used rather than `div_euclid` because that is what the original integer
+// `/` is used rather than `div_euclid` because that is what the original integer
 // division did: they agree for every exact multiple and every non-negative
 // dividend, and diverge only when the dividend is negative and not evenly
 // divisible — exactly the future-stamp case this formula exists to get right.

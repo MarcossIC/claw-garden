@@ -90,12 +90,6 @@ pub(crate) enum ChunkerKind {
 #[derive(Debug, Clone)]
 pub struct Chunk {
     pub text: String,
-    /// Approximate token count (target: `CHUNK_MAX_TOKENS`). Set by the tokenizer path;
-    /// 0 in byte-fallback mode. Nothing reads it yet — it is carried so a
-    /// re-ranking or telemetry consumer does not have to re-tokenize text the
-    /// splitter already counted.
-    #[allow(dead_code)]
-    pub token_count: usize,
 }
 
 /// Route an event to its chunker. Pure function — no I/O.

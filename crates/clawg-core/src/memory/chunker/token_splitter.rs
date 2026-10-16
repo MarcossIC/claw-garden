@@ -96,7 +96,7 @@ impl TokenSplitter {
                 let end_byte = offsets[end - 1].1;
                 // Safe: tokenizers guarantees offsets land on char boundaries.
                 let slice = &text[start_byte..end_byte];
-                Chunk { text: slice.to_string(), token_count: end - start }
+                Chunk { text: slice.to_string() }
             })
             .collect()
     }
@@ -123,7 +123,7 @@ impl TokenSplitter {
                 // so emit that character whole rather than an empty window.
                 e = ceil_char_boundary(text, s + 1).min(n);
             }
-            out.push(Chunk { text: text[s..e].to_string(), token_count: 0 });
+            out.push(Chunk { text: text[s..e].to_string() });
             if e == n {
                 break;
             }
@@ -300,7 +300,7 @@ mod tests {
 
     #[test]
     fn plan_windows_window_length_equals_end_minus_start_for_every_window() {
-        // Pins the exact quantity `split_by_tokens` reads off as `token_count`
+        // Pins the window length `split_by_tokens` slices each chunk by
         // (`end - start`) so an off-by-one there cannot silently drift from
         // what the windowing arithmetic actually produced.
         for &(max, overlap, n) in &[(480, 64, 6000usize), (1920, 256, 5760), (4, 0, 20), (1, 0, 5)] {
@@ -757,7 +757,6 @@ mod tests {
                 words[s..e].join(" "),
                 "chunk for window ({s},{e}) does not carry exactly those tokens"
             );
-            assert_eq!(chunk.token_count, e - s, "token_count must be the window length");
         }
     }
 
@@ -819,7 +818,6 @@ mod tests {
         let chunks = splitter.split(&text, 100, 20);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].text, text);
-        assert_eq!(chunks[0].token_count, 10);
     }
 
     #[test]
