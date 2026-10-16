@@ -299,6 +299,8 @@ impl FastEmbedLocal {
                     // Dropped oneshot receiver = caller gave up; ignore the send error.
                     let _ = resp.send(out);
                 }
+                drop(model);
+                return_freed_memory();
             })
             .map_err(|e| EmbedError::LoadFailed(format!("spawn worker: {e}")))?;
 
@@ -309,6 +311,24 @@ impl FastEmbedLocal {
         })
     }
 }
+
+/// Hands the pages freed by a dropped model back to the system. glibc keeps
+/// freed memory in its per-thread arenas: measured on Linux, dropping the
+/// session left ~650 MB of the ~1 GB resident until a trim brought the process
+/// down to ~40 MB. Other allocators return large blocks on their own.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn return_freed_memory() {
+    extern "C" {
+        fn malloc_trim(pad: usize) -> std::ffi::c_int;
+    }
+    // SAFETY: malloc_trim only releases free heap pages and takes no pointers.
+    unsafe {
+        malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn return_freed_memory() {}
 
 #[cfg(test)]
 impl FastEmbedLocal {
