@@ -1069,6 +1069,7 @@ async fn register(
         &app.runtime.workspaces(),
         std::path::Path::new(&body.root_path),
         &body.legacy_ids,
+        true,
     )
     .await
     .map_err(|e| match e {
