@@ -22,7 +22,7 @@
 ### 1. Qué raíces se registran
 
 - Cinco herramientas toman `project_path` y todas pasan por `project_for`: `save_memory` (`server.rs:541`), `search_memory` (`:570`), `recall_context` (`:596`), `search_project` (`:722`) y `synthesize` (`:747`). Sus campos son `server.rs:141`, `:159`, `:174`, `:188`, `:199`.
-- `resolve_project` da prioridad a `project_path` sobre el cwd del puente (`crates/clawg-cli/src/mcp/tools.rs:301-314`). `ProjectIdentity::resolve` sube hasta el primer `.git` o, fuera de git, deja el path canónico (`identity.rs:41-53`). Un `project_path` de `C:\Users\marco` sin `.git` arriba es la raíz **entera**.
+- `resolve_project` da prioridad a `project_path` sobre el cwd del puente (`crates/clawg-cli/src/mcp/tools.rs:301-314`). `ProjectIdentity::resolve` sube hasta el primer `.git` o, fuera de git, deja el path canónico (`identity.rs:41-53`). Un `project_path` de `C:\Users\dev` sin `.git` arriba es la raíz **entera**.
 - `project_for` registra la raíz una vez por proceso (`server.rs:515-521`). El daemon guarda `(id, root_path)` y lanza el refresco del índice en segundo plano (`api.rs:1036`, `spawn_doc_refresh` en `api.rs:1044-1064`).
 - Una ruta inexistente también se registra (se normaliza a texto, `identity.rs:44-47`), pero el índice falla con `NotADirectory` y sólo loguea (`crates/clawg-core/src/memory/project_docs/corpus.rs:70-72`, `api.rs:1061`). Queda una fila basura en `project`.
 - Lo que el índice lee: Markdown, manifiestos y código Rust, Python y TypeScript, hasta 2.000 archivos de 256 KB (`corpus.rs:14-17`), sin seguir enlaces simbólicos (`corpus.rs:81`) y saltando lo ignorado (`corpus.rs:73-83`). Se guarda en `project_doc_*` y viaja en los backups.

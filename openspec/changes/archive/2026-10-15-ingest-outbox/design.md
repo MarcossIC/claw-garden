@@ -57,7 +57,7 @@ Se reabre la decisión D2 de secret-hygiene (`openspec/changes/archive/2026-10-1
 
 ## D4. Durabilidad
 
-La inserción de la fila (y la importación del volcado viejo) se escribe con `synchronous = FULL` y después la conexión vuelve a su valor, `NORMAL` en WAL (`crates/clawg-core/src/memory/db.rs:197`). Así la fila sobrevive también a un corte de luz, a costa de un fsync por save aceptado; el resto de la base, incluidos el progreso y el `DELETE` del final, sigue en `NORMAL`. Perder el `DELETE` en un corte sólo hace que la fila se reproduzca, y el dedup la vuelve un refuerzo. Un `202` queda así más durable que un `201`, que es lo que Marcos eligió en la tarjeta del hilo.
+La inserción de la fila (y la importación del volcado viejo) se escribe con `synchronous = FULL` y después la conexión vuelve a su valor, `NORMAL` en WAL (`crates/clawg-core/src/memory/db.rs:197`). Así la fila sobrevive también a un corte de luz, a costa de un fsync por save aceptado; el resto de la base, incluidos el progreso y el `DELETE` del final, sigue en `NORMAL`. Perder el `DELETE` en un corte sólo hace que la fila se reproduzca, y el dedup la vuelve un refuerzo. Un `202` queda así más durable que un `201`, que es lo que se eligió en la tarjeta del hilo.
 
 Costo por save: la inserción de la fila (antes de contestar), el `UPDATE` de intentos al tomarla y el `DELETE` del final, más el `UPDATE` de progreso dentro de las transacciones que ya existían. Tres commits chicos más; sólo el de la inserción paga un fsync.
 

@@ -22,7 +22,7 @@ U2 de long-save-context no se cumplió: la respuesta de un save `long` era alcan
 
 ## Medición (2026-10-15, Linux, modelo real)
 
-**El `golden.json` de Marcos no está en el repo** (`.gitignore`: `docs/**/golden.json`). Se armó una base sustituta de 20 filas en inglés y español con 4 casos, y sobre ella `golden-mine synth --seed 7` (1.012 filas, 82 casos, 12 `long`). Los números son de ese set: sirven para ver el mecanismo, no reemplazan la medición sobre el set real. La base, el programa de diagnóstico y las salidas quedan en la carpeta del proyecto, `long-save-ranking/` (`stand-in-base.json`, `lsr_diag.rs`, `diag-main.txt`, `sweep.txt`).
+**El golden set local (`docs/eval/golden.json`) no está en el repo** (`.gitignore`: `docs/**/golden.json`). Se armó una base sustituta de 20 filas en inglés y español con 4 casos, y sobre ella `golden-mine synth --seed 7` (1.012 filas, 82 casos, 12 `long`). Los números son de ese set: sirven para ver el mecanismo, no reemplazan la medición sobre el set real. La base, el programa de diagnóstico y las salidas quedan en la carpeta del proyecto, `long-save-ranking/` (`stand-in-base.json`, `lsr_diag.rs`, `diag-main.txt`, `sweep.txt`).
 
 ### `main` tal cual
 

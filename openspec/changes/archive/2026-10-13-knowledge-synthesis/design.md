@@ -92,4 +92,4 @@ Se queda todo lo que lee o administra las tablas (punto 1 del alcance de la prop
 
 ## D8. Orden de los commits
 
-Primero la limpieza (con R1 cubierta por los tests que ya existen) en commits que compilan solos, después la migración, la procedencia, la síntesis, el HTTP y el MCP. Así la limpieza se puede revisar (o revertir) sin mirar la funcionalidad nueva, y si Marcos elige "sólo limpieza" la rama se corta después del commit de limpieza.
+Primero la limpieza (con R1 cubierta por los tests que ya existen) en commits que compilan solos, después la migración, la procedencia, la síntesis, el HTTP y el MCP. Así la limpieza se puede revisar (o revertir) sin mirar la funcionalidad nueva, y si se elige "sólo limpieza" la rama se corta después del commit de limpieza.

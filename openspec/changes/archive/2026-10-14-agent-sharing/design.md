@@ -79,7 +79,7 @@ El daemon serializa el campo tal cual. El cliente lo lee con `#[serde(default)]`
 
 ## D8. Orden de los commits
 
-La primera implementación siguió la propuesta con permisos explícitos (commits 1 a 8). Cuando Marcos eligió "Todo compartido", el cambio de semántica entró en dos commits más en lugar de reescribir la historia ya publicada:
+La primera implementación siguió la propuesta con permisos explícitos (commits 1 a 8). Cuando se eligió "Todo compartido", el cambio de semántica entró en dos commits más en lugar de reescribir la historia ya publicada:
 
 1. `refactor(core): drop the unused Scope enum` (R9).
 2. `feat(core): read and write the sharing policy`.

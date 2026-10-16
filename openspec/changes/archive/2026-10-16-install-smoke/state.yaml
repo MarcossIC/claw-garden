@@ -9,7 +9,7 @@ artifacts:
   design: done
   tasks: done
   apply: done
-  verify: done  # Linux, the CI on Linux and Windows, and Windows on Marcos's machine, see verify.md
+  verify: done  # Linux, the CI on Linux and Windows, and Windows, see verify.md
   archive: done
 main_spec: openspec/specs/install/spec.md
 updated: 2026-10-16

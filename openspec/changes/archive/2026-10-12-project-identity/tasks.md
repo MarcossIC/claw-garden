@@ -44,4 +44,4 @@ Orden: las tareas 1–4 no cambian ningún id en uso. La 5 es la que empieza a u
 ## Verify
 
 - [x] `cargo test --workspace` en Linux contra la base (ver `verify.md`).
-- [ ] En Windows (máquina de Marcos): el test de `#[cfg(windows)]` y un puente arrancado en la raíz y en un subdirectorio del repo real, con un perfil `dev` de prueba.
+- [ ] En Windows: el test de `#[cfg(windows)]` y un puente arrancado en la raíz y en un subdirectorio del repo real, con un perfil `dev` de prueba.

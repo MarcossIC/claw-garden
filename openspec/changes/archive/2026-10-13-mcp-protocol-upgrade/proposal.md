@@ -45,7 +45,7 @@ Tests que fallan hoy (en `main` o contra la lectura de identidad de hoy) y pasan
 
 Siguen pasando los tests del handshake legacy (`crates/clawg-cli/src/mcp/mod.rs`, el de la sonda de Claude Code) y el resto del suite. `rag-eval` no aplica: no cambia nada del core ni del ranking.
 
-**Verificación manual con Claude Code real, contra el perfil dev** (máquina de Marcos): conecta, lista las siete herramientas y las memorias guardadas antes del cambio se siguen encontrando.
+**Verificación manual con Claude Code real, contra el perfil dev**: conecta, lista las siete herramientas y las memorias guardadas antes del cambio se siguen encontrando.
 
 ## Vuelta atrás
 

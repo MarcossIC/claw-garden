@@ -75,7 +75,7 @@ Las métricas del ancla ya no son las del baseline de `openspec/config.yaml` (R@
 
 ## Perfil dev
 
-Con autorización de Marcos, el 2026-10-14, con el `clawg.exe` de `main` 9bbc78f copiado al scratchpad (para que el daemon no bloquee `target-test`) y con un proyecto aparte como directorio de trabajo. Los bridges se manejaron por JSON-RPC sobre stdio.
+Con autorización del usuario, el 2026-10-14, con el `clawg.exe` de `main` 9bbc78f copiado al scratchpad (para que el daemon no bloquee `target-test`) y con un proyecto aparte como directorio de trabajo. Los bridges se manejaron por JSON-RPC sobre stdio.
 
 1. `clawg backup --profile dev` → `memory-2026-10-15T01-37-58.694Z-manual.db`. No había `sharing.json`. `clawg stop --profile dev` frenó el daemon del editor, que corría un binario anterior a project-indexing y a agent-sharing.
 2. El primer bridge (`--agent a`) levantó el daemon nuevo: el store estaba en V11, así que dejó los snapshots `pre-migration` y `pre-reembed`, migró a V12 y re-embebió por media. Embedder `ready` a los ~15 s.

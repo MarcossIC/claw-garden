@@ -32,7 +32,7 @@ Las decisiones abiertas de la exploración se cierran con la opción recomendada
 - **`--fail-on-regression`:** opcional, sólo con `--diff`; falla si una métrica primaria empeora con p < 0,05.
 - **`--docs` no entra:** queda para docs-search-quality (20).
 - **Generador del bootstrap:** un SplitMix64 propio en `rag-eval`, copiado del de `golden-mine` y fijado con los mismos valores; no hay crate de biblioteca compartido ([diseño, D3](design.md#d3-generador-del-bootstrap)).
-- **Set versionado y escrito a mano (enfoque D):** queda fuera; Marcos lo eligió en la tarjeta del hilo. Los tests usan fixtures dentro del código.
+- **Set versionado y escrito a mano (enfoque D):** queda fuera; se eligió en la tarjeta del hilo. Los tests usan fixtures dentro del código.
 
 ## Alcance
 
@@ -49,7 +49,7 @@ Las decisiones abiertas de la exploración se cierran con la opción recomendada
 
 - Cambiar `RELEVANCE_RATIO`, el piso de coseno, el umbral de contradicción o cualquier ranking. Este cambio mide; si la medición dice que una constante no se sostiene, se abre otro cambio.
 - Correr nada sobre `~/.clawg*` ni ampliar el set privado.
-- Un set versionado (enfoque D): Marcos eligió dejarlo fuera.
+- Un set versionado (enfoque D): se eligió dejarlo fuera.
 - La clase multiagente y multiproyecto, y pruebas de significancia para `--docs`.
 - Intervalos de latencia y un reporte HTML.
 - La tabla de CLS del comentario de `contradiction.rs:35-45` (es del core; va al backlog).
@@ -58,7 +58,7 @@ Las decisiones abiertas de la exploración se cierran con la opción recomendada
 
 Cada requisito tiene un test que falla hoy ([spec](spec.md)). Además:
 
-- **Los números no cambian.** `rag-eval --real` sobre el golden privado da un `--diff` contra el ancla (`2026-10-15-real-project-indexing-tip-anchor.json`) con 0 mejores y 0 peores en todas las métricas, y el mismo `content_sha256`. Corre en la máquina de Marcos, donde está el set.
+- **Los números no cambian.** `rag-eval --real` sobre el golden privado da un `--diff` contra el ancla (`2026-10-15-real-project-indexing-tip-anchor.json`) con 0 mejores y 0 peores en todas las métricas, y el mismo `content_sha256`. Corre donde esté el golden set local (`docs/eval/golden.json`, fuera de git).
 - **El diff ve lo que hoy no ve.** `--diff` entre `2026-10-15-real-relsweep-*-agent-view.json` 0,60 y 0,35 informa en `search.found` 6 mejores, 0 peores y p = 0,031; entre 0,35 y 0,20, 1 y 0, p = 1,0.
 - **La suite:** 1.902 tests en Windows antes del cambio; en Linux, las 3 fallas de `diff::tests` desaparecen.
 

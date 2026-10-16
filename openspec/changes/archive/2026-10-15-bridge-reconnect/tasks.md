@@ -39,8 +39,8 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 ## 6. Verificación
 
 - [x] `cargo test --workspace` en cada commit; conteo contra la base.
-- [x] `verify.md` con los pasos de Marcos: la suite en Windows y, en el perfil dev, `clawg stop` y `clawg serve` con una sesión de Claude Code abierta.
-- [x] Correr esos pasos (máquina de Marcos).
+- [x] `verify.md` con los pasos locales: la suite en Windows y, en el perfil dev, `clawg stop` y `clawg serve` con una sesión de Claude Code abierta.
+- [x] Correr esos pasos.
 
 ## 7. Archive
 

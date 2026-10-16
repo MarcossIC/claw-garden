@@ -10,8 +10,8 @@ El objetivo 5, extraer conclusiones con el tiempo, no tiene ningún camino vivo.
 
 1. **El pipeline LLM está compilado y muerto.** `extractor.rs`, `miner.rs`, `resolver.rs` y `episodic_writer.rs` son módulos públicos sin llamador en producción (`crates/clawg-core/src/memory/mod.rs:64-67`), igual que `providers` y `services` (`crates/clawg-core/src/lib.rs:10, 14`). `serve` sólo lanza el bootstrap del embedder, la ingesta y el mantenimiento (`crates/clawg-cli/src/daemon/serve.rs:87-103`). Lo que los alimentaba (la app de escritorio, su configuración, credenciales y runtime de agente) se borró en `5678ded`. Son unas 6.200 líneas que sólo ejercitan sus propios tests.
 2. **Dos lectores de esas tablas tampoco tienen llamador:** `get_failure_histogram_core` y `get_skill_steps_trend_core` (`crates/clawg-core/src/memory/admin.rs:889, 954`) eran comandos de la app.
-3. **Las tablas `episodic_trajectory` y `procedural_skill` sí pueden tener datos.** Hasta `5678ded`, la app de escritorio corría el miner al cerrar cada sesión y escribía trayectorias y skills (`5678ded^:src-tauri/src/memory_runtime.rs:264-340`) en el mismo directorio de datos (`5678ded^:src-tauri/src/state.rs:136`). La base de Marcos puede tener filas ahí, y hoy se recuperan: KNN de 5 + 5 en cada búsqueda (`crates/clawg-core/src/memory/search.rs:35-36`), la sección de skills del workspace (`crates/clawg-core/src/memory/workspace.rs:319-360`), `list_memories`, `GET` y `DELETE`. La opción a de la exploración (borrar las tablas y sus ramas KNN) escondería esas filas, y eso lo prohíbe `config.yaml`.
-4. **No hay forma de registrar una conclusión como tal.** El agente puede guardar "Marcos prefiere X" con `save_memory`, pero nada distingue esa fila de un hecho suelto, nada dice de qué memorias salió y nada le pide al agente que la escriba. El detector de contradicciones, además, puede disputar la conclusión contra sus propias fuentes: son filas cercanas, del mismo tema y con tipos que cargan afirmaciones (`crates/clawg-core/src/memory/worker.rs:522-525`, `crates/clawg-core/src/memory/contradiction.rs:122`).
+3. **Las tablas `episodic_trajectory` y `procedural_skill` sí pueden tener datos.** Hasta `5678ded`, la app de escritorio corría el miner al cerrar cada sesión y escribía trayectorias y skills (`5678ded^:src-tauri/src/memory_runtime.rs:264-340`) en el mismo directorio de datos (`5678ded^:src-tauri/src/state.rs:136`). Una base existente puede tener filas ahí, y hoy se recuperan: KNN de 5 + 5 en cada búsqueda (`crates/clawg-core/src/memory/search.rs:35-36`), la sección de skills del workspace (`crates/clawg-core/src/memory/workspace.rs:319-360`), `list_memories`, `GET` y `DELETE`. La opción a de la exploración (borrar las tablas y sus ramas KNN) escondería esas filas, y eso lo prohíbe `config.yaml`.
+4. **No hay forma de registrar una conclusión como tal.** El agente puede guardar "el usuario prefiere X" con `save_memory`, pero nada distingue esa fila de un hecho suelto, nada dice de qué memorias salió y nada le pide al agente que la escriba. El detector de contradicciones, además, puede disputar la conclusión contra sus propias fuentes: son filas cercanas, del mismo tema y con tipos que cargan afirmaciones (`crates/clawg-core/src/memory/worker.rs:522-525`, `crates/clawg-core/src/memory/contradiction.rs:122`).
 
 ## Decisiones (cierran las abiertas de la exploración)
 
@@ -62,7 +62,7 @@ El objetivo 5, extraer conclusiones con el tiempo, no tiene ningún camino vivo.
 | R@1 / R@5 / R@10 | 0,4348 / 0,7826 / 0,8913 | sin bajar ninguna |
 | MRR / nDCG@10 | 0,5979 / 0,6693 | sin bajar ninguna |
 
-La calidad de las conclusiones no tiene métrica automática: depende del agente. Se revisa a mano en la verificación, con el perfil dev en la máquina de Marcos (ver `verify.md`).
+La calidad de las conclusiones no tiene métrica automática: depende del agente. Se revisa a mano en la verificación, con el perfil dev (ver `verify.md`).
 
 ## Datos guardados
 

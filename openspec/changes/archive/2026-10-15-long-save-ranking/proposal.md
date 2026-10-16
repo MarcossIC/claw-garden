@@ -16,7 +16,7 @@ U2 de long-save-context (0,333 contra 0,75) se midió antes del pooling mean y d
 
 ## Decisión
 
-**Pedazos chicos (a de la exploración).** Tarjeta en el hilo, opción recomendada; mientras Marcos no elija otra, se sigue con ésta.
+**Pedazos chicos (a de la exploración).** Tarjeta en el hilo, opción recomendada; mientras no se elija otra, se sigue con ésta.
 
 - **¿Por qué no ventanas aparte (b)?** Daría el mismo ranking con una tabla nueva, migración y re-embed de ventanas. a lo consigue con dos constantes y deja la vista previa con el pedazo que ganó.
 - **¿Por qué no un puntaje por save (c)?** Los hermanos no tienen la respuesta; subir el save no hace ganar al pedazo correcto.
@@ -49,7 +49,7 @@ No cambia el esquema ni ningún dato guardado. Las filas, vínculos y vectores d
 - un save con más pedazos que el pozo deja lugar a otras memorias en el resultado;
 - las filas `long` de `golden-mine synth` no cambian al bajar el tope.
 
-**`rag-eval`, con umbrales fijados antes de medir** (set real de Marcos):
+**`rag-eval`, con umbrales fijados antes de medir** (golden set local, `docs/eval/golden.json`, fuera de git):
 
 | # | Condición | Corrida |
 |---|---|---|

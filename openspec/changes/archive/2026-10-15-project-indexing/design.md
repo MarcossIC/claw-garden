@@ -186,7 +186,7 @@ La opción elegida suma el código al mismo índice. Se reusan las tablas, el re
 
 ## D10. Pooling mean y re-embebido al arrancar
 
-Medido sobre las 10 preguntas de docs, el mismo e5-small con pooling mean sube MRR@10 de 0,16 a 0,29 sin tocar nada más; los modelos más grandes y el reranker que se probaron antes no superan eso por lo que cuestan (ver `verify.md`). El pooling vale para todo el store, así que Marcos eligió aplicarlo también a las memorias, y re-embeberlas al arrancar.
+Medido sobre las 10 preguntas de docs, el mismo e5-small con pooling mean sube MRR@10 de 0,16 a 0,29 sin tocar nada más; los modelos más grandes y el reranker que se probaron antes no superan eso por lo que cuestan (ver `verify.md`). El pooling vale para todo el store, así que se eligió aplicarlo también a las memorias, y re-embeberlas al arrancar.
 
 | Opción para los vectores guardados | A favor | En contra |
 |---|---|---|
@@ -205,4 +205,4 @@ Medido sobre las 10 preguntas de docs, el mismo e5-small con pooling mean sube M
 
 ## D11. Umbrales provisionales
 
-El golden set de memorias (`docs/eval/golden.json`) no está en este entorno, así que los umbrales se movieron con un proxy medido acá y quedan marcados como provisionales en su comentario. Con el piso viejo, el 91 % de los top-10 con mean quedaría bajo 0,8793 y el término de coseno valdría 0: no moverlo rompe el ranking. Los valores salen de mantener la misma posición en la distribución (percentil 5 para el piso) o la misma separación entre clases (contradicción y casi-duplicado). La calibración real es `rag-eval --real --audit`, `--sweep-cos-floor` y el sweep de contradicciones sobre el golden set, en la máquina de Marcos.
+El golden set de memorias (`docs/eval/golden.json`) no está en este entorno, así que los umbrales se movieron con un proxy medido acá y quedan marcados como provisionales en su comentario. Con el piso viejo, el 91 % de los top-10 con mean quedaría bajo 0,8793 y el término de coseno valdría 0: no moverlo rompe el ranking. Los valores salen de mantener la misma posición en la distribución (percentil 5 para el piso) o la misma separación entre clases (contradicción y casi-duplicado). La calibración real es `rag-eval --real --audit`, `--sweep-cos-floor` y el sweep de contradicciones sobre el golden set, con el golden set local.

@@ -38,4 +38,4 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 
 - [x] Suite y clippy en Linux sobre el último commit.
 - [x] El workflow en verde en Linux y Windows.
-- [x] Suite en Windows en la máquina de Marcos.
+- [x] Suite en Windows.

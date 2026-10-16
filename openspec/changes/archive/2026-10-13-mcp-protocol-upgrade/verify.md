@@ -55,7 +55,7 @@ claude -p ... --mcp-config '{"mcpServers":{"probe":{"type":"stdio","command":"..
 ```
 
 - `memory_status`: `agent: claude-code (reported by the client; pin it with --agent)`. El nombre sale del cliente y no es `mcp`.
-- `search_memory` ("¿Cómo se llama el bar de la esquina de Marco?") encuentra la #2 con score 0,64: el cliente sin `--agent` ve lo que se guardó antes del cambio.
+- `search_memory` ("¿Cómo se llama el bar de la esquina?"; la consulta que se corrió nombraba a una persona y se reescribió acá) encuentra la #2 con score 0,64: el cliente sin `--agent` ve lo que se guardó antes del cambio.
 - `list_memories` muestra la misma #2.
 
 No se guardó nada en esta prueba: `memory_status` informa el `agent_id` con el que se guardaría, que es el mismo bajo el que están las filas anteriores. No se determinó si Claude Code 2.1.296 usó el ciclo legacy o el 2026-07-28; la spec acepta los dos (R2 y R3), y el nombre resultó `claude-code` igual.

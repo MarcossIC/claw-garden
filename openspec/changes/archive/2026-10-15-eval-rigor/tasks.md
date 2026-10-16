@@ -72,8 +72,8 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 ## 12. Verificación
 
 - [x] `cargo test --workspace` en Linux en cada commit; el comando de `clippy` de `.claude/CLAUDE.md`.
-- [x] `verify.md` con el conteo y lo pendiente en la máquina de Marcos: la suite en Windows, `rag-eval --real` contra el ancla (diff vacío) y `--diff` de los `relsweep` de agent-view (0,60 contra 0,35: 6 y 0, p = 0,031).
-- [x] Correr esos pasos (máquina de Marcos) sobre `main` en `210c692`: pasan 1.983 y falla 1, un test de project-root-guard que no es de este cambio. `clippy` sale con código 0. El ancla da un diff vacío, y los `relsweep` y el piso léxico dan lo anticipado.
+- [x] `verify.md` con el conteo y lo pendiente en Windows con el golden set local: la suite en Windows, `rag-eval --real` contra el ancla (diff vacío) y `--diff` de los `relsweep` de agent-view (0,60 contra 0,35: 6 y 0, p = 0,031).
+- [x] Correr esos pasos sobre `main` en `210c692`: pasan 1.983 y falla 1, un test de project-root-guard que no es de este cambio. `clippy` sale con código 0. El ancla da un diff vacío, y los `relsweep` y el piso léxico dan lo anticipado.
 
 ## 13. Archive
 

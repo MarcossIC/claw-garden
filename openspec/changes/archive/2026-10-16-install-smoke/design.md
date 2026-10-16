@@ -28,7 +28,7 @@ Un valor desconocido es un error al arrancar (`ServeError::Embedder`), no el mod
 | Alternativa | Por qué no |
 |---|---|
 | El modelo real copiado a la caché del home temporal | 470 MB en cada máquina y en el CI, y una carga lenta, para probar supervivencia y no ranking |
-| Las dos según una variable (la recomendación de la exploración) | El camino real lo recorre la verificación en Windows de cada cambio, con el modelo real en la máquina de Marcos (por ejemplo, la de ingest-outbox); sumar su caché al CI es costo sin una falla que hoy lo pida. Queda abierto |
+| Las dos según una variable (la recomendación de la exploración) | El camino real lo recorre la verificación en Windows de cada cambio, con el modelo real (por ejemplo, la de ingest-outbox); sumar su caché al CI es costo sin una falla que hoy lo pida. Queda abierto |
 | Un `202` con el modelo falso y un retardo | Una carrera contra el reloj; `stalled` da el `202` siempre |
 
 ## D3. Sólo en el binario de test

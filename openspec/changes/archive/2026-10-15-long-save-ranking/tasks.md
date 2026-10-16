@@ -40,8 +40,8 @@ Si el test pasa sin código nuevo (lo esperado), el commit es sólo el test: fij
 ## 6. Verificación
 
 - [x] `cargo test --workspace` en cada commit; conteo contra la base.
-- [x] `verify.md` con los pasos de Marcos: U0 a U3 sobre su set real, y la suite en Windows.
-- [x] Correr esos pasos (máquina de Marcos): suite 1.900/0, U0 a U3 ✓ y perfil dev ✓.
+- [x] `verify.md` con los pasos locales: U0 a U3 sobre el golden set local, y la suite en Windows.
+- [x] Correr esos pasos: suite 1.900/0, U0 a U3 ✓ y perfil dev ✓.
 
 ## 7. Archive
 

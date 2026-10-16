@@ -57,8 +57,8 @@ Al correr `cargo test -p clawg-core` solo apareció otro warning, `search_all_me
 - [x] `cargo test --workspace` en cada commit; conteo contra la base y sin warnings del workspace.
 - [x] El comando de `clippy` de D7 termina con código 0.
 - [x] Bendecir a mano (R2): con `CLAWG_BLESS=1` reescribe y falla; la siguiente pasa; dos bendiciones dan los mismos bytes.
-- [x] `verify.md` con los pasos de Marcos: la suite y el `clippy` en Windows.
-- [x] Correr esos pasos (máquina de Marcos): 1.918 pasan y 0 fallan, `clippy` con código 0.
+- [x] `verify.md` con los pasos locales: la suite y el `clippy` en Windows.
+- [x] Correr esos pasos: 1.918 pasan y 0 fallan, `clippy` con código 0.
 
 ## 10. Archive
 

@@ -14,7 +14,7 @@ Detalle en la [exploración](exploration.md#problema-verificado-contra-el-códig
 
 ## Decisiones
 
-Defaults tomados donde la exploración dejaba la pregunta abierta. La de los patrones por contexto se preguntó en el hilo con una tarjeta; mientras Marcos no elija otra, se sigue con la recomendada.
+Defaults tomados donde la exploración dejaba la pregunta abierta. La de los patrones por contexto se preguntó en el hilo con una tarjeta; mientras no se elija otra, se sigue con la recomendada.
 
 - **Criterio para `sk-`: mayúscula, minúscula y dígito.** Las claves de OpenAI son aleatorias en base62 o base64url, así que tienen las tres clases; un identificador, una ruta o un nombre de paquete casi nunca lleva mayúsculas. Es una regla de una línea en `accepts`, sin tocar los otros patrones ([diseño, D1](design.md#d1-el-criterio-para-sk-)).
 - **La marca es `<private>…</private>`**, sin distinguir mayúsculas, y se reemplaza entera (con las marcas) por `[REDACTED:private]`. Una marca sin cerrar enmascara hasta el final del texto, como ya fijó el mapa. Una marca que abre justo después de una comilla invertida (`` `<private>` ``) es texto, no marca: así se puede escribir sobre la marca en un save o en un `.md` sin perder lo que sigue ([D2](design.md#d2-la-marca)).
@@ -64,4 +64,4 @@ Tests que fallan hoy (detalle en la [spec](spec.md)):
 - `masking_twice_finds_nothing_new` sigue valiendo con todos los tipos;
 - `clawg secrets` lista una fila guardada antes con un patrón nuevo.
 
-`rag-eval` no aplica: no cambia el ranking. En la máquina de Marcos, `clawg secrets` sobre el perfil dev con el binario nuevo es la medición sobre datos reales: cada fila nueva que lista es un secreto que se había guardado en claro o un falso positivo nuevo que hay que mirar ([`verify.md`](verify.md)).
+`rag-eval` no aplica: no cambia el ranking. `clawg secrets` sobre el perfil dev con el binario nuevo es la medición sobre datos reales: cada fila nueva que lista es un secreto que se había guardado en claro o un falso positivo nuevo que hay que mirar ([`verify.md`](verify.md)).

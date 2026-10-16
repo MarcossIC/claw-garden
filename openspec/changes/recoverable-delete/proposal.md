@@ -15,7 +15,7 @@ Borrar una memoria es el único error que hoy no tiene vuelta atrás. Detalle en
 
 ## Decisiones (cierran las abiertas de la exploración)
 
-Tarjeta en el hilo para la superficie; el resto son los valores por defecto que la exploración recomendaba o que siguen la regla de cambios anteriores. Mientras Marcos no elija otra cosa, se sigue con éstos.
+Tarjeta en el hilo para la superficie; el resto son los valores por defecto que la exploración recomendaba o que siguen la regla de cambios anteriores. Mientras no se elija otra cosa, se sigue con éstos.
 
 - **Superficie: el agente y el usuario.** Herramienta MCP `restore_memory` (la duodécima) con el agente que llama, más `clawg undelete <ID>` y `clawg memories list --deleted` para el usuario. El caso común es "me equivoqué, deshacelo" en la misma conversación, y el agente tiene el id: lo acaba de pasar a `delete_memory`. Restaurar se deshace volviendo a borrar, así que no necesita la barrera de `purge` (sólo CLI, con el daemon parado).
 - **Sólo lo propio.** Con scope, una fila de otro agente es "no existe", como `delete_memory` ([`specs/visibility`](../../specs/visibility/spec.md) R3 y R4; [`specs/sharing`](../../specs/sharing/spec.md) R5: lo compartido es de sólo lectura). `clawg undelete` es del usuario y no lleva scope.

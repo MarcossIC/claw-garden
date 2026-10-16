@@ -2,7 +2,7 @@
 
 **Código:** rama `claude/project-thread-851hmw`, un commit por tarea.
 **Modo:** Strict TDD. Cada test nuevo se vio fallar antes de su código (por no compilar o por la aserción), salvo `a_code_block_save_is_chunked_like_any_other`, que pasa desde el principio porque protege un borrado.
-**Estado:** verificado en Linux y en Windows; R1 a R15 pasan. Archivado el 2026-10-15 con dos criterios de salida que no se cumplen y que Marcos aceptó: la búsqueda en docs no llega al umbral de la propuesta (Hit@3 0,27 contra 0,70) y el ancla de memorias baja con el pooling mean (R@5 0,7826 → 0,6522, toda en las consultas en inglés). La verificación en Windows encontró que `RELEVANCE_RATIO` cortaba de más con mean y lo recalibró de 0,6 a 0,35 (ver «Windows»). Los otros umbrales de R15 quedaron medidos sobre el golden set y no cambian.
+**Estado:** verificado en Linux y en Windows; R1 a R15 pasan. Archivado el 2026-10-15 con dos criterios de salida que no se cumplen y que se aceptaron: la búsqueda en docs no llega al umbral de la propuesta (Hit@3 0,27 contra 0,70) y el ancla de memorias baja con el pooling mean (R@5 0,7826 → 0,6522, toda en las consultas en inglés). La verificación en Windows encontró que `RELEVANCE_RATIO` cortaba de más con mean y lo recalibró de 0,6 a 0,35 (ver «Windows»). Los otros umbrales de R15 quedaron medidos sobre el golden set y no cambian.
 
 ## Suite
 
@@ -99,7 +99,7 @@ Preguntas de código (cuenta la ruta, sin encabezado):
 
 ## Lo que cambió durante la implementación
 
-- **El código entra al índice (R13).** Marcos eligió "Docs + código cAST": el chunker muerto se borró igual (R1) y el troceo de código se escribió de cero con cAST.
+- **El código entra al índice (R13).** Se eligió "Docs + código cAST": el chunker muerto se borró igual (R1) y el troceo de código se escribió de cero con cAST.
 - **Pooling mean (R14).** Midiendo, apareció que e5-small se cargaba con pooling CLS. Se corrigió para todo el store, con re-embebido al arrancar después de un snapshot `pre-reembed`. El seam de verificación del bootstrap pasa a recibir el embedder.
 - **Umbrales provisionales (R15).** Con el piso de coseno viejo, el 91 % de los top-10 con mean quedaba debajo. Se movieron con un proxy (los docs de este repo y 20 pares escritos a mano) porque el golden set de memorias no está en este entorno. Los fixtures de contradicción se movieron a L2 ≈ 0,26 para quedar dentro de la banda nueva.
 
@@ -199,7 +199,7 @@ Aciertan primeras d01, d03, c02 y c04. d02 sale 8.ª y d05 5.ª, y las otras 9 n
 
 ### Perfil dev y Claude Code
 
-Con la evidencia que ya había, decidido con Marcos. No se tocó `~/.clawg-dev`.
+Con la evidencia que ya había, decidido en el hilo. No se tocó `~/.clawg-dev`.
 
 - **Re-embebido al arrancar.** El 2026-10-15 a las 01:38 UTC, la prueba de agent-sharing levantó un daemon de `9bbc78f` sobre el store dev, que estaba en V11 con vectores CLS. Dejó `memory-2026-10-15T01-38-17.341Z-pre-migration.db` y `memory-2026-10-15T01-38-30.827Z-pre-reembed.db`, migró a V12, re-embebió por media y quedó `ready` a los ~15 s ([verify de agent-sharing](../2026-10-14-agent-sharing/verify.md#perfil-dev), paso 2). La instalación de 0.3.0 en prod repitió lo mismo: `memory-2026-10-15T02-28-17.864Z-pre-migration.db` y `…02-28-19.943Z-pre-reembed.db`, con `memory_status` en `ready`. `loading` no se observó en vivo. Lo publica `run_embedder_bootstrap` antes de verificar el contrato (`bootstrap.rs:339`).
 - **`search_project` desde Claude Code.** En esta sesión (perfil prod, 0.3.0, agente `claude-code`), la pregunta «¿qué pasa al arrancar si el store tiene vectores CLS del mismo modelo?» trajo `bootstrap.rs > mod tests` (`cls_vectors_are_snapshotted_then_reembedded_by_mean`) y `README.md > Claw Garden > Si algo falla`, el pasaje sobre `loading` después de actualizar. Todavía con el aviso de índice en curso, porque el daemon tenía 6 minutos. Editar un doc cambia el resultado: minutos después de escribir la sección «Windows» de este archivo, «¿a qué valor se recalibró RELEVANCE_RATIO con pooling mean y por qué ese valor?» la trajo 3.ª, y la línea nueva de `specs/retrieval` salió 1.ª.

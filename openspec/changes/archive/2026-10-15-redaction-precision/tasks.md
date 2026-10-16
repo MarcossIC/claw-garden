@@ -40,7 +40,7 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 ## 7. Verificación
 
 - [x] `cargo test --workspace` sobre el último commit, clippy con `-A clippy::all -D warnings`, `verify.md` con el conteo contra la base.
-- [x] Pendiente en Windows (máquina de Marcos): la suite, clippy y `clawg secrets` sobre el perfil dev. En `2b1b08a` pasan 1.995 (la base de 1.984 más los 11 de este cambio) y no falla ninguno; `clippy` con código 0; `clawg secrets --profile dev` no lista ninguna fila.
+- [x] Pendiente en Windows: la suite, clippy y `clawg secrets` sobre el perfil dev. En `2b1b08a` pasan 1.995 (la base de 1.984 más los 11 de este cambio) y no falla ninguno; `clippy` con código 0; `clawg secrets --profile dev` no lista ninguna fila.
 
 ## 8. El separador `::` (R4)
 

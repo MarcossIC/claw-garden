@@ -35,7 +35,7 @@
 
 ## Set sustituto (Linux, modelo real)
 
-El `golden.json` de Marcos no está en el repo. La base sustituta (20 filas, 4 casos) y el programa de diagnóstico están en la carpeta del proyecto, `long-save-ranking/`; el set es `golden-mine synth --seed 7` sobre ella (1.012 filas, 82 casos, 12 `long`). `rag-eval --real --agent-view --golden <set>`, con el binario de `main` y con el de la punta:
+El golden set local (`docs/eval/golden.json`) no está en el repo. La base sustituta (20 filas, 4 casos) y el programa de diagnóstico están en la carpeta del proyecto, `long-save-ranking/`; el set es `golden-mine synth --seed 7` sobre ella (1.012 filas, 82 casos, 12 `long`). `rag-eval --real --agent-view --golden <set>`, con el binario de `main` y con el de la punta:
 
 | Subconjunto | Métrica | `main` | Punta |
 |---|---|---|---|

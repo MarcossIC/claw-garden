@@ -54,7 +54,7 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 ## 9. Verificación
 
 - [x] `cargo test --workspace` en cada commit, clippy con `-A clippy::all -D warnings`, `verify.md` con el conteo contra la base.
-- [x] Pendiente en Windows (máquina de Marcos): la suite y clippy. Sobre `main` en `210c692` fallaba `adding_a_project_lets_its_docs_be_searched`, un error del test con el prefijo `\\?\`; arreglado en `8312e42`, pasan 1.984 y no falla ninguno. `clippy` sale con código 0.
+- [x] Pendiente en Windows: la suite y clippy. Sobre `main` en `210c692` fallaba `adding_a_project_lets_its_docs_be_searched`, un error del test con el prefijo `\\?\`; arreglado en `8312e42`, pasan 1.984 y no falla ninguno. `clippy` sale con código 0.
 
 ## 10. Archive
 

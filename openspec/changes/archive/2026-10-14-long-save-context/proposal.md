@@ -19,7 +19,7 @@ Ya no son problema, y quedan fuera:
 
 ## Decisión (cierra las abiertas de la exploración)
 
-**Puntero y contexto (a + b de la exploración).** Tarjeta en el hilo, opción recomendada. Mientras Marcos no elija otra, se sigue con ésta.
+**Puntero y contexto (a + b de la exploración).** Tarjeta en el hilo, opción recomendada. Mientras no se elija otra, se sigue con ésta.
 
 - **¿a, b o las dos?** Las dos. b sola no arregla el vector: un pedazo sin el tema sigue sin aparecer por el tema. a sola tiene que guardar la cabecera dentro de cada pedazo, y entonces el agente la lee repetida y los hermanos siguen ocupando el top. Además, con a, los hermanos se parecen más entre sí (comparten el comienzo), así que empujan más fuerte hacia el top: sin el colapso de b, a empeora el problema 2.
 - **¿La cabecera se guarda o sólo se embebe?** Sólo se embebe. Se guarda aparte, en el vínculo del pedazo, para que un re-embed la reconstruya igual (`reembed_all`, `crates/clawg-core/src/memory/maintenance.rs:467`, lee el texto de la fila y lo vuelve a embeber). El contenido de la fila, su hash, el FTS y lo que ve el agente no cambian. El desajuste que temía la exploración (`chunker/mod.rs:12-14`) es otro: el truncado silencioso del embedder. Acá el vector lleva el texto completo de la fila más un contexto declarado, y nada se trunca (D2 del diseño).

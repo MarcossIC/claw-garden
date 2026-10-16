@@ -1,6 +1,6 @@
 # recoverable-delete — Verificación
 
-**Estado:** verificado en Linux, commit por commit. Falta lo que corre en la máquina de Marcos: la suite en Windows, `rag-eval --real --diff` y la prueba con el perfil dev ([pendiente](#pendiente-máquina-de-marcos)).
+**Estado:** verificado en Linux, commit por commit. Falta lo que necesita Windows, el golden set local y el perfil dev: la suite en Windows, `rag-eval --real --diff` y la prueba con el perfil dev ([pendiente](#pendiente-en-windows)).
 
 ## Tests
 
@@ -55,7 +55,7 @@ Los warnings de compilación no cambian.
 
 No corrido en Linux: necesita el modelo real. El cambio no toca la búsqueda, el puntaje ni el prompt, y el golden set no borra ni restaura filas, así que se espera diff vacío.
 
-## Pendiente (máquina de Marcos)
+## Pendiente en Windows
 
 1. **Suite en Windows:** `cargo test --workspace --no-fail-fast --target-dir target-test` en la punta de la rama. Se esperan 1.864 + 30 = **1.894 pasan, 0 fallan**.
 2. **rag-eval:** `rag-eval --real --diff` contra `main`, en el ancla y en `--agent-view`. Se espera diff vacío.

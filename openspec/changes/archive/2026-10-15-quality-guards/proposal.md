@@ -15,7 +15,7 @@ Lo que el modelo ve del servidor (nombres, descripciones y schemas de las herram
 
 ## Decisiones
 
-- **`AGENTS.md` pasa a ser un puntero** a `.claude/CLAUDE.md` (tarjeta en el hilo, opción recomendada; mientras Marcos no elija otra, se sigue con ésta). La causa del atraso es tener dos copias.
+- **`AGENTS.md` pasa a ser un puntero** a `.claude/CLAUDE.md` (tarjeta en el hilo, opción recomendada; mientras no se elija otra, se sigue con ésta). La causa del atraso es tener dos copias.
 - **Snapshot del contrato** (enfoque A): un JSON versionado junto a `server.rs` con cada herramienta tal como sale en `tools/list` y el texto de las instrucciones, sin el nombre ni la versión del servidor. Se bendice con `CLAWG_BLESS=1`, que reescribe el archivo y falla igual. Detalle en el [diseño](design.md).
 - **Inventario sólo contra `.claude/CLAUDE.md`** (enfoque B): su línea `MCP tools (...)` tiene un formato estable. La spec `mcp` no entra: los nombres van dentro de una oración en español y la mantiene el archivo de cada cambio.
 - **`Chunk::token_count` se borra.** «Nothing reads it yet» es la definición de especulativo; los tests que lo leen ya fijan el texto exacto de cada pedazo.

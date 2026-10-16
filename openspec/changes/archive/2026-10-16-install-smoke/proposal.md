@@ -15,7 +15,7 @@ Detalle en la [exploración](exploration.md#problema-verificado-contra-el-códig
 
 ## Decisiones
 
-Defaults tomados donde la exploración dejaba la pregunta abierta. La del CI se preguntó en el hilo con una tarjeta y Marcos eligió Windows y Linux.
+Defaults tomados donde la exploración dejaba la pregunta abierta. La del CI se preguntó en el hilo con una tarjeta y se eligió Windows y Linux.
 
 - **Aislamiento: `CLAWG_TEST_HOME` reemplaza el home, no el directorio de datos.** El perfil sigue eligiendo `.clawg-dev` o `.clawg` debajo, así que la regla de que un build debug nunca abre `.clawg` no cambia ni necesita un caso nuevo ([diseño, D1](design.md#d1-el-aislamiento)).
 - **Embedder: `CLAWG_TEST_EMBEDDER=fake|stalled`.** `fake` carga `FakeEmbedder` al instante y `stalled` deja la descarga sin terminar, que es como se consigue un `202` antes del kill. Un valor desconocido es un error al arrancar, nunca el modelo real ([D2](design.md#d2-el-embedder)).

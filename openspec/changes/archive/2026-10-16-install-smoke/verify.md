@@ -15,7 +15,7 @@ Sobre el último commit de la rama, una sola corrida (regla del proyecto):
 
 - [x] El workflow en verde en `ubuntu-latest` (2 min) y `windows-latest` (7,5 min) en el PR #32, sobre `e134a3c`: clippy y la suite completa, con las pruebas del binario incluidas.
 
-## Windows (máquina de Marcos)
+## Windows, con el modelo real
 
 Sobre `84ee27b` (`main`, el merge del PR #32, versión 0.11.0), el 2026-10-16:
 

@@ -2,7 +2,7 @@
 
 Cada tarea es un commit atómico: primero el test que falla, después el código. La suite queda sin fallas nuevas en cada commit.
 
-Las tareas 1 a 8 se hicieron con la primera versión de la propuesta (nada compartido hasta que el usuario concede). La 9 y la 10 llevan todo a "todo compartido, el usuario excluye", que es lo que eligió Marcos; los nombres de commit de 2 a 8 quedan como se publicaron.
+Las tareas 1 a 8 se hicieron con la primera versión de la propuesta (nada compartido hasta que el usuario concede). La 9 y la 10 llevan todo a "todo compartido, el usuario excluye", que es lo que se eligió; los nombres de commit de 2 a 8 quedan como se publicaron.
 
 ## 1. Borrar `enum Scope` (R9)
 

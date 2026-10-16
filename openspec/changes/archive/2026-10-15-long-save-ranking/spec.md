@@ -68,7 +68,7 @@ Contar saves y recortar MUST ser funciones puras sobre los hits y los vínculos.
 
 ## R5. Medición
 
-Con el set real de Marcos (`golden-mine synth --seed 7`) y los umbrales de la [propuesta](proposal.md#éxito):
+Con el golden set local (`docs/eval/golden.json`, fuera de git; `golden-mine synth --seed 7`) y los umbrales de la [propuesta](proposal.md#éxito):
 
 - U0, la base de `main`, se registra antes de medir la punta.
 - U1: el ancla de 46 casos no empeora en ninguna métrica.
