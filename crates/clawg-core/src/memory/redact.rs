@@ -1,5 +1,6 @@
 //! Masking of secrets with a known format: API keys, tokens, private keys and
-//! passwords inside URLs.
+//! passwords inside URLs, and of whatever the writer marks
+//! `<private>…</private>`.
 //!
 //! Only formats with a fixed prefix or structure are recognised. Nothing here
 //! guesses from entropy: commit hashes, UUIDs and checksums look random too,
@@ -23,6 +24,7 @@ pub enum SecretKind {
     PrivateKey,
     Jwt,
     UrlPassword,
+    Private,
 }
 
 impl SecretKind {
@@ -38,6 +40,7 @@ impl SecretKind {
             SecretKind::PrivateKey => "private_key",
             SecretKind::Jwt => "jwt",
             SecretKind::UrlPassword => "url_password",
+            SecretKind::Private => "private",
         }
     }
 }
@@ -81,6 +84,27 @@ static PATTERNS: Lazy<Vec<(SecretKind, Regex)>> = Lazy::new(|| {
     .collect()
 });
 
+static PRIVATE_OPEN: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)<private>").expect("the mark is valid"));
+static PRIVATE_CLOSE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)</private>").expect("the mark is valid"));
+
+/// The spans the writer marked private, marks included. A mark left open
+/// runs to the end: whoever opened it said what follows is secret. A mark
+/// right after a backtick is quoted, so text about the mark loses nothing.
+fn private_spans(text: &str) -> Vec<Range<usize>> {
+    let mut spans = Vec::new();
+    let mut at = 0;
+    while let Some(open) = PRIVATE_OPEN.find_at(text, at) {
+        if text[..open.start()].ends_with('`') {
+            at = open.end();
+            continue;
+        }
+        let end = PRIVATE_CLOSE.find_at(text, open.end()).map_or(text.len(), |close| close.end());
+        spans.push(open.start()..end);
+        at = end;
+    }
+    spans
+}
+
 /// Whether a match the regex alone accepts is really one. `secret` is the
 /// part that would be masked.
 fn accepts(kind: SecretKind, secret: &str) -> bool {
@@ -118,6 +142,7 @@ pub fn find_secrets(text: &str) -> Vec<Found> {
             found.push(Found { range: masked.range(), kind: *kind });
         }
     }
+    found.extend(private_spans(text).into_iter().map(|range| Found { range, kind: SecretKind::Private }));
     // Stable, so a tie in start and length keeps the pattern order.
     found.sort_by(|a, b| a.range.start.cmp(&b.range.start).then(b.range.end.cmp(&a.range.end)));
     let mut kept: Vec<Found> = Vec::with_capacity(found.len());
@@ -236,6 +261,39 @@ mod tests {
             let out = redact(&format!("key {key} end"));
             assert_eq!(out.text, "key [REDACTED:openai_key] end", "{key}");
         }
+    }
+
+    #[test]
+    fn a_private_span_is_masked_with_its_marks() {
+        let out = redact("user is <private>Ana, 34</private> and <PRIVATE>vive en Rosario</Private>.");
+        assert_eq!(out.text, "user is [REDACTED:private] and [REDACTED:private].");
+        assert_eq!(out.kinds, vec![SecretKind::Private]);
+    }
+
+    #[test]
+    fn an_open_private_mark_masks_to_the_end() {
+        let out = redact("keep this <private>card 4111 and everything after\nand the next line");
+        assert_eq!(out.text, "keep this [REDACTED:private]");
+        assert_eq!(out.kinds, vec![SecretKind::Private]);
+    }
+
+    #[test]
+    fn a_mark_quoted_in_backticks_is_text() {
+        let text = "wrap secrets in `<private>…</private>`; an open `<private>` masks to the end";
+        let out = redact(text);
+        assert_eq!(out.text, text);
+        assert!(out.kinds.is_empty(), "{:?}", out.kinds);
+
+        let out = redact("the mark `<private>` hides <private>this</private> only");
+        assert_eq!(out.text, "the mark `<private>` hides [REDACTED:private] only");
+    }
+
+    #[test]
+    fn a_private_span_covers_the_secrets_inside_it() {
+        let token = format!("ghp_{}", repeat("a1B2", 36));
+        let out = redact(&format!("<private>token {token}</private> rest"));
+        assert_eq!(out.text, "[REDACTED:private] rest");
+        assert_eq!(out.kinds, vec![SecretKind::Private]);
     }
 
     #[test]
