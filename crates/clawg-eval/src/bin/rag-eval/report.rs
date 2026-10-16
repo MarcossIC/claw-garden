@@ -120,6 +120,32 @@ pub struct SubsetAggregate {
     pub hits: Hits,
 }
 
+/// The language of a case's query and that of the rows it expects. The
+/// language split files a case by its rows alone, so a Spanish query about an
+/// English row lands beside an English one; the pair tells the two apart.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Pair {
+    pub query_lang: String,
+    pub lang: String,
+}
+
+/// A case's pair, only when both languages are known: a case missing either
+/// is left out of every pair, as `aggregate_by_lang` leaves out a case
+/// without a unanimous language.
+pub fn pair_of(query_lang: Option<&str>, lang: Option<&str>) -> Option<Pair> {
+    Some(Pair { query_lang: query_lang?.to_string(), lang: lang?.to_string() })
+}
+
+/// Retrieval quality restricted to the cases of one query–row language pair.
+#[derive(Debug, Clone, Serialize)]
+pub struct PairAggregate {
+    pub query_lang: String,
+    pub lang: String,
+    pub n_cases: usize,
+    pub aggregate: Aggregate,
+    pub hits: Hits,
+}
+
 /// Which part of the golden set a case belongs to: the cases constants are
 /// chosen on, or the ones the chosen value is reported on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -189,6 +215,11 @@ pub struct RetrievalResults {
     /// with no unanimous language are absent here but present in `aggregate`,
     /// so these sub-counts need not sum to `per_case.len()`.
     pub by_lang: Vec<LangAggregate>,
+    /// Per-pair split of `aggregate`, over the same active cases. A case
+    /// missing either language is absent here but present in `aggregate`;
+    /// the key is left out of the file when no case has a pair.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub by_pair: Vec<PairAggregate>,
     /// Per-subset split of `aggregate`, over the same active cases. Only the
     /// subsets present appear; the counts sum to the number of active cases.
     pub by_subset: Vec<SubsetAggregate>,
@@ -340,6 +371,10 @@ impl GoldenSetProvenance {
 pub struct SimilarityResults {
     pub aggregate: Aggregate,
     pub per_case: Vec<CaseResult>,
+    /// Per-pair split of `aggregate`, each pair with its own hits; left out
+    /// of the file when no case has a pair.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub by_pair: Vec<PairAggregate>,
     /// Query-anchored: each active case's weakest expected match minus its
     /// strongest rival, meaned across cases. Not comparable to a mined
     /// distractor-gap statistic — see `mean_corpus_distractor_gap` for the
@@ -446,6 +481,7 @@ impl RetrievalResults {
             aggregate: aggregate(&per_case),
             hits: hits(&per_case),
             by_lang: aggregate_by_lang(&per_case),
+            by_pair: aggregate_by_pair(&per_case),
             by_subset: aggregate_by_subset(&per_case),
             by_split: aggregate_by_split(&per_case),
             per_case,
@@ -555,6 +591,28 @@ pub fn aggregate_by_lang(cases: &[CaseResult]) -> Vec<LangAggregate> {
         .collect()
 }
 
+/// Splits `cases` by their query–row language pair and aggregates each group
+/// on its own, ordered by `(query_lang, lang)` so two runs of the same golden
+/// set produce byte-comparable JSON.
+pub fn aggregate_by_pair(cases: &[CaseResult]) -> Vec<PairAggregate> {
+    let mut grouped: BTreeMap<Pair, Vec<CaseResult>> = BTreeMap::new();
+    for case in cases {
+        if let Some(pair) = pair_of(case.query_lang.as_deref(), case.lang.as_deref()) {
+            grouped.entry(pair).or_default().push(case.clone());
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(pair, group)| PairAggregate {
+            query_lang: pair.query_lang,
+            lang: pair.lang,
+            n_cases: group.len(),
+            aggregate: aggregate(&group),
+            hits: hits(&group),
+        })
+        .collect()
+}
+
 /// Splits `cases` by `CaseResult::subset` and aggregates each group on its
 /// own. Ordered by the serialized subset name so two runs of the same golden
 /// set produce byte-comparable JSON.
@@ -597,6 +655,23 @@ fn format_subset_table(split: &[SubsetAggregate]) -> String {
             s.aggregate.recall_10,
             s.aggregate.mrr,
             s.aggregate.ndcg_10
+        ));
+    }
+    out
+}
+
+fn format_pair_table(pairs: &[PairAggregate]) -> String {
+    let mut out = String::from("    pair       n   recall@1  recall@5  recall@10     mrr   ndcg@10\n");
+    for p in pairs {
+        out.push_str(&format!(
+            "    {:<7} {:>3}  {:>9.4} {:>9.4} {:>10.4} {:>7.4} {:>9.4}\n",
+            format!("{}>{}", p.query_lang, p.lang),
+            p.n_cases,
+            p.aggregate.recall_1,
+            p.aggregate.recall_5,
+            p.aggregate.recall_10,
+            p.aggregate.mrr,
+            p.aggregate.ndcg_10
         ));
     }
     out
@@ -796,6 +871,14 @@ pub fn print_stdout(results: &RunResults) {
                 split.aggregate.ndcg_10
             );
         }
+    }
+    if !results.retrieval.by_pair.is_empty() {
+        println!("  retrieval by query>row language pair:");
+        print!("{}", format_pair_table(&results.retrieval.by_pair));
+    }
+    if let Some(similarity) = results.similarity.as_ref().filter(|s| !s.by_pair.is_empty()) {
+        println!("  similarity (pure cosine) by query>row language pair:");
+        print!("{}", format_pair_table(&similarity.by_pair));
     }
     if !results.retrieval.by_subset.is_empty() {
         println!("  retrieval by subset:");
@@ -1196,6 +1279,96 @@ mod tests {
         );
     }
 
+    // --- query–row language pairs ------------------------------------------
+
+    fn case_pair(query: &str, recall_10: f64, query_lang: Option<&str>, lang: Option<&str>) -> CaseResult {
+        CaseResult { query_lang: query_lang.map(str::to_string), ..case_in(query, recall_10, lang) }
+    }
+
+    #[test]
+    fn pair_of_needs_both_languages() {
+        assert_eq!(
+            pair_of(Some("es"), Some("en")),
+            Some(Pair { query_lang: "es".to_string(), lang: "en".to_string() })
+        );
+        assert_eq!(pair_of(None, Some("en")), None);
+        assert_eq!(pair_of(Some("es"), None), None);
+        assert_eq!(pair_of(None, None), None);
+    }
+
+    #[test]
+    fn two_cases_differing_only_in_query_lang_fall_in_different_pairs() {
+        let cases = vec![
+            case_pair("q-es", 0.0, Some("es"), Some("en")),
+            case_pair("q-en", 1.0, Some("en"), Some("en")),
+        ];
+        let results = RetrievalResults::from_cases(cases, vec![], vec![]);
+        let pairs: Vec<(&str, &str, usize)> =
+            results.by_pair.iter().map(|p| (p.query_lang.as_str(), p.lang.as_str(), p.n_cases)).collect();
+        assert_eq!(pairs, vec![("en", "en", 1), ("es", "en", 1)], "ordered by query language, then row language");
+        assert_eq!(results.by_pair[0].aggregate.recall_10, 1.0);
+        assert_eq!(results.by_pair[1].aggregate.recall_10, 0.0);
+        assert_eq!(results.by_pair[0].hits.at_10.strict.hits, 1, "each pair carries its own hits");
+    }
+
+    #[test]
+    fn a_case_missing_either_language_has_no_pair_but_counts_in_the_aggregate() {
+        let cases = vec![
+            case_pair("no-query-lang", 1.0, None, Some("en")),
+            case_pair("no-row-lang", 1.0, Some("es"), None),
+            case_pair("both", 0.0, Some("es"), Some("en")),
+        ];
+        let results = RetrievalResults::from_cases(cases, vec![], vec![]);
+        assert_eq!(results.by_pair.len(), 1);
+        assert_eq!((results.by_pair[0].query_lang.as_str(), results.by_pair[0].n_cases), ("es", 1));
+        assert!((results.aggregate.recall_10 - 2.0 / 3.0).abs() < 1e-12);
+        assert_eq!(results.hits.at_10.strict.n_cases, 3);
+        assert_eq!(results.by_lang[0].n_cases, 2, "the case without a query language stays in by_lang");
+    }
+
+    #[test]
+    fn by_pair_is_absent_from_the_json_when_no_case_has_a_pair() {
+        let cases = vec![case_in("q", 1.0, Some("en"))];
+        let results = RetrievalResults::from_cases(cases.clone(), vec![], vec![]);
+        assert!(results.by_pair.is_empty());
+        assert!(serde_json::to_value(&results).unwrap().get("by_pair").is_none());
+
+        let mut similarity = minimal_similarity_results();
+        similarity.by_pair = aggregate_by_pair(&cases);
+        similarity.per_case = cases;
+        assert!(similarity.by_pair.is_empty());
+        assert!(serde_json::to_value(&similarity).unwrap().get("by_pair").is_none());
+    }
+
+    #[test]
+    fn the_console_lists_one_row_per_pair() {
+        let pairs = aggregate_by_pair(&[
+            case_pair("a", 1.0, Some("es"), Some("en")),
+            case_pair("b", 0.0, Some("es"), Some("en")),
+            case_pair("c", 1.0, Some("en"), Some("en")),
+        ]);
+        let table = format_pair_table(&pairs);
+        assert_eq!(table.lines().count(), 3, "a header and one row per pair: {table}");
+        assert!(table.lines().nth(1).unwrap().contains("en>en"), "{table}");
+        let es_en = table.lines().nth(2).unwrap();
+        assert!(es_en.contains("es>en") && es_en.contains(" 2 "), "{table}");
+    }
+
+    #[test]
+    fn a_results_file_without_by_pair_still_reads_and_diffs() {
+        let old = serde_json::to_value(minimal_results("2026-07-27", Mode::Fake)).unwrap();
+        assert!(old["retrieval"].get("by_pair").is_none());
+        let mut with_pair = minimal_results("2026-07-27", Mode::Fake);
+        with_pair.retrieval =
+            RetrievalResults::from_cases(vec![case_pair("q", 1.0, Some("es"), Some("en"))], vec![], vec![]);
+        let new = serde_json::to_value(&with_pair).unwrap();
+        assert!(new["retrieval"]["by_pair"].is_array());
+
+        let label = std::path::Path::new("results.json");
+        crate::diff::diff_values(&old, label, &new, label).expect("a missing by_pair must not break the diff");
+        crate::diff::diff_values(&new, label, &old, label).expect("in either order");
+    }
+
     #[test]
     fn aggregate_by_lang_of_cases_without_any_language_is_empty_not_a_bucket_named_unknown() {
         let cases = vec![case_in("q1", 1.0, None), case_in("q2", 0.0, None)];
@@ -1286,6 +1459,7 @@ mod tests {
         SimilarityResults {
             aggregate: Aggregate::default(),
             per_case: vec![],
+            by_pair: vec![],
             mean_expected_distractor_gap: 0.1,
             mean_corpus_distractor_gap: 0.2,
             cosine_min: 0.3,

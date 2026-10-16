@@ -1197,6 +1197,7 @@ fn build_similarity_results(
 
     report::SimilarityResults {
         aggregate: report::aggregate(&per_case),
+        by_pair: report::aggregate_by_pair(&per_case),
         per_case,
         mean_expected_distractor_gap: similarity::mean_expected_distractor_gap(&expected_gap_cases),
         mean_corpus_distractor_gap: similarity::mean_corpus_distractor_gap(&corpus_gap_cases),
@@ -1375,6 +1376,34 @@ mod tests {
         assert_eq!(retrieval["aggregate"]["recall@1"], 1.0);
         assert_eq!(retrieval["hits"]["at_1"]["strict"]["hits"], 2);
         assert!(retrieval["per_case"][0].get("abstained").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_golden_without_query_lang_measures_exactly_as_before() {
+        let json = run_fake(sweep_golden_json(), "no-query-lang").await;
+        let keys = |v: &serde_json::Value| {
+            let mut keys: Vec<String> = v.as_object().expect("an object").keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        let retrieval = &json["retrieval"];
+        assert_eq!(
+            keys(retrieval),
+            ["aggregate", "blocked", "by_lang", "by_split", "by_subset", "hits", "per_case"]
+        );
+        for case in retrieval["per_case"].as_array().unwrap() {
+            assert_eq!(
+                keys(case),
+                [
+                    "expected_refs", "lang", "mrr", "ndcg@10", "query", "ranked_refs", "recall@1", "recall@10",
+                    "recall@5", "status", "subset"
+                ]
+            );
+        }
+        assert_eq!(retrieval["per_case"].as_array().unwrap().len(), 2);
+        assert_eq!(retrieval["aggregate"]["recall@1"], 1.0);
+        assert_eq!(retrieval["aggregate"]["mrr"], 1.0);
+        assert_eq!(retrieval["hits"]["at_1"]["strict"]["hits"], 2);
     }
 
     #[tokio::test]
@@ -1654,6 +1683,32 @@ mod tests {
         let sim = build_similarity_results(&[source], &[("c1".to_string(), vec![1.0, 0.0])], K_FINAL, "", "");
         assert_eq!(sim.per_case[0].query_lang.as_deref(), Some("es"));
         assert_eq!(sim.per_case[0].lang.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn similarity_by_pair_scores_each_pair_on_its_own_cases() {
+        let source = |query: &str, expected: &str, query_vector: Vec<f32>, query_lang: &str| SimCaseSource {
+            query: query.to_string(),
+            expected_refs: vec![expected.to_string()],
+            corpus_refs: vec!["c1".to_string(), "c2".to_string()],
+            query_vector,
+            query_lang: Some(query_lang.to_string()),
+            lang: Some("en".to_string()),
+            subset: CaseSubset::Natural,
+        };
+        let corpus = [("c1".to_string(), vec![1.0, 0.0]), ("c2".to_string(), vec![0.0, 1.0])];
+        // The first query lands on its own row; the second ranks c1 above the
+        // c2 it expects.
+        let sources = [source("hit", "c1", vec![1.0, 0.0], "es"), source("miss", "c2", vec![1.0, 0.1], "en")];
+        let sim = build_similarity_results(&sources, &corpus, K_FINAL, "", "");
+
+        let pairs: Vec<(&str, &str, usize)> =
+            sim.by_pair.iter().map(|p| (p.query_lang.as_str(), p.lang.as_str(), p.n_cases)).collect();
+        assert_eq!(pairs, vec![("en", "en", 1), ("es", "en", 1)]);
+        assert_eq!(sim.by_pair[0].aggregate.recall_1, 0.0);
+        assert_eq!(sim.by_pair[1].aggregate.recall_1, 1.0);
+        assert_eq!(sim.by_pair[1].hits.at_1.strict.hits, 1);
+        assert_eq!(sim.aggregate.recall_1, 0.5, "the block's own aggregate is unchanged");
     }
 
     #[test]
