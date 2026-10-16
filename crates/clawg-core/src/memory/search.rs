@@ -1287,6 +1287,7 @@ pub async fn search_all_memories(
 /// production call site keeps using the unparameterized wrapper above — this
 /// one exists for `rag-eval`, which needs to re-search a seeded corpus under
 /// several configs without re-seeding.
+#[cfg(feature = "eval")]
 pub(crate) async fn search_all_memories_with_scoring(
     store: &MemoryStore,
     embedding: &[f32],
