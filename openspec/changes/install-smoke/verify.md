@@ -13,7 +13,7 @@ Sobre el último commit de la rama, una sola corrida (regla del proyecto):
 
 ## CI
 
-- [ ] El workflow en verde en `ubuntu-latest` y `windows-latest` en el PR.
+- [x] El workflow en verde en `ubuntu-latest` (2 min) y `windows-latest` (7,5 min) en el PR #32, sobre `e134a3c`: clippy y la suite completa, con las pruebas del binario incluidas.
 
 ## Windows (máquina de Marcos)
 

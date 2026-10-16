@@ -9,6 +9,6 @@ artifacts:
   design: done
   tasks: done
   apply: done
-  verify: partial  # Linux; CI y Windows pendientes, ver verify.md
+  verify: partial  # Linux y CI; falta Windows local, ver verify.md
   archive: pending
 updated: 2026-10-16
