@@ -81,10 +81,10 @@ El test no ve un `dead_code` que el compilador marca sin `allow`; eso lo cubre `
 cargo clippy --workspace --all-targets -- -A clippy::all -D warnings
 ```
 
-En Windows, con `--target-dir` aparte por el lock de `clawg.exe`. Después de R5 termina con código 0 (`verify.md`). Los 29 hallazgos de `clippy` quedan anotados en el backlog del README de openspec; cuando se arreglen, el comando pierde `-A clippy::all`.
+En Windows, con `--target-dir` aparte por el lock de `clawg.exe`. Después de R5 termina con código 0 (`verify.md`). Los hallazgos de `clippy` que quedan (28: uno estaba en código que este cambio borra) van al backlog del README de openspec; cuando se arreglen, el comando pierde `-A clippy::all`.
 
 | Alternativa | Por qué no |
 |---|---|
-| Arreglar los 29 acá | Cambia firmas (`too_many_arguments`) y código de varios módulos en un cambio de redes de tests |
+| Arreglarlos acá | Cambia firmas (`too_many_arguments`) y código de varios módulos en un cambio de redes de tests |
 | `RUSTFLAGS="-D warnings" cargo test` | Cambiar `RUSTFLAGS` recompila todas las dependencias y descarta el caché de la suite normal |
 | Documentar `-D warnings` sin más | Un comando documentado que falla hoy se deja de correr |

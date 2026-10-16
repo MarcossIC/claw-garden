@@ -20,7 +20,7 @@ Lo que el modelo ve del servidor (nombres, descripciones y schemas de las herram
 - **Inventario sólo contra `.claude/CLAUDE.md`** (enfoque B): su línea `MCP tools (...)` tiene un formato estable. La spec `mcp` no entra: los nombres van dentro de una oración en español y la mantiene el archivo de cada cambio.
 - **`Chunk::token_count` se borra.** «Nothing reads it yet» es la definición de especulativo; los tests que lo leen ya fijan el texto exacto de cada pedazo.
 - **Compuertas a y b** de la exploración: un test que falla ante un `allow` de `dead_code` o `unused` en las fuentes, y el comando de `clippy` en la sección Testing de `.claude/CLAUDE.md`. Un workflow de CI se decide una sola vez en install-smoke (40).
-- **`clippy` acotado a los warnings del compilador.** Medido en `main`: `clippy -D warnings` no pasa, con 29 hallazgos propios de `clippy` y uno de `rustc` ([diseño, D7](design.md#d7-clippy-documentado)). El comando documentado es `-A clippy::all -D warnings`, que pasa después de este cambio; los 29 van al backlog.
+- **`clippy` acotado a los warnings del compilador.** Medido en `main`: `clippy -D warnings` no pasa, con 29 hallazgos propios de `clippy` y uno de `rustc` ([diseño, D7](design.md#d7-clippy-documentado)). El comando documentado es `-A clippy::all -D warnings`, que pasa después de este cambio; los de `clippy` van al backlog.
 
 ## Alcance
 
