@@ -9,6 +9,6 @@ artifacts:
   design: done
   tasks: done
   apply: done
-  verify: in_progress  # Linux and the real binary done; Windows and the dev profile with Claude Code pending, see verify.md
+  verify: in_progress  # Linux, the real binary and the Windows suite done; the dev profile with Claude Code pending, see verify.md
   archive: pending
 updated: 2026-10-16

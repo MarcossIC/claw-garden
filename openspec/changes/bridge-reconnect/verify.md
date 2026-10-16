@@ -2,7 +2,7 @@
 
 **Código:** rama `claude/project-thread-7b3nb7`, un commit por tarea, sobre `main` en `638812b`.
 **Modo:** Strict TDD (`openspec/config.yaml`). Cada test de un comportamiento nuevo falló antes de su código, por la aserción o por no compilar. Antes de la tarea 2, sobre el código de `main`: `a_restarted_daemon_is_reached_with_its_new_token`, `memory_status_after_a_restart_reports_the_new_daemon`, `a_daemon_that_comes_up_after_the_start_gave_up_is_used` y `a_refused_token_is_reread_once` fallaban por la aserción (igual que después los de las tareas 3 y 4 antes de su código); `an_error_the_daemon_answered_reaches_it_once` y `only_health_sets_a_timeout` ya pasaban, como se esperaba: fijan las invariantes de las que depende el reintento (no se repite lo que el daemon contestó, y ninguna llamada que escribe tiene timeout).
-**Estado:** R1 a R6 pasan en Linux, commit por commit, y con el binario real en un `HOME` descartable. Falta la suite en Windows y la prueba con Claude Code en el perfil dev ([pendiente](#pendiente-máquina-de-marcos)).
+**Estado:** R1 a R6 pasan en Linux, commit por commit, y con el binario real en un `HOME` descartable. La suite pasa entera en Windows. Falta la prueba con Claude Code en el perfil dev ([pendiente](#pendiente-máquina-de-marcos)).
 
 ## Suite
 
@@ -23,6 +23,8 @@ En la primera corrida de `ae8b86e` falló un test más (1.887 y 11), con otras c
 - **+10 tests**, ninguno reemplazado.
 - **Los 10 que fallan son los de `main`** (por nombre): `doctor::tests::*` (7, sólo pasan en Windows) y `rag-eval` `diff::tests::*` (3, leen `docs/eval/results/`, que `.gitignore` deja afuera).
 - **Warnings:** los de `main` (`spanning`, `search_all_memories_with_scoring`); ninguno nuevo. `cargo clippy -p clawg-cli --all-targets` da los mismos 16 que `main`.
+
+`cargo test --workspace --no-fail-fast --target-dir target-test` en Windows, sobre `main` en `f8a361e` (este cambio y quality-guards ya mergeados): **1.918 pasan, 0 fallan, 0 ignorados**. Es la base de 1.902, más los 10 de acá y los 6 de quality-guards.
 
 ## Requisitos
 
@@ -54,8 +56,8 @@ Como el daemon volvió al mismo puerto, este recorrido ejercita el camino del 40
 
 ## Pendiente (máquina de Marcos)
 
-1. **Suite en Windows:** `cargo test --workspace --no-fail-fast --target-dir <otro-dir>`. Espero 1.912 pasan y 0 fallan (la base de 1.902 más los 10 de acá).
-2. **Perfil dev con Claude Code**, con el binario debug de la rama:
+1. ~~**Suite en Windows**~~: hecha, ver [Suite](#suite).
+2. **Perfil dev con Claude Code**, con el binario debug de `main`. El que corría el editor era 0.4.0, anterior al cambio, así que hay que recompilarlo antes:
    1. Abrí una sesión de Claude Code con el servidor `clawg-dev` y pedile `memory_status`.
    2. En otra terminal, `clawg stop --profile dev`. Pedile `list_memories`: tiene que decir «the clawg daemon is not running (it may have been stopped or updated)…», y `clawg status --profile dev` tiene que seguir diciendo que no corre.
    3. `clawg serve --profile dev` en esa terminal. Sin tocar `/mcp`, pedile `save_memory` y después `search_memory` del mismo texto: los dos tienen que responder sin error, y `memory_status` tiene que mostrar el pid nuevo.
