@@ -45,7 +45,7 @@ impl MetricDiff {
 /// metrics never count: testing every row would make a false alarm likely.
 pub fn regressed(diff: &RunDiff) -> bool {
     let worse = |m: &MetricDiff| m.worse > m.better && m.p_value() < crate::stats::ALPHA;
-    worse(&diff.retrieval.recall_5) || diff.agent_view.is_some_and(|av| worse(&av.search_found))
+    worse(&diff.retrieval.recall_5) || diff.agent_view.as_ref().is_some_and(|av| worse(&av.search_found))
 }
 
 /// How a primary metric's movement reads at `stats::ALPHA`. A movement that
@@ -103,10 +103,17 @@ pub struct PairCut<B> {
     pub pair_in_one_file_only: usize,
 }
 
+/// Whether the agent saw an expected row, from each tool.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct FoundDiff {
+    pub search_found: MetricDiff,
+    pub context_found: MetricDiff,
+}
+
 /// What the agent received, case by case, from two `--agent-view` runs.
 /// Fewer tokens counts as better; the interval of a token row is still the
 /// raw change, second run minus first.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct AgentViewDiff {
     pub search_found: MetricDiff,
     pub context_found: MetricDiff,
@@ -114,6 +121,9 @@ pub struct AgentViewDiff {
     pub context_tokens: MetricDiff,
     /// Over `unanswerable` cases only, which stay out of the two `found` rows.
     pub search_abstained: MetricDiff,
+    /// The two `found` rows cut by pair. No token rows: a bootstrap interval
+    /// over the few cases of one pair says nothing.
+    pub by_pair: PairCut<FoundDiff>,
 }
 
 /// The whole paired diff: `retrieval` and `similarity`, computed the same
@@ -285,9 +295,6 @@ fn diff_agent_view(a: &[CaseView], b: &[CaseView]) -> AgentViewDiff {
         if a_case.abstained.is_some() || b_case.abstained.is_some() {
             let abstained = |c: &CaseView| flag(c.abstained == Some(true));
             accumulate(&mut diff.search_abstained, abstained(a_case), abstained(b_case));
-        } else {
-            accumulate(&mut diff.search_found, flag(a_case.search.found), flag(b_case.search.found));
-            accumulate(&mut diff.context_found, flag(a_case.context.found), flag(b_case.context.found));
         }
         let (a_s, b_s) = (a_case.search.tokens as f64, b_case.search.tokens as f64);
         let (a_c, b_c) = (a_case.context.tokens as f64, b_case.context.tokens as f64);
@@ -298,7 +305,30 @@ fn diff_agent_view(a: &[CaseView], b: &[CaseView]) -> AgentViewDiff {
     }
     diff.search_tokens.ci = Some(bootstrap(&search_tokens));
     diff.context_tokens.ci = Some(bootstrap(&context_tokens));
+    let (a_found, b_found) = (answerable(a), answerable(b));
+    let found = diff_found(&a_found, &b_found);
+    diff.search_found = found.search_found;
+    diff.context_found = found.context_found;
+    diff.by_pair = cut_by_pair(&a_found, &b_found, diff_found);
     diff
+}
+
+/// The cases a `found` row is about: active, and with a row to find. A case
+/// unanswerable in either file drops out of the join for lack of a partner.
+fn answerable(cases: &[CaseView]) -> Vec<CaseView> {
+    cases.iter().filter(|c| c.status == CaseStatus::Active && c.abstained.is_none()).cloned().collect()
+}
+
+/// The two `found` rows over `a` and `b` joined on `query`.
+fn diff_found(a: &[CaseView], b: &[CaseView]) -> FoundDiff {
+    let b_by_query: HashMap<&str, &CaseView> = b.iter().map(|c| (c.query.as_str(), c)).collect();
+    let mut found = FoundDiff::default();
+    for a_case in a {
+        let Some(b_case) = b_by_query.get(a_case.query.as_str()) else { continue };
+        accumulate(&mut found.search_found, flag(a_case.search.found), flag(b_case.search.found));
+        accumulate(&mut found.context_found, flag(a_case.context.found), flag(b_case.context.found));
+    }
+    found
 }
 
 /// Joins `a` and `b` on `query` and diffs each of the five metrics over the
@@ -342,6 +372,16 @@ impl PairedCase for CaseResult {
 
     fn pair(&self) -> Option<Pair> {
         pair_of(self.query_lang.as_deref(), self.lang.as_deref())
+    }
+}
+
+impl PairedCase for CaseView {
+    fn query(&self) -> &str {
+        &self.query
+    }
+
+    fn pair(&self) -> Option<Pair> {
+        pair_of(self.query_lang.as_deref(), self.row_lang.as_deref())
     }
 }
 
@@ -416,6 +456,12 @@ fn render(diff: &RunDiff) -> String {
         out.push_str(&metric_line("context.tokens", &av.context_tokens));
         if av.search_abstained.better + av.search_abstained.worse > 0 {
             out.push_str(&metric_line("search.abstain", &av.search_abstained));
+        }
+        out.push_str(&pairs_left_out(&av.by_pair));
+        for p in &av.by_pair.pairs {
+            out.push_str(&format!("  agent_view by pair {} ({} joined):\n{METRIC_HEADER}", p.pair, p.joined));
+            out.push_str(&metric_line("search.found", &p.block.search_found));
+            out.push_str(&metric_line("context.found", &p.block.context_found));
         }
     }
     if let Some(m) = &diff.freshness {
@@ -657,6 +703,45 @@ mod tests {
 
         assert_eq!(av.search_found, MetricDiff { ci: None, ..MetricDiff::default() });
         assert_eq!((av.context_found.better, av.context_found.worse), (0, 0));
+    }
+
+    #[test]
+    fn agent_view_pairs_use_only_active_cases() {
+        let labelled = |mut v: Value, abstained: Option<bool>| {
+            v["query_lang"] = serde_json::json!("es");
+            v["row_lang"] = serde_json::json!("en");
+            if let Some(abstained) = abstained {
+                v["abstained"] = serde_json::json!(abstained);
+            }
+            v
+        };
+        let a = agent_view_file(vec![
+            labelled(view("q1", "active", false, 100, false), None),
+            labelled(view("q2", "active", false, 100, false), None),
+            labelled(view("red", "known_red", false, 100, false), None),
+            labelled(view("none", "active", false, 100, false), Some(false)),
+        ]);
+        let b = agent_view_file(vec![
+            labelled(view("q1", "active", true, 100, true), None),
+            labelled(view("q2", "active", false, 100, false), None),
+            labelled(view("red", "known_red", true, 100, true), None),
+            labelled(view("none", "active", false, 100, false), Some(true)),
+        ]);
+
+        let diff = diff_of(&a, &b);
+        let av = diff.agent_view.as_ref().expect("both files measured the agent view");
+        assert_eq!(pair_labels(&av.by_pair), vec!["es>en"]);
+        let es_en = &av.by_pair.pairs[0];
+        assert_eq!(es_en.joined, 2, "known_red and unanswerable cases stay out");
+        assert_eq!((es_en.block.search_found.better, es_en.block.context_found.better), (1, 1));
+        assert_eq!((av.by_pair.pair_differs, av.by_pair.pair_in_one_file_only), (0, 0));
+        assert_eq!(av.search_found.better, 1, "the global row is unchanged");
+
+        let text = render(&diff);
+        let pair_block = text.split("  agent_view by pair es>en (2 joined):\n").nth(1).expect("a pair block");
+        let pair_block = pair_block.split("  primary:").next().unwrap();
+        assert!(pair_block.contains("search.found") && pair_block.contains("context.found"), "{text}");
+        assert!(!pair_block.contains("tokens"), "a pair carries no token rows: {text}");
     }
 
     #[test]
