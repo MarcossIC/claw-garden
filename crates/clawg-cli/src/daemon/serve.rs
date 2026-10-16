@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use clawg_core::memory::bootstrap::{production_deps, run_embedder_bootstrap_with_retry, LogSink};
+use clawg_core::memory::bootstrap::{run_embedder_bootstrap_with_retry, serve_deps, LogSink};
 use clawg_core::memory::store_lock::StoreHolder;
 use clawg_core::memory::MemoryError;
 use clawg_core::paths::{data_dir, PathsError, Profile};
@@ -46,6 +46,9 @@ pub enum ServeError {
         #[source]
         source: std::io::Error,
     },
+    /// Only a build with test stand-ins can refuse its embedder this early.
+    #[error("{0}")]
+    Embedder(String),
     #[error("the HTTP server stopped unexpectedly: {0}")]
     Server(std::io::Error),
 }
@@ -85,7 +88,8 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
     // daemon must answer `/health` and accept saves throughout the download.
     // A failed download is retried until the network comes back.
     let (ensure, load, verify) =
-        production_deps(runtime.store.clone(), clawg_core::paths::backups_dir(&base_dir));
+        serve_deps(runtime.store.clone(), clawg_core::paths::backups_dir(&base_dir))
+            .map_err(ServeError::Embedder)?;
     tokio::spawn(run_embedder_bootstrap_with_retry(
         base_dir.clone(),
         runtime.embedder.clone(),

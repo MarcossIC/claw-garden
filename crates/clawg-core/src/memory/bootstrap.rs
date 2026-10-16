@@ -249,6 +249,92 @@ pub fn production_deps(
     (ensure, load, verify)
 }
 
+/// Env var that, in a build with the `testing` feature, replaces the model
+/// `clawg serve` loads: `fake` loads [`FakeEmbedder`] at once and `stalled`
+/// never finishes the download. It lets a test run the real binary without
+/// the 470 MB model; a release build never reads it.
+///
+/// [`FakeEmbedder`]: crate::memory::embedder::FakeEmbedder
+#[cfg(any(test, feature = "testing"))]
+pub const TEST_EMBEDDER_VAR: &str = "CLAWG_TEST_EMBEDDER";
+
+/// The stand-in [`TEST_EMBEDDER_VAR`] names.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestEmbedder {
+    Fake,
+    Stalled,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl TestEmbedder {
+    /// `None` when unset or empty; an unknown value is an error rather than
+    /// the real model, which would start a 470 MB download inside a test.
+    pub fn parse(raw: Option<&str>) -> Result<Option<Self>, String> {
+        match raw.map(str::trim) {
+            None | Some("") => Ok(None),
+            Some("fake") => Ok(Some(Self::Fake)),
+            Some("stalled") => Ok(Some(Self::Stalled)),
+            Some(other) => Err(format!(
+                "{TEST_EMBEDDER_VAR}={other:?} is not a test embedder; use \"fake\" or \"stalled\""
+            )),
+        }
+    }
+
+    /// The bootstrap trio for this stand-in. The contract check is the real
+    /// one, so a test store records and verifies the fake model's identity.
+    pub fn deps(
+        self,
+        store: Arc<MemoryStore>,
+        backups: std::path::PathBuf,
+    ) -> (EnsureModelFn, LoadEmbedderFn, ContractVerifyFn) {
+        let (_, _, verify) = production_deps(store, backups);
+        let ensure: EnsureModelFn = match self {
+            Self::Fake => Arc::new(|_base_dir, _progress| {
+                Box::pin(async {
+                    Ok(crate::memory::model_download::ModelFiles {
+                        onnx: Vec::new(),
+                        tokenizer: fastembed::TokenizerFiles {
+                            tokenizer_file: Vec::new(),
+                            config_file: Vec::new(),
+                            special_tokens_map_file: Vec::new(),
+                            tokenizer_config_file: Vec::new(),
+                        },
+                    })
+                })
+            }),
+            Self::Stalled => Arc::new(|_base_dir, _progress| Box::pin(futures::future::pending())),
+        };
+        let load: LoadEmbedderFn = Arc::new(|_files| {
+            Ok(Arc::new(crate::memory::embedder::FakeEmbedder::default()) as Arc<dyn Embedder>)
+        });
+        (ensure, load, verify)
+    }
+}
+
+/// What `clawg serve` bootstraps against: [`production_deps`], or in a
+/// `testing` build the stand-in [`TEST_EMBEDDER_VAR`] names.
+#[cfg(feature = "testing")]
+pub fn serve_deps(
+    store: Arc<MemoryStore>,
+    backups: std::path::PathBuf,
+) -> Result<(EnsureModelFn, LoadEmbedderFn, ContractVerifyFn), String> {
+    let raw = std::env::var(TEST_EMBEDDER_VAR).ok();
+    Ok(match TestEmbedder::parse(raw.as_deref())? {
+        Some(stand_in) => stand_in.deps(store, backups),
+        None => production_deps(store, backups),
+    })
+}
+
+/// What `clawg serve` bootstraps against: always [`production_deps`].
+#[cfg(not(feature = "testing"))]
+pub fn serve_deps(
+    store: Arc<MemoryStore>,
+    backups: std::path::PathBuf,
+) -> Result<(EnsureModelFn, LoadEmbedderFn, ContractVerifyFn), String> {
+    Ok(production_deps(store, backups))
+}
+
 /// Whether `stored` describes the vectors this same model made before it
 /// pooled by mean: only the pooling differs, so every vector can be remade
 /// from its text and nothing else about the store has to change.
@@ -1152,6 +1238,42 @@ mod tests {
         .await
         .expect("contract check must reach the store");
         assert!(matches!(status, ContractStatus::Initialized));
+    }
+
+    // ---------- test embedder ----------
+
+    #[test]
+    fn the_test_embedder_is_named_by_its_variable_or_absent() {
+        assert_eq!(TestEmbedder::parse(None), Ok(None));
+        assert_eq!(TestEmbedder::parse(Some(" ")), Ok(None));
+        assert_eq!(TestEmbedder::parse(Some("fake")), Ok(Some(TestEmbedder::Fake)));
+        assert_eq!(TestEmbedder::parse(Some("stalled")), Ok(Some(TestEmbedder::Stalled)));
+        let err = TestEmbedder::parse(Some("real")).expect_err("an unknown value is refused");
+        assert!(err.contains(TEST_EMBEDDER_VAR) && err.contains("\"fake\""), "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_fake_test_embedder_loads_at_once_and_records_its_contract() {
+        let store = Arc::new(MemoryStore::new_for_test().await.expect("test store"));
+        let (ensure, load, verify) = TestEmbedder::Fake.deps(store, std::env::temp_dir());
+
+        let files = tokio::time::timeout(Duration::from_secs(1), ensure(std::env::temp_dir(), None))
+            .await
+            .expect("no download")
+            .expect("files");
+        let embedder = load(files).expect("the fake loads");
+        assert_eq!(embedder.model_id(), "fake-embedder");
+        let status = verify(embedder).await.expect("the real contract check");
+        assert!(matches!(status, ContractStatus::Initialized));
+    }
+
+    #[tokio::test]
+    async fn the_stalled_test_embedder_never_finishes_the_download() {
+        let store = Arc::new(MemoryStore::new_for_test().await.expect("test store"));
+        let (ensure, _load, _verify) = TestEmbedder::Stalled.deps(store, std::env::temp_dir());
+
+        let waited = tokio::time::timeout(Duration::from_millis(200), ensure(std::env::temp_dir(), None)).await;
+        assert!(waited.is_err(), "the download must still be running");
     }
 
     // ---------- embedder status ----------

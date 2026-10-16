@@ -19,8 +19,9 @@ crate-type = ["rlib"]
 eval = []
 
 # Opens `MemoryStore::new_for_test()`, `FakeEmbedder` and the two cross-module
-# test helpers to OTHER crates' test builds. Never enabled by a production
-# build: only dev-dependencies turn it on.
+# test helpers to OTHER crates' test builds, and lets the binary those builds
+# compile read `CLAWG_TEST_HOME` and `CLAWG_TEST_EMBEDDER`. Never enabled by a
+# production build: only dev-dependencies turn it on.
 testing = []
 
 [dependencies]
