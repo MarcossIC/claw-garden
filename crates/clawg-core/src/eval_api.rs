@@ -36,7 +36,7 @@ use crate::memory::events::{MemoryEvent, MemorySource};
 use crate::memory::model_download;
 use crate::memory::project_docs;
 use crate::memory::score::{ImportanceFactor, ScoringConfig};
-use crate::memory::search::{search_all_memories_with_scoring, SearchScope};
+use crate::memory::search::{lexical_channel_only, search_all_memories_with_scoring, SearchScope};
 use crate::memory::store_insert::{CreatedByType, MemoryType, NewMemoryRecord};
 use crate::memory::store_lock::StoreHolder;
 use crate::memory::worker::{memory_worker, resolve_tokenizer_and_chunker, IngestRequest};
@@ -338,6 +338,12 @@ impl EvalStore {
                 distance: h.distance,
             })
             .collect())
+    }
+
+    /// Row ids for `query_text` ranked by the lexical channel alone (bm25 over
+    /// `memory_fts`), never consulting a vector. Empty when no row matches.
+    pub async fn lexical_search(&self, query_text: &str, agent_id: &str, k: usize) -> Vec<i64> {
+        lexical_channel_only(&self.0, query_text, agent_id, k).await
     }
 
     /// Drops and recreates `memory_fts` with a different tokenizer. Eval-only
@@ -1223,5 +1229,23 @@ mod tests {
         };
         let gap = created(fresh).await - created(old).await;
         assert!((gap - (30 * DAY_MS) as i64).abs() < 60_000, "gap was {gap} ms");
+    }
+
+    #[tokio::test]
+    async fn lexical_search_ranks_by_bm25_without_vectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EvalStore::open(dir.path()).await.expect("open must succeed");
+        let mut query = vec![0.0_f32; 384];
+        query[0] = 1.0;
+        let mut far = vec![0.0_f32; 384];
+        far[1] = 1.0;
+        let word = store.insert("a", "the ferry schedule for zanzibar", "chat_message", 3.0, far, 0).await.unwrap();
+        let near = store.insert("a", "the ferry schedule for the island", "chat_message", 3.0, query.clone(), 0).await.unwrap();
+
+        assert_eq!(store.lexical_search("zanzibar", "a", 10).await, vec![word]);
+        let both = store.lexical_search("ferry schedule", "a", 10).await;
+        assert_eq!(both.len(), 2, "{both:?}");
+        assert!(both.contains(&near));
+        assert!(store.lexical_search("zanzibar", "someone-else", 10).await.is_empty());
     }
 }

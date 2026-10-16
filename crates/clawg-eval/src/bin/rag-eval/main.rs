@@ -42,6 +42,9 @@ const K_POOL: EvalScope = EvalScope { memory: Some(30), episodic: Some(5), proce
 /// change what those two field names mean.
 const K_FINAL: usize = 10;
 
+/// Tag of a `--lexical-only` results file.
+const LEXICAL_ONLY_SLUG: &str = "lexical-only";
+
 const EXIT_OK: i32 = 0;
 const EXIT_RUNTIME_FAILURE: i32 = 1;
 const EXIT_GOLDEN_INVALID: i32 = 2;
@@ -412,22 +415,23 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
         let mut blocked = Vec::new();
         let mut unanswerable = Vec::new();
         for ec in &embedded_cases {
-            let hits = match seeded
-                .store
-                .search(&ec.embedding, seed::AGENT_ID, scope, K_FINAL, point.scoring, Some(&ec.query))
-                .await
-            {
-                Ok(h) => h,
-                Err(e) => {
-                    eprintln!("search failed for query '{}': {e}", ec.query);
-                    return EXIT_RUNTIME_FAILURE;
+            let ids: Vec<i64> = if cli.lexical_only {
+                seeded.store.lexical_search(&ec.query, seed::AGENT_ID, K_FINAL).await
+            } else {
+                match seeded
+                    .store
+                    .search(&ec.embedding, seed::AGENT_ID, scope, K_FINAL, point.scoring, Some(&ec.query))
+                    .await
+                {
+                    Ok(h) => h.iter().map(|h| h.id).collect(),
+                    Err(e) => {
+                        eprintln!("search failed for query '{}': {e}", ec.query);
+                        return EXIT_RUNTIME_FAILURE;
+                    }
                 }
             };
-            let ranked_refs: Vec<String> = hits
-                .iter()
-                .filter_map(|h| seeded.refs.ref_of(h.id))
-                .map(|r| r.to_string())
-                .collect();
+            let ranked_refs: Vec<String> =
+                ids.iter().filter_map(|id| seeded.refs.ref_of(*id)).map(|r| r.to_string()).collect();
             let expected: HashSet<String> = ec.expected_refs.iter().cloned().collect();
 
             let recall_1 = metrics::recall_at_k(&ranked_refs, &expected, 1);
@@ -487,7 +491,8 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
         // set can discriminate.
         let audit_report = cli.audit.then(|| audit::audit(per_case, &golden_set.corpus));
 
-        let tag = fold_tag(run_tag.as_deref(), point_slug(point).as_deref());
+        let arm = if cli.lexical_only { Some(LEXICAL_ONLY_SLUG.to_string()) } else { point_slug(point) };
+        let tag = fold_tag(run_tag.as_deref(), arm.as_deref());
 
         let results = report::RunResults {
             date: date.clone(),
@@ -495,7 +500,11 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             tag,
             model_id: model_id.clone(),
             git_sha: git_sha.clone(),
-            k_pool: report::KPool { memory: 30, episodic: 5, procedural: 5, lexical: scope.lexical },
+            k_pool: if cli.lexical_only {
+                report::KPool { memory: 0, episodic: 0, procedural: 0, lexical: Some(K_FINAL) }
+            } else {
+                report::KPool { memory: 30, episodic: 5, procedural: 5, lexical: scope.lexical }
+            },
             fts_tokenizer: fts_tokenizer.clone(),
             k_final: K_FINAL,
             corpus_size: golden_set.corpus.len(),
@@ -1394,6 +1403,41 @@ mod tests {
         assert_eq!(retrieval["per_case"][0]["fresh_first"], true, "its query is the newer row's own text");
         assert_eq!(retrieval["freshness"]["hits"], 1);
         assert_eq!(retrieval["freshness"]["n_cases"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_lexical_only_run_writes_a_tagged_file_that_diffs() {
+        let golden_path = temp_path("lexical-only-golden.json");
+        std::fs::write(&golden_path, lexical_wiring_golden_json()).expect("write golden fixture");
+        let out_dir = temp_path("lexical-only-out");
+        let args = |extra: &[&str]| {
+            ["rag-eval", "--fake", "--golden", &golden_path.to_string_lossy(), "--out", &out_dir.to_string_lossy()]
+                .iter()
+                .map(|s| s.to_string())
+                .chain(extra.iter().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(run(args(&["--lexical-only"]).into_iter()).await, EXIT_OK);
+        assert_eq!(run(args(&["--tag", "full"]).into_iter()).await, EXIT_OK);
+
+        let lexical = read_results(&out_dir, LEXICAL_ONLY_SLUG);
+        assert_eq!(lexical["tag"], LEXICAL_ONLY_SLUG);
+        assert_eq!(lexical["k_pool"]["memory"], 0);
+        let ranked: Vec<&str> = lexical["retrieval"]["per_case"][0]["ranked_refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(ranked.len(), 5, "only the five rows carrying the token match: {ranked:?}");
+        assert!(ranked.iter().all(|r| ["c1", "c2", "c3", "c4", "c5"].contains(r)), "{ranked:?}");
+
+        let full_path = out_dir.join(format!("{}-fake-full.json", current_date_string()));
+        let lexical_path = out_dir.join(format!("{}-fake-{LEXICAL_ONLY_SLUG}.json", current_date_string()));
+        diff::diff_files(&lexical_path, &full_path).expect("the two arms compare");
+
+        std::fs::remove_file(&golden_path).ok();
+        std::fs::remove_dir_all(&out_dir).ok();
     }
 
     #[tokio::test]

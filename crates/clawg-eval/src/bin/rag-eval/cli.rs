@@ -78,6 +78,10 @@ pub struct Cli {
     pub docs: bool,
     /// `--root <dir>`, the project `--docs` indexes.
     pub docs_root: PathBuf,
+    /// `--lexical-only`: rank every case by the lexical channel alone (bm25,
+    /// no vectors), as a floor the full ranking has to beat. Mutually
+    /// exclusive with the other arms and every sweep flag.
+    pub lexical_only: bool,
 }
 
 /// What a parse attempt produces. `--help` is not an error: it takes
@@ -118,6 +122,8 @@ pub enum CliError {
     DocsWithOtherMode,
     #[error("--root is only meaningful with --docs")]
     RootWithoutDocs,
+    #[error("--lexical-only is mutually exclusive with --agent-view, --follow-up, --docs and the sweep flags (--sweep-imp, --sweep-cos-floor, --sweep-lexical, --fts-tokenizer)")]
+    LexicalOnlyWithOtherMode,
     #[error("--fail-on-regression is only meaningful with --diff")]
     FailOnRegressionWithoutDiff,
 }
@@ -189,6 +195,11 @@ OPTIONS:
                          Mutually exclusive with --audit, --follow-up, --agent-view and
                          every sweep flag.
     --root <dir>        With --docs: the project to index (default: this workspace)
+    --lexical-only      Rank every case by the lexical channel alone: the same FTS5 match and
+                         bm25 order the full search uses, with no vectors and no scoring. A
+                         floor for the full ranking; writes {date}-{mode}-lexical-only.json,
+                         which --diff compares with any other run. Mutually exclusive with
+                         --agent-view, --follow-up, --docs and every sweep flag.
     --help, -h          Print this message and exit
 
 EXIT CODES:
@@ -257,6 +268,7 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
     let mut docs = false;
     let mut docs_root: Option<PathBuf> = None;
     let mut fail_on_regression = false;
+    let mut lexical_only = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -265,6 +277,7 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
             "--agent-view" => agent_view = true,
             "--docs" => docs = true,
             "--fail-on-regression" => fail_on_regression = true,
+            "--lexical-only" => lexical_only = true,
             "--root" => {
                 let value = args
                     .next()
@@ -387,6 +400,17 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
     {
         return Err(CliError::DocsWithOtherMode);
     }
+    if lexical_only
+        && (follow_up
+            || agent_view
+            || docs
+            || !sweep_imp.is_empty()
+            || !sweep_cos_floor.is_empty()
+            || !sweep_lexical.is_empty()
+            || fts_tokenizer.is_some())
+    {
+        return Err(CliError::LexicalOnlyWithOtherMode);
+    }
     if fail_on_regression {
         return Err(CliError::FailOnRegressionWithoutDiff);
     }
@@ -411,6 +435,7 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
         agent_view,
         docs,
         docs_root: docs_root.unwrap_or_else(default_docs_root),
+        lexical_only,
     }))
 }
 
@@ -585,6 +610,28 @@ mod tests {
             parse(argv(&["--fail-on-regression", "--diff", "/tmp/a.json", "/tmp/b.json"])).unwrap(),
             diff_of("/tmp/a.json", "/tmp/b.json", true)
         );
+    }
+
+    #[test]
+    fn lexical_only_conflicts_with_the_other_arms() {
+        assert!(run_cli(&["--fake", "--lexical-only"]).lexical_only);
+        assert!(!run_cli(&["--fake"]).lexical_only);
+        for other in [
+            &["--agent-view"][..],
+            &["--follow-up"],
+            &["--docs"],
+            &["--sweep-imp", "0.5:1.0"],
+            &["--sweep-cos-floor", "0.8"],
+            &["--sweep-lexical", "0"],
+            &["--fts-tokenizer", "trigram"],
+        ] {
+            let args: Vec<&str> = ["--fake", "--lexical-only"].iter().chain(other).copied().collect();
+            let err = parse(argv(&args)).expect_err("--lexical-only is an arm of its own");
+            assert!(
+                matches!(err, CliError::LexicalOnlyWithOtherMode | CliError::DocsWithOtherMode | CliError::AgentViewWithOtherMode),
+                "{other:?}: {err:?}"
+            );
+        }
     }
 
     #[test]
