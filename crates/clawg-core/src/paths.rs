@@ -160,9 +160,37 @@ pub fn data_dir_in(home: Option<PathBuf>, profile: Profile) -> Result<PathBuf, P
     Ok(home.ok_or(PathsError::NoHome)?.join(profile.dir_name()))
 }
 
+/// Env var that stands in for the home directory, read only by a build with
+/// the `testing` feature: it lets a test run the real binary against a
+/// temporary directory, which redirecting `HOME` cannot do on Windows (the
+/// profile folder comes from the shell API there). The profile still picks
+/// `.clawg-dev` or `.clawg` under it, so a debug build stays out of `.clawg`.
+#[cfg(any(test, feature = "testing"))]
+pub const TEST_HOME_VAR: &str = "CLAWG_TEST_HOME";
+
+/// Pure core of the home lookup in a `testing` build: a non-empty
+/// [`TEST_HOME_VAR`] wins over the system's home.
+#[cfg(any(test, feature = "testing"))]
+pub fn home_in(test_home: Option<std::ffi::OsString>, system: Option<PathBuf>) -> Option<PathBuf> {
+    match test_home {
+        Some(home) if !home.is_empty() => Some(PathBuf::from(home)),
+        _ => system,
+    }
+}
+
+#[cfg(feature = "testing")]
+fn home_dir() -> Option<PathBuf> {
+    home_in(std::env::var_os(TEST_HOME_VAR), dirs::home_dir())
+}
+
+#[cfg(not(feature = "testing"))]
+fn home_dir() -> Option<PathBuf> {
+    dirs::home_dir()
+}
+
 /// Data directory for `profile` under the user's home directory.
 pub fn data_dir(profile: Profile) -> Result<PathBuf, PathsError> {
-    data_dir_in(dirs::home_dir(), profile)
+    data_dir_in(home_dir(), profile)
 }
 
 /// [`data_dir`] for the profile resolved from the environment via
@@ -335,6 +363,22 @@ mod tests {
     }
 
     // ── as_str / dir_name / mcp_server_name ─────────────────────────────
+
+    #[test]
+    fn a_test_home_replaces_the_system_home() {
+        let got = home_in(Some("/tmp/smoke".into()), Some(PathBuf::from("/home/u")));
+        assert_eq!(got, Some(PathBuf::from("/tmp/smoke")));
+        let dir = data_dir_in(got, Profile::Dev).expect("a home");
+        assert_eq!(dir, PathBuf::from("/tmp/smoke").join(".clawg-dev"));
+    }
+
+    #[test]
+    fn an_unset_or_empty_test_home_keeps_the_system_home() {
+        let system = Some(PathBuf::from("/home/u"));
+        assert_eq!(home_in(None, system.clone()), system);
+        assert_eq!(home_in(Some("".into()), system.clone()), system);
+        assert_eq!(home_in(Some("".into()), None), None);
+    }
 
     #[test]
     fn as_str_matches_profile() {

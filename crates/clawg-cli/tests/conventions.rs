@@ -80,3 +80,59 @@ fn no_source_allows_dead_code() {
     }
     assert!(found.is_empty(), "delete the unused code instead of allowing it:\n{}", found.join("\n"));
 }
+
+/// Lines of a manifest that turn on clawg-core's `testing` feature outside
+/// `[dev-dependencies]`. That feature lets a binary read `CLAWG_TEST_HOME`
+/// and `CLAWG_TEST_EMBEDDER`, so a release build must never get it.
+fn testing_outside_dev_dependencies(manifest: &str) -> Vec<usize> {
+    let mut section = "";
+    let mut found = Vec::new();
+    for (n, line) in manifest.lines().enumerate() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.starts_with('[') {
+            section = line;
+            continue;
+        }
+        let enables = line.contains("\"testing\"") || line.contains("/testing\"");
+        if enables && !section.ends_with("dev-dependencies]") {
+            found.push(n + 1);
+        }
+    }
+    found
+}
+
+#[test]
+fn testing_outside_dev_dependencies_reads_the_section() {
+    let manifest = r#"
+[dependencies]
+clawg-core = { workspace = true, features = ["testing"] }
+[dev-dependencies]
+clawg-core = { workspace = true, features = ["testing"] }
+[target.'cfg(unix)'.dev-dependencies]
+clawg-core = { workspace = true, features = ["testing"] }
+[features]
+testing = []
+default = ["testing"]
+local = ["clawg-core/testing"]
+"#;
+    assert_eq!(testing_outside_dev_dependencies(manifest), [3, 10, 11]);
+}
+
+#[test]
+fn only_dev_dependencies_turn_on_the_test_stand_ins() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let crates = root.join("crates");
+    let mut manifests = vec![root.join("Cargo.toml")];
+    for krate in fs::read_dir(&crates).expect("read crates/").flatten() {
+        manifests.push(krate.path().join("Cargo.toml"));
+    }
+
+    let mut found = Vec::new();
+    for manifest in manifests.iter().filter(|m| m.is_file()) {
+        let text = fs::read_to_string(manifest).unwrap_or_else(|e| panic!("read {}: {e}", manifest.display()));
+        for n in testing_outside_dev_dependencies(&text) {
+            found.push(format!("{}:{n}", manifest.display()));
+        }
+    }
+    assert!(found.is_empty(), "`testing` belongs only in [dev-dependencies]:\n{}", found.join("\n"));
+}

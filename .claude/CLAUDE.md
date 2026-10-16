@@ -88,6 +88,10 @@ cargo test --workspace
 
 Current baseline (Windows): 2034 tests, all passing.
 
+`crates/clawg-cli/tests/binary.rs` runs the built `clawg` itself: a hard kill with a save still pending, two daemons on one store, `status`/`stop`, `backup`/`restore`, MCP over real stdio and a daemon restart under an open bridge. Each test gets a temporary home through `CLAWG_TEST_HOME` and the fake model through `CLAWG_TEST_EMBEDDER=fake|stalled`; only a build with clawg-core's `testing` feature (its dev-dependencies) reads them, never a release build, and `tests/conventions.rs` fails when a manifest enables `testing` outside `[dev-dependencies]`. Every daemon binds `--port 0`, and each child is ended by its own handle, never by name. It takes about a second.
+
+CI (`.github/workflows/ci.yml`) runs clippy and the suite on Linux and Windows for every pull request and every push to `main`.
+
 On Windows, live `clawg.exe` processes (for example the editor's MCP bridge) lock `target\debug\clawg.exe` and make the build fail. Use a separate target directory instead: `cargo test --workspace --target-dir <other-dir>`.
 
 Compiler warnings, `dead_code` and `unused` among them, are errors here (clippy's own lints are not enforced yet):
