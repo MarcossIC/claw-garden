@@ -45,8 +45,13 @@ use crate::client::{
 use crate::mcp::startup::{on_failure, ClientHandle, Next};
 use crate::mcp::tools::{
     format_docs, format_recall, format_resolution, format_rows, format_save, format_search, format_sharing,
-    format_restore, format_status, format_synthesis, format_update, resolve_project,
+    format_restore, format_status, format_synthesis, format_update, indexes_docs, resolve_project,
 };
+
+/// The daemon refused a root because its id already belongs to another one.
+fn is_root_collision(err: &ClientError) -> bool {
+    matches!(err, ClientError::Daemon { status: 409, message, .. } if message == "project_root_collision")
+}
 
 /// Agent id used when neither `--agent` nor the MCP client named one.
 ///
@@ -184,7 +189,8 @@ pub struct SearchProjectArgs {
     #[serde(default)]
     pub limit: Option<usize>,
     /// Absolute path of the project. Defaults to the directory this bridge was
-    /// started in.
+    /// started in. Another project's files are searched only once the user
+    /// has added it with `clawg projects add`.
     #[serde(default)]
     pub project_path: Option<String>,
 }
@@ -456,6 +462,12 @@ impl ClawgMcp {
                  why, or try again if it is still starting"
                     .to_string()
             }
+            ClientError::Daemon { details, .. } if is_root_collision(err) => format!(
+                "not done: {}, and clawg will not mix two projects' memories under one id, so this \
+                 project cannot be used until one of the two folders is renamed; all_projects \
+                 still searches every project",
+                details.detail.as_deref().unwrap_or("this project's id belongs to another root")
+            ),
             ClientError::Daemon { status: 503, message, .. } if message == "embedder_not_ready" => {
                 "the memory index is still loading its embedding model; \
                  saving works now, and search will work in a minute"
@@ -543,25 +555,35 @@ impl ClawgMcp {
     /// Each root and legacy id is sent once per process, even when the call
     /// fails: a daemon that cannot register (an older version, say) must not
     /// cost every tool call a round trip, and the scope is the same either way.
-    /// The exception is a call the daemon never got (a refused token or
-    /// connection), which is sent again.
+    /// The exceptions are a call the daemon never got (a refused token or
+    /// connection), which is sent again, and a root whose id belongs to
+    /// another root: that is `Err`, because reading or writing under the id
+    /// would mix two projects, and it is asked again on the next call because
+    /// nothing in this process would notice it being resolved.
     async fn project_for(
         &self,
         client: &DaemonClient,
         project_path: Option<&str>,
         all_projects: bool,
-    ) -> Option<String> {
-        let project = resolve_project(
+    ) -> Result<Option<String>, ClientError> {
+        let Some(project) = resolve_project(
             self.default_project.as_ref(),
             project_path,
             all_projects,
             ProjectIdentity::resolve,
-        )?;
+        ) else {
+            return Ok(None);
+        };
         let mut registered = self.registered.lock().await;
         if registered.insert((project.root.clone(), project.legacy_id.clone())) {
             let legacy: Vec<String> =
                 Some(project.legacy_id.clone()).filter(|l| *l != project.id).into_iter().collect();
-            if let Err(e) = client.register_project(&project.root, &legacy).await {
+            let index_docs = indexes_docs(&project, self.default_project.as_ref());
+            if let Err(e) = client.register_project(&project.root, &legacy, index_docs).await {
+                if is_root_collision(&e) {
+                    registered.remove(&(project.root.clone(), project.legacy_id.clone()));
+                    return Err(e);
+                }
                 log::warn!("could not register project {}: {e}", project.root.display());
                 // The daemon never saw it, so the one found after reading the
                 // files again must get it.
@@ -570,7 +592,7 @@ impl ClawgMcp {
                 }
             }
         }
-        Some(project.id)
+        Ok(Some(project.id))
     }
 
     // ── Implementations, testable without a Peer ────────────────────────────
@@ -589,7 +611,7 @@ impl ClawgMcp {
                 // A save is never "all projects": a memory belongs somewhere, and
                 // an unscoped write would be invisible to every project-scoped
                 // search.
-                let project_id = self.project_for(&client, args.project_path.as_deref(), false).await;
+                let project_id = self.project_for(&client, args.project_path.as_deref(), false).await?;
                 client
                     .save(SaveArgs {
                         content: args.content.clone(),
@@ -625,7 +647,7 @@ impl ClawgMcp {
             .call(|client| async move {
                 let project_id = self
                     .project_for(&client, args.project_path.as_deref(), args.all_projects.unwrap_or(false))
-                    .await;
+                    .await?;
                 client
                     .search(SearchArgs {
                         query: args.query.clone(),
@@ -651,7 +673,7 @@ impl ClawgMcp {
         let args = &args;
         let result = self
             .call(|client| async move {
-                let project_id = self.project_for(&client, args.project_path.as_deref(), false).await;
+                let project_id = self.project_for(&client, args.project_path.as_deref(), false).await?;
                 client.context(&args.query, agent_id, project_id.as_deref()).await
             })
             .await;
@@ -806,7 +828,7 @@ impl ClawgMcp {
         let args = &args;
         let result = self
             .call(|client| async move {
-                let Some(project_id) = self.project_for(&client, args.project_path.as_deref(), false).await else {
+                let Some(project_id) = self.project_for(&client, args.project_path.as_deref(), false).await? else {
                     return Ok(None);
                 };
                 client.search_docs(&project_id, &args.query, args.limit).await.map(Some)
@@ -815,6 +837,9 @@ impl ClawgMcp {
         match result {
             Ok(Ok(Some(found))) => Self::ok(format_docs(&found)),
             Ok(Ok(None)) => Self::failed("no project to search: pass project_path"),
+            // Already the sentence the model should act on: which root, and
+            // the command the user runs to have it read.
+            Ok(Err(ClientError::Daemon { status: 403, message, .. })) => Self::failed(message),
             // The daemon's own 404 names the project; a bare one is a daemon
             // that predates the route.
             Ok(Err(ClientError::Daemon { status: 404, message, .. })) if message.starts_with("404") => Self::failed(
@@ -837,7 +862,7 @@ impl ClawgMcp {
             .call(|client| async move {
                 let project_id = self
                     .project_for(&client, args.project_path.as_deref(), args.all_projects.unwrap_or(false))
-                    .await;
+                    .await?;
                 client
                     .synthesis(&SynthesisArgs { agent_id: Some(agent_id.into()), project_id, limit: args.limit })
                     .await
@@ -1285,17 +1310,82 @@ mod tests {
         assert!(out.contains("[2] README.md > Repo > Build\nRun make."), "{out}");
     }
 
-    #[tokio::test]
-    async fn a_refused_registration_does_not_block_the_save() {
-        let (_repo, identity) = repo_with_src();
+    /// The store of a bridge's daemon, captured as the runtime is built.
+    async fn bridge_with_store(project: ProjectIdentity) -> (ClawgMcp, tempfile::TempDir, Arc<clawg_core::memory::MemoryStore>) {
         let store = std::sync::Mutex::new(None);
-        let (b, _d) = bridge_at(Some(identity.clone()), |runtime| {
+        let (b, d) = bridge_at(Some(project), |runtime| {
             *store.lock().unwrap() = Some(runtime.store.clone());
             runtime
         })
         .await;
-        let store = store.into_inner().unwrap().expect("store");
-        // Another root already owns this id, so the daemon answers 409.
+        (b, d, store.into_inner().unwrap().expect("store"))
+    }
+
+    async fn index_docs_of(store: &clawg_core::memory::MemoryStore, id: &str) -> Option<i64> {
+        let id = id.to_string();
+        store
+            .conn
+            .call(move |c| c.query_row("SELECT (SELECT index_docs FROM project WHERE id = ?1)", [id], |r| r.get(0)))
+            .await
+            .expect("project")
+    }
+
+    /// A directory outside the bridge's repository, with a doc in it.
+    fn elsewhere() -> (tempfile::TempDir, ProjectIdentity) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonicalize");
+        std::fs::write(root.join("README.md"), "# Elsewhere\nWhat lives outside the repo.\n").expect("readme");
+        let identity = ProjectIdentity::resolve(&root);
+        (dir, identity)
+    }
+
+    #[tokio::test]
+    async fn a_save_elsewhere_registers_the_root_without_reading_it() {
+        let (_repo, identity) = repo_with_src();
+        let (b, _d, store) = bridge_with_store(identity).await;
+        let (_other, other) = elsewhere();
+
+        let saved = b
+            .save_memory_impl(
+                "a",
+                SaveMemoryArgs { project_path: Some(other.root.display().to_string()), ..save_args("kept elsewhere") },
+            )
+            .await
+            .unwrap();
+
+        assert!(!is_error(&saved), "{}", text(&saved));
+        assert_eq!(rows_in(&b, &other.id).await, 1);
+        assert_eq!(index_docs_of(&store, &other.id).await, Some(0));
+        assert_eq!(clawg_core::memory::project_docs::doc_count(&store, &other.id).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn search_project_does_not_read_a_root_the_user_did_not_add() {
+        let (_repo, identity) = repo_with_src();
+        let (b, _d, store) = bridge_with_store(identity).await;
+        let (_other, other) = elsewhere();
+
+        let found = b
+            .search_project_impl(SearchProjectArgs {
+                query: "What lives outside the repo".into(),
+                limit: None,
+                project_path: Some(other.root.display().to_string()),
+            })
+            .await
+            .unwrap();
+
+        let out = text(&found);
+        assert!(is_error(&found), "{out}");
+        assert!(out.starts_with("clawg reads the files of"), "the daemon's sentence, unwrapped: {out}");
+        assert!(out.contains(&format!("clawg projects add \"{}\" --profile dev", other.root.display())), "{out}");
+        assert_eq!(clawg_core::memory::project_docs::doc_count(&store, &other.id).await.unwrap(), 0);
+    }
+
+    /// A bridge whose own root's id already belongs to `/elsewhere`, so the
+    /// daemon answers its registration with 409.
+    async fn colliding_bridge() -> (ClawgMcp, tempfile::TempDir, tempfile::TempDir, ProjectIdentity) {
+        let (repo, identity) = repo_with_src();
+        let (b, d, store) = bridge_with_store(identity.clone()).await;
         let id = identity.id.clone();
         store
             .conn
@@ -1304,11 +1394,56 @@ mod tests {
             })
             .await
             .expect("seed a colliding project");
+        (b, repo, d, identity)
+    }
 
-        let saved = b.save_memory_impl("a", save_args("still saved")).await.unwrap();
+    #[tokio::test]
+    async fn a_colliding_root_refuses_the_save_every_time() {
+        let (b, _repo, _d, identity) = colliding_bridge().await;
+
+        for _ in 0..2 {
+            let saved = b.save_memory_impl("a", save_args("never mixed")).await.unwrap();
+            let out = text(&saved);
+            assert!(is_error(&saved), "{out}");
+            assert!(out.contains("/elsewhere") && out.contains(&identity.root.display().to_string()), "{out}");
+            assert!(out.contains("all_projects"), "{out}");
+        }
+        assert_eq!(rows_in(&b, &identity.id).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_colliding_root_still_searches_all_projects() {
+        let (b, _repo, _d, _identity) = colliding_bridge().await;
+
+        let found = b
+            .search_memory_impl(
+                "a",
+                SearchMemoryArgs { query: "anything".into(), limit: None, project_path: None, all_projects: Some(true) },
+            )
+            .await
+            .unwrap();
+
+        assert!(!is_error(&found), "{}", text(&found));
+    }
+
+    #[tokio::test]
+    async fn a_registration_the_daemon_cannot_do_does_not_block_the_save() {
+        let data = tempfile::tempdir().expect("tempdir");
+        let _daemon = Published::start_with(data.path(), "token", |app| {
+            app.layer(axum::middleware::from_fn(|req: axum::extract::Request, next: axum::middleware::Next| async move {
+                if req.uri().path() == "/v1/projects" {
+                    return axum::response::IntoResponse::into_response(axum::http::StatusCode::NOT_FOUND);
+                }
+                next.run(req).await
+            }))
+        })
+        .await;
+        let b = ClawgMcp::with_project(DaemonClient::from_data_dir(data.path()).expect("files"), Profile::Dev, Some(test_project()));
+
+        let saved = b.save_memory_impl("agent", save_args("saved without a registration")).await.unwrap();
 
         assert!(!is_error(&saved), "{}", text(&saved));
-        assert_eq!(rows_in(&b, &identity.id).await, 1);
+        assert_eq!(rows_in(&b, &test_project().id).await, 1);
     }
 
     // ── agent identity ──────────────────────────────────────────────────────
@@ -3078,7 +3213,10 @@ mod tests {
         // the old token.
         let current = DaemonClient::from_data_dir(data.path()).expect("files");
         let stale = DaemonClient::new(current.base_url(), "token-of-the-old-daemon", data.path().to_path_buf());
-        let b = ClawgMcp::with_project(stale, Profile::Dev, Some(test_project()));
+        // A root on disk: the bridge's own root is registered to be indexed,
+        // and the daemon refuses that for a directory that does not exist.
+        let repo = tempfile::tempdir().expect("tempdir");
+        let b = ClawgMcp::with_project(stale, Profile::Dev, Some(ProjectIdentity::resolve(repo.path())));
 
         let saved = b.save_memory_impl("agent", save_args("registered after all")).await.unwrap();
         assert!(!is_error(&saved), "{}", text(&saved));

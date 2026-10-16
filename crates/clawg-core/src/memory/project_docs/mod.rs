@@ -45,6 +45,10 @@ const RRF_K: f64 = 60.0;
 pub enum DocIndexError {
     #[error("project {0} has no registered root")]
     UnknownProject(String),
+    /// Registered, but only as a label for memories: the user never let the
+    /// daemon read its files.
+    #[error("{} is not a project the daemon may read", .0.display())]
+    NotAccepted(PathBuf),
     #[error(transparent)]
     Corpus(#[from] CorpusError),
     #[error("embedding {path} failed: {source}")]
@@ -422,17 +426,27 @@ fn le_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
-/// The root `project_id` was registered with.
+/// The root `project_id` was registered with, if the daemon may read it.
+///
+/// Every read of a project's files starts here, so a root that was not
+/// accepted is refused before anything walks it.
 pub async fn root_of(store: &MemoryStore, project_id: &str) -> Result<PathBuf, DocIndexError> {
     let id = project_id.to_string();
-    let root: Option<String> = store
+    let row: Option<(String, bool)> = store
         .conn
         .call(move |c| -> rusqlite::Result<_> {
             use rusqlite::OptionalExtension;
-            c.query_row("SELECT root_path FROM project WHERE id = ?1", [&id], |r| r.get(0)).optional()
+            c.query_row("SELECT root_path, index_docs FROM project WHERE id = ?1", [&id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()
         })
         .await?;
-    root.map(PathBuf::from).ok_or_else(|| DocIndexError::UnknownProject(project_id.to_string()))
+    match row {
+        Some((root, true)) => Ok(PathBuf::from(root)),
+        Some((root, false)) => Err(DocIndexError::NotAccepted(PathBuf::from(root))),
+        None => Err(DocIndexError::UnknownProject(project_id.to_string())),
+    }
 }
 
 async fn fingerprints(store: &MemoryStore, project_id: &str) -> Result<Vec<Fingerprint>, DocIndexError> {
@@ -828,6 +842,20 @@ mod tests {
         let index = Arc::new(DocIndex::default());
         let result = index.try_refresh(&store, &Counting::new("m1"), None, "nobody").await;
         assert!(matches!(result, Err(DocIndexError::UnknownProject(ref p)) if p == "nobody"), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn a_root_that_was_not_accepted_is_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.md", "# A\na\n");
+        let store = store_with_project("p", dir.path()).await;
+        store.conn.call(|c| c.execute("UPDATE project SET index_docs = 0 WHERE id = 'p'", [])).await.unwrap();
+        let index = Arc::new(DocIndex::default());
+
+        let result = index.try_refresh(&store, &Counting::new("m1"), None, "p").await;
+
+        assert!(matches!(result, Err(DocIndexError::NotAccepted(ref root)) if *root == dir.path()), "{result:?}");
+        assert_eq!(index_sizes(&store).await, (0, 0, 0, 0));
     }
 
     #[tokio::test]

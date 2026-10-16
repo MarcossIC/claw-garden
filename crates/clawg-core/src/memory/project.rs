@@ -21,6 +21,8 @@ pub struct RegisterOutcome {
     pub project_id: String,
     /// Rows moved onto `project_id` by this call, across every table.
     pub rekeyed: usize,
+    /// Whether the daemon may read the root's files, as stored after this call.
+    pub index_docs: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -52,12 +54,17 @@ pub fn is_project_id(s: &str) -> bool {
 /// id `root` derives, soft-deleted rows included, then hands each legacy
 /// `workspace.md` to the project (see [`WorkspaceManager::adopt_legacy`]).
 ///
+/// `index_docs` lets the daemon read the root's files. It only ever raises
+/// the stored mark: any tool that names a path registers its root, and such a
+/// call must not take an index away from a root the user accepted.
+///
 /// Idempotent: once a legacy id has no rows left, a repeat moves nothing.
 pub async fn register_project(
     store: &MemoryStore,
     workspaces: &WorkspaceManager,
     root: &Path,
     legacy_ids: &[String],
+    index_docs: bool,
 ) -> Result<RegisterOutcome, RegisterError> {
     if let Some(bad) = legacy_ids.iter().find(|id| !is_project_id(id)) {
         return Err(RegisterError::InvalidLegacyId(bad.clone()));
@@ -74,16 +81,22 @@ pub async fn register_project(
     let moves = legacy.clone();
     let outcome = store
         .conn
-        .call(move |c| -> rusqlite::Result<Result<usize, String>> {
+        .call(move |c| -> rusqlite::Result<Result<(usize, bool), String>> {
             let tx = c.transaction()?;
             tx.execute(
-                "INSERT OR IGNORE INTO project (id, root_path, created_at) VALUES (?1, ?2, ?3)",
-                rusqlite::params![id, root_path, now_ms],
+                "INSERT OR IGNORE INTO project (id, root_path, created_at, index_docs) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![id, root_path, now_ms, index_docs],
             )?;
-            let existing: String =
-                tx.query_row("SELECT root_path FROM project WHERE id = ?1", [&id], |r| r.get(0))?;
+            let (existing, indexed): (String, bool) = tx.query_row(
+                "SELECT root_path, index_docs FROM project WHERE id = ?1",
+                [&id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
             if existing != root_path {
                 return Ok(Err(existing));
+            }
+            if index_docs && !indexed {
+                tx.execute("UPDATE project SET index_docs = 1 WHERE id = ?1", [&id])?;
             }
             let mut moved = 0;
             for legacy_id in &moves {
@@ -102,14 +115,14 @@ pub async fn register_project(
                 }
             }
             tx.commit()?;
-            Ok(Ok(moved))
+            Ok(Ok((moved, indexed || index_docs)))
         })
         .await
         .map_err(|e| match e {
             tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
             other => MemoryError::Backend(other.to_string()),
         })?;
-    let rekeyed = outcome
+    let (rekeyed, index_docs) = outcome
         .map_err(|existing| RegisterError::RootCollision { id: project_id.clone(), existing })?;
 
     // After the commit and outside it: a file copy that fails must not undo
@@ -120,7 +133,7 @@ pub async fn register_project(
         }
     }
 
-    Ok(RegisterOutcome { project_id, rekeyed })
+    Ok(RegisterOutcome { project_id, rekeyed, index_docs })
 }
 
 #[cfg(test)]
@@ -205,11 +218,11 @@ mod tests {
         let root = Path::new("/work/repo");
         let id = derive_project_id(root);
 
-        let outcome = register_project(&store, &WorkspaceManager::new(ws.path().into()), root, &["src-1a2b".into()])
+        let outcome = register_project(&store, &WorkspaceManager::new(ws.path().into()), root, &["src-1a2b".into()], true)
             .await
             .unwrap();
 
-        assert_eq!(outcome, RegisterOutcome { project_id: id.clone(), rekeyed: 4 });
+        assert_eq!(outcome, RegisterOutcome { project_id: id.clone(), rekeyed: 4, index_docs: true });
         let ids = project_ids(&store).await;
         let moved = ids.iter().filter(|(_, _, p)| p.as_deref() == Some(id.as_str())).count();
         assert_eq!(moved, 4, "{ids:?}");
@@ -223,9 +236,9 @@ mod tests {
         let (store, ws) = seeded().await;
         let ws = WorkspaceManager::new(ws.path().into());
         let root = Path::new("/work/repo");
-        register_project(&store, &ws, root, &["src-1a2b".into()]).await.unwrap();
+        register_project(&store, &ws, root, &["src-1a2b".into()], true).await.unwrap();
 
-        let again = register_project(&store, &ws, root, &["src-1a2b".into()]).await.unwrap();
+        let again = register_project(&store, &ws, root, &["src-1a2b".into()], true).await.unwrap();
 
         assert_eq!(again.rekeyed, 0);
         assert_eq!(count(&store, "SELECT COUNT(*) FROM project_rekey").await, 4);
@@ -235,7 +248,7 @@ mod tests {
     async fn the_rekey_log_restores_every_row_it_moved() {
         let (store, ws) = seeded().await;
         let before = project_ids(&store).await;
-        register_project(&store, &WorkspaceManager::new(ws.path().into()), Path::new("/work/repo"), &["src-1a2b".into()])
+        register_project(&store, &WorkspaceManager::new(ws.path().into()), Path::new("/work/repo"), &["src-1a2b".into()], true)
             .await
             .unwrap();
 
@@ -263,7 +276,7 @@ mod tests {
     #[tokio::test]
     async fn a_moved_row_is_found_lexically_under_its_new_project() {
         let (store, ws) = seeded().await;
-        let outcome = register_project(&store, &WorkspaceManager::new(ws.path().into()), Path::new("/work/repo"), &["src-1a2b".into()])
+        let outcome = register_project(&store, &WorkspaceManager::new(ws.path().into()), Path::new("/work/repo"), &["src-1a2b".into()], true)
             .await
             .unwrap();
 
@@ -301,11 +314,68 @@ mod tests {
             .unwrap();
         let before = project_ids(&store).await;
 
-        let err = register_project(&store, &ws, root, &["src-1a2b".into()]).await.unwrap_err();
+        let err = register_project(&store, &ws, root, &["src-1a2b".into()], true).await.unwrap_err();
 
         assert!(matches!(err, RegisterError::RootCollision { ref existing, .. } if existing == "/elsewhere/repo"), "{err:?}");
         assert_eq!(project_ids(&store).await, before);
         assert_eq!(count(&store, "SELECT COUNT(*) FROM project_rekey").await, 0);
+    }
+
+    async fn index_docs_of(store: &MemoryStore, id: &str) -> Vec<i64> {
+        let id = id.to_string();
+        store
+            .conn
+            .call(move |c| {
+                let mut stmt = c.prepare("SELECT index_docs FROM project WHERE id = ?1")?;
+                let marks = stmt.query_map([id], |r| r.get(0))?.collect();
+                marks
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn registering_to_index_raises_the_mark_and_never_lowers_it() {
+        let (store, ws) = seeded().await;
+        let ws = WorkspaceManager::new(ws.path().into());
+        let root = Path::new("/work/repo");
+        let id = derive_project_id(root);
+
+        let first = register_project(&store, &ws, root, &[], false).await.unwrap();
+        assert!(!first.index_docs);
+        assert_eq!(index_docs_of(&store, &id).await, vec![0]);
+
+        let raised = register_project(&store, &ws, root, &[], true).await.unwrap();
+        assert!(raised.index_docs);
+        assert_eq!(index_docs_of(&store, &id).await, vec![1]);
+
+        let kept = register_project(&store, &ws, root, &[], false).await.unwrap();
+        assert!(kept.index_docs, "a later registration that does not index keeps the mark");
+        assert_eq!(index_docs_of(&store, &id).await, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn a_collision_leaves_the_other_roots_mark_alone() {
+        let (store, ws) = seeded().await;
+        let ws = WorkspaceManager::new(ws.path().into());
+        let root = Path::new("/work/repo");
+        let id = derive_project_id(root);
+        let taken = id.clone();
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO project (id, root_path, created_at, index_docs) VALUES (?1, '/elsewhere/repo', 0, 0)",
+                    [taken],
+                )
+            })
+            .await
+            .unwrap();
+
+        let err = register_project(&store, &ws, root, &[], true).await.unwrap_err();
+
+        assert!(matches!(err, RegisterError::RootCollision { .. }), "{err:?}");
+        assert_eq!(index_docs_of(&store, &id).await, vec![0]);
     }
 
     #[tokio::test]
@@ -313,7 +383,7 @@ mod tests {
         let (store, ws) = seeded().await;
         let before = project_ids(&store).await;
 
-        let err = register_project(&store, &WorkspaceManager::new(ws.path().into()), Path::new("/work/repo"), &["src-1a2b".into(), "x' OR 1".into()])
+        let err = register_project(&store, &WorkspaceManager::new(ws.path().into()), Path::new("/work/repo"), &["src-1a2b".into(), "x' OR 1".into()], true)
             .await
             .unwrap_err();
 
@@ -330,7 +400,7 @@ mod tests {
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         std::fs::write(&legacy, "notes").unwrap();
 
-        let outcome = register_project(&store, &ws, Path::new("/work/repo"), &["src-1a2b".into()]).await.unwrap();
+        let outcome = register_project(&store, &ws, Path::new("/work/repo"), &["src-1a2b".into()], true).await.unwrap();
 
         let adopted = ws.workspace_path("agent-a", Some(&outcome.project_id));
         assert_eq!(std::fs::read_to_string(adopted).unwrap(), "notes");
