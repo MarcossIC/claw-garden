@@ -516,12 +516,23 @@ impl ClawgMcp {
                 }
                 Ok(text)
             }
-            Ok(SaveOutcome::Queued { reason }) if reason.as_deref() == Some("embedder_loading") => {
-                Ok("accepted; it will be stored once the embedding model finishes loading".into())
+            Ok(SaveOutcome::Queued { reason, operation_id }) => {
+                let accepted = match &operation_id {
+                    Some(id) => format!("accepted as operation {id}"),
+                    None => "accepted".to_string(),
+                };
+                Ok(match reason.as_deref() {
+                    Some("embedder_loading") => format!(
+                        "{accepted}; it will be stored once the embedding model finishes loading \
+                         (memory_status lists it if it fails)"
+                    ),
+                    Some("already_queued") => format!("{accepted} earlier and still waiting to be stored"),
+                    _ => format!(
+                        "{accepted} but not confirmed yet; memory_status lists it if it fails, \
+                         list_memories shows it once stored"
+                    ),
+                })
             }
-            Ok(SaveOutcome::Queued { .. }) => Ok(
-                "accepted but not confirmed yet; check with list_memories before relying on it".into(),
-            ),
             Err(ClientError::Daemon { message, details, .. }) if message == "embedder_failed" => {
                 let mut text = format!(
                     "not saved: the embedding model failed to load ({})",
@@ -2315,13 +2326,28 @@ mod tests {
                 (update_memory changes its importance or type)"
                 .to_string())
         );
+        let queued = |reason: &str| SaveOutcome::Queued { reason: Some(reason.into()), operation_id: Some("op-7".into()) };
         assert_eq!(
-            text(Ok(SaveOutcome::Queued { reason: Some("unconfirmed".into()) })),
-            Ok("accepted but not confirmed yet; check with list_memories before relying on it".to_string())
+            text(Ok(queued("unconfirmed"))),
+            Ok("accepted as operation op-7 but not confirmed yet; memory_status lists it if it fails, \
+                list_memories shows it once stored"
+                .to_string())
         );
         assert_eq!(
-            text(Ok(SaveOutcome::Queued { reason: Some("embedder_loading".into()) })),
-            Ok("accepted; it will be stored once the embedding model finishes loading".to_string())
+            text(Ok(queued("embedder_loading"))),
+            Ok("accepted as operation op-7; it will be stored once the embedding model finishes loading \
+                (memory_status lists it if it fails)"
+                .to_string())
+        );
+        assert_eq!(
+            text(Ok(queued("already_queued"))),
+            Ok("accepted as operation op-7 earlier and still waiting to be stored".to_string())
+        );
+        assert_eq!(
+            text(Ok(SaveOutcome::Queued { reason: Some("embedder_loading".into()), operation_id: None })),
+            Ok("accepted; it will be stored once the embedding model finishes loading \
+                (memory_status lists it if it fails)"
+                .to_string())
         );
         assert_eq!(
             text(Err(daemon_error(
@@ -2360,8 +2386,8 @@ mod tests {
             Err("not saved: the ingest queue is full; try again shortly".to_string())
         );
         for answer in [
-            text(Ok(SaveOutcome::Queued { reason: None })),
-            text(Ok(SaveOutcome::Queued { reason: Some("unconfirmed".into()) })),
+            text(Ok(SaveOutcome::Queued { reason: None, operation_id: None })),
+            text(Ok(SaveOutcome::Queued { reason: Some("unconfirmed".into()), operation_id: Some("op-7".into()) })),
         ] {
             let t = answer.unwrap();
             assert!(!t.split(|c: char| !c.is_alphanumeric()).any(|w| w == "queued"), "{t}");

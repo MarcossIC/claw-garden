@@ -72,8 +72,9 @@ pub struct Purged {
     pub backups: Vec<PathBuf>,
 }
 
-/// Removes `memory` row `id` for good: the row, its vector and its terms in
-/// the full-text index, so its text is in neither `memory.db` nor its WAL.
+/// Removes `memory` row `id` for good: the row, its vector, its terms in the
+/// full-text index and the outbox rows holding its text, so that text is in
+/// neither `memory.db` nor its WAL.
 ///
 /// Only on a stopped store that is up to date: the lock is taken first, and
 /// nothing is written before every check passes. No snapshot is taken first,
@@ -105,6 +106,9 @@ pub fn purge(base_dir: &Path, id: i64) -> Result<Purged, MemoryError> {
     // Unlike a soft delete, the id can be handed to a later row, which must
     // not inherit this one's provenance.
     tx.execute("DELETE FROM memory_derivation WHERE memory_id = ?1 OR source_id = ?1", [id])?;
+    // A save not stored yet, or that failed after it was accepted, holds the
+    // text in the outbox; a row stored from a long save is one of its pieces.
+    tx.execute("DELETE FROM ingest_outbox WHERE instr(content, ?1) > 0", [&content])?;
     // After the delete, so the row no longer counts as live for them.
     if live {
         release_challengers(&tx, id, TimestampMs::now())?;
@@ -129,27 +133,43 @@ pub fn purge(base_dir: &Path, id: i64) -> Result<Purged, MemoryError> {
     Ok(Purged { backups: backups_holding(&crate::paths::backups_dir(base_dir), id, &content) })
 }
 
-/// The snapshots in `dir` with a row `id` whose content is `content`, by
-/// name. One that cannot be read is listed too: it may hold the row.
+/// The snapshots in `dir` with a row `id` whose content is `content`, or an
+/// outbox row holding it, by name. One that cannot be read is listed too: it
+/// may hold the row.
 fn backups_holding(dir: &Path, id: i64, content: &str) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut holding: Vec<PathBuf> = entries
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.file_name().and_then(|n| n.to_str()).and_then(parse_snapshot_name).is_some())
         .filter(|p| {
-            open_for_probe(p)
-                .and_then(|c| {
-                    c.query_row(
-                        "SELECT count(*) FROM memory WHERE id = ?1 AND content = ?2",
-                        rusqlite::params![id, content],
-                        |r| r.get::<_, i64>(0),
-                    )
-                })
-                .map_or(true, |n| n > 0)
+            let Ok(c) = open_for_probe(p) else { return true };
+            let in_memory = c
+                .query_row(
+                    "SELECT count(*) FROM memory WHERE id = ?1 AND content = ?2",
+                    rusqlite::params![id, content],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_or(true, |n| n > 0);
+            in_memory || outbox_holds(&c, content)
         })
         .collect();
     holding.sort();
     holding
+}
+
+/// Whether a snapshot's outbox has a row with `content` in it. A snapshot
+/// from before the outbox has no such table, and so cannot hold one.
+fn outbox_holds(c: &rusqlite::Connection, content: &str) -> bool {
+    let has_table = c
+        .query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'ingest_outbox'", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .map_or(true, |n| n > 0);
+    has_table
+        && c.query_row("SELECT count(*) FROM ingest_outbox WHERE instr(content, ?1) > 0", [content], |r| {
+            r.get::<_, i64>(0)
+        })
+        .map_or(true, |n| n > 0)
 }
 
 #[cfg(test)]
@@ -479,6 +499,59 @@ mod tests {
         let now: Vec<Vec<u8>> =
             [&without, &with, &after_delete].iter().map(|p| std::fs::read(p).unwrap()).collect();
         assert_eq!(now, kept, "no backup was changed");
+    }
+
+    fn add_outbox_row(c: &rusqlite::Connection, operation_id: &str, content: &str) {
+        c.execute(
+            "INSERT INTO ingest_outbox (operation_id, agent_id, content, event, state, created_at, updated_at) \
+             VALUES (?1, 'agent-s', ?2, '{}', 'failed', 0, 0)",
+            [operation_id, content],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn purge_removes_the_text_from_the_outbox() {
+        use crate::memory::backup::backup_offline;
+        let dir = tempfile::tempdir().unwrap();
+        crate::memory::db::seed_on_disk(dir.path(), None).await;
+        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+        add_outbox_row(&c, "op-1", &format!("before it was stored: {SECRET}, and more"));
+        add_outbox_row(&c, "op-2", "nothing to do with it");
+        drop(c);
+        let only_in_the_outbox = backup_offline(dir.path()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+        c.execute(INSERT_ROW, [SECRET]).unwrap();
+        let id = c.last_insert_rowid();
+        drop(c);
+
+        let purged = purge(dir.path(), id).unwrap();
+
+        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+        let left: Vec<String> = c
+            .prepare("SELECT operation_id FROM ingest_outbox ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        drop(c);
+        assert_eq!(left, ["op-2"]);
+        assert!(!bytes_mention(dir.path(), b"quokka"), "the secret's bytes are still on disk");
+        assert_eq!(purged, Purged { backups: vec![only_in_the_outbox] });
+    }
+
+    #[tokio::test]
+    async fn a_backup_from_before_the_outbox_is_not_named_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = crate::paths::backups_dir(dir.path());
+        std::fs::create_dir_all(&backups).unwrap();
+        let old = backups.join(crate::memory::backup::snapshot_name(0, crate::memory::backup::Reason::Manual));
+        crate::memory::db::seed_on_disk(dir.path(), Some(crate::memory::backup::latest_known() - 1)).await;
+        std::fs::copy(dir.path().join("memory.db"), &old).unwrap();
+
+        assert!(backups_holding(&backups, 1, SECRET).is_empty());
     }
 
     #[test]

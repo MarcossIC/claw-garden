@@ -5,7 +5,7 @@
 //! each chunk, and inserts both `memory` and `memory_vectors` rows atomically.
 //! Failure isolation: errors are logged and the worker NEVER panics.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use once_cell::sync::OnceCell;
@@ -16,11 +16,11 @@ use tokio::time::Instant;
 use crate::memory::chunker::{
     embedding_text, select_chunker, ChatChunker, Chunk, ChunkerKind, SaveSplit,
 };
+use crate::memory::outbox::{resume_positions, Claimed, NotedPiece, OutboxNote};
 use crate::memory::pieces::StoredPiece;
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::events::{MemoryEvent, MemorySource};
 use crate::memory::redact::{redact, SecretKind};
-use crate::memory::spill::Replay;
 use crate::memory::store_insert::NewMemoryRecord;
 use crate::memory::MemoryStore;
 
@@ -58,11 +58,15 @@ pub struct IngestRequest {
     /// that stopped waiting leaves the receiver closed, and the report is
     /// dropped.
     pub reply: Option<oneshot::Sender<IngestReport>>,
+    /// The `ingest_outbox` row that holds this event until it is stored.
+    /// `None` for an event nothing recorded (the in-process paths of tests
+    /// and evaluation), which is ingested exactly as before the outbox.
+    pub outbox: Option<i64>,
 }
 
 impl From<MemoryEvent> for IngestRequest {
     fn from(event: MemoryEvent) -> Self {
-        Self { event, reply: None }
+        Self { event, reply: None, outbox: None }
     }
 }
 
@@ -151,6 +155,36 @@ fn collapse_duplicate_chunks(chunks: Vec<Chunk>) -> Vec<PendingChunk> {
     out
 }
 
+/// Outbox rows to ingest on this start, ahead of anything new on the channel.
+pub struct Replay {
+    requests: VecDeque<IngestRequest>,
+}
+
+impl Replay {
+    /// Nothing to replay.
+    pub fn none() -> Self {
+        Self { requests: VecDeque::new() }
+    }
+
+    /// The pending outbox rows, in the order given.
+    pub(crate) fn rows(rows: Vec<(i64, MemoryEvent)>) -> Self {
+        Self {
+            requests: rows
+                .into_iter()
+                .map(|(row, event)| IngestRequest { event, reply: None, outbox: Some(row) })
+                .collect(),
+        }
+    }
+
+    fn next(&mut self) -> Option<IngestRequest> {
+        self.requests.pop_front()
+    }
+
+    fn into_remaining(self) -> VecDeque<IngestRequest> {
+        self.requests
+    }
+}
+
 /// What the worker does with the next event it takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DrainStep {
@@ -216,17 +250,19 @@ pub async fn memory_worker(
     let mut queue_over_depth = false;
     let mut drain = Some(drain);
     let mut deadline: Option<Instant> = None;
+    // The outbox rows taken in this run. A row the start-up read found can
+    // also arrive on the channel; the second delivery is skipped, and its
+    // caller, who may be waiting, gets the report of the first.
+    let mut taken: HashSet<i64> = HashSet::new();
+    let mut replayed: HashMap<i64, IngestReport> = HashMap::new();
     loop {
         observe_drain(&mut rx, &mut drain, &mut deadline);
-        let IngestRequest { event: evt, reply } = match replay.next() {
-            Some(evt) => IngestRequest::from(evt),
-            None => {
-                replay.finish().await;
-                match next_event(&mut rx, &mut drain, &mut deadline).await {
-                    Some(request) => request,
-                    None => break,
-                }
-            }
+        let (IngestRequest { event: evt, reply, outbox }, from_replay) = match replay.next() {
+            Some(request) => (request, true),
+            None => match next_event(&mut rx, &mut drain, &mut deadline).await {
+                Some(request) => (request, false),
+                None => break,
+            },
         };
         // Read after recv: this is the backlog still waiting, which is what
         // "falling behind" means.
@@ -244,16 +280,36 @@ pub async fn memory_worker(
         }
         hold_for_embedder(&embedder_cell, &mut rx, &mut drain, &mut deadline).await;
         if drain_step(Instant::now(), deadline, embedder_cell.get().is_some()) == DrainStep::Spill {
-            return unstarted(evt, replay, &mut rx);
+            return unstarted(IngestRequest { event: evt, reply, outbox }, replay, &mut rx);
         }
-        let report = process_event(
+        let track = match outbox {
+            None => None,
+            Some(row) => match take_row(&store, row, &mut taken).await {
+                Some(progress) => Some(Track { row, progress }),
+                None => {
+                    // A dropped reply reads as unconfirmed.
+                    if let (Some(reply), Some(report)) = (reply, replayed.remove(&row)) {
+                        let _ = reply.send(report);
+                    }
+                    continue;
+                }
+            },
+        };
+        let report = process_tracked(
             &evt,
             &store,
             &embedder_cell,
             &chat_chunker,
             &mut absorbed_duplicates,
+            track,
         )
         .await;
+        if let (Some(row), Some(failure)) = (outbox, &report.failure) {
+            let transient = *failure == IngestFailure::EmbedderUnavailable;
+            if let Err(e) = store.outbox_fail(row, failure.to_string(), transient).await {
+                log::warn!("could not note why outbox row {row} stopped: {e}");
+            }
+        }
         if let Some(e) = &report.failure {
             log::warn!(
                 "ingest event stopped after {} stored chunks (agent={}, role={:?}): {e}",
@@ -266,8 +322,14 @@ pub async fn memory_worker(
             let kinds: Vec<&str> = report.redacted.iter().map(|k| k.as_str()).collect();
             log::info!("ingest masked {} (agent={})", kinds.join(", "), evt.agent_id);
         }
-        if let Some(reply) = reply {
-            let _ = reply.send(report);
+        match (reply, outbox) {
+            (Some(reply), _) => {
+                let _ = reply.send(report);
+            }
+            (None, Some(row)) if from_replay => {
+                replayed.insert(row, report);
+            }
+            _ => {}
         }
     }
     log::info!("memory_worker shutting down — channel closed");
@@ -347,22 +409,45 @@ async fn hold_for_embedder(
     }
 }
 
-/// `evt`, then the events left to replay, then everything still queued, in
-/// order. Closes the channel first so nothing can slip in behind the last
-/// event read.
+/// Takes outbox `row` for this run: its progress, or `None` when there is
+/// nothing to ingest (taken already in this run, finished, failed, given up
+/// just now, or unreadable, which leaves it for the next start).
+async fn take_row(store: &Arc<MemoryStore>, row: i64, taken: &mut HashSet<i64>) -> Option<Vec<NotedPiece>> {
+    if !taken.insert(row) {
+        log::debug!("outbox row {row} arrived twice; ingested once");
+        return None;
+    }
+    match store.outbox_claim(row).await {
+        Ok(Claimed::Process { progress }) => Some(progress),
+        Ok(Claimed::Skip) => None,
+        Ok(Claimed::GaveUp) => {
+            log::warn!("gave up outbox row {row}: the daemon stopped every time it ingested it");
+            None
+        }
+        Err(e) => {
+            log::warn!("could not take outbox row {row}: {e}; it is ingested on the next start");
+            None
+        }
+    }
+}
+
+/// The events nothing recorded among `first`, the requests left to replay and
+/// everything still queued, in order. A recorded one stays in the outbox for
+/// the next start. Closes the channel first so nothing can slip in behind the
+/// last event read.
 fn unstarted(
-    evt: MemoryEvent,
+    first: IngestRequest,
     replay: Replay,
     rx: &mut Receiver<IngestRequest>,
 ) -> Vec<MemoryEvent> {
     rx.close();
-    let mut events = vec![evt];
-    events.extend(replay.into_remaining());
+    let mut requests = vec![first];
+    requests.extend(replay.into_remaining());
     while let Ok(next) = rx.try_recv() {
-        events.push(next.event);
+        requests.push(next);
     }
-    log::info!("ingest stopped with {} events not yet ingested", events.len());
-    events
+    log::info!("ingest stopped with {} events not yet ingested", requests.len());
+    requests.into_iter().filter(|r| r.outbox.is_none()).map(|r| r.event).collect()
 }
 
 /// Runs the write-border dedup gate for one chunk hash. `Some(id)` means the
@@ -387,14 +472,16 @@ async fn absorb_duplicate(
     evt: &MemoryEvent,
     content_hash: &str,
     absorbed: &mut u64,
+    note: impl FnOnce(i64) -> Option<OutboxNote> + Send + 'static,
 ) -> Option<i64> {
     match store
-        .reinforce_if_duplicate(
+        .reinforce_noting(
             &evt.agent_id,
             evt.project_id.as_deref(),
             content_hash,
             evt.sources(),
             evt.timestamp_ms,
+            note,
         )
         .await
     {
@@ -417,6 +504,36 @@ async fn absorb_duplicate(
     }
 }
 
+/// The outbox row an event is ingested for, and the pieces of it already
+/// stored by an earlier attempt.
+struct Track {
+    row: i64,
+    progress: Vec<NotedPiece>,
+}
+
+/// The note a store write of `position` records for `track`, built from the
+/// progress so far plus the row the write produces.
+fn note_for(
+    track: Option<&Track>,
+    noted: &[NotedPiece],
+    position: usize,
+    hash: &str,
+    inserted: bool,
+    context: &str,
+) -> impl FnOnce(i64) -> Option<OutboxNote> + Send + 'static {
+    let row = track.map(|t| t.row);
+    let mut progress = noted.to_vec();
+    let (hash, context) = (hash.to_string(), context.to_string());
+    move |id| {
+        row.map(|row| {
+            progress.push(NotedPiece { position, hash, id, inserted, context });
+            OutboxNote { row, progress }
+        })
+    }
+}
+
+/// [`process_tracked`] for an event no outbox row holds.
+#[cfg(test)]
 async fn process_event(
     evt: &MemoryEvent,
     store: &Arc<MemoryStore>,
@@ -424,9 +541,53 @@ async fn process_event(
     chat_chunker: &Arc<ChatChunker>,
     absorbed: &mut u64,
 ) -> IngestReport {
+    process_tracked(evt, store, embedder_cell, chat_chunker, absorbed, None).await
+}
+
+/// Ingests `evt` and, when it finished, links its pieces; for an event with
+/// an outbox row, the link and the row's removal go in one transaction. A
+/// failure leaves the row, with the pieces stored so far noted in it.
+async fn process_tracked(
+    evt: &MemoryEvent,
+    store: &Arc<MemoryStore>,
+    embedder_cell: &Arc<OnceCell<Arc<dyn Embedder>>>,
+    chat_chunker: &Arc<ChatChunker>,
+    absorbed: &mut u64,
+    track: Option<Track>,
+) -> IngestReport {
+    let row = track.as_ref().map(|t| t.row);
+    let (report, pieces) = ingest_pieces(evt, store, embedder_cell, chat_chunker, absorbed, track).await;
+    if report.failure.is_some() {
+        return report;
+    }
+    match row {
+        // A failure here leaves the row with every piece noted: the next start
+        // only finishes it.
+        Some(row) => {
+            if let Err(e) = store.outbox_finish(row, pieces).await {
+                log::warn!("could not finish outbox row {row}: {e}; the next start finishes it");
+            }
+        }
+        None => link_save(store, pieces).await,
+    }
+    report
+}
+
+/// Stores the pieces of `evt` and returns its report with the pieces to link,
+/// in order, each with the head its vector was embedded behind.
+async fn ingest_pieces(
+    evt: &MemoryEvent,
+    store: &Arc<MemoryStore>,
+    embedder_cell: &Arc<OnceCell<Arc<dyn Embedder>>>,
+    chat_chunker: &Arc<ChatChunker>,
+    absorbed: &mut u64,
+    track: Option<Track>,
+) -> (IngestReport, Vec<StoredPiece>) {
     // Masked before anything else reads the text, so the chunker, the dedup
     // hash, the embedding, the full-text index and the stored row all see the
-    // same masked content, and the secret reaches none of them.
+    // same masked content, and the secret reaches none of them. An event from
+    // the outbox was masked before it was recorded, and this pass finds
+    // nothing more.
     let masked = redact(&evt.content);
     let redacted = masked.kinds;
     let content = masked.text;
@@ -442,13 +603,13 @@ async fn process_event(
         let kind = select_chunker(evt.role.clone(), evt.is_error, &content);
         match kind {
             ChunkerKind::Chat => chat_chunker.split_save(&content),
-            ChunkerKind::Skip => return IngestReport { redacted, ..Default::default() },
+            ChunkerKind::Skip => return (IngestReport { redacted, ..Default::default() }, Vec::new()),
         }
     };
 
     if chunks.is_empty() {
         // Content was all-whitespace or empty after chunker policy. Not an error.
-        return IngestReport { redacted, ..Default::default() };
+        return (IngestReport { redacted, ..Default::default() }, Vec::new());
     }
 
     // `memory_worker` holds events until the embedder is loaded, so this only
@@ -461,7 +622,9 @@ async fn process_event(
             chunks.len(),
             evt.agent_id
         );
-        return IngestReport { memories: vec![], failure: Some(IngestFailure::EmbedderUnavailable), redacted };
+        let report =
+            IngestReport { memories: vec![], failure: Some(IngestFailure::EmbedderUnavailable), redacted };
+        return (report, Vec::new());
     };
 
     // Stage 1 — gate. Every chunk passes the hash gate before anything is
@@ -477,26 +640,67 @@ async fn process_event(
         Some(head) if position > 0 => head.as_str(),
         _ => "",
     };
+    // What an earlier attempt already stored is taken as it was: reinforcing
+    // it again would count an access nobody made, and its link keeps the head
+    // it was embedded behind.
+    let hashes: Vec<&str> = pending_chunks.iter().map(|p| p.content_hash.as_str()).collect();
+    let mut resumed: Vec<Option<NotedPiece>> = vec![None; pending_chunks.len()];
+    let mut noted: Vec<NotedPiece> = Vec::new();
+    if let Some(track) = &track {
+        match resume_positions(&track.progress, &hashes) {
+            Some(by_position) => {
+                resumed = by_position;
+                noted = track.progress.clone();
+            }
+            None => log::warn!(
+                "outbox row {} was noted for a different split of its text; the dedup gate takes over its pieces",
+                track.row
+            ),
+        }
+    }
     let mut stored: Vec<Option<SavedChunk>> = vec![None; pending_chunks.len()];
+    let mut contexts: Vec<String> = vec![String::new(); pending_chunks.len()];
     let mut survivors: Vec<(usize, PendingChunk)> = Vec::new();
     for (position, pending) in pending_chunks.into_iter().enumerate() {
-        if let Some(id) = absorb_duplicate(store, evt, &pending.content_hash, absorbed).await {
+        if let Some(done) = resumed[position].take() {
+            let outcome = if done.inserted { ChunkOutcome::Inserted } else { ChunkOutcome::Reinforced };
+            stored[position] = Some(SavedChunk { id: done.id, outcome });
+            contexts[position] = done.context;
+            continue;
+        }
+        let note = note_for(track.as_ref(), &noted, position, &pending.content_hash, false, "");
+        if let Some(id) = absorb_duplicate(store, evt, &pending.content_hash, absorbed, note).await {
+            if track.is_some() {
+                noted.push(NotedPiece {
+                    position,
+                    hash: pending.content_hash.clone(),
+                    id,
+                    inserted: false,
+                    context: String::new(),
+                });
+            }
             for _ in 1..pending.multiplicity {
-                absorb_duplicate(store, evt, &pending.content_hash, absorbed).await;
+                absorb_duplicate(store, evt, &pending.content_hash, absorbed, |_| None).await;
             }
             stored[position] = Some(SavedChunk { id, outcome: ChunkOutcome::Reinforced });
             continue;
         }
         survivors.push((position, pending));
     }
-    let report = |stored: Vec<Option<SavedChunk>>, failure| IngestReport {
-        memories: stored.into_iter().flatten().collect(),
+    let report = |stored: &[Option<SavedChunk>], failure| IngestReport {
+        memories: stored.iter().flatten().copied().collect(),
         failure,
         redacted: redacted.clone(),
     };
+    let pieces = |stored: &[Option<SavedChunk>], contexts: &[String]| -> Vec<StoredPiece> {
+        stored
+            .iter()
+            .zip(contexts)
+            .filter_map(|(saved, context)| saved.map(|s| StoredPiece { memory_id: s.id, context: context.clone() }))
+            .collect()
+    };
     if survivors.is_empty() {
-        link_save(store, &stored, &[]).await;
-        return report(stored, None);
+        return (report(&stored, None), pieces(&stored, &contexts));
     }
 
     // Stage 2 — one inference call for the whole event. Passage: a stored
@@ -510,24 +714,22 @@ async fn process_event(
     let vectors = match embedder.embed_batch(&texts, EmbedRole::Passage).await {
         Ok(v) => v,
         Err(EmbedError::NotReady) | Err(EmbedError::WorkerGone) => {
-            return report(stored, Some(IngestFailure::EmbedderUnavailable));
+            return (report(&stored, Some(IngestFailure::EmbedderUnavailable)), Vec::new());
         }
         Err(e) => {
-            return report(stored, Some(IngestFailure::Failed(format!("embed failed: {e}"))));
+            return (report(&stored, Some(IngestFailure::Failed(format!("embed failed: {e}")))), Vec::new());
         }
     };
     if vectors.len() != survivors.len() {
         // Zipping a short reply would pair chunks with other chunks'
         // vectors and store the mismatch as fact. Dropping the event is
         // recoverable; a silently mislabeled memory is not.
-        return report(
-            stored,
-            Some(IngestFailure::Failed(format!(
-                "embedder returned {} vectors for {} chunks",
-                vectors.len(),
-                survivors.len()
-            ))),
-        );
+        let failure = IngestFailure::Failed(format!(
+            "embedder returned {} vectors for {} chunks",
+            vectors.len(),
+            survivors.len()
+        ));
+        return (report(&stored, Some(failure)), Vec::new());
     }
 
     // Stage 3 — sequential, one chunk at a time: chunk N's contradiction
@@ -539,7 +741,7 @@ async fn process_event(
     // dispute each other. The rows a conclusion was drawn from are passed the
     // same way: it restates them, it does not contradict them.
     let mut siblings: Vec<i64> = evt.sources().to_vec();
-    let mut embedded_with: Vec<(usize, String)> = Vec::new();
+    siblings.extend(stored.iter().flatten().filter(|s| s.outcome == ChunkOutcome::Inserted).map(|s| s.id));
     for ((position, pending), vec) in survivors.into_iter().zip(vectors) {
         let PendingChunk { chunk, content_hash, multiplicity } = pending;
         // The contradiction hook runs between embed and insert: it needs the
@@ -553,47 +755,49 @@ async fn process_event(
         if !disputed.is_empty() {
             record.disputed_against = Some(disputed);
         }
-        let id = match store.insert_memory_with_vector(record, vec).await {
+        let note = note_for(track.as_ref(), &noted, position, &content_hash, true, context(position));
+        let id = match store.insert_noting(record, vec, note).await {
             Ok(id) => id,
             Err(e) => {
-                return report(stored, Some(IngestFailure::Failed(format!("store insert failed: {e}"))));
+                let failure = IngestFailure::Failed(format!("store insert failed: {e}"));
+                return (report(&stored, Some(failure)), Vec::new());
             }
         };
+        if track.is_some() {
+            noted.push(NotedPiece {
+                position,
+                hash: content_hash.clone(),
+                id,
+                inserted: true,
+                context: context(position).to_string(),
+            });
+        }
         stored[position] = Some(SavedChunk { id, outcome: ChunkOutcome::Inserted });
-        embedded_with.push((position, context(position).to_string()));
+        contexts[position] = context(position).to_string();
         siblings.push(id);
         // The extra copies now find the row this iteration just wrote and
         // take the same branch a copy from a later event takes.
         for _ in 1..multiplicity {
-            absorb_duplicate(store, evt, &content_hash, absorbed).await;
+            absorb_duplicate(store, evt, &content_hash, absorbed, |_| None).await;
         }
     }
-    link_save(store, &stored, &embedded_with).await;
-    report(stored, None)
+    (report(&stored, None), pieces(&stored, &contexts))
 }
 
-/// Links the pieces of a finished save of two or more. `embedded_with` names
-/// the positions this event inserted and the head each was embedded behind;
-/// a position it absorbed into an existing row keeps that row's vector, made
-/// without this head, so its link carries none.
+/// Links the pieces of a finished save of two or more that no outbox row
+/// stands for. A position absorbed into an existing row keeps that row's
+/// vector, made without this save's head, so its link carries none.
 ///
 /// A failure here leaves the rows unlinked, which is how every save was stored
 /// before links existed; the save itself did not fail and is not reported as
 /// failed.
-async fn link_save(store: &Arc<MemoryStore>, stored: &[Option<SavedChunk>], embedded_with: &[(usize, String)]) {
-    if stored.len() < 2 {
+async fn link_save(store: &Arc<MemoryStore>, pieces: Vec<StoredPiece>) {
+    if pieces.len() < 2 {
         return;
     }
-    let pieces: Vec<StoredPiece> = stored
-        .iter()
-        .enumerate()
-        .filter_map(|(position, saved)| {
-            let context = embedded_with.iter().find(|(p, _)| *p == position).map(|(_, c)| c.clone());
-            saved.map(|s| StoredPiece { memory_id: s.id, context: context.unwrap_or_default() })
-        })
-        .collect();
+    let count = pieces.len();
     if let Err(e) = store.link_pieces(pieces).await {
-        log::warn!("could not link the {} pieces of a save: {e}; they stay unlinked", stored.len());
+        log::warn!("could not link the {count} pieces of a save: {e}; they stay unlinked");
     }
 }
 
@@ -2700,6 +2904,195 @@ mod tests {
         let now = Instant::now();
         let later = now + std::time::Duration::from_secs(10);
         assert_eq!(drain_step(now, Some(later), false), DrainStep::Spill);
+    }
+
+    // ── Saves recorded in the outbox ─────────────────────────────────────────
+
+    async fn record(store: &MemoryStore, content: &str) -> i64 {
+        let evt = make_event(Role::User, content, None, 1);
+        match store.outbox_record(uuid::Uuid::new_v4().to_string(), evt).await.unwrap() {
+            crate::memory::outbox::Recorded::New { row } => row,
+            other => panic!("expected a new row, got {other:?}"),
+        }
+    }
+
+    /// Runs the worker over `replay` and `requests` until both are drained.
+    async fn run_worker(
+        store: &Arc<MemoryStore>,
+        embedder: Arc<dyn Embedder>,
+        replay: Replay,
+        requests: Vec<IngestRequest>,
+    ) {
+        let cell: OnceCell<Arc<dyn Embedder>> = OnceCell::new();
+        cell.set(embedder).ok();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        for request in requests {
+            tx.try_send(request).unwrap();
+        }
+        drop(tx);
+        let chat_chunker = Arc::new(ChatChunker::with_fallback());
+        memory_worker(rx, no_drain(), replay, store.clone(), Arc::new(cell), chat_chunker).await;
+    }
+
+    async fn replay_pending(store: &Arc<MemoryStore>, embedder: Arc<dyn Embedder>) {
+        let rows = store.outbox_pending().await.unwrap();
+        run_worker(store, embedder, Replay::rows(rows), Vec::new()).await;
+    }
+
+    async fn outbox_row(store: &MemoryStore, row: i64) -> Option<(String, i64, Option<String>, Vec<NotedPiece>)> {
+        use rusqlite::OptionalExtension;
+        store
+            .conn
+            .call(move |c| {
+                c.query_row(
+                    "SELECT state, attempts, last_error, progress FROM ingest_outbox WHERE id = ?1",
+                    [row],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, String>(3)?)),
+                )
+                .optional()
+            })
+            .await
+            .unwrap()
+            .map(|(state, attempts, error, progress)| {
+                (state, attempts, error, serde_json::from_str(&progress).unwrap())
+            })
+    }
+
+    async fn access_counts(store: &MemoryStore) -> Vec<i64> {
+        store
+            .conn
+            .call(|c| {
+                let mut stmt = c.prepare("SELECT access_count FROM memory ORDER BY id")?;
+                let rows = stmt.query_map([], |r| r.get(0))?;
+                rows.collect::<Result<Vec<i64>, _>>()
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn memory_ids(store: &MemoryStore) -> Vec<i64> {
+        store
+            .conn
+            .call(|c| {
+                let mut stmt = c.prepare("SELECT id FROM memory ORDER BY id")?;
+                let rows = stmt.query_map([], |r| r.get(0))?;
+                rows.collect::<Result<Vec<i64>, _>>()
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn each_piece_is_noted_with_the_row_it_wrote() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let content = long_save();
+        assert!(chunk_count(&content) >= 3, "fixture must split into three pieces or more");
+        let row = record(&store, &content).await;
+
+        replay_pending(&store, Arc::new(NanAtEmbedder { position: 2 })).await;
+
+        let (state, attempts, error, progress) = outbox_row(&store, row).await.expect("the row stays");
+        assert_eq!((state.as_str(), attempts), ("pending", 1));
+        assert!(error.unwrap().starts_with("store insert failed"));
+        let ids = memory_ids(&store).await;
+        assert_eq!(progress.iter().map(|p| (p.position, p.id, p.inserted)).collect::<Vec<_>>(), vec![
+            (0, ids[0], true),
+            (1, ids[1], true),
+        ]);
+        assert_eq!(progress[0].context, "");
+        assert!(!progress[1].context.is_empty(), "the second piece is embedded behind the head");
+        assert!(piece_links(&store).await.is_empty(), "an unfinished save is not linked");
+    }
+
+    #[tokio::test]
+    async fn a_replayed_save_resumes_after_its_last_noted_piece() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let content = long_save();
+        let pieces = chunk_count(&content);
+        let row = record(&store, &content).await;
+        replay_pending(&store, Arc::new(NanAtEmbedder { position: 2 })).await;
+        let head = outbox_row(&store, row).await.unwrap().3[1].context.clone();
+
+        replay_pending(&store, Arc::new(FakeEmbedder::default())).await;
+
+        assert_eq!(outbox_row(&store, row).await, None, "a finished save leaves no row");
+        assert_eq!(access_counts(&store).await, vec![1; pieces], "no piece is reinforced by the replay");
+        let links = piece_links(&store).await;
+        assert_eq!(links.len(), pieces);
+        let ids = memory_ids(&store).await;
+        for (i, (save_id, piece, memory_id, context)) in links.into_iter().enumerate() {
+            assert_eq!((save_id, piece, memory_id), (1, i as i64 + 1, ids[i]));
+            assert_eq!(context, if i == 0 { String::new() } else { head.clone() });
+        }
+    }
+
+    #[tokio::test]
+    async fn progress_that_does_not_fit_the_split_is_dropped() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let row = record(&store, "a short save of one piece").await;
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE ingest_outbox SET progress = \
+                     '[{\"position\":4,\"hash\":\"x\",\"id\":999,\"inserted\":true,\"context\":\"\"}]' \
+                     WHERE id = ?1",
+                    [row],
+                )
+            })
+            .await
+            .unwrap();
+
+        replay_pending(&store, Arc::new(FakeEmbedder::default())).await;
+
+        assert_eq!(count_memory(&store).await, 1);
+        assert_eq!(outbox_row(&store, row).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_row_delivered_twice_is_ingested_once() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let row = record(&store, "delivered by the start-up read and the channel").await;
+        let rows = store.outbox_pending().await.unwrap();
+        let again = IngestRequest { event: rows[0].1.clone(), reply: None, outbox: Some(row) };
+
+        run_worker(&store, Arc::new(FakeEmbedder::default()), Replay::rows(rows), vec![again]).await;
+
+        assert_eq!(access_counts(&store).await, vec![1]);
+        assert_eq!(outbox_row(&store, row).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_row_that_stopped_the_process_three_times_fails_and_the_next_one_runs() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let poison = record(&store, "the save that kills the process").await;
+        let next = record(&store, "the save after it").await;
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE ingest_outbox SET attempts = 3 WHERE id = ?1", [poison]))
+            .await
+            .unwrap();
+
+        replay_pending(&store, Arc::new(FakeEmbedder::default())).await;
+
+        let (state, _, error, _) = outbox_row(&store, poison).await.expect("a failed row stays");
+        assert_eq!(state, "failed");
+        assert_eq!(error.as_deref(), Some("the daemon stopped 3 times while ingesting this save"));
+        assert_eq!(outbox_row(&store, next).await, None);
+        assert_eq!(count_memory(&store).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_failure_after_the_answer_stays_in_the_outbox_with_its_cause() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let row = record(&store, "accepted while the model loaded").await;
+
+        replay_pending(&store, Arc::new(NanAtEmbedder { position: 0 })).await;
+
+        let (state, attempts, error, progress) = outbox_row(&store, row).await.expect("the row stays");
+        assert_eq!((state.as_str(), attempts, progress.len()), ("pending", 1, 0));
+        assert!(error.unwrap().starts_with("store insert failed"));
+        assert_eq!(count_memory(&store).await, 0);
     }
 
     // ── Test harnesses ───────────────────────────────────────────────────────

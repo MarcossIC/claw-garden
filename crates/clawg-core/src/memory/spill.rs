@@ -1,11 +1,8 @@
-//! The ingest spill file: events an orderly shutdown could not ingest,
-//! written to `<data>/ingest-pending.jsonl` and replayed on the next start.
-//!
-//! One `MemoryEvent` as JSON per line. The line format is pure so it can be
-//! tested without a filesystem; the file is replaced atomically so a shutdown
-//! that dies mid-write leaves the previous spill whole.
+//! The ingest spill file a previous version wrote: events an orderly
+//! shutdown could not ingest, in `<data>/ingest-pending.jsonl`, one
+//! `MemoryEvent` as JSON per line. Nothing writes it any more; on start its
+//! events move to the outbox and the file goes.
 
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 use crate::memory::events::MemoryEvent;
@@ -17,60 +14,50 @@ pub const SPILL_FILE: &str = "ingest-pending.jsonl";
 /// lines are someone's saves, and only a person can tell what they were.
 pub const REJECTED_FILE: &str = "ingest-pending.rejected.jsonl";
 
-/// Spilled events still to be ingested on this start, ahead of anything new.
-pub struct Replay {
-    events: VecDeque<MemoryEvent>,
-    /// The spill file to remove once every event is taken; `None` when there
-    /// is none, or when its unparseable lines could not be set aside and it
-    /// must stay as their only copy.
+/// The events a spill file held.
+pub(crate) struct Spilled {
+    pub events: Vec<MemoryEvent>,
+    /// The file to remove once the events are kept elsewhere; `None` when
+    /// there is none, or when its unparseable lines could not be set aside and
+    /// it must stay as their only copy.
     file: Option<PathBuf>,
 }
 
-impl Replay {
-    /// Nothing to replay.
-    pub fn none() -> Self {
-        Self { events: VecDeque::new(), file: None }
+impl Spilled {
+    fn none() -> Self {
+        Self { events: Vec::new(), file: None }
     }
 
-    pub(crate) fn next(&mut self) -> Option<MemoryEvent> {
-        self.events.pop_front()
+    /// Whether there is anything to move or remove.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.events.is_empty() && self.file.is_none()
     }
 
-    /// The events not taken yet, in order.
-    pub(crate) fn into_remaining(self) -> VecDeque<MemoryEvent> {
-        self.events
-    }
-
-    /// Removes the spill file once every event is taken. Until then a crash
-    /// replays the whole file again, and the dedup gate absorbs the events
-    /// already ingested.
-    pub(crate) async fn finish(&mut self) {
-        if !self.events.is_empty() {
-            return;
-        }
-        let Some(file) = self.file.take() else { return };
+    /// Removes the spill file, once its events are kept elsewhere.
+    pub(crate) async fn remove(self) {
+        let Some(file) = self.file else { return };
         match tokio::fs::remove_file(&file).await {
-            Ok(()) => log::info!("replayed every spilled ingest event from {}", file.display()),
+            Ok(()) => log::info!("moved every spilled ingest event from {} to the outbox", file.display()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => log::warn!("could not remove {} after replaying it: {e}", file.display()),
+            Err(e) => log::warn!("could not remove {} after moving its events: {e}", file.display()),
         }
     }
 }
 
-/// Reads `<base_dir>/ingest-pending.jsonl` for replay, moving lines that do
-/// not parse to [`REJECTED_FILE`].
-pub(crate) async fn load(base_dir: &Path) -> Replay {
+/// Reads `<base_dir>/ingest-pending.jsonl`, moving lines that do not parse to
+/// [`REJECTED_FILE`].
+pub(crate) async fn load(base_dir: &Path) -> Spilled {
     let path = base_dir.join(SPILL_FILE);
     let text = match tokio::fs::read_to_string(&path).await {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Replay::none(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Spilled::none(),
         Err(e) => {
-            log::error!("could not read {}, its events are not replayed: {e}", path.display());
-            return Replay::none();
+            log::error!("could not read {}, its events are not ingested: {e}", path.display());
+            return Spilled::none();
         }
     };
     let (events, rejected) = parse_lines(&text);
-    log::info!("replaying {} spilled ingest events from {}", events.len(), path.display());
+    log::info!("moving {} spilled ingest events from {} to the outbox", events.len(), path.display());
     let mut file = Some(path);
     if !rejected.is_empty() {
         let rejected_path = base_dir.join(REJECTED_FILE);
@@ -90,7 +77,7 @@ pub(crate) async fn load(base_dir: &Path) -> Replay {
             }
         }
     }
-    Replay { events: events.into(), file }
+    Spilled { events, file }
 }
 
 /// Blocking on purpose: it runs once at startup, only when a spill had bad
@@ -102,19 +89,6 @@ fn append_lines(path: &Path, lines: &[String]) -> std::io::Result<()> {
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
     f.write_all(text.as_bytes())?;
     f.sync_all()
-}
-
-/// One JSON line per event. JSON escapes newlines inside strings, so an event
-/// always fits on one line.
-pub(crate) fn to_lines(events: &[MemoryEvent]) -> String {
-    let mut out = String::new();
-    for event in events {
-        // A `MemoryEvent` is plain owned data with string keys; serializing it
-        // cannot fail.
-        out.push_str(&serde_json::to_string(event).expect("MemoryEvent serializes"));
-        out.push('\n');
-    }
-    out
 }
 
 /// Parses spill text into the events it holds and the lines that are not
@@ -129,12 +103,6 @@ pub(crate) fn parse_lines(text: &str) -> (Vec<MemoryEvent>, Vec<String>) {
         }
     }
     (events, rejected)
-}
-
-/// Replaces `<base_dir>/ingest-pending.jsonl` with `events`.
-pub(crate) async fn write(base_dir: &Path, events: &[MemoryEvent]) -> std::io::Result<()> {
-    crate::memory::workspace::write_atomically(&base_dir.join(SPILL_FILE), to_lines(events).as_bytes())
-        .await
 }
 
 #[cfg(test)]
@@ -156,6 +124,10 @@ mod tests {
             importance: Some(8.0),
             derived_from: vec![3, 1],
         }
+    }
+
+    fn to_lines(events: &[MemoryEvent]) -> String {
+        events.iter().map(|e| format!("{}\n", serde_json::to_string(e).unwrap())).collect()
     }
 
     fn json(e: &MemoryEvent) -> serde_json::Value {
@@ -202,20 +174,5 @@ mod tests {
             vec!["a", "b"]
         );
         assert_eq!(rejected, vec!["{\"agent_id\": \"trunc".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn write_replaces_the_spill_file_with_exactly_the_given_events() {
-        let tmp = tempfile::tempdir().unwrap();
-        write(tmp.path(), &[event("old")]).await.unwrap();
-        write(tmp.path(), &[event("new 1"), event("new 2")]).await.unwrap();
-
-        let text = std::fs::read_to_string(tmp.path().join(SPILL_FILE)).unwrap();
-        let (events, rejected) = parse_lines(&text);
-        assert!(rejected.is_empty());
-        assert_eq!(
-            events.iter().map(|e| e.content.as_str()).collect::<Vec<_>>(),
-            vec!["new 1", "new 2"]
-        );
     }
 }

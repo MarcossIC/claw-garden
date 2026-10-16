@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clawg_core::memory::dispute::Resolution;
+use clawg_core::memory::outbox::OutboxSummary;
 use clawg_core::memory::store_lock::{StoreHolder, StoreLock, StoreOwner};
 use clawg_core::paths::{data_dir, PathsError, Profile};
 use serde::{Deserialize, Serialize};
@@ -127,6 +128,11 @@ pub struct Health {
     #[serde(default)]
     pub embedder_retryable: Option<bool>,
     pub uptime_s: u64,
+    /// Saves accepted and not stored yet, and those that failed after the
+    /// answer. `None` from a daemon before the outbox, or when the store did
+    /// not answer health in time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest: Option<OutboxSummary>,
 }
 
 impl Health {
@@ -363,8 +369,9 @@ pub enum SaveOutcome {
     /// masked out before storing; a daemon that predates masking sends none.
     Saved { memories: Vec<SavedMemory>, redacted: Vec<String> },
     /// Accepted but not confirmed; `reason` says why (`"unconfirmed"`,
-    /// `"embedder_loading"`).
-    Queued { reason: Option<String> },
+    /// `"embedder_loading"`, `"already_queued"`), and `operation_id` is what
+    /// it waits under; a daemon that predates the outbox sends none.
+    Queued { reason: Option<String>, operation_id: Option<String> },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -521,6 +528,8 @@ impl DaemonClient {
             memories: Vec<SavedMemory>,
             #[serde(default)]
             redacted: Vec<String>,
+            #[serde(default)]
+            operation_id: Option<String>,
         }
         let resp = self
             .http
@@ -533,7 +542,7 @@ impl DaemonClient {
         let body: Body = Self::read_response(resp).await?;
         Ok(match body.status.as_str() {
             "saved" => SaveOutcome::Saved { memories: body.memories, redacted: body.redacted },
-            _ => SaveOutcome::Queued { reason: body.reason },
+            _ => SaveOutcome::Queued { reason: body.reason, operation_id: body.operation_id },
         })
     }
 
@@ -1042,6 +1051,13 @@ pub(crate) mod tests {
 
     use crate::daemon::api::{router, AppCtx, SAVE_CONFIRM_TIMEOUT};
     use crate::daemon::lifecycle::{write_state, write_token, DaemonState};
+
+    #[test]
+    fn a_health_without_ingest_still_parses() {
+        let old = r#"{"status":"ok","version":"0.5.0","profile":"dev","pid":1,"embedder":"ready","uptime_s":3}"#;
+        let h: Health = serde_json::from_str(old).expect("a daemon from before the outbox");
+        assert!(h.ingest.is_none());
+    }
 
     /// An in-process daemon plus the tempdir holding its lifecycle files.
     pub(crate) struct TestDaemon {

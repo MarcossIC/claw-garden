@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 | M | — (conviene que cierre antes de 25; se coordina con 18, 31 y 32; ver «Interacciones») | exploración (borrador) |
+| 1 | M | — (conviene que cierre antes de 25; se coordina con 18, 31 y 32; ver «Interacciones») | exploración cerrada; sigue en la [propuesta](proposal.md) |
 
 **Tesis:** un save que el daemon aceptó y todavía no insertó vive sólo en RAM. Esa ventana es justo el arranque de cada daemon (el modelo está cargando y `clawg mcp` lo autoarranca al empezar la sesión) y cualquier save cuya confirmación vence. Un kill, un crash o una señal de terminar en esa ventana pierde saves que el agente ya recibió como `202`, y un fallo después de aceptar sólo llega al log: el agente nunca se entera. Hoy «aceptado» no promete nada. Debería querer decir «se guardará, o se reportará como fallido». El cambio es mover la verdad de la cola en RAM a una tabla de `memory.db` (un outbox), escrita ya enmascarada antes de contestar y borrada en la misma transacción que inserta la memoria.
 

@@ -1,5 +1,5 @@
-//! An orderly shutdown must leave every accepted event either in the store or
-//! in the spill file; none may be dropped.
+//! Every accepted save ends in the store or waits in the outbox for the next
+//! start, whether the process stops in order or dies.
 
 #![cfg(feature = "testing")]
 
@@ -16,6 +16,7 @@ use clawg_core::models::chat::Role;
 use clawg_core::runtime::{MemoryRuntime, Workers};
 use once_cell::sync::OnceCell;
 use clawg_core::memory::worker::IngestRequest;
+use clawg_core::runtime::Accepted;
 use tokio::sync::mpsc::Receiver;
 
 fn event(content: &str) -> MemoryEvent {
@@ -56,13 +57,21 @@ async fn stored_contents(store: &MemoryStore) -> Vec<String> {
         .expect("query")
 }
 
-fn spilled_contents(base_dir: &std::path::Path) -> Option<Vec<String>> {
-    let text = std::fs::read_to_string(base_dir.join(SPILL_FILE)).ok()?;
-    Some(
-        text.lines()
-            .map(|l| serde_json::from_str::<MemoryEvent>(l).expect("spill line").content)
-            .collect(),
-    )
+async fn outbox_contents(store: &MemoryStore) -> Vec<String> {
+    store
+        .conn
+        .call(|c| -> Result<Vec<String>, rusqlite::Error> {
+            let mut stmt = c.prepare("SELECT content FROM ingest_outbox WHERE state = 'pending' ORDER BY id")?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            rows.collect()
+        })
+        .await
+        .expect("query")
+}
+
+async fn accept(runtime: &MemoryRuntime, content: &str) {
+    let accepted = runtime.accept(event(content), None, None).await.expect("accept");
+    assert!(matches!(accepted, Accepted::Queued { .. }), "{accepted:?}");
 }
 
 /// Wraps the fake embedder with a fixed delay per call, standing in for a
@@ -99,23 +108,24 @@ async fn shutdown_ingests_every_queued_event_when_the_embedder_is_ready() {
     let workers = start(&runtime, rx);
     let sent: Vec<String> = (0..20).map(|i| format!("queued fact number {i}")).collect();
     for content in &sent {
-        runtime.memory_tx.try_send(event(content).into()).unwrap();
+        accept(&runtime, content).await;
     }
 
     runtime.shutdown(workers).await;
 
     assert_eq!(stored_contents(&runtime.store).await, sent);
-    assert_eq!(spilled_contents(tmp.path()), None);
+    assert!(outbox_contents(&runtime.store).await.is_empty());
+    assert!(!tmp.path().join(SPILL_FILE).exists());
 }
 
 #[tokio::test]
-async fn shutdown_spills_events_held_for_an_embedder_that_never_loaded() {
+async fn shutdown_leaves_saves_held_for_the_embedder_in_the_outbox() {
     let tmp = tempfile::tempdir().unwrap();
     let (runtime, rx) = MemoryRuntime::new_for_test(tmp.path().to_path_buf()).await;
     let runtime = MemoryRuntime { embedder: Arc::new(OnceCell::<Arc<dyn Embedder>>::new()), ..runtime };
     let workers = start(&runtime, rx);
     for content in ["first", "second", "third"] {
-        runtime.memory_tx.try_send(event(content).into()).unwrap();
+        accept(&runtime, content).await;
     }
     // Long enough for the worker to take "first" and hold it.
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -123,14 +133,12 @@ async fn shutdown_spills_events_held_for_an_embedder_that_never_loaded() {
     runtime.shutdown(workers).await;
 
     assert_eq!(stored_contents(&runtime.store).await, Vec::<String>::new());
-    assert_eq!(
-        spilled_contents(tmp.path()),
-        Some(vec!["first".to_string(), "second".to_string(), "third".to_string()])
-    );
+    assert_eq!(outbox_contents(&runtime.store).await, vec!["first", "second", "third"]);
+    assert!(!tmp.path().join(SPILL_FILE).exists(), "nothing is spilled to a file any more");
 }
 
 #[tokio::test]
-async fn shutdown_spills_what_the_drain_deadline_left_unstarted() {
+async fn shutdown_leaves_what_the_drain_deadline_left_unstarted_in_the_outbox() {
     let tmp = tempfile::tempdir().unwrap();
     let (runtime, rx) = MemoryRuntime::new_for_test(tmp.path().to_path_buf()).await;
     let slow: Arc<dyn Embedder> =
@@ -141,7 +149,7 @@ async fn shutdown_spills_what_the_drain_deadline_left_unstarted() {
     let workers = start(&runtime, rx);
     let sent: Vec<String> = (0..5).map(|i| format!("slow fact number {i}")).collect();
     for content in &sent {
-        runtime.memory_tx.try_send(event(content).into()).unwrap();
+        accept(&runtime, content).await;
     }
     // Let the first event start embedding before the drain begins.
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -149,7 +157,7 @@ async fn shutdown_spills_what_the_drain_deadline_left_unstarted() {
     runtime.shutdown_within(workers, Duration::from_millis(100)).await;
 
     assert_eq!(stored_contents(&runtime.store).await, sent[..1].to_vec());
-    assert_eq!(spilled_contents(tmp.path()), Some(sent[1..].to_vec()));
+    assert_eq!(outbox_contents(&runtime.store).await, sent[1..].to_vec());
 }
 
 fn write_spill(base_dir: &std::path::Path, lines: &[String]) {
@@ -174,53 +182,79 @@ async fn wait_for_rows(store: &MemoryStore, n: usize) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn spilled_events_are_ingested_first_on_startup() {
+async fn pending_rows_are_ingested_first_on_startup() {
     let tmp = tempfile::tempdir().unwrap();
-    write_spill(tmp.path(), &[spill_line("spilled one"), spill_line("spilled two")]);
     let (runtime, rx) = MemoryRuntime::new_for_test(tmp.path().to_path_buf()).await;
-    runtime.memory_tx.try_send(event("saved after the restart").into()).unwrap();
-
+    let runtime = MemoryRuntime { embedder: Arc::new(OnceCell::<Arc<dyn Embedder>>::new()), ..runtime };
     let workers = start(&runtime, rx);
-    let rows = wait_for_rows(&runtime.store, 3).await;
-
-    assert_eq!(rows, vec!["spilled one", "spilled two", "saved after the restart"]);
-    assert!(!tmp.path().join(SPILL_FILE).exists(), "a fully replayed spill must be removed");
+    accept(&runtime, "accepted one").await;
+    accept(&runtime, "accepted two").await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
     runtime.shutdown(workers).await;
+    let store = runtime.store.clone();
+
+    // The same store, a new channel and a ready embedder: what a restart sees.
+    let (memory_tx, rx) = tokio::sync::mpsc::channel(16);
+    let cell = OnceCell::new();
+    cell.set(Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>).ok();
+    let restarted = MemoryRuntime { memory_tx, embedder: Arc::new(cell), ..runtime };
+    accept(&restarted, "saved after the restart").await;
+    let workers = start(&restarted, rx);
+    let rows = wait_for_rows(&store, 3).await;
+
+    assert_eq!(rows, vec!["accepted one", "accepted two", "saved after the restart"]);
+    assert!(outbox_contents(&store).await.is_empty());
+    restarted.shutdown(workers).await;
 }
 
 #[tokio::test]
-async fn a_corrupt_spill_line_is_set_aside_and_the_rest_ingested() {
+async fn an_old_spill_is_imported_masked_and_removed() {
     let tmp = tempfile::tempdir().unwrap();
     let truncated = "{\"agent_id\":\"agent-shutdown\",\"proj".to_string();
-    write_spill(tmp.path(), &[spill_line("before"), truncated.clone(), spill_line("after")]);
+    // Built at run time so no literal looks like a live credential.
+    let token = format!("ghp_{}", "a1B2".repeat(9));
+    write_spill(
+        tmp.path(),
+        &[spill_line("before"), truncated.clone(), spill_line(&format!("the token is {token}"))],
+    );
     let (runtime, rx) = MemoryRuntime::new_for_test(tmp.path().to_path_buf()).await;
 
     let workers = start(&runtime, rx);
     let rows = wait_for_rows(&runtime.store, 2).await;
     runtime.shutdown(workers).await;
 
-    assert_eq!(rows, vec!["before", "after"]);
+    assert_eq!(rows, vec!["before", "the token is [REDACTED:github_token]"]);
     let rejected = std::fs::read_to_string(tmp.path().join(REJECTED_FILE)).unwrap();
     assert_eq!(rejected, format!("{truncated}\n"));
     assert!(!tmp.path().join(SPILL_FILE).exists());
+    assert!(outbox_contents(&runtime.store).await.is_empty());
 }
 
 #[tokio::test]
-async fn a_shutdown_during_replay_keeps_the_unreplayed_lines_first() {
+async fn a_save_accepted_while_the_model_loads_survives_a_process_that_dies() {
     let tmp = tempfile::tempdir().unwrap();
-    write_spill(tmp.path(), &[spill_line("old 1"), spill_line("old 2"), spill_line("old 3")]);
-    let (runtime, rx) = MemoryRuntime::new_for_test(tmp.path().to_path_buf()).await;
-    let runtime = MemoryRuntime { embedder: Arc::new(OnceCell::<Arc<dyn Embedder>>::new()), ..runtime };
-    runtime.memory_tx.try_send(event("new").into()).unwrap();
+    {
+        let (runtime, rx) = MemoryRuntime::open(tmp.path().to_path_buf(), StoreHolder::Daemon)
+            .await
+            .unwrap();
+        let worker = tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
+        accept(&runtime, "accepted before the process died").await;
+        // No shutdown: the worker is gone and the runtime dropped, as a kill
+        // would leave them.
+        worker.abort();
+        let _ = worker.await;
+    }
 
+    let (runtime, rx) = MemoryRuntime::open(tmp.path().to_path_buf(), StoreHolder::Daemon)
+        .await
+        .unwrap();
+    runtime.embedder.set(Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>).ok();
     let workers = start(&runtime, rx);
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    let rows = wait_for_rows(&runtime.store, 1).await;
     runtime.shutdown(workers).await;
 
-    assert_eq!(
-        spilled_contents(tmp.path()),
-        Some(vec!["old 1".to_string(), "old 2".to_string(), "old 3".to_string(), "new".to_string()])
-    );
+    assert_eq!(rows, vec!["accepted before the process died"]);
+    assert!(outbox_contents(&runtime.store).await.is_empty());
 }
 
 #[tokio::test]
@@ -231,7 +265,7 @@ async fn shutdown_checkpoints_the_wal_into_memory_db() {
         .unwrap();
     runtime.embedder.set(Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>).ok();
     let workers = start(&runtime, rx);
-    runtime.memory_tx.try_send(event("written just before the stop").into()).unwrap();
+    accept(&runtime, "written just before the stop").await;
     assert_eq!(wait_for_rows(&runtime.store, 1).await.len(), 1);
 
     runtime.shutdown(workers).await;

@@ -655,7 +655,7 @@ mod tests {
 
         let after = conn.call(snapshot).await.unwrap();
         assert_eq!(before, after);
-        assert_eq!(after.0, 13);
+        assert_eq!(after.0, 14);
     }
 
     /// Rows written before `project` existed keep their project ids when the
@@ -935,6 +935,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(marks, vec![("repo-1a2b".to_string(), 1), ("web-3c4d".to_string(), 1)]);
+    }
+
+    /// Saves accepted but not yet stored lived only in memory before this
+    /// table, so a store from before it opens with the table empty and every
+    /// memory, piece link and project exactly as it was.
+    #[tokio::test]
+    async fn a_database_from_the_previous_version_opens_with_an_empty_outbox() {
+        ensure_vec0_registered();
+        let conn = Connection::open_in_memory().await.unwrap();
+        register_udfs(&conn).await.unwrap();
+        conn.call(|c| {
+            configured(crate::memory::migrations::runner())
+                .set_target(refinery::Target::Version(13))
+                .run(c)
+        })
+        .await
+        .unwrap();
+        conn.call(|c| {
+            for (id, content) in [(1, "the opening of a long save"), (2, "and the rest of it")] {
+                c.execute(
+                    "INSERT INTO memory \
+                     (id, scope, agent_id, project_id, content, memory_type, source, \
+                      created_at, created_by_type, created_by_ref, \
+                      last_modified_at, last_accessed_at, importance, tier, status) \
+                     VALUES (?1, 'agent', 'a', 'repo-1a2b', ?2, 'semantic_fact', 'explicit', \
+                      1, 'user', 'a', 1, 1, 5.0, 2, 'active')",
+                    rusqlite::params![id, content],
+                )?;
+            }
+            c.execute("INSERT INTO memory_piece VALUES (1, 1, 1, ''), (1, 2, 2, 'the opening')", [])?;
+            c.execute("INSERT INTO project VALUES ('repo-1a2b', '/work/repo', 1, 0)", [])?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+
+        let rows = |c: &mut rusqlite::Connection| -> Result<Vec<String>, rusqlite::Error> {
+            let mut stmt = c.prepare(
+                "SELECT json_array(id, project_id, content, tier, status) FROM memory \
+                 UNION ALL SELECT json_array(save_id, piece, memory_id, context) FROM memory_piece \
+                 UNION ALL SELECT json_array(id, root_path, index_docs) FROM project",
+            )?;
+            let rows = stmt.query_map([], |r| r.get(0))?.collect();
+            rows
+        };
+        let before = conn.call(rows).await.unwrap();
+
+        run_migrations(&conn).await.unwrap();
+
+        assert_eq!(conn.call(rows).await.unwrap(), before);
+        let outbox: i64 = conn
+            .call(|c| c.query_row("SELECT COUNT(*) FROM ingest_outbox", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(outbox, 0);
     }
 
     fn tamper(dir: &Path, sql: &str) {
@@ -1409,7 +1464,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 13, "Expected exactly 13 applied migrations, got {}", count);
+        assert_eq!(count, 14, "Expected exactly 14 applied migrations, got {}", count);
     }
 
     /// V8 — a fresh store records V8 as applied and carries the FTS5 lexical
@@ -1870,7 +1925,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 13);
+        assert_eq!(migration_count, 14);
     }
 
     // -----------------------------------------------------------------------

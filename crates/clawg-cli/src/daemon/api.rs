@@ -36,7 +36,7 @@ use clawg_core::memory::dispute::{resolve_dispute_core, Outcome, Resolution, Res
 use clawg_core::memory::embedder::{EmbedRole, Embedder};
 use clawg_core::memory::project_docs::{self, DocHit, DocIndexError, RefreshOutcome};
 use clawg_core::memory::worker::{
-    ChunkOutcome, IngestFailure, IngestReport, IngestRequest, SavedChunk,
+    ChunkOutcome, IngestFailure, IngestReport, SavedChunk,
 };
 use clawg_core::memory::events::{MemoryEvent, MemorySource};
 use clawg_core::memory::clock::TimestampMs;
@@ -49,9 +49,10 @@ use clawg_core::memory::synthesis::{
 use clawg_core::memory::{read_save_core, search_all_memories, RankedHit, SaveText, SearchScope};
 use clawg_core::models::chat::Role;
 use clawg_core::paths::Profile;
-use clawg_core::runtime::MemoryRuntime;
+use clawg_core::memory::outbox::{OutboxState, OutboxSummary};
+use clawg_core::memory::redact::SecretKind;
+use clawg_core::runtime::{AcceptError, Accepted, MemoryRuntime};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::oneshot;
 
 use crate::relevance::relevant_len;
@@ -328,6 +329,11 @@ pub struct SaveRequest {
     /// Ids of the memories this one is a conclusion drawn from.
     #[serde(default)]
     pub derived_from: Vec<i64>,
+    /// The caller's id for this save. Sending it again while the save waits
+    /// or failed answers that save instead of recording another; absent, the
+    /// daemon makes one up.
+    #[serde(default)]
+    pub operation_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -434,6 +440,11 @@ pub struct HealthBody {
     /// `embedder` is `"failed"`.
     pub embedder_retryable: Option<bool>,
     pub uptime_s: u64,
+    /// Saves accepted and not yet stored, and those that failed after the
+    /// caller was answered. Left out when the store did not answer in time:
+    /// health must not hang behind a busy writer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingest: Option<OutboxSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -453,11 +464,30 @@ pub struct SaveBody {
     /// The kinds of secret masked out of the content before it was stored.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub redacted: Vec<&'static str>,
+    /// The id this save is recorded under until it is stored.
+    pub operation_id: String,
 }
 
 impl SaveBody {
-    fn queued(reason: &'static str) -> Self {
-        Self { status: "queued", reason: Some(reason), memories: None, redacted: Vec::new() }
+    fn queued(reason: &'static str, operation_id: String) -> Self {
+        Self { status: "queued", reason: Some(reason), memories: None, redacted: Vec::new(), operation_id }
+    }
+}
+
+/// Longest `operation_id` a caller may send.
+pub const MAX_OPERATION_ID_LEN: usize = 128;
+
+/// A caller's operation id, or why it is refused: one to
+/// [`MAX_OPERATION_ID_LEN`] visible ASCII characters, so it prints and
+/// compares the same everywhere it is shown.
+fn check_operation_id(id: Option<String>) -> Result<Option<String>, ApiError> {
+    match id {
+        Some(id) if id.is_empty() || id.len() > MAX_OPERATION_ID_LEN || !id.bytes().all(|b| b.is_ascii_graphic()) => {
+            Err(ApiError::bad_request(format!(
+                "operation_id must be 1 to {MAX_OPERATION_ID_LEN} visible ASCII characters"
+            )))
+        }
+        id => Ok(id),
     }
 }
 
@@ -626,11 +656,22 @@ async fn require_bearer(
 
 // ── Handlers ────────────────────────────────────────────────────────────────
 
+/// How long health waits for the outbox counts before answering without them.
+const HEALTH_INGEST_WAIT: Duration = Duration::from_millis(250);
+
 async fn health(State(app): State<Arc<AppCtx>>) -> Json<HealthBody> {
     let (embedder, embedder_error, embedder_retryable) = match app.runtime.embedder_status() {
         EmbedderStatus::Loading => ("loading", None, None),
         EmbedderStatus::Ready => ("ready", None, None),
         EmbedderStatus::Failed { error, retryable } => ("failed", Some(error), Some(retryable)),
+    };
+    let ingest = match tokio::time::timeout(HEALTH_INGEST_WAIT, app.runtime.store.outbox_summary()).await {
+        Ok(Ok(summary)) => Some(summary),
+        Ok(Err(e)) => {
+            log::warn!("health could not read the ingest outbox: {e}");
+            None
+        }
+        Err(_) => None,
     };
     Json(HealthBody {
         status: "ok",
@@ -641,6 +682,7 @@ async fn health(State(app): State<Arc<AppCtx>>) -> Json<HealthBody> {
         embedder_error,
         embedder_retryable,
         uptime_s: app.started_at.elapsed().as_secs(),
+        ingest,
     })
 }
 
@@ -653,10 +695,16 @@ enum Confirmation {
     Unconfirmed,
 }
 
-/// The answer to a save that waited for the worker.
-fn save_response(confirmation: Confirmation) -> ApiResult<(StatusCode, SaveBody)> {
+/// The answer to a save that waited for the worker. `masked` is what the
+/// daemon masked before recording the save; the worker's own pass over the
+/// masked text finds nothing more, except for an event nothing recorded.
+fn save_response(
+    confirmation: Confirmation,
+    operation_id: String,
+    masked: &[SecretKind],
+) -> ApiResult<(StatusCode, SaveBody)> {
     let report = match confirmation {
-        Confirmation::Unconfirmed => return Ok((StatusCode::ACCEPTED, SaveBody::queued("unconfirmed"))),
+        Confirmation::Unconfirmed => return Ok((StatusCode::ACCEPTED, SaveBody::queued("unconfirmed", operation_id))),
         Confirmation::Reported(report) => report,
     };
     let memories: Vec<SavedMemory> = report.memories.into_iter().map(SavedMemory::from).collect();
@@ -668,7 +716,8 @@ fn save_response(confirmation: Confirmation) -> ApiResult<(StatusCode, SaveBody)
                     status: "saved",
                     reason: None,
                     memories: Some(memories),
-                    redacted: report.redacted.iter().map(|k| k.as_str()).collect(),
+                    redacted: masked_kinds(masked, &report.redacted),
+                    operation_id,
                 },
             ));
         }
@@ -684,8 +733,20 @@ fn save_response(confirmation: Confirmation) -> ApiResult<(StatusCode, SaveBody)
     Err(ApiError { memories: Some(memories), ..error })
 }
 
+/// Each kind once, in the order first masked.
+fn masked_kinds(before: &[SecretKind], worker: &[SecretKind]) -> Vec<&'static str> {
+    let mut kinds: Vec<&'static str> = Vec::new();
+    for kind in before.iter().chain(worker) {
+        if !kinds.contains(&kind.as_str()) {
+            kinds.push(kind.as_str());
+        }
+    }
+    kinds
+}
+
 /// Saves a memory and answers with the rows it wrote: `201` once the worker
-/// confirms, `202` when it cannot wait for that.
+/// confirms, `202` when it cannot wait for that. Either way the save is
+/// recorded in the outbox first, so a `202` outlives the process.
 ///
 /// # Why the worker does the writing
 ///
@@ -706,6 +767,7 @@ async fn save_memory(
     if body.content.trim().is_empty() {
         return Err(ApiError::bad_request("content must not be empty"));
     }
+    let operation_id = check_operation_id(body.operation_id)?;
     // Checked here rather than by the worker: once queued, a save can only be
     // reported as failed long after the caller was told it was accepted.
     let derived_from = distinct_sources(&body.derived_from)?;
@@ -754,21 +816,38 @@ async fn save_memory(
     } else {
         (None, None)
     };
-    app.runtime.memory_tx.try_send(IngestRequest { event, reply }).map_err(|e| match e {
-        TrySendError::Full(_) => ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "ingest_queue_full"),
-        TrySendError::Closed(_) => {
-            ApiError::internal("the ingest worker has stopped; restart the daemon")
-        }
+    let accepted = app.runtime.accept(event, operation_id, reply).await.map_err(|e| match e {
+        AcceptError::QueueFull => ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "ingest_queue_full"),
+        AcceptError::WorkerStopped => ApiError::internal("the ingest worker has stopped; restart the daemon"),
+        AcceptError::Store(e) => ApiError::internal(e),
     })?;
+    let (row, operation_id, masked) = match accepted {
+        Accepted::Queued { row, operation_id, redacted } => (row, operation_id, redacted),
+        Accepted::Existing { operation_id, state: OutboxState::Pending, .. } => {
+            return Ok((StatusCode::ACCEPTED, Json(SaveBody::queued("already_queued", operation_id))));
+        }
+        Accepted::Existing { state: OutboxState::Failed, last_error, .. } => {
+            return Err(ApiError { detail: last_error, ..ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "ingest_failed") });
+        }
+    };
 
     let Some(report) = report else {
-        return Ok((StatusCode::ACCEPTED, Json(SaveBody::queued("embedder_loading"))));
+        return Ok((StatusCode::ACCEPTED, Json(SaveBody::queued("embedder_loading", operation_id))));
     };
     let confirmation = match tokio::time::timeout(app.save_timeout, report).await {
         Ok(Ok(report)) => Confirmation::Reported(report),
         Ok(Err(_)) | Err(_) => Confirmation::Unconfirmed,
     };
-    save_response(confirmation).map(|(status, body)| (status, Json(body)))
+    // A failure this answer carries reaches the caller here, so nobody needs
+    // the row to learn about it. Only the handler knows the report arrived in
+    // time: the worker cannot tell a reply that was read from one sent just
+    // as the wait ran out.
+    if matches!(&confirmation, Confirmation::Reported(report) if report.failure.is_some()) {
+        if let Err(e) = app.runtime.store.outbox_forget(row).await {
+            log::warn!("could not drop the outbox row of a failed save: {e}; it is retried on the next start");
+        }
+    }
+    save_response(confirmation, operation_id, &masked).map(|(status, body)| (status, Json(body)))
 }
 
 /// The loaded embedder, or the 503 a search answers while there is none.
@@ -1274,7 +1353,7 @@ mod tests {
             memories: vec![chunk(57, ChunkOutcome::Inserted), chunk(12, ChunkOutcome::Reinforced)],
             failure: None,
             ..Default::default()
-        }))
+        }), "op-1".into(), &[])
         .expect("a clean report is a success");
         assert_eq!(saved.0, StatusCode::CREATED);
         assert_eq!(
@@ -1285,14 +1364,14 @@ mod tests {
             ])
         );
 
-        let unconfirmed = save_response(Confirmation::Unconfirmed).expect("not an error");
-        assert_eq!(unconfirmed, (StatusCode::ACCEPTED, SaveBody::queued("unconfirmed")));
+        let unconfirmed = save_response(Confirmation::Unconfirmed, "op-1".into(), &[]).expect("not an error");
+        assert_eq!(unconfirmed, (StatusCode::ACCEPTED, SaveBody::queued("unconfirmed", "op-1".into())));
 
         let partial = save_response(Confirmation::Reported(IngestReport {
             memories: vec![chunk(57, ChunkOutcome::Inserted)],
             failure: Some(IngestFailure::Failed("store insert failed: disk full".into())),
             ..Default::default()
-        }))
+        }), "op-1".into(), &[])
         .expect_err("a failure is an error");
         assert_eq!(partial.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(partial.message, "ingest_failed");
@@ -1303,11 +1382,34 @@ mod tests {
             memories: vec![],
             failure: Some(IngestFailure::EmbedderUnavailable),
             ..Default::default()
-        }))
+        }), "op-1".into(), &[])
         .expect_err("a failure is an error");
         assert_eq!(unavailable.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(unavailable.message, "embedder_unavailable");
         assert_eq!(unavailable.memories, Some(vec![]));
+    }
+
+    #[test]
+    fn operation_ids_are_checked() {
+        assert_eq!(check_operation_id(None).unwrap(), None);
+        assert_eq!(check_operation_id(Some("hook-42.a_b".into())).unwrap(), Some("hook-42.a_b".into()));
+        let longest = "x".repeat(MAX_OPERATION_ID_LEN);
+        assert_eq!(check_operation_id(Some(longest.clone())).unwrap(), Some(longest));
+        for bad in ["".to_string(), "x".repeat(MAX_OPERATION_ID_LEN + 1), "has space".into(), "acción".into()] {
+            assert_eq!(check_operation_id(Some(bad.clone())).unwrap_err().status, StatusCode::BAD_REQUEST, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_confirmed_save_names_its_operation_and_what_was_masked_before_it_was_recorded() {
+        let (_, body) = save_response(
+            Confirmation::Reported(IngestReport { memories: vec![chunk(57, ChunkOutcome::Inserted)], ..Default::default() }),
+            "op-9".into(),
+            &[SecretKind::GithubToken],
+        )
+        .expect("a clean report is a success");
+        assert_eq!(body.operation_id, "op-9");
+        assert_eq!(body.redacted, vec!["github_token"]);
     }
 
     #[test]
@@ -1319,14 +1421,14 @@ mod tests {
                 clawg_core::memory::redact::SecretKind::GithubToken,
                 clawg_core::memory::redact::SecretKind::Jwt,
             ],
-        }))
+        }), "op-1".into(), &[])
         .expect("a clean report is a success");
         assert_eq!(body.redacted, vec!["github_token", "jwt"]);
 
         let (_, plain) = save_response(Confirmation::Reported(IngestReport {
             memories: vec![chunk(58, ChunkOutcome::Inserted)],
             ..Default::default()
-        }))
+        }), "op-1".into(), &[])
         .expect("a clean report is a success");
         let json = serde_json::to_value(&plain).unwrap();
         assert!(json.get("redacted").is_none(), "{json}");
