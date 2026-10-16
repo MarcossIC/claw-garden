@@ -7,14 +7,14 @@
 //! no other stable key shared by two independently-generated results files.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use serde_json::Value;
 
 use crate::agent_view::CaseView;
 use crate::golden::CaseStatus;
-use crate::report::CaseResult;
+use crate::report::{pair_of, CaseResult, Pair};
 use crate::stats::{paired_bootstrap_ci, Interval, BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED};
 
 /// One metric's movement between two runs, counted over every case the join
@@ -80,6 +80,29 @@ pub struct BlockDiff {
     pub ndcg_10: MetricDiff,
 }
 
+/// One pair's share of a block: the rows of the block over the joined cases
+/// both files give this pair, and how many they are.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PairDiff<B> {
+    pub pair: Pair,
+    pub joined: usize,
+    pub block: B,
+}
+
+/// A block cut by query–row language pair. A joined case enters a pair only
+/// when both files give it that same pair; the other cases that have one are
+/// counted apart, and a case with a pair in neither file is counted nowhere.
+/// Informative only: the verdict reads the global rows.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PairCut<B> {
+    pub pairs: Vec<PairDiff<B>>,
+    /// Joined cases with a pair in both files, not the same one.
+    pub pair_differs: usize,
+    /// Joined cases with a pair in one file and none in the other, as when an
+    /// unlabelled file meets a labelled one.
+    pub pair_in_one_file_only: usize,
+}
+
 /// What the agent received, case by case, from two `--agent-view` runs.
 /// Fewer tokens counts as better; the interval of a token row is still the
 /// raw change, second run minus first.
@@ -96,10 +119,12 @@ pub struct AgentViewDiff {
 /// The whole paired diff: `retrieval` and `similarity`, computed the same
 /// way but never combined — see the module doc comment for why.
 /// `agent_view` is there only when both files measured it.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct RunDiff {
     pub retrieval: BlockDiff,
     pub similarity: BlockDiff,
+    pub retrieval_by_pair: PairCut<BlockDiff>,
+    pub similarity_by_pair: PairCut<BlockDiff>,
     pub agent_view: Option<AgentViewDiff>,
     /// `retrieval.unanswerable[].abstained`, when both files have such cases.
     pub abstention: Option<MetricDiff>,
@@ -201,6 +226,8 @@ pub fn diff_values(a: &Value, a_path: &Path, b: &Value, b_path: &Path) -> Result
     Ok(RunDiff {
         retrieval: diff_block(&a_retrieval, &b_retrieval),
         similarity: diff_block(&a_similarity, &b_similarity),
+        retrieval_by_pair: cut_by_pair(&a_retrieval, &b_retrieval, diff_block),
+        similarity_by_pair: cut_by_pair(&a_similarity, &b_similarity, diff_block),
         freshness: diff_freshness(&a_retrieval, &b_retrieval),
         agent_view,
         abstention,
@@ -300,6 +327,52 @@ fn diff_block(a: &[CaseResult], b: &[CaseResult]) -> BlockDiff {
     block
 }
 
+/// What the pair cut reads of a case, whichever block it comes from.
+trait PairedCase: Clone {
+    fn query(&self) -> &str;
+    /// From the file's own case, never from its `by_pair`: an old file has
+    /// none, and the cut must not depend on how a file summarized itself.
+    fn pair(&self) -> Option<Pair>;
+}
+
+impl PairedCase for CaseResult {
+    fn query(&self) -> &str {
+        &self.query
+    }
+
+    fn pair(&self) -> Option<Pair> {
+        pair_of(self.query_lang.as_deref(), self.lang.as_deref())
+    }
+}
+
+/// Joins `a` and `b` on `query` like `diff_block`, sorts each joined case by
+/// its pair in the two files, and diffs every pair's cases with `diff`.
+/// Pairs come out ordered by `(query_lang, lang)`.
+fn cut_by_pair<C: PairedCase, B>(a: &[C], b: &[C], diff: impl Fn(&[C], &[C]) -> B) -> PairCut<B> {
+    let b_by_query: HashMap<&str, &C> = b.iter().map(|c| (c.query(), c)).collect();
+    let mut groups: BTreeMap<Pair, (Vec<C>, Vec<C>)> = BTreeMap::new();
+    let mut pair_differs = 0;
+    let mut pair_in_one_file_only = 0;
+    for a_case in a {
+        let Some(b_case) = b_by_query.get(a_case.query()) else { continue };
+        match (a_case.pair(), b_case.pair()) {
+            (Some(a_pair), Some(b_pair)) if a_pair == b_pair => {
+                let (a_group, b_group) = groups.entry(a_pair).or_default();
+                a_group.push(a_case.clone());
+                b_group.push((*b_case).clone());
+            }
+            (Some(_), Some(_)) => pair_differs += 1,
+            (Some(_), None) | (None, Some(_)) => pair_in_one_file_only += 1,
+            (None, None) => {}
+        }
+    }
+    let pairs = groups
+        .into_iter()
+        .map(|(pair, (a_group, b_group))| PairDiff { pair, joined: a_group.len(), block: diff(&a_group, &b_group) })
+        .collect();
+    PairCut { pairs, pair_differs, pair_in_one_file_only }
+}
+
 fn bootstrap(deltas: &[f64]) -> Interval {
     paired_bootstrap_ci(deltas, BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED)
 }
@@ -325,51 +398,92 @@ fn accumulate(m: &mut MetricDiff, a_val: f64, b_val: f64) {
 /// diff, because a diff is derived entirely from two files that are already
 /// on disk.
 pub fn print_stdout(diff: &RunDiff) {
-    println!("rag-eval diff");
-    print_block("retrieval", &diff.retrieval);
-    print_block("similarity", &diff.similarity);
+    print!("{}", render(diff));
+}
+
+/// The report [`print_stdout`] prints, built apart from the printing so its
+/// text can be checked.
+fn render(diff: &RunDiff) -> String {
+    let mut out = String::from("rag-eval diff\n");
+    render_block(&mut out, "retrieval", &diff.retrieval, &diff.retrieval_by_pair);
+    render_block(&mut out, "similarity", &diff.similarity, &diff.similarity_by_pair);
     if let Some(av) = &diff.agent_view {
-        println!("  agent_view (fewer tokens is better; the mean is second run minus first):");
-        println!("    metric          better  worse     net       p");
-        print_metric("search.found", &av.search_found);
-        print_metric("context.found", &av.context_found);
-        print_metric("search.tokens", &av.search_tokens);
-        print_metric("context.tokens", &av.context_tokens);
+        out.push_str("  agent_view (fewer tokens is better; the mean is second run minus first):\n");
+        out.push_str(METRIC_HEADER);
+        out.push_str(&metric_line("search.found", &av.search_found));
+        out.push_str(&metric_line("context.found", &av.context_found));
+        out.push_str(&metric_line("search.tokens", &av.search_tokens));
+        out.push_str(&metric_line("context.tokens", &av.context_tokens));
         if av.search_abstained.better + av.search_abstained.worse > 0 {
-            print_metric("search.abstain", &av.search_abstained);
+            out.push_str(&metric_line("search.abstain", &av.search_abstained));
         }
     }
     if let Some(m) = &diff.freshness {
-        println!("  update (the newer row first):");
-        print_metric("fresh_first", m);
+        out.push_str("  update (the newer row first):\n");
+        out.push_str(&metric_line("fresh_first", m));
     }
     if let Some(m) = &diff.abstention {
-        println!("  unanswerable (the search returned nothing):");
-        print_metric("abstained", m);
+        out.push_str("  unanswerable (the search returned nothing):\n");
+        out.push_str(&metric_line("abstained", m));
     }
-    println!("  primary:");
-    println!("    {}", verdict("retrieval recall@5", &diff.retrieval.recall_5));
+    out.push_str("  primary:\n");
+    out.push_str(&format!("    {}\n", verdict("retrieval recall@5", &diff.retrieval.recall_5)));
     if let Some(av) = &diff.agent_view {
-        println!("    {}", verdict("agent_view search.found", &av.search_found));
+        out.push_str(&format!("    {}\n", verdict("agent_view search.found", &av.search_found)));
+    }
+    out
+}
+
+const METRIC_HEADER: &str = "    metric          better  worse     net       p\n";
+
+/// A block's global rows, the cases its pair cut left out, then one block of
+/// the same rows per pair.
+fn render_block(out: &mut String, name: &str, block: &BlockDiff, by_pair: &PairCut<BlockDiff>) {
+    out.push_str(&format!("  {name}:\n{METRIC_HEADER}"));
+    out.push_str(&block_rows(block));
+    out.push_str(&pairs_left_out(by_pair));
+    for p in &by_pair.pairs {
+        out.push_str(&format!("  {name} by pair {} ({} joined):\n{METRIC_HEADER}", p.pair, p.joined));
+        out.push_str(&block_rows(&p.block));
     }
 }
 
-fn print_block(name: &str, block: &BlockDiff) {
-    println!("  {name}:");
-    println!("    metric          better  worse     net       p");
-    print_metric("recall@1", &block.recall_1);
-    print_metric("recall@5", &block.recall_5);
-    print_metric("recall@10", &block.recall_10);
-    print_metric("mrr", &block.mrr);
-    print_metric("ndcg@10", &block.ndcg_10);
+fn block_rows(block: &BlockDiff) -> String {
+    [
+        ("recall@1", &block.recall_1),
+        ("recall@5", &block.recall_5),
+        ("recall@10", &block.recall_10),
+        ("mrr", &block.mrr),
+        ("ndcg@10", &block.ndcg_10),
+    ]
+    .iter()
+    .map(|(name, m)| metric_line(name, m))
+    .collect()
 }
 
-fn print_metric(name: &str, m: &MetricDiff) {
+fn pairs_left_out<B>(cut: &PairCut<B>) -> String {
+    let mut out = String::new();
+    if cut.pair_differs > 0 {
+        out.push_str(&format!(
+            "    pair differs between the files: {} case(s), counted in no pair\n",
+            cut.pair_differs
+        ));
+    }
+    if cut.pair_in_one_file_only > 0 {
+        out.push_str(&format!(
+            "    pair in one file only: {} case(s), counted in no pair\n",
+            cut.pair_in_one_file_only
+        ));
+    }
+    out
+}
+
+fn metric_line(name: &str, m: &MetricDiff) -> String {
     let ci = m
         .ci
         .map(|c| format!("  mean {:+.4} [{:+.4}, {:+.4}]", c.mean, c.lo, c.hi))
         .unwrap_or_default();
-    println!("    {:<14}  {:>6}  {:>5}  {:>6}  {:>6.4}{ci}", name, m.better, m.worse, m.net, m.p_value());
+    format!("    {:<14}  {:>6}  {:>5}  {:>6}  {:>6.4}{ci}\n", name, m.better, m.worse, m.net, m.p_value())
 }
 
 #[cfg(test)]
@@ -686,6 +800,201 @@ mod tests {
         let diff = diff_files(&path, &path).expect("diffing the reference file against itself must succeed");
         assert_block_is_a_no_op(&diff.retrieval, "retrieval");
         assert_block_is_a_no_op(&diff.similarity, "similarity");
+    }
+
+    // --- the cut by query–row language pair -----------------------------------
+
+    fn pair_case(query: &str, hit: f64, query_lang: Option<&str>, lang: Option<&str>) -> Value {
+        serde_json::json!({
+            "query": query, "expected_refs": ["c1"], "ranked_refs": ["c1"],
+            "recall@1": hit, "recall@5": hit, "recall@10": hit, "mrr": hit, "ndcg@10": hit,
+            "status": "active", "lang": lang, "query_lang": query_lang
+        })
+    }
+
+    fn retrieval_file(cases: Vec<Value>) -> Value {
+        serde_json::json!({ "retrieval": { "per_case": cases } })
+    }
+
+    /// `n` cases of one pair, the first `hits` of them recalled.
+    fn cases_of(prefix: &str, n: usize, hits: usize, query_lang: &str, lang: &str) -> Vec<Value> {
+        (0..n)
+            .map(|i| pair_case(&format!("{prefix}{i}"), if i < hits { 1.0 } else { 0.0 }, Some(query_lang), Some(lang)))
+            .collect()
+    }
+
+    fn pair_labels<B>(cut: &PairCut<B>) -> Vec<String> {
+        cut.pairs.iter().map(|p| p.pair.to_string()).collect()
+    }
+
+    fn diff_of(a: &Value, b: &Value) -> RunDiff {
+        diff_values(a, &reference_results_path(), b, &reference_results_path()).expect("diffing must succeed")
+    }
+
+    #[test]
+    fn a_pair_block_joins_only_the_cases_with_that_pair() {
+        let a = retrieval_file(vec![
+            pair_case("q1", 0.0, Some("es"), Some("en")),
+            pair_case("q2", 0.0, Some("es"), Some("en")),
+            pair_case("q3", 1.0, Some("es"), Some("es")),
+        ]);
+        let b = retrieval_file(vec![
+            pair_case("q1", 1.0, Some("es"), Some("en")),
+            pair_case("q2", 0.0, Some("es"), Some("en")),
+            pair_case("q3", 1.0, Some("es"), Some("es")),
+            pair_case("only in b", 1.0, Some("es"), Some("en")),
+        ]);
+        let cut = diff_of(&a, &b).retrieval_by_pair;
+        assert_eq!(pair_labels(&cut), vec!["es>en", "es>es"]);
+        assert_eq!(cut.pairs[0].joined, 2);
+        assert_eq!((cut.pairs[0].block.recall_5.better, cut.pairs[0].block.recall_5.worse), (1, 0));
+        assert_eq!(cut.pairs[1].joined, 1);
+        assert_block_is_a_no_op(&cut.pairs[1].block, "es>es");
+        assert_eq!((cut.pair_differs, cut.pair_in_one_file_only), (0, 0));
+    }
+
+    #[test]
+    fn six_improvements_in_one_pair_are_significant_there_only() {
+        let a = retrieval_file([cases_of("cross", 19, 0, "es", "en"), cases_of("same", 20, 20, "es", "es")].concat());
+        let b = retrieval_file([cases_of("cross", 19, 6, "es", "en"), cases_of("same", 20, 17, "es", "es")].concat());
+        let diff = diff_of(&a, &b);
+        let cut = &diff.retrieval_by_pair;
+        assert_eq!(pair_labels(cut), vec!["es>en", "es>es"]);
+        let cross = cut.pairs[0].block.recall_5;
+        assert_eq!((cut.pairs[0].joined, cross.better, cross.worse), (19, 6, 0));
+        assert!((cross.p_value() - 0.03125).abs() < 1e-9, "p = {}", cross.p_value());
+        let same = cut.pairs[1].block.recall_5;
+        assert_eq!((cut.pairs[1].joined, same.better, same.worse), (20, 0, 3));
+        assert_eq!((diff.retrieval.recall_5.better, diff.retrieval.recall_5.worse), (6, 3));
+        assert!(diff.retrieval.recall_5.p_value() >= 0.05, "the global row does not reach significance");
+    }
+
+    #[test]
+    fn a_case_whose_pair_differs_between_the_files_is_reported_apart() {
+        let a = retrieval_file(vec![pair_case("q1", 0.0, Some("es"), Some("en"))]);
+        let b = retrieval_file(vec![pair_case("q1", 1.0, Some("en"), Some("en"))]);
+        let diff = diff_of(&a, &b);
+        assert!(diff.retrieval_by_pair.pairs.is_empty(), "in neither es>en nor en>en");
+        assert_eq!((diff.retrieval_by_pair.pair_differs, diff.retrieval_by_pair.pair_in_one_file_only), (1, 0));
+        assert_eq!(diff.retrieval.recall_5.better, 1, "the global row still counts it");
+        assert!(render(&diff).contains("    pair differs between the files: 1 case(s), counted in no pair"));
+    }
+
+    #[test]
+    fn a_case_with_a_pair_in_one_file_only_is_reported_apart() {
+        let a = retrieval_file(vec![pair_case("q1", 0.0, None, Some("en"))]);
+        let b = retrieval_file(vec![pair_case("q1", 1.0, Some("es"), Some("en"))]);
+        let diff = diff_of(&a, &b);
+        assert!(diff.retrieval_by_pair.pairs.is_empty());
+        assert_eq!((diff.retrieval_by_pair.pair_differs, diff.retrieval_by_pair.pair_in_one_file_only), (0, 1));
+        let text = render(&diff);
+        assert!(text.contains("    pair in one file only: 1 case(s), counted in no pair"), "{text}");
+        assert!(!text.contains("pair differs"), "{text}");
+    }
+
+    #[test]
+    fn a_case_without_a_pair_in_either_file_is_counted_nowhere() {
+        let a = retrieval_file(vec![pair_case("q1", 0.0, None, Some("en")), pair_case("q2", 0.0, Some("es"), Some("en"))]);
+        let b = retrieval_file(vec![pair_case("q1", 1.0, None, Some("en")), pair_case("q2", 0.0, Some("es"), Some("en"))]);
+        let diff = diff_of(&a, &b);
+        let cut = &diff.retrieval_by_pair;
+        assert_eq!(pair_labels(cut), vec!["es>en"]);
+        assert_eq!(cut.pairs[0].joined, 1);
+        assert_block_is_a_no_op(&cut.pairs[0].block, "es>en");
+        assert_eq!((cut.pair_differs, cut.pair_in_one_file_only), (0, 0));
+        assert_eq!(diff.retrieval.recall_5.better, 1, "the global row still counts it");
+    }
+
+    #[test]
+    fn similarity_has_its_own_pair_blocks() {
+        let file = |hits: usize| {
+            serde_json::json!({
+                "retrieval": { "per_case": [pair_case("q0", 1.0, None, Some("en"))] },
+                "similarity": { "per_case": cases_of("q", 3, hits, "es", "en") },
+            })
+        };
+        let diff = diff_of(&file(0), &file(2));
+        assert_eq!(diff.retrieval_by_pair, PairCut::default());
+        assert_eq!(pair_labels(&diff.similarity_by_pair), vec!["es>en"]);
+        assert_eq!(diff.similarity_by_pair.pairs[0].block.recall_5.better, 2);
+        assert!(render(&diff).contains("  similarity by pair es>en (3 joined):"), "{}", render(&diff));
+    }
+
+    #[test]
+    fn the_global_rows_do_not_change_when_pairs_are_present() {
+        let labelled = |hits: usize| {
+            let cases = [cases_of("x", 10, hits, "es", "en"), cases_of("y", 10, 10 - hits, "en", "en")].concat();
+            serde_json::json!({ "retrieval": { "per_case": cases.clone() }, "similarity": { "per_case": cases } })
+        };
+        let unlabelled = |hits: usize| {
+            let mut file = labelled(hits);
+            for block in ["retrieval", "similarity"] {
+                for case in file[block]["per_case"].as_array_mut().unwrap() {
+                    case.as_object_mut().unwrap().remove("query_lang");
+                }
+            }
+            file
+        };
+        let with_pairs = diff_of(&labelled(2), &labelled(7));
+        let without = diff_of(&unlabelled(2), &unlabelled(7));
+        assert_eq!(with_pairs.retrieval, without.retrieval);
+        assert_eq!(with_pairs.similarity, without.similarity);
+        assert_eq!(pair_labels(&with_pairs.retrieval_by_pair), vec!["en>en", "es>en"]);
+        assert!(without.retrieval_by_pair.pairs.is_empty());
+    }
+
+    #[test]
+    fn a_file_without_pairs_diffs_against_one_with_them() {
+        let new = retrieval_file(cases_of("q", 46, 30, "es", "en"));
+        let mut old = new.clone();
+        for case in old["retrieval"]["per_case"].as_array_mut().unwrap() {
+            case.as_object_mut().unwrap().remove("query_lang");
+        }
+        for (a, b) in [(&old, &new), (&new, &old)] {
+            let diff = diff_of(a, b);
+            assert_block_is_a_no_op(&diff.retrieval, "retrieval");
+            assert!(diff.retrieval_by_pair.pairs.is_empty(), "no case has the same pair in both files");
+            assert_eq!((diff.retrieval_by_pair.pair_differs, diff.retrieval_by_pair.pair_in_one_file_only), (0, 46));
+            assert!(!regressed(&diff));
+        }
+    }
+
+    #[test]
+    fn two_files_without_pairs_have_no_pair_block() {
+        let diff = diff_of(&reference_value(), &reference_value());
+        assert_eq!(diff.retrieval_by_pair, PairCut::default());
+        assert_eq!(diff.similarity_by_pair, PairCut::default());
+        let text = render(&diff);
+        assert!(!text.contains("by pair") && !text.contains("counted in no pair"), "{text}");
+    }
+
+    /// 20 Spanish-to-English cases lose R@5 and 20 Spanish-to-Spanish ones
+    /// gain it: the global row is a wash, one pair a clear regression.
+    fn a_wash_with_one_pair_regressing() -> (Value, Value) {
+        let a = retrieval_file([cases_of("cross", 20, 20, "es", "en"), cases_of("same", 20, 0, "es", "es")].concat());
+        let b = retrieval_file([cases_of("cross", 20, 0, "es", "en"), cases_of("same", 20, 20, "es", "es")].concat());
+        (a, b)
+    }
+
+    #[test]
+    fn a_regression_inside_a_pair_never_fails() {
+        let (a, b) = a_wash_with_one_pair_regressing();
+        let diff = diff_of(&a, &b);
+        let cross = diff.retrieval_by_pair.pairs[0].block.recall_5;
+        assert_eq!((cross.better, cross.worse), (0, 20));
+        assert!(cross.p_value() < crate::stats::ALPHA);
+        assert!(!regressed(&diff));
+    }
+
+    #[test]
+    fn the_primary_lines_ignore_the_pair_blocks() {
+        let (a, b) = a_wash_with_one_pair_regressing();
+        let with_pairs = diff_of(&a, &b);
+        let without = RunDiff { retrieval_by_pair: PairCut::default(), similarity_by_pair: PairCut::default(), ..with_pairs.clone() };
+        let primary = |diff: &RunDiff| render(diff).split("  primary:\n").nth(1).expect("a primary section").to_string();
+        assert_eq!(primary(&with_pairs), primary(&without));
+        assert!(render(&with_pairs).contains("  retrieval by pair es>en (20 joined):"));
+        assert!(!primary(&with_pairs).contains("by pair"));
     }
 
     #[test]

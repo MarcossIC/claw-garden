@@ -1502,6 +1502,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn diff_exits_zero_when_only_a_pair_regresses() {
+        let case = |query: String, hit: f64, query_lang: &str, lang: &str| {
+            serde_json::json!({
+                "query": query, "expected_refs": ["c1"], "ranked_refs": ["c1"],
+                "recall@1": hit, "recall@5": hit, "recall@10": hit, "mrr": hit, "ndcg@10": hit,
+                "status": "active", "lang": lang, "query_lang": query_lang
+            })
+        };
+        // The Spanish-to-English cases lose what the Spanish-to-Spanish ones gain.
+        let file = |cross: f64| {
+            let cases: Vec<serde_json::Value> = (0..20)
+                .map(|i| case(format!("cross{i}"), cross, "es", "en"))
+                .chain((0..20).map(|i| case(format!("same{i}"), 1.0 - cross, "es", "es")))
+                .collect();
+            serde_json::json!({ "retrieval": { "per_case": cases } })
+        };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (a, b) = (dir.path().join("a.json"), dir.path().join("b.json"));
+        std::fs::write(&a, file(1.0).to_string()).expect("write a");
+        std::fs::write(&b, file(0.0).to_string()).expect("write b");
+
+        let cut = diff::diff_files(&a, &b).expect("the files diff").retrieval_by_pair;
+        assert_eq!(cut.pairs[0].pair.to_string(), "es>en");
+        assert_eq!(cut.pairs[0].block.recall_5.worse, 20);
+
+        let (a, b) = (a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned());
+        let argv = ["rag-eval", "--diff", a.as_str(), b.as_str(), "--fail-on-regression"].map(str::to_string);
+        assert_eq!(run(argv.into_iter()).await, EXIT_OK);
+    }
+
+    #[tokio::test]
     async fn fake_end_to_end_run_produces_a_valid_results_json() {
         // Two queries are set to the exact text of the corpus rows they
         // should retrieve: FakeEmbedder is deterministic, so identical text
