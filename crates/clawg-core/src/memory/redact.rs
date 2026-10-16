@@ -1,10 +1,11 @@
 //! Masking of secrets with a known format: API keys, tokens, private keys and
-//! passwords inside URLs, and of whatever the writer marks
+//! passwords inside URLs; of literal values after a password key or an
+//! `Authorization` header; and of whatever the writer marks
 //! `<private>…</private>`.
 //!
-//! Only formats with a fixed prefix or structure are recognised. Nothing here
-//! guesses from entropy: commit hashes, UUIDs and checksums look random too,
-//! and they are memory worth keeping.
+//! Only formats with a fixed prefix or structure, or a fixed key in front,
+//! are recognised. Nothing here guesses from entropy: commit hashes, UUIDs and
+//! checksums look random too, and they are memory worth keeping.
 
 use std::ops::Range;
 
@@ -28,6 +29,8 @@ pub enum SecretKind {
     PrivateKey,
     Jwt,
     UrlPassword,
+    Password,
+    AuthHeader,
     Private,
 }
 
@@ -48,6 +51,8 @@ impl SecretKind {
             SecretKind::PrivateKey => "private_key",
             SecretKind::Jwt => "jwt",
             SecretKind::UrlPassword => "url_password",
+            SecretKind::Password => "password",
+            SecretKind::AuthHeader => "auth_header",
             SecretKind::Private => "private",
         }
     }
@@ -70,7 +75,8 @@ pub struct Redacted {
 
 /// One regex per kind, in the order a tie between two matches starting at the
 /// same byte is settled. The capture group, when there is one, is what
-/// [`accepts`] checks; in a URL it is also the only part masked.
+/// [`accepts`] checks; in a URL and after a key it is also the only part
+/// masked.
 static PATTERNS: Lazy<Vec<(SecretKind, Regex)>> = Lazy::new(|| {
     [
         (SecretKind::AwsAccessKey, r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
@@ -90,6 +96,14 @@ static PATTERNS: Lazy<Vec<(SecretKind, Regex)>> = Lazy::new(|| {
         ),
         (SecretKind::Jwt, r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*"),
         (SecretKind::UrlPassword, r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s:/@]+:([^\s/@]+)@"),
+        (
+            SecretKind::Password,
+            r#"(?i)\b\w*pass(?:word|wd)["']?\s*[:=]{1,2}\s*["']?([^\s"'`,;)}\]]+)"#,
+        ),
+        (
+            SecretKind::AuthHeader,
+            r#"(?i)\bauthorization["']?\s*[:=]\s*["']?(?:bearer|basic|token)\s+([^\s"'`,;)}\]]+)"#,
+        ),
     ]
     .into_iter()
     .map(|(kind, pattern)| (kind, Regex::new(pattern).expect("secret patterns are valid")))
@@ -134,8 +148,27 @@ fn accepts(kind: SecretKind, secret: &str) -> bool {
         // A variable, a template slot, an earlier placeholder or a masked
         // value: none of them is the password.
         SecretKind::UrlPassword => !secret.starts_with(['$', '<', '{', '[', '*']),
+        SecretKind::Password | SecretKind::AuthHeader => is_literal_secret(secret),
         _ => true,
     }
+}
+
+/// Whether the value after a password key or an `Authorization` scheme is a
+/// literal secret rather than code, a type, a placeholder or prose. A word
+/// with no digit and no symbol is let through: it is far more often a type
+/// or a variable than a password, and masking it destroys the memory.
+fn is_literal_secret(value: &str) -> bool {
+    let is_identifier = |s: &str| {
+        let mut chars = s.chars();
+        chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    let is_dotted_path = value.contains('.') && value.split('.').all(is_identifier);
+    value.chars().count() >= 6
+        && !value.starts_with(['$', '%', '*'])
+        && !value.contains(['(', ')', '[', ']', '{', '}', '<', '>'])
+        && !is_dotted_path
+        && value.chars().any(|c| c.is_ascii_digit() || !(c.is_alphanumeric() || matches!(c, '-' | '_' | '.')))
 }
 
 /// Every secret in `text`, in order, none overlapping. Of two that overlap,
@@ -150,7 +183,8 @@ pub fn find_secrets(text: &str) -> Vec<Found> {
             if !accepts(*kind, part.as_str()) {
                 continue;
             }
-            let masked = if *kind == SecretKind::UrlPassword { part } else { whole };
+            let value_only = matches!(kind, SecretKind::UrlPassword | SecretKind::Password | SecretKind::AuthHeader);
+            let masked = if value_only { part } else { whole };
             found.push(Found { range: masked.range(), kind: *kind });
         }
     }
@@ -310,6 +344,84 @@ mod tests {
         let out = redact(&format!("<private>token {token}</private> rest"));
         assert_eq!(out.text, "[REDACTED:private] rest");
         assert_eq!(out.kinds, vec![SecretKind::Private]);
+    }
+
+    #[test]
+    fn a_literal_password_is_masked_and_its_key_kept() {
+        for (text, expected) in [
+            ("password=hunter2", "password=[REDACTED:password]"),
+            ("export DB_PASSWORD=\"s3cr3t!x\"", "export DB_PASSWORD=\"[REDACTED:password]\""),
+            ("{\"password\": \"p@ssw0rd\"}", "{\"password\": \"[REDACTED:password]\"}"),
+            ("PGPASSWORD=Zx9-kq2 psql", "PGPASSWORD=[REDACTED:password] psql"),
+            ("db_passwd: 'open-sesame-77'", "db_passwd: '[REDACTED:password]'"),
+            ("pass := \"x\"; password := \"tr0ub4dor\"", "pass := \"x\"; password := \"[REDACTED:password]\""),
+        ] {
+            let out = redact(text);
+            assert_eq!(out.text, expected, "{text}");
+            assert_eq!(out.kinds, vec![SecretKind::Password], "{text}");
+        }
+    }
+
+    #[test]
+    fn code_and_placeholders_after_a_password_key_are_left_alone() {
+        for text in [
+            "password=<tu-clave>",
+            "password: string",
+            "password: Option<String>,",
+            "password: Optional[str] = None",
+            "password = os.getenv(\"DB\")",
+            "password: cfg.db.password",
+            "PGPASSWORD=$PGPASS",
+            "password=${DB_PASSWORD}",
+            "password: change-me",
+            "password: YOUR_PASSWORD_HERE",
+            "password: ******",
+            "password=%DB_PASS%",
+            "password_hash: \"$2b$12$abcdefghijk\"",
+            "passwordFile=/etc/app/pass1",
+            "PWD=/home/user/app2",
+            "WHERE password = ?",
+            "password=[REDACTED:url_password]",
+        ] {
+            let out = redact(text);
+            assert_eq!(out.text, text);
+            assert!(out.kinds.is_empty(), "{text}: {:?}", out.kinds);
+        }
+    }
+
+    #[test]
+    fn an_authorization_header_masks_only_its_credential() {
+        let out = redact("curl -H \"Authorization: Bearer a1b2c3d4e5f6g7h8\" https://api.example.com");
+        assert_eq!(out.text, "curl -H \"Authorization: Bearer [REDACTED:auth_header]\" https://api.example.com");
+        assert_eq!(out.kinds, vec![SecretKind::AuthHeader]);
+
+        let out = redact("authorization: basic dXNlcjpwYXNzd29yZA==");
+        assert_eq!(out.text, "authorization: basic [REDACTED:auth_header]");
+
+        for text in [
+            "Authorization: Bearer $TOKEN",
+            "Authorization: Bearer <token>",
+            "Authorization: Bearer YOUR_TOKEN",
+            "headers = {\"Authorization\": f\"Bearer {token}\"}",
+            "send a Bearer token in the Authorization header",
+        ] {
+            let out = redact(text);
+            assert_eq!(out.text, text);
+            assert!(out.kinds.is_empty(), "{text}: {:?}", out.kinds);
+        }
+    }
+
+    #[test]
+    fn a_known_format_wins_over_its_context() {
+        let token = format!("ghp_{}", repeat("a1B2", 36));
+        let out = redact(&format!("Authorization: Bearer {token}"));
+        assert_eq!(out.text, "Authorization: Bearer [REDACTED:github_token]");
+        assert_eq!(out.kinds, vec![SecretKind::GithubToken]);
+
+        let key = format!("sk-proj-{}", repeat("k3Lm", 48));
+        let out = redact(&format!("OPENAI_PASSWORD={key}"));
+        assert_eq!(out.text, "OPENAI_PASSWORD=[REDACTED:openai_key]");
+        assert_eq!(out.kinds, vec![SecretKind::OpenaiKey]);
     }
 
     #[test]
