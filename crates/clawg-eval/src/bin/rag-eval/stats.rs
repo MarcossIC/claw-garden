@@ -34,9 +34,94 @@ pub fn min_one_way_significant() -> usize {
     (1..).find(|&m| mcnemar_exact(m, 0) < ALPHA).expect("the p-value halves with every case")
 }
 
+/// A mean difference and its interval.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Interval {
+    pub mean: f64,
+    pub lo: f64,
+    pub hi: f64,
+}
+
+pub const BOOTSTRAP_RESAMPLES: usize = 10_000;
+
+/// Fixed so the same two files always print the same interval.
+pub const BOOTSTRAP_SEED: u64 = 0x5EED_0F_E7A1;
+
+/// Mean of the per-case differences and its 95 % percentile bootstrap
+/// interval: `resamples` draws of the cases with replacement, the mean of
+/// each, and the 2.5th and 97.5th of those means. Makes no assumption about
+/// the shape of the differences, which for MRR and nDCG pile up at 0 and ±1.
+pub fn paired_bootstrap_ci(deltas: &[f64], resamples: usize, seed: u64) -> Interval {
+    let n = deltas.len();
+    if n == 0 || resamples == 0 {
+        return Interval::default();
+    }
+    let mean = deltas.iter().sum::<f64>() / n as f64;
+    let mut rng = SplitMix64::new(seed);
+    let mut means: Vec<f64> = (0..resamples)
+        .map(|_| (0..n).map(|_| deltas[(rng.next_u64() % n as u64) as usize]).sum::<f64>() / n as f64)
+        .collect();
+    means.sort_by(f64::total_cmp);
+    let lo = means[((ALPHA / 2.0) * resamples as f64).floor() as usize];
+    let hi = means[((1.0 - ALPHA / 2.0) * resamples as f64).ceil() as usize - 1];
+    Interval { mean, lo, hi }
+}
+
+/// SplitMix64, the generator `golden-mine` uses (`synth/rng.rs`), copied
+/// rather than shared: the two binaries have no library in common, and this
+/// one needs only these two functions. `rand` is avoided for the same reason
+/// there: its sequences may change between versions.
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splitmix_matches_the_golden_mine_sequence() {
+        let mut rng = SplitMix64::new(0);
+        assert_eq!(rng.next_u64(), 0xE220_A839_7B1D_CDAF);
+        assert_eq!(rng.next_u64(), 0x6E78_9E6A_A1B9_65F4);
+        assert_eq!(rng.next_u64(), 0x06C4_5D18_8009_454F);
+    }
+
+    #[test]
+    fn bootstrap_is_deterministic_for_a_seed() {
+        let deltas = [0.5, -0.25, 0.0, 1.0, 0.0, -1.0, 0.75];
+        let a = paired_bootstrap_ci(&deltas, 2_000, 7);
+        assert_eq!(a, paired_bootstrap_ci(&deltas, 2_000, 7));
+        assert_ne!(a, paired_bootstrap_ci(&deltas, 2_000, 8));
+        assert!(a.lo <= a.mean && a.mean <= a.hi, "{a:?}");
+    }
+
+    #[test]
+    fn bootstrap_of_zero_differences_is_zero() {
+        assert_eq!(paired_bootstrap_ci(&[0.0; 12], 1_000, BOOTSTRAP_SEED), Interval::default());
+        assert_eq!(paired_bootstrap_ci(&[], 1_000, BOOTSTRAP_SEED), Interval::default());
+    }
+
+    #[test]
+    fn bootstrap_of_positive_differences_excludes_zero() {
+        let deltas = [0.1, 0.5, 0.2, 1.0, 0.3, 0.4];
+        let ci = paired_bootstrap_ci(&deltas, BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED);
+        assert!(ci.lo > 0.0, "{ci:?}");
+    }
 
     fn close(a: f64, b: f64, tol: f64) -> bool {
         (a - b).abs() <= tol

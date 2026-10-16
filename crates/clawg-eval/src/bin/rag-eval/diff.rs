@@ -13,6 +13,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::report::CaseResult;
+use crate::stats::{paired_bootstrap_ci, Interval, BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED};
 
 /// One metric's movement between two runs, counted over every case the join
 /// could match. `net` is `better - worse`, not `better + worse`: a metric
@@ -24,6 +25,10 @@ pub struct MetricDiff {
     pub better: usize,
     pub worse: usize,
     pub net: i64,
+    /// Mean per-case difference (second minus first) and its bootstrap
+    /// interval. Only on continuous metrics, where how far a case moved
+    /// matters as well as which way.
+    pub ci: Option<Interval>,
 }
 
 impl MetricDiff {
@@ -153,6 +158,8 @@ fn diff_block(a: &[CaseResult], b: &[CaseResult]) -> BlockDiff {
     let b_by_query: HashMap<&str, &CaseResult> = b.iter().map(|c| (c.query.as_str(), c)).collect();
 
     let mut block = BlockDiff::default();
+    let mut mrr_deltas = Vec::new();
+    let mut ndcg_deltas = Vec::new();
     for a_case in a {
         let Some(b_case) = b_by_query.get(a_case.query.as_str()) else { continue };
         accumulate(&mut block.recall_1, a_case.recall_1, b_case.recall_1);
@@ -160,8 +167,16 @@ fn diff_block(a: &[CaseResult], b: &[CaseResult]) -> BlockDiff {
         accumulate(&mut block.recall_10, a_case.recall_10, b_case.recall_10);
         accumulate(&mut block.mrr, a_case.mrr, b_case.mrr);
         accumulate(&mut block.ndcg_10, a_case.ndcg_10, b_case.ndcg_10);
+        mrr_deltas.push(b_case.mrr - a_case.mrr);
+        ndcg_deltas.push(b_case.ndcg_10 - a_case.ndcg_10);
     }
+    block.mrr.ci = Some(bootstrap(&mrr_deltas));
+    block.ndcg_10.ci = Some(bootstrap(&ndcg_deltas));
     block
+}
+
+fn bootstrap(deltas: &[f64]) -> Interval {
+    paired_bootstrap_ci(deltas, BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED)
 }
 
 /// `b_val` vs `a_val` for one matched pair, folded into the running
@@ -203,7 +218,11 @@ fn print_block(name: &str, block: &BlockDiff) {
 }
 
 fn print_metric(name: &str, m: &MetricDiff) {
-    println!("    {:<10}  {:>6}  {:>5}  {:>6}  {:>6.4}", name, m.better, m.worse, m.net, m.p_value());
+    let ci = m
+        .ci
+        .map(|c| format!("  mean {:+.4} [{:+.4}, {:+.4}]", c.mean, c.lo, c.hi))
+        .unwrap_or_default();
+    println!("    {:<10}  {:>6}  {:>5}  {:>6}  {:>6.4}{ci}", name, m.better, m.worse, m.net, m.p_value());
 }
 
 #[cfg(test)]
@@ -251,7 +270,7 @@ mod tests {
     }
 
     fn moved(better: usize, worse: usize) -> MetricDiff {
-        MetricDiff { better, worse, net: better as i64 - worse as i64 }
+        MetricDiff { better, worse, net: better as i64 - worse as i64, ci: None }
     }
 
     #[test]
@@ -280,6 +299,21 @@ mod tests {
                 assert!(!line.contains(phrase), "{line}");
             }
         }
+    }
+
+    #[test]
+    fn a_continuous_metric_carries_a_bootstrap_interval() {
+        let a = reference_value();
+        let mut b = a.clone();
+        b["retrieval"]["per_case"][1]["mrr"] = serde_json::json!(1.0);
+        let path = reference_results_path();
+
+        let diff = diff_values(&a, &path, &b, &path).expect("diffing must succeed");
+
+        let ci = diff.retrieval.mrr.ci.expect("mrr carries an interval");
+        assert!((ci.mean - 0.25).abs() < 1e-9, "{ci:?}");
+        assert!(ci.lo <= ci.mean && ci.mean <= ci.hi, "{ci:?}");
+        assert_eq!(diff.retrieval.recall_5.ci, None, "a recall carries no interval");
     }
 
     #[test]
@@ -318,7 +352,7 @@ mod tests {
 
         assert_eq!(
             diff.retrieval.recall_1,
-            MetricDiff { better: 0, worse: 1, net: -1 },
+            MetricDiff { better: 0, worse: 1, net: -1, ci: None },
             "the one mutated case must show up as a retrieval regression"
         );
         assert_block_is_a_no_op(&diff.similarity, "similarity");
