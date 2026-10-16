@@ -164,7 +164,7 @@ impl RefMap {
     /// (it can only answer questions about ids you already hold). Scoring
     /// itself only ever travels id → ref, so this direction is unused outside
     /// tests by design rather than by oversight.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn id_of(&self, r: &str) -> Option<i64> {
         self.to_id.get(r).copied()
     }
