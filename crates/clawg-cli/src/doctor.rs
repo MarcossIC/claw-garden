@@ -130,39 +130,41 @@ mod tests {
 
     const NAME: &str = "clawg.exe";
 
-    fn dirs(list: &[&str]) -> Vec<PathBuf> {
-        list.iter().map(PathBuf::from).collect()
+    /// A directory under this platform's root, so `join` builds the same
+    /// spelling `analyze` builds and the fixtures hold on every platform.
+    fn dir(name: &str) -> PathBuf {
+        let root = if cfg!(windows) { r"C:\" } else { "/" };
+        PathBuf::from(root).join(name)
     }
 
-    fn present(files: &'static [&'static str]) -> impl Fn(&Path) -> bool {
-        move |p| files.iter().any(|f| Path::new(f) == p)
+    fn exe(name: &str) -> PathBuf {
+        dir(name).join(NAME)
+    }
+
+    fn dirs(list: &[&str]) -> Vec<PathBuf> {
+        list.iter().map(|d| dir(d)).collect()
+    }
+
+    fn present(names: &[&str]) -> impl Fn(&Path) -> bool {
+        let files: Vec<PathBuf> = names.iter().map(|n| exe(n)).collect();
+        move |p| files.iter().any(|f| f == p)
     }
 
     #[test]
     fn a_single_install_that_is_the_running_binary_is_healthy() {
-        let a = analyze(
-            Path::new(r"C:\new\clawg.exe"),
-            &dirs(&[r"C:\tools", r"C:\new"]),
-            NAME,
-            present(&[r"C:\new\clawg.exe"]),
-        );
+        let a = analyze(&exe("new"), &dirs(&["tools", "new"]), NAME, present(&["new"]));
         assert_eq!(a.installs.len(), 1);
         assert!(a.installs[0].is_current);
-        assert_eq!(a.winner.as_deref(), Some(Path::new(r"C:\new\clawg.exe")));
+        assert_eq!(a.winner, Some(exe("new")));
         assert!(a.is_healthy());
     }
 
     #[test]
     fn an_earlier_copy_shadows_the_running_binary() {
-        let a = analyze(
-            Path::new(r"C:\new\clawg.exe"),
-            &dirs(&[r"C:\old", r"C:\new"]),
-            NAME,
-            present(&[r"C:\old\clawg.exe", r"C:\new\clawg.exe"]),
-        );
+        let a = analyze(&exe("new"), &dirs(&["old", "new"]), NAME, present(&["old", "new"]));
         assert!(a.shadowed);
         assert!(a.duplicates);
-        assert_eq!(a.winner.as_deref(), Some(Path::new(r"C:\old\clawg.exe")));
+        assert_eq!(a.winner, Some(exe("old")));
         let flags: Vec<bool> = a.installs.iter().map(|i| i.is_current).collect();
         assert_eq!(flags, [false, true], "order is resolution order");
         assert!(!a.is_healthy());
@@ -170,12 +172,7 @@ mod tests {
 
     #[test]
     fn a_later_copy_is_a_duplicate_but_does_not_shadow() {
-        let a = analyze(
-            Path::new(r"C:\new\clawg.exe"),
-            &dirs(&[r"C:\new", r"C:\old"]),
-            NAME,
-            present(&[r"C:\old\clawg.exe", r"C:\new\clawg.exe"]),
-        );
+        let a = analyze(&exe("new"), &dirs(&["new", "old"]), NAME, present(&["old", "new"]));
         assert!(!a.shadowed);
         assert!(a.duplicates);
         assert!(!a.is_healthy());
@@ -183,19 +180,14 @@ mod tests {
 
     #[test]
     fn a_running_binary_off_the_path_is_shadowed_by_the_one_on_it() {
-        let a = analyze(
-            Path::new(r"C:\build\clawg.exe"),
-            &dirs(&[r"C:\old"]),
-            NAME,
-            present(&[r"C:\old\clawg.exe"]),
-        );
+        let a = analyze(&exe("build"), &dirs(&["old"]), NAME, present(&["old"]));
         assert!(a.shadowed);
         assert!(!a.duplicates);
     }
 
     #[test]
     fn nothing_on_the_path_means_no_winner_and_no_shadowing() {
-        let a = analyze(Path::new(r"C:\build\clawg.exe"), &dirs(&[r"C:\tools"]), NAME, |_| false);
+        let a = analyze(&exe("build"), &dirs(&["tools"]), NAME, |_| false);
         assert!(a.installs.is_empty());
         assert_eq!(a.winner, None);
         assert!(!a.shadowed);
@@ -204,23 +196,19 @@ mod tests {
 
     #[test]
     fn a_directory_listed_twice_is_one_install() {
-        let a = analyze(
-            Path::new(r"C:\new\clawg.exe"),
-            &dirs(&[r"C:\new", r"C:\new"]),
-            NAME,
-            present(&[r"C:\new\clawg.exe"]),
-        );
+        let a = analyze(&exe("new"), &dirs(&["new", "new"]), NAME, present(&["new"]));
         assert_eq!(a.installs.len(), 1);
         assert!(!a.duplicates);
     }
 
     #[test]
     fn blank_entries_are_skipped_and_quotes_are_stripped() {
+        let quoted = PathBuf::from(format!("\"{}\"", dir("Program Files").display()));
         let a = analyze(
-            Path::new(r"C:\Program Files\clawg\clawg.exe"),
-            &dirs(&["", "  ", r#""C:\Program Files\clawg""#]),
+            &exe("Program Files"),
+            &[PathBuf::from(""), PathBuf::from("  "), quoted],
             NAME,
-            present(&[r"C:\Program Files\clawg\clawg.exe"]),
+            present(&["Program Files"]),
         );
         assert_eq!(a.installs.len(), 1);
         assert!(a.installs[0].is_current);
@@ -231,7 +219,7 @@ mod tests {
     fn windows_spellings_of_one_file_are_the_same_install() {
         let a = analyze(
             Path::new(r"\\?\C:\New\CLAWG.exe"),
-            &dirs(&["c:/new"]),
+            &[PathBuf::from("c:/new")],
             NAME,
             |_| true,
         );
@@ -243,15 +231,10 @@ mod tests {
     #[test]
     fn the_report_serialises_the_documented_fields() {
         let report = Report {
-            exe: PathBuf::from(r"C:\new\clawg.exe"),
+            exe: exe("new"),
             version: "0.1.0".into(),
             profile: "dev".into(),
-            analysis: analyze(
-                Path::new(r"C:\new\clawg.exe"),
-                &dirs(&[r"C:\old", r"C:\new"]),
-                NAME,
-                |_| true,
-            ),
+            analysis: analyze(&exe("new"), &dirs(&["old", "new"]), NAME, |_| true),
         };
         let json = serde_json::to_value(&report).expect("serialise");
         for key in ["exe", "version", "profile", "installs", "winner", "shadowed", "duplicates"] {
