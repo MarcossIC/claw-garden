@@ -32,7 +32,7 @@ Las decisiones abiertas de la exploración se cierran con la opción recomendada
 - **`--fail-on-regression`:** opcional, sólo con `--diff`; falla si una métrica primaria empeora con p < 0,05.
 - **`--docs` no entra:** queda para docs-search-quality (20).
 - **Generador del bootstrap:** un SplitMix64 propio en `rag-eval`, copiado del de `golden-mine` y fijado con los mismos valores; no hay crate de biblioteca compartido ([diseño, D3](design.md#d3-generador-del-bootstrap)).
-- **Set versionado y escrito a mano (enfoque D):** queda fuera mientras Marcos no elija otra cosa en la tarjeta del hilo, que recomienda dejarlo fuera. Los tests usan fixtures dentro del código.
+- **Set versionado y escrito a mano (enfoque D):** queda fuera; Marcos lo eligió en la tarjeta del hilo. Los tests usan fixtures dentro del código.
 
 ## Alcance
 
@@ -49,7 +49,7 @@ Las decisiones abiertas de la exploración se cierran con la opción recomendada
 
 - Cambiar `RELEVANCE_RATIO`, el piso de coseno, el umbral de contradicción o cualquier ranking. Este cambio mide; si la medición dice que una constante no se sostiene, se abre otro cambio.
 - Correr nada sobre `~/.clawg*` ni ampliar el set privado.
-- Un set versionado (enfoque D), salvo que Marcos lo pida en la tarjeta.
+- Un set versionado (enfoque D): Marcos eligió dejarlo fuera.
 - La clase multiagente y multiproyecto, y pruebas de significancia para `--docs`.
 - Intervalos de latencia y un reporte HTML.
 - La tabla de CLS del comentario de `contradiction.rs:35-45` (es del core; va al backlog).

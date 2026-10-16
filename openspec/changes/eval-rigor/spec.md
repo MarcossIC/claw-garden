@@ -63,7 +63,7 @@ Cuando los dos archivos tienen `agent_view.per_case`, `--diff` MUST comparar, un
 - GIVEN un archivo sin `agent_view` y otro con el bloque
 - THEN el diff no falla y no imprime el bloque
 
-**Tests** (`diff.rs`): `a_found_flip_in_agent_view_shows_up`, `fewer_tokens_count_as_better`, `agent_view_joins_on_query_and_skips_known_red`, `a_file_without_agent_view_diffs_without_the_block`, `abstention_and_freshness_are_diffed_when_both_files_have_them`.
+**Tests** (`diff.rs`): `a_found_flip_in_agent_view_shows_up`, `fewer_tokens_count_as_better`, `agent_view_joins_on_query_and_skips_known_red`, `a_file_without_agent_view_diffs_without_the_block`, `abstention_is_diffed_when_both_files_have_it`, `freshness_is_diffed_when_both_files_have_update_cases`.
 
 ## R4. `--fail-on-regression`
 
@@ -148,13 +148,13 @@ Un caso con `subset: "update"` MUST tener exactamente una esperada y `stale_refs
 - GIVEN un caso `update` cuya esperada tiene `age_days` 30 y la vieja 1
 - THEN la validación falla
 
-**Tests:** `an_update_case_needs_one_expected_and_older_stale_rows`, `stale_refs_outside_an_update_case_fail`, `a_negative_age_fails` (`golden.rs`); `fresh_first_needs_the_expected_row_before_every_stale_one` (`metrics.rs`); `seed_backdates_a_row_by_its_age` (`seed.rs`); `eval_insert_backdates_created_at` (`eval_api.rs`).
+**Tests:** `an_update_case_needs_one_expected_and_older_stale_rows`, `stale_refs_outside_an_update_case_fail`, `a_negative_age_fails` (`golden.rs`); `fresh_first_needs_the_expected_row_before_every_stale_one` (`metrics.rs`); `freshness_counts_only_update_cases` (`report.rs`); `age_days_converts_to_whole_milliseconds` (`seed.rs`); `eval_insert_backdates_created_at` (`eval_api.rs`); `an_update_case_is_scored_and_reports_freshness` (`main.rs`).
 
 ## R10. Un golden sin clases nuevas mide igual
 
 Un golden sin `unanswerable`, `update`, `stale_refs` ni `age_days` MUST producir las mismas métricas, el mismo `content_sha256` y ningún bloque `unanswerable`, `abstention` ni `freshness`.
 
-**Test** (`main.rs`): `a_golden_without_the_new_classes_measures_exactly_as_before`, que compara `aggregate` y `per_case` contra los valores fijados de un golden de fixture con `--fake`.
+**Test** (`main.rs`): `a_golden_without_the_new_classes_measures_exactly_as_before`, que corre `--fake` sobre un golden de fixture y comprueba que no aparece ningún bloque nuevo y que las métricas son las fijadas. `an_unanswerable_case_stays_out_of_the_ranked_metrics_and_reports_abstention` comprueba además que sumar un caso `unanswerable` deja `per_case` y `aggregate` idénticos.
 
 ## R11. Brazo sólo léxico
 
