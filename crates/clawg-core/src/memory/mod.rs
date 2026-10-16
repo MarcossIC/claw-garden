@@ -33,6 +33,7 @@ pub mod worker;
 pub mod error;
 pub mod identity;
 pub mod migrations;
+pub mod outbox;
 pub(crate) mod pieces;
 pub mod project;
 pub mod project_docs;

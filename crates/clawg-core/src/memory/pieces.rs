@@ -181,19 +181,7 @@ impl MemoryStore {
         self.conn
             .call(move |c| -> rusqlite::Result<i64> {
                 let tx = c.transaction()?;
-                if let Some(id) = existing_save(&tx, &pieces)? {
-                    return Ok(id);
-                }
-                let save_id: i64 =
-                    tx.query_row("SELECT COALESCE(MAX(save_id), 0) + 1 FROM memory_piece", [], |r| r.get(0))?;
-                {
-                    let mut insert = tx.prepare(
-                        "INSERT INTO memory_piece (save_id, piece, memory_id, context) VALUES (?1, ?2, ?3, ?4)",
-                    )?;
-                    for (i, p) in pieces.iter().enumerate() {
-                        insert.execute(rusqlite::params![save_id, i as i64 + 1, p.memory_id, p.context])?;
-                    }
-                }
+                let save_id = link_in(&tx, &pieces)?;
                 tx.commit()?;
                 Ok(save_id)
             })
@@ -212,6 +200,21 @@ impl MemoryStore {
             .await
             .map_err(backend("save_links"))
     }
+}
+
+/// [`MemoryStore::link_pieces`] inside a transaction the caller commits, so the
+/// link can land together with whatever else finishes the save.
+pub(crate) fn link_in(c: &rusqlite::Connection, pieces: &[StoredPiece]) -> rusqlite::Result<i64> {
+    if let Some(id) = existing_save(c, pieces)? {
+        return Ok(id);
+    }
+    let save_id: i64 = c.query_row("SELECT COALESCE(MAX(save_id), 0) + 1 FROM memory_piece", [], |r| r.get(0))?;
+    let mut insert =
+        c.prepare("INSERT INTO memory_piece (save_id, piece, memory_id, context) VALUES (?1, ?2, ?3, ?4)")?;
+    for (i, p) in pieces.iter().enumerate() {
+        insert.execute(rusqlite::params![save_id, i as i64 + 1, p.memory_id, p.context])?;
+    }
+    Ok(save_id)
 }
 
 /// [`MemoryStore::save_links`] on a connection already in hand, for a caller

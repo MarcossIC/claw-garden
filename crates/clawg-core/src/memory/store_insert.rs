@@ -9,6 +9,7 @@ use crate::memory::chunker::Chunk;
 use crate::memory::clock::TimestampMs;
 use crate::memory::events::{MemoryEvent, MemorySource};
 use crate::memory::vector::to_unit;
+use crate::memory::outbox::{apply_note, OutboxNote};
 use crate::memory::MemoryStore;
 use crate::models::chat::Role;
 use rusqlite::OptionalExtension;
@@ -243,6 +244,18 @@ const REINFORCE_LOOKUP_SQL: &str = "SELECT id FROM memory \
      ORDER BY created_at ASC LIMIT 1";
 
 impl MemoryStore {
+    /// [`MemoryStore::reinforce_noting`] with nothing to note.
+    pub(crate) async fn reinforce_if_duplicate(
+        &self,
+        agent_id: &str,
+        project_id: Option<&str>,
+        content_hash: &str,
+        derived_from: &[i64],
+        now_ms: u64,
+    ) -> Result<Option<i64>, MemoryStoreError> {
+        self.reinforce_noting(agent_id, project_id, content_hash, derived_from, now_ms, |_| None).await
+    }
+
     /// Reinforces the existing active row matching `(agent_id,
     /// COALESCE(project_id,''), content_hash)`, if any: `access_count += 1`,
     /// `last_accessed_at = MAX(last_accessed_at, now_ms)`, `tier` recomputed
@@ -277,13 +290,17 @@ impl MemoryStore {
     /// `disputed_against`; (ii) a migration swapping the index for a real
     /// `UNIQUE` one; (iii) catching `SQLITE_CONSTRAINT_UNIQUE` on insert and
     /// falling back to this method.
-    pub(crate) async fn reinforce_if_duplicate(
+    ///
+    /// On a hit it also writes the outbox progress `note(id)` names, in the
+    /// same transaction, so a replay never reinforces the row a second time.
+    pub(crate) async fn reinforce_noting(
         &self,
         agent_id: &str,
         project_id: Option<&str>,
         content_hash: &str,
         derived_from: &[i64],
         now_ms: u64,
+        note: impl FnOnce(i64) -> Option<OutboxNote> + Send + 'static,
     ) -> Result<Option<i64>, MemoryStoreError> {
         let agent_id = agent_id.to_string();
         let project_id = project_id.map(str::to_string);
@@ -316,6 +333,9 @@ impl MemoryStore {
                     rusqlite::params![id, now],
                 )?;
                 link_sources(&tx, id, &derived_from, now)?;
+                if let Some(note) = note(id) {
+                    apply_note(&tx, &note)?;
+                }
 
                 tx.commit()?;
                 Ok(Some(id))
@@ -328,6 +348,18 @@ impl MemoryStore {
         &self,
         record: NewMemoryRecord,
         embedding: Vec<f32>,
+    ) -> Result<i64, MemoryStoreError> {
+        self.insert_noting(record, embedding, |_| None).await
+    }
+
+    /// [`MemoryStore::insert_memory_with_vector`] that writes the outbox
+    /// progress `note(id)` names in the same transaction as the row, so a
+    /// process that dies after it leaves both or neither.
+    pub(crate) async fn insert_noting(
+        &self,
+        record: NewMemoryRecord,
+        embedding: Vec<f32>,
+        note: impl FnOnce(i64) -> Option<OutboxNote> + Send + 'static,
     ) -> Result<i64, MemoryStoreError> {
         let unit = to_unit(&embedding)
             .map_err(|e| MemoryStoreError::InvalidEmbedding { reason: e.to_string() })?;
@@ -394,6 +426,9 @@ impl MemoryStore {
                     rusqlite::params![id, bytes],
                 )?;
                 link_sources(&tx, id, &record.derived_from, created_at)?;
+                if let Some(note) = note(id) {
+                    apply_note(&tx, &note)?;
+                }
                 tx.commit()?;
                 Ok(id)
             })
