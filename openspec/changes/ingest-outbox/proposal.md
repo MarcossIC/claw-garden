@@ -17,7 +17,7 @@ Detalle en la [exploración](exploration.md#problema-verificado-contra-el-códig
 
 Defaults tomados donde la exploración dejaba la pregunta abierta. La primera se preguntó en el hilo con una tarjeta; mientras Marcos no elija otra, se sigue con la recomendada.
 
-- **Durabilidad: `synchronous = NORMAL`, como el resto de la base** (tarjeta, opción recomendada). La fila del outbox sobrevive a un kill, un crash o una señal de terminar, no a un corte de luz. Un `202` queda tan protegido como un `201`, que hoy tampoco sobrevive a un corte de luz; el fsync por save no se paga ([diseño, D4](design.md#d4-durabilidad)).
+- **Durabilidad: `synchronous = FULL` para la fila del outbox** (tarjeta, elegida por Marcos). La fila sobrevive a un kill, un crash, una señal de terminar y también a un corte de luz, pagando un fsync por save aceptado; el resto de la base sigue en `NORMAL` ([diseño, D4](design.md#d4-durabilidad)).
 - **Outbox en una tabla de `memory.db`** (enfoque A). La fila se confirma antes de contestar; el worker la borra cuando termina el save, y escribe su progreso en la misma transacción que cada pieza ([D1](design.md#d1-una-tabla-en-memorydb), [D2](design.md#d2-progreso-por-pieza)).
 - **Progreso por pieza** (A.1a). Un replay retoma desde la pieza siguiente, no refuerza las ya guardadas y vincula con las cabeceras originales. Si el texto ya no da las mismas piezas (cambió el tokenizer), se cae al dedup de hoy.
 - **Se enmascara en el handler, antes de escribir la fila.** El worker conserva su pasada, que no encuentra nada nuevo; el `redacted` del `201` sale del enmascarado del handler. Reabre la decisión D2 de secret-hygiene sólo para la copia persistida ([D3](design.md#d3-enmascarar-antes-de-persistir)).

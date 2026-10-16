@@ -12,7 +12,7 @@ Un save aceptado queda en `memory.db` antes de que el daemon conteste, y termina
 
 ## R1. Aceptar es durable
 
-`POST /v1/memories` MUST escribir y confirmar la fila del outbox antes de encolar el evento y antes de responder `201` o `202`. La fila MUST guardar el texto ya enmascarado.
+`POST /v1/memories` MUST escribir y confirmar la fila del outbox antes de encolar el evento y antes de responder `201` o `202`. La fila MUST guardar el texto ya enmascarado. El commit de la fila MUST hacerse con `synchronous = FULL`, y la conexión MUST volver después a su valor.
 
 Si la cola rechaza el evento (llena o cerrada), el save MUST responder como hoy (`503 ingest_queue_full` o `500`) y MUST borrar la fila: un save rechazado no queda guardado.
 
@@ -32,7 +32,7 @@ Si la cola rechaza el evento (llena o cerrada), el save MUST responder como hoy 
 - WHEN se guardan 3 textos
 - THEN el tercero responde `503 ingest_queue_full` y el outbox tiene 2 filas
 
-**Tests:** `a_save_accepted_while_the_model_loads_survives_a_process_that_dies` (`crates/clawg-core/tests/shutdown.rs`); `a_save_accepted_while_the_model_loads_is_in_the_outbox_before_the_answer`, `an_unconfirmed_save_is_in_the_outbox` y `a_save_into_a_full_queue_leaves_no_outbox_row` (`crates/clawg-cli/tests/api.rs`); `accept_writes_the_row_before_it_queues_the_event` y `a_refused_event_leaves_no_row` (`crates/clawg-core/src/runtime.rs`).
+**Tests:** `a_save_accepted_while_the_model_loads_survives_a_process_that_dies` (`crates/clawg-core/tests/shutdown.rs`); `a_save_accepted_while_the_model_loads_is_in_the_outbox_before_the_answer`, `an_unconfirmed_save_is_in_the_outbox` y `a_save_into_a_full_queue_leaves_no_outbox_row` (`crates/clawg-cli/tests/api.rs`); `accept_writes_the_row_before_it_queues_the_event` y `a_refused_event_leaves_no_row` (`crates/clawg-core/src/runtime.rs`); `durably_writes_under_full_and_puts_the_setting_back` y `recording_a_row_leaves_the_store_on_normal` (`outbox.rs`).
 
 ## R2. Terminar borra la fila con lo que escribió
 
