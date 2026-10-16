@@ -97,6 +97,8 @@ cargo clippy --workspace --all-targets -- -A clippy::all -D warnings
 
 What the model sees of the MCP server (each tool's name, description and input schema, and the instructions) is pinned in `crates/clawg-cli/src/mcp/agent_contract.json`. When a change to it is intended, run `CLAWG_BLESS=1 cargo test -p clawg-cli the_agent_contract_matches_its_file`: it rewrites the file and fails, so review the diff and run the tests again. The `MCP tools` line above is checked against the registered tools.
 
+A ranking change is compared with the baseline by `cargo run -p clawg-eval --bin rag-eval -- --diff <before.json> <after.json>`. Every metric carries the exact paired p-value of the cases that moved (and MRR, nDCG and tokens a bootstrap interval of the mean change); the primary metrics are `recall@5` and, between two `--agent-view` runs, `search.found`. With the 46-case set a conclusion needs at least 6 cases moving one way; fewer is "not distinguishable", never "no difference". `--fail-on-regression` exits 6 when a primary metric gets worse at p < 0.05. Choose a new constant reading `by_split.calibration` and report `by_split.test`; `--lexical-only` gives the bm25-only floor to compare against.
+
 ## Claude Code
 
 - Prefer `rg` for searching and the Read/Edit/Write tools over shell text utilities.
