@@ -83,6 +83,9 @@ pub struct CaseResult {
     /// still reads back in `--diff`.
     #[serde(default)]
     pub subset: CaseSubset,
+    /// Only on `unanswerable` cases: the search returned nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abstained: Option<bool>,
 }
 
 /// Retrieval quality restricted to the cases of one language. The embedding
@@ -190,6 +193,14 @@ pub struct RetrievalResults {
     /// `aggregate` — a structural impossibility (a row seeded at a tier the
     /// KNN pool never scans) must not be misread as a ranking regression.
     pub blocked: Vec<CaseResult>,
+    /// `unanswerable` cases, kept apart like `blocked`: with nothing to find,
+    /// a ranked metric could only count them as misses.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unanswerable: Vec<CaseResult>,
+    /// Share of `unanswerable` cases whose search returned nothing. Absent
+    /// when the set has none, so no file reads as having measured it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abstention: Option<Rate>,
 }
 
 /// The threshold sweep restricted to the pairs of one language. A distance
@@ -413,7 +424,10 @@ pub struct RunResults {
 impl RetrievalResults {
     /// Scores the active cases and keeps the blocked ones beside them, every
     /// split computed from the same `per_case`.
-    pub fn from_cases(per_case: Vec<CaseResult>, blocked: Vec<CaseResult>) -> Self {
+    pub fn from_cases(per_case: Vec<CaseResult>, blocked: Vec<CaseResult>, unanswerable: Vec<CaseResult>) -> Self {
+        let abstention = (!unanswerable.is_empty()).then(|| {
+            Rate::of(unanswerable.iter().filter(|c| c.abstained == Some(true)).count(), unanswerable.len())
+        });
         Self {
             aggregate: aggregate(&per_case),
             hits: hits(&per_case),
@@ -422,12 +436,14 @@ impl RetrievalResults {
             by_split: aggregate_by_split(&per_case),
             per_case,
             blocked,
+            unanswerable,
+            abstention,
         }
     }
 }
 
 /// A count of cases out of `n_cases` and its 95 % Wilson interval.
-#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct Rate {
     pub hits: usize,
     pub n_cases: usize,
@@ -783,6 +799,12 @@ pub fn print_stdout(results: &RunResults) {
             );
         }
     }
+    if let Some(a) = &results.retrieval.abstention {
+        println!(
+            "  abstention (unanswerable cases with an empty result): {}/{} = {:.4} [{:.3}, {:.3}]",
+            a.hits, a.n_cases, a.rate, a.lo, a.hi
+        );
+    }
     if !results.retrieval.blocked.is_empty() {
         println!(
             "  blocked (known_red, excluded from aggregate, n={}):",
@@ -896,6 +918,7 @@ mod tests {
             status,
             lang: None,
             subset: CaseSubset::Natural,
+            abstained: None,
         }
     }
 
@@ -924,7 +947,7 @@ mod tests {
         let r = hits(&cases).at_5.strict;
         assert_eq!((r.hits, r.n_cases), (36, 46));
         assert!((r.lo - 0.644).abs() < 0.001 && (r.hi - 0.877).abs() < 0.001, "{r:?}");
-        let lang = &RetrievalResults::from_cases(cases.clone(), vec![]).by_subset[0];
+        let lang = &RetrievalResults::from_cases(cases.clone(), vec![], vec![]).by_subset[0];
         assert_eq!(lang.hits.at_5.strict, r, "every split block carries its own hits");
     }
 
@@ -964,13 +987,27 @@ mod tests {
     #[test]
     fn every_split_block_carries_its_hits() {
         let cases: Vec<CaseResult> = queries(0..30).iter().map(|q| multi(q, 0.5)).collect();
-        let results = RetrievalResults::from_cases(cases, vec![]);
+        let results = RetrievalResults::from_cases(cases, vec![], vec![]);
         for s in &results.by_split {
             assert_eq!(s.hits.at_5.partial.hits, s.n_cases);
             assert_eq!(s.hits.at_5.strict.hits, 0);
         }
         assert_eq!(results.by_subset[0].hits.at_5.partial.hits, 30);
         assert_eq!(results.hits.at_5.partial.n_cases, 30);
+    }
+
+    #[test]
+    fn abstention_is_absent_without_unanswerable_cases() {
+        let results = RetrievalResults::from_cases(vec![case("q", 1.0, CaseStatus::Active)], vec![], vec![]);
+        assert_eq!(results.abstention, None);
+        let json = serde_json::to_value(&results).unwrap();
+        assert!(json.get("abstention").is_none() && json.get("unanswerable").is_none(), "{json}");
+
+        let none = CaseResult { abstained: Some(false), subset: CaseSubset::Unanswerable, ..case("u1", 0.0, CaseStatus::Active) };
+        let some = CaseResult { abstained: Some(true), ..none.clone() };
+        let results = RetrievalResults::from_cases(vec![], vec![], vec![none, some]);
+        let a = results.abstention.expect("measured");
+        assert_eq!((a.hits, a.n_cases), (1, 2));
     }
 
     #[test]
@@ -1172,7 +1209,7 @@ mod tests {
             scoring_config: EvalScoringConfig::default(),
             known_bugs_live: vec!["fake-embedder-unnormalized-contradiction-sweep-degenerate".to_string()],
             golden_set: GoldenSetProvenance::derive(1, 0, "h".to_string()),
-            retrieval: RetrievalResults::from_cases(vec![], vec![]),
+            retrieval: RetrievalResults::from_cases(vec![], vec![], vec![]),
             contradiction: ContradictionResults { curve: vec![], by_lang: vec![] },
             norm_check: NormCheck { asserted: false, mean_norm: 11.3, max_deviation: 10.3 },
             audit: None,
@@ -1191,6 +1228,7 @@ mod tests {
             search: Default::default(),
             context: Default::default(),
             by_subset: Default::default(),
+            abstention: None,
             per_case: vec![],
         }
     }

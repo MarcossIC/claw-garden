@@ -19,7 +19,7 @@ use super::{
     answer_reachable, answer_visible, build_results, context_section_tokens, read_context, read_search, AgentViewResults,
     AnswerView, CaseView, ContextOutcome, SearchOutcome,
 };
-use crate::golden::GoldenSet;
+use crate::golden::{CaseSubset, GoldenSet};
 use crate::seed::AGENT_ID;
 
 #[derive(Debug, thiserror::Error)]
@@ -137,6 +137,7 @@ async fn answer_cases(
         let count_tokens = |line: &str| input.counter.count(line);
         let search_read = read_search(&search_text, &count_tokens, &case.expected_refs, corpus)
             .map_err(|source| RunError::Parse { query: case.query.clone(), source })?;
+        let search_lines_printed = search_read.lines.len();
 
         let started = Instant::now();
         let prompt = session.client.context(&case.query, AGENT_ID, None).await?.prompt;
@@ -189,6 +190,7 @@ async fn answer_cases(
             },
             subset: case.subset,
             answer,
+            abstained: (case.subset == CaseSubset::Unanswerable).then_some(search_lines_printed == 0),
         });
     }
     Ok(views)

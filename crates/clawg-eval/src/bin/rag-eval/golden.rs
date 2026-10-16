@@ -90,6 +90,9 @@ pub enum CaseSubset {
     HighImportance,
     LowImportance,
     Long,
+    /// No row answers the query: what is measured is whether the search
+    /// returns nothing, so the case stays out of every ranked metric.
+    Unanswerable,
 }
 
 impl CaseSubset {
@@ -103,6 +106,7 @@ impl CaseSubset {
             Self::HighImportance => "high_importance",
             Self::LowImportance => "low_importance",
             Self::Long => "long",
+            Self::Unanswerable => "unanswerable",
         }
     }
 }
@@ -213,6 +217,12 @@ pub enum GoldenError {
 
     #[error("E_MISSING_BLOCKED_BY: retrieval_case '{0}' is marked known_red but has no blocked_by")]
     MissingBlockedBy(String),
+
+    #[error("E_NO_EXPECTED: retrieval_case '{0}' expects no row; only an unanswerable case may")]
+    NoExpected(String),
+
+    #[error("E_UNANSWERABLE_EXPECTS: retrieval_case '{0}' is unanswerable but lists expected_refs")]
+    UnanswerableExpects(String),
 }
 
 /// A validated golden set paired with the SHA-256 of the exact bytes it was
@@ -294,6 +304,15 @@ pub fn validate(golden: &GoldenSet) -> Result<(), GoldenError> {
             }
         }
 
+        // `recall_at_k` scores an empty expectation as a total miss, so a case
+        // without one would drag every aggregate down; only the class that
+        // stays out of them may have it.
+        match (case.subset == CaseSubset::Unanswerable, case.expected_refs.is_empty()) {
+            (true, false) => return Err(GoldenError::UnanswerableExpects(case.query.clone())),
+            (false, true) => return Err(GoldenError::NoExpected(case.query.clone())),
+            _ => {}
+        }
+
         if case.status == CaseStatus::KnownRed && case.blocked_by.is_none() {
             return Err(GoldenError::MissingBlockedBy(case.query.clone()));
         }
@@ -322,6 +341,29 @@ mod tests {
 
     fn parse_only(raw: &str) -> GoldenSet {
         serde_json::from_str(raw).expect("fixture must parse")
+    }
+
+    // --- unanswerable cases ----------------------------------------------
+
+    fn with_case(case: &str) -> GoldenSet {
+        parse_only(&VALID_MINIMAL.replace(
+            r#"{"query": "q1", "corpus_refs": ["c1"], "expected_refs": ["c1"]}"#,
+            case,
+        ))
+    }
+
+    #[test]
+    fn an_unanswerable_case_must_expect_nothing() {
+        let ok = with_case(r#"{"query": "q1", "corpus_refs": ["c1"], "expected_refs": [], "subset": "unanswerable"}"#);
+        assert!(validate(&ok).is_ok());
+        let bad = with_case(r#"{"query": "q1", "corpus_refs": ["c1"], "expected_refs": ["c1"], "subset": "unanswerable"}"#);
+        assert!(matches!(validate(&bad), Err(GoldenError::UnanswerableExpects(q)) if q == "q1"));
+    }
+
+    #[test]
+    fn only_an_unanswerable_case_may_expect_nothing() {
+        let bad = with_case(r#"{"query": "q1", "corpus_refs": ["c1"], "expected_refs": []}"#);
+        assert!(matches!(validate(&bad), Err(GoldenError::NoExpected(q)) if q == "q1"));
     }
 
     // --- valid file ------------------------------------------------------

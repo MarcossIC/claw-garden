@@ -493,6 +493,7 @@ mod tests {
             status: CaseStatus::Active,
             lang: None,
             subset: crate::golden::CaseSubset::Natural,
+            abstained: None,
         }
     }
 

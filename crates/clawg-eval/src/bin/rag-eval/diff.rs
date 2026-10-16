@@ -89,6 +89,8 @@ pub struct AgentViewDiff {
     pub context_found: MetricDiff,
     pub search_tokens: MetricDiff,
     pub context_tokens: MetricDiff,
+    /// Over `unanswerable` cases only, which stay out of the two `found` rows.
+    pub search_abstained: MetricDiff,
 }
 
 /// The whole paired diff: `retrieval` and `similarity`, computed the same
@@ -99,6 +101,8 @@ pub struct RunDiff {
     pub retrieval: BlockDiff,
     pub similarity: BlockDiff,
     pub agent_view: Option<AgentViewDiff>,
+    /// `retrieval.unanswerable[].abstained`, when both files have such cases.
+    pub abstention: Option<MetricDiff>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -115,7 +119,7 @@ pub enum DiffError {
         #[source]
         source: serde_json::Error,
     },
-    #[error("'{block}.per_case' in '{}' is not a valid case array: {source}", path.display())]
+    #[error("'{block}' in '{}' is not a valid case array: {source}", path.display())]
     Cases {
         path: std::path::PathBuf,
         block: &'static str,
@@ -140,7 +144,7 @@ fn read_json(path: &Path) -> Result<Value, DiffError> {
     serde_json::from_str(&text).map_err(|e| DiffError::Parse { path: path.to_path_buf(), source: e })
 }
 
-/// Extracts `value[block]["per_case"]` as `Vec<CaseResult>`. Absent
+/// Extracts the case array at `block` (`retrieval.per_case`, …) as `Vec<CaseResult>`. Absent
 /// (`value[block]` missing, e.g. `similarity` under a `--fake` run) is not an
 /// error — it degrades to an empty case list, the same way an empty slice
 /// degrades every other aggregator in this harness (see
@@ -148,9 +152,20 @@ fn read_json(path: &Path) -> Result<Value, DiffError> {
 /// block IS an error: that is a results file this tool cannot honestly
 /// compare, not a block that was never computed.
 fn per_case(value: &Value, path: &Path, block: &'static str) -> Result<Vec<CaseResult>, DiffError> {
-    match value.pointer(&format!("/{block}/per_case")) {
-        None => Ok(Vec::new()),
+    Ok(cases_at(value, path, block)?.unwrap_or_default())
+}
+
+/// The case array at `block` (a dotted path such as `retrieval.per_case`), or
+/// `None` when the file has no such key.
+fn cases_at<T: serde::de::DeserializeOwned>(
+    value: &Value,
+    path: &Path,
+    block: &'static str,
+) -> Result<Option<Vec<T>>, DiffError> {
+    match value.pointer(&format!("/{}", block.replace('.', "/"))) {
+        None => Ok(None),
         Some(cases) => serde_json::from_value(cases.clone())
+            .map(Some)
             .map_err(|e| DiffError::Cases { path: path.to_path_buf(), block, source: e }),
     }
 }
@@ -159,12 +174,7 @@ fn per_case(value: &Value, path: &Path, block: &'static str) -> Result<Vec<CaseR
 /// the agent receives. Same rule as [`per_case`] otherwise: present but
 /// malformed is an error.
 fn agent_view_cases(value: &Value, path: &Path) -> Result<Option<Vec<CaseView>>, DiffError> {
-    match value.pointer("/agent_view/per_case") {
-        None => Ok(None),
-        Some(cases) => serde_json::from_value(cases.clone())
-            .map(Some)
-            .map_err(|e| DiffError::Cases { path: path.to_path_buf(), block: "agent_view", source: e }),
-    }
+    cases_at(value, path, "agent_view.per_case")
 }
 
 /// The pure join-and-diff: two already-parsed results values, diffed on
@@ -172,11 +182,15 @@ fn agent_view_cases(value: &Value, path: &Path) -> Result<Option<Vec<CaseView>>,
 /// `b_path` are used only to label a [`DiffError::Cases`] with which file was
 /// malformed; they carry no meaning for the comparison itself.
 pub fn diff_values(a: &Value, a_path: &Path, b: &Value, b_path: &Path) -> Result<RunDiff, DiffError> {
-    let a_retrieval = per_case(a, a_path, "retrieval")?;
-    let b_retrieval = per_case(b, b_path, "retrieval")?;
-    let a_similarity = per_case(a, a_path, "similarity")?;
-    let b_similarity = per_case(b, b_path, "similarity")?;
+    let a_retrieval = per_case(a, a_path, "retrieval.per_case")?;
+    let b_retrieval = per_case(b, b_path, "retrieval.per_case")?;
+    let a_similarity = per_case(a, a_path, "similarity.per_case")?;
+    let b_similarity = per_case(b, b_path, "similarity.per_case")?;
 
+    let abstention = match (unanswerable_cases(a, a_path)?, unanswerable_cases(b, b_path)?) {
+        (Some(a_cases), Some(b_cases)) => Some(diff_abstention(&a_cases, &b_cases)),
+        _ => None,
+    };
     let agent_view = match (agent_view_cases(a, a_path)?, agent_view_cases(b, b_path)?) {
         (Some(a_cases), Some(b_cases)) => Some(diff_agent_view(&a_cases, &b_cases)),
         _ => None,
@@ -186,7 +200,31 @@ pub fn diff_values(a: &Value, a_path: &Path, b: &Value, b_path: &Path) -> Result
         retrieval: diff_block(&a_retrieval, &b_retrieval),
         similarity: diff_block(&a_similarity, &b_similarity),
         agent_view,
+        abstention,
     })
+}
+
+/// `value.retrieval.unanswerable`, or `None` when the set had no such case.
+fn unanswerable_cases(value: &Value, path: &Path) -> Result<Option<Vec<CaseResult>>, DiffError> {
+    cases_at(value, path, "retrieval.unanswerable")
+}
+
+fn flag(f: bool) -> f64 {
+    if f {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+fn diff_abstention(a: &[CaseResult], b: &[CaseResult]) -> MetricDiff {
+    let b_by_query: HashMap<&str, &CaseResult> = b.iter().map(|c| (c.query.as_str(), c)).collect();
+    let mut m = MetricDiff::default();
+    for a_case in a {
+        let Some(b_case) = b_by_query.get(a_case.query.as_str()) else { continue };
+        accumulate(&mut m, flag(a_case.abstained == Some(true)), flag(b_case.abstained == Some(true)));
+    }
+    m
 }
 
 /// Joins the active cases of two agent-view runs on `query`. `known_red`
@@ -200,9 +238,13 @@ fn diff_agent_view(a: &[CaseView], b: &[CaseView]) -> AgentViewDiff {
     let mut context_tokens = Vec::new();
     for a_case in a.iter().filter(|c| c.status == CaseStatus::Active) {
         let Some(b_case) = b_by_query.get(a_case.query.as_str()) else { continue };
-        let found = |f: bool| if f { 1.0 } else { 0.0 };
-        accumulate(&mut diff.search_found, found(a_case.search.found), found(b_case.search.found));
-        accumulate(&mut diff.context_found, found(a_case.context.found), found(b_case.context.found));
+        if a_case.abstained.is_some() || b_case.abstained.is_some() {
+            let abstained = |c: &CaseView| flag(c.abstained == Some(true));
+            accumulate(&mut diff.search_abstained, abstained(a_case), abstained(b_case));
+        } else {
+            accumulate(&mut diff.search_found, flag(a_case.search.found), flag(b_case.search.found));
+            accumulate(&mut diff.context_found, flag(a_case.context.found), flag(b_case.context.found));
+        }
         let (a_s, b_s) = (a_case.search.tokens as f64, b_case.search.tokens as f64);
         let (a_c, b_c) = (a_case.context.tokens as f64, b_case.context.tokens as f64);
         accumulate(&mut diff.search_tokens, -a_s, -b_s);
@@ -276,6 +318,13 @@ pub fn print_stdout(diff: &RunDiff) {
         print_metric("context.found", &av.context_found);
         print_metric("search.tokens", &av.search_tokens);
         print_metric("context.tokens", &av.context_tokens);
+        if av.search_abstained.better + av.search_abstained.worse > 0 {
+            print_metric("search.abstain", &av.search_abstained);
+        }
+    }
+    if let Some(m) = &diff.abstention {
+        println!("  unanswerable (the search returned nothing):");
+        print_metric("abstained", m);
     }
     println!("  primary:");
     println!("    {}", verdict("retrieval recall@5", &diff.retrieval.recall_5));
@@ -484,6 +533,37 @@ mod tests {
         let diff = diff_values(&a, &path, &b, &path).expect("an older file must still diff");
         assert_eq!(diff.agent_view, None);
         assert_eq!(diff_values(&a, &path, &a, &path).expect("self-diff").agent_view, None);
+    }
+
+    #[test]
+    fn abstention_is_diffed_when_both_files_have_it() {
+        let unanswerable = |query: &str, abstained: bool| {
+            serde_json::json!({
+                "query": query, "expected_refs": [], "ranked_refs": [], "recall@1": 0.0, "recall@5": 0.0,
+                "recall@10": 0.0, "mrr": 0.0, "ndcg@10": 0.0, "status": "active", "lang": null,
+                "subset": "unanswerable", "abstained": abstained
+            })
+        };
+        let file = |abstained: bool| {
+            serde_json::json!({ "retrieval": { "per_case": [], "unanswerable": [unanswerable("u1", abstained), unanswerable("u2", false)] } })
+        };
+        let path = reference_results_path();
+
+        let diff = diff_values(&file(false), &path, &file(true), &path).expect("diffing must succeed");
+        let m = diff.abstention.expect("both files have unanswerable cases");
+        assert_eq!((m.better, m.worse), (1, 0));
+        assert_eq!(diff_values(&reference_value(), &path, &file(true), &path).unwrap().abstention, None);
+
+        let mut a_view = view("u1", "active", false, 50, false);
+        a_view["abstained"] = serde_json::json!(false);
+        let mut b_view = a_view.clone();
+        b_view["abstained"] = serde_json::json!(true);
+        let av = diff_values(&agent_view_file(vec![a_view]), &path, &agent_view_file(vec![b_view]), &path)
+            .unwrap()
+            .agent_view
+            .unwrap();
+        assert_eq!((av.search_abstained.better, av.search_abstained.worse), (1, 0));
+        assert_eq!(av.search_found.better + av.search_found.worse, 0, "an unanswerable case has no found to move");
     }
 
     #[test]

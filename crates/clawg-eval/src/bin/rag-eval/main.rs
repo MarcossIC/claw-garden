@@ -254,7 +254,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
     let similarity_results = if cli.mode == cli::Mode::Real {
         let sim_sources: Vec<SimCaseSource> = embedded_cases
             .iter()
-            .filter(|c| c.status != CaseStatus::KnownRed)
+            .filter(|c| c.status != CaseStatus::KnownRed && c.subset != CaseSubset::Unanswerable)
             .map(|c| SimCaseSource {
                 query: c.query.clone(),
                 expected_refs: c.expected_refs.clone(),
@@ -409,6 +409,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
 
         let mut per_case = Vec::new();
         let mut blocked = Vec::new();
+        let mut unanswerable = Vec::new();
         for ec in &embedded_cases {
             let hits = match seeded
                 .store
@@ -434,6 +435,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             let mrr = metrics::mrr_contribution(&ranked_refs, &expected);
             let ndcg_10 = metrics::ndcg_at_10(&ranked_refs, &expected);
 
+            let abstained = (ec.subset == CaseSubset::Unanswerable).then_some(ranked_refs.is_empty());
             let result = report::CaseResult {
                 query: ec.query.clone(),
                 expected_refs: ec.expected_refs.clone(),
@@ -446,9 +448,12 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
                 status: ec.status,
                 lang: ec.lang.clone(),
                 subset: ec.subset,
+                abstained,
             };
 
-            if ec.status == CaseStatus::KnownRed {
+            if abstained.is_some() {
+                unanswerable.push(result);
+            } else if ec.status == CaseStatus::KnownRed {
                 // The concrete, code-free signal that the tier-1 exclusion
                 // this case is blocked on has been lifted: a case that
                 // structurally could not score now scores.
@@ -461,7 +466,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             }
         }
 
-        let retrieval = report::RetrievalResults::from_cases(per_case, blocked);
+        let retrieval = report::RetrievalResults::from_cases(per_case, blocked, unanswerable);
         let aggregate = retrieval.aggregate;
         let per_case = &retrieval.per_case;
         // Computed unconditionally, not gated behind `cli.audit`: a sweep's
@@ -663,7 +668,7 @@ fn build_agent_view_run_results(
             loaded_golden.content_sha256.clone(),
         ),
         scoring_config: EvalScoringConfig::default(),
-        retrieval: report::RetrievalResults::from_cases(vec![], vec![]),
+        retrieval: report::RetrievalResults::from_cases(vec![], vec![], vec![]),
         contradiction: report::ContradictionResults { curve: vec![], by_lang: vec![] },
         norm_check: report::NormCheck { asserted: false, mean_norm: 0.0, max_deviation: 0.0 },
         audit: None,
@@ -734,7 +739,7 @@ async fn run_follow_up(ctx: FollowUpRunContext<'_>) -> i32 {
         .golden_set
         .retrieval_cases
         .iter()
-        .filter(|c| c.status == CaseStatus::Active)
+        .filter(|c| c.status == CaseStatus::Active && c.subset != CaseSubset::Unanswerable)
         .collect();
     let n_active = active_cases.len();
 
@@ -852,6 +857,7 @@ async fn score_follow_up_arm<'a>(
             status: case.status,
             lang: case_lang(&case.expected_refs, ctx.lang_by_ref),
             subset: case.subset,
+            abstained: None,
         });
     }
     Ok(per_case)
@@ -881,7 +887,7 @@ fn build_follow_up_run_results(
         known_bugs_live: ctx.known_bugs.clone(),
         golden_set: ctx.golden_provenance.clone(),
         scoring_config: EvalScoringConfig::default(),
-        retrieval: report::RetrievalResults::from_cases(per_case, vec![]),
+        retrieval: report::RetrievalResults::from_cases(per_case, vec![], vec![]),
         contradiction: report::ContradictionResults {
             curve: ctx.contradiction_curve.clone(),
             by_lang: ctx.contradiction_curve_by_lang.clone(),
@@ -1129,6 +1135,7 @@ fn build_similarity_results(
             status: CaseStatus::Active,
             lang: src.lang.clone(),
             subset: src.subset,
+            abstained: None,
         });
 
         // Query-anchored rivals: every OTHER corpus vector, not just this
@@ -1305,6 +1312,65 @@ mod tests {
 
     fn temp_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("rag-eval-main-test-{tag}-{}", uuid::Uuid::new_v4()))
+    }
+
+    /// Runs `--fake` on `golden_json` under `tag` and returns the results file.
+    async fn run_fake(golden_json: &str, tag: &str) -> serde_json::Value {
+        let golden_path = temp_path(&format!("{tag}-golden.json"));
+        std::fs::write(&golden_path, golden_json).expect("write golden fixture");
+        let out_dir = temp_path(&format!("{tag}-out"));
+        let args = [
+            "rag-eval",
+            "--fake",
+            "--golden",
+            &golden_path.to_string_lossy(),
+            "--out",
+            &out_dir.to_string_lossy(),
+            "--tag",
+            tag,
+        ]
+        .map(str::to_string);
+        assert_eq!(run(args.into_iter()).await, EXIT_OK);
+        let results = read_results(&out_dir, tag);
+        std::fs::remove_file(&golden_path).ok();
+        std::fs::remove_dir_all(&out_dir).ok();
+        results
+    }
+
+    fn with_extra_case(golden: &str, case: &str) -> String {
+        golden.replacen(r#""retrieval_cases": ["#, &format!(r#""retrieval_cases": [{case},"#), 1)
+    }
+
+    #[tokio::test]
+    async fn a_golden_without_the_new_classes_measures_exactly_as_before() {
+        let json = run_fake(sweep_golden_json(), "plain").await;
+        let retrieval = &json["retrieval"];
+        for key in ["unanswerable", "abstention", "freshness"] {
+            assert!(retrieval.get(key).is_none(), "{key} must be absent: {retrieval}");
+        }
+        assert_eq!(retrieval["per_case"].as_array().unwrap().len(), 2);
+        assert_eq!(retrieval["aggregate"]["recall@1"], 1.0);
+        assert_eq!(retrieval["hits"]["at_1"]["strict"]["hits"], 2);
+        assert!(retrieval["per_case"][0].get("abstained").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unanswerable_case_stays_out_of_the_ranked_metrics_and_reports_abstention() {
+        let plain = run_fake(sweep_golden_json(), "without-unanswerable").await;
+        let golden = with_extra_case(
+            sweep_golden_json(),
+            r#"{"query": "a question nobody ever saved an answer to", "corpus_refs": ["c1"], "expected_refs": [], "subset": "unanswerable"}"#,
+        );
+        let json = run_fake(&golden, "with-unanswerable").await;
+
+        let (before, after) = (&plain["retrieval"], &json["retrieval"]);
+        assert_eq!(before["per_case"], after["per_case"]);
+        assert_eq!(before["aggregate"], after["aggregate"]);
+        let unanswerable = after["unanswerable"].as_array().expect("its own list");
+        assert_eq!(unanswerable.len(), 1);
+        assert_eq!(unanswerable[0]["abstained"], false, "the search returns rows for any query today");
+        assert_eq!(after["abstention"]["hits"], 0);
+        assert_eq!(after["abstention"]["n_cases"], 1);
     }
 
     #[tokio::test]
