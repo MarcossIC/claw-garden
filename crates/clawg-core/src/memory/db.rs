@@ -655,7 +655,7 @@ mod tests {
 
         let after = conn.call(snapshot).await.unwrap();
         assert_eq!(before, after);
-        assert_eq!(after.0, 12);
+        assert_eq!(after.0, 13);
     }
 
     /// Rows written before `project` existed keep their project ids when the
@@ -866,6 +866,75 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(index, (0, 0, 0, 0));
+    }
+
+    /// Every root registered before the daemon asked whether it may read a
+    /// project's files was one the user chose by working in it, so it stays
+    /// indexable, and its index is kept as it was.
+    #[tokio::test]
+    async fn a_database_from_the_previous_version_keeps_its_projects_indexed() {
+        ensure_vec0_registered();
+        let conn = Connection::open_in_memory().await.unwrap();
+        register_udfs(&conn).await.unwrap();
+        conn.call(|c| {
+            configured(crate::memory::migrations::runner())
+                .set_target(refinery::Target::Version(12))
+                .run(c)
+        })
+        .await
+        .unwrap();
+        conn.call(|c| {
+            for (id, content) in [(1, "the daemon listens on loopback"), (2, "saves are confirmed")] {
+                c.execute(
+                    "INSERT INTO memory \
+                     (id, scope, agent_id, project_id, content, memory_type, source, \
+                      created_at, created_by_type, created_by_ref, \
+                      last_modified_at, last_accessed_at, importance, tier, status) \
+                     VALUES (?1, 'agent', 'a', 'repo-1a2b', ?2, 'semantic_fact', 'explicit', \
+                      1, 'user', 'a', 1, 1, 5.0, 2, 'active')",
+                    rusqlite::params![id, content],
+                )?;
+            }
+            c.execute("INSERT INTO project VALUES ('repo-1a2b', '/work/repo', 1)", [])?;
+            c.execute("INSERT INTO project VALUES ('web-3c4d', '/work/web', 2)", [])?;
+            c.execute(
+                "INSERT INTO project_doc_file VALUES ('repo-1a2b', 'README.md', 'abc', 'model', 1, 1)",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO project_doc_chunk (id, project_id, path, ordinal, breadcrumb, body) \
+                 VALUES (1, 'repo-1a2b', 'README.md', 0, 'README.md', 'How the repo is laid out.')",
+                [],
+            )?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+
+        let rows = |c: &mut rusqlite::Connection| -> Result<Vec<String>, rusqlite::Error> {
+            let mut stmt = c.prepare(
+                "SELECT json_array(id, project_id, content, tier, status) FROM memory \
+                 UNION ALL SELECT json_array(id, root_path, created_at) FROM project \
+                 UNION ALL SELECT json_array(project_id, path, content_hash, chunks) FROM project_doc_file \
+                 UNION ALL SELECT json_array(id, project_id, breadcrumb, body) FROM project_doc_chunk",
+            )?;
+            let rows = stmt.query_map([], |r| r.get(0))?.collect();
+            rows
+        };
+        let before = conn.call(rows).await.unwrap();
+
+        run_migrations(&conn).await.unwrap();
+
+        assert_eq!(conn.call(rows).await.unwrap(), before);
+        let marks: Vec<(String, i64)> = conn
+            .call(|c| {
+                let mut stmt = c.prepare("SELECT id, index_docs FROM project ORDER BY id")?;
+                let marks = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect();
+                marks
+            })
+            .await
+            .unwrap();
+        assert_eq!(marks, vec![("repo-1a2b".to_string(), 1), ("web-3c4d".to_string(), 1)]);
     }
 
     fn tamper(dir: &Path, sql: &str) {
@@ -1340,7 +1409,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 12, "Expected exactly 12 applied migrations, got {}", count);
+        assert_eq!(count, 13, "Expected exactly 13 applied migrations, got {}", count);
     }
 
     /// V8 — a fresh store records V8 as applied and carries the FTS5 lexical
@@ -1801,7 +1870,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 12);
+        assert_eq!(migration_count, 13);
     }
 
     // -----------------------------------------------------------------------
