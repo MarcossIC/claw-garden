@@ -2315,7 +2315,7 @@ mod tests {
     // ── collapse_duplicate_chunks (pure) ─────────────────────────────────────
 
     fn make_chunk(text: &str) -> Chunk {
-        Chunk { text: text.to_string(), token_count: 0 }
+        Chunk { text: text.to_string() }
     }
 
     #[test]
