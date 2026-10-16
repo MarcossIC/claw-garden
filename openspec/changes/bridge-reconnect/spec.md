@@ -29,7 +29,7 @@ Cuando una herramienta falla con una falla que se resuelve releyendo, sea al ped
 
 Repetir MUST NOT llegar dos veces al handler del daemon: sólo se repite lo que el daemon no atendió (un 401 lo corta `require_bearer` antes del handler, `crates/clawg-cli/src/daemon/api.rs:607-625`; una conexión rechazada no llegó). La única llamada del cliente con timeout MUST seguir siendo `/health` (`client.rs:505`), de modo que en una herramienta que escribe `NotRunning` sólo signifique una conexión que no se abrió.
 
-Al encontrar un daemon de otra versión que el puente, el puente SHOULD dejarlo en el log con el texto de `version_warning` (`crates/clawg-cli/src/memories.rs:332`). No MUST cambiar lo que contesta la herramienta.
+Al encontrar un daemon releyendo, el puente SHOULD dejar en el log su dirección, la versión del daemon y la propia, y MUST NOT cambiar por eso lo que contesta la herramienta. `version_warning` (`crates/clawg-cli/src/memories.rs:332`) no sirve acá: aconseja `clawg stop`, y después de una actualización el viejo es el puente, no el daemon.
 
 #### Escenario: el daemon se reinició
 - GIVEN un puente contra el daemon A, con su puerto y su token
@@ -61,7 +61,7 @@ Cuando el arranque en segundo plano del puente terminó en `StartTimeout`, o tod
 - WHEN el agente llama a `memory_status`
 - THEN la respuesta es el estado de ese daemon, no un error
 
-**Test:** `a_daemon_that_comes_up_after_the_start_gave_up_is_used` (`mcp/startup.rs`).
+**Test:** `a_daemon_that_comes_up_after_the_start_gave_up_is_used` (`mcp/server.rs`).
 
 ## R4. Textos de falla
 
@@ -98,6 +98,6 @@ Un registro de proyecto (`POST /v1/projects`, `project_for` en `mcp/server.rs`) 
 #### Escenario
 - GIVEN un puente contra el daemon A que se detuvo, y el daemon B arrancado
 - WHEN el agente llama a `memory_status`
-- THEN la respuesta muestra el pid de B
+- THEN la respuesta es el estado de B, no un error
 
 **Test:** `memory_status_after_a_restart_reports_the_new_daemon` (`mcp/server.rs`).
