@@ -9,6 +9,7 @@ mod metrics;
 mod report;
 mod seed;
 mod similarity;
+mod stats;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;

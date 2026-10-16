@@ -26,6 +26,33 @@ pub struct MetricDiff {
     pub net: i64,
 }
 
+impl MetricDiff {
+    /// Exact paired p-value of this movement: how likely a split at least
+    /// this lopsided is if neither run is better.
+    pub fn p_value(&self) -> f64 {
+        crate::stats::mcnemar_exact(self.better, self.worse)
+    }
+}
+
+/// How a primary metric's movement reads at `stats::ALPHA`. A movement that
+/// does not reach it says how many one-way cases would have, and never that
+/// the runs are the same: with a few dozen cases, "not distinguishable" is all
+/// the data can say.
+pub fn verdict(name: &str, m: &MetricDiff) -> String {
+    let p = m.p_value();
+    let moved = m.better + m.worse;
+    if p < crate::stats::ALPHA {
+        let direction = if m.better > m.worse { "better" } else { "worse" };
+        format!("{name}: distinguishable, {direction} (p = {p:.4}, {} better / {} worse)", m.better, m.worse)
+    } else {
+        format!(
+            "{name}: not distinguishable with {moved} case(s) moving (p = {p:.4}); \
+             a conclusion needs at least {} cases moving one way",
+            crate::stats::min_one_way_significant()
+        )
+    }
+}
+
 /// The five per-case metrics' movement for one block (`retrieval` or
 /// `similarity`), each scored independently — a case can improve on `mrr`
 /// while regressing on `recall@1` in the same run, and collapsing the five
@@ -161,11 +188,13 @@ pub fn print_stdout(diff: &RunDiff) {
     println!("rag-eval diff");
     print_block("retrieval", &diff.retrieval);
     print_block("similarity", &diff.similarity);
+    println!("  primary:");
+    println!("    {}", verdict("retrieval recall@5", &diff.retrieval.recall_5));
 }
 
 fn print_block(name: &str, block: &BlockDiff) {
     println!("  {name}:");
-    println!("    metric      better  worse     net");
+    println!("    metric      better  worse     net       p");
     print_metric("recall@1", &block.recall_1);
     print_metric("recall@5", &block.recall_5);
     print_metric("recall@10", &block.recall_10);
@@ -174,7 +203,7 @@ fn print_block(name: &str, block: &BlockDiff) {
 }
 
 fn print_metric(name: &str, m: &MetricDiff) {
-    println!("    {:<10}  {:>6}  {:>5}  {:>6}", name, m.better, m.worse, m.net);
+    println!("    {:<10}  {:>6}  {:>5}  {:>6}  {:>6.4}", name, m.better, m.worse, m.net, m.p_value());
 }
 
 #[cfg(test)]
@@ -217,6 +246,39 @@ mod tests {
             assert_eq!(m.better, 0, "{label}.{metric_name}.better must be 0 for a self-diff, got {m:?}");
             assert_eq!(m.worse, 0, "{label}.{metric_name}.worse must be 0 for a self-diff, got {m:?}");
             assert_eq!(m.net, 0, "{label}.{metric_name}.net must be 0 for a self-diff, got {m:?}");
+            assert_eq!(m.p_value(), 1.0, "{label}.{metric_name} must have p = 1 for a self-diff");
+        }
+    }
+
+    fn moved(better: usize, worse: usize) -> MetricDiff {
+        MetricDiff { better, worse, net: better as i64 - worse as i64 }
+    }
+
+    #[test]
+    fn six_one_way_improvements_are_significant() {
+        let m = moved(6, 0);
+        assert!((m.p_value() - 0.03125).abs() < 1e-9, "p = {}", m.p_value());
+        let line = verdict("retrieval recall@5", &m);
+        assert!(line.contains("distinguishable, better"), "{line}");
+        assert!(!line.contains("not distinguishable"), "{line}");
+    }
+
+    #[test]
+    fn one_improvement_is_not_distinguishable_and_says_how_many_are_needed() {
+        let m = moved(1, 0);
+        assert_eq!(m.p_value(), 1.0);
+        let line = verdict("retrieval recall@5", &m);
+        assert!(line.contains("not distinguishable with 1 case(s)"), "{line}");
+        assert!(line.contains("at least 6 cases"), "{line}");
+    }
+
+    #[test]
+    fn the_verdict_never_says_there_is_no_difference() {
+        for (b, w) in [(0, 0), (1, 0), (3, 3), (0, 6), (9, 1)] {
+            let line = verdict("m", &moved(b, w)).to_lowercase();
+            for phrase in ["no difference", "same", "equal", "unchanged"] {
+                assert!(!line.contains(phrase), "{line}");
+            }
         }
     }
 

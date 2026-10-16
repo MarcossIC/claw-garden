@@ -161,8 +161,9 @@ OPTIONS:
     --diff <a.json> <b.json>
                          Compare two existing results files' retrieval.per_case and
                          similarity.per_case, joined on query, reporting better/worse/net
-                         per metric per block. Needs neither --fake/--real nor a golden set;
-                         short-circuits like --help.
+                         and the exact paired p-value per metric per block, and whether
+                         recall@5 moved distinguishably at p < 0.05. Needs neither
+                         --fake/--real nor a golden set; short-circuits like --help.
     --follow-up          Run the synthetic Ceiling/Floor/Treatment arms instead of the
                          normal single-arm pass, measuring whether conversational context
                          helps a content-free follow-up retrieve the right document.
