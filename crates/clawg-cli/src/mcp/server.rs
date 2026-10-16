@@ -543,6 +543,8 @@ impl ClawgMcp {
     /// Each root and legacy id is sent once per process, even when the call
     /// fails: a daemon that cannot register (an older version, say) must not
     /// cost every tool call a round trip, and the scope is the same either way.
+    /// The exception is a call the daemon never got (a refused token or
+    /// connection), which is sent again.
     async fn project_for(
         &self,
         client: &DaemonClient,
@@ -561,6 +563,11 @@ impl ClawgMcp {
                 Some(project.legacy_id.clone()).filter(|l| *l != project.id).into_iter().collect();
             if let Err(e) = client.register_project(&project.root, &legacy).await {
                 log::warn!("could not register project {}: {e}", project.root.display());
+                // The daemon never saw it, so the one found after reading the
+                // files again must get it.
+                if on_failure(&e) == Next::Reresolve {
+                    registered.remove(&(project.root.clone(), project.legacy_id.clone()));
+                }
             }
         }
         Some(project.id)
@@ -2671,6 +2678,15 @@ mod tests {
 
     impl Published {
         async fn start(data_dir: &std::path::Path, token: &str) -> Self {
+            Self::start_with(data_dir, token, |app| app).await
+        }
+
+        /// [`Published::start`] with its router wrapped by `wrap` first.
+        async fn start_with(
+            data_dir: &std::path::Path,
+            token: &str,
+            wrap: impl FnOnce(axum::Router) -> axum::Router,
+        ) -> Self {
             let store = tempfile::tempdir().expect("tempdir");
             let (runtime, rx) = MemoryRuntime::new_for_test(store.path().to_path_buf()).await;
             tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
@@ -2683,7 +2699,7 @@ mod tests {
                 shutdown,
                 save_timeout: SAVE_CONFIRM_TIMEOUT,
             });
-            Self::serve(data_dir, token, router(ctx)).await.with_store(store)
+            Self::serve(data_dir, token, wrap(router(ctx))).await.with_store(store)
         }
 
         /// Serves `app` and publishes it, for a stub that is not a daemon.
@@ -2857,5 +2873,35 @@ mod tests {
         let t = text(&b.list_memories_impl("agent", list_all()).await.unwrap());
         assert!(!t.contains("delete the token file"), "{t}");
         assert!(t.contains("even after re-reading it"), "{t}");
+    }
+
+    #[tokio::test]
+    async fn a_project_registration_the_old_daemon_refused_is_sent_to_the_new_one() {
+        let data = tempfile::tempdir().expect("tempdir");
+        let registered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&registered);
+        let _daemon = Published::start_with(data.path(), "token-of-the-new-daemon", move |app| {
+            app.layer(axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let counted = Arc::clone(&counted);
+                async move {
+                    let projects = req.uri().path() == "/v1/projects";
+                    let response = next.run(req).await;
+                    if projects && response.status().is_success() {
+                        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    response
+                }
+            }))
+        })
+        .await;
+        // What a bridge holds after its daemon restarted: the right address,
+        // the old token.
+        let current = DaemonClient::from_data_dir(data.path()).expect("files");
+        let stale = DaemonClient::new(current.base_url(), "token-of-the-old-daemon", data.path().to_path_buf());
+        let b = ClawgMcp::with_project(stale, Profile::Dev, Some(test_project()));
+
+        let saved = b.save_memory_impl("agent", save_args("registered after all")).await.unwrap();
+        assert!(!is_error(&saved), "{}", text(&saved));
+        assert_eq!(registered.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
