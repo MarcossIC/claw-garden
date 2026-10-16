@@ -94,14 +94,14 @@ Las piezas puras y el cambio van en **un solo commit**. Por separado, las piezas
 - [x] `.claude/CLAUDE.md:9` dice «ONNX embeddings (fastembed)»: pasa a «ONNX embeddings (ONNX Runtime)». Lo mismo en `.cursor/rules/cursor.mdc:15` y `.gemini/GEMINI.md:9`.
 - [x] `openspec/README.md`: la fila de este cambio (línea 72; la de orden, 101, sigue valiendo) y la de `:177` («Embeddings locales con fastembed-rs», que sigue siendo un descarte: sólo se corrige el nombre de la herramienta, y su cita pasa a `model_download.rs:26`).
 - [x] `openspec/config.yaml:5` menciona «fastembed ONNX multilingual-e5-small».
-- [ ] Este cambio: `design.md` ya trae D5; completar `verify.md` con los resultados de la sección 10 cuando existan.
+- [x] Este cambio: `design.md` ya trae D5; completar `verify.md` con los resultados de la sección 10 cuando existan.
 - Commit: `docs: describe the embedding model running on ONNX Runtime with one shared tokenizer`
 
 ## 10. Verificación (cierra el cambio)
 
 - [ ] Suite y clippy en Linux sobre el último commit (`cargo test --workspace`; `cargo clippy --workspace --all-targets -- -A clippy::all -D warnings`); 1 ignorado, el de `e5_golden`.
 - [ ] El CI en verde en Linux y Windows.
-- [ ] Suite y clippy en Windows con `--target-dir <otro>` (el `clawg.exe` del editor bloquea `target`).
-- [ ] `cargo test -p clawg-core --features eval --test e5_golden -- --ignored` con `CLAWG_E5_MODEL_DIR`, en una máquina con el modelo: bits exactos si la CPU coincide con la del fixture, o diferencia máxima de 1e-6 si no, diciendo cuál; y sin la variable, falla.
-- [ ] `rag-eval --diff` con `--real` de `main` al cambio, y otra vez con `--agent-view`: ningún caso se mueve.
-- [ ] R7 en el daemon, en Windows y en Linux, siguiendo D5 «R7 sobre lo medido»: línea de base con `CLAWG_TEST_EMBEDDER=fake` y sólo `tokenizer.json`; con el modelo y `CLAWG_EMBEDDER_IDLE_MINUTES=1`, diez recargas con `POST /v1/search` (nunca `clawg memories search`); la mediana queda a no más de 64 MB de la línea de base, la de las recargas 6 a 10 no supera la de 1 a 5 en más de 16 MB, la `distance` de cada hit es igual en las diez vueltas, y el log tiene una sola línea `tokenizer.json parsed`.
+- [x] Suite y clippy en Windows con `--target-dir <otro>` (el `clawg.exe` del editor bloquea `target`).
+- [x] `cargo test -p clawg-core --features eval --test e5_golden -- --ignored` con `CLAWG_E5_MODEL_DIR`, en una máquina con el modelo: bits exactos si la CPU coincide con la del fixture, o diferencia máxima de 1e-6 si no, diciendo cuál; y sin la variable, falla.
+- [x] `rag-eval --diff` con `--real` de `main` al cambio, y otra vez con `--agent-view`: ningún caso se mueve.
+- [ ] R7 en el daemon, en Windows (hecho: [verify](verify.md#r7-en-windows)) y en Linux (falta), siguiendo D5 «R7 sobre lo medido»: línea de base con `CLAWG_TEST_EMBEDDER=fake` y sólo `tokenizer.json`; con el modelo y `CLAWG_EMBEDDER_IDLE_MINUTES=1`, diez recargas con `POST /v1/search` (nunca `clawg memories search`); la mediana queda a no más de 64 MB de la línea de base, la de las recargas 6 a 10 no supera la de 1 a 5 en más de 16 MB, la `distance` de cada hit es igual en las diez vueltas, y el log tiene una sola línea `tokenizer.json parsed`.

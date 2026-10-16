@@ -9,6 +9,6 @@ artifacts:
   design: done  # D5: un solo tokenizer por proceso
   tasks: done  # secciones 6 a 10 para D5
   apply: done  # secciones 1 a 9
-  verify: pending  # sección 10: suite, CI, test dorado, rag-eval y R7 en el daemon en Windows y Linux
+  verify: partial  # Windows: suite, clippy, test dorado, rag-eval y R7 en el daemon; faltan CI, la suite en Linux y R7 en Linux
   archive: pending
 updated: 2026-10-16

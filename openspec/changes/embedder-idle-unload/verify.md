@@ -84,6 +84,43 @@ Cada parse del tokenizer son ~1,2 millones de asignaciones chicas, y lo que deja
 
 Los 287 MB tras la primera descarga son ese tokenizer más ~20 MB. R7 pide menos de 300 MB tomando la medición de un arnés que no tiene ese tokenizer: en el daemon, en cualquier plataforma, el piso con el modelo suelto ronda los 265 MB en este build. Con el modelo cargado, el daemon tiene dos parses del mismo tokenizer.
 
+## Después de D5: un solo tokenizer
+
+Sobre `71fd1fa`, el cambio de motor (`269de1f` sólo suma docs), el 2026-10-16, en Windows, build debug con `--target-dir target-test`:
+
+- [x] `cargo test --workspace --target-dir target-test`: **2.119 pasan, 0 fallan, 1 ignorado** (`the_vectors_are_the_ones_fastembed_gave`, que necesita el modelo), sin warnings. `cargo clippy --workspace --all-targets -- -A clippy::all -D warnings`: código 0.
+- [x] **Los mismos vectores (R9).** `cargo test -p clawg-core --features eval --test e5_golden -- --include-ignored` con `CLAWG_E5_MODEL_DIR`: los 31 textos de la fixture, generada con fastembed en `9112ab3`, dan los mismos bits con `E5Embedder`, en la CPU que la generó (x86_64 con AVX2, AVX-512F y FMA). Sin la variable, el test falla.
+- [x] El lock pierde `fastembed`, `safetensors`, `allocator-api2` y `foldhash` 0.2.0, y no suma ningún paquete.
+- [x] **`rag-eval --diff --real`** de `cda7ead` (el último commit con fastembed, armado en un worktree) a `269de1f`, sobre la golden set de 46 casos: ningún caso se mueve en ninguna métrica ni en ningún corte por par de idiomas, y con `--agent-view` tampoco (`search.found` y `context.found` incluidos). Las dos comparaciones salen con código 0 bajo `--fail-on-regression`.
+- [x] **R7 en el daemon.** Se cumple: abajo.
+- [ ] CI en Linux y Windows: la rama no se subió todavía.
+- [ ] R7 en Linux: falta una máquina Linux con el modelo.
+
+### R7 en Windows
+
+**Línea de base:** el mismo build con `CLAWG_TEST_EMBEDDER=fake` y sólo `tokenizer.json`, en un home temporal: **264,2 MB**, con una línea `tokenizer.json parsed`.
+
+**Con el modelo:** el daemon dev de este build con `CLAWG_EMBEDDER_IDLE_MINUTES=1`. Se soltó primero el modelo del arranque (282,6 MB) y después hubo diez recargas, cada una con una búsqueda semántica (`POST /v1/search`) y 100 s sin uso:
+
+| Recarga | En el log: archivos con hash + sesión | Privados con el modelo | Privados suelto |
+|---|---|---|---|
+| 1 | 8.665 + 217 ms | 739,4 MB | 285,4 MB |
+| 2 | 12.641 + 458 ms | 743,4 MB | 284,8 MB |
+| 3 | 8.679 + 195 ms | 745,8 MB | 284,0 MB |
+| 4 | 13.517 + 512 ms | 741,8 MB | 284,7 MB |
+| 5 | 12.253 + 433 ms | 745,8 MB | 285,6 MB |
+| 6 | 8.961 + 247 ms | 745,3 MB | 286,3 MB |
+| 7 | 12.114 + 441 ms | 746,7 MB | 285,3 MB |
+| 8 | 11.704 + 472 ms | 746,4 MB | 288,5 MB |
+| 9 | 11.756 + 319 ms | 747,3 MB | 289,8 MB |
+| 10 | 11.654 + 309 ms | 749,2 MB | 287,2 MB |
+
+- **Mediana de las diez:** 285,5 MB, **21,3 MB sobre la línea de base** (el límite es 64).
+- **Medianas de 1 a 5 y de 6 a 10:** 284,8 y 287,2 MB, **+2,4 MB** (el límite es 16).
+- **Parses:** el log tiene una sola línea `tokenizer.json parsed`, la del arranque.
+- **Vectores:** la `distance` de cada hit es la misma en las diez recargas, 0,572561502456665 y 0,692162275314331, y es la que daba fastembed antes del cambio.
+- **Contra la primera implementación:** con el modelo, ~745 MB en lugar de 1.095-1.240 MB, porque falta el segundo parse del tokenizer. Suelto, plano en 284-290 MB en lugar de subir de 310 a 398 MB. Armar la sesión tarda 0,2-0,5 s en lugar de 1,9-2,8 s, porque ya no se parsea el tokenizer. La lectura con hash sigue siendo lo que más tarda: 8,7-13,5 s en debug.
+
 ## Diferencias entre los docs del cambio y el código
 
 Encontradas al consolidar los requisitos contra `49bd269`, para el archivo:
