@@ -91,7 +91,7 @@ pub struct Cli {
 pub enum ParseOutcome {
     Help,
     Run(Cli),
-    Diff(PathBuf, PathBuf),
+    Diff { a: PathBuf, b: PathBuf, fail_on_regression: bool },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -118,6 +118,8 @@ pub enum CliError {
     DocsWithOtherMode,
     #[error("--root is only meaningful with --docs")]
     RootWithoutDocs,
+    #[error("--fail-on-regression is only meaningful with --diff")]
+    FailOnRegressionWithoutDiff,
 }
 
 pub const HELP_TEXT: &str = "\
@@ -167,6 +169,9 @@ OPTIONS:
                          tokens of each tool. Ends with whether each primary metric
                          (recall@5, search.found) moved distinguishably at p < 0.05. Needs
                          neither --fake/--real nor a golden set; short-circuits like --help.
+    --fail-on-regression With --diff, on either side of it: exit 6 when a primary metric
+                         (retrieval recall@5, agent_view search.found) gets worse with
+                         p < 0.05. The informative metrics never fail the run.
     --follow-up          Run the synthetic Ceiling/Floor/Treatment arms instead of the
                          normal single-arm pass, measuring whether conversational context
                          helps a content-free follow-up retrieve the right document.
@@ -193,6 +198,7 @@ EXIT CODES:
     3    --real --check-only and the model is not cached
     4    a results file for this date+config already exists and --force was not given
     5    --audit and the golden set is not fit to measure against
+    6    --diff --fail-on-regression and a primary metric got worse with p < 0.05
 ";
 
 /// Default golden-set path, resolved relative to this crate's own manifest
@@ -250,6 +256,7 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
     let mut agent_view = false;
     let mut docs = false;
     let mut docs_root: Option<PathBuf> = None;
+    let mut fail_on_regression = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -257,6 +264,7 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
             "--follow-up" => follow_up = true,
             "--agent-view" => agent_view = true,
             "--docs" => docs = true,
+            "--fail-on-regression" => fail_on_regression = true,
             "--root" => {
                 let value = args
                     .next()
@@ -270,7 +278,8 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
                 let b = args
                     .next()
                     .ok_or_else(|| CliError::MissingValue("--diff".to_string()))?;
-                return Ok(ParseOutcome::Diff(PathBuf::from(a), PathBuf::from(b)));
+                let fail_on_regression = fail_on_regression || args.any(|rest| rest == "--fail-on-regression");
+                return Ok(ParseOutcome::Diff { a: PathBuf::from(a), b: PathBuf::from(b), fail_on_regression });
             }
             "--fake" => {
                 if matches!(mode, Some(Mode::Real)) {
@@ -378,6 +387,9 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
     {
         return Err(CliError::DocsWithOtherMode);
     }
+    if fail_on_regression {
+        return Err(CliError::FailOnRegressionWithoutDiff);
+    }
     if docs_root.is_some() && !docs {
         return Err(CliError::RootWithoutDocs);
     }
@@ -417,7 +429,7 @@ mod tests {
         match parse(argv(items)).expect("parse must succeed") {
             ParseOutcome::Run(cli) => cli,
             ParseOutcome::Help => panic!("expected Run, got Help"),
-            ParseOutcome::Diff(a, b) => panic!("expected Run, got Diff({a:?}, {b:?})"),
+            ParseOutcome::Diff { a, b, .. } => panic!("expected Run, got Diff({a:?}, {b:?})"),
         }
     }
 
@@ -547,7 +559,7 @@ mod tests {
         // MissingMode, because comparing two results files needs neither.
         assert_eq!(
             parse(argv(&["--diff", "/tmp/a.json", "/tmp/b.json"])).unwrap(),
-            ParseOutcome::Diff(PathBuf::from("/tmp/a.json"), PathBuf::from("/tmp/b.json"))
+            diff_of("/tmp/a.json", "/tmp/b.json", false)
         );
     }
 
@@ -555,8 +567,30 @@ mod tests {
     fn diff_short_circuits_before_a_later_conflict_would_fire() {
         assert_eq!(
             parse(argv(&["--fake", "--diff", "/tmp/a.json", "/tmp/b.json", "--real"])).unwrap(),
-            ParseOutcome::Diff(PathBuf::from("/tmp/a.json"), PathBuf::from("/tmp/b.json"))
+            diff_of("/tmp/a.json", "/tmp/b.json", false)
         );
+    }
+
+    fn diff_of(a: &str, b: &str, fail_on_regression: bool) -> ParseOutcome {
+        ParseOutcome::Diff { a: PathBuf::from(a), b: PathBuf::from(b), fail_on_regression }
+    }
+
+    #[test]
+    fn fail_on_regression_parses_on_either_side_of_diff() {
+        assert_eq!(
+            parse(argv(&["--diff", "/tmp/a.json", "/tmp/b.json", "--fail-on-regression"])).unwrap(),
+            diff_of("/tmp/a.json", "/tmp/b.json", true)
+        );
+        assert_eq!(
+            parse(argv(&["--fail-on-regression", "--diff", "/tmp/a.json", "/tmp/b.json"])).unwrap(),
+            diff_of("/tmp/a.json", "/tmp/b.json", true)
+        );
+    }
+
+    #[test]
+    fn fail_on_regression_without_diff_is_an_error() {
+        let err = parse(argv(&["--fake", "--fail-on-regression"])).expect_err("the flag needs --diff");
+        assert_eq!(err, CliError::FailOnRegressionWithoutDiff);
     }
 
     #[test]

@@ -41,6 +41,13 @@ impl MetricDiff {
     }
 }
 
+/// A primary metric got worse by more than chance explains. The informative
+/// metrics never count: testing every row would make a false alarm likely.
+pub fn regressed(diff: &RunDiff) -> bool {
+    let worse = |m: &MetricDiff| m.worse > m.better && m.p_value() < crate::stats::ALPHA;
+    worse(&diff.retrieval.recall_5) || diff.agent_view.is_some_and(|av| worse(&av.search_found))
+}
+
 /// How a primary metric's movement reads at `stats::ALPHA`. A movement that
 /// does not reach it says how many one-way cases would have, and never that
 /// the runs are the same: with a few dozen cases, "not distinguishable" is all
@@ -359,6 +366,36 @@ mod tests {
         let line = verdict("retrieval recall@5", &m);
         assert!(line.contains("not distinguishable with 1 case(s)"), "{line}");
         assert!(line.contains("at least 6 cases"), "{line}");
+    }
+
+    #[test]
+    fn a_significant_primary_regression_fails() {
+        let mut diff = RunDiff::default();
+        diff.retrieval.recall_5 = moved(0, 6);
+        assert!(regressed(&diff));
+
+        let mut diff = RunDiff::default();
+        diff.agent_view = Some(AgentViewDiff { search_found: moved(0, 6), ..AgentViewDiff::default() });
+        assert!(regressed(&diff));
+    }
+
+    #[test]
+    fn five_lost_cases_do_not_fail() {
+        let mut diff = RunDiff::default();
+        diff.retrieval.recall_5 = moved(0, 5);
+        assert!(!regressed(&diff));
+        diff.retrieval.recall_5 = moved(6, 0);
+        assert!(!regressed(&diff), "an improvement never fails");
+    }
+
+    #[test]
+    fn an_informative_regression_never_fails() {
+        let mut diff = RunDiff::default();
+        diff.retrieval.mrr = moved(0, 20);
+        diff.retrieval.recall_1 = moved(0, 20);
+        diff.similarity.recall_5 = moved(0, 20);
+        diff.agent_view = Some(AgentViewDiff { context_found: moved(0, 20), ..AgentViewDiff::default() });
+        assert!(!regressed(&diff));
     }
 
     #[test]

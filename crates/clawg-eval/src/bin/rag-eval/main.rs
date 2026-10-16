@@ -51,6 +51,8 @@ const EXIT_RESULTS_EXISTS: i32 = 4;
 /// claim. Distinct from `EXIT_GOLDEN_INVALID`, which means the file is
 /// structurally broken: this one means the file is well-formed and useless.
 const EXIT_GOLDEN_UNFIT: i32 = 5;
+/// `--diff --fail-on-regression` found a primary metric worse at p < 0.05.
+const EXIT_REGRESSION: i32 = 6;
 
 // Single-threaded runtime: the crate's declared tokio features (sync, macros,
 // time, rt, process, io-util) do not include `rt-multi-thread`, so the
@@ -98,7 +100,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             println!("{}", cli::HELP_TEXT);
             return EXIT_OK;
         }
-        Ok(cli::ParseOutcome::Diff(a, b)) => return run_diff(&a, &b),
+        Ok(cli::ParseOutcome::Diff { a, b, fail_on_regression }) => return run_diff(&a, &b, fail_on_regression),
         Ok(cli::ParseOutcome::Run(cli)) => cli,
         Err(e) => {
             // Not one of the dedicated exit codes (0/2/3/4): a usage
@@ -688,11 +690,16 @@ fn build_agent_view_run_results(
 /// CLI usage error, this happens before any golden set, model, or database is
 /// touched, so a failure here is reported as a generic runtime failure rather
 /// than overloading a more specific code with a meaning it does not have.
-fn run_diff(a_path: &std::path::Path, b_path: &std::path::Path) -> i32 {
+fn run_diff(a_path: &std::path::Path, b_path: &std::path::Path, fail_on_regression: bool) -> i32 {
     match diff::diff_files(a_path, b_path) {
         Ok(d) => {
             diff::print_stdout(&d);
-            EXIT_OK
+            if fail_on_regression && diff::regressed(&d) {
+                eprintln!("a primary metric got worse with p < 0.05");
+                EXIT_REGRESSION
+            } else {
+                EXIT_OK
+            }
         }
         Err(e) => {
             eprintln!("error: {e}");
@@ -1321,6 +1328,29 @@ mod tests {
 
     fn temp_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("rag-eval-main-test-{tag}-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn diff_exits_six_on_a_significant_regression_only_with_the_flag() {
+        let case = |i: usize, hit: f64| {
+            serde_json::json!({
+                "query": format!("q{i}"), "expected_refs": ["c1"], "ranked_refs": ["c1"],
+                "recall@1": hit, "recall@5": hit, "recall@10": hit, "mrr": hit, "ndcg@10": hit,
+                "status": "active", "lang": null
+            })
+        };
+        let file = |hit: f64| serde_json::json!({ "retrieval": { "per_case": (0..6).map(|i| case(i, hit)).collect::<Vec<_>>() } });
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (a, b) = (dir.path().join("a.json"), dir.path().join("b.json"));
+        std::fs::write(&a, file(1.0).to_string()).expect("write a");
+        std::fs::write(&b, file(0.0).to_string()).expect("write b");
+        let (a, b) = (a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned());
+        let argv = |extra: &[&str]| {
+            ["rag-eval", "--diff", a.as_str(), b.as_str()].iter().chain(extra).map(|s| s.to_string()).collect::<Vec<_>>()
+        };
+
+        assert_eq!(run(argv(&[]).into_iter()).await, EXIT_OK);
+        assert_eq!(run(argv(&["--fail-on-regression"]).into_iter()).await, EXIT_REGRESSION);
     }
 
     #[tokio::test]
