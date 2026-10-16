@@ -245,6 +245,7 @@ const REINFORCE_LOOKUP_SQL: &str = "SELECT id FROM memory \
 
 impl MemoryStore {
     /// [`MemoryStore::reinforce_noting`] with nothing to note.
+    #[cfg(test)]
     pub(crate) async fn reinforce_if_duplicate(
         &self,
         agent_id: &str,

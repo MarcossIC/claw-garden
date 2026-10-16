@@ -31,9 +31,11 @@ use crate::memory::embedder::Embedder;
 use crate::memory::events::MemoryEvent;
 use crate::memory::store_lock::StoreHolder;
 use crate::memory::maintenance::{run_maintenance_loop, MAINTENANCE_PERIOD, STARTUP_DELAY};
+use crate::memory::outbox::{OutboxState, Recorded};
+use crate::memory::redact::{redact, SecretKind};
 use crate::memory::project_docs::DocIndex;
 use crate::memory::spill;
-use crate::memory::worker::{memory_worker, resolve_tokenizer_and_chunker, IngestRequest};
+use crate::memory::worker::{memory_worker, resolve_tokenizer_and_chunker, IngestReport, IngestRequest, Replay};
 use crate::memory::workspace::WorkspaceManager;
 use crate::memory::{MemoryError, MemoryStore};
 
@@ -44,12 +46,33 @@ use crate::memory::{MemoryError, MemoryStore};
 /// still downloading from turning every save into unbounded memory.
 pub const INGEST_QUEUE_CAPACITY: usize = 1024;
 
-/// How long a shutdown keeps ingesting what is queued before it spills the
-/// rest to disk. It must leave `clawg stop`'s timeout room for the event in
-/// flight, the spill, the access flush and the checkpoint, so the stop sees
+/// How long a shutdown keeps ingesting what is queued before it leaves the
+/// rest in the outbox for the next start. It must leave `clawg stop`'s timeout
+/// room for the event in flight, the access flush and the checkpoint, so the stop sees
 /// the process end; a test in `clawg-cli` pins that relation. A starting value
 /// chosen for that margin, not measured.
 pub const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Why [`MemoryRuntime::accept`] refused a save. Nothing of it is kept.
+#[derive(Debug, thiserror::Error)]
+pub enum AcceptError {
+    #[error("the ingest queue is full")]
+    QueueFull,
+    #[error("the ingest worker has stopped")]
+    WorkerStopped,
+    #[error(transparent)]
+    Store(#[from] MemoryError),
+}
+
+/// A save [`MemoryRuntime::accept`] took.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Accepted {
+    /// Recorded in the outbox and queued for the worker.
+    Queued { row: i64, operation_id: String, redacted: Vec<SecretKind> },
+    /// The agent already has a row under this operation id: nothing new was
+    /// recorded or queued.
+    Existing { row: i64, operation_id: String, state: OutboxState, last_error: Option<String> },
+}
 
 /// The background tasks a host spawned from a [`MemoryRuntime`], handed back
 /// to [`MemoryRuntime::shutdown`].
@@ -166,7 +189,7 @@ impl MemoryRuntime {
     ///
     /// `drain` is the receiving end of [`Workers::drain`]: a host that will
     /// call [`MemoryRuntime::shutdown`] keeps the sender there. The future
-    /// resolves to the events it did not ingest, which shutdown spills.
+    /// resolves to the events it did not ingest that no outbox row holds.
     pub fn ingest_worker(
         &self,
         rx: Receiver<IngestRequest>,
@@ -180,6 +203,41 @@ impl MemoryRuntime {
             rx,
             drain,
         )
+    }
+
+    /// Takes a save: masks its secrets, records it in the outbox under
+    /// `operation_id` (a new UUID when `None`), and only then queues it, so an
+    /// accepted save outlives the process. A save the queue refuses is not
+    /// accepted, and its row goes too.
+    pub async fn accept(
+        &self,
+        mut event: MemoryEvent,
+        operation_id: Option<String>,
+        reply: Option<tokio::sync::oneshot::Sender<IngestReport>>,
+    ) -> Result<Accepted, AcceptError> {
+        // Masked before the row is written: the row lives in memory.db and in
+        // every snapshot for as long as the save waits or stays failed.
+        let masked = redact(&event.content);
+        event.content = masked.text;
+        let operation_id = operation_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let row = match self.store.outbox_record(operation_id.clone(), event.clone()).await? {
+            Recorded::New { row } => row,
+            Recorded::Existing { row, state, last_error } => {
+                return Ok(Accepted::Existing { row, operation_id, state, last_error });
+            }
+        };
+        match self.memory_tx.try_send(IngestRequest { event, reply, outbox: Some(row) }) {
+            Ok(()) => Ok(Accepted::Queued { row, operation_id, redacted: masked.kinds }),
+            Err(refused) => {
+                if let Err(e) = self.store.outbox_forget(row).await {
+                    log::warn!("could not drop the outbox row of a refused save: {e}; the next start ingests it");
+                }
+                Err(match refused {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => AcceptError::QueueFull,
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => AcceptError::WorkerStopped,
+                })
+            }
+        }
     }
 
     /// The periodic maintenance loop's future — **not** spawned, same
@@ -203,9 +261,9 @@ impl MemoryRuntime {
     }
 
     /// Orderly shutdown, once nothing can send new events: drains the ingest
-    /// queue for up to [`DRAIN_DEADLINE`] and spills what is left to
-    /// `<base_dir>/ingest-pending.jsonl`, flushes the access tracker, stops
-    /// maintenance and checkpoints the WAL.
+    /// queue for up to [`DRAIN_DEADLINE`], leaving what is left in the outbox
+    /// for the next start, flushes the access tracker, stops maintenance and
+    /// checkpoints the WAL.
     pub async fn shutdown(&self, workers: Workers) {
         self.shutdown_by(workers, DRAIN_DEADLINE).await;
     }
@@ -219,25 +277,15 @@ impl MemoryRuntime {
     async fn shutdown_by(&self, workers: Workers, drain_deadline: Duration) {
         // An error means the worker already ended; awaiting it below says how.
         let _ = workers.drain.send(Some(Instant::now() + drain_deadline));
-        let unstarted = match workers.ingest.await {
-            Ok(events) => events,
-            Err(e) => {
-                log::error!("the ingest worker ended abnormally: {e}");
-                Vec::new()
-            }
-        };
-        if !unstarted.is_empty() {
-            match spill::write(&self.base_dir, &unstarted).await {
-                Ok(()) => log::info!(
-                    "saved {} events not yet ingested to {} for the next start",
-                    unstarted.len(),
-                    self.base_dir.join(spill::SPILL_FILE).display()
-                ),
-                Err(e) => log::error!(
-                    "could not save {} events not yet ingested, they are lost: {e}",
-                    unstarted.len()
-                ),
-            }
+        match workers.ingest.await {
+            // Only an event queued without `accept` lacks a row, and only the
+            // in-process paths of tests and evaluation queue one.
+            Ok(unrecorded) if !unrecorded.is_empty() => log::warn!(
+                "{} events queued without an outbox row were not ingested",
+                unrecorded.len()
+            ),
+            Ok(_) => {}
+            Err(e) => log::error!("the ingest worker ended abnormally: {e}; the outbox keeps what it held"),
         }
         self.access_tracker.shutdown().await;
         workers.maintenance.abort();
@@ -360,8 +408,43 @@ fn ingest_worker_future(
 ) -> impl Future<Output = Vec<MemoryEvent>> + Send + 'static {
     async move {
         let chat_chunker = resolve_tokenizer_and_chunker(&base_dir, &tokenizer);
-        let replay = spill::load(&base_dir).await;
+        import_spill(&base_dir, &store).await;
+        let replay = match store.outbox_pending().await {
+            Ok(rows) => {
+                if !rows.is_empty() {
+                    log::info!("ingesting {} saves accepted before this start", rows.len());
+                }
+                Replay::rows(rows)
+            }
+            Err(e) => {
+                log::error!("could not read the outbox: {e}; its saves wait for the next start");
+                Replay::none()
+            }
+        };
         memory_worker(rx, drain, replay, store, embedder, chat_chunker).await
+    }
+}
+
+/// Moves the events a previous version spilled to `ingest-pending.jsonl` into
+/// the outbox, masked, and removes the file once they are committed. A file
+/// that cannot be moved stays for the next start.
+async fn import_spill(base_dir: &std::path::Path, store: &MemoryStore) {
+    let spilled = spill::load(base_dir).await;
+    if spilled.is_empty() {
+        return;
+    }
+    let events: Vec<MemoryEvent> = spilled
+        .events
+        .iter()
+        .cloned()
+        .map(|mut event| {
+            event.content = redact(&event.content).text;
+            event
+        })
+        .collect();
+    match store.outbox_import(events).await {
+        Ok(()) => spilled.remove().await,
+        Err(e) => log::error!("could not move the spilled ingest events to the outbox: {e}; they stay on disk"),
     }
 }
 
@@ -614,7 +697,7 @@ mod tests {
 
         let (reply, report) = tokio::sync::oneshot::channel::<IngestReport>();
         rt.memory_tx
-            .try_send(IngestRequest { event: chat_event("the report comes back"), reply: Some(reply) })
+            .try_send(IngestRequest { event: chat_event("the report comes back"), reply: Some(reply), outbox: None })
             .expect("send");
         let report = report.await.expect("the worker must answer a request that asked");
 
@@ -635,6 +718,66 @@ mod tests {
         let third = rt.memory_tx.try_send(chat_event("three").into());
 
         assert!(matches!(third, Err(TrySendError::Full(_))), "got {third:?}");
+    }
+
+    async fn outbox_rows(store: &MemoryStore) -> Vec<(i64, String)> {
+        store
+            .conn
+            .call(|c| -> Result<Vec<(i64, String)>, rusqlite::Error> {
+                let mut stmt = c.prepare("SELECT id, content FROM ingest_outbox ORDER BY id")?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect();
+                rows
+            })
+            .await
+            .expect("outbox")
+    }
+
+    #[tokio::test]
+    async fn accept_writes_the_row_before_it_queues_the_event() {
+        let tmp = tmp_base();
+        let (rt, mut rx) = MemoryRuntime::new_for_test(tmp.path().to_path_buf()).await;
+        // Built at run time so no literal looks like a live credential.
+        let token = format!("ghp_{}", "a1B2".repeat(9));
+
+        let accepted = rt.accept(chat_event(&format!("the token is {token}")), None, None).await.unwrap();
+
+        let Accepted::Queued { row, operation_id, redacted } = accepted else { panic!("{accepted:?}") };
+        assert_eq!(uuid::Uuid::parse_str(&operation_id).map(|u| u.get_version_num()), Ok(4));
+        assert_eq!(redacted, vec![SecretKind::GithubToken]);
+        assert_eq!(outbox_rows(&rt.store).await, vec![(row, "the token is [REDACTED:github_token]".to_string())]);
+        let queued = rx.recv().await.unwrap();
+        assert_eq!(queued.outbox, Some(row));
+        assert_eq!(queued.event.content, "the token is [REDACTED:github_token]");
+    }
+
+    #[tokio::test]
+    async fn an_operation_id_already_recorded_is_not_queued_again() {
+        let tmp = tmp_base();
+        let (rt, mut rx) = MemoryRuntime::new_for_test(tmp.path().to_path_buf()).await;
+        let first = rt.accept(chat_event("once"), Some("op-7".into()), None).await.unwrap();
+        let Accepted::Queued { row, .. } = first else { panic!("{first:?}") };
+
+        let again = rt.accept(chat_event("once"), Some("op-7".into()), None).await.unwrap();
+
+        assert_eq!(
+            again,
+            Accepted::Existing { row, operation_id: "op-7".into(), state: OutboxState::Pending, last_error: None }
+        );
+        rx.recv().await.unwrap();
+        assert!(rx.try_recv().is_err(), "the second save must not be queued");
+    }
+
+    #[tokio::test]
+    async fn a_refused_event_leaves_no_row() {
+        let tmp = tmp_base();
+        let (rt, _rx) = MemoryRuntime::new_for_test_with_capacity(tmp.path().to_path_buf(), 1).await;
+        rt.accept(chat_event("fits"), None, None).await.unwrap();
+
+        let refused = rt.accept(chat_event("does not fit"), None, None).await;
+
+        assert!(matches!(refused, Err(AcceptError::QueueFull)), "{refused:?}");
+        let contents: Vec<String> = outbox_rows(&rt.store).await.into_iter().map(|(_, c)| c).collect();
+        assert_eq!(contents, vec!["fits"]);
     }
 
     #[test]

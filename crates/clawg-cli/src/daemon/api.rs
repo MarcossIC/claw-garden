@@ -754,7 +754,7 @@ async fn save_memory(
     } else {
         (None, None)
     };
-    app.runtime.memory_tx.try_send(IngestRequest { event, reply }).map_err(|e| match e {
+    app.runtime.memory_tx.try_send(IngestRequest { event, reply, outbox: None }).map_err(|e| match e {
         TrySendError::Full(_) => ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "ingest_queue_full"),
         TrySendError::Closed(_) => {
             ApiError::internal("the ingest worker has stopped; restart the daemon")
