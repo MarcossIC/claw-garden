@@ -22,7 +22,7 @@ La exploración pedía separar «conexión rechazada» de «timeout» en `map_tr
 
 ## Decisión
 
-**Releer y reintentar una vez, sin autoarrancar (A de la exploración).** El autoarranque a mitad de sesión quedó en una tarjeta del hilo; mientras Marcos no elija otra opción, se sigue con «nunca».
+**Releer y reintentar una vez, sin autoarrancar (A de la exploración).** Marcos eligió «nunca» para el autoarranque a mitad de sesión (tarjeta del hilo, 2026-10-16).
 
 Decisiones abiertas de la exploración, con el valor por defecto que toma este cambio:
 
