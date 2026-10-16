@@ -1,0 +1,15 @@
+change: bridge-reconnect
+objective: "4"
+depends_on: []
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # Linux, Windows and the dev profile with Claude Code, see verify.md
+  archive: done
+main_spec: openspec/specs/mcp/spec.md
+updated: 2026-10-15

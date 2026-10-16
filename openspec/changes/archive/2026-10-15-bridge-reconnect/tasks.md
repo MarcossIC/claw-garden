@@ -40,9 +40,10 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 
 - [x] `cargo test --workspace` en cada commit; conteo contra la base.
 - [x] `verify.md` con los pasos de Marcos: la suite en Windows y, en el perfil dev, `clawg stop` y `clawg serve` con una sesión de Claude Code abierta.
-- [ ] Correr esos pasos (máquina de Marcos).
+- [x] Correr esos pasos (máquina de Marcos).
 
 ## 7. Archive
 
-- [ ] `openspec/specs/mcp/spec.md`: R1 a R6 de acá como apartado nuevo y la línea **Origen**.
-- [ ] `git mv` a `changes/archive/AAAA-MM-DD-bridge-reconnect`, `state.yaml`, fila 39, base de tests y subir el minor.
+- [x] `openspec/specs/mcp/spec.md`: R1 a R6 de acá como apartado nuevo y la línea **Origen**.
+- [x] `git mv` a `changes/archive/AAAA-MM-DD-bridge-reconnect`, `state.yaml`, fila 39 y base de tests.
+- [x] Subir el minor (`Cargo.toml` y `Cargo.lock`, con `cargo update --workspace`), en su propio commit.

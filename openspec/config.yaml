@@ -18,7 +18,7 @@ context: |
   (docs/eval/results/2026-10-15-real-project-indexing-tip-anchor.json).
   Agent-view baseline (RELEVANCE_RATIO 0.35): search_memory 36/46 at 764.0 mean tokens,
   recall_context 39/46 at 1086.4 (docs/eval/results/2026-10-15-real-project-indexing-relcut-agent-view.json).
-  Test baseline: cargo test --workspace -> 1902 passed, 0 failed.
+  Test baseline: cargo test --workspace -> 1918 passed, 0 failed.
 
 strict_tdd: true
 
