@@ -48,7 +48,7 @@ Daemon HTTP API: `GET /health` (open; its `ingest` block counts pending and fail
 
 A project's docs index (`crates/clawg-core/src/memory/project_docs/`) holds its Markdown and manifests (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`) as passages split by heading, each under its breadcrumb (`path > heading > subheading`), and its Rust, Python and TypeScript code split along the syntax tree (tree-sitter), each piece under its path and the headers of the definitions that contain it (`path > impl Store`). It honours `.gitignore`, is derived from disk in its own tables and never touches `memory`; a file is re-read when its sha256 or the model changes. Only a root marked `index_docs` in `project` is read: the bridge asks for it for its own root alone, and `clawg projects add` for any other, so a `project_path` the model passes is a label for memories until the user adds it. When a root's id already belongs to another root, every tool that scopes to it fails rather than mix two projects (`all_projects` still works); any other registration failure only logs a warning.
 
-Ingest masks secrets of known formats (`crates/clawg-core/src/memory/redact.rs`) before a save is chunked, hashed or embedded; a confirmed save lists the masked kinds in `redacted`.
+Ingest masks secrets (`crates/clawg-core/src/memory/redact.rs`) before a save is chunked, hashed or embedded, and the docs index does the same with every passage; a confirmed save lists the masked kinds in `redacted`. It masks keys and tokens of known formats (an `sk-` key only when it mixes upper case, lower case and digits, so hyphenated identifiers pass), the literal value after a key ending in `password` or `passwd` and after `Authorization: Bearer|Basic|Token` (never a variable, a type, a call or a placeholder), and everything the writer wraps in a private mark, `<private>` to `</private>`. A mark left open masks to the end of the text; a mark right after a backtick is text. Nothing is guessed from entropy.
 
 A save is written, already masked, to the `ingest_outbox` table of `memory.db` before the daemon answers `201` or `202`, and its row goes in the transaction that finishes storing it (`crates/clawg-core/src/memory/outbox.rs`), so a kill, crash or power cut loses nothing accepted (the row alone is written with `synchronous = FULL`; the rest of the store keeps `NORMAL`). Each piece of a long save is noted in the row as it is stored, and a replay resumes after it. On start the daemon ingests pending rows before new saves; a row that stopped the process 3 times, or failed after the caller was answered, stays `failed` with its cause. Every save answers with an `operation_id` (a UUID v4, or the caller's own, 1 to 128 visible ASCII characters); sending the same one again while its row exists answers `already_queued` (pending) or `ingest_failed` (failed) instead of saving twice. Shutdown no longer writes `ingest-pending.jsonl`; one left by an older clawg is imported masked on start and removed.
 
@@ -86,7 +86,7 @@ MCP tools (`crates/clawg-cli/src/mcp/server.rs`): `save_memory`, `search_memory`
 cargo test --workspace
 ```
 
-Current baseline (Windows): 1918 tests, all passing.
+Current baseline (Windows): 1984 tests, all passing.
 
 On Windows, live `clawg.exe` processes (for example the editor's MCP bridge) lock `target\debug\clawg.exe` and make the build fail. Use a separate target directory instead: `cargo test --workspace --target-dir <other-dir>`.
 

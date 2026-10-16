@@ -54,4 +54,9 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 ## 9. Verificación
 
 - [x] `cargo test --workspace` en cada commit, clippy con `-A clippy::all -D warnings`, `verify.md` con el conteo contra la base.
-- [ ] Pendiente en Windows (máquina de Marcos): la suite y clippy.
+- [x] Pendiente en Windows (máquina de Marcos): la suite y clippy. Sobre `main` en `210c692` fallaba `adding_a_project_lets_its_docs_be_searched`, un error del test con el prefijo `\\?\`; arreglado en `8312e42`, pasan 1.984 y no falla ninguno. `clippy` sale con código 0.
+
+## 10. Archive
+
+- [x] [`specs/project-docs`](../../../specs/project-docs/spec.md) y [`specs/project`](../../../specs/project/spec.md) con los requisitos, la línea **Origen** y los `ruta:línea` revisados contra `main`.
+- [x] `git mv` a `changes/archive/2026-10-15-project-root-guard`; `state.yaml` archivado; fila 29 y orden de ejecución del `README.md` de openspec; base de tests de `.claude/CLAUDE.md` y `openspec/config.yaml`; subir el minor.

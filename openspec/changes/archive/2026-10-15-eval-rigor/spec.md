@@ -1,6 +1,6 @@
 # eval-rigor — Especificación
 
-Delta sobre [`specs/eval`](../../specs/eval/spec.md). Cambia lo que `rag-eval` reporta y compara; no cambia ningún ranking ni ningún número de las métricas que ya existen.
+Delta sobre [`specs/eval`](../../../specs/eval/spec.md). Cambia lo que `rag-eval` reporta y compara; no cambia ningún ranking ni ningún número de las métricas que ya existen.
 
 ## Definiciones
 

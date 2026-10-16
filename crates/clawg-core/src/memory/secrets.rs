@@ -244,6 +244,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_scan_flags_rows_saved_before_a_new_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+        let password = insert(&store, "db password=hunter2".to_string()).await;
+        let marked = insert(&store, "card <private>4111 1111</private>".to_string()).await;
+        store.conn.clone().close().await.unwrap();
+        drop(store);
+
+        assert_eq!(
+            scan(dir.path()).unwrap(),
+            vec![
+                Flagged { id: password, kinds: vec![SecretKind::Password], deleted: false },
+                Flagged { id: marked, kinds: vec![SecretKind::Private], deleted: false },
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn the_scan_reads_while_another_process_holds_the_store() {
         let dir = tempfile::tempdir().unwrap();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();

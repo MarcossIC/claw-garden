@@ -73,3 +73,9 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 
 - [x] `cargo test --workspace` en Linux en cada commit; el comando de `clippy` de `.claude/CLAUDE.md`.
 - [x] `verify.md` con el conteo y lo pendiente en la máquina de Marcos: la suite en Windows, `rag-eval --real` contra el ancla (diff vacío) y `--diff` de los `relsweep` de agent-view (0,60 contra 0,35: 6 y 0, p = 0,031).
+- [x] Correr esos pasos (máquina de Marcos) sobre `main` en `210c692`: pasan 1.983 y falla 1, un test de project-root-guard que no es de este cambio. `clippy` sale con código 0. El ancla da un diff vacío, y los `relsweep` y el piso léxico dan lo anticipado.
+
+## 13. Archive
+
+- [x] [`specs/eval`](../../../specs/eval/spec.md) con R1 a R12, la línea **Origen**, los `ruta:línea` revisados contra `main` y el piso léxico en la baseline medida.
+- [x] `git mv` a `changes/archive/2026-10-15-eval-rigor`; `state.yaml` archivado; fila 33 y orden de ejecución del `README.md` de openspec; base de tests de `.claude/CLAUDE.md` y `openspec/config.yaml`; subir el minor.
