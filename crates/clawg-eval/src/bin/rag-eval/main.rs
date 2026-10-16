@@ -461,22 +461,22 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             }
         }
 
-        let aggregate = report::aggregate(&per_case);
-        let by_lang_aggregate = report::aggregate_by_lang(&per_case);
-        let by_subset_aggregate = report::aggregate_by_subset(&per_case);
+        let retrieval = report::RetrievalResults::from_cases(per_case, blocked);
+        let aggregate = retrieval.aggregate;
+        let per_case = &retrieval.per_case;
         // Computed unconditionally, not gated behind `cli.audit`: a sweep's
         // SweepPoint carries these two numbers regardless of whether the
         // full AuditReport (saturation/mirror-case gating) was asked for —
         // the gate that reads them needs every point's value, not just the
         // ones a human happened to also request `--audit` for.
-        let dominance = audit::importance_rank_dominance(&per_case, &golden_set.corpus);
-        let modal = audit::modal_rank_agreement(&per_case);
+        let dominance = audit::importance_rank_dominance(per_case, &golden_set.corpus);
+        let modal = audit::modal_rank_agreement(per_case);
 
         // Audited over the active cases only, matching what `aggregate`
         // reports: a `known_red` case is blocked by a change that does not
         // exist yet, so its ranking says nothing about whether the golden
         // set can discriminate.
-        let audit_report = cli.audit.then(|| audit::audit(&per_case, &golden_set.corpus));
+        let audit_report = cli.audit.then(|| audit::audit(per_case, &golden_set.corpus));
 
         let tag = fold_tag(run_tag.as_deref(), point_slug(point).as_deref());
 
@@ -495,13 +495,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             known_bugs_live: known_bugs.clone(),
             golden_set: golden_provenance.clone(),
             scoring_config: point.scoring,
-            retrieval: report::RetrievalResults {
-                aggregate,
-                by_lang: by_lang_aggregate,
-                by_subset: by_subset_aggregate,
-                per_case,
-                blocked,
-            },
+            retrieval,
             contradiction: report::ContradictionResults { curve: curve.clone(), by_lang: curve_by_lang.clone() },
             norm_check: report::NormCheck {
                 asserted: cli.mode == cli::Mode::Real,
@@ -669,13 +663,7 @@ fn build_agent_view_run_results(
             loaded_golden.content_sha256.clone(),
         ),
         scoring_config: EvalScoringConfig::default(),
-        retrieval: report::RetrievalResults {
-            aggregate: report::Aggregate::default(),
-            by_lang: vec![],
-            by_subset: vec![],
-            per_case: vec![],
-            blocked: vec![],
-        },
+        retrieval: report::RetrievalResults::from_cases(vec![], vec![]),
         contradiction: report::ContradictionResults { curve: vec![], by_lang: vec![] },
         norm_check: report::NormCheck { asserted: false, mean_norm: 0.0, max_deviation: 0.0 },
         audit: None,
@@ -780,8 +768,8 @@ async fn run_follow_up(ctx: FollowUpRunContext<'_>) -> i32 {
         ceiling_agg.recall_10, floor_agg.recall_10
     );
 
-    let ceiling_results = build_follow_up_run_results(&ctx, "ceiling", ceiling_per_case, ceiling_agg);
-    let floor_results = build_follow_up_run_results(&ctx, "floor", floor_per_case, floor_agg);
+    let ceiling_results = build_follow_up_run_results(&ctx, "ceiling", ceiling_per_case);
+    let floor_results = build_follow_up_run_results(&ctx, "floor", floor_per_case);
     for results in [&ceiling_results, &floor_results] {
         report::print_stdout(results);
         if let Err(e) = write_follow_up_arm_results(results, ctx.out_dir, ctx.force) {
@@ -802,9 +790,7 @@ async fn run_follow_up(ctx: FollowUpRunContext<'_>) -> i32 {
             Ok(v) => v,
             Err(code) => return code,
         };
-    let treatment_agg = report::aggregate(&treatment_per_case);
-    let treatment_results =
-        build_follow_up_run_results(&ctx, "treatment", treatment_per_case, treatment_agg);
+    let treatment_results = build_follow_up_run_results(&ctx, "treatment", treatment_per_case);
     report::print_stdout(&treatment_results);
     if let Err(e) = write_follow_up_arm_results(&treatment_results, ctx.out_dir, ctx.force) {
         return e;
@@ -879,10 +865,7 @@ fn build_follow_up_run_results(
     ctx: &FollowUpRunContext<'_>,
     arm_name: &str,
     per_case: Vec<report::CaseResult>,
-    aggregate: report::Aggregate,
 ) -> report::RunResults {
-    let by_lang_aggregate = report::aggregate_by_lang(&per_case);
-    let by_subset_aggregate = report::aggregate_by_subset(&per_case);
     report::RunResults {
         date: ctx.date.clone(),
         mode: ctx.mode,
@@ -898,13 +881,7 @@ fn build_follow_up_run_results(
         known_bugs_live: ctx.known_bugs.clone(),
         golden_set: ctx.golden_provenance.clone(),
         scoring_config: EvalScoringConfig::default(),
-        retrieval: report::RetrievalResults {
-            aggregate,
-            by_lang: by_lang_aggregate,
-            by_subset: by_subset_aggregate,
-            per_case,
-            blocked: vec![],
-        },
+        retrieval: report::RetrievalResults::from_cases(per_case, vec![]),
         contradiction: report::ContradictionResults {
             curve: ctx.contradiction_curve.clone(),
             by_lang: ctx.contradiction_curve_by_lang.clone(),

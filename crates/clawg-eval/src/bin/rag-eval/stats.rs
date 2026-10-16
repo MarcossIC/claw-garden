@@ -25,6 +25,26 @@ pub fn mcnemar_exact(better: usize, worse: usize) -> f64 {
     (2.0 * sum).min(1.0)
 }
 
+/// Two-sided normal quantile for a 95 % interval.
+const Z_95: f64 = 1.959_963_985;
+
+/// The 95 % Wilson score interval of `k` successes in `n` trials. Unlike the
+/// normal approximation it stays inside `[0, 1]` and is still honest at `k = 0`
+/// or `k = n`, which is where small golden sets put most of their subsets.
+/// No trials say nothing: the whole range.
+pub fn wilson(k: usize, n: usize) -> (f64, f64) {
+    if n == 0 {
+        return (0.0, 1.0);
+    }
+    let (k, n) = (k as f64, n as f64);
+    let p = k / n;
+    let z2 = Z_95 * Z_95;
+    let denom = 1.0 + z2 / n;
+    let center = (p + z2 / (2.0 * n)) / denom;
+    let half = Z_95 * (p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt() / denom;
+    ((center - half).max(0.0), (center + half).min(1.0))
+}
+
 /// The significance level every verdict in this harness is read at.
 pub const ALPHA: f64 = 0.05;
 
@@ -125,6 +145,21 @@ mod tests {
 
     fn close(a: f64, b: f64, tol: f64) -> bool {
         (a - b).abs() <= tol
+    }
+
+    #[test]
+    fn wilson_matches_known_intervals() {
+        let (lo, hi) = wilson(36, 46);
+        assert!(close(lo, 0.644, 0.001) && close(hi, 0.877, 0.001), "({lo}, {hi})");
+        let (lo, hi) = wilson(0, 10);
+        assert!(lo == 0.0 && close(hi, 0.278, 0.001), "({lo}, {hi})");
+        let (lo, hi) = wilson(10, 10);
+        assert!(close(lo, 0.722, 0.001) && hi == 1.0, "({lo}, {hi})");
+    }
+
+    #[test]
+    fn wilson_of_no_cases_is_the_whole_range() {
+        assert_eq!(wilson(0, 0), (0.0, 1.0));
     }
 
     #[test]
