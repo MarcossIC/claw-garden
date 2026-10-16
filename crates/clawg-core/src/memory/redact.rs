@@ -96,9 +96,11 @@ static PATTERNS: Lazy<Vec<(SecretKind, Regex)>> = Lazy::new(|| {
         ),
         (SecretKind::Jwt, r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*"),
         (SecretKind::UrlPassword, r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s:/@]+:([^\s/@]+)@"),
+        // A value never starts with `:`: `password::x` is a path through a
+        // module, not a key and its value.
         (
             SecretKind::Password,
-            r#"(?i)\b\w*pass(?:word|wd)["']?\s*[:=]{1,2}\s*["']?([^\s"'`,;)}\]]+)"#,
+            r#"(?i)\b\w*pass(?:word|wd)["']?\s*(?:==|:=|=|:)\s*["']?([^\s"'`,;)}\]:][^\s"'`,;)}\]]*)"#,
         ),
         (
             SecretKind::AuthHeader,
@@ -355,6 +357,7 @@ mod tests {
             ("PGPASSWORD=Zx9-kq2 psql", "PGPASSWORD=[REDACTED:password] psql"),
             ("db_passwd: 'open-sesame-77'", "db_passwd: '[REDACTED:password]'"),
             ("pass := \"x\"; password := \"tr0ub4dor\"", "pass := \"x\"; password := \"[REDACTED:password]\""),
+            ("password==s3cr3t9", "password==[REDACTED:password]"),
         ] {
             let out = redact(text);
             assert_eq!(out.text, expected, "{text}");
@@ -382,6 +385,9 @@ mod tests {
             "PWD=/home/user/app2",
             "WHERE password = ?",
             "password=[REDACTED:url_password]",
+            "use crate::auth::password::rules::check;",
+            "use crate::password::hash_v2;",
+            "algo: Password::Argon2id",
         ] {
             let out = redact(text);
             assert_eq!(out.text, text);
