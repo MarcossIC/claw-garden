@@ -225,7 +225,17 @@
           },
           "memory_type": {
             "default": null,
-            "description": "What kind of memory this is. One of: semantic_fact, user_preference,\narchitectural_decision, session_summary, code_block, chat_message,\ntool_error.\nDefaults to semantic_fact when omitted.",
+            "description": "What kind of memory this is, one of the listed values; any other is\nrefused. Defaults to semantic_fact when omitted.",
+            "enum": [
+              "semantic_fact",
+              "user_preference",
+              "architectural_decision",
+              "session_summary",
+              "code_block",
+              "chat_message",
+              "tool_error",
+              null
+            ],
             "type": [
               "string",
               "null"
@@ -386,7 +396,17 @@
           },
           "memory_type": {
             "default": null,
-            "description": "The new type, only for kind memory. One of: semantic_fact,\nuser_preference, architectural_decision, session_summary, code_block,\nchat_message, tool_error. Omit it to leave the type as it is.",
+            "description": "The new type, only for kind memory, one of the listed values. Omit it\nto leave the type as it is.",
+            "enum": [
+              "semantic_fact",
+              "user_preference",
+              "architectural_decision",
+              "session_summary",
+              "code_block",
+              "chat_message",
+              "tool_error",
+              null
+            ],
             "type": [
               "string",
               "null"

@@ -27,6 +27,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clawg_core::memory::sharing;
+use clawg_core::memory::store_insert::MemoryType;
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -126,16 +127,24 @@ project's own documentation and code.";
 
 // ── Tool parameters ─────────────────────────────────────────────────────────
 
+/// Lists the memory types in the schema of a `memory_type` argument. The
+/// argument stays a free string: an unknown one then reaches the daemon and
+/// comes back as its sentence, not as a protocol error the model cannot read.
+fn memory_type_enum(schema: &mut schemars::Schema) {
+    let mut values: Vec<serde_json::Value> = MemoryType::ALL.iter().map(|t| t.as_str().into()).collect();
+    values.push(serde_json::Value::Null);
+    schema.insert("enum".into(), values.into());
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SaveMemoryArgs {
     /// The memory to store, written as a self-contained statement — it will be
     /// read back in a future session with none of this conversation around it.
     pub content: String,
-    /// What kind of memory this is. One of: semantic_fact, user_preference,
-    /// architectural_decision, session_summary, code_block, chat_message,
-    /// tool_error.
-    /// Defaults to semantic_fact when omitted.
+    /// What kind of memory this is, one of the listed values; any other is
+    /// refused. Defaults to semantic_fact when omitted.
     #[serde(default)]
+    #[schemars(transform = memory_type_enum)]
     pub memory_type: Option<String>,
     /// How much this matters, 0 to 10. Higher values survive longer and are
     /// retrieved sooner. Defaults to 5.
@@ -272,10 +281,10 @@ pub struct UpdateMemoryArgs {
     /// The new importance, 0 to 10. Omit it to leave the importance as it is.
     #[serde(default)]
     pub importance: Option<f64>,
-    /// The new type, only for kind memory. One of: semantic_fact,
-    /// user_preference, architectural_decision, session_summary, code_block,
-    /// chat_message, tool_error. Omit it to leave the type as it is.
+    /// The new type, only for kind memory, one of the listed values. Omit it
+    /// to leave the type as it is.
     #[serde(default)]
+    #[schemars(transform = memory_type_enum)]
     pub memory_type: Option<String>,
 }
 
@@ -1826,29 +1835,19 @@ mod tests {
     }
 
     /// The model has to pick `memory_type` from the set the store recognises;
-    /// an invented string is stored verbatim and then never matches a filter.
-    /// The doc comments on `SaveMemoryArgs` are the only place that set reaches
-    /// it, so the generated schema has to actually carry them.
+    /// the daemon refuses any other, so the schema lists them for the model to
+    /// see before it calls. `null` stays valid because it is the declared
+    /// default.
     #[tokio::test]
     async fn the_save_memory_schema_names_the_accepted_memory_types() {
         let (b, _d) = bridge().await;
-        let tool = b
-            .tool_router
-            .list_all()
-            .into_iter()
-            .find(|t| t.name == "save_memory")
-            .expect("save_memory must be registered");
-        let schema = serde_json::to_string(&tool.input_schema).expect("schema");
-        for value in [
-            "semantic_fact",
-            "user_preference",
-            "architectural_decision",
-            "session_summary",
-            "code_block",
-            "chat_message",
-            "tool_error",
-        ] {
-            assert!(schema.contains(value), "schema does not mention {value}: {schema}");
+        let mut expected: Vec<serde_json::Value> =
+            MemoryType::ALL.iter().map(|t| serde_json::Value::from(t.as_str())).collect();
+        expected.push(serde_json::Value::Null);
+        for name in ["save_memory", "update_memory"] {
+            let schema = tool(&b, name).input_schema;
+            let declared = &schema["properties"]["memory_type"]["enum"];
+            assert_eq!(declared, &serde_json::Value::Array(expected.clone()), "{name}: {schema:?}");
         }
     }
 
