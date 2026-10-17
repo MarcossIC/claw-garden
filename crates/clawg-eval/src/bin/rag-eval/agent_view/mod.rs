@@ -298,8 +298,13 @@ pub fn render_summary(results: &AgentViewResults) -> String {
     if results.by_subset.len() > 1 {
         for (name, subset) in &results.by_subset {
             out.push_str(&format!(
-                "  {name} (n={}): search hit rate {:.4}, context hit rate {:.4}, repeated rows {}\n",
-                subset.search.n_cases, subset.search.hit_rate, subset.context.hit_rate, subset.repeated_rows
+                "  {name} (n={}): search hit rate {:.4} (all {:.4}), context hit rate {:.4} (all {:.4}), repeated rows {}\n",
+                subset.search.n_cases,
+                subset.search.hit_rate,
+                subset.search.all_hit_rate,
+                subset.context.hit_rate,
+                subset.context.all_hit_rate,
+                subset.repeated_rows
             ));
         }
     }
@@ -338,6 +343,11 @@ fn tool_line(tool: &str, group: &str, stats: &ToolStats) -> String {
     )
 }
 
+/// Every expected row is among the ones a tool showed.
+fn shows_every(expected: &[String], found: &[String]) -> bool {
+    !expected.is_empty() && expected.iter().all(|e| found.contains(e))
+}
+
 /// Builds the run summary from the finished per-case readings.
 pub fn build_results(
     corpus_size: usize,
@@ -353,11 +363,13 @@ pub fn build_results(
     };
     let search_sample = |c: &CaseView| Sample {
         found: c.search.found,
+        all_found: shows_every(&c.expected_refs, &c.search.found_refs),
         tokens: c.search.tokens,
         latency_ms: c.search.latency_ms,
     };
     let context_sample = |c: &CaseView| Sample {
         found: c.context.found,
+        all_found: shows_every(&c.expected_refs, &c.context.found_refs),
         tokens: c.context.tokens,
         latency_ms: c.context.latency_ms,
     };
@@ -633,6 +645,27 @@ mod tests {
         assert!(results.by_subset["natural"].answers.is_empty());
         let text = render_summary(&results);
         assert!(text.contains("long answers (n=1): search visible 0.0000 reachable 1.0000"), "{text}");
+    }
+
+    #[test]
+    fn all_hit_rate_counts_only_cases_that_showed_every_expected_row() {
+        let shown = |found: &[&str]| {
+            let mut c = case_view(CaseStatus::Active, true, true, 10);
+            c.subset = CaseSubset::MultiRef;
+            c.expected_refs = refs(&["c1", "c2"]);
+            c.search.found_refs = refs(found);
+            c.context.found_refs = refs(&["c1", "c2"]);
+            c
+        };
+        let mut natural = case_view(CaseStatus::Active, true, true, 10);
+        natural.search.found_refs = refs(&["c1"]);
+        let results = build_results(2, 2, &corpus(), vec![shown(&["c1"]), shown(&["c1", "c2"]), natural]);
+        let s = &results.by_subset["multi_ref"];
+        assert_eq!((s.search.hit_rate, s.search.all_hit_rate), (1.0, 0.5));
+        assert_eq!(s.context.all_hit_rate, 1.0);
+        assert_eq!(results.by_subset["natural"].search.all_hit_rate, 1.0, "one expected row, shown");
+        let text = render_summary(&results);
+        assert!(text.contains("multi_ref (n=2): search hit rate 1.0000 (all 0.5000)"), "{text}");
     }
 
     #[test]
