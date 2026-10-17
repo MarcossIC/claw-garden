@@ -252,6 +252,23 @@ pub struct Context {
     /// conclusions. A daemon that predates the count omits it.
     #[serde(default)]
     pub unreviewed: usize,
+    /// Whether memories were searched for the prompt. A daemon that predates
+    /// the field omits it, and then nothing can be said either way.
+    #[serde(default)]
+    pub retrieval: Option<Retrieval>,
+}
+
+/// Whether `POST /v1/context` searched memories, and if not, why.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Retrieval {
+    Searched,
+    EmbedderNotReady,
+    EmbedderFailed { detail: String, retryable: bool },
+    SearchFailed { detail: String },
+    /// A state a newer daemon added: the context is still good to read.
+    #[serde(other)]
+    Unknown,
 }
 
 /// What `POST /v1/synthesis` answers.
@@ -572,21 +589,27 @@ impl DaemonClient {
         Ok(Self::read_response::<Body>(resp).await?.hits)
     }
 
+    /// `budget: None` leaves the size to the daemon's default.
     pub async fn context(
         &self,
         query: &str,
         agent_id: &str,
         project_id: Option<&str>,
+        budget: Option<usize>,
     ) -> Result<Context, ClientError> {
+        let mut body = serde_json::json!({
+            "query": query,
+            "agent_id": agent_id,
+            "project_id": project_id,
+        });
+        if let Some(budget) = budget {
+            body["budget"] = budget.into();
+        }
         let resp = self
             .http
             .post(self.url("/v1/context"))
             .bearer_auth(&self.token)
-            .json(&serde_json::json!({
-                "query": query,
-                "agent_id": agent_id,
-                "project_id": project_id,
-            }))
+            .json(&body)
             .send()
             .await
             .map_err(Self::map_transport)?;
@@ -1076,6 +1099,22 @@ pub(crate) mod tests {
         assert_eq!(h.embedder_resident, None);
     }
 
+    #[test]
+    fn a_context_without_retrieval_still_parses() {
+        let old: Context = serde_json::from_str(r#"{"prompt":"","unreviewed":0}"#).expect("a daemon that never said");
+        assert_eq!(old.retrieval, None);
+
+        let failed: Context = serde_json::from_str(
+            r#"{"prompt":"","unreviewed":0,"retrieval":{"state":"embedder_failed","detail":"disk full","retryable":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(failed.retrieval, Some(Retrieval::EmbedderFailed { detail: "disk full".into(), retryable: true }));
+
+        let newer: Context = serde_json::from_str(r#"{"prompt":"","unreviewed":0,"retrieval":{"state":"thinking"}}"#)
+            .expect("a state from a newer daemon is not a broken answer");
+        assert_eq!(newer.retrieval, Some(Retrieval::Unknown));
+    }
+
     /// An in-process daemon plus the tempdir holding its lifecycle files.
     pub(crate) struct TestDaemon {
         pub(crate) dir: tempfile::TempDir,
@@ -1274,7 +1313,7 @@ pub(crate) mod tests {
             .expect("search");
         assert!(hits.iter().any(|h| h.id == id), "the saved row must be retrievable");
 
-        let context = c.context(content, "agent-client", None).await.expect("context");
+        let context = c.context(content, "agent-client", None, None).await.expect("context");
         assert_eq!(context.unreviewed, 1, "the one saved memory has not been reviewed yet");
 
         let synthesis = c.synthesis(&SynthesisArgs::default()).await.expect("synthesis");

@@ -114,10 +114,20 @@
       "name": "read_memory"
     },
     "recall_context": {
-      "description": "Get a ready-to-read background block for a query: the user's workspace notes, recent memories and long-term memories, already assembled and deduplicated, with full content. It costs several times the tokens of `search_memory`, so use it once when starting a broad task that needs background, and `search_memory` for specific questions.",
+      "description": "Get a ready-to-read background block for a query: the user's workspace notes, recent memories and long-term memories, already assembled and deduplicated, with full content up to a byte budget; what does not fit is named by id for `read_memory`. It costs several times the tokens of `search_memory`, so use it once when starting a broad task that needs background, and `search_memory` for specific questions.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
+          "budget": {
+            "default": null,
+            "description": "Most bytes of context to return, about 4 per token. Defaults to 8000,\nat most 24000. What does not fit is named by id at the end.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "project_path": {
             "default": null,
             "description": "Absolute path of the project. Defaults to the directory this bridge was\nstarted in.",
