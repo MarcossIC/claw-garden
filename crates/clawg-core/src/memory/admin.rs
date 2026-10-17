@@ -1192,6 +1192,7 @@ mod tests {
             created_at: TimestampMs::from_unix_millis(0),
             agent_id: None,
             piece: None,
+            exact: false,
         }
     }
 
@@ -2034,6 +2035,7 @@ mod tests {
             created_at: TimestampMs::from_unix_millis(0),
             agent_id: None,
             piece: None,
+            exact: false,
         }
     }
 
@@ -2909,6 +2911,7 @@ mod tests {
             created_at: TimestampMs::from_unix_millis(0),
             agent_id: None,
             piece: None,
+            exact: false,
         }];
 
         assert_eq!(format_skill_hits(&hits), "skill_hits=1");

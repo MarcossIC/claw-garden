@@ -89,6 +89,9 @@ pub struct RankedHit {
     /// Which piece of a long save this row is; absent for a save of one piece.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub piece: Option<PiecePosition>,
+    /// The row holds every identifier of the query and took the lexical
+    /// bonus, so its score says nothing about how close the others are.
+    pub exact: bool,
 }
 
 /// Position `piece` (from 1) of a save stored as `pieces` rows.
@@ -534,6 +537,7 @@ async fn knn_one(
                     created_at: r.created_at,
                     agent_id: r.agent_id,
                     piece: None,
+                    exact: r.lexical_match,
                 })
                 .collect();
             // Sorted before the trim, not after: the widened window is cut
@@ -1069,6 +1073,7 @@ async fn score_lexical_candidates(
                     created_at: r.created_at,
                     agent_id: r.agent_id,
                     piece: None,
+                    exact: r.lexical_match,
                 });
             }
             Ok(hits)
@@ -1426,6 +1431,7 @@ mod tests {
             created_at: TimestampMs::from_unix_millis(0),
             agent_id: None,
             piece: None,
+            exact: false,
         };
         let h2 = RankedHit {
             id: 2,
@@ -1439,6 +1445,7 @@ mod tests {
             created_at: TimestampMs::from_unix_millis(0),
             agent_id: None,
             piece: None,
+            exact: false,
         };
         let mut hits = vec![h2, h1];
         hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
@@ -1467,6 +1474,7 @@ mod tests {
                 created_at: TimestampMs::from_unix_millis(0),
                 agent_id: None,
                 piece: None,
+                exact: false,
             }
         }
 
@@ -4596,6 +4604,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_row_holding_the_query_identifier_comes_back_exact() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let agent = "agent-identifier-exact";
+        let expected = seed_identifier_family(&store, agent).await;
+
+        let query = Some("where is resolveLedger4182 used");
+        let hits = search_with(&store, query, agent, SearchScope::all_default(), &ScoringConfig::DEFAULT).await;
+        let exact: Vec<i64> = hits.iter().filter(|h| h.exact).map(|h| h.id).collect();
+        assert_eq!(exact, vec![expected]);
+
+        let query = Some("which helper retries the request twice");
+        let natural = search_with(&store, query, agent, SearchScope::all_default(), &ScoringConfig::DEFAULT).await;
+        assert!(natural.iter().all(|h| !h.exact), "a query without identifiers marks nothing");
+    }
+
+    /// The row the dense pool misses reaches the results through the lexical
+    /// candidates, which build their hits apart from the dense ones.
+    #[tokio::test]
+    async fn a_lexical_candidate_holding_the_identifier_comes_back_exact() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let near = unit_basis_vec();
+        let agent = "agent-lexical-exact";
+        bulk_insert_memory_rows(&store, agent, None, 20, serialize_embedding(&near)).await;
+        let far = insert_memory_row(
+            &store, agent, "kept parseLedger7731 on the old path", "chat_message", 3, 5.0, "active",
+            serialize_embedding(&far_vec(&near)),
+        )
+        .await;
+
+        let scope = SearchScope { memory: Some(20), episodic: None, procedural: None, ..SearchScope::all_default() };
+        let query = Some("parseLedger7731");
+        let hits = search_all_memories_inner(&store, &near, query, agent, scope, 25, &ScoringConfig::DEFAULT)
+            .await
+            .unwrap()
+            .0;
+
+        let exact: Vec<i64> = hits.iter().filter(|h| h.exact).map(|h| h.id).collect();
+        assert_eq!(exact, vec![far]);
+    }
+
+    #[tokio::test]
     async fn an_identifier_past_the_sixteenth_token_still_reaches_its_row() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let near = unit_basis_vec();
@@ -4936,6 +4985,7 @@ mod tests {
             created_at: TimestampMs::from_unix_millis(0),
             agent_id: None,
             piece: None,
+            exact: false,
         }
     }
 
