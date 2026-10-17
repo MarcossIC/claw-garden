@@ -1,14 +1,14 @@
 change: memory-rank-fusion
 objective: "1"
 depends_on: [eval-rigor]
-phase: explore
+phase: apply
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
+  exploration: done
+  proposal: done
+  spec: done
+  design: skipped  # the proposal settles approach A against B, C and D with the exploration's tradeoffs; no other open alternative
+  tasks: done
   apply: pending
   verify: pending
   archive: pending
-updated: 2026-10-15
+updated: 2026-10-17
