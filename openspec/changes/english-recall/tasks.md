@@ -69,27 +69,27 @@ Ninguna de estas tareas toca el historial de git; sólo `verify.md` (tarea 12) s
 
 ## 9. Paso 0: la base (necesita el modelo real y `docs/eval/`)
 
-- [ ] **9.1** Sobre el commit con las tareas 1 a 6: `rag-eval --real --tag english-recall-base`; su `--diff` contra `2026-10-16-real-eval-rigor-tip-anchor.json` da 0 casos movidos en `retrieval` y en `similarity`. Si algo se mueve, se para y se busca la causa. El `content_sha256` cambia sólo por las etiquetas (8.1). Hecho cuando el diff está anotado con su salida.
-- [ ] **9.2** `rag-eval --real --agent-view --tag english-recall-base` y su `--diff` contra `2026-10-15-real-long-save-ranking-tip-agent-view.json`; si algo se mueve, el archivo nuevo es la base y el movimiento se anota con su p.
-- [ ] **9.3** Los mismos dos con `--golden docs/eval/golden-cross.json`: la base de U6.
-- [ ] **9.4** Hipótesis (f): el `by_pair` del paso 0 reproduce la tabla de la exploración (n 20/7/19; R@5 0,90/0,86/0,32 en los dos bloques); si no, el registro usa las cifras del paso 0 y dice por qué.
+- [x] **9.1** Sobre el commit con las tareas 1 a 6: `rag-eval --real --tag english-recall-base`; su `--diff` contra `2026-10-16-real-eval-rigor-tip-anchor.json` da 0 casos movidos en `retrieval` y en `similarity`. Si algo se mueve, se para y se busca la causa. El `content_sha256` cambia sólo por las etiquetas (8.1). Hecho cuando el diff está anotado con su salida.
+- [x] **9.2** `rag-eval --real --agent-view --tag english-recall-base` y su `--diff` contra `2026-10-15-real-long-save-ranking-tip-agent-view.json`; si algo se mueve, el archivo nuevo es la base y el movimiento se anota con su p.
+- [x] **9.3** Los mismos dos con `--golden docs/eval/golden-cross.json`: la base de U6.
+- [x] **9.4** Hipótesis (f): el `by_pair` del paso 0 reproduce la tabla de la exploración (n 20/7/19; R@5 0,90/0,86/0,32 en los dos bloques); si no, el registro usa las cifras del paso 0 y dice por qué.
 
 ## 10. Hipótesis (a) a (e) (necesitan el modelo real; (b) además un worktree descartable)
 
-- [ ] **(a)** `--sweep-cos-floor` 0,70, 0,75, 0,79, 0,81 y 0,83 sobre la base, leído por pareja.
-- [ ] **(b)** Brazos A1 (`"query: "`/`"passage: "`) y A2 (`""`/`""`) contra A0 (la base). Un worktree por brazo, desde el commit del paso 0, cambiando sólo `embedder.rs:102` y `:123`, cada uno con su `--target-dir` y `--tag english-recall-b-a1` o `-a2`, sobre los dos goldens, con y sin `--agent-view`. Hecho cuando `similarity.query_prefix` y `passage_prefix` de cada archivo prueban qué brazo corrió. **Los worktrees no se mergean ni se commitean y se borran al terminar**; la rama de `main` no recibe ningún cambio de prefijo.
-- [ ] **(c)** Contar los fallos de español→inglés con código (al menos un tramo entre comillas invertidas) y sin código, en A0 y en cada brazo; control `golden-c-prosa.json` medido en A0. Informativa.
-- [ ] **(d)** `--lexical-only` sobre la base, leído por pareja.
-- [ ] **(e)** `golden-e-consulta-en.json` y `golden-e-fila-es.json` medidos en A0 y en el brazo ganador, si lo hay.
+- [x] **(a)** `--sweep-cos-floor` 0,70, 0,75, 0,79, 0,81 y 0,83 sobre la base, leído por pareja.
+- [x] **(b)** Brazos A1 (`"query: "`/`"passage: "`) y A2 (`""`/`""`) contra A0 (la base). Un worktree por brazo, desde el commit del paso 0, cambiando sólo `embedder.rs:102` y `:123`, cada uno con su `--target-dir` y `--tag english-recall-b-a1` o `-a2`, sobre los dos goldens, con y sin `--agent-view`. Hecho cuando `similarity.query_prefix` y `passage_prefix` de cada archivo prueban qué brazo corrió. **Los worktrees no se mergean ni se commitean y se borran al terminar**; la rama de `main` no recibe ningún cambio de prefijo.
+- [x] **(c)** Contar los fallos de español→inglés con código (al menos un tramo entre comillas invertidas) y sin código, en A0 y en cada brazo; control `golden-c-prosa.json` medido en A0. Informativa.
+- [x] **(d)** `--lexical-only` sobre la base, leído por pareja.
+- [x] **(e)** `golden-e-consulta-en.json` y `golden-e-fila-es.json` medidos en A0 y en el brazo ganador, si lo hay.
 - Hecho cuando: cada corrida tiene archivo en `docs/eval/results/`, su `--tag`, el `sha` del golden y su `--diff` contra la base, con los umbrales U1 a U10 de la propuesta sin moverse.
 
 ## 11. Borrar los worktrees descartables
 
-- [ ] `git worktree remove` de cada brazo de (b) y borrar sus `--target-dir`. Hecho cuando `git worktree list` no muestra ninguno y `git status` no tiene cambios de prefijo.
+- [x] `git worktree remove` de cada brazo de (b) y borrar sus `--target-dir`. Hecho cuando `git worktree list` no muestra ninguno y `git status` no tiene cambios de prefijo.
 
 ## 12. El registro (`verify.md`)
 
-- [ ] `openspec/changes/english-recall/verify.md`: un apartado por paso y por hipótesis, con commit, comando, `--tag` y archivo de resultados, `sha` del golden, cifras por pareja con su intervalo, filas del `--diff` con su p y el veredicto según las tablas de la propuesta; un apartado para memory-protocol (22) con las cifras por pareja; y si sigue C, D o las dos. Incluye el conteo de la suite y el resultado de `clippy` de la tarea 7. Sin números locales ni rutas personales: dice qué necesita cada paso, no en qué máquina corrió.
+- [x] `openspec/changes/english-recall/verify.md`: un apartado por paso y por hipótesis, con commit, comando, `--tag` y archivo de resultados, `sha` del golden, cifras por pareja con su intervalo, filas del `--diff` con su p y el veredicto según las tablas de la propuesta; un apartado para memory-protocol (22) con las cifras por pareja; y si sigue C, D o las dos. Incluye el conteo de la suite y el resultado de `clippy` de la tarea 7. Sin números locales ni rutas personales: dice qué necesita cada paso, no en qué máquina corrió.
 - Commit: `docs(openspec): record the language-pair diagnosis`
 
 ## 13. Archive (fuera de este cambio hasta que se cierre)
