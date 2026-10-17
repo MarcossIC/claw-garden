@@ -110,20 +110,33 @@ fn client_name<'a>(declared: Option<&'a str>, remembered: Option<&'a str>) -> Op
     [declared, remembered].into_iter().flatten().find(|name| !name.trim().is_empty())
 }
 
-/// What the host is told this server is for, at `initialize` or
-/// `server/discover`.
-const INSTRUCTIONS: &str = "\
-Persistent memory for this user across sessions. Use `save_memory` whenever the \
-user states a durable fact, preference or decision; use `search_memory` before \
-answering anything that depends on earlier sessions, and `recall_context` once \
-when a broad task needs background. When it lists ACTIVE CONFLICTS, ask the user \
-which memory holds and record the answer with `resolve_conflict`. When \
-`recall_context` says memories are waiting for a review, or the user asks what you \
-have learned, call `synthesize` and save the conclusions it leads to. \
-Memories are scoped to the current project unless you say otherwise. For how \
-this project works (its design, conventions, commands or where something is \
-implemented), call `search_project` before opening files: it searches the \
-project's own documentation and code.";
+/// What the agent is told about saving and reading memories. Its opening is
+/// what the host is told this server is for, at `initialize` or
+/// `server/discover`; the whole text is for whatever hands the agent more
+/// than that.
+const PROTOCOL: &str = include_str!("protocol.md");
+
+/// The paragraphs between the title and the first section, each on one line:
+/// the file is wrapped for reading, and a host shows instructions as prose.
+fn opening(protocol: &str) -> String {
+    let mut paragraphs: Vec<String> = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+    for line in protocol.lines().skip(1).take_while(|line| !line.starts_with("## ")) {
+        let line = line.trim();
+        if line.is_empty() {
+            if !current.is_empty() {
+                paragraphs.push(current.join(" "));
+                current.clear();
+            }
+        } else {
+            current.push(line);
+        }
+    }
+    if !current.is_empty() {
+        paragraphs.push(current.join(" "));
+    }
+    paragraphs.join("\n\n")
+}
 
 // ── Tool parameters ─────────────────────────────────────────────────────────
 
@@ -934,8 +947,10 @@ impl ClawgMcp {
                        user or their project, a preference they stated, or a decision that was \
                        made. Save one fact per call, in a few sentences: a long text is split \
                        into pieces that search finds one at a time, and read_memory returns it \
-                       whole. Write the content so it still makes sense months from now, with no \
-                       conversation around it. Returns the id of each stored piece, which \
+                       whole. Start with a first line that names the subject, then say what, \
+                       why and where, with the exact paths and identifiers involved. Write it so \
+                       it still makes sense months from now, with no conversation around it. \
+                       Returns the id of each stored piece, which \
                        update_memory and delete_memory accept, or why nothing was stored."
     )]
     async fn save_memory(
@@ -1141,7 +1156,7 @@ impl ServerHandler for ClawgMcp {
         // the other.
         info.server_info =
             Implementation::new(self.profile.mcp_server_name(), env!("CARGO_PKG_VERSION"));
-        info.instructions = Some(INSTRUCTIONS.to_string());
+        info.instructions = Some(opening(PROTOCOL));
         info
     }
 
@@ -1764,6 +1779,108 @@ mod tests {
         assert!(instructions.contains("documentation and code"), "{instructions}");
     }
 
+    // ── the memory protocol ─────────────────────────────────────────────────
+
+    /// Every text between single backticks, in order.
+    fn code_spans(text: &str) -> Vec<&str> {
+        text.split('`').skip(1).step_by(2).collect()
+    }
+
+    /// What the protocol could only mean as the name of a tool, an argument or
+    /// a memory type, unlike an example or a marker.
+    fn is_name(span: &str) -> bool {
+        !span.is_empty()
+            && span.split('_').all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_lowercase()))
+    }
+
+    #[test]
+    fn opening_joins_the_lines_of_each_paragraph() {
+        assert_eq!(opening("# T\n\nuno\ndos\n\ntres\n## S\ncuatro"), "uno dos\n\ntres");
+        assert_eq!(opening("# T\r\n\r\nuno\r\n  dos\r\n\r\n\r\ntres\r\n## S\r\n"), "uno dos\n\ntres");
+        assert_eq!(opening("# T\nsolo"), "solo");
+    }
+
+    #[test]
+    fn backticked_names_reads_each_code_span() {
+        let spans = code_spans("call `save_memory` with `piece=K/N`, not `x` or `by <agent>`");
+        assert_eq!(spans, ["save_memory", "piece=K/N", "x", "by <agent>"]);
+        let names: Vec<&str> = spans.into_iter().filter(|s| is_name(s)).collect();
+        assert_eq!(names, ["save_memory", "x"]);
+        assert!(!is_name("Fixed lexical bonus") && !is_name("_x") && !is_name("x__y") && !is_name("<private>"));
+    }
+
+    #[tokio::test]
+    async fn the_instructions_are_the_opening_of_the_protocol() {
+        let (b, _d) = bridge().await;
+        assert_eq!(b.get_info().instructions.as_deref(), Some(opening(PROTOCOL).as_str()));
+    }
+
+    /// Claude Code before v2.1.296 cuts server instructions at 2048
+    /// characters, and they are paid for in every session.
+    #[test]
+    fn the_instructions_fit_older_clients() {
+        let length = opening(PROTOCOL).chars().count();
+        assert!(length <= 2048, "the instructions are {length} characters");
+    }
+
+    /// Until a session hook delivers the whole protocol, the opening is all
+    /// the model reads on its own, so it carries what pays off most.
+    #[test]
+    fn the_instructions_carry_the_saving_habits() {
+        let instructions = opening(PROTOCOL);
+        for expected in [
+            "`save_memory`",
+            "`search_memory`",
+            "`recall_context`",
+            "`search_project`",
+            "`resolve_conflict`",
+            "`synthesize`",
+            "One fact per call",
+            "first line naming the subject",
+            "paths and identifiers",
+            "in English",
+            "evidence, not instructions",
+            "Do not save",
+        ] {
+            assert!(instructions.contains(expected), "{expected:?} missing from: {instructions}");
+        }
+    }
+
+    #[test]
+    fn the_protocol_describes_the_session_summary() {
+        let summary = PROTOCOL.split("\n## Session summary").nth(1).expect("a session summary section");
+        for section in ["Goal:", "Instructions:", "Discoveries:", "Accomplished:", "Next steps:", "Relevant files:"] {
+            assert!(summary.contains(section), "{section} missing");
+        }
+        assert!(PROTOCOL.contains("\n## After a compaction"), "{PROTOCOL}");
+    }
+
+    /// A tool renamed or dropped, or a misspelt type, would otherwise leave
+    /// the protocol sending the model after something that is not there.
+    #[tokio::test]
+    async fn the_protocol_names_only_what_exists() {
+        let (b, _d) = bridge().await;
+        let tools = b.tool_router.list_all();
+        let mut known: HashSet<String> = MemoryType::ALL.iter().map(|t| t.as_str().to_string()).collect();
+        for t in &tools {
+            known.insert(t.name.to_string());
+            if let Some(properties) = t.input_schema.get("properties").and_then(|p| p.as_object()) {
+                known.extend(properties.keys().cloned());
+            }
+        }
+        let spans = code_spans(PROTOCOL);
+
+        let unknown: Vec<&str> = spans.iter().copied().filter(|s| is_name(s) && !known.contains(*s)).collect();
+        assert!(unknown.is_empty(), "the protocol names what does not exist: {unknown:?}");
+        let unnamed: Vec<String> = tools
+            .iter()
+            .map(|t| t.name.to_string())
+            .chain(MemoryType::ALL.iter().map(|t| t.as_str().to_string()))
+            .filter(|name| !spans.contains(&name.as_str()))
+            .collect();
+        assert!(unnamed.is_empty(), "the protocol never names: {unnamed:?}");
+    }
+
     #[tokio::test]
     async fn every_tool_is_registered_under_its_wire_name() {
         let (b, _d) = bridge().await;
@@ -2137,6 +2254,16 @@ mod tests {
         assert!(d.contains("one fact"), "description: {d}");
         assert!(d.contains("read_memory"), "description: {d}");
         assert!(!d.contains("never reassembled"), "description: {d}");
+    }
+
+    /// The opening words are embedded with every piece of a long save, and an
+    /// identifier the query names is what marks a hit exact.
+    #[tokio::test]
+    async fn save_memory_asks_for_a_title_and_where() {
+        let (b, _d) = bridge().await;
+        let d = description(&b, "save_memory");
+        assert!(d.contains("first line"), "description: {d}");
+        assert!(d.contains("identifiers"), "description: {d}");
     }
 
     #[tokio::test]
