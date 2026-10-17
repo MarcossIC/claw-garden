@@ -36,6 +36,8 @@ pub enum RunError {
     Serve(std::io::Error),
     #[error("the in-process server failed: {0}")]
     Server(String),
+    #[error("could not close the store: {0}")]
+    Close(String),
     #[error(transparent)]
     Eval(#[from] EvalError),
     #[error("the daemon API answered with an error: {0}")]
@@ -71,6 +73,9 @@ const TOKEN: &str = "rag-eval-agent-view";
 struct Session {
     client: DaemonClient,
     server: tokio::task::JoinHandle<std::io::Result<()>>,
+    /// The server's state, kept past the server so that releasing the session
+    /// can close the store.
+    app: std::sync::Arc<AppCtx>,
 }
 
 /// Ingests the corpus through the real pipeline and serves the result.
@@ -103,9 +108,9 @@ async fn start(input: &AgentViewInput<'_>, scratch: &Path) -> Result<Session, Ru
         shutdown,
         save_timeout: SAVE_CONFIRM_TIMEOUT,
     });
-    let (addr, server) = serve_ephemeral(app).await.map_err(RunError::Serve)?;
+    let (addr, server) = serve_ephemeral(app.clone()).await.map_err(RunError::Serve)?;
     let client = DaemonClient::new(format!("http://{addr}"), TOKEN, scratch.to_path_buf());
-    Ok(Session { client, server })
+    Ok(Session { client, server, app })
 }
 
 fn elapsed_ms(since: Instant) -> f64 {
@@ -209,24 +214,34 @@ async fn read_save_text(client: &DaemonClient, id: i64) -> Result<Option<String>
     }
 }
 
-/// Stops the server, waits until it has let go of the store, and removes the
-/// scratch directory.
-async fn stop(session: Session, scratch: &Path) -> Result<(), RunError> {
-    let Session { client, server } = session;
+/// Stops the server and closes the store, returning once neither holds a file
+/// in the scratch directory.
+async fn release(session: Session) -> Result<(), RunError> {
+    let Session { client, server, app } = session;
     client.shutdown().await?;
     drop(client);
     server
         .await
         .map_err(|e| RunError::Server(e.to_string()))?
         .map_err(|e| RunError::Server(e.to_string()))?;
+    // Dropping the last handle to the store only signals the connection's
+    // thread, which closes the database a moment later; on Windows its files
+    // cannot be deleted until then, so the close is awaited instead.
+    app.runtime.store.conn.clone().close().await.map_err(|e| RunError::Close(e.to_string()))?;
+    Ok(())
+}
+
+/// Releases the session and removes the scratch directory.
+async fn stop(session: Session, scratch: &Path) -> Result<(), RunError> {
+    release(session).await?;
     remove_scratch(scratch).await;
     Ok(())
 }
 
-/// Removal is retried because the database connection closes on its own
-/// thread, a moment after the store handle is dropped; on Windows a directory
-/// holding an open file cannot be deleted. Failing to delete is reported, not
-/// fatal: the measurement itself is already complete.
+/// Removal is still retried: on Windows another process (a virus scanner, the
+/// search indexer) can hold a file it has just seen written for a moment, and a
+/// directory holding an open file cannot be deleted. Failing to delete is
+/// reported, not fatal: the measurement itself is already complete.
 async fn remove_scratch(scratch: &Path) {
     for _ in 0..40 {
         match std::fs::remove_dir_all(scratch) {
@@ -354,6 +369,25 @@ mod tests {
         assert!(first.context.found, "and in recall_context");
         assert!(first.search.tokens > 0 && first.context.tokens > 0);
         assert!(!scratch.exists(), "the scratch directory must be removed once the run is over");
+    }
+
+    /// On Windows a file SQLite still holds cannot be deleted, so a removal that
+    /// needs a retry means the session let go of the store before it was closed.
+    #[tokio::test]
+    async fn a_released_session_holds_no_file_in_the_scratch_directory() {
+        let golden = golden_set();
+        let scratch = scratch();
+        let input = AgentViewInput {
+            golden_set: &golden,
+            embedder: &EvalEmbedder::fake(),
+            counter: &EvalTokenCounter::fake(),
+            tokenizer_dir: &scratch,
+        };
+        let session = start(&input, &scratch).await.expect("start");
+
+        release(session).await.expect("release");
+
+        std::fs::remove_dir_all(&scratch).expect("the scratch directory must come off at the first attempt");
     }
 
     #[tokio::test]
