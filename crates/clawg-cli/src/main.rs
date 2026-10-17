@@ -26,6 +26,7 @@ use clawg_cli::status::status_report;
 use clawg_cli::stop::{stop_in, STOP_TIMEOUT};
 use clawg_cli::undelete;
 use clawg_core::memory::backup::{backup_offline, probe, restore};
+use clawg_core::memory::embedder::keep_one_malloc_arena;
 use clawg_core::memory::secrets::{purge, scan};
 use clawg_core::paths::data_dir;
 use clap::Parser;
@@ -34,12 +35,23 @@ use clap::Parser;
 /// "the command was never valid".
 const EXIT_FAILURE: u8 = 1;
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let cli = Cli::parse();
     init_logging();
+    if cli.command.loads_the_model() {
+        // Before the runtime exists: the allocator setting only reaches the
+        // threads that have not allocated yet.
+        keep_one_malloc_arena();
+    }
+    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("clawg: cannot start the async runtime: {e}");
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
 
-    match dispatch(cli).await {
+    match runtime.block_on(dispatch(cli)) {
         Ok(code) => code,
         Err(message) => {
             // stderr, always: `clawg mcp` owns stdout as its protocol
