@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 | S | — | exploración (borrador) |
+| 1 | S | — | exploración cerrada; sigue en la [propuesta](proposal.md) |
 
 **Tesis:** lo que se guarda depende del agente, y eso decide qué se recupera después. Hoy el servidor MCP le dice al agente **cuándo** llamar a cada herramienta, pero casi nada de **qué** vale la pena guardar ni **cómo** escribirlo. Un único texto de protocolo, compilado en el binario y fijado por tests, mejora la calidad de lo guardado sin tocar ranking ni esquema. Es también la pieza que después van a entregar el hook de sesión y el setup del cliente.
 
@@ -154,18 +154,18 @@ Inglés porque herramientas, instrucciones y notas del servidor lo están (`serv
 - Un comando que imprima el protocolo (lo decide 25 o 26 si lo necesita).
 - Traducir el contenido ya guardado.
 
-## Decisiones abiertas
+## Decisiones
 
-Son del usuario.
+Cerradas el 2026-10-17. En todas se eligió la recomendación de esta exploración.
 
-- [ ] **Forma del texto.** ¿E2 (texto largo con sección corta derivada), E1 (sólo instrucciones ≤ 2.048) o E3 (todo en instrucciones, hasta 4.096)?
-- [ ] **Tope de longitud de las instrucciones.** ¿2.048 (seguro para clientes anteriores a la v2.1.296) o 4.096 (el límite actual)?
-- [ ] **Idioma.** ¿Inglés (recomendado, coherente con herramientas), o ofrecer el protocolo en español además?
-- [ ] **`CONFLICT_NOTE`.** ¿Se traduce al inglés (`prompt_builder.rs:348-351`)? Cambia texto que ven los agentes y los tests que lo fijan (`prompt_builder.rs:744-760`).
-- [ ] **Ubicación del archivo.** `crates/clawg-cli/src/mcp/protocol.md` (junto al servidor) o en `docs/`.
-- [ ] **Estructura del resumen de sesión.** ¿Las seis secciones propuestas o una más corta?
-- [ ] **Idioma de los saves y de las búsquedas.** ¿Uno fijo para guardar y para buscar (inglés, como las herramientas), o el de la conversación con el usuario? Lo que midió english-recall (21) es que tienen que coincidir; el modelo no cruza bien de idioma.
-- [ ] **Tipo desconocido en el save.** ¿Sólo protocolo (T0), enum en el schema (T2), rechazo con 400 (T1, recomendado junto con T2) o guardar y avisar el reemplazo (T3)?
+- [x] **Forma del texto:** E2, un texto largo con la sección corta derivada.
+- [x] **Tope de longitud de las instrucciones:** 2.048 caracteres.
+- [x] **Idioma del protocolo:** inglés, sin versión en español.
+- [x] **`CONFLICT_NOTE`:** pasa a inglés, con la línea de los pares omitidos.
+- [x] **Ubicación del archivo:** `crates/clawg-cli/src/mcp/protocol.md`, junto al servidor.
+- [x] **Estructura del resumen de sesión:** las seis secciones propuestas.
+- [x] **Idioma de los saves y de las búsquedas:** inglés fijo, el idioma en que se conversa no importa.
+- [x] **Tipo desconocido en el save:** T2 + T1. El schema declara el enum y el daemon contesta 400 con los siete valores.
 
 ## Cómo se mide
 
