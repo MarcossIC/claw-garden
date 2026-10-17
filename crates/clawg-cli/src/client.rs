@@ -589,21 +589,27 @@ impl DaemonClient {
         Ok(Self::read_response::<Body>(resp).await?.hits)
     }
 
+    /// `budget: None` leaves the size to the daemon's default.
     pub async fn context(
         &self,
         query: &str,
         agent_id: &str,
         project_id: Option<&str>,
+        budget: Option<usize>,
     ) -> Result<Context, ClientError> {
+        let mut body = serde_json::json!({
+            "query": query,
+            "agent_id": agent_id,
+            "project_id": project_id,
+        });
+        if let Some(budget) = budget {
+            body["budget"] = budget.into();
+        }
         let resp = self
             .http
             .post(self.url("/v1/context"))
             .bearer_auth(&self.token)
-            .json(&serde_json::json!({
-                "query": query,
-                "agent_id": agent_id,
-                "project_id": project_id,
-            }))
+            .json(&body)
             .send()
             .await
             .map_err(Self::map_transport)?;
@@ -1307,7 +1313,7 @@ pub(crate) mod tests {
             .expect("search");
         assert!(hits.iter().any(|h| h.id == id), "the saved row must be retrievable");
 
-        let context = c.context(content, "agent-client", None).await.expect("context");
+        let context = c.context(content, "agent-client", None, None).await.expect("context");
         assert_eq!(context.unreviewed, 1, "the one saved memory has not been reviewed yet");
 
         let synthesis = c.synthesis(&SynthesisArgs::default()).await.expect("synthesis");
