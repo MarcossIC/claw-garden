@@ -1157,6 +1157,37 @@ async fn context_returns_a_prompt_string() {
     );
 }
 
+/// An empty or workspace-only prompt reads as "no memories" unless the
+/// answer says the memories were never searched.
+#[tokio::test]
+async fn context_says_whether_memories_were_searched() {
+    async fn ask(h: &Harness) -> (u16, Value) {
+        h.post_json("/v1/context", json!({ "query": "tabs", "agent_id": "a" })).await
+    }
+
+    let h = Harness::start().await;
+    let (status, body) = ask(&h).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["retrieval"], json!({ "state": "searched" }));
+
+    for h in [Harness::start_without_embedder().await, Harness::start_unloaded(true).await] {
+        let (status, body) = ask(&h).await;
+        assert_eq!(status, 200, "the workspace still comes back: {body}");
+        assert_eq!(body["retrieval"], json!({ "state": "embedder_not_ready" }));
+    }
+
+    let h = Harness::start_failed("disk full", false).await;
+    let (status, body) = ask(&h).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["retrieval"], json!({ "state": "embedder_failed", "detail": "disk full", "retryable": false }));
+
+    let h = Harness::start_with_failing_embedder().await;
+    let (status, body) = ask(&h).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["retrieval"]["state"], "search_failed", "{body}");
+    assert!(body["retrieval"]["detail"].as_str().is_some_and(|d| d.contains("onnx session crashed")), "{body}");
+}
+
 #[tokio::test]
 async fn context_reports_unreviewed_memories() {
     let h = Harness::start().await;

@@ -252,6 +252,23 @@ pub struct Context {
     /// conclusions. A daemon that predates the count omits it.
     #[serde(default)]
     pub unreviewed: usize,
+    /// Whether memories were searched for the prompt. A daemon that predates
+    /// the field omits it, and then nothing can be said either way.
+    #[serde(default)]
+    pub retrieval: Option<Retrieval>,
+}
+
+/// Whether `POST /v1/context` searched memories, and if not, why.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Retrieval {
+    Searched,
+    EmbedderNotReady,
+    EmbedderFailed { detail: String, retryable: bool },
+    SearchFailed { detail: String },
+    /// A state a newer daemon added: the context is still good to read.
+    #[serde(other)]
+    Unknown,
 }
 
 /// What `POST /v1/synthesis` answers.
@@ -1074,6 +1091,22 @@ pub(crate) mod tests {
         let old = r#"{"status":"ok","version":"0.11.0","profile":"dev","pid":1,"embedder":"ready","uptime_s":3}"#;
         let h: Health = serde_json::from_str(old).expect("a daemon that always keeps its model");
         assert_eq!(h.embedder_resident, None);
+    }
+
+    #[test]
+    fn a_context_without_retrieval_still_parses() {
+        let old: Context = serde_json::from_str(r#"{"prompt":"","unreviewed":0}"#).expect("a daemon that never said");
+        assert_eq!(old.retrieval, None);
+
+        let failed: Context = serde_json::from_str(
+            r#"{"prompt":"","unreviewed":0,"retrieval":{"state":"embedder_failed","detail":"disk full","retryable":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(failed.retrieval, Some(Retrieval::EmbedderFailed { detail: "disk full".into(), retryable: true }));
+
+        let newer: Context = serde_json::from_str(r#"{"prompt":"","unreviewed":0,"retrieval":{"state":"thinking"}}"#)
+            .expect("a state from a newer daemon is not a broken answer");
+        assert_eq!(newer.retrieval, Some(Retrieval::Unknown));
     }
 
     /// An in-process daemon plus the tempdir holding its lifecycle files.
