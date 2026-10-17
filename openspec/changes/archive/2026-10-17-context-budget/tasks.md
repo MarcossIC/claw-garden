@@ -34,5 +34,5 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 ## 6. Verificación
 
 - [x] Suite y clippy en Linux sobre el último commit ([verify](verify.md)).
-- [ ] El CI en verde en Linux y Windows.
-- [ ] `rag-eval --real --agent-view` antes y después (necesita el modelo real y `docs/eval/golden.json`): `found` de `recall_context` 39/46 y tokens sin aumento.
+- [x] El CI en verde en Linux y Windows.
+- [x] `rag-eval --real --agent-view` antes y después (necesita el modelo real y `docs/eval/golden.json`): `found` de `recall_context` 39/46 y tokens sin aumento ([verify](verify.md#medición-con-el-modelo-real)).

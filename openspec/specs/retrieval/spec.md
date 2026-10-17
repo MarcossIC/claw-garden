@@ -1,6 +1,6 @@
 # retrieval — Especificación
 
-Fuente de verdad del comportamiento actual de la recuperación: el corte relativo de `POST /v1/search` y de la herramienta `search_memory`, qué hits cuentan como acceso en `search` y en `recall_context`, el bono que lleva una fila con el identificador exacto de la consulta, y el texto que arma `recall_context` (hits, conflictos y workspace) junto con el parser que lo lee en `rag-eval`. A qué filas de otros agentes llegan la búsqueda y el contexto lo define [`specs/sharing`](../sharing/spec.md); acá está cómo se muestra un hit ajeno. La búsqueda en la documentación y el código de un proyecto es otra cosa y está en [`specs/project-docs`](../project-docs/spec.md).
+Fuente de verdad del comportamiento actual de la recuperación: el corte relativo de `POST /v1/search` y de la herramienta `search_memory`, qué hits cuentan como acceso en `search` y en `recall_context`, el bono que lleva una fila con el identificador exacto de la consulta, y el texto que arma `recall_context` (hits, conflictos y workspace, dentro de un presupuesto de bytes) junto con el parser que lo lee en `rag-eval`. Cómo se pide ese presupuesto y cómo avisa `recall_context` que no buscó memorias está en [`specs/mcp`](../mcp/spec.md). A qué filas de otros agentes llegan la búsqueda y el contexto lo define [`specs/sharing`](../sharing/spec.md); acá está cómo se muestra un hit ajeno. La búsqueda en la documentación y el código de un proyecto es otra cosa y está en [`specs/project-docs`](../project-docs/spec.md).
 
 **Origen:**
 - [retrieval-hygiene](../../changes/archive/2026-10-12-retrieval-hygiene/proposal.md), archivado el 2026-10-12.
@@ -10,6 +10,7 @@ Fuente de verdad del comportamiento actual de la recuperación: el corte relativ
 - [agent-sharing](../../changes/archive/2026-10-14-agent-sharing/proposal.md), archivado el 2026-10-14 (sólo "Hits de otros agentes" y los cambios de agente en "El bono respeta el scope" y en "Línea de hit en `recall_context`").
 - [project-indexing](../../changes/archive/2026-10-15-project-indexing/proposal.md), archivado el 2026-10-15 (sólo "El piso de coseno", "Indexar un proyecto no cambia la búsqueda de memorias", el valor de `RELEVANCE_RATIO` y la medición con pooling mean en "Medición del contexto").
 - [memory-rank-fusion](../../changes/archive/2026-10-17-memory-rank-fusion/proposal.md), archivado el 2026-10-17 (sólo "Definiciones", "Corte relativo en `POST /v1/search`" y "Cliente HTTP y herramienta `search_memory`").
+- [context-budget](../../changes/archive/2026-10-17-context-budget/proposal.md), archivado el 2026-10-17 (desde "El prompt cumple el presupuesto" hasta "Un workspace más grande que el presupuesto se entrega y se dice", y lo que esos apartados cambian en "Definiciones", "`recall_context` no cuenta los ceros", los conflictos, "Medición del contexto" e "Invariantes").
 
 ## Definiciones
 
@@ -29,20 +30,23 @@ Fuente de verdad del comportamiento actual de la recuperación: el corte relativ
 - **Match de identificador (`identifier_matches`, `search.rs:754`):** fila de `memory` visible para el llamador (mismos predicados de agente, proyecto, estado y `deleted_at` que el canal léxico) cuyo contenido tiene **todos** los identificadores de la consulta, según FTS5 (`"t1" AND "t2" …`). FTS5 separa en `_`, así que `"user_id"` es una frase que también matchea `user id` y `user-id`: para los identificadores con `_` el contenido MUST tenerlos escritos tal cual, sin distinguir mayúsculas y sin pegarse a otro nombre (`holds_identifier`, `search.rs:723`). Las filas que no los tienen así no reciben bono ni cuentan para el presupuesto.
 - **Presupuesto léxico:** `SearchScope.lexical`, 20 por defecto (`search.rs:43`).
 - **Bono léxico:** `ScoringConfig.lexical_bonus`, 1,0 por defecto (`crates/clawg-core/src/memory/score.rs:185`).
-- **Hit mostrado:** hit de `kind = memory` presente en RECENT o LONG-TERM del prompt de `recall_context` (`build_memory_prompt`, `crates/clawg-core/src/memory/prompt_builder.rs:110`). Los ids son por tabla (`shown`, `prompt_builder.rs:211`, sólo toma `TableKind::Memory`), así que un hit episodic o procedural nunca cuenta.
-- **Fila del workspace:** id en `EmittedIds` (`crates/clawg-core/src/memory/workspace.rs:201`), que también se suma a `shown`. Su bullet no tiene id. **No** es un hit mostrado.
-- **Posición de un hit:** índice 0-based en el orden impreso: RECENT y luego LONG-TERM.
-- **Par de conflicto:** fila nueva (`disputed`) contra una fila vieja. `fetch_active_conflicts` (`prompt_builder.rs:478`) sólo trae pares con al menos un lado que es hit mostrado o fila del workspace; el otro lado puede estar fuera del prompt.
+- **Presupuesto del contexto:** el `budget` de `POST /v1/context`, en bytes del prompt (unos 4 por token): `DEFAULT_BUDGET` 8.000 y `MAX_BUDGET` 24.000 (`crates/clawg-core/src/memory/prompt_builder.rs:50-52`). Cómo llega y se valida está en [`specs/mcp`](../mcp/spec.md).
+- **Hit candidato:** hit que el prompt de `recall_context` llevaría sin presupuesto: los de la búsqueda sin las filas del workspace, cortados en `K_FINAL = 10` (`build_memory_prompt`, `prompt_builder.rs:143`; el corte en `:212-213`).
+- **Hit mostrado:** hit candidato de `kind = memory` que el presupuesto dejó en RECENT o LONG-TERM, entero o recortado. Los ids son por tabla, así que un hit episodic o procedural nunca cuenta. Sin recorte, los hits mostrados son todos los candidatos de `memory`.
+- **Cortado / recortado:** un hit candidato que el presupuesto dejó afuera / uno cuyo texto acortó.
+- **Fila del workspace:** id en `EmittedIds` (`crates/clawg-core/src/memory/workspace.rs:201`), que se suma a los candidatos de `memory` en `shown` (`prompt_builder.rs:237-242`). Su bullet no tiene id. **No** es un hit mostrado.
+- **Posición de un hit:** índice 0-based en el orden impreso: RECENT y luego LONG-TERM (`positions`, `prompt_builder.rs:380`). El presupuesto corta desde el final de ese orden, así que no cambia la posición de los hits que quedan.
+- **Par de conflicto:** fila nueva (`disputed`) contra una fila vieja. `fetch_active_conflicts` (`prompt_builder.rs:659`) sólo trae pares con al menos un lado en `shown`, es decir, hit candidato de `memory` o fila del workspace, antes del presupuesto; el otro lado puede estar fuera del prompt.
 
 El corte vive en `clawg-cli` y no en el core: `search_all_memories` devuelve siempre la lista completa ordenada, y las métricas de `rag-eval` se miden sobre esa lista (`rag-eval` llama a `store.search` directo).
 
 ## Corte relativo en `POST /v1/search`
 
-`POST /v1/search` MUST aceptar el campo opcional `min_relative_score` (`SearchRequest`, `crates/clawg-cli/src/daemon/api.rs:340-350`).
+`POST /v1/search` MUST aceptar el campo opcional `min_relative_score` (`SearchRequest`, `crates/clawg-cli/src/daemon/api.rs:349-359`).
 
 - Ausente: la respuesta MUST traer todos los hits ordenados hasta `limit`, sin corte.
-- Presente con un valor en `[0, 1]`: el daemon MUST devolver sólo los hits que pasan el corte relativo con ese ratio, en el mismo orden (`search`, `api.rs:877`; el corte en `:799-802`). Cada hit de la respuesta MUST llevar `exact`.
-- Presente fuera de `[0, 1]`, o no finito: MUST responder `400` sin buscar ni registrar accesos (`check_relative_score`, `api.rs:308`). La validación corre después de comprobar el embedder: sin embedder listo, la respuesta es la de esa condición (`503`).
+- Presente con un valor en `[0, 1]`: el daemon MUST devolver sólo los hits que pasan el corte relativo con ese ratio, en el mismo orden (`search`, `api.rs:924`; el corte en `:846-849`). Cada hit de la respuesta MUST llevar `exact`.
+- Presente fuera de `[0, 1]`, o no finito: MUST responder `400` sin buscar ni registrar accesos (`check_relative_score`, `api.rs:317`). La validación corre después de comprobar el embedder: sin embedder listo, la respuesta es la de esa condición (`503`).
 
 #### Escenario: sin campo
 - GIVEN una fila igual a la consulta y tres sin relación
@@ -67,7 +71,7 @@ El corte vive en `clawg-cli` y no en el core: `search_all_memories` devuelve sie
 
 ## `search` registra sólo lo que devuelve
 
-El handler `search` MUST registrar como acceso exactamente los hits contables de la respuesta que envía, después del corte (`api.rs:915`). Un hit cortado, o con score 0, MUST NOT cambiar `access_count` ni `last_accessed_at`.
+El handler `search` MUST registrar como acceso exactamente los hits contables de la respuesta que envía, después del corte (`api.rs:962`). Un hit cortado, o con score 0, MUST NOT cambiar `access_count` ni `last_accessed_at`.
 
 #### Escenario: hit cortado
 - GIVEN una fila A con score alto y una fila B bajo el corte de 0,6 en posición ≥ 2
@@ -83,7 +87,7 @@ El handler `search` MUST registrar como acceso exactamente los hits contables de
 
 ## `recall_context` no cuenta los ceros
 
-`build_memory_prompt` MUST registrar sólo los hits contables entre los que entran al prompt, después de sacar las filas del workspace y de cortar en `K_FINAL = 10` (`crates/clawg-core/src/memory/prompt_builder.rs:42`, `:178-179`, `:187`). Los hits con score 0 MUST seguir apareciendo en el prompt.
+`build_memory_prompt` MUST registrar sólo los hits contables entre los que quedan en el prompt: después de sacar las filas del workspace, de cortar en `K_FINAL = 10` y de aplicar el presupuesto (`crates/clawg-core/src/memory/prompt_builder.rs:43`, `:212-213`, `:267-269`). Un hit cortado MUST NOT contar; uno recortado cuenta. Los hits con score 0 MUST seguir apareciendo en el prompt.
 
 #### Escenario: cero de relleno
 - GIVEN una fila igual a la consulta y otra ortogonal (score 0)
@@ -95,11 +99,16 @@ El handler `search` MUST registrar como acceso exactamente los hits contables de
 - WHEN se arma el prompt y se hace flush
 - THEN la fila `memory` no cambia
 
-**Tests:** `recall_does_not_count_zero_score_hits_as_accesses`, `a_memory_hit_is_recorded_by_the_access_tracker` y `a_hit_from_another_table_does_not_touch_the_memory_row_with_the_same_id` (`prompt_builder.rs`, mod tests).
+#### Escenario: cortado por el presupuesto
+- GIVEN dos hits contables y un presupuesto que sólo deja entrar uno
+- WHEN se arma el prompt y se hace flush
+- THEN sólo el que quedó en el prompt sube `access_count`
+
+**Tests:** `recall_does_not_count_zero_score_hits_as_accesses`, `a_memory_hit_is_recorded_by_the_access_tracker`, `a_hit_from_another_table_does_not_touch_the_memory_row_with_the_same_id` y `a_hit_cut_by_the_budget_is_not_counted_as_accessed` (`prompt_builder.rs`, mod tests).
 
 ## Cliente HTTP y herramienta `search_memory`
 
-`DaemonClient::search` MUST mandar `min_relative_score = RELEVANCE_RATIO` junto con los campos de `SearchArgs` (`search_request`, `crates/clawg-cli/src/client.rs:403`; uso en `:538`). El puente MUST volver a aplicar el corte al renderizar `search_memory` (`relevant_hits` y `format_search`, `crates/clawg-cli/src/mcp/tools.rs:60` y `:67`), con el mismo `shown_hits` que el daemon, así que un hit exacto se muestra aunque el corte deje fuera a otro. `Hit` del cliente MUST leer `exact` con `#[serde(default)]`: un hit sin el campo vale `false`. Aplicar el corte dos veces da el mismo resultado, y contra un daemon que ignora el campo el agente ve lo mismo.
+`DaemonClient::search` MUST mandar `min_relative_score = RELEVANCE_RATIO` junto con los campos de `SearchArgs` (`search_request`, `crates/clawg-cli/src/client.rs:420`; uso en `:555`). El puente MUST volver a aplicar el corte al renderizar `search_memory` (`relevant_hits` y `format_search`, `crates/clawg-cli/src/mcp/tools.rs:60` y `:67`), con el mismo `shown_hits` que el daemon, así que un hit exacto se muestra aunque el corte deje fuera a otro. `Hit` del cliente MUST leer `exact` con `#[serde(default)]`: un hit sin el campo vale `false`. Aplicar el corte dos veces da el mismo resultado, y contra un daemon que ignora el campo el agente ve lo mismo.
 
 #### Escenario: cuerpo del pedido
 - WHEN el cliente arma el cuerpo de una búsqueda
@@ -226,21 +235,21 @@ Ningún código de producción escribe `episodic_trajectory` ni `procedural_skil
 
 ## Hits de otros agentes
 
-La búsqueda y el contexto traen, además de lo propio, las filas de los autores que la política de [`specs/sharing`](../sharing/spec.md) deja leer al llamador: `POST /v1/search` y `POST /v1/context` resuelven el alcance del agente del pedido en cada llamada (`reach`, `api.rs:925`; usos en `api.rs:895` y `:964`). Sobre eso:
+La búsqueda y el contexto traen, además de lo propio, las filas de los autores que la política de [`specs/sharing`](../sharing/spec.md) deja leer al llamador: `POST /v1/search` y `POST /v1/context` resuelven el alcance del agente del pedido en cada llamada (`reach`, `api.rs:972`; usos en `api.rs:942` y `:1012`). Sobre eso:
 
 - Cada hit de `POST /v1/search` MUST llevar su autor como `agent_id` (`RankedHit.agent_id`, `search.rs:88`); el cliente lo lee con `#[serde(default)]` y un hit sin autor cuenta como propio (`client.rs:165`).
 - El workspace, ACTIVE CONFLICTS, el listado, la síntesis y el detector de contradicciones al guardar MUST seguir viendo sólo lo del agente: sólo los hits de búsqueda llegan a filas ajenas.
-- Un hit ajeno MUST contar como acceso igual que uno propio (`api.rs:915`).
+- Un hit ajeno MUST contar como acceso igual que uno propio (`api.rs:962`).
 
 **Test:** `a_hit_carries_its_author` (`search.rs`), `search_returns_the_author_of_each_hit` y `search_and_context_follow_the_sharing_policy_from_the_next_call` (`crates/clawg-cli/tests/api.rs`), `the_workspace_and_conflicts_stay_own` (`prompt_builder.rs`) y `contradiction_probe_ignores_shared_authors` (`contradiction.rs`).
 
 ## Línea de hit en `recall_context`
 
-Cada hit MUST imprimirse como un encabezado de una línea seguido del texto en la misma línea (`format_hit_line`, `prompt_builder.rs:333`):
+Cada hit MUST imprimirse como un encabezado de una línea seguido del texto en la misma línea (`format_hit_line`, `prompt_builder.rs:514`):
 
 - `kind = memory`: `[YYYY-MM-DD #id tipo] texto`
 - otro kind: `[YYYY-MM-DD #id kind/tipo] texto`, con `kind` en minúsculas (`episodic`, `procedural`). Para esos kinds la búsqueda pone el tipo fijo `episode` o `procedure`.
-- un hit de otro agente lleva ` by <autor>` antes del `]` (`[YYYY-MM-DD #id tipo by <autor>] texto`), y si hay alguno el prompt termina con un bloque `=== SHARED ===` con una nota (`prompt_builder.rs:276-282`): [`specs/sharing`](../sharing/spec.md) R4. Sin hits ajenos, el prompt es el de siempre.
+- un hit de otro agente lleva ` by <autor>` antes del `]` (`[YYYY-MM-DD #id tipo by <autor>] texto`), y si hay alguno el prompt termina con un bloque `=== SHARED ===` con una nota (`prompt_builder.rs:423-429`): [`specs/sharing`](../sharing/spec.md) R4. Sin hits ajenos, el prompt es el de siempre.
 
 Si el texto tiene varias líneas, las siguientes MUST seguir tal cual (líneas en blanco y código incluidos) hasta el próximo encabezado de hit o separador `=== `. No se imprime `SOURCE:`, `TYPE:` ni `CONTENT:`. El `#id` es el que aceptan `delete_memory` y `update_memory`, con el kind de la línea (`memory` si no tiene).
 
@@ -260,9 +269,9 @@ Si el texto tiene varias líneas, las siguientes MUST seguir tal cual (líneas e
 
 ## Conflictos por referencia
 
-Cada par MUST imprimir los ids de sus dos lados como `#id`: son los valores que `resolve_conflict` recibe como `keep` y `other` (`ResolveConflictArgs`, `crates/clawg-cli/src/mcp/server.rs:268`), y los dos son ids de `memory`.
+Cada par MUST imprimir los ids de sus dos lados como `#id`: son los valores que `resolve_conflict` recibe como `keep` y `other` (`ResolveConflictArgs`, `crates/clawg-cli/src/mcp/server.rs:294`), y los dos son ids de `memory`.
 
-Un lado que es hit mostrado MUST imprimirse sólo como `#id`. Un lado que no es hit mostrado (fila del workspace, o fila fuera del prompt) MUST imprimirse con su texto completo bajo el encabezado `[YYYY-MM-DD #id]` la primera vez que aparece en el bloque, y sólo como `#id` las siguientes (`format_conflict_block`, `prompt_builder.rs:376`). Así el texto de una fila aparece a lo sumo una vez en el bloque aunque esté en varios pares: en una cadena de disputas, la fila del medio es nueva en un par y vieja en otro. Un par con ambos lados mostrados MUST NOT imprimir ningún texto. `importance`, `tier` y `status` no se imprimen.
+Un lado que es hit mostrado MUST imprimirse sólo como `#id`. Un lado que no es hit mostrado (fila del workspace, o fila fuera del prompt) MUST imprimirse con su texto completo bajo el encabezado `[YYYY-MM-DD #id]` la primera vez que aparece en el bloque, y sólo como `#id` las siguientes (`format_conflict_block`, `prompt_builder.rs:557`). Así el texto de una fila aparece a lo sumo una vez en el bloque aunque esté en varios pares: en una cadena de disputas, la fila del medio es nueva en un par y vieja en otro. Un par con ambos lados mostrados MUST NOT imprimir ningún texto. `importance`, `tier` y `status` no se imprimen. Un lado cuyo hit cortó el presupuesto no es hit mostrado: MUST llevar su texto, nunca un `#id` que el prompt no imprime (el bloque cita por las posiciones de los hits que quedaron, `render`, `prompt_builder.rs:421`).
 
 Formato de un grupo:
 
@@ -287,7 +296,11 @@ OLD #M                      | OLD [YYYY-MM-DD #M] texto
 - GIVEN los pares (old 2, new 3), (old 1, new 3) y (old 1, new 2), ninguno con hits
 - THEN el bloque es `NEW [<fecha> #3 disputed] <texto de 3>`, `OLD [<fecha> #2] <texto de 2>`, `OLD [<fecha> #1] <texto de 1>`, `NEW #2`, `OLD #1`
 
-**Test:** `conflict_block_cites_shown_hits_by_id_and_prints_text_only_for_the_rest`, `a_row_in_several_pairs_prints_its_text_once` y `e2e_full_4_block_output` (la fila mostrada aparece una vez y el bloque la cita como `OLD #id`) en `prompt_builder.rs`.
+#### Escenario: lado cortado por el presupuesto
+- GIVEN el par (old 2, new 1), con 1 como hit mostrado y 2 como hit candidato que el presupuesto dejó afuera
+- THEN el bloque contiene `NEW #1` y `OLD [<fecha> #2] <texto de 2>`, no `OLD #2`
+
+**Test:** `conflict_block_cites_shown_hits_by_id_and_prints_text_only_for_the_rest`, `a_row_in_several_pairs_prints_its_text_once` y `e2e_full_4_block_output` (la fila mostrada aparece una vez y el bloque la cita como `OLD #id`) en `prompt_builder.rs`; el lado cortado, `a_conflict_on_a_cut_hit_carries_its_text` (`prompt_builder.rs`).
 
 ## Conflictos agrupados por fila nueva
 
@@ -301,7 +314,7 @@ Los pares que comparten `new_id` MUST formar un grupo: una línea `NEW`, y una l
 
 ## Una NOTE por bloque de conflictos
 
-La NOTE MUST imprimirse una sola vez por bloque, justo bajo el separador y antes de los grupos (`CONFLICT_NOTE`, `prompt_builder.rs:348`):
+La NOTE MUST imprimirse una sola vez por bloque, justo bajo el separador y antes de los grupos (`CONFLICT_NOTE`, `prompt_builder.rs:529`):
 
 ```
 NOTE: estas memorias se contradicen y aún no resolviste cuál vale.
@@ -317,14 +330,14 @@ Con su respuesta, llamá a resolve_conflict (keep = la que vale, other = la otra
 
 ## Orden y tope de los conflictos
 
-Una función pura sobre los pares leídos (`rank_conflicts`, `prompt_builder.rs:357`) MUST ordenarlos por clave `(rank, new_id desc, old_id asc)`:
+Una función pura sobre los pares leídos (`rank_conflicts`, `prompt_builder.rs:538`) MUST ordenarlos por clave `(rank, new_id desc, old_id asc)`:
 
-- `rank` = menor posición de hit entre sus lados que son hits mostrados;
-- los pares sin ningún hit mostrado (sólo tocan una fila del workspace) MUST ir al final, con `rank` = infinito.
+- `rank` = menor posición de hit entre sus lados que son hits candidatos de `memory` (las posiciones se toman antes del presupuesto, `prompt_builder.rs:246` y `:255`);
+- los pares sin ningún hit candidato (sólo tocan una fila del workspace) MUST ir al final, con `rank` = infinito.
 
 El resultado MUST NOT depender del orden de entrada. Los grupos salen en orden de su primer par.
 
-Tras ordenar, el bloque MUST conservar los primeros 5 pares (`MAX_CONFLICT_PAIRS`, `prompt_builder.rs:44`; el tope cuenta pares, antes de agrupar). Si quedan N > 0 afuera, la última línea del bloque MUST ser `(+N conflictos más sin mostrar)`. Con N = 0 MUST NOT haber esa línea.
+Tras ordenar, el bloque MUST conservar los primeros 5 pares (`MAX_CONFLICT_PAIRS`, `prompt_builder.rs:45`; el tope cuenta pares, antes de agrupar). Si quedan N > 0 afuera, la última línea del bloque MUST ser `(+N conflictos más sin mostrar)`. Con N = 0 MUST NOT haber esa línea. Los pares que el presupuesto quita después ([El prompt cumple el presupuesto](#el-prompt-cumple-el-presupuesto)) se suman a N.
 
 #### Escenario: posición
 - GIVEN un par cuyo hit está en posición 0 y otro en posición 4
@@ -346,7 +359,7 @@ Tras ordenar, el bloque MUST conservar los primeros 5 pares (`MAX_CONFLICT_PAIRS
 
 ## Workspace en el prompt
 
-El workspace entregado al modelo (`workspace_for_prompt`, `prompt_builder.rs:430`) MUST NOT contener `<!-- `, ni sección USER vacía, ni un encabezado `## ` de la sección AUTO sin bullets debajo. El contenido no vacío de USER MUST conservarse tal cual lo escribió el usuario, encabezados incluidos, sin marcadores y sin líneas en blanco al principio ni al final: la poda de encabezados sólo mira la sección AUTO, que es la que genera `render_rows` (`workspace.rs:445`). Un archivo sin `AUTO_START` MUST entregarse entero; uno con AUTO pero sin `AUTO-END` se toma como AUTO hasta el final, y el texto antes de `AUTO-START` se entrega. Si no queda nada, no se emite la sección WORKSPACE. El archivo en disco MUST ser byte a byte idéntico antes y después de un recall.
+El workspace entregado al modelo (`workspace_for_prompt`, `prompt_builder.rs:611`) MUST NOT contener `<!-- `, ni sección USER vacía, ni un encabezado `## ` de la sección AUTO sin bullets debajo. El contenido no vacío de USER MUST conservarse tal cual lo escribió el usuario, encabezados incluidos, sin marcadores y sin líneas en blanco al principio ni al final: la poda de encabezados sólo mira la sección AUTO, que es la que genera `render_rows` (`workspace.rs:445`). Un archivo sin `AUTO_START` MUST entregarse entero; uno con AUTO pero sin `AUTO-END` se toma como AUTO hasta el final, y el texto antes de `AUTO-START` se entrega. Si no queda nada, no se emite la sección WORKSPACE. El archivo en disco MUST ser byte a byte idéntico antes y después de un recall.
 
 #### Escenario: sin marcadores
 - GIVEN un archivo con AUTO/USER, un bullet bajo `## User Preferences` y los otros dos encabezados vacíos
@@ -362,9 +375,55 @@ El workspace entregado al modelo (`workspace_for_prompt`, `prompt_builder.rs:430
 
 **Test:** `workspace_in_prompt_has_no_markers_or_empty_headings`, `workspace_user_section_content_is_kept_without_markers` y `workspace_file_bytes_are_unchanged_by_rendering_the_prompt` en `prompt_builder.rs`; el archivo plano, `embedder_none_emits_workspace_only_if_present`.
 
+## El prompt cumple el presupuesto
+
+`build_memory_prompt` recibe el presupuesto del contexto y arma el texto con `fit_to_budget` (`prompt_builder.rs:316`), una función pura sobre el workspace, los hits candidatos y los pares ya ordenados. Si el texto entero entra, MUST ser byte a byte el que se arma sin presupuesto. Si no entra, MUST quitar de a uno, midiendo otra vez el texto entero después de cada paso, primero los hits de LONG-TERM desde el último, después los de RECENT desde el último y después los pares de conflictos desde el último, hasta que entre. El texto MUST NOT superar el presupuesto salvo en el caso de [un workspace más grande que el presupuesto](#un-workspace-más-grande-que-el-presupuesto-se-entrega-y-se-dice).
+
+El workspace MUST NOT recortarse: sus preferencias y su sección USER son el acuerdo con el usuario, y cada fila que imprimió es una que la búsqueda salteó (`EmittedIds`), así que cortarla la dejaría sin ningún canal. Medir el texto entero en cada paso cuenta la nota `SHARED`, el bloque `BUDGET` y el texto que gana un conflicto cuando se va su hit.
+
+#### Escenario: muchas filas largas
+- GIVEN diez hits de 2.000 bytes y un presupuesto de 8.000
+- THEN el prompt ocupa como mucho 8.000 bytes, y los hits que quedan son los primeros en orden de prioridad
+
+#### Escenario: sin recorte
+- GIVEN un contexto de 3.000 bytes y el presupuesto default
+- THEN el prompt es byte a byte el que se arma sin presupuesto, sin bloque `BUDGET`
+
+**Tests:** `the_prompt_never_exceeds_the_budget`, `the_cut_starts_at_the_end_of_long_term`, `a_context_that_fits_is_left_as_it_was`, `conflicts_go_after_every_hit` y, con el store, `a_store_of_long_rows_fits_the_budget` (`prompt_builder.rs`). Que sin recorte el prompt sea el de antes lo siguen probando `e2e_full_4_block_output` y los tests de bloques, que corren con el default.
+
+## El primer hit de un bloque se recorta en lugar de saltarse
+
+Cuando el hit a quitar es el único que queda en su bloque, su texto MUST acortarse en lo que sobra, en un límite de carácter UTF-8, sin espacio al final y terminado en ` [truncated]` (`shorten`, `prompt_builder.rs:365`). Si volver a medir lo deja todavía por encima, se acorta otra vez sin repetir la marca. Sólo si no le queda texto MUST quitarse. Un hit recortado sigue siendo hit mostrado: un hit acortado y su id dicen más que un bloque vacío.
+
+**Tests:** `the_first_hit_of_a_block_is_shortened_not_dropped` y `a_shortened_text_ends_on_a_character_boundary` (`prompt_builder.rs`).
+
+## Lo cortado se nombra por id
+
+Si algo se cortó o recortó, el prompt MUST terminar con un bloque `=== BUDGET ===` (`render`, `prompt_builder.rs:430-438`; su texto en `format_cut`, `:445`) que dice el presupuesto, cuántos bytes ocupa el contexto entero, los ids cortados en el orden en que se imprimirían y los recortados, con su kind delante cuando no es `memory` (`episodic #3`), y que `read_memory` los devuelve enteros:
+
+```
+=== BUDGET ===
+Cut to fit 8000 bytes; the full context is 12040 bytes. Left out: #40, #41. Shortened: #12. read_memory returns any of them whole.
+```
+
+Sin recorte el bloque MUST NOT aparecer. El bloque MUST NOT quitarse para entrar.
+
+#### Escenario: pedir lo que quedó afuera
+- GIVEN un contexto que cortó el hit #40
+- WHEN el agente llama `read_memory` con 40
+- THEN recibe su texto entero
+
+**Tests:** `what_the_budget_left_out_is_named_by_id` y `the_budget_block_stays_with_the_smallest_budget` (`prompt_builder.rs`); `a_hit_cut_by_the_budget_is_readable_whole` (`crates/clawg-cli/src/mcp/server.rs`).
+
+## Un workspace más grande que el presupuesto se entrega y se dice
+
+Si sin ningún hit ni par el texto sigue por encima del presupuesto, el prompt MUST llevar el workspace entero, ningún hit y el bloque `BUDGET` con cuántos bytes ocupa el contexto entero y la frase `The workspace alone is over the budget and is shown whole.` (`prompt_builder.rs:329-331` y `:462-464`). Es el único caso en que el prompt supera el presupuesto.
+
+**Test:** `a_workspace_over_the_budget_is_kept_and_said` (`prompt_builder.rs`).
+
 ## El parser de `rag-eval --agent-view`
 
-`context_segments` (`crates/clawg-eval/src/bin/rag-eval/agent_view/parse.rs:84`) MUST segmentar por sección (`context_sections`, `parse.rs:67`): los segmentos de hit salen sólo de RECENT CONTEXT y LONG-TERM KNOWLEDGE; los bullets, sólo de WORKSPACE; el texto de ACTIVE CONFLICTS MUST NOT contar para `found`. Encabezado de hit = línea que cumple `[` + `YYYY-MM-DD` + ` #` + dígitos + (` ` + palabra sin espacios)? + `]` + ` ` (`hit_text`, `parse.rs:137`); el texto es lo que sigue en la misma línea, y el segmento corre hasta el próximo encabezado o separador. Un marcador `<!--` cierra un bullet.
+`context_segments` (`crates/clawg-eval/src/bin/rag-eval/agent_view/parse.rs:84`) MUST segmentar por sección (`context_sections`, `parse.rs:67`): los segmentos de hit salen sólo de RECENT CONTEXT y LONG-TERM KNOWLEDGE; los bullets, sólo de WORKSPACE; el texto de ACTIVE CONFLICTS, SHARED y BUDGET MUST NOT contar para `found`. Encabezado de hit = línea que cumple `[` + `YYYY-MM-DD` + ` #` + dígitos + (` ` + palabra sin espacios)? + `]` + ` ` (`hit_text`, `parse.rs:137`); el texto es lo que sigue en la misma línea, y el segmento corre hasta el próximo encabezado o separador. Un marcador `<!--` cierra un bullet.
 
 #### Escenario: multilínea
 - GIVEN dos hits, el primero con código y línea en blanco
@@ -378,7 +437,7 @@ El workspace entregado al modelo (`workspace_for_prompt`, `prompt_builder.rs:430
 
 ## Los ids de `recall_context` en `delete_memory` y `update_memory`
 
-La doc de `DeleteMemoryArgs.id` (`server.rs:228`), la de `UpdateMemoryArgs.id` (`server.rs:251`) y la descripción de `delete_memory` (`server.rs:873`) MUST nombrar `recall_context` además de `search_memory` y `list_memories`, y decir que un hit sin kind explícito es `memory`. `kind` sigue siendo obligatorio en las dos.
+La doc de `DeleteMemoryArgs.id` (`server.rs:254`), la de `UpdateMemoryArgs.id` (`server.rs:277`) y la descripción de `delete_memory` (`server.rs:902`) MUST nombrar `recall_context` además de `search_memory` y `list_memories`, y decir que un hit sin kind explícito es `memory`. `kind` sigue siendo obligatorio en las dos.
 
 **Test:** `memory_id_docs_name_recall_context_and_the_default_kind` en `server.rs`.
 
@@ -398,6 +457,8 @@ Detalle de las corridas en el [`verify.md`](../../changes/archive/2026-10-14-con
 
 Esas cifras son con pooling CLS. Desde project-indexing (pooling mean, `RELEVANCE_RATIO` 0,35), medido en Windows el 2026-10-15 con el mismo golden set: `search_memory` encuentra 36/46 con 764,0 / 1.206 tokens (media / máximo) y `recall_context` 39/46 con 1.086,4 / 1.408. Los casos que se pierden contra CLS (c02, c09, c11, c18, c26 y c41) no vuelven aunque el corte baje a 0,2: la pérdida es del pooling, sobre todo en las consultas en inglés. Detalle en el [`verify.md`](../../changes/archive/2026-10-15-project-indexing/verify.md) de project-indexing.
 
+Desde context-budget, con el presupuesto default de 8.000 bytes, medido en Windows el 2026-10-17 sobre `f3c44ef` con el golden de english-recall (sha256 `363d3e08…a1fb`, n = 46): `recall_context` 39/46 con 1.086,4 / 1.408 tokens y `search_memory` 36/46 con 764,0 / 1.206, sin ningún prompt cortado (ninguno lleva `=== BUDGET ===`). Contra `2026-10-17-real-rank-fusion-tip-agent-view.json` (`31420de`), `rag-eval --diff` no mueve ningún caso en ninguna métrica. Detalle en el [`verify.md`](../../changes/archive/2026-10-17-context-budget/verify.md) de context-budget.
+
 ## Indexar un proyecto no cambia la búsqueda de memorias
 
 Con un proyecto indexado ([`specs/project-docs`](../project-docs/spec.md)), `search_all_memories`, `POST /v1/search`, `POST /v1/context`, `search_memory` y `recall_context` MUST devolver exactamente lo mismo que sin índice: el índice vive en tablas propias (`project_doc_*`) que ninguna de esas rutas consulta, y el refresco no escribe `memory` ni sus vectores, su FTS o el access tracker.
@@ -415,8 +476,9 @@ Con un proyecto indexado ([`specs/project-docs`](../project-docs/spec.md)), `sea
 - Las corridas de eval no registran accesos (`AccessTracker::inert`, `crates/clawg-core/src/eval_api.rs:478`).
 - Con `lexical_bonus = 0` el ranking es bit a bit el de antes del bono: es la forma de apagarlo sin tocar el canal léxico.
 - Los contadores ya guardados no se reescriben. Los accesos que se contaron de más antes de este comportamiento quedan como estaban.
-- El formato del prompt de `recall_context` no toca la búsqueda: la salida de `search_memory` es la misma, y el orden y los separadores de las secciones (`prompt_builder.rs:21-24`) y `K_FINAL` (`:42`) no dependen de él. El separador `=== ACTIVE CONFLICTS (review needed) ===` lo nombran las instrucciones del servidor y la doc de `resolve_conflict`.
-- Un prompt vacío se entrega como `no context yet` (`format_context`, `crates/clawg-cli/src/mcp/tools.rs:298`), y el aviso de `synthesize` va después del prompt (`format_recall`, `tools.rs:285`), fuera de lo que mide `rag-eval`.
+- El formato del prompt de `recall_context` no toca la búsqueda: la salida de `search_memory` es la misma, y el orden y los separadores de las secciones (`prompt_builder.rs:21-24`) y `K_FINAL` (`:43`) no dependen de él. El separador `=== ACTIVE CONFLICTS (review needed) ===` lo nombran las instrucciones del servidor y la doc de `resolve_conflict`.
+- El presupuesto no toca la búsqueda ni el ranking: corta lo que se imprime, después de `K_FINAL`, y la salida de `search_memory` es la misma.
+- Un prompt vacío se entrega como `no context yet` (`format_context`, `crates/clawg-cli/src/mcp/tools.rs:323`), salvo cuando las memorias no se buscaron: entonces lo reemplaza el aviso de [`specs/mcp`](../mcp/spec.md). Ese aviso va antes del prompt y el de `synthesize` después (`format_recall`, `tools.rs:304`), los dos fuera de lo que mide `rag-eval`.
 - Armar el prompt no escribe: `fetch_active_conflicts` es un `SELECT`, y el archivo del workspace no cambia.
 
 ## Fuera de esta spec

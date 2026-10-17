@@ -1,7 +1,7 @@
 change: context-budget
 objective: "1"
 depends_on: []
-phase: verify
+phase: archive
 artifacts:
   exploration: done
   proposal: done
@@ -9,6 +9,6 @@ artifacts:
   design: done
   tasks: done
   apply: done
-  verify: partial  # suite y clippy en Linux; faltan el CI y rag-eval --real --agent-view
-  archive: pending
+  verify: done  # suite y clippy en Linux, CI en Linux y Windows, rag-eval --real --agent-view sin ningún caso movido
+  archive: done
 updated: 2026-10-17

@@ -1,6 +1,6 @@
 # context-budget — Especificación
 
-Al archivar, R1 a R5 se suman a `specs/retrieval` (el armado de `recall_context`) y R6 y R7 a `specs/mcp` (la petición, la respuesta y la herramienta).
+Archivado el 2026-10-17: R1 a R4 están en [`specs/retrieval`](../../../specs/retrieval/spec.md#el-prompt-cumple-el-presupuesto), R5 en sus apartados de accesos y conflictos, y R6 y R7 en [`specs/mcp`](../../../specs/mcp/spec.md#el-presupuesto-de-recall_context) (la petición, la respuesta y la herramienta).
 
 ## Definiciones
 

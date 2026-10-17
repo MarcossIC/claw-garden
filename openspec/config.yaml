@@ -27,6 +27,8 @@ context: |
   Compare two runs with rag-eval --diff: a conclusion needs at least 6 cases moving one way (p < 0.05).
   Agent-view baseline (RELEVANCE_RATIO 0.35): search_memory 36/46 at 764.0 mean tokens,
   recall_context 39/46 at 1086.4 (docs/eval/results/2026-10-15-real-project-indexing-relcut-agent-view.json).
+  recall_context takes a byte budget (default 8000, at most 24000); with the default no golden case is cut and no case
+  moves (docs/eval/results/2026-10-17-real-context-budget-tip-agent-view.json).
   Expanded golden (docs/eval/golden-expanded.json, sha256 855c64b98e5403e55777c87873bcf006299502b857dcfbb7920acb48d9d6f2b5,
   outside git): 1280 rows, 154 cases, 30 of them lexical_related. Its agent-view baselines are
   docs/eval/results/2026-10-17-real-rank-fusion-base-expanded-agent-view.json (lexical_related all_hit_rate 0.00) and
