@@ -116,11 +116,13 @@ pub struct MemoryRuntime {
     /// What the bootstrap last said about the embedder. The bootstrap gets a
     /// clone of this sender; readers use [`MemoryRuntime::embedder_status`].
     pub embedder_status: watch::Sender<EmbedderStatus>,
-    /// Shared tokenizer for query-context composition, filled by the ingest
-    /// worker's setup step from the same `tokenizer.json` the chat chunker
-    /// loads — so the two can never disagree about what a "token" is. Empty at
-    /// construction in every constructor; there is no eager load here, only a
-    /// shared slot for whoever fills it.
+    /// The process's one parse of `tokenizer.json`, shared by the chunkers,
+    /// query-context composition and the embedder — so they can never disagree
+    /// about what a "token" is, and a model reload parses nothing. Whichever
+    /// asks first fills it from bytes checked against their SHA-256: the ingest
+    /// worker's setup step or the model load. Empty at construction in every
+    /// constructor; there is no eager load here, only a shared slot for whoever
+    /// fills it.
     pub tokenizer: Arc<OnceCell<Arc<tokenizers::Tokenizer>>>,
     /// Fire-and-forget access tracker for the retrieval hot path. Its flush
     /// worker is already spawned by the time this struct exists — see
