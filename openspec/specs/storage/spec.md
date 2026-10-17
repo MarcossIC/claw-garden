@@ -1,6 +1,6 @@
 # storage — Especificación
 
-Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde queda un save aceptado hasta que termina de guardarse, el apagado del daemon, la reinyección de lo pendiente al arrancar y la importación del volcado de versiones anteriores, la resolución del directorio de datos, el runner de migraciones y la verificación del esquema, el pooling del modelo y el re-embebido de un store CLS al arrancar, los snapshots, `clawg backup` y `clawg restore`, la escritura de `workspace.md`, y lo que `clawg status`, MCP y el instalador dicen cuando la base no se puede abrir.
+Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde queda un save aceptado hasta que termina de guardarse, el apagado del daemon, la reinyección de lo pendiente al arrancar y la importación del volcado de versiones anteriores, la resolución del directorio de datos, el runner de migraciones y la verificación del esquema, el pooling del modelo y el re-embebido de un store CLS al arrancar, el ciclo de vida del embedder (soltar el modelo ocioso, recargarlo, un solo tokenizer por proceso y la memoria que vuelve al sistema), los snapshots, `clawg backup` y `clawg restore`, la escritura de `workspace.md`, y lo que `clawg status`, MCP y el instalador dicen cuando la base no se puede abrir.
 
 **Origen:**
 - [data-preservation](../../changes/archive/2026-10-12-data-preservation/proposal.md) (partes A + F), archivado el 2026-10-12.
@@ -8,6 +8,7 @@ Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde q
 - [project-indexing](../../changes/archive/2026-10-15-project-indexing/proposal.md), archivado el 2026-10-15 (sólo "Contrato de embedding y pooling", el motivo `pre-reembed` y la fila de V12).
 - [project-root-guard](../../changes/archive/2026-10-15-project-root-guard/proposal.md), archivado el 2026-10-15 (sólo la fila de V13).
 - [ingest-outbox](../../changes/archive/2026-10-15-ingest-outbox/proposal.md), archivado el 2026-10-15 (el outbox, el apagado y el arranque sin volcado, el volcado viejo y la fila de V14). El contrato de `POST /v1/memories` que lo usa está en [`specs/ingest`](../ingest/spec.md).
+- [embedder-idle-unload](../../changes/archive/2026-10-17-embedder-idle-unload/proposal.md), archivado el 2026-10-17 (el ciclo de vida del embedder y la reescritura de «El modelo se carga con pooling mean» para `E5Embedder`). El campo `embedder_resident` de `/health` está en [`specs/mcp`](../mcp/spec.md).
 
 ## Definiciones
 
@@ -247,15 +248,15 @@ Con plan `Pending`, `open` MUST hacer un snapshot `pre-migration` antes de aplic
 
 ### El modelo se carga con pooling mean
 
-`FastEmbedLocal` MUST cargar multilingual-e5-small con pooling mean, el de su entrenamiento (`e5_model`, `crates/clawg-core/src/memory/embedder.rs:138`). Sin indicarlo, fastembed toma el token CLS de un modelo definido por el usuario, y entonces todos los pasajes de un corpus quedan a 0,90–0,91 de coseno de cualquier pregunta.
+`E5Embedder` (`crates/clawg-core/src/memory/embedder.rs:397`) MUST embeber con pooling mean, el del entrenamiento de multilingual-e5-small: la media de los estados ocultos sobre la máscara de atención y después L2 (`pool_and_normalize`, `embedder.rs:277`). Con el token CLS, todos los pasajes de un corpus quedaban a 0,90–0,91 de coseno de cualquier pregunta. La inferencia la arma clawg sobre ONNX Runtime; las reglas de la ventana, el relleno y la salida están en «Los mismos vectores que fastembed», abajo.
 
-El id del modelo en el contrato de embedding MUST ser `multilingual-e5-small/mean` (`E5_MODEL_ID`, `embedder.rs:128`). El id anterior, `multilingual-e5-small` (`LEGACY_CLS_MODEL_ID`, `embedder.rs:133`), nombra los vectores CLS: el archivo del modelo es el mismo, el espacio no. El contrato no tiene una columna de pooling; el id es lo que distingue espacios, y el índice de documentación de los proyectos, que guarda el `model_id` de cada doc, se reindexa solo cuando cambia ([`specs/project-docs`](../project-docs/spec.md)).
+El id del modelo en el contrato de embedding MUST ser `multilingual-e5-small/mean` (`E5_MODEL_ID`, `embedder.rs:133`). El id anterior, `multilingual-e5-small` (`LEGACY_CLS_MODEL_ID`, `embedder.rs:139`), nombra los vectores CLS: el archivo del modelo es el mismo, el espacio no. El contrato no tiene una columna de pooling; el id es lo que distingue espacios, y el índice de documentación de los proyectos, que guarda el `model_id` de cada doc, se reindexa solo cuando cambia ([`specs/project-docs`](../project-docs/spec.md)).
 
-**Test:** `the_e5_model_is_pooled_by_mean` y `the_model_id_names_its_pooling_apart_from_the_cls_vectors_of_before` en `embedder.rs`.
+**Tests:** `mean_pooling_matches_fastembeds_formula_bit_for_bit` y `the_model_id_names_its_pooling_apart_from_the_cls_vectors_of_before` en `embedder.rs`.
 
 ### Re-embebido de un store CLS al arrancar
 
-Al arrancar, después de cargar el modelo y dentro del bootstrap del embedder, el daemon verifica el contrato (`verify_or_reembed`, `crates/clawg-core/src/memory/bootstrap.rs:394`, cableado en `production_deps`, `bootstrap.rs:232`, que `serve_deps`, `bootstrap.rs:319`, entrega al daemon en `crates/clawg-cli/src/daemon/serve.rs:94`). Si el contrato guardado tiene `LEGACY_CLS_MODEL_ID` y el embedder cargado tiene `E5_MODEL_ID`, con la misma dimensión y los mismos prefijos (`is_pooling_upgrade`, `bootstrap.rs:380`, pura), MUST:
+Al arrancar, después de cargar el modelo y dentro del bootstrap del embedder, el daemon verifica el contrato (`verify_or_reembed`, `crates/clawg-core/src/memory/bootstrap.rs:431`, cableado por `contract_verifier`, `bootstrap.rs:250`, en `production_deps`, `bootstrap.rs:272`, que `serve_deps`, `bootstrap.rs:354`, entrega al daemon en `crates/clawg-cli/src/daemon/serve.rs:94`). Si el contrato guardado tiene `LEGACY_CLS_MODEL_ID` y el embedder cargado tiene `E5_MODEL_ID`, con la misma dimensión y los mismos prefijos (`is_pooling_upgrade`, `bootstrap.rs:417`, pura), MUST:
 
 1. escribir un snapshot `pre-reembed` en `<data>/backups`; si falla, no re-embebe, y el intento termina como un fallo de verificación, que se reintenta con la espera de siempre ([`specs/ingest`](../ingest/spec.md), «Reintento del bootstrap»);
 2. re-embeber `memory`, `episodic_trajectory` y `procedural_skill` con el embedder cargado (`reembed_all` en modo `ReInfer`, `crates/clawg-core/src/memory/maintenance.rs:467`);
@@ -281,6 +282,143 @@ Cualquier otro contrato que no coincide (otro modelo, otra dimensión, otros pre
 - THEN no hay snapshot ni re-embebido
 
 **Tests:** `only_the_cls_vectors_of_the_same_model_are_a_pooling_upgrade`, `cls_vectors_are_snapshotted_then_reembedded_by_mean`, `any_other_mismatch_is_left_as_it_is` y `a_store_that_matches_is_not_touched` en `crates/clawg-core/src/memory/bootstrap.rs`; el nombre `pre-reembed` en `snapshot_names_sort_in_time_order` (`backup.rs`). La regla de que el contrato se escribe al final está en los tests de `reembed_all` de `maintenance.rs`.
+
+## Ciclo de vida del embedder
+
+El daemon envuelve el modelo en un `IdleEmbedder` (`crates/clawg-core/src/memory/idle_embedder.rs:154`), que lo suelta tras un tiempo sin uso y lo vuelve a cargar cuando una llamada necesita un vector. Lo arma `unloading_when_idle` (`crates/clawg-core/src/memory/bootstrap.rs:381`), cableado en `crates/clawg-cli/src/daemon/serve.rs:107`.
+
+**Definiciones:**
+- **Tiempo de ocio:** los minutos de `CLAWG_EMBEDDER_IDLE_MINUTES` (`IDLE_MINUTES_VAR`, `idle_embedder.rs:28`), 10 si falta o está vacía.
+- **Residente:** el modelo está en memoria y una llamada no necesita cargarlo.
+- **Uso:** una llamada de embedding, desde que pide el modelo (incluida su carga) hasta que vuelve.
+- **Línea de base:** la memoria privada del mismo build con el embedder falso (`CLAWG_TEST_EMBEDDER=fake`) y sólo `tokenizer.json` en su directorio de datos.
+
+### Soltar el modelo ocioso
+
+El daemon MUST soltar el modelo cuando pasó el tiempo de ocio desde el último uso y no hay ningún uso en curso (`should_unload`, `idle_embedder.rs:53`, pura). Un uso MUST reiniciar la cuenta. Con `CLAWG_EMBEDDER_IDLE_MINUTES=0` MUST NOT soltarlo nunca. Un valor que no es un número entero de minutos SHOULD avisar en el log y MUST usar 10, sin impedir el arranque. El barrido corre cada cuarto del tiempo de ocio, entre 1 y 60 s (`sweep_period`, `idle_embedder.rs:59`), y termina con el embedder.
+
+#### Escenario: se suelta tras el ocio
+- GIVEN un modelo residente con un tiempo de ocio de 10 minutos
+- WHEN pasan 10 minutos sin usos
+- THEN deja de ser residente
+
+#### Escenario: un uso largo lo retiene
+- GIVEN una llamada de embedding que dura más que el tiempo de ocio
+- WHEN se cumple el tiempo de ocio durante la llamada
+- THEN el modelo sigue residente, y la cuenta empieza cuando la llamada vuelve
+
+**Tests:** `a_model_goes_only_after_the_idle_time_with_nothing_in_flight`, `an_unused_model_is_unloaded_after_the_idle_time`, `each_use_restarts_the_idle_time`, `a_call_in_flight_keeps_the_model_past_the_idle_time`, `the_idle_time_defaults_to_ten_minutes_and_zero_keeps_the_model`, `an_idle_time_that_is_not_whole_minutes_is_refused` y `the_sweeper_ends_with_the_embedder` (`idle_embedder.rs`).
+
+### Recargar a demanda, una sola vez
+
+Una llamada con el modelo suelto MUST cargarlo con los mismos archivos verificados y la misma carga del arranque (`ensure` y `load` otra vez, en `unloading_when_idle`), y MUST devolver el mismo vector que antes de soltarlo. Una recarga MUST NOT volver a parsear el tokenizer («Un solo tokenizer por proceso»). Las llamadas que llegan durante una carga MUST compartirla. `model_id`, `dimensions` y los prefijos MUST NOT cargar el modelo.
+
+#### Escenario: varias llamadas, una carga
+- GIVEN el modelo suelto
+- WHEN llegan 8 llamadas a la vez
+- THEN el modelo se carga una vez y las 8 responden
+
+**Tests:** `a_call_after_an_unload_loads_the_model_again_and_gets_the_same_vector`, `calls_arriving_while_the_model_is_away_share_one_load` e `identity_and_prefixes_never_load_the_model` (`idle_embedder.rs`); `a_reload_does_not_parse_the_tokenizer_again` y `an_idle_unloading_embedder_reloads_through_the_same_files_and_load` (`bootstrap.rs`).
+
+### Una recarga que falla no deja nada roto
+
+Una recarga que falla MUST responder «no listo» (`EmbedError::NotReady`) y la llamada siguiente MUST intentar otra vez. Una recarga que trae otro `model_id` u otra dimensión MUST rechazarse igual: los vectores nuevos no pueden caer en otro espacio que los guardados. El estado del embedder MUST NOT pasar a `failed` por una recarga.
+
+#### Escenario: los archivos desaparecieron
+- GIVEN el modelo suelto y una recarga que falla
+- WHEN llega una búsqueda
+- THEN responde `503 embedder_not_ready` (`embed_failure`, `crates/clawg-cli/src/daemon/api.rs:860`), y la búsqueda siguiente vuelve a intentar la carga
+
+**Tests:** `a_failed_load_is_not_ready_and_the_next_call_tries_again` y `a_model_that_comes_back_as_another_model_is_refused` (`idle_embedder.rs`); `a_search_whose_model_cannot_load_again_answers_not_ready` (`crates/clawg-cli/tests/api.rs`).
+
+### Las herramientas funcionan con el modelo suelto
+
+Buscar, guardar, restaurar y `recall_context` con el modelo suelto MUST esperar la recarga y responder como con el modelo residente. `embedder` en `/health` MUST seguir en `ready`; si el modelo está en memoria lo dice `embedder_resident` ([`specs/mcp`](../mcp/spec.md), «El modelo en memoria en `/health`»).
+
+**Tests:** `a_search_with_the_model_unloaded_loads_it_and_answers` y `a_save_with_the_model_unloaded_is_stored` (`crates/clawg-cli/tests/api.rs`).
+
+### Registrar un proyecto despierta el modelo
+
+`POST /v1/projects` MUST empezar a cargar un modelo suelto y MUST responder sin esperar esa carga (`embedder.wake()`, `api.rs:1188`; `wake`, `idle_embedder.rs:236`). Con el modelo residente MUST NOT cargar nada. Un modelo despertado MUST contar como recién usado.
+
+#### Escenario: el puente empieza una sesión
+- GIVEN el modelo suelto
+- WHEN el puente registra su raíz
+- THEN la respuesta llega enseguida y el modelo queda residente poco después, sin que nadie haya buscado
+
+**Tests:** `wake_loads_the_model_without_a_caller_waiting` y `a_woken_model_gets_a_full_idle_time` (`idle_embedder.rs`); `registering_a_project_wakes_an_unloaded_model_without_waiting_for_it` (`crates/clawg-cli/tests/api.rs`).
+
+### La memoria vuelve al sistema
+
+Con el modelo suelto, la memoria privada del daemon MUST quedar cerca de la línea de base. En 10 recargas seguidas, la mediana MUST NOT superar la línea de base en más de 64 MB, y la mediana de las recargas 6 a 10 MUST NOT superar la de las recargas 1 a 5 en más de 16 MB. Vale en Windows y en Linux.
+
+En Linux con glibc, dos cosas lo hacen posible:
+- El hilo dueño de la sesión MUST devolver al sistema las páginas libres al soltarla (`return_freed_memory`, `embedder.rs:572`, un `malloc_trim(0)` después de `drop(inference.session)`).
+- `clawg serve` MUST dejar todos sus hilos en una sola arena de `malloc` (`keep_one_malloc_arena`, `embedder.rs:595`, `mallopt(M_ARENA_MAX, 1)`), fijada en `main` antes de construir el runtime de tokio (`crates/clawg-cli/src/main.rs:41-45`), porque glibc le asigna la arena a un hilo en su primera asignación. Los demás comandos no la fijan (`Command::loads_the_model`, `crates/clawg-cli/src/cli.rs:166`, pura). Cada carga arma, usa y suelta la sesión en hilos nuevos para ella; con las arenas por hilo de glibc, cada recarga podía estrenar otra arena, y cada una retenía de 6 a 24 MB después del trim.
+
+#### Escenario: diez recargas
+- GIVEN `CLAWG_EMBEDDER_IDLE_MINUTES=1` y la línea de base medida en el mismo build
+- WHEN diez veces una búsqueda semántica (`POST /v1/search`) carga el modelo y el tiempo de ocio lo suelta
+- THEN la mediana de las diez muestras con el modelo suelto no supera la línea de base en más de 64 MB, y la mediana de las recargas 6 a 10 no supera la de las recargas 1 a 5 en más de 16 MB
+
+#### Escenario: un parse en toda la corrida
+- GIVEN la misma corrida de diez recargas
+- WHEN termina
+- THEN el log tiene una sola línea `tokenizer.json parsed`
+
+**Medición, no test:** ningún test de la suite comprueba el trim ni la arena; la prueba es el procedimiento de [embedder-idle-unload, D5, «R7 sobre lo medido»](../../changes/archive/2026-10-17-embedder-idle-unload/design.md#r7-sobre-lo-medido), con el build de la suite y un `CLAWG_TEST_HOME` temporal, muestreando `PrivateMemorySize64` en Windows y `RssAnon` en Linux. La búsqueda es `POST /v1/search`, nunca `clawg memories search`, que es una búsqueda por texto y no carga el modelo. Medido el 2026-10-17: en Windows, 21,3 MB sobre la base y +2,4 entre mitades; en Linux, con la arena única, 7,6 MB sobre la base y +0,0 entre mitades (sin ella, entre 60 y 76 MB y +18). `only_serve_loads_the_model` (`cli.rs`) fija qué comando pide la arena.
+
+### Un solo tokenizer por proceso
+
+El daemon MUST parsear `tokenizer.json` a lo sumo una vez por proceso, y sólo de bytes cuyo SHA-256 verificó. El chunker, el índice de docs y el embedder MUST compartir esa copia, la celda `MemoryRuntime::tokenizer` (`crates/clawg-core/src/runtime.rs:126`). La llenan `resolve_tokenizer_and_chunker` (`crates/clawg-core/src/memory/worker.rs:810`), con `load_verified_tokenizer` (`crates/clawg-core/src/memory/model_download.rs:154`), y `model_loader` (`bootstrap.rs:228`); cada parse deja la línea `tokenizer.json parsed` (`model_download.rs:164` y `:191`). Una recarga MUST NOT volver a parsearlo. El embedder MUST NOT cambiar la configuración del tokenizer compartido.
+
+#### Escenario: arranque con el modelo en disco, en cualquier orden
+- GIVEN el modelo en disco
+- WHEN el worker y la carga del modelo piden el tokenizer, en cualquier orden
+- THEN se parsea una vez y los dos reciben el mismo `Arc`
+
+#### Escenario: primer arranque
+- GIVEN un directorio sin modelo
+- WHEN la carga del modelo baja y verifica los archivos
+- THEN la carga parsea el tokenizer y llena la celda, y el chunker sigue partiendo por bytes hasta el próximo arranque
+
+#### Escenario: `tokenizer.json` alterado
+- GIVEN un `tokenizer.json` con otro SHA-256
+- WHEN el worker intenta cargarlo
+- THEN no lo parsea
+
+#### Escenario: recarga
+- GIVEN el tokenizer ya parseado y el modelo suelto
+- WHEN una llamada recarga el modelo
+- THEN no hay ningún parse
+
+**Tests:** `the_worker_and_the_model_load_share_one_parse` y `a_reload_does_not_parse_the_tokenizer_again` (`bootstrap.rs`); `a_tokenizer_file_with_another_sha256_is_not_parsed` (`worker.rs`).
+
+### Los mismos vectores que fastembed
+
+Para el mismo texto y el mismo rol, el embedder MUST devolver los mismos bits que devolvió fastembed 5.13.4 en una CPU y un sistema operativo como los que generaron la referencia. ONNX Runtime elige sus kernels según la CPU y viene compilado aparte para cada sistema, así que en otra CPU o en otro sistema la diferencia máxima por componente MUST NOT pasar de 1e-6. Eso exige una ventana de `EMBED_MAX_TOKENS` (`embedder.rs:153`) que cuenta `<s>` y `</s>` (`window_encodings`, `embedder.rs:216`), relleno hasta el texto más largo del pedido con `pad_token_id` (`pad_right`, `embedder.rs:235`), `token_type_ids` cuando el modelo los pide, pooling por media sobre la máscara y L2. La carga (`from_parts`, `embedder.rs:530`) MUST rechazar (`LoadFailed`) un tokenizer con truncación o relleno propios, un token de `special_tokens_map.json` que el tokenizer no trata como especial, un `model_max_length` menor que `EMBED_MAX_TOKENS` (`check_tokenizer`, `embedder.rs:335`) y un modelo sin salida elegible (`pick_output`, `embedder.rs:260`). La sesión usa el proveedor de CPU sin arena, optimización de grafo nivel 3 y tantos hilos intra-op como tiene la máquina (`build_session`, `embedder.rs:500`).
+
+#### Escenario: un texto largo conserva `</s>`
+- GIVEN un texto de más de `EMBED_MAX_TOKENS` tokens
+- WHEN se codifica
+- THEN se corta a la ventana y `</s>` queda al final, dentro de los 512 tokens
+
+#### Escenario: un lote de largos mezclados
+- GIVEN un pedido con textos de largos distintos
+- WHEN se codifica
+- THEN cada texto se rellena hasta el más largo del pedido con `pad_token_id`, y ids, máscara y tipos son los de fastembed
+
+#### Escenario: tokens especiales literales en el texto
+- GIVEN un texto con `<s> </s> <pad> <unk> <mask>` escritos
+- WHEN se codifica y se hace el pooling
+- THEN el vector es el que dio fastembed
+
+#### Escenario: otro sistema con la misma CPU
+- GIVEN la fixture generada en Windows y una máquina Linux con la misma arquitectura, AVX2, AVX-512F y FMA
+- WHEN se comparan los vectores
+- THEN se comparan con tolerancia 1e-6, no por bits
+
+**Tests:** `an_encoding_matches_the_tokenizer_configured_like_fastembed`, `a_long_text_is_cut_to_the_window_and_keeps_its_closing_token`, `mean_pooling_matches_fastembeds_formula_bit_for_bit`, `the_load_refuses_a_tokenizer_with_its_own_truncation_or_padding`, `the_load_refuses_a_special_token_the_tokenizer_does_not_treat_as_special`, `the_load_refuses_a_model_window_shorter_than_embed_max_tokens`, `the_output_is_picked_like_fastembed` y `the_cpu_provider_turns_its_arena_off` (`embedder.rs`); `the_vectors_are_the_ones_fastembed_gave` y `the_comparison_is_by_bits_only_on_the_cpu_that_made_the_fixture` (`crates/clawg-core/tests/e5_golden.rs`; el primero, ignorado por defecto, necesita los archivos del modelo por `CLAWG_E5_MODEL_DIR` y se corre con `--ignored`). Verificado el 2026-10-17: bits exactos en la CPU de Windows que generó la fixture, y en Linux (Xeon con AVX2, AVX-512F y FMA) una diferencia máxima de 8,9e-8 en los 32 vectores.
 
 ## Snapshots
 

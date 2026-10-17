@@ -23,7 +23,7 @@ El daemon MUST soltar el modelo cuando pasó el tiempo de ocio desde el último 
 - WHEN se cumple el tiempo de ocio durante la llamada
 - THEN el modelo sigue residente, y la cuenta empieza cuando la llamada vuelve
 
-**Tests:** `a_model_goes_only_after_the_idle_time_with_nothing_in_flight`, `an_unused_model_is_unloaded_after_the_idle_time`, `each_use_restarts_the_idle_time`, `a_call_in_flight_keeps_the_model_past_the_idle_time`, `the_idle_time_defaults_to_ten_minutes_and_zero_keeps_the_model`, `an_idle_time_that_is_not_whole_minutes_is_refused` (`idle_embedder.rs`).
+**Tests:** `a_model_goes_only_after_the_idle_time_with_nothing_in_flight`, `an_unused_model_is_unloaded_after_the_idle_time`, `each_use_restarts_the_idle_time`, `a_call_in_flight_keeps_the_model_past_the_idle_time`, `the_idle_time_defaults_to_ten_minutes_and_zero_keeps_the_model`, `an_idle_time_that_is_not_whole_minutes_is_refused`, `the_sweeper_ends_with_the_embedder` (`idle_embedder.rs`).
 
 ## R2. Recargar a demanda, una sola vez
 
@@ -72,7 +72,7 @@ Buscar, guardar, restaurar y `recall_context` con el modelo suelto MUST esperar 
 
 ## R7. La memoria vuelve al sistema
 
-Con el modelo suelto, la memoria privada del daemon MUST quedar cerca de la línea de base. En 10 recargas seguidas, la mediana MUST NOT superar la línea de base en más de 64 MB, y la mediana de las recargas 6 a 10 MUST NOT superar la de las recargas 1 a 5 en más de 16 MB. Vale en Windows y en Linux. En Linux con glibc, el hilo dueño de la sesión MUST devolver al sistema las páginas libres al terminar.
+Con el modelo suelto, la memoria privada del daemon MUST quedar cerca de la línea de base. En 10 recargas seguidas, la mediana MUST NOT superar la línea de base en más de 64 MB, y la mediana de las recargas 6 a 10 MUST NOT superar la de las recargas 1 a 5 en más de 16 MB. Vale en Windows y en Linux. En Linux con glibc, el hilo dueño de la sesión MUST devolver al sistema las páginas libres al terminar, y `clawg serve` MUST dejar todos sus hilos en una sola arena de `malloc`, fijada antes de crear cualquier hilo ([diseño, D6](design.md#d6-una-sola-arena-de-malloc-en-linux)).
 
 #### Escenario: diez recargas
 - GIVEN `CLAWG_EMBEDDER_IDLE_MINUTES=1` y la línea de base medida en el mismo build
@@ -84,7 +84,7 @@ Con el modelo suelto, la memoria privada del daemon MUST quedar cerca de la lín
 - WHEN termina
 - THEN el log tiene una sola línea `tokenizer.json parsed`
 
-**Medición:** el procedimiento de [diseño, D5, «R7 sobre lo medido»](design.md#r7-sobre-lo-medido), en Windows (`PrivateMemorySize64`) y en Linux (`RssAnon`). La búsqueda es `POST /v1/search`, nunca `clawg memories search`, que es una búsqueda por texto y no carga el modelo.
+**Medición:** el procedimiento de [diseño, D5, «R7 sobre lo medido»](design.md#r7-sobre-lo-medido); `only_serve_loads_the_model` (`cli.rs`) fija qué comando pide la arena, y ningún test comprueba la arena ni el trim, en Windows (`PrivateMemorySize64`) y en Linux (`RssAnon`). La búsqueda es `POST /v1/search`, nunca `clawg memories search`, que es una búsqueda por texto y no carga el modelo.
 
 ## R8. Un solo tokenizer por proceso
 
@@ -110,11 +110,11 @@ El daemon MUST parsear `tokenizer.json` a lo sumo una vez por proceso, y sólo d
 - WHEN una llamada recarga el modelo
 - THEN no hay ningún parse
 
-**Tests:** `the_worker_and_the_model_load_share_one_parse`, `a_tokenizer_file_with_another_sha256_is_not_parsed` (`worker.rs`), `a_reload_does_not_parse_the_tokenizer_again` (`bootstrap.rs`).
+**Tests:** `the_worker_and_the_model_load_share_one_parse`, `a_reload_does_not_parse_the_tokenizer_again` (`bootstrap.rs`), `a_tokenizer_file_with_another_sha256_is_not_parsed` (`worker.rs`).
 
 ## R9. Los mismos vectores que fastembed
 
-Para el mismo texto y el mismo rol, el embedder MUST devolver los mismos bits que devolvió fastembed 5.13.4 en una CPU como la que generó la referencia. ONNX Runtime elige sus kernels según la CPU, así que en otra CPU la diferencia máxima por componente MUST NOT pasar de 1e-6. Eso exige una ventana de `EMBED_MAX_TOKENS` que cuenta `<s>` y `</s>`, relleno hasta el texto más largo del pedido con `pad_token_id`, `token_type_ids` cuando el modelo los pide, pooling por media sobre la máscara y L2. La carga MUST rechazar (`LoadFailed`) un tokenizer con truncación o relleno propios, un token de `special_tokens_map.json` que el tokenizer no trata como especial, un `model_max_length` menor que `EMBED_MAX_TOKENS` y un modelo sin salida elegible.
+Para el mismo texto y el mismo rol, el embedder MUST devolver los mismos bits que devolvió fastembed 5.13.4 en una CPU y un sistema operativo como los que generaron la referencia. ONNX Runtime elige sus kernels según la CPU y viene compilado aparte para cada sistema, así que en otra CPU o en otro sistema la diferencia máxima por componente MUST NOT pasar de 1e-6. Eso exige una ventana de `EMBED_MAX_TOKENS` que cuenta `<s>` y `</s>`, relleno hasta el texto más largo del pedido con `pad_token_id`, `token_type_ids` cuando el modelo los pide, pooling por media sobre la máscara y L2. La carga MUST rechazar (`LoadFailed`) un tokenizer con truncación o relleno propios, un token de `special_tokens_map.json` que el tokenizer no trata como especial, un `model_max_length` menor que `EMBED_MAX_TOKENS` y un modelo sin salida elegible.
 
 #### Escenario: un texto largo conserva `</s>`
 - GIVEN un texto de más de `EMBED_MAX_TOKENS` tokens
@@ -131,4 +131,4 @@ Para el mismo texto y el mismo rol, el embedder MUST devolver los mismos bits qu
 - WHEN se codifica y se hace el pooling
 - THEN el vector es el que dio fastembed
 
-**Tests:** `an_encoding_matches_the_tokenizer_configured_like_fastembed`, `a_long_text_is_cut_to_the_window_and_keeps_its_closing_token`, `mean_pooling_matches_fastembeds_formula_bit_for_bit`, `the_load_refuses_a_tokenizer_with_its_own_truncation_or_padding`, `the_load_refuses_a_special_token_the_tokenizer_does_not_treat_as_special`, `the_load_refuses_a_model_window_shorter_than_embed_max_tokens`, `the_output_is_picked_like_fastembed` (`embedder.rs`), `the_vectors_are_the_ones_fastembed_gave` (`crates/clawg-core/tests/e5_golden.rs`; ignorado por defecto: necesita los archivos del modelo por `CLAWG_E5_MODEL_DIR` y se corre con `--ignored`).
+**Tests:** `an_encoding_matches_the_tokenizer_configured_like_fastembed`, `a_long_text_is_cut_to_the_window_and_keeps_its_closing_token`, `mean_pooling_matches_fastembeds_formula_bit_for_bit`, `the_load_refuses_a_tokenizer_with_its_own_truncation_or_padding`, `the_load_refuses_a_special_token_the_tokenizer_does_not_treat_as_special`, `the_load_refuses_a_model_window_shorter_than_embed_max_tokens`, `the_output_is_picked_like_fastembed` (`embedder.rs`), `the_vectors_are_the_ones_fastembed_gave` y `the_comparison_is_by_bits_only_on_the_cpu_that_made_the_fixture` (`crates/clawg-core/tests/e5_golden.rs`; el primero ignorado por defecto: necesita los archivos del modelo por `CLAWG_E5_MODEL_DIR` y se corre con `--ignored`).

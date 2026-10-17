@@ -32,7 +32,7 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 
 - [x] Suite y clippy en Linux sobre el último commit (2.065 pasan; clippy con código 0).
 - [x] El CI en verde en Linux y Windows.
-- [ ] Bytes privados del daemon dev en Windows antes y después del tiempo de ocio: medidos, no cumplen R7 (ver [verify](verify.md#resultado)).
+- [ ] Bytes privados del daemon dev en Windows antes y después del tiempo de ocio: medidos, no cumplen R7 (ver [verify](verify.md#resultado)). Lo resuelve D5, sección 10.
 
 La verificación en Windows mostró que D1 no alcanza ([verify](verify.md#resultado)); las secciones 6 a 10 son el trabajo de [D5](design.md#d5-un-solo-tokenizer-por-proceso-la-inferencia-la-arma-clawg). Las secciones 1 a 5 quedan como la historia de la primera implementación. El orden está pensado para que cada commit compile y pase la suite, y para que el fixture exista antes de que cambie la inferencia.
 
@@ -104,6 +104,12 @@ Las piezas puras y el cambio van en **un solo commit**. Por separado, las piezas
 - [x] Suite y clippy en Windows con `--target-dir <otro>` (el `clawg.exe` del editor bloquea `target`).
 - [x] `cargo test -p clawg-core --features eval --test e5_golden -- --ignored` con `CLAWG_E5_MODEL_DIR`, en una máquina con el modelo: bits exactos si la CPU coincide con la del fixture, o diferencia máxima de 1e-6 si no, diciendo cuál; y sin la variable, falla.
 - [x] `rag-eval --diff` con `--real` de `main` al cambio, y otra vez con `--agent-view`: ningún caso se mueve.
-- [ ] R7 en el daemon, en Windows (hecho: [verify](verify.md#r7-en-windows)) y en Linux (medido el 2026-10-17, no cumple: [verify](verify.md#r7-en-linux)), siguiendo D5 «R7 sobre lo medido»: línea de base con `CLAWG_TEST_EMBEDDER=fake` y sólo `tokenizer.json`; con el modelo y `CLAWG_EMBEDDER_IDLE_MINUTES=1`, diez recargas con `POST /v1/search` (nunca `clawg memories search`); la mediana queda a no más de 64 MB de la línea de base, la de las recargas 6 a 10 no supera la de 1 a 5 en más de 16 MB, la `distance` de cada hit es igual en las diez vueltas, y el log tiene una sola línea `tokenizer.json parsed`.
+- [x] R7 en el daemon, en Windows ([verify](verify.md#r7-en-windows)) y en Linux (sin D6 no cumplía, [verify](verify.md#r7-en-linux); con D6 cumple, [verify](verify.md#después-de-d6-una-sola-arena-en-linux)), siguiendo D5 «R7 sobre lo medido»: línea de base con `CLAWG_TEST_EMBEDDER=fake` y sólo `tokenizer.json`; con el modelo y `CLAWG_EMBEDDER_IDLE_MINUTES=1`, diez recargas con `POST /v1/search` (nunca `clawg memories search`); la mediana queda a no más de 64 MB de la línea de base, la de las recargas 6 a 10 no supera la de 1 a 5 en más de 16 MB, la `distance` de cada hit es igual en las diez vueltas, y el log tiene una sola línea `tokenizer.json parsed`.
 
-Sólo queda la última tarea, R7 en Linux. Si cumple, el cambio se archiva sin otra revisión: [verify, «Para archivar»](verify.md#para-archivar).
+## 11. Una sola arena en Linux (D6)
+
+- [x] Test primero: `only_serve_loads_the_model` (`crates/clawg-cli/src/cli.rs`) falla sin `Command::loads_the_model`.
+- [x] `Command::loads_the_model`, `keep_one_malloc_arena` (`embedder.rs`, `mallopt(M_ARENA_MAX, 1)` en Linux con glibc, vacía en las demás plataformas) y `main` síncrona: fija la arena para `serve` y después construye el runtime.
+- [x] Test primero: `the_comparison_is_by_bits_only_on_the_cpu_that_made_the_fixture` con otro sistema falla sin `os` en la huella; la huella suma `os` y la fixture dice `windows`.
+- [x] Suite, clippy, `e5_golden` con el modelo y R7 en Linux: [verify, «Después de D6»](verify.md#después-de-d6-una-sola-arena-en-linux).
+- Commits: `fix(cli): keep clawg serve on one malloc arena on Linux`, `test(core): compare e5 vectors by bits only on the fixture's system`

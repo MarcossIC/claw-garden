@@ -9,6 +9,7 @@ Fuente de verdad del comportamiento actual del puente `clawg mcp`: cómo abre un
 - [bridge-reconnect](../../changes/archive/2026-10-15-bridge-reconnect/proposal.md), archivado el 2026-10-15 (sólo el apartado de reconexión con el daemon).
 - [project-root-guard](../../changes/archive/2026-10-15-project-root-guard/proposal.md), archivado el 2026-10-15 (sólo la colisión en «Registro del proyecto»).
 - [ingest-outbox](../../changes/archive/2026-10-15-ingest-outbox/proposal.md), archivado el 2026-10-15 (sólo el bloque `ingest` de `memory_status` y el texto de `save_memory` ante un `202`).
+- [embedder-idle-unload](../../changes/archive/2026-10-17-embedder-idle-unload/proposal.md), archivado el 2026-10-17 (sólo «El modelo en memoria en `/health`»; el ciclo de vida del embedder está en [`specs/storage`](../storage/spec.md)).
 
 ## Definiciones
 
@@ -203,6 +204,17 @@ El texto de `ClientError::Unauthorized` de la CLI (`crates/clawg-cli/src/client.
 - THEN el texto incluye `ingest.failed` y el `operation_id` y la causa del save
 
 **Tests:** `format_status_shows_the_ingest_block` (`tools.rs`); `save_outcome_text_covers_every_daemon_answer` (`server.rs`).
+
+## El modelo en memoria en `/health`
+
+`GET /health` MUST incluir `embedder_resident` (`Health`, `crates/clawg-cli/src/daemon/api.rs:445`, que lo lee de `Embedder::resident` en `api.rs:688`): `true` con el modelo en memoria, `false` cuando el daemon lo soltó por ocio y la próxima llamada que necesite un vector espera que vuelva a cargar, y `null` antes de la primera carga. `embedder` sigue en `ready` con el modelo suelto ([`specs/storage`](../storage/spec.md), «Ciclo de vida del embedder»). El cliente MUST leer un `/health` sin el campo, el de un daemon anterior, como `None` (`client.rs:134`, `#[serde(default)]`). `memory_status` lo muestra porque imprime el `Health` entero.
+
+#### Escenario: el modelo suelto
+- GIVEN un daemon con el modelo cargado una vez y soltado por ocio
+- WHEN se pide `/health`
+- THEN `embedder` es `ready` y `embedder_resident` es `false`
+
+**Tests:** `health_says_whether_the_model_is_in_memory` (`crates/clawg-cli/tests/api.rs`); `a_health_without_residency_still_parses` (`client.rs`).
 
 ## Lo compartido en las herramientas
 
