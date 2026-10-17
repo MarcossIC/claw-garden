@@ -41,7 +41,7 @@ use clawg_core::memory::worker::{
 use clawg_core::memory::events::{MemoryEvent, MemorySource};
 use clawg_core::memory::clock::TimestampMs;
 use clawg_core::memory::project::{register_project, RegisterError};
-use clawg_core::memory::prompt_builder::{build_memory_prompt, QueryTexts};
+use clawg_core::memory::prompt_builder::{build_memory_prompt, QueryTexts, Retrieval, DEFAULT_BUDGET, MAX_BUDGET};
 use clawg_core::memory::sharing::{self, Reach};
 use clawg_core::memory::synthesis::{
     existing_memory_ids, synthesis_core, unreviewed_count, Synthesis, SynthesisParams,
@@ -306,6 +306,14 @@ fn missing_sources(requested: &[i64], existing: &[i64]) -> Vec<i64> {
     requested.iter().copied().filter(|id| !existing.contains(id)).collect()
 }
 
+fn check_budget(budget: Option<usize>) -> Result<usize, ApiError> {
+    match budget {
+        Some(0) => Err(ApiError::bad_request("budget must be at least 1 byte")),
+        Some(b) => Ok(b.min(MAX_BUDGET)),
+        None => Ok(DEFAULT_BUDGET),
+    }
+}
+
 fn check_relative_score(ratio: Option<f64>) -> Result<Option<f64>, ApiError> {
     match ratio {
         Some(r) if !(0.0..=1.0).contains(&r) => {
@@ -357,6 +365,10 @@ pub struct ContextRequest {
     pub agent_id: String,
     #[serde(default)]
     pub project_id: Option<String>,
+    /// Most bytes the prompt may take. Absent, [`DEFAULT_BUDGET`]; above
+    /// [`MAX_BUDGET`], that.
+    #[serde(default)]
+    pub budget: Option<usize>,
 }
 
 /// `deny_unknown_fields` because every field here narrows the result: an
@@ -526,6 +538,35 @@ pub struct ContextBody {
     /// Memories of the requested scope that arrived since it was last
     /// reviewed for conclusions (`POST /v1/synthesis`).
     pub unreviewed: usize,
+    pub retrieval: RetrievalState,
+}
+
+/// Whether the context searched memories. Without it a prompt holding only
+/// the workspace, or nothing, reads as "there are no memories".
+#[derive(Debug, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum RetrievalState {
+    Searched,
+    EmbedderNotReady,
+    EmbedderFailed { detail: String, retryable: bool },
+    SearchFailed { detail: String },
+}
+
+impl RetrievalState {
+    /// Reads a missing embedder from `status`, as [`ready_embedder`] does for
+    /// a search, so the two never disagree on why memories cannot be reached.
+    fn of(retrieval: Retrieval, status: EmbedderStatus) -> Self {
+        match retrieval {
+            Retrieval::Searched => Self::Searched,
+            Retrieval::NoEmbedder => match status {
+                EmbedderStatus::Failed { error, retryable } => Self::EmbedderFailed { detail: error, retryable },
+                EmbedderStatus::Loading | EmbedderStatus::Ready => Self::EmbedderNotReady,
+            },
+            Retrieval::EmbedFailed(EmbedError::NotReady) => Self::EmbedderNotReady,
+            Retrieval::EmbedFailed(e) => Self::SearchFailed { detail: e.to_string() },
+            Retrieval::SearchFailed(detail) => Self::SearchFailed { detail },
+        }
+    }
 }
 
 /// Strict for the same reason as [`OwnerQuery`].
@@ -947,6 +988,7 @@ async fn context(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<ContextRequest>,
 ) -> ApiResult<Json<ContextBody>> {
+    let budget = check_budget(body.budget)?;
     let workspace = app.runtime.workspaces();
     let project_id = body.project_id.as_deref();
 
@@ -971,6 +1013,7 @@ async fn context(
         QueryTexts { lexical: &body.query, embedded: &body.query },
         &emitted,
         Some(app.runtime.access_tracker.as_ref()),
+        budget,
     )
     .await
     .map_err(ApiError::internal)?;
@@ -982,7 +1025,8 @@ async fn context(
         0
     });
 
-    Ok(Json(ContextBody { prompt, unreviewed }))
+    let retrieval = RetrievalState::of(prompt.retrieval, app.runtime.embedder_status());
+    Ok(Json(ContextBody { prompt: prompt.text, unreviewed, retrieval }))
 }
 
 async fn synthesis(

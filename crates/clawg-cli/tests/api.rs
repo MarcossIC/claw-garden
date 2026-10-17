@@ -1202,6 +1202,74 @@ async fn context_returns_a_prompt_string() {
     );
 }
 
+/// An empty or workspace-only prompt reads as "no memories" unless the
+/// answer says the memories were never searched.
+#[tokio::test]
+async fn context_says_whether_memories_were_searched() {
+    async fn ask(h: &Harness) -> (u16, Value) {
+        h.post_json("/v1/context", json!({ "query": "tabs", "agent_id": "a" })).await
+    }
+
+    let h = Harness::start().await;
+    let (status, body) = ask(&h).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["retrieval"], json!({ "state": "searched" }));
+
+    for h in [Harness::start_without_embedder().await, Harness::start_unloaded(true).await] {
+        let (status, body) = ask(&h).await;
+        assert_eq!(status, 200, "the workspace still comes back: {body}");
+        assert_eq!(body["retrieval"], json!({ "state": "embedder_not_ready" }));
+    }
+
+    let h = Harness::start_failed("disk full", false).await;
+    let (status, body) = ask(&h).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["retrieval"], json!({ "state": "embedder_failed", "detail": "disk full", "retryable": false }));
+
+    let h = Harness::start_with_failing_embedder().await;
+    let (status, body) = ask(&h).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["retrieval"]["state"], "search_failed", "{body}");
+    assert!(body["retrieval"]["detail"].as_str().is_some_and(|d| d.contains("onnx session crashed")), "{body}");
+}
+
+/// Standing preferences are never cut, so a workspace of many long ones
+/// overflows any budget and the closing note names the one that applied.
+#[tokio::test]
+async fn context_takes_a_budget_and_clamps_it() {
+    let h = Harness::start().await;
+    for i in 0..20 {
+        let content = format!("preference {i}: {}", "always keep the error path explicit ".repeat(40));
+        let (status, body) = h
+            .post_json("/v1/memories", json!({ "content": content, "agent_id": "a", "memory_type": "user_preference", "importance": 9.0 }))
+            .await;
+        assert_eq!(status, 201, "{body}");
+    }
+    let context = |budget: Value| {
+        let mut request = json!({ "query": "error path", "agent_id": "a" });
+        if !budget.is_null() {
+            request["budget"] = budget;
+        }
+        request
+    };
+
+    for (budget, applied) in [(Value::Null, 8_000), (json!(2_000), 2_000), (json!(1_000_000), 24_000)] {
+        let (status, body) = h.post_json("/v1/context", context(budget)).await;
+        assert_eq!(status, 200, "{body}");
+        let prompt = body["prompt"].as_str().unwrap();
+        assert!(prompt.contains(&format!("Cut to fit {applied} bytes")), "{prompt}");
+    }
+}
+
+#[tokio::test]
+async fn context_refuses_a_zero_budget() {
+    let h = Harness::start().await;
+    let (status, body) = h.post_json("/v1/context", json!({ "query": "q", "agent_id": "a", "budget": 0 })).await;
+    assert_eq!(status, 400, "{body}");
+    let (status, body) = h.post_json("/v1/context", json!({ "query": "q", "agent_id": "a", "budget": -5 })).await;
+    assert!((400..500).contains(&status), "a negative budget is not a budget: {status} {body}");
+}
+
 #[tokio::test]
 async fn context_reports_unreviewed_memories() {
     let h = Harness::start().await;

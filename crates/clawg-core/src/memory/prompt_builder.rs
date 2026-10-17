@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::memory::{
     access::AccessTracker,
     clock::TimestampMs,
-    embedder::{EmbedRole, Embedder},
+    embedder::{EmbedError, EmbedRole, Embedder},
     search::{search_all_memories, RankedHit, SearchScope},
     sharing::Reach,
     workspace::{EmittedIds, WorkspaceManager},
@@ -23,6 +23,7 @@ const SEP_RECENT: &str = "=== RECENT CONTEXT (Last 7 Days) ===";
 const SEP_LONGTERM: &str = "=== LONG-TERM KNOWLEDGE ===";
 const SEP_CONFLICTS: &str = "=== ACTIVE CONFLICTS (review needed) ===";
 const SEP_SHARED: &str = "=== SHARED ===";
+const SEP_BUDGET: &str = "=== BUDGET ===";
 
 /// Said once, after every other block, when a hit came from another agent.
 /// A memory saved by another agent may carry text that agent read somewhere
@@ -42,6 +43,15 @@ const RECENT_WINDOW_MS: i64 = 7 * 86_400_000;
 const K_FINAL: usize = 10;
 /// Pairs the conflicts block prints; the rest are only counted.
 const MAX_CONFLICT_PAIRS: usize = 5;
+
+/// Bytes of prompt a context call gets when it names no budget (about 4 per
+/// token). Under the 10,000 characters a client hook prints before it moves
+/// the output to a file, and above the largest context the eval measured.
+pub const DEFAULT_BUDGET: usize = 8_000;
+/// The most a caller may ask for; a larger budget is cut down to this.
+pub const MAX_BUDGET: usize = 24_000;
+/// Ends a hit whose text the budget shortened.
+const TRUNCATED: &str = " [truncated]";
 
 // ---------------------------------------------------------------------------
 // Internal data types
@@ -77,6 +87,25 @@ impl<'a> QueryTexts<'a> {
     }
 }
 
+/// Whether the prompt searched memories, and if not, why. Every case but
+/// `Searched` leaves the prompt with the workspace alone, which reads as "no
+/// memories" unless the caller says otherwise.
+#[derive(Debug)]
+pub enum Retrieval {
+    Searched,
+    NoEmbedder,
+    EmbedFailed(EmbedError),
+    SearchFailed(String),
+}
+
+/// What `build_memory_prompt` hands back: the text, and whether memories
+/// were searched for it.
+#[derive(Debug)]
+pub struct MemoryPrompt {
+    pub text: String,
+    pub retrieval: Retrieval,
+}
+
 struct ConflictPair {
     old_id: i64,
     old_created_at: TimestampMs,
@@ -92,8 +121,9 @@ struct ConflictPair {
 
 /// Builds the WORKSPACE / RECENT / LONG-TERM / [ACTIVE CONFLICTS] prefix string.
 ///
-/// Returns `Ok(String::new())` when all four blocks would be empty.
-/// Each internal failure is degraded to "the matching block is empty".
+/// The text is empty when all four blocks would be. Each internal failure is
+/// degraded to "the matching block is empty"; a retrieval that did not run
+/// says so in [`MemoryPrompt::retrieval`].
 ///
 /// `emitted` names the rows the workspace file already carries, so the same
 /// row is never handed to the model twice. It comes from the regeneration
@@ -107,6 +137,9 @@ struct ConflictPair {
 /// `access_tracker` is fired-and-forgotten after retrieval hits are assembled.
 /// Production callers pass `Some(&state.access_tracker)`;
 /// test callers pass `None` to skip recording.
+///
+/// `budget` is the most bytes the text may take; see [`fit_to_budget`] for
+/// what gives way and the one case that can still go over it.
 pub async fn build_memory_prompt(
     store: &MemoryStore,
     workspace: &WorkspaceManager,
@@ -117,7 +150,8 @@ pub async fn build_memory_prompt(
     query: QueryTexts<'_>,
     emitted: &EmittedIds,
     access_tracker: Option<&AccessTracker>,
-) -> Result<String, MemoryError> {
+    budget: usize,
+) -> Result<MemoryPrompt, MemoryError> {
     // 1. Read workspace file (may be empty on fresh install or read failure).
     // Only its content reaches the model: no markers, no empty headings.
     let workspace_content = {
@@ -141,7 +175,7 @@ pub async fn build_memory_prompt(
     // gets. The per-table pools (30/5/5) are the real ceiling, so this only
     // ever spends candidates that were already fetched.
     let k_request = K_FINAL.saturating_add(emitted.len());
-    let mut hits: Vec<RankedHit> = match embedder {
+    let (mut hits, retrieval): (Vec<RankedHit>, Retrieval) = match embedder {
         // Query: the composed (or, absent composition, raw) text is the thing
         // being searched FOR on the dense side; the lexical/FTS5 side always
         // gets the raw text — see `QueryTexts`'s doc comment for why the two
@@ -158,34 +192,26 @@ pub async fn build_memory_prompt(
                 )
                 .await
                 {
-                    Ok(h) => h,
+                    Ok(h) => (h, Retrieval::Searched),
                     Err(e) => {
                         log::warn!("search_all_memories failed: {e}; no retrieval hits this turn");
-                        Vec::new()
+                        (Vec::new(), Retrieval::SearchFailed(e.to_string()))
                     }
                 }
             }
             Err(e) => {
                 log::warn!("embedder.embed failed: {e}; no retrieval hits this turn");
-                Vec::new()
+                (Vec::new(), Retrieval::EmbedFailed(e))
             }
         },
         None => {
             log::warn!("embedder not ready; retrieval skipped this turn (agent_id={agent_id})");
-            Vec::new()
+            (Vec::new(), Retrieval::NoEmbedder)
         }
     };
     hits.retain(|h| !emitted.contains(h.kind, h.id));
     hits.truncate(K_FINAL);
     let hits = hits;
-
-    // Fire-and-forget access recording. Runs on the filtered set: a row this
-    // channel suppressed was not retrieved by it, and counting it would
-    // inflate the access count that drives tier promotion.
-    // Called AFTER hits are assembled — non-blocking, never awaits.
-    if let Some(tracker) = access_tracker {
-        tracker.record_hits(&hits);
-    }
 
     // Tier-1 coverage logging — the real measure of the "Tier 1 covers 80%"
     // criterion (workspace_content presence alone, or hit count alone, can't
@@ -216,52 +242,173 @@ pub async fn build_memory_prompt(
         .collect();
 
     // 3. Bucket hits into RECENT vs LONG-TERM.
-    let any_shared = hits.iter().any(|h| is_shared(h, agent_id));
     let (recent, longterm) = bucket_by_recency(hits, TimestampMs::now());
-    let hit_positions: HashMap<i64, usize> = recent
-        .iter()
-        .chain(&longterm)
-        .enumerate()
-        .filter(|(_, h)| h.kind == TableKind::Memory)
-        .map(|(position, h)| (h.id, position))
-        .collect();
+    let hit_positions = positions(&recent, &longterm);
 
-    // 4. Fetch the conflicts on what this prompt shows; the block is emitted only when non-empty.
+    // 4. Fetch the conflicts on what this prompt could show, before the budget
+    // cuts any of it: the cut stays pure, and a side whose hit it drops is
+    // printed with its text instead of cited by an id that is not there.
     let conflicts = fetch_active_conflicts(store, agent_id, &shown).await.unwrap_or_else(|e| {
         log::warn!("fetch_active_conflicts failed: {e}; CONFLICTS block omitted");
         Vec::new()
     });
-    let (conflicts, omitted) = rank_conflicts(conflicts, &hit_positions, MAX_CONFLICT_PAIRS);
+    let (conflicts, conflicts_omitted) = rank_conflicts(conflicts, &hit_positions, MAX_CONFLICT_PAIRS);
 
-    // 5. Assemble in order: WORKSPACE → RECENT → LONG-TERM → CONFLICTS.
+    // 5. Assemble in order: WORKSPACE → RECENT → LONG-TERM → CONFLICTS, cut to the budget.
+    let fitted = fit_to_budget(
+        PromptParts { workspace: &workspace_content, recent, longterm, conflicts, conflicts_omitted, reader: agent_id },
+        budget,
+    );
+
+    // Fire-and-forget access recording, of the hits the text kept: a row this
+    // channel suppressed or the budget cut was not retrieved for the agent,
+    // and counting it would inflate the access count that drives tier
+    // promotion. Non-blocking, never awaits.
+    if let Some(tracker) = access_tracker {
+        tracker.record_hits(&fitted.shown);
+    }
+
+    Ok(MemoryPrompt { text: fitted.text, retrieval })
+}
+
+/// Everything the prompt can hold, before the budget is applied.
+struct PromptParts<'a> {
+    workspace: &'a str,
+    recent: Vec<RankedHit>,
+    longterm: Vec<RankedHit>,
+    /// Already ranked; the budget drops them from the end.
+    conflicts: Vec<ConflictPair>,
+    conflicts_omitted: usize,
+    reader: &'a str,
+}
+
+/// What the budget took out, said at the end of the prompt.
+struct Cut {
+    budget: usize,
+    full: usize,
+    left_out: Vec<(TableKind, i64)>,
+    shortened: Vec<(TableKind, i64)>,
+    /// Nothing is left to cut and the text is still over.
+    workspace_over: bool,
+}
+
+/// The prompt's text and the hits it prints, whole or shortened.
+struct Fitted {
+    text: String,
+    shown: Vec<RankedHit>,
+}
+
+/// Renders `parts` in at most `budget` bytes.
+///
+/// While the text is over, the last hit of LONG-TERM goes, then the last of
+/// RECENT, then the last conflict pair, which joins the count of pairs not
+/// shown. A hit left alone in its block is shortened instead, and goes only
+/// when no text is left of it: one shortened hit and its id say more than an
+/// empty block. Each step renders the whole text, so the closing note, the
+/// SHARED note and the text a conflict gains when its hit goes are all
+/// counted as they are.
+///
+/// The workspace is never cut: its preferences and USER section are the
+/// standing contract with the user, and every row it printed is one the
+/// search skipped, so cutting it here would leave that row with no channel.
+/// When the workspace and the closing note alone are over the budget, the
+/// text goes over it and says so.
+fn fit_to_budget(mut parts: PromptParts<'_>, budget: usize) -> Fitted {
+    let full = render(&parts, None);
+    if full.len() <= budget {
+        return Fitted { text: full, shown: parts.recent.into_iter().chain(parts.longterm).collect() };
+    }
+    let mut cut = Cut { budget, full: full.len(), left_out: Vec::new(), shortened: Vec::new(), workspace_over: false };
+    loop {
+        let text = render(&parts, Some(&cut));
+        let Some(over) = text.len().checked_sub(budget).filter(|&over| over > 0) else {
+            return Fitted { text, shown: parts.recent.into_iter().chain(parts.longterm).collect() };
+        };
+        let block = if parts.longterm.is_empty() { &mut parts.recent } else { &mut parts.longterm };
+        match block.len() {
+            0 if parts.conflicts.is_empty() => {
+                cut.workspace_over = true;
+                return Fitted { text: render(&parts, Some(&cut)), shown: Vec::new() };
+            }
+            0 => {
+                parts.conflicts.pop();
+                parts.conflicts_omitted += 1;
+            }
+            1 => {
+                let hit = &mut block[0];
+                let id = (hit.kind, hit.id);
+                match shorten(&hit.content, over, cut.shortened.contains(&id)) {
+                    Some(content) => {
+                        hit.content = content;
+                        if !cut.shortened.contains(&id) {
+                            cut.shortened.push(id);
+                        }
+                    }
+                    None => {
+                        block.pop();
+                        cut.shortened.retain(|s| *s != id);
+                        cut.left_out.push(id);
+                    }
+                }
+            }
+            _ => {
+                let hit = block.pop().expect("the block has hits");
+                cut.left_out.push((hit.kind, hit.id));
+            }
+        }
+    }
+}
+
+/// `content` cut `over` bytes shorter, on a character boundary, and marked;
+/// `None` when nothing of it would be left. `marked` says the mark is already
+/// at its end, from an earlier pass.
+fn shorten(content: &str, over: usize, marked: bool) -> Option<String> {
+    let (text, marker) = match content.strip_suffix(TRUNCATED) {
+        Some(text) if marked => (text, 0),
+        _ => (content, TRUNCATED.len()),
+    };
+    let mut keep = text.len().checked_sub(over + marker)?;
+    while !text.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    let kept = text[..keep].trim_end();
+    (!kept.is_empty()).then(|| format!("{kept}{TRUNCATED}"))
+}
+
+/// Where each printed `memory` hit sits, for the conflicts block to cite it
+/// by id and to order its pairs.
+fn positions(recent: &[RankedHit], longterm: &[RankedHit]) -> HashMap<i64, usize> {
+    recent
+        .iter()
+        .chain(longterm)
+        .enumerate()
+        .filter(|(_, h)| h.kind == TableKind::Memory)
+        .map(|(position, h)| (h.id, position))
+        .collect()
+}
+
+fn render(parts: &PromptParts<'_>, cut: Option<&Cut>) -> String {
+    let PromptParts { workspace, recent, longterm, conflicts, conflicts_omitted, reader } = parts;
     let mut out = String::new();
-    if !workspace_content.is_empty() {
+    if !workspace.is_empty() {
         out.push_str(SEP_WORKSPACE);
         out.push('\n');
-        out.push_str(&workspace_content);
-        if !workspace_content.ends_with('\n') {
+        out.push_str(workspace);
+        if !workspace.ends_with('\n') {
             out.push('\n');
         }
     }
-    if !recent.is_empty() {
+    for (separator, hits) in [(SEP_RECENT, recent), (SEP_LONGTERM, longterm)] {
+        if hits.is_empty() {
+            continue;
+        }
         if !out.is_empty() {
             out.push('\n');
         }
-        out.push_str(SEP_RECENT);
+        out.push_str(separator);
         out.push('\n');
-        for h in &recent {
-            out.push_str(&format_hit_line(h, agent_id));
-            out.push('\n');
-        }
-    }
-    if !longterm.is_empty() {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(SEP_LONGTERM);
-        out.push('\n');
-        for h in &longterm {
-            out.push_str(&format_hit_line(h, agent_id));
+        for h in hits {
+            out.push_str(&format_hit_line(h, reader));
             out.push('\n');
         }
     }
@@ -271,17 +418,51 @@ pub async fn build_memory_prompt(
         }
         out.push_str(SEP_CONFLICTS);
         out.push('\n');
-        out.push_str(&format_conflict_block(&conflicts, &hit_positions, omitted));
+        out.push_str(&format_conflict_block(conflicts, &positions(recent, longterm), *conflicts_omitted));
     }
-    if any_shared {
+    if recent.iter().chain(longterm.iter()).any(|h| is_shared(h, reader)) {
         out.push('\n');
         out.push_str(SEP_SHARED);
         out.push('\n');
         out.push_str(SHARED_NOTE);
         out.push('\n');
     }
+    if let Some(cut) = cut {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(SEP_BUDGET);
+        out.push('\n');
+        out.push_str(&format_cut(cut));
+        out.push('\n');
+    }
+    out
+}
 
-    Ok(out)
+/// The closing note of a cut prompt: the budget, the size of the whole
+/// context, and the ids the cut left out or shortened, which `read_memory`
+/// returns whole. Ids are listed in the order the prompt would print them.
+fn format_cut(cut: &Cut) -> String {
+    let label = |&(kind, id): &(TableKind, i64)| match kind {
+        TableKind::Memory => format!("#{id}"),
+        other => format!("{} #{id}", format!("{other:?}").to_lowercase()),
+    };
+    let mut left_out = cut.left_out.clone();
+    left_out.reverse();
+    let mut out = format!("Cut to fit {} bytes; the full context is {} bytes.", cut.budget, cut.full);
+    if !left_out.is_empty() {
+        out.push_str(&format!(" Left out: {}.", left_out.iter().map(label).collect::<Vec<_>>().join(", ")));
+    }
+    if !cut.shortened.is_empty() {
+        out.push_str(&format!(" Shortened: {}.", cut.shortened.iter().map(label).collect::<Vec<_>>().join(", ")));
+    }
+    if !left_out.is_empty() || !cut.shortened.is_empty() {
+        out.push_str(" read_memory returns any of them whole.");
+    }
+    if cut.workspace_over {
+        out.push_str(" The workspace alone is over the budget and is shown whole.");
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -569,7 +750,7 @@ mod tests {
         let recording = Arc::new(RecordingEmbedder { calls: std::sync::Mutex::new(Vec::new()) });
         let embedder: Arc<dyn Embedder> = recording.clone();
 
-        build_memory_prompt(&store, &wm, Some(embedder), "agent-1", None, &Reach::Own, QueryTexts::single_shot("some query"), &EmittedIds::default(), None)
+        build_memory_prompt(&store, &wm, Some(embedder), "agent-1", None, &Reach::Own, QueryTexts::single_shot("some query"), &EmittedIds::default(), None, DEFAULT_BUDGET)
             .await
             .unwrap();
 
@@ -799,6 +980,135 @@ mod tests {
         assert!(!format_conflict_block(&kept, &HashMap::new(), omitted).contains("not shown"));
     }
 
+    // ── budget ─────────────────────────────────────────────────────────────
+
+    fn sized_hit(id: i64, bytes: usize) -> RankedHit {
+        hit_at_2023_11_14(id, TableKind::Memory, "semantic_fact", &format!("{id} ").repeat(bytes / (id.to_string().len() + 1)))
+    }
+
+    fn parts<'a>(workspace: &'a str, recent: &[(i64, usize)], longterm: &[(i64, usize)], conflicts: Vec<ConflictPair>) -> PromptParts<'a> {
+        PromptParts {
+            workspace,
+            recent: recent.iter().map(|&(id, bytes)| sized_hit(id, bytes)).collect(),
+            longterm: longterm.iter().map(|&(id, bytes)| sized_hit(id, bytes)).collect(),
+            conflicts,
+            conflicts_omitted: 0,
+            reader: "agent-1",
+        }
+    }
+
+    fn ten_long_hits<'a>() -> PromptParts<'a> {
+        parts(
+            "- tabs, not spaces",
+            &[(1, 2_000), (2, 2_000), (3, 2_000), (4, 2_000), (5, 2_000)],
+            &[(6, 2_000), (7, 2_000), (8, 2_000), (9, 2_000), (10, 2_000)],
+            vec![pair(301, 302), pair(303, 304)],
+        )
+    }
+
+    fn header_ids(text: &str) -> Vec<i64> {
+        text.lines()
+            .filter_map(|l| l.strip_prefix("[2023-11-14 #"))
+            .filter_map(|l| l.split(' ').next()?.parse().ok())
+            .collect()
+    }
+
+    #[test]
+    fn the_prompt_never_exceeds_the_budget() {
+        for budget in (600..30_000).step_by(397) {
+            let fitted = fit_to_budget(ten_long_hits(), budget);
+            assert!(fitted.text.len() <= budget, "{} bytes over a budget of {budget}:\n{}", fitted.text.len(), fitted.text);
+        }
+    }
+
+    #[test]
+    fn the_cut_starts_at_the_end_of_long_term() {
+        let fitted = fit_to_budget(parts("", &[(1, 1_000), (2, 1_000)], &[(3, 1_000), (4, 1_000), (5, 1_000)], vec![]), 3_600);
+        let ids = header_ids(&fitted.text);
+        assert_eq!(ids, [1, 2, 3], "{}", fitted.text);
+        assert_eq!(fitted.shown.iter().map(|h| h.id).collect::<Vec<_>>(), [1, 2, 3]);
+    }
+
+    #[test]
+    fn a_context_that_fits_is_left_as_it_was() {
+        let whole = fit_to_budget(ten_long_hits(), MAX_BUDGET).text;
+        assert!(!whole.contains(SEP_BUDGET), "{whole}");
+        assert_eq!(fit_to_budget(ten_long_hits(), whole.len()).text, whole, "a budget of exactly its size cuts nothing");
+        assert_eq!(header_ids(&whole), (1..=10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn conflicts_go_after_every_hit() {
+        let with_conflicts = fit_to_budget(ten_long_hits(), 1_200).text;
+        let block = block(&with_conflicts, SEP_CONFLICTS).expect("the conflicts outlast every hit");
+        assert_eq!(block.lines().filter(|l| l.starts_with("NEW ")).count(), 2, "{with_conflicts}");
+        assert_eq!(header_ids(&with_conflicts), [1], "only the first hit is left, shortened: {with_conflicts}");
+    }
+
+    #[test]
+    fn the_first_hit_of_a_block_is_shortened_not_dropped() {
+        let fitted = fit_to_budget(parts("", &[(7, 5_000)], &[], vec![]), 2_000);
+        assert!(fitted.text.len() <= 2_000, "{}", fitted.text);
+        let line = fitted.text.lines().find(|l| l.starts_with("[2023-11-14 #7 ")).expect("the hit stays, shortened");
+        assert!(line.ends_with(" [truncated]"), "{line}");
+        assert_eq!(fitted.shown.len(), 1);
+    }
+
+    #[test]
+    fn a_shortened_text_ends_on_a_character_boundary() {
+        for text in ["ñandú ".repeat(600), "日本語のメモ".repeat(300), "🦀".repeat(1_000)] {
+            for budget in 400..520 {
+                let mut hits = parts("", &[], &[], vec![]);
+                hits.recent = vec![hit_at_2023_11_14(7, TableKind::Memory, "semantic_fact", &text)];
+                let fitted = fit_to_budget(hits, budget);
+                assert!(fitted.text.len() <= budget, "{}", fitted.text);
+                assert!(fitted.text.contains(" [truncated]"), "{}", fitted.text);
+            }
+        }
+    }
+
+    #[test]
+    fn what_the_budget_left_out_is_named_by_id() {
+        let mut long = parts("", &[(1, 1_000), (2, 1_000)], &[(3, 1_000)], vec![]);
+        long.longterm.push(hit_at_2023_11_14(4, TableKind::Procedural, "procedure", &"step ".repeat(200)));
+        let fitted = fit_to_budget(long, 900);
+        let budget = block(&fitted.text, SEP_BUDGET).expect("a cut is said");
+        assert!(budget.contains("Cut to fit 900 bytes; the full context is "), "{budget}");
+        assert!(budget.contains("Left out: #2, #3, procedural #4."), "{budget}");
+        assert!(budget.contains("Shortened: #1."), "{budget}");
+        assert!(budget.contains("read_memory"), "{budget}");
+    }
+
+    #[test]
+    fn the_budget_block_stays_with_the_smallest_budget() {
+        let fitted = fit_to_budget(ten_long_hits(), 1);
+        assert!(fitted.text.contains(SEP_BUDGET), "{}", fitted.text);
+        assert!(fitted.text.contains("Left out: #1, #2,"), "{}", fitted.text);
+        assert!(fitted.shown.is_empty());
+    }
+
+    #[test]
+    fn a_workspace_over_the_budget_is_kept_and_said() {
+        let workspace = "- a standing preference\n".repeat(150);
+        let fitted = fit_to_budget(parts(&workspace, &[(1, 500)], &[(2, 500)], vec![]), 1_000);
+        assert!(fitted.text.contains(workspace.trim_end()), "the workspace is never cut");
+        assert!(header_ids(&fitted.text).is_empty(), "{}", fitted.text);
+        let budget = block(&fitted.text, SEP_BUDGET).expect("the overflow is said");
+        assert!(budget.contains("The workspace alone is over the budget"), "{budget}");
+        assert!(budget.contains(&format!("the full context is {} bytes", fit_to_budget(parts(&workspace, &[(1, 500)], &[(2, 500)], vec![]), MAX_BUDGET).text.len())), "{budget}");
+    }
+
+    #[test]
+    fn a_conflict_on_a_cut_hit_carries_its_text() {
+        let mut cut = parts("", &[(1, 300)], &[(3, 200), (2, 3_000)], vec![pair(2, 1)]);
+        cut.conflicts[0].old_content = "the hit text the cut removed".into();
+        let fitted = fit_to_budget(cut, 1_500);
+        assert_eq!(header_ids(&fitted.text), [1, 3], "{}", fitted.text);
+        let conflicts = block(&fitted.text, SEP_CONFLICTS).unwrap();
+        assert!(conflicts.contains("\nNEW #1\n"), "a printed hit is cited by id: {conflicts}");
+        assert!(conflicts.contains("OLD [2023-07-22 #2] the hit text the cut removed"), "a cut one carries its text: {conflicts}");
+    }
+
     #[test]
     fn bucket_by_recency_splits_at_7_days() {
         let now_ms: i64 = 1_700_000_000_000;
@@ -958,7 +1268,7 @@ mod tests {
         }).await.unwrap();
         let emitted = wm.regenerate_auto_section("agent-x", None, &store).await.unwrap();
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-x", None, &Reach::Own, QueryTexts::single_shot("query"), &emitted, None).await.unwrap();
+        let result = build_memory_prompt(&store, &wm, None, "agent-x", None, &Reach::Own, QueryTexts::single_shot("query"), &emitted, None, DEFAULT_BUDGET).await.unwrap().text;
         assert!(result.contains(SEP_CONFLICTS), "{result}");
     }
 
@@ -1031,10 +1341,54 @@ mod tests {
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
         // 7th argument `None::<&AccessTracker>` — must compile once the parameter exists.
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None::<&AccessTracker>)
+        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None::<&AccessTracker>, DEFAULT_BUDGET)
             .await
-            .unwrap();
+            .unwrap().text;
         assert_eq!(result, "", "all empty → empty string");
+    }
+
+    struct BrokenEmbedder;
+    #[async_trait::async_trait]
+    impl Embedder for BrokenEmbedder {
+        async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+            Err(EmbedError::InferenceFailed("the session is gone".into()))
+        }
+        fn dimensions(&self) -> usize {
+            384
+        }
+        fn model_id(&self) -> &str {
+            "broken"
+        }
+        fn query_prefix(&self) -> &str {
+            ""
+        }
+        fn passage_prefix(&self) -> &str {
+            ""
+        }
+    }
+
+    /// Each of these leaves the prompt with the workspace alone, which an
+    /// agent reads as "there are no memories" unless it is told why.
+    #[tokio::test]
+    async fn the_retrieval_outcome_names_each_silence() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let recall = |embedder: Option<Arc<dyn Embedder>>| {
+            let (store, wm) = (&store, &wm);
+            async move {
+                build_memory_prompt(store, wm, embedder, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET)
+                    .await
+                    .unwrap()
+                    .retrieval
+            }
+        };
+
+        assert!(matches!(recall(None).await, Retrieval::NoEmbedder));
+        let broken = recall(Some(Arc::new(BrokenEmbedder))).await;
+        assert!(matches!(broken, Retrieval::EmbedFailed(EmbedError::InferenceFailed(_))), "{broken:?}");
+        let working = recall(Some(Arc::new(RecordingEmbedder { calls: std::sync::Mutex::new(Vec::new()) }))).await;
+        assert!(matches!(working, Retrieval::Searched), "{working:?}");
     }
 
     #[tokio::test]
@@ -1043,7 +1397,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None).await.unwrap();
+        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET).await.unwrap().text;
         assert_eq!(result, "", "all empty → empty string");
     }
 
@@ -1059,7 +1413,7 @@ mod tests {
         let path = wm.workspace_path("agent-1", None);
         tokio::fs::write(&path, "<!-- AUTO-START -->\n## Notes\n- something\n<!-- AUTO-END -->\n<!-- USER-START -->\n<!-- USER-END -->\n").await.unwrap();
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None).await.unwrap();
+        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET).await.unwrap().text;
         assert!(result.contains(SEP_WORKSPACE), "should contain WORKSPACE separator");
         assert!(!result.contains(SEP_RECENT), "no embedder → no RECENT");
     }
@@ -1072,9 +1426,9 @@ mod tests {
         let path = wm.workspace_path("agent-1", None);
         tokio::fs::create_dir_all(path.parent().unwrap()).await.unwrap();
         tokio::fs::write(&path, content).await.unwrap();
-        let prompt = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None)
+        let prompt = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET)
             .await
-            .unwrap();
+            .unwrap().text;
         (prompt, path, tmp)
     }
 
@@ -1114,9 +1468,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None).await;
+        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET).await;
         assert!(result.is_ok(), "should not panic or error");
-        let s = result.unwrap();
+        let s = result.unwrap().text;
         assert!(!s.contains(SEP_RECENT), "no RECENT block without embedder");
     }
 
@@ -1130,7 +1484,7 @@ mod tests {
         tokio::fs::create_dir_all(path.parent().unwrap()).await.unwrap();
         tokio::fs::write(&path, "workspace content here\n").await.unwrap();
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None).await.unwrap();
+        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET).await.unwrap().text;
         assert!(result.contains(SEP_WORKSPACE));
         assert!(!result.contains(SEP_RECENT));
         assert!(!result.contains(SEP_LONGTERM));
@@ -1143,7 +1497,7 @@ mod tests {
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         disputed_pair(&store, "agent-x", "semantic_fact", 8.0).await;
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-x", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None).await.unwrap();
+        let result = build_memory_prompt(&store, &wm, None, "agent-x", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET).await.unwrap().text;
         assert!(!result.contains(SEP_CONFLICTS), "{result}");
     }
 
@@ -1153,7 +1507,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None).await.unwrap();
+        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET).await.unwrap().text;
         assert!(!result.contains("ACTIVE CONFLICTS"), "no disputes → CONFLICTS block omitted");
     }
 
@@ -1211,8 +1565,8 @@ mod tests {
 
         let result = build_memory_prompt(
             &store, &wm, Some(embedder), "agent-split", None, &Reach::Own, QueryTexts::single_shot("some query"),
-            &EmittedIds::default(), None
-        ).await.unwrap();
+            &EmittedIds::default(), None, DEFAULT_BUDGET
+        ).await.unwrap().text;
 
         assert!(result.contains(SEP_RECENT), "should have RECENT block");
         assert!(result.contains(SEP_LONGTERM), "should have LONG-TERM block");
@@ -1437,9 +1791,10 @@ mod tests {
             QueryTexts::single_shot("GPXSTORE7F3A"),
             &EmittedIds::default(),
             None,
+            DEFAULT_BUDGET,
         )
         .await
-        .unwrap();
+        .unwrap().text;
 
         assert!(
             result.contains("GPXSTORE7F3A"),
@@ -1497,9 +1852,9 @@ mod tests {
             embedded: "what should I check next\nRAREIDENT99XY",
         };
 
-        let result = build_memory_prompt(&store, &wm, Some(embedder), agent, None, &Reach::Own, query, &EmittedIds::default(), None)
+        let result = build_memory_prompt(&store, &wm, Some(embedder), agent, None, &Reach::Own, query, &EmittedIds::default(), None, DEFAULT_BUDGET)
             .await
-            .unwrap();
+            .unwrap().text;
 
         assert!(
             !result.contains("RAREIDENT99XY"),
@@ -1524,9 +1879,9 @@ mod tests {
             embedded: "raw current message\nprior turn folded in by composition",
         };
 
-        build_memory_prompt(&store, &wm, Some(embedder), "agent-1", None, &Reach::Own, query, &EmittedIds::default(), None)
+        build_memory_prompt(&store, &wm, Some(embedder), "agent-1", None, &Reach::Own, query, &EmittedIds::default(), None, DEFAULT_BUDGET)
             .await
-            .unwrap();
+            .unwrap().text;
 
         let calls = recording.calls.lock().unwrap();
         assert_eq!(calls.len(), 1, "expected exactly one embed call, got {calls:?}");
@@ -1558,9 +1913,9 @@ mod tests {
         assert_eq!(emitted.len(), 0, "importance 5 is below the workspace bar");
 
         let result =
-            build_memory_prompt(&store, &wm, Some(embedder), "agent-gap", None, &Reach::Own, QueryTexts::single_shot(content), &emitted, None)
+            build_memory_prompt(&store, &wm, Some(embedder), "agent-gap", None, &Reach::Own, QueryTexts::single_shot(content), &emitted, None, DEFAULT_BUDGET)
                 .await
-                .unwrap();
+                .unwrap().text;
 
         assert_eq!(
             result.matches(content).count(),
@@ -1632,9 +1987,9 @@ mod tests {
         assert_eq!(emitted.len(), 2, "one preference + one skill are rendered by the workspace");
 
         let result =
-            build_memory_prompt(&store, &wm, Some(embedder), "agent-3t", None, &Reach::Own, QueryTexts::single_shot(query), &emitted, None)
+            build_memory_prompt(&store, &wm, Some(embedder), "agent-3t", None, &Reach::Own, QueryTexts::single_shot(query), &emitted, None, DEFAULT_BUDGET)
                 .await
-                .unwrap();
+                .unwrap().text;
 
         assert_eq!(result.matches("prefiere voseo siempre").count(), 1, "memory row twice:\n{result}");
         assert_eq!(result.matches("arreglar-test-roto").count(), 1, "skill row twice:\n{result}");
@@ -1690,9 +2045,9 @@ mod tests {
         assert_eq!(emitted.len(), 5, "the fixture must actually fill the workspace");
 
         let result =
-            build_memory_prompt(&store, &wm, Some(embedder), "agent-budget", None, &Reach::Own, QueryTexts::single_shot(query), &emitted, None)
+            build_memory_prompt(&store, &wm, Some(embedder), "agent-budget", None, &Reach::Own, QueryTexts::single_shot(query), &emitted, None, DEFAULT_BUDGET)
                 .await
-                .unwrap();
+                .unwrap().text;
 
         let delivered = (0..K_FINAL)
             .filter(|i| result.contains(&format!("mensaje de chat {i}")))
@@ -1831,9 +2186,10 @@ mod tests {
             QueryTexts::single_shot("witness"),
             &EmittedIds::default(),
             Some(&tracker),
+            DEFAULT_BUDGET,
         )
         .await
-        .unwrap();
+        .unwrap().text;
         assert!(result.contains("colliding-skill"), "the skill must be a hit: {result}");
         assert!(!result.contains("bystander"), "the bystander must not be a hit: {result}");
 
@@ -1869,6 +2225,7 @@ mod tests {
             QueryTexts::single_shot("witness"),
             &EmittedIds::default(),
             Some(&tracker),
+            DEFAULT_BUDGET,
         )
         .await
         .unwrap();
@@ -1907,14 +2264,96 @@ mod tests {
             QueryTexts::single_shot("witness"),
             &EmittedIds::default(),
             Some(&tracker),
+            DEFAULT_BUDGET,
         )
         .await
-        .unwrap();
+        .unwrap().text;
         assert!(prompt.contains("filler"), "a zero-score hit still fills the prompt: {prompt}");
 
         force_flush_until_counted(&store, witness).await;
 
         assert_eq!(memory_access_state(&store, filler).await, before);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hit_cut_by_the_budget_is_not_counted_as_accessed() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let agent = "agent-cut-access";
+
+        let mut near = vec![0.0_f32; 384];
+        near[0] = 1.0;
+        let mut farther = near.clone();
+        farther[1] = 0.3;
+        let kept = seed_memory(&store, agent, "kept witness", "chat_message", 3, 5.0, unit_bytes(&near)).await;
+        let cut = seed_memory(&store, agent, &"cut witness ".repeat(400), "chat_message", 3, 5.0, unit_bytes(&farther)).await;
+        let before = memory_access_state(&store, cut).await;
+
+        let tracker = AccessTracker::new(store.conn.clone());
+        let prompt = build_memory_prompt(
+            &store,
+            &wm,
+            Some(Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>),
+            agent,
+            None,
+            &Reach::Own,
+            QueryTexts::single_shot("witness"),
+            &EmittedIds::default(),
+            Some(&tracker),
+            600,
+        )
+        .await
+        .unwrap()
+        .text;
+        assert!(prompt.contains(&format!("Left out: #{cut}.")), "{prompt}");
+
+        force_flush_until_counted(&store, kept).await;
+
+        assert_eq!(memory_access_state(&store, cut).await, before);
+    }
+
+    /// The months-old store the exploration feared: every row as long as a
+    /// piece gets, and a workspace well stocked.
+    #[tokio::test]
+    async fn a_store_of_long_rows_fits_the_budget() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let agent = "agent-long-rows";
+        let mut like_query = vec![0.0_f32; 384];
+        like_query[0] = 1.0;
+        for i in 0..30 {
+            seed_memory(&store, agent, &format!("row {i} ").repeat(500), "semantic_fact", 2, 5.0, unit_bytes(&like_query)).await;
+        }
+        let recall = |budget| {
+            let (store, wm) = (&store, &wm);
+            async move {
+                build_memory_prompt(
+                    store,
+                    wm,
+                    Some(Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>),
+                    agent,
+                    None,
+                    &Reach::Own,
+                    QueryTexts::single_shot("row"),
+                    &EmittedIds::default(),
+                    None,
+                    budget,
+                )
+                .await
+                .unwrap()
+                .text
+            }
+        };
+
+        let unbounded = recall(usize::MAX).await;
+        assert!(unbounded.len() > MAX_BUDGET, "the fixture has to overflow any budget: {} bytes", unbounded.len());
+        for budget in [DEFAULT_BUDGET, 3_000, MAX_BUDGET] {
+            let prompt = recall(budget).await;
+            assert!(prompt.len() <= budget, "{} bytes over {budget}", prompt.len());
+            assert!(prompt.contains(SEP_BUDGET), "{prompt}");
+        }
     }
 
     #[tokio::test]
@@ -2016,8 +2455,8 @@ mod tests {
         let emitted = wm.regenerate_auto_section("e2e-agent", None, &store).await.unwrap();
 
         let result = build_memory_prompt(
-            &store, &wm, Some(embedder), "e2e-agent", None, &Reach::Own, QueryTexts::single_shot("some query"), &emitted, None
-        ).await.unwrap();
+            &store, &wm, Some(embedder), "e2e-agent", None, &Reach::Own, QueryTexts::single_shot("some query"), &emitted, None, DEFAULT_BUDGET
+        ).await.unwrap().text;
 
         // All four separators must appear in order
         let ws_pos = result.find(SEP_WORKSPACE).expect("WORKSPACE separator missing");
@@ -2093,15 +2532,15 @@ mod tests {
         let query = QueryTexts::single_shot("dato");
         let emitted = EmittedIds::default();
 
-        let alone = build_memory_prompt(&store, &wm, embedder(), "cursor", None, &Reach::Own, query, &emitted, None).await.unwrap();
+        let alone = build_memory_prompt(&store, &wm, embedder(), "cursor", None, &Reach::Own, query, &emitted, None, DEFAULT_BUDGET).await.unwrap().text;
         assert!(alone.contains("dato propio de cursor"), "{alone}");
         assert!(!alone.contains("claude-code"), "reaching only its own, nothing is shared: {alone}");
         assert!(!alone.contains(SEP_SHARED), "{alone}");
 
         let query = QueryTexts::single_shot("dato");
-        let shared = build_memory_prompt(&store, &wm, embedder(), "cursor", None, &Reach::AllBut(Vec::new()), query, &emitted, None)
+        let shared = build_memory_prompt(&store, &wm, embedder(), "cursor", None, &Reach::AllBut(Vec::new()), query, &emitted, None, DEFAULT_BUDGET)
             .await
-            .unwrap();
+            .unwrap().text;
         assert!(shared.contains("semantic_fact by claude-code] dato de claude-code"), "{shared}");
         assert!(shared.contains("semantic_fact] dato propio de cursor"), "the own line keeps its shape: {shared}");
         assert!(shared.ends_with(&format!("{SEP_SHARED}\n{SHARED_NOTE}\n")), "the note closes the prompt: {shared}");
@@ -2140,9 +2579,10 @@ mod tests {
             QueryTexts::single_shot("regla"),
             &emitted,
             None,
+            DEFAULT_BUDGET,
         )
         .await
-        .unwrap();
+        .unwrap().text;
 
         if let Some(workspace) = block(&prompt, SEP_WORKSPACE) {
             assert!(!workspace.contains("regla de claude-code"), "{prompt}");

@@ -146,7 +146,7 @@ async fn answer_cases(
         let search_lines_printed = search_read.lines.len();
 
         let started = Instant::now();
-        let prompt = session.client.context(&case.query, AGENT_ID, None).await?.prompt;
+        let prompt = session.client.context(&case.query, AGENT_ID, None, None).await?.prompt;
         let context_text = format_context(&prompt);
         let context_ms = elapsed_ms(started);
         let context_found = read_context(&context_text, &case.expected_refs, corpus);

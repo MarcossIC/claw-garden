@@ -17,7 +17,7 @@ use clawg_core::memory::sharing::{Reach, SharingError, SharingPolicy};
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
 
-use crate::client::{Context, Health, Hit, MemoryRow, Restored, SavedText, Synthesis, Updated};
+use crate::client::{Context, Health, Hit, MemoryRow, Restored, Retrieval, SavedText, Synthesis, Updated};
 use crate::daemon::api::DocsSearchBody;
 use crate::relevance::{shown_hits, RELEVANCE_RATIO};
 
@@ -280,10 +280,35 @@ fn synthesis_nudge(unreviewed: usize) -> Option<String> {
     })
 }
 
-/// What `recall_context` hands the model: the context, then the reminder to
-/// synthesize when enough memories wait for it.
+/// Why memories were not searched, said before the context: a prompt holding
+/// only the workspace, or nothing, otherwise reads as "there are no memories".
+fn retrieval_notice(retrieval: &Retrieval, has_context: bool) -> Option<String> {
+    let why = match retrieval {
+        Retrieval::Searched | Retrieval::Unknown => return None,
+        Retrieval::EmbedderNotReady => {
+            "the embedding model is still loading; call again in a minute".to_string()
+        }
+        Retrieval::EmbedderFailed { detail, retryable } => format!(
+            "the embedding model could not load ({detail}), and memories stay out of reach {}",
+            if *retryable { "until clawg's retry succeeds" } else { "until the cause is fixed" }
+        ),
+        Retrieval::SearchFailed { detail } => format!("the search failed ({detail}); calling again may work"),
+    };
+    let shown = if has_context { "Only the workspace is shown below" } else { "The workspace is empty" };
+    Some(format!("Memories were not searched: {why}. {shown}; that does not mean there are no memories."))
+}
+
+/// What `recall_context` hands the model: why memories were not searched when
+/// they were not, the context, then the reminder to synthesize when enough
+/// memories wait for it.
 pub fn format_recall(context: &Context) -> String {
-    let text = format_context(&context.prompt);
+    let has_context = !context.prompt.trim().is_empty();
+    let notice = context.retrieval.as_ref().and_then(|r| retrieval_notice(r, has_context));
+    let text = match notice {
+        Some(notice) if has_context => format!("{notice}\n\n{}", context.prompt),
+        Some(notice) => notice,
+        None => format_context(&context.prompt),
+    };
     match synthesis_nudge(context.unreviewed) {
         Some(nudge) => format!("{text}\n\n{nudge}"),
         None => text,
@@ -718,7 +743,7 @@ mod tests {
 
     #[test]
     fn the_nudge_appears_from_the_threshold() {
-        let context = |unreviewed| Context { prompt: "## WORKSPACE\nstuff".into(), unreviewed };
+        let context = |unreviewed| Context { prompt: "## WORKSPACE\nstuff".into(), unreviewed, retrieval: None };
 
         assert_eq!(format_recall(&context(SYNTHESIS_NUDGE_THRESHOLD - 1)), "## WORKSPACE\nstuff");
         let out = format_recall(&context(SYNTHESIS_NUDGE_THRESHOLD));
@@ -728,8 +753,39 @@ mod tests {
     }
 
     #[test]
+    fn recall_says_when_memories_were_not_searched() {
+        let recall = |prompt: &str, retrieval| {
+            format_recall(&Context { prompt: prompt.into(), unreviewed: 0, retrieval: Some(retrieval) })
+        };
+        let cases = [
+            (Retrieval::EmbedderNotReady, "still loading"),
+            (Retrieval::EmbedderFailed { detail: "disk full".into(), retryable: true }, "disk full"),
+            (Retrieval::SearchFailed { detail: "database is locked".into() }, "database is locked"),
+        ];
+        for (retrieval, cause) in cases {
+            let with_workspace = recall("=== WORKSPACE ===\n- tabs", retrieval.clone());
+            assert!(with_workspace.starts_with("Memories were not searched"), "{with_workspace}");
+            assert!(with_workspace.contains(cause), "{with_workspace}");
+            assert!(with_workspace.ends_with("\n\n=== WORKSPACE ===\n- tabs"), "the context follows untouched: {with_workspace}");
+
+            let empty = recall("", retrieval);
+            assert!(empty.starts_with("Memories were not searched"), "{empty}");
+            assert!(!empty.contains("no context yet"), "an empty workspace is not an empty memory: {empty}");
+        }
+        assert_eq!(recall("=== WORKSPACE ===\n- tabs", Retrieval::Searched), "=== WORKSPACE ===\n- tabs");
+    }
+
+    #[test]
+    fn an_old_daemon_gets_no_invented_notice() {
+        for retrieval in [None, Some(Retrieval::Unknown)] {
+            let context = Context { prompt: String::new(), unreviewed: 0, retrieval };
+            assert_eq!(format_recall(&context), "no context yet");
+        }
+    }
+
+    #[test]
     fn the_nudge_follows_an_empty_context_too() {
-        let out = format_recall(&Context { prompt: String::new(), unreviewed: 50 });
+        let out = format_recall(&Context { prompt: String::new(), unreviewed: 50, retrieval: None });
         assert!(out.starts_with("no context yet\n\n"), "{out}");
     }
 

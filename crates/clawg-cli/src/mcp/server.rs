@@ -200,6 +200,10 @@ pub struct RecallContextArgs {
     /// started in.
     #[serde(default)]
     pub project_path: Option<String>,
+    /// Most bytes of context to return, about 4 per token. Defaults to 8000,
+    /// at most 24000. What does not fit is named by id at the end.
+    #[serde(default)]
+    pub budget: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -710,7 +714,7 @@ impl ClawgMcp {
         let result = self
             .call(|client| async move {
                 let project_id = self.project_for(&client, args.project_path.as_deref(), false).await?;
-                client.context(&args.query, agent_id, project_id.as_deref()).await
+                client.context(&args.query, agent_id, project_id.as_deref(), args.budget).await
             })
             .await;
         match result {
@@ -986,7 +990,8 @@ impl ClawgMcp {
         name = "recall_context",
         description = "Get a ready-to-read background block for a query: the user's workspace \
                        notes, recent memories and long-term memories, already assembled and \
-                       deduplicated, with full content. It costs several times the tokens of \
+                       deduplicated, with full content up to a byte budget; what does not fit \
+                       is named by id for `read_memory`. It costs several times the tokens of \
                        `search_memory`, so use it once when starting a broad task that needs \
                        background, and `search_memory` for specific questions."
     )]
@@ -1744,7 +1749,7 @@ mod tests {
         let listed = text(&b.list_memories_impl(&agent, list_all()).await.expect("list"));
         assert!(listed.contains("release branch"), "{listed}");
         let context = b
-            .recall_context_impl(&agent, RecallContextArgs { query: "release branch".into(), project_path: None })
+            .recall_context_impl(&agent, RecallContextArgs { query: "release branch".into(), project_path: None, budget: None })
             .await
             .expect("recall");
         assert!(text(&context).contains("ask before force-pushing"), "{}", text(&context));
@@ -1988,7 +1993,7 @@ mod tests {
             let saved = b.save_memory_impl("agent-mcp", save_args(&format!("fact number {i} about the build"))).await.expect("save");
             ids.push(text(&saved).strip_prefix("saved #").and_then(|n| n.parse::<i64>().ok()).expect("an id"));
         }
-        let recall = || b.recall_context_impl("agent-mcp", RecallContextArgs { query: "the build".into(), project_path: None });
+        let recall = || b.recall_context_impl("agent-mcp", RecallContextArgs { query: "the build".into(), project_path: None, budget: None });
         assert!(text(&recall().await.expect("recall")).contains("`synthesize`"), "enough memories wait for a review");
 
         let listed = text(&b.synthesize_impl("agent-mcp", SynthesizeArgs::default()).await.expect("synthesize"));
@@ -2572,7 +2577,7 @@ mod tests {
         let r = b
             .recall_context_impl(
                 "agent-mcp",
-                RecallContextArgs { query: "anything".into(), project_path: None },
+                RecallContextArgs { query: "anything".into(), project_path: None, budget: None },
             )
             .await
             .expect("recall");
@@ -3016,6 +3021,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recall_context_passes_its_budget() {
+        let (b, _d) = bridge().await;
+        saved_id(&b, "agent-mcp", &"the release script tags every crate before it publishes. ".repeat(10)).await;
+        let recall = |budget| {
+            let b = &b;
+            async move {
+                let args = RecallContextArgs { query: "release script".into(), project_path: None, budget };
+                text(&b.recall_context_impl("agent-mcp", args).await.expect("recall"))
+            }
+        };
+
+        assert!(!recall(None).await.contains("=== BUDGET ==="), "the default fits one memory");
+        let cut = recall(Some(300)).await;
+        assert!(cut.contains("Cut to fit 300 bytes"), "{cut}");
+        assert!(cut.len() <= 300, "{} bytes: {cut}", cut.len());
+    }
+
+    /// The closing note names what the cut left out so the agent can ask for
+    /// exactly that, without repeating the search.
+    #[tokio::test]
+    async fn a_hit_cut_by_the_budget_is_readable_whole() {
+        let (b, _d) = bridge().await;
+        let first = "the deploy job runs on every tag pushed to the release branch";
+        let second = format!("the deploy job {}", "waits for the database migration to finish and then ".repeat(12));
+        saved_id(&b, "agent-mcp", first).await;
+        let cut_id = saved_id(&b, "agent-mcp", &second).await;
+
+        let args = RecallContextArgs { query: "the deploy job".into(), project_path: None, budget: Some(400) };
+        let recalled = text(&b.recall_context_impl("agent-mcp", args).await.expect("recall"));
+        let named = format!("#{cut_id}");
+        let note = recalled.split("=== BUDGET ===").nth(1).unwrap_or_else(|| panic!("a cut is said: {recalled}"));
+        assert!(note.contains(&named), "{recalled}");
+
+        let read = b.read_memory_impl("agent-mcp", ReadMemoryArgs { id: cut_id, kind: None }).await.expect("read");
+        assert!(text(&read).contains(second.trim_end()), "{}", text(&read));
+    }
+
+    #[tokio::test]
     async fn recall_context_shows_another_agents_memory_with_its_author() {
         let (b, d) = bridge().await;
         let content = "claude-code learned that the staging database is rebuilt every night";
@@ -3023,7 +3066,7 @@ mod tests {
         let recall = || {
             let b = &b;
             async move {
-                text(&b.recall_context_impl("cursor", RecallContextArgs { query: content.into(), project_path: None }).await.expect("recall"))
+                text(&b.recall_context_impl("cursor", RecallContextArgs { query: content.into(), project_path: None, budget: None }).await.expect("recall"))
             }
         };
 
