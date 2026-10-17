@@ -47,4 +47,4 @@ Con `-D warnings` un campo sin lector es un error, así que `RankedHit.exact` en
 
 - [x] Suite y clippy en Linux en cada commit.
 - [x] El CI de Linux y Windows.
-- [ ] La medición con el modelo real de la [propuesta](proposal.md#medición-con-el-modelo-real): U1 a U6, en `verify.md`. Necesita el modelo y el golden set fuera de git.
+- [x] La medición con el modelo real de la [propuesta](proposal.md#medición-con-el-modelo-real): U1 a U6, en `verify.md`. Necesita el modelo y el golden set fuera de git.

@@ -7,11 +7,12 @@ Fuente de verdad del comportamiento actual de la evaluación de recuperación: e
 - [project-indexing](../../changes/archive/2026-10-15-project-indexing/proposal.md), archivado el 2026-10-15 (sólo "Barrido de contradicciones" y "`rag-eval --docs`").
 - [eval-rigor](../../changes/archive/2026-10-15-eval-rigor/proposal.md), archivado el 2026-10-15 (casos `unanswerable` y `update`, aciertos, procedencia, partición, `--diff`, brazo sólo léxico y el piso léxico de la baseline).
 - [english-recall](../../changes/archive/2026-10-17-english-recall/proposal.md), archivado el 2026-10-17 (idioma de la consulta, `by_pair`, el corte por pareja de `--diff` y la baseline por pareja).
+- [memory-rank-fusion](../../changes/archive/2026-10-17-memory-rank-fusion/proposal.md), archivado el 2026-10-17 (`all_hit_rate` de agent-view, el subconjunto `lexical_related` y su baseline).
 
 ## Definiciones
 
 - **Golden set:** el JSON que lee `rag-eval` (`docs/eval/golden.json`, fuera de git): `corpus`, `retrieval_cases` y pares. El parseo usa `deny_unknown_fields` en todos sus tipos (`crates/clawg-eval/src/bin/rag-eval/golden.rs:31`).
-- **Subconjunto:** `CaseSubset` (`golden.rs:98`): `natural`, `lexical`, `multi_ref`, `high_importance`, `low_importance`, `long`, `update` o `unanswerable`. Los casos del golden set original son `natural`.
+- **Subconjunto:** `CaseSubset` (`golden.rs:98`): `natural`, `lexical`, `lexical_related`, `multi_ref`, `high_importance`, `low_importance`, `long`, `update` o `unanswerable`. Los casos del golden set original son `natural`.
 - **Set generado:** la salida de `golden-mine synth`: todas las filas, casos y pares de la base sin cambios, seguidos de lo que agrega el generador (`synth::generate`, `crates/clawg-eval/src/bin/golden-mine/synth/mod.rs:69`).
 - **Distractor:** fila sintética que ningún caso espera.
 - **Caso activo:** caso que entra a las métricas ordenadas; los `known_red` y los `unanswerable` no entran.
@@ -64,6 +65,12 @@ El tamaño es `--distractors` (`DEFAULT_DISTRACTORS` = 500, `synth/mod.rs:17`); 
   - la esperada menciona el identificador al pasar, dentro de un marco distinto del que parafrasea la consulta;
   - los 7 hermanos usan ese marco, con identificadores del mismo prefijo cuyos dígitos son una permutación de los de la esperada o difieren en ±1 en el último dígito (`near_identifiers`, `synth/mod.rs:251`);
   - el identificador consultado MUST aparecer en una sola fila de todo el corpus de salida.
+- **30 casos `lexical_related`** (16 en inglés y 14 en español, con `query_lang` igual al idioma de sus filas). Cada uno tiene una consulta que nombra un identificador (función o código de error) y un tema identificado por un nombre clave:
+  - `expected_refs`: la fila con el identificador y tres filas del mismo tema y nombre clave que no lo tienen;
+  - `corpus_refs`: esas cuatro y cuatro hermanas con identificadores vecinos (los mismos dígitos en otro orden, o el último a un paso) que no hablan del tema;
+  - los identificadores MUST NOT repetirse con los de `lexical` ni aparecer en la base.
+  
+  Las filas y los casos de los demás subconjuntos MUST NOT cambiar al agregar estos.
 - **12 casos `multi_ref`** (`MULTI_REF_TOPICS`). Cada clave tiene 8 filas de aspectos que la nombran; la consulta pide 2 o 3 aspectos y sólo esas filas son `expected_refs`.
 - **12 casos `high_importance` y 12 `low_importance`** (`CONTESTED_CASES`), cada uno sobre una clave con 6 filas de aspectos (`CONTESTED_POOL`) y una consulta por un aspecto:
   - en `high_importance`, la esperada tiene importancia en [8, 10] y las otras 5, en [3, 5];
@@ -102,7 +109,7 @@ Toda `expected_ref` MUST existir en el corpus del caso. Los mínimos de casos y 
 
 ### Etiqueta de subconjunto
 
-`RetrievalCase` MUST aceptar una clave opcional `subset` (`golden.rs:80`) con los ocho valores de `CaseSubset`, en snake_case. Si falta, el caso MUST valer `natural`. Una clave desconocida, también una mal escrita como `subsett`, y un valor desconocido MUST seguir siendo un error de parseo.
+`RetrievalCase` MUST aceptar una clave opcional `subset` (`golden.rs:80`) con los nueve valores de `CaseSubset`, en snake_case. Si falta, el caso MUST valer `natural`. Una clave desconocida, también una mal escrita como `subsett`, y un valor desconocido MUST seguir siendo un error de parseo.
 
 #### Escenario: golden actual sin etiqueta
 - GIVEN el `golden.json` actual, sin `subset`
@@ -435,6 +442,16 @@ El resultado MUST llevar el tag `lexical-only` (`LEXICAL_ONLY_SLUG`, `main.rs:46
 
 **Tests:** `lexical_search_ranks_by_bm25_without_vectors` (`eval_api.rs`); `lexical_only_conflicts_with_the_other_arms` (`cli.rs`); `a_lexical_only_run_writes_a_tagged_file_that_diffs` (`main.rs`).
 
+## Todas las esperadas en agent-view
+
+Cada `ToolStats` de `rag-eval --agent-view` MUST llevar `all_hit_rate`: la parte de los casos cuyos `found_refs` son todas sus `expected_refs`. `hit_rate` cuenta un caso con al menos una esperada vista; `all_hit_rate` lo cuenta sólo si están todas. Un resultado sin el campo MUST seguir leyéndose (`#[serde(default)]`), y la consola lo imprime junto al `hit rate` por subconjunto.
+
+#### Escenario: un caso con dos esperadas y una vista
+- GIVEN un caso con `expected_refs = [a, b]` y `found_refs = [a]`
+- THEN cuenta para `hit_rate` y no para `all_hit_rate`
+
+**Tests** (`crates/clawg-eval/src/bin/rag-eval/agent_view/mod.rs`): `all_hit_rate_counts_only_cases_that_showed_every_expected_row`; (`agent_view/stats.rs`): `a_summary_without_all_hit_rate_still_reads`.
+
 ## Subconjunto `long`
 
 Mide si la respuesta que cae dentro de un save largo llega al agente. Viene de [long-save-context](../../changes/archive/2026-10-14-long-save-context/proposal.md), R9 de esa spec.
@@ -585,6 +602,8 @@ La brecha de `es>en` es del cruce: con la consulta traducida al inglés, sus 19 
 | multi_ref | 12 | 0,7778 | 0,7465 | 0,7686 |
 | high_importance | 12 | 1,0000 | 0,7292 | 0,7968 |
 | low_importance | 12 | 0,7500 | 0,3898 | 0,5342 |
+
+Set expandido (`golden-expanded.json`, sha256 `855c64b9…`, fuera de git): 1.280 filas y 154 casos, con `lexical_related` (30). Con `all_hit_rate` en agent-view, `lexical_related` pasa de 0,00 (0/30) a 0,70 (21/30) con el corte de [memory-rank-fusion](../../changes/archive/2026-10-17-memory-rank-fusion/proposal.md). El umbral de 0,90 no se cumple: el corte ya no oculta ninguna fila de ese subconjunto, y las 13 relacionadas que faltan rankean debajo de la décima línea, el límite por defecto de la búsqueda. Lo que resta es ranking, fuera de ese cambio. Las salidas de `search_memory` de los demás subconjuntos no cambian. Detalle en el [verify.md archivado](../../changes/archive/2026-10-17-memory-rank-fusion/verify.md#u1).
 
 ### Criterio de salida
 

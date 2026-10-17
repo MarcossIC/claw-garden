@@ -1,6 +1,6 @@
 # memory-rank-fusion — Especificación
 
-Delta sobre [`specs/retrieval`](../../specs/retrieval/spec.md) (el corte relativo y el bono léxico) y [`specs/eval`](../../specs/eval/spec.md) (agent-view y `golden-mine synth`). No cambia ningún score, el orden de la búsqueda ni `recall_context`.
+Delta sobre [`specs/retrieval`](../../../specs/retrieval/spec.md) (el corte relativo y el bono léxico) y [`specs/eval`](../../../specs/eval/spec.md) (agent-view y `golden-mine synth`). No cambia ningún score, el orden de la búsqueda ni `recall_context`.
 
 ## Definiciones
 
@@ -64,7 +64,7 @@ La función se llama `shown_hits(&[(f64, bool)], ratio) -> Vec<bool>`.
 - WHEN el lector busca
 - THEN el hit llega con `exact = true` y `agent_id` del autor, y `search_memory` lo muestra `by <autor>`
 
-**Tests:** `search_shows_the_rows_an_identifier_match_used_to_hide` y `an_identifier_match_from_another_agent_is_exact_and_attributed` (`crates/clawg-cli/tests/api.rs`, **RED**: con la regla de hoy el daemon devuelve dos hits, comprobado), con un embedder de prueba que fija los vectores por texto; `a_hit_without_exact_reads_as_inexact` (`client.rs`, guarda que compila recién con el campo); `relevant_hits_keeps_exact_hits_and_cuts_against_the_rest` y `an_exact_hit_from_another_agent_is_shown_by_its_author` (`tools.rs`, **RED**). Guardas: `search_without_a_relative_cut_is_unchanged`, `search_applies_the_requested_relative_cut`. Qué se registra como acceso no tiene test propio, como hoy ([`specs/retrieval`](../../specs/retrieval/spec.md#search-registra-sólo-lo-que-devuelve)): el handler registra la misma lista que responde (`api.rs:915`), y el flush corre cada 30 s, así que un test HTTP no lo puede adelantar.
+**Tests:** `search_shows_the_rows_an_identifier_match_used_to_hide` y `an_identifier_match_from_another_agent_is_exact_and_attributed` (`crates/clawg-cli/tests/api.rs`, **RED**: con la regla de hoy el daemon devuelve dos hits, comprobado), con un embedder de prueba que fija los vectores por texto; `a_hit_without_exact_reads_as_inexact` (`client.rs`, guarda que compila recién con el campo); `relevant_hits_keeps_exact_hits_and_cuts_against_the_rest` y `an_exact_hit_from_another_agent_is_shown_by_its_author` (`tools.rs`, **RED**). Guardas: `search_without_a_relative_cut_is_unchanged`, `search_applies_the_requested_relative_cut`. Qué se registra como acceso no tiene test propio, como hoy ([`specs/retrieval`](../../../specs/retrieval/spec.md#search-registra-sólo-lo-que-devuelve)): el handler registra la misma lista que responde (`api.rs:915`), y el flush corre cada 30 s, así que un test HTTP no lo puede adelantar.
 
 ## R4. Agent-view mide si se mostraron todas las esperadas
 

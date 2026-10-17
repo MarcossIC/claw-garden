@@ -9,12 +9,14 @@ Fuente de verdad del comportamiento actual de la recuperación: el corte relativ
 - [context-density](../../changes/archive/2026-10-14-context-density/proposal.md), archivado el 2026-10-14 (desde "Línea de hit en `recall_context`" hasta "Medición del contexto").
 - [agent-sharing](../../changes/archive/2026-10-14-agent-sharing/proposal.md), archivado el 2026-10-14 (sólo "Hits de otros agentes" y los cambios de agente en "El bono respeta el scope" y en "Línea de hit en `recall_context`").
 - [project-indexing](../../changes/archive/2026-10-15-project-indexing/proposal.md), archivado el 2026-10-15 (sólo "El piso de coseno", "Indexar un proyecto no cambia la búsqueda de memorias", el valor de `RELEVANCE_RATIO` y la medición con pooling mean en "Medición del contexto").
+- [memory-rank-fusion](../../changes/archive/2026-10-17-memory-rank-fusion/proposal.md), archivado el 2026-10-17 (sólo "Definiciones", "Corte relativo en `POST /v1/search`" y "Cliente HTTP y herramienta `search_memory`").
 
 ## Definiciones
 
-- **Corte relativo con ratio r (`relevant_len`, `crates/clawg-cli/src/relevance.rs:25`):** sobre scores ordenados mejor primero, se conservan los primeros mientras la posición sea menor que `MIN_SHOWN_HITS` o el score sea `>= r × mejor`. Sin scores, no queda ninguno.
+- **Hit exacto:** hit cuya fila recibió el bono léxico en esta búsqueda, es decir, `RawHit.lexical_match` (`crates/clawg-core/src/memory/score.rs:28-30`), una fila de `memory` que está en los matches de identificador de la consulta. Viaja en cada hit como `exact`. Un hit de `episodic` o `procedural` nunca es exacto.
+- **Corte relativo con ratio r (`shown_hits`, `crates/clawg-cli/src/relevance.rs:31`):** sobre hits ordenados mejor primero, cada uno con su score y su marca de exacto, pasa todo hit exacto, aunque quede detrás de uno cortado. Un hit no exacto pasa si está entre los `MIN_SHOWN_HITS` primeros no exactos o si su score es `>= r × mejor score no exacto`. Los que pasan conservan su orden. Sin scores, no queda ninguno. Sin hits exactos, el resultado es el de cortar por prefijo: los primeros mientras la posición sea menor que `MIN_SHOWN_HITS` o el score sea `>= r × mejor`.
 - **`RELEVANCE_RATIO` (`relevance.rs:19`):** 0,35. El ratio que usa el puente MCP y que pide el cliente HTTP. Medido con `rag-eval --real --agent-view` sobre vectores con pooling mean, cuyo mejor score tiene mediana 0,19: con 0,35 `search_memory` muestra el recuerdo esperado en 36 de 46 consultas con 764 tokens de media; con 0,6 eran 30 con 455 y con 0,2 son 37 con 894. El score del esperado (0,03–0,41) y el del resto (hasta 0,38) se superponen, por eso el corte es relativo.
-- **`MIN_SHOWN_HITS` (`relevance.rs:22`):** 2. Hits que pasan el corte sea cual sea su score.
+- **`MIN_SHOWN_HITS` (`relevance.rs:22`):** 2. Hits no exactos que pasan el corte sea cual sea su score; los exactos no cuentan para este mínimo.
 - **Acceso:** un id que llega al access tracker. En el flush suma `access_count`, lleva `last_accessed_at` al máximo entre el actual y el del flush, y recalcula el tier en la misma sentencia (`flush`, `crates/clawg-core/src/memory/access.rs:175`; el `UPDATE` en `:204-209`). El flush corre cada 30 s o al juntar 500 ids (`access.rs:76-78` y `:90`).
 - **Hit contable:** hit de `kind = memory` con `score > 0` (`AccessTracker::record_hits`, `access.rs:151`). Sólo cuentan los de `memory` porque los ids son por tabla y el flush sólo actualiza `memory`. Un hit con score 0 está bajo el piso de similitud y ocupa un lugar de relleno.
 - **Token:** cada tramo de `char::is_alphanumeric() || '_'` de la consulta, como los parte `fts_tokens` (`crates/clawg-core/src/memory/search.rs:576`).
@@ -39,7 +41,7 @@ El corte vive en `clawg-cli` y no en el core: `search_all_memories` devuelve sie
 `POST /v1/search` MUST aceptar el campo opcional `min_relative_score` (`SearchRequest`, `crates/clawg-cli/src/daemon/api.rs:340-350`).
 
 - Ausente: la respuesta MUST traer todos los hits ordenados hasta `limit`, sin corte.
-- Presente con un valor en `[0, 1]`: el daemon MUST devolver sólo los hits que pasan el corte relativo con ese ratio, en el mismo orden (`search`, `api.rs:877`; el corte en `:799-802`).
+- Presente con un valor en `[0, 1]`: el daemon MUST devolver sólo los hits que pasan el corte relativo con ese ratio, en el mismo orden (`search`, `api.rs:877`; el corte en `:799-802`). Cada hit de la respuesta MUST llevar `exact`.
 - Presente fuera de `[0, 1]`, o no finito: MUST responder `400` sin buscar ni registrar accesos (`check_relative_score`, `api.rs:308`). La validación corre después de comprobar el embedder: sin embedder listo, la respuesta es la de esa condición (`503`).
 
 #### Escenario: sin campo
@@ -50,13 +52,18 @@ El corte vive en `clawg-cli` y no en el core: `search_all_memories` devuelve sie
 #### Escenario: con corte
 - GIVEN las mismas filas
 - WHEN se busca con `min_relative_score = 0.6`
-- THEN vuelven los primeros `relevant_len(scores, 0.6)` hits de la búsqueda sin corte, en el mismo orden, y son menos que cuatro
+- THEN vuelven los hits que pasa `shown_hits` con ratio 0,6 sobre la búsqueda sin corte, en el mismo orden, y son menos que cuatro
+
+#### Escenario: exacto detrás de uno cortado
+- GIVEN una fila con el identificador de la consulta, con coseno 0,85, y tres sin él con 0,88, 0,87 y 0,86, del mismo tipo, importancia y edad
+- WHEN se busca con `min_relative_score = 0.35`
+- THEN vuelven las cuatro, con `exact = true` sólo en la primera
 
 #### Escenario: fuera de rango
 - WHEN se busca con `min_relative_score = 1.5` o `-0.1`
 - THEN la respuesta es `400`
 
-**Tests:** `search_without_a_relative_cut_is_unchanged`, `search_applies_the_requested_relative_cut` y `search_rejects_a_relative_score_outside_zero_to_one` (`crates/clawg-cli/tests/api.rs`); `a_relative_score_inside_zero_to_one_passes_through` y `a_relative_score_outside_zero_to_one_is_a_bad_request`, que incluye `NaN` e infinito (`api.rs`, mod tests); `relevance_ratio_pins_the_shipped_value`, `hits_far_below_the_best_match_are_not_shown`, `a_hit_exactly_at_the_ratio_is_shown`, `the_two_best_are_shown_whatever_they_score` y `no_scores_keep_nothing` (`relevance.rs`).
+**Tests:** `search_without_a_relative_cut_is_unchanged`, `search_applies_the_requested_relative_cut` y `search_rejects_a_relative_score_outside_zero_to_one` (`crates/clawg-cli/tests/api.rs`); `a_relative_score_inside_zero_to_one_passes_through` y `a_relative_score_outside_zero_to_one_is_a_bad_request`, que incluye `NaN` e infinito (`api.rs`, mod tests); `relevance_ratio_pins_the_shipped_value`, `hits_far_below_the_best_match_are_not_shown`, `a_hit_exactly_at_the_ratio_is_shown`, `the_two_best_are_shown_whatever_they_score` y `no_scores_keep_nothing` (`relevance.rs`); `exact_hits_do_not_set_the_bar_for_the_others`, `an_exact_hit_is_shown_behind_one_the_cut_drops` y `the_two_best_inexact_hits_are_shown_whatever_they_score` (`relevance.rs`); `search_shows_the_rows_an_identifier_match_used_to_hide` y `an_identifier_match_from_another_agent_is_exact_and_attributed` (`api.rs`).
 
 ## `search` registra sólo lo que devuelve
 
@@ -92,7 +99,7 @@ El handler `search` MUST registrar como acceso exactamente los hits contables de
 
 ## Cliente HTTP y herramienta `search_memory`
 
-`DaemonClient::search` MUST mandar `min_relative_score = RELEVANCE_RATIO` junto con los campos de `SearchArgs` (`search_request`, `crates/clawg-cli/src/client.rs:403`; uso en `:538`). El puente MUST volver a aplicar el corte al renderizar `search_memory` (`relevant_hits` y `format_search`, `crates/clawg-cli/src/mcp/tools.rs:60` y `:67`). Aplicar el corte dos veces da el mismo resultado, y contra un daemon que ignora el campo el agente ve lo mismo.
+`DaemonClient::search` MUST mandar `min_relative_score = RELEVANCE_RATIO` junto con los campos de `SearchArgs` (`search_request`, `crates/clawg-cli/src/client.rs:403`; uso en `:538`). El puente MUST volver a aplicar el corte al renderizar `search_memory` (`relevant_hits` y `format_search`, `crates/clawg-cli/src/mcp/tools.rs:60` y `:67`), con el mismo `shown_hits` que el daemon, así que un hit exacto se muestra aunque el corte deje fuera a otro. `Hit` del cliente MUST leer `exact` con `#[serde(default)]`: un hit sin el campo vale `false`. Aplicar el corte dos veces da el mismo resultado, y contra un daemon que ignora el campo el agente ve lo mismo.
 
 #### Escenario: cuerpo del pedido
 - WHEN el cliente arma el cuerpo de una búsqueda

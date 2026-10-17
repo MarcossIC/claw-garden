@@ -1,7 +1,7 @@
 change: memory-rank-fusion
 objective: "1"
 depends_on: [eval-rigor]
-phase: verify
+phase: archive
 artifacts:
   exploration: done
   proposal: done
@@ -9,6 +9,6 @@ artifacts:
   design: skipped  # the proposal settles approach A against B, C and D with the exploration's tradeoffs; no other open alternative
   tasks: done
   apply: done
-  verify: pending  # suite and clippy pass on Linux and in CI on Linux and Windows; the real-model measurement (U1-U6) remains
-  archive: pending
+  verify: done  # U2-U6 pass, U1 fails (lexical_related all_hit_rate 0.70 against >= 0.90; the cut hides no row there, the related rows rank below the 10-hit limit, so the rest is ranking and waits for a separate change)
+  archive: done
 updated: 2026-10-17
