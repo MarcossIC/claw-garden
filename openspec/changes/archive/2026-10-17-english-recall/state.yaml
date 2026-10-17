@@ -1,7 +1,7 @@
 change: english-recall
 objective: "1"
 depends_on: [eval-rigor]
-phase: archive
+phase: archived
 artifacts:
   exploration: done
   proposal: done
@@ -10,5 +10,6 @@ artifacts:
   tasks: done
   apply: done
   verify: done  # holds the diagnosis record; verdict D (the language crossing explains the gap, no prefix closes it)
-  archive: pending
+  archive: done
+main_spec: openspec/specs/eval/spec.md
 updated: 2026-10-17

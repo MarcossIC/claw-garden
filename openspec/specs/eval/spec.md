@@ -1,16 +1,17 @@
 # eval — Especificación
 
-Fuente de verdad del comportamiento actual de la evaluación de recuperación: el generador sintético de `golden-mine synth`, la etiqueta de subconjunto del golden set y sus casos sin respuesta y de versión nueva, el reporte de `rag-eval` (por subconjunto, aciertos estrictos y parciales con intervalo, partición calibración/prueba), la comparación de dos corridas con `--diff`, el brazo sólo léxico, los intrusos del audit, el barrido de contradicciones, `rag-eval --docs` (la medición del índice de la documentación y el código de un proyecto, [`specs/project-docs`](../project-docs/spec.md)) y la baseline medida.
+Fuente de verdad del comportamiento actual de la evaluación de recuperación: el generador sintético de `golden-mine synth`, la etiqueta de subconjunto y el idioma de la consulta en el golden set, sus casos sin respuesta y de versión nueva, el reporte de `rag-eval` (por subconjunto, por pareja de idiomas consulta–fila, aciertos estrictos y parciales con intervalo, partición calibración/prueba), la comparación de dos corridas con `--diff` y su corte por pareja, el brazo sólo léxico, los intrusos del audit, el barrido de contradicciones, `rag-eval --docs` (la medición del índice de la documentación y el código de un proyecto, [`specs/project-docs`](../project-docs/spec.md)) y la baseline medida.
 
 **Origen:**
 - [eval-golden-expansion](../../changes/archive/2026-10-12-eval-golden-expansion/proposal.md), archivado el 2026-10-12.
 - [project-indexing](../../changes/archive/2026-10-15-project-indexing/proposal.md), archivado el 2026-10-15 (sólo "Barrido de contradicciones" y "`rag-eval --docs`").
 - [eval-rigor](../../changes/archive/2026-10-15-eval-rigor/proposal.md), archivado el 2026-10-15 (casos `unanswerable` y `update`, aciertos, procedencia, partición, `--diff`, brazo sólo léxico y el piso léxico de la baseline).
+- [english-recall](../../changes/archive/2026-10-17-english-recall/proposal.md), archivado el 2026-10-17 (idioma de la consulta, `by_pair`, el corte por pareja de `--diff` y la baseline por pareja).
 
 ## Definiciones
 
 - **Golden set:** el JSON que lee `rag-eval` (`docs/eval/golden.json`, fuera de git): `corpus`, `retrieval_cases` y pares. El parseo usa `deny_unknown_fields` en todos sus tipos (`crates/clawg-eval/src/bin/rag-eval/golden.rs:31`).
-- **Subconjunto:** `CaseSubset` (`golden.rs:94`): `natural`, `lexical`, `multi_ref`, `high_importance`, `low_importance`, `long`, `update` o `unanswerable`. Los casos del golden set original son `natural`.
+- **Subconjunto:** `CaseSubset` (`golden.rs:98`): `natural`, `lexical`, `multi_ref`, `high_importance`, `low_importance`, `long`, `update` o `unanswerable`. Los casos del golden set original son `natural`.
 - **Set generado:** la salida de `golden-mine synth`: todas las filas, casos y pares de la base sin cambios, seguidos de lo que agrega el generador (`synth::generate`, `crates/clawg-eval/src/bin/golden-mine/synth/mod.rs:69`).
 - **Distractor:** fila sintética que ningún caso espera.
 - **Caso activo:** caso que entra a las métricas ordenadas; los `known_red` y los `unanswerable` no entran.
@@ -20,6 +21,7 @@ Fuente de verdad del comportamiento actual de la evaluación de recuperación: e
 - **Métrica primaria:** R@5 de `retrieval` y `search.found` de `agent_view`. Las demás son informativas y nunca hacen fallar un diff.
 - **Acierto estricto en k:** todas las esperadas en el top-k (`recall@k` = 1). **Parcial:** al menos una (`recall@k` > 0).
 - **Partición:** `calibration` o `test`, según el sha256 de la consulta. Una constante nueva se elige leyendo `calibration` y se reporta sobre `test`.
+- **Pareja:** el idioma de la consulta y el de las filas esperadas de un caso, escrita `consulta>fila` (`es>en`). El de la consulta es `query_lang`; el de las filas, el `lang` en que coinciden todas sus esperadas (`case_lang`). Un caso al que le falta alguno de los dos no tiene pareja, y sigue contando en todo lo demás.
 
 ## Generador sintético (`golden-mine synth`)
 
@@ -120,9 +122,9 @@ Toda `expected_ref` MUST existir en el corpus del caso. Los mínimos de casos y 
 
 Un caso `unanswerable` no tiene respuesta en el corpus: lo que se mide es si la búsqueda no devuelve nada.
 
-- Un caso con `subset: "unanswerable"` MUST tener `expected_refs` vacía, y un caso de cualquier otra clase MUST NOT tenerla vacía, sea cual sea su estado (`golden.rs:343-347`). Si no, la validación falla (salida 2).
-- En recuperación, el caso lleva `abstained` = el ranking quedó vacío (`crates/clawg-eval/src/bin/rag-eval/main.rs:443`) y va a `retrieval.unanswerable` (`report.rs:202`) antes de mirar su estado, así que también entra uno `known_red` (`main.rs:462`). MUST NOT entrar en `per_case`, R@k, MRR, nDCG, `by_subset`, `by_split`, `similarity` (`main.rs:261`) ni `--follow-up` (`main.rs:755`). `retrieval.abstention` (`report.rs:206`) da la tasa de abstención con su intervalo de Wilson.
-- En agent-view, el caso lleva `abstained` = `search_memory` no imprimió líneas (`agent_view/runner.rs:193`), queda fuera de `hit_rate`, de los resúmenes de tokens y de `by_subset`, y `agent_view.abstention` (`agent_view/mod.rs:162`) da la tasa sobre los casos activos.
+- Un caso con `subset: "unanswerable"` MUST tener `expected_refs` vacía, y un caso de cualquier otra clase MUST NOT tenerla vacía, sea cual sea su estado (`golden.rs:347-351`). Si no, la validación falla (salida 2).
+- En recuperación, el caso lleva `abstained` = el ranking quedó vacío (`crates/clawg-eval/src/bin/rag-eval/main.rs:441`) y va a `retrieval.unanswerable` (`report.rs:245`) antes de mirar su estado, así que también entra uno `known_red` (`main.rs:461`). MUST NOT entrar en `per_case`, R@k, MRR, nDCG, `by_subset`, `by_split`, `similarity` (`main.rs:258`) ni `--follow-up` (`main.rs:754`). `retrieval.abstention` (`report.rs:249`) da la tasa de abstención con su intervalo de Wilson.
+- En agent-view, el caso lleva `abstained` = `search_memory` no imprimió líneas (`agent_view/runner.rs:194`), queda fuera de `hit_rate`, de los resúmenes de tokens y de `by_subset`, y `agent_view.abstention` (`agent_view/mod.rs:173`) da la tasa sobre los casos activos.
 - Sin casos `unanswerable`, `retrieval.unanswerable`, `retrieval.abstention` y `agent_view.abstention` MUST NOT aparecer.
 
 #### Escenario: abstención correcta
@@ -143,12 +145,12 @@ Un caso `unanswerable` no tiene respuesta en el corpus: lo que se mide es si la 
 
 Un caso `update` tiene una fila nueva que repite un dato que dicen filas más viejas: la nueva debería salir primero.
 
-- `CorpusRow` MUST aceptar `age_days` opcional (`golden.rs:54-55`, 0 si falta), y ninguna fila MUST tenerla negativa (`golden.rs:311-315`).
-- `RetrievalCase` MUST aceptar `stale_refs` opcional (`golden.rs:88-89`). Sólo un caso `update` la puede tener. Ese caso MUST tener exactamente una esperada y `stale_refs` no vacía, dentro de `corpus_refs` y sin la esperada, y cada fila vieja MUST tener `age_days` mayor que la esperada; con edades iguales falla (`validate_update`, `golden.rs:361-384`).
+- `CorpusRow` MUST aceptar `age_days` opcional (`golden.rs:54-55`, 0 si falta), y ninguna fila MUST tenerla negativa (`golden.rs:315-319`).
+- `RetrievalCase` MUST aceptar `stale_refs` opcional (`golden.rs:88-89`). Sólo un caso `update` la puede tener. Ese caso MUST tener exactamente una esperada y `stale_refs` no vacía, dentro de `corpus_refs` y sin la esperada, y cada fila vieja MUST tener `age_days` mayor que la esperada; con edades iguales falla (`validate_update`, `golden.rs:365-388`).
 - Al sembrar, `age_days` se pasa a milisegundos redondeados (`DAY_MS`, `seed.rs:89-94`) y se resta de `created_at` (`EvalStore::insert`, `crates/clawg-core/src/eval_api.rs:271-285`). Agent-view siembra por la ruta real de guardado y no lee `age_days`.
-- El caso sigue en `per_case` y en R@k, y lleva `fresh_first`: la esperada está en el ranking y ninguna vieja sale antes (`metrics.rs:42-45`). `retrieval.freshness` (`report.rs:209`) da la tasa con su intervalo de Wilson, sobre los casos activos; `--follow-up` no la calcula.
+- El caso sigue en `per_case` y en R@k, y lleva `fresh_first`: la esperada está en el ranking y ninguna vieja sale antes (`metrics.rs:42-45`). `retrieval.freshness` (`report.rs:252`) da la tasa con su intervalo de Wilson, sobre los casos activos; `--follow-up` no la calcula.
 
-Errores de validación: `E_NO_EXPECTED`, `E_UNANSWERABLE_EXPECTS`, `E_NEGATIVE_AGE`, `E_STALE_OUTSIDE_UPDATE`, `E_UPDATE_SHAPE` y `E_UPDATE_NOT_NEWER` (`golden.rs:233-251`).
+Errores de validación: `E_NO_EXPECTED`, `E_UNANSWERABLE_EXPECTS`, `E_NEGATIVE_AGE`, `E_STALE_OUTSIDE_UPDATE`, `E_UPDATE_SHAPE` y `E_UPDATE_NOT_NEWER` (`golden.rs:237-255`).
 
 #### Escenario: la nueva primero
 - GIVEN un caso `update` cuya esperada queda en el puesto 2 y la vieja en el 4
@@ -164,17 +166,37 @@ Errores de validación: `E_NO_EXPECTED`, `E_UNANSWERABLE_EXPECTS`, `E_NEGATIVE_A
 
 **Tests:** `an_update_case_needs_one_expected_and_older_stale_rows`, `stale_refs_outside_an_update_case_fail`, `a_negative_age_fails` (`golden.rs`); `fresh_first_needs_the_expected_row_before_every_stale_one` (`metrics.rs`); `freshness_counts_only_update_cases` (`report.rs`); `age_days_converts_to_whole_milliseconds` (`seed.rs`); `eval_insert_backdates_created_at` (`eval_api.rs`); `an_update_case_is_scored_and_reports_freshness` (`main.rs`).
 
+### Idioma de la consulta
+
+`RetrievalCase` MUST aceptar una clave opcional `query_lang` (`golden.rs:93`), el idioma en que está escrita la consulta, que no tiene por qué ser el de las filas que espera. Si falta, vale `None`. Se valida sólo como texto, igual que el `lang` de una fila (`golden.rs:50`): no se detecta ni se compara con un catálogo. Una clave mal escrita, como `query_lnag`, MUST seguir siendo un error de parseo. `query_lang` es una anotación del reporte: MUST NOT sembrarse ni embeberse.
+
+La regla con que se etiqueta `docs/eval/golden.json`: el idioma de una consulta o de una fila es el de su prosa; los identificadores y el código no cuentan.
+
+#### Escenario: caso con idioma de consulta
+- GIVEN un caso con `"query_lang": "es"`
+- THEN el parseo da `Some("es")` para ese caso
+
+#### Escenario: sin la clave
+- GIVEN un caso sin `query_lang`
+- THEN `query_lang` es `None` y el golden valida igual que antes
+
+#### Escenario: clave mal escrita
+- GIVEN un caso con la clave `query_lnag`
+- THEN el parseo falla
+
+**Tests** (`golden.rs`): `a_case_may_name_the_language_of_its_query`, `a_case_without_query_lang_has_none` y `a_misspelled_query_lang_key_fails_to_parse`.
+
 ### Un golden sin clases nuevas mide igual
 
-Un golden sin `unanswerable`, `update`, `stale_refs` ni `age_days` MUST producir las mismas métricas y ningún bloque `unanswerable`, `abstention` ni `freshness`. Su `content_sha256` sale de los bytes crudos del archivo (`golden.rs:278`), así que no cambia.
+Un golden sin `unanswerable`, `update`, `stale_refs`, `age_days` ni `query_lang` MUST producir las mismas métricas y ningún bloque `unanswerable`, `abstention`, `freshness` ni `by_pair`, ni la clave `query_lang` en sus casos. Su `content_sha256` sale de los bytes crudos del archivo (`golden.rs:282`), así que no cambia.
 
-**Tests** (`main.rs`): `a_golden_without_the_new_classes_measures_exactly_as_before`, y `an_unanswerable_case_stays_out_of_the_ranked_metrics_and_reports_abstention`, que comprueba que sumar un caso `unanswerable` deja `per_case` y `aggregate` idénticos. Con el set real, el ancla de eval-rigor reprodujo el `content_sha256` y todas las métricas de la anterior ([Ancla de regresión](#ancla-de-regresión)).
+**Tests** (`main.rs`): `a_golden_without_the_new_classes_measures_exactly_as_before`, `a_golden_without_query_lang_measures_exactly_as_before`, y `an_unanswerable_case_stays_out_of_the_ranked_metrics_and_reports_abstention`, que comprueba que sumar un caso `unanswerable` deja `per_case` y `aggregate` idénticos. Con el set real, el ancla de eval-rigor reprodujo el `content_sha256` y todas las métricas de la anterior ([Ancla de regresión](#ancla-de-regresión)).
 
 ## Reporte de `rag-eval`
 
 ### Métricas por subconjunto
 
-El reporte de recuperación MUST incluir `by_subset` (`report.rs:189`): un bloque por subconjunto presente, con `n_cases`, el mismo `Aggregate` que el global y sus `hits`, junto a `by_lang`. Se calcula sólo sobre los casos activos (`aggregate_by_subset`, `crates/clawg-eval/src/bin/rag-eval/report.rs:556`, que `main.rs` llama con `per_case`), así que los `known_red` y los `unanswerable` MUST NOT entrar. Los bloques van ordenados por el nombre serializado, para que dos corridas del mismo set den JSON comparable byte a byte.
+El reporte de recuperación MUST incluir `by_subset` (`report.rs:232`): un bloque por subconjunto presente, con `n_cases`, el mismo `Aggregate` que el global y sus `hits`, junto a `by_lang`. Se calcula sólo sobre los casos activos (`aggregate_by_subset`, `crates/clawg-eval/src/bin/rag-eval/report.rs:626`, que `main.rs` llama con `per_case`), así que los `known_red` y los `unanswerable` MUST NOT entrar. Los bloques van ordenados por el nombre serializado, para que dos corridas del mismo set den JSON comparable byte a byte.
 
 Un resultado previo sin `by_subset`, o con casos sin `subset`, MUST seguir leyéndose (los casos sin etiqueta vuelven como `natural`) y comparándose con `--diff`.
 
@@ -190,7 +212,7 @@ Un resultado previo sin `by_subset`, o con casos sin `subset`, MUST seguir leyé
 
 ### Aciertos estrictos y parciales
 
-El reporte de recuperación MUST incluir `hits` (`report.rs:182`): para k = 1, 5 y 10, los aciertos estrictos y los parciales, cada uno como `Rate` (`report.rs:457`: `hits`, `n_cases`, `rate`, `lo`, `hi`) con su intervalo de Wilson. Va en el bloque global y en cada bloque de `by_lang`, `by_subset` y `by_split`. `aggregate` MUST NOT cambiar: R@k sigue siendo la fracción de esperadas encontradas. La consola MUST mostrar `hits@5 strict k/n = r [lo, hi]  partial k/n = r [lo, hi]` (`format_hit`, `report.rs:576`).
+El reporte de recuperación MUST incluir `hits` (`report.rs:220`): para k = 1, 5 y 10, los aciertos estrictos y los parciales, cada uno como `Rate` (`report.rs:505`: `hits`, `n_cases`, `rate`, `lo`, `hi`) con su intervalo de Wilson. Va en el bloque global y en cada bloque de `by_lang`, `by_subset` y `by_split`. `aggregate` MUST NOT cambiar: R@k sigue siendo la fracción de esperadas encontradas. La consola MUST mostrar `hits@5 strict k/n = r [lo, hi]  partial k/n = r [lo, hi]` (`format_hit`, `report.rs:646`).
 
 #### Escenario: dos esperadas, una encontrada
 - GIVEN un caso con dos esperadas y una sola en el top 5
@@ -200,7 +222,7 @@ El reporte de recuperación MUST incluir `hits` (`report.rs:182`): para k = 1, 5
 
 ### Tamaño de efecto mínimo en la procedencia
 
-`GoldenSetProvenance` MUST incluir `min_one_way_cases` (`report.rs:258`), y su nota MUST terminar con `a paired comparison needs at least {m} cases moving one way ({p} points of {n})` (`report.rs:284-286`), donde `n` es el total de casos del golden (también los `known_red` y los `unanswerable`) y `p` = 100·m/n. Con `n` = 0 la nota omite el paréntesis. `provisional` MUST NOT cambiar.
+`GoldenSetProvenance` MUST incluir `min_one_way_cases` (`report.rs:301`), y su nota MUST terminar con `a paired comparison needs at least {m} cases moving one way ({p} points of {n})` (`report.rs:327-329`), donde `n` es el total de casos del golden (también los `known_red` y los `unanswerable`) y `p` = 100·m/n. Con `n` = 0 la nota omite el paréntesis. `provisional` MUST NOT cambiar.
 
 #### Escenario: el set de 46
 - GIVEN un golden de 46 casos y 28 pares
@@ -210,7 +232,7 @@ El reporte de recuperación MUST incluir `hits` (`report.rs:182`): para k = 1, 5
 
 ### Partición calibración/prueba
 
-Cada caso MUST pertenecer a `calibration` o a `test` según `split_of(query)` (`report.rs:142`): los primeros 16 dígitos hex del sha256 de la consulta, leídos como `u64`, módulo 10, son `calibration` si dan menos de `CALIBRATION_BUCKETS` = 7 (`report.rs:137`). La asignación MUST NOT depender de los otros casos ni de su orden, y no usa semilla. El reporte MUST incluir `by_split` (`report.rs:193`), un bloque por partición presente con `n_cases`, `aggregate` y `hits`, calibración primero, calculado sobre `per_case`. La consola lo encabeza con `retrieval by split (choose on calibration, report test):`. `similarity` y `agent_view` no tienen `by_split`.
+Cada caso MUST pertenecer a `calibration` o a `test` según `split_of(query)` (`report.rs:180`): los primeros 16 dígitos hex del sha256 de la consulta, leídos como `u64`, módulo 10, son `calibration` si dan menos de `CALIBRATION_BUCKETS` = 7 (`report.rs:175`). La asignación MUST NOT depender de los otros casos ni de su orden, y no usa semilla. El reporte MUST incluir `by_split` (`report.rs:236`), un bloque por partición presente con `n_cases`, `aggregate` y `hits`, calibración primero, calculado sobre `per_case`. La consola lo encabeza con `retrieval by split (choose on calibration, report test):`. `similarity` y `agent_view` no tienen `by_split`.
 
 #### Escenario: agregar casos
 - GIVEN 40 consultas y su partición
@@ -223,11 +245,35 @@ Cada caso MUST pertenecer a `calibration` o a `test` según `split_of(query)` (`
 
 **Tests** (`report.rs`): `split_of_is_stable_when_cases_are_added`, `about_seventy_percent_of_queries_calibrate`, `aggregate_by_split_scores_each_split_on_its_own_cases`.
 
+### Métricas por pareja
+
+`by_lang` reparte un caso sólo por el idioma de sus filas, así que una consulta en español sobre una fila en inglés cae junto a una en inglés. La pareja las separa.
+
+`CaseResult` MUST llevar `query_lang` (`report.rs:81`), copiado del caso junto a `lang` en `retrieval.per_case` (`main.rs:454`; con `--follow-up`, `main.rs:870`) y en `similarity.per_case` (`main.rs:1153`). Un caso sin `query_lang` no escribe la clave, y un archivo sin ella se lee con `None`. `pair_of` (`report.rs:142`) da la pareja sólo si están los dos idiomas.
+
+`retrieval` y `similarity` MUST incluir `by_pair` (`report.rs:229`, `:384`): un bloque por pareja presente, con `query_lang`, `lang`, `n_cases`, el mismo `Aggregate` que el global y sus `hits`, calculado sobre los mismos casos que el agregado de su bloque, así que los `known_red` y los `unanswerable` no entran (`aggregate_by_pair`, `report.rs:604`, llamado en `report.rs:491` y `main.rs:1196`). Los bloques van ordenados por `(query_lang, lang)`, para que dos corridas del mismo set den JSON comparable byte a byte. Un caso sin pareja MUST NOT aparecer en ningún bloque y MUST seguir contando en `aggregate`, `hits`, `by_lang`, `by_subset` y `by_split`: por eso los `n_cases` de `by_pair` pueden no sumar `per_case`. Si ningún caso tiene pareja, `by_pair` MUST NOT aparecer en el JSON. La consola imprime, bajo `retrieval by query>row language pair:` y `similarity (pure cosine) by query>row language pair:`, una fila por pareja con `n`, R@1, R@5, R@10, MRR y nDCG@10 (`format_pair_table`, `report.rs:670`; `report.rs:882-889`).
+
+En agent-view, `CaseView` MUST llevar `query_lang` y `row_lang` (`agent_view/mod.rs:91`, `:94`), copiados del caso y de `case_lang` (`agent_view/runner.rs:195-196`), y `AgentViewResults` MUST incluir `by_pair` (`agent_view/mod.rs:169`): un `SubsetSummary` por pareja, con clave `consulta>fila`, sobre los mismos casos que `by_subset`, activos y no `unanswerable` (`agent_view/mod.rs:391-396`). El resumen de consola suma una línea por pareja (`agent_view/mod.rs:306-311`). Sin parejas, `by_pair` no aparece, y un resultado sin `query_lang` ni `row_lang` se sigue leyendo.
+
+#### Escenario: dos parejas por el idioma de la consulta
+- GIVEN dos casos con las mismas filas esperadas en `en`, uno con `query_lang` `es` y otro con `en`
+- THEN hay dos bloques, `en>en` y `es>en`, y cada uno agrega sólo su caso
+
+#### Escenario: sin pareja pero con agregado
+- GIVEN un caso sin `query_lang` y otro con filas esperadas sin `lang`
+- THEN ninguno aparece en `by_pair`, y los dos cuentan en `aggregate`
+
+#### Escenario: casos activos de agent-view por pareja
+- GIVEN tres casos activos, dos `es>en` y uno `en>en`, un `known_red` `es>en` y un `unanswerable` `es>en`
+- THEN `by_pair` tiene `es>en` con `n_cases` 2 y `en>en` con 1
+
+**Tests:** `pair_of_needs_both_languages`, `a_case_result_without_query_lang_neither_writes_nor_requires_it`, `two_cases_differing_only_in_query_lang_fall_in_different_pairs`, `a_case_missing_either_language_has_no_pair_but_counts_in_the_aggregate`, `by_pair_is_absent_from_the_json_when_no_case_has_a_pair`, `the_console_lists_one_row_per_pair` y `a_results_file_without_by_pair_still_reads_and_diffs` (`report.rs`); `the_query_language_reaches_the_retrieval_and_similarity_cases`, `similarity_by_pair_scores_each_pair_on_its_own_cases` y `an_agent_view_run_labels_each_case_with_its_pair` (`main.rs`); `build_results_splits_active_cases_by_pair`, `agent_view_pairs_leave_out_known_red_and_unanswerable` y `a_case_view_without_languages_reads_back_and_writes_none` (`agent_view/mod.rs`).
+
 ### Tests de resultados autocontenidos
 
-Ningún test de `report.rs` ni de `diff.rs` MUST leer un archivo bajo `docs/eval/`: usan fixtures en el código (`reference_value`, `diff.rs:382`) o un directorio temporal.
+Ningún test de `report.rs` ni de `diff.rs` MUST leer un archivo bajo `docs/eval/`: usan fixtures en el código (`reference_value`, `diff.rs:542`) o un directorio temporal.
 
-**Tests:** `a_results_file_without_the_block_still_diffs_against_one_with_it` (`report.rs:1313`); `self_diff_is_a_no_op`, `diff_isolates_similarity_from_ranked_movement` y `diff_files_reads_both_paths_and_produces_the_same_result_as_diff_values` (`diff.rs`).
+**Tests:** `a_results_file_without_the_block_still_diffs_against_one_with_it` (`report.rs:1515`); `self_diff_is_a_no_op`, `diff_isolates_similarity_from_ranked_movement` y `diff_files_reads_both_paths_and_produces_the_same_result_as_diff_values` (`diff.rs`).
 
 ### Intrusos por subconjunto en el audit
 
@@ -276,18 +322,19 @@ rag-eval --diff <a.json> <b.json> [--fail-on-regression]
 
 `--diff` une los casos de los dos archivos por `query` y MUST informar, por cada métrica, `better`, `worse`, `net` y el p exacto (`MetricDiff`, `diff.rs:26`; `p_value`, `diff.rs:39`):
 
-- **`retrieval` y `similarity`:** R@1, R@5, R@10, MRR y nDCG@10. MRR y nDCG@10 llevan además la diferencia media (segundo menos primero) con su intervalo bootstrap, en los dos bloques (`diff_block`, `diff.rs:282`).
-- **`agent_view`**, cuando los dos archivos tienen `agent_view.per_case`, sólo sobre casos activos (`diff_agent_view`, `diff.rs:250`): `search.found`, `context.found`, `search.tokens` y `context.tokens`. En tokens, menos es mejor, pero la media del intervalo es el cambio crudo, así que una media negativa es una mejora. Los tokens incluyen los casos `unanswerable`. Un caso cuenta como `unanswerable` si lo es en cualquiera de los dos archivos, y la fila `search.abstain` se imprime sólo si alguno se movió.
-- **Abstención**, cuando los dos tienen `retrieval.unanswerable` (`diff_abstention`, `diff.rs:237`): abstenerse en el segundo es mejor.
-- **Frescura**, cuando algún caso unido tiene `fresh_first` en los dos (`diff_freshness`, `diff.rs:210`).
+- **`retrieval` y `similarity`:** R@1, R@5, R@10, MRR y nDCG@10. MRR y nDCG@10 llevan además la diferencia media (segundo menos primero) con su intervalo bootstrap, en los dos bloques (`diff_block`, `diff.rs:339`).
+- **`agent_view`**, cuando los dos archivos tienen `agent_view.per_case`, sólo sobre casos activos (`diff_agent_view`, `diff.rs:287`): `search.found`, `context.found`, `search.tokens` y `context.tokens`. En tokens, menos es mejor, pero la media del intervalo es el cambio crudo, así que una media negativa es una mejora. Los tokens incluyen los casos `unanswerable`. Un caso cuenta como `unanswerable` si lo es en cualquiera de los dos archivos, y la fila `search.abstain` se imprime sólo si alguno se movió.
+- **Abstención**, cuando los dos tienen `retrieval.unanswerable` (`diff_abstention`, `diff.rs:274`): abstenerse en el segundo es mejor.
+- **Frescura**, cuando algún caso unido tiene `fresh_first` en los dos (`diff_freshness`, `diff.rs:247`).
+- **Por pareja**, cuando algún caso unido tiene la misma pareja en los dos archivos ([Corte por pareja](#corte-por-pareja)).
 
 Si a uno de los dos archivos le falta un bloque, ese bloque MUST NOT aparecer y el diff MUST NOT fallar.
 
-Una fila se imprime como `{métrica}  {better}  {worse}  {net}  {p}`, seguida de `mean {media} [{lo}, {hi}]` en las que llevan intervalo (`print_metric`, `diff.rs:367-372`). Con cero casos unidos, el intervalo se imprime igual, en cero.
+Una fila se imprime como `{métrica}  {better}  {worse}  {net}  {p}`, seguida de `mean {media} [{lo}, {hi}]` en las que llevan intervalo (`metric_line`, `diff.rs:527-533`). Con cero casos unidos, el intervalo se imprime igual, en cero.
 
 ### Veredicto
 
-Al final, bajo `primary:`, MUST imprimirse siempre la línea de `retrieval recall@5`, haya o no casos de recuperación en los archivos, y la de `agent_view search.found` cuando existe el bloque (`diff.rs:350-354`). El texto sale de `verdict` (`diff.rs:55`):
+Al final, bajo `primary:`, MUST imprimirse siempre la línea de `retrieval recall@5`, haya o no casos de recuperación en los archivos, y la de `agent_view search.found` cuando existe el bloque (`render`, `diff.rs:475-479`). El texto sale de `verdict` (`diff.rs:55`):
 
 - con p < 0,05: `{nombre}: distinguishable, better|worse (p = {p}, {b} better / {w} worse)`;
 - si no: `{nombre}: not distinguishable with {movidos} case(s) moving (p = {p}); a conclusion needs at least 6 cases moving one way`. El 6 es el mínimo cuando ningún caso se mueve en la otra dirección; con movimiento mixto hacen falta más, y la línea no lo dice.
@@ -321,11 +368,45 @@ El texto MUST NOT decir que no hay diferencia, ni que las corridas son iguales.
 
 **Tests** (`diff.rs`): `self_diff_is_a_no_op`, `six_one_way_improvements_are_significant`, `one_improvement_is_not_distinguishable_and_says_how_many_are_needed`, `a_continuous_metric_carries_a_bootstrap_interval`, `the_verdict_never_says_there_is_no_difference`, `a_found_flip_in_agent_view_shows_up`, `fewer_tokens_count_as_better`, `agent_view_joins_on_query_and_skips_known_red`, `a_file_without_agent_view_diffs_without_the_block`, `abstention_is_diffed_when_both_files_have_it` y `freshness_is_diffed_when_both_files_have_update_cases`.
 
+### Corte por pareja
+
+Un cambio que toca la recuperación entre idiomas se lee acá. `--diff` MUST cortar `retrieval`, `similarity` y `agent_view` por pareja (`cut_by_pair`, `diff.rs:391`), con las mismas filas que el bloque global, calculadas sólo sobre los casos unidos que tienen la misma pareja en los dos archivos: las cinco métricas de `diff_block` en `retrieval` y `similarity` (`diff.rs:239-240`), y en `agent_view` sólo `search.found` y `context.found`, sobre los casos activos y con fila que encontrar (`diff.rs:312`). Sin tokens: un intervalo bootstrap sobre los pocos casos de una pareja no dice nada. La pareja de cada archivo sale de su propio `per_case` (`query_lang` y `lang`, o `row_lang` en agent-view), nunca de su `by_pair`, así que un archivo viejo se compara igual. Los bloques van ordenados por pareja.
+
+Dos clases de caso unido MUST NOT entrar en ninguna pareja y se cuentan aparte, por bloque (`PairCut`, `diff.rs:96-104`):
+
+- **la pareja difiere:** tiene pareja en los dos archivos, y no es la misma;
+- **pareja en un solo archivo:** tiene pareja en uno y ninguna en el otro, como al comparar un archivo sin `query_lang` con uno que lo tiene.
+
+Un caso sin pareja en ninguno de los dos archivos no se cuenta en ninguna parte. Las filas globales MUST NOT cambiar: el corte no quita ni suma casos a `diff_block` ni a `diff_agent_view`.
+
+Tras las filas globales de cada bloque, la salida imprime `    pair differs between the files: {k} case(s), counted in no pair` y `    pair in one file only: {k} case(s), counted in no pair` cuando son mayores que 0 (`pairs_left_out`, `diff.rs:510`), y después, por pareja, `  {bloque} by pair {consulta}>{fila} ({n} joined):` con sus filas (`render_block`, `diff.rs:487`; agent-view en `diff.rs:460-465`).
+
+Las filas por pareja son informativas: MUST NOT entrar en `primary:` ni en `regressed` (`diff.rs:46-49`), que siguen mirando sólo R@5 de `retrieval` y `search.found` de `agent_view` globales. Una regresión dentro de una pareja, por grande que sea, nunca hace salir con 6.
+
+#### Escenario: seis casos mejoran en una pareja
+- GIVEN dos archivos con 19 casos `es>en` donde R@5 mejora en 6 y no empeora en ninguno
+- THEN el bloque `es>en` de `retrieval` informa `recall@5` 6 mejores, 0 peores y p = 0,03125
+
+#### Escenario: la pareja cambió entre archivos
+- GIVEN un caso `es>en` en el primer archivo y `en>en` en el segundo
+- THEN no entra ni en `es>en` ni en `en>en`, y el conteo «pair differs» da 1
+
+#### Escenario: archivo sin parejas contra uno con parejas
+- GIVEN un archivo sin `query_lang` y otro, del mismo set, con `query_lang` en sus 46 casos
+- THEN el diff no falla, no hay bloques de pareja y «pair in one file only» da 46 en `retrieval`
+
+#### Escenario: regresión sólo en una pareja
+- GIVEN 20 casos `es>en` que pierden R@5 y 20 `es>es` que lo ganan
+- THEN el bloque `es>en` informa 20 peores con p < 0,05
+- AND `--fail-on-regression` sale con 0 y `primary:` queda igual que sin parejas
+
+**Tests:** `a_pair_block_joins_only_the_cases_with_that_pair`, `six_improvements_in_one_pair_are_significant_there_only`, `a_case_whose_pair_differs_between_the_files_is_reported_apart`, `a_case_with_a_pair_in_one_file_only_is_reported_apart`, `a_case_without_a_pair_in_either_file_is_counted_nowhere`, `similarity_has_its_own_pair_blocks`, `agent_view_pairs_use_only_active_cases`, `the_global_rows_do_not_change_when_pairs_are_present`, `a_file_without_pairs_diffs_against_one_with_them`, `two_files_without_pairs_have_no_pair_block`, `a_regression_inside_a_pair_never_fails` y `the_primary_lines_ignore_the_pair_blocks` (`diff.rs`); `diff_exits_zero_when_only_a_pair_regresses` (`main.rs`); `the_diff_help_describes_the_pair_cut` (`cli.rs`, sobre `HELP_TEXT`, que lo describe en `cli.rs:175-178`).
+
 ### `--fail-on-regression`
 
 Con `--diff` y `--fail-on-regression`, antes o después de `--diff`, `rag-eval` MUST salir con 6 (`EXIT_REGRESSION`, `main.rs:58`) si una métrica primaria presente empeora (`worse > better`) con p < 0,05 (`regressed`, `diff.rs:46-49`), e imprimir por stderr `a primary metric got worse with p < 0.05`. Si no, sale con 0. Sin el flag MUST salir con 0. Las métricas informativas nunca cuentan: probarlas todas haría probable una falsa alarma.
 
-El flag MUST NOT aceptarse sin `--diff`: es un error de uso, que sale con 1. Si además falta el modo, el error que se informa es el de falta de modo (`cli.rs:367`). Lo que venga después de `--diff a b`, salvo el flag, se ignora.
+El flag MUST NOT aceptarse sin `--diff`: es un error de uso, que sale con 1. Si además falta el modo, el error que se informa es el de falta de modo (`cli.rs:371`). Lo que venga después de `--diff a b`, salvo el flag, se ignora.
 
 #### Escenario: regresión significativa
 - GIVEN 6 casos que pierden R@5 y ninguno que gana
@@ -345,7 +426,7 @@ rag-eval (--fake | --real) --lexical-only [--tag <slug>]
 
 `--lexical-only` MUST ordenar cada caso por el canal léxico solo: la misma consulta FTS5 y el mismo orden `bm25` que la búsqueda completa (`lexical_candidates`, `crates/clawg-core/src/memory/search.rs:705`), con la consulta tal cual, sin vectores ni puntaje, y hasta 10 filas (`EvalStore::lexical_search`, `crates/clawg-core/src/eval_api.rs:345`). Si FTS falla, el caso queda sin filas, sin aviso.
 
-El resultado MUST llevar el tag `lexical-only` (`LEXICAL_ONLY_SLUG`, `main.rs:46`), y con `--tag X`, `X-lexical-only`, en un archivo que `--diff` compara con cualquier otro. `similarity` se sigue calculando. El flag MUST NOT combinarse con `--agent-view`, `--follow-up`, `--docs`, los barridos ni `--fts-tokenizer` (`cli.rs:403-413`). Con `--audit` sí se puede.
+El resultado MUST llevar el tag `lexical-only` (`LEXICAL_ONLY_SLUG`, `main.rs:46`), y con `--tag X`, `X-lexical-only`, en un archivo que `--diff` compara con cualquier otro. `similarity` se sigue calculando. El flag MUST NOT combinarse con `--agent-view`, `--follow-up`, `--docs`, los barridos ni `--fts-tokenizer` (`cli.rs:407-417`). Con `--audit` sí se puede.
 
 #### Escenario: palabra exacta
 - GIVEN dos filas, una con la palabra `zanzibar` y otra sin ella pero con un vector más cercano
@@ -369,7 +450,7 @@ Mide si la respuesta que cae dentro de un save largo llega al agente. Viene de [
 
 Con la misma base y la misma semilla, las filas y casos que el generador agrega hoy MUST salir idénticos. Como el archivo crece, el set de la semilla 7 pasa de 1.028 filas y 112 casos a 1.040 filas y 124 casos, y su sha256 cambia.
 
-`RetrievalCase` MUST aceptar `answer` opcional (`golden.rs:85`), y `CaseSubset` el valor `long` (`golden.rs:101`). Un golden sin esas claves MUST parsear igual que antes.
+`RetrievalCase` MUST aceptar `answer` opcional (`golden.rs:85`), y `CaseSubset` el valor `long` (`golden.rs:105`). Un golden sin esas claves MUST parsear igual que antes.
 
 #### Escenario: el dato después del corte
 - GIVEN un caso `long` con clave `amber-falcon` y `answer` `"retry budget of 7 attempts"`
@@ -428,8 +509,8 @@ rag-eval (--fake | --real) --docs [--root <dir>] [--golden <path>]
 
 Mide docs y código juntos ([`specs/project-docs`](../project-docs/spec.md)) y MUST:
 
-- indexar la raíz (por defecto, el workspace de `clawg-eval`: `default_docs_root`, `cli.rs:235`) en un store temporal con el embedder elegido, que se borra al terminar. No toca el store de memorias de ningún perfil; con `--real` el modelo se toma del directorio de datos que resuelve `production_base_dir` (`main.rs:74`), el mismo caché que usa el resto de `rag-eval --real`;
-- leer el golden set de docs (por defecto `crates/clawg-eval/golden/project-docs.json`, `default_docs_golden_path`, `cli.rs:230`; `deny_unknown_fields`): una lista de `{ "id", "question", "expected": [{ "path", "heading"? }] }`, con ids únicos, preguntas no vacías y al menos un `expected` por pregunta;
+- indexar la raíz (por defecto, el workspace de `clawg-eval`: `default_docs_root`, `cli.rs:239`) en un store temporal con el embedder elegido, que se borra al terminar. No toca el store de memorias de ningún perfil; con `--real` el modelo se toma del directorio de datos que resuelve `production_base_dir` (`main.rs:74`), el mismo caché que usa el resto de `rag-eval --real`;
+- leer el golden set de docs (por defecto `crates/clawg-eval/golden/project-docs.json`, `default_docs_golden_path`, `cli.rs:234`; `deny_unknown_fields`): una lista de `{ "id", "question", "expected": [{ "path", "heading"? }] }`, con ids únicos, preguntas no vacías y al menos un `expected` por pregunta;
 - contar un acierto cuando un hit tiene la ruta esperada y, si se da `heading`, el último tramo de su breadcrumb igual a ese encabezado (`matches`, `crates/clawg-eval/src/bin/rag-eval/docs.rs:86`); la posición de una pregunta es la del primer hit que acierta con cualquiera de sus `expected`, entre los 10 primeros;
 - reportar por stdout Hit@1, Hit@3, Hit@5 y MRR@10 para todas las preguntas y, aparte, para las de docs y las de código (según la primera ruta esperada), el tiempo de indexado, la cantidad de docs, de pasajes y de salteados, y el detalle de cada pregunta (para una que no acierta primera, qué esperaba y qué salió primero). No escribe archivo de resultados, así que no hay `--diff` de docs;
 - rechazar `--docs` junto a `--audit`, `--follow-up`, `--agent-view`, `--lexical-only` o los flags de sweep (`--sweep-imp`, `--sweep-cos-floor`, `--sweep-lexical`, `--fts-tokenizer`), y `--root` sin `--docs`; el rechazo es un error de uso (salida 1);
@@ -454,6 +535,8 @@ Reproducido el 2026-10-15 sobre `210c692`, al archivar eval-rigor, en `2026-10-1
 
 Los dos archivos sirven de ancla, pero para leer `by_split` hace falta el nuevo.
 
+Reproducido de nuevo el 2026-10-17 sobre `fed1e3f`, al archivar english-recall, en `2026-10-17-real-english-recall-base.json`, con el golden ya etiquetado por pareja (`content_sha256` `363d3e08…`: cambia sólo por las etiquetas). Contra el de eval-rigor, el `--diff` no mueve ningún caso en `retrieval` ni en `similarity`, y las 46 listas rankeadas son idénticas caso por caso. Para leer `by_pair` hace falta este archivo.
+
 ### Piso léxico
 
 `rag-eval --real --lexical-only` sobre el mismo `golden.json`, el 2026-10-15 y sobre `210c692` (`2026-10-16-real-lexical-only.json`), da R@1 0,3478, R@5 0,5000, R@10 0,5000, MRR 0,4040 y nDCG@10 0,4279. En inglés R@5 es 0,2727 y en español 0,7083. Contra el ancla:
@@ -466,7 +549,29 @@ Los dos archivos sirven de ancla, pero para leer `by_split` hace falta el nuevo.
 
 El ranking completo es mejor en R@10 y en MRR. En R@5 la diferencia no se distingue con 46 casos. El número absoluto de un cambio de ranking se lee contra este piso.
 
-La referencia anterior, R@5 0,7826 y MRR 0,5979, era con vectores CLS y el piso 0,8793, y el código de hoy ya no la puede reproducir. La baja la trajo el pooling mean y es toda de las consultas en inglés: en español R@5 pasa de 0,875 a 0,833 y MRR de 0,7153 a 0,7167; en inglés R@5 cae de 0,6818 a 0,4545 y MRR de 0,4698 a 0,3733. Se aceptó al archivar project-indexing ([`verify.md`](../../changes/archive/2026-10-15-project-indexing/verify.md)).
+La referencia anterior, R@5 0,7826 y MRR 0,5979, era con vectores CLS y el piso 0,8793, y el código de hoy ya no la puede reproducir. La baja la trajo el pooling mean y es toda de las consultas en inglés: en español R@5 pasa de 0,875 a 0,833 y MRR de 0,7153 a 0,7167; en inglés R@5 cae de 0,6818 a 0,4545 y MRR de 0,4698 a 0,3733. Se aceptó al archivar project-indexing ([`verify.md`](../../changes/archive/2026-10-15-project-indexing/verify.md)). english-recall mostró que esa baja es del cruce de idiomas ([Por pareja](#por-pareja)).
+
+### Por pareja
+
+Sobre el ancla de 2026-10-17 (`2026-10-17-real-english-recall-base.json`), con el golden etiquetado por la regla de [Idioma de la consulta](#idioma-de-la-consulta). Intervalos de Wilson al 95 %:
+
+| Pareja | n | `similarity` R@5 | `similarity` R@10 | `retrieval` R@5 | `retrieval` R@10 | `retrieval` MRR |
+|---|---|---|---|---|---|---|
+| `es>es` | 20 | 18/20 [0,699, 0,972] | 19/20 | 18/20 | 19/20 | 0,7800 |
+| `en>en` | 7 | 6/7 [0,487, 0,974] | 6/7 | 6/7 | 7/7 | 0,7083 |
+| `es>en` | 19 | 6/19 [0,154, 0,540] | 11/19 | 6/19 | 13/19 | 0,2555 |
+
+Agent-view (`2026-10-17-real-english-recall-base-agent-view.json`, el mismo `search_memory` 36/46 a 764,0 tokens y `recall_context` 39/46 a 1.086,4 que la baseline de agent-view, sin ningún caso movido):
+
+| Pareja | n | `search.found` | `context.found` |
+|---|---|---|---|
+| `es>es` | 20 | 19/20 | 19/20 |
+| `en>en` | 7 | 6/7 | 7/7 |
+| `es>en` | 19 | 11/19 | 13/19 |
+
+Un golden aparte, `docs/eval/golden-cross.json` (`6a04ea4b…`, fuera de git), cruza cada fila con una consulta en el otro idioma, sin identificadores ni nombres propios: `en>es` da R@5 21/22 [0,782, 0,992] en `similarity` y `es>en` 19/26 [0,539, 0,863] (`2026-10-17-real-english-recall-base-cross.json`).
+
+La brecha de `es>en` es del cruce: con la consulta traducida al inglés, sus 19 casos pasan de R@5 6/19 a 19/19 en `similarity` (13 a 0, p = 0,000244), y con la fila traducida al español, a 18/19 (12 a 0, p = 0,000488). Ningún prefijo de E5 la cierra (`"passage: "` en las filas da 5/19; sin prefijos, 4/19), ni un piso de coseno, ni el canal léxico (2/19 solo). Por eso el ranking y el embedder no cambiaron. Detalle en el [`verify.md` archivado](../../changes/archive/2026-10-17-english-recall/verify.md#veredicto).
 
 ### Set de la semilla 7
 

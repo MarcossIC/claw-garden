@@ -94,4 +94,6 @@ Ninguna de estas tareas toca el historial de git; sólo `verify.md` (tarea 12) s
 
 ## 13. Archive (fuera de este cambio hasta que se cierre)
 
-- [ ] La base por pareja pasa a `specs/eval` y al contexto de `openspec/config.yaml`; la conclusión, a la fila 21 de `openspec/README.md`; el subir de versión pertenece al archivado y no es una tarea de este plan.
+- [x] La base por pareja pasa a `specs/eval` y al contexto de `openspec/config.yaml`; la conclusión, a la fila 21 de `openspec/README.md`; el subir de versión pertenece al archivado y no es una tarea de este plan.
+- [x] [`specs/eval`](../../../specs/eval/spec.md) con R1 a R8 (idioma de la consulta, métricas por pareja y el corte por pareja de `--diff`), la línea **Origen**, la base por pareja en la baseline medida y los `ruta:línea` revisados contra `main`, también los que el código de este cambio había corrido.
+- [x] `git mv` a `changes/archive/2026-10-17-english-recall`; `state.yaml` archivado; fila 21, fila 22 y orden de ejecución del `README.md` de openspec; el hallazgo del idioma de los saves, a la exploración de memory-protocol (22).

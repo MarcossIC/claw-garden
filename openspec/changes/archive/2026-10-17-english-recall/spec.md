@@ -1,6 +1,6 @@
 # english-recall — Especificación
 
-Delta sobre [`specs/eval`](../../specs/eval/spec.md). Suma a `rag-eval` un eje por pareja consulta–fila: el idioma de la consulta en el golden, un bloque `by_pair` en `retrieval`, `similarity` y `agent_view`, y un corte por pareja en `--diff`. No cambia ningún ranking, ninguna métrica que ya existe ni el comportamiento de `clawg-core`. Todo el código está en `clawg-eval`.
+Delta sobre [`specs/eval`](../../../specs/eval/spec.md). Suma a `rag-eval` un eje por pareja consulta–fila: el idioma de la consulta en el golden, un bloque `by_pair` en `retrieval`, `similarity` y `agent_view`, y un corte por pareja en `--diff`. No cambia ningún ranking, ninguna métrica que ya existe ni el comportamiento de `clawg-core`. Todo el código está en `clawg-eval`.
 
 Fuera de esta especificación, y en la [propuesta](proposal.md) (sección «Cómo se mide») y en `verify.md`: las etiquetas de `docs/eval/golden.json`, `golden-cross.json` y los goldens de control, el paso 0, las hipótesis (a) a (f), los umbrales U1 a U10 y el registro del diagnóstico. Lo que sigue describe sólo las herramientas con que se mide.
 

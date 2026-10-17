@@ -1,6 +1,6 @@
 # english-recall — Verificación
 
-**Estado:** código, datos y medición hechos (tareas 1 a 12). **Veredicto: D.** El cruce de idiomas explica la brecha ((e) cumple U1 con 13 a 0 y 12 a 0), ningún prefijo la cierra ((b) falla U1 en los dos brazos) y el piso, el canal léxico y el código de las filas no son la causa ((a), (d), (c)). No sigue C. Lo que cambia el resultado es en qué idioma se guarda una memoria, y eso es de memory-protocol (22). Falta archivar.
+**Estado:** archivado el 2026-10-17 ([`specs/eval`](../../../specs/eval/spec.md)); código, datos y medición hechos (tareas 1 a 12). **Veredicto: D.** El cruce de idiomas explica la brecha ((e) cumple U1 con 13 a 0 y 12 a 0), ningún prefijo la cierra ((b) falla U1 en los dos brazos) y el piso, el canal léxico y el código de las filas no son la causa ((a), (d), (c)). No sigue C. Lo que cambia el resultado es en qué idioma se guarda una memoria, y eso es de memory-protocol (22).
 
 ## Código (tareas 1 a 7)
 
@@ -230,3 +230,9 @@ Una memoria guardada en el idioma en que se la va a buscar se encuentra; una gua
 - Los worktrees de (b) y sus directorios de build se armaron en un directorio temporal fuera del repositorio. `git worktree remove --force` les quitó el registro, pero en Windows no pudo borrar los directorios por rutas demasiado largas dentro del build, y se borraron aparte. Al terminar, `git worktree list` sólo muestra `main` y `git status` no tiene cambios de prefijo.
 - Los controles de (c) y (e) corrieron con un `rag-eval` compilado mientras el árbol tenía un cambio sin commitear en `agent_view/runner.rs`, que sólo cambia cómo se cierra el store al terminar agent-view. Esas corridas no son de agent-view y no ejecutan ese código.
 - No se anota cuántos tests tiene la suite: la cuenta queda vieja con cada cambio.
+
+## Al archivar
+
+- [`specs/eval`](../../../specs/eval/spec.md) suma el idioma de la consulta, las métricas por pareja (`retrieval`, `similarity` y agent-view), el corte por pareja de `--diff` y la base por pareja, con cada `ruta:línea` revisado contra `main` en `eb775de`.
+- El código de este cambio había corrido 38 citas de `specs/eval` (en `golden.rs`, `report.rs`, `diff.rs`, `main.rs`, `cli.rs` y `agent_view/`): se movieron a sus líneas de hoy. Dos nombraban funciones que ya no existen con ese nombre: la fila de una métrica ahora la arma `metric_line` (era `print_metric`) y las líneas `primary:` las arma `render`.
+- `openspec/config.yaml` suma la base por pareja al contexto; la fila 21 del mapa de openspec, la conclusión; la exploración de memory-protocol (22), el hallazgo del idioma de los saves, con sus cifras y una decisión abierta.

@@ -16,7 +16,12 @@ context: |
   Retrieval baseline (rag-eval --real, golden set of 46 cases, mean pooling, cosine floor 0.79):
   R@1 0.4348, R@5 0.6522, R@10 0.8478, MRR 0.5524, nDCG@10 0.6215
   (docs/eval/results/2026-10-15-real-project-indexing-tip-anchor.json; reproduced with no case moving in
-  docs/eval/results/2026-10-16-real-eval-rigor-tip-anchor.json, which also carries hits and by_split).
+  docs/eval/results/2026-10-16-real-eval-rigor-tip-anchor.json, which also carries hits and by_split, and again in
+  docs/eval/results/2026-10-17-real-english-recall-base.json, whose golden labels each case with query_lang).
+  By query>row language pair (that file): similarity R@5 es>es 18/20, en>en 6/7, es>en 6/19;
+  search_memory finds es>es 19/20, en>en 6/7, es>en 11/19. The es>en gap is the language crossing: with
+  either side translated it reaches 19/19 and 18/19, and no E5 prefix, cosine floor or lexical channel closes it.
+  A change that touches cross-language retrieval reads the pair rows of rag-eval --diff.
   Lexical-only floor (rag-eval --real --lexical-only): R@1 0.3478, R@5 0.5000, R@10 0.5000, MRR 0.4040
   (docs/eval/results/2026-10-16-real-lexical-only.json).
   Compare two runs with rag-eval --diff: a conclusion needs at least 6 cases moving one way (p < 0.05).
