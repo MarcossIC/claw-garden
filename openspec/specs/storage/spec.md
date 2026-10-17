@@ -327,7 +327,7 @@ Una recarga que falla MUST responder «no listo» (`EmbedError::NotReady`) y la 
 #### Escenario: los archivos desaparecieron
 - GIVEN el modelo suelto y una recarga que falla
 - WHEN llega una búsqueda
-- THEN responde `503 embedder_not_ready` (`embed_failure`, `crates/clawg-cli/src/daemon/api.rs:860`), y la búsqueda siguiente vuelve a intentar la carga
+- THEN responde `503 embedder_not_ready` (`embed_failure`, `crates/clawg-cli/src/daemon/api.rs:907`), y la búsqueda siguiente vuelve a intentar la carga
 
 **Tests:** `a_failed_load_is_not_ready_and_the_next_call_tries_again` y `a_model_that_comes_back_as_another_model_is_refused` (`idle_embedder.rs`); `a_search_whose_model_cannot_load_again_answers_not_ready` (`crates/clawg-cli/tests/api.rs`).
 
@@ -339,7 +339,7 @@ Buscar, guardar, restaurar y `recall_context` con el modelo suelto MUST esperar 
 
 ### Registrar un proyecto despierta el modelo
 
-`POST /v1/projects` MUST empezar a cargar un modelo suelto y MUST responder sin esperar esa carga (`embedder.wake()`, `api.rs:1188`; `wake`, `idle_embedder.rs:236`). Con el modelo residente MUST NOT cargar nada. Un modelo despertado MUST contar como recién usado.
+`POST /v1/projects` MUST empezar a cargar un modelo suelto y MUST responder sin esperar esa carga (`embedder.wake()`, `api.rs:1238`; `wake`, `idle_embedder.rs:236`). Con el modelo residente MUST NOT cargar nada. Un modelo despertado MUST contar como recién usado.
 
 #### Escenario: el puente empieza una sesión
 - GIVEN el modelo suelto
@@ -449,7 +449,7 @@ Después de cada snapshot automático, el directorio de backups MUST conservar l
 
 `clawg backup [--profile P]` (`crates/clawg-cli/src/main.rs:127`) MUST producir un snapshot `manual` e imprimir su ruta.
 
-- Con el daemon andando, MUST pedirlo por `POST /v1/backup` (con el token; `crates/clawg-cli/src/daemon/api.rs:1130`, ruta en `:600`), que lo hace sobre la conexión del daemon (`MemoryRuntime::snapshot`, `crates/clawg-core/src/runtime.rs:253`) y responde `{"path": "..."}`.
+- Con el daemon andando, MUST pedirlo por `POST /v1/backup` (con el token; `crates/clawg-cli/src/daemon/api.rs:1180`, ruta en `:642`), que lo hace sobre la conexión del daemon (`MemoryRuntime::snapshot`, `crates/clawg-core/src/runtime.rs:253`) y responde `{"path": "..."}`.
 - Sin daemon, MUST tomar el lock del store con el titular `Maintenance` (`crates/clawg-core/src/memory/store_lock.rs:59`), copiar sin migrar y soltar el lock (`backup_offline`, `backup.rs:311`).
 - Sin `memory.db`, MUST decir que no hay base, sin crear el directorio de datos.
 
@@ -491,7 +491,7 @@ La lectura (`probe`, `backup.rs:442`) MUST hacerse sin lock, sin migrar y sin es
 
 ### MCP nombra `clawg status` cuando el daemon no arrancó
 
-Con `StartTimeout`, el texto de la herramienta MUST decir que clawg intentó arrancar su daemon y que `clawg status` muestra la causa (`crates/clawg-cli/src/mcp/server.rs:263`). Con `NotRunning` (autoarranque apagado) MUST seguir pidiendo `clawg serve`.
+Con `StartTimeout`, el texto de la herramienta MUST decir que clawg intentó arrancar su daemon y que `clawg status` muestra la causa (`crates/clawg-cli/src/mcp/server.rs:289`). Con `NotRunning` (autoarranque apagado) MUST seguir pidiendo `clawg serve`.
 
 **Tests:** `a_daemon_that_did_not_start_points_at_status` (`server.rs`) y `a_tool_call_when_the_daemon_never_comes_up_gives_the_readable_error` (`mcp/mod.rs`).
 

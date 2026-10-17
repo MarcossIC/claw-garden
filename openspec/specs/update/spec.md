@@ -101,14 +101,14 @@ Sobre una fila que no existe, borrada o de otro agente cuando el cambio tiene sc
 
 ## R4. HTTP
 
-`PATCH /v1/memories/{kind}/{id}` (`update_memory`, `crates/clawg-cli/src/daemon/api.rs:1047`) MUST aceptar el cuerpo `{importance?, memory_type?}` (`UpdateRequest`, `api.rs:418`) y la query `agent` de siempre.
+`PATCH /v1/memories/{kind}/{id}` (`update_memory`, `crates/clawg-cli/src/daemon/api.rs:1097`) MUST aceptar el cuerpo `{importance?, memory_type?}` (`UpdateRequest`, `api.rs:431`) y la query `agent` de siempre.
 
 - Un cambio inválido (R1) MUST responder 400 con el mensaje de la validación.
 - Un campo desconocido en el cuerpo MUST responder 400 o 422, nunca 200: un campo mal escrito no puede pasar por un cambio hecho (`deny_unknown_fields`).
 - "No existe" (R3) MUST responder 404.
 - Un cambio hecho MUST responder 200 con `updated = 1` y `importance`, `memory_type` y `tier` de la fila como quedó.
 
-`DaemonClient::update` (`crates/clawg-cli/src/client.rs:730`) es el lado del cliente.
+`DaemonClient::update` (`crates/clawg-cli/src/client.rs:753`) es el lado del cliente.
 
 #### Escenario
 - GIVEN una memoria guardada por HTTP
@@ -121,14 +121,14 @@ Sobre una fila que no existe, borrada o de otro agente cuando el cambio tiene sc
 
 ## R5. Herramienta MCP `update_memory`
 
-El puente MUST exponer `update_memory` con `kind`, `id`, `importance` (opcional) y `memory_type` (opcional, con los tipos conocidos en la descripción del esquema) (`UpdateMemoryArgs`, `crates/clawg-cli/src/mcp/server.rs:220`), y MUST mandar siempre el agente que llama (`update_memory_impl`, `server.rs:616`).
+El puente MUST exponer `update_memory` con `kind`, `id`, `importance` (opcional) y `memory_type` (opcional, con los tipos conocidos en la descripción del esquema) (`UpdateMemoryArgs`, `crates/clawg-cli/src/mcp/server.rs:246`), y MUST mandar siempre el agente que llama (`update_memory_impl`, `server.rs:645`).
 
 - Sobre una fila propia, MUST devolver un texto que nombra el id y cómo quedaron importancia, tipo y tier (`format_update`, `crates/clawg-cli/src/mcp/tools.rs:139`): `updated #12 memory: user_preference, importance 8.0, tier 1`.
 - Sobre una fila de otro agente, MUST fallar como si el id no existiera ([`specs/visibility`](../visibility/spec.md) R3), y la fila MUST NOT cambiar.
 - Un cambio inválido MUST fallar con el mensaje de la validación.
-- La descripción (`server.rs:777`) MUST decir que es para cuando el usuario corrige la importancia o el tipo, y que para cambiar el contenido se guarda el nuevo y se borra el viejo.
+- La descripción (`server.rs:806`) MUST decir que es para cuando el usuario corrige la importancia o el tipo, y que para cambiar el contenido se guarda el nuevo y se borra el viejo.
 
-`save_memory` MUST nombrar `update_memory`: en su descripción, junto a `delete_memory` (`server.rs:702`), y en la respuesta de un refuerzo, que ya dice el id (`save_outcome_text`, `server.rs:416-417`).
+`save_memory` MUST nombrar `update_memory`: en su descripción, junto a `delete_memory` (`server.rs:731`), y en la respuesta de un refuerzo, que ya dice el id (`save_outcome_text`, `server.rs:442-443`).
 
 `tools/list` MUST listar `update_memory` entre sus herramientas; el conteo vigente, once, y la lista completa están en [`specs/mcp`](../mcp/spec.md).
 

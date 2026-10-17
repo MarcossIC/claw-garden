@@ -103,7 +103,7 @@ El descarte es una función pura sobre los hits y los vínculos de sus filas. Si
 Un hit con vínculo MUST mostrar `piece=K/N` en su metadato:
 
 - `search_memory` (`crates/clawg-cli/src/mcp/tools.rs:81`): `{rank}. #{id} [{kind}/{type}/t{tier} piece={K}/{N} score={score}] {contenido}`;
-- `recall_context` (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:333-345`): `[YYYY-MM-DD #{id} {type} piece={K}/{N}] {contenido}` para `memory`; las otras tablas llevan su kind antes del tipo, como ya hacían.
+- `recall_context` (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:514-526`): `[YYYY-MM-DD #{id} {type} piece={K}/{N}] {contenido}` para `memory`; las otras tablas llevan su kind antes del tipo, como ya hacían.
 - un hit de otro agente suma ` by <autor>` antes del `]` en los dos ([`specs/sharing`](../sharing/spec.md) R4).
 
 Un hit sin vínculo MUST seguir con el formato de antes. `Hit` en el cliente (`crates/clawg-cli/src/client.rs:153`) MUST leer `piece` con `#[serde(default)]` (`client.rs:169`), así un daemon viejo sigue respondiendo.
@@ -119,7 +119,7 @@ Los parsers del eval (`crates/clawg-eval/src/bin/rag-eval/agent_view/parse.rs`) 
 
 ## R6. El save entero
 
-`GET /v1/memories/{kind}/{id}/save` (`crates/clawg-cli/src/daemon/api.rs:599`, handler `get_save`, `api.rs:1034`) con la query `agent` MUST devolver el save de la fila (`read_save_core`, `crates/clawg-core/src/memory/pieces.rs:95`):
+`GET /v1/memories/{kind}/{id}/save` (`crates/clawg-cli/src/daemon/api.rs:641`, handler `get_save`, `api.rs:1084`) con la query `agent` MUST devolver el save de la fila (`read_save_core`, `crates/clawg-core/src/memory/pieces.rs:95`):
 
 - `id`, `kind`, `piece` (la posición de la fila pedida), `pieces` (el total) e `ids`: el id de cada posición, o `null` si esa fila está borrada o es de otro agente;
 - `missing`: las posiciones sin fila visible;
@@ -129,9 +129,9 @@ Una fila sin vínculos MUST devolverse como save de un pedazo, con su contenido 
 
 Quitar el solapamiento es `join_pieces` (`pieces.rs:58`), una función pura: entre dos pedazos vecinos busca el sufijo más largo del primero que es prefijo del segundo, de al menos 16 caracteres (`MIN_OVERLAP_CHARS`, `pieces.rs:50`) y dentro de los últimos 2.048 bytes (`MAX_OVERLAP_BYTES`, `pieces.rs:53`), y lo deja una sola vez (`overlap`, `pieces.rs:78`). Si no lo encuentra, une con un salto de línea y no recorta nada. `read_save_core` aplica `join_pieces` a cada tramo de pedazos visibles consecutivos y une los tramos con un salto de línea: nunca compara dos pedazos que no eran vecinos.
 
-El puente MUST exponer `read_memory(id, kind?)` (`crates/clawg-cli/src/mcp/server.rs:863`, `read_memory_impl`, `server.rs:651`), con `kind = memory` por defecto y el agente que llama. La respuesta (`format_save`, `crates/clawg-cli/src/mcp/tools.rs:123`) MUST abrir con una línea que dice qué pedazo es y de cuántos, los ids del save y los que faltan, y seguir con `text`. Sobre una fila ajena MUST fallar como si no existiera.
+El puente MUST exponer `read_memory(id, kind?)` (`crates/clawg-cli/src/mcp/server.rs:892`, `read_memory_impl`, `server.rs:680`), con `kind = memory` por defecto y el agente que llama. La respuesta (`format_save`, `crates/clawg-cli/src/mcp/tools.rs:123`) MUST abrir con una línea que dice qué pedazo es y de cuántos, los ids del save y los que faltan, y seguir con `text`. Sobre una fila ajena MUST fallar como si no existiera.
 
-`save_memory` MUST nombrar `read_memory` en su descripción (`server.rs:787`) y en la respuesta de un save largo (`saved as N pieces: …; read_memory with any of them returns the whole text`). `search_memory` MUST explicar `piece=K/N` en su descripción (`server.rs:805`). `tools/list` MUST listar `read_memory` entre sus herramientas; el conteo vigente, once, y la lista completa están en [`specs/mcp`](../mcp/spec.md).
+`save_memory` MUST nombrar `read_memory` en su descripción (`server.rs:816`) y en la respuesta de un save largo (`saved as N pieces: …; read_memory with any of them returns the whole text`). `search_memory` MUST explicar `piece=K/N` en su descripción (`server.rs:834`). `tools/list` MUST listar `read_memory` entre sus herramientas; el conteo vigente, once, y la lista completa están en [`specs/mcp`](../mcp/spec.md).
 
 Contra un daemon que no tiene la ruta, su 404 no trae el error JSON del daemon: `route_failure_text` (`crates/clawg-cli/src/mcp/server.rs`) MUST decir que hay que reiniciar el daemon, no que la fila no existe.
 
