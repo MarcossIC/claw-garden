@@ -1,7 +1,7 @@
 change: embedder-idle-unload
 objective: "transversal"
 depends_on: []
-phase: verify
+phase: design
 artifacts:
   exploration: done
   proposal: done  # revisada por D5
@@ -9,6 +9,6 @@ artifacts:
   design: done  # D5: un solo tokenizer por proceso
   tasks: done  # secciones 6 a 10 para D5
   apply: done  # secciones 1 a 9
-  verify: partial  # sólo falta R7 en Linux; con eso se archiva sin otra revisión (verify.md, «Para archivar»)
+  verify: partial  # R7 en Linux medido: no cumple (+75,9 MB y +18,4 MB); vuelve a diseño, junto con la huella de e5_golden (verify.md, «R7 en Linux» y «Los vectores en Linux»)
   archive: pending
 updated: 2026-10-17

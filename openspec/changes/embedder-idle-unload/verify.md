@@ -95,7 +95,7 @@ Sobre `71fd1fa`, el cambio de motor (`269de1f` sólo suma docs), el 2026-10-16, 
 - [x] **R7 en el daemon.** Se cumple: abajo.
 - [x] **CI en Linux y Windows.** El workflow pasa clippy y `cargo test --workspace` en `ubuntu-latest` y `windows-latest` sobre `0d36f88`, el último commit con código. El primer run con el cambio de motor, sobre `1233d13`, pasó en Linux y falló en el `cargo test` de Windows; desde `d095d84`, que cierra el store de `rag-eval --agent-view` antes de borrar su directorio temporal, pasa en los dos.
 - [x] `cargo test --workspace --target-dir target-test` en Windows sobre `d095d84` (0.13.0), con los artefactos del workspace limpiados antes: **2.120 pasan, 0 fallan, 1 ignorado**, el de `e5_golden`.
-- [ ] **R7 en Linux: es lo único que falta.** Necesita una máquina Linux con glibc y el modelo; ver «Para archivar».
+- [ ] **R7 en Linux: no se cumple.** La mediana con el modelo suelto queda 75,9 MB sobre la línea de base y la segunda mitad 18,4 MB sobre la primera: abajo, en «R7 en Linux». El cambio vuelve a diseño.
 
 ### R7 en Windows
 
@@ -122,7 +122,45 @@ Sobre `71fd1fa`, el cambio de motor (`269de1f` sólo suma docs), el 2026-10-16, 
 - **Vectores:** la `distance` de cada hit es la misma en las diez recargas, 0,572561502456665 y 0,692162275314331, y es la que daba fastembed antes del cambio.
 - **Contra la primera implementación:** con el modelo, ~745 MB en lugar de 1.095-1.240 MB, porque falta el segundo parse del tokenizer. Suelto, plano en 284-290 MB en lugar de subir de 310 a 398 MB. Armar la sesión tarda 0,2-0,5 s en lugar de 1,9-2,8 s, porque ya no se parsea el tokenizer. La lectura con hash sigue siendo lo que más tarda: 8,7-13,5 s en debug.
 
+### R7 en Linux
+
+Sobre `cd96f34` (0.13.0), el 2026-10-17, en Linux x86_64 con glibc (Intel Xeon a 2,10 GHz, 4 hilos, AVX2, AVX-512F y FMA), con el build debug de `cargo test --workspace` en `target`. Sobre ese mismo commit, `cargo test --workspace` da **2.113 pasan, 0 fallan, 1 ignorado** (el de `e5_golden`) y `cargo clippy --workspace --all-targets -- -A clippy::all -D warnings` sale con 0. Los cinco archivos del modelo, bajados de `HF_BASE_URL`, pasan el SHA-256 de `ALL_FILES`. Las dos corridas usan un `CLAWG_TEST_HOME` temporal, así que ningún perfil real se toca; la muestra es `RssAnon` de `/proc/<pid>/status`, y la estable, 8 lecturas cada 0,5 s dentro de 1 MB.
+
+**Línea de base:** `CLAWG_TEST_EMBEDDER=fake` y sólo `tokenizer.json`: **285,0 MB**, con una línea `tokenizer.json parsed`.
+
+**Con el modelo:** `CLAWG_EMBEDDER_IDLE_MINUTES=1` y dos memorias guardadas antes de empezar, para que la búsqueda tenga hits. Se soltó primero el modelo del arranque (298,0 MB) y después hubo diez recargas, cada una con un `POST /v1/search` y la espera de `embedder_resident` en `false`:
+
+| Recarga | En el log: archivos con hash + sesión | `RssAnon` con el modelo | `RssAnon` suelto |
+|---|---|---|---|
+| 1 | 12.015 + 4.059 ms | 822,7 MB | 313,4 MB |
+| 2 | 13.749 + 2.981 ms | 795,9 MB | 344,7 MB |
+| 3 | 11.824 + 1.961 ms | 847,1 MB | 344,6 MB |
+| 4 | 11.940 + 2.378 ms | 796,0 MB | 344,8 MB |
+| 5 | 12.254 + 1.384 ms | 863,4 MB | 360,9 MB |
+| 6 | 12.039 + 1.878 ms | 812,2 MB | 361,1 MB |
+| 7 | 11.971 + 1.831 ms | 863,4 MB | 360,9 MB |
+| 8 | 12.428 + 1.988 ms | 814,4 MB | 363,3 MB |
+| 9 | 12.034 + 2.110 ms | 865,6 MB | 363,1 MB |
+| 10 | 12.050 + 2.139 ms | 814,4 MB | 363,3 MB |
+
+- **Mediana de las diez:** 360,9 MB, **75,9 MB sobre la línea de base** (el límite es 64). **No cumple.**
+- **Medianas de 1 a 5 y de 6 a 10:** 344,7 y 363,1 MB, **+18,4 MB** (el límite es 16). **No cumple.**
+- **Parses:** una sola línea `tokenizer.json parsed`, la del arranque. Cumple.
+- **Vectores:** la `distance` de los dos hits es la misma en las diez recargas, 0,5915524959564209 y 0,6260557770729065. Cumple.
+- **La forma:** no crece en cada vuelta como fastembed en Windows, sino a escalones que se aplanan: +15 MB en la primera recarga, +31 en la segunda, +16 en la quinta y +2 en la octava, y entre escalones queda quieto. Con el modelo cargado no hay tendencia (796-866 MB).
+- **Hipótesis para el diseño, sin probar:** cada carga arma la sesión y su hilo `embedder-worker` nuevos, y glibc le da a cada hilo nuevo una arena de `malloc` propia, hasta 8 por núcleo; `malloc_trim(0)` devuelve las páginas libres enteras, pero lo que queda ocupado o fragmentado en cada arena no vuelve. Escalones que se aplanan encajan con un número acotado de arenas. Lo que conviene medir primero: `M_ARENA_MAX` (o `MALLOC_ARENA_MAX`) bajo, y un solo hilo dueño de la sesión que viva lo que vive el proceso.
+
+### Los vectores en Linux (R9)
+
+Con el mismo modelo, `CLAWG_E5_MODEL_DIR=<dir> cargo test -p clawg-core --features eval --test e5_golden -- --include-ignored` **falla**: la huella de esta CPU (`x86_64`, AVX2, AVX-512F y FMA) es la de la fixture, así que el test compara bits, y los 32 vectores difieren en los últimos bits, el que más por 8,9e-8. Comparados con la tolerancia de 1e-6, pasan los 32.
+
+- No es el número de hilos: con `taskset` a 1, 2 y 4 núcleos los 32 vectores dan los mismos bits.
+- Para fp32, ONNX Runtime elige sus kernels por AVX-512F y por AVX2 con FMA, que coinciden; las extensiones que esta CPU suma (VNNI, AMX, FP16) son de los kernels de enteros. Lo que cambia es el sistema: la fixture se generó en Windows, y ONNX Runtime viene compilado de otra forma en cada uno. No está aislado entre las dos causas.
+- R9 dice «los mismos bits en una CPU como la que generó la referencia», y el test decide qué es «como» con una huella que no incluye el sistema. Hay que decidir si la huella suma el sistema operativo (`std::env::consts::OS`) o si R9 promete bits exactos sólo en la máquina que generó la fixture. Los vectores en sí están dentro de lo que R9 permite en otra máquina.
+
 ## Para archivar
+
+**Estado al 2026-10-17:** R7 en Linux no se cumple (arriba), así que, por el punto 4, el cambio vuelve a diseño y no se archiva. El diseño nuevo también tiene que resolver la huella de `e5_golden` («Los vectores en Linux»).
 
 Sólo falta R7 en Linux; lo demás está hecho y verificado. Quien lo mida no necesita otra revisión para archivar:
 
@@ -140,6 +178,7 @@ Encontradas al consolidar los requisitos contra `49bd269`, para el archivo:
 3. El diseño (D1) y la propuesta citan `embedder.rs:333` para el trim. En 333 está la definición de `return_freed_memory`; la llamada está en `embedder.rs:316`, después de `drop(model)` en `:315`, y el `malloc_trim(0)` en `:339`.
 4. La propuesta cita `DocIndexError::Query` en `crates/clawg-core/src/memory/project_docs/mod.rs:62`; la variante está en la 63 (la 62 es su atributo `#[error]`).
 5. El procedimiento de Windows de este archivo pedía una búsqueda por texto, que no carga el modelo (ver «Cómo se midió»).
+6. R8 en la spec ubica `the_worker_and_the_model_load_share_one_parse` en `worker.rs`; está en `bootstrap.rs`.
 
 Sin diferencia: `should_unload` (`idle_embedder.rs:53`), `unloading_when_idle` (`bootstrap.rs:344`), `embed_failure` (`api.rs:860`), `embedder_resident` en `/health` (`api.rs:688`), el `wake` de `POST /v1/projects` (`api.rs:1188`), `hold_for_embedder` (`worker.rs:389`), `after_failure` (`outbox.rs:74-78`) y la `OnceCell` (`runtime.rs:107-115`) están donde dicen los docs. El barrido (un cuarto del ocio, entre 1 y 60 s) y `IDLE_MINUTES_VAR` también coinciden.
 
