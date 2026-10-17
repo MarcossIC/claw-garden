@@ -346,9 +346,9 @@ fn format_hit_line(hit: &RankedHit, reader: &str) -> String {
 
 /// Printed once above the pairs: it is the same for every one of them.
 const CONFLICT_NOTE: &str = "\
-NOTE: estas memorias se contradicen y aún no resolviste cuál vale.
-Si vas a tomar una decisión que dependa de esto, preguntale al usuario.
-Con su respuesta, llamá a resolve_conflict (keep = la que vale, other = la otra).";
+NOTE: these memories contradict each other, and which one holds is not settled yet.
+Before a decision that depends on them, ask the user.
+With the answer, call resolve_conflict (keep = the one that holds, other = the other one).";
 
 /// Orders pairs by the earliest printed hit among their sides and keeps the
 /// first `cap`, returning how many were left out. The query cannot order them:
@@ -399,7 +399,7 @@ fn format_conflict_block(pairs: &[ConflictPair], hit_positions: &HashMap<i64, us
         }
     }
     if omitted > 0 {
-        out.push_str(&format!("(+{omitted} conflictos más sin mostrar)\n"));
+        out.push_str(&format!("(+{omitted} more conflicts not shown)\n"));
     }
     out
 }
@@ -754,7 +754,17 @@ mod tests {
     fn the_conflict_note_names_the_tool() {
         let block = format_conflict_block(&[pair(11, 22)], &HashMap::new(), 0);
         let note: Vec<&str> = block.lines().take_while(|l| !l.starts_with("NEW ")).collect();
-        assert!(note.iter().any(|l| l.contains("resolve_conflict (keep = la que vale, other = la otra)")), "{block}");
+        assert!(note.iter().any(|l| l.contains("resolve_conflict (keep = the one that holds, other = the other one)")), "{block}");
+    }
+
+    /// Everything else the agent reads from clawg is in English.
+    #[test]
+    fn the_conflict_note_is_in_english() {
+        let block = format_conflict_block(&[pair(11, 22)], &HashMap::new(), 2);
+        let note: String = block.lines().take_while(|l| !l.starts_with("NEW ")).collect::<Vec<_>>().join("\n");
+        assert!(note.is_ascii(), "{note}");
+        assert!(note.contains("contradict each other") && note.contains("ask the user"), "{note}");
+        assert_eq!(block.lines().last(), Some("(+2 more conflicts not shown)"), "{block}");
     }
 
     /// A conflict on a standing preference would otherwise take the cap on
@@ -781,12 +791,12 @@ mod tests {
         let (kept, omitted) = rank_conflicts(eight, &HashMap::new(), MAX_CONFLICT_PAIRS);
         assert_eq!((kept.len(), omitted), (5, 3));
         let block = format_conflict_block(&kept, &HashMap::new(), omitted);
-        assert_eq!(block.lines().last(), Some("(+3 conflictos más sin mostrar)"), "{block}");
+        assert_eq!(block.lines().last(), Some("(+3 more conflicts not shown)"), "{block}");
 
         let five: Vec<ConflictPair> = (1..=5).map(|i| pair(100 + i, i)).collect();
         let (kept, omitted) = rank_conflicts(five, &HashMap::new(), MAX_CONFLICT_PAIRS);
         assert_eq!((kept.len(), omitted), (5, 0));
-        assert!(!format_conflict_block(&kept, &HashMap::new(), omitted).contains("sin mostrar"));
+        assert!(!format_conflict_block(&kept, &HashMap::new(), omitted).contains("not shown"));
     }
 
     #[test]
