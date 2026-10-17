@@ -11,7 +11,7 @@ use crate::memory::chunker::embedding_text;
 use crate::memory::dispute::{release_challengers, settle_row};
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::search::{viewer_match_expression, RankedHit};
-use crate::memory::store_insert::MemoryType;
+use crate::memory::store_insert::{MemoryType, UnknownMemoryType};
 use crate::memory::tier::retier;
 use crate::memory::TableKind;
 use crate::memory::{MemoryError, MemoryStore};
@@ -140,8 +140,8 @@ pub enum PatchError {
     Empty,
     #[error("importance must be a number from 0 to 10, got {0}")]
     ImportanceOutOfScale(f64),
-    #[error("unknown memory_type {0:?}; expected one of semantic_fact, user_preference, architectural_decision, session_summary, code_block, chat_message, tool_error")]
-    UnknownType(String),
+    #[error(transparent)]
+    UnknownType(#[from] UnknownMemoryType),
     #[error("memory_type can only be changed on memory rows, not on {0:?} rows")]
     TypeOnlyOnMemory(MemoryKind),
 }
@@ -170,7 +170,7 @@ impl MemoryPatch {
         let memory_type = match memory_type {
             None => None,
             Some(_) if kind != MemoryKind::Memory => return Err(PatchError::TypeOnlyOnMemory(kind)),
-            Some(raw) => Some(MemoryType::from_db_str(raw).ok_or_else(|| PatchError::UnknownType(raw.to_string()))?),
+            Some(raw) => Some(raw.parse::<MemoryType>()?),
         };
         Ok(Self { importance, memory_type })
     }
@@ -1434,7 +1434,7 @@ mod tests {
     #[test]
     fn an_unknown_memory_type_is_refused() {
         let err = MemoryPatch::new(MemoryKind::Memory, None, Some("preference")).unwrap_err();
-        assert_eq!(err, PatchError::UnknownType("preference".into()));
+        assert_eq!(err, PatchError::UnknownType(UnknownMemoryType("preference".into())));
         assert!(err.to_string().contains("memory_type"), "{err}");
         assert!(MemoryPatch::new(MemoryKind::Memory, None, Some("user_preference")).is_ok());
     }

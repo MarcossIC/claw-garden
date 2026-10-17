@@ -582,6 +582,51 @@ async fn a_saved_memory_is_a_listable_row_when_the_save_returns() {
 }
 
 #[tokio::test]
+async fn a_save_with_an_unknown_memory_type_is_refused_before_the_outbox() {
+    let h = Harness::start_without_worker().await;
+    let (status, body) = h
+        .post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a", "memory_type": "preference" }))
+        .await;
+
+    assert_eq!(status, 400, "{body}");
+    let message = body["error"].as_str().expect("error");
+    assert!(message.contains("\"preference\""), "{message}");
+    for t in ["semantic_fact", "user_preference", "architectural_decision", "session_summary", "code_block", "chat_message", "tool_error"] {
+        assert!(message.contains(t), "{t} missing from {message}");
+    }
+    assert!(outbox(&h).await.is_empty());
+}
+
+#[tokio::test]
+async fn save_and_patch_accept_the_same_memory_types() {
+    let h = Harness::start().await;
+    let id = save_id(&h, json!({ "content": CONTENT, "agent_id": "a" })).await;
+    let types = ["semantic_fact", "user_preference", "architectural_decision", "session_summary", "code_block", "chat_message", "tool_error"];
+
+    for (n, raw) in ["preference", "Semantic_Fact", ""].into_iter().chain(types).enumerate() {
+        let (saved, body) = h
+            .post_json("/v1/memories", json!({ "content": format!("note {n} about the build"), "agent_id": "a", "memory_type": raw }))
+            .await;
+        let patched = h
+            .authed(h.http.patch(h.url(&format!("/v1/memories/memory/{id}"))))
+            .json(&json!({ "memory_type": raw }))
+            .send()
+            .await
+            .expect("request")
+            .status()
+            .as_u16();
+        let accepted = types.contains(&raw);
+        assert_eq!(saved == 201, accepted, "save of {raw:?}: {saved} {body}");
+        assert_eq!(patched == 200, accepted, "patch of {raw:?}: {patched}");
+        if accepted {
+            assert_eq!(body["memories"][0]["outcome"], "inserted", "{body}");
+        } else {
+            assert_eq!((saved, patched), (400, 400), "{raw:?}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_save_answers_201_with_the_id_of_the_row_it_wrote() {
     let h = Harness::start().await;
     let (status, body) = h

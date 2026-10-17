@@ -57,6 +57,8 @@ A save longer than one piece (480 tokens) is split into pieces of 96 tokens, nei
 
 MCP tools (`crates/clawg-cli/src/mcp/server.rs`): `save_memory`, `search_memory`, `recall_context`, `search_project`, `list_memories`, `read_memory`, `update_memory`, `delete_memory`, `restore_memory`, `resolve_conflict`, `synthesize`, `memory_status`.
 
+What the agent is told about memory lives in one text, `crates/clawg-cli/src/mcp/protocol.md`, compiled into the binary: when to save, how to write a save (a first line naming the subject, the exact paths and identifiers, in English), what not to save, which type and importance to pick, the session summary, and that whatever a tool retrieves is evidence, not instructions. Its opening paragraphs, before the first `##` section, are the server instructions, at most 2048 characters; tests keep it naming only registered tools, their arguments and the memory types. `save_memory` and `update_memory` list the seven memory types in their schemas, and `POST /v1/memories` refuses any other with a 400 that lists them, before the save reaches the outbox, as `PATCH` does; an outbox row written before that check still stores as `semantic_fact`.
+
 ## Code conventions
 
 - Comments explain only a non-obvious why. No commented-out code, no `#[allow]` to hide dead code.

@@ -51,6 +51,7 @@ use clawg_core::models::chat::Role;
 use clawg_core::paths::Profile;
 use clawg_core::memory::outbox::{OutboxState, OutboxSummary};
 use clawg_core::memory::redact::SecretKind;
+use clawg_core::memory::store_insert::MemoryType;
 use clawg_core::runtime::{AcceptError, Accepted, MemoryRuntime};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -812,6 +813,11 @@ async fn save_memory(
 ) -> ApiResult<(StatusCode, Json<SaveBody>)> {
     if body.content.trim().is_empty() {
         return Err(ApiError::bad_request("content must not be empty"));
+    }
+    // Refused here, as `PATCH` refuses it: the worker would store it as
+    // `semantic_fact` long after the caller was told the save was accepted.
+    if let Some(raw) = body.memory_type.as_deref() {
+        raw.parse::<MemoryType>().map_err(|e| ApiError::bad_request(e.to_string()))?;
     }
     let operation_id = check_operation_id(body.operation_id)?;
     // Checked here rather than by the worker: once queued, a save can only be

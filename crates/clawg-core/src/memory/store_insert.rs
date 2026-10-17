@@ -28,7 +28,18 @@ pub enum MemoryType {
 }
 
 impl MemoryType {
-    pub(crate) fn as_str(self) -> &'static str {
+    /// Every type, in the order an error message lists them.
+    pub const ALL: [MemoryType; 7] = [
+        Self::SemanticFact,
+        Self::UserPreference,
+        Self::ArchitecturalDecision,
+        Self::SessionSummary,
+        Self::CodeBlock,
+        Self::ChatMessage,
+        Self::ToolError,
+    ];
+
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::ChatMessage => "chat_message",
             Self::ToolError => "tool_error",
@@ -64,6 +75,21 @@ impl MemoryType {
             "semantic_fact" => Some(Self::SemanticFact),
             _ => None,
         }
+    }
+}
+
+/// A `memory_type` a caller named that is not one of [`MemoryType::ALL`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown memory_type {:?}; expected one of {}", .0, MemoryType::ALL.map(MemoryType::as_str).join(", "))]
+pub struct UnknownMemoryType(pub String);
+
+/// What a caller names: unlike [`MemoryType::from_db_str`], which reads values
+/// already stored, an unknown name here is a mistake to report.
+impl std::str::FromStr for MemoryType {
+    type Err = UnknownMemoryType;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_db_str(s).ok_or_else(|| UnknownMemoryType(s.to_string()))
     }
 }
 
@@ -743,6 +769,42 @@ mod tests {
         ];
         for v in variants {
             assert_eq!(MemoryType::from_db_str(v.as_str()), Some(v), "round-trip failed for {v:?}");
+        }
+    }
+
+    #[test]
+    fn every_listed_type_parses_back_to_itself() {
+        // Exhaustive on purpose: an eighth variant fails to compile here until
+        // it is placed in `ALL` too.
+        let listed = |t: MemoryType| match t {
+            MemoryType::ChatMessage
+            | MemoryType::ToolError
+            | MemoryType::CodeBlock
+            | MemoryType::SessionSummary
+            | MemoryType::UserPreference
+            | MemoryType::ArchitecturalDecision
+            | MemoryType::SemanticFact => MemoryType::ALL.contains(&t),
+        };
+        for t in MemoryType::ALL {
+            assert!(listed(t));
+            assert_eq!(t.as_str().parse::<MemoryType>(), Ok(t));
+            assert_eq!(MemoryType::from_db_str(t.as_str()), Some(t));
+        }
+        let distinct: std::collections::BTreeSet<&str> = MemoryType::ALL.iter().map(|t| t.as_str()).collect();
+        assert_eq!(distinct.len(), 7);
+    }
+
+    #[test]
+    fn an_unknown_type_names_the_accepted_ones() {
+        let err = "preference".parse::<MemoryType>().unwrap_err();
+        assert_eq!(err, UnknownMemoryType("preference".into()));
+        assert_eq!(
+            err.to_string(),
+            "unknown memory_type \"preference\"; expected one of semantic_fact, user_preference, \
+             architectural_decision, session_summary, code_block, chat_message, tool_error"
+        );
+        for raw in ["", "Semantic_Fact", "episode"] {
+            assert!(raw.parse::<MemoryType>().is_err(), "{raw:?}");
         }
     }
 
