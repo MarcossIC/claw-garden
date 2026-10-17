@@ -55,7 +55,7 @@ use clawg_core::runtime::{AcceptError, Accepted, MemoryRuntime};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-use crate::relevance::relevant_len;
+use crate::relevance::shown_hits;
 
 use super::lifecycle::now_ms;
 
@@ -909,8 +909,8 @@ async fn search(
     // retrieved for it, and counting it would feed the ranking a row the
     // agent never read.
     if let Some(ratio) = min_relative_score {
-        let scores: Vec<f64> = hits.iter().map(|h| h.score).collect();
-        hits.truncate(relevant_len(&scores, ratio));
+        let scored: Vec<(f64, bool)> = hits.iter().map(|h| (h.score, h.exact)).collect();
+        hits = hits.into_iter().zip(shown_hits(&scored, ratio)).filter_map(|(h, shown)| shown.then_some(h)).collect();
     }
     app.runtime.access_tracker.record_hits(&hits);
 

@@ -46,6 +46,42 @@ enum EmbedderState {
     DroppingReplies,
     /// The model was let go for being idle; loading it again works or fails.
     Unloaded { reload_fails: bool },
+    /// Texts holding one of these keys embed to its vector, so a test decides
+    /// the cosines; any other text embeds as the fake model would.
+    Fixed(Vec<(&'static str, Vec<f32>)>),
+}
+
+struct FixedEmbedder(Vec<(&'static str, Vec<f32>)>);
+
+#[async_trait::async_trait]
+impl Embedder for FixedEmbedder {
+    async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+        match self.0.iter().find(|(key, _)| text.contains(key)) {
+            Some((_, v)) => Ok(v.clone()),
+            None => FakeEmbedder::default().embed_with_role(text, role).await,
+        }
+    }
+    fn dimensions(&self) -> usize {
+        384
+    }
+    fn model_id(&self) -> &str {
+        "fixed"
+    }
+    fn query_prefix(&self) -> &str {
+        ""
+    }
+    fn passage_prefix(&self) -> &str {
+        ""
+    }
+}
+
+/// A unit vector at `cosine` from the first axis, leaning on axis `axis` so
+/// that two vectors built on different axes are no closer than they must be.
+fn at_cosine(cosine: f32, axis: usize) -> Vec<f32> {
+    let mut v = vec![0.0; 384];
+    v[0] = cosine;
+    v[axis] = (1.0 - cosine * cosine).sqrt();
+    v
 }
 
 /// An embedder that loaded and then fails every call, as a broken ONNX
@@ -221,6 +257,12 @@ impl Harness {
             EmbedderState::FailingEmbedder => {
                 let runtime = with_empty_embedder(runtime, EmbedderStatus::Ready);
                 runtime.embedder.set(Arc::new(FailingEmbedder) as Arc<dyn Embedder>).ok();
+                tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
+                (runtime, None)
+            }
+            EmbedderState::Fixed(vectors) => {
+                let runtime = with_empty_embedder(runtime, EmbedderStatus::Ready);
+                runtime.embedder.set(Arc::new(FixedEmbedder(vectors)) as Arc<dyn Embedder>).ok();
                 tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
                 (runtime, None)
             }
@@ -964,10 +1006,16 @@ async fn search_applies_the_requested_relative_cut() {
     let (_, full) = h
         .post_json("/v1/search", json!({ "query": CONTENT, "agent_id": "agent-cut" }))
         .await;
-    let scores: Vec<f64> =
-        full["hits"].as_array().expect("hits").iter().map(|h| h["score"].as_f64().expect("score")).collect();
-    let expected_len = clawg_cli::relevance::relevant_len(&scores, 0.6);
-    assert!(expected_len < scores.len(), "the fixture must leave a tail to cut: {full}");
+    let scored: Vec<(f64, bool)> = full["hits"]
+        .as_array()
+        .expect("hits")
+        .iter()
+        .map(|h| (h["score"].as_f64().expect("score"), h["exact"].as_bool().expect("exact")))
+        .collect();
+    let shown = clawg_cli::relevance::shown_hits(&scored, 0.6);
+    let expected_len = shown.iter().filter(|s| **s).count();
+    assert!(expected_len < scored.len(), "the fixture must leave a tail to cut: {full}");
+    assert!(shown[..expected_len].iter().all(|s| *s), "without an identifier the cut keeps a prefix: {full}");
 
     let (status, cut) = h
         .post_json(
@@ -977,6 +1025,93 @@ async fn search_applies_the_requested_relative_cut() {
         .await;
     assert_eq!(status, 200, "{cut}");
     assert_eq!(hit_ids(&cut), hit_ids(&full)[..expected_len]);
+}
+
+const IDENTIFIER_QUERY: &str = "how does parseLedger4821 load the nightly batch";
+const IDENTIFIER_ROW: &str = "We kept `parseLedger4821` on the old import path.";
+const RELATED_ROWS: [&str; 3] = [
+    "The ledger import reads the nightly batch from the bucket.",
+    "The nightly batch is loaded into the ledger in one transaction.",
+    "A late nightly batch leaves the ledger totals stale until morning.",
+];
+const NOISE_ROW: &str = "a recipe for lentil soup with cumin";
+
+/// The query on the first axis; the row holding its identifier at cosine
+/// 0.85, three rows about the same topic without it at 0.88, 0.87 and 0.86,
+/// and one unrelated row. Measured against the identifier match, whose bonus
+/// lifts it a point above any cosine, none of the three passes a cut at 0.35;
+/// measured against the best of them, all three do.
+fn identifier_and_related_vectors() -> Vec<(&'static str, Vec<f32>)> {
+    let mut v = vec![(IDENTIFIER_QUERY, at_cosine(1.0, 1)), (IDENTIFIER_ROW, at_cosine(0.85, 2))];
+    for (i, (row, cosine)) in RELATED_ROWS.iter().zip([0.88, 0.87, 0.86]).enumerate() {
+        v.push((row, at_cosine(cosine, 3 + i)));
+    }
+    v.push((NOISE_ROW, at_cosine(0.3, 6)));
+    v
+}
+
+async fn save_as(h: &Harness, content: &str, agent: &str) {
+    let (status, body) = h
+        .post_json(
+            "/v1/memories",
+            json!({ "content": content, "agent_id": agent, "memory_type": "semantic_fact", "importance": 5 }),
+        )
+        .await;
+    assert!(status == 201 || status == 202, "{status}: {body}");
+}
+
+async fn seed_identifier_and_related(h: &Harness, identifier_author: &str) {
+    save_as(h, IDENTIFIER_ROW, identifier_author).await;
+    for row in RELATED_ROWS.iter().chain([&NOISE_ROW]) {
+        save_as(h, row, "agent-reader").await;
+    }
+    h.wait_for_rows("memory", 5).await;
+}
+
+fn hit_contents(body: &Value) -> Vec<&str> {
+    body["hits"].as_array().expect("hits").iter().map(|h| h["content"].as_str().expect("content")).collect()
+}
+
+#[tokio::test]
+async fn search_shows_the_rows_an_identifier_match_used_to_hide() {
+    let h = Harness::start_inner(EmbedderState::Fixed(identifier_and_related_vectors())).await;
+    seed_identifier_and_related(&h, "agent-reader").await;
+
+    let (status, body) = h
+        .post_json(
+            "/v1/search",
+            json!({ "query": IDENTIFIER_QUERY, "agent_id": "agent-reader", "min_relative_score": 0.35 }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let mut want = vec![IDENTIFIER_ROW];
+    want.extend(RELATED_ROWS);
+    assert_eq!(hit_contents(&body), want, "{body}");
+    let exact: Vec<bool> = body["hits"].as_array().unwrap().iter().map(|h| h["exact"].as_bool().unwrap()).collect();
+    assert_eq!(exact, [true, false, false, false]);
+
+    let hits: Vec<clawg_cli::client::Hit> = serde_json::from_value(body["hits"].clone()).expect("client hits");
+    let shown = clawg_cli::mcp::tools::relevant_hits(hits);
+    assert_eq!(shown.len(), 4, "the bridge must keep what the daemon sent");
+}
+
+#[tokio::test]
+async fn an_identifier_match_from_another_agent_is_exact_and_attributed() {
+    let h = Harness::start_inner(EmbedderState::Fixed(identifier_and_related_vectors())).await;
+    seed_identifier_and_related(&h, "agent-author").await;
+
+    let (status, body) = h
+        .post_json(
+            "/v1/search",
+            json!({ "query": IDENTIFIER_QUERY, "agent_id": "agent-reader", "min_relative_score": 0.35 }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let first = &body["hits"][0];
+    assert_eq!(first["content"], IDENTIFIER_ROW, "{body}");
+    assert_eq!(first["exact"], true);
+    assert_eq!(first["agent_id"], "agent-author");
+    assert_eq!(hit_contents(&body).len(), 4, "{body}");
 }
 
 #[tokio::test]
