@@ -150,6 +150,23 @@ Sobre `cd96f34` (0.13.0), el 2026-10-17, en Linux x86_64 con glibc (Intel Xeon a
 - **La forma:** no crece en cada vuelta como fastembed en Windows, sino a escalones que se aplanan: +15 MB en la primera recarga, +31 en la segunda, +16 en la quinta y +2 en la octava, y entre escalones queda quieto. Con el modelo cargado no hay tendencia (796-866 MB).
 - **Hipótesis para el diseño, sin probar:** cada carga arma la sesión y su hilo `embedder-worker` nuevos, y glibc le da a cada hilo nuevo una arena de `malloc` propia, hasta 8 por núcleo; `malloc_trim(0)` devuelve las páginas libres enteras, pero lo que queda ocupado o fragmentado en cada arena no vuelve. Escalones que se aplanan encajan con un número acotado de arenas. Lo que conviene medir primero: `M_ARENA_MAX` (o `MALLOC_ARENA_MAX`) bajo, y un solo hilo dueño de la sesión que viva lo que vive el proceso.
 
+### Por qué no cumple: las arenas de glibc
+
+Misma máquina y mismo build, el 2026-10-17, tres corridas de diez recargas en paralelo con el procedimiento de arriba. En cada muestra también se desglosó `/proc/<pid>/smaps`: el `[heap]` de la arena principal y las reservas anónimas alineadas a 64 MB, que son los heaps de las otras arenas. Las líneas de base, con y sin `MALLOC_ARENA_MAX=1`, dan 284,6 y 285,0 MB.
+
+| Variante | Mediana suelta | Sobre la base | 6 a 10 contra 1 a 5 | Recarga: hash + sesión |
+|---|---|---|---|---|
+| Por defecto | 345,4 MB | +60,4 | +18,3 | 11,7-12,4 s + 2,1-3,8 s |
+| `MALLOC_ARENA_MAX=2` | 327,5 MB | +42,5 | +1,2 | 12,0-12,5 s + 1,8-3,7 s |
+| `MALLOC_ARENA_MAX=1` | 292,2 MB | **+7,2** | **0,0** | 11,8-12,6 s + 2,0-4,0 s |
+
+- **Por defecto**, cada escalón es una arena que retiene de 6 a 24 MB que `malloc_trim(0)` no devuelve: a la vuelta 4 hay cinco arenas así (23,9, 17,5, 16,9, 6,1 y 3,8 MB), y desde ahí nada cambia. La sesión se arma en un hilo del pool de bloqueo de tokio (`spawn_blocking` en `unloading_when_idle`), la inferencia corre en un `embedder-worker` nuevo en cada carga y los hilos intra-op de ONNX Runtime también son nuevos, así que cada recarga puede caer en otra arena hasta llenar el tope de glibc (8 por núcleo). Entre esta corrida (+60,4) y la primera (+75,9) se ve que el resultado depende de qué arenas toque cada vuelta.
+- **Con una sola arena**, la memoria suelta queda en 292,1-292,2 MB en las diez vueltas, sin escalones.
+- Las `distance` son las mismas en las tres variantes y en las diez vueltas, y hay un solo parse del tokenizer en cada log.
+- **El costo en la inferencia no se ve:** el test `e5_golden`, que embebe 32 textos (entre ellos uno de ~2.000 tokens y un lote de 17), tarda 19,2-20,1 s con `MALLOC_ARENA_MAX=1` y 19,5-19,8 s sin él, en tres pares alternados.
+
+La propuesta que sale de esto es [D6](design.md#d6-una-sola-arena-de-malloc-en-linux-propuesta).
+
 ### Los vectores en Linux (R9)
 
 Con el mismo modelo, `CLAWG_E5_MODEL_DIR=<dir> cargo test -p clawg-core --features eval --test e5_golden -- --include-ignored` **falla**: la huella de esta CPU (`x86_64`, AVX2, AVX-512F y FMA) es la de la fixture, así que el test compara bits, y los 32 vectores difieren en los últimos bits, el que más por 8,9e-8. Comparados con la tolerancia de 1e-6, pasan los 32.

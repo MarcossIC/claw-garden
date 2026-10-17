@@ -172,3 +172,27 @@ Procedimiento, en Windows y en Linux, con el mismo build debug con `testing` (`c
 | `crates/clawg-core/tests/e5_golden.rs` y su fixture | Los vectores de fastembed, con el modelo |
 | `Cargo.toml`, `crates/clawg-core/Cargo.toml`, `Cargo.lock` | Sin fastembed; `ort` y `tokenizers` con sus features; `ndarray` de desarrollo |
 | `.claude/CLAUDE.md` y las instrucciones de los otros agentes, `openspec/README.md:177`, los comentarios de `chunker/mod.rs:13` e `idle_embedder.rs:9` | Ya no dicen fastembed |
+
+## D6. Una sola arena de malloc en Linux (propuesta)
+
+**Problema.** En Linux con glibc, R7 no se cumple: con el modelo suelto el daemon queda 60-76 MB sobre la línea de base y sube a escalones ([verify, «R7 en Linux»](verify.md#r7-en-linux)). Cada escalón es una arena de `malloc` que retiene de 6 a 24 MB después del `malloc_trim(0)`. Los hilos que arman, usan y sueltan la sesión cambian en cada carga, así que cada recarga puede estrenar otra arena hasta llegar al tope de glibc ([verify, «Por qué no cumple»](verify.md#por-qué-no-cumple-las-arenas-de-glibc)).
+
+**Decisión propuesta.** `clawg serve`, en Linux con glibc, fija `mallopt(M_ARENA_MAX, 1)` antes de crear cualquier hilo. Medido con `MALLOC_ARENA_MAX=1`: la memoria suelta queda 7,2 MB sobre la base y plana en diez recargas, la recarga tarda lo mismo y la inferencia no se ve más lenta.
+
+- **Antes de cualquier hilo.** glibc le asigna la arena a un hilo en su primer `malloc`, y `#[tokio::main]` arma los workers antes del cuerpo de `main`. Por eso `main` pasa a ser síncrona: fija la arena y después construye el runtime con `tokio::runtime::Builder::new_multi_thread`. Sólo para `serve`, porque los demás comandos no cargan el modelo.
+- **Lo puro aparte.** Qué comando lo pide es una función pura testeable (qué subcomando, qué plataforma); el `mallopt` es una línea `unsafe` al lado de `return_freed_memory`, con el mismo `cfg`.
+- **El trim sigue.** Con una sola arena, `malloc_trim(0)` es lo que devuelve las páginas libres al soltar la sesión.
+- **Windows y otros asignadores, sin cambios:** R7 ya se cumple en Windows.
+
+**Alternativas.**
+
+| Alternativa | Por qué no |
+|---|---|
+| `MALLOC_ARENA_MAX=2` | Cumple (+42,5 y +1,2) pero oscila entre 311 y 329 MB según qué arena toque cada vuelta |
+| Un hilo dueño de la sesión que vive lo que vive el proceso, con el pool global de hilos de ONNX Runtime | Acota las arenas y las reusa, pero cambia el ciclo de vida del worker, el pool de hilos y cómo se arma la sesión; deja igual la primera arena retenida, y una sola arena ya alcanza |
+| mimalloc u otro asignador global | Un asignador nuevo para todo el proceso; ya se descartó en D5 por el piso que deja |
+| Que el usuario fije `MALLOC_ARENA_MAX` | El daemon lo arranca el puente; el objetivo no puede depender de una variable que nadie pone |
+
+**Verificación.** La de R7 en Linux, en las dos corridas (línea de base y diez recargas) con el build de la suite, y la suite con clippy. En Windows no cambia nada; el CI lo cubre.
+
+**Pendiente aparte, para el mismo cierre:** la huella de `e5_golden` no distingue el sistema operativo, y en Linux, con la misma huella de CPU que la fixture de Windows, los bits difieren por 8,9e-8 ([verify, «Los vectores en Linux»](verify.md#los-vectores-en-linux-r9)). Propuesta: sumar `os` (`std::env::consts::OS`) a la huella, con `windows` en la fixture, y que R9 diga «en una CPU y un sistema como los que generaron la referencia».
