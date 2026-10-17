@@ -239,6 +239,7 @@ fn lexical_families(base: &Golden, rng: &mut SplitMix64) -> (Vec<Row>, Vec<Case>
             history: Vec::new(),
             subset: Subset::Lexical,
             answer: None,
+            query_lang: None,
         });
     }
     (rows, cases)
@@ -352,6 +353,7 @@ fn multi_ref_topics(base: &Golden, names: &mut Codenames, rng: &mut SplitMix64) 
             history: Vec::new(),
             subset: Subset::MultiRef,
             answer: None,
+            query_lang: None,
         });
     }
     (rows, cases)
@@ -408,6 +410,7 @@ fn contested_importance(base: &Golden, names: &mut Codenames, rng: &mut SplitMix
                 history: Vec::new(),
                 subset,
                 answer: None,
+                query_lang: None,
             });
         }
     }
@@ -457,6 +460,7 @@ fn long_saves(base: &Golden, names: &mut Codenames, rng: &mut SplitMix64) -> (Ve
             history: Vec::new(),
             subset: Subset::Long,
             answer: Some(templates::fill(answer, &[("{n}", &number)])),
+            query_lang: None,
         });
     }
     (rows, cases)
@@ -525,6 +529,7 @@ mod tests {
             history: vec![],
             subset: Subset::Natural,
             answer: None,
+            query_lang: None,
         }
     }
 
