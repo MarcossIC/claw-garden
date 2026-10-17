@@ -2316,7 +2316,7 @@ mod tests {
     // ── Shared fixture: write two real messages, read them back ────────────
 
     use crate::memory::prompt_builder::{
-        build_memory_prompt, QueryTexts, SEP_LONGTERM_TEST, SEP_RECENT_TEST,
+        build_memory_prompt, QueryTexts, DEFAULT_BUDGET, SEP_LONGTERM_TEST, SEP_RECENT_TEST,
     };
     use crate::memory::search::{search_all_memories, RankedHit, SearchScope};
     use crate::memory::workspace::WorkspaceManager;
@@ -2391,7 +2391,7 @@ mod tests {
         let prompt = build_memory_prompt(
             &store, &wm, Some(embedder.clone() as Arc<dyn Embedder>),
             AGENT, None, &crate::memory::sharing::Reach::Own, QueryTexts::single_shot(&fresh.content),
-            &crate::memory::workspace::EmittedIds::default(), None,
+            &crate::memory::workspace::EmittedIds::default(), None, DEFAULT_BUDGET,
         )
         .await
         .unwrap().text;

@@ -41,7 +41,7 @@ use clawg_core::memory::worker::{
 use clawg_core::memory::events::{MemoryEvent, MemorySource};
 use clawg_core::memory::clock::TimestampMs;
 use clawg_core::memory::project::{register_project, RegisterError};
-use clawg_core::memory::prompt_builder::{build_memory_prompt, QueryTexts, Retrieval};
+use clawg_core::memory::prompt_builder::{build_memory_prompt, QueryTexts, Retrieval, DEFAULT_BUDGET};
 use clawg_core::memory::sharing::{self, Reach};
 use clawg_core::memory::synthesis::{
     existing_memory_ids, synthesis_core, unreviewed_count, Synthesis, SynthesisParams,
@@ -994,6 +994,7 @@ async fn context(
         QueryTexts { lexical: &body.query, embedded: &body.query },
         &emitted,
         Some(app.runtime.access_tracker.as_ref()),
+        DEFAULT_BUDGET,
     )
     .await
     .map_err(ApiError::internal)?;
