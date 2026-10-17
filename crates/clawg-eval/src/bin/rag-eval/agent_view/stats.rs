@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sample {
     pub found: bool,
+    /// Every expected row was visible, not just one.
+    pub all_found: bool,
     pub tokens: usize,
     pub latency_ms: f64,
 }
@@ -16,6 +18,11 @@ pub struct ToolStats {
     pub n_cases: usize,
     /// Share of cases where an expected row was visible in the output.
     pub hit_rate: f64,
+    /// Share of cases where every expected row was visible. A case that
+    /// expects two rows and shows one counts in `hit_rate` and not here.
+    /// Results written before it was recorded read 0.
+    #[serde(default)]
+    pub all_hit_rate: f64,
     pub mean_tokens: f64,
     pub max_tokens: usize,
     pub latency_p50_ms: f64,
@@ -53,6 +60,7 @@ pub fn summarize(samples: &[Sample]) -> ToolStats {
     ToolStats {
         n_cases: n,
         hit_rate: samples.iter().filter(|s| s.found).count() as f64 / n as f64,
+        all_hit_rate: samples.iter().filter(|s| s.all_found).count() as f64 / n as f64,
         mean_tokens: samples.iter().map(|s| s.tokens).sum::<usize>() as f64 / n as f64,
         max_tokens: samples.iter().map(|s| s.tokens).max().unwrap_or(0),
         latency_p50_ms: percentile(&latencies, 50.0),
@@ -103,16 +111,24 @@ mod tests {
     #[test]
     fn summarize_reports_hit_rate_token_mean_and_max() {
         let stats = summarize(&[
-            Sample { found: true, tokens: 100, latency_ms: 1.0 },
-            Sample { found: false, tokens: 300, latency_ms: 2.0 },
-            Sample { found: true, tokens: 200, latency_ms: 3.0 },
-            Sample { found: true, tokens: 0, latency_ms: 4.0 },
+            Sample { found: true, all_found: true, tokens: 100, latency_ms: 1.0 },
+            Sample { found: false, all_found: false, tokens: 300, latency_ms: 2.0 },
+            Sample { found: true, all_found: false, tokens: 200, latency_ms: 3.0 },
+            Sample { found: true, all_found: true, tokens: 0, latency_ms: 4.0 },
         ]);
         assert_eq!(stats.n_cases, 4);
         assert_eq!(stats.hit_rate, 0.75);
+        assert_eq!(stats.all_hit_rate, 0.5);
         assert_eq!(stats.mean_tokens, 150.0);
         assert_eq!(stats.max_tokens, 300);
         assert_eq!(stats.latency_p50_ms, 2.0);
         assert_eq!(stats.latency_p99_ms, 4.0);
+    }
+
+    #[test]
+    fn a_summary_without_all_hit_rate_still_reads() {
+        let old = r#"{"n_cases":1,"hit_rate":1.0,"mean_tokens":10.0,"max_tokens":10,"latency_p50_ms":1.0,"latency_p99_ms":1.0}"#;
+        let stats: ToolStats = serde_json::from_str(old).expect("a summary from before the strict rate");
+        assert_eq!(stats.all_hit_rate, 0.0);
     }
 }

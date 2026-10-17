@@ -19,7 +19,7 @@ use clawg_core::paths::Profile;
 
 use crate::client::{Context, Health, Hit, MemoryRow, Restored, SavedText, Synthesis, Updated};
 use crate::daemon::api::DocsSearchBody;
-use crate::relevance::{relevant_len, RELEVANCE_RATIO};
+use crate::relevance::{shown_hits, RELEVANCE_RATIO};
 
 /// How much of a hit's content a search result shows.
 ///
@@ -54,13 +54,13 @@ pub fn truncate_content(s: &str, max: usize) -> String {
     format!("{kept}…")
 }
 
-/// Drops the hits too far below the best one to be worth their tokens.
+/// Drops the hits too far below the best one without an identifier match to
+/// be worth their tokens.
 ///
 /// Expects `hits` best first, which is the order search returns them in.
-pub fn relevant_hits(mut hits: Vec<Hit>) -> Vec<Hit> {
-    let scores: Vec<f64> = hits.iter().map(|h| h.score).collect();
-    hits.truncate(relevant_len(&scores, RELEVANCE_RATIO));
-    hits
+pub fn relevant_hits(hits: Vec<Hit>) -> Vec<Hit> {
+    let scored: Vec<(f64, bool)> = hits.iter().map(|h| (h.score, h.exact)).collect();
+    hits.into_iter().zip(shown_hits(&scored, RELEVANCE_RATIO)).filter_map(|(h, shown)| shown.then_some(h)).collect()
 }
 
 /// What `search_memory` hands the model for a search's hits, as `reader`.
@@ -384,7 +384,13 @@ mod tests {
             score,
             agent_id: None,
             piece: None,
+            exact: false,
         }
+    }
+
+    fn exact(mut h: Hit) -> Hit {
+        h.exact = true;
+        h
     }
 
     fn scored(scores: &[f64]) -> Vec<Hit> {
@@ -406,6 +412,25 @@ mod tests {
         let text = format_search(scored(&[0.50, 0.10, 0.05]), "a");
         assert!(text.contains("#1 ") && text.contains("#2 "), "{text}");
         assert!(!text.contains("#3 "), "{text}");
+    }
+
+    #[test]
+    fn relevant_hits_keeps_exact_hits_and_cuts_against_the_rest() {
+        let mut hits = scored(&[1.40, 0.30, 0.25, 0.20, 0.05]);
+        hits[0] = exact(hits[0].clone());
+        assert_eq!(ids(&relevant_hits(hits)), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn an_exact_hit_from_another_agent_is_shown_by_its_author() {
+        let hits = vec![
+            exact(by(hit(1, "Memory", "code_block", 3, 1.40, "kept parseLedger4821"), "claude-code")),
+            hit(2, "Memory", "semantic_fact", 3, 0.30, "ledger import"),
+            hit(3, "Memory", "semantic_fact", 3, 0.25, "ledger lock"),
+        ];
+        let out = format_search(hits, "cursor");
+        assert!(out.starts_with("1. #1 [Memory/code_block/t3 score=1.40 by claude-code] kept parseLedger4821"), "{out}");
+        assert!(out.contains("3. #3 "), "{out}");
     }
 
     #[test]

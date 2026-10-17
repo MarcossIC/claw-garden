@@ -41,6 +41,8 @@ pub struct Case {
     pub subset: Subset,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_lang: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -61,6 +63,7 @@ pub enum Subset {
     HighImportance,
     LowImportance,
     Long,
+    LexicalRelated,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -99,7 +102,7 @@ mod tests {
         let golden: Golden = serde_json::from_str(MINIMAL).unwrap();
         let json = serde_json::to_value(&golden).unwrap();
         let case = json["retrieval_cases"][0].as_object().unwrap();
-        for key in ["status", "blocked_by", "history", "subset", "answer"] {
+        for key in ["status", "blocked_by", "history", "subset", "answer", "query_lang"] {
             assert!(!case.contains_key(key), "{key} must be omitted at its default");
         }
         assert!(!json["corpus"][0].as_object().unwrap().contains_key("lang"));
@@ -133,6 +136,15 @@ mod tests {
         assert_eq!(json["retrieval_cases"][0]["answer"], "capped at 40 records");
         let back: Golden = serde_json::from_value(json).unwrap();
         assert_eq!(back, golden);
+    }
+
+    #[test]
+    fn a_base_case_keeps_its_query_lang() {
+        let raw = MINIMAL.replace(r#""expected_refs": ["c1"]"#, r#""expected_refs": ["c1"], "query_lang": "es""#);
+        let golden: Golden = serde_json::from_str(&raw).expect("a base labelled with query languages");
+        assert_eq!(golden.retrieval_cases[0].query_lang.as_deref(), Some("es"));
+        let json = serde_json::to_value(&golden).unwrap();
+        assert_eq!(json["retrieval_cases"][0]["query_lang"], "es");
     }
 
     #[test]

@@ -167,6 +167,11 @@ pub struct Hit {
     /// and from a daemon that does not link pieces.
     #[serde(default)]
     pub piece: Option<PiecePosition>,
+    /// The hit holds every identifier of the query, so the relevance cut
+    /// does not measure the others against it. A daemon that predates the
+    /// flag does not send it, and its hits are cut as before.
+    #[serde(default)]
+    pub exact: bool,
 }
 
 /// Position `piece` (from 1) of a save stored as `pieces` rows.
@@ -1766,5 +1771,19 @@ pub(crate) mod tests {
         });
         let hit: Hit = serde_json::from_value(old).expect("old shape still parses");
         assert_eq!(hit.agent_id, None);
+    }
+
+    #[test]
+    fn a_hit_without_exact_reads_as_inexact() {
+        let old = serde_json::json!({
+            "id": 3, "kind": "Memory", "content": "x", "memory_type": "semantic_fact", "tier": 3, "score": 0.5
+        });
+        let hit: Hit = serde_json::from_value(old).expect("old shape still parses");
+        assert!(!hit.exact);
+        let new = serde_json::json!({
+            "id": 3, "kind": "Memory", "content": "x", "memory_type": "semantic_fact", "tier": 3, "score": 1.5,
+            "exact": true
+        });
+        assert!(serde_json::from_value::<Hit>(new).expect("new shape parses").exact);
     }
 }
