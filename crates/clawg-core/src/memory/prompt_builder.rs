@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::memory::{
     access::AccessTracker,
     clock::TimestampMs,
-    embedder::{EmbedRole, Embedder},
+    embedder::{EmbedError, EmbedRole, Embedder},
     search::{search_all_memories, RankedHit, SearchScope},
     sharing::Reach,
     workspace::{EmittedIds, WorkspaceManager},
@@ -77,6 +77,25 @@ impl<'a> QueryTexts<'a> {
     }
 }
 
+/// Whether the prompt searched memories, and if not, why. Every case but
+/// `Searched` leaves the prompt with the workspace alone, which reads as "no
+/// memories" unless the caller says otherwise.
+#[derive(Debug)]
+pub enum Retrieval {
+    Searched,
+    NoEmbedder,
+    EmbedFailed(EmbedError),
+    SearchFailed(String),
+}
+
+/// What `build_memory_prompt` hands back: the text, and whether memories
+/// were searched for it.
+#[derive(Debug)]
+pub struct MemoryPrompt {
+    pub text: String,
+    pub retrieval: Retrieval,
+}
+
 struct ConflictPair {
     old_id: i64,
     old_created_at: TimestampMs,
@@ -92,8 +111,9 @@ struct ConflictPair {
 
 /// Builds the WORKSPACE / RECENT / LONG-TERM / [ACTIVE CONFLICTS] prefix string.
 ///
-/// Returns `Ok(String::new())` when all four blocks would be empty.
-/// Each internal failure is degraded to "the matching block is empty".
+/// The text is empty when all four blocks would be. Each internal failure is
+/// degraded to "the matching block is empty"; a retrieval that did not run
+/// says so in [`MemoryPrompt::retrieval`].
 ///
 /// `emitted` names the rows the workspace file already carries, so the same
 /// row is never handed to the model twice. It comes from the regeneration
@@ -117,7 +137,7 @@ pub async fn build_memory_prompt(
     query: QueryTexts<'_>,
     emitted: &EmittedIds,
     access_tracker: Option<&AccessTracker>,
-) -> Result<String, MemoryError> {
+) -> Result<MemoryPrompt, MemoryError> {
     // 1. Read workspace file (may be empty on fresh install or read failure).
     // Only its content reaches the model: no markers, no empty headings.
     let workspace_content = {
@@ -141,7 +161,7 @@ pub async fn build_memory_prompt(
     // gets. The per-table pools (30/5/5) are the real ceiling, so this only
     // ever spends candidates that were already fetched.
     let k_request = K_FINAL.saturating_add(emitted.len());
-    let mut hits: Vec<RankedHit> = match embedder {
+    let (mut hits, retrieval): (Vec<RankedHit>, Retrieval) = match embedder {
         // Query: the composed (or, absent composition, raw) text is the thing
         // being searched FOR on the dense side; the lexical/FTS5 side always
         // gets the raw text — see `QueryTexts`'s doc comment for why the two
@@ -158,21 +178,21 @@ pub async fn build_memory_prompt(
                 )
                 .await
                 {
-                    Ok(h) => h,
+                    Ok(h) => (h, Retrieval::Searched),
                     Err(e) => {
                         log::warn!("search_all_memories failed: {e}; no retrieval hits this turn");
-                        Vec::new()
+                        (Vec::new(), Retrieval::SearchFailed(e.to_string()))
                     }
                 }
             }
             Err(e) => {
                 log::warn!("embedder.embed failed: {e}; no retrieval hits this turn");
-                Vec::new()
+                (Vec::new(), Retrieval::EmbedFailed(e))
             }
         },
         None => {
             log::warn!("embedder not ready; retrieval skipped this turn (agent_id={agent_id})");
-            Vec::new()
+            (Vec::new(), Retrieval::NoEmbedder)
         }
     };
     hits.retain(|h| !emitted.contains(h.kind, h.id));
@@ -281,7 +301,7 @@ pub async fn build_memory_prompt(
         out.push('\n');
     }
 
-    Ok(out)
+    Ok(MemoryPrompt { text: out, retrieval })
 }
 
 // ---------------------------------------------------------------------------
@@ -571,7 +591,7 @@ mod tests {
 
         build_memory_prompt(&store, &wm, Some(embedder), "agent-1", None, &Reach::Own, QueryTexts::single_shot("some query"), &EmittedIds::default(), None)
             .await
-            .unwrap();
+            .unwrap().text;
 
         let calls = recording.calls.lock().unwrap();
         assert_eq!(calls.len(), 1, "expected exactly one embed call, got {calls:?}");
@@ -948,7 +968,7 @@ mod tests {
         }).await.unwrap();
         let emitted = wm.regenerate_auto_section("agent-x", None, &store).await.unwrap();
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-x", None, &Reach::Own, QueryTexts::single_shot("query"), &emitted, None).await.unwrap();
+        let result = build_memory_prompt(&store, &wm, None, "agent-x", None, &Reach::Own, QueryTexts::single_shot("query"), &emitted, None).await.unwrap().text;
         assert!(result.contains(SEP_CONFLICTS), "{result}");
     }
 
@@ -1023,8 +1043,52 @@ mod tests {
         // 7th argument `None::<&AccessTracker>` — must compile once the parameter exists.
         let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None::<&AccessTracker>)
             .await
-            .unwrap();
+            .unwrap().text;
         assert_eq!(result, "", "all empty → empty string");
+    }
+
+    struct BrokenEmbedder;
+    #[async_trait::async_trait]
+    impl Embedder for BrokenEmbedder {
+        async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+            Err(EmbedError::InferenceFailed("the session is gone".into()))
+        }
+        fn dimensions(&self) -> usize {
+            384
+        }
+        fn model_id(&self) -> &str {
+            "broken"
+        }
+        fn query_prefix(&self) -> &str {
+            ""
+        }
+        fn passage_prefix(&self) -> &str {
+            ""
+        }
+    }
+
+    /// Each of these leaves the prompt with the workspace alone, which an
+    /// agent reads as "there are no memories" unless it is told why.
+    #[tokio::test]
+    async fn the_retrieval_outcome_names_each_silence() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let recall = |embedder: Option<Arc<dyn Embedder>>| {
+            let (store, wm) = (&store, &wm);
+            async move {
+                build_memory_prompt(store, wm, embedder, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None)
+                    .await
+                    .unwrap()
+                    .retrieval
+            }
+        };
+
+        assert!(matches!(recall(None).await, Retrieval::NoEmbedder));
+        let broken = recall(Some(Arc::new(BrokenEmbedder))).await;
+        assert!(matches!(broken, Retrieval::EmbedFailed(EmbedError::InferenceFailed(_))), "{broken:?}");
+        let working = recall(Some(Arc::new(RecordingEmbedder { calls: std::sync::Mutex::new(Vec::new()) }))).await;
+        assert!(matches!(working, Retrieval::Searched), "{working:?}");
     }
 
     #[tokio::test]
@@ -1033,7 +1097,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None).await.unwrap();
+        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None).await.unwrap().text;
         assert_eq!(result, "", "all empty → empty string");
     }
 
@@ -1049,7 +1113,7 @@ mod tests {
         let path = wm.workspace_path("agent-1", None);
         tokio::fs::write(&path, "<!-- AUTO-START -->\n## Notes\n- something\n<!-- AUTO-END -->\n<!-- USER-START -->\n<!-- USER-END -->\n").await.unwrap();
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None).await.unwrap();
+        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None).await.unwrap().text;
         assert!(result.contains(SEP_WORKSPACE), "should contain WORKSPACE separator");
         assert!(!result.contains(SEP_RECENT), "no embedder → no RECENT");
     }
@@ -1064,7 +1128,7 @@ mod tests {
         tokio::fs::write(&path, content).await.unwrap();
         let prompt = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None)
             .await
-            .unwrap();
+            .unwrap().text;
         (prompt, path, tmp)
     }
 
@@ -1106,7 +1170,7 @@ mod tests {
 
         let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None).await;
         assert!(result.is_ok(), "should not panic or error");
-        let s = result.unwrap();
+        let s = result.unwrap().text;
         assert!(!s.contains(SEP_RECENT), "no RECENT block without embedder");
     }
 
@@ -1120,7 +1184,7 @@ mod tests {
         tokio::fs::create_dir_all(path.parent().unwrap()).await.unwrap();
         tokio::fs::write(&path, "workspace content here\n").await.unwrap();
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None).await.unwrap();
+        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None).await.unwrap().text;
         assert!(result.contains(SEP_WORKSPACE));
         assert!(!result.contains(SEP_RECENT));
         assert!(!result.contains(SEP_LONGTERM));
@@ -1133,7 +1197,7 @@ mod tests {
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         disputed_pair(&store, "agent-x", "semantic_fact", 8.0).await;
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-x", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None).await.unwrap();
+        let result = build_memory_prompt(&store, &wm, None, "agent-x", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None).await.unwrap().text;
         assert!(!result.contains(SEP_CONFLICTS), "{result}");
     }
 
@@ -1143,7 +1207,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None).await.unwrap();
+        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None).await.unwrap().text;
         assert!(!result.contains("ACTIVE CONFLICTS"), "no disputes → CONFLICTS block omitted");
     }
 
@@ -1202,7 +1266,7 @@ mod tests {
         let result = build_memory_prompt(
             &store, &wm, Some(embedder), "agent-split", None, &Reach::Own, QueryTexts::single_shot("some query"),
             &EmittedIds::default(), None
-        ).await.unwrap();
+        ).await.unwrap().text;
 
         assert!(result.contains(SEP_RECENT), "should have RECENT block");
         assert!(result.contains(SEP_LONGTERM), "should have LONG-TERM block");
@@ -1429,7 +1493,7 @@ mod tests {
             None,
         )
         .await
-        .unwrap();
+        .unwrap().text;
 
         assert!(
             result.contains("GPXSTORE7F3A"),
@@ -1489,7 +1553,7 @@ mod tests {
 
         let result = build_memory_prompt(&store, &wm, Some(embedder), agent, None, &Reach::Own, query, &EmittedIds::default(), None)
             .await
-            .unwrap();
+            .unwrap().text;
 
         assert!(
             !result.contains("RAREIDENT99XY"),
@@ -1516,7 +1580,7 @@ mod tests {
 
         build_memory_prompt(&store, &wm, Some(embedder), "agent-1", None, &Reach::Own, query, &EmittedIds::default(), None)
             .await
-            .unwrap();
+            .unwrap().text;
 
         let calls = recording.calls.lock().unwrap();
         assert_eq!(calls.len(), 1, "expected exactly one embed call, got {calls:?}");
@@ -1550,7 +1614,7 @@ mod tests {
         let result =
             build_memory_prompt(&store, &wm, Some(embedder), "agent-gap", None, &Reach::Own, QueryTexts::single_shot(content), &emitted, None)
                 .await
-                .unwrap();
+                .unwrap().text;
 
         assert_eq!(
             result.matches(content).count(),
@@ -1624,7 +1688,7 @@ mod tests {
         let result =
             build_memory_prompt(&store, &wm, Some(embedder), "agent-3t", None, &Reach::Own, QueryTexts::single_shot(query), &emitted, None)
                 .await
-                .unwrap();
+                .unwrap().text;
 
         assert_eq!(result.matches("prefiere voseo siempre").count(), 1, "memory row twice:\n{result}");
         assert_eq!(result.matches("arreglar-test-roto").count(), 1, "skill row twice:\n{result}");
@@ -1682,7 +1746,7 @@ mod tests {
         let result =
             build_memory_prompt(&store, &wm, Some(embedder), "agent-budget", None, &Reach::Own, QueryTexts::single_shot(query), &emitted, None)
                 .await
-                .unwrap();
+                .unwrap().text;
 
         let delivered = (0..K_FINAL)
             .filter(|i| result.contains(&format!("mensaje de chat {i}")))
@@ -1823,7 +1887,7 @@ mod tests {
             Some(&tracker),
         )
         .await
-        .unwrap();
+        .unwrap().text;
         assert!(result.contains("colliding-skill"), "the skill must be a hit: {result}");
         assert!(!result.contains("bystander"), "the bystander must not be a hit: {result}");
 
@@ -1861,7 +1925,7 @@ mod tests {
             Some(&tracker),
         )
         .await
-        .unwrap();
+        .unwrap().text;
 
         force_flush_until_counted(&store, hit).await;
 
@@ -1899,7 +1963,7 @@ mod tests {
             Some(&tracker),
         )
         .await
-        .unwrap();
+        .unwrap().text;
         assert!(prompt.contains("filler"), "a zero-score hit still fills the prompt: {prompt}");
 
         force_flush_until_counted(&store, witness).await;
@@ -2007,7 +2071,7 @@ mod tests {
 
         let result = build_memory_prompt(
             &store, &wm, Some(embedder), "e2e-agent", None, &Reach::Own, QueryTexts::single_shot("some query"), &emitted, None
-        ).await.unwrap();
+        ).await.unwrap().text;
 
         // All four separators must appear in order
         let ws_pos = result.find(SEP_WORKSPACE).expect("WORKSPACE separator missing");
@@ -2083,7 +2147,7 @@ mod tests {
         let query = QueryTexts::single_shot("dato");
         let emitted = EmittedIds::default();
 
-        let alone = build_memory_prompt(&store, &wm, embedder(), "cursor", None, &Reach::Own, query, &emitted, None).await.unwrap();
+        let alone = build_memory_prompt(&store, &wm, embedder(), "cursor", None, &Reach::Own, query, &emitted, None).await.unwrap().text;
         assert!(alone.contains("dato propio de cursor"), "{alone}");
         assert!(!alone.contains("claude-code"), "reaching only its own, nothing is shared: {alone}");
         assert!(!alone.contains(SEP_SHARED), "{alone}");
@@ -2091,7 +2155,7 @@ mod tests {
         let query = QueryTexts::single_shot("dato");
         let shared = build_memory_prompt(&store, &wm, embedder(), "cursor", None, &Reach::AllBut(Vec::new()), query, &emitted, None)
             .await
-            .unwrap();
+            .unwrap().text;
         assert!(shared.contains("semantic_fact by claude-code] dato de claude-code"), "{shared}");
         assert!(shared.contains("semantic_fact] dato propio de cursor"), "the own line keeps its shape: {shared}");
         assert!(shared.ends_with(&format!("{SEP_SHARED}\n{SHARED_NOTE}\n")), "the note closes the prompt: {shared}");
@@ -2132,7 +2196,7 @@ mod tests {
             None,
         )
         .await
-        .unwrap();
+        .unwrap().text;
 
         if let Some(workspace) = block(&prompt, SEP_WORKSPACE) {
             assert!(!workspace.contains("regla de claude-code"), "{prompt}");

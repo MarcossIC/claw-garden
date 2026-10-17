@@ -967,7 +967,8 @@ async fn context(
         Some(app.runtime.access_tracker.as_ref()),
     )
     .await
-    .map_err(ApiError::internal)?;
+    .map_err(ApiError::internal)?
+    .text;
 
     // Same degradation as the regen above: a reminder that cannot be counted
     // is a reminder skipped, not a failed request.

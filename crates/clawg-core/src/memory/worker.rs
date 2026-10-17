@@ -2394,7 +2394,7 @@ mod tests {
             &crate::memory::workspace::EmittedIds::default(), None,
         )
         .await
-        .unwrap();
+        .unwrap().text;
 
         WrittenMemoryFixture { hits, prompt, fresh, stale }
     }
