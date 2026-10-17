@@ -9,6 +9,6 @@ artifacts:
   design: skipped  # the proposal settles approach A against B, C and D with the exploration's tradeoffs; no other open alternative
   tasks: done
   apply: done
-  verify: pending  # suite and clippy pass on Linux; CI and the real-model measurement (U1-U6) remain
+  verify: pending  # suite and clippy pass on Linux and in CI on Linux and Windows; the real-model measurement (U1-U6) remains
   archive: pending
 updated: 2026-10-17
