@@ -63,6 +63,7 @@ pub enum Subset {
     HighImportance,
     LowImportance,
     Long,
+    LexicalRelated,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

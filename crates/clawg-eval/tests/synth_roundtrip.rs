@@ -69,7 +69,7 @@ fn the_expanded_set_scores_under_rag_eval_and_reports_every_subset() {
 
     let by_subset = results["retrieval"]["by_subset"].as_array().expect("by_subset must be present");
     let names: Vec<&str> = by_subset.iter().map(|b| b["subset"].as_str().unwrap()).collect();
-    assert_eq!(names, vec!["high_importance", "lexical", "long", "low_importance", "multi_ref", "natural"]);
+    assert_eq!(names, vec!["high_importance", "lexical", "lexical_related", "long", "low_importance", "multi_ref", "natural"]);
     let natural = by_subset.iter().find(|b| b["subset"] == "natural").unwrap();
     assert_eq!(natural["n_cases"], 2, "the base cases keep the natural label");
 }
@@ -101,7 +101,7 @@ fn the_audit_names_an_intruder_for_every_generated_subset() {
 
     let intruders = results["audit"]["top_intruders"].as_array().expect("the audit must carry top_intruders");
     let subsets: Vec<&str> = intruders.iter().map(|i| i["subset"].as_str().unwrap()).collect();
-    assert_eq!(subsets, vec!["high_importance", "lexical", "long", "low_importance", "multi_ref", "natural"]);
+    assert_eq!(subsets, vec!["high_importance", "lexical", "lexical_related", "long", "low_importance", "multi_ref", "natural"]);
     for intruder in intruders {
         assert!(intruder["intruder_ref"].is_string());
         assert!(intruder["fraction"].as_f64().unwrap() > 0.0);

@@ -23,6 +23,10 @@ const MAX_COPY_RETRIES: usize = 50;
 const LEXICAL_FAMILIES: usize = 30;
 const SIBLINGS_PER_FAMILY: usize = 8;
 const MULTI_REF_TOPICS: usize = 12;
+/// Cases whose answer is the identifier's row and the rows on its topic.
+const RELATED_FAMILIES: usize = 30;
+/// Rows in a related family that carry a near identifier and another topic.
+const RELATED_SIBLINGS: usize = 4;
 /// Cases per direction of the importance split.
 const CONTESTED_CASES: usize = 12;
 /// Rows that name the same entity in a contested case: the answer and five rivals.
@@ -90,6 +94,10 @@ pub fn generate(base: &Golden, seed: u64, sizes: &Sizes) -> Result<Golden, Synth
     // Last, so the draws above, and everything they generate, stay as they
     // were before long cases existed.
     let (rows, cases) = long_saves(base, &mut names, &mut rng);
+    out.corpus.extend(rows);
+    out.retrieval_cases.extend(cases);
+    // After long cases for the same reason.
+    let (rows, cases) = lexical_related(base, &out.corpus[base.corpus.len()..], &mut names, &mut rng);
     out.corpus.extend(rows);
     out.retrieval_cases.extend(cases);
 
@@ -187,30 +195,11 @@ fn lexical_families(base: &Golden, rng: &mut SplitMix64) -> (Vec<Row>, Vec<Case>
         let spanish = (family / 2) % 2 == 1;
         let frame = rng.pick(templates::lexical_frames(kind, spanish));
         let mention = *rng.pick(templates::mention_frames(kind, spanish));
-        let stem = match kind {
-            IdentKind::Function => format!(
-                "{}{}",
-                rng.pick(&templates::FUNCTION_VERBS),
-                rng.pick(&templates::FUNCTION_NOUNS)
-            ),
-            IdentKind::ErrorCode => format!("E_{}_", rng.pick(&templates::ERROR_AREAS)),
-        };
-
         let taken = |candidate: &str| {
             used.iter().any(|u| u.contains(candidate) || candidate.contains(u.as_str()))
                 || base.corpus.iter().any(|r| r.content.contains(candidate))
         };
-        let (seed_ident, near) = loop {
-            let digits = (1000 + rng.below(9000)).to_string();
-            let seed_ident = format!("{stem}{digits}");
-            if taken(&seed_ident) {
-                continue;
-            }
-            let near = near_identifiers(&stem, &digits, SIBLINGS_PER_FAMILY - 1, rng, &taken);
-            if near.len() == SIBLINGS_PER_FAMILY - 1 {
-                break (seed_ident, near);
-            }
-        };
+        let (seed_ident, near) = identifier_family(kind, SIBLINGS_PER_FAMILY - 1, rng, &taken);
         let expected = rng.below(SIBLINGS_PER_FAMILY);
         let mut idents = near;
         idents.insert(expected, seed_ident);
@@ -240,6 +229,96 @@ fn lexical_families(base: &Golden, rng: &mut SplitMix64) -> (Vec<Row>, Vec<Case>
             subset: Subset::Lexical,
             answer: None,
             query_lang: None,
+        });
+    }
+    (rows, cases)
+}
+
+/// A `{stem}{digits}` identifier of `kind` that is not `taken`, and `near`
+/// others a few digits away from it, none of them `taken` either.
+fn identifier_family(
+    kind: IdentKind,
+    near: usize,
+    rng: &mut SplitMix64,
+    taken: &dyn Fn(&str) -> bool,
+) -> (String, Vec<String>) {
+    let stem = match kind {
+        IdentKind::Function => format!(
+            "{}{}",
+            rng.pick(&templates::FUNCTION_VERBS),
+            rng.pick(&templates::FUNCTION_NOUNS)
+        ),
+        IdentKind::ErrorCode => format!("E_{}_", rng.pick(&templates::ERROR_AREAS)),
+    };
+    loop {
+        let digits = (1000 + rng.below(9000)).to_string();
+        let seed_ident = format!("{stem}{digits}");
+        if taken(&seed_ident) {
+            continue;
+        }
+        let others = near_identifiers(&stem, &digits, near, rng, taken);
+        if others.len() == near {
+            return (seed_ident, others);
+        }
+    }
+}
+
+/// Families of eight rows asked about one identifier, where the answer is
+/// more than the row that holds it: three rows on the same topic, named by a
+/// codename, say the rest without naming the identifier, and four rows carry
+/// identifiers a few digits away and talk about something else. What it
+/// measures is whether the rows about the topic still reach the agent once
+/// the identifier's row takes the lexical bonus.
+fn lexical_related(
+    base: &Golden,
+    generated: &[Row],
+    names: &mut Codenames,
+    rng: &mut SplitMix64,
+) -> (Vec<Row>, Vec<Case>) {
+    let mut used: Vec<String> = Vec::new();
+    let mut rows = Vec::new();
+    let mut cases = Vec::new();
+
+    for family in 0..RELATED_FAMILIES {
+        let kind = if family % 2 == 0 { IdentKind::Function } else { IdentKind::ErrorCode };
+        let spanish = (family / 2) % 2 == 1;
+        let lang = if spanish { "es" } else { "en" };
+        let topic = &templates::related_topics(kind, spanish)[(family / 4) % 2];
+        let sibling = rng.pick(templates::lexical_frames(kind, spanish));
+        let key = names.next(base, rng);
+        let taken = |candidate: &str| {
+            used.iter().any(|u| u.contains(candidate) || candidate.contains(u.as_str()))
+                || base.corpus.iter().chain(generated).any(|r| r.content.contains(candidate))
+        };
+        let (ident, near) = identifier_family(kind, RELATED_SIBLINGS, rng, &taken);
+        used.push(ident.clone());
+        used.extend(near.iter().cloned());
+
+        let values = [("{id}", ident.as_str()), ("{key}", key.as_str())];
+        let mut texts: Vec<(String, &str)> = vec![(templates::fill(topic.exact, &values), topic.exact_type)];
+        texts.extend(topic.related.iter().map(|r| (templates::fill(r, &values), "semantic_fact")));
+        texts.extend(near.iter().map(|id| (templates::fill(sibling.content, &[("{id}", id)]), sibling.memory_type)));
+
+        let refs: Vec<String> = (0..texts.len()).map(|j| format!("s-lr-{family:02}-{j}")).collect();
+        for (ref_, (content, memory_type)) in refs.iter().zip(texts) {
+            rows.push(Row {
+                ref_: ref_.clone(),
+                content,
+                memory_type: memory_type.to_string(),
+                importance: 5.0,
+                lang: Some(lang.to_string()),
+            });
+        }
+        cases.push(Case {
+            query: templates::fill(topic.query, &values),
+            expected_refs: refs[..1 + topic.related.len()].to_vec(),
+            corpus_refs: refs,
+            status: Status::Active,
+            blocked_by: None,
+            history: Vec::new(),
+            subset: Subset::LexicalRelated,
+            answer: None,
+            query_lang: Some(lang.to_string()),
         });
     }
     (rows, cases)
@@ -1073,8 +1152,8 @@ mod tests {
     #[test]
     fn adding_long_cases_leaves_the_rest_of_the_set_unchanged() {
         let mut out = generate(&grouped_base(), 7, &Sizes { distractors: 40 }).unwrap();
-        out.corpus.retain(|r| !r.ref_.starts_with("s-long-"));
-        out.retrieval_cases.retain(|c| c.subset != Subset::Long);
+        out.corpus.retain(|r| !r.ref_.starts_with("s-long-") && !r.ref_.starts_with("s-lr-"));
+        out.retrieval_cases.retain(|c| c.subset != Subset::Long && c.subset != Subset::LexicalRelated);
         let digest = clawg_core::eval_api::sha256_hex(serde_json::to_string(&out).unwrap().as_bytes());
         assert_eq!(digest, "f05a66281b5db6008277aee3fec78691b881f58f02b14102e37d401f5ebc1d27");
     }
@@ -1087,6 +1166,82 @@ mod tests {
         let long: Vec<&Row> = out.corpus.iter().filter(|r| r.ref_.starts_with("s-long-")).collect();
         let digest = clawg_core::eval_api::sha256_hex(serde_json::to_string(&long).unwrap().as_bytes());
         assert_eq!(digest, "ea1ac4ed4ce564b3632e6b1593ba7ef9d32b099b2e98b8329325f6fbf85beff9");
+    }
+
+    /// The digest of the set seed 7 gave before related cases existed. They
+    /// draw from the generator after everything else, so removing them must
+    /// give back that exact set, byte for byte.
+    #[test]
+    fn the_other_subsets_do_not_change_when_lexical_related_is_added() {
+        let mut out = generate(&grouped_base(), 7, &Sizes { distractors: 40 }).unwrap();
+        out.corpus.retain(|r| !r.ref_.starts_with("s-lr-"));
+        out.retrieval_cases.retain(|c| c.subset != Subset::LexicalRelated);
+        let digest = clawg_core::eval_api::sha256_hex(serde_json::to_string(&out).unwrap().as_bytes());
+        assert_eq!(digest, "d3f2cdd3047ae3ed010199302d935d8911305885090412ff29f8c69c1718c2c4");
+    }
+
+    #[test]
+    fn there_are_thirty_lexical_related_cases() {
+        for distractors in [0, 500] {
+            let out = generate(&grouped_base(), 7, &Sizes { distractors }).unwrap();
+            assert_eq!(cases_of(&out, Subset::LexicalRelated).len(), 30, "distractors={distractors}");
+        }
+    }
+
+    /// The identifier of a related case: the token of its query that its
+    /// first expected row holds in backticks.
+    fn related_ident<'a>(out: &'a Golden, case: &Case) -> &'a str {
+        ident_of(row_of(out, &case.expected_refs[0]))
+    }
+
+    #[test]
+    fn a_lexical_related_case_expects_the_identifier_row_and_three_related_rows() {
+        let out = generate(&grouped_base(), 7, &NONE).unwrap();
+        for case in cases_of(&out, Subset::LexicalRelated) {
+            assert_eq!((case.corpus_refs.len(), case.expected_refs.len()), (8, 4), "{}", case.query);
+            assert!(case.expected_refs.iter().all(|r| case.corpus_refs.contains(r)));
+            let ident = related_ident(&out, case);
+            assert!(case.query.contains(ident), "{} lacks {ident}", case.query);
+            let lang = row_of(&out, &case.expected_refs[0]).lang.clone();
+            assert_eq!(case.query_lang, lang);
+            let key = case.query.split_whitespace().find(|w| w.contains('-')).expect("a codename");
+            for r in &case.corpus_refs {
+                let row = row_of(&out, r);
+                assert_eq!(row.lang, lang);
+                assert_eq!(row.content.contains(key), case.expected_refs.contains(r), "{key} in {}", row.content);
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_identifier_row_of_a_related_case_holds_its_identifier() {
+        let out = generate(&grouped_base(), 7, &Sizes { distractors: 200 }).unwrap();
+        for case in cases_of(&out, Subset::LexicalRelated) {
+            let ident = related_ident(&out, case);
+            let holders: Vec<&str> =
+                out.corpus.iter().filter(|r| r.content.contains(ident)).map(|r| r.ref_.as_str()).collect();
+            assert_eq!(holders, [case.expected_refs[0].as_str()]);
+            let split = ident.len() - 4;
+            let (stem, digits) = ident.split_at(split);
+            for r in &case.corpus_refs[4..] {
+                let sibling = ident_of(row_of(&out, r));
+                let tail = sibling.strip_prefix(stem).unwrap_or_else(|| panic!("{sibling} vs {stem}"));
+                assert!(digits_are_near(digits, tail), "{sibling} vs {ident}");
+            }
+        }
+    }
+
+    #[test]
+    fn lexical_related_identifiers_are_unique_and_new() {
+        let out = generate(&grouped_base(), 7, &NONE).unwrap();
+        let lexical: Vec<&str> = out.corpus.iter().filter(|r| r.ref_.starts_with("s-lex-")).map(ident_of).collect();
+        let related: Vec<&str> = out.corpus.iter().filter(|r| r.ref_.starts_with("s-lr-")).filter_map(|r| r.content.split('`').nth(1)).filter(|i| !i.contains('-')).collect();
+        assert_eq!(related.len(), 30 * 5, "one identifier per related row and one per sibling");
+        let unique: HashSet<&str> = related.iter().copied().collect();
+        assert_eq!(unique.len(), related.len());
+        for ident in &related {
+            assert!(lexical.iter().all(|l| !l.contains(ident) && !ident.contains(l)), "{ident}");
+        }
     }
 
     fn base() -> Golden {

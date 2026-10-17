@@ -189,6 +189,111 @@ pub fn mention_frames(kind: IdentKind, spanish: bool) -> &'static [&'static str]
     }
 }
 
+/// A topic a related case asks about: the row that names the queried
+/// identifier, three rows on the same topic that never name it, and the
+/// question, which names both the identifier and the topic. Every text
+/// names `{key}`; only `exact` and `query` name `{id}`.
+pub struct RelatedTopic {
+    pub exact_type: &'static str,
+    pub exact: &'static str,
+    pub related: [&'static str; 3],
+    pub query: &'static str,
+}
+
+/// Two topics per kind of identifier and language.
+pub fn related_topics(kind: IdentKind, spanish: bool) -> &'static [RelatedTopic; 2] {
+    match (kind, spanish) {
+        (IdentKind::Function, false) => &[
+            RelatedTopic {
+                exact_type: "semantic_fact",
+                exact: "`{id}` is the entry point of the `{key}` nightly import; it parses each batch file before the ledger is touched.",
+                related: [
+                    "The `{key}` nightly import reads its batch files from the shared bucket after midnight.",
+                    "When the `{key}` nightly import fails, the ledger keeps yesterday's totals until someone reruns it.",
+                    "The `{key}` nightly import holds a lock on the ledger while a batch is written.",
+                ],
+                query: "how does {id} run the {key} nightly import",
+            },
+            RelatedTopic {
+                exact_type: "semantic_fact",
+                exact: "`{id}` warms the `{key}` cache on startup by loading the most requested entries first.",
+                related: [
+                    "The `{key}` cache is warmed on startup so the first requests do not miss.",
+                    "Warming the `{key}` cache takes about two minutes and blocks the readiness probe.",
+                    "If the `{key}` cache warmup is skipped, latency stays high until traffic fills it.",
+                ],
+                query: "what does {id} do when the {key} cache warms up",
+            },
+        ],
+        (IdentKind::Function, true) => &[
+            RelatedTopic {
+                exact_type: "semantic_fact",
+                exact: "`{id}` es el punto de entrada de la importación nocturna de `{key}`; procesa cada archivo del lote antes de tocar el libro mayor.",
+                related: [
+                    "La importación nocturna de `{key}` lee sus archivos de lote del bucket compartido después de medianoche.",
+                    "Cuando falla la importación nocturna de `{key}`, el libro mayor conserva los totales de ayer hasta que alguien la vuelve a correr.",
+                    "La importación nocturna de `{key}` bloquea el libro mayor mientras se escribe un lote.",
+                ],
+                query: "cómo corre {id} la importación nocturna de {key}",
+            },
+            RelatedTopic {
+                exact_type: "semantic_fact",
+                exact: "`{id}` precalienta la caché de `{key}` al arrancar, cargando primero las entradas más pedidas.",
+                related: [
+                    "La caché de `{key}` se precalienta al arrancar para que las primeras peticiones no fallen.",
+                    "Precalentar la caché de `{key}` tarda unos dos minutos y bloquea la sonda de disponibilidad.",
+                    "Si se omite el precalentamiento de la caché de `{key}`, la latencia sigue alta hasta que el tráfico la llena.",
+                ],
+                query: "qué hace {id} cuando se precalienta la caché de {key}",
+            },
+        ],
+        (IdentKind::ErrorCode, false) => &[
+            RelatedTopic {
+                exact_type: "tool_error",
+                exact: "`{id}` is what the `{key}` sync raises when the remote rejects a batch because of a schema mismatch.",
+                related: [
+                    "The `{key}` sync pushes local changes to the remote every five minutes.",
+                    "A rejected batch stops the `{key}` sync until the schema on both sides matches again.",
+                    "After a schema change, the `{key}` sync has to be restarted by hand.",
+                ],
+                query: "why does the {key} sync fail with {id}",
+            },
+            RelatedTopic {
+                exact_type: "tool_error",
+                exact: "`{id}` shows up when the `{key}` deploy cannot reach the registry to pull the new image.",
+                related: [
+                    "The `{key}` deploy pulls its image from the internal registry before draining the old pods.",
+                    "When the registry is down, the `{key}` deploy stalls and the old version keeps serving.",
+                    "The `{key}` deploy retries the image pull three times before giving up.",
+                ],
+                query: "what does {id} mean during the {key} deploy",
+            },
+        ],
+        (IdentKind::ErrorCode, true) => &[
+            RelatedTopic {
+                exact_type: "tool_error",
+                exact: "`{id}` es lo que lanza la sincronización de `{key}` cuando el remoto rechaza un lote por un esquema distinto.",
+                related: [
+                    "La sincronización de `{key}` envía los cambios locales al remoto cada cinco minutos.",
+                    "Un lote rechazado detiene la sincronización de `{key}` hasta que el esquema vuelve a coincidir en los dos lados.",
+                    "Después de un cambio de esquema, la sincronización de `{key}` hay que reiniciarla a mano.",
+                ],
+                query: "por qué falla la sincronización de {key} con {id}",
+            },
+            RelatedTopic {
+                exact_type: "tool_error",
+                exact: "`{id}` aparece cuando el despliegue de `{key}` no llega al registro para bajar la imagen nueva.",
+                related: [
+                    "El despliegue de `{key}` baja su imagen del registro interno antes de vaciar los pods viejos.",
+                    "Cuando el registro está caído, el despliegue de `{key}` se traba y la versión vieja sigue atendiendo.",
+                    "El despliegue de `{key}` reintenta bajar la imagen tres veces antes de rendirse.",
+                ],
+                query: "qué significa {id} durante el despliegue de {key}",
+            },
+        ],
+    }
+}
+
 /// What can be said about an entity, one row per aspect, each with the
 /// question that asks for exactly that aspect. Every row names `{key}`.
 pub fn aspect_catalog(spanish: bool) -> &'static [(&'static str, &'static str); 8] {
@@ -417,6 +522,22 @@ mod tests {
                         lexical_frames(kind, spanish).iter().all(|f| f.content != *mention),
                         "{mention}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_related_topic_names_the_identifier_only_in_its_exact_row_and_query() {
+        for kind in [IdentKind::Function, IdentKind::ErrorCode] {
+            for spanish in [false, true] {
+                for topic in related_topics(kind, spanish) {
+                    assert_eq!(topic.exact.matches("`{id}`").count(), 1, "{}", topic.exact);
+                    assert_eq!(topic.query.matches("{id}").count(), 1, "{}", topic.query);
+                    for text in [topic.exact, topic.query].iter().chain(&topic.related) {
+                        assert!(text.contains("{key}"), "{text}");
+                    }
+                    assert!(topic.related.iter().all(|r| !r.contains("{id}")));
                 }
             }
         }

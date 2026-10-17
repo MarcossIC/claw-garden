@@ -103,6 +103,9 @@ pub enum CaseSubset {
     HighImportance,
     LowImportance,
     Long,
+    /// The query names an identifier, and the answer is the row that holds it
+    /// and the rows on the same topic that do not.
+    LexicalRelated,
     /// A newer row restates a fact older rows also state; it should come first.
     Update,
     /// No row answers the query: what is measured is whether the search
@@ -121,6 +124,7 @@ impl CaseSubset {
             Self::HighImportance => "high_importance",
             Self::LowImportance => "low_importance",
             Self::Long => "long",
+            Self::LexicalRelated => "lexical_related",
             Self::Update => "update",
             Self::Unanswerable => "unanswerable",
         }
@@ -515,6 +519,7 @@ mod tests {
             ("high_importance", CaseSubset::HighImportance),
             ("low_importance", CaseSubset::LowImportance),
             ("long", CaseSubset::Long),
+            ("lexical_related", CaseSubset::LexicalRelated),
         ] {
             let golden = parse_only(&case_with(&format!(r#", "subset": "{name}""#)));
             assert_eq!(golden.retrieval_cases[0].subset, want, "{name}");
