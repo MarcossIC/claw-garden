@@ -35,7 +35,7 @@ Los conflictos se piden, como hoy, sobre los hits candidatos y las filas del wor
 | Después del recorte | Sólo conflictos de lo visible | Una consulta por paso de recorte, o perder conflictos; el recorte deja de ser puro |
 | Antes, citando por id | Más corto | Cita un id que no se imprimió (exploración, «Orden de corte») |
 
-`rank_conflicts` no cambia: con posiciones de los hits que quedaron, un par cuyo hit se fue ordena como uno de workspace.
+`rank_conflicts` no cambia y ordena una sola vez, con las posiciones de los hits candidatos; el recorte quita pares desde el final de ese orden. Las posiciones con que se imprime cada lado se recalculan en cada render, sobre los hits que quedaron.
 
 ## D4. Lo que se cortó, por id
 
@@ -43,10 +43,10 @@ El bloque `=== BUDGET ===` sale sólo si algo se cortó o el workspace no entra:
 
 ```
 === BUDGET ===
-Cut to fit 8000 bytes; the full context is 11234 bytes. Left out: #40, #41, procedural/3; shortened: #12. read_memory returns any of them whole.
+Cut to fit 8000 bytes; the full context is 11234 bytes. Left out: #40, #41, procedural #3. Shortened: #12. read_memory returns any of them whole.
 ```
 
-Un hit recortado termina en ` [truncated]`. El separador propio hace que el parser de `rag-eval --agent-view` no lo lea como texto de un hit (`crates/clawg-eval/src/bin/rag-eval/agent_view/parse.rs:83-94`). Los ids de otra tabla llevan su kind, como en la línea del hit; los conflictos cortados se cuentan en su propio bloque.
+Un hit recortado termina en ` [truncated]`. Los ids van en el orden en que el prompt los imprimiría. Cuando no queda nada por cortar y el texto sigue pasado, el bloque agrega `The workspace alone is over the budget and is shown whole.` El separador propio hace que el parser de `rag-eval --agent-view` no lo lea como texto de un hit (`crates/clawg-eval/src/bin/rag-eval/agent_view/parse.rs:83-94`). Los ids de otra tabla llevan su kind, como en la línea del hit; los conflictos cortados se cuentan en su propio bloque.
 
 El corte de un texto cae en un límite de carácter UTF-8: retrocede desde el largo pedido hasta `is_char_boundary`.
 

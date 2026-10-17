@@ -20,7 +20,7 @@ El prompt MUST NOT superar el presupuesto, salvo cuando el workspace y el bloque
 - GIVEN un contexto de 3.000 bytes y el presupuesto default
 - THEN el prompt es byte a byte el de antes del cambio
 
-**Tests:** `the_prompt_never_exceeds_the_budget`, `the_cut_starts_at_the_end_of_long_term`, `a_context_that_fits_is_left_as_it_was`, `conflicts_go_after_every_hit` (`prompt_builder.rs`), `a_store_of_long_rows_fits_the_budget` (`prompt_builder.rs`, con el store).
+**Tests:** `the_prompt_never_exceeds_the_budget`, `the_cut_starts_at_the_end_of_long_term`, `a_context_that_fits_is_left_as_it_was`, `conflicts_go_after_every_hit` (`prompt_builder.rs`), `a_store_of_long_rows_fits_the_budget` (`prompt_builder.rs`, con el store). Que sin recorte el prompt sea el de antes lo siguen probando los tests de armado que ya existían (`e2e_full_4_block_output` y los de bloques), que corren con el default.
 
 ## R2. El primer hit de un bloque se recorta en lugar de saltarse
 
@@ -37,7 +37,7 @@ Si algo se cortó o recortó, el prompt MUST terminar con un bloque `=== BUDGET 
 - WHEN el agente llama `read_memory` con 40
 - THEN recibe su texto entero
 
-**Tests:** `what_the_budget_left_out_is_named_by_id`, `the_budget_block_stays_with_the_smallest_budget`, `a_hit_cut_by_the_budget_is_readable_whole` (`server.rs`).
+**Tests:** `what_the_budget_left_out_is_named_by_id`, `the_budget_block_stays_with_the_smallest_budget` (`prompt_builder.rs`), `a_hit_cut_by_the_budget_is_readable_whole` (`server.rs`).
 
 ## R4. Un workspace más grande que el presupuesto se entrega y se dice
 
@@ -53,7 +53,7 @@ Los conflictos MUST pedirse sobre los hits candidatos y el workspace, antes del 
 
 ## R6. `budget` en la petición
 
-`POST /v1/context` MUST aceptar `budget` opcional: ausente, MUST usar 8.000; mayor que 24.000, MUST usar 24.000; `0` o un valor que no es un entero positivo MUST responder `400`. `recall_context` MUST aceptar `budget` y pasarlo; el cliente MUST NOT mandarlo cuando no se le dio.
+`POST /v1/context` MUST aceptar `budget` opcional: ausente, MUST usar 8.000; mayor que 24.000, MUST usar 24.000; `0` MUST responder `400`, y un valor que no es un entero no negativo MUST rechazarse como cualquier cuerpo mal formado (un `4xx`). `recall_context` MUST aceptar `budget` y pasarlo; el cliente MUST NOT mandarlo cuando no se le dio.
 
 **Tests:** `context_takes_a_budget_and_clamps_it`, `context_refuses_a_zero_budget` (`tests/api.rs`), `recall_context_passes_its_budget` (`server.rs`).
 
