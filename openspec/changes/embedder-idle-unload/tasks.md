@@ -99,9 +99,11 @@ Las piezas puras y el cambio van en **un solo commit**. Por separado, las piezas
 
 ## 10. Verificación (cierra el cambio)
 
-- [ ] Suite y clippy en Linux sobre el último commit (`cargo test --workspace`; `cargo clippy --workspace --all-targets -- -A clippy::all -D warnings`); 1 ignorado, el de `e5_golden`.
-- [ ] El CI en verde en Linux y Windows.
+- [x] Suite y clippy en Linux sobre el último commit (`cargo test --workspace`; `cargo clippy --workspace --all-targets -- -A clippy::all -D warnings`): los corre el CI en `ubuntu-latest` sobre `0d36f88` ([verify](verify.md#después-de-d5-un-solo-tokenizer)).
+- [x] El CI en verde en Linux y Windows, sobre `0d36f88`.
 - [x] Suite y clippy en Windows con `--target-dir <otro>` (el `clawg.exe` del editor bloquea `target`).
 - [x] `cargo test -p clawg-core --features eval --test e5_golden -- --ignored` con `CLAWG_E5_MODEL_DIR`, en una máquina con el modelo: bits exactos si la CPU coincide con la del fixture, o diferencia máxima de 1e-6 si no, diciendo cuál; y sin la variable, falla.
 - [x] `rag-eval --diff` con `--real` de `main` al cambio, y otra vez con `--agent-view`: ningún caso se mueve.
 - [ ] R7 en el daemon, en Windows (hecho: [verify](verify.md#r7-en-windows)) y en Linux (falta), siguiendo D5 «R7 sobre lo medido»: línea de base con `CLAWG_TEST_EMBEDDER=fake` y sólo `tokenizer.json`; con el modelo y `CLAWG_EMBEDDER_IDLE_MINUTES=1`, diez recargas con `POST /v1/search` (nunca `clawg memories search`); la mediana queda a no más de 64 MB de la línea de base, la de las recargas 6 a 10 no supera la de 1 a 5 en más de 16 MB, la `distance` de cada hit es igual en las diez vueltas, y el log tiene una sola línea `tokenizer.json parsed`.
+
+Sólo queda la última tarea, R7 en Linux. Si cumple, el cambio se archiva sin otra revisión: [verify, «Para archivar»](verify.md#para-archivar).

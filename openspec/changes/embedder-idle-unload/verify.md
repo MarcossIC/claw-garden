@@ -93,8 +93,9 @@ Sobre `71fd1fa`, el cambio de motor (`269de1f` sólo suma docs), el 2026-10-16, 
 - [x] El lock pierde `fastembed`, `safetensors`, `allocator-api2` y `foldhash` 0.2.0, y no suma ningún paquete.
 - [x] **`rag-eval --diff --real`** de `cda7ead` (el último commit con fastembed, armado en un worktree) a `269de1f`, sobre la golden set de 46 casos: ningún caso se mueve en ninguna métrica ni en ningún corte por par de idiomas, y con `--agent-view` tampoco (`search.found` y `context.found` incluidos). Las dos comparaciones salen con código 0 bajo `--fail-on-regression`.
 - [x] **R7 en el daemon.** Se cumple: abajo.
-- [ ] CI en Linux y Windows: la rama no se subió todavía.
-- [ ] R7 en Linux: falta una máquina Linux con el modelo.
+- [x] **CI en Linux y Windows.** El workflow pasa clippy y `cargo test --workspace` en `ubuntu-latest` y `windows-latest` sobre `0d36f88`, el último commit con código. El primer run con el cambio de motor, sobre `1233d13`, pasó en Linux y falló en el `cargo test` de Windows; desde `d095d84`, que cierra el store de `rag-eval --agent-view` antes de borrar su directorio temporal, pasa en los dos.
+- [x] `cargo test --workspace --target-dir target-test` en Windows sobre `d095d84` (0.13.0), con los artefactos del workspace limpiados antes: **2.120 pasan, 0 fallan, 1 ignorado**, el de `e5_golden`.
+- [ ] **R7 en Linux: es lo único que falta.** Necesita una máquina Linux con glibc y el modelo; ver «Para archivar».
 
 ### R7 en Windows
 
@@ -121,6 +122,15 @@ Sobre `71fd1fa`, el cambio de motor (`269de1f` sólo suma docs), el 2026-10-16, 
 - **Vectores:** la `distance` de cada hit es la misma en las diez recargas, 0,572561502456665 y 0,692162275314331, y es la que daba fastembed antes del cambio.
 - **Contra la primera implementación:** con el modelo, ~745 MB en lugar de 1.095-1.240 MB, porque falta el segundo parse del tokenizer. Suelto, plano en 284-290 MB en lugar de subir de 310 a 398 MB. Armar la sesión tarda 0,2-0,5 s en lugar de 1,9-2,8 s, porque ya no se parsea el tokenizer. La lectura con hash sigue siendo lo que más tarda: 8,7-13,5 s en debug.
 
+## Para archivar
+
+Sólo falta R7 en Linux; lo demás está hecho y verificado. Quien lo mida no necesita otra revisión para archivar:
+
+1. **Medir.** En una máquina Linux x86_64 con glibc, el procedimiento de [D5, «R7 sobre lo medido»](design.md#r7-sobre-lo-medido) con el build de `cargo test --workspace` (en Linux el directorio es `target`), muestreando `RssAnon` de `/proc/<pid>/status`. Las dos corridas usan un `CLAWG_TEST_HOME` temporal, así que ningún perfil real se toca.
+2. **Anotar.** Una sección «R7 en Linux» como «R7 en Windows», con la línea de base y la tabla de las diez recargas, y marcar la última tarea de la sección 10 de [tasks](tasks.md) y su línea en «Después de D5».
+3. **Si cumple** (mediana a no más de 64 MB de la línea de base, no más de 16 MB entre la mediana de 1 a 5 y la de 6 a 10, una sola línea `tokenizer.json parsed` y la misma `distance` en las diez), archivar: consolidar R1 a R9 donde dice el encabezado de la [spec](spec.md), incluido el requisito «El modelo se carga con pooling mean» de `specs/storage`, que todavía nombra `FastEmbedLocal` y `the_e5_model_is_pooled_by_mean`; resolver ahí las diferencias de abajo; mover el cambio a `changes/archive/` con la fecha; actualizar sus dos filas en `openspec/README.md` (el mapa y el orden); y subir la versión menor (`.claude/CLAUDE.md`, «Versioning»).
+4. **Si no cumple**, el cambio vuelve a diseño y no se archiva.
+
 ## Diferencias entre los docs del cambio y el código
 
 Encontradas al consolidar los requisitos contra `49bd269`, para el archivo:
@@ -132,6 +142,8 @@ Encontradas al consolidar los requisitos contra `49bd269`, para el archivo:
 5. El procedimiento de Windows de este archivo pedía una búsqueda por texto, que no carga el modelo (ver «Cómo se midió»).
 
 Sin diferencia: `should_unload` (`idle_embedder.rs:53`), `unloading_when_idle` (`bootstrap.rs:344`), `embed_failure` (`api.rs:860`), `embedder_resident` en `/health` (`api.rs:688`), el `wake` de `POST /v1/projects` (`api.rs:1188`), `hold_for_embedder` (`worker.rs:389`), `after_failure` (`outbox.rs:74-78`) y la `OnceCell` (`runtime.rs:107-115`) están donde dicen los docs. El barrido (un cuarto del ocio, entre 1 y 60 s) y `IDLE_MINUTES_VAR` también coinciden.
+
+Contra `0d36f88`, después de D5, se movieron: `unloading_when_idle` a `bootstrap.rs:381`; `the_cpu_provider_turns_its_arena_off` a `embedder.rs:1223`; y el trim, que ahora sigue a `drop(inference.session)` (`embedder.rs:554`), con la llamada en `:555`, la definición de `return_freed_memory` en `:572` y el `malloc_trim(0)` en `:578`. Lo de R8, para consolidarlo: la celda es `MemoryRuntime::tokenizer` (`crates/clawg-core/src/runtime.rs:124`); la llenan `resolve_tokenizer_and_chunker` (`worker.rs:810`), con `load_verified_tokenizer` (`model_download.rs:154`), y `model_loader` (`bootstrap.rs:228`), y cada parse deja la línea `tokenizer.json parsed` (`model_download.rs:164` y `:191`). El resto de las citas de arriba sigue valiendo.
 
 ## Fuera de alcance
 
