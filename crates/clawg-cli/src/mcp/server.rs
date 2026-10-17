@@ -543,6 +543,9 @@ impl ClawgMcp {
                 }
                 Err(text)
             }
+            // The daemon's sentence says what was wrong with the call, an
+            // unknown memory_type with the accepted ones among them.
+            Err(ClientError::Daemon { status: 400, message, .. }) => Err(format!("not saved: {message}")),
             Err(ClientError::Daemon { message, .. }) if message == "ingest_queue_full" => {
                 Err("not saved: the ingest queue is full; try again shortly".into())
             }
@@ -2274,6 +2277,24 @@ mod tests {
 
         assert!(is_error(&r), "text was: {}", text(&r));
         assert!(text(&r).contains("connection refused"), "text was: {}", text(&r));
+    }
+
+    /// The daemon's own sentence lists the accepted types, which is what the
+    /// model needs to call again with one of them.
+    #[tokio::test]
+    async fn save_memory_says_an_unknown_type_was_not_saved() {
+        let (b, _d) = bridge().await;
+        let r = b
+            .save_memory_impl(
+                "agent-mcp",
+                SaveMemoryArgs { memory_type: Some("preference".into()), ..save_args("the build runs on tuesdays") },
+            )
+            .await
+            .expect("save");
+
+        assert!(is_error(&r), "text was: {}", text(&r));
+        assert!(text(&r).starts_with("not saved: unknown memory_type \"preference\""), "text was: {}", text(&r));
+        assert!(text(&r).contains("user_preference"), "text was: {}", text(&r));
     }
 
     fn daemon_error(status: u16, message: &str, details: ErrorDetails) -> ClientError {
