@@ -49,7 +49,8 @@ rules:
     - Strict TDD - each implementation task is preceded by its failing test.
     - Each task maps to one atomic conventional commit that compiles and passes the suite.
   apply:
-    - Run tests with a separate target dir on Windows - cargo test --workspace --target-dir <dir>.
+    - Run tests and clippy in target-test on Windows (cargo test --workspace --target-dir target-test), never in another target dir.
+    - Before testing a new version run cargo clean --workspace --target-dir target-test; after rustup update or a dependency change, cargo clean --target-dir target-test. Delete any comparison build dir before the task ends.
     - No release builds, installs, or access to ~/.clawg or ~/.clawg-dev without explicit authorization.
     - Never kill running clawg.exe processes. Stage by explicit path. No AI attribution in commits.
   verify:

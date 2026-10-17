@@ -74,6 +74,7 @@ MCP tools (`crates/clawg-cli/src/mcp/server.rs`): `save_memory`, `search_memory`
 - `docs/migration-plan.md` is a working log and is NEVER committed. Stage by explicit path; never `git add -A`, `git add .` or `git add -u`.
 - Do not run release builds, installs, or touch the real data profiles (`~/.clawg*`) without explicit authorization.
 - Do not kill running `clawg.exe` processes; they may be the editor's own MCP.
+- Before testing a new version, clean the old builds out of the test build directory, and end every task with no build directory other than `target` and `target-test` (Build directories, under Testing).
 
 ## Versioning
 
@@ -94,7 +95,7 @@ The bar is that the whole suite passes. Never record how many tests it has (in t
 
 CI (`.github/workflows/ci.yml`) runs clippy and the suite on Linux and Windows for every pull request and every push to `main`.
 
-On Windows, live `clawg.exe` processes (for example the editor's MCP bridge) lock `target\debug\clawg.exe` and make the build fail. Use a separate target directory instead: `cargo test --workspace --target-dir <other-dir>`.
+On Windows, live `clawg.exe` processes (for example the editor's MCP bridge) lock `target\debug\clawg.exe` and make the build fail. There the suite and clippy run in `target-test` instead: `cargo test --workspace --target-dir target-test`. See Build directories below for when it is cleaned.
 
 Compiler warnings, `dead_code` and `unused` among them, are errors here (clippy's own lints are not enforced yet):
 
@@ -107,6 +108,16 @@ cargo clippy --workspace --all-targets -- -A clippy::all -D warnings
 What the model sees of the MCP server (each tool's name, description and input schema, and the instructions) is pinned in `crates/clawg-cli/src/mcp/agent_contract.json`. When a change to it is intended, run `CLAWG_BLESS=1 cargo test -p clawg-cli the_agent_contract_matches_its_file`: it rewrites the file and fails, so review the diff and run the tests again. The `MCP tools` line above is checked against the registered tools.
 
 A ranking change is compared with the baseline by `cargo run -p clawg-eval --bin rag-eval -- --diff <before.json> <after.json>`. Every metric carries the exact paired p-value of the cases that moved (and MRR, nDCG and tokens a bootstrap interval of the mean change); the primary metrics are `recall@5` and, between two `--agent-view` runs, `search.found`. With the 46-case set a conclusion needs at least 6 cases moving one way; fewer is "not distinguishable", never "no difference". `--fail-on-regression` exits 6 when a primary metric gets worse at p < 0.05. When the golden cases carry `query_lang`, every block is also cut by the language pair of query and row (`es>en`, …), over the cases with that pair in both files: a change that touches retrieval across languages is read there, and the pair rows stay informative, outside the verdict and `--fail-on-regression`. Choose a new constant reading `by_split.calibration` and report `by_split.test`; `--lexical-only` gives the bm25-only floor to compare against.
+
+### Build directories
+
+Cargo never removes an old artifact from a target directory. Every version bump, branch or worktree with other sources, feature set or toolchain leaves a new set of the workspace's test binaries beside the previous ones, so a directory that is only ever reused grows past 100 GB. Most of that weight is the workspace's own crates, not its dependencies.
+
+- Tests and clippy use one directory: `target`, or `target-test` on Windows. Never create another one (`target-apply`, `target/verify-win`, a directory outside the repository).
+- Before testing a new version (another branch or openspec change, a version bump, another worktree's sources), remove the workspace's old artifacts and keep the dependencies: `cargo clean --workspace --target-dir target-test`. After `rustup update` or a dependency change in `Cargo.lock`, empty it: `cargo clean --target-dir target-test`. Within one change's TDD loop the directory is reused, not cleaned.
+- On Windows, `target` is cleaned only when no `clawg.exe` built there is running; never stop one to clean it.
+- A directory a one-off comparison needs (a worktree arm, a baseline build) is deleted, with its worktree, by the task that made it.
+- A task ends with no build directory other than `target` and `target-test`.
 
 ## Claude Code
 
