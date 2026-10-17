@@ -160,6 +160,14 @@ pub enum SharingAction {
     Unhide(Exclusion),
 }
 
+impl Command {
+    /// Whether this process will load the embedding model, and so has to set up
+    /// the allocator for it before the runtime starts any thread.
+    pub fn loads_the_model(&self) -> bool {
+        matches!(self, Command::Serve { .. })
+    }
+}
+
 impl SharingAction {
     /// The `--profile` the action was given, if any.
     pub fn profile(&self) -> &ProfileArg {
@@ -464,6 +472,21 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).expect("parse")
+    }
+
+    #[test]
+    fn only_serve_loads_the_model() {
+        assert!(parse(&["clawg", "serve"]).command.loads_the_model());
+        for args in [
+            &["clawg", "mcp"][..],
+            &["clawg", "status"],
+            &["clawg", "stop"],
+            &["clawg", "backup"],
+            &["clawg", "doctor"],
+            &["clawg", "memories", "stats"],
+        ] {
+            assert!(!parse(args).command.loads_the_model(), "{args:?}");
+        }
     }
 
     #[test]

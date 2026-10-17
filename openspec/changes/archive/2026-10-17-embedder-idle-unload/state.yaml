@@ -1,0 +1,15 @@
+change: embedder-idle-unload
+objective: "transversal"
+depends_on: []
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done  # revisada por D5
+  spec: done  # R7 reescrito y con la arena de D6; R8 nuevo; R9 nuevo y con el sistema en la huella
+  design: done  # D5: un solo tokenizer por proceso; D6: una sola arena de malloc en Linux
+  tasks: done  # secciones 6 a 10 para D5, 11 para D6
+  apply: done  # secciones 1 a 9 y 11
+  verify: done  # R7 en Windows y en Linux (con D6), R9 con el modelo en las dos
+  archive: done
+main_spec: openspec/specs/storage/spec.md
+updated: 2026-10-17
