@@ -26,9 +26,12 @@ const DIMENSIONS: usize = 384;
 const TOLERANCE: f32 = 1e-6;
 
 /// What decides which kernels ONNX Runtime picks, so whether another machine
-/// can be expected to give the same bits.
+/// can be expected to give the same bits. The system counts too: ONNX Runtime
+/// is built apart for each one, and on Linux a CPU with the same features as
+/// the Windows one that made the fixture moved the last bits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Cpu {
+    os: String,
     arch: String,
     avx2: bool,
     avx512f: bool,
@@ -52,6 +55,7 @@ fn comparison_for(fixture: &Cpu, this: &Cpu) -> Comparison {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn this_cpu() -> Cpu {
     Cpu {
+        os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
         avx2: is_x86_feature_detected!("avx2"),
         avx512f: is_x86_feature_detected!("avx512f"),
@@ -61,7 +65,13 @@ fn this_cpu() -> Cpu {
 
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 fn this_cpu() -> Cpu {
-    Cpu { arch: std::env::consts::ARCH.to_string(), avx2: false, avx512f: false, fma: false }
+    Cpu {
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        avx2: false,
+        avx512f: false,
+        fma: false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,7 +123,7 @@ fn max_difference(expected: &[u32], actual: &[f32]) -> f32 {
 
 #[test]
 fn the_comparison_is_by_bits_only_on_the_cpu_that_made_the_fixture() {
-    let fixture = Cpu { arch: "x86_64".into(), avx2: true, avx512f: true, fma: true };
+    let fixture = Cpu { os: "windows".into(), arch: "x86_64".into(), avx2: true, avx512f: true, fma: true };
     assert_eq!(comparison_for(&fixture, &fixture.clone()), Comparison::ExactBits);
 
     let no_avx512 = Cpu { avx512f: false, ..fixture.clone() };
@@ -127,6 +137,9 @@ fn the_comparison_is_by_bits_only_on_the_cpu_that_made_the_fixture() {
 
     let other_arch = Cpu { arch: "aarch64".into(), ..fixture.clone() };
     assert_eq!(comparison_for(&fixture, &other_arch), Comparison::MaxDifference(TOLERANCE));
+
+    let other_os = Cpu { os: "linux".into(), ..fixture.clone() };
+    assert_eq!(comparison_for(&fixture, &other_os), Comparison::MaxDifference(TOLERANCE));
 }
 
 #[test]

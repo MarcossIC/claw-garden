@@ -582,6 +582,30 @@ fn return_freed_memory() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn return_freed_memory() {}
 
+/// Keeps every thread of the process on glibc's main malloc arena. Each load
+/// builds, runs and drops the session on threads that are new to it, and each
+/// new thread can open another arena; measured on Linux, every arena kept 6 to
+/// 24 MB after [`return_freed_memory`], so the idle daemon grew with each
+/// reload until glibc ran out of arenas. With one arena it stayed flat, 7 MB
+/// over the daemon without a model, at the same speed.
+///
+/// glibc gives a thread its arena on its first allocation, so this has to run
+/// before the process starts any other thread.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn keep_one_malloc_arena() {
+    const M_ARENA_MAX: std::ffi::c_int = -8;
+    extern "C" {
+        fn mallopt(param: std::ffi::c_int, value: std::ffi::c_int) -> std::ffi::c_int;
+    }
+    // SAFETY: mallopt only sets an allocator tunable and takes no pointers.
+    unsafe {
+        mallopt(M_ARENA_MAX, 1);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub fn keep_one_malloc_arena() {}
+
 #[cfg(test)]
 impl E5Embedder {
     /// Test-only constructor: take a pre-wired request sender connected to a
