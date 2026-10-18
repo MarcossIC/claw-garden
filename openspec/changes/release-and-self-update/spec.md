@@ -15,16 +15,17 @@ No existe `specs/update`: esa es la de `update_memory` y no se toca. Nada de lo 
 - **Release:** un release de GitHub del repositorio, no borrador ni prerelease, con un tag `vX.Y.Z`.
 - **Binario instalado:** el `clawg` que corre `clawg update`.
 - **Marca de distribución:** la constante de compilación `CLAWG_DIST_TARGET=<triple>`; sólo la ponen los builds de `release.yml`. Un `cargo build --release` local no la tiene.
-- **Lista de claves:** las claves públicas minisign que el binario acepta, embebidas en él.
+- **Lista de claves:** las claves públicas minisign que el binario acepta, embebidas en él. En producción son dos: la clave primaria (su mitad privada está en el environment `release`) y la clave de respaldo (su mitad privada está fuera de GitHub).
+- **Sello de prueba:** un JSON al final de una copia del binario de prueba (versión, triple de distribución, migraciones que conoce y falla simulada del daemon), que sólo lee un build con la feature `testing`.
 - **Daemon:** el proceso `clawg serve` del perfil `prod`.
 - **Candidato:** el binario nuevo bajado y preparado junto al destino, todavía sin instalar.
 - **Intercambio:** el paso que renombra el binario instalado a `.old-*` y pone el candidato en su lugar.
 
-Estado actual que estos requisitos cambian (verificado contra `e13dca7`):
+Estado actual que estos requisitos cambian (verificado contra `9616854`, versión `0.19.0`):
 
 - `license` y `repository` están vacíos y `authors` nombra a una persona (`Cargo.toml:7-9`); `reqwest` usa sus features por defecto (`Cargo.toml:19`); el único workflow es `ci.yml`.
 - El binario sólo distingue debug de release (`Profile::compiled_default`, `crates/clawg-core/src/paths.rs:60-66`) y compara versiones por igualdad, sólo en `clawg memories` (`version_warning`, `crates/clawg-cli/src/memories.rs:332-338`).
-- `install.ps1` para el daemon, renombra el binario a `.old-*` y no vuelve a levantar nada (`scripts/install.ps1:174-211`); un puente abierto nunca arranca un daemon (`ClientHandle::reresolve`, `crates/clawg-cli/src/mcp/startup.rs:96-102`) y el autoarranque lanza `current_exe()` (`ProcessSpawner::spawn_serve`, `crates/clawg-cli/src/client.rs:979-982`).
+- `install.ps1` para el daemon, renombra el binario a `.old-*` y no vuelve a levantar nada (`scripts/install.ps1:174-211`); un puente abierto nunca arranca un daemon (`ClientHandle::reresolve`, `crates/clawg-cli/src/mcp/startup.rs:96-106`) y el autoarranque lanza `current_exe()` (`ProcessSpawner::spawn_serve`, `crates/clawg-cli/src/client.rs:979-982`).
 
 ---
 
@@ -75,9 +76,9 @@ El repositorio MUST llevar un `LICENSE` MIT cuyo titular es «The Claw Garden co
 `release.yml` MUST dispararse por `workflow_run` de `CI` y publicar sólo si `event == 'push'`, `conclusion == 'success'` y `head_branch == 'main'`, y la versión de `[workspace.package]` leída en el `head_sha` de esa ejecución no tiene tag `vX.Y.Z`. MUST etiquetar ese `head_sha`. La ejecución de CI de un pull request, aun desde un fork con una rama llamada `main`, MUST NOT publicar. Si el tag ya existe, el workflow MUST terminar sin publicar ni fallar.
 
 #### Escenario: bump en main
-- GIVEN una CI exitosa por push a `main` cuyo `Cargo.toml` dice `0.19.0` y sin tag `v0.19.0`
+- GIVEN una CI exitosa por push a `main` cuyo `Cargo.toml` dice `X.Y.Z` y sin tag `vX.Y.Z`
 - WHEN corre `release.yml`
-- THEN publica `v0.19.0` sobre ese `head_sha`
+- THEN publica `vX.Y.Z` sobre ese `head_sha`
 
 #### Escenario: pull request de un fork
 - GIVEN una CI exitosa con `event == 'pull_request'` y `head_branch == 'main'`
@@ -109,28 +110,35 @@ Cada release MUST llevar exactamente `clawg-x86_64-pc-windows-msvc.exe`, `clawg-
 
 ## R6. Firma y claves
 
-`SHA256SUMS` MUST firmarse con minisign usando una clave privada y su contraseña guardadas como secretos del environment `release`, limitado a `main`, sin revisores obligatorios. La clave pública correspondiente MUST estar commiteada y MUST estar en la lista de claves. El workflow MUST verificar su propia firma (`minisign -Vm SHA256SUMS`) con la clave del repositorio antes de publicar. La lista de claves MUST admitir más de una clave desde el primer día y MUST NOT contener la clave de prueba.
+`SHA256SUMS` MUST firmarse con minisign usando una clave privada cifrada con contraseña; la clave y la contraseña son secretos del environment `release`, limitado a `main`, sin revisores obligatorios. El paso de firma MUST pasar la contraseña por la entrada estándar (`printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S -s <clave> -t "clawg vX.Y.Z SHA256SUMS" -m SHA256SUMS`), nunca como argumento, y MUST NOT imprimirla ni activar la traza de la shell; los secretos MUST llegar sólo como `env` de ese paso, y GitHub enmascara sus valores en los registros.
+
+La lista de claves MUST contener, desde el primer release, dos claves públicas commiteadas: la primaria, cuya mitad privada es la del environment `release`, y una de respaldo, cuya mitad privada se guarda fuera de GitHub y MUST NOT estar en el repositorio ni en la CI. Ambas MUST estar embebidas en el binario. El respaldo permite seguir publicando firmado si se pierde la primaria: los binarios instalados aceptan los releases nuevos. No protege de una filtración a los binarios que no se actualicen: siguen aceptando la clave filtrada hasta instalar un release cuya lista ya no la tenga, y la documentación MUST decirlo. El workflow MUST verificar su propia firma (`minisign -Vm SHA256SUMS`) con la clave primaria del repositorio antes de publicar. La lista MUST NOT contener la clave de prueba.
 
 #### Escenario: firma verificada antes de publicar
 - GIVEN `SHA256SUMS` y `SHA256SUMS.minisig` recién generados
 - WHEN el workflow verifica con la clave del repositorio
 - THEN pasa, y sólo entonces se crea el release
 
-#### Escenario: clave de prueba fuera de la lista
+#### Escenario: la contraseña no se filtra al registro
+- GIVEN el paso de firma del workflow
+- WHEN el test lee `release.yml`
+- THEN la contraseña llega por `env` y por entrada estándar, sin `set -x` ni `echo` del secreto, y ni la clave ni la contraseña se declaran fuera de ese paso
+
+#### Escenario: las dos claves y no la de prueba
 - GIVEN la lista de claves embebida
 - WHEN el test la compara con la clave de prueba de la suite
-- THEN no la contiene, y contiene la clave pública del repositorio
+- THEN contiene la clave primaria y la de respaldo del repositorio, y no contiene la de prueba
 
-**Pruebas:** `the_embedded_key_list_has_the_repository_key_and_not_the_test_key` (convención, medida 9 de la propuesta); la verificación con `minisign`, en el workflow, fuera de la suite.
+**Pruebas:** `the_embedded_key_list_has_the_primary_and_backup_keys_and_not_the_test_key` (convención, medida 9 de la propuesta); `the_signing_step_reads_the_key_password_from_stdin_without_echo` (convención sobre `release.yml`); la verificación con `minisign`, en el workflow, fuera de la suite.
 
 ## R7. Verificación en el workflow
 
 Antes de publicar, el workflow MUST ejecutar el binario de cada plataforma y comprobar que `--version` responde la versión del tag. Las acciones de terceros MUST fijarse por SHA de commit. La clave privada MUST NOT estar disponible para jobs que no firman.
 
 #### Escenario: versión del tag
-- GIVEN el binario construido para el tag `v0.19.0`
+- GIVEN el binario construido para el tag `vX.Y.Z`
 - WHEN el paso de humo corre `--version`
-- THEN la salida contiene `0.19.0`; si no, el workflow falla antes de publicar
+- THEN la salida contiene `X.Y.Z`; si no, el workflow falla antes de publicar
 
 **Pruebas:** `third_party_actions_are_pinned_to_a_commit` (convención sobre `release.yml`); el humo `--version`, en el workflow, fuera de la suite.
 
@@ -163,7 +171,7 @@ Si falta el VC++ Redistributable, `install.ps1` MUST decirlo con el enlace ofici
 
 ## R10. Documentación
 
-El README MUST traer la instalación en una línea, cómo verificar lo bajado (`minisign` con la clave del repositorio), la glibc mínima de Linux, SmartScreen y Smart App Control, qué pasa con una clave comprometida, y «Actualizar» con la vuelta atrás a mano. `.claude/CLAUDE.md` MUST describir el flujo de Versioning y de CI con el release, y listar `update` en Commands.
+El README MUST traer la instalación en una línea, cómo verificar lo bajado (`minisign` con la clave del repositorio), la glibc mínima de Linux, SmartScreen y Smart App Control, qué pasa con una clave comprometida (incluido que el respaldo no protege a los binarios que no se actualicen), y «Actualizar» con la vuelta atrás a mano. `.claude/CLAUDE.md` MUST describir el flujo de Versioning y de CI con el release, y listar `update` en Commands.
 
 #### Escenario: README completo
 - GIVEN el README
@@ -234,12 +242,17 @@ El analizador de `SHA256SUMS` MUST rechazar una línea faltante para el asset, u
 
 ## S5. Firma
 
-`update` MUST verificar la firma minisign de `SHA256SUMS` con alguna clave de la lista (`minisign-verify`, la única dependencia nueva) antes de confiar en un hash. MUST fallar para una clave fuera de la lista, un `SHA256SUMS` alterado y un `.minisig` de otro archivo.
+`update` MUST verificar la firma minisign de `SHA256SUMS` con alguna clave de la lista (`minisign-verify`, con `allow_legacy = false`) antes de confiar en un hash. `minisign-verify` es la única dependencia directa nueva de runtime; el cambio de TLS (R2) suma `rustls-native-certs`, ausente hoy de `Cargo.lock`, y deja rustls, ring, hyper-rustls y tokio-rustls dentro del binario, y las pruebas suman la dev-dependency `minisign` (con ct-codecs, scrypt y rpassword). MUST fallar para una clave fuera de la lista, un `SHA256SUMS` alterado, un `.minisig` de otro archivo y una firma legada.
 
 #### Escenario: firma válida con la segunda clave
 - GIVEN una lista de dos claves y un archivo firmado con la segunda
 - WHEN se verifica
 - THEN pasa
+
+#### Escenario: firma prehashed del firmante de pruebas
+- GIVEN un archivo firmado con la dev-dependency `minisign` en modo *prehashed*
+- WHEN se verifica con `allow_legacy = false`
+- THEN pasa; y una firma legada del mismo archivo falla
 
 #### Escenario: firma que no vale
 - GIVEN un archivo firmado con una clave fuera de la lista, un archivo alterado, o el `.minisig` de otro archivo
@@ -250,12 +263,12 @@ El analizador de `SHA256SUMS` MUST rechazar una línea faltante para el asset, u
 
 ## S6. Sólo a pedido
 
-El daemon MUST NOT consultar nada por su cuenta. Sólo `clawg update` y `clawg update --check` MUST tocar la red. Las peticiones MUST mandar `User-Agent`. `--check` MUST NOT descargar el binario ni modificar nada, y sus códigos de salida MUST distinguir «hay una versión nueva», «al día» y «error» (los números concretos los fija el diseño).
+El daemon MUST NOT consultar nada por su cuenta. Sólo `clawg update` y `clawg update --check` MUST tocar la red. Las peticiones MUST mandar `User-Agent`. `--check` MUST NOT descargar el binario ni modificar nada, y sus códigos de salida MUST ser `0` si está al día, `100` si hay una versión nueva (que nombra en stdout) y `1` si hay un error o una negativa (S2). El `2` queda para los errores de uso de clap.
 
 #### Escenario: `--check` con y sin versión nueva
 - GIVEN un servidor de release falso con claves de prueba
-- WHEN corre `clawg update --check` primero con una versión mayor y luego con la misma
-- THEN los dos códigos de salida son distintos y distintos del de error, y el binario instalado no cambia
+- WHEN corre `clawg update --check` primero con una versión mayor, luego con la misma y luego con el servidor caído
+- THEN los códigos de salida son `100`, `0` y `1`, y el binario instalado no cambia
 
 **Test:** `update_check_reports_a_newer_version_and_an_up_to_date_one` en `crates/clawg-cli/tests/binary.rs`; que las peticiones llevan `User-Agent`, en un test del cliente contra el servidor falso.
 
@@ -277,7 +290,7 @@ Antes del intercambio `update` MUST: bajar el candidato junto al destino, verifi
 
 ## S8. Plan e intercambio
 
-El plan de `update` MUST ser una lista de pasos como datos, ejecutada aparte, de modo que el orden y la deshecha de cada falla se prueben sin disco ni red. Con daemon, el orden MUST ser: parar el daemon con el binario instalado (`stop_in`, `crates/clawg-cli/src/stop.rs:23`); renombrar el binario a `.old-*`; poner el candidato; arrancar el daemon nuevo por su ruta explícita (no por `ProcessSpawner`, que lanza `current_exe()`, `client.rs:979-982`); esperar `/health`. Sin daemon, `update` MUST NOT arrancar uno. Al empezar, MUST borrar los `.old-*` de corridas anteriores. Si un editor abre un puente entre la parada y el arranque, `update` MUST confirmar la versión del daemon que contesta e informarla. Dos `update` a la vez MUST NOT intercambiar a la vez: el segundo falla con un error claro (el mecanismo lo fija el diseño).
+El plan de `update` MUST ser una lista de pasos como datos, ejecutada aparte, de modo que el orden y la deshecha de cada falla se prueben sin disco ni red. Con daemon, el orden MUST ser: parar el daemon con el binario instalado (`stop_in`, `crates/clawg-cli/src/stop.rs:23`); renombrar el binario a `.old-*`; poner el candidato; arrancar el daemon nuevo por su ruta explícita (no por `ProcessSpawner`, que lanza `current_exe()`, `client.rs:979-982`); esperar `/health`. Sin daemon, `update` MUST NOT arrancar uno. Al empezar, MUST borrar los `.old-*` de corridas anteriores. Si un editor abre un puente entre la parada y el arranque, `update` MUST confirmar la versión del daemon que contesta e informarla. En Linux el binario instalado también se aparta a `.old-*` antes de poner el candidato: no se reemplaza en el lugar. Dos `update` a la vez MUST NOT intercambiar a la vez: un cerrojo exclusivo del sistema sobre `<data>/update.lock` hace que el segundo falle con un error claro.
 
 #### Escenario: actualización completa con daemon
 - GIVEN un daemon corriendo y un servidor de release falso con una versión mayor
@@ -294,25 +307,28 @@ El plan de `update` MUST ser una lista de pasos como datos, ejecutada aparte, de
 - WHEN arranca otro
 - THEN el segundo falla con un error claro y no toca el binario
 
-**Pruebas:** `a_full_update_with_a_daemon_replaces_the_binary_and_a_bridge_reaches_the_new_daemon` en `binary.rs` (parte del escenario de `binary.rs:535` con el binario reemplazado); `update_without_a_daemon_does_not_start_one` (plan); `plan_order_with_and_without_daemon` (plan); `two_updates_do_not_swap_at_once` (puro o binario, según el diseño).
+**Pruebas:** `a_full_update_with_a_daemon_replaces_the_binary_and_a_bridge_reaches_the_new_daemon` en `binary.rs` (parte del escenario de `binary.rs:535` con el binario reemplazado); `update_without_a_daemon_does_not_start_one` (plan); `plan_order_with_and_without_daemon` (plan); `two_updates_do_not_swap_at_once` (sobre el cerrojo, en un test de la unidad que lo toma).
 
 ## S9. Vuelta atrás tras el intercambio
 
-Si el daemon nuevo no contesta `/health` con la versión nueva en el plazo, `update` MUST devolver el binario viejo a su nombre y volver a levantar su daemon; el plazo MUST distinguir «arrancando» (migración o re-embed largos) de «no arrancó». Si el daemon nuevo alcanzó a migrar el store y el binario viejo se niega (`MemoryError::SchemaNewer`, `crates/clawg-core/src/memory/error.rs:54-58`), `update` MUST resolverlo de una de dos maneras, y el diseño decide cuál: restaurar el snapshot `pre-migration` en el acto (`restore` guarda antes el store reemplazado, así que nada se destruye), o dejar el binario nuevo y decir cómo volver. Ambas satisfacen este requisito siempre que se cumpla S10. Un candidato que no arranca MUST dejar el binario viejo y su daemon.
-
-*Decidido en `design.md`: cuál de las dos opciones de vuelta atrás tras una migración.*
+Si el daemon nuevo no contesta `/health` con la versión nueva en el plazo, `update` MUST devolver el binario viejo a su nombre y volver a levantar su daemon; el plazo MUST distinguir «arrancando» (migración o re-embed largos) de «no arrancó». Si el daemon nuevo alcanzó a migrar el store y el binario viejo se niega a abrirlo (`MemoryError::SchemaNewer` o `SchemaDiverged`, `crates/clawg-core/src/memory/error.rs:53-64`), `update` MUST restaurar en el acto el snapshot `pre-migration` que escribió ese arranque, con `clawg_core::memory::backup::restore` llamado desde el propio proceso de `update` (el binario viejo), y después devolver el binario viejo y arrancar su daemon. `restore` guarda antes el store migrado como `pre-restore`, así que nada se destruye. Si el restore falla, `update` MUST dejar el binario nuevo, el único que abre ese store, y el informe MUST dar la causa del arranque, la del restore, dónde está cada archivo y los comandos para volver a mano (D2). Un candidato que no arranca y no migró MUST dejar el binario viejo y su daemon.
 
 #### Escenario: el nuevo no arranca
 - GIVEN un candidato que no levanta el daemon
 - WHEN corre `update` con daemon previo
 - THEN vuelven el binario viejo y su daemon, `/health` contesta la versión vieja y `update` sale con error
 
-#### Escenario: el nuevo migró y el viejo se niega
+#### Escenario: el nuevo migró y el viejo se niega, el restore funciona
 - GIVEN un daemon nuevo que migró el store y deja de contestar
-- WHEN el binario viejo vuelve y se niega por `SchemaNewer`
-- THEN el usuario queda en una de las dos situaciones permitidas, con un mensaje que lo explica y el comando de vuelta
+- WHEN el binario viejo se niega a abrir el store migrado y el restore del `pre-migration` termina bien
+- THEN vuelven el binario viejo y su daemon con los datos de antes de la migración, el store migrado queda como `pre-restore` y `update` sale con error explicando la causa
 
-**Pruebas:** `a_new_binary_that_does_not_start_brings_the_old_one_and_its_daemon_back` en `binary.rs`; `each_failed_step_undoes_what_it_did` (plan).
+#### Escenario: el nuevo migró y el restore falla
+- GIVEN el mismo caso, pero el restore falla
+- WHEN `update` no puede devolver el store
+- THEN queda el binario nuevo, el store migrado intacto, y el informe da la causa del arranque, la del restore, las rutas del `.old-*`, del `pre-migration` y del `pre-restore`, y los comandos a mano
+
+**Pruebas:** `a_new_binary_that_does_not_start_brings_the_old_one_and_its_daemon_back` y `a_new_binary_that_migrated_and_failed_gets_its_pre_migration_restored` en `binary.rs`; `each_failed_step_undoes_what_it_did` y `a_failed_restore_leaves_the_new_binary_and_explains_the_way_back` (plan); `restoring_over_a_store_migrated_by_a_newer_version_keeps_it_as_pre_restore` en `backup.rs` (D2).
 
 ## S10. Garantías de datos
 
@@ -322,26 +338,26 @@ Si el daemon nuevo no contesta `/health` con la versión nueva en el plazo, `upd
 2. Después del intercambio, o contesta `/health` con la versión nueva el daemon nuevo, o vuelven el binario viejo y su daemon, o (S9) el usuario queda en una situación explicada con un camino de vuelta.
 3. El usuario MUST NOT quedar sin daemon y sin saber por qué.
 4. `update` MUST NOT borrar un `.old-*` ni un snapshot de la corrida en curso.
-5. Un store con migraciones pendientes MUST dejar su `pre-migration` en `<data>/backups` (`crates/clawg-core/src/memory/db.rs:207-213`) y sus datos MUST seguir alcanzables. Un store de un clawg más nuevo MUST hacer que el daemon nuevo se niegue sin tocarlo, y el usuario queda con el binario anterior y su daemon.
+5. Un store con migraciones pendientes MUST dejar su `pre-migration` en `<data>/backups` (`crates/clawg-core/src/memory/db.rs:207-217`) y sus datos MUST seguir alcanzables. Un candidato cuyo daemon se niega a abrir el store (esquema más nuevo o migración divergente para el candidato, `db.rs:388-398`) MUST dejar el store sin tocar, y el usuario queda con el binario anterior y su daemon. Con releases ordenados por versión ese caso no ocurre de verdad (un store más nuevo que el candidato lo es también del binario viejo, y entonces no habría daemon viejo corriendo); se reproduce con el sello de prueba (`migrations_up_to`).
 
 #### Escenario: migración pendiente
 - GIVEN una base sembrada en la versión anterior con una migración pendiente
 - WHEN el daemon nuevo la abre tras `update`
 - THEN existe el snapshot `pre-migration` y los datos siguen alcanzables por búsqueda
 
-#### Escenario: store de un clawg más nuevo
-- GIVEN un store con esquema mayor que el del candidato
+#### Escenario: candidato cuyo daemon se niega a abrir el store
+- GIVEN un store al día para el binario instalado y un candidato que, por su sello de prueba, conoce menos migraciones que las del store
 - WHEN corre `update`
-- THEN el daemon nuevo se niega sin tocarlo, y el usuario queda con el binario anterior y su daemon respondiendo
+- THEN el daemon nuevo se niega sin tocar el store, no se escribe ningún snapshot nuevo, vuelven el binario viejo y su daemon respondiendo, y el informe dice por qué
 
-**Pruebas:** `an_update_over_a_pending_migration_leaves_a_pre_migration_snapshot_and_the_data` y `an_update_over_a_newer_store_leaves_the_old_binary_and_its_daemon` en `binary.rs`, con la base sembrada en la versión anterior (regla de `openspec/config.yaml` para cambios que tocan el esquema). Prerrequisito ya fusionado: `to_prune` conserva el `pre-migration` más nuevo (`crates/clawg-core/src/memory/backup.rs:238-259`, 0.18.1), con su test.
+**Pruebas:** `an_update_over_a_pending_migration_leaves_a_pre_migration_snapshot_and_the_data` y `an_update_whose_candidate_refuses_the_store_leaves_the_old_binary_and_its_daemon` en `binary.rs`, con la base sembrada en la versión anterior (regla de `openspec/config.yaml` para cambios que tocan el esquema). Prerrequisito ya fusionado: `to_prune` conserva el `pre-migration` más nuevo (`crates/clawg-core/src/memory/backup.rs:238-259`, 0.18.1), con su test.
 
 ## S11. Informe
 
 Al terminar bien, `update` MUST informar la versión anterior y la nueva, el snapshot `pre-migration` si se escribió (su ruta), que volver atrás pierde lo escrito después de él, y que los editores abiertos siguen con el puente viejo hasta reiniciarse. Un `update` fallido MUST decir en qué estado dejó la instalación y el daemon.
 
 #### Escenario: informe de éxito
-- GIVEN una actualización completa de `0.18.1` a `0.19.0` con migración
+- GIVEN una actualización completa de una versión a otra mayor, con migración
 - WHEN termina
 - THEN la salida contiene ambas versiones, la ruta del `pre-migration` y el aviso de reinicio de los editores
 
@@ -349,14 +365,19 @@ Al terminar bien, `update` MUST informar la versión anterior y la nueva, el sna
 
 ## S12. Sustitución sólo en builds de test
 
-La URL base del servidor de releases y la lista de claves MUST poder sustituirse sólo en un build con la feature `testing`, con la regla de `CLAWG_TEST_HOME` (`crates/clawg-core/src/paths.rs:169`): un build sin `testing` MUST NOT leer esas variables, y la lista embebida de producción MUST NOT contener la clave de prueba. Ningún test MUST tocar `~/.clawg*` ni la red real.
+La URL base del servidor de releases y la lista de claves MUST poder sustituirse sólo en un build con la feature `testing`, con la regla de `CLAWG_TEST_HOME` (`crates/clawg-core/src/paths.rs:169`): un build sin `testing` MUST NOT leer esas variables, y la lista embebida de producción MUST NOT contener la clave de prueba. El sello de prueba (versión, triple de distribución, migraciones que conoce y falla simulada del daemon) MUST leerse sólo en un build con `testing`; en uno sin `testing` un sello al final del archivo MUST NOT cambiar nada. Ningún test MUST tocar `~/.clawg*` ni la red real.
 
 #### Escenario: build de producción
 - GIVEN un build sin `testing`
 - WHEN las variables de sustitución están puestas
 - THEN `update` usa la URL de GitHub y la lista embebida
 
-**Pruebas:** `only_dev_dependencies_turn_on_the_test_stand_ins` (ya existe, `conventions.rs`) más `the_embedded_key_list_has_the_repository_key_and_not_the_test_key` (R6, medida 9); `update_overrides_are_read_only_in_a_test_build` (puro, con `cfg`).
+#### Escenario: bytes finales en un ejecutable
+- GIVEN una copia del binario de prueba con un sello al final, en Windows (PE) y en Linux (ELF)
+- WHEN se ejecuta
+- THEN se comporta igual que sin el sello, y un build con `testing` lee la versión del sello
+
+**Pruebas:** `only_dev_dependencies_turn_on_the_test_stand_ins` (ya existe, `conventions.rs`) más `the_embedded_key_list_has_the_primary_and_backup_keys_and_not_the_test_key` (R6, medida 9); `update_overrides_are_read_only_in_a_test_build` (puro, con `cfg`). Entre los primeros tests en rojo: `trailing_bytes_after_the_executable_image_do_not_change_execution` en `binary.rs` (corre en las dos plataformas de CI) y el de firma *prehashed* con `allow_legacy = false` de S5 (`signature_cases`).
 
 ---
 
