@@ -393,14 +393,84 @@ fn the_release_workflow_builds_only_the_cli_with_the_dist_mark() {
         .iter()
         .find(|s| s.iter().any(|l| l.contains("--version")))
         .expect("a step runs the built binary with --version");
-    let smoke = smoke.join("
-");
+    let smoke = smoke.join("\n");
     assert!(smoke.contains("clawg ${VERSION}"), "the smoke test compares with the planned version");
     assert!(smoke.contains("CLAWG_TEST_"), "the smoke test looks for the test stand-ins in the binary");
 
     let linkage = steps.iter().find(|s| s.iter().any(|l| l.contains("ldd"))).expect("a step runs ldd");
-    let linkage = linkage.join("
-");
+    let linkage = linkage.join("\n");
     assert!(linkage.contains("libssl") && linkage.contains("libcrypto"));
     assert!(linkage.contains("runner.os == 'Linux'"));
+}
+
+#[test]
+fn the_release_workflow_publishes_last() {
+    let lines = workflow_code("release.yml");
+    let jobs = jobs_of(&lines);
+    let publish = job(&jobs, "publish");
+
+    let needs = publish.key("needs").expect("publish waits for other jobs");
+    assert!(needs.contains("plan") && needs.contains("build"), "publish needs plan and build: {needs}");
+    assert!(publish.key("if").is_some_and(|c| c.contains("needs.plan.outputs.publish == 'true'")));
+
+    let only_in_publish = |needle: &str| {
+        for other in jobs.iter().filter(|j| j.name != "publish") {
+            assert!(!other.text().contains(needle), "`{needle}` appears in job `{}`", other.name);
+        }
+    };
+    only_in_publish("gh release create");
+    only_in_publish("environment:");
+    only_in_publish("contents: write");
+    only_in_publish("id-token: write");
+    only_in_publish("attestations: write");
+    only_in_publish("secrets.");
+    assert_eq!(publish.key("environment").as_deref(), Some("release"));
+
+    let text = publish.text();
+    assert!(text.contains("gh release create"));
+    assert!(text.contains("--target ${TARGET_SHA}") && text.contains("TARGET_SHA: ${{ github.event.workflow_run.head_sha }}"));
+    for asset in [
+        "dist/clawg-x86_64-pc-windows-msvc.exe",
+        "dist/clawg-x86_64-unknown-linux-gnu",
+        "dist/install.ps1",
+        "dist/SHA256SUMS",
+        "dist/SHA256SUMS.minisig",
+    ] {
+        let uploads = text.lines().filter(|l| l.trim().trim_end_matches('\\').trim() == asset).count();
+        assert!(uploads >= 2, "`{asset}` must be attested and uploaded; found {uploads}");
+    }
+
+    let position = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("publish lacks `{needle}`"));
+    assert!(position("minisign -S") < position("minisign -Vm dist/SHA256SUMS -p release/minisign.pub"));
+    assert!(position("minisign -Vm") < position("actions/attest-build-provenance"));
+    assert!(position("actions/attest-build-provenance") < position("gh release create"));
+}
+
+#[test]
+fn the_signing_step_reads_the_key_password_from_stdin_without_echo() {
+    let lines = workflow_code("release.yml");
+    assert!(!lines.iter().any(|l| l.contains("set -x") || l.contains("xtrace")), "the shell trace would print secrets");
+
+    let jobs = jobs_of(&lines);
+    let publish = job(&jobs, "publish");
+    let steps = publish.steps();
+    let signing = steps.iter().find(|s| s.iter().any(|l| l.contains("minisign -S"))).expect("a step signs");
+
+    let pipe = "printf '%s\\n' \"$MINISIGN_PASSWORD\" | minisign -S -s \"$key\" -t \"clawg v${VERSION} SHA256SUMS\" -m SHA256SUMS";
+    assert!(signing.iter().any(|l| l.trim() == pipe), "the password goes in on stdin: {signing:?}");
+    assert!(!signing.iter().any(|l| l.split_whitespace().any(|w| w == "-W")), "-W would sign without a password");
+    assert_eq!(signing.iter().filter(|l| l.contains("$MINISIGN_PASSWORD")).count(), 1, "the password is used once, on stdin");
+    assert!(!signing.iter().any(|l| l.contains("echo") && l.contains("MINISIGN_")), "a secret is echoed");
+    for secret in ["MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}", "MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}"] {
+        assert!(signing.iter().any(|l| l.trim() == secret), "the signing step lacks `{secret}`");
+    }
+    assert!(signing.iter().any(|l| l.contains("umask 077") || l.contains("chmod 600")), "the key file must be private");
+    assert!(signing.iter().any(|l| l.contains("trap") && l.contains("rm -f")), "the key file must be removed at the end");
+
+    for (n, line) in lines.iter().enumerate() {
+        let outside = !signing.contains(line);
+        assert!(!(outside && line.contains("MINISIGN_PASSWORD")), "release.yml:{}: the password leaves the signing step", n + 1);
+        assert!(!(outside && line.contains("MINISIGN_SECRET_KEY")), "release.yml:{}: the key leaves the signing step", n + 1);
+        assert!(!(outside && line.contains("secrets.")), "release.yml:{}: a secret outside the signing step", n + 1);
+    }
 }
