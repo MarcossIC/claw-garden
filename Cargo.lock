@@ -351,6 +351,7 @@ dependencies = [
  "clawg-core",
  "dirs",
  "env_logger",
+ "fs2",
  "libc",
  "log",
  "minisign",

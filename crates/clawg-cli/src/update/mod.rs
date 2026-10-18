@@ -2,6 +2,7 @@
 
 pub mod client;
 pub mod eligibility;
+pub mod lock;
 pub mod plan;
 pub mod release;
 pub mod report;
