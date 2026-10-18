@@ -15,6 +15,13 @@ pub enum SignatureError {
     Rejected(String),
 }
 
+/// The public keys a release signature is checked against, the text of a
+/// `.pub` each. A `testing` build can take them from the environment; the
+/// embedded list is empty, so any other build rejects every signature.
+pub fn trusted_keys() -> Vec<String> {
+    clawg_core::build_info::release_keys_override().unwrap_or_default()
+}
+
 /// Checks `signature` (the text of a `.minisig`) over `content` against each
 /// of `keys` (the text of a `.pub` each) and returns the signed trusted
 /// comment of the first key that made it.

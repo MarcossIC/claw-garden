@@ -1,0 +1,351 @@
+//! The update's contact with the world: the release server, the files beside
+//! the installed binary, and the daemon's processes.
+
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use clawg_core::memory::store_lock::StoreLock;
+use clawg_core::paths::{backups_dir, Profile};
+
+use crate::client::{spawn_serve_at, DaemonClient, Health};
+use crate::daemon::lifecycle::{clear_state, read_state};
+use crate::stop::{stop_in, STOP_TIMEOUT};
+
+use super::client::ReleaseClient;
+use super::plan::{
+    judge, new_pre_migration, Answer, Effects, Observation, Running, Step, StoreRestore, Undo, Verdict,
+};
+use super::release::Release;
+use super::report::{install_dir_access, NewDaemon};
+
+/// How often a starting daemon is looked at.
+const WATCH_INTERVAL: Duration = Duration::from_millis(200);
+/// A daemon that holds the store is reported on after this long, then at
+/// every [`PROGRESS_EVERY`].
+const PROGRESS_AFTER: Duration = Duration::from_secs(5);
+const PROGRESS_EVERY: Duration = Duration::from_secs(10);
+/// How many lines of the daemon's log a failure quotes.
+const LOG_LINES: usize = 8;
+
+/// The files an update moves.
+pub struct Paths {
+    pub exe: PathBuf,
+    /// Where the downloaded binary waits, beside `exe`.
+    pub staged: PathBuf,
+    /// Where the installed binary is set aside.
+    pub aside: PathBuf,
+    pub base_dir: PathBuf,
+}
+
+/// What the update installs and how it trusts it.
+pub struct Candidate {
+    pub release: Release,
+    pub triple: &'static str,
+    pub keys: Vec<String>,
+    pub client: ReleaseClient,
+}
+
+/// The installation `clawg update` works on and what it has done to it.
+pub struct Installation {
+    paths: Paths,
+    profile: Profile,
+    candidate: Candidate,
+    /// The daemon that was running when the update began.
+    old: Option<Running>,
+    child: Option<Child>,
+    backups_before: Option<Vec<String>>,
+    set_aside: bool,
+    new_daemon: Option<NewDaemon>,
+}
+
+impl Installation {
+    pub fn new(paths: Paths, profile: Profile, candidate: Candidate, old: Option<Running>) -> Self {
+        Self {
+            paths,
+            profile,
+            candidate,
+            old,
+            child: None,
+            backups_before: None,
+            set_aside: false,
+            new_daemon: None,
+        }
+    }
+
+    /// Where the previous binary was set aside, if it was.
+    pub fn set_aside_at(&self) -> Option<&Path> {
+        self.set_aside.then_some(self.paths.aside.as_path())
+    }
+
+    /// The daemon of the new version that is running, if one was started.
+    pub fn new_daemon(&self) -> Option<&NewDaemon> {
+        self.new_daemon.as_ref()
+    }
+
+    /// The snapshot the daemon started by the update wrote before migrating.
+    pub fn pre_migration(&self) -> Option<PathBuf> {
+        let before = self.backups_before.as_ref()?;
+        let name = new_pre_migration(before, &self.backup_names())?;
+        Some(backups_dir(&self.paths.base_dir).join(name))
+    }
+
+    fn backup_names(&self) -> Vec<String> {
+        std::fs::read_dir(backups_dir(&self.paths.base_dir))
+            .map(|entries| {
+                entries.filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().into_owned()).collect()
+            })
+            .unwrap_or_default()
+    }
+
+    async fn stage(&self) -> Result<(), String> {
+        let dir = self.paths.staged.parent().unwrap_or(Path::new("."));
+        // Creating the file is the permission check, and it comes before any
+        // request: a directory the user cannot write to costs nothing.
+        let created = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&self.paths.staged)
+            .map(drop)
+            .map_err(|e| e.kind());
+        install_dir_access(dir, created)?;
+        std::fs::remove_file(&self.paths.staged).map_err(|e| format!("cannot remove {}: {e}", self.paths.staged.display()))?;
+
+        let keys: Vec<&str> = self.candidate.keys.iter().map(String::as_str).collect();
+        self.candidate.client
+            .fetch_binary(&self.candidate.release, self.candidate.triple, &keys, &self.paths.staged)
+            .await
+            .map_err(|e| e.to_string())?;
+        make_executable(&self.paths.staged)
+    }
+
+    /// The downloaded binary must run and say it is the version the release
+    /// announced.
+    async fn smoke(&self) -> Result<(), String> {
+        let expected = format!("clawg {}", self.candidate.release.version);
+        // A virus scanner reading the file just written can keep Windows from
+        // creating the process for a moment.
+        let attempts = if cfg!(windows) { 3 } else { 1 };
+        let mut why = String::new();
+        for attempt in 1..=attempts {
+            match Command::new(&self.paths.staged).arg("--version").stdin(Stdio::null()).output() {
+                Ok(out) => {
+                    let said = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if out.status.success() && said == expected {
+                        return Ok(());
+                    }
+                    return Err(format!("the downloaded binary says {said:?} instead of {expected:?}"));
+                }
+                Err(e) => why = e.to_string(),
+            }
+            if attempt < attempts {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+        Err(format!("cannot run the downloaded binary: {why}"))
+    }
+
+    /// Starts the binary at `exe` as the profile's daemon on `port` and waits
+    /// until a daemon of `version` answers. When a daemon of another version
+    /// got the store first (an editor's bridge started it between the stop and
+    /// this start), it is stopped and the start is tried once more.
+    async fn start_and_wait(&mut self, exe: &Path, version: &str, port: u16) -> Result<Health, String> {
+        for attempt in 1..=2 {
+            let child = spawn_serve_at(exe, &self.paths.base_dir, self.profile, Some(port)).map_err(|e| e.to_string())?;
+            println!("starting the daemon (pid {})", child.id());
+            self.child = Some(child);
+            match self.wait_for(version).await {
+                Ok(health) => return Ok(health),
+                Err(Waited::Other(other)) if attempt == 1 => {
+                    println!(
+                        "a daemon {} (pid {}) got the store first; stopping it to start the right one",
+                        other.version, other.pid
+                    );
+                    stop_in(&self.paths.base_dir, STOP_TIMEOUT).await.map_err(|e| e.to_string())?;
+                }
+                Err(Waited::Other(other)) => {
+                    return Err(format!(
+                        "a daemon {} (pid {}) keeps taking the store, started by something that was open \
+                         before the update; run `clawg stop` and then any clawg command",
+                        other.version, other.pid
+                    ));
+                }
+                Err(Waited::Failed(why)) => return Err(why),
+            }
+        }
+        Err("the daemon did not start".to_string())
+    }
+
+    async fn wait_for(&mut self, version: &str) -> Result<Health, Waited> {
+        let started = Instant::now();
+        let mut last_report: Option<Instant> = None;
+        loop {
+            let child = self.child.as_mut().expect("a daemon was started");
+            let pid = child.id();
+            let exited = child.try_wait().ok().flatten();
+            let health = ask_health(&self.paths.base_dir).await;
+            let seen = Observation {
+                exited: exited.is_some(),
+                store_owner: StoreLock::recorded_owner(&self.paths.base_dir).map(|o| o.pid),
+                answering: health.as_ref().map(|h| Answer { pid: h.pid, version: h.version.clone() }),
+            };
+            let elapsed = started.elapsed();
+            match judge(&seen, elapsed, pid, version) {
+                Verdict::Ready => return Ok(health.expect("a daemon answered")),
+                Verdict::Exited => {
+                    let status = exited.map(|s| s.to_string()).unwrap_or_default();
+                    return Err(Waited::Failed(format!(
+                        "the daemon ended ({status}) before it answered\n{}",
+                        self.log_tail()
+                    )));
+                }
+                Verdict::TimedOut => {
+                    return Err(Waited::Failed(format!(
+                        "the daemon did not answer within {} s\n{}",
+                        elapsed.as_secs(),
+                        self.log_tail()
+                    )));
+                }
+                Verdict::Other { pid, version } => return Err(Waited::Other(Answer { pid, version })),
+                Verdict::Wait => {
+                    let holds_store = seen.store_owner == Some(pid);
+                    let due = last_report.map_or(elapsed >= PROGRESS_AFTER, |at| at.elapsed() >= PROGRESS_EVERY);
+                    if holds_store && due {
+                        last_report = Some(Instant::now());
+                        let snapshot = self
+                            .pre_migration()
+                            .map(|p| format!(" (pre-migration snapshot {})", p.display()))
+                            .unwrap_or_default();
+                        println!("the daemon is preparing the store{snapshot}, {} s", elapsed.as_secs());
+                    }
+                    tokio::time::sleep(WATCH_INTERVAL).await;
+                }
+            }
+        }
+    }
+
+    fn log_tail(&self) -> String {
+        let log = std::fs::read_to_string(self.paths.base_dir.join("logs").join("serve.log")).unwrap_or_default();
+        let tail = tail_lines(&log, LOG_LINES);
+        if tail.is_empty() {
+            String::new()
+        } else {
+            format!("last lines of the daemon's log:\n{tail}")
+        }
+    }
+}
+
+/// Why waiting for a daemon ended without one.
+enum Waited {
+    Other(Answer),
+    Failed(String),
+}
+
+async fn ask_health(base_dir: &Path) -> Option<Health> {
+    DaemonClient::from_data_dir(base_dir)?.health().await.ok()
+}
+
+/// The last `count` non-empty lines of `text`.
+fn tail_lines(text: &str, count: usize) -> String {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    lines[lines.len().saturating_sub(count)..].join("\n")
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("cannot make {} executable: {e}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+fn rename(from: &Path, to: &Path) -> Result<(), String> {
+    std::fs::rename(from, to).map_err(|e| format!("cannot rename {} to {}: {e}", from.display(), to.display()))
+}
+
+impl Effects for Installation {
+    async fn run(&mut self, step: Step) -> Result<(), String> {
+        match step {
+            Step::Stage => self.stage().await,
+            Step::Smoke => self.smoke().await,
+            Step::StopDaemon => {
+                let pid = stop_in(&self.paths.base_dir, STOP_TIMEOUT).await.map_err(|e| e.to_string())?;
+                println!("stopped the daemon (pid {pid})");
+                Ok(())
+            }
+            Step::SetAside => {
+                rename(&self.paths.exe, &self.paths.aside)?;
+                self.set_aside = true;
+                Ok(())
+            }
+            Step::PutInPlace => rename(&self.paths.staged, &self.paths.exe),
+            Step::StartDaemon => {
+                let port = self.old.as_ref().map(|d| d.port).ok_or("there is no daemon port to start on")?;
+                self.backups_before = Some(self.backup_names());
+                let (exe, version) = (self.paths.exe.clone(), self.candidate.release.version.to_string());
+                let health = self.start_and_wait(&exe, &version, port).await?;
+                self.new_daemon = Some(NewDaemon { pid: health.pid, embedder: health.embedder });
+                Ok(())
+            }
+        }
+    }
+
+    async fn undo(&mut self, undo: Undo) -> Result<(), String> {
+        match undo {
+            Undo::RemoveStaged => match std::fs::remove_file(&self.paths.staged) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    Err(format!("cannot remove {}: {e}", self.paths.staged.display()))
+                }
+                _ => Ok(()),
+            },
+            Undo::StartOldDaemon => {
+                let old = self.old.clone().ok_or("there was no daemon to start again")?;
+                let exe = self.paths.exe.clone();
+                self.start_and_wait(&exe, &old.version, old.port).await.map(drop)
+            }
+            Undo::RestoreAside => {
+                rename(&self.paths.aside, &self.paths.exe)?;
+                self.set_aside = false;
+                Ok(())
+            }
+            Undo::TakeBackNew => rename(&self.paths.exe, &self.paths.staged),
+            Undo::EndNewDaemon => {
+                let Some(mut child) = self.child.take() else {
+                    return Ok(());
+                };
+                let pid = child.id();
+                // By its own handle, never by name: a clawg the user's editor
+                // runs must survive.
+                let _ = child.kill();
+                child.wait().map_err(|e| format!("cannot wait for the daemon (pid {pid}) to end: {e}"))?;
+                if read_state(&self.paths.base_dir).is_some_and(|s| s.pid == pid) {
+                    clear_state(&self.paths.base_dir);
+                }
+                self.new_daemon = None;
+                Ok(())
+            }
+        }
+    }
+
+    async fn restore_store(&mut self) -> Result<StoreRestore, String> {
+        Ok(StoreRestore::NotNeeded)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_log_tail_keeps_the_last_lines_without_blanks() {
+        let log = "one\n\ntwo\nthree\n   \nfour\n";
+
+        assert_eq!(tail_lines(log, 2), "three\nfour");
+        assert_eq!(tail_lines(log, 10), "one\ntwo\nthree\nfour");
+        assert_eq!(tail_lines("", 3), "");
+    }
+}

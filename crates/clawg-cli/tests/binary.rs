@@ -56,7 +56,11 @@ impl Sandbox {
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        let mut cmd = Command::new(BIN);
+        self.command_of(Path::new(BIN), args)
+    }
+
+    fn command_of(&self, bin: &Path, args: &[&str]) -> Command {
+        let mut cmd = Command::new(bin);
         cmd.args(args)
             .env("CLAWG_TEST_HOME", &self.home)
             .env("CLAWG_TEST_EMBEDDER", "fake")
@@ -77,9 +81,14 @@ impl Sandbox {
     }
 
     async fn serve_with(&self, embedder: &str) -> Daemon {
+        self.serve_binary(Path::new(BIN), embedder).await
+    }
+
+    /// A daemon run from the copy of the binary at `bin`.
+    async fn serve_binary(&self, bin: &Path, embedder: &str) -> Daemon {
         let log = self.log(&format!("serve-{}", now_ns()));
         let child = self
-            .command(&["serve", "--profile", "dev", "--port", "0"])
+            .command_of(bin, &["serve", "--profile", "dev", "--port", "0"])
             .env("CLAWG_TEST_EMBEDDER", embedder)
             .stdout(Stdio::null())
             .stderr(File::create(&log).expect("log file"))
@@ -91,11 +100,16 @@ impl Sandbox {
     /// A bridge started in an empty folder of its own, so the root it
     /// registers has nothing to index.
     fn bridge(&self) -> Bridge {
+        self.bridge_of(Path::new(BIN))
+    }
+
+    /// A bridge run from the copy of the binary at `bin`.
+    fn bridge_of(&self, bin: &Path) -> Bridge {
         let root = self.home.join(format!("project-{}", now_ns()));
         std::fs::create_dir_all(&root).expect("project dir");
         let log = self.log(&format!("mcp-{}", now_ns()));
         let mut child = self
-            .command(&["mcp", "--profile", "dev", "--no-autostart", "--agent", "smoke"])
+            .command_of(bin, &["mcp", "--profile", "dev", "--no-autostart", "--agent", "smoke"])
             .current_dir(&root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -572,16 +586,25 @@ async fn a_test_that_fails_midway_leaves_no_daemon_holding_the_store() {
 /// image, which only a `testing` build reads.
 fn stamped_copy(dir: &Path, json: &str) -> PathBuf {
     let copy = dir.join(format!("clawg-copy{}", std::env::consts::EXE_SUFFIX));
+    write_executable(&copy, &stamped_bytes(json));
+    copy
+}
+
+/// The test binary with `0x00 CLAWG-TEST-STAMP <json>` after its image.
+fn stamped_bytes(json: &str) -> Vec<u8> {
     let mut bytes = std::fs::read(BIN).expect("read the test binary");
     bytes.push(0);
     bytes.extend_from_slice(format!("CLAWG-TEST-STAMP {json}").as_bytes());
-    std::fs::write(&copy, bytes).expect("write the copy");
+    bytes
+}
+
+fn write_executable(path: &Path, bytes: &[u8]) {
+    std::fs::write(path, bytes).expect("write the copy");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     }
-    copy
 }
 
 fn run_binary(sandbox: &Sandbox, bin: &Path, args: &[&str]) -> Output {
@@ -636,17 +659,38 @@ struct ReleaseServer {
 
 impl ReleaseServer {
     async fn start(releases: Value) -> Self {
+        Self::serving(releases, std::collections::HashMap::new()).await
+    }
+
+    /// Also serves `files`, by name, as the downloads of any release tag.
+    async fn serving(releases: Value, files: std::collections::HashMap<String, Vec<u8>>) -> Self {
+        use axum::extract::{Path as UrlPath, State};
+        use axum::http::StatusCode;
         use axum::routing::get;
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = hits.clone();
-        let app = axum::Router::new().route(
-            "/repos/MarcossIC/claw-garden/releases",
-            get(move || {
-                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let body = releases.to_string();
-                async move { ([("content-type", "application/json")], body) }
-            }),
-        );
+        let app = axum::Router::new()
+            .route(
+                "/repos/MarcossIC/claw-garden/releases",
+                get(move || {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let body = releases.to_string();
+                    async move { ([("content-type", "application/json")], body) }
+                }),
+            )
+            .route(
+                "/MarcossIC/claw-garden/releases/download/{tag}/{name}",
+                get(
+                    |State(files): State<Arc<std::collections::HashMap<String, Vec<u8>>>>,
+                     UrlPath((_tag, name)): UrlPath<(String, String)>| async move {
+                        match files.get(&name) {
+                            Some(bytes) => Ok(bytes.clone()),
+                            None => Err(StatusCode::NOT_FOUND),
+                        }
+                    },
+                ),
+            )
+            .with_state(Arc::new(files));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let base = format!("http://{}", listener.local_addr().expect("addr"));
         tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
@@ -725,4 +769,154 @@ async fn update_refuses_a_binary_without_a_stamp() {
         assert!(stderr_of(&out).contains("built locally"), "{}", stderr_of(&out));
     }
     assert_eq!(server.hits(), 0, "a refused binary asks nothing");
+}
+
+// ── update ─────────────────────────────────────────────────────────────────
+
+/// A release whose files are signed on the spot, with the public key that
+/// verifies them.
+struct SignedRelease {
+    listing: Value,
+    files: std::collections::HashMap<String, Vec<u8>>,
+    /// The text of the `.pub` file.
+    public: String,
+    /// What the release's executable holds.
+    binary: Vec<u8>,
+}
+
+fn stamp_json(version: &str, extra: &str) -> String {
+    format!(r#"{{"version":"{version}","dist_target":"{STAMPED_TARGET}"{extra}}}"#)
+}
+
+/// A release `version` whose executable is the test binary stamped as that
+/// version, with `extra` fields (`,"migrations_up_to":7`) in its stamp.
+fn signed_release(version: &str, extra: &str) -> SignedRelease {
+    use sha2::{Digest, Sha256};
+    let asset = format!("clawg-{STAMPED_TARGET}{}", if cfg!(windows) { ".exe" } else { "" });
+    let binary = stamped_bytes(&stamp_json(version, extra));
+    let hash: String = Sha256::digest(&binary).iter().map(|b| format!("{b:02x}")).collect();
+    let sums = format!("{hash}  {asset}\n");
+    let pair = minisign::KeyPair::generate_unencrypted_keypair().expect("key pair");
+    let public = pair.pk.to_box().expect("public key").into_string();
+    let signature = minisign::sign(
+        None,
+        &pair.sk,
+        std::io::Cursor::new(sums.as_bytes()),
+        Some(&format!("clawg v{version} SHA256SUMS")),
+        None,
+    )
+    .expect("sign")
+    .into_string();
+    let listing = json!([{
+        "tag_name": format!("v{version}"),
+        "draft": false,
+        "prerelease": false,
+        "assets": [{ "name": asset }, { "name": "SHA256SUMS" }, { "name": "SHA256SUMS.minisig" }],
+    }]);
+    let files = std::collections::HashMap::from([
+        (asset, binary.clone()),
+        ("SHA256SUMS".to_string(), sums.into_bytes()),
+        ("SHA256SUMS.minisig".to_string(), signature.into_bytes()),
+    ]);
+    SignedRelease { listing, files, public, binary }
+}
+
+/// Where the installed copy lives, as an installer would leave it.
+fn install(sandbox: &Sandbox, stamp: &str) -> PathBuf {
+    let dir = sandbox.home.join("bin");
+    std::fs::create_dir_all(&dir).expect("bin dir");
+    let installed = dir.join(format!("clawg{}", std::env::consts::EXE_SUFFIX));
+    write_executable(&installed, &stamped_bytes(stamp));
+    installed
+}
+
+/// `clawg update`, from `installed`, against `server`, trusting `public`.
+fn update_from(sandbox: &Sandbox, installed: &Path, server: &str, public: &str) -> Output {
+    Command::new(installed)
+        .arg("update")
+        .env("CLAWG_TEST_HOME", &sandbox.home)
+        .env("CLAWG_TEST_EMBEDDER", "fake")
+        .env("CLAWG_TEST_RELEASE_URL", server)
+        .env("CLAWG_TEST_RELEASE_KEYS", json!([public]).to_string())
+        .env_remove("CLAWG_PROFILE")
+        .current_dir(&sandbox.home)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run clawg update")
+}
+
+/// Stops, when it drops, whatever daemon the profile has: the one `update`
+/// starts is not a child of the test.
+struct StopOnDrop {
+    home: PathBuf,
+}
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        let _ = Command::new(BIN)
+            .args(["stop", "--profile", "dev"])
+            .env("CLAWG_TEST_HOME", &self.home)
+            .env_remove("CLAWG_PROFILE")
+            .stdin(Stdio::null())
+            .output();
+    }
+}
+
+/// `/health` of the daemon the data directory names.
+async fn published_health(data_dir: &Path) -> Value {
+    let state: Value =
+        serde_json::from_str(&std::fs::read_to_string(data_dir.join("daemon.json")).expect("daemon.json"))
+            .expect("daemon.json is JSON");
+    let port = state["port"].as_u64().expect("port");
+    reqwest::get(format!("http://127.0.0.1:{port}/health"))
+        .await
+        .expect("health")
+        .json()
+        .await
+        .expect("health json")
+}
+
+/// The files beside the installed binary whose name starts with `prefix`.
+fn beside(installed: &Path, prefix: &str) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(installed.parent().expect("dir"))
+        .expect("read the install dir")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(prefix)))
+        .collect();
+    found.sort();
+    found
+}
+
+// The server runs in this process while the binary is waited on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_update_with_a_daemon_replaces_the_binary_and_a_bridge_reaches_the_new_daemon() {
+    let sandbox = Sandbox::new();
+    let installed = install(&sandbox, &stamp_json("0.18.0", ""));
+    let original = std::fs::read(&installed).expect("read the installed binary");
+    let old = sandbox.serve_binary(&installed, "fake").await;
+    let mut bridge = sandbox.bridge_of(&installed);
+    bridge.initialize();
+    assert!(!tool_failed(&bridge.call(2, "memory_status", json!({}))));
+    let release = signed_release("0.19.0", "");
+    let server = ReleaseServer::serving(release.listing.clone(), release.files.clone()).await;
+    let _stop = StopOnDrop { home: sandbox.home.clone() };
+
+    let out = update_from(&sandbox, &installed, &server.base, &release.public);
+
+    assert_eq!(out.status.code(), Some(0), "{}\n{}", stdout_of(&out), stderr_of(&out));
+    let report = stdout_of(&out);
+    assert!(report.contains("0.18.0") && report.contains("0.19.0"), "{report}");
+    old.wait_for_exit(Duration::from_secs(10)).await;
+    let health = published_health(&sandbox.data_dir()).await;
+    assert_eq!(health["version"], "0.19.0", "{health}");
+    assert_ne!(health["pid"].as_u64(), Some(u64::from(old.pid)), "a new daemon, not the old one");
+
+    assert_eq!(std::fs::read(&installed).expect("read the installed binary"), release.binary);
+    let aside = beside(&installed, &format!("clawg{}.old-", std::env::consts::EXE_SUFFIX));
+    assert_eq!(aside.len(), 1, "{aside:?}");
+    assert_eq!(std::fs::read(&aside[0]).expect("read the old binary"), original);
+    assert!(beside(&installed, "clawg.new-").is_empty(), "the staged file is gone");
+
+    let reply = bridge.call(3, "memory_status", json!({}));
+    assert!(!tool_failed(&reply), "the open bridge must find the new daemon: {reply}");
 }
