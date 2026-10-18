@@ -81,3 +81,6 @@ once_cell.workspace = true
 # Signs the release files the update tests serve; the shipped binary only
 # verifies.
 minisign = "=0.9.1"
+# Seeds a store at an old schema with plain SQL: the daemon of that schema runs
+# the current insert code, which writes columns the old schema lacks.
+rusqlite.workspace = true

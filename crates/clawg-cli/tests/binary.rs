@@ -929,6 +929,79 @@ async fn seeded_store(sandbox: &Sandbox) -> (PathBuf, Daemon) {
     (installed, old)
 }
 
+/// The schema the installed binary of a store with a pending migration is
+/// frozen at. Fixed, not "the last one minus one": the rows are inserted by
+/// SQL against this schema, so a later migration only adds one more pending.
+const OLD_SCHEMA: i32 = 15;
+
+/// A daemon of an installed copy frozen at [`OLD_SCHEMA`], over a store with
+/// `SEEDED` in it.
+async fn store_behind(sandbox: &Sandbox) -> (PathBuf, Daemon) {
+    let installed = install(sandbox, &stamp_json("0.18.0", &format!(r#","migrations_up_to":{OLD_SCHEMA}"#)));
+    // The first start only creates the store at that schema.
+    let first = sandbox.serve_binary(&installed, "fake").await;
+    let stopped = sandbox.command_of(&installed, &["stop", "--profile", "dev"]).output().expect("run clawg stop");
+    assert!(stopped.status.success(), "{}", stderr_of(&stopped));
+    first.wait_for_exit(Duration::from_secs(10)).await;
+
+    let db = rusqlite::Connection::open(sandbox.data_dir().join("memory.db")).expect("open the store");
+    for text in SEEDED {
+        db.execute(
+            "INSERT INTO memory (agent_id, content, created_at, last_modified_at, last_accessed_at) \
+             VALUES ('smoke', ?1, 0, 0, 0)",
+            [text],
+        )
+        .expect("seed a row");
+    }
+    drop(db);
+    (installed.clone(), sandbox.serve_binary(&installed, "fake").await)
+}
+
+/// The `pre-migration` snapshots in the data directory.
+fn pre_migrations(data_dir: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(data_dir.join("backups"))
+        .map(|rd| rd.map(|e| e.expect("entry").path()).collect())
+        .unwrap_or_default();
+    found.retain(|p| {
+        let name = p.file_name().expect("name").to_string_lossy().into_owned();
+        clawg_core::memory::backup::parse_snapshot_name(&name) == Some(clawg_core::memory::backup::Reason::PreMigration)
+    });
+    found.sort();
+    found
+}
+
+// The server runs in this process while the binary is waited on.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_over_a_pending_migration_leaves_a_pre_migration_snapshot_and_the_data() {
+    let sandbox = Sandbox::new();
+    let (installed, old) = store_behind(&sandbox).await;
+    let release = signed_release("0.19.0", "");
+    let server = ReleaseServer::serving(release.listing.clone(), release.files.clone()).await;
+    let _stop = StopOnDrop { home: sandbox.home.clone() };
+
+    let out = update_from(&sandbox, &installed, &server.base, &release.public);
+
+    assert_eq!(out.status.code(), Some(0), "{}\n{}", stdout_of(&out), stderr_of(&out));
+    old.wait_for_exit(Duration::from_secs(10)).await;
+    let health = published_health(&sandbox.data_dir()).await;
+    assert_eq!(health["version"], "0.19.0", "{health}");
+
+    let snapshots = pre_migrations(&sandbox.data_dir());
+    assert_eq!(snapshots.len(), 1, "{snapshots:?}");
+    let report = stdout_of(&out);
+    assert!(report.contains(&snapshots[0].display().to_string()), "the snapshot is named: {report}");
+    let before = rusqlite::Connection::open(&snapshots[0]).expect("open the snapshot");
+    let version: i32 = before
+        .query_row("SELECT max(version) FROM refinery_schema_history", [], |r| r.get(0))
+        .expect("snapshot schema");
+    assert_eq!(version, OLD_SCHEMA, "the snapshot is the store as the old binary left it");
+
+    let rows = published_get(&sandbox.data_dir(), "/v1/memories?limit=100").await;
+    for text in SEEDED {
+        assert!(rows.contains(text), "{text:?} survived the migration: {rows}");
+    }
+}
+
 // The server runs in this process while the binary is waited on.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_update_whose_candidate_refuses_the_store_leaves_the_old_binary_and_its_daemon() {
