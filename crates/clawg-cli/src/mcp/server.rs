@@ -756,7 +756,7 @@ impl ClawgMcp {
             })
             .await;
         match result {
-            Ok(Ok(hits)) => Self::ok(format_search(hits, agent_id)),
+            Ok(Ok(found)) => Self::ok(format_search(found, agent_id)),
             Ok(Err(e)) => Self::failed(Self::explain(&e)),
             Err(failure) => Ok(failure),
         }
@@ -2718,6 +2718,17 @@ mod tests {
             .expect("search");
         assert!(!is_error(&r), "an empty corpus is not an error");
         assert_eq!(text(&r), "no memories found");
+    }
+
+    /// Under the fake model a text other than the query scores 0, so the
+    /// stored row is searched and none is close enough to show.
+    #[tokio::test]
+    async fn search_memory_tells_nothing_relevant_from_nothing_stored() {
+        let (b, _d) = bridge().await;
+        saved_id(&b, "agent-mcp", "the release branch is cut on thursdays").await;
+        let r = b.search_memory_impl("agent-mcp", search_args("which port does the proxy use")).await.expect("search");
+        assert!(!is_error(&r), "nothing relevant is not an error");
+        assert_eq!(text(&r), "no relevant memories for this query: 1 searched, none close enough to show");
     }
 
     #[tokio::test]
