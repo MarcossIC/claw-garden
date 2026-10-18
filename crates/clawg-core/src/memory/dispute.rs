@@ -194,6 +194,13 @@ pub(crate) fn release_challengers(c: &Connection, id: i64, now: TimestampMs) -> 
     c.execute(&sql, rusqlite::params![now, id])
 }
 
+/// Settles every row whose `disputed_against` names row `id`, once `id` is
+/// live again: a restored row brings back the escalated pairs it was part of.
+pub(crate) fn settle_challengers(c: &Connection, id: i64, now: TimestampMs) -> rusqlite::Result<usize> {
+    let sql = settle_sql(&format!("EXISTS (SELECT 1 FROM {NAMED_DISPUTES} WHERE value = ?2)"));
+    c.execute(&sql, rusqlite::params![now, id])
+}
+
 /// Settles row `id` alone. A row coming back from deletion may name rows
 /// that were deleted or superseded while it was gone.
 pub(crate) fn settle_row(c: &Connection, id: i64, now: TimestampMs) -> rusqlite::Result<usize> {
