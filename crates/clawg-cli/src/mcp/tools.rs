@@ -792,7 +792,7 @@ mod tests {
     #[test]
     fn format_resolution_names_both_rows_and_what_replaced_one() {
         let row = |id, status: &str, superseded_by| ResolvedRow { id, status: status.into(), superseded_by };
-        let out = format_resolution(&Resolution { keep: row(9, "active", None), other: row(4, "superseded", Some(9)) });
+        let out = format_resolution(&Resolution { keep: row(9, "active", None), other: row(4, "superseded", Some(9)), pair: None });
         assert_eq!(out, "#9 active\n#4 superseded by #9");
     }
 

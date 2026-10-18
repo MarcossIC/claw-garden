@@ -1,10 +1,12 @@
-//! Closing a dispute the contradiction detector opened.
+//! Judging the pairs the contradiction detector found.
 //!
-//! The detector marks the newer row `disputed` and names the rows it
-//! contradicts in `disputed_against`. Closing a dispute either supersedes one
-//! side (`superseded_by` points at the row that stays) or keeps both, and in
-//! either case drops each side from the other's `disputed_against`, so that
-//! list always names the disputes still open.
+//! Every pair is a `memory_conflict` row. An escalated pair is also named in
+//! the newer row's `disputed_against`, which makes that row `disputed` and
+//! puts the pair in ACTIVE CONFLICTS. A verdict either supersedes one side
+//! (`superseded_by` points at the row that stays), keeps both, or escalates
+//! the pair; the first two drop each side from the other's
+//! `disputed_against`, so that list always names the disputes still open, and
+//! the pair keeps the verdict.
 //!
 //! A row that is not superseded never has its status written directly: every
 //! path settles it with [`REST_STATUS`], which reads it off the rows its
@@ -26,10 +28,54 @@ pub enum Outcome {
     KeepBoth,
 }
 
+/// What a caller says about a pair the detector found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// `keep` replaces `other`, which stops being retrieved.
+    Supersedes,
+    /// The two do not conflict, related or not.
+    Compatible,
+    /// Both hold, each in its own scope; the reason says which.
+    Scoped,
+    /// They do conflict, and the user has to say which holds.
+    Conflicts,
+}
+
+impl Verdict {
+    pub const ALL: [Verdict; 4] = [Self::Supersedes, Self::Compatible, Self::Scoped, Self::Conflicts];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Supersedes => "supersedes",
+            Self::Compatible => "compatible",
+            Self::Scoped => "scoped",
+            Self::Conflicts => "conflicts",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown verdict {0:?}; expected one of {list}", list = Verdict::ALL.map(Verdict::as_str).join(", "))]
+pub struct UnknownVerdict(pub String);
+
+impl std::str::FromStr for Verdict {
+    type Err = UnknownVerdict;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Verdict::ALL.into_iter().find(|v| v.as_str() == s).ok_or_else(|| UnknownVerdict(s.to_string()))
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
     #[error("a memory cannot be resolved against itself")]
     SameRow,
+    #[error("a scoped verdict needs a reason that says where each memory holds")]
+    ReasonRequired,
+    #[error(
+        "memories {keep} and {other} include a preference or a decision; ask the user first: \
+         judge the pair `conflicts`, and `supersedes` once the user has answered"
+    )]
+    NeedsUser { keep: i64, other: i64 },
     #[error("no memory row with id {0}")]
     NotFound(i64),
     #[error("memories {keep} and {other} are not in dispute with each other")]
@@ -58,6 +104,10 @@ pub struct ResolvedRow {
 pub struct Resolution {
     pub keep: ResolvedRow,
     pub other: ResolvedRow,
+    /// The state the pair was left in, `judged` or `escalated`. Absent from
+    /// a daemon that predates the pair table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair: Option<String>,
 }
 
 /// What deciding whether two rows can be resolved needs from each of them.
@@ -67,25 +117,33 @@ struct PairRow {
     status: String,
     superseded_by: Option<i64>,
     disputes: Vec<i64>,
+    memory_type: String,
 }
 
 impl PairRow {
     fn replaced_by(&self) -> Option<i64> {
         (self.status == "superseded").then_some(self.superseded_by).flatten()
     }
+
+    /// A preference or a decision is never superseded on the agent's word.
+    fn protected(&self) -> bool {
+        matches!(self.memory_type.as_str(), "user_preference" | "architectural_decision")
+    }
 }
 
-/// Two rows can be resolved when one names the other in `disputed_against`,
-/// or one was superseded by the other — the second is what lets a resolution
-/// be undone. A row superseded by a third row is refused: rewriting its
-/// `superseded_by` would silently drop that earlier decision.
-fn check_pair(keep: &PairRow, other: &PairRow) -> Result<(), ResolveError> {
+/// Two rows can be resolved when the detector paired them (`noted`), when one
+/// names the other in `disputed_against`, or when one was superseded by the
+/// other — the last is what lets a resolution be undone. A row superseded by
+/// a third row is refused: rewriting its `superseded_by` would silently drop
+/// that earlier decision.
+fn check_pair(keep: &PairRow, other: &PairRow, noted: bool) -> Result<(), ResolveError> {
     for (row, partner) in [(keep, other), (other, keep)] {
         if let Some(by) = row.replaced_by().filter(|by| *by != partner.id) {
             return Err(ResolveError::SupersededElsewhere { id: row.id, by });
         }
     }
-    let linked = keep.disputes.contains(&other.id)
+    let linked = noted
+        || keep.disputes.contains(&other.id)
         || other.disputes.contains(&keep.id)
         || keep.replaced_by() == Some(other.id)
         || other.replaced_by() == Some(keep.id);
@@ -149,7 +207,7 @@ pub(crate) fn settle_disputed(c: &Connection, now: TimestampMs) -> rusqlite::Res
     c.execute(&settle_sql("status = 'disputed'"), rusqlite::params![now])
 }
 
-const SELECT_PAIR_ROW: &str = "SELECT id, status, superseded_by, disputed_against FROM memory \
+const SELECT_PAIR_ROW: &str = "SELECT id, status, superseded_by, disputed_against, memory_type FROM memory \
      WHERE id = ?1 AND deleted_at IS NULL AND (?2 IS NULL OR agent_id = ?2)";
 
 /// Another agent's row reads as missing, so a scoped caller learns nothing
@@ -166,6 +224,7 @@ fn read_pair_row(c: &Connection, id: i64, owner: Option<&str>) -> Result<PairRow
                     .get::<_, Option<String>>(3)?
                     .and_then(|s| serde_json::from_str(&s).ok())
                     .unwrap_or_default(),
+                memory_type: r.get(4)?,
             })
         })
         .optional()?;
@@ -198,9 +257,27 @@ const REVIVE_SQL: &str = "UPDATE memory SET status = 'active', superseded_by = N
 const SUPERSEDE_SQL: &str = "UPDATE memory SET status = 'superseded', superseded_by = ?2, last_modified_at = ?3 \
                              WHERE id = ?1";
 
-/// Closes the dispute between `keep` and `other` in one transaction, and
-/// returns both rows as they stand afterwards. With `owner`, both rows must
-/// belong to that agent.
+/// Adds `?2` to `?1`'s `disputed_against` unless it is there already.
+fn add_dispute_sql() -> String {
+    format!(
+        "UPDATE memory SET disputed_against = \
+           (SELECT json_group_array(value) FROM \
+              (SELECT value FROM {NAMED_DISPUTES} UNION SELECT ?2)), \
+         last_disputed_at = ?3, last_modified_at = ?3 \
+         WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM {NAMED_DISPUTES} WHERE value = ?2)"
+    )
+}
+
+/// Records the pair's state after a verdict. A pair with no row (two rows
+/// linked only by `superseded_by`, from before the pair table) gets one.
+const RECORD_PAIR_SQL: &str = "INSERT INTO memory_conflict \
+     (new_id, old_id, distance, state, verdict, reason, created_at, judged_at) \
+     VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7) \
+     ON CONFLICT (new_id, old_id) DO UPDATE SET \
+       state = excluded.state, verdict = excluded.verdict, reason = excluded.reason, \
+       judged_at = excluded.judged_at";
+
+/// [`judge_pair`] with the outcome a caller that predates verdicts sends.
 pub async fn resolve_dispute_core(
     store: &MemoryStore,
     keep: i64,
@@ -208,48 +285,157 @@ pub async fn resolve_dispute_core(
     outcome: Outcome,
     owner: Option<&str>,
 ) -> Result<Resolution, ResolveError> {
+    let verdict = match outcome {
+        Outcome::Supersede => Verdict::Supersedes,
+        Outcome::KeepBoth => Verdict::Compatible,
+    };
+    judge_pair(store, keep, other, verdict, None, owner).await
+}
+
+/// Judges the pair `keep`, `other` in one transaction, and returns both rows
+/// as they stand afterwards. With `owner`, both rows must belong to that
+/// agent. `keep` only matters for `supersedes`: it is the row that stays.
+pub async fn judge_pair(
+    store: &MemoryStore,
+    keep: i64,
+    other: i64,
+    verdict: Verdict,
+    reason: Option<String>,
+    owner: Option<&str>,
+) -> Result<Resolution, ResolveError> {
     if keep == other {
         return Err(ResolveError::SameRow);
     }
+    let reason = reason.map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
+    if verdict == Verdict::Scoped && reason.is_none() {
+        return Err(ResolveError::ReasonRequired);
+    }
     let now = TimestampMs::now();
     let owner = owner.map(str::to_owned);
+    let (new, old) = (keep.max(other), keep.min(other));
     store
         .conn
         .call(move |c| -> Result<Resolution, ResolveError> {
+            use rusqlite::OptionalExtension;
             let tx = c.transaction()?;
-            check_pair(
-                &read_pair_row(&tx, keep, owner.as_deref())?,
-                &read_pair_row(&tx, other, owner.as_deref())?,
-            )?;
+            let keep_row = read_pair_row(&tx, keep, owner.as_deref())?;
+            let other_row = read_pair_row(&tx, other, owner.as_deref())?;
+            let state: Option<String> = tx
+                .query_row(
+                    "SELECT state FROM memory_conflict WHERE new_id = ?1 AND old_id = ?2",
+                    [new, old],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            check_pair(&keep_row, &other_row, state.is_some())?;
+            if verdict == Verdict::Supersedes
+                && state.as_deref() == Some("pending")
+                && (keep_row.protected() || other_row.protected())
+            {
+                return Err(ResolveError::NeedsUser { keep, other });
+            }
 
             let drop_dispute = drop_dispute_sql();
-            tx.execute(&drop_dispute, rusqlite::params![keep, other, now])?;
-            tx.execute(&drop_dispute, rusqlite::params![other, keep, now])?;
+            if verdict != Verdict::Conflicts {
+                tx.execute(&drop_dispute, rusqlite::params![keep, other, now])?;
+                tx.execute(&drop_dispute, rusqlite::params![other, keep, now])?;
+            }
             tx.execute(REVIVE_SQL, rusqlite::params![keep, other, now])?;
-            match outcome {
-                Outcome::Supersede => {
+            match verdict {
+                Verdict::Supersedes => {
                     tx.execute(SUPERSEDE_SQL, rusqlite::params![other, keep, now])?;
                     release_challengers(&tx, other, now)?;
                 }
-                Outcome::KeepBoth => {
+                Verdict::Compatible | Verdict::Scoped => {
                     tx.execute(REVIVE_SQL, rusqlite::params![other, keep, now])?;
+                }
+                Verdict::Conflicts => {
+                    tx.execute(REVIVE_SQL, rusqlite::params![other, keep, now])?;
+                    tx.execute(&add_dispute_sql(), rusqlite::params![new, old, now])?;
                 }
             }
             let settle_one = settle_sql("id = ?2");
             tx.execute(&settle_one, rusqlite::params![now, keep])?;
             tx.execute(&settle_one, rusqlite::params![now, other])?;
 
-            let resolution = Resolution { keep: read_resolved(&tx, keep)?, other: read_resolved(&tx, other)? };
+            let (pair, judged, judged_at) = match verdict {
+                Verdict::Conflicts => ("escalated", None, None),
+                v => ("judged", Some(v.as_str()), Some(now)),
+            };
+            tx.execute(RECORD_PAIR_SQL, rusqlite::params![new, old, pair, judged, reason, now, judged_at])?;
+
+            let resolution = Resolution {
+                keep: read_resolved(&tx, keep)?,
+                other: read_resolved(&tx, other)?,
+                pair: Some(pair.to_string()),
+            };
             tx.commit()?;
             Ok(resolution)
         })
         .await
         .map_err(|e| match e {
             tokio_rusqlite::Error::Error(e) => e,
-            tokio_rusqlite::Error::ConnectionClosed => ResolveError::Store(MemoryError::Backend(
-                "connection closed during resolve_dispute_core".into(),
-            )),
+            tokio_rusqlite::Error::ConnectionClosed => {
+                ResolveError::Store(MemoryError::Backend("connection closed during judge_pair".into()))
+            }
             other => ResolveError::Store(MemoryError::Backend(other.to_string())),
+        })
+}
+
+/// A pair waiting for the agent's verdict.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpenPair {
+    pub new_id: i64,
+    pub old_id: i64,
+    pub distance: Option<f64>,
+    pub created_at: i64,
+}
+
+/// The pairs not judged yet, among live rows.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OpenPairs {
+    pub pending: i64,
+    pub escalated: i64,
+    /// The oldest pending pairs, up to the limit asked for.
+    pub pairs: Vec<OpenPair>,
+}
+
+/// A pair counts while both rows are live; with `owner`, only that agent's.
+const OPEN_PAIR_FROM: &str = "FROM memory_conflict p \
+     JOIN memory n ON n.id = p.new_id JOIN memory o ON o.id = p.old_id \
+     WHERE n.deleted_at IS NULL AND o.deleted_at IS NULL \
+       AND n.status <> 'superseded' AND o.status <> 'superseded' \
+       AND (?1 IS NULL OR n.agent_id = ?1)";
+
+/// Counts the open pairs and lists the `limit` oldest pending ones.
+pub async fn open_pairs(store: &MemoryStore, owner: Option<&str>, limit: usize) -> Result<OpenPairs, MemoryError> {
+    let owner = owner.map(str::to_owned);
+    store
+        .conn
+        .call(move |c| -> rusqlite::Result<OpenPairs> {
+            let (pending, escalated) = c.query_row(
+                &format!(
+                    "SELECT COALESCE(SUM(p.state = 'pending'), 0), COALESCE(SUM(p.state = 'escalated'), 0) \
+                     {OPEN_PAIR_FROM}"
+                ),
+                [&owner],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let mut stmt = c.prepare(&format!(
+                "SELECT p.new_id, p.old_id, p.distance, p.created_at {OPEN_PAIR_FROM} AND p.state = 'pending' \
+                 ORDER BY p.created_at, p.new_id, p.old_id LIMIT ?2"
+            ))?;
+            let pairs = stmt
+                .query_map(rusqlite::params![owner, limit as i64], |r| {
+                    Ok(OpenPair { new_id: r.get(0)?, old_id: r.get(1)?, distance: r.get(2)?, created_at: r.get(3)? })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(OpenPairs { pending, escalated, pairs })
+        })
+        .await
+        .map_err(|e| match e {
+            tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
+            other => MemoryError::Backend(format!("open_pairs: {other}")),
         })
 }
 
@@ -260,7 +446,7 @@ mod tests {
     use crate::memory::search::{search_all_memories, SearchScope};
 
     fn pair_row(id: i64, status: &str, superseded_by: Option<i64>, disputes: &[i64]) -> PairRow {
-        PairRow { id, status: status.into(), superseded_by, disputes: disputes.to_vec() }
+        PairRow { id, status: status.into(), superseded_by, disputes: disputes.to_vec(), memory_type: "semantic_fact".into() }
     }
 
     // ── check_pair ──────────────────────────────────────────────────────────
@@ -269,38 +455,45 @@ mod tests {
     fn a_dispute_in_either_direction_links_the_pair() {
         let old = pair_row(1, "active", None, &[]);
         let new = pair_row(2, "disputed", None, &[1]);
-        assert!(check_pair(&new, &old).is_ok());
-        assert!(check_pair(&old, &new).is_ok());
+        assert!(check_pair(&new, &old, false).is_ok());
+        assert!(check_pair(&old, &new, false).is_ok());
     }
 
     #[test]
     fn a_superseded_link_in_either_direction_links_the_pair() {
         let winner = pair_row(1, "active", None, &[]);
         let loser = pair_row(2, "superseded", Some(1), &[]);
-        assert!(check_pair(&winner, &loser).is_ok());
-        assert!(check_pair(&loser, &winner).is_ok());
+        assert!(check_pair(&winner, &loser, false).is_ok());
+        assert!(check_pair(&loser, &winner, false).is_ok());
+    }
+
+    #[test]
+    fn a_noted_pair_links_the_rows() {
+        let a = pair_row(1, "active", None, &[]);
+        let b = pair_row(2, "active", None, &[]);
+        assert!(check_pair(&a, &b, true).is_ok());
     }
 
     #[test]
     fn unrelated_rows_are_not_linked() {
         let a = pair_row(1, "active", None, &[]);
         let b = pair_row(2, "disputed", None, &[3]);
-        assert!(matches!(check_pair(&a, &b), Err(ResolveError::NotInDispute { keep: 1, other: 2 })));
+        assert!(matches!(check_pair(&a, &b, false), Err(ResolveError::NotInDispute { keep: 1, other: 2 })));
     }
 
     #[test]
     fn a_row_superseded_by_a_third_row_is_refused() {
         let a = pair_row(1, "superseded", Some(9), &[2]);
         let b = pair_row(2, "active", None, &[]);
-        assert!(matches!(check_pair(&a, &b), Err(ResolveError::SupersededElsewhere { id: 1, by: 9 })));
-        assert!(matches!(check_pair(&b, &a), Err(ResolveError::SupersededElsewhere { id: 1, by: 9 })));
+        assert!(matches!(check_pair(&a, &b, false), Err(ResolveError::SupersededElsewhere { id: 1, by: 9 })));
+        assert!(matches!(check_pair(&b, &a, false), Err(ResolveError::SupersededElsewhere { id: 1, by: 9 })));
     }
 
     #[test]
     fn a_stale_superseded_by_on_a_live_row_does_not_link() {
         let a = pair_row(1, "active", Some(2), &[]);
         let b = pair_row(2, "active", None, &[]);
-        assert!(matches!(check_pair(&a, &b), Err(ResolveError::NotInDispute { .. })));
+        assert!(matches!(check_pair(&a, &b, false), Err(ResolveError::NotInDispute { .. })));
     }
 
     // ── against the store ───────────────────────────────────────────────────
@@ -596,6 +789,209 @@ mod tests {
         assert_eq!(row(&store, old).await.status, "superseded");
         assert_eq!(row(&store, new).await.status, "active");
         assert_eq!(row(&store, orphan).await.status, "active");
+    }
+
+    // ── verdicts ────────────────────────────────────────────────────────────
+
+    async fn seed_typed(store: &MemoryStore, memory_type: &str, status: &str, disputes: &[i64], axis: usize) -> i64 {
+        let id = seed(store, &format!("claim on axis {axis}"), status, disputes, axis).await;
+        let memory_type = memory_type.to_string();
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE memory SET memory_type = ?2 WHERE id = ?1", rusqlite::params![id, memory_type]))
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn note_pair(store: &MemoryStore, new: i64, old: i64, state: &str) {
+        let state = state.to_string();
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (?1, ?2, 0.3, ?3, 1000)",
+                    rusqlite::params![new, old, state],
+                )
+            })
+            .await
+            .unwrap();
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct Pair {
+        state: String,
+        verdict: Option<String>,
+        reason: Option<String>,
+        judged: bool,
+    }
+
+    async fn pair_of(store: &MemoryStore, new: i64, old: i64) -> Pair {
+        store
+            .conn
+            .call(move |c| {
+                c.query_row(
+                    "SELECT state, verdict, reason, judged_at IS NOT NULL FROM memory_conflict \
+                     WHERE new_id = ?1 AND old_id = ?2",
+                    [new, old],
+                    |r| Ok(Pair { state: r.get(0)?, verdict: r.get(1)?, reason: r.get(2)?, judged: r.get(3)? }),
+                )
+            })
+            .await
+            .unwrap()
+    }
+
+    fn judged(verdict: &str, reason: Option<&str>) -> Pair {
+        Pair { state: "judged".into(), verdict: Some(verdict.into()), reason: reason.map(str::to_owned), judged: true }
+    }
+
+    #[tokio::test]
+    async fn supersedes_keeps_the_superseding_effect_and_judges_the_pair() {
+        let store = store().await;
+        let old = seed(&store, "the API listens on 8080", "active", &[], 0).await;
+        let new = seed(&store, "the API listens on 9090", "disputed", &[old], 1).await;
+        note_pair(&store, new, old, "escalated").await;
+
+        let resolution = judge_pair(&store, new, old, Verdict::Supersedes, None, None).await.unwrap();
+
+        assert_eq!(resolution.other, ResolvedRow { id: old, status: "superseded".into(), superseded_by: Some(new) });
+        assert_eq!(resolution.pair.as_deref(), Some("judged"));
+        assert_eq!(pair_of(&store, new, old).await, judged("supersedes", None));
+
+        let undone = judge_pair(&store, old, new, Verdict::Compatible, None, None).await.unwrap();
+        assert_eq!((undone.keep.status.as_str(), undone.other.status.as_str()), ("active", "active"));
+        assert_eq!(pair_of(&store, new, old).await, judged("compatible", None));
+    }
+
+    #[tokio::test]
+    async fn compatible_and_scoped_close_without_touching_the_ranking() {
+        let store = store().await;
+        let old = seed(&store, "old", "active", &[], 0).await;
+        let a = seed(&store, "a", "active", &[], 1).await;
+        let b = seed(&store, "b", "active", &[], 2).await;
+        note_pair(&store, a, old, "pending").await;
+        note_pair(&store, b, old, "pending").await;
+
+        judge_pair(&store, a, old, Verdict::Compatible, None, None).await.unwrap();
+        judge_pair(&store, old, b, Verdict::Scoped, Some("one is the dev profile".into()), None).await.unwrap();
+
+        assert_eq!(pair_of(&store, a, old).await, judged("compatible", None));
+        assert_eq!(pair_of(&store, b, old).await, judged("scoped", Some("one is the dev profile")));
+        for id in [old, a, b] {
+            assert_eq!(row(&store, id).await.status, "active");
+        }
+        let hits = search_all_memories(&store, &basis(0), None, "agent-d", SearchScope::all_default(), 10)
+            .await
+            .unwrap();
+        assert!(hits.iter().any(|h| h.id == old), "{hits:?}");
+    }
+
+    #[tokio::test]
+    async fn scoped_without_a_reason_is_refused() {
+        let store = store().await;
+        let old = seed(&store, "old", "active", &[], 0).await;
+        let new = seed(&store, "new", "active", &[], 1).await;
+        note_pair(&store, new, old, "pending").await;
+
+        for reason in [None, Some("  ".to_string())] {
+            assert!(matches!(
+                judge_pair(&store, new, old, Verdict::Scoped, reason, None).await,
+                Err(ResolveError::ReasonRequired)
+            ));
+        }
+        assert_eq!(pair_of(&store, new, old).await.state, "pending");
+    }
+
+    #[tokio::test]
+    async fn conflicts_escalates_a_pending_pair() {
+        let store = store().await;
+        let old = seed(&store, "old", "active", &[], 0).await;
+        let new = seed(&store, "new", "active", &[], 1).await;
+        note_pair(&store, new, old, "pending").await;
+
+        let resolution = judge_pair(&store, old, new, Verdict::Conflicts, Some("ports differ".into()), None).await.unwrap();
+
+        assert_eq!(resolution.pair.as_deref(), Some("escalated"));
+        let newer = row(&store, new).await;
+        assert_eq!((newer.status.as_str(), newer.disputes), ("disputed", Some(format!("[{old}]"))));
+        let pair = pair_of(&store, new, old).await;
+        assert_eq!((pair.state.as_str(), pair.verdict, pair.judged), ("escalated", None, false));
+
+        let again = judge_pair(&store, new, old, Verdict::Conflicts, None, None).await.unwrap();
+        assert_eq!(row(&store, new).await.disputes, Some(format!("[{old}]")), "named once");
+        assert_eq!(again.keep.status, "disputed");
+    }
+
+    #[tokio::test]
+    async fn a_protected_pending_pair_is_not_superseded_without_the_user() {
+        let store = store().await;
+        let old = seed_typed(&store, "user_preference", "active", &[], 0).await;
+        let new = seed_typed(&store, "semantic_fact", "active", &[], 1).await;
+        note_pair(&store, new, old, "pending").await;
+
+        assert!(matches!(
+            judge_pair(&store, new, old, Verdict::Supersedes, None, None).await,
+            Err(ResolveError::NeedsUser { .. })
+        ));
+        assert_eq!(row(&store, old).await.status, "active", "a refused verdict changes nothing");
+
+        judge_pair(&store, new, old, Verdict::Conflicts, None, None).await.unwrap();
+        let resolution = judge_pair(&store, new, old, Verdict::Supersedes, None, None).await.unwrap();
+        assert_eq!(resolution.other.status, "superseded");
+    }
+
+    #[tokio::test]
+    async fn a_pending_pair_links_the_rows() {
+        let store = store().await;
+        let old = seed(&store, "old", "active", &[], 0).await;
+        let new = seed(&store, "new", "active", &[], 1).await;
+        assert!(matches!(
+            judge_pair(&store, new, old, Verdict::Compatible, None, None).await,
+            Err(ResolveError::NotInDispute { .. })
+        ));
+
+        note_pair(&store, new, old, "pending").await;
+
+        assert!(judge_pair(&store, new, old, Verdict::Compatible, None, None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_old_resolve_records_its_verdict() {
+        let store = store().await;
+        let old = seed(&store, "old", "active", &[], 0).await;
+        let new = seed(&store, "new", "disputed", &[old], 1).await;
+
+        resolve_dispute_core(&store, new, old, Outcome::KeepBoth, None).await.unwrap();
+
+        assert_eq!(pair_of(&store, new, old).await, judged("compatible", None));
+    }
+
+    #[tokio::test]
+    async fn open_pairs_count_and_list_the_live_pending_ones() {
+        let store = store().await;
+        let old = seed(&store, "old", "active", &[], 0).await;
+        let a = seed(&store, "a", "active", &[], 1).await;
+        let b = seed(&store, "b", "disputed", &[old], 2).await;
+        let gone = seed(&store, "gone", "active", &[], 3).await;
+        note_pair(&store, a, old, "pending").await;
+        note_pair(&store, b, old, "escalated").await;
+        note_pair(&store, gone, old, "pending").await;
+        soft_delete(&store, gone).await;
+
+        let open = open_pairs(&store, Some("agent-d"), 5).await.unwrap();
+
+        assert_eq!((open.pending, open.escalated), (1, 1));
+        assert_eq!(open.pairs.iter().map(|p| (p.new_id, p.old_id)).collect::<Vec<_>>(), vec![(a, old)]);
+        assert_eq!(open_pairs(&store, Some("agent-x"), 5).await.unwrap().pending, 0);
+    }
+
+    #[test]
+    fn every_verdict_parses_back_to_itself() {
+        for v in Verdict::ALL {
+            assert_eq!(v.as_str().parse::<Verdict>().unwrap(), v);
+        }
+        let err = "keep_both".parse::<Verdict>().unwrap_err().to_string();
+        assert!(err.contains("supersedes, compatible, scoped, conflicts"), "{err}");
     }
 
     #[tokio::test]

@@ -1163,11 +1163,11 @@ async fn resolve_dispute(
         .await
         .map(Json)
         .map_err(|e| match e {
-            ResolveError::SameRow => ApiError::bad_request(e.to_string()),
+            ResolveError::SameRow | ResolveError::ReasonRequired => ApiError::bad_request(e.to_string()),
             ResolveError::NotFound(_) => ApiError::not_found(e.to_string()),
-            ResolveError::NotInDispute { .. } | ResolveError::SupersededElsewhere { .. } => {
-                ApiError::conflict(e.to_string())
-            }
+            ResolveError::NotInDispute { .. }
+            | ResolveError::SupersededElsewhere { .. }
+            | ResolveError::NeedsUser { .. } => ApiError::conflict(e.to_string()),
             ResolveError::Store(_) => ApiError::internal(e),
         })
 }
