@@ -44,6 +44,7 @@ pub mod redact;
 pub mod secrets;
 pub mod sharing;
 
+pub use contradiction::Candidate;
 pub use db::MemoryStore;
 pub use error::MemoryError;
 pub use identity::{derive_project_id, ProjectIdentity};

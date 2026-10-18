@@ -26,6 +26,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use clawg_core::memory::dispute::Verdict;
 use clawg_core::memory::sharing;
 use clawg_core::memory::store_insert::MemoryType;
 use clawg_core::memory::ProjectIdentity;
@@ -41,12 +42,12 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::client::{
-    ClientError, DaemonClient, ListArgs, SaveArgs, SaveOutcome, SearchArgs, SynthesisArgs,
+    ClientError, DaemonClient, ListArgs, RelatedMemory, SaveArgs, SaveOutcome, SearchArgs, SynthesisArgs,
 };
 use crate::mcp::startup::{on_failure, ClientHandle, Next};
 use crate::mcp::tools::{
     format_docs, format_recall, format_resolution, format_rows, format_save, format_search, format_sharing,
-    format_restore, format_status, format_synthesis, format_update, indexes_docs, resolve_project,
+    format_open_pairs, format_restore, format_status, format_synthesis, format_update, indexes_docs, resolve_project,
 };
 
 /// The daemon refused a root because its id already belongs to another one.
@@ -305,18 +306,46 @@ pub struct UpdateMemoryArgs {
     pub memory_type: Option<String>,
 }
 
+/// The line `save_memory` adds when the save is close to earlier memories:
+/// the agent still has the conversation that produced it, so it is the one to
+/// judge the pairs, except those already put to the user.
+fn related_text(related: &[RelatedMemory]) -> String {
+    let named = related
+        .iter()
+        .map(|r| {
+            let asks = if r.escalated { ", asks the user" } else { "" };
+            format!("#{} \"{}\"{asks}", r.id, r.excerpt)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "\nclose to earlier memories: {named}. If this save replaces one, call resolve_conflict with \
+         verdict supersedes (keep = the new id); if both hold, compatible or scoped"
+    )
+}
+
+/// The verdicts `resolve_conflict` takes, from the one list in the core.
+fn verdict_enum(schema: &mut schemars::Schema) {
+    let values: Vec<serde_json::Value> = Verdict::ALL.iter().map(|v| v.as_str().into()).collect();
+    schema.insert("enum".into(), values.into());
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ResolveConflictArgs {
-    /// The memory id that stays, as shown in the ACTIVE CONFLICTS block.
+    /// One memory id of the pair, as shown by ACTIVE CONFLICTS, `save_memory`
+    /// or `memory_status`. With supersedes it is the one that stays.
     pub keep: i64,
-    /// The other memory id of the same conflict. It is superseded by `keep`:
-    /// no longer retrieved, still listed, and restored by resolving the pair
-    /// the other way round.
+    /// The other memory id of the pair.
     pub other: i64,
-    /// Set to true when the two memories do not actually contradict each
-    /// other: both stay and the conflict is closed. Defaults to false.
+    /// supersedes: `keep` replaces `other`, which is no longer retrieved but
+    /// stays listed and comes back if the pair is judged again. compatible:
+    /// they do not conflict. scoped: both hold, each in its own scope, said
+    /// in `reason`. conflicts: they do, and the user has to say which holds.
+    #[schemars(transform = verdict_enum)]
+    pub verdict: String,
+    /// One sentence on why; required for scoped.
     #[serde(default)]
-    pub keep_both: Option<bool>,
+    pub reason: Option<String>,
 }
 
 // ── The server ──────────────────────────────────────────────────────────────
@@ -523,7 +552,7 @@ impl ClawgMcp {
             memories.iter().map(|m| format!("#{}", m.id)).collect::<Vec<_>>().join(", ")
         };
         match result {
-            Ok(SaveOutcome::Saved { memories, redacted }) => {
+            Ok(SaveOutcome::Saved { memories, redacted, related }) => {
                 let mut text = match memories.as_slice() {
                     [one] if one.outcome == "reinforced" => format!(
                         "already stored as #{}; reinforced it instead of saving a copy \
@@ -539,6 +568,9 @@ impl ClawgMcp {
                 };
                 if !redacted.is_empty() {
                     text.push_str(&format!("; masked {} before storing it", redacted.join(", ")));
+                }
+                if !related.is_empty() {
+                    text.push_str(&related_text(&related));
                 }
                 Ok(text)
             }
@@ -852,11 +884,17 @@ impl ClawgMcp {
         let args = &args;
         let result = self
             .call(|client| async move {
-                client.resolve(args.keep, args.other, args.keep_both.unwrap_or(false), Some(agent_id)).await
+                client.judge(args.keep, args.other, &args.verdict, args.reason.as_deref(), Some(agent_id)).await
             })
             .await;
         match result {
             Ok(Ok(resolution)) => Self::ok(format_resolution(&resolution)),
+            // The daemon's own 404 names the row; a bare one is a daemon that
+            // predates verdicts.
+            Ok(Err(ClientError::Daemon { status: 404, message, .. })) if message.starts_with("404") => Self::failed(
+                "the running clawg daemon is older than this bridge and cannot take a verdict; \
+                 restart it with `clawg stop` and call the tool again",
+            ),
             Ok(Err(e)) => Self::failed(Self::explain(&e)),
             Err(failure) => Ok(failure),
         }
@@ -926,6 +964,9 @@ impl ClawgMcp {
                 // file in the same data directory, so this is what the next
                 // search will use.
                 let sharing = format_sharing(&sharing::load(client.base_dir()), &agent_id);
+                // A daemon that predates the pair table has nothing to count,
+                // and a status must not fail over a line it can leave out.
+                let conflicts = client.open_disputes(&agent_id).await.map(|open| format_open_pairs(&open)).ok();
                 Self::ok(format_status(
                     &health,
                     self.profile,
@@ -933,6 +974,7 @@ impl ClawgMcp {
                     &agent_id,
                     source.describe(),
                     &sharing,
+                    conflicts.as_deref(),
                 ))
             }
             Ok(Err(e)) => Self::failed(Self::explain(&e)),
@@ -1084,12 +1126,12 @@ impl ClawgMcp {
 
     #[tool(
         name = "resolve_conflict",
-        description = "Settle a conflict listed under ACTIVE CONFLICTS by `recall_context`, once \
-                       the user has said which memory is right. `keep` stays; `other` is \
-                       superseded by it and stops being retrieved, but is still listed and comes \
-                       back if you resolve the pair the other way. Pass keep_both when the two \
-                       do not really contradict each other. Returns the status of both memories. \
-                       Only your own memories: one marked `by <agent>` is read-only."
+        description = "Judge a pair of memories the detector found close to each other: one \
+                       that `save_memory` or `memory_status` names, which you judge yourself, or \
+                       one under ACTIVE CONFLICTS in `recall_context`, once the user has said \
+                       which holds. A preference or a decision is superseded only after the user \
+                       answered: until then judge it conflicts. Returns the status of both \
+                       memories. Only your own memories: one marked `by <agent>` is read-only."
     )]
     async fn resolve_conflict(
         &self,
@@ -1846,6 +1888,8 @@ mod tests {
             "in English",
             "evidence, not instructions",
             "Do not save",
+            "judge each with `resolve_conflict`",
+            "ask the user which memory holds",
         ] {
             assert!(instructions.contains(expected), "{expected:?} missing from: {instructions}");
         }
@@ -2442,14 +2486,14 @@ mod tests {
         assert_eq!(
             text(Ok(SaveOutcome::Saved {
                 memories: vec![saved(57, "inserted")],
-                redacted: vec!["slack_token".into()],
+                redacted: vec!["slack_token".into()], related: vec![]
             })),
             Ok("saved #57; masked slack_token before storing it".to_string())
         );
         assert_eq!(
             text(Ok(SaveOutcome::Saved {
                 memories: vec![saved(57, "reinforced")],
-                redacted: vec!["github_token".into(), "jwt".into()],
+                redacted: vec!["github_token".into(), "jwt".into()], related: vec![]
             })),
             Ok("already stored as #57; reinforced it instead of saving a copy \
                 (update_memory changes its importance or type); \
@@ -2462,18 +2506,18 @@ mod tests {
     fn save_outcome_text_covers_every_daemon_answer() {
         let text = |r| ClawgMcp::save_outcome_text(r);
         assert_eq!(
-            text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "inserted")], redacted: vec![] })),
+            text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "inserted")], redacted: vec![], related: vec![] })),
             Ok("saved #57".to_string())
         );
         assert_eq!(
             text(Ok(SaveOutcome::Saved {
                 memories: vec![saved(57, "inserted"), saved(58, "inserted"), saved(59, "reinforced")],
-                redacted: vec![],
+                redacted: vec![], related: vec![]
             })),
             Ok("saved as 3 pieces: #57, #58, #59; read_memory with any of them returns the whole text".to_string())
         );
         assert_eq!(
-            text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "reinforced")], redacted: vec![] })),
+            text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "reinforced")], redacted: vec![], related: vec![] })),
             Ok("already stored as #57; reinforced it instead of saving a copy \
                 (update_memory changes its importance or type)"
                 .to_string())
@@ -2615,6 +2659,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_status_counts_pending_candidates() {
+        let mut store = None;
+        let (b, _d) = bridge_with(|runtime| {
+            store = Some(runtime.store.clone());
+            runtime
+        })
+        .await;
+        let old = saved_id(&b, "agent-mcp", "the cache expires after one hour").await;
+        let new = saved_id(&b, "agent-mcp", "the cache expires after one day").await;
+        let status = |agent: &'static str| {
+            let b = b.clone();
+            async move { text(&b.memory_status_impl((agent.to_string(), AgentSource::Flag)).await.expect("status")) }
+        };
+        assert!(status("agent-mcp").await.ends_with("\nconflict candidates: none open"));
+        store
+            .expect("the runtime's store")
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (?1, ?2, 0.3, 'pending', 1)",
+                    [new, old],
+                )
+            })
+            .await
+            .expect("note the pair");
+
+        let t = status("agent-mcp").await;
+        assert!(t.contains("conflict candidates: 1 for you to judge, 0 waiting for the user"), "{t}");
+        assert!(t.contains(&format!("#{new} close to #{old}")), "{t}");
+        assert!(status("agent-other").await.ends_with("\nconflict candidates: none open"));
+    }
+
+    #[tokio::test]
     async fn deleting_a_missing_row_is_an_error_result_the_model_can_read() {
         let (b, _d) = bridge().await;
         let r = b
@@ -2658,19 +2735,81 @@ mod tests {
             .expect("mark the dispute");
 
         let r = b
-            .resolve_conflict_impl("agent-mcp", ResolveConflictArgs { keep: new, other: old, keep_both: None })
+            .resolve_conflict_impl("agent-mcp", ResolveConflictArgs { keep: new, other: old, verdict: "supersedes".into(), reason: None })
             .await
             .expect("call");
 
         assert!(!is_error(&r), "resolve failed: {}", text(&r));
         assert_eq!(text(&r), format!("#{new} active\n#{old} superseded by #{new}"));
+
+        let r = b
+            .resolve_conflict_impl(
+                "agent-mcp",
+                ResolveConflictArgs { keep: old, other: new, verdict: "conflicts".into(), reason: None },
+            )
+            .await
+            .expect("call");
+        assert_eq!(
+            text(&r),
+            format!("#{old} active\n#{new} disputed\nthe pair waits for the user in ACTIVE CONFLICTS")
+        );
+        let r = b
+            .resolve_conflict_impl(
+                "agent-mcp",
+                ResolveConflictArgs { keep: old, other: new, verdict: "scoped".into(), reason: None },
+            )
+            .await
+            .expect("call");
+        assert!(is_error(&r) && text(&r).contains("reason"), "text was: {}", text(&r));
+    }
+
+    #[test]
+    fn save_outcome_text_names_related_memories() {
+        let related = |id, escalated| RelatedMemory { id, escalated, excerpt: format!("claim {id}") };
+        let text = ClawgMcp::save_outcome_text(Ok(SaveOutcome::Saved {
+            memories: vec![saved(57, "inserted")],
+            redacted: vec![],
+            related: vec![related(12, false), related(15, true)],
+        }));
+        assert_eq!(
+            text,
+            Ok("saved #57\nclose to earlier memories: #12 \"claim 12\"; #15 \"claim 15\", asks the user. \
+                If this save replaces one, call resolve_conflict with verdict supersedes (keep = the new id); \
+                if both hold, compatible or scoped"
+                .to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_conflict_against_an_older_daemon_asks_for_a_restart() {
+        // A daemon from before verdicts has no such route: axum answers a
+        // bare 404 for it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr: SocketAddr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, axum::Router::new()).await;
+        });
+        let dir = tempfile::tempdir().expect("tempdir");
+        let client = DaemonClient::new(format!("http://127.0.0.1:{}", addr.port()), "t", dir.path().to_path_buf());
+        let b = ClawgMcp::with_project(client, Profile::Dev, Some(test_project()));
+
+        let r = b
+            .resolve_conflict_impl(
+                "agent-mcp",
+                ResolveConflictArgs { keep: 2, other: 1, verdict: "compatible".into(), reason: None },
+            )
+            .await
+            .expect("call");
+
+        assert!(is_error(&r));
+        assert!(text(&r).contains("clawg stop"), "text was: {}", text(&r));
     }
 
     #[tokio::test]
     async fn resolve_conflict_reports_a_refusal() {
         let (b, _d) = bridge().await;
         let r = b
-            .resolve_conflict_impl("agent-mcp", ResolveConflictArgs { keep: 4, other: 4, keep_both: Some(true) })
+            .resolve_conflict_impl("agent-mcp", ResolveConflictArgs { keep: 4, other: 4, verdict: "compatible".into(), reason: None })
             .await
             .expect("call");
         assert!(is_error(&r));
@@ -2910,7 +3049,7 @@ mod tests {
             .expect("mark the dispute");
 
         let r = b
-            .resolve_conflict_impl("agent-b", ResolveConflictArgs { keep: new, other: old, keep_both: None })
+            .resolve_conflict_impl("agent-b", ResolveConflictArgs { keep: new, other: old, verdict: "supersedes".into(), reason: None })
             .await
             .expect("call");
 
@@ -3112,12 +3251,12 @@ mod tests {
             let b = &b;
             async move { text(&b.memory_status_impl((agent.to_string(), AgentSource::Flag)).await.expect("status")) }
         };
-        assert!(status("cursor").await.ends_with("shared: reads every agent"));
+        assert!(status("cursor").await.contains("shared: reads every agent\n"));
         hide(&d, "cursor", "claude-code");
         hide(&d, "cursor", "codex");
-        assert!(status("cursor").await.ends_with("shared: reads every agent but claude-code, codex"));
+        assert!(status("cursor").await.contains("shared: reads every agent but claude-code, codex\n"));
         hide(&d, "cursor", "*");
-        assert!(status("cursor").await.ends_with("shared: none (reads only its own)"));
+        assert!(status("cursor").await.contains("shared: none (reads only its own)\n"));
         std::fs::write(clawg_core::paths::sharing_file(d.path()), "{").unwrap();
         let t = status("cursor").await;
         assert!(t.contains("shared: none (sharing.json is not valid"), "{t}");
