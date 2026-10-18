@@ -5,6 +5,7 @@ Memoria local para agentes de código. Claw Garden guarda, clasifica y recupera 
 ## Contenido
 
 - [Instalar desde un release](#instalar-desde-un-release)
+- [Actualizar](#actualizar)
 - [Instalar en Windows](#instalar-en-windows)
 - [Comprobar que funciona](#comprobar-que-funciona)
 - [Ver lo que se guarda](#ver-lo-que-se-guarda)
@@ -66,6 +67,40 @@ La clave privada de uso está cifrada con contraseña y sólo existe como secret
 - **Si se pierde o se filtra la de uso**, se publica un release firmado con la de respaldo que ya no lista la clave comprometida.
 - **Lo que la clave de respaldo no hace:** no protege a los binarios que no se actualicen. Siguen aceptando la clave filtrada hasta que instales un release cuya lista ya no la tenga, y quien tenga esa clave puede firmar un `SHA256SUMS` que ellos acepten. Mientras tanto, desconfiá de cualquier release que no hayas visto anunciado en el repositorio.
 - Si se compromete la de respaldo, se publica un release firmado con la de uso que la saca de la lista.
+
+## Actualizar
+
+Un `clawg` instalado desde un release se actualiza solo, y sólo cuando se lo pedís: el daemon nunca consulta nada por su cuenta.
+
+```
+clawg update --check    # dice si hay una versión nueva; sale con 100 si la hay, 0 si estás al día y 1 si falla
+clawg update            # la instala
+```
+
+`clawg update` baja el binario del último release junto al instalado, verifica la firma de `SHA256SUMS` con las claves del binario y el hash del archivo, y comprueba que el nuevo diga la versión esperada. Hasta ahí no toca nada: si algo falla, el binario, el daemon y tus memorias quedan como estaban. Después detiene el daemon (si había uno), aparta el binario actual como `clawg.exe.old-<fecha>` (`clawg.old-<fecha>` en Linux), pone el nuevo y arranca su daemon en el mismo puerto. Si no había daemon, no arranca ninguno.
+
+- **Si el daemon nuevo no arranca**, vuelven el binario anterior y su daemon, y `clawg update` sale con 1 explicando por qué.
+- **Si el daemon nuevo alcanzó a migrar el store y el anterior ya no lo abre**, `clawg update` restaura el snapshot `pre-migration` que escribió ese arranque y devuelve el binario anterior. El store migrado queda guardado como `pre-restore` en `backups`, así que nada se destruye. Si el restore también falla, queda instalado el binario nuevo (el único que abre ese store) y el informe dice dónde está cada archivo y qué comandos correr.
+- **Si el store tiene migraciones pendientes**, el daemon nuevo escribe antes un snapshot `pre-migration` en `backups` y el informe final nombra su ruta. Volver a la versión anterior después de migrar significa restaurarlo, y se pierde lo que se guardó desde entonces.
+- **Los editores abiertos** siguen con el puente anterior hasta que los reinicies; el puente abierto igual alcanza al daemon nuevo.
+
+`clawg update` se niega, y dice por qué, en un build de desarrollo, en uno compilado a mano (no lleva la marca de un release) y en uno que corre dentro de un directorio `target` de cargo: esos se actualizan con git y cargo. En Linux no usa `sudo`: si no podés escribir donde está el binario, falla antes de bajar nada.
+
+### Volver atrás a mano
+
+Si querés volver a la versión anterior después de una actualización:
+
+```
+clawg stop --profile prod
+```
+
+Poné de nuevo el binario anterior en su nombre: renombrá `clawg.exe.old-<fecha>` (la carpeta de instalación es la de `clawg doctor`) a `clawg.exe`. Si la actualización migró el store, restaurá el snapshot de antes con ese binario:
+
+```
+clawg restore ~/.clawg/backups/memory-<fecha>-pre-migration.db --profile prod
+```
+
+`clawg restore` guarda el store actual como `pre-restore` antes de reemplazarlo. El siguiente comando que necesite el daemon lo arranca.
 
 ## Instalar en Windows
 
@@ -410,6 +445,7 @@ clawg mcp --profile dev       # puente MCP por stdio; arranca un daemon si no ha
 clawg status --profile dev    # estado y salud del daemon en JSON (sale con 1 si no está corriendo)
 clawg stop --profile dev      # detiene el daemon
 clawg doctor                  # a qué clawg resuelve el PATH (sale con 1 si hay uno que tapa o está duplicado)
+clawg update --check          # dice si hay un release nuevo (100 si lo hay); clawg update lo instala
 clawg memories list|search|show|stats   # visor de sólo lectura (list --deleted: las borradas)
 clawg undelete 12 --profile dev         # devuelve una memoria borrada (con el daemon corriendo)
 ```

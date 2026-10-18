@@ -528,6 +528,13 @@ fn the_readme_documents_the_install_and_update_path() {
         ("release/minisign.pub", "the repository key"),
         ("release/minisign-next.pub", "the backup key"),
         ("no protege", "the backup key does not protect binaries that never update"),
+        ("## Actualizar", "the update section"),
+        ("clawg update --check", "how to ask whether there is a newer release"),
+        ("clawg update", "how to update"),
+        ("clawg stop", "the first step of going back by hand"),
+        (".old-", "the previous binary that going back by hand puts back"),
+        ("clawg restore", "how to give the store back its snapshot"),
+        ("pre-migration", "the snapshot taken before a migration"),
     ] {
         assert!(readme.contains(wanted), "README.md lacks {why}: `{wanted}`");
     }
