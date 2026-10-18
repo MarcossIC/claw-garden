@@ -1,6 +1,7 @@
 //! The update as data: which steps run, in which order, and what undoes each.
 
 use std::future::Future;
+use std::path::PathBuf;
 
 /// A daemon that was answering when the update began.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +62,24 @@ pub fn plan(initial: &Initial) -> Vec<Planned> {
 pub trait Effects {
     fn run(&mut self, step: Step) -> impl Future<Output = Result<(), String>>;
     fn undo(&mut self, undo: Undo) -> impl Future<Output = Result<(), String>>;
+    /// Called once the new daemon is gone: gives the store back to the old
+    /// binary if the new one migrated it past what the old one opens.
+    fn restore_store(&mut self) -> impl Future<Output = Result<StoreRestore, String>>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreRestore {
+    NotNeeded,
+    /// `from` replaced the store; the store it replaced is `kept_as`.
+    Restored { from: PathBuf, kept_as: Option<PathBuf> },
+}
+
+/// What happened to the store while undoing.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StoreState {
+    Untouched,
+    Restored { from: PathBuf, kept_as: Option<PathBuf> },
+    RestoreFailed(String),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -78,6 +97,10 @@ pub struct Failure {
     pub undone: Vec<Undo>,
     /// The undos that failed, with their cause.
     pub stuck: Vec<(Undo, String)>,
+    /// The undos left undone because the store could not be given back: the
+    /// new binary stays, the only one that opens the migrated store.
+    pub skipped: Vec<Undo>,
+    pub store: StoreState,
 }
 
 impl Step {
@@ -110,13 +133,26 @@ pub async fn apply<E: Effects>(plan: &[Planned], fx: &mut E) -> Outcome {
 async fn roll_back<E: Effects>(step: Step, cause: String, done: Vec<Undo>, fx: &mut E) -> Failure {
     let mut undone = Vec::new();
     let mut stuck = Vec::new();
-    for undo in done.into_iter().rev() {
+    let mut store = StoreState::Untouched;
+    let mut pending = done.into_iter().rev();
+    while let Some(undo) = pending.next() {
         match fx.undo(undo).await {
             Ok(()) => undone.push(undo),
             Err(why) => stuck.push((undo, why)),
         }
+        if undo != Undo::EndNewDaemon {
+            continue;
+        }
+        match fx.restore_store().await {
+            Ok(StoreRestore::NotNeeded) => {}
+            Ok(StoreRestore::Restored { from, kept_as }) => store = StoreState::Restored { from, kept_as },
+            Err(why) => {
+                let skipped = pending.collect();
+                return Failure { step, cause, undone, stuck, skipped, store: StoreState::RestoreFailed(why) };
+            }
+        }
     }
-    Failure { step, cause, undone, stuck }
+    Failure { step, cause, undone, stuck, skipped: Vec::new(), store }
 }
 
 #[cfg(test)]
@@ -192,6 +228,7 @@ mod apply_cases {
         calls: Vec<String>,
         fail_run: Option<(Step, &'static str)>,
         fail_undo: Option<Undo>,
+        restore: Result<StoreRestore, String>,
     }
 
     impl Fake {
@@ -204,6 +241,7 @@ mod apply_cases {
                 calls: Vec::new(),
                 fail_run: None,
                 fail_undo: None,
+                restore: Ok(StoreRestore::NotNeeded),
             }
         }
 
@@ -254,6 +292,11 @@ mod apply_cases {
                 Undo::EndNewDaemon => self.daemon = Daemon::Stopped,
             }
             Ok(())
+        }
+
+        async fn restore_store(&mut self) -> Result<StoreRestore, String> {
+            self.calls.push("restore_store".into());
+            self.restore.clone()
         }
     }
 
@@ -312,6 +355,82 @@ mod apply_cases {
             assert!(failure.stuck.is_empty());
             assert!(fake.as_it_was(), "{step:?} left the installation changed");
         }
+    }
+
+    fn restored() -> StoreRestore {
+        StoreRestore::Restored { from: "backups/pre-migration.db".into(), kept_as: Some("backups/pre-restore.db".into()) }
+    }
+
+    #[tokio::test]
+    async fn a_store_the_old_binary_cannot_open_is_restored_before_the_old_binary_returns() {
+        let mut fake = Fake::failing(Step::StartDaemon, "the new daemon migrated and stopped answering");
+        fake.restore = Ok(restored());
+
+        let failure = failure(apply(&with_daemon(), &mut fake).await);
+
+        assert_eq!(
+            failure.store,
+            StoreState::Restored {
+                from: "backups/pre-migration.db".into(),
+                kept_as: Some("backups/pre-restore.db".into())
+            }
+        );
+        assert_eq!(
+            fake.calls[6..],
+            [
+                "undo EndNewDaemon",
+                "restore_store",
+                "undo TakeBackNew",
+                "undo RestoreAside",
+                "undo StartOldDaemon",
+                "undo RemoveStaged"
+            ],
+            "the child is gone before the store is touched, and the old daemon starts on the restored store"
+        );
+        assert!(fake.as_it_was());
+    }
+
+    #[tokio::test]
+    async fn a_failed_restore_leaves_the_new_binary_and_explains_the_way_back() {
+        let mut fake = Fake::failing(Step::StartDaemon, "the new daemon migrated and stopped answering");
+        fake.restore = Err("the snapshot is missing".into());
+
+        let failure = failure(apply(&with_daemon(), &mut fake).await);
+
+        assert_eq!(failure.store, StoreState::RestoreFailed("the snapshot is missing".into()));
+        assert_eq!(failure.undone, [Undo::EndNewDaemon]);
+        assert_eq!(
+            failure.skipped,
+            [Undo::TakeBackNew, Undo::RestoreAside, Undo::StartOldDaemon, Undo::RemoveStaged]
+        );
+        assert_eq!(
+            (fake.installed, fake.aside, fake.daemon),
+            (Some("new"), Some("old"), Daemon::Stopped),
+            "the new binary stays: it is the only one that opens the migrated store"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_store_is_only_looked_at_when_a_new_daemon_was_started() {
+        for step in [Step::Stage, Step::StopDaemon, Step::SetAside, Step::PutInPlace] {
+            let mut fake = Fake::failing(step, "it broke");
+            fake.restore = Err("must not be asked".into());
+
+            let failure = failure(apply(&with_daemon(), &mut fake).await);
+
+            assert_eq!(failure.store, StoreState::Untouched, "{step:?}");
+            assert!(!fake.calls.contains(&"restore_store".to_string()), "{step:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_that_needs_no_restore_is_left_alone() {
+        let mut fake = Fake::failing(Step::StartDaemon, "the new daemon refused the store");
+
+        let failure = failure(apply(&with_daemon(), &mut fake).await);
+
+        assert_eq!(failure.store, StoreState::Untouched);
+        assert!(fake.as_it_was());
     }
 
     #[tokio::test]
