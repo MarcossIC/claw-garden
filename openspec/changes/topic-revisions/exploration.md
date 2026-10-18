@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 | M (append-only por clave) a L (reemplazo en el lugar con historial) | conflict-candidates (blanda; ver «Dependencia») | exploración (borrador) |
+| 1 | M (append-only por clave) a L (reemplazo en el lugar con historial) | conflict-candidates (blanda; ver «Dependencia») | exploración cerrada; decisiones en la [propuesta](proposal.md#decisiones) |
 
 **Tesis:** una decisión que evoluciona («la base es X», después «migramos a Y») hoy termina en **dos filas vivas**, y la vieja sigue puntuando en el ranking. El detector sólo la frena si las dos caen en su banda, y en ese caso lo único que hace es pedirle una decisión al usuario. No hay una forma de decir «esto reemplaza a aquello» sin conocer el id del viejo y sin perder su historia. La pregunta de diseño es si la revisión **reemplaza el contenido de una fila** (conserva id, accesos y tier, pero rompe la inmutabilidad que sostiene varios índices) o **encadena una fila nueva** (más filas, pero todo lo que existe sigue siendo cierto).
 
@@ -155,7 +155,9 @@ Por eso `depends_on: [conflict-candidates]` queda como se planeó, con ese motiv
 
 ## Decisiones abiertas
 
-Son del usuario.
+Son del usuario. Quedaron tomadas en la [propuesta](proposal.md#decisiones): E2, sin puerta por id, clave con el formato propuesto y alcance agente + proyecto, herencia de tier, accesos, tipo e importancia, y revisión de preferencias y decisiones sin pasar por el usuario.
+
+Desde que se escribió esta exploración se archivó conflict-candidates: la banda ya no marca `disputed` toda candidata (sólo los pares escalados), las candidatas vuelven en `related`, y el spill se reemplazó por la outbox (`ingest_outbox`). Las citas `path:line` de arriba son de antes de ese cambio; la propuesta las vuelve a citar contra `main`.
 
 - [ ] **Enfoque.** E1 (reemplazo en el lugar con historial, el del pedido), E2 (encadenado por clave, recomendado como primer paso) o E3 (`replaces: <id>`). Decide también si se acepta que el id cambie.
 - [ ] **Puerta del reemplazo por id.** ¿`replaces` en `save_memory` (E3) o `content` en `update_memory` (E3b)? Una sola de las dos.
