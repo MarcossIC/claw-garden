@@ -4,6 +4,7 @@ pub mod client;
 pub mod eligibility;
 pub mod plan;
 pub mod release;
+pub mod report;
 pub mod signature;
 pub mod version;
 
