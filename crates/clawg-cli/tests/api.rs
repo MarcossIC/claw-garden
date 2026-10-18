@@ -1254,6 +1254,24 @@ async fn context_says_whether_memories_were_searched() {
     assert!(body["retrieval"]["detail"].as_str().is_some_and(|d| d.contains("onnx session crashed")), "{body}");
 }
 
+#[tokio::test]
+async fn context_without_a_query_does_not_need_the_embedder() {
+    let h = Harness::start().await;
+    h.post_json("/v1/memories", json!({ "content": "the deploy script lives in ops/deploy.sh", "agent_id": "a" })).await;
+    h.wait_for_rows("memory", 1).await;
+    for body in [json!({ "agent_id": "a" }), json!({ "query": "  ", "agent_id": "a" })] {
+        let (status, body) = h.post_json("/v1/context", body).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["retrieval"], json!({ "state": "recent", "hits": 1 }));
+        assert!(body["prompt"].as_str().unwrap().contains("ops/deploy.sh"), "{body}");
+    }
+
+    let h = Harness::start_with_failing_embedder().await;
+    let (status, body) = h.post_json("/v1/context", json!({ "agent_id": "a" })).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["retrieval"], json!({ "state": "recent", "hits": 0 }), "nothing was embedded: {body}");
+}
+
 /// Under the fake model only the row identical to the query scores; the
 /// others land below the cosine floor.
 #[tokio::test]
