@@ -90,6 +90,12 @@ El detector MUST NOT emparejar una pieza nueva con una fila viva de su mismo alc
 
 - `save_memory` MUST tomar `topic_key` y su schema MUST describir el formato. El texto del save MUST nombrar cada fila reemplazada con su primera línea. Si el daemon no devuelve `topic_key` cuando se mandó, MUST decir que se guardó sin reemplazar y que se reinicie el daemon.
 - `list_memories` MUST mostrar `topic=K` en una fila con clave y `by=#N` en una `superseded`.
-- `protocol.md` MUST decir cuándo usar la clave. La apertura MUST seguir en 2048 caracteres o menos.
+- Un hit de `search_memory` MUST mostrar ` topic=K` cuando la fila es del lector y tiene clave; uno de otro agente MUST NOT mostrarla, porque un save con esa clave sólo revisa filas propias. `read_memory` MUST mostrarla en la cabecera. `POST /v1/search` MUST devolver `topic_key` en cada hit que la tiene, y `GET /v1/memories/{kind}/{id}/save` la de la fila pedida; un hit sin clave MUST NOT llevar el campo.
+- `protocol.md` MUST decir cuándo usar la clave, y que una versión nueva se guarda bajo la clave que muestran `search_memory` y `read_memory`. La apertura MUST seguir en 2048 caracteres o menos.
 
-**Test:** `save_outcome_text_names_the_replaced_memories`, `a_key_sent_to_an_older_daemon_is_reported` en `server.rs`; `rows_show_their_key_and_who_replaced_them` en `tools.rs`; `the_agent_contract_matches_its_file`.
+#### Escenario: otra sesión revisa la decisión
+- GIVEN una `architectural_decision` guardada con la clave `cli/tui/library`
+- WHEN un agente en una sesión nueva la encuentra con `search_memory` y guarda la versión nueva
+- THEN el hit y `read_memory` le muestran `topic=cli/tui/library`, y el save bajo esa clave responde `replaces #N`
+
+**Test:** `save_outcome_text_names_the_replaced_memories`, `a_key_sent_to_an_older_daemon_is_reported` en `server.rs`; `rows_show_their_key_and_who_replaced_them`, `a_hit_shows_the_topic_key_it_is_revised_under`, `a_hit_without_a_key_is_shown_as_before`, `another_agents_hit_does_not_show_its_topic_key` y `format_save_names_the_topic_key_of_the_row` en `tools.rs`; `a_search_hit_carries_its_topic_key` en `worker.rs`; `read_save_carries_the_key_of_the_row_asked_for` en `pieces.rs`; `a_search_hit_and_the_save_read_carry_the_topic_key` en `crates/clawg-cli/tests/api.rs`; `the_agent_contract_matches_its_file`.

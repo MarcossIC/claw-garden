@@ -10,6 +10,7 @@ Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde q
 - [ingest-outbox](../../changes/archive/2026-10-15-ingest-outbox/proposal.md), archivado el 2026-10-15 (el outbox, el apagado y el arranque sin volcado, el volcado viejo y la fila de V14). El contrato de `POST /v1/memories` que lo usa está en [`specs/ingest`](../ingest/spec.md).
 - [embedder-idle-unload](../../changes/archive/2026-10-17-embedder-idle-unload/proposal.md), archivado el 2026-10-17 (el ciclo de vida del embedder y la reescritura de «El modelo se carga con pooling mean» para `E5Embedder`). El campo `embedder_resident` de `/health` está en [`specs/mcp`](../mcp/spec.md).
 - [conflict-candidates](../../changes/archive/2026-10-18-conflict-candidates/proposal.md), archivado el 2026-10-18 (sólo la fila de V15 y «Una base en V14 abre con sus disputas como pares»). La tabla de pares y su conversión están en [`specs/disputes`](../disputes/spec.md).
+- [topic-revisions](../../changes/archive/2026-10-18-topic-revisions/proposal.md), archivado el 2026-10-18 (sólo la fila de V16 y «Una base en V15 abre con sus filas sin clave»). Qué hace un save con clave está en [`specs/ingest`](../ingest/spec.md).
 
 ## Definiciones
 
@@ -29,7 +30,7 @@ Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde q
 
 ### Un save aceptado está en el outbox hasta que termina
 
-Un save que termina de guardarse MUST NOT dejar su fila. Cada pieza que el worker inserta o refuerza MUST anotar su posición en el progreso de la fila en la misma transacción que la escribe (`apply_note`, `crates/clawg-core/src/memory/outbox.rs:117`, llamado desde `insert_noting` y `reinforce_noting`). El vínculo de `memory_piece` ([`specs/pieces`](../pieces/spec.md)) y el borrado de la fila MUST ir en una transacción (`outbox_finish`, `outbox.rs:330`, que usa `link_in`, `crates/clawg-core/src/memory/pieces.rs:208`). Las copias repetidas dentro del mismo save se refuerzan después de anotar su posición y sin nota: un kill en ese punto pierde a lo sumo un refuerzo, nunca agrega uno.
+Un save que termina de guardarse MUST NOT dejar su fila. Cada pieza que el worker inserta o refuerza MUST anotar su posición en el progreso de la fila en la misma transacción que la escribe (`apply_note`, `crates/clawg-core/src/memory/outbox.rs:117`, llamado desde `insert_noting` y `reinforce_noting`). El vínculo de `memory_piece` ([`specs/pieces`](../pieces/spec.md)) y el borrado de la fila MUST ir en una transacción (`outbox_finish`, `outbox.rs:330`, que usa `link_in`, `crates/clawg-core/src/memory/pieces.rs:222`). Las copias repetidas dentro del mismo save se refuerzan después de anotar su posición y sin nota: un kill en ese punto pierde a lo sumo un refuerzo, nunca agrega uno.
 
 #### Escenario
 - GIVEN un daemon con el embedder listo
@@ -204,7 +205,7 @@ Las migraciones pendientes de un arranque MUST aplicarse en una sola transacció
 
 ### Checksums fijados
 
-Los checksums de las migraciones publicadas (hoy V1–V15) MUST coincidir con una lista fija en el código (`PINNED`, `crates/clawg-core/src/memory/migrations.rs:44`). Cambiar una migración publicada MUST romper un test. Una migración nueva agrega su fila a la lista en el mismo commit.
+Los checksums de las migraciones publicadas (hoy V1–V16) MUST coincidir con una lista fija en el código (`PINNED`, `crates/clawg-core/src/memory/migrations.rs:44`). Cambiar una migración publicada MUST romper un test. Una migración nueva agrega su fila a la lista en el mismo commit.
 
 **Test:** `published_migration_checksums_are_pinned` (`migrations.rs`).
 
@@ -225,12 +226,25 @@ V15 (`crates/clawg-core/migrations/V15__memory_conflict.sql`) agrega la tabla `m
 
 **Test:** `a_database_with_disputes_opens_with_escalated_pairs` (`db.rs`).
 
+### Una base en V15 abre con sus filas sin clave
+
+V16 (`crates/clawg-core/migrations/V16__topic_key.sql`) agrega `memory.topic_key` (TEXT, nullable) y el índice parcial `idx_memory_topic` sobre `(agent_id, COALESCE(project_id, ''), topic_key)` para las filas no borradas con clave. El índice no es único: las piezas de un save comparten la clave, y la unicidad de lo vivo la mantienen el worker y `restore` ([`specs/ingest`](../ingest/spec.md), «Un save con clave reemplaza la fila viva de su clave»). El `COALESCE` es el de `idx_memory_dedup`, porque `project_id` es nullable y SQLite trata un NULL como distinto de otro.
+
+Una base en V15 MUST abrir con V16 con cada fila de `memory` igual y con `topic_key = NULL`, y con los pares de `memory_conflict`, los vínculos de `memory_piece` y el índice de texto como estaban. La migración MUST NOT cambiar ninguna fila. Un binario anterior a V16 rechaza la base migrada con `SchemaNewer` («Verificación del esquema antes de migrar»): la vuelta atrás es el snapshot `pre-migration`.
+
+#### Escenario
+- GIVEN una base en V15 con filas, una de ellas `superseded`, piezas vinculadas, un par y el índice de texto
+- WHEN se abre con la versión nueva
+- THEN cada fila queda igual y con `topic_key = NULL`, y los pares, los vínculos y el índice de texto siguen iguales
+
+**Tests:** `a_database_from_before_topic_keys_opens_unchanged` (`db.rs`), que siembra V15 con SQL directo; el checksum de V16 en `published_migration_checksums_are_pinned` (`migrations.rs`). La primera llama a `run_migrations` directo, así que el snapshot `pre-migration` de la apertura lo cubre la regla general de «Snapshot antes de migrar».
+
 ### Verificación del esquema antes de migrar
 
 La decisión es pura (`schema_plan`, `backup.rs:83`). `MemoryStore::open` MUST calcularla antes de cualquier pragma y antes del runner (`check_schema`, `crates/clawg-core/src/memory/db.rs:388`, llamada en `db.rs:185`). Con `Newer` o `Diverged`, `open` MUST devolver `MemoryError::SchemaNewer` o `MemoryError::SchemaDiverged` (`crates/clawg-core/src/memory/error.rs:58` y `:64`) y MUST NOT escribir nada en `memory.db`. Los mensajes MUST decir las versiones, que nada cambió, y qué hacer: instalar la versión que la escribió o `clawg restore` de un backup anterior.
 
 #### Escenario: base más nueva
-- GIVEN una base en la última versión del binario, N (hoy V15), con una fila N + 1 agregada en `refinery_schema_history`
+- GIVEN una base en la última versión del binario, N (hoy V16), con una fila N + 1 agregada en `refinery_schema_history`
 - WHEN se abre
 - THEN el error es `SchemaNewer { db: N + 1, binary: N }`, nombra `clawg restore`, y `memory.db` es byte a byte igual
 

@@ -6,6 +6,7 @@ Fuente de verdad del comportamiento actual de los pares que encuentra el detecto
 - [dispute-resolution](../../changes/archive/2026-10-13-dispute-resolution/proposal.md), archivado el 2026-10-13.
 - [project-indexing](../../changes/archive/2026-10-15-project-indexing/proposal.md), archivado el 2026-10-15 (sólo "Umbral y banda del detector").
 - [conflict-candidates](../../changes/archive/2026-10-18-conflict-candidates/proposal.md), archivado el 2026-10-18 (los pares de `memory_conflict`, el escalamiento, los veredictos, las candidatas en la respuesta del save y el paso de los pares por restore, purge y mantenimiento).
+- [topic-revisions](../../changes/archive/2026-10-18-topic-revisions/proposal.md), archivado el 2026-10-18 (sólo R9 y la restauración de una fila con clave en R4).
 
 ## Definiciones
 
@@ -127,9 +128,11 @@ Juzgar un par enlazado con `conflicts` MUST hacer que la fila más nueva nombre 
 
 ## R4. Borrar, reemplazar, restaurar y purgar
 
-Cuando una fila X se borra (`delete_memory_core`, `crates/clawg-core/src/memory/admin.rs:302`) o pasa a `superseded`, toda fila `disputed` cuyo `disputed_against` nombra a X MUST volver a su estado de reposo en la misma transacción (`release_challengers`, `dispute.rs:191`). `disputed_against` MAY seguir nombrando a X; X ya no cuenta porque no está viva. Borrar MUST NOT tocar los pares de X.
+Cuando una fila X se borra (`delete_memory_core`, `crates/clawg-core/src/memory/admin.rs:302`) o pasa a `superseded`, toda fila `disputed` cuyo `disputed_against` nombra a X MUST volver a su estado de reposo en la misma transacción (`release_challengers`, `dispute.rs:191`). Pasa a `superseded` por un juicio (R1) o porque un save con la misma `topic_key` la reemplaza ([`specs/ingest`](../ingest/spec.md), «Un save con clave reemplaza la fila viva de su clave»): en los dos casos se liberan sus retadoras. `disputed_against` MAY seguir nombrando a X; X ya no cuenta porque no está viva. Borrar MUST NOT tocar los pares de X.
 
 Restaurar X (`restore_memory_core`, `admin.rs:436`) MUST llevar a su estado de reposo a X y a toda fila cuyo `disputed_against` la nombra (`admin.rs:508-509`): el par escalado vuelve con ella.
+
+Restaurar una fila borrada que tenía `topic_key` MUST fallar sin cambiar nada cuando el alcance de su clave ya tiene otra fila viva (`RESTORE_TOPIC_HOLDER`, `admin.rs:411`; `RestoreError::TopicTaken`, `admin.rs:370`). El error MUST nombrar la clave y la fila que la tiene, y la fila restaurada se queda borrada: restaurarla dejaría dos versiones vivas de un tema que una revisión mantiene en una. `POST /v1/memories/memory/{id}/restore` MUST responder `409` (`restore_memory`, `crates/clawg-cli/src/daemon/api.rs:1248`), como con un gemelo vivo o un secreto.
 
 Purgar X (`purge`, `crates/clawg-core/src/memory/secrets.rs:82`) MUST borrar los pares que la nombran (`secrets.rs:109`).
 
@@ -148,7 +151,13 @@ Purgar X (`purge`, `crates/clawg-core/src/memory/secrets.rs:82`) MUST borrar los
 - WHEN se restaura O
 - THEN N vuelve a `disputed` y el par vuelve a ACTIVE CONFLICTS
 
-**Test:** `deleting_the_disputed_row_releases_its_challenger`, `deleting_one_of_two_keeps_the_dispute` y `a_restored_row_brings_its_escalated_pair_back` en `crates/clawg-core/src/memory/admin.rs`; `purging_drops_the_pairs_of_the_row` en `secrets.rs`.
+#### Escenario: restaurar una fila cuya clave volvió a estar viva
+- GIVEN una fila V1 con la clave K, borrada, y otra fila V2 viva con K
+- WHEN se restaura V1
+- THEN falla, el error nombra K y V2, y V1 sigue borrada
+- AND el endpoint responde `409`
+
+**Test:** `deleting_the_disputed_row_releases_its_challenger`, `deleting_one_of_two_keeps_the_dispute`, `a_restored_row_brings_its_escalated_pair_back` y `a_row_whose_key_is_live_again_is_not_restored` en `crates/clawg-core/src/memory/admin.rs`; `restore_refuses_a_row_whose_topic_is_live_again` en `crates/clawg-cli/tests/api.rs`; `purging_drops_the_pairs_of_the_row` en `secrets.rs`.
 
 ## R5. El mantenimiento libera las huérfanas
 
@@ -180,7 +189,7 @@ Las dos rutas de veredicto responden igual (`resolve_error`, `api.rs:1257`):
 | Una fila no existe o está borrada (o, con `agent_id`, es de otro agente) | `404` |
 | Par no enlazado, una reemplazada por una tercera, o `supersedes` sobre un par pendiente con una fila protegida | `409` |
 
-El puente MCP MUST exponer `resolve_conflict` con `keep`, `other`, `verdict` (obligatorio, con el `enum` de los cuatro valores en el schema, `verdict_enum`, `server.rs:341`) y `reason` (`ResolveConflictArgs`, `server.rs:347`); el agente es el del puente. Contra un daemon que contesta un 404 sin cuerpo en `/v1/disputes/judge`, MUST decir que se reinicie el daemon con `clawg stop` (`resolve_conflict_impl`, `server.rs:904`). `memory_status` MUST sumar una línea con los pares pendientes y escalados del agente, y los pendientes listados, citados por id, con cómo juzgarlos (`format_open_pairs`, `crates/clawg-cli/src/mcp/tools.rs:134`); contra un daemon sin la ruta, omite la línea. En cada par va primero el lado sin marca, y la marca va junto al id del otro; ACTIVE CONFLICTS marca cada lado sin reordenar (P4 de [`specs/provenance`](../provenance/spec.md)). El origen no cambia el estado de ningún par.
+El puente MCP MUST exponer `resolve_conflict` con `keep`, `other`, `verdict` (obligatorio, con el `enum` de los cuatro valores en el schema, `verdict_enum`, `server.rs:341`) y `reason` (`ResolveConflictArgs`, `server.rs:347`); el agente es el del puente. Contra un daemon que contesta un 404 sin cuerpo en `/v1/disputes/judge`, MUST decir que se reinicie el daemon con `clawg stop` (`resolve_conflict_impl`, `server.rs:904`). `memory_status` MUST sumar una línea con los pares pendientes y escalados del agente, y los pendientes listados, citados por id, con cómo juzgarlos (`format_open_pairs`, `crates/clawg-cli/src/mcp/tools.rs:138`); contra un daemon sin la ruta, omite la línea. En cada par va primero el lado sin marca, y la marca va junto al id del otro; ACTIVE CONFLICTS marca cada lado sin reordenar (P4 de [`specs/provenance`](../provenance/spec.md)). El origen no cambia el estado de ningún par.
 
 La NOTE de ACTIVE CONFLICTS (una vez por bloque; [`specs/retrieval`](../retrieval/spec.md)) MUST NOT afirmar que las memorias se contradicen, y MUST nombrar `resolve_conflict` y sus veredictos. La apertura del protocolo ([`specs/mcp`](../mcp/spec.md)) MUST pedir que se juzguen en la sesión las candidatas que nombra `save_memory` y que se pregunte al usuario por lo que lista ACTIVE CONFLICTS. Cada par del bloque imprime los ids de sus dos lados, que son los que recibe `resolve_conflict`.
 
@@ -221,6 +230,19 @@ Desde [long-save-context](../../changes/archive/2026-10-14-long-save-context/pro
 - THEN hay un solo par, `pending`, entre el save nuevo y la fila vieja, y ninguno entre los hermanos
 
 **Test:** `sibling_chunks_of_one_save_do_not_dispute_each_other`, `a_chunk_still_pairs_with_an_older_row` y `a_conclusion_does_not_dispute_its_sources` en `crates/clawg-core/src/memory/worker.rs`.
+
+## R9. Una revisión no se empareja con lo que reemplaza
+
+El detector MUST NOT emparejar un pedazo nuevo con una fila viva del alcance de la `topic_key` del save: son las filas que ese mismo save va a dejar `superseded` al terminar ([`specs/ingest`](../ingest/spec.md), «Un save con clave reemplaza la fila viva de su clave»). Un par entre una versión y la siguiente nacería `pending` y quedaría muerto en la misma transacción que reemplaza a la vieja. Las demás filas se siguen emparejando, también las de otra clave.
+
+El worker suma las filas del alcance a los hermanos que ya pasa al detector (`siblings`, `worker.rs:776-778`), que `detect_contradiction` deja fuera como a los pedazos de R8 y a las fuentes de una conclusión.
+
+#### Escenario
+- GIVEN un `semantic_fact` guardado con la clave K, y otro `semantic_fact` cercano sin clave
+- WHEN se guarda una versión nueva con K, a una distancia de los dos dentro de la banda
+- THEN hay un par con el que no tiene clave y ninguno con la versión que reemplaza
+
+**Test:** `a_revision_does_not_pair_with_the_row_it_replaces` en `crates/clawg-core/src/memory/worker.rs`.
 
 ## Umbral y banda del detector
 

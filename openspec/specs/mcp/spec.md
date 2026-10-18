@@ -13,6 +13,7 @@ Fuente de verdad del comportamiento actual del puente `clawg mcp`: cómo abre un
 - [context-budget](../../changes/archive/2026-10-17-context-budget/proposal.md), archivado el 2026-10-17 (sólo «El presupuesto de `recall_context`» y «`recall_context` dice si buscó memorias»).
 - [memory-protocol](../../changes/archive/2026-10-17-memory-protocol/proposal.md), archivado el 2026-10-17 (desde «El protocolo de memoria» hasta el final).
 - [conflict-candidates](../../changes/archive/2026-10-18-conflict-candidates/proposal.md), archivado el 2026-10-18 (sólo «Los conflictos en las herramientas», el largo de la apertura, el hábito de juzgar las memorias cercanas y qué dice de una decisión la descripción de `memory_type`).
+- [topic-revisions](../../changes/archive/2026-10-18-topic-revisions/proposal.md), archivado el 2026-10-18 (sólo «La clave de tema en las herramientas» y lo que el protocolo completo dice de la clave).
 
 ## Definiciones
 
@@ -111,7 +112,7 @@ Test: `memories_saved_through_initialize_stay_visible_without_it` (`server.rs`).
 
 El puente no se queda con el daemon que encontró al abrir. Cuando una llamada falla porque el daemon cambió (token nuevo, puerto nuevo) o porque su arranque no terminó a tiempo, vuelve a leer `daemon.json` y `token` del directorio de datos y repite la llamada una vez. Nunca lanza un daemon: un `clawg stop` hecho a propósito se respeta. No cambia ninguna herramienta, ni sus argumentos, ni lo que contesta cuando el daemon responde.
 
-**Releer** es sondear el daemon como lo hace `probe_running(base_dir, false)` (`crates/clawg-cli/src/client.rs:1082`): leer `daemon.json` y `token` y pedir `/health`. Lo hace `ClientHandle::reresolve` (`crates/clawg-cli/src/mcp/startup.rs:102`). Sin daemon que conteste devuelve `NotRunning` (`client.rs:1107`); si el almacén lo tiene otro proceso que no es un daemon, devuelve `StoreHeld`.
+**Releer** es sondear el daemon como lo hace `probe_running(base_dir, false)` (`crates/clawg-cli/src/client.rs:1090`): leer `daemon.json` y `token` y pedir `/health`. Lo hace `ClientHandle::reresolve` (`crates/clawg-cli/src/mcp/startup.rs:102`). Sin daemon que conteste devuelve `NotRunning` (`client.rs:1115`); si el almacén lo tiene otro proceso que no es un daemon, devuelve `StoreHeld`.
 
 **Falla que se resuelve releyendo:** `ClientError::Unauthorized` (el daemon contestó 401), `ClientError::NotRunning` (la conexión no se abrió) o `ClientError::StartTimeout` (el arranque no terminó a tiempo). La decisión es la función pura `on_failure` (`startup.rs:39`): da `Next::Reresolve` para esas tres y `Next::Report` para cualquier otra, entre ellas `StoreHeld`, `Spawn`, `Daemon` y `Http`.
 
@@ -130,7 +131,7 @@ El puente no se queda con el daemon que encontró al abrir. Cuando una llamada f
 
 Al encontrar un daemon releyendo, el puente deja en el log su dirección, la versión del daemon y la propia (`startup.rs:109-115`; si `/health` falla en ese momento, sólo la dirección) y MUST NOT cambiar por eso lo que contesta la herramienta. `version_warning` (`crates/clawg-cli/src/memories.rs:332`) no se usa en el puente: aconseja `clawg stop`, y después de una actualización lo viejo es el puente, no el daemon.
 
-Repetir MUST NOT llegar dos veces al handler del daemon: un 401 lo corta `require_bearer` antes del handler (`crates/clawg-cli/src/daemon/api.rs:756-774`), y una conexión rechazada no llegó. Por eso la única llamada del cliente con timeout es `/health` (`crates/clawg-cli/src/client.rs:576`, `HEALTH_TIMEOUT` en `client.rs:45`), y en una herramienta que escribe `NotRunning` sólo significa una conexión que no se abrió. `map_transport` (`client.rs:564`) mapea a `NotRunning` lo que es `is_connect` o `is_timeout`.
+Repetir MUST NOT llegar dos veces al handler del daemon: un 401 lo corta `require_bearer` antes del handler (`crates/clawg-cli/src/daemon/api.rs:756-774`), y una conexión rechazada no llegó. Por eso la única llamada del cliente con timeout es `/health` (`crates/clawg-cli/src/client.rs:584`, `HEALTH_TIMEOUT` en `client.rs:45`), y en una herramienta que escribe `NotRunning` sólo significa una conexión que no se abrió. `map_transport` (`client.rs:572`) mapea a `NotRunning` lo que es `is_connect` o `is_timeout`.
 
 #### Escenario: el daemon se reinició
 - GIVEN un puente contra el daemon A, con su puerto y su token
@@ -156,7 +157,7 @@ Repetir MUST NOT llegar dos veces al handler del daemon: un 401 lo corta `requir
 
 **Tests:** `an_error_the_daemon_answered_reaches_it_once` (`mcp/server.rs`); `only_health_sets_a_timeout` (`client.rs`).
 
-**Arranque que no terminó.** El arranque en segundo plano del puente (`crates/clawg-cli/src/mcp/mod.rs:99-114`) deja su resultado en un `ClientHandle`. `ClientHandle::get` (`startup.rs:75`) espera el resultado el tiempo de la herramienta: si el arranque falló, devuelve su error (`startup.rs:88`), que es `StartTimeout` cuando `start_daemon` se rindió esperando al daemon (`crates/clawg-cli/src/client.rs:1114`); si el arranque sigue sin terminar al vencer la espera, `StartTimeout` (`startup.rs:89` y `startup.rs:92`); si el emisor se soltó sin resolver, `NotRunning` (`startup.rs:91`). La herramienta siguiente relee, como arriba. Si el daemon contesta, se usa y se guarda; si no, se informa el texto de `StartTimeout` (`crates/clawg-cli/src/mcp/server.rs:528-532`), no el de un daemon detenido, porque lo que falló fue el arranque.
+**Arranque que no terminó.** El arranque en segundo plano del puente (`crates/clawg-cli/src/mcp/mod.rs:99-114`) deja su resultado en un `ClientHandle`. `ClientHandle::get` (`startup.rs:75`) espera el resultado el tiempo de la herramienta: si el arranque falló, devuelve su error (`startup.rs:88`), que es `StartTimeout` cuando `start_daemon` se rindió esperando al daemon (`crates/clawg-cli/src/client.rs:1122`); si el arranque sigue sin terminar al vencer la espera, `StartTimeout` (`startup.rs:89` y `startup.rs:92`); si el emisor se soltó sin resolver, `NotRunning` (`startup.rs:91`). La herramienta siguiente relee, como arriba. Si el daemon contesta, se usa y se guarda; si no, se informa el texto de `StartTimeout` (`crates/clawg-cli/src/mcp/server.rs:528-532`), no el de un daemon detenido, porque lo que falló fue el arranque.
 
 #### Escenario: el daemon termina de arrancar después
 - GIVEN un puente cuyo arranque venció
@@ -190,7 +191,7 @@ El texto de `ClientError::Unauthorized` de la CLI (`crates/clawg-cli/src/client.
 
 **Test:** `a_project_registration_the_old_daemon_refused_is_sent_to_the_new_one` (`mcp/server.rs`).
 
-**`memory_status`.** `memory_status_impl` (`crates/clawg-cli/src/mcp/server.rs:981`) pasa por `call` como las demás herramientas. Su `/health` no lleva token (`DaemonClient::health`, `client.rs:576`; ruta abierta en `crates/clawg-cli/src/daemon/api.rs:726`), así que después de un reinicio muestra el daemon nuevo.
+**`memory_status`.** `memory_status_impl` (`crates/clawg-cli/src/mcp/server.rs:981`) pasa por `call` como las demás herramientas. Su `/health` no lleva token (`DaemonClient::health`, `client.rs:584`; ruta abierta en `crates/clawg-cli/src/daemon/api.rs:726`), así que después de un reinicio muestra el daemon nuevo.
 
 #### Escenario: `memory_status` después de un reinicio
 - GIVEN un puente contra el daemon A que se detuvo, y el daemon B arrancado
@@ -199,7 +200,7 @@ El texto de `ClientError::Unauthorized` de la CLI (`crates/clawg-cli/src/client.
 
 **Test:** `memory_status_after_a_restart_reports_the_new_daemon` (`mcp/server.rs`).
 
-**Saves que esperan o fallaron.** `memory_status` MUST mostrar el bloque `ingest` del `/health` del daemon (`pending`, `failed`, `oldest_pending_s` y los `problems`, cada uno con su `operation_id` y su causa) porque imprime el `Health` entero como JSON (`format_status`, `crates/clawg-cli/src/mcp/tools.rs:434`; `Health.ingest`, `client.rs:140`). Contra un daemon que no lo trae, o que no contestó a tiempo, el bloque no aparece ([`specs/ingest`](../ingest/spec.md), «Estado del outbox en `/health`»). Es el lugar donde el agente se entera de un save aceptado con un `202` que después falló: los textos de `save_memory` ante un `202` nombran el `operation_id` y dicen que un fallo aparece en `memory_status` ([`specs/ingest`](../ingest/spec.md), «Texto que ve el modelo»). `save_memory` no tiene un argumento `operation_id`, y por eso `agent_contract.json` no cambió con el outbox.
+**Saves que esperan o fallaron.** `memory_status` MUST mostrar el bloque `ingest` del `/health` del daemon (`pending`, `failed`, `oldest_pending_s` y los `problems`, cada uno con su `operation_id` y su causa) porque imprime el `Health` entero como JSON (`format_status`, `crates/clawg-cli/src/mcp/tools.rs:439`; `Health.ingest`, `client.rs:140`). Contra un daemon que no lo trae, o que no contestó a tiempo, el bloque no aparece ([`specs/ingest`](../ingest/spec.md), «Estado del outbox en `/health`»). Es el lugar donde el agente se entera de un save aceptado con un `202` que después falló: los textos de `save_memory` ante un `202` nombran el `operation_id` y dicen que un fallo aparece en `memory_status` ([`specs/ingest`](../ingest/spec.md), «Texto que ve el modelo»). `save_memory` no tiene un argumento `operation_id`, y por eso `agent_contract.json` no cambió con el outbox.
 
 #### Escenario: un save que falló después de contestar
 - GIVEN una fila `failed` en el outbox
@@ -228,7 +229,7 @@ El texto de `ClientError::Unauthorized` de la CLI (`crates/clawg-cli/src/client.
 - `0` MUST responder `400`;
 - un valor que no es un entero no negativo MUST rechazarse como cualquier cuerpo mal formado (un `4xx`).
 
-`recall_context` MUST aceptar `budget` (`RecallContextArgs`, `crates/clawg-cli/src/mcp/server.rs:209-221`) y pasarlo (`recall_context_impl`, `server.rs:774`), y su descripción MUST decir que el contenido llega entero hasta un presupuesto de bytes y que lo que no entra se nombra por id para `read_memory` (`server.rs:1057-1063`). `DaemonClient::context` MUST NOT mandar `budget` cuando no se le dio (`crates/clawg-cli/src/client.rs:647-661`): un puente sin presupuesto deja el tamaño al daemon, y un daemon anterior al campo recibe el cuerpo de siempre.
+`recall_context` MUST aceptar `budget` (`RecallContextArgs`, `crates/clawg-cli/src/mcp/server.rs:209-221`) y pasarlo (`recall_context_impl`, `server.rs:774`), y su descripción MUST decir que el contenido llega entero hasta un presupuesto de bytes y que lo que no entra se nombra por id para `read_memory` (`server.rs:1057-1063`). `DaemonClient::context` MUST NOT mandar `budget` cuando no se le dio (`crates/clawg-cli/src/client.rs:655-669`): un puente sin presupuesto deja el tamaño al daemon, y un daemon anterior al campo recibe el cuerpo de siempre.
 
 #### Escenario: sin presupuesto y con uno chico
 - GIVEN una memoria que entra en 8.000 bytes
@@ -251,9 +252,9 @@ El texto de `ClientError::Unauthorized` de la CLI (`crates/clawg-cli/src/client.
 - `embedder_failed`, con `detail` y `retryable`: no hay embedder y el estado es `failed`;
 - `search_failed`, con `detail`: `embed` falló por otra causa, o falló la búsqueda.
 
-En los cuatro casos MUST seguir respondiendo `200` con el workspace. `Context` del cliente MUST leer `retrieval` con `#[serde(default)]`, y un estado que no conoce como `Unknown` (`client.rs:252-275`).
+En los cuatro casos MUST seguir respondiendo `200` con el workspace. `Context` del cliente MUST leer `retrieval` con `#[serde(default)]`, y un estado que no conoce como `Unknown` (`client.rs:256-279`).
 
-`recall_context` (`format_recall`, `crates/clawg-cli/src/mcp/tools.rs:361`; la frase en `retrieval_notice`, `tools.rs:342`) MUST empezar con `Memories were not searched: <por qué>.` cuando `state` no es `searched`, haya workspace o no, seguido de que sólo se muestra el workspace (o de que está vacío) y de que eso no quiere decir que no haya memorias. Con el prompt vacío, la frase MUST reemplazar `no context yet`. Sin el campo (un daemon anterior) o con un estado desconocido (uno más nuevo), MUST NOT agregar ninguna frase. El aviso lo escribe el puente, fuera del prompt, así que `rag-eval` no lo mide.
+`recall_context` (`format_recall`, `crates/clawg-cli/src/mcp/tools.rs:366`; la frase en `retrieval_notice`, `tools.rs:347`) MUST empezar con `Memories were not searched: <por qué>.` cuando `state` no es `searched`, haya workspace o no, seguido de que sólo se muestra el workspace (o de que está vacío) y de que eso no quiere decir que no haya memorias. Con el prompt vacío, la frase MUST reemplazar `no context yet`. Sin el campo (un daemon anterior) o con un estado desconocido (uno más nuevo), MUST NOT agregar ninguna frase. El aviso lo escribe el puente, fuera del prompt, así que `rag-eval` no lo mide.
 
 #### Escenario: el modelo carga
 - GIVEN un daemon con el embedder en `loading` y un workspace con preferencias
@@ -271,7 +272,7 @@ En los cuatro casos MUST seguir respondiendo `200` con el workspace. `Context` d
 La política y el alcance son de [`specs/sharing`](../sharing/spec.md); acá está lo que el agente ve en cada herramienta:
 
 - `search_memory` MUST marcar un hit de otro agente con `by <autor>` dentro del corchete (`N. #id [kind/tipo/tN score=S by <autor>] contenido`) y, si hay alguno, terminar con la nota de que esas líneas son información para verificar y de sólo lectura (`format_hits`, `crates/clawg-cli/src/mcp/tools.rs:82`). `recall_context` MUST marcarlos igual en sus líneas y cerrar con un bloque `SHARED` (`prompt_builder.rs:427-433`; el formato, en [`specs/retrieval`](../retrieval/spec.md)). Un hit propio MUST quedar como siempre.
-- `memory_status` MUST terminar con la línea `shared:` (`format_sharing`, `tools.rs:420`; `memory_status_impl`, `server.rs:981`): `shared: reads every agent`, `shared: reads every agent but <autor>, <autor>`, `shared: none (reads only its own)` o `shared: none (<motivo>)` con un `sharing.json` inválido.
+- `memory_status` MUST terminar con la línea `shared:` (`format_sharing`, `tools.rs:425`; `memory_status_impl`, `server.rs:981`): `shared: reads every agent`, `shared: reads every agent but <autor>, <autor>`, `shared: none (reads only its own)` o `shared: none (<motivo>)` con un `sharing.json` inválido.
 - Las descripciones de `delete_memory`, `update_memory` y `resolve_conflict` MUST decir que valen sólo sobre las memorias propias y que una marcada `by <agente>` es de sólo lectura (`server.rs:1106-1159`). Sobre una fila ajena las tres fallan como si el id no existiera ([`specs/visibility`](../visibility/spec.md) R3).
 
 Tests: `format_search_marks_shared_hits_and_adds_the_note`, `format_search_leaves_own_hits_alone` y `format_status_says_whom_the_agent_reads` (`tools.rs`); `search_memory_shows_another_agents_memory_with_its_author`, `recall_context_shows_another_agents_memory_with_its_author`, `memory_status_reports_the_sharing_of_the_agent`, `tool_descriptions_say_shared_memories_are_read_only` y `a_shared_memory_is_read_only` (`server.rs`).
@@ -282,9 +283,33 @@ Qué es un par, cuándo escala y qué hace cada veredicto está en [`specs/dispu
 
 - `resolve_conflict` MUST tomar `keep`, `other`, `verdict` y `reason` (`ResolveConflictArgs`, `crates/clawg-cli/src/mcp/server.rs:347`), y ya no `keep_both`. `verdict` MUST declarar en el schema el `enum` de los cuatro veredictos de `Verdict::ALL` (`verdict_enum`, `server.rs:341`). Al deserializar sigue siendo una cadena libre, así que un valor desconocido llega al daemon y vuelve como un error que lista los cuatro. Contra un daemon anterior a `/v1/disputes/judge`, MUST pedir que se lo reinicie con `clawg stop` (`server.rs:917-922`).
 - `save_memory` MUST sumar la línea `close to earlier memories: …` cuando el save tiene candidatas (`related_text`, `server.rs:325`).
-- `memory_status` MUST sumar `conflict candidates: none open`, o los pares pendientes y escalados del agente con los pendientes más viejos y cómo juzgarlos (`format_open_pairs`, `crates/clawg-cli/src/mcp/tools.rs:134`). Contra un daemon sin `GET /v1/disputes` MUST omitir la línea, y no fallar (`server.rs:992-994`).
+- `memory_status` MUST sumar `conflict candidates: none open`, o los pares pendientes y escalados del agente con los pendientes más viejos y cómo juzgarlos (`format_open_pairs`, `crates/clawg-cli/src/mcp/tools.rs:138`). Contra un daemon sin `GET /v1/disputes` MUST omitir la línea, y no fallar (`server.rs:992-994`).
 
 **Tests:** `resolve_conflict_reports_the_outcome`, `resolve_conflict_against_an_older_daemon_asks_for_a_restart`, `save_outcome_text_names_related_memories` y `memory_status_counts_pending_candidates` (`server.rs`). El schema lo fija también `the_agent_contract_matches_its_file` ([`specs/quality`](../quality/spec.md)).
+
+## La clave de tema en las herramientas
+
+Qué hace un save con clave y cómo se valida está en [`specs/ingest`](../ingest/spec.md); acá está lo que el agente pasa y lo que ve.
+
+- `save_memory` MUST tomar `topic_key`, opcional (`SaveMemoryArgs.topic_key`, `crates/clawg-cli/src/mcp/server.rs:182`), y su schema MUST describir el formato: segmentos de `a-z`, `0-9`, `.`, `_` o `-` unidos por `/`, de a lo sumo 80 caracteres, y que guardar otra vez bajo la misma clave reemplaza a la memoria guardada con ella, que queda en la historia. El texto de la respuesta nombra cada fila reemplazada con su primera línea, y avisa cuando el daemon no devolvió la clave que se mandó ([`specs/ingest`](../ingest/spec.md), «Texto que ve el modelo»). La descripción de la herramienta no cambia.
+- `list_memories` MUST mostrar ` topic=K` en una fila con clave y ` by=#N` en una `superseded` (`revision`, `crates/clawg-cli/src/mcp/tools.rs:233`), para que un listado muestre las versiones de un tema y cuál reemplazó a cuál.
+- Un hit de `search_memory` MUST mostrar ` topic=K` después del `score` cuando la fila es del lector y tiene clave (`format_hits`, `tools.rs:82`): `N. #id [kind/tipo/tN score=S topic=K] contenido`. Uno de otro agente MUST NOT mostrarla, porque un save con esa clave sólo revisa filas propias y la clave prometería una revisión que el lector no puede hacer. Un hit sin clave MUST quedar como antes.
+- `read_memory` MUST mostrarla en la cabecera (`format_save`, `tools.rs:166`; [`specs/pieces`](../pieces/spec.md), R6). Lee siempre filas del lector, así que no necesita la regla de los hits ajenos.
+- `POST /v1/search` MUST devolver `topic_key` en cada hit de una fila que la tiene (`RankedHit.topic_key`, `crates/clawg-core/src/memory/search.rs:98`; el cliente la lee con `#[serde(default)]` en `Hit`, `crates/clawg-cli/src/client.rs:178`), y `GET /v1/memories/{kind}/{id}/save` la de la fila pedida. Un hit de una fila sin clave, y el de `episodic_trajectory` o `procedural_skill`, que no tienen la columna, MUST NOT llevar el campo.
+- `recall_context` no muestra la clave (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:518`): es un prompt con presupuesto y cada byte cuenta.
+
+#### Escenario: otra sesión revisa la decisión
+- GIVEN una `architectural_decision` guardada con la clave `cli/tui/library`
+- WHEN un agente en una sesión nueva la encuentra con `search_memory` y guarda la versión nueva
+- THEN el hit y `read_memory` le muestran `topic=cli/tui/library`
+- AND el save bajo esa clave responde `saved #N; replaces #M "<primera línea>"`
+
+#### Escenario: el hit de otro agente
+- GIVEN una fila con clave de un agente A, que B puede leer
+- WHEN B busca y la encuentra
+- THEN el hit dice `by A` y no muestra `topic=`
+
+**Tests:** `save_outcome_text_names_the_replaced_memories`, `a_key_sent_to_an_older_daemon_is_reported` y `save_memory_revises_by_topic_key` (`server.rs`); `rows_show_their_key_and_who_replaced_them`, `a_hit_shows_the_topic_key_it_is_revised_under`, `a_hit_without_a_key_is_shown_as_before`, `another_agents_hit_does_not_show_its_topic_key` y `format_save_names_the_topic_key_of_the_row` (`tools.rs`); `a_search_hit_carries_its_topic_key` (`worker.rs`); `read_save_carries_the_key_of_the_row_asked_for` (`pieces.rs`); `a_search_hit_and_the_save_read_carry_the_topic_key` (`crates/clawg-cli/tests/api.rs`). El schema lo fija también `the_agent_contract_matches_its_file` ([`specs/quality`](../quality/spec.md)). Lo que ve un agente de verdad en una sesión nueva se midió en el perfil dev con Claude Code ([verify](../../changes/archive/2026-10-18-topic-revisions/verify.md#perfil-dev-con-claude-code-2026-10-18)); cuántas veces lo hace sin que se lo pidan no está medido.
 
 ## El protocolo de memoria
 
@@ -318,7 +343,7 @@ Mientras sea el único texto del protocolo que llega solo al agente, la apertura
 - pedir que las memorias cercanas que nombra `save_memory` se juzguen con `resolve_conflict` mientras la conversación sigue ahí, y que se le pregunte al usuario por lo que lista ACTIVE CONFLICTS ([`specs/disputes`](../disputes/spec.md));
 - decir qué no guardar.
 
-El texto completo MUST traer además el resumen de sesión con sus seis partes (Goal, Instructions, Discoveries, Accomplished, Next steps y Relevant files) y qué hacer tras una compactación.
+El texto completo MUST traer además el resumen de sesión con sus seis partes (Goal, Instructions, Discoveries, Accomplished, Next steps y Relevant files) y qué hacer tras una compactación. También MUST decir cuándo darle una `topic_key` a un save (una decisión o una preferencia que puede cambiar, con un nombre corto y estable como `storage/engine`) y que una versión nueva se guarda bajo la clave que muestran `search_memory` y `read_memory`, nunca bajo una nueva. Esa oración va en «How to write a save», fuera de la apertura, así que las instrucciones y su largo no cambian; no tiene un test que la pida, y `the_protocol_names_only_what_exists` comprueba que `topic_key` sea una propiedad del schema.
 
 **Tests:** `the_instructions_carry_the_saving_habits` y `the_protocol_describes_the_session_summary` (`server.rs`); además, `get_info_advertises_tools_and_the_profiles_server_name` e `instructions_say_when_to_search_the_project` (`server.rs`) y `a_discover_probe_is_answered_with_what_the_server_offers` (`handshake.rs`) piden `save_memory`, `synthesize` y `search_project` en las instrucciones.
 

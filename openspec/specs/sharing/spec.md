@@ -57,9 +57,9 @@ Por defecto, sin archivo, cada agente lee a todos los demás: ocultar es una dec
 
 ## R2. Búsqueda con lo ajeno
 
-- La búsqueda de L MUST traer las filas propias y las de los autores de su alcance, en las tres tablas (`memory`, `episodic`, `procedural`), en los dos canales (vectorial y léxico) y en la bonificación por identificador. El alcance viaja en `SearchScope.reach` (`crates/clawg-core/src/memory/search.rs:33`, `with_reach` en `:54`) y entra a cada consulta como un solo parámetro JSON (`reach_bind`, `search.rs:63`): `ELIGIBLE_SQL_MEMORY` (`:227`, con las de `episodic` y `procedural`), las tres KNN (`:178`, `:195`, `:210`), `LEXICAL_CANDIDATE_SQL` (`:611`), `IDENTIFIER_MATCH_SQL` (`:738`) y `LEXICAL_SCORE_SQL_PREFIX` (`:890`).
+- La búsqueda de L MUST traer las filas propias y las de los autores de su alcance, en las tres tablas (`memory`, `episodic`, `procedural`), en los dos canales (vectorial y léxico) y en la bonificación por identificador. El alcance viaja en `SearchScope.reach` (`crates/clawg-core/src/memory/search.rs:33`, `with_reach` en `:54`) y entra a cada consulta como un solo parámetro JSON (`reach_bind`, `search.rs:63`): `ELIGIBLE_SQL_MEMORY` (`:260`, con las de `episodic` y `procedural`), las tres KNN (`:202`, `:219`, `:234`), `LEXICAL_CANDIDATE_SQL` (`:673`), `IDENTIFIER_MATCH_SQL` (`:800`) y `LEXICAL_SCORE_SQL_PREFIX` (`:952`).
 - Una fila ajena MUST pasar los mismos filtros que una propia: estado `active` o `disputed`, sin `deleted_at`, y el filtro de proyecto de siempre (la del proyecto, las sin proyecto y `user_preference` de cualquiera).
-- El conteo de elegibles que decide el reintento de vec0 (`search.rs:462`) MUST contar con el mismo alcance, para que una ventana llena de filas no visibles siga disparando el reintento y una llena de visibles no lo dispare.
+- El conteo de elegibles que decide el reintento de vec0 (`search.rs:516`) MUST contar con el mismo alcance, para que una ventana llena de filas no visibles siga disparando el reintento y una llena de visibles no lo dispare.
 - Lo propio y lo ajeno MUST puntuar con la misma fórmula: compartir no agrega pesos.
 - Con alcance `Own`, la búsqueda MUST devolver exactamente las mismas filas, en el mismo orden y con los mismos puntajes que sin compartir. Sin filas ajenas, `AllBut` MUST dar lo mismo que `Own`. `SearchScope::all_default()` queda en `Own` (`search.rs:44`): rag-eval y todo scope armado a mano ven sólo lo propio; el daemon es quien pone el alcance de la política.
 - La búsqueda que hace el detector de contradicciones al guardar MUST seguir viendo sólo las filas del que guarda (`reach: Reach::Own`, `crates/clawg-core/src/memory/contradiction.rs:175`).
@@ -134,7 +134,7 @@ En `search_memory` (`format_hits`, `crates/clawg-cli/src/mcp/tools.rs:82`; `shar
 
 ## R6. `memory_status` dice a quién lee el agente
 
-`memory_status` MUST terminar con una línea `shared:` (`format_sharing`, `crates/clawg-cli/src/mcp/tools.rs:420`; el puente lee el mismo archivo que el daemon, en `memory_status_impl`, `server.rs:981`):
+`memory_status` MUST terminar con una línea `shared:` (`format_sharing`, `crates/clawg-cli/src/mcp/tools.rs:425`; el puente lee el mismo archivo que el daemon, en `memory_status_impl`, `server.rs:981`):
 
 - `shared: reads every agent` sin exclusiones para el agente (o sin archivo);
 - `shared: reads every agent but <autor>, <autor>` (orden alfabético) con exclusiones;

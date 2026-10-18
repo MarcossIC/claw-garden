@@ -22,16 +22,16 @@ Fuente de verdad del comportamiento actual de la recuperación: el corte relativ
 - **`MIN_SHOWN_HITS` (`relevance.rs:22`):** 2. Hits no exactos que pasan el corte sea cual sea su score; los exactos no cuentan para este mínimo.
 - **Acceso:** un id que llega al access tracker. En el flush suma `access_count`, lleva `last_accessed_at` al máximo entre el actual y el del flush, y recalcula el tier en la misma sentencia (`flush`, `crates/clawg-core/src/memory/access.rs:175`; el `UPDATE` en `:204-209`). El flush corre cada 30 s o al juntar 500 ids (`access.rs:76-78` y `:90`).
 - **Hit contable:** hit de `kind = memory` con `score > 0` (`AccessTracker::record_hits`, `access.rs:151`). Sólo cuentan los de `memory` porque los ids son por tabla y el flush sólo actualiza `memory`. Un hit con score 0 está bajo el piso de similitud y ocupa un lugar de relleno.
-- **Token:** cada tramo de `char::is_alphanumeric() || '_'` de la consulta, como los parte `fts_tokens` (`crates/clawg-core/src/memory/search.rs:576`).
-- **Token identificador (`is_identifier`, `search.rs:712`):** un token que cumple al menos una de:
+- **Token:** cada tramo de `char::is_alphanumeric() || '_'` de la consulta, como los parte `fts_tokens` (`crates/clawg-core/src/memory/search.rs:638`).
+- **Token identificador (`is_identifier`, `search.rs:774`):** un token que cumple al menos una de:
   - tiene letras y dígitos (`getUser4821`, `v2`);
   - tiene `_` y al menos una letra (`E_AUTH_4821`, `snake_case`);
   - tiene una minúscula seguida inmediatamente de una mayúscula (`getEstadoLabel`).
   Un número solo (`4821`) no es identificador.
-- **Identificadores de la consulta (`identifier_tokens`, `search.rs:699`):** los tokens identificadores distintos de toda la consulta, en orden de aparición, hasta 8 (`MAX_IDENTIFIER_TOKENS`, `search.rs:691`).
-- **Match de identificador (`identifier_matches`, `search.rs:754`):** fila de `memory` visible para el llamador (mismos predicados de agente, proyecto, estado y `deleted_at` que el canal léxico) cuyo contenido tiene **todos** los identificadores de la consulta, según FTS5 (`"t1" AND "t2" …`). FTS5 separa en `_`, así que `"user_id"` es una frase que también matchea `user id` y `user-id`: para los identificadores con `_` el contenido MUST tenerlos escritos tal cual, sin distinguir mayúsculas y sin pegarse a otro nombre (`holds_identifier`, `search.rs:723`). Las filas que no los tienen así no reciben bono ni cuentan para el presupuesto.
+- **Identificadores de la consulta (`identifier_tokens`, `search.rs:761`):** los tokens identificadores distintos de toda la consulta, en orden de aparición, hasta 8 (`MAX_IDENTIFIER_TOKENS`, `search.rs:753`).
+- **Match de identificador (`identifier_matches`, `search.rs:816`):** fila de `memory` visible para el llamador (mismos predicados de agente, proyecto, estado y `deleted_at` que el canal léxico) cuyo contenido tiene **todos** los identificadores de la consulta, según FTS5 (`"t1" AND "t2" …`). FTS5 separa en `_`, así que `"user_id"` es una frase que también matchea `user id` y `user-id`: para los identificadores con `_` el contenido MUST tenerlos escritos tal cual, sin distinguir mayúsculas y sin pegarse a otro nombre (`holds_identifier`, `search.rs:785`). Las filas que no los tienen así no reciben bono ni cuentan para el presupuesto.
 - **Presupuesto léxico:** `SearchScope.lexical`, 20 por defecto (`search.rs:43`).
-- **Bono léxico:** `ScoringConfig.lexical_bonus`, 1,0 por defecto (`crates/clawg-core/src/memory/score.rs:185`).
+- **Bono léxico:** `ScoringConfig.lexical_bonus`, 1,0 por defecto (`crates/clawg-core/src/memory/score.rs:188`).
 - **Presupuesto del contexto:** el `budget` de `POST /v1/context`, en bytes del prompt (unos 4 por token): `DEFAULT_BUDGET` 8.000 y `MAX_BUDGET` 24.000 (`crates/clawg-core/src/memory/prompt_builder.rs:51-53`). Cómo llega y se valida está en [`specs/mcp`](../mcp/spec.md).
 - **Hit candidato:** hit que el prompt de `recall_context` llevaría sin presupuesto: los de la búsqueda sin las filas del workspace, cortados en `K_FINAL = 10` (`build_memory_prompt`, `prompt_builder.rs:147`; el corte en `:216-217`).
 - **Hit mostrado:** hit candidato de `kind = memory` que el presupuesto dejó en RECENT o LONG-TERM, entero o recortado. Los ids son por tabla, así que un hit episodic o procedural nunca cuenta. Sin recorte, los hits mostrados son todos los candidatos de `memory`.
@@ -110,7 +110,7 @@ El handler `search` MUST registrar como acceso exactamente los hits contables de
 
 ## Cliente HTTP y herramienta `search_memory`
 
-`DaemonClient::search` MUST mandar `min_relative_score = RELEVANCE_RATIO` junto con los campos de `SearchArgs` (`search_request`, `crates/clawg-cli/src/client.rs:466`; uso en `:639`). El puente MUST volver a aplicar el corte al renderizar `search_memory` (`relevant_hits` y `format_search`, `crates/clawg-cli/src/mcp/tools.rs:61` y `:68`), con el mismo `shown_hits` que el daemon, así que un hit exacto se muestra aunque el corte deje fuera a otro. `Hit` del cliente MUST leer `exact` con `#[serde(default)]`: un hit sin el campo vale `false`. Aplicar el corte dos veces da el mismo resultado, y contra un daemon que ignora el campo el agente ve lo mismo.
+`DaemonClient::search` MUST mandar `min_relative_score = RELEVANCE_RATIO` junto con los campos de `SearchArgs` (`search_request`, `crates/clawg-cli/src/client.rs:474`; uso en `:647`). El puente MUST volver a aplicar el corte al renderizar `search_memory` (`relevant_hits` y `format_search`, `crates/clawg-cli/src/mcp/tools.rs:62` y `:68`), con el mismo `shown_hits` que el daemon, así que un hit exacto se muestra aunque el corte deje fuera a otro. `Hit` del cliente MUST leer `exact` con `#[serde(default)]`: un hit sin el campo vale `false`. Aplicar el corte dos veces da el mismo resultado, y contra un daemon que ignora el campo el agente ve lo mismo.
 
 #### Escenario: cuerpo del pedido
 - WHEN el cliente arma el cuerpo de una búsqueda
@@ -143,7 +143,7 @@ El handler `search` MUST registrar como acceso exactamente los hits contables de
 
 ## El score de un match suma el bono
 
-Para un hit marcado como match de identificador (`RawHit.lexical_match`, `score.rs:30`), `score()` (`score.rs:263`) MUST valer `(cos' + lexical_bonus) × max(piso_tier, decaimiento) × importancia × estado`, donde `cos'` es el coseno ya re-escalado contra el piso (la suma en `score.rs:276`). Para un hit sin match, MUST valer lo mismo que sin el bono.
+Para un hit marcado como match de identificador (`RawHit.lexical_match`, `score.rs:30`), `score()` (`score.rs:262`) MUST valer `(cos' + lexical_bonus) × max(piso_tier, decaimiento) × importancia × estado`, donde `cos'` es el coseno ya re-escalado contra el piso (la suma en `score.rs:275`). Para un hit sin match, MUST valer lo mismo que sin el bono.
 
 #### Escenario: el bono se suma después del piso
 - GIVEN un hit match con coseno bajo el piso (cos' = 0), tier 1, edad 0, importancia 1 y estado `active`
@@ -157,7 +157,7 @@ Para un hit marcado como match de identificador (`RawHit.lexical_match`, `score.
 
 ## El piso de coseno
 
-El coseno de cada hit MUST re-escalarse contra `ScoringConfig::DEFAULT.cosine_floor`, que vale 0,79 (`score.rs:181`): `cos' = clamp((cos − piso) / (1 − piso), 0, 1)` (`rescale_cosine`, `score.rs:214`; aplicado en `score()`, `score.rs:270`). Un coseno bajo el piso vale 0 y el piso es el cero del término de similitud; sin la re-escala, todos los cosenos caerían en una banda angosta y la similitud casi no pesaría frente a la importancia.
+El coseno de cada hit MUST re-escalarse contra `ScoringConfig::DEFAULT.cosine_floor`, que vale 0,79 (`score.rs:184`): `cos' = clamp((cos − piso) / (1 − piso), 0, 1)` (`rescale_cosine`, `score.rs:217`; aplicado en `score()`, `score.rs:270`). Un coseno bajo el piso vale 0 y el piso es el cero del término de similitud; sin la re-escala, todos los cosenos caerían en una banda angosta y la similitud casi no pesaría frente a la importancia.
 
 El valor está atado a la distribución de cosenos del embedder: al pooling mean del modelo (`multilingual-e5-small/mean`, [`specs/storage`](../storage/spec.md)) y a los prefijos de consulta y pasaje que el daemon manda hoy. Cambiar cualquiera de los dos mueve toda la distribución y obliga a medirlo de nuevo.
 
@@ -167,7 +167,7 @@ El valor está atado a la distribución de cosenos del embedder: al pooling mean
 
 ## La búsqueda premia el identificador exacto
 
-Con el canal léxico encendido y texto de consulta, `search_all_memories` MUST marcar como match de identificador cada fila que lo sea, venga del canal denso (`knn_one`, `search.rs:391`) o del léxico (`score_lexical_candidates`, `search.rs:951`), y MUST sumar los matches a los candidatos léxicos aunque estén fuera del top denso o pasado el token 16. Los matches se calculan antes del `try_join!` de los canales (`search.rs:1087`).
+Con el canal léxico encendido y texto de consulta, `search_all_memories` MUST marcar como match de identificador cada fila que lo sea, venga del canal denso (`knn_one`, `search.rs:430`) o del léxico (`score_lexical_candidates`, `search.rs:1013`), y MUST sumar los matches a los candidatos léxicos aunque estén fuera del top denso o pasado el token 16. Los matches se calculan antes del `try_join!` de los canales (`search.rs:1145`).
 
 #### Escenario: el identificador le gana a los hermanos
 - GIVEN 8 filas: 7 hermanos de coseno alto con `resolveLedger4812`, `resolveLedger4821`… y una fila de coseno más bajo que menciona `resolveLedger4182`
@@ -202,7 +202,7 @@ Si las filas visibles que matchean los identificadores de la consulta son más q
 
 ## El bono respeta el scope
 
-Un match de identificador MUST cumplir los mismos predicados que el candidato léxico: agente (el llamador y los autores de su alcance, [`specs/sharing`](../sharing/spec.md) R2), proyecto (con la excepción de `user_preference`), estado `active`/`disputed` y `deleted_at IS NULL` (`IDENTIFIER_MATCH_SQL`, `search.rs:738`). Una fila de un autor fuera de su alcance, borrada o de otro proyecto MUST NOT recibir el bono ni contar para el presupuesto.
+Un match de identificador MUST cumplir los mismos predicados que el candidato léxico: agente (el llamador y los autores de su alcance, [`specs/sharing`](../sharing/spec.md) R2), proyecto (con la excepción de `user_preference`), estado `active`/`disputed` y `deleted_at IS NULL` (`IDENTIFIER_MATCH_SQL`, `search.rs:800`). Una fila de un autor fuera de su alcance, borrada o de otro proyecto MUST NOT recibir el bono ni contar para el presupuesto.
 
 #### Escenario: fila de otro agente
 - GIVEN 21 filas de otro agente que el llamador no lee y una del llamador con `getUser42`
@@ -220,7 +220,7 @@ Un match de identificador MUST cumplir los mismos predicados que el candidato l�
 
 ## La búsqueda no falla por el canal de identificadores
 
-Un error de la consulta de matches (FTS ausente, MATCH rechazado, conexión cerrada) MUST dejar la búsqueda como si no hubiera matches, igual que los candidatos léxicos (`search.rs:787`, junto a `:683`).
+Un error de la consulta de matches (FTS ausente, MATCH rechazado, conexión cerrada) MUST dejar la búsqueda como si no hubiera matches, igual que los candidatos léxicos (`search.rs:848-851`, junto a `:744-747`).
 
 **Test:** `a_failing_identifier_query_leaves_the_search_unboosted` en `search.rs`.
 
@@ -480,12 +480,12 @@ Con un proyecto indexado ([`specs/project-docs`](../project-docs/spec.md)), `sea
 - Los contadores ya guardados no se reescriben. Los accesos que se contaron de más antes de este comportamiento quedan como estaban.
 - El formato del prompt de `recall_context` no toca la búsqueda: la salida de `search_memory` es la misma, y el orden y los separadores de las secciones (`prompt_builder.rs:22-25`) y `K_FINAL` (`:44`) no dependen de él. El separador `=== ACTIVE CONFLICTS (review needed) ===` lo nombran las instrucciones del servidor y la doc de `resolve_conflict`.
 - El presupuesto no toca la búsqueda ni el ranking: corta lo que se imprime, después de `K_FINAL`, y la salida de `search_memory` es la misma.
-- Un prompt vacío se entrega como `no context yet` (`format_context`, `crates/clawg-cli/src/mcp/tools.rs:380`), salvo cuando las memorias no se buscaron: entonces lo reemplaza el aviso de [`specs/mcp`](../mcp/spec.md). Ese aviso va antes del prompt y el de `synthesize` después (`format_recall`, `tools.rs:361`), los dos fuera de lo que mide `rag-eval`.
+- Un prompt vacío se entrega como `no context yet` (`format_context`, `crates/clawg-cli/src/mcp/tools.rs:385`), salvo cuando las memorias no se buscaron: entonces lo reemplaza el aviso de [`specs/mcp`](../mcp/spec.md). Ese aviso va antes del prompt y el de `synthesize` después (`format_recall`, `tools.rs:366`), los dos fuera de lo que mide `rag-eval`.
 - Armar el prompt no escribe: `fetch_active_conflicts` es un `SELECT`, y el archivo del workspace no cambia.
 
 ## Fuera de esta spec
 
-- El orden entre hits con score 0: `hit_cmp` desempata por `(kind, id)` ascendente (`crates/clawg-core/src/memory/search.rs:135`). Desde lexical-fusion, un match de identificador ya no depende de ese desempate para llegar al top 10: el bono lo deja con score > 0 aunque su coseno quede bajo el piso.
+- El orden entre hits con score 0: `hit_cmp` desempata por `(kind, id)` ascendente (`crates/clawg-core/src/memory/search.rs:168`). Desde lexical-fusion, un match de identificador ya no depende de ese desempate para llegar al top 10: el bono lo deja con score > 0 aunque su coseno quede bajo el piso.
 - Un bono parcial (la fila tiene sólo algunos identificadores de la consulta), números solos como identificadores y FTS para `episodic` y `procedural`.
 - Qué pares se disputan y cómo se resuelven: [`specs/disputes`](../disputes/spec.md). Acá sólo está cómo se imprimen.
 - Un id en los bullets del workspace. Hoy no lo tienen, y por eso una fila del workspace que está en un conflicto lleva su texto también en el bloque.

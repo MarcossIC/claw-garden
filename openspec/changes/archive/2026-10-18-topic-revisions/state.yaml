@@ -1,7 +1,7 @@
 change: topic-revisions
 objective: "1"
 depends_on: [conflict-candidates]
-phase: verify
+phase: archived
 artifacts:
   exploration: done
   proposal: done
@@ -9,6 +9,7 @@ artifacts:
   design: done
   tasks: done
   apply: done
-  verify: in_progress  # Linux hecho; faltan Windows, el modelo real y el perfil dev
-  archive: pending
+  verify: done  # Linux, Windows, modelo real y el perfil dev con Claude Code; la compuerta previa pasó a revision-eval
+  archive: done
 updated: 2026-10-18
+main_spec: openspec/specs/ingest/spec.md, openspec/specs/pieces/spec.md, openspec/specs/disputes/spec.md, openspec/specs/storage/spec.md, openspec/specs/mcp/spec.md, openspec/specs/update/spec.md

@@ -197,7 +197,7 @@ El texto de un doc MUST pasar entero por `redact` (`crates/clawg-core/src/memory
 - Antes de buscar, si el último refresco del proyecto empezó hace 60 s o más (`REFRESH_INTERVAL`, `mod.rs:32`) o nunca empezó, y no hay uno en curso, MUST refrescar (`is_due`, `needs_refresh`). Un refresco fallido MUST NOT impedir la búsqueda sobre lo que ya está indexado: la respuesta MUST traer `warning` con el error.
 - Si hay un refresco del proyecto en curso y el índice del proyecto está vacío (el primero, que suele lanzar el registro del puente un momento antes), MUST esperarlo hasta 20 s (`FIRST_INDEX_WAIT`, `api.rs:1403`) antes de buscar, para no contestar "los docs no dicen nada" mientras se arman. Con un índice ya armado no espera: contesta con lo que hay.
 - `indexing` MUST ser `true` si un refresco del proyecto está en curso al responder.
-- La búsqueda (`search`, `mod.rs:262`) MUST combinar dos listas, cada una de hasta 50 pasajes del proyecto (`CANDIDATES_PER_CHANNEL`, `mod.rs:37`): los vecinos más cercanos al vector de la consulta (rol `Query`) y los mejores por BM25 de FTS5 con la misma expresión de consulta que usa la búsqueda léxica de memorias (`fts_match_expression` con `MAX_LEXICAL_TOKENS`, `crates/clawg-core/src/memory/search.rs:615` y `:595`). MUST fusionarlas por rango recíproco (`fuse`, `mod.rs:247`: `1 / (60 + rango)`, rango desde 1, sumado si un pasaje está en las dos; `RRF_K`, `mod.rs:42`), ordenar por puntaje y desempatar por id de pasaje menor. Usa rangos y no el piso de coseno ni el bono léxico de las memorias, que se calibraron sobre otro corpus.
+- La búsqueda (`search`, `mod.rs:262`) MUST combinar dos listas, cada una de hasta 50 pasajes del proyecto (`CANDIDATES_PER_CHANNEL`, `mod.rs:37`): los vecinos más cercanos al vector de la consulta (rol `Query`) y los mejores por BM25 de FTS5 con la misma expresión de consulta que usa la búsqueda léxica de memorias (`fts_match_expression` con `MAX_LEXICAL_TOKENS`, `crates/clawg-core/src/memory/search.rs:625` y `:605`). MUST fusionarlas por rango recíproco (`fuse`, `mod.rs:247`: `1 / (60 + rango)`, rango desde 1, sumado si un pasaje está en las dos; `RRF_K`, `mod.rs:42`), ordenar por puntaje y desempatar por id de pasaje menor. Usa rangos y no el piso de coseno ni el bono léxico de las memorias, que se calibraron sobre otro corpus.
 - MUST NOT devolver pasajes de otro proyecto.
 - `text` MUST ser el cuerpo del pasaje, sin el breadcrumb repetido.
 
@@ -260,7 +260,7 @@ El puente MUST ofrecer `search_project(query, project_path?, limit?)` (`SearchPr
 
 La descripción de `project_path` (`server.rs:231-233`) MUST decir que, por defecto, se busca en el directorio en que arrancó el puente, y que los archivos de otro proyecto se buscan sólo después de que el usuario lo agregue con `clawg projects add`.
 
-La salida (`format_docs`, `crates/clawg-cli/src/mcp/tools.rs:307`) MUST ser, por hit, una línea `[n] <breadcrumb>` seguida del texto del pasaje entero, separados por una línea en blanco. Además:
+La salida (`format_docs`, `crates/clawg-cli/src/mcp/tools.rs:312`) MUST ser, por hit, una línea `[n] <breadcrumb>` seguida del texto del pasaje entero, separados por una línea en blanco. Además:
 
 - si `indexing` es `true`, MUST empezar avisando que el índice todavía se está armando y que los resultados pueden estar incompletos;
 - si hay `warning`, MUST nombrarlo antes de los resultados (`The index could not be refreshed (…); these results are from before.`);
