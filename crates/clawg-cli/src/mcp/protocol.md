@@ -76,8 +76,9 @@ Every row competes with the others in search, so leave out:
   language and searched in another is often missed.
 - Set `user_stated` only when the memory is what the user said: their words,
   a correction or an explicit instruction. Leave it out for what you
-  inferred, found or concluded. Without it the memory is yours, and a
-  conflict pair marks it inferred; a side with no mark may be the user's.
+  inferred, found or concluded. Without it the memory is yours: a conflict
+  pair marks an ordinary save inferred and a save with `derived_from` a
+  conclusion; a side with no mark may be the user's.
 
 ## Type and importance
 
