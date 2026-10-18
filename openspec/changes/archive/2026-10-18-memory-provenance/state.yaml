@@ -1,0 +1,15 @@
+change: memory-provenance
+objective: "1, 4, 5"
+depends_on: []
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # Linux, Windows y el perfil dev con Claude Code; rag-eval no hace falta, el ranking y agent-view no cambian
+  archive: done
+updated: 2026-10-18
+main_spec: openspec/specs/provenance/spec.md

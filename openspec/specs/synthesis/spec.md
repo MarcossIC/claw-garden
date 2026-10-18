@@ -81,6 +81,7 @@ Purgar una fila (`clawg purge`) sí la borra de verdad: MUST borrar en la misma 
 
 - devolver las memorias pendientes del alcance, de la más nueva a la más vieja, hasta `limit` (30 por defecto, entre 1 y 100), y cuántas pendientes hay en total;
 - devolver las conclusiones vivas del alcance (hasta 20, de la más nueva a la más vieja) con su `derived_from`;
+- en `synthesize`, marcar el origen de cada memoria y conclusión que lo tiene (`origin=inferred`, `origin=conclusion`; P5 de [`specs/provenance`](../provenance/spec.md)). Una conclusión se guarda sellada `synthesis` / `agent`, y `user_stated` con `derived_from` es un 400 (P1 y P2);
 - con agente, mirar sólo sus filas; la herramienta MCP siempre manda el agente que llama;
 - registrar `reviewed_at = ahora` para el alcance en `synthesis_review`; la revisión de un agente no apaga el recordatorio de otro;
 - MUST NOT escribir nada más: no crea, no borra ni cambia memorias, y no registra accesos.

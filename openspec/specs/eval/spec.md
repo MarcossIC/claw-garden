@@ -432,7 +432,7 @@ El flag MUST NOT aceptarse sin `--diff`: es un error de uso, que sale con 1. Si 
 rag-eval (--fake | --real) --lexical-only [--tag <slug>]
 ```
 
-`--lexical-only` MUST ordenar cada caso por el canal léxico solo: la misma consulta FTS5 y el mismo orden `bm25` que la búsqueda completa (`lexical_candidates`, `crates/clawg-core/src/memory/search.rs:705`), con la consulta tal cual, sin vectores ni puntaje, y hasta 10 filas (`EvalStore::lexical_search`, `crates/clawg-core/src/eval_api.rs:345`). Si FTS falla, el caso queda sin filas, sin aviso.
+`--lexical-only` MUST ordenar cada caso por el canal léxico solo: la misma consulta FTS5 y el mismo orden `bm25` que la búsqueda completa (`lexical_candidates`, `crates/clawg-core/src/memory/search.rs:705`), con la consulta tal cual, sin vectores ni puntaje, y hasta 10 filas (`EvalStore::lexical_search`, `crates/clawg-core/src/eval_api.rs:346`). Si FTS falla, el caso queda sin filas, sin aviso.
 
 El resultado MUST llevar el tag `lexical-only` (`LEXICAL_ONLY_SLUG`, `main.rs:46`), y con `--tag X`, `X-lexical-only`, en un archivo que `--diff` compara con cualquier otro. `similarity` se sigue calculando. El flag MUST NOT combinarse con `--agent-view`, `--follow-up`, `--docs`, los barridos ni `--fts-tokenizer` (`cli.rs:407-417`). Con `--audit` sí se puede.
 
@@ -525,7 +525,7 @@ El reporte de `rag-eval` MUST incluir la curva del umbral de contradicción: par
 conflict-eval (--real | --fake) [--pairs FILE] [--specs DIR | --flow FILE] [--out FILE]
 ```
 
-El barrido de arriba mide la distancia sola. `conflict-eval` (`crates/clawg-eval/src/bin/conflict-eval/main.rs`) mide el detector entero, con el filtro de tipo, el piso, el colapso por save y el escalamiento ([`specs/disputes`](../disputes/spec.md)): MUST ingerir con el worker de producción (`EvalIngest`) y leer los pares que quedaron (`conflict_pairs`, `crates/clawg-core/src/eval_api.rs:580`).
+El barrido de arriba mide la distancia sola. `conflict-eval` (`crates/clawg-eval/src/bin/conflict-eval/main.rs`) mide el detector entero, con el filtro de tipo, el piso, el colapso por save y el escalamiento ([`specs/disputes`](../disputes/spec.md)): MUST ingerir con el worker de producción (`EvalIngest`) y leer los pares que quedaron (`conflict_pairs`, `crates/clawg-core/src/eval_api.rs:585`).
 
 - **Pares etiquetados** (`crates/clawg-eval/data/conflict-pairs.json`, 110 pares en inglés y español): cada uno se guarda, el viejo y después el nuevo, en una base propia. Su clase dice qué es el nuevo para el viejo (`Class`, `crates/clawg-eval/src/bin/conflict-eval/measure.rs:13`): `contradiction`, `update`, `complement`, `rephrase` o `distinct`. `parse_pairs` (`measure.rs:81`) MUST rechazar un archivo con una clase bajo su mínimo (`Class::minimum`, `measure.rs:41`: 30 para contradicción y distintos, 15 para las demás).
 - **Flujo:** una sola base que recibe saves uno tras otro, como un proyecto que acumula memorias. Sin `--flow`, son las oraciones con MUST de `openspec/specs` (más de 200), cada una como `semantic_fact` (`flow_saves`, `main.rs:175`). Con `--flow FILE`, son los saves de un arreglo JSON de `{"content", "memory_type"}`, en su orden, con su tipo (`parse_flow`, `measure.rs:66`): así se mide el store real de un usuario con los tipos con que se guardó.

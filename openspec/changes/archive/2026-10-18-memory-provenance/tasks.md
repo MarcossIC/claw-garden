@@ -34,6 +34,6 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 ## 6. Verificación
 
 - [x] `cargo test --workspace` y el clippy de `.claude/CLAUDE.md` en Linux.
-- [ ] Lo mismo en Windows, en `target-test`.
-- [ ] Perfil dev con Claude Code: un save declarado, uno sin declarar y una conclusión, vistos en `clawg memories show` y en `memory_status`.
+- [x] Lo mismo en Windows, en `target-test`.
+- [x] Perfil dev con Claude Code: un save declarado, uno sin declarar y una conclusión, vistos en `clawg memories show` y en `memory_status`.
 - [x] `verify.md`.
