@@ -527,10 +527,9 @@ fn format_hit_line(hit: &RankedHit, reader: &str) -> String {
 
 /// Printed once above the pairs: it is the same for every one of them.
 const CONFLICT_NOTE: &str = "\
-NOTE: these memories say close things and may conflict; the user has not said which holds.
+NOTE: these memories may conflict; the user has not said which holds.
 Before a decision that depends on them, ask the user.
-With the answer, call resolve_conflict: verdict supersedes with keep = the one that holds, \
-or compatible or scoped (with a reason) when both hold.";
+Then call resolve_conflict: verdict supersedes with keep = the one that holds, or compatible or scoped.";
 
 /// Orders pairs by the earliest printed hit among their sides and keeps the
 /// first `cap`, returning how many were left out. The query cannot order them:
@@ -960,6 +959,14 @@ mod tests {
         for verdict in ["supersedes", "compatible", "scoped"] {
             assert!(note.contains(verdict), "{verdict}: {note}");
         }
+    }
+
+    /// The NOTE is printed in every block with conflicts, so naming the
+    /// verdicts must not cost more than the 228 bytes of the note that named
+    /// none.
+    #[test]
+    fn the_conflict_note_is_no_longer_than_the_one_without_verdicts() {
+        assert!(CONFLICT_NOTE.len() <= 228, "{} bytes: {CONFLICT_NOTE}", CONFLICT_NOTE.len());
     }
 
     /// A conflict on a standing preference would otherwise take the cap on

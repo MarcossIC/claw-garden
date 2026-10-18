@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn conflict_text_yields_no_segments() {
-        let text = "=== ACTIVE CONFLICTS (review needed) ===\nNOTE: these memories say close things and may conflict; the user has not said which holds.\nNEW [2026-08-11 #2 disputed] x\n- looks like a bullet\nOLD [2026-08-10 #1] y\n[2026-08-09 #5 chat_message] looks like a hit\n";
+        let text = "=== ACTIVE CONFLICTS (review needed) ===\nNOTE: these memories may conflict; the user has not said which holds.\nNEW [2026-08-11 #2 disputed] x\n- looks like a bullet\nOLD [2026-08-10 #1] y\n[2026-08-09 #5 chat_message] looks like a hit\n";
         assert!(context_segments(text).is_empty());
     }
 
