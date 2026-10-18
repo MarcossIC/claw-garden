@@ -1004,6 +1004,58 @@ async fn an_update_over_a_pending_migration_leaves_a_pre_migration_snapshot_and_
 
 // The server runs in this process while the binary is waited on.
 #[tokio::test(flavor = "multi_thread")]
+async fn a_new_binary_that_migrated_and_failed_gets_its_pre_migration_restored() {
+    let sandbox = Sandbox::new();
+    let (installed, old) = store_behind(&sandbox).await;
+    let original = std::fs::read(&installed).expect("read the installed binary");
+    let release = signed_release("0.19.0", r#","serve_fault":"after_open""#);
+    let server = ReleaseServer::serving(release.listing.clone(), release.files.clone()).await;
+    let _stop = StopOnDrop { home: sandbox.home.clone() };
+
+    let out = update_from(&sandbox, &installed, &server.base, &release.public);
+
+    assert_eq!(out.status.code(), Some(1), "{}\n{}", stdout_of(&out), stderr_of(&out));
+    let report = stderr_of(&out);
+    assert!(report.contains("starting the new daemon"), "{report}");
+    assert!(report.contains("Everything was put back: clawg 0.18.0 is installed"), "{report}");
+    let snapshots = pre_migrations(&sandbox.data_dir());
+    assert_eq!(snapshots.len(), 1, "{snapshots:?}");
+    assert!(report.contains(&format!("The store was restored from {}", snapshots[0].display())), "{report}");
+    assert!(report.contains("What the new daemon had migrated is kept at"), "{report}");
+    assert!(report.contains("Its daemon is running again"), "{report}");
+    assert_eq!(std::fs::read(&installed).expect("read the installed binary"), original);
+    assert!(beside(&installed, "clawg.new-").is_empty(), "the staged file is gone");
+
+    old.wait_for_exit(Duration::from_secs(10)).await;
+    let health = published_health(&sandbox.data_dir()).await;
+    assert_eq!(health["version"], "0.18.0", "the old binary's daemon answers: {health}");
+    let kept: Vec<PathBuf> = std::fs::read_dir(sandbox.data_dir().join("backups"))
+        .expect("backups")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.to_string_lossy().ends_with("-pre-restore.db"))
+        .collect();
+    assert_eq!(kept.len(), 1, "the migrated store is kept: {kept:?}");
+    let migrated = rusqlite::Connection::open(&kept[0]).expect("open the kept store");
+    let version: i32 = migrated
+        .query_row("SELECT max(version) FROM refinery_schema_history", [], |r| r.get(0))
+        .expect("kept schema");
+    assert_eq!(version, last_migration(), "the kept store is the one the new daemon migrated");
+    // Read from the file: a daemon frozen at an old schema runs the current
+    // queries, which name columns that schema lacks, so its list is a 500.
+    let restored = rusqlite::Connection::open(sandbox.data_dir().join("memory.db")).expect("open the store");
+    let version: i32 = restored
+        .query_row("SELECT max(version) FROM refinery_schema_history", [], |r| r.get(0))
+        .expect("store schema");
+    assert_eq!(version, OLD_SCHEMA, "the store is the one from before the migration");
+    let rows: Vec<String> = restored
+        .prepare("SELECT content FROM memory ORDER BY id")
+        .and_then(|mut q| q.query_map([], |r| r.get(0)).and_then(Iterator::collect))
+        .expect("read the rows");
+    assert_eq!(rows, SEEDED, "the seeded rows are back");
+}
+
+// The server runs in this process while the binary is waited on.
+#[tokio::test(flavor = "multi_thread")]
 async fn an_update_whose_candidate_refuses_the_store_leaves_the_old_binary_and_its_daemon() {
     let sandbox = Sandbox::new();
     // The installed binary knows every migration and has migrated the store;

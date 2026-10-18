@@ -4,7 +4,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clawg_core::memory::backup::{parse_snapshot_name, snapshot_name, Reason};
+use clawg_core::memory::backup::{parse_snapshot_name, snapshot_name, ProbeState, Reason, SchemaPlan};
 
 /// A daemon that was answering when the update began.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,6 +254,13 @@ pub fn new_pre_migration(before: &[String], after: &[String]) -> Option<String> 
         .filter(|name| parse_snapshot_name(name) == Some(Reason::PreMigration))
         .max()
         .cloned()
+}
+
+/// Whether the store, read by the binary that is running, is one it cannot
+/// open: the new daemon migrated it past this binary's migrations. An
+/// unreadable store is not judged: restoring over it would hide the cause.
+pub fn store_needs_restore(state: &ProbeState) -> bool {
+    matches!(state, ProbeState::Schema(SchemaPlan::Newer { .. } | SchemaPlan::Diverged { .. }))
 }
 
 /// `clawg.exe` as (`clawg`, `.exe`); a name without an extension has none.
@@ -757,5 +764,18 @@ mod watch_cases {
         );
         assert_eq!(new_pre_migration(&[], &[old.clone(), new.clone()]), Some(new), "the newest of several");
         assert_eq!(new_pre_migration(&[], &["notes.txt".to_string()]), None);
+    }
+
+    #[test]
+    fn a_store_the_running_binary_cannot_open_is_given_back() {
+        use clawg_core::memory::backup::{ProbeState, SchemaPlan};
+        for needed in [SchemaPlan::Newer { db: 16, binary: 15 }, SchemaPlan::Diverged { version: 12 }] {
+            assert!(store_needs_restore(&ProbeState::Schema(needed)), "{needed:?}");
+        }
+        for fine in [SchemaPlan::Fresh, SchemaPlan::UpToDate, SchemaPlan::Pending { from: 14, to: 15 }] {
+            assert!(!store_needs_restore(&ProbeState::Schema(fine)), "{fine:?}");
+        }
+        assert!(!store_needs_restore(&ProbeState::Missing));
+        assert!(!store_needs_restore(&ProbeState::Unreadable("locked".into())));
     }
 }

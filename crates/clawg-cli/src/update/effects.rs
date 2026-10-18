@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use clawg_core::memory::backup;
 use clawg_core::memory::store_lock::StoreLock;
 use clawg_core::paths::{backups_dir, Profile};
 
@@ -14,7 +15,8 @@ use crate::stop::{stop_in, STOP_TIMEOUT};
 
 use super::client::ReleaseClient;
 use super::plan::{
-    judge, new_pre_migration, Answer, Effects, Observation, Running, Step, StoreRestore, Undo, Verdict,
+    judge, new_pre_migration, store_needs_restore, Answer, Effects, Observation, Running, Step, StoreRestore,
+    Undo, Verdict,
 };
 use super::release::Release;
 use super::report::{install_dir_access, NewDaemon};
@@ -332,7 +334,17 @@ impl Effects for Installation {
     }
 
     async fn restore_store(&mut self) -> Result<StoreRestore, String> {
-        Ok(StoreRestore::NotNeeded)
+        // This process is still the previous binary, so the probe asks the
+        // question that matters: can the binary being put back open the store.
+        let probe = backup::probe(&self.paths.base_dir);
+        if !store_needs_restore(&probe.state) {
+            return Ok(StoreRestore::NotNeeded);
+        }
+        let from = self
+            .pre_migration()
+            .ok_or("the store was migrated, but the snapshot the new daemon wrote before migrating was not found")?;
+        let restored = backup::restore(&self.paths.base_dir, &from).map_err(|e| e.to_string())?;
+        Ok(StoreRestore::Restored { from, kept_as: restored.previous })
     }
 }
 
