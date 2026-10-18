@@ -1,7 +1,7 @@
 change: search-abstention
 objective: "1"
 depends_on: [eval-rigor, memory-rank-fusion]
-phase: verify
+phase: archived
 artifacts:
   exploration: done
   proposal: done
@@ -9,6 +9,7 @@ artifacts:
   design: skipped  # the proposal settles approach C against A, B and D with the exploration's tradeoffs; the calibrated gate is a separate change
   tasks: done
   apply: done
-  verify: in_progress  # Linux hecho; faltan el CI y el modelo real
-  archive: pending
+  verify: done  # Linux, CI de Linux y Windows y modelo real; U3 falla por el relleno de score 0 que el cambio quita
+  archive: done
 updated: 2026-10-18
+main_spec: openspec/specs/retrieval/spec.md, openspec/specs/mcp/spec.md

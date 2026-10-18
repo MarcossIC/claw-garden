@@ -31,7 +31,7 @@ Fuente de verdad del comportamiento actual de la ingesta: el contrato de `POST /
 
 ### Aceptar es durable
 
-Después de validar el pedido (contenido, `memory_type`, `operation_id`, `derived_from` y `topic_key`, cada uno un `400`) y de comprobar que el embedder no está `failed`, `POST /v1/memories` MUST pasar por `MemoryRuntime::accept` (`crates/clawg-core/src/runtime.rs:212`, llamado en `save_memory`, `api.rs:968`), que en este orden:
+Después de validar el pedido (contenido, `memory_type`, `operation_id`, `derived_from` y `topic_key`, cada uno un `400`) y de comprobar que el embedder no está `failed`, `POST /v1/memories` MUST pasar por `MemoryRuntime::accept` (`crates/clawg-core/src/runtime.rs:212`, llamado en `save_memory`, `api.rs:972`), que en este orden:
 
 1. enmascara el contenido (ver [`specs/secrets`](../secrets/spec.md), R2): la fila guarda el texto ya enmascarado;
 2. escribe y confirma la fila del outbox (`outbox_record`, `crates/clawg-core/src/memory/outbox.rs:208`). El commit MUST hacerse con `synchronous = FULL` y la conexión MUST volver después a su valor (`durably`, `outbox.rs:183`): un save aceptado sobrevive también a un corte de luz, a costa de un fsync por save. El resto de la base, incluidos el progreso y el borrado final de la fila, sigue en `NORMAL`;
@@ -65,7 +65,7 @@ Los tipos de memoria están en un solo lugar, `MemoryType::ALL` (`crates/clawg-c
 unknown memory_type "preference"; expected one of semantic_fact, user_preference, architectural_decision, session_summary, code_block, chat_message, tool_error
 ```
 
-`POST /v1/memories` con un `memory_type` que no es uno de los siete MUST responder `400` con ese mensaje (`save_memory`, `crates/clawg-cli/src/daemon/api.rs:901-905`), después de comprobar el contenido y antes de `check_operation_id` y del outbox: MUST NOT escribir la fila del outbox ni encolar el evento. Se valida en el handler y no en el worker porque el worker corre cuando quien guardó ya recibió su `201` o `202`, y un rechazo ahí no le llegaría. Un `memory_type` ausente MUST guardarse como `semantic_fact`, y uno válido como ese tipo. `PATCH /v1/memories/{kind}/{id}` rechaza con el mismo mensaje, porque `PatchError::UnknownType` envuelve el mismo error (`crates/clawg-core/src/memory/admin.rs:144`; [`specs/update`](../update/spec.md)): las dos rutas aceptan y rechazan las mismas cadenas.
+`POST /v1/memories` con un `memory_type` que no es uno de los siete MUST responder `400` con ese mensaje (`save_memory`, `crates/clawg-cli/src/daemon/api.rs:905-909`), después de comprobar el contenido y antes de `check_operation_id` y del outbox: MUST NOT escribir la fila del outbox ni encolar el evento. Se valida en el handler y no en el worker porque el worker corre cuando quien guardó ya recibió su `201` o `202`, y un rechazo ahí no le llegaría. Un `memory_type` ausente MUST guardarse como `semantic_fact`, y uno válido como ese tipo. `PATCH /v1/memories/{kind}/{id}` rechaza con el mismo mensaje, porque `PatchError::UnknownType` envuelve el mismo error (`crates/clawg-core/src/memory/admin.rs:144`; [`specs/update`](../update/spec.md)): las dos rutas aceptan y rechazan las mismas cadenas.
 
 Una fila del outbox con un tipo desconocido, escrita antes de esta validación, MUST seguir guardándose como `semantic_fact` al reproducirse (`store_insert.rs:171-176`).
 
@@ -84,7 +84,7 @@ Una fila del outbox con un tipo desconocido, escrita antes de esta validación, 
 
 ### La clave de tema se valida y vuelve en la respuesta
 
-`POST /v1/memories` MUST aceptar `topic_key`, opcional (`SaveRequest.topic_key`, `crates/clawg-cli/src/daemon/api.rs:353`). Una clave que no cumple el formato de «Definiciones» MUST responder `400` con el mensaje de `validate_topic_key`, que empieza con `topic_key`, después de comprobar el contenido y antes de escribir la fila del outbox ni encolar el evento (`save_memory`, `api.rs:907-908`). Se valida en el handler y no en el worker por la misma razón que el tipo: un rechazo del worker llegaría cuando quien guardó ya recibió su `201` o `202`. `validate_topic_key` es pura, y su error (`TopicKeyError`, `topic.rs:23`) usa `thiserror`.
+`POST /v1/memories` MUST aceptar `topic_key`, opcional (`SaveRequest.topic_key`, `crates/clawg-cli/src/daemon/api.rs:353`). Una clave que no cumple el formato de «Definiciones» MUST responder `400` con el mensaje de `validate_topic_key`, que empieza con `topic_key`, después de comprobar el contenido y antes de escribir la fila del outbox ni encolar el evento (`save_memory`, `api.rs:911-912`). Se valida en el handler y no en el worker por la misma razón que el tipo: un rechazo del worker llegaría cuando quien guardó ya recibió su `201` o `202`. `validate_topic_key` es pura, y su error (`TopicKeyError`, `topic.rs:23`) usa `thiserror`.
 
 Todo `201` y `202` de un save con clave MUST llevarla en `topic_key` (`SaveBody.topic_key`, `api.rs:501`); sin clave, el campo no va. Un daemon anterior ignora el campo del pedido (`SaveRequest` no usa `deny_unknown_fields`) y no lo devuelve: así el puente se entera de que su clave no se aplicó.
 
@@ -143,7 +143,7 @@ La respuesta MUST listar las filas reemplazadas en `replaced`, cada una con su i
 
 ### Un save confirmado devuelve los ids
 
-Con el embedder `ready`, `POST /v1/memories` MUST encolar el evento con un canal de respuesta, esperar el reporte del worker y responder `201` con un elemento por chunk, en el orden de los chunks (`save_memory`, `api.rs:894`; `save_response`, `api.rs:821`). Todo `201` lleva además el `operation_id` (ver «`operation_id`»):
+Con el embedder `ready`, `POST /v1/memories` MUST encolar el evento con un canal de respuesta, esperar el reporte del worker y responder `201` con un elemento por chunk, en el orden de los chunks (`save_memory`, `api.rs:898`; `save_response`, `api.rs:825`). Todo `201` lleva además el `operation_id` (ver «`operation_id`»):
 
 ```json
 {"status": "saved", "memories": [{"kind": "memory", "id": 57, "outcome": "inserted"}], "operation_id": "3f0c…"}
@@ -392,7 +392,7 @@ Los textos de un `202` MUST nombrar el `operation_id` (sin él, dicen sólo `acc
 
 ### El cliente HTTP devuelve el resultado parseado
 
-`DaemonClient::save` (`client.rs:597`) MUST devolver `SaveOutcome` (`Saved { memories, redacted, related, replaced, key_dropped }` o `Queued { reason, operation_id }`, `client.rs:432`), no `()`. `key_dropped` vale `true` cuando el pedido llevó una `topic_key` y la respuesta confirmada no la trae (`client.rs:632`). `operation_id` es `None` con un daemon anterior al outbox. Los errores son `ClientError::Daemon { status, message, details }`, y `details` (`ErrorDetails`, `client.rs:84`) MUST conservar `detail`, `retryable` y `memories` del cuerpo de error para que la herramienta los muestre.
+`DaemonClient::save` (`client.rs:614`) MUST devolver `SaveOutcome` (`Saved { memories, redacted, related, replaced, key_dropped }` o `Queued { reason, operation_id }`, `client.rs:449`), no `()`. `key_dropped` vale `true` cuando el pedido llevó una `topic_key` y la respuesta confirmada no la trae (`client.rs:649`). `operation_id` es `None` con un daemon anterior al outbox. Los errores son `ClientError::Daemon { status, message, details }`, y `details` (`ErrorDetails`, `client.rs:84`) MUST conservar `detail`, `retryable` y `memories` del cuerpo de error para que la herramienta los muestre.
 
 **Test:** `save_returns_the_ids_the_daemon_reported` (`client.rs`, mod tests).
 

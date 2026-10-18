@@ -132,7 +132,7 @@ Cuando una fila X se borra (`delete_memory_core`, `crates/clawg-core/src/memory/
 
 Restaurar X (`restore_memory_core`, `admin.rs:436`) MUST llevar a su estado de reposo a X y a toda fila cuyo `disputed_against` la nombra (`admin.rs:508-509`): el par escalado vuelve con ella.
 
-Restaurar una fila borrada que tenía `topic_key` MUST fallar sin cambiar nada cuando el alcance de su clave ya tiene otra fila viva (`RESTORE_TOPIC_HOLDER`, `admin.rs:411`; `RestoreError::TopicTaken`, `admin.rs:370`). El error MUST nombrar la clave y la fila que la tiene, y la fila restaurada se queda borrada: restaurarla dejaría dos versiones vivas de un tema que una revisión mantiene en una. `POST /v1/memories/memory/{id}/restore` MUST responder `409` (`restore_memory`, `crates/clawg-cli/src/daemon/api.rs:1248`), como con un gemelo vivo o un secreto.
+Restaurar una fila borrada que tenía `topic_key` MUST fallar sin cambiar nada cuando el alcance de su clave ya tiene otra fila viva (`RESTORE_TOPIC_HOLDER`, `admin.rs:411`; `RestoreError::TopicTaken`, `admin.rs:370`). El error MUST nombrar la clave y la fila que la tiene, y la fila restaurada se queda borrada: restaurarla dejaría dos versiones vivas de un tema que una revisión mantiene en una. `POST /v1/memories/memory/{id}/restore` MUST responder `409` (`restore_memory`, `crates/clawg-cli/src/daemon/api.rs:1254`), como con un gemelo vivo o un secreto.
 
 Purgar X (`purge`, `crates/clawg-core/src/memory/secrets.rs:82`) MUST borrar los pares que la nombran (`secrets.rs:109`).
 
@@ -174,13 +174,13 @@ Cubre las huérfanas que dejaron las versiones que borraban sin liberar. La mism
 
 ## R6. HTTP y MCP
 
-Detrás del token, sobre filas de `memory` (rutas en `crates/clawg-cli/src/daemon/api.rs:714-716`):
+Detrás del token, sobre filas de `memory` (rutas en `crates/clawg-cli/src/daemon/api.rs:718-720`):
 
-- `POST /v1/disputes/judge` MUST aceptar `{"keep": <id>, "other": <id>, "verdict": "supersedes" | "compatible" | "scoped" | "conflicts", "reason": <opcional>, "agent_id": <opcional>}` (`judge_dispute`, `api.rs:1279`).
+- `POST /v1/disputes/judge` MUST aceptar `{"keep": <id>, "other": <id>, "verdict": "supersedes" | "compatible" | "scoped" | "conflicts", "reason": <opcional>, "agent_id": <opcional>}` (`judge_dispute`, `api.rs:1285`).
 - `POST /v1/disputes/resolve` MUST seguir aceptando `{"keep", "other", "keep_both": <bool, opcional, false por defecto>, "agent_id"}` para los puentes anteriores, y guardar `compatible` (con `keep_both`) o `supersedes` (`resolve_dispute_core`, `dispute.rs:289`).
-- `GET /v1/disputes?agent_id=` MUST devolver `{pending, escalated, pairs}`: los conteos de pares abiertos entre filas vivas del agente y hasta 5 pares pendientes (`OPEN_PAIRS_SHOWN`, `api.rs:698`), los más viejos primero (`open_pairs`, `dispute.rs:425`), cada lado con la marca de su origen (P4 de [`specs/provenance`](../provenance/spec.md)).
+- `GET /v1/disputes?agent_id=` MUST devolver `{pending, escalated, pairs}`: los conteos de pares abiertos entre filas vivas del agente y hasta 5 pares pendientes (`OPEN_PAIRS_SHOWN`, `api.rs:702`), los más viejos primero (`open_pairs`, `dispute.rs:425`), cada lado con la marca de su origen (P4 de [`specs/provenance`](../provenance/spec.md)).
 
-Las dos rutas de veredicto responden igual (`resolve_error`, `api.rs:1257`):
+Las dos rutas de veredicto responden igual (`resolve_error`, `api.rs:1263`):
 
 | Caso | Respuesta |
 |---|---|
@@ -189,7 +189,7 @@ Las dos rutas de veredicto responden igual (`resolve_error`, `api.rs:1257`):
 | Una fila no existe o está borrada (o, con `agent_id`, es de otro agente) | `404` |
 | Par no enlazado, una reemplazada por una tercera, o `supersedes` sobre un par pendiente con una fila protegida | `409` |
 
-El puente MCP MUST exponer `resolve_conflict` con `keep`, `other`, `verdict` (obligatorio, con el `enum` de los cuatro valores en el schema, `verdict_enum`, `server.rs:341`) y `reason` (`ResolveConflictArgs`, `server.rs:347`); el agente es el del puente. Contra un daemon que contesta un 404 sin cuerpo en `/v1/disputes/judge`, MUST decir que se reinicie el daemon con `clawg stop` (`resolve_conflict_impl`, `server.rs:904`). `memory_status` MUST sumar una línea con los pares pendientes y escalados del agente, y los pendientes listados, citados por id, con cómo juzgarlos (`format_open_pairs`, `crates/clawg-cli/src/mcp/tools.rs:138`); contra un daemon sin la ruta, omite la línea. En cada par va primero el lado sin marca, y la marca va junto al id del otro; ACTIVE CONFLICTS marca cada lado sin reordenar (P4 de [`specs/provenance`](../provenance/spec.md)). El origen no cambia el estado de ningún par.
+El puente MCP MUST exponer `resolve_conflict` con `keep`, `other`, `verdict` (obligatorio, con el `enum` de los cuatro valores en el schema, `verdict_enum`, `server.rs:341`) y `reason` (`ResolveConflictArgs`, `server.rs:347`); el agente es el del puente. Contra un daemon que contesta un 404 sin cuerpo en `/v1/disputes/judge`, MUST decir que se reinicie el daemon con `clawg stop` (`resolve_conflict_impl`, `server.rs:904`). `memory_status` MUST sumar una línea con los pares pendientes y escalados del agente, y los pendientes listados, citados por id, con cómo juzgarlos (`format_open_pairs`, `crates/clawg-cli/src/mcp/tools.rs:151`); contra un daemon sin la ruta, omite la línea. En cada par va primero el lado sin marca, y la marca va junto al id del otro; ACTIVE CONFLICTS marca cada lado sin reordenar (P4 de [`specs/provenance`](../provenance/spec.md)). El origen no cambia el estado de ningún par.
 
 La NOTE de ACTIVE CONFLICTS (una vez por bloque; [`specs/retrieval`](../retrieval/spec.md)) MUST NOT afirmar que las memorias se contradicen, y MUST nombrar `resolve_conflict` y sus veredictos. La apertura del protocolo ([`specs/mcp`](../mcp/spec.md)) MUST pedir que se juzguen en la sesión las candidatas que nombra `save_memory` y que se pregunte al usuario por lo que lista ACTIVE CONFLICTS. Cada par del bloque imprime los ids de sus dos lados, que son los que recibe `resolve_conflict`.
 
