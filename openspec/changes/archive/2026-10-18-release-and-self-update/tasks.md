@@ -109,6 +109,7 @@ Reglas de todo el cambio:
 
 ## Cierre
 
-- [ ] Archivar: specs `release`, `self-update` e `install` (I1 reemplaza «CI»); `git mv` al archivo; subir el minor.
+- [x] Archivar: specs `release`, `self-update` e `install` (I1 reemplaza «CI»); `git mv` al archivo; subir el minor (0.21.0).
+  Commits: `docs(openspec): archive release-and-self-update` y `chore: bump version to 0.21.0`
 - [ ] Commit `chore: bump version to X.Y.Z` (`Cargo.toml` y `cargo update --workspace`). El PR llega a `main` con el archivo y el bump en el mismo push, nunca antes: ese commit dispara `release.yml`.
 - [ ] Tras el merge: los controles del release real y el bootstrap manual en Windows se anotan en el `verify.md` archivado, en un commit `docs(openspec)` aparte. Si alguno falla, se arregla con un fix y un bump de patch, que publica el release siguiente.

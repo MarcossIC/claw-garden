@@ -68,7 +68,7 @@ Extraer los nombres de esa línea MUST ser una función pura sobre el texto del 
 
 Ningún archivo `.rs` bajo `crates/*/src` ni `crates/*/tests`, en cualquier subdirectorio, MUST tener un atributo `allow` o `expect`, interno o externo, también dentro de `cfg_attr`, que nombre `dead_code`, `unused` o un lint `unused_*`. El test MUST fallar con `ruta:línea` de cada hallazgo, la ruta relativa a `crates/`. Otros lints (por ejemplo `clippy::too_many_arguments` o `clippy::unused_io_amount`) MUST NOT contar.
 
-Reconocer el atributo en una línea MUST ser una función pura (`hides_dead_code`, `crates/clawg-cli/tests/conventions.rs:10`). Se examina línea por línea: un atributo partido en varias líneas no se reconoce.
+Reconocer el atributo en una línea MUST ser una función pura (`hides_dead_code`, `crates/clawg-cli/tests/conventions.rs:12`). Se examina línea por línea: un atributo partido en varias líneas no se reconoce.
 
 #### Escenario: un `allow` en una fuente
 - GIVEN una fuente con `#[allow(dead_code)]` delante de una función
@@ -80,7 +80,7 @@ Reconocer el atributo en una línea MUST ser una función pura (`hides_dead_code
 - WHEN se la examina
 - THEN no cuenta
 
-**Test:** `no_source_allows_dead_code` (`conventions.rs:62`) y el puro `hides_dead_code_recognises_the_attribute_forms` (`conventions.rs:37`).
+**Test:** `no_source_allows_dead_code` (`conventions.rs:64`) y el puro `hides_dead_code_recognises_the_attribute_forms` (`conventions.rs:39`).
 
 ## R6. Los docs dicen dónde están las convenciones y cómo se chequean
 

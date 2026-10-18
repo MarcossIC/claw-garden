@@ -91,6 +91,13 @@ Según «Cierre» de las [tareas](tasks.md), lo de GitHub se anota después del 
 
 No se puede comprobar después que cada test haya fallado antes de su código: cada test va en el mismo commit que el código que lo hace pasar, como piden las tareas.
 
+## Al archivar
+
+- La spec quedó en tres lugares: [`specs/release`](../../../specs/release/spec.md) (R1 a R10), [`specs/self-update`](../../../specs/self-update/spec.md) (S1 a S12) y [`specs/install`](../../../specs/install/spec.md), donde I1 reemplazó la sección «CI». No se tocó [`specs/update`](../../../specs/update/spec.md), que es la de `update_memory`. Los requisitos que sólo se cumplen con la corrida real de `release.yml` y con un Windows limpio quedan como requisitos, con su prueba anotada «fuera de la suite».
+- Las citas `archivo:línea` de las specs a los archivos que el cambio tocó (`backup.rs`, `cli.rs`, `serve.rs`, `main.rs`, `binary.rs`, `doctor.rs`, los `Cargo.toml`) se llevaron a la línea de hoy; varias ya estaban corridas antes de este cambio y se corrigieron por lo que citan, no por el desplazamiento.
+- La versión sube a 0.21.0.
+- Lo pendiente de la sección anterior sigue pendiente: se anota en este archivo después del merge, en un commit aparte.
+
 ## Veredicto
 
 Verificado en Windows, contra el código, la spec, el diseño y las tareas. No hay ningún CRITICAL. Quedan cuatro WARNING (W1 es un error real en un camino de falla poco frecuente) y cinco SUGGESTION. Linux y los controles del release real se hacen después del merge.

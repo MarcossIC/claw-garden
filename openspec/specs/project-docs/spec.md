@@ -238,7 +238,7 @@ El puente registra su propia raíz pidiendo indexarla antes de su primera herram
 
 ## `clawg projects add`
 
-`clawg projects add <RUTA> [--profile P]` (`add`, `crates/clawg-cli/src/projects.rs:23`; rama en `crates/clawg-cli/src/main.rs:204-220`) es el camino por el que el usuario, no el modelo, acepta una raíz que no es la de un puente. MUST:
+`clawg projects add <RUTA> [--profile P]` (`add`, `crates/clawg-cli/src/projects.rs:23`; rama en `crates/clawg-cli/src/main.rs:224-240`) es el camino por el que el usuario, no el modelo, acepta una raíz que no es la de un puente. MUST:
 
 - resolver la raíz de RUTA con `ProjectIdentity::resolve` ([`specs/project`](../project/spec.md), R1);
 - registrarla con `index_docs: true` y con el id viejo de RUTA si difiere, a través del daemon que está corriendo;
