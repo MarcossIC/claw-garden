@@ -42,27 +42,7 @@ pub fn verify(keys: &[&str], content: &[u8], signature: &str) -> Result<String, 
 #[cfg(test)]
 mod signature_cases {
     use super::*;
-    use minisign::KeyPair;
-    use std::io::Cursor;
-
-    struct Signer {
-        public: String,
-        secret: minisign::SecretKey,
-    }
-
-    impl Signer {
-        fn new() -> Self {
-            let pair = KeyPair::generate_unencrypted_keypair().expect("key pair");
-            let public = pair.pk.to_box().expect("public key box").into_string();
-            Self { public, secret: pair.sk }
-        }
-
-        fn sign(&self, content: &[u8], trusted_comment: &str) -> String {
-            minisign::sign(None, &self.secret, Cursor::new(content), Some(trusted_comment), None)
-                .expect("sign")
-                .into_string()
-        }
-    }
+    use crate::update::testkit::Signer;
 
     #[test]
     fn a_prehashed_signature_from_the_test_signer_is_accepted_without_legacy_mode() {

@@ -31,6 +31,7 @@ log.workspace = true
 dirs.workspace = true
 rand.workspace = true
 reqwest.workspace = true
+sha2.workspace = true
 
 # `rt-multi-thread` for `#[tokio::main]`, `signal` for Ctrl-C-driven graceful
 # shutdown, `net` for the loopback `TcpListener`, `io-std` for the MCP stdio
