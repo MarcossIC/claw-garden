@@ -887,6 +887,84 @@ fn beside(installed: &Path, prefix: &str) -> Vec<PathBuf> {
     found
 }
 
+/// The newest migration this build of clawg knows.
+fn last_migration() -> i32 {
+    clawg_core::memory::backup::known_migrations()
+        .iter()
+        .map(|m| m.version)
+        .max()
+        .expect("the binary has migrations")
+}
+
+/// What the daemon the data directory names answers to `path`.
+async fn published_get(data_dir: &Path, path: &str) -> String {
+    let state: Value =
+        serde_json::from_str(&std::fs::read_to_string(data_dir.join("daemon.json")).expect("daemon.json"))
+            .expect("daemon.json is JSON");
+    let token = std::fs::read_to_string(data_dir.join("token")).expect("token");
+    let response = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{}{path}", state["port"]))
+        .bearer_auth(token.trim())
+        .send()
+        .await
+        .expect("request");
+    assert!(response.status().is_success(), "{path}: {}", response.status());
+    response.text().await.expect("body")
+}
+
+const SEEDED: [&str; 2] = [
+    "the lighthouse keeper logs every ship that passes",
+    "the harbour master closes the gate at midnight",
+];
+
+/// A daemon of the installed copy with `SEEDED` saved through it.
+async fn seeded_store(sandbox: &Sandbox) -> (PathBuf, Daemon) {
+    let installed = install(sandbox, &stamp_json("0.18.0", ""));
+    let old = sandbox.serve_binary(&installed, "fake").await;
+    for text in SEEDED {
+        let (status, body) = old.post("/v1/memories", json!({ "content": text, "agent_id": "smoke" })).await;
+        assert_eq!(status, 201, "{body}");
+    }
+    old.wait_until_ingested().await;
+    (installed, old)
+}
+
+// The server runs in this process while the binary is waited on.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_whose_candidate_refuses_the_store_leaves_the_old_binary_and_its_daemon() {
+    let sandbox = Sandbox::new();
+    // The installed binary knows every migration and has migrated the store;
+    // the candidate knows one less, as an older release would.
+    let (installed, old) = seeded_store(&sandbox).await;
+    let original = std::fs::read(&installed).expect("read the installed binary");
+    let behind = format!(r#","migrations_up_to":{}"#, last_migration() - 1);
+    let release = signed_release("0.19.0", &behind);
+    let server = ReleaseServer::serving(release.listing.clone(), release.files.clone()).await;
+    let _stop = StopOnDrop { home: sandbox.home.clone() };
+    let backups_before = std::fs::read_dir(sandbox.data_dir().join("backups")).map(|rd| rd.count()).unwrap_or(0);
+
+    let out = update_from(&sandbox, &installed, &server.base, &release.public);
+
+    assert_eq!(out.status.code(), Some(1), "{}
+{}", stdout_of(&out), stderr_of(&out));
+    let report = stderr_of(&out);
+    assert!(report.contains("newer than the"), "the refusal is named: {report}");
+    assert!(report.contains("Everything was put back: clawg 0.18.0 is installed"), "{report}");
+    assert!(report.contains("Its daemon is running again"), "{report}");
+    assert_eq!(std::fs::read(&installed).expect("read the installed binary"), original);
+    assert!(beside(&installed, "clawg.new-").is_empty(), "the staged file is gone");
+
+    old.wait_for_exit(Duration::from_secs(10)).await;
+    let health = published_health(&sandbox.data_dir()).await;
+    assert_eq!(health["version"], "0.18.0", "{health}");
+    let backups_after = std::fs::read_dir(sandbox.data_dir().join("backups")).map(|rd| rd.count()).unwrap_or(0);
+    assert_eq!(backups_after, backups_before, "the refused store was not snapshotted or touched");
+    let rows = published_get(&sandbox.data_dir(), "/v1/memories?limit=100").await;
+    for text in SEEDED {
+        assert!(rows.contains(text), "{text:?} is still there: {rows}");
+    }
+}
+
 // The server runs in this process while the binary is waited on.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_new_binary_that_does_not_start_brings_the_old_one_and_its_daemon_back() {
