@@ -539,3 +539,27 @@ fn the_readme_documents_the_install_and_update_path() {
         assert!(readme.contains(wanted), "README.md lacks {why}: `{wanted}`");
     }
 }
+
+/// The base64 line of a minisign `.pub`, which names the key whatever its
+/// comment says.
+fn key_line(public_key: &str) -> &str {
+    public_key.lines().nth(1).unwrap_or_default().trim()
+}
+
+#[test]
+fn the_release_keys_are_two_distinct_minisign_public_keys() {
+    let mut key_lines = Vec::new();
+    for file in ["release/minisign.pub", "release/minisign-next.pub"] {
+        let text = read_repo_file(file);
+        assert_eq!(text.lines().count(), 2, "{file} must be a comment line and a key line");
+        assert!(
+            text.lines().next().unwrap_or_default().starts_with("untrusted comment:"),
+            "{file} must start with the `untrusted comment:` line of a minisign key"
+        );
+        let key = key_line(&text);
+        assert_eq!(key.len(), 56, "{file} must hold a 56 character minisign key");
+        assert!(key.starts_with("RW"), "{file} must hold an Ed25519 minisign key (`RW...`)");
+        key_lines.push(key.to_string());
+    }
+    assert_ne!(key_lines[0], key_lines[1], "the primary and the backup release keys must differ");
+}
