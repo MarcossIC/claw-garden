@@ -225,7 +225,7 @@ El texto de un doc MUST pasar entero por `redact` (`crates/clawg-core/src/memory
 
 ## Registrar una raíz aceptada la indexa en segundo plano
 
-Cuando `POST /v1/projects` registra o confirma una raíz y, después del registro, la raíz está aceptada (`RegisterOutcome::index_docs`), el daemon MUST lanzar un refresco de ese proyecto en segundo plano. Ese refresco espera a que el embedder deje de estar en `loading` (`spawn_doc_refresh`, `crates/clawg-cli/src/daemon/api.rs:1384`; llamado en `:1292-1294`). Un registro que deja la raíz sólo registrada MUST NOT lanzarlo. La respuesta del registro MUST NOT esperar el refresco y MUST NOT cambiar de forma. Un refresco fallido, o un embedder que no cargó, MUST quedar en el log como warn y MUST NOT afectar el registro.
+Cuando `POST /v1/projects` registra o confirma una raíz y, después del registro, la raíz está aceptada (`RegisterOutcome::index_docs`), el daemon MUST lanzar un refresco de ese proyecto en segundo plano. Ese refresco espera a que el embedder deje de estar en `loading` (`spawn_doc_refresh`, `crates/clawg-cli/src/daemon/api.rs:1384`; llamado en `register`, `:1374-1376`). Un registro que deja la raíz sólo registrada MUST NOT lanzarlo. La respuesta del registro MUST NOT esperar el refresco y MUST NOT cambiar de forma. Un refresco fallido, o un embedder que no cargó, MUST quedar en el log como warn y MUST NOT afectar el registro.
 
 El puente registra su propia raíz pidiendo indexarla antes de su primera herramienta ([`specs/project`](../project/spec.md), R6). Así, el primer indexado empieza con la sesión y no con la primera búsqueda.
 
