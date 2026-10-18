@@ -196,7 +196,7 @@ El `CARGO_BIN_EXE_clawg` (`binary.rs:23`) no lleva sello, así que `update` se n
 | `--check` | 0.18.0 → igual, 0.19.0, servidor caído | salidas `0`, `100` con la versión, `1` |
 | Actualización completa | 0.18.0 → 0.19.0 | daemon y puente lanzados desde la copia; `/health` dice 0.19.0; el `.old-*` es el binario original; el puente abierto llega al daemon nuevo (el escenario de `binary.rs:534-549`) |
 | No arranca | → 0.19.0 `before_open` | salida `1`; el binario en su lugar es el original; un daemon 0.18.0 contesta |
-| Migración pendiente | 0.18.0 `migrations_up_to = última - 1` → 0.19.0 | filas guardadas antes; el informe nombra el `pre-migration`; las filas siguen en el daemon nuevo |
+| Migración pendiente | 0.18.0 con `migrations_up_to` fijo en 15 (la versión anterior a V16) → 0.19.0 | filas insertadas por SQL contra ese esquema (un daemon con tope usa el código de inserción actual, que escribe columnas que su esquema no tiene, así que no puede guardarlas); el informe nombra el `pre-migration`; las filas siguen en el daemon nuevo. El tope es fijo para que una migración futura sólo agregue una pendiente más |
 | Migró y falló | ídem → 0.19.0 `after_open` | salida `1`; el daemon 0.18.0 sirve las filas; existe el `pre-restore` |
 | Candidato que se niega ante el store | 0.18.0 (todas) → 0.19.0 `migrations_up_to = última - 1` | el daemon nuevo se niega sin tocar el store (`SchemaNewer`, `db.rs:388-398`); ningún snapshot nuevo; vuelven el viejo y su daemon (`an_update_whose_candidate_refuses_the_store_leaves_the_old_binary_and_its_daemon`) |
 | Sin sello | el binario de `target-test` | se niega, «compilado en local»; nada cambia |

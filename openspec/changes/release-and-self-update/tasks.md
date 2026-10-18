@@ -89,9 +89,9 @@ Reglas de todo el cambio:
   Commit: `feat(cli): add clawg update`
 - [x] 34. Test `a_new_binary_that_does_not_start_brings_the_old_one_and_its_daemon_back`.
   Commit: `feat(cli): bring the old daemon back when the new one does not start`
-- [ ] 35. **Base sembrada en la versión anterior** (instalado con `migrations_up_to = última - 1`, filas guardadas por su daemon): `an_update_over_a_pending_migration_leaves_a_pre_migration_snapshot_and_the_data`.
+- [x] 35. **Base sembrada en un esquema anterior** (instalado con `migrations_up_to` fijo en 15, la versión anterior a V16; su daemon crea el store, se detiene y las filas se insertan por SQL con `rusqlite`, porque un daemon con tope usa el código de inserción actual y no puede guardarlas): `an_update_over_a_pending_migration_leaves_a_pre_migration_snapshot_and_the_data`.
   Commit: `test(cli): update over a store with a pending migration`
-- [ ] 36. Misma siembra: `a_new_binary_that_migrated_and_failed_gets_its_pre_migration_restored` (`serve_fault = after_open`).
+- [x] 36. Misma siembra: `a_new_binary_that_migrated_and_failed_gets_its_pre_migration_restored` (`serve_fault = after_open`); `Installation::restore_store` sondea el store con las migraciones del binario que corre y restaura el `pre-migration` de ese arranque.
   Commit: `feat(cli): restore the store when the new daemon migrated and failed`
 - [x] 37. Siembra al día y candidato con `migrations_up_to = última - 1`: `an_update_whose_candidate_refuses_the_store_leaves_the_old_binary_and_its_daemon`.
   Commit: `test(cli): update with a candidate that refuses the store`
