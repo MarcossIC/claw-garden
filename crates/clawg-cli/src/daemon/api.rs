@@ -1200,7 +1200,7 @@ async fn restore_memory(
         Ok(row) => Ok(Json(RestoredBody { restored: 1, row })),
         Err(e @ RestoreError::OnlyMemory(_)) => Err(ApiError::bad_request(e.to_string())),
         Err(RestoreError::NotFound(_)) => Err(ApiError::not_found(format!("no deleted {kind:?} row with id {id}"))),
-        Err(e @ (RestoreError::LiveTwin { .. } | RestoreError::HoldsSecret { .. })) => {
+        Err(e @ (RestoreError::LiveTwin { .. } | RestoreError::TopicTaken { .. } | RestoreError::HoldsSecret { .. })) => {
             Err(ApiError::conflict(e.to_string()))
         }
         Err(RestoreError::Embed(_, e)) => Err(embed_failure(e)),
