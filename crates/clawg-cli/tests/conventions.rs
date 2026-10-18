@@ -136,3 +136,49 @@ fn only_dev_dependencies_turn_on_the_test_stand_ins() {
     }
     assert!(found.is_empty(), "`testing` belongs only in [dev-dependencies]:\n{}", found.join("\n"));
 }
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn read_repo_file(relative: &str) -> String {
+    let path = repo_root().join(relative);
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+/// The value written for `key` inside `[section]` of a manifest, as the raw
+/// text after the `=`, without a trailing comment.
+fn manifest_value(manifest: &str, section: &str, key: &str) -> Option<String> {
+    let mut inside = false;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            inside = line == format!("[{section}]");
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        if let Some((name, value)) = line.split_once('=') {
+            if name.trim() == key {
+                let value = value.split(" #").next().unwrap_or(value);
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn the_manifest_carries_the_publication_metadata() {
+    let manifest = read_repo_file("Cargo.toml");
+    let value = |key: &str| manifest_value(&manifest, "workspace.package", key).unwrap_or_default();
+
+    assert_eq!(value("license"), "\"MIT\"");
+    assert_eq!(value("repository"), "\"https://github.com/MarcossIC/claw-garden\"");
+    assert_eq!(value("authors"), "[\"The Claw Garden contributors\"]");
+
+    let license = read_repo_file("LICENSE");
+    assert!(license.starts_with("MIT License"), "LICENSE is the MIT text");
+    assert!(license.contains("The Claw Garden contributors"), "LICENSE names the holder");
+}
