@@ -515,3 +515,20 @@ fn the_ci_workflow_ignores_only_non_code_paths_and_runs_on_both_platforms() {
         assert!(!lines.iter().any(|l| l.contains(forbidden)), "ci.yml must not use `{forbidden}`");
     }
 }
+
+#[test]
+fn the_readme_documents_the_install_and_update_path() {
+    let readme = read_repo_file("README.md");
+    for (wanted, why) in [
+        ("irm https://github.com/MarcossIC/claw-garden/releases/latest/download/install.ps1 | iex", "the one-line install"),
+        ("glibc 2.35", "the oldest glibc the Linux binary runs on"),
+        ("SmartScreen", "the warning of an unsigned executable"),
+        ("Smart App Control", "the policy that can block it"),
+        ("minisign -Vm SHA256SUMS", "how to verify what was downloaded"),
+        ("release/minisign.pub", "the repository key"),
+        ("release/minisign-next.pub", "the backup key"),
+        ("no protege", "the backup key does not protect binaries that never update"),
+    ] {
+        assert!(readme.contains(wanted), "README.md lacks {why}: `{wanted}`");
+    }
+}
