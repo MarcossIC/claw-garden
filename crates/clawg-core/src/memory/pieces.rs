@@ -177,6 +177,7 @@ impl MemoryStore {
     /// Saving the same long text again finds every piece already stored and
     /// would link the same rows once more; a save whose rows, in order, are
     /// already linked under one id answers that id and writes nothing.
+    #[cfg(test)]
     pub(crate) async fn link_pieces(&self, pieces: Vec<StoredPiece>) -> Result<i64, MemoryError> {
         self.conn
             .call(move |c| -> rusqlite::Result<i64> {

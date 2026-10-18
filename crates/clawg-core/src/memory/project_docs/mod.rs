@@ -1034,6 +1034,7 @@ mod tests {
                 memory_type: None,
                 importance: None,
                 derived_from: Vec::new(),
+                topic_key: None,
             };
             let chunk = Chunk { text: content.into() };
             let vector = FakeEmbedder::default().embed_with_role(content, EmbedRole::Passage).await.unwrap();
@@ -1078,6 +1079,7 @@ mod tests {
             memory_type: None,
             importance: None,
             derived_from: Vec::new(),
+            topic_key: None,
         };
         let chunk = Chunk { text: evt.content.clone() };
         let vector = FakeEmbedder::default().embed_with_role(&evt.content, EmbedRole::Passage).await.unwrap();

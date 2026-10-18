@@ -53,7 +53,7 @@ El informe del save MUST listar las reemplazadas en `replaced` (id y primera lí
 - WHEN se guarda otra vez el texto de la versión 1 con K
 - THEN se inserta una fila nueva que reemplaza a la versión 2; la versión 1 sigue `superseded`
 
-**Test:** `a_keyed_save_replaces_the_live_row_of_its_key`, `the_same_text_under_its_key_only_reinforces`, `saving_an_earlier_text_again_is_another_revision`, `a_revision_inherits_tier_and_accesses`, `a_revision_releases_the_rows_disputing_the_old_one`, `a_failed_revision_replaces_nothing` y `a_reinforced_row_without_a_key_takes_it` en `worker.rs`; `a_revision_is_finished_with_its_outbox_row` en `outbox.rs`.
+**Test:** `a_keyed_save_replaces_the_live_row_of_its_key`, `the_same_text_under_its_key_only_reinforces`, `saving_an_earlier_text_again_is_another_revision`, `a_revision_inherits_tier_and_accesses`, `a_revision_releases_the_rows_disputing_the_old_one`, `a_failed_revision_replaces_nothing` y `a_reinforced_row_without_a_key_takes_it`, `a_save_without_a_key_replaces_nothing` y `a_revision_is_finished_with_its_outbox_row` en `worker.rs`.
 
 ## T5. Tipo e importancia
 
@@ -63,7 +63,7 @@ Si el save con clave no trae `memory_type` o `importance`, las filas nuevas MUST
 
 ## T6. Piezas
 
-Un save largo con clave MUST reemplazar todas las filas vivas del alcance que no son piezas suyas. Una fila del alcance que `memory_piece` enlaza a otro save con alguna fila fuera del alcance MUST quedar viva, sin clave.
+Un save largo con clave MUST reemplazar todas las filas vivas del alcance que no son piezas suyas. Una fila del alcance que `memory_piece` enlaza a un save cuya primera pieza es una fila viva sin esa clave (un save que la dedup le sumó a otro) MUST quedar viva, sin clave.
 
 **Test:** `a_long_revision_replaces_every_piece_of_the_old_save` y `a_piece_shared_with_another_save_is_detached` en `worker.rs`.
 

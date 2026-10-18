@@ -19,8 +19,10 @@ Un corte antes de terminar deja la outbox con todas las piezas anotadas; el arra
 replaced = filas vivas del alcance (agent_id, COALESCE(project_id,''), topic_key)
            que no son piezas de este save
 shared   = las de replaced que memory_piece enlaza a un save
-           con alguna fila cuya topic_key no es la del save
+           cuya primera pieza es una fila viva con otra clave o sin clave
 ```
+
+La primera pieza dice de quién es el save: un save con clave se la da a todas sus filas (abajo), así que su primera pieza la lleva aunque la dedup le haya sumado una fila de otra clave en el medio. Mirar todas las filas del save, en vez de la primera, desengancharía la versión vieja entera en ese caso.
 
 `replaced − shared` pasa a `superseded` por la primera fila del save (`SUPERSEDE_SQL` de `dispute.rs`, más `release_challengers`); `shared` queda viva con `topic_key = NULL`. El índice parcial de V16 sirve a la primera consulta.
 

@@ -913,6 +913,7 @@ async fn save_memory(
         memory_type: body.memory_type,
         importance: body.importance,
         derived_from,
+        topic_key: None,
     };
 
     let (reply, report) = if wait {
