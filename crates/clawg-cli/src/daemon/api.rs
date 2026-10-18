@@ -595,7 +595,8 @@ pub struct ContextBody {
 #[derive(Debug, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum RetrievalState {
-    Searched,
+    /// `hits` went into the prompt; `withheld` scored 0 and were left out.
+    Searched { hits: usize, withheld: usize },
     EmbedderNotReady,
     EmbedderFailed { detail: String, retryable: bool },
     SearchFailed { detail: String },
@@ -606,7 +607,7 @@ impl RetrievalState {
     /// a search, so the two never disagree on why memories cannot be reached.
     fn of(retrieval: Retrieval, status: EmbedderStatus) -> Self {
         match retrieval {
-            Retrieval::Searched { .. } => Self::Searched,
+            Retrieval::Searched { hits, withheld } => Self::Searched { hits, withheld },
             Retrieval::NoEmbedder => match status {
                 EmbedderStatus::Failed { error, retryable } => Self::EmbedderFailed { detail: error, retryable },
                 EmbedderStatus::Loading | EmbedderStatus::Ready => Self::EmbedderNotReady,

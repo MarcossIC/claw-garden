@@ -350,11 +350,15 @@ fn synthesis_nudge(unreviewed: usize) -> Option<String> {
     })
 }
 
-/// Why memories were not searched, said before the context: a prompt holding
-/// only the workspace, or nothing, otherwise reads as "there are no memories".
+/// Why the context holds no memory, said before it: a prompt holding only the
+/// workspace, or nothing, otherwise reads as "there are no memories".
 fn retrieval_notice(retrieval: &Retrieval, has_context: bool) -> Option<String> {
     let why = match retrieval {
-        Retrieval::Searched | Retrieval::Unknown => return None,
+        Retrieval::Searched { hits: 0, withheld } if *withheld > 0 => {
+            let shown = if has_context { "only the workspace is shown below" } else { "the workspace is empty" };
+            return Some(format!("{}; {shown}.", nothing_relevant(*withheld)));
+        }
+        Retrieval::Searched { .. } | Retrieval::Unknown => return None,
         Retrieval::EmbedderNotReady => {
             "the embedding model is still loading; call again in a minute".to_string()
         }
@@ -902,12 +906,27 @@ mod tests {
             assert!(empty.starts_with("Memories were not searched"), "{empty}");
             assert!(!empty.contains("no context yet"), "an empty workspace is not an empty memory: {empty}");
         }
-        assert_eq!(recall("=== WORKSPACE ===\n- tabs", Retrieval::Searched), "=== WORKSPACE ===\n- tabs");
+        let searched = Retrieval::Searched { hits: 1, withheld: 2 };
+        assert_eq!(recall("=== WORKSPACE ===\n- tabs", searched), "=== WORKSPACE ===\n- tabs");
+    }
+
+    #[test]
+    fn recall_says_when_nothing_was_relevant() {
+        let recall = |prompt: &str| {
+            let retrieval = Some(Retrieval::Searched { hits: 0, withheld: 2 });
+            format_recall(&Context { prompt: prompt.into(), unreviewed: 0, retrieval })
+        };
+        let sentence = "no relevant memories for this query: 2 searched, none close enough to show";
+        assert_eq!(
+            recall("=== WORKSPACE ===\n- tabs"),
+            format!("{sentence}; only the workspace is shown below.\n\n=== WORKSPACE ===\n- tabs")
+        );
+        assert_eq!(recall(""), format!("{sentence}; the workspace is empty."));
     }
 
     #[test]
     fn an_old_daemon_gets_no_invented_notice() {
-        for retrieval in [None, Some(Retrieval::Unknown)] {
+        for retrieval in [None, Some(Retrieval::Unknown), Some(Retrieval::Searched { hits: 0, withheld: 0 })] {
             let context = Context { prompt: String::new(), unreviewed: 0, retrieval };
             assert_eq!(format_recall(&context), "no context yet");
         }

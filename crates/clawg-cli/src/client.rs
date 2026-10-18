@@ -275,7 +275,14 @@ pub struct Context {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Retrieval {
-    Searched,
+    /// A daemon that predates the counts sends neither, and then nothing is
+    /// said about relevance.
+    Searched {
+        #[serde(default)]
+        hits: usize,
+        #[serde(default)]
+        withheld: usize,
+    },
     EmbedderNotReady,
     EmbedderFailed { detail: String, retryable: bool },
     SearchFailed { detail: String },
@@ -1181,6 +1188,13 @@ pub(crate) mod tests {
     fn a_search_answer_without_withheld_still_parses() {
         let old: Found = serde_json::from_str(r#"{"hits":[]}"#).expect("a daemon that never said");
         assert_eq!(old.withheld, 0);
+    }
+
+    #[test]
+    fn a_searched_context_without_counts_still_parses() {
+        let old: Context =
+            serde_json::from_str(r#"{"prompt":"","unreviewed":0,"retrieval":{"state":"searched"}}"#).expect("parses");
+        assert_eq!(old.retrieval, Some(Retrieval::Searched { hits: 0, withheld: 0 }));
     }
 
     #[test]
