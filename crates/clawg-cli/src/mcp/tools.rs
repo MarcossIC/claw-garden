@@ -90,9 +90,13 @@ fn format_hits(hits: &[Hit], reader: &str) -> String {
         .enumerate()
         .map(|(i, h)| {
             let piece = h.piece.map(|p| format!(" piece={}/{}", p.piece, p.pieces)).unwrap_or_default();
-            let by = shared_author(h, reader).map(|a| format!(" by {a}")).unwrap_or_default();
+            let author = shared_author(h, reader);
+            let by = author.map(|a| format!(" by {a}")).unwrap_or_default();
+            // A save under a key revises only the saver's own rows, so another
+            // agent's key would promise a revision the reader cannot make.
+            let topic = h.topic_key.as_deref().filter(|_| author.is_none()).map(|k| format!(" topic={k}")).unwrap_or_default();
             format!(
-                "{}. #{} [{}/{}/t{}{piece} score={:.2}{by}] {}",
+                "{}. #{} [{}/{}/t{}{piece} score={:.2}{topic}{by}] {}",
                 i + 1,
                 h.id,
                 h.kind,
@@ -160,8 +164,9 @@ pub fn format_open_pairs(open: &OpenPairs) -> String {
 /// row of the save, then the whole text. A position with no row it may read
 /// is named, so the model knows the text has a gap there.
 pub fn format_save(save: &SavedText) -> String {
+    let topic = save.topic_key.as_deref().map(|k| format!(" topic={k}")).unwrap_or_default();
     if save.pieces <= 1 {
-        return format!("#{}\n{}", save.id, save.text);
+        return format!("#{}{topic}\n{}", save.id, save.text);
     }
     let ids = save
         .ids
@@ -169,7 +174,7 @@ pub fn format_save(save: &SavedText) -> String {
         .map(|id| id.map_or_else(|| "(missing)".to_string(), |id| format!("#{id}")))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("#{} is piece {} of {} of one save: {ids}\n{}", save.id, save.piece, save.pieces, save.text)
+    format!("#{} is piece {} of {} of one save: {ids}{topic}\n{}", save.id, save.piece, save.pieces, save.text)
 }
 
 /// What `update_memory` tells the model about the row it changed. The tier is
@@ -473,6 +478,7 @@ mod tests {
             agent_id: None,
             piece: None,
             exact: false,
+            topic_key: None,
         }
     }
 
@@ -519,6 +525,35 @@ mod tests {
         let out = format_search(hits, "cursor");
         assert!(out.starts_with("1. #1 [Memory/code_block/t3 score=1.40 by claude-code] kept parseLedger4821"), "{out}");
         assert!(out.contains("3. #3 "), "{out}");
+    }
+
+    fn keyed(mut h: Hit, key: &str) -> Hit {
+        h.topic_key = Some(key.into());
+        h
+    }
+
+    #[test]
+    fn a_hit_shows_the_topic_key_it_is_revised_under() {
+        let out = format_hits(&[keyed(hit(68, "Memory", "architectural_decision", 2, 0.56, "clawg export"), "cli/export-format")], "a");
+        assert_eq!(out, "1. #68 [Memory/architectural_decision/t2 score=0.56 topic=cli/export-format] clawg export");
+        let own = keyed(by(hit(68, "Memory", "architectural_decision", 2, 0.56, "clawg export"), "a"), "cli/export-format");
+        assert!(format_hits(&[own], "a").contains(" score=0.56 topic=cli/export-format]"));
+    }
+
+    #[test]
+    fn a_hit_without_a_key_is_shown_as_before() {
+        let out = format_hits(&[hit(68, "Memory", "semantic_fact", 2, 0.56, "clawg export")], "a");
+        assert_eq!(out, "1. #68 [Memory/semantic_fact/t2 score=0.56] clawg export");
+    }
+
+    /// A save under a key revises only the saver's own rows, so the key on
+    /// another agent's hit would send the reader to a revision that cannot happen.
+    #[test]
+    fn another_agents_hit_does_not_show_its_topic_key() {
+        let shared = keyed(by(hit(68, "Memory", "architectural_decision", 2, 0.56, "clawg export"), "claude-code"), "cli/export-format");
+        let out = format_hits(&[shared], "cursor");
+        assert!(out.starts_with("1. #68 [Memory/architectural_decision/t2 score=0.56 by claude-code] clawg export"), "{out}");
+        assert!(!out.contains("topic="), "{out}");
     }
 
     #[test]
@@ -653,6 +688,7 @@ mod tests {
             ids: vec![Some(57), Some(58), None, Some(60)],
             missing: vec![3],
             text: "first and second\nfourth".into(),
+            topic_key: None,
         };
         assert_eq!(
             format_save(&save),
@@ -660,6 +696,26 @@ mod tests {
         );
         let single = SavedText { piece: 1, pieces: 1, ids: vec![Some(58)], missing: vec![], text: "short".into(), ..save };
         assert_eq!(format_save(&single), "#58\nshort");
+    }
+
+    #[test]
+    fn format_save_names_the_topic_key_of_the_row() {
+        let single = SavedText {
+            kind: "memory".into(),
+            id: 68,
+            piece: 1,
+            pieces: 1,
+            ids: vec![Some(68)],
+            missing: vec![],
+            text: "short".into(),
+            topic_key: Some("cli/export-format".into()),
+        };
+        assert_eq!(format_save(&single), "#68 topic=cli/export-format\nshort");
+        let piece = SavedText { piece: 2, pieces: 3, ids: vec![Some(67), Some(68), Some(69)], ..single };
+        assert_eq!(
+            format_save(&piece),
+            "#68 is piece 2 of 3 of one save: #67, #68, #69 topic=cli/export-format\nshort"
+        );
     }
 
     // ── format_rows ─────────────────────────────────────────────────────────

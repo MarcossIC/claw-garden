@@ -3404,6 +3404,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_search_hit_carries_its_topic_key() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let text = "Storage engine is SQLite\nChosen for a single local file.";
+        let keyed_id = only_id(&save(&store, &keyed(text, "storage/engine")).await);
+        let plain_id = only_id(&save(&store, &explicit("Deploys happen on fridays", "architectural_decision")).await);
+
+        let vector = FakeEmbedder::default().embed_with_role(text, EmbedRole::Passage).await.unwrap();
+        let hits = crate::memory::search::search_all_memories(
+            &store,
+            &vector,
+            Some("SQLite"),
+            "agent-test",
+            crate::memory::search::SearchScope::all_default(),
+            10,
+        )
+        .await
+        .unwrap();
+
+        let key_of = |id: i64| hits.iter().find(|h| h.id == id).unwrap_or_else(|| panic!("#{id} not found: {hits:?}")).topic_key.clone();
+        assert_eq!(key_of(keyed_id).as_deref(), Some("storage/engine"));
+        assert_eq!(key_of(plain_id), None);
+        let json = serde_json::to_value(hits.iter().find(|h| h.id == plain_id).unwrap()).unwrap();
+        assert!(json.get("topic_key").is_none(), "{json}");
+    }
+
+    #[tokio::test]
     async fn a_save_without_a_key_replaces_nothing() {
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
         let old = only_id(&save(&store, &keyed("Storage engine is SQLite", "storage/engine")).await);

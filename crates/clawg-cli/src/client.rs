@@ -172,6 +172,10 @@ pub struct Hit {
     /// flag does not send it, and its hits are cut as before.
     #[serde(default)]
     pub exact: bool,
+    /// The key a new version of this memory is saved under. A daemon that
+    /// predates the field does not send it, and the hit is shown without one.
+    #[serde(default)]
+    pub topic_key: Option<String>,
 }
 
 /// Position `piece` (from 1) of a save stored as `pieces` rows.
@@ -409,6 +413,10 @@ pub struct SavedText {
     /// Positions, from 1, with no row to show.
     pub missing: Vec<i64>,
     pub text: String,
+    /// The key of the row asked for. A daemon that predates the field does
+    /// not send it, and the save is shown without one.
+    #[serde(default)]
+    pub topic_key: Option<String>,
 }
 
 #[derive(Serialize)]

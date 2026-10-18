@@ -73,6 +73,7 @@ fn ranked_hit_serializes_to_json() {
         agent_id: None,
         piece: None,
         exact: false,
+        topic_key: None,
     };
     let json = serde_json::to_value(&hit).expect("RankedHit must be Serialize");
     assert_eq!(json["id"], 7);
