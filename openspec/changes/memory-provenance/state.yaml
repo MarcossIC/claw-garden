@@ -8,7 +8,7 @@ artifacts:
   spec: done
   design: done
   tasks: done
-  apply: in_progress
-  verify: pending
+  apply: done
+  verify: in_progress  # Linux; falta Windows y el perfil dev con Claude Code
   archive: pending
 updated: 2026-10-18
