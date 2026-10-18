@@ -156,7 +156,9 @@ pub struct SaveMemoryArgs {
     /// read back in a future session with none of this conversation around it.
     pub content: String,
     /// What kind of memory this is, one of the listed values; any other is
-    /// refused. Defaults to semantic_fact when omitted.
+    /// refused. Defaults to semantic_fact when omitted. An
+    /// architectural_decision is a design choice and its reason; what was
+    /// done, found or measured is a semantic_fact, even after a decision.
     #[serde(default)]
     #[schemars(transform = memory_type_enum)]
     pub memory_type: Option<String>,
@@ -2015,6 +2017,18 @@ mod tests {
             let declared = &schema["properties"]["memory_type"]["enum"];
             assert_eq!(declared, &serde_json::Value::Array(expected.clone()), "{name}: {schema:?}");
         }
+    }
+
+    /// Two close decisions are put to the user as a conflict, so a note of what
+    /// happened saved as a decision asks the user for nothing. The schema is
+    /// what the model reads when it picks the type.
+    #[tokio::test]
+    async fn the_save_memory_schema_says_what_a_decision_is() {
+        let (b, _d) = bridge().await;
+        let schema = tool(&b, "save_memory").input_schema;
+        let described = schema["properties"]["memory_type"]["description"].as_str().unwrap_or_default().to_string();
+        assert!(described.contains("architectural_decision is a design choice and its reason"), "{described}");
+        assert!(described.contains("is a semantic_fact"), "{described}");
     }
 
     /// A conclusion is only a conclusion if its sources reach the store, and

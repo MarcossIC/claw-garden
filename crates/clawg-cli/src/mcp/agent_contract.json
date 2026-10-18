@@ -246,7 +246,7 @@
           },
           "memory_type": {
             "default": null,
-            "description": "What kind of memory this is, one of the listed values; any other is\nrefused. Defaults to semantic_fact when omitted.",
+            "description": "What kind of memory this is, one of the listed values; any other is\nrefused. Defaults to semantic_fact when omitted. An\narchitectural_decision is a design choice and its reason; what was\ndone, found or measured is a semantic_fact, even after a decision.",
             "enum": [
               "semantic_fact",
               "user_preference",

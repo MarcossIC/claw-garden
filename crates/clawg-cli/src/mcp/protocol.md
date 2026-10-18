@@ -73,9 +73,13 @@ Every row competes with the others in search, so leave out:
 
 `memory_type` is one of:
 
-- `semantic_fact`: a fact about the project or the world. The default.
+- `semantic_fact`: a fact about the project or the world: what is true, what
+  was done, found or measured, and a fixed bug with its root cause. The
+  default.
 - `user_preference`: how the user wants things done, in any project.
-- `architectural_decision`: a design choice and its reason.
+- `architectural_decision`: a design choice and its reason. What was done,
+  archived or measured after a decision is a `semantic_fact`: two close
+  decisions are put to the user as a conflict.
 - `session_summary`: the summary of a session (below). It never takes part in
   a conflict, and it fades twice as fast as a fact.
 - `code_block`, `chat_message` and `tool_error`: a snippet, a turn worth
