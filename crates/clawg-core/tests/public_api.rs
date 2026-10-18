@@ -95,6 +95,7 @@ fn explicit_event(content: &str, memory_type: Option<&str>, importance: Option<f
         memory_type: memory_type.map(str::to_owned),
         importance,
         derived_from: Vec::new(),
+        topic_key: None,
         user_stated: false,
     }
 }

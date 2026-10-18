@@ -366,6 +366,8 @@ pub enum RestoreError {
     NotFound(i64),
     #[error("memory #{id} was saved again as #{twin}, which is live; #{id} stays deleted so the text is not stored twice")]
     LiveTwin { id: i64, twin: i64 },
+    #[error("memory #{id} was saved under topic {key}, which #{live} holds now; #{id} stays deleted so the topic has one current memory")]
+    TopicTaken { id: i64, key: String, live: i64 },
     #[error(
         "memory #{id} holds a secret ({}), so it stays deleted: restored, it would reach searches and other agents. \
          `clawg purge {id} --yes` removes it for good",
@@ -403,6 +405,15 @@ const RESTORE_TWIN: &str = "SELECT t.id FROM memory m JOIN memory t \
      WHERE m.id = ?1 AND m.content_hash IS NOT NULL AND t.id <> m.id \
      AND t.deleted_at IS NULL AND t.status IN ('active', 'disputed') \
      ORDER BY t.created_at ASC LIMIT 1";
+
+/// The live row that holds the deleted row's topic key now, in the same scope
+/// as `SCOPE_ROWS_SQL` in `topic.rs`.
+const RESTORE_TOPIC_HOLDER: &str = "SELECT m.topic_key, t.id FROM memory m JOIN memory t \
+     ON t.agent_id IS m.agent_id AND COALESCE(t.project_id, '') = COALESCE(m.project_id, '') \
+     AND t.topic_key = m.topic_key \
+     WHERE m.id = ?1 AND t.id <> m.id \
+     AND t.deleted_at IS NULL AND t.status IN ('active', 'disputed') \
+     ORDER BY t.id LIMIT 1";
 
 const RESTORE_ROW: &str = "UPDATE memory SET deleted_at = NULL, last_modified_at = ?2, \
      update_count = update_count + 1 WHERE id = ?1 AND deleted_at IS NOT NULL";
@@ -468,6 +479,7 @@ pub async fn restore_memory_core(
         Restored(RestoredRow),
         Gone,
         Twin(i64),
+        TopicTaken(String, i64),
     }
     let outcome = store
         .conn
@@ -483,6 +495,11 @@ pub async fn restore_memory_core(
             }
             if let Some(twin) = tx.query_row(RESTORE_TWIN, [id], |r| r.get(0)).optional()? {
                 return Ok(Outcome::Twin(twin));
+            }
+            if let Some((key, live)) =
+                tx.query_row(RESTORE_TOPIC_HOLDER, [id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?
+            {
+                return Ok(Outcome::TopicTaken(key, live));
             }
             tx.execute(RESTORE_ROW, rusqlite::params![id, now])?;
             tx.execute(DELETE_VEC_MEMORY, [id])?;
@@ -502,6 +519,7 @@ pub async fn restore_memory_core(
         Outcome::Restored(row) => Ok(row),
         Outcome::Gone => Err(RestoreError::NotFound(id)),
         Outcome::Twin(twin) => Err(RestoreError::LiveTwin { id, twin }),
+        Outcome::TopicTaken(key, live) => Err(RestoreError::TopicTaken { id, key, live }),
     }
 }
 
@@ -575,6 +593,9 @@ pub struct MemoryAdminRow {
     /// conclusion has them; every other row omits the field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub derived_from: Option<Vec<i64>>,
+    /// The topic key the row was saved under; only `memory` rows have one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic_key: Option<String>,
 }
 
 /// Filter/pagination params for `list_memories_core`. `kind: None` merges
@@ -756,7 +777,8 @@ pub(crate) const SELECT_MEMORY: &str = "SELECT id, scope, agent_id, project_id, 
      tier, importance, status, access_count, created_at, last_accessed_at, superseded_by, \
      deleted_at, source, source_session_id, created_by_type, created_by_ref, \
      last_modified_at, update_count, dispute_count, disputed_against, last_disputed_at, \
-     (SELECT json_group_array(source_id) FROM memory_derivation WHERE memory_id = memory.id) \
+     (SELECT json_group_array(source_id) FROM memory_derivation WHERE memory_id = memory.id), \
+     topic_key \
      FROM memory";
 const SELECT_EPISODIC: &str = "SELECT id, scope, agent_id, project_id, task, tier, importance, \
      status, access_count, created_at, last_accessed_at, superseded_by, deleted_at \
@@ -863,6 +885,7 @@ pub(crate) fn map_memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory
         disputed_against: row.get(21)?,
         last_disputed_at: row.get(22)?,
         derived_from: sources_from_json(&row.get::<_, String>(23)?),
+        topic_key: row.get(24)?,
     })
 }
 
@@ -928,6 +951,7 @@ fn map_episodic_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryAdminRow>
         disputed_against: None,
         last_disputed_at: None,
         derived_from: None,
+        topic_key: None,
     })
 }
 
@@ -984,6 +1008,7 @@ fn map_procedural_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryAdminRo
         disputed_against: None,
         last_disputed_at: None,
         derived_from: None,
+        topic_key: None,
     })
 }
 
@@ -3153,6 +3178,40 @@ mod tests {
         assert!(err.to_string().contains(&format!("#{twin}")), "{err}");
         assert!(columns(&store, first).await.0.is_some(), "the row stays deleted");
         assert_eq!(stored_vector(&store, first).await, None);
+    }
+
+    async fn set_key(store: &MemoryStore, id: i64, key: &str) {
+        let key = key.to_owned();
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE memory SET topic_key = ?2 WHERE id = ?1", rusqlite::params![id, key]))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_row_whose_key_is_live_again_is_not_restored() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let first = save(&store, "a", "storage engine is sqlite").await;
+        set_key(&store, first, "storage/engine").await;
+        delete(&store, first).await;
+        let current = save(&store, "a", "storage engine moved to postgres").await;
+        set_key(&store, current, "storage/engine").await;
+        let elsewhere = save(&store, "b", "storage engine is duckdb").await;
+        set_key(&store, elsewhere, "storage/engine").await;
+
+        let err = restore(&store, first, Some("a")).await.unwrap_err();
+
+        assert!(
+            matches!(err, RestoreError::TopicTaken { id, live, ref key } if id == first && live == current && key == "storage/engine"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains(&format!("#{current}")), "{err}");
+        assert!(columns(&store, first).await.0.is_some(), "the row stays deleted");
+        assert_eq!(stored_vector(&store, first).await, None);
+
+        delete(&store, current).await;
+        assert_eq!(restore(&store, first, Some("a")).await.unwrap().status, "active");
     }
 
     #[tokio::test]

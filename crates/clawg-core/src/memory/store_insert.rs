@@ -133,6 +133,8 @@ pub struct NewMemoryRecord {
     /// The `memory` rows this one was drawn from, linked in the same
     /// transaction as the insert.
     pub derived_from: Vec<i64>,
+    /// The topic key of the save this row is a piece of (`topic.rs`).
+    pub topic_key: Option<String>,
 }
 
 /// Neutral importance for a row nothing has said anything special about.
@@ -212,6 +214,7 @@ impl NewMemoryRecord {
             created_at_ms: evt.timestamp_ms,
             candidates: Vec::new(),
             derived_from: evt.sources().to_vec(),
+            topic_key: evt.topic().map(str::to_string),
         }
     }
 }
@@ -409,8 +412,8 @@ impl MemoryStore {
             .map_err(|e| MemoryStoreError::InvalidEmbedding { reason: e.to_string() })?;
         let bytes = serialize_f32_vec(&unit);
         let created_at = TimestampMs::from_unix_millis_u64(record.created_at_ms);
-        // Derive dispute columns in Rust before .call() so all 15
-        // params flow through a single c.transaction() — atomic, no partial writes.
+        // Derive dispute columns in Rust before .call() so every
+        // param flows through a single c.transaction() — atomic, no partial writes.
         let escalated: Vec<i64> = record.candidates.iter().filter(|c| c.escalated).map(|c| c.id).collect();
         let disputed = !escalated.is_empty();
         let status: &'static str = if disputed { "disputed" } else { "active" };
@@ -434,8 +437,8 @@ impl MemoryStore {
                      (scope, agent_id, project_id, content, memory_type, source, \
                       created_at, created_by_type, created_by_ref, \
                       last_modified_at, last_accessed_at, access_count, importance, tier, \
-                      status, disputed_against, last_disputed_at, content_hash) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                      status, disputed_against, last_disputed_at, content_hash, topic_key) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     rusqlite::params![
                         record.scope,
                         record.agent_id,
@@ -465,6 +468,7 @@ impl MemoryStore {
                         da_json,
                         last_disp,
                         content_hash,
+                        record.topic_key,
                     ],
                 )?;
                 let id = tx.last_insert_rowid();
@@ -868,6 +872,7 @@ mod tests {
             created_at_ms: 1_000_000,
             candidates: Vec::new(),
             derived_from: Vec::new(),
+            topic_key: None,
         }
     }
 
@@ -988,6 +993,7 @@ mod tests {
             memory_type: None,
             importance: None,
             derived_from: Vec::new(),
+            topic_key: None,
             user_stated: false,
         };
         let chunk = Chunk { text: "hello".to_string() };
@@ -1013,6 +1019,7 @@ mod tests {
             memory_type: None,
             importance: None,
             derived_from: Vec::new(),
+            topic_key: None,
             user_stated: false,
         };
         let chunk = Chunk { text: "delta summary text".to_string() };
@@ -1041,6 +1048,7 @@ mod tests {
             memory_type: memory_type.map(str::to_owned),
             importance,
             derived_from: Vec::new(),
+            topic_key: None,
             user_stated: false,
         }
     }

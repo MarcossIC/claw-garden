@@ -770,6 +770,7 @@ mod tests {
             created_at_ms: 0,
             candidates: Vec::new(),
             derived_from: Vec::new(),
+            topic_key: None,
         };
         let stored_id = store.insert_memory_with_vector(record, emb.clone()).await.unwrap();
 

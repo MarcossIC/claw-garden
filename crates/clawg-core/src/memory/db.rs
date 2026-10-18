@@ -655,7 +655,7 @@ mod tests {
 
         let after = conn.call(snapshot).await.unwrap();
         assert_eq!(before, after);
-        assert_eq!(after.0, 15);
+        assert_eq!(after.0, 16);
     }
 
     /// Rows written before `project` existed keep their project ids when the
@@ -1062,6 +1062,69 @@ mod tests {
             .unwrap();
         let escalated = |new, old, at| (new, old, None, "escalated".to_string(), None, at);
         assert_eq!(pairs, vec![escalated(2, 1, 20), escalated(4, 1, 40), escalated(4, 3, 40)]);
+    }
+
+    #[tokio::test]
+    async fn a_database_from_before_topic_keys_opens_unchanged() {
+        ensure_vec0_registered();
+        let conn = Connection::open_in_memory().await.unwrap();
+        register_udfs(&conn).await.unwrap();
+        conn.call(|c| {
+            configured(crate::memory::migrations::runner())
+                .set_target(refinery::Target::Version(15))
+                .run(c)
+        })
+        .await
+        .unwrap();
+        conn.call(|c| {
+            for (id, status, by) in [(1, "active", None), (2, "superseded", Some(3)), (3, "active", None)] {
+                c.execute(
+                    "INSERT INTO memory \
+                     (id, scope, agent_id, content, memory_type, source, \
+                      created_at, created_by_type, created_by_ref, \
+                      last_modified_at, last_accessed_at, importance, tier, status, superseded_by) \
+                     VALUES (?1, 'agent', 'a', 'storage engine claim ' || ?1, 'architectural_decision', 'explicit', \
+                      ?1, 'user', 'a', 1, 1, 5.0, 3, ?2, ?3)",
+                    rusqlite::params![id, status, by],
+                )?;
+            }
+            c.execute_batch(
+                "INSERT INTO memory_piece (save_id, piece, memory_id, context) VALUES (1, 1, 1, ''), (1, 2, 3, 'head');
+                 INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (3, 1, 0.2, 'pending', 3);",
+            )?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+
+        let snapshot = |c: &mut rusqlite::Connection| -> Result<Vec<String>, rusqlite::Error> {
+            let mut out = Vec::new();
+            for sql in [
+                "SELECT json_array(id, content, status, superseded_by, tier, access_count) FROM memory ORDER BY id",
+                "SELECT json_array(save_id, piece, memory_id, context) FROM memory_piece ORDER BY save_id, piece",
+                "SELECT json_array(new_id, old_id, distance, state) FROM memory_conflict ORDER BY new_id",
+                "SELECT json_array(rowid) FROM memory_fts WHERE memory_fts MATCH 'engine' ORDER BY rowid",
+            ] {
+                let mut stmt = c.prepare(sql)?;
+                let rows: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+                out.extend(rows);
+            }
+            Ok(out)
+        };
+        let before = conn.call(snapshot).await.unwrap();
+
+        run_migrations(&conn).await.unwrap();
+
+        assert_eq!(conn.call(snapshot).await.unwrap(), before);
+        let keys: Vec<Option<String>> = conn
+            .call(|c| {
+                let mut stmt = c.prepare("SELECT topic_key FROM memory ORDER BY id")?;
+                let keys = stmt.query_map([], |r| r.get(0))?.collect();
+                keys
+            })
+            .await
+            .unwrap();
+        assert_eq!(keys, vec![None, None, None]);
     }
 
     fn tamper(dir: &Path, sql: &str) {
@@ -1536,7 +1599,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 15, "Expected exactly 15 applied migrations, got {}", count);
+        assert_eq!(count, 16, "Expected exactly 16 applied migrations, got {}", count);
     }
 
     /// V8 — a fresh store records V8 as applied and carries the FTS5 lexical
@@ -1997,7 +2060,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 15);
+        assert_eq!(migration_count, 16);
     }
 
     // -----------------------------------------------------------------------

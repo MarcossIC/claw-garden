@@ -43,6 +43,7 @@ use clawg_core::memory::clock::TimestampMs;
 use clawg_core::memory::project::{register_project, RegisterError};
 use clawg_core::memory::prompt_builder::{build_memory_prompt, QueryTexts, Retrieval, DEFAULT_BUDGET, MAX_BUDGET};
 use clawg_core::memory::sharing::{self, Reach};
+use clawg_core::memory::topic::validate_topic_key;
 use clawg_core::memory::synthesis::{
     existing_memory_ids, synthesis_core, unreviewed_count, Synthesis, SynthesisParams,
 };
@@ -346,6 +347,10 @@ pub struct SaveRequest {
     /// daemon makes one up.
     #[serde(default)]
     pub operation_id: Option<String>,
+    /// The topic this save is a version of: it replaces the caller's live
+    /// memories saved under the same key in the same project.
+    #[serde(default)]
+    pub topic_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -487,6 +492,13 @@ pub struct SaveBody {
     /// The earlier memories the contradiction detector paired with this save.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub related: Vec<RelatedMemory>,
+    /// The memories of the save's topic key it superseded.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub replaced: Vec<ReplacedMemory>,
+    /// The key the save was taken under. A bridge that sent one and finds it
+    /// missing is talking to a daemon that ignored it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic_key: Option<String>,
     /// The id this save is recorded under until it is stored.
     pub operation_id: String,
 }
@@ -499,9 +511,19 @@ impl SaveBody {
             memories: None,
             redacted: Vec::new(),
             related: Vec::new(),
+            replaced: Vec::new(),
+            topic_key: None,
             operation_id,
         }
     }
+}
+
+/// An earlier `memory` row a save under a topic key superseded.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ReplacedMemory {
+    pub kind: &'static str,
+    pub id: i64,
+    pub excerpt: String,
 }
 
 /// An earlier `memory` row a save was found close to. `escalated` says the
@@ -820,6 +842,12 @@ fn save_response(
                         .into_iter()
                         .map(|c| RelatedMemory { kind: "memory", id: c.id, escalated: c.escalated, excerpt: c.excerpt })
                         .collect(),
+                    replaced: report
+                        .replaced
+                        .into_iter()
+                        .map(|r| ReplacedMemory { kind: "memory", id: r.id, excerpt: r.excerpt })
+                        .collect(),
+                    topic_key: None,
                     operation_id,
                 },
             ));
@@ -876,6 +904,10 @@ async fn save_memory(
         raw.parse::<MemoryType>().map_err(|e| ApiError::bad_request(e.to_string()))?;
     }
     let operation_id = check_operation_id(body.operation_id)?;
+    if let Some(key) = body.topic_key.as_deref() {
+        validate_topic_key(key).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    }
+    let topic_key = body.topic_key.clone();
     // Checked here rather than by the worker: once queued, a save can only be
     // reported as failed long after the caller was told it was accepted.
     let derived_from = distinct_sources(&body.derived_from)?;
@@ -923,6 +955,7 @@ async fn save_memory(
         memory_type: body.memory_type,
         importance: body.importance,
         derived_from,
+        topic_key: body.topic_key,
         user_stated: body.user_stated,
     };
 
@@ -940,7 +973,8 @@ async fn save_memory(
     let (row, operation_id, masked) = match accepted {
         Accepted::Queued { row, operation_id, redacted } => (row, operation_id, redacted),
         Accepted::Existing { operation_id, state: OutboxState::Pending, .. } => {
-            return Ok((StatusCode::ACCEPTED, Json(SaveBody::queued("already_queued", operation_id))));
+            let body = SaveBody { topic_key, ..SaveBody::queued("already_queued", operation_id) };
+            return Ok((StatusCode::ACCEPTED, Json(body)));
         }
         Accepted::Existing { state: OutboxState::Failed, last_error, .. } => {
             return Err(ApiError { detail: last_error, ..ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "ingest_failed") });
@@ -948,7 +982,8 @@ async fn save_memory(
     };
 
     let Some(report) = report else {
-        return Ok((StatusCode::ACCEPTED, Json(SaveBody::queued("embedder_loading", operation_id))));
+        let body = SaveBody { topic_key, ..SaveBody::queued("embedder_loading", operation_id) };
+        return Ok((StatusCode::ACCEPTED, Json(body)));
     };
     let confirmation = match tokio::time::timeout(app.save_timeout, report).await {
         Ok(Ok(report)) => Confirmation::Reported(report),
@@ -963,7 +998,7 @@ async fn save_memory(
             log::warn!("could not drop the outbox row of a failed save: {e}; it is retried on the next start");
         }
     }
-    save_response(confirmation, operation_id, &masked).map(|(status, body)| (status, Json(body)))
+    save_response(confirmation, operation_id, &masked).map(|(status, body)| (status, Json(SaveBody { topic_key, ..body })))
 }
 
 /// A model that was let go for being idle and could not load again is not
@@ -1210,7 +1245,7 @@ async fn restore_memory(
         Ok(row) => Ok(Json(RestoredBody { restored: 1, row })),
         Err(e @ RestoreError::OnlyMemory(_)) => Err(ApiError::bad_request(e.to_string())),
         Err(RestoreError::NotFound(_)) => Err(ApiError::not_found(format!("no deleted {kind:?} row with id {id}"))),
-        Err(e @ (RestoreError::LiveTwin { .. } | RestoreError::HoldsSecret { .. })) => {
+        Err(e @ (RestoreError::LiveTwin { .. } | RestoreError::TopicTaken { .. } | RestoreError::HoldsSecret { .. })) => {
             Err(ApiError::conflict(e.to_string()))
         }
         Err(RestoreError::Embed(_, e)) => Err(embed_failure(e)),

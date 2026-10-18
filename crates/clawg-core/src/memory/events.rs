@@ -41,6 +41,12 @@ pub struct MemoryEvent {
     /// overrides above, and with the same `#[serde(default)]` contract.
     #[serde(default)]
     pub derived_from: Vec<i64>,
+    /// The topic this save is a version of (`topic.rs`): the live rows its
+    /// agent saved under the same key in the same project are replaced by it.
+    /// Honoured only for [`MemorySource::Explicit`], with the same
+    /// `#[serde(default)]` contract.
+    #[serde(default)]
+    pub topic_key: Option<String>,
     /// The client declares the content is what the user said, not something
     /// it inferred. Honoured only for [`MemorySource::Explicit`]; absent, as
     /// in an outbox row written before the field existed, the save is the
@@ -88,6 +94,14 @@ impl MemoryEvent {
         }
     }
 
+    /// The topic key this event revises, for a deliberate save only.
+    pub(crate) fn topic(&self) -> Option<&str> {
+        match self.source {
+            MemorySource::Explicit => self.topic_key.as_deref(),
+            _ => None,
+        }
+    }
+
     /// Build an event from a persisted `ChatMessage`.
     ///
     /// Returns `None` for messages we deliberately do NOT ingest:
@@ -116,6 +130,7 @@ impl MemoryEvent {
                 memory_type: None,
                 importance: None,
                 derived_from: Vec::new(),
+                topic_key: None,
                 user_stated: false,
             }),
         }
@@ -155,6 +170,7 @@ mod tests {
             memory_type: None,
             importance: None,
             derived_from: Vec::new(),
+            topic_key: None,
             user_stated: false,
         };
         assert!(matches!(evt.role, Role::Tool));
@@ -213,6 +229,7 @@ mod tests {
             memory_type: Some("user_preference".into()),
             importance: Some(9.5),
             derived_from: Vec::new(),
+            topic_key: None,
             user_stated: false,
         };
         let json = serde_json::to_string(&evt).expect("serialize");
@@ -238,6 +255,19 @@ mod tests {
         let evt: MemoryEvent = serde_json::from_str(json).expect("legacy payload must still parse");
         assert_eq!(evt.memory_type, None);
         assert_eq!(evt.importance, None);
+    }
+
+    #[test]
+    fn an_event_without_a_topic_key_still_parses() {
+        let json = r#"{"agent_id": "a", "project_id": null, "role": "user", "content": "hello",
+            "is_error": null, "source": "explicit", "timestamp_ms": 0}"#;
+        let evt: MemoryEvent = serde_json::from_str(json).expect("an outbox row from before topic keys parses");
+        assert_eq!(evt.topic(), None);
+
+        let keyed = MemoryEvent { topic_key: Some("storage/engine".into()), ..evt };
+        assert_eq!(keyed.topic(), Some("storage/engine"));
+        let chat = MemoryEvent { source: MemorySource::Chat, ..keyed };
+        assert_eq!(chat.topic(), None, "only a deliberate save revises a topic");
     }
 
     /// Chat ingest never carries overrides: they exist for deliberately saved
@@ -273,6 +303,7 @@ mod tests {
             memory_type: None,
             importance: None,
             derived_from: Vec::new(),
+            topic_key: None,
             user_stated: false,
         });
         // Result is Err when receiver is dropped — must not panic
