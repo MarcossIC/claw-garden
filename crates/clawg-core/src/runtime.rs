@@ -503,6 +503,7 @@ mod tests {
             memory_type: None,
             importance: None,
             derived_from: Vec::new(),
+            user_stated: false,
         }
     }
 

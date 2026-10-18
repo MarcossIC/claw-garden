@@ -1921,7 +1921,7 @@ async fn show_returns_every_metadata_field_of_a_saved_memory() {
     assert_eq!(item["kind"], "memory");
     assert_eq!(item["summary"], CONTENT, "the full content, not a preview");
     assert_eq!(item["source"], "explicit");
-    assert_eq!(item["created_by_type"], "user");
+    assert_eq!(item["created_by_type"], "agent", "an undeclared save is the agent's");
     assert_eq!(item["agent_id"], "agent-http");
     assert_eq!(item["project_id"], "proj-show");
     assert_eq!(item["memory_type"], "semantic_fact");

@@ -859,6 +859,7 @@ mod tests {
             memory_type: None,
             importance: None,
             derived_from: Vec::new(),
+            user_stated: false,
         }
     }
 
@@ -874,6 +875,7 @@ mod tests {
             memory_type: None,
             importance: None,
             derived_from: Vec::new(),
+            user_stated: false,
         }
     }
 
@@ -944,6 +946,7 @@ mod tests {
             memory_type: None,
             importance: None,
             derived_from: Vec::new(),
+            user_stated: false,
         };
         // Wait: the "tool_calls" filter is in from_message, but the worker just
         // calls select_chunker(Role::Assistant, None, "") → Skip (empty content).
@@ -1303,6 +1306,7 @@ mod tests {
                 memory_type: None,
                 importance: None,
                 derived_from: Vec::new(),
+                user_stated: false,
             })).unwrap();
         }
         drain_worker(tx, handle).await;
@@ -1384,6 +1388,7 @@ mod tests {
                 memory_type: None,
                 importance: None,
                 derived_from: Vec::new(),
+                user_stated: false,
             })).unwrap();
         }
         drain_worker(tx2, handle2).await;
@@ -1413,6 +1418,7 @@ mod tests {
                 memory_type: None,
                 importance: None,
                 derived_from: Vec::new(),
+                user_stated: false,
             })).unwrap();
         }
         drain_worker(tx3, handle3).await;
@@ -2368,6 +2374,7 @@ mod tests {
             memory_type: None,
             importance: None,
             derived_from: Vec::new(),
+            user_stated: false,
         })).unwrap();
         drain_worker(tx, handle).await;
 
@@ -2394,6 +2401,7 @@ mod tests {
             memory_type: None,
             importance: None,
             derived_from: Vec::new(),
+            user_stated: false,
         })).unwrap();
         drain_worker(tx, handle).await;
 

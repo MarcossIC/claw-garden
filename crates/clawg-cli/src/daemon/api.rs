@@ -901,8 +901,8 @@ async fn save_memory(
     let event = MemoryEvent {
         agent_id: body.agent_id,
         project_id: body.project_id,
-        // Explicit saves are attributed to the user: nothing derived them from
-        // an assistant turn, someone asserted them.
+        // Not read for an explicit save: `provenance::seal` decides who
+        // stated it.
         role: Role::User,
         content: body.content,
         // Only `Role::Tool` messages carry an error flag.
@@ -913,6 +913,7 @@ async fn save_memory(
         memory_type: body.memory_type,
         importance: body.importance,
         derived_from,
+        user_stated: false,
     };
 
     let (reply, report) = if wait {
