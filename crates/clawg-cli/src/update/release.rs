@@ -10,6 +10,14 @@ pub enum ReleaseError {
     Listing(String),
     #[error("release {tag} has no file for {triple}: expected {asset}")]
     MissingAsset { tag: String, triple: String, asset: String },
+    #[error("line {number} of SHA256SUMS is not a 64-digit lowercase hash, a separator and a name")]
+    BadSumsLine { number: usize },
+    #[error("SHA256SUMS lists {0} twice")]
+    DuplicateSumsName(String),
+    #[error("SHA256SUMS has no line for {0}")]
+    NotInSums(String),
+    #[error("SHA256SUMS is signed as {signed:?}, not for this release ({expected:?})")]
+    SignedForAnotherVersion { signed: String, expected: String },
 }
 
 /// A release the update may offer: published, with a tag `vX.Y.Z`.
@@ -65,6 +73,57 @@ impl Release {
         }
         Err(ReleaseError::MissingAsset { tag: self.tag.clone(), triple: triple.to_string(), asset })
     }
+}
+
+/// The hashes a release publishes in `SHA256SUMS`, as `sha256sum` writes them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sha256Sums(Vec<(String, String)>);
+
+impl Sha256Sums {
+    /// Lines of `<64 lowercase hex digits><space><space or *><name>`. Any other
+    /// line, blank ones included, and a name listed twice are refused.
+    pub fn parse(text: &str) -> Result<Self, ReleaseError> {
+        let mut entries: Vec<(String, String)> = Vec::new();
+        for (index, line) in text.lines().enumerate() {
+            let bad = || ReleaseError::BadSumsLine { number: index + 1 };
+            let (hash, rest) = (line.get(..64).ok_or_else(bad)?, &line[64..]);
+            let lowercase_hex = hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+            let name = rest
+                .strip_prefix("  ")
+                .or_else(|| rest.strip_prefix(" *"))
+                .filter(|name| !name.is_empty());
+            let (true, Some(name)) = (lowercase_hex, name) else {
+                return Err(bad());
+            };
+            if entries.iter().any(|(known, _)| known == name) {
+                return Err(ReleaseError::DuplicateSumsName(name.to_string()));
+            }
+            entries.push((name.to_string(), hash.to_string()));
+        }
+        Ok(Self(entries))
+    }
+
+    pub fn hash_of(&self, name: &str) -> Result<&str, ReleaseError> {
+        self.0
+            .iter()
+            .find(|(known, _)| known == name)
+            .map(|(_, hash)| hash.as_str())
+            .ok_or_else(|| ReleaseError::NotInSums(name.to_string()))
+    }
+}
+
+/// The trusted comment the release signs `SHA256SUMS` with, which binds the
+/// signed hashes to the version the listing announced.
+pub fn signed_comment(version: Version) -> String {
+    format!("clawg v{version} SHA256SUMS")
+}
+
+pub fn check_signed_comment(signed: &str, version: Version) -> Result<(), ReleaseError> {
+    let expected = signed_comment(version);
+    if signed == expected {
+        return Ok(());
+    }
+    Err(ReleaseError::SignedForAnotherVersion { signed: signed.to_string(), expected })
 }
 
 #[cfg(test)]
@@ -175,5 +234,126 @@ mod release_choice_and_asset_cases {
 
         assert!(error.to_string().contains(LINUX), "{error}");
         assert!(error.to_string().contains("v0.19.0"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod sha256sums_parse_cases {
+    use super::*;
+
+    const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HASH_B: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn the_lines_sha256sum_writes_are_read_in_both_modes() {
+        let text = format!("{HASH_A}  clawg-x86_64-unknown-linux-gnu
+{HASH_B} *install.ps1
+");
+
+        let sums = Sha256Sums::parse(&text).expect("valid");
+
+        assert_eq!(sums.hash_of("clawg-x86_64-unknown-linux-gnu").unwrap(), HASH_A);
+        assert_eq!(sums.hash_of("install.ps1").unwrap(), HASH_B);
+    }
+
+    #[test]
+    fn a_missing_line_for_the_asset_is_its_own_error() {
+        let sums = Sha256Sums::parse(&format!("{HASH_A}  install.ps1
+")).unwrap();
+
+        assert_eq!(
+            sums.hash_of("clawg-x86_64-unknown-linux-gnu"),
+            Err(ReleaseError::NotInSums("clawg-x86_64-unknown-linux-gnu".into()))
+        );
+    }
+
+    #[test]
+    fn a_hash_that_is_not_64_lowercase_hex_digits_names_its_line() {
+        let short = format!("{HASH_A}  a
+{}  b
+", &HASH_B[..63]);
+        let upper = format!("{}  a
+", HASH_B.to_uppercase());
+        let not_hex = format!("{}z  a
+", &HASH_B[..63]);
+        let long = format!("{HASH_B}0  a
+");
+
+        assert_eq!(Sha256Sums::parse(&short), Err(ReleaseError::BadSumsLine { number: 2 }));
+        for text in [upper, not_hex, long] {
+            assert_eq!(Sha256Sums::parse(&text), Err(ReleaseError::BadSumsLine { number: 1 }), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_line_that_is_not_hash_separator_name_names_its_line() {
+        for text in [
+            format!("{HASH_A} a
+"),
+            format!("{HASH_A}  
+"),
+            format!("{HASH_A}
+"),
+            format!("
+{HASH_A}  a
+"),
+            "no hash here
+".to_string(),
+        ] {
+            assert!(matches!(Sha256Sums::parse(&text), Err(ReleaseError::BadSumsLine { .. })), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_repeated_name_is_refused() {
+        let text = format!("{HASH_A}  install.ps1
+{HASH_B}  install.ps1
+");
+
+        assert_eq!(Sha256Sums::parse(&text), Err(ReleaseError::DuplicateSumsName("install.ps1".into())));
+    }
+
+    #[test]
+    fn the_three_failures_are_three_different_errors() {
+        let short = Sha256Sums::parse(&format!("{}  a
+", &HASH_A[..10])).unwrap_err();
+        let twice = Sha256Sums::parse(&format!("{HASH_A}  a
+{HASH_A}  a
+")).unwrap_err();
+        let missing = Sha256Sums::parse(&format!("{HASH_A}  a
+")).unwrap().hash_of("b").unwrap_err();
+
+        assert_ne!(short, twice);
+        assert_ne!(short, missing);
+        assert_ne!(twice, missing);
+    }
+}
+
+#[cfg(test)]
+mod trusted_comment_cases {
+    use super::*;
+
+    fn v(text: &str) -> Version {
+        Version::parse(text).unwrap()
+    }
+
+    #[test]
+    fn the_signed_comment_must_name_the_announced_version() {
+        assert_eq!(signed_comment(v("0.19.0")), "clawg v0.19.0 SHA256SUMS");
+        assert_eq!(check_signed_comment("clawg v0.19.0 SHA256SUMS", v("0.19.0")), Ok(()));
+    }
+
+    #[test]
+    fn the_comment_of_another_version_is_refused() {
+        assert_eq!(
+            check_signed_comment("clawg v0.18.0 SHA256SUMS", v("0.19.0")),
+            Err(ReleaseError::SignedForAnotherVersion {
+                signed: "clawg v0.18.0 SHA256SUMS".into(),
+                expected: "clawg v0.19.0 SHA256SUMS".into(),
+            })
+        );
+        for comment in ["", "timestamp:1", "clawg v0.19.0 SHA256SUMS ", "clawg v0.19.0"] {
+            assert!(check_signed_comment(comment, v("0.19.0")).is_err(), "{comment:?}");
+        }
     }
 }
