@@ -157,6 +157,17 @@ impl StoreLock {
         Ok(Self { _file: file, owner_path })
     }
 
+    /// What `memory.owner` says, as written, without touching the lock.
+    ///
+    /// For watching a daemon that is starting: [`StoreLock::current_owner`]
+    /// confirms the record with a try-lock, and a probe that lands while the
+    /// starting daemon is acquiring makes it lose the store. The record of a
+    /// dead holder is returned too, so the caller compares the pid with the
+    /// process it started.
+    pub fn recorded_owner(base_dir: &Path) -> Option<StoreOwner> {
+        read_owner(base_dir)
+    }
+
     /// Who holds the store right now, if anyone.
     ///
     /// Reads `memory.owner`, then CONFIRMS it with a try-lock on `memory.lock`:
@@ -264,6 +275,26 @@ mod tests {
 
         let owner = StoreLock::current_owner(dir.path()).expect("still held");
         assert_eq!(owner.holder, StoreHolder::Daemon);
+    }
+
+    #[test]
+    fn recorded_owner_reads_the_record_without_probing_the_lock() {
+        let dir = tmp();
+        assert_eq!(StoreLock::recorded_owner(dir.path()), None);
+
+        let lock = StoreLock::acquire(dir.path(), StoreHolder::Daemon).expect("acquire");
+        let owner = StoreLock::recorded_owner(dir.path()).expect("recorded");
+        assert_eq!(owner.holder, StoreHolder::Daemon);
+        assert_eq!(owner.pid, std::process::id());
+        drop(lock);
+
+        // A crashed holder's record is returned as written: telling it from a
+        // live one is the caller's job, by the pid.
+        let stale = StoreOwner { holder: StoreHolder::Daemon, pid: 4242, started_at_ms: 1 };
+        std::fs::write(store_owner_file(dir.path()), serde_json::to_string(&stale).unwrap()).unwrap();
+        assert_eq!(StoreLock::recorded_owner(dir.path()), Some(stale));
+        std::fs::write(store_owner_file(dir.path()), b"{half writ").unwrap();
+        assert_eq!(StoreLock::recorded_owner(dir.path()), None);
     }
 
     #[test]
