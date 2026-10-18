@@ -620,3 +620,109 @@ async fn a_test_build_reads_its_version_from_the_stamp() {
     let unstamped = run_binary(&sandbox, Path::new(BIN), &["--version"]);
     assert_eq!(stdout_of(&unstamped).trim(), format!("clawg {}", env!("CARGO_PKG_VERSION")));
 }
+
+// ── update --check ─────────────────────────────────────────────────────────
+
+/// The target the stamped copies claim to be distributed for.
+const STAMPED_TARGET: &str =
+    if cfg!(windows) { "x86_64-pc-windows-msvc" } else { "x86_64-unknown-linux-gnu" };
+
+/// A release server on an ephemeral port that answers the listing with
+/// `releases` and counts the requests it gets.
+struct ReleaseServer {
+    base: String,
+    hits: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ReleaseServer {
+    async fn start(releases: Value) -> Self {
+        use axum::routing::get;
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = hits.clone();
+        let app = axum::Router::new().route(
+            "/repos/MarcossIC/claw-garden/releases",
+            get(move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = releases.to_string();
+                async move { ([("content-type", "application/json")], body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        Self { base, hits }
+    }
+
+    /// An address nothing listens on.
+    async fn down() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        format!("http://{}", listener.local_addr().expect("addr"))
+    }
+
+    fn hits(&self) -> usize {
+        self.hits.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+fn listing(tags: &[&str]) -> Value {
+    Value::Array(
+        tags.iter()
+            .map(|tag| json!({ "tag_name": tag, "draft": false, "prerelease": false, "assets": [] }))
+            .collect(),
+    )
+}
+
+fn update(sandbox: &Sandbox, bin: &Path, server: &str, args: &[&str]) -> Output {
+    Command::new(bin)
+        .arg("update")
+        .args(args)
+        .env("CLAWG_TEST_HOME", &sandbox.home)
+        .env("CLAWG_TEST_RELEASE_URL", server)
+        .env_remove("CLAWG_PROFILE")
+        .current_dir(&sandbox.home)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run clawg update")
+}
+
+// The server runs in this process while the binary is waited on.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_check_reports_a_newer_version_and_an_up_to_date_one() {
+    let sandbox = Sandbox::new();
+    let installed = stamped_copy(
+        &sandbox.home,
+        &format!(r#"{{"version":"0.18.0","dist_target":"{STAMPED_TARGET}"}}"#),
+    );
+    let before = std::fs::read(&installed).expect("read the installed binary");
+
+    let newer = ReleaseServer::start(listing(&["v0.18.0", "v0.19.0"])).await;
+    let out = update(&sandbox, &installed, &newer.base, &["--check"]);
+    assert_eq!(out.status.code(), Some(100), "{}", stderr_of(&out));
+    assert!(stdout_of(&out).contains("0.19.0"), "{}", stdout_of(&out));
+    assert_eq!(newer.hits(), 1);
+
+    let same = ReleaseServer::start(listing(&["v0.18.0", "v0.17.0"])).await;
+    let out = update(&sandbox, &installed, &same.base, &["--check"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    assert!(stdout_of(&out).contains("up to date"), "{}", stdout_of(&out));
+
+    let out = update(&sandbox, &installed, &ReleaseServer::down().await, &["--check"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout_of(&out));
+    assert!(!stderr_of(&out).is_empty());
+
+    assert_eq!(std::fs::read(&installed).expect("read again"), before, "--check changes nothing");
+}
+
+// The server runs in this process while the binary is waited on.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_refuses_a_binary_without_a_stamp() {
+    let sandbox = Sandbox::new();
+    let server = ReleaseServer::start(listing(&["v99.0.0"])).await;
+
+    for args in [&["--check"][..], &[][..]] {
+        let out = update(&sandbox, Path::new(BIN), &server.base, args);
+        assert_eq!(out.status.code(), Some(1), "{}", stdout_of(&out));
+        assert!(stderr_of(&out).contains("built locally"), "{}", stderr_of(&out));
+    }
+    assert_eq!(server.hits(), 0, "a refused binary asks nothing");
+}
