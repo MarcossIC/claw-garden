@@ -998,67 +998,86 @@ pub struct ProcessSpawner {
 
 impl DaemonSpawner for ProcessSpawner {
     fn spawn_serve(&self, profile: Profile) -> Result<(), ClientError> {
-        use std::process::{Command, Stdio};
-
         let exe = std::env::current_exe()
             .map_err(|e| ClientError::Spawn(format!("cannot locate the clawg executable: {e}")))?;
-
-        // Both streams go to one appended log file. Appending, not truncating:
-        // a daemon that died is exactly when the previous run's tail matters.
-        let log_dir = self.base_dir.join("logs");
-        std::fs::create_dir_all(&log_dir)
-            .map_err(|e| ClientError::Spawn(format!("cannot create {}: {e}", log_dir.display())))?;
-        let log_path = log_dir.join("serve.log");
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .map_err(|e| ClientError::Spawn(format!("cannot open {}: {e}", log_path.display())))?;
-        let log_err = log
-            .try_clone()
-            .map_err(|e| ClientError::Spawn(format!("cannot duplicate the log handle: {e}")))?;
-
-        let mut cmd = Command::new(exe);
-        cmd.arg("serve")
-            .arg("--profile")
-            .arg(profile.as_str())
-            // Null stdin, never inherited: the caller is usually `clawg mcp`,
-            // whose stdin IS the MCP transport. A child sharing it would eat
-            // protocol frames.
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log))
-            .stderr(Stdio::from(log_err));
-
-        // Detach so the daemon outlives whatever started it — and, on Windows,
-        // so a Ctrl-C in the parent's console does not travel to it.
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-            const DETACHED_PROCESS: u32 = 0x0000_0008;
-            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
-            // Detaching the console is not detaching the handles: without
-            // this the daemon inherits the host's stdio pipes and the host
-            // never sees this bridge exit. See `detach.rs`.
-            crate::detach::disinherit_std_handles();
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            // Its own process group, so a SIGINT delivered to the parent's
-            // group stops the bridge without taking the daemon with it.
-            cmd.process_group(0);
-        }
-
         // The handle is dropped without a `wait`: this process does not
         // supervise the daemon, and blocking to reap it would defeat the point
         // of detaching. On Unix that leaves one zombie entry until the parent
         // exits — bounded by one, since autostart happens at most once per
         // bridge process.
-        cmd.spawn()
-            .map(|_child| ())
-            .map_err(|e| ClientError::Spawn(format!("could not spawn `clawg serve`: {e}")))
+        spawn_serve_at(&exe, &self.base_dir, profile, None).map(|_child| ())
     }
+}
+
+/// The arguments of `clawg serve` for `profile`; without a port the daemon
+/// binds the profile's default.
+fn serve_args(profile: Profile, port: Option<u16>) -> Vec<String> {
+    let mut args = vec!["serve".to_string(), "--profile".to_string(), profile.as_str().to_string()];
+    if let Some(port) = port {
+        args.push("--port".to_string());
+        args.push(port.to_string());
+    }
+    args
+}
+
+/// Launches the binary at `exe` as a detached `clawg serve`, its output
+/// appended to `<base_dir>/logs/serve.log`, and returns the child so a caller
+/// that cares can watch it.
+pub fn spawn_serve_at(
+    exe: &Path,
+    base_dir: &Path,
+    profile: Profile,
+    port: Option<u16>,
+) -> Result<std::process::Child, ClientError> {
+    use std::process::{Command, Stdio};
+
+    // Both streams go to one appended log file. Appending, not truncating:
+    // a daemon that died is exactly when the previous run's tail matters.
+    let log_dir = base_dir.join("logs");
+    std::fs::create_dir_all(&log_dir)
+        .map_err(|e| ClientError::Spawn(format!("cannot create {}: {e}", log_dir.display())))?;
+    let log_path = log_dir.join("serve.log");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| ClientError::Spawn(format!("cannot open {}: {e}", log_path.display())))?;
+    let log_err = log
+        .try_clone()
+        .map_err(|e| ClientError::Spawn(format!("cannot duplicate the log handle: {e}")))?;
+
+    let mut cmd = Command::new(exe);
+    cmd.args(serve_args(profile, port))
+        // Null stdin, never inherited: the caller is usually `clawg mcp`,
+        // whose stdin IS the MCP transport. A child sharing it would eat
+        // protocol frames.
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err));
+
+    // Detach so the daemon outlives whatever started it — and, on Windows,
+    // so a Ctrl-C in the parent's console does not travel to it.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+        // Detaching the console is not detaching the handles: without
+        // this the daemon inherits the host's stdio pipes and the host
+        // never sees this bridge exit. See `detach.rs`.
+        crate::detach::disinherit_std_handles();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Its own process group, so a SIGINT delivered to the parent's
+        // group stops the bridge without taking the daemon with it.
+        cmd.process_group(0);
+    }
+
+    cmd.spawn()
+        .map_err(|e| ClientError::Spawn(format!("could not spawn `clawg serve`: {e}")))
 }
 
 /// Returns a client for a live daemon, starting one if allowed.
@@ -1177,6 +1196,12 @@ pub(crate) mod tests {
 
     use crate::daemon::api::{router, AppCtx, SAVE_CONFIRM_TIMEOUT};
     use crate::daemon::lifecycle::{write_state, write_token, DaemonState};
+
+    #[test]
+    fn serve_is_started_on_the_profiles_default_port_unless_one_is_given() {
+        assert_eq!(serve_args(Profile::Dev, None), ["serve", "--profile", "dev"]);
+        assert_eq!(serve_args(Profile::Prod, Some(27380)), ["serve", "--profile", "prod", "--port", "27380"]);
+    }
 
     #[test]
     fn a_health_without_ingest_still_parses() {
