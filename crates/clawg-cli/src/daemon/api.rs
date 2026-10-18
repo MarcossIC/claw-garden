@@ -603,7 +603,7 @@ impl RetrievalState {
     /// a search, so the two never disagree on why memories cannot be reached.
     fn of(retrieval: Retrieval, status: EmbedderStatus) -> Self {
         match retrieval {
-            Retrieval::Searched => Self::Searched,
+            Retrieval::Searched { .. } => Self::Searched,
             Retrieval::NoEmbedder => match status {
                 EmbedderStatus::Failed { error, retryable } => Self::EmbedderFailed { detail: error, retryable },
                 EmbedderStatus::Loading | EmbedderStatus::Ready => Self::EmbedderNotReady,
