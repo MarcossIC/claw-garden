@@ -14,24 +14,24 @@ Reglas de todo el cambio:
 
 ## Tanda 1. Pipeline e instalación
 
-- [ ] 1. Test `the_manifest_carries_the_publication_metadata` (`conventions.rs`). `LICENSE` MIT («The Claw Garden contributors») y `license`, `repository`, `authors` en `[workspace.package]` de `Cargo.toml`.
+- [x] 1. Test `the_manifest_carries_the_publication_metadata` (`conventions.rs`). `LICENSE` MIT («The Claw Garden contributors») y `license`, `repository`, `authors` en `[workspace.package]` de `Cargo.toml`.
   Commit: `chore: add the MIT license and publication metadata`
-- [ ] 2. Test `reqwest_uses_rustls_with_the_system_roots` (`conventions.rs`). `reqwest` de `Cargo.toml` raíz con `default-features = false` y las features de D9; `Cargo.lock`. Después `cargo clean --target-dir target-test`.
+- [x] 2. Test `reqwest_uses_rustls_with_the_system_roots` (`conventions.rs`). `reqwest` de `Cargo.toml` raíz con `default-features = false` y las features de D9; `Cargo.lock`. Después `cargo clean --target-dir target-test`.
   Commit: `build: use rustls with the system roots for reqwest`
 - [ ] M1. **Manual (un administrador del repositorio en GitHub, con `minisign`):** generar los dos pares minisign fuera del repositorio; la privada principal y su contraseña, como secretos del environment `release` (limitado a `main`, sin revisores); la privada de respaldo, fuera de GitHub. De aquí salen `minisign.pub` y `minisign-next.pub`. Pueden avanzar sin M1, sólo con claves de prueba, las tareas 1, 2, 4 a 17 y 19 a 38; dependen de M1 las tareas 3 y 18 (y la ejecución real de la tanda). Nunca se commitea una clave de relleno.
 - [ ] 3. **Depende de M1.** Test `the_release_keys_are_two_distinct_minisign_public_keys` (`conventions.rs`, por líneas: comentario `untrusted comment:`, segunda línea de 56 caracteres que empieza con `RW`, las dos distintas). Se commitean `release/minisign.pub` y `release/minisign-next.pub`.
   Commit: `chore: add the release signing public keys`
-- [ ] 4. Test `third_party_actions_are_pinned_to_a_commit` y `the_release_workflow_publishes_only_for_a_successful_push_to_main` (`conventions.rs`; fallan: no existe `release.yml`). `.github/workflows/release.yml` con el disparador `workflow_run` y el job `plan` (D8: `event`, `conclusion`, `head_branch`, `head_repository`, tag existente, `concurrency`); SHAs resueltos con `gh api` al escribirlo, el tag en un comentario.
+- [x] 4. Test `third_party_actions_are_pinned_to_a_commit` y `the_release_workflow_publishes_only_for_a_successful_push_to_main` (`conventions.rs`; fallan: no existe `release.yml`). `.github/workflows/release.yml` con el disparador `workflow_run` y el job `plan` (D8: `event`, `conclusion`, `head_branch`, `head_repository`, tag existente, `concurrency`); SHAs resueltos con `gh api` al escribirlo, el tag en un comentario.
   Commit: `ci: add the release workflow trigger and plan job`
-- [ ] 5. Test `the_release_workflow_builds_only_the_cli_with_the_dist_mark` (R3). Job `build` (matriz `windows-2022` / `ubuntu-22.04`, `CLAWG_DIST_TARGET`, `cargo build --release --locked -p clawg-cli --target`), humo `--version`, ausencia de `CLAWG_TEST_`, `ldd` sin `libssl`/`libcrypto`.
+- [x] 5. Test `the_release_workflow_builds_only_the_cli_with_the_dist_mark` (R3). Job `build` (matriz `windows-2022` / `ubuntu-22.04`, `CLAWG_DIST_TARGET`, `cargo build --release --locked -p clawg-cli --target`), humo `--version`, ausencia de `CLAWG_TEST_`, `ldd` sin `libssl`/`libcrypto`.
   Commit: `ci: build and smoke-test the release binaries`
-- [ ] 6. Tests `the_release_workflow_publishes_last` (el `publish` depende de `plan` y `build`; `gh release create` sólo ahí; `environment: release` sólo ahí) y `the_signing_step_reads_the_key_password_from_stdin_without_echo` (`printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S …`, sin `set -x` ni `echo` del secreto, sin `-W`, `secrets.MINISIGN_*` sólo dentro de ese paso). Job `publish`: `SHA256SUMS`, firma, `minisign -Vm`, atestación, `gh release create`.
+- [x] 6. Tests `the_release_workflow_publishes_last` (el `publish` depende de `plan` y `build`; `gh release create` sólo ahí; `environment: release` sólo ahí) y `the_signing_step_reads_the_key_password_from_stdin_without_echo` (`printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S …`, sin `set -x` ni `echo` del secreto, sin `-W`, `secrets.MINISIGN_*` sólo dentro de ese paso). Job `publish`: `SHA256SUMS`, firma, `minisign -Vm`, atestación, `gh release create`.
   Commit: `ci: sign and publish the release as the last step`
-- [ ] 7. Test `the_ci_workflow_ignores_only_non_code_paths_and_runs_on_both_platforms` (I1; pasa hoy: fija el estado actual de `ci.yml`, sin secretos del environment `release`). Sin cambios a `ci.yml` salvo que el test lo exija.
+- [x] 7. Test `the_ci_workflow_ignores_only_non_code_paths_and_runs_on_both_platforms` (I1; pasa hoy: fija el estado actual de `ci.yml`, sin secretos del environment `release`). Sin cambios a `ci.yml` salvo que el test lo exija.
   Commit: `test(cli): pin the CI workflow paths and platforms`
-- [ ] 8. `scripts/install.ps1` como bootstrap (R8, R9): baja el binario del último release, compara con `SHA256SUMS`, avisa del VC++ Redistributable sin instalar nada; con `clawg.exe` local instala ese. Sin test automático (no hay tests de `scripts/`); se verifica a mano en el checklist.
+- [x] 8. `scripts/install.ps1` como bootstrap (R8, R9): baja el binario del último release, compara con `SHA256SUMS`, avisa del VC++ Redistributable sin instalar nada; con `clawg.exe` local instala ese. Sin test automático (no hay tests de `scripts/`); se verifica a mano en el checklist.
   Commit: `feat(scripts): install the latest release from install.ps1`
-- [ ] 9. Test `the_readme_documents_the_install_and_update_path` (`conventions.rs`) con la URL de `install.ps1`, la glibc mínima, SmartScreen, clave comprometida y verificación con `minisign`. `README.md` y `.claude/CLAUDE.md` (Versioning y CI con el release).
+- [x] 9. Test `the_readme_documents_the_install_and_update_path` (`conventions.rs`) con la URL de `install.ps1`, la glibc mínima, SmartScreen, clave comprometida y verificación con `minisign`. `README.md` y `.claude/CLAUDE.md` (Versioning y CI con el release).
   Commit: `docs: document installing from a release`
 
 ## Tanda 2. `clawg update --check`
