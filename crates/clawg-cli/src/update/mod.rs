@@ -187,7 +187,7 @@ async fn install(
     let had_daemon = old.is_some();
     let steps = plan(&Initial { daemon: old.clone() });
     let candidate = Candidate { release, triple, keys: trusted_keys(), client };
-    let mut installation = Installation::new(paths, profile, candidate, old);
+    let mut installation = Installation::new(paths, profile, candidate, installed, old);
 
     match apply(&steps, &mut installation).await {
         Outcome::Updated => Ok(report::success(&Updated {

@@ -238,6 +238,20 @@ impl Daemon {
         r.text().await.expect("list body")
     }
 
+    /// Until the model is loaded. `/health` answers before it is, and a save
+    /// sent meanwhile is queued (202) instead of stored (201).
+    async fn wait_until_ready(&self) {
+        let deadline = Instant::now() + START_BUDGET;
+        loop {
+            let health = self.health().await;
+            if health["embedder"] == "ready" {
+                return;
+            }
+            assert!(Instant::now() < deadline, "the model did not load: {health}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     /// Until no accepted save is still waiting to be stored.
     async fn wait_until_ingested(&self) {
         let deadline = Instant::now() + START_BUDGET;
@@ -468,6 +482,7 @@ async fn a_debug_binary_refuses_prod_even_with_a_test_home() {
 async fn a_restored_backup_brings_back_its_rows_and_keeps_the_replaced_store() {
     let sandbox = Sandbox::new();
     let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
     let (status, body) = daemon
         .post("/v1/memories", json!({ "content": "kept by the backup", "agent_id": "smoke" }))
         .await;
@@ -921,6 +936,7 @@ const SEEDED: [&str; 2] = [
 async fn seeded_store(sandbox: &Sandbox) -> (PathBuf, Daemon) {
     let installed = install(sandbox, &stamp_json("0.18.0", ""));
     let old = sandbox.serve_binary(&installed, "fake").await;
+    old.wait_until_ready().await;
     for text in SEEDED {
         let (status, body) = old.post("/v1/memories", json!({ "content": text, "agent_id": "smoke" })).await;
         assert_eq!(status, 201, "{body}");
@@ -1116,6 +1132,67 @@ async fn a_new_binary_that_does_not_start_brings_the_old_one_and_its_daemon_back
     let health = published_health(&sandbox.data_dir()).await;
     assert_eq!(health["version"], "0.18.0", "the old binary's daemon answers: {health}");
     assert_ne!(health["pid"].as_u64(), Some(u64::from(old.pid)), "started again, not the one that was stopped");
+}
+
+// The daemon runs from another copy than the one that updates, as after a
+// file replaced under a running daemon: it reports a version the installed
+// binary does not have, and the one brought back must be waited for by the
+// installed binary's own version.
+// The server runs in this process while the binary is waited on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_daemon_is_brought_back_by_the_installed_binary_when_the_new_one_does_not_start() {
+    let sandbox = Sandbox::new();
+    let installed = install(&sandbox, &stamp_json("0.18.0", ""));
+    let original = std::fs::read(&installed).expect("read the installed binary");
+    let other = sandbox.home.join("other").join(installed.file_name().expect("name"));
+    std::fs::create_dir_all(other.parent().expect("dir")).expect("other dir");
+    write_executable(&other, &stamped_bytes(&stamp_json("0.17.0", "")));
+    let old = sandbox.serve_binary(&other, "fake").await;
+    let release = signed_release("0.19.0", r#","serve_fault":"before_open""#);
+    let server = ReleaseServer::serving(release.listing.clone(), release.files.clone()).await;
+    let _stop = StopOnDrop { home: sandbox.home.clone() };
+
+    // The wait for a daemon of the wrong version lasts ten minutes, so the
+    // update is given a deadline instead of being waited on.
+    let (out_log, err_log) = (sandbox.log("update-out"), sandbox.log("update-err"));
+    let mut update = Command::new(&installed)
+        .arg("update")
+        .env("CLAWG_TEST_HOME", &sandbox.home)
+        .env("CLAWG_TEST_EMBEDDER", "fake")
+        .env("CLAWG_TEST_RELEASE_URL", &server.base)
+        .env("CLAWG_TEST_RELEASE_KEYS", json!([release.public]).to_string())
+        .env_remove("CLAWG_PROFILE")
+        .current_dir(&sandbox.home)
+        .stdin(Stdio::null())
+        .stdout(File::create(&out_log).expect("log file"))
+        .stderr(File::create(&err_log).expect("log file"))
+        .spawn()
+        .expect("run clawg update");
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = update.try_wait().expect("wait for the update") {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = update.kill();
+            let _ = update.wait();
+            panic!(
+                "the update did not finish in 120 s\n{}",
+                std::fs::read_to_string(&err_log).unwrap_or_default()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+
+    let report = std::fs::read_to_string(&err_log).expect("update stderr");
+    assert_eq!(status.code(), Some(1), "{}\n{report}", std::fs::read_to_string(&out_log).unwrap_or_default());
+    assert!(report.contains("Everything was put back: clawg 0.18.0 is installed"), "{report}");
+    assert!(report.contains("Its daemon is running again"), "{report}");
+    assert_eq!(std::fs::read(&installed).expect("read the installed binary"), original);
+
+    old.wait_for_exit(Duration::from_secs(10)).await;
+    let health = published_health(&sandbox.data_dir()).await;
+    assert_eq!(health["version"], "0.18.0", "the installed binary's daemon answers: {health}");
 }
 
 // The server runs in this process while the binary is waited on.

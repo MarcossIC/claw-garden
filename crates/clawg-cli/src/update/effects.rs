@@ -20,6 +20,7 @@ use super::plan::{
 };
 use super::release::Release;
 use super::report::{install_dir_access, NewDaemon};
+use super::version::Version;
 
 /// How often a starting daemon is looked at.
 const WATCH_INTERVAL: Duration = Duration::from_millis(200);
@@ -53,6 +54,8 @@ pub struct Installation {
     paths: Paths,
     profile: Profile,
     candidate: Candidate,
+    /// The version of the binary this process is, the one an undo restarts.
+    installed: Version,
     /// The daemon that was running when the update began.
     old: Option<Running>,
     child: Option<Child>,
@@ -62,11 +65,12 @@ pub struct Installation {
 }
 
 impl Installation {
-    pub fn new(paths: Paths, profile: Profile, candidate: Candidate, old: Option<Running>) -> Self {
+    pub fn new(paths: Paths, profile: Profile, candidate: Candidate, installed: Version, old: Option<Running>) -> Self {
         Self {
             paths,
             profile,
             candidate,
+            installed,
             old,
             child: None,
             backups_before: None,
@@ -326,7 +330,10 @@ impl Effects for Installation {
             Undo::StartOldDaemon => {
                 let old = self.old.clone().ok_or("there was no daemon to start again")?;
                 let exe = self.paths.exe.clone();
-                self.start_and_wait(&exe, &old.version, old.port).await.map(drop)
+                // The daemon that was running may report another version than
+                // the binary put back (one started before the file was replaced).
+                let version = self.installed.to_string();
+                self.start_and_wait(&exe, &version, old.port).await.map(drop)
             }
             Undo::RestoreAside => {
                 rename(&self.paths.aside, &self.paths.exe)?;
