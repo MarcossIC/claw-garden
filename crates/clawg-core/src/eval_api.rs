@@ -294,7 +294,7 @@ impl EvalStore {
             created_by_ref: "rag-eval".to_string(),
             importance,
             created_at_ms,
-            disputed_against: None,
+            candidates: Vec::new(),
             derived_from: Vec::new(),
         };
         self.0

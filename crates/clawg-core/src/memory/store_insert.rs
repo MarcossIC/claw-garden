@@ -7,6 +7,7 @@
 
 use crate::memory::chunker::Chunk;
 use crate::memory::clock::TimestampMs;
+use crate::memory::contradiction::Candidate;
 use crate::memory::events::{MemoryEvent, MemorySource};
 use crate::memory::vector::to_unit;
 use crate::memory::outbox::{apply_note, OutboxNote};
@@ -123,10 +124,11 @@ pub struct NewMemoryRecord {
     pub created_by_ref: String,
     pub importance: f64,
     pub created_at_ms: u64,
-    /// IDs of existing memory rows that conflict with this candidate.
-    /// When `Some(_)`, the row is inserted with `status='disputed'`.
-    /// Set by the contradiction detector in worker.rs before INSERT.
-    pub disputed_against: Option<Vec<i64>>,
+    /// The existing rows the contradiction detector found close to this one,
+    /// set in worker.rs before INSERT. Each becomes a `memory_conflict` pair;
+    /// an escalated one is also named in `disputed_against`, and makes the
+    /// row `disputed`.
+    pub candidates: Vec<Candidate>,
     /// The `memory` rows this one was drawn from, linked in the same
     /// transaction as the insert.
     pub derived_from: Vec<i64>,
@@ -212,7 +214,7 @@ impl NewMemoryRecord {
             created_by_ref: evt.agent_id.clone(),
             importance,
             created_at_ms: evt.timestamp_ms,
-            disputed_against: None,
+            candidates: Vec::new(),
             derived_from: evt.sources().to_vec(),
         }
     }
@@ -234,6 +236,25 @@ fn link_sources(
     )?;
     for source in sources {
         stmt.execute(rusqlite::params![memory_id, source, now])?;
+    }
+    Ok(())
+}
+
+/// Writes one `memory_conflict` pair per candidate of the row `new_id`,
+/// inside the caller's transaction.
+fn note_candidates(
+    tx: &rusqlite::Transaction<'_>,
+    new_id: i64,
+    candidates: &[Candidate],
+    now: TimestampMs,
+) -> rusqlite::Result<()> {
+    let mut stmt = tx.prepare_cached(
+        "INSERT OR IGNORE INTO memory_conflict (new_id, old_id, distance, state, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    for c in candidates {
+        let state = if c.escalated { "escalated" } else { "pending" };
+        stmt.execute(rusqlite::params![new_id, c.id, c.distance, state, now])?;
     }
     Ok(())
 }
@@ -394,10 +415,12 @@ impl MemoryStore {
         let created_at = TimestampMs::from_unix_millis_u64(record.created_at_ms);
         // Derive dispute columns in Rust before .call() so all 15
         // params flow through a single c.transaction() — atomic, no partial writes.
-        let da_vec: Option<&Vec<i64>> = record.disputed_against.as_ref().filter(|v| !v.is_empty());
-        let status: &'static str = if da_vec.is_some() { "disputed" } else { "active" };
-        let da_json: Option<String> = da_vec.map(|v| serde_json::to_string(v).expect("Vec<i64> serialises infallibly"));
-        let last_disp: Option<TimestampMs> = da_vec.map(|_| created_at);
+        let escalated: Vec<i64> = record.candidates.iter().filter(|c| c.escalated).map(|c| c.id).collect();
+        let disputed = !escalated.is_empty();
+        let status: &'static str = if disputed { "disputed" } else { "active" };
+        let da_json: Option<String> =
+            disputed.then(|| serde_json::to_string(&escalated).expect("Vec<i64> serialises infallibly"));
+        let last_disp: Option<TimestampMs> = disputed.then_some(created_at);
         // Compute the initial tier explicitly instead of relying
         // on the schema DEFAULT — the single source of truth for every
         // producer. PROMOTE-ONLY, starts from current=3 (see memory/tier.rs).
@@ -453,6 +476,7 @@ impl MemoryStore {
                     rusqlite::params![id, bytes],
                 )?;
                 link_sources(&tx, id, &record.derived_from, created_at)?;
+                note_candidates(&tx, id, &record.candidates, created_at)?;
                 if let Some(note) = note(id) {
                     apply_note(&tx, &note)?;
                 }
@@ -845,7 +869,7 @@ mod tests {
             created_by_ref: agent_id.to_string(),
             importance: 5.0,
             created_at_ms: 1_000_000,
-            disputed_against: None,
+            candidates: Vec::new(),
             derived_from: Vec::new(),
         }
     }
@@ -943,16 +967,16 @@ mod tests {
         assert!(result.is_ok(), "expected Ok for agent scope with project, got {:?}", result.err());
     }
 
-    // ── NewMemoryRecord.disputed_against defaults None ─────
+    // ── NewMemoryRecord.candidates defaults empty ─────
 
     #[test]
-    fn new_memory_record_disputed_against_defaults_none_in_make_record() {
+    fn new_memory_record_candidates_default_empty_in_make_record() {
         let rec = make_record("a", None);
-        assert!(rec.disputed_against.is_none(), "make_record must default disputed_against=None");
+        assert!(rec.candidates.is_empty(), "make_record must default to no candidates");
     }
 
     #[test]
-    fn new_memory_record_from_event_and_chunk_disputed_against_none() {
+    fn new_memory_record_from_event_and_chunk_has_no_candidates() {
         use crate::memory::events::{MemoryEvent, MemorySource};
         use crate::memory::chunker::Chunk;
         use crate::models::chat::Role;
@@ -970,8 +994,7 @@ mod tests {
         };
         let chunk = Chunk { text: "hello".to_string() };
         let rec = NewMemoryRecord::from_event_and_chunk(&evt, &chunk);
-        assert!(rec.disputed_against.is_none(),
-            "from_event_and_chunk must default disputed_against=None");
+        assert!(rec.candidates.is_empty(), "from_event_and_chunk must default to no candidates");
     }
 
     // ── Source-first arm — Compaction source overrides role ──
@@ -1134,7 +1157,7 @@ mod tests {
     #[tokio::test]
     async fn insert_with_no_dispute_writes_active_status() {
         let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
-        let record = make_record("a", None); // disputed_against = None
+        let record = make_record("a", None);
         let embedding = make_embedding_384();
         let id = store.insert_memory_with_vector(record, embedding).await.unwrap();
 
@@ -1155,11 +1178,15 @@ mod tests {
         assert!(lda.is_none(), "non-disputed row must have last_disputed_at=NULL");
     }
 
+    fn candidate(id: i64, distance: f64, escalated: bool) -> Candidate {
+        Candidate { id, distance, escalated, excerpt: String::new() }
+    }
+
     #[tokio::test]
     async fn insert_with_dispute_writes_disputed_status_and_json() {
         let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
         let mut record = make_record("a", None);
-        record.disputed_against = Some(vec![12i64, 34]);
+        record.candidates = vec![candidate(12, 0.2, true), candidate(34, 0.3, true)];
         let embedding = make_embedding_384();
         let id = store.insert_memory_with_vector(record, embedding).await.unwrap();
 
@@ -1184,12 +1211,69 @@ mod tests {
         assert_eq!(lda, Some(created_at_ms), "last_disputed_at must equal created_at when disputed");
     }
 
+    async fn conflict_rows(store: &crate::memory::db::MemoryStore) -> Vec<(i64, i64, Option<f64>, String, i64)> {
+        store
+            .conn
+            .call(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT new_id, old_id, distance, state, created_at FROM memory_conflict ORDER BY old_id",
+                )?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect();
+                rows
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn insert_writes_one_conflict_row_per_candidate() {
+        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let mut record = make_record("a", None);
+        record.candidates = vec![candidate(7, 0.25, false), candidate(9, 0.31, true)];
+        let id = store.insert_memory_with_vector(record, make_embedding_384()).await.unwrap();
+
+        let rows = conflict_rows(&store).await;
+        assert_eq!(
+            rows,
+            vec![
+                (id, 7, Some(0.25), "pending".to_string(), 1_000_000),
+                (id, 9, Some(0.31), "escalated".to_string(), 1_000_000),
+            ]
+        );
+        let (status, da): (String, Option<String>) = store
+            .conn
+            .call(move |c| c.query_row("SELECT status, disputed_against FROM memory WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?))))
+            .await
+            .unwrap();
+        assert_eq!((status.as_str(), da.as_deref()), ("disputed", Some("[9]")), "only the escalated pair disputes");
+    }
+
+    #[tokio::test]
+    async fn pending_candidates_alone_leave_the_row_active() {
+        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let mut record = make_record("a", None);
+        record.candidates = vec![candidate(7, 0.25, false)];
+        let id = store.insert_memory_with_vector(record, make_embedding_384()).await.unwrap();
+
+        let (status, da, lda): (String, Option<String>, Option<i64>) = store
+            .conn
+            .call(move |c| {
+                c.query_row("SELECT status, disputed_against, last_disputed_at FROM memory WHERE id = ?1", [id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!((status.as_str(), da, lda), ("active", None, None));
+        assert_eq!(conflict_rows(&store).await.len(), 1);
+    }
+
     #[tokio::test]
     async fn insert_with_dispute_is_atomic_single_transaction() {
         // Verify both memory and memory_vectors rows exist after disputed insert
         let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
         let mut record = make_record("a", None);
-        record.disputed_against = Some(vec![99i64]);
+        record.candidates = vec![candidate(99, 0.2, true)];
         let embedding = make_embedding_384();
         let id = store.insert_memory_with_vector(record, embedding).await.unwrap();
 

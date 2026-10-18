@@ -1491,6 +1491,7 @@ mod tests {
                 clawg_core::memory::redact::SecretKind::GithubToken,
                 clawg_core::memory::redact::SecretKind::Jwt,
             ],
+            ..Default::default()
         }), "op-1".into(), &[])
         .expect("a clean report is a success");
         assert_eq!(body.redacted, vec!["github_token", "jwt"]);
