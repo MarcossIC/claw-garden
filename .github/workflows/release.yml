@@ -59,3 +59,81 @@ jobs:
             echo "publish=${publish}"
             echo "version=${version}"
           } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: plan
+    if: needs.plan.outputs.publish == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            asset: clawg-x86_64-pc-windows-msvc.exe
+            binary: clawg.exe
+          # An older glibc than the newest runner image, so the binary runs on more distributions.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            asset: clawg-x86_64-unknown-linux-gnu
+            binary: clawg
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
+      - run: rustc -Vv
+      # Only the CLI: building the workspace would also build clawg-eval, which
+      # turns on a clawg-core feature that production binaries must not link.
+      - name: Build
+        env:
+          CLAWG_DIST_TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked -p clawg-cli --target ${{ matrix.target }}
+      - name: Smoke test
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          BINARY: target/${{ matrix.target }}/release/${{ matrix.binary }}
+        run: |
+          out=$("$BINARY" --version)
+          echo "$out"
+          if [ "$out" != "clawg ${VERSION}" ]; then
+            echo "the binary reports '$out', expected 'clawg ${VERSION}'" >&2
+            exit 1
+          fi
+          if grep -aq 'CLAWG_TEST_' "$BINARY"; then
+            echo "the binary carries the test stand-ins" >&2
+            exit 1
+          fi
+      - name: Check the linkage
+        if: runner.os == 'Linux'
+        env:
+          BINARY: target/${{ matrix.target }}/release/${{ matrix.binary }}
+        run: |
+          ldd "$BINARY"
+          if ldd "$BINARY" | grep -E 'libssl|libcrypto'; then
+            echo "the binary links OpenSSL" >&2
+            exit 1
+          fi
+          echo "highest glibc symbol version required:"
+          objdump -T "$BINARY" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n 1
+      - name: Collect the asset
+        shell: bash
+        env:
+          BINARY: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          mkdir dist
+          cp "$BINARY" "dist/${ASSET}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error

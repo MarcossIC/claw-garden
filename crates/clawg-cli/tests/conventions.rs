@@ -248,6 +248,28 @@ impl Job {
         }
         Some(value)
     }
+
+    /// The steps of the job, each as its own lines.
+    fn steps(&self) -> Vec<Vec<String>> {
+        let mut steps: Vec<Vec<String>> = Vec::new();
+        let mut inside = false;
+        for line in &self.lines {
+            if indent_of(line) == 4 && line.trim_start().starts_with("steps:") {
+                inside = true;
+                continue;
+            }
+            if !inside {
+                continue;
+            }
+            if indent_of(line) == 6 && line.trim_start().starts_with("- ") {
+                steps.push(Vec::new());
+            }
+            if let Some(step) = steps.last_mut() {
+                step.push(line.clone());
+            }
+        }
+        steps
+    }
 }
 
 fn jobs_of(lines: &[String]) -> Vec<Job> {
@@ -333,4 +355,52 @@ fn the_release_workflow_publishes_only_for_a_successful_push_to_main() {
     for other in jobs.iter().filter(|j| j.name != "plan") {
         assert!(other.key("needs").is_some_and(|n| n.contains("plan")), "job `{}` must wait for plan", other.name);
     }
+}
+
+#[test]
+fn the_release_workflow_builds_only_the_cli_with_the_dist_mark() {
+    let lines = workflow_code("release.yml");
+    let jobs = jobs_of(&lines);
+    let build = job(&jobs, "build");
+
+    assert!(build.key("needs").is_some_and(|n| n.contains("plan")));
+    assert!(build.key("if").is_some_and(|c| c.contains("needs.plan.outputs.publish == 'true'")));
+    assert!(!lines.iter().any(|l| l.contains("-latest")), "runners are pinned, not `-latest`");
+    for runner in ["os: windows-2022", "os: ubuntu-22.04"] {
+        assert!(lines.iter().any(|l| l.trim().trim_start_matches("- ") == runner), "the matrix lacks `{runner}`");
+    }
+    for target in ["target: x86_64-pc-windows-msvc", "target: x86_64-unknown-linux-gnu"] {
+        assert!(lines.iter().any(|l| l.trim() == target), "the matrix lacks `{target}`");
+    }
+
+    let builds: Vec<&String> = lines.iter().filter(|l| l.contains("cargo build")).collect();
+    assert!(!builds.is_empty(), "release.yml builds nothing");
+    for command in &builds {
+        assert!(command.contains("-p clawg-cli"), "builds only the CLI: {command}");
+        assert!(command.contains("--release") && command.contains("--locked"), "{command}");
+        assert!(command.contains("--target ${{ matrix.target }}"), "{command}");
+        assert!(!command.contains("--workspace") && !command.contains("--all"), "{command}");
+    }
+    for step in build.steps().iter().filter(|s| s.iter().any(|l| l.contains("cargo build"))) {
+        assert!(
+            step.iter().any(|l| l.trim() == "CLAWG_DIST_TARGET: ${{ matrix.target }}"),
+            "the build step must set CLAWG_DIST_TARGET: {step:?}"
+        );
+    }
+
+    let steps = build.steps();
+    let smoke = steps
+        .iter()
+        .find(|s| s.iter().any(|l| l.contains("--version")))
+        .expect("a step runs the built binary with --version");
+    let smoke = smoke.join("
+");
+    assert!(smoke.contains("clawg ${VERSION}"), "the smoke test compares with the planned version");
+    assert!(smoke.contains("CLAWG_TEST_"), "the smoke test looks for the test stand-ins in the binary");
+
+    let linkage = steps.iter().find(|s| s.iter().any(|l| l.contains("ldd"))).expect("a step runs ldd");
+    let linkage = linkage.join("
+");
+    assert!(linkage.contains("libssl") && linkage.contains("libcrypto"));
+    assert!(linkage.contains("runner.os == 'Linux'"));
 }
