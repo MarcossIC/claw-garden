@@ -148,6 +148,16 @@ impl Health {
     }
 }
 
+/// What `POST /v1/search` answers.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Found {
+    pub hits: Vec<Hit>,
+    /// Hits the daemon's relevance cut kept back. A daemon that predates the
+    /// count does not send it; its cut always left two hits standing.
+    #[serde(default)]
+    pub withheld: usize,
+}
+
 /// One retrieval hit, as much of it as a caller formats.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Hit {
@@ -265,7 +275,14 @@ pub struct Context {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Retrieval {
-    Searched,
+    /// A daemon that predates the counts sends neither, and then nothing is
+    /// said about relevance.
+    Searched {
+        #[serde(default)]
+        hits: usize,
+        #[serde(default)]
+        withheld: usize,
+    },
     EmbedderNotReady,
     EmbedderFailed { detail: String, retryable: bool },
     SearchFailed { detail: String },
@@ -627,11 +644,7 @@ impl DaemonClient {
         })
     }
 
-    pub async fn search(&self, args: SearchArgs) -> Result<Vec<Hit>, ClientError> {
-        #[derive(Deserialize)]
-        struct Body {
-            hits: Vec<Hit>,
-        }
+    pub async fn search(&self, args: SearchArgs) -> Result<Found, ClientError> {
         let resp = self
             .http
             .post(self.url("/v1/search"))
@@ -640,7 +653,7 @@ impl DaemonClient {
             .send()
             .await
             .map_err(Self::map_transport)?;
-        Ok(Self::read_response::<Body>(resp).await?.hits)
+        Self::read_response(resp).await
     }
 
     /// `budget: None` leaves the size to the daemon's default.
@@ -1172,6 +1185,19 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_search_answer_without_withheld_still_parses() {
+        let old: Found = serde_json::from_str(r#"{"hits":[]}"#).expect("a daemon that never said");
+        assert_eq!(old.withheld, 0);
+    }
+
+    #[test]
+    fn a_searched_context_without_counts_still_parses() {
+        let old: Context =
+            serde_json::from_str(r#"{"prompt":"","unreviewed":0,"retrieval":{"state":"searched"}}"#).expect("parses");
+        assert_eq!(old.retrieval, Some(Retrieval::Searched { hits: 0, withheld: 0 }));
+    }
+
+    #[test]
     fn a_context_without_retrieval_still_parses() {
         let old: Context = serde_json::from_str(r#"{"prompt":"","unreviewed":0}"#).expect("a daemon that never said");
         assert_eq!(old.retrieval, None);
@@ -1384,7 +1410,8 @@ pub(crate) mod tests {
                 limit: Some(5),
             })
             .await
-            .expect("search");
+            .expect("search")
+            .hits;
         assert!(hits.iter().any(|h| h.id == id), "the saved row must be retrievable");
 
         let context = c.context(content, "agent-client", None, None).await.expect("context");

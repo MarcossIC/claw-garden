@@ -2494,7 +2494,9 @@ mod tests {
         const DAY_MS: u64 = 86_400_000;
 
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
-        let embedder = Arc::new(FakeEmbedder::default());
+        // Every text on one axis: the month-old message is as close to the
+        // query as the fresh one, so both score and both reach the prompt.
+        let embedder = Arc::new(PlacedEmbedder { vectors: vec![turned(1, 0.0); 2] });
         let (tx, handle) =
             spawn_test_worker(Arc::clone(&store), embedder.clone() as Arc<dyn Embedder>).await;
 
