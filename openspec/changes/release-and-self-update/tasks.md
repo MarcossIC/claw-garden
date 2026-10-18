@@ -100,11 +100,12 @@ Reglas de todo el cambio:
 
 ## Verificación (checklist, no tareas de apply)
 
-- [ ] Suite y clippy en Windows (`target-test`) y en Linux; `the_agent_contract_matches_its_file` sin cambios.
+- [x] Suite y clippy en Windows (`target-test`); `the_agent_contract_matches_its_file` sin cambios.
+- [ ] Lo mismo en Linux (CI del PR).
 - [ ] Tras el merge (el workflow sólo corre desde `main`): ejecución de `release.yml`; `--version` = tag; `ldd` sin `libssl`; `minisign -Vm SHA256SUMS` con la clave del repositorio; cinco archivos y atestación (`gh attestation verify`).
 - [ ] **Manual (Windows limpio):** `irm … | iex`, aviso de VC++ sin él, `clawg update --check` dice «al día».
 - [ ] **Manual (administrador de GitHub):** revisar el primer release y el environment `release`.
-- [ ] `verify.md`.
+- [x] `verify.md` (con lo pendiente).
 
 ## Cierre
 

@@ -9,6 +9,6 @@ artifacts:
   design: done
   tasks: done
   apply: done
-  verify: pending
+  verify: done  # en Windows; Linux en el CI del PR, y los controles del release real tras el merge
   archive: pending
 updated: 2026-10-18
