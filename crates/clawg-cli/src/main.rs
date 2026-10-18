@@ -25,6 +25,7 @@ use clawg_cli::sharing;
 use clawg_cli::status::status_report;
 use clawg_cli::stop::{stop_in, STOP_TIMEOUT};
 use clawg_cli::undelete;
+use clawg_cli::update;
 use clawg_core::memory::backup::{backup_offline, probe, restore};
 use clawg_core::memory::embedder::keep_one_malloc_arena;
 use clawg_core::memory::secrets::{purge, scan};
@@ -211,6 +212,13 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             } else {
                 ExitCode::from(EXIT_FAILURE)
             })
+        }
+
+        Command::Update { check, profile } => {
+            let profile = profile.resolve().map_err(|e| e.to_string())?;
+            let (text, code) = update::run(check, profile).await.map_err(|e| e.to_string())?;
+            println!("{text}");
+            Ok(ExitCode::from(code))
         }
 
         Command::Projects { action: ProjectsAction::Add { path, profile } } => {
