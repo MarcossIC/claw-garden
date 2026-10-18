@@ -929,6 +929,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restoring_over_a_store_migrated_by_a_newer_version_keeps_it_as_pre_restore() {
+        let older = tempfile::tempdir().unwrap();
+        seed_on_disk(older.path(), None).await;
+        let snapshot = backup_offline(older.path()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        seed_on_disk(dir.path(), None).await;
+        add_row(dir.path(), "written by the newer version");
+        rusqlite::Connection::open(dir.path().join("memory.db"))
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+                 VALUES ({}, 'from_the_future', '2026-10-12T00:00:00Z', '1')",
+                latest_known() + 1
+            ))
+            .unwrap();
+        assert!(matches!(probe(dir.path()).state, ProbeState::Schema(SchemaPlan::Newer { .. })));
+
+        let restored = restore(dir.path(), &snapshot).unwrap();
+
+        let kept = restored.previous.expect("the migrated store was kept");
+        assert_eq!(parse_snapshot_name(&kept.file_name().unwrap().to_string_lossy()), Some(Reason::PreRestore));
+        assert_eq!(history_top(&kept), latest_known() + 1);
+        assert_eq!(
+            contents(&kept),
+            vec!["seeded on disk".to_string(), "written by the newer version".to_string()]
+        );
+        assert_eq!(history_top(&dir.path().join("memory.db")), latest_known());
+        assert_eq!(contents(&dir.path().join("memory.db")), vec!["seeded on disk".to_string()]);
+        assert_eq!(probe(dir.path()).state, ProbeState::Schema(SchemaPlan::UpToDate));
+    }
+
+    #[tokio::test]
     async fn probing_a_newer_store_reads_without_writing() {
         let dir = tempfile::tempdir().unwrap();
         // Through the production open, so the file is in WAL mode and was
