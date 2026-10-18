@@ -568,35 +568,55 @@ async fn a_test_that_fails_midway_leaves_no_daemon_holding_the_store() {
 
 // ── Bytes after the executable ─────────────────────────────────────────────
 
-#[tokio::test]
-async fn trailing_bytes_after_the_executable_image_do_not_change_execution() {
-    let sandbox = Sandbox::new();
-    let copy = sandbox.home.join(format!("clawg-copy{}", std::env::consts::EXE_SUFFIX));
+/// A copy of the test binary with `0x00 CLAWG-TEST-STAMP <json>` after its
+/// image, which only a `testing` build reads.
+fn stamped_copy(dir: &Path, json: &str) -> PathBuf {
+    let copy = dir.join(format!("clawg-copy{}", std::env::consts::EXE_SUFFIX));
     let mut bytes = std::fs::read(BIN).expect("read the test binary");
     bytes.push(0);
-    bytes.extend_from_slice(b"CLAWG-TEST-STAMP {\"version\":\"0.0.1\"}");
+    bytes.extend_from_slice(format!("CLAWG-TEST-STAMP {json}").as_bytes());
     std::fs::write(&copy, bytes).expect("write the copy");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     }
+    copy
+}
 
-    let run = |bin: &Path, args: &[&str]| {
-        Command::new(bin)
-            .args(args)
-            .env("CLAWG_TEST_HOME", &sandbox.home)
-            .env_remove("CLAWG_PROFILE")
-            .current_dir(&sandbox.home)
-            .stdin(Stdio::null())
-            .output()
-            .expect("run clawg")
-    };
+fn run_binary(sandbox: &Sandbox, bin: &Path, args: &[&str]) -> Output {
+    Command::new(bin)
+        .args(args)
+        .env("CLAWG_TEST_HOME", &sandbox.home)
+        .env_remove("CLAWG_PROFILE")
+        .current_dir(&sandbox.home)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run clawg")
+}
+
+#[tokio::test]
+async fn trailing_bytes_after_the_executable_image_do_not_change_execution() {
+    let sandbox = Sandbox::new();
+    let copy = stamped_copy(&sandbox.home, "{}");
+
     for args in [&["--version"][..], &["status", "--profile", "dev"][..]] {
-        let original = run(Path::new(BIN), args);
-        let stamped = run(&copy, args);
+        let original = run_binary(&sandbox, Path::new(BIN), args);
+        let stamped = run_binary(&sandbox, &copy, args);
         assert_eq!(original.status.code(), stamped.status.code(), "{args:?}: {}", stderr_of(&stamped));
         assert_eq!(original.stdout, stamped.stdout, "{args:?}");
         assert_eq!(original.stderr, stamped.stderr, "{args:?}");
     }
+}
+
+#[tokio::test]
+async fn a_test_build_reads_its_version_from_the_stamp() {
+    let sandbox = Sandbox::new();
+    let copy = stamped_copy(&sandbox.home, r#"{"version":"0.0.1"}"#);
+
+    let out = run_binary(&sandbox, &copy, &["--version"]);
+
+    assert_eq!(stdout_of(&out).trim(), "clawg 0.0.1", "{}", stderr_of(&out));
+    let unstamped = run_binary(&sandbox, Path::new(BIN), &["--version"]);
+    assert_eq!(stdout_of(&unstamped).trim(), format!("clawg {}", env!("CARGO_PKG_VERSION")));
 }

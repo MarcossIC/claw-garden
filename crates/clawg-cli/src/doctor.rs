@@ -118,7 +118,7 @@ pub fn run(profile: Profile) -> Result<Report, DoctorError> {
     let analysis = analyze(&exe, &entries, name, |p| p.is_file());
     Ok(Report {
         exe,
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: clawg_core::build_info::version().to_string(),
         profile: profile.as_str().to_string(),
         analysis,
     })

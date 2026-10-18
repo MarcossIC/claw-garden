@@ -12,7 +12,7 @@ use clawg_core::paths::{Profile, ProfileError};
 
 /// `clawg` — local-first memory for coding agents.
 #[derive(Debug, Parser)]
-#[command(name = "clawg", version, about, long_about = None)]
+#[command(name = "clawg", version = clawg_core::build_info::version(), about, long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,

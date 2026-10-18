@@ -110,7 +110,7 @@ impl ClientHandle {
                 "clawg mcp reached the daemon again at {} (daemon {}, bridge {})",
                 client.base_url(),
                 health.version,
-                env!("CARGO_PKG_VERSION")
+                clawg_core::build_info::version()
             ),
             Err(e) => log::info!("clawg mcp reached the daemon again at {} ({e})", client.base_url()),
         }

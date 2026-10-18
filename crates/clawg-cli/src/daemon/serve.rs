@@ -149,7 +149,7 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
             pid: std::process::id(),
             port: bound_port,
             profile: profile.as_str().to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: clawg_core::build_info::version().to_string(),
             started_at_ms: now_ms(),
         },
     )?;
