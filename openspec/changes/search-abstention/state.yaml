@@ -1,14 +1,14 @@
 change: search-abstention
 objective: "1"
 depends_on: [eval-rigor, memory-rank-fusion]
-phase: apply
+phase: verify
 artifacts:
   exploration: done
   proposal: done
   spec: done
   design: skipped  # the proposal settles approach C against A, B and D with the exploration's tradeoffs; the calibrated gate is a separate change
   tasks: done
-  apply: in_progress
-  verify: pending
+  apply: done
+  verify: in_progress  # Linux hecho; faltan el CI y el modelo real
   archive: pending
 updated: 2026-10-18
