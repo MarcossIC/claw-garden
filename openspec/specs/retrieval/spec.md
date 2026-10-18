@@ -11,6 +11,7 @@ Fuente de verdad del comportamiento actual de la recuperación: el corte relativ
 - [project-indexing](../../changes/archive/2026-10-15-project-indexing/proposal.md), archivado el 2026-10-15 (sólo "El piso de coseno", "Indexar un proyecto no cambia la búsqueda de memorias", el valor de `RELEVANCE_RATIO` y la medición con pooling mean en "Medición del contexto").
 - [memory-rank-fusion](../../changes/archive/2026-10-17-memory-rank-fusion/proposal.md), archivado el 2026-10-17 (sólo "Definiciones", "Corte relativo en `POST /v1/search`" y "Cliente HTTP y herramienta `search_memory`").
 - [context-budget](../../changes/archive/2026-10-17-context-budget/proposal.md), archivado el 2026-10-17 (desde "El prompt cumple el presupuesto" hasta "Un workspace más grande que el presupuesto se entrega y se dice", y lo que esos apartados cambian en "Definiciones", "`recall_context` no cuenta los ceros", los conflictos, "Medición del contexto" e "Invariantes").
+- [memory-protocol](../../changes/archive/2026-10-17-memory-protocol/proposal.md), archivado el 2026-10-17 (sólo el texto en inglés de "Una NOTE por bloque de conflictos" y de la línea de omitidos en "Orden y tope de los conflictos").
 
 ## Definiciones
 
@@ -269,7 +270,7 @@ Si el texto tiene varias líneas, las siguientes MUST seguir tal cual (líneas e
 
 ## Conflictos por referencia
 
-Cada par MUST imprimir los ids de sus dos lados como `#id`: son los valores que `resolve_conflict` recibe como `keep` y `other` (`ResolveConflictArgs`, `crates/clawg-cli/src/mcp/server.rs:294`), y los dos son ids de `memory`.
+Cada par MUST imprimir los ids de sus dos lados como `#id`: son los valores que `resolve_conflict` recibe como `keep` y `other` (`ResolveConflictArgs`, `crates/clawg-cli/src/mcp/server.rs:309`), y los dos son ids de `memory`.
 
 Un lado que es hit mostrado MUST imprimirse sólo como `#id`. Un lado que no es hit mostrado (fila del workspace, o fila fuera del prompt) MUST imprimirse con su texto completo bajo el encabezado `[YYYY-MM-DD #id]` la primera vez que aparece en el bloque, y sólo como `#id` las siguientes (`format_conflict_block`, `prompt_builder.rs:557`). Así el texto de una fila aparece a lo sumo una vez en el bloque aunque esté en varios pares: en una cadena de disputas, la fila del medio es nueva en un par y vieja en otro. Un par con ambos lados mostrados MUST NOT imprimir ningún texto. `importance`, `tier` y `status` no se imprimen. Un lado cuyo hit cortó el presupuesto no es hit mostrado: MUST llevar su texto, nunca un `#id` que el prompt no imprime (el bloque cita por las posiciones de los hits que quedaron, `render`, `prompt_builder.rs:421`).
 
@@ -314,19 +315,19 @@ Los pares que comparten `new_id` MUST formar un grupo: una línea `NEW`, y una l
 
 ## Una NOTE por bloque de conflictos
 
-La NOTE MUST imprimirse una sola vez por bloque, justo bajo el separador y antes de los grupos (`CONFLICT_NOTE`, `prompt_builder.rs:529`):
+La NOTE MUST imprimirse una sola vez por bloque, justo bajo el separador y antes de los grupos (`CONFLICT_NOTE`, `prompt_builder.rs:529-532`). MUST estar en inglés, como todo lo que el agente lee de clawg, empezar con `NOTE:` y nombrar `resolve_conflict` con el significado de `keep` y `other`:
 
 ```
-NOTE: estas memorias se contradicen y aún no resolviste cuál vale.
-Si vas a tomar una decisión que dependa de esto, preguntale al usuario.
-Con su respuesta, llamá a resolve_conflict (keep = la que vale, other = la otra).
+NOTE: these memories contradict each other, and which one holds is not settled yet.
+Before a decision that depends on them, ask the user.
+With the answer, call resolve_conflict (keep = the one that holds, other = the other one).
 ```
 
 #### Escenario
 - GIVEN 3 grupos
 - THEN `NOTE:` aparece exactamente una vez, y `resolve_conflict` también
 
-**Test:** `conflict_block_has_one_note` y `the_conflict_note_names_the_tool` en `prompt_builder.rs`.
+**Test:** `conflict_block_has_one_note`, `the_conflict_note_names_the_tool` y `the_conflict_note_is_in_english` en `prompt_builder.rs`.
 
 ## Orden y tope de los conflictos
 
@@ -337,7 +338,7 @@ Una función pura sobre los pares leídos (`rank_conflicts`, `prompt_builder.rs:
 
 El resultado MUST NOT depender del orden de entrada. Los grupos salen en orden de su primer par.
 
-Tras ordenar, el bloque MUST conservar los primeros 5 pares (`MAX_CONFLICT_PAIRS`, `prompt_builder.rs:45`; el tope cuenta pares, antes de agrupar). Si quedan N > 0 afuera, la última línea del bloque MUST ser `(+N conflictos más sin mostrar)`. Con N = 0 MUST NOT haber esa línea. Los pares que el presupuesto quita después ([El prompt cumple el presupuesto](#el-prompt-cumple-el-presupuesto)) se suman a N.
+Tras ordenar, el bloque MUST conservar los primeros 5 pares (`MAX_CONFLICT_PAIRS`, `prompt_builder.rs:45`; el tope cuenta pares, antes de agrupar). Si quedan N > 0 afuera, la última línea del bloque MUST ser `(+N more conflicts not shown)` (`prompt_builder.rs:582-584`). Con N = 0 MUST NOT haber esa línea. Los pares que el presupuesto quita después ([El prompt cumple el presupuesto](#el-prompt-cumple-el-presupuesto)) se suman a N.
 
 #### Escenario: posición
 - GIVEN un par cuyo hit está en posición 0 y otro en posición 4
@@ -353,7 +354,7 @@ Tras ordenar, el bloque MUST conservar los primeros 5 pares (`MAX_CONFLICT_PAIRS
 
 #### Escenario: tope
 - GIVEN 8 pares
-- THEN hay 5 pares impresos y la línea `(+3 conflictos más sin mostrar)`; con 5 pares no hay línea de omitidos
+- THEN hay 5 pares impresos y la línea `(+3 more conflicts not shown)`; con 5 pares no hay línea de omitidos
 
 **Test:** `conflict_pairs_rank_by_best_hit_position_workspace_only_last`, `conflict_pair_order_ignores_input_order` y `conflict_block_keeps_five_pairs_and_counts_the_rest` en `prompt_builder.rs`.
 
@@ -437,7 +438,7 @@ Si sin ningún hit ni par el texto sigue por encima del presupuesto, el prompt M
 
 ## Los ids de `recall_context` en `delete_memory` y `update_memory`
 
-La doc de `DeleteMemoryArgs.id` (`server.rs:254`), la de `UpdateMemoryArgs.id` (`server.rs:277`) y la descripción de `delete_memory` (`server.rs:902`) MUST nombrar `recall_context` además de `search_memory` y `list_memories`, y decir que un hit sin kind explícito es `memory`. `kind` sigue siendo obligatorio en las dos.
+La doc de `DeleteMemoryArgs.id` (`server.rs:269-272`), la de `UpdateMemoryArgs.id` (`server.rs:292-295`) y la descripción de `delete_memory` (`server.rs:1039-1043`) MUST nombrar `recall_context` además de `search_memory` y `list_memories`, y decir que un hit sin kind explícito es `memory`. `kind` sigue siendo obligatorio en las dos.
 
 **Test:** `memory_id_docs_name_recall_context_and_the_default_kind` en `server.rs`.
 

@@ -1,0 +1,15 @@
+change: memory-protocol
+objective: "1"
+depends_on: []
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # suite y clippy en Linux y Windows, sesión de Claude Code sobre el perfil dev
+  archive: done
+updated: 2026-10-17
+main_spec: openspec/specs/mcp/spec.md, openspec/specs/ingest/spec.md, openspec/specs/retrieval/spec.md

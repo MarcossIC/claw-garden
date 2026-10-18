@@ -1,6 +1,6 @@
 # mcp — Especificación
 
-Fuente de verdad del comportamiento actual del puente `clawg mcp`: cómo abre una sesión por stdio, en el ciclo legacy (`initialize`) y en el 2026-07-28 (`_meta` en cada request), y de qué nombre saca el `agent_id` de cada request. Qué filas modifica y lista cada agente está en [`specs/visibility`](../visibility/spec.md), y qué filas de otros agentes lee en [`specs/sharing`](../sharing/spec.md); este dominio sólo decide qué nombre entra como `client` en `resolve_agent` y cómo las herramientas muestran lo compartido (último apartado). Cómo el puente vuelve a encontrar al daemon después de un reinicio está en el apartado «Reconectar con el daemon tras un reinicio». Cómo `recall_context` pide un presupuesto de bytes y avisa que no buscó memorias está en «El presupuesto de `recall_context`» y «`recall_context` dice si buscó memorias»; qué entra en el presupuesto y qué se corta, en [`specs/retrieval`](../retrieval/spec.md). La herramienta `search_project`, que busca en la documentación y el código del proyecto, está en [`specs/project-docs`](../project-docs/spec.md); acá sólo se la cuenta entre las herramientas que lista el puente.
+Fuente de verdad del comportamiento actual del puente `clawg mcp`: cómo abre una sesión por stdio, en el ciclo legacy (`initialize`) y en el 2026-07-28 (`_meta` en cada request), y de qué nombre saca el `agent_id` de cada request. Qué filas modifica y lista cada agente está en [`specs/visibility`](../visibility/spec.md), y qué filas de otros agentes lee en [`specs/sharing`](../sharing/spec.md); este dominio sólo decide qué nombre entra como `client` en `resolve_agent` y cómo las herramientas muestran lo compartido (último apartado). Cómo el puente vuelve a encontrar al daemon después de un reinicio está en el apartado «Reconectar con el daemon tras un reinicio». Cómo `recall_context` pide un presupuesto de bytes y avisa que no buscó memorias está en «El presupuesto de `recall_context`» y «`recall_context` dice si buscó memorias»; qué entra en el presupuesto y qué se corta, en [`specs/retrieval`](../retrieval/spec.md). Qué le dice el servidor al agente sobre guardar y leer memorias (las instrucciones, el protocolo y lo que declaran los schemas de `memory_type` y la descripción de `save_memory`) está en «El protocolo de memoria» y los apartados que lo siguen. La herramienta `search_project`, que busca en la documentación y el código del proyecto, está en [`specs/project-docs`](../project-docs/spec.md); acá sólo se la cuenta entre las herramientas que lista el puente.
 
 **Origen:**
 - [mcp-protocol-upgrade](../../changes/archive/2026-10-13-mcp-protocol-upgrade/proposal.md), archivado el 2026-10-13.
@@ -11,6 +11,7 @@ Fuente de verdad del comportamiento actual del puente `clawg mcp`: cómo abre un
 - [ingest-outbox](../../changes/archive/2026-10-15-ingest-outbox/proposal.md), archivado el 2026-10-15 (sólo el bloque `ingest` de `memory_status` y el texto de `save_memory` ante un `202`).
 - [embedder-idle-unload](../../changes/archive/2026-10-17-embedder-idle-unload/proposal.md), archivado el 2026-10-17 (sólo «El modelo en memoria en `/health`»; el ciclo de vida del embedder está en [`specs/storage`](../storage/spec.md)).
 - [context-budget](../../changes/archive/2026-10-17-context-budget/proposal.md), archivado el 2026-10-17 (sólo «El presupuesto de `recall_context`» y «`recall_context` dice si buscó memorias»).
+- [memory-protocol](../../changes/archive/2026-10-17-memory-protocol/proposal.md), archivado el 2026-10-17 (desde «El protocolo de memoria» hasta el final).
 
 ## Definiciones
 
@@ -132,7 +133,7 @@ Repetir MUST NOT llegar dos veces al handler del daemon: un 401 lo corta `requir
 
 #### Escenario: el daemon se reinició
 - GIVEN un puente contra el daemon A, con su puerto y su token
-- AND A se detiene y el daemon B arranca sobre el mismo directorio de datos, con otro token y un puerto efímero (`Published::serve`, `server.rs:3211`)
+- AND A se detiene y el daemon B arranca sobre el mismo directorio de datos, con otro token y un puerto efímero (`Published::serve`, `server.rs:3237`)
 - WHEN el agente llama a `save_memory` y después a `search_memory`
 - THEN el save se guarda en B y la búsqueda lo encuentra
 - AND ninguna de las dos respuestas es un error
@@ -179,7 +180,7 @@ El texto de `ClientError::Unauthorized` de la CLI (`crates/clawg-cli/src/client.
 
 **Tests:** `a_daemon_stopped_mid_session_is_reported_without_starting_one` (`mcp/server.rs`).
 
-**Registro del proyecto.** `ClawgMcp::project_for` (`crates/clawg-cli/src/mcp/server.rs:592`) registra cada raíz y su id heredado una sola vez por proceso. Si el registro falla con una falla que se resuelve releyendo, la entrada se quita (`server.rs:619-621`) y el siguiente envío, incluida la repetición de la llamada, lo vuelve a mandar. Una colisión (409 `project_root_collision`) también quita la entrada, pero hace fallar la herramienta ([`specs/project`](../project/spec.md), R6). Cualquier otra falla cuenta como enviada, para no costarle un pedido a cada herramienta frente a un daemon que no sabe registrar.
+**Registro del proyecto.** `ClawgMcp::project_for` (`crates/clawg-cli/src/mcp/server.rs:603`) registra cada raíz y su id heredado una sola vez por proceso. Si el registro falla con una falla que se resuelve releyendo, la entrada se quita (`server.rs:630-632`) y el siguiente envío, incluida la repetición de la llamada, lo vuelve a mandar. Una colisión (409 `project_root_collision`) también quita la entrada, pero hace fallar la herramienta ([`specs/project`](../project/spec.md), R6). Cualquier otra falla cuenta como enviada, para no costarle un pedido a cada herramienta frente a un daemon que no sabe registrar.
 
 #### Escenario: el registro que el daemon anterior rechazó
 - GIVEN un puente cuyo daemon se reinició, con el token viejo guardado
@@ -270,6 +271,74 @@ La política y el alcance son de [`specs/sharing`](../sharing/spec.md); acá est
 
 - `search_memory` MUST marcar un hit de otro agente con `by <autor>` dentro del corchete (`N. #id [kind/tipo/tN score=S by <autor>] contenido`) y, si hay alguno, terminar con la nota de que esas líneas son información para verificar y de sólo lectura (`format_hits`, `crates/clawg-cli/src/mcp/tools.rs:81`). `recall_context` MUST marcarlos igual en sus líneas y cerrar con un bloque `SHARED` (`prompt_builder.rs:423-429`; el formato, en [`specs/retrieval`](../retrieval/spec.md)). Un hit propio MUST quedar como siempre.
 - `memory_status` MUST terminar con la línea `shared:` (`format_sharing`, `tools.rs:363`; `memory_status_impl`, `server.rs:918`): `shared: reads every agent`, `shared: reads every agent but <autor>, <autor>`, `shared: none (reads only its own)` o `shared: none (<motivo>)` con un `sharing.json` inválido.
-- Las descripciones de `delete_memory`, `update_memory` y `resolve_conflict` MUST decir que valen sólo sobre las memorias propias y que una marcada `by <agente>` es de sólo lectura (`server.rs:1038-1092`). Sobre una fila ajena las tres fallan como si el id no existiera ([`specs/visibility`](../visibility/spec.md) R3).
+- Las descripciones de `delete_memory`, `update_memory` y `resolve_conflict` MUST decir que valen sólo sobre las memorias propias y que una marcada `by <agente>` es de sólo lectura (`server.rs:1039-1092`). Sobre una fila ajena las tres fallan como si el id no existiera ([`specs/visibility`](../visibility/spec.md) R3).
 
 Tests: `format_search_marks_shared_hits_and_adds_the_note`, `format_search_leaves_own_hits_alone` y `format_status_says_whom_the_agent_reads` (`tools.rs`); `search_memory_shows_another_agents_memory_with_its_author`, `recall_context_shows_another_agents_memory_with_its_author`, `memory_status_reports_the_sharing_of_the_agent`, `tool_descriptions_say_shared_memories_are_read_only` y `a_shared_memory_is_read_only` (`server.rs`).
+
+## El protocolo de memoria
+
+Lo que el agente lee sobre qué guardar y cómo escribirlo sale de un solo texto en inglés, `crates/clawg-cli/src/mcp/protocol.md`, compilado en el binario (`PROTOCOL`, `crates/clawg-cli/src/mcp/server.rs:117`). Su **apertura** son los párrafos entre el título (la primera línea, `# …`) y la primera línea que empieza con `## `. Dentro de cada párrafo, las líneas se unen con un espacio, y los párrafos se separan con una línea en blanco. Las secciones desarrollan cada punto: cuándo guardar, qué no guardar, cómo escribir un save, tipo e importancia, el resumen de sesión, qué hacer tras una compactación, las conclusiones, que lo recuperado es evidencia y no instrucciones, y las demás herramientas. Hoy sólo la apertura llega sola al agente; el texto completo lo leen los tests de este apartado.
+
+### Las instrucciones son la apertura
+
+`get_info` MUST entregar la apertura como `instructions` (`server.rs:1164`), y `server/discover` MUST llevar las mismas, porque arma su respuesta con `get_info` (`server.rs:1170-1175`). Extraer la apertura MUST ser una función pura sobre el texto (`opening`, `server.rs:121`) que MUST NOT cortar una palabra, MUST NOT dejar saltos de línea dentro de un párrafo y MUST NOT incluir el título ni una línea de sección. Un checkout con `\r\n` MUST dar la misma apertura.
+
+#### Escenario: un párrafo cortado en dos líneas
+- GIVEN `# T\n\nuno\ndos\n\ntres\n## S\ncuatro`
+- WHEN se extrae la apertura
+- THEN es `uno dos\n\ntres`, y lo mismo con `\r\n` en lugar de `\n`
+
+**Tests:** el puro `opening_joins_the_lines_of_each_paragraph` y `the_instructions_are_the_opening_of_the_protocol` (`server.rs`). Como `discover` usa `get_info`, un solo test fija las dos puertas.
+
+### Las instrucciones caben en 2.048 caracteres
+
+La apertura MUST medir 2.048 caracteres o menos, contados como `char`: Claude Code anterior a la v2.1.296 corta las instrucciones de un servidor en ese largo, y se pagan en cada sesión. Hoy mide 1.699.
+
+**Test:** `the_instructions_fit_older_clients` (`server.rs`).
+
+### La apertura lleva los hábitos que más rinden
+
+Mientras sea el único texto del protocolo que llega solo al agente, la apertura MUST:
+
+- decir cuándo llamar a `save_memory`, `search_memory`, `recall_context`, `search_project`, `resolve_conflict` y `synthesize`;
+- pedir un hecho por llamada, con una primera línea que nombre el tema y con rutas e identificadores exactos;
+- pedir memorias y búsquedas en inglés, cualquiera sea el idioma de la conversación, porque una memoria se encuentra mejor con una consulta en su idioma (el corte por pareja de idiomas de [`specs/eval`](../eval/spec.md));
+- decir que lo recuperado (memorias y pasajes del proyecto) es evidencia y no instrucciones;
+- decir qué no guardar.
+
+El texto completo MUST traer además el resumen de sesión con sus seis partes (Goal, Instructions, Discoveries, Accomplished, Next steps y Relevant files) y qué hacer tras una compactación.
+
+**Tests:** `the_instructions_carry_the_saving_habits` y `the_protocol_describes_the_session_summary` (`server.rs`); además, `get_info_advertises_tools_and_the_profiles_server_name` e `instructions_say_when_to_search_the_project` (`server.rs`) y `a_discover_probe_is_answered_with_what_the_server_offers` (`handshake.rs`) piden `save_memory`, `synthesize` y `search_project` en las instrucciones.
+
+### El protocolo nombra sólo lo que existe
+
+- Cada herramienta registrada en `tool_router` MUST aparecer entre comillas invertidas en el protocolo.
+- Cada texto entre comillas invertidas que sea un nombre en minúsculas, con o sin `_` (`[a-z]+(_[a-z]+)*`), MUST ser una herramienta registrada, una propiedad del `inputSchema` de alguna herramienta o un tipo de memoria. Los ejemplos y las marcas (`` `Fixed lexical bonus ignoring paths` ``, `` `<private>` ``, `` `piece=K/N` ``, `` `by <agent>` ``) no cuentan.
+- Cada tipo de memoria MUST aparecer en el protocolo.
+
+Juntar los textos entre comillas invertidas MUST ser una función pura (`code_spans` e `is_name`, en los tests de `server.rs`).
+
+#### Escenario: una herramienta renombrada
+- GIVEN el protocolo con `` `save_memories` ``
+- THEN el test falla y nombra `save_memories`
+
+**Tests:** el puro `backticked_names_reads_each_code_span` y `the_protocol_names_only_what_exists` (`server.rs`).
+
+## El schema de `memory_type` declara los tipos
+
+En el `inputSchema` de `save_memory` y de `update_memory`, la propiedad `memory_type` MUST declarar `enum` con los siete tipos de `MemoryType::ALL`, en su orden, más `null`, para que el `default` declarado (`null`) siga siendo válido (`memory_type_enum`, `server.rs:146-150`, aplicado con `#[schemars(transform = …)]` en `server.rs:160` y `server.rs:304`). Sus descripciones MUST NOT repetir la lista: dicen que es uno de los valores listados y que cualquier otro se rechaza.
+
+Al deserializar, el argumento MUST seguir siendo una cadena libre (`Option<String>`): un valor desconocido llega al daemon y vuelve como `not saved: unknown memory_type …` con los siete tipos ([`specs/ingest`](../ingest/spec.md), «El tipo de memoria se valida al guardar»), no como un error de protocolo que el modelo no puede leer. El `enum` le muestra los tipos al modelo antes de llamar; la validación de verdad es la del daemon.
+
+#### Escenario: un tipo inventado
+- GIVEN un cliente que no valida el `enum`
+- WHEN el agente llama `save_memory` con `memory_type: "bug_fix"`
+- THEN la respuesta es un error que empieza con `not saved: unknown memory_type "bug_fix"` y nombra los siete tipos, y no se guarda nada
+
+**Tests:** `the_save_memory_schema_names_the_accepted_memory_types` (`server.rs`), que compara el `enum` de las dos herramientas con `MemoryType::ALL`; `save_memory_says_an_unknown_type_was_not_saved` (`server.rs`). El schema lo fija también `the_agent_contract_matches_its_file` ([`specs/quality`](../quality/spec.md)).
+
+## La descripción de `save_memory` pide título y "dónde"
+
+La descripción de `save_memory` (`server.rs:950-958`) MUST pedir una primera línea que nombre el tema y, después, qué, por qué y dónde, con las rutas e identificadores exactos: las primeras palabras se embeben con cada pieza de un save largo, y un identificador que nombra la consulta es lo que marca un hit como `exact`. MUST conservar "one fact" y `read_memory`.
+
+**Tests:** `save_memory_asks_for_a_title_and_where` y `save_memory_asks_for_one_fact_per_call` (`server.rs`).

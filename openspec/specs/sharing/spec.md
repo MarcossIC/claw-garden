@@ -117,8 +117,8 @@ En `search_memory` (`format_hits`, `crates/clawg-cli/src/mcp/tools.rs:81`; `shar
 
 - El workspace de L MUST cargar sólo filas de L (`regenerate_auto_section` con el agente del pedido, `api.rs:999`).
 - ACTIVE CONFLICTS MUST mostrar sólo disputas cuya fila nueva es de L, como siempre, aunque un hit ajeno esté en el prompt (`fetch_active_conflicts`, `prompt_builder.rs:659`, recibe sólo el agente).
-- `list_memories`, `synthesize`, el dedup y el detector de contradicciones al guardar MUST seguir viendo sólo lo de L (`list_memories_impl`, `crates/clawg-cli/src/mcp/server.rs:637`, manda `agent: Some(agent_id)`).
-- `delete_memory`, `update_memory` y `resolve_conflict` sobre una fila ajena que L ve en la búsqueda MUST fallar como si el id no existiera, sin tocar nada ([`specs/visibility`](../visibility/spec.md) R3 y R4). Sus descripciones MUST decir que sólo valen sobre las memorias propias y que lo compartido es de sólo lectura (`server.rs:900-941`).
+- `list_memories`, `synthesize`, el dedup y el detector de contradicciones al guardar MUST seguir viendo sólo lo de L (`list_memories_impl`, `crates/clawg-cli/src/mcp/server.rs:729`, manda `agent: Some(agent_id)`).
+- `delete_memory`, `update_memory` y `resolve_conflict` sobre una fila ajena que L ve en la búsqueda MUST fallar como si el id no existiera, sin tocar nada ([`specs/visibility`](../visibility/spec.md) R3 y R4). Sus descripciones MUST decir que sólo valen sobre las memorias propias y que lo compartido es de sólo lectura (`server.rs:1039-1092`).
 
 #### Escenario: borrar lo compartido
 - GIVEN una fila de A que B acaba de ver en `search_memory`
@@ -165,6 +165,6 @@ Las filas guardadas antes de que existiera compartir (`scope = 'agent'` y su `ag
 
 ## R9. No hay `enum Scope`
 
-No hay `enum Scope` en `clawg-core` ni su reexport. La columna `scope` y su CHECK (`crates/clawg-core/migrations/V1__init.sql:6-7`) siguen como están; `NewMemoryRecord` (`crates/clawg-core/src/memory/store_insert.rs:204`) sigue escribiendo `'agent'`.
+No hay `enum Scope` en `clawg-core` ni su reexport. La columna `scope` y su CHECK (`crates/clawg-core/migrations/V1__init.sql:6-7`) siguen como están; `NewMemoryRecord` (`crates/clawg-core/src/memory/store_insert.rs:115`) sigue escribiendo `'agent'`.
 
 **Test:** ninguno propio: compila y pasa la suite sin él.

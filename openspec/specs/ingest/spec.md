@@ -6,6 +6,7 @@ Fuente de verdad del comportamiento actual de la ingesta: el contrato de `POST /
 - [ingest-durability](../../changes/archive/2026-10-12-ingest-durability/proposal.md), archivado el 2026-10-12.
 - [project-indexing](../../changes/archive/2026-10-15-project-indexing/proposal.md), archivado el 2026-10-15 (sólo "Troceo del save").
 - [ingest-outbox](../../changes/archive/2026-10-15-ingest-outbox/proposal.md), archivado el 2026-10-15 (el outbox, el `operation_id` y el bloque `ingest` de `/health`; lo que el worker hace con una fila y el arranque y el apagado están en [`specs/storage`](../storage/spec.md), «Apagado sin pérdida»).
+- [memory-protocol](../../changes/archive/2026-10-17-memory-protocol/proposal.md), archivado el 2026-10-17 (sólo «El tipo de memoria se valida al guardar» y la fila del `400` en «Texto que ve el modelo»).
 
 ## Definiciones
 
@@ -25,7 +26,7 @@ Fuente de verdad del comportamiento actual de la ingesta: el contrato de `POST /
 
 ### Aceptar es durable
 
-Después de validar el pedido (contenido, `operation_id` y `derived_from`, cada uno un `400`) y de comprobar que el embedder no está `failed`, `POST /v1/memories` MUST pasar por `MemoryRuntime::accept` (`crates/clawg-core/src/runtime.rs:212`, llamado en `save_memory`, `api.rs:871`), que en este orden:
+Después de validar el pedido (contenido, `memory_type`, `operation_id` y `derived_from`, cada uno un `400`) y de comprobar que el embedder no está `failed`, `POST /v1/memories` MUST pasar por `MemoryRuntime::accept` (`crates/clawg-core/src/runtime.rs:212`, llamado en `save_memory`, `api.rs:871`), que en este orden:
 
 1. enmascara el contenido (ver [`specs/secrets`](../secrets/spec.md), R2): la fila guarda el texto ya enmascarado;
 2. escribe y confirma la fila del outbox (`outbox_record`, `crates/clawg-core/src/memory/outbox.rs:207`). El commit MUST hacerse con `synchronous = FULL` y la conexión MUST volver después a su valor (`durably`, `outbox.rs:182`): un save aceptado sobrevive también a un corte de luz, a costa de un fsync por save. El resto de la base, incluidos el progreso y el borrado final de la fila, sigue en `NORMAL`;
@@ -50,6 +51,31 @@ La fila MUST estar confirmada antes de encolar el evento y antes de responder `2
 - THEN el tercero responde `503 ingest_queue_full` y el outbox tiene 2 filas
 
 **Tests:** `a_save_accepted_while_the_model_loads_survives_a_process_that_dies` (`crates/clawg-core/tests/shutdown.rs`); `a_save_accepted_while_the_model_loads_is_in_the_outbox_before_the_answer`, `an_unconfirmed_save_is_in_the_outbox` y `a_save_into_a_full_queue_leaves_no_outbox_row` (`crates/clawg-cli/tests/api.rs`); `accept_writes_the_row_before_it_queues_the_event` y `a_refused_event_leaves_no_row` (`runtime.rs`, mod tests); `durably_writes_under_full_and_puts_the_setting_back` y `recording_a_row_leaves_the_store_on_normal` (`outbox.rs`, mod tests). Que `FULL` sobreviva a un corte de luz no tiene test: se prueba que el pragma se pone y se devuelve.
+
+### El tipo de memoria se valida al guardar
+
+Los tipos de memoria están en un solo lugar, `MemoryType::ALL` (`crates/clawg-core/src/memory/store_insert.rs:32`): `semantic_fact`, `user_preference`, `architectural_decision`, `session_summary`, `code_block`, `chat_message` y `tool_error`, en ese orden. La lista MUST ser exactamente lo que acepta `MemoryType::from_db_str` (`store_insert.rs:67`), que lee lo ya guardado y da `None` ante un valor desconocido. Un nombre que da quien llama se lee con `FromStr` (`store_insert.rs:88-94`), y uno desconocido es `UnknownMemoryType` (`store_insert.rs:81-84`), cuyo mensaje MUST nombrar el valor recibido y los siete tipos en ese orden:
+
+```
+unknown memory_type "preference"; expected one of semantic_fact, user_preference, architectural_decision, session_summary, code_block, chat_message, tool_error
+```
+
+`POST /v1/memories` con un `memory_type` que no es uno de los siete MUST responder `400` con ese mensaje (`save_memory`, `crates/clawg-cli/src/daemon/api.rs:817-821`), después de comprobar el contenido y antes de `check_operation_id` y del outbox: MUST NOT escribir la fila del outbox ni encolar el evento. Se valida en el handler y no en el worker porque el worker corre cuando quien guardó ya recibió su `201` o `202`, y un rechazo ahí no le llegaría. Un `memory_type` ausente MUST guardarse como `semantic_fact`, y uno válido como ese tipo. `PATCH /v1/memories/{kind}/{id}` rechaza con el mismo mensaje, porque `PatchError::UnknownType` envuelve el mismo error (`crates/clawg-core/src/memory/admin.rs:144`; [`specs/update`](../update/spec.md)): las dos rutas aceptan y rechazan las mismas cadenas.
+
+Una fila del outbox con un tipo desconocido, escrita antes de esta validación, MUST seguir guardándose como `semantic_fact` al reproducirse (`store_insert.rs:166-171`).
+
+#### Escenario: un tipo mal escrito
+- GIVEN un daemon sin worker
+- WHEN se guarda `{"content": "…", "agent_id": "a", "memory_type": "preference"}`
+- THEN responde `400`, el mensaje nombra `"preference"` y los siete tipos
+- AND el outbox queda vacío
+
+#### Escenario: las dos puertas
+- GIVEN las cadenas `preference`, `Semantic_Fact`, `""` y cada uno de los siete tipos
+- WHEN cada una se manda a `POST /v1/memories` y a `PATCH /v1/memories/memory/{id}`
+- THEN las dos rutas aceptan los siete tipos y rechazan las otras tres con `400`
+
+**Tests:** `every_listed_type_parses_back_to_itself` y `an_unknown_type_names_the_accepted_ones` (`store_insert.rs`, mod tests); `a_save_with_an_unknown_memory_type_is_refused_before_the_outbox` y `save_and_patch_accept_the_same_memory_types` (`crates/clawg-cli/tests/api.rs`); la reproducción, `explicit_source_with_an_unknown_type_override_falls_back_to_semantic_fact` (`store_insert.rs`, mod tests).
 
 ### Un save confirmado devuelve los ids
 
@@ -276,6 +302,7 @@ La espera tras el intento fallido `n` (1, 2, …) MUST ser `min(30 s · 2^(n-1),
 | `202 unconfirmed` | éxito | `accepted as operation <id> but not confirmed yet; memory_status lists it if it fails, list_memories shows it once stored` |
 | `202 embedder_loading` | éxito | `accepted as operation <id>; it will be stored once the embedding model finishes loading (memory_status lists it if it fails)` |
 | `202 already_queued` | éxito | `accepted as operation <id> earlier and still waiting to be stored` |
+| `400` (un `memory_type` desconocido, entre otros) | error | `not saved: <mensaje del daemon>`, por ejemplo `not saved: unknown memory_type "preference"; expected one of semantic_fact, …` |
 | `503 embedder_failed` | error | `not saved: the embedding model failed to load (<causa>)`, más `; clawg will retry` si es reintentable |
 | `500 ingest_failed` / `503 embedder_unavailable` | error | `not saved: <detalle>`, más `; partially saved as #…` si hubo filas |
 | `503 ingest_queue_full` | error | `not saved: the ingest queue is full; try again shortly` |
@@ -291,7 +318,7 @@ Los textos de un `202` MUST nombrar el `operation_id` (sin él, dicen sólo `acc
 - GIVEN el embedder `failed`
 - THEN `save_memory` devuelve un resultado de error que nombra la causa
 
-**Tests:** `save_outcome_text_covers_every_daemon_answer`, `save_memory_returns_the_id_that_delete_memory_accepts`, `save_memory_is_an_error_when_the_embedder_failed` y `explain_does_not_promise_search_when_the_embedder_failed` (`server.rs`, mod tests).
+**Tests:** `save_outcome_text_covers_every_daemon_answer`, `save_memory_returns_the_id_that_delete_memory_accepts`, `save_memory_is_an_error_when_the_embedder_failed`, `save_memory_says_an_unknown_type_was_not_saved` y `explain_does_not_promise_search_when_the_embedder_failed` (`server.rs`, mod tests).
 
 ### El cliente HTTP devuelve el resultado parseado
 

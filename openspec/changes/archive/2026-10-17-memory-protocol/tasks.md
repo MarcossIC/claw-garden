@@ -42,11 +42,11 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 ## 7. Verificación
 
 - [x] `cargo test --workspace` y el `clippy` de `.claude/CLAUDE.md` en Linux.
-- [ ] Lo mismo en Windows, en `target-test`.
-- [ ] Una sesión de Claude Code sobre el perfil dev, con autorización: el agente guarda una decisión y un bug según el protocolo, y un save con un tipo inventado vuelve con la lista.
-- [x] `verify.md`, con lo de Linux y lo pendiente.
+- [x] Lo mismo en Windows, en `target-test`.
+- [x] Una sesión de Claude Code sobre el perfil dev, con autorización: el agente guarda una decisión y un bug según el protocolo, y un save con un tipo inventado vuelve con la lista.
+- [x] `verify.md`, con Linux, Windows y el perfil dev.
 
 ## 8. Archive
 
-- [ ] Specs nuevas o actualizadas: `specs/mcp` (instrucciones, protocolo, enum), `specs/ingest` (el rechazo del tipo) y `specs/retrieval` (la nota en inglés). Cada una con su línea **Origen**.
-- [ ] `git mv` a `changes/archive/AAAA-MM-DD-memory-protocol`, `state.yaml` archivado, fila 22 del `README.md` de openspec y orden de ejecución. Subir el minor.
+- [x] Specs nuevas o actualizadas: `specs/mcp` (instrucciones, protocolo, enum), `specs/ingest` (el rechazo del tipo) y `specs/retrieval` (la nota en inglés). Cada una con su línea **Origen**.
+- [x] `git mv` a `changes/archive/AAAA-MM-DD-memory-protocol`, `state.yaml` archivado, fila 22 del `README.md` de openspec y orden de ejecución. Subir el minor.

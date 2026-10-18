@@ -2,15 +2,15 @@
 
 Fuente de verdad del comportamiento actual al corregir una memoria ya guardada: qué campos se pueden cambiar, cómo se valida el cambio, qué tier queda y qué exponen el daemon y el puente. El contenido no se cambia: para eso se guarda el texto nuevo y se borra el viejo. Qué filas puede cambiar cada agente está en [`specs/visibility`](../visibility/spec.md) (R3 y R4).
 
-**Origen:** [memory-update-tool](../../changes/archive/2026-10-14-memory-update-tool/proposal.md), archivado el 2026-10-14. Los ids de requisito son los de esa spec.
+**Origen:** [memory-update-tool](../../changes/archive/2026-10-14-memory-update-tool/proposal.md), archivado el 2026-10-14. Los ids de requisito son los de esa spec. [memory-protocol](../../changes/archive/2026-10-17-memory-protocol/proposal.md), archivado el 2026-10-17, sumó que el save y el cambio rechazan un tipo con el mismo mensaje y que el schema de `update_memory` declara los tipos.
 
 ## Definiciones
 
 - **Cambio:** un pedido con `importance`, `memory_type` o los dos, sobre una fila `(kind, id)`.
-- **Tipo efectivo de una fila:** su `memory_type` en `memory`; `'episodic_trajectory'` en `episodic_trajectory` y `'procedural_skill'` en `procedural_skill`, los mismos literales que usa el insert (`UPDATE_READ_*`, `crates/clawg-core/src/memory/admin.rs:188-193`).
+- **Tipo efectivo de una fila:** su `memory_type` en `memory`; `'episodic_trajectory'` en `episodic_trajectory` y `'procedural_skill'` en `procedural_skill`, los mismos literales que usa el insert (`UPDATE_READ_*`, `crates/clawg-core/src/memory/admin.rs:190-195`).
 - **Tier ganado** con una importancia `i` y un tipo efectivo `t`: `compute_tier(3, i, access_count, t)` (`crates/clawg-core/src/memory/tier.rs:22`), el tier que las reglas le dan a la fila sin contar nada más.
 - **Escala de importancia:** de 0 a 10 inclusive, la misma del save.
-- **Tipos conocidos:** `semantic_fact`, `user_preference`, `architectural_decision`, `session_summary`, `code_block`, `chat_message`, `tool_error` (`MemoryType`).
+- **Tipos conocidos:** `semantic_fact`, `user_preference`, `architectural_decision`, `session_summary`, `code_block`, `chat_message`, `tool_error` (`MemoryType::ALL`, `crates/clawg-core/src/memory/store_insert.rs:32`).
 
 ## R1. Qué cambio es válido
 
@@ -18,10 +18,10 @@ Un cambio MUST rechazarse, sin tocar la fila, cuando:
 
 - no trae ni `importance` ni `memory_type`;
 - `importance` no es un número finito dentro de la escala;
-- `memory_type` no es un tipo conocido;
+- `memory_type` no es un tipo conocido, con el mismo mensaje que da el save ([`specs/ingest`](../ingest/spec.md), «El tipo de memoria se valida al guardar»: `PatchError::UnknownType` envuelve `UnknownMemoryType`);
 - trae `memory_type` y `kind` no es `memory`.
 
-La validación es pura: `MemoryPatch::new` (`admin.rs:159`) devuelve `MemoryPatch` o un `PatchError` (`admin.rs:136`, `thiserror`) cuyo mensaje nombra el campo. A diferencia del save, una importancia fuera de escala MUST rechazarse, no recortarse: el save recorta lo que el agente estima al pasar, un cambio es una corrección explícita y recortarla en silencio diría "hecho" sobre un valor que nadie pidió.
+La validación es pura: `MemoryPatch::new` (`admin.rs:161`) devuelve `MemoryPatch` o un `PatchError` (`admin.rs:138`, `thiserror`) cuyo mensaje nombra el campo. A diferencia del save, una importancia fuera de escala MUST rechazarse, no recortarse: el save recorta lo que el agente estima al pasar, un cambio es una corrección explícita y recortarla en silencio diría "hecho" sobre un valor que nadie pidió.
 
 #### Escenario: fuera de escala
 - GIVEN una fila de `memory` con importancia 5
@@ -81,12 +81,12 @@ El workspace muestra `user_preference` y `architectural_decision` sólo con impo
 
 ## R3. Qué escribe un cambio
 
-Un cambio válido sobre una fila viva (`deleted_at IS NULL`) MUST, en una sola transacción (`update_memory_core`, `admin.rs:208`):
+Un cambio válido sobre una fila viva (`deleted_at IS NULL`) MUST, en una sola transacción (`update_memory_core`, `admin.rs:210`):
 
 - escribir los campos pedidos y dejar igual los que no;
 - escribir el tier de R2;
 - poner `last_modified_at` en ahora y sumar 1 a `update_count`;
-- devolver la fila como quedó (`UpdatedRow`, `admin.rs:179`): `id`, `kind`, `importance`, `memory_type` (sólo en `memory`) y `tier`.
+- devolver la fila como quedó (`UpdatedRow`, `admin.rs:181`): `id`, `kind`, `importance`, `memory_type` (sólo en `memory`) y `tier`.
 
 MUST NOT cambiar `status`, `access_count`, `last_accessed_at`, `superseded_by`, las disputas, la procedencia, el contenido ni el vector.
 
@@ -108,7 +108,7 @@ Sobre una fila que no existe, borrada o de otro agente cuando el cambio tiene sc
 - "No existe" (R3) MUST responder 404.
 - Un cambio hecho MUST responder 200 con `updated = 1` y `importance`, `memory_type` y `tier` de la fila como quedó.
 
-`DaemonClient::update` (`crates/clawg-cli/src/client.rs:753`) es el lado del cliente.
+`DaemonClient::update` (`crates/clawg-cli/src/client.rs:758`) es el lado del cliente.
 
 #### Escenario
 - GIVEN una memoria guardada por HTTP
@@ -121,14 +121,14 @@ Sobre una fila que no existe, borrada o de otro agente cuando el cambio tiene sc
 
 ## R5. Herramienta MCP `update_memory`
 
-El puente MUST exponer `update_memory` con `kind`, `id`, `importance` (opcional) y `memory_type` (opcional, con los tipos conocidos en la descripción del esquema) (`UpdateMemoryArgs`, `crates/clawg-cli/src/mcp/server.rs:246`), y MUST mandar siempre el agente que llama (`update_memory_impl`, `server.rs:645`).
+El puente MUST exponer `update_memory` con `kind`, `id`, `importance` (opcional) y `memory_type` (opcional; su schema declara los tipos conocidos como `enum`, ver [`specs/mcp`](../mcp/spec.md), «El schema de `memory_type` declara los tipos») (`UpdateMemoryArgs`, `crates/clawg-cli/src/mcp/server.rs:291`), y MUST mandar siempre el agente que llama (`update_memory_impl`, `server.rs:826`).
 
 - Sobre una fila propia, MUST devolver un texto que nombra el id y cómo quedaron importancia, tipo y tier (`format_update`, `crates/clawg-cli/src/mcp/tools.rs:139`): `updated #12 memory: user_preference, importance 8.0, tier 1`.
 - Sobre una fila de otro agente, MUST fallar como si el id no existiera ([`specs/visibility`](../visibility/spec.md) R3), y la fila MUST NOT cambiar.
 - Un cambio inválido MUST fallar con el mensaje de la validación.
-- La descripción (`server.rs:806`) MUST decir que es para cuando el usuario corrige la importancia o el tipo, y que para cambiar el contenido se guarda el nuevo y se borra el viejo.
+- La descripción (`server.rs:1070-1075`) MUST decir que es para cuando el usuario corrige la importancia o el tipo, y que para cambiar el contenido se guarda el nuevo y se borra el viejo.
 
-`save_memory` MUST nombrar `update_memory`: en su descripción, junto a `delete_memory` (`server.rs:731`), y en la respuesta de un refuerzo, que ya dice el id (`save_outcome_text`, `server.rs:442-443`).
+`save_memory` MUST nombrar `update_memory`: en su descripción, junto a `delete_memory` (`server.rs:950-958`), y en la respuesta de un refuerzo, que ya dice el id (`save_outcome_text`, `server.rs:528-532`).
 
 `tools/list` MUST listar `update_memory` entre sus herramientas; el conteo vigente, once, y la lista completa están en [`specs/mcp`](../mcp/spec.md).
 
