@@ -565,3 +565,38 @@ async fn a_test_that_fails_midway_leaves_no_daemon_holding_the_store() {
     let daemon = sandbox.serve().await;
     assert!(daemon.exit_status().is_none());
 }
+
+// ── Bytes after the executable ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn trailing_bytes_after_the_executable_image_do_not_change_execution() {
+    let sandbox = Sandbox::new();
+    let copy = sandbox.home.join(format!("clawg-copy{}", std::env::consts::EXE_SUFFIX));
+    let mut bytes = std::fs::read(BIN).expect("read the test binary");
+    bytes.push(0);
+    bytes.extend_from_slice(b"CLAWG-TEST-STAMP {\"version\":\"0.0.1\"}");
+    std::fs::write(&copy, bytes).expect("write the copy");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    let run = |bin: &Path, args: &[&str]| {
+        Command::new(bin)
+            .args(args)
+            .env("CLAWG_TEST_HOME", &sandbox.home)
+            .env_remove("CLAWG_PROFILE")
+            .current_dir(&sandbox.home)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run clawg")
+    };
+    for args in [&["--version"][..], &["status", "--profile", "dev"][..]] {
+        let original = run(Path::new(BIN), args);
+        let stamped = run(&copy, args);
+        assert_eq!(original.status.code(), stamped.status.code(), "{args:?}: {}", stderr_of(&stamped));
+        assert_eq!(original.stdout, stamped.stdout, "{args:?}");
+        assert_eq!(original.stderr, stamped.stderr, "{args:?}");
+    }
+}
