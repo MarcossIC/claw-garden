@@ -129,7 +129,7 @@ async fn answer_cases(
     let mut views = Vec::with_capacity(input.golden_set.retrieval_cases.len());
     for case in &input.golden_set.retrieval_cases {
         let started = Instant::now();
-        let hits = session
+        let found = session
             .client
             .search(SearchArgs {
                 query: case.query.clone(),
@@ -138,7 +138,7 @@ async fn answer_cases(
                 limit: None,
             })
             .await?;
-        let search_text = format_search(hits, AGENT_ID);
+        let search_text = format_search(found, AGENT_ID);
         let search_ms = elapsed_ms(started);
         let count_tokens = |line: &str| input.counter.count(line);
         let search_read = read_search(&search_text, &count_tokens, &case.expected_refs, corpus)

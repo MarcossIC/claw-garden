@@ -18,7 +18,7 @@ use clawg_core::memory::sharing::{Reach, SharingError, SharingPolicy};
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
 
-use crate::client::{Context, Health, Hit, MemoryRow, Restored, Retrieval, SavedText, Synthesis, Updated};
+use crate::client::{Context, Found, Health, Hit, MemoryRow, Restored, Retrieval, SavedText, Synthesis, Updated};
 use crate::daemon::api::DocsSearchBody;
 use crate::relevance::{shown_hits, RELEVANCE_RATIO};
 
@@ -64,9 +64,22 @@ pub fn relevant_hits(hits: Vec<Hit>) -> Vec<Hit> {
     hits.into_iter().zip(shown_hits(&scored, RELEVANCE_RATIO)).filter_map(|(h, shown)| shown.then_some(h)).collect()
 }
 
-/// What `search_memory` hands the model for a search's hits, as `reader`.
-pub fn format_search(hits: Vec<Hit>, reader: &str) -> String {
-    format_hits(&relevant_hits(hits), reader)
+/// How a search or a context opens when memories were searched and none came
+/// close enough to show: unlike "no memories found", there are memories.
+pub const NO_RELEVANT_MEMORIES: &str = "no relevant memories for this query";
+
+fn nothing_relevant(withheld: usize) -> String {
+    format!("{NO_RELEVANT_MEMORIES}: {withheld} searched, none close enough to show")
+}
+
+/// What `search_memory` hands the model for a search's answer, as `reader`.
+pub fn format_search(found: Found, reader: &str) -> String {
+    let returned = found.hits.len();
+    let hits = relevant_hits(found.hits);
+    if hits.is_empty() && returned + found.withheld > 0 {
+        return nothing_relevant(returned + found.withheld);
+    }
+    format_hits(&hits, reader)
 }
 
 /// The author of a hit `reader` did not save, if any. A hit without an author
@@ -342,11 +355,15 @@ fn synthesis_nudge(unreviewed: usize) -> Option<String> {
     })
 }
 
-/// Why memories were not searched, said before the context: a prompt holding
-/// only the workspace, or nothing, otherwise reads as "there are no memories".
+/// Why the context holds no memory, said before it: a prompt holding only the
+/// workspace, or nothing, otherwise reads as "there are no memories".
 fn retrieval_notice(retrieval: &Retrieval, has_context: bool) -> Option<String> {
     let why = match retrieval {
-        Retrieval::Searched | Retrieval::Unknown => return None,
+        Retrieval::Searched { hits: 0, withheld } if *withheld > 0 => {
+            let shown = if has_context { "only the workspace is shown below" } else { "the workspace is empty" };
+            return Some(format!("{}; {shown}.", nothing_relevant(*withheld)));
+        }
+        Retrieval::Searched { .. } | Retrieval::Unknown => return None,
         Retrieval::EmbedderNotReady => {
             "the embedding model is still loading; call again in a minute".to_string()
         }
@@ -491,6 +508,11 @@ mod tests {
         scores.iter().enumerate().map(|(i, &s)| hit(i as i64 + 1, "Memory", "semantic_fact", 3, s, "x")).collect()
     }
 
+    /// A search answer that held nothing back.
+    fn shown(hits: Vec<Hit>) -> Found {
+        Found { hits, withheld: 0 }
+    }
+
     fn ids(hits: &[Hit]) -> Vec<i64> {
         hits.iter().map(|h| h.id).collect()
     }
@@ -503,7 +525,7 @@ mod tests {
 
     #[test]
     fn the_search_output_shows_only_the_relevant_hits() {
-        let text = format_search(scored(&[0.50, 0.10, 0.05]), "a");
+        let text = format_search(shown(scored(&[0.50, 0.10, 0.05])), "a");
         assert!(text.contains("#1 ") && text.contains("#2 "), "{text}");
         assert!(!text.contains("#3 "), "{text}");
     }
@@ -522,7 +544,7 @@ mod tests {
             hit(2, "Memory", "semantic_fact", 3, 0.30, "ledger import"),
             hit(3, "Memory", "semantic_fact", 3, 0.25, "ledger lock"),
         ];
-        let out = format_search(hits, "cursor");
+        let out = format_search(shown(hits), "cursor");
         assert!(out.starts_with("1. #1 [Memory/code_block/t3 score=1.40 by claude-code] kept parseLedger4821"), "{out}");
         assert!(out.contains("3. #3 "), "{out}");
     }
@@ -554,6 +576,18 @@ mod tests {
         let out = format_hits(&[shared], "cursor");
         assert!(out.starts_with("1. #68 [Memory/architectural_decision/t2 score=0.56 by claude-code] clawg export"), "{out}");
         assert!(!out.contains("topic="), "{out}");
+    }
+
+    #[test]
+    fn search_says_when_nothing_was_relevant() {
+        let sentence = |n: usize| format!("no relevant memories for this query: {n} searched, none close enough to show");
+        assert_eq!(format_search(Found { hits: Vec::new(), withheld: 3 }, "a"), sentence(3), "the daemon cut them all");
+        assert_eq!(format_search(Found { hits: scored(&[0.0, 0.0]), withheld: 1 }, "a"), sentence(3), "the bridge cut the rest");
+    }
+
+    #[test]
+    fn nothing_stored_is_not_called_irrelevant() {
+        assert_eq!(format_search(shown(Vec::new()), "a"), "no memories found");
     }
 
     #[test]
@@ -928,12 +962,27 @@ mod tests {
             assert!(empty.starts_with("Memories were not searched"), "{empty}");
             assert!(!empty.contains("no context yet"), "an empty workspace is not an empty memory: {empty}");
         }
-        assert_eq!(recall("=== WORKSPACE ===\n- tabs", Retrieval::Searched), "=== WORKSPACE ===\n- tabs");
+        let searched = Retrieval::Searched { hits: 1, withheld: 2 };
+        assert_eq!(recall("=== WORKSPACE ===\n- tabs", searched), "=== WORKSPACE ===\n- tabs");
+    }
+
+    #[test]
+    fn recall_says_when_nothing_was_relevant() {
+        let recall = |prompt: &str| {
+            let retrieval = Some(Retrieval::Searched { hits: 0, withheld: 2 });
+            format_recall(&Context { prompt: prompt.into(), unreviewed: 0, retrieval })
+        };
+        let sentence = "no relevant memories for this query: 2 searched, none close enough to show";
+        assert_eq!(
+            recall("=== WORKSPACE ===\n- tabs"),
+            format!("{sentence}; only the workspace is shown below.\n\n=== WORKSPACE ===\n- tabs")
+        );
+        assert_eq!(recall(""), format!("{sentence}; the workspace is empty."));
     }
 
     #[test]
     fn an_old_daemon_gets_no_invented_notice() {
-        for retrieval in [None, Some(Retrieval::Unknown)] {
+        for retrieval in [None, Some(Retrieval::Unknown), Some(Retrieval::Searched { hits: 0, withheld: 0 })] {
             let context = Context { prompt: String::new(), unreviewed: 0, retrieval };
             assert_eq!(format_recall(&context), "no context yet");
         }
@@ -1145,7 +1194,7 @@ mod tests {
             by(hit(1, "Memory", "semantic_fact", 2, 0.80, "propia"), "cursor"),
             by(hit(2, "Memory", "semantic_fact", 3, 0.70, "ajena"), "claude-code"),
         ];
-        let out = format_search(hits, "cursor");
+        let out = format_search(shown(hits), "cursor");
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "1. #1 [Memory/semantic_fact/t2 score=0.80] propia");
         assert_eq!(lines[1], "2. #2 [Memory/semantic_fact/t3 score=0.70 by claude-code] ajena");
@@ -1157,7 +1206,7 @@ mod tests {
     fn format_search_leaves_own_hits_alone() {
         let own = vec![by(hit(1, "Memory", "semantic_fact", 2, 0.80, "propia"), "cursor"), hit(2, "Memory", "semantic_fact", 3, 0.70, "vieja")];
         assert_eq!(
-            format_search(own, "cursor"),
+            format_search(shown(own), "cursor"),
             "1. #1 [Memory/semantic_fact/t2 score=0.80] propia\n2. #2 [Memory/semantic_fact/t3 score=0.70] vieja"
         );
     }

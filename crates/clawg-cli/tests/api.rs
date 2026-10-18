@@ -1072,6 +1072,27 @@ async fn search_applies_the_requested_relative_cut() {
     assert_eq!(hit_ids(&cut), hit_ids(&full)[..expected_len]);
 }
 
+/// Under the fake model a text other than the query lands at a cosine near 0,
+/// below the floor, so every row here scores 0.
+#[tokio::test]
+async fn search_withholds_hits_that_did_not_score() {
+    let h = Harness::start().await;
+    seed_winner_and_tail(&h).await;
+    let query = "which port does the staging proxy listen on";
+
+    let (status, cut) = h
+        .post_json("/v1/search", json!({ "query": query, "agent_id": "agent-cut", "min_relative_score": 0.35 }))
+        .await;
+    assert_eq!(status, 200, "{cut}");
+    assert_eq!(cut["hits"], json!([]), "{cut}");
+    assert_eq!(cut["withheld"], 4, "{cut}");
+
+    let (status, full) = h.post_json("/v1/search", json!({ "query": query, "agent_id": "agent-cut" })).await;
+    assert_eq!(status, 200, "{full}");
+    assert_eq!(hit_ids(&full).len(), 4, "without a cut every hit comes back: {full}");
+    assert_eq!(full["withheld"], 0, "{full}");
+}
+
 const IDENTIFIER_QUERY: &str = "how does parseLedger4821 load the nightly batch";
 const IDENTIFIER_ROW: &str = "We kept `parseLedger4821` on the old import path.";
 const RELATED_ROWS: [&str; 3] = [
@@ -1213,7 +1234,7 @@ async fn context_says_whether_memories_were_searched() {
     let h = Harness::start().await;
     let (status, body) = ask(&h).await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(body["retrieval"], json!({ "state": "searched" }));
+    assert_eq!(body["retrieval"], json!({ "state": "searched", "hits": 0, "withheld": 0 }));
 
     for h in [Harness::start_without_embedder().await, Harness::start_unloaded(true).await] {
         let (status, body) = ask(&h).await;
@@ -1231,6 +1252,26 @@ async fn context_says_whether_memories_were_searched() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["retrieval"]["state"], "search_failed", "{body}");
     assert!(body["retrieval"]["detail"].as_str().is_some_and(|d| d.contains("onnx session crashed")), "{body}");
+}
+
+/// Under the fake model only the row identical to the query scores; the
+/// others land below the cosine floor.
+#[tokio::test]
+async fn context_says_how_many_hits_it_withheld() {
+    let h = Harness::start().await;
+    seed_winner_and_tail(&h).await;
+    let ask = |query: &'static str| {
+        let h = &h;
+        async move { h.post_json("/v1/context", json!({ "query": query, "agent_id": "agent-cut" })).await }
+    };
+
+    let (status, body) = ask(CONTENT).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["retrieval"], json!({ "state": "searched", "hits": 1, "withheld": 3 }));
+
+    let (status, body) = ask("which port does the staging proxy listen on").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["retrieval"], json!({ "state": "searched", "hits": 0, "withheld": 4 }));
 }
 
 /// Standing preferences are never cut, so a workspace of many long ones

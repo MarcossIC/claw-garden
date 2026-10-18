@@ -93,7 +93,10 @@ impl<'a> QueryTexts<'a> {
 /// memories" unless the caller says otherwise.
 #[derive(Debug)]
 pub enum Retrieval {
-    Searched,
+    /// `hits` went into the prompt, before the budget; `withheld` scored 0
+    /// and were left out, so a prompt without hits can tell "nothing came
+    /// close" from "nothing is stored".
+    Searched { hits: usize, withheld: usize },
     NoEmbedder,
     EmbedFailed(EmbedError),
     SearchFailed(String),
@@ -179,7 +182,9 @@ pub async fn build_memory_prompt(
     // gets. The per-table pools (30/5/5) are the real ceiling, so this only
     // ever spends candidates that were already fetched.
     let k_request = K_FINAL.saturating_add(emitted.len());
-    let (mut hits, retrieval): (Vec<RankedHit>, Retrieval) = match embedder {
+    // `None` is a search that ran; its counts are known only once the hits are
+    // filtered below.
+    let (mut hits, failure): (Vec<RankedHit>, Option<Retrieval>) = match embedder {
         // Query: the composed (or, absent composition, raw) text is the thing
         // being searched FOR on the dense side; the lexical/FTS5 side always
         // gets the raw text — see `QueryTexts`'s doc comment for why the two
@@ -196,26 +201,33 @@ pub async fn build_memory_prompt(
                 )
                 .await
                 {
-                    Ok(h) => (h, Retrieval::Searched),
+                    Ok(h) => (h, None),
                     Err(e) => {
                         log::warn!("search_all_memories failed: {e}; no retrieval hits this turn");
-                        (Vec::new(), Retrieval::SearchFailed(e.to_string()))
+                        (Vec::new(), Some(Retrieval::SearchFailed(e.to_string())))
                     }
                 }
             }
             Err(e) => {
                 log::warn!("embedder.embed failed: {e}; no retrieval hits this turn");
-                (Vec::new(), Retrieval::EmbedFailed(e))
+                (Vec::new(), Some(Retrieval::EmbedFailed(e)))
             }
         },
         None => {
             log::warn!("embedder not ready; retrieval skipped this turn (agent_id={agent_id})");
-            (Vec::new(), Retrieval::NoEmbedder)
+            (Vec::new(), Some(Retrieval::NoEmbedder))
         }
     };
     hits.retain(|h| !emitted.contains(h.kind, h.id));
+    // A hit at 0 is below the cosine floor without an identifier match: it came
+    // back only because the pool had room for it, and printing it would hand
+    // the model an unrelated row as context, and its conflicts with it.
+    let pooled = hits.len();
+    hits.retain(|h| h.score > 0.0);
+    let withheld = pooled - hits.len();
     hits.truncate(K_FINAL);
     let hits = hits;
+    let retrieval = failure.unwrap_or(Retrieval::Searched { hits: hits.len(), withheld });
 
     // Tier-1 coverage logging — the real measure of the "Tier 1 covers 80%"
     // criterion (workspace_content presence alone, or hit count alone, can't
@@ -1442,7 +1454,7 @@ mod tests {
         let broken = recall(Some(Arc::new(BrokenEmbedder))).await;
         assert!(matches!(broken, Retrieval::EmbedFailed(EmbedError::InferenceFailed(_))), "{broken:?}");
         let working = recall(Some(Arc::new(RecordingEmbedder { calls: std::sync::Mutex::new(Vec::new()) }))).await;
-        assert!(matches!(working, Retrieval::Searched), "{working:?}");
+        assert!(matches!(working, Retrieval::Searched { .. }), "{working:?}");
     }
 
     #[tokio::test]
@@ -1582,8 +1594,10 @@ mod tests {
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
         let embedder = Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>;
-        let fake_vec = embedder.embed_with_role("dummy", EmbedRole::Passage).await.unwrap();
-        let fake_bytes = crate::memory::search::serialize_f32_query_pub(&fake_vec);
+        // The query's own vector at unit length, as every insert path stores
+        // one, so each row scores above 0 and earns its place in the prompt.
+        let fake_vec = embedder.embed_with_role("some query", EmbedRole::Passage).await.unwrap();
+        let fake_bytes = unit_bytes(&fake_vec);
 
         let now_ms: i64 = TimestampMs::now().as_millis_i64();
 
@@ -2289,10 +2303,11 @@ mod tests {
         assert_eq!(memory_access_state(&store, hit).await.0, 1);
     }
 
-    /// A row that only fills a slot is shown, but the query did not find it,
-    /// so it must not gain the access that resets its decay.
+    /// A row below the cosine floor came back only because the pool had room
+    /// for it: it is not shown, and it gains no access that would reset its
+    /// decay.
     #[tokio::test(start_paused = true)]
-    async fn recall_does_not_count_zero_score_hits_as_accesses() {
+    async fn recall_leaves_out_hits_that_did_not_score() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
@@ -2321,12 +2336,59 @@ mod tests {
             DEFAULT_BUDGET,
         )
         .await
-        .unwrap().text;
-        assert!(prompt.contains("filler"), "a zero-score hit still fills the prompt: {prompt}");
+        .unwrap();
+        assert!(prompt.text.contains("witness"), "{}", prompt.text);
+        assert!(!prompt.text.contains("filler"), "a hit that did not score fills no slot: {}", prompt.text);
+        assert!(matches!(prompt.retrieval, Retrieval::Searched { hits: 1, withheld: 1 }), "{:?}", prompt.retrieval);
 
         force_flush_until_counted(&store, witness).await;
 
         assert_eq!(memory_access_state(&store, filler).await, before);
+    }
+
+    #[tokio::test]
+    async fn a_hit_that_did_not_score_brings_no_conflict() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let embedder = Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>;
+        let agent = "agent-unrelated-conflict";
+
+        let mut like_query = vec![0.0_f32; 384];
+        like_query[0] = 1.0;
+        let mut unrelated = vec![0.0_f32; 384];
+        unrelated[1] = 1.0;
+        seed_memory(&store, agent, "witness", "chat_message", 3, 5.0, unit_bytes(&like_query)).await;
+        let old = seed_memory(&store, agent, "old side", "semantic_fact", 3, 5.0, unit_bytes(&unrelated)).await;
+        let new = seed_memory(&store, agent, "new side", "semantic_fact", 3, 5.0, unit_bytes(&unrelated)).await;
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE memory SET status = 'disputed', disputed_against = json_array(?1) WHERE id = ?2",
+                    rusqlite::params![old, new],
+                )
+            })
+            .await
+            .unwrap();
+
+        let prompt = build_memory_prompt(
+            &store,
+            &wm,
+            Some(embedder),
+            agent,
+            None,
+            &Reach::Own,
+            QueryTexts::single_shot("witness"),
+            &EmittedIds::default(),
+            None,
+            DEFAULT_BUDGET,
+        )
+        .await
+        .unwrap()
+        .text;
+        assert!(prompt.contains("witness"), "{prompt}");
+        assert!(!prompt.contains(SEP_CONFLICTS), "a pair unrelated to the query stays out: {prompt}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -2419,8 +2481,10 @@ mod tests {
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
         let embedder = Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>;
-        let fake_vec = embedder.embed_with_role("dummy", EmbedRole::Passage).await.unwrap();
-        let fake_bytes = crate::memory::search::serialize_f32_query_pub(&fake_vec);
+        // The query's own vector at unit length, as every insert path stores
+        // one, so each row scores above 0 and earns its place in the prompt.
+        let fake_vec = embedder.embed_with_role("some query", EmbedRole::Passage).await.unwrap();
+        let fake_bytes = unit_bytes(&fake_vec);
 
         let now_ms: i64 = TimestampMs::now().as_millis_i64();
 

@@ -31,7 +31,7 @@ const NO_HITS: &str = "no memories found";
 
 /// Splits `format_search` output into its lines.
 pub fn parse_search_output(text: &str) -> Result<Vec<SearchLine>, ParseError> {
-    if text.trim() == NO_HITS {
+    if text.trim() == NO_HITS || text.starts_with(clawg_cli::mcp::tools::NO_RELEVANT_MEMORIES) {
         return Ok(Vec::new());
     }
     text.lines()
@@ -169,6 +169,15 @@ mod tests {
     #[test]
     fn the_empty_result_sentence_parses_to_no_lines() {
         assert!(parse_search_output("no memories found").unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_abstention_sentence_parses_to_no_lines() {
+        let text = clawg_cli::mcp::tools::format_search(
+            clawg_cli::client::Found { hits: Vec::new(), withheld: 3 },
+            "agent",
+        );
+        assert!(parse_search_output(&text).unwrap().is_empty(), "{text}");
     }
 
     #[test]

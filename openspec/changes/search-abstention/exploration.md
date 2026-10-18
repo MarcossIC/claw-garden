@@ -143,17 +143,17 @@ El agente ya ve el `score=` de cada línea (`tools.rs:93-101`).
 
 ## Decisiones abiertas
 
-Son del usuario.
+Tomadas en la [propuesta](proposal.md#decisiones): sólo C, sin constante nueva; la frase de abstención sin sugerencia; la puerta calibrada (A) queda para un cambio aparte, y con ella las preguntas sobre la puerta.
 
-- [ ] **¿Se entrega C solo y A después, o se espera a 33 y 34 para todo?** Recomendado: C ahora.
+- [x] **¿Se entrega C solo y A después, o se espera a 33 y 34 para todo?** C ahora.
 - [ ] **Sobre qué se pone la puerta de A:** el score final (A1) o la relevancia antes de decaimiento e importancia (A2).
 - [ ] **Cómo se calibra:** valor fijo con partición calibración y prueba, o un porcentil de las consultas sin respuesta; y qué margen se acepta respecto del mínimo observado.
 - [ ] **Pre-compromiso de aceptación.** Propuesta a discutir: abstención correcta de al menos 16 de 20 sin respuesta (cota inferior de Wilson publicada) y `found` de `search_memory` con respuesta de al menos 34/46 (hoy 36/46, con dos casos de tolerancia, no distinguibles del ruido según 33).
 - [ ] **¿La puerta puede bajar el mínimo de 2 hits?** Cada respuesta perdida cuesta 2,2 puntos; la tabla muestra 3 de 4 consultas con sólo 2 líneas que tienen la respuesta.
-- [ ] **Texto exacto de la frase de abstención** (inglés, como el resto de las herramientas) y si lleva sugerencia («guardá lo que aprendas»).
+- [x] **Texto exacto de la frase de abstención** (inglés, como el resto de las herramientas) y si lleva sugerencia («guardá lo que aprendas»).
 - [ ] **Dónde se mide:** en el ranking del core (scores crudos, para calibrar) o en agent-view (lo que ve el agente, para aceptar). Se inclina a las dos, con cada una en su papel.
 - [ ] **Dónde vive la función:** moverla a `clawg-core` o pasar el valor como argumento a `build_memory_prompt`.
-- [ ] **¿Se aplica también a las filas del workspace?** Hoy el workspace se entrega entero y no depende de la consulta; este cambio no lo toca.
+- [x] **¿Se aplica también a las filas del workspace?** Hoy el workspace se entrega entero y no depende de la consulta; este cambio no lo toca.
 
 ## Cómo se mide
 

@@ -576,6 +576,9 @@ impl From<SavedChunk> for SavedMemory {
 #[derive(Debug, Serialize)]
 pub struct SearchBody {
     pub hits: Vec<RankedHit>,
+    /// Hits the relevance cut kept back, so a caller handed none can tell
+    /// "nothing came close" from "nothing is stored".
+    pub withheld: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -592,7 +595,8 @@ pub struct ContextBody {
 #[derive(Debug, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum RetrievalState {
-    Searched,
+    /// `hits` went into the prompt; `withheld` scored 0 and were left out.
+    Searched { hits: usize, withheld: usize },
     EmbedderNotReady,
     EmbedderFailed { detail: String, retryable: bool },
     SearchFailed { detail: String },
@@ -603,7 +607,7 @@ impl RetrievalState {
     /// a search, so the two never disagree on why memories cannot be reached.
     fn of(retrieval: Retrieval, status: EmbedderStatus) -> Self {
         match retrieval {
-            Retrieval::Searched => Self::Searched,
+            Retrieval::Searched { hits, withheld } => Self::Searched { hits, withheld },
             Retrieval::NoEmbedder => match status {
                 EmbedderStatus::Failed { error, retryable } => Self::EmbedderFailed { detail: error, retryable },
                 EmbedderStatus::Loading | EmbedderStatus::Ready => Self::EmbedderNotReady,
@@ -1054,13 +1058,15 @@ async fn search(
     // The cut runs before recording: a hit the caller never receives was not
     // retrieved for it, and counting it would feed the ranking a row the
     // agent never read.
+    let found = hits.len();
     if let Some(ratio) = min_relative_score {
         let scored: Vec<(f64, bool)> = hits.iter().map(|h| (h.score, h.exact)).collect();
         hits = hits.into_iter().zip(shown_hits(&scored, ratio)).filter_map(|(h, shown)| shown.then_some(h)).collect();
     }
     app.runtime.access_tracker.record_hits(&hits);
 
-    Ok(Json(SearchBody { hits }))
+    let withheld = found - hits.len();
+    Ok(Json(SearchBody { hits, withheld }))
 }
 
 /// Whose memories `reader` may read, from the policy in the data directory,

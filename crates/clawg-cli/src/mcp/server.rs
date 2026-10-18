@@ -756,7 +756,7 @@ impl ClawgMcp {
             })
             .await;
         match result {
-            Ok(Ok(hits)) => Self::ok(format_search(hits, agent_id)),
+            Ok(Ok(found)) => Self::ok(format_search(found, agent_id)),
             Ok(Err(e)) => Self::failed(Self::explain(&e)),
             Err(failure) => Ok(failure),
         }
@@ -1830,7 +1830,14 @@ mod tests {
         let listed = text(&b.list_memories_impl(&agent, list_all()).await.expect("list"));
         assert!(listed.contains("release branch"), "{listed}");
         let context = b
-            .recall_context_impl(&agent, RecallContextArgs { query: "release branch".into(), project_path: None, budget: None })
+            .recall_context_impl(
+                &agent,
+                RecallContextArgs {
+                    query: "the release branch is cut on the first monday".into(),
+                    project_path: None,
+                    budget: None,
+                },
+            )
             .await
             .expect("recall");
         assert!(text(&context).contains("ask before force-pushing"), "{}", text(&context));
@@ -2713,6 +2720,17 @@ mod tests {
         assert_eq!(text(&r), "no memories found");
     }
 
+    /// Under the fake model a text other than the query scores 0, so the
+    /// stored row is searched and none is close enough to show.
+    #[tokio::test]
+    async fn search_memory_tells_nothing_relevant_from_nothing_stored() {
+        let (b, _d) = bridge().await;
+        saved_id(&b, "agent-mcp", "the release branch is cut on thursdays").await;
+        let r = b.search_memory_impl("agent-mcp", search_args("which port does the proxy use")).await.expect("search");
+        assert!(!is_error(&r), "nothing relevant is not an error");
+        assert_eq!(text(&r), "no relevant memories for this query: 1 searched, none close enough to show");
+    }
+
     #[tokio::test]
     async fn memory_status_reports_the_daemon_and_the_profile() {
         let (b, _d) = bridge().await;
@@ -3308,11 +3326,12 @@ mod tests {
     #[tokio::test]
     async fn recall_context_passes_its_budget() {
         let (b, _d) = bridge().await;
-        saved_id(&b, "agent-mcp", &"the release script tags every crate before it publishes. ".repeat(10)).await;
+        let content = "the release script tags every crate before it publishes. ".repeat(10);
+        saved_id(&b, "agent-mcp", &content).await;
         let recall = |budget| {
-            let b = &b;
+            let (b, content) = (&b, &content);
             async move {
-                let args = RecallContextArgs { query: "release script".into(), project_path: None, budget };
+                let args = RecallContextArgs { query: content.clone(), project_path: None, budget };
                 text(&b.recall_context_impl("agent-mcp", args).await.expect("recall"))
             }
         };
@@ -3328,12 +3347,14 @@ mod tests {
     #[tokio::test]
     async fn a_hit_cut_by_the_budget_is_readable_whole() {
         let (b, _d) = bridge().await;
-        let first = "the deploy job runs on every tag pushed to the release branch";
-        let second = format!("the deploy job {}", "waits for the database migration to finish and then ".repeat(12));
+        // Both hold the identifier the query names, so both score under the
+        // fake embedder, whose vectors only match an identical text.
+        let first = "deploy_job runs on every tag pushed to the release branch";
+        let second = format!("deploy_job {}", "waits for the database migration to finish and then ".repeat(12));
         saved_id(&b, "agent-mcp", first).await;
         let cut_id = saved_id(&b, "agent-mcp", &second).await;
 
-        let args = RecallContextArgs { query: "the deploy job".into(), project_path: None, budget: Some(400) };
+        let args = RecallContextArgs { query: "deploy_job".into(), project_path: None, budget: Some(400) };
         let recalled = text(&b.recall_context_impl("agent-mcp", args).await.expect("recall"));
         let named = format!("#{cut_id}");
         let note = recalled.split("=== BUDGET ===").nth(1).unwrap_or_else(|| panic!("a cut is said: {recalled}"));
@@ -3423,6 +3444,9 @@ mod tests {
         let store = store.expect("store");
         let content = "the previous version saved that payments run on stripe";
         let embedding = FakeEmbedder::default().embed_with_role(content, EmbedRole::Passage).await.expect("embed");
+        // Unit length, as every insert path stores it: a raw vector sits
+        // farther than any cosine from the query and would score 0.
+        let embedding = clawg_core::memory::vector::to_unit(&embedding).expect("unit");
         let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
         let snapshot = |store: Arc<clawg_core::memory::MemoryStore>| async move {
             store
