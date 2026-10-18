@@ -252,20 +252,20 @@ El orden es también el de menor riesgo: lo irreversible (reemplazar el binario 
 
 ## Decisiones abiertas
 
-Son del usuario.
+Resueltas el 2026-10-18, cada una con la opción recomendada; detalle en la [propuesta](proposal.md#decisiones).
 
-- [ ] **`authors`.** `Cargo.toml:7` nombra una persona. ¿Pasa a «The Claw Garden contributors» o se quita?
-- [ ] **TLS.** ¿`rustls` con raíces del sistema en las dos plataformas (recomendado), `rustls` sólo en Linux, o dejar OpenSSL y declarar la dependencia?
-- [ ] **Runner de Linux.** ¿`ubuntu-latest` o uno fijo más viejo? ¿Se escribe la glibc mínima en el README?
-- [ ] **VC++ Redistributable.** ¿El bootstrap sólo avisa (recomendado), lo instala, o se distribuyen las DLL junto al `.exe`?
-- [ ] **Formato de los assets.** ¿Binarios sueltos (recomendado, sin dependencias) o comprimidos?
-- [ ] **Dónde vive el script de arranque.** ¿Adjunto al release (recomendado) o crudo desde `main`?
-- [ ] **Perfil.** ¿`update` actúa sólo sobre `prod`, o acepta `--profile`? ¿Qué hace si el daemon del otro perfil corre?
-- [ ] **Linux y macOS.** ¿`update` funciona en Linux sin instalador (reemplazando el binario donde esté), y qué hace con una ruta sin permiso? macOS no entra (CI no lo prueba; `ort-sys` sólo trae `aarch64`).
-- [ ] **Clave de firma.** ¿Una sola o lista de claves aceptadas desde el primer día? ¿Un *environment* con revisión obligatoria para el secreto?
-- [ ] **Release de `main` actual.** El primer disparo publica `v0.18.0` (no hay tags). ¿Se acepta, o se sube la versión antes?
-- [ ] **División.** ¿Los tres tramos de arriba, y si es así, ¿cada uno es un cambio de openspec o uno solo con tareas?
-- [ ] **Poda de snapshots.** ¿Se cierra antes de este cambio o junto con él?
+- [x] **`authors`.** `Cargo.toml:7` nombra una persona. ¿Pasa a «The Claw Garden contributors» o se quita? → Pasa a «The Claw Garden contributors», también titular de la licencia MIT.
+- [x] **TLS.** ¿`rustls` con raíces del sistema en las dos plataformas (recomendado), `rustls` sólo en Linux, o dejar OpenSSL y declarar la dependencia? → `rustls-tls-native-roots` en las dos, fijado en la raíz del workspace.
+- [x] **Runner de Linux.** ¿`ubuntu-latest` o uno fijo más viejo? ¿Se escribe la glibc mínima en el README? → `ubuntu-22.04` fijo, y el README declara la glibc mínima.
+- [x] **VC++ Redistributable.** ¿El bootstrap sólo avisa (recomendado), lo instala, o se distribuyen las DLL junto al `.exe`? → El bootstrap lo detecta y dice cómo instalarlo; no lo instala ni distribuye DLL.
+- [x] **Formato de los assets.** ¿Binarios sueltos (recomendado, sin dependencias) o comprimidos? → Binarios sueltos, con `SHA256SUMS` y su `.minisig`.
+- [x] **Dónde vive el script de arranque.** ¿Adjunto al release (recomendado) o crudo desde `main`? → Adjunto a cada release, en `releases/latest/download/install.ps1`.
+- [x] **Perfil.** ¿`update` actúa sólo sobre `prod`, o acepta `--profile`? ¿Qué hace si el daemon del otro perfil corre? → Sólo `prod`; se niega en un build debug o desde un binario dentro de un target de cargo.
+- [x] **Linux y macOS.** ¿`update` funciona en Linux sin instalador (reemplazando el binario donde esté), y qué hace con una ruta sin permiso? macOS no entra (CI no lo prueba; `ort-sys` sólo trae `aarch64`). → En Linux reemplaza el binario donde está y, sin permiso de escritura, falla con un mensaje claro, nunca con `sudo`.
+- [x] **Clave de firma.** ¿Una sola o lista de claves aceptadas desde el primer día? ¿Un *environment* con revisión obligatoria para el secreto? → Lista de claves desde el primer día; el secreto en un environment `release` limitado a `main`, sin revisores obligatorios.
+- [x] **Release de `main` actual.** El primer disparo publica `v0.18.0` (no hay tags). ¿Se acepta, o se sube la versión antes? → No se publica `v0.18.0`: el primer release es la versión que sube el archivo de este cambio, que llega a `main` junto con el bump.
+- [x] **División.** ¿Los tres tramos de arriba, y si es así, ¿cada uno es un cambio de openspec o uno solo con tareas? → Un solo cambio de openspec con tres tandas de tareas.
+- [x] **Poda de snapshots.** ¿Se cierra antes de este cambio o junto con él? → Antes, como fix aparte de patch.
 
 ## Cómo se mide
 
