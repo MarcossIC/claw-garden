@@ -38,9 +38,10 @@ pub fn read_history(c: &rusqlite::Connection) -> rusqlite::Result<Vec<MigrationI
     rows.collect()
 }
 
-/// The migrations embedded in this binary.
+/// The migrations embedded in this binary; a `testing` build stamped with a
+/// cap knows only up to it.
 pub fn known_migrations() -> Vec<MigrationId> {
-    crate::memory::migrations::runner()
+    let all = crate::memory::migrations::runner()
         .get_migrations()
         .iter()
         .map(|m| MigrationId {
@@ -48,7 +49,16 @@ pub fn known_migrations() -> Vec<MigrationId> {
             name: m.name().to_string(),
             checksum: m.checksum(),
         })
-        .collect()
+        .collect();
+    capped(all, crate::build_info::migrations_up_to())
+}
+
+/// `migrations` without those past `up_to`.
+fn capped(migrations: Vec<MigrationId>, up_to: Option<i32>) -> Vec<MigrationId> {
+    match up_to {
+        Some(newest) => migrations.into_iter().filter(|m| m.version <= newest).collect(),
+        None => migrations,
+    }
 }
 
 /// The newest migration this binary knows, so tests do not assume a count
@@ -603,6 +613,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_cap_hides_the_migrations_past_it() {
+        let all: Vec<MigrationId> = (1..=5).map(|v| MigrationId { version: v, name: format!("m{v}"), checksum: v as u64 }).collect();
+
+        assert_eq!(capped(all.clone(), None), all);
+        assert_eq!(capped(all.clone(), Some(5)), all);
+        let versions: Vec<i32> = capped(all.clone(), Some(3)).iter().map(|m| m.version).collect();
+        assert_eq!(versions, [1, 2, 3]);
+        assert!(capped(all, Some(0)).is_empty());
+    }
+
     #[tokio::test]
     async fn a_snapshot_includes_writes_still_in_the_wal() {
         let dir = tempfile::tempdir().unwrap();
@@ -926,6 +947,38 @@ mod tests {
             .collect();
         assert!(reasons.contains(&Some(Reason::PreMigration)), "{reasons:?}");
         assert!(reasons.contains(&Some(Reason::PreRestore)), "{reasons:?}");
+    }
+
+    #[tokio::test]
+    async fn restoring_over_a_store_migrated_by_a_newer_version_keeps_it_as_pre_restore() {
+        let older = tempfile::tempdir().unwrap();
+        seed_on_disk(older.path(), None).await;
+        let snapshot = backup_offline(older.path()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        seed_on_disk(dir.path(), None).await;
+        add_row(dir.path(), "written by the newer version");
+        rusqlite::Connection::open(dir.path().join("memory.db"))
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+                 VALUES ({}, 'from_the_future', '2026-10-12T00:00:00Z', '1')",
+                latest_known() + 1
+            ))
+            .unwrap();
+        assert!(matches!(probe(dir.path()).state, ProbeState::Schema(SchemaPlan::Newer { .. })));
+
+        let restored = restore(dir.path(), &snapshot).unwrap();
+
+        let kept = restored.previous.expect("the migrated store was kept");
+        assert_eq!(parse_snapshot_name(&kept.file_name().unwrap().to_string_lossy()), Some(Reason::PreRestore));
+        assert_eq!(history_top(&kept), latest_known() + 1);
+        assert_eq!(
+            contents(&kept),
+            vec!["seeded on disk".to_string(), "written by the newer version".to_string()]
+        );
+        assert_eq!(history_top(&dir.path().join("memory.db")), latest_known());
+        assert_eq!(contents(&dir.path().join("memory.db")), vec!["seeded on disk".to_string()]);
+        assert_eq!(probe(dir.path()).state, ProbeState::Schema(SchemaPlan::UpToDate));
     }
 
     #[tokio::test]

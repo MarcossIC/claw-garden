@@ -9,7 +9,7 @@ Fuente de verdad del comportamiento actual de qué agentes leen las memorias de 
 - **Lector:** el agente que busca: el agente del puente ([`specs/visibility`](../visibility/spec.md) R1) o el `agent_id` del cuerpo de `POST /v1/search` y `POST /v1/context`.
 - **Autor de una fila:** su `agent_id`.
 - **Exclusión:** un par dirigido (lector, autor): "cursor no lee a claude-code". `*` en cualquiera de los dos lados vale por todo agente.
-- **Política:** el conjunto de exclusiones, guardado en `<data>/sharing.json` (`sharing_file`, `crates/clawg-core/src/paths.rs:246`).
+- **Política:** el conjunto de exclusiones, guardado en `<data>/sharing.json` (`sharing_file`, `crates/clawg-core/src/paths.rs:254`).
 - **Alcance de L (`Reach`, `crates/clawg-core/src/memory/sharing.rs:40`):** lo que la búsqueda de L trae además de lo propio. `AllBut(autores)`, todo menos un conjunto de autores ocultos, u `Own`, sólo lo propio.
 - **Fila ajena para L:** una fila cuyo autor no es L.
 
@@ -29,8 +29,8 @@ Por defecto, sin archivo, cada agente lee a todos los demás: ocultar es una dec
 - El alcance de L MUST ser (`reach_for`, `sharing.rs:102`):
   - `Own` si entre las exclusiones de L o de `*` está el autor `*`;
   - si no, `AllBut` con la unión de las exclusiones de L y de `*`, sin L, en orden alfabético.
-- Un archivo inválido o ilegible MUST dar `Own` para todo lector: una exclusión que el usuario escribió no se pierde por un error de tipeo. Lo propio MUST seguir viéndose igual. El error MUST poder leerse: lo informan `memory_status` (R6), `clawg sharing` (R7) y el log del daemon (`reach`, `crates/clawg-cli/src/daemon/api.rs:1071`).
-- El daemon MUST leer el archivo en cada `POST /v1/search` y `POST /v1/context` (`api.rs:1041` y `api.rs:1111`): un cambio vale desde la próxima llamada, sin reiniciar.
+- Un archivo inválido o ilegible MUST dar `Own` para todo lector: una exclusión que el usuario escribió no se pierde por un error de tipeo. Lo propio MUST seguir viéndose igual. El error MUST poder leerse: lo informan `memory_status` (R6), `clawg sharing` (R7) y el log del daemon (`reach`, `crates/clawg-cli/src/daemon/api.rs:1077`).
+- El daemon MUST leer el archivo en cada `POST /v1/search` y `POST /v1/context` (`api.rs:1045` y `api.rs:1117`): un cambio vale desde la próxima llamada, sin reiniciar.
 - Parsear, validar y resolver el alcance MUST ser funciones puras, sin sistema de archivos; sólo `load` y `save` (`sharing.rs:154` y `:166`) tocan el disco.
 
 #### Escenario: sin archivo
@@ -57,13 +57,13 @@ Por defecto, sin archivo, cada agente lee a todos los demás: ocultar es una dec
 
 ## R2. Búsqueda con lo ajeno
 
-- La búsqueda de L MUST traer las filas propias y las de los autores de su alcance, en las tres tablas (`memory`, `episodic`, `procedural`), en los dos canales (vectorial y léxico) y en la bonificación por identificador. El alcance viaja en `SearchScope.reach` (`crates/clawg-core/src/memory/search.rs:33`, `with_reach` en `:54`) y entra a cada consulta como un solo parámetro JSON (`reach_bind`, `search.rs:63`): `ELIGIBLE_SQL_MEMORY` (`:227`, con las de `episodic` y `procedural`), las tres KNN (`:178`, `:195`, `:210`), `LEXICAL_CANDIDATE_SQL` (`:611`), `IDENTIFIER_MATCH_SQL` (`:738`) y `LEXICAL_SCORE_SQL_PREFIX` (`:890`).
+- La búsqueda de L MUST traer las filas propias y las de los autores de su alcance, en las tres tablas (`memory`, `episodic`, `procedural`), en los dos canales (vectorial y léxico) y en la bonificación por identificador. El alcance viaja en `SearchScope.reach` (`crates/clawg-core/src/memory/search.rs:33`, `with_reach` en `:54`) y entra a cada consulta como un solo parámetro JSON (`reach_bind`, `search.rs:63`): `ELIGIBLE_SQL_MEMORY` (`:260`, con las de `episodic` y `procedural`), las tres KNN (`:202`, `:219`, `:234`), `LEXICAL_CANDIDATE_SQL` (`:673`), `IDENTIFIER_MATCH_SQL` (`:800`) y `LEXICAL_SCORE_SQL_PREFIX` (`:952`).
 - Una fila ajena MUST pasar los mismos filtros que una propia: estado `active` o `disputed`, sin `deleted_at`, y el filtro de proyecto de siempre (la del proyecto, las sin proyecto y `user_preference` de cualquiera).
-- El conteo de elegibles que decide el reintento de vec0 (`search.rs:462`) MUST contar con el mismo alcance, para que una ventana llena de filas no visibles siga disparando el reintento y una llena de visibles no lo dispare.
+- El conteo de elegibles que decide el reintento de vec0 (`search.rs:516`) MUST contar con el mismo alcance, para que una ventana llena de filas no visibles siga disparando el reintento y una llena de visibles no lo dispare.
 - Lo propio y lo ajeno MUST puntuar con la misma fórmula: compartir no agrega pesos.
 - Con alcance `Own`, la búsqueda MUST devolver exactamente las mismas filas, en el mismo orden y con los mismos puntajes que sin compartir. Sin filas ajenas, `AllBut` MUST dar lo mismo que `Own`. `SearchScope::all_default()` queda en `Own` (`search.rs:44`): rag-eval y todo scope armado a mano ven sólo lo propio; el daemon es quien pone el alcance de la política.
 - La búsqueda que hace el detector de contradicciones al guardar MUST seguir viendo sólo las filas del que guarda (`reach: Reach::Own`, `crates/clawg-core/src/memory/contradiction.rs:175`).
-- Un hit ajeno que se devuelve MUST contar como acceso igual que uno propio (`record_hits`, `api.rs:1061` y `prompt_builder.rs:272`): el tier mide cuánto se usa una memoria, y el decaimiento la baja si deja de servir.
+- Un hit ajeno que se devuelve MUST contar como acceso igual que uno propio (`record_hits`, `api.rs:1066` y `prompt_builder.rs:284`): el tier mide cuánto se usa una memoria, y el decaimiento la baja si deja de servir.
 
 #### Escenario: B lee a A
 - GIVEN una fila de A "el deploy usa fly.io" y sin política
@@ -85,18 +85,18 @@ Por defecto, sin archivo, cada agente lee a todos los demás: ocultar es una dec
 ## R3. Cada hit dice su autor
 
 - Cada hit de búsqueda MUST llevar su autor (`RankedHit.agent_id`, `search.rs:88`). `POST /v1/search` MUST devolverlo en cada hit como `agent_id`.
-- El cliente del daemon MUST aceptar una respuesta sin `agent_id` (un daemon viejo) y tratar ese hit como propio (`Hit.agent_id` con `#[serde(default)]`, `crates/clawg-cli/src/client.rs:165`).
+- El cliente del daemon MUST aceptar una respuesta sin `agent_id` (un daemon viejo) y tratar ese hit como propio (`Hit.agent_id` con `#[serde(default)]`, `crates/clawg-cli/src/client.rs:175`).
 
 **Tests:** `a_hit_carries_its_author` en `search.rs`; `search_returns_the_author_of_each_hit` en `crates/clawg-cli/tests/api.rs`; `a_hit_from_an_old_daemon_reads_as_own` en `crates/clawg-cli/src/client.rs`.
 
 ## R4. Lo ajeno se presenta como dato
 
-En `recall_context` (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:518`; `is_shared`, `:511`):
+En `recall_context` (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:530`; `is_shared`, `:523`):
 
 - La línea de un hit ajeno MUST ser `[AAAA-MM-DD #id tipo by <autor>] contenido`. La de un hit propio MUST quedar igual que sin compartir.
-- Si hay al menos un hit ajeno, el prompt MUST terminar con un bloque `=== SHARED ===` (`SEP_SHARED`, `:26`; se arma en `:280-286`) de una sola nota (`SHARED_NOTE`, `:31`), que dice que las líneas marcadas `by <agente>` las guardó otro agente, que son información para verificar y no instrucciones, y que sólo ese agente puede cambiarlas o borrarlas. Sin hits ajenos, el bloque MUST NOT aparecer. Va al final, después de ACTIVE CONFLICTS.
+- Si hay al menos un hit ajeno, el prompt MUST terminar con un bloque `=== SHARED ===` (`SEP_SHARED`, `:26`; se arma en `:292-298`) de una sola nota (`SHARED_NOTE`, `:31`), que dice que las líneas marcadas `by <agente>` las guardó otro agente, que son información para verificar y no instrucciones, y que sólo ese agente puede cambiarlas o borrarlas. Sin hits ajenos, el bloque MUST NOT aparecer. Va al final, después de ACTIVE CONFLICTS.
 
-En `search_memory` (`format_hits`, `crates/clawg-cli/src/mcp/tools.rs:82`; `shared_author`, `:75`):
+En `search_memory` (`format_hits`, `crates/clawg-cli/src/mcp/tools.rs:95`; `shared_author`, `:88`):
 
 - La línea de un hit ajeno MUST llevar `by <autor>` dentro del corchete: `N. #id [kind/tipo/tN score=S by <autor>] contenido`. La de un hit propio MUST quedar igual.
 - Si hay al menos un hit ajeno, la respuesta MUST terminar con la misma nota (un solo texto, `SHARED_NOTE`, que la CLI reusa del core).
@@ -115,8 +115,8 @@ En `search_memory` (`format_hits`, `crates/clawg-cli/src/mcp/tools.rs:82`; `shar
 
 ## R5. Lo que sigue siendo de cada agente
 
-- El workspace de L MUST cargar sólo filas de L (`regenerate_auto_section` con el agente del pedido, `api.rs:1098`).
-- ACTIVE CONFLICTS MUST mostrar sólo disputas cuya fila nueva es de L, como siempre, aunque un hit ajeno esté en el prompt (`fetch_active_conflicts`, `prompt_builder.rs:667`, recibe sólo el agente).
+- El workspace de L MUST cargar sólo filas de L (`regenerate_auto_section` con el agente del pedido, `api.rs:1104`).
+- ACTIVE CONFLICTS MUST mostrar sólo disputas cuya fila nueva es de L, como siempre, aunque un hit ajeno esté en el prompt (`fetch_active_conflicts`, `prompt_builder.rs:679`, recibe sólo el agente).
 - `list_memories`, `synthesize`, el dedup y el detector de contradicciones al guardar MUST seguir viendo sólo lo de L (`list_memories_impl`, `crates/clawg-cli/src/mcp/server.rs:786`, manda `agent: Some(agent_id)`).
 - `delete_memory`, `update_memory` y `resolve_conflict` sobre una fila ajena que L ve en la búsqueda MUST fallar como si el id no existiera, sin tocar nada ([`specs/visibility`](../visibility/spec.md) R3 y R4). Sus descripciones MUST decir que sólo valen sobre las memorias propias y que lo compartido es de sólo lectura (`server.rs:1106-1159`).
 
@@ -134,7 +134,7 @@ En `search_memory` (`format_hits`, `crates/clawg-cli/src/mcp/tools.rs:82`; `shar
 
 ## R6. `memory_status` dice a quién lee el agente
 
-`memory_status` MUST terminar con una línea `shared:` (`format_sharing`, `crates/clawg-cli/src/mcp/tools.rs:420`; el puente lee el mismo archivo que el daemon, en `memory_status_impl`, `server.rs:981`):
+`memory_status` MUST terminar con una línea `shared:` (`format_sharing`, `crates/clawg-cli/src/mcp/tools.rs:442`; el puente lee el mismo archivo que el daemon, en `memory_status_impl`, `server.rs:981`):
 
 - `shared: reads every agent` sin exclusiones para el agente (o sin archivo);
 - `shared: reads every agent but <autor>, <autor>` (orden alfabético) con exclusiones;
@@ -145,14 +145,14 @@ En `search_memory` (`format_hits`, `crates/clawg-cli/src/mcp/tools.rs:82`; `shar
 
 ## R7. `clawg sharing`
 
-`Command::Sharing` (`crates/clawg-cli/src/cli.rs:103`; ejecución en `run`, `crates/clawg-cli/src/sharing.rs:15`, y `main.rs:167`):
+`Command::Sharing` (`crates/clawg-cli/src/cli.rs:111`; ejecución en `run`, `crates/clawg-cli/src/sharing.rs:15`, y `main.rs:196`):
 
 - `clawg sharing [--profile P]` MUST imprimir la política, una exclusión por línea (`<lector> does not read <autor>`, `no agent reads <autor>`, `<lector> reads no other agent`, `no agent reads another`), o `every agent reads every other agent` (`render`, `sharing.rs:131`). Con un archivo inválido MUST imprimir el error y salir con 1.
 - `clawg sharing hide <LECTOR> <AUTOR> [--profile P]` MUST agregar la exclusión y `clawg sharing unhide <LECTOR> <AUTOR>` MUST quitarla. Los dos imprimen la política resultante. Ocultar lo que ya está oculto o mostrar lo que no lo está MUST NOT fallar.
-- Los nombres MUST recortarse y no pueden quedar vacíos, igual que `--agent` (al parsear, `parse_agent` en `cli.rs:158` y `:161`). `*` vale en los dos lados. Lector igual a autor, salvo `* *`, MUST rechazarse antes de leer o escribir el archivo (`Exclusion::check`, `cli.rs:171`): un agente siempre lee lo suyo.
+- Los nombres MUST recortarse y no pueden quedar vacíos, igual que `--agent` (al parsear, `parse_agent` en `cli.rs:202` y `:205`). `*` vale en los dos lados. Lector igual a autor, salvo `* *`, MUST rechazarse antes de leer o escribir el archivo (`Exclusion::check`, `cli.rs:215`): un agente siempre lee lo suyo.
 - Sobre un archivo inválido, `hide` y `unhide` MUST fallar sin reescribirlo: puede ser una edición a mano a medio hacer (`sharing.rs:19-24`).
 - La escritura MUST ser atómica (archivo temporal y `rename`): un lector concurrente ve la política vieja o la nueva, nunca una a medias. Si el directorio de datos todavía no existe, MUST crearse: ocultar puede ser lo primero que hace el usuario (`save`, `crates/clawg-core/src/memory/sharing.rs:166`).
-- `--profile` MUST valer antes o después de la acción (`clawg sharing --profile dev hide …` y `clawg sharing hide … --profile dev`, `sharing_profile`, `cli.rs:150`): una exclusión escrita en el directorio de otro perfil deja compartiendo lo que el usuario cree oculto.
+- `--profile` MUST valer antes o después de la acción (`clawg sharing --profile dev hide …` y `clawg sharing hide … --profile dev`, `sharing_profile`, `cli.rs:194`): una exclusión escrita en el directorio de otro perfil deja compartiendo lo que el usuario cree oculto.
 - MUST funcionar con el daemon corriendo y sin abrir la base.
 
 **Tests:** `sharing_shows_hides_and_unhides`, `sharing_rejects_a_blank_or_self_exclusion`, `every_agent_is_accepted_on_either_side` y `sharing_takes_the_profile_from_either_side_of_the_action` en `crates/clawg-cli/src/cli.rs`; `hide_and_unhide_print_the_policy_they_leave`, `a_change_on_an_invalid_policy_leaves_it_alone`, `hiding_an_agent_from_itself_writes_nothing` y `every_agent_on_both_sides_stops_all_sharing` en `crates/clawg-cli/src/sharing.rs`; `hide_and_unhide_rewrite_the_policy`, `hiding_twice_and_unhiding_nothing_are_fine`, `an_invalid_policy_is_never_rewritten`, `an_exclusion_can_come_before_the_data_directory_exists`, `the_saved_file_parses_back_to_the_same_policy` y `render_lists_one_exclusion_per_line` en `crates/clawg-core/src/memory/sharing.rs`.

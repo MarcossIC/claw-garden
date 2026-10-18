@@ -2,12 +2,12 @@
 
 Fuente de verdad de cómo la suite prueba el binario `clawg` mismo: el build de test y las dos variables que sólo él lee (el home de prueba y el embedder de prueba), la regla que las mantiene fuera del binario que se entrega, las pruebas que lanzan el binario como proceso hijo, y el CI. Nada de esto cambia el binario que se entrega. El directorio de datos, el lock y el outbox están en [`specs/storage`](../storage/spec.md); el puente y su reconexión, en [`specs/mcp`](../mcp/spec.md).
 
-**Origen:** [install-smoke](../../changes/archive/2026-10-16-install-smoke/proposal.md), archivado el 2026-10-16.
+**Origen:** [install-smoke](../../changes/archive/2026-10-16-install-smoke/proposal.md), archivado el 2026-10-16. [release-and-self-update](../../changes/archive/2026-10-18-release-and-self-update/proposal.md), archivado el 2026-10-18, reemplazó la sección «CI» (I1): el filtro de rutas del workflow y su relación con el release.
 
 ## Definiciones
 
 - **Feature `testing`:** la feature de clawg-core que compila los sustitutos de prueba (`crates/clawg-core/Cargo.toml:25`).
-- **Build de test:** un binario compilado con `testing`. Es el que cargo arma para los tests de integración de clawg-cli (`CARGO_BIN_EXE_clawg`, `crates/clawg-cli/tests/binary.rs:23`), porque clawg-cli enciende la feature en sus `[dev-dependencies]` (`crates/clawg-cli/Cargo.toml:68`). `cargo build --release` no compila las dev-dependencies, así que el binario que se entrega no la tiene. Efecto aceptado: después de un `cargo test`, `target/debug/clawg` es un build de test. Sólo lee las variables si están puestas, y como build debug ya está limitado al perfil dev.
+- **Build de test:** un binario compilado con `testing`. Es el que cargo arma para los tests de integración de clawg-cli (`CARGO_BIN_EXE_clawg`, `crates/clawg-cli/tests/binary.rs:23`), porque clawg-cli enciende la feature en sus `[dev-dependencies]` (`crates/clawg-cli/Cargo.toml:73`). `cargo build --release` no compila las dev-dependencies, así que el binario que se entrega no la tiene. Efecto aceptado: después de un `cargo test`, `target/debug/clawg` es un build de test. Sólo lee las variables si están puestas, y como build debug ya está limitado al perfil dev.
 - **Home de prueba:** el valor no vacío de `CLAWG_TEST_HOME` (`TEST_HOME_VAR`, `crates/clawg-core/src/paths.rs:169`).
 - **Embedder de prueba:** el valor de `CLAWG_TEST_EMBEDDER` (`TEST_EMBEDDER_VAR`, `crates/clawg-core/src/memory/bootstrap.rs:260`), `fake` o `stalled` (`TestEmbedder`, `bootstrap.rs:265`).
 
@@ -29,16 +29,16 @@ Se reemplaza el home y no el directorio de datos para que el perfil siga eligien
 - WHEN corre `clawg status --profile prod`
 - THEN sale con 1, el error dice que un build debug no abre prod, y no existe `<home>/.clawg`
 
-**Tests:** `a_test_home_replaces_the_system_home` y `an_unset_or_empty_test_home_keeps_the_system_home` (`paths.rs`, mod tests); `a_debug_binary_refuses_prod_even_with_a_test_home` (`binary.rs:443`).
+**Tests:** `a_test_home_replaces_the_system_home` y `an_unset_or_empty_test_home_keeps_the_system_home` (`paths.rs`, mod tests); `a_debug_binary_refuses_prod_even_with_a_test_home` (`binary.rs:471`).
 
 ## El embedder de prueba
 
-`clawg serve` arma el bootstrap del embedder con `serve_deps` (`bootstrap.rs:319`, llamado en `crates/clawg-cli/src/daemon/serve.rs:94`). En un build de test, según el embedder de prueba:
+`clawg serve` arma el bootstrap del embedder con `serve_deps` (`bootstrap.rs:319`, llamado en `crates/clawg-cli/src/daemon/serve.rs:102`). En un build de test, según el embedder de prueba:
 
 - con `fake`, MUST cargar `FakeEmbedder` sin descargar nada: la «descarga» devuelve archivos vacíos al instante y la carga devuelve el falso, con `model_id` `fake-embedder`;
 - con `stalled`, la descarga MUST NOT terminar nunca, así que el embedder queda en `loading` y cada save responde `202`;
 - sin la variable, o con un valor vacío o de sólo espacios, MUST usar el modelo real (`production_deps`, `bootstrap.rs:232`);
-- con cualquier otro valor, MUST negarse a arrancar con un error que nombra la variable y los valores aceptados (`TestEmbedder::parse`, `bootstrap.rs:274`; `ServeError::Embedder`, `serve.rs:95`). Un typo en un test no puede disparar la descarga de 470 MB.
+- con cualquier otro valor, MUST negarse a arrancar con un error que nombra la variable y los valores aceptados (`TestEmbedder::parse`, `bootstrap.rs:274`; `ServeError::Embedder`, `serve.rs:107`). Un typo en un test no puede disparar la descarga de 470 MB.
 
 Un build sin `testing` MUST usar siempre el modelo real (`serve_deps`, `bootstrap.rs:332`).
 
@@ -56,15 +56,15 @@ En los dos sustitutos, la verificación del contrato de embedding MUST ser la re
 
 ## Sólo las dev-dependencies encienden `testing`
 
-Ningún `Cargo.toml` del workspace (el raíz y el de cada crate bajo `crates/`) MUST encender la feature `testing` de clawg-core fuera de una sección cuyo nombre termine en `dev-dependencies]`, también la de un target. Cuenta tanto un `features = ["testing"]` como un `clawg-core/testing` o un `default = ["testing"]` en una tabla de features. Hoy la enciende sólo `crates/clawg-cli/Cargo.toml:68`.
+Ningún `Cargo.toml` del workspace (el raíz y el de cada crate bajo `crates/`) MUST encender la feature `testing` de clawg-core fuera de una sección cuyo nombre termine en `dev-dependencies]`, también la de un target. Cuenta tanto un `features = ["testing"]` como un `clawg-core/testing` o un `default = ["testing"]` en una tabla de features. Hoy la enciende sólo `crates/clawg-cli/Cargo.toml:73`.
 
-El test MUST fallar con `manifiesto:línea` de cada hallazgo. Reconocerlos es la función pura `testing_outside_dev_dependencies` (`crates/clawg-cli/tests/conventions.rs:87`), que examina línea por línea, ignora lo que sigue a un `#`, y no cuenta la declaración `testing = []` porque no lleva comillas.
+El test MUST fallar con `manifiesto:línea` de cada hallazgo. Reconocerlos es la función pura `testing_outside_dev_dependencies` (`crates/clawg-cli/tests/conventions.rs:89`), que examina línea por línea, ignora lo que sigue a un `#`, y no cuenta la declaración `testing = []` porque no lleva comillas.
 
-**Tests:** `only_dev_dependencies_turn_on_the_test_stand_ins` (`conventions.rs:122`) y el puro `testing_outside_dev_dependencies_reads_the_section` (`conventions.rs:105`).
+**Tests:** `only_dev_dependencies_turn_on_the_test_stand_ins` (`conventions.rs:124`) y el puro `testing_outside_dev_dependencies_reads_the_section` (`conventions.rs:107`).
 
 ## El binario sobrevive a lo que sólo ve un proceso
 
-`crates/clawg-cli/tests/binary.rs` MUST lanzar el build de test como proceso hijo y probar los escenarios de abajo. Cada prueba MUST correr en su propio home de prueba (`Sandbox`, `binary.rs:32`), con `fake` salvo que el escenario pida otro y con `--port 0`. El puerto y el token se leen de `daemon.json` y `token` cuando `daemon.json` nombra el pid del hijo (`published`, `binary.rs:269`), así que las pruebas corren en paralelo sin chocar. Un puente MUST arrancar en una carpeta vacía propia (`Sandbox::bridge`, `binary.rs:93`), porque registra su raíz con `index_docs` y si no, indexaría lo que haya. Cada línea del stdout de un puente MUST ser un mensaje JSON-RPC: otra cosa falla la prueba con la línea a la vista (`Bridge::reply`, `binary.rs:296`).
+`crates/clawg-cli/tests/binary.rs` MUST lanzar el build de test como proceso hijo y probar los escenarios de abajo. Cada prueba MUST correr en su propio home de prueba (`Sandbox`, `binary.rs:32`), con `fake` salvo que el escenario pida otro y con `--port 0`. El puerto y el token se leen de `daemon.json` y `token` cuando `daemon.json` nombra el pid del hijo (`published`, `binary.rs:297`), así que las pruebas corren en paralelo sin chocar. Un puente MUST arrancar en una carpeta vacía propia (`Sandbox::bridge`, `binary.rs:102`), porque registra su raíz con `index_docs` y si no, indexaría lo que haya. Cada línea del stdout de un puente MUST ser un mensaje JSON-RPC: otra cosa falla la prueba con la línea a la vista (`Bridge::reply`, `binary.rs:310`).
 
 #### Escenario: kill duro
 - GIVEN un daemon con `stalled` que respondió `202` a un save
@@ -106,13 +106,13 @@ El test MUST fallar con `manifiesto:línea` de cada hallazgo. Reconocerlos es la
 - WHEN el daemon se detiene con `clawg stop` y arranca otro, con otro token
 - THEN la herramienta siguiente responde sin error
 
-**Tests:** `a_save_accepted_before_a_hard_kill_is_stored_after_the_restart` (`binary.rs:372`), `a_second_daemon_on_the_same_data_directory_is_refused_and_names_the_first` (`binary.rs:402`), `status_and_stop_follow_the_daemon_process` (`binary.rs:418`), `a_restored_backup_brings_back_its_rows_and_keeps_the_replaced_store` (`binary.rs:454`), `a_bridge_on_real_stdio_answers_initialize_and_the_tools_reach_the_daemon` (`binary.rs:491`), `a_bridge_on_real_stdio_serves_a_host_that_never_initializes` (`binary.rs:515`) y `a_bridge_left_open_reaches_the_daemon_after_a_restart` (`binary.rs:535`).
+**Tests:** `a_save_accepted_before_a_hard_kill_is_stored_after_the_restart` (`binary.rs:400`), `a_second_daemon_on_the_same_data_directory_is_refused_and_names_the_first` (`binary.rs:430`), `status_and_stop_follow_the_daemon_process` (`binary.rs:446`), `a_restored_backup_brings_back_its_rows_and_keeps_the_replaced_store` (`binary.rs:482`), `a_bridge_on_real_stdio_answers_initialize_and_the_tools_reach_the_daemon` (`binary.rs:520`), `a_bridge_on_real_stdio_serves_a_host_that_never_initializes` (`binary.rs:544`) y `a_bridge_left_open_reaches_the_daemon_after_a_restart` (`binary.rs:564`).
 
-**Límite conocido:** el autoarranque del puente no se prueba a través del binario. El daemon que lanza el puente usa el puerto fijo del perfil (`crates/clawg-cli/src/client.rs:995-998`), así que en la máquina del usuario chocaría con su daemon dev. Lo cubren los tests en proceso de `crates/clawg-cli/src/mcp/mod.rs`. Probarlo a través del binario pide antes poder elegir ese puerto, y eso es superficie de producto.
+**Límite conocido:** el autoarranque del puente no se prueba a través del binario. El daemon que lanza el puente usa el puerto fijo del perfil (`spawn_serve_at` sin puerto, `crates/clawg-cli/src/client.rs:1008`; `serve_args`, `:1014-1021`), así que en la máquina del usuario chocaría con su daemon dev. Lo cubren los tests en proceso de `crates/clawg-cli/src/mcp/mod.rs`. Probarlo a través del binario pide antes poder elegir ese puerto, y eso es superficie de producto.
 
 ## Ningún hijo sobrevive a su prueba
 
-Cada proceso que lanza la suite MUST terminarse por su propio handle cuando su prueba termina, también si la prueba entra en pánico. `Daemon` y `Bridge` matan y esperan a su hijo al soltarse (`binary.rs:262` y `binary.rs:338`). Un hilo cosecha cada daemon apenas sale (`Daemon::watch`, `binary.rs:149`): en Unix, un hijo sin cosechar queda zombi, y `clawg stop`, que pregunta por el pid, esperaría hasta su tope.
+Cada proceso que lanza la suite MUST terminarse por su propio handle cuando su prueba termina, también si la prueba entra en pánico. `Daemon` y `Bridge` matan y esperan a su hijo al soltarse (`binary.rs:290` y `binary.rs:366`). Un hilo cosecha cada daemon apenas sale (`Daemon::watch`, `binary.rs:163`): en Unix, un hijo sin cosechar queda zombi, y `clawg stop`, que pregunta por el pid, esperaría hasta su tope.
 
 La suite MUST NOT terminar procesos por nombre: un `clawg` que corre el editor del usuario tiene que sobrevivirla.
 
@@ -120,12 +120,24 @@ La suite MUST NOT terminar procesos por nombre: un `clawg` que corre el editor d
 - GIVEN una prueba que entra en pánico con su daemon corriendo
 - THEN otro daemon puede tomar el mismo directorio de datos enseguida
 
-**Test:** `a_test_that_fails_midway_leaves_no_daemon_holding_the_store` (`binary.rs:554`). Que no se termine nada por nombre no tiene test: se cumple por construcción, porque el repo no tiene ningún `taskkill`, `pkill`, `killall` ni `Stop-Process`.
+**Test:** `a_test_that_fails_midway_leaves_no_daemon_holding_the_store` (`binary.rs:583`). Que no se termine nada por nombre no tiene test: se cumple por construcción, porque el repo no tiene ningún `taskkill`, `pkill`, `killall` ni `Stop-Process`.
 
 ## CI
 
-Cada pull request y cada push a `main` MUST correr, en `ubuntu-latest` y en `windows-latest` (`.github/workflows/ci.yml:3-6` y `ci.yml:21`), el comando de `clippy` que hace fallar los warnings del compilador y `cargo test --workspace`, con las pruebas del binario incluidas (`ci.yml:33` y `ci.yml:36`). Las dos plataformas MUST correr hasta el final aunque una falle (`fail-fast: false`, `ci.yml:19`). El job no descarga el modelo: la suite usa `fake`.
+La CI MUST correr en cada pull request y en cada push a `main` que cambie algún archivo fuera de `docs/**`, `openspec/**`, `.claude/**`, `.cursor/**`, `.gemini/**`, `scripts/**`, `README.md` y `AGENTS.md` (`.github/workflows/ci.yml:5-26`). Un push que sólo cambia esas rutas MUST NOT correr CI y, por lo tanto, MUST NOT disparar `release.yml` ([`specs/release`](../release/spec.md), R4). En `ubuntu-latest` y `windows-latest` (`ci.yml:41`) MUST correr el comando de `clippy` que hace fallar los warnings del compilador (`ci.yml:53`) y `cargo test --workspace` (`ci.yml:56`), con las pruebas del binario incluidas; las dos plataformas MUST correr hasta el final aunque una falle (`fail-fast: false`, `ci.yml:39`). El job no descarga el modelo: la suite usa `fake`. La CI es el único disparador de `release.yml`: un release MUST NOT publicarse sin una CI exitosa por push a `main`, y la CI MUST NOT leer secretos del environment `release`.
 
-La suite MUST pasar en Linux y en Windows. Para eso, las fixtures de los tests de `doctor` arman sus rutas bajo la raíz de la plataforma, `C:\` o `/` (`dir`, `crates/clawg-cli/src/doctor.rs:135`), y el caso de las grafías de Windows (mayúsculas, barras y `\\?\`) corre sólo en Windows (`windows_spellings_of_one_file_are_the_same_install`, `doctor.rs:217`).
+La suite MUST pasar en Linux y en Windows. Para eso, las fixtures de los tests de `doctor` arman sus rutas bajo la raíz de la plataforma, `C:\` o `/` (`dir`, `crates/clawg-cli/src/doctor.rs:135`), y el caso de las grafías de Windows (mayúsculas, barras y `\\?\`) corre sólo en Windows (`windows_spellings_of_one_file_are_the_same_install`, `doctor.rs:219`).
+
+#### Escenario: bump de versión
+- GIVEN un push a `main` cuyo commit cambia `Cargo.toml` y `Cargo.lock`
+- WHEN la CI termina en verde
+- THEN `release.yml` se dispara por ese `workflow_run`
+
+#### Escenario: sólo documentación
+- GIVEN un push a `main` que sólo cambia `README.md` y `openspec/**`
+- WHEN GitHub evalúa los workflows
+- THEN no corre la CI ni `release.yml`
+
+**Prueba:** `the_ci_workflow_ignores_only_non_code_paths_and_runs_on_both_platforms` (convención sobre `ci.yml`); el comportamiento en GitHub, en el workflow, fuera de la suite.
 
 **Verificación:** el workflow quedó en verde en las dos plataformas en el PR #32, el que lo agrega, y la suite pasó en Linux y en Windows al archivar ([verify](../../changes/archive/2026-10-16-install-smoke/verify.md)).

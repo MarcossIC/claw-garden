@@ -31,7 +31,7 @@ Las doce abiertas de la exploración se resolvieron con la opción recomendada (
 - **Assets sueltos, sin comprimir:** `clawg-x86_64-pc-windows-msvc.exe`, `clawg-x86_64-unknown-linux-gnu`, `install.ps1`, `SHA256SUMS` (de los tres) y `SHA256SUMS.minisig`, más la atestación de procedencia de GitHub. El release se crea cuando todos existen: `releases/latest` nunca ve uno a medias.
 - **Firma minisign.** La clave privada y su contraseña son secretos de un environment `release` limitado a `main` por política de ramas, sin revisores obligatorios: los releases siguen siendo automáticos. El binario embebe una **lista** de claves públicas aceptadas desde el primer día, para poder rotar. La atestación queda para auditoría manual (`gh attestation verify`); `update` no la verifica.
 - **Sin Authenticode.** SignPath Foundation queda como camino posterior.
-- **El primer release es la versión que sube el archivo de este cambio.** El PR llega a `main` con el archivo y el bump en el mismo push: si `release.yml` aterrizara antes, publicaría con el número que hubiera en `main` un binario que no le corresponde. Hoy sería `v0.19.0`; si memory-provenance (41), en verify, se archiva antes, toma la `0.19.0` y este cambio publica la siguiente minor.
+- **El primer release es la versión que sube el archivo de este cambio.** El PR llega a `main` con el archivo y el bump en el mismo push: si `release.yml` aterrizara antes, publicaría con el número que hubiera en `main` un binario que no le corresponde. memory-provenance (41) se archivó con la `0.19.0`, así que hoy sería `v0.20.0`; si otro cambio se archiva antes, este publica la minor siguiente.
 
 **Primera instalación (Windows)**
 
@@ -44,7 +44,7 @@ Las doce abiertas de la exploración se resolvieron con la opción recomendada (
 - **Sólo el perfil `prod`.** Se niega en un build debug, sin la marca, o desde un binario dentro de un directorio de target de cargo, con un mensaje que dice por qué. La decisión es una función pura.
 - **Sólo hacia una versión estrictamente mayor** (`X.Y.Z` de tres enteros, sin dependencia nueva): cierra el ataque de servir un release viejo con firma válida.
 - **Sólo cuando se pide.** El daemon nunca consulta nada. Las peticiones mandan `User-Agent` (GitHub contesta 403 sin él).
-- **Verifica antes de tocar nada:** la firma de `SHA256SUMS` con alguna clave de la lista (`minisign-verify`, la única dependencia nueva), el sha256 del binario bajado junto al destino y el `--version` del binario preparado.
+- **Verifica antes de tocar nada:** la firma de `SHA256SUMS` con alguna clave de la lista (`minisign-verify`, la única dependencia directa nueva del binario; ver el diseño, D9), el sha256 del binario bajado junto al destino y el `--version` del binario preparado.
 - **El intercambio sigue el de `install.ps1`.** Si había daemon, lo para con el binario viejo (`stop_in`, `crates/clawg-cli/src/stop.rs:23`); renombra el actual a `.old-*` y pone el nuevo; y **sólo si había daemon** arranca el nuevo por su ruta explícita, no por `ProcessSpawner`, y espera `/health` con la versión nueva. Si no contesta, vuelven el binario viejo y su daemon.
 - **Linux:** reemplaza el binario donde está. Sin permiso de escritura falla antes de bajar nada, con un mensaje claro; nunca `sudo`.
 - **Informa** la versión anterior y la nueva, el snapshot `pre-migration` si se escribió, que volver atrás pierde lo escrito después (ver «Datos y vuelta atrás»), y que los editores abiertos siguen con el puente viejo hasta reiniciarse.
@@ -73,7 +73,7 @@ Specs nuevas: `release` (workflow, assets, firma, bootstrap) y `self-update` (el
 ## Requisitos previos
 
 - **La poda conserva el `pre-migration`.** `to_prune` elegía los automáticos fuera de los 5 más nuevos sin mirar el motivo, así que una racha de restores podía sacar la vuelta atrás de una actualización. El arreglo, conservar el más nuevo de cada motivo (`crates/clawg-core/src/memory/backup.rs:233-238`), entra antes como fix aparte con su bump de patch.
-- **El par de claves minisign**, generado fuera del repositorio por quien lo administra: la privada y su contraseña en el environment `release`, la pública commiteada y embebida.
+- **Los dos pares de claves minisign**, generados fuera del repositorio por quien los administra: la privada principal y su contraseña en el environment `release`, la de resguardo fuera de GitHub, y las dos públicas commiteadas y embebidas.
 - **La API de `minisign-verify`**, verificada y con la versión fijada en el diseño: la exploración la da como publicada hace pocas semanas.
 
 ## Cómo se mide el éxito

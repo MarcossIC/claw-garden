@@ -12,7 +12,7 @@ use clawg_core::paths::{Profile, ProfileError};
 
 /// `clawg` — local-first memory for coding agents.
 #[derive(Debug, Parser)]
-#[command(name = "clawg", version, about, long_about = None)]
+#[command(name = "clawg", version = clawg_core::build_info::version(), about, long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -117,6 +117,16 @@ pub enum Command {
     /// Report which `clawg` executables the PATH resolves to and whether this
     /// one is the one a terminal runs. Exits 1 if shadowed or duplicated.
     Doctor {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Replace this binary with the latest release. With `--check`, only say
+    /// whether there is one: exit 0 when up to date, 100 when a newer release
+    /// exists, 1 when it cannot tell.
+    Update {
+        /// Report instead of installing; nothing is downloaded or changed.
+        #[arg(long)]
+        check: bool,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -472,6 +482,19 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).expect("parse")
+    }
+
+    #[test]
+    fn update_takes_check_and_a_profile() {
+        assert_eq!(
+            parse(&["clawg", "update"]).command,
+            Command::Update { check: false, profile: ProfileArg { profile: None } }
+        );
+        assert_eq!(
+            parse(&["clawg", "update", "--check", "--profile", "dev"]).command,
+            Command::Update { check: true, profile: ProfileArg { profile: Some("dev".into()) } }
+        );
+        assert!(!parse(&["clawg", "update"]).command.loads_the_model());
     }
 
     #[test]

@@ -43,6 +43,9 @@ pub struct SaveText {
     pub missing: Vec<i64>,
     /// The visible pieces in order, each overlap kept once.
     pub text: String,
+    /// The key the row asked for was saved under, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic_key: Option<String>,
 }
 
 /// Shortest repeated text treated as the overlap between two neighbours;
@@ -107,7 +110,17 @@ pub async fn read_save_core(
     if !visible(row.agent_id.as_deref(), row.deleted_at) {
         return Ok(None);
     }
-    let single = |text: String| SaveText { kind, id, piece: 1, pieces: 1, ids: vec![Some(id)], missing: vec![], text };
+    let topic_key = row.topic_key.clone();
+    let single = |text: String| SaveText {
+        kind,
+        id,
+        piece: 1,
+        pieces: 1,
+        ids: vec![Some(id)],
+        missing: vec![],
+        text,
+        topic_key: topic_key.clone(),
+    };
     if kind != MemoryKind::Memory {
         return Ok(Some(single(row.summary)));
     }
@@ -161,6 +174,7 @@ pub async fn read_save_core(
         ids,
         missing,
         text,
+        topic_key,
     }))
 }
 
@@ -398,6 +412,29 @@ mod tests {
         let one = read_save_core(&store, MemoryKind::Memory, alone, Some("agent-a")).await.unwrap().unwrap();
         assert_eq!((one.piece, one.pieces, one.ids, one.missing), (1, 1, vec![Some(alone)], vec![]));
         assert_eq!(one.text, "a save of one piece");
+    }
+
+    #[tokio::test]
+    async fn read_save_carries_the_key_of_the_row_asked_for() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let first = insert_row(&store, "agent-a", "Export format: first piece").await;
+        let second = insert_row(&store, "agent-a", "second piece of the export format").await;
+        let alone = insert_row(&store, "agent-a", "a save of one piece").await;
+        store.link_pieces(vec![piece(first, ""), piece(second, "")]).await.unwrap();
+        store
+            .conn
+            .call(move |c| {
+                c.execute("UPDATE memory SET topic_key = 'cli/export-format' WHERE id IN (?1, ?2)", [first, second])?;
+                c.execute("UPDATE memory SET topic_key = 'cli/alone' WHERE id = ?1", [alone])
+            })
+            .await
+            .unwrap();
+
+        let of = |id| read_save_core(&store, MemoryKind::Memory, id, Some("agent-a"));
+        assert_eq!(of(second).await.unwrap().unwrap().topic_key.as_deref(), Some("cli/export-format"));
+        assert_eq!(of(alone).await.unwrap().unwrap().topic_key.as_deref(), Some("cli/alone"));
+        let plain = insert_row(&store, "agent-a", "no key here").await;
+        assert_eq!(of(plain).await.unwrap().unwrap().topic_key, None);
     }
 
     fn vector_bytes(v: &[f32]) -> Vec<u8> {

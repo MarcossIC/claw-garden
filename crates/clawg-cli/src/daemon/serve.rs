@@ -10,6 +10,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use clawg_core::build_info::{self, ServeFault};
 use clawg_core::memory::bootstrap::{
     run_embedder_bootstrap_with_retry, serve_deps, unloading_when_idle, LogSink,
 };
@@ -54,6 +55,9 @@ pub enum ServeError {
     Embedder(String),
     #[error("the HTTP server stopped unexpectedly: {0}")]
     Server(std::io::Error),
+    /// Only a build with test stand-ins fails on purpose.
+    #[error("{0}")]
+    Injected(String),
 }
 
 /// Splits "someone else has the store" from every other reason opening it can
@@ -77,6 +81,8 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
         source,
     })?;
 
+    build_info::inject_serve_fault(ServeFault::BeforeOpen).map_err(ServeError::Injected)?;
+
     // The store lock is taken inside `open`, BEFORE SQLite is touched, and held
     // by `runtime.store` for the life of this process. Two processes on one
     // database would each drain the ingest channel, and the dedup gate is only
@@ -86,6 +92,8 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
     let (runtime, ingest_rx) = MemoryRuntime::open(base_dir.clone(), StoreHolder::Daemon)
         .await
         .map_err(classify_open_error)?;
+    // The store is migrated by now and the lock is released when this returns.
+    build_info::inject_serve_fault(ServeFault::AfterOpen).map_err(ServeError::Injected)?;
 
     // Background, never awaited: the model may not be on disk yet, and the
     // daemon must answer `/health` and accept saves throughout the download.
@@ -149,7 +157,7 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
             pid: std::process::id(),
             port: bound_port,
             profile: profile.as_str().to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: clawg_core::build_info::version().to_string(),
             started_at_ms: now_ms(),
         },
     )?;

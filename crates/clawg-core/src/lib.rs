@@ -3,6 +3,7 @@
 //! The local-first memory layer and the shared chat types, which the daemon
 //! (`clawg-cli`) and the evaluation harness (`clawg-eval`) both build on.
 
+pub mod build_info;
 pub mod memory;
 pub mod models;
 pub mod paths;

@@ -31,6 +31,8 @@ log.workspace = true
 dirs.workspace = true
 rand.workspace = true
 reqwest.workspace = true
+sha2.workspace = true
+fs2.workspace = true
 
 # `rt-multi-thread` for `#[tokio::main]`, `signal` for Ctrl-C-driven graceful
 # shutdown, `net` for the loopback `TcpListener`, `io-std` for the MCP stdio
@@ -48,6 +50,9 @@ rmcp = { version = "3.5.1", features = ["server", "transport-io", "macros", "sch
 # rmcp generates tool schemas with schemars 1.x — a 0.8 here would not
 # satisfy its `JsonSchema` bound.
 schemars = "1"
+# Verifies the minisign signature of a release's `SHA256SUMS` (see
+# `update/signature.rs`). Exact version: it decides which binary the user runs.
+minisign-verify = "=0.2.5"
 
 # Clears the inherit flag on the bridge's own stdio before it spawns the daemon
 # (see `detach.rs`) and waits on the daemon's process handle in `clawg stop`
@@ -73,3 +78,9 @@ tokio = { workspace = true, features = ["test-util"] }
 # Lets a test swap a MemoryRuntime's embedder cell for an empty one, which is
 # how the pre-bootstrap 503 path is reproduced without a second core constructor.
 once_cell.workspace = true
+# Signs the release files the update tests serve; the shipped binary only
+# verifies.
+minisign = "=0.9.1"
+# Seeds a store at an old schema with plain SQL: the daemon of that schema runs
+# the current insert code, which writes columns the old schema lacks.
+rusqlite.workspace = true

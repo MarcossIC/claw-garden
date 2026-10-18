@@ -409,6 +409,7 @@ mod tests {
             agent_id: None,
             piece: None,
             exact: false,
+            topic_key: None,
         }
     }
 

@@ -1,0 +1,15 @@
+change: release-and-self-update
+objective: "transversal"
+depends_on: []  # el arreglo de la poda de snapshots entra antes como fix aparte, fuera de openspec
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # en Windows, sin CRITICAL; W1 corregido, W2 a W4 abiertos; Linux en el CI del PR y los controles del release real tras el merge
+  archive: done
+updated: 2026-10-18
+main_spec: openspec/specs/release/spec.md, openspec/specs/self-update/spec.md, openspec/specs/install/spec.md

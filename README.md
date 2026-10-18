@@ -4,6 +4,8 @@ Memoria local para agentes de código. Claw Garden guarda, clasifica y recupera 
 
 ## Contenido
 
+- [Instalar desde un release](#instalar-desde-un-release)
+- [Actualizar](#actualizar)
 - [Instalar en Windows](#instalar-en-windows)
 - [Comprobar que funciona](#comprobar-que-funciona)
 - [Ver lo que se guarda](#ver-lo-que-se-guarda)
@@ -13,9 +15,96 @@ Memoria local para agentes de código. Claw Garden guarda, clasifica y recupera 
 - [Desinstalar](#desinstalar)
 - [Referencia](#referencia)
 
+## Instalar desde un release
+
+Cada versión se publica en [GitHub Releases](https://github.com/MarcossIC/claw-garden/releases) con dos binarios sin comprimir (`clawg-x86_64-pc-windows-msvc.exe` y `clawg-x86_64-unknown-linux-gnu`), el script `install.ps1`, la lista `SHA256SUMS` y su firma `SHA256SUMS.minisig`.
+
+### Windows
+
+Hace falta el **Microsoft Visual C++ Redistributable (x64)**. El script comprueba que esté, y si falta te dice dónde bajarlo (<https://aka.ms/vs/17/release/vc_redist.x64.exe>) sin instalar nada. En una PowerShell:
+
+```powershell
+irm https://github.com/MarcossIC/claw-garden/releases/latest/download/install.ps1 | iex
+```
+
+El script baja el binario del último release, lo compara con `SHA256SUMS` y, si no coincide, se detiene sin tocar nada. Después hace lo mismo que se cuenta en el [paso 4](#paso-4-instalar) de más abajo: instala en `%LOCALAPPDATA%\Programs\clawg`, agrega esa carpeta al PATH del usuario y renombra el binario anterior a `clawg.exe.old-<fecha>`. Abrí una terminal nueva al terminar.
+
+El hash de `install.ps1` prueba que lo que bajaste es el archivo publicado, no quién lo publicó. Para comprobar la autoría, verificá la firma como se explica en [Verificar lo que bajaste](#verificar-lo-que-bajaste).
+
+**SmartScreen y Smart App Control.** El `.exe` no está firmado con un certificado Authenticode. Si lo bajás con el navegador, SmartScreen puede mostrar "Windows protegió su equipo" (*Más información*, *Ejecutar de todas formas*); el script lo baja con `Invoke-WebRequest`, que no marca el archivo como descargado de internet. Smart App Control (Windows 11) puede bloquear un ejecutable sin firma de confianza, y ese bloqueo no se salta desde el script: o lo desactivás, o [compilás desde el código fuente](#instalar-en-windows).
+
+### Linux
+
+Bajá el binario y su lista de hashes, verificalos y ponelo en tu PATH:
+
+```bash
+base=https://github.com/MarcossIC/claw-garden/releases/latest/download
+curl -fLO "$base/clawg-x86_64-unknown-linux-gnu"
+curl -fLO "$base/SHA256SUMS"
+sha256sum --check --ignore-missing SHA256SUMS
+install -m 755 clawg-x86_64-unknown-linux-gnu ~/.local/bin/clawg
+```
+
+El binario se construye en Ubuntu 22.04 y pide **glibc 2.35** o más nueva (`ldd --version` te dice la tuya). No enlaza OpenSSL. Sólo x86_64.
+
+### Verificar lo que bajaste
+
+Los hashes de `SHA256SUMS` están firmados con [minisign](https://jedisct1.github.io/minisign/). Las claves públicas viven en el repositorio, en `release/minisign.pub` (la de uso) y `release/minisign-next.pub` (la de respaldo). Con `minisign` instalado:
+
+```bash
+curl -fLO "$base/SHA256SUMS.minisig"
+curl -fLO https://raw.githubusercontent.com/MarcossIC/claw-garden/main/release/minisign.pub
+minisign -Vm SHA256SUMS -p minisign.pub
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+La firma lleva un comentario con la versión (`clawg vX.Y.Z SHA256SUMS`). Cada release lleva además una atestación de procedencia de GitHub: `gh attestation verify <archivo> --repo MarcossIC/claw-garden`.
+
+### Si una clave de firma se compromete
+
+La clave privada de uso está cifrada con contraseña y sólo existe como secreto del entorno `release` de GitHub Actions, que se limita a la rama `main`. La clave de respaldo se guarda fuera de GitHub y está en el repositorio desde el primer release.
+
+- **Si se pierde o se filtra la de uso**, se publica un release firmado con la de respaldo que ya no lista la clave comprometida.
+- **Lo que la clave de respaldo no hace:** no protege a los binarios que no se actualicen. Siguen aceptando la clave filtrada hasta que instales un release cuya lista ya no la tenga, y quien tenga esa clave puede firmar un `SHA256SUMS` que ellos acepten. Mientras tanto, desconfiá de cualquier release que no hayas visto anunciado en el repositorio.
+- Si se compromete la de respaldo, se publica un release firmado con la de uso que la saca de la lista.
+
+## Actualizar
+
+Un `clawg` instalado desde un release se actualiza solo, y sólo cuando se lo pedís: el daemon nunca consulta nada por su cuenta.
+
+```
+clawg update --check    # dice si hay una versión nueva; sale con 100 si la hay, 0 si estás al día y 1 si falla
+clawg update            # la instala
+```
+
+`clawg update` baja el binario del último release junto al instalado, verifica la firma de `SHA256SUMS` con las claves del binario y el hash del archivo, y comprueba que el nuevo diga la versión esperada. Hasta ahí no toca nada: si algo falla, el binario, el daemon y tus memorias quedan como estaban. Después detiene el daemon (si había uno), aparta el binario actual como `clawg.exe.old-<fecha>` (`clawg.old-<fecha>` en Linux), pone el nuevo y arranca su daemon en el mismo puerto. Si no había daemon, no arranca ninguno.
+
+- **Si el daemon nuevo no arranca**, vuelven el binario anterior y su daemon, y `clawg update` sale con 1 explicando por qué.
+- **Si el daemon nuevo alcanzó a migrar el store y el anterior ya no lo abre**, `clawg update` restaura el snapshot `pre-migration` que escribió ese arranque y devuelve el binario anterior. El store migrado queda guardado como `pre-restore` en `backups`, así que nada se destruye. Si el restore también falla, queda instalado el binario nuevo (el único que abre ese store) y el informe dice dónde está cada archivo y qué comandos correr.
+- **Si el store tiene migraciones pendientes**, el daemon nuevo escribe antes un snapshot `pre-migration` en `backups` y el informe final nombra su ruta. Volver a la versión anterior después de migrar significa restaurarlo, y se pierde lo que se guardó desde entonces.
+- **Los editores abiertos** siguen con el puente anterior hasta que los reinicies; el puente abierto igual alcanza al daemon nuevo.
+
+`clawg update` se niega, y dice por qué, en un build de desarrollo, en uno compilado a mano (no lleva la marca de un release) y en uno que corre dentro de un directorio `target` de cargo: esos se actualizan con git y cargo. En Linux no usa `sudo`: si no podés escribir donde está el binario, falla antes de bajar nada.
+
+### Volver atrás a mano
+
+Si querés volver a la versión anterior después de una actualización:
+
+```
+clawg stop --profile prod
+```
+
+Poné de nuevo el binario anterior en su nombre: renombrá `clawg.exe.old-<fecha>` (la carpeta de instalación es la de `clawg doctor`) a `clawg.exe`. Si la actualización migró el store, restaurá el snapshot de antes con ese binario:
+
+```
+clawg restore ~/.clawg/backups/memory-<fecha>-pre-migration.db --profile prod
+```
+
+`clawg restore` guarda el store actual como `pre-restore` antes de reemplazarlo. El siguiente comando que necesite el daemon lo arranca.
+
 ## Instalar en Windows
 
-Hoy no hay binarios publicados: se compila desde el código fuente y un script lo instala sólo para tu usuario, sin permisos de administrador. Son cinco pasos. Los comandos van en **PowerShell**.
+Esta sección compila desde el código fuente, por si preferís no usar el binario de un release o querés probar un cambio. Un script lo instala sólo para tu usuario, sin permisos de administrador. Son cinco pasos. Los comandos van en **PowerShell**.
 
 ### Paso 1. Instalar lo necesario
 
@@ -128,7 +217,7 @@ Opciones del script, por si las necesitás:
 
 El PATH actualizado sólo lo ven las terminales abiertas **después** de instalar. Cerrá la actual y abrí otra. Seguí con [Comprobar que funciona](#comprobar-que-funciona).
 
-> **¿Linux o macOS?** El script y `clawg path` son sólo para Windows. Podés compilar con `cargo build --release -p clawg-cli` y poner `target/release/clawg` en tu PATH a mano, pero esa ruta no está probada.
+> **¿Linux o macOS?** El script y `clawg path` son sólo para Windows. En Linux x86_64 usá el binario del release ([Linux](#linux)); en otras plataformas podés compilar con `cargo build --release -p clawg-cli` y poner `target/release/clawg` en tu PATH a mano, pero esa ruta no está probada.
 
 ## Comprobar que funciona
 
@@ -356,6 +445,7 @@ clawg mcp --profile dev       # puente MCP por stdio; arranca un daemon si no ha
 clawg status --profile dev    # estado y salud del daemon en JSON (sale con 1 si no está corriendo)
 clawg stop --profile dev      # detiene el daemon
 clawg doctor                  # a qué clawg resuelve el PATH (sale con 1 si hay uno que tapa o está duplicado)
+clawg update --check          # dice si hay un release nuevo (100 si lo hay); clawg update lo instala
 clawg memories list|search|show|stats   # visor de sólo lectura (list --deleted: las borradas)
 clawg undelete 12 --profile dev         # devuelve una memoria borrada (con el daemon corriendo)
 ```

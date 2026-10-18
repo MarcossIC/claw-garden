@@ -236,6 +236,14 @@ pub fn store_owner_file(base_dir: &std::path::Path) -> PathBuf {
     base_dir.join("memory.owner")
 }
 
+/// The file whose exclusive OS lock means "a `clawg update` is running for this
+/// profile" (`<base_dir>/update.lock`). It sits in the data directory, not
+/// beside the binary, because what two updates fight over is the profile's
+/// daemon, whichever copy of the binary each one is.
+pub fn update_lock_file(base_dir: &std::path::Path) -> PathBuf {
+    base_dir.join("update.lock")
+}
+
 /// Where snapshots of `memory.db` go (`<base_dir>/backups`).
 pub fn backups_dir(base_dir: &std::path::Path) -> PathBuf {
     base_dir.join("backups")
@@ -431,6 +439,13 @@ mod tests {
     fn store_lock_file_is_memory_lock_under_base_dir() {
         let base = PathBuf::from("/base");
         assert_eq!(store_lock_file(&base), base.join("memory.lock"));
+    }
+
+    #[test]
+    fn update_lock_file_is_update_lock_under_base_dir() {
+        let base = PathBuf::from("/base");
+        assert_eq!(update_lock_file(&base), base.join("update.lock"));
+        assert_ne!(update_lock_file(&base), store_lock_file(&base));
     }
 
     #[test]

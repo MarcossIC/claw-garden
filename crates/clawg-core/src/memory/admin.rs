@@ -1219,6 +1219,7 @@ mod tests {
             agent_id: None,
             piece: None,
             exact: false,
+            topic_key: None,
         }
     }
 
@@ -2062,6 +2063,7 @@ mod tests {
             agent_id: None,
             piece: None,
             exact: false,
+            topic_key: None,
         }
     }
 
@@ -2938,6 +2940,7 @@ mod tests {
             agent_id: None,
             piece: None,
             exact: false,
+            topic_key: None,
         }];
 
         assert_eq!(format_skill_hits(&hits), "skill_hits=1");

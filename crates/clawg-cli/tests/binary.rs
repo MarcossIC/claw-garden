@@ -56,7 +56,11 @@ impl Sandbox {
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        let mut cmd = Command::new(BIN);
+        self.command_of(Path::new(BIN), args)
+    }
+
+    fn command_of(&self, bin: &Path, args: &[&str]) -> Command {
+        let mut cmd = Command::new(bin);
         cmd.args(args)
             .env("CLAWG_TEST_HOME", &self.home)
             .env("CLAWG_TEST_EMBEDDER", "fake")
@@ -77,9 +81,14 @@ impl Sandbox {
     }
 
     async fn serve_with(&self, embedder: &str) -> Daemon {
+        self.serve_binary(Path::new(BIN), embedder).await
+    }
+
+    /// A daemon run from the copy of the binary at `bin`.
+    async fn serve_binary(&self, bin: &Path, embedder: &str) -> Daemon {
         let log = self.log(&format!("serve-{}", now_ns()));
         let child = self
-            .command(&["serve", "--profile", "dev", "--port", "0"])
+            .command_of(bin, &["serve", "--profile", "dev", "--port", "0"])
             .env("CLAWG_TEST_EMBEDDER", embedder)
             .stdout(Stdio::null())
             .stderr(File::create(&log).expect("log file"))
@@ -91,11 +100,16 @@ impl Sandbox {
     /// A bridge started in an empty folder of its own, so the root it
     /// registers has nothing to index.
     fn bridge(&self) -> Bridge {
+        self.bridge_of(Path::new(BIN))
+    }
+
+    /// A bridge run from the copy of the binary at `bin`.
+    fn bridge_of(&self, bin: &Path) -> Bridge {
         let root = self.home.join(format!("project-{}", now_ns()));
         std::fs::create_dir_all(&root).expect("project dir");
         let log = self.log(&format!("mcp-{}", now_ns()));
         let mut child = self
-            .command(&["mcp", "--profile", "dev", "--no-autostart", "--agent", "smoke"])
+            .command_of(bin, &["mcp", "--profile", "dev", "--no-autostart", "--agent", "smoke"])
             .current_dir(&root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -222,6 +236,20 @@ impl Daemon {
             .expect("list");
         assert!(r.status().is_success(), "{}", r.status());
         r.text().await.expect("list body")
+    }
+
+    /// Until the model is loaded. `/health` answers before it is, and a save
+    /// sent meanwhile is queued (202) instead of stored (201).
+    async fn wait_until_ready(&self) {
+        let deadline = Instant::now() + START_BUDGET;
+        loop {
+            let health = self.health().await;
+            if health["embedder"] == "ready" {
+                return;
+            }
+            assert!(Instant::now() < deadline, "the model did not load: {health}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     /// Until no accepted save is still waiting to be stored.
@@ -454,6 +482,7 @@ async fn a_debug_binary_refuses_prod_even_with_a_test_home() {
 async fn a_restored_backup_brings_back_its_rows_and_keeps_the_replaced_store() {
     let sandbox = Sandbox::new();
     let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
     let (status, body) = daemon
         .post("/v1/memories", json!({ "content": "kept by the backup", "agent_id": "smoke" }))
         .await;
@@ -564,4 +593,638 @@ async fn a_test_that_fails_midway_leaves_no_daemon_holding_the_store() {
     // Only a daemon that is gone has let go of the store lock.
     let daemon = sandbox.serve().await;
     assert!(daemon.exit_status().is_none());
+}
+
+// ── Bytes after the executable ─────────────────────────────────────────────
+
+/// A copy of the test binary with `0x00 CLAWG-TEST-STAMP <json>` after its
+/// image, which only a `testing` build reads.
+fn stamped_copy(dir: &Path, json: &str) -> PathBuf {
+    let copy = dir.join(format!("clawg-copy{}", std::env::consts::EXE_SUFFIX));
+    write_executable(&copy, &stamped_bytes(json));
+    copy
+}
+
+/// The test binary with `0x00 CLAWG-TEST-STAMP <json>` after its image.
+fn stamped_bytes(json: &str) -> Vec<u8> {
+    let mut bytes = std::fs::read(BIN).expect("read the test binary");
+    bytes.push(0);
+    bytes.extend_from_slice(format!("CLAWG-TEST-STAMP {json}").as_bytes());
+    bytes
+}
+
+fn write_executable(path: &Path, bytes: &[u8]) {
+    std::fs::write(path, bytes).expect("write the copy");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+}
+
+fn run_binary(sandbox: &Sandbox, bin: &Path, args: &[&str]) -> Output {
+    Command::new(bin)
+        .args(args)
+        .env("CLAWG_TEST_HOME", &sandbox.home)
+        .env_remove("CLAWG_PROFILE")
+        .current_dir(&sandbox.home)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run clawg")
+}
+
+#[tokio::test]
+async fn trailing_bytes_after_the_executable_image_do_not_change_execution() {
+    let sandbox = Sandbox::new();
+    let copy = stamped_copy(&sandbox.home, "{}");
+
+    for args in [&["--version"][..], &["status", "--profile", "dev"][..]] {
+        let original = run_binary(&sandbox, Path::new(BIN), args);
+        let stamped = run_binary(&sandbox, &copy, args);
+        assert_eq!(original.status.code(), stamped.status.code(), "{args:?}: {}", stderr_of(&stamped));
+        assert_eq!(original.stdout, stamped.stdout, "{args:?}");
+        assert_eq!(original.stderr, stamped.stderr, "{args:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_test_build_reads_its_version_from_the_stamp() {
+    let sandbox = Sandbox::new();
+    let copy = stamped_copy(&sandbox.home, r#"{"version":"0.0.1"}"#);
+
+    let out = run_binary(&sandbox, &copy, &["--version"]);
+
+    assert_eq!(stdout_of(&out).trim(), "clawg 0.0.1", "{}", stderr_of(&out));
+    let unstamped = run_binary(&sandbox, Path::new(BIN), &["--version"]);
+    assert_eq!(stdout_of(&unstamped).trim(), format!("clawg {}", env!("CARGO_PKG_VERSION")));
+}
+
+// ── update --check ─────────────────────────────────────────────────────────
+
+/// The target the stamped copies claim to be distributed for.
+const STAMPED_TARGET: &str =
+    if cfg!(windows) { "x86_64-pc-windows-msvc" } else { "x86_64-unknown-linux-gnu" };
+
+/// A release server on an ephemeral port that answers the listing with
+/// `releases` and counts the requests it gets.
+struct ReleaseServer {
+    base: String,
+    hits: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ReleaseServer {
+    async fn start(releases: Value) -> Self {
+        Self::serving(releases, std::collections::HashMap::new()).await
+    }
+
+    /// Also serves `files`, by name, as the downloads of any release tag.
+    async fn serving(releases: Value, files: std::collections::HashMap<String, Vec<u8>>) -> Self {
+        use axum::extract::{Path as UrlPath, State};
+        use axum::http::StatusCode;
+        use axum::routing::get;
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = hits.clone();
+        let app = axum::Router::new()
+            .route(
+                "/repos/MarcossIC/claw-garden/releases",
+                get(move || {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let body = releases.to_string();
+                    async move { ([("content-type", "application/json")], body) }
+                }),
+            )
+            .route(
+                "/MarcossIC/claw-garden/releases/download/{tag}/{name}",
+                get(
+                    |State(files): State<Arc<std::collections::HashMap<String, Vec<u8>>>>,
+                     UrlPath((_tag, name)): UrlPath<(String, String)>| async move {
+                        match files.get(&name) {
+                            Some(bytes) => Ok(bytes.clone()),
+                            None => Err(StatusCode::NOT_FOUND),
+                        }
+                    },
+                ),
+            )
+            .with_state(Arc::new(files));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        Self { base, hits }
+    }
+
+    /// An address nothing listens on.
+    async fn down() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        format!("http://{}", listener.local_addr().expect("addr"))
+    }
+
+    fn hits(&self) -> usize {
+        self.hits.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+fn listing(tags: &[&str]) -> Value {
+    Value::Array(
+        tags.iter()
+            .map(|tag| json!({ "tag_name": tag, "draft": false, "prerelease": false, "assets": [] }))
+            .collect(),
+    )
+}
+
+fn update(sandbox: &Sandbox, bin: &Path, server: &str, args: &[&str]) -> Output {
+    Command::new(bin)
+        .arg("update")
+        .args(args)
+        .env("CLAWG_TEST_HOME", &sandbox.home)
+        .env("CLAWG_TEST_RELEASE_URL", server)
+        .env_remove("CLAWG_PROFILE")
+        .current_dir(&sandbox.home)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run clawg update")
+}
+
+// The server runs in this process while the binary is waited on.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_check_reports_a_newer_version_and_an_up_to_date_one() {
+    let sandbox = Sandbox::new();
+    let installed = stamped_copy(
+        &sandbox.home,
+        &format!(r#"{{"version":"0.18.0","dist_target":"{STAMPED_TARGET}"}}"#),
+    );
+    let before = std::fs::read(&installed).expect("read the installed binary");
+
+    let newer = ReleaseServer::start(listing(&["v0.18.0", "v0.19.0"])).await;
+    let out = update(&sandbox, &installed, &newer.base, &["--check"]);
+    assert_eq!(out.status.code(), Some(100), "{}", stderr_of(&out));
+    assert!(stdout_of(&out).contains("0.19.0"), "{}", stdout_of(&out));
+    assert_eq!(newer.hits(), 1);
+
+    let same = ReleaseServer::start(listing(&["v0.18.0", "v0.17.0"])).await;
+    let out = update(&sandbox, &installed, &same.base, &["--check"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    assert!(stdout_of(&out).contains("up to date"), "{}", stdout_of(&out));
+
+    let out = update(&sandbox, &installed, &ReleaseServer::down().await, &["--check"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout_of(&out));
+    assert!(!stderr_of(&out).is_empty());
+
+    assert_eq!(std::fs::read(&installed).expect("read again"), before, "--check changes nothing");
+}
+
+// The server runs in this process while the binary is waited on.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_refuses_a_binary_without_a_stamp() {
+    let sandbox = Sandbox::new();
+    let server = ReleaseServer::start(listing(&["v99.0.0"])).await;
+
+    for args in [&["--check"][..], &[][..]] {
+        let out = update(&sandbox, Path::new(BIN), &server.base, args);
+        assert_eq!(out.status.code(), Some(1), "{}", stdout_of(&out));
+        assert!(stderr_of(&out).contains("built locally"), "{}", stderr_of(&out));
+    }
+    assert_eq!(server.hits(), 0, "a refused binary asks nothing");
+}
+
+// ── update ─────────────────────────────────────────────────────────────────
+
+/// A release whose files are signed on the spot, with the public key that
+/// verifies them.
+struct SignedRelease {
+    listing: Value,
+    files: std::collections::HashMap<String, Vec<u8>>,
+    /// The text of the `.pub` file.
+    public: String,
+    /// What the release's executable holds.
+    binary: Vec<u8>,
+}
+
+fn stamp_json(version: &str, extra: &str) -> String {
+    format!(r#"{{"version":"{version}","dist_target":"{STAMPED_TARGET}"{extra}}}"#)
+}
+
+/// A release `version` whose executable is the test binary stamped as that
+/// version, with `extra` fields (`,"migrations_up_to":7`) in its stamp.
+fn signed_release(version: &str, extra: &str) -> SignedRelease {
+    use sha2::{Digest, Sha256};
+    let asset = format!("clawg-{STAMPED_TARGET}{}", if cfg!(windows) { ".exe" } else { "" });
+    let binary = stamped_bytes(&stamp_json(version, extra));
+    let hash: String = Sha256::digest(&binary).iter().map(|b| format!("{b:02x}")).collect();
+    let sums = format!("{hash}  {asset}\n");
+    let pair = minisign::KeyPair::generate_unencrypted_keypair().expect("key pair");
+    let public = pair.pk.to_box().expect("public key").into_string();
+    let signature = minisign::sign(
+        None,
+        &pair.sk,
+        std::io::Cursor::new(sums.as_bytes()),
+        Some(&format!("clawg v{version} SHA256SUMS")),
+        None,
+    )
+    .expect("sign")
+    .into_string();
+    let listing = json!([{
+        "tag_name": format!("v{version}"),
+        "draft": false,
+        "prerelease": false,
+        "assets": [{ "name": asset }, { "name": "SHA256SUMS" }, { "name": "SHA256SUMS.minisig" }],
+    }]);
+    let files = std::collections::HashMap::from([
+        (asset, binary.clone()),
+        ("SHA256SUMS".to_string(), sums.into_bytes()),
+        ("SHA256SUMS.minisig".to_string(), signature.into_bytes()),
+    ]);
+    SignedRelease { listing, files, public, binary }
+}
+
+/// Where the installed copy lives, as an installer would leave it.
+fn install(sandbox: &Sandbox, stamp: &str) -> PathBuf {
+    let dir = sandbox.home.join("bin");
+    std::fs::create_dir_all(&dir).expect("bin dir");
+    let installed = dir.join(format!("clawg{}", std::env::consts::EXE_SUFFIX));
+    write_executable(&installed, &stamped_bytes(stamp));
+    installed
+}
+
+/// `clawg update`, from `installed`, against `server`, trusting `public`.
+fn update_from(sandbox: &Sandbox, installed: &Path, server: &str, public: &str) -> Output {
+    Command::new(installed)
+        .arg("update")
+        .env("CLAWG_TEST_HOME", &sandbox.home)
+        .env("CLAWG_TEST_EMBEDDER", "fake")
+        .env("CLAWG_TEST_RELEASE_URL", server)
+        .env("CLAWG_TEST_RELEASE_KEYS", json!([public]).to_string())
+        .env_remove("CLAWG_PROFILE")
+        .current_dir(&sandbox.home)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run clawg update")
+}
+
+/// Stops, when it drops, whatever daemon the profile has: the one `update`
+/// starts is not a child of the test.
+struct StopOnDrop {
+    home: PathBuf,
+}
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        let _ = Command::new(BIN)
+            .args(["stop", "--profile", "dev"])
+            .env("CLAWG_TEST_HOME", &self.home)
+            .env_remove("CLAWG_PROFILE")
+            .stdin(Stdio::null())
+            .output();
+    }
+}
+
+/// `/health` of the daemon the data directory names.
+async fn published_health(data_dir: &Path) -> Value {
+    let state: Value =
+        serde_json::from_str(&std::fs::read_to_string(data_dir.join("daemon.json")).expect("daemon.json"))
+            .expect("daemon.json is JSON");
+    let port = state["port"].as_u64().expect("port");
+    reqwest::get(format!("http://127.0.0.1:{port}/health"))
+        .await
+        .expect("health")
+        .json()
+        .await
+        .expect("health json")
+}
+
+/// The files beside the installed binary whose name starts with `prefix`.
+fn beside(installed: &Path, prefix: &str) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(installed.parent().expect("dir"))
+        .expect("read the install dir")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(prefix)))
+        .collect();
+    found.sort();
+    found
+}
+
+/// The newest migration this build of clawg knows.
+fn last_migration() -> i32 {
+    clawg_core::memory::backup::known_migrations()
+        .iter()
+        .map(|m| m.version)
+        .max()
+        .expect("the binary has migrations")
+}
+
+/// What the daemon the data directory names answers to `path`.
+async fn published_get(data_dir: &Path, path: &str) -> String {
+    let state: Value =
+        serde_json::from_str(&std::fs::read_to_string(data_dir.join("daemon.json")).expect("daemon.json"))
+            .expect("daemon.json is JSON");
+    let token = std::fs::read_to_string(data_dir.join("token")).expect("token");
+    let response = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{}{path}", state["port"]))
+        .bearer_auth(token.trim())
+        .send()
+        .await
+        .expect("request");
+    assert!(response.status().is_success(), "{path}: {}", response.status());
+    response.text().await.expect("body")
+}
+
+const SEEDED: [&str; 2] = [
+    "the lighthouse keeper logs every ship that passes",
+    "the harbour master closes the gate at midnight",
+];
+
+/// A daemon of the installed copy with `SEEDED` saved through it.
+async fn seeded_store(sandbox: &Sandbox) -> (PathBuf, Daemon) {
+    let installed = install(sandbox, &stamp_json("0.18.0", ""));
+    let old = sandbox.serve_binary(&installed, "fake").await;
+    old.wait_until_ready().await;
+    for text in SEEDED {
+        let (status, body) = old.post("/v1/memories", json!({ "content": text, "agent_id": "smoke" })).await;
+        assert_eq!(status, 201, "{body}");
+    }
+    old.wait_until_ingested().await;
+    (installed, old)
+}
+
+/// The schema the installed binary of a store with a pending migration is
+/// frozen at. Fixed, not "the last one minus one": the rows are inserted by
+/// SQL against this schema, so a later migration only adds one more pending.
+const OLD_SCHEMA: i32 = 15;
+
+/// A daemon of an installed copy frozen at [`OLD_SCHEMA`], over a store with
+/// `SEEDED` in it.
+async fn store_behind(sandbox: &Sandbox) -> (PathBuf, Daemon) {
+    let installed = install(sandbox, &stamp_json("0.18.0", &format!(r#","migrations_up_to":{OLD_SCHEMA}"#)));
+    // The first start only creates the store at that schema.
+    let first = sandbox.serve_binary(&installed, "fake").await;
+    let stopped = sandbox.command_of(&installed, &["stop", "--profile", "dev"]).output().expect("run clawg stop");
+    assert!(stopped.status.success(), "{}", stderr_of(&stopped));
+    first.wait_for_exit(Duration::from_secs(10)).await;
+
+    let db = rusqlite::Connection::open(sandbox.data_dir().join("memory.db")).expect("open the store");
+    for text in SEEDED {
+        db.execute(
+            "INSERT INTO memory (agent_id, content, created_at, last_modified_at, last_accessed_at) \
+             VALUES ('smoke', ?1, 0, 0, 0)",
+            [text],
+        )
+        .expect("seed a row");
+    }
+    drop(db);
+    (installed.clone(), sandbox.serve_binary(&installed, "fake").await)
+}
+
+/// The `pre-migration` snapshots in the data directory.
+fn pre_migrations(data_dir: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(data_dir.join("backups"))
+        .map(|rd| rd.map(|e| e.expect("entry").path()).collect())
+        .unwrap_or_default();
+    found.retain(|p| {
+        let name = p.file_name().expect("name").to_string_lossy().into_owned();
+        clawg_core::memory::backup::parse_snapshot_name(&name) == Some(clawg_core::memory::backup::Reason::PreMigration)
+    });
+    found.sort();
+    found
+}
+
+// The server runs in this process while the binary is waited on.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_over_a_pending_migration_leaves_a_pre_migration_snapshot_and_the_data() {
+    let sandbox = Sandbox::new();
+    let (installed, old) = store_behind(&sandbox).await;
+    let release = signed_release("0.19.0", "");
+    let server = ReleaseServer::serving(release.listing.clone(), release.files.clone()).await;
+    let _stop = StopOnDrop { home: sandbox.home.clone() };
+
+    let out = update_from(&sandbox, &installed, &server.base, &release.public);
+
+    assert_eq!(out.status.code(), Some(0), "{}\n{}", stdout_of(&out), stderr_of(&out));
+    old.wait_for_exit(Duration::from_secs(10)).await;
+    let health = published_health(&sandbox.data_dir()).await;
+    assert_eq!(health["version"], "0.19.0", "{health}");
+
+    let snapshots = pre_migrations(&sandbox.data_dir());
+    assert_eq!(snapshots.len(), 1, "{snapshots:?}");
+    let report = stdout_of(&out);
+    assert!(report.contains(&snapshots[0].display().to_string()), "the snapshot is named: {report}");
+    let before = rusqlite::Connection::open(&snapshots[0]).expect("open the snapshot");
+    let version: i32 = before
+        .query_row("SELECT max(version) FROM refinery_schema_history", [], |r| r.get(0))
+        .expect("snapshot schema");
+    assert_eq!(version, OLD_SCHEMA, "the snapshot is the store as the old binary left it");
+
+    let rows = published_get(&sandbox.data_dir(), "/v1/memories?limit=100").await;
+    for text in SEEDED {
+        assert!(rows.contains(text), "{text:?} survived the migration: {rows}");
+    }
+}
+
+// The server runs in this process while the binary is waited on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_binary_that_migrated_and_failed_gets_its_pre_migration_restored() {
+    let sandbox = Sandbox::new();
+    let (installed, old) = store_behind(&sandbox).await;
+    let original = std::fs::read(&installed).expect("read the installed binary");
+    let release = signed_release("0.19.0", r#","serve_fault":"after_open""#);
+    let server = ReleaseServer::serving(release.listing.clone(), release.files.clone()).await;
+    let _stop = StopOnDrop { home: sandbox.home.clone() };
+
+    let out = update_from(&sandbox, &installed, &server.base, &release.public);
+
+    assert_eq!(out.status.code(), Some(1), "{}\n{}", stdout_of(&out), stderr_of(&out));
+    let report = stderr_of(&out);
+    assert!(report.contains("starting the new daemon"), "{report}");
+    assert!(report.contains("Everything was put back: clawg 0.18.0 is installed"), "{report}");
+    let snapshots = pre_migrations(&sandbox.data_dir());
+    assert_eq!(snapshots.len(), 1, "{snapshots:?}");
+    assert!(report.contains(&format!("The store was restored from {}", snapshots[0].display())), "{report}");
+    assert!(report.contains("What the new daemon had migrated is kept at"), "{report}");
+    assert!(report.contains("Its daemon is running again"), "{report}");
+    assert_eq!(std::fs::read(&installed).expect("read the installed binary"), original);
+    assert!(beside(&installed, "clawg.new-").is_empty(), "the staged file is gone");
+
+    old.wait_for_exit(Duration::from_secs(10)).await;
+    let health = published_health(&sandbox.data_dir()).await;
+    assert_eq!(health["version"], "0.18.0", "the old binary's daemon answers: {health}");
+    let kept: Vec<PathBuf> = std::fs::read_dir(sandbox.data_dir().join("backups"))
+        .expect("backups")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.to_string_lossy().ends_with("-pre-restore.db"))
+        .collect();
+    assert_eq!(kept.len(), 1, "the migrated store is kept: {kept:?}");
+    let migrated = rusqlite::Connection::open(&kept[0]).expect("open the kept store");
+    let version: i32 = migrated
+        .query_row("SELECT max(version) FROM refinery_schema_history", [], |r| r.get(0))
+        .expect("kept schema");
+    assert_eq!(version, last_migration(), "the kept store is the one the new daemon migrated");
+    // Read from the file: a daemon frozen at an old schema runs the current
+    // queries, which name columns that schema lacks, so its list is a 500.
+    let restored = rusqlite::Connection::open(sandbox.data_dir().join("memory.db")).expect("open the store");
+    let version: i32 = restored
+        .query_row("SELECT max(version) FROM refinery_schema_history", [], |r| r.get(0))
+        .expect("store schema");
+    assert_eq!(version, OLD_SCHEMA, "the store is the one from before the migration");
+    let rows: Vec<String> = restored
+        .prepare("SELECT content FROM memory ORDER BY id")
+        .and_then(|mut q| q.query_map([], |r| r.get(0)).and_then(Iterator::collect))
+        .expect("read the rows");
+    assert_eq!(rows, SEEDED, "the seeded rows are back");
+}
+
+// The server runs in this process while the binary is waited on.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_whose_candidate_refuses_the_store_leaves_the_old_binary_and_its_daemon() {
+    let sandbox = Sandbox::new();
+    // The installed binary knows every migration and has migrated the store;
+    // the candidate knows one less, as an older release would.
+    let (installed, old) = seeded_store(&sandbox).await;
+    let original = std::fs::read(&installed).expect("read the installed binary");
+    let behind = format!(r#","migrations_up_to":{}"#, last_migration() - 1);
+    let release = signed_release("0.19.0", &behind);
+    let server = ReleaseServer::serving(release.listing.clone(), release.files.clone()).await;
+    let _stop = StopOnDrop { home: sandbox.home.clone() };
+    let backups_before = std::fs::read_dir(sandbox.data_dir().join("backups")).map(|rd| rd.count()).unwrap_or(0);
+
+    let out = update_from(&sandbox, &installed, &server.base, &release.public);
+
+    assert_eq!(out.status.code(), Some(1), "{}
+{}", stdout_of(&out), stderr_of(&out));
+    let report = stderr_of(&out);
+    assert!(report.contains("newer than the"), "the refusal is named: {report}");
+    assert!(report.contains("Everything was put back: clawg 0.18.0 is installed"), "{report}");
+    assert!(report.contains("Its daemon is running again"), "{report}");
+    assert_eq!(std::fs::read(&installed).expect("read the installed binary"), original);
+    assert!(beside(&installed, "clawg.new-").is_empty(), "the staged file is gone");
+
+    old.wait_for_exit(Duration::from_secs(10)).await;
+    let health = published_health(&sandbox.data_dir()).await;
+    assert_eq!(health["version"], "0.18.0", "{health}");
+    let backups_after = std::fs::read_dir(sandbox.data_dir().join("backups")).map(|rd| rd.count()).unwrap_or(0);
+    assert_eq!(backups_after, backups_before, "the refused store was not snapshotted or touched");
+    let rows = published_get(&sandbox.data_dir(), "/v1/memories?limit=100").await;
+    for text in SEEDED {
+        assert!(rows.contains(text), "{text:?} is still there: {rows}");
+    }
+}
+
+// The server runs in this process while the binary is waited on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_binary_that_does_not_start_brings_the_old_one_and_its_daemon_back() {
+    let sandbox = Sandbox::new();
+    let installed = install(&sandbox, &stamp_json("0.18.0", ""));
+    let original = std::fs::read(&installed).expect("read the installed binary");
+    let old = sandbox.serve_binary(&installed, "fake").await;
+    let release = signed_release("0.19.0", r#","serve_fault":"before_open""#);
+    let server = ReleaseServer::serving(release.listing.clone(), release.files.clone()).await;
+    let _stop = StopOnDrop { home: sandbox.home.clone() };
+
+    let out = update_from(&sandbox, &installed, &server.base, &release.public);
+
+    assert_eq!(out.status.code(), Some(1), "{}\n{}", stdout_of(&out), stderr_of(&out));
+    let report = stderr_of(&out);
+    assert!(report.contains("starting the new daemon"), "{report}");
+    assert!(report.contains("Everything was put back: clawg 0.18.0 is installed"), "{report}");
+    assert!(report.contains("Its daemon is running again"), "{report}");
+    assert_eq!(std::fs::read(&installed).expect("read the installed binary"), original);
+    assert!(beside(&installed, "clawg.new-").is_empty(), "the staged file is gone");
+    assert!(beside(&installed, &format!("clawg{}.old-", std::env::consts::EXE_SUFFIX)).is_empty());
+
+    old.wait_for_exit(Duration::from_secs(10)).await;
+    let health = published_health(&sandbox.data_dir()).await;
+    assert_eq!(health["version"], "0.18.0", "the old binary's daemon answers: {health}");
+    assert_ne!(health["pid"].as_u64(), Some(u64::from(old.pid)), "started again, not the one that was stopped");
+}
+
+// The daemon runs from another copy than the one that updates, as after a
+// file replaced under a running daemon: it reports a version the installed
+// binary does not have, and the one brought back must be waited for by the
+// installed binary's own version.
+// The server runs in this process while the binary is waited on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_daemon_is_brought_back_by_the_installed_binary_when_the_new_one_does_not_start() {
+    let sandbox = Sandbox::new();
+    let installed = install(&sandbox, &stamp_json("0.18.0", ""));
+    let original = std::fs::read(&installed).expect("read the installed binary");
+    let other = sandbox.home.join("other").join(installed.file_name().expect("name"));
+    std::fs::create_dir_all(other.parent().expect("dir")).expect("other dir");
+    write_executable(&other, &stamped_bytes(&stamp_json("0.17.0", "")));
+    let old = sandbox.serve_binary(&other, "fake").await;
+    let release = signed_release("0.19.0", r#","serve_fault":"before_open""#);
+    let server = ReleaseServer::serving(release.listing.clone(), release.files.clone()).await;
+    let _stop = StopOnDrop { home: sandbox.home.clone() };
+
+    // The wait for a daemon of the wrong version lasts ten minutes, so the
+    // update is given a deadline instead of being waited on.
+    let (out_log, err_log) = (sandbox.log("update-out"), sandbox.log("update-err"));
+    let mut update = Command::new(&installed)
+        .arg("update")
+        .env("CLAWG_TEST_HOME", &sandbox.home)
+        .env("CLAWG_TEST_EMBEDDER", "fake")
+        .env("CLAWG_TEST_RELEASE_URL", &server.base)
+        .env("CLAWG_TEST_RELEASE_KEYS", json!([release.public]).to_string())
+        .env_remove("CLAWG_PROFILE")
+        .current_dir(&sandbox.home)
+        .stdin(Stdio::null())
+        .stdout(File::create(&out_log).expect("log file"))
+        .stderr(File::create(&err_log).expect("log file"))
+        .spawn()
+        .expect("run clawg update");
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = update.try_wait().expect("wait for the update") {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = update.kill();
+            let _ = update.wait();
+            panic!(
+                "the update did not finish in 120 s\n{}",
+                std::fs::read_to_string(&err_log).unwrap_or_default()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+
+    let report = std::fs::read_to_string(&err_log).expect("update stderr");
+    assert_eq!(status.code(), Some(1), "{}\n{report}", std::fs::read_to_string(&out_log).unwrap_or_default());
+    assert!(report.contains("Everything was put back: clawg 0.18.0 is installed"), "{report}");
+    assert!(report.contains("Its daemon is running again"), "{report}");
+    assert_eq!(std::fs::read(&installed).expect("read the installed binary"), original);
+
+    old.wait_for_exit(Duration::from_secs(10)).await;
+    let health = published_health(&sandbox.data_dir()).await;
+    assert_eq!(health["version"], "0.18.0", "the installed binary's daemon answers: {health}");
+}
+
+// The server runs in this process while the binary is waited on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_update_with_a_daemon_replaces_the_binary_and_a_bridge_reaches_the_new_daemon() {
+    let sandbox = Sandbox::new();
+    let installed = install(&sandbox, &stamp_json("0.18.0", ""));
+    let original = std::fs::read(&installed).expect("read the installed binary");
+    let old = sandbox.serve_binary(&installed, "fake").await;
+    let mut bridge = sandbox.bridge_of(&installed);
+    bridge.initialize();
+    assert!(!tool_failed(&bridge.call(2, "memory_status", json!({}))));
+    let release = signed_release("0.19.0", "");
+    let server = ReleaseServer::serving(release.listing.clone(), release.files.clone()).await;
+    let _stop = StopOnDrop { home: sandbox.home.clone() };
+
+    let out = update_from(&sandbox, &installed, &server.base, &release.public);
+
+    assert_eq!(out.status.code(), Some(0), "{}\n{}", stdout_of(&out), stderr_of(&out));
+    let report = stdout_of(&out);
+    assert!(report.contains("0.18.0") && report.contains("0.19.0"), "{report}");
+    old.wait_for_exit(Duration::from_secs(10)).await;
+    let health = published_health(&sandbox.data_dir()).await;
+    assert_eq!(health["version"], "0.19.0", "{health}");
+    assert_ne!(health["pid"].as_u64(), Some(u64::from(old.pid)), "a new daemon, not the old one");
+
+    assert_eq!(std::fs::read(&installed).expect("read the installed binary"), release.binary);
+    let aside = beside(&installed, &format!("clawg{}.old-", std::env::consts::EXE_SUFFIX));
+    assert_eq!(aside.len(), 1, "{aside:?}");
+    assert_eq!(std::fs::read(&aside[0]).expect("read the old binary"), original);
+    assert!(beside(&installed, "clawg.new-").is_empty(), "the staged file is gone");
+
+    let reply = bridge.call(3, "memory_status", json!({}));
+    assert!(!tool_failed(&reply), "the open bridge must find the new daemon: {reply}");
 }

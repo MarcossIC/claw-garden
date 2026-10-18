@@ -143,13 +143,13 @@ El worker MUST seguir aplicando `redact` al contenido de cada evento, de cualqui
 
 ### R3. El save dice qué se enmascaró
 
-Una respuesta `201` de `POST /v1/memories` MUST incluir `redacted`, cada tipo una vez y en el orden en que se enmascaró, cuando no está vacía, y MUST omitirlo cuando lo está (`SaveBody.redacted`, `crates/clawg-cli/src/daemon/api.rs:491`; `save_response`, `api.rs:821`). La lista une lo que el daemon enmascaró al aceptar el save con lo que el reporte del worker agrega (`masked_kinds`, `api.rs:868`; sólo un evento sin fila puede sumar algo en el worker):
+Una respuesta `201` de `POST /v1/memories` MUST incluir `redacted`, cada tipo una vez y en el orden en que se enmascaró, cuando no está vacía, y MUST omitirlo cuando lo está (`SaveBody.redacted`, `crates/clawg-cli/src/daemon/api.rs:491`; `save_response`, `api.rs:825`). La lista une lo que el daemon enmascaró al aceptar el save con lo que el reporte del worker agrega (`masked_kinds`, `api.rs:872`; sólo un evento sin fila puede sumar algo en el worker):
 
 ```json
 {"status": "saved", "memories": [{"kind": "memory", "id": 57, "outcome": "inserted"}], "redacted": ["github_token"]}
 ```
 
-`DaemonClient` MUST leerlo en `SaveOutcome::Saved.redacted` (`crates/clawg-cli/src/client.rs:434`), vacío si un daemon anterior no lo manda. `save_memory` MUST agregar al texto de éxito `; masked <tipos> before storing it` (`save_outcome_text`, `crates/clawg-cli/src/mcp/server.rs:563`). Las respuestas `202` no lo llevan, aunque el daemon ya haya enmascarado: su cuerpo es `status`, `reason` y `operation_id` (`SaveBody::queued`, `api.rs:507`).
+`DaemonClient` MUST leerlo en `SaveOutcome::Saved.redacted` (`crates/clawg-cli/src/client.rs:459`), vacío si un daemon anterior no lo manda. `save_memory` MUST agregar al texto de éxito `; masked <tipos> before storing it` (`save_outcome_text`, `crates/clawg-cli/src/mcp/server.rs:563`). Las respuestas `202` no lo llevan, aunque el daemon ya haya enmascarado: su cuerpo es `status`, `reason` y `operation_id` (`SaveBody::queued`, `api.rs:507`).
 
 #### Escenario
 - GIVEN un daemon con el embedder listo
@@ -162,7 +162,7 @@ Una respuesta `201` de `POST /v1/memories` MUST incluir `redacted`, cada tipo un
 
 ### R4. `clawg secrets` reporta sin mostrar el secreto
 
-`clawg secrets [--profile P]` (`Command::Secrets`, `crates/clawg-cli/src/cli.rs:82`; `main.rs:152`) MUST recorrer todas las filas de `memory`, vivas y borradas, e imprimir una línea por fila con secreto: `memory <id> <tipos> <live|deleted>`. La salida MUST NOT contener ningún carácter de un secreto (sólo tipos, ids y estado): `Flagged` (`crates/clawg-core/src/memory/secrets.rs:24`) no lleva el contenido. Sin filas con secreto MUST decir `no stored memory holds a secret of a known format`. MUST terminar con 0 en los dos casos.
+`clawg secrets [--profile P]` (`Command::Secrets`, `crates/clawg-cli/src/cli.rs:82`; `main.rs:165`) MUST recorrer todas las filas de `memory`, vivas y borradas, e imprimir una línea por fila con secreto: `memory <id> <tipos> <live|deleted>`. La salida MUST NOT contener ningún carácter de un secreto (sólo tipos, ids y estado): `Flagged` (`crates/clawg-core/src/memory/secrets.rs:24`) no lleva el contenido. Sin filas con secreto MUST decir `no stored memory holds a secret of a known format`. MUST terminar con 0 en los dos casos.
 
 La lectura MUST hacerse en sólo lectura, sin el lock y sin migrar (`scan`, `secrets.rs:34`, con `open_for_probe`), de modo que funciona con el daemon andando. Sin `memory.db` MUST fallar diciendo que no hay base, sin crearla. El armado de la salida MUST ser puro (`report`, `crates/clawg-cli/src/secrets.rs:11`).
 
@@ -182,7 +182,7 @@ La lectura MUST hacerse en sólo lectura, sin el lock y sin migrar (`scan`, `sec
 
 ### R5. `clawg purge` saca una fila para siempre
 
-`clawg purge <ID> --yes [--profile P]` (`Command::Purge`, `cli.rs:89`; `main.rs:160`; `purge`, `crates/clawg-core/src/memory/secrets.rs:82`) MUST, en este orden:
+`clawg purge <ID> --yes [--profile P]` (`Command::Purge`, `cli.rs:89`; `main.rs:173`; `purge`, `crates/clawg-core/src/memory/secrets.rs:82`) MUST, en este orden:
 
 1. sin `--yes`, negarse sin abrir nada, con un mensaje que dice que no hay vuelta atrás y cómo confirmarlo (`confirm`, `crates/clawg-cli/src/secrets.rs:42`);
 2. si no existe `memory.db`, fallar diciendo que no hay base;

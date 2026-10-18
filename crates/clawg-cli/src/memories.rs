@@ -395,7 +395,7 @@ pub async fn run(
     now_ms: i64,
 ) -> Result<String, ClientError> {
     let health = client.health().await?;
-    if let Some(warning) = version_warning(&health.version, env!("CARGO_PKG_VERSION")) {
+    if let Some(warning) = version_warning(&health.version, clawg_core::build_info::version()) {
         eprintln!("{warning}");
     }
 

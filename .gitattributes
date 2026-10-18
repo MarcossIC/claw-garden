@@ -1,1 +1,4 @@
 *.sql text eol=lf
+release/*.pub text eol=lf
+
+crates/clawg-cli/src/update/testdata/* -text

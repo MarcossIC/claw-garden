@@ -2527,6 +2527,28 @@ async fn a_save_echoes_its_topic_key() {
 }
 
 #[tokio::test]
+async fn a_search_hit_and_the_save_read_carry_the_topic_key() {
+    let h = Harness::start().await;
+    let keyed = save_id(&h, json!({ "content": CONTENT, "agent_id": "a", "topic_key": "storage/engine" })).await;
+    let plain = save_id(&h, json!({ "content": "deploys happen on fridays", "agent_id": "a" })).await;
+
+    let (status, body) = h.post_json("/v1/search", json!({ "query": CONTENT, "agent_id": "a" })).await;
+    assert_eq!(status, 200, "{body}");
+    let hits = body["hits"].as_array().expect("hits array");
+    let hit = |id: i64| hits.iter().find(|hit| hit["id"].as_i64() == Some(id));
+    assert_eq!(hit(keyed).expect("keyed hit")["topic_key"], "storage/engine", "{body}");
+    if let Some(plain) = hit(plain) {
+        assert!(plain.get("topic_key").is_none(), "{body}");
+    }
+
+    let (status, save) = h.get_json(&format!("/v1/memories/memory/{keyed}/save?agent=a")).await;
+    assert_eq!(status, 200, "{save}");
+    assert_eq!(save["topic_key"], "storage/engine", "{save}");
+    let (_, save) = h.get_json(&format!("/v1/memories/memory/{plain}/save?agent=a")).await;
+    assert!(save.get("topic_key").is_none(), "{save}");
+}
+
+#[tokio::test]
 async fn restore_refuses_a_row_whose_topic_is_live_again() {
     let h = Harness::start().await;
     let save = |content: &str| json!({ "content": content, "agent_id": "a", "topic_key": "storage/engine" });

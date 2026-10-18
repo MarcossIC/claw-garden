@@ -40,11 +40,17 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 ## 7. Verificación
 
 - [x] `cargo test --workspace` y el clippy de `.claude/CLAUDE.md` en Linux.
-- [ ] Lo mismo en Windows, en `target-test`.
-- [ ] Compuerta previa y `rag-eval --real --diff` contra el ancla, con el modelo real y `docs/eval/`.
-- [x] `verify.md` (con lo pendiente).
-- [ ] Perfil dev con Claude Code.
+- [x] Lo mismo en Windows, en `target-test`.
+- [x] `rag-eval --real --diff` contra el ancla, con el modelo real y `docs/eval/`. La compuerta previa no se corrió: pasó a [revision-eval](../../revision-eval/exploration.md).
+- [x] `verify.md`.
+- [x] Perfil dev con Claude Code.
+
+## 7b. La clave en los hits y en `read_memory` (T10, hallazgo del perfil dev)
+
+- [x] Tests de formato en `tools.rs`, `a_search_hit_carries_its_topic_key` (`worker.rs`), `read_save_carries_the_key_of_the_row_asked_for` (`pieces.rs`) y `a_search_hit_and_the_save_read_carry_the_topic_key` (`tests/api.rs`).
+- [x] `topic_key` en `RankedHit`, `RawHit`, `SaveText`, `Hit` y `SavedText`; ` topic=K` en `format_hits` (sólo en hits propios) y en `format_save`; la oración de `protocol.md`.
+- Commits: `feat: show a memory's topic key in search hits and read_memory`, `docs: name the topic key in search hits and the save read`
 
 ## 8. Archive
 
-- [ ] Specs `ingest`, `pieces`, `update`, `disputes`, `storage` y `mcp`; `git mv` al archivo; subir el minor.
+- [x] Specs `ingest`, `pieces`, `update`, `disputes`, `storage` y `mcp`; `git mv` al archivo; subir el minor.

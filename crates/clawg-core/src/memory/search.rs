@@ -92,6 +92,10 @@ pub struct RankedHit {
     /// The row holds every identifier of the query and took the lexical
     /// bonus, so its score says nothing about how close the others are.
     pub exact: bool,
+    /// The key a save revises this row under; absent for a row saved without
+    /// one and for the tables that have no such column.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic_key: Option<String>,
 }
 
 /// Position `piece` (from 1) of a save stored as `pieces` rows.
@@ -197,7 +201,7 @@ pub fn serialize_f32_query_pub(v: &[f32]) -> Vec<u8> {
 // score order — `knn_one` is what turns this into a score-ordered result.
 const SEARCH_SQL_MEMORY: &str = "
     SELECT m.id, m.content, m.memory_type, m.tier, m.status, knn.distance,
-        m.created_at, m.last_accessed_at, m.importance, m.agent_id
+        m.created_at, m.last_accessed_at, m.importance, m.agent_id, m.topic_key
     FROM memory_vectors knn
     JOIN memory m ON m.id = knn.rowid
     WHERE knn.embedding MATCH ?1
@@ -214,7 +218,7 @@ const SEARCH_SQL_MEMORY: &str = "
 // the `'episode'` string this query still selects for display.
 const SEARCH_SQL_EPISODIC: &str = "
     SELECT epi.id, epi.task, 'episode' AS memory_type, epi.tier, epi.status, knn.distance,
-        epi.created_at, epi.last_accessed_at, epi.importance, epi.agent_id
+        epi.created_at, epi.last_accessed_at, epi.importance, epi.agent_id, NULL
     FROM episodic_vectors knn
     JOIN episodic_trajectory epi ON epi.id = knn.rowid
     WHERE knn.embedding MATCH ?1
@@ -229,7 +233,7 @@ const SEARCH_SQL_EPISODIC: &str = "
 // `DecayLambdas.procedure`, dispatched by `TableKind::Procedural`.
 const SEARCH_SQL_PROCEDURAL: &str = "
     SELECT pro.id, pro.skill_name, 'procedure' AS memory_type, pro.tier, pro.status, knn.distance,
-        pro.created_at, pro.last_accessed_at, pro.importance, pro.agent_id
+        pro.created_at, pro.last_accessed_at, pro.importance, pro.agent_id, NULL
     FROM procedural_vectors knn
     JOIN procedural_skill pro ON pro.id = knn.rowid
     WHERE knn.embedding MATCH ?1
@@ -479,6 +483,7 @@ async fn knn_one(
                             importance: row.get(8)?,
                             lexical_match: lexical_matches.contains(&id),
                             agent_id: row.get(9)?,
+                            topic_key: row.get(10)?,
                         })
                     },
                 )?;
@@ -538,6 +543,7 @@ async fn knn_one(
                     agent_id: r.agent_id,
                     piece: None,
                     exact: r.lexical_match,
+                    topic_key: r.topic_key,
                 })
                 .collect();
             // Sorted before the trim, not after: the widened window is cut
@@ -946,7 +952,7 @@ async fn identifier_matches(
 const LEXICAL_SCORE_SQL_PREFIX: &str = "
     SELECT m.id, m.content, m.memory_type, m.tier, m.status,
         vec_distance_l2(v.embedding, ?1) AS distance,
-        m.created_at, m.last_accessed_at, m.importance, m.agent_id
+        m.created_at, m.last_accessed_at, m.importance, m.agent_id, m.topic_key
     FROM memory_vectors v
     JOIN memory m NOT INDEXED ON m.id = v.rowid
     WHERE m.status IN ('active', 'disputed')
@@ -1055,6 +1061,7 @@ async fn score_lexical_candidates(
                     importance: row.get(8)?,
                     lexical_match: lexical_matches.contains(&id),
                     agent_id: row.get(9)?,
+                    topic_key: row.get(10)?,
                 })
             })?;
 
@@ -1074,6 +1081,7 @@ async fn score_lexical_candidates(
                     agent_id: r.agent_id,
                     piece: None,
                     exact: r.lexical_match,
+                    topic_key: r.topic_key,
                 });
             }
             Ok(hits)
@@ -1432,6 +1440,7 @@ mod tests {
             agent_id: None,
             piece: None,
             exact: false,
+            topic_key: None,
         };
         let h2 = RankedHit {
             id: 2,
@@ -1446,6 +1455,7 @@ mod tests {
             agent_id: None,
             piece: None,
             exact: false,
+            topic_key: None,
         };
         let mut hits = vec![h2, h1];
         hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
@@ -1475,6 +1485,7 @@ mod tests {
                 agent_id: None,
                 piece: None,
                 exact: false,
+                topic_key: None,
             }
         }
 
@@ -4986,6 +4997,7 @@ mod tests {
             agent_id: None,
             piece: None,
             exact: false,
+            topic_key: None,
         }
     }
 

@@ -30,6 +30,8 @@ pub(crate) struct RawHit {
     pub lexical_match: bool,
     /// Who saved the row: the reader, or an agent it was granted.
     pub agent_id: Option<String>,
+    /// The key a save revises the row under, if it has one.
+    pub topic_key: Option<String>,
 }
 
 /// Tier-floor decay minimums — `MAX(tier_floor, exp_decay(...))` never lets a
@@ -328,6 +330,7 @@ mod tests {
             last_accessed_at,
             importance,
             lexical_match: false,
+            topic_key: None,
             agent_id: None,
         }
     }

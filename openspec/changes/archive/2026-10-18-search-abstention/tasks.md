@@ -35,5 +35,10 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 ## 6. Verificación
 
 - [x] Suite y clippy en Linux sobre el último commit ([verify](verify.md)).
-- [ ] El CI en verde en Linux y Windows.
-- [ ] `rag-eval --real` y `rag-eval --real --agent-view` antes y después (necesita el modelo real y `docs/eval/golden.json`): U1 a U4 de la [propuesta](proposal.md#medición-con-el-modelo-real).
+- [x] El CI en verde en Linux y Windows, en el PR #41 y en el push del merge a `main` ([verify](verify.md#ci-2026-10-18)).
+- [x] `rag-eval --real` y `rag-eval --real --agent-view` antes y después (necesita el modelo real y `docs/eval/golden.json`): U1, U2 y U4 pasan; U3 falla por c09 y c10, que sólo llegaban al prompt como relleno de score 0 ([verify](verify.md#modelo-real-2026-10-18)).
+
+## 7. Archivo
+
+- [x] La spec en `specs/retrieval` y `specs/mcp`, las citas de las specs a los archivos que tocó el cambio, el mapa de `openspec/README.md` y la versión 0.20.0.
+- Commits: `docs(openspec): archive search-abstention` y `chore: bump version to 0.20.0`

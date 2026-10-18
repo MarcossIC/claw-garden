@@ -1227,7 +1227,7 @@ impl ServerHandler for ClawgMcp {
         // distinguishable servers in the host's list rather than one shadowing
         // the other.
         info.server_info =
-            Implementation::new(self.profile.mcp_server_name(), env!("CARGO_PKG_VERSION"));
+            Implementation::new(self.profile.mcp_server_name(), clawg_core::build_info::version());
         info.instructions = Some(opening(PROTOCOL));
         info
     }

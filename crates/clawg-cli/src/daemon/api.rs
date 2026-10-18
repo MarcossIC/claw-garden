@@ -798,7 +798,7 @@ async fn health(State(app): State<Arc<AppCtx>>) -> Json<HealthBody> {
     };
     Json(HealthBody {
         status: "ok",
-        version: env!("CARGO_PKG_VERSION"),
+        version: clawg_core::build_info::version(),
         profile: app.profile.as_str(),
         pid: std::process::id(),
         embedder,

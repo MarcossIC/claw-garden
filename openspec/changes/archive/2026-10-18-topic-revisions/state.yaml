@@ -1,0 +1,15 @@
+change: topic-revisions
+objective: "1"
+depends_on: [conflict-candidates]
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # Linux, Windows, modelo real y el perfil dev con Claude Code; la compuerta previa pasó a revision-eval
+  archive: done
+updated: 2026-10-18
+main_spec: openspec/specs/ingest/spec.md, openspec/specs/pieces/spec.md, openspec/specs/disputes/spec.md, openspec/specs/storage/spec.md, openspec/specs/mcp/spec.md, openspec/specs/update/spec.md
