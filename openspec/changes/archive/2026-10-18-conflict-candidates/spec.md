@@ -1,6 +1,6 @@
 # conflict-candidates — Especificación
 
-Requisitos nuevos o cambiados sobre [`specs/disputes`](../../specs/disputes/spec.md). Lo que no se nombra aquí sigue como está. Términos: un **par** es una fila de `memory_conflict`; un par está **pendiente**, **escalado** o **juzgado** según su `state`.
+Requisitos nuevos o cambiados sobre [`specs/disputes`](../../../specs/disputes/spec.md). Lo que no se nombra aquí sigue como está. Términos: un **par** es una fila de `memory_conflict`; un par está **pendiente**, **escalado** o **juzgado** según su `state`.
 
 ## C1. El detector anota candidatas
 

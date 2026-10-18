@@ -9,6 +9,7 @@ Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde q
 - [project-root-guard](../../changes/archive/2026-10-15-project-root-guard/proposal.md), archivado el 2026-10-15 (sólo la fila de V13).
 - [ingest-outbox](../../changes/archive/2026-10-15-ingest-outbox/proposal.md), archivado el 2026-10-15 (el outbox, el apagado y el arranque sin volcado, el volcado viejo y la fila de V14). El contrato de `POST /v1/memories` que lo usa está en [`specs/ingest`](../ingest/spec.md).
 - [embedder-idle-unload](../../changes/archive/2026-10-17-embedder-idle-unload/proposal.md), archivado el 2026-10-17 (el ciclo de vida del embedder y la reescritura de «El modelo se carga con pooling mean» para `E5Embedder`). El campo `embedder_resident` de `/health` está en [`specs/mcp`](../mcp/spec.md).
+- [conflict-candidates](../../changes/archive/2026-10-18-conflict-candidates/proposal.md), archivado el 2026-10-18 (sólo la fila de V15 y «Una base en V14 abre con sus disputas como pares»). La tabla de pares y su conversión están en [`specs/disputes`](../disputes/spec.md).
 
 ## Definiciones
 
@@ -39,7 +40,7 @@ Un save que termina de guardarse MUST NOT dejar su fila. Cada pieza que el worke
 
 ### Un replay retoma donde quedó
 
-Al tomar una fila con progreso, el worker MUST saltar las posiciones anotadas, MUST NOT reforzar sus filas y MUST vincular cada una con la cabecera anotada (`ingest_pieces`, `worker.rs:643-689`). Si el progreso no encaja con el troceo de hoy (nombra una posición que no existe, repite una, o el hash anotado no es el del texto de esa posición), MUST descartarlo con un warn y seguir por el dedup (`resume_positions`, `outbox.rs:96`, pura): sin saber qué fila tiene cada pieza, el dedup es lo único que evita duplicarlas.
+Al tomar una fila con progreso, el worker MUST saltar las posiciones anotadas, MUST NOT reforzar sus filas y MUST vincular cada una con la cabecera anotada (`ingest_pieces`, `worker.rs:646-692`). Si el progreso no encaja con el troceo de hoy (nombra una posición que no existe, repite una, o el hash anotado no es el del texto de esa posición), MUST descartarlo con un warn y seguir por el dedup (`resume_positions`, `outbox.rs:96`, pura): sin saber qué fila tiene cada pieza, el dedup es lo único que evita duplicarlas.
 
 #### Escenario
 - GIVEN un save de 3 piezas o más cuyo progreso anota las dos primeras, como si el proceso hubiera muerto antes de la tercera
@@ -50,7 +51,7 @@ Al tomar una fila con progreso, el worker MUST saltar las posiciones anotadas, M
 
 ### Una entrega doble se salta
 
-El worker MUST tomar cada fila a lo sumo una vez por ejecución (`take_row`, `worker.rs:415`, con el conjunto `taken` de `memory_worker`, `worker.rs:256`): una fila que el handler escribió antes de la lectura de arranque llega también por el canal. Una fila que ya no existe, o que está `failed`, MUST saltarse sin escribir nada (`Claimed::Skip`, `outbox.rs:138`). Si la segunda entrega trae un canal de respuesta y la primera vino de la lectura de arranque, el que espera recibe el reporte de la primera.
+El worker MUST tomar cada fila a lo sumo una vez por ejecución (`take_row`, `worker.rs:418`, con el conjunto `taken` de `memory_worker`, `worker.rs:259`): una fila que el handler escribió antes de la lectura de arranque llega también por el canal. Una fila que ya no existe, o que está `failed`, MUST saltarse sin escribir nada (`Claimed::Skip`, `outbox.rs:138`). Si la segunda entrega trae un canal de respuesta y la primera vino de la lectura de arranque, el que espera recibe el reporte de la primera.
 
 #### Escenario
 - GIVEN una fila pendiente que llega por la lectura de arranque y por el canal
@@ -87,7 +88,7 @@ Si el handler contesta al que guardó con el fallo (`500` o `503`), MUST borrar 
 
 En un apagado ordenado, cada save aceptado MUST terminar en uno de dos lugares: guardado en la base (o absorbido por el gate de dedup), o en el outbox para el próximo arranque. El apagado MUST seguir drenando hasta `DRAIN_DEADLINE`, MUST NOT escribir `ingest-pending.jsonl` y MUST NOT descartar un save: lo que el worker no empezó queda en su fila.
 
-La decisión de seguir drenando o dejar la cola es pura (`drain_step`, `crates/clawg-core/src/memory/worker.rs:198`; su variante `DrainStep::Spill` conserva el nombre de cuando el apagado volcaba a un archivo). `MemoryRuntime::shutdown` (`crates/clawg-core/src/runtime.rs:267`) espera al worker, y el daemon la llama antes de borrar su estado (`crates/clawg-cli/src/daemon/serve.rs:175`). Sólo un evento encolado sin fila (los caminos en proceso de tests y evaluación) puede quedar sin ingerir, y el apagado lo registra con un warn (`runtime.rs:283`).
+La decisión de seguir drenando o dejar la cola es pura (`drain_step`, `crates/clawg-core/src/memory/worker.rs:201`; su variante `DrainStep::Spill` conserva el nombre de cuando el apagado volcaba a un archivo). `MemoryRuntime::shutdown` (`crates/clawg-core/src/runtime.rs:267`) espera al worker, y el daemon la llama antes de borrar su estado (`crates/clawg-cli/src/daemon/serve.rs:175`). Sólo un evento encolado sin fila (los caminos en proceso de tests y evaluación) puede quedar sin ingerir, y el apagado lo registra con un warn (`runtime.rs:283`).
 
 #### Escenario: embedder listo
 - GIVEN el embedder cargado y 20 saves aceptados
@@ -111,7 +112,7 @@ La decisión de seguir drenando o dejar la cola es pura (`drain_step`, `crates/c
 Al arrancar, el worker (`ingest_worker_future`, `crates/clawg-core/src/runtime.rs:401`) MUST, en este orden:
 
 1. importar `ingest-pending.jsonl` si existe (`import_spill`, `runtime.rs:431`): cada evento válido pasa a una fila, enmascarado, todos en una transacción con `synchronous = FULL` (`outbox_import`, `outbox.rs:234`); el archivo MUST borrarse sólo después del commit. Si no se pudo borrar, se avisa: una segunda importación la absorbe el dedup;
-2. procesar las filas `pending` en orden de id antes que cualquier evento del canal (`outbox_pending`, `outbox.rs:345`; `Replay`, `worker.rs:159`).
+2. procesar las filas `pending` en orden de id antes que cualquier evento del canal (`outbox_pending`, `outbox.rs:345`; `Replay`, `worker.rs:162`).
 
 Si no se puede leer el outbox, el worker lo registra y sigue con el canal: esas filas esperan al próximo arranque.
 
@@ -203,7 +204,7 @@ Las migraciones pendientes de un arranque MUST aplicarse en una sola transacció
 
 ### Checksums fijados
 
-Los checksums de las migraciones publicadas (hoy V1–V14) MUST coincidir con una lista fija en el código (`PINNED`, `crates/clawg-core/src/memory/migrations.rs:44`). Cambiar una migración publicada MUST romper un test. Una migración nueva agrega su fila a la lista en el mismo commit.
+Los checksums de las migraciones publicadas (hoy V1–V15) MUST coincidir con una lista fija en el código (`PINNED`, `crates/clawg-core/src/memory/migrations.rs:44`). Cambiar una migración publicada MUST romper un test. Una migración nueva agrega su fila a la lista en el mismo commit.
 
 **Test:** `published_migration_checksums_are_pinned` (`migrations.rs`).
 
@@ -218,12 +219,18 @@ Una base en V13 MUST abrir con V14 con cada fila idéntica (`memory`, `memory_pi
 
 **Test:** `a_database_from_the_previous_version_opens_with_an_empty_outbox` (`db.rs`). Llama a `run_migrations` directo, así que el snapshot `pre-migration` de la apertura lo cubre la regla general de «Snapshot antes de migrar».
 
+### Una base en V14 abre con sus disputas como pares
+
+V15 (`crates/clawg-core/migrations/V15__memory_conflict.sql`) agrega la tabla `memory_conflict` y no toca ninguna columna de `memory`. Una base en V14 MUST abrir con V15 con cada fila de `memory` igual (estado, `disputed_against`, contenido) y con un par `escalated` por cada id de cada `disputed_against`; un `disputed_against` que no es JSON válido MUST NOT impedir la migración ([`specs/disputes`](../disputes/spec.md), «Datos de la versión anterior»). Un binario anterior a V15 rechaza la base migrada con `SchemaNewer` («Verificación del esquema antes de migrar»): la vuelta atrás es el snapshot `pre-migration`.
+
+**Test:** `a_database_with_disputes_opens_with_escalated_pairs` (`db.rs`).
+
 ### Verificación del esquema antes de migrar
 
 La decisión es pura (`schema_plan`, `backup.rs:83`). `MemoryStore::open` MUST calcularla antes de cualquier pragma y antes del runner (`check_schema`, `crates/clawg-core/src/memory/db.rs:388`, llamada en `db.rs:185`). Con `Newer` o `Diverged`, `open` MUST devolver `MemoryError::SchemaNewer` o `MemoryError::SchemaDiverged` (`crates/clawg-core/src/memory/error.rs:58` y `:64`) y MUST NOT escribir nada en `memory.db`. Los mensajes MUST decir las versiones, que nada cambió, y qué hacer: instalar la versión que la escribió o `clawg restore` de un backup anterior.
 
 #### Escenario: base más nueva
-- GIVEN una base en la última versión del binario, N (hoy V14), con una fila N + 1 agregada en `refinery_schema_history`
+- GIVEN una base en la última versión del binario, N (hoy V15), con una fila N + 1 agregada en `refinery_schema_history`
 - WHEN se abre
 - THEN el error es `SchemaNewer { db: N + 1, binary: N }`, nombra `clawg restore`, y `memory.db` es byte a byte igual
 
@@ -259,7 +266,7 @@ El id del modelo en el contrato de embedding MUST ser `multilingual-e5-small/mea
 Al arrancar, después de cargar el modelo y dentro del bootstrap del embedder, el daemon verifica el contrato (`verify_or_reembed`, `crates/clawg-core/src/memory/bootstrap.rs:431`, cableado por `contract_verifier`, `bootstrap.rs:250`, en `production_deps`, `bootstrap.rs:272`, que `serve_deps`, `bootstrap.rs:354`, entrega al daemon en `crates/clawg-cli/src/daemon/serve.rs:94`). Si el contrato guardado tiene `LEGACY_CLS_MODEL_ID` y el embedder cargado tiene `E5_MODEL_ID`, con la misma dimensión y los mismos prefijos (`is_pooling_upgrade`, `bootstrap.rs:417`, pura), MUST:
 
 1. escribir un snapshot `pre-reembed` en `<data>/backups`; si falla, no re-embebe, y el intento termina como un fallo de verificación, que se reintenta con la espera de siempre ([`specs/ingest`](../ingest/spec.md), «Reintento del bootstrap»);
-2. re-embeber `memory`, `episodic_trajectory` y `procedural_skill` con el embedder cargado (`reembed_all` en modo `ReInfer`, `crates/clawg-core/src/memory/maintenance.rs:467`);
+2. re-embeber `memory`, `episodic_trajectory` y `procedural_skill` con el embedder cargado (`reembed_all` en modo `ReInfer`, `crates/clawg-core/src/memory/maintenance.rs:488`);
 3. habilitar la memoria sólo si las tres tablas terminaron sin fallas, que es cuando `reembed_all` escribe el contrato nuevo. Si no, el contrato queda como estaba, la memoria sigue deshabilitada y el estado es el de un contrato que no coincide: ese bootstrap no se reintenta, pero el próximo arranque vuelve a empezar, y las filas ya hechas dan los mismos bytes.
 
 Mientras el snapshot y el re-embebido corren, el estado del embedder MUST ser `loading`: el bootstrap publica `loading` antes de empezar y `ready` sólo cuando el embedder entró a su celda. Un save de ese lapso espera en la cola como con cualquier carga ([`specs/ingest`](../ingest/spec.md), «Embedder cargando»).
@@ -327,7 +334,7 @@ Una recarga que falla MUST responder «no listo» (`EmbedError::NotReady`) y la 
 #### Escenario: los archivos desaparecieron
 - GIVEN el modelo suelto y una recarga que falla
 - WHEN llega una búsqueda
-- THEN responde `503 embedder_not_ready` (`embed_failure`, `crates/clawg-cli/src/daemon/api.rs:907`), y la búsqueda siguiente vuelve a intentar la carga
+- THEN responde `503 embedder_not_ready` (`embed_failure`, `crates/clawg-cli/src/daemon/api.rs:960`), y la búsqueda siguiente vuelve a intentar la carga
 
 **Tests:** `a_failed_load_is_not_ready_and_the_next_call_tries_again` y `a_model_that_comes_back_as_another_model_is_refused` (`idle_embedder.rs`); `a_search_whose_model_cannot_load_again_answers_not_ready` (`crates/clawg-cli/tests/api.rs`).
 
@@ -339,7 +346,7 @@ Buscar, guardar, restaurar y `recall_context` con el modelo suelto MUST esperar 
 
 ### Registrar un proyecto despierta el modelo
 
-`POST /v1/projects` MUST empezar a cargar un modelo suelto y MUST responder sin esperar esa carga (`embedder.wake()`, `api.rs:1238`; `wake`, `idle_embedder.rs:236`). Con el modelo residente MUST NOT cargar nada. Un modelo despertado MUST contar como recién usado.
+`POST /v1/projects` MUST empezar a cargar un modelo suelto y MUST responder sin esperar esa carga (`embedder.wake()`, `api.rs:1320`; `wake`, `idle_embedder.rs:236`). Con el modelo residente MUST NOT cargar nada. Un modelo despertado MUST contar como recién usado.
 
 #### Escenario: el puente empieza una sesión
 - GIVEN el modelo suelto
@@ -370,7 +377,7 @@ En Linux con glibc, dos cosas lo hacen posible:
 
 ### Un solo tokenizer por proceso
 
-El daemon MUST parsear `tokenizer.json` a lo sumo una vez por proceso, y sólo de bytes cuyo SHA-256 verificó. El chunker, el índice de docs y el embedder MUST compartir esa copia, la celda `MemoryRuntime::tokenizer` (`crates/clawg-core/src/runtime.rs:126`). La llenan `resolve_tokenizer_and_chunker` (`crates/clawg-core/src/memory/worker.rs:810`), con `load_verified_tokenizer` (`crates/clawg-core/src/memory/model_download.rs:154`), y `model_loader` (`bootstrap.rs:228`); cada parse deja la línea `tokenizer.json parsed` (`model_download.rs:164` y `:191`). Una recarga MUST NOT volver a parsearlo. El embedder MUST NOT cambiar la configuración del tokenizer compartido.
+El daemon MUST parsear `tokenizer.json` a lo sumo una vez por proceso, y sólo de bytes cuyo SHA-256 verificó. El chunker, el índice de docs y el embedder MUST compartir esa copia, la celda `MemoryRuntime::tokenizer` (`crates/clawg-core/src/runtime.rs:126`). La llenan `resolve_tokenizer_and_chunker` (`crates/clawg-core/src/memory/worker.rs:822`), con `load_verified_tokenizer` (`crates/clawg-core/src/memory/model_download.rs:154`), y `model_loader` (`bootstrap.rs:228`); cada parse deja la línea `tokenizer.json parsed` (`model_download.rs:164` y `:191`). Una recarga MUST NOT volver a parsearlo. El embedder MUST NOT cambiar la configuración del tokenizer compartido.
 
 #### Escenario: arranque con el modelo en disco, en cualquier orden
 - GIVEN el modelo en disco
@@ -449,7 +456,7 @@ Después de cada snapshot automático, el directorio de backups MUST conservar l
 
 `clawg backup [--profile P]` (`crates/clawg-cli/src/main.rs:127`) MUST producir un snapshot `manual` e imprimir su ruta.
 
-- Con el daemon andando, MUST pedirlo por `POST /v1/backup` (con el token; `crates/clawg-cli/src/daemon/api.rs:1180`, ruta en `:646`), que lo hace sobre la conexión del daemon (`MemoryRuntime::snapshot`, `crates/clawg-core/src/runtime.rs:253`) y responde `{"path": "..."}`.
+- Con el daemon andando, MUST pedirlo por `POST /v1/backup` (con el token; `crates/clawg-cli/src/daemon/api.rs:1262`, ruta en `:646`), que lo hace sobre la conexión del daemon (`MemoryRuntime::snapshot`, `crates/clawg-core/src/runtime.rs:253`) y responde `{"path": "..."}`.
 - Sin daemon, MUST tomar el lock del store con el titular `Maintenance` (`crates/clawg-core/src/memory/store_lock.rs:59`), copiar sin migrar y soltar el lock (`backup_offline`, `backup.rs:311`).
 - Sin `memory.db`, MUST decir que no hay base, sin crear el directorio de datos.
 
@@ -491,7 +498,7 @@ La lectura (`probe`, `backup.rs:442`) MUST hacerse sin lock, sin migrar y sin es
 
 ### MCP nombra `clawg status` cuando el daemon no arrancó
 
-Con `StartTimeout`, el texto de la herramienta MUST decir que clawg intentó arrancar su daemon y que `clawg status` muestra la causa (`crates/clawg-cli/src/mcp/server.rs:486-490`). Con `NotRunning` (autoarranque apagado) MUST seguir pidiendo `clawg serve`.
+Con `StartTimeout`, el texto de la herramienta MUST decir que clawg intentó arrancar su daemon y que `clawg status` muestra la causa (`crates/clawg-cli/src/mcp/server.rs:517-521`). Con `NotRunning` (autoarranque apagado) MUST seguir pidiendo `clawg serve`.
 
 **Tests:** `a_daemon_that_did_not_start_points_at_status` (`server.rs`) y `a_tool_call_when_the_daemon_never_comes_up_gives_the_readable_error` (`mcp/mod.rs`).
 

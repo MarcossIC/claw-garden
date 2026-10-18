@@ -1,6 +1,6 @@
 # eval — Especificación
 
-Fuente de verdad del comportamiento actual de la evaluación de recuperación: el generador sintético de `golden-mine synth`, la etiqueta de subconjunto y el idioma de la consulta en el golden set, sus casos sin respuesta y de versión nueva, el reporte de `rag-eval` (por subconjunto, por pareja de idiomas consulta–fila, aciertos estrictos y parciales con intervalo, partición calibración/prueba), la comparación de dos corridas con `--diff` y su corte por pareja, el brazo sólo léxico, los intrusos del audit, el barrido de contradicciones, `rag-eval --docs` (la medición del índice de la documentación y el código de un proyecto, [`specs/project-docs`](../project-docs/spec.md)) y la baseline medida.
+Fuente de verdad del comportamiento actual de la evaluación de recuperación: el generador sintético de `golden-mine synth`, la etiqueta de subconjunto y el idioma de la consulta en el golden set, sus casos sin respuesta y de versión nueva, el reporte de `rag-eval` (por subconjunto, por pareja de idiomas consulta–fila, aciertos estrictos y parciales con intervalo, partición calibración/prueba), la comparación de dos corridas con `--diff` y su corte por pareja, el brazo sólo léxico, los intrusos del audit, el barrido de contradicciones, `conflict-eval` (el detector de contradicciones entero, sobre pares etiquetados y un flujo de saves), `rag-eval --docs` (la medición del índice de la documentación y el código de un proyecto, [`specs/project-docs`](../project-docs/spec.md)) y la baseline medida.
 
 **Origen:**
 - [eval-golden-expansion](../../changes/archive/2026-10-12-eval-golden-expansion/proposal.md), archivado el 2026-10-12.
@@ -8,6 +8,7 @@ Fuente de verdad del comportamiento actual de la evaluación de recuperación: e
 - [eval-rigor](../../changes/archive/2026-10-15-eval-rigor/proposal.md), archivado el 2026-10-15 (casos `unanswerable` y `update`, aciertos, procedencia, partición, `--diff`, brazo sólo léxico y el piso léxico de la baseline).
 - [english-recall](../../changes/archive/2026-10-17-english-recall/proposal.md), archivado el 2026-10-17 (idioma de la consulta, `by_pair`, el corte por pareja de `--diff` y la baseline por pareja).
 - [memory-rank-fusion](../../changes/archive/2026-10-17-memory-rank-fusion/proposal.md), archivado el 2026-10-17 (`all_hit_rate` de agent-view, el subconjunto `lexical_related` y su baseline).
+- [conflict-candidates](../../changes/archive/2026-10-18-conflict-candidates/proposal.md), archivado el 2026-10-18 (sólo «`conflict-eval`: el detector entero» y su baseline).
 
 ## Definiciones
 
@@ -518,6 +519,21 @@ El reporte de `rag-eval` MUST incluir la curva del umbral de contradicción: par
 
 **Tests:** `threshold_curve_hand_picked_buckets`, `threshold_curve_empty_buckets_are_zero_not_nan` y `threshold_curve_uses_sweep_constants_in_order` en `crates/clawg-eval/src/bin/rag-eval/metrics.rs`.
 
+## `conflict-eval`: el detector entero
+
+```
+conflict-eval (--real | --fake) [--pairs FILE] [--specs DIR | --flow FILE] [--out FILE]
+```
+
+El barrido de arriba mide la distancia sola. `conflict-eval` (`crates/clawg-eval/src/bin/conflict-eval/main.rs`) mide el detector entero, con el filtro de tipo, el piso, el colapso por save y el escalamiento ([`specs/disputes`](../disputes/spec.md)): MUST ingerir con el worker de producción (`EvalIngest`) y leer los pares que quedaron (`conflict_pairs`, `crates/clawg-core/src/eval_api.rs:580`).
+
+- **Pares etiquetados** (`crates/clawg-eval/data/conflict-pairs.json`, 110 pares en inglés y español): cada uno se guarda, el viejo y después el nuevo, en una base propia. Su clase dice qué es el nuevo para el viejo (`Class`, `crates/clawg-eval/src/bin/conflict-eval/measure.rs:13`): `contradiction`, `update`, `complement`, `rephrase` o `distinct`. `parse_pairs` (`measure.rs:81`) MUST rechazar un archivo con una clase bajo su mínimo (`Class::minimum`, `measure.rs:41`: 30 para contradicción y distintos, 15 para las demás).
+- **Flujo:** una sola base que recibe saves uno tras otro, como un proyecto que acumula memorias. Sin `--flow`, son las oraciones con MUST de `openspec/specs` (más de 200), cada una como `semantic_fact` (`flow_saves`, `main.rs:175`). Con `--flow FILE`, son los saves de un arreglo JSON de `{"content", "memory_type"}`, en su orden, con su tipo (`parse_flow`, `measure.rs:66`): así se mide el store real de un usuario con los tipos con que se guardó.
+
+El reporte MUST dar, por clase y por clase e idioma, la fracción de pares con candidata y la fracción escalada, cada una con su intervalo de Wilson al 95 % (`wilson`, `measure.rs:107`); para el flujo, los saves, las candidatas y los escalados por save, y la fracción de saves con algún par escalado (`flow_report`, `measure.rs:183`). La compuerta (`gate`, `measure.rs:213`) pide menos del 5 % de saves del flujo con un par escalado (`GATE_ESCALATED_PER_SAVE`) y al menos 0,8 de candidatas en la clase contradicción (`GATE_CONTRADICTION_CANDIDATES`, `measure.rs:202-203`). Con `--fake` corre sin el modelo y prueba el circuito, no los números. `--real` necesita el modelo ya descargado en el perfil de datos y sale con 3 si no está.
+
+**Tests:** `wilson_interval_cases`, `labelled_pairs_parse_and_cover_every_class`, `a_class_under_its_minimum_is_refused`, `a_flow_file_is_read_in_order`, `the_flow_counts_saves_that_escalate_once` y `outcomes_group_by_class` (`measure.rs`); `the_arguments_parse`, `without_a_flow_file_the_flow_is_the_spec_sentences_as_facts`, `the_repository_specs_make_a_flow_of_at_least_two_hundred_facts` y `a_fake_run_measures_every_class_and_the_flow` (`main.rs`); `conflict_pairs_reads_the_table` (`eval_api.rs`).
+
 ## `rag-eval --docs`: medir el índice de documentación
 
 ```
@@ -618,6 +634,23 @@ Set expandido (`golden-expanded.json`, sha256 `855c64b9…`, fuera de git): 1.28
 Además se anota, sin umbral: con el canal léxico en 20 frente a 0, **0 de 112** casos cambian de ranking.
 
 Si una condición falla, el resultado MUST registrarse tal cual; los umbrales MUST NOT ajustarse después de medir. C4 y C5 quedaron aceptados por decisión del usuario, sin mover umbrales ni iterar el generador.
+
+### Detector de contradicciones
+
+`conflict-eval --real` sobre `711b02e`, el 2026-10-18 (`docs/eval/results/2026-10-18-real-conflict-eval-final.json`):
+
+| Clase | Candidata | Escalada |
+|---|---|---|
+| contradicción | 30/30 | 10/30 |
+| actualización | 15/15 | 4/15 |
+| reformulación | 14/15 | 4/15 |
+| complemento | 6/20 | 2/20 |
+| distinto | 0/30 | 0/30 |
+
+- Flujo de las specs (440 saves `semantic_fact`): 1,95 candidatas por save y 3 saves con un par escalado, el 0,7 % (Wilson 0,2–2,0 %). La compuerta pasa.
+- Flujo de un store real de 172 saves con sus tipos (`--flow`): 11,0 % de saves con un par escalado (7,2–16,6 %); con sus 24 notas de estado guardadas como `architectural_decision` reetiquetadas como `semantic_fact`, 5,2 % (2,8–9,6 %).
+
+Sobre el cambio tal como se mezcló (`e041ee6`), el flujo de las specs daba 23,4 % y fallaba: el corte del identificador (`IDENTIFIER_ESCALATE_BELOW`) y la regla de los dos lados protegidos ([`specs/disputes`](../disputes/spec.md)) se eligieron después, mirando esos mismos flujos, así que estos números no los confirman sobre datos nuevos. El detalle está en el [verify](../../changes/archive/2026-10-18-conflict-candidates/verify.md#modelo-real-2026-10-18) del cambio.
 
 ## Invariantes
 

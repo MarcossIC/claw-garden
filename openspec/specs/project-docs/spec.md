@@ -9,7 +9,7 @@ Fuente de verdad del comportamiento actual del índice de la documentación y el
 ## Definiciones
 
 - **Raíz:** la `root_path` que `POST /v1/projects` guardó en `project` para un `project_id` ([`specs/project`](../project/spec.md), R4).
-- **Raíz del puente:** la raíz que el puente resolvió de su cwd al arrancar (`default_project`, `crates/clawg-cli/src/mcp/server.rs:357-359`).
+- **Raíz del puente:** la raíz que el puente resolvió de su cwd al arrancar (`default_project`, `crates/clawg-cli/src/mcp/server.rs:388-390`).
 - **Raíz aceptada:** una fila de `project` con `index_docs = 1`: el daemon puede leer sus archivos.
 - **Raíz sólo registrada:** una fila de `project` con `index_docs = 0`: sus memorias se re-keyean y se buscan como las de cualquier proyecto, pero el daemon no lee sus archivos.
 - **Ruta relativa:** la ruta de un archivo respecto de la raíz, con `/` como separador en todas las plataformas.
@@ -188,14 +188,14 @@ El texto de un doc MUST pasar entero por `redact` (`crates/clawg-core/src/memory
 
 ## Búsqueda
 
-`POST /v1/projects/docs/search` (`search_docs`, `crates/clawg-cli/src/daemon/api.rs:1332`; ruta en `:648`), con token, recibe `{ "project_id": "...", "query": "...", "limit": n }` (`deny_unknown_fields`) y responde `{ "hits": [{ "path", "breadcrumb", "text", "score" }], "docs": <n>, "indexing": <bool>, "warning"?: "..." }`. `docs` es cuántos docs tiene el índice del proyecto.
+`POST /v1/projects/docs/search` (`search_docs`, `crates/clawg-cli/src/daemon/api.rs:1414`; ruta en `:648`), con token, recibe `{ "project_id": "...", "query": "...", "limit": n }` (`deny_unknown_fields`) y responde `{ "hits": [{ "path", "breadcrumb", "text", "score" }], "docs": <n>, "indexing": <bool>, "warning"?: "..." }`. `docs` es cuántos docs tiene el índice del proyecto.
 
 - En este orden: una `query` vacía o sólo de espacios MUST dar 400; un `project_id` sin raíz registrada MUST dar 404; una raíz sólo registrada MUST dar 403, sin refrescar ni buscar.
-- El `error` del 403 (`not_accepted`, `api.rs:1317`) MUST nombrar la raíz y el comando con que el usuario la acepta. Cuando el perfil del daemon no es `prod`, el comando lleva su `--profile`: «clawg reads the files of the project a bridge was started in, and of the ones the user added; `<raíz>` is neither. Ask the user to run ``clawg projects add "<raíz>" --profile dev`` if they want it searched, then call again». Lo arma el daemon, que sabe su perfil, así que también lo lee bien un puente de una versión anterior.
+- El `error` del 403 (`not_accepted`, `api.rs:1399`) MUST nombrar la raíz y el comando con que el usuario la acepta. Cuando el perfil del daemon no es `prod`, el comando lleva su `--profile`: «clawg reads the files of the project a bridge was started in, and of the ones the user added; `<raíz>` is neither. Ask the user to run ``clawg projects add "<raíz>" --profile dev`` if they want it searched, then call again». Lo arma el daemon, que sabe su perfil, así que también lo lee bien un puente de una versión anterior.
 - Con el embedder sin cargar o fallado MUST responder como `POST /v1/search` (503 con el mismo cuerpo, [`specs/ingest`](../ingest/spec.md)). Se comprueba después del 404 y del 403.
-- `limit` MUST tomar 5 si falta (`DEFAULT_DOCS_LIMIT`, `api.rs:1284`) y MUST quedar entre 1 y 20 (`clamp_docs_limit`, `api.rs:1286`; `MAX_DOCS_LIMIT`, `api.rs:1282`): 0 vale 1.
+- `limit` MUST tomar 5 si falta (`DEFAULT_DOCS_LIMIT`, `api.rs:1366`) y MUST quedar entre 1 y 20 (`clamp_docs_limit`, `api.rs:1368`; `MAX_DOCS_LIMIT`, `api.rs:1364`): 0 vale 1.
 - Antes de buscar, si el último refresco del proyecto empezó hace 60 s o más (`REFRESH_INTERVAL`, `mod.rs:32`) o nunca empezó, y no hay uno en curso, MUST refrescar (`is_due`, `needs_refresh`). Un refresco fallido MUST NOT impedir la búsqueda sobre lo que ya está indexado: la respuesta MUST traer `warning` con el error.
-- Si hay un refresco del proyecto en curso y el índice del proyecto está vacío (el primero, que suele lanzar el registro del puente un momento antes), MUST esperarlo hasta 20 s (`FIRST_INDEX_WAIT`, `api.rs:1275`) antes de buscar, para no contestar "los docs no dicen nada" mientras se arman. Con un índice ya armado no espera: contesta con lo que hay.
+- Si hay un refresco del proyecto en curso y el índice del proyecto está vacío (el primero, que suele lanzar el registro del puente un momento antes), MUST esperarlo hasta 20 s (`FIRST_INDEX_WAIT`, `api.rs:1357`) antes de buscar, para no contestar "los docs no dicen nada" mientras se arman. Con un índice ya armado no espera: contesta con lo que hay.
 - `indexing` MUST ser `true` si un refresco del proyecto está en curso al responder.
 - La búsqueda (`search`, `mod.rs:262`) MUST combinar dos listas, cada una de hasta 50 pasajes del proyecto (`CANDIDATES_PER_CHANNEL`, `mod.rs:37`): los vecinos más cercanos al vector de la consulta (rol `Query`) y los mejores por BM25 de FTS5 con la misma expresión de consulta que usa la búsqueda léxica de memorias (`fts_match_expression` con `MAX_LEXICAL_TOKENS`, `crates/clawg-core/src/memory/search.rs:615` y `:595`). MUST fusionarlas por rango recíproco (`fuse`, `mod.rs:247`: `1 / (60 + rango)`, rango desde 1, sumado si un pasaje está en las dos; `RRF_K`, `mod.rs:42`), ordenar por puntaje y desempatar por id de pasaje menor. Usa rangos y no el piso de coseno ni el bono léxico de las memorias, que se calibraron sobre otro corpus.
 - MUST NOT devolver pasajes de otro proyecto.
@@ -225,7 +225,7 @@ El texto de un doc MUST pasar entero por `redact` (`crates/clawg-core/src/memory
 
 ## Registrar una raíz aceptada la indexa en segundo plano
 
-Cuando `POST /v1/projects` registra o confirma una raíz y, después del registro, la raíz está aceptada (`RegisterOutcome::index_docs`), el daemon MUST lanzar un refresco de ese proyecto en segundo plano. Ese refresco espera a que el embedder deje de estar en `loading` (`spawn_doc_refresh`, `crates/clawg-cli/src/daemon/api.rs:1250`; llamado en `:1240-1242`). Un registro que deja la raíz sólo registrada MUST NOT lanzarlo. La respuesta del registro MUST NOT esperar el refresco y MUST NOT cambiar de forma. Un refresco fallido, o un embedder que no cargó, MUST quedar en el log como warn y MUST NOT afectar el registro.
+Cuando `POST /v1/projects` registra o confirma una raíz y, después del registro, la raíz está aceptada (`RegisterOutcome::index_docs`), el daemon MUST lanzar un refresco de ese proyecto en segundo plano. Ese refresco espera a que el embedder deje de estar en `loading` (`spawn_doc_refresh`, `crates/clawg-cli/src/daemon/api.rs:1332`; llamado en `:1240-1242`). Un registro que deja la raíz sólo registrada MUST NOT lanzarlo. La respuesta del registro MUST NOT esperar el refresco y MUST NOT cambiar de forma. Un refresco fallido, o un embedder que no cargó, MUST quedar en el log como warn y MUST NOT afectar el registro.
 
 El puente registra su propia raíz pidiendo indexarla antes de su primera herramienta ([`specs/project`](../project/spec.md), R6). Así, el primer indexado empieza con la sesión y no con la primera búsqueda.
 
@@ -256,16 +256,16 @@ MUST NOT abrir la base ni arrancar un daemon. Sin daemon falla como `clawg undel
 
 ## Herramienta MCP `search_project`
 
-El puente MUST ofrecer `search_project(query, project_path?, limit?)` (`SearchProjectArgs`, `crates/clawg-cli/src/mcp/server.rs:210`; `search_project_impl`, `server.rs:867`). La herramienta resuelve y registra el proyecto como las demás ([`specs/project`](../project/spec.md), R3 y R6) y llama a la búsqueda de arriba. Pide indexar sólo la raíz del puente, así que con un `project_path` ajeno busca únicamente en una raíz que el usuario ya agregó. No lleva `agent_id`: la documentación es del proyecto, no de un agente, así que no hay sharing ni visibilidad que aplicar. Sin proyecto (ni `project_path` ni uno por defecto) MUST fallar diciendo que se pase `project_path`. Una raíz cuyo id ya pertenece a otra raíz MUST fallar como en las demás herramientas ([`specs/project`](../project/spec.md), R6).
+El puente MUST ofrecer `search_project(query, project_path?, limit?)` (`SearchProjectArgs`, `crates/clawg-cli/src/mcp/server.rs:213`; `search_project_impl`, `server.rs:907`). La herramienta resuelve y registra el proyecto como las demás ([`specs/project`](../project/spec.md), R3 y R6) y llama a la búsqueda de arriba. Pide indexar sólo la raíz del puente, así que con un `project_path` ajeno busca únicamente en una raíz que el usuario ya agregó. No lleva `agent_id`: la documentación es del proyecto, no de un agente, así que no hay sharing ni visibilidad que aplicar. Sin proyecto (ni `project_path` ni uno por defecto) MUST fallar diciendo que se pase `project_path`. Una raíz cuyo id ya pertenece a otra raíz MUST fallar como en las demás herramientas ([`specs/project`](../project/spec.md), R6).
 
-La descripción de `project_path` (`server.rs:217-219`) MUST decir que, por defecto, se busca en el directorio en que arrancó el puente, y que los archivos de otro proyecto se buscan sólo después de que el usuario lo agregue con `clawg projects add`.
+La descripción de `project_path` (`server.rs:220-222`) MUST decir que, por defecto, se busca en el directorio en que arrancó el puente, y que los archivos de otro proyecto se buscan sólo después de que el usuario lo agregue con `clawg projects add`.
 
-La salida (`format_docs`, `crates/clawg-cli/src/mcp/tools.rs:250`) MUST ser, por hit, una línea `[n] <breadcrumb>` seguida del texto del pasaje entero, separados por una línea en blanco. Además:
+La salida (`format_docs`, `crates/clawg-cli/src/mcp/tools.rs:275`) MUST ser, por hit, una línea `[n] <breadcrumb>` seguida del texto del pasaje entero, separados por una línea en blanco. Además:
 
 - si `indexing` es `true`, MUST empezar avisando que el índice todavía se está armando y que los resultados pueden estar incompletos;
 - si hay `warning`, MUST nombrarlo antes de los resultados (`The index could not be refreshed (…); these results are from before.`);
 - si no hay hits, MUST decirlo, y MUST distinguir un índice vacío y sin refresco en curso ("No docs are indexed…") de uno que no tiene ningún pasaje que coincida;
-- un 403 del daemon (raíz sólo registrada) MUST devolverse como error de la herramienta con el texto del daemon tal cual, sin el prefijo `daemon returned 403:` (`server.rs:882`);
+- un 403 del daemon (raíz sólo registrada) MUST devolverse como error de la herramienta con el texto del daemon tal cual, sin el prefijo `daemon returned 403:` (`server.rs:922`);
 - un 404 sin cuerpo de error de un daemon que no conoce la ruta MUST explicarse como un daemon más viejo que el puente, que hay que reiniciar con `clawg stop`.
 
 #### Escenario: ruta ajena
@@ -278,7 +278,7 @@ La salida (`format_docs`, `crates/clawg-cli/src/mcp/tools.rs:250`) MUST ser, por
 - WHEN `search_project` recibe la consulta sin `project_path`
 - THEN responde con el pasaje del `README.md` bajo su breadcrumb
 
-Las instrucciones del servidor (la apertura de `crates/clawg-cli/src/mcp/protocol.md`, que `opening` arma en `server.rs:121` y entrega en `server.rs:1164`) MUST nombrar `search_project` para preguntas sobre cómo funciona el proyecto (su diseño, convenciones, comandos o dónde está implementado algo), antes de abrir archivos. La descripción de la herramienta (`server.rs:1122-1129`) y las instrucciones MUST decir que busca en los docs y en el código del proyecto. `recall_context` no consulta este índice.
+Las instrucciones del servidor (la apertura de `crates/clawg-cli/src/mcp/protocol.md`, que `opening` arma en `server.rs:122` y entrega en `server.rs:1208`) MUST nombrar `search_project` para preguntas sobre cómo funciona el proyecto (su diseño, convenciones, comandos o dónde está implementado algo), antes de abrir archivos. La descripción de la herramienta (`server.rs:1166-1173`) y las instrucciones MUST decir que busca en los docs y en el código del proyecto. `recall_context` no consulta este índice.
 
 **Tests:** `search_project_lists_each_hit_under_its_breadcrumb`, `search_project_does_not_read_a_root_the_user_did_not_add` e `instructions_say_when_to_search_the_project` en `crates/clawg-cli/src/mcp/server.rs`; `docs_are_numbered_under_their_breadcrumbs`, `search_project_warns_while_indexing`, `an_empty_index_and_no_match_read_differently` y `a_failed_refresh_is_named_before_the_results` en `crates/clawg-cli/src/mcp/tools.rs`. El conteo de herramientas (once) está en `every_tool_is_registered_under_its_wire_name` (`server.rs`) y en los tests de `handshake.rs` ([`specs/mcp`](../mcp/spec.md)).
 

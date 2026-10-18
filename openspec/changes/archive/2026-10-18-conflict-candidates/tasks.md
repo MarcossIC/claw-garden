@@ -46,10 +46,19 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 ## 8. Verificación
 
 - [x] `cargo test --workspace` y el clippy de `.claude/CLAUDE.md` en Linux.
-- [ ] Lo mismo en Windows, en `target-test`.
-- [ ] `conflict-eval --real` y `rag-eval --real --diff`, con el modelo real y `docs/eval/`.
-- [x] `verify.md`, con Linux; lo demás queda anotado como pendiente.
+- [x] Lo mismo en Windows, en `target-test`.
+- [x] `conflict-eval --real` y `rag-eval --real --diff`, con el modelo real y `docs/eval/`. La compuerta falló y se arregló en la tarea 9.
+- [x] `verify.md`.
+- [x] Perfil dev con Claude Code.
 
-## 9. Archive
+## 9. Arreglos después de medir
 
-- [ ] Specs `disputes`, `mcp`, `retrieval` y `storage`; `git mv` al archivo; subir el minor.
+- [x] `fix(core): escalate a shared identifier only when the pair is very close` (`IDENTIFIER_ESCALATE_BELOW`).
+- [x] `fix(core): keep the conflict note as short as before it named verdicts`.
+- [x] `feat(eval): replay a flow of saves from a file in conflict-eval` (`--flow`).
+- [x] `fix(core): escalate a pair by type only when both sides are protected`.
+- [x] `fix(cli): say in the save_memory schema what a decision is`.
+
+## 10. Archive
+
+- [x] Specs `disputes`, `mcp`, `retrieval`, `storage`, `eval` e `ingest`; `git mv` al archivo; subir el minor.

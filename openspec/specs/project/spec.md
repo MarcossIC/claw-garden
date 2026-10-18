@@ -67,7 +67,7 @@ El id nuevo de una ruta que ya es la raíz canónica MUST ser igual a `derive_pr
 
 ## R3. Todos los caminos usan la misma resolución
 
-El puente MCP (cwd y `project_path`) y `clawg memories --here` MUST derivar el id con `ProjectIdentity::resolve` (`crates/clawg-core/src/memory/identity.rs`). Si falla `current_dir()`, el puente MUST seguir como hoy: sin proyecto por defecto (`crates/clawg-cli/src/mcp/server.rs:357-359`).
+El puente MCP (cwd y `project_path`) y `clawg memories --here` MUST derivar el id con `ProjectIdentity::resolve` (`crates/clawg-core/src/memory/identity.rs`). Si falla `current_dir()`, el puente MUST seguir como hoy: sin proyecto por defecto (`crates/clawg-cli/src/mcp/server.rs:388-390`).
 
 #### Escenario
 - GIVEN un puente con cwd en `<tmp>/repo/src`
@@ -78,14 +78,14 @@ El puente MCP (cwd y `project_path`) y `clawg memories --here` MUST derivar el i
 
 ## R4. Registro de proyecto y re-key
 
-`POST /v1/projects`, con token, recibe `{ "root_path": "...", "legacy_ids": ["..."], "index_docs": <bool> }` y responde `{ "project_id": "...", "rekeyed": <n> }` (`register`, `crates/clawg-cli/src/daemon/api.rs:1208`; `register_project`, `crates/clawg-core/src/memory/project.rs:62`).
+`POST /v1/projects`, con token, recibe `{ "root_path": "...", "legacy_ids": ["..."], "index_docs": <bool> }` y responde `{ "project_id": "...", "rekeyed": <n> }` (`register`, `crates/clawg-cli/src/daemon/api.rs:1290`; `register_project`, `crates/clawg-core/src/memory/project.rs:62`).
 
 - El daemon MUST derivar el id de `root_path` él mismo; no lo recibe.
-- `index_docs` dice si el daemon puede leer los archivos de la raíz ([`specs/project-docs`](../project-docs/spec.md), «Qué raíces se leen»). Si falta MUST tomarse como `false` (`RegisterRequest::index_docs`, `api.rs:1195`): un puente de una versión anterior registra sin indexar, y lo arregla `clawg projects add` o un puente actual en esa raíz.
-- Con `index_docs: true` y una `root_path` que no es un directorio, MUST responder 400 antes de tocar `project` (`api.rs:1216-1218`). Sin `index_docs`, la misma ruta se sigue registrando como siempre.
+- `index_docs` dice si el daemon puede leer los archivos de la raíz ([`specs/project-docs`](../project-docs/spec.md), «Qué raíces se leen»). Si falta MUST tomarse como `false` (`RegisterRequest::index_docs`, `api.rs:1277`): un puente de una versión anterior registra sin indexar, y lo arregla `clawg projects add` o un puente actual en esa raíz.
+- Con `index_docs: true` y una `root_path` que no es un directorio, MUST responder 400 antes de tocar `project` (`api.rs:1298-1300`). Sin `index_docs`, la misma ruta se sigue registrando como siempre.
 - MUST guardar `(id, root_path, index_docs)` en `project` si no existe.
 - Si la fila existe con la misma raíz y el registro pide indexar, MUST pasar `index_docs` de 0 a 1. MUST NOT bajarlo de 1 a 0: un save en otra sesión no le quita a una raíz aceptada su índice (`project.rs:98-100`). El resultado (`RegisterOutcome::index_docs`) lleva el valor que quedó guardado.
-- Si el id ya está registrado con **otra** `root_path`, MUST responder 409 sin mover ninguna fila y sin tocar la marca de la otra raíz. El cuerpo es `{ "error": "project_root_collision", "detail": "<raíz> gets the project id <id>, which already belongs to <otra raíz>" }` (`api.rs:1229-1232`).
+- Si el id ya está registrado con **otra** `root_path`, MUST responder 409 sin mover ninguna fila y sin tocar la marca de la otra raíz. El cuerpo es `{ "error": "project_root_collision", "detail": "<raíz> gets the project id <id>, which already belongs to <otra raíz>" }` (`api.rs:1311-1314`).
 - Por cada id viejo distinto del nuevo, MUST pasar al id nuevo todas las filas de las tablas con proyecto que lo tengan, incluidas las borradas lógicamente, en **una** transacción.
 - Por cada fila movida, MUST escribir en `project_rekey` la tabla, el id de la fila, el id viejo, el id nuevo y la fecha, en la misma transacción.
 - Un id viejo con formato inválido (fuera de `{basename}-[0-9a-f]{4}`) MUST dar 400 sin mover nada.
@@ -138,11 +138,11 @@ La columna `index_docs` (V13) llega con 1 en cada fila de `project` que ya exist
 
 ## R6. El puente registra cada raíz una vez
 
-Antes de la primera tool que use una raíz, el puente MUST llamar a `POST /v1/projects` con esa raíz, el id viejo de la ruta cruda (si difiere) e `index_docs` (`ClawgMcp::project_for`, `crates/clawg-cli/src/mcp/server.rs:603`). MUST NOT volver a llamarlo para la misma raíz y ruta en el mismo proceso, salvo en dos casos: una colisión (abajo) y una falla que se resuelve releyendo ([`specs/mcp`](../mcp/spec.md), «Registro del proyecto»).
+Antes de la primera tool que use una raíz, el puente MUST llamar a `POST /v1/projects` con esa raíz, el id viejo de la ruta cruda (si difiere) e `index_docs` (`ClawgMcp::project_for`, `crates/clawg-cli/src/mcp/server.rs:637`). MUST NOT volver a llamarlo para la misma raíz y ruta en el mismo proceso, salvo en dos casos: una colisión (abajo) y una falla que se resuelve releyendo ([`specs/mcp`](../mcp/spec.md), «Registro del proyecto»).
 
-`index_docs` MUST ser `true` sólo cuando la raíz de la llamada es la raíz del puente, la que resolvió de su cwd al arrancar (`server.rs:357-359`), y `false` en cualquier otro caso. Una raíz que el modelo nombra en `project_path` queda así sólo registrada hasta que el usuario la agregue con `clawg projects add` ([`specs/project-docs`](../project-docs/spec.md)). La decisión es una función pura de las dos raíces, sin filesystem (`indexes_docs`, `crates/clawg-cli/src/mcp/tools.rs:358`). Compara `root` y no el id, porque dos raíces que chocan comparten id.
+`index_docs` MUST ser `true` sólo cuando la raíz de la llamada es la raíz del puente, la que resolvió de su cwd al arrancar (`server.rs:388-390`), y `false` en cualquier otro caso. Una raíz que el modelo nombra en `project_path` queda así sólo registrada hasta que el usuario la agregue con `clawg projects add` ([`specs/project-docs`](../project-docs/spec.md)). La decisión es una función pura de las dos raíces, sin filesystem (`indexes_docs`, `crates/clawg-cli/src/mcp/tools.rs:383`). Compara `root` y no el id, porque dos raíces que chocan comparten id.
 
-**Colisión.** Si el daemon responde 409 `project_root_collision`, la tool MUST fallar sin guardar ni buscar. El texto MUST nombrar las dos raíces y decir que clawg no mezcla las memorias de dos proyectos bajo un id. También MUST decir que el proyecto no se puede usar hasta renombrar una de las dos carpetas, y que `all_projects` sigue buscando en todos (`ClawgMcp::explain`, `server.rs:491-496`). El puente MUST NOT recordar la raíz como registrada (`server.rs:623-626`): la llamada siguiente vuelve a preguntar y vuelve a fallar mientras el choque siga. Así, un `clawg restore` que lo resuelve se nota sin reiniciar el puente. Vale para las cinco tools con proyecto: `save_memory`, `search_memory`, `recall_context`, `search_project` y `synthesize`. Con `all_projects: true` (en `search_memory` y `synthesize`) no hay proyecto ni registro, así que no fallan.
+**Colisión.** Si el daemon responde 409 `project_root_collision`, la tool MUST fallar sin guardar ni buscar. El texto MUST nombrar las dos raíces y decir que clawg no mezcla las memorias de dos proyectos bajo un id. También MUST decir que el proyecto no se puede usar hasta renombrar una de las dos carpetas, y que `all_projects` sigue buscando en todos (`ClawgMcp::explain`, `server.rs:522-527`). El puente MUST NOT recordar la raíz como registrada (`server.rs:657-660`): la llamada siguiente vuelve a preguntar y vuelve a fallar mientras el choque siga. Así, un `clawg restore` que lo resuelve se nota sin reiniciar el puente. Vale para las cinco tools con proyecto: `save_memory`, `search_memory`, `recall_context`, `search_project` y `synthesize`. Con `all_projects: true` (en `search_memory` y `synthesize`) no hay proyecto ni registro, así que no fallan.
 
 **Otras fallas.** Si el registro falla por otra causa (un daemon que no conoce la ruta, un 400, un error de transporte), la tool MUST seguir con el id nuevo y dejar un warn: un registro fallido no bloquea un save.
 
