@@ -23,6 +23,7 @@ use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::events::{MemoryEvent, MemorySource};
 use crate::memory::redact::{redact, SecretKind};
 use crate::memory::store_insert::NewMemoryRecord;
+use crate::memory::topic::{inherit, Replaced, Revision, TopicScope};
 use crate::memory::MemoryStore;
 
 /// What happened to one chunk that reached the store.
@@ -84,6 +85,8 @@ pub struct IngestReport {
     pub redacted: Vec<SecretKind>,
     /// The earlier rows the detector paired with this save, one per row.
     pub related: Vec<Candidate>,
+    /// The rows of the save's topic key it superseded.
+    pub replaced: Vec<Replaced>,
 }
 
 /// Backlog size at which the ingest channel is worth reporting. Events are
@@ -547,9 +550,10 @@ async fn process_event(
     process_tracked(evt, store, embedder_cell, chat_chunker, absorbed, None).await
 }
 
-/// Ingests `evt` and, when it finished, links its pieces; for an event with
-/// an outbox row, the link and the row's removal go in one transaction. A
-/// failure leaves the row, with the pieces stored so far noted in it.
+/// Ingests `evt` and, when it finished, links its pieces and applies its
+/// revision; for an event with an outbox row, those and the row's removal go
+/// in one transaction. A failure leaves the row, with the pieces stored so far
+/// noted in it, and replaces nothing.
 async fn process_tracked(
     evt: &MemoryEvent,
     store: &Arc<MemoryStore>,
@@ -559,20 +563,42 @@ async fn process_tracked(
     track: Option<Track>,
 ) -> IngestReport {
     let row = track.as_ref().map(|t| t.row);
-    let (report, pieces) = ingest_pieces(evt, store, embedder_cell, chat_chunker, absorbed, track).await;
+    let scope = evt.topic().map(|key| TopicScope {
+        agent_id: evt.agent_id.clone(),
+        project_id: evt.project_id.clone(),
+        key: key.to_string(),
+    });
+    // Read before anything is stored, and again on a replay: the rows a save
+    // replaces stay live until it finishes, so both reads find them.
+    let earlier = match &scope {
+        Some(scope) => store.topic_rows(scope).await.unwrap_or_else(|e| {
+            log::warn!("could not read the rows of topic {} (agent={}): {e}", scope.key, evt.agent_id);
+            Vec::new()
+        }),
+        None => Vec::new(),
+    };
+    let inherited = earlier.first().map(|oldest| inherit(evt, oldest));
+    let evt = inherited.as_ref().unwrap_or(evt);
+    let earlier: Vec<i64> = earlier.iter().map(|r| r.id).collect();
+    let (mut report, pieces) =
+        ingest_pieces(evt, store, embedder_cell, chat_chunker, absorbed, track, &earlier).await;
     if report.failure.is_some() {
         return report;
     }
-    match row {
+    let revision = scope.filter(|_| !pieces.is_empty()).map(|scope| Revision {
+        scope,
+        save: pieces.iter().map(|p| p.memory_id).collect(),
+        inserted: report.memories.iter().filter(|m| m.outcome == ChunkOutcome::Inserted).map(|m| m.id).collect(),
+    });
+    report.replaced = match row {
         // A failure here leaves the row with every piece noted: the next start
         // only finishes it.
-        Some(row) => {
-            if let Err(e) = store.outbox_finish(row, pieces).await {
-                log::warn!("could not finish outbox row {row}: {e}; the next start finishes it");
-            }
-        }
-        None => link_save(store, pieces).await,
-    }
+        Some(row) => store.outbox_finish(row, pieces, revision).await.unwrap_or_else(|e| {
+            log::warn!("could not finish outbox row {row}: {e}; the next start finishes it");
+            Vec::new()
+        }),
+        None => finish_save(store, pieces, revision).await,
+    };
     report
 }
 
@@ -585,6 +611,7 @@ async fn ingest_pieces(
     chat_chunker: &Arc<ChatChunker>,
     absorbed: &mut u64,
     track: Option<Track>,
+    earlier: &[i64],
 ) -> (IngestReport, Vec<StoredPiece>) {
     // Masked before anything else reads the text, so the chunker, the dedup
     // hash, the embedding, the full-text index and the stored row all see the
@@ -695,6 +722,7 @@ async fn ingest_pieces(
         failure,
         redacted: redacted.clone(),
         related: Vec::new(),
+        replaced: Vec::new(),
     };
     let pieces = |stored: &[Option<SavedChunk>], contexts: &[String]| -> Vec<StoredPiece> {
         stored
@@ -743,8 +771,10 @@ async fn ingest_pieces(
     // chunk; the chunks this event already inserted are passed as siblings,
     // because two parts of one save are one claim by one author and must not
     // dispute each other. The rows a conclusion was drawn from are passed the
-    // same way: it restates them, it does not contradict them.
+    // same way: it restates them, it does not contradict them. So are the
+    // earlier rows of the save's topic key: it replaces them once it finishes.
     let mut siblings: Vec<i64> = evt.sources().to_vec();
+    siblings.extend_from_slice(earlier);
     siblings.extend(stored.iter().flatten().filter(|s| s.outcome == ChunkOutcome::Inserted).map(|s| s.id));
     // A long save probes the same earlier save from several of its chunks;
     // the first chunk that finds it holds the pair, so two saves pair once.
@@ -796,21 +826,23 @@ async fn ingest_pieces(
     (IngestReport { related, ..report(&stored, None) }, pieces(&stored, &contexts))
 }
 
-/// Links the pieces of a finished save of two or more that no outbox row
-/// stands for. A position absorbed into an existing row keeps that row's
-/// vector, made without this save's head, so its link carries none.
+/// Finishes a save that no outbox row stands for: links its pieces when there
+/// are two or more and applies its revision. A position absorbed into an
+/// existing row keeps that row's vector, made without this save's head, so its
+/// link carries none.
 ///
-/// A failure here leaves the rows unlinked, which is how every save was stored
-/// before links existed; the save itself did not fail and is not reported as
-/// failed.
-async fn link_save(store: &Arc<MemoryStore>, pieces: Vec<StoredPiece>) {
-    if pieces.len() < 2 {
-        return;
+/// A failure here leaves the rows unlinked and the earlier version live, which
+/// is how every save was stored before links and keys existed; the save itself
+/// did not fail and is not reported as failed.
+async fn finish_save(store: &Arc<MemoryStore>, pieces: Vec<StoredPiece>, revision: Option<Revision>) -> Vec<Replaced> {
+    if pieces.len() < 2 && revision.is_none() {
+        return Vec::new();
     }
     let count = pieces.len();
-    if let Err(e) = store.link_pieces(pieces).await {
-        log::warn!("could not link the {count} pieces of a save: {e}; they stay unlinked");
-    }
+    store.finish_save(pieces, revision).await.unwrap_or_else(|e| {
+        log::warn!("could not finish a save of {count} pieces: {e}; they stay unlinked and replace nothing");
+        Vec::new()
+    })
 }
 
 /// Resolves the shared tokenizer exactly once and builds the chat chunker
@@ -859,6 +891,7 @@ mod tests {
             memory_type: None,
             importance: None,
             derived_from: Vec::new(),
+            topic_key: None,
             user_stated: false,
         }
     }
@@ -875,6 +908,7 @@ mod tests {
             memory_type: None,
             importance: None,
             derived_from: Vec::new(),
+            topic_key: None,
             user_stated: false,
         }
     }
@@ -946,6 +980,7 @@ mod tests {
             memory_type: None,
             importance: None,
             derived_from: Vec::new(),
+            topic_key: None,
             user_stated: false,
         };
         // Wait: the "tool_calls" filter is in from_message, but the worker just
@@ -1306,6 +1341,7 @@ mod tests {
                 memory_type: None,
                 importance: None,
                 derived_from: Vec::new(),
+                topic_key: None,
                 user_stated: false,
             })).unwrap();
         }
@@ -1388,6 +1424,7 @@ mod tests {
                 memory_type: None,
                 importance: None,
                 derived_from: Vec::new(),
+                topic_key: None,
                 user_stated: false,
             })).unwrap();
         }
@@ -1418,6 +1455,7 @@ mod tests {
                 memory_type: None,
                 importance: None,
                 derived_from: Vec::new(),
+                topic_key: None,
                 user_stated: false,
             })).unwrap();
         }
@@ -2374,6 +2412,7 @@ mod tests {
             memory_type: None,
             importance: None,
             derived_from: Vec::new(),
+            topic_key: None,
             user_stated: false,
         })).unwrap();
         drain_worker(tx, handle).await;
@@ -2401,6 +2440,7 @@ mod tests {
             memory_type: None,
             importance: None,
             derived_from: Vec::new(),
+            topic_key: None,
             user_stated: false,
         })).unwrap();
         drain_worker(tx, handle).await;
@@ -3287,5 +3327,331 @@ mod tests {
             memory_worker(rx, no_drain(), Replay::none(), store, cell, chat_chunker).await;
         });
         (tx, handle)
+    }
+
+    // ── Revisions by topic key ──────────────────────────────────────────────
+
+    fn keyed(content: &str, key: &str) -> MemoryEvent {
+        MemoryEvent { topic_key: Some(key.into()), ..explicit(content, "architectural_decision") }
+    }
+
+    /// `(status, superseded_by, topic_key)` of row `id`.
+    async fn revision_state(store: &MemoryStore, id: i64) -> (String, Option<i64>, Option<String>) {
+        store
+            .conn
+            .call(move |c| {
+                c.query_row("SELECT status, superseded_by, topic_key FROM memory WHERE id = ?1", [id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn live_with_key(store: &MemoryStore, key: &str) -> Vec<i64> {
+        let key = key.to_string();
+        store
+            .conn
+            .call(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT id FROM memory WHERE topic_key = ?1 AND deleted_at IS NULL \
+                     AND status IN ('active', 'disputed') ORDER BY id",
+                )?;
+                let ids = stmt.query_map([key], |r| r.get(0))?.collect();
+                ids
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn save(store: &Arc<MemoryStore>, evt: &MemoryEvent) -> IngestReport {
+        let report = process_with(Arc::new(FakeEmbedder::default()), store, evt).await;
+        assert_eq!(report.failure, None);
+        report
+    }
+
+    fn only_id(report: &IngestReport) -> i64 {
+        assert_eq!(report.memories.len(), 1, "{report:?}");
+        report.memories[0].id
+    }
+
+    #[tokio::test]
+    async fn a_keyed_save_replaces_the_live_row_of_its_key() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let old_text = "Storage engine is SQLite\nChosen for a single local file.";
+        let old = only_id(&save(&store, &keyed(old_text, "storage/engine")).await);
+
+        let report = save(&store, &keyed("Storage engine moved to Postgres\nFor concurrent writers.", "storage/engine")).await;
+        let new = only_id(&report);
+
+        assert_eq!(report.memories[0].outcome, ChunkOutcome::Inserted);
+        assert_eq!(report.replaced, vec![Replaced { id: old, excerpt: "Storage engine is SQLite".into() }]);
+        assert_eq!(revision_state(&store, old).await, ("superseded".into(), Some(new), Some("storage/engine".into())));
+        assert_eq!(revision_state(&store, new).await, ("active".into(), None, Some("storage/engine".into())));
+        assert_eq!(live_with_key(&store, "storage/engine").await, vec![new]);
+        let vector = FakeEmbedder::default().embed_with_role(old_text, EmbedRole::Passage).await.unwrap();
+        let hits = crate::memory::search::search_all_memories(
+            &store,
+            &vector,
+            Some("SQLite"),
+            "agent-test",
+            crate::memory::search::SearchScope::all_default(),
+            10,
+        )
+        .await
+        .unwrap();
+        assert!(hits.iter().all(|h| h.id != old), "{hits:?}");
+    }
+
+    #[tokio::test]
+    async fn a_save_without_a_key_replaces_nothing() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let old = only_id(&save(&store, &keyed("Storage engine is SQLite", "storage/engine")).await);
+
+        let report = save(&store, &explicit("Storage engine moved to Postgres", "architectural_decision")).await;
+
+        assert!(report.replaced.is_empty());
+        assert_eq!(revision_state(&store, old).await.0, "active");
+        assert_eq!(revision_state(&store, only_id(&report)).await.2, None);
+    }
+
+    #[tokio::test]
+    async fn the_same_text_under_its_key_only_reinforces() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let first = only_id(&save(&store, &keyed("Storage engine is SQLite", "storage/engine")).await);
+
+        let report = save(&store, &keyed("Storage engine is SQLite", "storage/engine")).await;
+
+        assert_eq!(report.memories, vec![SavedChunk { id: first, outcome: ChunkOutcome::Reinforced }]);
+        assert!(report.replaced.is_empty());
+        assert_eq!(revision_state(&store, first).await.0, "active");
+    }
+
+    #[tokio::test]
+    async fn saving_an_earlier_text_again_is_another_revision() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let v1 = only_id(&save(&store, &keyed("Storage engine is SQLite", "storage/engine")).await);
+        let v2 = only_id(&save(&store, &keyed("Storage engine moved to Postgres", "storage/engine")).await);
+
+        let report = save(&store, &keyed("Storage engine is SQLite", "storage/engine")).await;
+        let v3 = only_id(&report);
+
+        assert!(v3 != v1 && v3 != v2);
+        assert_eq!(report.memories[0].outcome, ChunkOutcome::Inserted);
+        assert_eq!(revision_state(&store, v1).await.1, Some(v2));
+        assert_eq!(revision_state(&store, v2).await.1, Some(v3));
+        assert_eq!(live_with_key(&store, "storage/engine").await, vec![v3]);
+    }
+
+    #[tokio::test]
+    async fn a_revision_inherits_tier_and_accesses() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let old = only_id(&save(&store, &keyed("Storage engine is SQLite", "storage/engine")).await);
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE memory SET tier = 1, access_count = 7 WHERE id = ?1", [old]))
+            .await
+            .unwrap();
+
+        let new = only_id(&save(&store, &keyed("Storage engine moved to Postgres", "storage/engine")).await);
+
+        let (tier, accesses): (i64, i64) = store
+            .conn
+            .call(move |c| c.query_row("SELECT tier, access_count FROM memory WHERE id = ?1", [new], |r| Ok((r.get(0)?, r.get(1)?))))
+            .await
+            .unwrap();
+        assert_eq!((tier, accesses), (1, 7));
+    }
+
+    #[tokio::test]
+    async fn a_revision_keeps_the_type_and_importance_it_does_not_name() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let first = MemoryEvent { importance: Some(8.0), ..keyed("Indent with tabs", "style/indent") };
+        let first = MemoryEvent { memory_type: Some("user_preference".into()), ..first };
+        save(&store, &first).await;
+
+        let revised = MemoryEvent { memory_type: None, importance: None, ..keyed("Indent with four spaces", "style/indent") };
+        let new = only_id(&save(&store, &revised).await);
+
+        let (memory_type, importance): (String, f64) = store
+            .conn
+            .call(move |c| c.query_row("SELECT memory_type, importance FROM memory WHERE id = ?1", [new], |r| Ok((r.get(0)?, r.get(1)?))))
+            .await
+            .unwrap();
+        assert_eq!((memory_type.as_str(), importance), ("user_preference", 8.0));
+    }
+
+    #[tokio::test]
+    async fn a_revision_releases_the_rows_disputing_the_old_one() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let old = only_id(&save(&store, &keyed("Storage engine is SQLite", "storage/engine")).await);
+        let challenger = only_id(&save(&store, &explicit("Storage engine is DuckDB", "architectural_decision")).await);
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE memory SET status = 'disputed', disputed_against = json_array(?2) WHERE id = ?1",
+                    [challenger, old],
+                )
+            })
+            .await
+            .unwrap();
+
+        save(&store, &keyed("Storage engine moved to Postgres", "storage/engine")).await;
+
+        assert_eq!(revision_state(&store, challenger).await.0, "active");
+    }
+
+    #[tokio::test]
+    async fn a_failed_revision_replaces_nothing() {
+        struct FailingBatch;
+        #[async_trait::async_trait]
+        impl Embedder for FailingBatch {
+            async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+                Err(EmbedError::InferenceFailed("boom".into()))
+            }
+            fn dimensions(&self) -> usize { 384 }
+            fn model_id(&self) -> &str { "failing" }
+            fn query_prefix(&self) -> &str { "" }
+            fn passage_prefix(&self) -> &str { "" }
+        }
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let old = only_id(&save(&store, &keyed("Storage engine is SQLite", "storage/engine")).await);
+
+        let report =
+            process_with(Arc::new(FailingBatch), &store, &keyed("Storage engine moved to Postgres", "storage/engine")).await;
+
+        assert!(report.failure.is_some());
+        assert!(report.replaced.is_empty());
+        assert_eq!(live_with_key(&store, "storage/engine").await, vec![old]);
+    }
+
+    #[tokio::test]
+    async fn a_reinforced_row_without_a_key_takes_it() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let unkeyed = only_id(&save(&store, &explicit("Storage engine moved to Postgres", "architectural_decision")).await);
+        let old = only_id(&save(&store, &keyed("Storage engine is SQLite", "storage/engine")).await);
+
+        let report = save(&store, &keyed("Storage engine moved to Postgres", "storage/engine")).await;
+
+        assert_eq!(report.memories, vec![SavedChunk { id: unkeyed, outcome: ChunkOutcome::Reinforced }]);
+        assert_eq!(revision_state(&store, old).await.1, Some(unkeyed));
+        assert_eq!(live_with_key(&store, "storage/engine").await, vec![unkeyed]);
+    }
+
+    #[tokio::test]
+    async fn a_revision_does_not_pair_with_the_row_it_replaces() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let placed = |angle| Arc::new(PlacedEmbedder { vectors: vec![turned(1, angle)] }) as Arc<dyn Embedder>;
+        let other = process_with(placed(0.30), &store, &explicit_fact("Storage engine notes")).await.memories[0].id;
+        let old = process_with(placed(0.0), &store, &MemoryEvent { memory_type: Some("semantic_fact".into()), ..keyed("Storage engine is SQLite", "storage/engine") })
+            .await
+            .memories[0]
+            .id;
+
+        let report = process_with(placed(0.15), &store, &MemoryEvent { memory_type: Some("semantic_fact".into()), ..keyed("Storage engine moved to Postgres", "storage/engine") }).await;
+        let new = only_id(&report);
+
+        let found = pairs(&store).await;
+        assert!(found.iter().all(|(n, o, _)| !(*n == new && *o == old)), "{found:?}");
+        assert!(found.iter().any(|(n, o, _)| *n == new && *o == other), "{found:?}");
+    }
+
+    #[tokio::test]
+    async fn a_key_is_scoped_to_its_agent_and_project() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let old = only_id(&save(&store, &keyed("Storage engine is SQLite", "storage/engine")).await);
+
+        let other_agent = MemoryEvent { agent_id: "agent-other".into(), ..keyed("Storage engine moved to Postgres", "storage/engine") };
+        let other_project = MemoryEvent { project_id: Some("p-2".into()), ..keyed("Storage engine moved to Oracle", "storage/engine") };
+        assert!(save(&store, &other_agent).await.replaced.is_empty());
+        assert!(save(&store, &other_project).await.replaced.is_empty());
+
+        assert_eq!(revision_state(&store, old).await.0, "active");
+    }
+
+    fn other_text(words: usize) -> String {
+        (0..words).map(|i| format!("x{i:05}")).collect::<Vec<_>>().join(" ")
+    }
+
+    #[tokio::test]
+    async fn a_long_revision_replaces_every_piece_of_the_old_save() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let old: Vec<i64> = save(&store, &keyed(&distinct_text(400), "storage/engine")).await.memories.iter().map(|m| m.id).collect();
+        assert!(old.len() >= 2);
+
+        let report = save(&store, &keyed(&other_text(400), "storage/engine")).await;
+        let head = report.memories[0].id;
+
+        let mut replaced: Vec<i64> = report.replaced.iter().map(|r| r.id).collect();
+        replaced.sort_unstable();
+        assert_eq!(replaced, old);
+        for id in old {
+            assert_eq!(revision_state(&store, id).await.1, Some(head));
+        }
+        let new: Vec<i64> = report.memories.iter().map(|m| m.id).collect();
+        assert_eq!(live_with_key(&store, "storage/engine").await, new);
+    }
+
+    #[tokio::test]
+    async fn a_piece_shared_with_another_save_is_detached() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let old: Vec<i64> = save(&store, &keyed(&distinct_text(400), "storage/engine")).await.memories.iter().map(|m| m.id).collect();
+        let unkeyed: Vec<i64> =
+            save(&store, &explicit(&other_text(400), "semantic_fact")).await.memories.iter().map(|m| m.id).collect();
+        // The dedup absorbed a piece of the keyed save into another save.
+        let (shared, first) = (old[1], unkeyed[0]);
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO memory_piece (save_id, piece, memory_id, context) \
+                     SELECT MAX(save_id) + 1, 1, ?1, '' FROM memory_piece \
+                     UNION ALL SELECT MAX(save_id) + 1, 2, ?2, '' FROM memory_piece",
+                    [first, shared],
+                )
+            })
+            .await
+            .unwrap();
+
+        save(&store, &keyed("Storage engine moved to Postgres", "storage/engine")).await;
+
+        assert_eq!(revision_state(&store, shared).await, ("active".into(), None, None));
+        assert_eq!(revision_state(&store, old[0]).await.0, "superseded");
+    }
+
+    #[tokio::test]
+    async fn two_queued_revisions_apply_in_order() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let (tx, handle) = spawn_test_worker(store.clone(), Arc::new(FakeEmbedder::default())).await;
+        for text in ["Storage engine is SQLite", "Storage engine moved to Postgres", "Storage engine moved to DuckDB"] {
+            tx.send(keyed(text, "storage/engine").into()).await.unwrap();
+        }
+        drain_worker(tx, handle).await;
+
+        let live = live_with_key(&store, "storage/engine").await;
+        assert_eq!(live.len(), 1);
+        assert_eq!(stored_content(&store, live[0]).await, "Storage engine moved to DuckDB");
+    }
+
+    #[tokio::test]
+    async fn a_revision_is_finished_with_its_outbox_row() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let old = only_id(&save(&store, &keyed("Storage engine is SQLite", "storage/engine")).await);
+        let row = match store
+            .outbox_record("op-revision".into(), keyed("Storage engine moved to Postgres", "storage/engine"))
+            .await
+            .unwrap()
+        {
+            crate::memory::outbox::Recorded::New { row } => row,
+            other => panic!("expected a new row, got {other:?}"),
+        };
+
+        replay_pending(&store, Arc::new(FakeEmbedder::default())).await;
+
+        assert_eq!(outbox_row(&store, row).await, None);
+        let live = live_with_key(&store, "storage/engine").await;
+        assert_eq!(live.len(), 1);
+        assert_eq!(revision_state(&store, old).await, ("superseded".into(), Some(live[0]), Some("storage/engine".into())));
     }
 }

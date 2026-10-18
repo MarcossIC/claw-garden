@@ -242,6 +242,9 @@ pub struct MemoryRow {
     /// row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derived_from: Option<Vec<i64>>,
+    /// The topic key the row was saved under; absent without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic_key: Option<String>,
 }
 
 /// What `POST /v1/context` answers.
@@ -328,6 +331,9 @@ pub struct SaveArgs {
     /// the same to a daemon that predates them.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub derived_from: Vec<i64>,
+    /// Left off the wire when absent, for the same reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic_key: Option<String>,
     /// Left off the wire when false, like `derived_from`.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub user_stated: bool,
@@ -348,6 +354,16 @@ pub struct RelatedMemory {
     pub id: i64,
     /// The pair waits for the user in ACTIVE CONFLICTS.
     pub escalated: bool,
+    /// The first line of the earlier row.
+    #[serde(default)]
+    pub excerpt: String,
+}
+
+/// An earlier row a save under a topic key superseded, as `POST /v1/memories`
+/// reports it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ReplacedMemory {
+    pub id: i64,
     /// The first line of the earlier row.
     #[serde(default)]
     pub excerpt: String,
@@ -409,8 +425,17 @@ pub enum SaveOutcome {
     /// Stored, one entry per chunk. `redacted` names the kinds of secret
     /// masked out before storing; a daemon that predates masking sends none.
     /// `related` names the earlier rows the save was found close to; a daemon
-    /// that predates the pair table sends none.
-    Saved { memories: Vec<SavedMemory>, redacted: Vec<String>, related: Vec<RelatedMemory> },
+    /// that predates the pair table sends none. `replaced` names the rows of
+    /// the save's topic key it superseded, and `key_dropped` says the save
+    /// named a key the daemon did not echo: one that predates topic keys
+    /// stored it as a new memory and replaced nothing.
+    Saved {
+        memories: Vec<SavedMemory>,
+        redacted: Vec<String>,
+        related: Vec<RelatedMemory>,
+        replaced: Vec<ReplacedMemory>,
+        key_dropped: bool,
+    },
     /// Accepted but not confirmed; `reason` says why (`"unconfirmed"`,
     /// `"embedder_loading"`, `"already_queued"`), and `operation_id` is what
     /// it waits under; a daemon that predates the outbox sends none.
@@ -574,8 +599,13 @@ impl DaemonClient {
             #[serde(default)]
             related: Vec<RelatedMemory>,
             #[serde(default)]
+            replaced: Vec<ReplacedMemory>,
+            #[serde(default)]
+            topic_key: Option<String>,
+            #[serde(default)]
             operation_id: Option<String>,
         }
+        let keyed = args.topic_key.is_some();
         let resp = self
             .http
             .post(self.url("/v1/memories"))
@@ -586,7 +616,13 @@ impl DaemonClient {
             .map_err(Self::map_transport)?;
         let body: Body = Self::read_response(resp).await?;
         Ok(match body.status.as_str() {
-            "saved" => SaveOutcome::Saved { memories: body.memories, redacted: body.redacted, related: body.related },
+            "saved" => SaveOutcome::Saved {
+                memories: body.memories,
+                redacted: body.redacted,
+                related: body.related,
+                replaced: body.replaced,
+                key_dropped: keyed && body.topic_key.is_none(),
+            },
             _ => SaveOutcome::Queued { reason: body.reason, operation_id: body.operation_id },
         })
     }
@@ -1317,6 +1353,7 @@ pub(crate) mod tests {
             memory_type: Some("semantic_fact".into()),
             importance: Some(7.0),
             derived_from: Vec::new(),
+            topic_key: None,
             user_stated: false,
         })
         .await
@@ -1403,6 +1440,7 @@ pub(crate) mod tests {
             memory_type: None,
             importance: None,
             derived_from: Vec::new(),
+            topic_key: None,
             user_stated: false,
         };
         let undeclared = serde_json::to_value(&args).unwrap();
@@ -1423,6 +1461,7 @@ pub(crate) mod tests {
             memory_type: None,
             importance: None,
             derived_from: Vec::new(),
+            topic_key: None,
             user_stated: false,
         };
 
@@ -1437,7 +1476,7 @@ pub(crate) mod tests {
             second,
             SaveOutcome::Saved {
                 memories: vec![SavedMemory { kind: "memory".into(), id: memories[0].id, outcome: "reinforced".into() }],
-                redacted: vec![], related: vec![]
+                redacted: vec![], related: vec![], replaced: vec![], key_dropped: false
             }
         );
     }
@@ -1725,6 +1764,7 @@ pub(crate) mod tests {
             memory_type: Some("semantic_fact".into()),
             importance: Some(6.0),
             derived_from: Vec::new(),
+            topic_key: None,
             user_stated: false,
         })
         .await

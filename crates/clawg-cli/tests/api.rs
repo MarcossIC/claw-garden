@@ -2451,6 +2451,55 @@ async fn restore_answers_each_refusal_with_its_status() {
 }
 
 #[tokio::test]
+async fn a_save_refuses_an_invalid_topic_key() {
+    let h = Harness::start().await;
+
+    let (status, body) =
+        h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a", "topic_key": "Storage Engine" })).await;
+
+    assert_eq!(status, 400, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("topic_key"), "{body}");
+    let (_, listed) = h.get_json("/v1/memories").await;
+    assert_eq!(listed["items"], json!([]), "nothing was queued: {listed}");
+}
+
+#[tokio::test]
+async fn a_save_echoes_its_topic_key() {
+    let h = Harness::start().await;
+    let save = |content: &str| json!({ "content": content, "agent_id": "a", "topic_key": "storage/engine" });
+
+    let (status, first) = h.post_json("/v1/memories", save("Storage engine is SQLite")).await;
+    assert_eq!(status, 201, "{first}");
+    assert_eq!(first["topic_key"], "storage/engine", "{first}");
+    assert!(first.get("replaced").is_none(), "{first}");
+    let old = first["memories"][0]["id"].as_i64().unwrap();
+
+    let (status, second) = h.post_json("/v1/memories", save("Storage engine moved to Postgres")).await;
+    assert_eq!(status, 201, "{second}");
+    assert_eq!(second["replaced"], json!([{ "kind": "memory", "id": old, "excerpt": "Storage engine is SQLite" }]));
+    let (_, item) = h.get_json(&format!("/v1/memories/memory/{old}")).await;
+    assert_eq!(item["item"]["status"], "superseded", "{item}");
+    assert_eq!(item["item"]["topic_key"], "storage/engine", "{item}");
+
+    let (_, plain) = h.post_json("/v1/memories", json!({ "content": "deploys happen on fridays", "agent_id": "a" })).await;
+    assert!(plain.get("topic_key").is_none(), "{plain}");
+}
+
+#[tokio::test]
+async fn restore_refuses_a_row_whose_topic_is_live_again() {
+    let h = Harness::start().await;
+    let save = |content: &str| json!({ "content": content, "agent_id": "a", "topic_key": "storage/engine" });
+    let old = save_id(&h, save("Storage engine is SQLite")).await;
+    h.delete_row(old).await;
+    let current = save_id(&h, save("Storage engine moved to Postgres")).await;
+
+    let (status, body) = h.restore("memory", old, Some("a")).await;
+
+    assert_eq!(status, 409, "{body}");
+    assert!(body["error"].as_str().unwrap().contains(&format!("#{current}")), "{body}");
+}
+
+#[tokio::test]
 async fn listing_deleted_rows_shows_only_them_newest_deletion_first() {
     let h = Harness::start().await;
     let kept = save_id(&h, json!({ "content": "the go service uses tabs", "agent_id": "a" })).await;

@@ -1,14 +1,14 @@
 change: topic-revisions
 objective: "1"
 depends_on: [conflict-candidates]
-phase: explore
+phase: verify
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
-  apply: pending
-  verify: pending
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: in_progress  # Linux hecho; faltan Windows, el modelo real y el perfil dev
   archive: pending
-updated: 2026-10-15
+updated: 2026-10-18

@@ -262,7 +262,7 @@ fn drop_dispute_sql() -> String {
 const REVIVE_SQL: &str = "UPDATE memory SET status = 'active', superseded_by = NULL, last_modified_at = ?3 \
                           WHERE id = ?1 AND status = 'superseded' AND superseded_by = ?2";
 
-const SUPERSEDE_SQL: &str = "UPDATE memory SET status = 'superseded', superseded_by = ?2, last_modified_at = ?3 \
+pub(crate) const SUPERSEDE_SQL: &str = "UPDATE memory SET status = 'superseded', superseded_by = ?2, last_modified_at = ?3 \
                              WHERE id = ?1";
 
 /// Adds `?2` to `?1`'s `disputed_against` unless it is there already.

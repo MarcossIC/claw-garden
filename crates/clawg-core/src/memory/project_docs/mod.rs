@@ -1034,6 +1034,7 @@ mod tests {
                 memory_type: None,
                 importance: None,
                 derived_from: Vec::new(),
+                topic_key: None,
                 user_stated: false,
             };
             let chunk = Chunk { text: content.into() };
@@ -1079,6 +1080,7 @@ mod tests {
             memory_type: None,
             importance: None,
             derived_from: Vec::new(),
+            topic_key: None,
             user_stated: false,
         };
         let chunk = Chunk { text: evt.content.clone() };

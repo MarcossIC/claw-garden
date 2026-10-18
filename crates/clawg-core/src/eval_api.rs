@@ -296,6 +296,7 @@ impl EvalStore {
             created_at_ms,
             candidates: Vec::new(),
             derived_from: Vec::new(),
+            topic_key: None,
         };
         self.0
             .insert_memory_with_vector(record, embedding)
@@ -544,6 +545,7 @@ impl EvalIngest {
                 memory_type: Some(memory_type.to_string()),
                 importance: Some(importance),
                 derived_from: Vec::new(),
+                topic_key: None,
                 // Sealed as every save was before provenance, so what the
                 // agent view reads matches the recorded baselines.
                 user_stated: true,
