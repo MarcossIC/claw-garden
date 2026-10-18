@@ -182,3 +182,17 @@ fn the_manifest_carries_the_publication_metadata() {
     assert!(license.starts_with("MIT License"), "LICENSE is the MIT text");
     assert!(license.contains("The Claw Garden contributors"), "LICENSE names the holder");
 }
+
+#[test]
+fn reqwest_uses_rustls_with_the_system_roots() {
+    let manifest = read_repo_file("Cargo.toml");
+    let declaration = manifest_value(&manifest, "workspace.dependencies", "reqwest").expect("reqwest is declared");
+
+    assert!(declaration.contains("default-features = false"), "{declaration}");
+    for feature in ["json", "stream", "rustls-tls-native-roots", "charset", "http2", "system-proxy"] {
+        assert!(declaration.contains(&format!("\"{feature}\"")), "reqwest needs `{feature}`: {declaration}");
+    }
+    for feature in ["default-tls", "native-tls"] {
+        assert!(!declaration.contains(feature), "reqwest must not enable `{feature}`: {declaration}");
+    }
+}
