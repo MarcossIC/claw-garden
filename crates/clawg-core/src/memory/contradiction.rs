@@ -57,10 +57,9 @@ const _: () = assert!(NEAR_DUPLICATE_FLOOR < CONTRADICTION_THRESHOLD);
 /// Candidates the detector weighs per probe, before room for siblings.
 const CANDIDATE_POOL: usize = 5;
 
-/// Below this L2 distance a candidate pair that involves a preference or a
-/// decision is put to the user. It sits
-/// between the last measured contradiction (0.350) and the first compatible
-/// pair (0.469) of the calibration above.
+/// Below this L2 distance a candidate pair of two preferences or decisions is
+/// put to the user. It sits between the last measured contradiction (0.350)
+/// and the first compatible pair (0.469) of the calibration above.
 pub(crate) const ESCALATE_BELOW: f64 = 0.40;
 
 /// Below this L2 distance a pair of plain facts that share an identifier is
@@ -94,14 +93,19 @@ pub(crate) enum SaveKey {
 
 /// Whether a candidate pair goes to the user rather than only to the agent.
 /// A distance nobody recorded (a pair from before the pair table) always
-/// does; otherwise only a close pair where one side states a preference or a
-/// decision, or a closer one whose two texts name the same identifier.
+/// does; otherwise only a close pair of two preferences or decisions, or a
+/// closer one whose two texts name the same identifier.
+///
+/// A fact close to a decision stays with the agent: in conflict-eval's replay
+/// of a real store, most of those were notes of what happened saved as
+/// decisions. The agent still cannot supersede the decision on its own word
+/// (`dispute::judge_pair`), so it asks the user through `conflicts`.
 pub(crate) fn needs_user(new: MemoryType, old: MemoryType, distance: Option<f64>, shares_identifier: bool) -> bool {
     let protected = |t: MemoryType| matches!(t, MemoryType::UserPreference | MemoryType::ArchitecturalDecision);
     match distance {
         None => true,
         Some(d) => {
-            (d < ESCALATE_BELOW && (protected(new) || protected(old)))
+            (d < ESCALATE_BELOW && protected(new) && protected(old))
                 || (d < IDENTIFIER_ESCALATE_BELOW && shares_identifier)
         }
     }
@@ -512,9 +516,11 @@ mod tests {
             (Fact, Fact, Some(IDENTIFIER_ESCALATE_BELOW), true, false),
             (Fact, Fact, between, true, false),
             (Fact, Fact, edge, true, false),
-            (Pref, Fact, between, false, true),
-            (Pref, Fact, close, false, true),
-            (Fact, Pref, close, false, true),
+            (Pref, Fact, between, false, false),
+            (Pref, Fact, close, false, false),
+            (Fact, Decision, close, false, false),
+            (Fact, Pref, nearer, true, true),
+            (Pref, Decision, between, false, true),
             (Decision, Decision, close, false, true),
             (Pref, Pref, edge, false, false),
             (Pref, Pref, Some(0.41), true, false),
