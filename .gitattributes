@@ -1,1 +1,3 @@
 *.sql text eol=lf
+
+crates/clawg-cli/src/update/testdata/* -text

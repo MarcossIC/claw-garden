@@ -73,4 +73,102 @@ mod signature_cases {
 
         assert_eq!(comment, "clawg v1.2.3 SHA256SUMS");
     }
+
+    #[test]
+    fn a_signature_by_the_second_key_of_the_list_is_accepted() {
+        let (first, second) = (Signer::new(), Signer::new());
+        let signature = second.sign(b"sums", "clawg v1.2.3 SHA256SUMS");
+
+        assert!(verify(&[&first.public, &second.public], b"sums", &signature).is_ok());
+    }
+
+    #[test]
+    fn a_key_outside_the_list_is_untrusted() {
+        let (listed, outsider) = (Signer::new(), Signer::new());
+        let signature = outsider.sign(b"sums", "clawg v1.2.3 SHA256SUMS");
+
+        assert_eq!(
+            verify(&[&listed.public], b"sums", &signature),
+            Err(SignatureError::UntrustedKey)
+        );
+        assert_eq!(verify(&[], b"sums", &signature), Err(SignatureError::UntrustedKey));
+    }
+
+    #[test]
+    fn an_altered_file_is_rejected() {
+        let signer = Signer::new();
+        let signature = signer.sign(b"sums", "clawg v1.2.3 SHA256SUMS");
+
+        let result = verify(&[&signer.public], b"sumz", &signature);
+
+        assert!(matches!(result, Err(SignatureError::Rejected(_))), "{result:?}");
+    }
+
+    #[test]
+    fn the_signature_of_another_file_is_rejected() {
+        let signer = Signer::new();
+        let other = signer.sign(b"another file", "clawg v1.2.3 SHA256SUMS");
+
+        let result = verify(&[&signer.public], b"sums", &other);
+
+        assert!(matches!(result, Err(SignatureError::Rejected(_))), "{result:?}");
+    }
+
+    #[test]
+    fn a_legacy_signature_is_rejected() {
+        let signer = Signer::new();
+        let signature = signer.sign(b"sums", "clawg v1.2.3 SHA256SUMS");
+
+        let result = verify(&[&signer.public], b"sums", &as_legacy(&signature));
+
+        assert!(matches!(result, Err(SignatureError::Rejected(_))), "{result:?}");
+    }
+
+    #[test]
+    fn text_that_is_not_a_key_or_a_signature_is_named_as_such() {
+        let signer = Signer::new();
+        let signature = signer.sign(b"sums", "clawg v1.2.3 SHA256SUMS");
+
+        assert!(matches!(
+            verify(&["not a key"], b"sums", &signature),
+            Err(SignatureError::BadKey(_))
+        ));
+        assert!(matches!(
+            verify(&[&signer.public], b"sums", "not a signature"),
+            Err(SignatureError::BadSignature(_))
+        ));
+    }
+
+    #[test]
+    fn the_files_signed_by_the_minisign_command_line_are_accepted() {
+        let key = include_str!("testdata/fixture.pub");
+        let sums = include_bytes!("testdata/SHA256SUMS");
+        let signature = include_str!("testdata/SHA256SUMS.minisig");
+
+        let comment = verify(&[key], sums, signature).expect("accepted");
+
+        assert_eq!(comment, "clawg v0.19.0 SHA256SUMS");
+    }
+
+    /// The same signature with the algorithm field that marks the legacy mode
+    /// (`Ed` instead of `ED`), the only difference the verifier reads first.
+    fn as_legacy(signature: &str) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut lines: Vec<String> = signature.lines().map(String::from).collect();
+        let head: Vec<u32> = lines[1][..4]
+            .bytes()
+            .map(|c| ALPHABET.iter().position(|&a| a == c).expect("base64") as u32)
+            .collect();
+        let bits = head.iter().fold(0u32, |acc, v| (acc << 6) | v);
+        let mut bytes = [(bits >> 16) as u8, (bits >> 8) as u8, bits as u8];
+        assert_eq!(&bytes[..2], b"ED");
+        bytes[1] = b'd';
+        let bits = (u32::from(bytes[0]) << 16) | (u32::from(bytes[1]) << 8) | u32::from(bytes[2]);
+        let encoded: String = (0..4)
+            .map(|i| ALPHABET[((bits >> (18 - 6 * i)) & 63) as usize] as char)
+            .collect();
+        lines[1].replace_range(..4, &encoded);
+        lines.join("\n") + "\n"
+    }
 }
