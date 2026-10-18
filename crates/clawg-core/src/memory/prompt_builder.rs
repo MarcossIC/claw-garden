@@ -4,6 +4,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::memory::pieces::SaveLink;
 use crate::memory::provenance::mark;
 use crate::memory::{
     access::AccessTracker,
@@ -97,6 +98,9 @@ pub enum Retrieval {
     /// and were left out, so a prompt without hits can tell "nothing came
     /// close" from "nothing is stored".
     Searched { hits: usize, withheld: usize },
+    /// Nothing was searched: the prompt was asked for without a query, and
+    /// `hits` are the newest saves, before the budget.
+    Recent { hits: usize },
     NoEmbedder,
     EmbedFailed(EmbedError),
     SearchFailed(String),
@@ -160,17 +164,7 @@ pub async fn build_memory_prompt(
     budget: usize,
 ) -> Result<MemoryPrompt, MemoryError> {
     // 1. Read workspace file (may be empty on fresh install or read failure).
-    // Only its content reaches the model: no markers, no empty headings.
-    let workspace_content = {
-        let raw = workspace
-            .read(agent_id, project_id)
-            .await
-            .unwrap_or_else(|e| {
-                log::warn!("workspace read failed: {e}; treating as empty");
-                String::new()
-            });
-        workspace_for_prompt(&raw)
-    };
+    let workspace_content = read_workspace(workspace, agent_id, project_id).await;
 
     // 2. Compute query embedding ONLY if embedder is available.
     //
@@ -249,6 +243,67 @@ pub async fn build_memory_prompt(
         crate::memory::admin::format_skill_hits(&hits)
     );
 
+    let fitted = assemble(store, &workspace_content, hits, emitted, agent_id, budget).await;
+
+    // Fire-and-forget access recording, of the hits the text kept: a row this
+    // channel suppressed or the budget cut was not retrieved for the agent,
+    // and counting it would inflate the access count that drives tier
+    // promotion. Non-blocking, never awaits.
+    if let Some(tracker) = access_tracker {
+        tracker.record_hits(&fitted.shown);
+    }
+
+    Ok(MemoryPrompt { text: fitted.text, retrieval })
+}
+
+/// The prompt of a context asked for without a query, as a session starts:
+/// the workspace and, as RECENT, the agent's own newest saves of the last
+/// seven days, one line per save. Nothing is embedded or searched, so it
+/// needs no model.
+///
+/// The agent's own only: the workspace is too, and other agents' rows reach
+/// it through a search, where a query makes them relevant. No access is
+/// recorded: these rows were picked for being new, not relevant, and
+/// counting them at every session start would promote a row for its age.
+pub async fn build_session_prompt(
+    store: &MemoryStore,
+    workspace: &WorkspaceManager,
+    agent_id: &str,
+    project_id: Option<&str>,
+    emitted: &EmittedIds,
+    budget: usize,
+) -> Result<MemoryPrompt, MemoryError> {
+    let workspace_content = read_workspace(workspace, agent_id, project_id).await;
+    let since = TimestampMs::now().as_millis_i64().saturating_sub(RECENT_WINDOW_MS);
+    let rows = fetch_recent_rows(store, agent_id, project_id, since).await?;
+    let rows: Vec<RankedHit> = rows.into_iter().filter(|h| !emitted.contains(h.kind, h.id)).collect();
+    let links = store.save_links(rows.iter().map(|h| h.id).collect()).await?;
+    let hits = one_row_per_save(rows, &links, K_FINAL);
+    let retrieval = Retrieval::Recent { hits: hits.len() };
+    let fitted = assemble(store, &workspace_content, hits, emitted, agent_id, budget).await;
+    Ok(MemoryPrompt { text: fitted.text, retrieval })
+}
+
+/// Only its content reaches the model: no markers, no empty headings. A
+/// file that cannot be read is an empty workspace, not a failed prompt.
+async fn read_workspace(workspace: &WorkspaceManager, agent_id: &str, project_id: Option<&str>) -> String {
+    let raw = workspace.read(agent_id, project_id).await.unwrap_or_else(|e| {
+        log::warn!("workspace read failed: {e}; treating as empty");
+        String::new()
+    });
+    workspace_for_prompt(&raw)
+}
+
+/// Lays `hits` out under the workspace, with the conflicts on what the
+/// prompt could show, cut to `budget`.
+async fn assemble(
+    store: &MemoryStore,
+    workspace_content: &str,
+    hits: Vec<RankedHit>,
+    emitted: &EmittedIds,
+    agent_id: &str,
+    budget: usize,
+) -> Fitted {
     // Taken before `bucket_by_recency` consumes `hits`.
     let shown: Vec<i64> = hits
         .iter()
@@ -271,20 +326,11 @@ pub async fn build_memory_prompt(
     let (conflicts, conflicts_omitted) = rank_conflicts(conflicts, &hit_positions, MAX_CONFLICT_PAIRS);
 
     // 5. Assemble in order: WORKSPACE → RECENT → LONG-TERM → CONFLICTS, cut to the budget.
-    let fitted = fit_to_budget(
-        PromptParts { workspace: &workspace_content, recent, longterm, conflicts, conflicts_omitted, reader: agent_id },
+    fit_to_budget(
+        PromptParts { workspace: workspace_content, recent, longterm, conflicts, conflicts_omitted, reader: agent_id },
         budget,
-    );
+    )
 
-    // Fire-and-forget access recording, of the hits the text kept: a row this
-    // channel suppressed or the budget cut was not retrieved for the agent,
-    // and counting it would inflate the access count that drives tier
-    // promotion. Non-blocking, never awaits.
-    if let Some(tracker) = access_tracker {
-        tracker.record_hits(&fitted.shown);
-    }
-
-    Ok(MemoryPrompt { text: fitted.text, retrieval })
 }
 
 /// Everything the prompt can hold, before the budget is applied.
@@ -609,6 +655,84 @@ fn format_conflict_block(pairs: &[ConflictPair], hit_positions: &HashMap<i64, us
 /// at or after the threshold is recent; the epoch or a negative stamp falls to
 /// long-term; a future stamp counts as recent rather than being clamped, so a
 /// skewed clock stays visible.
+/// Rows RECENT may print in a prompt without a query: the reader's own live
+/// rows since `?3`, newest first, under the search's project predicate. The
+/// pool is wider than the block because the pieces of one long save are
+/// rows of their own, and they fold into one line.
+const RECENT_ROWS_SQL: &str = "
+    SELECT id, content, memory_type, tier, status, created_at, agent_id, topic_key
+    FROM memory
+    WHERE status IN ('active', 'disputed')
+      AND deleted_at IS NULL
+      AND agent_id = ?1
+      AND (?2 IS NULL OR project_id = ?2 OR project_id IS NULL OR memory_type = 'user_preference')
+      AND created_at >= ?3
+    ORDER BY created_at DESC, id DESC
+    LIMIT ?4
+";
+const RECENT_ROW_POOL: i64 = 200;
+
+async fn fetch_recent_rows(
+    store: &MemoryStore,
+    agent_id: &str,
+    project_id: Option<&str>,
+    since: i64,
+) -> Result<Vec<RankedHit>, MemoryError> {
+    let (agent, project) = (agent_id.to_string(), project_id.map(str::to_string));
+    store
+        .conn
+        .call(move |c| -> rusqlite::Result<Vec<RankedHit>> {
+            let mut stmt = c.prepare(RECENT_ROWS_SQL)?;
+            let rows = stmt.query_map(rusqlite::params![agent, project, since, RECENT_ROW_POOL], |row| {
+                Ok(RankedHit {
+                    id: row.get(0)?,
+                    kind: TableKind::Memory,
+                    content: row.get(1)?,
+                    memory_type: row.get(2)?,
+                    tier: row.get(3)?,
+                    status: row.get(4)?,
+                    score: 0.0,
+                    distance: 0.0,
+                    created_at: TimestampMs::from_unix_millis(row.get(5)?),
+                    agent_id: row.get(6)?,
+                    piece: None,
+                    exact: false,
+                    topic_key: row.get(7)?,
+                })
+            })?;
+            rows.collect()
+        })
+        .await
+        .map_err(|e| MemoryError::Backend(format!("fetch_recent_rows: {e}")))
+}
+
+/// The first `k` saves of `rows`, in their order, each as its piece of
+/// lowest position: the opening is what names the subject of a long save.
+fn one_row_per_save(rows: Vec<RankedHit>, links: &HashMap<i64, SaveLink>, k: usize) -> Vec<RankedHit> {
+    let mut out: Vec<RankedHit> = Vec::new();
+    let mut slot_of_save: HashMap<i64, usize> = HashMap::new();
+    for mut row in rows {
+        let link = links.get(&row.id).copied();
+        row.piece = link.map(|l| l.position);
+        match link.and_then(|l| slot_of_save.get(&l.save_id).copied()) {
+            Some(slot) => {
+                let piece = |h: &RankedHit| h.piece.map_or(0, |p| p.piece);
+                if piece(&row) < piece(&out[slot]) {
+                    out[slot] = row;
+                }
+            }
+            None if out.len() < k => {
+                if let Some(link) = link {
+                    slot_of_save.insert(link.save_id, out.len());
+                }
+                out.push(row);
+            }
+            None => {}
+        }
+    }
+    out
+}
+
 fn bucket_by_recency(hits: Vec<RankedHit>, now: TimestampMs) -> (Vec<RankedHit>, Vec<RankedHit>) {
     let threshold = TimestampMs::from_unix_millis(now.as_millis_i64().saturating_sub(RECENT_WINDOW_MS));
     let mut recent = Vec::new();
@@ -2708,5 +2832,114 @@ mod tests {
         assert!(prompt.contains("by claude-code] regla de claude-code"), "it still arrives as a hit: {prompt}");
         assert!(prompt.contains(&format!("#{new_id} ")), "the disputed row is among the hits: {prompt}");
         assert!(!prompt.contains(SEP_CONFLICTS), "claude-code's dispute #{new_id} vs #{old_id} is not cursor's to review: {prompt}");
+    }
+
+    /// A live `memory` row of `agent_id` in `project_id`, `age_days` old, with
+    /// no vector: the context without a query never reads one.
+    async fn seed_dated(store: &MemoryStore, agent_id: &str, project_id: Option<&str>, content: &str, age_days: i64) -> i64 {
+        let (agent, project, content) = (agent_id.to_string(), project_id.map(str::to_string), content.to_string());
+        let ts = TimestampMs::now().as_millis_i64() - age_days * 86_400_000;
+        store
+            .conn
+            .call(move |c| -> Result<i64, rusqlite::Error> {
+                c.execute(
+                    "INSERT INTO memory (scope, agent_id, project_id, content, memory_type, source,
+                     created_at, created_by_type, created_by_ref,
+                     last_modified_at, last_accessed_at, importance, tier, status)
+                     VALUES ('agent', ?1, ?2, ?3, 'semantic_fact', 'explicit', ?4, 'agent', ?1, ?4, ?4, 5.0, 2, 'active')",
+                    rusqlite::params![agent, project, content, ts],
+                )?;
+                Ok(c.last_insert_rowid())
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn session_prompt(store: &MemoryStore, agent_id: &str, project_id: Option<&str>) -> MemoryPrompt {
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        build_session_prompt(store, &wm, agent_id, project_id, &EmittedIds::default(), DEFAULT_BUDGET).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_context_without_a_query_lists_the_recent_saves_by_date() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let older = seed_dated(&store, "agent-1", Some("proj-a"), "the retry budget is three", 3).await;
+        let newer = seed_dated(&store, "agent-1", Some("proj-a"), "the cache key holds the locale", 1).await;
+        let global = seed_dated(&store, "agent-1", None, "commits are conventional", 2).await;
+        let stale = seed_dated(&store, "agent-1", Some("proj-a"), "an old note", 30).await;
+        let elsewhere = seed_dated(&store, "agent-1", Some("proj-b"), "another project's note", 1).await;
+
+        let prompt = session_prompt(&store, "agent-1", Some("proj-a")).await;
+
+        assert!(matches!(prompt.retrieval, Retrieval::Recent { hits: 3 }), "{:?}", prompt.retrieval);
+        let text = prompt.text;
+        assert!(text.contains(SEP_RECENT), "{text}");
+        assert!(!text.contains(SEP_LONGTERM), "nothing is searched, so nothing is long-term: {text}");
+        let at = |id: i64| text.find(&format!("#{id} ")).unwrap_or_else(|| panic!("#{id} missing: {text}"));
+        assert!(at(newer) < at(global) && at(global) < at(older), "newest first: {text}");
+        for id in [stale, elsewhere] {
+            assert!(!text.contains(&format!("#{id} ")), "#{id} is out of the week or the project: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_context_without_a_query_shows_a_long_save_once_by_its_opening() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let first = seed_dated(&store, "agent-1", None, "opening piece of a long save", 1).await;
+        let second = seed_dated(&store, "agent-1", None, "closing piece of a long save", 1).await;
+        store
+            .link_pieces(vec![
+                crate::memory::pieces::StoredPiece { memory_id: first, context: String::new() },
+                crate::memory::pieces::StoredPiece { memory_id: second, context: "opening".into() },
+            ])
+            .await
+            .unwrap();
+
+        let prompt = session_prompt(&store, "agent-1", None).await;
+
+        assert!(matches!(prompt.retrieval, Retrieval::Recent { hits: 1 }), "{:?}", prompt.retrieval);
+        assert!(prompt.text.contains(&format!("#{first} semantic_fact piece=1/2]")), "{}", prompt.text);
+        assert!(!prompt.text.contains(&format!("#{second} ")), "{}", prompt.text);
+    }
+
+    #[tokio::test]
+    async fn a_context_without_a_query_reads_only_its_own_agent() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let own = seed_dated(&store, "agent-1", None, "my own note", 1).await;
+        let other = seed_dated(&store, "agent-2", None, "someone else's note", 1).await;
+
+        let text = session_prompt(&store, "agent-1", None).await.text;
+
+        assert!(text.contains(&format!("#{own} ")), "{text}");
+        assert!(!text.contains(&format!("#{other} ")), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_context_without_a_query_skips_what_the_workspace_showed_and_the_dead() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let shown = seed_dated(&store, "agent-1", None, "tabs over spaces in every file", 1).await;
+        let gone = seed_dated(&store, "agent-1", None, "a deleted note", 1).await;
+        let kept = seed_dated(&store, "agent-1", None, "a live note", 1).await;
+        store
+            .conn
+            .call(move |c| {
+                c.execute("UPDATE memory SET memory_type = 'user_preference', importance = 9.0, tier = 1 WHERE id = ?1", [shown])?;
+                c.execute("UPDATE memory SET deleted_at = 1 WHERE id = ?1", [gone])
+            })
+            .await
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let emitted = wm.regenerate_auto_section("agent-1", None, &store).await.unwrap();
+        assert!(emitted.contains(TableKind::Memory, shown), "the fixture needs the workspace to print #{shown}");
+
+        let text = build_session_prompt(&store, &wm, "agent-1", None, &emitted, DEFAULT_BUDGET).await.unwrap().text;
+
+        assert!(text.contains("tabs over spaces"), "the workspace still prints it: {text}");
+        assert!(text.contains(&format!("#{kept} ")), "{text}");
+        for id in [shown, gone] {
+            assert!(!text.contains(&format!("#{id} ")), "#{id} is not a RECENT line: {text}");
+        }
     }
 }

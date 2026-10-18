@@ -691,6 +691,25 @@ impl DaemonClient {
         Self::read_response(resp).await
     }
 
+    /// The context without a query: the workspace and the newest saves, as
+    /// a session starts. A daemon that predates it refuses the request.
+    pub async fn recent_context(
+        &self,
+        agent_id: &str,
+        project_id: Option<&str>,
+        budget: usize,
+    ) -> Result<Context, ClientError> {
+        let resp = self
+            .http
+            .post(self.url("/v1/context"))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "agent_id": agent_id, "project_id": project_id, "budget": budget }))
+            .send()
+            .await
+            .map_err(Self::map_transport)?;
+        Self::read_response(resp).await
+    }
+
     pub async fn synthesis(&self, args: &SynthesisArgs) -> Result<Synthesis, ClientError> {
         let resp = self
             .http

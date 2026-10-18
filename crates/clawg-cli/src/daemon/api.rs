@@ -41,7 +41,7 @@ use clawg_core::memory::worker::{
 use clawg_core::memory::events::{MemoryEvent, MemorySource};
 use clawg_core::memory::clock::TimestampMs;
 use clawg_core::memory::project::{register_project, RegisterError};
-use clawg_core::memory::prompt_builder::{build_memory_prompt, QueryTexts, Retrieval, DEFAULT_BUDGET, MAX_BUDGET};
+use clawg_core::memory::prompt_builder::{build_memory_prompt, build_session_prompt, QueryTexts, Retrieval, DEFAULT_BUDGET, MAX_BUDGET};
 use clawg_core::memory::sharing::{self, Reach};
 use clawg_core::memory::topic::validate_topic_key;
 use clawg_core::memory::synthesis::{
@@ -369,7 +369,10 @@ pub struct SearchRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct ContextRequest {
-    pub query: String,
+    /// Absent or blank, the prompt holds the newest saves instead of a
+    /// search, as a session starts with no question yet.
+    #[serde(default)]
+    pub query: Option<String>,
     pub agent_id: String,
     #[serde(default)]
     pub project_id: Option<String>,
@@ -597,6 +600,8 @@ pub struct ContextBody {
 pub enum RetrievalState {
     /// `hits` went into the prompt; `withheld` scored 0 and were left out.
     Searched { hits: usize, withheld: usize },
+    /// Asked for without a query: `hits` are the newest saves, by date.
+    Recent { hits: usize },
     EmbedderNotReady,
     EmbedderFailed { detail: String, retryable: bool },
     SearchFailed { detail: String },
@@ -608,6 +613,7 @@ impl RetrievalState {
     fn of(retrieval: Retrieval, status: EmbedderStatus) -> Self {
         match retrieval {
             Retrieval::Searched { hits, withheld } => Self::Searched { hits, withheld },
+            Retrieval::Recent { hits } => Self::Recent { hits },
             Retrieval::NoEmbedder => match status {
                 EmbedderStatus::Failed { error, retryable } => Self::EmbedderFailed { detail: error, retryable },
                 EmbedderStatus::Loading | EmbedderStatus::Ready => Self::EmbedderNotReady,
@@ -1108,19 +1114,24 @@ async fn context(
             Default::default()
         });
 
-    let prompt = build_memory_prompt(
-        &app.runtime.store,
-        &workspace,
-        app.runtime.embedder.get().cloned(),
-        &body.agent_id,
-        project_id,
-        &reach(&app, &body.agent_id),
-        QueryTexts { lexical: &body.query, embedded: &body.query },
-        &emitted,
-        Some(app.runtime.access_tracker.as_ref()),
-        budget,
-    )
-    .await
+    let prompt = match body.query.as_deref().filter(|q| !q.trim().is_empty()) {
+        Some(query) => {
+            build_memory_prompt(
+                &app.runtime.store,
+                &workspace,
+                app.runtime.embedder.get().cloned(),
+                &body.agent_id,
+                project_id,
+                &reach(&app, &body.agent_id),
+                QueryTexts { lexical: query, embedded: query },
+                &emitted,
+                Some(app.runtime.access_tracker.as_ref()),
+                budget,
+            )
+            .await
+        }
+        None => build_session_prompt(&app.runtime.store, &workspace, &body.agent_id, project_id, &emitted, budget).await,
+    }
     .map_err(ApiError::internal)?;
 
     // Same degradation as the regen above: a reminder that cannot be counted
