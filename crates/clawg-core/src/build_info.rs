@@ -98,6 +98,53 @@ pub const STAMP_WINDOW: u64 = 4096;
 pub struct Stamp {
     pub version: Option<String>,
     pub dist_target: Option<String>,
+    /// The newest migration the binary knows and applies, as if it were an
+    /// older release.
+    pub migrations_up_to: Option<i32>,
+    pub serve_fault: Option<ServeFault>,
+}
+
+/// Where `clawg serve` fails on purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServeFault {
+    /// Before the store is opened: the daemon does not start and touches nothing.
+    BeforeOpen,
+    /// After the store is opened, and so migrated, and before the daemon answers.
+    AfterOpen,
+}
+
+/// The newest migration a `testing` build applies and knows, from its stamp;
+/// `None` is all of them.
+#[cfg(feature = "testing")]
+pub fn migrations_up_to() -> Option<i32> {
+    stamp().and_then(|s| s.migrations_up_to)
+}
+
+/// Always `None`: a build without `testing` knows every migration it has.
+#[cfg(not(feature = "testing"))]
+pub fn migrations_up_to() -> Option<i32> {
+    None
+}
+
+/// Fails with a message when a `testing` build was stamped to fail at `at`.
+#[cfg(feature = "testing")]
+pub fn inject_serve_fault(at: ServeFault) -> Result<(), String> {
+    fault_at(stamp().and_then(|s| s.serve_fault), at)
+}
+
+/// Always succeeds: a build without `testing` fails only for real.
+#[cfg(not(feature = "testing"))]
+pub fn inject_serve_fault(_at: ServeFault) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(any(test, feature = "testing"))]
+fn fault_at(configured: Option<ServeFault>, at: ServeFault) -> Result<(), String> {
+    match configured {
+        Some(fault) if fault == at => Err(format!("fault injected by the test stamp: {fault:?}")),
+        _ => Ok(()),
+    }
 }
 
 /// The stamp at the end of `tail`: the last marker in it, followed by a JSON
@@ -149,8 +196,31 @@ mod tests {
             Some(Stamp {
                 version: Some("0.18.0".into()),
                 dist_target: Some("x86_64-pc-windows-msvc".into()),
+                ..Stamp::default()
             })
         );
+    }
+
+    #[test]
+    fn a_stamp_can_cap_the_migrations_and_ask_the_daemon_to_fail() {
+        let stamp = parse_stamp(&stamped(r#"{"migrations_up_to":7,"serve_fault":"after_open"}"#)).unwrap();
+
+        assert_eq!(stamp.migrations_up_to, Some(7));
+        assert_eq!(stamp.serve_fault, Some(ServeFault::AfterOpen));
+        let stamp = parse_stamp(&stamped(r#"{"serve_fault":"before_open"}"#)).unwrap();
+        assert_eq!(stamp.serve_fault, Some(ServeFault::BeforeOpen));
+        assert_eq!(stamp.migrations_up_to, None);
+        assert_eq!(parse_stamp(&stamped(r#"{"serve_fault":"somewhere_else"}"#)), None);
+    }
+
+    #[test]
+    fn a_fault_fires_only_at_the_point_it_names() {
+        let configured = Some(ServeFault::AfterOpen);
+
+        assert_eq!(fault_at(configured, ServeFault::BeforeOpen), Ok(()));
+        assert_eq!(fault_at(None, ServeFault::AfterOpen), Ok(()));
+        let fired = fault_at(configured, ServeFault::AfterOpen).unwrap_err();
+        assert!(fired.contains("AfterOpen"), "{fired}");
     }
 
     #[test]
@@ -230,6 +300,8 @@ mod tests {
 
         assert_eq!(release_url_override(), None);
         assert_eq!(release_keys_override(), None);
+        assert_eq!(migrations_up_to(), None);
+        assert_eq!(inject_serve_fault(ServeFault::AfterOpen), Ok(()));
         assert_eq!(version(), env!("CARGO_PKG_VERSION"));
     }
 }

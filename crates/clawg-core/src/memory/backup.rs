@@ -38,9 +38,10 @@ pub fn read_history(c: &rusqlite::Connection) -> rusqlite::Result<Vec<MigrationI
     rows.collect()
 }
 
-/// The migrations embedded in this binary.
+/// The migrations embedded in this binary; a `testing` build stamped with a
+/// cap knows only up to it.
 pub fn known_migrations() -> Vec<MigrationId> {
-    crate::memory::migrations::runner()
+    let all = crate::memory::migrations::runner()
         .get_migrations()
         .iter()
         .map(|m| MigrationId {
@@ -48,7 +49,16 @@ pub fn known_migrations() -> Vec<MigrationId> {
             name: m.name().to_string(),
             checksum: m.checksum(),
         })
-        .collect()
+        .collect();
+    capped(all, crate::build_info::migrations_up_to())
+}
+
+/// `migrations` without those past `up_to`.
+fn capped(migrations: Vec<MigrationId>, up_to: Option<i32>) -> Vec<MigrationId> {
+    match up_to {
+        Some(newest) => migrations.into_iter().filter(|m| m.version <= newest).collect(),
+        None => migrations,
+    }
 }
 
 /// The newest migration this binary knows, so tests do not assume a count
@@ -601,6 +611,17 @@ mod tests {
         ] {
             assert_eq!(parse_snapshot_name(other), None, "{other}");
         }
+    }
+
+    #[test]
+    fn a_cap_hides_the_migrations_past_it() {
+        let all: Vec<MigrationId> = (1..=5).map(|v| MigrationId { version: v, name: format!("m{v}"), checksum: v as u64 }).collect();
+
+        assert_eq!(capped(all.clone(), None), all);
+        assert_eq!(capped(all.clone(), Some(5)), all);
+        let versions: Vec<i32> = capped(all.clone(), Some(3)).iter().map(|m| m.version).collect();
+        assert_eq!(versions, [1, 2, 3]);
+        assert!(capped(all, Some(0)).is_empty());
     }
 
     #[tokio::test]

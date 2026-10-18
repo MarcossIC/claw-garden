@@ -380,7 +380,16 @@ async fn register_udfs(conn: &Connection) -> Result<(), MemoryError> {
 /// row re-runs the body on the next start, and for an `ADD COLUMN` that is a
 /// "duplicate column" error on every start from then on.
 fn configured(runner: refinery::Runner) -> refinery::Runner {
-    runner.set_grouped(true)
+    configured_to(runner, crate::build_info::migrations_up_to())
+}
+
+/// [`configured`] with the newest migration to apply, `None` for all.
+fn configured_to(runner: refinery::Runner, up_to: Option<i32>) -> refinery::Runner {
+    let runner = runner.set_grouped(true);
+    match up_to {
+        Some(newest) => runner.set_target(refinery::Target::Version(newest)),
+        None => runner,
+    }
 }
 
 /// Refuses a database this binary must not migrate, and says what opening it
@@ -1212,6 +1221,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(top, backup::latest_known());
+    }
+
+    #[tokio::test]
+    async fn a_runner_with_a_cap_migrates_no_further_than_it() {
+        ensure_vec0_registered();
+        for (cap, expected) in [(Some(7), 7), (None, backup::latest_known())] {
+            let conn = Connection::open_in_memory().await.unwrap();
+            register_udfs(&conn).await.unwrap();
+
+            conn.call(move |c| configured_to(crate::memory::migrations::runner(), cap).run(c))
+                .await
+                .unwrap();
+
+            let top: i32 = conn
+                .call(|c| c.query_row("SELECT MAX(version) FROM refinery_schema_history", [], |r| r.get(0)))
+                .await
+                .unwrap();
+            assert_eq!(top, expected, "{cap:?}");
+        }
     }
 
     #[tokio::test]
