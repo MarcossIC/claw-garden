@@ -566,6 +566,40 @@ impl EvalIngest {
     }
 }
 
+/// One pair the contradiction detector wrote, as `conflict-eval` reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvalConflictPair {
+    pub new_id: i64,
+    pub old_id: i64,
+    pub distance: Option<f64>,
+    /// Put to the user rather than only to the agent.
+    pub escalated: bool,
+}
+
+/// Every pair in `runtime`'s store, in id order.
+pub async fn conflict_pairs(runtime: &MemoryRuntime) -> Result<Vec<EvalConflictPair>, EvalError> {
+    runtime
+        .store
+        .conn
+        .call(|c| {
+            let mut stmt =
+                c.prepare("SELECT new_id, old_id, distance, state FROM memory_conflict ORDER BY new_id, old_id")?;
+            let pairs = stmt
+                .query_map([], |r| {
+                    Ok(EvalConflictPair {
+                        new_id: r.get(0)?,
+                        old_id: r.get(1)?,
+                        distance: r.get(2)?,
+                        escalated: r.get::<_, String>(3)? == "escalated",
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(pairs)
+        })
+        .await
+        .map_err(|e: tokio_rusqlite::Error| EvalError::Search(e.to_string()))
+}
+
 /// The token window the live embedder truncates to — re-exported so the eval
 /// binary's `--follow-up` budget reads the exact same number production's
 /// embedder enforces, rather than a second copy that could drift from it.
@@ -1166,6 +1200,36 @@ mod tests {
             Err(EvalError::UnknownMemoryType(t)) => assert_eq!(t, "not_a_real_type"),
             other => panic!("expected UnknownMemoryType, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn conflict_pairs_reads_the_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
+        let runtime = ingest.finish().await.unwrap();
+        assert!(conflict_pairs(&runtime).await.unwrap().is_empty());
+        runtime
+            .store
+            .conn
+            .call(|c| {
+                c.execute(
+                    "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) \
+                     VALUES (2, 1, 0.31, 'pending', 0), (3, 1, NULL, 'escalated', 0)",
+                    [],
+                )
+            })
+            .await
+            .unwrap();
+
+        let pairs = conflict_pairs(&runtime).await.unwrap();
+
+        assert_eq!(
+            pairs,
+            vec![
+                EvalConflictPair { new_id: 2, old_id: 1, distance: Some(0.31), escalated: false },
+                EvalConflictPair { new_id: 3, old_id: 1, distance: None, escalated: true },
+            ]
+        );
     }
 
     #[tokio::test]
