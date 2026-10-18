@@ -15,11 +15,19 @@ pub enum SignatureError {
     Rejected(String),
 }
 
+/// The release public keys every build carries: the primary, whose private
+/// half signs in `release.yml`, then the backup.
+pub const EMBEDDED_KEYS: [&str; 2] = [
+    include_str!("../../../../release/minisign.pub"),
+    include_str!("../../../../release/minisign-next.pub"),
+];
+
 /// The public keys a release signature is checked against, the text of a
-/// `.pub` each. A `testing` build can take them from the environment; the
-/// embedded list is empty, so any other build rejects every signature.
+/// `.pub` each: the embedded ones, or those a `testing` build takes from the
+/// environment instead.
 pub fn trusted_keys() -> Vec<String> {
-    clawg_core::build_info::release_keys_override().unwrap_or_default()
+    clawg_core::build_info::release_keys_override()
+        .unwrap_or_else(|| EMBEDDED_KEYS.iter().map(|key| key.to_string()).collect())
 }
 
 /// Checks `signature` (the text of a `.minisig`) over `content` against each

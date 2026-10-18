@@ -3,6 +3,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use clawg_cli::update::signature;
+
 /// Whether `line` is an attribute that silences an unused-code lint: an
 /// `allow` or `expect`, inner or outer, also behind a `cfg_attr`, naming
 /// `dead_code`, `unused` or an `unused_*` lint. The repository's rule is to
@@ -562,4 +564,17 @@ fn the_release_keys_are_two_distinct_minisign_public_keys() {
         key_lines.push(key.to_string());
     }
     assert_ne!(key_lines[0], key_lines[1], "the primary and the backup release keys must differ");
+}
+
+#[test]
+fn the_embedded_key_list_has_the_primary_and_backup_keys_and_not_the_test_key() {
+    let primary = read_repo_file("release/minisign.pub");
+    let backup = read_repo_file("release/minisign-next.pub");
+    let test_key = read_repo_file("crates/clawg-cli/src/update/testdata/fixture.pub");
+
+    assert_eq!(signature::EMBEDDED_KEYS, [primary.as_str(), backup.as_str()]);
+    assert!(
+        signature::EMBEDDED_KEYS.iter().all(|key| key_line(key) != key_line(&test_key)),
+        "a release must never trust the key the tests sign with"
+    );
 }
