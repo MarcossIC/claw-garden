@@ -63,3 +63,10 @@ tempfile = "3"
 
 clawg-core = { path = "crates/clawg-core" }
 clawg-cli = { path = "crates/clawg-cli" }
+
+# On Linux the debug info goes inside the executable (Windows keeps it in a
+# separate `.pdb`), and with all of it the `clawg` the update tests serve as a
+# release outgrows the 256 MiB `BINARY_CAP` that `clawg update` downloads.
+# Line tables keep file and line in a failing test's backtrace.
+[profile.test]
+debug = "line-tables-only"
