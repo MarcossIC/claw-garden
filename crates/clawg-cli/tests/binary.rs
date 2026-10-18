@@ -577,6 +577,87 @@ async fn a_bridge_left_open_reaches_the_daemon_after_a_restart() {
     assert!(!tool_failed(&reply), "the open bridge must find the new daemon: {reply}");
 }
 
+// ── Client hooks ───────────────────────────────────────────────────────────
+
+/// Runs `clawg hook` with `input` on stdin, as a client does.
+fn hook(sandbox: &Sandbox, args: &[&str], input: &str) -> Output {
+    let mut child = sandbox
+        .command(&[&["hook"], args].concat())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn clawg hook");
+    child.stdin.take().expect("stdin").write_all(input.as_bytes()).expect("write stdin");
+    child.wait_with_output().expect("clawg hook")
+}
+
+#[tokio::test]
+async fn a_hook_without_a_daemon_prints_nothing() {
+    let sandbox = Sandbox::new();
+    let input = json!({ "cwd": sandbox.home, "source": "startup" }).to_string();
+    let out = hook(&sandbox, &["session-start", "--agent", "smoke", "--profile", "dev"], &input);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    assert_eq!(stdout_of(&out), "");
+    assert!(!sandbox.data_dir().join("daemon.json").exists(), "no daemon was started");
+}
+
+#[tokio::test]
+async fn a_hook_with_input_that_is_not_json_prints_nothing() {
+    let sandbox = Sandbox::new();
+    let _daemon = sandbox.serve().await;
+    for event in ["session-start", "user-prompt-submit"] {
+        let out = hook(&sandbox, &[event, "--agent", "smoke", "--profile", "dev"], "not json");
+        assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+        assert_eq!(stdout_of(&out), "");
+    }
+}
+
+#[tokio::test]
+async fn a_hook_usage_error_exits_1() {
+    let sandbox = Sandbox::new();
+    for args in [&["session-start"][..], &["session-end", "--agent", "a"], &["session-start", "--agent", "a", "--profile", "prod"]] {
+        let out = hook(&sandbox, args, "{}");
+        assert_eq!(out.status.code(), Some(1), "2 would block the client: {args:?} {}", stderr_of(&out));
+        assert!(!stderr_of(&out).is_empty(), "{args:?}");
+    }
+}
+
+#[tokio::test]
+async fn session_start_injects_the_saved_memories() {
+    let sandbox = Sandbox::new();
+    let root = sandbox.home.join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let project = clawg_core::memory::ProjectIdentity::resolve(&root).id;
+    let daemon = sandbox.serve().await;
+    let (status, body) = daemon
+        .post(
+            "/v1/memories",
+            json!({ "content": "the deploy script lives in ops/deploy.sh", "agent_id": "smoke", "project_id": project }),
+        )
+        .await;
+    assert!(status == 201 || status == 202, "{body}");
+    daemon.wait_until_ingested().await;
+
+    let input = json!({ "session_id": "s", "cwd": root, "hook_event_name": "SessionStart", "source": "startup" });
+    let out = hook(&sandbox, &["session-start", "--agent", "smoke", "--profile", "dev"], &input.to_string());
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let reply: Value = serde_json::from_str(&stdout_of(&out)).expect("one JSON object");
+    assert_eq!(reply["hookSpecificOutput"]["hookEventName"], "SessionStart");
+    let context = reply["hookSpecificOutput"]["additionalContext"].as_str().expect("context");
+    assert!(context.contains("ops/deploy.sh"), "{context}");
+
+    let other = hook(&sandbox, &["session-start", "--agent", "other", "--profile", "dev"], &input.to_string());
+    assert_eq!(stdout_of(&other), "", "another agent's session has nothing of its own");
+
+    let transcript = sandbox.home.join("transcript.jsonl");
+    std::fs::write(&transcript, "").unwrap();
+    let prompt = json!({ "cwd": root, "prompt": "go on", "transcript_path": transcript });
+    let out = hook(&sandbox, &["user-prompt-submit", "--agent", "smoke", "--profile", "dev"], &prompt.to_string());
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    assert_eq!(stdout_of(&out), "", "the session just started and a save just landed");
+}
+
 // ── Cleanup ────────────────────────────────────────────────────────────────
 
 #[tokio::test]
