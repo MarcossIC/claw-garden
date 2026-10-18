@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1, 4, 5 | S | — (lo usan 24 y 45, y lo produce 44; ver «Interacciones») | exploración (borrador) |
+| 1, 4, 5 | S | — (lo usan 24 y 45, y lo produce 44; ver «Interacciones») | decidida; sigue en la [propuesta](proposal.md) |
 
 **Tesis:** cada memoria guardada por MCP queda sellada como dicha por el usuario, aunque el agente la haya inferido y aunque sea una conclusión de `synthesize`. La base afirma, fila por fila, algo que no sabe. Las columnas que describen el origen existen desde la primera migración, pero nadie las lee salvo el listado. Saber quién afirmó cada cosa es justo lo que ayuda a decidir en tres lugares:
 
@@ -105,11 +105,11 @@
 
 Son del usuario.
 
-- [ ] **Enfoque.** ¿A (sólo lo que el daemon sabe) o B (más la declaración del agente, recomendado)?
-- [ ] **Nombre y forma de la declaración** en B: ¿un booleano, o un valor de origen?
-- [ ] **Usos.** ¿Cuáles de los cuatro entran en este cambio? Se recomiendan 1 y 2. El 3 se mide antes.
-- [ ] **Valores.** ¿`source` gana `synthesis` e `import`, o la conclusión se marca sólo con `created_by_type`?
-- [ ] **Filas anteriores.** ¿Se dejan como están (recomendado) y se documenta?
+- [x] **Enfoque.** B: el daemon sella lo que sabe y el agente puede declarar lo que dijo el usuario.
+- [x] **Nombre y forma de la declaración** en B: un booleano, `user_stated`.
+- [x] **Usos.** Entran 1 y 2. El 3 y el 4 quedan fuera.
+- [x] **Valores.** `source` gana `synthesis` e `import`.
+- [x] **Filas anteriores.** Se dejan como están y se documenta.
 
 ## Cómo se mide
 
