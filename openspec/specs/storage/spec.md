@@ -441,14 +441,19 @@ Un snapshot MUST incluir el outbox, y con él el texto enmascarado de los saves 
 
 ### Retención
 
-Después de cada snapshot automático, el directorio de backups MUST conservar los 5 automáticos más nuevos (`AUTO_KEEP`, `backup.rs:231`) y borrar los demás automáticos. Los `manual` MUST NOT borrarse nunca, y un archivo con otro nombre MUST NOT tocarse. La elección es pura (`to_prune`, `backup.rs:236`); el borrado es best-effort.
+Después de cada snapshot automático, el directorio de backups MUST conservar los 5 automáticos más nuevos (`AUTO_KEEP`, `backup.rs:231`) y, además, el más nuevo de cada motivo automático (`pre-migration`, `pre-restore`, `pre-reembed`), de modo que una racha de restores o re-embeds no saque el `pre-migration` que es la vuelta atrás de una actualización; los demás automáticos se borran. Los `manual` MUST NOT borrarse nunca, y un archivo con otro nombre MUST NOT tocarse. La elección es pura (`to_prune`, `backup.rs:238`); el borrado es best-effort.
 
 #### Escenario
 - GIVEN 7 snapshots automáticos, 2 manuales y un `notas.txt`
 - WHEN se hace un snapshot automático más
 - THEN quedan los 5 automáticos más nuevos, los 2 manuales y `notas.txt`
 
-**Tests:** `pruning_keeps_the_newest_automatic_snapshots_and_every_manual_one` y `an_automatic_snapshot_prunes_older_automatic_ones` (`backup.rs`).
+#### Escenario: una racha de otro motivo no saca al único `pre-migration`
+- GIVEN un `pre-migration`, un `pre-reembed` y 7 `pre-restore` más nuevos
+- WHEN se calcula qué podar
+- THEN sólo se podan los 2 `pre-restore` más viejos; el `pre-migration` y el `pre-reembed` quedan
+
+**Tests:** `pruning_keeps_the_newest_automatic_snapshots_and_every_manual_one`, `pruning_keeps_the_newest_snapshot_of_every_automatic_reason` y `an_automatic_snapshot_prunes_older_automatic_ones` (`backup.rs`).
 
 ## Backup y restore
 
