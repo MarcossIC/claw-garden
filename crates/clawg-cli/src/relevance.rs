@@ -18,7 +18,8 @@
 /// shows 37 at 894.
 pub const RELEVANCE_RATIO: f64 = 0.35;
 
-/// Hits without an identifier match shown regardless of score.
+/// Hits without an identifier match shown however low they scored, as long
+/// as they scored at all.
 pub const MIN_SHOWN_HITS: usize = 2;
 
 /// Which of `hits`, best first as `(score, exact)`, survive a cut at `ratio`.
@@ -28,6 +29,10 @@ pub const MIN_SHOWN_HITS: usize = 2;
 /// any cosine, and measured against it no row about the same topic survived.
 /// The others are cut against the best of them, so a query with an identifier
 /// shows its matches above the list a query without one would show.
+///
+/// A hit that scored 0 is below the cosine floor and holds no identifier: it
+/// came back only because the pool had room for it, so it is never shown and
+/// does not count toward the minimum.
 pub fn shown_hits(hits: &[(f64, bool)], ratio: f64) -> Vec<bool> {
     let best = hits.iter().find(|(_, exact)| !exact).map_or(0.0, |&(score, _)| score);
     let mut inexact_seen = 0;
@@ -35,6 +40,9 @@ pub fn shown_hits(hits: &[(f64, bool)], ratio: f64) -> Vec<bool> {
         .map(|&(score, exact)| {
             if exact {
                 return true;
+            }
+            if score <= 0.0 {
+                return false;
             }
             inexact_seen += 1;
             inexact_seen <= MIN_SHOWN_HITS || score >= ratio * best
@@ -101,5 +109,21 @@ mod tests {
     fn the_two_best_inexact_hits_are_shown_whatever_they_score() {
         let hits = [(1.6, true), (1.5, true), (0.10, false), (0.02, false), (0.01, false)];
         assert_eq!(kept(&hits), [1.6, 1.5, 0.10, 0.02]);
+    }
+
+    #[test]
+    fn a_hit_that_did_not_score_is_never_shown() {
+        assert!(kept(&inexact(&[0.0, 0.0])).is_empty());
+    }
+
+    #[test]
+    fn hits_that_did_not_score_do_not_fill_the_minimum() {
+        assert_eq!(kept(&inexact(&[0.10, 0.0, 0.0])), [0.10]);
+    }
+
+    #[test]
+    fn an_exact_hit_is_shown_among_hits_that_did_not_score() {
+        let hits = [(0.0, false), (0.6, true), (0.0, false)];
+        assert_eq!(kept(&hits), [0.6]);
     }
 }

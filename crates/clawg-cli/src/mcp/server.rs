@@ -3423,6 +3423,9 @@ mod tests {
         let store = store.expect("store");
         let content = "the previous version saved that payments run on stripe";
         let embedding = FakeEmbedder::default().embed_with_role(content, EmbedRole::Passage).await.expect("embed");
+        // Unit length, as every insert path stores it: a raw vector sits
+        // farther than any cosine from the query and would score 0.
+        let embedding = clawg_core::memory::vector::to_unit(&embedding).expect("unit");
         let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
         let snapshot = |store: Arc<clawg_core::memory::MemoryStore>| async move {
             store
