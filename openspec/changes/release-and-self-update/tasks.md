@@ -65,37 +65,37 @@ Reglas de todo el cambio:
 
 ## Tanda 3. `clawg update`
 
-- [ ] 23. Tests de `paths::update_lock_file` y `StoreLock::recorded_owner` (no prueba el cerrojo). Código en `clawg-core`.
+- [x] 23. Tests de `paths::update_lock_file` y `StoreLock::recorded_owner` (no prueba el cerrojo). Código en `clawg-core`.
   Commit: `feat(core): expose the update lock path and the recorded store owner`
-- [ ] 24. Test `restoring_over_a_store_migrated_by_a_newer_version_keeps_it_as_pre_restore` (`backup.rs`; fija un contrato existente, puede pasar de entrada).
+- [x] 24. Test `restoring_over_a_store_migrated_by_a_newer_version_keeps_it_as_pre_restore` (`backup.rs`; fija un contrato existente, puede pasar de entrada).
   Commit: `test(core): pin restoring over a store migrated by a newer version`
-- [ ] 25. Tests `plan_order_with_and_without_daemon` y `update_without_a_daemon_does_not_start_one`. `src/update/plan.rs`: `Step`, `Undo`, `plan`.
+- [x] 25. Tests `plan_order_with_and_without_daemon` y `update_without_a_daemon_does_not_start_one`. `src/update/plan.rs`: `Step`, `Undo`, `plan`.
   Commit: `feat(cli): describe the update as a plan`
-- [ ] 26. Tests `each_failed_step_undoes_what_it_did`, `a_hash_mismatch_never_touches_the_installed_binary`, `a_failed_download_or_signature_leaves_everything_as_it_was`, el de `StopTimeout` sin renombrar. `apply` y `Effects` con falsos.
+- [x] 26. Tests `each_failed_step_undoes_what_it_did`, `a_hash_mismatch_never_touches_the_installed_binary`, `a_failed_download_or_signature_leaves_everything_as_it_was`, el de `StopTimeout` sin renombrar. `apply` y `Effects` con falsos.
   Commit: `feat(cli): run the update plan and undo on failure`
-- [ ] 27. Test `a_failed_restore_leaves_the_new_binary_and_explains_the_way_back` y el de restore exitoso (D2).
+- [x] 27. Test `a_failed_restore_leaves_the_new_binary_and_explains_the_way_back` y el de restore exitoso (D2).
   Commit: `feat(cli): restore the pre-migration snapshot when the new daemon migrated and failed`
-- [ ] 28. Tests de `judge` (cada señal y plazo, `Other`), `leftovers` y del diff de snapshots.
+- [x] 28. Tests de `judge` (cada señal y plazo, `Other`), `leftovers` y del diff de snapshots.
   Commit: `feat(cli): judge a starting daemon and pick leftovers`
-- [ ] 29. Tests `an_unwritable_install_dir_fails_before_downloading` y `the_update_report_names_versions_snapshot_and_restart_notice`. `src/update/report.rs`.
+- [x] 29. Tests `an_unwritable_install_dir_fails_before_downloading` y `the_update_report_names_versions_snapshot_and_restart_notice`. `src/update/report.rs`.
   Commit: `feat(cli): report the outcome of an update`
-- [ ] 30. Test `two_updates_do_not_swap_at_once` (cerrojo `fs2` sobre `update.lock`).
+- [x] 30. Test `two_updates_do_not_swap_at_once` (cerrojo `fs2` sobre `update.lock`).
   Commit: `feat(cli): serialize updates with an exclusive lock`
-- [ ] 31. Extraer de `ProcessSpawner::spawn_serve` (`client.rs`) el arranque por ruta y puerto; el net son los tests existentes (`binary.rs`, `client.rs`).
+- [x] 31. Extraer de `ProcessSpawner::spawn_serve` (`client.rs`) el arranque por ruta y puerto; el net son los tests existentes (`binary.rs`, `client.rs`).
   Commit: `refactor(cli): start the daemon from an explicit binary path`
-- [ ] 32. Tests: `migrations_up_to` filtra `known_migrations`/`set_target` bajo `testing`, y `serve_fault` `before_open`/`after_open` (unitarios en `build_info`/`db.rs`). Código en `build_info.rs`, `backup.rs`, `db.rs`, `daemon/serve.rs`.
+- [x] 32. Tests: `migrations_up_to` filtra `known_migrations`/`set_target` bajo `testing`, y `serve_fault` `before_open`/`after_open` (unitarios en `build_info`/`db.rs`). Código en `build_info.rs`, `backup.rs`, `db.rs`, `daemon/serve.rs`.
   Commit: `feat(core): let a test build cap its migrations and fail on purpose`
-- [ ] 33. **RED por el binario real.** Test `a_full_update_with_a_daemon_replaces_the_binary_and_a_bridge_reaches_the_new_daemon`. `effects.rs` de producción y el cableado de `update/mod.rs`.
+- [x] 33. **RED por el binario real.** Test `a_full_update_with_a_daemon_replaces_the_binary_and_a_bridge_reaches_the_new_daemon`. `effects.rs` de producción y el cableado de `update/mod.rs`.
   Commit: `feat(cli): add clawg update`
-- [ ] 34. Test `a_new_binary_that_does_not_start_brings_the_old_one_and_its_daemon_back`.
+- [x] 34. Test `a_new_binary_that_does_not_start_brings_the_old_one_and_its_daemon_back`.
   Commit: `feat(cli): bring the old daemon back when the new one does not start`
 - [ ] 35. **Base sembrada en la versión anterior** (instalado con `migrations_up_to = última - 1`, filas guardadas por su daemon): `an_update_over_a_pending_migration_leaves_a_pre_migration_snapshot_and_the_data`.
   Commit: `test(cli): update over a store with a pending migration`
 - [ ] 36. Misma siembra: `a_new_binary_that_migrated_and_failed_gets_its_pre_migration_restored` (`serve_fault = after_open`).
   Commit: `feat(cli): restore the store when the new daemon migrated and failed`
-- [ ] 37. Siembra al día y candidato con `migrations_up_to = última - 1`: `an_update_whose_candidate_refuses_the_store_leaves_the_old_binary_and_its_daemon`.
+- [x] 37. Siembra al día y candidato con `migrations_up_to = última - 1`: `an_update_whose_candidate_refuses_the_store_leaves_the_old_binary_and_its_daemon`.
   Commit: `test(cli): update with a candidate that refuses the store`
-- [ ] 38. `README.md` («Actualizar», vuelta atrás) y ampliación de `the_readme_documents_the_install_and_update_path`; `.claude/CLAUDE.md` (Commands `clawg update [--check]`, Testing). `MCP tools` y `agent_contract.json` sin tocar.
+- [x] 38. `README.md` («Actualizar», vuelta atrás) y ampliación de `the_readme_documents_the_install_and_update_path`; `.claude/CLAUDE.md` (Commands `clawg update [--check]`, Testing). `MCP tools` y `agent_contract.json` sin tocar.
   Commit: `docs: document clawg update`
 
 ## Verificación (checklist, no tareas de apply)
