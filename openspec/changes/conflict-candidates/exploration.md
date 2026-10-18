@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 | M | — (se coordina con recoverable-delete, context-budget y agent-lifecycle-hooks; ver «Interacciones») | exploración (borrador) |
+| 1 | M | — (se coordina con recoverable-delete, context-budget y agent-lifecycle-hooks; ver «Interacciones») | cerrada; decisiones en la [propuesta](proposal.md#decisiones) |
 
 **Tesis:** el detector mide **cercanía**, no contradicción. Cuando dos memorias del mismo agente caen en la banda de distancia, la nueva queda `disputed`, el par entra en ACTIVE CONFLICTS y las instrucciones del servidor le piden al agente que le pregunte al usuario. Si las dos dicen cosas distintas pero compatibles, el usuario recibe una pregunta sin sentido, y su respuesta («valen las dos») no se guarda en ningún lado. Antes de construir hay que **medir** cuántas veces pasa; hoy nadie lo midió, y la medición puede achicar este cambio.
 
