@@ -346,7 +346,7 @@ pub fn format_docs(found: &DocsSearchBody) -> String {
 /// and stop being read; far above it, the review is a long read.
 pub const SYNTHESIS_NUDGE_THRESHOLD: usize = 20;
 
-fn synthesis_nudge(unreviewed: usize) -> Option<String> {
+pub(crate) fn synthesis_nudge(unreviewed: usize) -> Option<String> {
     (unreviewed >= SYNTHESIS_NUDGE_THRESHOLD).then(|| {
         format!(
             "{unreviewed} memories here have not been reviewed for conclusions yet. When the \

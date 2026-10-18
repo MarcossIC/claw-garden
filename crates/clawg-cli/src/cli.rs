@@ -141,6 +141,18 @@ pub enum Command {
         #[command(subcommand)]
         action: MemoriesAction,
     },
+    /// Answer one of the agent client's lifecycle hooks: read its JSON on
+    /// stdin, print what it should add to the agent's context. Never starts a
+    /// daemon, and prints nothing when there is none.
+    Hook {
+        event: HookEvent,
+        /// The agent id the client's bridge uses (its `--agent`): the hook
+        /// gets no client name, and another id would read another agent.
+        #[arg(long, value_parser = parse_agent)]
+        agent: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
     /// Add or remove a directory on the user PATH (Windows). The installer
     /// runs this so `clawg` works from any new terminal.
     Path {
@@ -242,6 +254,24 @@ impl MemoriesAction {
             MemoriesAction::Stats(o) => &o.profile,
         }
     }
+}
+
+/// The client lifecycle events `clawg hook` answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum HookEvent {
+    SessionStart,
+    UserPromptSubmit,
+}
+
+/// Whether `args`, as the process got them, run `clawg hook`. A client reads
+/// exit code 2 from a hook as "block": clap's usage error would erase the
+/// user's prompt, so a hook's usage error has to exit otherwise.
+pub fn is_hook_invocation<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    args.into_iter().nth(1).is_some_and(|a| a.as_ref() == "hook")
 }
 
 /// The three tables a row can live in.
@@ -560,6 +590,32 @@ mod tests {
                 agent: None,
             }
         );
+    }
+
+    #[test]
+    fn hook_takes_an_event_an_agent_and_a_profile() {
+        assert_eq!(
+            parse(&["clawg", "hook", "session-start", "--agent", " claude-code ", "--profile", "dev"]).command,
+            Command::Hook {
+                event: HookEvent::SessionStart,
+                agent: "claude-code".into(),
+                profile: ProfileArg { profile: Some("dev".into()) },
+            }
+        );
+        assert_eq!(
+            parse(&["clawg", "hook", "user-prompt-submit", "--agent", "a"]).command,
+            Command::Hook { event: HookEvent::UserPromptSubmit, agent: "a".into(), profile: ProfileArg { profile: None } }
+        );
+        assert!(Cli::try_parse_from(["clawg", "hook", "session-start"]).is_err(), "the agent is required");
+        assert!(Cli::try_parse_from(["clawg", "hook", "pre-compact", "--agent", "a"]).is_err(), "only the events it answers");
+    }
+
+    #[test]
+    fn a_hook_usage_error_never_blocks() {
+        assert!(is_hook_invocation(["clawg", "hook", "session-start"]));
+        assert!(is_hook_invocation(["clawg", "hook"]));
+        assert!(!is_hook_invocation(["clawg", "mcp", "hook"]));
+        assert!(!is_hook_invocation(["clawg"]));
     }
 
     #[test]

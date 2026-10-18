@@ -11,11 +11,12 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use clawg_cli::cli::{sharing_profile, Cli, Command, PathAction, ProjectsAction};
+use clawg_cli::cli::{is_hook_invocation, sharing_profile, Cli, Command, PathAction, ProjectsAction};
 use clawg_cli::client::{probe_running, ClientError, DaemonClient, Probe};
 use clawg_cli::daemon::lifecycle::{now_ms, read_state};
 use clawg_cli::daemon::serve;
 use clawg_cli::doctor;
+use clawg_cli::hook;
 use clawg_cli::mcp;
 use clawg_cli::memories;
 use clawg_cli::projects;
@@ -37,7 +38,16 @@ use clap::Parser;
 const EXIT_FAILURE: u8 = 1;
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let hook = is_hook_invocation(std::env::args_os());
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        // A client reads 2 from a hook as "block the session or the prompt".
+        Err(e) if hook && e.use_stderr() => {
+            let _ = e.print();
+            return ExitCode::from(EXIT_FAILURE);
+        }
+        Err(e) => e.exit(),
+    };
     init_logging();
     if cli.command.loads_the_model() {
         // Before the runtime exists: the allocator setting only reaches the
@@ -52,7 +62,7 @@ fn main() -> ExitCode {
         }
     };
 
-    match runtime.block_on(dispatch(cli)) {
+    let code = match runtime.block_on(dispatch(cli)) {
         Ok(code) => code,
         Err(message) => {
             // stderr, always: `clawg mcp` owns stdout as its protocol
@@ -61,7 +71,13 @@ fn main() -> ExitCode {
             eprintln!("clawg: {message}");
             ExitCode::from(EXIT_FAILURE)
         }
+    };
+    if hook {
+        // A stdin the client never closed still holds a blocking read, which
+        // an ordinary drop of the runtime would wait for past the deadline.
+        runtime.shutdown_background();
     }
+    code
 }
 
 /// Logging to stderr, `info` by default, `RUST_LOG` overriding.
@@ -82,6 +98,15 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             let profile = profile.resolve().map_err(|e| e.to_string())?;
             let port = port.unwrap_or_else(|| profile.default_port());
             serve::run(profile, port).await.map_err(|e| e.to_string())?;
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Hook { event, agent, profile } => {
+            let profile = profile.resolve().map_err(|e| e.to_string())?;
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            if let Some(out) = hook::respond(event, &agent, &base_dir, tokio::io::stdin(), hook::HOOK_DEADLINE).await {
+                println!("{out}");
+            }
             Ok(ExitCode::SUCCESS)
         }
 
