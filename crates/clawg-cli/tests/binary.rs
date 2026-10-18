@@ -889,6 +889,34 @@ fn beside(installed: &Path, prefix: &str) -> Vec<PathBuf> {
 
 // The server runs in this process while the binary is waited on.
 #[tokio::test(flavor = "multi_thread")]
+async fn a_new_binary_that_does_not_start_brings_the_old_one_and_its_daemon_back() {
+    let sandbox = Sandbox::new();
+    let installed = install(&sandbox, &stamp_json("0.18.0", ""));
+    let original = std::fs::read(&installed).expect("read the installed binary");
+    let old = sandbox.serve_binary(&installed, "fake").await;
+    let release = signed_release("0.19.0", r#","serve_fault":"before_open""#);
+    let server = ReleaseServer::serving(release.listing.clone(), release.files.clone()).await;
+    let _stop = StopOnDrop { home: sandbox.home.clone() };
+
+    let out = update_from(&sandbox, &installed, &server.base, &release.public);
+
+    assert_eq!(out.status.code(), Some(1), "{}\n{}", stdout_of(&out), stderr_of(&out));
+    let report = stderr_of(&out);
+    assert!(report.contains("starting the new daemon"), "{report}");
+    assert!(report.contains("Everything was put back: clawg 0.18.0 is installed"), "{report}");
+    assert!(report.contains("Its daemon is running again"), "{report}");
+    assert_eq!(std::fs::read(&installed).expect("read the installed binary"), original);
+    assert!(beside(&installed, "clawg.new-").is_empty(), "the staged file is gone");
+    assert!(beside(&installed, &format!("clawg{}.old-", std::env::consts::EXE_SUFFIX)).is_empty());
+
+    old.wait_for_exit(Duration::from_secs(10)).await;
+    let health = published_health(&sandbox.data_dir()).await;
+    assert_eq!(health["version"], "0.18.0", "the old binary's daemon answers: {health}");
+    assert_ne!(health["pid"].as_u64(), Some(u64::from(old.pid)), "started again, not the one that was stopped");
+}
+
+// The server runs in this process while the binary is waited on.
+#[tokio::test(flavor = "multi_thread")]
 async fn a_full_update_with_a_daemon_replaces_the_binary_and_a_bridge_reaches_the_new_daemon() {
     let sandbox = Sandbox::new();
     let installed = install(&sandbox, &stamp_json("0.18.0", ""));
