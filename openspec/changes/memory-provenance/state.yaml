@@ -1,14 +1,14 @@
 change: memory-provenance
 objective: "1, 4, 5"
 depends_on: []
-phase: explore
+phase: apply
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
-  apply: pending
-  verify: pending
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: in_progress  # Linux; falta Windows y el perfil dev con Claude Code
   archive: pending
-updated: 2026-10-15
+updated: 2026-10-18

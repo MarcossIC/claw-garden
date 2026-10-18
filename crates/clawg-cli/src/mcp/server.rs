@@ -174,6 +174,11 @@ pub struct SaveMemoryArgs {
     /// `synthesize` lists them. Omit for an ordinary memory.
     #[serde(default)]
     pub derived_from: Option<Vec<i64>>,
+    /// True only when the content is what the user said: their words or an
+    /// explicit instruction. Omit it for what you inferred, found or
+    /// concluded; never with derived_from.
+    #[serde(default)]
+    pub user_stated: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -694,6 +699,7 @@ impl ClawgMcp {
                         memory_type: args.memory_type.clone(),
                         importance: args.importance,
                         derived_from: args.derived_from.clone().unwrap_or_default(),
+                        user_stated: args.user_stated.unwrap_or(false),
                     })
                     .await
             })
@@ -1333,7 +1339,7 @@ mod tests {
     }
 
     fn save_args(content: &str) -> SaveMemoryArgs {
-        SaveMemoryArgs { content: content.into(), memory_type: None, importance: None, project_path: None, derived_from: None }
+        SaveMemoryArgs { content: content.into(), memory_type: None, importance: None, project_path: None, derived_from: None, user_stated: None }
     }
 
     #[tokio::test]
@@ -1349,6 +1355,7 @@ mod tests {
                 memory_type: None,
                 importance: None,
                 derived_from: Vec::new(),
+                user_stated: false,
             })
             .await
             .expect("seed a legacy row");
@@ -1726,6 +1733,7 @@ mod tests {
                 memory_type: None,
                 importance: None,
                 derived_from: Vec::new(),
+                user_stated: false,
             })
             .await
             .expect("save");
@@ -1777,6 +1785,7 @@ mod tests {
                 memory_type: None,
                 importance: None,
                 derived_from: Vec::new(),
+                user_stated: false,
             })
             .await
             .expect("save");
@@ -2039,6 +2048,16 @@ mod tests {
         let schema = serde_json::to_string(&tool(&b, "save_memory").input_schema).expect("schema");
         assert!(schema.contains("derived_from"), "{schema}");
         assert!(schema.contains("synthesize"), "the field must say where its ids come from: {schema}");
+    }
+
+    /// The schema is the only place the model learns it may declare a save
+    /// as the user's, and when it must not.
+    #[tokio::test]
+    async fn the_save_schema_names_user_stated() {
+        let (b, _d) = bridge().await;
+        let schema = serde_json::to_string(&tool(&b, "save_memory").input_schema).expect("schema");
+        assert!(schema.contains("user_stated"), "{schema}");
+        assert!(schema.contains("inferred"), "the field must say what it is not for: {schema}");
     }
 
     #[tokio::test]
@@ -2391,6 +2410,7 @@ mod tests {
                     importance: Some(8.0),
                     project_path: None,
                     derived_from: None,
+                    user_stated: None,
                 },
             )
             .await
@@ -2459,6 +2479,7 @@ mod tests {
                     importance: None,
                     project_path: None,
                     derived_from: None,
+                    user_stated: None,
                 },
             )
             .await
@@ -2701,7 +2722,7 @@ mod tests {
 
         let t = status("agent-mcp").await;
         assert!(t.contains("conflict candidates: 1 for you to judge, 0 waiting for the user"), "{t}");
-        assert!(t.contains(&format!("#{new} close to #{old}")), "{t}");
+        assert!(t.contains(&format!("#{new} inferred close to #{old} inferred")), "two undeclared saves: {t}");
         assert!(status("agent-other").await.ends_with("\nconflict candidates: none open"));
     }
 
@@ -2729,7 +2750,7 @@ mod tests {
             let saved = b
                 .save_memory_impl(
                     "agent-mcp",
-                    SaveMemoryArgs { content: content.into(), memory_type: None, importance: None, project_path: None, derived_from: None },
+                    SaveMemoryArgs { content: content.into(), memory_type: None, importance: None, project_path: None, derived_from: None, user_stated: None },
                 )
                 .await
                 .expect("save");
@@ -3095,6 +3116,7 @@ mod tests {
                 importance: None,
                 project_path: Some("/some/elsewhere".into()),
                 derived_from: None,
+                user_stated: None,
             },
         )
         .await
