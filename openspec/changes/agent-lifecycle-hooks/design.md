@@ -52,3 +52,21 @@ El host lee 0 como éxito, 2 como error que **bloquea** (en `UserPromptSubmit` b
 ## D6. Sin autoarranque
 
 El hook usa `DaemonClient::from_data_dir` y nunca `probe_running(.., true)`, que puede esperar hasta 60 s (`AUTOSTART_TIMEOUT`). El puente MCP arranca el daemon junto con la sesión; el costo es que el primer `SessionStart` del día puede llegar antes y quedar sin contexto.
+
+## Probar a mano
+
+La instalación es de client-setup (26). Para probar, un `.claude/settings.local.json` (no se commitea) con el mismo `--agent` que el puente y, con un build de desarrollo, `--profile dev`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      { "matcher": "startup|resume|clear|compact",
+        "hooks": [ { "type": "command", "command": "clawg hook session-start --agent claude-code --profile dev", "timeout": 5 } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "clawg hook user-prompt-submit --agent claude-code --profile dev", "timeout": 5 } ] }
+    ]
+  }
+}
+```

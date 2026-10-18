@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1, 5 | M | memory-protocol (22), context-budget (23), conflict-candidates (24) | exploración (borrador) |
+| 1, 5 | M | memory-protocol (22), context-budget (23), conflict-candidates (24) | exploración cerrada; las decisiones abiertas se tomaron en la [propuesta](proposal.md#decisiones) |
 
 **Tesis:** hoy la memoria sólo funciona si el agente se acuerda de llamarla. Una sesión empieza ciega salvo que el modelo decida llamar a `recall_context`; después de una compactación el cliente pierde lo que se había recordado; y la síntesis (objetivo 5) depende de que un recordatorio dentro de la respuesta de `recall_context` llegue a leerse. El host (Claude Code) ofrece hooks de ciclo de vida que corren **sin pasar por el modelo**. Un subcomando `clawg hook <evento>` puede usarlos para empujar la memoria en los momentos justos, sin depender de la disciplina del agente y sin scripts por plataforma.
 
