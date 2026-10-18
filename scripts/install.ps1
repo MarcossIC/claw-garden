@@ -3,9 +3,19 @@
 Installs clawg for the current user, without administrator rights.
 
 .DESCRIPTION
-Copies clawg.exe, which must sit next to this script, into -InstallDir and adds
-that directory to the user PATH. A prod daemon from a previous install is
-stopped first, because Windows will not overwrite a running executable.
+Installs clawg.exe into -InstallDir and adds that directory to the user PATH.
+With a clawg.exe next to this script, that one is installed. Without one (for
+example when the script is piped to Invoke-Expression), the binary of the
+latest GitHub release is downloaded and compared with the release's
+SHA256SUMS; a mismatch aborts before anything on the machine is touched. The
+hash proves the download is the published file, not who published it: to check
+the author, verify SHA256SUMS.minisig with minisign as the README explains.
+
+The Visual C++ Redistributable must already be installed. The script says where
+to get it when it is missing, and installs nothing itself.
+
+A prod daemon from a previous install is stopped first, because Windows will
+not overwrite a running executable.
 
 A legacy install (the old "Claw Garden" installer, or any other clawg.exe
 reachable through PATH) can shadow the new binary, so the script refuses to
@@ -30,6 +40,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+$ReleaseBase = 'https://github.com/MarcossIC/claw-garden/releases/latest/download'
+$AssetName = 'clawg-x86_64-pc-windows-msvc.exe'
+$VcRedistUrl = 'https://aka.ms/vs/17/release/vc_redist.x64.exe'
 
 $LegacyDisplayName = 'Claw Garden'
 $UninstallRoots = @(
@@ -118,6 +132,53 @@ function Get-ShadowMessage([string[]]$Resolved, [string]$Target) {
     return "A new terminal would run $($Resolved[0]) (directory $(Split-Path -Parent $Resolved[0])), not $Target. That copy shadows the one just installed: remove it or move it after $(Split-Path -Parent $Target) on the PATH."
 }
 
+# Whether the x64 Visual C++ runtime that clawg.exe links against is present.
+function Test-VcRedist {
+    $key = 'HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\X64'
+    if (Test-Path -LiteralPath $key) {
+        if ((Get-ItemProperty -LiteralPath $key).Installed -eq 1) { return $true }
+    }
+    return Test-Path -LiteralPath (Join-Path $env:SystemRoot 'System32\vcruntime140.dll')
+}
+
+# The hash SHA256SUMS lists for $Name, lower case, or $null. Lines are what
+# sha256sum writes: 64 hex digits, a space, a space or '*', the file name.
+function Get-ExpectedHash([string]$SumsText, [string]$Name) {
+    foreach ($line in $SumsText -split "`r?`n") {
+        if ($line -match '^([0-9a-fA-F]{64}) [ *](.+)$' -and $Matches[2] -ceq $Name) {
+            return $Matches[1].ToLowerInvariant()
+        }
+    }
+    return $null
+}
+
+# Downloads the latest release's binary into $Dir and returns its path, after
+# checking it against the release's SHA256SUMS.
+function Save-VerifiedRelease([string]$Dir) {
+    # Windows PowerShell 5.1 does not offer TLS 1.2 by default, which GitHub requires.
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    # The progress bar makes Invoke-WebRequest several times slower in 5.1.
+    $ProgressPreference = 'SilentlyContinue'
+    $binary = Join-Path $Dir $AssetName
+    try {
+        Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseBase/$AssetName" -OutFile $binary
+        $sums = (Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseBase/SHA256SUMS").Content
+    }
+    catch {
+        throw "Could not download the latest release from $ReleaseBase. Nothing was changed. ($($_.Exception.Message))"
+    }
+    if ($sums -is [byte[]]) { $sums = [Text.Encoding]::UTF8.GetString($sums) }
+    $expected = Get-ExpectedHash $sums $AssetName
+    if (-not $expected) {
+        throw "SHA256SUMS of the latest release does not list $AssetName. Nothing was changed."
+    }
+    $actual = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -ne $expected) {
+        throw "The downloaded $AssetName has sha256 $actual, but SHA256SUMS lists $expected. Nothing was changed."
+    }
+    return $binary
+}
+
 function Remove-LegacyInstall($Entry) {
     if (-not $Entry.UninstallString) {
         throw "The legacy install at $($Entry.Location) has no UninstallString; remove it by hand."
@@ -136,12 +197,27 @@ function Remove-LegacyInstall($Entry) {
     throw "The legacy uninstaller finished but $($Entry.Location) or its registry entry ($($Entry.Key)) is still there. Remove it by hand and run this script again."
 }
 
-$source = Join-Path $PSScriptRoot 'clawg.exe'
-if (-not (Test-Path -LiteralPath $source)) {
-    throw "clawg.exe not found next to this script ($source)."
+$target = Join-Path $InstallDir 'clawg.exe'
+
+# Nothing is downloaded or written without the runtime clawg.exe needs.
+if (-not (Test-VcRedist)) {
+    throw "The Microsoft Visual C++ Redistributable (x64) is not installed, and clawg.exe needs it. Nothing was changed. Install it from $VcRedistUrl and run this script again."
 }
 
-$target = Join-Path $InstallDir 'clawg.exe'
+# A copy next to the script wins; piped to Invoke-Expression there is no script
+# directory, and the latest release is fetched further down.
+$source = $null
+if ($PSScriptRoot) {
+    $candidate = Join-Path $PSScriptRoot 'clawg.exe'
+    if (Test-Path -LiteralPath $candidate) { $source = $candidate }
+}
+$downloadDir = $null
+function Remove-Download {
+    if ($downloadDir -and (Test-Path -LiteralPath $downloadDir)) {
+        Remove-Item -LiteralPath $downloadDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+trap { Remove-Download; break }
 
 # Decided before anything is touched, so a refusal leaves the machine as it was.
 $legacy = @(Get-LegacyEntry)
@@ -150,6 +226,15 @@ if (($legacy.Count -gt 0 -or $foreign.Count -gt 0) -and -not $RemoveLegacy) {
     $where = @($legacy | ForEach-Object { "$($_.Location) (registered as '$LegacyDisplayName')" }) + @($foreign)
     throw "Another clawg install is present and would shadow the new one: $($where -join '; '). Nothing was changed. Run this script again with -RemoveLegacy to uninstall the registered one."
 }
+# Downloaded after the refusals above and before anything is removed or
+# stopped, so a failed download or a wrong hash leaves the machine as it was.
+if (-not $source) {
+    $downloadDir = Join-Path ([IO.Path]::GetTempPath()) "clawg-install-$([guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $downloadDir | Out-Null
+    Write-Host "Downloading $AssetName from the latest release"
+    $source = Save-VerifiedRelease $downloadDir
+}
+
 foreach ($entry in $legacy) {
     Write-Host "Removing legacy install at $($entry.Location)"
     Remove-LegacyInstall $entry
@@ -211,6 +296,8 @@ catch {
     if ($aside) { Move-Item -LiteralPath $aside -Destination $target -ErrorAction SilentlyContinue }
     throw "Could not copy clawg.exe to $target; the previous binary was left in place. ($reason)"
 }
+
+Remove-Download
 
 if (-not $SkipPath) {
     & $target path add --dir $InstallDir
