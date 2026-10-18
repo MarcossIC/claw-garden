@@ -231,16 +231,31 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 pub const AUTO_KEEP: usize = 5;
 
 /// The automatic snapshots among `names` that fall outside the newest
-/// [`AUTO_KEEP`]. Manual snapshots and names this module did not produce are
-/// never chosen.
+/// [`AUTO_KEEP`], except the newest of each reason: a burst of restores or
+/// re-embeds must not push out the `pre-migration` snapshot that is the way
+/// back from an upgrade. Manual snapshots and names this module did not
+/// produce are never chosen.
 pub fn to_prune(names: &[String]) -> Vec<String> {
-    let mut automatic: Vec<&String> = names
+    let mut automatic: Vec<(&String, Reason)> = names
         .iter()
-        .filter(|n| parse_snapshot_name(n).is_some_and(Reason::is_automatic))
+        .filter_map(|n| parse_snapshot_name(n).filter(|r| r.is_automatic()).map(|r| (n, r)))
         .collect();
-    automatic.sort();
+    automatic.sort_by(|a, b| a.0.cmp(b.0));
     let excess = automatic.len().saturating_sub(AUTO_KEEP);
-    automatic.into_iter().take(excess).cloned().collect()
+    let mut newest_of: Vec<Reason> = Vec::new();
+    let mut kept_newest: Vec<&String> = Vec::new();
+    for (name, reason) in automatic.iter().rev() {
+        if !newest_of.contains(reason) {
+            newest_of.push(*reason);
+            kept_newest.push(name);
+        }
+    }
+    automatic
+        .into_iter()
+        .take(excess)
+        .filter(|(name, _)| !kept_newest.contains(name))
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 /// Best effort: a snapshot that cannot be deleted is one too many, never an
@@ -675,6 +690,21 @@ mod tests {
 
         assert_eq!(to_prune(&names), auto[..2].to_vec());
         assert_eq!(to_prune(&auto[..AUTO_KEEP]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn pruning_keeps_the_newest_snapshot_of_every_automatic_reason() {
+        let migration = snapshot_name(1_700_000_000_000, Reason::PreMigration);
+        let reembed = snapshot_name(1_700_000_001_000, Reason::PreReembed);
+        let restores: Vec<String> = (0..AUTO_KEEP as i64 + 2)
+            .map(|i| snapshot_name(1_700_000_010_000 + i * 1000, Reason::PreRestore))
+            .collect();
+        let mut names = vec![migration.clone(), reembed.clone()];
+        names.extend(restores.iter().cloned());
+
+        // Only restores outside the newest AUTO_KEEP go; the lone migration and
+        // re-embed snapshots are the way back from their operations.
+        assert_eq!(to_prune(&names), restores[..2].to_vec());
     }
 
     #[tokio::test]
