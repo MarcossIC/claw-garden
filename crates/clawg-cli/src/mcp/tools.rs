@@ -360,7 +360,7 @@ fn synthesis_nudge(unreviewed: usize) -> Option<String> {
 fn retrieval_notice(retrieval: &Retrieval, has_context: bool) -> Option<String> {
     let why = match retrieval {
         Retrieval::Searched { hits: 0, withheld } if *withheld > 0 => {
-            let shown = if has_context { "only the workspace is shown below" } else { "the workspace is empty" };
+            let shown = if has_context { "the workspace and any active conflicts are shown below" } else { "the workspace is empty" };
             return Some(format!("{}; {shown}.", nothing_relevant(*withheld)));
         }
         Retrieval::Searched { .. } | Retrieval::Unknown => return None,
@@ -975,7 +975,7 @@ mod tests {
         let sentence = "no relevant memories for this query: 2 searched, none close enough to show";
         assert_eq!(
             recall("=== WORKSPACE ===\n- tabs"),
-            format!("{sentence}; only the workspace is shown below.\n\n=== WORKSPACE ===\n- tabs")
+            format!("{sentence}; the workspace and any active conflicts are shown below.\n\n=== WORKSPACE ===\n- tabs")
         );
         assert_eq!(recall(""), format!("{sentence}; the workspace is empty."));
     }

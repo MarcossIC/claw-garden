@@ -255,7 +255,7 @@ El texto de `ClientError::Unauthorized` de la CLI (`crates/clawg-cli/src/client.
 
 En los cuatro casos MUST seguir respondiendo `200` con el workspace. `Context` del cliente MUST leer `retrieval` con `#[serde(default)]`, un estado que no conoce como `Unknown`, y `searched` sin conteos (un daemon anterior) con `hits` y `withheld` en 0 (`client.rs:264-296`).
 
-`recall_context` (`format_recall`, `crates/clawg-cli/src/mcp/tools.rs:383`; la frase en `retrieval_notice`, `tools.rs:360`) MUST empezar con `Memories were not searched: <por qué>.` cuando `state` no es `searched`, haya workspace o no, seguido de que sólo se muestra el workspace (o de que está vacío) y de que eso no quiere decir que no haya memorias. Con `searched`, `hits = 0` y `withheld > 0`, MUST empezar con la frase de abstención de [`specs/retrieval`](../retrieval/spec.md) (`no relevant memories for this query: N searched, none close enough to show`, con `N` = `withheld`) seguida de `; only the workspace is shown below.` si hay prompt o de `; the workspace is empty.` si no lo hay (`tools.rs:362-365`). Con el prompt vacío, cualquiera de las dos frases MUST reemplazar `no context yet`. Sin el campo (un daemon anterior), con `searched` sin conteos o con un estado desconocido (uno más nuevo), MUST NOT agregar ninguna frase. El aviso lo escribe el puente, fuera del prompt, así que `rag-eval` no lo mide.
+`recall_context` (`format_recall`, `crates/clawg-cli/src/mcp/tools.rs:383`; la frase en `retrieval_notice`, `tools.rs:360`) MUST empezar con `Memories were not searched: <por qué>.` cuando `state` no es `searched`, haya workspace o no, seguido de que sólo se muestra el workspace (o de que está vacío) y de que eso no quiere decir que no haya memorias. Con `searched`, `hits = 0` y `withheld > 0`, MUST empezar con la frase de abstención de [`specs/retrieval`](../retrieval/spec.md) (`no relevant memories for this query: N searched, none close enough to show`, con `N` = `withheld`) seguida de `; the workspace and any active conflicts are shown below.` si hay prompt o de `; the workspace is empty.` si no lo hay (`tools.rs:362-365`): sin hits, ACTIVE CONFLICTS todavía puede mostrar un par que toca una fila del workspace ([`specs/retrieval`](../retrieval/spec.md)). Con el prompt vacío, cualquiera de las dos frases MUST reemplazar `no context yet`. Sin el campo (un daemon anterior), con `searched` sin conteos o con un estado desconocido (uno más nuevo), MUST NOT agregar ninguna frase. El aviso lo escribe el puente, fuera del prompt, así que `rag-eval` no lo mide.
 
 #### Escenario: el modelo carga
 - GIVEN un daemon con el embedder en `loading` y un workspace con preferencias
@@ -264,7 +264,7 @@ En los cuatro casos MUST seguir respondiendo `200` con el workspace. `Context` d
 
 #### Escenario: nada relevante
 - GIVEN `retrieval` en `searched` con `hits: 0` y `withheld: 2`, y un workspace
-- THEN `recall_context` empieza con `no relevant memories for this query: 2 searched, none close enough to show; only the workspace is shown below.` y después viene el workspace; sin workspace, dice la frase terminada en `; the workspace is empty.`
+- THEN `recall_context` empieza con `no relevant memories for this query: 2 searched, none close enough to show; the workspace and any active conflicts are shown below.` y después viene el workspace; sin workspace, dice la frase terminada en `; the workspace is empty.`
 
 #### Escenario: un daemon anterior
 - GIVEN una respuesta de `POST /v1/context` sin `retrieval`, o con `searched` sin conteos, y con el prompt vacío
