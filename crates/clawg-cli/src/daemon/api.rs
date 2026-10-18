@@ -338,6 +338,9 @@ pub struct SaveRequest {
     /// Ids of the memories this one is a conclusion drawn from.
     #[serde(default)]
     pub derived_from: Vec<i64>,
+    /// The content is what the user said, not something the agent inferred.
+    #[serde(default)]
+    pub user_stated: bool,
     /// The caller's id for this save. Sending it again while the save waits
     /// or failed answers that save instead of recording another; absent, the
     /// daemon makes one up.
@@ -876,6 +879,13 @@ async fn save_memory(
     // Checked here rather than by the worker: once queued, a save can only be
     // reported as failed long after the caller was told it was accepted.
     let derived_from = distinct_sources(&body.derived_from)?;
+    // A conclusion is the agent's even when its sources are the user's words;
+    // storing it as the agent's after this declaration would hide the refusal.
+    if body.user_stated && !derived_from.is_empty() {
+        return Err(ApiError::bad_request(
+            "user_stated cannot go with derived_from: a conclusion is drawn by the agent, not stated by the user",
+        ));
+    }
     if !derived_from.is_empty() {
         let existing = existing_memory_ids(&app.runtime.store, &derived_from, Some(&body.agent_id))
             .await
@@ -913,7 +923,7 @@ async fn save_memory(
         memory_type: body.memory_type,
         importance: body.importance,
         derived_from,
-        user_stated: false,
+        user_stated: body.user_stated,
     };
 
     let (reply, report) = if wait {
