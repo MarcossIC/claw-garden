@@ -58,10 +58,17 @@ const _: () = assert!(NEAR_DUPLICATE_FLOOR < CONTRADICTION_THRESHOLD);
 const CANDIDATE_POOL: usize = 5;
 
 /// Below this L2 distance a candidate pair that involves a preference or a
-/// decision, or whose texts share an identifier, is put to the user. It sits
+/// decision is put to the user. It sits
 /// between the last measured contradiction (0.350) and the first compatible
 /// pair (0.469) of the calibration above.
 pub(crate) const ESCALATE_BELOW: f64 = 0.40;
+
+/// Below this L2 distance a pair of plain facts that share an identifier is
+/// put to the user. Facts of one project name the same identifiers all the
+/// time: in conflict-eval's flow of this repository's requirements, such
+/// pairs sat between 0.34 and 0.40, and escalating them at [`ESCALATE_BELOW`]
+/// put one save in four to the user.
+pub(crate) const IDENTIFIER_ESCALATE_BELOW: f64 = 0.30;
 
 /// How many characters of a candidate's first line a save answer shows.
 pub(crate) const EXCERPT_CHARS: usize = 80;
@@ -87,13 +94,16 @@ pub(crate) enum SaveKey {
 
 /// Whether a candidate pair goes to the user rather than only to the agent.
 /// A distance nobody recorded (a pair from before the pair table) always
-/// does; otherwise only a close pair, and only when one side states a
-/// preference or a decision, or the two texts name the same identifier.
+/// does; otherwise only a close pair where one side states a preference or a
+/// decision, or a closer one whose two texts name the same identifier.
 pub(crate) fn needs_user(new: MemoryType, old: MemoryType, distance: Option<f64>, shares_identifier: bool) -> bool {
     let protected = |t: MemoryType| matches!(t, MemoryType::UserPreference | MemoryType::ArchitecturalDecision);
     match distance {
         None => true,
-        Some(d) => d < ESCALATE_BELOW && (protected(new) || protected(old) || shares_identifier),
+        Some(d) => {
+            (d < ESCALATE_BELOW && (protected(new) || protected(old)))
+                || (d < IDENTIFIER_ESCALATE_BELOW && shares_identifier)
+        }
     }
 }
 
@@ -494,10 +504,15 @@ mod tests {
         use MemoryType::{ArchitecturalDecision as Decision, SemanticFact as Fact, UserPreference as Pref};
         let close = Some(0.30);
         let edge = Some(ESCALATE_BELOW);
+        let nearer = Some(0.25);
+        let between = Some(0.35);
         let cases: &[(MemoryType, MemoryType, Option<f64>, bool, bool)] = &[
-            (Fact, Fact, close, false, false),
-            (Fact, Fact, close, true, true),
+            (Fact, Fact, nearer, false, false),
+            (Fact, Fact, nearer, true, true),
+            (Fact, Fact, Some(IDENTIFIER_ESCALATE_BELOW), true, false),
+            (Fact, Fact, between, true, false),
             (Fact, Fact, edge, true, false),
+            (Pref, Fact, between, false, true),
             (Pref, Fact, close, false, true),
             (Fact, Pref, close, false, true),
             (Decision, Decision, close, false, true),
@@ -520,6 +535,15 @@ mod tests {
             ESCALATE_BELOW, 0.40,
             "ESCALATE_BELOW sits between the last measured contradiction (0.350) and the first \
              compatible pair (0.469); move it only from a conflict-eval run"
+        );
+    }
+
+    #[test]
+    fn identifier_escalate_below_pins_the_shipped_value() {
+        assert_eq!(
+            IDENTIFIER_ESCALATE_BELOW, 0.30,
+            "facts of one project that share an identifier sit between 0.34 and 0.40 in \
+             conflict-eval's flow; move it only from a conflict-eval run"
         );
     }
 
