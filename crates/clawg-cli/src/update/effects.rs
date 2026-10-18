@@ -163,6 +163,9 @@ impl Installation {
                         "a daemon {} (pid {}) got the store first; stopping it to start the right one",
                         other.version, other.pid
                     );
+                    // The child that lost may still be starting: ended first, it
+                    // cannot take the store the stop frees, out of reach of any undo.
+                    self.end_child()?;
                     stop_in(&self.paths.base_dir, STOP_TIMEOUT).await.map_err(|e| e.to_string())?;
                 }
                 Err(Waited::Other(other)) => {
@@ -224,6 +227,22 @@ impl Installation {
                 }
             }
         }
+    }
+
+    /// Ends the process the update started, if any, and waits for it.
+    fn end_child(&mut self) -> Result<(), String> {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        let pid = child.id();
+        // By its own handle, never by name: a clawg the user's editor runs
+        // must survive.
+        let _ = child.kill();
+        child.wait().map_err(|e| format!("cannot wait for the daemon (pid {pid}) to end: {e}"))?;
+        if read_state(&self.paths.base_dir).is_some_and(|s| s.pid == pid) {
+            clear_state(&self.paths.base_dir);
+        }
+        Ok(())
     }
 
     fn log_tail(&self) -> String {
@@ -316,17 +335,7 @@ impl Effects for Installation {
             }
             Undo::TakeBackNew => rename(&self.paths.exe, &self.paths.staged),
             Undo::EndNewDaemon => {
-                let Some(mut child) = self.child.take() else {
-                    return Ok(());
-                };
-                let pid = child.id();
-                // By its own handle, never by name: a clawg the user's editor
-                // runs must survive.
-                let _ = child.kill();
-                child.wait().map_err(|e| format!("cannot wait for the daemon (pid {pid}) to end: {e}"))?;
-                if read_state(&self.paths.base_dir).is_some_and(|s| s.pid == pid) {
-                    clear_state(&self.paths.base_dir);
-                }
+                self.end_child()?;
                 self.new_daemon = None;
                 Ok(())
             }
