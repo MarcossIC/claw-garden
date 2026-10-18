@@ -3,3 +3,4 @@
 pub mod signature;
 pub mod version;
 pub mod release;
+pub mod eligibility;
