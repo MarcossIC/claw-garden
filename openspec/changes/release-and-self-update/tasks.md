@@ -36,31 +36,31 @@ Reglas de todo el cambio:
 
 ## Tanda 2. `clawg update --check`
 
-- [ ] 10. **Primer RED, riesgo de D11.** Test `trailing_bytes_after_the_executable_image_do_not_change_execution` (`binary.rs`): una copia del binario con `0x00 CLAWG-TEST-STAMP {json}` al final se comporta igual (PE y ELF; corre en las dos plataformas de CI). Pasa en cuanto existe; es el control de la premisa. Si falla en una plataforma, se detiene la tanda y vuelve al diseño (D11).
+- [x] 10. **Primer RED, riesgo de D11.** Test `trailing_bytes_after_the_executable_image_do_not_change_execution` (`binary.rs`): una copia del binario con `0x00 CLAWG-TEST-STAMP {json}` al final se comporta igual (PE y ELF; corre en las dos plataformas de CI). Pasa en cuanto existe; es el control de la premisa. Si falla en una plataforma, se detiene la tanda y vuelve al diseño (D11).
   Commit: `test(cli): pin that bytes after the executable do not change execution`
-- [ ] 11. **Primer RED, riesgo de D1.** Dependencias `minisign-verify = "=0.2.5"`, `sha2` y `fs2` del workspace, dev `minisign = "=0.9.1"`; `cargo clean --target-dir target-test`. Test `signature_cases` (caso «prehashed del firmante de pruebas» con `allow_legacy = false`) en `src/update/signature.rs`, y `verify`. Si el firmante de pruebas firma en modo legado, se detiene y vuelve al diseño (D1, alternativas).
+- [x] 11. **Primer RED, riesgo de D1.** Dependencias `minisign-verify = "=0.2.5"`, `sha2` y `fs2` del workspace, dev `minisign = "=0.9.1"`; `cargo clean --target-dir target-test`. Test `signature_cases` (caso «prehashed del firmante de pruebas» con `allow_legacy = false`) en `src/update/signature.rs`, y `verify`. Si el firmante de pruebas firma en modo legado, se detiene y vuelve al diseño (D1, alternativas).
   Commit: `feat(cli): verify minisign signatures against a key list`
-- [ ] 12. Resto de `signature_cases`: segunda clave de la lista, clave fuera, archivo alterado, `.minisig` ajeno, legada rechazada, y el juego fijo firmado por el CLI de minisign (`src/update/testdata/`).
+- [x] 12. Resto de `signature_cases`: segunda clave de la lista, clave fuera, archivo alterado, `.minisig` ajeno, legada rechazada, y el juego fijo firmado por el CLI de minisign (`src/update/testdata/`).
   Commit: `test(cli): cover signature rejection and the minisign CLI fixture`
-- [ ] 13. Test `version_parse_and_order_cases`. `src/update/version.rs`.
+- [x] 13. Test `version_parse_and_order_cases`. `src/update/version.rs`.
   Commit: `feat(cli): parse and order release versions`
-- [ ] 14. Test `release_choice_and_asset_cases` (JSON fijo: borrador, prerelease, tag mal formado, falta el asset y el error nombra el triple). `src/update/release.rs`.
+- [x] 14. Test `release_choice_and_asset_cases` (JSON fijo: borrador, prerelease, tag mal formado, falta el asset y el error nombra el triple). `src/update/release.rs`.
   Commit: `feat(cli): choose the release and asset for a target`
-- [ ] 15. Tests `sha256sums_parse_cases` y el del comentario confiable de otra versión. `SHA256SUMS` y comentario en `release.rs`.
+- [x] 15. Tests `sha256sums_parse_cases` y el del comentario confiable de otra versión. `SHA256SUMS` y comentario en `release.rs`.
   Commit: `feat(cli): parse SHA256SUMS and bind its signature to a version`
-- [ ] 16. Tests de `build_info` en `clawg-core` (lectura del sello, `parse_stamp` pura) y `update_overrides_are_read_only_in_a_test_build` (`cfg`), más en `binary.rs` `a_test_build_reads_its_version_from_the_stamp`. `crates/clawg-core/src/build_info.rs` (`version()`, `dist_target()`, sello, sustituciones; dos cuerpos según `testing`); los siete sitios de `env!("CARGO_PKG_VERSION")` de D10 pasan a `version()`.
+- [x] 16. Tests de `build_info` en `clawg-core` (lectura del sello, `parse_stamp` pura) y `update_overrides_are_read_only_in_a_test_build` (`cfg`), más en `binary.rs` `a_test_build_reads_its_version_from_the_stamp`. `crates/clawg-core/src/build_info.rs` (`version()`, `dist_target()`, sello, sustituciones; dos cuerpos según `testing`); los siete sitios de `env!("CARGO_PKG_VERSION")` de D10 pasan a `version()`.
   Commit: `feat(core): read the build version and distribution mark from one place`
-- [ ] 17. Test `update_eligibility_cases` (cada negativa con su motivo; release marcado en `prod` pasa). `src/update/eligibility.rs` y la lectura de `.cargo-lock`.
+- [x] 17. Test `update_eligibility_cases` (cada negativa con su motivo; release marcado en `prod` pasa). `src/update/eligibility.rs` y la lectura de `.cargo-lock`.
   Commit: `feat(cli): decide whether a binary can update itself`
 - [ ] 18. **Depende de 3.** Test `the_embedded_key_list_has_the_primary_and_backup_keys_and_not_the_test_key` (`conventions.rs`, vía `clawg_cli::update::signature`). `include_str!` de las dos claves de `release/` y sustitución por `CLAWG_TEST_RELEASE_KEYS` sólo en `testing`.
   Commit: `feat(cli): embed the release public keys`
-- [ ] 19. Test del cliente contra un servidor axum falso: `requests_carry_a_user_agent`, topes de tamaño, orden (firma antes del binario). `src/update/client.rs`.
+- [x] 19. Test del cliente contra un servidor axum falso: `requests_carry_a_user_agent`, topes de tamaño, orden (firma antes del binario). `src/update/client.rs`.
   Commit: `feat(cli): query the release server on request`
-- [ ] 20. Test de `cli.rs` para `update [--check]` y test del mapeo a salida `0`/`100`/`1` (puro). `Command::Update`, su brazo en `main.rs`, `update/mod.rs` con `--check`.
+- [x] 20. Test de `cli.rs` para `update [--check]` y test del mapeo a salida `0`/`100`/`1` (puro). `Command::Update`, su brazo en `main.rs`, `update/mod.rs` con `--check`.
   Commit: `feat(cli): add clawg update --check`
-- [ ] 21. Tests `update_check_reports_a_newer_version_and_an_up_to_date_one` y `update_refuses_a_binary_without_a_stamp` (`binary.rs`, con el arnés: copia con sello en `<home>/bin`, servidor falso firmado al vuelo, `CLAWG_TEST_RELEASE_URL`/`CLAWG_TEST_RELEASE_KEYS`).
+- [x] 21. Tests `update_check_reports_a_newer_version_and_an_up_to_date_one` y `update_refuses_a_binary_without_a_stamp` (`binary.rs`, con el arnés: copia con sello en `<home>/bin`, servidor falso firmado al vuelo, `CLAWG_TEST_RELEASE_URL`/`CLAWG_TEST_RELEASE_KEYS`).
   Commit: `test(cli): drive update --check through the real binary`
-- [ ] 22. `.claude/CLAUDE.md`: variables de `testing` y sello de prueba (Testing). Se comprueba que `agent_contract.json` no cambia (`cargo test -p clawg-cli the_agent_contract_matches_its_file` sin bendecir).
+- [x] 22. `.claude/CLAUDE.md`: variables de `testing` y sello de prueba (Testing). Se comprueba que `agent_contract.json` no cambia (`cargo test -p clawg-cli the_agent_contract_matches_its_file` sin bendecir).
   Commit: `docs: describe the update test stand-ins`
 
 ## Tanda 3. `clawg update`
