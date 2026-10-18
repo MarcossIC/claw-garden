@@ -655,7 +655,7 @@ mod tests {
 
         let after = conn.call(snapshot).await.unwrap();
         assert_eq!(before, after);
-        assert_eq!(after.0, 14);
+        assert_eq!(after.0, 15);
     }
 
     /// Rows written before `project` existed keep their project ids when the
@@ -990,6 +990,78 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outbox, 0);
+    }
+
+    /// Disputes lived only in `disputed_against` before the pair table, so
+    /// each id it names becomes an escalated pair with no distance, and every
+    /// row keeps its status and its list: what was in ACTIVE CONFLICTS stays.
+    #[tokio::test]
+    async fn a_database_with_disputes_opens_with_escalated_pairs() {
+        ensure_vec0_registered();
+        let conn = Connection::open_in_memory().await.unwrap();
+        register_udfs(&conn).await.unwrap();
+        conn.call(|c| {
+            configured(crate::memory::migrations::runner())
+                .set_target(refinery::Target::Version(14))
+                .run(c)
+        })
+        .await
+        .unwrap();
+        conn.call(|c| {
+            let rows: [(i64, &str, Option<&str>, Option<i64>, Option<i64>); 6] = [
+                (1, "active", None, None, None),
+                (2, "disputed", Some("[1]"), None, Some(20)),
+                (3, "active", None, None, None),
+                (4, "disputed", Some("[3,1]"), None, Some(40)),
+                (5, "disputed", Some("not json"), None, Some(50)),
+                (6, "superseded", None, Some(2), None),
+            ];
+            for (id, status, against, by, disputed_at) in rows {
+                c.execute(
+                    "INSERT INTO memory \
+                     (id, scope, agent_id, content, memory_type, source, \
+                      created_at, created_by_type, created_by_ref, \
+                      last_modified_at, last_accessed_at, importance, tier, status, \
+                      disputed_against, superseded_by, last_disputed_at) \
+                     VALUES (?1, 'agent', 'a', 'claim ' || ?1, 'semantic_fact', 'explicit', \
+                      ?1, 'user', 'a', 1, 1, 5.0, 3, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![id, status, against, by, disputed_at],
+                )?;
+            }
+            c.execute("UPDATE memory SET deleted_at = 99 WHERE id = 3", [])?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+
+        let rows = |c: &mut rusqlite::Connection| -> Result<Vec<String>, rusqlite::Error> {
+            let mut stmt = c.prepare(
+                "SELECT json_array(id, content, status, disputed_against, superseded_by, \
+                 last_disputed_at, deleted_at) FROM memory ORDER BY id",
+            )?;
+            let rows = stmt.query_map([], |r| r.get(0))?.collect();
+            rows
+        };
+        let before = conn.call(rows).await.unwrap();
+
+        run_migrations(&conn).await.unwrap();
+
+        assert_eq!(conn.call(rows).await.unwrap(), before);
+        let pairs: Vec<(i64, i64, Option<f64>, String, Option<String>, i64)> = conn
+            .call(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT new_id, old_id, distance, state, verdict, created_at FROM memory_conflict \
+                     ORDER BY new_id, old_id",
+                )?;
+                let pairs = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
+                    .collect();
+                pairs
+            })
+            .await
+            .unwrap();
+        let escalated = |new, old, at| (new, old, None, "escalated".to_string(), None, at);
+        assert_eq!(pairs, vec![escalated(2, 1, 20), escalated(4, 1, 40), escalated(4, 3, 40)]);
     }
 
     fn tamper(dir: &Path, sql: &str) {
@@ -1464,7 +1536,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 14, "Expected exactly 14 applied migrations, got {}", count);
+        assert_eq!(count, 15, "Expected exactly 15 applied migrations, got {}", count);
     }
 
     /// V8 — a fresh store records V8 as applied and carries the FTS5 lexical
@@ -1925,7 +1997,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 14);
+        assert_eq!(migration_count, 15);
     }
 
     // -----------------------------------------------------------------------

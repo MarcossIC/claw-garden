@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use clawg_core::memory::dispute::{Resolution, ResolvedRow};
+use clawg_core::memory::dispute::{OpenPairs, Resolution, ResolvedRow};
 use clawg_core::memory::prompt_builder::SHARED_NOTE;
 use clawg_core::memory::sharing::{Reach, SharingError, SharingPolicy};
 use clawg_core::memory::ProjectIdentity;
@@ -114,7 +114,32 @@ pub fn format_resolution(r: &Resolution) -> String {
         Some(by) if row.status == "superseded" => format!("#{} superseded by #{by}", row.id),
         _ => format!("#{} {}", row.id, row.status),
     };
-    format!("{}\n{}", line(&r.keep), line(&r.other))
+    let rows = format!("{}\n{}", line(&r.keep), line(&r.other));
+    match r.pair.as_deref() {
+        Some("escalated") => format!("{rows}\nthe pair waits for the user in ACTIVE CONFLICTS"),
+        _ => rows,
+    }
+}
+
+/// What `memory_status` says about the pairs the agent has not judged.
+pub fn format_open_pairs(open: &OpenPairs) -> String {
+    if open.pending == 0 && open.escalated == 0 {
+        return "conflict candidates: none open".to_string();
+    }
+    let mut out = format!(
+        "conflict candidates: {} for you to judge, {} waiting for the user in ACTIVE CONFLICTS",
+        open.pending, open.escalated
+    );
+    for p in &open.pairs {
+        out.push_str(&format!("\n  #{} close to #{}", p.new_id, p.old_id));
+    }
+    if open.pending > 0 {
+        out.push_str(
+            "\nread_memory both sides, then resolve_conflict: supersedes, compatible, scoped (with a \
+             reason) or conflicts to put the pair to the user",
+        );
+    }
+    out
 }
 
 /// What `read_memory` tells the model: which piece it asked for and every
@@ -381,17 +406,22 @@ pub fn format_status(
     agent: &str,
     origin: &str,
     sharing: &str,
+    conflicts: Option<&str>,
 ) -> String {
     // `to_string_pretty` on a struct that always serializes cannot fail; the
     // fallback exists so this function has no panic in it rather than because
     // the branch is reachable.
     let json = serde_json::to_string_pretty(health)
         .unwrap_or_else(|_| format!("{{\"status\":\"{}\"}}", health.status));
-    format!(
+    let mut out = format!(
         "{json}\n\nprofile: {}\ndata dir: {}\nagent: {agent} ({origin})\n{sharing}",
         profile.as_str(),
         base_dir.display()
-    )
+    );
+    if let Some(conflicts) = conflicts {
+        out.push_str(&format!("\n{conflicts}"));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -792,7 +822,7 @@ mod tests {
     #[test]
     fn format_resolution_names_both_rows_and_what_replaced_one() {
         let row = |id, status: &str, superseded_by| ResolvedRow { id, status: status.into(), superseded_by };
-        let out = format_resolution(&Resolution { keep: row(9, "active", None), other: row(4, "superseded", Some(9)) });
+        let out = format_resolution(&Resolution { keep: row(9, "active", None), other: row(4, "superseded", Some(9)), pair: None });
         assert_eq!(out, "#9 active\n#4 superseded by #9");
     }
 
@@ -877,7 +907,7 @@ mod tests {
 
     #[test]
     fn format_status_includes_the_health_json_the_data_dir_and_the_profile() {
-        let out = format_status(&health(), Profile::Dev, Path::new("/home/u/.clawg-dev"), "a", "from --agent", "shared: none");
+        let out = format_status(&health(), Profile::Dev, Path::new("/home/u/.clawg-dev"), "a", "from --agent", "shared: none", None);
         assert!(out.contains("\"pid\": 4242"), "health must be pretty JSON: {out}");
         assert!(out.contains("loading"), "out was: {out}");
         assert!(out.contains(".clawg-dev"), "the data dir must be named: {out}");
@@ -901,14 +931,14 @@ mod tests {
             }),
             ..health()
         };
-        let out = format_status(&h, Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none");
+        let out = format_status(&h, Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", None);
         assert!(out.contains("\"failed\": 1"), "out was: {out}");
         assert!(out.contains("\"operation_id\": \"op-1\""), "out was: {out}");
     }
 
     #[test]
     fn format_status_names_the_agent() {
-        let out = format_status(&health(), Profile::Dev, Path::new("/d"), "claude-code", "from --agent", "shared: none");
+        let out = format_status(&health(), Profile::Dev, Path::new("/d"), "claude-code", "from --agent", "shared: none", None);
         assert!(out.contains("\nagent: claude-code (from --agent)\n"), "out was: {out}");
     }
 
@@ -922,8 +952,30 @@ mod tests {
         let line = format_sharing(&broken, "cursor");
         assert!(line.starts_with("shared: none (") && line.contains("version 2"), "{line}");
 
-        let out = format_status(&health(), Profile::Dev, Path::new("/d"), "cursor", "from --agent", &format_sharing(&policy, "cursor"));
+        let out = format_status(&health(), Profile::Dev, Path::new("/d"), "cursor", "from --agent", &format_sharing(&policy, "cursor"), None);
         assert!(out.ends_with("\nshared: reads every agent but claude-code, codex"), "out was: {out}");
+    }
+
+    #[test]
+    fn format_status_ends_with_the_open_pairs() {
+        let open = OpenPairs {
+            pending: 2,
+            escalated: 1,
+            pairs: vec![
+                clawg_core::memory::dispute::OpenPair { new_id: 9, old_id: 4, distance: Some(0.3), created_at: 1 },
+                clawg_core::memory::dispute::OpenPair { new_id: 12, old_id: 4, distance: None, created_at: 2 },
+            ],
+        };
+        let out = format_status(&health(), Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", Some(&format_open_pairs(&open)));
+        assert!(
+            out.ends_with(
+                "\nconflict candidates: 2 for you to judge, 1 waiting for the user in ACTIVE CONFLICTS\n  #9 close to #4\n  \
+                 #12 close to #4\nread_memory both sides, then resolve_conflict: supersedes, compatible, scoped (with a \
+                 reason) or conflicts to put the pair to the user"
+            ),
+            "out was: {out}"
+        );
+        assert_eq!(format_open_pairs(&OpenPairs::default()), "conflict candidates: none open");
     }
 
     fn by(mut h: Hit, author: &str) -> Hit {

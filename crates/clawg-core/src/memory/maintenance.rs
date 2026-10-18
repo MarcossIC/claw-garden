@@ -120,6 +120,11 @@ pub(crate) async fn run_maintenance_once_at(store: &MemoryStore, now_ms: Timesta
         log::info!("maintenance: released {released} disputes whose other side was deleted");
     }
 
+    let dropped = drop_orphaned_pairs(store).await;
+    if dropped > 0 {
+        log::info!("maintenance: dropped {dropped} conflict pairs that name a row no longer stored");
+    }
+
     // Placed after the demotion pass so the counts describe the post-pass
     // state. A query failure here logs and returns like the demotion above —
     // losing one day's corpus-size log line is not worth stopping the loop.
@@ -213,6 +218,22 @@ async fn release_orphaned_disputes(store: &MemoryStore, now_ms: TimestampMs) -> 
         Ok(n) => n,
         Err(e) => {
             log::warn!("maintenance: orphaned-dispute release failed: {e}");
+            0
+        }
+    }
+}
+
+/// Deletes the conflict pairs that name a row the store no longer holds,
+/// which only a purge by a version that predates the pairs leaves behind. A
+/// failure is logged and reported as 0, like the passes above.
+async fn drop_orphaned_pairs(store: &MemoryStore) -> usize {
+    let sql = "DELETE FROM memory_conflict \
+               WHERE NOT EXISTS (SELECT 1 FROM memory WHERE id = new_id) \
+                  OR NOT EXISTS (SELECT 1 FROM memory WHERE id = old_id)";
+    match store.conn.call(move |c| c.execute(sql, [])).await {
+        Ok(n) => n,
+        Err(e) => {
+            log::warn!("maintenance: orphaned-pair drop failed: {e}");
             0
         }
     }
@@ -1389,6 +1410,38 @@ mod tests {
 
         assert_eq!(super::release_orphaned_disputes(&store, now_ms()).await, 1);
         assert_eq!(super::release_orphaned_disputes(&store, now_ms()).await, 0);
+    }
+
+    #[tokio::test]
+    async fn maintenance_drops_pairs_of_missing_rows() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let old = seed_dispute(&store, "old", "active", None).await;
+        let new = seed_dispute(&store, "new", "active", None).await;
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) \
+                     VALUES (?1, ?2, 0.3, 'pending', 0), (?3, ?1, 0.3, 'pending', 0), (?1, 999999, 0.3, 'pending', 0)",
+                    [new, old, new + 1000],
+                )
+            })
+            .await
+            .unwrap();
+
+        super::run_maintenance_once_at(&store, now_ms()).await;
+
+        let left: Vec<(i64, i64)> = store
+            .conn
+            .call(|c| {
+                let mut stmt = c.prepare("SELECT new_id, old_id FROM memory_conflict")?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect();
+                rows
+            })
+            .await
+            .unwrap();
+        assert_eq!(left, vec![(new, old)]);
+        assert_eq!(super::drop_orphaned_pairs(&store).await, 0, "a second pass finds nothing");
     }
 
     // ── reembed_all ──────────────────────────────────────────────────────

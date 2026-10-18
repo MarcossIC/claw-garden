@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use clawg_core::memory::dispute::Resolution;
+use clawg_core::memory::dispute::{OpenPairs, Resolution};
 use clawg_core::memory::outbox::OutboxSummary;
 use clawg_core::memory::store_lock::{StoreHolder, StoreLock, StoreOwner};
 use clawg_core::paths::{data_dir, PathsError, Profile};
@@ -339,6 +339,17 @@ pub struct SavedMemory {
     pub outcome: String,
 }
 
+/// An earlier row a save was found close to, as `POST /v1/memories` reports it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RelatedMemory {
+    pub id: i64,
+    /// The pair waits for the user in ACTIVE CONFLICTS.
+    pub escalated: bool,
+    /// The first line of the earlier row.
+    #[serde(default)]
+    pub excerpt: String,
+}
+
 /// How a row ended up after `PATCH /v1/memories/{kind}/{id}`.
 ///
 /// Every field but `memory_type` is required: a daemon older than the type
@@ -394,7 +405,9 @@ struct UpdateBody<'a> {
 pub enum SaveOutcome {
     /// Stored, one entry per chunk. `redacted` names the kinds of secret
     /// masked out before storing; a daemon that predates masking sends none.
-    Saved { memories: Vec<SavedMemory>, redacted: Vec<String> },
+    /// `related` names the earlier rows the save was found close to; a daemon
+    /// that predates the pair table sends none.
+    Saved { memories: Vec<SavedMemory>, redacted: Vec<String>, related: Vec<RelatedMemory> },
     /// Accepted but not confirmed; `reason` says why (`"unconfirmed"`,
     /// `"embedder_loading"`, `"already_queued"`), and `operation_id` is what
     /// it waits under; a daemon that predates the outbox sends none.
@@ -556,6 +569,8 @@ impl DaemonClient {
             #[serde(default)]
             redacted: Vec<String>,
             #[serde(default)]
+            related: Vec<RelatedMemory>,
+            #[serde(default)]
             operation_id: Option<String>,
         }
         let resp = self
@@ -568,7 +583,7 @@ impl DaemonClient {
             .map_err(Self::map_transport)?;
         let body: Body = Self::read_response(resp).await?;
         Ok(match body.status.as_str() {
-            "saved" => SaveOutcome::Saved { memories: body.memories, redacted: body.redacted },
+            "saved" => SaveOutcome::Saved { memories: body.memories, redacted: body.redacted, related: body.related },
             _ => SaveOutcome::Queued { reason: body.reason, operation_id: body.operation_id },
         })
     }
@@ -806,24 +821,42 @@ impl DaemonClient {
         Self::read_response::<Restored>(resp).await
     }
 
-    /// `agent` scopes the resolution as in [`DaemonClient::update`].
-    pub async fn resolve(
+    /// `agent` scopes the verdict as in [`DaemonClient::update`]. A daemon
+    /// that predates verdicts answers a bare 404.
+    pub async fn judge(
         &self,
         keep: i64,
         other: i64,
-        keep_both: bool,
+        verdict: &str,
+        reason: Option<&str>,
         agent: Option<&str>,
     ) -> Result<Resolution, ClientError> {
         let resp = self
             .http
-            .post(self.url("/v1/disputes/resolve"))
+            .post(self.url("/v1/disputes/judge"))
             .bearer_auth(&self.token)
-            .json(&serde_json::json!({ "keep": keep, "other": other, "keep_both": keep_both, "agent_id": agent }))
+            .json(&serde_json::json!({
+                "keep": keep, "other": other, "verdict": verdict, "reason": reason, "agent_id": agent,
+            }))
             .send()
             .await
             .map_err(Self::map_transport)?;
         Self::read_response::<Resolution>(resp).await
-}
+    }
+
+    /// The pairs `agent` has not judged yet. A daemon that predates the pair
+    /// table answers a bare 404.
+    pub async fn open_disputes(&self, agent: &str) -> Result<OpenPairs, ClientError> {
+        let resp = self
+            .http
+            .get(self.url("/v1/disputes"))
+            .query(&[("agent_id", agent)])
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(Self::map_transport)?;
+        Self::read_response::<OpenPairs>(resp).await
+    }
 
     /// Asks the daemon for a manual snapshot and returns where it wrote it.
     pub async fn backup(&self) -> Result<PathBuf, ClientError> {
@@ -1382,7 +1415,7 @@ pub(crate) mod tests {
             second,
             SaveOutcome::Saved {
                 memories: vec![SavedMemory { kind: "memory".into(), id: memories[0].id, outcome: "reinforced".into() }],
-                redacted: vec![],
+                redacted: vec![], related: vec![]
             }
         );
     }
@@ -1441,12 +1474,12 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_refuses_a_pair_without_a_dispute() {
+    async fn judge_refuses_a_row_against_itself() {
         let d = start_daemon().await;
         publish(&d);
         let c = DaemonClient::from_data_dir(d.dir.path()).expect("client");
 
-        let err = c.resolve(1, 1, false, None).await.expect_err("a row cannot be resolved against itself");
+        let err = c.judge(1, 1, "compatible", None, None).await.expect_err("a row cannot be judged against itself");
 
         assert!(matches!(err, ClientError::Daemon { status: 400, .. }), "{err:?}");
     }

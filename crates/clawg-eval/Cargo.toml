@@ -8,7 +8,7 @@ repository.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
-# No library target: this crate is only the two evaluation binaries.
+# No library target: this crate is only the evaluation binaries.
 autobins = false
 
 # Directory name matches the declared bin name so cargo's `src/bin/*/main.rs`
@@ -25,6 +25,11 @@ path = "src/bin/rag-eval/main.rs"
 name = "golden-mine"
 path = "src/bin/golden-mine/main.rs"
 
+# Measures the contradiction detector through the production ingest worker.
+[[bin]]
+name = "conflict-eval"
+path = "src/bin/conflict-eval/main.rs"
+
 [dependencies]
 clawg-core = { workspace = true, features = ["eval"] }
 # Only `rag-eval --agent-view` uses it: it serves the daemon's own router in-process
@@ -36,6 +41,5 @@ thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 log.workspace = true
-
-[dev-dependencies]
+# `conflict-eval` gives every labelled pair a store of its own.
 tempfile.workspace = true

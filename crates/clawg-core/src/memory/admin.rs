@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::memory::clock::TimestampMs;
 use crate::memory::chunker::embedding_text;
-use crate::memory::dispute::{release_challengers, settle_row};
+use crate::memory::dispute::{release_challengers, settle_challengers, settle_row};
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::search::{viewer_match_expression, RankedHit};
 use crate::memory::store_insert::{MemoryType, UnknownMemoryType};
@@ -489,6 +489,7 @@ pub async fn restore_memory_core(
             tx.execute("INSERT INTO memory_vectors(rowid, embedding) VALUES (?1, ?2)", rusqlite::params![id, bytes])?;
             tx.execute(RESTORE_TEXT_INDEX, [id])?;
             settle_row(&tx, id, now)?;
+            settle_challengers(&tx, id, now)?;
             let row = tx.query_row("SELECT status, superseded_by FROM memory WHERE id = ?1", [id], |r| {
                 Ok(RestoredRow { id, status: r.get(0)?, superseded_by: r.get(1)? })
             })?;
@@ -3237,7 +3238,35 @@ mod tests {
         let row = restore(&store, new, None).await.unwrap();
 
         assert_eq!(row.status, "active", "the row it disputed is still deleted");
-        assert_eq!(memory_status(&store, other).await, "active", "released disputes stay released");
+        assert_eq!(memory_status(&store, other).await, "disputed", "its dispute with the restored row is back");
+    }
+
+    #[tokio::test]
+    async fn a_restored_row_brings_its_escalated_pair_back() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let old = save(&store, "a", "the api listens on 8080").await;
+        let new = save(&store, "a", "the api listens on 9090").await;
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE memory SET status = 'disputed', disputed_against = ?2 WHERE id = ?1",
+                    rusqlite::params![new, format!("[{old}]")],
+                )?;
+                c.execute(
+                    "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) \
+                     VALUES (?1, ?2, 0.3, 'escalated', 0)",
+                    [new, old],
+                )
+            })
+            .await
+            .unwrap();
+        delete(&store, old).await;
+        assert_eq!(memory_status(&store, new).await, "active", "the delete released it");
+
+        restore(&store, old, None).await.unwrap();
+
+        assert_eq!(memory_status(&store, new).await, "disputed", "the pair is back with the row");
     }
 
     #[tokio::test]

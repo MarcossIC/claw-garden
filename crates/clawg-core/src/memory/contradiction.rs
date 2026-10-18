@@ -1,10 +1,16 @@
 //! Contradiction detection for the RAG sycophancy guard.
 //!
-//! Detects existing memory rows that are semantically close (L2 distance < threshold)
-//! to a candidate embedding. Called in `worker.rs` between embed and insert so that
-//! disputed rows are flagged atomically inside the INSERT transaction.
+//! Finds existing memory rows that are semantically close (L2 distance under
+//! the threshold) to a new row's embedding. Closeness is not contradiction: a
+//! rewording, a complement or an update sits in the same band as a negation.
+//! So every row found is a candidate, recorded as a `memory_conflict` pair,
+//! and only the pairs [`needs_user`] picks are escalated to the user. Called
+//! in `worker.rs` between embed and insert so the pairs are written inside the
+//! INSERT transaction.
 
-use crate::memory::search::{search_all_memories, SearchScope};
+use std::collections::HashMap;
+
+use crate::memory::search::{identifier_tokens, search_all_memories, SearchScope};
 use crate::memory::record::TableKind;
 use crate::memory::store_insert::MemoryType;
 use crate::memory::MemoryStore;
@@ -12,49 +18,22 @@ use crate::memory::MemoryStore;
 #[cfg(test)]
 use crate::memory::vector::to_unit;
 
-/// L2 distance below which two embeddings are considered contradictory.
+/// L2 distance below which two embeddings are close enough to be a candidate
+/// contradiction.
 ///
 /// Ten contradicting and ten compatible pairs of project facts
 /// (`El proyecto usa PostgreSQL` / `… SQLite`, against `… SQLite` /
-/// `Las migraciones se aplican con refinery`) separate at (0.276, 0.328]
-/// under CLS pooling, where the golden set put its gap at (0.30, 0.35], and
-/// at (0.350, 0.469] under mean pooling. 0.42 keeps 0.07 above the last
-/// contradiction and 0.05 below the first compatible pair. On the golden set
-/// with mean vectors no compatible pair falls under 0.50, and 0.42 sits
-/// between recall 0.8 at 0.40 and 0.9 at 0.45; going higher would trade the
-/// margin the hand-written compatible pair at 0.469 asks for.
+/// `Las migraciones se aplican con refinery`) separate at (0.350, 0.469]
+/// under mean pooling. 0.42 keeps 0.07 above the last contradiction and 0.05
+/// below the first compatible pair. On the golden set with mean vectors no
+/// compatible pair falls under 0.50, and 0.42 sits between recall 0.8 at 0.40
+/// and 0.9 at 0.45; going higher would trade the margin the hand-written
+/// compatible pair at 0.469 asks for.
 ///
-/// The CLS-pooled calibration it replaces was measured against
-/// `multilingual-e5-small`, over the 20 non-identical labelled pairs
-/// (10 contradiction / 10 non-contradiction) from the domain golden set. The 8 identical pairs in that set are excluded from
-/// this calibration on purpose: the write-border dedup gate intercepts an
-/// identical resend by content hash before it ever reaches this detector,
-/// so a pair the detector will structurally never see must not move the
+/// The labelled pairs leave out identical texts on purpose: the write-border
+/// dedup gate intercepts an identical resend by content hash before it ever
+/// reaches this detector, so a pair the detector never sees must not move the
 /// threshold that governs the pairs it does see.
-///
-/// Sweep (fraction of pairs at-or-under each L2 threshold):
-///
-/// | threshold | recall (contradiction) | fpr (non-contradiction) |
-/// |-----------|-------------------------|--------------------------|
-/// | 0.10      | 0.000                   | 0.000                    |
-/// | 0.15      | 0.000                   | 0.000                    |
-/// | 0.20      | 0.200                   | 0.000                    |
-/// | 0.25      | 0.400                   | 0.000                    |
-/// | 0.30      | 1.000                   | 0.000                    |
-/// | 0.35      | 1.000                   | 0.000                    |
-/// | 0.40      | 1.000                   | 0.200                    |
-///
-/// All 10 contradiction pairs sit at distance <= 0.30; all 10 non-contradiction
-/// pairs sit at distance > 0.35 — the class-separating gap is (0.30, 0.35].
-/// 0.30 sits at the exact bottom edge of that gap: it is the ceiling of the
-/// positive class, so it carries zero recall margin — any small upward drift
-/// in the embedding distribution drops recall with no warning. 0.35 sits at
-/// the top of the same gap: identical recall (1.000) and identical
-/// fpr_no_contradiction (0.000) as 0.30, plus roughly 0.05 of headroom below
-/// it that 0.30 does not have — 0.35 strictly dominates 0.30 on this data.
-/// That headroom is not unlimited above 0.35 either: at 0.40 fpr_no_contradiction
-/// rises to 0.200. 0.35 is the point that costs no recall or precision for
-/// real margin below it, not a value with room to spare in either direction.
 pub(crate) const CONTRADICTION_THRESHOLD: f32 = 0.42;
 
 /// Below this L2 distance the two texts are the same claim, not two claims
@@ -70,25 +49,76 @@ pub(crate) const NEAR_DUPLICATE_FLOOR: f32 = 0.10;
 // build instead of the detector silently returning nothing at runtime.
 const _: () = assert!(NEAR_DUPLICATE_FLOOR < CONTRADICTION_THRESHOLD);
 
-// The sweep table above is measured by re-embedding each labelled pair's raw
-// text and computing L2 distance directly on the two resulting vectors — it
-// never calls `detect_contradiction`. The type gate, `NEAR_DUPLICATE_FLOOR`,
-// and the write-border dedup gate are all absent from what produced those
-// numbers. The threshold comparison itself is still meaningful, because
-// production compares new embeddings against that same raw L2 distance; what
-// the sweep cannot do is say anything about the gate or the dedup path, or
-// move if either of them changes — re-running it against the same labelled
-// text will always reproduce the same curve regardless of what else in the
-// write path was edited. Read this table as a calibration of the distance
-// metric alone, never as an end-to-end measurement of the detector.
+// The calibration above re-embeds each labelled pair's raw text and measures
+// L2 directly on the two vectors; it never calls `detect_contradiction`, so it
+// says nothing about the type gate, the floor or the dedup path. Read it as a
+// calibration of the distance alone; `conflict-eval` measures the detector.
 
 /// Candidates the detector weighs per probe, before room for siblings.
 const CANDIDATE_POOL: usize = 5;
 
-/// Return the IDs of existing memory rows whose embedding is within the
-/// dispute band `[NEAR_DUPLICATE_FLOOR, CONTRADICTION_THRESHOLD)` of
-/// `embedding`, scoped to `agent_id` and, when given, `project_id`, leaving
-/// out `siblings`: the rows the same event already inserted.
+/// Below this L2 distance a candidate pair that involves a preference or a
+/// decision, or whose texts share an identifier, is put to the user. It sits
+/// between the last measured contradiction (0.350) and the first compatible
+/// pair (0.469) of the calibration above.
+pub(crate) const ESCALATE_BELOW: f64 = 0.40;
+
+/// How many characters of a candidate's first line a save answer shows.
+pub(crate) const EXCERPT_CHARS: usize = 80;
+
+/// One existing row the detector found close to a new one.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Candidate {
+    pub id: i64,
+    pub distance: f64,
+    /// Whether the pair is put to the user ([`needs_user`]).
+    pub escalated: bool,
+    /// The first line of the candidate, cut to [`EXCERPT_CHARS`].
+    pub excerpt: String,
+}
+
+/// The save a candidate belongs to: the `memory_piece` save of a piece, the
+/// row itself otherwise. A new save pairs once with each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SaveKey {
+    Save(i64),
+    Row(i64),
+}
+
+/// Whether a candidate pair goes to the user rather than only to the agent.
+/// A distance nobody recorded (a pair from before the pair table) always
+/// does; otherwise only a close pair, and only when one side states a
+/// preference or a decision, or the two texts name the same identifier.
+pub(crate) fn needs_user(new: MemoryType, old: MemoryType, distance: Option<f64>, shares_identifier: bool) -> bool {
+    let protected = |t: MemoryType| matches!(t, MemoryType::UserPreference | MemoryType::ArchitecturalDecision);
+    match distance {
+        None => true,
+        Some(d) => d < ESCALATE_BELOW && (protected(new) || protected(old) || shares_identifier),
+    }
+}
+
+/// Whether `a` and `b` hold a common identifier (`identifier_tokens`).
+pub(crate) fn shares_identifier(a: &str, b: &str) -> bool {
+    let theirs: Vec<String> = identifier_tokens(b).iter().map(|t| t.to_lowercase()).collect();
+    identifier_tokens(a).iter().any(|t| theirs.contains(&t.to_lowercase()))
+}
+
+/// The first non-blank line of `content`, cut to [`EXCERPT_CHARS`] characters.
+pub(crate) fn excerpt(content: &str) -> String {
+    let line = content.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    if line.chars().count() <= EXCERPT_CHARS {
+        return line.to_string();
+    }
+    let mut cut: String = line.chars().take(EXCERPT_CHARS).collect();
+    cut.push('…');
+    cut
+}
+
+/// Return the existing memory rows whose embedding is within the dispute
+/// band `[NEAR_DUPLICATE_FLOOR, CONTRADICTION_THRESHOLD)` of `embedding`,
+/// scoped to `agent_id` and, when given, `project_id`, leaving out
+/// `siblings`: the rows the same event already inserted. Each comes with the
+/// save it belongs to; the search already keeps the closest piece of each.
 ///
 /// Deliberately searches `memory` only. An episodic trajectory records what
 /// happened and a procedural skill records how something is done — neither
@@ -137,11 +167,12 @@ fn contradiction_search_scope(project_id: Option<&str>, pool: usize) -> SearchSc
 pub(crate) async fn detect_contradiction(
     store: &MemoryStore,
     embedding: &[f32],
+    text: &str,
     agent_id: &str,
     project_id: Option<&str>,
     candidate_type: MemoryType,
     siblings: &[i64],
-) -> Vec<i64> {
+) -> Vec<(SaveKey, Candidate)> {
     if !candidate_type.is_claim_bearing() {
         return Vec::new();
     }
@@ -151,26 +182,48 @@ pub(crate) async fn detect_contradiction(
     // its own chunks and a real dispute with an older row is never seen.
     let pool = CANDIDATE_POOL + siblings.len();
     let scope = contradiction_search_scope(project_id, pool);
-    match search_all_memories(store, embedding, None, agent_id, scope, pool).await {
-        // Two similar chat messages are not a knowledge contradiction. Only
-        // types that assert something can contradict something, so the
-        // detector is gated to those and skips the KNN entirely for the rest.
-        Ok(hits) => hits
-            .into_iter()
-            .filter(|h| {
-                matches!(h.kind, TableKind::Memory)
-                    && !siblings.contains(&h.id)
-                    && MemoryType::from_db_str(&h.memory_type).is_some_and(MemoryType::is_claim_bearing)
-                    && h.distance >= NEAR_DUPLICATE_FLOOR as f64
-                    && h.distance < CONTRADICTION_THRESHOLD as f64
-            })
-            .map(|h| h.id)
-            .collect(),
+    let hits = match search_all_memories(store, embedding, None, agent_id, scope, pool).await {
+        Ok(hits) => hits,
         Err(e) => {
             log::warn!("contradiction detect failed (agent={agent_id}): {e}");
-            Vec::new()
+            return Vec::new();
         }
+    };
+    // Two similar chat messages are not a knowledge contradiction. Only
+    // types that assert something can contradict something, so the
+    // detector is gated to those and skips the KNN entirely for the rest.
+    let found: Vec<Candidate> = hits
+        .into_iter()
+        .filter(|h| {
+            matches!(h.kind, TableKind::Memory)
+                && !siblings.contains(&h.id)
+                && h.distance >= NEAR_DUPLICATE_FLOOR as f64
+                && h.distance < CONTRADICTION_THRESHOLD as f64
+        })
+        .filter_map(|h| {
+            let old_type = MemoryType::from_db_str(&h.memory_type).filter(|t| t.is_claim_bearing())?;
+            let escalated = needs_user(candidate_type, old_type, Some(h.distance), shares_identifier(text, &h.content));
+            Some(Candidate { id: h.id, distance: h.distance, escalated, excerpt: excerpt(&h.content) })
+        })
+        .collect();
+    if found.is_empty() {
+        return Vec::new();
     }
+    let ids: Vec<i64> = found.iter().map(|c| c.id).collect();
+    let saves = match store.save_links(ids).await {
+        Ok(saves) => saves,
+        Err(e) => {
+            log::warn!("contradiction detect could not read the saves of its candidates (agent={agent_id}): {e}");
+            HashMap::new()
+        }
+    };
+    found
+        .into_iter()
+        .map(|c| {
+            let key = saves.get(&c.id).map_or(SaveKey::Row(c.id), |link| SaveKey::Save(link.save_id));
+            (key, c)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -183,6 +236,22 @@ mod tests {
     use crate::memory::db::MemoryStore;
 
     // ── shared test helpers ──────────────────────────────────────────────────
+
+    /// The ids `detect_contradiction` finds for a probe with no text.
+    async fn detected(
+        store: &MemoryStore,
+        embedding: &[f32],
+        agent_id: &str,
+        project_id: Option<&str>,
+        candidate_type: MemoryType,
+        siblings: &[i64],
+    ) -> Vec<i64> {
+        detect_contradiction(store, embedding, "", agent_id, project_id, candidate_type, siblings)
+            .await
+            .into_iter()
+            .map(|(_, c)| c.id)
+            .collect()
+    }
 
     /// Serialize a float slice to little-endian bytes for vec0 storage.
     fn emb_bytes(v: &[f32]) -> Vec<u8> {
@@ -297,7 +366,7 @@ mod tests {
 
         insert_row(&store, "agent-far", &base).await;
 
-        let ids = detect_contradiction(&store, &query, "agent-far", None, MemoryType::UserPreference, &[]).await;
+        let ids = detected(&store, &query, "agent-far", None, MemoryType::UserPreference, &[]).await;
         assert!(ids.is_empty(), "far vectors must not be flagged; got {ids:?}");
     }
 
@@ -325,7 +394,7 @@ mod tests {
 
         let stored_id = insert_row(&store, "agent-near", &base).await;
 
-        let ids = detect_contradiction(&store, &query, "agent-near", None, MemoryType::UserPreference, &[]).await;
+        let ids = detected(&store, &query, "agent-near", None, MemoryType::UserPreference, &[]).await;
         assert!(
             ids.contains(&stored_id),
             "stored_id={stored_id} must be in contradiction ids={ids:?}"
@@ -336,7 +405,7 @@ mod tests {
     async fn detect_contradiction_empty_db_returns_empty() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let base = base_vec(3);
-        let ids = detect_contradiction(&store, &base, "agent-empty", None, MemoryType::UserPreference, &[]).await;
+        let ids = detected(&store, &base, "agent-empty", None, MemoryType::UserPreference, &[]).await;
         assert!(ids.is_empty(), "empty DB must yield empty contradiction ids");
     }
 
@@ -348,7 +417,7 @@ mod tests {
         insert_row(&store, "agent-a", &base).await;
         // Query with "agent-b" → different scope → empty
         let query = near(&base, 0.05);
-        let ids = detect_contradiction(&store, &query, "agent-b", None, MemoryType::UserPreference, &[]).await;
+        let ids = detected(&store, &query, "agent-b", None, MemoryType::UserPreference, &[]).await;
         assert!(
             ids.is_empty(),
             "row from agent-a must not appear for agent-b; got {ids:?}"
@@ -396,7 +465,7 @@ mod tests {
 
         for (idx, (contradicting, _, query)) in fixtures.iter().enumerate() {
             let agent_id = format!("eval-agent-{idx}");
-            let ids = detect_contradiction(&store, query, &agent_id, None, MemoryType::UserPreference, &[]).await;
+            let ids = detected(&store, query, &agent_id, None, MemoryType::UserPreference, &[]).await;
             let expected_id = stored_ids[idx].unwrap();
             let flagged = ids.contains(&expected_id);
 
@@ -416,6 +485,58 @@ mod tests {
             fp, 0,
             "no non-contradicting fixture should be flagged; got fp={fp}"
         );
+    }
+
+    // ── Escalation ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn needs_user_cases() {
+        use MemoryType::{ArchitecturalDecision as Decision, SemanticFact as Fact, UserPreference as Pref};
+        let close = Some(0.30);
+        let edge = Some(ESCALATE_BELOW);
+        let cases: &[(MemoryType, MemoryType, Option<f64>, bool, bool)] = &[
+            (Fact, Fact, close, false, false),
+            (Fact, Fact, close, true, true),
+            (Fact, Fact, edge, true, false),
+            (Pref, Fact, close, false, true),
+            (Fact, Pref, close, false, true),
+            (Decision, Decision, close, false, true),
+            (Pref, Pref, edge, false, false),
+            (Pref, Pref, Some(0.41), true, false),
+            (Fact, Fact, None, false, true),
+        ];
+        for &(new, old, distance, shares, expected) in cases {
+            assert_eq!(
+                needs_user(new, old, distance, shares),
+                expected,
+                "needs_user({new:?}, {old:?}, {distance:?}, {shares})"
+            );
+        }
+    }
+
+    #[test]
+    fn escalate_below_pins_the_shipped_value() {
+        assert_eq!(
+            ESCALATE_BELOW, 0.40,
+            "ESCALATE_BELOW sits between the last measured contradiction (0.350) and the first \
+             compatible pair (0.469); move it only from a conflict-eval run"
+        );
+    }
+
+    #[test]
+    fn identifiers_are_shared_only_when_both_texts_hold_one() {
+        assert!(shares_identifier("the cache lives in load_index", "load_index reads the WAL"));
+        assert!(!shares_identifier("the project uses PostgreSQL", "the project uses SQLite"));
+        assert!(!shares_identifier("parseLedger7731 is slow", "parseLedger is slow"));
+    }
+
+    #[test]
+    fn an_excerpt_is_the_first_line_cut_to_its_limit() {
+        assert_eq!(excerpt("\n  Ports\nthe api listens on 8080"), "Ports");
+        let long = "é".repeat(EXCERPT_CHARS + 5);
+        let cut = excerpt(&long);
+        assert_eq!(cut.chars().count(), EXCERPT_CHARS + 1);
+        assert!(cut.ends_with('…'));
     }
 
     // ── Pinned field: contradiction_search_scope.lexical ────────────────────
@@ -477,7 +598,7 @@ mod tests {
 
         insert_row_typed(&store, "agent-gate", "user_preference", &base).await;
 
-        let ids = detect_contradiction(&store, &query, "agent-gate", None, MemoryType::ChatMessage, &[]).await;
+        let ids = detected(&store, &query, "agent-gate", None, MemoryType::ChatMessage, &[]).await;
         assert!(
             ids.is_empty(),
             "an ineligible candidate type must short-circuit to [], got {ids:?}"
@@ -495,7 +616,7 @@ mod tests {
         let query = near(&base, 3.0); // unit-space L2 ≈ 0.26, inside the band
         insert_row_typed(&store, "agent-hitgate", "chat_message", &base).await;
 
-        let ids = detect_contradiction(&store, &query, "agent-hitgate", None, MemoryType::UserPreference, &[]).await;
+        let ids = detected(&store, &query, "agent-hitgate", None, MemoryType::UserPreference, &[]).await;
         assert!(
             ids.is_empty(),
             "a chat_message hit must be dropped even for an eligible candidate, got {ids:?}"
@@ -523,7 +644,7 @@ mod tests {
 
         insert_row_typed(&store, "agent-floor", "user_preference", &base).await;
 
-        let ids = detect_contradiction(&store, &query, "agent-floor", None, MemoryType::UserPreference, &[]).await;
+        let ids = detected(&store, &query, "agent-floor", None, MemoryType::UserPreference, &[]).await;
         assert!(
             ids.is_empty(),
             "a hit below NEAR_DUPLICATE_FLOOR must be skipped, not disputed; got {ids:?}"
@@ -617,7 +738,7 @@ mod tests {
             created_by_ref: "agent-contra-pref".to_string(),
             importance: 8.0,
             created_at_ms: 0,
-            disputed_against: None,
+            candidates: Vec::new(),
             derived_from: Vec::new(),
         };
         let stored_id = store.insert_memory_with_vector(record, emb.clone()).await.unwrap();
@@ -636,7 +757,7 @@ mod tests {
             "fixture must land inside [{NEAR_DUPLICATE_FLOOR}, {CONTRADICTION_THRESHOLD}); got {dist}"
         );
 
-        let candidates = detect_contradiction(&store, &query, "agent-contra-pref", None, MemoryType::UserPreference, &[]).await;
+        let candidates = detected(&store, &query, "agent-contra-pref", None, MemoryType::UserPreference, &[]).await;
         assert!(
             candidates.contains(&stored_id),
             "a contradictory user_preference at an in-band distance must be detected"

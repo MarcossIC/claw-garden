@@ -527,9 +527,10 @@ fn format_hit_line(hit: &RankedHit, reader: &str) -> String {
 
 /// Printed once above the pairs: it is the same for every one of them.
 const CONFLICT_NOTE: &str = "\
-NOTE: these memories contradict each other, and which one holds is not settled yet.
+NOTE: these memories say close things and may conflict; the user has not said which holds.
 Before a decision that depends on them, ask the user.
-With the answer, call resolve_conflict (keep = the one that holds, other = the other one).";
+With the answer, call resolve_conflict: verdict supersedes with keep = the one that holds, \
+or compatible or scoped (with a reason) when both hold.";
 
 /// Orders pairs by the earliest printed hit among their sides and keeps the
 /// first `cap`, returning how many were left out. The query cannot order them:
@@ -935,7 +936,7 @@ mod tests {
     fn the_conflict_note_names_the_tool() {
         let block = format_conflict_block(&[pair(11, 22)], &HashMap::new(), 0);
         let note: Vec<&str> = block.lines().take_while(|l| !l.starts_with("NEW ")).collect();
-        assert!(note.iter().any(|l| l.contains("resolve_conflict (keep = the one that holds, other = the other one)")), "{block}");
+        assert!(note.iter().any(|l| l.contains("resolve_conflict: verdict supersedes with keep = the one that holds")), "{block}");
     }
 
     /// Everything else the agent reads from clawg is in English.
@@ -944,8 +945,21 @@ mod tests {
         let block = format_conflict_block(&[pair(11, 22)], &HashMap::new(), 2);
         let note: String = block.lines().take_while(|l| !l.starts_with("NEW ")).collect::<Vec<_>>().join("\n");
         assert!(note.is_ascii(), "{note}");
-        assert!(note.contains("contradict each other") && note.contains("ask the user"), "{note}");
+        assert!(note.contains("ask the user"), "{note}");
         assert_eq!(block.lines().last(), Some("(+2 more conflicts not shown)"), "{block}");
+    }
+
+    /// The detector measures closeness; the note must not state as fact a
+    /// contradiction nobody confirmed.
+    #[test]
+    fn the_conflict_note_does_not_claim_a_contradiction() {
+        let block = format_conflict_block(&[pair(11, 22)], &HashMap::new(), 0);
+        let note: String = block.lines().take_while(|l| !l.starts_with("NEW ")).collect::<Vec<_>>().join("\n");
+        assert!(!note.contains("contradict"), "{note}");
+        assert!(note.contains("may conflict"), "{note}");
+        for verdict in ["supersedes", "compatible", "scoped"] {
+            assert!(note.contains(verdict), "{verdict}: {note}");
+        }
     }
 
     /// A conflict on a standing preference would otherwise take the cap on

@@ -32,7 +32,7 @@ use clawg_core::memory::admin::{
 };
 use clawg_core::memory::backup::Reason;
 use clawg_core::memory::bootstrap::EmbedderStatus;
-use clawg_core::memory::dispute::{resolve_dispute_core, Outcome, Resolution, ResolveError};
+use clawg_core::memory::dispute::{judge_pair, open_pairs, resolve_dispute_core, OpenPairs, Outcome, Resolution, ResolveError, Verdict};
 use clawg_core::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use clawg_core::memory::project_docs::{self, DocHit, DocIndexError, RefreshOutcome};
 use clawg_core::memory::worker::{
@@ -481,14 +481,35 @@ pub struct SaveBody {
     /// The kinds of secret masked out of the content before it was stored.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub redacted: Vec<&'static str>,
+    /// The earlier memories the contradiction detector paired with this save.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<RelatedMemory>,
     /// The id this save is recorded under until it is stored.
     pub operation_id: String,
 }
 
 impl SaveBody {
     fn queued(reason: &'static str, operation_id: String) -> Self {
-        Self { status: "queued", reason: Some(reason), memories: None, redacted: Vec::new(), operation_id }
+        Self {
+            status: "queued",
+            reason: Some(reason),
+            memories: None,
+            redacted: Vec::new(),
+            related: Vec::new(),
+            operation_id,
+        }
     }
+}
+
+/// An earlier `memory` row a save was found close to. `escalated` says the
+/// pair waits for the user in ACTIVE CONFLICTS; otherwise it waits for the
+/// caller's own verdict.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RelatedMemory {
+    pub kind: &'static str,
+    pub id: i64,
+    pub escalated: bool,
+    pub excerpt: String,
 }
 
 /// Longest `operation_id` a caller may send.
@@ -626,6 +647,31 @@ pub struct ResolveRequest {
     pub agent_id: Option<String>,
 }
 
+/// A verdict on a pair the contradiction detector found.
+#[derive(Debug, Deserialize)]
+pub struct JudgeRequest {
+    pub keep: i64,
+    pub other: i64,
+    /// `supersedes`, `compatible`, `scoped` or `conflicts`.
+    pub verdict: String,
+    /// Why, required for `scoped`.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Scopes the verdict to this agent's rows, as [`OwnerQuery`] does.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisputesQuery {
+    #[serde(default)]
+    pub agent_id: Option<String>,
+}
+
+/// How many pending pairs `GET /v1/disputes` names.
+const OPEN_PAIRS_SHOWN: usize = 5;
+
 // ── Router ──────────────────────────────────────────────────────────────────
 
 /// Builds the daemon's router.
@@ -640,7 +686,9 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         )
         .route("/memories/{kind}/{id}/save", get(get_save))
         .route("/memories/{kind}/{id}/restore", post(restore_memory))
+        .route("/disputes", get(disputes))
         .route("/disputes/resolve", post(resolve_dispute))
+        .route("/disputes/judge", post(judge_dispute))
         .route("/synthesis", post(synthesis))
         .route("/stats", get(stats))
         .route("/backup", post(backup))
@@ -764,6 +812,11 @@ fn save_response(
                     reason: None,
                     memories: Some(memories),
                     redacted: masked_kinds(masked, &report.redacted),
+                    related: report
+                        .related
+                        .into_iter()
+                        .map(|c| RelatedMemory { kind: "memory", id: c.id, escalated: c.escalated, excerpt: c.excerpt })
+                        .collect(),
                     operation_id,
                 },
             ));
@@ -1154,6 +1207,18 @@ async fn restore_memory(
     }
 }
 
+/// The answer every verdict route gives a refused one.
+fn resolve_error(e: ResolveError) -> ApiError {
+    match e {
+            ResolveError::SameRow | ResolveError::ReasonRequired => ApiError::bad_request(e.to_string()),
+            ResolveError::NotFound(_) => ApiError::not_found(e.to_string()),
+            ResolveError::NotInDispute { .. }
+            | ResolveError::SupersededElsewhere { .. }
+            | ResolveError::NeedsUser { .. } => ApiError::conflict(e.to_string()),
+            ResolveError::Store(_) => ApiError::internal(e),
+    }
+}
+
 async fn resolve_dispute(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<ResolveRequest>,
@@ -1162,14 +1227,31 @@ async fn resolve_dispute(
     resolve_dispute_core(&app.runtime.store, body.keep, body.other, outcome, body.agent_id.as_deref())
         .await
         .map(Json)
-        .map_err(|e| match e {
-            ResolveError::SameRow => ApiError::bad_request(e.to_string()),
-            ResolveError::NotFound(_) => ApiError::not_found(e.to_string()),
-            ResolveError::NotInDispute { .. } | ResolveError::SupersededElsewhere { .. } => {
-                ApiError::conflict(e.to_string())
-            }
-            ResolveError::Store(_) => ApiError::internal(e),
-        })
+        .map_err(resolve_error)
+}
+
+async fn judge_dispute(
+    State(app): State<Arc<AppCtx>>,
+    Json(body): Json<JudgeRequest>,
+) -> ApiResult<Json<Resolution>> {
+    let verdict: Verdict = body.verdict.parse().map_err(|e: clawg_core::memory::dispute::UnknownVerdict| {
+        ApiError::bad_request(e.to_string())
+    })?;
+    judge_pair(&app.runtime.store, body.keep, body.other, verdict, body.reason, body.agent_id.as_deref())
+        .await
+        .map(Json)
+        .map_err(resolve_error)
+}
+
+/// The pairs not judged yet, counted, with the oldest pending ones.
+async fn disputes(
+    State(app): State<Arc<AppCtx>>,
+    Query(q): Query<DisputesQuery>,
+) -> ApiResult<Json<OpenPairs>> {
+    open_pairs(&app.runtime.store, q.agent_id.as_deref(), OPEN_PAIRS_SHOWN)
+        .await
+        .map(Json)
+        .map_err(ApiError::internal)
 }
 
 #[derive(Debug, Serialize)]
@@ -1483,6 +1565,37 @@ mod tests {
     }
 
     #[test]
+    fn save_body_leaves_related_out_when_empty() {
+        let (_, body) = save_response(
+            Confirmation::Reported(IngestReport { memories: vec![chunk(57, ChunkOutcome::Inserted)], ..Default::default() }),
+            "op-1".into(),
+            &[],
+        )
+        .expect("a clean report is a success");
+        let json = serde_json::to_value(&body).unwrap();
+        assert!(json.get("related").is_none(), "{json}");
+
+        let candidate = clawg_core::memory::Candidate {
+            id: 12,
+            distance: 0.3,
+            escalated: true,
+            excerpt: "Ports".into(),
+        };
+        let (_, body) = save_response(
+            Confirmation::Reported(IngestReport {
+                memories: vec![chunk(57, ChunkOutcome::Inserted)],
+                related: vec![candidate],
+                ..Default::default()
+            }),
+            "op-1".into(),
+            &[],
+        )
+        .expect("a clean report is a success");
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["related"], serde_json::json!([{ "kind": "memory", "id": 12, "escalated": true, "excerpt": "Ports" }]));
+    }
+
+    #[test]
     fn a_confirmed_save_lists_the_kinds_it_masked() {
         let (_, body) = save_response(Confirmation::Reported(IngestReport {
             memories: vec![chunk(57, ChunkOutcome::Inserted)],
@@ -1491,6 +1604,7 @@ mod tests {
                 clawg_core::memory::redact::SecretKind::GithubToken,
                 clawg_core::memory::redact::SecretKind::Jwt,
             ],
+            ..Default::default()
         }), "op-1".into(), &[])
         .expect("a clean report is a success");
         assert_eq!(body.redacted, vec!["github_token", "jwt"]);

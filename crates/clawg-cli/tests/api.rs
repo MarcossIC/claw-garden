@@ -1502,6 +1502,82 @@ async fn resolve_can_keep_both_rows() {
 }
 
 #[tokio::test]
+async fn resolve_with_keep_both_still_works() {
+    let h = Harness::start().await;
+    let (old, new) = seed_dispute(&h).await;
+
+    let (status, body) = h
+        .post_json("/v1/disputes/resolve", json!({ "keep": new, "other": old, "keep_both": true }))
+        .await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["pair"], "judged", "{body}");
+}
+
+#[tokio::test]
+async fn judge_records_a_verdict() {
+    let h = Harness::start().await;
+    let (old, new) = seed_dispute(&h).await;
+
+    let (status, body) = h
+        .post_json(
+            "/v1/disputes/judge",
+            json!({ "keep": old, "other": new, "verdict": "scoped", "reason": "8080 is dev, 9090 is prod", "agent_id": "agent-http" }),
+        )
+        .await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["keep"]["status"], "active");
+    assert_eq!(body["other"]["status"], "active");
+    assert_eq!(body["pair"], "judged");
+    let (status, body) = h
+        .post_json("/v1/disputes/judge", json!({ "keep": old, "other": new, "verdict": "keep_both" }))
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body["error"].as_str().is_some_and(|e| e.contains("supersedes, compatible, scoped, conflicts")), "{body}");
+}
+
+#[tokio::test]
+async fn judge_refuses_scoped_without_reason() {
+    let h = Harness::start().await;
+    let (old, new) = seed_dispute(&h).await;
+
+    let (status, body) =
+        h.post_json("/v1/disputes/judge", json!({ "keep": old, "other": new, "verdict": "scoped" })).await;
+
+    assert_eq!(status, 400, "{body}");
+    let (_, listed) = h.get_json("/v1/memories?kind=memory&status=disputed").await;
+    assert_eq!(listed["items"][0]["id"], new, "a refused verdict changes nothing: {listed}");
+}
+
+#[tokio::test]
+async fn disputes_lists_pending_pairs_of_the_agent() {
+    let h = Harness::start().await;
+    let (old, new) = seed_dispute(&h).await;
+    h.ctx
+        .runtime
+        .store
+        .conn
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (?1, ?2, 0.3, 'pending', 1)",
+                [new, old],
+            )
+        })
+        .await
+        .expect("note the pair");
+
+    let (status, body) = h.get_json("/v1/disputes?agent_id=agent-http").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["pending"], 1, "{body}");
+    assert_eq!(body["pairs"][0]["new_id"], new, "{body}");
+    assert_eq!(body["pairs"][0]["old_id"], old, "{body}");
+
+    let (_, other) = h.get_json("/v1/disputes?agent_id=agent-other").await;
+    assert_eq!(other["pending"], 0, "{other}");
+}
+
+#[tokio::test]
 async fn resolve_rejects_the_same_row() {
     let h = Harness::start().await;
     let (_, new) = seed_dispute(&h).await;
@@ -1525,10 +1601,13 @@ async fn resolve_unknown_row_is_not_found() {
 #[tokio::test]
 async fn resolve_rows_without_a_dispute_conflict() {
     let h = Harness::start().await;
-    let (old, new) = seed_dispute(&h).await;
-    h.post_json("/v1/disputes/resolve", json!({ "keep": new, "other": old, "keep_both": true })).await;
+    for content in ["the API listens on port 8080", "the logo is green"] {
+        h.post_json("/v1/memories", json!({ "content": content, "agent_id": "agent-http" })).await;
+    }
+    let items = h.wait_for_rows("memory", 2).await;
+    let (a, b) = (items[0]["id"].as_i64().expect("id"), items[1]["id"].as_i64().expect("id"));
 
-    let (status, body) = h.post_json("/v1/disputes/resolve", json!({ "keep": new, "other": old })).await;
+    let (status, body) = h.post_json("/v1/disputes/resolve", json!({ "keep": a, "other": b })).await;
 
     assert_eq!(status, 409, "{body}");
 }

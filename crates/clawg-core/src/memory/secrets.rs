@@ -106,6 +106,7 @@ pub fn purge(base_dir: &Path, id: i64) -> Result<Purged, MemoryError> {
     // Unlike a soft delete, the id can be handed to a later row, which must
     // not inherit this one's provenance.
     tx.execute("DELETE FROM memory_derivation WHERE memory_id = ?1 OR source_id = ?1", [id])?;
+    tx.execute("DELETE FROM memory_conflict WHERE new_id = ?1 OR old_id = ?1", [id])?;
     // A save not stored yet, or that failed after it was accepted, holds the
     // text in the outbox; a row stored from a long save is one of its pieces.
     tx.execute("DELETE FROM ingest_outbox WHERE instr(content, ?1) > 0", [&content])?;
@@ -397,6 +398,34 @@ mod tests {
         let status: String =
             c.query_row("SELECT status FROM memory WHERE id = ?1", [challenger], |r| r.get(0)).unwrap();
         assert_eq!(status, "active");
+    }
+
+    #[tokio::test]
+    async fn purging_drops_the_pairs_of_the_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+        let old = insert(&store, "the deploy runs on fridays".to_string()).await;
+        let purged = insert(&store, "the deploy runs on mondays".to_string()).await;
+        let newer = insert(&store, "the deploy runs on sundays".to_string()).await;
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) \
+                     VALUES (?2, ?1, 0.3, 'pending', 0), (?3, ?2, 0.3, 'judged', 0), (?3, ?1, 0.3, 'pending', 0)",
+                    [old, purged, newer],
+                )
+            })
+            .await
+            .unwrap();
+        store.conn.clone().close().await.unwrap();
+        drop(store);
+
+        purge(dir.path(), purged).unwrap();
+
+        let sql = "SELECT count(*) FROM memory_conflict WHERE new_id = ?1 OR old_id = ?1";
+        assert_eq!(count(dir.path(), sql, purged), 0);
+        assert_eq!(count(dir.path(), sql, old), 1, "the pair of two other rows stays");
     }
 
     #[tokio::test]

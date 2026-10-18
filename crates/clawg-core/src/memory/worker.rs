@@ -17,6 +17,7 @@ use crate::memory::chunker::{
     embedding_text, select_chunker, ChatChunker, Chunk, ChunkerKind, SaveSplit,
 };
 use crate::memory::outbox::{resume_positions, Claimed, NotedPiece, OutboxNote};
+use crate::memory::contradiction::{Candidate, SaveKey};
 use crate::memory::pieces::StoredPiece;
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::events::{MemoryEvent, MemorySource};
@@ -75,12 +76,14 @@ impl From<MemoryEvent> for IngestRequest {
 /// Both halves at once rather than a `Result`: a failure part-way through a
 /// multi-chunk event leaves earlier chunks written, and the caller needs
 /// their ids to clean up or retry only the rest.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct IngestReport {
     pub memories: Vec<SavedChunk>,
     pub failure: Option<IngestFailure>,
     /// The kinds of secret masked out of the event before it was chunked.
     pub redacted: Vec<SecretKind>,
+    /// The earlier rows the detector paired with this save, one per row.
+    pub related: Vec<Candidate>,
 }
 
 /// Backlog size at which the ingest channel is worth reporting. Events are
@@ -623,7 +626,7 @@ async fn ingest_pieces(
             evt.agent_id
         );
         let report =
-            IngestReport { memories: vec![], failure: Some(IngestFailure::EmbedderUnavailable), redacted };
+            IngestReport { failure: Some(IngestFailure::EmbedderUnavailable), redacted, ..Default::default() };
         return (report, Vec::new());
     };
 
@@ -691,6 +694,7 @@ async fn ingest_pieces(
         memories: stored.iter().flatten().copied().collect(),
         failure,
         redacted: redacted.clone(),
+        related: Vec::new(),
     };
     let pieces = |stored: &[Option<SavedChunk>], contexts: &[String]| -> Vec<StoredPiece> {
         stored
@@ -742,19 +746,26 @@ async fn ingest_pieces(
     // same way: it restates them, it does not contradict them.
     let mut siblings: Vec<i64> = evt.sources().to_vec();
     siblings.extend(stored.iter().flatten().filter(|s| s.outcome == ChunkOutcome::Inserted).map(|s| s.id));
+    // A long save probes the same earlier save from several of its chunks;
+    // the first chunk that finds it holds the pair, so two saves pair once.
+    let mut paired: HashSet<SaveKey> = HashSet::new();
+    let mut related: Vec<Candidate> = Vec::new();
     for ((position, pending), vec) in survivors.into_iter().zip(vectors) {
         let PendingChunk { chunk, content_hash, multiplicity } = pending;
         // The contradiction hook runs between embed and insert: it needs the
         // freshly computed embedding to find near-duplicate candidates via
-        // KNN, and its result (which existing rows this chunk disputes) must
-        // be attached to the record before it is written, not after.
+        // KNN, and its result (which existing rows this chunk is close to)
+        // must be attached to the record before it is written, not after.
         let mut record = NewMemoryRecord::from_event_and_chunk(evt, &chunk);
-        let disputed = crate::memory::contradiction::detect_contradiction(
-            store, &vec, &evt.agent_id, evt.project_id.as_deref(), record.memory_type, &siblings,
-        ).await;
-        if !disputed.is_empty() {
-            record.disputed_against = Some(disputed);
-        }
+        record.candidates = crate::memory::contradiction::detect_contradiction(
+            store, &vec, &chunk.text, &evt.agent_id, evt.project_id.as_deref(), record.memory_type, &siblings,
+        )
+        .await
+        .into_iter()
+        .filter(|(save, _)| paired.insert(*save))
+        .map(|(_, candidate)| candidate)
+        .collect();
+        let candidates = record.candidates.clone();
         let note = note_for(track.as_ref(), &noted, position, &content_hash, true, context(position));
         let id = match store.insert_noting(record, vec, note).await {
             Ok(id) => id,
@@ -775,13 +786,14 @@ async fn ingest_pieces(
         stored[position] = Some(SavedChunk { id, outcome: ChunkOutcome::Inserted });
         contexts[position] = context(position).to_string();
         siblings.push(id);
+        related.extend(candidates);
         // The extra copies now find the row this iteration just wrote and
         // take the same branch a copy from a later event takes.
         for _ in 1..multiplicity {
             absorb_duplicate(store, evt, &content_hash, absorbed, |_| None).await;
         }
     }
-    (report(&stored, None), pieces(&stored, &contexts))
+    (IngestReport { related, ..report(&stored, None) }, pieces(&stored, &contexts))
 }
 
 /// Links the pieces of a finished save of two or more that no outbox row
@@ -1801,8 +1813,75 @@ mod tests {
         }
     }
 
+    async fn pairs(store: &MemoryStore) -> Vec<(i64, i64, String)> {
+        store
+            .conn
+            .call(|c| {
+                let mut stmt = c.prepare("SELECT new_id, old_id, state FROM memory_conflict ORDER BY new_id, old_id")?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect();
+                rows
+            })
+            .await
+            .unwrap()
+    }
+
+    fn explicit(content: &str, memory_type: &str) -> MemoryEvent {
+        MemoryEvent { memory_type: Some(memory_type.into()), ..explicit_fact(content) }
+    }
+
     #[tokio::test]
-    async fn a_chunk_still_disputes_an_older_row() {
+    async fn a_close_fact_is_a_pending_candidate_and_both_stay_active() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let older = PlacedEmbedder { vectors: vec![turned(2, 0.2)] };
+        let older = process_with(Arc::new(older), &store, &explicit_fact("the build uses cargo")).await.memories[0].id;
+        let newer = PlacedEmbedder { vectors: vec![turned(1, 0.0)] };
+        let newer = process_with(Arc::new(newer), &store, &explicit_fact("the build uses make")).await.memories[0].id;
+
+        assert_eq!(disputes_of(&store, older).await, ("active".to_string(), None));
+        assert_eq!(disputes_of(&store, newer).await, ("active".to_string(), None));
+        assert_eq!(pairs(&store).await, vec![(newer, older, "pending".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn a_close_preference_escalates_and_disputes() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let older = PlacedEmbedder { vectors: vec![turned(2, 0.2)] };
+        let older = process_with(Arc::new(older), &store, &explicit("answer in English", "user_preference"))
+            .await
+            .memories[0]
+            .id;
+        let newer = PlacedEmbedder { vectors: vec![turned(1, 0.0)] };
+        let newer = process_with(Arc::new(newer), &store, &explicit("answer in Spanish", "user_preference"))
+            .await
+            .memories[0]
+            .id;
+
+        assert_eq!(disputes_of(&store, newer).await, ("disputed".to_string(), Some(format!("[{older}]"))));
+        assert_eq!(pairs(&store).await, vec![(newer, older, "escalated".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_save_names_its_candidates() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let older = PlacedEmbedder { vectors: vec![turned(2, 0.2)] };
+        let older = process_with(Arc::new(older), &store, &explicit_fact("Build tool\nthe build uses cargo"))
+            .await
+            .memories[0]
+            .id;
+        let far = PlacedEmbedder { vectors: vec![turned(3, 1.5)] };
+        let lonely = process_with(Arc::new(far), &store, &explicit_fact("the logo is green")).await;
+        assert!(lonely.related.is_empty(), "{:?}", lonely.related);
+
+        let newer = PlacedEmbedder { vectors: vec![turned(1, 0.0)] };
+        let report = process_with(Arc::new(newer), &store, &explicit_fact("the build uses make")).await;
+
+        assert_eq!(report.related.len(), 1, "{:?}", report.related);
+        let related = &report.related[0];
+        assert_eq!((related.id, related.escalated, related.excerpt.as_str()), (older, false, "Build tool"));
+    }
+
+    #[tokio::test]
+    async fn a_chunk_still_pairs_with_an_older_row() {
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
         let older = PlacedEmbedder { vectors: vec![turned(2, 0.2)] };
         let older = process_with(Arc::new(older), &store, &explicit_fact("the build uses cargo")).await;
@@ -1820,8 +1899,37 @@ mod tests {
         assert_eq!(report.failure, None);
         assert_eq!(report.memories.len(), chunks);
         for saved in &report.memories {
-            assert_eq!(disputes_of(&store, saved.id).await, ("disputed".to_string(), Some(format!("[{older}]"))));
+            assert_eq!(disputes_of(&store, saved.id).await.0, "active");
         }
+        let first = report.memories[0].id;
+        assert_eq!(pairs(&store).await, vec![(first, older, "pending".to_string())], "one pair per pair of saves");
+    }
+
+    #[tokio::test]
+    async fn a_long_save_pairs_once_with_an_earlier_save() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let content = distinct_text(400);
+        let chunks = chunk_count(&content);
+        assert!(chunks >= 3, "fixture must split into several chunks, got {chunks}");
+        let earlier = PlacedEmbedder { vectors: (0..chunks).map(|i| turned(1, 0.15 + 0.01 * i as f32)).collect() };
+        let earlier = process_with(Arc::new(earlier), &store, &explicit_fact(&content)).await;
+        let pieces = earlier
+            .memories
+            .iter()
+            .map(|m| StoredPiece { memory_id: m.id, context: String::new() })
+            .collect();
+        store.link_pieces(pieces).await.unwrap();
+
+        let rewrite = distinct_text(400).replace('w', "v");
+        let later = PlacedEmbedder { vectors: (0..chunks).map(|i| turned(2, 0.15 + 0.01 * i as f32)).collect() };
+        let later = process_with(Arc::new(later), &store, &explicit_fact(&rewrite)).await;
+
+        assert_eq!(later.failure, None);
+        let found = pairs(&store).await;
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, later.memories[0].id);
+        assert!(earlier.memories.iter().any(|m| m.id == found[0].1), "{found:?}");
+        assert_eq!(later.related.len(), 1, "{:?}", later.related);
     }
 
     // ── The pieces of a long save ───────────────────────────────────────────
@@ -2061,10 +2169,9 @@ mod tests {
         .await;
 
         assert_eq!(report.failure, None);
-        assert_eq!(
-            disputes_of(&store, report.memories[0].id).await,
-            ("disputed".to_string(), Some(format!("[{other}]")))
-        );
+        let conclusion = report.memories[0].id;
+        let of_conclusion: Vec<_> = pairs(&store).await.into_iter().filter(|p| p.0 == conclusion).collect();
+        assert_eq!(of_conclusion, vec![(conclusion, other, "pending".to_string())]);
     }
 
     #[tokio::test]

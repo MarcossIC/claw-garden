@@ -1,0 +1,776 @@
+{
+ "version": 1,
+ "description": "Hand-written pairs of memories for conflict-eval: each pair is saved old then new in its own store, by one agent, and the class says what the new one is to the old one.",
+ "pairs": [
+  {
+   "class": "contradiction",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "The HTTP API listens on port 8080.",
+   "new": "The HTTP API listens on port 9090."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "The project stores memories in PostgreSQL.",
+   "new": "The project stores memories in SQLite."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "CI runs clippy on every pull request.",
+   "new": "CI does not run clippy on pull requests."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "The daemon binds to 0.0.0.0 so other machines can reach it.",
+   "new": "The daemon binds only to 127.0.0.1 and is not reachable from other machines."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "Migrations are applied with refinery at startup.",
+   "new": "Migrations are applied with sqlx at startup."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "The embedding model is multilingual-e5-small.",
+   "new": "The embedding model is all-MiniLM-L6-v2."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "Release builds strip debug symbols.",
+   "new": "Release builds keep debug symbols."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "The ingest queue holds at most 256 events.",
+   "new": "The ingest queue holds at most 1024 events."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "Tests run with cargo nextest.",
+   "new": "Tests run with plain cargo test, not nextest."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "load_index reads the whole WAL before answering.",
+   "new": "load_index never reads the WAL before answering."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "The bearer token is regenerated on every daemon start.",
+   "new": "The bearer token is kept across daemon restarts."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "Search results are capped at 10 hits.",
+   "new": "Search results are capped at 25 hits."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "The workspace uses Rust edition 2021.",
+   "new": "The workspace uses Rust edition 2024."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "Backups are written to <data>/backups.",
+   "new": "Backups are written to <data>/snapshots."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "user_preference",
+   "lang": "en",
+   "old": "Always answer the user in English.",
+   "new": "Always answer the user in Spanish."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "user_preference",
+   "lang": "en",
+   "old": "Use tabs for indentation in Go files.",
+   "new": "Use spaces for indentation in Go files."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "user_preference",
+   "lang": "en",
+   "old": "Prefer squash merges for pull requests.",
+   "new": "Prefer rebase merges for pull requests, never squash."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "architectural_decision",
+   "lang": "en",
+   "old": "Decision: the bridge starts a daemon when none is running.",
+   "new": "Decision: the bridge never starts a daemon; the user starts it."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "architectural_decision",
+   "lang": "en",
+   "old": "Decision: deleted memories are kept with deleted_at, never removed.",
+   "new": "Decision: deleted memories are removed from the table right away."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "El proyecto usa PostgreSQL.",
+   "new": "El proyecto usa SQLite."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "El botón del diálogo dice Cerrar.",
+   "new": "El botón del diálogo dice Cancelar."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "La API escucha en el puerto 8080.",
+   "new": "La API escucha en el puerto 3000."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "El componente app-person-name-inputs valida el apellido.",
+   "new": "El componente app-person-name-inputs no valida el apellido."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "El formulario de alta es para persona física.",
+   "new": "El formulario de alta es para persona moral."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "Las migraciones se corren a mano antes de desplegar.",
+   "new": "Las migraciones se corren solas al arrancar el servicio."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "El timeout de las peticiones es de 30 segundos.",
+   "new": "El timeout de las peticiones es de 5 segundos."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "user_preference",
+   "lang": "es",
+   "old": "El usuario quiere los commits en español.",
+   "new": "El usuario quiere los commits en inglés."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "user_preference",
+   "lang": "es",
+   "old": "Usar voseo en las respuestas.",
+   "new": "No usar voseo en las respuestas; usar tuteo."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "architectural_decision",
+   "lang": "es",
+   "old": "Decisión: el caché vive en Redis.",
+   "new": "Decisión: el caché vive en memoria del proceso, sin Redis."
+  },
+  {
+   "class": "contradiction",
+   "memory_type": "architectural_decision",
+   "lang": "es",
+   "old": "Decisión: los ids de proyecto salen del remoto de git.",
+   "new": "Decisión: los ids de proyecto salen de la ruta del directorio, no del remoto."
+  },
+  {
+   "class": "update",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "The current version is 0.16.0.",
+   "new": "The current version is 0.17.0."
+  },
+  {
+   "class": "update",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "The golden set has 40 cases.",
+   "new": "The golden set now has 46 cases."
+  },
+  {
+   "class": "update",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "The default context budget is 6000 bytes.",
+   "new": "The default context budget was raised to 8000 bytes."
+  },
+  {
+   "class": "update",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "The embedder is unloaded after 5 idle minutes.",
+   "new": "The embedder is now unloaded after 10 idle minutes."
+  },
+  {
+   "class": "update",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "The latest migration is V14 ingest_outbox.",
+   "new": "The latest migration is now V15 memory_conflict."
+  },
+  {
+   "class": "update",
+   "memory_type": "architectural_decision",
+   "lang": "en",
+   "old": "Decision: long saves split at 424 tokens.",
+   "new": "Decision: long saves now split at 480 tokens, in pieces of 96."
+  },
+  {
+   "class": "update",
+   "memory_type": "user_preference",
+   "lang": "en",
+   "old": "Run the suite before every commit.",
+   "new": "Run the suite and clippy before every commit."
+  },
+  {
+   "class": "update",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "Recall@5 on the golden set is 0.61.",
+   "new": "Recall@5 on the golden set improved to 0.65."
+  },
+  {
+   "class": "update",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "El MCP expone once herramientas.",
+   "new": "El MCP ahora expone doce herramientas, con restore_memory."
+  },
+  {
+   "class": "update",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "El README dice que el puerto dev es 27380.",
+   "new": "El README se corrigió: el puerto dev es 27381."
+  },
+  {
+   "class": "update",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "El equipo despliega los viernes.",
+   "new": "Desde octubre el equipo despliega los martes."
+  },
+  {
+   "class": "update",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "La rama principal se llama master.",
+   "new": "La rama principal se renombró a main."
+  },
+  {
+   "class": "update",
+   "memory_type": "architectural_decision",
+   "lang": "es",
+   "old": "Decisión: el umbral de contradicción es 0,35.",
+   "new": "Decisión: el umbral de contradicción pasó a 0,42 con pooling mean."
+  },
+  {
+   "class": "update",
+   "memory_type": "user_preference",
+   "lang": "es",
+   "old": "El usuario revisa los PR por la tarde.",
+   "new": "El usuario ahora revisa los PR por la mañana."
+  },
+  {
+   "class": "update",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "El cliente usa la versión 2.1 del SDK.",
+   "new": "El cliente se actualizó a la versión 3.0 del SDK."
+  },
+  {
+   "class": "complement",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "The HTTP API listens on port 8080.",
+   "new": "The HTTP API requires a bearer token on every /v1 route."
+  },
+  {
+   "class": "complement",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "Migrations are applied with refinery at startup.",
+   "new": "A pre-migration snapshot is written before refinery applies migrations."
+  },
+  {
+   "class": "complement",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "The daemon writes daemon.json in the data directory.",
+   "new": "The daemon also writes a bearer token file next to daemon.json."
+  },
+  {
+   "class": "complement",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "Search fills its KNN pool with distinct saves.",
+   "new": "Search labels the best piece of a long save as piece=K/N."
+  },
+  {
+   "class": "complement",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "CI runs clippy on every pull request.",
+   "new": "CI also runs the test suite on Windows."
+  },
+  {
+   "class": "complement",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "The embedding model is multilingual-e5-small.",
+   "new": "The embedding model vectors are pooled by mean, not CLS."
+  },
+  {
+   "class": "complement",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "Backups are written to <data>/backups.",
+   "new": "clawg restore replaces memory.db with a snapshot from <data>/backups."
+  },
+  {
+   "class": "complement",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "The ingest outbox row is written with synchronous FULL.",
+   "new": "The rest of the store keeps synchronous NORMAL."
+  },
+  {
+   "class": "complement",
+   "memory_type": "user_preference",
+   "lang": "en",
+   "old": "Always answer the user in English.",
+   "new": "Keep answers short and skip the preamble."
+  },
+  {
+   "class": "complement",
+   "memory_type": "architectural_decision",
+   "lang": "en",
+   "old": "Decision: deleted memories are kept with deleted_at.",
+   "new": "Decision: purge removes one deleted row for good, on request."
+  },
+  {
+   "class": "complement",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "El proyecto usa PostgreSQL.",
+   "new": "El proyecto tiene réplicas de lectura en PostgreSQL."
+  },
+  {
+   "class": "complement",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "La API escucha en el puerto 8080.",
+   "new": "La API devuelve 401 sin el token."
+  },
+  {
+   "class": "complement",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "El formulario de alta es para persona física.",
+   "new": "El formulario de alta pide el RFC con homoclave."
+  },
+  {
+   "class": "complement",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "Las migraciones se corren solas al arrancar.",
+   "new": "Antes de migrar se guarda una copia en backups."
+  },
+  {
+   "class": "complement",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "El componente app-person-name-inputs valida el apellido.",
+   "new": "El componente app-person-name-inputs muestra el error debajo del campo."
+  },
+  {
+   "class": "complement",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "El equipo despliega los martes.",
+   "new": "El despliegue lo aprueba el líder técnico."
+  },
+  {
+   "class": "complement",
+   "memory_type": "user_preference",
+   "lang": "es",
+   "old": "El usuario quiere los commits en inglés.",
+   "new": "El usuario quiere commits atómicos con conventional commits."
+  },
+  {
+   "class": "complement",
+   "memory_type": "architectural_decision",
+   "lang": "es",
+   "old": "Decisión: el caché vive en Redis.",
+   "new": "Decisión: las claves del caché expiran a la hora."
+  },
+  {
+   "class": "complement",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "El timeout de las peticiones es de 30 segundos.",
+   "new": "Las peticiones se reintentan tres veces."
+  },
+  {
+   "class": "complement",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "La rama principal se llama main.",
+   "new": "Main está protegida y pide una revisión."
+  },
+  {
+   "class": "rephrase",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "The HTTP API listens on port 8080.",
+   "new": "Port 8080 is where the HTTP API listens."
+  },
+  {
+   "class": "rephrase",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "Migrations are applied with refinery at startup.",
+   "new": "At startup, refinery applies the migrations."
+  },
+  {
+   "class": "rephrase",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "CI runs clippy on every pull request.",
+   "new": "Every pull request gets a clippy run in CI."
+  },
+  {
+   "class": "rephrase",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "The daemon binds only to 127.0.0.1.",
+   "new": "The daemon listens on loopback only."
+  },
+  {
+   "class": "rephrase",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "Release builds strip debug symbols.",
+   "new": "Debug symbols are stripped from release builds."
+  },
+  {
+   "class": "rephrase",
+   "memory_type": "user_preference",
+   "lang": "en",
+   "old": "Always answer the user in English.",
+   "new": "The user wants every answer written in English."
+  },
+  {
+   "class": "rephrase",
+   "memory_type": "architectural_decision",
+   "lang": "en",
+   "old": "Decision: deleted memories are kept with deleted_at.",
+   "new": "Decision: a deleted memory stays in the table, marked by deleted_at."
+  },
+  {
+   "class": "rephrase",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "Search results are capped at 10 hits.",
+   "new": "No search returns more than 10 hits."
+  },
+  {
+   "class": "rephrase",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "El proyecto usa PostgreSQL.",
+   "new": "PostgreSQL es la base de datos del proyecto."
+  },
+  {
+   "class": "rephrase",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "La API escucha en el puerto 8080.",
+   "new": "El puerto de la API es el 8080."
+  },
+  {
+   "class": "rephrase",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "El botón del diálogo dice Cerrar.",
+   "new": "En el diálogo, el botón tiene el texto Cerrar."
+  },
+  {
+   "class": "rephrase",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "Las migraciones se corren solas al arrancar.",
+   "new": "Al arrancar, el servicio aplica las migraciones por sí mismo."
+  },
+  {
+   "class": "rephrase",
+   "memory_type": "user_preference",
+   "lang": "es",
+   "old": "Usar voseo en las respuestas.",
+   "new": "Las respuestas van con voseo."
+  },
+  {
+   "class": "rephrase",
+   "memory_type": "architectural_decision",
+   "lang": "es",
+   "old": "Decisión: el caché vive en Redis.",
+   "new": "Decisión: Redis guarda el caché."
+  },
+  {
+   "class": "rephrase",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "El timeout de las peticiones es de 30 segundos.",
+   "new": "Las peticiones vencen a los 30 segundos."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "The HTTP API listens on port 8080.",
+   "new": "The logo uses the brand green #2E7D32."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "Migrations are applied with refinery at startup.",
+   "new": "The docs site is built with mdBook."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "CI runs clippy on every pull request.",
+   "new": "The fake embedder is selected with CLAWG_TEST_EMBEDDER=fake."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "The daemon writes daemon.json in the data directory.",
+   "new": "Golden cases carry a query_lang field."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "Search results are capped at 10 hits.",
+   "new": "clawg doctor lists the clawg.exe files on PATH."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "The embedding model is multilingual-e5-small.",
+   "new": "sharing.json holds which agents hide which authors."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "Backups are written to <data>/backups.",
+   "new": "The MCP bridge reads clientInfo.name for the agent id."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "The ingest queue holds at most 256 events.",
+   "new": "The version lives in [workspace.package] of the root Cargo.toml."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "Release builds strip debug symbols.",
+   "new": "rag-eval --diff reports a paired p-value per metric."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "The bearer token is regenerated on every start.",
+   "new": "Project docs are split along the tree-sitter syntax tree."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "user_preference",
+   "lang": "en",
+   "old": "Use tabs for indentation in Go files.",
+   "new": "Write commit messages in the imperative mood."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "user_preference",
+   "lang": "en",
+   "old": "Prefer squash merges for pull requests.",
+   "new": "Show file paths relative to the repository root."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "architectural_decision",
+   "lang": "en",
+   "old": "Decision: the bridge starts a daemon when none is running.",
+   "new": "Decision: secrets are masked before a save is chunked."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "architectural_decision",
+   "lang": "en",
+   "old": "Decision: deleted memories are kept with deleted_at.",
+   "new": "Decision: a debug build refuses the prod profile."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "semantic_fact",
+   "lang": "en",
+   "old": "load_index reads the whole WAL before answering.",
+   "new": "parse_header rejects a version byte above 3."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "El proyecto usa PostgreSQL.",
+   "new": "El equipo de diseño trabaja en Figma."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "El botón del diálogo dice Cerrar.",
+   "new": "El servidor de staging se apaga los fines de semana."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "La API escucha en el puerto 8080.",
+   "new": "Las facturas se timbran con el PAC del proveedor."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "El componente app-person-name-inputs valida el apellido.",
+   "new": "El reporte mensual se manda el día 5."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "El formulario de alta es para persona física.",
+   "new": "Los logs se guardan 14 días."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "Las migraciones se corren a mano antes de desplegar.",
+   "new": "El onboarding de clientes tarda dos semanas."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "El timeout de las peticiones es de 30 segundos.",
+   "new": "La paleta usa tres tonos de azul."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "user_preference",
+   "lang": "es",
+   "old": "El usuario quiere los commits en español.",
+   "new": "El usuario prefiere tablas antes que listas largas."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "user_preference",
+   "lang": "es",
+   "old": "Usar voseo en las respuestas.",
+   "new": "Citar siempre la ruta y la línea del código."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "architectural_decision",
+   "lang": "es",
+   "old": "Decisión: el caché vive en Redis.",
+   "new": "Decisión: la autenticación usa OAuth con PKCE."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "architectural_decision",
+   "lang": "es",
+   "old": "Decisión: los ids de proyecto salen del remoto de git.",
+   "new": "Decisión: los reportes se generan en PDF."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "El equipo despliega los martes.",
+   "new": "La documentación interna vive en el wiki."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "La rama principal se llama main.",
+   "new": "El cliente móvil está hecho en Flutter."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "El cliente usa la versión 3.0 del SDK.",
+   "new": "Las pruebas de carga se corren con k6."
+  },
+  {
+   "class": "distinct",
+   "memory_type": "semantic_fact",
+   "lang": "es",
+   "old": "El MCP expone doce herramientas.",
+   "new": "El tablero de métricas se actualiza cada hora."
+  }
+ ]
+}
