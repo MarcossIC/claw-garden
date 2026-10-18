@@ -1,0 +1,61 @@
+name: Release
+
+# Runs only after CI finished for a push to main, never for a pull request: the
+# jobs below build and sign what is on the commit CI ran on, so nothing from a
+# fork can reach them. A version that already has its tag is left alone.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A release is built from a clean tree and published whole; two runs must not
+# race to create the same tag.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: plan
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-22.04
+    outputs:
+      publish: ${{ steps.plan.outputs.publish }}
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - id: plan
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "clawg-cli") | .version')
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "unexpected version: $version" >&2; exit 1 ;;
+          esac
+          remote="https://github.com/${GITHUB_REPOSITORY}.git"
+          existing=$(git ls-remote --tags --refs "$remote" "refs/tags/v${version}")
+          publish=true
+          if [ -n "$existing" ]; then
+            echo "v${version} is already published; nothing to do."
+            publish=false
+          else
+            latest=$(git ls-remote --tags --refs "$remote" 'refs/tags/v*' | sed 's|.*refs/tags/v||' | sort -V | tail -n 1)
+            if [ -n "$latest" ] && [ "$(printf '%s\n%s\n' "$latest" "$version" | sort -V | tail -n 1)" != "$version" ]; then
+              echo "${version} does not exceed the latest release ${latest}; nothing to do."
+              publish=false
+            fi
+          fi
+          {
+            echo "publish=${publish}"
+            echo "version=${version}"
+          } >> "$GITHUB_OUTPUT"

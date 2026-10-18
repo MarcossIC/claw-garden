@@ -196,3 +196,141 @@ fn reqwest_uses_rustls_with_the_system_roots() {
         assert!(!declaration.contains(feature), "reqwest must not enable `{feature}`: {declaration}");
     }
 }
+
+// The workflow tests read the files as text, line by line, like the manifest
+// tests above: a YAML parser would be a dependency with no other use. A
+// reformat that keeps the meaning can break them, and is fixed in the same commit.
+
+/// The lines of a workflow with comments removed: a whole-line comment becomes
+/// empty and a trailing ` #` comment is cut.
+fn workflow_code(name: &str) -> Vec<String> {
+    read_repo_file(&format!(".github/workflows/{name}"))
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with('#') {
+                String::new()
+            } else {
+                line.split(" #").next().unwrap_or(line).trim_end().to_string()
+            }
+        })
+        .collect()
+}
+
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+struct Job {
+    name: String,
+    lines: Vec<String>,
+}
+
+impl Job {
+    fn text(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    /// The value of the job's own `key:` (at the job's key indentation), with the
+    /// continuation lines of a folded or literal block joined by spaces.
+    fn key(&self, key: &str) -> Option<String> {
+        let prefix = format!("{key}:");
+        let at = self.lines.iter().position(|l| indent_of(l) == 4 && l.trim_start().starts_with(&prefix))?;
+        let mut value = self.lines[at].trim_start()[prefix.len()..].trim().to_string();
+        for line in &self.lines[at + 1..] {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if indent_of(line) <= 4 {
+                break;
+            }
+            value.push(' ');
+            value.push_str(line.trim());
+        }
+        Some(value)
+    }
+}
+
+fn jobs_of(lines: &[String]) -> Vec<Job> {
+    let mut jobs: Vec<Job> = Vec::new();
+    let mut inside = false;
+    for line in lines {
+        if line == "jobs:" {
+            inside = true;
+            continue;
+        }
+        if !inside || line.trim().is_empty() {
+            continue;
+        }
+        if indent_of(line) == 0 {
+            break;
+        }
+        if indent_of(line) == 2 && line.trim_end().ends_with(':') {
+            jobs.push(Job { name: line.trim().trim_end_matches(':').to_string(), lines: Vec::new() });
+            continue;
+        }
+        if let Some(job) = jobs.last_mut() {
+            job.lines.push(line.clone());
+        }
+    }
+    jobs
+}
+
+fn job<'a>(jobs: &'a [Job], name: &str) -> &'a Job {
+    jobs.iter().find(|j| j.name == name).unwrap_or_else(|| panic!("no job `{name}`"))
+}
+
+#[test]
+fn third_party_actions_are_pinned_to_a_commit() {
+    let raw = read_repo_file(".github/workflows/release.yml");
+    let mut seen = 0;
+    for (n, line) in raw.lines().enumerate() {
+        let Some(at) = line.find("uses:") else { continue };
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        let reference = line[at + "uses:".len()..].split_whitespace().next().unwrap_or("");
+        if reference.starts_with("./") {
+            continue;
+        }
+        let (_, pin) = reference.split_once('@').unwrap_or_else(|| panic!("release.yml:{}: `{reference}` has no @ref", n + 1));
+        let is_commit = pin.len() == 40 && pin.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        assert!(is_commit, "release.yml:{}: `{reference}` is not pinned to a full commit SHA", n + 1);
+        assert!(line.contains(" # "), "release.yml:{}: name the tag the SHA stands for in a trailing comment", n + 1);
+        seen += 1;
+    }
+    assert!(seen > 0, "release.yml uses no action at all");
+}
+
+#[test]
+fn the_release_workflow_publishes_only_for_a_successful_push_to_main() {
+    let lines = workflow_code("release.yml");
+    let has = |wanted: &str| lines.iter().any(|l| l.trim() == wanted);
+
+    assert!(has("workflow_run:") && has("workflows: [CI]") && has("types: [completed]") && has("branches: [main]"));
+    for other in ["pull_request", "pull_request_target", "push:", "workflow_dispatch", "schedule:"] {
+        assert!(!lines.iter().any(|l| l.trim_start().starts_with(other)), "release.yml must not be triggered by `{other}`");
+    }
+    let permissions = lines.iter().position(|l| l == "permissions:").expect("top-level permissions");
+    assert_eq!(lines[permissions + 1].trim(), "contents: read");
+    let concurrency = lines.iter().position(|l| l == "concurrency:").expect("top-level concurrency");
+    assert_eq!(lines[concurrency + 1].trim(), "group: release");
+    assert_eq!(lines[concurrency + 2].trim(), "cancel-in-progress: false");
+
+    let jobs = jobs_of(&lines);
+    let plan = job(&jobs, "plan");
+    let condition = plan.key("if").expect("the plan job is conditional");
+    for wanted in [
+        "github.event.workflow_run.conclusion == 'success'",
+        "github.event.workflow_run.event == 'push'",
+        "github.event.workflow_run.head_branch == 'main'",
+        "github.event.workflow_run.head_repository.full_name == github.repository",
+    ] {
+        assert!(condition.contains(wanted), "plan runs without `{wanted}`: {condition}");
+    }
+    let text = plan.text();
+    assert!(text.contains("ref: ${{ github.event.workflow_run.head_sha }}"), "plan must read the commit CI ran on");
+    assert!(text.contains("refs/tags/v"), "plan must look for the version's tag");
+    for other in jobs.iter().filter(|j| j.name != "plan") {
+        assert!(other.key("needs").is_some_and(|n| n.contains("plan")), "job `{}` must wait for plan", other.name);
+    }
+}
