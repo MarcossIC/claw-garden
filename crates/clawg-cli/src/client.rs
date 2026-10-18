@@ -334,6 +334,9 @@ pub struct SaveArgs {
     /// Left off the wire when absent, for the same reason.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topic_key: Option<String>,
+    /// Left off the wire when false, like `derived_from`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub user_stated: bool,
 }
 
 /// A row a save wrote or reinforced, as `POST /v1/memories` reports it.
@@ -1351,6 +1354,7 @@ pub(crate) mod tests {
             importance: Some(7.0),
             derived_from: Vec::new(),
             topic_key: None,
+            user_stated: false,
         })
         .await
         .expect("save");
@@ -1427,6 +1431,24 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn a_save_sends_user_stated_only_when_declared() {
+        let args = SaveArgs {
+            content: "use Postgres for the ledger".into(),
+            agent_id: "a".into(),
+            project_id: None,
+            memory_type: None,
+            importance: None,
+            derived_from: Vec::new(),
+            topic_key: None,
+            user_stated: false,
+        };
+        let undeclared = serde_json::to_value(&args).unwrap();
+        assert!(undeclared.get("user_stated").is_none(), "{undeclared}");
+        let declared = serde_json::to_value(SaveArgs { user_stated: true, ..args }).unwrap();
+        assert_eq!(declared["user_stated"], true, "{declared}");
+    }
+
     #[tokio::test]
     async fn save_returns_the_ids_the_daemon_reported() {
         let d = start_daemon().await;
@@ -1440,6 +1462,7 @@ pub(crate) mod tests {
             importance: None,
             derived_from: Vec::new(),
             topic_key: None,
+            user_stated: false,
         };
 
         let first = c.save(args.clone()).await.expect("save");
@@ -1742,6 +1765,7 @@ pub(crate) mod tests {
             importance: Some(6.0),
             derived_from: Vec::new(),
             topic_key: None,
+            user_stated: false,
         })
         .await
         .expect("save");

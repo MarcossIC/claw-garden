@@ -180,6 +180,11 @@ pub struct SaveMemoryArgs {
     /// saved under it, which stays in the history. Omit for a new topic.
     #[serde(default)]
     pub topic_key: Option<String>,
+    /// True only when the content is what the user said: their words or an
+    /// explicit instruction. Omit it for what you inferred, found or
+    /// concluded; never with derived_from.
+    #[serde(default)]
+    pub user_stated: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -711,6 +716,7 @@ impl ClawgMcp {
                         importance: args.importance,
                         derived_from: args.derived_from.clone().unwrap_or_default(),
                         topic_key: args.topic_key.clone(),
+                        user_stated: args.user_stated.unwrap_or(false),
                     })
                     .await
             })
@@ -1357,6 +1363,7 @@ mod tests {
             project_path: None,
             derived_from: None,
             topic_key: None,
+            user_stated: None,
         }
     }
 
@@ -1374,6 +1381,7 @@ mod tests {
                 importance: None,
                 derived_from: Vec::new(),
                 topic_key: None,
+                user_stated: false,
             })
             .await
             .expect("seed a legacy row");
@@ -1752,6 +1760,7 @@ mod tests {
                 importance: None,
                 derived_from: Vec::new(),
                 topic_key: None,
+                user_stated: false,
             })
             .await
             .expect("save");
@@ -1804,6 +1813,7 @@ mod tests {
                 importance: None,
                 derived_from: Vec::new(),
                 topic_key: None,
+                user_stated: false,
             })
             .await
             .expect("save");
@@ -2066,6 +2076,16 @@ mod tests {
         let schema = serde_json::to_string(&tool(&b, "save_memory").input_schema).expect("schema");
         assert!(schema.contains("derived_from"), "{schema}");
         assert!(schema.contains("synthesize"), "the field must say where its ids come from: {schema}");
+    }
+
+    /// The schema is the only place the model learns it may declare a save
+    /// as the user's, and when it must not.
+    #[tokio::test]
+    async fn the_save_schema_names_user_stated() {
+        let (b, _d) = bridge().await;
+        let schema = serde_json::to_string(&tool(&b, "save_memory").input_schema).expect("schema");
+        assert!(schema.contains("user_stated"), "{schema}");
+        assert!(schema.contains("inferred"), "the field must say what it is not for: {schema}");
     }
 
     #[tokio::test]
@@ -2419,6 +2439,7 @@ mod tests {
                     project_path: None,
                     derived_from: None,
                     topic_key: None,
+                    user_stated: None,
                 },
             )
             .await
@@ -2488,6 +2509,7 @@ mod tests {
                     project_path: None,
                     derived_from: None,
                     topic_key: None,
+                    user_stated: None,
                 },
             )
             .await
@@ -2730,7 +2752,7 @@ mod tests {
 
         let t = status("agent-mcp").await;
         assert!(t.contains("conflict candidates: 1 for you to judge, 0 waiting for the user"), "{t}");
-        assert!(t.contains(&format!("#{new} close to #{old}")), "{t}");
+        assert!(t.contains(&format!("#{new} inferred close to #{old} inferred")), "two undeclared saves: {t}");
         assert!(status("agent-other").await.ends_with("\nconflict candidates: none open"));
     }
 
@@ -3204,6 +3226,7 @@ mod tests {
                 project_path: Some("/some/elsewhere".into()),
                 derived_from: None,
                 topic_key: None,
+                user_stated: None,
             },
         )
         .await

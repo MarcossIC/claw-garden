@@ -96,6 +96,7 @@ fn explicit_event(content: &str, memory_type: Option<&str>, importance: Option<f
         importance,
         derived_from: Vec::new(),
         topic_key: None,
+        user_stated: false,
     }
 }
 
@@ -243,11 +244,10 @@ async fn explicit_overrides_reach_the_stored_row() {
     let worker = tokio::spawn(rt.ingest_worker(rx, tokio::sync::watch::channel(None).1));
 
     tx.try_send(
-        explicit_event(
-            "the team uses conventional commits",
-            Some("user_preference"),
-            Some(9.5),
-        )
+        MemoryEvent {
+            user_stated: true,
+            ..explicit_event("the team uses conventional commits", Some("user_preference"), Some(9.5))
+        }
         .into(),
     )
     .expect("send");

@@ -546,6 +546,9 @@ impl EvalIngest {
                 importance: Some(importance),
                 derived_from: Vec::new(),
                 topic_key: None,
+                // Sealed as every save was before provenance, so what the
+                // agent view reads matches the recorded baselines.
+                user_stated: true,
             }
             .into())
             .await

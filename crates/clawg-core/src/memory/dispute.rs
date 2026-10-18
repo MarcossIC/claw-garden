@@ -17,6 +17,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::memory::clock::TimestampMs;
+use crate::memory::provenance::mark;
 use crate::memory::{MemoryError, MemoryStore};
 
 /// How a dispute between two rows is closed.
@@ -396,6 +397,12 @@ pub struct OpenPair {
     pub old_id: i64,
     pub distance: Option<f64>,
     pub created_at: i64,
+    /// What a reader shows of each side's origin (`provenance::mark`);
+    /// absent from a daemon that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_mark: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_mark: Option<String>,
 }
 
 /// The pairs not judged yet, among live rows.
@@ -429,12 +436,24 @@ pub async fn open_pairs(store: &MemoryStore, owner: Option<&str>, limit: usize) 
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
             let mut stmt = c.prepare(&format!(
-                "SELECT p.new_id, p.old_id, p.distance, p.created_at {OPEN_PAIR_FROM} AND p.state = 'pending' \
+                "SELECT p.new_id, p.old_id, p.distance, p.created_at, n.source, n.created_by_type, \
+                 o.source, o.created_by_type {OPEN_PAIR_FROM} AND p.state = 'pending' \
                  ORDER BY p.created_at, p.new_id, p.old_id LIMIT ?2"
             ))?;
+            let side = |r: &rusqlite::Row<'_>, at: usize| -> rusqlite::Result<Option<String>> {
+                let (source, by): (String, String) = (r.get(at)?, r.get(at + 1)?);
+                Ok(mark(&source, &by).map(str::to_owned))
+            };
             let pairs = stmt
                 .query_map(rusqlite::params![owner, limit as i64], |r| {
-                    Ok(OpenPair { new_id: r.get(0)?, old_id: r.get(1)?, distance: r.get(2)?, created_at: r.get(3)? })
+                    Ok(OpenPair {
+                        new_id: r.get(0)?,
+                        old_id: r.get(1)?,
+                        distance: r.get(2)?,
+                        created_at: r.get(3)?,
+                        new_mark: side(r, 4)?,
+                        old_mark: side(r, 6)?,
+                    })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(OpenPairs { pending, escalated, pairs })
@@ -990,6 +1009,25 @@ mod tests {
         assert_eq!((open.pending, open.escalated), (1, 1));
         assert_eq!(open.pairs.iter().map(|p| (p.new_id, p.old_id)).collect::<Vec<_>>(), vec![(a, old)]);
         assert_eq!(open_pairs(&store, Some("agent-x"), 5).await.unwrap().pending, 0);
+    }
+
+    #[tokio::test]
+    async fn open_pairs_carry_each_sides_mark() {
+        let store = store().await;
+        let old = seed(&store, "use Postgres for the ledger", "active", &[], 0).await;
+        let new = seed(&store, "the ledger seems to use SQLite", "active", &[], 1).await;
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE memory SET created_by_type = 'agent' WHERE id = ?1", [new]))
+            .await
+            .unwrap();
+        note_pair(&store, new, old, "pending").await;
+
+        let open = open_pairs(&store, Some("agent-d"), 5).await.unwrap();
+
+        let pair = &open.pairs[0];
+        assert_eq!((pair.new_mark.as_deref(), pair.old_mark.as_deref()), (Some("inferred"), None));
+        assert_eq!(pair_of(&store, new, old).await.state, "pending", "the origin judges nothing");
     }
 
     #[test]

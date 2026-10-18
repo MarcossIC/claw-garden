@@ -13,6 +13,7 @@ use std::path::Path;
 
 use clawg_core::memory::dispute::{OpenPairs, Resolution, ResolvedRow};
 use clawg_core::memory::prompt_builder::SHARED_NOTE;
+use clawg_core::memory::provenance::mark;
 use clawg_core::memory::sharing::{Reach, SharingError, SharingPolicy};
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
@@ -121,6 +122,14 @@ pub fn format_resolution(r: &Resolution) -> String {
     }
 }
 
+/// One side of a pair: its id, then what is shown of its origin.
+fn side((id, mark): (i64, Option<&str>)) -> String {
+    match mark {
+        Some(mark) => format!("#{id} {mark}"),
+        None => format!("#{id}"),
+    }
+}
+
 /// What `memory_status` says about the pairs the agent has not judged.
 pub fn format_open_pairs(open: &OpenPairs) -> String {
     if open.pending == 0 && open.escalated == 0 {
@@ -131,7 +140,12 @@ pub fn format_open_pairs(open: &OpenPairs) -> String {
         open.pending, open.escalated
     );
     for p in &open.pairs {
-        out.push_str(&format!("\n  #{} close to #{}", p.new_id, p.old_id));
+        let new = (p.new_id, p.new_mark.as_deref());
+        let old = (p.old_id, p.old_mark.as_deref());
+        // A side that may be the user's goes first: an inference is the one
+        // more likely to give way, though the agent still judges the pair.
+        let (first, second) = if new.1.is_some() && old.1.is_none() { (old, new) } else { (new, old) };
+        out.push_str(&format!("\n  {} close to {}", side(first), side(second)));
     }
     if open.pending > 0 {
         out.push_str(
@@ -246,8 +260,12 @@ If an existing conclusion is now wrong or incomplete, save the corrected one and
 conflict it raises with `resolve_conflict`. If nothing generalizes yet, save nothing.";
 
 fn synthesis_line(r: &MemoryRow) -> String {
+    let origin = match (r.source.as_deref(), r.created_by_type.as_deref()) {
+        (Some(source), Some(by)) => mark(source, by).map(|m| format!(" origin={m}")).unwrap_or_default(),
+        _ => String::new(),
+    };
     format!(
-        "#{} {}{} {}",
+        "#{} {}{origin}{} {}",
         r.id,
         r.memory_type.as_deref().unwrap_or("-"),
         sources(r),
@@ -442,6 +460,7 @@ pub fn format_status(
 mod tests {
     use super::*;
     use clawg_core::memory::outbox::{OutboxProblem, OutboxState, OutboxSummary};
+    use clawg_core::memory::dispute::OpenPair;
 
     fn hit(id: i64, kind: &str, memory_type: &str, tier: i64, score: f64, content: &str) -> Hit {
         Hit {
@@ -740,6 +759,24 @@ mod tests {
     }
 
     #[test]
+    fn the_synthesis_marks_each_rows_origin() {
+        let origin = |id, source: &str, by: &str| MemoryRow {
+            source: Some(source.into()),
+            created_by_type: Some(by.into()),
+            ..row(id, "memory", Some("semantic_fact"), "text")
+        };
+        let out = format_synthesis(&synthesis(
+            vec![origin(12, "explicit", "agent"), origin(13, "explicit", "user")],
+            2,
+            vec![MemoryRow { derived_from: Some(vec![12, 13]), ..origin(9, "synthesis", "agent") }],
+        ));
+
+        assert!(out.contains("#9 semantic_fact origin=conclusion from=#12,#13 text"), "{out}");
+        assert!(out.contains("#12 semantic_fact origin=inferred text"), "{out}");
+        assert!(out.contains("#13 semantic_fact text"), "a side that may be the user's has no mark: {out}");
+    }
+
+    #[test]
     fn a_synthesis_with_nothing_pending_asks_for_nothing() {
         let out = format_synthesis(&synthesis(vec![], 0, vec![]));
         assert!(!out.contains("save_memory"), "{out}");
@@ -989,14 +1026,44 @@ mod tests {
         assert!(out.ends_with("\nshared: reads every agent but claude-code, codex"), "out was: {out}");
     }
 
+    fn open_pair(new_id: i64, old_id: i64, new_mark: Option<&str>, old_mark: Option<&str>) -> OpenPair {
+        OpenPair {
+            new_id,
+            old_id,
+            distance: Some(0.3),
+            created_at: 1,
+            new_mark: new_mark.map(str::to_owned),
+            old_mark: old_mark.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn the_unmarked_side_of_a_pair_goes_first() {
+        let open = OpenPairs {
+            pending: 3,
+            escalated: 0,
+            pairs: vec![
+                open_pair(9, 4, Some("inferred"), None),
+                open_pair(12, 4, None, Some("inferred")),
+                open_pair(15, 13, Some("conclusion"), Some("inferred")),
+            ],
+        };
+
+        let out = format_open_pairs(&open);
+
+        assert!(out.contains("\n  #4 close to #9 inferred\n"), "{out}");
+        assert!(out.contains("\n  #12 close to #4 inferred\n"), "{out}");
+        assert!(out.contains("\n  #15 conclusion close to #13 inferred\n"), "{out}");
+    }
+
     #[test]
     fn format_status_ends_with_the_open_pairs() {
         let open = OpenPairs {
             pending: 2,
             escalated: 1,
             pairs: vec![
-                clawg_core::memory::dispute::OpenPair { new_id: 9, old_id: 4, distance: Some(0.3), created_at: 1 },
-                clawg_core::memory::dispute::OpenPair { new_id: 12, old_id: 4, distance: None, created_at: 2 },
+                open_pair(9, 4, None, None),
+                open_pair(12, 4, None, None),
             ],
         };
         let out = format_status(&health(), Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", Some(&format_open_pairs(&open)));

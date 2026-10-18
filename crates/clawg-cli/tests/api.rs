@@ -1352,6 +1352,55 @@ async fn a_save_from_unknown_sources_is_refused() {
     assert_eq!(list["items"].as_array().map(Vec::len), Some(1), "nothing was saved: {list}");
 }
 
+/// `source` and `created_by_type` of a memory row, as the viewer reads them.
+async fn origin(h: &Harness, id: i64) -> (String, String) {
+    let (status, body) = h.get_json(&format!("/v1/memories/memory/{id}")).await;
+    assert_eq!(status, 200, "{body}");
+    let field = |name: &str| body["item"][name].as_str().unwrap_or_default().to_string();
+    (field("source"), field("created_by_type"))
+}
+
+#[tokio::test]
+async fn an_undeclared_save_is_the_agents() {
+    let h = Harness::start().await;
+    let id = save_id(&h, json!({ "content": "the parser seems to reject tabs", "agent_id": "a" })).await;
+    assert_eq!(origin(&h, id).await, ("explicit".into(), "agent".into()));
+}
+
+#[tokio::test]
+async fn a_declared_save_is_the_users() {
+    let h = Harness::start().await;
+    let id = save_id(&h, json!({ "content": "use Postgres for the ledger", "agent_id": "a", "user_stated": true })).await;
+    assert_eq!(origin(&h, id).await, ("explicit".into(), "user".into()));
+}
+
+#[tokio::test]
+async fn a_conclusion_is_sealed_as_synthesis() {
+    let h = Harness::start().await;
+    let a = save_id(&h, json!({ "content": "the go service uses tabs", "agent_id": "a", "user_stated": true })).await;
+    let b = save_id(&h, json!({ "content": "the rust crate uses tabs", "agent_id": "a" })).await;
+    let c = save_id(&h, json!({ "content": "the user indents with tabs", "agent_id": "a", "derived_from": [a, b] })).await;
+    assert_eq!(origin(&h, c).await, ("synthesis".into(), "agent".into()));
+}
+
+#[tokio::test]
+async fn user_stated_with_derived_from_is_refused() {
+    let h = Harness::start().await;
+    let a = save_id(&h, json!({ "content": "the go service uses tabs", "agent_id": "a" })).await;
+
+    let (status, body) = h
+        .post_json(
+            "/v1/memories",
+            json!({ "content": "a conclusion", "agent_id": "a", "derived_from": [a], "user_stated": true }),
+        )
+        .await;
+
+    assert_eq!(status, 400, "{body}");
+    assert!(body.to_string().contains("user_stated"), "{body}");
+    let (_, list) = h.get_json("/v1/memories?kind=memory").await;
+    assert_eq!(list["items"].as_array().map(Vec::len), Some(1), "nothing was saved: {list}");
+}
+
 #[tokio::test]
 async fn an_agent_neither_reviews_nor_cites_another_agents_memories() {
     let h = Harness::start().await;
@@ -1921,7 +1970,7 @@ async fn show_returns_every_metadata_field_of_a_saved_memory() {
     assert_eq!(item["kind"], "memory");
     assert_eq!(item["summary"], CONTENT, "the full content, not a preview");
     assert_eq!(item["source"], "explicit");
-    assert_eq!(item["created_by_type"], "user");
+    assert_eq!(item["created_by_type"], "agent", "an undeclared save is the agent's");
     assert_eq!(item["agent_id"], "agent-http");
     assert_eq!(item["project_id"], "proj-show");
     assert_eq!(item["memory_type"], "semantic_fact");

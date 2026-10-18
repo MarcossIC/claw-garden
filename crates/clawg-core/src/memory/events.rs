@@ -47,6 +47,12 @@ pub struct MemoryEvent {
     /// `#[serde(default)]` contract.
     #[serde(default)]
     pub topic_key: Option<String>,
+    /// The client declares the content is what the user said, not something
+    /// it inferred. Honoured only for [`MemorySource::Explicit`]; absent, as
+    /// in an outbox row written before the field existed, the save is the
+    /// agent's.
+    #[serde(default)]
+    pub user_stated: bool,
 }
 
 /// Where the ingest event originated (which producer).
@@ -62,15 +68,18 @@ pub enum MemorySource {
     Compaction,
     /// File-watcher-driven code ingest (reserved; nothing emits it yet).
     CodeFile,
+    /// A conclusion: an explicit save that names the rows it was drawn from.
+    /// Only the stored row carries it (`provenance::seal`); no event does.
+    Synthesis,
     /// A memory a client saved deliberately (the MCP `save_memory` tool), not
     /// derived from a conversation.
     ///
     /// Kept distinct from [`MemorySource::Chat`] because the provenance is
     /// genuinely different: a chat memory is something the pipeline *noticed*,
-    /// an explicit one is something a user *asserted*. That difference is what
-    /// justifies honouring the client's `memory_type`/`importance` overrides
-    /// here and nowhere else, and it keeps "what did I save on purpose?"
-    /// answerable with a `WHERE source = 'explicit'`.
+    /// an explicit one is something a client *chose to save*. That difference
+    /// is what justifies honouring the client's `memory_type`/`importance`
+    /// overrides here and nowhere else, and it keeps "what did I save on
+    /// purpose?" answerable with a `WHERE source IN ('explicit', 'synthesis')`.
     Explicit,
 }
 
@@ -122,6 +131,7 @@ impl MemoryEvent {
                 importance: None,
                 derived_from: Vec::new(),
                 topic_key: None,
+                user_stated: false,
             }),
         }
     }
@@ -161,6 +171,7 @@ mod tests {
             importance: None,
             derived_from: Vec::new(),
             topic_key: None,
+            user_stated: false,
         };
         assert!(matches!(evt.role, Role::Tool));
         assert_eq!(evt.is_error, Some(true));
@@ -181,6 +192,7 @@ mod tests {
             MemorySource::Compaction => "compaction",
             MemorySource::CodeFile => "code_file",
             MemorySource::Explicit => "explicit",
+            MemorySource::Synthesis => "synthesis",
         };
     }
 
@@ -197,6 +209,14 @@ mod tests {
     }
 
     #[test]
+    fn an_event_without_user_stated_reads_as_undeclared() {
+        let json = r#"{"agent_id":"a","project_id":null,"role":"user","content":"x","is_error":null,
+                       "source":"explicit","timestamp_ms":7}"#;
+        let evt: MemoryEvent = serde_json::from_str(json).expect("an event from before the field parses");
+        assert!(!evt.user_stated);
+    }
+
+    #[test]
     fn explicit_event_round_trips_with_its_overrides() {
         let evt = MemoryEvent {
             agent_id: "a".into(),
@@ -210,6 +230,7 @@ mod tests {
             importance: Some(9.5),
             derived_from: Vec::new(),
             topic_key: None,
+            user_stated: false,
         };
         let json = serde_json::to_string(&evt).expect("serialize");
         let back: MemoryEvent = serde_json::from_str(&json).expect("deserialize");
@@ -283,6 +304,7 @@ mod tests {
             importance: None,
             derived_from: Vec::new(),
             topic_key: None,
+            user_stated: false,
         });
         // Result is Err when receiver is dropped — must not panic
         let _ = result;

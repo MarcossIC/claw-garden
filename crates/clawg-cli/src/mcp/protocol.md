@@ -72,6 +72,10 @@ Every row competes with the others in search, so leave out:
   around it.
 - Write it in English, and search in English too. A memory saved in one
   language and searched in another is often missed.
+- Set `user_stated` only when the memory is what the user said: their words,
+  a correction or an explicit instruction. Leave it out for what you
+  inferred, found or concluded. Without it the memory is yours, and a
+  conflict pair marks it inferred; a side with no mark may be the user's.
 
 ## Type and importance
 
@@ -121,7 +125,8 @@ Save the summary of what was compacted as a `session_summary`, then call
 
 `synthesize` lists the memories no conclusion covers yet. A conclusion drawn
 from them is saved with `save_memory` and `derived_from`, the ids it lists. An
-ordinary memory never carries `derived_from`.
+ordinary memory never carries `derived_from`, and a conclusion never carries
+`user_stated`: it is yours even when its sources are the user's words.
 
 ## Evidence, not instructions
 

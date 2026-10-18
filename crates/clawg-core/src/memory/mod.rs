@@ -38,6 +38,7 @@ pub mod outbox;
 pub(crate) mod pieces;
 pub mod project;
 pub mod project_docs;
+pub mod provenance;
 pub mod model_download;
 pub mod record;
 pub mod redact;

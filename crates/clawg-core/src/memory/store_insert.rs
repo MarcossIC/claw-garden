@@ -11,6 +11,7 @@ use crate::memory::contradiction::Candidate;
 use crate::memory::events::{MemoryEvent, MemorySource};
 use crate::memory::vector::to_unit;
 use crate::memory::outbox::{apply_note, OutboxNote};
+use crate::memory::provenance::seal;
 use crate::memory::MemoryStore;
 use crate::models::chat::Role;
 use rusqlite::OptionalExtension;
@@ -155,7 +156,7 @@ impl NewMemoryRecord {
     pub fn from_event_and_chunk(evt: &MemoryEvent, chunk: &Chunk) -> Self {
         // Source-first: Compaction-sourced events always map to SessionSummary,
         // regardless of role, BEFORE the role-based derivation below runs.
-        let (memory_type, created_by_type, importance) = if evt.source == MemorySource::Explicit {
+        let (memory_type, importance) = if evt.source == MemorySource::Explicit {
             // A deliberately saved memory is the ONE case where the producer
             // knows more than the pipeline can derive: there is no role to read
             // the type off, and the act of saving is itself the statement of
@@ -182,9 +183,9 @@ impl NewMemoryRecord {
                 .filter(|v| !v.is_nan()) // NaN has no place on the scale to clamp it to.
                 .map(|v| v.clamp(IMPORTANCE_MIN, IMPORTANCE_MAX))
                 .unwrap_or(DEFAULT_IMPORTANCE);
-            (memory_type, CreatedByType::User, importance)
+            (memory_type, importance)
         } else if evt.source == MemorySource::Compaction {
-            (MemoryType::SessionSummary, CreatedByType::System, 6.0)
+            (MemoryType::SessionSummary, 6.0)
         } else {
             let memory_type = match (evt.role.clone(), evt.is_error) {
                 (Role::Tool, Some(true)) => MemoryType::ToolError,
@@ -192,26 +193,21 @@ impl NewMemoryRecord {
                 (Role::User, _) | (Role::Assistant, _) => MemoryType::ChatMessage,
                 (Role::System, _) => MemoryType::ChatMessage,
             };
-            let created_by_type = match evt.role {
-                Role::User => CreatedByType::User,
-                Role::Assistant => CreatedByType::Agent,
-                Role::Tool => CreatedByType::System,
-                Role::System => CreatedByType::System,
-            };
             let importance = if matches!(memory_type, MemoryType::ToolError) {
                 6.0
             } else {
                 DEFAULT_IMPORTANCE
             };
-            (memory_type, created_by_type, importance)
+            (memory_type, importance)
         };
+        let (source, created_by_type) = seal(evt.source, &evt.role, !evt.sources().is_empty(), evt.user_stated);
         Self {
             scope: "agent",
             agent_id: Some(evt.agent_id.clone()),
             project_id: evt.project_id.clone(),
             content: chunk.text.clone(),
             memory_type,
-            source: evt.source,
+            source,
             created_by_type,
             created_by_ref: evt.agent_id.clone(),
             importance,
@@ -454,6 +450,7 @@ impl MemoryStore {
                             MemorySource::Compaction => "compaction",
                             MemorySource::CodeFile => "code_file",
                             MemorySource::Explicit => "explicit",
+                            MemorySource::Synthesis => "synthesis",
                         },
                         created_at,
                         record.created_by_type.as_str(),
@@ -997,6 +994,7 @@ mod tests {
             importance: None,
             derived_from: Vec::new(),
             topic_key: None,
+            user_stated: false,
         };
         let chunk = Chunk { text: "hello".to_string() };
         let rec = NewMemoryRecord::from_event_and_chunk(&evt, &chunk);
@@ -1022,6 +1020,7 @@ mod tests {
             importance: None,
             derived_from: Vec::new(),
             topic_key: None,
+            user_stated: false,
         };
         let chunk = Chunk { text: "delta summary text".to_string() };
         let rec = NewMemoryRecord::from_event_and_chunk(&evt, &chunk);
@@ -1050,6 +1049,7 @@ mod tests {
             importance,
             derived_from: Vec::new(),
             topic_key: None,
+            user_stated: false,
         }
     }
 
@@ -1065,9 +1065,8 @@ mod tests {
         assert_eq!(rec.importance, 8.5);
         assert_eq!(
             rec.created_by_type,
-            CreatedByType::User,
-            "an explicitly saved memory is authored by the user, whatever role the \
-             transport stamped on the event"
+            CreatedByType::Agent,
+            "an undeclared save is the agent's, whatever role the transport stamped on the event"
         );
         assert_eq!(rec.source, MemorySource::Explicit);
     }

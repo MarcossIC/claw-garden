@@ -277,6 +277,14 @@
               "string",
               "null"
             ]
+          },
+          "user_stated": {
+            "default": null,
+            "description": "True only when the content is what the user said: their words or an\nexplicit instruction. Omit it for what you inferred, found or\nconcluded; never with derived_from.",
+            "type": [
+              "boolean",
+              "null"
+            ]
           }
         },
         "required": [

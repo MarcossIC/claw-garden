@@ -447,6 +447,7 @@ mod tests {
             importance: Some(8.0),
             derived_from: vec![3],
             topic_key: None,
+            user_stated: false,
         }
     }
 

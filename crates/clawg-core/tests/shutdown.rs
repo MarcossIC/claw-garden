@@ -32,6 +32,7 @@ fn event(content: &str) -> MemoryEvent {
         importance: None,
         derived_from: Vec::new(),
         topic_key: None,
+        user_stated: false,
     }
 }
 
