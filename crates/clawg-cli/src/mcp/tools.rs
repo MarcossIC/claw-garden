@@ -13,6 +13,7 @@ use std::path::Path;
 
 use clawg_core::memory::dispute::{OpenPairs, Resolution, ResolvedRow};
 use clawg_core::memory::prompt_builder::SHARED_NOTE;
+use clawg_core::memory::provenance::mark;
 use clawg_core::memory::sharing::{Reach, SharingError, SharingPolicy};
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
@@ -245,8 +246,12 @@ If an existing conclusion is now wrong or incomplete, save the corrected one and
 conflict it raises with `resolve_conflict`. If nothing generalizes yet, save nothing.";
 
 fn synthesis_line(r: &MemoryRow) -> String {
+    let origin = match (r.source.as_deref(), r.created_by_type.as_deref()) {
+        (Some(source), Some(by)) => mark(source, by).map(|m| format!(" origin={m}")).unwrap_or_default(),
+        _ => String::new(),
+    };
     format!(
-        "#{} {}{} {}",
+        "#{} {}{origin}{} {}",
         r.id,
         r.memory_type.as_deref().unwrap_or("-"),
         sources(r),
@@ -718,6 +723,24 @@ mod tests {
         assert!(out.contains("1 of 40"), "the agent must know the list is partial: {out}");
         assert!(out.contains("#12 semantic_fact the go service uses tabs"), "{out}");
         assert!(out.find("#9 ").unwrap() < out.find("#12 ").unwrap(), "conclusions come first: {out}");
+    }
+
+    #[test]
+    fn the_synthesis_marks_each_rows_origin() {
+        let origin = |id, source: &str, by: &str| MemoryRow {
+            source: Some(source.into()),
+            created_by_type: Some(by.into()),
+            ..row(id, "memory", Some("semantic_fact"), "text")
+        };
+        let out = format_synthesis(&synthesis(
+            vec![origin(12, "explicit", "agent"), origin(13, "explicit", "user")],
+            2,
+            vec![MemoryRow { derived_from: Some(vec![12, 13]), ..origin(9, "synthesis", "agent") }],
+        ));
+
+        assert!(out.contains("#9 semantic_fact origin=conclusion from=#12,#13 text"), "{out}");
+        assert!(out.contains("#12 semantic_fact origin=inferred text"), "{out}");
+        assert!(out.contains("#13 semantic_fact text"), "a side that may be the user's has no mark: {out}");
     }
 
     #[test]
