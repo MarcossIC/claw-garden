@@ -474,3 +474,44 @@ fn the_signing_step_reads_the_key_password_from_stdin_without_echo() {
         assert!(!(outside && line.contains("secrets.")), "release.yml:{}: a secret outside the signing step", n + 1);
     }
 }
+
+/// The quoted entries of the `paths-ignore:` list under `event` in `on:`.
+fn ignored_paths(lines: &[String], event: &str) -> Vec<String> {
+    let header = format!("{event}:");
+    let Some(start) = lines.iter().position(|l| indent_of(l) == 2 && l.trim() == header) else {
+        panic!("ci.yml has no `{event}` trigger");
+    };
+    let section: Vec<&String> = lines[start + 1..]
+        .iter()
+        .take_while(|l| l.trim().is_empty() || indent_of(l) > 2)
+        .collect();
+    let list = section
+        .iter()
+        .position(|l| l.trim() == "paths-ignore:")
+        .unwrap_or_else(|| panic!("`{event}` has no paths-ignore"));
+    section[list + 1..]
+        .iter()
+        .take_while(|l| l.trim().starts_with("- "))
+        .map(|l| l.trim().trim_start_matches("- ").trim_matches('\'').to_string())
+        .collect()
+}
+
+#[test]
+fn the_ci_workflow_ignores_only_non_code_paths_and_runs_on_both_platforms() {
+    let lines = workflow_code("ci.yml");
+    let non_code = ["docs/**", "openspec/**", ".claude/**", ".cursor/**", ".gemini/**", "scripts/**", "README.md", "AGENTS.md"];
+    for event in ["push", "pull_request"] {
+        assert_eq!(ignored_paths(&lines, event), non_code, "paths ignored on {event}");
+    }
+    let has = |wanted: &str| lines.iter().any(|l| l.trim() == wanted);
+    assert!(has("branches: [main]"), "the push trigger is main");
+    assert!(has("os: [ubuntu-latest, windows-latest]"), "both platforms run");
+    assert!(has("fail-fast: false"), "one platform failing must not stop the other");
+    assert!(has("- run: cargo clippy --workspace --all-targets -- -A clippy::all -D warnings"));
+    assert!(has("- run: cargo test --workspace"));
+
+    // CI is the only trigger of the release and must never hold its secrets.
+    for forbidden in ["secrets.", "environment:", "id-token", "contents: write"] {
+        assert!(!lines.iter().any(|l| l.contains(forbidden)), "ci.yml must not use `{forbidden}`");
+    }
+}
