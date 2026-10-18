@@ -41,7 +41,7 @@ La respuesta MUST llevar `withheld`: cuántos hits de la búsqueda dejó afuera 
 
 ## R3. `recall_context` no rellena
 
-`build_memory_prompt` MUST sacar los hits de score 0 después de sacar las filas del workspace y antes de cortar en `K_FINAL`. Un hit sacado MUST NOT aparecer en el prompt ni entrar en las filas sobre las que se piden los conflictos. `MemoryPrompt` MUST decir cuántos hits usó el prompt antes del presupuesto y cuántos sacó.
+`build_memory_prompt` MUST sacar los hits de score 0 después de sacar las filas del workspace y antes de cortar en `K_FINAL`. Un hit sacado MUST NOT aparecer en el prompt ni entrar en las filas sobre las que se piden los conflictos. `Retrieval::Searched` MUST decir cuántos hits usó el prompt antes del presupuesto (`hits`) y cuántos sacó (`withheld`).
 
 #### Escenario: cero de relleno
 - GIVEN una fila igual a la consulta y otra ortogonal
@@ -57,9 +57,9 @@ La respuesta MUST llevar `withheld`: cuántos hits de la búsqueda dejó afuera 
 
 ## R4. `POST /v1/context` dice cuánto ocultó
 
-Con `retrieval.state = "searched"`, la respuesta MUST llevar `hits` y `withheld` de `MemoryPrompt`. `Context` del cliente MUST leerlos con `#[serde(default)]` (0 si faltan). Los otros estados MUST NOT cambiar.
+Con `retrieval.state = "searched"`, la respuesta MUST llevar `hits` y `withheld` de `Retrieval::Searched`. `Context` del cliente MUST leerlos con `#[serde(default)]` (0 si faltan). Los otros estados MUST NOT cambiar.
 
-**Tests:** `context_says_how_many_hits_it_withheld` (`crates/clawg-cli/tests/api.rs`); `a_searched_context_without_counts_still_parses` (`client.rs`).
+**Tests:** `context_says_how_many_hits_it_withheld` y `context_says_whether_memories_were_searched` (`crates/clawg-cli/tests/api.rs`); `a_searched_context_without_counts_still_parses` (`client.rs`).
 
 ## R5. Las herramientas dicen la frase de abstención
 
@@ -77,7 +77,7 @@ Con `retrieval.state = "searched"`, la respuesta MUST llevar `hits` y `withheld`
 - GIVEN `retrieval.state = "embedder_not_ready"`
 - THEN `recall_context` dice que las memorias no se buscaron, y no la frase
 
-**Tests:** `search_says_when_nothing_was_relevant`, `recall_says_when_nothing_was_relevant`, `an_old_daemon_gets_no_abstention` (`tools.rs`); `search_memory_tells_nothing_relevant_from_nothing_stored` (`server.rs`).
+**Tests:** `search_says_when_nothing_was_relevant`, `nothing_stored_is_not_called_irrelevant`, `recall_says_when_nothing_was_relevant`, `an_old_daemon_gets_no_invented_notice` (que suma `searched` sin conteos) y `recall_says_when_memories_were_not_searched` (`tools.rs`); `search_memory_tells_nothing_relevant_from_nothing_stored` y `search_with_nothing_stored_says_so_without_failing` (`server.rs`).
 
 ## R6. agent-view lee la frase como cero líneas
 

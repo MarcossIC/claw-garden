@@ -32,7 +32,7 @@ Tomadas sobre las preguntas abiertas de la exploración:
 
 1. **Corte:** `shown_hits` no muestra una fila inexacta con score 0 ni la cuenta para el mínimo. Lo usan el daemon y el puente.
 2. **Daemon:** `withheld` en `SearchBody`; `hits` y `withheld` en `RetrievalState::Searched`.
-3. **Núcleo:** `build_memory_prompt` saca los hits de score 0 antes de cortar en `K_FINAL` y devuelve cuántos hits usó y cuántos sacó en `MemoryPrompt`. Una fila sacada no entra en `shown`, así que no trae conflictos.
+3. **Núcleo:** `build_memory_prompt` saca los hits de score 0 antes de cortar en `K_FINAL` y devuelve cuántos hits usó y cuántos sacó en `Retrieval::Searched`. Una fila sacada no entra en `shown`, así que no trae conflictos.
 4. **Puente:** `DaemonClient::search` devuelve los hits y `withheld`; `format_search` y `format_recall` dicen la frase.
 5. **`rag-eval --agent-view`:** el parser lee la frase como cero líneas, igual que `no memories found`, así que un caso `unanswerable` cuenta como abstención cuando la búsqueda la dice.
 6. **`.claude/CLAUDE.md`** (API HTTP y herramientas) y el mapa de `openspec/README.md`.
