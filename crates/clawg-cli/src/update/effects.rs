@@ -30,6 +30,9 @@ const PROGRESS_AFTER: Duration = Duration::from_secs(5);
 const PROGRESS_EVERY: Duration = Duration::from_secs(10);
 /// How many lines of the daemon's log a failure quotes.
 const LOG_LINES: usize = 8;
+/// How long a rename is tried again while another process holds the file.
+const RENAME_PATIENCE: Duration = Duration::from_secs(10);
+const RENAME_RETRY_EVERY: Duration = Duration::from_millis(100);
 
 /// The files an update moves.
 pub struct Paths {
@@ -288,8 +291,34 @@ fn make_executable(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn rename(from: &Path, to: &Path) -> Result<(), String> {
-    std::fs::rename(from, to).map_err(|e| format!("cannot rename {} to {}: {e}", from.display(), to.display()))
+async fn rename(from: &Path, to: &Path) -> Result<(), String> {
+    rename_within(from, to, RENAME_PATIENCE).await
+}
+
+async fn rename_within(from: &Path, to: &Path, patience: Duration) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            // A virus scanner reading a binary just written or run keeps it
+            // open without sharing deletion, and Windows refuses to rename it
+            // until the scan ends.
+            Err(e) if held_by_another_process(&e) && started.elapsed() < patience => {
+                tokio::time::sleep(RENAME_RETRY_EVERY).await;
+            }
+            Err(e) => return Err(format!("cannot rename {} to {}: {e}", from.display(), to.display())),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn held_by_another_process(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32)
+}
+
+#[cfg(not(windows))]
+fn held_by_another_process(_: &std::io::Error) -> bool {
+    false
 }
 
 impl Effects for Installation {
@@ -303,11 +332,11 @@ impl Effects for Installation {
                 Ok(())
             }
             Step::SetAside => {
-                rename(&self.paths.exe, &self.paths.aside)?;
+                rename(&self.paths.exe, &self.paths.aside).await?;
                 self.set_aside = true;
                 Ok(())
             }
-            Step::PutInPlace => rename(&self.paths.staged, &self.paths.exe),
+            Step::PutInPlace => rename(&self.paths.staged, &self.paths.exe).await,
             Step::StartDaemon => {
                 let port = self.old.as_ref().map(|d| d.port).ok_or("there is no daemon port to start on")?;
                 self.backups_before = Some(self.backup_names());
@@ -336,11 +365,11 @@ impl Effects for Installation {
                 self.start_and_wait(&exe, &version, old.port).await.map(drop)
             }
             Undo::RestoreAside => {
-                rename(&self.paths.aside, &self.paths.exe)?;
+                rename(&self.paths.aside, &self.paths.exe).await?;
                 self.set_aside = false;
                 Ok(())
             }
-            Undo::TakeBackNew => rename(&self.paths.exe, &self.paths.staged),
+            Undo::TakeBackNew => rename(&self.paths.exe, &self.paths.staged).await,
             Undo::EndNewDaemon => {
                 self.end_child()?;
                 self.new_daemon = None;
@@ -375,5 +404,58 @@ mod tests {
         assert_eq!(tail_lines(log, 2), "three\nfour");
         assert_eq!(tail_lines(log, 10), "one\ntwo\nthree\nfour");
         assert_eq!(tail_lines("", 3), "");
+    }
+
+    /// Opens `path` the way a virus scanner can: without letting anyone
+    /// rename it until the handle is dropped.
+    #[cfg(windows)]
+    fn hold(path: &Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().read(true).share_mode(0).open(path).expect("hold the file")
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_rename_waits_for_a_file_another_process_holds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (from, to) = (dir.path().join("clawg.exe"), dir.path().join("clawg.exe.old"));
+        std::fs::write(&from, b"binary").expect("write");
+        let held = hold(&from);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+
+        rename(&from, &to).await.expect("renamed once the file is let go");
+
+        release.join().expect("released");
+        assert_eq!(std::fs::read(&to).expect("read the renamed file"), b"binary");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_rename_gives_up_on_a_file_held_past_its_patience() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (from, to) = (dir.path().join("clawg.exe"), dir.path().join("clawg.exe.old"));
+        std::fs::write(&from, b"binary").expect("write");
+        let _held = hold(&from);
+
+        let started = Instant::now();
+        let err = rename_within(&from, &to, Duration::from_millis(300)).await.expect_err("still held");
+
+        assert!(err.contains("cannot rename"), "{err}");
+        assert!(started.elapsed() >= Duration::from_millis(250), "the rename was tried again");
+        assert!(from.exists() && !to.exists());
+    }
+
+    #[tokio::test]
+    async fn a_rename_that_cannot_work_is_not_tried_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let started = Instant::now();
+        let err = rename(&dir.path().join("missing"), &dir.path().join("other")).await.expect_err("nothing to rename");
+
+        assert!(err.contains("cannot rename"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(1), "refused at once, not waited on");
     }
 }
