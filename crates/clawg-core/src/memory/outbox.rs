@@ -434,6 +434,7 @@ mod tests {
             memory_type: Some("decision".into()),
             importance: Some(8.0),
             derived_from: vec![3],
+            user_stated: false,
         }
     }
 
