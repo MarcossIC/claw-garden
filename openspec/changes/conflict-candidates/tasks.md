@@ -45,10 +45,10 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 ## 8. Verificación
 
-- [ ] `cargo test --workspace` y el clippy de `.claude/CLAUDE.md` en Linux.
+- [x] `cargo test --workspace` y el clippy de `.claude/CLAUDE.md` en Linux.
 - [ ] Lo mismo en Windows, en `target-test`.
 - [ ] `conflict-eval --real` y `rag-eval --real --diff`, con el modelo real y `docs/eval/`.
-- [ ] `verify.md`.
+- [x] `verify.md`, con Linux; lo demás queda anotado como pendiente.
 
 ## 9. Archive
 
