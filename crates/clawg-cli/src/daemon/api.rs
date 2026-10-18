@@ -597,6 +597,8 @@ pub struct ContextBody {
 pub enum RetrievalState {
     /// `hits` went into the prompt; `withheld` scored 0 and were left out.
     Searched { hits: usize, withheld: usize },
+    /// Asked for without a query: `hits` are the newest saves, by date.
+    Recent { hits: usize },
     EmbedderNotReady,
     EmbedderFailed { detail: String, retryable: bool },
     SearchFailed { detail: String },
@@ -608,6 +610,7 @@ impl RetrievalState {
     fn of(retrieval: Retrieval, status: EmbedderStatus) -> Self {
         match retrieval {
             Retrieval::Searched { hits, withheld } => Self::Searched { hits, withheld },
+            Retrieval::Recent { hits } => Self::Recent { hits },
             Retrieval::NoEmbedder => match status {
                 EmbedderStatus::Failed { error, retryable } => Self::EmbedderFailed { detail: error, retryable },
                 EmbedderStatus::Loading | EmbedderStatus::Ready => Self::EmbedderNotReady,
