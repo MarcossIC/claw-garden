@@ -2,6 +2,9 @@
 
 use std::future::Future;
 use std::path::PathBuf;
+use std::time::Duration;
+
+use clawg_core::memory::backup::{parse_snapshot_name, snapshot_name, Reason};
 
 /// A daemon that was answering when the update began.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +156,121 @@ async fn roll_back<E: Effects>(step: Step, cause: String, done: Vec<Undo>, fx: &
         }
     }
     Failure { step, cause, undone, stuck, skipped: Vec::new(), store }
+}
+
+/// How long a new daemon has to take the store. A starting value, not measured.
+pub const STORE_WAIT: Duration = Duration::from_secs(60);
+/// How long a daemon that holds the store may spend on the snapshot and the
+/// migrations of a big store before it binds. A starting value, not measured.
+pub const PREPARE_WAIT: Duration = Duration::from_secs(600);
+
+/// What `/health` said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Answer {
+    pub pid: u32,
+    pub version: String,
+}
+
+/// What was seen of the daemon a moment ago.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Observation {
+    /// The process the update started has ended.
+    pub exited: bool,
+    /// The pid `memory.owner` records, read without testing the lock.
+    pub store_owner: Option<u32>,
+    pub answering: Option<Answer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    Wait,
+    /// A daemon of the new version answers.
+    Ready,
+    /// The process ended and nothing answers: it did not start.
+    Exited,
+    TimedOut,
+    /// A daemon of another version answers: the process lost the store to it.
+    Other { pid: u32, version: String },
+}
+
+/// Decides, from what was seen, whether the daemon the update started is up,
+/// still starting or failed.
+///
+/// Who answers counts before whether the child lives: an editor's bridge can
+/// start a daemon between the stop and the start, and then the child is the
+/// one that ended.
+pub fn judge(seen: &Observation, elapsed: Duration, child_pid: u32, new_version: &str) -> Verdict {
+    if let Some(answer) = &seen.answering {
+        if answer.version == new_version {
+            return Verdict::Ready;
+        }
+        if answer.pid != child_pid {
+            return Verdict::Other { pid: answer.pid, version: answer.version.clone() };
+        }
+    }
+    if seen.exited {
+        return Verdict::Exited;
+    }
+    let limit = if seen.store_owner == Some(child_pid) { PREPARE_WAIT } else { STORE_WAIT };
+    if elapsed >= limit {
+        Verdict::TimedOut
+    } else {
+        Verdict::Wait
+    }
+}
+
+/// The name the installed binary is set aside under. The format is the one
+/// `install.ps1` uses (`yyyyMMddHHmmssfff`), so each tool cleans up the other's.
+pub fn aside_name(exe_name: &str, now_ms: i64) -> String {
+    format!("{exe_name}.old-{}", stamp(now_ms))
+}
+
+/// The name the candidate is staged under. It is executed, so it keeps the
+/// extension of the installed binary.
+pub fn staged_name(exe_name: &str, now_ms: i64) -> String {
+    let (stem, extension) = split_name(exe_name);
+    format!("{stem}.new-{}{extension}", stamp(now_ms))
+}
+
+/// The files an earlier run left beside the binary: set-aside and staged
+/// ones, in the order given.
+pub fn leftovers(names: &[String], exe_name: &str) -> Vec<String> {
+    let (stem, _) = split_name(exe_name);
+    let aside = format!("{exe_name}.old-");
+    let staged = format!("{stem}.new-");
+    names
+        .iter()
+        .filter(|name| name.starts_with(&aside) || name.starts_with(&staged))
+        .cloned()
+        .collect()
+}
+
+/// The `pre-migration` snapshot that is in `after` and was not in `before`:
+/// the one the daemon just started wrote. The newest, if several.
+pub fn new_pre_migration(before: &[String], after: &[String]) -> Option<String> {
+    after
+        .iter()
+        .filter(|name| !before.contains(name))
+        .filter(|name| parse_snapshot_name(name) == Some(Reason::PreMigration))
+        .max()
+        .cloned()
+}
+
+/// `clawg.exe` as (`clawg`, `.exe`); a name without an extension has none.
+fn split_name(exe_name: &str) -> (&str, &str) {
+    match exe_name.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => (stem, &exe_name[stem.len()..]),
+        _ => (exe_name, ""),
+    }
+}
+
+/// `yyyyMMddHHmmssfff` in UTC, the digits of a snapshot's own timestamp.
+fn stamp(ms: i64) -> String {
+    snapshot_name(ms, Reason::Manual)
+        .chars()
+        .filter(char::is_ascii_digit)
+        .take(17)
+        .collect()
 }
 
 #[cfg(test)]
@@ -503,5 +621,141 @@ mod apply_cases {
             [Undo::EndNewDaemon, Undo::TakeBackNew, Undo::StartOldDaemon, Undo::RemoveStaged]
         );
         assert_eq!(fake.aside, Some("old"), "the old binary is still where the failed undo left it");
+    }
+}
+
+#[cfg(test)]
+mod watch_cases {
+    use super::*;
+
+    const CHILD: u32 = 500;
+    const NEW: &str = "0.19.0";
+
+    fn seen() -> Observation {
+        Observation { exited: false, store_owner: None, answering: None }
+    }
+
+    fn answering(pid: u32, version: &str) -> Option<Answer> {
+        Some(Answer { pid, version: version.into() })
+    }
+
+    fn judged(observation: &Observation, seconds: u64) -> Verdict {
+        judge(observation, Duration::from_secs(seconds), CHILD, NEW)
+    }
+
+    #[test]
+    fn a_daemon_answering_with_the_new_version_is_ready() {
+        let observation = Observation { answering: answering(CHILD, NEW), ..seen() };
+
+        assert_eq!(judged(&observation, 3), Verdict::Ready);
+    }
+
+    #[test]
+    fn the_new_version_counts_whoever_started_it() {
+        // An editor's bridge may have started it between the stop and the start.
+        let observation = Observation { exited: true, answering: answering(901, NEW), ..seen() };
+
+        assert_eq!(judged(&observation, 3), Verdict::Ready);
+    }
+
+    #[test]
+    fn another_version_answering_is_not_the_child() {
+        let observation = Observation { exited: true, answering: answering(901, "0.18.0"), ..seen() };
+
+        assert_eq!(judged(&observation, 3), Verdict::Other { pid: 901, version: "0.18.0".into() });
+    }
+
+    #[test]
+    fn a_child_that_ended_without_anyone_answering_did_not_start() {
+        let observation = Observation { exited: true, ..seen() };
+
+        assert_eq!(judged(&observation, 3), Verdict::Exited);
+    }
+
+    #[test]
+    fn a_child_that_has_not_taken_the_store_has_a_minute() {
+        assert_eq!(judged(&seen(), 59), Verdict::Wait);
+        assert_eq!(judged(&seen(), 60), Verdict::TimedOut);
+        let other_holder = Observation { store_owner: Some(CHILD + 1), ..seen() };
+        assert_eq!(judged(&other_holder, 60), Verdict::TimedOut, "the record of another process is not the child's");
+    }
+
+    #[test]
+    fn a_child_holding_the_store_is_preparing_it_and_has_ten_minutes() {
+        let holding = Observation { store_owner: Some(CHILD), ..seen() };
+
+        assert_eq!(judged(&holding, 61), Verdict::Wait);
+        assert_eq!(judged(&holding, 599), Verdict::Wait);
+        assert_eq!(judged(&holding, 600), Verdict::TimedOut);
+    }
+
+    #[test]
+    fn an_answer_ends_the_wait_even_after_the_deadline() {
+        let observation = Observation { answering: answering(CHILD, NEW), ..seen() };
+
+        assert_eq!(judged(&observation, 10_000), Verdict::Ready);
+    }
+
+    const EXE: &str = "clawg.exe";
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn leftovers_picks_the_set_aside_and_staged_files_of_this_binary_only() {
+        let found = leftovers(
+            &names(&[
+                "clawg.exe",
+                "clawg.exe.old-20261012175116123",
+                "clawg.new-20261012175116456.exe",
+                "clawg.exe.old-x",
+                "clawg.newest.exe",
+                "clawg.exe.bak",
+                "other.exe.old-1",
+                "notes.txt",
+            ]),
+            EXE,
+        );
+
+        assert_eq!(found, names(&["clawg.exe.old-20261012175116123", "clawg.new-20261012175116456.exe", "clawg.exe.old-x"]));
+    }
+
+    #[test]
+    fn leftovers_on_a_binary_without_an_extension() {
+        let found = leftovers(&names(&["clawg", "clawg.old-1", "clawg.new-2", "clawg.exe.old-3"]), "clawg");
+
+        assert_eq!(found, names(&["clawg.old-1", "clawg.new-2"]));
+    }
+
+    #[test]
+    fn the_names_an_update_makes_are_the_ones_it_cleans_up_next_time() {
+        for exe in [EXE, "clawg"] {
+            let made = vec![aside_name(exe, 1_791_827_476_123), staged_name(exe, 1_791_827_476_123)];
+
+            assert_eq!(leftovers(&made, exe), made, "{exe}");
+        }
+        assert_eq!(aside_name(EXE, 1_791_827_476_123), "clawg.exe.old-20261012175116123");
+        assert_eq!(staged_name(EXE, 1_791_827_476_123), "clawg.new-20261012175116123.exe");
+        assert_eq!(staged_name("clawg", 1_791_827_476_123), "clawg.new-20261012175116123");
+    }
+
+    #[test]
+    fn the_snapshot_a_start_wrote_is_the_pre_migration_that_was_not_there_before() {
+        use clawg_core::memory::backup::{snapshot_name, Reason};
+        let old = snapshot_name(1_700_000_000_000, Reason::PreMigration);
+        let manual = snapshot_name(1_700_000_001_000, Reason::Manual);
+        let new = snapshot_name(1_700_000_002_000, Reason::PreMigration);
+        let reembed = snapshot_name(1_700_000_003_000, Reason::PreReembed);
+        let before = vec![old.clone(), manual.clone()];
+
+        assert_eq!(new_pre_migration(&before, &[old.clone(), manual.clone()]), None);
+        assert_eq!(new_pre_migration(&before, &[old.clone(), manual.clone(), reembed.clone()]), None);
+        assert_eq!(
+            new_pre_migration(&before, &[old.clone(), manual, new.clone(), reembed]),
+            Some(new.clone())
+        );
+        assert_eq!(new_pre_migration(&[], &[old.clone(), new.clone()]), Some(new), "the newest of several");
+        assert_eq!(new_pre_migration(&[], &["notes.txt".to_string()]), None);
     }
 }
