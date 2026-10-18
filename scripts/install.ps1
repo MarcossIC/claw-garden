@@ -39,281 +39,286 @@ param(
     [switch]$RemoveLegacy
 )
 
-$ErrorActionPreference = 'Stop'
-
-$ReleaseBase = 'https://github.com/MarcossIC/claw-garden/releases/latest/download'
-$AssetName = 'clawg-x86_64-pc-windows-msvc.exe'
-$VcRedistUrl = 'https://aka.ms/vs/17/release/vc_redist.x64.exe'
-
-$LegacyDisplayName = 'Claw Garden'
-$UninstallRoots = @(
-    'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
-    'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
-    'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
-)
-
-function Test-SamePath([string]$A, [string]$B) {
-    if (-not $A -or -not $B) { return $false }
-    $left = [IO.Path]::GetFullPath($A).TrimEnd('\')
-    $right = [IO.Path]::GetFullPath($B).TrimEnd('\')
-    return $left -ieq $right
-}
-
-# Every distinct clawg.exe a shell would find in PathValue, in resolution order.
-# Windows takes quotes around an entry and ignores blank ones.
-function Find-ClawgInPath([string]$PathValue, [string]$ExeName = 'clawg.exe') {
-    $found = @()
-    foreach ($entry in $PathValue.Split(';')) {
-        $dir = $entry.Trim().Trim('"')
-        if (-not $dir) { continue }
-        $candidate = Join-Path $dir $ExeName
-        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
-        if ($found | Where-Object { Test-SamePath $_ $candidate }) { continue }
-        $found += $candidate
-    }
-    return , $found
-}
-
-# The PATH a newly opened terminal gets: Machine, then User, straight from the
-# registry. $env:Path belongs to this process and would miss what was just added.
-function Get-FreshPath {
-    $parts = foreach ($hive in @(
-        'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment',
-        'HKCU:\Environment')) {
-        $key = Get-Item -LiteralPath $hive
-        $raw = $key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
-        [Environment]::ExpandEnvironmentVariables($raw)
-    }
-    return ($parts -join ';')
-}
-
-# The uninstaller path from an UninstallString, which may be quoted and may
-# carry arguments.
-function Get-UninstallExe([string]$UninstallString) {
-    $s = $UninstallString.Trim()
-    if ($s.StartsWith('"')) { return $s.Substring(1).Split('"')[0] }
-    if ($s -match '^(.+?\.exe)(\s|$)') { return $Matches[1] }
-    return $s
-}
-
-function Get-LegacyEntry([string[]]$Roots = $UninstallRoots, [string]$DisplayName = $LegacyDisplayName) {
-    foreach ($root in $Roots) {
-        if (-not (Test-Path -LiteralPath $root)) { continue }
-        foreach ($key in Get-ChildItem -LiteralPath $root) {
-            if ($key.GetValue('DisplayName') -ne $DisplayName) { continue }
-            $uninstall = [string]$key.GetValue('UninstallString')
-            # NSIS stores InstallLocation quoted, which Test-Path would not find.
-            $location = ([string]$key.GetValue('InstallLocation')).Trim('"')
-            if (-not $location -and $uninstall) {
-                $location = Split-Path -Parent (Get-UninstallExe $uninstall)
-            }
-            [pscustomobject]@{
-                Key             = $key.PSPath
-                UninstallString = $uninstall
-                Location        = $location
-            }
-        }
-    }
-}
-
-# clawg.exe files on PATH outside the install directory.
-function Get-ForeignClawg([string]$PathValue, [string]$InstallDir) {
-    $all = Find-ClawgInPath $PathValue
-    return , @($all | Where-Object { -not (Test-SamePath (Split-Path -Parent $_) $InstallDir) })
-}
-
-# Decides what the shadowing check should say: $null when the first hit is the
-# installed binary, otherwise the message naming who wins.
-function Get-ShadowMessage([string[]]$Resolved, [string]$Target) {
-    if (-not $Resolved -or $Resolved.Count -eq 0) {
-        return "clawg.exe is not on the PATH a new terminal gets, so $Target will not be found by name."
-    }
-    if (Test-SamePath $Resolved[0] $Target) { return $null }
-    return "A new terminal would run $($Resolved[0]) (directory $(Split-Path -Parent $Resolved[0])), not $Target. That copy shadows the one just installed: remove it or move it after $(Split-Path -Parent $Target) on the PATH."
-}
-
-# Whether the x64 Visual C++ runtime that clawg.exe links against is present.
-function Test-VcRedist {
-    $key = 'HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\X64'
-    if (Test-Path -LiteralPath $key) {
-        if ((Get-ItemProperty -LiteralPath $key).Installed -eq 1) { return $true }
-    }
-    return Test-Path -LiteralPath (Join-Path $env:SystemRoot 'System32\vcruntime140.dll')
-}
-
-# The hash SHA256SUMS lists for $Name, lower case, or $null. Lines are what
-# sha256sum writes: 64 hex digits, a space, a space or '*', the file name.
-function Get-ExpectedHash([string]$SumsText, [string]$Name) {
-    foreach ($line in $SumsText -split "`r?`n") {
-        if ($line -match '^([0-9a-fA-F]{64}) [ *](.+)$' -and $Matches[2] -ceq $Name) {
-            return $Matches[1].ToLowerInvariant()
-        }
-    }
-    return $null
-}
-
-# Downloads the latest release's binary into $Dir and returns its path, after
-# checking it against the release's SHA256SUMS.
-function Save-VerifiedRelease([string]$Dir) {
-    # Windows PowerShell 5.1 does not offer TLS 1.2 by default, which GitHub requires.
-    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    # The progress bar makes Invoke-WebRequest several times slower in 5.1.
-    $ProgressPreference = 'SilentlyContinue'
-    $binary = Join-Path $Dir $AssetName
-    try {
-        Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseBase/$AssetName" -OutFile $binary
-        $sums = (Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseBase/SHA256SUMS").Content
-    }
-    catch {
-        throw "Could not download the latest release from $ReleaseBase. Nothing was changed. ($($_.Exception.Message))"
-    }
-    if ($sums -is [byte[]]) { $sums = [Text.Encoding]::UTF8.GetString($sums) }
-    $expected = Get-ExpectedHash $sums $AssetName
-    if (-not $expected) {
-        throw "SHA256SUMS of the latest release does not list $AssetName. Nothing was changed."
-    }
-    $actual = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($actual -ne $expected) {
-        throw "The downloaded $AssetName has sha256 $actual, but SHA256SUMS lists $expected. Nothing was changed."
-    }
-    return $binary
-}
-
-function Remove-LegacyInstall($Entry) {
-    if (-not $Entry.UninstallString) {
-        throw "The legacy install at $($Entry.Location) has no UninstallString; remove it by hand."
-    }
-    $exe = Get-UninstallExe $Entry.UninstallString
-    # NSIS uninstallers copy themselves to a temp directory and relaunch, so the
-    # process waited on exits early; the entry and folder are what prove it is done.
-    Start-Process -FilePath $exe -ArgumentList '/S' -Wait
-    $deadline = (Get-Date).AddSeconds(60)
-    while ((Get-Date) -lt $deadline) {
-        $gone = -not (Test-Path -LiteralPath $Entry.Key) -and
-            (-not $Entry.Location -or -not (Test-Path -LiteralPath $Entry.Location))
-        if ($gone) { return }
-        Start-Sleep -Milliseconds 500
-    }
-    throw "The legacy uninstaller finished but $($Entry.Location) or its registry entry ($($Entry.Key)) is still there. Remove it by hand and run this script again."
-}
-
-$target = Join-Path $InstallDir 'clawg.exe'
-
-# Nothing is downloaded or written without the runtime clawg.exe needs.
-if (-not (Test-VcRedist)) {
-    throw "The Microsoft Visual C++ Redistributable (x64) is not installed, and clawg.exe needs it. Nothing was changed. Install it from $VcRedistUrl and run this script again."
-}
-
-# A copy next to the script wins; piped to Invoke-Expression there is no script
-# directory, and the latest release is fetched further down.
-$source = $null
-if ($PSScriptRoot) {
-    $candidate = Join-Path $PSScriptRoot 'clawg.exe'
-    if (Test-Path -LiteralPath $candidate) { $source = $candidate }
-}
-$downloadDir = $null
-function Remove-Download {
-    if ($downloadDir -and (Test-Path -LiteralPath $downloadDir)) {
-        Remove-Item -LiteralPath $downloadDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
-trap { Remove-Download; break }
-
-# Decided before anything is touched, so a refusal leaves the machine as it was.
-$legacy = @(Get-LegacyEntry)
-$foreign = Get-ForeignClawg $env:Path $InstallDir
-if (($legacy.Count -gt 0 -or $foreign.Count -gt 0) -and -not $RemoveLegacy) {
-    $where = @($legacy | ForEach-Object { "$($_.Location) (registered as '$LegacyDisplayName')" }) + @($foreign)
-    throw "Another clawg install is present and would shadow the new one: $($where -join '; '). Nothing was changed. Run this script again with -RemoveLegacy to uninstall the registered one."
-}
-# Downloaded after the refusals above and before anything is removed or
-# stopped, so a failed download or a wrong hash leaves the machine as it was.
-if (-not $source) {
-    $downloadDir = Join-Path ([IO.Path]::GetTempPath()) "clawg-install-$([guid]::NewGuid().ToString('N'))"
-    New-Item -ItemType Directory -Path $downloadDir | Out-Null
-    Write-Host "Downloading $AssetName from the latest release"
-    $source = Save-VerifiedRelease $downloadDir
-}
-
-foreach ($entry in $legacy) {
-    Write-Host "Removing legacy install at $($entry.Location)"
-    Remove-LegacyInstall $entry
-}
-# A copy no uninstaller owns cannot be removed from here; the check at the end
-# still fails loudly if it is the one that wins.
-foreach ($path in $foreign) {
-    if (Test-Path -LiteralPath $path) {
-        Write-Warning "Another clawg.exe is on the PATH and was not removed: $path"
-    }
-}
-
-# The previous binary is the one that can talk to the running daemon, so it
-# does the stopping. "No daemon running" is reported on stderr, which Windows
-# PowerShell 5.1 turns into a terminating error under 'Stop', so the check is
-# done with errors relaxed.
-#
-# `stop` exits 1 both when no daemon was running and when it did not end in
-# time, so its exit code cannot tell the two apart. `status` exits 0 only when
-# a daemon still answers, which is exactly the case where replacing the binary
-# would leave the old version serving with the store locked.
-if (Test-Path -LiteralPath $target) {
-    $ErrorActionPreference = 'Continue'
-    & $target stop --profile prod *> $null
-    & $target status --profile prod *> $null
-    $stillRunning = $LASTEXITCODE -eq 0
+# Piped to Invoke-Expression, a script runs in the caller's own scope. The
+# rest runs in a child scope instead, so $ErrorActionPreference, the helper
+# functions and the installer's variables do not stay in the caller's session.
+& {
     $ErrorActionPreference = 'Stop'
-    if ($stillRunning) {
-        throw "The clawg daemon for the prod profile is still running after 'clawg stop', so the binary was not replaced. Stop it (or close the editor whose MCP keeps restarting it) and run this script again."
+
+    $ReleaseBase = 'https://github.com/MarcossIC/claw-garden/releases/latest/download'
+    $AssetName = 'clawg-x86_64-pc-windows-msvc.exe'
+    $VcRedistUrl = 'https://aka.ms/vs/17/release/vc_redist.x64.exe'
+
+    $LegacyDisplayName = 'Claw Garden'
+    $UninstallRoots = @(
+        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+    )
+
+    function Test-SamePath([string]$A, [string]$B) {
+        if (-not $A -or -not $B) { return $false }
+        $left = [IO.Path]::GetFullPath($A).TrimEnd('\')
+        $right = [IO.Path]::GetFullPath($B).TrimEnd('\')
+        return $left -ieq $right
     }
-}
 
-New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+    # Every distinct clawg.exe a shell would find in PathValue, in resolution order.
+    # Windows takes quotes around an entry and ignores blank ones.
+    function Find-ClawgInPath([string]$PathValue, [string]$ExeName = 'clawg.exe') {
+        $found = @()
+        foreach ($entry in $PathValue.Split(';')) {
+            $dir = $entry.Trim().Trim('"')
+            if (-not $dir) { continue }
+            $candidate = Join-Path $dir $ExeName
+            if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+            if ($found | Where-Object { Test-SamePath $_ $candidate }) { continue }
+            $found += $candidate
+        }
+        return , $found
+    }
 
-# Binaries set aside by earlier runs. One that is still mapped cannot be
-# deleted yet and is left for a later run.
-Get-ChildItem -LiteralPath $InstallDir -Filter 'clawg.exe.old-*' |
-    Remove-Item -Force -ErrorAction SilentlyContinue
+    # The PATH a newly opened terminal gets: Machine, then User, straight from the
+    # registry. $env:Path belongs to this process and would miss what was just added.
+    function Get-FreshPath {
+        $parts = foreach ($hive in @(
+            'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment',
+            'HKCU:\Environment')) {
+            $key = Get-Item -LiteralPath $hive
+            $raw = $key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            [Environment]::ExpandEnvironmentVariables($raw)
+        }
+        return ($parts -join ';')
+    }
 
-# Windows refuses to overwrite an executable that another process has mapped:
-# a running clawg, but also an antivirus or the search indexer reading it, with
-# no clawg process left. Renaming a mapped file is allowed, so the previous
-# binary is moved aside instead of overwritten.
-$aside = $null
-if (Test-Path -LiteralPath $target) {
-    $aside = "$target.old-$(Get-Date -Format yyyyMMddHHmmssfff)"
+    # The uninstaller path from an UninstallString, which may be quoted and may
+    # carry arguments.
+    function Get-UninstallExe([string]$UninstallString) {
+        $s = $UninstallString.Trim()
+        if ($s.StartsWith('"')) { return $s.Substring(1).Split('"')[0] }
+        if ($s -match '^(.+?\.exe)(\s|$)') { return $Matches[1] }
+        return $s
+    }
+
+    function Get-LegacyEntry([string[]]$Roots = $UninstallRoots, [string]$DisplayName = $LegacyDisplayName) {
+        foreach ($root in $Roots) {
+            if (-not (Test-Path -LiteralPath $root)) { continue }
+            foreach ($key in Get-ChildItem -LiteralPath $root) {
+                if ($key.GetValue('DisplayName') -ne $DisplayName) { continue }
+                $uninstall = [string]$key.GetValue('UninstallString')
+                # NSIS stores InstallLocation quoted, which Test-Path would not find.
+                $location = ([string]$key.GetValue('InstallLocation')).Trim('"')
+                if (-not $location -and $uninstall) {
+                    $location = Split-Path -Parent (Get-UninstallExe $uninstall)
+                }
+                [pscustomobject]@{
+                    Key             = $key.PSPath
+                    UninstallString = $uninstall
+                    Location        = $location
+                }
+            }
+        }
+    }
+
+    # clawg.exe files on PATH outside the install directory.
+    function Get-ForeignClawg([string]$PathValue, [string]$InstallDir) {
+        $all = Find-ClawgInPath $PathValue
+        return , @($all | Where-Object { -not (Test-SamePath (Split-Path -Parent $_) $InstallDir) })
+    }
+
+    # Decides what the shadowing check should say: $null when the first hit is the
+    # installed binary, otherwise the message naming who wins.
+    function Get-ShadowMessage([string[]]$Resolved, [string]$Target) {
+        if (-not $Resolved -or $Resolved.Count -eq 0) {
+            return "clawg.exe is not on the PATH a new terminal gets, so $Target will not be found by name."
+        }
+        if (Test-SamePath $Resolved[0] $Target) { return $null }
+        return "A new terminal would run $($Resolved[0]) (directory $(Split-Path -Parent $Resolved[0])), not $Target. That copy shadows the one just installed: remove it or move it after $(Split-Path -Parent $Target) on the PATH."
+    }
+
+    # Whether the x64 Visual C++ runtime that clawg.exe links against is present.
+    function Test-VcRedist {
+        $key = 'HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\X64'
+        if (Test-Path -LiteralPath $key) {
+            if ((Get-ItemProperty -LiteralPath $key).Installed -eq 1) { return $true }
+        }
+        return Test-Path -LiteralPath (Join-Path $env:SystemRoot 'System32\vcruntime140.dll')
+    }
+
+    # The hash SHA256SUMS lists for $Name, lower case, or $null. Lines are what
+    # sha256sum writes: 64 hex digits, a space, a space or '*', the file name.
+    function Get-ExpectedHash([string]$SumsText, [string]$Name) {
+        foreach ($line in $SumsText -split "`r?`n") {
+            if ($line -match '^([0-9a-fA-F]{64}) [ *](.+)$' -and $Matches[2] -ceq $Name) {
+                return $Matches[1].ToLowerInvariant()
+            }
+        }
+        return $null
+    }
+
+    # Downloads the latest release's binary into $Dir and returns its path, after
+    # checking it against the release's SHA256SUMS.
+    function Save-VerifiedRelease([string]$Dir) {
+        # Windows PowerShell 5.1 does not offer TLS 1.2 by default, which GitHub requires.
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        # The progress bar makes Invoke-WebRequest several times slower in 5.1.
+        $ProgressPreference = 'SilentlyContinue'
+        $binary = Join-Path $Dir $AssetName
+        try {
+            Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseBase/$AssetName" -OutFile $binary
+            $sums = (Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseBase/SHA256SUMS").Content
+        }
+        catch {
+            throw "Could not download the latest release from $ReleaseBase. Nothing was changed. ($($_.Exception.Message))"
+        }
+        if ($sums -is [byte[]]) { $sums = [Text.Encoding]::UTF8.GetString($sums) }
+        $expected = Get-ExpectedHash $sums $AssetName
+        if (-not $expected) {
+            throw "SHA256SUMS of the latest release does not list $AssetName. Nothing was changed."
+        }
+        $actual = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actual -ne $expected) {
+            throw "The downloaded $AssetName has sha256 $actual, but SHA256SUMS lists $expected. Nothing was changed."
+        }
+        return $binary
+    }
+
+    function Remove-LegacyInstall($Entry) {
+        if (-not $Entry.UninstallString) {
+            throw "The legacy install at $($Entry.Location) has no UninstallString; remove it by hand."
+        }
+        $exe = Get-UninstallExe $Entry.UninstallString
+        # NSIS uninstallers copy themselves to a temp directory and relaunch, so the
+        # process waited on exits early; the entry and folder are what prove it is done.
+        Start-Process -FilePath $exe -ArgumentList '/S' -Wait
+        $deadline = (Get-Date).AddSeconds(60)
+        while ((Get-Date) -lt $deadline) {
+            $gone = -not (Test-Path -LiteralPath $Entry.Key) -and
+                (-not $Entry.Location -or -not (Test-Path -LiteralPath $Entry.Location))
+            if ($gone) { return }
+            Start-Sleep -Milliseconds 500
+        }
+        throw "The legacy uninstaller finished but $($Entry.Location) or its registry entry ($($Entry.Key)) is still there. Remove it by hand and run this script again."
+    }
+
+    $target = Join-Path $InstallDir 'clawg.exe'
+
+    # Nothing is downloaded or written without the runtime clawg.exe needs.
+    if (-not (Test-VcRedist)) {
+        throw "The Microsoft Visual C++ Redistributable (x64) is not installed, and clawg.exe needs it. Nothing was changed. Install it from $VcRedistUrl and run this script again."
+    }
+
+    # A copy next to the script wins; piped to Invoke-Expression there is no script
+    # directory, and the latest release is fetched further down.
+    $source = $null
+    if ($PSScriptRoot) {
+        $candidate = Join-Path $PSScriptRoot 'clawg.exe'
+        if (Test-Path -LiteralPath $candidate) { $source = $candidate }
+    }
+    $downloadDir = $null
+    function Remove-Download {
+        if ($downloadDir -and (Test-Path -LiteralPath $downloadDir)) {
+            Remove-Item -LiteralPath $downloadDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    trap { Remove-Download; break }
+
+    # Decided before anything is touched, so a refusal leaves the machine as it was.
+    $legacy = @(Get-LegacyEntry)
+    $foreign = Get-ForeignClawg $env:Path $InstallDir
+    if (($legacy.Count -gt 0 -or $foreign.Count -gt 0) -and -not $RemoveLegacy) {
+        $where = @($legacy | ForEach-Object { "$($_.Location) (registered as '$LegacyDisplayName')" }) + @($foreign)
+        throw "Another clawg install is present and would shadow the new one: $($where -join '; '). Nothing was changed. Run this script again with -RemoveLegacy to uninstall the registered one."
+    }
+    # Downloaded after the refusals above and before anything is removed or
+    # stopped, so a failed download or a wrong hash leaves the machine as it was.
+    if (-not $source) {
+        $downloadDir = Join-Path ([IO.Path]::GetTempPath()) "clawg-install-$([guid]::NewGuid().ToString('N'))"
+        New-Item -ItemType Directory -Path $downloadDir | Out-Null
+        Write-Host "Downloading $AssetName from the latest release"
+        $source = Save-VerifiedRelease $downloadDir
+    }
+
+    foreach ($entry in $legacy) {
+        Write-Host "Removing legacy install at $($entry.Location)"
+        Remove-LegacyInstall $entry
+    }
+    # A copy no uninstaller owns cannot be removed from here; the check at the end
+    # still fails loudly if it is the one that wins.
+    foreach ($path in $foreign) {
+        if (Test-Path -LiteralPath $path) {
+            Write-Warning "Another clawg.exe is on the PATH and was not removed: $path"
+        }
+    }
+
+    # The previous binary is the one that can talk to the running daemon, so it
+    # does the stopping. "No daemon running" is reported on stderr, which Windows
+    # PowerShell 5.1 turns into a terminating error under 'Stop', so the check is
+    # done with errors relaxed.
+    #
+    # `stop` exits 1 both when no daemon was running and when it did not end in
+    # time, so its exit code cannot tell the two apart. `status` exits 0 only when
+    # a daemon still answers, which is exactly the case where replacing the binary
+    # would leave the old version serving with the store locked.
+    if (Test-Path -LiteralPath $target) {
+        $ErrorActionPreference = 'Continue'
+        & $target stop --profile prod *> $null
+        & $target status --profile prod *> $null
+        $stillRunning = $LASTEXITCODE -eq 0
+        $ErrorActionPreference = 'Stop'
+        if ($stillRunning) {
+            throw "The clawg daemon for the prod profile is still running after 'clawg stop', so the binary was not replaced. Stop it (or close the editor whose MCP keeps restarting it) and run this script again."
+        }
+    }
+
+    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+
+    # Binaries set aside by earlier runs. One that is still mapped cannot be
+    # deleted yet and is left for a later run.
+    Get-ChildItem -LiteralPath $InstallDir -Filter 'clawg.exe.old-*' |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+
+    # Windows refuses to overwrite an executable that another process has mapped:
+    # a running clawg, but also an antivirus or the search indexer reading it, with
+    # no clawg process left. Renaming a mapped file is allowed, so the previous
+    # binary is moved aside instead of overwritten.
+    $aside = $null
+    if (Test-Path -LiteralPath $target) {
+        $aside = "$target.old-$(Get-Date -Format yyyyMMddHHmmssfff)"
+        try {
+            Move-Item -LiteralPath $target -Destination $aside
+        }
+        catch {
+            throw "Could not move the previous $target out of the way. Nothing was changed. ($($_.Exception.Message))"
+        }
+    }
     try {
-        Move-Item -LiteralPath $target -Destination $aside
+        Copy-Item -LiteralPath $source -Destination $target
     }
     catch {
-        throw "Could not move the previous $target out of the way. Nothing was changed. ($($_.Exception.Message))"
-    }
-}
-try {
-    Copy-Item -LiteralPath $source -Destination $target
-}
-catch {
-    $reason = $_.Exception.Message
-    if ($aside) { Move-Item -LiteralPath $aside -Destination $target -ErrorAction SilentlyContinue }
-    throw "Could not copy clawg.exe to $target; the previous binary was left in place. ($reason)"
-}
-
-Remove-Download
-
-if (-not $SkipPath) {
-    & $target path add --dir $InstallDir
-    if ($LASTEXITCODE -ne 0) {
-        throw "clawg could not update the user PATH (exit code $LASTEXITCODE)."
+        $reason = $_.Exception.Message
+        if ($aside) { Move-Item -LiteralPath $aside -Destination $target -ErrorAction SilentlyContinue }
+        throw "Could not copy clawg.exe to $target; the previous binary was left in place. ($reason)"
     }
 
-    $shadow = Get-ShadowMessage (Find-ClawgInPath (Get-FreshPath)) $target
-    if ($shadow) { throw $shadow }
-}
+    Remove-Download
 
-& $target --version
-Write-Host "Installed to $target"
-if ($SkipPath) {
-    Write-Host 'PATH left untouched: not checked whether "clawg" resolves to this install.'
-}
-else {
-    Write-Host 'Open a new terminal so the updated PATH is picked up.'
+    if (-not $SkipPath) {
+        & $target path add --dir $InstallDir
+        if ($LASTEXITCODE -ne 0) {
+            throw "clawg could not update the user PATH (exit code $LASTEXITCODE)."
+        }
+
+        $shadow = Get-ShadowMessage (Find-ClawgInPath (Get-FreshPath)) $target
+        if ($shadow) { throw $shadow }
+    }
+
+    & $target --version
+    Write-Host "Installed to $target"
+    if ($SkipPath) {
+        Write-Host 'PATH left untouched: not checked whether "clawg" resolves to this install.'
+    }
+    else {
+        Write-Host 'Open a new terminal so the updated PATH is picked up.'
+    }
 }
