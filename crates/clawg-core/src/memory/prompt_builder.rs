@@ -4,6 +4,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::memory::provenance::mark;
 use crate::memory::{
     access::AccessTracker,
     clock::TimestampMs,
@@ -110,9 +111,12 @@ struct ConflictPair {
     old_id: i64,
     old_created_at: TimestampMs,
     old_content: String,
+    /// What the block shows of each side's origin (`provenance::mark`).
+    old_mark: Option<&'static str>,
     new_id: i64,
     new_created_at: TimestampMs,
     new_content: String,
+    new_mark: Option<&'static str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -563,20 +567,24 @@ fn format_conflict_block(pairs: &[ConflictPair], hit_positions: &HashMap<i64, us
         }
     }
     let mut printed: HashSet<i64> = HashSet::new();
-    let mut side = |id: i64, created_at: TimestampMs, content: &str, label: &str| {
+    let mut side = |id: i64, created_at: TimestampMs, content: &str, label: &str, origin: Option<&str>| {
+        let origin = origin.map(|m| format!(" {m}")).unwrap_or_default();
         if hit_positions.contains_key(&id) || !printed.insert(id) {
-            format!("#{id}")
+            format!("#{id}{origin}")
         } else {
             let (y, m, d) = unix_millis_to_ymd(created_at);
-            format!("[{y:04}-{m:02}-{d:02} #{id}{label}] {content}")
+            format!("[{y:04}-{m:02}-{d:02} #{id}{label}{origin}] {content}")
         }
     };
 
     let mut out = format!("{CONFLICT_NOTE}\n");
     for (first, members) in groups {
-        out.push_str(&format!("NEW {}\n", side(first.new_id, first.new_created_at, &first.new_content, " disputed")));
+        out.push_str(&format!(
+            "NEW {}\n",
+            side(first.new_id, first.new_created_at, &first.new_content, " disputed", first.new_mark)
+        ));
         for p in members {
-            out.push_str(&format!("OLD {}\n", side(p.old_id, p.old_created_at, &p.old_content, "")));
+            out.push_str(&format!("OLD {}\n", side(p.old_id, p.old_created_at, &p.old_content, "", p.old_mark)));
         }
     }
     if omitted > 0 {
@@ -671,7 +679,8 @@ async fn fetch_active_conflicts(
         .call(move |c| -> Result<Vec<ConflictPair>, rusqlite::Error> {
             let mut stmt = c.prepare(
                 "SELECT m_old.id, m_old.created_at, m_old.content,
-                        m_new.id, m_new.created_at, m_new.content
+                        m_new.id, m_new.created_at, m_new.content,
+                        m_old.source, m_old.created_by_type, m_new.source, m_new.created_by_type
                  FROM memory m_new
                  JOIN memory m_old
                    ON m_old.id IN (SELECT value FROM json_each(m_new.disputed_against))
@@ -684,13 +693,18 @@ async fn fetch_active_conflicts(
             )?;
             let pairs: Vec<ConflictPair> = stmt
                 .query_map(rusqlite::params![agent, shown], |row| {
+                    let side = |at: usize| -> rusqlite::Result<Option<&'static str>> {
+                        Ok(mark(&row.get::<_, String>(at)?, &row.get::<_, String>(at + 1)?))
+                    };
                     Ok(ConflictPair {
                         old_id: row.get(0)?,
                         old_created_at: row.get(1)?,
                         old_content: row.get(2)?,
+                        old_mark: side(6)?,
                         new_id: row.get(3)?,
                         new_created_at: row.get(4)?,
                         new_content: row.get(5)?,
+                        new_mark: side(8)?,
                     })
                 })?
                 .filter_map(|r| r.ok())
@@ -842,10 +856,24 @@ mod tests {
             old_id,
             old_created_at: TimestampMs::from_unix_millis(1_690_000_000_000),
             old_content: format!("old fact {old_id}"),
+            old_mark: None,
             new_id,
             new_created_at: TimestampMs::from_unix_millis(1_700_000_000_000),
             new_content: format!("new fact {new_id}"),
+            new_mark: None,
         }
+    }
+
+    #[test]
+    fn the_conflict_block_marks_an_inferred_side() {
+        let inferred = || ConflictPair { new_mark: Some("inferred"), ..pair(1, 2) };
+
+        let printed = format_conflict_block(&[inferred()], &HashMap::new(), 0);
+        assert!(printed.contains("#2 disputed inferred] new fact 2\n"), "{printed}");
+        assert!(printed.contains(" #1] old fact 1\n"), "{printed}");
+
+        let cited = format_conflict_block(&[inferred()], &HashMap::from([(2, 0)]), 0);
+        assert!(cited.contains("NEW #2 inferred\n"), "{cited}");
     }
 
     fn new_old(pairs: &[ConflictPair]) -> Vec<(i64, i64)> {

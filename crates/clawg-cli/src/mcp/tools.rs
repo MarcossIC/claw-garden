@@ -121,6 +121,14 @@ pub fn format_resolution(r: &Resolution) -> String {
     }
 }
 
+/// One side of a pair: its id, then what is shown of its origin.
+fn side((id, mark): (i64, Option<&str>)) -> String {
+    match mark {
+        Some(mark) => format!("#{id} {mark}"),
+        None => format!("#{id}"),
+    }
+}
+
 /// What `memory_status` says about the pairs the agent has not judged.
 pub fn format_open_pairs(open: &OpenPairs) -> String {
     if open.pending == 0 && open.escalated == 0 {
@@ -131,7 +139,12 @@ pub fn format_open_pairs(open: &OpenPairs) -> String {
         open.pending, open.escalated
     );
     for p in &open.pairs {
-        out.push_str(&format!("\n  #{} close to #{}", p.new_id, p.old_id));
+        let new = (p.new_id, p.new_mark.as_deref());
+        let old = (p.old_id, p.old_mark.as_deref());
+        // A side that may be the user's goes first: an inference is the one
+        // more likely to give way, though the agent still judges the pair.
+        let (first, second) = if new.1.is_some() && old.1.is_none() { (old, new) } else { (new, old) };
+        out.push_str(&format!("\n  {} close to {}", side(first), side(second)));
     }
     if open.pending > 0 {
         out.push_str(
@@ -428,6 +441,7 @@ pub fn format_status(
 mod tests {
     use super::*;
     use clawg_core::memory::outbox::{OutboxProblem, OutboxState, OutboxSummary};
+    use clawg_core::memory::dispute::OpenPair;
 
     fn hit(id: i64, kind: &str, memory_type: &str, tier: i64, score: f64, content: &str) -> Hit {
         Hit {
@@ -956,14 +970,44 @@ mod tests {
         assert!(out.ends_with("\nshared: reads every agent but claude-code, codex"), "out was: {out}");
     }
 
+    fn open_pair(new_id: i64, old_id: i64, new_mark: Option<&str>, old_mark: Option<&str>) -> OpenPair {
+        OpenPair {
+            new_id,
+            old_id,
+            distance: Some(0.3),
+            created_at: 1,
+            new_mark: new_mark.map(str::to_owned),
+            old_mark: old_mark.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn the_unmarked_side_of_a_pair_goes_first() {
+        let open = OpenPairs {
+            pending: 3,
+            escalated: 0,
+            pairs: vec![
+                open_pair(9, 4, Some("inferred"), None),
+                open_pair(12, 4, None, Some("inferred")),
+                open_pair(15, 13, Some("conclusion"), Some("inferred")),
+            ],
+        };
+
+        let out = format_open_pairs(&open);
+
+        assert!(out.contains("\n  #4 close to #9 inferred\n"), "{out}");
+        assert!(out.contains("\n  #12 close to #4 inferred\n"), "{out}");
+        assert!(out.contains("\n  #15 conclusion close to #13 inferred\n"), "{out}");
+    }
+
     #[test]
     fn format_status_ends_with_the_open_pairs() {
         let open = OpenPairs {
             pending: 2,
             escalated: 1,
             pairs: vec![
-                clawg_core::memory::dispute::OpenPair { new_id: 9, old_id: 4, distance: Some(0.3), created_at: 1 },
-                clawg_core::memory::dispute::OpenPair { new_id: 12, old_id: 4, distance: None, created_at: 2 },
+                open_pair(9, 4, None, None),
+                open_pair(12, 4, None, None),
             ],
         };
         let out = format_status(&health(), Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", Some(&format_open_pairs(&open)));

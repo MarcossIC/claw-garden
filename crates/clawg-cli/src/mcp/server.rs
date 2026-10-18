@@ -2722,7 +2722,7 @@ mod tests {
 
         let t = status("agent-mcp").await;
         assert!(t.contains("conflict candidates: 1 for you to judge, 0 waiting for the user"), "{t}");
-        assert!(t.contains(&format!("#{new} close to #{old}")), "{t}");
+        assert!(t.contains(&format!("#{new} inferred close to #{old} inferred")), "two undeclared saves: {t}");
         assert!(status("agent-other").await.ends_with("\nconflict candidates: none open"));
     }
 
