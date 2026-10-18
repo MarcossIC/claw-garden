@@ -593,6 +593,9 @@ pub struct MemoryAdminRow {
     /// conclusion has them; every other row omits the field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub derived_from: Option<Vec<i64>>,
+    /// The topic key the row was saved under; only `memory` rows have one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic_key: Option<String>,
 }
 
 /// Filter/pagination params for `list_memories_core`. `kind: None` merges
@@ -774,7 +777,8 @@ pub(crate) const SELECT_MEMORY: &str = "SELECT id, scope, agent_id, project_id, 
      tier, importance, status, access_count, created_at, last_accessed_at, superseded_by, \
      deleted_at, source, source_session_id, created_by_type, created_by_ref, \
      last_modified_at, update_count, dispute_count, disputed_against, last_disputed_at, \
-     (SELECT json_group_array(source_id) FROM memory_derivation WHERE memory_id = memory.id) \
+     (SELECT json_group_array(source_id) FROM memory_derivation WHERE memory_id = memory.id), \
+     topic_key \
      FROM memory";
 const SELECT_EPISODIC: &str = "SELECT id, scope, agent_id, project_id, task, tier, importance, \
      status, access_count, created_at, last_accessed_at, superseded_by, deleted_at \
@@ -881,6 +885,7 @@ pub(crate) fn map_memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory
         disputed_against: row.get(21)?,
         last_disputed_at: row.get(22)?,
         derived_from: sources_from_json(&row.get::<_, String>(23)?),
+        topic_key: row.get(24)?,
     })
 }
 
@@ -946,6 +951,7 @@ fn map_episodic_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryAdminRow>
         disputed_against: None,
         last_disputed_at: None,
         derived_from: None,
+        topic_key: None,
     })
 }
 
@@ -1002,6 +1008,7 @@ fn map_procedural_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryAdminRo
         disputed_against: None,
         last_disputed_at: None,
         derived_from: None,
+        topic_key: None,
     })
 }
 

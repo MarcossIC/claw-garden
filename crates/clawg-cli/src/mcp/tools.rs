@@ -190,7 +190,7 @@ pub fn format_rows(rows: &[MemoryRow]) -> String {
     rows.iter()
         .map(|r| {
             format!(
-                "#{} {} {} t{} imp={:.1} acc={} {}{} {}",
+                "#{} {} {} t{} imp={:.1} acc={} {}{}{} {}",
                 r.id,
                 r.kind,
                 // Only `memory` rows have a type; a dash keeps every later
@@ -200,12 +200,26 @@ pub fn format_rows(rows: &[MemoryRow]) -> String {
                 r.importance,
                 r.access_count,
                 r.status,
+                revision(r),
                 sources(r),
                 truncate_content(&r.summary, CONTENT_PREVIEW_LIMIT)
             )
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// ` by=#9` for a superseded row and ` topic=K` for a row saved under a key,
+/// so a listing shows the versions of a topic and which one replaced which.
+fn revision(r: &MemoryRow) -> String {
+    let mut out = String::new();
+    if let (Some(by), "superseded") = (r.superseded_by, r.status.as_str()) {
+        out.push_str(&format!(" by=#{by}"));
+    }
+    if let Some(key) = &r.topic_key {
+        out.push_str(&format!(" topic={key}"));
+    }
+    out
 }
 
 /// ` from=#3,#7` for a conclusion, nothing for any other row.
@@ -505,6 +519,25 @@ mod tests {
             access_count: 3,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn rows_show_their_key_and_who_replaced_them() {
+        let current = MemoryRow { topic_key: Some("storage/engine".into()), ..row(9, "memory", Some("architectural_decision"), "postgres") };
+        let old = MemoryRow {
+            status: "superseded".into(),
+            superseded_by: Some(9),
+            topic_key: Some("storage/engine".into()),
+            ..row(4, "memory", Some("architectural_decision"), "sqlite")
+        };
+        let plain = row(2, "memory", Some("semantic_fact"), "tabs");
+
+        let out = format_rows(&[current, old, plain]);
+
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "#9 memory architectural_decision t2 imp=5.0 acc=3 active topic=storage/engine postgres");
+        assert_eq!(lines[1], "#4 memory architectural_decision t2 imp=5.0 acc=3 superseded by=#9 topic=storage/engine sqlite");
+        assert_eq!(lines[2], "#2 memory semantic_fact t2 imp=5.0 acc=3 active tabs");
     }
 
     // ── truncate_content ────────────────────────────────────────────────────

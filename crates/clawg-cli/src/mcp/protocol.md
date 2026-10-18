@@ -64,6 +64,10 @@ Every row competes with the others in search, so leave out:
   identifier finds the memories that contain it.
 - One fact per call. A save that mixes two topics makes search pick one piece
   of it.
+- A decision or a preference that may change later gets a `topic_key`, a
+  short stable name such as `storage/engine`. When it changes, save the new
+  version under the same `topic_key`: it replaces the old one, which stays in
+  the history, and the answer names what it replaced.
 - Write it so it reads on its own months from now, with no conversation
   around it.
 - Write it in English, and search in English too. A memory saved in one

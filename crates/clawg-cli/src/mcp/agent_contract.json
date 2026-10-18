@@ -269,6 +269,14 @@
               "string",
               "null"
             ]
+          },
+          "topic_key": {
+            "default": null,
+            "description": "A stable name for what this memory is about, such as `storage/engine`:\nlowercase segments of a-z, 0-9, '.', '_' or '-' joined by '/', at most\n80 characters. Saving again under the same key replaces the memory\nsaved under it, which stays in the history. Omit for a new topic.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [

@@ -174,6 +174,12 @@ pub struct SaveMemoryArgs {
     /// `synthesize` lists them. Omit for an ordinary memory.
     #[serde(default)]
     pub derived_from: Option<Vec<i64>>,
+    /// A stable name for what this memory is about, such as `storage/engine`:
+    /// lowercase segments of a-z, 0-9, '.', '_' or '-' joined by '/', at most
+    /// 80 characters. Saving again under the same key replaces the memory
+    /// saved under it, which stays in the history. Omit for a new topic.
+    #[serde(default)]
+    pub topic_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -554,7 +560,7 @@ impl ClawgMcp {
             memories.iter().map(|m| format!("#{}", m.id)).collect::<Vec<_>>().join(", ")
         };
         match result {
-            Ok(SaveOutcome::Saved { memories, redacted, related }) => {
+            Ok(SaveOutcome::Saved { memories, redacted, related, replaced, key_dropped }) => {
                 let mut text = match memories.as_slice() {
                     [one] if one.outcome == "reinforced" => format!(
                         "already stored as #{}; reinforced it instead of saving a copy \
@@ -570,6 +576,16 @@ impl ClawgMcp {
                 };
                 if !redacted.is_empty() {
                     text.push_str(&format!("; masked {} before storing it", redacted.join(", ")));
+                }
+                if !replaced.is_empty() {
+                    let named: Vec<String> = replaced.iter().map(|r| format!("#{} \"{}\"", r.id, r.excerpt)).collect();
+                    text.push_str(&format!("; replaces {}", named.join(", ")));
+                }
+                if key_dropped {
+                    text.push_str(
+                        "; the running clawg daemon predates topic_key, so this replaced nothing: restart it \
+                         with the installed clawg (`clawg stop`, then save again)",
+                    );
                 }
                 if !related.is_empty() {
                     text.push_str(&related_text(&related));
@@ -694,6 +710,7 @@ impl ClawgMcp {
                         memory_type: args.memory_type.clone(),
                         importance: args.importance,
                         derived_from: args.derived_from.clone().unwrap_or_default(),
+                        topic_key: args.topic_key.clone(),
                     })
                     .await
             })
@@ -1230,7 +1247,7 @@ mod tests {
     use clawg_core::memory::bootstrap::EmbedderStatus;
     use clawg_core::runtime::MemoryRuntime;
 
-    use crate::client::{ErrorDetails, ListArgs, SaveArgs, SaveOutcome, SavedMemory};
+    use crate::client::{ErrorDetails, ListArgs, ReplacedMemory, SaveArgs, SaveOutcome, SavedMemory};
     use crate::daemon::api::{router, AppCtx, SAVE_CONFIRM_TIMEOUT};
     use crate::mcp::tools::CONTENT_PREVIEW_LIMIT;
 
@@ -1333,7 +1350,14 @@ mod tests {
     }
 
     fn save_args(content: &str) -> SaveMemoryArgs {
-        SaveMemoryArgs { content: content.into(), memory_type: None, importance: None, project_path: None, derived_from: None }
+        SaveMemoryArgs {
+            content: content.into(),
+            memory_type: None,
+            importance: None,
+            project_path: None,
+            derived_from: None,
+            topic_key: None,
+        }
     }
 
     #[tokio::test]
@@ -1349,6 +1373,7 @@ mod tests {
                 memory_type: None,
                 importance: None,
                 derived_from: Vec::new(),
+                topic_key: None,
             })
             .await
             .expect("seed a legacy row");
@@ -1726,6 +1751,7 @@ mod tests {
                 memory_type: None,
                 importance: None,
                 derived_from: Vec::new(),
+                topic_key: None,
             })
             .await
             .expect("save");
@@ -1777,6 +1803,7 @@ mod tests {
                 memory_type: None,
                 importance: None,
                 derived_from: Vec::new(),
+                topic_key: None,
             })
             .await
             .expect("save");
@@ -2391,6 +2418,7 @@ mod tests {
                     importance: Some(8.0),
                     project_path: None,
                     derived_from: None,
+                    topic_key: None,
                 },
             )
             .await
@@ -2459,6 +2487,7 @@ mod tests {
                     importance: None,
                     project_path: None,
                     derived_from: None,
+                    topic_key: None,
                 },
             )
             .await
@@ -2500,14 +2529,14 @@ mod tests {
         assert_eq!(
             text(Ok(SaveOutcome::Saved {
                 memories: vec![saved(57, "inserted")],
-                redacted: vec!["slack_token".into()], related: vec![]
+                redacted: vec!["slack_token".into()], related: vec![], replaced: vec![], key_dropped: false
             })),
             Ok("saved #57; masked slack_token before storing it".to_string())
         );
         assert_eq!(
             text(Ok(SaveOutcome::Saved {
                 memories: vec![saved(57, "reinforced")],
-                redacted: vec!["github_token".into(), "jwt".into()], related: vec![]
+                redacted: vec!["github_token".into(), "jwt".into()], related: vec![], replaced: vec![], key_dropped: false
             })),
             Ok("already stored as #57; reinforced it instead of saving a copy \
                 (update_memory changes its importance or type); \
@@ -2520,18 +2549,18 @@ mod tests {
     fn save_outcome_text_covers_every_daemon_answer() {
         let text = |r| ClawgMcp::save_outcome_text(r);
         assert_eq!(
-            text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "inserted")], redacted: vec![], related: vec![] })),
+            text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "inserted")], redacted: vec![], related: vec![], replaced: vec![], key_dropped: false })),
             Ok("saved #57".to_string())
         );
         assert_eq!(
             text(Ok(SaveOutcome::Saved {
                 memories: vec![saved(57, "inserted"), saved(58, "inserted"), saved(59, "reinforced")],
-                redacted: vec![], related: vec![]
+                redacted: vec![], related: vec![], replaced: vec![], key_dropped: false
             })),
             Ok("saved as 3 pieces: #57, #58, #59; read_memory with any of them returns the whole text".to_string())
         );
         assert_eq!(
-            text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "reinforced")], redacted: vec![], related: vec![] })),
+            text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "reinforced")], redacted: vec![], related: vec![], replaced: vec![], key_dropped: false })),
             Ok("already stored as #57; reinforced it instead of saving a copy \
                 (update_memory changes its importance or type)"
                 .to_string())
@@ -2729,7 +2758,7 @@ mod tests {
             let saved = b
                 .save_memory_impl(
                     "agent-mcp",
-                    SaveMemoryArgs { content: content.into(), memory_type: None, importance: None, project_path: None, derived_from: None },
+                    SaveMemoryArgs { content: content.into(), ..save_args("") },
                 )
                 .await
                 .expect("save");
@@ -2784,6 +2813,8 @@ mod tests {
             memories: vec![saved(57, "inserted")],
             redacted: vec![],
             related: vec![related(12, false), related(15, true)],
+            replaced: vec![],
+            key_dropped: false,
         }));
         assert_eq!(
             text,
@@ -2792,6 +2823,83 @@ mod tests {
                 if both hold, compatible or scoped"
                 .to_string())
         );
+    }
+
+    #[test]
+    fn save_outcome_text_names_the_replaced_memories() {
+        let replaced = |id| ReplacedMemory { id, excerpt: format!("claim {id}") };
+        let text = ClawgMcp::save_outcome_text(Ok(SaveOutcome::Saved {
+            memories: vec![saved(57, "inserted")],
+            redacted: vec![],
+            related: vec![],
+            replaced: vec![replaced(12), replaced(13)],
+            key_dropped: false,
+        }));
+        assert_eq!(text, Ok("saved #57; replaces #12 \"claim 12\", #13 \"claim 13\"".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_key_sent_to_an_older_daemon_is_reported() {
+        // A daemon from before topic keys ignores the field and answers the
+        // save without echoing it.
+        use axum::routing::post;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr: SocketAddr = listener.local_addr().expect("addr");
+        let app = axum::Router::new().route(
+            "/v1/memories",
+            post(|| async {
+                (
+                    axum::http::StatusCode::CREATED,
+                    axum::Json(serde_json::json!({
+                        "status": "saved",
+                        "memories": [{ "kind": "memory", "id": 5, "outcome": "inserted" }],
+                        "operation_id": "op-1"
+                    })),
+                )
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let dir = tempfile::tempdir().expect("tempdir");
+        let client = DaemonClient::new(format!("http://127.0.0.1:{}", addr.port()), "t", dir.path().to_path_buf());
+        let b = ClawgMcp::with_project(client, Profile::Dev, Some(test_project()));
+
+        let r = b
+            .save_memory_impl("agent-mcp", SaveMemoryArgs { topic_key: Some("storage/engine".into()), ..save_args("v2") })
+            .await
+            .expect("call");
+
+        assert!(!is_error(&r), "the save itself went through: {}", text(&r));
+        let said = text(&r);
+        assert!(said.starts_with("saved #5"), "{said}");
+        assert!(said.contains("replaced nothing") && said.contains("clawg stop"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn save_memory_revises_by_topic_key() {
+        let (b, _d) = bridge().await;
+        let first = b
+            .save_memory_impl("agent-mcp", SaveMemoryArgs { topic_key: Some("storage/engine".into()), ..save_args("Storage engine is SQLite") })
+            .await
+            .expect("call");
+        let old = text(&first);
+
+        let second = b
+            .save_memory_impl(
+                "agent-mcp",
+                SaveMemoryArgs { topic_key: Some("storage/engine".into()), ..save_args("Storage engine moved to Postgres") },
+            )
+            .await
+            .expect("call");
+
+        let id = old.trim_start_matches("saved #").to_string();
+        assert_eq!(text(&second).split_once("; ").map(|(_, r)| r.to_string()), Some(format!("replaces #{id} \"Storage engine is SQLite\"")));
+        let bad = b
+            .save_memory_impl("agent-mcp", SaveMemoryArgs { topic_key: Some("Storage Engine".into()), ..save_args("x") })
+            .await
+            .expect("call");
+        assert!(is_error(&bad) && text(&bad).contains("topic_key"), "{}", text(&bad));
     }
 
     #[tokio::test]
@@ -3095,6 +3203,7 @@ mod tests {
                 importance: None,
                 project_path: Some("/some/elsewhere".into()),
                 derived_from: None,
+                topic_key: None,
             },
         )
         .await
