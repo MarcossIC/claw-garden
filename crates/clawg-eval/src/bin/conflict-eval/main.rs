@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 
 use clawg_core::eval_api::{conflict_pairs, model_is_cached, EvalEmbedder, EvalIngest};
 
-use measure::{by, flow_report, gate, parse_pairs, requirement_sentences, Class, ClassReport, PairOutcome};
+use measure::{
+    by, flow_report, gate, parse_flow, parse_pairs, requirement_sentences, Class, ClassReport, FlowSave, PairOutcome,
+};
 
 const EXIT_OK: i32 = 0;
 const EXIT_RUNTIME_FAILURE: i32 = 1;
@@ -21,12 +23,15 @@ const EXIT_INPUT_INVALID: i32 = 2;
 const EXIT_MODEL_ABSENT: i32 = 3;
 
 const HELP_TEXT: &str = "\
-conflict-eval (--real | --fake) [--pairs FILE] [--specs DIR] [--out FILE]
+conflict-eval (--real | --fake) [--pairs FILE] [--specs DIR | --flow FILE] [--out FILE]
 
   --real        the cached embedding model of the data profile
   --fake        the deterministic double: checks the pipeline, not the numbers
   --pairs FILE  labelled pairs (default: crates/clawg-eval/data/conflict-pairs.json)
-  --specs DIR   spec files whose MUST sentences make the flow (default: openspec/specs)
+  --specs DIR   spec files whose MUST sentences make the flow, each saved as a
+                semantic_fact (default: openspec/specs)
+  --flow FILE   the flow instead: a JSON array of {\"content\", \"memory_type\"},
+                saved in its order
   --out FILE    also write the JSON report there
 
 Prints the JSON report. Exit 0 measured, 1 failed, 2 bad input, 3 model not cached.";
@@ -36,6 +41,7 @@ struct Options {
     real: bool,
     pairs: PathBuf,
     specs: PathBuf,
+    flow: Option<PathBuf>,
     out: Option<PathBuf>,
 }
 
@@ -44,6 +50,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
     let mut real = None;
     let mut pairs = root.join("data/conflict-pairs.json");
     let mut specs = root.join("../../openspec/specs");
+    let mut flow = None;
     let mut out = None;
     let mut args = args.skip(1);
     while let Some(arg) = args.next() {
@@ -55,12 +62,13 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
             "--fake" => real = Some(false),
             "--pairs" => pairs = PathBuf::from(value("--pairs")?),
             "--specs" => specs = PathBuf::from(value("--specs")?),
+            "--flow" => flow = Some(PathBuf::from(value("--flow")?)),
             "--out" => out = Some(PathBuf::from(value("--out")?)),
             other => return Err(format!("unknown argument {other}")),
         }
     }
     let real = real.ok_or("pass --real or --fake")?;
-    Ok(Some(Options { real, pairs, specs, out }))
+    Ok(Some(Options { real, pairs, specs, flow, out }))
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -87,14 +95,15 @@ async fn run(args: impl Iterator<Item = String>) -> i32 {
             return EXIT_INPUT_INVALID;
         }
     };
-    let facts = match read_flow(&options.specs) {
-        Ok(facts) if !facts.is_empty() => facts,
+    let source = options.flow.as_deref().unwrap_or(&options.specs);
+    let flow = match flow_saves(options.flow.as_deref(), &options.specs) {
+        Ok(flow) if !flow.is_empty() => flow,
         Ok(_) => {
-            eprintln!("{}: no MUST sentence to make a flow of", options.specs.display());
+            eprintln!("{}: no save to make a flow of", source.display());
             return EXIT_INPUT_INVALID;
         }
         Err(e) => {
-            eprintln!("{}: {e}", options.specs.display());
+            eprintln!("{}: {e}", source.display());
             return EXIT_INPUT_INVALID;
         }
     };
@@ -123,7 +132,7 @@ async fn run(args: impl Iterator<Item = String>) -> i32 {
     };
     let tokenizer_dir = if options.real { base_dir.clone() } else { std::env::temp_dir() };
 
-    match measure_all(&embedder, &tokenizer_dir, &pairs, &facts, options.real).await {
+    match measure_all(&embedder, &tokenizer_dir, &pairs, &flow, options.real).await {
         Ok(report) => {
             let json = serde_json::to_string_pretty(&report).expect("the report always serializes");
             println!("{json}");
@@ -161,6 +170,19 @@ fn read_flow(dir: &Path) -> std::io::Result<Vec<String>> {
     Ok(facts)
 }
 
+/// The saves of `flow` when given, else every MUST sentence under `specs`
+/// saved as a fact.
+fn flow_saves(flow: Option<&Path>, specs: &Path) -> Result<Vec<FlowSave>, String> {
+    match flow {
+        Some(file) => parse_flow(&std::fs::read_to_string(file).map_err(|e| e.to_string())?),
+        None => Ok(read_flow(specs)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|content| FlowSave { content, memory_type: "semantic_fact".into() })
+            .collect()),
+    }
+}
+
 #[derive(serde::Serialize)]
 struct Report<'a> {
     model: &'static str,
@@ -176,7 +198,7 @@ async fn measure_all<'a>(
     embedder: &EvalEmbedder,
     tokenizer_dir: &Path,
     pairs: &'a [measure::LabelledPair],
-    facts: &[String],
+    flow: &[FlowSave],
     real: bool,
 ) -> Result<Report<'a>, String> {
     let mut outcomes: Vec<(Class, PairOutcome)> = Vec::new();
@@ -195,8 +217,8 @@ async fn measure_all<'a>(
 
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let ingest = EvalIngest::open(dir.path(), embedder, tokenizer_dir).await.map_err(|e| e.to_string())?;
-    for fact in facts {
-        ingest.send(AGENT, fact, "semantic_fact", 5.0).await.map_err(|e| e.to_string())?;
+    for save in flow {
+        ingest.send(AGENT, &save.content, &save.memory_type, 5.0).await.map_err(|e| e.to_string())?;
     }
     let runtime = ingest.finish().await.map_err(|e| e.to_string())?;
     let flow_pairs: Vec<(i64, bool)> = conflict_pairs(&runtime)
@@ -205,7 +227,7 @@ async fn measure_all<'a>(
         .into_iter()
         .map(|p| (p.new_id, p.escalated))
         .collect();
-    let flow = flow_report(facts.len(), &flow_pairs);
+    let flow = flow_report(flow.len(), &flow_pairs);
 
     let classes = by(&outcomes);
     let contradiction = classes.get(&Class::Contradiction).cloned().ok_or("no contradiction pair was measured")?;
@@ -233,10 +255,29 @@ mod tests {
         assert!(!o.real);
         assert_eq!(o.out, Some(PathBuf::from("r.json")));
         assert!(o.pairs.ends_with("data/conflict-pairs.json"));
+        assert_eq!(o.flow, None);
+        let o = parse_args(args(&["--real", "--flow", "saves.json"])).unwrap().unwrap();
+        assert_eq!(o.flow, Some(PathBuf::from("saves.json")));
         assert_eq!(parse_args(args(&["--help"])).unwrap(), None);
         assert!(parse_args(args(&[])).is_err());
         assert!(parse_args(args(&["--real", "--fake"])).is_err());
         assert!(parse_args(args(&["--pairs"])).is_err());
+        assert!(parse_args(args(&["--fake", "--flow"])).is_err());
+    }
+
+    #[test]
+    fn without_a_flow_file_the_flow_is_the_spec_sentences_as_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("a")).unwrap();
+        std::fs::write(dir.path().join("a/spec.md"), "- La fila MUST quedar `active` cuando no queda ninguna disputa.\n").unwrap();
+        let flow = flow_saves(None, dir.path()).unwrap();
+        assert_eq!(
+            flow,
+            vec![FlowSave {
+                content: "La fila MUST quedar `active` cuando no queda ninguna disputa.".into(),
+                memory_type: "semantic_fact".into(),
+            }]
+        );
     }
 
     #[test]
@@ -256,10 +297,13 @@ mod tests {
             .iter()
             .flat_map(|c| pairs.iter().filter(move |p| p.class == *c).take(1).cloned())
             .collect();
-        let facts = vec!["the first fact of the flow is long enough".to_string(), "a second fact".to_string()];
+        let flow = vec![
+            FlowSave { content: "the first fact of the flow is long enough".into(), memory_type: "semantic_fact".into() },
+            FlowSave { content: "a preference of the flow".into(), memory_type: "user_preference".into() },
+        ];
         let tokenizer = tempfile::tempdir().unwrap();
 
-        let report = measure_all(&EvalEmbedder::fake(), tokenizer.path(), &few, &facts, false).await.unwrap();
+        let report = measure_all(&EvalEmbedder::fake(), tokenizer.path(), &few, &flow, false).await.unwrap();
 
         assert_eq!(report.by_class.len(), Class::ALL.len());
         assert_eq!(report.flow.saves, 2);

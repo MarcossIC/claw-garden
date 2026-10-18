@@ -55,6 +55,22 @@ pub struct LabelledPair {
     pub new: String,
 }
 
+/// One save of a flow: its text and the memory type it is saved with.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct FlowSave {
+    pub content: String,
+    pub memory_type: String,
+}
+
+/// Parses a flow file: a JSON array of saves, replayed in its order.
+pub fn parse_flow(text: &str) -> Result<Vec<FlowSave>, String> {
+    let saves: Vec<FlowSave> = serde_json::from_str(text).map_err(|e| format!("not a flow file: {e}"))?;
+    if let Some(i) = saves.iter().position(|s| s.content.trim().is_empty()) {
+        return Err(format!("save {i} has no content"));
+    }
+    Ok(saves)
+}
+
 #[derive(Debug, Deserialize)]
 struct PairsFile {
     version: u32,
@@ -252,6 +268,20 @@ mod tests {
             requirement_sentences(spec),
             vec!["La fila MUST quedar `active` cuando no queda ninguna disputa abierta.".to_string()]
         );
+    }
+
+    #[test]
+    fn a_flow_file_is_read_in_order() {
+        let text = r#"[{"content":"the api listens on 8080","memory_type":"semantic_fact"},
+                       {"content":"indent with tabs","memory_type":"user_preference"}]"#;
+        let save = |content: &str, memory_type: &str| FlowSave { content: content.into(), memory_type: memory_type.into() };
+        assert_eq!(
+            parse_flow(text).unwrap(),
+            vec![save("the api listens on 8080", "semantic_fact"), save("indent with tabs", "user_preference")]
+        );
+        let err = parse_flow(r#"[{"content":"  ","memory_type":"semantic_fact"}]"#).unwrap_err();
+        assert!(err.contains("save 0 has no content"), "{err}");
+        assert!(parse_flow("{}").is_err());
     }
 
     #[test]
