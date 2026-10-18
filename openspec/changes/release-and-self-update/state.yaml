@@ -1,14 +1,14 @@
 change: release-and-self-update
 objective: "transversal"
 depends_on: []  # el arreglo de la poda de snapshots entra antes como fix aparte, fuera de openspec
-phase: apply
+phase: verify
 artifacts:
   exploration: done
   proposal: done
   spec: done
   design: done
   tasks: done
-  apply: in_progress
+  apply: done
   verify: pending
   archive: pending
 updated: 2026-10-18

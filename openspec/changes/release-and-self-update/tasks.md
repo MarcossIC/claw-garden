@@ -18,8 +18,8 @@ Reglas de todo el cambio:
   Commit: `chore: add the MIT license and publication metadata`
 - [x] 2. Test `reqwest_uses_rustls_with_the_system_roots` (`conventions.rs`). `reqwest` de `Cargo.toml` raíz con `default-features = false` y las features de D9; `Cargo.lock`. Después `cargo clean --target-dir target-test`.
   Commit: `build: use rustls with the system roots for reqwest`
-- [ ] M1. **Manual (un administrador del repositorio en GitHub, con `minisign`):** generar los dos pares minisign fuera del repositorio; la privada principal y su contraseña, como secretos del environment `release` (limitado a `main`, sin revisores); la privada de respaldo, fuera de GitHub. De aquí salen `minisign.pub` y `minisign-next.pub`. Pueden avanzar sin M1, sólo con claves de prueba, las tareas 1, 2, 4 a 17 y 19 a 38; dependen de M1 las tareas 3 y 18 (y la ejecución real de la tanda). Nunca se commitea una clave de relleno.
-- [ ] 3. **Depende de M1.** Test `the_release_keys_are_two_distinct_minisign_public_keys` (`conventions.rs`, por líneas: comentario `untrusted comment:`, segunda línea de 56 caracteres que empieza con `RW`, las dos distintas). Se commitean `release/minisign.pub` y `release/minisign-next.pub`.
+- [x] M1. **Manual (un administrador del repositorio en GitHub, con `minisign`):** generar los dos pares minisign fuera del repositorio; la privada principal y su contraseña, como secretos del environment `release` (limitado a `main`, sin revisores); la privada de respaldo, fuera de GitHub. De aquí salen `minisign.pub` y `minisign-next.pub`. Pueden avanzar sin M1, sólo con claves de prueba, las tareas 1, 2, 4 a 17 y 19 a 38; dependen de M1 las tareas 3 y 18 (y la ejecución real de la tanda). Nunca se commitea una clave de relleno.
+- [x] 3. **Depende de M1.** Test `the_release_keys_are_two_distinct_minisign_public_keys` (`conventions.rs`, por líneas: comentario `untrusted comment:`, segunda línea de 56 caracteres que empieza con `RW`, las dos distintas). Se commitean `release/minisign.pub` y `release/minisign-next.pub`.
   Commit: `chore: add the release signing public keys`
 - [x] 4. Test `third_party_actions_are_pinned_to_a_commit` y `the_release_workflow_publishes_only_for_a_successful_push_to_main` (`conventions.rs`; fallan: no existe `release.yml`). `.github/workflows/release.yml` con el disparador `workflow_run` y el job `plan` (D8: `event`, `conclusion`, `head_branch`, `head_repository`, tag existente, `concurrency`); SHAs resueltos con `gh api` al escribirlo, el tag en un comentario.
   Commit: `ci: add the release workflow trigger and plan job`
@@ -52,7 +52,7 @@ Reglas de todo el cambio:
   Commit: `feat(core): read the build version and distribution mark from one place`
 - [x] 17. Test `update_eligibility_cases` (cada negativa con su motivo; release marcado en `prod` pasa). `src/update/eligibility.rs` y la lectura de `.cargo-lock`.
   Commit: `feat(cli): decide whether a binary can update itself`
-- [ ] 18. **Depende de 3.** Test `the_embedded_key_list_has_the_primary_and_backup_keys_and_not_the_test_key` (`conventions.rs`, vía `clawg_cli::update::signature`). `include_str!` de las dos claves de `release/` y sustitución por `CLAWG_TEST_RELEASE_KEYS` sólo en `testing`.
+- [x] 18. **Depende de 3.** Test `the_embedded_key_list_has_the_primary_and_backup_keys_and_not_the_test_key` (`conventions.rs`, vía `clawg_cli::update::signature`). `include_str!` de las dos claves de `release/` y sustitución por `CLAWG_TEST_RELEASE_KEYS` sólo en `testing`.
   Commit: `feat(cli): embed the release public keys`
 - [x] 19. Test del cliente contra un servidor axum falso: `requests_carry_a_user_agent`, topes de tamaño, orden (firma antes del binario). `src/update/client.rs`.
   Commit: `feat(cli): query the release server on request`
