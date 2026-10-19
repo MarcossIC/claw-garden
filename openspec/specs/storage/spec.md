@@ -1,6 +1,6 @@
 # storage — Especificación
 
-Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde queda un save aceptado hasta que termina de guardarse, el apagado del daemon, la reinyección de lo pendiente al arrancar y la importación del volcado de versiones anteriores, la resolución del directorio de datos, el runner de migraciones y la verificación del esquema, el pooling del modelo y el re-embebido de un store CLS al arrancar, el ciclo de vida del embedder (soltar el modelo ocioso, recargarlo, un solo tokenizer por proceso y la memoria que vuelve al sistema), los snapshots, `clawg backup` y `clawg restore`, la escritura de `workspace.md`, y lo que `clawg status`, MCP y el instalador dicen cuando la base no se puede abrir.
+Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde queda un save aceptado hasta que termina de guardarse, el apagado del daemon, la reinyección de lo pendiente al arrancar y la importación del volcado de versiones anteriores, la resolución del directorio de datos, el runner de migraciones y la verificación del esquema, el pooling del modelo y el re-embebido de un store CLS al arrancar, la descarga del modelo (la caché, los plazos de red, un hash por archivo fuera de los hilos del runtime y el origen `CLAWG_HF_BASE_URL`), el ciclo de vida del embedder (soltar el modelo ocioso, recargarlo desde la caché y repararla, un solo tokenizer por proceso y la memoria que vuelve al sistema), los snapshots, `clawg backup` y `clawg restore`, la escritura de `workspace.md`, y lo que `clawg status`, MCP y el instalador dicen cuando la base no se puede abrir.
 
 **Origen:**
 - [data-preservation](../../changes/archive/2026-10-12-data-preservation/proposal.md) (partes A + F), archivado el 2026-10-12.
@@ -11,6 +11,7 @@ Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde q
 - [embedder-idle-unload](../../changes/archive/2026-10-17-embedder-idle-unload/proposal.md), archivado el 2026-10-17 (el ciclo de vida del embedder y la reescritura de «El modelo se carga con pooling mean» para `E5Embedder`). El campo `embedder_resident` de `/health` está en [`specs/mcp`](../mcp/spec.md).
 - [conflict-candidates](../../changes/archive/2026-10-18-conflict-candidates/proposal.md), archivado el 2026-10-18 (sólo la fila de V15 y «Una base en V14 abre con sus disputas como pares»). La tabla de pares y su conversión están en [`specs/disputes`](../disputes/spec.md).
 - [topic-revisions](../../changes/archive/2026-10-18-topic-revisions/proposal.md), archivado el 2026-10-18 (sólo la fila de V16 y «Una base en V15 abre con sus filas sin clave»). Qué hace un save con clave está en [`specs/ingest`](../ingest/spec.md).
+- [model-download](../../changes/archive/2026-10-19-model-download/proposal.md), archivado el 2026-10-19 (la «Descarga del modelo», y la recarga desde la caché y su reparación en «Recargar a demanda, una sola vez» y «Una recarga que falla no deja nada roto»). Lo que dice el error de una descarga que agota sus intentos está en [`specs/ingest`](../ingest/spec.md), «Estado en `/health` y `clawg status`».
 
 ## Definiciones
 
@@ -19,7 +20,7 @@ Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde q
 - **Progreso:** la lista de posiciones de un save ya escritas (`NotedPiece`, `outbox.rs:85`): para cada una, su posición, el hash de su texto, la fila de `memory` que la tiene, si este save la insertó o la reforzó, y la cabecera con la que se embebió.
 - **Tope de intentos (`MAX_ATTEMPTS`, `outbox.rs:25`):** 3.
 - **Apagado ordenado:** el que empieza con Ctrl-C o con `POST /v1/shutdown`. Un kill del proceso no es un apagado ordenado.
-- **Plazo de drenaje (`DRAIN_DEADLINE`, `crates/clawg-core/src/runtime.rs:54`):** el tiempo máximo que el apagado dedica a ingerir lo encolado.
+- **Plazo de drenaje (`DRAIN_DEADLINE`, `crates/clawg-core/src/runtime.rs:55`):** el tiempo máximo que el apagado dedica a ingerir lo encolado.
 - **Volcado viejo:** el archivo `<data>/ingest-pending.jsonl` (`SPILL_FILE`, `crates/clawg-core/src/memory/spill.rs:11`), un `MemoryEvent` en JSON por línea, que las versiones anteriores al outbox escribían en un apagado ordenado. Ninguna versión actual lo escribe.
 - **Directorio de backups:** `<data>/backups/` (`backups_dir`, `crates/clawg-core/src/paths.rs`).
 - **Snapshot:** una copia completa y autónoma de `memory.db` hecha con `VACUUM INTO`. Incluye lo commiteado en el WAL y no tiene archivo WAL propio.
@@ -89,7 +90,7 @@ Si el handler contesta al que guardó con el fallo (`500` o `503`), MUST borrar 
 
 En un apagado ordenado, cada save aceptado MUST terminar en uno de dos lugares: guardado en la base (o absorbido por el gate de dedup), o en el outbox para el próximo arranque. El apagado MUST seguir drenando hasta `DRAIN_DEADLINE`, MUST NOT escribir `ingest-pending.jsonl` y MUST NOT descartar un save: lo que el worker no empezó queda en su fila.
 
-La decisión de seguir drenando o dejar la cola es pura (`drain_step`, `crates/clawg-core/src/memory/worker.rs:221`; su variante `DrainStep::Spill` conserva el nombre de cuando el apagado volcaba a un archivo). `MemoryRuntime::shutdown` (`crates/clawg-core/src/runtime.rs:259`) espera al worker, y el daemon la llama antes de borrar su estado (`crates/clawg-cli/src/daemon/serve.rs:188`). Sólo un evento encolado sin fila (los caminos en proceso de tests y evaluación) puede quedar sin ingerir, y el apagado lo registra con un warn (`runtime.rs:275`).
+La decisión de seguir drenando o dejar la cola es pura (`drain_step`, `crates/clawg-core/src/memory/worker.rs:221`; su variante `DrainStep::Spill` conserva el nombre de cuando el apagado volcaba a un archivo). `MemoryRuntime::shutdown` (`crates/clawg-core/src/runtime.rs:261`) espera al worker, y el daemon la llama antes de borrar su estado (`crates/clawg-cli/src/daemon/serve.rs:189`). Sólo un evento encolado sin fila (los caminos en proceso de tests y evaluación) puede quedar sin ingerir, y el apagado lo registra con un warn (`runtime.rs:277`).
 
 #### Escenario: embedder listo
 - GIVEN el embedder cargado y 20 saves aceptados
@@ -110,9 +111,9 @@ La decisión de seguir drenando o dejar la cola es pura (`drain_step`, `crates/c
 
 ### Arranque: se ingiere lo pendiente antes que lo nuevo
 
-Al arrancar, el worker (`ingest_worker_future`, `crates/clawg-core/src/runtime.rs:393`) MUST, en este orden:
+Al arrancar, el worker (`ingest_worker_future`, `crates/clawg-core/src/runtime.rs:395`) MUST, en este orden:
 
-1. importar `ingest-pending.jsonl` si existe (`import_spill`, `runtime.rs:429`): cada evento válido pasa a una fila, enmascarado, todos en una transacción con `synchronous = FULL` (`outbox_import`, `outbox.rs:235`); el archivo MUST borrarse sólo después del commit. Si no se pudo borrar, se avisa: una segunda importación la absorbe el dedup;
+1. importar `ingest-pending.jsonl` si existe (`import_spill`, `runtime.rs:440`): cada evento válido pasa a una fila, enmascarado, todos en una transacción con `synchronous = FULL` (`outbox_import`, `outbox.rs:235`); el archivo MUST borrarse sólo después del commit. Si no se pudo borrar, se avisa: una segunda importación la absorbe el dedup;
 2. procesar las filas `pending` en orden de id antes que cualquier evento del canal (`outbox_pending`, `outbox.rs:357`; `Replay`, `worker.rs:165`).
 
 Si no se puede leer el outbox, el worker lo registra y sigue con el canal: esas filas esperan al próximo arranque.
@@ -153,7 +154,7 @@ En un apagado ordenado, el tracker MUST escribir el buffer pendiente antes de te
 
 ### Checkpoint al terminar
 
-Después de drenar y del flush del tracker, el apagado SHOULD hacer `PRAGMA wal_checkpoint(TRUNCATE)` (`checkpoint`, `runtime.rs:370`). Un fallo del checkpoint MUST registrarse y MUST NOT impedir el resto del apagado.
+Después de drenar y del flush del tracker, el apagado SHOULD hacer `PRAGMA wal_checkpoint(TRUNCATE)` (`checkpoint`, `runtime.rs:372`). Un fallo del checkpoint MUST registrarse y MUST NOT impedir el resto del apagado.
 
 #### Escenario
 - GIVEN una base en WAL con escrituras recientes
@@ -168,7 +169,7 @@ Después de drenar y del flush del tracker, el apagado SHOULD hacer `PRAGMA wal_
 
 **Test:** `the_drain_deadline_leaves_room_inside_the_stop_timeout` (`stop.rs`).
 
-**Límite conocido:** el plazo acota el apagado ordenado, pero no la vida del proceso. Si el apagado llega mientras carga el modelo, el proceso sigue vivo hasta que esa carga vuelve: corre en `spawn_blocking` (`crates/clawg-core/src/memory/bootstrap.rs:492`), y el runtime de `#[tokio::main]` (`crates/clawg-cli/src/main.rs:47`) espera a esas tareas al soltarse. Los datos ya están a salvo para entonces: lo no ingerido está en el outbox. Está en el backlog de `openspec/README.md`.
+**Límite conocido:** el plazo acota el apagado ordenado, pero no la vida del proceso. Si el apagado llega mientras carga el modelo, el proceso sigue vivo hasta que esa carga vuelve: corre en `spawn_blocking` (`crates/clawg-core/src/memory/bootstrap.rs:592`), y el runtime de `#[tokio::main]` (`crates/clawg-cli/src/main.rs:47`) espera a esas tareas al soltarse. Los datos ya están a salvo para entonces: lo no ingerido está en el outbox. Está en el backlog de `openspec/README.md`.
 
 ## Directorio de datos
 
@@ -298,7 +299,7 @@ El id del modelo en el contrato de embedding MUST ser `multilingual-e5-small/mea
 
 ### Re-embebido de un store CLS al arrancar
 
-Al arrancar, después de cargar el modelo y dentro del bootstrap del embedder, el daemon verifica el contrato (`verify_or_reembed`, `crates/clawg-core/src/memory/bootstrap.rs:431`, cableado por `contract_verifier`, `bootstrap.rs:250`, en `production_deps`, `bootstrap.rs:272`, que `serve_deps`, `bootstrap.rs:354`, entrega al daemon en `crates/clawg-cli/src/daemon/serve.rs:102`). Si el contrato guardado tiene `LEGACY_CLS_MODEL_ID` y el embedder cargado tiene `E5_MODEL_ID`, con la misma dimensión y los mismos prefijos (`is_pooling_upgrade`, `bootstrap.rs:417`, pura), MUST:
+Al arrancar, después de cargar el modelo y dentro del bootstrap del embedder, el daemon verifica el contrato (`verify_or_reembed`, `crates/clawg-core/src/memory/bootstrap.rs:494`, cableado por `contract_verifier`, `bootstrap.rs:259`, en `production_deps`, `bootstrap.rs:289`, que `serve_deps`, `bootstrap.rs:373`, entrega al daemon en `crates/clawg-cli/src/daemon/serve.rs:102`). Si el contrato guardado tiene `LEGACY_CLS_MODEL_ID` y el embedder cargado tiene `E5_MODEL_ID`, con la misma dimensión y los mismos prefijos (`is_pooling_upgrade`, `bootstrap.rs:480`, pura), MUST:
 
 1. escribir un snapshot `pre-reembed` en `<data>/backups`; si falla, no re-embebe, y el intento termina como un fallo de verificación, que se reintenta con la espera de siempre ([`specs/ingest`](../ingest/spec.md), «Reintento del bootstrap»);
 2. re-embeber `memory`, `episodic_trajectory` y `procedural_skill` con el embedder cargado (`reembed_all` en modo `ReInfer`, `crates/clawg-core/src/memory/maintenance.rs:507`);
@@ -325,9 +326,72 @@ Cualquier otro contrato que no coincide (otro modelo, otra dimensión, otros pre
 
 **Tests:** `only_the_cls_vectors_of_the_same_model_are_a_pooling_upgrade`, `cls_vectors_are_snapshotted_then_reembedded_by_mean`, `any_other_mismatch_is_left_as_it_is` y `a_store_that_matches_is_not_touched` en `crates/clawg-core/src/memory/bootstrap.rs`; el nombre `pre-reembed` en `snapshot_names_sort_in_time_order` (`backup.rs`). La regla de que el contrato se escribe al final está en los tests de `reembed_all` de `maintenance.rs`.
 
+## Descarga del modelo
+
+El daemon consigue el modelo con `ensure_model` (`crates/clawg-core/src/memory/model_download.rs:396`): en el primer arranque lo baja y en los siguientes lo lee de la caché. Es la única entrada de producción: arma un `ModelSource` (`:371`) con el origen, el oráculo de disco, la espera entre intentos, los plazos y el manifiesto, y llama a `ensure_model_from` (`:421`), la que un test usa con su propio `ModelSource`. La caché se lee y se verifica en un solo lugar, `read_verified` (`:605`).
+
+**Definiciones:**
+- **Caché:** los cinco archivos del modelo en `<data>/models/multilingual-e5-small/`, cada uno con el SHA-256 fijado en `ALL_FILES` (`model_download.rs:91`).
+- **Intento:** una petición de un archivo, desde el envío hasta el último byte.
+- **Corrida:** una llamada a `ensure`: el arranque, cada reintento del bootstrap ([`specs/ingest`](../ingest/spec.md), «Reintento del bootstrap») y cada reparación («Una recarga que falla no deja nada roto»).
+
+### La caché primero, y sólo se baja lo que falta
+
+Si los cinco archivos de la caché pasan su SHA-256, `ensure` MUST devolverlos sin emitir eventos de progreso, sin chequear el disco y sin tocar la red. Si falta alguno o no pasa, MUST pedir 600 MB libres (`MIN_FREE_BYTES`, `model_download.rs:223`) antes del primer byte y MUST bajar sólo esos (`fetch`, `:445`). Cada archivo MUST tener 3 intentos, con esperas de 5 y 30 s entre ellos (`RETRY_BACKOFF_SECS`, `:243`; `download_one`, `:654`). Cada intento MUST empezar de un `.partial` vacío y borrarlo si falla, y ninguno MUST quedar al terminar la corrida, bien o mal. El archivo bajado MUST reemplazar al de la caché sólo después de verificar su hash, renombrando el `.partial` (`commit_file`, `:875`). Un SHA-256 distinto MUST terminar la corrida sin gastar los intentos que quedan: el origen mandó otros bytes enteros y volvería a mandarlos. Una corrida que baja algo emite `Start`, `Chunk` y `Verify`, nunca `Done`, que es del bootstrap después de cargar; una que falla termina con un solo `Error` (`DownloadProgress`, `:330`).
+
+#### Escenario: la caché completa
+- GIVEN los cinco archivos con su SHA-256
+- WHEN corre `ensure`
+- THEN no hay ninguna petición ni ningún evento, y el disco no se mira
+
+#### Escenario: un archivo alterado en el origen
+- GIVEN un origen que manda otros bytes para `onnx/model.onnx`
+- WHEN corre `ensure`
+- THEN hay una sola petición de ese archivo, la corrida termina con `ChecksumMismatch` y no queda ningún `.partial`
+
+**Tests:** `skips_download_when_all_files_cached`, `cached_path_skips_disk_check`, `downloads_only_missing_files`, `corrupt_cached_file_triggers_redownload`, `insufficient_disk_returns_err_no_http`, `sufficient_disk_passes_preflight`, `retry_succeeds_on_second_attempt`, `three_failures_returns_network_err_and_stops`, `sha_mismatch_after_retries_returns_checksum_err`, `network_failure_returns_err_no_partial_files`, `successful_download_leaves_no_partial_files`, `real_backoff_uses_correct_secs_table`, `lifecycle_events_in_expected_order` y `error_path_emits_exactly_one_terminal_error_event` (`model_download.rs`).
+
+### Plazos de red
+
+La descarga MUST usar un cliente con 30 s para conectar y 60 s por lectura (`DOWNLOAD_TIMEOUTS`, `model_download.rs:390`), armado una vez por corrida (`fetch`, `:477-481`). El plazo de lectura se reinicia con cada lectura y cubre también la espera de las cabeceras. MUST NOT haber un plazo total: un enlace lento que sigue mandando bytes termina. Un plazo vencido MUST terminar el intento como fallido, borrar su `.partial` y pasar al siguiente intento como cualquier otro error de red. Un cliente que no se puede armar MUST ser un error de la corrida (`DownloadError::Client`, `:344`), que el bootstrap reintenta.
+
+#### Escenario: el servidor se calla a mitad
+- GIVEN un servidor que responde `200` con cabeceras y unos bytes y después no manda nada sin cerrar
+- WHEN `ensure` baja ese archivo
+- THEN cada intento termina al vencer el plazo de lectura, y `ensure` vuelve con un error que lo dice y sin `.partial`
+
+#### Escenario: el servidor acepta y no contesta
+- GIVEN un servidor que acepta la conexión y nunca manda cabeceras
+- WHEN `ensure` baja ese archivo
+- THEN cada intento termina al vencer el plazo de lectura y `ensure` vuelve con error
+
+**Tests:** `a_body_that_stops_arriving_fails_the_attempt`, `a_server_that_never_answers_fails_the_attempt` y `the_download_waits_30_s_to_connect_and_60_s_per_read` (`model_download.rs`). Con los plazos reales, un espejo en loopback que acepta y no contesta deja el embedder `failed` a los 3 min 35 s (tres intentos de 60 s y las esperas de 5 y 30 s), medido con el binario en la verificación del archivo.
+
+### Un hash por archivo, fuera de los hilos del runtime
+
+Leer y hashear la caché MUST correr en una tarea bloqueante (`check_cache_off_runtime`, `model_download.rs:532`), no en un hilo del runtime asíncrono, en el arranque y en cada recarga. El worker de ingest MUST leer, verificar y parsear `tokenizer.json` en una tarea bloqueante (`ingest_worker_future`, `crates/clawg-core/src/runtime.rs:397`). En una corrida, cada archivo MUST hashearse una sola vez: el de la caché al leerlo (`check_cache`, `:572`), el bajado mientras llegan sus bytes, sin volver a leerlo del disco. Los bytes que recibe la carga MUST ser los mismos que se hashearon. El cierre del archivo bajado (`sync_all` y el `rename`) MUST correr en una tarea bloqueante. Como el archivo bajado queda en memoria para entregarlo sin releerlo, un archivo que anuncia o trae más de 600 MB (`MAX_FILE_BYTES`, `:836`, lo que pide libre el chequeo de disco y más que cualquier archivo del modelo) MUST fallar sin reintentar y sin reservar esa memoria (`DownloadError::TooLarge`, `:350`).
+
+#### Escenario: falta un archivo chico
+- GIVEN la caché completa salvo `config.json`
+- WHEN corre `ensure`
+- THEN el ONNX se lee y se hashea una vez y sólo se pide `config.json`
+
+**Tests:** `the_cache_check_leaves_the_runtime_thread_free`, `each_file_is_hashed_once_per_run` y `a_file_larger_than_any_model_file_is_refused_without_holding_it` (`model_download.rs`); `the_worker_resolves_the_tokenizer_off_the_runtime_thread` (`runtime.rs`).
+
+### El origen: `CLAWG_HF_BASE_URL`
+
+Sin la variable, vacía o con sólo espacios, el origen MUST ser `https://huggingface.co/intfloat/multilingual-e5-small/resolve/main` (`HF_BASE_URL`, `model_download.rs:26`). Con ella, MUST aceptar una URL `https://` con cualquier host y una `http://` sólo con host `localhost`, `127.0.0.1` o `[::1]` (`base_url_from`, `:204`, pura). Cualquier otro valor MUST ser un error que nombra la variable y lo que se acepta, MUST NOT caer en silencio al origen por defecto y MUST NOT chequear la caché ni el disco ni hacer ninguna petición (`ensure_model`, `:400-408`), así que falla aunque la caché esté completa. El error MUST NOT repetir el valor, que puede llevar credenciales: dice el esquema y el host. Una `/` final MUST ignorarse. Los SHA-256 fijados MUST verificarse con cualquier origen. La variable se lee en cada corrida, y un valor inválido es un error de descarga que el bootstrap reintenta como cualquier otro ([`specs/ingest`](../ingest/spec.md), «Reintento del bootstrap»).
+
+#### Escenario: un valor que no es https ni loopback
+- GIVEN `CLAWG_HF_BASE_URL=http://example.com`
+- WHEN arranca el daemon
+- THEN `embedder` queda `failed` y `embedder_error` nombra la variable y lo que se acepta, sin ninguna petición
+
+**Tests:** `the_base_url_defaults_to_hugging_face`, `the_base_url_takes_https_and_loopback_http` y `a_base_url_that_is_not_https_or_loopback_is_refused` (`model_download.rs`). Que la corrida falla sin pedir nada no tiene test: lo comprobó el binario en la verificación del archivo.
+
 ## Ciclo de vida del embedder
 
-El daemon envuelve el modelo en un `IdleEmbedder` (`crates/clawg-core/src/memory/idle_embedder.rs:154`), que lo suelta tras un tiempo sin uso y lo vuelve a cargar cuando una llamada necesita un vector. Lo arma `unloading_when_idle` (`crates/clawg-core/src/memory/bootstrap.rs:381`), cableado en `crates/clawg-cli/src/daemon/serve.rs:115`.
+El daemon envuelve el modelo en un `IdleEmbedder` (`crates/clawg-core/src/memory/idle_embedder.rs:154`), que lo suelta tras un tiempo sin uso y lo vuelve a cargar cuando una llamada necesita un vector. Lo arma `unloading_when_idle` (`crates/clawg-core/src/memory/bootstrap.rs:405`), con la lectura de la caché para recargar y la descarga para repararla, cableado en `crates/clawg-cli/src/daemon/serve.rs:115`.
 
 **Definiciones:**
 - **Tiempo de ocio:** los minutos de `CLAWG_EMBEDDER_IDLE_MINUTES` (`IDLE_MINUTES_VAR`, `idle_embedder.rs:28`), 10 si falta o está vacía.
@@ -353,25 +417,28 @@ El daemon MUST soltar el modelo cuando pasó el tiempo de ocio desde el último 
 
 ### Recargar a demanda, una sola vez
 
-Una llamada con el modelo suelto MUST cargarlo con los mismos archivos verificados y la misma carga del arranque (`ensure` y `load` otra vez, en `unloading_when_idle`), y MUST devolver el mismo vector que antes de soltarlo. Una recarga MUST NOT volver a parsear el tokenizer («Un solo tokenizer por proceso»). Las llamadas que llegan durante una carga MUST compartirla. `model_id`, `dimensions` y los prefijos MUST NOT cargar el modelo.
+Una llamada con el modelo suelto MUST cargarlo con la misma carga del arranque sobre los archivos de la caché, leídos y verificados otra vez (`cached` y `load`, en `unloading_when_idle`; `load_cached_model`, `crates/clawg-core/src/memory/model_download.rs:516`), y MUST devolver el mismo vector que antes de soltarlo. Una recarga MUST NOT tocar la red. Una recarga MUST NOT volver a parsear el tokenizer («Un solo tokenizer por proceso»). Las llamadas que llegan durante una carga MUST compartirla. `model_id`, `dimensions` y los prefijos MUST NOT cargar el modelo.
 
 #### Escenario: varias llamadas, una carga
 - GIVEN el modelo suelto
 - WHEN llegan 8 llamadas a la vez
 - THEN el modelo se carga una vez y las 8 responden
 
-**Tests:** `a_call_after_an_unload_loads_the_model_again_and_gets_the_same_vector`, `calls_arriving_while_the_model_is_away_share_one_load` e `identity_and_prefixes_never_load_the_model` (`idle_embedder.rs`); `a_reload_does_not_parse_the_tokenizer_again` y `an_idle_unloading_embedder_reloads_through_the_same_files_and_load` (`bootstrap.rs`).
+**Tests:** `a_call_after_an_unload_loads_the_model_again_and_gets_the_same_vector`, `calls_arriving_while_the_model_is_away_share_one_load` e `identity_and_prefixes_never_load_the_model` (`idle_embedder.rs`); `a_reload_does_not_parse_the_tokenizer_again` y `an_idle_unloading_embedder_reloads_through_the_same_files_and_load` (`bootstrap.rs`, con una descarga que hace fallar el test si se llama); `the_cached_model_never_touches_the_network` (`model_download.rs`).
 
 ### Una recarga que falla no deja nada roto
 
-Una recarga que falla MUST responder «no listo» (`EmbedError::NotReady`) y la llamada siguiente MUST intentar otra vez. Una recarga que trae otro `model_id` u otra dimensión MUST rechazarse igual: los vectores nuevos no pueden caer en otro espacio que los guardados. El estado del embedder MUST NOT pasar a `failed` por una recarga.
+Una recarga cuya caché no pasa (falta un archivo, no se lee o tiene otro SHA-256; `DownloadError::NotCached`, `crates/clawg-core/src/memory/model_download.rs:348`) MUST responder «no listo» (`EmbedError::NotReady`) sin esperar ninguna descarga, y MUST lanzar una reparación: `ensure` en una tarea del runtime, fuera del cerrojo del modelo, salvo que ya haya una en curso, así que hay a lo sumo una a la vez (`repair_in_background`, `bootstrap.rs:449`). La reparación no carga el modelo: la llamada siguiente que encuentre la caché reparada MUST cargarla. Una reparación que falla MUST dejarlo en el log, y la llamada siguiente MAY lanzar otra. Cualquier otra recarga que falla MUST responder «no listo» igual, y la llamada siguiente MUST intentar otra vez. Una recarga que trae otro `model_id` u otra dimensión MUST rechazarse igual: los vectores nuevos no pueden caer en otro espacio que los guardados. El estado del embedder MUST NOT pasar a `failed` por una recarga ni por una reparación.
 
-#### Escenario: los archivos desaparecieron
-- GIVEN el modelo suelto y una recarga que falla
-- WHEN llega una búsqueda
-- THEN responde `503 embedder_not_ready` (`embed_failure`, `crates/clawg-cli/src/daemon/api.rs:1136`), y la búsqueda siguiente vuelve a intentar la carga
+El cerrojo del modelo queda tomado lo que tarda leer y hashear la caché, nunca lo que tarda la red: la lectura recorre los cinco archivos aunque el que no pasa sea chico, así que el «no listo» llega después de hashear el ONNX. Medido el 2026-10-19 con el modelo real, en un build debug en Windows: las dos búsquedas respondieron en 8,7 y 9,2 s, lo que una recarga buena tarda en leer y verificar la caché (9,5 s).
 
-**Tests:** `a_failed_load_is_not_ready_and_the_next_call_tries_again` y `a_model_that_comes_back_as_another_model_is_refused` (`idle_embedder.rs`); `a_search_whose_model_cannot_load_again_answers_not_ready` (`crates/clawg-cli/tests/api.rs`).
+#### Escenario: un archivo borrado del modelo suelto
+- GIVEN el modelo suelto, `tokenizer_config.json` borrado de la caché y una descarga que tarda
+- WHEN llegan dos búsquedas seguidas
+- THEN las dos responden `503 embedder_not_ready` (`embed_failure`, `crates/clawg-cli/src/daemon/api.rs:1136`) sin esperar la descarga, y hay una sola en curso
+- AND cuando la descarga termina, la búsqueda siguiente carga el modelo y responde
+
+**Tests:** `a_failed_load_is_not_ready_and_the_next_call_tries_again` y `a_model_that_comes_back_as_another_model_is_refused` (`idle_embedder.rs`); `a_reload_with_a_damaged_cache_is_not_ready_and_repairs_it_once_in_the_background` (`bootstrap.rs`); `a_search_whose_model_cannot_load_again_answers_not_ready` (`crates/clawg-cli/tests/api.rs`).
 
 ### Las herramientas funcionan con el modelo suelto
 
@@ -412,7 +479,7 @@ En Linux con glibc, dos cosas lo hacen posible:
 
 ### Un solo tokenizer por proceso
 
-El daemon MUST parsear `tokenizer.json` a lo sumo una vez por proceso, y sólo de bytes cuyo SHA-256 verificó. El chunker, el índice de docs y el embedder MUST compartir esa copia, la celda `MemoryRuntime::tokenizer` (`crates/clawg-core/src/runtime.rs:126`). La llenan `resolve_tokenizer_and_chunker` (`crates/clawg-core/src/memory/worker.rs:883`), con `load_verified_tokenizer` (`crates/clawg-core/src/memory/model_download.rs:154`), y `model_loader` (`bootstrap.rs:228`); cada parse deja la línea `tokenizer.json parsed` (`model_download.rs:164` y `:191`). Una recarga MUST NOT volver a parsearlo. El embedder MUST NOT cambiar la configuración del tokenizer compartido. El chunker del worker MUST leer la celda en cada save (`ChatChunker::from_cell`, `crates/clawg-core/src/memory/chunker/chat.rs:64`): una celda que se llena después de construirlo cambia su troceo sin reiniciar, y un mismo save se corta entero con un solo splitter.
+El daemon MUST parsear `tokenizer.json` a lo sumo una vez por proceso, y sólo de bytes cuyo SHA-256 verificó. El chunker, el índice de docs y el embedder MUST compartir esa copia, la celda `MemoryRuntime::tokenizer` (`crates/clawg-core/src/runtime.rs:127`). La llenan `resolve_tokenizer_and_chunker` (`crates/clawg-core/src/memory/worker.rs:883`), con `load_verified_tokenizer` (`crates/clawg-core/src/memory/model_download.rs:154`), y `model_loader` (`bootstrap.rs:237`); cada parse deja la línea `tokenizer.json parsed` (`model_download.rs:164` y `:191`). Una recarga MUST NOT volver a parsearlo. El embedder MUST NOT cambiar la configuración del tokenizer compartido. El chunker del worker MUST leer la celda en cada save (`ChatChunker::from_cell`, `crates/clawg-core/src/memory/chunker/chat.rs:64`): una celda que se llena después de construirlo cambia su troceo sin reiniciar, y un mismo save se corta entero con un solo splitter.
 
 #### Escenario: arranque con el modelo en disco, en cualquier orden
 - GIVEN el modelo en disco

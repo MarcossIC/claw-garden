@@ -68,7 +68,7 @@
 ## Interacciones
 
 - **outbox-lifecycle (53).** Su enfoque E reintenta en la sesión los fallos pasajeros y cita «el trabajador del embedder caído» como uno. Contra el mismo `Arc<dyn Embedder>` muerto el reintento fallaría para siempre: es este cambio el que lo vuelve pasajero, así que **61 aterriza antes que 53**.
-- **model-download (60).** Acota la descarga y propone que la recarga no descargue bajo el `Mutex`; ambos tocan `Shared::lease` (`idle_embedder.rs:97-118`). Hay que acordar el orden de los dos parches; B añade un punto de entrada a esa misma recarga.
+- **model-download (60).** Acota la descarga y propone que la recarga no descargue bajo el `Mutex`; ambos tocan `Shared::lease` (`idle_embedder.rs:97-118`). Hay que acordar el orden de los dos parches; B añade un punto de entrada a esa misma recarga. Archivado el 2026-10-19 sin tocar `idle_embedder.rs`: la lectura de la caché y la reparación viven en el `ReloadFn` que arma `unloading_when_idle` (`crates/clawg-core/src/memory/bootstrap.rs:405`), así que `lease` sigue como lo describe esta exploración.
 - **embedder-idle-unload (46, archivado).** `specs/storage` «Ciclo de vida del embedder» dice que una recarga fallida responde `NotReady` y que `embedder` sigue `ready`; no cambia. Se agrega un escenario de recuperación.
 - **shutdown-budget (55).** Las recargas corren en `spawn_blocking` (`bootstrap.rs:396`); más recargas posibles, mismo tratamiento.
 - **embedder-footprint (62).** Mide CPU y memoria y tocará `build_session` y `embed_batch`; D y A tocan el bucle vecino.
@@ -115,4 +115,4 @@ Tests RED primero (TDD estricto), todo con mocks, sin modelo real, red ni perfil
 - **Bucle de recargas:** un fallo determinista al inferir (A2 + B) recargaría el modelo en cada llamada (leer y verificar unos 470 MB y armar la sesión otra vez). Hace falta un retardo mínimo entre recargas o contar fallos seguidos; a decidir en el diseño.
 - **`AssertUnwindSafe`:** no prueba nada; A2 lo limita al no reusar la sesión.
 - **Carrera de `ptr_eq`:** vaciar la celda equivocada tiraría un modelo sano; lo cubre la prueba 3.
-- **Choque con 60** en `lease`: acordar el orden antes de aplicar.
+- **Choque con 60** en `lease`: no hubo; 60 se archivó sin tocar `lease`.

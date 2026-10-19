@@ -9,7 +9,7 @@ Fuente de verdad de cómo la suite prueba el binario `clawg` mismo: el build de 
 - **Feature `testing`:** la feature de clawg-core que compila los sustitutos de prueba (`crates/clawg-core/Cargo.toml:25`).
 - **Build de test:** un binario compilado con `testing`. Es el que cargo arma para los tests de integración de clawg-cli (`CARGO_BIN_EXE_clawg`, `crates/clawg-cli/tests/binary.rs:23`), porque clawg-cli enciende la feature en sus `[dev-dependencies]` (`crates/clawg-cli/Cargo.toml:73`). `cargo build --release` no compila las dev-dependencies, así que el binario que se entrega no la tiene. Efecto aceptado: después de un `cargo test`, `target/debug/clawg` es un build de test. Sólo lee las variables si están puestas, y como build debug ya está limitado al perfil dev.
 - **Home de prueba:** el valor no vacío de `CLAWG_TEST_HOME` (`TEST_HOME_VAR`, `crates/clawg-core/src/paths.rs:169`).
-- **Embedder de prueba:** el valor de `CLAWG_TEST_EMBEDDER` (`TEST_EMBEDDER_VAR`, `crates/clawg-core/src/memory/bootstrap.rs:260`), `fake` o `stalled` (`TestEmbedder`, `bootstrap.rs:265`).
+- **Embedder de prueba:** el valor de `CLAWG_TEST_EMBEDDER` (`TEST_EMBEDDER_VAR`, `crates/clawg-core/src/memory/bootstrap.rs:313`), `fake` o `stalled` (`TestEmbedder`, `bootstrap.rs:318`).
 
 ## El home de prueba
 
@@ -33,16 +33,16 @@ Se reemplaza el home y no el directorio de datos para que el perfil siga eligien
 
 ## El embedder de prueba
 
-`clawg serve` arma el bootstrap del embedder con `serve_deps` (`bootstrap.rs:319`, llamado en `crates/clawg-cli/src/daemon/serve.rs:102`). En un build de test, según el embedder de prueba:
+`clawg serve` arma el bootstrap del embedder con `serve_deps` (`bootstrap.rs:373`, llamado en `crates/clawg-cli/src/daemon/serve.rs:102`). En un build de test, según el embedder de prueba:
 
 - con `fake`, MUST cargar `FakeEmbedder` sin descargar nada: la «descarga» devuelve archivos vacíos al instante y la carga devuelve el falso, con `model_id` `fake-embedder`;
 - con `stalled`, la descarga MUST NOT terminar nunca, así que el embedder queda en `loading` y cada save responde `202`;
-- sin la variable, o con un valor vacío o de sólo espacios, MUST usar el modelo real (`production_deps`, `bootstrap.rs:232`);
-- con cualquier otro valor, MUST negarse a arrancar con un error que nombra la variable y los valores aceptados (`TestEmbedder::parse`, `bootstrap.rs:274`; `ServeError::Embedder`, `serve.rs:107`). Un typo en un test no puede disparar la descarga de 470 MB.
+- sin la variable, o con un valor vacío o de sólo espacios, MUST usar el modelo real (`production_deps`, `bootstrap.rs:289`);
+- con cualquier otro valor, MUST negarse a arrancar con un error que nombra la variable y los valores aceptados (`TestEmbedder::parse`, `bootstrap.rs:327`; `ServeError::Embedder`, `serve.rs:107`). Un typo en un test no puede disparar la descarga de 470 MB.
 
-Un build sin `testing` MUST usar siempre el modelo real (`serve_deps`, `bootstrap.rs:332`).
+Un build sin `testing` MUST usar siempre el modelo real (`serve_deps`, `bootstrap.rs:387`).
 
-En los dos sustitutos, la verificación del contrato de embedding MUST ser la real: `TestEmbedder::deps` (`bootstrap.rs:287`) usa la de `production_deps`. Un store de prueba registra el contrato de `fake-embedder` y lo verifica al reiniciar, por el mismo camino que recorre el modelo real.
+En los dos sustitutos, la verificación del contrato de embedding MUST ser la real: `TestEmbedder::deps` (`bootstrap.rs:341`) usa la de `production_deps`. Un store de prueba registra el contrato de `fake-embedder` y lo verifica al reiniciar, por el mismo camino que recorre el modelo real.
 
 #### Escenario: fake
 - WHEN el bootstrap corre con `fake`

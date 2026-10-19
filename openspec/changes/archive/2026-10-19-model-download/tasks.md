@@ -54,5 +54,10 @@ Hallado al releer el diff: el cuerpo se acumula en memoria y la reserva sale de 
 ## 8. Verificación
 
 - [x] Suite y clippy en Linux sobre el último commit.
-- [ ] El CI en verde en Linux y Windows.
-- [ ] «Probar a mano» del diseño sobre el perfil dev (pide autorización para tocar `~/.clawg-dev`).
+- [x] El CI en verde en Linux y Windows (`d653bed`), y la suite y clippy en Windows sobre el merge en `develop`.
+- [x] «Probar a mano» del diseño con el perfil dev en homes de prueba, sin tocar `~/.clawg-dev`; los tres pasos en [`verify.md`](verify.md).
+
+## 9. Archive
+
+- [x] [`specs/storage`](../../../specs/storage/spec.md) con la «Descarga del modelo» nueva (R1, R4, R5 y lo que R6 conserva), la recarga desde la caché y su reparación (R3), la línea **Origen** y los `ruta:línea` revisados; R2 y el origen inválido en [`specs/ingest`](../../../specs/ingest/spec.md); las citas a los archivos movidos también en [`specs/install`](../../../specs/install/spec.md) y [`specs/secrets`](../../../specs/secrets/spec.md).
+- [x] `git mv` a `changes/archive/2026-10-19-model-download`; `state.yaml` archivado; fila 60, filas 53 y 61, orden de ejecución y backlog del `README.md` de openspec; las notas sobre 60 en las exploraciones de 61 y 64; subir el minor.

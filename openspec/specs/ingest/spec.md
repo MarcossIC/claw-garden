@@ -10,13 +10,14 @@ Fuente de verdad del comportamiento actual de la ingesta: el contrato de `POST /
 - [conflict-candidates](../../changes/archive/2026-10-18-conflict-candidates/proposal.md), archivado el 2026-10-18 (sólo el campo `related` de la respuesta del save).
 - [topic-revisions](../../changes/archive/2026-10-18-topic-revisions/proposal.md), archivado el 2026-10-18 (sólo «La clave de tema se valida y vuelve en la respuesta», «Un save con clave reemplaza la fila viva de su clave» y lo que `save_memory` dice de lo reemplazado). Lo que el agente ve de la clave en las demás herramientas está en [`specs/mcp`](../mcp/spec.md).
 - [session-handoff](../../changes/archive/2026-10-19-session-handoff/proposal.md), archivado el 2026-10-19 (sólo «La sesión del host», sus R1 y R2). El bloque LAST SESSION está en [`specs/retrieval`](../retrieval/spec.md), y el registro desde los hooks en [`specs/hooks`](../hooks/spec.md).
+- [model-download](../../changes/archive/2026-10-19-model-download/proposal.md), archivado el 2026-10-19 (sólo la causa de una descarga que agota sus intentos, en «Estado en `/health` y `clawg status`», y el origen inválido en «Reintento del bootstrap»). La descarga está en [`specs/storage`](../storage/spec.md), «Descarga del modelo».
 
 ## Definiciones
 
 - **Worker:** el único consumidor de la cola de ingesta (`memory_worker`, `crates/clawg-core/src/memory/worker.rs:255`). Ninguna ruta de ingesta agrega otro escritor: el dedup sólo es correcto con un consumidor secuencial.
 - **Resultado de un chunk:** `inserted` (fila nueva) o `reinforced` (el dedup absorbió el chunk en una fila existente). En los dos casos hay un id de la tabla `memory` (`SavedChunk` y `ChunkOutcome`, `worker.rs:40` y `worker.rs:31`).
 - **Reporte de un evento:** `IngestReport` (`worker.rs:81`): los chunks que quedaron en la base, en orden, y la causa que cortó el evento si la hubo. Lleva las dos partes a la vez porque un fallo a mitad de un evento deja chunks ya escritos. Lleva además `replaced`, las filas que el save reemplazó por su clave de tema (`worker.rs:89`).
-- **Estado del embedder:** `EmbedderStatus` (`crates/clawg-core/src/memory/bootstrap.rs:38`): `Loading`, `Ready` o `Failed { error, retryable }`. El `OnceCell` del embedder se llena antes de publicar `Ready`.
+- **Estado del embedder:** `EmbedderStatus` (`crates/clawg-core/src/memory/bootstrap.rs:39`): `Loading`, `Ready` o `Failed { error, retryable }`. El `OnceCell` del embedder se llena antes de publicar `Ready`.
 - **Outbox:** la tabla `ingest_outbox` de `memory.db` (migración V14, `crates/clawg-core/migrations/V14__ingest_outbox.sql`): un save aceptado, ya enmascarado, hasta que termina de guardarse. Su contenido (`content` es el texto enmascarado; `event`, el resto del evento en JSON; `progress`, las piezas ya guardadas) y lo que el worker hace con cada fila están en [`specs/storage`](../storage/spec.md), «Apagado sin pérdida».
 - **Save aceptado:** uno que respondió `201` o `202`: tiene su fila confirmada en el outbox, o ya terminó de guardarse. Un save que el handler rechazó (`503 ingest_queue_full` o `500`) no es aceptado y no deja fila.
 - **Fila `pending` / `failed`:** `state = 'pending'` (espera al worker) o `'failed'` (se la dio por perdida, con su causa en `last_error`).
@@ -26,13 +27,13 @@ Fuente de verdad del comportamiento actual de la ingesta: el contrato de `POST /
 - **Clave de tema (`topic_key`):** el nombre estable con el que un save explícito dice de qué tema es una versión: segmentos no vacíos de `[a-z0-9._-]` separados por `/`, de 1 a 80 caracteres en total (`validate_topic_key`, `crates/clawg-core/src/memory/topic.rs:33`). Minúsculas solamente, para que un tema escrito en otra caja siga siendo una sola clave.
 - **Alcance de una clave:** `(agent_id, COALESCE(project_id, ''), topic_key)`: las filas de un agente, en un proyecto o en ninguno, bajo una clave. Es el mismo alcance del dedup, así que otro agente u otro proyecto con la misma clave no se tocan.
 - **Fila viva:** una fila de `memory` sin `deleted_at` y con `status` `active` o `disputed`.
-- **Capacidad de la cola (`INGEST_QUEUE_CAPACITY`, `crates/clawg-core/src/runtime.rs:47`):** 1024 eventos.
+- **Capacidad de la cola (`INGEST_QUEUE_CAPACITY`, `crates/clawg-core/src/runtime.rs:48`):** 1024 eventos.
 
 ## Contrato de `POST /v1/memories`
 
 ### Aceptar es durable
 
-Después de validar el pedido (contenido, `memory_type`, `operation_id`, `derived_from` y `topic_key`, cada uno un `400`) y de comprobar que el embedder no está `failed`, `POST /v1/memories` MUST pasar por `MemoryRuntime::accept` (`crates/clawg-core/src/runtime.rs:212`, llamado en `save_memory`, `api.rs:1098`), que en este orden:
+Después de validar el pedido (contenido, `memory_type`, `operation_id`, `derived_from` y `topic_key`, cada uno un `400`) y de comprobar que el embedder no está `failed`, `POST /v1/memories` MUST pasar por `MemoryRuntime::accept` (`crates/clawg-core/src/runtime.rs:214`, llamado en `save_memory`, `api.rs:1098`), que en este orden:
 
 1. enmascara el contenido (ver [`specs/secrets`](../secrets/spec.md), R2): la fila guarda el texto ya enmascarado;
 2. escribe y confirma la fila del outbox (`outbox_record`, `crates/clawg-core/src/memory/outbox.rs:208`). El commit MUST hacerse con `synchronous = FULL` y la conexión MUST volver después a su valor (`durably`, `outbox.rs:183`): un save aceptado sobrevive también a un corte de luz, a costa de un fsync por save. El resto de la base, incluidos el progreso y el borrado final de la fila, sigue en `NORMAL`;
@@ -277,13 +278,13 @@ La cola de ingesta MUST tener capacidad `INGEST_QUEUE_CAPACITY` (1024 eventos). 
 - WHEN se guardan 3 textos
 - THEN los dos primeros responden `202` y el tercero `503 ingest_queue_full`, y el outbox tiene las filas de los dos primeros
 
-**Tests:** `a_save_into_a_full_queue_is_503_queue_full` (`tests/api.rs`) y `the_production_ingest_queue_holds_1024_saves` (`crates/clawg-core/src/runtime.rs`, mod tests). La capacidad se inyecta con `MemoryRuntime::new_for_test_with_capacity` (`runtime.rs:328`). Las filas las cubre `a_save_into_a_full_queue_leaves_no_outbox_row` (`tests/api.rs`).
+**Tests:** `a_save_into_a_full_queue_is_503_queue_full` (`tests/api.rs`) y `the_production_ingest_queue_holds_1024_saves` (`crates/clawg-core/src/runtime.rs`, mod tests). La capacidad se inyecta con `MemoryRuntime::new_for_test_with_capacity` (`runtime.rs:330`). Las filas las cubre `a_save_into_a_full_queue_leaves_no_outbox_row` (`tests/api.rs`).
 
 ### `operation_id`
 
 Toda respuesta `201` y `202` de `POST /v1/memories` MUST llevar `operation_id`. Sin uno en el pedido, el daemon MUST emitir un UUID v4. Con uno (`SaveRequest.operation_id`, `api.rs:366`), MUST validarlo (1 a 128 caracteres ASCII visibles, `MAX_OPERATION_ID_LEN`; si no, `400`; `check_operation_id`, `api.rs:574`) y usarlo. `SaveRequest` no usa `deny_unknown_fields`, así que el campo es aditivo.
 
-Mientras exista una fila con ese `operation_id` para ese agente, un save con el mismo MUST NOT crear otra ni encolar nada (`Accepted::Existing`, `runtime.rs:74`): con la fila `pending` responde `202` con `reason: "already_queued"`; con la fila `failed`, `500 ingest_failed` con su causa en `detail`. Después de completado el save, la fila ya no existe: un reenvío vuelve a guardar y el dedup lo absorbe como `reinforced`. El `operation_id` identifica el save, no su texto: un reenvío con otro contenido y el mismo id no guarda el contenido nuevo mientras la fila exista.
+Mientras exista una fila con ese `operation_id` para ese agente, un save con el mismo MUST NOT crear otra ni encolar nada (`Accepted::Existing`, `runtime.rs:75`): con la fila `pending` responde `202` con `reason: "already_queued"`; con la fila `failed`, `500 ingest_failed` con su causa en `detail`. Después de completado el save, la fila ya no existe: un reenvío vuelve a guardar y el dedup lo absorbe como `reinforced`. El `operation_id` identifica el save, no su texto: un reenvío con otro contenido y el mismo id no guarda el contenido nuevo mientras la fila exista.
 
 La herramienta `save_memory` MUST NOT tener un argumento `operation_id`: el modelo no tiene un id estable que repetir, y el esquema pagaría tokens en cada sesión.
 
@@ -359,21 +360,28 @@ La lectura MUST NOT hacer esperar a `/health` más de 250 ms (`HEALTH_INGEST_WAI
 
 `clawg status` serializa el `Health` del cliente (`crates/clawg-cli/src/client.rs:117`), que tiene los mismos campos. `embedder_error` y `embedder_retryable` son `#[serde(default)]`: un cliente nuevo contra un daemon que no los publica sigue parseando.
 
+Cuando un archivo del modelo agota sus intentos, el error MUST nombrar el archivo, el host del origen, la cantidad de intentos y la causa del último: el estado HTTP (`HTTP 503 Service Unavailable`) o el error de red con su cadena de causas, que es donde están `operation timed out`, `connection refused` o el error de TLS (`DownloadError::RetryExhausted`, `crates/clawg-core/src/memory/model_download.rs:357`; `describe`, `:862`). MUST NOT contener la URL entera ni las credenciales que traiga: del origen va el host, con su puerto si lo tiene (`host_of`, `:847`). Cada intento fallido MUST dejar un `warn!` con el archivo, el host, el número de intento y su causa (`download_one`, `:682` y `:825`). El texto llega sin cambios a `embedder_error` y al `503 embedder_failed` de un save («Embedder fallido»).
+
 #### Escenario: descarga fallida
 - GIVEN un bootstrap cuya descarga falló con `connection refused`
 - THEN `/health` tiene `embedder: "failed"`, `embedder_error` contiene `connection refused` y `embedder_retryable: true`
+
+#### Escenario: un 503
+- GIVEN un origen que responde `503` a todo
+- WHEN `ensure` agota los intentos
+- THEN el error contiene `503` y el host, y no la ruta del archivo en el origen
 
 #### Escenario: contrato distinto
 - GIVEN un bootstrap cuyo contrato no coincide
 - THEN `embedder: "failed"` y `embedder_retryable: false`
 
-**Tests:** `health_reports_failed_with_the_cause_after_a_failed_bootstrap` (`tests/api.rs`) y `a_failed_embedder_shows_in_the_status_report` (`crates/clawg-cli/src/status.rs`).
+**Tests:** `health_reports_failed_with_the_cause_after_a_failed_bootstrap` (`tests/api.rs`) y `a_failed_embedder_shows_in_the_status_report` (`crates/clawg-cli/src/status.rs`); `an_exhausted_download_names_the_last_status_and_the_host` y `the_cause_never_carries_the_credentials_of_the_url` (`crates/clawg-core/src/memory/model_download.rs`).
 
 ### Reintento del bootstrap
 
-Un bootstrap que falla por descarga, carga o verificación del contrato (error al leer la base) MUST reintentarse. Un contrato que no coincide MUST NOT reintentarse (`classify`, `bootstrap.rs:69`).
+Un bootstrap que falla por descarga, carga o verificación del contrato (error al leer la base) MUST reintentarse. Un contrato que no coincide MUST NOT reintentarse (`classify`, `bootstrap.rs:70`). Un `CLAWG_HF_BASE_URL` inválido es un error de descarga y se reintenta igual: el bootstrap no distingue configuración de red, y mientras tanto `embedder_error` dice qué corregir ([`specs/storage`](../storage/spec.md), «El origen: `CLAWG_HF_BASE_URL`»).
 
-La espera tras el intento fallido `n` (1, 2, …) MUST ser `min(30 s · 2^(n-1), 30 min)`, con saturación para no desbordar (`retry_delay`, `bootstrap.rs:87`). No hay tope de intentos. Durante la espera el estado es `failed` con `retryable: true`; durante un intento es `loading`. El bucle es `run_embedder_bootstrap_with_retry` (`bootstrap.rs:589`), que el daemon lanza con `tokio::time::sleep` (`crates/clawg-cli/src/daemon/serve.rs:132`); `classify` y `retry_delay` son funciones puras y la espera se inyecta, así que los tests corren sin dormir.
+La espera tras el intento fallido `n` (1, 2, …) MUST ser `min(30 s · 2^(n-1), 30 min)`, con saturación para no desbordar (`retry_delay`, `bootstrap.rs:88`). No hay tope de intentos. Durante la espera el estado es `failed` con `retryable: true`; durante un intento es `loading`. El bucle es `run_embedder_bootstrap_with_retry` (`bootstrap.rs:689`), que el daemon lanza con `tokio::time::sleep` (`crates/clawg-cli/src/daemon/serve.rs:133`); `classify` y `retry_delay` son funciones puras y la espera se inyecta, así que los tests corren sin dormir.
 
 #### Escenario: se recupera
 - GIVEN un `ensure` falso que falla la primera vez y funciona la segunda
