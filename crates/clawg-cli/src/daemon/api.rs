@@ -967,6 +967,7 @@ async fn save_memory(
         derived_from,
         topic_key: body.topic_key,
         user_stated: body.user_stated,
+        session_id: None,
     };
 
     let (reply, report) = if wait {
