@@ -9,7 +9,7 @@
 Detalle en la [exploración](exploration.md); lo que sigue está verificado otra vez contra `develop` (`4a213aa`).
 
 1. **Conectar clawg a Claude Code son pasos a mano, y el que fija la identidad es opcional.** `Command` no tiene ningún subcomando que registre el servidor o toque la configuración de un cliente (`crates/clawg-cli/src/cli.rs:32-162`). El README da `claude mcp add` sin `--agent` como paso principal (`README.md:312`) y la variante con `--agent claude-code` en una sección posterior (`README.md:330-340`). Sin `--agent`, el agente es lo que el cliente diga de sí mismo, y un cambio de ese nombre deja lo guardado fuera del dominio del agente nuevo (la tabla de la exploración).
-2. **Los hooks de 25 no los instala nadie.** `clawg hook` existe (`crates/clawg-cli/src/hook.rs`), pero sólo se configura copiando a mano el JSON de «Probar a mano» del [diseño archivado](../archive/2026-10-18-agent-lifecycle-hooks/design.md#probar-a-mano), que además depende del PATH.
+2. **Los hooks de 25 no los instala nadie.** `clawg hook` existe (`crates/clawg-cli/src/hook.rs`), pero sólo se configura copiando a mano el JSON de «Probar a mano» del [diseño archivado](../2026-10-18-agent-lifecycle-hooks/design.md#probar-a-mano), que además depende del PATH.
 3. **El protocolo completo no llega al agente.** De `crates/clawg-cli/src/mcp/protocol.md` sólo viaja la apertura, como instrucciones del servidor (`opening`, `crates/clawg-cli/src/mcp/server.rs:122`, usado en `:1231`). Las secciones siguientes (tipos, importancia, resumen de sesión, después de compactar) no las carga ningún archivo que Claude Code lea solo.
 
 ## Objetivo que sirve
@@ -22,7 +22,7 @@ El porqué de cada una está en el [diseño](design.md). Las decisiones abiertas
 
 - **`clawg setup claude-code [--profile P] [--dry-run] [--remove]`**, un subcomando con una tabla de un solo cliente.
 - **Registro por el CLI de Claude Code** (enfoque C): `claude mcp add --scope user <servidor> -- <ruta absoluta> mcp --profile P --agent claude-code`. El estado previo se lee de `.claude.json` sin escribirlo. Sin `claude` en el PATH se imprime el comando exacto, se instala lo demás y sale con 1. `.claude.json` nunca se edita.
-- **El agente es siempre `claude-code`**, el nombre que Claude Code reporta (`openspec/changes/archive/2026-10-13-mcp-protocol-upgrade/verify.md:57`): fijarlo igual conserva filas y workspace ([`specs/visibility`](../../specs/visibility/spec.md), R6).
+- **El agente es siempre `claude-code`**, el nombre que Claude Code reporta (`openspec/changes/archive/2026-10-13-mcp-protocol-upgrade/verify.md:57`): fijarlo igual conserva filas y workspace ([`specs/visibility`](../../../specs/visibility/spec.md), R6).
 - **Filas guardadas con otro nombre: nada** (opción c). Ni renombre ni alias; queda documentado cómo verlo con `clawg memories stats`.
 - **Hooks siempre, a nivel usuario** (`settings.json` del directorio de configuración de Claude Code): `SessionStart` (`startup|resume|clear|compact`) y `UserPromptSubmit`, con el mismo `--agent` y `--profile` que el puente.
 - **El protocolo completo, entre marcadores, en el `CLAUDE.md` de usuario.** El hook no lo repite (D3 de 25), así que no se duplica salvo la apertura, que también llega como instrucciones del servidor.

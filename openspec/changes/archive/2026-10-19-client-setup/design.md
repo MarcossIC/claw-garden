@@ -22,7 +22,7 @@
 
 ## D3. Identidad fija `claude-code`
 
-Siempre `--agent claude-code`. Es el único nombre observado de Claude Code (2.1.296, `openspec/changes/archive/2026-10-13-mcp-protocol-upgrade/verify.md:57`), así que quien venía sin `--agent` sigue con sus filas, su workspace y sus reglas de `sharing.json` ([`specs/visibility`](../../specs/visibility/spec.md), R6). Tomar el nombre de `clawg memories stats` necesitaría un daemon corriendo y elegir entre varios; un usuario con otro nombre lo ve ahí y en `memory_status`, y el README lo dice. Renombre y alias quedan fuera (exploración, opciones a y b).
+Siempre `--agent claude-code`. Es el único nombre observado de Claude Code (2.1.296, `openspec/changes/archive/2026-10-13-mcp-protocol-upgrade/verify.md:57`), así que quien venía sin `--agent` sigue con sus filas, su workspace y sus reglas de `sharing.json` ([`specs/visibility`](../../../specs/visibility/spec.md), R6). Tomar el nombre de `clawg memories stats` necesitaría un daemon corriendo y elegir entre varios; un usuario con otro nombre lo ve ahí y en `memory_status`, y el README lo dice. Renombre y alias quedan fuera (exploración, opciones a y b).
 
 ## D4. Hooks en el `settings.json` de usuario
 

@@ -1,0 +1,15 @@
+change: client-setup
+objective: "4"
+depends_on: [memory-protocol, agent-lifecycle-hooks]
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # Linux y Claude Code 2.1.303 en un home temporal, sin CRITICAL; Windows y una sesión real quedan como WARNING
+  archive: done
+updated: 2026-10-19
+main_spec: openspec/specs/setup/spec.md, openspec/specs/hooks/spec.md
