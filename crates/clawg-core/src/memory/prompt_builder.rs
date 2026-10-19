@@ -366,6 +366,9 @@ struct PromptParts<'a> {
 struct Cut {
     budget: usize,
     full: usize,
+    /// Every hit in the order the prompt prints them, which is not the order
+    /// the cut takes them in.
+    printed: Vec<(TableKind, i64)>,
     left_out: Vec<(TableKind, i64)>,
     shortened: Vec<(TableKind, i64)>,
     /// Nothing is left to cut and the text is still over.
@@ -381,15 +384,17 @@ struct Fitted {
 
 /// Renders `parts` in at most `budget` bytes.
 ///
-/// While the text is over, the last hit of LONG-TERM goes, then the last of
-/// RECENT, then the last session's summary, then the last conflict pair,
-/// which joins the count of pairs not shown. The summary outlasts the hits
-/// because no query brings it back, and gives way to the conflicts because
-/// they ask for the user. A hit left alone in its block is shortened instead, and goes only
-/// when no text is left of it: one shortened hit and its id say more than an
-/// empty block. Each step renders the whole text, so the closing note, the
-/// SHARED note and the text a conflict gains when its hit goes are all
-/// counted as they are.
+/// While the text is over, the hit of RECENT or LONG-TERM that scored lowest
+/// goes (see [`next_to_cut`]), then the last session's summary, then the
+/// last conflict pair, which joins the count of pairs not shown. The blocks
+/// say how old a hit is, not how relevant: cutting a whole block first would
+/// drop an `exact` hit of last week before a recent one that barely passed
+/// the floor. The summary outlasts the hits because no query brings it back,
+/// and gives way to the conflicts because they ask for the user. A hit left
+/// alone in its block is shortened instead, and goes only when no text is
+/// left of it: one shortened hit and its id say more than an empty block.
+/// Each step renders the whole text, so the closing note, the SHARED note and
+/// the text a conflict gains when its hit goes are all counted as they are.
 ///
 /// The workspace is never cut: its preferences and USER section are the
 /// standing contract with the user, and every row it printed is one the
@@ -401,18 +406,18 @@ fn fit_to_budget(mut parts: PromptParts<'_>, budget: usize) -> Fitted {
     if full.len() <= budget {
         return Fitted { text: full, shown: parts.recent.into_iter().chain(parts.longterm).collect() };
     }
-    let mut cut = Cut { budget, full: full.len(), left_out: Vec::new(), shortened: Vec::new(), workspace_over: false };
+    let printed =
+        parts.last_session.iter().chain(&parts.recent).chain(&parts.longterm).map(|h| (h.kind, h.id)).collect();
+    let mut cut = Cut { budget, full: full.len(), printed, left_out: Vec::new(), shortened: Vec::new(), workspace_over: false };
     loop {
         let text = render(&parts, Some(&cut));
         let Some(over) = text.len().checked_sub(budget).filter(|&over| over > 0) else {
             return Fitted { text, shown: parts.recent.into_iter().chain(parts.longterm).collect() };
         };
-        let block = if !parts.longterm.is_empty() {
-            &mut parts.longterm
-        } else if !parts.recent.is_empty() {
-            &mut parts.recent
-        } else {
-            &mut parts.last_session
+        let (block, at) = match next_to_cut(&parts.recent, &parts.longterm) {
+            Some((Bucket::LongTerm, at)) => (&mut parts.longterm, at),
+            Some((Bucket::Recent, at)) => (&mut parts.recent, at),
+            None => (&mut parts.last_session, 0),
         };
         match block.len() {
             0 if parts.conflicts.is_empty() => {
@@ -441,11 +446,31 @@ fn fit_to_budget(mut parts: PromptParts<'_>, budget: usize) -> Fitted {
                 }
             }
             _ => {
-                let hit = block.pop().expect("the block has hits");
+                let hit = block.remove(at);
                 cut.left_out.push((hit.kind, hit.id));
             }
         }
     }
+}
+
+enum Bucket {
+    Recent,
+    LongTerm,
+}
+
+/// Where the hit the budget cuts next sits, if RECENT or LONG-TERM has one:
+/// the lowest score, and an `exact` hit only when no other is left, since
+/// holding every identifier of the query is the surest sign of the row asked
+/// for, which is why the search's relevance cut always keeps it. A tie goes
+/// from the end of LONG-TERM, then from the end of RECENT: a context without
+/// a query, whose rows all score 0, is still cut from its oldest save.
+fn next_to_cut(recent: &[RankedHit], longterm: &[RankedHit]) -> Option<(Bucket, usize)> {
+    let longterm = longterm.iter().enumerate().rev().map(|(at, h)| (Bucket::LongTerm, at, h));
+    let recent = recent.iter().enumerate().rev().map(|(at, h)| (Bucket::Recent, at, h));
+    longterm
+        .chain(recent)
+        .min_by(|(_, _, a), (_, _, b)| a.exact.cmp(&b.exact).then(a.score.total_cmp(&b.score)))
+        .map(|(bucket, at, _)| (bucket, at))
 }
 
 /// `content` cut `over` bytes shorter, on a character boundary, and marked;
@@ -537,7 +562,7 @@ fn format_cut(cut: &Cut) -> String {
         other => format!("{} #{id}", format!("{other:?}").to_lowercase()),
     };
     let mut left_out = cut.left_out.clone();
-    left_out.reverse();
+    left_out.sort_by_key(|id| cut.printed.iter().position(|p| p == id));
     let mut out = format!("Cut to fit {} bytes; the full context is {} bytes.", cut.budget, cut.full);
     if !left_out.is_empty() {
         out.push_str(&format!(" Left out: {}.", left_out.iter().map(label).collect::<Vec<_>>().join(", ")));
@@ -1335,6 +1360,36 @@ mod tests {
         let ids = header_ids(&fitted.text);
         assert_eq!(ids, [1, 2, 3], "{}", fitted.text);
         assert_eq!(fitted.shown.iter().map(|h| h.id).collect::<Vec<_>>(), [1, 2, 3]);
+    }
+
+    #[test]
+    fn the_cut_takes_the_lowest_score_first_across_recent_and_long_term() {
+        let mut parts = parts("", &[(1, 1_000), (2, 1_000)], &[(3, 1_000), (4, 1_000)], vec![]);
+        for (hit, score) in parts.recent.iter_mut().chain(&mut parts.longterm).zip([0.9, 0.01, 0.8, 0.02]) {
+            hit.score = score;
+        }
+        let fitted = fit_to_budget(parts, 2_500);
+        assert_eq!(header_ids(&fitted.text), [1, 3], "{}", fitted.text);
+        assert!(block(&fitted.text, SEP_BUDGET).unwrap().contains("Left out: #2, #4."), "in the order they would print: {}", fitted.text);
+    }
+
+    #[test]
+    fn an_exact_hit_is_cut_only_when_no_other_hit_is_left() {
+        let exact_in_long_term = || {
+            let mut parts = parts("", &[(1, 1_000), (2, 1_000)], &[(3, 1_000)], vec![]);
+            parts.longterm[0].score = 0.01;
+            parts.longterm[0].exact = true;
+            parts
+        };
+        let fitted = fit_to_budget(exact_in_long_term(), 2_500);
+        assert_eq!(header_ids(&fitted.text), [1, 3], "{}", fitted.text);
+        assert!(!fitted.text.contains(TRUNCATED), "{}", fitted.text);
+
+        let one_left = (300..2_500)
+            .map(|budget| fit_to_budget(exact_in_long_term(), budget).text)
+            .find(|text| header_ids(text).len() == 1)
+            .expect("some budget leaves a single hit");
+        assert_eq!(header_ids(&one_left), [3], "{one_left}");
     }
 
     #[test]
