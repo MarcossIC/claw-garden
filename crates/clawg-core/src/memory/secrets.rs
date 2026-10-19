@@ -112,6 +112,10 @@ pub enum PurgeError {
 /// What [`purge`] did.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Purged {
+    /// The other rows of the long save the row was a piece of, in id order.
+    /// Neighbours share the tokens at their edges, so each holds a little of
+    /// the purged text.
+    pub pieces: Vec<i64>,
     /// The outbox rows removed with the row's text: saves accepted and not
     /// stored, or failed after they were accepted.
     pub outbox: Vec<OutboxRemoved>,
@@ -173,6 +177,23 @@ pub fn purge(base_dir: &Path, id: i64) -> Result<Purged, MemoryError> {
     let held = OutboxMatch { agent: agent.as_deref(), content: &content, piece };
 
     let tx = c.transaction()?;
+    let pieces: Vec<i64> = {
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT q.memory_id FROM memory_piece p \
+             JOIN memory_piece q ON q.save_id = p.save_id JOIN memory m ON m.id = q.memory_id \
+             WHERE p.memory_id = ?1 AND q.memory_id <> ?1 ORDER BY q.memory_id",
+        )?;
+        let rows = stmt.query_map([id], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    // Every later piece of a save was embedded behind its opening, which the
+    // links keep as text. The link of the row itself stays: it holds an id,
+    // and says which piece is missing.
+    tx.execute(
+        "UPDATE memory_piece SET context = '' \
+         WHERE save_id IN (SELECT save_id FROM memory_piece WHERE memory_id = ?1 AND piece = 1)",
+        [id],
+    )?;
     tx.execute("DELETE FROM memory_vectors WHERE rowid = ?1", [id])?;
     tx.execute("DELETE FROM memory WHERE id = ?1", [id])?;
     // A purged conclusion rests on nothing. A link that names the row as a
@@ -204,7 +225,7 @@ pub fn purge(base_dir: &Path, id: i64) -> Result<Purged, MemoryError> {
     c.execute("INSERT INTO memory_fts(memory_fts) VALUES ('optimize')", [])?;
     leave_no_old_copy(c)?;
     let backups = backups_holding(&crate::paths::backups_dir(base_dir), id, &held);
-    Ok(Purged { outbox, backups })
+    Ok(Purged { pieces, outbox, backups })
 }
 
 /// What [`mask_reasons`] did.
@@ -828,6 +849,44 @@ mod tests {
         let mut stmt = c.prepare("SELECT operation_id FROM ingest_outbox ORDER BY id").unwrap();
         let ids = stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
         ids
+    }
+
+    #[tokio::test]
+    async fn purging_the_first_piece_empties_the_head_of_its_save() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::memory::db::seed_on_disk(dir.path(), None).await;
+        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+        let mut ids = Vec::new();
+        for text in [SECRET, "and the second piece of it", "and the third piece of it"] {
+            c.execute(INSERT_ROW, [text]).unwrap();
+            ids.push(c.last_insert_rowid());
+        }
+        for (piece, (id, context)) in ids.iter().zip(["", SECRET, SECRET]).enumerate() {
+            c.execute(
+                "INSERT INTO memory_piece (save_id, piece, memory_id, context) VALUES (1, ?1, ?2, ?3)",
+                rusqlite::params![piece as i64 + 1, id, context],
+            )
+            .unwrap();
+        }
+        let whole = format!("{SECRET} and the second piece of it and the third piece of it");
+        add_outbox_row(&c, "op-long", &whole);
+        drop(c);
+
+        let purged = purge(dir.path(), ids[0]).unwrap();
+
+        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+        let links: Vec<(i64, String)> = c
+            .prepare("SELECT memory_id, context FROM memory_piece ORDER BY piece")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        drop(c);
+        assert_eq!(links, ids.iter().map(|&id| (id, String::new())).collect::<Vec<_>>());
+        assert!(outbox_ids(dir.path()).is_empty());
+        assert_eq!(purged.pieces, ids[1..]);
+        assert!(!bytes_mention(dir.path(), b"quokka"), "the secret's bytes are still on disk");
     }
 
     #[tokio::test]
