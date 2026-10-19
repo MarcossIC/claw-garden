@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| transversal | M | — (conviene antes de 53 outbox-lifecycle y junto a 61 embedder-recovery; ver «Interacciones») | exploración (borrador) |
+| transversal | M | — (conviene antes de 53 outbox-lifecycle y junto a 61 embedder-recovery; ver «Interacciones») | exploración cerrada; ver [`state.yaml`](state.yaml) |
 
 **Tesis:** conseguir el modelo nunca cuelga al daemon, y cuando falla siempre dice por qué. Hoy la descarga no tiene ningún plazo (ni de conexión ni de lectura), así que un servidor o un proxy que contesta y deja de enviar mantiene el bootstrap en `loading` para siempre; y la recarga del modelo ocioso, si la caché ya no pasa su SHA-256, ejecuta esa misma descarga con el cerrojo del embedder tomado, de modo que toda llamada que necesita un vector espera detrás de ella mientras `/health` dice `ready`. Cuando la descarga sí falla, la causa (el código HTTP, el error de red) se descarta y el usuario lee sólo «retry budget exhausted … after 3 attempts». Además, el camino de verificación lee y hashea el ONNX de ~470 MB hasta tres veces y lo hace en un hilo del runtime asíncrono. Nada de lo de acá toca `memory.db`: el cambio vive en los archivos del modelo (`<data>/models/`), no en la base del usuario. No toca inferencia ni chunking.
 
@@ -113,16 +113,16 @@
 - Hacer volver al hilo de inferencia muerto (61) y medir CPU/memoria (62).
 - Un salto del hash por mtime (G) sin números.
 
-## Decisiones abiertas
+## Decisiones
 
-Son del usuario.
+Cerradas con el usuario; ver la [propuesta](proposal.md#decisiones).
 
-- [ ] **Valores de los plazos.** ¿`connect_timeout` 30 s y `read_timeout` 60 s, u otros? ¿Configurables por entorno?
-- [ ] **Reparar la caché.** Con B, ¿quién baja de nuevo los archivos que ya no verifican: una tarea disparada por la recarga fallida, o sólo el reinicio del daemon? ¿Es de este cambio o de 61?
-- [ ] **`CLAWG_HF_BASE_URL`.** ¿H (documentada, https salvo loopback, valor inválido es error) o I (sólo `testing`)?
-- [ ] **Salto del hash por mtime (G).** ¿Se acepta perder la detección de corrupción del mismo tamaño, o se mantiene el hash completo?
-- [ ] **Forma del mensaje.** ¿La causa va en el texto de `RetryExhausted` o en un campo aparte de `/health`?
-- [ ] **Colapsar las costuras (J).** ¿En este cambio o aparte?
+- [x] **Valores de los plazos.** `connect_timeout` 30 s y `read_timeout` 60 s, fijos, sin variable de entorno.
+- [x] **Reparar la caché.** Una tarea aparte que lanza la recarga fallida, una a la vez, fuera del cerrojo; es de este cambio.
+- [x] **`CLAWG_HF_BASE_URL`.** H: documentada, `https://` salvo loopback, un valor inválido es un error que nombra la variable.
+- [x] **Salto del hash por mtime (G).** No: se mantiene el hash completo.
+- [x] **Forma del mensaje.** La causa va en el texto de `RetryExhausted`, sin campo nuevo en `/health`.
+- [x] **Colapsar las costuras (J).** En este cambio, primero y en un commit aparte.
 
 ## Cómo se mide
 

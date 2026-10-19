@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use clawg_core::build_info::{self, ServeFault};
 use clawg_core::memory::bootstrap::{
-    run_embedder_bootstrap_with_retry, serve_deps, unloading_when_idle, LogSink,
+    run_embedder_bootstrap_with_retry, serve_deps, unloading_when_idle, EmbedderDeps, LogSink,
 };
 use clawg_core::memory::idle_embedder::{idle_after, DEFAULT_IDLE, IDLE_MINUTES_VAR};
 use clawg_core::memory::store_lock::StoreHolder;
@@ -98,7 +98,7 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
     // Background, never awaited: the model may not be on disk yet, and the
     // daemon must answer `/health` and accept saves throughout the download.
     // A failed download is retried until the network comes back.
-    let (ensure, load, verify) =
+    let EmbedderDeps { ensure, cached, load, verify } =
         serve_deps(
             runtime.store.clone(),
             clawg_core::paths::backups_dir(&base_dir),
@@ -113,6 +113,7 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
     });
     let load = match idle {
         Some(idle) => unloading_when_idle(
+            cached,
             ensure.clone(),
             load,
             base_dir.clone(),
