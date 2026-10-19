@@ -20,7 +20,7 @@ Fuente de verdad del comportamiento actual de `clawg setup <cliente>`: el subcom
 
 ## R1. `clawg setup claude-code`
 
-`clawg setup claude-code [--profile P] [--dry-run] [--remove]` (`Command::Setup`, `crates/clawg-cli/src/cli.rs:168`) MUST resolver el perfil como los otros subcomandos (un build debug MUST rechazar `prod`), MUST rechazar una ruta del binario que no sea absoluta (`plan`, `setup.rs:198-200`), y MUST NOT abrir el store ni arrancar un daemon. Antes de escribir MUST leer los tres archivos; si uno no se puede leer, no es JSON válido o no tiene la forma que escribe Claude Code (los dos JSON, `parse_object`, `setup.rs:249`), o tiene un marcador sin su par (el `CLAUDE.md`, `find_block`, `setup.rs:566`), MUST fallar sin escribir ninguno.
+`clawg setup claude-code [--profile P] [--dry-run] [--remove]` (`Command::Setup`, `crates/clawg-cli/src/cli.rs:174`) MUST resolver el perfil como los otros subcomandos (un build debug MUST rechazar `prod`), MUST rechazar una ruta del binario que no sea absoluta (`plan`, `setup.rs:198-200`), y MUST NOT abrir el store ni arrancar un daemon. Antes de escribir MUST leer los tres archivos; si uno no se puede leer, no es JSON válido o no tiene la forma que escribe Claude Code (los dos JSON, `parse_object`, `setup.rs:249`), o tiene un marcador sin su par (el `CLAUDE.md`, `find_block`, `setup.rs:566`), MUST fallar sin escribir ninguno.
 
 **Tests:** `setup_takes_a_client_a_profile_dry_run_and_remove` (`cli.rs`), `a_relative_binary_path_is_refused`, `an_invalid_settings_file_writes_nothing`, `a_lone_marker_writes_nothing` (`setup.rs`).
 
@@ -97,7 +97,7 @@ Cada archivo MUST escribirse por un temporal en el directorio del archivo real y
 
 ## R8. `clawg` sin subcomando
 
-`clawg` sin ningún argumento MUST imprimir la ayuda en stderr y salir con 1, no con 2: es lo que corre un cliente anterior a 2.1.139, que no conoce `args` y ejecuta `command` solo, y 2 bloquea la sesión (`is_bare_invocation`, `crates/clawg-cli/src/cli.rs:308`; la rama de `Cli::try_parse` en `crates/clawg-cli/src/main.rs:43-55`). Los demás errores de uso MUST seguir saliendo con 2, salvo los de `clawg hook`, que salen con 1 ([`specs/hooks`](../hooks/spec.md), R3).
+`clawg` sin ningún argumento MUST imprimir la ayuda en stderr y salir con 1, no con 2: es lo que corre un cliente anterior a 2.1.139, que no conoce `args` y ejecuta `command` solo, y 2 bloquea la sesión (`is_bare_invocation`, `crates/clawg-cli/src/cli.rs:344`; la rama de `Cli::try_parse` en `crates/clawg-cli/src/main.rs:44-56`). Los demás errores de uso MUST seguir saliendo con 2, salvo los de `clawg hook`, que salen con 1 ([`specs/hooks`](../hooks/spec.md), R3).
 
 #### Escenario: un cliente que ignora `args`
 - GIVEN un hook en forma exec y un cliente anterior a 2.1.139

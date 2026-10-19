@@ -434,6 +434,23 @@ pub struct Updated {
     pub tier: i64,
 }
 
+/// A failed save taken back to pending. `queued` is false when the daemon's
+/// queue was full and it waits for the next start.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct OutboxRetried {
+    pub operation_id: String,
+    pub agent_id: String,
+    pub queued: bool,
+}
+
+/// A failed save dropped, with the memories it had stored, now deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct OutboxDiscarded {
+    pub operation_id: String,
+    pub agent_id: String,
+    pub deleted: Vec<i64>,
+}
+
 /// How a restored row ended up. A `superseded` one is live but still left out
 /// of searches. Every field after `superseded_by` is absent from a daemon
 /// that predates them.
@@ -516,9 +533,11 @@ pub enum SaveOutcome {
         key_dropped: bool,
     },
     /// Accepted but not confirmed; `reason` says why (`"unconfirmed"`,
-    /// `"embedder_loading"`, `"already_queued"`), and `operation_id` is what
-    /// it waits under; a daemon that predates the outbox sends none.
-    Queued { reason: Option<String>, operation_id: Option<String> },
+    /// `"embedder_loading"`, `"already_queued"`, `"partially_saved"`), and
+    /// `operation_id` is what it waits under; a daemon that predates the
+    /// outbox sends none. A save that stopped part-way names the pieces it
+    /// stored in `memories` and why it stopped in `detail`.
+    Queued { reason: Option<String>, operation_id: Option<String>, memories: Vec<SavedMemory>, detail: Option<String> },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -685,6 +704,8 @@ impl DaemonClient {
             topic_key: Option<String>,
             #[serde(default)]
             operation_id: Option<String>,
+            #[serde(default)]
+            detail: Option<String>,
         }
         let keyed = args.topic_key.is_some();
         let resp = self
@@ -704,7 +725,12 @@ impl DaemonClient {
                 replaced: body.replaced,
                 key_dropped: keyed && body.topic_key.is_none(),
             },
-            _ => SaveOutcome::Queued { reason: body.reason, operation_id: body.operation_id },
+            _ => SaveOutcome::Queued {
+                reason: body.reason,
+                operation_id: body.operation_id,
+                memories: body.memories,
+                detail: body.detail,
+            },
         })
     }
 
@@ -978,6 +1004,34 @@ impl DaemonClient {
             .await
             .map_err(Self::map_transport)?;
         Self::read_response::<Restored>(resp).await
+    }
+
+    /// Takes the failed save of `operation_id` back to pending; `agent` is
+    /// needed only when another agent used the same id.
+    pub async fn outbox_retry(&self, operation_id: &str, agent: Option<&str>) -> Result<OutboxRetried, ClientError> {
+        let resp = self
+            .http
+            .post(self.url("/v1/outbox/retry"))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "operation_id": operation_id, "agent_id": agent }))
+            .send()
+            .await
+            .map_err(Self::map_transport)?;
+        Self::read_response(resp).await
+    }
+
+    /// Drops the failed save of `operation_id` and deletes the memories it
+    /// had stored; `agent` as in [`DaemonClient::outbox_retry`].
+    pub async fn outbox_discard(&self, operation_id: &str, agent: Option<&str>) -> Result<OutboxDiscarded, ClientError> {
+        let resp = self
+            .http
+            .post(self.url("/v1/outbox/discard"))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "operation_id": operation_id, "agent_id": agent }))
+            .send()
+            .await
+            .map_err(Self::map_transport)?;
+        Self::read_response(resp).await
     }
 
     /// `agent` scopes the verdict as in [`DaemonClient::update`]. A daemon

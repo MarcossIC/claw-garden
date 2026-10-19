@@ -581,6 +581,16 @@ pub fn format_status(
     if let Some(conflicts) = conflicts {
         out.push_str(&format!("\n{conflicts}"));
     }
+    if let Some(failed) = health.ingest.as_ref().map(|i| i.failed).filter(|n| *n > 0) {
+        let (saves, each, them, they) = match failed {
+            1 => ("save", "it", "it", "it"),
+            _ => ("saves", "each", "them", "they"),
+        };
+        out.push_str(&format!(
+            "\n{failed} {saves} failed for good; the user retries or discards {each} with \
+             `clawg outbox retry|discard <operation_id>` (ingest.problems names {them} and the memories {they} stored)"
+        ));
+    }
     out
 }
 
@@ -1320,6 +1330,7 @@ mod tests {
                     state: OutboxState::Failed,
                     attempts: 3,
                     error: "the daemon stopped 3 times while ingesting this save".into(),
+                    pieces: vec![41],
                 }],
             }),
             ..health()
@@ -1327,6 +1338,15 @@ mod tests {
         let out = format_status(&h, Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", None);
         assert!(out.contains("\"failed\": 1"), "out was: {out}");
         assert!(out.contains("\"operation_id\": \"op-1\""), "out was: {out}");
+        assert!(
+            out.ends_with(
+                "\n1 save failed for good; the user retries or discards it with \
+                 `clawg outbox retry|discard <operation_id>` (ingest.problems names it and the memories it stored)"
+            ),
+            "out was: {out}"
+        );
+        let none_failed = format_status(&health(), Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", None);
+        assert!(!none_failed.contains("clawg outbox"), "out was: {none_failed}");
     }
 
     #[test]
