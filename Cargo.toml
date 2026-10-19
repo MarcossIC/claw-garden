@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/clawg-cli", "crates/clawg-core", "crates/clawg-eval"]
 
 [workspace.package]
-version = "0.27.5"
+version = "0.28.0"
 authors = ["The Claw Garden contributors"]
 license = "MIT"
 repository = "https://github.com/MarcossIC/claw-garden"

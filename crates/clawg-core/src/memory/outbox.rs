@@ -15,6 +15,7 @@ use crate::memory::clock::TimestampMs;
 use crate::memory::error::MemoryError;
 use crate::memory::events::MemoryEvent;
 use crate::memory::pieces::{link_in, StoredPiece};
+use crate::memory::redact::redact;
 use crate::memory::topic::{revise_in, Replaced, Revision};
 use crate::memory::MemoryStore;
 
@@ -299,6 +300,9 @@ impl MemoryStore {
     /// Notes why `row` stopped. See [`after_failure`].
     pub(crate) async fn outbox_fail(&self, row: i64, error: String, transient: bool) -> Result<(), MemoryError> {
         let now = TimestampMs::now();
+        // The cause is a library's error text and reaches `/health`; nothing
+        // stops one from quoting its input.
+        let error = redact(&error).text;
         self.conn
             .call(move |c| -> rusqlite::Result<()> {
                 let tx = c.transaction()?;
@@ -376,7 +380,7 @@ impl MemoryStore {
                         Err(e) => {
                             tx.execute(
                                 "UPDATE ingest_outbox SET state = 'failed', last_error = ?2, updated_at = ?3 WHERE id = ?1",
-                                rusqlite::params![row, format!("the saved event does not parse: {e}"), now],
+                                rusqlite::params![row, redact(&format!("the saved event does not parse: {e}")).text, now],
                             )?;
                         }
                     }
@@ -685,6 +689,31 @@ mod tests {
         let contents: Vec<String> =
             store.outbox_pending().await.unwrap().into_iter().map(|(_, e)| e.content).collect();
         assert_eq!(contents, vec!["one", "two"]);
+    }
+
+    #[tokio::test]
+    async fn a_failure_is_stored_masked() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let token: String = "a1B2".chars().cycle().take(36).collect();
+        let row = new_row(&store, "op-1", "x").await;
+        store.outbox_claim(row).await.unwrap();
+
+        store.outbox_fail(row, format!("embed failed: token ghp_{token}"), false).await.unwrap();
+
+        let error = row_state(&store, row).await.unwrap().2;
+        assert_eq!(error.as_deref(), Some("embed failed: token [REDACTED:github_token]"));
+
+        let row = new_row(&store, "op-2", "x").await;
+        let event = format!("{{\"importance\": \"ghp_{token}\"}}");
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE ingest_outbox SET event = ?2 WHERE id = ?1", rusqlite::params![row, event]))
+            .await
+            .unwrap();
+        store.outbox_pending().await.unwrap();
+        let error = row_state(&store, row).await.unwrap().2.unwrap();
+        assert!(error.starts_with("the saved event does not parse"), "{error}");
+        assert!(!error.contains(&token), "{error}");
     }
 
     #[tokio::test]

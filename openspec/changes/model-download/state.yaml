@@ -1,14 +1,14 @@
 change: model-download
 objective: "transversal"
 depends_on: []
-phase: explore
+phase: verify
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
-  apply: pending
-  verify: pending
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: partial  # Linux; faltan el CI de Linux y Windows y «Probar a mano» sobre el perfil dev
   archive: pending
 updated: 2026-10-19

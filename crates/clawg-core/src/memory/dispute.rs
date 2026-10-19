@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::memory::clock::TimestampMs;
 use crate::memory::provenance::mark;
+use crate::memory::redact::redact;
 use crate::memory::{MemoryError, MemoryStore};
 
 /// How a dispute between two rows is closed.
@@ -324,7 +325,8 @@ pub async fn judge_pair(
     if keep == other {
         return Err(ResolveError::SameRow);
     }
-    let reason = reason.map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
+    // Masked as a save is: the pair lives in memory.db and in every snapshot.
+    let reason = reason.map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).map(|r| redact(&r).text);
     if verdict == Verdict::Scoped && reason.is_none() {
         return Err(ResolveError::ReasonRequired);
     }
@@ -942,6 +944,21 @@ mod tests {
             .await
             .unwrap();
         assert!(hits.iter().any(|h| h.id == old), "{hits:?}");
+    }
+
+    #[tokio::test]
+    async fn a_verdict_reason_is_stored_masked() {
+        let store = store().await;
+        let old = seed(&store, "old", "active", &[], 0).await;
+        let new = seed(&store, "new", "active", &[], 1).await;
+        note_pair(&store, new, old, "pending").await;
+        let key: String = "Q7ZX".chars().cycle().take(16).collect();
+
+        let reason = format!("the staging key AKIA{key} is only for ci");
+        judge_pair(&store, new, old, Verdict::Scoped, Some(reason), None).await.unwrap();
+
+        let stored = "the staging key [REDACTED:aws_access_key] is only for ci";
+        assert_eq!(pair_of(&store, new, old).await, judged("scoped", Some(stored)));
     }
 
     #[tokio::test]

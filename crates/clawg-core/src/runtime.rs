@@ -27,6 +27,7 @@ use tokio::time::Instant;
 use crate::memory::access::AccessTracker;
 use crate::memory::backup::Reason;
 use crate::memory::bootstrap::EmbedderStatus;
+use crate::memory::chunker::chat::ChatChunker;
 use crate::memory::embedder::Embedder;
 use crate::memory::events::MemoryEvent;
 use crate::memory::store_lock::StoreHolder;
@@ -204,6 +205,7 @@ impl MemoryRuntime {
             self.tokenizer.clone(),
             rx,
             drain,
+            crate::memory::model_download::load_verified_tokenizer,
         )
     }
 
@@ -392,20 +394,29 @@ async fn checkpoint(store: &MemoryStore) {
 /// Builds the chat chunker once — resolving the tokenizer as a side effect,
 /// which is what fills `tokenizer_cell` for the query path — then hands
 /// ownership to the worker loop.
-fn ingest_worker_future(
+fn ingest_worker_future<L>(
     base_dir: PathBuf,
     store: Arc<MemoryStore>,
     embedder: Arc<OnceCell<Arc<dyn Embedder>>>,
     tokenizer: Arc<OnceCell<Arc<tokenizers::Tokenizer>>>,
     rx: Receiver<IngestRequest>,
     drain: watch::Receiver<Option<Instant>>,
-) -> impl Future<Output = Vec<MemoryEvent>> + Send + 'static {
+    load_tokenizer: L,
+) -> impl Future<Output = Vec<MemoryEvent>> + Send + 'static
+where
+    L: FnOnce(&std::path::Path) -> Option<Arc<tokenizers::Tokenizer>> + Send + 'static,
+{
     async move {
-        let chat_chunker = resolve_tokenizer_and_chunker(
-            &base_dir,
-            &tokenizer,
-            crate::memory::model_download::load_verified_tokenizer,
-        );
+        // Reading, hashing and parsing 17 MB is blocking work.
+        let chat_chunker = {
+            let (base_dir, tokenizer) = (base_dir.clone(), tokenizer.clone());
+            tokio::task::spawn_blocking(move || resolve_tokenizer_and_chunker(&base_dir, &tokenizer, load_tokenizer))
+                .await
+        }
+        .unwrap_or_else(|e| {
+            log::warn!("reading tokenizer.json failed ({e}); chunking by bytes until the model loads");
+            Arc::new(ChatChunker::from_cell(tokenizer.clone()))
+        });
         import_spill(&base_dir, &store).await;
         let replay = match store.outbox_pending().await {
             Ok(rows) => {
@@ -734,6 +745,7 @@ mod tests {
             tokenizer,
             rx,
             watch::channel(None).1,
+            crate::memory::model_download::load_verified_tokenizer,
         ));
         memory_tx.try_send(chat_event("through the free function").into()).expect("send");
         drop(memory_tx);
@@ -754,6 +766,34 @@ mod tests {
 
         fn assert_spawnable<F: Future<Output = ()> + Send + 'static>(_: &F) {}
         assert_spawnable(&maintenance_worker_future(store));
+    }
+
+    #[tokio::test]
+    async fn the_worker_resolves_the_tokenizer_off_the_runtime_thread() {
+        let tmp = tmp_base();
+        let (rt, rx) = MemoryRuntime::new_for_test(tmp.path().to_path_buf()).await;
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let loader = {
+            let seen = seen.clone();
+            move |_dir: &std::path::Path| {
+                *seen.lock().unwrap() = Some(std::thread::current().id());
+                None
+            }
+        };
+        let worker = tokio::spawn(ingest_worker_future(
+            rt.base_dir.clone(),
+            rt.store.clone(),
+            rt.embedder.clone(),
+            rt.tokenizer.clone(),
+            rx,
+            watch::channel(None).1,
+            loader,
+        ));
+        drop(rt);
+        worker.await.expect("worker exits");
+
+        let thread = seen.lock().unwrap().expect("the worker read the tokenizer");
+        assert_ne!(thread, std::thread::current().id(), "read on the runtime thread");
     }
 
     #[tokio::test]
