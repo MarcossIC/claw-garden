@@ -103,11 +103,44 @@ fn backups_lines(backups: &[std::path::PathBuf]) -> Vec<String> {
     lines
 }
 
-/// The lines printed after a purge. Backups that still hold the row are named
-/// and left alone: they are the way back from everything else.
+/// The lines printed after a purge, one per group that is not empty. Backups
+/// and workspace files that still hold the row are named and left alone:
+/// the backups are the way back from everything else, and a workspace's
+/// hand-written part is the user's.
 pub fn purge_report(id: i64, purged: &Purged) -> String {
+    let ids = |ids: &[i64]| ids.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(", ");
     let mut lines = vec![format!("purged memory #{id}")];
+    if !purged.revived.is_empty() {
+        lines.push(format!("back as the current version of its topic: {}", ids(&purged.revived)));
+    }
+    if !purged.hidden.is_empty() {
+        lines.push(format!("still replaced, by a verdict: {}", ids(&purged.hidden)));
+    }
+    if !purged.pieces.is_empty() {
+        lines.push(format!(
+            "the other pieces of its save share text with it at their edges: {}; \
+             purge them too if the whole save must go",
+            ids(&purged.pieces)
+        ));
+    }
+    if !purged.outbox.is_empty() {
+        let removed: Vec<String> =
+            purged.outbox.iter().map(|o| format!("{} ({}, {})", o.operation_id, o.agent_id, o.state)).collect();
+        lines.push(format!("removed from the ingest outbox: {}", removed.join(", ")));
+    }
     lines.extend(backups_lines(&purged.backups));
+    if !purged.workspaces.is_empty() {
+        lines.push("these workspace files still hold it:".to_string());
+        const AUTO: &str = "AUTO section, rewritten by the agent's next recall_context in that project";
+        for w in &purged.workspaces {
+            let section = match (w.holding.auto, w.holding.user) {
+                (true, true) => format!("{AUTO}; and outside it: edit it by hand"),
+                (true, false) => AUTO.to_string(),
+                _ => "outside the AUTO section: edit it by hand".to_string(),
+            };
+            lines.push(format!("  {} ({section})", w.path.display()));
+        }
+    }
     lines.join("\n")
 }
 
@@ -210,6 +243,47 @@ mod tests {
         let msg = explain(err, "purge");
         assert!(msg.contains("the clawg daemon (pid 7)") && msg.contains("run `clawg stop` first, then purge"), "{msg}");
         assert_eq!(explain(MemoryError::Internal("boom".into()), "purge"), "internal memory error: boom");
+    }
+
+    #[test]
+    fn the_purge_report_names_what_came_back_and_what_went() {
+        use clawg_core::memory::secrets::{OutboxRemoved, WorkspaceHolding};
+        use clawg_core::memory::workspace::Holding;
+        use std::path::PathBuf;
+        let workspace =
+            |path: &str, auto, user| WorkspaceHolding { path: PathBuf::from(path), holding: Holding { auto, user } };
+        let purged = Purged {
+            revived: vec![12],
+            hidden: vec![8, 9],
+            pieces: vec![58, 59],
+            outbox: vec![OutboxRemoved {
+                operation_id: "op-1".into(),
+                agent_id: "agent-s".into(),
+                state: "failed".into(),
+            }],
+            backups: vec![PathBuf::from("/b/memory-x-manual.db")],
+            workspaces: vec![
+                workspace("/w/a/p/workspace.md", true, false),
+                workspace("/w/a/q/workspace.md", false, true),
+                workspace("/w/b/p/workspace.md", true, true),
+            ],
+        };
+        assert_eq!(
+            purge_report(57, &purged),
+            "purged memory #57\n\
+             back as the current version of its topic: #12\n\
+             still replaced, by a verdict: #8, #9\n\
+             the other pieces of its save share text with it at their edges: #58, #59; \
+             purge them too if the whole save must go\n\
+             removed from the ingest outbox: op-1 (agent-s, failed)\n\
+             these backups still hold it; delete them if it must be gone everywhere:\n  \
+             /b/memory-x-manual.db\n\
+             these workspace files still hold it:\n  \
+             /w/a/p/workspace.md (AUTO section, rewritten by the agent's next recall_context in that project)\n  \
+             /w/a/q/workspace.md (outside the AUTO section: edit it by hand)\n  \
+             /w/b/p/workspace.md (AUTO section, rewritten by the agent's next recall_context in that project; \
+             and outside it: edit it by hand)"
+        );
     }
 
     #[test]
