@@ -321,6 +321,8 @@ pub enum DownloadError {
     InsufficientDisk { free_mb: u64, required_mb: u64 },
     #[error("could not build the HTTP client for the model download: {0}")]
     Client(#[source] reqwest::Error),
+    #[error("the model files in the cache do not verify: {}", files.join(", "))]
+    NotCached { files: Vec<String> },
     #[error("sha-256 mismatch for {file}: expected {expected}, got {actual}")]
     ChecksumMismatch {
         file: String,
@@ -412,23 +414,15 @@ async fn fetch(
     progress: Option<&UnboundedSender<DownloadProgress>>,
 ) -> Result<ModelFiles, DownloadError> {
     let cache_dir = cache_dir_of(base_dir);
+    std::fs::create_dir_all(&cache_dir).map_err(|e| DownloadError::Io {
+        file: cache_dir.display().to_string(),
+        source: e,
+    })?;
+
     // (1) Cache-hit fast path: NO events emitted. Every startup after the first
     // takes this branch, and emitting progress here would flash a download UI
-    // for work that never happens. Reading and hashing half a gigabyte is
-    // blocking work, kept off the runtime's threads.
-    let mut cached = {
-        let (dir, files) = (cache_dir.clone(), source.files.to_vec());
-        tokio::task::spawn_blocking(move || {
-            std::fs::create_dir_all(&dir)?;
-            Ok(check_cache(&dir, &files))
-        })
-        .await
-        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
-        .map_err(|e| DownloadError::Io {
-            file: cache_dir.display().to_string(),
-            source: e,
-        })?
-    };
+    // for work that never happens.
+    let mut cached = check_cache_off_runtime(&cache_dir, source.files).await?;
     if cached.missing.is_empty() {
         return Ok(cached.into_model_files());
     }
@@ -481,6 +475,34 @@ async fn fetch(
         let _ = tx.send(DownloadProgress::Verify);
     }
     Ok(cached.into_model_files())
+}
+
+/// The model from the cache alone: a missing or altered file is an error and
+/// nothing is downloaded. What a reload of the idle model reads.
+pub async fn load_cached_model(base_dir: &Path) -> Result<ModelFiles, DownloadError> {
+    load_cached_from(base_dir, &ALL_FILES).await
+}
+
+pub(crate) async fn load_cached_from(base_dir: &Path, files: &[FileSpec]) -> Result<ModelFiles, DownloadError> {
+    let cached = check_cache_off_runtime(&cache_dir_of(base_dir), files).await?;
+    if !cached.missing.is_empty() {
+        return Err(DownloadError::NotCached {
+            files: cached.missing.iter().map(|spec| spec.path.to_string()).collect(),
+        });
+    }
+    Ok(cached.into_model_files())
+}
+
+/// [`check_cache`] on a blocking thread: reading and hashing half a gigabyte
+/// would hold up every other task of the runtime thread it ran on.
+async fn check_cache_off_runtime(cache_dir: &Path, files: &[FileSpec]) -> Result<CacheCheck, DownloadError> {
+    let (dir, files) = (cache_dir.to_path_buf(), files.to_vec());
+    tokio::task::spawn_blocking(move || check_cache(&dir, &files))
+        .await
+        .map_err(|e| DownloadError::Io {
+            file: cache_dir.display().to_string(),
+            source: std::io::Error::other(e.to_string()),
+        })
 }
 
 /// What the cache holds: the bytes of every file that passed its hash, and
@@ -1493,6 +1515,28 @@ mod tests {
             expected.sort();
             assert_eq!(reads, expected, "with {damaged} missing, each cached file read once and the downloaded one never");
         }
+    }
+
+    #[tokio::test]
+    async fn the_cached_model_never_touches_the_network() {
+        let tmp = TestDir::new("cache-only");
+        let cache_dir = tmp.path().join("models").join("multilingual-e5-small");
+        let files = fixture_files();
+        let specs = fixture_specs(&files);
+        write_all_to_cache(&cache_dir, &files);
+
+        let model = load_cached_from(tmp.path(), &specs).await.expect("a good cache loads");
+        assert_eq!(model.onnx, files[0].bytes);
+
+        std::fs::remove_file(cache_dir.join("tokenizer_config.json")).unwrap();
+        std::fs::write(cache_dir.join("config.json"), b"altered").unwrap();
+        match load_cached_from(tmp.path(), &specs).await {
+            Err(DownloadError::NotCached { files }) => {
+                assert_eq!(files, ["config.json", "tokenizer_config.json"]);
+            }
+            other => panic!("expected NotCached, got {other:?}"),
+        }
+        assert!(collect_partials(&cache_dir).is_empty());
     }
 
     // ---------- The cause of a failure ----------
