@@ -92,7 +92,7 @@ impl Sandbox {
             .env("CLAWG_TEST_EMBEDDER", embedder)
             .stdout(Stdio::null())
             .stderr(File::create(&log).expect("log file"))
-            .spawn()
+            .spawn_copy()
             .expect("spawn clawg serve");
         Daemon::watch(child, log).answering(&self.data_dir()).await
     }
@@ -114,7 +114,7 @@ impl Sandbox {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(File::create(&log).expect("log file"))
-            .spawn()
+            .spawn_copy()
             .expect("spawn clawg mcp");
         let stdin = child.stdin.take().expect("stdin");
         let stdout = child.stdout.take().expect("stdout");
@@ -653,6 +653,18 @@ async fn a_hook_usage_error_exits_1() {
     }
 }
 
+/// What a client that does not know a hook's `args` runs.
+#[tokio::test]
+async fn a_bare_clawg_exits_1() {
+    let sandbox = Sandbox::new();
+    let out = sandbox.command(&[]).output().expect("run clawg");
+    assert_eq!(out.status.code(), Some(1), "2 would block the client: {}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("Usage"), "{}", stderr_of(&out));
+    assert!(stdout_of(&out).is_empty(), "{}", stdout_of(&out));
+    let typo = sandbox.command(&["statsu"]).output().expect("run clawg");
+    assert_eq!(typo.status.code(), Some(2), "any other usage error stays 2");
+}
+
 #[tokio::test]
 async fn session_start_injects_the_saved_memories() {
     let sandbox = Sandbox::new();
@@ -758,6 +770,35 @@ fn stamped_bytes(json: &str) -> Vec<u8> {
     bytes
 }
 
+/// Runs a copy of the binary this process wrote. While the copy was open for
+/// writing, a child another test forked meanwhile inherited that descriptor
+/// and holds it until it execs, and running the copy in that moment fails
+/// with "text file busy", so the run is tried again.
+trait RunCopy {
+    fn spawn_copy(&mut self) -> std::io::Result<Child>;
+    fn output_copy(&mut self) -> std::io::Result<Output>;
+}
+
+impl RunCopy for Command {
+    fn spawn_copy(&mut self) -> std::io::Result<Child> {
+        retry_while_busy(|| self.spawn())
+    }
+
+    fn output_copy(&mut self) -> std::io::Result<Output> {
+        retry_while_busy(|| self.output())
+    }
+}
+
+fn retry_while_busy<T>(mut run: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    for _ in 0..50 {
+        match run() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => std::thread::sleep(Duration::from_millis(20)),
+            done => return done,
+        }
+    }
+    run()
+}
+
 fn write_executable(path: &Path, bytes: &[u8]) {
     std::fs::write(path, bytes).expect("write the copy");
     #[cfg(unix)]
@@ -774,7 +815,7 @@ fn run_binary(sandbox: &Sandbox, bin: &Path, args: &[&str]) -> Output {
         .env_remove("CLAWG_PROFILE")
         .current_dir(&sandbox.home)
         .stdin(Stdio::null())
-        .output()
+        .output_copy()
         .expect("run clawg")
 }
 
@@ -885,7 +926,7 @@ fn update(sandbox: &Sandbox, bin: &Path, server: &str, args: &[&str]) -> Output 
         .env_remove("CLAWG_PROFILE")
         .current_dir(&sandbox.home)
         .stdin(Stdio::null())
-        .output()
+        .output_copy()
         .expect("run clawg update")
 }
 
@@ -1001,7 +1042,7 @@ fn update_from(sandbox: &Sandbox, installed: &Path, server: &str, public: &str) 
         .env_remove("CLAWG_PROFILE")
         .current_dir(&sandbox.home)
         .stdin(Stdio::null())
-        .output()
+        .output_copy()
         .expect("run clawg update")
 }
 
@@ -1109,7 +1150,7 @@ async fn store_at(sandbox: &Sandbox, schema: i32, seed: impl FnOnce(&rusqlite::C
     let installed = install(sandbox, &stamp_json("0.18.0", &format!(r#","migrations_up_to":{schema}"#)));
     // The first start only creates the store at that schema.
     let first = sandbox.serve_binary(&installed, "fake").await;
-    let stopped = sandbox.command_of(&installed, &["stop", "--profile", "dev"]).output().expect("run clawg stop");
+    let stopped = sandbox.command_of(&installed, &["stop", "--profile", "dev"]).output_copy().expect("run clawg stop");
     assert!(stopped.status.success(), "{}", stderr_of(&stopped));
     first.wait_for_exit(Duration::from_secs(10)).await;
 
@@ -1433,7 +1474,7 @@ async fn a_stale_daemon_is_brought_back_by_the_installed_binary_when_the_new_one
         .stdin(Stdio::null())
         .stdout(File::create(&out_log).expect("log file"))
         .stderr(File::create(&err_log).expect("log file"))
-        .spawn()
+        .spawn_copy()
         .expect("run clawg update");
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
     let status = loop {
@@ -1536,8 +1577,10 @@ async fn setup_without_claude_prints_the_command_and_installs_the_rest() {
     let bin = std::fs::canonicalize(BIN).unwrap();
     let line = format!("claude mcp add --scope user clawg-dev -- {} mcp --profile dev --agent claude-code", bin.display());
     assert!(text.contains(&line), "{text}");
-    let settings = std::fs::read_to_string(sandbox.home.join("claude-config").join("settings.json")).unwrap();
-    assert!(settings.contains("hook session-start --agent claude-code --profile dev"), "{settings}");
+    let settings: Value = serde_json::from_str(&std::fs::read_to_string(sandbox.home.join("claude-config").join("settings.json")).unwrap()).unwrap();
+    let hook = &settings["hooks"]["SessionStart"][0]["hooks"][0];
+    assert_eq!(hook["command"], json!(bin), "{settings}");
+    assert_eq!(hook["args"], json!(["hook", "session-start", "--agent", "claude-code", "--profile", "dev"]), "{settings}");
     let md = std::fs::read_to_string(sandbox.home.join("claude-config").join("CLAUDE.md")).unwrap();
     assert!(md.starts_with("<!-- BEGIN CLAWG MEMORY PROTOCOL -->"), "{md}");
 }
