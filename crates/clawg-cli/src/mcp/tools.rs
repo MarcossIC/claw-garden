@@ -86,8 +86,8 @@ pub fn format_search(found: Found, reader: &str) -> String {
 }
 
 /// The author of a hit `reader` did not save, if any. A hit without an author
-/// comes from a daemon that predates sharing, where every hit was the
-/// reader's own.
+/// is a row no agent saved, or comes from a daemon that predates sharing,
+/// where every hit was the reader's own: either way there is nobody to name.
 fn shared_author<'a>(hit: &'a Hit, reader: &str) -> Option<&'a str> {
     hit.agent_id.as_deref().filter(|a| *a != reader)
 }
