@@ -183,7 +183,7 @@ pub fn load(base_dir: &Path) -> Result<SharingPolicy, SharingError> {
 pub fn save(base_dir: &Path, policy: &SharingPolicy) -> Result<(), SharingError> {
     let path = sharing_file(base_dir);
     let tmp = path.with_extension("json.tmp");
-    std::fs::create_dir_all(base_dir).map_err(SharingError::Write)?;
+    crate::private_dir::ensure_private_dir(base_dir).map_err(SharingError::Write)?;
     std::fs::write(&tmp, policy.to_json()).map_err(SharingError::Write)?;
     std::fs::rename(&tmp, &path).map_err(SharingError::Write)?;
     Ok(())
@@ -358,5 +358,16 @@ mod tests {
         let mut off = SharingPolicy::default();
         off.hide("*", "*");
         assert_eq!(off.render(), "no agent reads another");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_creates_a_private_data_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let base = home.path().join(".clawg-dev");
+
+        save(&base, &SharingPolicy::default()).unwrap();
+
+        assert_eq!(crate::private_dir::mode_of(&base), 0o700);
     }
 }

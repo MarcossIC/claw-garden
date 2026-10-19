@@ -424,6 +424,46 @@ async fn a_save_accepted_before_a_hard_kill_is_stored_after_the_restart() {
     assert!(hits.to_string().contains("the smoke test survives a hard kill"), "{hits}");
 }
 
+// ── Data directory mode ─────────────────────────────────────────────────────
+
+#[cfg(unix)]
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_daemon_on_a_fresh_home_leaves_a_private_data_directory() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+
+    assert_eq!(mode_of(&sandbox.data_dir()), 0o700);
+    assert!(!daemon.log_text().contains("made it"), "a new directory is born private:\n{}", daemon.log_text());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_open_data_directory_is_tightened_and_keeps_its_rows() {
+    use std::os::unix::fs::PermissionsExt;
+    let sandbox = Sandbox::new();
+    let first = sandbox.serve().await;
+    first.wait_until_ready().await;
+    let (status, body) = first.post("/v1/memories", json!({ "content": "kept across the tightening", "agent_id": "smoke" })).await;
+    assert_eq!(status, 201, "{body}");
+    first.wait_until_ingested().await;
+    assert_eq!(sandbox.run(&["stop", "--profile", "dev"]).status.code(), Some(0));
+    first.wait_for_exit(Duration::from_secs(10)).await;
+    std::fs::set_permissions(sandbox.data_dir(), std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let second = sandbox.serve().await;
+
+    assert_eq!(mode_of(&sandbox.data_dir()), 0o700);
+    assert!(second.log_text().contains("was 0755; made it 0700"), "{}", second.log_text());
+    second.wait_until_ingested().await;
+    assert!(second.list().await.contains("kept across the tightening"));
+}
+
 // ── Lock ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]

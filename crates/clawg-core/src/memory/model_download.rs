@@ -448,7 +448,7 @@ async fn fetch(
     progress: Option<&UnboundedSender<DownloadProgress>>,
 ) -> Result<ModelFiles, DownloadError> {
     let cache_dir = cache_dir_of(base_dir);
-    std::fs::create_dir_all(&cache_dir).map_err(|e| DownloadError::Io {
+    crate::private_dir::ensure_private_dir(&cache_dir).map_err(|e| DownloadError::Io {
         file: cache_dir.display().to_string(),
         source: e,
     })?;
@@ -666,7 +666,7 @@ async fn download_one(
 
     let target = cache_dir.join(spec.path);
     if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| DownloadError::Io {
+        crate::private_dir::ensure_private_dir(parent).map_err(|e| DownloadError::Io {
             file: spec.path.into(),
             source: e,
         })?;
@@ -1201,6 +1201,33 @@ mod tests {
             partials.is_empty(),
             "expected zero .partial files, found {partials:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_model_cache_is_created_private() {
+        let tmp = TestDir::new("dl-private");
+        let files = fixture_files();
+        let specs = fixture_specs(&files);
+        let mut server = mockito::Server::new_async().await;
+        let _mocks = mount_all(&mut server, &files, 200).await;
+        let oracle = MockDiskOracle::returning(MIN_FREE_BYTES);
+
+        ensure_model_from(tmp.path(), &source(&server.url(), &oracle, &specs), None).await.unwrap();
+
+        let models = tmp.path().join("models");
+        let cache_dir = models.join("multilingual-e5-small");
+        let mut dirs = vec![models, cache_dir.clone()];
+        for spec in &specs {
+            let mut parent = cache_dir.join(spec.path).parent().unwrap().to_path_buf();
+            while parent != cache_dir {
+                dirs.push(parent.clone());
+                parent = parent.parent().unwrap().to_path_buf();
+            }
+        }
+        for dir in dirs {
+            assert_eq!(crate::private_dir::mode_of(&dir), 0o700, "{}", dir.display());
+        }
     }
 
     #[tokio::test]

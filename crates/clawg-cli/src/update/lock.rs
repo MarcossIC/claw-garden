@@ -4,6 +4,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use clawg_core::paths::update_lock_file;
+use clawg_core::private_dir::ensure_private_dir;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LockError {
@@ -29,7 +30,7 @@ impl UpdateLock {
     pub fn acquire(base_dir: &Path) -> Result<Self, LockError> {
         let path = update_lock_file(base_dir);
         let io = |source| LockError::Io { path: path.clone(), source };
-        std::fs::create_dir_all(base_dir).map_err(io)?;
+        ensure_private_dir(base_dir).map_err(io)?;
         let file = File::options().create(true).read(true).write(true).truncate(false).open(&path).map_err(io)?;
         // Fully qualified: `File` has its own `try_lock*` methods with other
         // semantics, as `StoreLock` notes.
@@ -73,5 +74,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         UpdateLock::acquire(&dir.path().join("never-created")).expect("created on the way");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_update_lock_makes_the_data_directory_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let (fresh, open) = (home.path().join(".clawg-dev"), home.path().join(".clawg"));
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        for base in [&fresh, &open] {
+            drop(UpdateLock::acquire(base).unwrap());
+            let mode = std::fs::metadata(base).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", base.display());
+        }
     }
 }

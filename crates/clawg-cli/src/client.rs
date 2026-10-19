@@ -24,6 +24,7 @@ use clawg_core::memory::dispute::{OpenPairs, Resolution};
 use clawg_core::memory::outbox::OutboxSummary;
 use clawg_core::memory::store_lock::{StoreHolder, StoreLock, StoreOwner};
 use clawg_core::paths::{data_dir, PathsError, Profile};
+use clawg_core::private_dir::ensure_private_dir;
 use serde::{Deserialize, Serialize};
 
 use crate::daemon::api::DocsSearchBody;
@@ -1186,7 +1187,7 @@ pub fn spawn_serve_at(
     // Both streams go to one appended log file. Appending, not truncating:
     // a daemon that died is exactly when the previous run's tail matters.
     let log_dir = base_dir.join("logs");
-    std::fs::create_dir_all(&log_dir)
+    ensure_private_dir(&log_dir)
         .map_err(|e| ClientError::Spawn(format!("cannot create {}: {e}", log_dir.display())))?;
     let log_path = log_dir.join("serve.log");
     let log = std::fs::OpenOptions::new()
@@ -1311,7 +1312,7 @@ pub async fn start_daemon(
 ) -> Result<DaemonClient, ClientError> {
     // The data directory has to exist before the daemon can publish into it —
     // on a first ever run it does not.
-    std::fs::create_dir_all(base_dir)
+    ensure_private_dir(base_dir)
         .map_err(|e| ClientError::Spawn(format!("cannot create {}: {e}", base_dir.display())))?;
 
     spawner.spawn_serve(profile)?;
@@ -1812,6 +1813,36 @@ pub(crate) mod tests {
             0,
             "a daemon that already answers must never be started a second time"
         );
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn autostart_creates_a_private_data_directory() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let base = home.path().join(".clawg-dev");
+
+        let _ = super::start_daemon(&base, Profile::Dev, &DeadSpawner, Duration::from_millis(10)).await;
+
+        assert_eq!(mode_of(&base), 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_serve_log_goes_in_a_private_directory() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let base = home.path().join(".clawg-dev");
+        std::fs::create_dir(&base).expect("data dir");
+
+        let mut child = spawn_serve_at(Path::new("true"), &base, Profile::Dev, None).expect("spawn");
+        child.wait().expect("wait");
+
+        assert_eq!(mode_of(&base.join("logs")), 0o700);
     }
 
     #[tokio::test]
