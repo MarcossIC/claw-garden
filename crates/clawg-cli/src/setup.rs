@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use clawg_core::paths::{backups_dir, Profile};
+use clawg_core::private_dir::ensure_private_dir;
 use serde_json::{Map, Value};
 
 use crate::update::plan::stamp;
@@ -773,8 +774,11 @@ fn write_file(step: &FileStep, file: &File, base_dir: &Path, now_ms: i64) -> std
     let target = link_target(&file.path)?;
     let backup = match &file.text {
         Some(text) => {
+            // Setup can be the first thing run over a data directory an
+            // older clawg left open, before any daemon tightens it.
+            ensure_private_dir(base_dir)?;
             let dir = copies_dir(base_dir);
-            std::fs::create_dir_all(&dir)?;
+            ensure_private_dir(&dir)?;
             let copy = dir.join(format!("{}-{}", copy_name(&file.path), stamp(now_ms)));
             create_fresh(&copy, Some(0o600))?.write_all(text.as_bytes())?;
             Some(copy)
@@ -1511,6 +1515,24 @@ mod tests {
         for copy in copies {
             assert_eq!(mode(&copy), 0o600, "{}", copy.display());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_copies_go_in_a_private_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, data) = (dir.path().join("config"), dir.path().join("data"));
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("settings.json"), r#"{"theme":"dark"}"#).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        chmod(&data, 0o755);
+
+        let (text, code) = run_in(state_in(&config, Some(&planned_server_json())), Mode::Install, false, None, &data, 0).unwrap();
+
+        assert_eq!(code, 0, "{text}");
+        assert_eq!(mode(&data), 0o700);
+        assert_eq!(mode(&data.join("backups")), 0o700);
+        assert_eq!(mode(&data.join("backups").join("setup")), 0o700);
     }
 
     #[test]

@@ -10,14 +10,14 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 
 ## 2. Los lugares de `clawg-core` (R6, D3)
 
-- [x] Tests primero (Unix): `opening_a_store_makes_its_directory_private`, `a_snapshot_directory_is_created_private`, `restore_creates_a_private_data_directory`, `save_creates_a_private_data_directory`, `workspace_directories_are_created_private`, `the_model_cache_is_created_private`.
+- [x] Tests primero (Unix): `opening_a_store_makes_its_directory_private`, `a_data_directory_that_cannot_be_created_is_an_error`, `a_snapshot_directory_is_created_private`, `restore_creates_a_private_data_directory`, `save_creates_a_private_data_directory`, `workspace_directories_are_created_private`, `the_model_cache_is_created_private`.
 - [x] `MemoryStore::open`, `snapshot_into`, `restore`, `sharing::save`, `workspace.rs` y `model_download.rs` usan el ayudante; `open` devuelve el error al crear.
 - Commit: `fix(core): create the data directory and its subdirectories private to the owner`
 
 ## 3. Los lugares de `clawg-cli` (R6, D4)
 
-- [ ] Tests primero (Unix): `the_update_lock_makes_the_data_directory_private`, `setup_copies_go_in_a_private_directory`; en `tests/binary.rs`, `a_bridge_on_a_fresh_home_leaves_a_private_data_directory` y `an_open_data_directory_is_tightened_and_keeps_its_rows`.
-- [ ] `serve`, `start_daemon`, `spawn_serve_at`, `UpdateLock::acquire` y `setup` usan el ayudante.
+- [x] Tests primero (Unix): `the_update_lock_makes_the_data_directory_private`, `setup_copies_go_in_a_private_directory`, `autostart_creates_a_private_data_directory`, `the_serve_log_goes_in_a_private_directory`; en `tests/binary.rs`, `a_daemon_on_a_fresh_home_leaves_a_private_data_directory` y `an_open_data_directory_is_tightened_and_keeps_its_rows`. Los dos del binario ya pasan los modos tras la tarea 2, porque `MemoryStore::open` aprieta lo que `serve` acaba de crear 0755; lo que falla antes de esta tarea es ese `warn` en una instalación nueva, y el test lo fija.
+- [x] `serve`, `start_daemon`, `spawn_serve_at`, `UpdateLock::acquire` y `setup` usan el ayudante.
 - Commit: `fix(cli): create the data directory private to the owner from every entry point`
 
 ## 4. Docs
