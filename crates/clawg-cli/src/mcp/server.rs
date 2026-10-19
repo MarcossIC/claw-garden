@@ -47,7 +47,7 @@ use crate::client::{
 use crate::mcp::startup::{on_failure, ClientHandle, Next};
 use crate::mcp::tools::{
     format_docs, format_recall, format_resolution, format_rows, format_save, format_search, format_sharing,
-    format_open_pairs, format_restore, format_status, format_synthesis, format_update, indexes_docs, resolve_project,
+    format_delete, format_open_pairs, format_restore, format_status, format_synthesis, format_update, indexes_docs, resolve_project,
 };
 
 /// The daemon refused a root because its id already belongs to another one.
@@ -822,7 +822,7 @@ impl ClawgMcp {
             .call(|client| async move { client.delete(&args.kind, args.id, Some(agent_id)).await })
             .await;
         match result {
-            Ok(Ok(n)) => Self::ok(format!("deleted {n}; restore_memory with the same id and kind undoes it")),
+            Ok(Ok(deleted)) => Self::ok(format_delete(&deleted)),
             Ok(Err(e)) => Self::failed(Self::explain(&e)),
             Err(failure) => Ok(failure),
         }
@@ -1107,7 +1107,8 @@ impl ClawgMcp {
                        `search_memory`, `list_memories` or `recall_context` first — ids are \
                        per-kind, so the same number exists in all three tables. Only your own \
                        memories: one marked `by <agent>` was saved by another agent and is \
-                       read-only. `restore_memory` undoes it."
+                       read-only. Deleting the current memory of a `topic_key` makes the version \
+                       it replaced current again. `restore_memory` undoes it."
     )]
     async fn delete_memory(
         &self,
@@ -1121,8 +1122,10 @@ impl ClawgMcp {
         name = "restore_memory",
         description = "Undo a `delete_memory`: bring a memory you deleted back, with the id and \
                        kind you deleted it with, when the user says the delete was a mistake. \
-                       Refused when the same text was saved again since, or when the memory holds \
-                       a secret. Only your own memories: one marked `by <agent>` is read-only."
+                       Refused when the same text was saved again since, when a newer memory holds \
+                       its `topic_key`, or when the memory holds a secret. Names the memories saved \
+                       meanwhile that are close to it, to judge with `resolve_conflict`. Only your own \
+                       memories: one marked `by <agent>` is read-only."
     )]
     async fn restore_memory(
         &self,
@@ -1169,10 +1172,11 @@ impl ClawgMcp {
     #[tool(
         name = "synthesize",
         description = "Review stored memories for conclusions: the memories no conclusion covers \
-                       yet, newest first, the conclusions already drawn, and how to save new \
+                       yet, newest first, the conclusions already drawn, those whose sources \
+                       were deleted or replaced since, and how to save new ones or fix old \
                        ones. A conclusion is saved with `save_memory` and `derived_from`; the \
                        memories it rests on stay as they are. Use it when `recall_context` says \
-                       memories are waiting, at the end of a long task, or when the user asks \
+                       memories are waiting or conclusions need a review, at the end of a long task, or when the user asks \
                        what you have learned. Calling it marks the memories as reviewed, even \
                        if you save nothing."
     )]
@@ -1286,6 +1290,7 @@ mod tests {
             started_at: Instant::now(),
             shutdown,
             save_timeout: SAVE_CONFIRM_TIMEOUT,
+            sessions: Default::default(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr: SocketAddr = listener.local_addr().expect("addr");
@@ -3538,6 +3543,7 @@ mod tests {
                 started_at: Instant::now(),
                 shutdown,
                 save_timeout: SAVE_CONFIRM_TIMEOUT,
+                sessions: Default::default(),
             });
             Self::serve(data_dir, token, wrap(router(ctx))).await.with_store(store)
         }

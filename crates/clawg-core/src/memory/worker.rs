@@ -22,7 +22,7 @@ use crate::memory::pieces::StoredPiece;
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::events::{MemoryEvent, MemorySource};
 use crate::memory::redact::{redact, SecretKind};
-use crate::memory::store_insert::NewMemoryRecord;
+use crate::memory::store_insert::{NewMemoryRecord, Stored};
 use crate::memory::topic::{inherit, Replaced, Revision, TopicScope};
 use crate::memory::MemoryStore;
 
@@ -191,6 +191,23 @@ impl Replay {
     }
 }
 
+/// The outbox rows the start-up read found: the only ones that can reach the
+/// worker twice. A save accepted before the read is both in it and on the
+/// channel; one accepted after arrives once. The replay runs before anything
+/// from the channel, so the copy arrives after its row was taken, and the set
+/// never grows past what the read found.
+struct StartupRows(HashSet<i64>);
+
+impl StartupRows {
+    fn of(replay: &Replay) -> Self {
+        Self(replay.requests.iter().filter_map(|r| r.outbox).collect())
+    }
+
+    fn is_second_delivery(&self, row: i64, from_replay: bool) -> bool {
+        !from_replay && self.0.contains(&row)
+    }
+}
+
 /// What the worker does with the next event it takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DrainStep {
@@ -256,10 +273,9 @@ pub async fn memory_worker(
     let mut queue_over_depth = false;
     let mut drain = Some(drain);
     let mut deadline: Option<Instant> = None;
-    // The outbox rows taken in this run. A row the start-up read found can
-    // also arrive on the channel; the second delivery is skipped, and its
-    // caller, who may be waiting, gets the report of the first.
-    let mut taken: HashSet<i64> = HashSet::new();
+    // A second delivery is skipped, and its caller, who may be waiting, gets
+    // the report of the first.
+    let startup = StartupRows::of(&replay);
     let mut replayed: HashMap<i64, IngestReport> = HashMap::new();
     loop {
         observe_drain(&mut rx, &mut drain, &mut deadline);
@@ -290,15 +306,17 @@ pub async fn memory_worker(
         }
         let track = match outbox {
             None => None,
-            Some(row) => match take_row(&store, row, &mut taken).await {
-                Some(progress) => Some(Track { row, progress }),
-                None => {
-                    // A dropped reply reads as unconfirmed.
-                    if let (Some(reply), Some(report)) = (reply, replayed.remove(&row)) {
-                        let _ = reply.send(report);
-                    }
-                    continue;
+            Some(row) if startup.is_second_delivery(row, from_replay) => {
+                log::debug!("outbox row {row} arrived twice; ingested once");
+                // A dropped reply reads as unconfirmed.
+                if let (Some(reply), Some(report)) = (reply, replayed.remove(&row)) {
+                    let _ = reply.send(report);
                 }
+                continue;
+            }
+            Some(row) => match take_row(&store, row).await {
+                Some(progress) => Some(Track { row, progress }),
+                None => continue,
             },
         };
         let report = process_tracked(
@@ -418,11 +436,7 @@ async fn hold_for_embedder(
 /// Takes outbox `row` for this run: its progress, or `None` when there is
 /// nothing to ingest (taken already in this run, finished, failed, given up
 /// just now, or unreadable, which leaves it for the next start).
-async fn take_row(store: &Arc<MemoryStore>, row: i64, taken: &mut HashSet<i64>) -> Option<Vec<NotedPiece>> {
-    if !taken.insert(row) {
-        log::debug!("outbox row {row} arrived twice; ingested once");
-        return None;
-    }
+async fn take_row(store: &Arc<MemoryStore>, row: i64) -> Option<Vec<NotedPiece>> {
     match store.outbox_claim(row).await {
         Ok(Claimed::Process { progress }) => Some(progress),
         Ok(Claimed::Skip) => None,
@@ -797,8 +811,21 @@ async fn ingest_pieces(
         .collect();
         let candidates = record.candidates.clone();
         let note = note_for(track.as_ref(), &noted, position, &content_hash, true, context(position));
-        let id = match store.insert_noting(record, vec, note).await {
-            Ok(id) => id,
+        let absorbed_note = note_for(track.as_ref(), &noted, position, &content_hash, false, "");
+        let id = match store.insert_unless_twin(record, vec, note, absorbed_note).await {
+            Ok(Stored::Inserted(id)) => id,
+            Ok(Stored::Absorbed(id)) => {
+                *absorbed += 1;
+                log::debug!("ingest absorbed a twin that came back while the save was embedded (memory_id={id})");
+                if track.is_some() {
+                    noted.push(NotedPiece { position, hash: content_hash.clone(), id, inserted: false, context: String::new() });
+                }
+                stored[position] = Some(SavedChunk { id, outcome: ChunkOutcome::Reinforced });
+                for _ in 1..multiplicity {
+                    absorb_duplicate(store, evt, &content_hash, absorbed, |_| None).await;
+                }
+                continue;
+            }
             Err(e) => {
                 let failure = IngestFailure::Failed(format!("store insert failed: {e}"));
                 return (report(&stored, Some(failure)), Vec::new());
@@ -846,24 +873,23 @@ async fn finish_save(store: &Arc<MemoryStore>, pieces: Vec<StoredPiece>, revisio
 }
 
 /// Resolves the shared tokenizer exactly once and builds the chat chunker
-/// from that SAME value: `tokenizer_cell` and the returned chunker can never
+/// over that SAME cell: `tokenizer_cell` and the returned chunker can never
 /// disagree about which parse of `tokenizer.json` they got, and the file is
-/// never read twice for one process. Pulled out of the worker's setup so this
-/// wiring is unit-testable on its own. The loader is a parameter so the daemon
-/// can pass the one that checks the file's hash and tests can pass their own.
+/// never read twice for one process. A cell this leaves empty is filled by
+/// the model load later, and the chunker splits by tokens from then on.
+/// Pulled out of the worker's setup so this wiring is unit-testable on its
+/// own. The loader is a parameter so the daemon can pass the one that checks
+/// the file's hash and tests can pass their own.
 pub fn resolve_tokenizer_and_chunker<L>(
     base_dir: &std::path::Path,
-    tokenizer_cell: &OnceCell<Arc<tokenizers::Tokenizer>>,
+    tokenizer_cell: &Arc<OnceCell<Arc<tokenizers::Tokenizer>>>,
     load: L,
 ) -> Arc<ChatChunker>
 where
     L: FnOnce(&std::path::Path) -> Option<Arc<tokenizers::Tokenizer>>,
 {
-    let tok = tokenizer_cell
-        .get_or_try_init(|| load(base_dir).ok_or(()))
-        .ok()
-        .cloned();
-    Arc::new(ChatChunker::from_tokenizer(tok))
+    let _ = tokenizer_cell.get_or_try_init(|| load(base_dir).ok_or(()));
+    Arc::new(ChatChunker::from_cell(tokenizer_cell.clone()))
 }
 
 #[cfg(test)]
@@ -893,6 +919,7 @@ mod tests {
             derived_from: Vec::new(),
             topic_key: None,
             user_stated: false,
+            session_id: None,
         }
     }
 
@@ -910,6 +937,7 @@ mod tests {
             derived_from: Vec::new(),
             topic_key: None,
             user_stated: false,
+            session_id: None,
         }
     }
 
@@ -982,6 +1010,7 @@ mod tests {
             derived_from: Vec::new(),
             topic_key: None,
             user_stated: false,
+            session_id: None,
         };
         // Wait: the "tool_calls" filter is in from_message, but the worker just
         // calls select_chunker(Role::Assistant, None, "") → Skip (empty content).
@@ -1343,6 +1372,7 @@ mod tests {
                 derived_from: Vec::new(),
                 topic_key: None,
                 user_stated: false,
+                session_id: None,
             })).unwrap();
         }
         drain_worker(tx, handle).await;
@@ -1426,6 +1456,7 @@ mod tests {
                 derived_from: Vec::new(),
                 topic_key: None,
                 user_stated: false,
+                session_id: None,
             })).unwrap();
         }
         drain_worker(tx2, handle2).await;
@@ -1457,6 +1488,7 @@ mod tests {
                 derived_from: Vec::new(),
                 topic_key: None,
                 user_stated: false,
+                session_id: None,
             })).unwrap();
         }
         drain_worker(tx3, handle3).await;
@@ -2074,6 +2106,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_save_writes_its_session_on_every_row() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let long = MemoryEvent { session_id: Some("sess-1".into()), ..explicit_fact(&long_save()) };
+        let report = process_with(Arc::new(FakeEmbedder::default()), &store, &long).await;
+        assert!(report.memories.len() > 1, "the fixture splits into pieces");
+        process_with(Arc::new(FakeEmbedder::default()), &store, &explicit_fact("no session behind this one")).await;
+
+        let sessions: Vec<Option<String>> = store
+            .conn
+            .call(|c| {
+                let mut stmt = c.prepare("SELECT source_session_id FROM memory ORDER BY id")?;
+                let rows = stmt.query_map([], |r| r.get(0))?.collect();
+                rows
+            })
+            .await
+            .unwrap();
+        let mut want = vec![Some("sess-1".to_string()); report.memories.len()];
+        want.push(None);
+        assert_eq!(sessions, want);
+    }
+
+    #[tokio::test]
     async fn an_absorbed_piece_is_linked_without_context() {
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
         let content = long_save();
@@ -2270,6 +2324,73 @@ mod tests {
         );
     }
 
+    /// The dedup check runs before the embedding and the contradiction probe,
+    /// and a restore of the same text can land while the save waits for the
+    /// model.
+    #[tokio::test]
+    async fn a_twin_restored_while_the_save_is_embedded_is_reinforced_not_copied() {
+        use std::sync::Mutex;
+        use tokio::sync::oneshot;
+        struct GatedEmbedder {
+            reached: Mutex<Option<oneshot::Sender<()>>>,
+            release: Mutex<Option<oneshot::Receiver<()>>>,
+        }
+        #[async_trait::async_trait]
+        impl Embedder for GatedEmbedder {
+            async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+                let reached = self.reached.lock().unwrap().take();
+                if let Some(reached) = reached {
+                    let _ = reached.send(());
+                }
+                let release = self.release.lock().unwrap().take();
+                if let Some(release) = release {
+                    let _ = release.await;
+                }
+                Ok(vec![0.1_f32; 384])
+            }
+            fn dimensions(&self) -> usize { 384 }
+            fn model_id(&self) -> &str { "gated" }
+            fn query_prefix(&self) -> &str { "" }
+            fn passage_prefix(&self) -> &str { "" }
+        }
+
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let evt = make_event(Role::User, "the train leaves on tuesdays", None, 1);
+        let twin = process_with(Arc::new(FakeEmbedder::default()), &store, &evt).await.memories[0].id;
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE memory SET deleted_at = 1 WHERE id = ?1", [twin]))
+            .await
+            .unwrap();
+
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let gated: Arc<dyn Embedder> = Arc::new(GatedEmbedder {
+            reached: Mutex::new(Some(reached_tx)),
+            release: Mutex::new(Some(release_rx)),
+        });
+        let saving = {
+            let (store, evt) = (store.clone(), evt.clone());
+            tokio::spawn(async move { process_with(gated, &store, &evt).await })
+        };
+        reached_rx.await.expect("the save reached the embedding");
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE memory SET deleted_at = NULL WHERE id = ?1", [twin]))
+            .await
+            .unwrap();
+        release_tx.send(()).unwrap();
+        let report = saving.await.unwrap();
+
+        assert_eq!(report.memories, vec![SavedChunk { id: twin, outcome: ChunkOutcome::Reinforced }]);
+        let live: i64 = store
+            .conn
+            .call(|c| c.query_row("SELECT COUNT(*) FROM memory WHERE deleted_at IS NULL", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(live, 1, "one text, one live row");
+    }
+
     #[tokio::test]
     async fn a_failed_embed_batch_reports_the_failure_and_no_rows() {
         struct FailingBatch;
@@ -2414,6 +2535,7 @@ mod tests {
             derived_from: Vec::new(),
             topic_key: None,
             user_stated: false,
+            session_id: None,
         })).unwrap();
         drain_worker(tx, handle).await;
 
@@ -2442,6 +2564,7 @@ mod tests {
             derived_from: Vec::new(),
             topic_key: None,
             user_stated: false,
+            session_id: None,
         })).unwrap();
         drain_worker(tx, handle).await;
 
@@ -3011,7 +3134,7 @@ mod tests {
         let base_dir = unique_temp_dir("resolve-tok");
         write_minimal_tokenizer_fixture(&base_dir);
 
-        let cell: OnceCell<Arc<tokenizers::Tokenizer>> = OnceCell::new();
+        let cell: Arc<OnceCell<Arc<tokenizers::Tokenizer>>> = Arc::new(OnceCell::new());
         let chunker = resolve_tokenizer_and_chunker(&base_dir, &cell, crate::memory::model_download::load_tokenizer);
 
         let cell_tok = cell.get().expect("cell must be filled when tokenizer.json is present");
@@ -3031,10 +3154,29 @@ mod tests {
         std::fs::remove_dir_all(&base_dir).ok();
     }
 
+    /// A new install starts the worker before the first model download lands,
+    /// and the process can then run for days.
+    #[test]
+    fn the_chunker_splits_by_tokens_once_the_tokenizer_loads_after_it() {
+        let base_dir = unique_temp_dir("resolve-tok-late");
+        let cell: Arc<OnceCell<Arc<tokenizers::Tokenizer>>> = Arc::new(OnceCell::new());
+        let chunker = resolve_tokenizer_and_chunker(&base_dir, &cell, |_: &std::path::Path| None);
+        assert!(cell.get().is_none(), "nothing on disk yet");
+
+        write_minimal_tokenizer_fixture(&base_dir);
+        let tokenizer = crate::memory::model_download::load_tokenizer(&base_dir).expect("the fixture loads");
+        cell.set(tokenizer).ok();
+
+        let chunks = chunker.chunk("hello world", 1);
+        assert_eq!(chunks.len(), 2, "once the model loaded, the same chunker must split by tokens");
+
+        std::fs::remove_dir_all(&base_dir).ok();
+    }
+
     #[test]
     fn resolve_tokenizer_and_chunker_leaves_the_cell_empty_when_the_file_is_absent() {
         let base_dir = unique_temp_dir("resolve-tok-absent");
-        let cell: OnceCell<Arc<tokenizers::Tokenizer>> = OnceCell::new();
+        let cell: Arc<OnceCell<Arc<tokenizers::Tokenizer>>> = Arc::new(OnceCell::new());
         let chunker = resolve_tokenizer_and_chunker(&base_dir, &cell, crate::memory::model_download::load_tokenizer);
 
         assert!(cell.get().is_none(), "no tokenizer.json on disk must leave the cell empty");
@@ -3049,7 +3191,7 @@ mod tests {
         write_minimal_tokenizer_fixture(&base_dir);
 
         let parses = std::cell::Cell::new(0u32);
-        let cell: OnceCell<Arc<tokenizers::Tokenizer>> = OnceCell::new();
+        let cell: Arc<OnceCell<Arc<tokenizers::Tokenizer>>> = Arc::new(OnceCell::new());
         let chunker = resolve_tokenizer_and_chunker(&base_dir, &cell, |dir| {
             crate::memory::model_download::load_verified_tokenizer_with(dir, |bytes| {
                 parses.set(parses.get() + 1);
@@ -3245,6 +3387,15 @@ mod tests {
         assert_eq!(outbox_row(&store, row).await, None);
     }
 
+    #[test]
+    fn only_the_channel_copy_of_a_start_up_row_is_a_second_delivery() {
+        let startup = StartupRows::of(&Replay::rows(vec![(7, make_event(Role::User, "read at start", None, 1))]));
+
+        assert!(!startup.is_second_delivery(7, true), "the replay's own delivery is the first");
+        assert!(startup.is_second_delivery(7, false), "its copy on the channel is the second");
+        assert!(!startup.is_second_delivery(8, false), "a save accepted after the read arrives once");
+    }
+
     #[tokio::test]
     async fn a_row_that_stopped_the_process_three_times_fails_and_the_next_one_runs() {
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
@@ -3403,6 +3554,24 @@ mod tests {
         .await
         .unwrap();
         assert!(hits.iter().all(|h| h.id != old), "{hits:?}");
+    }
+
+    #[tokio::test]
+    async fn a_revision_records_why_it_replaced() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let old = only_id(&save(&store, &keyed("Storage engine is SQLite", "storage/engine")).await);
+        let new = only_id(&save(&store, &keyed("Storage engine moved to Postgres", "storage/engine")).await);
+
+        let causes: Vec<Option<String>> = store
+            .conn
+            .call(move |c| {
+                let mut stmt = c.prepare("SELECT supersede_cause FROM memory WHERE id IN (?1, ?2) ORDER BY id")?;
+                let rows = stmt.query_map([old, new], |r| r.get(0))?.collect();
+                rows
+            })
+            .await
+            .unwrap();
+        assert_eq!(causes, vec![Some("revision".to_string()), None]);
     }
 
     #[tokio::test]

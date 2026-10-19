@@ -135,6 +135,8 @@ pub struct NewMemoryRecord {
     pub derived_from: Vec<i64>,
     /// The topic key of the save this row is a piece of (`topic.rs`).
     pub topic_key: Option<String>,
+    /// The host session the save came from, when the daemon knew it.
+    pub source_session_id: Option<String>,
 }
 
 /// Neutral importance for a row nothing has said anything special about.
@@ -215,6 +217,7 @@ impl NewMemoryRecord {
             candidates: Vec::new(),
             derived_from: evt.sources().to_vec(),
             topic_key: evt.topic().map(str::to_string),
+            source_session_id: evt.session_id.clone(),
         }
     }
 }
@@ -330,7 +333,9 @@ impl MemoryStore {
     /// with the same hash finishes its own miss) is closed by
     /// `memory_worker` being the single sequential consumer of one ingest
     /// channel — not by a DB constraint, because `idx_memory_dedup` cannot
-    /// be `UNIQUE` (see the migration). `MemoryRuntime::ingest_worker`
+    /// be `UNIQUE` (see the migration). A restore can still bring a twin back
+    /// to life while the worker embeds, so the worker's insert looks again
+    /// ([`MemoryStore::insert_unless_twin`]). `MemoryRuntime::ingest_worker`
     /// is the only spawn site (`rg -n 'ingest_worker\('` confirms this). If the worker is ever parallelized, this guarantee
     /// breaks, and the fix is, in order: (i) a maintenance pass collapsing
     /// legacy duplicate triples, reassigning `superseded_by` /
@@ -371,15 +376,7 @@ impl MemoryStore {
                     return Ok(None);
                 };
 
-                tx.execute(
-                    "UPDATE memory \
-                     SET last_accessed_at = MAX(last_accessed_at, ?2), \
-                         access_count     = access_count + 1, \
-                         tier = compute_tier(tier, importance, access_count + 1, memory_type) \
-                     WHERE id = ?1",
-                    rusqlite::params![id, now],
-                )?;
-                link_sources(&tx, id, &derived_from, now)?;
+                reinforce_in(&tx, id, now, &derived_from)?;
                 if let Some(note) = note(id) {
                     apply_note(&tx, &note)?;
                 }
@@ -408,76 +405,11 @@ impl MemoryStore {
         embedding: Vec<f32>,
         note: impl FnOnce(i64) -> Option<OutboxNote> + Send + 'static,
     ) -> Result<i64, MemoryStoreError> {
-        let unit = to_unit(&embedding)
-            .map_err(|e| MemoryStoreError::InvalidEmbedding { reason: e.to_string() })?;
-        let bytes = serialize_f32_vec(&unit);
-        let created_at = TimestampMs::from_unix_millis_u64(record.created_at_ms);
-        // Derive dispute columns in Rust before .call() so every
-        // param flows through a single c.transaction() — atomic, no partial writes.
-        let escalated: Vec<i64> = record.candidates.iter().filter(|c| c.escalated).map(|c| c.id).collect();
-        let disputed = !escalated.is_empty();
-        let status: &'static str = if disputed { "disputed" } else { "active" };
-        let da_json: Option<String> =
-            disputed.then(|| serde_json::to_string(&escalated).expect("Vec<i64> serialises infallibly"));
-        let last_disp: Option<TimestampMs> = disputed.then_some(created_at);
-        // Compute the initial tier explicitly instead of relying
-        // on the schema DEFAULT — the single source of truth for every
-        // producer. PROMOTE-ONLY, starts from current=3 (see memory/tier.rs).
-        let tier: i64 = crate::memory::tier::compute_tier(3, record.importance, 0, record.memory_type.as_str());
-        // Same normalization the write-border dedup gate hashes against
-        // (worker.rs, before embed) — writing it here too keeps every row
-        // dedup-eligible regardless of which producer inserted it.
-        let content_hash = crate::memory::dedup::content_hash(&record.content);
-
+        let row = PreparedRow::new(record, &embedding)?;
         self.conn
             .call(move |c| -> Result<i64, rusqlite::Error> {
                 let tx = c.transaction()?;
-                tx.execute(
-                    "INSERT INTO memory \
-                     (scope, agent_id, project_id, content, memory_type, source, \
-                      created_at, created_by_type, created_by_ref, \
-                      last_modified_at, last_accessed_at, access_count, importance, tier, \
-                      status, disputed_against, last_disputed_at, content_hash, topic_key) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    rusqlite::params![
-                        record.scope,
-                        record.agent_id,
-                        record.project_id,
-                        record.content,
-                        record.memory_type.as_str(),
-                        match record.source {
-                            MemorySource::Chat => "chat",
-                            MemorySource::Compaction => "compaction",
-                            MemorySource::CodeFile => "code_file",
-                            MemorySource::Explicit => "explicit",
-                            MemorySource::Synthesis => "synthesis",
-                        },
-                        created_at,
-                        record.created_by_type.as_str(),
-                        record.created_by_ref,
-                        created_at,
-                        created_at,
-                        // Written explicitly as 1, not left at the schema's DEFAULT 0: this
-                        // row's creation is itself the first occurrence of this content, so
-                        // a chunk resent once (one REINFORCE, `access_count + 1`) reads as
-                        // "seen twice" — 2, not 1 — matching what REINFORCE's `+= 1` promises.
-                        1,
-                        record.importance,
-                        tier,
-                        status,
-                        da_json,
-                        last_disp,
-                        content_hash,
-                        record.topic_key,
-                    ],
-                )?;
-                let id = tx.last_insert_rowid();
-                tx.execute(
-                    "INSERT INTO memory_vectors(rowid, embedding) VALUES (?, ?)",
-                    rusqlite::params![id, bytes],
-                )?;
-                link_sources(&tx, id, &record.derived_from, created_at)?;
-                note_candidates(&tx, id, &record.candidates, created_at)?;
+                let id = row.insert(&tx)?;
                 if let Some(note) = note(id) {
                     apply_note(&tx, &note)?;
                 }
@@ -486,6 +418,171 @@ impl MemoryStore {
             })
             .await
             .map_err(MemoryStoreError::from)
+    }
+
+    /// [`MemoryStore::insert_noting`] that first looks, in the same
+    /// transaction, for a live row of the same scope and text, and reinforces
+    /// it instead. The worker's own lookup runs before the embedding, and a
+    /// restore can bring the same text back to life in between: inserting
+    /// then would leave two live copies that nothing collapses. `inserted`
+    /// notes an insert, `absorbed` a reinforcement.
+    pub(crate) async fn insert_unless_twin(
+        &self,
+        record: NewMemoryRecord,
+        embedding: Vec<f32>,
+        inserted: impl FnOnce(i64) -> Option<OutboxNote> + Send + 'static,
+        absorbed: impl FnOnce(i64) -> Option<OutboxNote> + Send + 'static,
+    ) -> Result<Stored, MemoryStoreError> {
+        let row = PreparedRow::new(record, &embedding)?;
+        self.conn
+            .call(move |c| -> Result<Stored, rusqlite::Error> {
+                let tx = c.transaction()?;
+                let twin: Option<i64> = tx
+                    .query_row(
+                        REINFORCE_LOOKUP_SQL,
+                        rusqlite::params![row.record.agent_id, row.record.project_id, row.content_hash],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                let (stored, note) = match twin {
+                    Some(id) => {
+                        reinforce_in(&tx, id, row.created_at, &row.record.derived_from)?;
+                        (Stored::Absorbed(id), absorbed(id))
+                    }
+                    None => {
+                        let id = row.insert(&tx)?;
+                        (Stored::Inserted(id), inserted(id))
+                    }
+                };
+                if let Some(note) = note {
+                    apply_note(&tx, &note)?;
+                }
+                tx.commit()?;
+                Ok(stored)
+            })
+            .await
+            .map_err(MemoryStoreError::from)
+    }
+}
+
+/// What [`MemoryStore::insert_unless_twin`] did with a piece.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stored {
+    Inserted(i64),
+    Absorbed(i64),
+}
+
+/// One more access to an existing row, at `now`, its tier recomputed, and the
+/// save's sources linked to it.
+fn reinforce_in(
+    tx: &rusqlite::Transaction<'_>,
+    id: i64,
+    now: TimestampMs,
+    derived_from: &[i64],
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "UPDATE memory \
+         SET last_accessed_at = MAX(last_accessed_at, ?2), \
+             access_count     = access_count + 1, \
+             tier = compute_tier(tier, importance, access_count + 1, memory_type) \
+         WHERE id = ?1",
+        rusqlite::params![id, now],
+    )?;
+    link_sources(tx, id, derived_from, now)
+}
+
+/// A `memory` row and its vector, worked out before the transaction that
+/// writes them.
+struct PreparedRow {
+    record: NewMemoryRecord,
+    bytes: Vec<u8>,
+    created_at: TimestampMs,
+    tier: i64,
+    status: &'static str,
+    disputed_against: Option<String>,
+    last_disputed_at: Option<TimestampMs>,
+    content_hash: String,
+}
+
+impl PreparedRow {
+    fn new(record: NewMemoryRecord, embedding: &[f32]) -> Result<Self, MemoryStoreError> {
+        let unit = to_unit(embedding)
+            .map_err(|e| MemoryStoreError::InvalidEmbedding { reason: e.to_string() })?;
+        let created_at = TimestampMs::from_unix_millis_u64(record.created_at_ms);
+        // Derive dispute columns in Rust before .call() so every
+        // param flows through a single c.transaction() — atomic, no partial writes.
+        let escalated: Vec<i64> = record.candidates.iter().filter(|c| c.escalated).map(|c| c.id).collect();
+        let disputed = !escalated.is_empty();
+        Ok(Self {
+            bytes: serialize_f32_vec(&unit),
+            created_at,
+            // Compute the initial tier explicitly instead of relying
+            // on the schema DEFAULT — the single source of truth for every
+            // producer. PROMOTE-ONLY, starts from current=3 (see memory/tier.rs).
+            tier: crate::memory::tier::compute_tier(3, record.importance, 0, record.memory_type.as_str()),
+            status: if disputed { "disputed" } else { "active" },
+            disputed_against: disputed
+                .then(|| serde_json::to_string(&escalated).expect("Vec<i64> serialises infallibly")),
+            last_disputed_at: disputed.then_some(created_at),
+            // Same normalization the write-border dedup gate hashes against
+            // (worker.rs, before embed) — writing it here too keeps every row
+            // dedup-eligible regardless of which producer inserted it.
+            content_hash: crate::memory::dedup::content_hash(&record.content),
+            record,
+        })
+    }
+
+    /// Writes the row, its vector, its source links and its candidate pairs.
+    fn insert(&self, tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<i64> {
+        let record = &self.record;
+        tx.execute(
+            "INSERT INTO memory \
+             (scope, agent_id, project_id, content, memory_type, source, \
+              created_at, created_by_type, created_by_ref, \
+              last_modified_at, last_accessed_at, access_count, importance, tier, \
+              status, disputed_against, last_disputed_at, content_hash, topic_key, source_session_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                record.scope,
+                record.agent_id,
+                record.project_id,
+                record.content,
+                record.memory_type.as_str(),
+                match record.source {
+                    MemorySource::Chat => "chat",
+                    MemorySource::Compaction => "compaction",
+                    MemorySource::CodeFile => "code_file",
+                    MemorySource::Explicit => "explicit",
+                    MemorySource::Synthesis => "synthesis",
+                },
+                self.created_at,
+                record.created_by_type.as_str(),
+                record.created_by_ref,
+                self.created_at,
+                self.created_at,
+                // Written explicitly as 1, not left at the schema's DEFAULT 0: this
+                // row's creation is itself the first occurrence of this content, so
+                // a chunk resent once (one REINFORCE, `access_count + 1`) reads as
+                // "seen twice" — 2, not 1 — matching what REINFORCE's `+= 1` promises.
+                1,
+                record.importance,
+                self.tier,
+                self.status,
+                self.disputed_against,
+                self.last_disputed_at,
+                self.content_hash,
+                record.topic_key,
+                record.source_session_id,
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO memory_vectors(rowid, embedding) VALUES (?, ?)",
+            rusqlite::params![id, self.bytes],
+        )?;
+        link_sources(tx, id, &record.derived_from, self.created_at)?;
+        note_candidates(tx, id, &record.candidates, self.created_at)?;
+        Ok(id)
     }
 }
 
@@ -873,6 +970,7 @@ mod tests {
             candidates: Vec::new(),
             derived_from: Vec::new(),
             topic_key: None,
+            source_session_id: None,
         }
     }
 
@@ -995,6 +1093,7 @@ mod tests {
             derived_from: Vec::new(),
             topic_key: None,
             user_stated: false,
+            session_id: None,
         };
         let chunk = Chunk { text: "hello".to_string() };
         let rec = NewMemoryRecord::from_event_and_chunk(&evt, &chunk);
@@ -1021,6 +1120,7 @@ mod tests {
             derived_from: Vec::new(),
             topic_key: None,
             user_stated: false,
+            session_id: None,
         };
         let chunk = Chunk { text: "delta summary text".to_string() };
         let rec = NewMemoryRecord::from_event_and_chunk(&evt, &chunk);
@@ -1050,6 +1150,7 @@ mod tests {
             derived_from: Vec::new(),
             topic_key: None,
             user_stated: false,
+            session_id: None,
         }
     }
 

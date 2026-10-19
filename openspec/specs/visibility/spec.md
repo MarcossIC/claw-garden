@@ -61,7 +61,8 @@ El `--agent` de `clawg hook` MUST ser el del puente, para que el hook lea al mis
 - `update_memory` sobre una fila de otro agente MUST fallar como si el id no existiera, y MUST NOT cambiar su importancia, su tipo ni su tier ([`specs/update`](../update/spec.md), R5).
 - `resolve_conflict` con alguna de las dos filas de otro agente MUST fallar como si el id no existiera, y MUST NOT cambiar ninguna de las dos.
 - `read_memory` sobre una fila de otro agente, o sobre el save de una fila de otro agente, MUST fallar como si el id no existiera ([`specs/pieces`](../pieces/spec.md), R6). Su ruta de daemon, `GET /v1/memories/{kind}/{id}/save`, responde `404` con el mismo "no existe" (R4).
-- Sobre filas propias, las cinco se comportan igual que sin scope.
+- `restore_memory` sobre una fila borrada de otro agente MUST fallar como si el id no existiera, igual que sobre una fila viva o purgada, y MUST NOT cambiar la fila ([`specs/restore`](../restore/spec.md), R1).
+- Sobre filas propias, las seis se comportan igual que sin scope.
 - Que una fila ajena llegue al agente por `search_memory` o `recall_context` porque `specs/sharing` la comparte (marcada `by <autor>`) no cambia nada de lo anterior: para el agente que no es su autor, modificarla, resolverla o leer su save sigue siendo "no existe", y la fila queda intacta.
 
 #### Escenario: borrar lo ajeno
@@ -84,15 +85,15 @@ El `--agent` de `clawg hook` MUST ser el del puente, para que el hook lea al mis
 - WHEN B llama `resolve_conflict` sobre el par
 - THEN la respuesta es un error y las dos filas siguen igual
 
-**Test:** `an_agent_cannot_delete_another_agents_memory`, `an_agent_cannot_update_another_agents_memory`, `an_agent_lists_only_its_own_memories`, `an_agent_cannot_resolve_another_agents_conflict` y `an_agent_cannot_read_another_agents_save` en `server.rs`; `a_shared_memory_is_read_only` en `server.rs` para lo compartido.
+**Test:** `an_agent_cannot_delete_another_agents_memory`, `an_agent_cannot_update_another_agents_memory`, `an_agent_lists_only_its_own_memories`, `an_agent_cannot_resolve_another_agents_conflict` y `an_agent_cannot_read_another_agents_save` en `server.rs`; `a_shared_memory_is_read_only` en `server.rs` para lo compartido; `an_agent_cannot_restore_another_agents_memory` en `server.rs` para `restore_memory`.
 
 ## R4. Scope opcional en el daemon
 
-- `DELETE` y `PATCH /v1/memories/{kind}/{id}` MUST aceptar `agent` en la query; `GET /v1/memories/{kind}/{id}/save` MUST aceptar lo mismo; `POST /v1/disputes/resolve` MUST aceptar `agent_id` en el cuerpo.
+- `DELETE` y `PATCH /v1/memories/{kind}/{id}` MUST aceptar `agent` en la query, y `POST /v1/memories/{kind}/{id}/restore` también (`restore_memory`, `crates/clawg-cli/src/daemon/api.rs:1390`); `GET /v1/memories/{kind}/{id}/save` MUST aceptar lo mismo; `POST /v1/disputes/resolve` MUST aceptar `agent_id` en el cuerpo.
 - Con scope, si la fila (o alguna de las dos, al resolver) es de otro agente, la respuesta MUST ser `404`, igual que un id inexistente, y MUST NOT cambiar nada: ni la fila, ni su vector, ni sus disputas, ni su `last_modified_at`, ni su `update_count`. En el `GET` del save, el scope se aplica a la fila pedida (si es ajena, 404) y a cada posición del save: un pedazo de otro agente, que el dedup dejó dentro de un save propio, figura como faltante con `ids` en `null` ([`specs/pieces`](../pieces/spec.md), R6).
 - La regla no depende de lo que el agente ve: una fila que `specs/sharing` le muestra en una búsqueda es igual de ajena para el scope. Lo mismo vale para `POST /v1/synthesis`, que con `agent_id` sólo mira filas de ese agente.
 - Sin scope, la operación MUST valer sobre cualquier fila, como antes de existir el scope.
-- La misma regla vale para las tres tablas (`memory`, `episodic`, `procedural`).
+- La misma regla vale para las tres tablas (`memory`, `episodic`, `procedural`), salvo el restore, que sólo existe para `memory`.
 
 #### Escenario: borrar con scope
 - GIVEN una fila de `memory` de A con su vector
@@ -104,7 +105,7 @@ El `--agent` de `clawg hook` MUST ser el del puente, para que el hook lea al mis
 - WHEN se llama `DELETE /v1/memories/memory/{id}` sin `agent`
 - THEN responde `200` con `deleted = 1`
 
-**Test:** `delete_with_another_agent_is_404_and_keeps_the_row`, `patch_with_another_agent_is_404_and_keeps_the_importance`, `resolve_with_another_agent_is_404_and_changes_nothing` y `get_save_of_another_agent_is_404` en `crates/clawg-cli/tests/api.rs`; `an_owner_mismatch_deletes_nothing`, `an_owner_mismatch_changes_no_importance` en `crates/clawg-core/src/memory/admin.rs` y `a_pair_of_another_agent_is_not_found` en `crates/clawg-core/src/memory/dispute.rs`.
+**Test:** `delete_with_another_agent_is_404_and_keeps_the_row`, `patch_with_another_agent_is_404_and_keeps_the_importance`, `resolve_with_another_agent_is_404_and_changes_nothing` y `get_save_of_another_agent_is_404` en `crates/clawg-cli/tests/api.rs`; `an_owner_mismatch_deletes_nothing`, `an_owner_mismatch_changes_no_importance` en `crates/clawg-core/src/memory/admin.rs` y `a_pair_of_another_agent_is_not_found` en `crates/clawg-core/src/memory/dispute.rs`; para el restore, `restore_brings_a_deleted_memory_back_for_its_owner` (el `404` con otro agente) en `api.rs` y `restoring_needs_a_deleted_row_of_the_owner` en `admin.rs`.
 
 ## R5. Ruta del workspace
 

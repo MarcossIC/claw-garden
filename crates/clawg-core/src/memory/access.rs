@@ -661,9 +661,9 @@ mod tests {
 
     // ── 500-entry flush (1500 bind vars) ──────────────────────────
     //
-    // Verifies that `set_limit(SQLITE_LIMIT_VARIABLE_NUMBER, 32766)`
-    // allows a single CTE UPDATE with 500 rows × 3 vars = 1500 bind variables.
-    // Without the limit raise this would error at row 334 (default limit = 999).
+    // Verifies that the bundled SQLite's 32766-variable limit allows a single
+    // CTE UPDATE with 500 rows × 3 vars = 1500 bind variables. A build at the
+    // old default of 999 would error at row 334.
 
     #[tokio::test]
     async fn flush_500_distinct_ids_respects_variable_limit() {

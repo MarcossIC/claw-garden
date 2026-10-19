@@ -1,0 +1,15 @@
+change: revision-aware-delete
+objective: "1"
+depends_on: [recoverable-delete, conflict-candidates, topic-revisions]
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # Linux, Windows, binario real en home temporal, `clawg update` sobre V16 (test), V17 sobre la copia de una base real de la release anterior y perfil dev por el puente MCP; sin CRITICAL ni WARNING
+  archive: done
+updated: 2026-10-19
+main_spec: openspec/specs/restore/spec.md, openspec/specs/disputes/spec.md, openspec/specs/storage/spec.md, openspec/specs/ingest/spec.md, openspec/specs/mcp/spec.md, openspec/specs/self-update/spec.md

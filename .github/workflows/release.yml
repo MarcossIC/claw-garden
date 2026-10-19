@@ -138,8 +138,9 @@ jobs:
           if-no-files-found: error
 
   # The only job with the signing key, write access and an attestation. The
-  # release is created in its last step, once every file exists and the
-  # signature has been checked, so `releases/latest` never sees half a release.
+  # release is created as a draft once every file exists and the signature has
+  # been checked, and only published after its uploads, so `releases/latest`
+  # never sees half a release.
   publish:
     name: publish
     needs: [plan, build]
@@ -203,7 +204,10 @@ jobs:
             dist/install.ps1
             dist/SHA256SUMS
             dist/SHA256SUMS.minisig
-      - name: Create the release
+      # Without --draft, gh deletes the draft it made when publishing fails, so a
+      # single 5xx on that last request threw away every upload. A draft has no
+      # tag yet: GitHub creates it from the target when the release is published.
+      - name: Create the draft release
         id: create
         env:
           GH_TOKEN: ${{ github.token }}
@@ -211,6 +215,7 @@ jobs:
           TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           gh release create "v${VERSION}" \
+            --draft \
             --repo "$GITHUB_REPOSITORY" \
             --target ${TARGET_SHA} \
             --title "clawg v${VERSION}" \
@@ -220,11 +225,34 @@ jobs:
             dist/install.ps1 \
             dist/SHA256SUMS \
             dist/SHA256SUMS.minisig
-      # `gh` leaves a draft behind when an upload fails; the next run must find
-      # neither a tag nor a release.
-      - name: Remove a partial release
-        if: failure() && steps.create.outcome == 'failure'
+      # Publishing a draft can be repeated safely, and a 5xx can come after GitHub
+      # already published it, so the answer is not trusted: the release is read
+      # back until it is no longer a draft.
+      - name: Publish the release
+        id: publish
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.plan.outputs.version }}
-        run: gh release delete "v${VERSION}" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+        run: |
+          for attempt in 1 2 3 4 5; do
+            gh release edit "v${VERSION}" --repo "$GITHUB_REPOSITORY" --draft=false || true
+            if [ "$(gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = false ]; then
+              exit 0
+            fi
+            sleep $((attempt * 15))
+          done
+          echo "v${VERSION} is still a draft after ${attempt} attempts" >&2
+          exit 1
+      # Only a draft is removed: a published release already holds every file, and
+      # deleting it would leave its tag behind, which the plan job reads as a
+      # release that exists.
+      - name: Remove a draft left behind
+        if: failure() && (steps.create.outcome == 'failure' || steps.publish.outcome == 'failure')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          draft=$(gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft || true)
+          if [ "$draft" = true ]; then
+            gh release delete "v${VERSION}" --repo "$GITHUB_REPOSITORY" --yes
+          fi

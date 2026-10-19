@@ -9,6 +9,7 @@ use std::sync::Arc;
 use super::Chunk;
 
 /// Pure "split this text by token cap with overlap" helper.
+#[derive(Clone)]
 pub(crate) struct TokenSplitter {
     tokenizer: Option<Arc<tokenizers::Tokenizer>>,
 }

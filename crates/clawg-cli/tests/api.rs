@@ -282,6 +282,7 @@ impl Harness {
             started_at: Instant::now(),
             shutdown,
             save_timeout,
+            sessions: Default::default(),
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -481,6 +482,101 @@ async fn a_non_bearer_authorization_header_is_unauthorized() {
         .await
         .expect("request");
     assert_eq!(r.status(), 401);
+}
+
+// ── Host and Origin ─────────────────────────────────────────────────────────
+
+/// What a DNS-rebinding page sends: the attacker's name, resolved to loopback.
+#[tokio::test]
+async fn a_foreign_host_is_forbidden_on_health_and_v1_with_or_without_a_token() {
+    let h = Harness::start().await;
+    let foreign = format!("evil.example:{}", h.addr.port());
+    for (path, token) in [("/health", false), ("/health", true), ("/v1/stats", false), ("/v1/stats", true)] {
+        let mut req = h.http.get(h.url(path)).header("host", &foreign);
+        if token {
+            req = req.bearer_auth(&h.token);
+        }
+        let r = req.send().await.expect("request");
+        assert_eq!(r.status(), 403, "{path} with token={token}");
+        let body: Value = r.json().await.expect("json");
+        assert_eq!(body, json!({ "error": "forbidden" }), "{path} with token={token}");
+    }
+}
+
+/// A browser sends `Origin` on every write, cross-site or not; no client of
+/// the daemon sends one.
+#[tokio::test]
+async fn an_origin_is_forbidden_even_with_the_token() {
+    let h = Harness::start().await;
+    h.authed(h.http.post(h.url("/v1/memories")))
+        .json(&json!({ "content": "Kept in the store: the origin test row.", "agent_id": "a" }))
+        .send()
+        .await
+        .expect("save");
+
+    let r = h
+        .authed(h.http.post(h.url("/v1/search")))
+        .header("origin", "http://evil.example")
+        .json(&json!({ "query": "origin test row", "agent_id": "a" }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(r.status(), 403);
+    let body: Value = r.json().await.expect("json");
+    assert_eq!(body, json!({ "error": "forbidden" }));
+
+    let r = h.http.get(h.url("/health")).header("origin", "null").send().await.expect("request");
+    assert_eq!(r.status(), 403);
+}
+
+/// One answer for both reasons, as for the token: telling them apart would
+/// tell a page which half to change.
+#[tokio::test]
+async fn both_refusals_answer_the_same_body() {
+    let h = Harness::start().await;
+    let by_host = h.http.get(h.url("/health")).header("host", "evil.example").send().await.expect("request");
+    let by_origin = h
+        .http
+        .get(h.url("/health"))
+        .header("origin", "http://evil.example")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(by_host.status(), 403);
+    assert_eq!(by_origin.status(), 403);
+    assert_eq!(by_host.text().await.expect("body"), by_origin.text().await.expect("body"));
+}
+
+#[tokio::test]
+async fn a_daemon_client_passes_the_guard() {
+    use clawg_cli::client::{DaemonClient, SaveArgs, SearchArgs};
+    let h = Harness::start().await;
+    let client = DaemonClient::new(format!("http://{}", h.addr), &h.token, h._dir.path().to_path_buf());
+
+    assert_eq!(client.health().await.expect("health").status, "ok");
+    client
+        .save(SaveArgs {
+            content: "The guard lets the daemon client through.".into(),
+            agent_id: "a".into(),
+            project_id: None,
+            memory_type: None,
+            importance: None,
+            derived_from: Vec::new(),
+            topic_key: None,
+            user_stated: false,
+        })
+        .await
+        .expect("save");
+    client
+        .search(SearchArgs {
+            query: "guard daemon client".into(),
+            agent_id: "a".into(),
+            project_id: None,
+            limit: None,
+        })
+        .await
+        .expect("search");
+    client.shutdown().await.expect("shutdown");
 }
 
 // ── Save while the embedder is not ready ────────────────────────────────────
@@ -1387,6 +1483,40 @@ async fn synthesis_over_http() {
     assert_eq!(body["conclusions"][0]["derived_from"], json!([a, b]));
     let (_, item) = h.get_json(&format!("/v1/memories/memory/{c}")).await;
     assert_eq!(item["item"]["derived_from"], json!([a, b]), "{item}");
+    assert_eq!(body["to_review"], json!([]), "every source is live: {body}");
+
+    let r = h.authed(h.http.delete(h.url(&format!("/v1/memories/memory/{a}")))).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let (_, body) = h.post_json("/v1/synthesis", json!({ "project_id": "p" })).await;
+    assert_eq!(body["to_review_total"], 1, "{body}");
+    assert_eq!(body["to_review"][0]["conclusion"]["id"], c, "{body}");
+    assert_eq!(body["to_review"][0]["live"], 1, "{body}");
+    assert_eq!(body["to_review"][0]["lost"], json!([{ "id": a, "state": "deleted" }]), "{body}");
+}
+
+#[tokio::test]
+async fn context_reports_conclusions_to_review() {
+    let h = Harness::start().await;
+    let a = save_id(&h, json!({ "content": "the go service uses tabs", "agent_id": "a", "project_id": "p" })).await;
+    let b = save_id(&h, json!({ "content": "the rust crate uses tabs", "agent_id": "a", "project_id": "p" })).await;
+    save_id(
+        &h,
+        json!({ "content": "the user indents with tabs", "agent_id": "a", "project_id": "p", "derived_from": [a, b] }),
+    )
+    .await;
+    let context = || h.post_json("/v1/context", json!({ "query": "tabs", "agent_id": "a", "project_id": "p" }));
+    let (status, body) = context().await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["conclusions_to_review"], 0, "{body}");
+
+    let r = h.authed(h.http.delete(h.url(&format!("/v1/memories/memory/{a}")))).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let (_, body) = context().await;
+    assert_eq!(body["conclusions_to_review"], 1, "{body}");
+
+    h.post_json("/v1/synthesis", json!({ "agent_id": "a", "project_id": "p" })).await;
+    let (_, body) = context().await;
+    assert_eq!(body["conclusions_to_review"], 0, "the review turns the reminder off: {body}");
 }
 
 #[tokio::test]
@@ -1411,12 +1541,102 @@ async fn a_save_from_unknown_sources_is_refused() {
     assert_eq!(list["items"].as_array().map(Vec::len), Some(1), "nothing was saved: {list}");
 }
 
+#[tokio::test]
+async fn a_save_from_a_replaced_source_is_refused() {
+    let h = Harness::start().await;
+    let old = save_id(&h, json!({ "content": "the deploy runs on fridays", "agent_id": "a", "topic_key": "deploy/day" })).await;
+    let new = save_id(&h, json!({ "content": "the deploy runs on mondays", "agent_id": "a", "topic_key": "deploy/day" })).await;
+    let kept = save_id(&h, json!({ "content": "the release is tagged by CI", "agent_id": "a" })).await;
+
+    let (status, body) = h
+        .post_json(
+            "/v1/memories",
+            json!({ "content": "deploys follow the calendar", "agent_id": "a", "derived_from": [kept, old] }),
+        )
+        .await;
+
+    assert_eq!(status, 400, "{body}");
+    let message = body.to_string();
+    assert!(message.contains(&format!("{old} (by {new})")), "the refusal names what replaced it: {message}");
+    let (status, body) = h
+        .post_json(
+            "/v1/memories",
+            json!({ "content": "deploys follow the calendar", "agent_id": "a", "derived_from": [kept, new] }),
+        )
+        .await;
+    assert_eq!(status, 201, "the current version is a source: {body}");
+}
+
 /// `source` and `created_by_type` of a memory row, as the viewer reads them.
 async fn origin(h: &Harness, id: i64) -> (String, String) {
     let (status, body) = h.get_json(&format!("/v1/memories/memory/{id}")).await;
     assert_eq!(status, 200, "{body}");
     let field = |name: &str| body["item"][name].as_str().unwrap_or_default().to_string();
     (field("source"), field("created_by_type"))
+}
+
+/// `source_session_id` of a memory row, as the viewer reads it.
+async fn session_of(h: &Harness, id: i64) -> Option<String> {
+    let (status, body) = h.get_json(&format!("/v1/memories/memory/{id}")).await;
+    assert_eq!(status, 200, "{body}");
+    body["item"]["source_session_id"].as_str().map(str::to_string)
+}
+
+#[tokio::test]
+async fn a_save_carries_the_registered_session() {
+    let h = Harness::start().await;
+    let register = |agent: &'static str, project: Option<&'static str>, session: &'static str| {
+        h.post_json("/v1/sessions", json!({ "agent_id": agent, "project_id": project, "session_id": session }))
+    };
+    assert_eq!(register("a", Some("p"), "s1").await.0, 204);
+    assert_eq!(register("a", Some("p"), "s2").await.0, 204);
+
+    let mine = save_id(&h, json!({ "content": "the cache key holds the locale", "agent_id": "a", "project_id": "p" })).await;
+    let other_agent = save_id(&h, json!({ "content": "the retry budget is three", "agent_id": "b", "project_id": "p" })).await;
+    let other_project = save_id(&h, json!({ "content": "deploys happen on fridays", "agent_id": "a", "project_id": "q" })).await;
+
+    assert_eq!(session_of(&h, mine).await.as_deref(), Some("s2"));
+    assert_eq!(session_of(&h, other_agent).await, None);
+    assert_eq!(session_of(&h, other_project).await, None);
+
+    let (status, body) = h.post_json("/v1/sessions", json!({ "agent_id": "a", "session_id": "has space" })).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.to_string().contains("session_id"), "{body}");
+}
+
+#[tokio::test]
+async fn a_queued_save_keeps_its_session_in_the_outbox() {
+    let h = Harness::start_without_embedder().await;
+    h.post_json("/v1/sessions", json!({ "agent_id": "a", "session_id": "s1" })).await;
+    let (status, body) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a" })).await;
+    assert_eq!(status, 202, "{body}");
+
+    let stamped: Vec<Option<String>> = h
+        .ctx
+        .runtime
+        .store
+        .conn
+        .call(|c| {
+            let mut stmt = c.prepare("SELECT json_extract(event, '$.session_id') FROM ingest_outbox")?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .await
+        .expect("outbox");
+    assert_eq!(stamped, vec![Some("s1".to_string())], "a replay after a restart keeps the session it was accepted in");
+}
+
+#[tokio::test]
+async fn rows_without_a_session_stay_reachable() {
+    let h = Harness::start().await;
+    let id = save_id(&h, json!({ "content": "the parser rejects tabs in yaml", "agent_id": "a" })).await;
+    assert_eq!(session_of(&h, id).await, None);
+
+    let (_, list) = h.get_json("/v1/memories?kind=memory&agent=a").await;
+    assert_eq!(list["items"].as_array().map(Vec::len), Some(1), "{list}");
+    let (status, found) = h.post_json("/v1/search", json!({ "query": "the parser rejects tabs in yaml", "agent_id": "a" })).await;
+    assert_eq!(status, 200, "{found}");
+    assert_eq!(found["hits"][0]["id"], id, "{found}");
 }
 
 #[tokio::test]
@@ -2578,6 +2798,81 @@ async fn restore_refuses_a_row_whose_topic_is_live_again() {
 
     assert_eq!(status, 409, "{body}");
     assert!(body["error"].as_str().unwrap().contains(&format!("#{current}")), "{body}");
+}
+
+#[tokio::test]
+async fn deleting_the_current_revision_answers_what_it_revived() {
+    let h = Harness::start().await;
+    let save = |content: &str| json!({ "content": content, "agent_id": "a", "topic_key": "storage/engine" });
+    let old = save_id(&h, save(CONTENT)).await;
+    let current = save_id(&h, save("Storage engine moved to Postgres")).await;
+    assert!(!finds(&h, "a", old).await, "the revision replaced it");
+
+    let (status, body) =
+        h.send(h.http.delete(h.url(&format!("/v1/memories/memory/{current}?agent=a")))).await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["revived"][0]["id"].as_i64(), Some(old), "{body}");
+    assert_eq!(body["revived"][0]["kind"], "memory", "{body}");
+    assert!(body.get("hidden").is_none(), "{body}");
+    assert!(finds(&h, "a", old).await, "the version before is current again");
+
+    let (status, body) = h.restore("memory", current, Some("a")).await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["topic_key"], "storage/engine", "{body}");
+    assert_eq!(body["replaced"][0]["id"].as_i64(), Some(old), "{body}");
+    assert!(!finds(&h, "a", old).await, "the restore replaced it again");
+}
+
+/// `v` normalized, as the store keeps it.
+fn unit(v: &[f32]) -> Vec<f32> {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    v.iter().map(|x| x / norm).collect()
+}
+
+#[tokio::test]
+async fn a_restore_answers_its_key_and_its_new_pairs() {
+    let h = Harness::start().await;
+    let text = "Storage engine is SQLite";
+    let restored = save_id(&h, json!({ "content": text, "agent_id": "a", "topic_key": "storage/engine" })).await;
+    h.delete_row(restored).await;
+    let newer = save_id(&h, json!({ "content": "the store keeps one local file", "agent_id": "a" })).await;
+    // The fake model places unrelated texts far apart; this puts the newer
+    // row inside the detector's band of the restored one.
+    let a = unit(&FakeEmbedder::default().embed_with_role(text, EmbedRole::Passage).await.unwrap());
+    let e = unit(&FakeEmbedder::default().embed_with_role("another direction", EmbedRole::Passage).await.unwrap());
+    let along: f32 = a.iter().zip(&e).map(|(x, y)| x * y).sum();
+    let across = unit(&e.iter().zip(&a).map(|(y, x)| y - along * x).collect::<Vec<_>>());
+    let angle = 2.0 * (0.3f32 / 2.0).asin();
+    let near: Vec<u8> = a
+        .iter()
+        .zip(&across)
+        .map(|(x, y)| x * angle.cos() + y * angle.sin())
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    h.ctx
+        .runtime
+        .store
+        .conn
+        .call(move |c| {
+            c.execute("UPDATE memory SET memory_type = 'semantic_fact' WHERE id = ?1", [restored])?;
+            c.execute("UPDATE memory SET memory_type = 'semantic_fact' WHERE id = ?1", [newer])?;
+            c.execute("UPDATE memory_vectors SET embedding = ?2 WHERE rowid = ?1", rusqlite::params![newer, near])
+        })
+        .await
+        .expect("place");
+
+    let (status, body) = h.restore("memory", restored, Some("a")).await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["topic_key"], "storage/engine", "{body}");
+    assert_eq!(
+        body["related"],
+        json!([{ "kind": "memory", "id": newer, "escalated": false, "excerpt": "the store keeps one local file" }]),
+        "{body}"
+    );
+    assert!(body.get("replaced").is_none() && body.get("superseded_by_deleted").is_none(), "{body}");
 }
 
 #[tokio::test]

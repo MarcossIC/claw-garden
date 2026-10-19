@@ -16,17 +16,17 @@ Fuente de verdad del comportamiento actual de los pares que encuentra el detecto
 - **Par enlazado:** dos filas que tienen un par en `memory_conflict`, o tales que el `disputed_against` de una nombra a la otra, o que una está `superseded` con `superseded_by` apuntando a la otra (`check_pair`, `crates/clawg-core/src/memory/dispute.rs:140`).
 - **Estado de reposo de una fila no reemplazada:** `disputed` si su `disputed_against` nombra al menos una fila viva; `active` si no.
 - **Fila protegida:** una `user_preference` o una `architectural_decision`.
-- **Pedazos hermanos:** las filas que inserta un mismo evento de ingesta (un mismo save), una por pedazo (`ingest_pieces`, `crates/clawg-core/src/memory/worker.rs:607`).
+- **Pedazos hermanos:** las filas que inserta un mismo evento de ingesta (un mismo save), una por pedazo (`ingest_pieces`, `crates/clawg-core/src/memory/worker.rs:621`).
 
 `disputed_against` significa "disputas pendientes": cerrar una disputa saca el id de la otra fila. `last_disputed_at` no cambia al resolver. `superseded_by` guarda quién reemplazó a quién. Las columnas de `memory` son las de V1 (`crates/clawg-core/migrations/V1__init.sql`); V15 agrega la tabla de pares y no toca `memory`.
 
 ## El detector anota candidatas
 
-Cada fila que el detector encuentra en la banda ("Umbral y banda del detector") es una candidata (`Candidate`, `crates/clawg-core/src/memory/contradiction.rs:77`): su id, su distancia, si escala y la primera línea de su texto. El insert MUST escribir un par por candidata en la misma transacción que la fila nueva (`note_candidates`, `crates/clawg-core/src/memory/store_insert.rs:244`), `escalated` si escala y `pending` si no. La fila nueva MUST quedar `disputed`, nombrando en `disputed_against` sólo a las candidatas que escalan (`store_insert.rs:417-421`); con candidatas pendientes nada más, MUST quedar `active`.
+Cada fila que el detector encuentra en la banda ("Umbral y banda del detector") es una candidata (`Candidate`, `crates/clawg-core/src/memory/contradiction.rs:77`): su id, su distancia, si escala y la primera línea de su texto. El insert MUST escribir un par por candidata en la misma transacción que la fila nueva (`note_candidates`, `crates/clawg-core/src/memory/store_insert.rs:247`), `escalated` si escala y `pending` si no. La fila nueva MUST quedar `disputed`, nombrando en `disputed_against` sólo a las candidatas que escalan (`store_insert.rs:514-526`); con candidatas pendientes nada más, MUST quedar `active`.
 
 Una candidata escala cuando `needs_user` (`contradiction.rs:103`), que es pura, devuelve verdadero: si la distancia no se conoce; si es menor que `ESCALATE_BELOW` y los dos lados son filas protegidas; o si es menor que `IDENTIFIER_ESCALATE_BELOW` y los dos textos comparten un identificador (`shares_identifier`, `contradiction.rs:115`, que usa `identifier_tokens` de `search.rs`). Dos `semantic_fact` cercanos que no llegan a ese corte no escalan, ni un hecho cerca de una preferencia o una decisión: los ve el agente en la respuesta del save y en `memory_status`. El agente no puede reemplazar el lado protegido de un par pendiente sin preguntar (R3), así que una decisión no se pierde porque su par no escaló.
 
-Dentro de un pedazo, el detector MUST quedarse con la candidata más cercana de cada save (`SaveKey`, `contradiction.rs:89`: el save de `memory_piece`, o la fila si no es un pedazo). Un save nuevo MUST anotar a lo sumo un par con cada save anterior: entre sus pedazos, gana el primero que encuentra a ese save (`worker.rs:781` y `:795`). Los pedazos hermanos siguen sin emparejarse (R8).
+Dentro de un pedazo, el detector MUST quedarse con la candidata más cercana de cada save (`SaveKey`, `contradiction.rs:89`: el save de `memory_piece`, o la fila si no es un pedazo). Un save nuevo MUST anotar a lo sumo un par con cada save anterior: entre sus pedazos, gana el primero que encuentra a ese save (`worker.rs:795` y `:795`). Los pedazos hermanos siguen sin emparejarse (R8).
 
 #### Escenario: hechos cercanos sin identificador común
 - GIVEN un `semantic_fact` guardado
@@ -47,20 +47,20 @@ Dentro de un pedazo, el detector MUST quedarse con la candidata más cercana de 
 
 ## Las candidatas en la respuesta del save
 
-Un save confirmado cuyo detector anotó pares MUST listarlos en `related` (`SaveBody`, `crates/clawg-cli/src/daemon/api.rs:494`; cada uno `RelatedMemory`, `api.rs:533`, con `kind`, `id`, `escalated` y la primera línea de la candidata cortada a `EXCERPT_CHARS` = 80 caracteres, `contradiction.rs:73`), uno por fila vieja. Sin pares, MUST NOT llevar el campo. El texto de `save_memory` MUST sumar una línea `close to earlier memories: #id "<línea>"` (con `, asks the user` en las que escalan) que pide juzgarlas con `resolve_conflict`, sólo cuando hay alguna (`related_text`, `crates/clawg-cli/src/mcp/server.rs:325`). Un puente que no conoce el campo muestra el save igual.
+Un save confirmado cuyo detector anotó pares MUST listarlos en `related` (`SaveBody`, `crates/clawg-cli/src/daemon/api.rs:509`; cada uno `RelatedMemory`, `api.rs:561`, con `kind`, `id`, `escalated` y la primera línea de la candidata cortada a `EXCERPT_CHARS` = 80 caracteres, `contradiction.rs:73`), uno por fila vieja. Sin pares, MUST NOT llevar el campo. El texto de `save_memory` MUST sumar una línea `close to earlier memories: #id "<línea>"` (con `, asks the user` en las que escalan) que pide juzgarlas con `resolve_conflict`, sólo cuando hay alguna (`related_text`, `crates/clawg-cli/src/mcp/server.rs:325`). Un puente que no conoce el campo muestra el save igual.
 
 **Tests:** `a_confirmed_save_names_its_candidates` en `worker.rs`; `save_outcome_text_names_related_memories` en `server.rs`; `save_body_leaves_related_out_when_empty` en `api.rs`.
 
 ## R1. `supersedes`: una gana
 
-Juzgar un par enlazado `(keep, other)` con `supersedes` (`judge_pair`, `dispute.rs:306`) MUST, en una sola transacción:
+Juzgar un par enlazado `(keep, other)` con `supersedes` (`judge_pair`, `dispute.rs:316`) MUST, en una sola transacción:
 
-- dejar `other` con `status = 'superseded'` y `superseded_by = keep`;
+- dejar `other` con `status = 'superseded'`, `superseded_by = keep` y `supersede_cause = 'verdict'` (`SUPERSEDE_SQL`, `crates/clawg-core/src/memory/dispute.rs:268`, llamada desde `judge_pair` en `dispute.rs:364`); una revisión por clave escribe `revision` en su lugar (`revise_in`, `crates/clawg-core/src/memory/topic.rs:131`), así que la causa es lo que distingue a las dos ([`specs/restore`](../restore/spec.md), «Borrar la vigente revive a la anterior»);
 - sacar a `keep` del `disputed_against` de `other`, y a `other` del de `keep`;
 - si `keep` estaba reemplazada por `other`, poner su `superseded_by` en `NULL`;
 - llevar a `keep` a su estado de reposo;
 - llevar a su estado de reposo a toda fila `disputed` cuyo `disputed_against` nombre a `other` (R4);
-- dejar el par `judged` con el veredicto (`RECORD_PAIR_SQL`, `dispute.rs:281`), creando su fila si no la tenía;
+- dejar el par `judged` con el veredicto (`RECORD_PAIR_SQL`, `dispute.rs:291`), creando su fila si no la tenía;
 - actualizar `last_modified_at` de las filas que cambian.
 
 Ninguna fila MUST borrarse: `other` conserva contenido, vector y FTS, sigue en `list_memories` y en `GET /v1/memories/memory/{id}`, y se recupera juzgando al revés (R3).
@@ -89,7 +89,7 @@ Ninguna fila MUST borrarse: `other` conserva contenido, vector y FTS, sigue en `
 
 ## R2. `compatible` y `scoped`: valen las dos
 
-Juzgar un par enlazado con `compatible` o `scoped` MUST sacar a cada fila del `disputed_against` de la otra, poner en `NULL` un `superseded_by` que apunte de una a la otra, llevar a las dos a su estado de reposo y dejar el par `judged` con el veredicto y el motivo. Ninguna MUST quedar `superseded`, y el ranking de las dos no cambia. `scoped` MUST traer un motivo no vacío; sin él, MUST fallar sin cambiar nada (`ResolveError::ReasonRequired`, `dispute.rs:318-320`).
+Juzgar un par enlazado con `compatible` o `scoped` MUST sacar a cada fila del `disputed_against` de la otra, poner en `NULL` un `superseded_by` que apunte de una a la otra, llevar a las dos a su estado de reposo y dejar el par `judged` con el veredicto y el motivo. Ninguna MUST quedar `superseded`, y el ranking de las dos no cambia. `scoped` MUST traer un motivo no vacío; sin él, MUST fallar sin cambiar nada (`ResolveError::ReasonRequired`, `dispute.rs:328-330`).
 
 #### Escenario
 - GIVEN O activa y N `disputed` contra O
@@ -112,7 +112,7 @@ Juzgar un par enlazado con `conflicts` MUST hacer que la fila más nueva nombre 
 - `keep = other` MUST fallar sin cambiar nada (error "misma fila").
 - Un id que no existe o está borrado MUST fallar sin cambiar nada (error "no encontrada").
 - Un par no enlazado MUST fallar sin cambiar nada (error "no están en disputa"). Lo mismo si alguna de las dos está reemplazada por una tercera fila.
-- `supersedes` sobre un par `pending` con una fila protegida MUST fallar sin cambiar nada, con un error que pide juzgarlo `conflicts` y preguntar al usuario (`ResolveError::NeedsUser`, `dispute.rs:339-344`). Sobre un par escalado sí vale: el usuario ya fue consultado.
+- `supersedes` sobre un par `pending` con una fila protegida MUST fallar sin cambiar nada, con un error que pide juzgarlo `conflicts` y preguntar al usuario (`ResolveError::NeedsUser`, `dispute.rs:349-354`). Sobre un par escalado sí vale: el usuario ya fue consultado.
 
 #### Escenario: deshacer
 - GIVEN O reemplazada por N
@@ -128,13 +128,13 @@ Juzgar un par enlazado con `conflicts` MUST hacer que la fila más nueva nombre 
 
 ## R4. Borrar, reemplazar, restaurar y purgar
 
-Cuando una fila X se borra (`delete_memory_core`, `crates/clawg-core/src/memory/admin.rs:302`) o pasa a `superseded`, toda fila `disputed` cuyo `disputed_against` nombra a X MUST volver a su estado de reposo en la misma transacción (`release_challengers`, `dispute.rs:191`). Pasa a `superseded` por un juicio (R1) o porque un save con la misma `topic_key` la reemplaza ([`specs/ingest`](../ingest/spec.md), «Un save con clave reemplaza la fila viva de su clave»): en los dos casos se liberan sus retadoras. `disputed_against` MAY seguir nombrando a X; X ya no cuenta porque no está viva. Borrar MUST NOT tocar los pares de X.
+Cuando una fila X se borra (`delete_memory_core`, `crates/clawg-core/src/memory/admin.rs:316`) o pasa a `superseded`, toda fila `disputed` cuyo `disputed_against` nombra a X MUST volver a su estado de reposo en la misma transacción (`release_challengers`, `dispute.rs:191`). Pasa a `superseded` por un juicio (R1) o porque un save con la misma `topic_key` la reemplaza ([`specs/ingest`](../ingest/spec.md), «Un save con clave reemplaza la fila viva de su clave»): en los dos casos se liberan sus retadoras. `disputed_against` MAY seguir nombrando a X; X ya no cuenta porque no está viva. Borrar MUST NOT tocar los pares de X.
 
-Restaurar X (`restore_memory_core`, `admin.rs:436`) MUST llevar a su estado de reposo a X y a toda fila cuyo `disputed_against` la nombra (`admin.rs:508-509`): el par escalado vuelve con ella.
+Restaurar X (`restore_memory_core`, `admin.rs:583`; el resto del restore está en [`specs/restore`](../restore/spec.md)) MUST llevar a su estado de reposo a X y a toda fila cuyo `disputed_against` la nombra (`settle_row` y `settle_challengers`, `dispute.rs:207` y `dispute.rs:200`, llamadas en `admin.rs:672-673`): el par escalado vuelve con ella.
 
-Restaurar una fila borrada que tenía `topic_key` MUST fallar sin cambiar nada cuando el alcance de su clave ya tiene otra fila viva (`RESTORE_TOPIC_HOLDER`, `admin.rs:411`; `RestoreError::TopicTaken`, `admin.rs:370`). El error MUST nombrar la clave y la fila que la tiene, y la fila restaurada se queda borrada: restaurarla dejaría dos versiones vivas de un tema que una revisión mantiene en una. `POST /v1/memories/memory/{id}/restore` MUST responder `409` (`restore_memory`, `crates/clawg-cli/src/daemon/api.rs:1254`), como con un gemelo vivo o un secreto.
+Restaurar una fila borrada que tenía `topic_key` MUST fallar sin cambiar nada cuando el alcance de su clave ya tiene una fila viva de otro save (las demás piezas de su propio save no cuentan) (`RESTORE_TOPIC_HOLDER`, `admin.rs:453`; `RestoreError::TopicTaken`, `admin.rs:391`). El error MUST nombrar la clave y la fila que la tiene, y la fila restaurada se queda borrada: restaurarla dejaría dos versiones vivas de un tema que una revisión mantiene en una. `POST /v1/memories/memory/{id}/restore` MUST responder `409` (`restore_memory`, `crates/clawg-cli/src/daemon/api.rs:1390`, el brazo del `409` en `api.rs:1404`), como con un gemelo vivo o un secreto.
 
-Purgar X (`purge`, `crates/clawg-core/src/memory/secrets.rs:82`) MUST borrar los pares que la nombran (`secrets.rs:109`).
+Purgar X (`purge`, `crates/clawg-core/src/memory/secrets.rs:82`) MUST borrar los pares que la nombran (`secrets.rs:111`).
 
 #### Escenario: borrar la vieja
 - GIVEN O activa y N `disputed` sólo contra O
@@ -159,11 +159,28 @@ Purgar X (`purge`, `crates/clawg-core/src/memory/secrets.rs:82`) MUST borrar los
 
 **Test:** `deleting_the_disputed_row_releases_its_challenger`, `deleting_one_of_two_keeps_the_dispute`, `a_restored_row_brings_its_escalated_pair_back` y `a_row_whose_key_is_live_again_is_not_restored` en `crates/clawg-core/src/memory/admin.rs`; `restore_refuses_a_row_whose_topic_is_live_again` en `crates/clawg-cli/tests/api.rs`; `purging_drops_the_pairs_of_the_row` en `secrets.rs`.
 
+### Un veredicto y el borrado de su ganador
+
+Borrar la fila que un veredicto `supersedes` dejó como ganadora (K) MUST NOT revivir a la perdedora (L): L sigue `superseded` por K, porque una decisión juzgada no se deshace por un borrado. La respuesta del borrado MUST nombrar a L en `hidden` ([`specs/restore`](../restore/spec.md), «Borrar la vigente revive a la anterior»).
+
+#### Escenario
+- GIVEN L reemplazada por K por un veredicto `supersedes`
+- WHEN se borra K
+- THEN L sigue `superseded` por K, la búsqueda no la muestra, y la respuesta la nombra en `hidden`
+
+**Test:** `deleting_a_verdict_winner_leaves_the_loser_hidden` en `crates/clawg-core/src/memory/admin.rs`; `a_verdict_records_why_it_replaced` en `crates/clawg-core/src/memory/dispute.rs`.
+
+### Redetección al restaurar
+
+Restaurar una fila que sigue viva y no reemplazada anota los pares con las filas guardadas mientras estuvo borrada, con las reglas de `needs_user` de este spec. El par es `(new_id = C, old_id = A)`, donde C es la guardada después (la nueva) y A la restaurada: C es la que carga la disputa si el par escala, y `disputed_against` de C nombra a A. Un par ya existente con su veredicto no se pisa. El detalle y los casos que no se anotan están en [`specs/restore`](../restore/spec.md), «Redetección al restaurar».
+
+**Test:** `a_restored_row_is_paired_with_what_was_saved_while_deleted` y `an_escalated_pair_from_a_restore_disputes_the_newer_row` en `crates/clawg-core/src/memory/admin.rs`.
+
 ## R5. El mantenimiento libera las huérfanas
 
-La pasada de mantenimiento (`release_orphaned_disputes`, `crates/clawg-core/src/memory/maintenance.rs:216`) MUST llevar a su estado de reposo toda fila `disputed` que no tenga ninguna fila viva en `disputed_against`, y MUST NOT tocar las demás. Una segunda pasada MUST NOT cambiar nada.
+La pasada de mantenimiento (`release_orphaned_disputes`, `crates/clawg-core/src/memory/maintenance.rs:222`) MUST llevar a su estado de reposo toda fila `disputed` que no tenga ninguna fila viva en `disputed_against`, y MUST NOT tocar las demás. Una segunda pasada MUST NOT cambiar nada.
 
-Cubre las huérfanas que dejaron las versiones que borraban sin liberar. La misma pasada MUST borrar los pares que nombran una fila que ya no existe (`drop_orphaned_pairs`, `maintenance.rs:229`), que sólo deja un purge de una versión anterior a la tabla.
+Cubre las huérfanas que dejaron las versiones que borraban sin liberar. La misma pasada MUST borrar los pares que nombran una fila que ya no existe (`drop_orphaned_pairs`, `maintenance.rs:248`), que sólo deja un purge de una versión anterior a la tabla.
 
 #### Escenario
 - GIVEN una fila N `disputed` contra O, y O borrada como la borraba la versión anterior (sólo `deleted_at`)
@@ -174,13 +191,13 @@ Cubre las huérfanas que dejaron las versiones que borraban sin liberar. La mism
 
 ## R6. HTTP y MCP
 
-Detrás del token, sobre filas de `memory` (rutas en `crates/clawg-cli/src/daemon/api.rs:718-720`):
+Detrás del token, sobre filas de `memory` (rutas en `crates/clawg-cli/src/daemon/api.rs:804-806`):
 
-- `POST /v1/disputes/judge` MUST aceptar `{"keep": <id>, "other": <id>, "verdict": "supersedes" | "compatible" | "scoped" | "conflicts", "reason": <opcional>, "agent_id": <opcional>}` (`judge_dispute`, `api.rs:1285`).
-- `POST /v1/disputes/resolve` MUST seguir aceptando `{"keep", "other", "keep_both": <bool, opcional, false por defecto>, "agent_id"}` para los puentes anteriores, y guardar `compatible` (con `keep_both`) o `supersedes` (`resolve_dispute_core`, `dispute.rs:289`).
-- `GET /v1/disputes?agent_id=` MUST devolver `{pending, escalated, pairs}`: los conteos de pares abiertos entre filas vivas del agente y hasta 5 pares pendientes (`OPEN_PAIRS_SHOWN`, `api.rs:702`), los más viejos primero (`open_pairs`, `dispute.rs:425`), cada lado con la marca de su origen (P4 de [`specs/provenance`](../provenance/spec.md)).
+- `POST /v1/disputes/judge` MUST aceptar `{"keep": <id>, "other": <id>, "verdict": "supersedes" | "compatible" | "scoped" | "conflicts", "reason": <opcional>, "agent_id": <opcional>}` (`judge_dispute`, `api.rs:1435`).
+- `POST /v1/disputes/resolve` MUST seguir aceptando `{"keep", "other", "keep_both": <bool, opcional, false por defecto>, "agent_id"}` para los puentes anteriores, y guardar `compatible` (con `keep_both`) o `supersedes` (`resolve_dispute_core`, `dispute.rs:299`).
+- `GET /v1/disputes?agent_id=` MUST devolver `{pending, escalated, pairs}`: los conteos de pares abiertos entre filas vivas del agente y hasta 5 pares pendientes (`OPEN_PAIRS_SHOWN`, `api.rs:784`), los más viejos primero (`open_pairs`, `dispute.rs:435`), cada lado con la marca de su origen (P4 de [`specs/provenance`](../provenance/spec.md)).
 
-Las dos rutas de veredicto responden igual (`resolve_error`, `api.rs:1263`):
+Las dos rutas de veredicto responden igual (`resolve_error`, `api.rs:1413`):
 
 | Caso | Respuesta |
 |---|---|
@@ -189,7 +206,7 @@ Las dos rutas de veredicto responden igual (`resolve_error`, `api.rs:1263`):
 | Una fila no existe o está borrada (o, con `agent_id`, es de otro agente) | `404` |
 | Par no enlazado, una reemplazada por una tercera, o `supersedes` sobre un par pendiente con una fila protegida | `409` |
 
-El puente MCP MUST exponer `resolve_conflict` con `keep`, `other`, `verdict` (obligatorio, con el `enum` de los cuatro valores en el schema, `verdict_enum`, `server.rs:341`) y `reason` (`ResolveConflictArgs`, `server.rs:347`); el agente es el del puente. Contra un daemon que contesta un 404 sin cuerpo en `/v1/disputes/judge`, MUST decir que se reinicie el daemon con `clawg stop` (`resolve_conflict_impl`, `server.rs:904`). `memory_status` MUST sumar una línea con los pares pendientes y escalados del agente, y los pendientes listados, citados por id, con cómo juzgarlos (`format_open_pairs`, `crates/clawg-cli/src/mcp/tools.rs:151`); contra un daemon sin la ruta, omite la línea. En cada par va primero el lado sin marca, y la marca va junto al id del otro; ACTIVE CONFLICTS marca cada lado sin reordenar (P4 de [`specs/provenance`](../provenance/spec.md)). El origen no cambia el estado de ningún par.
+El puente MCP MUST exponer `resolve_conflict` con `keep`, `other`, `verdict` (obligatorio, con el `enum` de los cuatro valores en el schema, `verdict_enum`, `server.rs:341`) y `reason` (`ResolveConflictArgs`, `server.rs:347`); el agente es el del puente. Contra un daemon que contesta un 404 sin cuerpo en `/v1/disputes/judge`, MUST decir que se reinicie el daemon con `clawg stop` (`resolve_conflict_impl`, `server.rs:904`). `memory_status` MUST sumar una línea con los pares pendientes y escalados del agente, y los pendientes listados, citados por id, con cómo juzgarlos (`format_open_pairs`, `crates/clawg-cli/src/mcp/tools.rs:154`); contra un daemon sin la ruta, omite la línea. En cada par va primero el lado sin marca, y la marca va junto al id del otro; ACTIVE CONFLICTS marca cada lado sin reordenar (P4 de [`specs/provenance`](../provenance/spec.md)). El origen no cambia el estado de ningún par.
 
 La NOTE de ACTIVE CONFLICTS (una vez por bloque; [`specs/retrieval`](../retrieval/spec.md)) MUST NOT afirmar que las memorias se contradicen, y MUST nombrar `resolve_conflict` y sus veredictos. La apertura del protocolo ([`specs/mcp`](../mcp/spec.md)) MUST pedir que se juzguen en la sesión las candidatas que nombra `save_memory` y que se pregunte al usuario por lo que lista ACTIVE CONFLICTS. Cada par del bloque imprime los ids de sus dos lados, que son los que recibe `resolve_conflict`.
 
@@ -235,7 +252,7 @@ Desde [long-save-context](../../changes/archive/2026-10-14-long-save-context/pro
 
 El detector MUST NOT emparejar un pedazo nuevo con una fila viva del alcance de la `topic_key` del save: son las filas que ese mismo save va a dejar `superseded` al terminar ([`specs/ingest`](../ingest/spec.md), «Un save con clave reemplaza la fila viva de su clave»). Un par entre una versión y la siguiente nacería `pending` y quedaría muerto en la misma transacción que reemplaza a la vieja. Las demás filas se siguen emparejando, también las de otra clave.
 
-El worker suma las filas del alcance a los hermanos que ya pasa al detector (`siblings`, `worker.rs:776-778`), que `detect_contradiction` deja fuera como a los pedazos de R8 y a las fuentes de una conclusión.
+El worker suma las filas del alcance a los hermanos que ya pasa al detector (`siblings`, `worker.rs:790-792`), que `detect_contradiction` deja fuera como a los pedazos de R8 y a las fuentes de una conclusión.
 
 #### Escenario
 - GIVEN un `semantic_fact` guardado con la clave K, y otro `semantic_fact` cercano sin clave

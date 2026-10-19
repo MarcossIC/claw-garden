@@ -259,10 +259,14 @@ fn drop_dispute_sql() -> String {
 
 /// Brings `?1` back from being superseded by `?2`. Its status is settled
 /// afterwards; `active` here is only the starting point.
-const REVIVE_SQL: &str = "UPDATE memory SET status = 'active', superseded_by = NULL, last_modified_at = ?3 \
+pub(crate) const REVIVE_SQL: &str = "UPDATE memory SET status = 'active', superseded_by = NULL, supersede_cause = NULL, \
+                          last_modified_at = ?3 \
                           WHERE id = ?1 AND status = 'superseded' AND superseded_by = ?2";
 
-pub(crate) const SUPERSEDE_SQL: &str = "UPDATE memory SET status = 'superseded', superseded_by = ?2, last_modified_at = ?3 \
+/// Supersedes `?1` by `?2` for the reason `?4`, `revision` or `verdict`. A row
+/// a delete had brought back is no longer that delete's to take back.
+pub(crate) const SUPERSEDE_SQL: &str = "UPDATE memory SET status = 'superseded', superseded_by = ?2, \
+                             supersede_cause = ?4, revived_from = NULL, last_modified_at = ?3 \
                              WHERE id = ?1";
 
 /// Adds `?2` to `?1`'s `disputed_against` unless it is there already.
@@ -274,6 +278,12 @@ fn add_dispute_sql() -> String {
          last_disputed_at = ?3, last_modified_at = ?3 \
          WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM {NAMED_DISPUTES} WHERE value = ?2)"
     )
+}
+
+/// Names row `against` in row `row`'s `disputed_against`, inside the
+/// caller's transaction. The row's status is settled afterwards.
+pub(crate) fn add_dispute_in(c: &Connection, row: i64, against: i64, now: TimestampMs) -> rusqlite::Result<usize> {
+    c.execute(&add_dispute_sql(), rusqlite::params![row, against, now])
 }
 
 /// Records the pair's state after a verdict. A pair with no row (two rows
@@ -351,7 +361,7 @@ pub async fn judge_pair(
             tx.execute(REVIVE_SQL, rusqlite::params![keep, other, now])?;
             match verdict {
                 Verdict::Supersedes => {
-                    tx.execute(SUPERSEDE_SQL, rusqlite::params![other, keep, now])?;
+                    tx.execute(SUPERSEDE_SQL, rusqlite::params![other, keep, now, "verdict"])?;
                     release_challengers(&tx, other, now)?;
                 }
                 Verdict::Compatible | Verdict::Scoped => {
@@ -616,6 +626,28 @@ mod tests {
         let kept = row(&store, new).await;
         assert_eq!(kept.disputes, None);
         assert_eq!(kept.last_disputed_at, Some(1000), "the record that a dispute happened stays");
+    }
+
+    async fn cause(store: &MemoryStore, id: i64) -> Option<String> {
+        store
+            .conn
+            .call(move |c| c.query_row("SELECT supersede_cause FROM memory WHERE id = ?1", [id], |r| r.get(0)))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_verdict_records_why_it_replaced() {
+        let store = store().await;
+        let old = seed(&store, "the API listens on 8080", "active", &[], 0).await;
+        let new = seed(&store, "the API listens on 9090", "disputed", &[old], 1).await;
+
+        resolve_dispute_core(&store, new, old, Outcome::Supersede, None).await.unwrap();
+        assert_eq!(cause(&store, old).await.as_deref(), Some("verdict"));
+
+        resolve_dispute_core(&store, old, new, Outcome::Supersede, None).await.unwrap();
+        assert_eq!(cause(&store, old).await, None, "the row brought back carries no cause");
+        assert_eq!(cause(&store, new).await.as_deref(), Some("verdict"));
     }
 
     #[tokio::test]

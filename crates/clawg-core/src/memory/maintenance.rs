@@ -12,6 +12,7 @@ use crate::memory::clock::TimestampMs;
 use crate::memory::db::{EmbeddingIdentity, MemoryStore};
 use crate::memory::dispute::settle_disputed;
 use crate::memory::embedder::{EmbedRole, Embedder};
+use crate::memory::revival::revive_hidden;
 use crate::memory::vector::to_unit;
 use crate::memory::MemoryError;
 use serde::Serialize;
@@ -120,6 +121,11 @@ pub(crate) async fn run_maintenance_once_at(store: &MemoryStore, now_ms: Timesta
         log::info!("maintenance: released {released} disputes whose other side was deleted");
     }
 
+    let revived = revive_hidden_revisions(store, now_ms).await;
+    if revived > 0 {
+        log::info!("maintenance: brought back {revived} rows a delete of the current version of their topic left hidden");
+    }
+
     let dropped = drop_orphaned_pairs(store).await;
     if dropped > 0 {
         log::info!("maintenance: dropped {dropped} conflict pairs that name a row no longer stored");
@@ -153,9 +159,9 @@ pub(crate) async fn run_maintenance_once_at(store: &MemoryStore, now_ms: Timesta
 /// whole vector table.
 ///
 /// The selection joins the parent to its vector rather than listing every
-/// soft-deleted id, and that join is what makes a repeated pass free. Nothing
-/// in this codebase hard-deletes a parent row, so "soft-deleted" is a set that
-/// only ever grows: selecting on it alone would hand the loop below a longer
+/// soft-deleted id, and that join is what makes a repeated pass free. Only
+/// `clawg purge` removes a parent row, so "soft-deleted" is a set that keeps
+/// growing: selecting on it alone would hand the loop below a longer
 /// list every single day and spend a point delete on each one to discover the
 /// vector had already been dropped years ago. Joining to the vector table
 /// means the list IS the orphans — once they are gone the select returns
@@ -223,6 +229,19 @@ async fn release_orphaned_disputes(store: &MemoryStore, now_ms: TimestampMs) -> 
     }
 }
 
+/// Brings back the versions a delete that predates revivals left superseded
+/// by the deleted current version of their topic (`revival.rs`). A failure is
+/// logged and reported as 0, like the passes above.
+async fn revive_hidden_revisions(store: &MemoryStore, now_ms: TimestampMs) -> usize {
+    match store.conn.call(move |c| revive_hidden(c, now_ms)).await {
+        Ok(n) => n,
+        Err(e) => {
+            log::warn!("maintenance: reviving hidden revisions failed: {e}");
+            0
+        }
+    }
+}
+
 /// Deletes the conflict pairs that name a row the store no longer holds,
 /// which only a purge by a version that predates the pairs leaves behind. A
 /// failure is logged and reported as 0, like the passes above.
@@ -267,9 +286,9 @@ pub(crate) struct TableRowCounts {
 /// back to a bare `SCAN memory`.
 ///
 /// Reporting only the live count would hide how much of each table is
-/// soft-deleted. Those rows stay in the parent table forever — nothing in
-/// this codebase hard-deletes from `memory`, `episodic_trajectory` or
-/// `procedural_skill` — so the gap between `total` and `live` is accumulated
+/// soft-deleted. Those rows stay in the parent table until `clawg purge`
+/// removes one from `memory` (nothing removes rows of `episodic_trajectory`
+/// or `procedural_skill`), so the gap between `total` and `live` is accumulated
 /// tombstone weight. Their vectors no longer sit in that gap: a delete drops
 /// the vector row inline and [`sweep_orphaned_vectors`] backfills the ones
 /// deleted before that existed, so the gap no longer inflates the vec0 scan.
@@ -1410,6 +1429,44 @@ mod tests {
 
         assert_eq!(super::release_orphaned_disputes(&store, now_ms()).await, 1);
         assert_eq!(super::release_orphaned_disputes(&store, now_ms()).await, 0);
+    }
+
+    #[tokio::test]
+    async fn maintenance_revives_what_an_earlier_delete_left_hidden() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let v1 = seed_dispute(&store, "storage engine is sqlite", "active", None).await;
+        let v2 = seed_dispute(&store, "storage engine is postgres", "active", None).await;
+        let loser = seed_dispute(&store, "the api listens on 8080", "active", None).await;
+        let winner = seed_dispute(&store, "the api listens on 9090", "active", None).await;
+        // What a delete by the previous version left: the current version of
+        // a topic deleted, the one it replaced still superseded by it.
+        store
+            .conn
+            .call(move |c| {
+                c.execute("UPDATE memory SET topic_key = 'storage/engine' WHERE id IN (?1, ?2)", [v1, v2])?;
+                c.execute(
+                    "UPDATE memory SET status = 'superseded', superseded_by = ?2, supersede_cause = 'revision' WHERE id = ?1",
+                    [v1, v2],
+                )?;
+                c.execute(
+                    "UPDATE memory SET status = 'superseded', superseded_by = ?2, supersede_cause = 'verdict' WHERE id = ?1",
+                    [loser, winner],
+                )?;
+                c.execute("UPDATE memory SET deleted_at = 1 WHERE id IN (?1, ?2)", [v2, winner])
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(super::revive_hidden_revisions(&store, now_ms()).await, 1);
+        assert_eq!(super::revive_hidden_revisions(&store, now_ms()).await, 0, "idempotent");
+
+        let revived: (String, Option<i64>) = store
+            .conn
+            .call(move |c| c.query_row("SELECT status, revived_from FROM memory WHERE id = ?1", [v1], |r| Ok((r.get(0)?, r.get(1)?))))
+            .await
+            .unwrap();
+        assert_eq!(revived, ("active".to_string(), Some(v2)));
+        assert_eq!(status_of(&store, loser).await.0, "superseded", "a verdict stands");
     }
 
     #[tokio::test]

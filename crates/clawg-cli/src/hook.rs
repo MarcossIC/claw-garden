@@ -18,7 +18,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::cli::HookEvent;
 use crate::client::{Context, DaemonClient, Health, ListArgs};
-use crate::mcp::tools::synthesis_nudge;
+use crate::mcp::tools::{review_nudge, synthesis_nudge};
 
 /// The most a hook takes, from reading stdin to the answer: under the five
 /// seconds a hook is configured with, so the client never cancels one.
@@ -43,6 +43,10 @@ pub struct HookInput {
     pub source: Option<String>,
     #[serde(default)]
     pub transcript_path: Option<PathBuf>,
+    /// The host's id of the session, registered so the saves of this agent
+    /// in this project carry it.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 impl HookInput {
@@ -79,6 +83,7 @@ pub fn session_start_text(context: &Context, health: Option<&Health>, compacted:
         ));
     }
     parts.extend(synthesis_nudge(context.unreviewed));
+    parts.extend(review_nudge(context.conclusions_to_review));
     (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
@@ -132,17 +137,34 @@ pub async fn respond(
     tokio::time::timeout(deadline, answer(event, agent, base_dir, input)).await.ok().flatten()
 }
 
-async fn answer(event: HookEvent, agent: &str, base_dir: &Path, mut input: impl AsyncRead + Unpin) -> Option<String> {
+/// The most stdin a hook reads: the client's object is a few hundred bytes,
+/// and nothing else may fill the hook's memory.
+const INPUT_LIMIT: u64 = 1 << 20;
+
+/// All of `input`, or `None` when it fails or holds more than [`INPUT_LIMIT`].
+async fn read_input(input: impl AsyncRead + Unpin) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
-    input.read_to_end(&mut bytes).await.ok()?;
+    input.take(INPUT_LIMIT + 1).read_to_end(&mut bytes).await.ok()?;
+    (bytes.len() as u64 <= INPUT_LIMIT).then_some(bytes)
+}
+
+async fn answer(event: HookEvent, agent: &str, base_dir: &Path, input: impl AsyncRead + Unpin) -> Option<String> {
+    let bytes = read_input(input).await?;
     let input = HookInput::parse(&bytes)?;
     let client = DaemonClient::from_data_dir(base_dir)?;
     let cwd = input.cwd.clone().or_else(|| std::env::current_dir().ok())?;
     let project = ProjectIdentity::resolve(&cwd).id;
+    // Both events register: a daemon started since the session began learns
+    // it at the next prompt. A refusal changes nothing the hook prints.
+    let register = async {
+        if let Some(session) = input.session_id.as_deref() {
+            let _ = client.register_session(agent, Some(&project), session).await;
+        }
+    };
     let text = match event {
         HookEvent::SessionStart => {
-            let (context, health) =
-                tokio::join!(client.recent_context(agent, Some(&project), SESSION_BUDGET), client.health());
+            let (context, health, ()) =
+                tokio::join!(client.recent_context(agent, Some(&project), SESSION_BUDGET), client.health(), register);
             let compacted = input.source.as_deref() == Some("compact");
             session_start_text(&context.ok()?, health.ok().as_ref(), compacted)
         }
@@ -150,11 +172,12 @@ async fn answer(event: HookEvent, agent: &str, base_dir: &Path, mut input: impl 
             let args = ListArgs {
                 kind: Some("memory".into()),
                 agent: Some(agent.into()),
-                project: Some(project),
+                project: Some(project.clone()),
                 limit: Some(1),
                 ..ListArgs::default()
             };
-            let last = client.list(args).await.ok()?.first().and_then(|row| row.created_at);
+            let (list, ()) = tokio::join!(client.list(args), register);
+            let last = list.ok()?.first().and_then(|row| row.created_at);
             let started = input.transcript_path.as_deref().and_then(session_started_at);
             save_reminder(now_ms(), last, started)
         }
@@ -169,7 +192,7 @@ mod tests {
     const MINUTE: i64 = 60_000;
 
     fn context(prompt: &str, unreviewed: usize) -> Context {
-        Context { prompt: prompt.into(), unreviewed, retrieval: None }
+        Context { prompt: prompt.into(), unreviewed, retrieval: None, ..Default::default() }
     }
 
     fn health(embedder: &str) -> Health {
@@ -188,6 +211,7 @@ mod tests {
         .unwrap();
         assert_eq!(input.cwd.as_deref(), Some(Path::new("/work/repo")));
         assert_eq!(input.source.as_deref(), Some("compact"));
+        assert_eq!(input.session_id.as_deref(), Some("s"));
         assert_eq!(HookInput::parse(b"{}"), Some(HookInput::default()));
         assert_eq!(HookInput::parse(b"not json"), None);
     }
@@ -231,6 +255,16 @@ mod tests {
     }
 
     #[test]
+    fn session_start_carries_the_review_nudge() {
+        let to_review = Context { conclusions_to_review: 2, ..context("ctx", 25) };
+        let text = session_start_text(&to_review, None, false).unwrap();
+        assert!(text.ends_with(&review_nudge(2).unwrap()), "{text}");
+        assert!(text.contains(&synthesis_nudge(25).unwrap()), "{text}");
+        let without_context = Context { conclusions_to_review: 1, ..context("", 0) };
+        assert!(session_start_text(&without_context, None, false).is_some(), "the reminder comes on its own");
+    }
+
+    #[test]
     fn an_empty_context_prints_nothing() {
         assert_eq!(session_start_text(&context(" \n", 0), Some(&health("ready")), false), None);
     }
@@ -265,6 +299,23 @@ mod tests {
     fn no_session_start_no_reminder() {
         assert_eq!(save_reminder(10_000 * MINUTE, None, None), None);
         assert_eq!(save_reminder(10_000 * MINUTE, Some(0), None), None);
+    }
+
+    #[tokio::test]
+    async fn input_up_to_the_limit_is_read_whole_and_more_is_refused() {
+        let at_limit = vec![b' '; INPUT_LIMIT as usize];
+        assert_eq!(read_input(&at_limit[..]).await.as_deref(), Some(&at_limit[..]));
+        let over = vec![b' '; INPUT_LIMIT as usize + 1];
+        assert_eq!(read_input(&over[..]).await, None);
+    }
+
+    #[tokio::test]
+    async fn input_over_the_limit_prints_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut input = br#"{"cwd":"/"}"#.to_vec();
+        input.resize(INPUT_LIMIT as usize + 1, b' ');
+        let out = respond(HookEvent::SessionStart, "a", dir.path(), &input[..], HOOK_DEADLINE).await;
+        assert_eq!(out, None);
     }
 
     #[tokio::test]

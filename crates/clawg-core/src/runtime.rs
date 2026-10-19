@@ -25,7 +25,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::memory::access::AccessTracker;
-use crate::memory::backup::{self, Reason};
+use crate::memory::backup::Reason;
 use crate::memory::bootstrap::EmbedderStatus;
 use crate::memory::embedder::Embedder;
 use crate::memory::events::MemoryEvent;
@@ -249,17 +249,9 @@ impl MemoryRuntime {
         maintenance_worker_future(self.store.clone())
     }
 
-    /// Writes a snapshot of the store to `<base_dir>/backups` through the
-    /// runtime's own connection, which is the only one while it holds the
-    /// store.
+    /// Writes a snapshot of the store to `<base_dir>/backups`.
     pub async fn snapshot(&self, reason: Reason) -> Result<PathBuf, MemoryError> {
-        let dir = crate::paths::backups_dir(&self.base_dir);
-        self.store
-            .conn
-            .call(move |c| -> rusqlite::Result<_> { Ok(backup::snapshot_into(c, &dir, reason)) })
-            .await
-            .map_err(MemoryError::Connection)?
-            .map_err(MemoryError::from)
+        self.store.snapshot(crate::paths::backups_dir(&self.base_dir), reason).await
     }
 
     /// Orderly shutdown, once nothing can send new events: drains the ingest
@@ -505,6 +497,7 @@ mod tests {
             derived_from: Vec::new(),
             topic_key: None,
             user_stated: false,
+            session_id: None,
         }
     }
 
@@ -531,6 +524,72 @@ mod tests {
             .await
             .expect("vec_version");
         assert!(!version.is_empty());
+    }
+
+    /// `VACUUM INTO` reads the whole file, and every call queued behind it on
+    /// the store's connection (a save's outbox row, a search, a hook's
+    /// context) would wait for the copy.
+    #[tokio::test]
+    async fn a_snapshot_does_not_wait_behind_the_stores_connection() {
+        let tmp = tmp_base();
+        let (rt, _rx) = MemoryRuntime::open(tmp.path().to_path_buf(), StoreHolder::Daemon)
+            .await
+            .expect("open");
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let conn = rt.store.conn.clone();
+        let busy = tokio::spawn(async move {
+            conn.call(move |_| -> rusqlite::Result<()> {
+                let _ = held_tx.send(());
+                let _ = release_rx.recv();
+                Ok(())
+            })
+            .await
+        });
+        held_rx.await.expect("the store's connection is busy");
+
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), rt.snapshot(Reason::Manual)).await;
+        release_tx.send(()).expect("release the store's connection");
+        busy.await.expect("join").expect("the busy call");
+
+        let path = snapshot
+            .expect("the snapshot waited behind the store's connection")
+            .expect("snapshot");
+        let bytes = std::fs::read(&path).expect("the snapshot exists");
+        assert!(bytes.starts_with(b"SQLite format 3\0"), "a whole SQLite database");
+    }
+
+    /// The snapshot's own connection must still read what the store's
+    /// connection committed and has not checkpointed yet.
+    #[tokio::test]
+    async fn a_snapshot_holds_the_rows_still_in_the_wal() {
+        let tmp = tmp_base();
+        let (rt, _rx) = MemoryRuntime::open(tmp.path().to_path_buf(), StoreHolder::Daemon)
+            .await
+            .expect("open");
+        rt.store
+            .conn
+            .call(|c| {
+                c.execute(
+                    "INSERT INTO memory (scope, agent_id, content, memory_type, source, \
+                     created_at, created_by_type, created_by_ref, last_modified_at, \
+                     last_accessed_at, importance, tier, status) \
+                     VALUES ('agent', 'agent-rt', 'only in the WAL', 'semantic_fact', 'explicit', \
+                     0, 'agent', 'agent-rt', 0, 0, 5.0, 3, 'active')",
+                    [],
+                )
+            })
+            .await
+            .expect("insert");
+        let wal = std::fs::metadata(tmp.path().join("memory.db-wal")).map(|m| m.len()).unwrap_or(0);
+        assert!(wal > 0, "the row must still be in the WAL for this test to mean anything");
+
+        let path = rt.snapshot(Reason::Manual).await.expect("snapshot");
+        let copy = rusqlite::Connection::open(&path).expect("open the snapshot");
+        let rows: i64 = copy
+            .query_row("SELECT COUNT(*) FROM memory WHERE content = 'only in the WAL'", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(rows, 1, "the snapshot must include what is still in the WAL");
     }
 
     /// Production `open()` must NOT fill the embedder cell: the 470 MB

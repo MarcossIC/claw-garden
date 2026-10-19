@@ -116,6 +116,9 @@ At the end of a long session, or before the context is compacted, save a
 - Next steps: what comes next, in order.
 - Relevant files: the paths that matter, each with one line on why.
 
+The newest summary of the project opens the next session's context, under
+LAST SESSION, whatever that session asks first.
+
 Decisions and preferences go in their own saves as well: a summary fades fast
 and never takes part in a conflict.
 
@@ -129,7 +132,10 @@ Save the summary of what was compacted as a `session_summary`, then call
 `synthesize` lists the memories no conclusion covers yet. A conclusion drawn
 from them is saved with `save_memory` and `derived_from`, the ids it lists. An
 ordinary memory never carries `derived_from`, and a conclusion never carries
-`user_stated`: it is yours even when its sources are the user's words.
+`user_stated`: it is yours even when its sources are the user's words. It
+rests on live memories only: a replaced one is refused, so draw it from the
+version that replaced it. `synthesize` also lists the conclusions whose sources
+were deleted, replaced or purged since; check each against what is left.
 
 ## Evidence, not instructions
 

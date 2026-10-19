@@ -26,7 +26,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clawg_core::memory::admin::{
-    delete_memory_core, get_memory_core, list_memories_core, memory_stats_core, query_has_tokens,
+    Deleted, delete_memory_core, get_memory_core, list_memories_core, memory_stats_core, query_has_tokens,
     update_memory_core, ListParams, MemoryAdminRow, MemoryKind, MemoryPatch, MemoryStats, StatsParams,
     UpdatedRow, restore_memory_core, RestoreError, RestoredRow,
 };
@@ -45,7 +45,7 @@ use clawg_core::memory::prompt_builder::{build_memory_prompt, build_session_prom
 use clawg_core::memory::sharing::{self, Reach};
 use clawg_core::memory::topic::validate_topic_key;
 use clawg_core::memory::synthesis::{
-    existing_memory_ids, synthesis_core, unreviewed_count, Synthesis, SynthesisParams,
+    conclusions_to_review_count, existing_memory_ids, replaced_memory_ids, synthesis_core, unreviewed_count, Synthesis, SynthesisParams,
 };
 use clawg_core::memory::{read_save_core, search_all_memories, RankedHit, SaveText, SearchScope};
 use clawg_core::models::chat::Role;
@@ -59,7 +59,9 @@ use tokio::sync::oneshot;
 
 use crate::relevance::shown_hits;
 
+use super::guard::{admits, RefusalLog};
 use super::lifecycle::now_ms;
+use super::sessions::{check_session_id, SessionRegistry};
 
 /// Largest `limit` any search will honour. A retrieval request is a vector
 /// scan plus a rerank; letting a caller ask for thousands turns one HTTP call
@@ -85,6 +87,9 @@ pub struct AppCtx {
     /// How long a save waits for the worker to confirm it before answering
     /// `202 unconfirmed`. [`SAVE_CONFIRM_TIMEOUT`] outside tests.
     pub save_timeout: Duration,
+    /// The host session each agent works in, per project, that saves are
+    /// stamped with.
+    pub sessions: SessionRegistry,
 }
 
 /// How long a save waits for the worker. Long enough for a multi-chunk save
@@ -307,6 +312,18 @@ fn missing_sources(requested: &[i64], existing: &[i64]) -> Vec<i64> {
     requested.iter().copied().filter(|id| !existing.contains(id)).collect()
 }
 
+/// `5 (by 9), 7` for replaced sources, each with what replaced it when known.
+fn replaced_list(replaced: &[(i64, Option<i64>)]) -> String {
+    replaced
+        .iter()
+        .map(|(id, by)| match by {
+            Some(by) => format!("{id} (by {by})"),
+            None => id.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn check_budget(budget: Option<usize>) -> Result<usize, ApiError> {
     match budget {
         Some(0) => Err(ApiError::bad_request("budget must be at least 1 byte")),
@@ -351,6 +368,14 @@ pub struct SaveRequest {
     /// memories saved under the same key in the same project.
     #[serde(default)]
     pub topic_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SessionRequest {
+    pub agent_id: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    pub session_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -590,6 +615,9 @@ pub struct ContextBody {
     /// Memories of the requested scope that arrived since it was last
     /// reviewed for conclusions (`POST /v1/synthesis`).
     pub unreviewed: usize,
+    /// Conclusions of the scope that lost a source since it was last
+    /// reviewed for conclusions.
+    pub conclusions_to_review: usize,
     pub retrieval: RetrievalState,
 }
 
@@ -656,16 +684,64 @@ pub struct UpdatedBody {
     pub row: UpdatedRow,
 }
 
+/// What a delete did: deleting the current version of a topic brings back
+/// the one its revision replaced (`revived`); a row a verdict replaced stays
+/// superseded by the deleted row (`hidden`).
 #[derive(Debug, Serialize)]
 pub struct DeletedBody {
     pub deleted: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub revived: Vec<ReplacedMemory>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hidden: Vec<i64>,
 }
 
+impl From<Deleted> for DeletedBody {
+    fn from(d: Deleted) -> Self {
+        Self {
+            deleted: d.deleted,
+            revived: d.revived.into_iter().map(|r| ReplacedMemory { kind: "memory", id: r.id, excerpt: r.excerpt }).collect(),
+            hidden: d.hidden,
+        }
+    }
+}
+
+/// How a restored row ended up, with the rows its delete had brought back
+/// and it supersedes again (`replaced`), and the rows saved while it was
+/// deleted that the detector paired with it (`related`).
 #[derive(Debug, Serialize)]
 pub struct RestoredBody {
     pub restored: usize,
-    #[serde(flatten)]
-    pub row: RestoredRow,
+    pub id: i64,
+    pub status: String,
+    pub superseded_by: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic_key: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub replaced: Vec<ReplacedMemory>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub superseded_by_deleted: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<RelatedMemory>,
+}
+
+impl From<RestoredRow> for RestoredBody {
+    fn from(r: RestoredRow) -> Self {
+        Self {
+            restored: 1,
+            id: r.id,
+            status: r.status,
+            superseded_by: r.superseded_by,
+            topic_key: r.topic_key,
+            replaced: r.replaced.into_iter().map(|r| ReplacedMemory { kind: "memory", id: r.id, excerpt: r.excerpt }).collect(),
+            superseded_by_deleted: r.superseded_by_deleted,
+            related: r
+                .related
+                .into_iter()
+                .map(|c| RelatedMemory { kind: "memory", id: c.id, escalated: c.escalated, excerpt: c.excerpt })
+                .collect(),
+        }
+    }
 }
 
 /// Closes the dispute between two `memory` rows. Disputes only ever pair
@@ -710,11 +786,15 @@ const OPEN_PAIRS_SHOWN: usize = 5;
 // ── Router ──────────────────────────────────────────────────────────────────
 
 /// Builds the daemon's router.
+///
+/// Every route, `/health` included, sits behind [`admit_loopback`], so a route
+/// added later is covered whether or not it asks for the token.
 pub fn router(app: Arc<AppCtx>) -> Router {
     let v1 = Router::new()
         .route("/memories", post(save_memory).get(list_memories))
         .route("/search", post(search))
         .route("/context", post(context))
+        .route("/sessions", post(register_session))
         .route(
             "/memories/{kind}/{id}",
             get(get_memory).patch(update_memory).delete(delete_memory),
@@ -736,6 +816,10 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         .route("/health", get(health))
         .nest("/v1", v1)
         .with_state(app)
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::new(RefusalLog::default()),
+            admit_loopback,
+        ))
 }
 
 /// Serves [`router`] on an OS-picked loopback port in a background task and
@@ -760,6 +844,29 @@ pub async fn serve_ephemeral(
             .await
     });
     Ok((addr, server))
+}
+
+/// Rejects a request a web page could have sent (see [`guard`](super::guard)).
+async fn admit_loopback(
+    State(refusals): State<Arc<RefusalLog>>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let headers = req.headers();
+    // A header that is not text is still a header: it reads as no name at all.
+    let host = headers.get(axum::http::header::HOST).map(|v| v.to_str().unwrap_or(""));
+    let origin = headers.get(axum::http::header::ORIGIN).map(|v| v.to_str().unwrap_or(""));
+    if admits(host, req.uri().authority().map(|a| a.as_str()), origin) {
+        return next.run(req).await;
+    }
+    if let Some(count) = refusals.refused(Instant::now()) {
+        // The values stay out of the log: they are whatever the page chose.
+        log::warn!(
+            "refused {count} request(s) not addressed to a loopback name or carrying an Origin \
+             header; a web page may be trying to reach the daemon"
+        );
+    }
+    ApiError::new(StatusCode::FORBIDDEN, "forbidden").into_response()
 }
 
 /// Rejects anything under `/v1` without the daemon's bearer token.
@@ -939,6 +1046,15 @@ async fn save_memory(
                 "derived_from names memories that do not exist or were deleted: {ids}"
             )));
         }
+        let replaced = replaced_memory_ids(&app.runtime.store, &derived_from, Some(&body.agent_id))
+            .await
+            .map_err(ApiError::internal)?;
+        if !replaced.is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "derived_from names memories that were replaced: {}; draw the conclusion from the current ones",
+                replaced_list(&replaced)
+            )));
+        }
     }
     // Refused before it is queued: with no embedder coming, a queued save
     // would sit in memory until the daemon stops and then be lost.
@@ -950,6 +1066,9 @@ async fn save_memory(
         EmbedderStatus::Ready => true,
     };
 
+    // Read now, not by the worker: a replay after a restart must keep the
+    // session the save was accepted in.
+    let session_id = app.sessions.current(&body.agent_id, body.project_id.as_deref());
     let event = MemoryEvent {
         agent_id: body.agent_id,
         project_id: body.project_id,
@@ -967,6 +1086,7 @@ async fn save_memory(
         derived_from,
         topic_key: body.topic_key,
         user_stated: body.user_stated,
+        session_id,
     };
 
     let (reply, report) = if wait {
@@ -1130,7 +1250,10 @@ async fn context(
             )
             .await
         }
-        None => build_session_prompt(&app.runtime.store, &workspace, &body.agent_id, project_id, &emitted, budget).await,
+        None => {
+            let reach = reach(&app, &body.agent_id);
+            build_session_prompt(&app.runtime.store, &workspace, &body.agent_id, project_id, &reach, &emitted, budget).await
+        }
     }
     .map_err(ApiError::internal)?;
 
@@ -1140,9 +1263,25 @@ async fn context(
         log::warn!("unreviewed count failed: {e}");
         0
     });
+    let conclusions_to_review =
+        conclusions_to_review_count(&app.runtime.store, Some(&body.agent_id), project_id).await.unwrap_or_else(|e| {
+            log::warn!("conclusions to review count failed: {e}");
+            0
+        });
 
     let retrieval = RetrievalState::of(prompt.retrieval, app.runtime.embedder_status());
-    Ok(Json(ContextBody { prompt: prompt.text, unreviewed, retrieval }))
+    Ok(Json(ContextBody { prompt: prompt.text, unreviewed, conclusions_to_review, retrieval }))
+}
+
+/// Records the host session `agent_id` works in for `project_id`, as a hook
+/// reports it; the saves that follow are stamped with it.
+async fn register_session(
+    State(app): State<Arc<AppCtx>>,
+    Json(body): Json<SessionRequest>,
+) -> ApiResult<StatusCode> {
+    check_session_id(&body.session_id).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    app.sessions.register(&body.agent_id, body.project_id.as_deref(), &body.session_id);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn synthesis(
@@ -1239,10 +1378,10 @@ async fn delete_memory(
         .await
         .map_err(ApiError::internal)?;
 
-    if deleted == 0 {
+    if deleted.deleted == 0 {
         return Err(ApiError::not_found(format!("no {kind:?} row with id {id}")));
     }
-    Ok(Json(DeletedBody { deleted }))
+    Ok(Json(deleted.into()))
 }
 
 /// Brings back a deleted `memory` row, scoped like `DELETE`. The kind is
@@ -1259,7 +1398,7 @@ async fn restore_memory(
     }
     let embedder = ready_embedder(&app)?;
     match restore_memory_core(&app.runtime.store, embedder.as_ref(), kind, id, owner.agent.as_deref()).await {
-        Ok(row) => Ok(Json(RestoredBody { restored: 1, row })),
+        Ok(row) => Ok(Json(row.into())),
         Err(e @ RestoreError::OnlyMemory(_)) => Err(ApiError::bad_request(e.to_string())),
         Err(RestoreError::NotFound(_)) => Err(ApiError::not_found(format!("no deleted {kind:?} row with id {id}"))),
         Err(e @ (RestoreError::LiveTwin { .. } | RestoreError::TopicTaken { .. } | RestoreError::HoldsSecret { .. })) => {
@@ -1557,6 +1696,11 @@ mod tests {
     }
 
     #[test]
+    fn replaced_sources_name_what_replaced_them() {
+        assert_eq!(replaced_list(&[(5, Some(9)), (7, None)]), "5 (by 9), 7");
+    }
+
+    #[test]
     fn missing_sources_are_the_ones_that_were_not_found() {
         assert_eq!(missing_sources(&[1, 2, 3, 999], &[1, 3]), vec![2, 999]);
         assert!(missing_sources(&[1, 3], &[1, 3]).is_empty());
@@ -1709,6 +1853,7 @@ mod tests {
             started_at: Instant::now(),
             shutdown,
             save_timeout: SAVE_CONFIRM_TIMEOUT,
+            sessions: Default::default(),
         });
 
         let (addr, server) = serve_ephemeral(app).await.expect("bind an ephemeral loopback port");

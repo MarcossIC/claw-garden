@@ -119,7 +119,7 @@ Antes del intercambio `update` MUST: bajar el candidato junto al destino, verifi
 
 ## S8. Plan e intercambio
 
-El plan de `update` MUST ser una lista de pasos como datos, ejecutada aparte, de modo que el orden y la deshecha de cada falla se prueben sin disco ni red. Con daemon, el orden MUST ser: parar el daemon con el binario instalado (`stop_in`, `crates/clawg-cli/src/stop.rs:23`); renombrar el binario a `.old-*`; poner el candidato; arrancar el daemon nuevo por su ruta explícita (no por `ProcessSpawner`, que lanza `current_exe()`, `client.rs:1000-1002`); esperar `/health`. Sin daemon, `update` MUST NOT arrancar uno. Al empezar, MUST borrar los `.old-*` de corridas anteriores. Si un editor abre un puente entre la parada y el arranque, `update` MUST confirmar la versión del daemon que contesta e informarla. En Linux el binario instalado también se aparta a `.old-*` antes de poner el candidato: no se reemplaza en el lugar. Dos `update` a la vez MUST NOT intercambiar a la vez: un cerrojo exclusivo del sistema sobre `<data>/update.lock` hace que el segundo falle con un error claro.
+El plan de `update` MUST ser una lista de pasos como datos, ejecutada aparte, de modo que el orden y la deshecha de cada falla se prueben sin disco ni red. Con daemon, el orden MUST ser: parar el daemon con el binario instalado (`stop_in`, `crates/clawg-cli/src/stop.rs:23`); renombrar el binario a `.old-*`; poner el candidato; arrancar el daemon nuevo por su ruta explícita (no por `ProcessSpawner`, que lanza `current_exe()`, `client.rs:1098-1100`); esperar `/health`. Sin daemon, `update` MUST NOT arrancar uno. Al empezar, MUST borrar los `.old-*` de corridas anteriores. Si un editor abre un puente entre la parada y el arranque, `update` MUST confirmar la versión del daemon que contesta e informarla. En Linux el binario instalado también se aparta a `.old-*` antes de poner el candidato: no se reemplaza en el lugar. Dos `update` a la vez MUST NOT intercambiar a la vez: un cerrojo exclusivo del sistema sobre `<data>/update.lock` hace que el segundo falle con un error claro.
 
 #### Escenario: actualización completa con daemon
 - GIVEN un daemon corriendo y un servidor de release falso con una versión mayor
@@ -167,7 +167,7 @@ Si el daemon nuevo no contesta `/health` con la versión nueva en el plazo, `upd
 2. Después del intercambio, o contesta `/health` con la versión nueva el daemon nuevo, o vuelven el binario viejo y su daemon, o (S9) el usuario queda en una situación explicada con un camino de vuelta.
 3. El usuario MUST NOT quedar sin daemon y sin saber por qué.
 4. `update` MUST NOT borrar un `.old-*` ni un snapshot de la corrida en curso.
-5. Un store con migraciones pendientes MUST dejar su `pre-migration` en `<data>/backups` (`crates/clawg-core/src/memory/db.rs:207-217`) y sus datos MUST seguir alcanzables. Un candidato cuyo daemon se niega a abrir el store (esquema más nuevo o migración divergente para el candidato, `db.rs:395-407`) MUST dejar el store sin tocar, y el usuario queda con el binario anterior y su daemon. Con releases ordenados por versión ese caso no ocurre de verdad (un store más nuevo que el candidato lo es también del binario viejo, y entonces no habría daemon viejo corriendo); se reproduce con el sello de prueba (`migrations_up_to`).
+5. Un store con migraciones pendientes MUST dejar su `pre-migration` en `<data>/backups` (`crates/clawg-core/src/memory/db.rs:223-233`) y sus datos MUST seguir alcanzables. Un candidato cuyo daemon se niega a abrir el store (esquema más nuevo o migración divergente para el candidato, `db.rs:407-419`) MUST dejar el store sin tocar, y el usuario queda con el binario anterior y su daemon. Con releases ordenados por versión ese caso no ocurre de verdad (un store más nuevo que el candidato lo es también del binario viejo, y entonces no habría daemon viejo corriendo); se reproduce con el sello de prueba (`migrations_up_to`).
 
 #### Escenario: migración pendiente
 - GIVEN una base sembrada en la versión anterior con una migración pendiente
@@ -179,7 +179,13 @@ Si el daemon nuevo no contesta `/health` con la versión nueva en el plazo, `upd
 - WHEN corre `update`
 - THEN el daemon nuevo se niega sin tocar el store, no se escribe ningún snapshot nuevo, vuelven el binario viejo y su daemon respondiendo, y el informe dice por qué
 
-**Pruebas:** `an_update_over_a_pending_migration_leaves_a_pre_migration_snapshot_and_the_data` y `an_update_whose_candidate_refuses_the_store_leaves_the_old_binary_and_its_daemon` en `binary.rs`, con la base sembrada en la versión anterior (regla de `openspec/config.yaml` para cambios que tocan el esquema). Prerrequisito ya fusionado: `to_prune` conserva el `pre-migration` más nuevo (`crates/clawg-core/src/memory/backup.rs:243-269`, 0.18.1), con su test.
+#### Escenario: migración pendiente sobre filas sin causa de reemplazo
+- GIVEN una base en V16 (`UNCAUSED_SCHEMA`) con una revisión por clave, una revisión deshecha por un veredicto, un veredicto entre filas sin clave y una vigente borrada
+- WHEN `update` instala el binario nuevo y su daemon abre la base
+- THEN el snapshot `pre-migration` es la base en V16 con todas sus filas, la base migrada tiene las mismas filas, la revisión queda `revision`, los dos veredictos `verdict` y ninguna fila tiene `revived_from`
+- AND a través del daemon nuevo, borrar la revisión vigente revive a la anterior, y borrar el ganador de un veredicto (el de la revisión deshecha incluido) deja a la perdedora en `hidden`
+
+**Pruebas:** `an_update_over_a_pending_migration_leaves_a_pre_migration_snapshot_and_the_data`, `an_update_whose_candidate_refuses_the_store_leaves_the_old_binary_and_its_daemon` y `an_update_over_a_store_without_supersede_causes_keeps_its_rows_and_tells_revisions_from_verdicts` en `binary.rs`, con la base sembrada en la versión anterior (regla de `openspec/config.yaml` para cambios que tocan el esquema). Prerrequisito ya fusionado: `to_prune` conserva el `pre-migration` más nuevo (`crates/clawg-core/src/memory/backup.rs:243-269`, 0.18.1), con su test.
 
 ## S11. Informe
 

@@ -8,6 +8,8 @@
 
 use std::path::Path;
 
+use rusqlite::OptionalExtension;
+
 use crate::memory::identity::derive_project_id;
 use crate::memory::workspace::WorkspaceManager;
 use crate::memory::{MemoryError, MemoryStore};
@@ -81,7 +83,7 @@ pub async fn register_project(
     let moves = legacy.clone();
     let outcome = store
         .conn
-        .call(move |c| -> rusqlite::Result<Result<(usize, bool), String>> {
+        .call(move |c| -> rusqlite::Result<Result<(usize, bool, Vec<String>), String>> {
             let tx = c.transaction()?;
             tx.execute(
                 "INSERT OR IGNORE INTO project (id, root_path, created_at, index_docs) VALUES (?1, ?2, ?3, ?4)",
@@ -99,7 +101,18 @@ pub async fn register_project(
                 tx.execute("UPDATE project SET index_docs = 1 WHERE id = ?1", [&id])?;
             }
             let mut moved = 0;
+            let mut kept = Vec::new();
             for legacy_id in &moves {
+                // Ids carry 16 bits of hash: a legacy id that is another root's
+                // own id would take that project's rows.
+                let owner: Option<String> = tx
+                    .query_row("SELECT root_path FROM project WHERE id = ?1", [legacy_id], |r| r.get(0))
+                    .optional()?;
+                if owner.is_some_and(|other| other != root_path) {
+                    log::warn!("{legacy_id} belongs to another registered project; its rows were not moved to {id}");
+                    kept.push(legacy_id.clone());
+                    continue;
+                }
                 for table in PROJECT_TABLES {
                     tx.execute(
                         &format!(
@@ -115,19 +128,19 @@ pub async fn register_project(
                 }
             }
             tx.commit()?;
-            Ok(Ok((moved, indexed || index_docs)))
+            Ok(Ok((moved, indexed || index_docs, kept)))
         })
         .await
         .map_err(|e| match e {
             tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
             other => MemoryError::Backend(other.to_string()),
         })?;
-    let (rekeyed, index_docs) = outcome
+    let (rekeyed, index_docs, kept) = outcome
         .map_err(|existing| RegisterError::RootCollision { id: project_id.clone(), existing })?;
 
     // After the commit and outside it: a file copy that fails must not undo
     // rows already moved, and the legacy file is still there for the next try.
-    for legacy_id in &legacy {
+    for legacy_id in legacy.iter().filter(|id| !kept.contains(id)) {
         if let Err(e) = workspaces.adopt_legacy(legacy_id, &project_id).await {
             log::warn!("could not carry the workspace of {legacy_id} over to {project_id}: {e}");
         }
@@ -390,6 +403,30 @@ mod tests {
         assert!(matches!(err, RegisterError::InvalidLegacyId(_)), "{err:?}");
         assert_eq!(project_ids(&store).await, before);
         assert_eq!(count(&store, "SELECT COUNT(*) FROM project").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_legacy_id_of_another_registered_project_keeps_its_rows_and_workspace() {
+        let (store, ws_dir) = seeded().await;
+        let ws = WorkspaceManager::new(ws_dir.path().into());
+        store
+            .conn
+            .call(|c| {
+                c.execute("INSERT INTO project (id, root_path, created_at) VALUES ('src-1a2b', '/work/other', 0)", [])
+            })
+            .await
+            .unwrap();
+        let theirs = ws.workspace_path("agent-a", Some("src-1a2b"));
+        std::fs::create_dir_all(theirs.parent().unwrap()).unwrap();
+        std::fs::write(&theirs, "notes of the other project").unwrap();
+        let before = project_ids(&store).await;
+
+        let outcome = register_project(&store, &ws, Path::new("/work/repo"), &["src-1a2b".into()], true).await.unwrap();
+
+        assert_eq!(outcome.rekeyed, 0);
+        assert_eq!(project_ids(&store).await, before);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM project_rekey").await, 0);
+        assert!(!ws.workspace_path("agent-a", Some(&outcome.project_id)).exists());
     }
 
     #[tokio::test]

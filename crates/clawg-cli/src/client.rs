@@ -269,6 +269,10 @@ pub struct Context {
     /// conclusions. A daemon that predates the count omits it.
     #[serde(default)]
     pub unreviewed: usize,
+    /// Conclusions of the scope that lost a source since it was last
+    /// reviewed. A daemon that predates the count omits it.
+    #[serde(default)]
+    pub conclusions_to_review: usize,
     /// Whether memories were searched for the prompt. A daemon that predates
     /// the field omits it, and then nothing can be said either way.
     #[serde(default)]
@@ -301,6 +305,30 @@ pub struct Synthesis {
     pub pending: Vec<MemoryRow>,
     pub pending_total: usize,
     pub conclusions: Vec<MemoryRow>,
+    /// Conclusions with a lost source. A daemon that predates them omits
+    /// both fields.
+    #[serde(default)]
+    pub to_review: Vec<ConclusionReview>,
+    #[serde(default)]
+    pub to_review_total: usize,
+}
+
+/// A conclusion with a source that was deleted, replaced or purged.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct ConclusionReview {
+    pub conclusion: MemoryRow,
+    /// Sources still live.
+    pub live: usize,
+    pub lost: Vec<LostSource>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct LostSource {
+    pub id: i64,
+    /// `deleted`, `superseded` or `purged`.
+    pub state: String,
+    #[serde(default)]
+    pub superseded_by: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -406,12 +434,37 @@ pub struct Updated {
 }
 
 /// How a restored row ended up. A `superseded` one is live but still left out
-/// of searches.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// of searches. Every field after `superseded_by` is absent from a daemon
+/// that predates them.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct Restored {
     pub id: i64,
     pub status: String,
     pub superseded_by: Option<i64>,
+    #[serde(default)]
+    pub topic_key: Option<String>,
+    /// The rows its delete had brought back, superseded by it again.
+    #[serde(default)]
+    pub replaced: Vec<ReplacedMemory>,
+    /// The row that supersedes it is deleted too.
+    #[serde(default)]
+    pub superseded_by_deleted: bool,
+    /// Rows saved while it was deleted that the detector paired with it.
+    #[serde(default)]
+    pub related: Vec<RelatedMemory>,
+}
+
+/// What `DELETE /v1/memories/{kind}/{id}` did. `revived` and `hidden` are
+/// absent from a daemon that predates them.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct Deleted {
+    pub deleted: usize,
+    /// The version of a topic the deleted row had replaced, current again.
+    #[serde(default)]
+    pub revived: Vec<ReplacedMemory>,
+    /// Rows a verdict replaced by the deleted row, still superseded by it.
+    #[serde(default)]
+    pub hidden: Vec<i64>,
 }
 
 /// The save a row belongs to, from `GET /v1/memories/{kind}/{id}/save`: a
@@ -532,7 +585,9 @@ impl DaemonClient {
         Self {
             base_url: base_url.into(),
             token: token.into(),
-            http: reqwest::Client::new(),
+            // The daemon is on loopback and the bearer token travels with every
+            // call: a configured or system proxy must never see them.
+            http: reqwest::Client::builder().no_proxy().build().expect("build the daemon HTTP client"),
             base_dir,
         }
     }
@@ -710,6 +765,34 @@ impl DaemonClient {
         Self::read_response(resp).await
     }
 
+    /// Tells the daemon which host session `agent_id` works in for
+    /// `project_id`; the saves that follow carry it. A daemon that predates
+    /// it answers 404.
+    pub async fn register_session(
+        &self,
+        agent_id: &str,
+        project_id: Option<&str>,
+        session_id: &str,
+    ) -> Result<(), ClientError> {
+        let resp = self
+            .http
+            .post(self.url("/v1/sessions"))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "agent_id": agent_id, "project_id": project_id, "session_id": session_id }))
+            .send()
+            .await
+            .map_err(Self::map_transport)?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(ClientError::Unauthorized);
+        }
+        if !status.is_success() {
+            let body = resp.json::<serde_json::Value>().await.ok();
+            return Err(daemon_error(status, body));
+        }
+        Ok(())
+    }
+
     pub async fn synthesis(&self, args: &SynthesisArgs) -> Result<Synthesis, ClientError> {
         let resp = self
             .http
@@ -870,11 +953,7 @@ impl DaemonClient {
     }
 
     /// `agent` scopes the delete as in [`DaemonClient::update`].
-    pub async fn delete(&self, kind: &str, id: i64, agent: Option<&str>) -> Result<usize, ClientError> {
-        #[derive(Deserialize)]
-        struct Body {
-            deleted: usize,
-        }
+    pub async fn delete(&self, kind: &str, id: i64, agent: Option<&str>) -> Result<Deleted, ClientError> {
         let resp = self
             .http
             .delete(self.url(&format!("/v1/memories/{kind}/{id}")))
@@ -883,7 +962,7 @@ impl DaemonClient {
             .send()
             .await
             .map_err(Self::map_transport)?;
-        Ok(Self::read_response::<Body>(resp).await?.deleted)
+        Self::read_response::<Deleted>(resp).await
     }
 
     /// Brings back a deleted `memory` row. `agent` scopes it as in
@@ -1250,6 +1329,16 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn answers_without_conclusions_to_review_still_parse() {
+        let old: Context = serde_json::from_str(r#"{"prompt":"","unreviewed":0}"#).expect("a daemon that never said");
+        assert_eq!(old.conclusions_to_review, 0);
+        let old: Synthesis = serde_json::from_str(r#"{"pending":[],"pending_total":0,"conclusions":[]}"#)
+            .expect("a daemon that never said");
+        assert!(old.to_review.is_empty());
+        assert_eq!(old.to_review_total, 0);
+    }
+
+    #[test]
     fn a_context_without_retrieval_still_parses() {
         let old: Context = serde_json::from_str(r#"{"prompt":"","unreviewed":0}"#).expect("a daemon that never said");
         assert_eq!(old.retrieval, None);
@@ -1286,6 +1375,7 @@ pub(crate) mod tests {
             started_at: Instant::now(),
             shutdown,
             save_timeout: SAVE_CONFIRM_TIMEOUT,
+            sessions: Default::default(),
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -1474,7 +1564,7 @@ pub(crate) mod tests {
         assert_eq!(synthesis.pending_total, 1);
 
         assert_eq!(c.update("memory", id, Some(9.5), None, None).await.expect("patch").tier, 1);
-        assert_eq!(c.delete("memory", id, None).await.expect("delete"), 1);
+        assert_eq!(c.delete("memory", id, None).await.expect("delete").deleted, 1);
     }
 
     #[test]

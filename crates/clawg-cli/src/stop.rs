@@ -11,8 +11,8 @@ use crate::process::{Exit, Watched};
 
 /// How long `clawg stop` waits for the daemon to end. After the HTTP server
 /// stops, the daemon ingests what is still queued for up to
-/// [`clawg_core::runtime::DRAIN_DEADLINE`], writes what it could not ingest to
-/// `ingest-pending.jsonl`, flushes the access counts and checkpoints the WAL.
+/// [`clawg_core::runtime::DRAIN_DEADLINE`], leaves what it could not ingest in
+/// the outbox for the next start, flushes the access counts and checkpoints the WAL.
 /// With an idle queue that is well under a second; this bound has to cover a
 /// full drain plus the rest, so the installer never replaces the binary while
 /// the daemon is still writing.
@@ -114,6 +114,7 @@ mod tests {
             started_at: Instant::now(),
             shutdown,
             save_timeout: SAVE_CONFIRM_TIMEOUT,
+            sessions: Default::default(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();

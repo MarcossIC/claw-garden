@@ -443,6 +443,31 @@ async fn a_second_daemon_on_the_same_data_directory_is_refused_and_names_the_fir
 // ── status and stop ────────────────────────────────────────────────────────
 
 #[tokio::test]
+async fn the_daemon_client_ignores_an_http_proxy() {
+    let sandbox = Sandbox::new();
+    let _daemon = sandbox.serve().await;
+    let proxy = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the stand-in proxy");
+    proxy.set_nonblocking(true).expect("non-blocking accept");
+    let url = format!("http://{}", proxy.local_addr().expect("proxy address"));
+
+    let status = sandbox
+        .command(&["status", "--profile", "dev"])
+        .env("HTTP_PROXY", &url)
+        .env("http_proxy", &url)
+        .env("ALL_PROXY", &url)
+        .env("all_proxy", &url)
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .output()
+        .expect("run clawg status");
+
+    assert_eq!(status.status.code(), Some(0), "{}", stderr_of(&status));
+    let report: Value = serde_json::from_slice(&status.stdout).expect("status prints JSON");
+    assert_eq!(report["running"], true);
+    assert!(proxy.accept().is_err(), "the loopback traffic went to the proxy");
+}
+
+#[tokio::test]
 async fn status_and_stop_follow_the_daemon_process() {
     let sandbox = Sandbox::new();
     let before = sandbox.run(&["status", "--profile", "dev"]);
@@ -588,7 +613,12 @@ fn hook(sandbox: &Sandbox, args: &[&str], input: &str) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn clawg hook");
-    child.stdin.take().expect("stdin").write_all(input.as_bytes()).expect("write stdin");
+    // A usage error exits before stdin is read, and the write may then find
+    // the pipe closed; the exit code is what such a test checks.
+    match child.stdin.take().expect("stdin").write_all(input.as_bytes()) {
+        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => panic!("write stdin: {e}"),
+        _ => {}
+    }
     child.wait_with_output().expect("clawg hook")
 }
 
@@ -656,6 +686,40 @@ async fn session_start_injects_the_saved_memories() {
     let out = hook(&sandbox, &["user-prompt-submit", "--agent", "smoke", "--profile", "dev"], &prompt.to_string());
     assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
     assert_eq!(stdout_of(&out), "", "the session just started and a save just landed");
+}
+
+#[tokio::test]
+async fn a_hook_registers_the_session_of_the_saves() {
+    let sandbox = Sandbox::new();
+    let root = sandbox.home.join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let project = clawg_core::memory::ProjectIdentity::resolve(&root).id;
+    let daemon = sandbox.serve().await;
+    let save = |content: &'static str| {
+        daemon.post("/v1/memories", json!({ "content": content, "agent_id": "smoke", "project_id": project }))
+    };
+    let session_of = |list: &str, content: &str| -> Value {
+        let list: Value = serde_json::from_str(list).expect("list json");
+        let item = list["items"].as_array().unwrap().iter().find(|i| i["summary"] == content).cloned();
+        item.unwrap_or_else(|| panic!("{content} not listed: {list}"))["source_session_id"].clone()
+    };
+
+    let start = json!({ "session_id": "s1", "cwd": root, "hook_event_name": "SessionStart", "source": "startup" });
+    let out = hook(&sandbox, &["session-start", "--agent", "smoke", "--profile", "dev"], &start.to_string());
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let (status, body) = save("the deploy script lives in ops/deploy.sh").await;
+    assert!(status == 201 || status == 202, "{body}");
+
+    let prompt = json!({ "session_id": "s2", "cwd": root, "prompt": "go on", "hook_event_name": "UserPromptSubmit" });
+    let out = hook(&sandbox, &["user-prompt-submit", "--agent", "smoke", "--profile", "dev"], &prompt.to_string());
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let (status, body) = save("the release notes live in docs/releases").await;
+    assert!(status == 201 || status == 202, "{body}");
+    daemon.wait_until_ingested().await;
+
+    let list = daemon.list().await;
+    assert_eq!(session_of(&list, "the deploy script lives in ops/deploy.sh"), "s1", "{list}");
+    assert_eq!(session_of(&list, "the release notes live in docs/releases"), "s2", "a later prompt of another session wins: {list}");
 }
 
 // ── Cleanup ────────────────────────────────────────────────────────────────
@@ -992,20 +1056,28 @@ fn last_migration() -> i32 {
         .expect("the binary has migrations")
 }
 
-/// What the daemon the data directory names answers to `path`.
-async fn published_get(data_dir: &Path, path: &str) -> String {
+/// What the daemon the data directory names answers to `method` on `path`.
+async fn published_send(data_dir: &Path, method: reqwest::Method, path: &str) -> String {
     let state: Value =
         serde_json::from_str(&std::fs::read_to_string(data_dir.join("daemon.json")).expect("daemon.json"))
             .expect("daemon.json is JSON");
     let token = std::fs::read_to_string(data_dir.join("token")).expect("token");
     let response = reqwest::Client::new()
-        .get(format!("http://127.0.0.1:{}{path}", state["port"]))
+        .request(method, format!("http://127.0.0.1:{}{path}", state["port"]))
         .bearer_auth(token.trim())
         .send()
         .await
         .expect("request");
     assert!(response.status().is_success(), "{path}: {}", response.status());
     response.text().await.expect("body")
+}
+
+async fn published_get(data_dir: &Path, path: &str) -> String {
+    published_send(data_dir, reqwest::Method::GET, path).await
+}
+
+async fn published_delete(data_dir: &Path, path: &str) -> Value {
+    serde_json::from_str(&published_send(data_dir, reqwest::Method::DELETE, path).await).expect("delete json")
 }
 
 const SEEDED: [&str; 2] = [
@@ -1031,10 +1103,10 @@ async fn seeded_store(sandbox: &Sandbox) -> (PathBuf, Daemon) {
 /// SQL against this schema, so a later migration only adds one more pending.
 const OLD_SCHEMA: i32 = 15;
 
-/// A daemon of an installed copy frozen at [`OLD_SCHEMA`], over a store with
-/// `SEEDED` in it.
-async fn store_behind(sandbox: &Sandbox) -> (PathBuf, Daemon) {
-    let installed = install(sandbox, &stamp_json("0.18.0", &format!(r#","migrations_up_to":{OLD_SCHEMA}"#)));
+/// A daemon of an installed copy frozen at `schema`, over a store `seed`
+/// wrote into while no daemon held it.
+async fn store_at(sandbox: &Sandbox, schema: i32, seed: impl FnOnce(&rusqlite::Connection)) -> (PathBuf, Daemon) {
+    let installed = install(sandbox, &stamp_json("0.18.0", &format!(r#","migrations_up_to":{schema}"#)));
     // The first start only creates the store at that schema.
     let first = sandbox.serve_binary(&installed, "fake").await;
     let stopped = sandbox.command_of(&installed, &["stop", "--profile", "dev"]).output().expect("run clawg stop");
@@ -1042,16 +1114,76 @@ async fn store_behind(sandbox: &Sandbox) -> (PathBuf, Daemon) {
     first.wait_for_exit(Duration::from_secs(10)).await;
 
     let db = rusqlite::Connection::open(sandbox.data_dir().join("memory.db")).expect("open the store");
-    for text in SEEDED {
+    seed(&db);
+    drop(db);
+    (installed.clone(), sandbox.serve_binary(&installed, "fake").await)
+}
+
+/// A daemon of an installed copy frozen at [`OLD_SCHEMA`], over a store with
+/// `SEEDED` in it.
+async fn store_behind(sandbox: &Sandbox) -> (PathBuf, Daemon) {
+    store_at(sandbox, OLD_SCHEMA, |db| {
+        for text in SEEDED {
+            db.execute(
+                "INSERT INTO memory (agent_id, content, created_at, last_modified_at, last_accessed_at) \
+                 VALUES ('smoke', ?1, 0, 0, 0)",
+                [text],
+            )
+            .expect("seed a row");
+        }
+    })
+    .await
+}
+
+/// The last schema before `supersede_cause`. A store at it holds revisions
+/// and verdicts with no cause recorded, and the migration has to tell them
+/// apart by what they left in `topic_key` and `memory_conflict`.
+const UNCAUSED_SCHEMA: i32 = 16;
+
+type Row = (i64, String, String, Option<i64>, Option<String>, bool);
+
+/// `(id, content, status, superseded_by, topic_key, deleted)`. 2 revised 1;
+/// 4 revised 3 until a verdict undid it; 6 won a verdict over 5; 8 revised 7
+/// and was deleted.
+const UNCAUSED_ROWS: [(i64, &str, &str, Option<i64>, Option<&str>, bool); 8] = [
+    (1, "storage engine is SQLite", "superseded", Some(2), Some("storage/engine"), false),
+    (2, "storage engine moved to Postgres", "active", None, Some("storage/engine"), false),
+    (3, "the daemon listens on port 27380", "active", None, Some("api/port"), false),
+    (4, "the daemon listens on port 27390", "superseded", Some(3), Some("api/port"), false),
+    (5, "backups are written weekly", "superseded", Some(6), None, false),
+    (6, "backups are written every night", "active", None, None, false),
+    (7, "logs rotate at 10 MB", "superseded", Some(8), Some("logs/rotation"), false),
+    (8, "logs rotate at 50 MB", "active", None, Some("logs/rotation"), true),
+];
+
+fn seed_uncaused(db: &rusqlite::Connection) {
+    for (id, content, status, by, key, deleted) in UNCAUSED_ROWS {
         db.execute(
-            "INSERT INTO memory (agent_id, content, created_at, last_modified_at, last_accessed_at) \
-             VALUES ('smoke', ?1, 0, 0, 0)",
-            [text],
+            "INSERT INTO memory (id, agent_id, content, status, superseded_by, topic_key, deleted_at, \
+             created_at, last_modified_at, last_accessed_at) \
+             VALUES (?1, 'smoke', ?2, ?3, ?4, ?5, ?6, ?1, ?1, ?1)",
+            rusqlite::params![id, content, status, by, key, deleted.then_some(100)],
         )
         .expect("seed a row");
     }
-    drop(db);
-    (installed.clone(), sandbox.serve_binary(&installed, "fake").await)
+    db.execute_batch(
+        "INSERT INTO memory_conflict (new_id, old_id, distance, state, verdict, created_at, judged_at) \
+         VALUES (4, 3, NULL, 'judged', 'supersedes', 4, 4), (6, 5, 0.2, 'judged', 'supersedes', 6, 6);",
+    )
+    .expect("seed the verdicts");
+}
+
+/// The rows of the store at `path`, as [`UNCAUSED_ROWS`] lists them.
+fn rows_in(path: &Path) -> Vec<Row> {
+    let db = rusqlite::Connection::open(path).expect("open the store");
+    db.prepare(
+        "SELECT id, content, status, superseded_by, topic_key, deleted_at IS NOT NULL FROM memory ORDER BY id",
+    )
+    .and_then(|mut q| {
+        q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+            .and_then(Iterator::collect)
+    })
+    .expect("read the rows")
 }
 
 /// The `pre-migration` snapshots in the data directory.
@@ -1097,6 +1229,60 @@ async fn an_update_over_a_pending_migration_leaves_a_pre_migration_snapshot_and_
     for text in SEEDED {
         assert!(rows.contains(text), "{text:?} survived the migration: {rows}");
     }
+}
+
+// The server runs in this process while the binary is waited on.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_over_a_store_without_supersede_causes_keeps_its_rows_and_tells_revisions_from_verdicts() {
+    let sandbox = Sandbox::new();
+    let (installed, old) = store_at(&sandbox, UNCAUSED_SCHEMA, seed_uncaused).await;
+    let release = signed_release("0.19.0", "");
+    let server = ReleaseServer::serving(release.listing.clone(), release.files.clone()).await;
+    let _stop = StopOnDrop { home: sandbox.home.clone() };
+
+    let out = update_from(&sandbox, &installed, &server.base, &release.public);
+
+    assert_eq!(out.status.code(), Some(0), "{}\n{}", stdout_of(&out), stderr_of(&out));
+    old.wait_for_exit(Duration::from_secs(10)).await;
+    let health = published_health(&sandbox.data_dir()).await;
+    assert_eq!(health["version"], "0.19.0", "{health}");
+
+    let seeded: Vec<Row> = UNCAUSED_ROWS
+        .iter()
+        .map(|&(id, content, status, by, key, deleted)| {
+            (id, content.to_string(), status.to_string(), by, key.map(str::to_string), deleted)
+        })
+        .collect();
+    let snapshots = pre_migrations(&sandbox.data_dir());
+    assert_eq!(snapshots.len(), 1, "{snapshots:?}");
+    let version: i32 = rusqlite::Connection::open(&snapshots[0])
+        .and_then(|db| db.query_row("SELECT max(version) FROM refinery_schema_history", [], |r| r.get(0)))
+        .expect("snapshot schema");
+    assert_eq!(version, UNCAUSED_SCHEMA, "the snapshot is the store as the old binary left it");
+    assert_eq!(rows_in(&snapshots[0]), seeded, "the snapshot holds every row");
+
+    let store = sandbox.data_dir().join("memory.db");
+    assert_eq!(rows_in(&store), seeded, "the migration changed no row");
+    let added: Vec<(Option<String>, Option<i64>)> = rusqlite::Connection::open(&store)
+        .expect("open the store")
+        .prepare("SELECT supersede_cause, revived_from FROM memory ORDER BY id")
+        .and_then(|mut q| q.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).and_then(Iterator::collect))
+        .expect("read the causes");
+    let causes: Vec<Option<&str>> = added.iter().map(|(cause, _)| cause.as_deref()).collect();
+    assert_eq!(
+        causes,
+        [Some("revision"), None, None, Some("verdict"), Some("verdict"), None, Some("revision"), None]
+    );
+    assert!(added.iter().all(|(_, from)| from.is_none()), "{added:?}");
+
+    let revised = published_delete(&sandbox.data_dir(), "/v1/memories/memory/2").await;
+    assert_eq!(revised["revived"][0]["id"], 1, "the version before is current again: {revised}");
+    assert!(revised.get("hidden").is_none(), "{revised}");
+    let undone = published_delete(&sandbox.data_dir(), "/v1/memories/memory/3").await;
+    assert!(undone.get("revived").is_none(), "a revision a verdict undid stays replaced: {undone}");
+    assert_eq!(undone["hidden"], json!([4]), "{undone}");
+    let judged = published_delete(&sandbox.data_dir(), "/v1/memories/memory/6").await;
+    assert_eq!(judged["hidden"], json!([5]), "{judged}");
 }
 
 // The server runs in this process while the binary is waited on.
@@ -1308,4 +1494,89 @@ async fn a_full_update_with_a_daemon_replaces_the_binary_and_a_bridge_reaches_th
 
     let reply = bridge.call(3, "memory_status", json!({}));
     assert!(!tool_failed(&reply), "the open bridge must find the new daemon: {reply}");
+}
+
+// ── Client setup ───────────────────────────────────────────────────────────
+
+/// `clawg setup` with Claude Code's configuration in `<home>/claude-config`
+/// and `path` as the whole PATH, so neither the real configuration nor a
+/// real `claude` is ever reached.
+fn setup(sandbox: &Sandbox, args: &[&str], path: &Path) -> Output {
+    sandbox
+        .command(&[&["setup", "claude-code", "--profile", "dev"], args].concat())
+        .env("CLAUDE_CONFIG_DIR", sandbox.home.join("claude-config"))
+        .env("PATH", path)
+        .output()
+        .expect("run clawg setup")
+}
+
+#[tokio::test]
+async fn setup_dry_run_writes_nothing() {
+    let sandbox = Sandbox::new();
+    let empty = sandbox.home.join("empty-path");
+    std::fs::create_dir_all(&empty).unwrap();
+    let out = setup(&sandbox, &["--dry-run"], &empty);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let text = stdout_of(&out);
+    assert!(text.contains("mcp server clawg-dev: would register it"), "{text}");
+    assert!(text.contains("would add SessionStart, UserPromptSubmit"), "{text}");
+    assert!(!sandbox.home.join("claude-config").exists());
+    assert!(!sandbox.data_dir().exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn setup_without_claude_prints_the_command_and_installs_the_rest() {
+    let sandbox = Sandbox::new();
+    let empty = sandbox.home.join("empty-path");
+    std::fs::create_dir_all(&empty).unwrap();
+    let out = setup(&sandbox, &[], &empty);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    let text = stdout_of(&out);
+    let bin = std::fs::canonicalize(BIN).unwrap();
+    let line = format!("claude mcp add --scope user clawg-dev -- {} mcp --profile dev --agent claude-code", bin.display());
+    assert!(text.contains(&line), "{text}");
+    let settings = std::fs::read_to_string(sandbox.home.join("claude-config").join("settings.json")).unwrap();
+    assert!(settings.contains("hook session-start --agent claude-code --profile dev"), "{settings}");
+    let md = std::fs::read_to_string(sandbox.home.join("claude-config").join("CLAUDE.md")).unwrap();
+    assert!(md.starts_with("<!-- BEGIN CLAWG MEMORY PROTOCOL -->"), "{md}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn setup_registers_through_a_fake_claude_and_remove_undoes_it() {
+    let sandbox = Sandbox::new();
+    let fake = sandbox.home.join("fake-bin");
+    std::fs::create_dir_all(&fake).unwrap();
+    write_executable(&fake.join("claude"), b"#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"${0%/*}/calls\"\n");
+    let config = sandbox.home.join("claude-config");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("CLAUDE.md"), "# Mine\n").unwrap();
+
+    let out = setup(&sandbox, &[], &fake);
+    assert_eq!(out.status.code(), Some(0), "{}{}", stdout_of(&out), stderr_of(&out));
+    let bin = std::fs::canonicalize(BIN).unwrap();
+    let calls = std::fs::read_to_string(fake.join("calls")).unwrap();
+    let expected = format!(
+        "mcp\nadd\n--scope\nuser\nclawg-dev\n--\n{}\nmcp\n--profile\ndev\n--agent\nclaude-code\n",
+        bin.display()
+    );
+    assert_eq!(calls, expected);
+    assert!(stdout_of(&out).contains("previous file copied to"), "{}", stdout_of(&out));
+
+    // What `claude mcp add` would have written.
+    let registered = json!({ "mcpServers": { "clawg-dev": {
+        "type": "stdio", "command": bin, "args": ["mcp", "--profile", "dev", "--agent", "claude-code"], "env": {} } } });
+    std::fs::write(config.join(".claude.json"), registered.to_string()).unwrap();
+    let again = setup(&sandbox, &[], &fake);
+    assert_eq!(again.status.code(), Some(0), "{}", stdout_of(&again));
+    assert!(stdout_of(&again).contains("mcp server clawg-dev: already registered"), "{}", stdout_of(&again));
+    assert_eq!(std::fs::read_to_string(fake.join("calls")).unwrap(), expected, "claude is not run again");
+
+    let removed = setup(&sandbox, &["--remove"], &fake);
+    assert_eq!(removed.status.code(), Some(0), "{}", stdout_of(&removed));
+    let calls = std::fs::read_to_string(fake.join("calls")).unwrap();
+    assert!(calls.ends_with("mcp\nremove\n--scope\nuser\nclawg-dev\n"), "{calls}");
+    assert_eq!(std::fs::read_to_string(config.join("CLAUDE.md")).unwrap(), "# Mine\n");
+    assert_eq!(std::fs::read_to_string(config.join("settings.json")).unwrap(), "{}\n");
 }

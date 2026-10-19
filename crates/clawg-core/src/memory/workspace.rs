@@ -4,7 +4,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::memory::{record::TableKind, MemoryError, MemoryStore};
 
@@ -43,7 +43,7 @@ impl WorkspaceManager {
     pub fn workspace_path(&self, agent_id: &str, project_id: Option<&str>) -> PathBuf {
         self.workspaces_root
             .join(workspace_segment(agent_id).as_ref())
-            .join(project_id.unwrap_or(DEFAULT_PROJECT_SEGMENT))
+            .join(project_segment(project_id.unwrap_or(DEFAULT_PROJECT_SEGMENT)).as_ref())
             .join("workspace.md")
     }
 
@@ -67,8 +67,8 @@ impl WorkspaceManager {
             // Already a segment on disk: going through `workspace_path` would
             // encode an encoded name a second time.
             let agent_dir = agent.path();
-            let from = agent_dir.join(legacy_id).join("workspace.md");
-            let to = agent_dir.join(project_id).join("workspace.md");
+            let from = agent_dir.join(project_segment(legacy_id).as_ref()).join("workspace.md");
+            let to = agent_dir.join(project_segment(project_id).as_ref()).join("workspace.md");
             let legacy = match tokio::fs::read(&from).await {
                 Ok(bytes) => bytes,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -630,6 +630,25 @@ fn workspace_segment(agent_id: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// The folder name of a project's workspace inside an agent's folder.
+///
+/// A project id is `<folder name>-hhhh` and is used as is, which keeps every
+/// existing folder where it is. Anything that is not exactly one plain path
+/// component (an absolute path, `.`, `..`, a separator, a drive prefix, the
+/// empty id) could leave the agent's folder, so it is encoded like an agent id.
+fn project_segment(project_id: &str) -> Cow<'_, str> {
+    let mut components = Path::new(project_id).components();
+    let plain = matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(name)), None) if name == project_id
+    );
+    if plain && !project_id.contains(['/', '\\']) {
+        Cow::Borrowed(project_id)
+    } else {
+        workspace_segment(project_id)
+    }
+}
+
 /// Whether Windows takes `name` for a device: its part before the first dot,
 /// without trailing spaces, is a reserved name in any case.
 fn is_windows_device_name(name: &str) -> bool {
@@ -682,6 +701,50 @@ mod tests {
         let read = |p| std::fs::read_to_string(ws.workspace_path("agent-a", Some(p))).unwrap();
         assert_eq!(read("repo-3c4d"), "current");
         assert_eq!(read("src-1a2b"), "legacy");
+    }
+
+    #[test]
+    fn a_project_id_that_is_not_one_plain_name_stays_inside_the_agents_folder() {
+        let root = PathBuf::from("/base/workspaces");
+        let ws = WorkspaceManager::new(root.clone());
+        let agent_dir = root.join("agent-a");
+        let outside = std::env::temp_dir().join("elsewhere");
+        let absolute = outside.to_string_lossy().into_owned();
+        for id in [absolute.as_str(), "/etc", "..", ".", "../../x", "a/b", "a\\b", "C:x", ""] {
+            let path = ws.workspace_path("agent-a", Some(id));
+            assert!(path.starts_with(&agent_dir), "{id:?} -> {path:?}");
+            assert_eq!(path.strip_prefix(&agent_dir).unwrap().components().count(), 2, "{id:?} -> {path:?}");
+        }
+    }
+
+    #[test]
+    fn a_real_project_id_keeps_its_folder() {
+        let root = PathBuf::from("/base/workspaces");
+        let ws = WorkspaceManager::new(root.clone());
+        for id in ["repo-3c4d", "my app-1a2b", "100%-beef", "café-0001"] {
+            assert_eq!(
+                ws.workspace_path("agent-a", Some(id)),
+                root.join("agent-a").join(id).join("workspace.md"),
+                "{id:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn adopting_never_reads_or_writes_outside_the_agents_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspaces");
+        let ws = WorkspaceManager::new(root.clone());
+        let legacy = ws.workspace_path("agent-a", Some("src-1a2b"));
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "legacy").unwrap();
+
+        ws.adopt_legacy("src-1a2b", "../../planted").await.unwrap();
+
+        assert!(!dir.path().join("planted").exists());
+        let adopted = ws.workspace_path("agent-a", Some("../../planted"));
+        assert!(adopted.starts_with(root.join("agent-a")));
+        assert_eq!(std::fs::read_to_string(adopted).unwrap(), "legacy");
     }
 
     #[test]

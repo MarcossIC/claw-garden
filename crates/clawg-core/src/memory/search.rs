@@ -105,6 +105,15 @@ pub struct PiecePosition {
     pub pieces: i64,
 }
 
+/// The hits `reader` may read, in their order. The queries already filter by
+/// reach; this is the check that does not depend on each of them repeating it.
+/// A hit without an author is not readable by anyone.
+fn readable_hits(hits: Vec<RankedHit>, reader: &str, reach: &Reach) -> Vec<RankedHit> {
+    hits.into_iter()
+        .filter(|hit| hit.agent_id.as_deref().is_some_and(|author| reach.admits(reader, author)))
+        .collect()
+}
+
 /// Keeps the first, so best ranked, hit of each save and drops its other
 /// pieces, so one long text takes one slot. Only `memory` rows are pieces:
 /// the other tables number their rows independently.
@@ -888,13 +897,13 @@ async fn identifier_matches(
 // through `idx_memory_agent_active`, so without `NOT INDEXED` the planner
 // drives the join from that index and visits EVERY live row the agent owns,
 // applying the id list afterwards as a filter. Same rows out, same distances,
-// cost proportional to the corpus instead of to the candidate list: at 5,000
-// rows and a 20-candidate budget that is ~730 µs instead of ~330 µs for this
-// query's `m.id IN` spelling with `NOT INDEXED` removed (measured on this
-// machine), and it grows with the corpus from there. The `v.rowid IN`
-// spelling pays far more for the same missing hint — tens of milliseconds at
-// the same corpus size — which is a separate, larger cost covered where that
-// spelling is rejected below. `NOT INDEXED` bars every index on `memory`
+// but a cost proportional to the corpus instead of to the candidate list:
+// it grows with every live row the agent owns, while the rowid plan grows
+// only with the ids named. The `v.rowid IN` spelling pays far more for the
+// same missing hint, since its `memory_vectors` plan line becomes an
+// unconstrained scan of the vector table, a separate and larger cost that
+// is covered where that spelling is rejected below. `NOT INDEXED` bars
+// every index on `memory`
 // while explicitly leaving the rowid available, which is the one access path
 // a query holding a list of ids ever wants.
 //
@@ -1239,6 +1248,7 @@ async fn search_all_memories_inner(
     let mut all: Vec<RankedHit> =
         mem.hits.into_iter().chain(epi.hits).chain(pro.hits).chain(lex_hits).collect();
     all.sort_by(hit_cmp);
+    let all = readable_hits(all, agent_id, &scope.reach);
     let memory_ids: Vec<i64> = all.iter().filter(|h| h.kind == TableKind::Memory).map(|h| h.id).collect();
     // Without the links the pieces stay separate hits, as before they were
     // linked; a search never fails over them.
@@ -5032,6 +5042,23 @@ mod tests {
 
         assert_eq!(ids_and_pieces(&collapsed), vec![(3, None), (11, None), (2, Some((1, 2))), (1, None)]);
         assert_eq!(collapsed[1].kind, TableKind::Episodic);
+    }
+
+    #[test]
+    fn a_hit_the_reader_may_not_see_is_dropped_and_the_order_kept() {
+        let by = |id: i64, author: Option<&str>| {
+            let mut hit = memory_hit(id, 1.0 - id as f64 / 10.0);
+            hit.agent_id = author.map(str::to_string);
+            hit
+        };
+        let hits = vec![by(1, Some("hidden")), by(2, Some("me")), by(3, None), by(4, Some("visible")), by(5, Some("hidden"))];
+
+        let reach = Reach::AllBut(vec!["hidden".to_string()]);
+        let kept = readable_hits(hits.clone(), "me", &reach);
+        assert_eq!(kept.iter().map(|h| h.id).collect::<Vec<_>>(), vec![2, 4]);
+
+        let own = readable_hits(hits, "me", &Reach::Own);
+        assert_eq!(own.iter().map(|h| h.id).collect::<Vec<_>>(), vec![2]);
     }
 
     async fn seed_linked_save(store: &MemoryStore, agent: &str) -> Vec<i64> {

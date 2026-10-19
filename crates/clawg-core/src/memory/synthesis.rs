@@ -38,6 +38,71 @@ const PENDING: &str = "deleted_at IS NULL AND status <> 'superseded' \
 const CONCLUSION: &str = "deleted_at IS NULL AND status <> 'superseded' \
      AND EXISTS (SELECT 1 FROM memory_derivation d WHERE d.memory_id = memory.id)";
 
+/// The source `d.source_id` is lost: no live row holds it any more, because
+/// it was deleted, replaced or purged. The SQL side of [`SourceState::of`].
+const LOST_SOURCE: &str = "NOT EXISTS (SELECT 1 FROM memory s WHERE s.id = d.source_id \
+     AND s.deleted_at IS NULL AND s.status <> 'superseded')";
+
+/// Conclusions to review returned at most: each line names what it lost, so
+/// they are longer than the conclusions listed beside them.
+pub const REVIEW_LIMIT: u32 = 10;
+
+fn to_review_condition() -> String {
+    format!(
+        "{CONCLUSION} AND EXISTS (SELECT 1 FROM memory_derivation d \
+         WHERE d.memory_id = memory.id AND {LOST_SOURCE})"
+    )
+}
+
+/// What became of one source of a conclusion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceState {
+    /// Still live: `active`, or `disputed`, which says nothing about whether
+    /// it is true.
+    Live,
+    Deleted,
+    Superseded,
+    /// Its row is gone; the link names an id no row will hold again.
+    Purged,
+}
+
+impl SourceState {
+    /// From the source's row as `(deleted, status)`, `None` when it has none.
+    pub fn of(row: Option<(bool, &str)>) -> Self {
+        match row {
+            None => Self::Purged,
+            Some((true, _)) => Self::Deleted,
+            Some((false, "superseded")) => Self::Superseded,
+            Some(_) => Self::Live,
+        }
+    }
+}
+
+/// A conclusion is to review once one source is lost: the user deleting or
+/// replacing a memory is a statement about it, and only whoever reads the
+/// conclusion can tell whether what is left still carries it.
+pub fn needs_review(sources: &[SourceState]) -> bool {
+    sources.iter().any(|s| *s != SourceState::Live)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LostSource {
+    pub id: i64,
+    pub state: SourceState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<i64>,
+}
+
+/// A live conclusion with a lost source.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConclusionReview {
+    pub conclusion: MemoryAdminRow,
+    /// Sources still live, of the `derived_from` of the conclusion.
+    pub live: usize,
+    pub lost: Vec<LostSource>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SynthesisParams {
     /// `None` is the store owner, who reviews every agent's memories.
@@ -54,6 +119,9 @@ pub struct Synthesis {
     /// Every pending memory of the scope.
     pub pending_total: usize,
     pub conclusions: Vec<MemoryAdminRow>,
+    /// Newest first, at most [`REVIEW_LIMIT`].
+    pub to_review: Vec<ConclusionReview>,
+    pub to_review_total: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -98,8 +166,8 @@ fn rows(
     rows.collect()
 }
 
-fn count(c: &rusqlite::Connection, scope: Scope<'_>, after: Option<i64>) -> rusqlite::Result<usize> {
-    let mut sql = format!("SELECT COUNT(*) FROM memory WHERE {PENDING}");
+fn count(c: &rusqlite::Connection, condition: &str, scope: Scope<'_>, after: Option<i64>) -> rusqlite::Result<usize> {
+    let mut sql = format!("SELECT COUNT(*) FROM memory WHERE {condition}");
     let mut params = Vec::new();
     scope.push(&mut sql, &mut params);
     if let Some(after) = after {
@@ -108,6 +176,37 @@ fn count(c: &rusqlite::Connection, scope: Scope<'_>, after: Option<i64>) -> rusq
     }
     let n: i64 = c.query_row(&sql, rusqlite::params_from_iter(params), |r| r.get(0))?;
     Ok(n as usize)
+}
+
+/// Each conclusion of `conclusions` with what became of its sources.
+fn reviews(c: &rusqlite::Connection, conclusions: Vec<MemoryAdminRow>) -> rusqlite::Result<Vec<ConclusionReview>> {
+    let mut stmt = c.prepare_cached(
+        "SELECT d.source_id, s.id IS NOT NULL, s.deleted_at IS NOT NULL, s.status, s.superseded_by \
+         FROM memory_derivation d LEFT JOIN memory s ON s.id = d.source_id \
+         WHERE d.memory_id = ?1 ORDER BY d.source_id",
+    )?;
+    let mut found = Vec::new();
+    for conclusion in conclusions {
+        let sources = stmt
+            .query_map([conclusion.id], |r| {
+                let exists: bool = r.get(1)?;
+                let deleted: bool = r.get(2)?;
+                let status: Option<String> = r.get(3)?;
+                let state = SourceState::of(exists.then_some((deleted, status.as_deref().unwrap_or(""))));
+                let superseded_by = if state == SourceState::Superseded { r.get(4)? } else { None };
+                Ok(LostSource { id: r.get(0)?, state, superseded_by })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let states: Vec<SourceState> = sources.iter().map(|s| s.state).collect();
+        // `LOST_SOURCE` picked the conclusion; the rule has the last word, so
+        // the two can never list one the other would not.
+        if !needs_review(&states) {
+            continue;
+        }
+        let (live, lost): (Vec<_>, Vec<_>) = sources.into_iter().partition(|s| s.state == SourceState::Live);
+        found.push(ConclusionReview { conclusion, live: live.len(), lost });
+    }
+    Ok(found)
 }
 
 fn reviewed_at(c: &rusqlite::Connection, scope: Scope<'_>) -> rusqlite::Result<Option<i64>> {
@@ -145,10 +244,13 @@ pub async fn synthesis_core(
         .call(move |c| -> rusqlite::Result<Synthesis> {
             let tx = c.transaction()?;
             let scope = Scope { agent: params.agent_id.as_deref(), project: params.project_id.as_deref() };
+            let to_review = to_review_condition();
             let found = Synthesis {
                 pending: rows(&tx, PENDING, scope, limit)?,
-                pending_total: count(&tx, scope, None)?,
+                pending_total: count(&tx, PENDING, scope, None)?,
                 conclusions: rows(&tx, CONCLUSION, scope, CONCLUSIONS_LIMIT)?,
+                to_review: reviews(&tx, rows(&tx, &to_review, scope, REVIEW_LIMIT)?)?,
+                to_review_total: count(&tx, &to_review, scope, None)?,
             };
             let (agent, project) = scope.key();
             tx.execute(
@@ -177,10 +279,81 @@ pub async fn unreviewed_count(
         .call(move |c| -> rusqlite::Result<usize> {
             let scope = Scope { agent: agent_id.as_deref(), project: project_id.as_deref() };
             let after = reviewed_at(c, scope)?;
-            count(c, scope, after)
+            count(c, PENDING, scope, after)
         })
         .await
         .map_err(backend("unreviewed count"))
+}
+
+/// How many conclusions of a scope lost a source after its last review by the
+/// same agent; every conclusion to review when the scope was never reviewed.
+///
+/// A deleted source was lost at its `deleted_at`, a replaced one at its
+/// `last_modified_at`, which replacing it writes. A purged source counts only
+/// before the first review: nothing records when it was purged.
+pub async fn conclusions_to_review_count(
+    store: &MemoryStore,
+    agent_id: Option<&str>,
+    project_id: Option<&str>,
+) -> Result<usize, MemoryError> {
+    let agent_id = agent_id.map(str::to_owned);
+    let project_id = project_id.map(str::to_owned);
+    store
+        .conn
+        .call(move |c| -> rusqlite::Result<usize> {
+            let scope = Scope { agent: agent_id.as_deref(), project: project_id.as_deref() };
+            let mut params = Vec::new();
+            let mut sql = match reviewed_at(c, scope)? {
+                None => format!("SELECT COUNT(*) FROM memory WHERE {}", to_review_condition()),
+                Some(after) => {
+                    params.push(rusqlite::types::Value::Integer(after));
+                    format!(
+                        "SELECT COUNT(*) FROM memory WHERE {CONCLUSION} AND EXISTS \
+                         (SELECT 1 FROM memory_derivation d JOIN memory s ON s.id = d.source_id \
+                          WHERE d.memory_id = memory.id \
+                            AND (s.deleted_at IS NOT NULL OR s.status = 'superseded') \
+                            AND COALESCE(s.deleted_at, s.last_modified_at) > ?)"
+                    )
+                }
+            };
+            scope.push(&mut sql, &mut params);
+            let n: i64 = c.query_row(&sql, rusqlite::params_from_iter(params), |r| r.get(0))?;
+            Ok(n as usize)
+        })
+        .await
+        .map_err(backend("conclusions to review count"))
+}
+
+/// The ids among `ids` that name a `memory` row not deleted but superseded,
+/// ascending, each with the row that replaced it. With an agent, another
+/// agent's row is left out, as in [`existing_memory_ids`].
+pub async fn replaced_memory_ids(
+    store: &MemoryStore,
+    ids: &[i64],
+    agent_id: Option<&str>,
+) -> Result<Vec<(i64, Option<i64>)>, MemoryError> {
+    let ids = ids.to_vec();
+    let agent_id = agent_id.map(str::to_owned);
+    store
+        .conn
+        .call(move |c| -> rusqlite::Result<Vec<(i64, Option<i64>)>> {
+            use rusqlite::OptionalExtension;
+            let mut stmt = c.prepare_cached(
+                "SELECT superseded_by FROM memory WHERE id = ?1 AND deleted_at IS NULL \
+                 AND status = 'superseded' AND (?2 IS NULL OR agent_id = ?2)",
+            )?;
+            let mut found = Vec::new();
+            for id in ids {
+                if let Some(by) = stmt.query_row(rusqlite::params![id, agent_id], |r| r.get(0)).optional()? {
+                    found.push((id, by));
+                }
+            }
+            found.sort_unstable();
+            found.dedup();
+            Ok(found)
+        })
+        .await
+        .map_err(backend("source lookup"))
 }
 
 /// The ids among `ids` that name a `memory` row not deleted, ascending. With
@@ -430,6 +603,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replaced_ids_name_their_replacement() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let live = seed(&store, None, "live", 1).await;
+        let old = seed(&store, None, "old", 2).await;
+        let new = seed(&store, None, "new", 3).await;
+        supersede(&store, old, new, 3).await;
+        let theirs = seed_as(&store, "b", None, "theirs", 4).await;
+        supersede(&store, theirs, new, 4).await;
+
+        assert_eq!(replaced_memory_ids(&store, &[new, old, live, theirs], Some("a")).await.unwrap(), vec![(old, Some(new))]);
+        assert_eq!(
+            replaced_memory_ids(&store, &[old, theirs], None).await.unwrap(),
+            vec![(old, Some(new)), (theirs, Some(new))]
+        );
+    }
+
+    #[tokio::test]
     async fn existing_ids_leave_out_another_agents_rows() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let mine = seed_as(&store, "a", None, "mine", 1).await;
@@ -437,6 +627,220 @@ mod tests {
 
         assert_eq!(existing_memory_ids(&store, &[mine, theirs], Some("a")).await.unwrap(), vec![mine]);
         assert_eq!(existing_memory_ids(&store, &[mine, theirs], None).await.unwrap(), vec![mine, theirs]);
+    }
+
+    async fn supersede(store: &MemoryStore, id: i64, by: i64, at: i64) {
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE memory SET status = 'superseded', superseded_by = ?2, \
+                     supersede_cause = 'revision', last_modified_at = ?3 WHERE id = ?1",
+                    [id, by, at],
+                )
+            })
+            .await
+            .unwrap();
+    }
+
+    fn lost(review: &ConclusionReview) -> Vec<(i64, SourceState, Option<i64>)> {
+        review.lost.iter().map(|l| (l.id, l.state, l.superseded_by)).collect()
+    }
+
+    #[test]
+    fn source_state_cases() {
+        use SourceState::*;
+        let cases = [
+            (None, Purged),
+            (Some((true, "active")), Deleted),
+            (Some((true, "superseded")), Deleted),
+            (Some((false, "superseded")), Superseded),
+            (Some((false, "active")), Live),
+            (Some((false, "disputed")), Live),
+        ];
+        for (row, want) in cases {
+            assert_eq!(SourceState::of(row), want, "{row:?}");
+        }
+    }
+
+    #[test]
+    fn review_needs_one_lost_source() {
+        use SourceState::*;
+        assert!(!needs_review(&[Live, Live]));
+        assert!(needs_review(&[Live, Live, Deleted]));
+        assert!(needs_review(&[Superseded]));
+        assert!(needs_review(&[Purged, Live]));
+    }
+
+    #[tokio::test]
+    async fn a_conclusion_with_a_deleted_source_is_to_review() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let a = seed(&store, Some("p"), "tabs in go", 1).await;
+        let b = seed(&store, Some("p"), "tabs in rust", 2).await;
+        let c = conclude(&store, Some("p"), &[a, b], 3).await;
+
+        delete_memory_core(&store, a, MemoryKind::Memory, None).await.unwrap();
+        let found = synthesis_core(&store, in_project("p"), TimestampMs::from_unix_millis(10)).await.unwrap();
+
+        assert_eq!(found.to_review_total, 1);
+        assert_eq!(found.to_review.len(), 1);
+        assert_eq!(found.to_review[0].conclusion.id, c);
+        assert_eq!(found.to_review[0].live, 1);
+        assert_eq!(lost(&found.to_review[0]), vec![(a, SourceState::Deleted, None)]);
+        assert_eq!(ids(&found.conclusions), vec![c], "a conclusion to review is still a live conclusion");
+    }
+
+    #[tokio::test]
+    async fn a_conclusion_with_every_source_live_is_not() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let a = seed(&store, Some("p"), "tabs in go", 1).await;
+        let b = seed(&store, Some("p"), "tabs in rust", 2).await;
+        conclude(&store, Some("p"), &[a, b], 3).await;
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE memory SET status = 'disputed' WHERE id = ?1", [a]))
+            .await
+            .unwrap();
+
+        let found = synthesis_core(&store, in_project("p"), TimestampMs::from_unix_millis(10)).await.unwrap();
+
+        assert!(found.to_review.is_empty(), "a disputed source is still live");
+        assert_eq!(found.to_review_total, 0);
+    }
+
+    #[tokio::test]
+    async fn restoring_the_source_takes_the_conclusion_off_the_list() {
+        use crate::memory::admin::restore_memory_core;
+        use crate::memory::embedder::FakeEmbedder;
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let a = seed(&store, Some("p"), "tabs in go", 1).await;
+        conclude(&store, Some("p"), &[a], 2).await;
+        delete_memory_core(&store, a, MemoryKind::Memory, None).await.unwrap();
+
+        restore_memory_core(&store, &FakeEmbedder::default(), MemoryKind::Memory, a, None).await.unwrap();
+        let found = synthesis_core(&store, in_project("p"), TimestampMs::from_unix_millis(10)).await.unwrap();
+
+        assert!(found.to_review.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_replaced_source_names_its_replacement() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let a = seed(&store, Some("p"), "the deploy runs on fridays", 1).await;
+        let c = conclude(&store, Some("p"), &[a], 2).await;
+        let a2 = seed(&store, Some("p"), "the deploy runs on mondays", 3).await;
+        supersede(&store, a, a2, 3).await;
+
+        let found = synthesis_core(&store, in_project("p"), TimestampMs::from_unix_millis(10)).await.unwrap();
+
+        assert_eq!(found.to_review[0].conclusion.id, c);
+        assert_eq!(found.to_review[0].live, 0);
+        assert_eq!(lost(&found.to_review[0]), vec![(a, SourceState::Superseded, Some(a2))]);
+    }
+
+    #[tokio::test]
+    async fn a_purged_source_leaves_the_conclusion_to_review() {
+        use crate::memory::store_lock::StoreHolder;
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+        let a = seed(&store, Some("p"), "tabs in go", 1).await;
+        let c = conclude(&store, Some("p"), &[a], 2).await;
+        store.conn.clone().close().await.unwrap();
+        drop(store);
+
+        crate::memory::secrets::purge(dir.path(), a).unwrap();
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+        let found = synthesis_core(&store, in_project("p"), TimestampMs::from_unix_millis(10)).await.unwrap();
+
+        assert_eq!(ids(&found.conclusions), vec![c], "it is still a conclusion");
+        assert!(found.pending.is_empty(), "a conclusion is never pending");
+        assert_eq!(lost(&found.to_review[0]), vec![(a, SourceState::Purged, None)]);
+    }
+
+    #[tokio::test]
+    async fn the_review_count_follows_losses_after_the_last_review() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let a = seed(&store, Some("p"), "tabs in go", 1).await;
+        let b = seed(&store, Some("p"), "tabs in rust", 2).await;
+        let c = conclude(&store, Some("p"), &[a, b], 3).await;
+        let count = || conclusions_to_review_count(&store, None, Some("p"));
+        assert_eq!(count().await.unwrap(), 0);
+
+        delete_memory_core(&store, a, MemoryKind::Memory, None).await.unwrap();
+        assert_eq!(count().await.unwrap(), 1, "never reviewed: every conclusion to review");
+        assert_eq!(conclusions_to_review_count(&store, None, Some("q")).await.unwrap(), 0);
+
+        let later = TimestampMs::now().as_millis_i64() + 1_000;
+        let found = synthesis_core(&store, in_project("p"), TimestampMs::from_unix_millis(later)).await.unwrap();
+        assert_eq!(count().await.unwrap(), 0, "the review turns the reminder off");
+        assert_eq!(found.to_review[0].conclusion.id, c, "and the conclusion stays on the list");
+
+        let b2 = seed(&store, Some("p"), "tabs in rust, spaces in tests", later + 5).await;
+        supersede(&store, b, b2, later + 5).await;
+        assert_eq!(count().await.unwrap(), 1, "a loss after the review counts again");
+    }
+
+    #[tokio::test]
+    async fn a_purged_source_counts_until_the_first_review() {
+        use crate::memory::store_lock::StoreHolder;
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+        let a = seed(&store, Some("p"), "tabs in go", 1).await;
+        conclude(&store, Some("p"), &[a], 2).await;
+        store.conn.clone().close().await.unwrap();
+        drop(store);
+        crate::memory::secrets::purge(dir.path(), a).unwrap();
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        assert_eq!(conclusions_to_review_count(&store, None, Some("p")).await.unwrap(), 1);
+        synthesis_core(&store, in_project("p"), TimestampMs::from_unix_millis(10)).await.unwrap();
+        assert_eq!(
+            conclusions_to_review_count(&store, None, Some("p")).await.unwrap(),
+            0,
+            "nothing says when it was purged"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_review_list_is_capped_newest_first() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let gone = seed(&store, Some("p"), "gone", 1).await;
+        let mut made = Vec::new();
+        for i in 0..(REVIEW_LIMIT as i64 + 2) {
+            made.push(conclude(&store, Some("p"), &[gone], 2 + i).await);
+        }
+        delete_memory_core(&store, gone, MemoryKind::Memory, None).await.unwrap();
+
+        let found = synthesis_core(&store, in_project("p"), TimestampMs::from_unix_millis(100)).await.unwrap();
+
+        assert_eq!(found.to_review_total, made.len());
+        let listed: Vec<i64> = found.to_review.iter().map(|r| r.conclusion.id).collect();
+        let newest: Vec<i64> = made.iter().rev().take(REVIEW_LIMIT as usize).copied().collect();
+        assert_eq!(listed, newest);
+    }
+
+    #[tokio::test]
+    async fn another_agents_conclusion_is_not_to_review() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let theirs = seed_as(&store, "b", Some("p"), "their memory", 1).await;
+        let conclusion = seed_as(&store, "b", Some("p"), "their conclusion", 2).await;
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO memory_derivation (memory_id, source_id, created_at) VALUES (?1, ?2, 0)",
+                    [conclusion, theirs],
+                )
+            })
+            .await
+            .unwrap();
+        delete_memory_core(&store, theirs, MemoryKind::Memory, None).await.unwrap();
+        let as_a = SynthesisParams { agent_id: Some("a".into()), ..in_project("p") };
+
+        let found = synthesis_core(&store, as_a, TimestampMs::from_unix_millis(10)).await.unwrap();
+
+        assert!(found.to_review.is_empty());
+        assert_eq!(found.to_review_total, 0);
     }
 
     #[tokio::test]
