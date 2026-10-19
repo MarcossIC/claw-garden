@@ -27,9 +27,9 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 
 ## 5. Verificación
 
-- [ ] Suite y clippy en Linux sobre el último commit.
-- [ ] Con dos cuentas en Linux: la otra no lista el directorio, no lee `memory.db` y no abre `memory.lock`; antes del cambio sí.
-- [ ] `verify.md`.
+- [x] Suite y clippy en Linux sobre el último commit.
+- [x] Con dos cuentas en Linux: la otra no lista el directorio, no lee `memory.db` y no abre `memory.lock`; antes del cambio sí.
+- [x] `verify.md`.
 
 ## 6. Archive
 
