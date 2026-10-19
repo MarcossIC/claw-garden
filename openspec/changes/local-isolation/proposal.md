@@ -43,7 +43,7 @@ Cerradas con el usuario; el porqué está en el [diseño](design.md).
 
 ## Alcance
 
-1. `ensure_private_dir` en `crates/clawg-core/src/paths.rs`, con la decisión del modo pura.
+1. `ensure_private_dir` en `crates/clawg-core/src/private_dir.rs`, con la decisión del modo pura.
 2. Los trece lugares de la tabla lo usan; `MemoryStore::open` deja de ignorar el error.
 3. `clawg setup` aprieta también el directorio de datos antes de copiar, porque puede ser lo primero que corre sobre una instalación anterior.
 4. Requisitos en `specs/daemon-access`: uno nuevo (el directorio de datos es privado en Unix) y R5 pasa a remitir a él; el párrafo `Límite` dice que el directorio frena a otro usuario.
@@ -61,7 +61,7 @@ Cerradas con el usuario; el porqué está en el [diseño](design.md).
 
 Tests que fallan hoy (ver [spec](spec.md)), en Linux:
 
-- `ensure_private_dir` crea anidados en 0700 con `umask` 022, aprieta uno 0755 a 0700 y deja uno 0700 como está (`paths.rs`).
+- `ensure_private_dir` crea anidados en 0700 con `umask` 022, aprieta uno 0755 a 0700 y deja uno 0700 como está (`private_dir.rs`).
 - Cada lugar que crea un directorio lo deja 0700: `sharing::save`, `snapshot_into`, `restore`, `MemoryStore::open`, `UpdateLock::acquire`, las copias de `setup`, `workspace.md` y la descarga del modelo.
 - Con el binario real (`tests/binary.rs`): un puente que autoarranca el daemon en un home vacío deja el directorio de datos y `logs/` en 0700; un directorio 0755 con un store poblado queda 0700 tras arrancar el daemon y el store devuelve las mismas filas.
 

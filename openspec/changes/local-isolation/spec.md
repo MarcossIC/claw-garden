@@ -6,7 +6,7 @@ Modifica [`specs/daemon-access`](../../specs/daemon-access/spec.md): agrega R6 (
 
 - **Directorio de datos:** `<home>/.clawg` o `<home>/.clawg-dev` (`data_dir_in`, `crates/clawg-core/src/paths.rs:159`).
 - **Modo privado:** en Unix, un directorio sin ningún bit de grupo ni de otros (`modo & 0o077 == 0`). Uno nuevo nace 0700.
-- **Ayudante:** `ensure_private_dir(dir)` en `crates/clawg-core/src/paths.rs`.
+- **Ayudante:** `ensure_private_dir(dir)` en `crates/clawg-core/src/private_dir.rs`.
 
 ## Límite (modifica el de `specs/daemon-access`)
 
@@ -38,7 +38,7 @@ Todo lugar de clawg que crea el directorio de datos o un subdirectorio suyo MUST
 - WHEN se llama al ayudante sobre él
 - THEN el directorio es 0700, y el archivo y el padre conservan su modo
 
-**Tests:** `a_missing_directory_and_its_parents_are_created_private`, `an_open_directory_is_tightened_and_the_rest_left_alone`, `a_private_directory_is_left_as_it_is`, `only_group_and_other_bits_are_taken` (`paths.rs`, Unix); `save_creates_a_private_data_directory` (`sharing.rs`), `a_snapshot_directory_is_created_private` (`backup.rs`), `restore_creates_a_private_data_directory` (`backup.rs`), `opening_a_store_makes_its_directory_private` (`db.rs`), `the_update_lock_makes_the_data_directory_private` (`update/lock.rs`), `setup_copies_go_in_a_private_directory` (`setup.rs`), `workspace_directories_are_created_private` (`workspace.rs`), `the_model_cache_is_created_private` (`model_download.rs`); `a_bridge_on_a_fresh_home_leaves_a_private_data_directory`, `an_open_data_directory_is_tightened_and_keeps_its_rows` (`tests/binary.rs`, Unix).
+**Tests:** `a_missing_directory_and_its_parents_are_created_private`, `an_open_directory_is_tightened_and_the_rest_left_alone`, `a_private_directory_is_left_as_it_is`, `only_group_and_other_bits_are_taken` (`private_dir.rs`, Unix); `save_creates_a_private_data_directory` (`sharing.rs`), `a_snapshot_directory_is_created_private` (`backup.rs`), `restore_creates_a_private_data_directory` (`backup.rs`), `opening_a_store_makes_its_directory_private` (`db.rs`), `the_update_lock_makes_the_data_directory_private` (`update/lock.rs`), `setup_copies_go_in_a_private_directory` (`setup.rs`), `workspace_directories_are_created_private` (`workspace.rs`), `the_model_cache_is_created_private` (`model_download.rs`); `a_bridge_on_a_fresh_home_leaves_a_private_data_directory`, `an_open_data_directory_is_tightened_and_keeps_its_rows` (`tests/binary.rs`, Unix).
 
 ## R5. El token y `daemon.json` nacen restringidos (Unix) (modifica R5)
 

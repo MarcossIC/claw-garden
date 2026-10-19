@@ -26,7 +26,7 @@ No poder **crear** el directorio sí es un error, como hoy. `MemoryStore::open` 
 
 ## D4. Dónde vive y quién lo llama
 
-En `crates/clawg-core/src/paths.rs`, junto a `data_dir_in`: lo usan los dos crates y ya es el módulo de las rutas. Sin dependencia nueva (`std::os::unix::fs::{DirBuilderExt, PermissionsExt}`). Es síncrono; `workspace.rs` lo llama desde código `async` como ya lo hace `db.rs` con `create_dir_all`: crear un directorio no bloquea lo que importe.
+En un módulo propio, `crates/clawg-core/src/private_dir.rs`: lo usan los dos crates, y `paths.rs` no puede llevarlo porque se declara dependiente sólo de `std`, `dirs` y `thiserror` (`paths.rs:4-7`) y el ayudante registra con `log`. Sin dependencia nueva (`std::os::unix::fs::{DirBuilderExt, PermissionsExt}`). Es síncrono; `workspace.rs` lo llama desde código `async` como ya lo hace `db.rs` con `create_dir_all`: crear un directorio no bloquea lo que importe.
 
 `setup` es el único lugar que lo llama dos veces (el de datos y `backups/setup/`): puede ser lo primero que corre en una instalación anterior sin que arranque un daemon. En el resto, el directorio de datos ya pasó por el ayudante en el mismo proceso antes de crear el subdirectorio (el daemon al abrir el store; el puente en `start_daemon`; `update` en su candado).
 

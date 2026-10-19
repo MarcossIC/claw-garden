@@ -4,8 +4,8 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 
 ## 1. El ayudante (R6, D2, D3)
 
-- [ ] Tests primero (Unix): `a_missing_directory_and_its_parents_are_created_private`, `an_open_directory_is_tightened_and_the_rest_left_alone`, `a_private_directory_is_left_as_it_is`, `only_group_and_other_bits_are_taken`.
-- [ ] `ensure_private_dir` y `tightened` en `paths.rs`.
+- [x] Tests primero (Unix): `a_missing_directory_and_its_parents_are_created_private`, `an_open_directory_is_tightened_and_the_rest_left_alone`, `a_private_directory_is_left_as_it_is`, `only_group_and_other_bits_are_taken`.
+- [x] `ensure_private_dir` y `tightened` en `private_dir.rs`.
 - Commit: `feat(core): add a helper that keeps a directory private to its owner`
 
 ## 2. Los lugares de `clawg-core` (R6, D3)
