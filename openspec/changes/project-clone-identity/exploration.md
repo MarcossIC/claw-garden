@@ -14,6 +14,7 @@
 | Dos worktrees del mismo repo son proyectos distintos | **Falso para el caso común.** Un worktree vinculado tiene un archivo `.git` con `gitdir:`; el resolutor lee `<gitdir>/commondir` y devuelve la carpeta del repo principal (`identity.rs:55-68`, `:87-96`). Ya hay test con un worktree armado a mano (`crates/clawg-core/tests/project_root.rs:38-50`) y spec (`specs/project` R1). El comando `git rev-parse --git-common-dir` en este repo devuelve `.git`, que es el mismo dato que `commondir` expresa. |
 | Dos clones del mismo repo son proyectos distintos | **Cierto.** El resolutor no mira remotos ni `.git/config`: `identity.rs` entero no contiene la palabra `origin` ni lee configuración. El código de producción no llama a `git` ni usa `git2`/`gix` (sólo `rag-eval` ejecuta `git`, `crates/clawg-eval/src/bin/rag-eval/report.rs:565`). |
 | Los worktrees de un repo bare o con `--separate-git-dir` | **Hueco real, chico.** Si el directorio común no se llama `.git`, el worktree queda como su propia raíz (`identity.rs:92-95`; test `a_worktree_of_a_bare_repository_is_its_own_root`, `identity.rs:261-267`). Es una decisión explícita, porque no hay árbol de trabajo principal al que apuntar. |
+| Unir dos ids con `register_project` es mover filas y nada más | **Falso.** El guard de `project.rs:105-115` salta los ids legados que pertenecen a otra raíz registrada; para el resto inserta en `project_rekey` y corre `UPDATE {table} SET project_id = ?2 WHERE project_id = ?1` (`project.rs:116-129`). No reconcilia `content_hash` repetidos ni `topic_key` vivos repetidos en el scope (agente, proyecto) que resulta, y no llama a `revise_in` (`topic.rs:111`). El re-key es un escritor de `memory` fuera del worker de ingesta, cuya serialización es lo que mantiene esas dos invariantes. |
 | Un submódulo | Es su propio proyecto, a propósito (`identity.rs:70-79`; `project_root.rs:53-63`). No se toca. |
 
 ## Problema (verificado contra el código)
@@ -45,6 +46,15 @@ Dos hallazgos que condicionan el diseño:
 
 1. **El índice de documentos y `synthesis_review` no siguen un re-key.** Hoy no hace falta (el id nuevo se registra y se reindexa desde cero), pero con ids que cambian dejan huérfanos: el índice viejo ocupa espacio y vive en los backups. El índice es derivado (`V12__project_docs.sql:1-5`), así que lo correcto es borrarlo y reconstruirlo, no moverlo.
 2. **`register_project` trata «mismo id, otra raíz» como colisión** (`project.rs:83-87`). Con identidad por remoto, dos clones **deben** compartir id y tener raíces distintas. La tabla `project` es `PRIMARY KEY (id)`: una sola `root_path` por id. Hay que separar «el id» de «las raíces donde vive» o el segundo clone daría 409.
+
+### Unir dos scopes sin reconciliar
+
+La operación que esta exploración llama «unir dos ids» (el re-key, `merge`) deja, en el scope unido:
+
+- **Dos versiones vigentes de un tema.** Dos ids legados con filas del mismo agente y el mismo `topic_key` quedan ambas vivas. La próxima escritura de esa clave la arregla (`revise_in` reemplaza todo lo vivo del scope), pero hasta entonces el agente lee las dos.
+- **Dos filas vivas con el mismo texto.** Mismo `content_hash` en el mismo (agente, proyecto): el dedup las refuerza al guardar, pero el re-key no pasa por ahí, y ninguna escritura posterior las junta.
+
+Forma del arreglo, dentro de la transacción del re-key: aplicar la regla de `revise_in` a cada clave duplicada (gana la más nueva, causa `revision`) y marcar los duplicados exactos como refuerzo de la fila más vieja. Esos cambios hay que registrarlos para que el re-key siga siendo reversible: hoy `project_rekey` sólo anota movimientos de `project_id`, así que un `status` o `superseded_by` cambiado no se deshace con el SQL de `V9__project.sql:12-16`. Un ayudante «buscar el gemelo vivo dentro de la transacción que escribe» puede compartirse con un arreglo previsto en el insert del worker.
 
 ### Qué más depende de una sola raíz
 
@@ -149,6 +159,12 @@ Une dos ids que el usuario sabe que son el mismo proyecto (clone sin remoto, rep
 
 Hay quien quiere memorias separadas por clone (por ejemplo, un clone de producción y otro de experimentos). Opciones: clave explícita C por clone (override) o un `clawg projects split`. C ya lo cubre, porque pone otra clave a ese clone.
 
+### Reconciliación al unir
+
+**Q1. Reconciliar dentro de la transacción del re-key (recomendado).** Ver «Unir dos scopes sin reconciliar»; el costo es registrar lo que cambia además del `project_id`.
+**Q2. Dejarlo al `doctor-checks` (31).** Detecta las dos invariantes después; no las arregla y el duplicado exacto nunca se corrige solo.
+**Q3. Rechazar la unión si hay claves o hashes repetidos.** Es seguro, pero bloquea justo el caso de dos clones con memorias parecidas, que es el motivo del cambio.
+
 ## Descartado
 
 - **Identidad por nombre del repo:** repos distintos con el mismo nombre (`app`, `api`, `web`) se fusionarían sin que nadie lo decida. La clave tiene que incluir host y dueño.
@@ -168,6 +184,7 @@ Hay quien quiere memorias separadas por clone (por ejemplo, un clone de producci
 4. El daemon reúne los ids viejos de una raíz (`R1`) y los pasa a `register_project`. Snapshot previo al primer re-key de una raíz.
 5. Limpieza del índice de documentos y de `synthesis_review` del id viejo (derivados o reconstruibles).
 6. `clawg projects merge <desde> <hasta>` y su deshacer; `clawg projects list` (compartido con 29).
+6b. Reconciliación en la transacción del re-key y de `merge` (Q1): `revise_in` por clave repetida, refuerzo de duplicados exactos y un registro de esos cambios que mantenga reversible el re-key.
 7. Override explícito (C) si se decide.
 8. Documentar en `CLAUDE.md` la identidad por remoto, la migración y el comando.
 
@@ -197,6 +214,7 @@ Son del usuario.
 - [ ] **Opt-out.** ¿Hay clave explícita por clone, o basta `merge`/ningún comando?
 - [ ] **Comando de unión.** Nombre y forma: `clawg projects merge`, y si lleva `--dry-run` que cuente filas sin mover nada.
 - [ ] **Repos sin remoto que luego lo ganan.** Al hacer `git remote add origin`, ¿el id pasa a la clave de remoto y se re-keya, o se queda en el de la ruta?
+- [ ] **Reconciliación al unir.** ¿Q1 (reconciliar en la transacción), Q2 (sólo detectar) o Q3 (rechazar)? Y dónde se registra lo que cambia para poder deshacerlo (una columna o tabla nueva junto a `project_rekey`).
 - [ ] **Snapshot.** ¿Un `Reason` nuevo (`PreRekey`) o reutilizar `Manual`?
 
 ## Cómo se mide
@@ -218,6 +236,8 @@ Tests RED primero:
 13. Clones con ramas distintas (si I1): `search_project` sirve los documentos del checkout activo.
 14. No se promete que el binario anterior abra la base nueva: una base de una versión posterior se rechaza intacta (`CLAUDE.md`, perfiles de datos). El test confirma que ese rechazo sigue en pie con la migración nueva.
 
+15. **Reconciliar al unir:** dos ids legados con el mismo `topic_key` y el mismo texto; tras registrar, hay un save vivo por clave y una fila viva por `content_hash` en el scope. Hoy fallan ambas. El deshacer devuelve cada fila a su id y a su estado anterior.
+
 `rag-eval --diff`: no es requisito para identidad. Sí conviene correr `rag-eval --real` una vez si el re-key toca el conjunto dorado, para confirmar que no cambia ninguna métrica (el golden usa un proyecto fijo).
 
 ## Riesgos
@@ -226,6 +246,7 @@ Tests RED primero:
 - **Poda de snapshots (`PreRekey`):** un `Reason` automático nuevo comparte el presupuesto `AUTO_KEEP = 5` con `pre-migration` y los demás (`is_automatic` es «todo menos `Manual`», `crates/clawg-core/src/memory/backup.rs:143-145`; `to_prune` conserva los 5 más nuevos de todas las razones juntas, `backup.rs:227-243`). Cada re-key sube la chance de que se pode el snapshot `pre-migration` que protege la migración de esquema de este mismo cambio. La mejora pendiente del backlog (conservar el más nuevo de cada razón) debe aterrizar **antes** de este cambio, o `PreRekey` va fuera de la poda automática.
 - **Fusión no deseada:** dos clones con contenidos de memoria que el usuario quería separados quedan juntos, y separarlos fila a fila no tiene herramienta. Mitiga C y que el primer re-key sea visible (log, `clawg projects list`).
 - **Un id que cambia con el remoto:** cambiar el `origin` mueve la identidad. Sin R1 queda huérfana la memoria vieja.
+- **Re-key que deja duplicados:** sin reconciliar, dos versiones vigentes de un tema (la próxima escritura de la clave las arregla) o dos filas vivas idénticas (nunca se arreglan). Mitiga Q1 y el test 15. El mismo defecto lo tendría `merge`.
 - **Credenciales en la URL:** la normalización tiene que descartarlas antes de guardar o hashear. Test 1.
 - **Remotos que no son servidores** (rutas, `file://`, espejos locales): dos clones darían claves distintas o iguales por azar; se descartan.
 - **Índice de documentos:** con I2, documentos de la rama equivocada; con I1, un segundo id y más código en el puente.
