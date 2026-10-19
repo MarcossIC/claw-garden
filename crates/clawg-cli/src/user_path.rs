@@ -121,6 +121,8 @@ pub mod registry {
                 format!("the user PATH has registry type {:?}, not a string; leaving it alone", raw.vtype),
             ));
         }
+        // A byte left after the last whole unit is half a unit, which no
+        // reader takes for text, so dropping it rewrites what every reader sees.
         let units: Vec<u16> = raw
             .bytes
             .chunks_exact(2)
@@ -262,7 +264,10 @@ mod tests {
             }
 
             fn set(&self, value: &str, vtype: RegType) {
-                let bytes = value.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+                self.set_bytes(value.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect(), vtype);
+            }
+
+            fn set_bytes(&self, bytes: Vec<u8>, vtype: RegType) {
                 let key = RegKey::predef(HKEY_CURRENT_USER)
                     .open_subkey_with_flags(&self.0, winreg::enums::KEY_SET_VALUE)
                     .expect("open for write");
@@ -315,6 +320,22 @@ mod tests {
             assert_eq!(scratch.get(), (r"%USERPROFILE%\bin;C:\tools".to_string(), REG_EXPAND_SZ));
 
             assert_eq!(remove(&scratch.0, DIR).expect("remove again"), Change::NotPresent);
+        }
+
+        /// The registry hands such a byte back as 0 (seen on Windows 11), and
+        /// a UTF-16 reader counts whole units anyway: refusing the value would
+        /// only keep `clawg path add` from a PATH every program reads.
+        #[test]
+        fn a_byte_left_after_the_last_unit_is_not_part_of_the_value() {
+            for tail in [&[b'x'][..], &[0][..], &[0, 0, 0][..]] {
+                let scratch = ScratchKey::new("odd");
+                let mut bytes: Vec<u8> = r"C:\tools".encode_utf16().flat_map(u16::to_le_bytes).collect();
+                bytes.extend_from_slice(tail);
+                scratch.set_bytes(bytes, REG_EXPAND_SZ);
+
+                assert_eq!(add(&scratch.0, DIR).expect("add"), Change::Added, "{tail:?}");
+                assert_eq!(scratch.get(), (format!(r"C:\tools;{DIR}"), REG_EXPAND_SZ), "{tail:?}");
+            }
         }
 
         #[test]
