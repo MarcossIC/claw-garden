@@ -989,7 +989,7 @@ async fn fetch_active_conflicts(
                         new_mark: side(8)?,
                     })
                 })?
-                .filter_map(|r| r.ok())
+                .filter_map(|r| r.map_err(|e| log::warn!("fetch_active_conflicts: a pair did not read: {e}")).ok())
                 .collect();
             Ok(pairs)
         })

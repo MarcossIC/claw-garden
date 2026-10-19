@@ -262,12 +262,12 @@ async fn fetch_auto_rows(
                    AND status <> 'superseded'
                  ORDER BY importance DESC",
             )?;
-            let user_prefs: Vec<MemoryLine> = stmt
-                .query_map(rusqlite::params![agent], |row| {
+            let user_prefs: Vec<MemoryLine> = readable(
+                stmt.query_map(rusqlite::params![agent], |row| {
                     Ok(MemoryLine { id: row.get(0)?, content: row.get(1)? })
-                })?
-                .filter_map(|r| r.ok())
-                .collect();
+                })?,
+                "user_preference",
+            );
 
             // Query 2: architectural_decision rows, scoped to project when provided,
             // otherwise all architectural decisions for the agent. importance >= 8.
@@ -290,12 +290,12 @@ async fn fetch_auto_rows(
                        AND status <> 'superseded'
                      ORDER BY importance DESC",
                 )?;
-                let rows: Vec<MemoryLine> = stmt2
-                    .query_map(rusqlite::params![agent, pid], |row| {
+                let rows: Vec<MemoryLine> = readable(
+                    stmt2.query_map(rusqlite::params![agent, pid], |row| {
                         Ok(MemoryLine { id: row.get(0)?, content: row.get(1)? })
-                    })?
-                    .filter_map(|r| r.ok())
-                    .collect();
+                    })?,
+                    "architectural_decision",
+                );
                 rows
             } else {
                 let mut stmt2 = c.prepare(
@@ -308,12 +308,12 @@ async fn fetch_auto_rows(
                        AND status <> 'superseded'
                      ORDER BY importance DESC",
                 )?;
-                let rows: Vec<MemoryLine> = stmt2
-                    .query_map(rusqlite::params![agent], |row| {
+                let rows: Vec<MemoryLine> = readable(
+                    stmt2.query_map(rusqlite::params![agent], |row| {
                         Ok(MemoryLine { id: row.get(0)?, content: row.get(1)? })
-                    })?
-                    .filter_map(|r| r.ok())
-                    .collect();
+                    })?,
+                    "architectural_decision",
+                );
                 rows
             };
 
@@ -342,10 +342,8 @@ async fn fetch_auto_rows(
                      ORDER BY access_count DESC
                      LIMIT 5",
                 )?;
-                let rows: Vec<SkillLine> = stmt3
-                    .query_map(rusqlite::params![agent, pid], |row| map_skill(row))?
-                    .filter_map(|r| r.ok())
-                    .collect();
+                let rows: Vec<SkillLine> =
+                    readable(stmt3.query_map(rusqlite::params![agent, pid], |row| map_skill(row))?, "skill");
                 rows
             } else {
                 let mut stmt3 = c.prepare(
@@ -356,10 +354,8 @@ async fn fetch_auto_rows(
                      ORDER BY access_count DESC
                      LIMIT 5",
                 )?;
-                let rows: Vec<SkillLine> = stmt3
-                    .query_map(rusqlite::params![agent], |row| map_skill(row))?
-                    .filter_map(|r| r.ok())
-                    .collect();
+                let rows: Vec<SkillLine> =
+                    readable(stmt3.query_map(rusqlite::params![agent], |row| map_skill(row))?, "skill");
                 rows
             };
 
@@ -377,6 +373,13 @@ async fn fetch_auto_rows(
             }
             other => MemoryError::Backend(other.to_string()),
         })
+}
+
+/// The rows that read. One that does not is left out of its section rather
+/// than failing the whole file, and logged so the gap has a trace.
+fn readable<T>(rows: impl Iterator<Item = rusqlite::Result<T>>, section: &str) -> Vec<T> {
+    rows.filter_map(|r| r.map_err(|e| log::warn!("workspace: a {section} row did not read: {e}")).ok())
+        .collect()
 }
 
 /// Renders the AUTO section AND reports which rows ended up inside it.
