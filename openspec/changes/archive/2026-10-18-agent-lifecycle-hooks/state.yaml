@@ -1,0 +1,15 @@
+change: agent-lifecycle-hooks
+objective: "1, 5"
+depends_on: [memory-protocol, context-budget, conflict-candidates]
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # CI en Linux y Windows, Windows local y Claude Code sobre el perfil dev, sin CRITICAL; W2 corregido a medias, W3 al archivar, W1 abierto
+  archive: done
+updated: 2026-10-18
+main_spec: openspec/specs/hooks/spec.md, openspec/specs/retrieval/spec.md, openspec/specs/mcp/spec.md

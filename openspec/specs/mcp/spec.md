@@ -15,6 +15,7 @@ Fuente de verdad del comportamiento actual del puente `clawg mcp`: cómo abre un
 - [conflict-candidates](../../changes/archive/2026-10-18-conflict-candidates/proposal.md), archivado el 2026-10-18 (sólo «Los conflictos en las herramientas», el largo de la apertura, el hábito de juzgar las memorias cercanas y qué dice de una decisión la descripción de `memory_type`).
 - [topic-revisions](../../changes/archive/2026-10-18-topic-revisions/proposal.md), archivado el 2026-10-18 (sólo «La clave de tema en las herramientas» y lo que el protocolo completo dice de la clave).
 - [search-abstention](../../changes/archive/2026-10-18-search-abstention/proposal.md), archivado el 2026-10-18 (sólo los conteos de `searched` y la frase de abstención en «`recall_context` dice si buscó memorias»).
+- [agent-lifecycle-hooks](../../changes/archive/2026-10-18-agent-lifecycle-hooks/proposal.md), archivado el 2026-10-18 (sólo el estado `recent` en «`recall_context` dice si buscó memorias» y la `query` opcional de `POST /v1/context`).
 
 ## Definiciones
 
@@ -223,7 +224,7 @@ El texto de `ClientError::Unauthorized` de la CLI (`crates/clawg-cli/src/client.
 
 ## El presupuesto de `recall_context`
 
-`POST /v1/context` MUST aceptar `budget` opcional, en bytes del prompt (`ContextRequest`, `crates/clawg-cli/src/daemon/api.rs:371-380`; `check_budget`, `api.rs:310`, que el handler llama antes de armar nada, `api.rs:1096`):
+`POST /v1/context` MUST aceptar `budget` opcional, en bytes del prompt (`ContextRequest`, `crates/clawg-cli/src/daemon/api.rs:371-384`, donde `query` también es opcional y una en blanco vale como ausente: [`specs/retrieval`](../retrieval/spec.md), «El contexto sin consulta»; `check_budget`, `api.rs:310`, que el handler llama antes de armar nada, `api.rs:1096`):
 
 - ausente, MUST usar 8.000 (`DEFAULT_BUDGET`);
 - mayor que 24.000, MUST usar 24.000 (`MAX_BUDGET`);
@@ -249,13 +250,14 @@ El texto de `ClientError::Unauthorized` de la CLI (`crates/clawg-cli/src/client.
 `POST /v1/context` MUST responder `retrieval` con `state` (`ContextBody` y `RetrievalState`, `api.rs:584-620`), leído del mismo estado del embedder que usa `POST /v1/search` (`RetrievalState::of`, `api.rs:1133`):
 
 - `searched`, con `hits` y `withheld`: se buscó; `hits` son los que usó el prompt antes del presupuesto y `withheld` las filas de score 0 que dejó afuera ([`specs/retrieval`](../retrieval/spec.md), «`recall_context` deja afuera los ceros»);
+- `recent`, con `hits`: el contexto se pidió sin `query`, o con una en blanco, y no se buscó nada; `hits` son los saves de RECENT ([`specs/retrieval`](../retrieval/spec.md), «El contexto sin consulta»). Lo pide el hook de inicio de sesión, pero también lo recibe `recall_context` cuando el modelo manda una `query` en blanco, porque el puente la reenvía tal cual (`recall_context_impl`, `server.rs:774`);
 - `embedder_not_ready`: no hay embedder y el estado no es `failed` (el modelo carga), o `embed` contestó que el modelo no está listo;
 - `embedder_failed`, con `detail` y `retryable`: no hay embedder y el estado es `failed`;
 - `search_failed`, con `detail`: `embed` falló por otra causa, o falló la búsqueda.
 
-En los cuatro casos MUST seguir respondiendo `200` con el workspace. `Context` del cliente MUST leer `retrieval` con `#[serde(default)]`, un estado que no conoce como `Unknown`, y `searched` sin conteos (un daemon anterior) con `hits` y `withheld` en 0 (`client.rs:264-296`).
+En los cinco casos MUST seguir respondiendo `200` con el workspace. `Context` del cliente MUST leer `retrieval` con `#[serde(default)]`, un estado que no conoce como `Unknown`, y `searched` sin conteos (un daemon anterior) con `hits` y `withheld` en 0 (`client.rs:264-296`).
 
-`recall_context` (`format_recall`, `crates/clawg-cli/src/mcp/tools.rs:383`; la frase en `retrieval_notice`, `tools.rs:360`) MUST empezar con `Memories were not searched: <por qué>.` cuando `state` no es `searched`, haya workspace o no, seguido de que sólo se muestra el workspace (o de que está vacío) y de que eso no quiere decir que no haya memorias. Con `searched`, `hits = 0` y `withheld > 0`, MUST empezar con la frase de abstención de [`specs/retrieval`](../retrieval/spec.md) (`no relevant memories for this query: N searched, none close enough to show`, con `N` = `withheld`) seguida de `; the workspace and any active conflicts are shown below.` si hay prompt o de `; the workspace is empty.` si no lo hay (`tools.rs:362-365`): sin hits, ACTIVE CONFLICTS todavía puede mostrar un par que toca una fila del workspace ([`specs/retrieval`](../retrieval/spec.md)). Con el prompt vacío, cualquiera de las dos frases MUST reemplazar `no context yet`. Sin el campo (un daemon anterior), con `searched` sin conteos o con un estado desconocido (uno más nuevo), MUST NOT agregar ninguna frase. El aviso lo escribe el puente, fuera del prompt, así que `rag-eval` no lo mide.
+`recall_context` (`format_recall`, `crates/clawg-cli/src/mcp/tools.rs:383`; la frase en `retrieval_notice`, `tools.rs:360`) MUST empezar con `Memories were not searched: <por qué>.` cuando `state` no es `searched`, haya workspace o no, seguido de que sólo se muestra el workspace (o de que está vacío) y de que eso no quiere decir que no haya memorias. Con `searched`, `hits = 0` y `withheld > 0`, MUST empezar con la frase de abstención de [`specs/retrieval`](../retrieval/spec.md) (`no relevant memories for this query: N searched, none close enough to show`, con `N` = `withheld`) seguida de `; the workspace and any active conflicts are shown below.` si hay prompt o de `; the workspace is empty.` si no lo hay (`tools.rs:362-365`): sin hits, ACTIVE CONFLICTS todavía puede mostrar un par que toca una fila del workspace ([`specs/retrieval`](../retrieval/spec.md)). Con el prompt vacío, cualquiera de las dos frases MUST reemplazar `no context yet`. Sin el campo (un daemon anterior), con `searched` sin conteos o con un estado desconocido (uno más nuevo) o `recent`, MUST NOT agregar ninguna frase: `Context` lee `recent` como `Unknown` (`#[serde(other)]`, `client.rs:293-295`; `retrieval_notice`, `tools.rs:366`), así que una `query` en blanco recibe el contexto de RECENT sin aviso. El aviso lo escribe el puente, fuera del prompt, así que `rag-eval` no lo mide.
 
 #### Escenario: el modelo carga
 - GIVEN un daemon con el embedder en `loading` y un workspace con preferencias
@@ -266,11 +268,15 @@ En los cuatro casos MUST seguir respondiendo `200` con el workspace. `Context` d
 - GIVEN `retrieval` en `searched` con `hits: 0` y `withheld: 2`, y un workspace
 - THEN `recall_context` empieza con `no relevant memories for this query: 2 searched, none close enough to show; the workspace and any active conflicts are shown below.` y después viene el workspace; sin workspace, dice la frase terminada en `; the workspace is empty.`
 
+#### Escenario: una consulta en blanco
+- GIVEN una respuesta de `POST /v1/context` con `retrieval` en `recent`
+- THEN `recall_context` entrega el prompt sin ningún aviso de que no se buscó
+
 #### Escenario: un daemon anterior
 - GIVEN una respuesta de `POST /v1/context` sin `retrieval`, o con `searched` sin conteos, y con el prompt vacío
 - THEN `recall_context` dice `no context yet`, sin aviso
 
-**Tests:** `context_says_whether_memories_were_searched` (`crates/clawg-cli/tests/api.rs`, los cuatro estados) y `context_says_how_many_hits_it_withheld` (`crates/clawg-cli/tests/api.rs`); `a_context_without_retrieval_still_parses` y `a_searched_context_without_counts_still_parses` (`client.rs`); `recall_says_when_memories_were_not_searched`, `recall_says_when_nothing_was_relevant` y `an_old_daemon_gets_no_invented_notice`, con `searched` sin conteos (`tools.rs`); `the_retrieval_outcome_names_each_silence` (`crates/clawg-core/src/memory/prompt_builder.rs`).
+**Tests:** `context_says_whether_memories_were_searched` (`crates/clawg-cli/tests/api.rs`, los cuatro estados) y `context_says_how_many_hits_it_withheld` (`crates/clawg-cli/tests/api.rs`); `a_context_without_retrieval_still_parses` y `a_searched_context_without_counts_still_parses` (`client.rs`); `recall_says_when_memories_were_not_searched`, `recall_says_when_nothing_was_relevant` y `an_old_daemon_gets_no_invented_notice`, con `searched` sin conteos (`tools.rs`); `the_retrieval_outcome_names_each_silence` (`crates/clawg-core/src/memory/prompt_builder.rs`). Ningún test pasa `recent` por el puente: lo cubre que un estado desconocido no avise (`an_old_daemon_gets_no_invented_notice`, `tools.rs:985`), porque `recent` se lee como `Unknown`.
 
 ## Lo compartido en las herramientas
 

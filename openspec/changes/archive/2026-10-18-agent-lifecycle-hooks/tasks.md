@@ -33,5 +33,6 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 ## 6. Verificación
 
 - [x] Suite y clippy en Linux sobre el último commit.
-- [ ] El CI en verde en Linux y Windows.
-- [ ] Con Claude Code sobre el perfil dev, con la configuración manual: el inicio de sesión trae el contexto, `/compact` lo vuelve a traer con la línea de compactación, y el recordatorio sale después de 30 minutos sin guardar.
+- [x] El CI en verde en Linux y Windows.
+- [x] Con Claude Code sobre el perfil dev, con la configuración manual: el inicio de sesión trae el contexto, `/compact` lo vuelve a traer con la línea de compactación, y el recordatorio sale después de 30 minutos sin guardar.
+- [x] Lo que encontró la verificación: el pozo de RECENT deja la apertura de un save que corta (W2, `b365f78`, con `a_long_save_the_row_pool_cuts_is_still_shown_by_its_opening` primero) y dos comentarios desfasados (S6, `20d69bc`). Ver el [verify](verify.md).

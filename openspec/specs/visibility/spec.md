@@ -24,6 +24,8 @@ El agente del puente MUST ser, en este orden:
 
 `--agent` con un valor vacío o sólo espacios MUST rechazarse al parsear la línea de comandos.
 
+El `--agent` de `clawg hook` MUST ser el del puente, para que el hook lea al mismo agente que guarda ([`specs/hooks`](../hooks/spec.md), R2).
+
 #### Escenario: el cliente no se identifica
 - GIVEN filas guardadas con `agent_id = "claude-code"` y un puente lanzado con `--agent claude-code`
 - WHEN el cliente no manda `clientInfo`

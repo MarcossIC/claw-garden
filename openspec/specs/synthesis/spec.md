@@ -128,6 +128,8 @@ No hay filtro de texto: la síntesis le da al modelo lo que no revisó, no un bu
 
 `POST /v1/context` MUST devolver `unreviewed`: cuántas memorias sin revisar tiene el alcance pedido, para el agente del pedido. `recall_context` MUST agregar al final del contexto una línea que nombra `synthesize` y la cantidad cuando `unreviewed` es 20 o más, y no agregar nada debajo de eso. La línea MUST NOT ir dentro del prompt que arma `build_memory_prompt`, para que `rag-eval --agent-view` no cambie. Un contexto vacío (`no context yet`) lleva la línea igual.
 
+La misma línea llega al inicio de la sesión por el hook `session-start` ([`specs/hooks`](../hooks/spec.md), R4).
+
 Las instrucciones del servidor MCP MUST nombrar `synthesize`.
 
 #### Escenario

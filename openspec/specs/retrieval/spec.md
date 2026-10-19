@@ -14,6 +14,7 @@ Fuente de verdad del comportamiento actual de la recuperación: el corte relativ
 - [memory-protocol](../../changes/archive/2026-10-17-memory-protocol/proposal.md), archivado el 2026-10-17 (sólo el texto en inglés de "Una NOTE por bloque de conflictos" y de la línea de omitidos en "Orden y tope de los conflictos").
 - [conflict-candidates](../../changes/archive/2026-10-18-conflict-candidates/proposal.md), archivado el 2026-10-18 (sólo el texto de "Una NOTE por bloque de conflictos" y qué es un "Par de conflicto").
 - [search-abstention](../../changes/archive/2026-10-18-search-abstention/proposal.md), archivado el 2026-10-18 (sólo la fila de score 0 y la frase de abstención en "Definiciones", y lo que cambian en el corte relativo, en "Corte relativo en `POST /v1/search`", en "`recall_context` deja afuera los ceros", en "Cliente HTTP y herramienta `search_memory`", en el parser de `rag-eval --agent-view`, en "Medición del contexto", en "Invariantes" y en "Fuera de esta spec").
+- [agent-lifecycle-hooks](../../changes/archive/2026-10-18-agent-lifecycle-hooks/proposal.md), archivado el 2026-10-18 (sólo «El contexto sin consulta», R1 de esa spec; sus R2 a R5 viven en [`specs/hooks`](../hooks/spec.md)).
 
 ## Definiciones
 
@@ -404,6 +405,32 @@ El workspace entregado al modelo (`workspace_for_prompt`, `prompt_builder.rs:631
 
 **Test:** `workspace_in_prompt_has_no_markers_or_empty_headings`, `workspace_user_section_content_is_kept_without_markers` y `workspace_file_bytes_are_unchanged_by_rendering_the_prompt` en `prompt_builder.rs`; el archivo plano, `embedder_none_emits_workspace_only_if_present`.
 
+## El contexto sin consulta
+
+Un `POST /v1/context` sin `query`, o con una que sólo tiene espacios, MUST NOT embeber ni buscar, así que no necesita el modelo (`ContextRequest.query` es opcional, `crates/clawg-cli/src/daemon/api.rs:371-376`; el handler decide con `filter(|q| !q.trim().is_empty())`, `api.rs:1117`, y llama a `build_session_prompt`, `crates/clawg-core/src/memory/prompt_builder.rs:268`). Es el contexto con el que empieza una sesión, cuando todavía no hay una pregunta. Su prompt MUST llevar el workspace y, bajo RECENT, las filas vivas (`active` o `disputed`, sin `deleted_at`) del agente que pide, creadas en los últimos siete días, con el predicado de proyecto de la búsqueda: las del proyecto pedido, las que no tienen proyecto y las `user_preference` de cualquier proyecto (`RECENT_ROWS_SQL`, `prompt_builder.rs:660-670`, el mismo predicado que `crates/clawg-core/src/memory/search.rs:212`). Quedan afuera las filas que el workspace ya imprimió (`EmittedIds`). Va de la más nueva a la más vieja (`created_at DESC, id ASC`), hasta `K_FINAL` saves (diez, `prompt_builder.rs:45`), una línea por save.
+
+Cada save largo MUST contarse una vez, por su pedazo de menor posición, que es el que nombra el tema (`one_row_per_save`, `prompt_builder.rs:709`). Como los pedazos son filas de `memory`, la consulta trae como mucho `RECENT_ROW_POOL` (200, `prompt_builder.rs:671`) filas y las junta después. Los pedazos de un save comparten `created_at` y se insertan en orden, así que `id ASC` dentro de un mismo instante hace que el corte del pool nunca deje a un save sin su apertura. No lleva LONG-TERM: sin consulta no hay nada que sea relevante, sólo nuevo. Los conflictos activos y el presupuesto MUST ser los de un contexto con consulta (`assemble`, `prompt_builder.rs:299`).
+
+`retrieval` MUST ser `{"state": "recent", "hits": N}`, con `N` los saves que usó el prompt (`Retrieval::Recent`, `prompt_builder.rs:282`; `RetrievalState::Recent`, `api.rs:604`). MUST NOT registrar accesos: esas filas se eligieron por ser nuevas y no por ser relevantes, y contarlas en cada inicio de sesión promovería una fila por su edad (`build_session_prompt` no recibe un `AccessTracker`). Un contexto con consulta MUST NOT cambiar. Cómo lee el puente el estado `recent` está en [`specs/mcp`](../mcp/spec.md), y el hook que pide este contexto al iniciar la sesión, en [`specs/hooks`](../hooks/spec.md).
+
+Queda abierto que RECENT muestre menos de diez saves cuando los diez más nuevos suman más de 200 filas: el pool corta por filas y no por saves. Un arreglo posible es juntar los pedazos en SQL, por `memory_piece`, antes del `LIMIT` ([verify](../../changes/archive/2026-10-18-agent-lifecycle-hooks/verify.md#lo-que-encontró-la-verificación), W2).
+
+#### Escenario: la sesión empieza
+- GIVEN un agente con un save de ayer y otro de hace un mes en el proyecto, y un daemon sin embedder
+- WHEN pide el contexto sin consulta
+- THEN el prompt trae el de ayer bajo RECENT, no trae el de hace un mes, y `retrieval.state` es `recent`
+
+#### Escenario: un save largo
+- GIVEN un save de más de una pieza y el pool de 200 filas cortado dentro de sus pedazos
+- WHEN se pide el contexto sin consulta
+- THEN el save sale una vez, por su apertura
+
+#### Escenario: una consulta en blanco
+- GIVEN `recall_context` con `query` igual a `"   "`
+- THEN el daemon arma el contexto sin consulta, sin embeber y sin registrar accesos
+
+**Tests:** `a_context_without_a_query_lists_the_recent_saves_by_date`, `a_context_without_a_query_shows_a_long_save_once_by_its_opening`, `a_long_save_the_row_pool_cuts_is_still_shown_by_its_opening`, `a_context_without_a_query_reads_only_its_own_agent` y `a_context_without_a_query_skips_what_the_workspace_showed_and_the_dead` (`prompt_builder.rs`); `context_without_a_query_does_not_need_the_embedder` (`crates/clawg-cli/tests/api.rs`). Ningún test fija el tope de diez saves, que una consulta en blanco tome este camino, el predicado de proyecto con una `user_preference` de otro proyecto ni que no se registren accesos (esto último lo garantiza la firma de `build_session_prompt`).
+
 ## El prompt cumple el presupuesto
 
 `build_memory_prompt` recibe el presupuesto del contexto y arma el texto con `fit_to_budget` (`prompt_builder.rs:332`), una función pura sobre el workspace, los hits candidatos y los pares ya ordenados. Si el texto entero entra, MUST ser byte a byte el que se arma sin presupuesto. Si no entra, MUST quitar de a uno, midiendo otra vez el texto entero después de cada paso, primero los hits de LONG-TERM desde el último, después los de RECENT desde el último y después los pares de conflictos desde el último, hasta que entre. El texto MUST NOT superar el presupuesto salvo en el caso de [un workspace más grande que el presupuesto](#un-workspace-más-grande-que-el-presupuesto-se-entrega-y-se-dice).
@@ -513,6 +540,7 @@ Con un proyecto indexado ([`specs/project-docs`](../project-docs/spec.md)), `sea
 - El presupuesto no toca la búsqueda ni el ranking: corta lo que se imprime, después de `K_FINAL`, y la salida de `search_memory` es la misma.
 - Un prompt vacío se entrega como `no context yet` (`format_context`, `crates/clawg-cli/src/mcp/tools.rs:402`), salvo cuando las memorias no se buscaron, o se buscaron y todas las filas eran de score 0: entonces lo reemplaza el aviso de [`specs/mcp`](../mcp/spec.md) o la frase de abstención. Ese aviso va antes del prompt y el de `synthesize` después (`format_recall`, `tools.rs:383`), los dos fuera de lo que mide `rag-eval`.
 - Armar el prompt no escribe: `fetch_active_conflicts` es un `SELECT`, y el archivo del workspace no cambia.
+- Un contexto sin consulta tampoco registra accesos: `build_session_prompt` no recibe un `AccessTracker` (`prompt_builder.rs:268`), a diferencia de `build_memory_prompt`.
 
 ## Fuera de esta spec
 
