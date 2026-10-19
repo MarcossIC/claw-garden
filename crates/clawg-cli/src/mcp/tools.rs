@@ -18,7 +18,7 @@ use clawg_core::memory::sharing::{Reach, SharingError, SharingPolicy};
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
 
-use crate::client::{Context, Found, Health, Hit, MemoryRow, Restored, Retrieval, SavedText, Synthesis, Updated};
+use crate::client::{Context, Deleted, Found, Health, Hit, MemoryRow, Restored, Retrieval, SavedText, Synthesis, Updated};
 use crate::daemon::api::DocsSearchBody;
 use crate::relevance::{shown_hits, RELEVANCE_RATIO};
 
@@ -201,17 +201,64 @@ pub fn format_update(u: &Updated) -> String {
     format!("updated #{} {}: {fields}, tier {}", u.id, u.kind, u.tier)
 }
 
+/// What `delete_memory` tells the model. Deleting the current version of a
+/// topic brings back the one it replaced, which the model would not expect;
+/// a row a verdict replaced stays out of searches with it.
+pub fn format_delete(d: &Deleted) -> String {
+    let mut out = format!("deleted {}; restore_memory with the same id and kind undoes it", d.deleted);
+    if !d.revived.is_empty() {
+        let named: Vec<String> = d.revived.iter().map(|r| format!("#{} \"{}\"", r.id, r.excerpt)).collect();
+        out.push_str(&format!("\nthe version it had replaced is current again: {}", named.join(", ")));
+    }
+    if !d.hidden.is_empty() {
+        let named: Vec<String> = d.hidden.iter().map(|id| format!("#{id}")).collect();
+        out.push_str(&format!(
+            "\n{} stay superseded by it, as a resolve_conflict verdict left them, so searches leave them out",
+            named.join(", ")
+        ));
+    }
+    out
+}
+
 /// What `restore_memory` tells the model. A row that was superseded before it
-/// was deleted comes back superseded, and searching for it would find nothing.
+/// was deleted comes back superseded, and searching for it would find nothing;
+/// when the row that superseded it is deleted too, a verdict cannot keep it,
+/// since that row is not there to judge against.
 pub fn format_restore(r: &Restored) -> String {
-    match r.superseded_by {
+    let key = r.topic_key.as_deref().map(|k| format!(" topic={k}")).unwrap_or_default();
+    let mut out = match r.superseded_by {
+        Some(by) if r.status == "superseded" && r.superseded_by_deleted => format!(
+            "restored #{}{key}; it is still superseded by #{by}, which is deleted too, so searches leave it out \
+             until restore_memory brings #{by} back or the content is saved again",
+            r.id
+        ),
         Some(by) if r.status == "superseded" => format!(
-            "restored #{}; it is still superseded by #{by}, so searches leave it out until \
+            "restored #{}{key}; it is still superseded by #{by}, so searches leave it out until \
              resolve_conflict keeps it",
             r.id
         ),
-        _ => format!("restored #{}", r.id),
+        _ => format!("restored #{}{key}", r.id),
+    };
+    if !r.replaced.is_empty() {
+        let named: Vec<String> = r.replaced.iter().map(|m| format!("#{} \"{}\"", m.id, m.excerpt)).collect();
+        out.push_str(&format!("\nreplaces again the version its delete had brought back: {}", named.join(", ")));
     }
+    if !r.related.is_empty() {
+        let named: Vec<String> = r
+            .related
+            .iter()
+            .map(|m| {
+                let asks = if m.escalated { ", asks the user" } else { "" };
+                format!("#{} \"{}\"{asks}", m.id, m.excerpt)
+            })
+            .collect();
+        out.push_str(&format!(
+            "\nsaved while it was deleted, close to it: {}. If a newer one replaces it, call resolve_conflict \
+             with verdict supersedes (keep = the newer id); if both hold, compatible or scoped",
+            named.join("; ")
+        ));
+    }
+    out
 }
 
 /// Renders inventory rows as a compact one-line-per-row table.
@@ -483,6 +530,7 @@ mod tests {
     use super::*;
     use clawg_core::memory::outbox::{OutboxProblem, OutboxState, OutboxSummary};
     use clawg_core::memory::dispute::OpenPair;
+    use crate::client::{RelatedMemory, ReplacedMemory};
 
     fn hit(id: i64, kind: &str, memory_type: &str, tier: i64, score: f64, content: &str) -> Hit {
         Hit {
@@ -804,15 +852,61 @@ mod tests {
         assert_eq!(format_update(&skill), "updated #3 procedural: importance 2.0, tier 1");
     }
 
+    fn restored(id: i64, status: &str, superseded_by: Option<i64>) -> Restored {
+        Restored { id, status: status.into(), superseded_by, ..Restored::default() }
+    }
+
     #[test]
     fn format_restore_says_when_the_row_is_still_superseded() {
-        let active = Restored { id: 12, status: "active".into(), superseded_by: None };
-        assert_eq!(format_restore(&active), "restored #12");
-        let replaced = Restored { id: 12, status: "superseded".into(), superseded_by: Some(15) };
+        assert_eq!(format_restore(&restored(12, "active", None)), "restored #12");
         assert_eq!(
-            format_restore(&replaced),
+            format_restore(&restored(12, "superseded", Some(15))),
             "restored #12; it is still superseded by #15, so searches leave it out until \
              resolve_conflict keeps it"
+        );
+        let gone = Restored { superseded_by_deleted: true, ..restored(12, "superseded", Some(15)) };
+        assert_eq!(
+            format_restore(&gone),
+            "restored #12; it is still superseded by #15, which is deleted too, so searches leave it out \
+             until restore_memory brings #15 back or the content is saved again"
+        );
+    }
+
+    #[test]
+    fn format_restore_names_key_replacements_and_pairs() {
+        let r = Restored {
+            topic_key: Some("storage/engine".into()),
+            replaced: vec![ReplacedMemory { id: 4, excerpt: "Storage engine is SQLite".into() }],
+            related: vec![
+                RelatedMemory { id: 20, escalated: false, excerpt: "the store keeps one file".into() },
+                RelatedMemory { id: 21, escalated: true, excerpt: "storage engine is postgres".into() },
+            ],
+            ..restored(12, "active", None)
+        };
+        assert_eq!(
+            format_restore(&r),
+            "restored #12 topic=storage/engine\n\
+             replaces again the version its delete had brought back: #4 \"Storage engine is SQLite\"\n\
+             saved while it was deleted, close to it: #20 \"the store keeps one file\"; \
+             #21 \"storage engine is postgres\", asks the user. If a newer one replaces it, call \
+             resolve_conflict with verdict supersedes (keep = the newer id); if both hold, compatible or scoped"
+        );
+    }
+
+    #[test]
+    fn format_delete_names_what_came_back_and_what_stays_hidden() {
+        let plain = Deleted { deleted: 1, ..Deleted::default() };
+        assert_eq!(format_delete(&plain), "deleted 1; restore_memory with the same id and kind undoes it");
+        let both = Deleted {
+            deleted: 1,
+            revived: vec![ReplacedMemory { id: 4, excerpt: "Storage engine is SQLite".into() }],
+            hidden: vec![7, 8],
+        };
+        assert_eq!(
+            format_delete(&both),
+            "deleted 1; restore_memory with the same id and kind undoes it\n\
+             the version it had replaced is current again: #4 \"Storage engine is SQLite\"\n\
+             #7, #8 stay superseded by it, as a resolve_conflict verdict left them, so searches leave them out"
         );
     }
 

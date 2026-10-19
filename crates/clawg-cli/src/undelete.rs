@@ -7,13 +7,28 @@ use crate::client::{ClientError, DaemonClient, Restored};
 
 /// What `clawg undelete` prints for a restored row.
 pub fn report(r: &Restored) -> String {
-    match r.superseded_by {
-        Some(by) if r.status == "superseded" => format!(
-            "restored memory #{}; it is still superseded by #{by}, so searches leave it out",
+    let key = r.topic_key.as_deref().map(|k| format!(" (topic {k})")).unwrap_or_default();
+    let mut out = match r.superseded_by {
+        Some(by) if r.status == "superseded" && r.superseded_by_deleted => format!(
+            "restored memory #{}{key}; it is still superseded by #{by}, which is deleted too: \
+             `clawg undelete {by}` brings it back",
             r.id
         ),
-        _ => format!("restored memory #{}", r.id),
+        Some(by) if r.status == "superseded" => format!(
+            "restored memory #{}{key}; it is still superseded by #{by}, so searches leave it out",
+            r.id
+        ),
+        _ => format!("restored memory #{}{key}", r.id),
+    };
+    if !r.replaced.is_empty() {
+        let named: Vec<String> = r.replaced.iter().map(|m| format!("#{} \"{}\"", m.id, m.excerpt)).collect();
+        out.push_str(&format!("\nsuperseded again: {}", named.join(", ")));
     }
+    for m in &r.related {
+        let asks = if m.escalated { " (put to the user)" } else { "" };
+        out.push_str(&format!("\nclose to #{} \"{}\", saved while it was deleted{asks}", m.id, m.excerpt));
+    }
+    out
 }
 
 /// Restores the `memory` row `id`, unscoped: the user's own command reaches
@@ -26,14 +41,31 @@ pub async fn run(client: &DaemonClient, id: i64) -> Result<String, ClientError> 
 mod tests {
     use super::*;
     use crate::client::tests::{publish, save_and_wait, start_daemon};
-    use crate::client::ListArgs;
+    use crate::client::{ListArgs, RelatedMemory, ReplacedMemory};
 
     #[test]
     fn report_names_the_row_and_a_replacement() {
-        let active = Restored { id: 4, status: "active".into(), superseded_by: None };
+        let active = Restored { id: 4, status: "active".into(), ..Restored::default() };
         assert_eq!(report(&active), "restored memory #4");
-        let replaced = Restored { id: 4, status: "superseded".into(), superseded_by: Some(9) };
+        let replaced = Restored { id: 4, status: "superseded".into(), superseded_by: Some(9), ..Restored::default() };
         assert_eq!(report(&replaced), "restored memory #4; it is still superseded by #9, so searches leave it out");
+        let gone = Restored { superseded_by_deleted: true, ..replaced };
+        assert_eq!(
+            report(&gone),
+            "restored memory #4; it is still superseded by #9, which is deleted too: `clawg undelete 9` brings it back"
+        );
+        let full = Restored {
+            topic_key: Some("storage/engine".into()),
+            replaced: vec![ReplacedMemory { id: 2, excerpt: "Storage engine is SQLite".into() }],
+            related: vec![RelatedMemory { id: 7, escalated: true, excerpt: "storage engine is postgres".into() }],
+            ..active
+        };
+        assert_eq!(
+            report(&full),
+            "restored memory #4 (topic storage/engine)\n\
+             superseded again: #2 \"Storage engine is SQLite\"\n\
+             close to #7 \"storage engine is postgres\", saved while it was deleted (put to the user)"
+        );
     }
 
     #[tokio::test]

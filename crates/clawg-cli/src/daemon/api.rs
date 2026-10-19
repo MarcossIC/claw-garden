@@ -668,11 +668,64 @@ pub struct UpdatedBody {
     pub row: UpdatedRow,
 }
 
+/// What a delete did: deleting the current version of a topic brings back
+/// the one its revision replaced (`revived`); a row a verdict replaced stays
+/// superseded by the deleted row (`hidden`).
+#[derive(Debug, Serialize)]
+pub struct DeletedBody {
+    pub deleted: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub revived: Vec<ReplacedMemory>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hidden: Vec<i64>,
+}
+
+impl From<Deleted> for DeletedBody {
+    fn from(d: Deleted) -> Self {
+        Self {
+            deleted: d.deleted,
+            revived: d.revived.into_iter().map(|r| ReplacedMemory { kind: "memory", id: r.id, excerpt: r.excerpt }).collect(),
+            hidden: d.hidden,
+        }
+    }
+}
+
+/// How a restored row ended up, with the rows its delete had brought back
+/// and it supersedes again (`replaced`), and the rows saved while it was
+/// deleted that the detector paired with it (`related`).
 #[derive(Debug, Serialize)]
 pub struct RestoredBody {
     pub restored: usize,
-    #[serde(flatten)]
-    pub row: RestoredRow,
+    pub id: i64,
+    pub status: String,
+    pub superseded_by: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic_key: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub replaced: Vec<ReplacedMemory>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub superseded_by_deleted: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<RelatedMemory>,
+}
+
+impl From<RestoredRow> for RestoredBody {
+    fn from(r: RestoredRow) -> Self {
+        Self {
+            restored: 1,
+            id: r.id,
+            status: r.status,
+            superseded_by: r.superseded_by,
+            topic_key: r.topic_key,
+            replaced: r.replaced.into_iter().map(|r| ReplacedMemory { kind: "memory", id: r.id, excerpt: r.excerpt }).collect(),
+            superseded_by_deleted: r.superseded_by_deleted,
+            related: r
+                .related
+                .into_iter()
+                .map(|c| RelatedMemory { kind: "memory", id: c.id, escalated: c.escalated, excerpt: c.excerpt })
+                .collect(),
+        }
+    }
 }
 
 /// Closes the dispute between two `memory` rows. Disputes only ever pair
@@ -1259,7 +1312,7 @@ async fn delete_memory(
     State(app): State<Arc<AppCtx>>,
     Path((kind, id)): Path<(String, i64)>,
     Query(owner): Query<OwnerQuery>,
-) -> ApiResult<Json<Deleted>> {
+) -> ApiResult<Json<DeletedBody>> {
     let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
     let deleted = delete_memory_core(&app.runtime.store, id, kind, owner.agent.as_deref())
         .await
@@ -1268,7 +1321,7 @@ async fn delete_memory(
     if deleted.deleted == 0 {
         return Err(ApiError::not_found(format!("no {kind:?} row with id {id}")));
     }
-    Ok(Json(deleted))
+    Ok(Json(deleted.into()))
 }
 
 /// Brings back a deleted `memory` row, scoped like `DELETE`. The kind is
@@ -1285,7 +1338,7 @@ async fn restore_memory(
     }
     let embedder = ready_embedder(&app)?;
     match restore_memory_core(&app.runtime.store, embedder.as_ref(), kind, id, owner.agent.as_deref()).await {
-        Ok(row) => Ok(Json(RestoredBody { restored: 1, row })),
+        Ok(row) => Ok(Json(row.into())),
         Err(e @ RestoreError::OnlyMemory(_)) => Err(ApiError::bad_request(e.to_string())),
         Err(RestoreError::NotFound(_)) => Err(ApiError::not_found(format!("no deleted {kind:?} row with id {id}"))),
         Err(e @ (RestoreError::LiveTwin { .. } | RestoreError::TopicTaken { .. } | RestoreError::HoldsSecret { .. })) => {

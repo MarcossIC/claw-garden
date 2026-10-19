@@ -290,12 +290,10 @@ const DELETE_VEC_PROCEDURAL: &str = "DELETE FROM procedural_vectors WHERE rowid 
 /// What a delete did. Deleting the current version of a topic brings back the
 /// version its revision replaced (`revival.rs`); a row a verdict replaced
 /// stays superseded by the deleted one and is named in `hidden`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Deleted {
     pub deleted: usize,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub revived: Vec<Replaced>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub hidden: Vec<i64>,
 }
 
@@ -407,21 +405,17 @@ pub enum RestoreError {
 /// replaced: searches leave it out until a `resolve_conflict` verdict keeps
 /// it, or, when the row that replaced it is deleted too
 /// (`superseded_by_deleted`), until that row is restored.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RestoredRow {
     pub id: i64,
     pub status: String,
     pub superseded_by: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub topic_key: Option<String>,
     /// The rows its delete had brought back, superseded by it again.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub replaced: Vec<Replaced>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub superseded_by_deleted: bool,
     /// The rows saved while it was deleted that the detector found close to
     /// it, each now a pair for the agent to judge, the newer row first.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub related: Vec<Candidate>,
 }
 
