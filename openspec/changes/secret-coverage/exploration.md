@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 | M | — (conviene antes de 43 y 44; ver «Interacciones») | exploración (borrador) |
+| 1 | M | — (conviene antes de 43 y 44; ver «Interacciones») | exploración cerrada; decisiones en la [propuesta](proposal.md#decisiones) |
 
 **Tesis:** un secreto que llega a clawg se enmascara en todo lugar donde la regla puede verlo, y `clawg purge` saca un texto de todos los lugares donde clawg lo copió, y sólo ese texto. Hoy hay cuatro huecos verificados. El detector no conoce formatos frecuentes (claves de AWS, OpenRouter, Hugging Face, webhooks de Slack, claves PGP) porque sus patrones por contexto sólo se anclan en `password`. `purge` deja el texto en `workspace.md` y la cabecera de un save largo, y a la vez puede borrar saves aceptados de otros agentes, porque compara el outbox por subcadena. Y el `reason` de un veredicto se guarda sin enmascarar, en una columna que `clawg secrets` no mira. Y `purge` de la versión vigente de un tema deja las versiones anteriores escondidas para siempre, porque nadie las revive. Los cuatro rompen la promesa que el producto hace con los secretos, y una importación (44) los multiplica.
 
@@ -141,16 +141,16 @@ Resultado: **una** columna con texto libre del usuario o el agente que nunca se 
 
 ## Decisiones abiertas
 
-Son del usuario.
+Respondidas en la [propuesta](proposal.md#decisiones): `credential` aparte con el piso de 6 caracteres; D; G con H; M y N; `last_error` se enmascara siempre; sin P; se acepta que una regla nueva bloquee `undelete`.
 
-- [ ] **Claves del patrón `Credential`.** ¿Cuáles entran, y se mantiene el piso de 6 caracteres de `is_literal_secret`?
-- [ ] **Tipo.** ¿`credential` aparte (recomendado) o ampliar `password`?
-- [ ] **Workspace.** ¿D (nombrar), E (reescribir AUTO) o F (regenerar)?
-- [ ] **Outbox.** ¿G con H, o I con su migración?
-- [ ] **`reason` viejos.** ¿Sólo `scan` los lista (M), o hay un comando de limpieza (N)?
-- [ ] **`last_error`.** ¿Se verifica y, si cita contenido, se enmascara?
-- [ ] **Historial ya escondido.** O arregla lo que se purgue desde ahora. ¿Se agrega una pasada de mantenimiento (P) para los `superseded_by` que ya cuelgan, revive o reapunta, o los lista `doctor` (31) y se deja al usuario?
-- [ ] **Restauración de filas viejas.** ¿Se acepta que una regla nueva bloquee `undelete` de filas que antes volvían?
+- [x] **Claves del patrón `Credential`.** ¿Cuáles entran, y se mantiene el piso de 6 caracteres de `is_literal_secret`?
+- [x] **Tipo.** ¿`credential` aparte (recomendado) o ampliar `password`?
+- [x] **Workspace.** ¿D (nombrar), E (reescribir AUTO) o F (regenerar)?
+- [x] **Outbox.** ¿G con H, o I con su migración?
+- [x] **`reason` viejos.** ¿Sólo `scan` los lista (M), o hay un comando de limpieza (N)?
+- [x] **`last_error`.** ¿Se verifica y, si cita contenido, se enmascara?
+- [x] **Historial ya escondido.** O arregla lo que se purgue desde ahora. ¿Se agrega una pasada de mantenimiento (P) para los `superseded_by` que ya cuelgan, revive o reapunta, o los lista `doctor` (31) y se deja al usuario?
+- [x] **Restauración de filas viejas.** ¿Se acepta que una regla nueva bloquee `undelete` de filas que antes volvían?
 
 ## Cómo se mide
 
