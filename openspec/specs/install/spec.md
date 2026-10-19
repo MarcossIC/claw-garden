@@ -2,7 +2,7 @@
 
 Fuente de verdad de cómo la suite prueba el binario `clawg` mismo: el build de test y las dos variables que sólo él lee (el home de prueba y el embedder de prueba), la regla que las mantiene fuera del binario que se entrega, las pruebas que lanzan el binario como proceso hijo, y el CI. Nada de esto cambia el binario que se entrega. El directorio de datos, el lock y el outbox están en [`specs/storage`](../storage/spec.md); el puente y su reconexión, en [`specs/mcp`](../mcp/spec.md).
 
-**Origen:** [install-smoke](../../changes/archive/2026-10-16-install-smoke/proposal.md), archivado el 2026-10-16. [release-and-self-update](../../changes/archive/2026-10-18-release-and-self-update/proposal.md), archivado el 2026-10-18, reemplazó la sección «CI» (I1): el filtro de rutas del workflow y su relación con el release.
+**Origen:** [install-smoke](../../changes/archive/2026-10-16-install-smoke/proposal.md), archivado el 2026-10-16. [release-and-self-update](../../changes/archive/2026-10-18-release-and-self-update/proposal.md), archivado el 2026-10-18, reemplazó la sección «CI» (I1): el filtro de rutas del workflow y su relación con el release. [ci-hardening](../../changes/archive/2026-10-19-ci-hardening/proposal.md), archivado el 2026-10-19, la amplió (C1 a C6): `--locked`, la configuración de producción, acciones fijadas, el toolchain fijado y los workflows de avisos y del instalador.
 
 ## Definiciones
 
@@ -124,7 +124,14 @@ La suite MUST NOT terminar procesos por nombre: un `clawg` que corre el editor d
 
 ## CI
 
-La CI MUST correr en cada pull request y en cada push a `main` que cambie algún archivo fuera de `docs/**`, `openspec/**`, `.claude/**`, `.cursor/**`, `.gemini/**`, `scripts/**`, `README.md` y `AGENTS.md` (`.github/workflows/ci.yml:5-26`). Un push que sólo cambia esas rutas MUST NOT correr CI y, por lo tanto, MUST NOT disparar `release.yml` ([`specs/release`](../release/spec.md), R4). En `ubuntu-latest` y `windows-latest` (`ci.yml:41`) MUST correr el comando de `clippy` que hace fallar los warnings del compilador (`ci.yml:53`) y `cargo test --workspace` (`ci.yml:56`), con las pruebas del binario incluidas; las dos plataformas MUST correr hasta el final aunque una falle (`fail-fast: false`, `ci.yml:39`). El job no descarga el modelo: la suite usa `fake`. La CI es el único disparador de `release.yml`: un release MUST NOT publicarse sin una CI exitosa por push a `main`, y la CI MUST NOT leer secretos del environment `release`.
+La CI MUST correr en cada pull request y en cada push a `main` que cambie algún archivo fuera de `docs/**`, `openspec/**`, `.claude/**`, `.cursor/**`, `.gemini/**`, `scripts/**`, `README.md` y `AGENTS.md` (`.github/workflows/ci.yml:5-26`). Un push que sólo cambia esas rutas MUST NOT correr CI y, por lo tanto, MUST NOT disparar `release.yml` ([`specs/release`](../release/spec.md), R4). En `ubuntu-latest` y `windows-latest` (`ci.yml:41`) las dos plataformas MUST correr hasta el final aunque una falle (`fail-fast: false`, `ci.yml:39`), y cada una MUST correr, todos con `--locked`, así un `Cargo.lock` atrasado respecto de `Cargo.toml` la pone roja en vez de reescribirse (C1):
+
+- `cargo clippy --locked --workspace --all-targets -- -A clippy::all -D warnings` (`ci.yml:64`), que hace fallar los warnings del compilador;
+- `cargo test --locked --workspace` (`ci.yml:67`), con las pruebas del binario incluidas;
+- `cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings` (`ci.yml:70`): sin `--all-targets` no entran las dev-dependencies y, con ellas, tampoco `testing`; es lo que construye `release.yml`, mientras `--workspace` une `testing` y `eval`;
+- `cargo test --locked -p clawg-core --lib build_info` (`ci.yml:72`): las pruebas de `build_info` en su variante `cfg(not(feature = "testing"))`.
+
+El job no descarga el modelo: la suite usa `fake`. La CI es el único disparador de `release.yml`: un release MUST NOT publicarse sin una CI exitosa por push a `main`, y la CI MUST NOT leer secretos, usar un `environment`, pedir `id-token` ni escribir contenidos. Sólo `ci.yml` MUST llamarse `CI`: `release.yml` espera un workflow con ese nombre.
 
 La suite MUST pasar en Linux y en Windows. Para eso, las fixtures de los tests de `doctor` arman sus rutas bajo la raíz de la plataforma, `C:\` o `/` (`dir`, `crates/clawg-cli/src/doctor.rs:135`), y el caso de las grafías de Windows (mayúsculas, barras y `\\?\`) corre sólo en Windows (`windows_spellings_of_one_file_are_the_same_install`, `doctor.rs:219`).
 
@@ -133,11 +140,61 @@ La suite MUST pasar en Linux y en Windows. Para eso, las fixtures de los tests d
 - WHEN la CI termina en verde
 - THEN `release.yml` se dispara por ese `workflow_run`
 
+#### Escenario: lock atrasado
+- GIVEN un commit que sube la versión en `Cargo.toml` sin correr `cargo update --workspace`
+- WHEN corre la CI
+- THEN `clippy` falla porque el lock tendría que cambiar
+
+#### Escenario: un error que sólo existe sin `testing`
+- GIVEN un error de compilación dentro de un bloque `cfg(not(feature = "testing"))` de clawg-core
+- WHEN corre la CI de un PR
+- THEN el `clippy` de `-p clawg-cli` falla antes del merge
+
 #### Escenario: sólo documentación
 - GIVEN un push a `main` que sólo cambia `README.md` y `openspec/**`
 - WHEN GitHub evalúa los workflows
 - THEN no corre la CI ni `release.yml`
 
-**Prueba:** `the_ci_workflow_ignores_only_non_code_paths_and_runs_on_both_platforms` (convención sobre `ci.yml`); el comportamiento en GitHub, en el workflow, fuera de la suite.
+**Pruebas:** `the_ci_workflow_ignores_only_non_code_paths_and_runs_on_both_platforms`, `the_ci_workflow_checks_the_locked_production_build` y `only_the_ci_workflow_gates_the_release` (convenciones sobre los workflows, `crates/clawg-cli/tests/conventions.rs`); el comportamiento en GitHub, en el workflow, fuera de la suite.
 
-**Verificación:** el workflow quedó en verde en las dos plataformas en el PR #32, el que lo agrega, y la suite pasó en Linux y en Windows al archivar ([verify](../../changes/archive/2026-10-16-install-smoke/verify.md)).
+**Verificación:** el workflow quedó en verde en las dos plataformas en el PR #32, el que lo agrega, y la suite pasó en Linux y en Windows al archivar ([verify](../../changes/archive/2026-10-16-install-smoke/verify.md)). Los pasos de producción y `--locked`, en el PR de ci-hardening ([verify](../../changes/archive/2026-10-19-ci-hardening/verify.md)).
+
+### Acciones fijadas y caché (C2)
+
+Toda acción de terceros de todo workflow MUST estar fijada por un SHA completo de commit, con la etiqueta o rama que representa en un comentario al final de la línea. Todo `actions/checkout` MUST llevar `persist-credentials: false`, así el `GITHUB_TOKEN` no queda en `.git/config` mientras corre el build. `Swatinem/rust-cache` MUST llevar `save-if: ${{ github.ref == 'refs/heads/main' }}` (`ci.yml:58-60`): un PR lee la caché y sólo un push a `main` la escribe, así lo que el `build.rs` de un PR deja ahí no llega a una corrida de `main`. Efecto aceptado: el primer PR después de un cambio de dependencias compila de cero.
+
+**Pruebas:** `third_party_actions_are_pinned_to_a_commit`, `every_checkout_drops_the_token` y `the_ci_workflow_checks_the_locked_production_build`.
+
+### Toolchain fijado (C3)
+
+`rust-toolchain.toml` MUST fijar `channel` a una versión exacta `X.Y.Z` (hoy 1.99.1) y pedir `clippy`; lo usan también los builds locales. Cada `dtolnay/rust-toolchain` de cada workflow MUST pasar esa misma versión en `toolchain:` (`ci.yml:54`, `release.yml:90`, `advisories.yml:43`). `[workspace.package] rust-version` MUST ser al menos 1.90, el mayor `rust-version` de los paquetes del lock (hoy `tree-sitter-language` 0.1.9, y `ort`, `ort-sys`, `rmcp`, `ignore` y otros piden 1.88), y no mayor que el toolchain; `cargo +1.90.0 check --locked --workspace --all-targets` compila. Subir el toolchain es un commit propio que cambia todos esos lugares; un lint nuevo del compilador no pone roja la CI sin un cambio del repositorio.
+
+#### Escenario: subir el toolchain
+- GIVEN `rust-toolchain.toml` sube a otra versión y un workflow queda con la anterior
+- WHEN corre la suite
+- THEN falla nombrando el workflow
+
+**Prueba:** `the_toolchain_is_pinned_once_for_every_workflow`. El 1.90 es una constante de la prueba (`DEPENDENCIES_NEED_RUST`), que se revisa al subir una dependencia.
+
+### Dependabot (C4)
+
+`.github/dependabot.yml` MUST actualizar sólo el ecosistema `github-actions` del directorio `/`, una vez por mes y con `target-branch: develop`, en un único PR agrupado. Los crates no: de los avisos se ocupa el workflow de avisos.
+
+**Prueba:** `dependabot_updates_the_pinned_actions_on_develop`.
+
+### Avisos de seguridad (C5)
+
+`.github/workflows/advisories.yml` MUST correr `cargo deny --locked check advisories` con el `deny.toml` de la raíz en cada PR y push a `main` que cambie un `Cargo.toml`, `Cargo.lock`, `deny.toml` o el propio workflow, y cada semana (`schedule:`), para que un aviso publicado sin cambio en el lock se vea igual. `cargo-deny` MUST bajarse de una URL con versión exacta y compararse con un SHA-256 fijado en el workflow antes de correrlo. El workflow es informativo: MUST NOT llamarse `CI`, así no es la puerta de un release ni bloquea un PR, y MUST NOT leer secretos. Cada `ignore` de `deny.toml` MUST llevar su `reason`; hoy hay uno, `paste` (RUSTSEC-2024-0436, sin mantenimiento y sin sucesor), que `tokenizers` usa como proc-macro en tiempo de compilación.
+
+#### Escenario: aviso nuevo sin cambio en el repo
+- GIVEN una dependencia del lock recibe un aviso de RustSec
+- WHEN corre la ejecución semanal
+- THEN el workflow de avisos queda rojo con el id del aviso, y los PR y el release siguen sin él
+
+**Prueba:** `the_advisories_workflow_runs_a_pinned_cargo_deny_apart_from_ci`; que pase sobre el lock, en la [verificación](../../changes/archive/2026-10-19-ci-hardening/verify.md).
+
+### Análisis de `install.ps1` (C6)
+
+`.github/workflows/installer.yml` MUST correr PSScriptAnalyzer sobre `scripts/` en `windows-2022`, en cada PR y push a `main` que cambie `scripts/**` o el propio workflow, con `scripts/PSScriptAnalyzerSettings.psd1`. El módulo MUST bajarse de una URL con versión exacta y compararse con un SHA-256 fijado antes de cargarlo, en vez del que traiga la imagen del runner. Cualquier hallazgo MUST hacer fallar el job, y cada regla excluida en la configuración MUST llevar su motivo en un comentario. El workflow MUST NOT llamarse `CI` ni leer secretos. Ejecutar el script en un Windows limpio sigue siendo a mano ([`specs/release`](../release/spec.md), R8).
+
+**Prueba:** `the_installer_is_analyzed_with_a_pinned_psscriptanalyzer`; que hoy no haya hallazgos, en la [verificación](../../changes/archive/2026-10-19-ci-hardening/verify.md).

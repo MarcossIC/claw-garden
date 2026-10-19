@@ -303,26 +303,56 @@ fn job<'a>(jobs: &'a [Job], name: &str) -> &'a Job {
     jobs.iter().find(|j| j.name == name).unwrap_or_else(|| panic!("no job `{name}`"))
 }
 
+/// The file names in `.github/workflows`, sorted.
+fn workflow_files() -> Vec<String> {
+    let dir = repo_root().join(".github/workflows");
+    let mut names: Vec<String> = fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .map(|entry| entry.expect("workflow entry").file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".yml") || name.ends_with(".yaml"))
+        .collect();
+    names.sort();
+    names
+}
+
 #[test]
 fn third_party_actions_are_pinned_to_a_commit() {
-    let raw = read_repo_file(".github/workflows/release.yml");
-    let mut seen = 0;
-    for (n, line) in raw.lines().enumerate() {
-        let Some(at) = line.find("uses:") else { continue };
-        if line.trim_start().starts_with('#') {
-            continue;
+    for name in workflow_files() {
+        let raw = read_repo_file(&format!(".github/workflows/{name}"));
+        for (n, line) in raw.lines().enumerate() {
+            let Some(at) = line.find("uses:") else { continue };
+            if line.trim_start().starts_with('#') {
+                continue;
+            }
+            let reference = line[at + "uses:".len()..].split_whitespace().next().unwrap_or("");
+            if reference.starts_with("./") {
+                continue;
+            }
+            let (_, pin) = reference.split_once('@').unwrap_or_else(|| panic!("{name}:{}: `{reference}` has no @ref", n + 1));
+            let is_commit = pin.len() == 40 && pin.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            assert!(is_commit, "{name}:{}: `{reference}` is not pinned to a full commit SHA", n + 1);
+            assert!(line.contains(" # "), "{name}:{}: name the tag the SHA stands for in a trailing comment", n + 1);
         }
-        let reference = line[at + "uses:".len()..].split_whitespace().next().unwrap_or("");
-        if reference.starts_with("./") {
-            continue;
-        }
-        let (_, pin) = reference.split_once('@').unwrap_or_else(|| panic!("release.yml:{}: `{reference}` has no @ref", n + 1));
-        let is_commit = pin.len() == 40 && pin.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-        assert!(is_commit, "release.yml:{}: `{reference}` is not pinned to a full commit SHA", n + 1);
-        assert!(line.contains(" # "), "release.yml:{}: name the tag the SHA stands for in a trailing comment", n + 1);
-        seen += 1;
     }
-    assert!(seen > 0, "release.yml uses no action at all");
+}
+
+#[test]
+fn every_checkout_drops_the_token() {
+    let mut seen = 0;
+    for name in workflow_files() {
+        let lines = workflow_code(&name);
+        for job in jobs_of(&lines) {
+            for step in job.steps().iter().filter(|s| s.iter().any(|l| l.contains("uses: actions/checkout@"))) {
+                assert!(
+                    step.iter().any(|l| l.trim() == "persist-credentials: false"),
+                    "{name}, job `{}`: checkout leaves the token in .git/config: {step:?}",
+                    job.name
+                );
+                seen += 1;
+            }
+        }
+    }
+    assert!(seen > 0, "no workflow checks out the repository");
 }
 
 #[test]
@@ -388,6 +418,10 @@ fn the_release_workflow_builds_only_the_cli_with_the_dist_mark() {
             step.iter().any(|l| l.trim() == "CLAWG_DIST_TARGET: ${{ matrix.target }}"),
             "the build step must set CLAWG_DIST_TARGET: {step:?}"
         );
+        // ort-sys downloads ONNX Runtime while building; one failed request
+        // must not stop a release.
+        let text = step.join("\n");
+        assert!(text.contains("for attempt in 1 2 3") && text.contains("sleep"), "the build is retried: {text}");
     }
 
     let steps = build.steps();
@@ -547,13 +581,211 @@ fn the_ci_workflow_ignores_only_non_code_paths_and_runs_on_both_platforms() {
     assert!(has("branches: [main]"), "the push trigger is main");
     assert!(has("os: [ubuntu-latest, windows-latest]"), "both platforms run");
     assert!(has("fail-fast: false"), "one platform failing must not stop the other");
-    assert!(has("- run: cargo clippy --workspace --all-targets -- -A clippy::all -D warnings"));
-    assert!(has("- run: cargo test --workspace"));
+    assert!(has("- run: cargo clippy --locked --workspace --all-targets -- -A clippy::all -D warnings"));
+    assert!(has("- run: cargo test --locked --workspace"));
 
     // CI is the only trigger of the release and must never hold its secrets.
     for forbidden in ["secrets.", "environment:", "id-token", "contents: write"] {
         assert!(!lines.iter().any(|l| l.contains(forbidden)), "ci.yml must not use `{forbidden}`");
     }
+}
+
+/// `X.Y` or `X.Y.Z` as three numbers, a missing patch read as 0.
+fn rust_version(text: &str) -> Option<(u32, u32, u32)> {
+    let parts: Vec<u32> = text.split('.').map(|p| p.parse().ok()).collect::<Option<_>>()?;
+    match parts[..] {
+        [major, minor] => Some((major, minor, 0)),
+        [major, minor, patch] => Some((major, minor, patch)),
+        _ => None,
+    }
+}
+
+/// The highest `rust-version` among the packages in Cargo.lock, today
+/// `tree-sitter-language` 0.1.9's. Reading it needs the cargo registry, so it
+/// is written here and checked again when a dependency is raised.
+const DEPENDENCIES_NEED_RUST: (u32, u32, u32) = (1, 90, 0);
+
+#[test]
+fn the_toolchain_is_pinned_once_for_every_workflow() {
+    let file = read_repo_file("rust-toolchain.toml");
+    let channel = manifest_value(&file, "toolchain", "channel").expect("rust-toolchain.toml names a channel");
+    let channel = channel.trim_matches('"');
+    let pinned = rust_version(channel).filter(|_| channel.split('.').count() == 3);
+    let pinned = pinned.unwrap_or_else(|| panic!("the toolchain is an exact X.Y.Z, not `{channel}`"));
+    let components = manifest_value(&file, "toolchain", "components").unwrap_or_default();
+    assert!(components.contains("\"clippy\""), "the toolchain brings clippy: {components}");
+
+    let mut seen = 0;
+    for name in workflow_files() {
+        let lines = workflow_code(&name);
+        for job in jobs_of(&lines) {
+            for step in job.steps().iter().filter(|s| s.iter().any(|l| l.contains("uses: dtolnay/rust-toolchain@"))) {
+                let given = step.iter().find_map(|l| l.trim().strip_prefix("toolchain:")).map(str::trim);
+                assert_eq!(given, Some(channel), "{name}, job `{}` installs another toolchain than rust-toolchain.toml", job.name);
+                seen += 1;
+            }
+        }
+    }
+    assert!(seen > 0, "no workflow installs the toolchain");
+
+    let manifest = read_repo_file("Cargo.toml");
+    let declared = manifest_value(&manifest, "workspace.package", "rust-version").expect("the workspace declares rust-version");
+    let declared = rust_version(declared.trim_matches('"')).unwrap_or_else(|| panic!("rust-version `{declared}` is not a version"));
+    assert!(declared >= DEPENDENCIES_NEED_RUST, "rust-version {declared:?} is below what the dependencies need, {DEPENDENCIES_NEED_RUST:?}");
+    assert!(declared <= pinned, "rust-version {declared:?} is above the pinned toolchain {pinned:?}");
+}
+
+#[test]
+fn only_the_ci_workflow_gates_the_release() {
+    // release.yml runs after a workflow named CI; any other workflow with that
+    // name would gate, or trigger, a release too.
+    for name in workflow_files() {
+        let lines = workflow_code(&name);
+        let named_ci = lines.iter().any(|l| l.trim() == "name: CI" && indent_of(l) == 0);
+        assert_eq!(named_ci, name == "ci.yml", "{name}: only ci.yml is named CI");
+    }
+}
+
+/// The `env:` value of `key` in a job, as written.
+fn job_env(job: &Job, key: &str) -> String {
+    let prefix = format!("{key}:");
+    job.lines
+        .iter()
+        .find_map(|l| l.trim().strip_prefix(&prefix).map(|v| v.trim().to_string()))
+        .unwrap_or_else(|| panic!("job `{}` sets no `{key}`", job.name))
+}
+
+/// Asserts a workflow downloads a tool from `url_start` with an exact version
+/// and checks it against a SHA-256 kept in `hash_key`.
+fn assert_pinned_download(name: &str, job: &Job, url_key: &str, url_start: &str, version: &str, hash_key: &str) {
+    let url = job_env(job, url_key);
+    assert!(url.starts_with(url_start), "{name}: {url_key} is `{url}`");
+    assert!(url.contains(&format!("/{version}/")), "{name}: {url_key} names version {version}: {url}");
+    let hash = job_env(job, hash_key);
+    assert!(hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()), "{name}: {hash_key} is a SHA-256: {hash}");
+}
+
+fn assert_reads_no_secret(name: &str, lines: &[String]) {
+    for forbidden in ["secrets.", "environment:", "id-token", "contents: write"] {
+        assert!(!lines.iter().any(|l| l.contains(forbidden)), "{name} must not use `{forbidden}`");
+    }
+}
+
+#[test]
+fn the_advisories_workflow_runs_a_pinned_cargo_deny_apart_from_ci() {
+    let name = "advisories.yml";
+    let lines = workflow_code(name);
+    let has = |wanted: &str| lines.iter().any(|l| l.trim() == wanted);
+    for trigger in ["pull_request:", "push:", "schedule:"] {
+        assert!(lines.iter().any(|l| indent_of(l) == 2 && l.trim() == trigger), "{name} runs on `{trigger}`");
+    }
+    for path in ["- '**/Cargo.toml'", "- 'Cargo.lock'", "- 'deny.toml'", "- '.github/workflows/advisories.yml'"] {
+        let listed = lines.iter().filter(|l| l.trim() == path).count();
+        assert_eq!(listed, 2, "{name}: pull requests and pushes both watch `{path}`");
+    }
+    assert!(has("branches: [main]"));
+    assert_reads_no_secret(name, &lines);
+
+    let jobs = jobs_of(&lines);
+    let advisories = job(&jobs, "advisories");
+    assert_pinned_download(
+        name,
+        advisories,
+        "CARGO_DENY_URL",
+        "https://github.com/EmbarkStudios/cargo-deny/releases/download/",
+        "0.20.2",
+        "CARGO_DENY_SHA256",
+    );
+    let text = advisories.text();
+    assert!(text.contains("sha256sum --check"), "{name} checks the download before running it");
+    let commands = run_commands(advisories);
+    assert!(commands.iter().any(|c| c == "cargo deny --locked check advisories"), "{name}: {commands:?}");
+
+    let deny = read_repo_file("deny.toml");
+    assert!(deny.lines().any(|l| l.trim() == "[advisories]"), "deny.toml configures the advisories");
+    for line in deny.lines().filter(|l| l.contains("id = \"RUSTSEC-")) {
+        assert!(line.contains("reason = \""), "an ignored advisory says why: {line}");
+    }
+}
+
+#[test]
+fn the_installer_is_analyzed_with_a_pinned_psscriptanalyzer() {
+    let name = "installer.yml";
+    let lines = workflow_code(name);
+    for path in ["- 'scripts/**'", "- '.github/workflows/installer.yml'"] {
+        let listed = lines.iter().filter(|l| l.trim() == path).count();
+        assert_eq!(listed, 2, "{name}: pull requests and pushes both watch `{path}`");
+    }
+    assert_reads_no_secret(name, &lines);
+
+    let jobs = jobs_of(&lines);
+    let analyze = job(&jobs, "analyze");
+    assert!(analyze.key("runs-on").is_some_and(|r| r.starts_with("windows-")), "{name} runs on Windows");
+    assert_pinned_download(
+        name,
+        analyze,
+        "PSSA_URL",
+        "https://github.com/PowerShell/PSScriptAnalyzer/releases/download/",
+        "1.25.0",
+        "PSSA_SHA256",
+    );
+    let text = analyze.text();
+    let position = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("{name} lacks `{needle}`"));
+    assert!(position("Get-FileHash -Algorithm SHA256") < position("Import-Module"), "{name} checks the module before loading it");
+    assert!(text.contains("Invoke-ScriptAnalyzer -Path scripts -Recurse -Settings scripts/PSScriptAnalyzerSettings.psd1"));
+    assert!(text.contains("if ($findings.Count -gt 0) { throw"), "{name}: any finding fails the run");
+
+    let settings = read_repo_file("scripts/PSScriptAnalyzerSettings.psd1");
+    let settings: Vec<&str> = settings.lines().map(str::trim).collect();
+    for (n, rule) in settings.iter().enumerate().filter(|(_, l)| l.starts_with("'PS")) {
+        assert!(n > 0 && settings[n - 1].starts_with('#'), "the excluded rule {rule} says why in a comment above it");
+    }
+}
+
+#[test]
+fn dependabot_updates_the_pinned_actions_on_develop() {
+    let config = read_repo_file(".github/dependabot.yml");
+    let lines: Vec<&str> = config.lines().map(str::trim).filter(|l| !l.starts_with('#')).collect();
+    let ecosystems: Vec<&str> = lines.iter().filter_map(|l| l.strip_prefix("- package-ecosystem:")).map(str::trim).collect();
+    assert_eq!(ecosystems, ["github-actions"], "crates are left to the Advisories workflow");
+    for wanted in ["directory: /", "target-branch: develop", "interval: monthly"] {
+        assert!(lines.contains(&wanted), "dependabot.yml lacks `{wanted}`");
+    }
+}
+
+/// The command of every `run:` step of a job, single-line ones only.
+fn run_commands(job: &Job) -> Vec<String> {
+    job.steps()
+        .iter()
+        .flat_map(|step| step.iter())
+        .filter_map(|l| {
+            let l = l.trim().trim_start_matches("- ");
+            l.strip_prefix("run: ").map(|c| c.trim().to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn the_ci_workflow_checks_the_locked_production_build() {
+    let lines = workflow_code("ci.yml");
+    let jobs = jobs_of(&lines);
+    let commands = run_commands(job(&jobs, "test"));
+
+    // A Cargo.lock that trails Cargo.toml must fail here, not in release.yml.
+    for command in commands.iter().filter(|c| c.starts_with("cargo ")) {
+        assert!(command.contains(" --locked"), "ci.yml runs `{command}` without --locked");
+    }
+    // Without --all-targets no dev-dependency, and so no `testing`, reaches
+    // clawg-core: the configuration release.yml builds.
+    for wanted in ["cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings", "cargo test --locked -p clawg-core --lib build_info"] {
+        assert!(commands.iter().any(|c| c == wanted), "ci.yml lacks `{wanted}`: {commands:?}");
+    }
+
+    // Only main writes the cache, so nothing a pull request builds is restored
+    // into a run on main.
+    let steps = job(&jobs, "test").steps();
+    let cache = steps.iter().find(|s| s.iter().any(|l| l.contains("uses: Swatinem/rust-cache@"))).expect("ci.yml caches the build");
+    assert!(cache.iter().any(|l| l.trim() == "save-if: ${{ github.ref == 'refs/heads/main' }}"), "the cache is written from any ref: {cache:?}");
 }
 
 #[test]

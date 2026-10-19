@@ -87,14 +87,28 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
         with:
-          toolchain: stable
+          toolchain: 1.99.1
       - run: rustc -Vv
       # Only the CLI: building the workspace would also build clawg-eval, which
       # turns on a clawg-core feature that production binaries must not link.
+      # ort-sys downloads ONNX Runtime from cdn.pyke.io while building (checked
+      # against the SHA-256 it pins), so a failed request there is retried
+      # rather than stopping the release.
       - name: Build
+        shell: bash
         env:
           CLAWG_DIST_TARGET: ${{ matrix.target }}
-        run: cargo build --release --locked -p clawg-cli --target ${{ matrix.target }}
+        run: |
+          for attempt in 1 2 3; do
+            if cargo build --release --locked -p clawg-cli --target ${{ matrix.target }}; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 30))
+            fi
+          done
+          echo "the build failed ${attempt} times" >&2
+          exit 1
       - name: Smoke test
         shell: bash
         env:

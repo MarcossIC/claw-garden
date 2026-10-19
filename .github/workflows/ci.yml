@@ -44,13 +44,29 @@ jobs:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # This workflow is what release.yml waits for, so its actions are pinned
+      # as there, and the token does not stay in .git/config for the build.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: 1.99.1
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      # Pull requests read the cache and only main writes it, so what a build
+      # script of a pull request leaves there never reaches a run on main.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Compiler warnings are errors; clippy's own lints are not enforced yet.
-      - run: cargo clippy --workspace --all-targets -- -A clippy::all -D warnings
+      # --locked everywhere: a Cargo.lock that trails Cargo.toml fails here
+      # instead of in release.yml, after the merge.
+      - run: cargo clippy --locked --workspace --all-targets -- -A clippy::all -D warnings
       # Includes crates/clawg-cli/tests/binary.rs, which runs the built binary
       # against a temporary home with the fake model: nothing is downloaded.
-      - run: cargo test --workspace
+      - run: cargo test --locked --workspace
+      # What release.yml builds: --workspace turns on clawg-core's `testing` and
+      # `eval`, and without --all-targets no dev-dependency, so neither, is in.
+      - run: cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings
+      # The build_info tests of a build without `testing`.
+      - run: cargo test --locked -p clawg-core --lib build_info

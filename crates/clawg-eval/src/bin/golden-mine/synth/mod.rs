@@ -510,7 +510,7 @@ fn long_saves(base: &Golden, names: &mut Codenames, rng: &mut SplitMix64) -> (Ve
         let facts = templates::long_facts(spanish);
         let (sentence, answer, query) = facts[(n / 2) % facts.len()];
         let number = (10 + rng.below(90)).to_string();
-        let opening = templates::fill(rng.pick(templates::long_openings(spanish)), &[("{key}", &key)]);
+        let opening = templates::fill(*rng.pick(templates::long_openings(spanish)), &[("{key}", &key)]);
 
         let mut sentences = vec![opening];
         while clawg_core::eval_api::fallback_pieces(&sentences.join(" "), LONG_PIECE_TOKENS).len() < LONG_MIN_PIECES {
