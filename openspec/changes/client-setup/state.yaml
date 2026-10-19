@@ -1,14 +1,14 @@
 change: client-setup
 objective: "4"
 depends_on: [memory-protocol, agent-lifecycle-hooks]
-phase: explore
+phase: apply
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
-  apply: pending
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: in_progress
   verify: pending
   archive: pending
-updated: 2026-10-15
+updated: 2026-10-19
