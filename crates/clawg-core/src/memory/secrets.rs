@@ -15,6 +15,7 @@ use crate::memory::backup::{
 use crate::memory::clock::TimestampMs;
 use crate::memory::dispute::release_challengers;
 use crate::memory::redact::{redact, SecretKind};
+use crate::memory::revival::{revive_after_delete_of_piece, Revived};
 use crate::memory::store_lock::{StoreHolder, StoreLock};
 use crate::memory::MemoryError;
 
@@ -112,6 +113,11 @@ pub enum PurgeError {
 /// What [`purge`] did.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Purged {
+    /// The rows the purged one had replaced as the current version of its
+    /// topic, current again, as a delete of it would have left them.
+    pub revived: Vec<i64>,
+    /// The rows a verdict replaced with the purged one, which stay replaced.
+    pub hidden: Vec<i64>,
     /// The other rows of the long save the row was a piece of, in id order.
     /// Neighbours share the tokens at their edges, so each holds a little of
     /// the purged text.
@@ -177,6 +183,16 @@ pub fn purge(base_dir: &Path, id: i64) -> Result<Purged, MemoryError> {
     let held = OutboxMatch { agent: agent.as_deref(), content: &content, piece };
 
     let tx = c.transaction()?;
+    // Deleted first, so the revival a delete runs sees it as one: the rows it
+    // replaced as its topic's current version come back. Purging must not
+    // hide more than the row.
+    let revived = if live {
+        let now = TimestampMs::now();
+        tx.execute("UPDATE memory SET deleted_at = ?2 WHERE id = ?1", rusqlite::params![id, now])?;
+        revive_after_delete_of_piece(&tx, id, now)?
+    } else {
+        Revived::default()
+    };
     let pieces: Vec<i64> = {
         let mut stmt = tx.prepare(
             "SELECT DISTINCT q.memory_id FROM memory_piece p \
@@ -225,7 +241,13 @@ pub fn purge(base_dir: &Path, id: i64) -> Result<Purged, MemoryError> {
     c.execute("INSERT INTO memory_fts(memory_fts) VALUES ('optimize')", [])?;
     leave_no_old_copy(c)?;
     let backups = backups_holding(&crate::paths::backups_dir(base_dir), id, &held);
-    Ok(Purged { pieces, outbox, backups })
+    Ok(Purged {
+        revived: revived.revived.into_iter().map(|r| r.id).collect(),
+        hidden: revived.hidden,
+        pieces,
+        outbox,
+        backups,
+    })
 }
 
 /// What [`mask_reasons`] did.
@@ -849,6 +871,41 @@ mod tests {
         let mut stmt = c.prepare("SELECT operation_id FROM ingest_outbox ORDER BY id").unwrap();
         let ids = stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
         ids
+    }
+
+    #[tokio::test]
+    async fn purging_the_current_revision_brings_the_previous_one_back() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::memory::db::seed_on_disk(dir.path(), None).await;
+        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+        let mut ids = Vec::new();
+        for text in ["deploy to fly", "deploy to render", "a rule a verdict replaced", SECRET] {
+            c.execute(INSERT_ROW, [text]).unwrap();
+            ids.push(c.last_insert_rowid());
+        }
+        let [first, middle, judged, current] = ids[..] else { unreachable!() };
+        let supersede = "UPDATE memory SET status = 'superseded', superseded_by = ?2, supersede_cause = ?3, \
+                         topic_key = ?4 WHERE id = ?1";
+        let key = Some("deploy/target");
+        c.execute(supersede, rusqlite::params![first, middle, "revision", key]).unwrap();
+        c.execute(supersede, rusqlite::params![middle, current, "revision", key]).unwrap();
+        c.execute(supersede, rusqlite::params![judged, current, "verdict", None::<&str>]).unwrap();
+        c.execute("UPDATE memory SET topic_key = 'deploy/target' WHERE id = ?1", [current]).unwrap();
+        drop(c);
+
+        let purged = purge(dir.path(), current).unwrap();
+
+        assert_eq!((purged.revived.as_slice(), purged.hidden.as_slice()), ([middle].as_slice(), [judged].as_slice()));
+        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+        let state = |id: i64| -> (String, Option<i64>) {
+            c.query_row("SELECT status, superseded_by FROM memory WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+        };
+        assert_eq!(state(middle), ("active".to_string(), None));
+        assert_eq!(state(first), ("superseded".to_string(), Some(middle)));
+        assert_eq!(state(judged), ("superseded".to_string(), Some(current)), "a verdict stays");
+        drop(c);
+        assert_no_trace(dir.path(), current);
     }
 
     #[tokio::test]
