@@ -163,6 +163,13 @@ pub struct MemoryStore {
     dir: Option<PathBuf>,
 }
 
+/// Bytes of WAL a checkpoint may leave on disk. A checkpoint rewinds the WAL
+/// but never shrinks it, and the daemon truncates it only at shutdown, so one
+/// large transaction (a migration, a re-embed batch, writes while a snapshot
+/// holds an older read) would otherwise keep a file that size for the life
+/// of the process.
+const WAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
+
 impl MemoryStore {
     /// Open (or create) the memory database at `<base_dir>/memory.db`.
     ///
@@ -205,6 +212,12 @@ impl MemoryStore {
             Ok(mode) if mode.eq_ignore_ascii_case("wal") => {}
             Ok(mode) => log::warn!("memory.db journal_mode is {mode}, not wal; falling back to the default rollback journal"),
             Err(e) => log::warn!("could not set memory.db journal mode: {e}; falling back to the default rollback journal"),
+        }
+        if let Err(e) = conn
+            .call(|c| c.pragma_update_and_check(None, "journal_size_limit", WAL_SIZE_LIMIT, |r| r.get::<_, i64>(0)))
+            .await
+        {
+            log::warn!("could not limit the memory.db WAL size: {e}");
         }
         register_udfs(&conn).await?;
         if let SchemaPlan::Pending { .. } = plan {
@@ -1706,6 +1719,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(synchronous, 1, "expected synchronous=NORMAL (1), got {synchronous}");
+    }
+
+    /// WAL-4 — production open() caps the WAL a checkpoint leaves on disk.
+    #[tokio::test]
+    async fn open_limits_the_wal_left_after_a_checkpoint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+        let limit: i64 = store
+            .conn
+            .call(|c| -> rusqlite::Result<i64> { c.query_row("PRAGMA journal_size_limit", [], |r| r.get(0)) })
+            .await
+            .unwrap();
+        assert_eq!(limit, 64 * 1024 * 1024, "expected a 64 MiB WAL limit, got {limit}");
     }
 
     /// WAL-3 — new_for_test()'s in-memory connection is deliberately left
