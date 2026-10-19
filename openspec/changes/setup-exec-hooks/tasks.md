@@ -34,6 +34,6 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 
 ## 6. Verificación
 
-- [ ] Suite y clippy en Linux sobre el último commit.
-- [ ] `clawg setup claude-code` con el binario de tests en un home temporal, y el `claude` real del PATH.
-- [ ] `verify.md`.
+- [x] Suite y clippy en Linux sobre el último commit.
+- [x] `clawg setup claude-code` con el binario de tests en un home temporal, y el `claude` real del PATH.
+- [x] `verify.md`.

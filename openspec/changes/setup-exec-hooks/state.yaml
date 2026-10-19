@@ -1,7 +1,7 @@
 change: setup-exec-hooks
 objective: "4"
 depends_on: []
-phase: apply
+phase: verify
 artifacts:
   exploration: done
   proposal: done
@@ -9,6 +9,6 @@ artifacts:
   design: done
   tasks: done
   apply: done
-  verify: pending
+  verify: done  # Linux y el claude real en un home temporal, sin CRITICAL; Windows y una sesión real quedan como WARNING
   archive: pending
 updated: 2026-10-19
