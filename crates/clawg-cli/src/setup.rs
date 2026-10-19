@@ -16,6 +16,7 @@
 //! rewritten in place when it is exactly what setup wrote.
 
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -719,31 +720,92 @@ fn run_claude(claude: &Path, args: &[String]) -> ServerOutcome {
 }
 
 fn write_file(step: &FileStep, file: &File, base_dir: &Path, now_ms: i64) -> std::io::Result<Option<PathBuf>> {
+    let target = link_target(&file.path)?;
     let backup = match &file.text {
         Some(text) => {
             let dir = backups_dir(base_dir).join("setup");
             std::fs::create_dir_all(&dir)?;
             let name = file.path.file_name().map_or_else(|| "file".into(), |n| n.to_string_lossy().into_owned());
             let copy = dir.join(format!("{name}-{}", stamp(now_ms)));
-            std::fs::write(&copy, text)?;
+            create_fresh(&copy, Some(0o600))?.write_all(text.as_bytes())?;
             Some(copy)
         }
         None => None,
     };
-    match step {
-        FileStep::Write(text) => {
-            if let Some(dir) = file.path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            let mut tmp = file.path.clone().into_os_string();
-            tmp.push(".clawg-tmp");
-            std::fs::write(&tmp, text)?;
-            std::fs::rename(&tmp, &file.path)?;
-        }
-        FileStep::Delete => std::fs::remove_file(&file.path)?,
-        FileStep::Unchanged => {}
+    match (step, target) {
+        (FileStep::Write(text), target) => replace(target.as_deref().unwrap_or(&file.path), text)?,
+        // Taking away the link, or what it points to, would break whatever
+        // manages it, such as a dotfiles repository.
+        (FileStep::Delete, Some(target)) => replace(&target, "")?,
+        (FileStep::Delete, None) => std::fs::remove_file(&file.path)?,
+        (FileStep::Unchanged, _) => {}
     }
     Ok(backup)
+}
+
+/// The file `path` points to when it is a symbolic link, so a write lands
+/// there and the link stays a link. A broken link is an error.
+fn link_target(path: &Path) -> std::io::Result<Option<PathBuf>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(path).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// Puts `text` in `path` through a temporary file beside it and a rename, so
+/// a reader sees the old file or the new one and never half of it. The
+/// temporary file has the mode of the file it replaces from the moment it
+/// exists, and reaches the disk before the rename.
+fn replace(path: &Path, text: &str) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".clawg-tmp");
+    let tmp = PathBuf::from(tmp);
+    let mut out = create_fresh(&tmp, mode_of(path))?;
+    out.write_all(text.as_bytes())?;
+    out.sync_all()?;
+    drop(out);
+    std::fs::rename(&tmp, path)
+}
+
+#[cfg(unix)]
+fn mode_of(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).ok().map(|m| m.permissions().mode() & 0o7777)
+}
+
+#[cfg(not(unix))]
+fn mode_of(_path: &Path) -> Option<u32> {
+    None
+}
+
+/// A new, empty file at `path`, replacing any there, with `mode` when given
+/// on Unix: set at creation and again after it, since the umask may have
+/// taken bits from the first.
+#[cfg(unix)]
+fn create_fresh(path: &Path, mode: Option<u32>) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    if let Some(mode) = mode {
+        options.mode(mode);
+    }
+    let file = options.open(path)?;
+    if let Some(mode) = mode {
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn create_fresh(path: &Path, _mode: Option<u32>) -> std::io::Result<std::fs::File> {
+    std::fs::File::create(path)
 }
 
 /// The report, one line per step, and the exit code: 1 when a step did not
@@ -1303,8 +1365,100 @@ mod tests {
         assert!(text.contains(&format!("previous file copied to {}", copy.display())), "{text}");
         let value: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(value["hooks"]["SessionStart"][0]["hooks"][0], hook("session-start"));
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
-        assert!(!leftovers.iter().any(|n| n.to_string_lossy().ends_with(".clawg-tmp")), "{leftovers:?}");
+        assert!(temporaries(dir.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// The names in `dir` a write left behind.
+    fn temporaries(dir: &Path) -> Vec<std::ffi::OsString> {
+        let names = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name());
+        names.filter(|n| n.to_string_lossy().ends_with(".clawg-tmp")).collect()
+    }
+
+    /// The files as read from `config`, as `read_state` reads them.
+    #[cfg(unix)]
+    fn state_in(config: &Path, servers: Option<&str>) -> State {
+        let read = |name: &str| super::read(config.join(name)).unwrap();
+        State {
+            servers: File { path: config.join(".claude.json"), text: servers.map(String::from) },
+            settings: read("settings.json"),
+            instructions: read("CLAUDE.md"),
+            ..state(None, None, None)
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_file_is_written_through_its_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, dotfiles, data) = (dir.path().join("config"), dir.path().join("dotfiles"), dir.path().join("data"));
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        std::fs::write(dotfiles.join("settings.json"), r#"{"theme":"dark"}"#).unwrap();
+        chmod(&dotfiles.join("settings.json"), 0o600);
+        std::fs::write(dotfiles.join("CLAUDE.md"), "").unwrap();
+        std::os::unix::fs::symlink(dotfiles.join("settings.json"), config.join("settings.json")).unwrap();
+        std::os::unix::fs::symlink(dotfiles.join("CLAUDE.md"), config.join("CLAUDE.md")).unwrap();
+
+        let (text, code) = run_in(state_in(&config, Some(&planned_server_json())), Mode::Install, false, None, &data, 0).unwrap();
+        assert_eq!(code, 0, "{text}");
+        for name in ["settings.json", "CLAUDE.md"] {
+            let link = config.join(name);
+            assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "{name} is still a link");
+            assert_eq!(std::fs::read_link(&link).unwrap(), dotfiles.join(name));
+        }
+        let value: Value = serde_json::from_str(&std::fs::read_to_string(dotfiles.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(value["hooks"]["SessionStart"][0]["hooks"][0], hook("session-start"));
+        assert_eq!(mode(&dotfiles.join("settings.json")), 0o600);
+        assert!(std::fs::read_to_string(dotfiles.join("CLAUDE.md")).unwrap().starts_with(BEGIN_MARKER));
+        assert!(temporaries(&config).is_empty() && temporaries(&dotfiles).is_empty());
+
+        let (text, code) = run_in(state_in(&config, None), Mode::Remove, false, None, &data, 1).unwrap();
+        assert_eq!(code, 0, "{text}");
+        assert!(std::fs::symlink_metadata(config.join("CLAUDE.md")).unwrap().file_type().is_symlink(), "removing the block keeps the link");
+        assert_eq!(std::fs::read_to_string(dotfiles.join("CLAUDE.md")).unwrap(), "", "and leaves what it points to empty");
+
+        let dangling = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&dangling).unwrap();
+        std::fs::remove_file(config.join("CLAUDE.md")).unwrap();
+        std::os::unix::fs::symlink(dangling.join("missing").join("CLAUDE.md"), config.join("CLAUDE.md")).unwrap();
+        let (text, code) = run_in(state_in(&config, Some(&planned_server_json())), Mode::Install, false, None, &data, 2).unwrap();
+        assert_eq!(code, 1, "{text}");
+        assert!(text.contains(&format!("cannot write {}", config.join("CLAUDE.md").display())), "{text}");
+        assert!(std::fs::symlink_metadata(config.join("CLAUDE.md")).unwrap().file_type().is_symlink(), "a broken link is left as it is");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_keeps_its_mode_and_copies_are_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, data) = (dir.path().join("config"), dir.path().join("data"));
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("settings.json"), r#"{"theme":"dark"}"#).unwrap();
+        chmod(&config.join("settings.json"), 0o640);
+        std::fs::write(config.join("CLAUDE.md"), "Use tabs.\n").unwrap();
+        chmod(&config.join("CLAUDE.md"), 0o600);
+
+        let (text, code) = run_in(state_in(&config, Some(&planned_server_json())), Mode::Install, false, None, &data, 0).unwrap();
+        assert_eq!(code, 0, "{text}");
+        assert_eq!(mode(&config.join("settings.json")), 0o640);
+        assert_eq!(mode(&config.join("CLAUDE.md")), 0o600);
+        let copies: Vec<PathBuf> = std::fs::read_dir(data.join("backups").join("setup")).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(copies.len(), 2, "{copies:?}");
+        for copy in copies {
+            assert_eq!(mode(&copy), 0o600, "{}", copy.display());
+        }
     }
 
     #[test]
