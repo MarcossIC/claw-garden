@@ -26,6 +26,8 @@ pub enum SecretKind {
     NpmToken,
     GoogleOauthSecret,
     SendgridKey,
+    HuggingfaceToken,
+    SlackWebhook,
     PrivateKey,
     Jwt,
     UrlPassword,
@@ -48,6 +50,8 @@ impl SecretKind {
             SecretKind::NpmToken => "npm_token",
             SecretKind::GoogleOauthSecret => "google_oauth_secret",
             SecretKind::SendgridKey => "sendgrid_key",
+            SecretKind::HuggingfaceToken => "huggingface_token",
+            SecretKind::SlackWebhook => "slack_webhook",
             SecretKind::PrivateKey => "private_key",
             SecretKind::Jwt => "jwt",
             SecretKind::UrlPassword => "url_password",
@@ -83,16 +87,21 @@ static PATTERNS: Lazy<Vec<(SecretKind, Regex)>> = Lazy::new(|| {
         (SecretKind::GithubToken, r"\b(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,})"),
         (SecretKind::AnthropicKey, r"\bsk-ant-[A-Za-z0-9_-]{20,}"),
         (SecretKind::OpenaiKey, r"\bsk-(?:proj-|svcacct-|admin-)?([A-Za-z0-9_-]{20,})"),
-        (SecretKind::SlackToken, r"\bxox[abposr]-[A-Za-z0-9-]{10,}"),
+        (SecretKind::SlackToken, r"\b(?:xox[abposr]|xapp)-[A-Za-z0-9-]{10,}"),
         (SecretKind::GoogleApiKey, r"\bAIza[A-Za-z0-9_-]{35}"),
-        (SecretKind::StripeKey, r"\b[sr]k_live_[A-Za-z0-9]{16,}"),
+        (SecretKind::StripeKey, r"\b(?:[sr]k_live_[A-Za-z0-9]{16,}|whsec_[A-Za-z0-9]{24,})"),
         (SecretKind::GitlabToken, r"\bglpat-[A-Za-z0-9_-]{20,}"),
         (SecretKind::NpmToken, r"\bnpm_[A-Za-z0-9]{36}\b"),
         (SecretKind::GoogleOauthSecret, r"\bGOCSPX-[A-Za-z0-9_-]{28}"),
         (SecretKind::SendgridKey, r"\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}"),
+        (SecretKind::HuggingfaceToken, r"\bhf_([A-Za-z0-9]{34})\b"),
+        (
+            SecretKind::SlackWebhook,
+            r"\bhttps://hooks\.slack\.com/services/T[A-Z0-9]{6,}/B[A-Z0-9]{6,}/[A-Za-z0-9]{20,}",
+        ),
         (
             SecretKind::PrivateKey,
-            r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?s:.*?-----END [A-Z ]*PRIVATE KEY-----|.*)",
+            r"-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----(?s:.*?-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|.*)",
         ),
         (SecretKind::Jwt, r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*"),
         (SecretKind::UrlPassword, r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s:/@]+:([^\s/@]+)@"),
@@ -141,18 +150,22 @@ fn accepts(kind: SecretKind, secret: &str) -> bool {
         // names, which are almost never mixed case. A real key is random
         // base62 or base64url, so it has upper and lower case letters and
         // digits; `sk-ant-` is Anthropic's.
-        SecretKind::OpenaiKey => {
-            !secret.starts_with("ant-")
-                && secret.bytes().any(|b| b.is_ascii_digit())
-                && secret.bytes().any(|b| b.is_ascii_uppercase())
-                && secret.bytes().any(|b| b.is_ascii_lowercase())
-        }
+        SecretKind::OpenaiKey => !secret.starts_with("ant-") && mixes_case_and_digits(secret),
+        // 34 letters after `hf_` can be a class name
+        // (`AutoModelForSequenceClassification`); a token is random base62.
+        SecretKind::HuggingfaceToken => mixes_case_and_digits(secret),
         // A variable, a template slot, an earlier placeholder or a masked
         // value: none of them is the password.
         SecretKind::UrlPassword => !secret.starts_with(['$', '<', '{', '[', '*']),
         SecretKind::Password | SecretKind::AuthHeader => is_literal_secret(secret),
         _ => true,
     }
+}
+
+fn mixes_case_and_digits(s: &str) -> bool {
+    s.bytes().any(|b| b.is_ascii_digit())
+        && s.bytes().any(|b| b.is_ascii_uppercase())
+        && s.bytes().any(|b| b.is_ascii_lowercase())
 }
 
 /// Whether the value after a password key or an `Authorization` scheme is a
@@ -256,6 +269,16 @@ mod tests {
                 format!("eyJ{}.eyJ{}.{}", repeat("hbGc", 20), repeat("zdWI", 30), repeat("SflK", 43)),
                 SecretKind::Jwt,
             ),
+            (format!("hf_{}", repeat("aB3d", 34)), SecretKind::HuggingfaceToken),
+            (
+                format!(
+                    "https://hooks.slack.com/services/T{}/B{}/{}",
+                    repeat("Q7ZX", 9),
+                    repeat("K2LM", 9),
+                    repeat("x9Yz", 24)
+                ),
+                SecretKind::SlackWebhook,
+            ),
         ]
     }
 
@@ -287,8 +310,11 @@ mod tests {
                     sk-learn-is-not-a-key-at-all, AKIA alone, ghp_short, \
                     postgres://app:${DB_PASSWORD}@db:5432/app, \
                     https://user:<password>@example.com, https://example.com/a@b, \
-                    risk-assessment-for-the-quarterly-plan-2026";
-        let out = redact(text);
+                    risk-assessment-for-the-quarterly-plan-2026, hf_hub_download, \
+                    https://hooks.slack.com/services/your-webhook-here";
+        // Joined at run time: a secret scanner takes the literal for a token.
+        let text = format!("{text}, hf_{}", "AutoModelForSequenceClassification");
+        let out = redact(&text);
         assert_eq!(out.text, text);
         assert!(out.kinds.is_empty(), "{:?}", out.kinds);
     }
@@ -443,6 +469,28 @@ mod tests {
         let out = redact(&text);
         assert_eq!(out.text, "config:\n[REDACTED:private_key]");
         assert_eq!(out.kinds, vec![SecretKind::PrivateKey]);
+    }
+
+    #[test]
+    fn a_pgp_private_key_block_is_masked() {
+        let block = format!(
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----\n\n{}\n-----END PGP PRIVATE KEY BLOCK-----",
+            repeat("lQdGBF", 64)
+        );
+        let out = redact(&format!("signing key:\n{block}\nkeep this"));
+        assert_eq!(out.text, "signing key:\n[REDACTED:private_key]\nkeep this");
+        assert_eq!(out.kinds, vec![SecretKind::PrivateKey]);
+    }
+
+    #[test]
+    fn the_slack_app_and_stripe_webhook_forms_are_masked() {
+        for (secret, kind) in [
+            (format!("xapp-1-{}", repeat("A0b1-", 40)), SecretKind::SlackToken),
+            (format!("whsec_{}", repeat("Mk7p", 32)), SecretKind::StripeKey),
+        ] {
+            let out = redact(&format!("use {secret} here"));
+            assert_eq!(out.text, format!("use [REDACTED:{}] here", kind.as_str()), "{secret}");
+        }
     }
 
     #[test]
