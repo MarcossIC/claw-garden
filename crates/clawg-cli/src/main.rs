@@ -12,7 +12,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use clawg_cli::cli::{is_hook_invocation, sharing_profile, Cli, Command, PathAction, ProjectsAction};
+use clawg_cli::cli::{is_hook_invocation, sharing_profile, Cli, Command, PathAction, ProjectsAction, SetupClient};
 use clawg_cli::client::{probe_running, ClientError, DaemonClient, Probe};
 use clawg_cli::daemon::lifecycle::{now_ms, read_state};
 use clawg_cli::daemon::serve;
@@ -23,6 +23,7 @@ use clawg_cli::memories;
 use clawg_cli::projects;
 use clawg_cli::restore;
 use clawg_cli::secrets;
+use clawg_cli::setup;
 use clawg_cli::sharing;
 use clawg_cli::status::status_report;
 use clawg_cli::stop::{stop_in, STOP_TIMEOUT};
@@ -284,6 +285,14 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 .map_err(unavailable)?;
             println!("{out}");
             Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Setup { client: SetupClient::ClaudeCode, dry_run, remove, profile } => {
+            let profile = profile.resolve().map_err(|e| e.to_string())?;
+            let mode = if remove { setup::Mode::Remove } else { setup::Mode::Install };
+            let (text, code) = setup::run(profile, mode, dry_run).map_err(|e| e.to_string())?;
+            println!("{text}");
+            Ok(ExitCode::from(code))
         }
 
         Command::Path { action } => run_path(action),

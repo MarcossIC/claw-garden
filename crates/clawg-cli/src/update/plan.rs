@@ -272,7 +272,7 @@ fn split_name(exe_name: &str) -> (&str, &str) {
 }
 
 /// `yyyyMMddHHmmssfff` in UTC, the digits of a snapshot's own timestamp.
-fn stamp(ms: i64) -> String {
+pub fn stamp(ms: i64) -> String {
     snapshot_name(ms, Reason::Manual)
         .chars()
         .filter(char::is_ascii_digit)

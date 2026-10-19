@@ -38,6 +38,7 @@ pub mod projects;
 pub mod relevance;
 pub mod restore;
 pub mod secrets;
+pub mod setup;
 pub mod sharing;
 pub mod status;
 pub mod stop;
