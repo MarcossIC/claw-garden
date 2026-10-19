@@ -515,9 +515,11 @@ pub enum SaveOutcome {
         key_dropped: bool,
     },
     /// Accepted but not confirmed; `reason` says why (`"unconfirmed"`,
-    /// `"embedder_loading"`, `"already_queued"`), and `operation_id` is what
-    /// it waits under; a daemon that predates the outbox sends none.
-    Queued { reason: Option<String>, operation_id: Option<String> },
+    /// `"embedder_loading"`, `"already_queued"`, `"partially_saved"`), and
+    /// `operation_id` is what it waits under; a daemon that predates the
+    /// outbox sends none. A save that stopped part-way names the pieces it
+    /// stored in `memories` and why it stopped in `detail`.
+    Queued { reason: Option<String>, operation_id: Option<String>, memories: Vec<SavedMemory>, detail: Option<String> },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -684,6 +686,8 @@ impl DaemonClient {
             topic_key: Option<String>,
             #[serde(default)]
             operation_id: Option<String>,
+            #[serde(default)]
+            detail: Option<String>,
         }
         let keyed = args.topic_key.is_some();
         let resp = self
@@ -703,7 +707,12 @@ impl DaemonClient {
                 replaced: body.replaced,
                 key_dropped: keyed && body.topic_key.is_none(),
             },
-            _ => SaveOutcome::Queued { reason: body.reason, operation_id: body.operation_id },
+            _ => SaveOutcome::Queued {
+                reason: body.reason,
+                operation_id: body.operation_id,
+                memories: body.memories,
+                detail: body.detail,
+            },
         })
     }
 

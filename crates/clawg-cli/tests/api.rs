@@ -938,6 +938,39 @@ async fn a_failure_the_caller_was_told_leaves_no_outbox_row() {
 }
 
 #[tokio::test]
+async fn a_partial_save_answers_202_and_keeps_its_row() {
+    // Only the last pieces hold this word, and the store refuses a vector that
+    // is not finite, so the pieces before them are stored and these are not.
+    let h = Harness::start_inner(EmbedderState::Fixed(vec![("w00590", vec![f32::NAN; 384])])).await;
+    let content = (0..600).map(|i| format!("w{i:05}")).collect::<Vec<_>>().join(" ");
+
+    let (status, body) = h.post_json("/v1/memories", json!({ "content": content, "agent_id": "a" })).await;
+
+    assert_eq!((status, body["status"].as_str(), body["reason"].as_str()), (202, Some("queued"), Some("partially_saved")), "{body}");
+    let stored: Vec<i64> = body["memories"].as_array().expect("memories").iter().map(|m| m["id"].as_i64().unwrap()).collect();
+    assert!(!stored.is_empty() && stored.len() < 15, "{body}");
+    assert!(body["detail"].as_str().is_some_and(|d| d.starts_with("store insert failed")), "{body}");
+    assert!(body["operation_id"].as_str().is_some(), "{body}");
+    let rows = outbox(&h).await;
+    assert_eq!(rows.len(), 1, "the row keeps what is left of the save");
+    assert_eq!(rows[0].0, "pending");
+    let progress: String = h
+        .ctx
+        .runtime
+        .store
+        .conn
+        .call(|c| c.query_row("SELECT progress FROM ingest_outbox", [], |r| r.get(0)))
+        .await
+        .expect("progress");
+    let noted: Vec<i64> = serde_json::from_str::<Vec<Value>>(&progress)
+        .expect("progress parses")
+        .iter()
+        .map(|p| p["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(noted, stored, "the next start resumes after the stored pieces");
+}
+
+#[tokio::test]
 async fn a_save_answers_with_an_operation_id() {
     let h = Harness::start().await;
     let (_, made_up) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a" })).await;

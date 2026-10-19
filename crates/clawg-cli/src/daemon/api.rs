@@ -527,6 +527,9 @@ pub struct SaveBody {
     /// missing is talking to a daemon that ignored it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topic_key: Option<String>,
+    /// Why a save that is still queued stopped, when it stopped part-way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     /// The id this save is recorded under until it is stored.
     pub operation_id: String,
 }
@@ -541,6 +544,7 @@ impl SaveBody {
             related: Vec::new(),
             replaced: Vec::new(),
             topic_key: None,
+            detail: None,
             operation_id,
         }
     }
@@ -965,7 +969,20 @@ fn save_response(
                         .map(|r| ReplacedMemory { kind: "memory", id: r.id, excerpt: r.excerpt })
                         .collect(),
                     topic_key: None,
+                    detail: None,
                     operation_id,
+                },
+            ));
+        }
+        // The pieces stored so far stay noted in the save's row, which the
+        // next start finishes: the save is accepted, not failed.
+        Some(IngestFailure::Failed(detail)) if !memories.is_empty() => {
+            return Ok((
+                StatusCode::ACCEPTED,
+                SaveBody {
+                    memories: Some(memories),
+                    detail: Some(detail),
+                    ..SaveBody::queued("partially_saved", operation_id)
                 },
             ));
         }
@@ -1120,10 +1137,11 @@ async fn save_memory(
         Ok(Err(_)) | Err(_) => Confirmation::Unconfirmed,
     };
     // A failure this answer carries reaches the caller here, so nobody needs
-    // the row to learn about it. Only the handler knows the report arrived in
-    // time: the worker cannot tell a reply that was read from one sent just
-    // as the wait ran out.
-    if matches!(&confirmation, Confirmation::Reported(report) if report.failure.is_some()) {
+    // the row to learn about it, unless the save stored some of its pieces:
+    // the row is then the only way to finish it. Only the handler knows the
+    // report arrived in time: the worker cannot tell a reply that was read
+    // from one sent just as the wait ran out.
+    if matches!(&confirmation, Confirmation::Reported(report) if report.failure.is_some() && report.memories.is_empty()) {
         if let Err(e) = app.runtime.store.outbox_forget(row).await {
             log::warn!("could not drop the outbox row of a failed save: {e}; it is retried on the next start");
         }
@@ -1726,16 +1744,28 @@ mod tests {
         let unconfirmed = save_response(Confirmation::Unconfirmed, "op-1".into(), &[]).expect("not an error");
         assert_eq!(unconfirmed, (StatusCode::ACCEPTED, SaveBody::queued("unconfirmed", "op-1".into())));
 
-        let partial = save_response(Confirmation::Reported(IngestReport {
+        let failed = save_response(Confirmation::Reported(IngestReport {
+            memories: vec![],
+            failure: Some(IngestFailure::Failed("embed failed: onnx".into())),
+            ..Default::default()
+        }), "op-1".into(), &[])
+        .expect_err("a failure that stored nothing is an error");
+        assert_eq!(failed.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(failed.message, "ingest_failed");
+        assert_eq!(failed.detail.as_deref(), Some("embed failed: onnx"));
+        assert_eq!(failed.memories, Some(vec![]));
+
+        let (status, partial) = save_response(Confirmation::Reported(IngestReport {
             memories: vec![chunk(57, ChunkOutcome::Inserted)],
             failure: Some(IngestFailure::Failed("store insert failed: disk full".into())),
             ..Default::default()
         }), "op-1".into(), &[])
-        .expect_err("a failure is an error");
-        assert_eq!(partial.status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(partial.message, "ingest_failed");
+        .expect("a save that stored a piece is accepted");
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(partial.reason, Some("partially_saved"));
         assert_eq!(partial.detail.as_deref(), Some("store insert failed: disk full"));
         assert_eq!(partial.memories, Some(vec![SavedMemory { kind: "memory", id: 57, outcome: "inserted" }]));
+        assert_eq!(partial.operation_id, "op-1");
 
         let unavailable = save_response(Confirmation::Reported(IngestReport {
             memories: vec![],
