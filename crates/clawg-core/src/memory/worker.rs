@@ -101,6 +101,17 @@ const INGEST_QUEUE_WARN_DEPTH: usize = 64;
 /// How often a worker held for the embedder checks whether it has loaded.
 const EMBEDDER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// The longest a save the embedder could not take waits for its next try:
+/// `IdleEmbedder` recovers a dead inference worker at most once a minute, so
+/// trying more often only finds it not ready again.
+const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a save waits before its `retries`-th try after a transient
+/// failure: one second, doubling, at most [`MAX_RETRY_DELAY`].
+fn retry_delay(retries: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(1u64 << retries.min(6)).min(MAX_RETRY_DELAY)
+}
+
 /// Which way the backlog just crossed [`INGEST_QUEUE_WARN_DEPTH`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueueDepthEdge {
@@ -239,13 +250,21 @@ fn drain_step(now: Instant, deadline: Option<Instant>, embedder_ready: bool) -> 
 /// `replay` holds the events a previous shutdown spilled. They go first, in
 /// file order, before anything from the channel.
 ///
+/// A save with an outbox row that the embedder could not take is answered
+/// with that failure, its attempt handed back, and tried again after
+/// [`retry_delay`], until it is stored or fails for another reason. Nothing
+/// behind it is taken meanwhile: two saves under one topic key must be applied
+/// in the order they were accepted, and while the embedder is away the ones
+/// behind would fail the same way.
+///
 /// `drain` carries the instant a shutdown wants the queue drained by. Once it
 /// is set the channel is closed to new events, what is already queued keeps
 /// being ingested until [`drain_step`] says to stop, and the events not yet
 /// started (unreplayed ones first) are returned in order for the caller to
 /// spill. The event in flight
 /// always finishes: a half-ingested event replayed later would duplicate the
-/// chunks that did land. A dropped `drain` sender never asks for a drain.
+/// chunks that did land. A save waiting for its retry is left in its row. A
+/// dropped `drain` sender never asks for a drain.
 /// A spilled request's reply is dropped unanswered, so its caller reports the
 /// save as unconfirmed rather than failed.
 ///
@@ -302,58 +321,69 @@ pub async fn memory_worker(
         }
         hold_for_embedder(&embedder_cell, &mut rx, &mut drain, &mut deadline).await;
         if drain_step(Instant::now(), deadline, embedder_cell.get().is_some()) == DrainStep::Spill {
-            return unstarted(IngestRequest { event: evt, reply, outbox }, replay, &mut rx);
+            return unstarted(Some(IngestRequest { event: evt, reply, outbox }), replay, &mut rx);
         }
-        let track = match outbox {
-            None => None,
-            Some(row) if startup.is_second_delivery(row, from_replay) => {
-                log::debug!("outbox row {row} arrived twice; ingested once");
-                // A dropped reply reads as unconfirmed.
-                if let (Some(reply), Some(report)) = (reply, replayed.remove(&row)) {
-                    let _ = reply.send(report);
-                }
-                continue;
-            }
-            Some(row) => match take_row(&store, row).await {
-                Some(progress) => Some(Track { row, progress }),
-                None => continue,
-            },
-        };
-        let report = process_tracked(
-            &evt,
-            &store,
-            &embedder_cell,
-            &chat_chunker,
-            &mut absorbed_duplicates,
-            track,
-        )
-        .await;
-        if let (Some(row), Some(failure)) = (outbox, &report.failure) {
-            let transient = *failure == IngestFailure::EmbedderUnavailable;
-            if let Err(e) = store.outbox_fail(row, failure.to_string(), transient).await {
-                log::warn!("could not note why outbox row {row} stopped: {e}");
-            }
-        }
-        if let Some(e) = &report.failure {
-            log::warn!(
-                "ingest event stopped after {} stored chunks (agent={}, role={:?}): {e}",
-                report.memories.len(),
-                evt.agent_id,
-                evt.role
-            );
-        }
-        if !report.redacted.is_empty() {
-            let kinds: Vec<&str> = report.redacted.iter().map(|k| k.as_str()).collect();
-            log::info!("ingest masked {} (agent={})", kinds.join(", "), evt.agent_id);
-        }
-        match (reply, outbox) {
-            (Some(reply), _) => {
+        if let Some(row) = outbox.filter(|row| startup.is_second_delivery(*row, from_replay)) {
+            log::debug!("outbox row {row} arrived twice; ingested once");
+            // A dropped reply reads as unconfirmed.
+            if let (Some(reply), Some(report)) = (reply, replayed.remove(&row)) {
                 let _ = reply.send(report);
             }
-            (None, Some(row)) if from_replay => {
-                replayed.insert(row, report);
+            continue;
+        }
+        let mut reply = reply;
+        let mut retries = 0;
+        loop {
+            let track = match outbox {
+                None => None,
+                Some(row) => match take_row(&store, row).await {
+                    Some(progress) => Some(Track { row, progress }),
+                    None => break,
+                },
+            };
+            let report = process_tracked(
+                &evt,
+                &store,
+                &embedder_cell,
+                &chat_chunker,
+                &mut absorbed_duplicates,
+                track,
+            )
+            .await;
+            let transient = report.failure == Some(IngestFailure::EmbedderUnavailable);
+            if let (Some(row), Some(failure)) = (outbox, &report.failure) {
+                if let Err(e) = store.outbox_fail(row, failure.to_string(), transient).await {
+                    log::warn!("could not note why outbox row {row} stopped: {e}");
+                }
             }
-            _ => {}
+            if let Some(e) = &report.failure {
+                log::warn!(
+                    "ingest event stopped after {} stored chunks (agent={}, role={:?}): {e}",
+                    report.memories.len(),
+                    evt.agent_id,
+                    evt.role
+                );
+            }
+            if !report.redacted.is_empty() && retries == 0 {
+                let kinds: Vec<&str> = report.redacted.iter().map(|k| k.as_str()).collect();
+                log::info!("ingest masked {} (agent={})", kinds.join(", "), evt.agent_id);
+            }
+            match (reply.take(), outbox) {
+                (Some(reply), _) => {
+                    let _ = reply.send(report);
+                }
+                (None, Some(row)) if from_replay && retries == 0 => {
+                    replayed.insert(row, report);
+                }
+                _ => {}
+            }
+            let Some(row) = outbox.filter(|_| transient) else { break };
+            let delay = retry_delay(retries);
+            log::info!("outbox row {row} is tried again in {}s, once the embedder can take it", delay.as_secs());
+            if !wait_to_retry(delay, &mut rx, &mut drain, &mut deadline).await {
+                return unstarted(None, replay, &mut rx);
+            }
+            retries += 1;
         }
     }
     log::info!("memory_worker shutting down — channel closed");
@@ -433,6 +463,34 @@ async fn hold_for_embedder(
     }
 }
 
+/// Waits `delay` before a save is tried again. `false` when a drain started
+/// meanwhile, or every sender is gone and nothing can ask for one: the save
+/// then stays in its row for the next start.
+async fn wait_to_retry(
+    delay: std::time::Duration,
+    rx: &mut Receiver<IngestRequest>,
+    drain: &mut Option<watch::Receiver<Option<Instant>>>,
+    deadline: &mut Option<Instant>,
+) -> bool {
+    let until = Instant::now() + delay;
+    loop {
+        observe_drain(rx, drain, deadline);
+        if deadline.is_some() || rx.is_closed() {
+            return false;
+        }
+        let Some(signal) = drain.as_mut() else {
+            tokio::time::sleep_until(until).await;
+            return true;
+        };
+        tokio::select! {
+            _ = tokio::time::sleep_until(until) => return true,
+            changed = signal.changed() => if changed.is_err() {
+                *drain = None;
+            },
+        }
+    }
+}
+
 /// Takes outbox `row` for this run: its progress, or `None` when there is
 /// nothing to ingest (taken already in this run, finished, failed, given up
 /// just now, or unreadable, which leaves it for the next start).
@@ -456,12 +514,12 @@ async fn take_row(store: &Arc<MemoryStore>, row: i64) -> Option<Vec<NotedPiece>>
 /// the next start. Closes the channel first so nothing can slip in behind the
 /// last event read.
 fn unstarted(
-    first: IngestRequest,
+    first: Option<IngestRequest>,
     replay: Replay,
     rx: &mut Receiver<IngestRequest>,
 ) -> Vec<MemoryEvent> {
     rx.close();
-    let mut requests = vec![first];
+    let mut requests: Vec<IngestRequest> = first.into_iter().collect();
     requests.extend(replay.into_remaining());
     while let Ok(next) = rx.try_recv() {
         requests.push(next);
@@ -3427,6 +3485,138 @@ mod tests {
         assert_eq!((state.as_str(), attempts, progress.len()), ("pending", 1, 0));
         assert!(error.unwrap().starts_with("store insert failed"));
         assert_eq!(count_memory(&store).await, 0);
+    }
+
+    // ── A save the embedder could not take is retried ────────────────────────
+
+    #[test]
+    fn retry_delay_doubles_up_to_a_minute() {
+        let secs = |n| retry_delay(n).as_secs();
+        assert_eq!((secs(0), secs(1), secs(2), secs(5)), (1, 2, 4, 32));
+        assert_eq!((secs(6), secs(7), secs(40)), (60, 60, 60));
+    }
+
+    /// Not ready for the first `failures` batches, then the fake model.
+    struct FlakyEmbedder {
+        failures: std::sync::atomic::AtomicUsize,
+    }
+    impl FlakyEmbedder {
+        fn failing(times: usize) -> Arc<Self> {
+            Arc::new(Self { failures: std::sync::atomic::AtomicUsize::new(times) })
+        }
+    }
+    #[async_trait::async_trait]
+    impl Embedder for FlakyEmbedder {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+            FakeEmbedder::default().embed_with_role(text, role).await
+        }
+        async fn embed_batch(&self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
+            use std::sync::atomic::Ordering;
+            if self.failures.load(Ordering::SeqCst) > 0 {
+                self.failures.fetch_sub(1, Ordering::SeqCst);
+                return Err(EmbedError::NotReady);
+            }
+            FakeEmbedder::default().embed_batch(texts, role).await
+        }
+        fn dimensions(&self) -> usize { 384 }
+        fn model_id(&self) -> &str { "flaky" }
+        fn query_prefix(&self) -> &str { "" }
+        fn passage_prefix(&self) -> &str { "" }
+    }
+
+    async fn record_event(store: &MemoryStore, evt: MemoryEvent) -> i64 {
+        match store.outbox_record(uuid::Uuid::new_v4().to_string(), evt).await.unwrap() {
+            crate::memory::outbox::Recorded::New { row } => row,
+            other => panic!("expected a new row, got {other:?}"),
+        }
+    }
+
+    /// A worker over the pending rows whose channel stays open, as the
+    /// daemon's does, with the sender of its drain signal.
+    fn spawn_replaying(
+        store: &Arc<MemoryStore>,
+        embedder: Arc<dyn Embedder>,
+        rows: Vec<(i64, MemoryEvent)>,
+    ) -> (Sender<IngestRequest>, watch::Sender<Option<Instant>>, JoinHandle<Vec<MemoryEvent>>) {
+        let cell: OnceCell<Arc<dyn Embedder>> = OnceCell::new();
+        cell.set(embedder).ok();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let (drain_tx, drain_rx) = watch::channel(None);
+        let worker = tokio::spawn(memory_worker(
+            rx,
+            drain_rx,
+            Replay::rows(rows),
+            store.clone(),
+            Arc::new(cell),
+            Arc::new(ChatChunker::with_fallback()),
+        ));
+        (tx, drain_tx, worker)
+    }
+
+    async fn wait_until_gone(store: &MemoryStore, row: i64) {
+        for _ in 0..100 {
+            if outbox_row(store, row).await.is_none() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("outbox row {row} was not finished within 5 s: {:?}", outbox_row(store, row).await);
+    }
+
+    #[tokio::test]
+    async fn a_transient_failure_is_retried_in_the_same_run() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let row = record(&store, "saved while the model could not load").await;
+        let rows = store.outbox_pending().await.unwrap();
+        let (tx, _drain, worker) = spawn_replaying(&store, FlakyEmbedder::failing(1), rows);
+
+        wait_until_gone(&store, row).await;
+
+        assert_eq!(count_memory(&store).await, 1);
+        drop(tx);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_save_behind_a_retried_one_waits_for_it() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let first = record_event(&store, keyed("Storage engine is SQLite\nOne local file.", "storage/engine")).await;
+        let second = record_event(&store, keyed("Storage engine is Postgres\nConcurrent writers.", "storage/engine")).await;
+        let rows = store.outbox_pending().await.unwrap();
+        let (tx, _drain, worker) = spawn_replaying(&store, FlakyEmbedder::failing(1), rows);
+
+        wait_until_gone(&store, first).await;
+        wait_until_gone(&store, second).await;
+
+        let live = live_with_key(&store, "storage/engine").await;
+        assert_eq!(live.len(), 1, "{live:?}");
+        assert!(content_of(&store, live[0]).await.starts_with("Storage engine is Postgres"), "the later save is the live one");
+        drop(tx);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_drain_during_a_retry_leaves_the_row_pending() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let row = record(&store, "saved while the model never came back").await;
+        let rows = store.outbox_pending().await.unwrap();
+        let (_tx, drain, worker) = spawn_replaying(&store, FlakyEmbedder::failing(usize::MAX), rows);
+        for _ in 0..100 {
+            if outbox_row(&store, row).await.is_some_and(|r| r.2.is_some()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        drain.send(Some(Instant::now() + std::time::Duration::from_secs(10))).unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(500), worker)
+            .await
+            .expect("a drain ends the wait for the retry")
+            .unwrap();
+
+        let (state, attempts, error, _) = outbox_row(&store, row).await.expect("the row stays");
+        assert_eq!((state.as_str(), attempts), ("pending", 0));
+        assert_eq!(error.as_deref(), Some("the embedder is not available"));
     }
 
     // ── Test harnesses ───────────────────────────────────────────────────────

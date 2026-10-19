@@ -603,6 +603,11 @@ impl ClawgMcp {
                     None => "accepted".to_string(),
                 };
                 Ok(match reason.as_deref() {
+                    Some("retrying") => format!(
+                        "{accepted}; the embedding model could not take it ({}), and clawg keeps retrying \
+                         until it is stored (memory_status lists it if it fails)",
+                        detail.as_deref().unwrap_or("no cause given"),
+                    ),
                     Some("partially_saved") => format!(
                         "partially saved as {} ({}); the rest waits as operation {}, which clawg retries \
                          when the daemon next starts (memory_status lists it if it fails)",
@@ -2627,6 +2632,17 @@ mod tests {
         assert_eq!(
             text(Ok(queued("already_queued"))),
             Ok("accepted as operation op-7 earlier and still waiting to be stored".to_string())
+        );
+        assert_eq!(
+            text(Ok(SaveOutcome::Queued {
+                reason: Some("retrying".into()),
+                operation_id: Some("op-7".into()),
+                memories: vec![],
+                detail: Some("the embedder is not available".into()),
+            })),
+            Ok("accepted as operation op-7; the embedding model could not take it (the embedder is not \
+                available), and clawg keeps retrying until it is stored (memory_status lists it if it fails)"
+                .to_string())
         );
         assert_eq!(
             text(Ok(SaveOutcome::Queued {

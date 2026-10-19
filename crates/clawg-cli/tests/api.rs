@@ -18,7 +18,7 @@ use clawg_core::memory::bootstrap::EmbedderStatus;
 use clawg_core::memory::embedder::{EmbedError, EmbedRole, Embedder, FakeEmbedder};
 use clawg_core::memory::idle_embedder::{IdleEmbedder, ReloadFn};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use clawg_core::memory::worker::IngestRequest;
+use clawg_core::memory::worker::{IngestFailure, IngestReport, IngestRequest};
 use clawg_core::paths::Profile;
 use clawg_core::runtime::{MemoryRuntime, INGEST_QUEUE_CAPACITY};
 use tokio::sync::mpsc::Receiver;
@@ -46,6 +46,10 @@ enum EmbedderState {
     DroppingReplies,
     /// The model was let go for being idle; loading it again works or fails.
     Unloaded { reload_fails: bool },
+    /// The embedder is ready and something takes each save off the queue and
+    /// answers that the embedder could not take it, as the worker does before
+    /// it tries the save again.
+    AnsweringUnavailable,
     /// Texts holding one of these keys embed to its vector, so a test decides
     /// the cosines; any other text embeds as the fake model would.
     Fixed(Vec<(&'static str, Vec<f32>)>),
@@ -269,6 +273,18 @@ impl Harness {
             EmbedderState::DroppingReplies => {
                 let mut rx = rx;
                 tokio::spawn(async move { while rx.recv().await.is_some() {} });
+                (runtime, None)
+            }
+            EmbedderState::AnsweringUnavailable => {
+                let mut rx = rx;
+                tokio::spawn(async move {
+                    while let Some(request) = rx.recv().await {
+                        let report = IngestReport { failure: Some(IngestFailure::EmbedderUnavailable), ..Default::default() };
+                        if let Some(reply) = request.reply {
+                            let _ = reply.send(report);
+                        }
+                    }
+                });
                 (runtime, None)
             }
         };
@@ -2962,6 +2978,21 @@ async fn a_save_with_the_model_unloaded_is_stored() {
         .await;
     assert_eq!(status, 201, "{body}");
     assert_eq!(h.reloads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_save_the_model_cannot_take_answers_202_retrying_and_keeps_its_row() {
+    let h = Harness::start_inner(EmbedderState::AnsweringUnavailable).await;
+    let (status, body) = h
+        .post_json("/v1/memories", json!({ "content": "saved while the model files are gone", "agent_id": "a" }))
+        .await;
+
+    assert_eq!((status, body["reason"].as_str()), (202, Some("retrying")), "{body}");
+    assert_eq!(body["detail"], "the embedder is not available", "{body}");
+    assert!(body["operation_id"].as_str().is_some(), "{body}");
+    let rows = outbox(&h).await;
+    assert_eq!(rows.len(), 1, "the worker retries the row: {rows:?}");
+    assert_eq!(rows[0].0, "pending");
 }
 
 #[tokio::test]

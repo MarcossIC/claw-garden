@@ -986,10 +986,18 @@ fn save_response(
                 },
             ));
         }
-        Some(IngestFailure::EmbedderUnavailable) => ApiError {
-            detail: Some(IngestFailure::EmbedderUnavailable.to_string()),
-            ..ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "embedder_unavailable")
-        },
+        // The worker keeps the save and tries it again once the embedder can
+        // take it.
+        Some(IngestFailure::EmbedderUnavailable) => {
+            return Ok((
+                StatusCode::ACCEPTED,
+                SaveBody {
+                    memories: Some(memories).filter(|m| !m.is_empty()),
+                    detail: Some(IngestFailure::EmbedderUnavailable.to_string()),
+                    ..SaveBody::queued("retrying", operation_id)
+                },
+            ));
+        }
         Some(IngestFailure::Failed(detail)) => ApiError {
             detail: Some(detail),
             ..ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "ingest_failed")
@@ -1137,11 +1145,14 @@ async fn save_memory(
         Ok(Err(_)) | Err(_) => Confirmation::Unconfirmed,
     };
     // A failure this answer carries reaches the caller here, so nobody needs
-    // the row to learn about it, unless the save stored some of its pieces:
-    // the row is then the only way to finish it. Only the handler knows the
-    // report arrived in time: the worker cannot tell a reply that was read
-    // from one sent just as the wait ran out.
-    if matches!(&confirmation, Confirmation::Reported(report) if report.failure.is_some() && report.memories.is_empty()) {
+    // the row to learn about it, unless the save stored some of its pieces or
+    // the worker tries it again: the row is then the only way to finish it.
+    // Only the handler knows the report arrived in time: the worker cannot
+    // tell a reply that was read from one sent just as the wait ran out.
+    if matches!(
+        &confirmation,
+        Confirmation::Reported(IngestReport { failure: Some(IngestFailure::Failed(_)), memories, .. }) if memories.is_empty()
+    ) {
         if let Err(e) = app.runtime.store.outbox_forget(row).await {
             log::warn!("could not drop the outbox row of a failed save: {e}; it is retried on the next start");
         }
@@ -1767,15 +1778,16 @@ mod tests {
         assert_eq!(partial.memories, Some(vec![SavedMemory { kind: "memory", id: 57, outcome: "inserted" }]));
         assert_eq!(partial.operation_id, "op-1");
 
-        let unavailable = save_response(Confirmation::Reported(IngestReport {
+        let (status, retrying) = save_response(Confirmation::Reported(IngestReport {
             memories: vec![],
             failure: Some(IngestFailure::EmbedderUnavailable),
             ..Default::default()
         }), "op-1".into(), &[])
-        .expect_err("a failure is an error");
-        assert_eq!(unavailable.status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(unavailable.message, "embedder_unavailable");
-        assert_eq!(unavailable.memories, Some(vec![]));
+        .expect("the worker tries it again");
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(retrying.reason, Some("retrying"));
+        assert_eq!(retrying.detail.as_deref(), Some("the embedder is not available"));
+        assert_eq!(retrying.memories, None);
     }
 
     #[test]
