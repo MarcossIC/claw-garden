@@ -49,8 +49,9 @@ Un solo commit: la regla sola sería código muerto, y las advertencias son erro
 ## 9. Verificación
 
 - [x] `cargo test --workspace` y el clippy de `.claude/CLAUDE.md` en Linux.
-- [ ] Lo mismo en Windows, en `target-test`.
-- [ ] Perfil dev con el puente MCP real. (El binario real ya se probó en un home temporal: [verify](verify.md#binario-real-home-temporal).)
+- [x] Lo mismo en Windows, en `target-test`.
+- [x] Perfil dev con el puente MCP real. (El binario real ya se probó en un home temporal: [verify](verify.md#binario-real-home-temporal).)
+- [x] V17 a través de `clawg update`: test `an_update_over_a_store_without_supersede_causes_keeps_its_rows_and_tells_revisions_from_verdicts` (`binary.rs`) y una base real de la release anterior. Commit: `test(cli): update over a store without supersede causes`
 - [x] `verify.md`.
 
 ## 10. Archive

@@ -9,6 +9,6 @@ artifacts:
   design: done
   tasks: done
   apply: done
-  verify: partial  # Linux y el binario real en un home temporal; faltan Windows y el perfil dev
+  verify: done
   archive: pending
 updated: 2026-10-19
