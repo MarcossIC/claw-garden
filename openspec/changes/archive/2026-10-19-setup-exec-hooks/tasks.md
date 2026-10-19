@@ -38,3 +38,7 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 - [x] `clawg setup claude-code` con el binario de tests en un home temporal, y el `claude` real del PATH.
 - [x] Suite y clippy en Windows, y `clawg setup claude-code` con una ruta con espacio y una sesión real de Claude Code que recibe el contexto del hook.
 - [x] `verify.md`.
+
+## 7. Archive
+
+- [x] `specs/setup` con la definición de hook en sus dos formas, R3, R6, R7 y R8, y las citas de `setup.rs` realineadas; el puntero y las citas de `cli.rs` y `main.rs` en `specs/hooks`; `git mv` a `changes/archive/2026-10-19-setup-exec-hooks`; `state.yaml` archivado; fila 66, fila 50 y orden de ejecución del `README.md` de openspec; subir el minor.

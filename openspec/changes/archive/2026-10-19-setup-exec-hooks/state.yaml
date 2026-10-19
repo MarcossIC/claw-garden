@@ -1,7 +1,7 @@
 change: setup-exec-hooks
 objective: "4"
 depends_on: []
-phase: verify
+phase: archived
 artifacts:
   exploration: done
   proposal: done
@@ -10,5 +10,6 @@ artifacts:
   tasks: done
   apply: done
   verify: done  # Linux y Windows con el claude real en un home temporal, y una sesión real en Windows, sin CRITICAL; Windows sin Git Bash, un enlace en Windows y un cliente anterior a 2.1.139 quedan como WARNING
-  archive: pending
+  archive: done
 updated: 2026-10-19
+main_spec: openspec/specs/setup/spec.md
