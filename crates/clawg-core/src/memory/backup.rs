@@ -322,6 +322,9 @@ pub fn snapshot_into(
         let _ = std::fs::remove_file(&tmp);
         return Err(BackupError::Io { path, source });
     }
+    if let Err(source) = sync_dir(dir) {
+        return Err(BackupError::Io { path, source });
+    }
     if reason.is_automatic() {
         prune(dir);
     }
@@ -414,7 +417,26 @@ fn swap_in(tmp: &Path, db: &Path) -> std::io::Result<()> {
             _ => {}
         }
     }
-    std::fs::rename(tmp, db)
+    std::fs::rename(tmp, db)?;
+    match db.parent() {
+        Some(dir) => sync_dir(dir),
+        None => Ok(()),
+    }
+}
+
+/// Makes a rename in `dir` survive a power cut. On Unix the rename lives in
+/// the directory entry, which reaches the disk only when the directory itself
+/// is synced: without it a `pre-migration` snapshot could be gone after a
+/// crash although the migration it guards was applied. NTFS journals the
+/// rename with the file system, and Windows cannot open a directory this way.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Whether `path` is a whole clawg store this binary can open, read without
@@ -896,6 +918,14 @@ mod tests {
         }
         assert_eq!(std::fs::read(dir.path().join("memory.db")).unwrap(), before);
         assert!(files_in(&dir.path().join("backups")).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_syncs_and_a_missing_one_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        sync_dir(dir.path()).expect("a directory syncs");
+        assert!(sync_dir(&dir.path().join("missing")).is_err());
     }
 
     /// A copy of a store something still had open carries commits in its
