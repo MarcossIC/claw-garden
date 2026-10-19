@@ -232,22 +232,6 @@ impl MemoryStore {
             .map_err(MemoryError::Connection)??;
         }
         run_migrations(&conn).await?;
-        // Raise SQLITE_LIMIT_VARIABLE_NUMBER from the default 999 to 32766 (SQLite hard
-        // maximum). Flush batches of ≤500 rows × 3 bind vars = 1500 params would otherwise
-        // exceed the default limit at row 334.
-        conn.call(|c| -> rusqlite::Result<()> {
-            // SAFETY: c is the exclusive connection reference for this call.
-            unsafe {
-                rusqlite::ffi::sqlite3_limit(
-                    c.handle(),
-                    rusqlite::ffi::SQLITE_LIMIT_VARIABLE_NUMBER,
-                    32766,
-                );
-            }
-            Ok(())
-        })
-        .await
-        .map_err(MemoryError::Connection)?;
         Ok(Self {
             conn,
             knn_latency: Arc::new(KnnLatency::new()),
@@ -269,20 +253,6 @@ impl MemoryStore {
             .map_err(MemoryError::Sqlite)?;
         register_udfs(&conn).await?;
         run_migrations(&conn).await?;
-        // Raise SQLITE_LIMIT_VARIABLE_NUMBER — same as open() path.
-        conn.call(|c| -> rusqlite::Result<()> {
-            // SAFETY: c is the exclusive connection reference for this call.
-            unsafe {
-                rusqlite::ffi::sqlite3_limit(
-                    c.handle(),
-                    rusqlite::ffi::SQLITE_LIMIT_VARIABLE_NUMBER,
-                    32766,
-                );
-            }
-            Ok(())
-        })
-        .await
-        .map_err(MemoryError::Connection)?;
         Ok(Self {
             conn,
             knn_latency: Arc::new(KnnLatency::new()),
@@ -1639,17 +1609,19 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // SQLITE_LIMIT_VARIABLE_NUMBER must be 32766 through BOTH connection-
-    // opening paths (open() and new_for_test()) — a mismatch here would mean
-    // only one of the two ever benefits from the raised bind-parameter cap.
+    // opening paths (open() and new_for_test()). The bundled SQLite compiles
+    // it at that value, the default since 3.32.0, and nothing raises it: an
+    // access flush binds 1500 parameters, which a build still at the old 999
+    // would refuse at row 334.
     // -----------------------------------------------------------------------
 
-    /// Production open() path sets SQLITE_LIMIT_VARIABLE_NUMBER = 32766.
+    /// Production open() path binds up to 32766 variables.
     ///
     /// Uses `sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, -1)` to query the
     /// current value without changing it (SQLite contract: any negative new_val
     /// is a no-op that returns the current limit).
     #[tokio::test]
-    async fn limit_variable_number_set_in_open_path() {
+    async fn limit_variable_number_in_open_path() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let limit: i32 = store
@@ -1669,9 +1641,9 @@ mod tests {
         assert_eq!(limit, 32766, "open(): expected 32766, got {limit}");
     }
 
-    /// Test new_for_test() path sets SQLITE_LIMIT_VARIABLE_NUMBER = 32766.
+    /// Test new_for_test() path binds up to 32766 variables.
     #[tokio::test]
-    async fn limit_variable_number_set_in_new_for_test_path() {
+    async fn limit_variable_number_in_new_for_test_path() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let limit: i32 = store
             .conn
