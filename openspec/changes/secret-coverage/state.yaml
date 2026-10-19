@@ -1,14 +1,14 @@
 change: secret-coverage
 objective: "1"
 depends_on: []
-phase: apply
+phase: verify
 artifacts:
   exploration: done
   proposal: done
   spec: done
   design: skipped  # the decisions are in the proposal
   tasks: done
-  apply: in_progress
-  verify: pending
+  apply: done
+  verify: done  # Linux, the repository corpus and a real daemon in a test home, no CRITICAL; Windows is a WARNING until the CI
   archive: pending
 updated: 2026-10-19

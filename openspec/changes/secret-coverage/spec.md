@@ -35,7 +35,7 @@ Un formato conocido MUST seguir ganando sobre su contexto (`HF_TOKEN=hf_…` que
 - WHEN se enmascara
 - THEN el texto no cambia y no hay tipos
 
-**Tests:** `every_known_secret_format_is_masked_in_place`, `a_literal_credential_is_masked_and_its_key_kept`, `code_and_placeholders_after_a_credential_key_are_left_alone`, `a_known_format_wins_over_its_context`, `a_pgp_private_key_block_is_masked`, `masking_twice_finds_nothing_new` (`redact.rs`).
+**Tests:** `every_known_secret_format_is_masked_in_place`, `ordinary_identifiers_and_hashes_are_left_alone`, `a_literal_credential_is_masked_and_its_key_kept`, `code_and_placeholders_after_a_credential_key_are_left_alone`, `a_known_format_wins_over_its_context`, `a_pgp_private_key_block_is_masked`, `the_slack_app_and_stripe_webhook_forms_are_masked`, `masking_twice_finds_nothing_new` (`redact.rs`).
 
 ## R4 (modifica). `clawg secrets` también mira los veredictos
 
@@ -46,7 +46,7 @@ Un formato conocido MUST seguir ganando sobre su contexto (`HF_TOKEN=hf_…` que
 - WHEN se escanea
 - THEN el reporte lista la fila y el par, con sus tipos, y ningún carácter del token
 
-**Tests:** `the_scan_finds_reasons_that_hold_a_secret` (`crates/clawg-core/src/memory/secrets.rs`), `the_secrets_report_lists_pairs_and_how_to_mask_them` (`crates/clawg-cli/src/secrets.rs`).
+**Tests:** `the_scan_finds_reasons_that_hold_a_secret` y `the_scan_of_a_store_from_before_the_pairs_lists_rows_only` (`crates/clawg-core/src/memory/secrets.rs`), `the_secrets_report_lists_pairs_and_how_to_mask_them` (`crates/clawg-cli/src/secrets.rs`).
 
 ## R5 (modifica). Lo que `purge` borra y lo que devuelve
 
@@ -108,7 +108,7 @@ MUST, en este orden: sin `--yes`, negarse sin abrir nada; sin `memory.db`, falla
 - WHEN se corre con `--yes`
 - THEN el primero queda `rotated [REDACTED:github_token]`, el otro igual, y los bytes del token no están en `memory.db` ni en el WAL
 
-**Tests:** `masking_reasons_rewrites_only_the_ones_with_a_secret`, `masking_reasons_refuses_while_the_daemon_holds_the_store` (`secrets.rs`); `mask_reasons_needs_yes` (`crates/clawg-cli/src/secrets.rs`); `secrets_takes_only_a_profile` (`cli.rs`).
+**Tests:** `masking_reasons_rewrites_only_the_ones_with_a_secret`, `masking_reasons_refuses_while_the_daemon_holds_the_store` (`secrets.rs`); `mask_reasons_needs_yes` y `the_mask_report_names_pairs_and_backups` (`crates/clawg-cli/src/secrets.rs`); `secrets_takes_a_profile_and_masks_reasons_on_request` (`cli.rs`).
 
 ## R9 (nuevo). `last_error` se guarda enmascarado
 
