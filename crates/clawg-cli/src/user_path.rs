@@ -149,6 +149,11 @@ pub mod registry {
         };
         let area: Vec<u16> = "Environment".encode_utf16().chain([0]).collect();
         let mut result = 0usize;
+        // With `HWND_BROADCAST` each top-level window gets the whole timeout,
+        // so a few slow ones add up. It stays at 5 s anyway: a window that has
+        // not taken the message when its time runs out never gets it, and an
+        // Explorer that missed it hands the old PATH to every new terminal.
+        //
         // SAFETY: `area` is a NUL-terminated UTF-16 string that outlives the
         // call; the timeout bounds the wait on windows that do not answer.
         unsafe {
