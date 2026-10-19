@@ -597,12 +597,24 @@ impl ClawgMcp {
                 }
                 Ok(text)
             }
-            Ok(SaveOutcome::Queued { reason, operation_id }) => {
+            Ok(SaveOutcome::Queued { reason, operation_id, memories, detail }) => {
                 let accepted = match &operation_id {
                     Some(id) => format!("accepted as operation {id}"),
                     None => "accepted".to_string(),
                 };
                 Ok(match reason.as_deref() {
+                    Some("retrying") => format!(
+                        "{accepted}; the embedding model could not take it ({}), and clawg keeps retrying \
+                         until it is stored (memory_status lists it if it fails)",
+                        detail.as_deref().unwrap_or("no cause given"),
+                    ),
+                    Some("partially_saved") => format!(
+                        "partially saved as {} ({}); the rest waits as operation {}, which clawg retries \
+                         when the daemon next starts (memory_status lists it if it fails)",
+                        ids(&memories),
+                        detail.as_deref().unwrap_or("no cause given"),
+                        operation_id.as_deref().unwrap_or("unknown"),
+                    ),
                     Some("embedder_loading") => format!(
                         "{accepted}; it will be stored once the embedding model finishes loading \
                          (memory_status lists it if it fails)"
@@ -2599,7 +2611,12 @@ mod tests {
                 (update_memory changes its importance or type)"
                 .to_string())
         );
-        let queued = |reason: &str| SaveOutcome::Queued { reason: Some(reason.into()), operation_id: Some("op-7".into()) };
+        let queued = |reason: &str| SaveOutcome::Queued {
+            reason: Some(reason.into()),
+            operation_id: Some("op-7".into()),
+            memories: vec![],
+            detail: None,
+        };
         assert_eq!(
             text(Ok(queued("unconfirmed"))),
             Ok("accepted as operation op-7 but not confirmed yet; memory_status lists it if it fails, \
@@ -2617,7 +2634,34 @@ mod tests {
             Ok("accepted as operation op-7 earlier and still waiting to be stored".to_string())
         );
         assert_eq!(
-            text(Ok(SaveOutcome::Queued { reason: Some("embedder_loading".into()), operation_id: None })),
+            text(Ok(SaveOutcome::Queued {
+                reason: Some("retrying".into()),
+                operation_id: Some("op-7".into()),
+                memories: vec![],
+                detail: Some("the embedder is not available".into()),
+            })),
+            Ok("accepted as operation op-7; the embedding model could not take it (the embedder is not \
+                available), and clawg keeps retrying until it is stored (memory_status lists it if it fails)"
+                .to_string())
+        );
+        assert_eq!(
+            text(Ok(SaveOutcome::Queued {
+                reason: Some("partially_saved".into()),
+                operation_id: Some("op-7".into()),
+                memories: vec![saved(57, "inserted"), saved(58, "inserted")],
+                detail: Some("store insert failed: disk full".into()),
+            })),
+            Ok("partially saved as #57, #58 (store insert failed: disk full); the rest waits as operation op-7, \
+                which clawg retries when the daemon next starts (memory_status lists it if it fails)"
+                .to_string())
+        );
+        assert_eq!(
+            text(Ok(SaveOutcome::Queued {
+                reason: Some("embedder_loading".into()),
+                operation_id: None,
+                memories: vec![],
+                detail: None,
+            })),
             Ok("accepted; it will be stored once the embedding model finishes loading \
                 (memory_status lists it if it fails)"
                 .to_string())
@@ -2659,8 +2703,8 @@ mod tests {
             Err("not saved: the ingest queue is full; try again shortly".to_string())
         );
         for answer in [
-            text(Ok(SaveOutcome::Queued { reason: None, operation_id: None })),
-            text(Ok(SaveOutcome::Queued { reason: Some("unconfirmed".into()), operation_id: Some("op-7".into()) })),
+            text(Ok(SaveOutcome::Queued { reason: None, operation_id: None, memories: vec![], detail: None })),
+            text(Ok(queued("unconfirmed"))),
         ] {
             let t = answer.unwrap();
             assert!(!t.split(|c: char| !c.is_alphanumeric()).any(|w| w == "queued"), "{t}");

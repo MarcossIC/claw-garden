@@ -13,15 +13,18 @@ Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde q
 - [topic-revisions](../../changes/archive/2026-10-18-topic-revisions/proposal.md), archivado el 2026-10-18 (sólo la fila de V16 y «Una base en V15 abre con sus filas sin clave»). Qué hace un save con clave está en [`specs/ingest`](../ingest/spec.md).
 - [model-download](../../changes/archive/2026-10-19-model-download/proposal.md), archivado el 2026-10-19 (la «Descarga del modelo», y la recarga desde la caché y su reparación en «Recargar a demanda, una sola vez» y «Una recarga que falla no deja nada roto»). Lo que dice el error de una descarga que agota sus intentos está en [`specs/ingest`](../ingest/spec.md), «Estado en `/health` y `clawg status`».
 - [embedder-recovery](../../changes/archive/2026-10-19-embedder-recovery/proposal.md), archivado el 2026-10-19 («Un pánico en la inferencia contesta y suelta la sesión», «Un hilo muerto se recupera en la misma llamada», y el `IdleEmbedder` sin barrido con ocio `0`).
+- [outbox-lifecycle](../../changes/archive/2026-10-19-outbox-lifecycle/proposal.md), archivado el 2026-10-19 (el reintento de un fallo pasajero en la misma ejecución, la regla única de `failed`, la pausa del apagado entre pedazos y «Una fila `failed` se reintenta o se descarta»). Lo que contesta un save que falla a medias está en [`specs/ingest`](../ingest/spec.md).
 
 ## Definiciones
 
 - **Save aceptado:** uno que respondió `201` o `202`: su fila está confirmada en el outbox, o ya terminó de guardarse ([`specs/ingest`](../ingest/spec.md), «Aceptar es durable»).
 - **Outbox:** la tabla `ingest_outbox` de `memory.db` (migración V14, `crates/clawg-core/migrations/V14__ingest_outbox.sql`). Una fila por save aceptado y no terminado: `operation_id` y `agent_id` (únicos juntos), `content` (el texto ya enmascarado, en su propia columna para que `purge` lo encuentre con `instr`), `event` (el `MemoryEvent` en JSON con `content` vacío), `state` (`pending` o `failed`), `attempts`, `last_error`, `progress`, `created_at` y `updated_at`. El `id` es `AUTOINCREMENT` porque el worker recuerda por id las filas que ya tomó en esta ejecución, y un id reusado se leería como una ya vista.
-- **Progreso:** la lista de posiciones de un save ya escritas (`NotedPiece`, `outbox.rs:85`): para cada una, su posición, el hash de su texto, la fila de `memory` que la tiene, si este save la insertó o la reforzó, y la cabecera con la que se embebió.
-- **Tope de intentos (`MAX_ATTEMPTS`, `outbox.rs:25`):** 3.
+- **Progreso:** la lista de posiciones de un save ya escritas (`NotedPiece`, `outbox.rs:86`): para cada una, su posición, el hash de su texto, la fila de `memory` que la tiene, si este save la insertó o la reforzó, y la cabecera con la que se embebió.
+- **Tope de intentos (`MAX_ATTEMPTS`, `outbox.rs:26`):** 3.
+- **Toma:** `outbox_claim` de una fila (`outbox.rs:299`), que gasta un intento.
+- **Fallo pasajero:** `IngestFailure::EmbedderUnavailable`: el modelo no está, o su recarga no pudo hacerse.
 - **Apagado ordenado:** el que empieza con Ctrl-C o con `POST /v1/shutdown`. Un kill del proceso no es un apagado ordenado.
-- **Plazo de drenaje (`DRAIN_DEADLINE`, `crates/clawg-core/src/runtime.rs:55`):** el tiempo máximo que el apagado dedica a ingerir lo encolado.
+- **Plazo de drenaje (`DRAIN_DEADLINE`, `crates/clawg-core/src/runtime.rs:56`):** el tiempo máximo que el apagado dedica a ingerir lo encolado.
 - **Volcado viejo:** el archivo `<data>/ingest-pending.jsonl` (`SPILL_FILE`, `crates/clawg-core/src/memory/spill.rs:11`), un `MemoryEvent` en JSON por línea, que las versiones anteriores al outbox escribían en un apagado ordenado. Ninguna versión actual lo escribe.
 - **Directorio de backups:** `<data>/backups/` (`backups_dir`, `crates/clawg-core/src/paths.rs`).
 - **Snapshot:** una copia completa y autónoma de `memory.db` hecha con `VACUUM INTO`. Incluye lo commiteado en el WAL y no tiene archivo WAL propio.
@@ -32,7 +35,7 @@ Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde q
 
 ### Un save aceptado está en el outbox hasta que termina
 
-Un save que termina de guardarse MUST NOT dejar su fila. Cada pieza que el worker inserta o refuerza MUST anotar su posición en el progreso de la fila en la misma transacción que la escribe (`apply_note`, `crates/clawg-core/src/memory/outbox.rs:117`, llamado desde `insert_noting` y `reinforce_noting`). El vínculo de `memory_piece` ([`specs/pieces`](../pieces/spec.md)) y el borrado de la fila MUST ir en una transacción (`outbox_finish`, `outbox.rs:330`, que usa `link_in`, `crates/clawg-core/src/memory/pieces.rs:222`). Las copias repetidas dentro del mismo save se refuerzan después de anotar su posición y sin nota: un kill en ese punto pierde a lo sumo un refuerzo, nunca agrega uno.
+Un save que termina de guardarse MUST NOT dejar su fila. Cada pieza que el worker inserta o refuerza MUST anotar su posición en el progreso de la fila en la misma transacción que la escribe (`apply_note`, `crates/clawg-core/src/memory/outbox.rs:118`, llamado desde `insert_noting` y `reinforce_noting`). El vínculo de `memory_piece` ([`specs/pieces`](../pieces/spec.md)) y el borrado de la fila MUST ir en una transacción (`outbox_finish`, `outbox.rs:459`, que usa `link_in`, `crates/clawg-core/src/memory/pieces.rs:222`). Las copias repetidas dentro del mismo save se refuerzan después de anotar su posición y sin nota: un kill en ese punto pierde a lo sumo un refuerzo, nunca agrega uno.
 
 #### Escenario
 - GIVEN un daemon con el embedder listo
@@ -43,7 +46,7 @@ Un save que termina de guardarse MUST NOT dejar su fila. Cada pieza que el worke
 
 ### Un replay retoma donde quedó
 
-Al tomar una fila con progreso, el worker MUST saltar las posiciones anotadas, MUST NOT reforzar sus filas y MUST vincular cada una con la cabecera anotada (`ingest_pieces`, `worker.rs:687-733`). Si el progreso no encaja con el troceo de hoy (nombra una posición que no existe, repite una, o el hash anotado no es el del texto de esa posición), MUST descartarlo con un warn y seguir por el dedup (`resume_positions`, `outbox.rs:97`, pura): sin saber qué fila tiene cada pieza, el dedup es lo único que evita duplicarlas.
+Al tomar una fila con progreso, el worker MUST saltar las posiciones anotadas, MUST NOT reforzar sus filas y MUST vincular cada una con la cabecera anotada (`ingest_pieces`, `worker.rs:715`). Si el progreso no encaja con el troceo de hoy (nombra una posición que no existe, repite una, o el hash anotado no es el del texto de esa posición), MUST descartarlo con un warn y seguir por el dedup (`resume_positions`, `outbox.rs:98`, pura): sin saber qué fila tiene cada pieza, el dedup es lo único que evita duplicarlas.
 
 #### Escenario
 - GIVEN un save de 3 piezas o más cuyo progreso anota las dos primeras, como si el proceso hubiera muerto antes de la tercera
@@ -54,7 +57,7 @@ Al tomar una fila con progreso, el worker MUST saltar las posiciones anotadas, M
 
 ### Una entrega doble se salta
 
-El worker MUST tomar cada fila a lo sumo una vez por ejecución (`take_row`): una fila que el handler escribió antes de la lectura de arranque llega también por el canal. Esa copia la reconoce `StartupRows` (`worker.rs:199-209`), que guarda sólo los ids que encontró la lectura de arranque y no crece en toda la ejecución, porque el replay corre antes que el canal y una fila escrita después de la lectura llega una sola vez. Una fila que ya no existe, o que está `failed`, MUST saltarse sin escribir nada (`Claimed::Skip`, `outbox.rs:139`). Si la segunda entrega trae un canal de respuesta y la primera vino de la lectura de arranque, el que espera recibe el reporte de la primera.
+El worker MUST tomar cada fila a lo sumo una vez por ejecución (`take_row`): una fila que el handler escribió antes de la lectura de arranque llega también por el canal. Esa copia la reconoce `StartupRows` (`worker.rs:213`), que guarda sólo los ids que encontró la lectura de arranque y no crece en toda la ejecución, porque el replay corre antes que el canal y una fila escrita después de la lectura llega una sola vez. Una fila que ya no existe, o que está `failed`, MUST saltarse sin escribir nada (`Claimed::Skip`, `outbox.rs:140`). Si la segunda entrega trae un canal de respuesta y la primera vino de la lectura de arranque, el que espera recibe el reporte de la primera.
 
 #### Escenario
 - GIVEN una fila pendiente que llega por la lectura de arranque y por el canal
@@ -64,11 +67,11 @@ El worker MUST tomar cada fila a lo sumo una vez por ejecución (`take_row`): un
 
 ### Intentos y fallo a la vista
 
-Tomar una fila MUST sumar un intento antes de procesarla (`outbox_claim`, `outbox.rs:253`). Si la fila ya tenía `MAX_ATTEMPTS`, MUST quedar `failed` con la causa `the daemon stopped N times while ingesting this save`, sin procesarse, y el worker MUST seguir con la siguiente (`claim_step`, `outbox.rs:64`, pura): tres cortes del proceso seguidos con el mismo save dicen que el save es lo que lo mata.
+Tomar una fila MUST sumar un intento antes de procesarla (`outbox_claim`, `outbox.rs:299`). Si la fila ya tenía `MAX_ATTEMPTS`, MUST quedar `failed` con la causa `the daemon stopped N times while ingesting this save`, sin procesarse, y el worker MUST seguir con la siguiente (`claim_step`, `outbox.rs:65`, pura): tres cortes del proceso seguidos con el mismo save dicen que el save es lo que lo mata.
 
-Un fallo del worker MUST anotar su causa en `last_error` (`outbox_fail`, `outbox.rs:300`). Un fallo transitorio (`IngestFailure::EmbedderUnavailable`) MUST NOT contar como intento. Con el tope alcanzado la fila MUST quedar `failed`; si no, `pending` y se reintenta en el próximo arranque, no en la misma ejecución, porque el mismo texto falla igual (`after_failure`, `outbox.rs:75`, pura). Una fila cuyo `event` ya no parsea MUST darse por perdida con esa causa en vez de bloquear a las demás (`outbox_pending`, `outbox.rs:357`).
+Un fallo del worker MUST anotar su causa en `last_error` (`outbox_fail`, `outbox.rs:346`). Una fila MUST pasar a `failed` sólo cuando gastó `MAX_ATTEMPTS` tomas que terminaron en un fallo no pasajero o en la muerte del proceso (`after_failure`, `outbox.rs:76`, pura, y `claim_step`), o cuando su `event` ya no parsea, que MUST darse por perdida con esa causa en vez de bloquear a las demás (`outbox_pending`, `outbox.rs:486`). Un fallo no pasajero que no llega al tope deja la fila `pending` para el próximo arranque, no para la misma ejecución, porque el mismo texto falla igual. Un fallo pasajero y una pausa del apagado (abajo) MUST devolver su intento.
 
-Si el handler contesta al que guardó con el fallo (`500` o `503`), MUST borrar la fila ([`specs/ingest`](../ingest/spec.md), «Un fallo del worker llega al que guardó»). Una fila `failed` MUST NOT borrarse sola: queda a la vista en `/health` ([`specs/ingest`](../ingest/spec.md), «Estado del outbox en `/health`»).
+Si el handler contesta al que guardó un fallo no pasajero sin pedazos guardados (`500`), MUST borrar la fila; con pedazos guardados o con un fallo pasajero MUST conservarla ([`specs/ingest`](../ingest/spec.md), «Un fallo del worker llega al que guardó»). Una fila `failed` MUST NOT borrarse sola: queda a la vista en `/health` ([`specs/ingest`](../ingest/spec.md), «Estado del outbox en `/health`») hasta que el usuario la reintenta o la descarta (abajo).
 
 #### Escenario: evento que corta el proceso
 - GIVEN una fila con `attempts = 3`
@@ -85,13 +88,57 @@ Si el handler contesta al que guardó con el fallo (`500` o `503`), MUST borrar 
 - WHEN un save responde `500 ingest_failed`
 - THEN el outbox está vacío
 
-**Tests:** `claim_step_processes_until_the_attempts_run_out` y `after_failure_fails_a_row_only_at_the_cap_and_hands_back_a_transient_attempt` (`outbox.rs`, mod tests); `claiming_spends_an_attempt_and_gives_up_once_none_is_left`, `a_failure_keeps_its_cause_and_a_transient_one_its_attempt` y `an_event_that_does_not_parse_is_given_up_with_its_cause` (`outbox.rs`, mod tests); `a_row_that_stopped_the_process_three_times_fails_and_the_next_one_runs` y `a_failure_after_the_answer_stays_in_the_outbox_with_its_cause` (`worker.rs`, mod tests); `a_failure_the_caller_was_told_leaves_no_outbox_row` (`tests/api.rs`). Que un fallo transitorio devuelva su intento está probado en el store y en la función pura, no a través del worker; que no se reintente en la misma ejecución no tiene test.
+**Tests:** `claim_step_processes_until_the_attempts_run_out`, `after_failure_fails_a_row_only_at_the_cap_and_hands_back_a_transient_attempt` y `a_pause_hands_back_its_attempt` (`outbox.rs`, mod tests); `claiming_spends_an_attempt_and_gives_up_once_none_is_left`, `a_failure_keeps_its_cause_and_a_transient_one_its_attempt` y `an_event_that_does_not_parse_is_given_up_with_its_cause` (`outbox.rs`, mod tests); `a_row_that_stopped_the_process_three_times_fails_and_the_next_one_runs` y `a_failure_after_the_answer_stays_in_the_outbox_with_its_cause` (`worker.rs`, mod tests); `a_failure_the_caller_was_told_leaves_no_outbox_row` (`tests/api.rs`).
+
+### Un fallo pasajero se reintenta en la misma ejecución
+
+Tras un fallo pasajero de un save con fila, el worker MUST anotar la causa y devolver el intento, MUST contestar al que espera, si lo hay, y MUST tomar la misma fila otra vez tras `retry_delay(n)` (`worker.rs:114`, pura): 1 s la primera vez, el doble cada vez siguiente, a lo sumo 60 s (`MAX_RETRY_DELAY`, `worker.rs:110`, el mismo minuto en que `IdleEmbedder` recupera a lo sumo un hilo muerto). Mientras espera MUST NOT tomar otro evento (`memory_worker`, `worker.rs:299`): dos saves con la misma clave se aplican en el orden en que se aceptaron, y lo que espera detrás fallaría igual. Si en la espera empieza un drenaje, o ya no queda quien lo pida, el worker MUST dejar el save en su fila, con el intento ya devuelto, y terminar como con un evento sin empezar (`wait_to_retry`, `worker.rs:504`). Un evento sin fila MUST informarse como antes, sin reintento. No hay barrido del outbox: las filas que esperan en el canal también están `pending` y el worker no las ve hasta recibirlas.
+
+Una fila de la lectura de arranque que se reintenta retiene también la copia que llegó por el canal con la respuesta de quien la guardó, y ese llamante ve `202 unconfirmed` al vencer su espera. Sólo ocurre con un save aceptado entre que el daemon escucha y que el worker lee el outbox.
+
+#### Escenario: el modelo vuelve
+- GIVEN un save con fila y un embedder que responde `NotReady` una vez y después funciona
+- WHEN el worker lo procesa
+- THEN el save queda guardado y su fila borrada sin reiniciar el worker
+
+#### Escenario: el orden se conserva
+- GIVEN dos saves con la misma `topic_key`, el primero con un fallo pasajero
+- WHEN el worker termina los dos
+- THEN la versión viva de la clave es la del segundo
+
+#### Escenario: un drenaje durante la espera
+- GIVEN un save que espera su reintento
+- WHEN empieza un drenaje
+- THEN el worker termina y la fila queda `pending` con los intentos que tenía antes de tomarla
+
+**Tests:** `retry_delay_doubles_up_to_a_minute`, `a_transient_failure_is_retried_in_the_same_run`, `a_save_behind_a_retried_one_waits_for_it` y `a_drain_during_a_retry_leaves_the_row_pending` (`worker.rs`, mod tests).
+
+### Una fila `failed` se reintenta o se descarta
+
+`MemoryRuntime::retry_failed` y `discard_failed` (`crates/clawg-core/src/runtime.rs:267` y `:282`), detrás de `POST /v1/outbox/retry` y `POST /v1/outbox/discard` (`{"operation_id", "agent_id"?}`, `crates/clawg-cli/src/daemon/api.rs:1485` y `:1491`) y de `clawg outbox retry|discard <OPERATION_ID> [--agent NAME]` (`crates/clawg-cli/src/outbox.rs`), MUST actuar sobre la fila `failed` de ese `operation_id`: la del agente nombrado, o la única que lo tenga (`outbox_find_failed`, `outbox.rs:382`). MUST responder `404` sin fila, y `409` con una fila `pending` (el worker puede estar en ella), con un `operation_id` que tienen varios agentes (la frase de `error` los nombra) o con un evento que ya no parsea (`OutboxActionError`). Un `operation_id` inválido es un `400`, como en un save. El comando va por el daemon en marcha y MUST NOT arrancar uno.
+
+- **Reintentar** MUST escribir otra vez la fila, en una transacción, con otro `id`, `pending`, `attempts = 0`, sin `last_error` y con su progreso (`outbox_requeue`, `outbox.rs:420`), y encolarla. Otro `id` porque el worker reconoce por `id` las filas de su lectura de arranque, y tomaría una que estaba `pending` al arrancar por la segunda entrega de sí misma. Si la cola no la admite, la fila queda `pending` para el próximo arranque y la respuesta lo dice (`queued: false`).
+- **Descartar** MUST borrar suavemente, con el borrado de siempre (`delete_memory_core`), los pedazos que ese save insertó según su progreso y siguen vivos, y después la fila. Como el save no terminó, su revisión no corrió y la versión anterior de su clave sigue viva: borrar sus pedazos no revive nada. `clawg undelete` trae cada uno. La respuesta los nombra, y el `operation_id` queda libre otra vez.
+
+#### Escenario: reintentar
+- GIVEN una fila `failed` con `operation_id` `op-1` y un embedder que funciona
+- WHEN se reintenta `op-1`
+- THEN la memoria queda guardada y el outbox vacío
+
+#### Escenario: descartar
+- GIVEN una fila `failed` cuyo save insertó un pedazo
+- WHEN se descarta
+- THEN el pedazo queda borrado, la respuesta lo nombra, el outbox está vacío y un save con `op-1` vuelve a guardarse
+
+**Tests:** `retrying_a_failed_row_writes_it_again_under_a_new_id`, `only_a_failed_row_is_retried_or_discarded` y `an_operation_id_two_agents_hold_is_ambiguous` (`outbox.rs`, mod tests); `a_failed_save_is_retried_by_its_operation_id`, `discarding_a_failed_save_deletes_the_pieces_it_inserted` y `a_pending_or_shared_operation_id_is_refused` (`tests/api.rs`); `outbox_takes_an_action_an_operation_id_and_an_agent` (`cli.rs`, mod tests); `outbox_reports_say_what_was_done` (`crates/clawg-cli/src/outbox.rs`, mod tests).
 
 ### Ningún save aceptado se pierde en un apagado ordenado
 
 En un apagado ordenado, cada save aceptado MUST terminar en uno de dos lugares: guardado en la base (o absorbido por el gate de dedup), o en el outbox para el próximo arranque. El apagado MUST seguir drenando hasta `DRAIN_DEADLINE`, MUST NOT escribir `ingest-pending.jsonl` y MUST NOT descartar un save: lo que el worker no empezó queda en su fila.
 
-La decisión de seguir drenando o dejar la cola es pura (`drain_step`, `crates/clawg-core/src/memory/worker.rs:221`; su variante `DrainStep::Spill` conserva el nombre de cuando el apagado volcaba a un archivo). `MemoryRuntime::shutdown` (`crates/clawg-core/src/runtime.rs:261`) espera al worker, y el daemon la llama antes de borrar su estado (`crates/clawg-cli/src/daemon/serve.rs:188`). Sólo un evento encolado sin fila (los caminos en proceso de tests y evaluación) puede quedar sin ingerir, y el apagado lo registra con un warn (`runtime.rs:277`).
+La decisión de seguir drenando o dejar la cola es pura (`drain_step`, `crates/clawg-core/src/memory/worker.rs:235`; su variante `DrainStep::Spill` conserva el nombre de cuando el apagado volcaba a un archivo). `MemoryRuntime::shutdown` (`crates/clawg-core/src/runtime.rs:310`) espera al worker, y el daemon la llama antes de borrar su estado (`crates/clawg-cli/src/daemon/serve.rs:188`). Sólo un evento encolado sin fila (los caminos en proceso de tests y evaluación) puede quedar sin ingerir, y el apagado lo registra con un warn (`runtime.rs:328`).
+
+Un save con fila que está en curso MUST mirar el plazo antes de insertar cada pedazo, salvo el primero que inserta cada toma (`pause_due`, `worker.rs:246`, pura, leída en `ingest_pieces`), porque el drenaje puede empezar después de tomarlo. Vencido, MUST detenerse con el progreso ya anotado (`IngestReport::paused`), MUST devolver el intento sin cambiar `last_error` (`outbox_pause`, `outbox.rs:371`), MUST NOT contestar al que espera (que ve `202 unconfirmed`) y MUST terminar como con un evento sin empezar; el próximo arranque retoma el save. La primera inserción de cada toma no se pausa: así una toma no tira entero el embed que pagó, un save de un solo pedazo termina, y un save largo avanza en cada arranque. Un evento sin fila termina siempre: retomarlo duplicaría lo guardado.
 
 #### Escenario: embedder listo
 - GIVEN el embedder cargado y 20 saves aceptados
@@ -108,16 +155,22 @@ La decisión de seguir drenando o dejar la cola es pura (`drain_step`, `crates/c
 - WHEN se hace un apagado ordenado
 - THEN el save en curso termina su insert, y los que no empezaron quedan en el outbox
 
-**Tests:** `shutdown_ingests_every_queued_event_when_the_embedder_is_ready`, `shutdown_leaves_saves_held_for_the_embedder_in_the_outbox` y `shutdown_leaves_what_the_drain_deadline_left_unstarted_in_the_outbox` (`crates/clawg-core/tests/shutdown.rs`), más los unit de `drain_step` en `worker.rs` (`a_drain_keeps_ingesting_until_its_deadline` y `a_drain_without_an_embedder_spills_at_once`).
+#### Escenario: un save largo al vencer el plazo
+- GIVEN un save de 3 pedazos o más con los dos primeros guardados por una toma anterior, y un drenaje que vence mientras se embebe el resto
+- WHEN el worker inserta el tercer pedazo y llega al cuarto
+- THEN no lo inserta, la fila conserva su progreso y los intentos de antes de la toma
+- AND otra ejecución termina el save con los mismos ids y el vínculo completo
+
+**Tests:** `shutdown_ingests_every_queued_event_when_the_embedder_is_ready`, `shutdown_leaves_saves_held_for_the_embedder_in_the_outbox` y `shutdown_leaves_what_the_drain_deadline_left_unstarted_in_the_outbox` (`crates/clawg-core/tests/shutdown.rs`), más los unit de `drain_step` en `worker.rs` (`a_drain_keeps_ingesting_until_its_deadline` y `a_drain_without_an_embedder_spills_at_once`), y para la pausa `a_pause_is_due_once_the_drain_deadline_passes` y `a_drain_pauses_a_long_save_between_pieces` (`worker.rs`).
 
 ### Arranque: se ingiere lo pendiente antes que lo nuevo
 
-Al arrancar, el worker (`ingest_worker_future`, `crates/clawg-core/src/runtime.rs:395`) MUST, en este orden:
+Al arrancar, el worker (`ingest_worker_future`, `crates/clawg-core/src/runtime.rs:444`) MUST, en este orden:
 
-1. importar `ingest-pending.jsonl` si existe (`import_spill`, `runtime.rs:440`): cada evento válido pasa a una fila, enmascarado, todos en una transacción con `synchronous = FULL` (`outbox_import`, `outbox.rs:235`); el archivo MUST borrarse sólo después del commit. Si no se pudo borrar, se avisa: una segunda importación la absorbe el dedup;
-2. procesar las filas `pending` en orden de id antes que cualquier evento del canal (`outbox_pending`, `outbox.rs:357`; `Replay`, `worker.rs:165`).
+1. importar `ingest-pending.jsonl` si existe (`import_spill`, `runtime.rs:487`): cada evento válido pasa a una fila, enmascarado, todos en una transacción con `synchronous = FULL` (`outbox_import`, `outbox.rs:281`); el archivo MUST borrarse sólo después del commit. Si no se pudo borrar, se avisa: una segunda importación la absorbe el dedup;
+2. procesar las filas `pending` en orden de id antes que cualquier evento del canal (`outbox_pending`, `outbox.rs:486`; `Replay`, `worker.rs:179`).
 
-Si no se puede leer el outbox, el worker lo registra y sigue con el canal: esas filas esperan al próximo arranque.
+Si no se puede leer el outbox, el worker lo registra y sigue con el canal: esas filas esperan al próximo arranque. Fuera de este arranque, el outbox sólo vuelve al worker por el reintento de un fallo pasajero y por `clawg outbox retry`.
 
 #### Escenario: reinyección
 - GIVEN dos saves aceptados que el apagado dejó en el outbox y un save nuevo, con el embedder listo
@@ -155,7 +208,7 @@ En un apagado ordenado, el tracker MUST escribir el buffer pendiente antes de te
 
 ### Checkpoint al terminar
 
-Después de drenar y del flush del tracker, el apagado SHOULD hacer `PRAGMA wal_checkpoint(TRUNCATE)` (`checkpoint`, `runtime.rs:372`). Un fallo del checkpoint MUST registrarse y MUST NOT impedir el resto del apagado.
+Después de drenar y del flush del tracker, el apagado SHOULD hacer `PRAGMA wal_checkpoint(TRUNCATE)` (`checkpoint`, `runtime.rs:421`). Un fallo del checkpoint MUST registrarse y MUST NOT impedir el resto del apagado.
 
 #### Escenario
 - GIVEN una base en WAL con escrituras recientes
@@ -370,7 +423,7 @@ La descarga MUST usar un cliente con 30 s para conectar y 60 s por lectura (`DOW
 
 ### Un hash por archivo, fuera de los hilos del runtime
 
-Leer y hashear la caché MUST correr en una tarea bloqueante (`check_cache_off_runtime`, `model_download.rs:532`), no en un hilo del runtime asíncrono, en el arranque y en cada recarga. El worker de ingest MUST leer, verificar y parsear `tokenizer.json` en una tarea bloqueante (`ingest_worker_future`, `crates/clawg-core/src/runtime.rs:397`). En una corrida, cada archivo MUST hashearse una sola vez: el de la caché al leerlo (`check_cache`, `:572`), el bajado mientras llegan sus bytes, sin volver a leerlo del disco. Los bytes que recibe la carga MUST ser los mismos que se hashearon. El cierre del archivo bajado (`sync_all` y el `rename`) MUST correr en una tarea bloqueante. Como el archivo bajado queda en memoria para entregarlo sin releerlo, un archivo que anuncia o trae más de 600 MB (`MAX_FILE_BYTES`, `:836`, lo que pide libre el chequeo de disco y más que cualquier archivo del modelo) MUST fallar sin reintentar y sin reservar esa memoria (`DownloadError::TooLarge`, `:350`).
+Leer y hashear la caché MUST correr en una tarea bloqueante (`check_cache_off_runtime`, `model_download.rs:532`), no en un hilo del runtime asíncrono, en el arranque y en cada recarga. El worker de ingest MUST leer, verificar y parsear `tokenizer.json` en una tarea bloqueante (`ingest_worker_future`, `crates/clawg-core/src/runtime.rs:444`). En una corrida, cada archivo MUST hashearse una sola vez: el de la caché al leerlo (`check_cache`, `:572`), el bajado mientras llegan sus bytes, sin volver a leerlo del disco. Los bytes que recibe la carga MUST ser los mismos que se hashearon. El cierre del archivo bajado (`sync_all` y el `rename`) MUST correr en una tarea bloqueante. Como el archivo bajado queda en memoria para entregarlo sin releerlo, un archivo que anuncia o trae más de 600 MB (`MAX_FILE_BYTES`, `:836`, lo que pide libre el chequeo de disco y más que cualquier archivo del modelo) MUST fallar sin reintentar y sin reservar esa memoria (`DownloadError::TooLarge`, `:350`).
 
 #### Escenario: falta un archivo chico
 - GIVEN la caché completa salvo `config.json`
@@ -437,7 +490,7 @@ El cerrojo del modelo queda tomado lo que tarda leer y hashear la caché, nunca 
 #### Escenario: un archivo borrado del modelo suelto
 - GIVEN el modelo suelto, `tokenizer_config.json` borrado de la caché y una descarga que tarda
 - WHEN llegan dos búsquedas seguidas
-- THEN las dos responden `503 embedder_not_ready` (`embed_failure`, `crates/clawg-cli/src/daemon/api.rs:1136`) sin esperar la descarga, y hay una sola en curso
+- THEN las dos responden `503 embedder_not_ready` (`embed_failure`, `crates/clawg-cli/src/daemon/api.rs:1194`) sin esperar la descarga, y hay una sola en curso
 - AND cuando la descarga termina, la búsqueda siguiente carga el modelo y responde
 
 **Tests:** `a_failed_load_is_not_ready_and_the_next_call_tries_again` y `a_model_that_comes_back_as_another_model_is_refused` (`idle_embedder.rs`); `a_reload_with_a_damaged_cache_is_not_ready_and_repairs_it_once_in_the_background` (`bootstrap.rs`); `a_search_whose_model_cannot_load_again_answers_not_ready` (`crates/clawg-cli/tests/api.rs`).
@@ -499,7 +552,7 @@ Buscar, guardar, restaurar y `recall_context` con el modelo suelto MUST esperar 
 
 ### Registrar un proyecto despierta el modelo
 
-`POST /v1/projects` MUST empezar a cargar un modelo suelto y MUST responder sin esperar esa carga (`embedder.wake()`, `api.rs:1522`; `wake`, `idle_embedder.rs:287`). Con el modelo residente MUST NOT cargar nada. Un modelo despertado MUST contar como recién usado.
+`POST /v1/projects` MUST empezar a cargar un modelo suelto y MUST responder sin esperar esa carga (`embedder.wake()`, `api.rs:1607`; `wake`, `idle_embedder.rs:287`). Con el modelo residente MUST NOT cargar nada. Un modelo despertado MUST contar como recién usado.
 
 #### Escenario: el puente empieza una sesión
 - GIVEN el modelo suelto
@@ -530,7 +583,7 @@ En Linux con glibc, dos cosas lo hacen posible:
 
 ### Un solo tokenizer por proceso
 
-El daemon MUST parsear `tokenizer.json` a lo sumo una vez por proceso, y sólo de bytes cuyo SHA-256 verificó. El chunker, el índice de docs y el embedder MUST compartir esa copia, la celda `MemoryRuntime::tokenizer` (`crates/clawg-core/src/runtime.rs:127`). La llenan `resolve_tokenizer_and_chunker` (`crates/clawg-core/src/memory/worker.rs:883`), con `load_verified_tokenizer` (`crates/clawg-core/src/memory/model_download.rs:154`), y `model_loader` (`bootstrap.rs:237`); cada parse deja la línea `tokenizer.json parsed` (`model_download.rs:164` y `:191`). Una recarga MUST NOT volver a parsearlo. El embedder MUST NOT cambiar la configuración del tokenizer compartido. El chunker del worker MUST leer la celda en cada save (`ChatChunker::from_cell`, `crates/clawg-core/src/memory/chunker/chat.rs:64`): una celda que se llena después de construirlo cambia su troceo sin reiniciar, y un mismo save se corta entero con un solo splitter.
+El daemon MUST parsear `tokenizer.json` a lo sumo una vez por proceso, y sólo de bytes cuyo SHA-256 verificó. El chunker, el índice de docs y el embedder MUST compartir esa copia, la celda `MemoryRuntime::tokenizer` (`crates/clawg-core/src/runtime.rs:143`). La llenan `resolve_tokenizer_and_chunker` (`crates/clawg-core/src/memory/worker.rs:984`), con `load_verified_tokenizer` (`crates/clawg-core/src/memory/model_download.rs:154`), y `model_loader` (`bootstrap.rs:237`); cada parse deja la línea `tokenizer.json parsed` (`model_download.rs:164` y `:191`). Una recarga MUST NOT volver a parsearlo. El embedder MUST NOT cambiar la configuración del tokenizer compartido. El chunker del worker MUST leer la celda en cada save (`ChatChunker::from_cell`, `crates/clawg-core/src/memory/chunker/chat.rs:64`): una celda que se llena después de construirlo cambia su troceo sin reiniciar, y un mismo save se corta entero con un solo splitter.
 
 #### Escenario: arranque con el modelo en disco, en cualquier orden
 - GIVEN el modelo en disco
@@ -614,7 +667,7 @@ Después de cada snapshot automático, el directorio de backups MUST conservar l
 
 `clawg backup [--profile P]` (`crates/clawg-cli/src/main.rs:140`) MUST producir un snapshot `manual` e imprimir su ruta.
 
-- Con el daemon andando, MUST pedirlo por `POST /v1/backup` (con el token; `crates/clawg-cli/src/daemon/api.rs:1464`, ruta en `:809`), que lo hace en una conexión propia y corta, dentro de `spawn_blocking`, para que el `VACUUM INTO` no deje esperando detrás a cada llamada de la conexión del daemon (`MemoryStore::snapshot`, `crates/clawg-core/src/memory/db.rs:271`), y responde `{"path": "..."}`. El store en memoria de las pruebas, sin archivo, copia por su propia conexión.
+- Con el daemon andando, MUST pedirlo por `POST /v1/backup` (con el token; `crates/clawg-cli/src/daemon/api.rs:1549`, ruta en `:842`), que lo hace en una conexión propia y corta, dentro de `spawn_blocking`, para que el `VACUUM INTO` no deje esperando detrás a cada llamada de la conexión del daemon (`MemoryStore::snapshot`, `crates/clawg-core/src/memory/db.rs:271`), y responde `{"path": "..."}`. El store en memoria de las pruebas, sin archivo, copia por su propia conexión.
 - Sin daemon, MUST tomar el lock del store con el titular `Maintenance` (`crates/clawg-core/src/memory/store_lock.rs:59`), copiar sin migrar y soltar el lock (`backup_offline`, `backup.rs:339`).
 - Sin `memory.db`, MUST decir que no hay base, sin crear el directorio de datos.
 

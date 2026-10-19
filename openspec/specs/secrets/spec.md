@@ -144,9 +144,9 @@ Dos matches que se superponen MUST resolverse a favor del que empieza antes y, s
 
 ### R2. La ingesta enmascara antes de trocear
 
-El daemon MUST enmascarar el contenido de un save antes de escribir su fila en el outbox (`MemoryRuntime::accept`, `crates/clawg-core/src/runtime.rs:222`): la fila vive en `memory.db` y en cada snapshot mientras el save espera o queda `failed`, y guarda sólo el texto ya enmascarado ([`specs/ingest`](../ingest/spec.md), «Aceptar es durable»). El volcado de una versión anterior, que sí guardaba texto crudo, se enmascara al importarlo (`import_spill`, `runtime.rs:450`).
+El daemon MUST enmascarar el contenido de un save antes de escribir su fila en el outbox (`MemoryRuntime::accept`, `crates/clawg-core/src/runtime.rs:238`): la fila vive en `memory.db` y en cada snapshot mientras el save espera o queda `failed`, y guarda sólo el texto ya enmascarado ([`specs/ingest`](../ingest/spec.md), «Aceptar es durable»). El volcado de una versión anterior, que sí guardaba texto crudo, se enmascara al importarlo (`import_spill`, `runtime.rs:497`).
 
-El worker MUST seguir aplicando `redact` al contenido de cada evento, de cualquier fuente, antes de elegir el chunker y de trocear (`ingest_pieces`, `crates/clawg-core/src/memory/worker.rs:635`): sobre el texto de una fila del outbox ya no encuentra nada, porque `redact` es idempotente (R1), y es la pasada que enmascara un evento que ninguna fila respalda (los caminos en proceso de tests y evaluación). El hash de dedup, el embedding, el FTS y `memory.content` MUST calcularse sobre el texto enmascarado. `IngestReport.redacted` (`worker.rs:85`) MUST llevar los tipos que el worker enmascaró del evento en todos los caminos de salida, también cuando el evento falla después.
+El worker MUST seguir aplicando `redact` al contenido de cada evento, de cualquier fuente, antes de elegir el chunker y de trocear (`ingest_pieces`, `crates/clawg-core/src/memory/worker.rs:730`): sobre el texto de una fila del outbox ya no encuentra nada, porque `redact` es idempotente (R1), y es la pasada que enmascara un evento que ninguna fila respalda (los caminos en proceso de tests y evaluación). El hash de dedup, el embedding, el FTS y `memory.content` MUST calcularse sobre el texto enmascarado. `IngestReport.redacted` (`worker.rs:85`) MUST llevar los tipos que el worker enmascaró del evento en todos los caminos de salida, también cuando el evento falla después.
 
 #### Escenario: el secreto no llega a la base
 - GIVEN un save `deploy uses ghp_<36 caracteres>`
@@ -167,13 +167,13 @@ El worker MUST seguir aplicando `redact` al contenido de cada evento, de cualqui
 
 ### R3. El save dice qué se enmascaró
 
-Una respuesta `201` de `POST /v1/memories` MUST incluir `redacted`, cada tipo una vez y en el orden en que se enmascaró, cuando no está vacía, y MUST omitirlo cuando lo está (`SaveBody.redacted`, `crates/clawg-cli/src/daemon/api.rs:519`; `save_response`, `api.rs:938`). La lista une lo que el daemon enmascaró al aceptar el save con lo que el reporte del worker agrega (`masked_kinds`, `api.rs:985`; sólo un evento sin fila puede sumar algo en el worker):
+Una respuesta `201` de `POST /v1/memories` MUST incluir `redacted`, cada tipo una vez y en el orden en que se enmascaró, cuando no está vacía, y MUST omitirlo cuando lo está (`SaveBody.redacted`, `crates/clawg-cli/src/daemon/api.rs:519`; `save_response`, `api.rs:971`). La lista une lo que el daemon enmascaró al aceptar el save con lo que el reporte del worker agrega (`masked_kinds`, `api.rs:1039`; sólo un evento sin fila puede sumar algo en el worker):
 
 ```json
 {"status": "saved", "memories": [{"kind": "memory", "id": 57, "outcome": "inserted"}], "redacted": ["github_token"]}
 ```
 
-`DaemonClient` MUST leerlo en `SaveOutcome::Saved.redacted` (`crates/clawg-cli/src/client.rs:512`), vacío si un daemon anterior no lo manda. `save_memory` MUST agregar al texto de éxito `; masked <tipos> before storing it` (`save_outcome_text`, `crates/clawg-cli/src/mcp/server.rs:563`). Las respuestas `202` no lo llevan, aunque el daemon ya haya enmascarado: su cuerpo es `status`, `reason` y `operation_id` (`SaveBody::queued`, `api.rs:535`).
+`DaemonClient` MUST leerlo en `SaveOutcome::Saved.redacted` (`crates/clawg-cli/src/client.rs:529`), vacío si un daemon anterior no lo manda. `save_memory` MUST agregar al texto de éxito `; masked <tipos> before storing it` (`save_outcome_text`, `crates/clawg-cli/src/mcp/server.rs:563`). Las respuestas `202` no lo llevan, aunque el daemon ya haya enmascarado: su cuerpo es `status`, `reason` y `operation_id` (`SaveBody::queued`, `api.rs:538`).
 
 #### Escenario
 - GIVEN un daemon con el embedder listo
@@ -336,7 +336,7 @@ También MUST leer cada `workspaces/<agente>/<proyecto>/workspace.md` del direct
 
 ### R9. `last_error` se guarda enmascarado
 
-Todo `last_error` del outbox que lleva el texto de un error MUST pasar por `redact` antes de escribirse: el de `outbox_fail` (`crates/clawg-core/src/memory/outbox.rs:301`) y el de un evento que no se lee (`outbox_pending`, `outbox.rs:361`), cuyo error de serde repite valores del evento. La columna sale en `/health` y en `memory_status`, y nada impide que una librería cite su entrada. El abandono tras tres arranques es un mensaje fijo.
+Todo `last_error` del outbox que lleva el texto de un error MUST pasar por `redact` antes de escribirse: el de `outbox_fail` (`crates/clawg-core/src/memory/outbox.rs:346`) y el de un evento que no se lee (`outbox_pending`, `outbox.rs:486`), cuyo error de serde repite valores del evento. La columna sale en `/health` y en `memory_status`, y nada impide que una librería cite su entrada. El abandono tras tres arranques es un mensaje fijo.
 
 #### Escenario
 - GIVEN una fila del outbox

@@ -50,7 +50,7 @@ use clawg_core::memory::synthesis::{
 use clawg_core::memory::{read_save_core, search_all_memories, RankedHit, SaveText, SearchScope};
 use clawg_core::models::chat::Role;
 use clawg_core::paths::Profile;
-use clawg_core::memory::outbox::{OutboxState, OutboxSummary};
+use clawg_core::memory::outbox::{OutboxActionError, OutboxState, OutboxSummary};
 use clawg_core::memory::redact::SecretKind;
 use clawg_core::memory::store_insert::MemoryType;
 use clawg_core::runtime::{AcceptError, Accepted, MemoryRuntime};
@@ -527,6 +527,9 @@ pub struct SaveBody {
     /// missing is talking to a daemon that ignored it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topic_key: Option<String>,
+    /// Why a save that is still queued stopped, when it stopped part-way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     /// The id this save is recorded under until it is stored.
     pub operation_id: String,
 }
@@ -541,6 +544,7 @@ impl SaveBody {
             related: Vec::new(),
             replaced: Vec::new(),
             topic_key: None,
+            detail: None,
             operation_id,
         }
     }
@@ -744,6 +748,33 @@ impl From<RestoredRow> for RestoredBody {
     }
 }
 
+/// Names a save the daemon gave up on: its operation id, and its agent when
+/// another agent holds the same id.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboxRequest {
+    pub operation_id: String,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+}
+
+/// A failed save taken back to pending; `queued` is false when the queue was
+/// full and it waits for the next start.
+#[derive(Debug, Serialize)]
+pub struct RetriedBody {
+    pub operation_id: String,
+    pub agent_id: String,
+    pub queued: bool,
+}
+
+/// A failed save dropped, with the memories it had inserted, now deleted.
+#[derive(Debug, Serialize)]
+pub struct DiscardedBody {
+    pub operation_id: String,
+    pub agent_id: String,
+    pub deleted: Vec<i64>,
+}
+
 /// Closes the dispute between two `memory` rows. Disputes only ever pair
 /// `memory` rows, so there is no `kind`.
 #[derive(Debug, Deserialize)]
@@ -805,6 +836,8 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         .route("/disputes/resolve", post(resolve_dispute))
         .route("/disputes/judge", post(judge_dispute))
         .route("/synthesis", post(synthesis))
+        .route("/outbox/retry", post(retry_outbox))
+        .route("/outbox/discard", post(discard_outbox))
         .route("/stats", get(stats))
         .route("/backup", post(backup))
         .route("/projects", post(register))
@@ -965,14 +998,35 @@ fn save_response(
                         .map(|r| ReplacedMemory { kind: "memory", id: r.id, excerpt: r.excerpt })
                         .collect(),
                     topic_key: None,
+                    detail: None,
                     operation_id,
                 },
             ));
         }
-        Some(IngestFailure::EmbedderUnavailable) => ApiError {
-            detail: Some(IngestFailure::EmbedderUnavailable.to_string()),
-            ..ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "embedder_unavailable")
-        },
+        // The pieces stored so far stay noted in the save's row, which the
+        // next start finishes: the save is accepted, not failed.
+        Some(IngestFailure::Failed(detail)) if !memories.is_empty() => {
+            return Ok((
+                StatusCode::ACCEPTED,
+                SaveBody {
+                    memories: Some(memories),
+                    detail: Some(detail),
+                    ..SaveBody::queued("partially_saved", operation_id)
+                },
+            ));
+        }
+        // The worker keeps the save and tries it again once the embedder can
+        // take it.
+        Some(IngestFailure::EmbedderUnavailable) => {
+            return Ok((
+                StatusCode::ACCEPTED,
+                SaveBody {
+                    memories: Some(memories).filter(|m| !m.is_empty()),
+                    detail: Some(IngestFailure::EmbedderUnavailable.to_string()),
+                    ..SaveBody::queued("retrying", operation_id)
+                },
+            ));
+        }
         Some(IngestFailure::Failed(detail)) => ApiError {
             detail: Some(detail),
             ..ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "ingest_failed")
@@ -1120,10 +1174,14 @@ async fn save_memory(
         Ok(Err(_)) | Err(_) => Confirmation::Unconfirmed,
     };
     // A failure this answer carries reaches the caller here, so nobody needs
-    // the row to learn about it. Only the handler knows the report arrived in
-    // time: the worker cannot tell a reply that was read from one sent just
-    // as the wait ran out.
-    if matches!(&confirmation, Confirmation::Reported(report) if report.failure.is_some()) {
+    // the row to learn about it, unless the save stored some of its pieces or
+    // the worker tries it again: the row is then the only way to finish it.
+    // Only the handler knows the report arrived in time: the worker cannot
+    // tell a reply that was read from one sent just as the wait ran out.
+    if matches!(
+        &confirmation,
+        Confirmation::Reported(IngestReport { failure: Some(IngestFailure::Failed(_)), memories, .. }) if memories.is_empty()
+    ) {
         if let Err(e) = app.runtime.store.outbox_forget(row).await {
             log::warn!("could not drop the outbox row of a failed save: {e}; it is retried on the next start");
         }
@@ -1407,6 +1465,33 @@ async fn restore_memory(
         Err(RestoreError::Embed(_, e)) => Err(embed_failure(e)),
         Err(e) => Err(ApiError::internal(e)),
     }
+}
+
+fn outbox_error(e: OutboxActionError) -> ApiError {
+    match e {
+        OutboxActionError::NotFound(_) => ApiError::not_found(e.to_string()),
+        OutboxActionError::NotFailed(_) | OutboxActionError::Ambiguous { .. } | OutboxActionError::Unreadable(_) => {
+            ApiError::conflict(e.to_string())
+        }
+        OutboxActionError::Store(_) => ApiError::internal(e),
+    }
+}
+
+/// The operation id of an outbox request, checked as a save checks it.
+fn requested_operation(body: &OutboxRequest) -> ApiResult<String> {
+    Ok(check_operation_id(Some(body.operation_id.clone()))?.unwrap_or_default())
+}
+
+async fn retry_outbox(State(app): State<Arc<AppCtx>>, Json(body): Json<OutboxRequest>) -> ApiResult<Json<RetriedBody>> {
+    let operation_id = requested_operation(&body)?;
+    let retried = app.runtime.retry_failed(&operation_id, body.agent_id.as_deref()).await.map_err(outbox_error)?;
+    Ok(Json(RetriedBody { operation_id, agent_id: retried.agent_id, queued: retried.queued }))
+}
+
+async fn discard_outbox(State(app): State<Arc<AppCtx>>, Json(body): Json<OutboxRequest>) -> ApiResult<Json<DiscardedBody>> {
+    let operation_id = requested_operation(&body)?;
+    let discarded = app.runtime.discard_failed(&operation_id, body.agent_id.as_deref()).await.map_err(outbox_error)?;
+    Ok(Json(DiscardedBody { operation_id, agent_id: discarded.agent_id, deleted: discarded.deleted }))
 }
 
 /// The answer every verdict route gives a refused one.
@@ -1726,26 +1811,39 @@ mod tests {
         let unconfirmed = save_response(Confirmation::Unconfirmed, "op-1".into(), &[]).expect("not an error");
         assert_eq!(unconfirmed, (StatusCode::ACCEPTED, SaveBody::queued("unconfirmed", "op-1".into())));
 
-        let partial = save_response(Confirmation::Reported(IngestReport {
+        let failed = save_response(Confirmation::Reported(IngestReport {
+            memories: vec![],
+            failure: Some(IngestFailure::Failed("embed failed: onnx".into())),
+            ..Default::default()
+        }), "op-1".into(), &[])
+        .expect_err("a failure that stored nothing is an error");
+        assert_eq!(failed.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(failed.message, "ingest_failed");
+        assert_eq!(failed.detail.as_deref(), Some("embed failed: onnx"));
+        assert_eq!(failed.memories, Some(vec![]));
+
+        let (status, partial) = save_response(Confirmation::Reported(IngestReport {
             memories: vec![chunk(57, ChunkOutcome::Inserted)],
             failure: Some(IngestFailure::Failed("store insert failed: disk full".into())),
             ..Default::default()
         }), "op-1".into(), &[])
-        .expect_err("a failure is an error");
-        assert_eq!(partial.status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(partial.message, "ingest_failed");
+        .expect("a save that stored a piece is accepted");
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(partial.reason, Some("partially_saved"));
         assert_eq!(partial.detail.as_deref(), Some("store insert failed: disk full"));
         assert_eq!(partial.memories, Some(vec![SavedMemory { kind: "memory", id: 57, outcome: "inserted" }]));
+        assert_eq!(partial.operation_id, "op-1");
 
-        let unavailable = save_response(Confirmation::Reported(IngestReport {
+        let (status, retrying) = save_response(Confirmation::Reported(IngestReport {
             memories: vec![],
             failure: Some(IngestFailure::EmbedderUnavailable),
             ..Default::default()
         }), "op-1".into(), &[])
-        .expect_err("a failure is an error");
-        assert_eq!(unavailable.status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(unavailable.message, "embedder_unavailable");
-        assert_eq!(unavailable.memories, Some(vec![]));
+        .expect("the worker tries it again");
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(retrying.reason, Some("retrying"));
+        assert_eq!(retrying.detail.as_deref(), Some("the embedder is not available"));
+        assert_eq!(retrying.memories, None);
     }
 
     #[test]
