@@ -664,7 +664,7 @@ mod tests {
 
         let after = conn.call(snapshot).await.unwrap();
         assert_eq!(before, after);
-        assert_eq!(after.0, 16);
+        assert_eq!(after.0, 17);
     }
 
     /// Rows written before `project` existed keep their project ids when the
@@ -1134,6 +1134,87 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(keys, vec![None, None, None]);
+    }
+
+    #[tokio::test]
+    async fn a_database_from_before_revivals_opens_with_its_supersede_causes() {
+        ensure_vec0_registered();
+        let conn = Connection::open_in_memory().await.unwrap();
+        register_udfs(&conn).await.unwrap();
+        conn.call(|c| {
+            configured(crate::memory::migrations::runner())
+                .set_target(refinery::Target::Version(16))
+                .run(c)
+        })
+        .await
+        .unwrap();
+        conn.call(|c| {
+            // 2 is a revision of 1; 4 lost a verdict to 3; 6 was a revision of
+            // 5 until a verdict undid it; 7 is another agent's row under 1's key.
+            let rows: [(i64, &str, &str, Option<i64>, Option<&str>); 7] = [
+                (1, "a", "active", None, Some("storage/engine")),
+                (2, "a", "superseded", Some(1), Some("storage/engine")),
+                (3, "a", "active", None, None),
+                (4, "a", "superseded", Some(3), None),
+                (5, "a", "active", None, Some("api/port")),
+                (6, "a", "superseded", Some(5), Some("api/port")),
+                (7, "b", "superseded", Some(1), Some("storage/engine")),
+            ];
+            for (id, agent, status, by, key) in rows {
+                c.execute(
+                    "INSERT INTO memory \
+                     (id, scope, agent_id, project_id, content, memory_type, source, \
+                      created_at, created_by_type, created_by_ref, \
+                      last_modified_at, last_accessed_at, importance, tier, status, superseded_by, topic_key) \
+                     VALUES (?1, 'agent', ?2, 'p', 'storage engine claim ' || ?1, 'architectural_decision', 'explicit', \
+                      ?1, 'agent', ?2, 1, 1, 5.0, 3, ?3, ?4, ?5)",
+                    rusqlite::params![id, agent, status, by, key],
+                )?;
+            }
+            c.execute_batch(
+                "INSERT INTO memory_piece (save_id, piece, memory_id, context) VALUES (1, 1, 1, ''), (1, 2, 3, 'head');
+                 INSERT INTO memory_conflict (new_id, old_id, distance, state, verdict, created_at, judged_at)
+                 VALUES (6, 5, 0.2, 'judged', 'supersedes', 6, 6), (3, 1, 0.3, 'pending', NULL, 3, NULL);",
+            )?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+
+        let snapshot = |c: &mut rusqlite::Connection| -> Result<Vec<String>, rusqlite::Error> {
+            let mut out = Vec::new();
+            for sql in [
+                "SELECT json_array(id, content, status, superseded_by, topic_key, tier, access_count, last_modified_at) \
+                 FROM memory ORDER BY id",
+                "SELECT json_array(save_id, piece, memory_id, context) FROM memory_piece ORDER BY save_id, piece",
+                "SELECT json_array(new_id, old_id, distance, state, verdict) FROM memory_conflict ORDER BY new_id",
+                "SELECT json_array(rowid) FROM memory_fts WHERE memory_fts MATCH 'engine' ORDER BY rowid",
+            ] {
+                let mut stmt = c.prepare(sql)?;
+                let rows: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+                out.extend(rows);
+            }
+            Ok(out)
+        };
+        let before = conn.call(snapshot).await.unwrap();
+
+        run_migrations(&conn).await.unwrap();
+
+        assert_eq!(conn.call(snapshot).await.unwrap(), before);
+        let added: Vec<(Option<String>, Option<i64>)> = conn
+            .call(|c| {
+                let mut stmt = c.prepare("SELECT supersede_cause, revived_from FROM memory ORDER BY id")?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect();
+                rows
+            })
+            .await
+            .unwrap();
+        let causes: Vec<Option<&str>> = added.iter().map(|(cause, _)| cause.as_deref()).collect();
+        assert_eq!(
+            causes,
+            vec![None, Some("revision"), None, Some("verdict"), None, Some("verdict"), Some("verdict")]
+        );
+        assert!(added.iter().all(|(_, from)| from.is_none()));
     }
 
     fn tamper(dir: &Path, sql: &str) {
@@ -1627,7 +1708,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 16, "Expected exactly 16 applied migrations, got {}", count);
+        assert_eq!(count, 17, "Expected exactly 17 applied migrations, got {}", count);
     }
 
     /// V8 — a fresh store records V8 as applied and carries the FTS5 lexical
@@ -2088,7 +2169,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 16);
+        assert_eq!(migration_count, 17);
     }
 
     // -----------------------------------------------------------------------

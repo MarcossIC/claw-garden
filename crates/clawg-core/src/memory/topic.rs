@@ -128,7 +128,7 @@ pub(crate) fn revise_in(c: &Connection, revision: &Revision, now: TimestampMs) -
             )?;
             continue;
         }
-        c.execute(SUPERSEDE_SQL, rusqlite::params![row.id, head, now])?;
+        c.execute(SUPERSEDE_SQL, rusqlite::params![row.id, head, now, "revision"])?;
         release_challengers(c, row.id, now)?;
         best_tier = Some(best_tier.map_or(tier, |t| t.min(tier)));
         most_accesses = Some(most_accesses.map_or(accesses, |a| a.max(accesses)));
