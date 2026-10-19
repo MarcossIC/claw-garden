@@ -26,11 +26,11 @@ Al aceptar un save, el daemon MUST poner en el evento el id registrado para su `
 - WHEN llega un save
 - THEN la fila tiene `source_session_id` `NULL` y se lee, busca y muestra como antes
 
-**Tests:** `an_event_without_a_session_reads_as_none` (`events.rs`), `a_save_writes_its_session_on_every_row` (`store_insert.rs`), `a_save_carries_the_registered_session` (`tests/api.rs`), `rows_without_a_session_stay_reachable` (`tests/api.rs`), `the_agent_contract_matches_its_file` (sin cambios).
+**Tests:** `an_event_without_a_session_reads_as_none` (`events.rs`), `a_save_writes_its_session_on_every_row` (`worker.rs`), `a_save_carries_the_registered_session`, `a_queued_save_keeps_its_session_in_the_outbox`, `rows_without_a_session_stay_reachable` (`tests/api.rs`), `the_agent_contract_matches_its_file` (sin cambios).
 
 ## R3. El bloque LAST SESSION
 
-Todo prompt de `POST /v1/context`, con consulta o sin ella, MUST llevar, si existe, el resumen visible más nuevo (por `created_at`, un save largo por su pedazo de menor posición) bajo `=== LAST SESSION ===`, después del workspace y antes de RECENT, en el formato de línea de los hits, con ` by <author>` cuando es de otro agente. No depende de la consulta ni del modelo. MUST NOT registrar accesos. Si el resumen más nuevo es también un hit, MUST NOT repetirse en RECENT ni en LONG-TERM. Si el workspace ya lo imprimió, o no hay resumen visible, MUST NOT haber bloque.
+Todo prompt de `POST /v1/context`, con consulta o sin ella, MUST llevar, si existe, el resumen visible más nuevo (por `created_at`, un save largo por su pedazo de menor posición) bajo `=== LAST SESSION ===`, después del workspace y antes de RECENT, en el formato de línea de los hits, con ` by <author>` cuando es de otro agente. No depende de la consulta ni del modelo. MUST NOT registrar accesos. Si el resumen más nuevo es también un hit, MUST NOT repetirse en RECENT ni en LONG-TERM. Sin resumen visible MUST NOT haber bloque.
 
 #### Escenario: la sesión siguiente
 - GIVEN dos `session_summary` de `a` en `p`, de ayer y de hace un mes
@@ -42,7 +42,7 @@ Todo prompt de `POST /v1/context`, con consulta o sin ella, MUST llevar, si exis
 - WHEN `a` pide el contexto y `sharing.json` no oculta `b` a `a`
 - THEN el bloque lo trae marcado `by b`; si lo oculta, el bloque trae el de `a` o no aparece
 
-**Tests:** `the_last_session_block_shows_the_newest_summary`, `the_last_session_block_respects_sharing`, `the_last_session_block_is_not_repeated_as_a_hit`, `a_context_without_a_query_opens_with_the_last_session` (`prompt_builder.rs`).
+**Tests:** `the_last_session_block_shows_the_newest_summary`, `the_last_session_block_respects_sharing`, `the_last_session_block_is_not_repeated_as_a_hit`, `a_context_without_a_query_opens_with_the_last_session` (`prompt_builder.rs`), `a_reach_admits_the_reader_and_whoever_is_not_hidden` (`sharing.rs`).
 
 ## R4. El presupuesto
 

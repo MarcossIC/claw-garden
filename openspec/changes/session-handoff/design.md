@@ -33,7 +33,7 @@ Un save que refuerza una fila existente (mismo texto) no cambia su sesión: la f
 - **Con el sharing, también sin consulta:** RECENT es sólo del agente porque lo elige la fecha y no una consulta. El resumen es lo contrario: lo que más sirve es justamente el de la sesión anterior aunque la haya hecho otro agente (relevo entre clientes en el mismo proyecto). Llega marcado `by <author>` y con la nota de SHARED, como un hit compartido.
 - **Sin umbral de antigüedad:** la línea lleva su fecha y el agente la juzga; un umbral sería una constante sin medir que escondería el único resumen de un proyecto retomado después de meses.
 - **Sin accesos:** se eligió por ser el último, no por ser relevante; contarlo en cada contexto lo promovería de tier por su edad.
-- **Sin repetirlo:** si el resumen es también un hit, sale de RECENT/LONG-TERM; si el workspace lo emitió, no hay bloque (el workspace no se corta y ya lo muestra).
+- **Sin repetirlo:** si el resumen es también un hit (él u otro pedazo del mismo save), sale de RECENT/LONG-TERM. El workspace no hace falta mirarlo: sólo imprime preferencias, decisiones y skills (`crates/clawg-core/src/memory/workspace.rs:257`, `:284`, `:336`), nunca un `session_summary`.
 - **Fuera de los conflictos:** no se suma a las filas cuyos pares se buscan; un resumen nunca entra en un par (`protocol.md:94`).
 
 **Alternativa:** subir el puntaje del último resumen dentro de la búsqueda. Descartada: no llegaría sin consulta, depende del corte relativo y cambiaría el ranking que mide el golden set.
