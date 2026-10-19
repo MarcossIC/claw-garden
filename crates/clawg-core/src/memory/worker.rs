@@ -860,24 +860,23 @@ async fn finish_save(store: &Arc<MemoryStore>, pieces: Vec<StoredPiece>, revisio
 }
 
 /// Resolves the shared tokenizer exactly once and builds the chat chunker
-/// from that SAME value: `tokenizer_cell` and the returned chunker can never
+/// over that SAME cell: `tokenizer_cell` and the returned chunker can never
 /// disagree about which parse of `tokenizer.json` they got, and the file is
-/// never read twice for one process. Pulled out of the worker's setup so this
-/// wiring is unit-testable on its own. The loader is a parameter so the daemon
-/// can pass the one that checks the file's hash and tests can pass their own.
+/// never read twice for one process. A cell this leaves empty is filled by
+/// the model load later, and the chunker splits by tokens from then on.
+/// Pulled out of the worker's setup so this wiring is unit-testable on its
+/// own. The loader is a parameter so the daemon can pass the one that checks
+/// the file's hash and tests can pass their own.
 pub fn resolve_tokenizer_and_chunker<L>(
     base_dir: &std::path::Path,
-    tokenizer_cell: &OnceCell<Arc<tokenizers::Tokenizer>>,
+    tokenizer_cell: &Arc<OnceCell<Arc<tokenizers::Tokenizer>>>,
     load: L,
 ) -> Arc<ChatChunker>
 where
     L: FnOnce(&std::path::Path) -> Option<Arc<tokenizers::Tokenizer>>,
 {
-    let tok = tokenizer_cell
-        .get_or_try_init(|| load(base_dir).ok_or(()))
-        .ok()
-        .cloned();
-    Arc::new(ChatChunker::from_tokenizer(tok))
+    let _ = tokenizer_cell.get_or_try_init(|| load(base_dir).ok_or(()));
+    Arc::new(ChatChunker::from_cell(tokenizer_cell.clone()))
 }
 
 #[cfg(test)]
@@ -3055,7 +3054,7 @@ mod tests {
         let base_dir = unique_temp_dir("resolve-tok");
         write_minimal_tokenizer_fixture(&base_dir);
 
-        let cell: OnceCell<Arc<tokenizers::Tokenizer>> = OnceCell::new();
+        let cell: Arc<OnceCell<Arc<tokenizers::Tokenizer>>> = Arc::new(OnceCell::new());
         let chunker = resolve_tokenizer_and_chunker(&base_dir, &cell, crate::memory::model_download::load_tokenizer);
 
         let cell_tok = cell.get().expect("cell must be filled when tokenizer.json is present");
@@ -3075,10 +3074,29 @@ mod tests {
         std::fs::remove_dir_all(&base_dir).ok();
     }
 
+    /// A new install starts the worker before the first model download lands,
+    /// and the process can then run for days.
+    #[test]
+    fn the_chunker_splits_by_tokens_once_the_tokenizer_loads_after_it() {
+        let base_dir = unique_temp_dir("resolve-tok-late");
+        let cell: Arc<OnceCell<Arc<tokenizers::Tokenizer>>> = Arc::new(OnceCell::new());
+        let chunker = resolve_tokenizer_and_chunker(&base_dir, &cell, |_: &std::path::Path| None);
+        assert!(cell.get().is_none(), "nothing on disk yet");
+
+        write_minimal_tokenizer_fixture(&base_dir);
+        let tokenizer = crate::memory::model_download::load_tokenizer(&base_dir).expect("the fixture loads");
+        cell.set(tokenizer).ok();
+
+        let chunks = chunker.chunk("hello world", 1);
+        assert_eq!(chunks.len(), 2, "once the model loaded, the same chunker must split by tokens");
+
+        std::fs::remove_dir_all(&base_dir).ok();
+    }
+
     #[test]
     fn resolve_tokenizer_and_chunker_leaves_the_cell_empty_when_the_file_is_absent() {
         let base_dir = unique_temp_dir("resolve-tok-absent");
-        let cell: OnceCell<Arc<tokenizers::Tokenizer>> = OnceCell::new();
+        let cell: Arc<OnceCell<Arc<tokenizers::Tokenizer>>> = Arc::new(OnceCell::new());
         let chunker = resolve_tokenizer_and_chunker(&base_dir, &cell, crate::memory::model_download::load_tokenizer);
 
         assert!(cell.get().is_none(), "no tokenizer.json on disk must leave the cell empty");
@@ -3093,7 +3111,7 @@ mod tests {
         write_minimal_tokenizer_fixture(&base_dir);
 
         let parses = std::cell::Cell::new(0u32);
-        let cell: OnceCell<Arc<tokenizers::Tokenizer>> = OnceCell::new();
+        let cell: Arc<OnceCell<Arc<tokenizers::Tokenizer>>> = Arc::new(OnceCell::new());
         let chunker = resolve_tokenizer_and_chunker(&base_dir, &cell, |dir| {
             crate::memory::model_download::load_verified_tokenizer_with(dir, |bytes| {
                 parses.set(parses.get() + 1);

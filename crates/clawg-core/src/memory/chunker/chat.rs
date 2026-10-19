@@ -12,6 +12,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use once_cell::sync::OnceCell;
+
 use super::token_splitter::TokenSplitter;
 use super::{Chunk, CHUNK_MAX_TOKENS, PIECE_MAX_TOKENS, PIECE_OVERLAP_TOKENS, SAVE_HEAD_TOKENS};
 
@@ -25,7 +27,15 @@ pub struct SaveSplit {
 
 /// Turn-based chat chunker. One call per `MemoryEvent` from the worker.
 pub struct ChatChunker {
-    splitter: TokenSplitter,
+    source: Source,
+}
+
+enum Source {
+    Fixed(TokenSplitter),
+    /// Read on every call: the worker's chunker is built before a new
+    /// install's first model download lands, and a splitter fixed at that
+    /// moment would cut by bytes for the rest of the process.
+    Cell(Arc<OnceCell<Arc<tokenizers::Tokenizer>>>),
 }
 
 // Compile-time Send + Sync proof.
@@ -44,8 +54,24 @@ impl ChatChunker {
     /// second parse of the same ~17 MB file.
     pub fn from_tokenizer(tokenizer: Option<Arc<tokenizers::Tokenizer>>) -> Self {
         match tokenizer {
-            Some(tok) => Self { splitter: TokenSplitter::with_tokenizer(tok) },
-            None => Self { splitter: TokenSplitter::fallback() },
+            Some(tok) => Self { source: Source::Fixed(TokenSplitter::with_tokenizer(tok)) },
+            None => Self { source: Source::Fixed(TokenSplitter::fallback()) },
+        }
+    }
+
+    /// A chunker that splits by the tokenizer in `cell` once it is filled, and
+    /// by byte length until then.
+    pub fn from_cell(cell: Arc<OnceCell<Arc<tokenizers::Tokenizer>>>) -> Self {
+        Self { source: Source::Cell(cell) }
+    }
+
+    fn splitter(&self) -> TokenSplitter {
+        match &self.source {
+            Source::Fixed(splitter) => splitter.clone(),
+            Source::Cell(cell) => match cell.get() {
+                Some(tok) => TokenSplitter::with_tokenizer(tok.clone()),
+                None => TokenSplitter::fallback(),
+            },
         }
     }
 
@@ -60,13 +86,13 @@ impl ChatChunker {
     /// Test-only — pre-wired tokenizer.
     #[cfg(test)]
     pub fn with_tokenizer(tok: Arc<tokenizers::Tokenizer>) -> Self {
-        Self { splitter: TokenSplitter::with_tokenizer(tok) }
+        Self { source: Source::Fixed(TokenSplitter::with_tokenizer(tok)) }
     }
 
     /// Test-only — force fallback path.
     #[cfg(test)]
     pub fn with_fallback() -> Self {
-        Self { splitter: TokenSplitter::fallback() }
+        Self { source: Source::Fixed(TokenSplitter::fallback()) }
     }
 
     /// Chunk a single turn's content. The speaker boundary is implicit:
@@ -74,10 +100,7 @@ impl ChatChunker {
     /// chunks share `CHUNK_OVERLAP_TOKENS` tokens so a fact that would
     /// otherwise straddle a hard cut stays whole in at least one of them.
     pub fn chunk(&self, content: &str, max_tokens: usize) -> Vec<Chunk> {
-        if content.is_empty() {
-            return vec![];
-        }
-        self.splitter.split(content, max_tokens, super::CHUNK_OVERLAP_TOKENS)
+        chunk_with(&self.splitter(), content, max_tokens)
     }
 
     /// Splits one event's text for storing. A text that fits in one piece of
@@ -85,20 +108,31 @@ impl ChatChunker {
     /// it, with no head. A longer one is cut into pieces of
     /// [`PIECE_MAX_TOKENS`] sharing [`PIECE_OVERLAP_TOKENS`], each later one
     /// embedded behind the first [`SAVE_HEAD_TOKENS`] of the text.
+    ///
+    /// One splitter cuts all three, so a tokenizer that loads in between
+    /// cannot leave a head cut by bytes over pieces cut by tokens.
     pub fn split_save(&self, content: &str) -> SaveSplit {
-        let whole = self.chunk(content, CHUNK_MAX_TOKENS);
+        let splitter = self.splitter();
+        let whole = chunk_with(&splitter, content, CHUNK_MAX_TOKENS);
         if whole.len() <= 1 {
             return SaveSplit { pieces: whole, head: None };
         }
-        let head = self.splitter.split(content, SAVE_HEAD_TOKENS, 0).into_iter().next().map(|c| c.text);
-        SaveSplit { pieces: self.splitter.split(content, PIECE_MAX_TOKENS, PIECE_OVERLAP_TOKENS), head }
+        let head = splitter.split(content, SAVE_HEAD_TOKENS, 0).into_iter().next().map(|c| c.text);
+        SaveSplit { pieces: splitter.split(content, PIECE_MAX_TOKENS, PIECE_OVERLAP_TOKENS), head }
     }
 
     /// Test-only: see `TokenSplitter::tokenizer_ptr`.
     #[cfg(test)]
     pub(crate) fn tokenizer_ptr(&self) -> Option<*const tokenizers::Tokenizer> {
-        self.splitter.tokenizer_ptr()
+        self.splitter().tokenizer_ptr()
     }
+}
+
+fn chunk_with(splitter: &TokenSplitter, content: &str, max_tokens: usize) -> Vec<Chunk> {
+    if content.is_empty() {
+        return vec![];
+    }
+    splitter.split(content, max_tokens, super::CHUNK_OVERLAP_TOKENS)
 }
 
 #[cfg(test)]
