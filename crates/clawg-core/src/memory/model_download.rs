@@ -1,14 +1,13 @@
 //! First-run model download + SHA-256 verification.
 //!
-//! # Test indirection: HuggingFace base URL
+//! # Origin
 //!
-//! Production code hits `https://huggingface.co/intfloat/multilingual-e5-small/resolve/main`.
-//! Tests MUST NEVER hit the real HF — that would be slow, flaky, and would make the
-//! suite depend on a third-party host being up. So `base_url()` consults the
-//! `CLAWG_HF_BASE_URL` env var; tests
-//! set it to a `mockito::Server::url()` value, prod leaves it unset and falls back to
-//! [`HF_BASE_URL`]. The [`ModelSource`] a test builds also carries an explicit
-//! `base_url` parameter so individual tests can be parallel-safe (env vars are global).
+//! The daemon downloads from [`HF_BASE_URL`] unless `CLAWG_HF_BASE_URL`
+//! ([`BASE_URL_VAR`]) names a mirror: an `https://` URL, or an `http://` one on
+//! the machine itself, for a closed network or an install check. The pinned
+//! SHA-256 of every file is checked whatever the origin. Tests never use the
+//! variable (it is global to the process): the [`ModelSource`] a test builds
+//! carries its own local server.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,7 +21,8 @@ pub struct TokenizerFiles {
     pub tokenizer_config_file: Vec<u8>,
 }
 
-/// Hard-coded HuggingFace base URL (production). Tests override via `base_url()`.
+/// Hugging Face, where the model is downloaded from unless [`BASE_URL_VAR`]
+/// names a mirror.
 pub(super) const HF_BASE_URL: &str =
     "https://huggingface.co/intfloat/multilingual-e5-small/resolve/main";
 
@@ -192,10 +192,31 @@ where
     Some(Arc::new(tokenizer))
 }
 
-/// Returns the base URL for HF resolve requests. Honors the
-/// `CLAWG_HF_BASE_URL` env var to enable mockito-driven tests.
-pub(super) fn base_url() -> String {
-    std::env::var("CLAWG_HF_BASE_URL").unwrap_or_else(|_| HF_BASE_URL.to_string())
+/// Env var naming a mirror of [`HF_BASE_URL`].
+pub(crate) const BASE_URL_VAR: &str = "CLAWG_HF_BASE_URL";
+
+/// The origin [`BASE_URL_VAR`] asks for, without a trailing `/`: unset or
+/// empty is [`HF_BASE_URL`]; otherwise an `https://` URL, or an `http://` one
+/// on `localhost`, `127.0.0.1` or `[::1]`. Plain HTTP to another host would send
+/// the request in the clear, and a typo must not fall back to Hugging Face
+/// unseen, so anything else is an error naming the variable. The error never
+/// repeats the value, which may carry credentials.
+pub(crate) fn base_url_from(raw: Option<&str>) -> Result<String, String> {
+    let text = match raw.map(str::trim) {
+        None | Some("") => return Ok(HF_BASE_URL.to_string()),
+        Some(text) => text,
+    };
+    const ACCEPTED: &str = "use an https:// URL, or an http:// one on localhost, 127.0.0.1 or [::1]";
+    let url = reqwest::Url::parse(text).map_err(|_| format!("{BASE_URL_VAR} is not a URL; {ACCEPTED}"))?;
+    let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    match url.scheme() {
+        "https" if url.host_str().is_some() => Ok(text.trim_end_matches('/').to_string()),
+        "http" if loopback => Ok(text.trim_end_matches('/').to_string()),
+        scheme => Err(format!(
+            "{BASE_URL_VAR} points at {scheme}://{}; {ACCEPTED}",
+            url.host_str().unwrap_or("")
+        )),
+    }
 }
 
 /// Minimum free disk space required before initiating a fresh download (600 MB).
@@ -321,6 +342,8 @@ pub enum DownloadError {
     InsufficientDisk { free_mb: u64, required_mb: u64 },
     #[error("could not build the HTTP client for the model download: {0}")]
     Client(#[source] reqwest::Error),
+    #[error("{0}")]
+    BaseUrl(String),
     #[error("the model files in the cache do not verify: {}", files.join(", "))]
     NotCached { files: Vec<String> },
     #[error("sha-256 mismatch for {file}: expected {expected}, got {actual}")]
@@ -372,7 +395,16 @@ pub async fn ensure_model(
     base_dir: &Path,
     progress: Option<UnboundedSender<DownloadProgress>>,
 ) -> Result<ModelFiles, DownloadError> {
-    let url = base_url();
+    let url = match base_url_from(std::env::var(BASE_URL_VAR).ok().as_deref()) {
+        Ok(url) => url,
+        Err(e) => {
+            let e = DownloadError::BaseUrl(e);
+            if let Some(tx) = progress.as_ref() {
+                let _ = tx.send(DownloadProgress::Error { message: e.to_string() });
+            }
+            return Err(e);
+        }
+    };
     let source = ModelSource {
         base_url: &url,
         oracle: &Fs2Oracle,
@@ -1537,6 +1569,44 @@ mod tests {
             other => panic!("expected NotCached, got {other:?}"),
         }
         assert!(collect_partials(&cache_dir).is_empty());
+    }
+
+    // ---------- CLAWG_HF_BASE_URL ----------
+
+    #[test]
+    fn the_base_url_defaults_to_hugging_face() {
+        for raw in [None, Some(""), Some("  ")] {
+            assert_eq!(base_url_from(raw).as_deref(), Ok(HF_BASE_URL), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn the_base_url_takes_https_and_loopback_http() {
+        for (raw, url) in [
+            ("https://mirror.example/e5/", "https://mirror.example/e5"),
+            ("https://mirror.example:8443/e5", "https://mirror.example:8443/e5"),
+            ("http://127.0.0.1:8080", "http://127.0.0.1:8080"),
+            ("http://localhost:9/model/", "http://localhost:9/model"),
+            ("http://[::1]:9", "http://[::1]:9"),
+        ] {
+            assert_eq!(base_url_from(Some(raw)).as_deref(), Ok(url), "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_base_url_that_is_not_https_or_loopback_is_refused() {
+        for raw in [
+            "http://example.com/e5",
+            "http://user:s3cret@example.com",
+            "http://127.0.0.2:8080",
+            "ftp://127.0.0.1/e5",
+            "file:///models",
+            "not a url",
+        ] {
+            let err = base_url_from(Some(raw)).expect_err(raw);
+            assert!(err.contains(BASE_URL_VAR), "{err}");
+            assert!(!err.contains("s3cret"), "{err}");
+        }
     }
 
     // ---------- The cause of a failure ----------
