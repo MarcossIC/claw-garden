@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::memory::clock::TimestampMs;
 use crate::memory::chunker::embedding_text;
-use crate::memory::dispute::{release_challengers, settle_challengers, settle_row};
+use crate::memory::contradiction::excerpt;
+use crate::memory::dispute::{release_challengers, settle_challengers, settle_row, SUPERSEDE_SQL};
 use crate::memory::revival::revive_after_delete;
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::search::{viewer_match_expression, RankedHit};
@@ -403,12 +404,21 @@ pub enum RestoreError {
 }
 
 /// How a restored row ended up. A `superseded` row is live again but still
-/// replaced: searches leave it out until a `resolve_conflict` verdict keeps it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// replaced: searches leave it out until a `resolve_conflict` verdict keeps
+/// it, or, when the row that replaced it is deleted too
+/// (`superseded_by_deleted`), until that row is restored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct RestoredRow {
     pub id: i64,
     pub status: String,
     pub superseded_by: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic_key: Option<String>,
+    /// The rows its delete had brought back, superseded by it again.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub replaced: Vec<Replaced>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub superseded_by_deleted: bool,
 }
 
 /// The deleted row, scoped like the update read, with the head its vector was
@@ -430,11 +440,12 @@ const RESTORE_TWIN: &str = "SELECT t.id FROM memory m JOIN memory t \
 
 /// The live row that holds the deleted row's topic key now, in the same scope
 /// as `SCOPE_ROWS_SQL` in `topic.rs`. The other pieces of the row's own save
-/// are not holders: a keyed long save gives its key to every piece.
+/// are not holders: a keyed long save gives its key to every piece. Nor is a
+/// row the deleted one's delete brought back: the restore takes it back.
 const RESTORE_TOPIC_HOLDER: &str = "SELECT m.topic_key, t.id FROM memory m JOIN memory t \
      ON t.agent_id IS m.agent_id AND COALESCE(t.project_id, '') = COALESCE(m.project_id, '') \
      AND t.topic_key = m.topic_key \
-     WHERE m.id = ?1 AND t.id <> m.id \
+     WHERE m.id = ?1 AND t.id <> m.id AND t.revived_from IS NOT m.id \
      AND NOT EXISTS (SELECT 1 FROM memory_piece a JOIN memory_piece b ON b.save_id = a.save_id \
                      WHERE a.memory_id = m.id AND b.memory_id = t.id) \
      AND t.deleted_at IS NULL AND t.status IN ('active', 'disputed') \
@@ -450,6 +461,32 @@ const RESTORE_ROW: &str = "UPDATE memory SET deleted_at = NULL, last_modified_at
 /// stays indexed exactly once.
 const RESTORE_TEXT_INDEX: &str = "INSERT INTO memory_fts(rowid, content, agent_id, project_id, memory_type) \
      SELECT id, content, agent_id, project_id, memory_type FROM memory WHERE id = ?1";
+
+/// The restored row as it stands, with whether the row that replaces it is
+/// deleted.
+const RESTORED_SQL: &str = "SELECT m.status, m.superseded_by, m.topic_key, \
+     m.status = 'superseded' AND EXISTS (SELECT 1 FROM memory b WHERE b.id = m.superseded_by AND b.deleted_at IS NOT NULL) \
+     FROM memory m WHERE m.id = ?1";
+
+/// Supersedes again, by the restored row `id`, the live rows its delete had
+/// brought back, as the revision they were first replaced by.
+fn take_back_revived(c: &rusqlite::Connection, id: i64, now: TimestampMs) -> rusqlite::Result<Vec<Replaced>> {
+    let revived: Vec<(i64, String)> = {
+        let mut stmt = c.prepare(
+            "SELECT id, content FROM memory WHERE revived_from = ?1 \
+             AND deleted_at IS NULL AND status IN ('active', 'disputed') ORDER BY id",
+        )?;
+        let rows = stmt.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut replaced = Vec::with_capacity(revived.len());
+    for (row, content) in revived {
+        c.execute(SUPERSEDE_SQL, rusqlite::params![row, id, now, "revision"])?;
+        release_challengers(c, row, now)?;
+        replaced.push(Replaced { id: row, excerpt: excerpt(&content) });
+    }
+    Ok(replaced)
+}
 
 /// Brings back the deleted `memory` row `id` with its vector and text index
 /// entry. With `owner`, another agent's row is answered as missing.
@@ -530,10 +567,28 @@ pub async fn restore_memory_core(
             tx.execute(DELETE_VEC_MEMORY, [id])?;
             tx.execute("INSERT INTO memory_vectors(rowid, embedding) VALUES (?1, ?2)", rusqlite::params![id, bytes])?;
             tx.execute(RESTORE_TEXT_INDEX, [id])?;
+            let (status, superseded_by): (String, Option<i64>) =
+                tx.query_row("SELECT status, superseded_by FROM memory WHERE id = ?1", [id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?;
+            let replaced = match superseded_by.filter(|_| status == "superseded") {
+                None => take_back_revived(&tx, id, now)?,
+                Some(by) => {
+                    revive_after_delete(&tx, by, now)?;
+                    Vec::new()
+                }
+            };
             settle_row(&tx, id, now)?;
             settle_challengers(&tx, id, now)?;
-            let row = tx.query_row("SELECT status, superseded_by FROM memory WHERE id = ?1", [id], |r| {
-                Ok(RestoredRow { id, status: r.get(0)?, superseded_by: r.get(1)? })
+            let row = tx.query_row(RESTORED_SQL, [id], |r| {
+                Ok(RestoredRow {
+                    id,
+                    status: r.get(0)?,
+                    superseded_by: r.get(1)?,
+                    topic_key: r.get(2)?,
+                    replaced,
+                    superseded_by_deleted: r.get(3)?,
+                })
             })?;
             tx.commit()?;
             Ok(Outcome::Restored(row))
@@ -3137,7 +3192,7 @@ mod tests {
 
         let row = restore(&store, id, Some("a")).await.unwrap();
 
-        assert_eq!(row, RestoredRow { id, status: "active".into(), superseded_by: None });
+        assert_eq!(row, RestoredRow { id, status: "active".into(), ..RestoredRow::default() });
         let query = passage(content).await;
         let hits = search_all_memories(&store, &query, None, "a", SearchScope::all_default(), 10).await.unwrap();
         assert!(hits.iter().any(|h| h.id == id), "the vector search finds it again");
@@ -3376,7 +3431,7 @@ mod tests {
 
         let row = restore(&store, id, None).await.unwrap();
 
-        assert_eq!(row, RestoredRow { id, status: "superseded".into(), superseded_by: Some(keep) });
+        assert_eq!(row, RestoredRow { id, status: "superseded".into(), superseded_by: Some(keep), ..RestoredRow::default() });
         let (deleted_at, status, update_count, access_count, last_accessed_at, tier) = columns(&store, id).await;
         assert_eq!(
             (deleted_at, status.as_str(), update_count, access_count, last_accessed_at, tier),
@@ -3435,7 +3490,15 @@ mod tests {
 
         let row = restore(&store, second, Some("a")).await.unwrap();
 
-        assert_eq!(row, RestoredRow { id: second, status: "active".into(), superseded_by: None });
+        assert_eq!(
+            row,
+            RestoredRow {
+                id: second,
+                status: "active".into(),
+                topic_key: Some("ledger/notes".into()),
+                ..RestoredRow::default()
+            }
+        );
         assert!(columns(&store, second).await.0.is_none(), "the piece is live");
         assert!(stored_vector(&store, second).await.is_some());
         assert_eq!(text_matches(&store, "second").await, vec![second]);
@@ -3657,6 +3720,87 @@ mod tests {
         delete_reporting(&store, v2).await;
 
         assert_eq!(memory_status(&store, challenger).await, "disputed");
+    }
+
+    #[tokio::test]
+    async fn restoring_the_deleted_revision_replaces_the_revived_one_again() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let v1 = keyed(&store, "a", "Storage engine is SQLite", "storage/engine").await;
+        let v2 = keyed(&store, "a", "Storage engine moved to Postgres", "storage/engine").await;
+        supersede(&store, v1, v2, "revision").await;
+        delete_reporting(&store, v2).await;
+
+        let row = restore(&store, v2, Some("a")).await.unwrap();
+
+        assert_eq!(
+            row,
+            RestoredRow {
+                id: v2,
+                status: "active".into(),
+                topic_key: Some("storage/engine".into()),
+                replaced: vec![Replaced { id: v1, excerpt: "Storage engine is SQLite".into() }],
+                ..RestoredRow::default()
+            }
+        );
+        assert_eq!(lineage(&store, v1).await, replaced_by(v2, "revision"));
+        assert_eq!(lineage(&store, v2).await, current());
+    }
+
+    #[tokio::test]
+    async fn a_newer_revision_still_blocks_the_restore() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let v1 = keyed(&store, "a", "Storage engine is SQLite", "storage/engine").await;
+        let v2 = keyed(&store, "a", "Storage engine moved to Postgres", "storage/engine").await;
+        supersede(&store, v1, v2, "revision").await;
+        delete_reporting(&store, v2).await;
+        let v3 = keyed(&store, "a", "Storage engine moved to DuckDB", "storage/engine").await;
+        supersede(&store, v1, v3, "revision").await;
+
+        let err = restore(&store, v2, Some("a")).await.unwrap_err();
+
+        assert!(matches!(err, RestoreError::TopicTaken { id, live, .. } if id == v2 && live == v3), "{err:?}");
+        assert_eq!(lineage(&store, v3).await, current());
+    }
+
+    #[tokio::test]
+    async fn a_row_replaced_by_a_deleted_revision_comes_back_current() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let v1 = keyed(&store, "a", "Storage engine is SQLite", "storage/engine").await;
+        let v2 = keyed(&store, "a", "Storage engine moved to Postgres", "storage/engine").await;
+        supersede(&store, v1, v2, "revision").await;
+        delete_reporting(&store, v1).await;
+        delete_reporting(&store, v2).await;
+
+        let row = restore(&store, v1, Some("a")).await.unwrap();
+
+        assert_eq!((row.status.as_str(), row.superseded_by, row.superseded_by_deleted), ("active", None, false));
+        assert_eq!(lineage(&store, v1).await, revived_by(v2));
+
+        restore(&store, v2, Some("a")).await.unwrap();
+        assert_eq!(lineage(&store, v1).await, replaced_by(v2, "revision"), "restoring v2 takes it back");
+    }
+
+    #[tokio::test]
+    async fn a_row_replaced_by_a_deleted_verdict_winner_says_so() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let loser = save(&store, "a", "the api listens on 8080").await;
+        let winner = save(&store, "a", "the api listens on 9090").await;
+        supersede(&store, loser, winner, "verdict").await;
+        delete_reporting(&store, loser).await;
+        delete_reporting(&store, winner).await;
+
+        let row = restore(&store, loser, Some("a")).await.unwrap();
+
+        assert_eq!(
+            row,
+            RestoredRow {
+                id: loser,
+                status: "superseded".into(),
+                superseded_by: Some(winner),
+                superseded_by_deleted: true,
+                ..RestoredRow::default()
+            }
+        );
     }
 
     /// Seeds a row the way the previous version leaves a deleted one: the
