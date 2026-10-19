@@ -46,4 +46,12 @@ PowerShell 7.6.7 en Linux, con PSScriptAnalyzer 1.25.0 bajado del release que us
 
 ## CI del PR
 
-Pendiente: se completa con la corrida de GitHub sobre el PR.
+Sobre `0536952`, el último commit con código del cambio (los posteriores tocan sólo `openspec/`, la versión y la mezcla de `develop`), las tres corridas del PR terminaron en verde:
+
+| Workflow | Job | Resultado |
+|---|---|---|
+| CI | `test (ubuntu-latest)` y `test (windows-latest)` | verde: con 1.99.1, `--locked`, el `clippy` de `-p clawg-cli` sin `testing` y `build_info` sin `testing`, en las dos plataformas |
+| Advisories | `advisories` | verde: `cargo-deny` 0.20.2 pasó la comparación del hash y `advisories ok` |
+| Installer | `analyze` (`windows-2022`) | verde: el log dice `PSScriptAnalyzer 1.25.0`, el módulo bajado y no el de la imagen, y no hay hallazgos |
+
+Lo que una corrida de PR no muestra queda para después del merge a `main`: que un push a `main` escriba la caché (en el PR, `save-if` es falso y no la escribe), la corrida semanal de avisos, el primer PR de Dependabot y el reintento del build de `release.yml`, que sólo corre desde `main`.
