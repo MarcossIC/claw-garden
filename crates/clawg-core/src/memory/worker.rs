@@ -191,6 +191,23 @@ impl Replay {
     }
 }
 
+/// The outbox rows the start-up read found: the only ones that can reach the
+/// worker twice. A save accepted before the read is both in it and on the
+/// channel; one accepted after arrives once. The replay runs before anything
+/// from the channel, so the copy arrives after its row was taken, and the set
+/// never grows past what the read found.
+struct StartupRows(HashSet<i64>);
+
+impl StartupRows {
+    fn of(replay: &Replay) -> Self {
+        Self(replay.requests.iter().filter_map(|r| r.outbox).collect())
+    }
+
+    fn is_second_delivery(&self, row: i64, from_replay: bool) -> bool {
+        !from_replay && self.0.contains(&row)
+    }
+}
+
 /// What the worker does with the next event it takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DrainStep {
@@ -256,10 +273,9 @@ pub async fn memory_worker(
     let mut queue_over_depth = false;
     let mut drain = Some(drain);
     let mut deadline: Option<Instant> = None;
-    // The outbox rows taken in this run. A row the start-up read found can
-    // also arrive on the channel; the second delivery is skipped, and its
-    // caller, who may be waiting, gets the report of the first.
-    let mut taken: HashSet<i64> = HashSet::new();
+    // A second delivery is skipped, and its caller, who may be waiting, gets
+    // the report of the first.
+    let startup = StartupRows::of(&replay);
     let mut replayed: HashMap<i64, IngestReport> = HashMap::new();
     loop {
         observe_drain(&mut rx, &mut drain, &mut deadline);
@@ -290,15 +306,17 @@ pub async fn memory_worker(
         }
         let track = match outbox {
             None => None,
-            Some(row) => match take_row(&store, row, &mut taken).await {
-                Some(progress) => Some(Track { row, progress }),
-                None => {
-                    // A dropped reply reads as unconfirmed.
-                    if let (Some(reply), Some(report)) = (reply, replayed.remove(&row)) {
-                        let _ = reply.send(report);
-                    }
-                    continue;
+            Some(row) if startup.is_second_delivery(row, from_replay) => {
+                log::debug!("outbox row {row} arrived twice; ingested once");
+                // A dropped reply reads as unconfirmed.
+                if let (Some(reply), Some(report)) = (reply, replayed.remove(&row)) {
+                    let _ = reply.send(report);
                 }
+                continue;
+            }
+            Some(row) => match take_row(&store, row).await {
+                Some(progress) => Some(Track { row, progress }),
+                None => continue,
             },
         };
         let report = process_tracked(
@@ -418,11 +436,7 @@ async fn hold_for_embedder(
 /// Takes outbox `row` for this run: its progress, or `None` when there is
 /// nothing to ingest (taken already in this run, finished, failed, given up
 /// just now, or unreadable, which leaves it for the next start).
-async fn take_row(store: &Arc<MemoryStore>, row: i64, taken: &mut HashSet<i64>) -> Option<Vec<NotedPiece>> {
-    if !taken.insert(row) {
-        log::debug!("outbox row {row} arrived twice; ingested once");
-        return None;
-    }
+async fn take_row(store: &Arc<MemoryStore>, row: i64) -> Option<Vec<NotedPiece>> {
     match store.outbox_claim(row).await {
         Ok(Claimed::Process { progress }) => Some(progress),
         Ok(Claimed::Skip) => None,
@@ -3273,6 +3287,15 @@ mod tests {
 
         assert_eq!(access_counts(&store).await, vec![1]);
         assert_eq!(outbox_row(&store, row).await, None);
+    }
+
+    #[test]
+    fn only_the_channel_copy_of_a_start_up_row_is_a_second_delivery() {
+        let startup = StartupRows::of(&Replay::rows(vec![(7, make_event(Role::User, "read at start", None, 1))]));
+
+        assert!(!startup.is_second_delivery(7, true), "the replay's own delivery is the first");
+        assert!(startup.is_second_delivery(7, false), "its copy on the channel is the second");
+        assert!(!startup.is_second_delivery(8, false), "a save accepted after the read arrives once");
     }
 
     #[tokio::test]
