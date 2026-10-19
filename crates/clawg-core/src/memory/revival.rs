@@ -130,6 +130,32 @@ pub(crate) fn revive_after_delete(c: &Connection, deleted: i64, now: TimestampMs
     Ok(Revived { revived, hidden: plan.hidden })
 }
 
+/// Deleted rows still current when deleted that a live revision of theirs
+/// still points at: what a delete that predates revivals left behind.
+const HIDDEN_SQL: &str = "SELECT DISTINCT d.id FROM memory d JOIN memory r ON r.superseded_by = d.id \
+     WHERE d.deleted_at IS NOT NULL AND d.status IN ('active', 'disputed') \
+       AND r.deleted_at IS NULL AND r.status = 'superseded' AND r.supersede_cause = 'revision' \
+     ORDER BY d.id";
+
+/// Applies [`revive_after_delete`] to every row [`HIDDEN_SQL`] finds, in one
+/// transaction, and returns how many rows came back. A second pass finds
+/// nothing: what is left points at a row whose topic is held, or is a
+/// verdict's.
+pub(crate) fn revive_hidden(c: &mut Connection, now: TimestampMs) -> rusqlite::Result<usize> {
+    let tx = c.transaction()?;
+    let deleted: Vec<i64> = {
+        let mut stmt = tx.prepare(HIDDEN_SQL)?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut revived = 0;
+    for id in deleted {
+        revived += revive_after_delete(&tx, id, now)?.revived.len();
+    }
+    tx.commit()?;
+    Ok(revived)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
