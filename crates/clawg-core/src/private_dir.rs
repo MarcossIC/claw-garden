@@ -57,14 +57,18 @@ fn tightened(mode: u32) -> Option<u32> {
     (mode & 0o077 != 0).then_some(mode & 0o7700)
 }
 
+/// The permission bits of `path`, for the tests of every place that creates
+/// a directory under the data directory.
+#[cfg(all(test, unix))]
+pub(crate) fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-
-    fn mode_of(path: &Path) -> u32 {
-        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
-    }
 
     fn set_mode(path: &Path, mode: u32) {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();

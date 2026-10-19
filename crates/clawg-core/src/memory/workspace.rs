@@ -86,7 +86,7 @@ impl WorkspaceManager {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     if let Some(dir) = to.parent() {
-                        tokio::fs::create_dir_all(dir).await.map_err(io_err(dir))?;
+                        crate::private_dir::ensure_private_dir(dir).map_err(io_err(dir))?;
                     }
                     write_atomically(&to, &legacy).await.map_err(io_err(&to))?;
                 }
@@ -130,8 +130,7 @@ impl WorkspaceManager {
 
         // Create parent dirs if needed
         if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
+            crate::private_dir::ensure_private_dir(parent)
                 .map_err(|e| MemoryError::WorkspaceIo { path: path.clone(), source: e })?;
         }
 
@@ -950,6 +949,27 @@ mod tests {
         assert!(result.contains(AUTO_END));
         assert!(result.contains(USER_START));
         assert!(result.contains(USER_END));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_directories_are_created_private() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspaces");
+        let wm = WorkspaceManager::new(root.clone());
+        let store = MemoryStore::new_for_test().await.unwrap();
+
+        wm.regenerate_auto_section("agent-1", Some("proj-1"), &store).await.unwrap();
+
+        let path = wm.workspace_path("agent-1", Some("proj-1"));
+        let mut dir = path.parent().unwrap();
+        loop {
+            assert_eq!(crate::private_dir::mode_of(dir), 0o700, "{}", dir.display());
+            if dir == root {
+                break;
+            }
+            dir = dir.parent().unwrap();
+        }
     }
 
     #[tokio::test]

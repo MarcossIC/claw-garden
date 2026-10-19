@@ -10,8 +10,8 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 
 ## 2. Los lugares de `clawg-core` (R6, D3)
 
-- [ ] Tests primero (Unix): `opening_a_store_makes_its_directory_private`, `a_snapshot_directory_is_created_private`, `restore_creates_a_private_data_directory`, `save_creates_a_private_data_directory`, `workspace_directories_are_created_private`, `the_model_cache_is_created_private`.
-- [ ] `MemoryStore::open`, `snapshot_into`, `restore`, `sharing::save`, `workspace.rs` y `model_download.rs` usan el ayudante; `open` devuelve el error al crear.
+- [x] Tests primero (Unix): `opening_a_store_makes_its_directory_private`, `a_snapshot_directory_is_created_private`, `restore_creates_a_private_data_directory`, `save_creates_a_private_data_directory`, `workspace_directories_are_created_private`, `the_model_cache_is_created_private`.
+- [x] `MemoryStore::open`, `snapshot_into`, `restore`, `sharing::save`, `workspace.rs` y `model_download.rs` usan el ayudante; `open` devuelve el error al crear.
 - Commit: `fix(core): create the data directory and its subdirectories private to the owner`
 
 ## 3. Los lugares de `clawg-cli` (R6, D4)

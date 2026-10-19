@@ -183,8 +183,8 @@ impl MemoryStore {
     /// `holder` says who is asking, so the loser's message can name it.
     pub async fn open(base_dir: &Path, holder: StoreHolder) -> Result<Self, MemoryError> {
         ensure_vec0_registered();
-        // Best-effort directory creation — we'll get a clean error on open if it fails.
-        let _ = std::fs::create_dir_all(base_dir);
+        crate::private_dir::ensure_private_dir(base_dir)
+            .map_err(|source| MemoryError::DataDir { path: base_dir.to_path_buf(), source })?;
         let lock = StoreLock::acquire(base_dir, holder)?;
         let path = base_dir.join("memory.db");
         // Connection::open returns Result<_, rusqlite::Error>
@@ -2492,5 +2492,37 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let _t = MemoryStore::new_for_test().await.expect("test store");
         StoreLock::acquire(dir.path(), StoreHolder::Daemon).expect("nothing to collide with");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opening_a_store_makes_its_directory_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let fresh = home.path().join(".clawg-dev");
+        let open = home.path().join(".clawg");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        for base in [&fresh, &open] {
+            let store = MemoryStore::open(base, StoreHolder::Eval).await.unwrap();
+            drop(store);
+            assert_eq!(crate::private_dir::mode_of(base), 0o700, "{}", base.display());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_data_directory_that_cannot_be_created_is_an_error() {
+        let home = tempfile::tempdir().unwrap();
+        let file = home.path().join("not-a-directory");
+        std::fs::write(&file, b"").unwrap();
+        let base = file.join(".clawg-dev");
+
+        let err = MemoryStore::open(&base, StoreHolder::Eval).await.err().expect("refused");
+
+        match err {
+            MemoryError::DataDir { path, .. } => assert_eq!(path, base),
+            other => panic!("expected DataDir naming the directory, got {other:?}"),
+        }
     }
 }
