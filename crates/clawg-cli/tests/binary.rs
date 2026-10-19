@@ -1309,3 +1309,88 @@ async fn a_full_update_with_a_daemon_replaces_the_binary_and_a_bridge_reaches_th
     let reply = bridge.call(3, "memory_status", json!({}));
     assert!(!tool_failed(&reply), "the open bridge must find the new daemon: {reply}");
 }
+
+// ── Client setup ───────────────────────────────────────────────────────────
+
+/// `clawg setup` with Claude Code's configuration in `<home>/claude-config`
+/// and `path` as the whole PATH, so neither the real configuration nor a
+/// real `claude` is ever reached.
+fn setup(sandbox: &Sandbox, args: &[&str], path: &Path) -> Output {
+    sandbox
+        .command(&[&["setup", "claude-code", "--profile", "dev"], args].concat())
+        .env("CLAUDE_CONFIG_DIR", sandbox.home.join("claude-config"))
+        .env("PATH", path)
+        .output()
+        .expect("run clawg setup")
+}
+
+#[tokio::test]
+async fn setup_dry_run_writes_nothing() {
+    let sandbox = Sandbox::new();
+    let empty = sandbox.home.join("empty-path");
+    std::fs::create_dir_all(&empty).unwrap();
+    let out = setup(&sandbox, &["--dry-run"], &empty);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let text = stdout_of(&out);
+    assert!(text.contains("mcp server clawg-dev: would register it"), "{text}");
+    assert!(text.contains("would add SessionStart, UserPromptSubmit"), "{text}");
+    assert!(!sandbox.home.join("claude-config").exists());
+    assert!(!sandbox.data_dir().exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn setup_without_claude_prints_the_command_and_installs_the_rest() {
+    let sandbox = Sandbox::new();
+    let empty = sandbox.home.join("empty-path");
+    std::fs::create_dir_all(&empty).unwrap();
+    let out = setup(&sandbox, &[], &empty);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    let text = stdout_of(&out);
+    let bin = std::fs::canonicalize(BIN).unwrap();
+    let line = format!("claude mcp add --scope user clawg-dev -- {} mcp --profile dev --agent claude-code", bin.display());
+    assert!(text.contains(&line), "{text}");
+    let settings = std::fs::read_to_string(sandbox.home.join("claude-config").join("settings.json")).unwrap();
+    assert!(settings.contains("hook session-start --agent claude-code --profile dev"), "{settings}");
+    let md = std::fs::read_to_string(sandbox.home.join("claude-config").join("CLAUDE.md")).unwrap();
+    assert!(md.starts_with("<!-- BEGIN CLAWG MEMORY PROTOCOL -->"), "{md}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn setup_registers_through_a_fake_claude_and_remove_undoes_it() {
+    let sandbox = Sandbox::new();
+    let fake = sandbox.home.join("fake-bin");
+    std::fs::create_dir_all(&fake).unwrap();
+    write_executable(&fake.join("claude"), b"#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"${0%/*}/calls\"\n");
+    let config = sandbox.home.join("claude-config");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("CLAUDE.md"), "# Mine\n").unwrap();
+
+    let out = setup(&sandbox, &[], &fake);
+    assert_eq!(out.status.code(), Some(0), "{}{}", stdout_of(&out), stderr_of(&out));
+    let bin = std::fs::canonicalize(BIN).unwrap();
+    let calls = std::fs::read_to_string(fake.join("calls")).unwrap();
+    let expected = format!(
+        "mcp\nadd\n--scope\nuser\nclawg-dev\n--\n{}\nmcp\n--profile\ndev\n--agent\nclaude-code\n",
+        bin.display()
+    );
+    assert_eq!(calls, expected);
+    assert!(stdout_of(&out).contains("previous file copied to"), "{}", stdout_of(&out));
+
+    // What `claude mcp add` would have written.
+    let registered = json!({ "mcpServers": { "clawg-dev": {
+        "type": "stdio", "command": bin, "args": ["mcp", "--profile", "dev", "--agent", "claude-code"], "env": {} } } });
+    std::fs::write(config.join(".claude.json"), registered.to_string()).unwrap();
+    let again = setup(&sandbox, &[], &fake);
+    assert_eq!(again.status.code(), Some(0), "{}", stdout_of(&again));
+    assert!(stdout_of(&again).contains("mcp server clawg-dev: already registered"), "{}", stdout_of(&again));
+    assert_eq!(std::fs::read_to_string(fake.join("calls")).unwrap(), expected, "claude is not run again");
+
+    let removed = setup(&sandbox, &["--remove"], &fake);
+    assert_eq!(removed.status.code(), Some(0), "{}", stdout_of(&removed));
+    let calls = std::fs::read_to_string(fake.join("calls")).unwrap();
+    assert!(calls.ends_with("mcp\nremove\n--scope\nuser\nclawg-dev\n"), "{calls}");
+    assert_eq!(std::fs::read_to_string(config.join("CLAUDE.md")).unwrap(), "# Mine\n");
+    assert_eq!(std::fs::read_to_string(config.join("settings.json")).unwrap(), "{}\n");
+}
