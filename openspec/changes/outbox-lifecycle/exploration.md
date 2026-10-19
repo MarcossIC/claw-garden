@@ -10,22 +10,22 @@
 
 | Premisa | Resultado |
 |---|---|
-| `outbox_pending` se lee una sola vez, al arrancar el worker | **Cierta.** La única llamada de producción es `runtime.rs:410`; las demás son tests (`worker.rs:3151`, `:3269`). Nada relee el outbox durante la sesión. |
-| Un fallo transitorio devuelve el intento y nada lo reintenta en la sesión | **Cierta.** `after_failure` (`outbox.rs:75-79`) resta el intento si `transient`; `outbox_fail` (`:300-318`) lo escribe; el worker lo invoca en `worker.rs:313-318` con `transient = (failure == EmbedderUnavailable)`. La fila queda `pending` hasta el próximo arranque. **Matiz: es diseño escrito**, no olvido: `specs/storage`, «Intentos y fallo a la vista», dice «se reintenta en el próximo arranque, no en la misma ejecución, porque el mismo texto falla igual». Vale para un fallo determinista (un vector NaN), no para uno pasajero. |
-| `EmbedderUnavailable` también sale con un daemon `ready` | **Cierta.** La recarga fallida del modelo ocioso devuelve `EmbedError::NotReady` (`idle_embedder.rs:105-111`), `embed_batch` lo mapea a `EmbedderUnavailable` (`worker.rs:748-750`), y la celda del embedder ya está llena (`worker.rs:649` no se alcanza). El estado de `/health` sigue `ready`. |
+| `outbox_pending` se lee una sola vez, al arrancar el worker | **Cierta.** La única llamada de producción es `runtime.rs:410`; las demás son tests (`worker.rs:3263`, `:3269`). Nada relee el outbox durante la sesión. |
+| Un fallo transitorio devuelve el intento y nada lo reintenta en la sesión | **Cierta.** `after_failure` (`outbox.rs:75-79`) resta el intento si `transient`; `outbox_fail` (`:300-318`) lo escribe; el worker lo invoca en `worker.rs:331-336` con `transient = (failure == EmbedderUnavailable)`. La fila queda `pending` hasta el próximo arranque. **Matiz: es diseño escrito**, no olvido: `specs/storage`, «Intentos y fallo a la vista», dice «se reintenta en el próximo arranque, no en la misma ejecución, porque el mismo texto falla igual». Vale para un fallo determinista (un vector NaN), no para uno pasajero. |
+| `EmbedderUnavailable` también sale con un daemon `ready` | **Cierta.** La recarga fallida del modelo ocioso devuelve `EmbedError::NotReady` (`idle_embedder.rs:105-111`), `embed_batch` lo mapea a `EmbedderUnavailable` (`worker.rs:762-764`), y la celda del embedder ya está llena (`worker.rs:663` no se alcanza). El estado de `/health` sigue `ready`. |
 | El `.claude/CLAUDE.md` dice que una fila que «failed after the caller was answered» queda `failed` | **Cierta, y el código no lo hace.** En `outbox_fail`, una falla no transitoria con `attempts < 3` deja `pending` (`outbox.rs:77`); una fila sólo pasa a `failed` por `claim_step` tras 3 arranques (`outbox.rs:269-280`), por `after_failure` cuando ya traía 3 intentos, o por un evento que no parsea (`outbox.rs:376-380`). `specs/storage` (líneas del escenario «fallo después de un `202`») sí coincide con el código. La frase de `.claude/CLAUDE.md` es la que está mal. |
 | El texto que el puente le da al agente cubre un `202` que después falla | **Parcial.** `server.rs:606-614` dice «memory_status lists it if it fails». Cierto mientras la fila está `pending` o `failed`; pero con un `500` contestado la fila se borra (`api.rs:1126-1130`) y ya no hay nada que listar, lo cual es correcto porque el agente recibió el fallo en la respuesta. |
-| Un fallo en el pedazo k deja los pedazos 1..k-1 vivos | **Cierta para el insert, falsa para el embed.** Los vectores de todos los pedazos que sobreviven al dedup se calculan en **una** llamada antes de insertar nada (`worker.rs:744-754`); si falla, no se guardó ningún pedazo nuevo en ese intento. El prefijo sólo nace del fallo de `insert_noting` (`worker.rs:800-806`) o de una reanudación que ya traía pedazos. Cada pedazo se confirma en su propia transacción (`worker.rs:799`) y nace con el `topic_key` (`store_insert.rs:219`, escrito en `:474`). |
-| `outbox_finish` es el único que corre `link_in` y `revise_in` | **Cierta** salvo para un evento sin fila, que usa `finish_save` (`worker.rs:837`). En producción todo save pasa por `accept` con fila (`runtime.rs:231`); un evento sin fila sólo viene de `From<MemoryEvent>` (`worker.rs:69-72`), usado por tests. |
-| El fallo no reemplaza nada | **Cierta**, y es el problema: `process_tracked` vuelve antes de `outbox_finish` (`worker.rs:585-587`), así que la versión anterior de la clave sigue viva y el prefijo nuevo también lleva la clave. Dos filas vivas con la misma clave y pedazos sueltos que se muestran como saves independientes, sin `piece=K/N`. |
+| Un fallo en el pedazo k deja los pedazos 1..k-1 vivos | **Cierta para el insert, falsa para el embed.** Los vectores de todos los pedazos que sobreviven al dedup se calculan en **una** llamada antes de insertar nada (`worker.rs:758-768`); si falla, no se guardó ningún pedazo nuevo en ese intento. El prefijo sólo nace del fallo del insert (`worker.rs:815-833`) o de una reanudación que ya traía pedazos. Cada pedazo se confirma en su propia transacción (`worker.rs:813`) y nace con el `topic_key` (`store_insert.rs:219`, escrito en `:474`). |
+| `outbox_finish` es el único que corre `link_in` y `revise_in` | **Cierta** salvo para un evento sin fila, que usa `finish_save` (`worker.rs:864`). En producción todo save pasa por `accept` con fila (`runtime.rs:231`); un evento sin fila sólo viene de `From<MemoryEvent>` (`worker.rs:69-72`), usado por tests. |
+| El fallo no reemplaza nada | **Cierta**, y es el problema: `process_tracked` vuelve antes de `outbox_finish` (`worker.rs:599-601`), así que la versión anterior de la clave sigue viva y el prefijo nuevo también lleva la clave. Dos filas vivas con la misma clave y pedazos sueltos que se muestran como saves independientes, sin `piece=K/N`. |
 | Con el que guardó esperando, el handler olvida la fila y con ella el progreso | **Cierta.** `api.rs:1126-1130` llama `outbox_forget` ante cualquier `report.failure`. Con un prefijo guardado, la fila era lo único que permitía terminar el save. El puente dice `not saved: …; partially saved as #ids` (`server.rs:633-640`), lo que es literal pero deja el prefijo vivo. |
 | Nada repara el prefijo | **Cierta, con una salvedad que `specs/pieces` documenta:** guardar el mismo texto otra vez absorbe los pedazos ya guardados (dedup) y escribe el vínculo entonces (`specs/pieces`, «un save que se corta…»). El agente tiene que reenviar a mano, y la absorción suma un acceso a cada pedazo. Un save sin `topic_key` que nadie reenvía deja los pedazos sueltos para siempre. |
-| El comentario de `worker.rs:553-556` dice que un fallo «replaces nothing» | **Cierta**, y es lo que el prefijo viola desde el otro lado: no reemplaza, pero ya insertó. |
-| El apagado nunca corta el evento en curso | **Cierta.** `drain_step` se evalúa una vez por evento, antes de empezarlo (`worker.rs:204-211`, llamado en `:288`). Los bucles por pedazo (`worker.rs:694-719`, `:783-825`) no miran el plazo. |
-| La razón del comentario (`worker.rs:229-231`) ya no es cierta | **Cierta para filas con seguimiento.** `insert_noting` anota el progreso en la misma transacción (`worker.rs:799-800`, el absorbido en `:701-702`) y `resume_positions` (`outbox.rs:97-107`, usada en `worker.rs:680`) salta lo anotado. En producción todo save tiene fila (arriba), así que el caso «sin seguimiento» sólo existe en tests. |
+| El comentario de `worker.rs:567-570` dice que un fallo «replaces nothing» | **Cierta**, y es lo que el prefijo viola desde el otro lado: no reemplaza, pero ya insertó. |
+| El apagado nunca corta el evento en curso | **Cierta.** `drain_step` se evalúa una vez por evento, antes de empezarlo (`worker.rs:221-228`, llamado en `:288`). Los bucles por pedazo (`worker.rs:708-733`, `:783-825`) no miran el plazo. |
+| La razón del comentario (`worker.rs:246-248`) ya no es cierta | **Cierta para filas con seguimiento.** El insert anota el progreso en la misma transacción (`worker.rs:813-815`, el absorbido en `:715-716`) y `resume_positions` (`outbox.rs:97-107`, usada en `worker.rs:694`) salta lo anotado. En producción todo save tiene fila (arriba), así que el caso «sin seguimiento» sólo existe en tests. |
 | `DRAIN_DEADLINE` es 10 s y `STOP_TIMEOUT` 15 s | **Cierta** (`runtime.rs:54`, `crates/clawg-cli/src/stop.rs:19`; el test que los relaciona está en `stop.rs:66`). Hay además un plazo de confirmación de 10 s para el que espera (`SAVE_CONFIRM_TIMEOUT`, `api.rs:98`), tras el cual la respuesta es «sin confirmar» y el fallo posterior no llega a nadie. |
 | Una fila `failed` no tiene salida | **Cierta.** Del outbox sólo salen `outbox_forget` (`api.rs:1127`, `runtime.rs:234`), `outbox_finish` (`outbox.rs:347`) y el `purge`. Nada la reintenta ni la descarta; `/health` la cuenta (`outbox.rs:396-402`) y reenviar su `operation_id` responde `500 ingest_failed` (`api.rs:1109-1111`). |
-| `last_error` puede citar contenido | **No verificado.** Las causas que escribe el código son `embed failed: {e}`, `store insert failed: {e}` (`worker.rs:752`, `:803`) y las fijas de `outbox.rs`. Que `{e}` cite texto del save depende de cada librería; hace falta un fallo provocado (ver «Cómo se mide»). Es de secret-coverage (51); aquí sólo se anota. |
+| `last_error` puede citar contenido | **No verificado.** Las causas que escribe el código son `embed failed: {e}`, `store insert failed: {e}` (`worker.rs:766`, `:803`) y las fijas de `outbox.rs`. Que `{e}` cite texto del save depende de cada librería; hace falta un fallo provocado (ver «Cómo se mide»). Es de secret-coverage (51); aquí sólo se anota. |
 
 ## Problema (verificado contra el código)
 
@@ -58,10 +58,10 @@ Está `failed` hasta que alguien edite la base. Cuenta en `/health` para siempre
 
 ## Lo que ya existe y se reutiliza
 
-- Progreso por pedazo en la misma transacción que la inserción y `resume_positions`: la reanudación sin duplicados ya existe y está probada (`worker.rs:2250-2290` y los de replay, `:3151-3280`).
+- Progreso por pedazo en la misma transacción que la inserción y `resume_positions`: la reanudación sin duplicados ya existe y está probada (`worker.rs:2276-2316` y los de replay, `:3151-3280`).
 - `after_failure` y `claim_step` son funciones puras (`outbox.rs:64-79`): la regla nueva se prueba sin base.
-- `drain_step` pura (`worker.rs:204-211`); hace falta una variante por pedazo, no un mecanismo nuevo.
-- Un único consumidor de los inserts en `memory`: `memory_worker` (nota en `worker.rs:246-251`). Todo reintento tiene que entrar por ahí.
+- `drain_step` pura (`worker.rs:221-228`); hace falta una variante por pedazo, no un mecanismo nuevo.
+- Un único consumidor de los inserts en `memory`: `memory_worker` (nota en `worker.rs:263-268`). Todo reintento tiene que entrar por ahí.
 - `delete_memory_core` (`admin.rs:316`) y su inverso `restore_memory_core` (`admin.rs:583`): borrar sin perder, con vuelta atrás.
 - `OutboxSummary` y `OutboxProblem` (`outbox.rs:146-163`) ya dan a `/health`, y por él a `memory_status`, lo que hay que mostrar.
 - `operation_id` único por agente (`outbox_record`): un reintento no duplica.
@@ -86,7 +86,7 @@ Está `failed` hasta que alguien edite la base. Cuenta en `/health` para siempre
 
 **E (recomendado). Reintentar sólo lo pasajero.** Tras un `EmbedderUnavailable`, el worker vuelve a poner la fila en su propia cola local con un `not_before` creciente (1 s, 2 s, … tope 60 s) y la toma otra vez; es el mismo consumidor, sin tarea nueva. Un barrido de baja frecuencia (por ejemplo cada 5 min) relee `outbox_pending` para las `pending` cuya `updated_at` sea vieja y no estén ya en la cola local. Un fallo determinista (`Failed(_)`) conserva el comportamiento de hoy salvo por la regla de la sección siguiente.
 - **A favor:** respeta la razón escrita en `specs/storage` (el mismo texto falla igual); cierra el hueco sin schema nuevo (el retraso vive en memoria); acotado por el tope y el barrido.
-- **En contra:** el set `taken` (`worker.rs:262`) hay que vaciarlo para la fila al reencolar, o se la salta como «entrega doble» (`worker.rs:422`); un reintento tiene que respetar el drenaje (no reencolar en apagado).
+- **En contra:** una fila de la lectura de arranque que vuelve a entrar por el canal se toma por la copia de una entrega doble y se salta (`StartupRows`, `worker.rs:199-209`), así que el reintento tiene que reencolarla por otro camino o sacarla de ese conjunto; un reintento tiene que respetar el drenaje (no reencolar en apagado).
 
 **F. Reintentar también los fallos no transitorios en la sesión**, con retraso creciente hasta `MAX_ATTEMPTS`. Más simple de explicar («3 fallos y es `failed`»), pero contradice el diseño escrito y convierte un NaN determinista en tres ciclos de embed inútiles. Es la alternativa si se prefiere una sola regla (siguiente punto).
 
@@ -96,7 +96,7 @@ Está `failed` hasta que alguien edite la base. Cuenta en `/health` para siempre
 
 ### Pausa en el apagado
 
-**I (recomendado).** El bucle por pedazo (`worker.rs:783-825`) consulta el plazo antes de cada pedazo; vencido, devuelve un resultado `Paused` (no un `IngestFailure`) con el progreso ya anotado; el worker devuelve el intento (misma operación que un fallo transitorio, sin cambiar `last_error`), no llama a `outbox_fail` ni deja que el handler olvide la fila, y retorna con el resto como hoy. Sólo para filas con seguimiento: en producción son todas. Encaja con D: el estado en que queda es el de la reanudación normal. El que esperaba pierde su canal (la respuesta se descarta y ve «sin confirmar», el mismo caso del plazo vencido).
+**I (recomendado).** El bucle por pedazo (`worker.rs:797-852`) consulta el plazo antes de cada pedazo; vencido, devuelve un resultado `Paused` (no un `IngestFailure`) con el progreso ya anotado; el worker devuelve el intento (misma operación que un fallo transitorio, sin cambiar `last_error`), no llama a `outbox_fail` ni deja que el handler olvide la fila, y retorna con el resto como hoy. Sólo para filas con seguimiento: en producción son todas. Encaja con D: el estado en que queda es el de la reanudación normal. El que esperaba pierde su canal (la respuesta se descarta y ve «sin confirmar», el mismo caso del plazo vencido).
 - **En contra:** hay que decidir qué ve el que espera; hoy un reporte con `failure: None` y menos pedazos que los pedidos no existe.
 
 ### Salida para una fila `failed`
@@ -107,8 +107,8 @@ Está `failed` hasta que alguien edite la base. Cuenta en `/health` para siempre
 
 | Opción | Razón técnica |
 |---|---|
-| C. Un save en una sola transacción | La sonda de contradicción del pedazo N busca por KNN sobre filas ya guardadas, incluso las del pedazo N-1 (`worker.rs:767-782`); meter todo en una transacción mantendría una escritura abierta durante cada embed y cambia el modelo de hermanos. Es un rediseño de tamaño L y 54 (save-bounds) toca el mismo bucle. |
-| Reintentar desde otra tarea | Rompe el único consumidor de los inserts en `memory` (`worker.rs:246-251`). Todo entra por el canal o la cola local del worker. |
+| C. Un save en una sola transacción | La sonda de contradicción del pedazo N busca por KNN sobre filas ya guardadas, incluso las del pedazo N-1 (`worker.rs:781-796`); meter todo en una transacción mantendría una escritura abierta durante cada embed y cambia el modelo de hermanos. Es un rediseño de tamaño L y 54 (save-bounds) toca el mismo bucle. |
+| Reintentar desde otra tarea | Rompe el único consumidor de los inserts en `memory` (`worker.rs:263-268`). Todo entra por el canal o la cola local del worker. |
 | Expiración automática de filas `failed` | Borraría un save aceptado sin una decisión. |
 | Marcar `failed` la fila de un evento pausado por el apagado | Es una mentira sobre la causa y bloquea el replay del próximo arranque. |
 | Reescribir `last_error` para enmascarar | Es de secret-coverage (51); aquí sólo se verifica. |
@@ -151,7 +151,7 @@ Son del usuario.
 
 ## Cómo se mide
 
-Tests RED primero, con `FakeEmbedder` y un embedder de prueba configurable (hoy el repo tiene `NanAtEmbedder`, `worker.rs:2250`; hace falta uno que falle una vez y luego funcione):
+Tests RED primero, con `FakeEmbedder` y un embedder de prueba configurable (hoy el repo tiene `NanAtEmbedder`, `worker.rs:2276`; hace falta uno que falle una vez y luego funcione):
 
 1. Embedder que falla una vez con `EmbedderUnavailable` y save sin nadie esperando (`reply: None`): la fila se reintenta y termina en la misma ejecución del worker, sin reiniciarlo. Hoy queda `pending`.
 2. Save con `topic_key` sobre una clave existente, de varios pedazos, cuyo insert falla en el pedazo 2 con el que guardó esperando: después del fallo la clave tiene una versión viva y ningún pedazo suelto, o la fila sigue con su progreso y se termina después (según lo que se elija). Hoy hay dos versiones vivas y se borra la fila.

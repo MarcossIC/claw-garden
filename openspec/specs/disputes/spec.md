@@ -16,17 +16,17 @@ Fuente de verdad del comportamiento actual de los pares que encuentra el detecto
 - **Par enlazado:** dos filas que tienen un par en `memory_conflict`, o tales que el `disputed_against` de una nombra a la otra, o que una está `superseded` con `superseded_by` apuntando a la otra (`check_pair`, `crates/clawg-core/src/memory/dispute.rs:140`).
 - **Estado de reposo de una fila no reemplazada:** `disputed` si su `disputed_against` nombra al menos una fila viva; `active` si no.
 - **Fila protegida:** una `user_preference` o una `architectural_decision`.
-- **Pedazos hermanos:** las filas que inserta un mismo evento de ingesta (un mismo save), una por pedazo (`ingest_pieces`, `crates/clawg-core/src/memory/worker.rs:607`).
+- **Pedazos hermanos:** las filas que inserta un mismo evento de ingesta (un mismo save), una por pedazo (`ingest_pieces`, `crates/clawg-core/src/memory/worker.rs:621`).
 
 `disputed_against` significa "disputas pendientes": cerrar una disputa saca el id de la otra fila. `last_disputed_at` no cambia al resolver. `superseded_by` guarda quién reemplazó a quién. Las columnas de `memory` son las de V1 (`crates/clawg-core/migrations/V1__init.sql`); V15 agrega la tabla de pares y no toca `memory`.
 
 ## El detector anota candidatas
 
-Cada fila que el detector encuentra en la banda ("Umbral y banda del detector") es una candidata (`Candidate`, `crates/clawg-core/src/memory/contradiction.rs:77`): su id, su distancia, si escala y la primera línea de su texto. El insert MUST escribir un par por candidata en la misma transacción que la fila nueva (`note_candidates`, `crates/clawg-core/src/memory/store_insert.rs:247`), `escalated` si escala y `pending` si no. La fila nueva MUST quedar `disputed`, nombrando en `disputed_against` sólo a las candidatas que escalan (`store_insert.rs:420-424`); con candidatas pendientes nada más, MUST quedar `active`.
+Cada fila que el detector encuentra en la banda ("Umbral y banda del detector") es una candidata (`Candidate`, `crates/clawg-core/src/memory/contradiction.rs:77`): su id, su distancia, si escala y la primera línea de su texto. El insert MUST escribir un par por candidata en la misma transacción que la fila nueva (`note_candidates`, `crates/clawg-core/src/memory/store_insert.rs:247`), `escalated` si escala y `pending` si no. La fila nueva MUST quedar `disputed`, nombrando en `disputed_against` sólo a las candidatas que escalan (`store_insert.rs:514-526`); con candidatas pendientes nada más, MUST quedar `active`.
 
 Una candidata escala cuando `needs_user` (`contradiction.rs:103`), que es pura, devuelve verdadero: si la distancia no se conoce; si es menor que `ESCALATE_BELOW` y los dos lados son filas protegidas; o si es menor que `IDENTIFIER_ESCALATE_BELOW` y los dos textos comparten un identificador (`shares_identifier`, `contradiction.rs:115`, que usa `identifier_tokens` de `search.rs`). Dos `semantic_fact` cercanos que no llegan a ese corte no escalan, ni un hecho cerca de una preferencia o una decisión: los ve el agente en la respuesta del save y en `memory_status`. El agente no puede reemplazar el lado protegido de un par pendiente sin preguntar (R3), así que una decisión no se pierde porque su par no escaló.
 
-Dentro de un pedazo, el detector MUST quedarse con la candidata más cercana de cada save (`SaveKey`, `contradiction.rs:89`: el save de `memory_piece`, o la fila si no es un pedazo). Un save nuevo MUST anotar a lo sumo un par con cada save anterior: entre sus pedazos, gana el primero que encuentra a ese save (`worker.rs:781` y `:795`). Los pedazos hermanos siguen sin emparejarse (R8).
+Dentro de un pedazo, el detector MUST quedarse con la candidata más cercana de cada save (`SaveKey`, `contradiction.rs:89`: el save de `memory_piece`, o la fila si no es un pedazo). Un save nuevo MUST anotar a lo sumo un par con cada save anterior: entre sus pedazos, gana el primero que encuentra a ese save (`worker.rs:795` y `:795`). Los pedazos hermanos siguen sin emparejarse (R8).
 
 #### Escenario: hechos cercanos sin identificador común
 - GIVEN un `semantic_fact` guardado
@@ -252,7 +252,7 @@ Desde [long-save-context](../../changes/archive/2026-10-14-long-save-context/pro
 
 El detector MUST NOT emparejar un pedazo nuevo con una fila viva del alcance de la `topic_key` del save: son las filas que ese mismo save va a dejar `superseded` al terminar ([`specs/ingest`](../ingest/spec.md), «Un save con clave reemplaza la fila viva de su clave»). Un par entre una versión y la siguiente nacería `pending` y quedaría muerto en la misma transacción que reemplaza a la vieja. Las demás filas se siguen emparejando, también las de otra clave.
 
-El worker suma las filas del alcance a los hermanos que ya pasa al detector (`siblings`, `worker.rs:776-778`), que `detect_contradiction` deja fuera como a los pedazos de R8 y a las fuentes de una conclusión.
+El worker suma las filas del alcance a los hermanos que ya pasa al detector (`siblings`, `worker.rs:790-792`), que `detect_contradiction` deja fuera como a los pedazos de R8 y a las fuentes de una conclusión.
 
 #### Escenario
 - GIVEN un `semantic_fact` guardado con la clave K, y otro `semantic_fact` cercano sin clave

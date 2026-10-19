@@ -7,7 +7,7 @@ Fuente de verdad del comportamiento actual de un save que no entra en un pedazo:
 ## Definiciones
 
 - **Save:** un evento de ingesta (`MemoryEvent`): un `save_memory` o un turno de chat. Es la misma unidad que los pedazos hermanos de [`specs/disputes`](../disputes/spec.md) R8.
-- **Texto del save:** el contenido del evento después de enmascarar secretos (`redact`, en `ingest_pieces`, `crates/clawg-core/src/memory/worker.rs:621`). Todo lo de abajo trabaja sobre ese texto.
+- **Texto del save:** el contenido del evento después de enmascarar secretos (`redact`, en `ingest_pieces`, `crates/clawg-core/src/memory/worker.rs:635`). Todo lo de abajo trabaja sobre ese texto.
 - **Pedazo:** cada ventana que deja el chunker, después de colapsar los repetidos dentro del mismo evento (`collapse_duplicate_chunks`, `worker.rs:148`). Su posición es 1, 2, … en ese orden.
 - **Save largo:** un save con dos pedazos o más.
 - **Cabecera:** los primeros `SAVE_HEAD_TOKENS` = 48 tokens del texto del save, contados con el mismo splitter del chunker (en modo sin tokenizer, 4 bytes por token).
@@ -17,7 +17,7 @@ Fuente de verdad del comportamiento actual de un save que no entra en un pedazo:
 
 ## R1. Un texto que entra en un pedazo no cambia
 
-Un texto del save que el chunker deja en un pedazo con el tope de `CHUNK_MAX_TOKENS` = 480 (`chunker/mod.rs:15`) MUST partirse, embeberse y guardarse como siempre: el mismo texto, el mismo vector y ningún vínculo. `ChatChunker::split_save` (`chunker/chat.rs:88`) devuelve ese pedazo sin cabecera.
+Un texto del save que el chunker deja en un pedazo con el tope de `CHUNK_MAX_TOKENS` = 480 (`chunker/mod.rs:15`) MUST partirse, embeberse y guardarse como siempre: el mismo texto, el mismo vector y ningún vínculo. `ChatChunker::split_save` (`chunker/chat.rs:114`) devuelve ese pedazo sin cabecera.
 
 #### Escenario
 - GIVEN un save de 300 tokens
@@ -28,13 +28,13 @@ Un texto del save que el chunker deja en un pedazo con el tope de `CHUNK_MAX_TOK
 
 ## R2. Un save largo se parte con lugar para la cabecera
 
-Un texto del save que no entra en un pedazo de `CHUNK_MAX_TOKENS` = 480 tokens (`chunker/mod.rs:15`) MUST partirse en pedazos de a lo sumo `PIECE_MAX_TOKENS` = 96 tokens (`chunker/mod.rs:39`), con `PIECE_OVERLAP_TOKENS` = 24 de solapamiento entre vecinos (`chunker/mod.rs:44`; `ChatChunker::split_save`, `chunker/chat.rs:88`). Un pedazo chico deja la respuesta de un save largo como una parte grande de su vector, en lugar de una frase promediada entre muchas. `ChatChunker::chunk` (`chunker/chat.rs:76`), que usan los demás caminos, MUST seguir cortando con `CHUNK_OVERLAP_TOKENS` = 64 (`chunker/mod.rs:21`).
+Un texto del save que no entra en un pedazo de `CHUNK_MAX_TOKENS` = 480 tokens (`chunker/mod.rs:15`) MUST partirse en pedazos de a lo sumo `PIECE_MAX_TOKENS` = 96 tokens (`chunker/mod.rs:39`), con `PIECE_OVERLAP_TOKENS` = 24 de solapamiento entre vecinos (`chunker/mod.rs:44`; `ChatChunker::split_save`, `chunker/chat.rs:114`). Un pedazo chico deja la respuesta de un save largo como una parte grande de su vector, en lugar de una frase promediada entre muchas. `ChatChunker::chunk` (`chunker/chat.rs:102`), que usan los demás caminos, MUST seguir cortando con `CHUNK_OVERLAP_TOKENS` = 64 (`chunker/mod.rs:21`).
 
 Dos `const _: () = assert!(...)` (`chunker/mod.rs:48-49`) comprueban en compilación que `PIECE_OVERLAP_TOKENS < PIECE_MAX_TOKENS` y que `SAVE_HEAD_TOKENS + HEAD_JOIN_RESERVE + PIECE_MAX_TOKENS <= CHUNK_MAX_TOKENS` (48 y 8 tokens de reserva para el separador `"\n…\n"` y la suma de tokens en el borde), así el texto embebido nunca pasa el límite que el embedder trunca en silencio.
 
 Cada pedazo desde el segundo MUST embeberse con contexto (la cabecera). El primero se embebe sin él, porque ya empieza con la cabecera. La fila MUST guardar sólo el pedazo: el contenido, el hash de dedup y el FTS no llevan la cabecera.
 
-El armado del texto embebido es `embedding_text(context, piece)` (`chunker/mod.rs:55`), una función pura que usan el worker (`worker.rs:745`) y el re-embed (R7).
+El armado del texto embebido es `embedding_text(context, piece)` (`chunker/mod.rs:55`), una función pura que usan el worker (`worker.rs:759`) y el re-embed (R7).
 
 Un save de un pedazo de hasta 480 tokens no se parte con este tope: el tope de 96 sólo aplica si el de 480 no alcanza. El save más corto que se parte (más de 480 tokens) da al menos 7 pedazos.
 
@@ -57,16 +57,16 @@ Un save de un pedazo de hasta 480 tokens no se parte con este tope: el tope de 9
 
 ## R3. El save deja su vínculo
 
-Cuando un save largo termina sin falla, el worker MUST escribir, en una sola transacción, un vínculo por pedazo (`link_in`, `crates/clawg-core/src/memory/pieces.rs:222`). Si el save tiene una fila del outbox, el vínculo y el borrado de la fila van en la misma transacción (`outbox_finish`, `crates/clawg-core/src/memory/outbox.rs:330`, llamado por `process_tracked`, `worker.rs:557`; [`specs/storage`](../storage/spec.md), «Un save aceptado está en el outbox hasta que termina»); un evento sin fila lo vincula `finish_save` (`worker.rs:837`, por `MemoryStore::finish_save`, `crates/clawg-core/src/memory/topic.rs:174`, que en la misma transacción aplica la revisión de su `topic_key`, ver R10 y [`specs/ingest`](../ingest/spec.md), «Un save con clave reemplaza la fila viva de su clave»):
+Cuando un save largo termina sin falla, el worker MUST escribir, en una sola transacción, un vínculo por pedazo (`link_in`, `crates/clawg-core/src/memory/pieces.rs:222`). Si el save tiene una fila del outbox, el vínculo y el borrado de la fila van en la misma transacción (`outbox_finish`, `crates/clawg-core/src/memory/outbox.rs:330`, llamado por `process_tracked`, `worker.rs:571`; [`specs/storage`](../storage/spec.md), «Un save aceptado está en el outbox hasta que termina»); un evento sin fila lo vincula `finish_save` (`worker.rs:864`, por `MemoryStore::finish_save`, `crates/clawg-core/src/memory/topic.rs:174`, que en la misma transacción aplica la revisión de su `topic_key`, ver R10 y [`specs/ingest`](../ingest/spec.md), «Un save con clave reemplaza la fila viva de su clave»):
 
 - `save_id`: un número nuevo, uno más que el mayor de la tabla;
 - `piece`: la posición del pedazo, desde 1;
-- `memory_id`: la fila que lo guarda, insertada por este evento o absorbida por el dedup (`absorb_duplicate`, `worker.rs:476`);
+- `memory_id`: la fila que lo guarda, insertada por este evento o absorbida por el dedup (`absorb_duplicate`, `worker.rs:490`);
 - `context`: la cabecera con la que se embebió la fila si este evento la insertó con contexto; si no, vacío. Una fila absorbida conserva el vector que ya tenía, así que su vínculo no dice que lo embebió con contexto.
 
 Un save de un pedazo MUST NOT dejar vínculos. Un save que se corta a mitad de camino (`IngestReport.failure`, `worker.rs:83`) MUST NOT dejar vínculos: sus filas quedan sueltas, como antes de la tabla. Si tiene fila en el outbox, el siguiente arranque retoma después de las piezas ya guardadas y escribe el vínculo al terminar ([`specs/storage`](../storage/spec.md), «Un replay retoma donde quedó»); si no, al guardarlo de nuevo los pedazos se absorben y el vínculo se escribe entonces.
 
-Si escribir el vínculo falla, el save MUST seguir informándose como guardado: sus filas ya están y se encuentran igual. La falla va al log (`worker.rs:843`, y `worker.rs:597` con una fila en el outbox, que entonces queda para que el próximo arranque la termine).
+Si escribir el vínculo falla, el save MUST seguir informándose como guardado: sus filas ya están y se encuentran igual. La falla va al log (`worker.rs:870`, y `worker.rs:611` con una fila en el outbox, que entonces queda para que el próximo arranque la termine).
 
 Guardar otra vez exactamente las mismas filas, en el mismo orden, MUST devolver el `save_id` que ya forman (`existing_save`, `pieces.rs:261`) y no escribir nada: el mismo save no se vincula dos veces.
 

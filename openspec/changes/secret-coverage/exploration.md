@@ -17,7 +17,7 @@
 | Una fila de `memory` no guarda el `operation_id` de su save | **Cierta.** `memory` sólo guarda `source_session_id` (`migrations/V1__init.sql:16`); `operation_id` está sólo en `ingest_outbox` (`V14__ingest_outbox.sql:13`, `UNIQUE (agent_id, operation_id)` en `:23`) y `worker.rs` no lo escribe en `memory`. |
 | Una fila guardada puede ser un pedazo de un save largo, así que la subcadena es a propósito | **Cierta**, y hay una salida que la premisa no mencionaba: «una fila sin vínculo es un save de un solo pedazo» (`crates/clawg-core/src/memory/pieces.rs:1-7`). Para ésas, el outbox tiene el mismo texto entero. |
 | El `reason` de un veredicto se guarda sin enmascarar | **Cierta.** `judge_pair` lo recorta (`dispute.rs:327`) y lo escribe en `memory_conflict.reason` (`:383`, `V15__memory_conflict.sql:19`); la ruta llega por `crates/clawg-cli/src/daemon/api.rs:1442`. |
-| `redact(` se llama sólo en `runtime.rs` ~222/~447, `worker.rs` ~621, `project_docs/mod.rs` ~382, `admin.rs` ~616 | **Cierta**, con líneas exactas `runtime.rs:222`, `:447`, `worker.rs:621`, `project_docs/mod.rs:382`, `admin.rs:616`. Más `secrets.rs:46` (el escaneo) y los tests. No hay otra llamada en `crates/`. |
+| `redact(` se llama sólo en `runtime.rs` ~222/~447, `worker.rs` ~621, `project_docs/mod.rs` ~382, `admin.rs` ~616 | **Cierta**, con líneas exactas `runtime.rs:222`, `:447`, `worker.rs:635`, `project_docs/mod.rs:382`, `admin.rs:616`. Más `secrets.rs:46` (el escaneo) y los tests. No hay otra llamada en `crates/`. |
 | `secrets::scan` lee sólo `memory.content` | **Cierta** (`secrets.rs:41`). |
 | `purge` revive las versiones anteriores de un tema, como un `delete` | **Falsa.** `purge` (`secrets.rs:82-137`) hace `DELETE FROM memory` (`:105`) y `release_challengers` (`:117`, sólo si la fila estaba viva); no llama a `revive_after_delete_of_piece`, que sí llama `delete_memory_core` (`admin.rs:355`) |
 | La pasada de mantenimiento recupera lo que `purge` deja escondido | **Falsa.** `revive_after_delete` no hace nada si la fila no existe con `deleted_at IS NOT NULL` (`revival.rs:86-93`) y `HIDDEN_SQL` une la fila borrada (`revival.rs:156-159`), así que nunca ve un id purgado. `drop_orphaned_pairs` (`maintenance.rs:248`) sólo limpia `memory_conflict`; nada limpia un `superseded_by` hacia un id que ya no existe |
@@ -37,10 +37,10 @@
 - **a. `workspace.md`.** Si la fila purgada era una preferencia, decisión o procedimiento elegible, su texto está en la sección AUTO de `workspaces/<agente>/<proyecto>/workspace.md`, que se regenera sólo en `recall_context`. `purge` corre con el daemon parado y sin `MemoryStore`. La sección USER es del usuario y nunca se reescribe (`assemble_file`, `workspace.rs:494-584`); puede tener el texto, y sólo se la puede **nombrar**. La copia de un archivo legado a un id de proyecto nuevo nunca mueve el original (`workspace.rs:50-55`), así que el texto puede estar en dos archivos.
 - **b. Subcadena entre agentes.** Un texto corto (`use pnpm`) borra todo save pendiente o `failed` de **cualquier** agente que lo contenga: saves aceptados con `201`/`202` que se pierden sin aviso. Es el mismo contrato que dice «no se pierde nada de lo aceptado» (`.claude/CLAUDE.md`, sección del outbox).
 - **c. Cabecera de un save largo** (backlog de `openspec/README.md`). `memory_piece.context` guarda el principio del save (`V11__memory_piece.sql:4-8`, `:11-16`); `purge` no toca esa tabla (`secrets.rs:103-111`), así que purgar el pedazo 1 deja sus primeros tokens en los vínculos de los pedazos 2..N.
-- **d. Fila `failed` del outbox sin salida** (backlog). Nada la reintenta ni la descarta (`outbox.rs:300-317` sólo la marca). No es un problema de secretos por sí mismo, pero el `last_error` (`IngestFailure::Failed(format!("embed failed: {e}"))`, `worker.rs:752`, `:803`) puede citar el error de una librería; **no se verificó que cite el contenido**, y habría que comprobarlo con un fallo provocado.
+- **d. Fila `failed` del outbox sin salida** (backlog). Nada la reintenta ni la descarta (`outbox.rs:300-317` sólo la marca). No es un problema de secretos por sí mismo, pero el `last_error` (`IngestFailure::Failed(format!("embed failed: {e}"))`, `worker.rs:766`, `:803`) puede citar el error de una librería; **no se verificó que cite el contenido**, y habría que comprobarlo con un fallo provocado.
 
 - **e. El historial de un tema queda escondido.** Si la fila purgada es la versión vigente de un `topic_key` (el caso típico: era la que tenía el secreto), las versiones anteriores quedan `superseded` por un id que ya no existe. No salen en búsqueda ni en contexto, y `restore` no aplica porque no están borradas. `purge` promete sacar «sólo ese texto» y en realidad esconde todo el historial del tema. Solo las filas con `supersede_cause = 'revision'` deberían volver; las reemplazadas por un veredicto (`verdict`, V17) se quedan escondidas a propósito.
-- Comentarios que esto vuelve falsos: `maintenance.rs:162-163` y `:289-291` dicen que nada en el código borra de verdad una fila de `memory`; `purge` lo hace.
+- Los comentarios de `maintenance.rs:162-163` y `:289-291` ya nombran a `purge` como el único borrado duro (`46045aa`); si este cambio cambia lo que `purge` borra, hay que revisarlos.
 
 ### 3. Texto libre que no pasa por `redact`
 
@@ -48,10 +48,10 @@ Barrido de `crates/clawg-core/migrations/` y de los escritores:
 
 | Columna / archivo | Quién escribe | ¿Enmascarado? | ¿`secrets` / `purge` llegan? |
 |---|---|---|---|
-| `memory.content` | worker, tras `redact` (`worker.rs:621`) | Sí | Sí (`secrets.rs:41`; `purge` lo borra) |
+| `memory.content` | worker, tras `redact` (`worker.rs:635`) | Sí | Sí (`secrets.rs:41`; `purge` lo borra) |
 | `ingest_outbox.content` | `accept`, tras `redact` (`runtime.rs:222`) | Sí | `purge` por subcadena (`:114`); `scan` no lo mira (ya enmascarado) |
 | `ingest_outbox.event` | el resto del evento en JSON, sin `content` (`V14:6-7`); lleva `topic_key`, `derived_from`, `session_id` | No aplica, no es texto libre largo | No |
-| `ingest_outbox.last_error` | worker, texto de un error (`worker.rs:315`) | No | No; sale en `/health` por `operation_id`. **A verificar** si cita contenido |
+| `ingest_outbox.last_error` | worker, texto de un error (`worker.rs:333`) | No | No; sale en `/health` por `operation_id`. **A verificar** si cita contenido |
 | `memory_conflict.reason` | `judge_pair` (`dispute.rs:327`, `:383`) | **No** | **No.** `purge` borra sólo pares de la fila purgada (`secrets.rs:111`); un secreto en el `reason` de otro par queda y `scan` no lo ve |
 | `memory_piece.context` | worker, cabecera de un save, ya enmascarado | Sí (viene de `content`) | **No** `purge` (backlog) |
 | `workspace.md`, sección AUTO | `regenerate_auto_section`, copia de `memory.content` | Hereda: una fila vieja sin enmascarar vuelve a copiarse | **No** |
@@ -128,7 +128,7 @@ Resultado: **una** columna con texto libre del usuario o el agente que nunca se 
 1. Patrón `Credential` y los prefijos que faltan, con tabla de casos en los dos sentidos, y `specs/secrets` R1.
 2. `purge` filtra el outbox por agente y, para filas sin vínculo, por igualdad; lista lo borrado.
 3. `purge` nombra los `workspace.md` que contienen el texto, sin reescribirlos; y limpia la cabecera del pedazo 1 en `memory_piece.context`.
-3b. `purge` revive, en su transacción, las versiones anteriores del tema (O) y las lista; corrige los comentarios de `maintenance.rs:162-163` y `:289-291`.
+3b. `purge` revive, en su transacción, las versiones anteriores del tema (O) y las lista.
 4. `redact` en `judge_pair` (el `reason`).
 5. `clawg secrets` mira `memory_conflict.reason`.
 6. Docs: `specs/secrets`, `.claude/CLAUDE.md`, y los dos ítems del backlog que se absorben (cabecera; el de la fila `failed` queda fuera).

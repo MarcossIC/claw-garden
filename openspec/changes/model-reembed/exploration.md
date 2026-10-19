@@ -27,7 +27,7 @@ Un punto que ese texto no cubría: la memoria apagada no es «vacía» para todo
 ### Dónde vive el contrato y qué ve el usuario
 
 - La tabla `embedding_contract` guarda una fila con `model_id`, `dim`, `query_prefix` y `passage_prefix` (`crates/clawg-core/migrations/V5__embedding_contract.sql`). También `metric` y `normalized`, que no se comparan.
-- `ensure_embedding_contract` la escribe si no existe y la compara byte a byte si existe (`crates/clawg-core/src/memory/db.rs:339-388`). Una diferencia da `Mismatch`.
+- `ensure_embedding_contract` la escribe si no existe y la compara byte a byte si existe (`crates/clawg-core/src/memory/db.rs:309-358`). Una diferencia da `Mismatch`.
 - La identidad la informa el embedder. Modelo y dimensión salen de literales en `FastEmbedLocal::from_bytes` (`embedder.rs:268-269`). Los prefijos salen de dos constantes (`embedder.rs:214-220`).
 - El bootstrap compara **después** de bajar y cargar el modelo (`bootstrap.rs:320-346`). Ante un mismatch deja la celda del embedder vacía y devuelve `BootstrapError::Mismatch`. No reintenta (`specs/ingest`, líneas 184-185).
 - **Lo que ve el usuario:**
@@ -79,9 +79,9 @@ Un punto que ese texto no cubría: la memoria apagada no es «vacía» para todo
 ### ¿Hay un test que fije el contrato de producción?
 
 - **Prefijos: sí.** `e5_prefix_constants_are_symmetric_with_the_load_bearing_trailing_space` (`embedder.rs:730-738`). Cambiarlos rompe un test.
-- **Modelo y dimensión de producción: no.** `FastEmbedLocal` sólo se construye con `from_bytes`, que necesita el modelo real. Los literales `384` y `"multilingual-e5-small"` (`embedder.rs:268-269`) no los verifica ningún test automático. Los tests de `db.rs:1844-1856` y `bootstrap.rs:889-1007` usan embedders simulados con valores escritos a mano, así que pasarían igual si el de producción cambiara. El único `384` que se afirma es el del `FakeEmbedder` (`embedder.rs:493-496`).
+- **Modelo y dimensión de producción: no.** `FastEmbedLocal` sólo se construye con `from_bytes`, que necesita el modelo real. Los literales `384` y `"multilingual-e5-small"` (`embedder.rs:268-269`) no los verifica ningún test automático. Los tests de `db.rs:1816-1828` y `bootstrap.rs:889-1007` usan embedders simulados con valores escritos a mano, así que pasarían igual si el de producción cambiara. El único `384` que se afirma es el del `FakeEmbedder` (`embedder.rs:493-496`).
 - **Nada compara la dimensión del embedder con la de V2.** Si alguien subiera `dimensions` a 768 sin migración, las bases existentes darían mismatch y, en una base nueva, los inserts fallarían contra `float[384]`.
-- El comportamiento del mismatch sí está probado (`db.rs:1951,1921,1941`; `bootstrap.rs:889,960`).
+- El comportamiento del mismatch sí está probado (`db.rs:1923,1921,1941`; `bootstrap.rs:889,960`).
 
 ### Opciones ante una fila que no se puede embeber
 
@@ -96,7 +96,7 @@ Un store con vectores CLS que un día no pueda terminar el re-embed tiene el mis
 - **Fail-closed.** Un contrato distinto no borra nada: apaga la memoria (`bootstrap.rs:338-346`). Los datos siguen en `memory.db`.
 - **El contrato se escribe al final.** Un re-embed incompleto no puede declararse completo (`maintenance.rs:467-497`).
 - **Snapshots.** `snapshot_into` usa `VACUUM INTO`, incluye el WAL y los vectores y no deja archivos a medias (`crates/clawg-core/src/memory/backup.rs:275`; tests `a_snapshot_keeps_vectors_and_full_text_searchable` y `a_failed_snapshot_leaves_no_file_behind`).
-- **Restore con el daemon parado**, con snapshot de lo que reemplaza (`backup.rs:329`; `crates/clawg-cli/src/restore.rs`). Es **la** vuelta atrás de un re-embed: devuelve vectores y contrato viejos de una vez.
+- **Restore con el daemon parado**, con snapshot de lo que reemplaza (`backup.rs:332`; `crates/clawg-cli/src/restore.rs`). Es **la** vuelta atrás de un re-embed: devuelve vectores y contrato viejos de una vez.
 - **Lock exclusivo** `memory.lock`, con el titular `Maintenance` para `backup`, `restore` y `purge` (`crates/clawg-core/src/memory/store_lock.rs:58`).
 - **Esquema.** Una base de otra versión se rechaza sin tocarla (`specs/storage`, «Verificación del esquema antes de migrar»).
 - **Los saves ya no se pierden en silencio durante un mismatch** (ver la tabla de arriba).
@@ -105,7 +105,7 @@ Un store con vectores CLS que un día no pueda terminar el re-embed tiene el mis
 
 - `snapshot_into(conn, dir, reason)` y `Reason` (`backup.rs:119`). `PreReembed` **ya existe** (`backup.rs:119-139`): el nombre del archivo lo lleva, `Reason::ALL` y `is_automatic` lo cubren, y el arranque ya lo usa para la reparación del pooling (`bootstrap.rs:290`). Un `clawg reembed` lo reutilizaría; lo que faltaría es, a lo sumo, ampliar los tests de nombres (`snapshot_names_parse_back_to_their_reason`) si cambia algo.
 - La retención automática conserva las últimas 5 (`AUTO_KEEP`, `to_prune`, `backup.rs:227-243`), y `pre-reembed` comparte ese presupuesto con `pre-migration` y `pre-restore` (`is_automatic` es «todo menos `Manual`», `backup.rs:143-145`): un re-embed con varios reintentos puede sacar de la ventana un `pre-migration` sano, además del propio `pre-reembed`. **Cuidado:** varios reintentos de un re-embed podrían sacar de la ventana al snapshot sano. Va a decisiones abiertas.
-- `StoreLock::acquire(…, StoreHolder::Maintenance)` y `open_existing` (`backup.rs:493`). El patrón de `purge` (`crates/clawg-core/src/memory/secrets.rs:81`) es el modelo: lock, abrir sin migrar, verificar `schema_plan` y operar.
+- `StoreLock::acquire(…, StoreHolder::Maintenance)` y `open_existing` (`backup.rs:527`). El patrón de `purge` (`crates/clawg-core/src/memory/secrets.rs:81`) es el modelo: lock, abrir sin migrar, verificar `schema_plan` y operar.
 
 ## Enfoques posibles
 

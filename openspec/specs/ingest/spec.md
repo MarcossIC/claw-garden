@@ -13,7 +13,7 @@ Fuente de verdad del comportamiento actual de la ingesta: el contrato de `POST /
 
 ## Definiciones
 
-- **Worker:** el único consumidor de la cola de ingesta (`memory_worker`, `crates/clawg-core/src/memory/worker.rs:238`). Ninguna ruta de ingesta agrega otro escritor: el dedup sólo es correcto con un consumidor secuencial.
+- **Worker:** el único consumidor de la cola de ingesta (`memory_worker`, `crates/clawg-core/src/memory/worker.rs:255`). Ninguna ruta de ingesta agrega otro escritor: el dedup sólo es correcto con un consumidor secuencial.
 - **Resultado de un chunk:** `inserted` (fila nueva) o `reinforced` (el dedup absorbió el chunk en una fila existente). En los dos casos hay un id de la tabla `memory` (`SavedChunk` y `ChunkOutcome`, `worker.rs:40` y `worker.rs:31`).
 - **Reporte de un evento:** `IngestReport` (`worker.rs:81`): los chunks que quedaron en la base, en orden, y la causa que cortó el evento si la hubo. Lleva las dos partes a la vez porque un fallo a mitad de un evento deja chunks ya escritos. Lleva además `replaced`, las filas que el save reemplazó por su clave de tema (`worker.rs:89`).
 - **Estado del embedder:** `EmbedderStatus` (`crates/clawg-core/src/memory/bootstrap.rs:38`): `Loading`, `Ready` o `Failed { error, retryable }`. El `OnceCell` del embedder se llena antes de publicar `Ready`.
@@ -123,7 +123,7 @@ Se hace al terminar el save y no con la primera pieza porque un save que falla e
 
 La respuesta MUST listar las filas reemplazadas en `replaced`, cada una con su id y su primera línea (`ReplacedMemory`, `api.rs:551`; `SaveBody.replaced`, `api.rs:525`; `IngestReport.replaced`, `worker.rs:89`). Sin reemplazos, el campo no va. Un save con clave y sin filas anteriores MUST comportarse como uno sin clave, salvo que sus filas llevan la clave. Un save sin clave MUST NOT reemplazar nada.
 
-**Tipo e importancia.** Si el save con clave no trae `memory_type` o `importance`, las filas nuevas MUST tomar los de la fila viva más antigua del alcance (`inherit`, `topic.rs:154`; el worker la lee con `topic_rows`, `topic.rs:164`, antes de guardar nada, `worker.rs:566-582`). En una reposición se lee otra vez y da lo mismo, porque la versión vieja sigue viva hasta el final.
+**Tipo e importancia.** Si el save con clave no trae `memory_type` o `importance`, las filas nuevas MUST tomar los de la fila viva más antigua del alcance (`inherit`, `topic.rs:154`; el worker la lee con `topic_rows`, `topic.rs:164`, antes de guardar nada, `worker.rs:580-596`). En una reposición se lee otra vez y da lo mismo, porque la versión vieja sigue viva hasta el final.
 
 **Alcance y orden.** Otro agente u otro proyecto con la misma clave MUST NOT reemplazar ni heredar nada. Dos saves con la misma clave en cola MUST aplicarse en orden, y la fila viva final es la del segundo: el worker es el único escritor de saves. No hay un índice único sobre la clave porque las piezas de un save la comparten (`idx_memory_topic` es parcial y no único, [`specs/storage`](../storage/spec.md)); la unicidad de lo vivo la mantienen el worker y `restore` ([`specs/disputes`](../disputes/spec.md), R4).
 
@@ -154,7 +154,7 @@ Con el embedder `ready`, `POST /v1/memories` MUST encolar el evento con un canal
 {"status": "saved", "memories": [{"kind": "memory", "id": 57, "outcome": "inserted"}], "operation_id": "3f0c…"}
 ```
 
-`kind` es siempre `"memory"`, de modo que `kind` e `id` son exactamente lo que toma `DELETE /v1/memories/{kind}/{id}`. Las copias repetidas dentro del mismo save MUST NOT generar elementos extra: cuentan como refuerzo de la fila de su primera copia (`collapse_duplicate_chunks`, `worker.rs:148`, y `ingest_pieces`, `worker.rs:607`).
+`kind` es siempre `"memory"`, de modo que `kind` e `id` son exactamente lo que toma `DELETE /v1/memories/{kind}/{id}`. Las copias repetidas dentro del mismo save MUST NOT generar elementos extra: cuentan como refuerzo de la fila de su primera copia (`collapse_duplicate_chunks`, `worker.rs:148`, y `ingest_pieces`, `worker.rs:621`).
 
 Si la ingesta enmascaró secretos, la respuesta lleva además `redacted` con sus tipos, y `save_memory` los nombra en su texto: ver [`specs/secrets`](../secrets/spec.md), R3.
 
@@ -174,14 +174,14 @@ Si el detector de contradicciones encontró memorias cercanas, la respuesta llev
 
 ### Un duplicado devuelve la fila existente
 
-Un save cuyo contenido ya está guardado MUST responder `201` con `outcome: "reinforced"` y el id de la fila existente. MUST NOT insertar otra fila.
+Un save cuyo contenido ya está guardado MUST responder `201` con `outcome: "reinforced"` y el id de la fila existente. MUST NOT insertar otra fila. Vale también para un gemelo que vuelve a estar vivo mientras el save se embebe, como un `restore_memory` del mismo texto: el insert lo busca de nuevo en su transacción y lo refuerza (`insert_unless_twin`, `crates/clawg-core/src/memory/store_insert.rs:429`).
 
 #### Escenario
 - GIVEN un save de `X` que devolvió el id 57
 - WHEN se guarda `X` otra vez, con el mismo agente y proyecto
 - THEN la respuesta tiene un elemento `{"id": 57, "outcome": "reinforced"}` y la tabla sigue con una fila
 
-**Tests:** `saving_the_same_text_twice_returns_the_same_id_as_reinforced` (`tests/api.rs`) y `process_event_reports_reinforced_with_the_existing_id` (`worker.rs`, mod tests).
+**Tests:** `saving_the_same_text_twice_returns_the_same_id_as_reinforced` (`tests/api.rs`) y `process_event_reports_reinforced_with_the_existing_id` y `a_twin_restored_while_the_save_is_embedded_is_reinforced_not_copied` (`worker.rs`, mod tests).
 
 ### Un fallo del worker llega al que guardó
 
@@ -241,7 +241,7 @@ Con el embedder `loading`, el save MUST encolar el evento sin canal de respuesta
 {"status": "queued", "reason": "embedder_loading", "operation_id": "3f0c…"}
 ```
 
-El worker MUST retener esos eventos hasta que el modelo cargue (`hold_for_embedder`, `worker.rs:395`). Un apagado ordenado que llega antes los deja en el outbox (ver [storage](../storage/spec.md)). Como la fila ya está confirmada, un `202 embedder_loading` sobrevive a un proceso que muere antes de que el modelo cargue.
+El worker MUST retener esos eventos hasta que el modelo cargue (`hold_for_embedder`, `worker.rs:413`). Un apagado ordenado que llega antes los deja en el outbox (ver [storage](../storage/spec.md)). Como la fila ya está confirmada, un `202 embedder_loading` sobrevive a un proceso que muere antes de que el modelo cargue.
 
 #### Escenario
 - GIVEN un daemon con el embedder `loading`
@@ -435,7 +435,7 @@ Los textos de un `202` MUST nombrar el `operation_id` (sin él, dicen sólo `acc
 
 ### Hay un solo chunker, también para el código
 
-El worker MUST trocear el contenido de cada save con el chunker de chat (`ChatChunker::split_save`, `crates/clawg-core/src/memory/chunker/chat.rs:88`), sea cual sea su `memory_type` y su `source`, incluido `code_block`. Lo único que la elección por evento decide es si el evento se descarta: `select_chunker` (`crates/clawg-core/src/memory/chunker/mod.rs:96`) devuelve `ChunkerKind::Skip` para un contenido vacío y para el rol `System`, y `ChunkerKind::Chat` para el resto (`ingest_pieces`, `worker.rs:630`); un evento de fuente `Compaction` ni consulta la elección y siempre va al chat chunker. No hay chunker de código en la ingesta: el código de un proyecto se trocea para su propio índice, que no es `memory` ([`specs/project-docs`](../project-docs/spec.md)).
+El worker MUST trocear el contenido de cada save con el chunker de chat (`ChatChunker::split_save`, `crates/clawg-core/src/memory/chunker/chat.rs:114`), sea cual sea su `memory_type` y su `source`, incluido `code_block`. Lo único que la elección por evento decide es si el evento se descarta: `select_chunker` (`crates/clawg-core/src/memory/chunker/mod.rs:96`) devuelve `ChunkerKind::Skip` para un contenido vacío y para el rol `System`, y `ChunkerKind::Chat` para el resto (`ingest_pieces`, `worker.rs:644`); un evento de fuente `Compaction` ni consulta la elección y siempre va al chat chunker. No hay chunker de código en la ingesta: el código de un proyecto se trocea para su propio índice, que no es `memory` ([`specs/project-docs`](../project-docs/spec.md)).
 
 Una fila guardada con `source = 'code_file'` o `memory_type = 'code_block'` MUST seguir leyéndose y listándose como cualquier otra (`MemorySource::CodeFile`, `events.rs:75`; `MemoryType::CodeBlock`, `store_insert.rs:25`).
 

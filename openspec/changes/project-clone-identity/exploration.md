@@ -54,7 +54,7 @@ La operación que esta exploración llama «unir dos ids» (el re-key, `merge`) 
 - **Dos versiones vigentes de un tema.** Dos ids legados con filas del mismo agente y el mismo `topic_key` quedan ambas vivas. La próxima escritura de esa clave la arregla (`revise_in` reemplaza todo lo vivo del scope), pero hasta entonces el agente lee las dos.
 - **Dos filas vivas con el mismo texto.** Mismo `content_hash` en el mismo (agente, proyecto): el dedup las refuerza al guardar, pero el re-key no pasa por ahí, y ninguna escritura posterior las junta.
 
-Forma del arreglo, dentro de la transacción del re-key: aplicar la regla de `revise_in` a cada clave duplicada (gana la más nueva, causa `revision`) y marcar los duplicados exactos como refuerzo de la fila más vieja. Esos cambios hay que registrarlos para que el re-key siga siendo reversible: hoy `project_rekey` sólo anota movimientos de `project_id`, así que un `status` o `superseded_by` cambiado no se deshace con el SQL de `V9__project.sql:12-16`. Un ayudante «buscar el gemelo vivo dentro de la transacción que escribe» puede compartirse con un arreglo previsto en el insert del worker.
+Forma del arreglo, dentro de la transacción del re-key: aplicar la regla de `revise_in` a cada clave duplicada (gana la más nueva, causa `revision`) y marcar los duplicados exactos como refuerzo de la fila más vieja. Esos cambios hay que registrarlos para que el re-key siga siendo reversible: hoy `project_rekey` sólo anota movimientos de `project_id`, así que un `status` o `superseded_by` cambiado no se deshace con el SQL de `V9__project.sql:12-16`. Un ayudante «buscar el gemelo vivo dentro de la transacción que escribe» puede compartirse con el del insert del worker, que ya busca así el gemelo y lo refuerza (`insert_unless_twin`, `crates/clawg-core/src/memory/store_insert.rs:429`).
 
 ### Qué más depende de una sola raíz
 
@@ -69,7 +69,7 @@ Forma del arreglo, dentro de la transacción del re-key: aplicar la regla de `re
 - Los snapshots: `Reason::PreMigration`, `PreRestore`, `Manual`, `PreReembed` (`crates/clawg-core/src/memory/backup.rs:119-128`) y `MemoryRuntime::snapshot(reason)` (`runtime.rs:195-203`). `register` no toma ninguno hoy (`api.rs:1017-1038`).
 - `is_project_id` (`project.rs:40-49`): valida `{nombre}-{4 hex}`; hay que ensancharla si cambia el ancho.
 - `clawg backup`, `restore`, `purge`, `sharing`: patrón de subcomando de mantenimiento (`cli.rs:68-122`). No hay `projects`.
-- Test de «base de la versión anterior» con ids intactos: `a_database_from_the_previous_version_opens_with_its_project_ids_untouched` (`crates/clawg-core/src/memory/db.rs:707-767`).
+- Test de «base de la versión anterior» con ids intactos: `a_database_from_the_previous_version_opens_with_its_project_ids_untouched` (`crates/clawg-core/src/memory/db.rs:677-737`).
 
 ## Enfoques posibles
 
