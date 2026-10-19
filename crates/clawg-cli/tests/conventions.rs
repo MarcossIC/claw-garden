@@ -708,6 +708,40 @@ fn the_advisories_workflow_runs_a_pinned_cargo_deny_apart_from_ci() {
     }
 }
 
+#[test]
+fn the_installer_is_analyzed_with_a_pinned_psscriptanalyzer() {
+    let name = "installer.yml";
+    let lines = workflow_code(name);
+    for path in ["- 'scripts/**'", "- '.github/workflows/installer.yml'"] {
+        let listed = lines.iter().filter(|l| l.trim() == path).count();
+        assert_eq!(listed, 2, "{name}: pull requests and pushes both watch `{path}`");
+    }
+    assert_reads_no_secret(name, &lines);
+
+    let jobs = jobs_of(&lines);
+    let analyze = job(&jobs, "analyze");
+    assert!(analyze.key("runs-on").is_some_and(|r| r.starts_with("windows-")), "{name} runs on Windows");
+    assert_pinned_download(
+        name,
+        analyze,
+        "PSSA_URL",
+        "https://github.com/PowerShell/PSScriptAnalyzer/releases/download/",
+        "1.25.0",
+        "PSSA_SHA256",
+    );
+    let text = analyze.text();
+    let position = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("{name} lacks `{needle}`"));
+    assert!(position("Get-FileHash -Algorithm SHA256") < position("Import-Module"), "{name} checks the module before loading it");
+    assert!(text.contains("Invoke-ScriptAnalyzer -Path scripts -Recurse -Settings scripts/PSScriptAnalyzerSettings.psd1"));
+    assert!(text.contains("if ($findings.Count -gt 0) { throw"), "{name}: any finding fails the run");
+
+    let settings = read_repo_file("scripts/PSScriptAnalyzerSettings.psd1");
+    let settings: Vec<&str> = settings.lines().map(str::trim).collect();
+    for (n, rule) in settings.iter().enumerate().filter(|(_, l)| l.starts_with("'PS")) {
+        assert!(n > 0 && settings[n - 1].starts_with('#'), "the excluded rule {rule} says why in a comment above it");
+    }
+}
+
 /// The command of every `run:` step of a job, single-line ones only.
 fn run_commands(job: &Job) -> Vec<String> {
     job.steps()
