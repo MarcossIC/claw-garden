@@ -585,7 +585,9 @@ impl DaemonClient {
         Self {
             base_url: base_url.into(),
             token: token.into(),
-            http: reqwest::Client::new(),
+            // The daemon is on loopback and the bearer token travels with every
+            // call: a configured or system proxy must never see them.
+            http: reqwest::Client::builder().no_proxy().build().expect("build the daemon HTTP client"),
             base_dir,
         }
     }

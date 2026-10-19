@@ -443,6 +443,31 @@ async fn a_second_daemon_on_the_same_data_directory_is_refused_and_names_the_fir
 // ── status and stop ────────────────────────────────────────────────────────
 
 #[tokio::test]
+async fn the_daemon_client_ignores_an_http_proxy() {
+    let sandbox = Sandbox::new();
+    let _daemon = sandbox.serve().await;
+    let proxy = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the stand-in proxy");
+    proxy.set_nonblocking(true).expect("non-blocking accept");
+    let url = format!("http://{}", proxy.local_addr().expect("proxy address"));
+
+    let status = sandbox
+        .command(&["status", "--profile", "dev"])
+        .env("HTTP_PROXY", &url)
+        .env("http_proxy", &url)
+        .env("ALL_PROXY", &url)
+        .env("all_proxy", &url)
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .output()
+        .expect("run clawg status");
+
+    assert_eq!(status.status.code(), Some(0), "{}", stderr_of(&status));
+    let report: Value = serde_json::from_slice(&status.stdout).expect("status prints JSON");
+    assert_eq!(report["running"], true);
+    assert!(proxy.accept().is_err(), "the loopback traffic went to the proxy");
+}
+
+#[tokio::test]
 async fn status_and_stop_follow_the_daemon_process() {
     let sandbox = Sandbox::new();
     let before = sandbox.run(&["status", "--profile", "dev"]);
