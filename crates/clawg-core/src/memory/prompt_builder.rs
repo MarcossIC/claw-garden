@@ -4,10 +4,11 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::memory::pieces::SaveLink;
+use crate::memory::pieces::{read_save_core, SaveLink};
 use crate::memory::provenance::mark;
 use crate::memory::{
     access::AccessTracker,
+    admin::MemoryKind,
     clock::TimestampMs,
     embedder::{EmbedError, EmbedRole, Embedder},
     search::{search_all_memories, RankedHit, SearchScope},
@@ -677,9 +678,9 @@ fn format_conflict_block(pairs: &[ConflictPair], hit_positions: &HashMap<i64, us
     out
 }
 
-/// The newest live `session_summary` of the project, the first piece of a
-/// long one, newest first; the project's own only, since a summary without
-/// one is not this project's last session. Authors are checked by the caller.
+/// The live `session_summary` rows of the project, newest first, a long save
+/// by its first piece; the project's own only, since a summary without one is
+/// not this project's last session. Authors are checked by the caller.
 const LAST_SESSION_SQL: &str = "
     SELECT id, content, memory_type, tier, status, created_at, agent_id, topic_key
     FROM memory
@@ -690,8 +691,10 @@ const LAST_SESSION_SQL: &str = "
     ORDER BY created_at DESC, id ASC
 ";
 
-/// The last session's summary `agent_id` may read, and `hits` without it or
-/// any other piece of its save. A failure only leaves the block out.
+/// The last session's summary `agent_id` may read, a long one joined whole,
+/// and `hits` without any piece of its save. Its last sections are the next
+/// steps and the files, so its first piece alone would leave them out. A
+/// failure only leaves the block out, or the summary at its first piece.
 async fn with_last_session(
     store: &MemoryStore,
     agent_id: &str,
@@ -714,8 +717,18 @@ async fn with_last_session(
     });
     let save_of = |id: i64| links.get(&id).map_or(id, |l| l.save_id);
     let hits = hits.into_iter().filter(|h| h.kind != TableKind::Memory || save_of(h.id) != save_of(summary.id)).collect();
-    let piece = links.get(&summary.id).map(|l| l.position);
-    (Some(RankedHit { piece, ..summary }), hits)
+    let Some(piece) = links.get(&summary.id).map(|l| l.position) else {
+        return (Some(summary), hits);
+    };
+    let summary = match read_save_core(store, MemoryKind::Memory, summary.id, summary.agent_id.as_deref()).await {
+        Ok(Some(save)) => RankedHit { content: save.text, ..summary },
+        Ok(None) => RankedHit { piece: Some(piece), ..summary },
+        Err(e) => {
+            log::warn!("read_save_core failed: {e}; LAST SESSION shows the first piece");
+            RankedHit { piece: Some(piece), ..summary }
+        }
+    };
+    (Some(summary), hits)
 }
 
 async fn fetch_last_session(
@@ -3170,6 +3183,35 @@ mod tests {
         }
         assert!(prompt.find(SEP_LAST_SESSION) < prompt.find(SEP_RECENT), "it comes before the hits: {prompt}");
         assert!(block(&prompt, SEP_RECENT).unwrap().contains(&format!("#{fact} ")), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn the_last_session_block_shows_a_long_summary_whole() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let opening = seed_summary(&store, "agent-1", Some("proj-a"), "Goal: wire the cache. Instructions: keep the locale key", 1).await;
+        let closing = seed_summary(&store, "agent-1", Some("proj-a"), "Next steps: invalidate on deploy. Relevant files: cache.rs", 1).await;
+        // Every piece of a save carries the save's stamp, as ingest writes it.
+        store
+            .conn
+            .call(move |c| {
+                c.execute("UPDATE memory SET created_at = (SELECT created_at FROM memory WHERE id = ?1) WHERE id = ?2", [opening, closing])
+            })
+            .await
+            .unwrap();
+        store
+            .link_pieces(vec![
+                crate::memory::pieces::StoredPiece { memory_id: opening, context: String::new() },
+                crate::memory::pieces::StoredPiece { memory_id: closing, context: "Goal".into() },
+            ])
+            .await
+            .unwrap();
+
+        let text = session_prompt(&store, "agent-1", Some("proj-a")).await.text;
+
+        let last = block(&text, SEP_LAST_SESSION).unwrap_or_else(|| panic!("no LAST SESSION block: {text}"));
+        assert!(last.contains(&format!("#{opening} session_summary] Goal: wire the cache")), "{text}");
+        assert!(last.contains("Next steps: invalidate on deploy. Relevant files: cache.rs"), "{text}");
+        assert!(!text.contains(&format!("#{closing} ")), "{text}");
     }
 
     #[tokio::test]
