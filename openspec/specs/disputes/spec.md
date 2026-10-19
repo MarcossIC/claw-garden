@@ -230,7 +230,7 @@ Las consultas a `memory` del workspace MUST excluir `status = 'superseded'`. Las
 
 ## R8. Los pedazos hermanos no se disputan
 
-El detector (`detect_contradiction`, `contradiction.rs:181`) MUST NOT devolver como candidata una fila insertada por el mismo evento que el pedazo que se compara. Para que los hermanos no ocupen el presupuesto de candidatos, la búsqueda MUST pedir tantos candidatos extra como hermanos ya insertados (`contradiction.rs:197`). Las filas de las que se sacó una conclusión entran como hermanas: la conclusión las reformula, no las contradice.
+El detector (`detect_contradiction`, `contradiction.rs:182`) MUST NOT devolver como candidata una fila insertada por el mismo evento que el pedazo que se compara. Para que los hermanos no ocupen el presupuesto de candidatos, la búsqueda MUST pedir tantos candidatos extra como hermanos ya insertados (`contradiction.rs:198`). Las filas de las que se sacó una conclusión entran como hermanas: la conclusión las reformula, no las contradice.
 
 Con el modelo real, antes de esta regla 220 de 263 pedazos de 40 saves largos quedaban `disputed` contra sus hermanos; con ella, ninguno ([verify](../../changes/archive/2026-10-13-dispute-resolution/verify.md#hipótesis-de-los-pedazos-hermanos-con-el-modelo-real)).
 
@@ -263,7 +263,7 @@ El worker suma las filas del alcance a los hermanos que ya pasa al detector (`si
 
 ## Umbral y banda del detector
 
-El detector (`detect_contradiction`, `contradiction.rs:181`) MUST devolver como candidata una fila de `memory`, del mismo agente y de un tipo que afirma algo, cuya distancia L2 al vector nuevo (ambos unitarios) cae en la banda `[NEAR_DUPLICATE_FLOOR, CONTRADICTION_THRESHOLD)` (`contradiction.rs:214-215`):
+El detector (`detect_contradiction`, `contradiction.rs:182`) MUST devolver como candidata una fila de `memory`, del mismo agente y de un tipo que afirma algo, cuya distancia L2 al vector nuevo (ambos unitarios) cae en la banda `[NEAR_DUPLICATE_FLOOR, CONTRADICTION_THRESHOLD)` (`contradiction.rs:215-216`):
 
 | Constante | Valor | Qué separa |
 |---|---|---|
@@ -276,7 +276,7 @@ Los cuatro valores son de L2 sobre vectores del pooling mean del modelo ([`specs
 
 **Cómo se midieron.** Con el golden set de memorias (`docs/eval/golden.json`, 46 casos, 28 pares de contradicción), con pooling mean, el 2026-10-15: la curva del barrido de [`specs/eval`](../eval/spec.md) da 0 falsos positivos sobre los pares no contradictorios hasta L2 0,50, recall 0,8 en 0,40 y 0,9 en 0,45. Los pares escritos a mano como proxy (diez que se contradicen y diez compatibles) quedan en (0,350, 0,469]: la última contradicción en 0,350 y el primer par compatible en 0,469, así que 0,42 queda con margen por debajo de él y `ESCALATE_BELOW` = 0,40 entre los dos. `NEAR_DUPLICATE_FLOOR` sale del mismo proxy: el par de una oración y ella misma con un doble espacio queda a L2 0,097, y el piso lo deja justo por encima. Esa calibración mide la distancia sola; el detector entero (el filtro de tipo, el piso, el colapso por save y el escalamiento) lo mide `conflict-eval` ([`specs/eval`](../eval/spec.md)). Los dos cortes de escalamiento salen de ahí, el 2026-10-18: con un solo corte de 0,40 para todo, el 23,4 % de los saves de un flujo de hechos del mismo proyecto escalaba por compartir identificadores (`agent_id`, `memory_type`), con esos pares entre 0,34 y 0,40, y en un store real un hecho cerca de una nota de estado guardada como decisión escalaba igual que dos decisiones. Con `IDENTIFIER_ESCALATE_BELOW` = 0,30 y la regla de los dos lados protegidos, el flujo baja al 0,7 % y las contradicciones protegidas del set etiquetado siguen escalando 9 de 9.
 
-El detector sigue viendo sólo las filas del que guarda (`Reach::Own`, `contradiction.rs:177`, [`specs/sharing`](../sharing/spec.md)) y no consulta el canal léxico (`lexical: None`).
+El detector sigue viendo sólo las filas del que guarda (`Reach::OwnOnly`, `contradiction.rs:178`, [`specs/sharing`](../sharing/spec.md)) y no consulta el canal léxico (`lexical: None`).
 
 **Tests:** `contradiction_threshold_pins_the_shipped_value`, `near_duplicate_floor_pins_the_shipped_value`, `escalate_below_pins_the_shipped_value` e `identifier_escalate_below_pins_the_shipped_value` (fijan los literales), `hit_below_near_duplicate_floor_is_excluded`, `detect_contradiction_near_vector_returns_stored_id`, `detect_contradiction_far_vectors_returns_empty` y `user_preference_contradiction_detected_at_in_band_distance` en `crates/clawg-core/src/memory/contradiction.rs`.
 

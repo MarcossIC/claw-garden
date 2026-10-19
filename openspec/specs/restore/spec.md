@@ -202,7 +202,7 @@ Restaurar una fila reemplazada por una borrada D MUST aplicar la regla a D (`rev
 
 Cuando la fila restaurada queda viva sin estar `superseded`, MUST compararse con el detector de un save (`detect_contradiction`, con sus reglas de banda, tipo y `needs_user`; `restore_candidates`, `admin.rs:484`) contra las filas vivas guardadas después de su `deleted_at` (`note_restored_pairs`, `admin.rs:521`). Cada candidata MUST anotarse como par `(new_id = C, old_id = A)`, en estado `pending` o `escalated`, con `INSERT OR IGNORE`, de modo que un par ya existente con su veredicto no se pisa. Un par escalado MUST sumar A a `disputed_against` de C (`add_dispute_in`, `crates/clawg-core/src/memory/dispute.rs:285`) y dejar a C `disputed`. La respuesta MUST devolver las candidatas en `related` (`RestoredRow.related`, `admin.rs:419`), y `format_restore` MUST marcar las escaladas con «asks the user».
 
-No se anotan: las filas guardadas antes del borrado, las que ya tienen par con A (con o sin veredicto) y las que A vuelve a reemplazar. Si la fila restaurada termina `superseded`, no se escribe ningún par. Un fallo del detector se registra en el log y no devuelve ninguna candidata, como en un save (`contradiction.rs:199-205`); el restore no lo reintenta.
+No se anotan: las filas guardadas antes del borrado, las que ya tienen par con A (con o sin veredicto) y las que A vuelve a reemplazar. Si la fila restaurada termina `superseded`, no se escribe ningún par. Un fallo del detector se registra en el log y no devuelve ninguna candidata, como en un save (`contradiction.rs:200-206`); el restore no lo reintenta.
 
 #### Escenario
 - GIVEN una fila A borrada, y después C guardada con texto cercano, sin identificador en común

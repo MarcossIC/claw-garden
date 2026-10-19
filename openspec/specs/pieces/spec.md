@@ -85,11 +85,11 @@ Guardar otra vez exactamente las mismas filas, en el mismo orden, MUST devolver 
 
 ## R4. Un hit por save
 
-La búsqueda (`search_all_memories_inner`, `crates/clawg-core/src/memory/search.rs:1109`) MUST, después de ordenar y antes de cortar en `k`, quedarse con el primer hit de cada save y descartar los demás pedazos de ese save (`collapse_saves`, `search.rs:111`, llamado en `search.rs:1252`; el corte es `search.rs:1258`). Un hit de una fila sin vínculos, o de `episodic_trajectory` o `procedural_skill`, MUST quedar donde está.
+La búsqueda (`search_all_memories_inner`, `crates/clawg-core/src/memory/search.rs:1179`) MUST, después de ordenar y antes de cortar en `k`, quedarse con el primer hit de cada save y descartar los demás pedazos de ese save (`collapse_saves`, `search.rs:141`, llamado en `search.rs:1322`; el corte es `search.rs:1328`). Un hit de una fila sin vínculos, o de `episodic_trajectory` o `procedural_skill`, MUST quedar donde está.
 
-Cada hit de una fila con vínculos MUST llevar su posición y el total de pedazos del save (`RankedHit.piece: Option<PiecePosition>`, `search.rs:89-91`; `PiecePosition`, `search.rs:103`). El descarte corre antes del corte: los lugares que liberan los hermanos los ocupan otras memorias.
+Cada hit de una fila con vínculos MUST llevar su posición y el total de pedazos del save (`RankedHit.piece: Option<PiecePosition>`, `search.rs:120-122`; `PiecePosition`, `search.rs:134`). El descarte corre antes del corte: los lugares que liberan los hermanos los ocupan otras memorias.
 
-El descarte es una función pura sobre los hits y los vínculos de sus filas. Si leer los vínculos falla, la búsqueda MUST devolver los hits sin colapsar y dejar un aviso en el log (`search.rs:1251-1257`): es lo de antes, no un error.
+El descarte es una función pura sobre los hits y los vínculos de sus filas. Si leer los vínculos falla, la búsqueda MUST devolver los hits sin colapsar y dejar un aviso en el log (`search.rs:1321-1327`): es lo de antes, no un error.
 
 #### Escenario: los hermanos no ocupan el top
 - GIVEN un save de 4 pedazos que puntúan 1.º, 2.º, 4.º y 5.º para una consulta, y 10 filas sueltas
@@ -167,9 +167,9 @@ La migración `V11__memory_piece.sql` (`crates/clawg-core/migrations/`) crea `me
 
 ## R9. El pozo de KNN cuenta saves
 
-La consulta KNN de `memory` (`knn_one`, `crates/clawg-core/src/memory/search.rs:430`) pide `k` vecinos (30 en `SearchScope::all_default`, `search.rs:37`). Cuando esa ventana vuelve llena y sus filas forman menos de `k` saves distintos (`distinct_saves`, `search.rs:139`, que cuenta una fila sin vínculo como su propio save), la consulta MUST repetirse una vez con la ventana ampliada (`retry_window`, `search.rs:365`), y el resultado MUST recortarse, en orden de puntaje, a las filas que alcanzan `k` saves distintos (`trim_to_saves`, `search.rs:146`, llamado en `search.rs:556`). Sin esto, un save con más pedazos cerca de la consulta que el tamaño del pozo lo llena de hermanos, y R4 los colapsa en un solo hit.
+La consulta KNN de `memory` (`knn_one`, `crates/clawg-core/src/memory/search.rs:486`) pide `k` vecinos (30 en `SearchScope::all_default`, `search.rs:37`). Cuando esa ventana vuelve llena y sus filas forman menos de `k` saves distintos (`distinct_saves`, `search.rs:167`, que cuenta una fila sin vínculo como su propio save), la consulta MUST repetirse una vez con la ventana ampliada (`retry_window`, `search.rs:421`), y el resultado MUST recortarse, en orden de puntaje, a las filas que alcanzan `k` saves distintos (`trim_to_saves`, `search.rs:174`, llamado en `search.rs:612`). Sin esto, un save con más pedazos cerca de la consulta que el tamaño del pozo lo llena de hermanos, y R4 los colapsa en un solo hit.
 
-Sigue habiendo a lo sumo una segunda pasada por búsqueda: la que pide un pozo vaciado por filas no elegibles y la que pide uno lleno de hermanos son la misma (`search.rs:513-531`). Los vínculos se leen en la misma conexión (`pieces::read_links`, `pieces.rs:237`). Si esa lectura falla, el pozo MUST contar filas, como antes, y dejar un aviso en el log (`search.rs:499-508`). Una tabla que no es `memory` no tiene vínculos y cuenta filas.
+Sigue habiendo a lo sumo una segunda pasada por búsqueda: la que pide un pozo vaciado por filas no elegibles y la que pide uno lleno de hermanos son la misma (`search.rs:569-587`). Los vínculos se leen en la misma conexión (`pieces::read_links`, `pieces.rs:237`). Si esa lectura falla, el pozo MUST contar filas, como antes, y dejar un aviso en el log (`search.rs:555-564`). Una tabla que no es `memory` no tiene vínculos y cuenta filas.
 
 `distinct_saves` y `trim_to_saves` son funciones puras sobre los hits y los vínculos.
 
