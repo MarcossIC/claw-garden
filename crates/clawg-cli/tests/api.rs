@@ -225,7 +225,7 @@ impl Harness {
                 let idle = IdleEmbedder::new(
                     Arc::new(FakeEmbedder::default()),
                     reload,
-                    Duration::from_secs(600),
+                    Some(Duration::from_secs(600)),
                     &tokio::runtime::Handle::current(),
                 );
                 idle.unload().await;

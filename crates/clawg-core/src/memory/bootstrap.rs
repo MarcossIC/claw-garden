@@ -393,10 +393,11 @@ pub fn serve_deps(
 }
 
 /// `load`, with every embedder it builds wrapped in an [`IdleEmbedder`] that
-/// lets the model go after `idle` without use. A reload goes through `cached`
-/// and `load` again, so it reads and checks the same files the bootstrap did;
-/// the contract is not checked again, because the reload refuses a model with
-/// another identity. The sweeper runs on `runtime`.
+/// lets the model go after `idle` without use, or never with `None`. A reload
+/// goes through `cached` and `load` again, so it reads and checks the same
+/// files the bootstrap did; the contract is not checked again, because the
+/// reload refuses a model with another identity. The sweeper runs on
+/// `runtime`.
 ///
 /// A reload never downloads: it runs under the lock every call that needs a
 /// vector waits on. When the cache no longer verifies, the reload answers at
@@ -407,7 +408,7 @@ pub fn unloading_when_idle(
     ensure: EnsureModelFn,
     load: LoadEmbedderFn,
     base_dir: std::path::PathBuf,
-    idle: Duration,
+    idle: Option<Duration>,
     runtime: tokio::runtime::Handle,
 ) -> LoadEmbedderFn {
     let repairing = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -923,7 +924,7 @@ mod tests {
             never_download(),
             load,
             std::path::PathBuf::from("unused"),
-            Duration::from_secs(600),
+            Some(Duration::from_secs(600)),
             tokio::runtime::Handle::current(),
         );
 
@@ -981,7 +982,7 @@ mod tests {
             ensure,
             load,
             std::path::PathBuf::from("unused"),
-            Duration::from_secs(600),
+            Some(Duration::from_secs(600)),
             tokio::runtime::Handle::current(),
         );
         let embedder = wrapped(empty_model_files()).expect("first load");
@@ -1097,7 +1098,7 @@ mod tests {
             never_download(),
             load,
             std::path::PathBuf::from("unused"),
-            Duration::from_secs(600),
+            Some(Duration::from_secs(600)),
             tokio::runtime::Handle::current(),
         );
 

@@ -111,17 +111,14 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
         log::warn!("{e}; the model is let go after {} minutes without use", DEFAULT_IDLE.as_secs() / 60);
         Some(DEFAULT_IDLE)
     });
-    let load = match idle {
-        Some(idle) => unloading_when_idle(
-            cached,
-            ensure.clone(),
-            load,
-            base_dir.clone(),
-            idle,
-            tokio::runtime::Handle::current(),
-        ),
-        None => load,
-    };
+    let load = unloading_when_idle(
+        cached,
+        ensure.clone(),
+        load,
+        base_dir.clone(),
+        idle,
+        tokio::runtime::Handle::current(),
+    );
     tokio::spawn(run_embedder_bootstrap_with_retry(
         base_dir.clone(),
         runtime.embedder.clone(),

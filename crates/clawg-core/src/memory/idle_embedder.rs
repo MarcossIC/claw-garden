@@ -73,7 +73,6 @@ struct Shared {
     /// Read by health without waiting on a load that holds `model`.
     resident: AtomicBool,
     reload: ReloadFn,
-    idle: Duration,
     dimensions: usize,
     model_id: String,
     query_prefix: String,
@@ -132,19 +131,19 @@ impl Shared {
         Ok(model)
     }
 
-    async fn unload_if_idle(&self) -> bool {
+    async fn unload_if_idle(&self, idle: Duration) -> bool {
         let mut slot = self.model.lock().await;
         if slot.is_none() {
             return false;
         }
         let due = {
             let usage = self.usage.lock().unwrap_or_else(|e| e.into_inner());
-            should_unload(Instant::now(), usage.last_used, usage.in_flight, self.idle)
+            should_unload(Instant::now(), usage.last_used, usage.in_flight, idle)
         };
         if due {
             self.resident.store(false, Ordering::Release);
             *slot = None;
-            log::info!("embedding model unloaded after {} s without use", self.idle.as_secs());
+            log::info!("embedding model unloaded after {} s without use", idle.as_secs());
         }
         due
     }
@@ -158,11 +157,12 @@ pub struct IdleEmbedder {
 impl IdleEmbedder {
     /// Wraps the `loaded` model, counting it as just used, and spawns on
     /// `runtime` the sweeper that unloads it once it sat `idle` unused. The
-    /// sweeper ends when the embedder is dropped.
+    /// sweeper ends when the embedder is dropped. With no `idle` there is no
+    /// sweeper and the model only goes when its worker does.
     pub fn new(
         loaded: Arc<dyn Embedder>,
         reload: ReloadFn,
-        idle: Duration,
+        idle: Option<Duration>,
         runtime: &tokio::runtime::Handle,
     ) -> Self {
         let shared = Arc::new(Shared {
@@ -174,8 +174,8 @@ impl IdleEmbedder {
             usage: SyncMutex::new(Usage { last_used: Instant::now(), in_flight: 0 }),
             resident: AtomicBool::new(true),
             reload,
-            idle,
         });
+        let Some(idle) = idle else { return Self { shared } };
         let weak = Arc::downgrade(&shared);
         runtime.spawn(async move {
             let mut tick = tokio::time::interval(sweep_period(idle));
@@ -183,7 +183,7 @@ impl IdleEmbedder {
             loop {
                 tick.tick().await;
                 let Some(shared) = weak.upgrade() else { return };
-                shared.unload_if_idle().await;
+                shared.unload_if_idle(idle).await;
             }
         });
         Self { shared }
@@ -271,7 +271,7 @@ mod tests {
     }
 
     fn idle_embedder(loads: Arc<AtomicUsize>) -> IdleEmbedder {
-        IdleEmbedder::new(fake(), counting_reload(loads), IDLE, &tokio::runtime::Handle::current())
+        IdleEmbedder::new(fake(), counting_reload(loads), Some(IDLE), &tokio::runtime::Handle::current())
     }
 
     async fn pass(duration: Duration) {
@@ -384,7 +384,7 @@ mod tests {
         let embedder = Arc::new(IdleEmbedder::new(
             Arc::new(Slow),
             reload,
-            IDLE,
+            Some(IDLE),
             &tokio::runtime::Handle::current(),
         ));
         let call = tokio::spawn({
@@ -414,7 +414,7 @@ mod tests {
                 })
             })
         };
-        let embedder = IdleEmbedder::new(fake(), reload, IDLE, &tokio::runtime::Handle::current());
+        let embedder = IdleEmbedder::new(fake(), reload, Some(IDLE), &tokio::runtime::Handle::current());
         pass(IDLE * 2).await;
 
         let first = embedder.embed_with_role("a text", EmbedRole::Query).await;
@@ -446,7 +446,7 @@ mod tests {
             }
         }
         let reload: ReloadFn = Arc::new(|| Box::pin(async { Ok(Arc::new(Other) as Arc<dyn Embedder>) }));
-        let embedder = IdleEmbedder::new(fake(), reload, IDLE, &tokio::runtime::Handle::current());
+        let embedder = IdleEmbedder::new(fake(), reload, Some(IDLE), &tokio::runtime::Handle::current());
         pass(IDLE * 2).await;
 
         let result = embedder.embed_with_role("a text", EmbedRole::Query).await;
@@ -491,6 +491,16 @@ mod tests {
         embedder.wake();
         pass(IDLE / 2).await;
         assert!(embedder.resident());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_no_idle_time_the_model_stays_and_a_dead_worker_is_still_recovered() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let embedder =
+            IdleEmbedder::new(fake(), counting_reload(loads.clone()), None, &tokio::runtime::Handle::current());
+        pass(IDLE * 100).await;
+        assert!(embedder.resident());
+        assert_eq!(loads.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(start_paused = true)]
