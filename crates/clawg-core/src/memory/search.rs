@@ -672,18 +672,24 @@ pub(crate) fn viewer_match_expression(query_text: &str) -> Option<String> {
 // vtab is the lowest rowids: the oldest memories, close to the worst
 // possible selection for a candidate budget.
 //
-// The two scope predicates are copied verbatim from `SEARCH_SQL_MEMORY`,
-// including the `?3 IS NULL` tautology (an unscoped caller's row set stays
-// untouched) and the `user_preference` exemption. They run here, before the
-// `LIMIT`, so the budget is spent on PERMITTED candidates only — a row this
-// caller may not see never occupies one of the `?4` slots. Dropping the
-// `user_preference` disjunct would make this channel stricter than the
-// dense one about which project-scoped rows are allowed through.
+// The live-status and scope predicates are copied verbatim from
+// `SEARCH_SQL_MEMORY`, including the `?3 IS NULL` tautology (an unscoped
+// caller's row set stays untouched) and the `user_preference` exemption. They
+// run here, before the `LIMIT`, so the budget is spent on candidates the
+// caller can be shown — a row it may not see never occupies one of the `?4`
+// slots. That includes the `superseded` versions of a topic: `memory_fts`
+// drops a row only when it is deleted, and those versions read almost like
+// the current one. Dropping the `user_preference` disjunct would make this
+// channel stricter than the dense one about which project-scoped rows are
+// allowed through.
 const LEXICAL_CANDIDATE_SQL: &str = "
-    SELECT rowid FROM memory_fts
+    SELECT memory_fts.rowid FROM memory_fts
+    JOIN memory m ON m.id = memory_fts.rowid
     WHERE memory_fts MATCH ?1
-      AND (agent_id = (?2 ->> '$.reader') OR ((?2 ->> '$.hidden') IS NOT NULL AND agent_id NOT IN (SELECT value FROM json_each(?2, '$.hidden'))))
-      AND (?3 IS NULL OR project_id = ?3 OR project_id IS NULL OR memory_type = 'user_preference')
+      AND m.status IN ('active', 'disputed')
+      AND m.deleted_at IS NULL
+      AND (m.agent_id = (?2 ->> '$.reader') OR ((?2 ->> '$.hidden') IS NOT NULL AND m.agent_id NOT IN (SELECT value FROM json_each(?2, '$.hidden'))))
+      AND (?3 IS NULL OR m.project_id = ?3 OR m.project_id IS NULL OR m.memory_type = 'user_preference')
     ORDER BY bm25(memory_fts)
     LIMIT ?4
 ";
@@ -3384,6 +3390,58 @@ mod tests {
             "the best bm25 match must survive the LIMIT even though it was inserted last \
              (highest rowid) — without ORDER BY bm25(...) a plain LIMIT keeps the lowest \
              rowids and drops it"
+        );
+    }
+
+    // A topic revised with `topic_key` leaves its old versions in `memory_fts`
+    // (only a delete takes a row out), each nearly the text of the current one.
+    // Shorter, they outrank it by bm25; filtered after the `LIMIT`, they would
+    // fill the budget and leave the current version out.
+    #[tokio::test]
+    async fn superseded_versions_do_not_spend_the_lexical_budget() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let emb = unit_basis_embedding();
+        let agent = "agent-revised";
+        for i in 0..3 {
+            insert_memory_row(
+                &store, agent, &format!("revtok version {i}"), "semantic_fact", 3, 5.0, "superseded", emb.clone(),
+            )
+            .await;
+        }
+        let current = insert_memory_row(
+            &store, agent, "revtok version 3, the wording that holds today", "semantic_fact", 3, 5.0, "active", emb,
+        )
+        .await;
+
+        let ids = lexical_candidates(&store, "revtok", &only(agent), None, 2).await;
+
+        assert_eq!(ids, vec![current]);
+    }
+
+    /// The candidate query is driven by the MATCH and reaches `memory` by rowid
+    /// for each match: driven from an index on `memory` instead, it would visit
+    /// every live row to test the MATCH on each.
+    #[tokio::test]
+    async fn the_lexical_candidate_query_is_driven_by_the_match() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let plan = store
+            .conn
+            .call(|c| -> Result<Vec<String>, rusqlite::Error> {
+                let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {LEXICAL_CANDIDATE_SQL}"))?;
+                let rows = stmt.query_map(
+                    rusqlite::params!["\"tok\"", only("plan-probe"), Option::<String>::None, 20],
+                    |r| r.get::<_, String>(3),
+                )?;
+                rows.collect()
+            })
+            .await
+            .unwrap();
+
+        let fts = plan.iter().position(|l| l.contains("memory_fts VIRTUAL TABLE"));
+        let memory = plan.iter().position(|l| l.contains(" m USING INTEGER PRIMARY KEY"));
+        assert!(
+            matches!((fts, memory), (Some(f), Some(m)) if f < m),
+            "expected memory_fts as the outer loop and `memory` by rowid, got {plan:#?}"
         );
     }
 
