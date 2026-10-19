@@ -588,7 +588,12 @@ fn hook(sandbox: &Sandbox, args: &[&str], input: &str) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn clawg hook");
-    child.stdin.take().expect("stdin").write_all(input.as_bytes()).expect("write stdin");
+    // A usage error exits before stdin is read, and the write may then find
+    // the pipe closed; the exit code is what such a test checks.
+    match child.stdin.take().expect("stdin").write_all(input.as_bytes()) {
+        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => panic!("write stdin: {e}"),
+        _ => {}
+    }
     child.wait_with_output().expect("clawg hook")
 }
 
