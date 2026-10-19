@@ -56,3 +56,11 @@ No hay diferencias de comportamiento con la spec. Quedan tres de redacción en e
 ## No aplica
 
 - `rag-eval`: el ranking no cambia.
+
+## Citas realineadas al consolidar
+
+Este cambio movió líneas de `bootstrap.rs`, `model_download.rs`, `runtime.rs` y `crates/clawg-cli/src/daemon/serve.rs`; secret-coverage (51), que entró en `develop` en el mismo merge, no tocó ninguno de los cuatro.
+
+- **Todas las specs y el `README.md` de openspec:** cada cita a uno de esos archivos se comparó con la línea que citaba en `48971bf` (el código antes de este cambio) y se movió a la única línea de `HEAD` con el mismo texto. Así se realinearon 26 en `ingest`, `secrets`, `storage` y el backlog. La de `serve_deps` en `storage` tenía dos líneas con el mismo texto, una por variante de `cfg`; queda la del build con `testing` (`bootstrap.rs:373`), la misma que cita `install` para lo que arma `clawg serve`.
+- **Las que ya estaban corridas antes de este cambio** apuntaban a una línea en blanco o a otro ítem, así que se corrigieron por el símbolo que nombran: en `install`, `TEST_EMBEDDER_VAR`, `TestEmbedder`, `serve_deps` (las dos variantes), `production_deps`, `TestEmbedder::parse` y `TestEmbedder::deps`; en `ingest`, `run_embedder_bootstrap_with_retry`; en `storage` y el backlog, el `spawn_blocking` de la carga del bootstrap (`bootstrap.rs:592`); en el backlog, el uso de producción de `load_verified_tokenizer` (`runtime.rs:208`).
+- Las citas nuevas de «Descarga del modelo», de la recarga y de la causa del fallo se tomaron de `HEAD`.
