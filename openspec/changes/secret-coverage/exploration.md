@@ -4,7 +4,7 @@
 |---|---|---|---|
 | 1 | M | — (conviene antes de 43 y 44; ver «Interacciones») | exploración (borrador) |
 
-**Tesis:** un secreto que llega a clawg se enmascara en todo lugar donde la regla puede verlo, y `clawg purge` saca un texto de todos los lugares donde clawg lo copió, y sólo ese texto. Hoy hay tres huecos verificados. El detector no conoce formatos frecuentes (claves de AWS, OpenRouter, Hugging Face, webhooks de Slack, claves PGP) porque sus patrones por contexto sólo se anclan en `password`. `purge` deja el texto en `workspace.md` y la cabecera de un save largo, y a la vez puede borrar saves aceptados de otros agentes, porque compara el outbox por subcadena. Y el `reason` de un veredicto se guarda sin enmascarar, en una columna que `clawg secrets` no mira. Los tres rompen la promesa que el producto hace con los secretos, y una importación (44) los multiplica.
+**Tesis:** un secreto que llega a clawg se enmascara en todo lugar donde la regla puede verlo, y `clawg purge` saca un texto de todos los lugares donde clawg lo copió, y sólo ese texto. Hoy hay cuatro huecos verificados. El detector no conoce formatos frecuentes (claves de AWS, OpenRouter, Hugging Face, webhooks de Slack, claves PGP) porque sus patrones por contexto sólo se anclan en `password`. `purge` deja el texto en `workspace.md` y la cabecera de un save largo, y a la vez puede borrar saves aceptados de otros agentes, porque compara el outbox por subcadena. Y el `reason` de un veredicto se guarda sin enmascarar, en una columna que `clawg secrets` no mira. Y `purge` de la versión vigente de un tema deja las versiones anteriores escondidas para siempre, porque nadie las revive. Los cuatro rompen la promesa que el producto hace con los secretos, y una importación (44) los multiplica.
 
 ## Premisas que se verificaron y cuáles no eran del todo ciertas
 
@@ -19,6 +19,8 @@
 | El `reason` de un veredicto se guarda sin enmascarar | **Cierta.** `judge_pair` lo recorta (`dispute.rs:327`) y lo escribe en `memory_conflict.reason` (`:383`, `V15__memory_conflict.sql:19`); la ruta llega por `crates/clawg-cli/src/daemon/api.rs:1442`. |
 | `redact(` se llama sólo en `runtime.rs` ~222/~447, `worker.rs` ~621, `project_docs/mod.rs` ~382, `admin.rs` ~616 | **Cierta**, con líneas exactas `runtime.rs:222`, `:447`, `worker.rs:621`, `project_docs/mod.rs:382`, `admin.rs:616`. Más `secrets.rs:46` (el escaneo) y los tests. No hay otra llamada en `crates/`. |
 | `secrets::scan` lee sólo `memory.content` | **Cierta** (`secrets.rs:41`). |
+| `purge` revive las versiones anteriores de un tema, como un `delete` | **Falsa.** `purge` (`secrets.rs:82-137`) hace `DELETE FROM memory` (`:105`) y `release_challengers` (`:117`, sólo si la fila estaba viva); no llama a `revive_after_delete_of_piece`, que sí llama `delete_memory_core` (`admin.rs:355`) |
+| La pasada de mantenimiento recupera lo que `purge` deja escondido | **Falsa.** `revive_after_delete` no hace nada si la fila no existe con `deleted_at IS NOT NULL` (`revival.rs:86-93`) y `HIDDEN_SQL` une la fila borrada (`revival.rs:156-159`), así que nunca ve un id purgado. `drop_orphaned_pairs` (`maintenance.rs:248`) sólo limpia `memory_conflict`; nada limpia un `superseded_by` hacia un id que ya no existe |
 | Cuatro formatos que se creían sin cubrir | **Dos matices.** `PGPASSWORD=` ya se cubría. `AWS_SECRET_ACCESS_KEY` no tiene prefijo fijo (40 caracteres base64), así que sólo se ve por su clave. |
 
 ## Problema (verificado contra el código)
@@ -36,6 +38,9 @@
 - **b. Subcadena entre agentes.** Un texto corto (`use pnpm`) borra todo save pendiente o `failed` de **cualquier** agente que lo contenga: saves aceptados con `201`/`202` que se pierden sin aviso. Es el mismo contrato que dice «no se pierde nada de lo aceptado» (`.claude/CLAUDE.md`, sección del outbox).
 - **c. Cabecera de un save largo** (backlog de `openspec/README.md`). `memory_piece.context` guarda el principio del save (`V11__memory_piece.sql:4-8`, `:11-16`); `purge` no toca esa tabla (`secrets.rs:103-111`), así que purgar el pedazo 1 deja sus primeros tokens en los vínculos de los pedazos 2..N.
 - **d. Fila `failed` del outbox sin salida** (backlog). Nada la reintenta ni la descarta (`outbox.rs:300-317` sólo la marca). No es un problema de secretos por sí mismo, pero el `last_error` (`IngestFailure::Failed(format!("embed failed: {e}"))`, `worker.rs:752`, `:803`) puede citar el error de una librería; **no se verificó que cite el contenido**, y habría que comprobarlo con un fallo provocado.
+
+- **e. El historial de un tema queda escondido.** Si la fila purgada es la versión vigente de un `topic_key` (el caso típico: era la que tenía el secreto), las versiones anteriores quedan `superseded` por un id que ya no existe. No salen en búsqueda ni en contexto, y `restore` no aplica porque no están borradas. `purge` promete sacar «sólo ese texto» y en realidad esconde todo el historial del tema. Solo las filas con `supersede_cause = 'revision'` deberían volver; las reemplazadas por un veredicto (`verdict`, V17) se quedan escondidas a propósito.
+- Comentarios que esto vuelve falsos: `maintenance.rs:162-163` y `:289-291` dicen que nada en el código borra de verdad una fila de `memory`; `purge` lo hace.
 
 ### 3. Texto libre que no pasa por `redact`
 
@@ -89,6 +94,9 @@ Resultado: **una** columna con texto libre del usuario o el agente que nunca se 
 **I. Guardar el `operation_id` en `memory` (migración V18).** Es la solución exacta, pero necesita migración, vuelta atrás y un test que siembre una base en V17. Las filas viejas no tendrían el vínculo (se mantendría la subcadena para ellas), y el dedup refuerza una fila con otro save (`store_insert.rs`, refuerzo por texto idéntico), así que una fila puede venir de varios saves. Se reabre sólo si G y H no alcanzan.
 
 **J. Cabecera de un save largo.** Que `purge` borre el vínculo de la fila y, si es la posición 1, vacíe `context` en los demás vínculos del save. Absorbido: es del mismo hueco («lo que `purge` promete») y de bajo costo.
+**O. Revivir dentro de la transacción de `purge` (recomendado).** Marcar la fila como borrada primero, aplicar la misma revival que un `delete` (`revive_after_delete_of_piece`) y recién después borrarla de verdad; la salida de `purge` lista lo que volvió. Reusa la regla ya probada (sólo `revision`; `verdict` queda escondido) y deja un solo camino para «salir de la versión vigente». Toca las mismas líneas (`secrets.rs:103-119`) que J: se escriben juntas. Con J, `read_save` muestra un pedazo purgado como ausente; en cambio un veredicto `supersedes` sobre un único pedazo (ítem del backlog) deja el pedazo presente aunque `superseded`: son dos políticas distintas que hay que nombrar.
+**P. Pasada de mantenimiento para `superseded_by` colgantes.** Para los que ya quedaron así en bases existentes: revivir (si `supersede_cause` es `revision`) o reapuntar. Cambia filas del usuario sin que nadie lo pida, así que es decisión y no se asume; O sola no arregla lo ya purgado.
+
 **K. Fila `failed` sin salida.** Se deja fuera: es un camino de reintento/descarte, no de cobertura de secretos. Se anota para 31.
 
 ### Texto libre
@@ -108,7 +116,9 @@ Resultado: **una** columna con texto libre del usuario o el agente que nunca se 
 
 - **history-import (44) y memory-portability (43).** 44 trae miles de textos de engram por `redact`; cada formato sin cubrir queda guardado en claro y cada falso positivo se multiplica, sin vuelta atrás. El export de 43 llevaría además `memory_conflict.reason`. Por eso este cambio va antes de ambos.
 - **redaction-precision (42, archivado).** Dejó la regla del valor literal y la marca privada; este cambio sólo suma formatos y claves, sin tocar esas reglas.
-- **doctor-checks (31).** Puede señalar las filas `failed` y los workspaces con texto purgado; este cambio no las necesita. Comparten la pregunta «qué hay en el store que no debería».
+- **doctor-checks (31).** Puede señalar las filas `failed` y los workspaces con texto purgado; este cambio no las necesita. Su chequeo de `superseded_by` hacia un id inexistente es el que encontraría lo que `purge` dejó antes de O; O es el arreglo de origen y 31 sólo lo detecta.
+- **topic-revisions (27) y revision-aware-delete (49), archivados.** Definen la cadena de `superseded`, `supersede_cause` y la revival que O reutiliza (`revival.rs`, `admin.rs:355`).
+- **outbox-lifecycle (53).** Toca el outbox que `purge` también borra; coordinar G con lo que 53 decida sobre filas `failed`. Comparten la pregunta «qué hay en el store que no debería».
 - **project-clone-identity (30).** Hace re-key de ids; el archivo legado de `workspace.md` es otro lugar que `purge` debe nombrar.
 - **Ya arreglado (`92cee20`):** un `project_id` ya no coloca un `workspace.md` fuera de la carpeta de su agente (`project_segment`, `workspace.rs:639`). No hace falta para D.
 - **Índice de docs.** Se re-lee por sha256 o modelo, no por cambio de regla (como en 42): un pasaje viejo queda con la regla vieja. Es derivado y no destruye nada del usuario; se acepta.
@@ -118,6 +128,7 @@ Resultado: **una** columna con texto libre del usuario o el agente que nunca se 
 1. Patrón `Credential` y los prefijos que faltan, con tabla de casos en los dos sentidos, y `specs/secrets` R1.
 2. `purge` filtra el outbox por agente y, para filas sin vínculo, por igualdad; lista lo borrado.
 3. `purge` nombra los `workspace.md` que contienen el texto, sin reescribirlos; y limpia la cabecera del pedazo 1 en `memory_piece.context`.
+3b. `purge` revive, en su transacción, las versiones anteriores del tema (O) y las lista; corrige los comentarios de `maintenance.rs:162-163` y `:289-291`.
 4. `redact` en `judge_pair` (el `reason`).
 5. `clawg secrets` mira `memory_conflict.reason`.
 6. Docs: `specs/secrets`, `.claude/CLAUDE.md`, y los dos ítems del backlog que se absorben (cabecera; el de la fila `failed` queda fuera).
@@ -138,6 +149,7 @@ Son del usuario.
 - [ ] **Outbox.** ¿G con H, o I con su migración?
 - [ ] **`reason` viejos.** ¿Sólo `scan` los lista (M), o hay un comando de limpieza (N)?
 - [ ] **`last_error`.** ¿Se verifica y, si cita contenido, se enmascara?
+- [ ] **Historial ya escondido.** O arregla lo que se purgue desde ahora. ¿Se agrega una pasada de mantenimiento (P) para los `superseded_by` que ya cuelgan, revive o reapunta, o los lista `doctor` (31) y se deja al usuario?
 - [ ] **Restauración de filas viejas.** ¿Se acepta que una regla nueva bloquee `undelete` de filas que antes volvían?
 
 ## Cómo se mide
@@ -150,6 +162,7 @@ Tests RED primero, todos puros salvo los de `purge`:
 4. `purge` de una fila con otro agente con el mismo texto en su outbox deja la fila del otro. Hoy la borra.
 5. `purge` de un pedazo 1 deja `memory_piece.context` sin su cabecera; con un `workspace.md` que contiene el texto, la salida lo nombra.
 6. Un `reason` con un secreto queda enmascarado.
+7. Dos versiones bajo un mismo `topic_key`, `purge` de la vigente: la anterior vuelve a estar viva y la salida la lista. Hoy queda `superseded` con un `superseded_by` colgante. Una versión reemplazada por veredicto (`verdict`) sigue escondida.
 
 **Falsos positivos sin tocar un perfil real.** Decisivo: un corpus de prosa técnica del propio repositorio (`docs/`, `openspec/`, `crates/**/*.md`) y fixtures de configuración, pasado por `find_secrets` antes y después de la regla; el resultado esperado es cero cambios. Complemento: restaurar un `clawg backup` en un `CLAWG_TEST_HOME` temporal y correr `clawg secrets` ahí. Correrlo contra un perfil real requiere autorización explícita y no es necesario.
 
@@ -159,3 +172,4 @@ Tests RED primero, todos puros salvo los de `purge`:
 - **`purge` que sigue sin garantizar «todo».** Los backups y la sección USER quedan fuera a propósito; la salida debe decirlo, no sugerir lo contrario.
 - **G no cierra el caso de un pedazo de un save largo con texto corto del mismo agente.** Se acepta o se pasa a I.
 - **Restaurar.** Ver la última decisión abierta.
+- **Revivir en `purge` cambia lo que ve el agente.** Una versión vieja vuelve a ser la vigente; si también tiene un secreto, `scan` la lista y se purga de nuevo, que es el comportamiento correcto.
