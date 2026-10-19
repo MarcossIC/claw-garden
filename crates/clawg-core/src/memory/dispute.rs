@@ -280,6 +280,12 @@ fn add_dispute_sql() -> String {
     )
 }
 
+/// Names row `against` in row `row`'s `disputed_against`, inside the
+/// caller's transaction. The row's status is settled afterwards.
+pub(crate) fn add_dispute_in(c: &Connection, row: i64, against: i64, now: TimestampMs) -> rusqlite::Result<usize> {
+    c.execute(&add_dispute_sql(), rusqlite::params![row, against, now])
+}
+
 /// Records the pair's state after a verdict. A pair with no row (two rows
 /// linked only by `superseded_by`, from before the pair table) gets one.
 const RECORD_PAIR_SQL: &str = "INSERT INTO memory_conflict \

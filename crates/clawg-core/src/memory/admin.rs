@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::memory::clock::TimestampMs;
 use crate::memory::chunker::embedding_text;
-use crate::memory::contradiction::excerpt;
-use crate::memory::dispute::{release_challengers, settle_challengers, settle_row, SUPERSEDE_SQL};
+use crate::memory::contradiction::{detect_contradiction, excerpt, Candidate};
+use crate::memory::dispute::{add_dispute_in, release_challengers, settle_challengers, settle_row, SUPERSEDE_SQL};
 use crate::memory::revival::revive_after_delete;
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::search::{viewer_match_expression, RankedHit};
@@ -407,7 +407,7 @@ pub enum RestoreError {
 /// replaced: searches leave it out until a `resolve_conflict` verdict keeps
 /// it, or, when the row that replaced it is deleted too
 /// (`superseded_by_deleted`), until that row is restored.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct RestoredRow {
     pub id: i64,
     pub status: String,
@@ -419,14 +419,28 @@ pub struct RestoredRow {
     pub replaced: Vec<Replaced>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub superseded_by_deleted: bool,
+    /// The rows saved while it was deleted that the detector found close to
+    /// it, each now a pair for the agent to judge, the newer row first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<Candidate>,
+}
+
+struct DeletedRow {
+    content: String,
+    context: Option<String>,
+    agent_id: Option<String>,
+    project_id: Option<String>,
+    memory_type: String,
 }
 
 /// The deleted row, scoped like the update read, with the head its vector was
 /// embedded behind when it is a piece of a long save (as `select_reembed_batch`
-/// reads it), so the restored vector is the one the row was saved with.
+/// reads it), so the restored vector is the one the row was saved with, and
+/// what the detector needs to compare it with what was saved meanwhile.
 const RESTORE_READ: &str = "SELECT m.content, \
      (SELECT mp.context FROM memory_piece mp WHERE mp.memory_id = m.id AND mp.context <> '' \
-      ORDER BY mp.save_id LIMIT 1) \
+      ORDER BY mp.save_id LIMIT 1), \
+     m.agent_id, m.project_id, m.memory_type, m.deleted_at \
      FROM memory m WHERE m.id = ?1 AND m.deleted_at IS NOT NULL AND (?2 IS NULL OR m.agent_id = ?2)";
 
 /// The live row a save of the same text would reinforce instead of storing
@@ -467,6 +481,83 @@ const RESTORE_TEXT_INDEX: &str = "INSERT INTO memory_fts(rowid, content, agent_i
 const RESTORED_SQL: &str = "SELECT m.status, m.superseded_by, m.topic_key, \
      m.status = 'superseded' AND EXISTS (SELECT 1 FROM memory b WHERE b.id = m.superseded_by AND b.deleted_at IS NOT NULL) \
      FROM memory m WHERE m.id = ?1";
+
+/// The rows the detector finds close to the deleted row `id`, vectored as
+/// `unit`, before the restore's transaction: the row is not live yet, so it
+/// cannot find itself. The rows it already forms a pair with and the ones it
+/// will take back from a revival are left out and widen the pool, so they do
+/// not take the places of rows saved while it was deleted.
+async fn restore_candidates(
+    store: &MemoryStore,
+    id: i64,
+    unit: &[f32],
+    content: &str,
+    agent_id: Option<String>,
+    project_id: Option<String>,
+    memory_type: &str,
+) -> Result<Vec<Candidate>, MemoryError> {
+    let (Some(agent_id), Some(memory_type)) = (agent_id, MemoryType::from_db_str(memory_type)) else {
+        return Ok(Vec::new());
+    };
+    let siblings: Vec<i64> = store
+        .conn
+        .call(move |c| -> rusqlite::Result<Vec<i64>> {
+            let mut stmt = c.prepare(
+                "SELECT old_id FROM memory_conflict WHERE new_id = ?1 \
+                 UNION SELECT new_id FROM memory_conflict WHERE old_id = ?1 \
+                 UNION SELECT id FROM memory WHERE revived_from = ?1",
+            )?;
+            let rows = stmt.query_map([id], |r| r.get(0))?;
+            rows.collect()
+        })
+        .await
+        .map_err(backend("restore_memory_core"))?;
+    Ok(detect_contradiction(store, unit, content, &agent_id, project_id.as_deref(), memory_type, &siblings)
+        .await
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .collect())
+}
+
+/// Writes a pair `(candidate, id)` for each candidate saved after the
+/// restored row's `deleted_at` that is still live, inside the restore's
+/// transaction. An escalated pair names the restored row in the newer row's
+/// `disputed_against`; settling the restored row's challengers afterwards
+/// makes it `disputed`. A pair already there, with its verdict, is kept.
+fn note_restored_pairs(
+    c: &rusqlite::Connection,
+    id: i64,
+    deleted_at: i64,
+    candidates: &[Candidate],
+    now: TimestampMs,
+) -> rusqlite::Result<Vec<Candidate>> {
+    let mut noted = Vec::new();
+    for candidate in candidates {
+        let in_window: bool = c.query_row(
+            "SELECT EXISTS (SELECT 1 FROM memory WHERE id = ?1 AND created_at > ?2 \
+             AND deleted_at IS NULL AND status IN ('active', 'disputed'))",
+            rusqlite::params![candidate.id, deleted_at],
+            |r| r.get(0),
+        )?;
+        if !in_window {
+            continue;
+        }
+        let state = if candidate.escalated { "escalated" } else { "pending" };
+        let written = c.execute(
+            "INSERT OR IGNORE INTO memory_conflict (new_id, old_id, distance, state, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![candidate.id, id, candidate.distance, state, now],
+        )?;
+        if written == 0 {
+            continue;
+        }
+        if candidate.escalated {
+            add_dispute_in(c, candidate.id, id, now)?;
+        }
+        noted.push(candidate.clone());
+    }
+    Ok(noted)
+}
 
 /// Supersedes again, by the restored row `id`, the live rows its delete had
 /// brought back, as the revision they were first replaced by.
@@ -512,13 +603,19 @@ pub async fn restore_memory_core(
         .call(move |c| {
             use rusqlite::OptionalExtension;
             c.query_row(RESTORE_READ, rusqlite::params![id, read_owner], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                Ok(DeletedRow {
+                    content: r.get(0)?,
+                    context: r.get(1)?,
+                    agent_id: r.get(2)?,
+                    project_id: r.get(3)?,
+                    memory_type: r.get(4)?,
+                })
             })
             .optional()
         })
         .await
         .map_err(backend("restore_memory_core"))?;
-    let Some((content, context)) = found else {
+    let Some(DeletedRow { content, context, agent_id, project_id, memory_type }) = found else {
         return Err(RestoreError::NotFound(id));
     };
 
@@ -535,6 +632,7 @@ pub async fn restore_memory_core(
     let unit = crate::memory::vector::to_unit(&vector)
         .map_err(|e| RestoreError::Embed(id, EmbedError::InferenceFailed(e.to_string())))?;
     let bytes: Vec<u8> = unit.iter().flat_map(|f| f.to_le_bytes()).collect();
+    let candidates = restore_candidates(store, id, &unit, &content, agent_id, project_id, &memory_type).await?;
     let now = TimestampMs::now();
 
     enum Outcome {
@@ -548,13 +646,12 @@ pub async fn restore_memory_core(
         .call(move |c| {
             use rusqlite::OptionalExtension;
             let tx = c.transaction()?;
-            let still_deleted = tx
-                .query_row(RESTORE_READ, rusqlite::params![id, owner], |_| Ok(()))
+            let Some(deleted_at) = tx
+                .query_row(RESTORE_READ, rusqlite::params![id, owner], |r| r.get::<_, i64>(5))
                 .optional()?
-                .is_some();
-            if !still_deleted {
+            else {
                 return Ok(Outcome::Gone);
-            }
+            };
             if let Some(twin) = tx.query_row(RESTORE_TWIN, [id], |r| r.get(0)).optional()? {
                 return Ok(Outcome::Twin(twin));
             }
@@ -571,11 +668,11 @@ pub async fn restore_memory_core(
                 tx.query_row("SELECT status, superseded_by FROM memory WHERE id = ?1", [id], |r| {
                     Ok((r.get(0)?, r.get(1)?))
                 })?;
-            let replaced = match superseded_by.filter(|_| status == "superseded") {
-                None => take_back_revived(&tx, id, now)?,
+            let (replaced, related) = match superseded_by.filter(|_| status == "superseded") {
+                None => (take_back_revived(&tx, id, now)?, note_restored_pairs(&tx, id, deleted_at, &candidates, now)?),
                 Some(by) => {
                     revive_after_delete(&tx, by, now)?;
-                    Vec::new()
+                    (Vec::new(), Vec::new())
                 }
             };
             settle_row(&tx, id, now)?;
@@ -588,6 +685,7 @@ pub async fn restore_memory_core(
                     topic_key: r.get(2)?,
                     replaced,
                     superseded_by_deleted: r.get(3)?,
+                    related,
                 })
             })?;
             tx.commit()?;
@@ -3801,6 +3899,148 @@ mod tests {
                 ..RestoredRow::default()
             }
         );
+    }
+
+    /// Answers every text with one vector, so a test places the restored row.
+    struct PlacedEmbedder(Vec<f32>);
+
+    #[async_trait::async_trait]
+    impl Embedder for PlacedEmbedder {
+        async fn embed_with_role(&self, _: &str, _: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+            Ok(self.0.clone())
+        }
+        fn dimensions(&self) -> usize {
+            384
+        }
+        fn model_id(&self) -> &str {
+            "placed"
+        }
+        fn query_prefix(&self) -> &str {
+            ""
+        }
+        fn passage_prefix(&self) -> &str {
+            ""
+        }
+    }
+
+    /// The first axis turned toward axis `toward` far enough that the two sit
+    /// at L2 distance `distance`.
+    fn placed(toward: usize, distance: f32) -> Vec<f32> {
+        let angle = 2.0 * (distance / 2.0).asin();
+        let mut v = vec![0.0f32; 384];
+        v[0] = angle.cos();
+        v[toward] = angle.sin();
+        v
+    }
+
+    /// A live row of agent `a` in project `p` with the vector `vector`,
+    /// created at `created_at`.
+    async fn save_placed(store: &MemoryStore, content: &str, memory_type: &str, vector: Vec<f32>, created_at: i64) -> i64 {
+        let bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let hash = crate::memory::dedup::content_hash(content);
+        let (content, memory_type) = (content.to_owned(), memory_type.to_owned());
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<i64> {
+                c.execute(
+                    "INSERT INTO memory (scope, agent_id, project_id, content, content_hash, memory_type, \
+                     source, created_at, created_by_type, created_by_ref, last_modified_at, \
+                     last_accessed_at, importance, tier, status) \
+                     VALUES ('agent', 'a', 'p', ?1, ?2, ?3, 'explicit', ?4, 'agent', 'a', ?4, ?4, 5.0, 3, 'active')",
+                    rusqlite::params![content, hash, memory_type, created_at],
+                )?;
+                let id = c.last_insert_rowid();
+                c.execute("INSERT INTO memory_vectors(rowid, embedding) VALUES (?1, ?2)", rusqlite::params![id, bytes])?;
+                Ok(id)
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn deleted_at(store: &MemoryStore, id: i64) -> i64 {
+        columns(store, id).await.0.expect("deleted")
+    }
+
+    async fn pairs(store: &MemoryStore) -> Vec<(i64, i64, String, Option<String>)> {
+        store
+            .conn
+            .call(|c| -> rusqlite::Result<Vec<(i64, i64, String, Option<String>)>> {
+                let mut stmt = c.prepare("SELECT new_id, old_id, state, verdict FROM memory_conflict ORDER BY new_id, old_id")?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+                rows.collect()
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn restore_placed(store: &MemoryStore, id: i64) -> RestoredRow {
+        restore_memory_core(store, &PlacedEmbedder(placed(1, 0.0)), MemoryKind::Memory, id, Some("a")).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_restored_row_is_paired_with_what_was_saved_while_deleted() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let restored = save_placed(&store, "the api listens on 8080", "semantic_fact", placed(1, 0.0), 1).await;
+        delete(&store, restored).await;
+        let after = deleted_at(&store, restored).await + 1;
+        let newer = save_placed(&store, "the api listens on 9090\nsince the proxy moved", "semantic_fact", placed(2, 0.3), after).await;
+
+        let row = restore_placed(&store, restored).await;
+
+        assert_eq!(row.related.iter().map(|c| (c.id, c.escalated)).collect::<Vec<_>>(), vec![(newer, false)]);
+        assert_eq!(row.related[0].excerpt, "the api listens on 9090");
+        assert_eq!(pairs(&store).await, vec![(newer, restored, "pending".into(), None)]);
+        assert_eq!(memory_status(&store, newer).await, "active");
+        assert_eq!(row.status, "active");
+    }
+
+    #[tokio::test]
+    async fn an_escalated_pair_from_a_restore_disputes_the_newer_row() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let restored = save_placed(&store, "storage engine is sqlite", "architectural_decision", placed(1, 0.0), 1).await;
+        delete(&store, restored).await;
+        let after = deleted_at(&store, restored).await + 1;
+        let newer = save_placed(&store, "storage engine is postgres", "architectural_decision", placed(2, 0.3), after).await;
+
+        let row = restore_placed(&store, restored).await;
+
+        assert_eq!(row.related.iter().map(|c| (c.id, c.escalated)).collect::<Vec<_>>(), vec![(newer, true)]);
+        assert_eq!(pairs(&store).await, vec![(newer, restored, "escalated".into(), None)]);
+        assert_eq!(memory_status(&store, newer).await, "disputed");
+        assert_eq!(row.status, "active", "the newer row carries the dispute");
+        let named: Option<String> = store
+            .conn
+            .call(move |c| c.query_row("SELECT disputed_against FROM memory WHERE id = ?1", [newer], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(named, Some(format!("[{restored}]")));
+    }
+
+    #[tokio::test]
+    async fn rows_saved_before_the_delete_or_already_paired_are_not_paired_again() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let restored = save_placed(&store, "the api listens on 8080", "semantic_fact", placed(1, 0.0), 1).await;
+        let before = save_placed(&store, "the api listens on 9090", "semantic_fact", placed(1, 0.3), 2).await;
+        delete(&store, restored).await;
+        let after = deleted_at(&store, restored).await + 1;
+        let judged = save_placed(&store, "the api listens on 7070", "semantic_fact", placed(2, 0.3), after).await;
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO memory_conflict (new_id, old_id, distance, state, verdict, created_at, judged_at) \
+                     VALUES (?1, ?2, 0.3, 'judged', 'compatible', ?3, ?3)",
+                    [judged, restored, after],
+                )
+            })
+            .await
+            .unwrap();
+
+        let row = restore_placed(&store, restored).await;
+
+        assert!(row.related.is_empty(), "{:?}", row.related);
+        assert_eq!(pairs(&store).await, vec![(judged, restored, "judged".into(), Some("compatible".into()))]);
+        assert_eq!(memory_status(&store, before).await, "active");
     }
 
     /// Seeds a row the way the previous version leaves a deleted one: the
