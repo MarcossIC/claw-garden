@@ -159,9 +159,9 @@ pub(crate) async fn run_maintenance_once_at(store: &MemoryStore, now_ms: Timesta
 /// whole vector table.
 ///
 /// The selection joins the parent to its vector rather than listing every
-/// soft-deleted id, and that join is what makes a repeated pass free. Nothing
-/// in this codebase hard-deletes a parent row, so "soft-deleted" is a set that
-/// only ever grows: selecting on it alone would hand the loop below a longer
+/// soft-deleted id, and that join is what makes a repeated pass free. Only
+/// `clawg purge` removes a parent row, so "soft-deleted" is a set that keeps
+/// growing: selecting on it alone would hand the loop below a longer
 /// list every single day and spend a point delete on each one to discover the
 /// vector had already been dropped years ago. Joining to the vector table
 /// means the list IS the orphans — once they are gone the select returns
@@ -286,9 +286,9 @@ pub(crate) struct TableRowCounts {
 /// back to a bare `SCAN memory`.
 ///
 /// Reporting only the live count would hide how much of each table is
-/// soft-deleted. Those rows stay in the parent table forever — nothing in
-/// this codebase hard-deletes from `memory`, `episodic_trajectory` or
-/// `procedural_skill` — so the gap between `total` and `live` is accumulated
+/// soft-deleted. Those rows stay in the parent table until `clawg purge`
+/// removes one from `memory` (nothing removes rows of `episodic_trajectory`
+/// or `procedural_skill`), so the gap between `total` and `live` is accumulated
 /// tombstone weight. Their vectors no longer sit in that gap: a delete drops
 /// the vector row inline and [`sweep_orphaned_vectors`] backfills the ones
 /// deleted before that existed, so the gap no longer inflates the vec0 scan.
