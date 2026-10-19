@@ -18,6 +18,8 @@
 | `clawg update` depende de `stop` | **Cierta.** `stop_in(..., STOP_TIMEOUT)` en `crates/clawg-cli/src/update/effects.rs:176` y `:330`; un error se devuelve como `String` (`map_err(|e| e.to_string())`) y el plan lo toma como fallo. `main.rs:155` lo usa para `clawg stop`. |
 | El ítem del backlog «`clawg stop` mientras carga el modelo» sigue vigente | **Cierta, con las líneas movidas.** El backlog cita `bootstrap.rs:492` y `main.rs:47`; hoy la carga en `spawn_blocking` está en `crates/clawg-core/src/memory/bootstrap.rs:529` (arranque) y `:396` (recargas tras descarga por inactividad), y el runtime se construye en `crates/clawg-cli/src/main.rs:56` y se suelta al volver de `block_on` (`:62-73`). Ya hay un precedente: `runtime.shutdown_background()` para el hook (`main.rs:74-78`), con el comentario de por qué. |
 | Las recargas del embedder (46) también corren en `spawn_blocking` | **Cierta** (`bootstrap.rs:396`). El mismo arreglo del runtime las cubre. |
+| El `checkpoint` del apagado vuelve enseguida si otra conexión lo bloquea | **Falsa.** Corre `PRAGMA wal_checkpoint(TRUNCATE)` (`crates/clawg-core/src/runtime.rs:384`, llamado en `:295`), y rusqlite 0.37.0 configura un busy timeout de 5 s en toda conexión que abre (`sqlite3_busy_timeout(db, 5000)`, `rusqlite-0.37.0/src/inner_connection.rs:119`). Según la documentación del SQLite empaquetado (`libsqlite3-sys-0.35.0/sqlite3/sqlite3.h:9872-9923`), el modo TRUNCATE invoca ese manejador mientras espera al escritor y a los lectores que no leen la instantánea más nueva, y mientras espera bloquea a los escritores nuevos. Una conexión abierta sin lectura en curso no lo frena; una lectura en curso de otro proceso sí (`clawg status` o `clawg secrets` con el daemon andando, que abren su propia conexión de lectura, `crates/clawg-core/src/memory/backup.rs:494-503`). Pasados los 5 s sigue como PASSIVE y devuelve «bloqueado», que el código ya registra (`runtime.rs:389-394`). La fase «Resto» puede tardar entonces hasta 5 s sólo en el checkpoint. |
+| Un backup cortado a medias deja un archivo que pasa por snapshot | **Falsa.** `snapshot_into` escribe a `<nombre>.db.tmp` y renombra al terminar; si `VACUUM INTO` falla, borra el temporal (`backup.rs:313-325`). Lo que queda abierto es otra cosa: un proceso que termina en medio de `VACUUM INTO` deja ese `.db.tmp`, y como cada snapshot lleva su propia marca de tiempo en el nombre, nada vuelve a borrarlo. Además, cortar la petición HTTP no corta el `VACUUM INTO`, que ya está en la cola de la conexión y sigue hasta terminar. |
 | SIGTERM termina el proceso sin drenaje ni checkpoint | **Cierta por construcción, no ejecutada.** Sin manejador, la acción por defecto de Unix mata el proceso y no corre `clear_state` (`serve.rs:192`) ni `Drop` de `StoreLock`. El `memory.lock` lo suelta el SO. |
 | Lo aceptado no se pierde | **Cierta.** La fila del outbox se escribe antes del `201`/`202` con `synchronous = FULL` y el daemon reingiere lo pendiente al arrancar (`.claude/CLAUDE.md`, sección del outbox). El WAL se repite al abrir. El costo de un SIGTERM es sólo estado viejo y trabajo de reingesta. |
 | El puente tolera un `daemon.json` viejo | **Cierta en lo que alcancé a ver.** `on_failure` vuelve a resolver ante `Unauthorized`, `NotRunning` y `StartTimeout` (`crates/clawg-cli/src/mcp/startup.rs:39-44`). El camino completo de arranque con un archivo viejo lo describe `local-isolation` (`probe_running`, `client.rs:1223`); no lo repetí. |
@@ -29,7 +31,7 @@ El apagado del daemon tiene cuatro fases y sólo dos tienen tope:
 
 1. **HTTP en vuelo** (`serve.rs:182-184`): sin tope. Dura lo que dure la petición más lenta (un guardado esperando confirmación hasta 10 s, un backup, un refresco del índice de docs).
 2. **Drenaje del ingest** (`runtime.rs:269-281`): `DRAIN_DEADLINE` = 10 s.
-3. **Resto** (`runtime.rs:282-292`): accesos, mantenimiento, `checkpoint`. Sin constante propia; el test supone 5 s.
+3. **Resto** (`runtime.rs:282-292`): accesos, mantenimiento, `checkpoint`. Sin constante propia; el test supone 5 s. El `checkpoint` por sí solo puede gastar esos 5 s en el busy handler si un lector de otro proceso tiene una lectura en curso (ver premisas), así que el supuesto no deja lugar a lo demás.
 4. **Desmontaje del runtime de tokio** (`main.rs:62-73`): al soltar el `Runtime` espera a las tareas bloqueantes, entre ellas una carga del modelo en curso (`bootstrap.rs:529`, `:396`). Sin tope. Tras el log «stopped» (`serve.rs:193`) el proceso sigue vivo.
 
 Suma peor caso: 10 s + 10 s + 5 s + la carga del modelo, contra 15 s. `stop` espera el **fin del proceso** (`stop.rs:33-42`, `process.rs`), no el log, así que la fase 4 también cuenta. El resultado: `StopTimeout` → exit 1 en `clawg stop`, y en `update` un `Err` que dispara el deshacer (`effects.rs:176`, `:330`) aunque el daemon se apague bien un instante después.
@@ -56,7 +58,7 @@ Lo que el sistema pide no se atiende: sin `SignalKind::terminate()`, `systemctl 
 
 **B. Plazo después de la señal (recomendado).** Rodear el futuro de `axum::serve` con un `select!` contra `señal + HTTP_GRACE`: pasado el plazo se abandona el servidor y se sigue con `runtime.shutdown`. Las peticiones cortadas se devuelven como conexión cerrada.
 - **A favor:** no cambia nada en operación normal; un backup legítimo de 20 s sigue funcionando mientras nadie pida parar.
-- **En contra:** hay que decidir qué pasa con una petición que se corta a medias. Un guardado ya tiene su fila en el outbox antes del `201`, así que no se pierde; un `VACUUM INTO` cortado deja un archivo parcial en `backups/`, lo que hay que mirar en el diseño (¿el snapshot se escribe a un nombre temporal y se renombra al final? No lo verifiqué en `backup.rs`).
+- **En contra:** hay que decidir qué pasa con una petición que se corta a medias. Un guardado ya tiene su fila en el outbox antes del `201`, así que no se pierde. Un backup no se corta: el `VACUUM INTO` sigue en la conexión aunque se abandone la respuesta, y el drenaje y el `checkpoint` esperan detrás de él en la misma cola. Nunca deja un snapshot a medias con nombre de terminado (`backup.rs:313-325`); sólo un proceso que muere en el medio deja un `.db.tmp` que nada borra.
 
 **C. `TimeoutLayer` por petición.** Corta en operación normal también. Descartado como solución de este problema (ver abajo), aunque podría ser un cambio aparte.
 
@@ -89,6 +91,7 @@ Lo que el sistema pide no se atiende: sin `SignalKind::terminate()`, `systemctl 
 - **embedder-idle-unload (46, archivado).** Sus recargas corren en `spawn_blocking` (`bootstrap.rs:396`); cubiertas por D.
 - **local-isolation.** Comparte el hecho de que tras SIGTERM/SIGKILL quedan `daemon.json`, `token` y `memory.owner` viejos; A resuelve el caso de SIGTERM, el de SIGKILL sigue siendo de aquel cambio.
 - **Backlog «`clawg stop` mientras carga el modelo»:** este cambio lo absorbe; al archivar hay que sacarlo de `openspec/README.md`.
+- **El snapshot por una conexión propia (backlog) y read-connections (57).** Los dos suman lectores dentro del daemon. Un `VACUUM INTO` por su propia conexión, o una búsqueda en un lector, con la lectura en curso cuando llega el `checkpoint`, lo hacen esperar hasta 5 s y frenan a los escritores mientras tanto. El orden del apagado tiene que dejar esas lecturas terminadas, o abandonadas, antes del `checkpoint`, o el presupuesto tiene que contarlas.
 
 ## Alcance candidato
 
@@ -129,7 +132,7 @@ Tests RED primero:
 
 ## Riesgos
 
-- **Cortar un backup a medias** deja un archivo parcial; se mide en el diseño antes de elegir `HTTP_GRACE`.
+- **Un backup en curso alarga el apagado:** no se corta con la petición (sigue en la cola de la conexión) y el drenaje espera detrás. Si el snapshot pasa a una conexión propia, deja de frenar el drenaje pero puede frenar el `checkpoint` hasta 5 s. Se mide en el diseño antes de elegir `HTTP_GRACE`.
 - **Hilos bloqueantes abandonados** (D) siguen vivos hasta salir del proceso; inocuo mientras el proceso sale enseguida.
 - **Plazo de Windows menor que el presupuesto:** el sistema puede matar al daemon antes de terminar, sin pérdida de datos pero con estado viejo.
 - **Subir `STOP_TIMEOUT`** alarga lo que `update` espera antes de deshacer.
