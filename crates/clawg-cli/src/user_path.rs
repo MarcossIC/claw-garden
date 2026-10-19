@@ -28,9 +28,10 @@ pub enum Change {
 const SEPARATOR: char = ';';
 
 /// `path` with `dir` appended, or `None` when an equivalent entry is already
-/// there (or `dir` is blank) and nothing should be written.
-pub fn with_entry(path: &str, dir: &str) -> Option<String> {
-    if normalized(dir).is_empty() || path.split(SEPARATOR).any(|entry| same_dir(entry, dir)) {
+/// there (or `dir` is blank) and nothing should be written. `var` reads the
+/// environment the entries are expanded with.
+pub fn with_entry(path: &str, dir: &str, var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    if normalized(dir).is_empty() || path.split(SEPARATOR).any(|entry| same_dir(entry, dir, &var)) {
         return None;
     }
     let mut out = path.to_string();
@@ -42,18 +43,43 @@ pub fn with_entry(path: &str, dir: &str) -> Option<String> {
 }
 
 /// `path` without any entry naming `dir`, or `None` when there was none.
-pub fn without_entry(path: &str, dir: &str) -> Option<String> {
-    let kept: Vec<&str> = path.split(SEPARATOR).filter(|entry| !same_dir(entry, dir)).collect();
+pub fn without_entry(path: &str, dir: &str, var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let kept: Vec<&str> = path.split(SEPARATOR).filter(|entry| !same_dir(entry, dir, &var)).collect();
     // Splitting and rejoining untouched entries reproduces them exactly, so
     // the entry count is enough to know whether anything was removed.
     (kept.len() != path.split(SEPARATOR).count()).then(|| kept.join(";"))
 }
 
 /// Whether two PATH entries name the same directory, the way Windows reads
-/// them: ignoring case, surrounding quotes and whitespace, and trailing slashes.
-fn same_dir(a: &str, b: &str) -> bool {
-    let a = normalized(a);
-    !a.is_empty() && a == normalized(b)
+/// them: with `%VAR%` expanded, ignoring case, surrounding quotes and
+/// whitespace, and trailing slashes.
+fn same_dir(a: &str, b: &str, var: &impl Fn(&str) -> Option<String>) -> bool {
+    let a = normalized(&expanded(a, var));
+    !a.is_empty() && a == normalized(&expanded(b, var))
+}
+
+/// `entry` with each `%NAME%` that `var` knows replaced by its value, as
+/// Windows expands a `REG_EXPAND_SZ` value: an unknown name, or a lone `%`,
+/// stays as written.
+fn expanded(entry: &str, var: &impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::new();
+    let mut rest = entry;
+    while let Some(open) = rest.find('%') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('%') else {
+            out.push_str(&rest[open..]);
+            return out;
+        };
+        let name = &after[..close];
+        match (!name.is_empty()).then(|| var(name)).flatten() {
+            Some(value) => out.push_str(&value),
+            None => out.push_str(&rest[open..open + close + 2]),
+        }
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn normalized(entry: &str) -> String {
@@ -85,7 +111,7 @@ pub mod registry {
         let key = open(subkey)?;
         // A missing value is an empty PATH, created the way Windows creates it.
         let (current, vtype) = read(&key)?.unwrap_or((String::new(), REG_EXPAND_SZ));
-        match with_entry(&current, dir) {
+        match with_entry(&current, dir, env_var) {
             Some(updated) => write(&key, &updated, vtype).map(|()| Change::Added),
             None => Ok(Change::AlreadyPresent),
         }
@@ -97,10 +123,16 @@ pub mod registry {
         let Some((current, vtype)) = read(&key)? else {
             return Ok(Change::NotPresent);
         };
-        match without_entry(&current, dir) {
+        match without_entry(&current, dir, env_var) {
             Some(updated) => write(&key, &updated, vtype).map(|()| Change::Removed),
             None => Ok(Change::NotPresent),
         }
+    }
+
+    /// The user's own environment, the one Windows expands the PATH with at
+    /// sign-in; names match without case, as `std::env::var` does on Windows.
+    fn env_var(name: &str) -> Option<String> {
+        std::env::var(name).ok()
     }
 
     fn open(subkey: &str) -> io::Result<RegKey> {
@@ -121,6 +153,8 @@ pub mod registry {
                 format!("the user PATH has registry type {:?}, not a string; leaving it alone", raw.vtype),
             ));
         }
+        // A byte left after the last whole unit is half a unit, which no
+        // reader takes for text, so dropping it rewrites what every reader sees.
         let units: Vec<u16> = raw
             .bytes
             .chunks_exact(2)
@@ -147,6 +181,11 @@ pub mod registry {
         };
         let area: Vec<u16> = "Environment".encode_utf16().chain([0]).collect();
         let mut result = 0usize;
+        // With `HWND_BROADCAST` each top-level window gets the whole timeout,
+        // so a few slow ones add up. It stays at 5 s anyway: a window that has
+        // not taken the message when its time runs out never gets it, and an
+        // Explorer that missed it hands the old PATH to every new terminal.
+        //
         // SAFETY: `area` is a NUL-terminated UTF-16 string that outlives the
         // call; the timeout bounds the wait on windows that do not answer.
         unsafe {
@@ -169,17 +208,23 @@ mod tests {
 
     const DIR: &str = r"C:\Users\dev\AppData\Local\Claw Garden";
 
+    /// The environment of the tests: only `LOCALAPPDATA`, whose name Windows
+    /// matches without case.
+    fn vars(name: &str) -> Option<String> {
+        name.eq_ignore_ascii_case("LOCALAPPDATA").then(|| r"C:\Users\dev\AppData\Local".to_string())
+    }
+
     // ── with_entry ──────────────────────────────────────────────────────────
 
     #[test]
     fn an_empty_path_becomes_just_the_directory() {
-        assert_eq!(with_entry("", DIR).as_deref(), Some(DIR));
+        assert_eq!(with_entry("", DIR, vars).as_deref(), Some(DIR));
     }
 
     #[test]
     fn the_directory_is_appended_after_a_separator() {
         assert_eq!(
-            with_entry(r"%USERPROFILE%\bin;C:\tools", DIR).as_deref(),
+            with_entry(r"%USERPROFILE%\bin;C:\tools", DIR, vars).as_deref(),
             Some(r"%USERPROFILE%\bin;C:\tools;C:\Users\dev\AppData\Local\Claw Garden")
         );
     }
@@ -187,7 +232,7 @@ mod tests {
     #[test]
     fn a_trailing_separator_is_not_doubled() {
         assert_eq!(
-            with_entry(r"C:\tools;", DIR).as_deref(),
+            with_entry(r"C:\tools;", DIR, vars).as_deref(),
             Some(r"C:\tools;C:\Users\dev\AppData\Local\Claw Garden")
         );
     }
@@ -196,12 +241,30 @@ mod tests {
     fn an_equivalent_entry_is_not_added_twice() {
         // Windows paths ignore case, a trailing backslash and surrounding quotes.
         let path = r#"C:\tools;"c:\users\DEV\appdata\local\claw garden\""#;
-        assert_eq!(with_entry(path, DIR), None);
+        assert_eq!(with_entry(path, DIR, vars), None);
+    }
+
+    #[test]
+    fn an_entry_written_with_a_variable_is_the_same_directory() {
+        for path in [r"C:\tools;%LOCALAPPDATA%\Claw Garden", r"%localappdata%\claw garden\;C:\tools"] {
+            assert_eq!(with_entry(path, DIR, vars), None, "{path}");
+            assert_eq!(without_entry(path, DIR, vars).as_deref(), Some(r"C:\tools"), "{path}");
+        }
+        assert_eq!(with_entry(DIR, r"%LOCALAPPDATA%\Claw Garden", vars), None, "the directory may be written so too");
+    }
+
+    #[test]
+    fn a_variable_that_is_not_set_is_compared_as_written() {
+        assert_eq!(
+            with_entry(r"%NOT_SET%\Claw Garden;50%", DIR, vars).as_deref(),
+            Some(r"%NOT_SET%\Claw Garden;50%;C:\Users\dev\AppData\Local\Claw Garden")
+        );
+        assert_eq!(with_entry(r"%NOT_SET%\x", r"%NOT_SET%\X", vars), None);
     }
 
     #[test]
     fn a_blank_directory_is_never_added() {
-        assert_eq!(with_entry(r"C:\tools", "  "), None);
+        assert_eq!(with_entry(r"C:\tools", "  ", vars), None);
     }
 
     // ── without_entry ───────────────────────────────────────────────────────
@@ -210,7 +273,7 @@ mod tests {
     fn removing_keeps_every_other_entry_untouched() {
         let path = r"%USERPROFILE%\bin;c:\users\dev\appdata\local\claw garden\;D:\x y";
         assert_eq!(
-            without_entry(path, DIR).as_deref(),
+            without_entry(path, DIR, vars).as_deref(),
             Some(r"%USERPROFILE%\bin;D:\x y")
         );
     }
@@ -218,17 +281,17 @@ mod tests {
     #[test]
     fn every_copy_of_the_entry_is_removed() {
         let path = format!(r"{DIR};C:\tools;{DIR}\");
-        assert_eq!(without_entry(&path, DIR).as_deref(), Some(r"C:\tools"));
+        assert_eq!(without_entry(&path, DIR, vars).as_deref(), Some(r"C:\tools"));
     }
 
     #[test]
     fn removing_an_absent_entry_changes_nothing() {
-        assert_eq!(without_entry(r"C:\tools;D:\x", DIR), None);
+        assert_eq!(without_entry(r"C:\tools;D:\x", DIR, vars), None);
     }
 
     #[test]
     fn a_path_holding_only_the_entry_becomes_empty() {
-        assert_eq!(without_entry(DIR, DIR).as_deref(), Some(""));
+        assert_eq!(without_entry(DIR, DIR, vars).as_deref(), Some(""));
     }
 
     // ── the registry, against a throwaway key ───────────────────────────────
@@ -262,7 +325,10 @@ mod tests {
             }
 
             fn set(&self, value: &str, vtype: RegType) {
-                let bytes = value.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+                self.set_bytes(value.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect(), vtype);
+            }
+
+            fn set_bytes(&self, bytes: Vec<u8>, vtype: RegType) {
                 let key = RegKey::predef(HKEY_CURRENT_USER)
                     .open_subkey_with_flags(&self.0, winreg::enums::KEY_SET_VALUE)
                     .expect("open for write");
@@ -315,6 +381,22 @@ mod tests {
             assert_eq!(scratch.get(), (r"%USERPROFILE%\bin;C:\tools".to_string(), REG_EXPAND_SZ));
 
             assert_eq!(remove(&scratch.0, DIR).expect("remove again"), Change::NotPresent);
+        }
+
+        /// The registry hands such a byte back as 0 (seen on Windows 11), and
+        /// a UTF-16 reader counts whole units anyway: refusing the value would
+        /// only keep `clawg path add` from a PATH every program reads.
+        #[test]
+        fn a_byte_left_after_the_last_unit_is_not_part_of_the_value() {
+            for tail in [&[b'x'][..], &[0][..], &[0, 0, 0][..]] {
+                let scratch = ScratchKey::new("odd");
+                let mut bytes: Vec<u8> = r"C:\tools".encode_utf16().flat_map(u16::to_le_bytes).collect();
+                bytes.extend_from_slice(tail);
+                scratch.set_bytes(bytes, REG_EXPAND_SZ);
+
+                assert_eq!(add(&scratch.0, DIR).expect("add"), Change::Added, "{tail:?}");
+                assert_eq!(scratch.get(), (format!(r"C:\tools;{DIR}"), REG_EXPAND_SZ), "{tail:?}");
+            }
         }
 
         #[test]

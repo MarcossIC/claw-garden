@@ -71,6 +71,14 @@ pub enum MemoryError {
     #[error(transparent)]
     Purge(#[from] crate::memory::secrets::PurgeError),
 
+    /// The data directory could not be created.
+    #[error("cannot create the data directory {path}: {source}")]
+    DataDir {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     /// The store's lock file could not be opened or locked for a reason other
     /// than contention (permissions, a read-only file system).
     #[error("memory store lock error at {path}: {source}")]

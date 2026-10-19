@@ -86,7 +86,7 @@ impl WorkspaceManager {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     if let Some(dir) = to.parent() {
-                        tokio::fs::create_dir_all(dir).await.map_err(io_err(dir))?;
+                        crate::private_dir::ensure_private_dir(dir).map_err(io_err(dir))?;
                     }
                     write_atomically(&to, &legacy).await.map_err(io_err(&to))?;
                 }
@@ -130,8 +130,7 @@ impl WorkspaceManager {
 
         // Create parent dirs if needed
         if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
+            crate::private_dir::ensure_private_dir(parent)
                 .map_err(|e| MemoryError::WorkspaceIo { path: path.clone(), source: e })?;
         }
 
@@ -262,12 +261,12 @@ async fn fetch_auto_rows(
                    AND status <> 'superseded'
                  ORDER BY importance DESC",
             )?;
-            let user_prefs: Vec<MemoryLine> = stmt
-                .query_map(rusqlite::params![agent], |row| {
+            let user_prefs: Vec<MemoryLine> = readable(
+                stmt.query_map(rusqlite::params![agent], |row| {
                     Ok(MemoryLine { id: row.get(0)?, content: row.get(1)? })
-                })?
-                .filter_map(|r| r.ok())
-                .collect();
+                })?,
+                "user_preference",
+            );
 
             // Query 2: architectural_decision rows, scoped to project when provided,
             // otherwise all architectural decisions for the agent. importance >= 8.
@@ -290,12 +289,12 @@ async fn fetch_auto_rows(
                        AND status <> 'superseded'
                      ORDER BY importance DESC",
                 )?;
-                let rows: Vec<MemoryLine> = stmt2
-                    .query_map(rusqlite::params![agent, pid], |row| {
+                let rows: Vec<MemoryLine> = readable(
+                    stmt2.query_map(rusqlite::params![agent, pid], |row| {
                         Ok(MemoryLine { id: row.get(0)?, content: row.get(1)? })
-                    })?
-                    .filter_map(|r| r.ok())
-                    .collect();
+                    })?,
+                    "architectural_decision",
+                );
                 rows
             } else {
                 let mut stmt2 = c.prepare(
@@ -308,12 +307,12 @@ async fn fetch_auto_rows(
                        AND status <> 'superseded'
                      ORDER BY importance DESC",
                 )?;
-                let rows: Vec<MemoryLine> = stmt2
-                    .query_map(rusqlite::params![agent], |row| {
+                let rows: Vec<MemoryLine> = readable(
+                    stmt2.query_map(rusqlite::params![agent], |row| {
                         Ok(MemoryLine { id: row.get(0)?, content: row.get(1)? })
-                    })?
-                    .filter_map(|r| r.ok())
-                    .collect();
+                    })?,
+                    "architectural_decision",
+                );
                 rows
             };
 
@@ -342,10 +341,8 @@ async fn fetch_auto_rows(
                      ORDER BY access_count DESC
                      LIMIT 5",
                 )?;
-                let rows: Vec<SkillLine> = stmt3
-                    .query_map(rusqlite::params![agent, pid], |row| map_skill(row))?
-                    .filter_map(|r| r.ok())
-                    .collect();
+                let rows: Vec<SkillLine> =
+                    readable(stmt3.query_map(rusqlite::params![agent, pid], |row| map_skill(row))?, "skill");
                 rows
             } else {
                 let mut stmt3 = c.prepare(
@@ -356,10 +353,8 @@ async fn fetch_auto_rows(
                      ORDER BY access_count DESC
                      LIMIT 5",
                 )?;
-                let rows: Vec<SkillLine> = stmt3
-                    .query_map(rusqlite::params![agent], |row| map_skill(row))?
-                    .filter_map(|r| r.ok())
-                    .collect();
+                let rows: Vec<SkillLine> =
+                    readable(stmt3.query_map(rusqlite::params![agent], |row| map_skill(row))?, "skill");
                 rows
             };
 
@@ -377,6 +372,13 @@ async fn fetch_auto_rows(
             }
             other => MemoryError::Backend(other.to_string()),
         })
+}
+
+/// The rows that read. One that does not is left out of its section rather
+/// than failing the whole file, and logged so the gap has a trace.
+fn readable<T>(rows: impl Iterator<Item = rusqlite::Result<T>>, section: &str) -> Vec<T> {
+    rows.filter_map(|r| r.map_err(|e| log::warn!("workspace: a {section} row did not read: {e}")).ok())
+        .collect()
 }
 
 /// Renders the AUTO section AND reports which rows ended up inside it.
@@ -480,6 +482,53 @@ pub(crate) async fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> st
         let _ = tokio::fs::remove_file(&tmp).await;
     }
     written
+}
+
+/// Where a `workspace.md` holds a text: in the AUTO section, which the next
+/// regeneration rewrites from the store, or anywhere else, which is the
+/// user's and never rewritten.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Holding {
+    pub auto: bool,
+    pub user: bool,
+}
+
+/// Where `file` holds `text`. Pure, so the split is under test without a
+/// filesystem.
+pub(crate) fn sections_holding(file: &str, text: &str) -> Holding {
+    let auto = file.find(AUTO_START).and_then(|start| {
+        let inner = start + AUTO_START.len();
+        file[inner..].find(AUTO_END).map(|end| start..inner + end + AUTO_END.len())
+    });
+    match auto {
+        Some(range) => Holding {
+            auto: file[range.clone()].contains(text),
+            user: file[..range.start].contains(text) || file[range.end..].contains(text),
+        },
+        None => Holding { auto: false, user: file.contains(text) },
+    }
+}
+
+/// Every `<root>/<agent>/<project>/workspace.md` that holds `text`, by path,
+/// in path order. Reads only; a file that cannot be read is skipped.
+pub(crate) fn workspaces_holding(root: &Path, text: &str) -> Vec<(PathBuf, Holding)> {
+    let dirs = |dir: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_dir()).collect())
+            .unwrap_or_default()
+    };
+    let mut holding: Vec<(PathBuf, Holding)> = dirs(root)
+        .iter()
+        .flat_map(|agent| dirs(agent))
+        .map(|project| project.join("workspace.md"))
+        .filter_map(|path| {
+            let bytes = std::fs::read(&path).ok()?;
+            let found = sections_holding(&String::from_utf8_lossy(&bytes), text);
+            (found.auto || found.user).then_some((path, found))
+        })
+        .collect();
+    holding.sort_by(|a, b| a.0.cmp(&b.0));
+    holding
 }
 
 /// Parse the existing file content to find AUTO and USER sections.
@@ -669,6 +718,21 @@ fn is_windows_device_name(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::memory::db::MemoryStore;
+
+    #[test]
+    fn the_sections_holding_a_text_are_told_apart() {
+        let text = "deploy with the vault key";
+        let file = |auto: &str, user: &str| {
+            format!("# notes\n{AUTO_START}\n{auto}\n{AUTO_END}\n{USER_START}\n{user}\n{USER_END}\n")
+        };
+        let holds = |auto, user| Holding { auto, user };
+        assert_eq!(sections_holding(&file(&format!("- {text}"), "mine"), text), holds(true, false));
+        assert_eq!(sections_holding(&file("- other", &format!("I wrote: {text}")), text), holds(false, true));
+        assert_eq!(sections_holding(&file(&format!("- {text}"), text), text), holds(true, true));
+        assert_eq!(sections_holding(&file("- other", "mine"), text), holds(false, false));
+        assert_eq!(sections_holding(&format!("{text} before any mark\n{}", file("", "")), text), holds(false, true));
+        assert_eq!(sections_holding(text, text), holds(false, true), "a file without marks is the user's");
+    }
 
         #[tokio::test]
     async fn a_rekey_copies_the_legacy_workspace_and_keeps_it() {
@@ -885,6 +949,27 @@ mod tests {
         assert!(result.contains(AUTO_END));
         assert!(result.contains(USER_START));
         assert!(result.contains(USER_END));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_directories_are_created_private() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspaces");
+        let wm = WorkspaceManager::new(root.clone());
+        let store = MemoryStore::new_for_test().await.unwrap();
+
+        wm.regenerate_auto_section("agent-1", Some("proj-1"), &store).await.unwrap();
+
+        let path = wm.workspace_path("agent-1", Some("proj-1"));
+        let mut dir = path.parent().unwrap();
+        loop {
+            assert_eq!(crate::private_dir::mode_of(dir), 0o700, "{}", dir.display());
+            if dir == root {
+                break;
+            }
+            dir = dir.parent().unwrap();
+        }
     }
 
     #[tokio::test]

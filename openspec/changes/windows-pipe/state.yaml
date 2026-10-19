@@ -1,6 +1,6 @@
-change: outbox-lifecycle
-objective: "1"
-depends_on: []
+change: windows-pipe
+objective: "transversal"
+depends_on: [local-transport]
 phase: explore
 artifacts:
   exploration: draft

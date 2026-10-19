@@ -2,7 +2,7 @@
 
 Fuente de verdad de cómo se publica `clawg`: los metadatos y la licencia, el TLS sin libssl, el workflow `release.yml` que compila, firma y publica los binarios cuando una CI de un push a `main` pasó y la versión no tiene tag, los assets de cada release, las claves de firma, el `install.ps1` que se baja del release y la documentación de la instalación. El comando que instala una versión nueva está en [`specs/self-update`](../self-update/spec.md); cómo la CI prueba el binario, en [`specs/install`](../install/spec.md).
 
-**Origen:** [release-and-self-update](../../changes/archive/2026-10-18-release-and-self-update/proposal.md), archivado el 2026-10-18. Los ids de requisito son los de esa spec.
+**Origen:** [release-and-self-update](../../changes/archive/2026-10-18-release-and-self-update/proposal.md), archivado el 2026-10-18. Los ids de requisito son los de esa spec. [ci-hardening](../../changes/archive/2026-10-19-ci-hardening/proposal.md), archivado el 2026-10-19, modificó R3 (el toolchain fijado y el reintento del build) y R8 (el análisis de `install.ps1`).
 
 ## Definiciones
 
@@ -42,10 +42,12 @@ El repositorio MUST llevar un `LICENSE` MIT cuyo titular es «The Claw Garden co
 
 `release.yml` MUST compilar con `cargo build --release -p clawg-cli` y MUST NOT usar `--workspace`: `clawg-eval` enciende la feature `eval` de clawg-core (`crates/clawg-eval/Cargo.toml:34`), que los builds de producción no enlazan (`crates/clawg-core/Cargo.toml:16-19`), y la unificación de features la llevaría al binario. Cada build MUST poner `CLAWG_DIST_TARGET` con su triple. Linux MUST compilarse en `ubuntu-24.04` fijo: el ONNX Runtime precompilado que `ort-sys` enlaza estático llama símbolos de glibc 2.38 (`__isoc23_strtol`, `__isoc23_strtoll`, `__isoc23_strtoull`), que `ubuntu-22.04` (glibc 2.35) no tiene y el enlace falla.
 
+El build MUST usar el toolchain fijado en `rust-toolchain.toml` (`toolchain:` de `dtolnay/rust-toolchain`, `.github/workflows/release.yml:90`; [`specs/install`](../install/spec.md), «Toolchain fijado») y MUST reintentar `cargo build --release --locked -p clawg-cli --target <triple>` hasta tres veces con espera creciente (`release.yml:102-111`): `ort-sys` baja ONNX Runtime de `cdn.pyke.io` mientras compila, con su SHA-256 fijado, y un pedido fallido ahí no tiene que frenar un release.
+
 #### Escenario: comando de build
 - GIVEN `.github/workflows/release.yml`
 - WHEN el test lo lee
-- THEN todo `cargo build` lleva `-p clawg-cli`, ninguno lleva `--workspace`, y cada build define `CLAWG_DIST_TARGET`
+- THEN todo `cargo build` lleva `-p clawg-cli`, `--release` y `--locked`, ninguno lleva `--workspace`, cada build define `CLAWG_DIST_TARGET` y se reintenta
 - AND el job de Linux corre en `ubuntu-24.04`
 
 **Test:** `the_release_workflow_builds_only_the_cli_with_the_dist_mark` (convención, `conventions.rs`).
@@ -135,7 +137,7 @@ Antes de publicar, el workflow MUST ejecutar el binario de cada plataforma y com
 - WHEN corre el script
 - THEN falla con un mensaje y el `clawg.exe` instalado queda intacto
 
-**Prueba:** a mano en Windows (máquina limpia), fuera de la suite; el script no tiene tests automáticos hoy (`scripts/` sólo contiene `install.ps1` y `compute_sha.ps1`).
+**Prueba:** a mano en Windows (máquina limpia), fuera de la suite. El script no se ejecuta en ninguna prueba automática; `.github/workflows/installer.yml` lo analiza con PSScriptAnalyzer cuando cambia `scripts/**` ([`specs/install`](../install/spec.md), «Análisis de `install.ps1`»).
 
 ## R9. Falta del VC++ Redistributable
 

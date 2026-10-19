@@ -77,9 +77,17 @@ pub enum Command {
         #[command(flatten)]
         profile: ProfileArg,
     },
-    /// List the stored memories that hold a secret of a known format, by id
-    /// and kind, never the secret. Read-only; works with the daemon running.
+    /// List the stored memories and verdict reasons that hold a secret of a
+    /// known format, by id and kind, never the secret. Read-only; works with
+    /// the daemon running.
     Secrets {
+        /// Replace the secrets of every stored verdict reason with their
+        /// placeholders instead. The daemon must be stopped.
+        #[arg(long)]
+        mask_reasons: bool,
+        /// Confirm that the reasons are to be rewritten for good.
+        #[arg(long, requires = "mask_reasons")]
+        yes: bool,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -102,6 +110,12 @@ pub enum Command {
         id: i64,
         #[command(flatten)]
         profile: ProfileArg,
+    },
+    /// Retry or discard a save the daemon gave up on, by the operation id
+    /// `clawg status` names under `ingest.problems`. Needs a running daemon.
+    Outbox {
+        #[command(subcommand)]
+        action: OutboxAction,
     },
     /// Show which agents do not read which agents' memories, or change it with
     /// `hide` and `unhide`. Every agent reads every other agent until hidden;
@@ -186,6 +200,36 @@ pub enum ProjectsAction {
         #[command(flatten)]
         profile: ProfileArg,
     },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum OutboxAction {
+    /// Store it again, after the pieces it already stored.
+    Retry(OutboxTarget),
+    /// Drop it, deleting the memories it had stored; `clawg undelete` brings
+    /// each back.
+    Discard(OutboxTarget),
+}
+
+/// The failed save an `outbox` action acts on.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct OutboxTarget {
+    /// The save's operation id.
+    pub operation_id: String,
+    /// The agent that saved it, needed only when another agent used the same
+    /// operation id.
+    #[arg(long, value_parser = parse_agent)]
+    pub agent: Option<String>,
+    #[command(flatten)]
+    pub profile: ProfileArg,
+}
+
+impl OutboxAction {
+    pub fn target(&self) -> &OutboxTarget {
+        match self {
+            OutboxAction::Retry(t) | OutboxAction::Discard(t) => t,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -293,6 +337,16 @@ where
     S: AsRef<std::ffi::OsStr>,
 {
     args.into_iter().nth(1).is_some_and(|a| a.as_ref() == "hook")
+}
+
+/// Whether `args` hold no argument after the program: what a client that does
+/// not know a hook's `args` runs, which must not exit 2 either.
+pub fn is_bare_invocation<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    args.into_iter().nth(1).is_none()
 }
 
 /// The three tables a row can live in.
@@ -655,6 +709,14 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_clawg_never_blocks() {
+        assert!(is_bare_invocation(["clawg"]));
+        assert!(is_bare_invocation(Vec::<&str>::new()));
+        assert!(!is_bare_invocation(["clawg", "status"]));
+        assert!(!is_bare_invocation(["clawg", "--help"]));
+    }
+
+    #[test]
     fn mcp_takes_an_agent() {
         let cli = parse(&["clawg", "mcp", "--agent", " claude-code "]);
         assert_eq!(
@@ -771,15 +833,20 @@ mod tests {
     }
 
     #[test]
-    fn secrets_takes_only_a_profile() {
+    fn secrets_takes_a_profile_and_masks_reasons_on_request() {
         assert_eq!(
             parse(&["clawg", "secrets"]).command,
-            Command::Secrets { profile: ProfileArg { profile: None } }
+            Command::Secrets { mask_reasons: false, yes: false, profile: ProfileArg { profile: None } }
         );
         assert_eq!(
             parse(&["clawg", "secrets", "--profile", "dev"]).command,
-            Command::Secrets { profile: ProfileArg { profile: Some("dev".into()) } }
+            Command::Secrets { mask_reasons: false, yes: false, profile: ProfileArg { profile: Some("dev".into()) } }
         );
+        assert_eq!(
+            parse(&["clawg", "secrets", "--mask-reasons", "--yes"]).command,
+            Command::Secrets { mask_reasons: true, yes: true, profile: ProfileArg { profile: None } }
+        );
+        assert!(Cli::try_parse_from(["clawg", "secrets", "--yes"]).is_err(), "--yes confirms a rewrite");
     }
 
     #[test]
@@ -794,6 +861,32 @@ mod tests {
             }
         );
         assert!(Cli::try_parse_from(["clawg", "projects", "add"]).is_err(), "the path is required");
+    }
+
+    #[test]
+    fn outbox_takes_an_action_an_operation_id_and_an_agent() {
+        assert_eq!(
+            parse(&["clawg", "outbox", "retry", "op-1"]).command,
+            Command::Outbox {
+                action: OutboxAction::Retry(OutboxTarget {
+                    operation_id: "op-1".into(),
+                    agent: None,
+                    profile: ProfileArg { profile: None },
+                })
+            }
+        );
+        assert_eq!(
+            parse(&["clawg", "outbox", "discard", "op-1", "--agent", "codex", "--profile", "dev"]).command,
+            Command::Outbox {
+                action: OutboxAction::Discard(OutboxTarget {
+                    operation_id: "op-1".into(),
+                    agent: Some("codex".into()),
+                    profile: ProfileArg { profile: Some("dev".into()) },
+                })
+            }
+        );
+        assert!(Cli::try_parse_from(["clawg", "outbox", "retry"]).is_err(), "the operation id is required");
+        assert!(Cli::try_parse_from(["clawg", "outbox", "forget", "op-1"]).is_err());
     }
 
     #[test]

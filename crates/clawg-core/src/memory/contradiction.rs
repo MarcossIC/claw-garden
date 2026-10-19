@@ -173,8 +173,9 @@ fn contradiction_search_scope(project_id: Option<&str>, pool: usize) -> SearchSc
         project_id: project_id.map(str::to_owned),
         lexical: None,
         // A save disputes only the saver's own rows: sharing lets an agent
-        // read another's memories, never mark them disputed.
-        reach: crate::memory::sharing::Reach::Own,
+        // read another's memories, never mark them disputed, and a pair with
+        // a row no agent saved is one no agent could judge.
+        reach: crate::memory::sharing::Reach::OwnOnly,
     }
 }
 
@@ -593,7 +594,23 @@ mod tests {
     #[test]
     fn contradiction_probe_ignores_shared_authors() {
         let scope = contradiction_search_scope(Some("proj"), CANDIDATE_POOL);
-        assert_eq!(scope.reach, crate::memory::sharing::Reach::Own);
+        assert_eq!(scope.reach, crate::memory::sharing::Reach::OwnOnly);
+    }
+
+    #[tokio::test]
+    async fn a_save_is_never_paired_with_a_row_no_agent_saved() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let base = base_vec(5);
+        let global = insert_row(&store, "agent-x", &base).await;
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE memory SET scope = 'global', agent_id = NULL WHERE id = ?1", [global]))
+            .await
+            .unwrap();
+
+        let ids = detected(&store, &near(&base, 3.0), "agent-x", None, MemoryType::UserPreference, &[]).await;
+
+        assert!(!ids.contains(&global), "no agent could judge a pair with a row that has no owner: {ids:?}");
     }
 
     // ── Type gate: candidate side ───────────────────────────────────────────

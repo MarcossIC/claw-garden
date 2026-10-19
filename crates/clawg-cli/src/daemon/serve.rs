@@ -12,12 +12,13 @@ use std::time::Instant;
 
 use clawg_core::build_info::{self, ServeFault};
 use clawg_core::memory::bootstrap::{
-    run_embedder_bootstrap_with_retry, serve_deps, unloading_when_idle, LogSink,
+    run_embedder_bootstrap_with_retry, serve_deps, unloading_when_idle, EmbedderDeps, LogSink,
 };
 use clawg_core::memory::idle_embedder::{idle_after, DEFAULT_IDLE, IDLE_MINUTES_VAR};
 use clawg_core::memory::store_lock::StoreHolder;
 use clawg_core::memory::MemoryError;
 use clawg_core::paths::{data_dir, PathsError, Profile};
+use clawg_core::private_dir::ensure_private_dir;
 use clawg_core::runtime::{MemoryRuntime, Workers};
 
 use super::api::{router, AppCtx, SAVE_CONFIRM_TIMEOUT};
@@ -76,7 +77,7 @@ fn classify_open_error(err: MemoryError) -> ServeError {
 /// is.
 pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
     let base_dir = data_dir(profile)?;
-    std::fs::create_dir_all(&base_dir).map_err(|source| ServeError::DataDir {
+    ensure_private_dir(&base_dir).map_err(|source| ServeError::DataDir {
         path: base_dir.display().to_string(),
         source,
     })?;
@@ -98,7 +99,7 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
     // Background, never awaited: the model may not be on disk yet, and the
     // daemon must answer `/health` and accept saves throughout the download.
     // A failed download is retried until the network comes back.
-    let (ensure, load, verify) =
+    let EmbedderDeps { ensure, cached, load, verify } =
         serve_deps(
             runtime.store.clone(),
             clawg_core::paths::backups_dir(&base_dir),
@@ -111,16 +112,16 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
         log::warn!("{e}; the model is let go after {} minutes without use", DEFAULT_IDLE.as_secs() / 60);
         Some(DEFAULT_IDLE)
     });
-    let load = match idle {
-        Some(idle) => unloading_when_idle(
-            ensure.clone(),
-            load,
-            base_dir.clone(),
-            idle,
-            tokio::runtime::Handle::current(),
-        ),
-        None => load,
-    };
+    // Wrapped even when it is never let go: the wrapper is also what loads
+    // the model again when its inference worker is gone.
+    let load = unloading_when_idle(
+        cached,
+        ensure.clone(),
+        load,
+        base_dir.clone(),
+        idle,
+        tokio::runtime::Handle::current(),
+    );
     tokio::spawn(run_embedder_bootstrap_with_retry(
         base_dir.clone(),
         runtime.embedder.clone(),

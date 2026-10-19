@@ -4,13 +4,14 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::memory::pieces::SaveLink;
+use crate::memory::pieces::{read_save_core, SaveLink};
 use crate::memory::provenance::mark;
 use crate::memory::{
     access::AccessTracker,
+    admin::MemoryKind,
     clock::TimestampMs,
     embedder::{EmbedError, EmbedRole, Embedder},
-    search::{search_all_memories, RankedHit, SearchScope},
+    search::{memory_project_predicate, search_all_memories, RankedHit, SearchScope},
     sharing::Reach,
     workspace::{EmittedIds, WorkspaceManager},
     MemoryError, MemoryStore, TableKind,
@@ -365,6 +366,9 @@ struct PromptParts<'a> {
 struct Cut {
     budget: usize,
     full: usize,
+    /// Every hit in the order the prompt prints them, which is not the order
+    /// the cut takes them in.
+    printed: Vec<(TableKind, i64)>,
     left_out: Vec<(TableKind, i64)>,
     shortened: Vec<(TableKind, i64)>,
     /// Nothing is left to cut and the text is still over.
@@ -380,15 +384,17 @@ struct Fitted {
 
 /// Renders `parts` in at most `budget` bytes.
 ///
-/// While the text is over, the last hit of LONG-TERM goes, then the last of
-/// RECENT, then the last session's summary, then the last conflict pair,
-/// which joins the count of pairs not shown. The summary outlasts the hits
-/// because no query brings it back, and gives way to the conflicts because
-/// they ask for the user. A hit left alone in its block is shortened instead, and goes only
-/// when no text is left of it: one shortened hit and its id say more than an
-/// empty block. Each step renders the whole text, so the closing note, the
-/// SHARED note and the text a conflict gains when its hit goes are all
-/// counted as they are.
+/// While the text is over, the hit of RECENT or LONG-TERM that scored lowest
+/// goes (see [`next_to_cut`]), then the last session's summary, then the
+/// last conflict pair, which joins the count of pairs not shown. The blocks
+/// say how old a hit is, not how relevant: cutting a whole block first would
+/// drop an `exact` hit of last week before a recent one that barely passed
+/// the floor. The summary outlasts the hits because no query brings it back,
+/// and gives way to the conflicts because they ask for the user. A hit left
+/// alone in its block is shortened instead, and goes only when no text is
+/// left of it: one shortened hit and its id say more than an empty block.
+/// Each step renders the whole text, so the closing note, the SHARED note and
+/// the text a conflict gains when its hit goes are all counted as they are.
 ///
 /// The workspace is never cut: its preferences and USER section are the
 /// standing contract with the user, and every row it printed is one the
@@ -400,18 +406,18 @@ fn fit_to_budget(mut parts: PromptParts<'_>, budget: usize) -> Fitted {
     if full.len() <= budget {
         return Fitted { text: full, shown: parts.recent.into_iter().chain(parts.longterm).collect() };
     }
-    let mut cut = Cut { budget, full: full.len(), left_out: Vec::new(), shortened: Vec::new(), workspace_over: false };
+    let printed =
+        parts.last_session.iter().chain(&parts.recent).chain(&parts.longterm).map(|h| (h.kind, h.id)).collect();
+    let mut cut = Cut { budget, full: full.len(), printed, left_out: Vec::new(), shortened: Vec::new(), workspace_over: false };
     loop {
         let text = render(&parts, Some(&cut));
         let Some(over) = text.len().checked_sub(budget).filter(|&over| over > 0) else {
             return Fitted { text, shown: parts.recent.into_iter().chain(parts.longterm).collect() };
         };
-        let block = if !parts.longterm.is_empty() {
-            &mut parts.longterm
-        } else if !parts.recent.is_empty() {
-            &mut parts.recent
-        } else {
-            &mut parts.last_session
+        let (block, at) = match next_to_cut(&parts.recent, &parts.longterm) {
+            Some((Bucket::LongTerm, at)) => (&mut parts.longterm, at),
+            Some((Bucket::Recent, at)) => (&mut parts.recent, at),
+            None => (&mut parts.last_session, 0),
         };
         match block.len() {
             0 if parts.conflicts.is_empty() => {
@@ -440,11 +446,31 @@ fn fit_to_budget(mut parts: PromptParts<'_>, budget: usize) -> Fitted {
                 }
             }
             _ => {
-                let hit = block.pop().expect("the block has hits");
+                let hit = block.remove(at);
                 cut.left_out.push((hit.kind, hit.id));
             }
         }
     }
+}
+
+enum Bucket {
+    Recent,
+    LongTerm,
+}
+
+/// Where the hit the budget cuts next sits, if RECENT or LONG-TERM has one:
+/// the lowest score, and an `exact` hit only when no other is left, since
+/// holding every identifier of the query is the surest sign of the row asked
+/// for, which is why the search's relevance cut always keeps it. A tie goes
+/// from the end of LONG-TERM, then from the end of RECENT: a context without
+/// a query, whose rows all score 0, is still cut from its oldest save.
+fn next_to_cut(recent: &[RankedHit], longterm: &[RankedHit]) -> Option<(Bucket, usize)> {
+    let longterm = longterm.iter().enumerate().rev().map(|(at, h)| (Bucket::LongTerm, at, h));
+    let recent = recent.iter().enumerate().rev().map(|(at, h)| (Bucket::Recent, at, h));
+    longterm
+        .chain(recent)
+        .min_by(|(_, _, a), (_, _, b)| a.exact.cmp(&b.exact).then(a.score.total_cmp(&b.score)))
+        .map(|(bucket, at, _)| (bucket, at))
 }
 
 /// `content` cut `over` bytes shorter, on a character boundary, and marked;
@@ -536,7 +562,7 @@ fn format_cut(cut: &Cut) -> String {
         other => format!("{} #{id}", format!("{other:?}").to_lowercase()),
     };
     let mut left_out = cut.left_out.clone();
-    left_out.reverse();
+    left_out.sort_by_key(|id| cut.printed.iter().position(|p| p == id));
     let mut out = format!("Cut to fit {} bytes; the full context is {} bytes.", cut.budget, cut.full);
     if !left_out.is_empty() {
         out.push_str(&format!(" Left out: {}.", left_out.iter().map(label).collect::<Vec<_>>().join(", ")));
@@ -590,8 +616,8 @@ fn unix_millis_to_ymd(ts: TimestampMs) -> (i32, u32, u32) {
     unix_secs_to_ymd(ts.as_millis_i64().div_euclid(1_000))
 }
 
-/// Saved by an agent other than `reader`. A hit without an author is the
-/// reader's own: nothing else could have reached its search.
+/// Saved by an agent other than `reader`. A hit without an author was saved
+/// by no agent, so there is nobody to name.
 fn is_shared(hit: &RankedHit, reader: &str) -> bool {
     hit.agent_id.as_deref().is_some_and(|a| a != reader)
 }
@@ -677,9 +703,9 @@ fn format_conflict_block(pairs: &[ConflictPair], hit_positions: &HashMap<i64, us
     out
 }
 
-/// The newest live `session_summary` of the project, the first piece of a
-/// long one, newest first; the project's own only, since a summary without
-/// one is not this project's last session. Authors are checked by the caller.
+/// The live `session_summary` rows of the project, newest first, a long save
+/// by its first piece; the project's own only, since a summary without one is
+/// not this project's last session. Authors are checked by the caller.
 const LAST_SESSION_SQL: &str = "
     SELECT id, content, memory_type, tier, status, created_at, agent_id, topic_key
     FROM memory
@@ -690,8 +716,10 @@ const LAST_SESSION_SQL: &str = "
     ORDER BY created_at DESC, id ASC
 ";
 
-/// The last session's summary `agent_id` may read, and `hits` without it or
-/// any other piece of its save. A failure only leaves the block out.
+/// The last session's summary `agent_id` may read, a long one joined whole,
+/// and `hits` without any piece of its save. Its last sections are the next
+/// steps and the files, so its first piece alone would leave them out. A
+/// failure only leaves the block out, or the summary at its first piece.
 async fn with_last_session(
     store: &MemoryStore,
     agent_id: &str,
@@ -714,8 +742,18 @@ async fn with_last_session(
     });
     let save_of = |id: i64| links.get(&id).map_or(id, |l| l.save_id);
     let hits = hits.into_iter().filter(|h| h.kind != TableKind::Memory || save_of(h.id) != save_of(summary.id)).collect();
-    let piece = links.get(&summary.id).map(|l| l.position);
-    (Some(RankedHit { piece, ..summary }), hits)
+    let Some(piece) = links.get(&summary.id).map(|l| l.position) else {
+        return (Some(summary), hits);
+    };
+    let summary = match read_save_core(store, MemoryKind::Memory, summary.id, summary.agent_id.as_deref()).await {
+        Ok(Some(save)) => RankedHit { content: save.text, ..summary },
+        Ok(None) => RankedHit { piece: Some(piece), ..summary },
+        Err(e) => {
+            log::warn!("read_save_core failed: {e}; LAST SESSION shows the first piece");
+            RankedHit { piece: Some(piece), ..summary }
+        }
+    };
+    (Some(summary), hits)
 }
 
 async fn fetch_last_session(
@@ -732,7 +770,7 @@ async fn fetch_last_session(
             let mut rows = stmt.query(rusqlite::params![project])?;
             while let Some(row) = rows.next()? {
                 let author: Option<String> = row.get(6)?;
-                if !author.as_deref().is_some_and(|a| reach.admits(&reader, a)) {
+                if !reach.admits(&reader, author.as_deref()) {
                     continue;
                 }
                 return Ok(Some(RankedHit {
@@ -763,17 +801,21 @@ async fn fetch_last_session(
 /// rows of their own, and they fold into one line. The pieces of a save share
 /// its stamp and are inserted in order, so `id ASC` within a stamp keeps the
 /// opening of a save the pool's cut falls inside.
-const RECENT_ROWS_SQL: &str = "
+const RECENT_ROWS_SQL: &str = concat!(
+    "
     SELECT id, content, memory_type, tier, status, created_at, agent_id, topic_key
     FROM memory
     WHERE status IN ('active', 'disputed')
       AND deleted_at IS NULL
       AND agent_id = ?1
-      AND (?2 IS NULL OR project_id = ?2 OR project_id IS NULL OR memory_type = 'user_preference')
+      AND ",
+    memory_project_predicate!("", "?2"),
+    "
       AND created_at >= ?3
     ORDER BY created_at DESC, id ASC
     LIMIT ?4
-";
+"
+);
 const RECENT_ROW_POOL: i64 = 200;
 
 async fn fetch_recent_rows(
@@ -951,7 +993,7 @@ async fn fetch_active_conflicts(
                         new_mark: side(8)?,
                     })
                 })?
-                .filter_map(|r| r.ok())
+                .filter_map(|r| r.map_err(|e| log::warn!("fetch_active_conflicts: a pair did not read: {e}")).ok())
                 .collect();
             Ok(pairs)
         })
@@ -1322,6 +1364,36 @@ mod tests {
         let ids = header_ids(&fitted.text);
         assert_eq!(ids, [1, 2, 3], "{}", fitted.text);
         assert_eq!(fitted.shown.iter().map(|h| h.id).collect::<Vec<_>>(), [1, 2, 3]);
+    }
+
+    #[test]
+    fn the_cut_takes_the_lowest_score_first_across_recent_and_long_term() {
+        let mut parts = parts("", &[(1, 1_000), (2, 1_000)], &[(3, 1_000), (4, 1_000)], vec![]);
+        for (hit, score) in parts.recent.iter_mut().chain(&mut parts.longterm).zip([0.9, 0.01, 0.8, 0.02]) {
+            hit.score = score;
+        }
+        let fitted = fit_to_budget(parts, 2_500);
+        assert_eq!(header_ids(&fitted.text), [1, 3], "{}", fitted.text);
+        assert!(block(&fitted.text, SEP_BUDGET).unwrap().contains("Left out: #2, #4."), "in the order they would print: {}", fitted.text);
+    }
+
+    #[test]
+    fn an_exact_hit_is_cut_only_when_no_other_hit_is_left() {
+        let exact_in_long_term = || {
+            let mut parts = parts("", &[(1, 1_000), (2, 1_000)], &[(3, 1_000)], vec![]);
+            parts.longterm[0].score = 0.01;
+            parts.longterm[0].exact = true;
+            parts
+        };
+        let fitted = fit_to_budget(exact_in_long_term(), 2_500);
+        assert_eq!(header_ids(&fitted.text), [1, 3], "{}", fitted.text);
+        assert!(!fitted.text.contains(TRUNCATED), "{}", fitted.text);
+
+        let one_left = (300..2_500)
+            .map(|budget| fit_to_budget(exact_in_long_term(), budget).text)
+            .find(|text| header_ids(text).len() == 1)
+            .expect("some budget leaves a single hit");
+        assert_eq!(header_ids(&one_left), [3], "{one_left}");
     }
 
     #[test]
@@ -3173,6 +3245,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_last_session_block_shows_a_long_summary_whole() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let opening = seed_summary(&store, "agent-1", Some("proj-a"), "Goal: wire the cache. Instructions: keep the locale key", 1).await;
+        let closing = seed_summary(&store, "agent-1", Some("proj-a"), "Next steps: invalidate on deploy. Relevant files: cache.rs", 1).await;
+        // Every piece of a save carries the save's stamp, as ingest writes it.
+        store
+            .conn
+            .call(move |c| {
+                c.execute("UPDATE memory SET created_at = (SELECT created_at FROM memory WHERE id = ?1) WHERE id = ?2", [opening, closing])
+            })
+            .await
+            .unwrap();
+        store
+            .link_pieces(vec![
+                crate::memory::pieces::StoredPiece { memory_id: opening, context: String::new() },
+                crate::memory::pieces::StoredPiece { memory_id: closing, context: "Goal".into() },
+            ])
+            .await
+            .unwrap();
+
+        let text = session_prompt(&store, "agent-1", Some("proj-a")).await.text;
+
+        let last = block(&text, SEP_LAST_SESSION).unwrap_or_else(|| panic!("no LAST SESSION block: {text}"));
+        assert!(last.contains(&format!("#{opening} session_summary] Goal: wire the cache")), "{text}");
+        assert!(last.contains("Next steps: invalidate on deploy. Relevant files: cache.rs"), "{text}");
+        assert!(!text.contains(&format!("#{closing} ")), "{text}");
+    }
+
+    #[tokio::test]
     async fn the_last_session_block_respects_sharing() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let own = seed_summary(&store, "agent-1", Some("proj-a"), "Goal: my own last session", 3).await;
@@ -3193,6 +3294,23 @@ mod tests {
 
         let hidden = session_prompt_reaching(&store, "agent-3", Some("proj-a"), &Reach::Own).await.text;
         assert!(!hidden.contains(SEP_LAST_SESSION), "an agent with no summary of its own and no reach gets no block: {hidden}");
+    }
+
+    #[tokio::test]
+    async fn the_last_session_block_shows_a_summary_no_agent_saved() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let global = seed_summary(&store, "agent-1", None, "Goal: a summary no agent saved", 1).await;
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE memory SET scope = 'global', agent_id = NULL WHERE id = ?1", [global]))
+            .await
+            .unwrap();
+
+        for reach in [Reach::Own, Reach::AllBut(vec!["agent-2".into()])] {
+            let text = session_prompt_reaching(&store, "agent-1", None, &reach).await.text;
+            let last = block(&text, SEP_LAST_SESSION).unwrap_or_else(|| panic!("{reach:?}: {text}"));
+            assert!(last.contains(&format!("#{global} session_summary] Goal: a summary no agent saved")), "{reach:?}: {text}");
+        }
     }
 
     #[tokio::test]

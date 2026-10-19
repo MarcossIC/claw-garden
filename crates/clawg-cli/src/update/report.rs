@@ -3,7 +3,7 @@
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use super::plan::{Failure, Step, StoreState, Undo};
+use super::plan::{Answer, Failure, Step, StoreState, Undo};
 use super::version::Version;
 
 /// A daemon of the new version that is running at the end.
@@ -60,6 +60,8 @@ pub struct FailureContext {
     /// The snapshot the new daemon wrote before migrating, if it did.
     pub pre_migration: Option<PathBuf>,
     pub had_daemon: bool,
+    /// The daemon that answered once the plan had ended, whoever started it.
+    pub answering: Option<Answer>,
 }
 
 pub fn failure(failure: &Failure, context: &FailureContext) -> String {
@@ -96,7 +98,7 @@ fn daemon_state(failure: &Failure, had_daemon: bool) -> String {
     } else if failure.undone.contains(&Undo::StartOldDaemon) {
         "Its daemon is running again.".to_string()
     } else if failure.stuck.iter().any(|(undo, _)| *undo == Undo::StartOldDaemon) {
-        "Its daemon is not running: start it with any clawg command that needs it, or `clawg serve`."
+        "Its daemon is not running: start it with `clawg serve` or by reconnecting the editor's MCP server."
             .to_string()
     } else {
         "Its daemon was not touched.".to_string()
@@ -111,6 +113,14 @@ fn kept_new_binary(restore_error: &str, context: &FailureContext) -> Vec<String>
             context.to
         ),
         format!("Restoring the store from before the migration failed: {restore_error}"),
+        match &context.answering {
+            Some(daemon) => format!("A daemon is running: pid {}, clawg {}.", daemon.pid, daemon.version),
+            None => format!(
+                "No daemon is running: start it with `clawg serve` or by reconnecting the editor's MCP server; \
+                 clawg {} opens the migrated store.",
+                context.to
+            ),
+        },
         "Where everything is:".to_string(),
     ];
     match &context.aside {
@@ -127,13 +137,15 @@ fn kept_new_binary(restore_error: &str, context: &FailureContext) -> Vec<String>
         context.data_dir.join("backups").display()
     ));
     lines.push("To go back by hand:".to_string());
-    lines.push("  1. clawg stop".to_string());
+    let mut steps = vec!["clawg stop, if a daemon is running".to_string()];
     if let Some(aside) = &context.aside {
-        lines.push(format!("  2. put {} back at {}", aside.display(), context.exe.display()));
+        steps.push(format!("put {} back at {}", aside.display(), context.exe.display()));
     }
     if let Some(snapshot) = &context.pre_migration {
-        lines.push(format!("  3. clawg restore {}", snapshot.display()));
+        steps.push(format!("clawg restore {}", snapshot.display()));
     }
+    steps.push("start the daemon again: `clawg serve`, or reconnect the editor's MCP server".to_string());
+    lines.extend(steps.iter().enumerate().map(|(i, step)| format!("  {}. {step}", i + 1)));
     lines.push(
         "Restoring keeps the migrated store as a pre-restore snapshot, and loses nothing else.".to_string(),
     );
@@ -231,6 +243,7 @@ mod tests {
             data_dir: "/data".into(),
             pre_migration: Some("/data/backups/pre-migration.db".into()),
             had_daemon: true,
+            answering: None,
         }
     }
 
@@ -323,13 +336,46 @@ mod tests {
             "/bin/clawg.old-1",
             "/data/backups/pre-migration.db",
             "pre-restore",
-            "clawg stop",
-            "put /bin/clawg.old-1 back at /bin/clawg",
-            "clawg restore /data/backups/pre-migration.db",
+            "No daemon is running: start it with `clawg serve` or by reconnecting the editor's MCP server",
+            "1. clawg stop, if a daemon is running",
+            "2. put /bin/clawg.old-1 back at /bin/clawg",
+            "3. clawg restore /data/backups/pre-migration.db",
+            "4. start the daemon again",
         ] {
             assert!(report.contains(needed), "missing {needed:?} in:\n{report}");
         }
         assert!(!report.contains("Everything was put back"), "{report}");
+    }
+
+    #[test]
+    fn a_failed_restore_names_the_daemon_that_answers_and_numbers_only_the_steps_left() {
+        let mut left = failed(Step::StartDaemon, "the new daemon stopped answering", &[Undo::EndNewDaemon]);
+        left.store = StoreState::RestoreFailed("the store is in use".into());
+        let context = FailureContext {
+            aside: None,
+            answering: Some(Answer { pid: 4343, version: "0.19.0".into() }),
+            ..context()
+        };
+
+        let report = failure(&left, &context);
+
+        assert!(report.contains("A daemon is running: pid 4343, clawg 0.19.0."), "{report}");
+        assert!(!report.contains("No daemon is running"), "{report}");
+        assert!(report.contains("2. clawg restore /data/backups/pre-migration.db"), "{report}");
+        assert!(report.contains("3. start the daemon again"), "{report}");
+    }
+
+    #[test]
+    fn a_daemon_that_could_not_be_started_again_says_what_starts_it() {
+        let mut stuck = failed(Step::StartDaemon, "no answer", &[Undo::EndNewDaemon]);
+        stuck.stuck = vec![(Undo::StartOldDaemon, "it did not answer".into())];
+
+        let report = failure(&stuck, &context());
+
+        assert!(
+            report.contains("Its daemon is not running: start it with `clawg serve` or by reconnecting the editor's MCP server."),
+            "{report}"
+        );
     }
 
     #[test]

@@ -22,7 +22,7 @@
 ### Qué parte la memoria hoy
 
 - El id es `{nombre de carpeta}-{16 bits de SipHash de la ruta}` (`identity.rs:11-15`, `:146-153`). Dos clones en `C:\work\app` y `D:\review\app` dan dos ids, sin relación.
-- Una sesión de un clone nunca ve lo que guardó la sesión del otro: toda búsqueda filtra por `m.project_id = ?` (`crates/clawg-core/src/memory/search.rs:179`, `:233`). La excepción son `user_preference` y las filas sin proyecto (`search.rs:179`).
+- Una sesión de un clone nunca ve lo que guardó la sesión del otro: toda búsqueda filtra por `m.project_id = ?` (`crates/clawg-core/src/memory/search.rs:207`, `:268`). La excepción son `user_preference` y las filas sin proyecto (`search.rs:207`).
 - Mover un repo de carpeta (renombrar, cambiar de disco) cambia la ruta y por lo tanto el id. Las filas quedan bajo el id viejo, que ninguna sesión nueva calcula. `project_rekey` sólo recibe los `legacy_ids` que el puente conoce y el puente sólo envía uno: el de la ruta cruda (`crates/clawg-cli/src/mcp/server.rs:516-517`). Un repo movido no tiene forma de reclamar su pasado sin SQL.
 - Lo que sí está bien: `register_project` ya sabe mover filas de varios ids a uno, deja registro por fila y es idempotente (`crates/clawg-core/src/memory/project.rs:56-124`). La maquinaria existe; lo que falta es **qué id es el correcto** y **cómo se enteran los ids viejos**.
 

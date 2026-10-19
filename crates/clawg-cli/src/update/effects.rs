@@ -1,8 +1,9 @@
 //! The update's contact with the world: the release server, the files beside
 //! the installed binary, and the daemon's processes.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use clawg_core::memory::backup;
@@ -33,6 +34,10 @@ const LOG_LINES: usize = 8;
 /// How long a rename is tried again while another process holds the file.
 const RENAME_PATIENCE: Duration = Duration::from_secs(10);
 const RENAME_RETRY_EVERY: Duration = Duration::from_millis(100);
+/// How long the downloaded binary has to print its version, with
+/// `update.lock` held meanwhile. A starting value, not measured.
+const SMOKE_TIMEOUT: Duration = Duration::from_secs(30);
+const SMOKE_POLL: Duration = Duration::from_millis(50);
 
 /// The files an update moves.
 pub struct Paths {
@@ -92,6 +97,11 @@ impl Installation {
         self.new_daemon.as_ref()
     }
 
+    /// The daemon that answers for the profile now, whoever started it.
+    pub async fn answering(&self) -> Option<Answer> {
+        ask_health(&self.paths.base_dir).await.map(|h| Answer { pid: h.pid, version: h.version })
+    }
+
     /// The snapshot the daemon started by the update wrote before migrating.
     pub fn pre_migration(&self) -> Option<PathBuf> {
         let before = self.backups_before.as_ref()?;
@@ -137,13 +147,19 @@ impl Installation {
         let attempts = if cfg!(windows) { 3 } else { 1 };
         let mut why = String::new();
         for attempt in 1..=attempts {
-            match Command::new(&self.paths.staged).arg("--version").stdin(Stdio::null()).output() {
-                Ok(out) => {
+            match output_within(Command::new(&self.paths.staged).arg("--version"), SMOKE_TIMEOUT).await {
+                Ok(Some(out)) => {
                     let said = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     if out.status.success() && said == expected {
                         return Ok(());
                     }
                     return Err(format!("the downloaded binary says {said:?} instead of {expected:?}"));
+                }
+                Ok(None) => {
+                    return Err(format!(
+                        "the downloaded binary did not print its version within {} s",
+                        SMOKE_TIMEOUT.as_secs()
+                    ));
                 }
                 Err(e) => why = e.to_string(),
             }
@@ -269,6 +285,30 @@ enum Waited {
     Failed(String),
 }
 
+/// Runs `command` and waits at most `timeout` for it to end; one still
+/// running then is ended and waited for, and `None` comes back. Its stdout is
+/// read once it has ended, which fits a line of `--version`: a process that
+/// fills the pipe first is taken for one that hangs.
+async fn output_within(command: &mut Command, timeout: Duration) -> std::io::Result<Option<Output>> {
+    let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let mut stdout = Vec::new();
+            if let Some(mut pipe) = child.stdout.take() {
+                pipe.read_to_end(&mut stdout)?;
+            }
+            return Ok(Some(Output { status, stdout, stderr: Vec::new() }));
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            child.wait()?;
+            return Ok(None);
+        }
+        tokio::time::sleep(SMOKE_POLL).await;
+    }
+}
+
 async fn ask_health(base_dir: &Path) -> Option<Health> {
     DaemonClient::from_data_dir(base_dir)?.health().await.ok()
 }
@@ -282,8 +322,11 @@ fn tail_lines(text: &str, count: usize) -> String {
 #[cfg(unix)]
 fn make_executable(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("cannot make {} executable: {e}", path.display()))
+    let failed = |e: std::io::Error| format!("cannot make {} executable: {e}", path.display());
+    let file = std::fs::File::open(path).map_err(failed)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o755)).map_err(failed)?;
+    // The mode belongs to the file, not to the directory synced after the swap.
+    file.sync_all().map_err(failed)
 }
 
 #[cfg(not(unix))]
@@ -336,7 +379,13 @@ impl Effects for Installation {
                 self.set_aside = true;
                 Ok(())
             }
-            Step::PutInPlace => rename(&self.paths.staged, &self.paths.exe).await,
+            Step::PutInPlace => {
+                rename(&self.paths.staged, &self.paths.exe).await?;
+                // Until the directory is synced a power cut can keep the first
+                // rename and lose the second, leaving no binary under the name.
+                let dir = self.paths.exe.parent().unwrap_or(Path::new("."));
+                backup::sync_dir(dir).map_err(|e| format!("cannot sync {}: {e}", dir.display()))
+            }
             Step::StartDaemon => {
                 let port = self.old.as_ref().map(|d| d.port).ok_or("there is no daemon port to start on")?;
                 self.backups_before = Some(self.backup_names());
@@ -396,6 +445,40 @@ impl Effects for Installation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A process of the system that runs for half a minute and prints little.
+    fn long_running() -> Command {
+        if cfg!(windows) {
+            let mut command = Command::new("ping");
+            command.args(["-n", "30", "127.0.0.1"]);
+            command
+        } else {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            command
+        }
+    }
+
+    #[tokio::test]
+    async fn a_process_still_running_at_its_deadline_is_ended() {
+        let started = Instant::now();
+
+        let out = output_within(&mut long_running(), Duration::from_millis(300)).await.expect("it started");
+
+        assert!(out.is_none(), "no output from a process that did not end in time");
+        assert!(started.elapsed() < Duration::from_secs(10), "the wait ended at the deadline, not with the process");
+    }
+
+    #[tokio::test]
+    async fn a_process_that_ends_in_time_gives_its_output() {
+        let mut command = if cfg!(windows) { Command::new("cmd") } else { Command::new("sh") };
+        command.args([if cfg!(windows) { "/C" } else { "-c" }, "echo smoke"]);
+
+        let out = output_within(&mut command, Duration::from_secs(30)).await.expect("it started").expect("it ended");
+
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "smoke");
+    }
 
     #[test]
     fn the_log_tail_keeps_the_last_lines_without_blanks() {

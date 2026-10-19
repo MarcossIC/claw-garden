@@ -11,12 +11,12 @@
 | Premisa | Resultado |
 |---|---|
 | Las dos tablas FTS usan `unicode61 remove_diacritics 2` | **Cierta.** `memory_fts` en `crates/clawg-core/migrations/V8__memory_fts.sql:36-43` y `project_doc_fts` en `V12__project_docs.sql:45-48`. La de docs guarda `text` y `project_id UNINDEXED`, sin más columnas. |
-| `_` parte el token y un identificador camelCase queda como uno solo | **Cierta, y el repo ya lo asume.** `holds_identifier` documenta que FTS5 parte en `_` (`search.rs:719-722`). El tokenizador pasa a minúsculas, así que `memoryType` se indexa como `memorytype`; `memory_type` como `memory` y `type`. Una consulta «memory type» no encuentra lo primero y `memoryType` no encuentra lo segundo. |
-| La expresión toma hasta 16 tokens unidos con OR, por posición | **Cierta.** `fts_match_expression` (`search.rs:563-571`), `MAX_LEXICAL_TOKENS = 16` (`:543`), comentario que declara «por posición, no por rareza» (`:537-542`). No hay ninguna lista de palabras vacías en el código de recuperación; las únicas son de las herramientas de evaluación (`rag-eval/audit.rs:110`, `golden-mine/synth/vocab.rs:11`). |
-| Docs reusa la misma función | **Cierta, en otra línea.** `project_docs/mod.rs:271` (no 265). La memoria la usa en `lexical_candidates` (`search.rs:660`). Cambiarla cambia los dos canales. |
+| `_` parte el token y un identificador camelCase queda como uno solo | **Cierta, y el repo ya lo asume.** `holds_identifier` documenta que FTS5 parte en `_` (`search.rs:783-786`). El tokenizador pasa a minúsculas, así que `memoryType` se indexa como `memorytype`; `memory_type` como `memory` y `type`. Una consulta «memory type» no encuentra lo primero y `memoryType` no encuentra lo segundo. |
+| La expresión toma hasta 16 tokens unidos con OR, por posición | **Cierta.** `fts_match_expression` (`search.rs:619-627`), `MAX_LEXICAL_TOKENS = 16` (`:599`), comentario que declara «por posición, no por rareza» (`:593-598`). No hay ninguna lista de palabras vacías en el código de recuperación; las únicas son de las herramientas de evaluación (`rag-eval/audit.rs:110`, `golden-mine/synth/vocab.rs:11`). |
+| Docs reusa la misma función | **Cierta, en otra línea.** `project_docs/mod.rs:271` (no 265). La memoria la usa en `lexical_candidates` (`search.rs:716`). Cambiarla cambia los dos canales. |
 | RRF_K = 60, `fuse`, 50 candidatos por canal, KNN partido por proyecto | **Cierta.** `RRF_K` `mod.rs:42`, `CANDIDATES_PER_CHANNEL` `:37`, `fuse` `:243-254`, `search` `:258-305`; partición en `V12__project_docs.sql:36-39`. |
 | Pasajes con rol `Passage` y consulta con rol `Query`, y los dos prefijos son «query: » | **Cierta.** `mod.rs:405` y `:266`; `E5_QUERY_PREFIX` y `E5_PASSAGE_PREFIX` (`embedder.rs:89`, `:110`). El comentario (`:91-109`) dice que «passage: » fue peor para **memorias** con CLS (recall@10 de 0,8261 a 0,6957) y que no se re-midió con mean. Para docs nunca se midió. |
-| Cambiar el prefijo es un contrato «sólo del índice de docs» | **Falsa.** El prefijo es del embedder, no del índice: `passage_prefix()` devuelve la misma constante para todo (`embedder.rs:236-238`), y el rol `Passage` también lo usan las memorias (`admin.rs:1614`, `maintenance.rs:586`, `contradiction.rs:608`). Mover la constante cambia el contrato de las memorias (y se cruza con 21). Para dejarlo en docs hace falta un rol o un prefijo propio del índice. |
+| Cambiar el prefijo es un contrato «sólo del índice de docs» | **Falsa.** El prefijo es del embedder, no del índice: `passage_prefix()` devuelve la misma constante para todo (`embedder.rs:236-238`), y el rol `Passage` también lo usan las memorias (`admin.rs:1614`, `maintenance.rs:586`, `contradiction.rs:625`). Mover la constante cambia el contrato de las memorias (y se cruza con 21). Para dejarlo en docs hace falta un rol o un prefijo propio del índice. |
 | Un re-embebido de docs se dispararía solo por cambiar el prefijo | **Falsa.** `plan_refresh` compara sólo `content_hash` y `model_id` (`mod.rs:104-117`, el `110`). El `model_id` es el del embedder (`mod.rs:358`) y nombra el modelo y el pooling (`E5_MODEL_ID = "multilingual-e5-small/mean"`, `embedder.rs:115`), no el prefijo ni el texto indexado. Un cambio de prefijo, de texto léxico o de breadcrumb dejaría los vectores viejos como «al día». Hay que meterlo en la huella. |
 | El nombre y la firma de una función están en el encabezado de un pasaje de código | **A medias.** El breadcrumb es `ruta > etiquetas` (`chunk.rs:109-113`). Una etiqueta (`header`, `code.rs:181-193`: sólo la primera línea del contenedor, hasta `{`, con tope de 120 bytes) se agrega sólo cuando un nodo **no entra** en el tope de 1.200 caracteres y se parte (`code.rs:156-173`). Las funciones chicas se empaquetan juntas y el pasaje lleva sólo la ruta, o las etiquetas del nodo más grande (`Packer::add`, `code.rs:104-115`). El nombre y la firma **sí** están en el cuerpo, y el cuerpo se embebe y se indexa (`indexed_text`, `chunk.rs:28-30`; `mod.rs:403` y `:485`). Lo que falta no es la presencia sino el peso y la posición. |
 | Hit@3 de docs es 0,27 contra 0,70 | **Cierta, con matiz.** 0,27 es el total de 15 preguntas (10 de docs y 5 de código); docs solo da 0,20 y código 0,40 (`verify.md:190-194`). El 0,70 es el umbral de la propuesta de project-indexing, no una medición. |
@@ -41,7 +41,7 @@ El texto de cada pasaje que entra a los dos canales es `breadcrumb + "\n\n" + cu
 
 ### Qué falla, con lo medido
 
-- **Una pregunta de lenguaje natural es casi toda palabras vacías.** Una de las del golden set tiene 19 palabras (`verify.md:79`); el recorte a 16 es por posición y descarta las últimas, que suelen ser las que nombran la cosa (`search.rs:564`). Cada «de», «el», «the» trae pasajes que sólo comparten eso (`verify.md:71`; `specs/project-docs` «Límites conocidos»).
+- **Una pregunta de lenguaje natural es casi toda palabras vacías.** Una de las del golden set tiene 19 palabras (`verify.md:79`); el recorte a 16 es por posición y descarta las últimas, que suelen ser las que nombran la cosa (`search.rs:620`). Cada «de», «el», «the» trae pasajes que sólo comparten eso (`verify.md:71`; `specs/project-docs` «Límites conocidos»).
 - **Los identificadores se parten distinto según cómo estén escritos** (premisa 2): el canal léxico no cruza `snake_case` con `camelCase`, que en un repo con Rust, Python y TypeScript es el caso normal.
 - **La regla de medición está sesgada.** Con el archivo que cita las preguntas en el corpus, 7 de 11 fallas tienen primero ese pasaje (`verify.md:198`). Toda mejora léxica empuja más hacia ese pasaje, porque comparte las palabras de la pregunta por construcción. Medir antes de arreglarlo puede mostrar una mejora falsa o esconder una real.
 - **La medición es chica.** 15 preguntas (`verify.md:190`): un acierto son 6,7 puntos de Hit@3, y 10 en el subconjunto de docs. Ningún umbral fino se sostiene sin el set más grande de eval-rigor.
@@ -56,7 +56,7 @@ El protocolo de memoria (22) empuja a los agentes a llamar `search_project` ante
 - `rag-eval --real --docs` y su golden set de 15 preguntas, con Hit@1/3/5 y MRR@10 separados por docs y código (`docs.rs:96-151`). Usa la misma `project_docs::search` que producción (`eval_api.rs:708`), así que mide la ruta real.
 - `check_corpus` (`docs.rs:76-84`): ya falla si un doc esperado falta; es el lugar para que también falle por un doc que cita la pregunta.
 - El patrón de barrido «recompilar con cada valor en un worktree descartable» usado para `RELEVANCE_RATIO` (`verify.md:169`).
-- `fts_tokens` y `identifier_tokens`/`is_identifier` (`search.rs:576`, `:699`, `:712`): extracción pura de identificadores, ya con tests.
+- `fts_tokens` y `identifier_tokens`/`is_identifier` (`search.rs:632`, `:763`, `:776`): extracción pura de identificadores, ya con tests.
 - `plan_refresh` (`mod.rs:104`) y `model_id` en la huella (`project_doc_file.model_id`, `V12:10-18`): un cambio de la cadena reindexa todo sin código extra (`another_model_reindexes_every_doc`, `mod.rs:726`). Es el mecanismo para cualquier cambio de contrato del índice de docs.
 - El índice de docs se deriva del disco y se puede reconstruir (`specs/project-docs`, «Invariantes»): ningún paso toca memorias.
 - `chunk_code` y `header` ya producen etiquetas por contenedor (`code.rs:63`, `:181`).
@@ -85,8 +85,8 @@ Una expresión propia del índice de docs, sin tocar `fts_match_expression`:
 - Los tokens más raros primero en lugar de los primeros 16. La rareza real necesita la frecuencia de documento del token: SQLite ofrece la tabla virtual `fts5vocab` para leerla, pero crearla es una tabla nueva (migración) o una consulta aparte por token. Sin eso, una heurística pura (identificadores primero, luego los más largos) es una aproximación sin costo.
 - Intentar con AND sobre los más raros y caer a OR si no hay resultados. Con preguntas largas, el AND sobre todo casi nunca coincide; sobre dos o tres tokens raros puede ser muy preciso.
 
-- Cada token una sola vez. `fts_match_expression` toma los primeros 16 por posición y no quita repetidos (`crates/clawg-core/src/memory/search.rs:563-564`), así que una palabra repetida en la pregunta ocupa varios lugares del tope y deja afuera otras.
-- Una ruta en la pregunta se busca como frase. `crates/clawg-core/src/memory/search.rs` se parte en siete palabras comunes (`fts_tokens`, `search.rs:573`) que, unidas con OR, coinciden con cualquier pasaje que diga «memory» o «src». Como frase FTS5 (`"crates clawg core src memory search rs"`), coincide con el breadcrumb del archivo, que empieza por su ruta y encabeza el texto que va a `project_doc_fts` (`indexed_text`, `crates/clawg-core/src/memory/project_docs/chunk.rs:28-30`). Es la pregunta típica de «qué hace este archivo».
+- Cada token una sola vez. `fts_match_expression` toma los primeros 16 por posición y no quita repetidos (`crates/clawg-core/src/memory/search.rs:619-620`), así que una palabra repetida en la pregunta ocupa varios lugares del tope y deja afuera otras.
+- Una ruta en la pregunta se busca como frase. `crates/clawg-core/src/memory/search.rs` se parte en siete palabras comunes (`fts_tokens`, `search.rs:629`) que, unidas con OR, coinciden con cualquier pasaje que diga «memory» o «src». Como frase FTS5 (`"crates clawg core src memory search rs"`), coincide con el breadcrumb del archivo, que empieza por su ruta y encabeza el texto que va a `project_doc_fts` (`indexed_text`, `crates/clawg-core/src/memory/project_docs/chunk.rs:28-30`). Es la pregunta típica de «qué hace este archivo».
 
 Piezas separables (se miden por separado): (2a) palabras vacías y cortos, (2b) orden por rareza, (2c) AND con respaldo OR, (2d) tokens repetidos, (2e) rutas como frase.
 
@@ -133,7 +133,11 @@ Un modelo pequeño que reordene los 20 primeros con un presupuesto de latencia (
 
 El verify midió e5-base int8 con mean y léxico filtrado: Hit@3 0,40 al doble del costo; e5-large int8 sólo vectores: Hit@3 0,40 con 745 s para embeber (`verify.md:67-68`). Es el mismo 0,40 que da el modelo actual con el léxico arreglado, a más costo. Cambiar de modelo es un cambio del contrato de embedding que alcanza a las memorias (17, model-reembed) y no tiene urgencia (`openspec/README.md`, fila 17). No hay ninguna medición en este repo de un modelo orientado a código.
 
-**Recomendación:** 1, 2 y 3 en ese orden, cada uno con su medición. El 4 se **prueba** en un worktree y se productiviza sólo si gana por un margen pre-comprometido. El 5 queda condicionado a lo que dejen los anteriores. 6 y 7 fuera.
+### 8. Un piso de relevancia para lo que se muestra
+
+`fuse` (`mod.rs:247-258`) devuelve siempre `limit` pasajes, aunque la pregunta no tenga nada que ver con el proyecto, y la `score` que ve el modelo es la suma de recíprocos de RRF (`mod.rs:251`), que con `RRF_K` = 60 (`mod.rs:42`) es como mucho 2/61 (unos 0,033) y no dice nada en términos absolutos. La búsqueda de memorias sí se abstiene: corta por `RELEVANCE_RATIO` y no muestra un hit de puntaje 0 (`openspec/specs/retrieval/spec.md`; `openspec/changes/archive/2026-10-18-search-abstention/`), pero ese corte no se aplica a `search_project`. Hay dos formas baratas: llevar en cada hit el coseno del canal denso y no mostrar lo que queda bajo el `cosine_floor` de las memorias, o exigir que un pasaje de rango bajo aparezca en los dos canales. Cualquiera de las dos cambia lo que ve el modelo, así que se mide con preguntas sin respuesta en el set de docs (hoy no tiene ninguna) y no mueve Hit@3 en las que sí la tienen.
+
+**Recomendación:** 1, 2 y 3 en ese orden, cada uno con su medición. El 4 se **prueba** en un worktree y se productiviza sólo si gana por un margen pre-comprometido. El 5 queda condicionado a lo que dejen los anteriores. 6 y 7 fuera. El 8 va después de 2, porque el canal léxico filtrado cambia qué pasajes aparecen en los dos canales, y necesita preguntas sin respuesta en el golden set de docs.
 
 ## Contrato del índice de docs
 
@@ -145,7 +149,7 @@ Reglas de `config.yaml` que aplican: un cambio del contrato de embedding lleva u
 
 | Opción | Razón técnica |
 |---|---|
-| Cambiar `fts_match_expression` para todos | Cambia el canal léxico de las memorias, que tiene su ancla (`search.rs:660`). Se acota a docs o se mide con `--diff` en las dos; ver «Interacciones». |
+| Cambiar `fts_match_expression` para todos | Cambia el canal léxico de las memorias, que tiene su ancla (`search.rs:716`). Se acota a docs o se mide con `--diff` en las dos; ver «Interacciones». |
 | Subir `MAX_LEXICAL_TOKENS` sin más | Más tokens por posición agregan más palabras vacías al OR. El problema es cuáles, no cuántas. |
 | Cambiar `RRF_K` o `CANDIDATES_PER_CHANNEL` | No hay evidencia de que la fusión sea la causa: con 10 preguntas de docs nada distingue un cambio de pesos de un azar. Se reabre con el set de eval-rigor. |
 | Mover `E5_PASSAGE_PREFIX` globalmente | Cambia el contrato de las memorias y la ancla (R@5 0,6522) por una medición que sólo existe en docs. Es de 21. |
@@ -169,6 +173,7 @@ Reglas de `config.yaml` que aplican: un cambio del contrato de embedding lleva u
 4. `docs_contract` y el test de reindexado con una huella vieja.
 5. (Condicional) rol o prefijo propio del índice de docs, si el experimento del paso 4 gana.
 6. Actualizar `specs/project-docs` (búsqueda y límites conocidos, que hoy dicen que filtrar las vacías «no cambia este contrato») y `specs/eval`, y reportar las mediciones antes y después.
+7. (Condicional) el piso de relevancia del paso 8, con preguntas sin respuesta en el golden set de docs.
 
 ### No-alcance
 
@@ -192,6 +197,7 @@ Son del usuario.
 - [ ] **Prefijo de docs.** ¿Se prueba en un worktree y se productiviza sólo si gana por un margen fijado de antemano, o se descarta el paso?
 - [ ] **Listas de palabras vacías.** ¿Quién las mantiene y dónde viven? Una constante en `project_docs` es lo más simple.
 - [ ] **Reranker.** ¿Descartado en este cambio y reabierto sólo con una medición que cumpla la latencia?
+- [ ] **Piso de relevancia.** ¿Coseno del canal denso contra el mismo `cosine_floor` de las memorias (un número calibrado sobre otro corpus), presencia en los dos canales para los rangos bajos, o ninguno hasta tener preguntas sin respuesta en el set de docs?
 
 ## Cómo se mide
 

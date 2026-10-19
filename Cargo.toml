@@ -3,12 +3,12 @@ resolver = "2"
 members = ["crates/clawg-cli", "crates/clawg-core", "crates/clawg-eval"]
 
 [workspace.package]
-version = "0.27.2"
+version = "0.34.0"
 authors = ["The Claw Garden contributors"]
 license = "MIT"
 repository = "https://github.com/MarcossIC/claw-garden"
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.90"
 
 # Dependencies shared by workspace members.
 [workspace.dependencies]

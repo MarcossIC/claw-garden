@@ -1,5 +1,5 @@
-change: secret-coverage
-objective: "1"
+change: embedder-footprint
+objective: "transversal"
 depends_on: []
 phase: explore
 artifacts:

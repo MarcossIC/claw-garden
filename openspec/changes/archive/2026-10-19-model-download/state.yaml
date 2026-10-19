@@ -1,0 +1,15 @@
+change: model-download
+objective: "transversal"
+depends_on: []
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # Linux, Windows, the CI on both, and the manual check with the real model in test homes; no CRITICAL
+  archive: done
+updated: 2026-10-19
+main_spec: openspec/specs/storage/spec.md

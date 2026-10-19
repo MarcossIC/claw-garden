@@ -11,7 +11,7 @@
 //! contract check as injected closures ([`EnsureModelFn`], [`LoadEmbedderFn`],
 //! [`ContractVerifyFn`]) so the whole lifecycle — early exit, happy path,
 //! download failure, contract mismatch, and the progress-forwarder pipeline —
-//! is assertable in-process. [`production_deps`] builds the real three.
+//! is assertable in-process. [`production_deps`] builds the real ones.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -26,7 +26,8 @@ use crate::memory::embedder::{E5Embedder, Embedder, E5_MODEL_ID, LEGACY_CLS_MODE
 use crate::memory::idle_embedder::{IdleEmbedder, ReloadFn};
 use crate::memory::maintenance::{reembed_all, ReInferPlan, ReembedMode};
 use crate::memory::model_download::{
-    ensure_model, parse_verified_tokenizer, DownloadProgress, TokenizerFiles,
+    ensure_model, load_cached_model, parse_verified_tokenizer, DownloadError, DownloadProgress, ModelFiles,
+    TokenizerFiles,
 };
 use crate::memory::MemoryStore;
 use crate::models::chat::StreamEvent;
@@ -202,6 +203,14 @@ pub type EnsureModelFn = Arc<
         + Sync,
 >;
 
+/// Type alias for the injectable read of the model from its cache alone, with
+/// no download: what a reload of the idle model goes through.
+pub type CachedModelFn = Arc<
+    dyn Fn(std::path::PathBuf) -> futures::future::BoxFuture<'static, Result<ModelFiles, DownloadError>>
+        + Send
+        + Sync,
+>;
+
 /// Type alias for the injectable model-load seam (replaces
 /// [`E5Embedder::from_parts`] in tests).
 pub type LoadEmbedderFn = Arc<
@@ -256,11 +265,19 @@ fn contract_verifier(store: Arc<MemoryStore>, backups: std::path::PathBuf) -> Co
     })
 }
 
-/// The three real dependencies [`run_embedder_bootstrap`] runs against in
-/// production: the HTTP download, the ONNX load, and the store's contract
-/// check.
+/// What a host bootstraps the embedder with: the download (`ensure`), the
+/// read of the cache alone (`cached`), the model load and the contract check.
+pub struct EmbedderDeps {
+    pub ensure: EnsureModelFn,
+    pub cached: CachedModelFn,
+    pub load: LoadEmbedderFn,
+    pub verify: ContractVerifyFn,
+}
+
+/// The real [`EmbedderDeps`]: the HTTP download, the cache read, the ONNX
+/// load, and the store's contract check.
 ///
-/// Exposed as one function because the trio is a unit — every host needs all
+/// Exposed as one function because they are a unit — every host needs all
 /// three, and the host-specific ingredients are the open [`MemoryStore`] the
 /// verifier closes over and the cell holding the process's tokenizer, which
 /// the load shares with whoever else needs it. Keeping the closures here
@@ -273,16 +290,17 @@ pub fn production_deps(
     store: Arc<MemoryStore>,
     backups: std::path::PathBuf,
     tokenizer: Arc<OnceCell<Arc<tokenizers::Tokenizer>>>,
-) -> (EnsureModelFn, LoadEmbedderFn, ContractVerifyFn) {
+) -> EmbedderDeps {
     let ensure: EnsureModelFn = Arc::new(|base_dir, progress| {
         Box::pin(async move { ensure_model(&base_dir, progress).await })
     });
+    let cached: CachedModelFn = Arc::new(|base_dir| Box::pin(async move { load_cached_model(&base_dir).await }));
     let load = model_loader(tokenizer, parse_verified_tokenizer, |onnx, tokenizer, files| {
         E5Embedder::from_parts(onnx, tokenizer, files)
             .map(|embedder| Arc::new(embedder) as Arc<dyn Embedder>)
             .map_err(|e| e.to_string())
     });
-    (ensure, load, contract_verifier(store, backups))
+    EmbedderDeps { ensure, cached, load, verify: contract_verifier(store, backups) }
 }
 
 /// Env var that, in a build with the `testing` feature, replaces the model
@@ -317,13 +335,10 @@ impl TestEmbedder {
         }
     }
 
-    /// The bootstrap trio for this stand-in. The contract check is the real
-    /// one, so a test store records and verifies the fake model's identity.
-    pub fn deps(
-        self,
-        store: Arc<MemoryStore>,
-        backups: std::path::PathBuf,
-    ) -> (EnsureModelFn, LoadEmbedderFn, ContractVerifyFn) {
+    /// The bootstrap dependencies for this stand-in, whose cache is whatever
+    /// its download gives. The contract check is the real one, so a test
+    /// store records and verifies the fake model's identity.
+    pub fn deps(self, store: Arc<MemoryStore>, backups: std::path::PathBuf) -> EmbedderDeps {
         let verify = contract_verifier(store, backups);
         let ensure: EnsureModelFn = match self {
             Self::Fake => Arc::new(|_base_dir, _progress| {
@@ -344,7 +359,11 @@ impl TestEmbedder {
         let load: LoadEmbedderFn = Arc::new(|_files| {
             Ok(Arc::new(crate::memory::embedder::FakeEmbedder::default()) as Arc<dyn Embedder>)
         });
-        (ensure, load, verify)
+        let cached: CachedModelFn = {
+            let ensure = ensure.clone();
+            Arc::new(move |base_dir| ensure(base_dir, None))
+        };
+        EmbedderDeps { ensure, cached, load, verify }
     }
 }
 
@@ -355,7 +374,7 @@ pub fn serve_deps(
     store: Arc<MemoryStore>,
     backups: std::path::PathBuf,
     tokenizer: Arc<OnceCell<Arc<tokenizers::Tokenizer>>>,
-) -> Result<(EnsureModelFn, LoadEmbedderFn, ContractVerifyFn), String> {
+) -> Result<EmbedderDeps, String> {
     let raw = std::env::var(TEST_EMBEDDER_VAR).ok();
     Ok(match TestEmbedder::parse(raw.as_deref())? {
         Some(stand_in) => stand_in.deps(store, backups),
@@ -369,29 +388,45 @@ pub fn serve_deps(
     store: Arc<MemoryStore>,
     backups: std::path::PathBuf,
     tokenizer: Arc<OnceCell<Arc<tokenizers::Tokenizer>>>,
-) -> Result<(EnsureModelFn, LoadEmbedderFn, ContractVerifyFn), String> {
+) -> Result<EmbedderDeps, String> {
     Ok(production_deps(store, backups, tokenizer))
 }
 
 /// `load`, with every embedder it builds wrapped in an [`IdleEmbedder`] that
-/// lets the model go after `idle` without use. A reload goes through `ensure`
-/// and `load` again, so it reads and checks the same files the bootstrap did;
-/// the contract is not checked again, because the reload refuses a model with
-/// another identity. The sweeper runs on `runtime`.
+/// lets the model go after `idle` without use, or never with `None`. A reload
+/// goes through `cached` and `load` again, so it reads and checks the same
+/// files the bootstrap did; the contract is not checked again, because the
+/// reload refuses a model with another identity. The sweeper runs on
+/// `runtime`.
+///
+/// A reload never downloads: it runs under the lock every call that needs a
+/// vector waits on. When the cache no longer verifies, the reload answers at
+/// once and `ensure` downloads the files again on `runtime`, one repair at a
+/// time; the next call after it loads them.
 pub fn unloading_when_idle(
+    cached: CachedModelFn,
     ensure: EnsureModelFn,
     load: LoadEmbedderFn,
     base_dir: std::path::PathBuf,
-    idle: Duration,
+    idle: Option<Duration>,
     runtime: tokio::runtime::Handle,
 ) -> LoadEmbedderFn {
+    let repairing = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let reload: ReloadFn = {
         let load = load.clone();
+        let runtime = runtime.clone();
         Arc::new(move || {
-            let (ensure, load, base_dir) = (ensure.clone(), load.clone(), base_dir.clone());
+            let (cached, load, base_dir) = (cached.clone(), load.clone(), base_dir.clone());
+            let (ensure, repairing, runtime) = (ensure.clone(), repairing.clone(), runtime.clone());
             Box::pin(async move {
                 let started = std::time::Instant::now();
-                let files = ensure(base_dir, None).await.map_err(|e| e.to_string())?;
+                let files = match cached(base_dir.clone()).await {
+                    Ok(files) => files,
+                    Err(e) => {
+                        repair_in_background(&runtime, ensure, base_dir, repairing);
+                        return Err(format!("{e}; the model is being downloaded again in the background"));
+                    }
+                };
                 let read = started.elapsed();
                 let model = tokio::task::spawn_blocking(move || load(files))
                     .await
@@ -409,6 +444,35 @@ pub fn unloading_when_idle(
         let loaded = load(files)?;
         Ok(Arc::new(IdleEmbedder::new(loaded, reload.clone(), idle, &runtime)) as Arc<dyn Embedder>)
     })
+}
+
+/// Starts `ensure` on `runtime` unless a repair is already running.
+fn repair_in_background(
+    runtime: &tokio::runtime::Handle,
+    ensure: EnsureModelFn,
+    base_dir: std::path::PathBuf,
+    repairing: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+    /// Clears the mark however the repair ends, a panic included, or no
+    /// repair would ever start again.
+    struct Running(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Running {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    if repairing.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let running = Running(repairing);
+    runtime.spawn(async move {
+        let _running = running;
+        match ensure(base_dir, None).await {
+            Ok(_) => log::info!("the model files were downloaded again; the next call loads them"),
+            Err(e) => log::warn!("could not download the model files again: {e}"),
+        }
+    });
 }
 
 /// Whether `stored` describes the vectors this same model made before it
@@ -840,11 +904,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn an_idle_unloading_embedder_reloads_through_the_same_files_and_load() {
-        let (ensure_calls, load_calls) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-        let ensure: EnsureModelFn = {
-            let calls = ensure_calls.clone();
-            Arc::new(move |_base, progress| {
-                assert!(progress.is_none(), "a reload reports no download progress");
+        let (cached_calls, load_calls) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let cached: CachedModelFn = {
+            let calls = cached_calls.clone();
+            Arc::new(move |_base| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async { Ok(empty_model_files()) })
             })
@@ -857,22 +920,151 @@ mod tests {
             })
         };
         let wrapped = unloading_when_idle(
-            ensure,
+            cached,
+            never_download(),
             load,
             std::path::PathBuf::from("unused"),
-            Duration::from_secs(600),
+            Some(Duration::from_secs(600)),
             tokio::runtime::Handle::current(),
         );
 
         let embedder = wrapped(empty_model_files()).expect("first load");
         assert!(embedder.resident());
-        assert_eq!((ensure_calls.load(Ordering::SeqCst), load_calls.load(Ordering::SeqCst)), (0, 1));
+        assert_eq!((cached_calls.load(Ordering::SeqCst), load_calls.load(Ordering::SeqCst)), (0, 1));
 
         tokio::time::sleep(Duration::from_secs(1200)).await;
         assert!(!embedder.resident());
         embedder.embed_with_role("again", crate::memory::embedder::EmbedRole::Query).await.expect("reload");
         assert!(embedder.resident());
-        assert_eq!((ensure_calls.load(Ordering::SeqCst), load_calls.load(Ordering::SeqCst)), (1, 2));
+        assert_eq!((cached_calls.load(Ordering::SeqCst), load_calls.load(Ordering::SeqCst)), (1, 2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_an_idle_time_the_loaded_model_is_still_wrapped() {
+        struct Dead;
+        #[async_trait::async_trait]
+        impl Embedder for Dead {
+            async fn embed_with_role(
+                &self,
+                _: &str,
+                _: crate::memory::embedder::EmbedRole,
+            ) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+                Err(crate::memory::embedder::EmbedError::WorkerGone)
+            }
+            fn dimensions(&self) -> usize {
+                384
+            }
+            fn model_id(&self) -> &str {
+                "fake-embedder"
+            }
+            fn query_prefix(&self) -> &str {
+                ""
+            }
+            fn passage_prefix(&self) -> &str {
+                ""
+            }
+        }
+        let loads = Arc::new(AtomicUsize::new(0));
+        let load: LoadEmbedderFn = {
+            let loads = loads.clone();
+            Arc::new(move |_files| {
+                if loads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(Arc::new(Dead) as Arc<dyn Embedder>)
+                } else {
+                    Ok(Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>)
+                }
+            })
+        };
+        let cached: CachedModelFn = Arc::new(|_base| Box::pin(async { Ok(empty_model_files()) }));
+        let wrapped = unloading_when_idle(
+            cached,
+            never_download(),
+            load,
+            std::path::PathBuf::from("unused"),
+            None,
+            tokio::runtime::Handle::current(),
+        );
+
+        let embedder = wrapped(empty_model_files()).expect("first load");
+        tokio::time::sleep(Duration::from_secs(24 * 3600)).await;
+        assert!(embedder.resident(), "never let go");
+        embedder.embed_with_role("a text", crate::memory::embedder::EmbedRole::Query).await.expect("recovered");
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+    }
+
+    /// A download a test does not expect: the reload of a good cache never
+    /// reaches the network.
+    fn never_download() -> EnsureModelFn {
+        Arc::new(|_base, _progress| panic!("a reload of a good cache downloaded"))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reload_with_a_damaged_cache_is_not_ready_and_repairs_it_once_in_the_background() {
+        let repaired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let downloads = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let cached: CachedModelFn = {
+            let repaired = repaired.clone();
+            Arc::new(move |_base| {
+                let repaired = repaired.load(Ordering::SeqCst);
+                Box::pin(async move {
+                    if repaired {
+                        Ok(empty_model_files())
+                    } else {
+                        Err(DownloadError::NotCached { files: vec!["tokenizer_config.json".into()] })
+                    }
+                })
+            })
+        };
+        let ensure: EnsureModelFn = {
+            let (repaired, downloads, gate) = (repaired.clone(), downloads.clone(), gate.clone());
+            Arc::new(move |_base, progress| {
+                assert!(progress.is_none(), "a repair reports no download progress");
+                downloads.fetch_add(1, Ordering::SeqCst);
+                let (repaired, gate) = (repaired.clone(), gate.clone());
+                Box::pin(async move {
+                    gate.notified().await;
+                    repaired.store(true, Ordering::SeqCst);
+                    Ok(empty_model_files())
+                })
+            })
+        };
+        let load: LoadEmbedderFn = Arc::new(|_files| Ok(Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>));
+        let wrapped = unloading_when_idle(
+            cached,
+            ensure,
+            load,
+            std::path::PathBuf::from("unused"),
+            Some(Duration::from_secs(600)),
+            tokio::runtime::Handle::current(),
+        );
+        let embedder = wrapped(empty_model_files()).expect("first load");
+        tokio::time::sleep(Duration::from_secs(1200)).await;
+        assert!(!embedder.resident());
+
+        for _ in 0..2 {
+            let answer = tokio::time::timeout(
+                Duration::from_secs(1),
+                embedder.embed_with_role("a text", crate::memory::embedder::EmbedRole::Query),
+            )
+            .await
+            .expect("the call answered without waiting for the download");
+            assert!(matches!(answer, Err(crate::memory::embedder::EmbedError::NotReady)), "{answer:?}");
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(downloads.load(Ordering::SeqCst), 1, "one repair at a time");
+
+        gate.notify_one();
+        while !repaired.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        embedder
+            .embed_with_role("a text", crate::memory::embedder::EmbedRole::Query)
+            .await
+            .expect("the repaired cache loads");
+        assert!(embedder.resident());
+        assert_eq!(downloads.load(Ordering::SeqCst), 1);
     }
 
     fn tiny_tokenizer() -> tokenizers::Tokenizer {
@@ -952,13 +1144,14 @@ mod tests {
         let cell: Arc<OnceCell<Arc<tokenizers::Tokenizer>>> = Arc::new(OnceCell::new());
         let parses = Arc::new(AtomicUsize::new(0));
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let ensure: EnsureModelFn = Arc::new(|_base, _progress| Box::pin(async { Ok(empty_model_files()) }));
+        let cached: CachedModelFn = Arc::new(|_base| Box::pin(async { Ok(empty_model_files()) }));
         let load = model_loader(cell.clone(), counting_parse(parses.clone()), recording_build(seen.clone()));
         let wrapped = unloading_when_idle(
-            ensure,
+            cached,
+            never_download(),
             load,
             std::path::PathBuf::from("unused"),
-            Duration::from_secs(600),
+            Some(Duration::from_secs(600)),
             tokio::runtime::Handle::current(),
         );
 
@@ -1198,7 +1391,9 @@ mod tests {
             Box::pin(async move {
                 Err(DownloadError::RetryExhausted {
                     file: "onnx/model.onnx".into(),
+                    host: "huggingface.co".into(),
                     attempts: 3,
+                    cause: "HTTP 503 Service Unavailable".into(),
                 })
             })
         });
@@ -1432,12 +1627,12 @@ mod tests {
 
     // ---------- production_deps ----------
 
-    /// The trio must be buildable from nothing but an open store — the daemon
+    /// The dependencies must be buildable from nothing but an open store — the daemon
     /// has no other context to offer.
     #[tokio::test]
     async fn production_deps_builds_all_three_closures_from_a_store() {
         let store = Arc::new(MemoryStore::new_for_test().await.expect("test store"));
-        let (_ensure, load, verify) =
+        let EmbedderDeps { load, verify, .. } =
             production_deps(store, std::env::temp_dir(), Arc::new(OnceCell::new()));
 
         // `load` is pure: hand it empty model bytes and it must report a
@@ -1470,12 +1665,16 @@ mod tests {
     #[tokio::test]
     async fn the_fake_test_embedder_loads_at_once_and_records_its_contract() {
         let store = Arc::new(MemoryStore::new_for_test().await.expect("test store"));
-        let (ensure, load, verify) = TestEmbedder::Fake.deps(store, std::env::temp_dir());
+        let EmbedderDeps { ensure, cached, load, verify } = TestEmbedder::Fake.deps(store, std::env::temp_dir());
 
         let files = tokio::time::timeout(Duration::from_secs(1), ensure(std::env::temp_dir(), None))
             .await
             .expect("no download")
             .expect("files");
+        tokio::time::timeout(Duration::from_secs(1), cached(std::env::temp_dir()))
+            .await
+            .expect("no download")
+            .expect("the same files from the cache");
         let embedder = load(files).expect("the fake loads");
         assert_eq!(embedder.model_id(), "fake-embedder");
         let status = verify(embedder).await.expect("the real contract check");
@@ -1485,7 +1684,7 @@ mod tests {
     #[tokio::test]
     async fn the_stalled_test_embedder_never_finishes_the_download() {
         let store = Arc::new(MemoryStore::new_for_test().await.expect("test store"));
-        let (ensure, _load, _verify) = TestEmbedder::Stalled.deps(store, std::env::temp_dir());
+        let EmbedderDeps { ensure, .. } = TestEmbedder::Stalled.deps(store, std::env::temp_dir());
 
         let waited = tokio::time::timeout(Duration::from_millis(200), ensure(std::env::temp_dir(), None)).await;
         assert!(waited.is_err(), "the download must still be running");
@@ -1517,7 +1716,12 @@ mod tests {
     fn refused_download() -> EnsureModelFn {
         Arc::new(|_base, _progress| {
             Box::pin(async move {
-                Err(DownloadError::RetryExhausted { file: "connection refused".into(), attempts: 3 })
+                Err(DownloadError::RetryExhausted {
+                    file: "onnx/model.onnx".into(),
+                    host: "huggingface.co".into(),
+                    attempts: 3,
+                    cause: "connection refused".into(),
+                })
             })
         })
     }
@@ -1653,7 +1857,12 @@ mod tests {
             let n = counted.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 if n == 0 {
-                    Err(DownloadError::RetryExhausted { file: "connection refused".into(), attempts: 3 })
+                    Err(DownloadError::RetryExhausted {
+                        file: "onnx/model.onnx".into(),
+                        host: "huggingface.co".into(),
+                        attempts: 3,
+                        cause: "connection refused".into(),
+                    })
                 } else {
                     Ok(empty_model_files())
                 }

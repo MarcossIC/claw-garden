@@ -15,6 +15,7 @@ use crate::memory::clock::TimestampMs;
 use crate::memory::error::MemoryError;
 use crate::memory::events::MemoryEvent;
 use crate::memory::pieces::{link_in, StoredPiece};
+use crate::memory::redact::redact;
 use crate::memory::topic::{revise_in, Replaced, Revision};
 use crate::memory::MemoryStore;
 
@@ -160,6 +161,51 @@ pub struct OutboxProblem {
     pub state: OutboxState,
     pub attempts: i64,
     pub error: String,
+    /// The memories the save inserted before it stopped: what discarding it
+    /// deletes. A daemon that predates the field sends none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pieces: Vec<i64>,
+}
+
+/// The ids a save inserted, by its progress. One that does not parse names
+/// none.
+fn inserted_pieces(progress: &str) -> Vec<i64> {
+    serde_json::from_str::<Vec<NotedPiece>>(progress)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p.inserted)
+        .map(|p| p.id)
+        .collect()
+}
+
+/// A row given up as failed, found by its operation id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FailedRow {
+    pub row: i64,
+    pub agent_id: String,
+    pub progress: Vec<NotedPiece>,
+}
+
+impl FailedRow {
+    /// The memories the save inserted before it stopped.
+    pub fn inserted(&self) -> Vec<i64> {
+        self.progress.iter().filter(|p| p.inserted).map(|p| p.id).collect()
+    }
+}
+
+/// Why a failed save could not be retried or discarded.
+#[derive(Debug, thiserror::Error)]
+pub enum OutboxActionError {
+    #[error("no save waits under operation {0}")]
+    NotFound(String),
+    #[error("operation {0} is still pending: the daemon is storing it")]
+    NotFailed(String),
+    #[error("operation {operation_id} belongs to more than one agent ({}); name the agent", agents.join(", "))]
+    Ambiguous { operation_id: String, agents: Vec<String> },
+    #[error("the saved event of operation {0} does not parse, so it cannot be tried again; discard it instead")]
+    Unreadable(String),
+    #[error(transparent)]
+    Store(#[from] MemoryError),
 }
 
 fn backend(context: &'static str) -> impl Fn(tokio_rusqlite::Error) -> MemoryError {
@@ -299,6 +345,9 @@ impl MemoryStore {
     /// Notes why `row` stopped. See [`after_failure`].
     pub(crate) async fn outbox_fail(&self, row: i64, error: String, transient: bool) -> Result<(), MemoryError> {
         let now = TimestampMs::now();
+        // The cause is a library's error text and reaches `/health`; nothing
+        // stops one from quoting its input.
+        let error = redact(&error).text;
         self.conn
             .call(move |c| -> rusqlite::Result<()> {
                 let tx = c.transaction()?;
@@ -315,6 +364,86 @@ impl MemoryStore {
             })
             .await
             .map_err(backend("outbox_fail"))
+    }
+
+    /// Hands back the attempt taking `row` spent, keeping its cause: a save a
+    /// shutdown paused between pieces did nothing wrong.
+    pub(crate) async fn outbox_pause(&self, row: i64) -> Result<(), MemoryError> {
+        self.conn
+            .call(move |c| {
+                c.execute("UPDATE ingest_outbox SET attempts = MAX(attempts - 1, 0) WHERE id = ?1", [row]).map(|_| ())
+            })
+            .await
+            .map_err(backend("outbox_pause"))
+    }
+
+    /// The failed row of `operation_id`, of `agent` or of the only agent
+    /// holding that id.
+    pub(crate) async fn outbox_find_failed(&self, operation_id: &str, agent: Option<&str>) -> Result<FailedRow, OutboxActionError> {
+        let (op, agent) = (operation_id.to_string(), agent.map(str::to_string));
+        let rows: Vec<(i64, String, String, String)> = self
+            .conn
+            .call(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT id, agent_id, state, progress FROM ingest_outbox \
+                     WHERE operation_id = ?1 AND (?2 IS NULL OR agent_id = ?2) ORDER BY agent_id",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![op, agent], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await
+            .map_err(backend("outbox_find_failed"))?;
+        match rows.as_slice() {
+            [] => Err(OutboxActionError::NotFound(operation_id.to_string())),
+            [(row, agent_id, state, progress)] => {
+                if OutboxState::parse(state) != OutboxState::Failed {
+                    return Err(OutboxActionError::NotFailed(operation_id.to_string()));
+                }
+                Ok(FailedRow {
+                    row: *row,
+                    agent_id: agent_id.clone(),
+                    progress: serde_json::from_str(progress).unwrap_or_default(),
+                })
+            }
+            many => Err(OutboxActionError::Ambiguous {
+                operation_id: operation_id.to_string(),
+                agents: many.iter().map(|(_, agent, _, _)| agent.clone()).collect(),
+            }),
+        }
+    }
+
+    /// Writes `row` again as a new pending row with its progress and no
+    /// attempt spent, and returns its id and event; `None`, changing nothing,
+    /// when the event no longer parses. A new id, because the worker knows the
+    /// rows its start-up read found by id, and would take the old one for a
+    /// second delivery of itself.
+    pub(crate) async fn outbox_requeue(&self, row: i64) -> Result<Option<(i64, MemoryEvent)>, MemoryError> {
+        let now = TimestampMs::now();
+        self.conn
+            .call(move |c| -> rusqlite::Result<Option<(i64, MemoryEvent)>> {
+                let tx = c.transaction()?;
+                let found: Option<(String, String, String, String, String, TimestampMs)> = tx
+                    .query_row(
+                        "SELECT operation_id, agent_id, content, event, progress, created_at FROM ingest_outbox WHERE id = ?1",
+                        [row],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                    )
+                    .optional()?;
+                let Some((operation_id, agent_id, content, event, progress, created_at)) = found else { return Ok(None) };
+                let Ok(mut parsed) = serde_json::from_str::<MemoryEvent>(&event) else { return Ok(None) };
+                parsed.content = content.clone();
+                tx.execute("DELETE FROM ingest_outbox WHERE id = ?1", [row])?;
+                tx.execute(
+                    "INSERT INTO ingest_outbox (operation_id, agent_id, content, event, progress, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![operation_id, agent_id, content, event, progress, created_at, now],
+                )?;
+                let again = tx.last_insert_rowid();
+                tx.commit()?;
+                Ok(Some((again, parsed)))
+            })
+            .await
+            .map_err(backend("outbox_requeue"))
     }
 
     /// Drops `row` once whoever saved it has been told how it ended.
@@ -376,7 +505,7 @@ impl MemoryStore {
                         Err(e) => {
                             tx.execute(
                                 "UPDATE ingest_outbox SET state = 'failed', last_error = ?2, updated_at = ?3 WHERE id = ?1",
-                                rusqlite::params![row, format!("the saved event does not parse: {e}"), now],
+                                rusqlite::params![row, redact(&format!("the saved event does not parse: {e}")).text, now],
                             )?;
                         }
                     }
@@ -401,7 +530,7 @@ impl MemoryStore {
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )?;
                 let mut stmt = c.prepare(
-                    "SELECT operation_id, agent_id, state, attempts, last_error FROM ingest_outbox \
+                    "SELECT operation_id, agent_id, state, attempts, last_error, progress FROM ingest_outbox \
                      WHERE last_error IS NOT NULL ORDER BY updated_at DESC, id DESC LIMIT ?1",
                 )?;
                 let problems = stmt
@@ -412,6 +541,7 @@ impl MemoryStore {
                             state: OutboxState::parse(&r.get::<_, String>(2)?),
                             attempts: r.get(3)?,
                             error: r.get(4)?,
+                            pieces: inserted_pieces(&r.get::<_, String>(5)?),
                         })
                     })?
                     .collect::<Result<_, _>>()?;
@@ -637,6 +767,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_pause_hands_back_its_attempt() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let row = new_row(&store, "op-1", "x").await;
+        store.outbox_claim(row).await.unwrap();
+        store.outbox_fail(row, "embed failed: NaN".into(), false).await.unwrap();
+
+        for _ in 0..MAX_ATTEMPTS {
+            assert!(matches!(store.outbox_claim(row).await.unwrap(), Claimed::Process { .. }));
+            store.outbox_pause(row).await.unwrap();
+        }
+
+        assert_eq!(
+            row_state(&store, row).await.unwrap(),
+            ("pending".into(), 1, Some("embed failed: NaN".into()), "[]".into()),
+            "a pause keeps the cause of the last failure"
+        );
+        assert!(matches!(store.outbox_claim(row).await.unwrap(), Claimed::Process { .. }));
+    }
+
+    #[tokio::test]
     async fn finishing_links_the_pieces_and_drops_the_row_together() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let row = new_row(&store, "op-1", "x").await;
@@ -688,6 +838,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failure_is_stored_masked() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let token: String = "a1B2".chars().cycle().take(36).collect();
+        let row = new_row(&store, "op-1", "x").await;
+        store.outbox_claim(row).await.unwrap();
+
+        store.outbox_fail(row, format!("embed failed: token ghp_{token}"), false).await.unwrap();
+
+        let error = row_state(&store, row).await.unwrap().2;
+        assert_eq!(error.as_deref(), Some("embed failed: token [REDACTED:github_token]"));
+
+        let row = new_row(&store, "op-2", "x").await;
+        let event = format!("{{\"importance\": \"ghp_{token}\"}}");
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE ingest_outbox SET event = ?2 WHERE id = ?1", rusqlite::params![row, event]))
+            .await
+            .unwrap();
+        store.outbox_pending().await.unwrap();
+        let error = row_state(&store, row).await.unwrap().2.unwrap();
+        assert!(error.starts_with("the saved event does not parse"), "{error}");
+        assert!(!error.contains(&token), "{error}");
+    }
+
+    #[tokio::test]
     async fn an_event_that_does_not_parse_is_given_up_with_its_cause() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let row = new_row(&store, "op-1", "x").await;
@@ -701,6 +876,71 @@ mod tests {
         let (state, _, error, _) = row_state(&store, row).await.unwrap();
         assert_eq!(state, "failed");
         assert!(error.unwrap().starts_with("the saved event does not parse"));
+    }
+
+    async fn fail_for_good(store: &MemoryStore, row: i64, progress: Vec<NotedPiece>) {
+        let progress = serde_json::to_string(&progress).unwrap();
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE ingest_outbox SET state = 'failed', attempts = 3, last_error = 'embed failed: NaN', \
+                     progress = ?2 WHERE id = ?1",
+                    rusqlite::params![row, progress],
+                )
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn retrying_a_failed_row_writes_it_again_under_a_new_id() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let row = new_row(&store, "op-1", "first line\nsecond line").await;
+        fail_for_good(&store, row, vec![noted(0, 10)]).await;
+
+        let failed = store.outbox_find_failed("op-1", None).await.unwrap();
+        assert_eq!((failed.row, failed.agent_id.as_str(), failed.progress.clone()), (row, "a", vec![noted(0, 10)]));
+        let (again, event) = store.outbox_requeue(row).await.unwrap().expect("the event parses");
+
+        assert!(again > row, "a new id: {again}");
+        assert_eq!(row_state(&store, row).await, None);
+        assert_eq!(
+            row_state(&store, again).await.unwrap(),
+            ("pending".into(), 0, None, serde_json::to_string(&vec![noted(0, 10)]).unwrap())
+        );
+        assert_eq!(event.content, "first line\nsecond line");
+        assert_eq!(store.outbox_pending().await.unwrap().into_iter().map(|(r, _)| r).collect::<Vec<_>>(), vec![again]);
+        assert_eq!(
+            store.outbox_record("op-1".into(), event).await.unwrap(),
+            Recorded::Existing { row: again, state: OutboxState::Pending, last_error: None },
+            "the operation id stays the save's"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_failed_row_is_retried_or_discarded() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        new_row(&store, "op-1", "x").await;
+
+        assert!(matches!(store.outbox_find_failed("op-1", None).await, Err(OutboxActionError::NotFailed(_))));
+        assert!(matches!(store.outbox_find_failed("op-9", None).await, Err(OutboxActionError::NotFound(_))));
+        assert!(matches!(store.outbox_find_failed("op-1", Some("b")).await, Err(OutboxActionError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn an_operation_id_two_agents_hold_is_ambiguous() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let a = new_row(&store, "op-1", "x").await;
+        let Recorded::New { row: b } = store.outbox_record("op-1".into(), event("b", "y")).await.unwrap() else {
+            panic!("a new row for another agent")
+        };
+        fail_for_good(&store, a, vec![]).await;
+        fail_for_good(&store, b, vec![]).await;
+
+        let err = store.outbox_find_failed("op-1", None).await.unwrap_err();
+        assert!(matches!(&err, OutboxActionError::Ambiguous { agents, .. } if agents == &["a", "b"]), "{err:?}");
+        assert_eq!(store.outbox_find_failed("op-1", Some("b")).await.unwrap().row, b);
     }
 
     #[tokio::test]
@@ -724,7 +964,13 @@ mod tests {
                 state: OutboxState::Pending,
                 attempts: 1,
                 error: "embed failed: NaN".into(),
+                pieces: vec![],
             }]
         );
+
+        let reinforced = NotedPiece { inserted: false, ..noted(1, 11) };
+        fail_for_good(&store, broken, vec![noted(0, 10), reinforced, noted(2, 12)]).await;
+        let summary = store.outbox_summary().await.unwrap();
+        assert_eq!(summary.problems[0].pieces, vec![10, 12], "the pieces the save inserted");
     }
 }

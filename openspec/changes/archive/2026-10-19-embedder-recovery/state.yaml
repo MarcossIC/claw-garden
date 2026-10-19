@@ -1,0 +1,15 @@
+change: embedder-recovery
+objective: "transversal"
+depends_on: []
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # Linux; the CI of the pull request covers Linux and Windows
+  archive: done
+updated: 2026-10-19
+main_spec: openspec/specs/storage/spec.md

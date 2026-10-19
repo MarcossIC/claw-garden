@@ -1,0 +1,48 @@
+name: Installer
+
+# install.ps1 ships in every release, signed with the binaries, and CI ignores
+# scripts/**, so this static analysis is its only automatic check. Running the
+# script on a clean Windows stays a manual step.
+on:
+  pull_request:
+    paths:
+      - 'scripts/**'
+      - '.github/workflows/installer.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/**'
+      - '.github/workflows/installer.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: analyze
+    runs-on: windows-2022
+    env:
+      # A fixed download, checked against its hash before anything loads it,
+      # instead of the module the runner image happens to carry.
+      PSSA_URL: https://github.com/PowerShell/PSScriptAnalyzer/releases/download/1.25.0/PSScriptAnalyzer.1.25.0.nupkg
+      PSSA_SHA256: 14e634c828eb98efb9f40b2918ba90f139ed5eccdf663a2a747736d996995d60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          $package = Join-Path $env:RUNNER_TEMP 'PSScriptAnalyzer.zip'
+          Invoke-WebRequest -Uri $env:PSSA_URL -OutFile $package
+          $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $package).Hash.ToLowerInvariant()
+          if ($actual -ne $env:PSSA_SHA256) { throw "PSScriptAnalyzer has sha256 $actual, expected $env:PSSA_SHA256" }
+          Expand-Archive -LiteralPath $package -DestinationPath (Join-Path $env:RUNNER_TEMP 'PSScriptAnalyzer')
+      - name: Analyze the scripts
+        shell: pwsh
+        run: |
+          Import-Module (Join-Path $env:RUNNER_TEMP 'PSScriptAnalyzer/PSScriptAnalyzer.psd1') -Force
+          "PSScriptAnalyzer $((Get-Module PSScriptAnalyzer).Version)"
+          $findings = @(Invoke-ScriptAnalyzer -Path scripts -Recurse -Settings scripts/PSScriptAnalyzerSettings.psd1)
+          $findings | Format-List RuleName, Severity, ScriptName, Line, Message
+          if ($findings.Count -gt 0) { throw "PSScriptAnalyzer reported $($findings.Count) finding(s)" }

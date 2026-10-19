@@ -5,14 +5,15 @@
 //! where it is testable without running this.
 //!
 //! Exit codes: `0` success, `1` a runtime failure (message on stderr), `2` a
-//! usage error (clap's own), except under `clawg hook`, where a usage error is
-//! `1`: a client reads `2` from a hook as "block".
+//! usage error (clap's own), except under `clawg hook` and for `clawg` alone,
+//! where a usage error is `1`: a client reads `2` from a hook as "block", and a
+//! client that ignores a hook's `args` runs the binary alone.
 
 #[cfg(windows)]
 use std::path::Path;
 use std::process::ExitCode;
 
-use clawg_cli::cli::{is_hook_invocation, sharing_profile, Cli, Command, PathAction, ProjectsAction, SetupClient};
+use clawg_cli::cli::{is_bare_invocation, is_hook_invocation, sharing_profile, Cli, Command, PathAction, ProjectsAction, SetupClient};
 use clawg_cli::client::{probe_running, ClientError, DaemonClient, Probe};
 use clawg_cli::daemon::lifecycle::{now_ms, read_state};
 use clawg_cli::daemon::serve;
@@ -20,6 +21,7 @@ use clawg_cli::doctor;
 use clawg_cli::hook;
 use clawg_cli::mcp;
 use clawg_cli::memories;
+use clawg_cli::outbox;
 use clawg_cli::projects;
 use clawg_cli::restore;
 use clawg_cli::secrets;
@@ -31,7 +33,7 @@ use clawg_cli::undelete;
 use clawg_cli::update;
 use clawg_core::memory::backup::{backup_offline, probe, restore};
 use clawg_core::memory::embedder::keep_one_malloc_arena;
-use clawg_core::memory::secrets::{purge, scan};
+use clawg_core::memory::secrets::{mask_reasons, purge, scan};
 use clawg_core::paths::data_dir;
 use clap::Parser;
 
@@ -41,10 +43,11 @@ const EXIT_FAILURE: u8 = 1;
 
 fn main() -> ExitCode {
     let hook = is_hook_invocation(std::env::args_os());
+    let bare = is_bare_invocation(std::env::args_os());
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         // A client reads 2 from a hook as "block the session or the prompt".
-        Err(e) if hook && e.use_stderr() => {
+        Err(e) if (hook || bare) && e.use_stderr() => {
             let _ = e.print();
             return ExitCode::from(EXIT_FAILURE);
         }
@@ -189,11 +192,20 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
 
-        Command::Secrets { profile } => {
+        Command::Secrets { mask_reasons: true, yes, profile } => {
+            secrets::confirm_mask_reasons(yes)?;
             let profile = profile.resolve().map_err(|e| e.to_string())?;
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
-            let flagged = scan(&base_dir).map_err(|e| e.to_string())?;
-            println!("{}", secrets::report(&flagged));
+            let masked = mask_reasons(&base_dir).map_err(|e| secrets::explain(e, "mask the reasons"))?;
+            println!("{}", secrets::mask_report(&masked));
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Secrets { mask_reasons: false, profile, .. } => {
+            let profile = profile.resolve().map_err(|e| e.to_string())?;
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let scanned = scan(&base_dir).map_err(|e| e.to_string())?;
+            println!("{}", secrets::report(&scanned));
             Ok(ExitCode::SUCCESS)
         }
 
@@ -201,7 +213,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             secrets::confirm(id, yes)?;
             let profile = profile.resolve().map_err(|e| e.to_string())?;
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
-            let purged = purge(&base_dir, id).map_err(secrets::explain)?;
+            let purged = purge(&base_dir, id).map_err(|e| secrets::explain(e, "purge"))?;
             println!("{}", secrets::purge_report(id, &purged));
             Ok(ExitCode::SUCCESS)
         }
@@ -217,6 +229,18 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
             };
             println!("{}", undelete::run(&client, id).await.map_err(unavailable)?);
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Outbox { action } => {
+            let profile = action.target().profile.resolve().map_err(|e| e.to_string())?;
+            let unavailable = |e: ClientError| memories::explain_unavailable(&e, profile);
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let client = match probe_running(&base_dir, false).await.map_err(unavailable)? {
+                Probe::Running(client) => client,
+                Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
+            };
+            println!("{}", outbox::run(&client, &action).await.map_err(unavailable)?);
             Ok(ExitCode::SUCCESS)
         }
 

@@ -92,18 +92,18 @@ El analizador de `SHA256SUMS` MUST rechazar una línea faltante para el asset, u
 
 ## S6. Sólo a pedido
 
-El daemon MUST NOT consultar nada por su cuenta. Sólo `clawg update` y `clawg update --check` MUST tocar la red. Las peticiones MUST mandar `User-Agent`. `--check` MUST NOT descargar el binario ni modificar nada, y sus códigos de salida MUST ser `0` si está al día, `100` si hay una versión nueva (que nombra en stdout) y `1` si hay un error o una negativa (S2). El `2` queda para los errores de uso de clap.
+El daemon MUST NOT consultar nada por su cuenta. Sólo `clawg update` y `clawg update --check` MUST tocar la red. Las peticiones MUST mandar `User-Agent`. Van sin token, así que la API de GitHub cuenta un límite por hora y por dirección: un 403 o un 429 con `x-ratelimit-remaining: 0` MUST informarse como ese límite agotado, con los minutos que faltan para `x-ratelimit-reset` si viene, y no sólo como el código de estado. `--check` MUST NOT descargar el binario ni modificar nada, y sus códigos de salida MUST ser `0` si está al día, `100` si hay una versión nueva (que nombra en stdout) y `1` si hay un error o una negativa (S2). El `2` queda para los errores de uso de clap.
 
 #### Escenario: `--check` con y sin versión nueva
 - GIVEN un servidor de release falso con claves de prueba
 - WHEN corre `clawg update --check` primero con una versión mayor, luego con la misma y luego con el servidor caído
 - THEN los códigos de salida son `100`, `0` y `1`, y el binario instalado no cambia
 
-**Test:** `update_check_reports_a_newer_version_and_an_up_to_date_one` en `crates/clawg-cli/tests/binary.rs`; que las peticiones llevan `User-Agent`, en un test del cliente contra el servidor falso.
+**Test:** `update_check_reports_a_newer_version_and_an_up_to_date_one` en `crates/clawg-cli/tests/binary.rs`; que las peticiones llevan `User-Agent`, en un test del cliente contra el servidor falso; el límite agotado, `a_refusal_with_no_requests_left_is_the_rate_limit` y `a_refusal_with_requests_left_or_another_status_is_only_a_status` (puros) y `the_rate_limit_is_read_from_the_answer` (contra un servidor falso).
 
 ## S7. Verificar antes de tocar
 
-Antes del intercambio `update` MUST: bajar el candidato junto al destino, verificar la firma de `SHA256SUMS` (S5), comprobar el sha256 del candidato contra esa lista y ejecutar su `--version` y comprobar que da la versión elegida. Si cualquiera falla, MUST dejar todo como estaba (binario instalado, daemon y datos), sin dejar el candidato. En Linux, sin permiso de escritura donde está el binario, MUST fallar antes de bajar nada con un mensaje claro, y MUST NOT usar `sudo`.
+Antes del intercambio `update` MUST: bajar el candidato junto al destino, verificar la firma de `SHA256SUMS` (S5), comprobar el sha256 del candidato contra esa lista y ejecutar su `--version` y comprobar que da la versión elegida. Un `--version` que no termina en 30 s MUST contar como falla, con el proceso terminado y esperado, para que `update` no quede colgado con `update.lock` tomado. Si cualquiera falla, MUST dejar todo como estaba (binario instalado, daemon y datos), sin dejar el candidato. En Linux, sin permiso de escritura donde está el binario, MUST fallar antes de bajar nada con un mensaje claro, y MUST NOT usar `sudo`.
 
 #### Escenario: hash que no coincide
 - GIVEN un candidato cuyo sha256 difiere del de `SHA256SUMS`
@@ -115,11 +115,11 @@ Antes del intercambio `update` MUST: bajar el candidato junto al destino, verifi
 - WHEN corre `update`
 - THEN falla antes de la primera petición de descarga, con un mensaje que lo dice
 
-**Test:** `a_hash_mismatch_never_touches_the_installed_binary` (plan, en proceso) y `a_failed_download_or_signature_leaves_everything_as_it_was` (plan); el permiso de Linux, `an_unwritable_install_dir_fails_before_downloading` (puro, sobre una función que decide con el resultado de un chequeo de escritura).
+**Test:** `a_hash_mismatch_never_touches_the_installed_binary` (plan, en proceso) y `a_failed_download_or_signature_leaves_everything_as_it_was` (plan); el permiso de Linux, `an_unwritable_install_dir_fails_before_downloading` (puro, sobre una función que decide con el resultado de un chequeo de escritura); el plazo del `--version`, `a_process_still_running_at_its_deadline_is_ended` y `a_process_that_ends_in_time_gives_its_output` (en `effects.rs`, con procesos del sistema).
 
 ## S8. Plan e intercambio
 
-El plan de `update` MUST ser una lista de pasos como datos, ejecutada aparte, de modo que el orden y la deshecha de cada falla se prueben sin disco ni red. Con daemon, el orden MUST ser: parar el daemon con el binario instalado (`stop_in`, `crates/clawg-cli/src/stop.rs:23`); renombrar el binario a `.old-*`; poner el candidato; arrancar el daemon nuevo por su ruta explícita (no por `ProcessSpawner`, que lanza `current_exe()`, `client.rs:1098-1100`); esperar `/health`. Sin daemon, `update` MUST NOT arrancar uno. Al empezar, MUST borrar los `.old-*` de corridas anteriores. Si un editor abre un puente entre la parada y el arranque, `update` MUST confirmar la versión del daemon que contesta e informarla. En Linux el binario instalado también se aparta a `.old-*` antes de poner el candidato: no se reemplaza en el lugar. Dos `update` a la vez MUST NOT intercambiar a la vez: un cerrojo exclusivo del sistema sobre `<data>/update.lock` hace que el segundo falle con un error claro.
+El plan de `update` MUST ser una lista de pasos como datos, ejecutada aparte, de modo que el orden y la deshecha de cada falla se prueben sin disco ni red. Con daemon, el orden MUST ser: parar el daemon con el binario instalado (`stop_in`, `crates/clawg-cli/src/stop.rs:23`); renombrar el binario a `.old-*`; poner el candidato; arrancar el daemon nuevo por su ruta explícita (no por `ProcessSpawner`, que lanza `current_exe()`, `client.rs:1152-1154`); esperar `/health`. Sin daemon, `update` MUST NOT arrancar uno. Al empezar, MUST borrar los `.old-*` de corridas anteriores. Si un editor abre un puente entre la parada y el arranque, `update` MUST confirmar la versión del daemon que contesta e informarla. En Linux el binario instalado también se aparta a `.old-*` antes de poner el candidato: no se reemplaza en el lugar. Dos `update` a la vez MUST NOT intercambiar a la vez: un cerrojo exclusivo del sistema sobre `<data>/update.lock` hace que el segundo falle con un error claro.
 
 #### Escenario: actualización completa con daemon
 - GIVEN un daemon corriendo y un servidor de release falso con una versión mayor
@@ -140,7 +140,7 @@ El plan de `update` MUST ser una lista de pasos como datos, ejecutada aparte, de
 
 ## S9. Vuelta atrás tras el intercambio
 
-Si el daemon nuevo no contesta `/health` con la versión nueva en el plazo, `update` MUST devolver el binario viejo a su nombre y volver a levantar su daemon; el plazo MUST distinguir «arrancando» (migración o re-embed largos) de «no arrancó». Si el daemon nuevo alcanzó a migrar el store y el binario viejo se niega a abrirlo (`MemoryError::SchemaNewer` o `SchemaDiverged`, `crates/clawg-core/src/memory/error.rs:53-64`), `update` MUST restaurar en el acto el snapshot `pre-migration` que escribió ese arranque, con `clawg_core::memory::backup::restore` llamado desde el propio proceso de `update` (el binario viejo), y después devolver el binario viejo y arrancar su daemon. `restore` guarda antes el store migrado como `pre-restore`, así que nada se destruye. Si el restore falla, `update` MUST dejar el binario nuevo, el único que abre ese store, y el informe MUST dar la causa del arranque, la del restore, dónde está cada archivo y los comandos para volver a mano (D2). Un candidato que no arranca y no migró MUST dejar el binario viejo y su daemon.
+Si el daemon nuevo no contesta `/health` con la versión nueva en el plazo, `update` MUST devolver el binario viejo a su nombre y volver a levantar su daemon; el plazo MUST distinguir «arrancando» (migración o re-embed largos) de «no arrancó». Si el daemon nuevo alcanzó a migrar el store y el binario viejo se niega a abrirlo (`MemoryError::SchemaNewer` o `SchemaDiverged`, `crates/clawg-core/src/memory/error.rs:53-64`), `update` MUST restaurar en el acto el snapshot `pre-migration` que escribió ese arranque, con `clawg_core::memory::backup::restore` llamado desde el propio proceso de `update` (el binario viejo), y después devolver el binario viejo y arrancar su daemon. `restore` guarda antes el store migrado como `pre-restore`, así que nada se destruye. Si el restore falla, `update` MUST dejar el binario nuevo, el único que abre ese store, y el informe MUST dar la causa del arranque, la del restore, qué daemon contesta al terminar (o que no queda ninguno y cómo arrancarlo), dónde está cada archivo y los comandos para volver a mano, el arranque del daemon incluido (D2). Un candidato que no arranca y no migró MUST dejar el binario viejo y su daemon.
 
 #### Escenario: el nuevo no arranca
 - GIVEN un candidato que no levanta el daemon
@@ -155,9 +155,9 @@ Si el daemon nuevo no contesta `/health` con la versión nueva en el plazo, `upd
 #### Escenario: el nuevo migró y el restore falla
 - GIVEN el mismo caso, pero el restore falla
 - WHEN `update` no puede devolver el store
-- THEN queda el binario nuevo, el store migrado intacto, y el informe da la causa del arranque, la del restore, las rutas del `.old-*`, del `pre-migration` y del `pre-restore`, y los comandos a mano
+- THEN queda el binario nuevo, el store migrado intacto, y el informe da la causa del arranque, la del restore, si contesta un daemon (su pid y su versión) o que no queda ninguno, las rutas del `.old-*`, del `pre-migration` y del `pre-restore`, y los comandos a mano, numerados, hasta volver a arrancar el daemon
 
-**Pruebas:** `a_new_binary_that_does_not_start_brings_the_old_one_and_its_daemon_back` y `a_new_binary_that_migrated_and_failed_gets_its_pre_migration_restored` en `binary.rs`; `each_failed_step_undoes_what_it_did` y `a_failed_restore_leaves_the_new_binary_and_explains_the_way_back` (plan); `restoring_over_a_store_migrated_by_a_newer_version_keeps_it_as_pre_restore` en `backup.rs` (D2).
+**Pruebas:** `a_new_binary_that_does_not_start_brings_the_old_one_and_its_daemon_back` y `a_new_binary_that_migrated_and_failed_gets_its_pre_migration_restored` en `binary.rs`; `each_failed_step_undoes_what_it_did` y `a_failed_restore_leaves_the_new_binary_and_explains_the_way_back` (plan); `a_failed_restore_explains_the_way_back` y `a_failed_restore_names_the_daemon_that_answers_and_numbers_only_the_steps_left` (informe, puros); `restoring_over_a_store_migrated_by_a_newer_version_keeps_it_as_pre_restore` en `backup.rs` (D2).
 
 ## S10. Garantías de datos
 

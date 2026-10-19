@@ -307,7 +307,7 @@ pub fn snapshot_into(
     dir: &Path,
     reason: Reason,
 ) -> Result<PathBuf, BackupError> {
-    std::fs::create_dir_all(dir)
+    crate::private_dir::ensure_private_dir(dir)
         .map_err(|source| BackupError::Dir { path: dir.to_path_buf(), source })?;
     let path = dir.join(snapshot_name(now_ms(), reason));
     let tmp = path.with_extension("db.tmp");
@@ -362,7 +362,7 @@ pub struct Restored {
 pub fn restore(base_dir: &Path, from: &Path) -> Result<Restored, MemoryError> {
     // A machine that never ran clawg has no data directory yet, and restoring
     // onto one is how a store moves to it.
-    std::fs::create_dir_all(base_dir)
+    crate::private_dir::ensure_private_dir(base_dir)
         .map_err(|source| BackupError::Dir { path: base_dir.to_path_buf(), source })?;
     let _lock = StoreLock::acquire(base_dir, StoreHolder::Maintenance)?;
     check_restorable(from)?;
@@ -430,12 +430,12 @@ fn swap_in(tmp: &Path, db: &Path) -> std::io::Result<()> {
 /// crash although the migration it guards was applied. NTFS journals the
 /// rename with the file system, and Windows cannot open a directory this way.
 #[cfg(unix)]
-fn sync_dir(dir: &Path) -> std::io::Result<()> {
+pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+pub fn sync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -846,6 +846,31 @@ mod tests {
 
         assert!(restored.previous.is_none());
         assert_eq!(contents(&base.join("memory.db")), vec!["seeded on disk".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restore_creates_a_private_data_directory() {
+        let source = tempfile::tempdir().unwrap();
+        seed_on_disk(source.path(), None).await;
+        let snapshot = backup_offline(source.path()).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let base = home.path().join(".clawg-dev");
+
+        restore(&base, &snapshot).unwrap();
+
+        assert_eq!(crate::private_dir::mode_of(&base), 0o700);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_snapshot_directory_is_created_private() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_on_disk(dir.path(), None).await;
+
+        let path = backup_offline(dir.path()).unwrap();
+
+        assert_eq!(crate::private_dir::mode_of(path.parent().unwrap()), 0o700);
     }
 
     fn add_row(dir: &Path, content: &str) {

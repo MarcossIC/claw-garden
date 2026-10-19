@@ -539,18 +539,11 @@ impl E5Embedder {
         let output = names[pick_output(&names)?].to_string();
         let mut inference = Inference { session, tokenizer, pad_id, wants_token_type_ids, output };
 
-        let (req_tx, mut req_rx) = mpsc::unbounded_channel::<EmbedRequest>();
+        let (req_tx, req_rx) = mpsc::unbounded_channel::<EmbedRequest>();
         std::thread::Builder::new()
             .name("embedder-worker".into())
             .spawn(move || {
-                // futures::executor::block_on bridges tokio's mpsc receiver into
-                // a non-tokio thread. Loop exits naturally when all senders drop.
-                while let Some(EmbedRequest { texts, resp }) =
-                    futures::executor::block_on(req_rx.recv())
-                {
-                    // Dropped oneshot receiver = caller gave up; ignore the send error.
-                    let _ = resp.send(inference.embed(&texts));
-                }
+                serve_requests(req_rx, |texts| inference.embed(texts));
                 drop(inference.session);
                 return_freed_memory();
             })
@@ -562,6 +555,44 @@ impl E5Embedder {
             model_id: E5_MODEL_ID,
         })
     }
+}
+
+/// The worker thread's loop: answers each request with `infer` until every
+/// sender is gone or an inference panics.
+///
+/// A panic is answered to its caller and ends the loop, so the session that
+/// panicked is never run again; the requests still queued lose their reply,
+/// which their callers see as [`EmbedError::WorkerGone`].
+fn serve_requests(
+    mut req_rx: mpsc::UnboundedReceiver<EmbedRequest>,
+    mut infer: impl FnMut(&[String]) -> Result<Vec<Vec<f32>>, EmbedError>,
+) {
+    // block_on bridges tokio's receiver into a thread outside the runtime.
+    while let Some(EmbedRequest { texts, resp }) = futures::executor::block_on(req_rx.recv()) {
+        if resp.is_closed() {
+            continue;
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| infer(&texts))) {
+            Ok(reply) => {
+                // A caller that left during the inference drops the reply.
+                let _ = resp.send(reply);
+            }
+            Err(payload) => {
+                let cause = panic_cause(payload.as_ref());
+                log::error!("the embedding model panicked: {cause}; its session is dropped");
+                let _ = resp.send(Err(EmbedError::InferenceFailed(format!("inference panicked: {cause}"))));
+                return;
+            }
+        }
+    }
+}
+
+fn panic_cause(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
 }
 
 /// Hands the pages freed by a dropped model back to the system. glibc keeps
@@ -1303,6 +1334,49 @@ mod tests {
             matches!(err, EmbedError::InferenceFailed(_)),
             "expected InferenceFailed for a vector-count mismatch, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_panicking_inference_answers_its_caller_and_ends_the_worker() {
+        let (req_tx, req_rx) = mpsc::unbounded_channel::<EmbedRequest>();
+        let worker = std::thread::spawn(move || {
+            serve_requests(req_rx, |_| panic!("the session broke"));
+        });
+        let local = E5Embedder::from_mock_worker(req_tx);
+
+        let first = local.embed_with_role("anything", EmbedRole::Query).await.unwrap_err();
+        match &first {
+            EmbedError::InferenceFailed(cause) => {
+                assert!(cause.contains("inference panicked"), "{cause}");
+                assert!(cause.contains("the session broke"), "{cause}");
+            }
+            other => panic!("expected InferenceFailed, got {other:?}"),
+        }
+        worker.join().expect("the worker returns instead of unwinding");
+        let second = local.embed_with_role("anything", EmbedRole::Query).await.unwrap_err();
+        assert!(matches!(second, EmbedError::WorkerGone), "{second:?}");
+    }
+
+    #[tokio::test]
+    async fn a_request_whose_caller_is_gone_is_not_inferred() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (req_tx, req_rx) = mpsc::unbounded_channel::<EmbedRequest>();
+        let (gone_tx, gone_rx) = oneshot::channel();
+        drop(gone_rx);
+        req_tx.send(EmbedRequest { texts: vec!["nobody waits".into()], resp: gone_tx }).unwrap();
+
+        let inferred = Arc::new(AtomicUsize::new(0));
+        let counted = inferred.clone();
+        std::thread::spawn(move || {
+            serve_requests(req_rx, |texts| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(texts.iter().map(|_| vec![0.0; 384]).collect())
+            });
+        });
+        let local = E5Embedder::from_mock_worker(req_tx);
+        local.embed_with_role("someone waits", EmbedRole::Query).await.expect("embed");
+        assert_eq!(inferred.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

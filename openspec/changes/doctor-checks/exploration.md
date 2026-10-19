@@ -30,7 +30,7 @@ Cada fila dice si el problema es real, y qué lo detecta hoy.
 | **`ingest-pending.jsonl` sin reproducir** | **Parcial.** El spill se reproduce solo en cada arranque del runtime (`spill::load`, `runtime.rs:355`). Un archivo presente significa que el daemon no arrancó desde el último `stop`: informativo. Lo que sí es un problema real es `ingest-pending.rejected.jsonl`: son líneas que no se pudieron parsear, "nothing deletes it" (`spill.rs:16-18`), y son saves de alguien | Sólo el log del arranque (`spill.rs:78-82`) |
 | **Último backup viejo** | **Real.** El único snapshot que se toma solo es el de migrar, restaurar o re-embeber (`Reason`, `backup.rs:119-128`). `Manual` sólo sale de `clawg backup` (`backup.rs:317`) y no hay ninguno periódico (`rg` de `snapshot_into` no encuentra otro llamador). Un usuario que nunca corre `backup` puede tener un único snapshot de hace meses | Nadie |
 | **La poda puede sacar el snapshot que era la vuelta atrás** | **Real pero improbable, y no la arregla `doctor`.** `to_prune` ordena **por nombre** y conserva los 5 automáticos más nuevos sin mirar el motivo (`backup.rs:235-243`). Cinco snapshots automáticos posteriores (migraciones, restores, re-embeds) desplazan al `pre-migration`. Los tests fijan el conteo (`pruning_keeps_the_newest_automatic_snapshots_and_every_manual_one`, `backup.rs:703`; `an_automatic_snapshot_prunes_older_automatic_ones`, `:680`) y **no** el motivo: sus nombres alternan `PreMigration` y `PreRestore` (`backup.rs:693`) y la aserción acepta que se pode cualquiera de los dos. Además el comentario de `AUTO_KEEP` sigue diciendo "pre-migration, pre-restore" (`backup.rs:227`) aunque `is_automatic` ya cubre `pre-reembed` (`:143-145`) | Nadie |
-| **`sharing.json` inválido** | **Parcial: no es silencioso del todo.** Comparte nada (`Reach::Own`) y escribe `log::warn!("…; nothing is shared")` en cada búsqueda (`daemon/api.rs:813-820`). `memory_status` lo dice: `shared: none (sharing.json is not valid…` (test en `mcp/server.rs:2419-2421`), y `clawg sharing` muestra el error y se niega a sobrescribir el archivo (`sharing.rs:19-25`). Lo que falta: que `doctor` y `clawg status` lo digan, que es donde el usuario va a mirar cuando algo no se comparte | `memory_status`, `clawg sharing`, el log |
+| **`sharing.json` inválido** | **Parcial: no es silencioso del todo.** Comparte nada (`Reach::Own`) y escribe `log::warn!("…; nothing is shared")` en cada búsqueda (`daemon/api.rs:813-820`). `memory_status` lo dice: `shared: none (sharing.json is not valid…` (test en `mcp/server.rs:2419-2421`), y `clawg sharing` muestra el error y se niega a sobrescribir el archivo (`sharing.rs:21-27`). Lo que falta: que `doctor` y `clawg status` lo digan, que es donde el usuario va a mirar cuando algo no se comparte | `memory_status`, `clawg sharing`, el log |
 
 Las invariantes de estado se tratan aparte, en la sección siguiente. Resumen de la tabla de arriba: de diez problemas, **cinco son reales y sin salida visible** (backup viejo, rechazados del spill, cabecera de `purge`, agentes partidos, registro MCP si 26 lo hace legible), **tres ya tienen otra vía** y lo que cambia es dónde se lee (contrato, `sharing.json`, spill pendiente), **uno se arregla solo** (disputas) y **uno es una falla de diseño de la poda** que se corrige en `backup.rs`, no se diagnostica (snapshot desplazado).
 
@@ -57,7 +57,7 @@ Caminos que hoy rompen alguna, y que el chequeo debe encontrar en bases ya exist
 - **Un camino de escritura bajo lock exclusivo.** `purge` toma `StoreLock::acquire(base_dir, StoreHolder::Maintenance)`, abre sin migrar, verifica `schema_plan` y recién ahí escribe (`secrets.rs:81-94`). Es el modelo para `apply`.
 - `read_history` y `schema_plan` (`backup.rs:20`, `:88-115`) dicen si el esquema está al día sin abrir con migraciones.
 - `parse_snapshot_name` y el formato con fecha del nombre (`backup.rs:180-210`): la edad de un snapshot sale del nombre, sin mirar el reloj del sistema de archivos. Hoy `parse_snapshot_name` devuelve sólo el motivo; la fecha habría que parsearla (función pura nueva).
-- `sharing::load` y `SharingError`, con mensajes ya redactados para el usuario (`sharing.rs:21-36`).
+- `sharing::load` y `SharingError`, con mensajes ya redactados para el usuario (`sharing.rs:23-38`).
 - `StoreLock::current_owner` y `memory.owner` (`store_lock.rs:179`) dicen quién tiene el store sin abrirlo; `probe_running` (`client.rs:937`) dice si hay daemon.
 - `GET /health` (abierto) da el estado del embedder y de la versión (`daemon/api.rs:610`).
 - `spill::SPILL_FILE` y `REJECTED_FILE` (`spill.rs:14-18`).
@@ -142,6 +142,7 @@ Códigos de salida: hoy 0 sano, 1 no sano (`main.rs:181-185`). Se mantiene 1 par
 - **topic-revisions (27) y revision-aware-delete (49), archivados.** Son quienes introducen las invariantes 1 a 3; el chequeo es su red de seguridad en bases ya existentes.
 - **outbox-lifecycle (53).** Los saves que fallan a la mitad y las filas `failed` son fuente de violaciones; los hallazgos se coordinan con lo que 53 decida sobre ellas.
 - **secret-coverage (51) y project-clone-identity (30).** Cada uno arregla de origen un camino que rompe una invariante (el `purge` de la versión vigente, el re-key que une scopes); `doctor` sólo encuentra lo que ya quedó guardado.
+- **local-isolation (50), local-transport (58) y windows-pipe (59).** `doctor` puede informar, sin abrir el store, el modo del directorio de datos (el A3 de 50), el largo de la ruta del socket frente al tope de `sun_path` (108 bytes en Linux, 104 en macOS) y, en Windows, el descriptor de seguridad de la pipe del daemon que corre.
 
 ## Alcance candidato
 
@@ -156,7 +157,8 @@ Códigos de salida: hoy 0 sano, 1 no sano (`main.rs:181-185`). Se mantiene 1 par
    - cabeceras huérfanas de `memory_piece`;
    - `project.id` contra `derive_project_id(root_path)`;
    - las seis invariantes de estado de la sección «Invariantes del estado de `memory`», con las cabeceras huérfanas fusionadas en la 5;
-   - filas `failed` del `ingest_outbox` (cuenta y `operation_id`, sin contenido), coordinado con 53.
+   - filas `failed` del `ingest_outbox` (cuenta y `operation_id`, sin contenido), coordinado con 53;
+   - el modo del directorio de datos y el largo de la ruta del socket (con 50 y 58).
 3. El sobre uniforme y el JSON compatible. Salida legible opcional además del JSON (decisión abierta).
 4. Con 26: chequeo del registro MCP (binario existe, agente fijo) sobre un parser puro del texto de configuración que 26 define.
 5. Con 29: chequeo de colisión de `project_id` si 29 hace que quede registrada.

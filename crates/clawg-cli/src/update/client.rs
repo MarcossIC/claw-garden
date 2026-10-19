@@ -27,6 +27,13 @@ pub enum FetchError {
     Request { url: String, reason: String },
     #[error("{url} answered {status}")]
     Status { url: String, status: u16 },
+    /// GitHub takes a few dozen requests an hour from an address without a
+    /// token, and a shared one can use them up before this user asks.
+    #[error(
+        "{url} answered {status}: the GitHub API's rate limit for this address is used up; {}",
+        try_again(.resets_in_minutes)
+    )]
+    RateLimited { url: String, status: u16, resets_in_minutes: Option<u64> },
     #[error("{url} is larger than the {cap} bytes allowed")]
     TooLarge { url: String, cap: u64 },
     #[error("{url} is not text")]
@@ -154,7 +161,9 @@ impl ReleaseClient {
                 hash.update(&chunk);
                 file.write_all(&chunk).map_err(write_failed)?;
             }
-            file.flush().map_err(write_failed)
+            // On disk before it is renamed into place, or a power cut can leave
+            // the installed name on an empty file; `flush` does nothing on a `File`.
+            file.sync_all().map_err(write_failed)
         }
         .await;
         drop(file);
@@ -174,13 +183,52 @@ impl ReleaseClient {
             .await
             .map_err(|e| request_failed(url, e))?;
         if !response.status().is_success() {
-            return Err(FetchError::Status { url: url.to_string(), status: response.status().as_u16() });
+            return Err(refusal(
+                url,
+                response.status().as_u16(),
+                header(&response, "x-ratelimit-remaining"),
+                header(&response, "x-ratelimit-reset"),
+                now_secs(),
+            ));
         }
         if response.content_length().is_some_and(|len| len > cap) {
             return Err(FetchError::TooLarge { url: url.to_string(), cap });
         }
         Ok(response)
     }
+}
+
+/// The error for an answer that is not a success. GitHub's rate limit comes
+/// as a 403 or a 429 with no requests left, and the time it resets at in
+/// seconds since the epoch.
+fn refusal(url: &str, status: u16, remaining: Option<&str>, reset: Option<&str>, now_secs: u64) -> FetchError {
+    let url = url.to_string();
+    if !matches!(status, 403 | 429) || remaining.map(str::trim) != Some("0") {
+        return FetchError::Status { url, status };
+    }
+    let resets_in_minutes = reset
+        .and_then(|at| at.trim().parse::<u64>().ok())
+        .map(|at| at.saturating_sub(now_secs).div_ceil(60));
+    FetchError::RateLimited { url, status, resets_in_minutes }
+}
+
+fn try_again(resets_in_minutes: &Option<u64>) -> String {
+    match resets_in_minutes {
+        Some(0) => "try again now".to_string(),
+        Some(minutes) => format!("try again in {minutes} min"),
+        None => "try again within the hour".to_string(),
+    }
+}
+
+fn header<'a>(response: &'a reqwest::Response, name: &str) -> Option<&'a str> {
+    response.headers().get(name).and_then(|value| value.to_str().ok())
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn request_failed(url: &str, error: reqwest::Error) -> FetchError {
@@ -423,6 +471,47 @@ mod tests {
             Err(FetchError::TooLarge { .. })
         ));
         assert!(!dest.exists());
+    }
+
+    #[test]
+    fn a_refusal_with_no_requests_left_is_the_rate_limit() {
+        const NOW: u64 = 1_800_000_000;
+        let reset = (NOW + 90).to_string();
+
+        for status in [403, 429] {
+            let error = refusal("https://api.github.com/x", status, Some("0"), Some(&reset), NOW);
+            assert!(
+                matches!(error, FetchError::RateLimited { resets_in_minutes: Some(2), .. }),
+                "{status}: {error}"
+            );
+            assert!(error.to_string().contains("rate limit for this address is used up; try again in 2 min"), "{error}");
+        }
+        let unknown = refusal("https://api.github.com/x", 403, Some("0"), None, NOW).to_string();
+        assert!(unknown.contains("try again within the hour"), "{unknown}");
+        let past = refusal("https://api.github.com/x", 403, Some("0"), Some(&NOW.to_string()), NOW).to_string();
+        assert!(past.contains("try again now"), "{past}");
+    }
+
+    #[test]
+    fn a_refusal_with_requests_left_or_another_status_is_only_a_status() {
+        for (status, remaining) in [(403, Some("12")), (403, None), (404, Some("0")), (500, Some("0"))] {
+            let error = refusal("https://api.github.com/x", status, remaining, Some("1800000090"), 1_800_000_000);
+            assert!(matches!(error, FetchError::Status { .. }), "{status} {remaining:?}: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_rate_limit_is_read_from_the_answer() {
+        let app = Router::new().fallback(|| async {
+            (StatusCode::FORBIDDEN, [("x-ratelimit-remaining", "0"), ("x-ratelimit-reset", "4102444800")], "limited")
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let error = ReleaseClient::new(&base, &base).list_releases().await.unwrap_err();
+
+        assert!(matches!(error, FetchError::RateLimited { status: 403, .. }), "{error}");
     }
 
     #[test]

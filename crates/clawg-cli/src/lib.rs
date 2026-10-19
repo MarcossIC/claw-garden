@@ -33,6 +33,7 @@ pub mod doctor;
 pub mod hook;
 pub mod mcp;
 pub mod memories;
+pub mod outbox;
 pub mod process;
 pub mod projects;
 pub mod relevance;

@@ -1,5 +1,5 @@
 //! KNN search across memory + episodic + procedural via tokio::try_join!,
-//! merged + ranked by the score formula computed in SQL.
+//! merged + ranked by the score formula of `score.rs`.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -58,17 +58,48 @@ impl SearchScope {
 }
 
 /// Who a search may read, as the JSON object every query below binds once:
-/// `reader` always, and `hidden` only when other agents are readable. One
-/// parameter whatever the policy, so no placeholder numbering moves.
+/// `reader` always, `authorless` when the rows no agent saved are readable,
+/// and `hidden` only when other agents are. One parameter whatever the
+/// policy, so no placeholder numbering moves.
 fn reach_bind(agent_id: &str, reach: &Reach) -> String {
     let value = match reach {
-        Reach::Own => serde_json::json!({ "reader": agent_id }),
-        Reach::AllBut(hidden) => serde_json::json!({ "reader": agent_id, "hidden": hidden }),
+        Reach::OwnOnly => serde_json::json!({ "reader": agent_id }),
+        Reach::Own => serde_json::json!({ "reader": agent_id, "authorless": true }),
+        Reach::AllBut(hidden) => serde_json::json!({ "reader": agent_id, "authorless": true, "hidden": hidden }),
     };
     value.to_string()
 }
 
-/// One result row after the score formula has been applied SQL-side.
+/// The reach predicate on the author column `$author`, over the object
+/// [`reach_bind`] binds to `$param`. Every query that reads by reach spells it
+/// through here, so no copy can drift, and a test holds [`Reach::admits`] to
+/// the same rule.
+macro_rules! reach_predicate {
+    ($author:literal, $param:literal) => {
+        concat!(
+            "(", $author, " = (", $param, " ->> '$.reader') OR (", $author, " IS NULL AND (", $param,
+            " ->> '$.authorless') IS NOT NULL) OR ((", $param, " ->> '$.hidden') IS NOT NULL AND ",
+            $author, " NOT IN (SELECT value FROM json_each(", $param, ", '$.hidden'))))"
+        )
+    };
+}
+
+/// The project predicate of `memory` rows under the column prefix `$m`
+/// (`"m."`, or `""` without an alias), for the project bound to `$param`: no
+/// project reads every row; a project reads its own, the rows without one and
+/// every `user_preference`, which describes the person and follows them from
+/// project to project.
+macro_rules! memory_project_predicate {
+    ($m:literal, $param:literal) => {
+        concat!(
+            "(", $param, " IS NULL OR ", $m, "project_id = ", $param, " OR ", $m, "project_id IS NULL OR ",
+            $m, "memory_type = 'user_preference')"
+        )
+    };
+}
+pub(crate) use memory_project_predicate;
+
+/// One result row, scored by `score::score`.
 ///
 /// `Serialize` because the `clawg serve` daemon answers retrieval requests
 /// with these rows as JSON.
@@ -107,11 +138,8 @@ pub struct PiecePosition {
 
 /// The hits `reader` may read, in their order. The queries already filter by
 /// reach; this is the check that does not depend on each of them repeating it.
-/// A hit without an author is not readable by anyone.
 fn readable_hits(hits: Vec<RankedHit>, reader: &str, reach: &Reach) -> Vec<RankedHit> {
-    hits.into_iter()
-        .filter(|hit| hit.agent_id.as_deref().is_some_and(|author| reach.admits(reader, author)))
-        .collect()
+    hits.into_iter().filter(|hit| reach.admits(reader, hit.agent_id.as_deref())).collect()
 }
 
 /// Keeps the first, so best ranked, hit of each save and drops its other
@@ -208,7 +236,8 @@ pub fn serialize_f32_query_pub(v: &[f32]) -> Vec<u8> {
 // `last_accessed_at` and `importance` straight off these rows instead of a
 // SQL-computed column. Rows still arrive in vec0's own distance order, not
 // score order — `knn_one` is what turns this into a score-ordered result.
-const SEARCH_SQL_MEMORY: &str = "
+const SEARCH_SQL_MEMORY: &str = concat!(
+    "
     SELECT m.id, m.content, m.memory_type, m.tier, m.status, knn.distance,
         m.created_at, m.last_accessed_at, m.importance, m.agent_id, m.topic_key
     FROM memory_vectors knn
@@ -217,15 +246,21 @@ const SEARCH_SQL_MEMORY: &str = "
       AND knn.k = ?2
       AND m.status IN ('active', 'disputed')
       AND m.deleted_at IS NULL
-      AND (m.agent_id = (?3 ->> '$.reader') OR ((?3 ->> '$.hidden') IS NOT NULL AND m.agent_id NOT IN (SELECT value FROM json_each(?3, '$.hidden'))))
-      AND (?4 IS NULL OR m.project_id = ?4 OR m.project_id IS NULL OR m.memory_type = 'user_preference')
-";
+      AND ",
+    reach_predicate!("m.agent_id", "?3"),
+    "
+      AND ",
+    memory_project_predicate!("m.", "?4"),
+    "
+"
+);
 
 // SQL for episodic table KNN. The 0.0077 lambda this table always used no
 // longer lives here — it is `DecayLambdas.episode` in score.rs, reached
 // through `lambda_for` dispatching on `TableKind::Episodic` rather than on
 // the `'episode'` string this query still selects for display.
-const SEARCH_SQL_EPISODIC: &str = "
+const SEARCH_SQL_EPISODIC: &str = concat!(
+    "
     SELECT epi.id, epi.task, 'episode' AS memory_type, epi.tier, epi.status, knn.distance,
         epi.created_at, epi.last_accessed_at, epi.importance, epi.agent_id, NULL
     FROM episodic_vectors knn
@@ -234,13 +269,17 @@ const SEARCH_SQL_EPISODIC: &str = "
       AND knn.k = ?2
       AND epi.status IN ('active', 'disputed')
       AND epi.deleted_at IS NULL
-      AND (epi.agent_id = (?3 ->> '$.reader') OR ((?3 ->> '$.hidden') IS NOT NULL AND epi.agent_id NOT IN (SELECT value FROM json_each(?3, '$.hidden'))))
+      AND ",
+    reach_predicate!("epi.agent_id", "?3"),
+    "
       AND (?4 IS NULL OR epi.project_id = ?4 OR epi.project_id IS NULL)
-";
+"
+);
 
 // SQL for procedural table KNN. Same as episodic: 0.0039 now lives in
 // `DecayLambdas.procedure`, dispatched by `TableKind::Procedural`.
-const SEARCH_SQL_PROCEDURAL: &str = "
+const SEARCH_SQL_PROCEDURAL: &str = concat!(
+    "
     SELECT pro.id, pro.skill_name, 'procedure' AS memory_type, pro.tier, pro.status, knn.distance,
         pro.created_at, pro.last_accessed_at, pro.importance, pro.agent_id, NULL
     FROM procedural_vectors knn
@@ -249,9 +288,12 @@ const SEARCH_SQL_PROCEDURAL: &str = "
       AND knn.k = ?2
       AND pro.status IN ('active', 'disputed')
       AND pro.deleted_at IS NULL
-      AND (pro.agent_id = (?3 ->> '$.reader') OR ((?3 ->> '$.hidden') IS NOT NULL AND pro.agent_id NOT IN (SELECT value FROM json_each(?3, '$.hidden'))))
+      AND ",
+    reach_predicate!("pro.agent_id", "?3"),
+    "
       AND (?4 IS NULL OR pro.project_id = ?4 OR pro.project_id IS NULL)
-";
+"
+);
 
 // How many rows THIS caller could receive at most, counted up to a ceiling of
 // `?1` (the pool size) because nothing above that changes any decision.
@@ -266,38 +308,52 @@ const SEARCH_SQL_PROCEDURAL: &str = "
 //
 // The LIMIT stops the count at k rather than walking every row the caller
 // may read.
-const ELIGIBLE_SQL_MEMORY: &str = "
+const ELIGIBLE_SQL_MEMORY: &str = concat!(
+    "
     SELECT COUNT(*) FROM (
         SELECT m.id FROM memory m
         WHERE m.status IN ('active', 'disputed')
           AND m.deleted_at IS NULL
-          AND (m.agent_id = (?2 ->> '$.reader') OR ((?2 ->> '$.hidden') IS NOT NULL AND m.agent_id NOT IN (SELECT value FROM json_each(?2, '$.hidden'))))
-          AND (?3 IS NULL OR m.project_id = ?3 OR m.project_id IS NULL OR m.memory_type = 'user_preference')
+          AND ",
+    reach_predicate!("m.agent_id", "?2"),
+    "
+          AND ",
+    memory_project_predicate!("m.", "?3"),
+    "
         LIMIT ?1
     )
-";
+"
+);
 
-const ELIGIBLE_SQL_EPISODIC: &str = "
+const ELIGIBLE_SQL_EPISODIC: &str = concat!(
+    "
     SELECT COUNT(*) FROM (
         SELECT epi.id FROM episodic_trajectory epi
         WHERE epi.status IN ('active', 'disputed')
           AND epi.deleted_at IS NULL
-          AND (epi.agent_id = (?2 ->> '$.reader') OR ((?2 ->> '$.hidden') IS NOT NULL AND epi.agent_id NOT IN (SELECT value FROM json_each(?2, '$.hidden'))))
+          AND ",
+    reach_predicate!("epi.agent_id", "?2"),
+    "
           AND (?3 IS NULL OR epi.project_id = ?3 OR epi.project_id IS NULL)
         LIMIT ?1
     )
-";
+"
+);
 
-const ELIGIBLE_SQL_PROCEDURAL: &str = "
+const ELIGIBLE_SQL_PROCEDURAL: &str = concat!(
+    "
     SELECT COUNT(*) FROM (
         SELECT pro.id FROM procedural_skill pro
         WHERE pro.status IN ('active', 'disputed')
           AND pro.deleted_at IS NULL
-          AND (pro.agent_id = (?2 ->> '$.reader') OR ((?2 ->> '$.hidden') IS NOT NULL AND pro.agent_id NOT IN (SELECT value FROM json_each(?2, '$.hidden'))))
+          AND ",
+    reach_predicate!("pro.agent_id", "?2"),
+    "
           AND (?3 IS NULL OR pro.project_id = ?3 OR pro.project_id IS NULL)
         LIMIT ?1
     )
-";
+"
+);
 
 /// vec0 refuses to bind a `k` above this — it is the engine's own ceiling, not
 /// a policy choice made here. A widened window has to be clamped to it, or the
@@ -672,21 +728,29 @@ pub(crate) fn viewer_match_expression(query_text: &str) -> Option<String> {
 // vtab is the lowest rowids: the oldest memories, close to the worst
 // possible selection for a candidate budget.
 //
-// The two scope predicates are copied verbatim from `SEARCH_SQL_MEMORY`,
-// including the `?3 IS NULL` tautology (an unscoped caller's row set stays
-// untouched) and the `user_preference` exemption. They run here, before the
-// `LIMIT`, so the budget is spent on PERMITTED candidates only — a row this
-// caller may not see never occupies one of the `?4` slots. Dropping the
-// `user_preference` disjunct would make this channel stricter than the
-// dense one about which project-scoped rows are allowed through.
-const LEXICAL_CANDIDATE_SQL: &str = "
-    SELECT rowid FROM memory_fts
+// The live-status and scope predicates are those of `SEARCH_SQL_MEMORY`, the
+// scope ones from the same macros. They run here, before the `LIMIT`, so the
+// budget is spent on candidates the caller can be shown — a row it may not
+// see never occupies one of the `?4` slots. That includes the `superseded`
+// versions of a topic: `memory_fts` drops a row only when it is deleted, and
+// those versions read almost like the current one.
+const LEXICAL_CANDIDATE_SQL: &str = concat!(
+    "
+    SELECT memory_fts.rowid FROM memory_fts
+    JOIN memory m ON m.id = memory_fts.rowid
     WHERE memory_fts MATCH ?1
-      AND (agent_id = (?2 ->> '$.reader') OR ((?2 ->> '$.hidden') IS NOT NULL AND agent_id NOT IN (SELECT value FROM json_each(?2, '$.hidden'))))
-      AND (?3 IS NULL OR project_id = ?3 OR project_id IS NULL OR memory_type = 'user_preference')
+      AND m.status IN ('active', 'disputed')
+      AND m.deleted_at IS NULL
+      AND ",
+    reach_predicate!("m.agent_id", "?2"),
+    "
+      AND ",
+    memory_project_predicate!("m.", "?3"),
+    "
     ORDER BY bm25(memory_fts)
     LIMIT ?4
-";
+"
+);
 
 /// Hard ceiling on how many candidate rowids one lexical search may carry
 /// into the scoring query, whatever budget the caller asked for.
@@ -806,16 +870,22 @@ fn holds_identifier(content: &str, identifier: &str) -> bool {
 // live-status and `deleted_at` predicates run before the `LIMIT`: a row the
 // caller cannot be shown must not use up the budget that decides whether
 // the identifier is rare enough to reward.
-const IDENTIFIER_MATCH_SQL: &str = "
+const IDENTIFIER_MATCH_SQL: &str = concat!(
+    "
     SELECT memory_fts.rowid, m.content FROM memory_fts
     JOIN memory m ON m.id = memory_fts.rowid
     WHERE memory_fts MATCH ?1
       AND m.status IN ('active', 'disputed')
       AND m.deleted_at IS NULL
-      AND (m.agent_id = (?2 ->> '$.reader') OR ((?2 ->> '$.hidden') IS NOT NULL AND m.agent_id NOT IN (SELECT value FROM json_each(?2, '$.hidden'))))
-      AND (?3 IS NULL OR m.project_id = ?3 OR m.project_id IS NULL OR m.memory_type = 'user_preference')
+      AND ",
+    reach_predicate!("m.agent_id", "?2"),
+    "
+      AND ",
+    memory_project_predicate!("m.", "?3"),
+    "
     LIMIT ?4
-";
+"
+);
 
 /// Ids of the `memory` rows that hold every identifier in `query_text`, or
 /// none at all when more rows than `budget` hold them: a name many rows share
@@ -958,7 +1028,8 @@ async fn identifier_matches(
 // not hypothetical: this query passed its own parity test with
 // `vec_distance_l1` substituted here, and every other test with it, until
 // that fixture was rebuilt to differ in more than one coordinate.
-const LEXICAL_SCORE_SQL_PREFIX: &str = "
+const LEXICAL_SCORE_SQL_PREFIX: &str = concat!(
+    "
     SELECT m.id, m.content, m.memory_type, m.tier, m.status,
         vec_distance_l2(v.embedding, ?1) AS distance,
         m.created_at, m.last_accessed_at, m.importance, m.agent_id, m.topic_key
@@ -966,9 +1037,14 @@ const LEXICAL_SCORE_SQL_PREFIX: &str = "
     JOIN memory m NOT INDEXED ON m.id = v.rowid
     WHERE m.status IN ('active', 'disputed')
       AND m.deleted_at IS NULL
-      AND (m.agent_id = (?2 ->> '$.reader') OR ((?2 ->> '$.hidden') IS NOT NULL AND m.agent_id NOT IN (SELECT value FROM json_each(?2, '$.hidden'))))
-      AND (?3 IS NULL OR m.project_id = ?3 OR m.project_id IS NULL OR m.memory_type = 'user_preference')
-";
+      AND ",
+    reach_predicate!("m.agent_id", "?2"),
+    "
+      AND ",
+    memory_project_predicate!("m.", "?3"),
+    "
+"
+);
 
 /// Builds the `m.id IN (...)` placeholder list for `n` ids, explicitly
 /// numbered starting at `?4` (`LEXICAL_SCORE_SQL_PREFIX` already claims
@@ -3387,6 +3463,58 @@ mod tests {
         );
     }
 
+    // A topic revised with `topic_key` leaves its old versions in `memory_fts`
+    // (only a delete takes a row out), each nearly the text of the current one.
+    // Shorter, they outrank it by bm25; filtered after the `LIMIT`, they would
+    // fill the budget and leave the current version out.
+    #[tokio::test]
+    async fn superseded_versions_do_not_spend_the_lexical_budget() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let emb = unit_basis_embedding();
+        let agent = "agent-revised";
+        for i in 0..3 {
+            insert_memory_row(
+                &store, agent, &format!("revtok version {i}"), "semantic_fact", 3, 5.0, "superseded", emb.clone(),
+            )
+            .await;
+        }
+        let current = insert_memory_row(
+            &store, agent, "revtok version 3, the wording that holds today", "semantic_fact", 3, 5.0, "active", emb,
+        )
+        .await;
+
+        let ids = lexical_candidates(&store, "revtok", &only(agent), None, 2).await;
+
+        assert_eq!(ids, vec![current]);
+    }
+
+    /// The candidate query is driven by the MATCH and reaches `memory` by rowid
+    /// for each match: driven from an index on `memory` instead, it would visit
+    /// every live row to test the MATCH on each.
+    #[tokio::test]
+    async fn the_lexical_candidate_query_is_driven_by_the_match() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let plan = store
+            .conn
+            .call(|c| -> Result<Vec<String>, rusqlite::Error> {
+                let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {LEXICAL_CANDIDATE_SQL}"))?;
+                let rows = stmt.query_map(
+                    rusqlite::params!["\"tok\"", only("plan-probe"), Option::<String>::None, 20],
+                    |r| r.get::<_, String>(3),
+                )?;
+                rows.collect()
+            })
+            .await
+            .unwrap();
+
+        let fts = plan.iter().position(|l| l.contains("memory_fts VIRTUAL TABLE"));
+        let memory = plan.iter().position(|l| l.contains(" m USING INTEGER PRIMARY KEY"));
+        assert!(
+            matches!((fts, memory), (Some(f), Some(m)) if f < m),
+            "expected memory_fts as the outer loop and `memory` by rowid, got {plan:#?}"
+        );
+    }
+
     #[tokio::test]
     async fn lexical_candidates_folds_accents_between_query_and_stored_content() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -4873,6 +5001,46 @@ mod tests {
         }
     }
 
+    /// A `global` row: the schema's shape for a `memory` row with neither an
+    /// author nor a project.
+    async fn insert_global_row(store: &MemoryStore, content: &str, embedding: Vec<u8>) -> i64 {
+        let content = content.to_string();
+        store
+            .conn
+            .call(move |c| -> Result<i64, rusqlite::Error> {
+                let tx = c.transaction()?;
+                tx.execute(
+                    "INSERT INTO memory (scope, agent_id, content, memory_type, source,
+                     created_at, created_by_type, created_by_ref,
+                     last_modified_at, last_accessed_at, importance, tier, status)
+                     VALUES ('global', NULL, ?1, 'semantic_fact', 'chat', 0, 'user', 'import', 0, 0, 5.0, 3, 'active')",
+                    params![content],
+                )?;
+                let id = tx.last_insert_rowid();
+                tx.execute("INSERT INTO memory_vectors(rowid, embedding) VALUES (?, ?)", params![id, embedding])?;
+                tx.commit()?;
+                Ok(id)
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_row_no_agent_saved_is_found_whatever_the_policy() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let global = insert_global_row(&store, "el deploy usa flyio_4821", serialize_embedding(&axis(0))).await;
+
+        for (channel, scope) in [("dense", dense_only()), ("lexical", lexical_only())] {
+            for reach in [Reach::Own, everyone(), Reach::AllBut(vec!["a".to_string()])] {
+                let hits =
+                    search_all_memories(&store, &axis(0), Some("flyio_4821"), "b", scope.clone().with_reach(reach.clone()), 10).await.unwrap();
+                assert!(ids_of(&hits).contains(&global), "{channel}, {reach:?}: no exclusion names a row without an author");
+            }
+            let probe = search_all_memories(&store, &axis(0), Some("flyio_4821"), "b", scope.with_reach(Reach::OwnOnly), 10).await.unwrap();
+            assert!(!ids_of(&probe).contains(&global), "{channel}: what a save is compared against holds only its agent's rows");
+        }
+    }
+
     #[tokio::test]
     async fn a_hidden_author_stays_out_in_every_channel() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -5044,6 +5212,22 @@ mod tests {
         assert_eq!(collapsed[1].kind, TableKind::Episodic);
     }
 
+    /// `Reach::admits` and the SQL predicate are two spellings of one rule:
+    /// LAST SESSION and the last check on the hits read the first, every query
+    /// the second.
+    #[test]
+    fn the_reach_predicate_agrees_with_admits() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let sql = concat!("SELECT count(*) FROM (SELECT ?2 AS agent_id) t WHERE ", reach_predicate!("t.agent_id", "?1"));
+        let all_but = |names: &[&str]| Reach::AllBut(names.iter().map(|n| n.to_string()).collect());
+        for reach in [Reach::OwnOnly, Reach::Own, all_but(&[]), all_but(&["b"]), all_but(&["b", "c"])] {
+            for author in [Some("a"), Some("b"), Some("c"), None] {
+                let in_sql: i64 = conn.query_row(sql, params![reach_bind("a", &reach), author], |r| r.get(0)).unwrap();
+                assert_eq!(in_sql == 1, reach.admits("a", author), "{reach:?} reading a row of {author:?}");
+            }
+        }
+    }
+
     #[test]
     fn a_hit_the_reader_may_not_see_is_dropped_and_the_order_kept() {
         let by = |id: i64, author: Option<&str>| {
@@ -5055,10 +5239,13 @@ mod tests {
 
         let reach = Reach::AllBut(vec!["hidden".to_string()]);
         let kept = readable_hits(hits.clone(), "me", &reach);
-        assert_eq!(kept.iter().map(|h| h.id).collect::<Vec<_>>(), vec![2, 4]);
+        assert_eq!(kept.iter().map(|h| h.id).collect::<Vec<_>>(), vec![2, 3, 4]);
 
-        let own = readable_hits(hits, "me", &Reach::Own);
-        assert_eq!(own.iter().map(|h| h.id).collect::<Vec<_>>(), vec![2]);
+        let own = readable_hits(hits.clone(), "me", &Reach::Own);
+        assert_eq!(own.iter().map(|h| h.id).collect::<Vec<_>>(), vec![2, 3]);
+
+        let only_own = readable_hits(hits, "me", &Reach::OwnOnly);
+        assert_eq!(only_own.iter().map(|h| h.id).collect::<Vec<_>>(), vec![2]);
     }
 
     async fn seed_linked_save(store: &MemoryStore, agent: &str) -> Vec<i64> {

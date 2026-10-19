@@ -19,6 +19,8 @@ Memoria local para agentes de código. Claw Garden guarda, clasifica y recupera 
 
 Cada versión se publica en [GitHub Releases](https://github.com/MarcossIC/claw-garden/releases) con dos binarios sin comprimir (`clawg-x86_64-pc-windows-msvc.exe` y `clawg-x86_64-unknown-linux-gnu`), el script `install.ps1`, la lista `SHA256SUMS` y su firma `SHA256SUMS.minisig`.
 
+El binario lleva adentro ONNX Runtime, el motor que calcula los embeddings, enlazado de forma estática. No es una build de Microsoft: es la que compila [pyke](https://ort.pyke.io/setup/linking), que `ort` baja de `cdn.pyke.io` al compilar y verifica contra el SHA-256 que `ort-sys` fija para cada plataforma.
+
 ### Windows
 
 Hace falta el **Microsoft Visual C++ Redistributable (x64)**. El script comprueba que esté, y si falta te dice dónde bajarlo (<https://aka.ms/vs/17/release/vc_redist.x64.exe>) sin instalar nada. En una PowerShell:
@@ -315,10 +317,10 @@ clawg setup claude-code --profile prod
 Hace tres cosas, y se puede repetir sin miedo:
 
 1. **Registra el servidor MCP** a nivel de usuario, así queda disponible en todos tus proyectos. Lo hace con el propio `claude mcp add --scope user`, con la ruta completa del `clawg` que corriste (para no depender del PATH del proceso que lanza Claude Code) y con la identidad del agente fijada en `--agent claude-code` (ver [Fijar la identidad del agente](#fijar-la-identidad-del-agente)).
-2. **Instala los hooks** de inicio de sesión y de cada mensaje en `~/.claude/settings.json`: al empezar (y después de compactar) la sesión recibe la memoria del proyecto, y a los 30 minutos sin guardar el agente se entera. Los hooks que ya tenías no se tocan.
+2. **Instala los hooks** de inicio de sesión y de cada mensaje en `~/.claude/settings.json`: al empezar (y después de compactar) la sesión recibe la memoria del proyecto, y a los 30 minutos sin guardar el agente se entera. Claude Code corre el binario directamente, sin pasar por un shell (hace falta Claude Code 2.1.139 o posterior), así que una ruta con espacios o un perfil de shell que imprime no los rompen. Los hooks que ya tenías no se tocan; los que instaló una versión anterior de `clawg setup` se pasan a la forma nueva.
 3. **Agrega el protocolo de memoria** (cuándo guardar, cómo escribir un save, qué no guardar) a `~/.claude/CLAUDE.md`, entre `<!-- BEGIN CLAWG MEMORY PROTOCOL -->` y `<!-- END CLAWG MEMORY PROTOCOL -->`. Lo que escribiste fuera de esas marcas no cambia; lo de adentro lo reescribe clawg cuando el protocolo cambia.
 
-Antes de cambiar un archivo, guarda una copia en `~/.clawg/backups/setup/`. Con `--dry-run` muestra lo que haría sin tocar nada. Si `CLAUDE_CONFIG_DIR` está definido, usa ese directorio en vez de `~/.claude`.
+Antes de cambiar un archivo, guarda una copia en `~/.clawg/backups/setup/` y conserva las cinco más recientes de cada uno. Si `settings.json` o `CLAUDE.md` es un enlace simbólico (por ejemplo, de un repositorio de dotfiles), escribe en el archivo al que apunta y el enlace queda; el archivo conserva sus permisos. Con `--dry-run` muestra lo que haría sin tocar nada. Si `CLAUDE_CONFIG_DIR` está definido, usa ese directorio en vez de `~/.claude`.
 
 Lo que no coincide con lo que instalaría no lo reemplaza: lo dice y sale con 1. Pasa, por ejemplo, si ya habías registrado `clawg` con otro comando o si moviste el binario. Para rehacerlo, `clawg setup claude-code --remove --profile prod` y otra vez `clawg setup claude-code --profile prod`. Si `claude` no está en el PATH, instala hooks y protocolo, imprime el comando de registro para que lo corras vos y sale con 1.
 
@@ -485,7 +487,7 @@ Registra `clawg-dev` con la ruta de ese binario y sus hooks con `--profile dev`;
 - Perfil `dev`: datos en `~/.clawg-dev`, puerto por defecto 27381.
 - Perfil `prod`: datos en `~/.clawg`, puerto por defecto 27380.
 
-El perfil sale de `--profile dev|prod`, luego de la variable de entorno `CLAWG_PROFILE`, y por último del tipo de build (debug es `dev`, release es `prod`). Un build debug rechaza `prod`, así que nunca puede tocar `~/.clawg`. El daemon escucha sólo en 127.0.0.1; los endpoints `/v1` exigen un token bearer guardado en el directorio de datos (en Unix, con permisos 0600 desde que se crea). Toda ruta, `/health` incluida, responde 403 a una petición dirigida a un nombre que no sea `127.0.0.1`, `localhost` o `[::1]`, o que traiga una cabecera `Origin`: así una página web abierta en el navegador no llega al daemon, ni con DNS rebinding. No es una barrera contra un proceso del mismo usuario, que puede leer el token.
+El perfil sale de `--profile dev|prod`, luego de la variable de entorno `CLAWG_PROFILE`, y por último del tipo de build (debug es `dev`, release es `prod`). Un build debug rechaza `prod`, así que nunca puede tocar `~/.clawg`. El daemon escucha sólo en 127.0.0.1; los endpoints `/v1` exigen un token bearer guardado en el directorio de datos (en Unix, con permisos 0600 desde que se crea). En Unix el directorio de datos es privado de su dueño: clawg lo crea 0700, igual que los directorios que crea adentro, y a uno que ya existía con permisos para el grupo u otros se los quita y lo deja escrito en el registro con el modo anterior y el nuevo (si se compartía por grupo a propósito, `chmod` lo devuelve). Así otro usuario de la máquina no lee la memoria, las copias ni los registros. Toda ruta, `/health` incluida, responde 403 a una petición dirigida a un nombre que no sea `127.0.0.1`, `localhost` o `[::1]`, o que traiga una cabecera `Origin`: así una página web abierta en el navegador no llega al daemon, ni con DNS rebinding. No es una barrera contra un proceso del mismo usuario, que puede leer el token.
 
 Cada directorio de datos contiene la base SQLite de memoria, `daemon.json` (pid, puerto, versión), `token`, y `memory.lock` / `memory.owner`, que garantizan que un único proceso sea dueño del almacén. Si se excluyó algo con `clawg sharing`, también `sharing.json`.
 

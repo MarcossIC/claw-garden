@@ -35,7 +35,7 @@ Un evento `chat`, `code_file` o `compaction` MUST sellarse como antes: por el ro
 
 ## P2. La declaración
 
-`save_memory` MUST aceptar `user_stated`, un booleano opcional, y su esquema MUST describirlo (`crates/clawg-cli/src/mcp/server.rs:183-187`). El puente MUST mandarlo sólo cuando es `true` (`crates/clawg-cli/src/client.rs:386-388`). `POST /v1/memories` MUST aceptarlo (`crates/clawg-cli/src/daemon/api.rs:359-361`) y MUST responder 400 que nombra `user_stated`, sin escribir en el outbox, si llega `true` junto a un `derived_from` no vacío (`crates/clawg-cli/src/daemon/api.rs:1033-1037`): una conclusión la saca el agente, y guardarla como del agente después de esa declaración escondería el rechazo. Un evento serializado sin el campo, como una fila del outbox escrita por la versión anterior o el pedido de un puente viejo, MUST leerse como `false`, es decir, como del agente (`crates/clawg-core/src/memory/events.rs:50-55`).
+`save_memory` MUST aceptar `user_stated`, un booleano opcional, y su esquema MUST describirlo (`crates/clawg-cli/src/mcp/server.rs:183-187`). El puente MUST mandarlo sólo cuando es `true` (`crates/clawg-cli/src/client.rs:386-388`). `POST /v1/memories` MUST aceptarlo (`crates/clawg-cli/src/daemon/api.rs:359-361`) y MUST responder 400 que nombra `user_stated`, sin escribir en el outbox, si llega `true` junto a un `derived_from` no vacío (`crates/clawg-cli/src/daemon/api.rs:1087-1091`): una conclusión la saca el agente, y guardarla como del agente después de esa declaración escondería el rechazo. Un evento serializado sin el campo, como una fila del outbox escrita por la versión anterior o el pedido de un puente viejo, MUST leerse como `false`, es decir, como del agente (`crates/clawg-core/src/memory/events.rs:50-55`).
 
 `crates/clawg-cli/src/mcp/protocol.md` dice cuándo declararlo: sólo cuando la memoria es lo que dijo el usuario (sus palabras, una corrección o una instrucción explícita), nunca para lo inferido, encontrado o concluido, y nunca en una conclusión. El argumento queda fijado en `crates/clawg-cli/src/mcp/agent_contract.json`.
 
@@ -60,7 +60,7 @@ Un evento `chat`, `code_file` o `compaction` MUST sellarse como antes: por el ro
 
 - `GET /v1/disputes` MUST traer la marca de cada lado de cada par pendiente que nombra (`new_mark`, `old_mark` de `OpenPair`, `crates/clawg-core/src/memory/dispute.rs:405-415`).
 - `memory_status` MUST nombrar primero, en cada par, un lado sin marca cuando el otro la tiene, y MUST escribir la marca junto al id del lado que la tiene (`format_open_pairs`, `crates/clawg-cli/src/mcp/tools.rs:162-168`): una inferencia es la que más probablemente cede, aunque el par lo sigue juzgando el agente.
-- ACTIVE CONFLICTS MUST escribir la marca de cada lado que la tiene: en el rótulo cuando imprime su texto (`[AAAA-MM-DD #N disputed inferred] …`) y junto al id cuando lo cita (`format_conflict_block`, `crates/clawg-core/src/memory/prompt_builder.rs:645-678`). No reordena: agrupa por la fila `disputed`, y reordenar rompería el grupo.
+- ACTIVE CONFLICTS MUST escribir la marca de cada lado que la tiene: en el rótulo cuando imprime su texto (`[AAAA-MM-DD #N disputed inferred] …`) y junto al id cuando lo cita (`format_conflict_block`, `crates/clawg-core/src/memory/prompt_builder.rs:671-704`). No reordena: agrupa por la fila `disputed`, y reordenar rompería el grupo.
 - El origen MUST NOT cambiar el estado de un par ni el de sus filas, ni el orden de los pares listados.
 
 #### Escenario: inferencia contra lo dicho

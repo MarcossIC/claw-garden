@@ -1,0 +1,7 @@
+# Read by `cargo deny check advisories` in .github/workflows/advisories.yml.
+# Every ignored advisory says why it is accepted, and goes once a fixed version
+# reaches Cargo.lock.
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained with no successor release; tokenizers brings it in as a proc-macro run at build time, so none of its code ships in the binary" },
+]

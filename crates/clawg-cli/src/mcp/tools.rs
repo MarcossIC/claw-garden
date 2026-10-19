@@ -86,8 +86,8 @@ pub fn format_search(found: Found, reader: &str) -> String {
 }
 
 /// The author of a hit `reader` did not save, if any. A hit without an author
-/// comes from a daemon that predates sharing, where every hit was the
-/// reader's own.
+/// is a row no agent saved, or comes from a daemon that predates sharing,
+/// where every hit was the reader's own: either way there is nobody to name.
 fn shared_author<'a>(hit: &'a Hit, reader: &str) -> Option<&'a str> {
     hit.agent_id.as_deref().filter(|a| *a != reader)
 }
@@ -548,7 +548,7 @@ pub fn indexes_docs(project: &ProjectIdentity, bridge: Option<&ProjectIdentity>)
 pub fn format_sharing(policy: &Result<SharingPolicy, SharingError>, reader: &str) -> String {
     match policy {
         Ok(p) => match p.reach_for(reader) {
-            Reach::Own => "shared: none (reads only its own)".to_string(),
+            Reach::Own | Reach::OwnOnly => "shared: none (reads no other agent)".to_string(),
             Reach::AllBut(hidden) if hidden.is_empty() => "shared: reads every agent".to_string(),
             Reach::AllBut(hidden) => format!("shared: reads every agent but {}", hidden.join(", ")),
         },
@@ -580,6 +580,16 @@ pub fn format_status(
     );
     if let Some(conflicts) = conflicts {
         out.push_str(&format!("\n{conflicts}"));
+    }
+    if let Some(failed) = health.ingest.as_ref().map(|i| i.failed).filter(|n| *n > 0) {
+        let (saves, each, them, they) = match failed {
+            1 => ("save", "it", "it", "it"),
+            _ => ("saves", "each", "them", "they"),
+        };
+        out.push_str(&format!(
+            "\n{failed} {saves} failed for good; the user retries or discards {each} with \
+             `clawg outbox retry|discard <operation_id>` (ingest.problems names {them} and the memories {they} stored)"
+        ));
     }
     out
 }
@@ -1320,6 +1330,7 @@ mod tests {
                     state: OutboxState::Failed,
                     attempts: 3,
                     error: "the daemon stopped 3 times while ingesting this save".into(),
+                    pieces: vec![41],
                 }],
             }),
             ..health()
@@ -1327,6 +1338,15 @@ mod tests {
         let out = format_status(&h, Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", None);
         assert!(out.contains("\"failed\": 1"), "out was: {out}");
         assert!(out.contains("\"operation_id\": \"op-1\""), "out was: {out}");
+        assert!(
+            out.ends_with(
+                "\n1 save failed for good; the user retries or discards it with \
+                 `clawg outbox retry|discard <operation_id>` (ingest.problems names it and the memories it stored)"
+            ),
+            "out was: {out}"
+        );
+        let none_failed = format_status(&health(), Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", None);
+        assert!(!none_failed.contains("clawg outbox"), "out was: {none_failed}");
     }
 
     #[test]
@@ -1340,7 +1360,7 @@ mod tests {
         let policy = SharingPolicy::parse(r#"{"version":1,"hides":{"cursor":["codex","claude-code"],"aider":["*"]}}"#);
         assert_eq!(format_sharing(&policy, "cursor"), "shared: reads every agent but claude-code, codex");
         assert_eq!(format_sharing(&policy, "codex"), "shared: reads every agent");
-        assert_eq!(format_sharing(&policy, "aider"), "shared: none (reads only its own)");
+        assert_eq!(format_sharing(&policy, "aider"), "shared: none (reads no other agent)");
         let broken = SharingPolicy::parse(r#"{"version":2}"#);
         let line = format_sharing(&broken, "cursor");
         assert!(line.starts_with("shared: none (") && line.contains("version 2"), "{line}");

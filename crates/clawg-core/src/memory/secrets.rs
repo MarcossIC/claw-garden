@@ -15,7 +15,9 @@ use crate::memory::backup::{
 use crate::memory::clock::TimestampMs;
 use crate::memory::dispute::release_challengers;
 use crate::memory::redact::{redact, SecretKind};
+use crate::memory::revival::{revive_after_delete_of_piece, Revived};
 use crate::memory::store_lock::{StoreHolder, StoreLock};
+use crate::memory::workspace::{workspaces_holding, Holding};
 use crate::memory::MemoryError;
 
 /// A `memory` row whose content holds at least one secret. Carries what the
@@ -27,11 +29,28 @@ pub struct Flagged {
     pub deleted: bool,
 }
 
-/// Every row of `memory`, live or deleted, that holds a secret, by id.
+/// A pair of `memory_conflict` whose verdict reason holds a secret, by the
+/// ids of its two rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlaggedPair {
+    pub new_id: i64,
+    pub old_id: i64,
+    pub kinds: Vec<SecretKind>,
+}
+
+/// What [`scan`] found, each list in id order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Scanned {
+    pub memories: Vec<Flagged>,
+    pub pairs: Vec<FlaggedPair>,
+}
+
+/// Every row of `memory`, live or deleted, and every verdict reason that
+/// holds a secret.
 ///
 /// Reads without the lock and without writing, so it works beside a running
 /// daemon: WAL lets a reader in while the daemon writes.
-pub fn scan(base_dir: &Path) -> Result<Vec<Flagged>, MemoryError> {
+pub fn scan(base_dir: &Path) -> Result<Scanned, MemoryError> {
     let path = base_dir.join("memory.db");
     if !path.exists() {
         return Err(BackupError::NoStore { path }.into());
@@ -40,15 +59,43 @@ pub fn scan(base_dir: &Path) -> Result<Vec<Flagged>, MemoryError> {
     let c = open_for_probe(&path)?;
     let mut stmt = c.prepare("SELECT id, content, deleted_at IS NOT NULL FROM memory ORDER BY id")?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, bool>(2)?)))?;
-    let mut flagged = Vec::new();
+    let mut scanned = Scanned::default();
     for row in rows {
         let (id, content, deleted) = row?;
         let kinds = redact(&content).kinds;
         if !kinds.is_empty() {
-            flagged.push(Flagged { id, kinds, deleted });
+            scanned.memories.push(Flagged { id, kinds, deleted });
+        }
+    }
+    scanned.pairs = reasons_with_a_secret(&c)?.into_iter().map(|(pair, _)| pair).collect();
+    Ok(scanned)
+}
+
+/// The verdict reasons that hold a secret, with each reason as stored. A
+/// store from before the pairs has none.
+fn reasons_with_a_secret(c: &rusqlite::Connection) -> rusqlite::Result<Vec<(FlaggedPair, String)>> {
+    if !has_table(c, "memory_conflict")? {
+        return Ok(Vec::new());
+    }
+    let mut stmt =
+        c.prepare("SELECT new_id, old_id, reason FROM memory_conflict WHERE reason IS NOT NULL ORDER BY new_id, old_id")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)))?;
+    let mut flagged = Vec::new();
+    for row in rows {
+        let (new_id, old_id, reason) = row?;
+        let kinds = redact(&reason).kinds;
+        if !kinds.is_empty() {
+            flagged.push((FlaggedPair { new_id, old_id, kinds }, reason));
         }
     }
     Ok(flagged)
+}
+
+fn has_table(c: &rusqlite::Connection, name: &str) -> rusqlite::Result<bool> {
+    c.query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", [name], |r| {
+        r.get::<_, i64>(0)
+    })
+    .map(|n| n > 0)
 }
 
 /// Why a purge did not run.
@@ -57,19 +104,71 @@ pub enum PurgeError {
     #[error("there is no memory #{0}")]
     NotFound(i64),
     #[error("memory.db has migrations pending (V{from} to V{to}); start the daemon once so it \
-             migrates them, stop it, and purge then")]
+             migrates them, stop it, and run this again")]
     Pending { from: i32, to: i32 },
-    #[error("memory.db stayed busy after the purge, so its WAL could not be emptied; \
-             make sure no other clawg is running and purge again")]
+    #[error("memory.db stayed busy after the rewrite, so its WAL could not be emptied; \
+             make sure no other clawg is running and run this again")]
     Busy,
 }
 
 /// What [`purge`] did.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Purged {
+    /// The rows the purged one had replaced as the current version of its
+    /// topic, current again, as a delete of it would have left them.
+    pub revived: Vec<i64>,
+    /// The rows a verdict replaced with the purged one, which stay replaced.
+    pub hidden: Vec<i64>,
+    /// The other rows of the long save the row was a piece of, in id order.
+    /// Neighbours share the tokens at their edges, so each holds a little of
+    /// the purged text.
+    pub pieces: Vec<i64>,
+    /// The outbox rows removed with the row's text: saves accepted and not
+    /// stored, or failed after they were accepted.
+    pub outbox: Vec<OutboxRemoved>,
     /// Snapshots in `<data>/backups` that still hold the row, by name. None
     /// is changed: deleting them is the user's call.
     pub backups: Vec<PathBuf>,
+    /// The `workspace.md` files that still hold the row's text, in path
+    /// order. None is changed: the AUTO section is rewritten by the agent's
+    /// next context there, and the rest is the user's.
+    pub workspaces: Vec<WorkspaceHolding>,
+}
+
+/// A `workspace.md` that holds a purged text, and in which section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceHolding {
+    pub path: PathBuf,
+    pub holding: Holding,
+}
+
+/// An outbox row a purge removed, by the save it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboxRemoved {
+    pub operation_id: String,
+    pub agent_id: String,
+    pub state: String,
+}
+
+/// Which outbox rows hold a purged row's text. The save of a row with no
+/// `memory_piece` link was that row alone, so its outbox row holds exactly
+/// the row's text; a piece of a long save is somewhere in the whole save.
+/// Either way only the save of the row's own agent: another agent's save that
+/// says the same is that agent's, and accepted. A row with no agent is
+/// matched in every agent's saves.
+struct OutboxMatch<'a> {
+    agent: Option<&'a str>,
+    content: &'a str,
+    piece: bool,
+}
+
+const OUTBOX_MATCH: &str = "(?1 IS NULL OR agent_id = ?1) \
+     AND CASE WHEN ?3 THEN instr(content, ?2) > 0 ELSE content = ?2 END";
+
+impl OutboxMatch<'_> {
+    fn params(&self) -> impl rusqlite::Params + '_ {
+        (self.agent, self.content, self.piece)
+    }
 }
 
 /// Removes `memory` row `id` for good: the row, its vector, its terms in the
@@ -80,27 +179,49 @@ pub struct Purged {
 /// nothing is written before every check passes. No snapshot is taken first,
 /// on purpose: it would be one more copy of what is being removed.
 pub fn purge(base_dir: &Path, id: i64) -> Result<Purged, MemoryError> {
-    let path = base_dir.join("memory.db");
-    if !path.exists() {
-        return Err(BackupError::NoStore { path }.into());
-    }
-    let _lock = StoreLock::acquire(base_dir, StoreHolder::Maintenance)?;
-    let mut c = open_existing(base_dir)?;
-    match schema_plan(&read_history(&c)?, &known_migrations()) {
-        SchemaPlan::UpToDate => {}
-        SchemaPlan::Fresh => return Err(PurgeError::NotFound(id).into()),
-        SchemaPlan::Pending { from, to } => return Err(PurgeError::Pending { from, to }.into()),
-        SchemaPlan::Newer { db, binary } => return Err(MemoryError::SchemaNewer { db, binary }),
-        SchemaPlan::Diverged { version } => return Err(MemoryError::SchemaDiverged { version }),
-    }
-    let (content, live): (String, bool) = c
-        .query_row("SELECT content, deleted_at IS NULL FROM memory WHERE id = ?1", [id], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
+    let Some((_lock, mut c)) = open_to_rewrite(base_dir)? else {
+        return Err(PurgeError::NotFound(id).into());
+    };
+    let (content, live, agent, piece): (String, bool, Option<String>, bool) = c
+        .query_row(
+            "SELECT content, deleted_at IS NULL, agent_id, \
+                    EXISTS (SELECT 1 FROM memory_piece WHERE memory_id = ?1) \
+             FROM memory WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
         .optional()?
         .ok_or(PurgeError::NotFound(id))?;
+    let held = OutboxMatch { agent: agent.as_deref(), content: &content, piece };
 
     let tx = c.transaction()?;
+    // Deleted first, so the revival a delete runs sees it as one: the rows it
+    // replaced as its topic's current version come back. Purging must not
+    // hide more than the row.
+    let revived = if live {
+        let now = TimestampMs::now();
+        tx.execute("UPDATE memory SET deleted_at = ?2 WHERE id = ?1", rusqlite::params![id, now])?;
+        revive_after_delete_of_piece(&tx, id, now)?
+    } else {
+        Revived::default()
+    };
+    let pieces: Vec<i64> = {
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT q.memory_id FROM memory_piece p \
+             JOIN memory_piece q ON q.save_id = p.save_id JOIN memory m ON m.id = q.memory_id \
+             WHERE p.memory_id = ?1 AND q.memory_id <> ?1 ORDER BY q.memory_id",
+        )?;
+        let rows = stmt.query_map([id], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    // Every later piece of a save was embedded behind its opening, which the
+    // links keep as text. The link of the row itself stays: it holds an id,
+    // and says which piece is missing.
+    tx.execute(
+        "UPDATE memory_piece SET context = '' \
+         WHERE save_id IN (SELECT save_id FROM memory_piece WHERE memory_id = ?1 AND piece = 1)",
+        [id],
+    )?;
     tx.execute("DELETE FROM memory_vectors WHERE rowid = ?1", [id])?;
     tx.execute("DELETE FROM memory WHERE id = ?1", [id])?;
     // A purged conclusion rests on nothing. A link that names the row as a
@@ -110,8 +231,17 @@ pub fn purge(base_dir: &Path, id: i64) -> Result<Purged, MemoryError> {
     tx.execute("DELETE FROM memory_derivation WHERE memory_id = ?1", [id])?;
     tx.execute("DELETE FROM memory_conflict WHERE new_id = ?1 OR old_id = ?1", [id])?;
     // A save not stored yet, or that failed after it was accepted, holds the
-    // text in the outbox; a row stored from a long save is one of its pieces.
-    tx.execute("DELETE FROM ingest_outbox WHERE instr(content, ?1) > 0", [&content])?;
+    // text in the outbox.
+    let outbox: Vec<OutboxRemoved> = {
+        let mut stmt = tx.prepare(&format!(
+            "SELECT operation_id, agent_id, state FROM ingest_outbox WHERE {OUTBOX_MATCH} ORDER BY id"
+        ))?;
+        let rows = stmt.query_map(held.params(), |r| {
+            Ok(OutboxRemoved { operation_id: r.get(0)?, agent_id: r.get(1)?, state: r.get(2)? })
+        })?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    tx.execute(&format!("DELETE FROM ingest_outbox WHERE {OUTBOX_MATCH}"), held.params())?;
     // After the delete, so the row no longer counts as live for them.
     if live {
         release_challengers(&tx, id, TimestampMs::now())?;
@@ -121,55 +251,153 @@ pub fn purge(base_dir: &Path, id: i64) -> Result<Purged, MemoryError> {
     // keeps the old segments until a merge: both still hold the text. A full
     // merge rewrites the index without them.
     c.execute("INSERT INTO memory_fts(memory_fts) VALUES ('optimize')", [])?;
-    // Pages freed long before this purge (every merge of the index frees
-    // some) still hold whatever they held, and `secure_delete` only zeroes
-    // pages freed from now on. Rebuilding the file leaves no free page. It
-    // keeps the rowids vec0 addresses its chunks by: a table with an index is
-    // copied with its rowids, and every vec0 shadow table has one.
+    leave_no_old_copy(c)?;
+    let backups = backups_holding(&crate::paths::backups_dir(base_dir), id, &held);
+    Ok(Purged {
+        revived: revived.revived.into_iter().map(|r| r.id).collect(),
+        hidden: revived.hidden,
+        pieces,
+        outbox,
+        backups,
+        workspaces: workspaces_holding(&base_dir.join("workspaces"), &content)
+            .into_iter()
+            .map(|(path, holding)| WorkspaceHolding { path, holding })
+            .collect(),
+    })
+}
+
+/// What [`mask_reasons`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct MaskedReasons {
+    /// The pairs whose reason was masked, with the kinds it held.
+    pub pairs: Vec<FlaggedPair>,
+    /// Snapshots in `<data>/backups` that still hold one of those reasons as
+    /// it was, by name. None is changed.
+    pub backups: Vec<PathBuf>,
+}
+
+/// Replaces every verdict reason that holds a secret with its masked text, so
+/// the secret is in neither `memory.db` nor its WAL. Every other reason, and
+/// everything else in the pair, stays as it is.
+///
+/// On a stopped store that is up to date, as [`purge`], and with no snapshot
+/// first for the same reason.
+pub fn mask_reasons(base_dir: &Path) -> Result<MaskedReasons, MemoryError> {
+    let Some((_lock, mut c)) = open_to_rewrite(base_dir)? else {
+        return Ok(MaskedReasons::default());
+    };
+    let found = reasons_with_a_secret(&c)?;
+    if found.is_empty() {
+        return Ok(MaskedReasons::default());
+    }
+    let tx = c.transaction()?;
+    for (pair, reason) in &found {
+        tx.execute(
+            "UPDATE memory_conflict SET reason = ?3 WHERE new_id = ?1 AND old_id = ?2",
+            rusqlite::params![pair.new_id, pair.old_id, redact(reason).text],
+        )?;
+    }
+    tx.commit()?;
+    leave_no_old_copy(c)?;
+    let backups = backups_holding_reasons(&crate::paths::backups_dir(base_dir), &found);
+    Ok(MaskedReasons { pairs: found.into_iter().map(|(pair, _)| pair).collect(), backups })
+}
+
+/// The store, locked against every other clawg and at a schema this binary
+/// writes, or `None` when it has never been migrated and so holds nothing.
+/// Nothing is written before every check passes.
+fn open_to_rewrite(base_dir: &Path) -> Result<Option<(StoreLock, rusqlite::Connection)>, MemoryError> {
+    let path = base_dir.join("memory.db");
+    if !path.exists() {
+        return Err(BackupError::NoStore { path }.into());
+    }
+    let lock = StoreLock::acquire(base_dir, StoreHolder::Maintenance)?;
+    let c = open_existing(base_dir)?;
+    match schema_plan(&read_history(&c)?, &known_migrations()) {
+        SchemaPlan::UpToDate => Ok(Some((lock, c))),
+        SchemaPlan::Fresh => Ok(None),
+        SchemaPlan::Pending { from, to } => Err(PurgeError::Pending { from, to }.into()),
+        SchemaPlan::Newer { db, binary } => Err(MemoryError::SchemaNewer { db, binary }),
+        SchemaPlan::Diverged { version } => Err(MemoryError::SchemaDiverged { version }),
+    }
+}
+
+/// Rebuilds the file and empties the WAL after a rewrite, then closes it.
+fn leave_no_old_copy(c: rusqlite::Connection) -> Result<(), MemoryError> {
+    // Pages freed long before this rewrite (every merge of the text index
+    // frees some) still hold whatever they held, and `secure_delete` only
+    // zeroes pages freed from now on. Rebuilding the file leaves no free
+    // page. It keeps the rowids vec0 addresses its chunks by: a table with an
+    // index is copied with its rowids, and every vec0 shadow table has one.
     c.execute_batch("VACUUM")?;
     // Older frames of the WAL can still hold the pages as they were.
     let busy: i64 = c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
     if busy != 0 {
         return Err(PurgeError::Busy.into());
     }
-    drop(c);
-    Ok(Purged { backups: backups_holding(&crate::paths::backups_dir(base_dir), id, &content) })
+    Ok(())
 }
 
-/// The snapshots in `dir` with a row `id` whose content is `content`, or an
-/// outbox row holding it, by name. One that cannot be read is listed too: it
-/// may hold the row.
-fn backups_holding(dir: &Path, id: i64, content: &str) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
-    let mut holding: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.file_name().and_then(|n| n.to_str()).and_then(parse_snapshot_name).is_some())
+/// The snapshots in `dir` that hold any of `found` with its reason as it was,
+/// by name. One that cannot be read is listed too.
+fn backups_holding_reasons(dir: &Path, found: &[(FlaggedPair, String)]) -> Vec<PathBuf> {
+    let mut holding: Vec<PathBuf> = snapshots_in(dir)
+        .into_iter()
         .filter(|p| {
             let Ok(c) = open_for_probe(p) else { return true };
-            let in_memory = c
-                .query_row(
-                    "SELECT count(*) FROM memory WHERE id = ?1 AND content = ?2",
-                    rusqlite::params![id, content],
+            if !has_table(&c, "memory_conflict").unwrap_or(true) {
+                return false;
+            }
+            found.iter().any(|(pair, reason)| {
+                c.query_row(
+                    "SELECT count(*) FROM memory_conflict WHERE new_id = ?1 AND old_id = ?2 AND reason = ?3",
+                    rusqlite::params![pair.new_id, pair.old_id, reason],
                     |r| r.get::<_, i64>(0),
                 )
-                .map_or(true, |n| n > 0);
-            in_memory || outbox_holds(&c, content)
+                .map_or(true, |n| n > 0)
+            })
         })
         .collect();
     holding.sort();
     holding
 }
 
-/// Whether a snapshot's outbox has a row with `content` in it. A snapshot
-/// from before the outbox has no such table, and so cannot hold one.
-fn outbox_holds(c: &rusqlite::Connection, content: &str) -> bool {
-    let has_table = c
-        .query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'ingest_outbox'", [], |r| {
-            r.get::<_, i64>(0)
+/// The files in `dir` named as snapshots.
+fn snapshots_in(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).and_then(parse_snapshot_name).is_some())
+        .collect()
+}
+
+/// The snapshots in `dir` with a row `id` whose content is the purged one, or
+/// an outbox row holding it, by name. One that cannot be read is listed too:
+/// it may hold the row.
+fn backups_holding(dir: &Path, id: i64, held: &OutboxMatch) -> Vec<PathBuf> {
+    let mut holding: Vec<PathBuf> = snapshots_in(dir)
+        .into_iter()
+        .filter(|p| {
+            let Ok(c) = open_for_probe(p) else { return true };
+            let in_memory = c
+                .query_row(
+                    "SELECT count(*) FROM memory WHERE id = ?1 AND content = ?2",
+                    rusqlite::params![id, held.content],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_or(true, |n| n > 0);
+            in_memory || outbox_holds(&c, held)
         })
-        .map_or(true, |n| n > 0);
-    has_table
-        && c.query_row("SELECT count(*) FROM ingest_outbox WHERE instr(content, ?1) > 0", [content], |r| {
+        .collect();
+    holding.sort();
+    holding
+}
+
+/// Whether a snapshot's outbox has a row `held` matches. A snapshot from
+/// before the outbox has no such table, and so cannot hold one.
+fn outbox_holds(c: &rusqlite::Connection, held: &OutboxMatch) -> bool {
+    has_table(c, "ingest_outbox").unwrap_or(true)
+        && c.query_row(&format!("SELECT count(*) FROM ingest_outbox WHERE {OUTBOX_MATCH}"), held.params(), |r| {
             r.get::<_, i64>(0)
         })
         .map_or(true, |n| n > 0)
@@ -237,7 +465,7 @@ mod tests {
         let before = files_in(dir.path());
 
         assert_eq!(
-            scan(dir.path()).unwrap(),
+            scan(dir.path()).unwrap().memories,
             vec![
                 Flagged { id: aws, kinds: vec![SecretKind::AwsAccessKey], deleted: false },
                 Flagged { id: jwt, kinds: vec![SecretKind::Jwt], deleted: true },
@@ -256,12 +484,120 @@ mod tests {
         drop(store);
 
         assert_eq!(
-            scan(dir.path()).unwrap(),
+            scan(dir.path()).unwrap().memories,
             vec![
                 Flagged { id: password, kinds: vec![SecretKind::Password], deleted: false },
                 Flagged { id: marked, kinds: vec![SecretKind::Private], deleted: false },
             ]
         );
+    }
+
+    async fn add_pair(store: &MemoryStore, new: i64, old: i64, reason: Option<String>) {
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO memory_conflict (new_id, old_id, distance, state, verdict, reason, created_at) \
+                     VALUES (?1, ?2, 0.3, 'judged', 'scoped', ?3, 0)",
+                    rusqlite::params![new, old, reason],
+                )
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_scan_finds_reasons_that_hold_a_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+        let a = insert(&store, "the deploy runs on fridays".to_string()).await;
+        let b = insert(&store, "the deploy runs on mondays".to_string()).await;
+        let c = insert(&store, "the deploy runs on sundays".to_string()).await;
+        add_pair(&store, b, a, Some(format!("rotated {}", fake("ghp_", "a1B2", 36)))).await;
+        add_pair(&store, c, a, Some("one is the dev profile".to_string())).await;
+        add_pair(&store, c, b, None).await;
+        store.conn.clone().close().await.unwrap();
+        drop(store);
+
+        let found = scan(dir.path()).unwrap();
+
+        assert!(found.memories.is_empty(), "{:?}", found.memories);
+        assert_eq!(found.pairs, vec![FlaggedPair { new_id: b, old_id: a, kinds: vec![SecretKind::GithubToken] }]);
+    }
+
+    fn reasons(dir: &Path) -> Vec<Option<String>> {
+        let c = rusqlite::Connection::open(dir.join("memory.db")).unwrap();
+        let mut stmt = c.prepare("SELECT reason FROM memory_conflict ORDER BY new_id, old_id").unwrap();
+        let reasons = stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        reasons
+    }
+
+    #[tokio::test]
+    async fn masking_reasons_rewrites_only_the_ones_with_a_secret() {
+        use crate::memory::backup::backup_offline;
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+        let a = insert(&store, "the deploy runs on fridays".to_string()).await;
+        let b = insert(&store, "the deploy runs on mondays".to_string()).await;
+        let c = insert(&store, "the deploy runs on sundays".to_string()).await;
+        let token = fake("ghp_", "q8Zk", 36);
+        add_pair(&store, b, a, Some(format!("rotated {token}"))).await;
+        add_pair(&store, c, a, Some("one is the dev profile".to_string())).await;
+        add_pair(&store, c, b, None).await;
+        store.conn.clone().close().await.unwrap();
+        drop(store);
+        let held = backup_offline(dir.path()).unwrap();
+        assert!(bytes_mention(dir.path(), b"q8Zkq8Zk"), "the fixture holds the token");
+
+        let masked = mask_reasons(dir.path()).unwrap();
+
+        assert_eq!(
+            masked,
+            MaskedReasons {
+                pairs: vec![FlaggedPair { new_id: b, old_id: a, kinds: vec![SecretKind::GithubToken] }],
+                backups: vec![held],
+            }
+        );
+        assert_eq!(
+            reasons(dir.path()),
+            [Some("rotated [REDACTED:github_token]".to_string()), Some("one is the dev profile".to_string()), None]
+        );
+        assert!(!bytes_mention(dir.path(), b"q8Zkq8Zk"), "the token's bytes are still on disk");
+        assert_eq!(mask_reasons(dir.path()).unwrap(), MaskedReasons::default(), "a second run finds nothing");
+        StoreLock::acquire(dir.path(), StoreHolder::Daemon).expect("the lock was released");
+    }
+
+    #[tokio::test]
+    async fn masking_reasons_refuses_while_the_daemon_holds_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+        let a = insert(&store, "the deploy runs on fridays".to_string()).await;
+        let b = insert(&store, "the deploy runs on mondays".to_string()).await;
+        add_pair(&store, b, a, Some(format!("rotated {}", fake("ghp_", "a1B2", 36)))).await;
+        store.conn.clone().close().await.unwrap();
+        drop(store);
+        let before = std::fs::read(dir.path().join("memory.db")).unwrap();
+        let _daemon = StoreLock::acquire(dir.path(), StoreHolder::Daemon).unwrap();
+
+        let err = mask_reasons(dir.path()).unwrap_err();
+
+        assert!(matches!(err, MemoryError::StoreInUse { .. }), "{err}");
+        assert_eq!(std::fs::read(dir.path().join("memory.db")).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn the_scan_of_a_store_from_before_the_pairs_lists_rows_only() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::memory::db::seed_on_disk(dir.path(), Some(14)).await;
+        rusqlite::Connection::open(dir.path().join("memory.db"))
+            .unwrap()
+            .execute(INSERT_ROW, [format!("ci token {}", fake("ghp_", "a1B2", 36))])
+            .unwrap();
+
+        let found = scan(dir.path()).unwrap();
+
+        assert_eq!(found.memories.len(), 1);
+        assert!(found.pairs.is_empty());
     }
 
     #[tokio::test]
@@ -276,7 +612,7 @@ mod tests {
 
         let found = scan(dir.path()).unwrap();
 
-        assert_eq!(found, vec![Flagged { id, kinds: vec![SecretKind::GithubToken], deleted: false }]);
+        assert_eq!(found.memories, vec![Flagged { id, kinds: vec![SecretKind::GithubToken], deleted: false }]);
         drop(store);
     }
 
@@ -527,19 +863,155 @@ mod tests {
 
         let purged = purge(dir.path(), id).unwrap();
 
-        assert_eq!(purged, Purged { backups: vec![with.clone(), after_delete.clone()] });
+        assert_eq!(purged.backups, vec![with.clone(), after_delete.clone()]);
         let now: Vec<Vec<u8>> =
             [&without, &with, &after_delete].iter().map(|p| std::fs::read(p).unwrap()).collect();
         assert_eq!(now, kept, "no backup was changed");
     }
 
     fn add_outbox_row(c: &rusqlite::Connection, operation_id: &str, content: &str) {
+        add_outbox_row_of(c, "agent-s", operation_id, content);
+    }
+
+    fn add_outbox_row_of(c: &rusqlite::Connection, agent: &str, operation_id: &str, content: &str) {
         c.execute(
             "INSERT INTO ingest_outbox (operation_id, agent_id, content, event, state, created_at, updated_at) \
-             VALUES (?1, 'agent-s', ?2, '{}', 'failed', 0, 0)",
-            [operation_id, content],
+             VALUES (?1, ?2, ?3, '{}', 'failed', 0, 0)",
+            [operation_id, agent, content],
         )
         .unwrap();
+    }
+
+    fn outbox_ids(dir: &Path) -> Vec<String> {
+        let c = rusqlite::Connection::open(dir.join("memory.db")).unwrap();
+        let mut stmt = c.prepare("SELECT operation_id FROM ingest_outbox ORDER BY id").unwrap();
+        let ids = stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        ids
+    }
+
+    #[tokio::test]
+    async fn purging_the_current_revision_brings_the_previous_one_back() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::memory::db::seed_on_disk(dir.path(), None).await;
+        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+        let mut ids = Vec::new();
+        for text in ["deploy to fly", "deploy to render", "a rule a verdict replaced", SECRET] {
+            c.execute(INSERT_ROW, [text]).unwrap();
+            ids.push(c.last_insert_rowid());
+        }
+        let [first, middle, judged, current] = ids[..] else { unreachable!() };
+        let supersede = "UPDATE memory SET status = 'superseded', superseded_by = ?2, supersede_cause = ?3, \
+                         topic_key = ?4 WHERE id = ?1";
+        let key = Some("deploy/target");
+        c.execute(supersede, rusqlite::params![first, middle, "revision", key]).unwrap();
+        c.execute(supersede, rusqlite::params![middle, current, "revision", key]).unwrap();
+        c.execute(supersede, rusqlite::params![judged, current, "verdict", None::<&str>]).unwrap();
+        c.execute("UPDATE memory SET topic_key = 'deploy/target' WHERE id = ?1", [current]).unwrap();
+        drop(c);
+
+        let purged = purge(dir.path(), current).unwrap();
+
+        assert_eq!((purged.revived.as_slice(), purged.hidden.as_slice()), ([middle].as_slice(), [judged].as_slice()));
+        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+        let state = |id: i64| -> (String, Option<i64>) {
+            c.query_row("SELECT status, superseded_by FROM memory WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+        };
+        assert_eq!(state(middle), ("active".to_string(), None));
+        assert_eq!(state(first), ("superseded".to_string(), Some(middle)));
+        assert_eq!(state(judged), ("superseded".to_string(), Some(current)), "a verdict stays");
+        drop(c);
+        assert_no_trace(dir.path(), current);
+    }
+
+    #[tokio::test]
+    async fn purge_names_the_workspaces_that_still_hold_the_text() {
+        use crate::memory::workspace::{AUTO_END, AUTO_START, USER_END, USER_START};
+        let dir = tempfile::tempdir().unwrap();
+        let id = store_with_a_secret(dir.path(), false).await;
+        let root = dir.path().join("workspaces");
+        let write = |agent: &str, project: &str, auto: &str, user: &str| {
+            let path = root.join(agent).join(project).join("workspace.md");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let text = format!("{AUTO_START}\n{auto}\n{AUTO_END}\n{USER_START}\n{user}\n{USER_END}\n");
+            std::fs::write(&path, &text).unwrap();
+            (path, text)
+        };
+        let auto = write("agent-s", "repo-1a2b", &format!("- {SECRET}"), "");
+        let user = write("agent-o", "default", "", &format!("copied: {SECRET}"));
+        let other = write("agent-s", "default", "- nothing to see", "");
+
+        let purged = purge(dir.path(), id).unwrap();
+
+        assert_eq!(
+            purged.workspaces,
+            vec![
+                WorkspaceHolding { path: user.0.clone(), holding: Holding { auto: false, user: true } },
+                WorkspaceHolding { path: auto.0.clone(), holding: Holding { auto: true, user: false } },
+            ]
+        );
+        for (path, text) in [auto, user, other] {
+            assert_eq!(std::fs::read_to_string(path).unwrap(), text, "no workspace was changed");
+        }
+    }
+
+    #[tokio::test]
+    async fn purging_the_first_piece_empties_the_head_of_its_save() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::memory::db::seed_on_disk(dir.path(), None).await;
+        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+        let mut ids = Vec::new();
+        for text in [SECRET, "and the second piece of it", "and the third piece of it"] {
+            c.execute(INSERT_ROW, [text]).unwrap();
+            ids.push(c.last_insert_rowid());
+        }
+        for (piece, (id, context)) in ids.iter().zip(["", SECRET, SECRET]).enumerate() {
+            c.execute(
+                "INSERT INTO memory_piece (save_id, piece, memory_id, context) VALUES (1, ?1, ?2, ?3)",
+                rusqlite::params![piece as i64 + 1, id, context],
+            )
+            .unwrap();
+        }
+        let whole = format!("{SECRET} and the second piece of it and the third piece of it");
+        add_outbox_row(&c, "op-long", &whole);
+        drop(c);
+
+        let purged = purge(dir.path(), ids[0]).unwrap();
+
+        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+        let links: Vec<(i64, String)> = c
+            .prepare("SELECT memory_id, context FROM memory_piece ORDER BY piece")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        drop(c);
+        assert_eq!(links, ids.iter().map(|&id| (id, String::new())).collect::<Vec<_>>());
+        assert!(outbox_ids(dir.path()).is_empty());
+        assert_eq!(purged.pieces, ids[1..]);
+        assert!(!bytes_mention(dir.path(), b"quokka"), "the secret's bytes are still on disk");
+    }
+
+    #[tokio::test]
+    async fn purge_keeps_other_agents_and_longer_saves_in_the_outbox() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::memory::db::seed_on_disk(dir.path(), None).await;
+        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+        c.execute(INSERT_ROW, ["use pnpm"]).unwrap();
+        let id = c.last_insert_rowid();
+        add_outbox_row_of(&c, "agent-o", "op-other", "use pnpm");
+        add_outbox_row_of(&c, "agent-s", "op-same", "use pnpm");
+        add_outbox_row_of(&c, "agent-s", "op-longer", "use pnpm in the monorepo");
+        drop(c);
+
+        let purged = purge(dir.path(), id).unwrap();
+
+        assert_eq!(outbox_ids(dir.path()), ["op-other", "op-longer"]);
+        assert_eq!(
+            purged.outbox,
+            vec![OutboxRemoved { operation_id: "op-same".into(), agent_id: "agent-s".into(), state: "failed".into() }]
+        );
     }
 
     #[tokio::test]
@@ -548,7 +1020,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         crate::memory::db::seed_on_disk(dir.path(), None).await;
         let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
-        add_outbox_row(&c, "op-1", &format!("before it was stored: {SECRET}, and more"));
+        add_outbox_row(&c, "op-1", SECRET);
         add_outbox_row(&c, "op-2", "nothing to do with it");
         drop(c);
         let only_in_the_outbox = backup_offline(dir.path()).unwrap();
@@ -560,18 +1032,9 @@ mod tests {
 
         let purged = purge(dir.path(), id).unwrap();
 
-        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
-        let left: Vec<String> = c
-            .prepare("SELECT operation_id FROM ingest_outbox ORDER BY id")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        drop(c);
-        assert_eq!(left, ["op-2"]);
+        assert_eq!(outbox_ids(dir.path()), ["op-2"]);
         assert!(!bytes_mention(dir.path(), b"quokka"), "the secret's bytes are still on disk");
-        assert_eq!(purged, Purged { backups: vec![only_in_the_outbox] });
+        assert_eq!(purged.backups, vec![only_in_the_outbox]);
     }
 
     #[tokio::test]
@@ -583,7 +1046,8 @@ mod tests {
         crate::memory::db::seed_on_disk(dir.path(), Some(crate::memory::backup::latest_known() - 1)).await;
         std::fs::copy(dir.path().join("memory.db"), &old).unwrap();
 
-        assert!(backups_holding(&backups, 1, SECRET).is_empty());
+        let held = OutboxMatch { agent: Some("agent-s"), content: SECRET, piece: false };
+        assert!(backups_holding(&backups, 1, &held).is_empty());
     }
 
     #[test]

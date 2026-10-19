@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 | M | — (conviene antes de 43 y 44; ver «Interacciones») | exploración (borrador) |
+| 1 | M | — (conviene antes de 43 y 44; ver «Interacciones») | exploración cerrada; decisiones en la [propuesta](proposal.md#decisiones) |
 
 **Tesis:** un secreto que llega a clawg se enmascara en todo lugar donde la regla puede verlo, y `clawg purge` saca un texto de todos los lugares donde clawg lo copió, y sólo ese texto. Hoy hay cuatro huecos verificados. El detector no conoce formatos frecuentes (claves de AWS, OpenRouter, Hugging Face, webhooks de Slack, claves PGP) porque sus patrones por contexto sólo se anclan en `password`. `purge` deja el texto en `workspace.md` y la cabecera de un save largo, y a la vez puede borrar saves aceptados de otros agentes, porque compara el outbox por subcadena. Y el `reason` de un veredicto se guarda sin enmascarar, en una columna que `clawg secrets` no mira. Y `purge` de la versión vigente de un tema deja las versiones anteriores escondidas para siempre, porque nadie las revive. Los cuatro rompen la promesa que el producto hace con los secretos, y una importación (44) los multiplica.
 
@@ -34,7 +34,7 @@
 
 ### 2. `purge` no saca «todo» y saca «de más»
 
-- **a. `workspace.md`.** Si la fila purgada era una preferencia, decisión o procedimiento elegible, su texto está en la sección AUTO de `workspaces/<agente>/<proyecto>/workspace.md`, que se regenera sólo en `recall_context`. `purge` corre con el daemon parado y sin `MemoryStore`. La sección USER es del usuario y nunca se reescribe (`assemble_file`, `workspace.rs:494-584`); puede tener el texto, y sólo se la puede **nombrar**. La copia de un archivo legado a un id de proyecto nuevo nunca mueve el original (`workspace.rs:50-55`), así que el texto puede estar en dos archivos.
+- **a. `workspace.md`.** Si la fila purgada era una preferencia, decisión o procedimiento elegible, su texto está en la sección AUTO de `workspaces/<agente>/<proyecto>/workspace.md`, que se regenera sólo en `recall_context`. `purge` corre con el daemon parado y sin `MemoryStore`. La sección USER es del usuario y nunca se reescribe (`assemble_file`, `workspace.rs:497-587`); puede tener el texto, y sólo se la puede **nombrar**. La copia de un archivo legado a un id de proyecto nuevo nunca mueve el original (`workspace.rs:50-55`), así que el texto puede estar en dos archivos.
 - **b. Subcadena entre agentes.** Un texto corto (`use pnpm`) borra todo save pendiente o `failed` de **cualquier** agente que lo contenga: saves aceptados con `201`/`202` que se pierden sin aviso. Es el mismo contrato que dice «no se pierde nada de lo aceptado» (`.claude/CLAUDE.md`, sección del outbox).
 - **c. Cabecera de un save largo** (backlog de `openspec/README.md`). `memory_piece.context` guarda el principio del save (`V11__memory_piece.sql:4-8`, `:11-16`); `purge` no toca esa tabla (`secrets.rs:103-111`), así que purgar el pedazo 1 deja sus primeros tokens en los vínculos de los pedazos 2..N.
 - **d. Fila `failed` del outbox sin salida** (backlog). Nada la reintenta ni la descarta (`outbox.rs:300-317` sólo la marca). No es un problema de secretos por sí mismo, pero el `last_error` (`IngestFailure::Failed(format!("embed failed: {e}"))`, `worker.rs:766`, `:803`) puede citar el error de una librería; **no se verificó que cite el contenido**, y habría que comprobarlo con un fallo provocado.
@@ -120,7 +120,7 @@ Resultado: **una** columna con texto libre del usuario o el agente que nunca se 
 - **topic-revisions (27) y revision-aware-delete (49), archivados.** Definen la cadena de `superseded`, `supersede_cause` y la revival que O reutiliza (`revival.rs`, `admin.rs:355`).
 - **outbox-lifecycle (53).** Toca el outbox que `purge` también borra; coordinar G con lo que 53 decida sobre filas `failed`. Comparten la pregunta «qué hay en el store que no debería».
 - **project-clone-identity (30).** Hace re-key de ids; el archivo legado de `workspace.md` es otro lugar que `purge` debe nombrar.
-- **Ya arreglado (`92cee20`):** un `project_id` ya no coloca un `workspace.md` fuera de la carpeta de su agente (`project_segment`, `workspace.rs:639`). No hace falta para D.
+- **Ya arreglado (`92cee20`):** un `project_id` ya no coloca un `workspace.md` fuera de la carpeta de su agente (`project_segment`, `workspace.rs:642`). No hace falta para D.
 - **Índice de docs.** Se re-lee por sha256 o modelo, no por cambio de regla (como en 42): un pasaje viejo queda con la regla vieja. Es derivado y no destruye nada del usuario; se acepta.
 
 ## Alcance candidato
@@ -141,16 +141,16 @@ Resultado: **una** columna con texto libre del usuario o el agente que nunca se 
 
 ## Decisiones abiertas
 
-Son del usuario.
+Respondidas en la [propuesta](proposal.md#decisiones): `credential` aparte con el piso de 6 caracteres; D; G con H; M y N; `last_error` se enmascara siempre; sin P; se acepta que una regla nueva bloquee `undelete`.
 
-- [ ] **Claves del patrón `Credential`.** ¿Cuáles entran, y se mantiene el piso de 6 caracteres de `is_literal_secret`?
-- [ ] **Tipo.** ¿`credential` aparte (recomendado) o ampliar `password`?
-- [ ] **Workspace.** ¿D (nombrar), E (reescribir AUTO) o F (regenerar)?
-- [ ] **Outbox.** ¿G con H, o I con su migración?
-- [ ] **`reason` viejos.** ¿Sólo `scan` los lista (M), o hay un comando de limpieza (N)?
-- [ ] **`last_error`.** ¿Se verifica y, si cita contenido, se enmascara?
-- [ ] **Historial ya escondido.** O arregla lo que se purgue desde ahora. ¿Se agrega una pasada de mantenimiento (P) para los `superseded_by` que ya cuelgan, revive o reapunta, o los lista `doctor` (31) y se deja al usuario?
-- [ ] **Restauración de filas viejas.** ¿Se acepta que una regla nueva bloquee `undelete` de filas que antes volvían?
+- [x] **Claves del patrón `Credential`.** ¿Cuáles entran, y se mantiene el piso de 6 caracteres de `is_literal_secret`?
+- [x] **Tipo.** ¿`credential` aparte (recomendado) o ampliar `password`?
+- [x] **Workspace.** ¿D (nombrar), E (reescribir AUTO) o F (regenerar)?
+- [x] **Outbox.** ¿G con H, o I con su migración?
+- [x] **`reason` viejos.** ¿Sólo `scan` los lista (M), o hay un comando de limpieza (N)?
+- [x] **`last_error`.** ¿Se verifica y, si cita contenido, se enmascara?
+- [x] **Historial ya escondido.** O arregla lo que se purgue desde ahora. ¿Se agrega una pasada de mantenimiento (P) para los `superseded_by` que ya cuelgan, revive o reapunta, o los lista `doctor` (31) y se deja al usuario?
+- [x] **Restauración de filas viejas.** ¿Se acepta que una regla nueva bloquee `undelete` de filas que antes volvían?
 
 ## Cómo se mide
 

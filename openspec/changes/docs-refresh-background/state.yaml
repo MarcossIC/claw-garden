@@ -1,5 +1,5 @@
-change: local-isolation
-objective: "transversal"
+change: docs-refresh-background
+objective: "3"
 depends_on: []
 phase: explore
 artifacts:

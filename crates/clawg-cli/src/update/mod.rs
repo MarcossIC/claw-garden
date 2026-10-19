@@ -206,6 +206,7 @@ async fn install(
                 data_dir: base_dir.to_path_buf(),
                 pre_migration: installation.pre_migration(),
                 had_daemon,
+                answering: installation.answering().await,
             };
             Err(UpdateError::Failed(report::failure(&failure, &context)))
         }
