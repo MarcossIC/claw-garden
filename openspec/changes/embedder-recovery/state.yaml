@@ -1,7 +1,7 @@
 change: embedder-recovery
 objective: "transversal"
 depends_on: []
-phase: verify
+phase: archive
 artifacts:
   exploration: done
   proposal: done
@@ -9,6 +9,6 @@ artifacts:
   design: done
   tasks: done
   apply: done
-  verify: pending
+  verify: done  # Linux; the CI of the pull request covers Linux and Windows
   archive: pending
 updated: 2026-10-19
