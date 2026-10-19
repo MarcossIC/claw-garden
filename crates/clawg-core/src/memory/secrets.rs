@@ -17,6 +17,7 @@ use crate::memory::dispute::release_challengers;
 use crate::memory::redact::{redact, SecretKind};
 use crate::memory::revival::{revive_after_delete_of_piece, Revived};
 use crate::memory::store_lock::{StoreHolder, StoreLock};
+use crate::memory::workspace::{workspaces_holding, Holding};
 use crate::memory::MemoryError;
 
 /// A `memory` row whose content holds at least one secret. Carries what the
@@ -128,6 +129,17 @@ pub struct Purged {
     /// Snapshots in `<data>/backups` that still hold the row, by name. None
     /// is changed: deleting them is the user's call.
     pub backups: Vec<PathBuf>,
+    /// The `workspace.md` files that still hold the row's text, in path
+    /// order. None is changed: the AUTO section is rewritten by the agent's
+    /// next context there, and the rest is the user's.
+    pub workspaces: Vec<WorkspaceHolding>,
+}
+
+/// A `workspace.md` that holds a purged text, and in which section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceHolding {
+    pub path: PathBuf,
+    pub holding: Holding,
 }
 
 /// An outbox row a purge removed, by the save it was.
@@ -247,6 +259,10 @@ pub fn purge(base_dir: &Path, id: i64) -> Result<Purged, MemoryError> {
         pieces,
         outbox,
         backups,
+        workspaces: workspaces_holding(&base_dir.join("workspaces"), &content)
+            .into_iter()
+            .map(|(path, holding)| WorkspaceHolding { path, holding })
+            .collect(),
     })
 }
 
@@ -906,6 +922,37 @@ mod tests {
         assert_eq!(state(judged), ("superseded".to_string(), Some(current)), "a verdict stays");
         drop(c);
         assert_no_trace(dir.path(), current);
+    }
+
+    #[tokio::test]
+    async fn purge_names_the_workspaces_that_still_hold_the_text() {
+        use crate::memory::workspace::{AUTO_END, AUTO_START, USER_END, USER_START};
+        let dir = tempfile::tempdir().unwrap();
+        let id = store_with_a_secret(dir.path(), false).await;
+        let root = dir.path().join("workspaces");
+        let write = |agent: &str, project: &str, auto: &str, user: &str| {
+            let path = root.join(agent).join(project).join("workspace.md");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let text = format!("{AUTO_START}\n{auto}\n{AUTO_END}\n{USER_START}\n{user}\n{USER_END}\n");
+            std::fs::write(&path, &text).unwrap();
+            (path, text)
+        };
+        let auto = write("agent-s", "repo-1a2b", &format!("- {SECRET}"), "");
+        let user = write("agent-o", "default", "", &format!("copied: {SECRET}"));
+        let other = write("agent-s", "default", "- nothing to see", "");
+
+        let purged = purge(dir.path(), id).unwrap();
+
+        assert_eq!(
+            purged.workspaces,
+            vec![
+                WorkspaceHolding { path: user.0.clone(), holding: Holding { auto: false, user: true } },
+                WorkspaceHolding { path: auto.0.clone(), holding: Holding { auto: true, user: false } },
+            ]
+        );
+        for (path, text) in [auto, user, other] {
+            assert_eq!(std::fs::read_to_string(path).unwrap(), text, "no workspace was changed");
+        }
     }
 
     #[tokio::test]

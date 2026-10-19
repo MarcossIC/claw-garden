@@ -485,6 +485,53 @@ pub(crate) async fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> st
     written
 }
 
+/// Where a `workspace.md` holds a text: in the AUTO section, which the next
+/// regeneration rewrites from the store, or anywhere else, which is the
+/// user's and never rewritten.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Holding {
+    pub auto: bool,
+    pub user: bool,
+}
+
+/// Where `file` holds `text`. Pure, so the split is under test without a
+/// filesystem.
+pub(crate) fn sections_holding(file: &str, text: &str) -> Holding {
+    let auto = file.find(AUTO_START).and_then(|start| {
+        let inner = start + AUTO_START.len();
+        file[inner..].find(AUTO_END).map(|end| start..inner + end + AUTO_END.len())
+    });
+    match auto {
+        Some(range) => Holding {
+            auto: file[range.clone()].contains(text),
+            user: file[..range.start].contains(text) || file[range.end..].contains(text),
+        },
+        None => Holding { auto: false, user: file.contains(text) },
+    }
+}
+
+/// Every `<root>/<agent>/<project>/workspace.md` that holds `text`, by path,
+/// in path order. Reads only; a file that cannot be read is skipped.
+pub(crate) fn workspaces_holding(root: &Path, text: &str) -> Vec<(PathBuf, Holding)> {
+    let dirs = |dir: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_dir()).collect())
+            .unwrap_or_default()
+    };
+    let mut holding: Vec<(PathBuf, Holding)> = dirs(root)
+        .iter()
+        .flat_map(|agent| dirs(agent))
+        .map(|project| project.join("workspace.md"))
+        .filter_map(|path| {
+            let bytes = std::fs::read(&path).ok()?;
+            let found = sections_holding(&String::from_utf8_lossy(&bytes), text);
+            (found.auto || found.user).then_some((path, found))
+        })
+        .collect();
+    holding.sort_by(|a, b| a.0.cmp(&b.0));
+    holding
+}
+
 /// Parse the existing file content to find AUTO and USER sections.
 struct Sections {
     before_auto: String,
@@ -672,6 +719,21 @@ fn is_windows_device_name(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::memory::db::MemoryStore;
+
+    #[test]
+    fn the_sections_holding_a_text_are_told_apart() {
+        let text = "deploy with the vault key";
+        let file = |auto: &str, user: &str| {
+            format!("# notes\n{AUTO_START}\n{auto}\n{AUTO_END}\n{USER_START}\n{user}\n{USER_END}\n")
+        };
+        let holds = |auto, user| Holding { auto, user };
+        assert_eq!(sections_holding(&file(&format!("- {text}"), "mine"), text), holds(true, false));
+        assert_eq!(sections_holding(&file("- other", &format!("I wrote: {text}")), text), holds(false, true));
+        assert_eq!(sections_holding(&file(&format!("- {text}"), text), text), holds(true, true));
+        assert_eq!(sections_holding(&file("- other", "mine"), text), holds(false, false));
+        assert_eq!(sections_holding(&format!("{text} before any mark\n{}", file("", "")), text), holds(false, true));
+        assert_eq!(sections_holding(text, text), holds(false, true), "a file without marks is the user's");
+    }
 
         #[tokio::test]
     async fn a_rekey_copies_the_legacy_workspace_and_keeps_it() {

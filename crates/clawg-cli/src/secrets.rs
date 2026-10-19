@@ -215,13 +215,14 @@ mod tests {
     #[test]
     fn the_purge_report_names_backups_to_delete_by_hand() {
         use std::path::PathBuf;
-        assert_eq!(purge_report(57, &Purged { revived: vec![], hidden: vec![], pieces: vec![], outbox: vec![], backups: vec![] }), "purged memory #57");
+        assert_eq!(purge_report(57, &Purged { revived: vec![], hidden: vec![], pieces: vec![], outbox: vec![], backups: vec![], workspaces: vec![] }), "purged memory #57");
         let held = Purged {
             revived: vec![],
             hidden: vec![],
             pieces: vec![],
             outbox: vec![],
             backups: vec![PathBuf::from("/b/memory-x-manual.db"), PathBuf::from("/b/memory-y-pre-restore.db")],
+            workspaces: vec![],
         };
         assert_eq!(
             purge_report(57, &held),
