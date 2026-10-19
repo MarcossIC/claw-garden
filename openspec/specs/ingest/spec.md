@@ -277,7 +277,7 @@ La cola de ingesta MUST tener capacidad `INGEST_QUEUE_CAPACITY` (1024 eventos). 
 - WHEN se guardan 3 textos
 - THEN los dos primeros responden `202` y el tercero `503 ingest_queue_full`, y el outbox tiene las filas de los dos primeros
 
-**Tests:** `a_save_into_a_full_queue_is_503_queue_full` (`tests/api.rs`) y `the_production_ingest_queue_holds_1024_saves` (`crates/clawg-core/src/runtime.rs`, mod tests). La capacidad se inyecta con `MemoryRuntime::new_for_test_with_capacity` (`runtime.rs:336`). Las filas las cubre `a_save_into_a_full_queue_leaves_no_outbox_row` (`tests/api.rs`).
+**Tests:** `a_save_into_a_full_queue_is_503_queue_full` (`tests/api.rs`) y `the_production_ingest_queue_holds_1024_saves` (`crates/clawg-core/src/runtime.rs`, mod tests). La capacidad se inyecta con `MemoryRuntime::new_for_test_with_capacity` (`runtime.rs:328`). Las filas las cubre `a_save_into_a_full_queue_leaves_no_outbox_row` (`tests/api.rs`).
 
 ### `operation_id`
 

@@ -69,7 +69,7 @@ Forma del arreglo, dentro de la transacción del re-key: aplicar la regla de `re
 - Los snapshots: `Reason::PreMigration`, `PreRestore`, `Manual`, `PreReembed` (`crates/clawg-core/src/memory/backup.rs:119-128`) y `MemoryRuntime::snapshot(reason)` (`runtime.rs:195-203`). `register` no toma ninguno hoy (`api.rs:1017-1038`).
 - `is_project_id` (`project.rs:40-49`): valida `{nombre}-{4 hex}`; hay que ensancharla si cambia el ancho.
 - `clawg backup`, `restore`, `purge`, `sharing`: patrón de subcomando de mantenimiento (`cli.rs:68-122`). No hay `projects`.
-- Test de «base de la versión anterior» con ids intactos: `a_database_from_the_previous_version_opens_with_its_project_ids_untouched` (`crates/clawg-core/src/memory/db.rs:665-725`).
+- Test de «base de la versión anterior» con ids intactos: `a_database_from_the_previous_version_opens_with_its_project_ids_untouched` (`crates/clawg-core/src/memory/db.rs:707-767`).
 
 ## Enfoques posibles
 

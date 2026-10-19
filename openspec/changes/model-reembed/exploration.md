@@ -27,7 +27,7 @@ Un punto que ese texto no cubría: la memoria apagada no es «vacía» para todo
 ### Dónde vive el contrato y qué ve el usuario
 
 - La tabla `embedding_contract` guarda una fila con `model_id`, `dim`, `query_prefix` y `passage_prefix` (`crates/clawg-core/migrations/V5__embedding_contract.sql`). También `metric` y `normalized`, que no se comparan.
-- `ensure_embedding_contract` la escribe si no existe y la compara byte a byte si existe (`crates/clawg-core/src/memory/db.rs:297-346`). Una diferencia da `Mismatch`.
+- `ensure_embedding_contract` la escribe si no existe y la compara byte a byte si existe (`crates/clawg-core/src/memory/db.rs:339-388`). Una diferencia da `Mismatch`.
 - La identidad la informa el embedder. Modelo y dimensión salen de literales en `FastEmbedLocal::from_bytes` (`embedder.rs:268-269`). Los prefijos salen de dos constantes (`embedder.rs:214-220`).
 - El bootstrap compara **después** de bajar y cargar el modelo (`bootstrap.rs:320-346`). Ante un mismatch deja la celda del embedder vacía y devuelve `BootstrapError::Mismatch`. No reintenta (`specs/ingest`, líneas 184-185).
 - **Lo que ve el usuario:**
@@ -79,9 +79,9 @@ Un punto que ese texto no cubría: la memoria apagada no es «vacía» para todo
 ### ¿Hay un test que fije el contrato de producción?
 
 - **Prefijos: sí.** `e5_prefix_constants_are_symmetric_with_the_load_bearing_trailing_space` (`embedder.rs:730-738`). Cambiarlos rompe un test.
-- **Modelo y dimensión de producción: no.** `FastEmbedLocal` sólo se construye con `from_bytes`, que necesita el modelo real. Los literales `384` y `"multilingual-e5-small"` (`embedder.rs:268-269`) no los verifica ningún test automático. Los tests de `db.rs:1789-1801` y `bootstrap.rs:889-1007` usan embedders simulados con valores escritos a mano, así que pasarían igual si el de producción cambiara. El único `384` que se afirma es el del `FakeEmbedder` (`embedder.rs:493-496`).
+- **Modelo y dimensión de producción: no.** `FastEmbedLocal` sólo se construye con `from_bytes`, que necesita el modelo real. Los literales `384` y `"multilingual-e5-small"` (`embedder.rs:268-269`) no los verifica ningún test automático. Los tests de `db.rs:1844-1856` y `bootstrap.rs:889-1007` usan embedders simulados con valores escritos a mano, así que pasarían igual si el de producción cambiara. El único `384` que se afirma es el del `FakeEmbedder` (`embedder.rs:493-496`).
 - **Nada compara la dimensión del embedder con la de V2.** Si alguien subiera `dimensions` a 768 sin migración, las bases existentes darían mismatch y, en una base nueva, los inserts fallarían contra `float[384]`.
-- El comportamiento del mismatch sí está probado (`db.rs:1896,1921,1941`; `bootstrap.rs:889,960`).
+- El comportamiento del mismatch sí está probado (`db.rs:1951,1921,1941`; `bootstrap.rs:889,960`).
 
 ### Opciones ante una fila que no se puede embeber
 

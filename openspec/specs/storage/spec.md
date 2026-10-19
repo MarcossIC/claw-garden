@@ -89,7 +89,7 @@ Si el handler contesta al que guardó con el fallo (`500` o `503`), MUST borrar 
 
 En un apagado ordenado, cada save aceptado MUST terminar en uno de dos lugares: guardado en la base (o absorbido por el gate de dedup), o en el outbox para el próximo arranque. El apagado MUST seguir drenando hasta `DRAIN_DEADLINE`, MUST NOT escribir `ingest-pending.jsonl` y MUST NOT descartar un save: lo que el worker no empezó queda en su fila.
 
-La decisión de seguir drenando o dejar la cola es pura (`drain_step`, `crates/clawg-core/src/memory/worker.rs:204`; su variante `DrainStep::Spill` conserva el nombre de cuando el apagado volcaba a un archivo). `MemoryRuntime::shutdown` (`crates/clawg-core/src/runtime.rs:267`) espera al worker, y el daemon la llama antes de borrar su estado (`crates/clawg-cli/src/daemon/serve.rs:188`). Sólo un evento encolado sin fila (los caminos en proceso de tests y evaluación) puede quedar sin ingerir, y el apagado lo registra con un warn (`runtime.rs:283`).
+La decisión de seguir drenando o dejar la cola es pura (`drain_step`, `crates/clawg-core/src/memory/worker.rs:204`; su variante `DrainStep::Spill` conserva el nombre de cuando el apagado volcaba a un archivo). `MemoryRuntime::shutdown` (`crates/clawg-core/src/runtime.rs:259`) espera al worker, y el daemon la llama antes de borrar su estado (`crates/clawg-cli/src/daemon/serve.rs:188`). Sólo un evento encolado sin fila (los caminos en proceso de tests y evaluación) puede quedar sin ingerir, y el apagado lo registra con un warn (`runtime.rs:275`).
 
 #### Escenario: embedder listo
 - GIVEN el embedder cargado y 20 saves aceptados
@@ -110,9 +110,9 @@ La decisión de seguir drenando o dejar la cola es pura (`drain_step`, `crates/c
 
 ### Arranque: se ingiere lo pendiente antes que lo nuevo
 
-Al arrancar, el worker (`ingest_worker_future`, `crates/clawg-core/src/runtime.rs:401`) MUST, en este orden:
+Al arrancar, el worker (`ingest_worker_future`, `crates/clawg-core/src/runtime.rs:393`) MUST, en este orden:
 
-1. importar `ingest-pending.jsonl` si existe (`import_spill`, `runtime.rs:437`): cada evento válido pasa a una fila, enmascarado, todos en una transacción con `synchronous = FULL` (`outbox_import`, `outbox.rs:235`); el archivo MUST borrarse sólo después del commit. Si no se pudo borrar, se avisa: una segunda importación la absorbe el dedup;
+1. importar `ingest-pending.jsonl` si existe (`import_spill`, `runtime.rs:429`): cada evento válido pasa a una fila, enmascarado, todos en una transacción con `synchronous = FULL` (`outbox_import`, `outbox.rs:235`); el archivo MUST borrarse sólo después del commit. Si no se pudo borrar, se avisa: una segunda importación la absorbe el dedup;
 2. procesar las filas `pending` en orden de id antes que cualquier evento del canal (`outbox_pending`, `outbox.rs:357`; `Replay`, `worker.rs:165`).
 
 Si no se puede leer el outbox, el worker lo registra y sigue con el canal: esas filas esperan al próximo arranque.
@@ -153,7 +153,7 @@ En un apagado ordenado, el tracker MUST escribir el buffer pendiente antes de te
 
 ### Checkpoint al terminar
 
-Después de drenar y del flush del tracker, el apagado SHOULD hacer `PRAGMA wal_checkpoint(TRUNCATE)` (`checkpoint`, `runtime.rs:378`). Un fallo del checkpoint MUST registrarse y MUST NOT impedir el resto del apagado.
+Después de drenar y del flush del tracker, el apagado SHOULD hacer `PRAGMA wal_checkpoint(TRUNCATE)` (`checkpoint`, `runtime.rs:370`). Un fallo del checkpoint MUST registrarse y MUST NOT impedir el resto del apagado.
 
 #### Escenario
 - GIVEN una base en WAL con escrituras recientes
@@ -189,7 +189,7 @@ La resolución es una función pura que recibe el home (`data_dir_in`, `paths.rs
 
 ### Migraciones atómicas
 
-Las migraciones pendientes de un arranque MUST aplicarse en una sola transacción junto con sus filas de historial (`configured`, `crates/clawg-core/src/memory/db.rs:382`, con `set_grouped(true)`). Si una falla, la base MUST quedar como estaba antes del arranque.
+Las migraciones pendientes de un arranque MUST aplicarse en una sola transacción junto con sus filas de historial (`configured`, `crates/clawg-core/src/memory/db.rs:424`, con `set_grouped(true)`). Si una falla, la base MUST quedar como estaba antes del arranque.
 
 #### Escenario: fallo a mitad
 - GIVEN una base vacía y la lista V1–V8 más una V9 cuyo SQL falla
@@ -250,7 +250,7 @@ Una base en V16 MUST abrir con V17 con cada fila igual, salvo `supersede_cause`,
 - WHEN se abre con la versión nueva
 - THEN la revisión queda `revision`, los dos veredictos `verdict`, la revisión deshecha `verdict`, y las demás filas sin causa ni `revived_from`
 
-**Tests:** `a_database_from_before_revivals_opens_with_its_supersede_causes` (`crates/clawg-core/src/memory/db.rs:1140`), que siembra V16 con SQL directo; el checksum de V17 en `published_migration_checksums_are_pinned` (`migrations.rs`). Que `clawg update` aplique V17 sobre una base en V16 con revisiones y veredictos, y que el daemon nuevo actúe según esas causas, está en [`specs/self-update`](../self-update/spec.md), S10, «Escenario: migración pendiente sobre filas sin causa de reemplazo».
+**Tests:** `a_database_from_before_revivals_opens_with_its_supersede_causes` (`crates/clawg-core/src/memory/db.rs:1182`), que siembra V16 con SQL directo; el checksum de V17 en `published_migration_checksums_are_pinned` (`migrations.rs`). Que `clawg update` aplique V17 sobre una base en V16 con revisiones y veredictos, y que el daemon nuevo actúe según esas causas, está en [`specs/self-update`](../self-update/spec.md), S10, «Escenario: migración pendiente sobre filas sin causa de reemplazo».
 
 #### Vuelta atrás de V17
 
@@ -262,7 +262,7 @@ Una base escrita por una versión anterior a V17 puede tener una versión reempl
 
 ### Verificación del esquema antes de migrar
 
-La decisión es pura (`schema_plan`, `backup.rs:93`). `MemoryStore::open` MUST calcularla antes de cualquier pragma y antes del runner (`check_schema`, `crates/clawg-core/src/memory/db.rs:397`, llamada en `db.rs:185`). Con `Newer` o `Diverged`, `open` MUST devolver `MemoryError::SchemaNewer` o `MemoryError::SchemaDiverged` (`crates/clawg-core/src/memory/error.rs:58` y `:64`) y MUST NOT escribir nada en `memory.db`. Los mensajes MUST decir las versiones, que nada cambió, y qué hacer: instalar la versión que la escribió o `clawg restore` de un backup anterior.
+La decisión es pura (`schema_plan`, `backup.rs:93`). `MemoryStore::open` MUST calcularla antes de cualquier pragma y antes del runner (`check_schema`, `crates/clawg-core/src/memory/db.rs:439`, llamada en `db.rs:195`). Con `Newer` o `Diverged`, `open` MUST devolver `MemoryError::SchemaNewer` o `MemoryError::SchemaDiverged` (`crates/clawg-core/src/memory/error.rs:58` y `:64`) y MUST NOT escribir nada en `memory.db`. Los mensajes MUST decir las versiones, que nada cambió, y qué hacer: instalar la versión que la escribió o `clawg restore` de un backup anterior.
 
 #### Escenario: base más nueva
 - GIVEN una base en la última versión del binario, N (hoy V17), con una fila N + 1 agregada en `refinery_schema_history`
@@ -277,7 +277,7 @@ La decisión es pura (`schema_plan`, `backup.rs:93`). `MemoryStore::open` MUST c
 
 ### Snapshot antes de migrar
 
-Con plan `Pending`, `open` MUST hacer un snapshot `pre-migration` antes de aplicar la primera migración pendiente (`db.rs:213`). Si falla, MUST devolver `MemoryError::Backup` y MUST NOT migrar. Con `Fresh` y `UpToDate` MUST NOT hacer snapshot.
+Con plan `Pending`, `open` MUST hacer un snapshot `pre-migration` antes de aplicar la primera migración pendiente (`db.rs:229`). Si falla, MUST devolver `MemoryError::Backup` y MUST NOT migrar. Con `Fresh` y `UpToDate` MUST NOT hacer snapshot.
 
 #### Escenario
 - GIVEN una base migrada hasta V7, con filas
@@ -472,7 +472,7 @@ El nombre MUST ser `memory-<AAAA-MM-DD>T<hh-mm-ss.mmm>Z-<motivo>.db` en UTC, de 
 
 Un snapshot MUST incluir el outbox, y con él el texto enmascarado de los saves que esperaban o habían fallado. Un `restore` MUST reemplazar las filas pendientes por las del snapshot: las de la base reemplazada quedan sólo en el `pre-restore` que `restore` ya escribe, y no se traspasan, porque mezclar filas de dos bases rompería el orden y los ids del progreso. `clawg purge` nombra los snapshots con una fila del outbox que contiene el texto purgado ([`specs/secrets`](../secrets/spec.md), R6).
 
-**Tests:** `a_snapshot_includes_writes_still_in_the_wal`, `a_snapshot_keeps_vectors_and_full_text_searchable`, `snapshot_names_sort_in_time_order`, `snapshot_names_parse_back_to_their_reason` y `a_failed_snapshot_leaves_no_file_behind` (`backup.rs`). Que el snapshot lleve el outbox y que un `restore` lo reemplace no tienen test propio: es lo que hace copiar la base entera.
+**Tests:** `a_snapshot_includes_writes_still_in_the_wal`, `a_snapshot_keeps_vectors_and_full_text_searchable`, `snapshot_names_sort_in_time_order`, `snapshot_names_parse_back_to_their_reason` y `a_failed_snapshot_leaves_no_file_behind` (`backup.rs`); `a_snapshot_does_not_wait_behind_the_stores_connection` y `a_snapshot_holds_the_rows_still_in_the_wal` (`runtime.rs`), que cubren la conexión propia. Que el snapshot lleve el outbox y que un `restore` lo reemplace no tienen test propio: es lo que hace copiar la base entera.
 
 ### Retención
 
@@ -496,7 +496,7 @@ Después de cada snapshot automático, el directorio de backups MUST conservar l
 
 `clawg backup [--profile P]` (`crates/clawg-cli/src/main.rs:140`) MUST producir un snapshot `manual` e imprimir su ruta.
 
-- Con el daemon andando, MUST pedirlo por `POST /v1/backup` (con el token; `crates/clawg-cli/src/daemon/api.rs:1464`, ruta en `:809`), que lo hace sobre la conexión del daemon (`MemoryRuntime::snapshot`, `crates/clawg-core/src/runtime.rs:253`) y responde `{"path": "..."}`.
+- Con el daemon andando, MUST pedirlo por `POST /v1/backup` (con el token; `crates/clawg-cli/src/daemon/api.rs:1464`, ruta en `:809`), que lo hace en una conexión propia y corta, dentro de `spawn_blocking`, para que el `VACUUM INTO` no deje esperando detrás a cada llamada de la conexión del daemon (`MemoryStore::snapshot`, `crates/clawg-core/src/memory/db.rs:301`), y responde `{"path": "..."}`. El store en memoria de las pruebas, sin archivo, copia por su propia conexión.
 - Sin daemon, MUST tomar el lock del store con el titular `Maintenance` (`crates/clawg-core/src/memory/store_lock.rs:59`), copiar sin migrar y soltar el lock (`backup_offline`, `backup.rs:336`).
 - Sin `memory.db`, MUST decir que no hay base, sin crear el directorio de datos.
 
