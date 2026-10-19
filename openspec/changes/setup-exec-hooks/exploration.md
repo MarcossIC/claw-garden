@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 4 | S–M | — (50 local-isolation cubre el modo del directorio de datos; ver «Interacciones») | exploración (borrador) |
+| 4 | S–M | — (50 local-isolation cubre el modo del directorio de datos; ver «Interacciones») | exploración cerrada; ver la [propuesta](proposal.md) |
 
 **Tesis:** los hooks que instala `clawg setup claude-code` corren en cualquier plataforma y con cualquier shell que use el cliente, sin un shell entre el cliente y clawg, y `setup` no degrada los archivos que escribe (enlaces simbólicos, permisos, las copias que guarda). Hoy el hook es una cadena que el cliente pasa a `sh -c`, a Git Bash o a PowerShell: una ruta con espacio sin Git Bash no se puede ejecutar, un perfil de shell que imprime ensucia el JSON, y la falla es muda porque `clawg hook` siempre sale con 0. Y `write_file` reemplaza un `settings.json` enlazado por un archivo común y ensancha un 0600 a 0644.
 
@@ -103,15 +103,15 @@
 - Mover el informe de `setup` a un módulo propio: `setup.rs` tiene 1182 líneas con las pruebas desde `:820`, y separarlo como `update` separa el suyo en `crates/clawg-cli/src/update/report.rs` es opcional y va en un commit aparte, igual que dejar de importar `crate::update::plan::stamp` sólo para la marca de las copias (`setup.rs:23`, `:670`).
 - Otros clientes además de Claude Code.
 
-## Decisiones abiertas
+## Decisiones
 
-Son del usuario.
+Cerradas con el usuario, todas con la recomendación.
 
-- [ ] **Piso de versión.** Exec desde 2.1.139 (CHANGELOG). ¿Se declara ese piso sin más, o se agrega D para que un cliente anterior no bloquee la sesión? Antes de la propuesta conviene confirmar el dato con un cliente de esa versión, porque la documentación no lo da.
-- [ ] **Qué es «forma vieja de clawg».** ¿Sólo la cadena idéntica a la que generaba `hook_commands` (sea cual sea la ruta) o cualquier cadena que `is_clawg_hook` ya reconoce hoy? La segunda reescribe también una editada a mano con otro `--agent`.
-- [ ] **Copias.** ¿Cuántas se conservan por archivo (por ejemplo 5)? Se reconcilia con R6.
-- [ ] **Enlace simbólico.** ¿Se escribe sobre el destino real, o se rechaza con un aviso y exit 1?
-- [ ] **`clawg` sin argumentos.** ¿Sale con 1 en lugar de 2 (D)? Cambia el uso normal.
+- [x] **Piso de versión.** Forma exec desde 2.1.139, y D: `clawg` sin subcomando sale con 1, así un cliente anterior no bloquea la sesión.
+- [x] **Qué es «forma vieja de clawg».** Sólo la cadena idéntica a la que generaba `hook_commands`, sea cual sea la ruta. Una editada a mano sigue en conflicto.
+- [x] **Copias.** Se conservan las 5 más recientes por archivo; R6 se reconcilia en la spec.
+- [x] **Enlace simbólico.** Se escribe sobre el destino real y el enlace queda.
+- [x] **`clawg` sin argumentos.** Sale con 1 (D).
 
 ## Cómo se mide
 
