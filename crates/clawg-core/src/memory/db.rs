@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Once};
 
 use rusqlite::OptionalExtension;
@@ -158,6 +158,9 @@ pub struct MemoryStore {
     /// first one goes would let a second process in under still-live writers.
     /// `None` for the in-memory test store, which has nothing to exclude.
     _lock: Option<Arc<StoreLock>>,
+    /// The data directory holding `memory.db`, where a second connection can
+    /// open it. `None` for the in-memory test store, which has no file.
+    dir: Option<PathBuf>,
 }
 
 impl MemoryStore {
@@ -183,9 +186,9 @@ impl MemoryStore {
         // First, before any pragma: switching the journal mode rewrites the
         // file header, and a database this binary refuses must stay untouched.
         let plan = check_schema(&conn).await?;
-        // WAL plus synchronous=NORMAL: one writer and concurrent readers
-        // instead of a writer that locks readers out, at the cost of an
-        // fsync per checkpoint rather than per commit. Set before the
+        // WAL plus synchronous=NORMAL: a commit appends without an fsync,
+        // which the checkpoint pays instead, and a snapshot reading on its
+        // own connection does not stop this one from writing. Set before the
         // migrations so the schema build runs under it too.
         //
         // Read back rather than assumed, and never fatal: journal_mode
@@ -236,6 +239,7 @@ impl MemoryStore {
             conn,
             knn_latency: Arc::new(KnnLatency::new()),
             _lock: Some(Arc::new(lock)),
+            dir: Some(base_dir.to_path_buf()),
         })
     }
 
@@ -270,7 +274,32 @@ impl MemoryStore {
             conn,
             knn_latency: Arc::new(KnnLatency::new()),
             _lock: None,
+            dir: None,
         })
+    }
+
+    /// Writes a snapshot of the store into `into` and returns its path.
+    ///
+    /// `VACUUM INTO` reads every page, so it runs on a short-lived connection
+    /// of its own: on this one, every call queued behind it would wait for the
+    /// whole copy. WAL lets that connection read one consistent state while
+    /// this one keeps writing. The in-memory test store has no file for a
+    /// second connection and copies through its own.
+    pub async fn snapshot(&self, into: PathBuf, reason: backup::Reason) -> Result<PathBuf, MemoryError> {
+        let Some(dir) = self.dir.clone() else {
+            return self
+                .conn
+                .call(move |c| -> rusqlite::Result<_> { Ok(backup::snapshot_into(c, &into, reason)) })
+                .await
+                .map_err(MemoryError::Connection)?
+                .map_err(MemoryError::from);
+        };
+        tokio::task::spawn_blocking(move || {
+            let c = backup::open_existing(&dir)?;
+            Ok(backup::snapshot_into(&c, &into, reason)?)
+        })
+        .await
+        .map_err(|e| MemoryError::Internal(format!("snapshot task: {e}")))?
     }
 
     /// The shared KNN latency recorder for this store's database.
