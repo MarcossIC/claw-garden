@@ -321,6 +321,17 @@ impl MemoryStore {
             .map_err(backend("outbox_fail"))
     }
 
+    /// Hands back the attempt taking `row` spent, keeping its cause: a save a
+    /// shutdown paused between pieces did nothing wrong.
+    pub(crate) async fn outbox_pause(&self, row: i64) -> Result<(), MemoryError> {
+        self.conn
+            .call(move |c| {
+                c.execute("UPDATE ingest_outbox SET attempts = MAX(attempts - 1, 0) WHERE id = ?1", [row]).map(|_| ())
+            })
+            .await
+            .map_err(backend("outbox_pause"))
+    }
+
     /// Drops `row` once whoever saved it has been told how it ended.
     pub async fn outbox_forget(&self, row: i64) -> Result<(), MemoryError> {
         self.conn
@@ -638,6 +649,26 @@ mod tests {
         store.outbox_claim(row).await.unwrap();
         store.outbox_fail(row, "embed failed: NaN".into(), false).await.unwrap();
         assert_eq!(row_state(&store, row).await.unwrap().1, 1);
+    }
+
+    #[tokio::test]
+    async fn a_pause_hands_back_its_attempt() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let row = new_row(&store, "op-1", "x").await;
+        store.outbox_claim(row).await.unwrap();
+        store.outbox_fail(row, "embed failed: NaN".into(), false).await.unwrap();
+
+        for _ in 0..MAX_ATTEMPTS {
+            assert!(matches!(store.outbox_claim(row).await.unwrap(), Claimed::Process { .. }));
+            store.outbox_pause(row).await.unwrap();
+        }
+
+        assert_eq!(
+            row_state(&store, row).await.unwrap(),
+            ("pending".into(), 1, Some("embed failed: NaN".into()), "[]".into()),
+            "a pause keeps the cause of the last failure"
+        );
+        assert!(matches!(store.outbox_claim(row).await.unwrap(), Claimed::Process { .. }));
     }
 
     #[tokio::test]

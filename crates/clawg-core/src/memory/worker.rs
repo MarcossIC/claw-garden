@@ -87,6 +87,9 @@ pub struct IngestReport {
     pub related: Vec<Candidate>,
     /// The rows of the save's topic key it superseded.
     pub replaced: Vec<Replaced>,
+    /// A shutdown stopped the save between two pieces; its outbox row notes
+    /// the ones stored, and the next start resumes after them.
+    pub paused: bool,
 }
 
 /// Backlog size at which the ingest channel is worth reporting. Events are
@@ -238,6 +241,26 @@ fn drain_step(now: Instant, deadline: Option<Instant>, embedder_ready: bool) -> 
     }
 }
 
+/// Whether a save stops before its next piece: a drain asked for one by an
+/// instant that has passed.
+fn pause_due(now: Instant, deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|d| now >= d)
+}
+
+/// When a shutdown wants the queue drained by, read again before each piece:
+/// the drain can start after the event was taken.
+#[derive(Clone, Copy, Default)]
+struct DrainWatch<'a> {
+    deadline: Option<Instant>,
+    signal: Option<&'a watch::Receiver<Option<Instant>>>,
+}
+
+impl DrainWatch<'_> {
+    fn deadline(&self) -> Option<Instant> {
+        self.deadline.or_else(|| self.signal.and_then(|signal| *signal.borrow()))
+    }
+}
+
 /// Top-level worker loop. One per app instance.
 ///
 /// Drains events FIFO. An event's surviving chunks are embedded in one call,
@@ -261,10 +284,12 @@ fn drain_step(now: Instant, deadline: Option<Instant>, embedder_ready: bool) -> 
 /// is set the channel is closed to new events, what is already queued keeps
 /// being ingested until [`drain_step`] says to stop, and the events not yet
 /// started (unreplayed ones first) are returned in order for the caller to
-/// spill. The event in flight
-/// always finishes: a half-ingested event replayed later would duplicate the
-/// chunks that did land. A save waiting for its retry is left in its row. A
-/// dropped `drain` sender never asks for a drain.
+/// spill. A save with an outbox row stops before its next piece once the
+/// deadline passes, after the first piece it stores, its attempt handed back:
+/// the row notes the pieces stored, and the next start resumes after them. An event without a row always
+/// finishes, since replaying it would duplicate the chunks that did land. A
+/// save waiting for its retry is left in its row. A dropped `drain` sender
+/// never asks for a drain.
 /// A spilled request's reply is dropped unanswered, so its caller reports the
 /// save as unconfirmed rather than failed.
 ///
@@ -341,6 +366,7 @@ pub async fn memory_worker(
                     None => break,
                 },
             };
+            let watch = DrainWatch { deadline, signal: drain.as_ref() };
             let report = process_tracked(
                 &evt,
                 &store,
@@ -348,8 +374,17 @@ pub async fn memory_worker(
                 &chat_chunker,
                 &mut absorbed_duplicates,
                 track,
+                watch,
             )
             .await;
+            if let Some(row) = outbox.filter(|_| report.paused) {
+                if let Err(e) = store.outbox_pause(row).await {
+                    log::warn!("could not hand back the attempt of paused outbox row {row}: {e}");
+                }
+                log::info!("shutdown paused outbox row {row} after {} stored pieces", report.memories.len());
+                // The reply goes unanswered, which its caller reads as unconfirmed.
+                return unstarted(None, replay, &mut rx);
+            }
             let transient = report.failure == Some(IngestFailure::EmbedderUnavailable);
             if let (Some(row), Some(failure)) = (outbox, &report.failure) {
                 if let Err(e) = store.outbox_fail(row, failure.to_string(), transient).await {
@@ -619,7 +654,7 @@ async fn process_event(
     chat_chunker: &Arc<ChatChunker>,
     absorbed: &mut u64,
 ) -> IngestReport {
-    process_tracked(evt, store, embedder_cell, chat_chunker, absorbed, None).await
+    process_tracked(evt, store, embedder_cell, chat_chunker, absorbed, None, DrainWatch::default()).await
 }
 
 /// Ingests `evt` and, when it finished, links its pieces and applies its
@@ -633,6 +668,7 @@ async fn process_tracked(
     chat_chunker: &Arc<ChatChunker>,
     absorbed: &mut u64,
     track: Option<Track>,
+    drain: DrainWatch<'_>,
 ) -> IngestReport {
     let row = track.as_ref().map(|t| t.row);
     let scope = evt.topic().map(|key| TopicScope {
@@ -653,8 +689,8 @@ async fn process_tracked(
     let evt = inherited.as_ref().unwrap_or(evt);
     let earlier: Vec<i64> = earlier.iter().map(|r| r.id).collect();
     let (mut report, pieces) =
-        ingest_pieces(evt, store, embedder_cell, chat_chunker, absorbed, track, &earlier).await;
-    if report.failure.is_some() {
+        ingest_pieces(evt, store, embedder_cell, chat_chunker, absorbed, track, &earlier, drain).await;
+    if report.failure.is_some() || report.paused {
         return report;
     }
     let revision = scope.filter(|_| !pieces.is_empty()).map(|scope| Revision {
@@ -684,6 +720,7 @@ async fn ingest_pieces(
     absorbed: &mut u64,
     track: Option<Track>,
     earlier: &[i64],
+    drain: DrainWatch<'_>,
 ) -> (IngestReport, Vec<StoredPiece>) {
     // Masked before anything else reads the text, so the chunker, the dedup
     // hash, the embedding, the full-text index and the stored row all see the
@@ -795,6 +832,7 @@ async fn ingest_pieces(
         redacted: redacted.clone(),
         related: Vec::new(),
         replaced: Vec::new(),
+        paused: false,
     };
     let pieces = |stored: &[Option<SavedChunk>], contexts: &[String]| -> Vec<StoredPiece> {
         stored
@@ -852,7 +890,12 @@ async fn ingest_pieces(
     // the first chunk that finds it holds the pair, so two saves pair once.
     let mut paired: HashSet<SaveKey> = HashSet::new();
     let mut related: Vec<Candidate> = Vec::new();
-    for ((position, pending), vec) in survivors.into_iter().zip(vectors) {
+    // Every take stores at least one piece before it may pause, so the embed
+    // it paid for is not thrown away whole and a save always moves forward.
+    for (taken, ((position, pending), vec)) in survivors.into_iter().zip(vectors).enumerate() {
+        if taken > 0 && track.is_some() && pause_due(Instant::now(), drain.deadline()) {
+            return (IngestReport { paused: true, ..report(&stored, None) }, Vec::new());
+        }
         let PendingChunk { chunk, content_hash, multiplicity } = pending;
         // The contradiction hook runs between embed and insert: it needs the
         // freshly computed embedding to find near-duplicate candidates via
@@ -3617,6 +3660,72 @@ mod tests {
         let (state, attempts, error, _) = outbox_row(&store, row).await.expect("the row stays");
         assert_eq!((state.as_str(), attempts), ("pending", 0));
         assert_eq!(error.as_deref(), Some("the embedder is not available"));
+    }
+
+    // ── A drain pauses a long save between pieces ───────────────────────────
+
+    #[test]
+    fn a_pause_is_due_once_the_drain_deadline_passes() {
+        let now = Instant::now();
+        assert!(!pause_due(now, None));
+        assert!(!pause_due(now, Some(now + std::time::Duration::from_secs(1))));
+        assert!(pause_due(now, Some(now)));
+    }
+
+    /// Embeds like the fake model once released, and says when it was asked.
+    struct GatedBatch {
+        asked: watch::Sender<bool>,
+        release: tokio::sync::Semaphore,
+    }
+    #[async_trait::async_trait]
+    impl Embedder for GatedBatch {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+            FakeEmbedder::default().embed_with_role(text, role).await
+        }
+        async fn embed_batch(&self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
+            self.asked.send_replace(true);
+            self.release.acquire().await.expect("the gate stays open").forget();
+            FakeEmbedder::default().embed_batch(texts, role).await
+        }
+        fn dimensions(&self) -> usize { 384 }
+        fn model_id(&self) -> &str { "gated-batch" }
+        fn query_prefix(&self) -> &str { "" }
+        fn passage_prefix(&self) -> &str { "" }
+    }
+
+    #[tokio::test]
+    async fn a_drain_pauses_a_long_save_between_pieces() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let content = long_save();
+        let pieces = chunk_count(&content);
+        assert!(pieces >= 3, "fixture must split into three pieces or more");
+        let row = record(&store, &content).await;
+        replay_pending(&store, Arc::new(NanAtEmbedder { position: 2 })).await;
+        let before = outbox_row(&store, row).await.unwrap();
+        assert_eq!((before.1, before.3.len()), (1, 2), "two pieces stored by the first take");
+
+        let gate = Arc::new(GatedBatch { asked: watch::Sender::new(false), release: tokio::sync::Semaphore::new(0) });
+        let mut asked = gate.asked.subscribe();
+        let rows = store.outbox_pending().await.unwrap();
+        let (_tx, drain, worker) = spawn_replaying(&store, gate.clone(), rows);
+        asked.wait_for(|asked| *asked).await.unwrap();
+        drain.send(Some(Instant::now())).unwrap();
+        gate.release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), worker)
+            .await
+            .expect("the drain ends the save before its next piece")
+            .unwrap();
+
+        let paused = outbox_row(&store, row).await.expect("the row stays");
+        assert_eq!((&paused.0, paused.1, &paused.2), (&before.0, before.1, &before.2), "the attempts of before the take");
+        assert_eq!(paused.3.len(), 3, "the take stores one piece, then pauses");
+        assert_eq!(count_memory(&store).await, 3);
+
+        replay_pending(&store, Arc::new(FakeEmbedder::default())).await;
+
+        assert_eq!(outbox_row(&store, row).await, None);
+        assert_eq!(access_counts(&store).await, vec![1; pieces], "nothing stored twice or reinforced");
+        assert_eq!(piece_links(&store).await.len(), pieces);
     }
 
     // ── Test harnesses ───────────────────────────────────────────────────────
