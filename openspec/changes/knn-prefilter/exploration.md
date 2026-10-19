@@ -47,6 +47,8 @@ Traducido: con 4 agentes que guardan sobre los mismos temas, `s ≈ 1/4` y el de
 
 Un caso concreto para contradicciones. El detector sólo mira filas propias (`Reach::Own`, `contradiction.rs:175-177`) y la banda es `[0.10, 0.42)` de distancia (`contradiction.rs:37`, `:45`, `:214-215`). Si otro agente guardó el mismo hecho con otras palabras, esas filas son vecinas muy cercanas de la consulta y ocupan la ventana de 5 y de 20 antes que la fila propia que habría que marcar como disputada. El save de ese agente se acepta sin que se detecte la contradicción.
 
+El pool de 5 (`CANDIDATE_POOL`, `contradiction.rs:58`) también cuenta filas propias que el detector descarta después. Sin ensanchar, la ventana trae las 5 más cercanas por distancia, pero la banda empieza en `NEAR_DUPLICATE_FLOOR` = 0,10 (`contradiction.rs:45`, `:214`). Un casi duplicado propio, el mismo hecho con otra puntuación que el dedup por hash no ve, ocupa un lugar y no puede ser par. Con la ventana ensanchada, `knn_one` ordena por puntaje antes de recortar (`search.rs:564-565`), así que de la banda sobreviven las filas de mejor puntaje, no las más cercanas: el decaimiento, la importancia y el tier deciden, aunque la banda se calibró en distancia. El piso de coseno no interviene, porque el borde de la banda (0,42) equivale a un coseno de 0,912, muy por encima de 0,79.
+
 Una medición sintética fuera del repo, con el SQLite empaquetado (3.50.2), sqlite-vec 0.1.9, las migraciones reales y el SQL de `SEARCH_SQL_MEMORY` copiado tal cual, coincide con la estimación: con 3 agentes, 5 proyectos y la lectura compartida cerrada (el lector puede leer cerca del 7 % de los vectores), quedaron 2 filas después del `JOIN` con `k = 30` y 8 con `k = 120`, igual con 10.000 que con 50.000 filas. Los vectores eran aleatorios, el reparto parejo que la tabla supone, así que sirve como orden de magnitud y no reemplaza la puerta de medición. Lo que muestra es que la pérdida crece con la fracción ajena (más proyectos, más agentes con la lectura cerrada) y no con el tamaño del store.
 
 ### Las revisiones de un tema
@@ -56,6 +58,13 @@ Una fila `superseded` conserva su vector (ver premisas) y el `WHERE` la descarta
 ### Quién paga el reintento
 
 Cuando el reintento corre, vec0 vuelve a recorrer sus vectores (el README ya describe a vec0 como fuerza bruta: "Índice HNSW … Descartado. vec0 es fuerza bruta", `openspec/README.md`, tabla de mejoras). No es un costo de ventana sino de pasada: quien está crowded paga una segunda búsqueda **en cada** consulta y puede igual volver corto (`search.rs:408-411`). Medido en el corpus de evaluación, una búsqueda tarda 13,0 ms (p50) y 16,4 ms (p99), y `recall_context` 15,2 y 20,7 (`docs/eval/results/2026-10-15-real-project-indexing-relcut-agent-view.json:65-66,75-76`). Ese corpus es de un solo agente: no dice qué cuesta una base crowded.
+
+### El canal léxico en la misma búsqueda
+
+El canal léxico corre en cada búsqueda, en el mismo hilo, y tiene su propio costo lineal. `fts_match_expression` une con OR las primeras 16 palabras de la consulta por posición, sin descartar las vacías (`search.rs:614`, `:634`; el comentario de `MAX_LEXICAL_TOKENS` admite que la rareza es una pregunta de IDF que la función no responde). Con `the`, `de` o `que` en la consulta, FTS5 puntúa con bm25 casi todas las filas, y por cada coincidencia lee `agent_id`, `project_id` y `memory_type`, que son columnas `UNINDEXED` de una tabla de contenido externo (`crates/clawg-core/migrations/V8__memory_fts.sql:38-40`), para el filtro de alcance de `LEXICAL_CANDIDATE_SQL` (`search.rs:682-689`). Una medición sintética fuera del repo (SQLite 3.45 del sistema, textos de 50 palabras con 8 palabras comunes) dio unos 0,5 ms con dos términos raros a 100.000 filas, contra unos 13 ms a 10.000, 60 a 50.000 y 119 a 100.000 con palabras comunes. Sirve para la forma de la curva, no para el valor del binario.
+
+- docs-search-quality (20) ya propone palabras vacías y términos raros primero, pero sólo para el canal de docs, y `fts_match_expression` es compartida (su exploración lo anota). Qué hace el canal de memorias lo decide quien toque la función primero; acá entra como parte del costo que mide la puerta.
+- La misma consulta no filtra `status`, así que las versiones `superseded` de un tema compiten por los 20 lugares del canal (`SearchScope.lexical`, `search.rs:43`) y se descartan recién al puntuar. Eso no necesita la puerta, porque es un `JOIN` con el filtro antes del `LIMIT`, y queda en el backlog del README como arreglo suelto.
 
 ### Qué sostiene el reintento hoy
 
@@ -171,7 +180,7 @@ Son del usuario.
 - [ ] **Cómo se anuncia la ruta exacta.** ¿Sólo en el log de búsqueda, o también en `memory_status`?
 - [ ] **Si la exacta tiene techo.** Si las filas elegibles superan un N medido, ¿se cae a la ventana ampliada de hoy y se avisa, o se permite la consulta cara?
 - [ ] **Cómo es el corpus propio.** Cuántos agentes, proyectos y filas, y cuántas revisiones por tema: sin cadenas de revisiones la puerta no ve la fuente de crowding que ya existe con un solo agente.
-- [ ] **Alcance en contradicciones.** ¿Se aplica el mismo mecanismo o el detector se queda con la ventana ampliada por su pool chico?
+- [ ] **Alcance en contradicciones.** ¿Se aplica el mismo mecanismo o el detector se queda con la ventana ampliada por su pool chico? Y, sea cual sea, ¿el pool cuenta sólo filas fuera de la franja de casi duplicados (distancia ≥ 0,10) y ordenadas por distancia, no por puntaje?
 
 ## Cómo se mide
 
