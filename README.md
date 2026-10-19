@@ -45,7 +45,7 @@ sha256sum --check --ignore-missing SHA256SUMS
 install -m 755 clawg-x86_64-unknown-linux-gnu ~/.local/bin/clawg
 ```
 
-El binario se construye en Ubuntu 22.04 y pide **glibc 2.35** o más nueva (`ldd --version` te dice la tuya). No enlaza OpenSSL. Sólo x86_64.
+El binario se construye en Ubuntu 24.04 y pide **glibc 2.39** o más nueva: Ubuntu 24.04, Debian 13 o Fedora 40 en adelante (`ldd --version` te dice la tuya). No enlaza OpenSSL. Sólo x86_64.
 
 ### Verificar lo que bajaste
 

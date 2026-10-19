@@ -368,7 +368,7 @@ fn the_release_workflow_builds_only_the_cli_with_the_dist_mark() {
     assert!(build.key("needs").is_some_and(|n| n.contains("plan")));
     assert!(build.key("if").is_some_and(|c| c.contains("needs.plan.outputs.publish == 'true'")));
     assert!(!lines.iter().any(|l| l.contains("-latest")), "runners are pinned, not `-latest`");
-    for runner in ["os: windows-2022", "os: ubuntu-22.04"] {
+    for runner in ["os: windows-2022", "os: ubuntu-24.04"] {
         assert!(lines.iter().any(|l| l.trim().trim_start_matches("- ") == runner), "the matrix lacks `{runner}`");
     }
     for target in ["target: x86_64-pc-windows-msvc", "target: x86_64-unknown-linux-gnu"] {
@@ -523,7 +523,7 @@ fn the_readme_documents_the_install_and_update_path() {
     let readme = read_repo_file("README.md");
     for (wanted, why) in [
         ("irm https://github.com/MarcossIC/claw-garden/releases/latest/download/install.ps1 | iex", "the one-line install"),
-        ("glibc 2.35", "the oldest glibc the Linux binary runs on"),
+        ("glibc 2.39", "the oldest glibc the Linux binary runs on"),
         ("SmartScreen", "the warning of an unsigned executable"),
         ("Smart App Control", "the policy that can block it"),
         ("minisign -Vm SHA256SUMS", "how to verify what was downloaded"),

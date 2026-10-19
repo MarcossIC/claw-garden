@@ -87,6 +87,7 @@ impl ImportanceFactor {
     /// introduces floating-point division `DEFAULT`'s literal
     /// `divisor: 60.0` never goes through, so even `spanning(0.85, 1.0)` —
     /// targeting DEFAULT's own endpoints — lands one ULP away from it.
+    #[cfg(any(test, feature = "eval"))]
     pub(crate) fn spanning(min: f64, max: f64) -> Self {
         let clamp_lo = ScoringConfig::DEFAULT.importance.clamp_lo;
         let clamp_hi = ScoringConfig::DEFAULT.importance.clamp_hi;

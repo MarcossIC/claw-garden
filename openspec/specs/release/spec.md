@@ -40,13 +40,13 @@ El repositorio MUST llevar un `LICENSE` MIT cuyo titular es «The Claw Garden co
 
 ## R3. Sólo `clawg-cli`, con marca
 
-`release.yml` MUST compilar con `cargo build --release -p clawg-cli` y MUST NOT usar `--workspace`: `clawg-eval` enciende la feature `eval` de clawg-core (`crates/clawg-eval/Cargo.toml:34`), que los builds de producción no enlazan (`crates/clawg-core/Cargo.toml:16-19`), y la unificación de features la llevaría al binario. Cada build MUST poner `CLAWG_DIST_TARGET` con su triple. Linux MUST compilarse en `ubuntu-22.04` fijo.
+`release.yml` MUST compilar con `cargo build --release -p clawg-cli` y MUST NOT usar `--workspace`: `clawg-eval` enciende la feature `eval` de clawg-core (`crates/clawg-eval/Cargo.toml:34`), que los builds de producción no enlazan (`crates/clawg-core/Cargo.toml:16-19`), y la unificación de features la llevaría al binario. Cada build MUST poner `CLAWG_DIST_TARGET` con su triple. Linux MUST compilarse en `ubuntu-24.04` fijo: el ONNX Runtime precompilado que `ort-sys` enlaza estático llama símbolos de glibc 2.38 (`__isoc23_strtol`, `__isoc23_strtoll`, `__isoc23_strtoull`), que `ubuntu-22.04` (glibc 2.35) no tiene y el enlace falla.
 
 #### Escenario: comando de build
 - GIVEN `.github/workflows/release.yml`
 - WHEN el test lo lee
 - THEN todo `cargo build` lleva `-p clawg-cli`, ninguno lleva `--workspace`, y cada build define `CLAWG_DIST_TARGET`
-- AND el job de Linux corre en `ubuntu-22.04`
+- AND el job de Linux corre en `ubuntu-24.04`
 
 **Test:** `the_release_workflow_builds_only_the_cli_with_the_dist_mark` (convención, `conventions.rs`).
 

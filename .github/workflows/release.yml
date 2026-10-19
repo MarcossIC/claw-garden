@@ -72,8 +72,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             asset: clawg-x86_64-pc-windows-msvc.exe
             binary: clawg.exe
-          # An older glibc than the newest runner image, so the binary runs on more distributions.
-          - os: ubuntu-22.04
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             asset: clawg-x86_64-unknown-linux-gnu
             binary: clawg
