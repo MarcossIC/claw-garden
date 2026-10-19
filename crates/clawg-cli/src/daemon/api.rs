@@ -60,6 +60,7 @@ use tokio::sync::oneshot;
 use crate::relevance::shown_hits;
 
 use super::lifecycle::now_ms;
+use super::sessions::{check_session_id, SessionRegistry};
 
 /// Largest `limit` any search will honour. A retrieval request is a vector
 /// scan plus a rerank; letting a caller ask for thousands turns one HTTP call
@@ -85,6 +86,9 @@ pub struct AppCtx {
     /// How long a save waits for the worker to confirm it before answering
     /// `202 unconfirmed`. [`SAVE_CONFIRM_TIMEOUT`] outside tests.
     pub save_timeout: Duration,
+    /// The host session each agent works in, per project, that saves are
+    /// stamped with.
+    pub sessions: SessionRegistry,
 }
 
 /// How long a save waits for the worker. Long enough for a multi-chunk save
@@ -351,6 +355,14 @@ pub struct SaveRequest {
     /// memories saved under the same key in the same project.
     #[serde(default)]
     pub topic_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SessionRequest {
+    pub agent_id: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    pub session_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -715,6 +727,7 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         .route("/memories", post(save_memory).get(list_memories))
         .route("/search", post(search))
         .route("/context", post(context))
+        .route("/sessions", post(register_session))
         .route(
             "/memories/{kind}/{id}",
             get(get_memory).patch(update_memory).delete(delete_memory),
@@ -950,6 +963,9 @@ async fn save_memory(
         EmbedderStatus::Ready => true,
     };
 
+    // Read now, not by the worker: a replay after a restart must keep the
+    // session the save was accepted in.
+    let session_id = app.sessions.current(&body.agent_id, body.project_id.as_deref());
     let event = MemoryEvent {
         agent_id: body.agent_id,
         project_id: body.project_id,
@@ -967,7 +983,7 @@ async fn save_memory(
         derived_from,
         topic_key: body.topic_key,
         user_stated: body.user_stated,
-        session_id: None,
+        session_id,
     };
 
     let (reply, report) = if wait {
@@ -1147,6 +1163,17 @@ async fn context(
 
     let retrieval = RetrievalState::of(prompt.retrieval, app.runtime.embedder_status());
     Ok(Json(ContextBody { prompt: prompt.text, unreviewed, retrieval }))
+}
+
+/// Records the host session `agent_id` works in for `project_id`, as a hook
+/// reports it; the saves that follow are stamped with it.
+async fn register_session(
+    State(app): State<Arc<AppCtx>>,
+    Json(body): Json<SessionRequest>,
+) -> ApiResult<StatusCode> {
+    check_session_id(&body.session_id).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    app.sessions.register(&body.agent_id, body.project_id.as_deref(), &body.session_id);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn synthesis(
@@ -1713,6 +1740,7 @@ mod tests {
             started_at: Instant::now(),
             shutdown,
             save_timeout: SAVE_CONFIRM_TIMEOUT,
+            sessions: Default::default(),
         });
 
         let (addr, server) = serve_ephemeral(app).await.expect("bind an ephemeral loopback port");
