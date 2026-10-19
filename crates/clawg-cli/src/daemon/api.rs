@@ -1131,7 +1131,10 @@ async fn context(
             )
             .await
         }
-        None => build_session_prompt(&app.runtime.store, &workspace, &body.agent_id, project_id, &emitted, budget).await,
+        None => {
+            let reach = reach(&app, &body.agent_id);
+            build_session_prompt(&app.runtime.store, &workspace, &body.agent_id, project_id, &reach, &emitted, budget).await
+        }
     }
     .map_err(ApiError::internal)?;
 
