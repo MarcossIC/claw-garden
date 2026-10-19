@@ -14,6 +14,8 @@
 
 **Al que espera** se le contesta en el primer fallo, no al terminar: el reintento puede tardar minutos y el plazo de confirmación es de 10 s. La respuesta `202 retrying` dice lo que pasa, y el handler conserva la fila porque el fallo es pasajero (D2).
 
+**Una fila de la lectura de arranque** que se reintenta retiene también la copia que llegó por el canal con la respuesta de quien la guardó: ese llamante ve `202 unconfirmed` al vencer su espera, que es cierto (la fila sigue y se termina). Sólo ocurre con un save aceptado entre que el daemon escucha y que el worker lee el outbox.
+
 **Drenaje:** la espera mira la misma señal que `next_event`; si empieza un drenaje, el pedido sale como uno sin empezar (su fila ya tiene el intento devuelto) y el worker devuelve el resto como hoy.
 
 **Un evento sin fila** no se reintenta: no hay fila que tomar, y sólo existe en tests y evaluación.
@@ -33,7 +35,7 @@
 
 **Elegido:** `ingest_pieces` recibe un `Pause` (el plazo ya visto y la señal de drenaje) y, en un save con fila, antes de cada insert pregunta `pause_due(now, plazo)` (pura). Vencido, vuelve con el reporte marcado `paused` y los pedazos guardados hasta ahí. El worker entonces llama `outbox_pause` (`attempts = MAX(attempts - 1, 0)`, sin tocar `last_error`), suelta la respuesta sin contestar y termina como con un evento sin empezar.
 
-El plazo se lee de la señal en cada pedazo porque el drenaje puede empezar después de tomar el evento. La pausa no es un `IngestFailure`: nada falló, y un fallo se anotaría en `last_error` y llegaría al que espera.
+El plazo se lee de la señal en cada pedazo porque el drenaje puede empezar después de tomar el evento. La primera inserción de cada toma no se pausa: pausar ahí tiraría el embed entero que la toma pagó, un save de un solo pedazo nunca terminaría en un apagado, y uno que se pausara siempre en el mismo punto no avanzaría nunca. La pausa no es un `IngestFailure`: nada falló, y un fallo se anotaría en `last_error` y llegaría al que espera.
 
 | Alternativa | Por qué no |
 |---|---|
@@ -44,7 +46,7 @@ El plazo se lee de la señal en cada pedazo porque el drenaje puede empezar desp
 
 **Elegido:** dos rutas del daemon y un comando `clawg outbox`, como `undelete`.
 
-- `MemoryStore::outbox_find_failed(op, agent)` resuelve la fila (`404`, `409 not_failed`, `409 ambiguous`).
+- `MemoryStore::outbox_find_failed(op, agent)` resuelve la fila; `OutboxActionError` dice por qué no (`404` sin fila, `409` pendiente, compartida por varios agentes o con un evento que ya no parsea).
 - **Reintentar:** `outbox_requeue(row)` inserta la fila otra vez con otro `id`, `pending`, `attempts = 0`, sin `last_error` y con su progreso, y borra la vieja, en una transacción; después se encola. Un `id` nuevo hace falta porque el worker reconoce por `id` las filas de la lectura de arranque, y una fila que estaba `pending` al arrancar y quedó `failed` en esta ejecución se tomaría por la segunda entrega de sí misma (`StartupRows`).
 - **Descartar:** se borran con `delete_memory_core` los pedazos con `inserted: true` del progreso, con el agente de la fila como dueño, y después la fila. Como el save nunca terminó, `revise_in` no corrió: la versión anterior de su clave sigue viva, así que borrar sus pedazos no revive nada. Un corte entre los dos pasos deja la fila `failed`; descartarla otra vez no encuentra pedazos vivos que borrar.
 

@@ -29,7 +29,7 @@ El handler que recibe un fallo pasajero MUST conservar la fila y responder `202`
 - THEN el worker termina y la fila queda `pending` con los intentos que tenía antes de tomarla
 
 #### Escenario: el que espera
-- GIVEN un daemon cuyo modelo no puede volver a cargar
+- GIVEN un worker que contesta que el embedder no pudo tomar el save
 - WHEN se guarda un texto
 - THEN la respuesta es `202` con `reason: "retrying"` y el outbox tiene la fila
 
@@ -55,19 +55,19 @@ Con el que guardó esperando y un fallo no pasajero, el handler MUST borrar la f
 
 ## R3. El apagado pausa un save entre pedazos
 
-Antes de insertar cada pedazo de un save con fila, el worker MUST mirar el plazo de drenaje. Vencido, MUST detenerse con el progreso ya anotado, MUST devolver el intento sin cambiar `last_error`, MUST NOT contestar al que espera (que ve `202 unconfirmed`) y MUST terminar como con un evento sin empezar, dejando los demás en sus filas.
+Antes de insertar cada pedazo de un save con fila, salvo el primero que inserta cada toma, el worker MUST mirar el plazo de drenaje. Así una toma nunca tira entero el embed que pagó y un save siempre avanza. Vencido, MUST detenerse con el progreso ya anotado, MUST devolver el intento sin cambiar `last_error`, MUST NOT contestar al que espera (que ve `202 unconfirmed`) y MUST terminar como con un evento sin empezar, dejando los demás en sus filas.
 
 #### Escenario: un save largo al vencer el plazo
 - GIVEN un save de 3 pedazos o más con los dos primeros guardados por una toma anterior, y un drenaje que vence mientras se embebe el resto
-- WHEN el worker llega al tercer pedazo
-- THEN no lo inserta, la fila conserva su progreso y los intentos de antes de la toma
+- WHEN el worker inserta el tercer pedazo y llega al cuarto
+- THEN no lo inserta, la fila conserva su progreso con tres pedazos y los intentos de antes de la toma
 - AND otra ejecución termina el save con los mismos ids y el vínculo completo
 
 #### Escenario: tres pausas
 - GIVEN una fila tomada y pausada tres veces
 - THEN la cuarta toma la procesa
 
-**Tests:** `a_drain_pauses_a_long_save_between_pieces` (`worker.rs`); `a_pause_hands_back_its_attempt` (`outbox.rs`).
+**Tests:** `a_pause_is_due_once_the_drain_deadline_passes` y `a_drain_pauses_a_long_save_between_pieces` (`worker.rs`); `a_pause_hands_back_its_attempt` (`outbox.rs`); que el save en curso de un solo pedazo termine su insert lo sigue cubriendo `shutdown_leaves_what_the_drain_deadline_left_unstarted_in_the_outbox` (`crates/clawg-core/tests/shutdown.rs`).
 
 ## R4. Una sola regla de `failed`
 
@@ -77,7 +77,7 @@ Una fila MUST pasar a `failed` sólo cuando gastó `MAX_ATTEMPTS` tomas que term
 
 ## R5. Reintentar o descartar una fila `failed`
 
-`POST /v1/outbox/retry` y `POST /v1/outbox/discard` (`{"operation_id", "agent_id"?}`, detrás del token) MUST actuar sobre la fila `failed` de ese `operation_id`; sin `agent_id`, sobre la única que lo tenga. MUST responder `404 not_found` sin fila, `409 not_failed` con una fila `pending` (el worker puede estar en ella) y `409 ambiguous` cuando varios agentes tienen ese `operation_id`, nombrándolos en `detail`.
+`POST /v1/outbox/retry` y `POST /v1/outbox/discard` (`{"operation_id", "agent_id"?}`, detrás del token) MUST actuar sobre la fila `failed` de ese `operation_id`; sin `agent_id`, sobre la única que lo tenga. MUST responder `404` sin fila, y `409` con una fila `pending` (el worker puede estar en ella) o cuando varios agentes tienen ese `operation_id`; `error` lo dice con una frase que nombra a esos agentes. Un `operation_id` inválido es un `400`, como en un save.
 
 - **Reintentar** MUST escribir otra vez la fila, en una transacción, con otro `id`, `pending`, `attempts = 0`, sin `last_error` y con su progreso, y encolarla. Si la cola no la admite, la fila queda `pending` para el próximo arranque y la respuesta lo dice (`queued: false`).
 - **Descartar** MUST borrar suavemente los pedazos que ese save insertó y siguen vivos, con el borrado de siempre (así `clawg undelete` los trae), y después la fila. La respuesta nombra los ids borrados. Un `operation_id` descartado vuelve a estar libre.
@@ -94,7 +94,7 @@ Una fila MUST pasar a `failed` sólo cuando gastó `MAX_ATTEMPTS` tomas que term
 - WHEN se descarta
 - THEN el pedazo queda borrado, la respuesta lo nombra, el outbox está vacío y un save con `op-1` vuelve a guardarse
 
-**Tests:** `retrying_a_failed_row_writes_it_again_under_a_new_id`, `only_a_failed_row_is_retried_or_discarded` y `an_operation_id_two_agents_hold_is_ambiguous` (`outbox.rs`); `a_failed_save_is_retried_by_its_operation_id` y `discarding_a_failed_save_deletes_the_pieces_it_inserted` (`tests/api.rs`); `outbox_takes_an_action_an_operation_id_and_an_agent` (`cli.rs`); `outbox_reports_say_what_was_done` (`outbox.rs` de `clawg-cli`).
+**Tests:** `retrying_a_failed_row_writes_it_again_under_a_new_id`, `only_a_failed_row_is_retried_or_discarded` y `an_operation_id_two_agents_hold_is_ambiguous` (`outbox.rs`); `a_failed_save_is_retried_by_its_operation_id`, `discarding_a_failed_save_deletes_the_pieces_it_inserted` y `a_pending_or_shared_operation_id_is_refused` (`tests/api.rs`); `outbox_takes_an_action_an_operation_id_and_an_agent` (`cli.rs`); `outbox_reports_say_what_was_done` (`crates/clawg-cli/src/outbox.rs`).
 
 ## R6. Lo que ven el agente y el usuario
 
