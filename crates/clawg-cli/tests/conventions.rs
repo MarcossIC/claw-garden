@@ -600,10 +600,10 @@ fn rust_version(text: &str) -> Option<(u32, u32, u32)> {
     }
 }
 
-/// The highest `rust-version` among the dependencies in Cargo.lock (`ort`,
-/// `ort-sys`, `rmcp` and `ignore`). Reading it needs the cargo registry, so it
+/// The highest `rust-version` among the packages in Cargo.lock, today
+/// `tree-sitter-language` 0.1.9's. Reading it needs the cargo registry, so it
 /// is written here and checked again when a dependency is raised.
-const DEPENDENCIES_NEED_RUST: (u32, u32, u32) = (1, 88, 0);
+const DEPENDENCIES_NEED_RUST: (u32, u32, u32) = (1, 90, 0);
 
 #[test]
 fn the_toolchain_is_pinned_once_for_every_workflow() {
