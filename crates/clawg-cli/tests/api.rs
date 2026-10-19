@@ -986,6 +986,94 @@ async fn a_partial_save_answers_202_and_keeps_its_row() {
     assert_eq!(noted, stored, "the next start resumes after the stored pieces");
 }
 
+/// Writes a save the daemon gave up on, as `agent`, with the progress of the
+/// pieces it stored.
+async fn seed_failed(h: &Harness, operation_id: &str, agent: &str, content: &str, progress: Value) {
+    let event = json!({
+        "agent_id": agent, "project_id": null, "role": "user", "content": "", "is_error": null,
+        "source": "explicit", "timestamp_ms": 1, "memory_type": "semantic_fact",
+    })
+    .to_string();
+    let (op, agent, content, progress) = (operation_id.to_string(), agent.to_string(), content.to_string(), progress.to_string());
+    h.ctx
+        .runtime
+        .store
+        .conn
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO ingest_outbox (operation_id, agent_id, content, event, state, attempts, last_error, progress, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, 'failed', 3, 'store insert failed: disk full', ?5, 1, 1)",
+                rusqlite::params![op, agent, content, event, progress],
+            )
+        })
+        .await
+        .expect("seed");
+}
+
+#[tokio::test]
+async fn a_failed_save_is_retried_by_its_operation_id() {
+    let h = Harness::start().await;
+    seed_failed(&h, "op-1", "a", "the release train leaves on tuesday", json!([])).await;
+
+    let (status, body) = h.post_json("/v1/outbox/retry", json!({ "operation_id": "op-1" })).await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, json!({ "operation_id": "op-1", "agent_id": "a", "queued": true }));
+    let rows = h.wait_for_rows("memory", 1).await;
+    assert_eq!(rows[0]["summary"], "the release train leaves on tuesday");
+    for _ in 0..40 {
+        if outbox(&h).await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(outbox(&h).await.is_empty());
+
+    let (status, body) = h.post_json("/v1/outbox/retry", json!({ "operation_id": "op-1" })).await;
+    assert_eq!(status, 404, "{body}");
+}
+
+#[tokio::test]
+async fn discarding_a_failed_save_deletes_the_pieces_it_inserted() {
+    let h = Harness::start().await;
+    let (_, saved) = h.post_json("/v1/memories", json!({ "content": "the first piece of a long save", "agent_id": "a" })).await;
+    let piece = saved["memories"][0]["id"].as_i64().expect("an id");
+    let progress = json!([{ "position": 0, "hash": "h0", "id": piece, "inserted": true, "context": "" }]);
+    seed_failed(&h, "op-1", "a", "the first piece of a long save, and the rest", progress).await;
+
+    let (_, health) = h.get_json("/health").await;
+    assert_eq!(health["ingest"]["problems"][0]["pieces"], json!([piece]), "{health}");
+    let (status, pending) = h.post_json("/v1/outbox/discard", json!({ "operation_id": "op-2" })).await;
+    assert_eq!(status, 404, "{pending}");
+    let (status, body) = h.post_json("/v1/outbox/discard", json!({ "operation_id": "op-1", "agent_id": "a" })).await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, json!({ "operation_id": "op-1", "agent_id": "a", "deleted": [piece] }));
+    assert!(outbox(&h).await.is_empty());
+    let (_, deleted) = h.get_json("/v1/memories?deleted=true").await;
+    assert_eq!(deleted["items"][0]["id"], piece, "{deleted}");
+    let (status, again) =
+        h.post_json("/v1/memories", json!({ "content": "saved again", "agent_id": "a", "operation_id": "op-1" })).await;
+    assert_eq!(status, 201, "the operation id is free again: {again}");
+}
+
+#[tokio::test]
+async fn a_pending_or_shared_operation_id_is_refused() {
+    let h = Harness::start_loading_with_queue(4).await;
+    h.post_json("/v1/memories", json!({ "content": "waiting for the model", "agent_id": "a", "operation_id": "op-1" })).await;
+    seed_failed(&h, "op-2", "a", "x", json!([])).await;
+    seed_failed(&h, "op-2", "b", "y", json!([])).await;
+
+    let (status, pending) = h.post_json("/v1/outbox/discard", json!({ "operation_id": "op-1" })).await;
+    assert_eq!(status, 409, "{pending}");
+    assert!(pending["error"].as_str().is_some_and(|e| e.contains("still pending")), "{pending}");
+    let (status, shared) = h.post_json("/v1/outbox/retry", json!({ "operation_id": "op-2" })).await;
+    assert_eq!(status, 409, "{shared}");
+    assert!(shared["error"].as_str().is_some_and(|e| e.contains("a, b")), "{shared}");
+    let (status, bad) = h.post_json("/v1/outbox/retry", json!({ "operation_id": "has space" })).await;
+    assert_eq!(status, 400, "{bad}");
+}
+
 #[tokio::test]
 async fn a_save_answers_with_an_operation_id() {
     let h = Harness::start().await;

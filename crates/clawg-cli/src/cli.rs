@@ -111,6 +111,12 @@ pub enum Command {
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Retry or discard a save the daemon gave up on, by the operation id
+    /// `clawg status` names under `ingest.problems`. Needs a running daemon.
+    Outbox {
+        #[command(subcommand)]
+        action: OutboxAction,
+    },
     /// Show which agents do not read which agents' memories, or change it with
     /// `hide` and `unhide`. Every agent reads every other agent until hidden;
     /// a change counts from the next search, with the daemon running. A shared
@@ -194,6 +200,36 @@ pub enum ProjectsAction {
         #[command(flatten)]
         profile: ProfileArg,
     },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum OutboxAction {
+    /// Store it again, after the pieces it already stored.
+    Retry(OutboxTarget),
+    /// Drop it, deleting the memories it had stored; `clawg undelete` brings
+    /// each back.
+    Discard(OutboxTarget),
+}
+
+/// The failed save an `outbox` action acts on.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct OutboxTarget {
+    /// The save's operation id.
+    pub operation_id: String,
+    /// The agent that saved it, needed only when another agent used the same
+    /// operation id.
+    #[arg(long, value_parser = parse_agent)]
+    pub agent: Option<String>,
+    #[command(flatten)]
+    pub profile: ProfileArg,
+}
+
+impl OutboxAction {
+    pub fn target(&self) -> &OutboxTarget {
+        match self {
+            OutboxAction::Retry(t) | OutboxAction::Discard(t) => t,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -825,6 +861,32 @@ mod tests {
             }
         );
         assert!(Cli::try_parse_from(["clawg", "projects", "add"]).is_err(), "the path is required");
+    }
+
+    #[test]
+    fn outbox_takes_an_action_an_operation_id_and_an_agent() {
+        assert_eq!(
+            parse(&["clawg", "outbox", "retry", "op-1"]).command,
+            Command::Outbox {
+                action: OutboxAction::Retry(OutboxTarget {
+                    operation_id: "op-1".into(),
+                    agent: None,
+                    profile: ProfileArg { profile: None },
+                })
+            }
+        );
+        assert_eq!(
+            parse(&["clawg", "outbox", "discard", "op-1", "--agent", "codex", "--profile", "dev"]).command,
+            Command::Outbox {
+                action: OutboxAction::Discard(OutboxTarget {
+                    operation_id: "op-1".into(),
+                    agent: Some("codex".into()),
+                    profile: ProfileArg { profile: Some("dev".into()) },
+                })
+            }
+        );
+        assert!(Cli::try_parse_from(["clawg", "outbox", "retry"]).is_err(), "the operation id is required");
+        assert!(Cli::try_parse_from(["clawg", "outbox", "forget", "op-1"]).is_err());
     }
 
     #[test]

@@ -21,6 +21,7 @@ use clawg_cli::doctor;
 use clawg_cli::hook;
 use clawg_cli::mcp;
 use clawg_cli::memories;
+use clawg_cli::outbox;
 use clawg_cli::projects;
 use clawg_cli::restore;
 use clawg_cli::secrets;
@@ -228,6 +229,18 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
             };
             println!("{}", undelete::run(&client, id).await.map_err(unavailable)?);
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Outbox { action } => {
+            let profile = action.target().profile.resolve().map_err(|e| e.to_string())?;
+            let unavailable = |e: ClientError| memories::explain_unavailable(&e, profile);
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let client = match probe_running(&base_dir, false).await.map_err(unavailable)? {
+                Probe::Running(client) => client,
+                Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
+            };
+            println!("{}", outbox::run(&client, &action).await.map_err(unavailable)?);
             Ok(ExitCode::SUCCESS)
         }
 

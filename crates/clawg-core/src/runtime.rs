@@ -32,7 +32,8 @@ use crate::memory::embedder::Embedder;
 use crate::memory::events::MemoryEvent;
 use crate::memory::store_lock::StoreHolder;
 use crate::memory::maintenance::{run_maintenance_loop, MAINTENANCE_PERIOD, STARTUP_DELAY};
-use crate::memory::outbox::{OutboxState, Recorded};
+use crate::memory::admin::{delete_memory_core, MemoryKind};
+use crate::memory::outbox::{OutboxActionError, OutboxState, Recorded};
 use crate::memory::redact::{redact, SecretKind};
 use crate::memory::project_docs::DocIndex;
 use crate::memory::spill;
@@ -73,6 +74,21 @@ pub enum Accepted {
     /// The agent already has a row under this operation id: nothing new was
     /// recorded or queued.
     Existing { row: i64, operation_id: String, state: OutboxState, last_error: Option<String> },
+}
+
+/// A failed save [`MemoryRuntime::retry_failed`] took back.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Retried {
+    pub agent_id: String,
+    pub queued: bool,
+}
+
+/// A failed save [`MemoryRuntime::discard_failed`] dropped, with the
+/// memories it had inserted and that were deleted with it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Discarded {
+    pub agent_id: String,
+    pub deleted: Vec<i64>,
 }
 
 /// The background tasks a host spawned from a [`MemoryRuntime`], handed back
@@ -242,6 +258,37 @@ impl MemoryRuntime {
                 })
             }
         }
+    }
+
+    /// Takes the failed save of `operation_id` (of `agent`, or of the only
+    /// agent holding that id) back to pending with no attempt spent, keeping
+    /// the pieces it stored, and queues it. `queued` is false when the queue
+    /// is full: the row waits for the next start.
+    pub async fn retry_failed(&self, operation_id: &str, agent: Option<&str>) -> Result<Retried, OutboxActionError> {
+        let failed = self.store.outbox_find_failed(operation_id, agent).await?;
+        let (row, event) = self
+            .store
+            .outbox_requeue(failed.row)
+            .await?
+            .ok_or_else(|| OutboxActionError::Unreadable(operation_id.to_string()))?;
+        let queued = self.memory_tx.try_send(IngestRequest { event, reply: None, outbox: Some(row) }).is_ok();
+        Ok(Retried { agent_id: failed.agent_id, queued })
+    }
+
+    /// Drops the failed save of `operation_id`, deleting first the memories
+    /// it inserted that are still live, so a save that stopped part-way
+    /// leaves no piece of itself. They are deleted as any delete does, and
+    /// `restore` brings each back. The operation id is free again afterwards.
+    pub async fn discard_failed(&self, operation_id: &str, agent: Option<&str>) -> Result<Discarded, OutboxActionError> {
+        let failed = self.store.outbox_find_failed(operation_id, agent).await?;
+        let mut deleted = Vec::new();
+        for id in failed.inserted() {
+            if delete_memory_core(&self.store, id, MemoryKind::Memory, Some(&failed.agent_id)).await?.deleted == 1 {
+                deleted.push(id);
+            }
+        }
+        self.store.outbox_forget(failed.row).await?;
+        Ok(Discarded { agent_id: failed.agent_id, deleted })
     }
 
     /// The periodic maintenance loop's future — **not** spawned, same

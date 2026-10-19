@@ -50,7 +50,7 @@ use clawg_core::memory::synthesis::{
 use clawg_core::memory::{read_save_core, search_all_memories, RankedHit, SaveText, SearchScope};
 use clawg_core::models::chat::Role;
 use clawg_core::paths::Profile;
-use clawg_core::memory::outbox::{OutboxState, OutboxSummary};
+use clawg_core::memory::outbox::{OutboxActionError, OutboxState, OutboxSummary};
 use clawg_core::memory::redact::SecretKind;
 use clawg_core::memory::store_insert::MemoryType;
 use clawg_core::runtime::{AcceptError, Accepted, MemoryRuntime};
@@ -748,6 +748,33 @@ impl From<RestoredRow> for RestoredBody {
     }
 }
 
+/// Names a save the daemon gave up on: its operation id, and its agent when
+/// another agent holds the same id.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboxRequest {
+    pub operation_id: String,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+}
+
+/// A failed save taken back to pending; `queued` is false when the queue was
+/// full and it waits for the next start.
+#[derive(Debug, Serialize)]
+pub struct RetriedBody {
+    pub operation_id: String,
+    pub agent_id: String,
+    pub queued: bool,
+}
+
+/// A failed save dropped, with the memories it had inserted, now deleted.
+#[derive(Debug, Serialize)]
+pub struct DiscardedBody {
+    pub operation_id: String,
+    pub agent_id: String,
+    pub deleted: Vec<i64>,
+}
+
 /// Closes the dispute between two `memory` rows. Disputes only ever pair
 /// `memory` rows, so there is no `kind`.
 #[derive(Debug, Deserialize)]
@@ -809,6 +836,8 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         .route("/disputes/resolve", post(resolve_dispute))
         .route("/disputes/judge", post(judge_dispute))
         .route("/synthesis", post(synthesis))
+        .route("/outbox/retry", post(retry_outbox))
+        .route("/outbox/discard", post(discard_outbox))
         .route("/stats", get(stats))
         .route("/backup", post(backup))
         .route("/projects", post(register))
@@ -1436,6 +1465,33 @@ async fn restore_memory(
         Err(RestoreError::Embed(_, e)) => Err(embed_failure(e)),
         Err(e) => Err(ApiError::internal(e)),
     }
+}
+
+fn outbox_error(e: OutboxActionError) -> ApiError {
+    match e {
+        OutboxActionError::NotFound(_) => ApiError::not_found(e.to_string()),
+        OutboxActionError::NotFailed(_) | OutboxActionError::Ambiguous { .. } | OutboxActionError::Unreadable(_) => {
+            ApiError::conflict(e.to_string())
+        }
+        OutboxActionError::Store(_) => ApiError::internal(e),
+    }
+}
+
+/// The operation id of an outbox request, checked as a save checks it.
+fn requested_operation(body: &OutboxRequest) -> ApiResult<String> {
+    Ok(check_operation_id(Some(body.operation_id.clone()))?.unwrap_or_default())
+}
+
+async fn retry_outbox(State(app): State<Arc<AppCtx>>, Json(body): Json<OutboxRequest>) -> ApiResult<Json<RetriedBody>> {
+    let operation_id = requested_operation(&body)?;
+    let retried = app.runtime.retry_failed(&operation_id, body.agent_id.as_deref()).await.map_err(outbox_error)?;
+    Ok(Json(RetriedBody { operation_id, agent_id: retried.agent_id, queued: retried.queued }))
+}
+
+async fn discard_outbox(State(app): State<Arc<AppCtx>>, Json(body): Json<OutboxRequest>) -> ApiResult<Json<DiscardedBody>> {
+    let operation_id = requested_operation(&body)?;
+    let discarded = app.runtime.discard_failed(&operation_id, body.agent_id.as_deref()).await.map_err(outbox_error)?;
+    Ok(Json(DiscardedBody { operation_id, agent_id: discarded.agent_id, deleted: discarded.deleted }))
 }
 
 /// The answer every verdict route gives a refused one.
