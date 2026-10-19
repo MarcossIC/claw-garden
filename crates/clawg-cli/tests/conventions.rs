@@ -303,26 +303,56 @@ fn job<'a>(jobs: &'a [Job], name: &str) -> &'a Job {
     jobs.iter().find(|j| j.name == name).unwrap_or_else(|| panic!("no job `{name}`"))
 }
 
+/// The file names in `.github/workflows`, sorted.
+fn workflow_files() -> Vec<String> {
+    let dir = repo_root().join(".github/workflows");
+    let mut names: Vec<String> = fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .map(|entry| entry.expect("workflow entry").file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".yml") || name.ends_with(".yaml"))
+        .collect();
+    names.sort();
+    names
+}
+
 #[test]
 fn third_party_actions_are_pinned_to_a_commit() {
-    let raw = read_repo_file(".github/workflows/release.yml");
-    let mut seen = 0;
-    for (n, line) in raw.lines().enumerate() {
-        let Some(at) = line.find("uses:") else { continue };
-        if line.trim_start().starts_with('#') {
-            continue;
+    for name in workflow_files() {
+        let raw = read_repo_file(&format!(".github/workflows/{name}"));
+        for (n, line) in raw.lines().enumerate() {
+            let Some(at) = line.find("uses:") else { continue };
+            if line.trim_start().starts_with('#') {
+                continue;
+            }
+            let reference = line[at + "uses:".len()..].split_whitespace().next().unwrap_or("");
+            if reference.starts_with("./") {
+                continue;
+            }
+            let (_, pin) = reference.split_once('@').unwrap_or_else(|| panic!("{name}:{}: `{reference}` has no @ref", n + 1));
+            let is_commit = pin.len() == 40 && pin.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            assert!(is_commit, "{name}:{}: `{reference}` is not pinned to a full commit SHA", n + 1);
+            assert!(line.contains(" # "), "{name}:{}: name the tag the SHA stands for in a trailing comment", n + 1);
         }
-        let reference = line[at + "uses:".len()..].split_whitespace().next().unwrap_or("");
-        if reference.starts_with("./") {
-            continue;
-        }
-        let (_, pin) = reference.split_once('@').unwrap_or_else(|| panic!("release.yml:{}: `{reference}` has no @ref", n + 1));
-        let is_commit = pin.len() == 40 && pin.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-        assert!(is_commit, "release.yml:{}: `{reference}` is not pinned to a full commit SHA", n + 1);
-        assert!(line.contains(" # "), "release.yml:{}: name the tag the SHA stands for in a trailing comment", n + 1);
-        seen += 1;
     }
-    assert!(seen > 0, "release.yml uses no action at all");
+}
+
+#[test]
+fn every_checkout_drops_the_token() {
+    let mut seen = 0;
+    for name in workflow_files() {
+        let lines = workflow_code(&name);
+        for job in jobs_of(&lines) {
+            for step in job.steps().iter().filter(|s| s.iter().any(|l| l.contains("uses: actions/checkout@"))) {
+                assert!(
+                    step.iter().any(|l| l.trim() == "persist-credentials: false"),
+                    "{name}, job `{}`: checkout leaves the token in .git/config: {step:?}",
+                    job.name
+                );
+                seen += 1;
+            }
+        }
+    }
+    assert!(seen > 0, "no workflow checks out the repository");
 }
 
 #[test]
@@ -583,6 +613,12 @@ fn the_ci_workflow_checks_the_locked_production_build() {
     for wanted in ["cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings", "cargo test --locked -p clawg-core --lib build_info"] {
         assert!(commands.iter().any(|c| c == wanted), "ci.yml lacks `{wanted}`: {commands:?}");
     }
+
+    // Only main writes the cache, so nothing a pull request builds is restored
+    // into a run on main.
+    let steps = job(&jobs, "test").steps();
+    let cache = steps.iter().find(|s| s.iter().any(|l| l.contains("uses: Swatinem/rust-cache@"))).expect("ci.yml caches the build");
+    assert!(cache.iter().any(|l| l.trim() == "save-if: ${{ github.ref == 'refs/heads/main' }}"), "the cache is written from any ref: {cache:?}");
 }
 
 #[test]
