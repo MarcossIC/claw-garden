@@ -103,7 +103,7 @@ El daemon MUST NOT consultar nada por su cuenta. Sólo `clawg update` y `clawg u
 
 ## S7. Verificar antes de tocar
 
-Antes del intercambio `update` MUST: bajar el candidato junto al destino, verificar la firma de `SHA256SUMS` (S5), comprobar el sha256 del candidato contra esa lista y ejecutar su `--version` y comprobar que da la versión elegida. Si cualquiera falla, MUST dejar todo como estaba (binario instalado, daemon y datos), sin dejar el candidato. En Linux, sin permiso de escritura donde está el binario, MUST fallar antes de bajar nada con un mensaje claro, y MUST NOT usar `sudo`.
+Antes del intercambio `update` MUST: bajar el candidato junto al destino, verificar la firma de `SHA256SUMS` (S5), comprobar el sha256 del candidato contra esa lista y ejecutar su `--version` y comprobar que da la versión elegida. Un `--version` que no termina en 30 s MUST contar como falla, con el proceso terminado y esperado, para que `update` no quede colgado con `update.lock` tomado. Si cualquiera falla, MUST dejar todo como estaba (binario instalado, daemon y datos), sin dejar el candidato. En Linux, sin permiso de escritura donde está el binario, MUST fallar antes de bajar nada con un mensaje claro, y MUST NOT usar `sudo`.
 
 #### Escenario: hash que no coincide
 - GIVEN un candidato cuyo sha256 difiere del de `SHA256SUMS`
@@ -115,7 +115,7 @@ Antes del intercambio `update` MUST: bajar el candidato junto al destino, verifi
 - WHEN corre `update`
 - THEN falla antes de la primera petición de descarga, con un mensaje que lo dice
 
-**Test:** `a_hash_mismatch_never_touches_the_installed_binary` (plan, en proceso) y `a_failed_download_or_signature_leaves_everything_as_it_was` (plan); el permiso de Linux, `an_unwritable_install_dir_fails_before_downloading` (puro, sobre una función que decide con el resultado de un chequeo de escritura).
+**Test:** `a_hash_mismatch_never_touches_the_installed_binary` (plan, en proceso) y `a_failed_download_or_signature_leaves_everything_as_it_was` (plan); el permiso de Linux, `an_unwritable_install_dir_fails_before_downloading` (puro, sobre una función que decide con el resultado de un chequeo de escritura); el plazo del `--version`, `a_process_still_running_at_its_deadline_is_ended` y `a_process_that_ends_in_time_gives_its_output` (en `effects.rs`, con procesos del sistema).
 
 ## S8. Plan e intercambio
 
