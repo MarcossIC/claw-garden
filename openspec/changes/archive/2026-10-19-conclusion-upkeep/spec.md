@@ -1,6 +1,6 @@
 # conclusion-upkeep — Especificación
 
-Requisitos nuevos sobre [`specs/synthesis`](../../specs/synthesis/spec.md) y [`specs/secrets`](../../specs/secrets/spec.md). Lo que no se nombra acá sigue como está. Términos: una fila **viva** no está borrada y su `status` no es `superseded`; una fuente está **perdida** cuando su fila no existe (purgada), está borrada o está `superseded`; una conclusión **a revisar** es una conclusión viva con al menos una fuente perdida.
+Requisitos nuevos sobre [`specs/synthesis`](../../../specs/synthesis/spec.md) y [`specs/secrets`](../../../specs/secrets/spec.md). Lo que no se nombra acá sigue como está. Términos: una fila **viva** no está borrada y su `status` no es `superseded`; una fuente está **perdida** cuando su fila no existe (purgada), está borrada o está `superseded`; una conclusión **a revisar** es una conclusión viva con al menos una fuente perdida.
 
 ## C1. La regla
 

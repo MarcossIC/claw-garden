@@ -21,7 +21,7 @@ Fuente de verdad del comportamiento actual de la recuperación: el corte relativ
 
 - **Hit exacto:** hit cuya fila recibió el bono léxico en esta búsqueda, es decir, `RawHit.lexical_match` (`crates/clawg-core/src/memory/score.rs:28-30`), una fila de `memory` que está en los matches de identificador de la consulta. Viaja en cada hit como `exact`. Un hit de `episodic` o `procedural` nunca es exacto.
 - **Fila de score 0:** hit no exacto cuyo score es 0, porque su coseno queda bajo el piso (`rescale_cosine`, `crates/clawg-core/src/memory/score.rs:217`) y no tiene el identificador de la consulta. Vuelve sólo porque el pool tenía lugar. Un hit exacto lleva el bono y nunca vale 0 mientras esté vivo.
-- **Frase de abstención:** `no relevant memories for this query: N searched, none close enough to show` (`NO_RELEVANT_MEMORIES` y `nothing_relevant`, `crates/clawg-cli/src/mcp/tools.rs:69-73`), con `N` el número de hits que la búsqueda trajo y no se muestran. Distingue «hay memorias y ninguna se acerca» de `no memories found`, que es un alcance sin nada.
+- **Frase de abstención:** `no relevant memories for this query: N searched, none close enough to show` (`NO_RELEVANT_MEMORIES` y `nothing_relevant`, `crates/clawg-cli/src/mcp/tools.rs:72-76`), con `N` el número de hits que la búsqueda trajo y no se muestran. Distingue «hay memorias y ninguna se acerca» de `no memories found`, que es un alcance sin nada.
 - **Corte relativo con ratio r (`shown_hits`, `crates/clawg-cli/src/relevance.rs:36`):** sobre hits ordenados mejor primero, cada uno con su score y su marca de exacto, pasa todo hit exacto, aunque quede detrás de uno cortado. Una fila de score 0 no pasa nunca y no cuenta para `MIN_SHOWN_HITS` (`relevance.rs:44-46`). Un hit no exacto con score mayor que 0 pasa si está entre los `MIN_SHOWN_HITS` primeros no exactos que puntuaron o si su score es `>= r × mejor score no exacto`. Los que pasan conservan su orden. Sin scores, no queda ninguno. Sin hits exactos ni filas de score 0, el resultado es el de cortar por prefijo: los primeros mientras la posición sea menor que `MIN_SHOWN_HITS` o el score sea `>= r × mejor`.
 - **`RELEVANCE_RATIO` (`relevance.rs:19`):** 0,35. El ratio que usa el puente MCP y que pide el cliente HTTP. Medido con `rag-eval --real --agent-view` sobre vectores con pooling mean, cuyo mejor score tiene mediana 0,19: con 0,35 `search_memory` muestra el recuerdo esperado en 36 de 46 consultas con 764 tokens de media; con 0,6 eran 30 con 455 y con 0,2 son 37 con 894. El score del esperado (0,03–0,41) y el del resto (hasta 0,38) se superponen, por eso el corte es relativo.
 - **`MIN_SHOWN_HITS` (`relevance.rs:23`):** 2. Hits no exactos que pasan el corte sea cual sea su score, siempre que sea mayor que 0; los exactos no cuentan para este mínimo.
@@ -49,13 +49,13 @@ El corte vive en `clawg-cli` y no en el core: `search_all_memories` devuelve sie
 
 ## Corte relativo en `POST /v1/search`
 
-`POST /v1/search` MUST aceptar el campo opcional `min_relative_score` (`SearchRequest`, `crates/clawg-cli/src/daemon/api.rs:370-381`).
+`POST /v1/search` MUST aceptar el campo opcional `min_relative_score` (`SearchRequest`, `crates/clawg-cli/src/daemon/api.rs:382-393`).
 
 - Ausente: la respuesta MUST traer todos los hits ordenados hasta `limit`, sin corte, las filas de score 0 incluidas.
-- Presente con un valor en `[0, 1]`: el daemon MUST devolver sólo los hits que pasan el corte relativo con ese ratio, en el mismo orden (`search`, `api.rs:1129`; el corte en `:1164-1167`). Cada hit de la respuesta MUST llevar `exact`.
-- Presente fuera de `[0, 1]`, o no finito: MUST responder `400` sin buscar ni registrar accesos (`check_relative_score`, `api.rs:323`). La validación corre después de comprobar el embedder: sin embedder listo, la respuesta es la de esa condición (`503`).
+- Presente con un valor en `[0, 1]`: el daemon MUST devolver sólo los hits que pasan el corte relativo con ese ratio, en el mismo orden (`search`, `api.rs:1153`; el corte en `:1188-1191`). Cada hit de la respuesta MUST llevar `exact`.
+- Presente fuera de `[0, 1]`, o no finito: MUST responder `400` sin buscar ni registrar accesos (`check_relative_score`, `api.rs:335`). La validación corre después de comprobar el embedder: sin embedder listo, la respuesta es la de esa condición (`503`).
 
-La respuesta MUST llevar `withheld`: cuántos hits de la búsqueda dejó afuera el corte, `0` sin `min_relative_score` (`SearchBody`, `api.rs:593-598`; la cuenta en `:1163` y `:1170`). Con `hits` vacío, es lo que separa «nada se acercó» de «no hay nada guardado».
+La respuesta MUST llevar `withheld`: cuántos hits de la búsqueda dejó afuera el corte, `0` sin `min_relative_score` (`SearchBody`, `api.rs:605-610`; la cuenta en `:1187` y `:1194`). Con `hits` vacío, es lo que separa «nada se acercó» de «no hay nada guardado».
 
 #### Escenario: sin campo
 - GIVEN una fila igual a la consulta y tres sin relación
@@ -85,7 +85,7 @@ La respuesta MUST llevar `withheld`: cuántos hits de la búsqueda dejó afuera 
 
 ## `search` registra sólo lo que devuelve
 
-El handler `search` MUST registrar como acceso exactamente los hits contables de la respuesta que envía, después del corte (`api.rs:1168`). Un hit cortado, o con score 0, MUST NOT cambiar `access_count` ni `last_accessed_at`.
+El handler `search` MUST registrar como acceso exactamente los hits contables de la respuesta que envía, después del corte (`api.rs:1192`). Un hit cortado, o con score 0, MUST NOT cambiar `access_count` ni `last_accessed_at`.
 
 #### Escenario: hit cortado
 - GIVEN una fila A con score alto y una fila B bajo el corte de 0,6 en posición ≥ 2
@@ -129,9 +129,9 @@ Como acceso, `build_memory_prompt` MUST registrar sólo los hits contables entre
 
 ## Cliente HTTP y herramienta `search_memory`
 
-`DaemonClient::search` MUST mandar `min_relative_score = RELEVANCE_RATIO` junto con los campos de `SearchArgs` (`search_request`, `crates/clawg-cli/src/client.rs:516`; uso en `:685`), y devolver los hits con `withheld` (`Found`, `client.rs:151-159`), leído con `#[serde(default)]`: un daemon anterior no lo manda y vale 0. El puente MUST volver a aplicar el corte al renderizar `search_memory` (`relevant_hits` y `format_search`, `crates/clawg-cli/src/mcp/tools.rs:62` y `:76`), con el mismo `shown_hits` que el daemon, así que un hit exacto se muestra aunque el corte deje fuera a otro. `Hit` del cliente MUST leer `exact` con `#[serde(default)]`: un hit sin el campo vale `false`. Aplicar el corte dos veces da el mismo resultado, y contra un daemon que ignora el campo el agente ve lo mismo.
+`DaemonClient::search` MUST mandar `min_relative_score = RELEVANCE_RATIO` junto con los campos de `SearchArgs` (`search_request`, `crates/clawg-cli/src/client.rs:544`; uso en `:715`), y devolver los hits con `withheld` (`Found`, `client.rs:151-159`), leído con `#[serde(default)]`: un daemon anterior no lo manda y vale 0. El puente MUST volver a aplicar el corte al renderizar `search_memory` (`relevant_hits` y `format_search`, `crates/clawg-cli/src/mcp/tools.rs:65` y `:79`), con el mismo `shown_hits` que el daemon, así que un hit exacto se muestra aunque el corte deje fuera a otro. `Hit` del cliente MUST leer `exact` con `#[serde(default)]`: un hit sin el campo vale `false`. Aplicar el corte dos veces da el mismo resultado, y contra un daemon que ignora el campo el agente ve lo mismo.
 
-Cuando no queda ninguna línea, `search_memory` MUST responder la frase de abstención si algún hit se ocultó, en el daemon o en el puente, con `N` los hits que devolvió el daemon más su `withheld` (`format_search`, `tools.rs:79-81`), y `no memories found` si no se ocultó ninguno (`format_hits`, `tools.rs:95-99`).
+Cuando no queda ninguna línea, `search_memory` MUST responder la frase de abstención si algún hit se ocultó, en el daemon o en el puente, con `N` los hits que devolvió el daemon más su `withheld` (`format_search`, `tools.rs:82-84`), y `no memories found` si no se ocultó ninguno (`format_hits`, `tools.rs:98-102`).
 
 #### Escenario: cuerpo del pedido
 - WHEN el cliente arma el cuerpo de una búsqueda
@@ -266,11 +266,11 @@ Ningún código de producción escribe `episodic_trajectory` ni `procedural_skil
 
 ## Hits de otros agentes
 
-La búsqueda y el contexto traen, además de lo propio, las filas de los autores que la política de [`specs/sharing`](../sharing/spec.md) deja leer al llamador: `POST /v1/search` y `POST /v1/context` resuelven el alcance del agente del pedido en cada llamada (`reach`, `crates/clawg-cli/src/daemon/api.rs:1179`; usos en `api.rs:1147`, `:1221` y `:1230`). Sobre eso:
+La búsqueda y el contexto traen, además de lo propio, las filas de los autores que la política de [`specs/sharing`](../sharing/spec.md) deja leer al llamador: `POST /v1/search` y `POST /v1/context` resuelven el alcance del agente del pedido en cada llamada (`reach`, `crates/clawg-cli/src/daemon/api.rs:1203`; usos en `api.rs:1171`, `:1245` y `:1254`). Sobre eso:
 
 - Cada hit de `POST /v1/search` MUST llevar su autor como `agent_id` (`RankedHit.agent_id`, `search.rs:88`); el cliente lo lee con `#[serde(default)]` y un hit sin autor cuenta como propio (`client.rs:175`).
 - El workspace, ACTIVE CONFLICTS, RECENT del contexto sin consulta, el listado, la síntesis y el detector de contradicciones al guardar MUST seguir viendo sólo lo del agente: sólo los hits de búsqueda y el resumen de [LAST SESSION](#la-última-sesión) llegan a filas ajenas.
-- Un hit ajeno MUST contar como acceso igual que uno propio (`api.rs:1168`).
+- Un hit ajeno MUST contar como acceso igual que uno propio (`api.rs:1192`).
 
 **Test:** `a_hit_carries_its_author` (`search.rs`), `search_returns_the_author_of_each_hit` y `search_and_context_follow_the_sharing_policy_from_the_next_call` (`crates/clawg-cli/tests/api.rs`), `the_workspace_and_conflicts_stay_own` (`prompt_builder.rs`) y `contradiction_probe_ignores_shared_authors` (`contradiction.rs`).
 
@@ -408,11 +408,11 @@ El workspace entregado al modelo (`workspace_for_prompt`, `prompt_builder.rs:863
 
 ## El contexto sin consulta
 
-Un `POST /v1/context` sin `query`, o con una que sólo tiene espacios, MUST NOT embeber ni buscar, así que no necesita el modelo (`ContextRequest.query` es opcional, `crates/clawg-cli/src/daemon/api.rs:384-388`; el handler decide con `filter(|q| !q.trim().is_empty())`, `api.rs:1213`, y llama a `build_session_prompt`, `crates/clawg-core/src/memory/prompt_builder.rs:271`, en `api.rs:1231`). Es el contexto con el que empieza una sesión, cuando todavía no hay una pregunta. Su prompt MUST llevar el workspace, el resumen de [LAST SESSION](#la-última-sesión) y, bajo RECENT, las filas vivas (`active` o `disputed`, sin `deleted_at`) del agente que pide, creadas en los últimos siete días, con el predicado de proyecto de la búsqueda: las del proyecto pedido, las que no tienen proyecto y las `user_preference` de cualquier proyecto (`RECENT_ROWS_SQL`, `prompt_builder.rs:766-776`, el mismo predicado que `crates/clawg-core/src/memory/search.rs:212`). Quedan afuera las filas que el workspace ya imprimió (`EmittedIds`) y el save del resumen de LAST SESSION. Va de la más nueva a la más vieja (`created_at DESC, id ASC`), hasta `K_FINAL` saves (diez, `prompt_builder.rs:46`), una línea por save.
+Un `POST /v1/context` sin `query`, o con una que sólo tiene espacios, MUST NOT embeber ni buscar, así que no necesita el modelo (`ContextRequest.query` es opcional, `crates/clawg-cli/src/daemon/api.rs:396-400`; el handler decide con `filter(|q| !q.trim().is_empty())`, `api.rs:1237`, y llama a `build_session_prompt`, `crates/clawg-core/src/memory/prompt_builder.rs:271`, en `api.rs:1255`). Es el contexto con el que empieza una sesión, cuando todavía no hay una pregunta. Su prompt MUST llevar el workspace, el resumen de [LAST SESSION](#la-última-sesión) y, bajo RECENT, las filas vivas (`active` o `disputed`, sin `deleted_at`) del agente que pide, creadas en los últimos siete días, con el predicado de proyecto de la búsqueda: las del proyecto pedido, las que no tienen proyecto y las `user_preference` de cualquier proyecto (`RECENT_ROWS_SQL`, `prompt_builder.rs:766-776`, el mismo predicado que `crates/clawg-core/src/memory/search.rs:212`). Quedan afuera las filas que el workspace ya imprimió (`EmittedIds`) y el save del resumen de LAST SESSION. Va de la más nueva a la más vieja (`created_at DESC, id ASC`), hasta `K_FINAL` saves (diez, `prompt_builder.rs:46`), una línea por save.
 
 Cada save largo MUST contarse una vez, por su pedazo de menor posición, que es el que nombra el tema (`one_row_per_save`, `prompt_builder.rs:815`). Como los pedazos son filas de `memory`, la consulta trae como mucho `RECENT_ROW_POOL` (200, `prompt_builder.rs:777`) filas y las junta después. Los pedazos de un save comparten `created_at` y se insertan en orden, así que `id ASC` dentro de un mismo instante hace que el corte del pool nunca deje a un save sin su apertura. No lleva LONG-TERM: sin consulta no hay nada que sea relevante, sólo nuevo. La última sesión, los conflictos activos y el presupuesto MUST ser los de un contexto con consulta (`with_last_session` y `assemble`, `prompt_builder.rs:287-288`).
 
-`retrieval` MUST ser `{"state": "recent", "hits": N}`, con `N` los saves que usó el prompt antes de sacar el del resumen (`Retrieval::Recent`, `prompt_builder.rs:286`; `RetrievalState::Recent`, `api.rs:617`). MUST NOT registrar accesos: esas filas se eligieron por ser nuevas y no por ser relevantes, y contarlas en cada inicio de sesión promovería una fila por su edad (`build_session_prompt` no recibe un `AccessTracker`). Cómo lee el puente el estado `recent` está en [`specs/mcp`](../mcp/spec.md), y el hook que pide este contexto al iniciar la sesión, en [`specs/hooks`](../hooks/spec.md).
+`retrieval` MUST ser `{"state": "recent", "hits": N}`, con `N` los saves que usó el prompt antes de sacar el del resumen (`Retrieval::Recent`, `prompt_builder.rs:286`; `RetrievalState::Recent`, `api.rs:632`). MUST NOT registrar accesos: esas filas se eligieron por ser nuevas y no por ser relevantes, y contarlas en cada inicio de sesión promovería una fila por su edad (`build_session_prompt` no recibe un `AccessTracker`). Cómo lee el puente el estado `recent` está en [`specs/mcp`](../mcp/spec.md), y el hook que pide este contexto al iniciar la sesión, en [`specs/hooks`](../hooks/spec.md).
 
 Queda abierto que RECENT muestre menos de diez saves cuando los diez más nuevos suman más de 200 filas: el pool corta por filas y no por saves. Un arreglo posible es juntar los pedazos en SQL, por `memory_piece`, antes del `LIMIT` ([verify](../../changes/archive/2026-10-18-agent-lifecycle-hooks/verify.md#lo-que-encontró-la-verificación), W2).
 
@@ -566,7 +566,7 @@ Con un proyecto indexado ([`specs/project-docs`](../project-docs/spec.md)), `sea
 - Los contadores ya guardados no se reescriben. Los accesos que se contaron de más antes de este comportamiento quedan como estaban.
 - El formato del prompt de `recall_context` no toca la búsqueda: la salida de `search_memory` es la misma, y el orden y los separadores de las secciones (`prompt_builder.rs:23-29`) y `K_FINAL` (`:46`) no dependen de él. El separador `=== ACTIVE CONFLICTS (review needed) ===` lo nombran las instrucciones del servidor y la doc de `resolve_conflict`.
 - El presupuesto no toca la búsqueda ni el ranking: corta lo que se imprime, después de `K_FINAL`, y la salida de `search_memory` es la misma.
-- Un prompt vacío se entrega como `no context yet` (`format_context`, `crates/clawg-cli/src/mcp/tools.rs:449`), salvo cuando las memorias no se buscaron, o se buscaron y todas las filas eran de score 0: entonces lo reemplaza el aviso de [`specs/mcp`](../mcp/spec.md) o la frase de abstención. Ese aviso va antes del prompt y el de `synthesize` después (`format_recall`, `tools.rs:430`), los dos fuera de lo que mide `rag-eval`.
+- Un prompt vacío se entrega como `no context yet` (`format_context`, `crates/clawg-cli/src/mcp/tools.rs:508`), salvo cuando las memorias no se buscaron, o se buscaron y todas las filas eran de score 0: entonces lo reemplaza el aviso de [`specs/mcp`](../mcp/spec.md) o la frase de abstención. Ese aviso va antes del prompt y el de `synthesize` después (`format_recall`, `tools.rs:489`), los dos fuera de lo que mide `rag-eval`.
 - Armar el prompt no escribe: `fetch_active_conflicts` y `fetch_last_session` son un `SELECT`, y el archivo del workspace no cambia.
 - Un contexto sin consulta tampoco registra accesos: `build_session_prompt` no recibe un `AccessTracker` (`prompt_builder.rs:271`), a diferencia de `build_memory_prompt`. El resumen de LAST SESSION no lo registra en ninguno de los dos.
 

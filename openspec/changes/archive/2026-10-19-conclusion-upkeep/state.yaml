@@ -1,0 +1,15 @@
+change: conclusion-upkeep
+objective: "5"
+depends_on: [knowledge-synthesis, topic-revisions, recoverable-delete]
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # Linux, Windows, binario real en home temporal y Claude Code sobre el perfil dev con el modelo real; corrigió la concordancia del aviso; sin CRITICAL ni WARNING
+  archive: done
+updated: 2026-10-19
+main_spec: openspec/specs/synthesis/spec.md, openspec/specs/secrets/spec.md, openspec/specs/hooks/spec.md

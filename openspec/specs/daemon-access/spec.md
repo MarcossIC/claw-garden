@@ -9,7 +9,7 @@ Fuente de verdad de qué peticiones llegan a la API HTTP del daemon antes de mir
 
 - **Nombre de loopback:** `127.0.0.1`, `localhost` o `[::1]`, comparados sin distinguir mayúsculas (`LOOPBACK_NAMES`, `crates/clawg-cli/src/daemon/guard.rs:19`).
 - **Autoridades de la petición:** la cabecera `Host` y la autoridad de la URI (la `:authority` de HTTP/2, o la de una URI absoluta en HTTP/1.1), las que estén. El daemon sirve HTTP/2 en texto plano: `hyper-util` llega con `http2` a través de `reqwest`.
-- **Guardia:** `admit_loopback` (`crates/clawg-cli/src/daemon/api.rs:835`), la capa que `router` (`api.rs:777`) aplica a todas sus rutas, `/health` y `/v1` incluidas, por fuera de `require_bearer` (`api.rs:798`).
+- **Guardia:** `admit_loopback` (`crates/clawg-cli/src/daemon/api.rs:850`), la capa que `router` (`api.rs:792`) aplica a todas sus rutas, `/health` y `/v1` incluidas, por fuera de `require_bearer` (`api.rs:813`).
 
 ## Límite
 

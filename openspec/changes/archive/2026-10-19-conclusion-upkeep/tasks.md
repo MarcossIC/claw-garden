@@ -40,10 +40,11 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 ## 7. Verificación
 
 - [x] `cargo test --workspace` y el clippy de `.claude/CLAUDE.md` en Linux.
-- [ ] Lo mismo en Windows, en `target-test`.
-- [ ] Perfil dev con el modelo real. (El binario real ya se probó en un home temporal: [verify](verify.md#binario-real-home-temporal).)
+- [x] Lo mismo en Windows, en `target-test`.
+- [x] Perfil dev con el modelo real y Claude Code ([verify](verify.md#perfil-dev-modelo-real-y-claude-code)).
 - [x] `verify.md`.
+- Commit: `fix(cli): keep the review reminder's verb plural` (lo que encontró la verificación)
 
 ## 8. Archive
 
-- [ ] Specs `synthesis` y `secrets`; `git mv` al archivo; subir el minor.
+- [x] Specs `synthesis` y `secrets`; `git mv` al archivo; subir el minor.

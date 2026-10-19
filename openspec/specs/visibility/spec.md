@@ -89,7 +89,7 @@ El `--agent` de `clawg hook` MUST ser el del puente, para que el hook lea al mis
 
 ## R4. Scope opcional en el daemon
 
-- `DELETE` y `PATCH /v1/memories/{kind}/{id}` MUST aceptar `agent` en la query, y `POST /v1/memories/{kind}/{id}/restore` también (`restore_memory`, `crates/clawg-cli/src/daemon/api.rs:1361`); `GET /v1/memories/{kind}/{id}/save` MUST aceptar lo mismo; `POST /v1/disputes/resolve` MUST aceptar `agent_id` en el cuerpo.
+- `DELETE` y `PATCH /v1/memories/{kind}/{id}` MUST aceptar `agent` en la query, y `POST /v1/memories/{kind}/{id}/restore` también (`restore_memory`, `crates/clawg-cli/src/daemon/api.rs:1390`); `GET /v1/memories/{kind}/{id}/save` MUST aceptar lo mismo; `POST /v1/disputes/resolve` MUST aceptar `agent_id` en el cuerpo.
 - Con scope, si la fila (o alguna de las dos, al resolver) es de otro agente, la respuesta MUST ser `404`, igual que un id inexistente, y MUST NOT cambiar nada: ni la fila, ni su vector, ni sus disputas, ni su `last_modified_at`, ni su `update_count`. En el `GET` del save, el scope se aplica a la fila pedida (si es ajena, 404) y a cada posición del save: un pedazo de otro agente, que el dedup dejó dentro de un save propio, figura como faltante con `ids` en `null` ([`specs/pieces`](../pieces/spec.md), R6).
 - La regla no depende de lo que el agente ve: una fila que `specs/sharing` le muestra en una búsqueda es igual de ajena para el scope. Lo mismo vale para `POST /v1/synthesis`, que con `agent_id` sólo mira filas de ese agente.
 - Sin scope, la operación MUST valer sobre cualquier fila, como antes de existir el scope.
