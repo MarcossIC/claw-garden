@@ -31,7 +31,7 @@ use clawg_cli::undelete;
 use clawg_cli::update;
 use clawg_core::memory::backup::{backup_offline, probe, restore};
 use clawg_core::memory::embedder::keep_one_malloc_arena;
-use clawg_core::memory::secrets::{purge, scan};
+use clawg_core::memory::secrets::{mask_reasons, purge, scan};
 use clawg_core::paths::data_dir;
 use clap::Parser;
 
@@ -189,7 +189,16 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
 
-        Command::Secrets { profile } => {
+        Command::Secrets { mask_reasons: true, yes, profile } => {
+            secrets::confirm_mask_reasons(yes)?;
+            let profile = profile.resolve().map_err(|e| e.to_string())?;
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let masked = mask_reasons(&base_dir).map_err(|e| secrets::explain(e, "mask the reasons"))?;
+            println!("{}", secrets::mask_report(&masked));
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Secrets { mask_reasons: false, profile, .. } => {
             let profile = profile.resolve().map_err(|e| e.to_string())?;
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
             let scanned = scan(&base_dir).map_err(|e| e.to_string())?;
@@ -201,7 +210,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             secrets::confirm(id, yes)?;
             let profile = profile.resolve().map_err(|e| e.to_string())?;
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
-            let purged = purge(&base_dir, id).map_err(secrets::explain)?;
+            let purged = purge(&base_dir, id).map_err(|e| secrets::explain(e, "purge"))?;
             println!("{}", secrets::purge_report(id, &purged));
             Ok(ExitCode::SUCCESS)
         }

@@ -102,10 +102,10 @@ pub enum PurgeError {
     #[error("there is no memory #{0}")]
     NotFound(i64),
     #[error("memory.db has migrations pending (V{from} to V{to}); start the daemon once so it \
-             migrates them, stop it, and purge then")]
+             migrates them, stop it, and run this again")]
     Pending { from: i32, to: i32 },
-    #[error("memory.db stayed busy after the purge, so its WAL could not be emptied; \
-             make sure no other clawg is running and purge again")]
+    #[error("memory.db stayed busy after the rewrite, so its WAL could not be emptied; \
+             make sure no other clawg is running and run this again")]
     Busy,
 }
 
@@ -125,19 +125,9 @@ pub struct Purged {
 /// nothing is written before every check passes. No snapshot is taken first,
 /// on purpose: it would be one more copy of what is being removed.
 pub fn purge(base_dir: &Path, id: i64) -> Result<Purged, MemoryError> {
-    let path = base_dir.join("memory.db");
-    if !path.exists() {
-        return Err(BackupError::NoStore { path }.into());
-    }
-    let _lock = StoreLock::acquire(base_dir, StoreHolder::Maintenance)?;
-    let mut c = open_existing(base_dir)?;
-    match schema_plan(&read_history(&c)?, &known_migrations()) {
-        SchemaPlan::UpToDate => {}
-        SchemaPlan::Fresh => return Err(PurgeError::NotFound(id).into()),
-        SchemaPlan::Pending { from, to } => return Err(PurgeError::Pending { from, to }.into()),
-        SchemaPlan::Newer { db, binary } => return Err(MemoryError::SchemaNewer { db, binary }),
-        SchemaPlan::Diverged { version } => return Err(MemoryError::SchemaDiverged { version }),
-    }
+    let Some((_lock, mut c)) = open_to_rewrite(base_dir)? else {
+        return Err(PurgeError::NotFound(id).into());
+    };
     let (content, live): (String, bool) = c
         .query_row("SELECT content, deleted_at IS NULL FROM memory WHERE id = ?1", [id], |r| {
             Ok((r.get(0)?, r.get(1)?))
@@ -166,29 +156,121 @@ pub fn purge(base_dir: &Path, id: i64) -> Result<Purged, MemoryError> {
     // keeps the old segments until a merge: both still hold the text. A full
     // merge rewrites the index without them.
     c.execute("INSERT INTO memory_fts(memory_fts) VALUES ('optimize')", [])?;
-    // Pages freed long before this purge (every merge of the index frees
-    // some) still hold whatever they held, and `secure_delete` only zeroes
-    // pages freed from now on. Rebuilding the file leaves no free page. It
-    // keeps the rowids vec0 addresses its chunks by: a table with an index is
-    // copied with its rowids, and every vec0 shadow table has one.
+    leave_no_old_copy(c)?;
+    Ok(Purged { backups: backups_holding(&crate::paths::backups_dir(base_dir), id, &content) })
+}
+
+/// What [`mask_reasons`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct MaskedReasons {
+    /// The pairs whose reason was masked, with the kinds it held.
+    pub pairs: Vec<FlaggedPair>,
+    /// Snapshots in `<data>/backups` that still hold one of those reasons as
+    /// it was, by name. None is changed.
+    pub backups: Vec<PathBuf>,
+}
+
+/// Replaces every verdict reason that holds a secret with its masked text, so
+/// the secret is in neither `memory.db` nor its WAL. Every other reason, and
+/// everything else in the pair, stays as it is.
+///
+/// On a stopped store that is up to date, as [`purge`], and with no snapshot
+/// first for the same reason.
+pub fn mask_reasons(base_dir: &Path) -> Result<MaskedReasons, MemoryError> {
+    let Some((_lock, mut c)) = open_to_rewrite(base_dir)? else {
+        return Ok(MaskedReasons::default());
+    };
+    let found = reasons_with_a_secret(&c)?;
+    if found.is_empty() {
+        return Ok(MaskedReasons::default());
+    }
+    let tx = c.transaction()?;
+    for (pair, reason) in &found {
+        tx.execute(
+            "UPDATE memory_conflict SET reason = ?3 WHERE new_id = ?1 AND old_id = ?2",
+            rusqlite::params![pair.new_id, pair.old_id, redact(reason).text],
+        )?;
+    }
+    tx.commit()?;
+    leave_no_old_copy(c)?;
+    let backups = backups_holding_reasons(&crate::paths::backups_dir(base_dir), &found);
+    Ok(MaskedReasons { pairs: found.into_iter().map(|(pair, _)| pair).collect(), backups })
+}
+
+/// The store, locked against every other clawg and at a schema this binary
+/// writes, or `None` when it has never been migrated and so holds nothing.
+/// Nothing is written before every check passes.
+fn open_to_rewrite(base_dir: &Path) -> Result<Option<(StoreLock, rusqlite::Connection)>, MemoryError> {
+    let path = base_dir.join("memory.db");
+    if !path.exists() {
+        return Err(BackupError::NoStore { path }.into());
+    }
+    let lock = StoreLock::acquire(base_dir, StoreHolder::Maintenance)?;
+    let c = open_existing(base_dir)?;
+    match schema_plan(&read_history(&c)?, &known_migrations()) {
+        SchemaPlan::UpToDate => Ok(Some((lock, c))),
+        SchemaPlan::Fresh => Ok(None),
+        SchemaPlan::Pending { from, to } => Err(PurgeError::Pending { from, to }.into()),
+        SchemaPlan::Newer { db, binary } => Err(MemoryError::SchemaNewer { db, binary }),
+        SchemaPlan::Diverged { version } => Err(MemoryError::SchemaDiverged { version }),
+    }
+}
+
+/// Rebuilds the file and empties the WAL after a rewrite, then closes it.
+fn leave_no_old_copy(c: rusqlite::Connection) -> Result<(), MemoryError> {
+    // Pages freed long before this rewrite (every merge of the text index
+    // frees some) still hold whatever they held, and `secure_delete` only
+    // zeroes pages freed from now on. Rebuilding the file leaves no free
+    // page. It keeps the rowids vec0 addresses its chunks by: a table with an
+    // index is copied with its rowids, and every vec0 shadow table has one.
     c.execute_batch("VACUUM")?;
     // Older frames of the WAL can still hold the pages as they were.
     let busy: i64 = c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
     if busy != 0 {
         return Err(PurgeError::Busy.into());
     }
-    drop(c);
-    Ok(Purged { backups: backups_holding(&crate::paths::backups_dir(base_dir), id, &content) })
+    Ok(())
+}
+
+/// The snapshots in `dir` that hold any of `found` with its reason as it was,
+/// by name. One that cannot be read is listed too.
+fn backups_holding_reasons(dir: &Path, found: &[(FlaggedPair, String)]) -> Vec<PathBuf> {
+    let mut holding: Vec<PathBuf> = snapshots_in(dir)
+        .into_iter()
+        .filter(|p| {
+            let Ok(c) = open_for_probe(p) else { return true };
+            if !has_table(&c, "memory_conflict").unwrap_or(true) {
+                return false;
+            }
+            found.iter().any(|(pair, reason)| {
+                c.query_row(
+                    "SELECT count(*) FROM memory_conflict WHERE new_id = ?1 AND old_id = ?2 AND reason = ?3",
+                    rusqlite::params![pair.new_id, pair.old_id, reason],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_or(true, |n| n > 0)
+            })
+        })
+        .collect();
+    holding.sort();
+    holding
+}
+
+/// The files in `dir` named as snapshots.
+fn snapshots_in(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).and_then(parse_snapshot_name).is_some())
+        .collect()
 }
 
 /// The snapshots in `dir` with a row `id` whose content is `content`, or an
 /// outbox row holding it, by name. One that cannot be read is listed too: it
 /// may hold the row.
 fn backups_holding(dir: &Path, id: i64, content: &str) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
-    let mut holding: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.file_name().and_then(|n| n.to_str()).and_then(parse_snapshot_name).is_some())
+    let mut holding: Vec<PathBuf> = snapshots_in(dir)
+        .into_iter()
         .filter(|p| {
             let Ok(c) = open_for_probe(p) else { return true };
             let in_memory = c
@@ -340,6 +422,66 @@ mod tests {
 
         assert!(found.memories.is_empty(), "{:?}", found.memories);
         assert_eq!(found.pairs, vec![FlaggedPair { new_id: b, old_id: a, kinds: vec![SecretKind::GithubToken] }]);
+    }
+
+    fn reasons(dir: &Path) -> Vec<Option<String>> {
+        let c = rusqlite::Connection::open(dir.join("memory.db")).unwrap();
+        let mut stmt = c.prepare("SELECT reason FROM memory_conflict ORDER BY new_id, old_id").unwrap();
+        let reasons = stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        reasons
+    }
+
+    #[tokio::test]
+    async fn masking_reasons_rewrites_only_the_ones_with_a_secret() {
+        use crate::memory::backup::backup_offline;
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+        let a = insert(&store, "the deploy runs on fridays".to_string()).await;
+        let b = insert(&store, "the deploy runs on mondays".to_string()).await;
+        let c = insert(&store, "the deploy runs on sundays".to_string()).await;
+        let token = fake("ghp_", "q8Zk", 36);
+        add_pair(&store, b, a, Some(format!("rotated {token}"))).await;
+        add_pair(&store, c, a, Some("one is the dev profile".to_string())).await;
+        add_pair(&store, c, b, None).await;
+        store.conn.clone().close().await.unwrap();
+        drop(store);
+        let held = backup_offline(dir.path()).unwrap();
+        assert!(bytes_mention(dir.path(), b"q8Zkq8Zk"), "the fixture holds the token");
+
+        let masked = mask_reasons(dir.path()).unwrap();
+
+        assert_eq!(
+            masked,
+            MaskedReasons {
+                pairs: vec![FlaggedPair { new_id: b, old_id: a, kinds: vec![SecretKind::GithubToken] }],
+                backups: vec![held],
+            }
+        );
+        assert_eq!(
+            reasons(dir.path()),
+            [Some("rotated [REDACTED:github_token]".to_string()), Some("one is the dev profile".to_string()), None]
+        );
+        assert!(!bytes_mention(dir.path(), b"q8Zkq8Zk"), "the token's bytes are still on disk");
+        assert_eq!(mask_reasons(dir.path()).unwrap(), MaskedReasons::default(), "a second run finds nothing");
+        StoreLock::acquire(dir.path(), StoreHolder::Daemon).expect("the lock was released");
+    }
+
+    #[tokio::test]
+    async fn masking_reasons_refuses_while_the_daemon_holds_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+        let a = insert(&store, "the deploy runs on fridays".to_string()).await;
+        let b = insert(&store, "the deploy runs on mondays".to_string()).await;
+        add_pair(&store, b, a, Some(format!("rotated {}", fake("ghp_", "a1B2", 36)))).await;
+        store.conn.clone().close().await.unwrap();
+        drop(store);
+        let before = std::fs::read(dir.path().join("memory.db")).unwrap();
+        let _daemon = StoreLock::acquire(dir.path(), StoreHolder::Daemon).unwrap();
+
+        let err = mask_reasons(dir.path()).unwrap_err();
+
+        assert!(matches!(err, MemoryError::StoreInUse { .. }), "{err}");
+        assert_eq!(std::fs::read(dir.path().join("memory.db")).unwrap(), before);
     }
 
     #[tokio::test]

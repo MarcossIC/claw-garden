@@ -2,7 +2,7 @@
 //! commands so the wording is under test without a store.
 
 use clawg_core::memory::redact::SecretKind;
-use clawg_core::memory::secrets::{Purged, Scanned};
+use clawg_core::memory::secrets::{MaskedReasons, Purged, Scanned};
 use clawg_core::memory::store_lock::StoreHolder;
 use clawg_core::memory::MemoryError;
 
@@ -66,24 +66,57 @@ pub fn confirm(id: i64, yes: bool) -> Result<(), String> {
     ))
 }
 
+/// `--mask-reasons` without `--yes` stops here, before anything is opened.
+pub fn confirm_mask_reasons(yes: bool) -> Result<(), String> {
+    if yes {
+        return Ok(());
+    }
+    Err("clawg secrets --mask-reasons replaces the secrets of every verdict reason with their \
+         placeholders for good, with no backup of them. Run it again with --yes to do it"
+        .to_string())
+}
+
+/// The lines printed after the reasons were masked: each pair by its rows,
+/// then the backups that still hold one as it was.
+pub fn mask_report(masked: &MaskedReasons) -> String {
+    if masked.pairs.is_empty() {
+        return "no verdict reason holds a secret of a known format".to_string();
+    }
+    let mut lines: Vec<String> = masked
+        .pairs
+        .iter()
+        .map(|p| {
+            let kinds: Vec<&str> = p.kinds.iter().map(|k| k.as_str()).collect();
+            format!("masked the reason of pair {} {} ({})", p.new_id, p.old_id, kinds.join(", "))
+        })
+        .collect();
+    lines.extend(backups_lines(&masked.backups));
+    lines.join("\n")
+}
+
+fn backups_lines(backups: &[std::path::PathBuf]) -> Vec<String> {
+    if backups.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec!["these backups still hold it; delete them if it must be gone everywhere:".to_string()];
+    lines.extend(backups.iter().map(|path| format!("  {}", path.display())));
+    lines
+}
+
 /// The lines printed after a purge. Backups that still hold the row are named
 /// and left alone: they are the way back from everything else.
 pub fn purge_report(id: i64, purged: &Purged) -> String {
-    let mut out = format!("purged memory #{id}");
-    if !purged.backups.is_empty() {
-        out.push_str("\nthese backups still hold it; delete them if it must be gone everywhere:");
-        for path in &purged.backups {
-            out.push_str(&format!("\n  {}", path.display()));
-        }
-    }
-    out
+    let mut lines = vec![format!("purged memory #{id}")];
+    lines.extend(backups_lines(&purged.backups));
+    lines.join("\n")
 }
 
-/// A purge refused because the daemon holds the store says how to free it.
-pub fn explain(err: MemoryError) -> String {
+/// A rewrite refused because the daemon holds the store says how to free
+/// it, and then to `then`.
+pub fn explain(err: MemoryError, then: &str) -> String {
     match &err {
         MemoryError::StoreInUse { owner: Some(o) } if o.holder == StoreHolder::Daemon => {
-            format!("{err}; run `clawg stop` first, then purge")
+            format!("{err}; run `clawg stop` first, then {then}")
         }
         _ => err.to_string(),
     }
@@ -138,6 +171,29 @@ mod tests {
     }
 
     #[test]
+    fn mask_reasons_needs_yes() {
+        let refused = confirm_mask_reasons(false).unwrap_err();
+        assert!(refused.contains("for good") && refused.contains("--yes"), "{refused}");
+        assert_eq!(confirm_mask_reasons(true), Ok(()));
+    }
+
+    #[test]
+    fn the_mask_report_names_pairs_and_backups() {
+        use std::path::PathBuf;
+        assert_eq!(mask_report(&MaskedReasons::default()), "no verdict reason holds a secret of a known format");
+        let masked = MaskedReasons {
+            pairs: vec![FlaggedPair { new_id: 12, old_id: 9, kinds: vec![SecretKind::Credential] }],
+            backups: vec![PathBuf::from("/b/memory-x-manual.db")],
+        };
+        assert_eq!(
+            mask_report(&masked),
+            "masked the reason of pair 12 9 (credential)\n\
+             these backups still hold it; delete them if it must be gone everywhere:\n  \
+             /b/memory-x-manual.db"
+        );
+    }
+
+    #[test]
     fn purge_needs_yes_before_it_opens_anything() {
         let refused = confirm(57, false).unwrap_err();
         assert!(refused.contains("memory #57 for good"), "{refused}");
@@ -151,9 +207,9 @@ mod tests {
         let err = MemoryError::StoreInUse {
             owner: Some(StoreOwner { holder: StoreHolder::Daemon, pid: 7, started_at_ms: 1 }),
         };
-        let msg = explain(err);
+        let msg = explain(err, "purge");
         assert!(msg.contains("the clawg daemon (pid 7)") && msg.contains("run `clawg stop` first, then purge"), "{msg}");
-        assert_eq!(explain(MemoryError::Internal("boom".into())), "internal memory error: boom");
+        assert_eq!(explain(MemoryError::Internal("boom".into()), "purge"), "internal memory error: boom");
     }
 
     #[test]
