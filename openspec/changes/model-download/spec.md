@@ -44,18 +44,18 @@ Una recarga MUST leer y verificar sólo la caché, sin tocar la red. Si la cach�
 - THEN las dos responden `503 embedder_not_ready` enseguida y hay una sola descarga en curso
 - AND cuando la descarga termina, la búsqueda siguiente carga el modelo y responde
 
-**Tests:** `a_reload_reads_the_cache_and_never_downloads`, `a_reload_with_a_damaged_cache_is_not_ready_and_repairs_it_once_in_the_background` y `an_idle_unloading_embedder_reloads_through_the_same_files_and_load` (`bootstrap.rs`); `the_cached_model_never_touches_the_network` (`model_download.rs`).
+**Tests:** `an_idle_unloading_embedder_reloads_through_the_same_files_and_load` (con una descarga que hace fallar el test si se llama) y `a_reload_with_a_damaged_cache_is_not_ready_and_repairs_it_once_in_the_background` (`bootstrap.rs`); `the_cached_model_never_touches_the_network` (`model_download.rs`).
 
 ## R4. Fuera de los hilos del runtime, un hash por archivo
 
-Leer y hashear la caché MUST correr en una tarea bloqueante (`spawn_blocking`), no en un hilo del runtime asíncrono, en el arranque y en cada recarga. El worker de ingest MUST leer, verificar y parsear `tokenizer.json` en una tarea bloqueante. En una corrida de `ensure`, cada archivo MUST hashearse una sola vez: el que está en la caché al leerlo, el que se baja mientras llegan sus bytes, sin volver a leerlo del disco. Los bytes que recibe la carga MUST ser los mismos que se hashearon.
+Leer y hashear la caché MUST correr en una tarea bloqueante (`spawn_blocking`), no en un hilo del runtime asíncrono, en el arranque y en cada recarga. El worker de ingest MUST leer, verificar y parsear `tokenizer.json` en una tarea bloqueante. En una corrida de `ensure`, cada archivo MUST hashearse una sola vez: el que está en la caché al leerlo, el que se baja mientras llegan sus bytes, sin volver a leerlo del disco. Los bytes que recibe la carga MUST ser los mismos que se hashearon. Como el archivo bajado queda en memoria para entregarlo sin releerlo, un archivo que anuncia o trae más de 600 MB (lo que pide libre el chequeo de disco, más que cualquier archivo del modelo) MUST fallar sin reintentar y sin reservar esa memoria.
 
 #### Escenario: falta un archivo chico
 - GIVEN la caché completa salvo `config.json`
 - WHEN corre `ensure`
 - THEN el ONNX se lee y se hashea una vez y sólo se pide `config.json`
 
-**Tests:** `the_cache_check_leaves_the_runtime_thread_free` y `each_file_is_hashed_once_per_run` (`model_download.rs`); `the_worker_resolves_the_tokenizer_off_the_runtime_thread` (`runtime.rs`).
+**Tests:** `the_cache_check_leaves_the_runtime_thread_free`, `each_file_is_hashed_once_per_run` y `a_file_larger_than_any_model_file_is_refused_without_holding_it` (`model_download.rs`); `the_worker_resolves_the_tokenizer_off_the_runtime_thread` (`runtime.rs`).
 
 ## R5. `CLAWG_HF_BASE_URL`
 

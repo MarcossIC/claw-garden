@@ -58,7 +58,7 @@ El cerrojo queda ocupado lo que tarda leer y hashear la caché, nunca lo que tar
 - **El tokenizer del worker:** `ingest_worker_future` resuelve el tokenizer y el chunker en `spawn_blocking`. El lector es un parámetro de esa función para que el test compruebe en qué hilo corre; producción pasa `load_verified_tokenizer`. Si la tarea entrara en pánico, el chunker se arma sobre la celda vacía y parte por bytes hasta que la carga del modelo la llene, como con un archivo que falta.
 - **Mismos bytes:** lo que recibe la sesión es exactamente lo que se hasheó, en los dos caminos; se mantiene la decisión de `bootstrap.rs:376-380`.
 
-El costo es memoria: con un archivo chico faltante, los ~470 MB del ONNX quedan en memoria mientras se baja el chico. Hoy se leían igual al final, así que el pico es el mismo.
+El costo es memoria: con un archivo chico faltante, los ~470 MB del ONNX quedan en memoria mientras se baja el chico. Hoy se leían igual al final, así que el pico es el mismo. Lo que sí es nuevo es que el cuerpo de una respuesta se acumula en memoria y no sólo en disco, y que la reserva inicial sale de `Content-Length`: un espejo o un proxy que anunciara 1 TB tumbaría el proceso al reservarlo. Por eso un archivo que anuncia o trae más de 600 MB (`MAX_FILE_BYTES`, lo mismo que pide libre el chequeo de disco y más que cualquier archivo del modelo) termina con `TooLarge`, sin reintentar, como un SHA-256 distinto: el origen no va a mandar otra cosa en el intento siguiente.
 
 Contar los hashes no tiene un punto de inyección natural: el test de R4 usa un registro de rutas leídas que existe sólo con `cfg(test)` dentro de `read_verified`, filtrado por el directorio temporal del test, porque la fase corre en otro hilo y un `thread_local` no la vería.
 
