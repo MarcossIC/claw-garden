@@ -55,6 +55,8 @@ Un punto que ese texto no cubría: la memoria apagada no es «vacía» para todo
   - **Con el binario viejo:** el contrato coincide, y la base sirve una mezcla de dos espacios de embedding **sin ningún aviso**. Es el riesgo real de un re-embed sin snapshot.
 - **Costo:** infiere fila por fila con `embed_with_role`, siempre con rol `Passage` (`compute_new_embedding`). No lo medí; la inferencia ONNX en CPU es el costo dominante.
 - **Fallos por fila:** la fila que no se puede embeber conserva su vector viejo, se cuenta como `failed` y el contrato no se actualiza (`maintenance.rs:507-570`).
+- **Consecuencia en el arranque: todo o nada.** `reembed_all` escribe el contrato sólo si `failed == 0 && !aborted` en las tres tablas (`maintenance.rs:507-535`, la condición en `:516`); la fila que falla conserva su vector viejo (`:582`). `verify_or_reembed` toma el snapshot `pre-reembed` (`bootstrap.rs:440-455`) y, si el contrato no se escribió, devuelve `Mismatch` (`:467`); `bootstrap.rs:547-558` lo convierte en `BootstrapError::Mismatch`, que `bootstrap.rs:73` trata como `GiveUp`: el embedder queda `failed` sin reintento en ese proceso, los saves responden `embedder_failed` y la búsqueda está apagada. El próximo arranque repite el snapshot y el re-embed completo. Cada intento suma un `pre-reembed` al presupuesto automático de 5 y puede sacar al `pre-migration` (ver «Lo que se puede reusar para el snapshot previo»). Una sola fila rebelde apaga la memoria hasta un arranque donde todas pasen.
+- **Qué hace fallar a una fila:** `EmbedError::{NotReady, WorkerGone, InferenceFailed, LoadFailed}` o un error de `to_unit` (dimensión, valor no finito, norma cero) (`maintenance.rs:617`, `embedder.rs:187-194, 216-235`, `vector.rs:41-57`). Un texto vacío, o vacío por el enmascarado, **no** falla: el tokenizador agrega los tokens especiales. El disparador realista es una falla transitoria o un texto patológico. Importa para las bases que aún tienen vectores por CLS (de antes de project-indexing, 12) y para cualquier cambio de modelo futuro por `clawg reembed`. Los tests cercanos a `maintenance.rs:1881` fijan el comportamiento de hoy (una fila fallida bloquea el contrato).
 - **Dimensión:** `UPDATE memory_vectors SET embedding = ?` con un vector de otra longitud falla contra `float[384]`. `reembed_all` sirve para cambiar modelo o prefijos **a la misma dimensión**, no para cambiar la dimensión.
 
 ### Las tres tablas vec0 tienen la dimensión escrita
@@ -80,6 +82,14 @@ Un punto que ese texto no cubría: la memoria apagada no es «vacía» para todo
 - **Modelo y dimensión de producción: no.** `FastEmbedLocal` sólo se construye con `from_bytes`, que necesita el modelo real. Los literales `384` y `"multilingual-e5-small"` (`embedder.rs:268-269`) no los verifica ningún test automático. Los tests de `db.rs:1789-1801` y `bootstrap.rs:889-1007` usan embedders simulados con valores escritos a mano, así que pasarían igual si el de producción cambiara. El único `384` que se afirma es el del `FakeEmbedder` (`embedder.rs:493-496`).
 - **Nada compara la dimensión del embedder con la de V2.** Si alguien subiera `dimensions` a 768 sin migración, las bases existentes darían mismatch y, en una base nueva, los inserts fallarían contra `float[384]`.
 - El comportamiento del mismatch sí está probado (`db.rs:1896,1921,1941`; `bootstrap.rs:889,960`).
+
+### Opciones ante una fila que no se puede embeber
+
+- **F1. Apartar la fila y escribir el contrato.** Quitar su vector del espacio nuevo (o dejarlo fuera de él), anotarla en una tabla o columna de «sin vector», mantenerla legible y listable, escribir el contrato e informar cuántas quedaron fuera. La memoria vuelve a encenderse; esas filas no aparecen en la búsqueda semántica (sí en la léxica, y por `list`/`read`). Hay que decidir cómo se reintentan y qué pasa si se guardan con un vector del espacio viejo: mezclar espacios es el riesgo que el contrato existe para evitar.
+- **F2. Reintentos acotados dentro de la corrida.** Reintentar las filas fallidas un número fijo de veces antes de rendirse. Cubre la falla transitoria, no el texto patológico; sigue siendo todo o nada.
+- **F3. Dejarlo como está.** Es la parada segura de hoy; el costo es la memoria apagada y un snapshot por arranque.
+
+Un store con vectores CLS que un día no pueda terminar el re-embed tiene el mismo problema que un cambio de modelo.
 
 ## Lo que ya protege
 
@@ -133,6 +143,7 @@ El alcance **mínimo recomendable** (A):
 
 Si el usuario elige B, además:
 
+6b. Decidir el tratamiento de la fila que no se puede embeber (F1, F2 o F3) tanto para el arranque como para `clawg reembed`, e informar cuántas quedaron fuera.
 7. `clawg reembed [--profile P]`, offline, con snapshot `pre-reembed`, lock `Maintenance`, informe por tabla (intentadas, actualizadas, fallidas) y salida distinta de cero si algo falló.
 8. Rechazo si el modelo cargado ya coincide con el contrato (nada que hacer) o si la dimensión difiere (dice que hace falta C).
 9. Retención del snapshot `pre-reembed` fuera de la poda automática, o con un conteo aparte.
@@ -161,6 +172,7 @@ Son del usuario. Esta exploración no las decide.
 - [ ] **¿Qué se hace con `ReembedMode::Normalize`?** Renormaliza vectores sin embedder y hoy no tiene ningún caso de uso. ¿Se expone, se borra o se deja sin llamador? Las reglas del repo piden no dejar abstracciones sin uso.
 - [ ] **Retención del snapshot previo.** ¿`pre-reembed` entra en la poda automática de 5, o se conserva aparte hasta que el usuario lo borre? Con reintentos, la poda podría eliminar el único snapshot sano.
 - [ ] **Texto del mismatch.** Hoy los saves responden 503 (verificado). ¿Alcanza, o el mensaje debe nombrar el comando de reparación?
+- [ ] **Fila que no se puede embeber.** ¿F1 (apartarla y escribir el contrato), F2 (reintentos acotados) o F3 (todo o nada, como hoy)? Si F1: dónde se anota, si la búsqueda léxica la sigue alcanzando y cómo se reintenta. Hoy cada arranque fallido suma un snapshot `pre-reembed`.
 - [ ] **Re-embed incompleto.** Hoy queda mezclado con el contrato viejo, y el binario viejo lo serviría sin avisar. ¿Se acepta con el restore como única vuelta atrás, o el comando deja una marca (por ejemplo una fila `reembed_in_progress`) que hace que cualquier binario se niegue a abrir el store hasta terminar?
 - [ ] **Dimensión (si se elige C).** ¿Tablas nuevas y renombrar en una transacción (a verificar con vec0) o `DROP` y recrear dentro de una migración? Lo segundo deja la memoria sin vectores hasta terminar.
 - [ ] **¿Una opción para aceptar el mismatch?** Para quien cambia sólo un prefijo y acepta vectores viejos. Hoy no existe y no la recomiendo: la base queda inconsistente.
@@ -177,7 +189,8 @@ Tests RED primero:
 5. **Re-embed completo (si B):** con un embedder simulado de la misma dimensión, las tres tablas quedan con el vector nuevo, el contrato cambia y el siguiente arranque queda `ready`.
 6. **Re-embed cortado (si B):** un fallo a mitad deja el contrato viejo, el informe lo dice, el comando sale distinto de cero y volver a correrlo termina el trabajo. Hoy esto está probado a nivel función (`maintenance.rs:1700,1753`).
 7. **Rechazos (si B):** con el daemon vivo no hace nada (como `restore_refuses_while_the_daemon_holds_the_store`); con el contrato igual no hace nada; con otra dimensión lo dice.
-8. **Dimensión (si C):** una base sembrada en V10 con filas en las tres tablas abre con la migración nueva y todas las filas siguen alcanzables tras el re-embed. Es la regla de `config.yaml` para cambios de esquema.
+8. **Fila rebelde (si F1 o F2):** un store con una fila que no se puede embeber (embedder simulado que falla para un id) y las demás con vectores CLS: tras el arranque el contrato queda escrito, la fila sigue legible y listable, el informe cuenta una fila fuera, y no se acumulan snapshots `pre-reembed` en cada arranque. Con F3, el mismo caso mantiene el comportamiento de hoy (los tests de `maintenance.rs:1881`).
+9. **Dimensión (si C):** una base sembrada en V10 con filas en las tres tablas abre con la migración nueva y todas las filas siguen alcanzables tras el re-embed. Es la regla de `config.yaml` para cambios de esquema.
 
 `rag-eval --diff` contra la baseline: **sólo si cambia el modelo o un prefijo.** Para A y B con el mismo contrato, las métricas deben ser idénticas. Un modelo nuevo exige una baseline nueva (el `model_id` va en el resultado) y se mide con `--real`, que necesita el modelo.
 
