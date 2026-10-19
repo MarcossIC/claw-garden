@@ -38,4 +38,4 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 
 ## 7. Archive
 
-- [ ] `specs/storage`, `specs/ingest` y `specs/pieces` con R1 a R6; `git mv` a `changes/archive/`; `state.yaml` archivado; fila 53 y orden de ejecución del `README.md` de openspec; subir el minor.
+- [x] `specs/storage`, `specs/ingest` y `specs/pieces` con R1 a R6 (y la línea de `memory_status` en `specs/mcp`), las citas de los archivos tocados realineadas en las specs y el `README.md`; `git mv` a `changes/archive/2026-10-19-outbox-lifecycle`; `state.yaml` archivado; fila 53, los hallazgos y el backlog que resolvió, y el orden de ejecución del `README.md` de openspec; subir el minor.

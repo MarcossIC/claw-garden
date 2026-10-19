@@ -16,7 +16,7 @@ Fuente de verdad del comportamiento actual de `clawg setup <cliente>`: el subcom
 
 ## R1. `clawg setup claude-code`
 
-`clawg setup claude-code [--profile P] [--dry-run] [--remove]` (`Command::Setup`, `crates/clawg-cli/src/cli.rs:160`) MUST resolver el perfil como los otros subcomandos (un build debug MUST rechazar `prod`), MUST rechazar una ruta del binario que no sea absoluta (`plan`, `setup.rs:189-191`), y MUST NOT abrir el store ni arrancar un daemon. Antes de escribir MUST leer los tres archivos; si uno no se puede leer, no es JSON válido o no tiene la forma que escribe Claude Code (los dos JSON, `parse_object`, `setup.rs:242`), o tiene un marcador sin su par (el `CLAUDE.md`, `find_block`, `setup.rs:505`), MUST fallar sin escribir ninguno.
+`clawg setup claude-code [--profile P] [--dry-run] [--remove]` (`Command::Setup`, `crates/clawg-cli/src/cli.rs:166`) MUST resolver el perfil como los otros subcomandos (un build debug MUST rechazar `prod`), MUST rechazar una ruta del binario que no sea absoluta (`plan`, `setup.rs:189-191`), y MUST NOT abrir el store ni arrancar un daemon. Antes de escribir MUST leer los tres archivos; si uno no se puede leer, no es JSON válido o no tiene la forma que escribe Claude Code (los dos JSON, `parse_object`, `setup.rs:242`), o tiene un marcador sin su par (el `CLAUDE.md`, `find_block`, `setup.rs:505`), MUST fallar sin escribir ninguno.
 
 **Tests:** `setup_takes_a_client_a_profile_dry_run_and_remove` (`cli.rs`), `a_relative_binary_path_is_refused`, `an_invalid_settings_file_writes_nothing`, `a_lone_marker_writes_nothing` (`setup.rs`).
 
