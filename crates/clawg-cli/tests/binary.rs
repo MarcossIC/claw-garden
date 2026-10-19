@@ -532,6 +532,25 @@ async fn status_and_stop_follow_the_daemon_process() {
     assert_eq!(after.status.code(), Some(1));
 }
 
+/// `systemctl stop` or a plain `kill` asks with SIGTERM: the daemon stops as
+/// it does for `clawg stop`, and leaves no state file sending clients nowhere.
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_stops_the_daemon_in_order() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    let pid = libc::pid_t::try_from(daemon.pid).expect("pid");
+
+    // SAFETY: plain FFI call on this test's own child.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+
+    let exit = daemon.wait_for_exit(Duration::from_secs(30)).await;
+    assert!(exit.success(), "a SIGTERM is an orderly stop: {exit}\n{}", daemon.log_text());
+    assert!(!sandbox.data_dir().join("daemon.json").exists(), "{}", daemon.log_text());
+    assert!(!sandbox.data_dir().join("token").exists(), "{}", daemon.log_text());
+    assert!(daemon.log_text().contains("checkpointed the WAL"), "{}", daemon.log_text());
+}
+
 #[tokio::test]
 async fn a_debug_binary_refuses_prod_even_with_a_test_home() {
     let sandbox = Sandbox::new();
