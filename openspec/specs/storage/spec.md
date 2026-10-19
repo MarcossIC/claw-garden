@@ -205,7 +205,7 @@ Las migraciones pendientes de un arranque MUST aplicarse en una sola transacció
 
 ### Checksums fijados
 
-Los checksums de las migraciones publicadas (hoy V1–V16) MUST coincidir con una lista fija en el código (`PINNED`, `crates/clawg-core/src/memory/migrations.rs:44`). Cambiar una migración publicada MUST romper un test. Una migración nueva agrega su fila a la lista en el mismo commit.
+Los checksums de las migraciones publicadas (hoy V1–V17) MUST coincidir con una lista fija en el código (`PINNED`, `crates/clawg-core/src/memory/migrations.rs:44`). Cambiar una migración publicada MUST romper un test. Una migración nueva agrega su fila a la lista en el mismo commit.
 
 **Test:** `published_migration_checksums_are_pinned` (`migrations.rs`).
 
@@ -239,12 +239,33 @@ Una base en V15 MUST abrir con V16 con cada fila de `memory` igual y con `topic_
 
 **Tests:** `a_database_from_before_topic_keys_opens_unchanged` (`db.rs`), que siembra V15 con SQL directo; el checksum de V16 en `published_migration_checksums_are_pinned` (`migrations.rs`). La primera llama a `run_migrations` directo, así que el snapshot `pre-migration` de la apertura lo cubre la regla general de «Snapshot antes de migrar».
 
+### Una base en V16 abre con sus causas de reemplazo
+
+V17 (`crates/clawg-core/migrations/V17__revival.sql`) agrega a `memory` la columna `supersede_cause` (`revision` | `verdict`, nullable) y la columna `revived_from` (INTEGER, nullable), con el índice parcial `idx_memory_revived` sobre las no nulas. Después completa `supersede_cause` de cada fila `superseded` que tiene `superseded_by`: `revision` cuando su reemplazante es del mismo agente, del mismo proyecto (`COALESCE`), tiene la misma `topic_key` no nula y ningún par de `memory_conflict` entre las dos está juzgado `supersedes`; `verdict` en cualquier otro caso. Antes de V16 sólo un veredicto reemplazaba, y desde V16 una revisión no escribe par, así que un par `supersedes` juzgado sólo puede venir de un veredicto. Ninguna otra columna cambia, y `revived_from` queda `NULL` en todas las filas.
+
+Una base en V16 MUST abrir con V17 con cada fila igual, salvo `supersede_cause`, y con esa causa completada según la regla de arriba; los pares, los vínculos y el índice de texto MUST seguir como estaban.
+
+#### Escenario
+- GIVEN una base en V16 con una revisión por clave, un veredicto `supersedes` entre dos filas sin clave, una revisión deshecha por un veredicto (misma clave, par `supersedes` juzgado), piezas, pares e índice de texto
+- WHEN se abre con la versión nueva
+- THEN la revisión queda `revision`, los dos veredictos `verdict`, la revisión deshecha `verdict`, y las demás filas sin causa ni `revived_from`
+
+**Tests:** `a_database_from_before_revivals_opens_with_its_supersede_causes` (`crates/clawg-core/src/memory/db.rs:1140`), que siembra V16 con SQL directo; el checksum de V17 en `published_migration_checksums_are_pinned` (`migrations.rs`). Que `clawg update` aplique V17 sobre una base en V16 con revisiones y veredictos, y que el daemon nuevo actúe según esas causas, está en [`specs/self-update`](../self-update/spec.md), S10, «Escenario: migración pendiente sobre filas sin causa de reemplazo».
+
+#### Vuelta atrás de V17
+
+Un binario anterior a V17 MUST NOT abrir una base en V17: la rechaza sin tocarla con `SchemaNewer`, que nombra `clawg restore` («Verificación del esquema antes de migrar»). La vuelta atrás es la copia `pre-migration` que se escribió antes de V17. Quitar V17 a mano (`DROP INDEX idx_memory_revived; ALTER TABLE memory DROP COLUMN revived_from; ALTER TABLE memory DROP COLUMN supersede_cause; DELETE FROM refinery_schema_history WHERE version = 17;`) deja al binario anterior con las filas vivas que un borrado revivió, que es lo que ve de cualquier fila viva.
+
+#### Bases de la versión anterior con borrados de la vigente
+
+Una base escrita por una versión anterior a V17 puede tener una versión reemplazada por una fila borrada, de la misma clave, porque el borrado de la vigente no la revivía. La migración escribe `revision` en esa fila (su reemplazante tiene la clave), y no la revive: el primer paso de mantenimiento la trae de vuelta, `STARTUP_DELAY` después de arrancar el daemon (`crates/clawg-core/src/memory/maintenance.rs:25`). Esto se acepta como está diseñado: el efecto queda sólo en el log del daemon (`maintenance: brought back N rows ...`), `clawg update` no lo informa, y restaurar la fila borrada la vuelve a reemplazar. Ver [`specs/restore`](../restore/spec.md), «Filas de una versión anterior a V17».
+
 ### Verificación del esquema antes de migrar
 
 La decisión es pura (`schema_plan`, `backup.rs:93`). `MemoryStore::open` MUST calcularla antes de cualquier pragma y antes del runner (`check_schema`, `crates/clawg-core/src/memory/db.rs:397`, llamada en `db.rs:185`). Con `Newer` o `Diverged`, `open` MUST devolver `MemoryError::SchemaNewer` o `MemoryError::SchemaDiverged` (`crates/clawg-core/src/memory/error.rs:58` y `:64`) y MUST NOT escribir nada en `memory.db`. Los mensajes MUST decir las versiones, que nada cambió, y qué hacer: instalar la versión que la escribió o `clawg restore` de un backup anterior.
 
 #### Escenario: base más nueva
-- GIVEN una base en la última versión del binario, N (hoy V16), con una fila N + 1 agregada en `refinery_schema_history`
+- GIVEN una base en la última versión del binario, N (hoy V17), con una fila N + 1 agregada en `refinery_schema_history`
 - WHEN se abre
 - THEN el error es `SchemaNewer { db: N + 1, binary: N }`, nombra `clawg restore`, y `memory.db` es byte a byte igual
 
@@ -280,7 +301,7 @@ El id del modelo en el contrato de embedding MUST ser `multilingual-e5-small/mea
 Al arrancar, después de cargar el modelo y dentro del bootstrap del embedder, el daemon verifica el contrato (`verify_or_reembed`, `crates/clawg-core/src/memory/bootstrap.rs:431`, cableado por `contract_verifier`, `bootstrap.rs:250`, en `production_deps`, `bootstrap.rs:272`, que `serve_deps`, `bootstrap.rs:354`, entrega al daemon en `crates/clawg-cli/src/daemon/serve.rs:102`). Si el contrato guardado tiene `LEGACY_CLS_MODEL_ID` y el embedder cargado tiene `E5_MODEL_ID`, con la misma dimensión y los mismos prefijos (`is_pooling_upgrade`, `bootstrap.rs:417`, pura), MUST:
 
 1. escribir un snapshot `pre-reembed` en `<data>/backups`; si falla, no re-embebe, y el intento termina como un fallo de verificación, que se reintenta con la espera de siempre ([`specs/ingest`](../ingest/spec.md), «Reintento del bootstrap»);
-2. re-embeber `memory`, `episodic_trajectory` y `procedural_skill` con el embedder cargado (`reembed_all` en modo `ReInfer`, `crates/clawg-core/src/memory/maintenance.rs:488`);
+2. re-embeber `memory`, `episodic_trajectory` y `procedural_skill` con el embedder cargado (`reembed_all` en modo `ReInfer`, `crates/clawg-core/src/memory/maintenance.rs:507`);
 3. habilitar la memoria sólo si las tres tablas terminaron sin fallas, que es cuando `reembed_all` escribe el contrato nuevo. Si no, el contrato queda como estaba, la memoria sigue deshabilitada y el estado es el de un contrato que no coincide: ese bootstrap no se reintenta, pero el próximo arranque vuelve a empezar, y las filas ya hechas dan los mismos bytes.
 
 Mientras el snapshot y el re-embebido corren, el estado del embedder MUST ser `loading`: el bootstrap publica `loading` antes de empezar y `ready` sólo cuando el embedder entró a su celda. Un save de ese lapso espera en la cola como con cualquier carga ([`specs/ingest`](../ingest/spec.md), «Embedder cargando»).
@@ -348,7 +369,7 @@ Una recarga que falla MUST responder «no listo» (`EmbedError::NotReady`) y la 
 #### Escenario: los archivos desaparecieron
 - GIVEN el modelo suelto y una recarga que falla
 - WHEN llega una búsqueda
-- THEN responde `503 embedder_not_ready` (`embed_failure`, `crates/clawg-cli/src/daemon/api.rs:1033`), y la búsqueda siguiente vuelve a intentar la carga
+- THEN responde `503 embedder_not_ready` (`embed_failure`, `crates/clawg-cli/src/daemon/api.rs:1112`), y la búsqueda siguiente vuelve a intentar la carga
 
 **Tests:** `a_failed_load_is_not_ready_and_the_next_call_tries_again` y `a_model_that_comes_back_as_another_model_is_refused` (`idle_embedder.rs`); `a_search_whose_model_cannot_load_again_answers_not_ready` (`crates/clawg-cli/tests/api.rs`).
 
@@ -360,7 +381,7 @@ Buscar, guardar, restaurar y `recall_context` con el modelo suelto MUST esperar 
 
 ### Registrar un proyecto despierta el modelo
 
-`POST /v1/projects` MUST empezar a cargar un modelo suelto y MUST responder sin esperar esa carga (`embedder.wake()`, `api.rs:1414`; `wake`, `idle_embedder.rs:236`). Con el modelo residente MUST NOT cargar nada. Un modelo despertado MUST contar como recién usado.
+`POST /v1/projects` MUST empezar a cargar un modelo suelto y MUST responder sin esperar esa carga (`embedder.wake()`, `api.rs:1493`; `wake`, `idle_embedder.rs:236`). Con el modelo residente MUST NOT cargar nada. Un modelo despertado MUST contar como recién usado.
 
 #### Escenario: el puente empieza una sesión
 - GIVEN el modelo suelto
@@ -475,7 +496,7 @@ Después de cada snapshot automático, el directorio de backups MUST conservar l
 
 `clawg backup [--profile P]` (`crates/clawg-cli/src/main.rs:140`) MUST producir un snapshot `manual` e imprimir su ruta.
 
-- Con el daemon andando, MUST pedirlo por `POST /v1/backup` (con el token; `crates/clawg-cli/src/daemon/api.rs:1356`, ruta en `:742`), que lo hace sobre la conexión del daemon (`MemoryRuntime::snapshot`, `crates/clawg-core/src/runtime.rs:253`) y responde `{"path": "..."}`.
+- Con el daemon andando, MUST pedirlo por `POST /v1/backup` (con el token; `crates/clawg-cli/src/daemon/api.rs:1435`, ruta en `:794`), que lo hace sobre la conexión del daemon (`MemoryRuntime::snapshot`, `crates/clawg-core/src/runtime.rs:253`) y responde `{"path": "..."}`.
 - Sin daemon, MUST tomar el lock del store con el titular `Maintenance` (`crates/clawg-core/src/memory/store_lock.rs:59`), copiar sin migrar y soltar el lock (`backup_offline`, `backup.rs:336`).
 - Sin `memory.db`, MUST decir que no hay base, sin crear el directorio de datos.
 

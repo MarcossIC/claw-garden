@@ -56,3 +56,18 @@ Las dos filas se borraron al terminar y el daemon se detuvo con `clawg stop`.
 ## No aplica
 
 - `rag-eval`: el ranking no cambia y el golden set no tiene claves ni borrados.
+
+## Diferencias entre la spec y el código
+
+Al consolidar en las specs principales se leyó cada requisito contra el código, y se comprobó que cada test nombrado existe. No hay diferencias de comportamiento. Quedan dos diferencias de redacción, en las que manda el código:
+
+- **Omisión de `topic_key`.** La spec (R9) dice que la respuesta del restore omite los campos vacíos o falsos. `RestoredBody.topic_key` es un `Option` y se omite cuando la fila no tiene clave (`crates/clawg-cli/src/daemon/api.rs:698`); con clave, va. Lo observable es lo mismo.
+- **Texto de `superseded_by_deleted`.** El diseño (D7) proponía «restore_memory #D, or save the content again». `format_restore` dice «until restore_memory brings #D back or the content is saved again» (`crates/clawg-cli/src/mcp/tools.rs:227`). Ambos cumplen lo que la spec exige: no mandar a `resolve_conflict`.
+
+## Citas realineadas al consolidar
+
+Este cambio movió líneas de `admin.rs`, `api.rs`, `dispute.rs`, `maintenance.rs`, `client.rs`, `mcp/server.rs` y `mcp/tools.rs`, y entre la base del cambio y `develop` entraron también los de daemon-hardening en `api.rs`.
+
+- **Las seis specs que se consolidaron** (`restore`, `disputes`, `storage`, `ingest`, `mcp`, `self-update`): las citas se recalcularon con los hunks de `git diff` y después se compararon una por una, línea citada antes contra línea citada ahora. Aparecieron dos que el recálculo no había movido, las abreviadas que heredan el archivo de la cita anterior (`ruta en :742` → `:794` en `storage`, `el campo en :986` → `:1065` en `ingest`). Las de `server.rs:825` y `server.rs:1106-1111` cambian de contenido a propósito: el texto de `delete_memory` pasó a `format_delete` y su descripción ganó una línea.
+- **Las otras specs** (`daemon-access`, `hooks`, `install`, `pieces`, `project`, `project-docs`, `provenance`, `quality`, `retrieval`, `secrets`, `sharing`, `update`, `visibility`): cada cita a un archivo movido se comparó con la versión del código del último commit de su spec, y sólo se reescribió cuando una única línea de `HEAD`, en un bloque sin cambios, tiene el mismo texto. La única que eso no resolvía, la descripción de `delete_memory` en `retrieval`, se corrigió a mano (`server.rs:1106-1111`).
+- Ninguna cita a `crates/clawg-cli/tests/binary.rs` cae después del test nuevo, así que ninguna se movió.

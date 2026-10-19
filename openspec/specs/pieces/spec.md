@@ -119,7 +119,7 @@ Los parsers del eval (`crates/clawg-eval/src/bin/rag-eval/agent_view/parse.rs`) 
 
 ## R6. El save entero
 
-`GET /v1/memories/{kind}/{id}/save` (`crates/clawg-cli/src/daemon/api.rs:735`, handler `get_save`, `api.rs:1231`) con la query `agent` MUST devolver el save de la fila (`read_save_core`, `crates/clawg-core/src/memory/pieces.rs:98`):
+`GET /v1/memories/{kind}/{id}/save` (`crates/clawg-cli/src/daemon/api.rs:787`, handler `get_save`, `api.rs:1310`) con la query `agent` MUST devolver el save de la fila (`read_save_core`, `crates/clawg-core/src/memory/pieces.rs:98`):
 
 - `id`, `kind`, `piece` (la posición de la fila pedida), `pieces` (el total) e `ids`: el id de cada posición, o `null` si esa fila está borrada o es de otro agente;
 - `missing`: las posiciones sin fila visible;
@@ -150,7 +150,7 @@ Contra un daemon que no tiene la ruta, su 404 no trae el error JSON del daemon: 
 
 ## R7. El re-embed reconstruye el contexto
 
-`reembed_all` (`crates/clawg-core/src/memory/maintenance.rs:488`) MUST re-embeber una fila de `memory` que tiene un vínculo con `context` no vacío con el mismo texto embebido de R2, armado con `embedding_text`. La consulta del lote (`select_reembed_batch`, `maintenance.rs:625`) trae ese `context` con una subconsulta sobre `memory_piece` (`maintenance.rs:661-663`). Una fila sin vínculos, o con `context` vacío, MUST re-embeberse con su contenido, como antes.
+`reembed_all` (`crates/clawg-core/src/memory/maintenance.rs:507`) MUST re-embeber una fila de `memory` que tiene un vínculo con `context` no vacío con el mismo texto embebido de R2, armado con `embedding_text`. La consulta del lote (`select_reembed_batch`, `maintenance.rs:644`) trae ese `context` con una subconsulta sobre `memory_piece` (`maintenance.rs:680-682`). Una fila sin vínculos, o con `context` vacío, MUST re-embeberse con su contenido, como antes.
 
 #### Escenario
 - GIVEN el pedazo 2 de un save largo, guardado con contexto

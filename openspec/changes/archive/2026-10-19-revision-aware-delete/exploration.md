@@ -115,7 +115,7 @@ A explorar, con lo que sugiere el código:
 
 ## Interacciones
 
-- **recoverable-delete (18), archivado ([`specs/restore`](../../specs/restore/spec.md)).** Se apoya en su `restore_memory_core`. 18 se cerró con la consulta de la dueña de la clave ya arreglada (no cuenta a las piezas hermanas), y su spec deja nombrados como límites conocidos los dos huecos que toma este cambio.
+- **recoverable-delete (18), archivado ([`specs/restore`](../../../specs/restore/spec.md)).** Se apoya en su `restore_memory_core`. 18 se cerró con la consulta de la dueña de la clave ya arreglada (no cuenta a las piezas hermanas), y su spec deja nombrados como límites conocidos los dos huecos que toma este cambio.
 - **conflict-candidates (24) y `specs/disputes`.** R4 («Borrar MUST NOT tocar los pares de X») sigue: el borrado no toca pares, sólo la fila anterior. «Restaurar X ... lleva a su reposo» se amplía con la redetección. Se actualizan R4 y su escenario de la clave.
 - **topic-revisions (27) y `specs/ingest`/`specs/storage`.** La unicidad de la clave la mantienen el worker y restore (`specs/storage:231`); este cambio suma el borrado como tercero que la respeta (no deja dos vivas y no deja ninguna cuando había una anterior).
 - **conclusion-upkeep (45).** Revivir una fuente la vuelve a cubrir y a hacer pendiente; una conclusión derivada de la borrada se ve «a revisar». 45 calcula al vuelo, no hay estado que limpiar. Su opción B (rechazar fuentes `superseded`) no cambia.

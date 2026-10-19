@@ -1,6 +1,6 @@
 # recoverable-delete — Verificación
 
-**Estado:** verificado en Linux commit por commit, en Windows, con `rag-eval --real --diff` y con el puente MCP real sobre el perfil dev. Antes de archivar, un nuevo análisis contra conflict-candidates (24) y topic-revisions (27), que entraron después, encontró un defecto: no se podía restaurar una pieza de un save largo con `topic_key`. Se corrigió ([lo que encontró la verificación](#lo-que-encontró-la-verificación)). Las otras interacciones son decisiones nuevas y pasan a [revision-aware-delete](../../revision-aware-delete/exploration.md) (49).
+**Estado:** verificado en Linux commit por commit, en Windows, con `rag-eval --real --diff` y con el puente MCP real sobre el perfil dev. Antes de archivar, un nuevo análisis contra conflict-candidates (24) y topic-revisions (27), que entraron después, encontró un defecto: no se podía restaurar una pieza de un save largo con `topic_key`. Se corrigió ([lo que encontró la verificación](#lo-que-encontró-la-verificación)). Las otras interacciones son decisiones nuevas y pasan a [revision-aware-delete](../2026-10-19-revision-aware-delete/exploration.md) (49).
 
 ## Tests
 

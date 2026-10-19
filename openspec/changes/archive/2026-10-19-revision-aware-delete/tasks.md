@@ -56,4 +56,4 @@ Un solo commit: la regla sola sería código muerto, y las advertencias son erro
 
 ## 10. Archive
 
-- [ ] Specs `restore`, `disputes`, `storage`, `ingest` y `mcp`; `git mv` al archivo; subir el minor.
+- [x] Specs `restore`, `disputes`, `storage`, `ingest` y `mcp` (y `self-update`, por el test de V17); `git mv` al archivo; subir el minor.

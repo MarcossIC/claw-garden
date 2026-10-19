@@ -35,7 +35,7 @@ Un evento `chat`, `code_file` o `compaction` MUST sellarse como antes: por el ro
 
 ## P2. La declaración
 
-`save_memory` MUST aceptar `user_stated`, un booleano opcional, y su esquema MUST describirlo (`crates/clawg-cli/src/mcp/server.rs:183-187`). El puente MUST mandarlo sólo cuando es `true` (`crates/clawg-cli/src/client.rs:358-360`). `POST /v1/memories` MUST aceptarlo (`crates/clawg-cli/src/daemon/api.rs:346-348`) y MUST responder 400 que nombra `user_stated`, sin escribir en el outbox, si llega `true` junto a un `derived_from` no vacío (`crates/clawg-cli/src/daemon/api.rs:939-943`): una conclusión la saca el agente, y guardarla como del agente después de esa declaración escondería el rechazo. Un evento serializado sin el campo, como una fila del outbox escrita por la versión anterior o el pedido de un puente viejo, MUST leerse como `false`, es decir, como del agente (`crates/clawg-core/src/memory/events.rs:50-55`).
+`save_memory` MUST aceptar `user_stated`, un booleano opcional, y su esquema MUST describirlo (`crates/clawg-cli/src/mcp/server.rs:183-187`). El puente MUST mandarlo sólo cuando es `true` (`crates/clawg-cli/src/client.rs:358-360`). `POST /v1/memories` MUST aceptarlo (`crates/clawg-cli/src/daemon/api.rs:347-349`) y MUST responder 400 que nombra `user_stated`, sin escribir en el outbox, si llega `true` junto a un `derived_from` no vacío (`crates/clawg-cli/src/daemon/api.rs:1018-1022`): una conclusión la saca el agente, y guardarla como del agente después de esa declaración escondería el rechazo. Un evento serializado sin el campo, como una fila del outbox escrita por la versión anterior o el pedido de un puente viejo, MUST leerse como `false`, es decir, como del agente (`crates/clawg-core/src/memory/events.rs:50-55`).
 
 `crates/clawg-cli/src/mcp/protocol.md` dice cuándo declararlo: sólo cuando la memoria es lo que dijo el usuario (sus palabras, una corrección o una instrucción explícita), nunca para lo inferido, encontrado o concluido, y nunca en una conclusión. El argumento queda fijado en `crates/clawg-cli/src/mcp/agent_contract.json`.
 
@@ -58,7 +58,7 @@ Un evento `chat`, `code_file` o `compaction` MUST sellarse como antes: por el ro
 
 ## P4. Los pares
 
-- `GET /v1/disputes` MUST traer la marca de cada lado de cada par pendiente que nombra (`new_mark`, `old_mark` de `OpenPair`, `crates/clawg-core/src/memory/dispute.rs:395-405`).
+- `GET /v1/disputes` MUST traer la marca de cada lado de cada par pendiente que nombra (`new_mark`, `old_mark` de `OpenPair`, `crates/clawg-core/src/memory/dispute.rs:405-415`).
 - `memory_status` MUST nombrar primero, en cada par, un lado sin marca cuando el otro la tiene, y MUST escribir la marca junto al id del lado que la tiene (`format_open_pairs`, `crates/clawg-cli/src/mcp/tools.rs:159-165`): una inferencia es la que más probablemente cede, aunque el par lo sigue juzgando el agente.
 - ACTIVE CONFLICTS MUST escribir la marca de cada lado que la tiene: en el rótulo cuando imprime su texto (`[AAAA-MM-DD #N disputed inferred] …`) y junto al id cuando lo cita (`format_conflict_block`, `crates/clawg-core/src/memory/prompt_builder.rs:645-678`). No reordena: agrupa por la fila `disputed`, y reordenar rompería el grupo.
 - El origen MUST NOT cambiar el estado de un par ni el de sus filas, ni el orden de los pares listados.
@@ -72,12 +72,12 @@ Un evento `chat`, `code_file` o `compaction` MUST sellarse como antes: por el ro
 
 ## P5. Síntesis
 
-`synthesize` MUST escribir `origin=<marca>` después del tipo de cada memoria pendiente y de cada conclusión que tiene marca, y nada en las que no la tienen (`synthesis_line`, `crates/clawg-cli/src/mcp/tools.rs:280-282`).
+`synthesize` MUST escribir `origin=<marca>` después del tipo de cada memoria pendiente y de cada conclusión que tiene marca, y nada en las que no la tienen (`synthesis_line`, `crates/clawg-cli/src/mcp/tools.rs:327-329`).
 
 **Test:** `the_synthesis_marks_each_rows_origin` en `crates/clawg-cli/src/mcp/tools.rs`.
 
 ## P6. Filas anteriores
 
-Una base con filas `explicit` / `user` escritas por la versión anterior MUST abrir con todas sus filas, sin cambiar su origen, y ninguna MUST llevar marca. No hay migración: el sello es un valor más en columnas que ya existían. Un binario anterior abre la base sin cambios y muestra los valores nuevos tal cual, porque los lee como texto (`crates/clawg-core/src/memory/admin.rs:878-880`); un save que haga después vuelve a sellarse `explicit` / `user`.
+Una base con filas `explicit` / `user` escritas por la versión anterior MUST abrir con todas sus filas, sin cambiar su origen, y ninguna MUST llevar marca. No hay migración: el sello es un valor más en columnas que ya existían. Un binario anterior abre la base sin cambios y muestra los valores nuevos tal cual, porque los lee como texto (`crates/clawg-core/src/memory/admin.rs:1047-1049`); un save que haga después vuelve a sellarse `explicit` / `user`.
 
 **Test:** `rows_saved_before_provenance_keep_their_origin_and_no_mark` en `crates/clawg-core/src/memory/provenance.rs`.

@@ -1,6 +1,6 @@
 # revision-aware-delete — Especificación
 
-Requisitos nuevos sobre [`specs/restore`](../../specs/restore/spec.md), [`specs/disputes`](../../specs/disputes/spec.md), [`specs/storage`](../../specs/storage/spec.md), [`specs/ingest`](../../specs/ingest/spec.md) y [`specs/mcp`](../../specs/mcp/spec.md). Lo que no se nombra acá sigue como está. Términos: una fila **viva** no está borrada y su `status` es `active` o `disputed`; la **vigente** de una clave es la fila viva de su alcance `(agent_id, COALESCE(project_id, ''), topic_key)`; una fila **reemplazada por D** está `superseded` con `superseded_by = D`.
+Requisitos nuevos sobre [`specs/restore`](../../../specs/restore/spec.md), [`specs/disputes`](../../../specs/disputes/spec.md), [`specs/storage`](../../../specs/storage/spec.md), [`specs/ingest`](../../../specs/ingest/spec.md) y [`specs/mcp`](../../../specs/mcp/spec.md). Lo que no se nombra acá sigue como está. Términos: una fila **viva** no está borrada y su `status` es `active` o `disputed`; la **vigente** de una clave es la fila viva de su alcance `(agent_id, COALESCE(project_id, ''), topic_key)`; una fila **reemplazada por D** está `superseded` con `superseded_by = D`.
 
 ## R1. Las columnas
 
