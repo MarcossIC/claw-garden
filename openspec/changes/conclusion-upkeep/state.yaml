@@ -1,14 +1,14 @@
 change: conclusion-upkeep
 objective: "5"
 depends_on: [knowledge-synthesis, topic-revisions, recoverable-delete]
-phase: apply
+phase: verify
 artifacts:
   exploration: done
   proposal: done
   spec: done
   design: done
   tasks: done
-  apply: pending
-  verify: pending
+  apply: done
+  verify: partial  # Linux y el binario real en un home temporal; faltan Windows y el perfil dev
   archive: pending
 updated: 2026-10-19
