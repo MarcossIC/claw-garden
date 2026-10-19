@@ -1,6 +1,6 @@
 # local-isolation — Especificación
 
-Modifica [`specs/daemon-access`](../../specs/daemon-access/spec.md): agrega R6 (el directorio de datos es privado) y cambia el párrafo `Límite` y R5.
+Modifica [`specs/daemon-access`](../../../specs/daemon-access/spec.md): agrega R6 (el directorio de datos es privado) y cambia el párrafo `Límite` y R5.
 
 ## Definiciones
 

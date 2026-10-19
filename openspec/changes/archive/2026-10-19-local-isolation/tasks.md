@@ -33,4 +33,4 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 
 ## 6. Archive
 
-- [ ] `specs/daemon-access` con R6, el `Límite` y R5; `git mv` a `changes/archive/AAAA-MM-DD-local-isolation`; `state.yaml` archivado; fila 50 y orden de ejecución del `README.md` de openspec; subir el minor.
+- [x] `specs/daemon-access` con R6, el `Límite` y R5; `git mv` a `changes/archive/2026-10-19-local-isolation`; `state.yaml` archivado; fila 50 y orden de ejecución del `README.md` de openspec; subir el minor.
