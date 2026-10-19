@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1, 5 | M–L (M si sólo la columna y el bloque; L si se suma captura de prompts o tabla) | agent-lifecycle-hooks (25); para el bloque en el contexto, además context-budget (23) | exploración (borrador) |
+| 1, 5 | M–L (M si sólo la columna y el bloque; L si se suma captura de prompts o tabla) | agent-lifecycle-hooks (25); para el bloque en el contexto, además context-budget (23) | exploración cerrada; sigue en la [propuesta](proposal.md) |
 
 **Tesis:** lo que una sesión nueva más necesita es saber dónde quedó la anterior, y hoy nada en el sistema lo sabe. Un `session_summary` es un `memory_type` más: no tiene estructura, no se distingue por sesión y no se muestra primero. Las columnas que identificarían la sesión existen desde V1 pero ningún código las escribe. Este cambio busca lo mínimo que haga cierto «retomá donde quedó la sesión anterior» sin construir maquinaria de sesiones.
 
@@ -131,17 +131,17 @@ Con `source_session_id` escrito, «las memorias guardadas en la misma sesión al
 
 ## Decisiones abiertas
 
-Son del usuario.
+Cerradas en la [propuesta](proposal.md), con las recomendaciones de arriba; el porqué está en el [diseño](design.md).
 
-- [ ] **Origen del id:** registro en el daemon (A), entorno del puente (B), o ambos. B exige verificar `CLAUDE_CODE_SESSION_ID` contra la doc oficial y su comportamiento tras `/clear`.
-- [ ] **Sesiones simultáneas:** ¿se acepta «gana la última» para el mismo agente y proyecto, o se deja `NULL` cuando hay más de un registro?
-- [ ] **Resumen demasiado viejo:** ¿el bloque LAST SESSION se muestra con su fecha o se omite pasado un umbral?
-- [ ] **Sharing del bloque:** ¿sólo el propio resumen del agente, o también los de otros agentes que le comparten?
-- [ ] **Índice:** ¿se mide antes de tocar el esquema? (recomendado)
-- [ ] **`last_modified_by`:** ¿se escribe, se deja, o se elimina del esquema en otro cambio? Hoy no tiene escritor ni lector.
-- [ ] **Línea de tiempo de sesión:** ¿entra, o se deja para después?
-- [ ] **Captura de prompts:** ¿se descarta (recomendado), o va en un cambio opt-in aparte?
-- [ ] **Dependencia:** si se elige sólo la opción B, ¿sigue dependiendo de 25 o basta 23?
+- [x] **Origen del id:** registro en el daemon (A), desde `session-start` y también desde `user-prompt-submit`. B queda fuera mientras el host no documente `CLAUDE_CODE_SESSION_ID`.
+- [x] **Sesiones simultáneas:** gana la última registrada (la del último prompt), como limitación documentada.
+- [x] **Resumen demasiado viejo:** se muestra con su fecha, sin umbral.
+- [x] **Sharing del bloque:** el propio y los de otros agentes que le comparten, marcados `by <author>`.
+- [x] **Índice:** no se toca el esquema.
+- [x] **`last_modified_by`:** se deja como está, fuera de este cambio.
+- [x] **Línea de tiempo de sesión:** queda para después.
+- [x] **Captura de prompts:** se descarta.
+- [x] **Dependencia:** 25 y 23, los dos archivados.
 
 ## Cómo se mide
 

@@ -45,6 +45,16 @@ pub enum Reach {
     AllBut(Vec<String>),
 }
 
+impl Reach {
+    /// Whether `reader` may read a row `author` saved.
+    pub(crate) fn admits(&self, reader: &str, author: &str) -> bool {
+        match self {
+            Reach::Own => author == reader,
+            Reach::AllBut(hidden) => author == reader || !hidden.iter().any(|h| h == author),
+        }
+    }
+}
+
 /// The file as written. `deny_unknown_fields` because a misspelled key
 /// (`"hide"`) would otherwise parse as an empty policy, and a user who meant to
 /// hide something would see it shared with no word about why.
@@ -182,6 +192,15 @@ mod tests {
 
     fn all_but(names: &[&str]) -> Reach {
         Reach::AllBut(names.iter().map(|n| n.to_string()).collect())
+    }
+
+    #[test]
+    fn a_reach_admits_the_reader_and_whoever_is_not_hidden() {
+        assert!(Reach::Own.admits("a", "a"));
+        assert!(!Reach::Own.admits("a", "b"));
+        let all_but_c = all_but(&["c"]);
+        assert!(all_but_c.admits("a", "a") && all_but_c.admits("a", "b"));
+        assert!(!all_but_c.admits("a", "c"));
     }
 
     #[test]

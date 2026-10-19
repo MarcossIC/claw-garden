@@ -33,6 +33,7 @@ fn event(content: &str) -> MemoryEvent {
         derived_from: Vec::new(),
         topic_key: None,
         user_stated: false,
+        session_id: None,
     }
 }
 

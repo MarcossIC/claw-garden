@@ -170,6 +170,7 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
         started_at: Instant::now(),
         shutdown: shutdown_tx,
         save_timeout: SAVE_CONFIRM_TIMEOUT,
+        sessions: Default::default(),
     });
 
     log::info!(
