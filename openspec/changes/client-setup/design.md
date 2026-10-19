@@ -62,7 +62,7 @@ Temporal en el mismo directorio y `rename`, como `sharing::save`, para que Claud
 
 ## D8. Ruta del binario
 
-`std::env::current_exe()`, sin el prefijo `\\?\` en Windows. Una ruta que no es absoluta se rechaza antes de planear: Claude Code lanza el comando con su propio directorio y PATH (`README.md:316`).
+`std::env::current_exe()`, sin el prefijo `\\?\` en Windows. Una ruta que no es absoluta se rechaza antes de planear: Claude Code lanza el comando con su propio directorio y PATH (lo dice el README en «Conectarlo a Claude Code»).
 
 ## D9. Códigos de salida y reporte
 

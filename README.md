@@ -306,19 +306,23 @@ Detalles útiles:
 
 ## Conectarlo a Claude Code
 
-`clawg mcp` es un servidor MCP por stdio: Claude Code lanza el comando y habla con él. Registralo a nivel de usuario, así queda disponible en todos tus proyectos:
+Con Claude Code instalado (`claude` en el PATH), un solo comando conecta clawg:
 
 ```powershell
-claude mcp add --scope user clawg -- "$env:LOCALAPPDATA\Programs\clawg\clawg.exe" mcp --profile prod
+clawg setup claude-code --profile prod
 ```
 
-Lo que va después de `--` es el comando que Claude Code ejecuta. Se usa la ruta completa a propósito, para no depender del PATH del proceso que lanza Claude Code.
+Hace tres cosas, y se puede repetir sin miedo:
 
-Comprobá que quedó registrado:
+1. **Registra el servidor MCP** a nivel de usuario, así queda disponible en todos tus proyectos. Lo hace con el propio `claude mcp add --scope user`, con la ruta completa del `clawg` que corriste (para no depender del PATH del proceso que lanza Claude Code) y con la identidad del agente fijada en `--agent claude-code` (ver [Fijar la identidad del agente](#fijar-la-identidad-del-agente)).
+2. **Instala los hooks** de inicio de sesión y de cada mensaje en `~/.claude/settings.json`: al empezar (y después de compactar) la sesión recibe la memoria del proyecto, y a los 30 minutos sin guardar el agente se entera. Los hooks que ya tenías no se tocan.
+3. **Agrega el protocolo de memoria** (cuándo guardar, cómo escribir un save, qué no guardar) a `~/.claude/CLAUDE.md`, entre `<!-- BEGIN CLAWG MEMORY PROTOCOL -->` y `<!-- END CLAWG MEMORY PROTOCOL -->`. Lo que escribiste fuera de esas marcas no cambia; lo de adentro lo reescribe clawg cuando el protocolo cambia.
 
-```powershell
-claude mcp list
-```
+Antes de cambiar un archivo, guarda una copia en `~/.clawg/backups/setup/`. Con `--dry-run` muestra lo que haría sin tocar nada. Si `CLAUDE_CONFIG_DIR` está definido, usa ese directorio en vez de `~/.claude`.
+
+Lo que no coincide con lo que instalaría no lo reemplaza: lo dice y sale con 1. Pasa, por ejemplo, si ya habías registrado `clawg` con otro comando o si moviste el binario. Para rehacerlo, `clawg setup claude-code --remove --profile prod` y otra vez `clawg setup claude-code --profile prod`. Si `claude` no está en el PATH, instala hooks y protocolo, imprime el comando de registro para que lo corras vos y sale con 1.
+
+Un servidor llamado igual en el scope `local` o `project` de Claude Code gana al de usuario; `claude mcp list` muestra cuál se usa.
 
 Después **abrí una sesión nueva** de Claude Code. Adentro:
 
@@ -331,13 +335,11 @@ Después **abrí una sesión nueva** de Claude Code. Adentro:
 
 Cada agente es dueño de sus memorias: las lista, las cambia, las borra y resuelve sus conflictos, pero no los de otro. Al buscar, también encuentra lo que guardaron los demás (ver [Compartir memorias entre agentes](#compartir-memorias-entre-agentes)). Sin configurar nada, el agente es el nombre que reporta el cliente MCP. Si el cliente cambia ese nombre, o deja de mandarlo (la versión nueva del protocolo lo vuelve opcional), lo guardado antes queda a nombre del agente viejo: la búsqueda lo sigue encontrando, marcado como de otro agente, pero el nuevo no lo puede listar, cambiar, borrar ni resolver como propio.
 
-Para que no pase, fijalo con `--agent` al registrar el servidor:
+`clawg setup claude-code` lo fija siempre en `claude-code`, que es el nombre que Claude Code reporta de sí mismo, así que si venías sin `--agent` no perdés nada. Si registraste el servidor a mano con otro nombre, lo anterior queda con ese nombre: `memory_status` dice qué agente está en uso y de dónde salió, y `clawg memories stats` cuenta las memorias por agente. Nada se borra; vuelve a verse con el nombre anterior. Registrarlo a mano sigue siendo posible:
 
 ```powershell
 claude mcp add --scope user clawg -- "$env:LOCALAPPDATA\Programs\clawg\clawg.exe" mcp --profile prod --agent claude-code
 ```
-
-Usá el mismo nombre con el que ya venías guardando, o lo anterior queda con el nombre viejo: `memory_status` dice qué agente está en uso y de dónde salió, y `clawg memories stats` cuenta las memorias por agente. Nada se borra al cambiarlo; vuelve a verse con el nombre anterior.
 
 ### Compartir memorias entre agentes
 
@@ -419,11 +421,11 @@ Hay otro `clawg.exe` en el PATH que gana, o una copia duplicada. El JSON que imp
 ```powershell
 clawg stop --profile prod
 clawg path remove --dir "$env:LOCALAPPDATA\Programs\clawg"
-claude mcp remove clawg
+clawg setup claude-code --remove --profile prod
 Remove-Item -Recurse "$env:LOCALAPPDATA\Programs\clawg"
 ```
 
-Esto, en orden: detiene el daemon, saca la carpeta del PATH, quita el servidor de Claude Code (sólo si lo registraste) y borra el binario.
+Esto, en orden: detiene el daemon, saca la carpeta del PATH, quita de Claude Code el servidor, los hooks y el protocolo que instaló `clawg setup` (si lo corriste) y borra el binario.
 
 Tus memorias **no se borran**: viven en `~/.clawg`. Si también querés eliminarlas, borrá esa carpeta a mano.
 
@@ -448,19 +450,20 @@ clawg doctor                  # a qué clawg resuelve el PATH (sale con 1 si hay
 clawg update --check          # dice si hay un release nuevo (100 si lo hay); clawg update lo instala
 clawg memories list|search|show|stats   # visor de sólo lectura (list --deleted: las borradas)
 clawg undelete 12 --profile dev         # devuelve una memoria borrada (con el daemon corriendo)
+clawg setup claude-code --profile dev   # conecta Claude Code: servidor MCP, hooks y protocolo (--dry-run, --remove)
 ```
 
 `clawg mcp --no-autostart` falla en vez de arrancar un daemon, y `clawg mcp --agent <nombre>` fija el agente con el que guarda y busca. `clawg serve --port <n>` cambia el puerto por defecto (`0` elige uno libre). `clawg path add|remove [--dir <dir>]` edita el PATH del usuario en Windows.
 
 ### Registrar el servidor MCP en un build de desarrollo
 
-Perfil `dev`, apuntando a un build debug:
+Perfil `dev`, apuntando a un build debug (un build debug no registra `prod`):
 
 ```
-claude mcp add clawg-dev -- /ruta/a/claw-garden/target/debug/clawg mcp --profile dev
+/ruta/a/claw-garden/target/debug/clawg setup claude-code --profile dev
 ```
 
-En Windows usá la ruta completa a `clawg.exe`. Los nombres `clawg-dev` y `clawg` son las identidades que usa cada perfil.
+Registra `clawg-dev` con la ruta de ese binario y sus hooks con `--profile dev`; los de `prod` no se tocan, y el protocolo es el mismo bloque para los dos. Los nombres `clawg-dev` y `clawg` son las identidades que usa cada perfil.
 
 ### Herramientas MCP
 

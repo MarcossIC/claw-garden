@@ -24,7 +24,7 @@ Sin servidor del perfil en el archivo de servidores, el plan MUST ser `claude mc
 - WHEN corre `clawg setup claude-code`
 - THEN el reporte dice que el servidor está en conflicto, `claude mcp add` no se corre y sale con 1
 
-**Tests:** `an_empty_state_plans_the_server_the_hooks_and_the_block`, `a_matching_server_is_left_alone`, `a_different_server_is_a_conflict`, `without_claude_the_command_is_printed` (`setup.rs`), `setup_registers_through_a_fake_claude` (`tests/binary.rs`, Unix).
+**Tests:** `an_empty_state_plans_the_server_the_hooks_and_the_block`, `a_matching_server_is_left_alone`, `a_different_server_is_a_conflict`, `without_claude_the_command_is_printed` (`setup.rs`), `setup_without_claude_prints_the_command_and_installs_the_rest` y `setup_registers_through_a_fake_claude_and_remove_undoes_it` (`tests/binary.rs`, Unix).
 
 ## R3. Los hooks
 
@@ -42,11 +42,11 @@ El plan MUST agregar el bloque al final de `CLAUDE.md`, separado por una línea 
 
 Una segunda corrida sobre el estado que dejó la primera MUST NOT escribir nada. `--dry-run` MUST reportar el mismo plan y MUST NOT escribir ningún archivo ni correr `claude mcp add|remove`.
 
-**Tests:** `a_second_run_changes_nothing`, `dry_run_writes_nothing` (`setup.rs`).
+**Tests:** `a_second_run_changes_nothing`, `dry_run_writes_nothing` (`setup.rs`), `setup_dry_run_writes_nothing` (`tests/binary.rs`).
 
 ## R6. `--remove`
 
-`--remove` MUST quitar el servidor del perfil si es de clawg (`command` llamado `clawg` y primer argumento `mcp`), los hooks de clawg del perfil y el bloque, salvo que el servidor del otro perfil siga en el archivo de servidores. Un servidor ajeno con el nombre del perfil MUST reportarse como conflicto y quedarse. Sobre un estado sin nada ajeno, `setup` seguido de `--remove` MUST devolver `settings.json` y `CLAUDE.md` al texto de antes. MUST NOT tocar el directorio de datos de clawg salvo las copias de R7.
+`--remove` MUST quitar el servidor del perfil si es de clawg (`command` llamado `clawg` y primer argumento `mcp`), los hooks de clawg del perfil y el bloque, salvo que el servidor del otro perfil siga en el archivo de servidores. Un servidor ajeno con el nombre del perfil MUST reportarse como conflicto y quedarse. `setup` seguido de `--remove` MUST devolver `CLAUDE.md` al texto de antes (un archivo que sólo tenía el bloque se borra) y `settings.json` al mismo contenido JSON, con la sangría de dos espacios que escribe Claude Code; uno que no existía queda como `{}`. MUST NOT tocar el directorio de datos de clawg salvo las copias de R7.
 
 **Tests:** `remove_after_setup_gives_back_the_files`, `remove_keeps_the_block_while_the_other_profile_is_registered`, `remove_leaves_a_foreign_server` (`setup.rs`).
 
