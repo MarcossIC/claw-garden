@@ -651,10 +651,6 @@ fn format_conflict_block(pairs: &[ConflictPair], hit_positions: &HashMap<i64, us
     out
 }
 
-/// Partitions hits into (recent, longterm) at `now - RECENT_WINDOW_MS`. A stamp
-/// at or after the threshold is recent; the epoch or a negative stamp falls to
-/// long-term; a future stamp counts as recent rather than being clamped, so a
-/// skewed clock stays visible.
 /// Rows RECENT may print in a prompt without a query: the reader's own live
 /// rows since `?3`, newest first, under the search's project predicate. The
 /// pool is wider than the block because the pieces of one long save are
@@ -735,6 +731,10 @@ fn one_row_per_save(rows: Vec<RankedHit>, links: &HashMap<i64, SaveLink>, k: usi
     out
 }
 
+/// Partitions hits into (recent, longterm) at `now - RECENT_WINDOW_MS`. A stamp
+/// at or after the threshold is recent; the epoch or a negative stamp falls to
+/// long-term; a future stamp counts as recent rather than being clamped, so a
+/// skewed clock stays visible.
 fn bucket_by_recency(hits: Vec<RankedHit>, now: TimestampMs) -> (Vec<RankedHit>, Vec<RankedHit>) {
     let threshold = TimestampMs::from_unix_millis(now.as_millis_i64().saturating_sub(RECENT_WINDOW_MS));
     let mut recent = Vec::new();

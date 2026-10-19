@@ -5,7 +5,8 @@
 //! where it is testable without running this.
 //!
 //! Exit codes: `0` success, `1` a runtime failure (message on stderr), `2` a
-//! usage error (clap's own, emitted before `main` ever runs).
+//! usage error (clap's own), except under `clawg hook`, where a usage error is
+//! `1`: a client reads `2` from a hook as "block".
 
 #[cfg(windows)]
 use std::path::Path;
