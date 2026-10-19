@@ -35,6 +35,7 @@ LAST SESSION y RECENT son lecturas de «lo más nuevo» y se pagan como lecturas
 3. **Las dos corren siempre en el camino caliente.** Un contexto sin consulta las corre a las dos; uno con consulta corre LAST SESSION. Comparten la conexión única de SQLite con los guardados y el tracker de accesos.
 4. **El predicado de proyecto de LAST SESSION no es indexable como está.** `(project_id = ?1 OR (?1 IS NULL AND project_id IS NULL))` mezcla dos casos en una condición; en la reproducción, ni con el índice nuevo disponible el planificador lo usa. Es lo que hace que «agregar el índice» sin tocar la sentencia no arregle nada.
 5. **Las filas `superseded` no se borran** (la historia de una clave es la cadena de filas reemplazadas), así que lo que recorren estas consultas sólo crece. LAST SESSION las descarta con `status`, pero después de leerlas.
+6. **LAST SESSION filtra el autor en Rust y no tiene `LIMIT`.** La sentencia trae todos los resúmenes vivos del proyecto (`prompt_builder.rs:683-691`) y `fetch_last_session` los recorre hasta el primero que `reach.admits` deja leer (`:733-737`). Hoy eso no agrega costo, porque el orden ya obliga a leer y ordenar todo. Con el índice nuevo sí cuenta: la lectura para en la primera fila legible, así que su costo pasa a ser cuántos resúmenes más nuevos escribieron autores que el lector no lee, cada pedazo de un resumen largo como una fila. Llevar el predicado de compartición a la sentencia, el mismo de `search.rs`, y ponerle `LIMIT 1` lo deja en una fila, pero suma otra copia de ese predicado, que hoy está copiado en nueve sentencias sin una prueba que las ate (backlog del README).
 
 ## Lo que ya existe y se reutiliza
 
@@ -121,6 +122,7 @@ Son del usuario.
 - [ ] **Estadísticas.** Evaluar `PRAGMA optimize` / `ANALYZE` con las pruebas de plan existentes y adoptar sólo si ninguna cambia; o descartarlo de entrada y dejar escrito por qué.
 - [ ] **Número de la migración** (V18 o la que quede libre) según el orden de archivo respecto de 54 y 51.
 - [ ] **Backlog de RECENT.** Dejarlo afuera (recomendado) o absorberlo.
+- [ ] **Autor de LAST SESSION en SQL.** Dejar el filtro en Rust (alcanza mientras los resúmenes ocultos sean pocos) o llevar el predicado de compartición a `LAST_SESSION_SQL` con `LIMIT 1`, con una prueba que lo compare con `Reach::admits`.
 - [ ] **Medición propia.** Cuánto de la medición con el SQLite empaquetado y filas generadas se escribe como prueba o `#[ignore]` y cuánto sólo se anota, y si se mide sobre un perfil real (requiere un perfil de datos y su autorización).
 
 ## Cómo se mide
