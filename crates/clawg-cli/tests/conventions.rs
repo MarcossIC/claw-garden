@@ -742,6 +742,17 @@ fn the_installer_is_analyzed_with_a_pinned_psscriptanalyzer() {
     }
 }
 
+#[test]
+fn dependabot_updates_the_pinned_actions_on_develop() {
+    let config = read_repo_file(".github/dependabot.yml");
+    let lines: Vec<&str> = config.lines().map(str::trim).filter(|l| !l.starts_with('#')).collect();
+    let ecosystems: Vec<&str> = lines.iter().filter_map(|l| l.strip_prefix("- package-ecosystem:")).map(str::trim).collect();
+    assert_eq!(ecosystems, ["github-actions"], "crates are left to the Advisories workflow");
+    for wanted in ["directory: /", "target-branch: develop", "interval: monthly"] {
+        assert!(lines.contains(&wanted), "dependabot.yml lacks `{wanted}`");
+    }
+}
+
 /// The command of every `run:` step of a job, single-line ones only.
 fn run_commands(job: &Job) -> Vec<String> {
     job.steps()
