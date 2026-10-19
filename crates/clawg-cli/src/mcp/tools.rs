@@ -449,13 +449,13 @@ pub(crate) fn synthesis_nudge(unreviewed: usize) -> Option<String> {
 /// From one conclusion with a lost source, `recall_context` reminds the model
 /// to review it: one is rarer than a new memory, and costs more if left.
 pub(crate) fn review_nudge(conclusions: usize) -> Option<String> {
-    let (n, verb) = match conclusions {
+    let n = match conclusions {
         0 => return None,
-        1 => ("1 conclusion here rests".to_string(), "was"),
-        n => (format!("{n} conclusions here rest"), "were"),
+        1 => "1 conclusion here rests".to_string(),
+        n => format!("{n} conclusions here rest"),
     };
     Some(format!(
-        "{n} on memories that {verb} deleted or replaced since the last review. When the current \
+        "{n} on memories that were deleted or replaced since the last review. When the current \
          task is done, call `synthesize` to check {}.",
         if conclusions == 1 { "it" } else { "them" }
     ))
@@ -1042,6 +1042,7 @@ mod tests {
         assert_eq!(format_recall(&context(0)), "## WORKSPACE\nstuff");
         let one = format_recall(&context(1));
         assert!(one.starts_with("## WORKSPACE\nstuff\n\n1 conclusion here rests "), "{one}");
+        assert!(one.contains("rests on memories that were deleted or replaced"), "the verb agrees with memories: {one}");
         assert!(one.contains("`synthesize`"), "{one}");
         let two = format_recall(&Context { unreviewed: SYNTHESIS_NUDGE_THRESHOLD, ..context(2) });
         assert!(two.ends_with(&review_nudge(2).unwrap()), "the review comes after the synthesis reminder: {two}");
