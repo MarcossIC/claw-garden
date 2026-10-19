@@ -35,7 +35,7 @@ Las abiertas de la exploración se respondieron en el hilo, con estas opciones:
 3. `outbox_fail` y la carga de un evento que no se lee enmascaran el `last_error`.
 4. `clawg secrets` lista los `reason` con secreto (`pair <new> <old> <tipos>`), y `clawg secrets --mask-reasons --yes` los limpia.
 5. `purge`: outbox por agente e igualdad, con las filas borradas listadas; la cabecera de un save largo; los otros pedazos nombrados; la revival en la transacción; los `workspace.md` nombrados.
-6. Docs: [`specs/secrets`](../../specs/secrets/spec.md) (en el archive), `.claude/CLAUDE.md` y el backlog de `openspec/README.md`.
+6. Docs: [`specs/secrets`](../../../specs/secrets/spec.md) (en el archive), `.claude/CLAUDE.md` y el backlog de `openspec/README.md`.
 
 ## Fuera de alcance
 

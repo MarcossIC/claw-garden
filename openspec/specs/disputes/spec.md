@@ -134,7 +134,7 @@ Restaurar X (`restore_memory_core`, `admin.rs:583`; el resto del restore está e
 
 Restaurar una fila borrada que tenía `topic_key` MUST fallar sin cambiar nada cuando el alcance de su clave ya tiene una fila viva de otro save (las demás piezas de su propio save no cuentan) (`RESTORE_TOPIC_HOLDER`, `admin.rs:453`; `RestoreError::TopicTaken`, `admin.rs:391`). El error MUST nombrar la clave y la fila que la tiene, y la fila restaurada se queda borrada: restaurarla dejaría dos versiones vivas de un tema que una revisión mantiene en una. `POST /v1/memories/memory/{id}/restore` MUST responder `409` (`restore_memory`, `crates/clawg-cli/src/daemon/api.rs:1390`, el brazo del `409` en `api.rs:1404`), como con un gemelo vivo o un secreto.
 
-Purgar X (`purge`, `crates/clawg-core/src/memory/secrets.rs:82`) MUST borrar los pares que la nombran (`secrets.rs:111`).
+Purgar X (`purge`, `crates/clawg-core/src/memory/secrets.rs:181`) MUST borrar los pares que la nombran (`secrets.rs:232`). El `reason` de un veredicto se guarda enmascarado ([`specs/secrets`](../secrets/spec.md) R7).
 
 #### Escenario: borrar la vieja
 - GIVEN O activa y N `disputed` sólo contra O

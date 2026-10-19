@@ -76,3 +76,8 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 ## 13. Verificación
 
 - [x] `cargo test --workspace`, clippy con `-A clippy::all -D warnings`, el corpus del repositorio y un daemon real en un home de prueba, en [`verify.md`](verify.md).
+
+## 14. Archive
+
+- [x] [`specs/secrets`](../../../specs/secrets/spec.md) con R1, R4, R5 y R6 rehechos, R7, R8 y R9 nuevos, la línea **Origen** y los `ruta:línea` revisados; la purga en [`specs/restore`](../../../specs/restore/spec.md), [`specs/pieces`](../../../specs/pieces/spec.md) y [`specs/disputes`](../../../specs/disputes/spec.md).
+- [x] `git mv` a `changes/archive/2026-10-19-secret-coverage`; `state.yaml` archivado; fila 51, orden de ejecución y backlog del `README.md` de openspec; subir el minor.

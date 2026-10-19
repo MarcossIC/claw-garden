@@ -1,6 +1,6 @@
 # secret-coverage — Especificación (delta sobre `specs/secrets`)
 
-Los ids siguen a los de [`specs/secrets`](../../specs/secrets/spec.md). R1, R4, R5 y R6 se modifican; R7, R8 y R9 son nuevos.
+Los ids siguen a los de [`specs/secrets`](../../../specs/secrets/spec.md). R1, R4, R5 y R6 se modifican; R7, R8 y R9 son nuevos.
 
 ## R1 (modifica). Formatos y patrones nuevos
 
