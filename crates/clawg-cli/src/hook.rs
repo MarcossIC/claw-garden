@@ -137,9 +137,19 @@ pub async fn respond(
     tokio::time::timeout(deadline, answer(event, agent, base_dir, input)).await.ok().flatten()
 }
 
-async fn answer(event: HookEvent, agent: &str, base_dir: &Path, mut input: impl AsyncRead + Unpin) -> Option<String> {
+/// The most stdin a hook reads: the client's object is a few hundred bytes,
+/// and nothing else may fill the hook's memory.
+const INPUT_LIMIT: u64 = 1 << 20;
+
+/// All of `input`, or `None` when it fails or holds more than [`INPUT_LIMIT`].
+async fn read_input(input: impl AsyncRead + Unpin) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
-    input.read_to_end(&mut bytes).await.ok()?;
+    input.take(INPUT_LIMIT + 1).read_to_end(&mut bytes).await.ok()?;
+    (bytes.len() as u64 <= INPUT_LIMIT).then_some(bytes)
+}
+
+async fn answer(event: HookEvent, agent: &str, base_dir: &Path, input: impl AsyncRead + Unpin) -> Option<String> {
+    let bytes = read_input(input).await?;
     let input = HookInput::parse(&bytes)?;
     let client = DaemonClient::from_data_dir(base_dir)?;
     let cwd = input.cwd.clone().or_else(|| std::env::current_dir().ok())?;
@@ -289,6 +299,23 @@ mod tests {
     fn no_session_start_no_reminder() {
         assert_eq!(save_reminder(10_000 * MINUTE, None, None), None);
         assert_eq!(save_reminder(10_000 * MINUTE, Some(0), None), None);
+    }
+
+    #[tokio::test]
+    async fn input_up_to_the_limit_is_read_whole_and_more_is_refused() {
+        let at_limit = vec![b' '; INPUT_LIMIT as usize];
+        assert_eq!(read_input(&at_limit[..]).await.as_deref(), Some(&at_limit[..]));
+        let over = vec![b' '; INPUT_LIMIT as usize + 1];
+        assert_eq!(read_input(&over[..]).await, None);
+    }
+
+    #[tokio::test]
+    async fn input_over_the_limit_prints_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut input = br#"{"cwd":"/"}"#.to_vec();
+        input.resize(INPUT_LIMIT as usize + 1, b' ');
+        let out = respond(HookEvent::SessionStart, "a", dir.path(), &input[..], HOOK_DEADLINE).await;
+        assert_eq!(out, None);
     }
 
     #[tokio::test]
