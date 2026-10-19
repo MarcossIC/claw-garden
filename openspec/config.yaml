@@ -25,8 +25,10 @@ context: |
   Lexical-only floor (rag-eval --real --lexical-only): R@1 0.3478, R@5 0.5000, R@10 0.5000, MRR 0.4040
   (docs/eval/results/2026-10-16-real-lexical-only.json).
   Compare two runs with rag-eval --diff: a conclusion needs at least 6 cases moving one way (p < 0.05).
-  Agent-view baseline (RELEVANCE_RATIO 0.35): search_memory 36/46 at 764.0 mean tokens,
-  recall_context 39/46 at 1086.4 (docs/eval/results/2026-10-15-real-project-indexing-relcut-agent-view.json).
+  Agent-view baseline (RELEVANCE_RATIO 0.35): search_memory 36/46 at 761.4 mean tokens,
+  recall_context 37/46 at 1036.5 (docs/eval/results/2026-10-19-real-session-handoff-tip-agent-view.json).
+  recall_context lost c09 and c10 with search-abstention (they only arrived as rows that scored 0), and every
+  prompt of the golden set opens with the same LAST SESSION line since session-handoff (87 tokens).
   recall_context takes a byte budget (default 8000, at most 24000); with the default no golden case is cut and no case
   moves (docs/eval/results/2026-10-17-real-context-budget-tip-agent-view.json).
   Expanded golden (docs/eval/golden-expanded.json, sha256 855c64b98e5403e55777c87873bcf006299502b857dcfbb7920acb48d9d6f2b5,

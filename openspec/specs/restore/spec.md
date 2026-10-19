@@ -98,15 +98,15 @@ Devuelve el id, el `status` y el `superseded_by` con que quedó la fila (`Restor
 
 ## R4. HTTP
 
-`POST /v1/memories/{kind}/{id}/restore` (ruta en `crates/clawg-cli/src/daemon/api.rs:723`, `restore_memory`, `api.rs:1251`) MUST aceptar `agent` en la query, como `DELETE`, y MUST responder:
+`POST /v1/memories/{kind}/{id}/restore` (ruta en `crates/clawg-cli/src/daemon/api.rs:736`, `restore_memory`, `api.rs:1282`) MUST aceptar `agent` en la query, como `DELETE`, y MUST responder:
 
 - 200 con `restored = 1`, `id`, `status` y `superseded_by`;
 - 400 si `kind` no es `memory` o no es un kind; el kind se mira antes que el embedder, así que un pedido que no puede salir bien lo dice aunque el modelo siga cargando;
 - 404 por "no existe" (R1);
-- 409 por gemela viva, con su id en el mensaje, por titular de la clave, con la clave y su id, y por secreto, con los tipos y `clawg purge` (`api.rs:1265`);
-- 503 cuando no hay un embedder con que calcular el vector. Con el modelo todavía sin cargar, `ready_embedder` (`api.rs:1024`) responde `embedder_not_ready` (cargando) o `embedder_failed` con la causa y si se reintenta (la carga falló), como la búsqueda. Con el modelo ya cargado una vez, aunque el daemon lo haya soltado por inactivo, el embedder es el `IdleEmbedder` ([`specs/storage`](../storage/spec.md), «Las herramientas funcionan con el modelo suelto»): el restore espera la recarga y responde 200, y sólo si esa recarga falla (o vuelve un modelo de otra identidad) responde `embedder_not_ready` (`embed_failure`, `api.rs:1016`; `crates/clawg-core/src/memory/idle_embedder.rs:105-112`) y la siguiente llamada vuelve a intentar. Cualquier otro error del embedder es un 500.
+- 409 por gemela viva, con su id en el mensaje, por titular de la clave, con la clave y su id, y por secreto, con los tipos y `clawg purge` (`api.rs:1296`);
+- 503 cuando no hay un embedder con que calcular el vector. Con el modelo todavía sin cargar, `ready_embedder` (`api.rs:1041`) responde `embedder_not_ready` (cargando) o `embedder_failed` con la causa y si se reintenta (la carga falló), como la búsqueda. Con el modelo ya cargado una vez, aunque el daemon lo haya soltado por inactivo, el embedder es el `IdleEmbedder` ([`specs/storage`](../storage/spec.md), «Las herramientas funcionan con el modelo suelto»): el restore espera la recarga y responde 200, y sólo si esa recarga falla (o vuelve un modelo de otra identidad) responde `embedder_not_ready` (`embed_failure`, `api.rs:1033`; `crates/clawg-core/src/memory/idle_embedder.rs:105-112`) y la siguiente llamada vuelve a intentar. Cualquier otro error del embedder es un 500.
 
-`GET /v1/memories` MUST aceptar `deleted=true`: lista sólo borradas, de la más recién borrada a la más vieja (`ORDER BY deleted_at DESC, id DESC`, `admin.rs:653`), con los mismos filtros y con `deleted_at` en cada ítem. Sin `deleted`, el listado MUST NOT cambiar. `deleted=true` con `q` MUST ser 400 (`api.rs:215-220`): una borrada no tiene entrada en el índice de texto.
+`GET /v1/memories` MUST aceptar `deleted=true`: lista sólo borradas, de la más recién borrada a la más vieja (`ORDER BY deleted_at DESC, id DESC`, `admin.rs:653`), con los mismos filtros y con `deleted_at` en cada ítem. Sin `deleted`, el listado MUST NOT cambiar. `deleted=true` con `q` MUST ser 400 (`api.rs:219-224`): una borrada no tiene entrada en el índice de texto.
 
 #### Escenario
 - GIVEN una memoria guardada y borrada por HTTP
@@ -121,7 +121,7 @@ Devuelve el id, el `status` y el `superseded_by` con que quedó la fila (`Restor
 
 ## R5. Herramienta MCP `restore_memory`
 
-El puente MUST exponer `restore_memory` con `kind` e `id`, y MUST mandar siempre el agente que llama (`restore_memory_impl`, `crates/clawg-cli/src/mcp/server.rs:832`; la herramienta, `server.rs:1121`; `DaemonClient::restore`, `crates/clawg-cli/src/client.rs:891`).
+El puente MUST exponer `restore_memory` con `kind` e `id`, y MUST mandar siempre el agente que llama (`restore_memory_impl`, `crates/clawg-cli/src/mcp/server.rs:832`; la herramienta, `server.rs:1121`; `DaemonClient::restore`, `crates/clawg-cli/src/client.rs:919`).
 
 - Sobre una borrada propia, MUST devolver un texto que nombra el id (`restored #N`); si sigue `superseded`, MUST decir por cuál y que la búsqueda no la muestra hasta que `resolve_conflict` la conserve (`format_restore`, `crates/clawg-cli/src/mcp/tools.rs:206`).
 - Sobre una de otro agente MUST fallar como si el id no existiera, y la fila MUST NOT cambiar ([`specs/visibility`](../visibility/spec.md) R3).

@@ -103,7 +103,7 @@ El descarte es una función pura sobre los hits y los vínculos de sus filas. Si
 Un hit con vínculo MUST mostrar `piece=K/N` en su metadato:
 
 - `search_memory` (`crates/clawg-cli/src/mcp/tools.rs:95`): `{rank}. #{id} [{kind}/{type}/t{tier} piece={K}/{N} score={score}] {contenido}`;
-- `recall_context` (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:530-542`): `[YYYY-MM-DD #{id} {type} piece={K}/{N}] {contenido}` para `memory`; las otras tablas llevan su kind antes del tipo, como ya hacían.
+- `recall_context` (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:602-614`): `[YYYY-MM-DD #{id} {type} piece={K}/{N}] {contenido}` para `memory`; las otras tablas llevan su kind antes del tipo, como ya hacían.
 - un hit de otro agente suma ` by <autor>` antes del `]` en los dos ([`specs/sharing`](../sharing/spec.md) R4).
 
 Un hit sin vínculo MUST seguir con el formato de antes. `Hit` en el cliente (`crates/clawg-cli/src/client.rs:163`) MUST leer `piece` con `#[serde(default)]` (`client.rs:179`), así un daemon viejo sigue respondiendo.
@@ -119,7 +119,7 @@ Los parsers del eval (`crates/clawg-eval/src/bin/rag-eval/agent_view/parse.rs`) 
 
 ## R6. El save entero
 
-`GET /v1/memories/{kind}/{id}/save` (`crates/clawg-cli/src/daemon/api.rs:716`, handler `get_save`, `api.rs:1189`) con la query `agent` MUST devolver el save de la fila (`read_save_core`, `crates/clawg-core/src/memory/pieces.rs:98`):
+`GET /v1/memories/{kind}/{id}/save` (`crates/clawg-cli/src/daemon/api.rs:735`, handler `get_save`, `api.rs:1231`) con la query `agent` MUST devolver el save de la fila (`read_save_core`, `crates/clawg-core/src/memory/pieces.rs:98`):
 
 - `id`, `kind`, `piece` (la posición de la fila pedida), `pieces` (el total) e `ids`: el id de cada posición, o `null` si esa fila está borrada o es de otro agente;
 - `missing`: las posiciones sin fila visible;

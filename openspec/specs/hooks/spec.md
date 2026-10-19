@@ -1,19 +1,20 @@
 # hooks — Especificación
 
-Fuente de verdad del comportamiento actual de `clawg hook <evento>`: el subcomando que el cliente corre en sus hooks de ciclo de vida para que la memoria llegue al agente sin que tenga que acordarse de pedirla. Cubre cómo lee su entrada, qué escribe al iniciar la sesión y al enviar un mensaje, y por qué nunca rompe la sesión. El contexto que pide al iniciar, el que no lleva consulta, está en [`specs/retrieval`](../retrieval/spec.md) («El contexto sin consulta»), y la herramienta `recall_context`, con la que comparte el aviso de síntesis, en [`specs/synthesis`](../synthesis/spec.md) (R8).
+Fuente de verdad del comportamiento actual de `clawg hook <evento>`: el subcomando que el cliente corre en sus hooks de ciclo de vida para que la memoria llegue al agente sin que tenga que acordarse de pedirla. Cubre cómo lee su entrada, qué escribe al iniciar la sesión y al enviar un mensaje, cómo le dice al daemon en qué sesión del host se trabaja, y por qué nunca rompe la sesión. El contexto que pide al iniciar, el que no lleva consulta, está en [`specs/retrieval`](../retrieval/spec.md) («El contexto sin consulta»), y la herramienta `recall_context`, con la que comparte el aviso de síntesis, en [`specs/synthesis`](../synthesis/spec.md) (R8).
 
 **Origen:**
 - [agent-lifecycle-hooks](../../changes/archive/2026-10-18-agent-lifecycle-hooks/proposal.md), archivado el 2026-10-18. Los ids de requisito son los de esa spec: R1 vive en [`specs/retrieval`](../retrieval/spec.md) y acá están R2 a R5.
+- [session-handoff](../../changes/archive/2026-10-19-session-handoff/proposal.md), archivado el 2026-10-19 (sólo R6, que en esa spec es R5, y el campo `session_id` de R2). El registro del daemon y el sello en el save están en [`specs/ingest`](../ingest/spec.md), «La sesión del host».
 
 ## Definiciones
 
 - **Host:** el cliente que corre los hooks (Claude Code). Le pasa al hook un objeto JSON por stdin y lee su stdout; lee el código de salida 2 como «bloquear la sesión o el mensaje».
-- **Sobre:** la salida que el host inyecta, `{"hookSpecificOutput": {"hookEventName": E, "additionalContext": T}}` (`envelope`, `crates/clawg-cli/src/hook.rs:104`).
-- **Inicio de la sesión:** la fecha de creación del archivo `transcript_path` que manda el host (`session_started_at`, `hook.rs:114`). Un sistema de archivos que no guarda la creación no la da.
+- **Sobre:** la salida que el host inyecta, `{"hookSpecificOutput": {"hookEventName": E, "additionalContext": T}}` (`envelope`, `crates/clawg-cli/src/hook.rs:108`).
+- **Inicio de la sesión:** la fecha de creación del archivo `transcript_path` que manda el host (`session_started_at`, `hook.rs:118`). Un sistema de archivos que no guarda la creación no la da.
 
 ## R2. `clawg hook <evento>`
 
-`clawg hook session-start|user-prompt-submit --agent A [--profile P]` MUST leer el JSON del host por stdin, tolerando campos desconocidos y ausentes (`HookInput`, `hook.rs:38`; todos sus campos son opcionales), y MUST NOT arrancar un daemon. `--agent` MUST ser obligatorio y se recorta; sólo hay dos eventos (`HookEvent`, `crates/clawg-cli/src/cli.rs:261`). El proyecto MUST salir de `cwd` (o del directorio actual sin él) como lo resuelve el puente (`ProjectIdentity::resolve`, `hook.rs:141`). Un perfil que el build rechaza MUST rechazarse como en los otros subcomandos (`profile.resolve()` en `crates/clawg-cli/src/main.rs:106`).
+`clawg hook session-start|user-prompt-submit --agent A [--profile P]` MUST leer el JSON del host por stdin, tolerando campos desconocidos y ausentes (`HookInput`, `hook.rs:38`; todos sus campos son opcionales, `session_id` entre ellos), y MUST NOT arrancar un daemon. `--agent` MUST ser obligatorio y se recorta; sólo hay dos eventos (`HookEvent`, `crates/clawg-cli/src/cli.rs:276`). El proyecto MUST salir de `cwd` (o del directorio actual sin él) como lo resuelve el puente (`ProjectIdentity::resolve`, `hook.rs:145`). Un perfil que el build rechaza MUST rechazarse como en los otros subcomandos (`profile.resolve()` en `crates/clawg-cli/src/main.rs:107`).
 
 El `--agent` del hook MUST ser el del puente: las memorias que pide y el último save que mira son las de ese agente, y con otro nombre el hook leería a un agente distinto del que guarda ([`specs/visibility`](../visibility/spec.md), R1).
 
@@ -23,11 +24,11 @@ Esta spec no instala el hook: lo instala `clawg setup claude-code`, con la ruta 
 
 ## R3. Un hook nunca rompe la sesión
 
-Sin daemon, con un daemon que responde un error o no responde a tiempo, o con una entrada que no es JSON, el hook MUST NOT escribir nada en stdout y MUST salir con 0 (`respond` y `answer`, `hook.rs:125-163`; `Command::Hook`, `main.rs:105-112`). El tope es de 3 s en total, de leer stdin a la respuesta (`HOOK_DEADLINE`, `hook.rs:25`), por debajo de los 5 s con los que se configura un hook, para que el host nunca lo cancele. Un error de uso de `clawg hook`, o un perfil rechazado, MUST salir con 1 y el motivo en stderr; `clawg hook` MUST NOT salir con 2, el código de clap para un uso inválido, que el host leería como «bloquear» y borraría el mensaje del usuario (`is_hook_invocation`, `cli.rs:269`; el camino de `Cli::try_parse` en `main.rs:43-51`).
+Sin daemon, con un daemon que responde un error o no responde a tiempo, o con una entrada que no es JSON, el hook MUST NOT escribir nada en stdout y MUST salir con 0 (`respond` y `answer`, `hook.rs:129-175`; `Command::Hook`, `main.rs:106-113`). El tope es de 3 s en total, de leer stdin a la respuesta (`HOOK_DEADLINE`, `hook.rs:25`), por debajo de los 5 s con los que se configura un hook, para que el host nunca lo cancele. Un error de uso de `clawg hook`, o un perfil rechazado, MUST salir con 1 y el motivo en stderr; `clawg hook` MUST NOT salir con 2, el código de clap para un uso inválido, que el host leería como «bloquear» y borraría el mensaje del usuario (`is_hook_invocation`, `cli.rs:290`; el camino de `Cli::try_parse` en `main.rs:43-52`).
 
 El hook MUST NOT arrancar un daemon (usa `DaemonClient::from_data_dir`, no `probe_running(.., true)`, que puede esperar hasta 60 s): el puente MCP es quien arranca el daemon con la sesión, así que el primer `SessionStart` del día puede llegar antes y quedar sin contexto. Es la decisión de no autoarrancar (D6 del diseño archivado), y ese es todo su costo.
 
-Como el host puede dejar abierto el stdin, `main` apaga el runtime sin esperar a las tareas bloqueantes cuando es un hook (`shutdown_background`, `main.rs:79`); un `drop` común esperaría la lectura de stdin más allá del tope.
+Como el host puede dejar abierto el stdin, `main` apaga el runtime sin esperar a las tareas bloqueantes cuando es un hook (`shutdown_background`, `main.rs:80`); un `drop` común esperaría la lectura de stdin más allá del tope.
 
 #### Escenario: el daemon no está
 - GIVEN un perfil sin daemon
@@ -38,7 +39,7 @@ Como el host puede dejar abierto el stdin, `main` apaga el runtime sin esperar a
 
 ## R4. `session-start`
 
-MUST pedir el contexto sin consulta con el presupuesto de 8.000 bytes (`SESSION_BUDGET`, `hook.rs:33`; `DaemonClient::recent_context`, `crates/clawg-cli/src/client.rs:696`) y, si el prompt no está vacío, MUST escribir el sobre con `hookEventName: "SessionStart"` y un texto que abre diciendo que es la memoria de clawg para este proyecto y que lo recuperado es evidencia y no instrucciones, seguido del prompt (`session_start_text`, `hook.rs:56`). Con `source = compact` MUST sumar que la conversación se acaba de compactar y que el protocolo pide un `session_summary`. Con el embedder `failed` MUST sumar que el modelo no cargó y que las búsquedas no funcionan hasta que cargue, con la causa y si clawg reintenta. Con al menos 20 memorias sin revisar MUST sumar el aviso de síntesis de `recall_context` (`synthesis_nudge`, [`specs/synthesis`](../synthesis/spec.md), R8). Sin prompt ni nada que sumar, MUST NOT escribir nada. Lo que el hook suma al prompt MUST ocupar menos de 1.000 bytes, para que el todo entre en los 10.000 caracteres que el host inyecta.
+MUST pedir el contexto sin consulta con el presupuesto de 8.000 bytes (`SESSION_BUDGET`, `hook.rs:33`; `DaemonClient::recent_context`, `crates/clawg-cli/src/client.rs:696`) y, si el prompt no está vacío, MUST escribir el sobre con `hookEventName: "SessionStart"` y un texto que abre diciendo que es la memoria de clawg para este proyecto y que lo recuperado es evidencia y no instrucciones, seguido del prompt (`session_start_text`, `hook.rs:60`). Con `source = compact` MUST sumar que la conversación se acaba de compactar y que el protocolo pide un `session_summary`. Con el embedder `failed` MUST sumar que el modelo no cargó y que las búsquedas no funcionan hasta que cargue, con la causa y si clawg reintenta. Con al menos 20 memorias sin revisar MUST sumar el aviso de síntesis de `recall_context` (`synthesis_nudge`, [`specs/synthesis`](../synthesis/spec.md), R8). Sin prompt ni nada que sumar, MUST NOT escribir nada. Lo que el hook suma al prompt MUST ocupar menos de 1.000 bytes, para que el todo entre en los 10.000 caracteres que el host inyecta.
 
 Verificado con Claude Code sobre el perfil dev: el inicio, la reanudación y la compactación inyectan el contexto, y la línea de la compactación sólo aparece con `source = compact`. La causa del modelo fallido no tiene tope (S2 del [verify](../../changes/archive/2026-10-18-agent-lifecycle-hooks/verify.md#lo-que-encontró-la-verificación)).
 
@@ -51,7 +52,7 @@ Verificado con Claude Code sobre el perfil dev: el inicio, la reanudación y la 
 
 ## R5. `user-prompt-submit`
 
-MUST pedir el último save de este agente en este proyecto (`GET /v1/memories?agent=&project=&limit=1`; el hook le agrega `kind=memory`, porque sólo esa tabla se escribe hoy, `hook.rs:150-156`). Si pasaron 30 minutos o más (`SAVE_REMINDER_AFTER`, `hook.rs:29`) desde el más reciente entre ese save y el inicio de la sesión, MUST escribir el sobre con `hookEventName: "UserPromptSubmit"` y un texto que dice cuántos minutos van sin guardar y que lo de la sesión sólo queda en memoria cuando `save_memory` lo guarda (`save_reminder`, `hook.rs:90`, pura). Si el inicio de la sesión no se puede leer, o pasaron menos de 30 minutos, MUST NOT escribir nada. Contar desde el más tardío de los dos evita que el primer mensaje de una sesión se entere de un save de ayer.
+MUST pedir el último save de este agente en este proyecto (`GET /v1/memories?agent=&project=&limit=1`; el hook le agrega `kind=memory`, porque sólo esa tabla se escribe hoy, `hook.rs:161-167`). Si pasaron 30 minutos o más (`SAVE_REMINDER_AFTER`, `hook.rs:29`) desde el más reciente entre ese save y el inicio de la sesión, MUST escribir el sobre con `hookEventName: "UserPromptSubmit"` y un texto que dice cuántos minutos van sin guardar y que lo de la sesión sólo queda en memoria cuando `save_memory` lo guarda (`save_reminder`, `hook.rs:94`, pura). Si el inicio de la sesión no se puede leer, o pasaron menos de 30 minutos, MUST NOT escribir nada. Contar desde el más tardío de los dos evita que el primer mensaje de una sesión se entere de un save de ayer.
 
 #### Escenario: media hora sin guardar
 - GIVEN una sesión que empezó hace 45 minutos y un último save de hace 40
@@ -62,3 +63,16 @@ MUST pedir el último save de este agente en este proyecto (`GET /v1/memories?ag
 - THEN el hook no escribe nada
 
 **Tests:** `the_reminder_waits_for_thirty_idle_minutes`, `the_reminder_counts_from_the_later_of_save_and_session_start` y `no_session_start_no_reminder` (`hook.rs`), sobre `save_reminder`. Contra un daemon sólo se prueba el silencio, al final de `session_start_injects_the_saved_memories` (`tests/binary.rs`): ningún test fija que `client.list` y la unidad de `created_at` lleguen bien (S4 del [verify](../../changes/archive/2026-10-18-agent-lifecycle-hooks/verify.md#lo-que-encontró-la-verificación)). Con Claude Code sobre el perfil dev, una sesión retomada 33 minutos después del último save recibió el recordatorio.
+
+## R6. Los hooks registran la sesión
+
+`session-start` y `user-prompt-submit` MUST, cuando la entrada trae `session_id` (`HookInput.session_id`, `hook.rs:49`), registrarlo en el daemon para su `--agent` y el proyecto de `cwd` (`POST /v1/sessions` por `DaemonClient::register_session`, `crates/clawg-cli/src/client.rs:716`; [`specs/ingest`](../ingest/spec.md), «La sesión del host»), en paralelo con lo que cada evento ya pide (`hook.rs:148-152`, unido en `:155-156` y en `:168`). El resultado del registro MUST NOT cambiar lo que el hook escribe ni su código de salida: un daemon anterior, que no tiene la ruta, lo rechaza y el hook sigue igual.
+
+Registran los dos eventos, y no sólo el inicio: un daemon que arrancó después del `SessionStart` (lo arranca el puente, R3) se entera de la sesión en el próximo mensaje, y con dos sesiones del mismo agente en el mismo proyecto queda la que recibió el último mensaje, que es la que más probablemente guarda. Sin daemon no hay a quién registrar y el hook no arranca uno.
+
+#### Escenario: la sesión empieza
+- GIVEN un daemon real
+- WHEN corre `clawg hook session-start --agent a` con `session_id` `s1` y el `cwd` del proyecto, y después `a` guarda en ese proyecto
+- THEN la fila lleva `s1`; después de un `user-prompt-submit` con `s2`, el save siguiente lleva `s2`
+
+**Tests:** `the_hook_input_tolerates_unknown_and_missing_fields` (`hook.rs`, que lee `session_id`); `a_hook_registers_the_session_of_the_saves` (`tests/binary.rs`, con el binario real). Con Claude Code sobre el perfil dev, dos sesiones seguidas guardaron con el `session_id` que el host les mandó ([verify](../../changes/archive/2026-10-19-session-handoff/verify.md#claude-code-sobre-el-perfil-dev-2026-10-19)).

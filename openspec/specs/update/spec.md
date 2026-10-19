@@ -101,14 +101,14 @@ Sobre una fila que no existe, borrada o de otro agente cuando el cambio tiene sc
 
 ## R4. HTTP
 
-`PATCH /v1/memories/{kind}/{id}` (`update_memory`, `crates/clawg-cli/src/daemon/api.rs:1202`) MUST aceptar el cuerpo `{importance?, memory_type?}` (`UpdateRequest`, `api.rs:439`) y la query `agent` de siempre.
+`PATCH /v1/memories/{kind}/{id}` (`update_memory`, `crates/clawg-cli/src/daemon/api.rs:1244`) MUST aceptar el cuerpo `{importance?, memory_type?}` (`UpdateRequest`, `api.rs:454`) y la query `agent` de siempre.
 
 - Un cambio inválido (R1) MUST responder 400 con el mensaje de la validación.
 - Un campo desconocido en el cuerpo MUST responder 400 o 422, nunca 200: un campo mal escrito no puede pasar por un cambio hecho (`deny_unknown_fields`).
 - "No existe" (R3) MUST responder 404.
 - Un cambio hecho MUST responder 200 con `updated = 1` y `importance`, `memory_type` y `tier` de la fila como quedó.
 
-`DaemonClient::update` (`crates/clawg-cli/src/client.rs:833`) es el lado del cliente.
+`DaemonClient::update` (`crates/clawg-cli/src/client.rs:880`) es el lado del cliente.
 
 #### Escenario
 - GIVEN una memoria guardada por HTTP
