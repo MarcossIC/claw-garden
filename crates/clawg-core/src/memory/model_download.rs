@@ -178,7 +178,7 @@ where
             log::warn!("tokenizer.json not readable at {} ({e}); chunking by bytes", path.display());
             return None;
         }
-        Err(Unusable::Altered { .. }) => {
+        Err(Unusable::Altered) => {
             log::warn!("tokenizer.json at {} is not the pinned file; chunking by bytes", path.display());
             return None;
         }
@@ -412,15 +412,23 @@ async fn fetch(
     progress: Option<&UnboundedSender<DownloadProgress>>,
 ) -> Result<ModelFiles, DownloadError> {
     let cache_dir = cache_dir_of(base_dir);
-    std::fs::create_dir_all(&cache_dir).map_err(|e| DownloadError::Io {
-        file: cache_dir.display().to_string(),
-        source: e,
-    })?;
-
     // (1) Cache-hit fast path: NO events emitted. Every startup after the first
     // takes this branch, and emitting progress here would flash a download UI
-    // for work that never happens.
-    let mut cached = check_cache(&cache_dir, source.files);
+    // for work that never happens. Reading and hashing half a gigabyte is
+    // blocking work, kept off the runtime's threads.
+    let mut cached = {
+        let (dir, files) = (cache_dir.clone(), source.files.to_vec());
+        tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&dir)?;
+            Ok(check_cache(&dir, &files))
+        })
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
+        .map_err(|e| DownloadError::Io {
+            file: cache_dir.display().to_string(),
+            source: e,
+        })?
+    };
     if cached.missing.is_empty() {
         return Ok(cached.into_model_files());
     }
@@ -453,7 +461,7 @@ async fn fetch(
     // (4) Download every missing or mismatched file.
     let mut bytes_downloaded_running: u64 = 0;
     for spec in std::mem::take(&mut cached.missing) {
-        download_one(
+        let bytes = download_one(
             &client,
             &cache_dir,
             &spec,
@@ -463,8 +471,6 @@ async fn fetch(
             &mut bytes_downloaded_running,
         )
         .await?;
-        let bytes = read_verified(&cache_dir.join(spec.path), spec.sha256)
-            .map_err(|unusable| unusable.into_error(&spec))?;
         cached.found.push((spec.kind, bytes));
     }
 
@@ -530,29 +536,22 @@ pub(crate) fn model_is_cached(base_dir: &Path) -> bool {
 #[derive(Debug)]
 enum Unusable {
     Unreadable(std::io::Error),
-    Altered { actual: String },
+    Altered,
 }
 
-impl Unusable {
-    fn into_error(self, spec: &FileSpec) -> DownloadError {
-        match self {
-            Unusable::Unreadable(source) => DownloadError::Io { file: spec.path.into(), source },
-            Unusable::Altered { actual } => DownloadError::ChecksumMismatch {
-                file: spec.path.into(),
-                expected: spec.sha256.into(),
-                actual,
-            },
-        }
-    }
-}
+/// Every file [`read_verified`] read and hashed, so a test can count the reads of its own
+/// directory whatever thread did them.
+#[cfg(test)]
+static READS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 /// The bytes of `path` when their SHA-256 is `expected_sha`: the one place the
 /// cache is read and checked.
 fn read_verified(path: &Path, expected_sha: &str) -> Result<Vec<u8>, Unusable> {
     let bytes = std::fs::read(path).map_err(Unusable::Unreadable)?;
-    let actual = sha256_hex(&bytes);
-    if actual != expected_sha {
-        return Err(Unusable::Altered { actual });
+    #[cfg(test)]
+    READS.lock().unwrap_or_else(|e| e.into_inner()).push(path.to_path_buf());
+    if sha256_hex(&bytes) != expected_sha {
+        return Err(Unusable::Altered);
     }
     Ok(bytes)
 }
@@ -585,7 +584,8 @@ fn partial_path_for(target: &Path) -> std::path::PathBuf {
 /// Throttle Chunk events to one per `CHUNK_PROGRESS_BYTES`.
 const CHUNK_PROGRESS_BYTES: u64 = 64 * 1024;
 
-/// Per-file download with retry (3 attempts, 5s/30s/120s backoff). A SHA-256
+/// Per-file download with retry (3 attempts, 5s/30s/120s backoff), returning
+/// the bytes it hashed and committed. A SHA-256
 /// mismatch returns IMMEDIATELY and does NOT consume the retry budget: the
 /// bytes arrived intact but wrong, which means tampering or persistent
 /// corruption upstream, and retrying would just re-fetch the same wrong bytes.
@@ -603,8 +603,9 @@ async fn download_one(
     backoff: &dyn BackoffPolicy,
     progress: Option<&UnboundedSender<DownloadProgress>>,
     bytes_downloaded_running: &mut u64,
-) -> Result<(), DownloadError> {
+) -> Result<Vec<u8>, DownloadError> {
     use futures::StreamExt;
+    use sha2::Digest;
     use std::io::Write;
 
     let target = cache_dir.join(spec.path);
@@ -666,6 +667,8 @@ async fn download_one(
         let bytes_total_hint = *bytes_downloaded_running + content_length;
         let mut next_emit_threshold = *bytes_downloaded_running + CHUNK_PROGRESS_BYTES;
 
+        let mut body = Vec::with_capacity(content_length as usize);
+        let mut digest = sha2::Sha256::new();
         let mut stream = resp.bytes_stream();
         let mut io_err: Option<DownloadError> = None;
         let mut stream_err: Option<reqwest::Error> = None;
@@ -679,6 +682,8 @@ async fn download_one(
                         });
                         break;
                     }
+                    digest.update(&bytes);
+                    body.extend_from_slice(&bytes);
                     *bytes_downloaded_running += bytes.len() as u64;
                     if let Some(tx) = progress {
                         if *bytes_downloaded_running >= next_emit_threshold {
@@ -709,22 +714,6 @@ async fn download_one(
             continue;
         }
 
-        if let Err(e) = file.flush() {
-            let _ = std::fs::remove_file(&partial);
-            return Err(DownloadError::Io {
-                file: spec.path.into(),
-                source: e,
-            });
-        }
-        if let Err(e) = file.sync_all() {
-            let _ = std::fs::remove_file(&partial);
-            return Err(DownloadError::Io {
-                file: spec.path.into(),
-                source: e,
-            });
-        }
-        drop(file);
-
         // Emit one final Chunk so consumers see exact byte count post-write.
         if let Some(tx) = progress {
             let _ = tx.send(DownloadProgress::Chunk {
@@ -733,18 +722,8 @@ async fn download_one(
             });
         }
 
-        // SHA verification.
-        let bytes = match std::fs::read(&partial) {
-            Ok(b) => b,
-            Err(e) => {
-                let _ = std::fs::remove_file(&partial);
-                return Err(DownloadError::Io {
-                    file: spec.path.into(),
-                    source: e,
-                });
-            }
-        };
-        let got = sha256_hex(&bytes);
+        // Hashed as the bytes arrived: the file is never read back.
+        let got = hex_digest(digest.finalize().as_slice());
         if got != spec.sha256 {
             // Return immediately, do NOT retry: a checksum mismatch is not a
             // transient fault, so the retry budget would buy nothing.
@@ -756,15 +735,26 @@ async fn download_one(
             });
         }
 
-        // Atomic rename → final.
-        if let Err(e) = commit_file(&partial, &target) {
+        // Syncing half a gigabyte can take seconds: not on a runtime thread.
+        let committed = {
+            let (partial, target) = (partial.clone(), target.clone());
+            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                file.flush()?;
+                file.sync_all()?;
+                drop(file);
+                commit_file(&partial, &target)
+            })
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
+        };
+        if let Err(e) = committed {
             let _ = std::fs::remove_file(&partial);
             return Err(DownloadError::Io {
                 file: spec.path.into(),
                 source: e,
             });
         }
-        return Ok(());
+        return Ok(body);
     }
 
     log::warn!("model download of {} from {host} failed on attempt {ATTEMPTS} of {ATTEMPTS}: {cause}", spec.path);
@@ -1432,6 +1422,77 @@ mod tests {
     #[tokio::test]
     async fn a_server_that_never_answers_fails_the_attempt() {
         ensure_against_silent_server("dl-no-answer", b"").await;
+    }
+
+    // ---------- Off the runtime, one hash per file ----------
+
+    /// The files under `dir` that [`read_verified`] read since the test began.
+    fn reads_under(dir: &Path) -> Vec<String> {
+        READS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.strip_prefix(dir).ok())
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_cache_check_leaves_the_runtime_thread_free() {
+        let tmp = TestDir::new("cache-off-runtime");
+        let cache_dir = tmp.path().join("models").join("multilingual-e5-small");
+        let mut files = fixture_files();
+        files[0].bytes = vec![7u8; 16 * 1024 * 1024];
+        write_all_to_cache(&cache_dir, &files);
+        let specs = fixture_specs(&files);
+        let oracle = MockDiskOracle::returning(MIN_FREE_BYTES);
+
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ticker = tokio::spawn({
+            let done = done.clone();
+            async move {
+                let mut ticks = 0u32;
+                while !done.load(Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    ticks += 1;
+                }
+                ticks
+            }
+        });
+        tokio::task::yield_now().await;
+        let res = ensure_model_from(tmp.path(), &source("http://unused.invalid", &oracle, &specs), None).await;
+        done.store(true, Ordering::SeqCst);
+        assert!(res.is_ok(), "{:?}", res.err());
+
+        let ticks = ticker.await.unwrap();
+        assert!(ticks >= 5, "the runtime thread ticked {ticks} times while the cache was hashed");
+    }
+
+    #[tokio::test]
+    async fn each_file_is_hashed_once_per_run() {
+        let files = fixture_files();
+        let specs = fixture_specs(&files);
+        let oracle = MockDiskOracle::returning(MIN_FREE_BYTES);
+
+        for damaged in ["config.json", "onnx/model.onnx"] {
+            let tmp = TestDir::new("hash-once");
+            let cache_dir = tmp.path().join("models").join("multilingual-e5-small");
+            write_all_to_cache(&cache_dir, &files);
+            std::fs::remove_file(cache_dir.join(damaged)).unwrap();
+            let mut server = mockito::Server::new_async().await;
+            let _mocks = mount_all(&mut server, &files, 200).await;
+
+            let res = ensure_model_from(tmp.path(), &source(&server.url(), &oracle, &specs), None).await;
+            let model = res.unwrap_or_else(|e| panic!("{damaged}: {e}"));
+            assert_eq!(model.onnx, files[0].bytes, "{damaged}");
+
+            let mut reads = reads_under(&cache_dir);
+            reads.sort();
+            let mut expected: Vec<String> =
+                files.iter().map(|f| f.path.to_string()).filter(|p| p != damaged).collect();
+            expected.sort();
+            assert_eq!(reads, expected, "with {damaged} missing, each cached file read once and the downloaded one never");
+        }
     }
 
     // ---------- The cause of a failure ----------
