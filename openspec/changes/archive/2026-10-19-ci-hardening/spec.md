@@ -1,6 +1,6 @@
 # ci-hardening — Especificación (delta sobre `specs/install` y `specs/release`)
 
-C1 a C4 reemplazan y amplían la sección «CI» de [`specs/install`](../../specs/install/spec.md); C5 y C6 son workflows nuevos; C7 modifica R3 de [`specs/release`](../../specs/release/spec.md) y C8 su R8. Todas las pruebas están en `crates/clawg-cli/tests/conventions.rs` y leen los archivos como texto; lo que hace GitHub con ellos sólo se ve en una corrida real.
+C1 a C4 reemplazan y amplían la sección «CI» de [`specs/install`](../../../specs/install/spec.md); C5 y C6 son workflows nuevos; C7 modifica R3 de [`specs/release`](../../../specs/release/spec.md) y C8 su R8. Todas las pruebas están en `crates/clawg-cli/tests/conventions.rs` y leen los archivos como texto; lo que hace GitHub con ellos sólo se ve en una corrida real.
 
 ## C1 (modifica «CI»). El CI compila lo que se publica
 

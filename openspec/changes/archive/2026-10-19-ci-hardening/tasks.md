@@ -62,5 +62,5 @@ Strict TDD: en cada tarea la prueba de convenciones va primero y falla por la as
 
 ## 11. Archive
 
-- [x] «CI» de [`specs/install`](../../specs/install/spec.md) con C1 a C6; R3 y R8 de [`specs/release`](../../specs/release/spec.md).
+- [x] «CI» de [`specs/install`](../../../specs/install/spec.md) con C1 a C6; R3 y R8 de [`specs/release`](../../../specs/release/spec.md).
 - [x] `git mv` a `changes/archive/2026-10-19-ci-hardening`; `state.yaml` archivado; fila 65, orden de ejecución y backlog del `README.md` de openspec; subir el minor.
