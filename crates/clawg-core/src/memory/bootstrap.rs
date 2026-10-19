@@ -939,6 +939,59 @@ mod tests {
         assert_eq!((cached_calls.load(Ordering::SeqCst), load_calls.load(Ordering::SeqCst)), (1, 2));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn without_an_idle_time_the_loaded_model_is_still_wrapped() {
+        struct Dead;
+        #[async_trait::async_trait]
+        impl Embedder for Dead {
+            async fn embed_with_role(
+                &self,
+                _: &str,
+                _: crate::memory::embedder::EmbedRole,
+            ) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+                Err(crate::memory::embedder::EmbedError::WorkerGone)
+            }
+            fn dimensions(&self) -> usize {
+                384
+            }
+            fn model_id(&self) -> &str {
+                "fake-embedder"
+            }
+            fn query_prefix(&self) -> &str {
+                ""
+            }
+            fn passage_prefix(&self) -> &str {
+                ""
+            }
+        }
+        let loads = Arc::new(AtomicUsize::new(0));
+        let load: LoadEmbedderFn = {
+            let loads = loads.clone();
+            Arc::new(move |_files| {
+                if loads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(Arc::new(Dead) as Arc<dyn Embedder>)
+                } else {
+                    Ok(Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>)
+                }
+            })
+        };
+        let cached: CachedModelFn = Arc::new(|_base| Box::pin(async { Ok(empty_model_files()) }));
+        let wrapped = unloading_when_idle(
+            cached,
+            never_download(),
+            load,
+            std::path::PathBuf::from("unused"),
+            None,
+            tokio::runtime::Handle::current(),
+        );
+
+        let embedder = wrapped(empty_model_files()).expect("first load");
+        tokio::time::sleep(Duration::from_secs(24 * 3600)).await;
+        assert!(embedder.resident(), "never let go");
+        embedder.embed_with_role("a text", crate::memory::embedder::EmbedRole::Query).await.expect("recovered");
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+    }
+
     /// A download a test does not expect: the reload of a good cache never
     /// reaches the network.
     fn never_download() -> EnsureModelFn {

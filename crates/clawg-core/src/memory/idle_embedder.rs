@@ -8,6 +8,9 @@
 //! unchanged; only the model behind it comes and goes. Dropping the inner
 //! embedder is what unloads it: for `E5Embedder` the last `Arc` takes the
 //! request channel with it and the owning thread drops the session.
+//!
+//! The same reload brings back a model whose inference worker is gone: a call
+//! that finds it so drops it, loads it again and repeats itself once.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as SyncMutex};
@@ -31,6 +34,11 @@ pub const IDLE_MINUTES_VAR: &str = "CLAWG_EMBEDDER_IDLE_MINUTES";
 /// asks for vectors every few minutes, so ten keeps a reload out of the middle
 /// of a task and still frees the memory over a long pause.
 pub const DEFAULT_IDLE: Duration = Duration::from_secs(10 * 60);
+
+/// The least time between two loads that replace a model whose worker was
+/// gone. A model that dies on every call would otherwise be read, checked and
+/// built again on every call.
+pub const RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The idle time [`IDLE_MINUTES_VAR`] asks for: `None` keeps the model
 /// loaded. Unset or empty is [`DEFAULT_IDLE`]; anything but a whole number
@@ -65,10 +73,18 @@ struct Usage {
     in_flight: usize,
 }
 
+struct Slot {
+    model: Option<Arc<dyn Embedder>>,
+    /// The model was dropped because its worker was gone, so the next load
+    /// is a recovery.
+    recovering: bool,
+    last_recovery: Option<Instant>,
+}
+
 struct Shared {
     /// Locked across a load, so calls arriving while the model is away share
     /// one load instead of each starting its own.
-    model: tokio::sync::Mutex<Option<Arc<dyn Embedder>>>,
+    model: tokio::sync::Mutex<Slot>,
     usage: SyncMutex<Usage>,
     /// Read by health without waiting on a load that holds `model`.
     resident: AtomicBool,
@@ -97,8 +113,16 @@ impl Shared {
         self.usage.lock().unwrap_or_else(|e| e.into_inner()).in_flight += 1;
         let guard = InFlight(self.clone());
         let mut slot = self.model.lock().await;
-        if let Some(model) = slot.as_ref() {
+        if let Some(model) = slot.model.as_ref() {
             return Ok((model.clone(), guard));
+        }
+        if slot.recovering {
+            let now = Instant::now();
+            if slot.last_recovery.is_some_and(|last| now.saturating_duration_since(last) < RECOVERY_INTERVAL) {
+                return Err(EmbedError::NotReady);
+            }
+            slot.recovering = false;
+            slot.last_recovery = Some(now);
         }
         let started = std::time::Instant::now();
         let model = match (self.reload)().await.and_then(|model| self.same_model(model)) {
@@ -111,9 +135,38 @@ impl Shared {
             }
         };
         log::info!("embedding model loaded again in {} ms", started.elapsed().as_millis());
-        *slot = Some(model.clone());
+        slot.model = Some(model.clone());
         self.resident.store(true, Ordering::Release);
         Ok((model, guard))
+    }
+
+    /// Drops `dead`, whose worker is gone, unless another call already
+    /// replaced it: that one's load must not be thrown away.
+    async fn discard(&self, dead: &Arc<dyn Embedder>) {
+        let mut slot = self.model.lock().await;
+        if !slot.model.as_ref().is_some_and(|model| Arc::ptr_eq(model, dead)) {
+            return;
+        }
+        log::warn!("the embedding model's inference worker is gone; the model is dropped and loaded again");
+        self.resident.store(false, Ordering::Release);
+        slot.model = None;
+        slot.recovering = true;
+    }
+
+    /// Runs `call` on the model, and once more on a model loaded again when
+    /// the first one's worker is gone.
+    async fn with_model<T, F>(self: &Arc<Self>, call: impl Fn(Arc<dyn Embedder>) -> F) -> Result<T, EmbedError>
+    where
+        F: std::future::Future<Output = Result<T, EmbedError>>,
+    {
+        for _ in 0..2 {
+            let (model, _in_flight) = self.lease().await?;
+            match call(model.clone()).await {
+                Err(EmbedError::WorkerGone) => self.discard(&model).await,
+                answer => return answer,
+            }
+        }
+        Err(EmbedError::NotReady)
     }
 
     /// A model that came back with another identity would put new vectors in
@@ -133,7 +186,7 @@ impl Shared {
 
     async fn unload_if_idle(&self, idle: Duration) -> bool {
         let mut slot = self.model.lock().await;
-        if slot.is_none() {
+        if slot.model.is_none() {
             return false;
         }
         let due = {
@@ -142,7 +195,7 @@ impl Shared {
         };
         if due {
             self.resident.store(false, Ordering::Release);
-            *slot = None;
+            slot.model = None;
             log::info!("embedding model unloaded after {} s without use", idle.as_secs());
         }
         due
@@ -170,7 +223,7 @@ impl IdleEmbedder {
             model_id: loaded.model_id().to_string(),
             query_prefix: loaded.query_prefix().to_string(),
             passage_prefix: loaded.passage_prefix().to_string(),
-            model: tokio::sync::Mutex::new(Some(loaded)),
+            model: tokio::sync::Mutex::new(Slot { model: Some(loaded), recovering: false, last_recovery: None }),
             usage: SyncMutex::new(Usage { last_used: Instant::now(), in_flight: 0 }),
             resident: AtomicBool::new(true),
             reload,
@@ -197,20 +250,18 @@ impl IdleEmbedder {
     pub async fn unload(&self) {
         let mut slot = self.shared.model.lock().await;
         self.shared.resident.store(false, Ordering::Release);
-        *slot = None;
+        slot.model = None;
     }
 }
 
 #[async_trait]
 impl Embedder for IdleEmbedder {
     async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
-        let (model, _in_flight) = self.shared.lease().await?;
-        model.embed_with_role(text, role).await
+        self.shared.with_model(|model| async move { model.embed_with_role(text, role).await }).await
     }
 
     async fn embed_batch(&self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
-        let (model, _in_flight) = self.shared.lease().await?;
-        model.embed_batch(texts, role).await
+        self.shared.with_model(|model| async move { model.embed_batch(texts, role).await }).await
     }
 
     fn dimensions(&self) -> usize {
@@ -501,6 +552,110 @@ mod tests {
         pass(IDLE * 100).await;
         assert!(embedder.resident());
         assert_eq!(loads.load(Ordering::SeqCst), 0);
+
+        let embedder =
+            IdleEmbedder::new(dead(), counting_reload(loads.clone()), None, &tokio::runtime::Handle::current());
+        embedder.embed_with_role("a text", EmbedRole::Query).await.expect("recovered");
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    /// A model whose inference worker is gone. With a barrier, each call
+    /// waits there first, so callers can be made to hold it together.
+    struct Dead(Option<Arc<tokio::sync::Barrier>>);
+
+    #[async_trait]
+    impl Embedder for Dead {
+        async fn embed_with_role(&self, _: &str, _: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+            if let Some(barrier) = &self.0 {
+                barrier.wait().await;
+            }
+            Err(EmbedError::WorkerGone)
+        }
+        fn dimensions(&self) -> usize {
+            384
+        }
+        fn model_id(&self) -> &str {
+            "fake-embedder"
+        }
+        fn query_prefix(&self) -> &str {
+            ""
+        }
+        fn passage_prefix(&self) -> &str {
+            ""
+        }
+    }
+
+    fn dead() -> Arc<dyn Embedder> {
+        Arc::new(Dead(None))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_model_whose_worker_is_gone_is_loaded_again_within_the_call() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let embedder =
+            IdleEmbedder::new(dead(), counting_reload(loads.clone()), Some(IDLE), &tokio::runtime::Handle::current());
+
+        let vector = embedder.embed_with_role("a text", EmbedRole::Query).await.expect("the call recovers");
+        assert_eq!(vector, fake().embed_with_role("a text", EmbedRole::Query).await.unwrap());
+        assert!(embedder.resident());
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        embedder.embed_batch(&["another".to_string()], EmbedRole::Passage).await.expect("batch");
+        assert_eq!(loads.load(Ordering::SeqCst), 1, "the recovered model stays");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn calls_that_find_the_worker_gone_together_share_one_reload() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let both_hold_it = Arc::new(tokio::sync::Barrier::new(2));
+        let embedder = Arc::new(IdleEmbedder::new(
+            Arc::new(Dead(Some(both_hold_it))),
+            counting_reload(loads.clone()),
+            Some(IDLE),
+            &tokio::runtime::Handle::current(),
+        ));
+
+        let calls = (0..2).map(|i| {
+            let embedder = embedder.clone();
+            tokio::spawn(async move { embedder.embed_with_role(&format!("text {i}"), EmbedRole::Query).await })
+        });
+        for call in futures::future::join_all(calls).await {
+            call.expect("task").expect("embed");
+        }
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        assert!(embedder.resident());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_model_that_keeps_dying_is_reloaded_at_most_once_a_minute() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let reload: ReloadFn = {
+            let loads = loads.clone();
+            Arc::new(move || {
+                loads.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(dead()) })
+            })
+        };
+        let embedder = IdleEmbedder::new(dead(), reload, Some(IDLE), &tokio::runtime::Handle::current());
+        let call = || embedder.embed_with_role("a text", EmbedRole::Query);
+
+        let first = call().await;
+        assert!(matches!(first, Err(EmbedError::NotReady)), "{first:?}");
+        assert!(!embedder.resident());
+        assert_eq!(loads.load(Ordering::SeqCst), 1, "the first recovery does not wait");
+
+        for wait in [Duration::ZERO, RECOVERY_INTERVAL - Duration::from_secs(1)] {
+            pass(wait).await;
+            let held = call().await;
+            assert!(matches!(held, Err(EmbedError::NotReady)), "{held:?}");
+            assert_eq!(loads.load(Ordering::SeqCst), 1, "held within the minute");
+        }
+
+        pass(Duration::from_secs(1)).await;
+        let again = call().await;
+        assert!(matches!(again, Err(EmbedError::NotReady)), "{again:?}");
+        assert_eq!(loads.load(Ordering::SeqCst), 2, "a minute later it loads again");
+        call().await.unwrap_err();
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test(start_paused = true)]

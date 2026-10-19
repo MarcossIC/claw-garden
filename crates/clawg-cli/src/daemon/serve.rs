@@ -111,6 +111,8 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
         log::warn!("{e}; the model is let go after {} minutes without use", DEFAULT_IDLE.as_secs() / 60);
         Some(DEFAULT_IDLE)
     });
+    // Wrapped even when it is never let go: the wrapper is also what loads
+    // the model again when its inference worker is gone.
     let load = unloading_when_idle(
         cached,
         ensure.clone(),
