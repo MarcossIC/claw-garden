@@ -153,6 +153,21 @@ pub enum Command {
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Connect clawg to an agent client: register the MCP server with this
+    /// binary's absolute path and a pinned agent id, install the lifecycle
+    /// hooks and the memory protocol. Safe to run again; what differs from
+    /// the plan is reported and left as it is.
+    Setup {
+        client: SetupClient,
+        /// Print what would change, and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Take away what setup installed. clawg's data stays.
+        #[arg(long)]
+        remove: bool,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
     /// Add or remove a directory on the user PATH (Windows). The installer
     /// runs this so `clawg` works from any new terminal.
     Path {
@@ -261,6 +276,12 @@ impl MemoriesAction {
 pub enum HookEvent {
     SessionStart,
     UserPromptSubmit,
+}
+
+/// The agent clients `clawg setup` knows how to configure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SetupClient {
+    ClaudeCode,
 }
 
 /// Whether `args`, as the process got them, run `clawg hook`. A client reads
@@ -608,6 +629,21 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["clawg", "hook", "session-start"]).is_err(), "the agent is required");
         assert!(Cli::try_parse_from(["clawg", "hook", "pre-compact", "--agent", "a"]).is_err(), "only the events it answers");
+    }
+
+    #[test]
+    fn setup_takes_a_client_a_profile_dry_run_and_remove() {
+        assert_eq!(
+            parse(&["clawg", "setup", "claude-code"]).command,
+            Command::Setup { client: SetupClient::ClaudeCode, dry_run: false, remove: false, profile: ProfileArg { profile: None } }
+        );
+        assert_eq!(
+            parse(&["clawg", "setup", "claude-code", "--dry-run", "--remove", "--profile", "dev"]).command,
+            Command::Setup { client: SetupClient::ClaudeCode, dry_run: true, remove: true, profile: ProfileArg { profile: Some("dev".into()) } }
+        );
+        assert!(Cli::try_parse_from(["clawg", "setup"]).is_err(), "the client is required");
+        assert!(Cli::try_parse_from(["clawg", "setup", "cursor"]).is_err(), "only the clients it knows");
+        assert!(!parse(&["clawg", "setup", "claude-code"]).command.loads_the_model());
     }
 
     #[test]

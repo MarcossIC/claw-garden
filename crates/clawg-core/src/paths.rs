@@ -178,13 +178,15 @@ pub fn home_in(test_home: Option<std::ffi::OsString>, system: Option<PathBuf>) -
     }
 }
 
+/// The user's home directory; in a `testing` build, [`TEST_HOME_VAR`] when set.
 #[cfg(feature = "testing")]
-fn home_dir() -> Option<PathBuf> {
+pub fn home_dir() -> Option<PathBuf> {
     home_in(std::env::var_os(TEST_HOME_VAR), dirs::home_dir())
 }
 
+/// The user's home directory.
 #[cfg(not(feature = "testing"))]
-fn home_dir() -> Option<PathBuf> {
+pub fn home_dir() -> Option<PathBuf> {
     dirs::home_dir()
 }
 

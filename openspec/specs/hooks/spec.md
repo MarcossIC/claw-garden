@@ -17,7 +17,7 @@ Fuente de verdad del comportamiento actual de `clawg hook <evento>`: el subcoman
 
 El `--agent` del hook MUST ser el del puente: las memorias que pide y el último save que mira son las de ese agente, y con otro nombre el hook leería a un agente distinto del que guarda ([`specs/visibility`](../visibility/spec.md), R1).
 
-Esta spec no instala el hook. Registrarlo en el host es de client-setup (la fila 26 del [mapa de cambios](../../README.md)); la configuración para probarlo a mano está en «Probar a mano» del [diseño archivado](../../changes/archive/2026-10-18-agent-lifecycle-hooks/design.md#probar-a-mano).
+Esta spec no instala el hook: lo instala `clawg setup claude-code`, con la ruta absoluta del binario y el mismo `--agent` y `--profile` que el puente ([`specs/setup`](../setup/spec.md), R3). La configuración para probarlo a mano está en «Probar a mano» del [diseño archivado](../../changes/archive/2026-10-18-agent-lifecycle-hooks/design.md#probar-a-mano).
 
 **Tests:** `hook_takes_an_event_an_agent_and_a_profile` (`cli.rs`), `the_hook_input_tolerates_unknown_and_missing_fields` (`hook.rs`). El perfil rechazado lo prueba `a_hook_usage_error_exits_1`, y el proyecto que sale de `cwd`, `session_start_injects_the_saved_memories` (`crates/clawg-cli/tests/binary.rs`).
 
