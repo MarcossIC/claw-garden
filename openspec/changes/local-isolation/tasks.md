@@ -22,7 +22,7 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 
 ## 4. Docs
 
-- [ ] README y `.claude/CLAUDE.md`; `state.yaml`.
+- [x] README y `.claude/CLAUDE.md`; `state.yaml`.
 - Commit: `docs: say the data directory is private to its owner on Unix`
 
 ## 5. Verificación
