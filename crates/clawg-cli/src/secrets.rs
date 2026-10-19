@@ -1,41 +1,58 @@
 //! `clawg secrets` and `clawg purge` — what they print, kept apart from the
 //! commands so the wording is under test without a store.
 
-use clawg_core::memory::secrets::{Flagged, Purged};
+use clawg_core::memory::redact::SecretKind;
+use clawg_core::memory::secrets::{Purged, Scanned};
 use clawg_core::memory::store_lock::StoreHolder;
 use clawg_core::memory::MemoryError;
 
-/// One line per row that holds a secret, then a line on what to do. Only ids,
-/// kinds and whether the row is deleted: the secret itself never reaches the
-/// terminal, where scrollback and logs would keep another copy.
-pub fn report(flagged: &[Flagged]) -> String {
-    let rows: Vec<[String; 3]> = flagged
+/// One line per row and per verdict reason that holds a secret, then a line
+/// on what to do with each. Only ids, kinds and whether the row is deleted:
+/// the secret itself never reaches the terminal, where scrollback and logs
+/// would keep another copy.
+pub fn report(scanned: &Scanned) -> String {
+    let kinds = |kinds: &[SecretKind]| kinds.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", ");
+    let rows: Vec<[String; 3]> = scanned
+        .memories
         .iter()
         .map(|f| {
-            let kinds: Vec<&str> = f.kinds.iter().map(|k| k.as_str()).collect();
             let state = if f.deleted { "deleted" } else { "live" };
-            [f.id.to_string(), kinds.join(", "), state.to_string()]
+            [f.id.to_string(), kinds(&f.kinds), state.to_string()]
         })
         .collect();
     let id_width = rows.iter().map(|r| r[0].len()).max().unwrap_or(0);
     let kinds_width = rows.iter().map(|r| r[1].len()).max().unwrap_or(0);
 
-    let mut out = String::new();
-    for [id, kinds, state] in &rows {
-        out.push_str(&format!("memory {id:>id_width$}  {kinds:<kinds_width$}  {state}\n"));
-    }
-    match flagged {
-        [] => out.push_str("no stored memory holds a secret of a known format"),
-        [one] => out.push_str(&format!(
+    let mut lines: Vec<String> = rows
+        .iter()
+        .map(|[id, kinds, state]| format!("memory {id:>id_width$}  {kinds:<kinds_width$}  {state}"))
+        .collect();
+    lines.extend(scanned.pairs.iter().map(|p| format!("pair {} {}  {}", p.new_id, p.old_id, kinds(&p.kinds))));
+    match scanned.memories.as_slice() {
+        [] => {}
+        [one] => lines.push(format!(
             "1 memory holds a secret. To remove it for good, run `clawg stop`, then `clawg purge {} --yes`.",
             one.id
         )),
-        many => out.push_str(&format!(
+        many => lines.push(format!(
             "{} memories hold a secret. To remove one for good, run `clawg stop`, then `clawg purge <ID> --yes`.",
             many.len()
         )),
     }
-    out
+    match scanned.pairs.len() {
+        0 => {}
+        1 => lines.push(
+            "1 verdict reason holds a secret. To mask it, run `clawg stop`, then `clawg secrets --mask-reasons --yes`."
+                .to_string(),
+        ),
+        n => lines.push(format!(
+            "{n} verdict reasons hold a secret. To mask them, run `clawg stop`, then `clawg secrets --mask-reasons --yes`."
+        )),
+    }
+    if lines.is_empty() {
+        return "no stored memory holds a secret of a known format".to_string();
+    }
+    lines.join("\n")
 }
 
 /// A purge without `--yes` stops here, before anything is opened.
@@ -75,7 +92,7 @@ pub fn explain(err: MemoryError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clawg_core::memory::redact::SecretKind;
+    use clawg_core::memory::secrets::{Flagged, FlaggedPair};
 
     #[test]
     fn the_secrets_report_lists_rows_and_never_their_content() {
@@ -83,18 +100,41 @@ mod tests {
             Flagged { id: 7, kinds: vec![SecretKind::AwsAccessKey], deleted: false },
             Flagged { id: 1234, kinds: vec![SecretKind::GithubToken, SecretKind::Jwt], deleted: true },
         ];
+        let scanned = |memories: &[Flagged]| Scanned { memories: memories.to_vec(), pairs: vec![] };
         assert_eq!(
-            report(&flagged),
+            report(&scanned(&flagged)),
             "memory    7  aws_access_key     live\n\
              memory 1234  github_token, jwt  deleted\n\
              2 memories hold a secret. To remove one for good, run `clawg stop`, then `clawg purge <ID> --yes`."
         );
         assert_eq!(
-            report(&flagged[..1]),
+            report(&scanned(&flagged[..1])),
             "memory 7  aws_access_key  live\n\
              1 memory holds a secret. To remove it for good, run `clawg stop`, then `clawg purge 7 --yes`."
         );
-        assert_eq!(report(&[]), "no stored memory holds a secret of a known format");
+        assert_eq!(report(&scanned(&[])), "no stored memory holds a secret of a known format");
+    }
+
+    #[test]
+    fn the_secrets_report_lists_pairs_and_how_to_mask_them() {
+        let pairs = vec![
+            FlaggedPair { new_id: 12, old_id: 9, kinds: vec![SecretKind::Credential] },
+            FlaggedPair { new_id: 130, old_id: 4, kinds: vec![SecretKind::GithubToken, SecretKind::Jwt] },
+        ];
+        let memories = vec![Flagged { id: 7, kinds: vec![SecretKind::AwsAccessKey], deleted: false }];
+        assert_eq!(
+            report(&Scanned { memories: memories.clone(), pairs: pairs.clone() }),
+            "memory 7  aws_access_key  live\n\
+             pair 12 9  credential\n\
+             pair 130 4  github_token, jwt\n\
+             1 memory holds a secret. To remove it for good, run `clawg stop`, then `clawg purge 7 --yes`.\n\
+             2 verdict reasons hold a secret. To mask them, run `clawg stop`, then `clawg secrets --mask-reasons --yes`."
+        );
+        assert_eq!(
+            report(&Scanned { memories: vec![], pairs: pairs[..1].to_vec() }),
+            "pair 12 9  credential\n\
+             1 verdict reason holds a secret. To mask it, run `clawg stop`, then `clawg secrets --mask-reasons --yes`."
+        );
     }
 
     #[test]

@@ -27,11 +27,28 @@ pub struct Flagged {
     pub deleted: bool,
 }
 
-/// Every row of `memory`, live or deleted, that holds a secret, by id.
+/// A pair of `memory_conflict` whose verdict reason holds a secret, by the
+/// ids of its two rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlaggedPair {
+    pub new_id: i64,
+    pub old_id: i64,
+    pub kinds: Vec<SecretKind>,
+}
+
+/// What [`scan`] found, each list in id order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Scanned {
+    pub memories: Vec<Flagged>,
+    pub pairs: Vec<FlaggedPair>,
+}
+
+/// Every row of `memory`, live or deleted, and every verdict reason that
+/// holds a secret.
 ///
 /// Reads without the lock and without writing, so it works beside a running
 /// daemon: WAL lets a reader in while the daemon writes.
-pub fn scan(base_dir: &Path) -> Result<Vec<Flagged>, MemoryError> {
+pub fn scan(base_dir: &Path) -> Result<Scanned, MemoryError> {
     let path = base_dir.join("memory.db");
     if !path.exists() {
         return Err(BackupError::NoStore { path }.into());
@@ -40,15 +57,43 @@ pub fn scan(base_dir: &Path) -> Result<Vec<Flagged>, MemoryError> {
     let c = open_for_probe(&path)?;
     let mut stmt = c.prepare("SELECT id, content, deleted_at IS NOT NULL FROM memory ORDER BY id")?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, bool>(2)?)))?;
-    let mut flagged = Vec::new();
+    let mut scanned = Scanned::default();
     for row in rows {
         let (id, content, deleted) = row?;
         let kinds = redact(&content).kinds;
         if !kinds.is_empty() {
-            flagged.push(Flagged { id, kinds, deleted });
+            scanned.memories.push(Flagged { id, kinds, deleted });
+        }
+    }
+    scanned.pairs = reasons_with_a_secret(&c)?.into_iter().map(|(pair, _)| pair).collect();
+    Ok(scanned)
+}
+
+/// The verdict reasons that hold a secret, with each reason as stored. A
+/// store from before the pairs has none.
+fn reasons_with_a_secret(c: &rusqlite::Connection) -> rusqlite::Result<Vec<(FlaggedPair, String)>> {
+    if !has_table(c, "memory_conflict")? {
+        return Ok(Vec::new());
+    }
+    let mut stmt =
+        c.prepare("SELECT new_id, old_id, reason FROM memory_conflict WHERE reason IS NOT NULL ORDER BY new_id, old_id")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)))?;
+    let mut flagged = Vec::new();
+    for row in rows {
+        let (new_id, old_id, reason) = row?;
+        let kinds = redact(&reason).kinds;
+        if !kinds.is_empty() {
+            flagged.push((FlaggedPair { new_id, old_id, kinds }, reason));
         }
     }
     Ok(flagged)
+}
+
+fn has_table(c: &rusqlite::Connection, name: &str) -> rusqlite::Result<bool> {
+    c.query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", [name], |r| {
+        r.get::<_, i64>(0)
+    })
+    .map(|n| n > 0)
 }
 
 /// Why a purge did not run.
@@ -237,7 +282,7 @@ mod tests {
         let before = files_in(dir.path());
 
         assert_eq!(
-            scan(dir.path()).unwrap(),
+            scan(dir.path()).unwrap().memories,
             vec![
                 Flagged { id: aws, kinds: vec![SecretKind::AwsAccessKey], deleted: false },
                 Flagged { id: jwt, kinds: vec![SecretKind::Jwt], deleted: true },
@@ -256,12 +301,60 @@ mod tests {
         drop(store);
 
         assert_eq!(
-            scan(dir.path()).unwrap(),
+            scan(dir.path()).unwrap().memories,
             vec![
                 Flagged { id: password, kinds: vec![SecretKind::Password], deleted: false },
                 Flagged { id: marked, kinds: vec![SecretKind::Private], deleted: false },
             ]
         );
+    }
+
+    async fn add_pair(store: &MemoryStore, new: i64, old: i64, reason: Option<String>) {
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO memory_conflict (new_id, old_id, distance, state, verdict, reason, created_at) \
+                     VALUES (?1, ?2, 0.3, 'judged', 'scoped', ?3, 0)",
+                    rusqlite::params![new, old, reason],
+                )
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_scan_finds_reasons_that_hold_a_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+        let a = insert(&store, "the deploy runs on fridays".to_string()).await;
+        let b = insert(&store, "the deploy runs on mondays".to_string()).await;
+        let c = insert(&store, "the deploy runs on sundays".to_string()).await;
+        add_pair(&store, b, a, Some(format!("rotated {}", fake("ghp_", "a1B2", 36)))).await;
+        add_pair(&store, c, a, Some("one is the dev profile".to_string())).await;
+        add_pair(&store, c, b, None).await;
+        store.conn.clone().close().await.unwrap();
+        drop(store);
+
+        let found = scan(dir.path()).unwrap();
+
+        assert!(found.memories.is_empty(), "{:?}", found.memories);
+        assert_eq!(found.pairs, vec![FlaggedPair { new_id: b, old_id: a, kinds: vec![SecretKind::GithubToken] }]);
+    }
+
+    #[tokio::test]
+    async fn the_scan_of_a_store_from_before_the_pairs_lists_rows_only() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::memory::db::seed_on_disk(dir.path(), Some(14)).await;
+        rusqlite::Connection::open(dir.path().join("memory.db"))
+            .unwrap()
+            .execute(INSERT_ROW, [format!("ci token {}", fake("ghp_", "a1B2", 36))])
+            .unwrap();
+
+        let found = scan(dir.path()).unwrap();
+
+        assert_eq!(found.memories.len(), 1);
+        assert!(found.pairs.is_empty());
     }
 
     #[tokio::test]
@@ -276,7 +369,7 @@ mod tests {
 
         let found = scan(dir.path()).unwrap();
 
-        assert_eq!(found, vec![Flagged { id, kinds: vec![SecretKind::GithubToken], deleted: false }]);
+        assert_eq!(found.memories, vec![Flagged { id, kinds: vec![SecretKind::GithubToken], deleted: false }]);
         drop(store);
     }
 
