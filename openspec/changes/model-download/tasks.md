@@ -54,5 +54,5 @@ Hallado al releer el diff: el cuerpo se acumula en memoria y la reserva sale de 
 ## 8. Verificación
 
 - [x] Suite y clippy en Linux sobre el último commit.
-- [ ] El CI en verde en Linux y Windows.
-- [ ] «Probar a mano» del diseño sobre el perfil dev (pide autorización para tocar `~/.clawg-dev`).
+- [x] El CI en verde en Linux y Windows (`d653bed`), y la suite y clippy en Windows sobre el merge en `develop`.
+- [x] «Probar a mano» del diseño con el perfil dev en homes de prueba, sin tocar `~/.clawg-dev`; los tres pasos en [`verify.md`](verify.md).
