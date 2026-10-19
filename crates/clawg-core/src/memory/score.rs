@@ -283,7 +283,9 @@ pub(crate) fn score(cfg: &ScoringConfig, hit: &RawHit, now: TimestampMs) -> f64 
     let lambda = lambda_for(cfg, hit.kind, &hit.memory_type);
     let age_secs = age_secs_from(now, hit.last_accessed_at);
     let age_days = age_secs as f64 / 86_400.0;
-    let decay = (-lambda * age_days).exp();
+    // A future stamp says the clock moved, not that the row is fresher than
+    // one read just now; unclamped, its decay grows past 1 without bound.
+    let decay = (-lambda * age_days.max(0.0)).exp();
 
     let importance = cfg.importance.base
         + hit
@@ -536,6 +538,16 @@ mod tests {
         let cfg = ScoringConfig::DEFAULT;
         let v = score(&cfg, &neutral_hit_at_importance(5.0, "superseded"), epoch());
         assert_eq!(v, 0.0);
+    }
+
+    #[test]
+    fn an_access_stamped_in_the_future_scores_like_one_made_now() {
+        let cfg = ScoringConfig::DEFAULT;
+        let now = TimestampMs::from_unix_millis(1_700_000_000_000);
+        let ahead = TimestampMs::from_unix_millis(now.as_millis_i64() + 30 * 86_400_000);
+        let hit = |at| make_raw_hit(TableKind::Memory, "tool_error", 3, "active", 0.1, at, 5.0);
+
+        assert_eq!(score(&cfg, &hit(ahead), now), score(&cfg, &hit(now), now));
     }
 
     // cosine_from_l2_unit — converts L2 distance between unit vectors into
