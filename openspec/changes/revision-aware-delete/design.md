@@ -52,7 +52,7 @@ Revivir es `REVIVE_SQL` + `revived_from = D`, y después `settle_row` y `settle_
 
 `revive_after_delete(c, d, now)` aplica la regla a la fila borrada `d` dentro de la transacción del llamador:
 
-1. **El borrado**, cuando la UPDATE afectó la fila (un segundo borrado no revive).
+1. **El borrado**, cuando la UPDATE afectó la fila (un segundo borrado no revive). Si la fila es una pieza de un save cuya primera pieza ya está borrada, la regla corre también para esa primera pieza: las filas que un save largo reemplazó apuntan a ella, y borrarla antes que las otras no revive nada mientras ellas tengan la clave. Lo revivido así queda con `revived_from` = la primera pieza, y es restaurarla a ella lo que lo vuelve a reemplazar; restaurar antes otra pieza da `TopicTaken` con la revivida.
 2. **El restore de una fila reemplazada por `d`**, ya borrada: la fila vuelve viva y `superseded`, y la regla decide si revive (por revisión, sin dueña viva de la clave) o queda escondida (`superseded_by_deleted`).
 3. **El barrido de mantenimiento**, para cada borrada que está `active` o `disputed` y a la que todavía apunta una fila viva de causa `revision`. Es idempotente: después de revivir no queda ninguna.
 

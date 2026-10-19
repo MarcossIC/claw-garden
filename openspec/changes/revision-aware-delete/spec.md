@@ -27,7 +27,7 @@ Una revisión por clave MUST dejar `supersede_cause = 'revision'`; un veredicto 
 
 ## R4. Borrar la vigente revive a la anterior
 
-En la transacción del borrado de una fila `memory` viva, MUST aplicarse R3. Cada fila revivida MUST quedar `active` (o `disputed` si sus disputas siguen), sin `superseded_by` ni causa, con `revived_from = D`, de vuelta en el KNN y el índice de texto, y sus retadoras MUST volver a disputarla. La respuesta MUST nombrar las revividas (`revived`, con su primera línea) y las escondidas (`hidden`). Un borrado que no afectó ninguna fila MUST NOT revivir nada. Las filas de otro agente o proyecto MUST NOT revivir.
+En la transacción del borrado de una fila `memory` viva, MUST aplicarse R3. Cada fila revivida MUST quedar `active` (o `disputed` si sus disputas siguen), sin `superseded_by` ni causa, con `revived_from = D`, de vuelta en el KNN y el índice de texto, y sus retadoras MUST volver a disputarla. La respuesta MUST nombrar las revividas (`revived`, con su primera línea) y las escondidas (`hidden`). Un borrado que no afectó ninguna fila MUST NOT revivir nada. Borrar la última pieza viva de un save largo cuya primera pieza ya está borrada MUST aplicar R3 a esa primera pieza. Las filas de otro agente o proyecto MUST NOT revivir.
 
 #### Escenario: la versión nueva se borra
 - GIVEN v1 reemplazada por v2 con la clave `storage/engine`
@@ -44,7 +44,7 @@ En la transacción del borrado de una fila `memory` viva, MUST aplicarse R3. Cad
 - WHEN se borra el ganador
 - THEN la perdedora sigue reemplazada y la respuesta la nombra en `hidden`
 
-**Test:** `deleting_the_current_revision_revives_the_one_it_replaced`, `deleting_the_head_of_a_chain_revives_only_the_one_before`, `deleting_a_replaced_revision_revives_nothing`, `deleting_a_verdict_winner_leaves_the_loser_hidden`, `deleting_an_undone_revision_revives_nothing`, `a_revived_save_comes_back_whole_and_the_rest_repoint`, `a_revival_stays_in_its_scope` y `a_revived_row_is_disputed_again` (`admin.rs`).
+**Test:** `deleting_the_current_revision_revives_the_one_it_replaced`, `deleting_the_head_of_a_chain_revives_only_the_one_before`, `deleting_a_replaced_revision_revives_nothing`, `deleting_a_verdict_winner_leaves_the_loser_hidden`, `deleting_an_undone_revision_revives_nothing`, `a_revived_save_comes_back_whole_and_the_rest_repoint`, `deleting_every_piece_of_a_long_revision_revives_the_one_before`, `a_revival_stays_in_its_scope` y `a_revived_row_is_disputed_again` (`admin.rs`).
 
 ## R5. Restaurar la borrada deshace la revivida
 

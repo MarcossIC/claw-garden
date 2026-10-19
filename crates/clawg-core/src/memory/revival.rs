@@ -130,6 +130,27 @@ pub(crate) fn revive_after_delete(c: &Connection, deleted: i64, now: TimestampMs
     Ok(Revived { revived, hidden: plan.hidden })
 }
 
+/// [`revive_after_delete`] for the deleted row `deleted`, and for the first
+/// piece of its save when that is another, already deleted row: the rows a
+/// long save replaced point at its first piece, and deleting that piece
+/// before the others revives nothing while they still hold the key.
+pub(crate) fn revive_after_delete_of_piece(c: &Connection, deleted: i64, now: TimestampMs) -> rusqlite::Result<Revived> {
+    let mut revived = revive_after_delete(c, deleted, now)?;
+    let head: Option<i64> = c
+        .query_row(
+            "SELECT f.memory_id FROM memory_piece p JOIN memory_piece f ON f.save_id = p.save_id AND f.piece = 1 \
+             WHERE p.memory_id = ?1 AND f.memory_id <> ?1 ORDER BY p.save_id LIMIT 1",
+            [deleted],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(head) = head {
+        let more = revive_after_delete(c, head, now)?;
+        revived.revived.extend(more.revived);
+    }
+    Ok(revived)
+}
+
 /// Deleted rows still current when deleted that a live revision of theirs
 /// still points at: what a delete that predates revivals left behind.
 const HIDDEN_SQL: &str = "SELECT DISTINCT d.id FROM memory d JOIN memory r ON r.superseded_by = d.id \

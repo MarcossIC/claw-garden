@@ -10,7 +10,7 @@ use crate::memory::clock::TimestampMs;
 use crate::memory::chunker::embedding_text;
 use crate::memory::contradiction::{detect_contradiction, excerpt, Candidate};
 use crate::memory::dispute::{add_dispute_in, release_challengers, settle_challengers, settle_row, SUPERSEDE_SQL};
-use crate::memory::revival::revive_after_delete;
+use crate::memory::revival::{revive_after_delete, revive_after_delete_of_piece};
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::search::{viewer_match_expression, RankedHit};
 use crate::memory::store_insert::{MemoryType, UnknownMemoryType};
@@ -352,7 +352,7 @@ pub async fn delete_memory_core(
                 let now = TimestampMs::from_unix_millis(now_ms);
                 release_challengers(&tx, id, now)?;
                 if affected == 1 {
-                    let revived = revive_after_delete(&tx, id, now)?;
+                    let revived = revive_after_delete_of_piece(&tx, id, now)?;
                     deleted.revived = revived.revived;
                     deleted.hidden = revived.hidden;
                 }
@@ -3779,6 +3779,23 @@ mod tests {
             assert_eq!(lineage(&store, id).await, revived_by(current_row), "piece #{id}");
         }
         assert_eq!(lineage(&store, older).await, replaced_by(first, "revision"));
+    }
+
+    #[tokio::test]
+    async fn deleting_every_piece_of_a_long_revision_revives_the_one_before() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let older = keyed(&store, "a", "ledger notes, the older version", "ledger/notes").await;
+        let (first, second, third) = keyed_save(&store, "ledger/notes").await;
+        supersede(&store, older, first, "revision").await;
+
+        assert!(delete_reporting(&store, first).await.revived.is_empty(), "its other pieces still hold the key");
+        assert!(delete_reporting(&store, second).await.revived.is_empty());
+        let last = delete_reporting(&store, third).await;
+
+        assert_eq!(last.revived.iter().map(|r| r.id).collect::<Vec<_>>(), vec![older]);
+        assert_eq!(lineage(&store, older).await, revived_by(first));
+        restore(&store, first, Some("a")).await.unwrap();
+        assert_eq!(lineage(&store, older).await, replaced_by(first, "revision"), "restoring the head takes it back");
     }
 
     #[tokio::test]
