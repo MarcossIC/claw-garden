@@ -215,8 +215,9 @@ mod tests {
     #[test]
     fn the_purge_report_names_backups_to_delete_by_hand() {
         use std::path::PathBuf;
-        assert_eq!(purge_report(57, &Purged { backups: vec![] }), "purged memory #57");
+        assert_eq!(purge_report(57, &Purged { outbox: vec![], backups: vec![] }), "purged memory #57");
         let held = Purged {
+            outbox: vec![],
             backups: vec![PathBuf::from("/b/memory-x-manual.db"), PathBuf::from("/b/memory-y-pre-restore.db")],
         };
         assert_eq!(

@@ -112,9 +112,41 @@ pub enum PurgeError {
 /// What [`purge`] did.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Purged {
+    /// The outbox rows removed with the row's text: saves accepted and not
+    /// stored, or failed after they were accepted.
+    pub outbox: Vec<OutboxRemoved>,
     /// Snapshots in `<data>/backups` that still hold the row, by name. None
     /// is changed: deleting them is the user's call.
     pub backups: Vec<PathBuf>,
+}
+
+/// An outbox row a purge removed, by the save it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboxRemoved {
+    pub operation_id: String,
+    pub agent_id: String,
+    pub state: String,
+}
+
+/// Which outbox rows hold a purged row's text. The save of a row with no
+/// `memory_piece` link was that row alone, so its outbox row holds exactly
+/// the row's text; a piece of a long save is somewhere in the whole save.
+/// Either way only the save of the row's own agent: another agent's save that
+/// says the same is that agent's, and accepted. A row with no agent is
+/// matched in every agent's saves.
+struct OutboxMatch<'a> {
+    agent: Option<&'a str>,
+    content: &'a str,
+    piece: bool,
+}
+
+const OUTBOX_MATCH: &str = "(?1 IS NULL OR agent_id = ?1) \
+     AND CASE WHEN ?3 THEN instr(content, ?2) > 0 ELSE content = ?2 END";
+
+impl OutboxMatch<'_> {
+    fn params(&self) -> impl rusqlite::Params + '_ {
+        (self.agent, self.content, self.piece)
+    }
 }
 
 /// Removes `memory` row `id` for good: the row, its vector, its terms in the
@@ -128,12 +160,17 @@ pub fn purge(base_dir: &Path, id: i64) -> Result<Purged, MemoryError> {
     let Some((_lock, mut c)) = open_to_rewrite(base_dir)? else {
         return Err(PurgeError::NotFound(id).into());
     };
-    let (content, live): (String, bool) = c
-        .query_row("SELECT content, deleted_at IS NULL FROM memory WHERE id = ?1", [id], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
+    let (content, live, agent, piece): (String, bool, Option<String>, bool) = c
+        .query_row(
+            "SELECT content, deleted_at IS NULL, agent_id, \
+                    EXISTS (SELECT 1 FROM memory_piece WHERE memory_id = ?1) \
+             FROM memory WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
         .optional()?
         .ok_or(PurgeError::NotFound(id))?;
+    let held = OutboxMatch { agent: agent.as_deref(), content: &content, piece };
 
     let tx = c.transaction()?;
     tx.execute("DELETE FROM memory_vectors WHERE rowid = ?1", [id])?;
@@ -145,8 +182,17 @@ pub fn purge(base_dir: &Path, id: i64) -> Result<Purged, MemoryError> {
     tx.execute("DELETE FROM memory_derivation WHERE memory_id = ?1", [id])?;
     tx.execute("DELETE FROM memory_conflict WHERE new_id = ?1 OR old_id = ?1", [id])?;
     // A save not stored yet, or that failed after it was accepted, holds the
-    // text in the outbox; a row stored from a long save is one of its pieces.
-    tx.execute("DELETE FROM ingest_outbox WHERE instr(content, ?1) > 0", [&content])?;
+    // text in the outbox.
+    let outbox: Vec<OutboxRemoved> = {
+        let mut stmt = tx.prepare(&format!(
+            "SELECT operation_id, agent_id, state FROM ingest_outbox WHERE {OUTBOX_MATCH} ORDER BY id"
+        ))?;
+        let rows = stmt.query_map(held.params(), |r| {
+            Ok(OutboxRemoved { operation_id: r.get(0)?, agent_id: r.get(1)?, state: r.get(2)? })
+        })?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    tx.execute(&format!("DELETE FROM ingest_outbox WHERE {OUTBOX_MATCH}"), held.params())?;
     // After the delete, so the row no longer counts as live for them.
     if live {
         release_challengers(&tx, id, TimestampMs::now())?;
@@ -157,7 +203,8 @@ pub fn purge(base_dir: &Path, id: i64) -> Result<Purged, MemoryError> {
     // merge rewrites the index without them.
     c.execute("INSERT INTO memory_fts(memory_fts) VALUES ('optimize')", [])?;
     leave_no_old_copy(c)?;
-    Ok(Purged { backups: backups_holding(&crate::paths::backups_dir(base_dir), id, &content) })
+    let backups = backups_holding(&crate::paths::backups_dir(base_dir), id, &held);
+    Ok(Purged { outbox, backups })
 }
 
 /// What [`mask_reasons`] did.
@@ -265,10 +312,10 @@ fn snapshots_in(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The snapshots in `dir` with a row `id` whose content is `content`, or an
-/// outbox row holding it, by name. One that cannot be read is listed too: it
-/// may hold the row.
-fn backups_holding(dir: &Path, id: i64, content: &str) -> Vec<PathBuf> {
+/// The snapshots in `dir` with a row `id` whose content is the purged one, or
+/// an outbox row holding it, by name. One that cannot be read is listed too:
+/// it may hold the row.
+fn backups_holding(dir: &Path, id: i64, held: &OutboxMatch) -> Vec<PathBuf> {
     let mut holding: Vec<PathBuf> = snapshots_in(dir)
         .into_iter()
         .filter(|p| {
@@ -276,27 +323,22 @@ fn backups_holding(dir: &Path, id: i64, content: &str) -> Vec<PathBuf> {
             let in_memory = c
                 .query_row(
                     "SELECT count(*) FROM memory WHERE id = ?1 AND content = ?2",
-                    rusqlite::params![id, content],
+                    rusqlite::params![id, held.content],
                     |r| r.get::<_, i64>(0),
                 )
                 .map_or(true, |n| n > 0);
-            in_memory || outbox_holds(&c, content)
+            in_memory || outbox_holds(&c, held)
         })
         .collect();
     holding.sort();
     holding
 }
 
-/// Whether a snapshot's outbox has a row with `content` in it. A snapshot
-/// from before the outbox has no such table, and so cannot hold one.
-fn outbox_holds(c: &rusqlite::Connection, content: &str) -> bool {
-    let has_table = c
-        .query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'ingest_outbox'", [], |r| {
-            r.get::<_, i64>(0)
-        })
-        .map_or(true, |n| n > 0);
-    has_table
-        && c.query_row("SELECT count(*) FROM ingest_outbox WHERE instr(content, ?1) > 0", [content], |r| {
+/// Whether a snapshot's outbox has a row `held` matches. A snapshot from
+/// before the outbox has no such table, and so cannot hold one.
+fn outbox_holds(c: &rusqlite::Connection, held: &OutboxMatch) -> bool {
+    has_table(c, "ingest_outbox").unwrap_or(true)
+        && c.query_row(&format!("SELECT count(*) FROM ingest_outbox WHERE {OUTBOX_MATCH}"), held.params(), |r| {
             r.get::<_, i64>(0)
         })
         .map_or(true, |n| n > 0)
@@ -762,19 +804,51 @@ mod tests {
 
         let purged = purge(dir.path(), id).unwrap();
 
-        assert_eq!(purged, Purged { backups: vec![with.clone(), after_delete.clone()] });
+        assert_eq!(purged.backups, vec![with.clone(), after_delete.clone()]);
         let now: Vec<Vec<u8>> =
             [&without, &with, &after_delete].iter().map(|p| std::fs::read(p).unwrap()).collect();
         assert_eq!(now, kept, "no backup was changed");
     }
 
     fn add_outbox_row(c: &rusqlite::Connection, operation_id: &str, content: &str) {
+        add_outbox_row_of(c, "agent-s", operation_id, content);
+    }
+
+    fn add_outbox_row_of(c: &rusqlite::Connection, agent: &str, operation_id: &str, content: &str) {
         c.execute(
             "INSERT INTO ingest_outbox (operation_id, agent_id, content, event, state, created_at, updated_at) \
-             VALUES (?1, 'agent-s', ?2, '{}', 'failed', 0, 0)",
-            [operation_id, content],
+             VALUES (?1, ?2, ?3, '{}', 'failed', 0, 0)",
+            [operation_id, agent, content],
         )
         .unwrap();
+    }
+
+    fn outbox_ids(dir: &Path) -> Vec<String> {
+        let c = rusqlite::Connection::open(dir.join("memory.db")).unwrap();
+        let mut stmt = c.prepare("SELECT operation_id FROM ingest_outbox ORDER BY id").unwrap();
+        let ids = stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        ids
+    }
+
+    #[tokio::test]
+    async fn purge_keeps_other_agents_and_longer_saves_in_the_outbox() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::memory::db::seed_on_disk(dir.path(), None).await;
+        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+        c.execute(INSERT_ROW, ["use pnpm"]).unwrap();
+        let id = c.last_insert_rowid();
+        add_outbox_row_of(&c, "agent-o", "op-other", "use pnpm");
+        add_outbox_row_of(&c, "agent-s", "op-same", "use pnpm");
+        add_outbox_row_of(&c, "agent-s", "op-longer", "use pnpm in the monorepo");
+        drop(c);
+
+        let purged = purge(dir.path(), id).unwrap();
+
+        assert_eq!(outbox_ids(dir.path()), ["op-other", "op-longer"]);
+        assert_eq!(
+            purged.outbox,
+            vec![OutboxRemoved { operation_id: "op-same".into(), agent_id: "agent-s".into(), state: "failed".into() }]
+        );
     }
 
     #[tokio::test]
@@ -783,7 +857,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         crate::memory::db::seed_on_disk(dir.path(), None).await;
         let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
-        add_outbox_row(&c, "op-1", &format!("before it was stored: {SECRET}, and more"));
+        add_outbox_row(&c, "op-1", SECRET);
         add_outbox_row(&c, "op-2", "nothing to do with it");
         drop(c);
         let only_in_the_outbox = backup_offline(dir.path()).unwrap();
@@ -795,18 +869,9 @@ mod tests {
 
         let purged = purge(dir.path(), id).unwrap();
 
-        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
-        let left: Vec<String> = c
-            .prepare("SELECT operation_id FROM ingest_outbox ORDER BY id")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        drop(c);
-        assert_eq!(left, ["op-2"]);
+        assert_eq!(outbox_ids(dir.path()), ["op-2"]);
         assert!(!bytes_mention(dir.path(), b"quokka"), "the secret's bytes are still on disk");
-        assert_eq!(purged, Purged { backups: vec![only_in_the_outbox] });
+        assert_eq!(purged.backups, vec![only_in_the_outbox]);
     }
 
     #[tokio::test]
@@ -818,7 +883,8 @@ mod tests {
         crate::memory::db::seed_on_disk(dir.path(), Some(crate::memory::backup::latest_known() - 1)).await;
         std::fs::copy(dir.path().join("memory.db"), &old).unwrap();
 
-        assert!(backups_holding(&backups, 1, SECRET).is_empty());
+        let held = OutboxMatch { agent: Some("agent-s"), content: SECRET, piece: false };
+        assert!(backups_holding(&backups, 1, &held).is_empty());
     }
 
     #[test]
