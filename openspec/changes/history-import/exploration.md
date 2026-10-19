@@ -111,9 +111,9 @@ Son del usuario.
 
 - [ ] **Mapeo de tipos.** ¿La tabla de arriba, o `bugfix` y `pattern` con otro destino?
 - [ ] **Proyecto.** ¿Por `directory` de la sesión, por un mapa de nombres que pasa el usuario, o las dos?
-- [ ] **Agente destino.** ¿Uno fijo (`--agent`, por ejemplo `claude-code`) o uno propio para lo importado?
+- [ ] **Agente destino.** ¿Uno fijo (`--agent`, por ejemplo `claude-code`) o uno propio para lo importado? Cualquiera de los dos, pero nunca vacío: el esquema admite `agent_id` NULL con `scope` `project` o `global` (`crates/clawg-core/migrations/V1__init.sql:31-33`), y una fila sin autor se ve distinto según la lectura. `Reach::Own` no la ve. Con `sharing.json` sin exclusiones el predicado de `search.rs` la deja ver, porque `NULL NOT IN` de una lista vacía es verdadero en SQLite. Con cualquier exclusión, aunque no tenga nada que ver con ella, deja de verse. LAST SESSION, por su parte, nunca admite un autor NULL (`prompt_builder.rs:735`). Hoy ningún camino de producción escribe NULL (todo save usa `scope = 'agent'`).
 - [ ] **Importancia** de lo importado, y si `revision_count` cuenta como uso.
-- [ ] **Zona horaria** de `created_at`. La fuente la escribe con `datetime('now')` de SQLite, que es UTC. Hay que confirmarlo antes de fijarlo.
+- [ ] **Zona horaria** de `created_at`. La fuente la escribe con `datetime('now')` de SQLite, que es UTC. Hay que confirmarlo antes de fijarlo. Equivocarse hacia adelante no es sólo una fecha corrida. Lo importado nace con `last_accessed_at = created_at`, y una edad negativa no se acota en el decaimiento (`crates/clawg-core/src/memory/score.rs:284-286`), así que la fila puntúa por encima de 1. El flush de accesos conserva el valor futuro (`MAX(last_accessed_at, now)`, `crates/clawg-core/src/memory/access.rs:205`). Una fecha posterior a la importación se acota a la hora de importar y se reporta, sea cual sea la zona elegida. El acotado en `score` está en el backlog del README.
 - [ ] **Detector**: ¿se saltea para lo importado?
 - [ ] **Orden respecto de 19 y 24**: ¿se espera a que cierren, o se importa antes con el detector salteado?
 
@@ -128,6 +128,7 @@ Tests RED primero, sobre un export sintético escrito a mano:
 5. Un segundo import no agrega filas ni accesos.
 6. Una `version` desconocida se rechaza sin escribir.
 7. `--dry-run` no escribe nada y su reporte coincide con lo que después se importa.
+8. Una nota con `created_at` posterior al momento de importar queda con la hora de importación y aparece en el reporte; ninguna fila importada queda con `agent_id` NULL.
 
 A mano y con autorización, sobre el perfil `dev`: importar el export real, revisar el reporte y buscar una docena de temas conocidos. Se mide cuánto tarda el re-embebido de todo el volumen con el modelo real. `rag-eval` no aplica al importador. Con 19 y 34 ya cerrados, un corpus con notas importadas puede volverse un subconjunto del golden set versionado de 33, escrito a mano y nunca minado de la base real.
 
