@@ -32,4 +32,4 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 
 ## 6. Archive
 
-- [ ] `specs/storage` con R1 a R5; `git mv` a `changes/archive/AAAA-MM-DD-embedder-recovery`; `state.yaml` archivado; fila 61 y orden de ejecución del `README.md` de openspec; subir el minor.
+- [x] `specs/storage` con R1 a R5 (y `embedder_resident` en `specs/mcp`), las citas de los cuatro archivos tocados realineadas en las specs y el backlog; `git mv` a `changes/archive/2026-10-19-embedder-recovery`; `state.yaml` archivado; fila 61 y orden de ejecución del `README.md` de openspec; subir el minor.

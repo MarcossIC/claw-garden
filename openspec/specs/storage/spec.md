@@ -1,6 +1,6 @@
 # storage — Especificación
 
-Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde queda un save aceptado hasta que termina de guardarse, el apagado del daemon, la reinyección de lo pendiente al arrancar y la importación del volcado de versiones anteriores, la resolución del directorio de datos, el runner de migraciones y la verificación del esquema, el pooling del modelo y el re-embebido de un store CLS al arrancar, la descarga del modelo (la caché, los plazos de red, un hash por archivo fuera de los hilos del runtime y el origen `CLAWG_HF_BASE_URL`), el ciclo de vida del embedder (soltar el modelo ocioso, recargarlo desde la caché y repararla, un solo tokenizer por proceso y la memoria que vuelve al sistema), los snapshots, `clawg backup` y `clawg restore`, la escritura de `workspace.md`, y lo que `clawg status`, MCP y el instalador dicen cuando la base no se puede abrir.
+Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde queda un save aceptado hasta que termina de guardarse, el apagado del daemon, la reinyección de lo pendiente al arrancar y la importación del volcado de versiones anteriores, la resolución del directorio de datos, el runner de migraciones y la verificación del esquema, el pooling del modelo y el re-embebido de un store CLS al arrancar, la descarga del modelo (la caché, los plazos de red, un hash por archivo fuera de los hilos del runtime y el origen `CLAWG_HF_BASE_URL`), el ciclo de vida del embedder (soltar el modelo ocioso, recargarlo desde la caché y repararla, recuperar un hilo de inferencia muerto, un solo tokenizer por proceso y la memoria que vuelve al sistema), los snapshots, `clawg backup` y `clawg restore`, la escritura de `workspace.md`, y lo que `clawg status`, MCP y el instalador dicen cuando la base no se puede abrir.
 
 **Origen:**
 - [data-preservation](../../changes/archive/2026-10-12-data-preservation/proposal.md) (partes A + F), archivado el 2026-10-12.
@@ -12,6 +12,7 @@ Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde q
 - [conflict-candidates](../../changes/archive/2026-10-18-conflict-candidates/proposal.md), archivado el 2026-10-18 (sólo la fila de V15 y «Una base en V14 abre con sus disputas como pares»). La tabla de pares y su conversión están en [`specs/disputes`](../disputes/spec.md).
 - [topic-revisions](../../changes/archive/2026-10-18-topic-revisions/proposal.md), archivado el 2026-10-18 (sólo la fila de V16 y «Una base en V15 abre con sus filas sin clave»). Qué hace un save con clave está en [`specs/ingest`](../ingest/spec.md).
 - [model-download](../../changes/archive/2026-10-19-model-download/proposal.md), archivado el 2026-10-19 (la «Descarga del modelo», y la recarga desde la caché y su reparación en «Recargar a demanda, una sola vez» y «Una recarga que falla no deja nada roto»). Lo que dice el error de una descarga que agota sus intentos está en [`specs/ingest`](../ingest/spec.md), «Estado en `/health` y `clawg status`».
+- [embedder-recovery](../../changes/archive/2026-10-19-embedder-recovery/proposal.md), archivado el 2026-10-19 («Un pánico en la inferencia contesta y suelta la sesión», «Un hilo muerto se recupera en la misma llamada», y el `IdleEmbedder` sin barrido con ocio `0`).
 
 ## Definiciones
 
@@ -90,7 +91,7 @@ Si el handler contesta al que guardó con el fallo (`500` o `503`), MUST borrar 
 
 En un apagado ordenado, cada save aceptado MUST terminar en uno de dos lugares: guardado en la base (o absorbido por el gate de dedup), o en el outbox para el próximo arranque. El apagado MUST seguir drenando hasta `DRAIN_DEADLINE`, MUST NOT escribir `ingest-pending.jsonl` y MUST NOT descartar un save: lo que el worker no empezó queda en su fila.
 
-La decisión de seguir drenando o dejar la cola es pura (`drain_step`, `crates/clawg-core/src/memory/worker.rs:221`; su variante `DrainStep::Spill` conserva el nombre de cuando el apagado volcaba a un archivo). `MemoryRuntime::shutdown` (`crates/clawg-core/src/runtime.rs:261`) espera al worker, y el daemon la llama antes de borrar su estado (`crates/clawg-cli/src/daemon/serve.rs:189`). Sólo un evento encolado sin fila (los caminos en proceso de tests y evaluación) puede quedar sin ingerir, y el apagado lo registra con un warn (`runtime.rs:277`).
+La decisión de seguir drenando o dejar la cola es pura (`drain_step`, `crates/clawg-core/src/memory/worker.rs:221`; su variante `DrainStep::Spill` conserva el nombre de cuando el apagado volcaba a un archivo). `MemoryRuntime::shutdown` (`crates/clawg-core/src/runtime.rs:261`) espera al worker, y el daemon la llama antes de borrar su estado (`crates/clawg-cli/src/daemon/serve.rs:188`). Sólo un evento encolado sin fila (los caminos en proceso de tests y evaluación) puede quedar sin ingerir, y el apagado lo registra con un warn (`runtime.rs:277`).
 
 #### Escenario: embedder listo
 - GIVEN el embedder cargado y 20 saves aceptados
@@ -169,7 +170,7 @@ Después de drenar y del flush del tracker, el apagado SHOULD hacer `PRAGMA wal_
 
 **Test:** `the_drain_deadline_leaves_room_inside_the_stop_timeout` (`stop.rs`).
 
-**Límite conocido:** el plazo acota el apagado ordenado, pero no la vida del proceso. Si el apagado llega mientras carga el modelo, el proceso sigue vivo hasta que esa carga vuelve: corre en `spawn_blocking` (`crates/clawg-core/src/memory/bootstrap.rs:592`), y el runtime de `#[tokio::main]` (`crates/clawg-cli/src/main.rs:47`) espera a esas tareas al soltarse. Los datos ya están a salvo para entonces: lo no ingerido está en el outbox. Está en el backlog de `openspec/README.md`.
+**Límite conocido:** el plazo acota el apagado ordenado, pero no la vida del proceso. Si el apagado llega mientras carga el modelo, el proceso sigue vivo hasta que esa carga vuelve: corre en `spawn_blocking` (`crates/clawg-core/src/memory/bootstrap.rs:593`), y el runtime de `#[tokio::main]` (`crates/clawg-cli/src/main.rs:47`) espera a esas tareas al soltarse. Los datos ya están a salvo para entonces: lo no ingerido está en el outbox. Está en el backlog de `openspec/README.md`.
 
 ## Directorio de datos
 
@@ -299,7 +300,7 @@ El id del modelo en el contrato de embedding MUST ser `multilingual-e5-small/mea
 
 ### Re-embebido de un store CLS al arrancar
 
-Al arrancar, después de cargar el modelo y dentro del bootstrap del embedder, el daemon verifica el contrato (`verify_or_reembed`, `crates/clawg-core/src/memory/bootstrap.rs:494`, cableado por `contract_verifier`, `bootstrap.rs:259`, en `production_deps`, `bootstrap.rs:289`, que `serve_deps`, `bootstrap.rs:373`, entrega al daemon en `crates/clawg-cli/src/daemon/serve.rs:102`). Si el contrato guardado tiene `LEGACY_CLS_MODEL_ID` y el embedder cargado tiene `E5_MODEL_ID`, con la misma dimensión y los mismos prefijos (`is_pooling_upgrade`, `bootstrap.rs:480`, pura), MUST:
+Al arrancar, después de cargar el modelo y dentro del bootstrap del embedder, el daemon verifica el contrato (`verify_or_reembed`, `crates/clawg-core/src/memory/bootstrap.rs:495`, cableado por `contract_verifier`, `bootstrap.rs:259`, en `production_deps`, `bootstrap.rs:289`, que `serve_deps`, `bootstrap.rs:373`, entrega al daemon en `crates/clawg-cli/src/daemon/serve.rs:102`). Si el contrato guardado tiene `LEGACY_CLS_MODEL_ID` y el embedder cargado tiene `E5_MODEL_ID`, con la misma dimensión y los mismos prefijos (`is_pooling_upgrade`, `bootstrap.rs:481`, pura), MUST:
 
 1. escribir un snapshot `pre-reembed` en `<data>/backups`; si falla, no re-embebe, y el intento termina como un fallo de verificación, que se reintenta con la espera de siempre ([`specs/ingest`](../ingest/spec.md), «Reintento del bootstrap»);
 2. re-embeber `memory`, `episodic_trajectory` y `procedural_skill` con el embedder cargado (`reembed_all` en modo `ReInfer`, `crates/clawg-core/src/memory/maintenance.rs:507`);
@@ -391,17 +392,18 @@ Sin la variable, vacía o con sólo espacios, el origen MUST ser `https://huggin
 
 ## Ciclo de vida del embedder
 
-El daemon envuelve el modelo en un `IdleEmbedder` (`crates/clawg-core/src/memory/idle_embedder.rs:154`), que lo suelta tras un tiempo sin uso y lo vuelve a cargar cuando una llamada necesita un vector. Lo arma `unloading_when_idle` (`crates/clawg-core/src/memory/bootstrap.rs:405`), con la lectura de la caché para recargar y la descarga para repararla, cableado en `crates/clawg-cli/src/daemon/serve.rs:115`.
+El daemon envuelve el modelo en un `IdleEmbedder` (`crates/clawg-core/src/memory/idle_embedder.rs:206`), que lo suelta tras un tiempo sin uso y lo vuelve a cargar cuando una llamada necesita un vector, y que recarga también un modelo cuyo hilo de inferencia murió. Lo envuelve siempre, también con `CLAWG_EMBEDDER_IDLE_MINUTES=0`. Lo arma `unloading_when_idle` (`crates/clawg-core/src/memory/bootstrap.rs:406`), con la lectura de la caché para recargar y la descarga para repararla, cableado en `crates/clawg-cli/src/daemon/serve.rs:116`.
 
 **Definiciones:**
-- **Tiempo de ocio:** los minutos de `CLAWG_EMBEDDER_IDLE_MINUTES` (`IDLE_MINUTES_VAR`, `idle_embedder.rs:28`), 10 si falta o está vacía.
+- **Tiempo de ocio:** los minutos de `CLAWG_EMBEDDER_IDLE_MINUTES` (`IDLE_MINUTES_VAR`, `idle_embedder.rs:31`), 10 si falta o está vacía.
 - **Residente:** el modelo está en memoria y una llamada no necesita cargarlo.
 - **Uso:** una llamada de embedding, desde que pide el modelo (incluida su carga) hasta que vuelve.
+- **Hilo muerto:** una llamada al modelo devuelve `EmbedError::WorkerGone` (`crates/clawg-core/src/memory/embedder.rs:191`): el hilo `embedder-worker`, dueño de la sesión, terminó o soltó la petición sin contestarla.
 - **Línea de base:** la memoria privada del mismo build con el embedder falso (`CLAWG_TEST_EMBEDDER=fake`) y sólo `tokenizer.json` en su directorio de datos.
 
 ### Soltar el modelo ocioso
 
-El daemon MUST soltar el modelo cuando pasó el tiempo de ocio desde el último uso y no hay ningún uso en curso (`should_unload`, `idle_embedder.rs:53`, pura). Un uso MUST reiniciar la cuenta. Con `CLAWG_EMBEDDER_IDLE_MINUTES=0` MUST NOT soltarlo nunca. Un valor que no es un número entero de minutos SHOULD avisar en el log y MUST usar 10, sin impedir el arranque. El barrido corre cada cuarto del tiempo de ocio, entre 1 y 60 s (`sweep_period`, `idle_embedder.rs:59`), y termina con el embedder.
+El daemon MUST soltar el modelo cuando pasó el tiempo de ocio desde el último uso y no hay ningún uso en curso (`should_unload`, `idle_embedder.rs:61`, pura). Un uso MUST reiniciar la cuenta. Con `CLAWG_EMBEDDER_IDLE_MINUTES=0` MUST NOT soltarlo nunca: el `IdleEmbedder` se arma sin barrido. Un valor que no es un número entero de minutos SHOULD avisar en el log y MUST usar 10, sin impedir el arranque. El barrido corre cada cuarto del tiempo de ocio, entre 1 y 60 s (`sweep_period`, `idle_embedder.rs:67`), y termina con el embedder.
 
 #### Escenario: se suelta tras el ocio
 - GIVEN un modelo residente con un tiempo de ocio de 10 minutos
@@ -413,7 +415,7 @@ El daemon MUST soltar el modelo cuando pasó el tiempo de ocio desde el último 
 - WHEN se cumple el tiempo de ocio durante la llamada
 - THEN el modelo sigue residente, y la cuenta empieza cuando la llamada vuelve
 
-**Tests:** `a_model_goes_only_after_the_idle_time_with_nothing_in_flight`, `an_unused_model_is_unloaded_after_the_idle_time`, `each_use_restarts_the_idle_time`, `a_call_in_flight_keeps_the_model_past_the_idle_time`, `the_idle_time_defaults_to_ten_minutes_and_zero_keeps_the_model`, `an_idle_time_that_is_not_whole_minutes_is_refused` y `the_sweeper_ends_with_the_embedder` (`idle_embedder.rs`).
+**Tests:** `a_model_goes_only_after_the_idle_time_with_nothing_in_flight`, `an_unused_model_is_unloaded_after_the_idle_time`, `each_use_restarts_the_idle_time`, `a_call_in_flight_keeps_the_model_past_the_idle_time`, `the_idle_time_defaults_to_ten_minutes_and_zero_keeps_the_model`, `an_idle_time_that_is_not_whole_minutes_is_refused`, `with_no_idle_time_the_model_stays_and_a_dead_worker_is_still_recovered` y `the_sweeper_ends_with_the_embedder` (`idle_embedder.rs`).
 
 ### Recargar a demanda, una sola vez
 
@@ -428,7 +430,7 @@ Una llamada con el modelo suelto MUST cargarlo con la misma carga del arranque s
 
 ### Una recarga que falla no deja nada roto
 
-Una recarga cuya caché no pasa (falta un archivo, no se lee o tiene otro SHA-256; `DownloadError::NotCached`, `crates/clawg-core/src/memory/model_download.rs:348`) MUST responder «no listo» (`EmbedError::NotReady`) sin esperar ninguna descarga, y MUST lanzar una reparación: `ensure` en una tarea del runtime, fuera del cerrojo del modelo, salvo que ya haya una en curso, así que hay a lo sumo una a la vez (`repair_in_background`, `bootstrap.rs:449`). La reparación no carga el modelo: la llamada siguiente que encuentre la caché reparada MUST cargarla. Una reparación que falla MUST dejarlo en el log, y la llamada siguiente MAY lanzar otra. Cualquier otra recarga que falla MUST responder «no listo» igual, y la llamada siguiente MUST intentar otra vez. Una recarga que trae otro `model_id` u otra dimensión MUST rechazarse igual: los vectores nuevos no pueden caer en otro espacio que los guardados. El estado del embedder MUST NOT pasar a `failed` por una recarga ni por una reparación.
+Una recarga cuya caché no pasa (falta un archivo, no se lee o tiene otro SHA-256; `DownloadError::NotCached`, `crates/clawg-core/src/memory/model_download.rs:348`) MUST responder «no listo» (`EmbedError::NotReady`) sin esperar ninguna descarga, y MUST lanzar una reparación: `ensure` en una tarea del runtime, fuera del cerrojo del modelo, salvo que ya haya una en curso, así que hay a lo sumo una a la vez (`repair_in_background`, `bootstrap.rs:450`). La reparación no carga el modelo: la llamada siguiente que encuentre la caché reparada MUST cargarla. Una reparación que falla MUST dejarlo en el log, y la llamada siguiente MAY lanzar otra. Cualquier otra recarga que falla MUST responder «no listo» igual, y la llamada siguiente MUST intentar otra vez. Una recarga que trae otro `model_id` u otra dimensión MUST rechazarse igual: los vectores nuevos no pueden caer en otro espacio que los guardados. El estado del embedder MUST NOT pasar a `failed` por una recarga ni por una reparación.
 
 El cerrojo del modelo queda tomado lo que tarda leer y hashear la caché, nunca lo que tarda la red: la lectura recorre los cinco archivos aunque el que no pasa sea chico, así que el «no listo» llega después de hashear el ONNX. Medido el 2026-10-19 con el modelo real, en un build debug en Windows: las dos búsquedas respondieron en 8,7 y 9,2 s, lo que una recarga buena tarda en leer y verificar la caché (9,5 s).
 
@@ -440,6 +442,55 @@ El cerrojo del modelo queda tomado lo que tarda leer y hashear la caché, nunca 
 
 **Tests:** `a_failed_load_is_not_ready_and_the_next_call_tries_again` y `a_model_that_comes_back_as_another_model_is_refused` (`idle_embedder.rs`); `a_reload_with_a_damaged_cache_is_not_ready_and_repairs_it_once_in_the_background` (`bootstrap.rs`); `a_search_whose_model_cannot_load_again_answers_not_ready` (`crates/clawg-cli/tests/api.rs`).
 
+### Un pánico en la inferencia contesta y suelta la sesión
+
+Cuando la inferencia de una petición entra en pánico, el hilo de inferencia (`serve_requests`, `crates/clawg-core/src/memory/embedder.rs:566`, con `catch_unwind`) MUST contestar esa petición con `EmbedError::InferenceFailed`, cuyo texto MUST decir `inference panicked` y la causa del pánico, MUST dejarlo en el log y MUST terminar, soltando la sesión. MUST NOT inferir otra petición con esa sesión. Las peticiones que esperaban en la cola MUST recibir `WorkerGone`. El hilo MUST NOT inferir una petición cuyo llamante ya soltó la respuesta cuando la toma; puede inferir una que se suelta durante la inferencia, a lo sumo un lote por llamante.
+
+No se conoce un camino que haga entrar en pánico a la inferencia (ver [embedder-recovery](../../changes/archive/2026-10-19-embedder-recovery/exploration.md)): este requisito y el siguiente cubren un fallo posible, no uno observado. La llamada que entró en pánico ve el error: un `500` en búsqueda y `recall_context`, y en el ingest un save `failed` con `embed failed: inference panicked: …`.
+
+#### Escenario: la primera petición entra en pánico
+- GIVEN un hilo cuya inferencia entra en pánico
+- WHEN llega una petición
+- THEN su llamante recibe `InferenceFailed` con `inference panicked`
+- AND la petición siguiente recibe `WorkerGone`, y el hilo terminó
+
+#### Escenario: un llamante que se fue
+- GIVEN una petición en cola cuyo llamante se fue y otra cuyo llamante espera
+- WHEN el hilo las toma
+- THEN la inferencia corre una vez, para la segunda
+
+**Tests:** `a_panicking_inference_answers_its_caller_and_ends_the_worker` y `a_request_whose_caller_is_gone_is_not_inferred` (`embedder.rs`).
+
+### Un hilo muerto se recupera en la misma llamada
+
+Cuando el modelo devuelve `WorkerGone`, `IdleEmbedder` (`with_model` y `discard`, `idle_embedder.rs:158` y `:145`) MUST descartarlo, salvo que la celda ya tenga otro modelo (una recuperación concurrente, comparada por `Arc::ptr_eq`), MUST marcarlo no residente y MUST repetir la llamada una vez sobre un modelo cargado con la misma recarga del modelo suelto. Las llamadas que encuentran el mismo hilo muerto a la vez MUST compartir una sola recarga. Si la repetición también encuentra el hilo muerto, la llamada MUST responder `NotReady`. `WorkerGone` MUST NOT salir de `IdleEmbedder`, así que búsqueda y `recall_context` responden el `503 embedder_not_ready` de una recarga que falla, y el ingest deja el save pendiente. Con `CLAWG_EMBEDDER_IDLE_MINUTES=0` vale igual. `embedder` en `/health` MUST seguir en `ready`; `embedder_resident` es `false` mientras el modelo está descartado.
+
+Una recarga que reemplaza un modelo muerto MUST NOT ocurrir menos de `RECOVERY_INTERVAL` (60 s, `idle_embedder.rs:41`) después de la anterior: entretanto el modelo queda descartado y toda llamada MUST responder `NotReady`; la primera llamada pasado el minuto MUST recargar. La primera recuperación MUST NOT esperar. La recarga del modelo soltado por ocio no cuenta y no espera, y una recarga de recuperación que falla no retiene las siguientes: un modelo que muere en cada llamada se lee, se verifica y se arma a lo sumo una vez por minuto, en vez de en cada llamada.
+
+#### Escenario: el hilo murió entre dos llamadas
+- GIVEN un modelo residente cuyo hilo terminó
+- WHEN llega una búsqueda
+- THEN el modelo se recarga una vez y la búsqueda responde
+
+#### Escenario: dos llamadas a la vez
+- GIVEN dos llamadas en curso sobre el mismo modelo cuyo hilo muere
+- WHEN las dos reciben `WorkerGone`
+- THEN el modelo se recarga una vez y las dos responden con el modelo nuevo
+
+#### Escenario: un modelo que muere en cada recarga
+- GIVEN un modelo cuyo hilo muere en cada llamada, también después de recargarlo
+- WHEN llegan llamadas seguidas durante un minuto
+- THEN el modelo se recarga una vez en ese minuto, y las llamadas responden `NotReady`
+- AND la primera llamada pasado el minuto lo recarga otra vez
+
+#### Escenario: ocio `0`
+- GIVEN un `IdleEmbedder` sin tiempo de ocio
+- WHEN pasan horas sin llamadas
+- THEN el modelo sigue residente
+- AND si su hilo muere, la llamada siguiente lo recarga y responde
+
+**Tests:** `a_model_whose_worker_is_gone_is_loaded_again_within_the_call`, `calls_that_find_the_worker_gone_together_share_one_reload`, `a_model_that_keeps_dying_is_reloaded_at_most_once_a_minute` y `with_no_idle_time_the_model_stays_and_a_dead_worker_is_still_recovered` (`idle_embedder.rs`); `without_an_idle_time_the_loaded_model_is_still_wrapped` (`bootstrap.rs`).
+
 ### Las herramientas funcionan con el modelo suelto
 
 Buscar, guardar, restaurar y `recall_context` con el modelo suelto MUST esperar la recarga y responder como con el modelo residente. `embedder` en `/health` MUST seguir en `ready`; si el modelo está en memoria lo dice `embedder_resident` ([`specs/mcp`](../mcp/spec.md), «El modelo en memoria en `/health`»).
@@ -448,7 +499,7 @@ Buscar, guardar, restaurar y `recall_context` con el modelo suelto MUST esperar 
 
 ### Registrar un proyecto despierta el modelo
 
-`POST /v1/projects` MUST empezar a cargar un modelo suelto y MUST responder sin esperar esa carga (`embedder.wake()`, `api.rs:1522`; `wake`, `idle_embedder.rs:236`). Con el modelo residente MUST NOT cargar nada. Un modelo despertado MUST contar como recién usado.
+`POST /v1/projects` MUST empezar a cargar un modelo suelto y MUST responder sin esperar esa carga (`embedder.wake()`, `api.rs:1522`; `wake`, `idle_embedder.rs:287`). Con el modelo residente MUST NOT cargar nada. Un modelo despertado MUST contar como recién usado.
 
 #### Escenario: el puente empieza una sesión
 - GIVEN el modelo suelto
@@ -462,8 +513,8 @@ Buscar, guardar, restaurar y `recall_context` con el modelo suelto MUST esperar 
 Con el modelo suelto, la memoria privada del daemon MUST quedar cerca de la línea de base. En 10 recargas seguidas, la mediana MUST NOT superar la línea de base en más de 64 MB, y la mediana de las recargas 6 a 10 MUST NOT superar la de las recargas 1 a 5 en más de 16 MB. Vale en Windows y en Linux.
 
 En Linux con glibc, dos cosas lo hacen posible:
-- El hilo dueño de la sesión MUST devolver al sistema las páginas libres al soltarla (`return_freed_memory`, `embedder.rs:572`, un `malloc_trim(0)` después de `drop(inference.session)`).
-- `clawg serve` MUST dejar todos sus hilos en una sola arena de `malloc` (`keep_one_malloc_arena`, `embedder.rs:595`, `mallopt(M_ARENA_MAX, 1)`), fijada en `main` antes de construir el runtime de tokio (`crates/clawg-cli/src/main.rs:42-46`), porque glibc le asigna la arena a un hilo en su primera asignación. Los demás comandos no la fijan (`Command::loads_the_model`, `crates/clawg-cli/src/cli.rs:176`, pura). Cada carga arma, usa y suelta la sesión en hilos nuevos para ella; con las arenas por hilo de glibc, cada recarga podía estrenar otra arena, y cada una retenía de 6 a 24 MB después del trim.
+- El hilo dueño de la sesión MUST devolver al sistema las páginas libres al soltarla (`return_freed_memory`, `embedder.rs:603`, un `malloc_trim(0)` después de `drop(inference.session)`).
+- `clawg serve` MUST dejar todos sus hilos en una sola arena de `malloc` (`keep_one_malloc_arena`, `embedder.rs:626`, `mallopt(M_ARENA_MAX, 1)`), fijada en `main` antes de construir el runtime de tokio (`crates/clawg-cli/src/main.rs:42-46`), porque glibc le asigna la arena a un hilo en su primera asignación. Los demás comandos no la fijan (`Command::loads_the_model`, `crates/clawg-cli/src/cli.rs:176`, pura). Cada carga arma, usa y suelta la sesión en hilos nuevos para ella; con las arenas por hilo de glibc, cada recarga podía estrenar otra arena, y cada una retenía de 6 a 24 MB después del trim.
 
 #### Escenario: diez recargas
 - GIVEN `CLAWG_EMBEDDER_IDLE_MINUTES=1` y la línea de base medida en el mismo build

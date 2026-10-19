@@ -381,7 +381,7 @@ Cuando un archivo del modelo agota sus intentos, el error MUST nombrar el archiv
 
 Un bootstrap que falla por descarga, carga o verificación del contrato (error al leer la base) MUST reintentarse. Un contrato que no coincide MUST NOT reintentarse (`classify`, `bootstrap.rs:70`). Un `CLAWG_HF_BASE_URL` inválido es un error de descarga y se reintenta igual: el bootstrap no distingue configuración de red, y mientras tanto `embedder_error` dice qué corregir ([`specs/storage`](../storage/spec.md), «El origen: `CLAWG_HF_BASE_URL`»).
 
-La espera tras el intento fallido `n` (1, 2, …) MUST ser `min(30 s · 2^(n-1), 30 min)`, con saturación para no desbordar (`retry_delay`, `bootstrap.rs:88`). No hay tope de intentos. Durante la espera el estado es `failed` con `retryable: true`; durante un intento es `loading`. El bucle es `run_embedder_bootstrap_with_retry` (`bootstrap.rs:689`), que el daemon lanza con `tokio::time::sleep` (`crates/clawg-cli/src/daemon/serve.rs:133`); `classify` y `retry_delay` son funciones puras y la espera se inyecta, así que los tests corren sin dormir.
+La espera tras el intento fallido `n` (1, 2, …) MUST ser `min(30 s · 2^(n-1), 30 min)`, con saturación para no desbordar (`retry_delay`, `bootstrap.rs:88`). No hay tope de intentos. Durante la espera el estado es `failed` con `retryable: true`; durante un intento es `loading`. El bucle es `run_embedder_bootstrap_with_retry` (`bootstrap.rs:690`), que el daemon lanza con `tokio::time::sleep` (`crates/clawg-cli/src/daemon/serve.rs:132`); `classify` y `retry_delay` son funciones puras y la espera se inyecta, así que los tests corren sin dormir.
 
 #### Escenario: se recupera
 - GIVEN un `ensure` falso que falla la primera vez y funciona la segunda

@@ -214,7 +214,7 @@ El texto de `ClientError::Unauthorized` de la CLI (`crates/clawg-cli/src/client.
 
 ## El modelo en memoria en `/health`
 
-`GET /health` MUST incluir `embedder_resident` (`Health`, `crates/clawg-cli/src/daemon/api.rs:494`, que lo lee de `Embedder::resident` en `api.rs:920`): `true` con el modelo en memoria, `false` cuando el daemon lo soltó por ocio y la próxima llamada que necesite un vector espera que vuelva a cargar, y `null` antes de la primera carga. `embedder` sigue en `ready` con el modelo suelto ([`specs/storage`](../storage/spec.md), «Ciclo de vida del embedder»). El cliente MUST leer un `/health` sin el campo, el de un daemon anterior, como `None` (`client.rs:134`, `#[serde(default)]`). `memory_status` lo muestra porque imprime el `Health` entero.
+`GET /health` MUST incluir `embedder_resident` (`Health`, `crates/clawg-cli/src/daemon/api.rs:494`, que lo lee de `Embedder::resident` en `api.rs:920`): `true` con el modelo en memoria, `false` cuando el daemon lo soltó por ocio, o lo descartó porque su hilo de inferencia murió, y la próxima llamada que necesite un vector espera que vuelva a cargar, y `null` antes de la primera carga. `embedder` sigue en `ready` con el modelo suelto ([`specs/storage`](../storage/spec.md), «Ciclo de vida del embedder»). El cliente MUST leer un `/health` sin el campo, el de un daemon anterior, como `None` (`client.rs:134`, `#[serde(default)]`). `memory_status` lo muestra porque imprime el `Health` entero.
 
 #### Escenario: el modelo suelto
 - GIVEN un daemon con el modelo cargado una vez y soltado por ocio
