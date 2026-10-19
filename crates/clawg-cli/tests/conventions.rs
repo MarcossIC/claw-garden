@@ -547,12 +547,41 @@ fn the_ci_workflow_ignores_only_non_code_paths_and_runs_on_both_platforms() {
     assert!(has("branches: [main]"), "the push trigger is main");
     assert!(has("os: [ubuntu-latest, windows-latest]"), "both platforms run");
     assert!(has("fail-fast: false"), "one platform failing must not stop the other");
-    assert!(has("- run: cargo clippy --workspace --all-targets -- -A clippy::all -D warnings"));
-    assert!(has("- run: cargo test --workspace"));
+    assert!(has("- run: cargo clippy --locked --workspace --all-targets -- -A clippy::all -D warnings"));
+    assert!(has("- run: cargo test --locked --workspace"));
 
     // CI is the only trigger of the release and must never hold its secrets.
     for forbidden in ["secrets.", "environment:", "id-token", "contents: write"] {
         assert!(!lines.iter().any(|l| l.contains(forbidden)), "ci.yml must not use `{forbidden}`");
+    }
+}
+
+/// The command of every `run:` step of a job, single-line ones only.
+fn run_commands(job: &Job) -> Vec<String> {
+    job.steps()
+        .iter()
+        .flat_map(|step| step.iter())
+        .filter_map(|l| {
+            let l = l.trim().trim_start_matches("- ");
+            l.strip_prefix("run: ").map(|c| c.trim().to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn the_ci_workflow_checks_the_locked_production_build() {
+    let lines = workflow_code("ci.yml");
+    let jobs = jobs_of(&lines);
+    let commands = run_commands(job(&jobs, "test"));
+
+    // A Cargo.lock that trails Cargo.toml must fail here, not in release.yml.
+    for command in commands.iter().filter(|c| c.starts_with("cargo ")) {
+        assert!(command.contains(" --locked"), "ci.yml runs `{command}` without --locked");
+    }
+    // Without --all-targets no dev-dependency, and so no `testing`, reaches
+    // clawg-core: the configuration release.yml builds.
+    for wanted in ["cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings", "cargo test --locked -p clawg-core --lib build_info"] {
+        assert!(commands.iter().any(|c| c == wanted), "ci.yml lacks `{wanted}`: {commands:?}");
     }
 }
 
