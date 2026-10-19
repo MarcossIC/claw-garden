@@ -43,9 +43,15 @@ Cada tarea es un commit atómico: primero el test que falla, después el código
 - [x] `a_stale_vector_does_not_stop_a_restore` deja en la fila un vector distinto del que da el embedder, como lo dejaría un modelo anterior, y prueba que el restore lo reemplaza.
 - Commit: `test(core): restore over a vector an earlier model wrote`
 
+## 8. Una pieza de un save con clave (hallazgo de la verificación)
+
+- [x] Tests en `admin.rs`: `a_piece_of_a_keyed_save_is_restored_beside_its_live_siblings`, `a_whole_keyed_save_is_restored_piece_by_piece`, `a_live_row_of_another_save_blocks_the_restore_of_a_piece`.
+- [x] `RESTORE_TOPIC_HOLDER` deja afuera las piezas del mismo save; los comentarios de `restore_memory_core` y `RestoredRow` dicen lo que hace el código.
+- Commit: `fix(core): restore a piece of a keyed save beside its live siblings`
+
 ## Verify
 
 - [x] `cargo test --workspace` en Linux en cada commit, contra la base: sin fallas nuevas ([`verify.md`](verify.md#linux)).
-- [ ] `cargo test --workspace --target-dir <otro-dir>` en Windows.
-- [ ] `rag-eval --real --diff` contra el baseline: se espera diff vacío (con el modelo real y el golden set local, `docs/eval/golden.json`, fuera de git).
-- [ ] Prueba manual con el perfil dev: borrar y restaurar desde Claude Code, listar con `clawg memories list --deleted`, restaurar con `clawg undelete`, intentar restaurar una de otro agente.
+- [x] `cargo test --workspace --target-dir target-test` en Windows ([`verify.md`](verify.md#windows)).
+- [x] `rag-eval --real --diff` contra el baseline: diff vacío, con el modelo real y el golden set local, `docs/eval/golden.json`, fuera de git ([`verify.md`](verify.md#rag-eval)).
+- [x] Prueba manual con el perfil dev por el puente MCP real: borrar y restaurar, listar con `clawg memories list --deleted`, restaurar con `clawg undelete`, intentar restaurar una de otro agente, la gemela viva y un save largo con clave ([`verify.md`](verify.md#perfil-dev-2026-10-18)).

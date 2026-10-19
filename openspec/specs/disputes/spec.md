@@ -130,9 +130,9 @@ Juzgar un par enlazado con `conflicts` MUST hacer que la fila más nueva nombre 
 
 Cuando una fila X se borra (`delete_memory_core`, `crates/clawg-core/src/memory/admin.rs:302`) o pasa a `superseded`, toda fila `disputed` cuyo `disputed_against` nombra a X MUST volver a su estado de reposo en la misma transacción (`release_challengers`, `dispute.rs:191`). Pasa a `superseded` por un juicio (R1) o porque un save con la misma `topic_key` la reemplaza ([`specs/ingest`](../ingest/spec.md), «Un save con clave reemplaza la fila viva de su clave»): en los dos casos se liberan sus retadoras. `disputed_against` MAY seguir nombrando a X; X ya no cuenta porque no está viva. Borrar MUST NOT tocar los pares de X.
 
-Restaurar X (`restore_memory_core`, `admin.rs:436`) MUST llevar a su estado de reposo a X y a toda fila cuyo `disputed_against` la nombra (`admin.rs:508-509`): el par escalado vuelve con ella.
+Restaurar X (`restore_memory_core`, `admin.rs:439`; el resto del restore está en [`specs/restore`](../restore/spec.md)) MUST llevar a su estado de reposo a X y a toda fila cuyo `disputed_against` la nombra (`settle_row` y `settle_challengers`, `dispute.rs:207` y `dispute.rs:200`, llamadas en `admin.rs:511-512`): el par escalado vuelve con ella.
 
-Restaurar una fila borrada que tenía `topic_key` MUST fallar sin cambiar nada cuando el alcance de su clave ya tiene otra fila viva (`RESTORE_TOPIC_HOLDER`, `admin.rs:411`; `RestoreError::TopicTaken`, `admin.rs:370`). El error MUST nombrar la clave y la fila que la tiene, y la fila restaurada se queda borrada: restaurarla dejaría dos versiones vivas de un tema que una revisión mantiene en una. `POST /v1/memories/memory/{id}/restore` MUST responder `409` (`restore_memory`, `crates/clawg-cli/src/daemon/api.rs:1254`), como con un gemelo vivo o un secreto.
+Restaurar una fila borrada que tenía `topic_key` MUST fallar sin cambiar nada cuando el alcance de su clave ya tiene una fila viva de otro save (las demás piezas de su propio save no cuentan) (`RESTORE_TOPIC_HOLDER`, `admin.rs:412`; `RestoreError::TopicTaken`, `admin.rs:370`). El error MUST nombrar la clave y la fila que la tiene, y la fila restaurada se queda borrada: restaurarla dejaría dos versiones vivas de un tema que una revisión mantiene en una. `POST /v1/memories/memory/{id}/restore` MUST responder `409` (`restore_memory`, `crates/clawg-cli/src/daemon/api.rs:1251`, el brazo del `409` en `api.rs:1265`), como con un gemelo vivo o un secreto.
 
 Purgar X (`purge`, `crates/clawg-core/src/memory/secrets.rs:82`) MUST borrar los pares que la nombran (`secrets.rs:109`).
 
@@ -176,11 +176,11 @@ Cubre las huérfanas que dejaron las versiones que borraban sin liberar. La mism
 
 Detrás del token, sobre filas de `memory` (rutas en `crates/clawg-cli/src/daemon/api.rs:718-720`):
 
-- `POST /v1/disputes/judge` MUST aceptar `{"keep": <id>, "other": <id>, "verdict": "supersedes" | "compatible" | "scoped" | "conflicts", "reason": <opcional>, "agent_id": <opcional>}` (`judge_dispute`, `api.rs:1285`).
+- `POST /v1/disputes/judge` MUST aceptar `{"keep": <id>, "other": <id>, "verdict": "supersedes" | "compatible" | "scoped" | "conflicts", "reason": <opcional>, "agent_id": <opcional>}` (`judge_dispute`, `api.rs:1296`).
 - `POST /v1/disputes/resolve` MUST seguir aceptando `{"keep", "other", "keep_both": <bool, opcional, false por defecto>, "agent_id"}` para los puentes anteriores, y guardar `compatible` (con `keep_both`) o `supersedes` (`resolve_dispute_core`, `dispute.rs:289`).
 - `GET /v1/disputes?agent_id=` MUST devolver `{pending, escalated, pairs}`: los conteos de pares abiertos entre filas vivas del agente y hasta 5 pares pendientes (`OPEN_PAIRS_SHOWN`, `api.rs:702`), los más viejos primero (`open_pairs`, `dispute.rs:425`), cada lado con la marca de su origen (P4 de [`specs/provenance`](../provenance/spec.md)).
 
-Las dos rutas de veredicto responden igual (`resolve_error`, `api.rs:1263`):
+Las dos rutas de veredicto responden igual (`resolve_error`, `api.rs:1274`):
 
 | Caso | Respuesta |
 |---|---|

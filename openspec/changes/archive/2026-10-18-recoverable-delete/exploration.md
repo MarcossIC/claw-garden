@@ -12,7 +12,7 @@ Revisada contra `main` (9aa1012), después de que se archivaran long-save-contex
 
 | Lo de abajo | Hoy |
 |---|---|
-| "Un chunk es una fila. Restaurar no re-trocea nada: es una fila, un texto, un vector" | Sigue siendo una fila, pero un pedazo de un save largo se embebió detrás de la cabecera del save, guardada en `memory_piece.context` (V11, [`specs/pieces`](../../specs/pieces/spec.md)). Restaurarlo tiene que usar ese texto, como el re-embed (`maintenance.rs:635-652`). `read_memory` nombra el pedazo borrado como faltante. |
+| "Un chunk es una fila. Restaurar no re-trocea nada: es una fila, un texto, un vector" | Sigue siendo una fila, pero un pedazo de un save largo se embebió detrás de la cabecera del save, guardada en `memory_piece.context` (V11, [`specs/pieces`](../../../specs/pieces/spec.md)). Restaurarlo tiene que usar ese texto, como el re-embed (`maintenance.rs:635-652`). `read_memory` nombra el pedazo borrado como faltante. |
 | Nueve herramientas MCP (`server.rs:1361`) | Son once (`read_memory` y `search_project` se sumaron): `restore_memory` sería la duodécima (`server.rs:1520`, `handshake.rs:442`). |
 | Conflicto 9: "¿el id purgado se reusa?" | **Resuelto:** `specs/synthesis` R6 ya dice que no se vuelve a usar, por `AUTOINCREMENT`. |
 | Conflicto 5: `superseded` | Sigue, y ahora es real: `resolve_conflict` escribe `superseded` (`dispute.rs:192`). |
@@ -188,7 +188,7 @@ Son del usuario.
 - [ ] **Filas `superseded`.** ¿Se restauran y se avisa que siguen reemplazadas, o se rechazan?
 - [ ] **Recencia y tier.** ¿Se conservan `last_accessed_at` y tier, o el restore cuenta como acceso (`last_accessed_at = ahora`)? Sin eso, una fila restaurada hace meses puede quedar viva e inalcanzable.
 - [ ] **Descubrimiento por MCP.** ¿`list_memories` aprende `deleted`, o el agente se limita a ids que ya tiene? Mientras se mantenga el test de los cinco argumentos, la respuesta por defecto es no.
-- [ ] **Scope.** Con scope (MCP, `?agent=`), ¿sólo las propias, como `delete_memory`? agent-sharing ya decidió quién modifica filas compartidas: sólo su autor; para los demás son de sólo lectura ([`specs/sharing`](../../specs/sharing/spec.md), R5).
+- [ ] **Scope.** Con scope (MCP, `?agent=`), ¿sólo las propias, como `delete_memory`? agent-sharing ya decidió quién modifica filas compartidas: sólo su autor; para los demás son de sólo lectura ([`specs/sharing`](../../../specs/sharing/spec.md), R5).
 - [ ] **Papelera con retención.** Hoy una borrada se queda para siempre salvo `purge`. ¿Se queda así (recomendado: la purga ya existe y borrar datos solos viola la regla de no destruir la base del usuario), o se agrega un vaciado automático?
 - [ ] **Borrado por proyecto.** ¿Cambio aparte, después de éste, sólo CLI?
 

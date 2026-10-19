@@ -8,7 +8,7 @@
 
 - **Borrada:** una fila de `memory` con `deleted_at` no nulo, todavía en la tabla. Una fila purgada (`clawg purge`) ya no está y no es una borrada.
 - **Restaurar:** volver a dejar viva una borrada, con el mismo id.
-- **Texto de embedding de una fila:** su `content`, o la cabecera de su vínculo de pedazo, el separador y su `content` cuando el vínculo tiene contexto (`embedding_text`, `crates/clawg-core/src/memory/chunker/mod.rs:48`). Es el mismo que usa el re-embed ([`specs/pieces`](../../specs/pieces/spec.md) R7).
+- **Texto de embedding de una fila:** su `content`, o la cabecera de su vínculo de pedazo, el separador y su `content` cuando el vínculo tiene contexto (`embedding_text`, `crates/clawg-core/src/memory/chunker/mod.rs:48`). Es el mismo que usa el re-embed ([`specs/pieces`](../../../specs/pieces/spec.md) R7).
 - **Gemela viva:** una fila viva de `memory`, con `status` `active` o `disputed`, del mismo agente, el mismo proyecto (`COALESCE(project_id, '')`) y el mismo `content_hash` no nulo. Es la que encontraría el dedup del save (`REINFORCE_LOOKUP_SQL`, `crates/clawg-core/src/memory/store_insert.rs:236-243`).
 
 ## R1. Qué se restaura
@@ -41,7 +41,7 @@ Un restore aceptado MUST, en una sola transacción, y sólo si la fila sigue bor
 - poner `deleted_at = NULL`, `last_modified_at` en ahora y sumar 1 a `update_count`;
 - borrar cualquier vector que la fila todavía tenga y escribir el nuevo (un delete de antes de la poda en línea puede haber dejado uno, `sweep_orphaned_vectors`, `crates/clawg-core/src/memory/maintenance.rs:170`);
 - sumar su entrada en `memory_fts` exactamente una vez;
-- recalcular su estado de reposo si no es `superseded`: `disputed` sólo si `disputed_against` nombra una fila viva, `active` si no ([`specs/disputes`](../../specs/disputes/spec.md) R4).
+- recalcular su estado de reposo si no es `superseded`: `disputed` sólo si `disputed_against` nombra una fila viva, `active` si no ([`specs/disputes`](../../../specs/disputes/spec.md) R4).
 
 MUST NOT cambiar `content`, `content_hash`, `importance`, `tier`, `memory_type`, `access_count`, `last_accessed_at`, `superseded_by`, `memory_derivation` ni `memory_piece`, ni ninguna otra fila. MUST NOT volver a disputar las filas que se liberaron al borrarla.
 
@@ -68,7 +68,7 @@ Devuelve el id, el `status` y el `superseded_by` con que quedó la fila.
 
 - Un pedazo de un save largo restaurado MUST embeberse con el contexto de su vínculo, y `read_memory` sobre el save MUST dejar de nombrarlo como faltante.
 - Un restore MUST usar el embedder vigente: una fila borrada antes de un re-embed con otro modelo vuelve con un vector del modelo de hoy, nunca con uno viejo.
-- Una conclusión restaurada MUST volver a cubrir a sus fuentes, y una fuente restaurada MUST quedar pendiente o cubierta según haya una conclusión viva ([`specs/synthesis`](../../specs/synthesis/spec.md) R6). No hace falta código: la síntesis mira `deleted_at`.
+- Una conclusión restaurada MUST volver a cubrir a sus fuentes, y una fuente restaurada MUST quedar pendiente o cubierta según haya una conclusión viva ([`specs/synthesis`](../../../specs/synthesis/spec.md) R6). No hace falta código: la síntesis mira `deleted_at`.
 
 #### Escenario: un pedazo
 - GIVEN un save de tres pedazos con el segundo borrado

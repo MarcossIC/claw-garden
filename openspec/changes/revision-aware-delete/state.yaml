@@ -1,0 +1,14 @@
+change: revision-aware-delete
+objective: "1"
+depends_on: [recoverable-delete, conflict-candidates, topic-revisions]
+phase: explore
+artifacts:
+  exploration: done
+  proposal: pending
+  spec: pending
+  design: pending
+  tasks: pending
+  apply: pending
+  verify: pending
+  archive: pending
+updated: 2026-10-18
