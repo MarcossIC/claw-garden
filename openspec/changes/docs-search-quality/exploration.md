@@ -133,7 +133,11 @@ Un modelo pequeño que reordene los 20 primeros con un presupuesto de latencia (
 
 El verify midió e5-base int8 con mean y léxico filtrado: Hit@3 0,40 al doble del costo; e5-large int8 sólo vectores: Hit@3 0,40 con 745 s para embeber (`verify.md:67-68`). Es el mismo 0,40 que da el modelo actual con el léxico arreglado, a más costo. Cambiar de modelo es un cambio del contrato de embedding que alcanza a las memorias (17, model-reembed) y no tiene urgencia (`openspec/README.md`, fila 17). No hay ninguna medición en este repo de un modelo orientado a código.
 
-**Recomendación:** 1, 2 y 3 en ese orden, cada uno con su medición. El 4 se **prueba** en un worktree y se productiviza sólo si gana por un margen pre-comprometido. El 5 queda condicionado a lo que dejen los anteriores. 6 y 7 fuera.
+### 8. Un piso de relevancia para lo que se muestra
+
+`fuse` (`mod.rs:247-258`) devuelve siempre `limit` pasajes, aunque la pregunta no tenga nada que ver con el proyecto, y la `score` que ve el modelo es la suma de recíprocos de RRF (`mod.rs:251`), que con `RRF_K` = 60 (`mod.rs:42`) es como mucho 2/61 (unos 0,033) y no dice nada en términos absolutos. La búsqueda de memorias sí se abstiene: corta por `RELEVANCE_RATIO` y no muestra un hit de puntaje 0 (`openspec/specs/retrieval/spec.md`; `openspec/changes/archive/2026-10-18-search-abstention/`), pero ese corte no se aplica a `search_project`. Hay dos formas baratas: llevar en cada hit el coseno del canal denso y no mostrar lo que queda bajo el `cosine_floor` de las memorias, o exigir que un pasaje de rango bajo aparezca en los dos canales. Cualquiera de las dos cambia lo que ve el modelo, así que se mide con preguntas sin respuesta en el set de docs (hoy no tiene ninguna) y no mueve Hit@3 en las que sí la tienen.
+
+**Recomendación:** 1, 2 y 3 en ese orden, cada uno con su medición. El 4 se **prueba** en un worktree y se productiviza sólo si gana por un margen pre-comprometido. El 5 queda condicionado a lo que dejen los anteriores. 6 y 7 fuera. El 8 va después de 2, porque el canal léxico filtrado cambia qué pasajes aparecen en los dos canales, y necesita preguntas sin respuesta en el golden set de docs.
 
 ## Contrato del índice de docs
 
@@ -169,6 +173,7 @@ Reglas de `config.yaml` que aplican: un cambio del contrato de embedding lleva u
 4. `docs_contract` y el test de reindexado con una huella vieja.
 5. (Condicional) rol o prefijo propio del índice de docs, si el experimento del paso 4 gana.
 6. Actualizar `specs/project-docs` (búsqueda y límites conocidos, que hoy dicen que filtrar las vacías «no cambia este contrato») y `specs/eval`, y reportar las mediciones antes y después.
+7. (Condicional) el piso de relevancia del paso 8, con preguntas sin respuesta en el golden set de docs.
 
 ### No-alcance
 
@@ -192,6 +197,7 @@ Son del usuario.
 - [ ] **Prefijo de docs.** ¿Se prueba en un worktree y se productiviza sólo si gana por un margen fijado de antemano, o se descarta el paso?
 - [ ] **Listas de palabras vacías.** ¿Quién las mantiene y dónde viven? Una constante en `project_docs` es lo más simple.
 - [ ] **Reranker.** ¿Descartado en este cambio y reabierto sólo con una medición que cumpla la latencia?
+- [ ] **Piso de relevancia.** ¿Coseno del canal denso contra el mismo `cosine_floor` de las memorias (un número calibrado sobre otro corpus), presencia en los dos canales para los rangos bajos, o ninguno hasta tener preguntas sin respuesta en el set de docs?
 
 ## Cómo se mide
 
