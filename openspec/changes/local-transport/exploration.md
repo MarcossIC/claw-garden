@@ -61,7 +61,7 @@ Un daemon que sólo escucha en el socket deja sin daemon a dos clientes que son 
 
 1. **Regla permanente:** `--port` explícito enciende TCP además del socket, y `daemon.json` lleva `port`. Así cualquier actualizador anterior, de cualquier versión, puede instalar y vigilar a cualquier versión nueva.
 2. **Versión de transición:** sin `--port`, el daemon escucha en el socket **y** en el puerto del perfil, y publica los dos; los clientes nuevos van por el socket y los anteriores por TCP. **El `bind` del puerto por defecto no es fatal en esta versión:** si falla (otro usuario, otro programa en el puerto), el daemon lo registra, sigue sólo con el socket y no publica `port`. Si fuera fatal, el choque entre usuarios seguiría abierto durante toda la transición. Con `--port` explícito, fallar sí es fatal, como hoy.
-3. **Una minor después:** sin `--port`, sólo socket; `port` sale de `daemon.json`. Un puente anterior que siga abierto falla como hoy cuando no hay daemon, hasta que se reinicie el editor; los clientes de vida corta (hooks, CLI) ya son nuevos. Al arrancar con TCP, un `warn` dice que está abierto y por qué.
+3. **Una minor después:** sin `--port`, sólo socket; `port` sale de `daemon.json`. Un puente anterior que siga abierto falla como hoy cuando no hay daemon, hasta que se reinicie el editor; los clientes de vida corta (hooks, CLI) ya son nuevos. Al arrancar con TCP, un `warn` dice que está abierto y por qué. Para depurar en Unix no hace falta TCP: `curl --unix-socket <data>/clawg.sock http://localhost/health` (curl 7.40.0 o posterior).
 
 **`update` y TCP.** Todo actualizador anterior pasa `--port` (`effects.rs:163`, `:341`), así que con la regla 1 cada daemon que lance tendrá TCP encendido. Si además el actualizador nuevo copiara el puerto del daemon viejo al nuevo, TCP quedaría encendido de actualización en actualización, sin que nadie lo haya pedido. Opciones:
 
@@ -98,6 +98,7 @@ Se conserva en todos los transportes. Sobre el socket no agrega seguridad (sólo
 - **release-and-self-update (47, archivado).** La regla del `--port` explícito y lo que hace `update` con TCP se escriben en `openspec/specs/self-update/spec.md`.
 - **doctor-checks (31).** Puede informar el modo del directorio y el largo de la ruta del socket frente al tope.
 - **Backlog «El daemon no pone tope a una conexión».** Con este cambio sólo aplica al modo TCP y al mismo usuario; baja de prioridad.
+- **El sandbox de Bash de Claude Code.** Cubre sólo los comandos de shell; los servidores MCP y los hooks corren fuera de él (documentación de Claude Code, *Configure the sandboxed Bash tool*, consultada 2026-10-19), así que el puente y los hooks no cambian. Lo que cambia es un `clawg memories` que el agente corra por Bash dentro del sandbox: hoy en Linux no llega al daemon, porque el `localhost` del comando es privado y `allowLocalBinding` no tiene efecto ahí, y en macOS necesita `allowLocalBinding`, que abre todo el `localhost` de la máquina. Con el socket, en macOS alcanza `network.allowUnixSockets` con su ruta, que la documentación describe sólo para macOS; en Linux los sockets Unix sólo se bloquean con el filtro seccomp opcional, y para abrirlos no hay una regla por ruta (`allowAllUnixSockets` los abre todos). Nada de esto se probó.
 - **Specs y documentación a reescribir al archivar:** `specs/daemon-access` (el párrafo `Límite`, R3 «los clientes de hoy pasan», R5 y requisitos nuevos: el socket con chequeo de uid, el huérfano borrado sólo con el candado, TCP sólo con `--port`), `specs/install` (sale el «Límite conocido»), `specs/mcp` (la reconexión habla de «token nuevo, puerto nuevo», `openspec/specs/mcp/spec.md:116`), `specs/self-update`, `.claude/CLAUDE.md` (perfiles, `serve --port`, la API) y `README.md` (`:456`, `:486`).
 
 ## Alcance candidato
@@ -108,7 +109,7 @@ Se conserva en todos los transportes. Sobre el socket no agrega seguridad (sólo
 4. `endpoint` pura y `from_data_dir` con `unix_socket` y `http://localhost`, sin caída a TCP.
 5. `update`: `Running.port` opcional y el daemon nuevo arrancado según la decisión de arriba.
 6. Un campo nuevo del sello de `testing` (por ejemplo `transport: "tcp"`) que hace que una copia del binario se comporte como un clawg anterior: sólo TCP y `daemon.json` sin el campo nuevo.
-7. Escenarios de `binary.rs` (sección siguiente).
+7. Escenarios de `binary.rs` (sección siguiente). Los ayudantes que hoy leen `port` de `daemon.json` (`answering`, `crates/clawg-cli/tests/binary.rs:188-208`; `:303`; `published_health`, `:1026`; `published_send`, `:1060`) necesitan una variante por el socket; los escenarios que pasan `--port 0` siguen en TCP sin cambios.
 8. Specs y documentación (Interacciones).
 9. La minor siguiente: TCP sólo con `--port`, `port` fuera de `daemon.json` cuando TCP está apagado, el `warn` al arrancar con TCP.
 
