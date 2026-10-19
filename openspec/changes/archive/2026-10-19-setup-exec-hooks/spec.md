@@ -1,6 +1,6 @@
 # setup-exec-hooks — Especificación
 
-Modifica [`specs/setup`](../../specs/setup/spec.md): la definición de hook de clawg, R3, R6 y R7. Agrega R8 (`clawg` sin subcomando).
+Modifica [`specs/setup`](../../../specs/setup/spec.md): la definición de hook de clawg, R3, R6 y R7. Agrega R8 (`clawg` sin subcomando).
 
 ## Definiciones
 
