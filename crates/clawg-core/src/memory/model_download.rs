@@ -319,12 +319,6 @@ pub enum DownloadProgress {
 pub enum DownloadError {
     #[error("insufficient disk space: {free_mb} MB free, {required_mb} MB required")]
     InsufficientDisk { free_mb: u64, required_mb: u64 },
-    #[error("http error for {file}: {source}")]
-    Http {
-        file: String,
-        #[source]
-        source: reqwest::Error,
-    },
     #[error("could not build the HTTP client for the model download: {0}")]
     Client(#[source] reqwest::Error),
     #[error("sha-256 mismatch for {file}: expected {expected}, got {actual}")]
@@ -333,8 +327,8 @@ pub enum DownloadError {
         expected: String,
         actual: String,
     },
-    #[error("retry budget exhausted for {file} after {attempts} attempts")]
-    RetryExhausted { file: String, attempts: u32 },
+    #[error("retry budget exhausted for {file} from {host} after {attempts} attempts: {cause}")]
+    RetryExhausted { file: String, host: String, attempts: u32, cause: String },
     #[error("io error for {file}: {source}")]
     Io {
         file: String,
@@ -623,8 +617,16 @@ async fn download_one(
     let partial = partial_path_for(&target);
 
     const ATTEMPTS: u32 = 3;
+    let host = host_of(base_url_str);
+    let mut cause = String::new();
 
     for attempt in 0..ATTEMPTS {
+        if !cause.is_empty() {
+            log::warn!(
+                "model download of {} from {host} failed on attempt {attempt} of {ATTEMPTS}: {cause}",
+                spec.path
+            );
+        }
         if attempt > 0 {
             // Backoff before retry; ZeroBackoff makes this instant in tests.
             backoff.sleep_for_attempt(attempt - 1).await;
@@ -645,13 +647,15 @@ async fn download_one(
         let url = format!("{base_url_str}/{}", spec.path);
         let resp = match client.get(&url).send().await {
             Ok(r) => r,
-            Err(_) => {
+            Err(e) => {
                 let _ = std::fs::remove_file(&partial);
+                cause = describe(e);
                 continue;
             }
         };
         if !resp.status().is_success() {
             let _ = std::fs::remove_file(&partial);
+            cause = format!("HTTP {}", resp.status());
             continue;
         }
 
@@ -664,7 +668,7 @@ async fn download_one(
 
         let mut stream = resp.bytes_stream();
         let mut io_err: Option<DownloadError> = None;
-        let mut had_http_err = false;
+        let mut stream_err: Option<reqwest::Error> = None;
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
@@ -687,8 +691,8 @@ async fn download_one(
                         }
                     }
                 }
-                Err(_) => {
-                    had_http_err = true;
+                Err(e) => {
+                    stream_err = Some(e);
                     break;
                 }
             }
@@ -699,8 +703,9 @@ async fn download_one(
             let _ = std::fs::remove_file(&partial);
             return Err(e);
         }
-        if had_http_err {
+        if let Some(e) = stream_err {
             let _ = std::fs::remove_file(&partial);
+            cause = describe(e);
             continue;
         }
 
@@ -762,10 +767,42 @@ async fn download_one(
         return Ok(());
     }
 
+    log::warn!("model download of {} from {host} failed on attempt {ATTEMPTS} of {ATTEMPTS}: {cause}", spec.path);
     Err(DownloadError::RetryExhausted {
         file: spec.path.into(),
+        host,
         attempts: ATTEMPTS,
+        cause,
     })
+}
+
+/// The host and port of `base_url`, without the path or any credentials it
+/// carries: what an error may show of the origin.
+fn host_of(base_url: &str) -> String {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| {
+            let host = url.host_str()?.to_string();
+            Some(match url.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host,
+            })
+        })
+        .unwrap_or_else(|| "the model origin".to_string())
+}
+
+/// `e` and the chain of its causes, where the refused connection, the TLS
+/// failure or the timeout is named, without the URL `reqwest` attaches.
+fn describe(e: reqwest::Error) -> String {
+    let e = e.without_url();
+    let mut text = e.to_string();
+    let mut source = std::error::Error::source(&e);
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
 }
 
 /// Atomic rename from a `.partial` working file to the final destination.
@@ -1205,7 +1242,7 @@ mod tests {
         let res = ensure_model_from(tmp.path(), &source(&server.url(), &oracle, &specs), None)
         .await;
         match res {
-            Err(DownloadError::RetryExhausted { attempts, file }) => {
+            Err(DownloadError::RetryExhausted { attempts, file, .. }) => {
                 assert_eq!(attempts, 3);
                 assert_eq!(file, "onnx/model.onnx");
             }
@@ -1372,8 +1409,10 @@ mod tests {
         .expect("the download returned instead of waiting forever");
 
         match res {
-            Err(DownloadError::RetryExhausted { file, attempts, .. }) => {
-                assert_eq!((file.as_str(), attempts), ("onnx/model.onnx", 3));
+            Err(e @ DownloadError::RetryExhausted { .. }) => {
+                let DownloadError::RetryExhausted { file, attempts, .. } = &e else { unreachable!() };
+                assert_eq!((file.as_str(), *attempts), ("onnx/model.onnx", 3));
+                assert!(e.to_string().contains("timed out"), "{e}");
             }
             other => panic!("expected RetryExhausted, got {other:?}"),
         }
@@ -1393,6 +1432,50 @@ mod tests {
     #[tokio::test]
     async fn a_server_that_never_answers_fails_the_attempt() {
         ensure_against_silent_server("dl-no-answer", b"").await;
+    }
+
+    // ---------- The cause of a failure ----------
+
+    #[tokio::test]
+    async fn an_exhausted_download_names_the_last_status_and_the_host() {
+        let tmp = TestDir::new("dl-cause-status");
+        let files = fixture_files();
+        let specs = fixture_specs(&files);
+        let mut server = mockito::Server::new_async().await;
+        let _mocks = mount_all(&mut server, &files, 503).await;
+        let oracle = MockDiskOracle::returning(MIN_FREE_BYTES);
+
+        let err = ensure_model_from(tmp.path(), &source(&server.url(), &oracle, &specs), None)
+            .await
+            .unwrap_err();
+
+        let text = err.to_string();
+        assert!(text.contains("HTTP 503"), "{text}");
+        assert!(text.contains(&server.host_with_port()), "{text}");
+        assert!(!text.contains(&format!("{}/onnx", server.url())), "{text}");
+    }
+
+    #[tokio::test]
+    async fn the_cause_never_carries_the_credentials_of_the_url() {
+        let files = fixture_files();
+        let specs = fixture_specs(&files);
+        let mut server = mockito::Server::new_async().await;
+        let _mocks = mount_all(&mut server, &files, 503).await;
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let oracle = MockDiskOracle::returning(MIN_FREE_BYTES);
+
+        for base in [
+            format!("http://user:s3cret@{}", server.host_with_port()),
+            format!("http://user:s3cret@{closed}"),
+        ] {
+            let tmp = TestDir::new("dl-cause-credentials");
+            let err = ensure_model_from(tmp.path(), &source(&base, &oracle, &specs), None)
+                .await
+                .unwrap_err();
+            let text = err.to_string();
+            assert!(matches!(err, DownloadError::RetryExhausted { .. }), "{text}");
+            assert!(!text.contains("s3cret"), "{text}");
+        }
     }
 
     #[test]

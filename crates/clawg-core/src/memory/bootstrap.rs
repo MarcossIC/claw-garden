@@ -1198,7 +1198,9 @@ mod tests {
             Box::pin(async move {
                 Err(DownloadError::RetryExhausted {
                     file: "onnx/model.onnx".into(),
+                    host: "huggingface.co".into(),
                     attempts: 3,
+                    cause: "HTTP 503 Service Unavailable".into(),
                 })
             })
         });
@@ -1517,7 +1519,12 @@ mod tests {
     fn refused_download() -> EnsureModelFn {
         Arc::new(|_base, _progress| {
             Box::pin(async move {
-                Err(DownloadError::RetryExhausted { file: "connection refused".into(), attempts: 3 })
+                Err(DownloadError::RetryExhausted {
+                    file: "onnx/model.onnx".into(),
+                    host: "huggingface.co".into(),
+                    attempts: 3,
+                    cause: "connection refused".into(),
+                })
             })
         })
     }
@@ -1653,7 +1660,12 @@ mod tests {
             let n = counted.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 if n == 0 {
-                    Err(DownloadError::RetryExhausted { file: "connection refused".into(), attempts: 3 })
+                    Err(DownloadError::RetryExhausted {
+                        file: "onnx/model.onnx".into(),
+                        host: "huggingface.co".into(),
+                        attempts: 3,
+                        cause: "connection refused".into(),
+                    })
                 } else {
                     Ok(empty_model_files())
                 }
