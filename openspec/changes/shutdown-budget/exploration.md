@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| transversal | S | — (53 outbox-lifecycle acota la fase de drenaje; ver «Interacciones») | exploración (borrador) |
+| transversal | S | — (53 outbox-lifecycle acota la fase de drenaje; ver «Interacciones») | ver [`state.yaml`](state.yaml) |
 
 **Tesis:** `clawg stop` y `clawg update` terminan dentro de un presupuesto conocido, haga lo que haga el daemon, y el daemon también se apaga en orden cuando el sistema se lo pide (SIGTERM en Unix, los eventos de consola y de apagado en Windows). Hoy el presupuesto de 15 s sólo cubre dos de las cuatro fases del apagado (el drenaje y lo que viene después), y su prueba lo declara con margen cero; la fase HTTP y la espera de una carga del modelo no tienen tope. Una petición larga, o un modelo cargándose, hace que `stop` salga con 1 y que `update` lo trate como fallo y deshaga. Y cuando eso pasa, `update` informa que el daemon «no se tocó» aunque ya se está apagando, y no lo vuelve a levantar: la memoria queda caída hasta que se reinicia el editor. Un SIGTERM mata el proceso sin pasar por el cierre, así que `daemon.json` y `token` quedan viejos. Nada de lo aceptado se pierde en ningún caso (el outbox ya lo garantiza); lo que falla es el plazo, el orden y lo que se le dice al usuario.
 
