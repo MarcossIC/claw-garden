@@ -710,6 +710,34 @@ impl DaemonClient {
         Self::read_response(resp).await
     }
 
+    /// Tells the daemon which host session `agent_id` works in for
+    /// `project_id`; the saves that follow carry it. A daemon that predates
+    /// it answers 404.
+    pub async fn register_session(
+        &self,
+        agent_id: &str,
+        project_id: Option<&str>,
+        session_id: &str,
+    ) -> Result<(), ClientError> {
+        let resp = self
+            .http
+            .post(self.url("/v1/sessions"))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "agent_id": agent_id, "project_id": project_id, "session_id": session_id }))
+            .send()
+            .await
+            .map_err(Self::map_transport)?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(ClientError::Unauthorized);
+        }
+        if !status.is_success() {
+            let body = resp.json::<serde_json::Value>().await.ok();
+            return Err(daemon_error(status, body));
+        }
+        Ok(())
+    }
+
     pub async fn synthesis(&self, args: &SynthesisArgs) -> Result<Synthesis, ClientError> {
         let resp = self
             .http
