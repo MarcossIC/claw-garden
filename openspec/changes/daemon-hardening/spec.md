@@ -3,7 +3,7 @@
 ## Definiciones
 
 - **Nombre de loopback:** `127.0.0.1`, `localhost` o `[::1]`, comparados sin distinguir mayúsculas.
-- **Autoridad de la petición:** la cabecera `Host` si está; si no, la autoridad de la URI (la `:authority` de HTTP/2).
+- **Autoridades de la petición:** la cabecera `Host` y la autoridad de la URI (la `:authority` de HTTP/2, o la de una URI absoluta en HTTP/1.1), las que estén.
 - **Guardia:** la capa que `router` (`crates/clawg-cli/src/daemon/api.rs`) aplica a todas sus rutas, `/health` y `/v1` incluidas, antes de `require_bearer`.
 
 ## R1. La decisión es pura
