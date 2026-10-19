@@ -5,14 +5,15 @@
 //! where it is testable without running this.
 //!
 //! Exit codes: `0` success, `1` a runtime failure (message on stderr), `2` a
-//! usage error (clap's own), except under `clawg hook`, where a usage error is
-//! `1`: a client reads `2` from a hook as "block".
+//! usage error (clap's own), except under `clawg hook` and for `clawg` alone,
+//! where a usage error is `1`: a client reads `2` from a hook as "block", and a
+//! client that ignores a hook's `args` runs the binary alone.
 
 #[cfg(windows)]
 use std::path::Path;
 use std::process::ExitCode;
 
-use clawg_cli::cli::{is_hook_invocation, sharing_profile, Cli, Command, PathAction, ProjectsAction, SetupClient};
+use clawg_cli::cli::{is_bare_invocation, is_hook_invocation, sharing_profile, Cli, Command, PathAction, ProjectsAction, SetupClient};
 use clawg_cli::client::{probe_running, ClientError, DaemonClient, Probe};
 use clawg_cli::daemon::lifecycle::{now_ms, read_state};
 use clawg_cli::daemon::serve;
@@ -41,10 +42,11 @@ const EXIT_FAILURE: u8 = 1;
 
 fn main() -> ExitCode {
     let hook = is_hook_invocation(std::env::args_os());
+    let bare = is_bare_invocation(std::env::args_os());
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         // A client reads 2 from a hook as "block the session or the prompt".
-        Err(e) if hook && e.use_stderr() => {
+        Err(e) if (hook || bare) && e.use_stderr() => {
             let _ = e.print();
             return ExitCode::from(EXIT_FAILURE);
         }
