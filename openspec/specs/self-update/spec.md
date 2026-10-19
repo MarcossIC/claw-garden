@@ -92,14 +92,14 @@ El analizador de `SHA256SUMS` MUST rechazar una línea faltante para el asset, u
 
 ## S6. Sólo a pedido
 
-El daemon MUST NOT consultar nada por su cuenta. Sólo `clawg update` y `clawg update --check` MUST tocar la red. Las peticiones MUST mandar `User-Agent`. `--check` MUST NOT descargar el binario ni modificar nada, y sus códigos de salida MUST ser `0` si está al día, `100` si hay una versión nueva (que nombra en stdout) y `1` si hay un error o una negativa (S2). El `2` queda para los errores de uso de clap.
+El daemon MUST NOT consultar nada por su cuenta. Sólo `clawg update` y `clawg update --check` MUST tocar la red. Las peticiones MUST mandar `User-Agent`. Van sin token, así que la API de GitHub cuenta un límite por hora y por dirección: un 403 o un 429 con `x-ratelimit-remaining: 0` MUST informarse como ese límite agotado, con los minutos que faltan para `x-ratelimit-reset` si viene, y no sólo como el código de estado. `--check` MUST NOT descargar el binario ni modificar nada, y sus códigos de salida MUST ser `0` si está al día, `100` si hay una versión nueva (que nombra en stdout) y `1` si hay un error o una negativa (S2). El `2` queda para los errores de uso de clap.
 
 #### Escenario: `--check` con y sin versión nueva
 - GIVEN un servidor de release falso con claves de prueba
 - WHEN corre `clawg update --check` primero con una versión mayor, luego con la misma y luego con el servidor caído
 - THEN los códigos de salida son `100`, `0` y `1`, y el binario instalado no cambia
 
-**Test:** `update_check_reports_a_newer_version_and_an_up_to_date_one` en `crates/clawg-cli/tests/binary.rs`; que las peticiones llevan `User-Agent`, en un test del cliente contra el servidor falso.
+**Test:** `update_check_reports_a_newer_version_and_an_up_to_date_one` en `crates/clawg-cli/tests/binary.rs`; que las peticiones llevan `User-Agent`, en un test del cliente contra el servidor falso; el límite agotado, `a_refusal_with_no_requests_left_is_the_rate_limit` y `a_refusal_with_requests_left_or_another_status_is_only_a_status` (puros) y `the_rate_limit_is_read_from_the_answer` (contra un servidor falso).
 
 ## S7. Verificar antes de tocar
 
