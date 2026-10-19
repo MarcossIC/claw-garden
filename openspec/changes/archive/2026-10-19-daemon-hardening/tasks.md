@@ -12,7 +12,7 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 
 - [x] Tests primero en `daemon/guard.rs`: la tabla de R1 y el tope del registro.
 - [x] `admits(host, uri_authority, origin)`, `RefusalLog`.
-- Commit: con la tarea 3
+- Commit: el de la tarea 3
 
 ## 3. El guardia en `router` (R2, R3)
 
@@ -22,11 +22,11 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 
 ## 4. Docs
 
-- [ ] `.claude/CLAUDE.md`, README, `openspec/README.md`, `state.yaml`.
+- [x] `.claude/CLAUDE.md`, README, `openspec/README.md`, `state.yaml`.
 - Commit: `docs: say the daemon refuses a foreign Host and any Origin`
 
 ## 5. Verificación
 
-- [ ] Suite y clippy en Linux sobre el último commit.
-- [ ] Un daemon real del perfil dev en un home de prueba, con `curl`: `Host` ajeno y `Origin` dan 403; `clawg status` y `clawg stop` funcionan.
-- [ ] `verify.md`.
+- [x] Suite y clippy en Linux sobre el último commit.
+- [x] Un daemon real del perfil dev en un home de prueba, con `curl`: `Host` ajeno y `Origin` dan 403; `clawg status` y `clawg stop` funcionan.
+- [x] `verify.md`.

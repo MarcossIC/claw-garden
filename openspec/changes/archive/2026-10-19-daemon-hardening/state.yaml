@@ -1,0 +1,15 @@
+change: daemon-hardening
+objective: "transversal"
+depends_on: []
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: skipped  # las decisiones caben en la propuesta
+  tasks: done
+  apply: done
+  verify: done  # Linux y un daemon real del perfil dev en un home de prueba, sin CRITICAL; Windows queda como WARNING hasta el CI
+  archive: done
+updated: 2026-10-19
+main_spec: openspec/specs/daemon-access/spec.md
