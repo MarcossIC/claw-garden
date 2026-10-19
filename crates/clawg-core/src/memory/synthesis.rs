@@ -324,6 +324,38 @@ pub async fn conclusions_to_review_count(
         .map_err(backend("conclusions to review count"))
 }
 
+/// The ids among `ids` that name a `memory` row not deleted but superseded,
+/// ascending, each with the row that replaced it. With an agent, another
+/// agent's row is left out, as in [`existing_memory_ids`].
+pub async fn replaced_memory_ids(
+    store: &MemoryStore,
+    ids: &[i64],
+    agent_id: Option<&str>,
+) -> Result<Vec<(i64, Option<i64>)>, MemoryError> {
+    let ids = ids.to_vec();
+    let agent_id = agent_id.map(str::to_owned);
+    store
+        .conn
+        .call(move |c| -> rusqlite::Result<Vec<(i64, Option<i64>)>> {
+            use rusqlite::OptionalExtension;
+            let mut stmt = c.prepare_cached(
+                "SELECT superseded_by FROM memory WHERE id = ?1 AND deleted_at IS NULL \
+                 AND status = 'superseded' AND (?2 IS NULL OR agent_id = ?2)",
+            )?;
+            let mut found = Vec::new();
+            for id in ids {
+                if let Some(by) = stmt.query_row(rusqlite::params![id, agent_id], |r| r.get(0)).optional()? {
+                    found.push((id, by));
+                }
+            }
+            found.sort_unstable();
+            found.dedup();
+            Ok(found)
+        })
+        .await
+        .map_err(backend("source lookup"))
+}
+
 /// The ids among `ids` that name a `memory` row not deleted, ascending. With
 /// an agent, another agent's row counts as missing, like an id that is not
 /// there.
@@ -568,6 +600,23 @@ mod tests {
         delete_memory_core(&store, d, MemoryKind::Memory, None).await.unwrap();
 
         assert_eq!(existing_memory_ids(&store, &[999_999, d, a, a], None).await.unwrap(), vec![a]);
+    }
+
+    #[tokio::test]
+    async fn replaced_ids_name_their_replacement() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let live = seed(&store, None, "live", 1).await;
+        let old = seed(&store, None, "old", 2).await;
+        let new = seed(&store, None, "new", 3).await;
+        supersede(&store, old, new, 3).await;
+        let theirs = seed_as(&store, "b", None, "theirs", 4).await;
+        supersede(&store, theirs, new, 4).await;
+
+        assert_eq!(replaced_memory_ids(&store, &[new, old, live, theirs], Some("a")).await.unwrap(), vec![(old, Some(new))]);
+        assert_eq!(
+            replaced_memory_ids(&store, &[old, theirs], None).await.unwrap(),
+            vec![(old, Some(new)), (theirs, Some(new))]
+        );
     }
 
     #[tokio::test]

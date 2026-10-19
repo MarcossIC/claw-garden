@@ -1507,6 +1507,32 @@ async fn a_save_from_unknown_sources_is_refused() {
     assert_eq!(list["items"].as_array().map(Vec::len), Some(1), "nothing was saved: {list}");
 }
 
+#[tokio::test]
+async fn a_save_from_a_replaced_source_is_refused() {
+    let h = Harness::start().await;
+    let old = save_id(&h, json!({ "content": "the deploy runs on fridays", "agent_id": "a", "topic_key": "deploy/day" })).await;
+    let new = save_id(&h, json!({ "content": "the deploy runs on mondays", "agent_id": "a", "topic_key": "deploy/day" })).await;
+    let kept = save_id(&h, json!({ "content": "the release is tagged by CI", "agent_id": "a" })).await;
+
+    let (status, body) = h
+        .post_json(
+            "/v1/memories",
+            json!({ "content": "deploys follow the calendar", "agent_id": "a", "derived_from": [kept, old] }),
+        )
+        .await;
+
+    assert_eq!(status, 400, "{body}");
+    let message = body.to_string();
+    assert!(message.contains(&format!("{old} (by {new})")), "the refusal names what replaced it: {message}");
+    let (status, body) = h
+        .post_json(
+            "/v1/memories",
+            json!({ "content": "deploys follow the calendar", "agent_id": "a", "derived_from": [kept, new] }),
+        )
+        .await;
+    assert_eq!(status, 201, "the current version is a source: {body}");
+}
+
 /// `source` and `created_by_type` of a memory row, as the viewer reads them.
 async fn origin(h: &Harness, id: i64) -> (String, String) {
     let (status, body) = h.get_json(&format!("/v1/memories/memory/{id}")).await;

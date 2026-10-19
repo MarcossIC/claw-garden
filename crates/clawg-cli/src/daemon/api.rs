@@ -45,7 +45,7 @@ use clawg_core::memory::prompt_builder::{build_memory_prompt, build_session_prom
 use clawg_core::memory::sharing::{self, Reach};
 use clawg_core::memory::topic::validate_topic_key;
 use clawg_core::memory::synthesis::{
-    existing_memory_ids, synthesis_core, unreviewed_count, Synthesis, SynthesisParams,
+    existing_memory_ids, replaced_memory_ids, synthesis_core, unreviewed_count, Synthesis, SynthesisParams,
 };
 use clawg_core::memory::{read_save_core, search_all_memories, RankedHit, SaveText, SearchScope};
 use clawg_core::models::chat::Role;
@@ -310,6 +310,18 @@ fn distinct_sources(ids: &[i64]) -> Result<Vec<i64>, ApiError> {
 /// The requested sources that are not among the ones that exist, in order.
 fn missing_sources(requested: &[i64], existing: &[i64]) -> Vec<i64> {
     requested.iter().copied().filter(|id| !existing.contains(id)).collect()
+}
+
+/// `5 (by 9), 7` for replaced sources, each with what replaced it when known.
+fn replaced_list(replaced: &[(i64, Option<i64>)]) -> String {
+    replaced
+        .iter()
+        .map(|(id, by)| match by {
+            Some(by) => format!("{id} (by {by})"),
+            None => id.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn check_budget(budget: Option<usize>) -> Result<usize, ApiError> {
@@ -1031,6 +1043,15 @@ async fn save_memory(
                 "derived_from names memories that do not exist or were deleted: {ids}"
             )));
         }
+        let replaced = replaced_memory_ids(&app.runtime.store, &derived_from, Some(&body.agent_id))
+            .await
+            .map_err(ApiError::internal)?;
+        if !replaced.is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "derived_from names memories that were replaced: {}; draw the conclusion from the current ones",
+                replaced_list(&replaced)
+            )));
+        }
     }
     // Refused before it is queued: with no embedder coming, a queued save
     // would sit in memory until the daemon stops and then be lost.
@@ -1664,6 +1685,11 @@ mod tests {
         assert!(distinct_sources(&repeated).is_ok(), "the cap counts distinct ids");
         let over: Vec<i64> = (0..=MAX_SOURCES as i64).collect();
         assert_eq!(distinct_sources(&over).unwrap_err().status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn replaced_sources_name_what_replaced_them() {
+        assert_eq!(replaced_list(&[(5, Some(9)), (7, None)]), "5 (by 9), 7");
     }
 
     #[test]
