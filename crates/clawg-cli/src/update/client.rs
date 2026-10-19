@@ -154,7 +154,9 @@ impl ReleaseClient {
                 hash.update(&chunk);
                 file.write_all(&chunk).map_err(write_failed)?;
             }
-            file.flush().map_err(write_failed)
+            // On disk before it is renamed into place, or a power cut can leave
+            // the installed name on an empty file; `flush` does nothing on a `File`.
+            file.sync_all().map_err(write_failed)
         }
         .await;
         drop(file);

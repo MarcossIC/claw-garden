@@ -287,8 +287,11 @@ fn tail_lines(text: &str, count: usize) -> String {
 #[cfg(unix)]
 fn make_executable(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("cannot make {} executable: {e}", path.display()))
+    let failed = |e: std::io::Error| format!("cannot make {} executable: {e}", path.display());
+    let file = std::fs::File::open(path).map_err(failed)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o755)).map_err(failed)?;
+    // The mode belongs to the file, not to the directory synced after the swap.
+    file.sync_all().map_err(failed)
 }
 
 #[cfg(not(unix))]
@@ -341,7 +344,13 @@ impl Effects for Installation {
                 self.set_aside = true;
                 Ok(())
             }
-            Step::PutInPlace => rename(&self.paths.staged, &self.paths.exe).await,
+            Step::PutInPlace => {
+                rename(&self.paths.staged, &self.paths.exe).await?;
+                // Until the directory is synced a power cut can keep the first
+                // rename and lose the second, leaving no binary under the name.
+                let dir = self.paths.exe.parent().unwrap_or(Path::new("."));
+                backup::sync_dir(dir).map_err(|e| format!("cannot sync {}: {e}", dir.display()))
+            }
             Step::StartDaemon => {
                 let port = self.old.as_ref().map(|d| d.port).ok_or("there is no daemon port to start on")?;
                 self.backups_before = Some(self.backup_names());

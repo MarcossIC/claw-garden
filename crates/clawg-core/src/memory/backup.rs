@@ -430,12 +430,12 @@ fn swap_in(tmp: &Path, db: &Path) -> std::io::Result<()> {
 /// crash although the migration it guards was applied. NTFS journals the
 /// rename with the file system, and Windows cannot open a directory this way.
 #[cfg(unix)]
-fn sync_dir(dir: &Path) -> std::io::Result<()> {
+pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+pub fn sync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
