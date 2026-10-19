@@ -1,6 +1,6 @@
 //! Masking of secrets with a known format: API keys, tokens, private keys and
-//! passwords inside URLs; of literal values after a password key or an
-//! `Authorization` header; and of whatever the writer marks
+//! passwords inside URLs; of literal values after a password, secret, token or
+//! API key name or an `Authorization` header; and of whatever the writer marks
 //! `<private>…</private>`.
 //!
 //! Only formats with a fixed prefix or structure, or a fixed key in front,
@@ -33,6 +33,7 @@ pub enum SecretKind {
     UrlPassword,
     Password,
     AuthHeader,
+    Credential,
     Private,
 }
 
@@ -57,6 +58,7 @@ impl SecretKind {
             SecretKind::UrlPassword => "url_password",
             SecretKind::Password => "password",
             SecretKind::AuthHeader => "auth_header",
+            SecretKind::Credential => "credential",
             SecretKind::Private => "private",
         }
     }
@@ -115,6 +117,10 @@ static PATTERNS: Lazy<Vec<(SecretKind, Regex)>> = Lazy::new(|| {
             SecretKind::AuthHeader,
             r#"(?i)\bauthorization["']?\s*[:=]\s*["']?(?:bearer|basic|token)\s+([^\s"'`,;)}\]]+)"#,
         ),
+        (
+            SecretKind::Credential,
+            r#"(?i)\b[a-z0-9_-]*?(?:secret|token|api[_-]?key|access[_-]?key|secret[_-]?key|account[_-]?key|auth[_-]?key)["']?\s*(?:==|:=|=|:)\s*["']?([^\s"'`,;)}\]:][^\s"'`,;)}\]]*)"#,
+        ),
     ]
     .into_iter()
     .map(|(kind, pattern)| (kind, Regex::new(pattern).expect("secret patterns are valid")))
@@ -158,6 +164,11 @@ fn accepts(kind: SecretKind, secret: &str) -> bool {
         // value: none of them is the password.
         SecretKind::UrlPassword => !secret.starts_with(['$', '<', '{', '[', '*']),
         SecretKind::Password | SecretKind::AuthHeader => is_literal_secret(secret),
+        // After these keys a number is a limit or a count (`max_token=100000`)
+        // and `a::b` a path, far more often than a secret.
+        SecretKind::Credential => {
+            is_literal_secret(secret) && secret.chars().any(|c| c.is_ascii_alphabetic()) && !secret.contains("::")
+        }
         _ => true,
     }
 }
@@ -168,10 +179,11 @@ fn mixes_case_and_digits(s: &str) -> bool {
         && s.bytes().any(|b| b.is_ascii_lowercase())
 }
 
-/// Whether the value after a password key or an `Authorization` scheme is a
-/// literal secret rather than code, a type, a placeholder or prose. A word
-/// with no digit and no symbol is let through: it is far more often a type
-/// or a variable than a password, and masking it destroys the memory.
+/// Whether the value after a password, secret, token or API key name or an
+/// `Authorization` scheme is a literal secret rather than code, a type, a
+/// placeholder or prose. A word with no digit and no symbol is let through:
+/// it is far more often a type or a variable than a password, and masking it
+/// destroys the memory.
 fn is_literal_secret(value: &str) -> bool {
     let is_identifier = |s: &str| {
         let mut chars = s.chars();
@@ -198,7 +210,10 @@ pub fn find_secrets(text: &str) -> Vec<Found> {
             if !accepts(*kind, part.as_str()) {
                 continue;
             }
-            let value_only = matches!(kind, SecretKind::UrlPassword | SecretKind::Password | SecretKind::AuthHeader);
+            let value_only = matches!(
+                kind,
+                SecretKind::UrlPassword | SecretKind::Password | SecretKind::AuthHeader | SecretKind::Credential
+            );
             let masked = if value_only { part } else { whole };
             found.push(Found { range: masked.range(), kind: *kind });
         }
@@ -422,6 +437,62 @@ mod tests {
     }
 
     #[test]
+    fn a_literal_credential_is_masked_and_its_key_kept() {
+        let aws = repeat("wJalrXUtnFEMI/K7MDENG+bPxRfiCY", 40);
+        let router = format!("sk-or-v1-{}", repeat("0f3a9c", 64));
+        let client = repeat("Zq8-xW2_", 34);
+        let api = repeat("d41d8cd98f00b204", 32);
+        let account = format!("{}==", repeat("Eby8vdM02xNOcqFl", 86));
+        for (text, expected) in [
+            (format!("AWS_SECRET_ACCESS_KEY={aws}"), "AWS_SECRET_ACCESS_KEY=[REDACTED:credential]".to_string()),
+            (format!("OPENROUTER_API_KEY={router}"), "OPENROUTER_API_KEY=[REDACTED:credential]".to_string()),
+            (
+                format!("{{\"client_secret\": \"{client}\"}}"),
+                "{\"client_secret\": \"[REDACTED:credential]\"}".to_string(),
+            ),
+            (format!("curl -H 'X-Api-Key: {api}'"), "curl -H 'X-Api-Key: [REDACTED:credential]'".to_string()),
+            (
+                format!("DefaultEndpointsProtocol=https;AccountName=app;AccountKey={account};"),
+                "DefaultEndpointsProtocol=https;AccountName=app;AccountKey=[REDACTED:credential];".to_string(),
+            ),
+            ("GITHUB_TOKEN: a1b2c3d4e5f6".to_string(), "GITHUB_TOKEN: [REDACTED:credential]".to_string()),
+            ("secret = \"zebra-quokka-7741\"".to_string(), "secret = \"[REDACTED:credential]\"".to_string()),
+            ("githubToken := \"q9W-e8R7t\"".to_string(), "githubToken := \"[REDACTED:credential]\"".to_string()),
+        ] {
+            let out = redact(&text);
+            assert_eq!(out.text, expected, "{text}");
+            assert_eq!(out.kinds, vec![SecretKind::Credential], "{text}");
+        }
+    }
+
+    #[test]
+    fn code_and_placeholders_after_a_credential_key_are_left_alone() {
+        for text in [
+            "token = next_token()",
+            "secret: string",
+            "api_key: Option<String>,",
+            "let token = parser.token;",
+            "max_token=100000",
+            "max_tokens: 4096",
+            "GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}",
+            "api_key=$OPENAI_API_KEY",
+            "secret_name: my-app",
+            "tokenizer: bert-base-2",
+            "api_key: YOUR_API_KEY",
+            "access_key: <your-access-key>",
+            "client_secret = os.environ[\"CLIENT_SECRET\"]",
+            "token: Token::Ident",
+            "the secret: keep it out of the repo",
+            "csrf_token: true",
+            "id_token: [REDACTED:jwt]",
+        ] {
+            let out = redact(text);
+            assert_eq!(out.text, text);
+            assert!(out.kinds.is_empty(), "{text}: {:?}", out.kinds);
+        }
+    }
+
+    #[test]
     fn an_authorization_header_masks_only_its_credential() {
         let out = redact("curl -H \"Authorization: Bearer a1b2c3d4e5f6g7h8\" https://api.example.com");
         assert_eq!(out.text, "curl -H \"Authorization: Bearer [REDACTED:auth_header]\" https://api.example.com");
@@ -454,6 +525,15 @@ mod tests {
         let out = redact(&format!("OPENAI_PASSWORD={key}"));
         assert_eq!(out.text, "OPENAI_PASSWORD=[REDACTED:openai_key]");
         assert_eq!(out.kinds, vec![SecretKind::OpenaiKey]);
+
+        let token = format!("hf_{}", repeat("aB3d", 34));
+        let out = redact(&format!("HF_TOKEN={token}"));
+        assert_eq!(out.text, "HF_TOKEN=[REDACTED:huggingface_token]");
+        assert_eq!(out.kinds, vec![SecretKind::HuggingfaceToken]);
+
+        let key = format!("AKIA{}", repeat("Q7ZX", 16));
+        let out = redact(&format!("aws_access_key: {key}"));
+        assert_eq!(out.text, "aws_access_key: [REDACTED:aws_access_key]");
     }
 
     #[test]
@@ -501,10 +581,16 @@ mod tests {
             text.push('\n');
         }
         text.push_str("mysql://root:hunter2@localhost/db\n");
-        text.push_str("DB_PASSWORD=s3cr3t!x\nAuthorization: Bearer a1b2c3d4e5f6g7h8\n");
+        text.push_str("DB_PASSWORD=s3cr3t!x\nAuthorization: Bearer a1b2c3d4e5f6g7h8\nAPI_KEY=q9W-e8R7t\n");
         text.push_str("<private>the vault code</private> and <private>an open mark\n");
         let once = redact(&text);
-        for kind in [SecretKind::UrlPassword, SecretKind::Password, SecretKind::AuthHeader, SecretKind::Private] {
+        for kind in [
+            SecretKind::UrlPassword,
+            SecretKind::Password,
+            SecretKind::AuthHeader,
+            SecretKind::Credential,
+            SecretKind::Private,
+        ] {
             assert!(once.kinds.contains(&kind), "{kind:?} in {:?}", once.kinds);
         }
         let twice = redact(&once.text);
