@@ -125,6 +125,7 @@ mod tests {
             derived_from: vec![3, 1],
             topic_key: None,
             user_stated: false,
+            session_id: None,
         }
     }
 

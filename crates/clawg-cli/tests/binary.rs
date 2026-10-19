@@ -588,7 +588,12 @@ fn hook(sandbox: &Sandbox, args: &[&str], input: &str) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn clawg hook");
-    child.stdin.take().expect("stdin").write_all(input.as_bytes()).expect("write stdin");
+    // A usage error exits before stdin is read, and the write may then find
+    // the pipe closed; the exit code is what such a test checks.
+    match child.stdin.take().expect("stdin").write_all(input.as_bytes()) {
+        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => panic!("write stdin: {e}"),
+        _ => {}
+    }
     child.wait_with_output().expect("clawg hook")
 }
 
@@ -656,6 +661,40 @@ async fn session_start_injects_the_saved_memories() {
     let out = hook(&sandbox, &["user-prompt-submit", "--agent", "smoke", "--profile", "dev"], &prompt.to_string());
     assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
     assert_eq!(stdout_of(&out), "", "the session just started and a save just landed");
+}
+
+#[tokio::test]
+async fn a_hook_registers_the_session_of_the_saves() {
+    let sandbox = Sandbox::new();
+    let root = sandbox.home.join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let project = clawg_core::memory::ProjectIdentity::resolve(&root).id;
+    let daemon = sandbox.serve().await;
+    let save = |content: &'static str| {
+        daemon.post("/v1/memories", json!({ "content": content, "agent_id": "smoke", "project_id": project }))
+    };
+    let session_of = |list: &str, content: &str| -> Value {
+        let list: Value = serde_json::from_str(list).expect("list json");
+        let item = list["items"].as_array().unwrap().iter().find(|i| i["summary"] == content).cloned();
+        item.unwrap_or_else(|| panic!("{content} not listed: {list}"))["source_session_id"].clone()
+    };
+
+    let start = json!({ "session_id": "s1", "cwd": root, "hook_event_name": "SessionStart", "source": "startup" });
+    let out = hook(&sandbox, &["session-start", "--agent", "smoke", "--profile", "dev"], &start.to_string());
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let (status, body) = save("the deploy script lives in ops/deploy.sh").await;
+    assert!(status == 201 || status == 202, "{body}");
+
+    let prompt = json!({ "session_id": "s2", "cwd": root, "prompt": "go on", "hook_event_name": "UserPromptSubmit" });
+    let out = hook(&sandbox, &["user-prompt-submit", "--agent", "smoke", "--profile", "dev"], &prompt.to_string());
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let (status, body) = save("the release notes live in docs/releases").await;
+    assert!(status == 201 || status == 202, "{body}");
+    daemon.wait_until_ingested().await;
+
+    let list = daemon.list().await;
+    assert_eq!(session_of(&list, "the deploy script lives in ops/deploy.sh"), "s1", "{list}");
+    assert_eq!(session_of(&list, "the release notes live in docs/releases"), "s2", "a later prompt of another session wins: {list}");
 }
 
 // ── Cleanup ────────────────────────────────────────────────────────────────

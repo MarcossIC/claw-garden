@@ -78,15 +78,15 @@ pub fn context_sections(text: &str) -> Vec<(String, String)> {
 }
 
 /// Content fragments of a `recall_context` prompt, in the order they appear:
-/// each hit of RECENT CONTEXT and LONG-TERM KNOWLEDGE and each workspace
-/// bullet. ACTIVE CONFLICTS yields nothing, so the text a conflict carries
+/// each hit of LAST SESSION, RECENT CONTEXT and LONG-TERM KNOWLEDGE and each
+/// workspace bullet. ACTIVE CONFLICTS yields nothing, so the text a conflict carries
 /// never counts as a row the agent was shown.
 pub fn context_segments(text: &str) -> Vec<String> {
     let mut segments = Vec::new();
     for (title, section) in context_sections(text) {
         if title == "WORKSPACE" {
             segments.extend(bullet_segments(&section));
-        } else if title.starts_with("RECENT CONTEXT") || title == "LONG-TERM KNOWLEDGE" {
+        } else if title == "LAST SESSION" || title.starts_with("RECENT CONTEXT") || title == "LONG-TERM KNOWLEDGE" {
             segments.extend(hit_segments(&section));
         }
     }
@@ -291,6 +291,12 @@ mod tests {
     fn a_hit_ends_at_the_next_section_separator() {
         let text = "=== RECENT CONTEXT (Last 7 Days) ===\n[2026-08-10 #2 chat_message] recent row\n\n=== LONG-TERM KNOWLEDGE ===\n[2026-01-01 #1 chat_message] old row\n";
         assert_eq!(context_segments(text), vec!["recent row".to_string(), "old row".to_string()]);
+    }
+
+    #[test]
+    fn the_last_session_block_counts_as_shown() {
+        let text = "=== LAST SESSION ===\n[2026-10-18 #9 session_summary] Goal: wire the cache\n\n=== RECENT CONTEXT (Last 7 Days) ===\n[2026-10-18 #2 chat_message] recent row\n";
+        assert_eq!(context_segments(text), vec!["Goal: wire the cache".to_string(), "recent row".to_string()]);
     }
 
     #[test]

@@ -53,6 +53,11 @@ pub struct MemoryEvent {
     /// agent's.
     #[serde(default)]
     pub user_stated: bool,
+    /// The host session the save came from, stamped by the daemon when it
+    /// accepts the save so a replay keeps it; absent, as in an outbox row
+    /// written before the field existed, the rows carry none.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// Where the ingest event originated (which producer).
@@ -132,6 +137,7 @@ impl MemoryEvent {
                 derived_from: Vec::new(),
                 topic_key: None,
                 user_stated: false,
+                session_id: None,
             }),
         }
     }
@@ -172,6 +178,7 @@ mod tests {
             derived_from: Vec::new(),
             topic_key: None,
             user_stated: false,
+            session_id: None,
         };
         assert!(matches!(evt.role, Role::Tool));
         assert_eq!(evt.is_error, Some(true));
@@ -217,6 +224,14 @@ mod tests {
     }
 
     #[test]
+    fn an_event_without_a_session_reads_as_none() {
+        let json = r#"{"agent_id":"a","project_id":null,"role":"user","content":"x","is_error":null,
+                       "source":"explicit","timestamp_ms":7}"#;
+        let evt: MemoryEvent = serde_json::from_str(json).expect("an event from before the field parses");
+        assert_eq!(evt.session_id, None);
+    }
+
+    #[test]
     fn explicit_event_round_trips_with_its_overrides() {
         let evt = MemoryEvent {
             agent_id: "a".into(),
@@ -231,6 +246,7 @@ mod tests {
             derived_from: Vec::new(),
             topic_key: None,
             user_stated: false,
+            session_id: None,
         };
         let json = serde_json::to_string(&evt).expect("serialize");
         let back: MemoryEvent = serde_json::from_str(&json).expect("deserialize");
@@ -305,6 +321,7 @@ mod tests {
             derived_from: Vec::new(),
             topic_key: None,
             user_stated: false,
+            session_id: None,
         });
         // Result is Err when receiver is dropped — must not panic
         let _ = result;
