@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 5 | S–M | — (gana sentido con 27 y 18; usa 41 si existe; ver «Interacciones») | exploración (borrador) |
+| 5 | S–M | — (gana sentido con 27 y 18; usa 41 si existe; ver «Interacciones») | exploración cerrada; ver [propuesta](proposal.md) |
 
 **Tesis:** una conclusión (objetivo 5) se guarda una vez y después nadie la vuelve a mirar. Si sus fuentes se borran, quedan reemplazadas o se purgan, `synthesize` la sigue listando como válida y nada se lo dice al agente. Además, `derived_from` acepta como fuente una memoria que ya fue reemplazada. A medida que la memoria evoluciona, con las revisiones de 27 y los borrados y restauraciones de 18, las conclusiones se separan de su evidencia en silencio. El objetivo 5 pide extraer conclusiones **con el tiempo**, y eso incluye revisarlas cuando la base cambia.
 
@@ -97,11 +97,11 @@ Una columna nueva, con una regla de refuerzo al volver a derivar y de decaimient
 
 Son del usuario.
 
-- [ ] **¿Qué estados de una fuente mandan a revisión?** Borrada y `superseded` seguro. ¿`disputed` también?
-- [ ] **¿Desde cuántas fuentes perdidas?** ¿Una, o la mayoría?
-- [ ] **B.** ¿Se rechaza una fuente `superseded`?
-- [ ] **C.** ¿`purge` deja el vínculo con el id purgado?
-- [ ] **Aviso.** ¿Se suma al conteo actual, o lleva una línea propia?
+- [x] **¿Qué estados de una fuente mandan a revisión?** Borrada, `superseded` y purgada; `disputed` no.
+- [x] **¿Desde cuántas fuentes perdidas?** Una.
+- [x] **B.** Sí, con 400 que nombra el reemplazante.
+- [x] **C.** Sí, el vínculo de la fila como fuente.
+- [x] **Aviso.** Línea propia, contando las pérdidas posteriores a la última revisión ([diseño](design.md#d3-el-aviso)).
 
 ## Cómo se mide
 

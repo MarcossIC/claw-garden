@@ -373,7 +373,7 @@
       "name": "search_project"
     },
     "synthesize": {
-      "description": "Review stored memories for conclusions: the memories no conclusion covers yet, newest first, the conclusions already drawn, and how to save new ones. A conclusion is saved with `save_memory` and `derived_from`; the memories it rests on stay as they are. Use it when `recall_context` says memories are waiting, at the end of a long task, or when the user asks what you have learned. Calling it marks the memories as reviewed, even if you save nothing.",
+      "description": "Review stored memories for conclusions: the memories no conclusion covers yet, newest first, the conclusions already drawn, those whose sources were deleted or replaced since, and how to save new ones or fix old ones. A conclusion is saved with `save_memory` and `derived_from`; the memories it rests on stay as they are. Use it when `recall_context` says memories are waiting or conclusions need a review, at the end of a long task, or when the user asks what you have learned. Calling it marks the memories as reviewed, even if you save nothing.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {

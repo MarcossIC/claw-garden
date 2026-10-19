@@ -103,9 +103,11 @@ pub fn purge(base_dir: &Path, id: i64) -> Result<Purged, MemoryError> {
     let tx = c.transaction()?;
     tx.execute("DELETE FROM memory_vectors WHERE rowid = ?1", [id])?;
     tx.execute("DELETE FROM memory WHERE id = ?1", [id])?;
-    // Unlike a soft delete, the id can be handed to a later row, which must
-    // not inherit this one's provenance.
-    tx.execute("DELETE FROM memory_derivation WHERE memory_id = ?1 OR source_id = ?1", [id])?;
+    // A purged conclusion rests on nothing. A link that names the row as a
+    // source stays: it holds an id, never text, and it is the only way the
+    // conclusion learns it lost a source. `AUTOINCREMENT` never hands the id
+    // to a later row.
+    tx.execute("DELETE FROM memory_derivation WHERE memory_id = ?1", [id])?;
     tx.execute("DELETE FROM memory_conflict WHERE new_id = ?1 OR old_id = ?1", [id])?;
     // A save not stored yet, or that failed after it was accepted, holds the
     // text in the outbox; a row stored from a long save is one of its pieces.
@@ -429,7 +431,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn purging_drops_the_links_to_and_from_the_row() {
+    async fn purging_keeps_the_links_that_name_the_row_as_a_source() {
         let dir = tempfile::tempdir().unwrap();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let source = insert(&store, "the go service uses tabs".to_string()).await;
@@ -451,9 +453,10 @@ mod tests {
 
         purge(dir.path(), purged).unwrap();
 
-        // A later row can be given the purged id, and must not inherit its links.
-        let sql = "SELECT count(*) FROM memory_derivation WHERE memory_id = ?1 OR source_id = ?1";
-        assert_eq!(count(dir.path(), sql, purged), 0);
+        let drawn = "SELECT count(*) FROM memory_derivation WHERE memory_id = ?1";
+        assert_eq!(count(dir.path(), drawn, purged), 0, "a purged conclusion rests on nothing");
+        let named = "SELECT count(*) FROM memory_derivation WHERE source_id = ?1";
+        assert_eq!(count(dir.path(), named, purged), 1, "the conclusion drawn from it keeps the trace of its loss");
     }
 
     #[tokio::test]
