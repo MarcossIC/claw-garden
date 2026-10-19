@@ -897,13 +897,13 @@ async fn identifier_matches(
 // through `idx_memory_agent_active`, so without `NOT INDEXED` the planner
 // drives the join from that index and visits EVERY live row the agent owns,
 // applying the id list afterwards as a filter. Same rows out, same distances,
-// cost proportional to the corpus instead of to the candidate list: at 5,000
-// rows and a 20-candidate budget that is ~730 µs instead of ~330 µs for this
-// query's `m.id IN` spelling with `NOT INDEXED` removed (measured on this
-// machine), and it grows with the corpus from there. The `v.rowid IN`
-// spelling pays far more for the same missing hint — tens of milliseconds at
-// the same corpus size — which is a separate, larger cost covered where that
-// spelling is rejected below. `NOT INDEXED` bars every index on `memory`
+// but a cost proportional to the corpus instead of to the candidate list:
+// it grows with every live row the agent owns, while the rowid plan grows
+// only with the ids named. The `v.rowid IN` spelling pays far more for the
+// same missing hint, since its `memory_vectors` plan line becomes an
+// unconstrained scan of the vector table, a separate and larger cost that
+// is covered where that spelling is rejected below. `NOT INDEXED` bars
+// every index on `memory`
 // while explicitly leaving the rowid available, which is the one access path
 // a query holding a list of ids ever wants.
 //
