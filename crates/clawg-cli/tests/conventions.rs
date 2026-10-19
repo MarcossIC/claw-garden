@@ -418,6 +418,10 @@ fn the_release_workflow_builds_only_the_cli_with_the_dist_mark() {
             step.iter().any(|l| l.trim() == "CLAWG_DIST_TARGET: ${{ matrix.target }}"),
             "the build step must set CLAWG_DIST_TARGET: {step:?}"
         );
+        // ort-sys downloads ONNX Runtime while building; one failed request
+        // must not stop a release.
+        let text = step.join("\n");
+        assert!(text.contains("for attempt in 1 2 3") && text.contains("sleep"), "the build is retried: {text}");
     }
 
     let steps = build.steps();
