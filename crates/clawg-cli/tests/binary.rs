@@ -1548,8 +1548,10 @@ async fn setup_without_claude_prints_the_command_and_installs_the_rest() {
     let bin = std::fs::canonicalize(BIN).unwrap();
     let line = format!("claude mcp add --scope user clawg-dev -- {} mcp --profile dev --agent claude-code", bin.display());
     assert!(text.contains(&line), "{text}");
-    let settings = std::fs::read_to_string(sandbox.home.join("claude-config").join("settings.json")).unwrap();
-    assert!(settings.contains("hook session-start --agent claude-code --profile dev"), "{settings}");
+    let settings: Value = serde_json::from_str(&std::fs::read_to_string(sandbox.home.join("claude-config").join("settings.json")).unwrap()).unwrap();
+    let hook = &settings["hooks"]["SessionStart"][0]["hooks"][0];
+    assert_eq!(hook["command"], json!(bin), "{settings}");
+    assert_eq!(hook["args"], json!(["hook", "session-start", "--agent", "claude-code", "--profile", "dev"]), "{settings}");
     let md = std::fs::read_to_string(sandbox.home.join("claude-config").join("CLAUDE.md")).unwrap();
     assert!(md.starts_with("<!-- BEGIN CLAWG MEMORY PROTOCOL -->"), "{md}");
 }

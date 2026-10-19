@@ -11,7 +11,9 @@
 //! Everything is read first, a pure [`plan`] decides, and [`apply`] only
 //! carries the plan out. Nothing that differs from the plan is replaced: a
 //! server or a clawg hook that does not match is reported as a conflict, and
-//! what is not clawg's is never touched.
+//! what is not clawg's is never touched. The one exception is the hook as
+//! earlier versions of setup wrote it, a command line for a shell, which is
+//! rewritten in place when it is exactly what setup wrote.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -156,6 +158,8 @@ pub struct HooksStep {
     pub added: Vec<&'static str>,
     pub unchanged: Vec<&'static str>,
     pub removed: Vec<&'static str>,
+    /// Events whose hook, as earlier versions of setup wrote it, is rewritten.
+    pub migrated: Vec<&'static str>,
     /// Events holding a clawg hook of this profile that differs from the plan,
     /// with its command.
     pub conflicts: Vec<(&'static str, String)>,
@@ -201,20 +205,19 @@ pub fn plan(state: &State, mode: Mode) -> Result<Plan, SetupError> {
         (Mode::Install, Some(entry)) if matches_server(entry, &server) => ServerStep::Unchanged,
         (Mode::Remove, None) => ServerStep::Absent,
         (Mode::Remove, Some(entry)) if is_clawg_server(entry) => ServerStep::Remove,
-        (_, Some(entry)) => ServerStep::Conflict(describe_server(entry)),
+        (_, Some(entry)) => ServerStep::Conflict(describe_command(entry)),
     };
 
     let mut settings = parse_object(&state.settings)?;
-    let commands = hook_commands(&state.exe, state.profile);
     if mode == Mode::Install && settings.is_none() {
         settings = Some(Map::new());
     }
     let hooks = match (mode, settings.as_mut()) {
         (_, None) => HooksStep::default(),
-        (Mode::Install, Some(s)) => install_hooks(s, &commands, state.profile, &state.settings.path)?,
+        (Mode::Install, Some(s)) => install_hooks(s, exe, state.profile, &state.settings.path)?,
         (Mode::Remove, Some(s)) => remove_hooks(s, state.profile, &state.settings.path)?,
     };
-    let settings_step = if hooks.added.is_empty() && hooks.removed.is_empty() {
+    let settings_step = if hooks.added.is_empty() && hooks.removed.is_empty() && hooks.migrated.is_empty() {
         FileStep::Unchanged
     } else {
         let value = Value::Object(settings.unwrap_or_default());
@@ -266,7 +269,8 @@ fn is_clawg_server(entry: &Value) -> bool {
     is_clawg_program(command) && first == Some("mcp")
 }
 
-fn describe_server(entry: &Value) -> String {
+/// A server entry or a hook as a command line: its `command`, then its `args`.
+fn describe_command(entry: &Value) -> String {
     let command = entry.get("command").and_then(Value::as_str);
     let args: Vec<&str> =
         entry.get("args").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
@@ -283,33 +287,41 @@ fn is_clawg_program(program: &str) -> bool {
     lower == "clawg" || lower == "clawg.exe"
 }
 
-/// The command each hook event runs, keyed by the client's event name.
-fn hook_commands(exe: &Path, profile: Profile) -> Vec<(&'static str, String)> {
-    let program = shell_word(&exe.to_string_lossy());
-    HOOK_EVENTS
-        .iter()
-        .map(|(event, arg)| (*event, format!("{program} hook {arg} --agent {AGENT} --profile {}", profile.as_str())))
-        .collect()
+/// What `clawg hook` takes for `event_arg` (`session-start`, …) and `profile`.
+fn hook_args(event_arg: &str, profile: Profile) -> Vec<String> {
+    ["hook", event_arg, "--agent", AGENT, "--profile", profile.as_str()].map(String::from).to_vec()
 }
 
-/// `exe` as the first word of a command a POSIX shell runs: with `/` for a
-/// Windows path, which Git Bash would otherwise read as escapes, and in
-/// double quotes only when it needs them, since the PowerShell a client falls
-/// back to does not run a quoted first word.
-fn shell_word(exe: &str) -> String {
-    let path = if cfg!(windows) { exe.replace('\\', "/") } else { exe.to_string() };
-    if !path.is_empty() && path.chars().all(|c| c.is_ascii_alphanumeric() || "/._-:".contains(c)) {
-        return path;
-    }
-    let mut quoted = String::from('"');
-    for c in path.chars() {
-        if matches!(c, '"' | '$' | '`' | '\\') {
-            quoted.push('\\');
+/// The hook the plan installs: the binary run directly with its arguments,
+/// without a shell between the client and clawg, so no shell can misread the
+/// path or print ahead of the hook's JSON.
+fn planned_hook(exe: &str, event_arg: &str, profile: Profile) -> Value {
+    serde_json::json!({ "type": "command", "command": exe, "args": hook_args(event_arg, profile), "timeout": HOOK_TIMEOUT_SECS })
+}
+
+/// The command line earlier versions of setup wrote for a hook, `words`
+/// being the program and its arguments: the program in double quotes only
+/// when it had anything outside `[A-Za-z0-9/._-:]`.
+fn legacy_command(words: &[String]) -> String {
+    let program = &words[0];
+    let mut line = if !program.is_empty() && program.chars().all(|c| c.is_ascii_alphanumeric() || "/._-:".contains(c)) {
+        program.clone()
+    } else {
+        let mut quoted = String::from('"');
+        for c in program.chars() {
+            if matches!(c, '"' | '$' | '`' | '\\') {
+                quoted.push('\\');
+            }
+            quoted.push(c);
         }
-        quoted.push(c);
+        quoted.push('"');
+        quoted
+    };
+    for word in &words[1..] {
+        line.push(' ');
+        line.push_str(word);
     }
-    quoted.push('"');
-    quoted
+    line
 }
 
 /// A word of a command line shown to the user, quoted when it has a space.
@@ -366,26 +378,45 @@ fn split_command(command: &str) -> Vec<String> {
     words
 }
 
-/// Whether a hook command is clawg's for `event_arg` (`session-start`, …)
-/// and `profile`. One without `--profile` belongs to no profile.
-fn is_clawg_hook(command: &str, event_arg: &str, profile: Profile) -> bool {
-    let words = split_command(command);
+/// A hook's program and arguments: `command` and `args` when it has `args`,
+/// which the client runs without a shell, else `command` split as a shell
+/// would. `None` when an argument is not text.
+fn hook_words(hook: &Value) -> Option<Vec<String>> {
+    let command = hook.get("command").and_then(Value::as_str)?;
+    match hook.get("args") {
+        None => Some(split_command(command)),
+        Some(args) => std::iter::once(Some(command.to_string()))
+            .chain(args.as_array()?.iter().map(|a| a.as_str().map(String::from)))
+            .collect(),
+    }
+}
+
+/// Whether a hook is clawg's for `event_arg` (`session-start`, …) and
+/// `profile`, in either form. One without `--profile` belongs to no profile.
+fn is_clawg_hook(hook: &Value, event_arg: &str, profile: Profile) -> bool {
+    let Some(words) = hook_words(hook) else { return false };
     let profile_given = words.windows(2).any(|w| w[0] == "--profile" && w[1] == profile.as_str())
         || words.iter().any(|w| w.strip_prefix("--profile=") == Some(profile.as_str()));
     words.len() >= 3 && is_clawg_program(&words[0]) && words[1] == "hook" && words[2] == event_arg && profile_given
 }
 
-fn event_arg(event: &str) -> &'static str {
-    HOOK_EVENTS.iter().find(|(e, _)| *e == event).map(|(_, a)| *a).expect("a known event")
+/// Whether a hook is, character for character, the command line earlier
+/// versions of setup wrote for `event_arg` and `profile`, whatever clawg
+/// binary it names. Anything else was edited by hand and is not rewritten.
+fn is_legacy_hook(hook: &Value, event_arg: &str, profile: Profile) -> bool {
+    let (Some(command), None) = (hook.get("command").and_then(Value::as_str), hook.get("args")) else { return false };
+    let words = split_command(command);
+    words.len() == 7 && is_clawg_program(&words[0]) && words[1..] == hook_args(event_arg, profile)[..] && legacy_command(&words) == command
 }
 
-/// The commands of every hook of an event's groups, in order.
-fn hook_commands_of(groups: &[Value]) -> impl Iterator<Item = &str> {
-    groups
-        .iter()
-        .filter_map(|g| g.get("hooks").and_then(Value::as_array))
-        .flatten()
-        .filter_map(|h| h.get("command").and_then(Value::as_str))
+/// Whether a hook runs what `planned` runs.
+fn runs_as(hook: &Value, planned: &Value) -> bool {
+    hook.get("command") == planned.get("command") && hook.get("args") == planned.get("args")
+}
+
+/// The hooks of an event's groups, in order.
+fn hooks_of(groups: &[Value]) -> impl Iterator<Item = &Value> {
+    groups.iter().filter_map(|g| g.get("hooks").and_then(Value::as_array)).flatten()
 }
 
 /// The `hooks` object of the settings, and the array of one event in it.
@@ -418,27 +449,31 @@ fn event_groups<'a>(
         .ok_or(SetupError::Unexpected { path: path.to_path_buf(), what: "an event under `hooks` is not a list" })
 }
 
-fn install_hooks(
-    settings: &mut Map<String, Value>,
-    commands: &[(&'static str, String)],
-    profile: Profile,
-    path: &Path,
-) -> Result<HooksStep, SetupError> {
+fn install_hooks(settings: &mut Map<String, Value>, exe: &str, profile: Profile, path: &Path) -> Result<HooksStep, SetupError> {
     let mut step = HooksStep::default();
-    for (event, command) in commands {
-        let event = *event;
+    for (event, arg) in HOOK_EVENTS {
+        let planned = planned_hook(exe, arg, profile);
         // Checked before anything is created, so an unchanged file stays byte
         // for byte as it was.
-        let existing: Vec<String> = match event_groups(settings, event, false, path)? {
-            Some(groups) => hook_commands_of(groups)
-                .filter(|c| is_clawg_hook(c, event_arg(event), profile))
-                .map(String::from)
-                .collect(),
-            None => Vec::new(),
-        };
-        if let Some(other) = existing.iter().find(|c| *c != command) {
-            step.conflicts.push((event, other.clone()));
-        } else if !existing.is_empty() {
+        let (mut installed, mut legacy, mut other) = (false, false, None);
+        if let Some(groups) = event_groups(settings, event, false, path)? {
+            for hook in hooks_of(groups).filter(|h| is_clawg_hook(h, arg, profile)) {
+                if runs_as(hook, &planned) {
+                    installed = true;
+                } else if is_legacy_hook(hook, arg, profile) {
+                    legacy = true;
+                } else if other.is_none() {
+                    other = Some(describe_command(hook));
+                }
+            }
+        }
+        if let Some(other) = other {
+            step.conflicts.push((event, other));
+        } else if legacy {
+            let groups = event_groups(settings, event, false, path)?.expect("found above");
+            migrate_hooks(groups, &planned, installed, arg, profile);
+            step.migrated.push(event);
+        } else if installed {
             step.unchanged.push(event);
         } else {
             let groups = event_groups(settings, event, true, path)?.expect("created");
@@ -446,13 +481,35 @@ fn install_hooks(
             if event == "SessionStart" {
                 group.insert("matcher".into(), SESSION_START_MATCHER.into());
             }
-            let hook = serde_json::json!({ "type": "command", "command": command, "timeout": HOOK_TIMEOUT_SECS });
-            group.insert("hooks".into(), Value::Array(vec![hook]));
+            group.insert("hooks".into(), Value::Array(vec![planned]));
             groups.push(Value::Object(group));
             step.added.push(event);
         }
     }
     Ok(step)
+}
+
+/// Puts `planned` where the first hook as setup wrote it was, so its group
+/// keeps its place and its matcher, and drops the others: one more would run
+/// clawg twice. A group left without hooks by that goes too.
+fn migrate_hooks(groups: &mut Vec<Value>, planned: &Value, installed: bool, event_arg: &str, profile: Profile) {
+    let mut placed = installed;
+    groups.retain_mut(|group| {
+        let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) else { return true };
+        let before = hooks.len();
+        hooks.retain_mut(|hook| {
+            if !is_legacy_hook(hook, event_arg, profile) {
+                return true;
+            }
+            if placed {
+                return false;
+            }
+            *hook = planned.clone();
+            placed = true;
+            true
+        });
+        !(hooks.len() != before && hooks.is_empty())
+    });
 }
 
 fn remove_hooks(settings: &mut Map<String, Value>, profile: Profile, path: &Path) -> Result<HooksStep, SetupError> {
@@ -463,7 +520,7 @@ fn remove_hooks(settings: &mut Map<String, Value>, profile: Profile, path: &Path
         groups.retain_mut(|group| {
             let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) else { return true };
             let before = hooks.len();
-            hooks.retain(|h| !h.get("command").and_then(Value::as_str).is_some_and(|c| is_clawg_hook(c, arg, profile)));
+            hooks.retain(|h| !is_clawg_hook(h, arg, profile));
             let emptied = hooks.len() != before;
             removed |= emptied;
             !(emptied && hooks.is_empty())
@@ -736,6 +793,9 @@ pub fn report(plan: &Plan, state: &State, applied: Option<&Applied>) -> (String,
     if !hooks.removed.is_empty() {
         parts.push(format!("{} {}", will("removed", "remove"), hooks.removed.join(", ")));
     }
+    if !hooks.migrated.is_empty() {
+        parts.push(format!("{} {} to run without a shell", will("migrated", "migrate"), hooks.migrated.join(", ")));
+    }
     if !hooks.unchanged.is_empty() {
         parts.push(format!("{} already there", hooks.unchanged.join(", ")));
     }
@@ -866,8 +926,26 @@ mod tests {
         .to_string()
     }
 
-    fn command(event_arg: &str) -> String {
-        format!("{} hook {event_arg} --agent claude-code --profile dev", shell_word(exe().to_str().unwrap()))
+    /// The hook the plan installs for `event_arg` in the dev profile.
+    fn hook(event_arg: &str) -> Value {
+        serde_json::json!({
+            "type": "command", "command": exe().to_str().unwrap(),
+            "args": ["hook", event_arg, "--agent", "claude-code", "--profile", "dev"], "timeout": 5
+        })
+    }
+
+    /// A settings file whose events hold these hooks, one group each.
+    fn settings_with(hooks: &[(&str, Value)]) -> String {
+        let mut events = Map::new();
+        for (event, hook) in hooks {
+            let groups = events.entry(event.to_string()).or_insert_with(|| Value::Array(Vec::new()));
+            groups.as_array_mut().unwrap().push(serde_json::json!({ "hooks": [hook] }));
+        }
+        serde_json::json!({ "hooks": events }).to_string()
+    }
+
+    fn shell_hook(command: &str) -> Value {
+        serde_json::json!({ "type": "command", "command": command, "timeout": 5 })
     }
 
     #[test]
@@ -883,9 +961,8 @@ mod tests {
         assert_eq!(
             settings,
             serde_json::json!({ "hooks": {
-                "SessionStart": [{ "matcher": "startup|resume|clear|compact",
-                    "hooks": [{ "type": "command", "command": command("session-start"), "timeout": 5 }] }],
-                "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": command("user-prompt-submit"), "timeout": 5 }] }]
+                "SessionStart": [{ "matcher": "startup|resume|clear|compact", "hooks": [hook("session-start")] }],
+                "UserPromptSubmit": [{ "hooks": [hook("user-prompt-submit")] }]
             }})
         );
         assert_eq!(plan.block, BlockStep::Added);
@@ -936,7 +1013,7 @@ mod tests {
         assert_eq!(events, ["UserPromptSubmit", "PreToolUse", "SessionStart"]);
         let prompt = value["hooks"]["UserPromptSubmit"].as_array().unwrap();
         assert_eq!(prompt[0]["hooks"][0]["command"], "~/bin/remind.sh");
-        assert_eq!(prompt[1]["hooks"][0]["command"], command("user-prompt-submit"));
+        assert_eq!(prompt[1]["hooks"][0], hook("user-prompt-submit"));
         assert_eq!(value["hooks"]["PreToolUse"], serde_json::json!([{ "matcher": "Bash", "hooks": [{ "type": "command", "command": "guard" }] }]));
     }
 
@@ -948,6 +1025,103 @@ mod tests {
         assert_eq!(plan.hooks.added, ["UserPromptSubmit"]);
         let value: Value = serde_json::from_str(written(&plan.settings)).unwrap();
         assert_eq!(value["hooks"]["SessionStart"].as_array().unwrap().len(), 1, "the conflicting hook is not replaced");
+
+        let moved = serde_json::json!({ "type": "command", "command": "/old/clawg",
+            "args": ["hook", "session-start", "--agent", "claude-code", "--profile", "dev"] });
+        let moved = super::plan(&state(None, Some(&settings_with(&[("SessionStart", moved)])), None), Mode::Install).unwrap();
+        let shown = "/old/clawg hook session-start --agent claude-code --profile dev".to_string();
+        assert_eq!(moved.hooks.conflicts, [("SessionStart", shown)]);
+    }
+
+    #[test]
+    fn the_hook_runs_the_binary_without_a_shell() {
+        let exe = if cfg!(windows) {
+            r"C:\Users\Ana María\AppData\Local\Programs\clawg\clawg.exe"
+        } else {
+            "/home/Ana María/bin/clawg"
+        };
+        let s = State { exe: PathBuf::from(exe), ..state(None, None, None) };
+        let plan = plan(&s, Mode::Install).unwrap();
+        let value: Value = serde_json::from_str(written(&plan.settings)).unwrap();
+        for (event, arg) in [("SessionStart", "session-start"), ("UserPromptSubmit", "user-prompt-submit")] {
+            let hook = &value["hooks"][event][0]["hooks"][0];
+            assert_eq!(hook["command"], exe, "the path as it is, unquoted");
+            assert_eq!(hook["args"], serde_json::json!(["hook", arg, "--agent", "claude-code", "--profile", "dev"]));
+        }
+    }
+
+    #[test]
+    fn an_old_shell_hook_of_clawg_is_migrated_in_place() {
+        let settings = serde_json::json!({ "theme": "dark", "hooks": {
+            "SessionStart": [{ "matcher": "startup|resume|clear|compact",
+                "hooks": [shell_hook("/old/clawg hook session-start --agent claude-code --profile dev")] }],
+            "UserPromptSubmit": [
+                { "hooks": [shell_hook(r#""/home/Ana María/clawg" hook user-prompt-submit --agent claude-code --profile dev"#)] },
+                { "hooks": [{ "type": "command", "command": "guard" }] }
+            ]
+        }})
+        .to_string();
+        let first = plan(&state(None, Some(&settings), None), Mode::Install).unwrap();
+        assert_eq!(first.hooks.migrated, ["SessionStart", "UserPromptSubmit"]);
+        assert!(first.hooks.added.is_empty() && first.hooks.conflicts.is_empty(), "{:?}", first.hooks);
+        let value: Value = serde_json::from_str(written(&first.settings)).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "theme": "dark", "hooks": {
+                "SessionStart": [{ "matcher": "startup|resume|clear|compact", "hooks": [hook("session-start")] }],
+                "UserPromptSubmit": [{ "hooks": [hook("user-prompt-submit")] }, { "hooks": [{ "type": "command", "command": "guard" }] }]
+            }})
+        );
+        let s = state(None, Some(&settings), None);
+        let (text, code) = report(&first, &s, None);
+        assert_eq!(code, 0, "{text}");
+        assert!(text.contains("would migrate SessionStart, UserPromptSubmit to run without a shell"), "{text}");
+
+        let second = plan(&state(None, after(Some(&settings), &first.settings).as_deref(), None), Mode::Install).unwrap();
+        assert_eq!(second.hooks.unchanged, ["SessionStart", "UserPromptSubmit"]);
+        assert_eq!(second.settings, FileStep::Unchanged);
+
+        let both = settings_with(&[
+            ("SessionStart", hook("session-start")),
+            ("SessionStart", shell_hook("/opt/clawg/clawg hook session-start --agent claude-code --profile dev")),
+        ]);
+        let plan = plan(&state(None, Some(&both), None), Mode::Install).unwrap();
+        assert_eq!(plan.hooks.migrated, ["SessionStart"]);
+        let value: Value = serde_json::from_str(written(&plan.settings)).unwrap();
+        assert_eq!(value["hooks"]["SessionStart"], serde_json::json!([{ "hooks": [hook("session-start")] }]), "it would run twice");
+    }
+
+    #[test]
+    fn an_edited_shell_hook_is_still_a_conflict() {
+        for edited in [
+            "/old/clawg hook session-start --agent claude-code --profile dev --verbose",
+            "/old/clawg  hook session-start --agent claude-code --profile dev",
+            "'/old/clawg' hook session-start --agent claude-code --profile dev",
+            "/old/clawg hook session-start --agent claude-code --profile=dev",
+        ] {
+            let settings = settings_with(&[("SessionStart", shell_hook(edited))]);
+            let plan = plan(&state(None, Some(&settings), None), Mode::Install).unwrap();
+            assert_eq!(plan.hooks.conflicts, [("SessionStart", edited.to_string())], "{edited}");
+            assert!(plan.hooks.migrated.is_empty(), "{edited}");
+            let value: Value = serde_json::from_str(written(&plan.settings)).unwrap();
+            assert_eq!(value["hooks"]["SessionStart"], serde_json::json!([{ "hooks": [shell_hook(edited)] }]), "{edited}");
+        }
+    }
+
+    #[test]
+    fn remove_takes_both_forms() {
+        let foreign = serde_json::json!({ "type": "command", "command": "echo hi" });
+        let exec = serde_json::json!({ "type": "command", "command": "/elsewhere/clawg",
+            "args": ["hook", "session-start", "--agent", "a", "--profile", "dev"] });
+        let settings = settings_with(&[
+            ("SessionStart", exec),
+            ("SessionStart", foreign.clone()),
+            ("UserPromptSubmit", shell_hook("clawg hook user-prompt-submit --agent a --profile dev")),
+        ]);
+        let plan = plan(&state(None, Some(&settings), None), Mode::Remove).unwrap();
+        assert_eq!(plan.hooks.removed, ["SessionStart", "UserPromptSubmit"]);
+        let value: Value = serde_json::from_str(written(&plan.settings)).unwrap();
+        assert_eq!(value, serde_json::json!({ "hooks": { "SessionStart": [{ "hooks": [foreign] }] } }));
     }
 
     #[test]
@@ -1127,7 +1301,8 @@ mod tests {
         let copy = data.join("backups").join("setup").join(format!("settings.json-{}", stamp(1_700_000_000_000)));
         assert_eq!(std::fs::read_to_string(&copy).unwrap(), r#"{"theme":"dark"}"#);
         assert!(text.contains(&format!("previous file copied to {}", copy.display())), "{text}");
-        assert!(std::fs::read_to_string(&settings).unwrap().contains("hook session-start"));
+        let value: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(value["hooks"]["SessionStart"][0]["hooks"][0], hook("session-start"));
         let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert!(!leftovers.iter().any(|n| n.to_string_lossy().ends_with(".clawg-tmp")), "{leftovers:?}");
     }
@@ -1161,22 +1336,25 @@ mod tests {
         assert_eq!(split_command(r#""/my dir/clawg" hook  session-start --profile 'dev'"#), ["/my dir/clawg", "hook", "session-start", "--profile", "dev"]);
         assert_eq!(split_command(r"a\ b c"), ["a b", "c"]);
         assert_eq!(split_command(r#""" x"#), ["", "x"]);
-        assert!(is_clawg_hook(r#""C:/Program Files/clawg/clawg.exe" hook session-start --agent a --profile=dev"#, "session-start", Profile::Dev));
-        assert!(!is_clawg_hook("clawg hook session-start --agent a", "session-start", Profile::Dev), "no profile");
-        assert!(!is_clawg_hook("clawgx hook session-start --profile dev", "session-start", Profile::Dev));
-        assert!(!is_clawg_hook("clawg hook user-prompt-submit --profile dev", "session-start", Profile::Dev));
+        let ours = |hook: Value| is_clawg_hook(&hook, "session-start", Profile::Dev);
+        assert!(ours(shell_hook(r#""C:/Program Files/clawg/clawg.exe" hook session-start --agent a --profile=dev"#)));
+        assert!(!ours(shell_hook("clawg hook session-start --agent a")), "no profile");
+        assert!(!ours(shell_hook("clawgx hook session-start --profile dev")));
+        assert!(!ours(shell_hook("clawg hook user-prompt-submit --profile dev")));
+        assert!(ours(serde_json::json!({ "command": r"C:\x\clawg.exe", "args": ["hook", "session-start", "--profile=dev"] })));
+        assert!(!ours(serde_json::json!({ "command": "clawg hook session-start --profile dev", "args": [] })), "args make command a program");
+        assert!(!ours(serde_json::json!({ "command": "/x/clawg", "args": ["hook", "session-start", "--profile", 1] })));
     }
 
     #[test]
-    fn the_hook_program_is_quoted_only_when_it_needs_it() {
-        assert_eq!(shell_word("/opt/clawg/clawg"), "/opt/clawg/clawg");
-        assert_eq!(shell_word("/home/a b/clawg"), "\"/home/a b/clawg\"");
-        assert_eq!(shell_word("/x/$HOME`/clawg"), "\"/x/\\$HOME\\`/clawg\"");
-        if cfg!(windows) {
-            assert_eq!(shell_word(r"C:\Users\me\clawg.exe"), "C:/Users/me/clawg.exe");
-        }
+    fn the_old_command_is_quoted_as_setup_quoted_it() {
+        let args = |program: &str| [program, "hook", "session-start"].map(String::from);
+        assert_eq!(legacy_command(&args("/opt/clawg/clawg")), "/opt/clawg/clawg hook session-start");
+        assert_eq!(legacy_command(&args("C:/Users/me/clawg.exe")), "C:/Users/me/clawg.exe hook session-start");
+        assert_eq!(legacy_command(&args("/home/a b/clawg")), "\"/home/a b/clawg\" hook session-start");
+        assert_eq!(legacy_command(&args("/x/$HOME`/clawg")), "\"/x/\\$HOME\\`/clawg\" hook session-start");
         for word in ["/opt/clawg/clawg", "/home/a b/clawg", "/x/$HOME`/clawg"] {
-            assert_eq!(split_command(&shell_word(word)), [word], "a quoted word reads back as itself");
+            assert_eq!(split_command(&legacy_command(&args(word)))[0], word, "a quoted word reads back as itself");
         }
     }
 }
