@@ -105,7 +105,7 @@
 
 ## Interacciones
 
-- **Subida de `Cargo.lock` (rustls, rustls-webpki, h2).** Es un arreglo suelto previo, con su commit y su bump de patch; este cambio es el proceso para que el aviso se vea la próxima vez. Con C activo, ese arreglo debe estar hecho antes o `deny.toml` arranca con `ignore`.
+- **Subida de `Cargo.lock` (rustls, rustls-webpki, h2).** Es un arreglo suelto previo, ya hecho (`c50dff3`, en 0.27.5); este cambio es el proceso para que el aviso se vea la próxima vez. Con C activo, ese arreglo debe estar hecho antes o `deny.toml` arranca con `ignore`.
 - **Backlog «Hallazgos de `clippy`» de `openspec/README.md`:** G da el MSRV real para el ítem «un ítem más nuevo que el MSRV» y, cuando esos lints se arreglen, el comando de `ci.yml:53` pierde `-A clippy::all`; este cambio no lo quita.
 - **release-and-self-update (47, archivado).** Cierra su W3. Modifica `openspec/specs/install/spec.md` (sección «CI», `:127-141`: comandos, acciones, escenarios y la prueba que fija `ci.yml`) y `openspec/specs/release/spec.md` (R4 sobre CI como único disparador, y R8 si se agrega I).
 - **`.claude/CLAUDE.md` (Testing, `:111-113`)** describe el CI y el release; se actualiza en el mismo commit que cualquier cambio de workflow, y `conventions.rs` lee los dos workflows como texto, así que workflow y prueba cambian juntos.
@@ -122,7 +122,7 @@
 
 ### No-alcance
 
-- La subida de `rustls`, `rustls-webpki` y `h2` en `Cargo.lock`: arreglo suelto previo.
+- La subida de `rustls`, `rustls-webpki` y `h2` en `Cargo.lock`: arreglo suelto previo, ya hecho (`c50dff3`).
 - Ajustes del repositorio en GitHub (revisor obligatorio en el environment `release`, ruleset en `main`, protección de etiquetas `v*`): son configuración fuera del repo y decisión aparte; hoy el environment está «sin revisores obligatorios» (`openspec/specs/release/spec.md:92`).
 - Quitar `-A clippy::all` y arreglar los lints.
 - Gate de rutas (H) e `install.ps1` (I), salvo decisión abajo.
