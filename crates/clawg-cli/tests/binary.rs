@@ -1031,20 +1031,28 @@ fn last_migration() -> i32 {
         .expect("the binary has migrations")
 }
 
-/// What the daemon the data directory names answers to `path`.
-async fn published_get(data_dir: &Path, path: &str) -> String {
+/// What the daemon the data directory names answers to `method` on `path`.
+async fn published_send(data_dir: &Path, method: reqwest::Method, path: &str) -> String {
     let state: Value =
         serde_json::from_str(&std::fs::read_to_string(data_dir.join("daemon.json")).expect("daemon.json"))
             .expect("daemon.json is JSON");
     let token = std::fs::read_to_string(data_dir.join("token")).expect("token");
     let response = reqwest::Client::new()
-        .get(format!("http://127.0.0.1:{}{path}", state["port"]))
+        .request(method, format!("http://127.0.0.1:{}{path}", state["port"]))
         .bearer_auth(token.trim())
         .send()
         .await
         .expect("request");
     assert!(response.status().is_success(), "{path}: {}", response.status());
     response.text().await.expect("body")
+}
+
+async fn published_get(data_dir: &Path, path: &str) -> String {
+    published_send(data_dir, reqwest::Method::GET, path).await
+}
+
+async fn published_delete(data_dir: &Path, path: &str) -> Value {
+    serde_json::from_str(&published_send(data_dir, reqwest::Method::DELETE, path).await).expect("delete json")
 }
 
 const SEEDED: [&str; 2] = [
@@ -1070,10 +1078,10 @@ async fn seeded_store(sandbox: &Sandbox) -> (PathBuf, Daemon) {
 /// SQL against this schema, so a later migration only adds one more pending.
 const OLD_SCHEMA: i32 = 15;
 
-/// A daemon of an installed copy frozen at [`OLD_SCHEMA`], over a store with
-/// `SEEDED` in it.
-async fn store_behind(sandbox: &Sandbox) -> (PathBuf, Daemon) {
-    let installed = install(sandbox, &stamp_json("0.18.0", &format!(r#","migrations_up_to":{OLD_SCHEMA}"#)));
+/// A daemon of an installed copy frozen at `schema`, over a store `seed`
+/// wrote into while no daemon held it.
+async fn store_at(sandbox: &Sandbox, schema: i32, seed: impl FnOnce(&rusqlite::Connection)) -> (PathBuf, Daemon) {
+    let installed = install(sandbox, &stamp_json("0.18.0", &format!(r#","migrations_up_to":{schema}"#)));
     // The first start only creates the store at that schema.
     let first = sandbox.serve_binary(&installed, "fake").await;
     let stopped = sandbox.command_of(&installed, &["stop", "--profile", "dev"]).output().expect("run clawg stop");
@@ -1081,16 +1089,76 @@ async fn store_behind(sandbox: &Sandbox) -> (PathBuf, Daemon) {
     first.wait_for_exit(Duration::from_secs(10)).await;
 
     let db = rusqlite::Connection::open(sandbox.data_dir().join("memory.db")).expect("open the store");
-    for text in SEEDED {
+    seed(&db);
+    drop(db);
+    (installed.clone(), sandbox.serve_binary(&installed, "fake").await)
+}
+
+/// A daemon of an installed copy frozen at [`OLD_SCHEMA`], over a store with
+/// `SEEDED` in it.
+async fn store_behind(sandbox: &Sandbox) -> (PathBuf, Daemon) {
+    store_at(sandbox, OLD_SCHEMA, |db| {
+        for text in SEEDED {
+            db.execute(
+                "INSERT INTO memory (agent_id, content, created_at, last_modified_at, last_accessed_at) \
+                 VALUES ('smoke', ?1, 0, 0, 0)",
+                [text],
+            )
+            .expect("seed a row");
+        }
+    })
+    .await
+}
+
+/// The last schema before `supersede_cause`. A store at it holds revisions
+/// and verdicts with no cause recorded, and the migration has to tell them
+/// apart by what they left in `topic_key` and `memory_conflict`.
+const UNCAUSED_SCHEMA: i32 = 16;
+
+type Row = (i64, String, String, Option<i64>, Option<String>, bool);
+
+/// `(id, content, status, superseded_by, topic_key, deleted)`. 2 revised 1;
+/// 4 revised 3 until a verdict undid it; 6 won a verdict over 5; 8 revised 7
+/// and was deleted.
+const UNCAUSED_ROWS: [(i64, &str, &str, Option<i64>, Option<&str>, bool); 8] = [
+    (1, "storage engine is SQLite", "superseded", Some(2), Some("storage/engine"), false),
+    (2, "storage engine moved to Postgres", "active", None, Some("storage/engine"), false),
+    (3, "the daemon listens on port 27380", "active", None, Some("api/port"), false),
+    (4, "the daemon listens on port 27390", "superseded", Some(3), Some("api/port"), false),
+    (5, "backups are written weekly", "superseded", Some(6), None, false),
+    (6, "backups are written every night", "active", None, None, false),
+    (7, "logs rotate at 10 MB", "superseded", Some(8), Some("logs/rotation"), false),
+    (8, "logs rotate at 50 MB", "active", None, Some("logs/rotation"), true),
+];
+
+fn seed_uncaused(db: &rusqlite::Connection) {
+    for (id, content, status, by, key, deleted) in UNCAUSED_ROWS {
         db.execute(
-            "INSERT INTO memory (agent_id, content, created_at, last_modified_at, last_accessed_at) \
-             VALUES ('smoke', ?1, 0, 0, 0)",
-            [text],
+            "INSERT INTO memory (id, agent_id, content, status, superseded_by, topic_key, deleted_at, \
+             created_at, last_modified_at, last_accessed_at) \
+             VALUES (?1, 'smoke', ?2, ?3, ?4, ?5, ?6, ?1, ?1, ?1)",
+            rusqlite::params![id, content, status, by, key, deleted.then_some(100)],
         )
         .expect("seed a row");
     }
-    drop(db);
-    (installed.clone(), sandbox.serve_binary(&installed, "fake").await)
+    db.execute_batch(
+        "INSERT INTO memory_conflict (new_id, old_id, distance, state, verdict, created_at, judged_at) \
+         VALUES (4, 3, NULL, 'judged', 'supersedes', 4, 4), (6, 5, 0.2, 'judged', 'supersedes', 6, 6);",
+    )
+    .expect("seed the verdicts");
+}
+
+/// The rows of the store at `path`, as [`UNCAUSED_ROWS`] lists them.
+fn rows_in(path: &Path) -> Vec<Row> {
+    let db = rusqlite::Connection::open(path).expect("open the store");
+    db.prepare(
+        "SELECT id, content, status, superseded_by, topic_key, deleted_at IS NOT NULL FROM memory ORDER BY id",
+    )
+    .and_then(|mut q| {
+        q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+            .and_then(Iterator::collect)
+    })
+    .expect("read the rows")
 }
 
 /// The `pre-migration` snapshots in the data directory.
@@ -1136,6 +1204,60 @@ async fn an_update_over_a_pending_migration_leaves_a_pre_migration_snapshot_and_
     for text in SEEDED {
         assert!(rows.contains(text), "{text:?} survived the migration: {rows}");
     }
+}
+
+// The server runs in this process while the binary is waited on.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_over_a_store_without_supersede_causes_keeps_its_rows_and_tells_revisions_from_verdicts() {
+    let sandbox = Sandbox::new();
+    let (installed, old) = store_at(&sandbox, UNCAUSED_SCHEMA, seed_uncaused).await;
+    let release = signed_release("0.19.0", "");
+    let server = ReleaseServer::serving(release.listing.clone(), release.files.clone()).await;
+    let _stop = StopOnDrop { home: sandbox.home.clone() };
+
+    let out = update_from(&sandbox, &installed, &server.base, &release.public);
+
+    assert_eq!(out.status.code(), Some(0), "{}\n{}", stdout_of(&out), stderr_of(&out));
+    old.wait_for_exit(Duration::from_secs(10)).await;
+    let health = published_health(&sandbox.data_dir()).await;
+    assert_eq!(health["version"], "0.19.0", "{health}");
+
+    let seeded: Vec<Row> = UNCAUSED_ROWS
+        .iter()
+        .map(|&(id, content, status, by, key, deleted)| {
+            (id, content.to_string(), status.to_string(), by, key.map(str::to_string), deleted)
+        })
+        .collect();
+    let snapshots = pre_migrations(&sandbox.data_dir());
+    assert_eq!(snapshots.len(), 1, "{snapshots:?}");
+    let version: i32 = rusqlite::Connection::open(&snapshots[0])
+        .and_then(|db| db.query_row("SELECT max(version) FROM refinery_schema_history", [], |r| r.get(0)))
+        .expect("snapshot schema");
+    assert_eq!(version, UNCAUSED_SCHEMA, "the snapshot is the store as the old binary left it");
+    assert_eq!(rows_in(&snapshots[0]), seeded, "the snapshot holds every row");
+
+    let store = sandbox.data_dir().join("memory.db");
+    assert_eq!(rows_in(&store), seeded, "the migration changed no row");
+    let added: Vec<(Option<String>, Option<i64>)> = rusqlite::Connection::open(&store)
+        .expect("open the store")
+        .prepare("SELECT supersede_cause, revived_from FROM memory ORDER BY id")
+        .and_then(|mut q| q.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).and_then(Iterator::collect))
+        .expect("read the causes");
+    let causes: Vec<Option<&str>> = added.iter().map(|(cause, _)| cause.as_deref()).collect();
+    assert_eq!(
+        causes,
+        [Some("revision"), None, None, Some("verdict"), Some("verdict"), None, Some("revision"), None]
+    );
+    assert!(added.iter().all(|(_, from)| from.is_none()), "{added:?}");
+
+    let revised = published_delete(&sandbox.data_dir(), "/v1/memories/memory/2").await;
+    assert_eq!(revised["revived"][0]["id"], 1, "the version before is current again: {revised}");
+    assert!(revised.get("hidden").is_none(), "{revised}");
+    let undone = published_delete(&sandbox.data_dir(), "/v1/memories/memory/3").await;
+    assert!(undone.get("revived").is_none(), "a revision a verdict undid stays replaced: {undone}");
+    assert_eq!(undone["hidden"], json!([4]), "{undone}");
+    let judged = published_delete(&sandbox.data_dir(), "/v1/memories/memory/6").await;
+    assert_eq!(judged["hidden"], json!([5]), "{judged}");
 }
 
 // The server runs in this process while the binary is waited on.
