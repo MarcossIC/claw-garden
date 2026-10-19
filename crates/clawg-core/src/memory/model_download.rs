@@ -346,6 +346,8 @@ pub enum DownloadError {
     BaseUrl(String),
     #[error("the model files in the cache do not verify: {}", files.join(", "))]
     NotCached { files: Vec<String> },
+    #[error("{file} is larger than {limit_mb} MB, more than any file of the model")]
+    TooLarge { file: String, limit_mb: u64 },
     #[error("sha-256 mismatch for {file}: expected {expected}, got {actual}")]
     ChecksumMismatch {
         file: String,
@@ -718,19 +720,27 @@ async fn download_one(
         // total (not per file), so a multi-file run yields a smooth progress
         // ramp without spamming the channel.
         let content_length = resp.content_length().unwrap_or(0);
+        if content_length > MAX_FILE_BYTES {
+            let _ = std::fs::remove_file(&partial);
+            return Err(too_large(spec));
+        }
         let bytes_total_hint = *bytes_downloaded_running + content_length;
         let mut next_emit_threshold = *bytes_downloaded_running + CHUNK_PROGRESS_BYTES;
 
         let mut body = Vec::with_capacity(content_length as usize);
         let mut digest = sha2::Sha256::new();
         let mut stream = resp.bytes_stream();
-        let mut io_err: Option<DownloadError> = None;
+        let mut fatal: Option<DownloadError> = None;
         let mut stream_err: Option<reqwest::Error> = None;
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
+                    if (body.len() + bytes.len()) as u64 > MAX_FILE_BYTES {
+                        fatal = Some(too_large(spec));
+                        break;
+                    }
                     if let Err(e) = file.write_all(&bytes) {
-                        io_err = Some(DownloadError::Io {
+                        fatal = Some(DownloadError::Io {
                             file: spec.path.into(),
                             source: e,
                         });
@@ -757,8 +767,9 @@ async fn download_one(
             }
         }
 
-        if let Some(e) = io_err {
-            // IO errors are not transient — bail out without consuming budget.
+        if let Some(e) = fatal {
+            // Not transient: a full disk or an oversized file does not change
+            // on the next attempt.
             let _ = std::fs::remove_file(&partial);
             return Err(e);
         }
@@ -818,6 +829,17 @@ async fn download_one(
         attempts: ATTEMPTS,
         cause,
     })
+}
+
+/// Larger than any file of the model: what the disk pre-flight asks to have
+/// free. The bytes are held in memory to hand them to the load unread.
+const MAX_FILE_BYTES: u64 = MIN_FREE_BYTES;
+
+fn too_large(spec: &FileSpec) -> DownloadError {
+    DownloadError::TooLarge {
+        file: spec.path.into(),
+        limit_mb: MAX_FILE_BYTES / (1024 * 1024),
+    }
 }
 
 /// The host and port of `base_url`, without the path or any credentials it
@@ -1607,6 +1629,22 @@ mod tests {
             assert!(err.contains(BASE_URL_VAR), "{err}");
             assert!(!err.contains("s3cret"), "{err}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_file_larger_than_any_model_file_is_refused_without_holding_it() {
+        let tmp = TestDir::new("dl-too-large");
+        let files = fixture_files();
+        let specs = fixture_specs(&files);
+        let oracle = MockDiskOracle::returning(MIN_FREE_BYTES);
+        let url = silent_server(b"HTTP/1.1 200 OK\r\nContent-Length: 1099511627776\r\n\r\nfake-onnx");
+        let source = ModelSource { timeouts: SHORT, ..source(&url, &oracle, &specs) };
+
+        match ensure_model_from(tmp.path(), &source, None).await {
+            Err(DownloadError::TooLarge { file, .. }) => assert_eq!(file, "onnx/model.onnx"),
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+        assert!(collect_partials(&tmp.path().join("models").join("multilingual-e5-small")).is_empty());
     }
 
     // ---------- The cause of a failure ----------
