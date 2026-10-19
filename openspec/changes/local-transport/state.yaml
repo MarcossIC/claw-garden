@@ -1,0 +1,14 @@
+change: local-transport
+objective: "transversal"
+depends_on: [local-isolation, shutdown-budget]
+phase: explore
+artifacts:
+  exploration: draft
+  proposal: pending
+  spec: pending
+  design: pending
+  tasks: pending
+  apply: pending
+  verify: pending
+  archive: pending
+updated: 2026-10-19
