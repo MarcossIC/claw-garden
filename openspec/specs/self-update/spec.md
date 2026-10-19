@@ -140,7 +140,7 @@ El plan de `update` MUST ser una lista de pasos como datos, ejecutada aparte, de
 
 ## S9. Vuelta atrás tras el intercambio
 
-Si el daemon nuevo no contesta `/health` con la versión nueva en el plazo, `update` MUST devolver el binario viejo a su nombre y volver a levantar su daemon; el plazo MUST distinguir «arrancando» (migración o re-embed largos) de «no arrancó». Si el daemon nuevo alcanzó a migrar el store y el binario viejo se niega a abrirlo (`MemoryError::SchemaNewer` o `SchemaDiverged`, `crates/clawg-core/src/memory/error.rs:53-64`), `update` MUST restaurar en el acto el snapshot `pre-migration` que escribió ese arranque, con `clawg_core::memory::backup::restore` llamado desde el propio proceso de `update` (el binario viejo), y después devolver el binario viejo y arrancar su daemon. `restore` guarda antes el store migrado como `pre-restore`, así que nada se destruye. Si el restore falla, `update` MUST dejar el binario nuevo, el único que abre ese store, y el informe MUST dar la causa del arranque, la del restore, dónde está cada archivo y los comandos para volver a mano (D2). Un candidato que no arranca y no migró MUST dejar el binario viejo y su daemon.
+Si el daemon nuevo no contesta `/health` con la versión nueva en el plazo, `update` MUST devolver el binario viejo a su nombre y volver a levantar su daemon; el plazo MUST distinguir «arrancando» (migración o re-embed largos) de «no arrancó». Si el daemon nuevo alcanzó a migrar el store y el binario viejo se niega a abrirlo (`MemoryError::SchemaNewer` o `SchemaDiverged`, `crates/clawg-core/src/memory/error.rs:53-64`), `update` MUST restaurar en el acto el snapshot `pre-migration` que escribió ese arranque, con `clawg_core::memory::backup::restore` llamado desde el propio proceso de `update` (el binario viejo), y después devolver el binario viejo y arrancar su daemon. `restore` guarda antes el store migrado como `pre-restore`, así que nada se destruye. Si el restore falla, `update` MUST dejar el binario nuevo, el único que abre ese store, y el informe MUST dar la causa del arranque, la del restore, qué daemon contesta al terminar (o que no queda ninguno y cómo arrancarlo), dónde está cada archivo y los comandos para volver a mano, el arranque del daemon incluido (D2). Un candidato que no arranca y no migró MUST dejar el binario viejo y su daemon.
 
 #### Escenario: el nuevo no arranca
 - GIVEN un candidato que no levanta el daemon
@@ -155,9 +155,9 @@ Si el daemon nuevo no contesta `/health` con la versión nueva en el plazo, `upd
 #### Escenario: el nuevo migró y el restore falla
 - GIVEN el mismo caso, pero el restore falla
 - WHEN `update` no puede devolver el store
-- THEN queda el binario nuevo, el store migrado intacto, y el informe da la causa del arranque, la del restore, las rutas del `.old-*`, del `pre-migration` y del `pre-restore`, y los comandos a mano
+- THEN queda el binario nuevo, el store migrado intacto, y el informe da la causa del arranque, la del restore, si contesta un daemon (su pid y su versión) o que no queda ninguno, las rutas del `.old-*`, del `pre-migration` y del `pre-restore`, y los comandos a mano, numerados, hasta volver a arrancar el daemon
 
-**Pruebas:** `a_new_binary_that_does_not_start_brings_the_old_one_and_its_daemon_back` y `a_new_binary_that_migrated_and_failed_gets_its_pre_migration_restored` en `binary.rs`; `each_failed_step_undoes_what_it_did` y `a_failed_restore_leaves_the_new_binary_and_explains_the_way_back` (plan); `restoring_over_a_store_migrated_by_a_newer_version_keeps_it_as_pre_restore` en `backup.rs` (D2).
+**Pruebas:** `a_new_binary_that_does_not_start_brings_the_old_one_and_its_daemon_back` y `a_new_binary_that_migrated_and_failed_gets_its_pre_migration_restored` en `binary.rs`; `each_failed_step_undoes_what_it_did` y `a_failed_restore_leaves_the_new_binary_and_explains_the_way_back` (plan); `a_failed_restore_explains_the_way_back` y `a_failed_restore_names_the_daemon_that_answers_and_numbers_only_the_steps_left` (informe, puros); `restoring_over_a_store_migrated_by_a_newer_version_keeps_it_as_pre_restore` en `backup.rs` (D2).
 
 ## S10. Garantías de datos
 

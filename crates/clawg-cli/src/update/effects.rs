@@ -92,6 +92,11 @@ impl Installation {
         self.new_daemon.as_ref()
     }
 
+    /// The daemon that answers for the profile now, whoever started it.
+    pub async fn answering(&self) -> Option<Answer> {
+        ask_health(&self.paths.base_dir).await.map(|h| Answer { pid: h.pid, version: h.version })
+    }
+
     /// The snapshot the daemon started by the update wrote before migrating.
     pub fn pre_migration(&self) -> Option<PathBuf> {
         let before = self.backups_before.as_ref()?;
