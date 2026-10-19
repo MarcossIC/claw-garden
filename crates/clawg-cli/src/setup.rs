@@ -46,6 +46,9 @@ const HOOK_TIMEOUT_SECS: u64 = 5;
 /// them and as `clawg hook` takes them.
 const HOOK_EVENTS: [(&str, &str); 2] = [("SessionStart", "session-start"), ("UserPromptSubmit", "user-prompt-submit")];
 
+/// Copies of each file kept in `backups/setup`, the newest.
+const KEPT_COPIES: usize = 5;
+
 /// Whether setup installs or takes away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -674,14 +677,17 @@ pub struct Applied {
     pub server: ServerOutcome,
     /// Copies of files as they were before being changed.
     pub backups: Vec<PathBuf>,
+    /// Older copies removed to keep [`KEPT_COPIES`] of each file.
+    pub pruned: Vec<PathBuf>,
     /// A file that could not be written, with why.
     pub failures: Vec<String>,
 }
 
 /// Carries the plan out: runs `claude` for the server, then writes the
 /// files, each through a temporary file and a rename after copying the old
-/// one to `<data>/backups/setup`. A failed step does not stop the others;
-/// each can be run again.
+/// one to `<data>/backups/setup`, where only the newest [`KEPT_COPIES`] of
+/// each file stay. A failed step does not stop the others; each can be run
+/// again.
 pub fn apply(plan: &Plan, state: &State, claude: Option<&Path>, base_dir: &Path, now_ms: i64) -> Applied {
     let args = match plan.server_step {
         ServerStep::Add => Some(plan.server.add_args()),
@@ -693,17 +699,61 @@ pub fn apply(plan: &Plan, state: &State, claude: Option<&Path>, base_dir: &Path,
         (Some(_), None) => ServerOutcome::Manual,
         (Some(args), Some(claude)) => run_claude(claude, &args),
     };
-    let mut applied = Applied { server, backups: Vec::new(), failures: Vec::new() };
+    let mut applied = Applied { server, backups: Vec::new(), pruned: Vec::new(), failures: Vec::new() };
     for (step, file) in [(&plan.settings, &state.settings), (&plan.instructions, &state.instructions)] {
         if *step == FileStep::Unchanged {
             continue;
         }
         match write_file(step, file, base_dir, now_ms) {
-            Ok(backup) => applied.backups.extend(backup),
+            Ok(Some(backup)) => {
+                prune_copies(&copies_dir(base_dir), &copy_name(&file.path), &mut applied);
+                applied.backups.push(backup);
+            }
+            Ok(None) => {}
             Err(e) => applied.failures.push(format!("cannot write {}: {e}", file.path.display())),
         }
     }
     applied
+}
+
+fn copies_dir(base_dir: &Path) -> PathBuf {
+    backups_dir(base_dir).join("setup")
+}
+
+/// The name the copies of `path` start with.
+fn copy_name(path: &Path) -> String {
+    path.file_name().map_or_else(|| "file".into(), |n| n.to_string_lossy().into_owned())
+}
+
+/// Of the names in the copies' directory, the copies of `name` beyond the
+/// newest `keep`, oldest first. The stamp sorts as text, and a name that is
+/// not `<name>-` and a stamp is not a copy setup made.
+fn stale_copies(names: &[String], name: &str, keep: usize) -> Vec<String> {
+    let is_copy = |n: &&String| {
+        let stamp = n.strip_prefix(name).and_then(|rest| rest.strip_prefix('-'));
+        stamp.is_some_and(|s| s.len() == 17 && s.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let mut copies: Vec<&String> = names.iter().filter(is_copy).collect();
+    copies.sort();
+    let stale = copies.len().saturating_sub(keep);
+    copies[..stale].iter().map(|n| n.to_string()).collect()
+}
+
+fn prune_copies(dir: &Path, name: &str, applied: &mut Applied) {
+    let names: Vec<String> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries.filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().into_owned()).collect(),
+        Err(e) => {
+            applied.failures.push(format!("cannot list the copies in {}: {e}", dir.display()));
+            return;
+        }
+    };
+    for stale in stale_copies(&names, name, KEPT_COPIES) {
+        let path = dir.join(stale);
+        match std::fs::remove_file(&path) {
+            Ok(()) => applied.pruned.push(path),
+            Err(e) => applied.failures.push(format!("cannot remove the older copy {}: {e}", path.display())),
+        }
+    }
 }
 
 fn run_claude(claude: &Path, args: &[String]) -> ServerOutcome {
@@ -723,10 +773,9 @@ fn write_file(step: &FileStep, file: &File, base_dir: &Path, now_ms: i64) -> std
     let target = link_target(&file.path)?;
     let backup = match &file.text {
         Some(text) => {
-            let dir = backups_dir(base_dir).join("setup");
+            let dir = copies_dir(base_dir);
             std::fs::create_dir_all(&dir)?;
-            let name = file.path.file_name().map_or_else(|| "file".into(), |n| n.to_string_lossy().into_owned());
-            let copy = dir.join(format!("{name}-{}", stamp(now_ms)));
+            let copy = dir.join(format!("{}-{}", copy_name(&file.path), stamp(now_ms)));
             create_fresh(&copy, Some(0o600))?.write_all(text.as_bytes())?;
             Some(copy)
         }
@@ -883,6 +932,9 @@ pub fn report(plan: &Plan, state: &State, applied: Option<&Applied>) -> (String,
     if let Some(applied) = applied {
         for backup in &applied.backups {
             lines.push(format!("previous file copied to {}", backup.display()));
+        }
+        for copy in &applied.pruned {
+            lines.push(format!("older copy removed: {}", copy.display()));
         }
         for failure in &applied.failures {
             incomplete = true;
@@ -1255,7 +1307,7 @@ mod tests {
         assert_eq!(second.server_step, ServerStep::Unchanged);
         assert_eq!(second.hooks.unchanged, ["SessionStart", "UserPromptSubmit"]);
         assert_eq!((&second.settings, &second.instructions), (&FileStep::Unchanged, &FileStep::Unchanged));
-        let (text, code) = report(&second, &s, Some(&Applied { server: ServerOutcome::NotRun, backups: vec![], failures: vec![] }));
+        let (text, code) = report(&second, &s, Some(&Applied { server: ServerOutcome::NotRun, backups: vec![], pruned: vec![], failures: vec![] }));
         assert_eq!(code, 0);
         assert!(!text.contains("Open a new"), "{text}");
     }
@@ -1458,6 +1510,46 @@ mod tests {
         assert_eq!(copies.len(), 2, "{copies:?}");
         for copy in copies {
             assert_eq!(mode(&copy), 0o600, "{}", copy.display());
+        }
+    }
+
+    #[test]
+    fn stale_copies_are_the_oldest_beyond_the_limit() {
+        let copy = |name: &str, ms: i64| format!("{name}-{}", stamp(ms));
+        let mut names: Vec<String> = (1..=7).rev().map(|ms| copy("settings.json", ms)).collect();
+        names.extend([copy("CLAUDE.md", 0), "settings.json-old".into(), "settings.json.bak".into(), copy("settings.json", 8) + "x"]);
+        assert_eq!(stale_copies(&names, "settings.json", 5), [copy("settings.json", 1), copy("settings.json", 2)]);
+        assert!(stale_copies(&names, "CLAUDE.md", 5).is_empty());
+    }
+
+    #[test]
+    fn only_the_newest_copies_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let copies = data.join("backups").join("setup");
+        std::fs::create_dir_all(&copies).unwrap();
+        for ms in 1..=6 {
+            std::fs::write(copies.join(format!("settings.json-{}", stamp(ms))), "old").unwrap();
+        }
+        std::fs::write(copies.join(format!("CLAUDE.md-{}", stamp(1))), "old").unwrap();
+        std::fs::write(copies.join("notes.txt"), "mine").unwrap();
+        let s = State {
+            settings: File { path: dir.path().join("settings.json"), text: Some("{}".into()) },
+            instructions: File { path: dir.path().join("CLAUDE.md"), text: None },
+            servers: File { path: dir.path().join(".claude.json"), text: Some(planned_server_json()) },
+            ..state(None, None, None)
+        };
+        let (text, code) = run_in(s, Mode::Install, false, None, &data, 1_700_000_000_000).unwrap();
+        assert_eq!(code, 0, "{text}");
+        let mut left: Vec<String> = std::fs::read_dir(&copies).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        let mut expected: Vec<String> = (3..=6).map(|ms| format!("settings.json-{}", stamp(ms))).collect();
+        expected.extend([format!("settings.json-{}", stamp(1_700_000_000_000)), format!("CLAUDE.md-{}", stamp(1)), "notes.txt".into()]);
+        expected.sort();
+        assert_eq!(left, expected);
+        for ms in [1, 2] {
+            let gone = copies.join(format!("settings.json-{}", stamp(ms)));
+            assert!(text.contains(&format!("older copy removed: {}", gone.display())), "{text}");
         }
     }
 
