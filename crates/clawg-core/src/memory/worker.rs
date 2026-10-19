@@ -22,7 +22,7 @@ use crate::memory::pieces::StoredPiece;
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::events::{MemoryEvent, MemorySource};
 use crate::memory::redact::{redact, SecretKind};
-use crate::memory::store_insert::NewMemoryRecord;
+use crate::memory::store_insert::{NewMemoryRecord, Stored};
 use crate::memory::topic::{inherit, Replaced, Revision, TopicScope};
 use crate::memory::MemoryStore;
 
@@ -811,8 +811,21 @@ async fn ingest_pieces(
         .collect();
         let candidates = record.candidates.clone();
         let note = note_for(track.as_ref(), &noted, position, &content_hash, true, context(position));
-        let id = match store.insert_noting(record, vec, note).await {
-            Ok(id) => id,
+        let absorbed_note = note_for(track.as_ref(), &noted, position, &content_hash, false, "");
+        let id = match store.insert_unless_twin(record, vec, note, absorbed_note).await {
+            Ok(Stored::Inserted(id)) => id,
+            Ok(Stored::Absorbed(id)) => {
+                *absorbed += 1;
+                log::debug!("ingest absorbed a twin that came back while the save was embedded (memory_id={id})");
+                if track.is_some() {
+                    noted.push(NotedPiece { position, hash: content_hash.clone(), id, inserted: false, context: String::new() });
+                }
+                stored[position] = Some(SavedChunk { id, outcome: ChunkOutcome::Reinforced });
+                for _ in 1..multiplicity {
+                    absorb_duplicate(store, evt, &content_hash, absorbed, |_| None).await;
+                }
+                continue;
+            }
             Err(e) => {
                 let failure = IngestFailure::Failed(format!("store insert failed: {e}"));
                 return (report(&stored, Some(failure)), Vec::new());
@@ -2309,6 +2322,73 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    /// The dedup check runs before the embedding and the contradiction probe,
+    /// and a restore of the same text can land while the save waits for the
+    /// model.
+    #[tokio::test]
+    async fn a_twin_restored_while_the_save_is_embedded_is_reinforced_not_copied() {
+        use std::sync::Mutex;
+        use tokio::sync::oneshot;
+        struct GatedEmbedder {
+            reached: Mutex<Option<oneshot::Sender<()>>>,
+            release: Mutex<Option<oneshot::Receiver<()>>>,
+        }
+        #[async_trait::async_trait]
+        impl Embedder for GatedEmbedder {
+            async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+                let reached = self.reached.lock().unwrap().take();
+                if let Some(reached) = reached {
+                    let _ = reached.send(());
+                }
+                let release = self.release.lock().unwrap().take();
+                if let Some(release) = release {
+                    let _ = release.await;
+                }
+                Ok(vec![0.1_f32; 384])
+            }
+            fn dimensions(&self) -> usize { 384 }
+            fn model_id(&self) -> &str { "gated" }
+            fn query_prefix(&self) -> &str { "" }
+            fn passage_prefix(&self) -> &str { "" }
+        }
+
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let evt = make_event(Role::User, "the train leaves on tuesdays", None, 1);
+        let twin = process_with(Arc::new(FakeEmbedder::default()), &store, &evt).await.memories[0].id;
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE memory SET deleted_at = 1 WHERE id = ?1", [twin]))
+            .await
+            .unwrap();
+
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let gated: Arc<dyn Embedder> = Arc::new(GatedEmbedder {
+            reached: Mutex::new(Some(reached_tx)),
+            release: Mutex::new(Some(release_rx)),
+        });
+        let saving = {
+            let (store, evt) = (store.clone(), evt.clone());
+            tokio::spawn(async move { process_with(gated, &store, &evt).await })
+        };
+        reached_rx.await.expect("the save reached the embedding");
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE memory SET deleted_at = NULL WHERE id = ?1", [twin]))
+            .await
+            .unwrap();
+        release_tx.send(()).unwrap();
+        let report = saving.await.unwrap();
+
+        assert_eq!(report.memories, vec![SavedChunk { id: twin, outcome: ChunkOutcome::Reinforced }]);
+        let live: i64 = store
+            .conn
+            .call(|c| c.query_row("SELECT COUNT(*) FROM memory WHERE deleted_at IS NULL", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(live, 1, "one text, one live row");
     }
 
     #[tokio::test]
