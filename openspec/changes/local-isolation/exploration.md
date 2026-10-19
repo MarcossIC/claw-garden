@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| transversal | S–M | — (es requisito de local-transport (58); se beneficia de doctor-checks (31) para verificar modos, pero no lo necesita) | exploración (borrador) |
+| transversal | S–M | — (es requisito de local-transport (58); se beneficia de doctor-checks (31) para verificar modos, pero no lo necesita) | cerrada; sigue en la [propuesta](proposal.md) |
 
 **Tesis:** `daemon-hardening` cerró el paso a las páginas web y dejó escrito que otro usuario local "sigue frenado sólo por el token". Ese cambio dejó fuera, a propósito, el modo del directorio de datos. Acá el adversario es **otro usuario de la misma máquina** (Unix sobre todo): el directorio de datos y casi todo lo que contiene (`memory.db`, copias, logs, workspaces) nace con el `umask`, y sólo `token` y `daemon.json` son 0600. Un único ayudante que crea el directorio en 0700, y aprieta el que ya existe, cierra la lectura a otros usuarios aunque los archivos de adentro sean 0644. Es también la garantía en la que se apoya el socket de local-transport (58): el permiso sobre el socket no es portable, el del directorio sí. Este cambio sólo protege el directorio; la suplantación de un daemon muerto y el `/health` abierto los cierran 58 en Unix y windows-pipe (59) en Windows, y el SIGTERM es de shutdown-budget (55) (ver «Lo que salió de este cambio»).
 
@@ -90,11 +90,11 @@ Lo que esta exploración descartaba antes como «Sockets Unix o pipes con nombre
 
 ## Decisiones abiertas
 
-Son del usuario.
+Cerradas con el usuario; quedan en la [propuesta](proposal.md).
 
-- [ ] **Apretar un directorio existente.** ¿Se aprieta a 0700 siempre (propuesta, con un aviso en el registro), sólo se avisa, o se pide confirmación? Un usuario que compartía `~/.clawg` por grupo pierde ese acceso; el daemon único con candado exclusivo hace raro que sirva, pero un trabajo de backup de otro usuario sí podría depender de él. Con 58, sólo avisar deja el socket con la garantía no portable del permiso del archivo.
-- [ ] **`umask` 077 en `serve` como segunda capa (A2).** ¿Sí o no? Suma `unsafe` y no cubre al cliente.
-- [ ] **Derivado de `memory.lock`.** ¿Se prueba con dos usuarios reales antes de redactar el requisito, o se acepta como plausible y el directorio 0700 lo cierra?
+- [x] **Apretar un directorio existente.** Se aprieta siempre, con un aviso en el registro. ¿Se aprieta a 0700 siempre (propuesta, con un aviso en el registro), sólo se avisa, o se pide confirmación? Un usuario que compartía `~/.clawg` por grupo pierde ese acceso; el daemon único con candado exclusivo hace raro que sirva, pero un trabajo de backup de otro usuario sí podría depender de él. Con 58, sólo avisar deja el socket con la garantía no portable del permiso del archivo.
+- [x] **`umask` 077 en `serve` como segunda capa (A2).** No. ¿Sí o no? Suma `unsafe` y no cubre al cliente.
+- [x] **Derivado de `memory.lock`.** Se acepta como plausible; lo cierra el directorio 0700 y se prueba a mano en `verify.md`. ¿Se prueba con dos usuarios reales antes de redactar el requisito, o se acepta como plausible y el directorio 0700 lo cierra?
 
 ## Cómo se mide
 

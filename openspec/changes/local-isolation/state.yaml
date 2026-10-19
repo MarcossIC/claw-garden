@@ -1,13 +1,13 @@
 change: local-isolation
 objective: "transversal"
 depends_on: []
-phase: explore
+phase: apply
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
   apply: pending
   verify: pending
   archive: pending
