@@ -19,6 +19,8 @@ Memoria local para agentes de código. Claw Garden guarda, clasifica y recupera 
 
 Cada versión se publica en [GitHub Releases](https://github.com/MarcossIC/claw-garden/releases) con dos binarios sin comprimir (`clawg-x86_64-pc-windows-msvc.exe` y `clawg-x86_64-unknown-linux-gnu`), el script `install.ps1`, la lista `SHA256SUMS` y su firma `SHA256SUMS.minisig`.
 
+El binario lleva adentro ONNX Runtime, el motor que calcula los embeddings, enlazado de forma estática. No es una build de Microsoft: es la que compila [pyke](https://ort.pyke.io/setup/linking), que `ort` baja de `cdn.pyke.io` al compilar y verifica contra el SHA-256 que `ort-sys` fija para cada plataforma.
+
 ### Windows
 
 Hace falta el **Microsoft Visual C++ Redistributable (x64)**. El script comprueba que esté, y si falta te dice dónde bajarlo (<https://aka.ms/vs/17/release/vc_redist.x64.exe>) sin instalar nada. En una PowerShell:
