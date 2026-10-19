@@ -651,6 +651,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_purged_source_leaves_the_conclusion_to_review() {
+        use crate::memory::store_lock::StoreHolder;
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+        let a = seed(&store, Some("p"), "tabs in go", 1).await;
+        let c = conclude(&store, Some("p"), &[a], 2).await;
+        store.conn.clone().close().await.unwrap();
+        drop(store);
+
+        crate::memory::secrets::purge(dir.path(), a).unwrap();
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+        let found = synthesis_core(&store, in_project("p"), TimestampMs::from_unix_millis(10)).await.unwrap();
+
+        assert_eq!(ids(&found.conclusions), vec![c], "it is still a conclusion");
+        assert!(found.pending.is_empty(), "a conclusion is never pending");
+        assert_eq!(lost(&found.to_review[0]), vec![(a, SourceState::Purged, None)]);
+    }
+
+    #[tokio::test]
     async fn the_review_list_is_capped_newest_first() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let gone = seed(&store, Some("p"), "gone", 1).await;
