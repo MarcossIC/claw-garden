@@ -142,6 +142,7 @@ Códigos de salida: hoy 0 sano, 1 no sano (`main.rs:181-185`). Se mantiene 1 par
 - **topic-revisions (27) y revision-aware-delete (49), archivados.** Son quienes introducen las invariantes 1 a 3; el chequeo es su red de seguridad en bases ya existentes.
 - **outbox-lifecycle (53).** Los saves que fallan a la mitad y las filas `failed` son fuente de violaciones; los hallazgos se coordinan con lo que 53 decida sobre ellas.
 - **secret-coverage (51) y project-clone-identity (30).** Cada uno arregla de origen un camino que rompe una invariante (el `purge` de la versión vigente, el re-key que une scopes); `doctor` sólo encuentra lo que ya quedó guardado.
+- **local-isolation (50), local-transport (58) y windows-pipe (59).** `doctor` puede informar, sin abrir el store, el modo del directorio de datos (el A3 de 50), el largo de la ruta del socket frente al tope de `sun_path` (108 bytes en Linux, 104 en macOS) y, en Windows, el descriptor de seguridad de la pipe del daemon que corre.
 
 ## Alcance candidato
 
@@ -156,7 +157,8 @@ Códigos de salida: hoy 0 sano, 1 no sano (`main.rs:181-185`). Se mantiene 1 par
    - cabeceras huérfanas de `memory_piece`;
    - `project.id` contra `derive_project_id(root_path)`;
    - las seis invariantes de estado de la sección «Invariantes del estado de `memory`», con las cabeceras huérfanas fusionadas en la 5;
-   - filas `failed` del `ingest_outbox` (cuenta y `operation_id`, sin contenido), coordinado con 53.
+   - filas `failed` del `ingest_outbox` (cuenta y `operation_id`, sin contenido), coordinado con 53;
+   - el modo del directorio de datos y el largo de la ruta del socket (con 50 y 58).
 3. El sobre uniforme y el JSON compatible. Salida legible opcional además del JSON (decisión abierta).
 4. Con 26: chequeo del registro MCP (binario existe, agente fijo) sobre un parser puro del texto de configuración que 26 define.
 5. Con 29: chequeo de colisión de `project_id` si 29 hace que quede registrada.

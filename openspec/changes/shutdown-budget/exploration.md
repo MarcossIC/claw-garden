@@ -89,7 +89,8 @@ Lo que el sistema pide no se atiende: sin `SignalKind::terminate()`, `systemctl 
 - **release-and-self-update (47, archivado).** `openspec/specs/self-update/spec.md` descansa en `stop`; un presupuesto estricto vuelve predecible cuándo `update` deshace. No cambia su spec salvo que `STOP_TIMEOUT` crezca (entonces el texto del plazo).
 - **install-smoke (40, archivado).** `binary.rs` ya levanta el binario real; los tests de SIGTERM (Unix) caben ahí sin infraestructura nueva.
 - **embedder-idle-unload (46, archivado).** Sus recargas corren en `spawn_blocking` (`bootstrap.rs:396`); cubiertas por D.
-- **local-isolation.** Comparte el hecho de que tras SIGTERM/SIGKILL quedan `daemon.json`, `token` y `memory.owner` viejos; A resuelve el caso de SIGTERM, el de SIGKILL sigue siendo de aquel cambio.
+- **local-isolation (50).** Tenía también el manejo de SIGTERM (su B1); salió de allí y este cambio es el único dueño. Tras un SIGKILL siguen quedando `daemon.json`, `token` y `memory.owner` viejos: con local-transport (58) eso ya no habilita a un impostor en Unix.
+- **local-transport (58).** Va después de este cambio y suma un segundo listener (el socket) que comparte la señal de apagado: los dos `axum::serve` tienen que terminar dentro del presupuesto que se escriba acá. Cuando entre, el test de SIGTERM suma que no quede `<data>/clawg.sock`.
 - **Backlog «`clawg stop` mientras carga el modelo»:** este cambio lo absorbe; al archivar hay que sacarlo de `openspec/README.md`.
 - **El snapshot por una conexión propia (`b1f22f3`) y read-connections (57).** Los dos suman lectores dentro del daemon. Un `VACUUM INTO` por su propia conexión, o una búsqueda en un lector, con la lectura en curso cuando llega el `checkpoint`, lo hacen esperar hasta 5 s y frenan a los escritores mientras tanto. El orden del apagado tiene que dejar esas lecturas terminadas, o abandonadas, antes del `checkpoint`, o el presupuesto tiene que contarlas.
 
@@ -106,7 +107,7 @@ Lo que el sistema pide no se atiende: sin `SignalKind::terminate()`, `systemctl 
 - Cancelar de verdad una carga del modelo ya en marcha.
 - `TimeoutLayer` en operación normal.
 - Reintento o descarte de filas `failed` del outbox.
-- SIGKILL y el estado viejo que deja (local-isolation).
+- SIGKILL y el estado viejo que deja; con local-transport (58) ya no habilita a un impostor en Unix, y windows-pipe (59) lo cubre en Windows.
 - Cambiar el protocolo de `stop` o de `update`.
 
 ## Decisiones abiertas
