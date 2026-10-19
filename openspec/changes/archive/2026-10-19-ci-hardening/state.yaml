@@ -1,14 +1,15 @@
 change: ci-hardening
 objective: "transversal"
 depends_on: []
-phase: apply
+phase: archived
 artifacts:
   exploration: done
   proposal: done
   spec: done
   design: skipped  # the decisions are in the proposal
   tasks: done
-  apply: pending
-  verify: pending
-  archive: pending
+  apply: done
+  verify: done  # Linux with 1.99.1 and 1.90.0, cargo deny and PSScriptAnalyzer locally; the workflows on the pull request
+  archive: done
 updated: 2026-10-19
+main_spec: openspec/specs/install/spec.md

@@ -41,7 +41,7 @@ Toda acción de terceros de todo workflow de `.github/workflows/` MUST estar fij
 
 ## C3. Un toolchain fijado
 
-`rust-toolchain.toml` MUST fijar `channel` a una versión exacta `X.Y.Z` y pedir `clippy`. Cada `dtolnay/rust-toolchain` de cada workflow MUST pasar esa misma versión en `toolchain:`. `[workspace.package] rust-version` MUST ser al menos 1.88, el mayor `rust-version` de las dependencias del lock (`ort`, `ort-sys`, `rmcp`, `ignore`), y no mayor que la versión del toolchain. El 1.88 es una constante de la prueba, que se revisa al subir una dependencia.
+`rust-toolchain.toml` MUST fijar `channel` a una versión exacta `X.Y.Z` y pedir `clippy`. Cada `dtolnay/rust-toolchain` de cada workflow MUST pasar esa misma versión en `toolchain:`. `[workspace.package] rust-version` MUST ser al menos 1.90, el mayor `rust-version` de los paquetes del lock (hoy `tree-sitter-language` 0.1.9, y `ort`, `ort-sys`, `rmcp`, `ignore` y otros piden 1.88), y no mayor que la versión del toolchain. El 1.90 es una constante de la prueba, que se revisa al subir una dependencia.
 
 #### Escenario: subir el toolchain
 - GIVEN `rust-toolchain.toml` sube a otra versión y un workflow queda con la anterior
