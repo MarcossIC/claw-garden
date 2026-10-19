@@ -43,10 +43,6 @@ pub struct HookInput {
     pub source: Option<String>,
     #[serde(default)]
     pub transcript_path: Option<PathBuf>,
-    /// The host's id of the session, registered so the saves of this agent
-    /// in this project carry it.
-    #[serde(default)]
-    pub session_id: Option<String>,
 }
 
 impl HookInput {
@@ -143,17 +139,10 @@ async fn answer(event: HookEvent, agent: &str, base_dir: &Path, mut input: impl 
     let client = DaemonClient::from_data_dir(base_dir)?;
     let cwd = input.cwd.clone().or_else(|| std::env::current_dir().ok())?;
     let project = ProjectIdentity::resolve(&cwd).id;
-    // Both events register: a daemon started since the session began learns
-    // it at the next prompt. A refusal changes nothing the hook prints.
-    let register = async {
-        if let Some(session) = input.session_id.as_deref() {
-            let _ = client.register_session(agent, Some(&project), session).await;
-        }
-    };
     let text = match event {
         HookEvent::SessionStart => {
-            let (context, health, ()) =
-                tokio::join!(client.recent_context(agent, Some(&project), SESSION_BUDGET), client.health(), register);
+            let (context, health) =
+                tokio::join!(client.recent_context(agent, Some(&project), SESSION_BUDGET), client.health());
             let compacted = input.source.as_deref() == Some("compact");
             session_start_text(&context.ok()?, health.ok().as_ref(), compacted)
         }
@@ -161,12 +150,11 @@ async fn answer(event: HookEvent, agent: &str, base_dir: &Path, mut input: impl 
             let args = ListArgs {
                 kind: Some("memory".into()),
                 agent: Some(agent.into()),
-                project: Some(project.clone()),
+                project: Some(project),
                 limit: Some(1),
                 ..ListArgs::default()
             };
-            let (list, ()) = tokio::join!(client.list(args), register);
-            let last = list.ok()?.first().and_then(|row| row.created_at);
+            let last = client.list(args).await.ok()?.first().and_then(|row| row.created_at);
             let started = input.transcript_path.as_deref().and_then(session_started_at);
             save_reminder(now_ms(), last, started)
         }
@@ -200,7 +188,6 @@ mod tests {
         .unwrap();
         assert_eq!(input.cwd.as_deref(), Some(Path::new("/work/repo")));
         assert_eq!(input.source.as_deref(), Some("compact"));
-        assert_eq!(input.session_id.as_deref(), Some("s"));
         assert_eq!(HookInput::parse(b"{}"), Some(HookInput::default()));
         assert_eq!(HookInput::parse(b"not json"), None);
     }

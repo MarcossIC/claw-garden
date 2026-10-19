@@ -893,7 +893,6 @@ mod tests {
             derived_from: Vec::new(),
             topic_key: None,
             user_stated: false,
-            session_id: None,
         }
     }
 
@@ -911,7 +910,6 @@ mod tests {
             derived_from: Vec::new(),
             topic_key: None,
             user_stated: false,
-            session_id: None,
         }
     }
 
@@ -984,7 +982,6 @@ mod tests {
             derived_from: Vec::new(),
             topic_key: None,
             user_stated: false,
-            session_id: None,
         };
         // Wait: the "tool_calls" filter is in from_message, but the worker just
         // calls select_chunker(Role::Assistant, None, "") → Skip (empty content).
@@ -1346,7 +1343,6 @@ mod tests {
                 derived_from: Vec::new(),
                 topic_key: None,
                 user_stated: false,
-                session_id: None,
             })).unwrap();
         }
         drain_worker(tx, handle).await;
@@ -1430,7 +1426,6 @@ mod tests {
                 derived_from: Vec::new(),
                 topic_key: None,
                 user_stated: false,
-                session_id: None,
             })).unwrap();
         }
         drain_worker(tx2, handle2).await;
@@ -1462,7 +1457,6 @@ mod tests {
                 derived_from: Vec::new(),
                 topic_key: None,
                 user_stated: false,
-                session_id: None,
             })).unwrap();
         }
         drain_worker(tx3, handle3).await;
@@ -2080,28 +2074,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_save_writes_its_session_on_every_row() {
-        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
-        let long = MemoryEvent { session_id: Some("sess-1".into()), ..explicit_fact(&long_save()) };
-        let report = process_with(Arc::new(FakeEmbedder::default()), &store, &long).await;
-        assert!(report.memories.len() > 1, "the fixture splits into pieces");
-        process_with(Arc::new(FakeEmbedder::default()), &store, &explicit_fact("no session behind this one")).await;
-
-        let sessions: Vec<Option<String>> = store
-            .conn
-            .call(|c| {
-                let mut stmt = c.prepare("SELECT source_session_id FROM memory ORDER BY id")?;
-                let rows = stmt.query_map([], |r| r.get(0))?.collect();
-                rows
-            })
-            .await
-            .unwrap();
-        let mut want = vec![Some("sess-1".to_string()); report.memories.len()];
-        want.push(None);
-        assert_eq!(sessions, want);
-    }
-
-    #[tokio::test]
     async fn an_absorbed_piece_is_linked_without_context() {
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
         let content = long_save();
@@ -2442,7 +2414,6 @@ mod tests {
             derived_from: Vec::new(),
             topic_key: None,
             user_stated: false,
-            session_id: None,
         })).unwrap();
         drain_worker(tx, handle).await;
 
@@ -2471,7 +2442,6 @@ mod tests {
             derived_from: Vec::new(),
             topic_key: None,
             user_stated: false,
-            session_id: None,
         })).unwrap();
         drain_worker(tx, handle).await;
 
