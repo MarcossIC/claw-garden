@@ -8,7 +8,7 @@ authors = ["The Claw Garden contributors"]
 license = "MIT"
 repository = "https://github.com/MarcossIC/claw-garden"
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.88"
 
 # Dependencies shared by workspace members.
 [workspace.dependencies]

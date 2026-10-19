@@ -1,0 +1,6 @@
+# The compiler of every build: local, CI and release. Raising it is a commit of
+# its own that also changes `toolchain:` in each workflow under .github/workflows
+# (crates/clawg-cli/tests/conventions.rs compares them).
+[toolchain]
+channel = "1.99.1"
+components = ["clippy"]

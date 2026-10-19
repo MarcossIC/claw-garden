@@ -586,6 +586,51 @@ fn the_ci_workflow_ignores_only_non_code_paths_and_runs_on_both_platforms() {
     }
 }
 
+/// `X.Y` or `X.Y.Z` as three numbers, a missing patch read as 0.
+fn rust_version(text: &str) -> Option<(u32, u32, u32)> {
+    let parts: Vec<u32> = text.split('.').map(|p| p.parse().ok()).collect::<Option<_>>()?;
+    match parts[..] {
+        [major, minor] => Some((major, minor, 0)),
+        [major, minor, patch] => Some((major, minor, patch)),
+        _ => None,
+    }
+}
+
+/// The highest `rust-version` among the dependencies in Cargo.lock (`ort`,
+/// `ort-sys`, `rmcp` and `ignore`). Reading it needs the cargo registry, so it
+/// is written here and checked again when a dependency is raised.
+const DEPENDENCIES_NEED_RUST: (u32, u32, u32) = (1, 88, 0);
+
+#[test]
+fn the_toolchain_is_pinned_once_for_every_workflow() {
+    let file = read_repo_file("rust-toolchain.toml");
+    let channel = manifest_value(&file, "toolchain", "channel").expect("rust-toolchain.toml names a channel");
+    let channel = channel.trim_matches('"');
+    let pinned = rust_version(channel).filter(|_| channel.split('.').count() == 3);
+    let pinned = pinned.unwrap_or_else(|| panic!("the toolchain is an exact X.Y.Z, not `{channel}`"));
+    let components = manifest_value(&file, "toolchain", "components").unwrap_or_default();
+    assert!(components.contains("\"clippy\""), "the toolchain brings clippy: {components}");
+
+    let mut seen = 0;
+    for name in workflow_files() {
+        let lines = workflow_code(&name);
+        for job in jobs_of(&lines) {
+            for step in job.steps().iter().filter(|s| s.iter().any(|l| l.contains("uses: dtolnay/rust-toolchain@"))) {
+                let given = step.iter().find_map(|l| l.trim().strip_prefix("toolchain:")).map(str::trim);
+                assert_eq!(given, Some(channel), "{name}, job `{}` installs another toolchain than rust-toolchain.toml", job.name);
+                seen += 1;
+            }
+        }
+    }
+    assert!(seen > 0, "no workflow installs the toolchain");
+
+    let manifest = read_repo_file("Cargo.toml");
+    let declared = manifest_value(&manifest, "workspace.package", "rust-version").expect("the workspace declares rust-version");
+    let declared = rust_version(declared.trim_matches('"')).unwrap_or_else(|| panic!("rust-version `{declared}` is not a version"));
+    assert!(declared >= DEPENDENCIES_NEED_RUST, "rust-version {declared:?} is below what the dependencies need, {DEPENDENCIES_NEED_RUST:?}");
+    assert!(declared <= pinned, "rust-version {declared:?} is above the pinned toolchain {pinned:?}");
+}
+
 /// The command of every `run:` step of a job, single-line ones only.
 fn run_commands(job: &Job) -> Vec<String> {
     job.steps()

@@ -87,7 +87,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
         with:
-          toolchain: stable
+          toolchain: 1.99.1
       - run: rustc -Vv
       # Only the CLI: building the workspace would also build clawg-eval, which
       # turns on a clawg-core feature that production binaries must not link.
