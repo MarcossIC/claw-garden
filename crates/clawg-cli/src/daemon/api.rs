@@ -45,7 +45,7 @@ use clawg_core::memory::prompt_builder::{build_memory_prompt, build_session_prom
 use clawg_core::memory::sharing::{self, Reach};
 use clawg_core::memory::topic::validate_topic_key;
 use clawg_core::memory::synthesis::{
-    existing_memory_ids, replaced_memory_ids, synthesis_core, unreviewed_count, Synthesis, SynthesisParams,
+    conclusions_to_review_count, existing_memory_ids, replaced_memory_ids, synthesis_core, unreviewed_count, Synthesis, SynthesisParams,
 };
 use clawg_core::memory::{read_save_core, search_all_memories, RankedHit, SaveText, SearchScope};
 use clawg_core::models::chat::Role;
@@ -615,6 +615,9 @@ pub struct ContextBody {
     /// Memories of the requested scope that arrived since it was last
     /// reviewed for conclusions (`POST /v1/synthesis`).
     pub unreviewed: usize,
+    /// Conclusions of the scope that lost a source since it was last
+    /// reviewed for conclusions.
+    pub conclusions_to_review: usize,
     pub retrieval: RetrievalState,
 }
 
@@ -1260,9 +1263,14 @@ async fn context(
         log::warn!("unreviewed count failed: {e}");
         0
     });
+    let conclusions_to_review =
+        conclusions_to_review_count(&app.runtime.store, Some(&body.agent_id), project_id).await.unwrap_or_else(|e| {
+            log::warn!("conclusions to review count failed: {e}");
+            0
+        });
 
     let retrieval = RetrievalState::of(prompt.retrieval, app.runtime.embedder_status());
-    Ok(Json(ContextBody { prompt: prompt.text, unreviewed, retrieval }))
+    Ok(Json(ContextBody { prompt: prompt.text, unreviewed, conclusions_to_review, retrieval }))
 }
 
 /// Records the host session `agent_id` works in for `project_id`, as a hook

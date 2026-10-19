@@ -18,7 +18,10 @@ use clawg_core::memory::sharing::{Reach, SharingError, SharingPolicy};
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
 
-use crate::client::{Context, Deleted, Found, Health, Hit, MemoryRow, Restored, Retrieval, SavedText, Synthesis, Updated};
+use crate::client::{
+    ConclusionReview, Context, Deleted, Found, Health, Hit, LostSource, MemoryRow, Restored, Retrieval, SavedText, Synthesis,
+    Updated,
+};
 use crate::daemon::api::DocsSearchBody;
 use crate::relevance::{shown_hits, RELEVANCE_RATIO};
 
@@ -324,13 +327,26 @@ architectural_decision or semantic_fact), and `derived_from` set to the ids it r
 If an existing conclusion is now wrong or incomplete, save the corrected one and settle the \
 conflict it raises with `resolve_conflict`. If nothing generalizes yet, save nothing.";
 
+/// What to do with a conclusion that lost a source, before the list of them.
+const REVIEW_GUIDE: &str = "\
+These conclusions rest on memories deleted, replaced or purged since they were drawn. Read \
+each against the sources it has left. If it no longer holds, delete it with `delete_memory`. \
+If it holds only in part, or now rests on the memories that replaced its sources, delete it \
+and save the corrected conclusion with `derived_from` set to the memories it rests on now. \
+If it still holds as it is, leave it.";
+
 fn synthesis_line(r: &MemoryRow) -> String {
+    synthesis_line_with(r, "")
+}
+
+/// A synthesis line, with `extra` after the sources and before the text.
+fn synthesis_line_with(r: &MemoryRow, extra: &str) -> String {
     let origin = match (r.source.as_deref(), r.created_by_type.as_deref()) {
         (Some(source), Some(by)) => mark(source, by).map(|m| format!(" origin={m}")).unwrap_or_default(),
         _ => String::new(),
     };
     format!(
-        "#{} {}{origin}{} {}",
+        "#{} {}{origin}{}{extra} {}",
         r.id,
         r.memory_type.as_deref().unwrap_or("-"),
         sources(r),
@@ -338,24 +354,52 @@ fn synthesis_line(r: &MemoryRow) -> String {
     )
 }
 
+/// `#4 deleted`, `#5 replaced by #11`, `#6 purged`.
+fn lost_source(l: &LostSource) -> String {
+    match (l.state.as_str(), l.superseded_by) {
+        ("superseded", Some(by)) => format!("#{} replaced by #{by}", l.id),
+        ("superseded", None) => format!("#{} replaced", l.id),
+        (state, _) => format!("#{} {state}", l.id),
+    }
+}
+
+/// A conclusion to review: how many sources it kept, of how many, and what
+/// became of each one it lost.
+fn review_line(r: &ConclusionReview) -> String {
+    let total = r.live + r.lost.len();
+    let lost: Vec<String> = r.lost.iter().map(lost_source).collect();
+    synthesis_line_with(&r.conclusion, &format!(" live={}/{total} lost={}", r.live, lost.join(",")))
+}
+
 /// What `synthesize` hands the model: the guide, the conclusions already
 /// drawn (first, so a new one updates them instead of repeating them), then
 /// the memories no conclusion covers, saying how many more there are.
 pub fn format_synthesis(s: &Synthesis) -> String {
-    let conclusions = (!s.conclusions.is_empty()).then(|| {
-        let mut lines = vec![String::new(), "Conclusions already drawn:".to_string()];
-        lines.extend(s.conclusions.iter().map(synthesis_line));
-        lines
-    });
+    let to_review: Vec<i64> = s.to_review.iter().map(|r| r.conclusion.id).collect();
+    let drawn: Vec<&MemoryRow> = s.conclusions.iter().filter(|c| !to_review.contains(&c.id)).collect();
+    let mut conclusions = Vec::new();
+    if !drawn.is_empty() {
+        conclusions.extend([String::new(), "Conclusions already drawn:".to_string()]);
+        conclusions.extend(drawn.into_iter().map(synthesis_line));
+    }
+    if !s.to_review.is_empty() {
+        conclusions.push(String::new());
+        conclusions.push(format!(
+            "Conclusions to review ({} of {}, newest first). {REVIEW_GUIDE}",
+            s.to_review.len(),
+            s.to_review_total
+        ));
+        conclusions.extend(s.to_review.iter().map(review_line));
+    }
     // The conclusions still answer "what have you learned" when nothing is
     // left to conclude; only the guide to saving one would be noise.
     if s.pending.is_empty() {
         let mut out = vec!["no memories are waiting for a conclusion".to_string()];
-        out.extend(conclusions.into_iter().flatten());
+        out.extend(conclusions);
         return out.join("\n");
     }
     let mut out = vec![SYNTHESIS_GUIDE.to_string()];
-    out.extend(conclusions.into_iter().flatten());
+    out.extend(conclusions);
     out.push(String::new());
     out.push(format!(
         "Memories without a conclusion ({} of {}, newest first):",
@@ -402,6 +446,21 @@ pub(crate) fn synthesis_nudge(unreviewed: usize) -> Option<String> {
     })
 }
 
+/// From one conclusion with a lost source, `recall_context` reminds the model
+/// to review it: one is rarer than a new memory, and costs more if left.
+pub(crate) fn review_nudge(conclusions: usize) -> Option<String> {
+    let (n, verb) = match conclusions {
+        0 => return None,
+        1 => ("1 conclusion here rests".to_string(), "was"),
+        n => (format!("{n} conclusions here rest"), "were"),
+    };
+    Some(format!(
+        "{n} on memories that {verb} deleted or replaced since the last review. When the current \
+         task is done, call `synthesize` to check {}.",
+        if conclusions == 1 { "it" } else { "them" }
+    ))
+}
+
 /// Why the context holds no memory, said before it: a prompt holding only the
 /// workspace, or nothing, otherwise reads as "there are no memories".
 fn retrieval_notice(retrieval: &Retrieval, has_context: bool) -> Option<String> {
@@ -426,7 +485,7 @@ fn retrieval_notice(retrieval: &Retrieval, has_context: bool) -> Option<String> 
 
 /// What `recall_context` hands the model: why memories were not searched when
 /// they were not, the context, then the reminder to synthesize when enough
-/// memories wait for it.
+/// memories wait for it, and to review conclusions that lost a source.
 pub fn format_recall(context: &Context) -> String {
     let has_context = !context.prompt.trim().is_empty();
     let notice = context.retrieval.as_ref().and_then(|r| retrieval_notice(r, has_context));
@@ -435,10 +494,10 @@ pub fn format_recall(context: &Context) -> String {
         Some(notice) => notice,
         None => format_context(&context.prompt),
     };
-    match synthesis_nudge(context.unreviewed) {
-        Some(nudge) => format!("{text}\n\n{nudge}"),
-        None => text,
-    }
+    let mut out = vec![text];
+    out.extend(synthesis_nudge(context.unreviewed));
+    out.extend(review_nudge(context.conclusions_to_review));
+    out.join("\n\n")
 }
 
 /// Passes a non-empty memory prompt through; substitutes a plain sentence when
@@ -922,7 +981,71 @@ mod tests {
     // ── synthesis ───────────────────────────────────────────────────────────
 
     fn synthesis(pending: Vec<MemoryRow>, pending_total: usize, conclusions: Vec<MemoryRow>) -> Synthesis {
-        Synthesis { pending, pending_total, conclusions }
+        Synthesis { pending, pending_total, conclusions, ..Default::default() }
+    }
+
+    fn lost(id: i64, state: &str, superseded_by: Option<i64>) -> LostSource {
+        LostSource { id, state: state.into(), superseded_by }
+    }
+
+    fn to_review() -> ConclusionReview {
+        ConclusionReview {
+            conclusion: MemoryRow {
+                derived_from: Some(vec![3, 4, 5, 6]),
+                ..row(9, "memory", Some("user_preference"), "tabs everywhere")
+            },
+            live: 1,
+            lost: vec![lost(4, "deleted", None), lost(5, "superseded", Some(11)), lost(6, "purged", None)],
+        }
+    }
+
+    #[test]
+    fn the_synthesis_names_what_each_conclusion_lost() {
+        let mut s = synthesis(
+            vec![row(12, "memory", Some("semantic_fact"), "the go service uses tabs")],
+            1,
+            vec![to_review().conclusion, row(8, "memory", Some("semantic_fact"), "an intact conclusion")],
+        );
+        s.to_review = vec![to_review()];
+        s.to_review_total = 3;
+        let out = format_synthesis(&s);
+
+        assert!(
+            out.contains("#9 user_preference from=#3,#4,#5,#6 live=1/4 lost=#4 deleted,#5 replaced by #11,#6 purged tabs everywhere"),
+            "{out}"
+        );
+        assert!(out.contains("1 of 3"), "the agent must know the list is partial: {out}");
+        for needle in ["delete_memory", "derived_from", "still holds"] {
+            assert!(out.contains(needle), "the review guide must mention {needle}: {out}");
+        }
+        assert_eq!(out.matches("#9 ").count(), 1, "a conclusion to review is not listed twice: {out}");
+        assert!(out.contains("#8 semantic_fact an intact conclusion"), "{out}");
+    }
+
+    #[test]
+    fn conclusions_to_review_show_with_nothing_pending() {
+        let mut s = synthesis(vec![], 0, vec![to_review().conclusion]);
+        s.to_review = vec![to_review()];
+        s.to_review_total = 1;
+        let out = format_synthesis(&s);
+
+        assert!(out.starts_with("no memories are waiting for a conclusion"), "{out}");
+        assert!(out.contains("live=1/4"), "{out}");
+        assert!(out.contains("delete_memory"), "{out}");
+        assert!(!out.contains("Conclusions already drawn"), "the only conclusion is listed to review: {out}");
+    }
+
+    #[test]
+    fn the_review_nudge_appears_from_one() {
+        let context = |n| Context { prompt: "## WORKSPACE\nstuff".into(), conclusions_to_review: n, ..Default::default() };
+
+        assert_eq!(format_recall(&context(0)), "## WORKSPACE\nstuff");
+        let one = format_recall(&context(1));
+        assert!(one.starts_with("## WORKSPACE\nstuff\n\n1 conclusion here rests "), "{one}");
+        assert!(one.contains("`synthesize`"), "{one}");
+        let two = format_recall(&Context { unreviewed: SYNTHESIS_NUDGE_THRESHOLD, ..context(2) });
+        assert!(two.ends_with(&review_nudge(2).unwrap()), "the review comes after the synthesis reminder: {two}");
+        assert!(two.contains("2 conclusions here rest "), "{two}");
     }
 
     #[test]
@@ -1027,7 +1150,7 @@ mod tests {
 
     #[test]
     fn the_nudge_appears_from_the_threshold() {
-        let context = |unreviewed| Context { prompt: "## WORKSPACE\nstuff".into(), unreviewed, retrieval: None };
+        let context = |unreviewed| Context { prompt: "## WORKSPACE\nstuff".into(), unreviewed, retrieval: None, ..Default::default() };
 
         assert_eq!(format_recall(&context(SYNTHESIS_NUDGE_THRESHOLD - 1)), "## WORKSPACE\nstuff");
         let out = format_recall(&context(SYNTHESIS_NUDGE_THRESHOLD));
@@ -1039,7 +1162,7 @@ mod tests {
     #[test]
     fn recall_says_when_memories_were_not_searched() {
         let recall = |prompt: &str, retrieval| {
-            format_recall(&Context { prompt: prompt.into(), unreviewed: 0, retrieval: Some(retrieval) })
+            format_recall(&Context { prompt: prompt.into(), unreviewed: 0, retrieval: Some(retrieval), ..Default::default() })
         };
         let cases = [
             (Retrieval::EmbedderNotReady, "still loading"),
@@ -1064,7 +1187,7 @@ mod tests {
     fn recall_says_when_nothing_was_relevant() {
         let recall = |prompt: &str| {
             let retrieval = Some(Retrieval::Searched { hits: 0, withheld: 2 });
-            format_recall(&Context { prompt: prompt.into(), unreviewed: 0, retrieval })
+            format_recall(&Context { prompt: prompt.into(), unreviewed: 0, retrieval, ..Default::default() })
         };
         let sentence = "no relevant memories for this query: 2 searched, none close enough to show";
         assert_eq!(
@@ -1077,14 +1200,14 @@ mod tests {
     #[test]
     fn an_old_daemon_gets_no_invented_notice() {
         for retrieval in [None, Some(Retrieval::Unknown), Some(Retrieval::Searched { hits: 0, withheld: 0 })] {
-            let context = Context { prompt: String::new(), unreviewed: 0, retrieval };
+            let context = Context { prompt: String::new(), unreviewed: 0, retrieval, ..Default::default() };
             assert_eq!(format_recall(&context), "no context yet");
         }
     }
 
     #[test]
     fn the_nudge_follows_an_empty_context_too() {
-        let out = format_recall(&Context { prompt: String::new(), unreviewed: 50, retrieval: None });
+        let out = format_recall(&Context { prompt: String::new(), unreviewed: 50, retrieval: None, ..Default::default() });
         assert!(out.starts_with("no context yet\n\n"), "{out}");
     }
 

@@ -269,6 +269,10 @@ pub struct Context {
     /// conclusions. A daemon that predates the count omits it.
     #[serde(default)]
     pub unreviewed: usize,
+    /// Conclusions of the scope that lost a source since it was last
+    /// reviewed. A daemon that predates the count omits it.
+    #[serde(default)]
+    pub conclusions_to_review: usize,
     /// Whether memories were searched for the prompt. A daemon that predates
     /// the field omits it, and then nothing can be said either way.
     #[serde(default)]
@@ -301,6 +305,30 @@ pub struct Synthesis {
     pub pending: Vec<MemoryRow>,
     pub pending_total: usize,
     pub conclusions: Vec<MemoryRow>,
+    /// Conclusions with a lost source. A daemon that predates them omits
+    /// both fields.
+    #[serde(default)]
+    pub to_review: Vec<ConclusionReview>,
+    #[serde(default)]
+    pub to_review_total: usize,
+}
+
+/// A conclusion with a source that was deleted, replaced or purged.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct ConclusionReview {
+    pub conclusion: MemoryRow,
+    /// Sources still live.
+    pub live: usize,
+    pub lost: Vec<LostSource>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct LostSource {
+    pub id: i64,
+    /// `deleted`, `superseded` or `purged`.
+    pub state: String,
+    #[serde(default)]
+    pub superseded_by: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -1296,6 +1324,16 @@ pub(crate) mod tests {
         let old: Context =
             serde_json::from_str(r#"{"prompt":"","unreviewed":0,"retrieval":{"state":"searched"}}"#).expect("parses");
         assert_eq!(old.retrieval, Some(Retrieval::Searched { hits: 0, withheld: 0 }));
+    }
+
+    #[test]
+    fn answers_without_conclusions_to_review_still_parse() {
+        let old: Context = serde_json::from_str(r#"{"prompt":"","unreviewed":0}"#).expect("a daemon that never said");
+        assert_eq!(old.conclusions_to_review, 0);
+        let old: Synthesis = serde_json::from_str(r#"{"pending":[],"pending_total":0,"conclusions":[]}"#)
+            .expect("a daemon that never said");
+        assert!(old.to_review.is_empty());
+        assert_eq!(old.to_review_total, 0);
     }
 
     #[test]
