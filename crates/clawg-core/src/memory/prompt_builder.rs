@@ -658,7 +658,9 @@ fn format_conflict_block(pairs: &[ConflictPair], hit_positions: &HashMap<i64, us
 /// Rows RECENT may print in a prompt without a query: the reader's own live
 /// rows since `?3`, newest first, under the search's project predicate. The
 /// pool is wider than the block because the pieces of one long save are
-/// rows of their own, and they fold into one line.
+/// rows of their own, and they fold into one line. The pieces of a save share
+/// its stamp and are inserted in order, so `id ASC` within a stamp keeps the
+/// opening of a save the pool's cut falls inside.
 const RECENT_ROWS_SQL: &str = "
     SELECT id, content, memory_type, tier, status, created_at, agent_id, topic_key
     FROM memory
@@ -667,7 +669,7 @@ const RECENT_ROWS_SQL: &str = "
       AND agent_id = ?1
       AND (?2 IS NULL OR project_id = ?2 OR project_id IS NULL OR memory_type = 'user_preference')
       AND created_at >= ?3
-    ORDER BY created_at DESC, id DESC
+    ORDER BY created_at DESC, id ASC
     LIMIT ?4
 ";
 const RECENT_ROW_POOL: i64 = 200;
@@ -2901,6 +2903,45 @@ mod tests {
         assert!(matches!(prompt.retrieval, Retrieval::Recent { hits: 1 }), "{:?}", prompt.retrieval);
         assert!(prompt.text.contains(&format!("#{first} semantic_fact piece=1/2]")), "{}", prompt.text);
         assert!(!prompt.text.contains(&format!("#{second} ")), "{}", prompt.text);
+    }
+
+    #[tokio::test]
+    async fn a_long_save_the_row_pool_cuts_is_still_shown_by_its_opening() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        // Every piece of a save carries the save's stamp, as ingest writes it.
+        let pieces = RECENT_ROW_POOL + 1;
+        let ts = TimestampMs::now().as_millis_i64() - 86_400_000;
+        let ids = store
+            .conn
+            .call(move |c| -> Result<Vec<i64>, rusqlite::Error> {
+                (0..pieces)
+                    .map(|i| {
+                        c.execute(
+                            "INSERT INTO memory (scope, agent_id, project_id, content, memory_type, source,
+                             created_at, created_by_type, created_by_ref,
+                             last_modified_at, last_accessed_at, importance, tier, status)
+                             VALUES ('agent', 'agent-1', NULL, ?1, 'semantic_fact', 'explicit', ?2, 'agent', 'agent-1', ?2, ?2, 5.0, 2, 'active')",
+                            rusqlite::params![format!("piece {i} of a long save"), ts],
+                        )?;
+                        Ok(c.last_insert_rowid())
+                    })
+                    .collect()
+            })
+            .await
+            .unwrap();
+        let linked = ids
+            .iter()
+            .enumerate()
+            .map(|(i, &memory_id)| crate::memory::pieces::StoredPiece {
+                memory_id,
+                context: if i == 0 { String::new() } else { "opening".into() },
+            })
+            .collect();
+        store.link_pieces(linked).await.unwrap();
+
+        let prompt = session_prompt(&store, "agent-1", None).await;
+
+        assert!(prompt.text.contains(&format!("#{} semantic_fact piece=1/{pieces}]", ids[0])), "{}", prompt.text);
     }
 
     #[tokio::test]
