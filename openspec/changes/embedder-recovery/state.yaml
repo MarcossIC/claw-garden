@@ -1,14 +1,14 @@
 change: embedder-recovery
 objective: "transversal"
 depends_on: []
-phase: apply
+phase: verify
 artifacts:
   exploration: done
   proposal: done
   spec: done
   design: done
   tasks: done
-  apply: pending
+  apply: done
   verify: pending
   archive: pending
 updated: 2026-10-19
