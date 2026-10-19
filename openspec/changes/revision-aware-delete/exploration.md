@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 | M | 18 (recoverable-delete), 24 y 27, archivados | exploración; la ventana de la redetección está decidida, el resto son decisiones abiertas |
+| 1 | M | 18 (recoverable-delete), 24 y 27, archivados | decidida; sigue en la [propuesta](proposal.md) |
 
 **Tesis:** 18 se implementó antes que 24 y 27, aunque el plan decía que restaurar «tiene que conocer las candidatas y las revisiones». Borrar y restaurar siguen escritos para un mundo donde una fila es independiente de las demás. Hoy borrar la versión vigente de un tema esconde el tema entero, restaurar una fila reemplazada por una borrada deja un callejón sin salida, y una fila restaurada nunca se compara con lo que se guardó mientras estaba borrada. Este cambio hace que borrar y restaurar respeten las revisiones y los pares.
 
@@ -144,15 +144,15 @@ A explorar, con lo que sugiere el código:
 
 ## Decisiones abiertas
 
-Son del usuario. Cada una trae una recomendación, no una decisión.
+Decididas; el detalle está en la [propuesta](proposal.md#decisiones).
 
-- [ ] **Qué pasa con la anterior al borrar la vigente.** Recomendación: A1, revivir la de la misma clave. Alternativas: B (dejarla y decirlo) o C (camino explícito).
-- [ ] **Si la cadena tiene varias reemplazadas por la misma.** Recomendación: revivir la de id mayor y reapuntar las otras.
-- [ ] **Un veredicto `supersedes` cuyo ganador se borra.** Recomendación: no revivir; decirlo en la respuesta.
-- [ ] **Restaurar una vigente con la anterior revivida.** Recomendación: A1, sin esquema, por orden de id. Alternativa: A2 con columna y migración.
-- [ ] **Barrido de mantenimiento** para las filas que dejó un binario anterior. Recomendación: sí, con la misma regla.
-- [x] **Redetección al restaurar:** sólo las vivas guardadas mientras estuvo borrada, como candidatas `pending` con las reglas de `needs_user`, devueltas en `related`. (Decidido.)
-- [ ] **La dirección del par y quién queda `disputed`.** Recomendación: C (la nueva) como `new_id` y como la que carga la disputa.
+- [x] **Qué pasa con la anterior al borrar la vigente:** revivirla, con registro (A2), y además con la causa de cada reemplazo, para no decidir por la clave ([diseño](design.md#d1-qué-se-registra)).
+- [x] **Si la cadena tiene varias reemplazadas por la misma:** revivir el save de id mayor y reapuntar las otras.
+- [x] **Un veredicto `supersedes` cuyo ganador se borra:** no revivir; decirlo en la respuesta.
+- [x] **Restaurar una vigente con la anterior revivida:** por `revived_from`, con la migración V17.
+- [x] **Barrido de mantenimiento** para las filas que dejó un binario anterior, con la misma regla.
+- [x] **Redetección al restaurar:** sólo las vivas guardadas mientras estuvo borrada, como candidatas `pending` con las reglas de `needs_user`, devueltas en `related`.
+- [x] **La dirección del par y quién queda `disputed`:** C (la nueva) como `new_id` y como la que carga la disputa.
 
 ## Cómo se mide
 
