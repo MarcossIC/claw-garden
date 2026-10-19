@@ -92,7 +92,7 @@ impl Sandbox {
             .env("CLAWG_TEST_EMBEDDER", embedder)
             .stdout(Stdio::null())
             .stderr(File::create(&log).expect("log file"))
-            .spawn()
+            .spawn_copy()
             .expect("spawn clawg serve");
         Daemon::watch(child, log).answering(&self.data_dir()).await
     }
@@ -114,7 +114,7 @@ impl Sandbox {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(File::create(&log).expect("log file"))
-            .spawn()
+            .spawn_copy()
             .expect("spawn clawg mcp");
         let stdin = child.stdin.take().expect("stdin");
         let stdout = child.stdout.take().expect("stdout");
@@ -770,6 +770,35 @@ fn stamped_bytes(json: &str) -> Vec<u8> {
     bytes
 }
 
+/// Runs a copy of the binary this process wrote. While the copy was open for
+/// writing, a child another test forked meanwhile inherited that descriptor
+/// and holds it until it execs, and running the copy in that moment fails
+/// with "text file busy", so the run is tried again.
+trait RunCopy {
+    fn spawn_copy(&mut self) -> std::io::Result<Child>;
+    fn output_copy(&mut self) -> std::io::Result<Output>;
+}
+
+impl RunCopy for Command {
+    fn spawn_copy(&mut self) -> std::io::Result<Child> {
+        retry_while_busy(|| self.spawn())
+    }
+
+    fn output_copy(&mut self) -> std::io::Result<Output> {
+        retry_while_busy(|| self.output())
+    }
+}
+
+fn retry_while_busy<T>(mut run: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    for _ in 0..50 {
+        match run() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => std::thread::sleep(Duration::from_millis(20)),
+            done => return done,
+        }
+    }
+    run()
+}
+
 fn write_executable(path: &Path, bytes: &[u8]) {
     std::fs::write(path, bytes).expect("write the copy");
     #[cfg(unix)]
@@ -786,7 +815,7 @@ fn run_binary(sandbox: &Sandbox, bin: &Path, args: &[&str]) -> Output {
         .env_remove("CLAWG_PROFILE")
         .current_dir(&sandbox.home)
         .stdin(Stdio::null())
-        .output()
+        .output_copy()
         .expect("run clawg")
 }
 
@@ -897,7 +926,7 @@ fn update(sandbox: &Sandbox, bin: &Path, server: &str, args: &[&str]) -> Output 
         .env_remove("CLAWG_PROFILE")
         .current_dir(&sandbox.home)
         .stdin(Stdio::null())
-        .output()
+        .output_copy()
         .expect("run clawg update")
 }
 
@@ -1013,7 +1042,7 @@ fn update_from(sandbox: &Sandbox, installed: &Path, server: &str, public: &str) 
         .env_remove("CLAWG_PROFILE")
         .current_dir(&sandbox.home)
         .stdin(Stdio::null())
-        .output()
+        .output_copy()
         .expect("run clawg update")
 }
 
@@ -1121,7 +1150,7 @@ async fn store_at(sandbox: &Sandbox, schema: i32, seed: impl FnOnce(&rusqlite::C
     let installed = install(sandbox, &stamp_json("0.18.0", &format!(r#","migrations_up_to":{schema}"#)));
     // The first start only creates the store at that schema.
     let first = sandbox.serve_binary(&installed, "fake").await;
-    let stopped = sandbox.command_of(&installed, &["stop", "--profile", "dev"]).output().expect("run clawg stop");
+    let stopped = sandbox.command_of(&installed, &["stop", "--profile", "dev"]).output_copy().expect("run clawg stop");
     assert!(stopped.status.success(), "{}", stderr_of(&stopped));
     first.wait_for_exit(Duration::from_secs(10)).await;
 
@@ -1445,7 +1474,7 @@ async fn a_stale_daemon_is_brought_back_by_the_installed_binary_when_the_new_one
         .stdin(Stdio::null())
         .stdout(File::create(&out_log).expect("log file"))
         .stderr(File::create(&err_log).expect("log file"))
-        .spawn()
+        .spawn_copy()
         .expect("run clawg update");
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
     let status = loop {
