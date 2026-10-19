@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| transversal | S | — (53 outbox-lifecycle depende de éste; ver «Interacciones») | exploración (borrador) |
+| transversal | S | — (53 outbox-lifecycle depende de éste; ver «Interacciones») | hecha; las decisiones abiertas se cerraron en la [propuesta](proposal.md#decisiones) |
 
 **Tesis:** un hilo de inferencia roto se recupera solo, también con `CLAWG_EMBEDDER_IDLE_MINUTES=0`, y el daemon no gasta inferencia en peticiones que nadie espera. Hoy, si el hilo `embedder-worker` muere, cada llamada siguiente devuelve `WorkerGone` y nada lo reemplaza hasta que el daemon se reinicie (o, con el ocio activo, hasta que pase un período completo sin una sola llamada, que casi nunca ocurre porque las llamadas fallidas cuentan como uso). Mientras tanto `/health` dice `ready` y `embedder_resident: true`. No se encontró un camino concreto que haga entrar en pánico al hilo, así que la gravedad es de resiliencia, no de un fallo observado. Nada de esto toca `memory.db` ni el contrato de embeddings: los vectores que produce el modelo no cambian.
 
