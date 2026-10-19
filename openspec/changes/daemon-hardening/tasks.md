@@ -10,14 +10,14 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 
 ## 2. La decisión pura y el registro con tope (R1, R4)
 
-- [ ] Tests primero en `daemon/guard.rs`: la tabla de R1 y el tope del registro.
-- [ ] `admits(host, origin)`, `RefusalLog`.
+- [x] Tests primero en `daemon/guard.rs`: la tabla de R1 y el tope del registro.
+- [x] `admits(host, uri_authority, origin)`, `RefusalLog`.
 - Commit: con la tarea 3
 
 ## 3. El guardia en `router` (R2, R3)
 
-- [ ] Tests primero en `tests/api.rs`: `a_foreign_host_is_forbidden_on_health_and_v1_with_or_without_a_token`, `an_origin_is_forbidden_even_with_the_token`, `both_refusals_answer_the_same_body`, `a_daemon_client_passes_the_guard`.
-- [ ] La capa en `router`, antes del token.
+- [x] Tests primero en `tests/api.rs`: `a_foreign_host_is_forbidden_on_health_and_v1_with_or_without_a_token`, `an_origin_is_forbidden_even_with_the_token`, `both_refusals_answer_the_same_body`, `a_daemon_client_passes_the_guard`.
+- [x] La capa en `router`, antes del token (`admit_loopback`).
 - Commit: `feat(cli): refuse a non-loopback Host and any Origin on every daemon route`
 
 ## 4. Docs

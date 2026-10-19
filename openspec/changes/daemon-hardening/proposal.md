@@ -31,7 +31,7 @@ Las decisiones abiertas de la exploración se cerraron con su recomendación; la
 
 ## Alcance
 
-1. `clawg-cli`: la función pura `admits(host, origin)`, la capa en `router` y el registro con tope; la apertura con modo en `lifecycle.rs`.
+1. `clawg-cli`: la función pura `admits(host, uri_authority, origin)`, la capa en `router` y el registro con tope; la apertura con modo en `lifecycle.rs`.
 2. Docs: `.claude/CLAUDE.md` (una línea en «Daemon HTTP API»), README si nombra la seguridad de la API, `openspec/README.md`, y una spec nueva `specs/daemon-access`.
 
 ## Fuera de alcance

@@ -8,7 +8,7 @@
 
 ## R1. La decisión es pura
 
-`admits(host, origin)` MUST admitir una petición sólo cuando su autoridad, sin el puerto, es un nombre de loopback y no trae `Origin`. Un `Origin` presente MUST rechazarse con cualquier valor, `null` incluido. Sin autoridad MUST rechazarse. Un puerto que no sea un número, o un nombre de loopback seguido de otra cosa (`127.0.0.1.evil.example`, `localhost.`), MUST rechazarse.
+`admits(host, uri_authority, origin)` MUST admitir una petición sólo cuando nombra al menos una autoridad, toda autoridad que nombra (la cabecera `Host` y la autoridad de la URI, que en una URI absoluta manda sobre `Host`) es, sin el puerto, un nombre de loopback, y no trae `Origin`. Un `Origin` presente MUST rechazarse con cualquier valor, `null` incluido. Sin autoridad MUST rechazarse. Un puerto que no sea un número, o un nombre de loopback seguido de otra cosa (`127.0.0.1.evil.example`, `localhost.`), MUST rechazarse.
 
 | Autoridad | `Origin` | Resultado |
 |---|---|---|
@@ -23,8 +23,10 @@
 | `127.0.0.1:27380` | `http://evil.example` | rechazada |
 | `127.0.0.1:27380` | `null` | rechazada |
 | — | — | rechazada |
+| sólo en la URI: `127.0.0.1:27380` | — | admitida |
+| `Host: 127.0.0.1:27380`, URI `http://evil.example/` | — | rechazada |
 
-**Tests:** `loopback_names_are_admitted_with_or_without_a_port`, `a_foreign_or_lookalike_host_is_refused`, `any_origin_is_refused`, `a_request_without_an_authority_is_refused` (`daemon/guard.rs`, mod tests).
+**Tests:** `loopback_names_are_admitted_with_or_without_a_port`, `a_foreign_or_lookalike_host_is_refused`, `any_origin_is_refused`, `a_request_without_an_authority_is_refused`, `the_uri_authority_stands_in_for_a_missing_host`, `a_foreign_uri_authority_is_refused_behind_a_loopback_host` (`daemon/guard.rs`, mod tests).
 
 ## R2. El guardia corre en toda ruta y antes del token
 
