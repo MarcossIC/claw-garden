@@ -50,7 +50,7 @@ El daemon los mapea a 404, 400, 409, 409, 500 y 500. El 503 lo decide antes `rea
 | Opción | A favor | En contra |
 |---|---|---|
 | **a. `POST .../restore`** | Una acción con nombre, como `/disputes/resolve`; no se confunde con un cambio de campos | Una ruta más |
-| b. `PATCH` con `deleted: false` | Sin ruta nueva | Mezcla dos contratos: `update_memory` contesta 404 a una borrada y valida "al menos un campo" ([`specs/update`](../../specs/update/spec.md) R1 y R3) |
+| b. `PATCH` con `deleted: false` | Sin ruta nueva | Mezcla dos contratos: `update_memory` contesta 404 a una borrada y valida "al menos un campo" ([`specs/update`](../../../specs/update/spec.md) R1 y R3) |
 | c. `DELETE` inverso (`PUT`) | Simétrico | Nadie lo lee como "deshacer" |
 
 **Elegida a.**

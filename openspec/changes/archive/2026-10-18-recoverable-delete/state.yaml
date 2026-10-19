@@ -1,0 +1,15 @@
+change: recoverable-delete
+objective: "1"
+depends_on: [visibility-policy, agent-sharing, long-save-context]
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # Linux, Windows, modelo real y el perfil dev por el puente MCP; el arreglo de las piezas con clave antes de archivar, el resto pasó a revision-aware-delete
+  archive: done
+updated: 2026-10-18
+main_spec: openspec/specs/restore/spec.md, openspec/specs/mcp/spec.md, openspec/specs/visibility/spec.md, openspec/specs/sharing/spec.md, openspec/specs/disputes/spec.md

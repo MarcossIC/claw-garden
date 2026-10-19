@@ -118,7 +118,7 @@ En `search_memory` (`format_hits`, `crates/clawg-cli/src/mcp/tools.rs:95`; `shar
 - El workspace de L MUST cargar sólo filas de L (`regenerate_auto_section` con el agente del pedido, `api.rs:1104`).
 - ACTIVE CONFLICTS MUST mostrar sólo disputas cuya fila nueva es de L, como siempre, aunque un hit ajeno esté en el prompt (`fetch_active_conflicts`, `prompt_builder.rs:679`, recibe sólo el agente).
 - `list_memories`, `synthesize`, el dedup y el detector de contradicciones al guardar MUST seguir viendo sólo lo de L (`list_memories_impl`, `crates/clawg-cli/src/mcp/server.rs:786`, manda `agent: Some(agent_id)`).
-- `delete_memory`, `update_memory` y `resolve_conflict` sobre una fila ajena que L ve en la búsqueda MUST fallar como si el id no existiera, sin tocar nada ([`specs/visibility`](../visibility/spec.md) R3 y R4). Sus descripciones MUST decir que sólo valen sobre las memorias propias y que lo compartido es de sólo lectura (`server.rs:1106-1159`).
+- `delete_memory`, `update_memory`, `resolve_conflict` y `restore_memory` sobre una fila ajena que L ve en la búsqueda MUST fallar como si el id no existiera, sin tocar nada ([`specs/visibility`](../visibility/spec.md) R3 y R4; para `restore_memory`, también [`specs/restore`](../restore/spec.md)). Sus descripciones MUST decir que sólo valen sobre las memorias propias y que lo compartido es de sólo lectura (`server.rs:1106-1159`).
 
 #### Escenario: borrar lo compartido
 - GIVEN una fila de A que B acaba de ver en `search_memory`

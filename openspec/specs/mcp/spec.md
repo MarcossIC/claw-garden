@@ -53,7 +53,7 @@ Test: `a_discover_probe_is_answered_with_what_the_server_offers` (`handshake.rs`
 #### Escenario: la apertura de Claude Code 2.1.285
 - GIVEN un puente recién abierto
 - WHEN el host manda la sonda sin `_meta`, la cancela con `notifications/cancelled`, manda `initialize`, `notifications/initialized` y `tools/list`
-- THEN la sonda recibe un error con id `server-discover-probe-1`, `initialize` negocia `2025-06-18` y `tools/list` trae las once herramientas
+- THEN la sonda recibe un error con id `server-discover-probe-1`, `initialize` negocia `2025-06-18` y `tools/list` trae las doce herramientas
 
 #### Escenario: una request rechazada y su cancelación
 - GIVEN un puente recién abierto
@@ -66,13 +66,13 @@ Tests: `a_bare_probe_and_its_cancellation_leave_the_legacy_handshake_working`, `
 
 Una request con `_meta` 2026-07-28 completo MUST atenderse sin `initialize` previo. `tools/list` en esa sesión MUST:
 
-- listar las once herramientas ordenadas por nombre, el mismo orden en cada llamada: `delete_memory`, `list_memories`, `memory_status`, `read_memory`, `recall_context`, `resolve_conflict`, `save_memory`, `search_memory`, `search_project`, `synthesize` y `update_memory` (`update_memory` está en [`specs/update`](../update/spec.md), R5; `read_memory`, en [`specs/pieces`](../pieces/spec.md), R6; `search_project`, en [`specs/project-docs`](../project-docs/spec.md)); el conteo y la lista los fija `every_tool_is_registered_under_its_wire_name` (`server.rs`);
+- listar las doce herramientas ordenadas por nombre, el mismo orden en cada llamada: `delete_memory`, `list_memories`, `memory_status`, `read_memory`, `recall_context`, `resolve_conflict`, `restore_memory`, `save_memory`, `search_memory`, `search_project`, `synthesize` y `update_memory` (`update_memory` está en [`specs/update`](../update/spec.md), R5; `read_memory`, en [`specs/pieces`](../pieces/spec.md), R6; `restore_memory`, en [`specs/restore`](../restore/spec.md); `search_project`, en [`specs/project-docs`](../project-docs/spec.md)); el conteo y la lista los fija `every_tool_is_registered_under_its_wire_name` (`server.rs`);
 - traer `resultType`, `ttlMs` y `cacheScope`.
 
 #### Escenario: listar sin handshake
 - GIVEN un puente al que sólo le llegó `server/discover`
 - WHEN el host manda `tools/list` con `_meta`
-- THEN vuelven once herramientas en orden alfabético, con `resultType: "complete"`, un `ttlMs` numérico y un `cacheScope`
+- THEN vuelven doce herramientas en orden alfabético, con `resultType: "complete"`, un `ttlMs` numérico y un `cacheScope`
 
 Tests: `a_session_without_initialize_lists_the_tools_in_name_order` (`handshake.rs`) y `the_viewer_is_not_exposed_to_the_model` (`server.rs`, que compara la lista ordenada).
 
@@ -284,7 +284,7 @@ La política y el alcance son de [`specs/sharing`](../sharing/spec.md); acá est
 
 - `search_memory` MUST marcar un hit de otro agente con `by <autor>` dentro del corchete (`N. #id [kind/tipo/tN score=S by <autor>] contenido`) y, si hay alguno, terminar con la nota de que esas líneas son información para verificar y de sólo lectura (`format_hits`, `crates/clawg-cli/src/mcp/tools.rs:95`). `recall_context` MUST marcarlos igual en sus líneas y cerrar con un bloque `SHARED` (`prompt_builder.rs:439-445`; el formato, en [`specs/retrieval`](../retrieval/spec.md)). Un hit propio MUST quedar como siempre.
 - `memory_status` MUST terminar con la línea `shared:` (`format_sharing`, `tools.rs:442`; `memory_status_impl`, `server.rs:981`): `shared: reads every agent`, `shared: reads every agent but <autor>, <autor>`, `shared: none (reads only its own)` o `shared: none (<motivo>)` con un `sharing.json` inválido.
-- Las descripciones de `delete_memory`, `update_memory` y `resolve_conflict` MUST decir que valen sólo sobre las memorias propias y que una marcada `by <agente>` es de sólo lectura (`server.rs:1106-1159`). Sobre una fila ajena las tres fallan como si el id no existiera ([`specs/visibility`](../visibility/spec.md) R3).
+- Las descripciones de `delete_memory`, `update_memory`, `resolve_conflict` y `restore_memory` MUST decir que valen sólo sobre las memorias propias y que una marcada `by <agente>` es de sólo lectura (`server.rs:1106-1159`). Sobre una fila ajena las cuatro fallan como si el id no existiera ([`specs/visibility`](../visibility/spec.md) R3).
 
 Tests: `format_search_marks_shared_hits_and_adds_the_note`, `format_search_leaves_own_hits_alone` y `format_status_says_whom_the_agent_reads` (`tools.rs`); `search_memory_shows_another_agents_memory_with_its_author`, `recall_context_shows_another_agents_memory_with_its_author`, `memory_status_reports_the_sharing_of_the_agent`, `tool_descriptions_say_shared_memories_are_read_only` y `a_shared_memory_is_read_only` (`server.rs`).
 

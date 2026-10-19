@@ -381,7 +381,7 @@ pub enum RestoreError {
 }
 
 /// How a restored row ended up. A `superseded` row is live again but still
-/// replaced: searches leave it out until the dispute is resolved otherwise.
+/// replaced: searches leave it out until a `resolve_conflict` verdict keeps it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RestoredRow {
     pub id: i64,
@@ -407,11 +407,14 @@ const RESTORE_TWIN: &str = "SELECT t.id FROM memory m JOIN memory t \
      ORDER BY t.created_at ASC LIMIT 1";
 
 /// The live row that holds the deleted row's topic key now, in the same scope
-/// as `SCOPE_ROWS_SQL` in `topic.rs`.
+/// as `SCOPE_ROWS_SQL` in `topic.rs`. The other pieces of the row's own save
+/// are not holders: a keyed long save gives its key to every piece.
 const RESTORE_TOPIC_HOLDER: &str = "SELECT m.topic_key, t.id FROM memory m JOIN memory t \
      ON t.agent_id IS m.agent_id AND COALESCE(t.project_id, '') = COALESCE(m.project_id, '') \
      AND t.topic_key = m.topic_key \
      WHERE m.id = ?1 AND t.id <> m.id \
+     AND NOT EXISTS (SELECT 1 FROM memory_piece a JOIN memory_piece b ON b.save_id = a.save_id \
+                     WHERE a.memory_id = m.id AND b.memory_id = t.id) \
      AND t.deleted_at IS NULL AND t.status IN ('active', 'disputed') \
      ORDER BY t.id LIMIT 1";
 
@@ -432,7 +435,7 @@ const RESTORE_TEXT_INDEX: &str = "INSERT INTO memory_fts(rowid, content, agent_i
 /// The vector is computed before the transaction, from the current embedder;
 /// inside it the row is read again, so a restore or a save that landed in
 /// between is seen. The row's own dispute is settled against what is live
-/// now; the disputes its deletion released stay released.
+/// now, and the escalated pairs its deletion released are put back.
 pub async fn restore_memory_core(
     store: &MemoryStore,
     embedder: &dyn Embedder,
@@ -3389,6 +3392,59 @@ mod tests {
         let whole = crate::memory::read_save_core(&store, MemoryKind::Memory, first, None).await.unwrap().unwrap();
         assert!(whole.missing.is_empty(), "{whole:?}");
         assert_eq!(whole.ids, vec![Some(first), Some(second), Some(third)]);
+    }
+
+    async fn keyed_save(store: &MemoryStore, key: &str) -> (i64, i64, i64) {
+        let first = save(store, "a", "Notes on clawg-ledger. The first piece of a long save").await;
+        let second = save(store, "a", "the second piece of a long save").await;
+        let third = save(store, "a", "the third piece of a long save").await;
+        link_save(store, vec![(first, ""), (second, "Notes on clawg-ledger."), (third, "Notes on clawg-ledger.")]).await;
+        for id in [first, second, third] {
+            set_key(store, id, key).await;
+        }
+        (first, second, third)
+    }
+
+    #[tokio::test]
+    async fn a_piece_of_a_keyed_save_is_restored_beside_its_live_siblings() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let (first, second, third) = keyed_save(&store, "ledger/notes").await;
+        delete(&store, second).await;
+
+        let row = restore(&store, second, Some("a")).await.unwrap();
+
+        assert_eq!(row, RestoredRow { id: second, status: "active".into(), superseded_by: None });
+        assert!(columns(&store, second).await.0.is_none(), "the piece is live");
+        assert!(stored_vector(&store, second).await.is_some());
+        assert_eq!(text_matches(&store, "second").await, vec![second]);
+        assert!(columns(&store, first).await.0.is_none() && columns(&store, third).await.0.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_whole_keyed_save_is_restored_piece_by_piece() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let (first, second, third) = keyed_save(&store, "ledger/notes").await;
+        for id in [first, second, third] {
+            delete(&store, id).await;
+        }
+
+        for id in [first, second, third] {
+            assert_eq!(restore(&store, id, Some("a")).await.unwrap().status, "active", "piece #{id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_live_row_of_another_save_blocks_the_restore_of_a_piece() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let (_, second, _) = keyed_save(&store, "ledger/notes").await;
+        delete(&store, second).await;
+        let other = save(&store, "a", "ledger notes were rewritten").await;
+        set_key(&store, other, "ledger/notes").await;
+
+        let err = restore(&store, second, Some("a")).await.unwrap_err();
+
+        assert!(matches!(err, RestoreError::TopicTaken { id, live, .. } if id == second && live == other), "{err:?}");
+        assert!(columns(&store, second).await.0.is_some(), "the piece stays deleted");
     }
 
     /// Seeds a row the way the previous version leaves a deleted one: the

@@ -286,7 +286,7 @@ clawg memories show 12 --profile prod              # una memoria completa, con t
 
 El número de `show` es el `id` que aparece en `list` y `search`.
 
-`clawg memories list --deleted` lista las memorias borradas, la última borrada primero. Una borrada vuelve con `clawg undelete <id> --profile prod`, también con el daemon corriendo: se busca de nuevo como antes de borrarla. No vuelve si después se guardó el mismo texto (ya está esa copia) ni si tiene un secreto (`clawg secrets` la lista y `clawg purge` la borra del todo).
+`clawg memories list --deleted` lista las memorias borradas, la última borrada primero. Una borrada vuelve con `clawg undelete <id> --profile prod`, también con el daemon corriendo: se busca de nuevo como antes de borrarla. No vuelve si después se guardó el mismo texto (ya está esa copia), ni si otra memoria viva del mismo agente y proyecto tiene hoy su misma `topic_key` (ya hay una versión vigente de ese tema), ni si tiene un secreto (`clawg secrets` la lista y `clawg purge` la borra del todo).
 
 Se pueden agregar estos filtros a `list` y `search`:
 
