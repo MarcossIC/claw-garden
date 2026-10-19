@@ -15,7 +15,7 @@
 | Cifras de la simulación: 500 piezas, 42 MB; 1 000, 169 MB; 2 000, 678 MB | **Vienen de una simulación en Python con SQLite 3.45, no del daemon.** El patrón (un `UPDATE` por pieza con el JSON completo, WAL, `synchronous = NORMAL`) coincide con el código, pero el tiempo (0,5 s, 1,9 s, 7,6 s) es de ese entorno. Se usan sólo como orden de magnitud; la medición propia es el primer paso (ver «Cómo se mide»). |
 | Un cuerpo de 2 MB son unas 7 000 piezas y unos 8 GB de JSON | **Extrapolación, no medida.** Con el estimador de 4 caracteres por token que usa el repo, 2 MB son ~500 000 tokens; las piezas son de 96 tokens con 24 compartidos (`PIECE_MAX_TOKENS`, `PIECE_OVERLAP_TOKENS`, `chunker/mod.rs:39`, `:44`), paso de 72, y se cortan en cuanto el save no cabe en un chunk de 480 (`chunker/chat.rs:88-94`). 500 000 / 72 ≈ 7 000. Los 8 GB salen de extender la curva cuadrática. Además, `collapse_duplicate_chunks` (`worker.rs:666`) puede reducir el número de entradas si el texto se repite, y la pieza que llega a un duplicado ya guardado no lleva `context`: el peor caso es texto sin repeticiones. |
 | `content` no tiene tope | **Cierta en el daemon.** Sólo `body.content.trim().is_empty()` (`crates/clawg-cli/src/daemon/api.rs:1015`). No hay `DefaultBodyLimit` en `daemon/` ni en `mcp/` (`rg` da cero), así que rige el defecto de 2 MB de axum para `Json`. **El puente tampoco lo acota:** `save_memory_impl` sólo comprueba que no esté vacío (`crates/clawg-cli/src/mcp/server.rs:700-702`) y reenvía `args.content.clone()` (`:712`). La documentación del campo (`:155-157`) no menciona tamaño. |
-| El embedding de todas las piezas va en una sola llamada y hay un KNN por pieza | **Cierta.** Etapa 2: un `embed_batch` con todos los sobrevivientes (`worker.rs:744-746`); etapa 3: un `detect_contradiction` por pieza, en secuencia y antes de cada inserción (`worker.rs:783-797`). Nada divide el lote: la memoria de los vectores y el tiempo hasta la primera inserción crecen con el save entero. El `embed_batch` real se parte o no por dentro en `embedder.rs:405`; no se leyó y queda a medir. |
+| El embedding de todas las piezas va en una sola llamada y hay un KNN por pieza | **Cierta.** Etapa 2: un `embed_batch` con todos los sobrevivientes (`worker.rs:744-746`); etapa 3: un `detect_contradiction` por pieza, en secuencia y antes de cada inserción (`worker.rs:783-797`). Cada uno es un `search_all_memories` con un pool de `CANDIDATE_POOL` (5) más un lugar por hermano (`crates/clawg-core/src/memory/contradiction.rs:58`, `:197-199`): un escaneo completo de `memory_vectors`, con un posible segundo escaneo de ventana 4× y la lectura de vínculos, en llamadas propias a la única conexión, seguido de la transacción de inserción de la pieza. Nada divide el lote: la memoria de los vectores y el tiempo hasta la primera inserción crecen con el save entero. El `embed_batch` real se parte o no por dentro en `embedder.rs:405`; no se leyó y queda a medir. |
 | El puente responde `unconfirmed` a los 10 s | **Matiz: lo hace el daemon, no el puente.** El handler espera el reporte del trabajador `SAVE_CONFIRM_TIMEOUT` = 10 s (`api.rs:98`, `:1118-1121`) y responde `202 unconfirmed` (`api.rs:944`); el save sigue en el outbox. El cliente HTTP del puente no pone otro plazo (`client.rs:590`; el único `.timeout(` es el de `/health`, comprobado por un test en `:1459-1462`). Entonces el save largo no se pierde: se acepta, se responde a los 10 s y se sigue guardando. El costo es el tiempo del hilo, no la respuesta. |
 | Piezas de 96 tokens con 24 compartidos pasados los 480 | **Cierta**, y el 480 es el `CHUNK_MAX_TOKENS` (`chunker/mod.rs:15`): un texto que entra en un chunk no se parte (`chat.rs:89-92`). Ojo: `.claude/CLAUDE.md` habla de «96 tokens, vecinos que comparten 24», consistente con esos valores. |
 | El backlog de `openspec/README.md` registra «El daemon no pone tope a una conexión ni al tamaño de un save» | **Cierta** (`openspec/README.md:221`). Este cambio toma la mitad del tamaño del save. La mitad de conexiones (`axum::serve` sin `Timer`, `header_read_timeout`, tope de conexiones) se queda en el backlog: es otro mecanismo (un bucle sobre `hyper_util`), no comparte código ni prueba con el tope de `content`, y su motivo es la robustez del puerto, no el costo de un save aceptado. |
@@ -31,7 +31,11 @@ Lo que cuesta es el hilo, no sólo el disco. Cada `UPDATE` ocurre dentro de `ins
 
 La reanudación también paga: `resume_positions` recorre todo el progreso y compara con `hashes` (`outbox.rs:97-107`), y `process_tracked` lo clona (`worker.rs:683`). Es O(n) una vez por reanudación, no el problema.
 
-### 2. El save no tiene tope
+### 2. Un escaneo KNN por pieza
+
+Un save de unos 5.000 tokens son unas 69 piezas (paso de 72 tokens: 96 con 24 compartidos), es decir, unos 69 escaneos completos del detector, más los reintentos. Una medición sintética fuera del repo, con el SQLite empaquetado (3.50.2) y sqlite-vec 0.1.9, dio del orden de 11 ms por escaneo a 10.000 filas y 54 ms a 50.000: entre 0,8 y 3,7 s de hilo de SQLite por ese save. Con el tope candidato de 64 KiB (~220 piezas) serían de 2,4 a 12 s, más que los 10 s de `SAVE_CONFIRM_TIMEOUT` (`crates/clawg-cli/src/daemon/api.rs:98`). No bloquea de una vez, porque cada pieza es una llamada aparte y entre ellas entran las demás, pero alarga la cola de la conexión y la confirmación del propio save. Las cifras sirven como orden de magnitud; el tiempo de hilo con un store sembrado es parte de la medición de este cambio.
+
+### 3. El save no tiene tope
 
 Con 2 MB de cuerpo entran miles de piezas, cada una con su embedding (un solo lote, `worker.rs:746`) y su KNN de contradicción (`worker.rs:790`) en el único trabajador de ingest. Mientras tanto la cola del canal (`INGEST_QUEUE_CAPACITY` = 1024, `runtime.rs:47`) se llena detrás y los saves cortos esperan. El handler responde `202 unconfirmed` a los 10 s, que es correcto pero esconde que el trabajador sigue ocupado.
 
@@ -75,6 +79,13 @@ Dividir el `embed_batch` de `worker.rs:746` en lotes de tamaño fijo.
 - **A favor:** acota la memoria y permite que el drenaje y el cierre intervengan entre lotes.
 - **En contra:** no cambia el costo total ni el del progreso. Con el tope de A el lote ya está acotado (~220 vectores de 384 floats no son memoria relevante). Depende de cómo trocee `embedder.rs:405` por dentro, que no se leyó. Sólo se justifica si la medición muestra que la espera previa a la primera inserción es el problema. **No recomendado ahora.**
 
+### E. Las búsquedas del detector de todas las piezas en una sola llamada
+
+Correr los KNN de todas las piezas dentro de una `call`, con una sentencia preparada que se reusa.
+
+- **A favor:** quita los viajes de ida y vuelta al hilo de SQLite y la preparación repetida.
+- **En contra:** no quita ningún escaneo, que es el costo; y una sola `call` larga deja a todo lo demás esperando detrás de ella de una vez, en lugar de intercalarse pieza por pieza. Lo que baja el costo de cada escaneo es knn-prefilter (37). **No recomendado** salvo que la medición muestre que los viajes pesan.
+
 ### Recomendación: medir, A y luego decidir B o C
 
 1. **Medir primero.** Una prueba que guarda textos de 100, 1 000 y 2 000 piezas con el embedder falso y cuenta los bytes escritos a `progress`. Hoy tiene que dar una curva cuadrática y servir de prueba roja para lo que sigue.
@@ -89,10 +100,12 @@ Dividir el `embed_batch` de `worker.rs:746` en lotes de tamaño fijo.
 | Partir el save en varios en el handler | Cambia lo que es un save (un `operation_id`, un `topic_key`, un vínculo `memory_piece`) y rompe `topic_key` y el reemplazo entero (`specs/pieces` R10). |
 | Tope sólo en el puente | Cualquier cliente del daemon con el token lo saltea; el daemon es quien tiene el contrato. Puede sumarse el mismo chequeo en el puente para dar el error sin ir a la red; no hace falta. |
 | `DefaultBodyLimit` solo | Rechaza con un 413 genérico antes de llegar al handler y sin decir el límite en el formato de error del daemon; además un cuerpo JSON con escapes pesa más que su `content`. Sirve de segunda línea, no de reemplazo. |
+| Comparar sólo la primera pieza y una de cada N contra el store | Las piezas vecinas comparten 24 tokens, así que podría alcanzar, pero cambia qué pares encuentra el detector: es un cambio del detector, que se mide con `conflict-eval`, no un tope del save. |
 | Tope de conexiones y `header_read_timeout` | Otra mitad del backlog (`openspec/README.md:221`), distinta causa y mecanismo; se queda allí. |
 
 ## Interacciones
 
+- **knn-prefilter (37).** Este cambio acota cuántos escaneos hace un save; aquel, cuánto cuesta cada uno.
 - **outbox-lifecycle (53).** Comparte el bucle de piezas (`worker.rs:783-825`). Una pausa entre piezas, un corte del drenaje y una política de reintento descansan en el `progress`: si 53 cambia qué se anota o cuándo, este cambio y 53 tocan las mismas líneas. Conviene que este cambio fije el formato del progreso primero, o que ambos se diseñen juntos antes de escribir código.
 - **secret-coverage (51).** Posible V18 en ambos (ver C). Además, si este cambio agrega una tabla con `context`, 51 tiene que hacer que `purge` la limpie. Si se elige B (sin tabla), no hay interacción.
 - **history-import (44).** Lo importa por el camino normal de `save_memory`. El máximo medido (45 372 caracteres) cabe en cualquier tope razonable, pero 44 debe decir qué hace con una nota que lo supere (partirla en varios saves a propósito, o rechazarla en el `--dry-run`). Este cambio va antes de 44 para que la importación de miles de notas no sea la primera carga real del progreso cuadrático: 1 931 de las 3 554 notas son saves de más de una pieza.
@@ -102,7 +115,7 @@ Dividir el `embed_batch` de `worker.rs:746` en lotes de tamaño fijo.
 
 ## Alcance candidato
 
-1. Prueba de medición de los bytes escritos a `progress` para N piezas (la curva de hoy).
+1. Prueba de medición de los bytes escritos a `progress` para N piezas (la curva de hoy) y de los escaneos del detector que corre un save de N piezas.
 2. Tope de `content` en bytes en `save_memory` del daemon (`api.rs:1015`), 400 antes del outbox que nombra el límite y escribe nada; la misma comprobación se refleja en el mensaje que el puente muestra.
 3. Una línea en `protocol.md` y, si cambia una descripción, `agent_contract.json` bendecido.
 4. Según la medición: B (progreso delgado, lee el formato viejo) o dejarlo.
@@ -125,6 +138,7 @@ Son del usuario.
 - [ ] **B, C o ninguno** después de medir.
 - [ ] **Numeración de la migración** si se elige C, junto con 51.
 - [ ] **Qué hace 44 con una nota sobre el tope.**
+- [ ] **El tope y los escaneos.** ¿El valor del tope se elige también por el tiempo de hilo que suman los KNN de sus piezas sobre un store grande, o sólo por los bytes del progreso?
 - [ ] **Segunda línea.** ¿`DefaultBodyLimit` además del tope, para acotar el cuerpo antes de deserializarlo?
 
 ## Cómo se mide
@@ -135,7 +149,8 @@ Todo con el embedder falso (`CLAWG_TEST_EMBEDDER=fake` en los tests de binario; 
 2. **El 400**: un cuerpo sobre el tope recibe `400` antes del outbox, con el límite en el mensaje, y `ingest_outbox` queda sin filas nuevas. Uno justo en el tope se acepta.
 3. **Compatibilidad**: una fila pendiente con el `progress` en el formato viejo (sembrada con el JSON de hoy) se reanuda y termina con el formato nuevo (si se elige B o C). Si hay migración, además la prueba de sembrar en V17.
 4. **Latencia de un save largo antes y después.** Requiere el modelo real (la inferencia domina) y un perfil de datos dev, con autorización; las cifras de la simulación (0,5 a 7,6 s sólo de escrituras) no sustituyen esta medición.
-5. **Contrato del agente**: `the_agent_contract_matches_its_file` pasa tras bendecir, y la prueba de la apertura de `protocol.md` sigue verde.
+5. **Escaneos por save**: con el embedder falso sobre un store sembrado, cuántas búsquedas del detector corre un save de N piezas (las pasadas que `KnnOutcome` ya cuenta, `crates/clawg-core/src/memory/search.rs:352-369`) y cuánto tiempo de hilo suman. Hoy da una por pieza más los reintentos.
+6. **Contrato del agente**: `the_agent_contract_matches_its_file` pasa tras bendecir, y la prueba de la apertura de `protocol.md` sigue verde.
 
 ## Riesgos
 
