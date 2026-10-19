@@ -285,6 +285,45 @@ pub async fn unreviewed_count(
         .map_err(backend("unreviewed count"))
 }
 
+/// How many conclusions of a scope lost a source after its last review by the
+/// same agent; every conclusion to review when the scope was never reviewed.
+///
+/// A deleted source was lost at its `deleted_at`, a replaced one at its
+/// `last_modified_at`, which replacing it writes. A purged source counts only
+/// before the first review: nothing records when it was purged.
+pub async fn conclusions_to_review_count(
+    store: &MemoryStore,
+    agent_id: Option<&str>,
+    project_id: Option<&str>,
+) -> Result<usize, MemoryError> {
+    let agent_id = agent_id.map(str::to_owned);
+    let project_id = project_id.map(str::to_owned);
+    store
+        .conn
+        .call(move |c| -> rusqlite::Result<usize> {
+            let scope = Scope { agent: agent_id.as_deref(), project: project_id.as_deref() };
+            let mut params = Vec::new();
+            let mut sql = match reviewed_at(c, scope)? {
+                None => format!("SELECT COUNT(*) FROM memory WHERE {}", to_review_condition()),
+                Some(after) => {
+                    params.push(rusqlite::types::Value::Integer(after));
+                    format!(
+                        "SELECT COUNT(*) FROM memory WHERE {CONCLUSION} AND EXISTS \
+                         (SELECT 1 FROM memory_derivation d JOIN memory s ON s.id = d.source_id \
+                          WHERE d.memory_id = memory.id \
+                            AND (s.deleted_at IS NOT NULL OR s.status = 'superseded') \
+                            AND COALESCE(s.deleted_at, s.last_modified_at) > ?)"
+                    )
+                }
+            };
+            scope.push(&mut sql, &mut params);
+            let n: i64 = c.query_row(&sql, rusqlite::params_from_iter(params), |r| r.get(0))?;
+            Ok(n as usize)
+        })
+        .await
+        .map_err(backend("conclusions to review count"))
+}
+
 /// The ids among `ids` that name a `memory` row not deleted, ascending. With
 /// an agent, another agent's row counts as missing, like an id that is not
 /// there.
@@ -667,6 +706,50 @@ mod tests {
         assert_eq!(ids(&found.conclusions), vec![c], "it is still a conclusion");
         assert!(found.pending.is_empty(), "a conclusion is never pending");
         assert_eq!(lost(&found.to_review[0]), vec![(a, SourceState::Purged, None)]);
+    }
+
+    #[tokio::test]
+    async fn the_review_count_follows_losses_after_the_last_review() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let a = seed(&store, Some("p"), "tabs in go", 1).await;
+        let b = seed(&store, Some("p"), "tabs in rust", 2).await;
+        let c = conclude(&store, Some("p"), &[a, b], 3).await;
+        let count = || conclusions_to_review_count(&store, None, Some("p"));
+        assert_eq!(count().await.unwrap(), 0);
+
+        delete_memory_core(&store, a, MemoryKind::Memory, None).await.unwrap();
+        assert_eq!(count().await.unwrap(), 1, "never reviewed: every conclusion to review");
+        assert_eq!(conclusions_to_review_count(&store, None, Some("q")).await.unwrap(), 0);
+
+        let later = TimestampMs::now().as_millis_i64() + 1_000;
+        let found = synthesis_core(&store, in_project("p"), TimestampMs::from_unix_millis(later)).await.unwrap();
+        assert_eq!(count().await.unwrap(), 0, "the review turns the reminder off");
+        assert_eq!(found.to_review[0].conclusion.id, c, "and the conclusion stays on the list");
+
+        let b2 = seed(&store, Some("p"), "tabs in rust, spaces in tests", later + 5).await;
+        supersede(&store, b, b2, later + 5).await;
+        assert_eq!(count().await.unwrap(), 1, "a loss after the review counts again");
+    }
+
+    #[tokio::test]
+    async fn a_purged_source_counts_until_the_first_review() {
+        use crate::memory::store_lock::StoreHolder;
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+        let a = seed(&store, Some("p"), "tabs in go", 1).await;
+        conclude(&store, Some("p"), &[a], 2).await;
+        store.conn.clone().close().await.unwrap();
+        drop(store);
+        crate::memory::secrets::purge(dir.path(), a).unwrap();
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        assert_eq!(conclusions_to_review_count(&store, None, Some("p")).await.unwrap(), 1);
+        synthesis_core(&store, in_project("p"), TimestampMs::from_unix_millis(10)).await.unwrap();
+        assert_eq!(
+            conclusions_to_review_count(&store, None, Some("p")).await.unwrap(),
+            0,
+            "nothing says when it was purged"
+        );
     }
 
     #[tokio::test]
