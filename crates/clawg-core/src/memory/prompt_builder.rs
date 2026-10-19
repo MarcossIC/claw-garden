@@ -21,7 +21,6 @@ use crate::memory::{
 // ---------------------------------------------------------------------------
 
 const SEP_WORKSPACE: &str = "=== WORKSPACE ===";
-const SEP_LAST_SESSION: &str = "=== LAST SESSION ===";
 const SEP_RECENT: &str = "=== RECENT CONTEXT (Last 7 Days) ===";
 const SEP_LONGTERM: &str = "=== LONG-TERM KNOWLEDGE ===";
 const SEP_CONFLICTS: &str = "=== ACTIVE CONFLICTS (review needed) ===";
@@ -244,8 +243,7 @@ pub async fn build_memory_prompt(
         crate::memory::admin::format_skill_hits(&hits)
     );
 
-    let (last_session, hits) = with_last_session(store, agent_id, project_id, reach, hits).await;
-    let fitted = assemble(store, &workspace_content, last_session, hits, emitted, agent_id, budget).await;
+    let fitted = assemble(store, &workspace_content, hits, emitted, agent_id, budget).await;
 
     // Fire-and-forget access recording, of the hits the text kept: a row this
     // channel suppressed or the budget cut was not retrieved for the agent,
@@ -259,21 +257,19 @@ pub async fn build_memory_prompt(
 }
 
 /// The prompt of a context asked for without a query, as a session starts:
-/// the workspace, the last session's summary and, as RECENT, the agent's own
-/// newest saves of the last seven days, one line per save. Nothing is
-/// embedded or searched, so it needs no model.
+/// the workspace and, as RECENT, the agent's own newest saves of the last
+/// seven days, one line per save. Nothing is embedded or searched, so it
+/// needs no model.
 ///
-/// RECENT is the agent's own only: the workspace is too, and other agents'
-/// rows reach it through a search, where a query makes them relevant. The
-/// last session's summary follows `reach`, as its block does in a search. No
-/// access is recorded: these rows were picked for being new, not relevant,
-/// and counting them at every session start would promote a row for its age.
+/// The agent's own only: the workspace is too, and other agents' rows reach
+/// it through a search, where a query makes them relevant. No access is
+/// recorded: these rows were picked for being new, not relevant, and
+/// counting them at every session start would promote a row for its age.
 pub async fn build_session_prompt(
     store: &MemoryStore,
     workspace: &WorkspaceManager,
     agent_id: &str,
     project_id: Option<&str>,
-    reach: &Reach,
     emitted: &EmittedIds,
     budget: usize,
 ) -> Result<MemoryPrompt, MemoryError> {
@@ -284,8 +280,7 @@ pub async fn build_session_prompt(
     let links = store.save_links(rows.iter().map(|h| h.id).collect()).await?;
     let hits = one_row_per_save(rows, &links, K_FINAL);
     let retrieval = Retrieval::Recent { hits: hits.len() };
-    let (last_session, hits) = with_last_session(store, agent_id, project_id, reach, hits).await;
-    let fitted = assemble(store, &workspace_content, last_session, hits, emitted, agent_id, budget).await;
+    let fitted = assemble(store, &workspace_content, hits, emitted, agent_id, budget).await;
     Ok(MemoryPrompt { text: fitted.text, retrieval })
 }
 
@@ -304,7 +299,6 @@ async fn read_workspace(workspace: &WorkspaceManager, agent_id: &str, project_id
 async fn assemble(
     store: &MemoryStore,
     workspace_content: &str,
-    last_session: Option<RankedHit>,
     hits: Vec<RankedHit>,
     emitted: &EmittedIds,
     agent_id: &str,
@@ -331,17 +325,9 @@ async fn assemble(
     });
     let (conflicts, conflicts_omitted) = rank_conflicts(conflicts, &hit_positions, MAX_CONFLICT_PAIRS);
 
-    // 5. Assemble in order: WORKSPACE → LAST SESSION → RECENT → LONG-TERM → CONFLICTS, cut to the budget.
+    // 5. Assemble in order: WORKSPACE → RECENT → LONG-TERM → CONFLICTS, cut to the budget.
     fit_to_budget(
-        PromptParts {
-            workspace: workspace_content,
-            last_session: last_session.into_iter().collect(),
-            recent,
-            longterm,
-            conflicts,
-            conflicts_omitted,
-            reader: agent_id,
-        },
+        PromptParts { workspace: workspace_content, recent, longterm, conflicts, conflicts_omitted, reader: agent_id },
         budget,
     )
 
@@ -350,9 +336,6 @@ async fn assemble(
 /// Everything the prompt can hold, before the budget is applied.
 struct PromptParts<'a> {
     workspace: &'a str,
-    /// The last session's summary, or nothing. A block of its own rather than
-    /// an option so the budget cuts it as it cuts the last hit of any block.
-    last_session: Vec<RankedHit>,
     recent: Vec<RankedHit>,
     longterm: Vec<RankedHit>,
     /// Already ranked; the budget drops them from the end.
@@ -371,8 +354,7 @@ struct Cut {
     workspace_over: bool,
 }
 
-/// The prompt's text and the hits it prints, whole or shortened; the last
-/// session's summary is not among them.
+/// The prompt's text and the hits it prints, whole or shortened.
 struct Fitted {
     text: String,
     shown: Vec<RankedHit>,
@@ -381,10 +363,8 @@ struct Fitted {
 /// Renders `parts` in at most `budget` bytes.
 ///
 /// While the text is over, the last hit of LONG-TERM goes, then the last of
-/// RECENT, then the last session's summary, then the last conflict pair,
-/// which joins the count of pairs not shown. The summary outlasts the hits
-/// because no query brings it back, and gives way to the conflicts because
-/// they ask for the user. A hit left alone in its block is shortened instead, and goes only
+/// RECENT, then the last conflict pair, which joins the count of pairs not
+/// shown. A hit left alone in its block is shortened instead, and goes only
 /// when no text is left of it: one shortened hit and its id say more than an
 /// empty block. Each step renders the whole text, so the closing note, the
 /// SHARED note and the text a conflict gains when its hit goes are all
@@ -406,13 +386,7 @@ fn fit_to_budget(mut parts: PromptParts<'_>, budget: usize) -> Fitted {
         let Some(over) = text.len().checked_sub(budget).filter(|&over| over > 0) else {
             return Fitted { text, shown: parts.recent.into_iter().chain(parts.longterm).collect() };
         };
-        let block = if !parts.longterm.is_empty() {
-            &mut parts.longterm
-        } else if !parts.recent.is_empty() {
-            &mut parts.recent
-        } else {
-            &mut parts.last_session
-        };
+        let block = if parts.longterm.is_empty() { &mut parts.recent } else { &mut parts.longterm };
         match block.len() {
             0 if parts.conflicts.is_empty() => {
                 cut.workspace_over = true;
@@ -476,7 +450,7 @@ fn positions(recent: &[RankedHit], longterm: &[RankedHit]) -> HashMap<i64, usize
 }
 
 fn render(parts: &PromptParts<'_>, cut: Option<&Cut>) -> String {
-    let PromptParts { workspace, last_session, recent, longterm, conflicts, conflicts_omitted, reader } = parts;
+    let PromptParts { workspace, recent, longterm, conflicts, conflicts_omitted, reader } = parts;
     let mut out = String::new();
     if !workspace.is_empty() {
         out.push_str(SEP_WORKSPACE);
@@ -486,7 +460,7 @@ fn render(parts: &PromptParts<'_>, cut: Option<&Cut>) -> String {
             out.push('\n');
         }
     }
-    for (separator, hits) in [(SEP_LAST_SESSION, last_session), (SEP_RECENT, recent), (SEP_LONGTERM, longterm)] {
+    for (separator, hits) in [(SEP_RECENT, recent), (SEP_LONGTERM, longterm)] {
         if hits.is_empty() {
             continue;
         }
@@ -508,7 +482,7 @@ fn render(parts: &PromptParts<'_>, cut: Option<&Cut>) -> String {
         out.push('\n');
         out.push_str(&format_conflict_block(conflicts, &positions(recent, longterm), *conflicts_omitted));
     }
-    if last_session.iter().chain(recent).chain(longterm).any(|h| is_shared(h, reader)) {
+    if recent.iter().chain(longterm.iter()).any(|h| is_shared(h, reader)) {
         out.push('\n');
         out.push_str(SEP_SHARED);
         out.push('\n');
@@ -675,86 +649,6 @@ fn format_conflict_block(pairs: &[ConflictPair], hit_positions: &HashMap<i64, us
         out.push_str(&format!("(+{omitted} more conflicts not shown)\n"));
     }
     out
-}
-
-/// The newest live `session_summary` of the project, the first piece of a
-/// long one, newest first; the project's own only, since a summary without
-/// one is not this project's last session. Authors are checked by the caller.
-const LAST_SESSION_SQL: &str = "
-    SELECT id, content, memory_type, tier, status, created_at, agent_id, topic_key
-    FROM memory
-    WHERE memory_type = 'session_summary'
-      AND status IN ('active', 'disputed')
-      AND deleted_at IS NULL
-      AND (project_id = ?1 OR (?1 IS NULL AND project_id IS NULL))
-    ORDER BY created_at DESC, id ASC
-";
-
-/// The last session's summary `agent_id` may read, and `hits` without it or
-/// any other piece of its save. A failure only leaves the block out.
-async fn with_last_session(
-    store: &MemoryStore,
-    agent_id: &str,
-    project_id: Option<&str>,
-    reach: &Reach,
-    hits: Vec<RankedHit>,
-) -> (Option<RankedHit>, Vec<RankedHit>) {
-    let summary = match fetch_last_session(store, agent_id, project_id, reach).await {
-        Ok(Some(summary)) => summary,
-        Ok(None) => return (None, hits),
-        Err(e) => {
-            log::warn!("fetch_last_session failed: {e}; LAST SESSION block omitted");
-            return (None, hits);
-        }
-    };
-    let ids: Vec<i64> = std::iter::once(summary.id).chain(hits.iter().map(|h| h.id)).collect();
-    let links = store.save_links(ids).await.unwrap_or_else(|e| {
-        log::warn!("save_links failed: {e}; the summary is matched by id alone");
-        HashMap::new()
-    });
-    let save_of = |id: i64| links.get(&id).map_or(id, |l| l.save_id);
-    let hits = hits.into_iter().filter(|h| h.kind != TableKind::Memory || save_of(h.id) != save_of(summary.id)).collect();
-    let piece = links.get(&summary.id).map(|l| l.position);
-    (Some(RankedHit { piece, ..summary }), hits)
-}
-
-async fn fetch_last_session(
-    store: &MemoryStore,
-    agent_id: &str,
-    project_id: Option<&str>,
-    reach: &Reach,
-) -> Result<Option<RankedHit>, MemoryError> {
-    let (reader, project, reach) = (agent_id.to_string(), project_id.map(str::to_string), reach.clone());
-    store
-        .conn
-        .call(move |c| -> rusqlite::Result<Option<RankedHit>> {
-            let mut stmt = c.prepare(LAST_SESSION_SQL)?;
-            let mut rows = stmt.query(rusqlite::params![project])?;
-            while let Some(row) = rows.next()? {
-                let author: Option<String> = row.get(6)?;
-                if !author.as_deref().is_some_and(|a| reach.admits(&reader, a)) {
-                    continue;
-                }
-                return Ok(Some(RankedHit {
-                    id: row.get(0)?,
-                    kind: TableKind::Memory,
-                    content: row.get(1)?,
-                    memory_type: row.get(2)?,
-                    tier: row.get(3)?,
-                    status: row.get(4)?,
-                    score: 0.0,
-                    distance: 0.0,
-                    created_at: TimestampMs::from_unix_millis(row.get(5)?),
-                    agent_id: author,
-                    piece: None,
-                    exact: false,
-                    topic_key: row.get(7)?,
-                }));
-            }
-            Ok(None)
-        })
-        .await
-        .map_err(|e| MemoryError::Backend(format!("fetch_last_session: {e}")))
 }
 
 /// Rows RECENT may print in a prompt without a query: the reader's own live
@@ -1285,7 +1179,6 @@ mod tests {
             workspace,
             recent: recent.iter().map(|&(id, bytes)| sized_hit(id, bytes)).collect(),
             longterm: longterm.iter().map(|&(id, bytes)| sized_hit(id, bytes)).collect(),
-            last_session: Vec::new(),
             conflicts,
             conflicts_omitted: 0,
             reader: "agent-1",
@@ -1338,32 +1231,6 @@ mod tests {
         let block = block(&with_conflicts, SEP_CONFLICTS).expect("the conflicts outlast every hit");
         assert_eq!(block.lines().filter(|l| l.starts_with("NEW ")).count(), 2, "{with_conflicts}");
         assert_eq!(header_ids(&with_conflicts), [1], "only the first hit is left, shortened: {with_conflicts}");
-    }
-
-    #[test]
-    fn the_last_session_block_gives_way_after_the_hits() {
-        let with_session = || PromptParts {
-            last_session: vec![sized_hit(9, 1_000)],
-            ..parts("", &[(1, 1_000), (2, 1_000)], &[(3, 1_000)], vec![pair(301, 302)])
-        };
-        let whole = fit_to_budget(with_session(), MAX_BUDGET);
-        assert_eq!(header_ids(&whole.text), [9, 1, 2, 3], "the block opens the hits: {}", whole.text);
-        assert!(!whole.shown.iter().any(|h| h.id == 9), "it was picked for being the last, not relevant, so no access counts");
-
-        let hits_gone = fit_to_budget(with_session(), 1_900);
-        let cut = block(&hits_gone.text, SEP_BUDGET).unwrap();
-        assert!(cut.contains("Left out: #2, #3.") && cut.contains("Shortened: #1."), "long-term and recent go first: {}", hits_gone.text);
-        assert_eq!(header_ids(&hits_gone.text), [9, 1], "{}", hits_gone.text);
-        assert!(block(&hits_gone.text, SEP_CONFLICTS).is_some(), "{}", hits_gone.text);
-
-        let shortened = fit_to_budget(with_session(), 700);
-        assert!(block(&shortened.text, SEP_BUDGET).unwrap().contains("Shortened: #9."), "{}", shortened.text);
-        let session_gone = (300..700).rev()
-            .map(|budget| fit_to_budget(with_session(), budget).text)
-            .find(|text| header_ids(text).is_empty())
-            .expect("some budget leaves no hit, the largest is checked");
-        assert!(block(&session_gone, SEP_CONFLICTS).is_some(), "the conflicts outlast it: {session_gone}");
-        assert!(block(&session_gone, SEP_BUDGET).unwrap().contains("Left out: #9, #1, #2, #3."), "{session_gone}");
     }
 
     #[test]
@@ -2991,13 +2858,9 @@ mod tests {
     }
 
     async fn session_prompt(store: &MemoryStore, agent_id: &str, project_id: Option<&str>) -> MemoryPrompt {
-        session_prompt_reaching(store, agent_id, project_id, &Reach::Own).await
-    }
-
-    async fn session_prompt_reaching(store: &MemoryStore, agent_id: &str, project_id: Option<&str>, reach: &Reach) -> MemoryPrompt {
         let tmp = tempfile::tempdir().unwrap();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
-        build_session_prompt(store, &wm, agent_id, project_id, reach, &EmittedIds::default(), DEFAULT_BUDGET).await.unwrap()
+        build_session_prompt(store, &wm, agent_id, project_id, &EmittedIds::default(), DEFAULT_BUDGET).await.unwrap()
     }
 
     #[tokio::test]
@@ -3112,138 +2975,12 @@ mod tests {
         let emitted = wm.regenerate_auto_section("agent-1", None, &store).await.unwrap();
         assert!(emitted.contains(TableKind::Memory, shown), "the fixture needs the workspace to print #{shown}");
 
-        let text = build_session_prompt(&store, &wm, "agent-1", None, &Reach::Own, &emitted, DEFAULT_BUDGET).await.unwrap().text;
+        let text = build_session_prompt(&store, &wm, "agent-1", None, &emitted, DEFAULT_BUDGET).await.unwrap().text;
 
         assert!(text.contains("tabs over spaces"), "the workspace still prints it: {text}");
         assert!(text.contains(&format!("#{kept} ")), "{text}");
         for id in [shown, gone] {
             assert!(!text.contains(&format!("#{id} ")), "#{id} is not a RECENT line: {text}");
         }
-    }
-
-    /// A live `session_summary` of `agent_id` in `project_id`, `age_days` old.
-    async fn seed_summary(store: &MemoryStore, agent_id: &str, project_id: Option<&str>, content: &str, age_days: i64) -> i64 {
-        let id = seed_dated(store, agent_id, project_id, content, age_days).await;
-        store
-            .conn
-            .call(move |c| c.execute("UPDATE memory SET memory_type = 'session_summary' WHERE id = ?1", [id]))
-            .await
-            .unwrap();
-        id
-    }
-
-    #[tokio::test]
-    async fn the_last_session_block_shows_the_newest_summary() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
-        let mut near = vec![0.0_f32; 384];
-        near[0] = 1.0;
-        let fact = seed_memory(&store, "agent-1", "the retry budget is three", "semantic_fact", 2, 5.0, unit_bytes(&near)).await;
-        let older = seed_summary(&store, "agent-1", Some("proj-a"), "Goal: the old migration", 30).await;
-        let newest = seed_summary(&store, "agent-1", Some("proj-a"), "Goal: wire the cache. Next steps: the locale key", 1).await;
-        let elsewhere = seed_summary(&store, "agent-1", Some("proj-b"), "Goal: another project's work", 0).await;
-        let unscoped = seed_summary(&store, "agent-1", None, "Goal: work outside any project", 0).await;
-        let deleted = seed_summary(&store, "agent-1", Some("proj-a"), "Goal: a summary since deleted", 0).await;
-        store.conn.call(move |c| c.execute("UPDATE memory SET deleted_at = 1 WHERE id = ?1", [deleted])).await.unwrap();
-
-        let prompt = build_memory_prompt(
-            &store,
-            &wm,
-            Some(Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>),
-            "agent-1",
-            Some("proj-a"),
-            &Reach::Own,
-            QueryTexts::single_shot("retry budget"),
-            &EmittedIds::default(),
-            None,
-            DEFAULT_BUDGET,
-        )
-        .await
-        .unwrap()
-        .text;
-
-        let last = block(&prompt, SEP_LAST_SESSION).unwrap_or_else(|| panic!("no LAST SESSION block: {prompt}"));
-        assert!(last.contains(&format!("#{newest} session_summary] Goal: wire the cache")), "{prompt}");
-        for id in [older, elsewhere, unscoped, deleted] {
-            assert!(!prompt.contains(&format!("#{id} ")), "#{id} is not the newest summary of the project: {prompt}");
-        }
-        assert!(prompt.find(SEP_LAST_SESSION) < prompt.find(SEP_RECENT), "it comes before the hits: {prompt}");
-        assert!(block(&prompt, SEP_RECENT).unwrap().contains(&format!("#{fact} ")), "{prompt}");
-    }
-
-    #[tokio::test]
-    async fn the_last_session_block_respects_sharing() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-        let own = seed_summary(&store, "agent-1", Some("proj-a"), "Goal: my own last session", 3).await;
-        let other = seed_summary(&store, "agent-2", Some("proj-a"), "Goal: the other agent's session", 1).await;
-
-        let shared = session_prompt_reaching(&store, "agent-1", Some("proj-a"), &Reach::AllBut(Vec::new())).await.text;
-        let last = block(&shared, SEP_LAST_SESSION).unwrap_or_else(|| panic!("{shared}"));
-        assert!(last.contains(&format!("#{other} session_summary by agent-2]")), "{shared}");
-        assert!(!last.contains(&format!("#{own} ")), "{shared}");
-        assert!(shared.contains(SHARED_NOTE), "{shared}");
-
-        for reach in [Reach::Own, Reach::AllBut(vec!["agent-2".into()])] {
-            let text = session_prompt_reaching(&store, "agent-1", Some("proj-a"), &reach).await.text;
-            let last = block(&text, SEP_LAST_SESSION).unwrap_or_else(|| panic!("{text}"));
-            assert!(last.contains(&format!("#{own} session_summary]")), "{reach:?}: {text}");
-            assert!(!text.contains(&format!("#{other} ")), "{reach:?}: {text}");
-        }
-
-        let hidden = session_prompt_reaching(&store, "agent-3", Some("proj-a"), &Reach::Own).await.text;
-        assert!(!hidden.contains(SEP_LAST_SESSION), "an agent with no summary of its own and no reach gets no block: {hidden}");
-    }
-
-    #[tokio::test]
-    async fn the_last_session_block_is_not_repeated_as_a_hit() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
-        let mut near = vec![0.0_f32; 384];
-        near[0] = 1.0;
-        let summary = seed_memory(&store, "agent-1", "Goal: the summary is also a hit", "session_summary", 2, 5.0, unit_bytes(&near)).await;
-        let fact = seed_memory(&store, "agent-1", "a fact close to the query", "semantic_fact", 2, 5.0, unit_bytes(&near)).await;
-
-        let prompt = build_memory_prompt(
-            &store,
-            &wm,
-            Some(Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>),
-            "agent-1",
-            None,
-            &Reach::Own,
-            QueryTexts::single_shot("summary"),
-            &EmittedIds::default(),
-            None,
-            DEFAULT_BUDGET,
-        )
-        .await
-        .unwrap();
-
-        let text = &prompt.text;
-        assert_eq!(text.matches(&format!("#{summary} ")).count(), 1, "{text}");
-        assert!(block(text, SEP_LAST_SESSION).unwrap().contains(&format!("#{summary} ")), "{text}");
-        assert!(block(text, SEP_RECENT).unwrap().contains(&format!("#{fact} ")), "{text}");
-    }
-
-    #[tokio::test]
-    async fn a_context_without_a_query_opens_with_the_last_session() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-        let newest = seed_summary(&store, "agent-1", Some("proj-a"), "Goal: yesterday's session", 1).await;
-        let previous = seed_summary(&store, "agent-1", Some("proj-a"), "Goal: the session before", 2).await;
-        let fact = seed_dated(&store, "agent-1", Some("proj-a"), "the cache key holds the locale", 1).await;
-
-        let prompt = session_prompt(&store, "agent-1", Some("proj-a")).await;
-
-        let text = &prompt.text;
-        assert!(block(text, SEP_LAST_SESSION).unwrap().contains(&format!("#{newest} session_summary] Goal: yesterday's")), "{text}");
-        let recent = block(text, SEP_RECENT).unwrap();
-        assert!(recent.contains(&format!("#{fact} ")) && recent.contains(&format!("#{previous} ")), "{text}");
-        assert!(!recent.contains(&format!("#{newest} ")), "{text}");
-
-        let old = MemoryStore::new_for_test().await.unwrap();
-        let month_old = seed_summary(&old, "agent-1", Some("proj-a"), "Goal: a month ago", 30).await;
-        let text = session_prompt(&old, "agent-1", Some("proj-a")).await.text;
-        assert!(block(&text, SEP_LAST_SESSION).unwrap().contains(&format!("#{month_old} ")), "with its date, however old: {text}");
     }
 }

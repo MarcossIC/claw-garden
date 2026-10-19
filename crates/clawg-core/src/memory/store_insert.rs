@@ -135,8 +135,6 @@ pub struct NewMemoryRecord {
     pub derived_from: Vec<i64>,
     /// The topic key of the save this row is a piece of (`topic.rs`).
     pub topic_key: Option<String>,
-    /// The host session the save came from, when the daemon knew it.
-    pub source_session_id: Option<String>,
 }
 
 /// Neutral importance for a row nothing has said anything special about.
@@ -217,7 +215,6 @@ impl NewMemoryRecord {
             candidates: Vec::new(),
             derived_from: evt.sources().to_vec(),
             topic_key: evt.topic().map(str::to_string),
-            source_session_id: evt.session_id.clone(),
         }
     }
 }
@@ -440,8 +437,8 @@ impl MemoryStore {
                      (scope, agent_id, project_id, content, memory_type, source, \
                       created_at, created_by_type, created_by_ref, \
                       last_modified_at, last_accessed_at, access_count, importance, tier, \
-                      status, disputed_against, last_disputed_at, content_hash, topic_key, source_session_id) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                      status, disputed_against, last_disputed_at, content_hash, topic_key) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     rusqlite::params![
                         record.scope,
                         record.agent_id,
@@ -472,7 +469,6 @@ impl MemoryStore {
                         last_disp,
                         content_hash,
                         record.topic_key,
-                        record.source_session_id,
                     ],
                 )?;
                 let id = tx.last_insert_rowid();
@@ -877,7 +873,6 @@ mod tests {
             candidates: Vec::new(),
             derived_from: Vec::new(),
             topic_key: None,
-            source_session_id: None,
         }
     }
 
@@ -1000,7 +995,6 @@ mod tests {
             derived_from: Vec::new(),
             topic_key: None,
             user_stated: false,
-            session_id: None,
         };
         let chunk = Chunk { text: "hello".to_string() };
         let rec = NewMemoryRecord::from_event_and_chunk(&evt, &chunk);
@@ -1027,7 +1021,6 @@ mod tests {
             derived_from: Vec::new(),
             topic_key: None,
             user_stated: false,
-            session_id: None,
         };
         let chunk = Chunk { text: "delta summary text".to_string() };
         let rec = NewMemoryRecord::from_event_and_chunk(&evt, &chunk);
@@ -1057,7 +1050,6 @@ mod tests {
             derived_from: Vec::new(),
             topic_key: None,
             user_stated: false,
-            session_id: None,
         }
     }
 

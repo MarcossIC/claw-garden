@@ -282,7 +282,6 @@ impl Harness {
             started_at: Instant::now(),
             shutdown,
             save_timeout,
-            sessions: Default::default(),
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1418,70 +1417,6 @@ async fn origin(h: &Harness, id: i64) -> (String, String) {
     assert_eq!(status, 200, "{body}");
     let field = |name: &str| body["item"][name].as_str().unwrap_or_default().to_string();
     (field("source"), field("created_by_type"))
-}
-
-/// `source_session_id` of a memory row, as the viewer reads it.
-async fn session_of(h: &Harness, id: i64) -> Option<String> {
-    let (status, body) = h.get_json(&format!("/v1/memories/memory/{id}")).await;
-    assert_eq!(status, 200, "{body}");
-    body["item"]["source_session_id"].as_str().map(str::to_string)
-}
-
-#[tokio::test]
-async fn a_save_carries_the_registered_session() {
-    let h = Harness::start().await;
-    let register = |agent: &'static str, project: Option<&'static str>, session: &'static str| {
-        h.post_json("/v1/sessions", json!({ "agent_id": agent, "project_id": project, "session_id": session }))
-    };
-    assert_eq!(register("a", Some("p"), "s1").await.0, 204);
-    assert_eq!(register("a", Some("p"), "s2").await.0, 204);
-
-    let mine = save_id(&h, json!({ "content": "the cache key holds the locale", "agent_id": "a", "project_id": "p" })).await;
-    let other_agent = save_id(&h, json!({ "content": "the retry budget is three", "agent_id": "b", "project_id": "p" })).await;
-    let other_project = save_id(&h, json!({ "content": "deploys happen on fridays", "agent_id": "a", "project_id": "q" })).await;
-
-    assert_eq!(session_of(&h, mine).await.as_deref(), Some("s2"));
-    assert_eq!(session_of(&h, other_agent).await, None);
-    assert_eq!(session_of(&h, other_project).await, None);
-
-    let (status, body) = h.post_json("/v1/sessions", json!({ "agent_id": "a", "session_id": "has space" })).await;
-    assert_eq!(status, 400, "{body}");
-    assert!(body.to_string().contains("session_id"), "{body}");
-}
-
-#[tokio::test]
-async fn a_queued_save_keeps_its_session_in_the_outbox() {
-    let h = Harness::start_without_embedder().await;
-    h.post_json("/v1/sessions", json!({ "agent_id": "a", "session_id": "s1" })).await;
-    let (status, body) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a" })).await;
-    assert_eq!(status, 202, "{body}");
-
-    let stamped: Vec<Option<String>> = h
-        .ctx
-        .runtime
-        .store
-        .conn
-        .call(|c| {
-            let mut stmt = c.prepare("SELECT json_extract(event, '$.session_id') FROM ingest_outbox")?;
-            let rows = stmt.query_map([], |r| r.get(0))?;
-            rows.collect::<Result<Vec<_>, _>>()
-        })
-        .await
-        .expect("outbox");
-    assert_eq!(stamped, vec![Some("s1".to_string())], "a replay after a restart keeps the session it was accepted in");
-}
-
-#[tokio::test]
-async fn rows_without_a_session_stay_reachable() {
-    let h = Harness::start().await;
-    let id = save_id(&h, json!({ "content": "the parser rejects tabs in yaml", "agent_id": "a" })).await;
-    assert_eq!(session_of(&h, id).await, None);
-
-    let (_, list) = h.get_json("/v1/memories?kind=memory&agent=a").await;
-    assert_eq!(list["items"].as_array().map(Vec::len), Some(1), "{list}");
-    let (status, found) = h.post_json("/v1/search", json!({ "query": "the parser rejects tabs in yaml", "agent_id": "a" })).await;
-    assert_eq!(status, 200, "{found}");
-    assert_eq!(found["hits"][0]["id"], id, "{found}");
 }
 
 #[tokio::test]

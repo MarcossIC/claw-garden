@@ -98,7 +98,6 @@ fn explicit_event(content: &str, memory_type: Option<&str>, importance: Option<f
         derived_from: Vec::new(),
         topic_key: None,
         user_stated: false,
-        session_id: None,
     }
 }
 
@@ -248,7 +247,6 @@ async fn explicit_overrides_reach_the_stored_row() {
     tx.try_send(
         MemoryEvent {
             user_stated: true,
-            session_id: None,
             ..explicit_event("the team uses conventional commits", Some("user_preference"), Some(9.5))
         }
         .into(),

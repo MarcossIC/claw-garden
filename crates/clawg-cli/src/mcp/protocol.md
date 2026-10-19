@@ -116,9 +116,6 @@ At the end of a long session, or before the context is compacted, save a
 - Next steps: what comes next, in order.
 - Relevant files: the paths that matter, each with one line on why.
 
-The newest summary of the project opens the next session's context, under
-LAST SESSION, whatever that session asks first.
-
 Decisions and preferences go in their own saves as well: a summary fades fast
 and never takes part in a conflict.
 
