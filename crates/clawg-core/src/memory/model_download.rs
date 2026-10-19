@@ -325,6 +325,8 @@ pub enum DownloadError {
         #[source]
         source: reqwest::Error,
     },
+    #[error("could not build the HTTP client for the model download: {0}")]
+    Client(#[source] reqwest::Error),
     #[error("sha-256 mismatch for {file}: expected {expected}, got {actual}")]
     ChecksumMismatch {
         file: String,
@@ -349,8 +351,25 @@ pub(crate) struct ModelSource<'a> {
     pub base_url: &'a str,
     pub oracle: &'a dyn DiskOracle,
     pub backoff: &'a dyn BackoffPolicy,
+    pub timeouts: Timeouts,
     pub files: &'a [FileSpec],
 }
+
+/// How long one attempt may wait on the network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Timeouts {
+    pub connect: std::time::Duration,
+    /// Restarted by every read, and running from the request to its headers:
+    /// a slow link that keeps sending finishes, a silent one does not.
+    pub read: std::time::Duration,
+}
+
+/// No total deadline: on a slow link the 470 MB model legitimately takes
+/// longer than any bound that would still catch a stall.
+pub(crate) const DOWNLOAD_TIMEOUTS: Timeouts = Timeouts {
+    connect: std::time::Duration::from_secs(30),
+    read: std::time::Duration::from_secs(60),
+};
 
 /// Production entrypoint: download the embedder model on first run.
 pub async fn ensure_model(
@@ -362,6 +381,7 @@ pub async fn ensure_model(
         base_url: &url,
         oracle: &Fs2Oracle,
         backoff: &RealBackoff,
+        timeouts: DOWNLOAD_TIMEOUTS,
         files: &ALL_FILES,
     };
     ensure_model_from(base_dir, &source, progress).await
@@ -424,6 +444,12 @@ async fn fetch(
         });
     }
 
+    let client = reqwest::Client::builder()
+        .connect_timeout(source.timeouts.connect)
+        .read_timeout(source.timeouts.read)
+        .build()
+        .map_err(DownloadError::Client)?;
+
     // (3) bytes_total is unknown here (no HEAD probes: a round trip without
     // observable gain, since the values arrive on the first `Chunk` anyway).
     if let Some(tx) = progress {
@@ -434,6 +460,7 @@ async fn fetch(
     let mut bytes_downloaded_running: u64 = 0;
     for spec in std::mem::take(&mut cached.missing) {
         download_one(
+            &client,
             &cache_dir,
             &spec,
             source.base_url,
@@ -575,6 +602,7 @@ const CHUNK_PROGRESS_BYTES: u64 = 64 * 1024;
 /// `CHUNK_PROGRESS_BYTES` (64 KB) of cumulative download progress across all
 /// files in the current run.
 async fn download_one(
+    client: &reqwest::Client,
     cache_dir: &Path,
     spec: &FileSpec,
     base_url_str: &str,
@@ -615,7 +643,7 @@ async fn download_one(
         };
 
         let url = format!("{base_url_str}/{}", spec.path);
-        let resp = match reqwest::get(&url).await {
+        let resp = match client.get(&url).send().await {
             Ok(r) => r,
             Err(_) => {
                 let _ = std::fs::remove_file(&partial);
@@ -808,7 +836,7 @@ mod tests {
     }
 
     fn source<'a>(base_url: &'a str, oracle: &'a dyn DiskOracle, files: &'a [FileSpec]) -> ModelSource<'a> {
-        ModelSource { base_url, oracle, backoff: &ZeroBackoff, files }
+        ModelSource { base_url, oracle, backoff: &ZeroBackoff, timeouts: DOWNLOAD_TIMEOUTS, files }
     }
 
     // ---------- Disk pre-flight ----------
@@ -1294,6 +1322,83 @@ mod tests {
         for m in &other_mocks {
             m.assert_async().await;
         }
+    }
+
+    // ---------- Deadlines ----------
+
+    /// A server on 127.0.0.1 that reads each request, writes `reply` and then
+    /// keeps the connection open without sending anything more.
+    fn silent_server(reply: &'static [u8]) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for mut stream in listener.incoming().flatten() {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = stream.write_all(reply);
+                let _ = stream.flush();
+                held.push(stream);
+            }
+        });
+        url
+    }
+
+    const SHORT: Timeouts = Timeouts {
+        connect: std::time::Duration::from_secs(5),
+        read: std::time::Duration::from_millis(300),
+    };
+
+    async fn ensure_against_silent_server(label: &str, reply: &'static [u8]) {
+        let tmp = TestDir::new(label);
+        let files = fixture_files();
+        let specs = fixture_specs(&files);
+        let url = silent_server(reply);
+        let oracle = MockDiskOracle::returning(MIN_FREE_BYTES);
+        let source = ModelSource { timeouts: SHORT, ..source(&url, &oracle, &specs) };
+
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            ensure_model_from(tmp.path(), &source, None),
+        )
+        .await
+        .expect("the download returned instead of waiting forever");
+
+        match res {
+            Err(DownloadError::RetryExhausted { file, attempts, .. }) => {
+                assert_eq!((file.as_str(), attempts), ("onnx/model.onnx", 3));
+            }
+            other => panic!("expected RetryExhausted, got {other:?}"),
+        }
+        let partials = collect_partials(&tmp.path().join("models").join("multilingual-e5-small"));
+        assert!(partials.is_empty(), "{partials:?}");
+    }
+
+    #[tokio::test]
+    async fn a_body_that_stops_arriving_fails_the_attempt() {
+        ensure_against_silent_server(
+            "dl-stalled-body",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nfake-onnx",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_answers_fails_the_attempt() {
+        ensure_against_silent_server("dl-no-answer", b"").await;
+    }
+
+    #[test]
+    fn the_download_waits_30_s_to_connect_and_60_s_per_read() {
+        assert_eq!(DOWNLOAD_TIMEOUTS.connect, std::time::Duration::from_secs(30));
+        assert_eq!(DOWNLOAD_TIMEOUTS.read, std::time::Duration::from_secs(60));
     }
 
     // ---------- Progress events ----------
