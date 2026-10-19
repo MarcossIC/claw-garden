@@ -420,7 +420,7 @@ fn the_release_workflow_publishes_last() {
             assert!(!other.text().contains(needle), "`{needle}` appears in job `{}`", other.name);
         }
     };
-    only_in_publish("gh release create");
+    only_in_publish("gh release");
     only_in_publish("environment:");
     only_in_publish("contents: write");
     only_in_publish("id-token: write");
@@ -446,6 +446,44 @@ fn the_release_workflow_publishes_last() {
     assert!(position("minisign -S") < position("minisign -Vm dist/SHA256SUMS -p release/minisign.pub"));
     assert!(position("minisign -Vm") < position("actions/attest-build-provenance"));
     assert!(position("actions/attest-build-provenance") < position("gh release create"));
+}
+
+#[test]
+fn the_release_is_drafted_and_published_by_a_repeated_request() {
+    let lines = workflow_code("release.yml");
+    let jobs = jobs_of(&lines);
+    let publish = job(&jobs, "publish");
+    let steps = publish.steps();
+    let step = |needle: &str| {
+        steps
+            .iter()
+            .find(|s| s.iter().any(|l| l.contains(needle)))
+            .unwrap_or_else(|| panic!("no step runs `{needle}`"))
+            .join("\n")
+    };
+
+    // Without --draft, gh deletes the draft it made when publishing fails, so one
+    // 5xx on that last request threw away every upload.
+    let create = step("gh release create");
+    assert!(create.contains("--draft") && !create.contains("--draft=false"), "the release is created as a draft: {create}");
+
+    let publication = step("--draft=false");
+    assert!(publication.contains("gh release edit \"v${VERSION}\""), "{publication}");
+    assert!(publication.contains("for attempt in"), "a failed publication is repeated: {publication}");
+    assert!(publication.contains("--json isDraft"), "a 5xx can come after GitHub published, so the release is read back: {publication}");
+
+    let cleanup = step("gh release delete");
+    for outcome in ["steps.create.outcome == 'failure'", "steps.publish.outcome == 'failure'"] {
+        assert!(cleanup.contains(outcome), "the cleanup runs when `{outcome}`: {cleanup}");
+    }
+    let reads = cleanup.find("--json isDraft").expect("the cleanup reads whether the release is still a draft");
+    let deletes = cleanup.find("gh release delete").expect("the cleanup deletes the draft");
+    assert!(reads < deletes, "only a draft is deleted: {cleanup}");
+
+    let text = publish.text();
+    let position = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("publish lacks `{needle}`"));
+    assert!(position("gh release create") < position("gh release edit"));
+    assert!(position("gh release edit") < position("gh release delete"));
 }
 
 #[test]
