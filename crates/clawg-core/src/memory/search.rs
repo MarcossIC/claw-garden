@@ -1,5 +1,5 @@
 //! KNN search across memory + episodic + procedural via tokio::try_join!,
-//! merged + ranked by the score formula computed in SQL.
+//! merged + ranked by the score formula of `score.rs`.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -68,7 +68,7 @@ fn reach_bind(agent_id: &str, reach: &Reach) -> String {
     value.to_string()
 }
 
-/// One result row after the score formula has been applied SQL-side.
+/// One result row, scored by `score::score`.
 ///
 /// `Serialize` because the `clawg serve` daemon answers retrieval requests
 /// with these rows as JSON.

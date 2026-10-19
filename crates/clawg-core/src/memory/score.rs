@@ -209,12 +209,11 @@ fn cosine_from_l2_unit(distance: f64) -> f64 {
 }
 
 /// Re-scales an already-clamped-nonnegative cosine against a measured
-/// corpus floor: `(cos-floor)/(1-floor)`, clamped to `[0,1]`. The measured
-/// live-corpus cosine distribution sits in a 0.86-0.95 band (p5-p95 swings
-/// only 1.04x), so left unscaled the similarity term has almost no room to
-/// compete with `importance_factor`'s 1.8x range inside the product this
-/// feeds — re-scaling spreads that same 1.04x band across the full [0,1]
-/// interval instead of leaving it crammed into the top few percent.
+/// corpus floor: `(cos-floor)/(1-floor)`, clamped to `[0,1]`. The model's
+/// cosines crowd the top of the interval (the floor in
+/// `ScoringConfig::DEFAULT` is their 5th percentile), so left unscaled the
+/// similarity term would barely move against the importance factor in the
+/// product this feeds; re-scaling spreads that band across `[0,1]`.
 fn rescale_cosine(cosine: f64, floor: f64) -> f64 {
     ((cosine - floor) / (1.0 - floor)).clamp(0.0, 1.0)
 }
