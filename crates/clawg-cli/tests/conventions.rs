@@ -631,6 +631,79 @@ fn the_toolchain_is_pinned_once_for_every_workflow() {
     assert!(declared <= pinned, "rust-version {declared:?} is above the pinned toolchain {pinned:?}");
 }
 
+#[test]
+fn only_the_ci_workflow_gates_the_release() {
+    // release.yml runs after a workflow named CI; any other workflow with that
+    // name would gate, or trigger, a release too.
+    for name in workflow_files() {
+        let lines = workflow_code(&name);
+        let named_ci = lines.iter().any(|l| l.trim() == "name: CI" && indent_of(l) == 0);
+        assert_eq!(named_ci, name == "ci.yml", "{name}: only ci.yml is named CI");
+    }
+}
+
+/// The `env:` value of `key` in a job, as written.
+fn job_env(job: &Job, key: &str) -> String {
+    let prefix = format!("{key}:");
+    job.lines
+        .iter()
+        .find_map(|l| l.trim().strip_prefix(&prefix).map(|v| v.trim().to_string()))
+        .unwrap_or_else(|| panic!("job `{}` sets no `{key}`", job.name))
+}
+
+/// Asserts a workflow downloads a tool from `url_start` with an exact version
+/// and checks it against a SHA-256 kept in `hash_key`.
+fn assert_pinned_download(name: &str, job: &Job, url_key: &str, url_start: &str, version: &str, hash_key: &str) {
+    let url = job_env(job, url_key);
+    assert!(url.starts_with(url_start), "{name}: {url_key} is `{url}`");
+    assert!(url.contains(&format!("/{version}/")), "{name}: {url_key} names version {version}: {url}");
+    let hash = job_env(job, hash_key);
+    assert!(hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()), "{name}: {hash_key} is a SHA-256: {hash}");
+}
+
+fn assert_reads_no_secret(name: &str, lines: &[String]) {
+    for forbidden in ["secrets.", "environment:", "id-token", "contents: write"] {
+        assert!(!lines.iter().any(|l| l.contains(forbidden)), "{name} must not use `{forbidden}`");
+    }
+}
+
+#[test]
+fn the_advisories_workflow_runs_a_pinned_cargo_deny_apart_from_ci() {
+    let name = "advisories.yml";
+    let lines = workflow_code(name);
+    let has = |wanted: &str| lines.iter().any(|l| l.trim() == wanted);
+    for trigger in ["pull_request:", "push:", "schedule:"] {
+        assert!(lines.iter().any(|l| indent_of(l) == 2 && l.trim() == trigger), "{name} runs on `{trigger}`");
+    }
+    for path in ["- '**/Cargo.toml'", "- 'Cargo.lock'", "- 'deny.toml'", "- '.github/workflows/advisories.yml'"] {
+        let listed = lines.iter().filter(|l| l.trim() == path).count();
+        assert_eq!(listed, 2, "{name}: pull requests and pushes both watch `{path}`");
+    }
+    assert!(has("branches: [main]"));
+    assert_reads_no_secret(name, &lines);
+
+    let jobs = jobs_of(&lines);
+    let advisories = job(&jobs, "advisories");
+    assert_pinned_download(
+        name,
+        advisories,
+        "CARGO_DENY_URL",
+        "https://github.com/EmbarkStudios/cargo-deny/releases/download/",
+        "0.20.2",
+        "CARGO_DENY_SHA256",
+    );
+    let text = advisories.text();
+    assert!(text.contains("sha256sum --check"), "{name} checks the download before running it");
+    let commands = run_commands(advisories);
+    assert!(commands.iter().any(|c| c == "cargo deny --locked check advisories"), "{name}: {commands:?}");
+
+    let deny = read_repo_file("deny.toml");
+    assert!(deny.lines().any(|l| l.trim() == "[advisories]"), "deny.toml configures the advisories");
+    for line in deny.lines().filter(|l| l.contains("id = \"RUSTSEC-")) {
+        assert!(line.contains("reason = \""), "an ignored advisory says why: {line}");
+    }
+}
+
 /// The command of every `run:` step of a job, single-line ones only.
 fn run_commands(job: &Job) -> Vec<String> {
     job.steps()
