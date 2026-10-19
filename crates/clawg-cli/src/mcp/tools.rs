@@ -548,7 +548,7 @@ pub fn indexes_docs(project: &ProjectIdentity, bridge: Option<&ProjectIdentity>)
 pub fn format_sharing(policy: &Result<SharingPolicy, SharingError>, reader: &str) -> String {
     match policy {
         Ok(p) => match p.reach_for(reader) {
-            Reach::Own => "shared: none (reads only its own)".to_string(),
+            Reach::Own | Reach::OwnOnly => "shared: none (reads no other agent)".to_string(),
             Reach::AllBut(hidden) if hidden.is_empty() => "shared: reads every agent".to_string(),
             Reach::AllBut(hidden) => format!("shared: reads every agent but {}", hidden.join(", ")),
         },
@@ -1340,7 +1340,7 @@ mod tests {
         let policy = SharingPolicy::parse(r#"{"version":1,"hides":{"cursor":["codex","claude-code"],"aider":["*"]}}"#);
         assert_eq!(format_sharing(&policy, "cursor"), "shared: reads every agent but claude-code, codex");
         assert_eq!(format_sharing(&policy, "codex"), "shared: reads every agent");
-        assert_eq!(format_sharing(&policy, "aider"), "shared: none (reads only its own)");
+        assert_eq!(format_sharing(&policy, "aider"), "shared: none (reads no other agent)");
         let broken = SharingPolicy::parse(r#"{"version":2}"#);
         let line = format_sharing(&broken, "cursor");
         assert!(line.starts_with("shared: none (") && line.contains("version 2"), "{line}");

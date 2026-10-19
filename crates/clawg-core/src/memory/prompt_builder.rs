@@ -616,8 +616,8 @@ fn unix_millis_to_ymd(ts: TimestampMs) -> (i32, u32, u32) {
     unix_secs_to_ymd(ts.as_millis_i64().div_euclid(1_000))
 }
 
-/// Saved by an agent other than `reader`. A hit without an author is the
-/// reader's own: nothing else could have reached its search.
+/// Saved by an agent other than `reader`. A hit without an author was saved
+/// by no agent, so there is nobody to name.
 fn is_shared(hit: &RankedHit, reader: &str) -> bool {
     hit.agent_id.as_deref().is_some_and(|a| a != reader)
 }
@@ -770,7 +770,7 @@ async fn fetch_last_session(
             let mut rows = stmt.query(rusqlite::params![project])?;
             while let Some(row) = rows.next()? {
                 let author: Option<String> = row.get(6)?;
-                if !author.as_deref().is_some_and(|a| reach.admits(&reader, a)) {
+                if !reach.admits(&reader, author.as_deref()) {
                     continue;
                 }
                 return Ok(Some(RankedHit {
@@ -3294,6 +3294,23 @@ mod tests {
 
         let hidden = session_prompt_reaching(&store, "agent-3", Some("proj-a"), &Reach::Own).await.text;
         assert!(!hidden.contains(SEP_LAST_SESSION), "an agent with no summary of its own and no reach gets no block: {hidden}");
+    }
+
+    #[tokio::test]
+    async fn the_last_session_block_shows_a_summary_no_agent_saved() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let global = seed_summary(&store, "agent-1", None, "Goal: a summary no agent saved", 1).await;
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE memory SET scope = 'global', agent_id = NULL WHERE id = ?1", [global]))
+            .await
+            .unwrap();
+
+        for reach in [Reach::Own, Reach::AllBut(vec!["agent-2".into()])] {
+            let text = session_prompt_reaching(&store, "agent-1", None, &reach).await.text;
+            let last = block(&text, SEP_LAST_SESSION).unwrap_or_else(|| panic!("{reach:?}: {text}"));
+            assert!(last.contains(&format!("#{global} session_summary] Goal: a summary no agent saved")), "{reach:?}: {text}");
+        }
     }
 
     #[tokio::test]

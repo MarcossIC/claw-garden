@@ -3428,7 +3428,7 @@ mod tests {
         hide(&d, "cursor", "codex");
         assert!(status("cursor").await.contains("shared: reads every agent but claude-code, codex\n"));
         hide(&d, "cursor", "*");
-        assert!(status("cursor").await.contains("shared: none (reads only its own)\n"));
+        assert!(status("cursor").await.contains("shared: none (reads no other agent)\n"));
         std::fs::write(clawg_core::paths::sharing_file(d.path()), "{").unwrap();
         let t = status("cursor").await;
         assert!(t.contains("shared: none (sharing.json is not valid"), "{t}");

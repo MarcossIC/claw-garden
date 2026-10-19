@@ -2,8 +2,10 @@
 //!
 //! Every agent reads every other agent's memories unless the user hides them:
 //! a set of directed exclusions — "cursor does not read codex" — kept in
-//! `<data>/sharing.json`, where `*` stands for every agent. Parsing and
-//! resolving are pure; only [`load`] and [`save`] touch the filesystem.
+//! `<data>/sharing.json`, where `*` stands for every agent. A row no agent
+//! saved is read by every agent: an exclusion names an author, and that row
+//! has none. Parsing and resolving are pure; only [`load`] and [`save`] touch
+//! the filesystem.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -38,19 +40,24 @@ pub enum SharingError {
 /// What one agent's search reaches besides its own rows.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Reach {
-    /// Its own rows only.
+    /// No other agent's rows: its own, and the rows no agent saved.
     #[default]
     Own,
-    /// Every agent's rows except these authors'.
+    /// Every agent's rows except these authors', and the rows no agent saved.
     AllBut(Vec<String>),
+    /// Its own rows alone, not even the ones no agent saved: what a save is
+    /// compared against, since an agent can only judge a pair it owns.
+    OwnOnly,
 }
 
 impl Reach {
-    /// Whether `reader` may read a row `author` saved.
-    pub(crate) fn admits(&self, reader: &str, author: &str) -> bool {
-        match self {
-            Reach::Own => author == reader,
-            Reach::AllBut(hidden) => author == reader || !hidden.iter().any(|h| h == author),
+    /// Whether `reader` may read a row `author` saved; `None` when no agent did.
+    pub(crate) fn admits(&self, reader: &str, author: Option<&str>) -> bool {
+        match (self, author) {
+            (Reach::OwnOnly, author) => author == Some(reader),
+            (_, None) => true,
+            (Reach::Own, Some(author)) => author == reader,
+            (Reach::AllBut(hidden), Some(author)) => author == reader || !hidden.iter().any(|h| h == author),
         }
     }
 }
@@ -196,11 +203,21 @@ mod tests {
 
     #[test]
     fn a_reach_admits_the_reader_and_whoever_is_not_hidden() {
-        assert!(Reach::Own.admits("a", "a"));
-        assert!(!Reach::Own.admits("a", "b"));
+        assert!(Reach::Own.admits("a", Some("a")));
+        assert!(!Reach::Own.admits("a", Some("b")));
         let all_but_c = all_but(&["c"]);
-        assert!(all_but_c.admits("a", "a") && all_but_c.admits("a", "b"));
-        assert!(!all_but_c.admits("a", "c"));
+        assert!(all_but_c.admits("a", Some("a")) && all_but_c.admits("a", Some("b")));
+        assert!(!all_but_c.admits("a", Some("c")));
+    }
+
+    #[test]
+    fn a_row_no_agent_saved_is_read_by_every_agent() {
+        let nothing_shared = policy(r#"{"version":1,"hides":{"*":["*"]}}"#).reach_for("cursor");
+        for reach in [Reach::Own, all_but(&[]), all_but(&["codex"]), nothing_shared] {
+            assert!(reach.admits("cursor", None), "no exclusion names a row without an author: {reach:?}");
+        }
+        assert!(!Reach::OwnOnly.admits("cursor", None), "a save is compared only against its agent's rows");
+        assert!(Reach::OwnOnly.admits("cursor", Some("cursor")) && !Reach::OwnOnly.admits("cursor", Some("codex")));
     }
 
     #[test]
