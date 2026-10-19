@@ -78,14 +78,14 @@ El puente MCP (cwd y `project_path`) y `clawg memories --here` MUST derivar el i
 
 ## R4. Registro de proyecto y re-key
 
-`POST /v1/projects`, con token, recibe `{ "root_path": "...", "legacy_ids": ["..."], "index_docs": <bool> }` y responde `{ "project_id": "...", "rekeyed": <n> }` (`register`, `crates/clawg-cli/src/daemon/api.rs:1342`; `register_project`, `crates/clawg-core/src/memory/project.rs:62`).
+`POST /v1/projects`, con token, recibe `{ "root_path": "...", "legacy_ids": ["..."], "index_docs": <bool> }` y responde `{ "project_id": "...", "rekeyed": <n> }` (`register`, `crates/clawg-cli/src/daemon/api.rs:1384`; `register_project`, `crates/clawg-core/src/memory/project.rs:62`).
 
 - El daemon MUST derivar el id de `root_path` él mismo; no lo recibe.
-- `index_docs` dice si el daemon puede leer los archivos de la raíz ([`specs/project-docs`](../project-docs/spec.md), «Qué raíces se leen»). Si falta MUST tomarse como `false` (`RegisterRequest::index_docs`, `api.rs:1329`): un puente de una versión anterior registra sin indexar, y lo arregla `clawg projects add` o un puente actual en esa raíz.
-- Con `index_docs: true` y una `root_path` que no es un directorio, MUST responder 400 antes de tocar `project` (`api.rs:1350-1352`). Sin `index_docs`, la misma ruta se sigue registrando como siempre.
+- `index_docs` dice si el daemon puede leer los archivos de la raíz ([`specs/project-docs`](../project-docs/spec.md), «Qué raíces se leen»). Si falta MUST tomarse como `false` (`RegisterRequest::index_docs`, `api.rs:1371`): un puente de una versión anterior registra sin indexar, y lo arregla `clawg projects add` o un puente actual en esa raíz.
+- Con `index_docs: true` y una `root_path` que no es un directorio, MUST responder 400 antes de tocar `project` (`api.rs:1392-1394`). Sin `index_docs`, la misma ruta se sigue registrando como siempre.
 - MUST guardar `(id, root_path, index_docs)` en `project` si no existe.
 - Si la fila existe con la misma raíz y el registro pide indexar, MUST pasar `index_docs` de 0 a 1. MUST NOT bajarlo de 1 a 0: un save en otra sesión no le quita a una raíz aceptada su índice (`project.rs:98-100`). El resultado (`RegisterOutcome::index_docs`) lleva el valor que quedó guardado.
-- Si el id ya está registrado con **otra** `root_path`, MUST responder 409 sin mover ninguna fila y sin tocar la marca de la otra raíz. El cuerpo es `{ "error": "project_root_collision", "detail": "<raíz> gets the project id <id>, which already belongs to <otra raíz>" }` (`api.rs:1363-1366`).
+- Si el id ya está registrado con **otra** `root_path`, MUST responder 409 sin mover ninguna fila y sin tocar la marca de la otra raíz. El cuerpo es `{ "error": "project_root_collision", "detail": "<raíz> gets the project id <id>, which already belongs to <otra raíz>" }` (`api.rs:1405-1408`).
 - Por cada id viejo distinto del nuevo, MUST pasar al id nuevo todas las filas de las tablas con proyecto que lo tengan, incluidas las borradas lógicamente, en **una** transacción.
 - Por cada fila movida, MUST escribir en `project_rekey` la tabla, el id de la fila, el id viejo, el id nuevo y la fecha, en la misma transacción.
 - Un id viejo con formato inválido (fuera de `{basename}-[0-9a-f]{4}`) MUST dar 400 sin mover nada.

@@ -22,7 +22,7 @@ Fuente de verdad del comportamiento actual de los pares que encuentra el detecto
 
 ## El detector anota candidatas
 
-Cada fila que el detector encuentra en la banda ("Umbral y banda del detector") es una candidata (`Candidate`, `crates/clawg-core/src/memory/contradiction.rs:77`): su id, su distancia, si escala y la primera línea de su texto. El insert MUST escribir un par por candidata en la misma transacción que la fila nueva (`note_candidates`, `crates/clawg-core/src/memory/store_insert.rs:244`), `escalated` si escala y `pending` si no. La fila nueva MUST quedar `disputed`, nombrando en `disputed_against` sólo a las candidatas que escalan (`store_insert.rs:417-421`); con candidatas pendientes nada más, MUST quedar `active`.
+Cada fila que el detector encuentra en la banda ("Umbral y banda del detector") es una candidata (`Candidate`, `crates/clawg-core/src/memory/contradiction.rs:77`): su id, su distancia, si escala y la primera línea de su texto. El insert MUST escribir un par por candidata en la misma transacción que la fila nueva (`note_candidates`, `crates/clawg-core/src/memory/store_insert.rs:247`), `escalated` si escala y `pending` si no. La fila nueva MUST quedar `disputed`, nombrando en `disputed_against` sólo a las candidatas que escalan (`store_insert.rs:420-424`); con candidatas pendientes nada más, MUST quedar `active`.
 
 Una candidata escala cuando `needs_user` (`contradiction.rs:103`), que es pura, devuelve verdadero: si la distancia no se conoce; si es menor que `ESCALATE_BELOW` y los dos lados son filas protegidas; o si es menor que `IDENTIFIER_ESCALATE_BELOW` y los dos textos comparten un identificador (`shares_identifier`, `contradiction.rs:115`, que usa `identifier_tokens` de `search.rs`). Dos `semantic_fact` cercanos que no llegan a ese corte no escalan, ni un hecho cerca de una preferencia o una decisión: los ve el agente en la respuesta del save y en `memory_status`. El agente no puede reemplazar el lado protegido de un par pendiente sin preguntar (R3), así que una decisión no se pierde porque su par no escaló.
 
@@ -47,7 +47,7 @@ Dentro de un pedazo, el detector MUST quedarse con la candidata más cercana de 
 
 ## Las candidatas en la respuesta del save
 
-Un save confirmado cuyo detector anotó pares MUST listarlos en `related` (`SaveBody`, `crates/clawg-cli/src/daemon/api.rs:494`; cada uno `RelatedMemory`, `api.rs:533`, con `kind`, `id`, `escalated` y la primera línea de la candidata cortada a `EXCERPT_CHARS` = 80 caracteres, `contradiction.rs:73`), uno por fila vieja. Sin pares, MUST NOT llevar el campo. El texto de `save_memory` MUST sumar una línea `close to earlier memories: #id "<línea>"` (con `, asks the user` en las que escalan) que pide juzgarlas con `resolve_conflict`, sólo cuando hay alguna (`related_text`, `crates/clawg-cli/src/mcp/server.rs:325`). Un puente que no conoce el campo muestra el save igual.
+Un save confirmado cuyo detector anotó pares MUST listarlos en `related` (`SaveBody`, `crates/clawg-cli/src/daemon/api.rs:496`; cada uno `RelatedMemory`, `api.rs:548`, con `kind`, `id`, `escalated` y la primera línea de la candidata cortada a `EXCERPT_CHARS` = 80 caracteres, `contradiction.rs:73`), uno por fila vieja. Sin pares, MUST NOT llevar el campo. El texto de `save_memory` MUST sumar una línea `close to earlier memories: #id "<línea>"` (con `, asks the user` en las que escalan) que pide juzgarlas con `resolve_conflict`, sólo cuando hay alguna (`related_text`, `crates/clawg-cli/src/mcp/server.rs:325`). Un puente que no conoce el campo muestra el save igual.
 
 **Tests:** `a_confirmed_save_names_its_candidates` en `worker.rs`; `save_outcome_text_names_related_memories` en `server.rs`; `save_body_leaves_related_out_when_empty` en `api.rs`.
 
@@ -132,7 +132,7 @@ Cuando una fila X se borra (`delete_memory_core`, `crates/clawg-core/src/memory/
 
 Restaurar X (`restore_memory_core`, `admin.rs:439`; el resto del restore está en [`specs/restore`](../restore/spec.md)) MUST llevar a su estado de reposo a X y a toda fila cuyo `disputed_against` la nombra (`settle_row` y `settle_challengers`, `dispute.rs:207` y `dispute.rs:200`, llamadas en `admin.rs:511-512`): el par escalado vuelve con ella.
 
-Restaurar una fila borrada que tenía `topic_key` MUST fallar sin cambiar nada cuando el alcance de su clave ya tiene una fila viva de otro save (las demás piezas de su propio save no cuentan) (`RESTORE_TOPIC_HOLDER`, `admin.rs:412`; `RestoreError::TopicTaken`, `admin.rs:370`). El error MUST nombrar la clave y la fila que la tiene, y la fila restaurada se queda borrada: restaurarla dejaría dos versiones vivas de un tema que una revisión mantiene en una. `POST /v1/memories/memory/{id}/restore` MUST responder `409` (`restore_memory`, `crates/clawg-cli/src/daemon/api.rs:1251`, el brazo del `409` en `api.rs:1265`), como con un gemelo vivo o un secreto.
+Restaurar una fila borrada que tenía `topic_key` MUST fallar sin cambiar nada cuando el alcance de su clave ya tiene una fila viva de otro save (las demás piezas de su propio save no cuentan) (`RESTORE_TOPIC_HOLDER`, `admin.rs:412`; `RestoreError::TopicTaken`, `admin.rs:370`). El error MUST nombrar la clave y la fila que la tiene, y la fila restaurada se queda borrada: restaurarla dejaría dos versiones vivas de un tema que una revisión mantiene en una. `POST /v1/memories/memory/{id}/restore` MUST responder `409` (`restore_memory`, `crates/clawg-cli/src/daemon/api.rs:1282`, el brazo del `409` en `api.rs:1296`), como con un gemelo vivo o un secreto.
 
 Purgar X (`purge`, `crates/clawg-core/src/memory/secrets.rs:82`) MUST borrar los pares que la nombran (`secrets.rs:109`).
 
@@ -174,13 +174,13 @@ Cubre las huérfanas que dejaron las versiones que borraban sin liberar. La mism
 
 ## R6. HTTP y MCP
 
-Detrás del token, sobre filas de `memory` (rutas en `crates/clawg-cli/src/daemon/api.rs:718-720`):
+Detrás del token, sobre filas de `memory` (rutas en `crates/clawg-cli/src/daemon/api.rs:737-739`):
 
-- `POST /v1/disputes/judge` MUST aceptar `{"keep": <id>, "other": <id>, "verdict": "supersedes" | "compatible" | "scoped" | "conflicts", "reason": <opcional>, "agent_id": <opcional>}` (`judge_dispute`, `api.rs:1296`).
+- `POST /v1/disputes/judge` MUST aceptar `{"keep": <id>, "other": <id>, "verdict": "supersedes" | "compatible" | "scoped" | "conflicts", "reason": <opcional>, "agent_id": <opcional>}` (`judge_dispute`, `api.rs:1327`).
 - `POST /v1/disputes/resolve` MUST seguir aceptando `{"keep", "other", "keep_both": <bool, opcional, false por defecto>, "agent_id"}` para los puentes anteriores, y guardar `compatible` (con `keep_both`) o `supersedes` (`resolve_dispute_core`, `dispute.rs:289`).
-- `GET /v1/disputes?agent_id=` MUST devolver `{pending, escalated, pairs}`: los conteos de pares abiertos entre filas vivas del agente y hasta 5 pares pendientes (`OPEN_PAIRS_SHOWN`, `api.rs:702`), los más viejos primero (`open_pairs`, `dispute.rs:425`), cada lado con la marca de su origen (P4 de [`specs/provenance`](../provenance/spec.md)).
+- `GET /v1/disputes?agent_id=` MUST devolver `{pending, escalated, pairs}`: los conteos de pares abiertos entre filas vivas del agente y hasta 5 pares pendientes (`OPEN_PAIRS_SHOWN`, `api.rs:720`), los más viejos primero (`open_pairs`, `dispute.rs:425`), cada lado con la marca de su origen (P4 de [`specs/provenance`](../provenance/spec.md)).
 
-Las dos rutas de veredicto responden igual (`resolve_error`, `api.rs:1274`):
+Las dos rutas de veredicto responden igual (`resolve_error`, `api.rs:1305`):
 
 | Caso | Respuesta |
 |---|---|

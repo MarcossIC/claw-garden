@@ -2,6 +2,7 @@
 //! process wiring that starts both.
 
 pub mod api;
+pub mod guard;
 pub mod lifecycle;
 pub mod serve;
 pub mod sessions;

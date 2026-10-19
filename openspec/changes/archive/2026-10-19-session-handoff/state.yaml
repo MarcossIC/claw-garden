@@ -1,0 +1,15 @@
+change: session-handoff
+objective: "1, 5"
+depends_on: [agent-lifecycle-hooks, context-budget]
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # Linux, CI de Linux y Windows, Windows sobre develop, rag-eval --real --agent-view y Claude Code sobre el perfil dev; sin CRITICAL ni WARNING
+  archive: done
+updated: 2026-10-19
+main_spec: openspec/specs/retrieval/spec.md, openspec/specs/ingest/spec.md, openspec/specs/hooks/spec.md, openspec/specs/sharing/spec.md, openspec/specs/mcp/spec.md

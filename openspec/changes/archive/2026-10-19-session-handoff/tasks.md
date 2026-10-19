@@ -40,6 +40,6 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 ## 7. Verificación
 
 - [x] Suite y clippy en Linux sobre el último commit.
-- [ ] El CI en verde en Linux y Windows.
-- [ ] `rag-eval --real --agent-view` contra la línea base, con el umbral de la propuesta (pide el modelo real y el golden set de `docs/eval/`).
-- [ ] Con Claude Code sobre el perfil dev, «Probar a mano» del diseño.
+- [x] El CI en verde en Linux y Windows.
+- [x] `rag-eval --real --agent-view` contra la línea base, con el umbral de la propuesta (pide el modelo real y el golden set de `docs/eval/`).
+- [x] Con Claude Code sobre el perfil dev, «Probar a mano» del diseño.

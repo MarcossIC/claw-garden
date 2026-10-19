@@ -484,6 +484,101 @@ async fn a_non_bearer_authorization_header_is_unauthorized() {
     assert_eq!(r.status(), 401);
 }
 
+// ── Host and Origin ─────────────────────────────────────────────────────────
+
+/// What a DNS-rebinding page sends: the attacker's name, resolved to loopback.
+#[tokio::test]
+async fn a_foreign_host_is_forbidden_on_health_and_v1_with_or_without_a_token() {
+    let h = Harness::start().await;
+    let foreign = format!("evil.example:{}", h.addr.port());
+    for (path, token) in [("/health", false), ("/health", true), ("/v1/stats", false), ("/v1/stats", true)] {
+        let mut req = h.http.get(h.url(path)).header("host", &foreign);
+        if token {
+            req = req.bearer_auth(&h.token);
+        }
+        let r = req.send().await.expect("request");
+        assert_eq!(r.status(), 403, "{path} with token={token}");
+        let body: Value = r.json().await.expect("json");
+        assert_eq!(body, json!({ "error": "forbidden" }), "{path} with token={token}");
+    }
+}
+
+/// A browser sends `Origin` on every write, cross-site or not; no client of
+/// the daemon sends one.
+#[tokio::test]
+async fn an_origin_is_forbidden_even_with_the_token() {
+    let h = Harness::start().await;
+    h.authed(h.http.post(h.url("/v1/memories")))
+        .json(&json!({ "content": "Kept in the store: the origin test row.", "agent_id": "a" }))
+        .send()
+        .await
+        .expect("save");
+
+    let r = h
+        .authed(h.http.post(h.url("/v1/search")))
+        .header("origin", "http://evil.example")
+        .json(&json!({ "query": "origin test row", "agent_id": "a" }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(r.status(), 403);
+    let body: Value = r.json().await.expect("json");
+    assert_eq!(body, json!({ "error": "forbidden" }));
+
+    let r = h.http.get(h.url("/health")).header("origin", "null").send().await.expect("request");
+    assert_eq!(r.status(), 403);
+}
+
+/// One answer for both reasons, as for the token: telling them apart would
+/// tell a page which half to change.
+#[tokio::test]
+async fn both_refusals_answer_the_same_body() {
+    let h = Harness::start().await;
+    let by_host = h.http.get(h.url("/health")).header("host", "evil.example").send().await.expect("request");
+    let by_origin = h
+        .http
+        .get(h.url("/health"))
+        .header("origin", "http://evil.example")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(by_host.status(), 403);
+    assert_eq!(by_origin.status(), 403);
+    assert_eq!(by_host.text().await.expect("body"), by_origin.text().await.expect("body"));
+}
+
+#[tokio::test]
+async fn a_daemon_client_passes_the_guard() {
+    use clawg_cli::client::{DaemonClient, SaveArgs, SearchArgs};
+    let h = Harness::start().await;
+    let client = DaemonClient::new(format!("http://{}", h.addr), &h.token, h._dir.path().to_path_buf());
+
+    assert_eq!(client.health().await.expect("health").status, "ok");
+    client
+        .save(SaveArgs {
+            content: "The guard lets the daemon client through.".into(),
+            agent_id: "a".into(),
+            project_id: None,
+            memory_type: None,
+            importance: None,
+            derived_from: Vec::new(),
+            topic_key: None,
+            user_stated: false,
+        })
+        .await
+        .expect("save");
+    client
+        .search(SearchArgs {
+            query: "guard daemon client".into(),
+            agent_id: "a".into(),
+            project_id: None,
+            limit: None,
+        })
+        .await
+        .expect("search");
+    client.shutdown().await.expect("shutdown");
+}
+
 // ── Save while the embedder is not ready ────────────────────────────────────
 
 const FAILED_CAUSE: &str = "download failed: connection refused";

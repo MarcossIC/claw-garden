@@ -59,6 +59,7 @@ use tokio::sync::oneshot;
 
 use crate::relevance::shown_hits;
 
+use super::guard::{admits, RefusalLog};
 use super::lifecycle::now_ms;
 use super::sessions::{check_session_id, SessionRegistry};
 
@@ -770,6 +771,9 @@ const OPEN_PAIRS_SHOWN: usize = 5;
 // ── Router ──────────────────────────────────────────────────────────────────
 
 /// Builds the daemon's router.
+///
+/// Every route, `/health` included, sits behind [`admit_loopback`], so a route
+/// added later is covered whether or not it asks for the token.
 pub fn router(app: Arc<AppCtx>) -> Router {
     let v1 = Router::new()
         .route("/memories", post(save_memory).get(list_memories))
@@ -797,6 +801,10 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         .route("/health", get(health))
         .nest("/v1", v1)
         .with_state(app)
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::new(RefusalLog::default()),
+            admit_loopback,
+        ))
 }
 
 /// Serves [`router`] on an OS-picked loopback port in a background task and
@@ -821,6 +829,29 @@ pub async fn serve_ephemeral(
             .await
     });
     Ok((addr, server))
+}
+
+/// Rejects a request a web page could have sent (see [`guard`](super::guard)).
+async fn admit_loopback(
+    State(refusals): State<Arc<RefusalLog>>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let headers = req.headers();
+    // A header that is not text is still a header: it reads as no name at all.
+    let host = headers.get(axum::http::header::HOST).map(|v| v.to_str().unwrap_or(""));
+    let origin = headers.get(axum::http::header::ORIGIN).map(|v| v.to_str().unwrap_or(""));
+    if admits(host, req.uri().authority().map(|a| a.as_str()), origin) {
+        return next.run(req).await;
+    }
+    if let Some(count) = refusals.refused(Instant::now()) {
+        // The values stay out of the log: they are whatever the page chose.
+        log::warn!(
+            "refused {count} request(s) not addressed to a loopback name or carrying an Origin \
+             header; a web page may be trying to reach the daemon"
+        );
+    }
+    ApiError::new(StatusCode::FORBIDDEN, "forbidden").into_response()
 }
 
 /// Rejects anything under `/v1` without the daemon's bearer token.
