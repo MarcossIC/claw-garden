@@ -9,6 +9,6 @@ artifacts:
   design: done
   tasks: done
   apply: done
-  verify: done  # Linux y el claude real en un home temporal, sin CRITICAL; Windows y una sesión real quedan como WARNING
+  verify: done  # Linux y Windows con el claude real en un home temporal, y una sesión real en Windows, sin CRITICAL; Windows sin Git Bash, un enlace en Windows y un cliente anterior a 2.1.139 quedan como WARNING
   archive: pending
 updated: 2026-10-19

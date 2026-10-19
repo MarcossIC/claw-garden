@@ -36,4 +36,5 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 
 - [x] Suite y clippy en Linux sobre el último commit.
 - [x] `clawg setup claude-code` con el binario de tests en un home temporal, y el `claude` real del PATH.
+- [x] Suite y clippy en Windows, y `clawg setup claude-code` con una ruta con espacio y una sesión real de Claude Code que recibe el contexto del hook.
 - [x] `verify.md`.
