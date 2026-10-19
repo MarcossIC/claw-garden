@@ -112,11 +112,15 @@ MUST, en este orden: sin `--yes`, negarse sin abrir nada; sin `memory.db`, falla
 
 ## R9 (nuevo). `last_error` se guarda enmascarado
 
-Todo `last_error` que se escribe en `ingest_outbox` MUST pasar por `redact` antes (`outbox_fail`, el abandono tras tres arranques y el evento que no se lee).
+Todo `last_error` que lleva el texto de un error MUST pasar por `redact` antes de escribirse en `ingest_outbox`: el de `outbox_fail` y el del evento que no se lee, cuyo error de serde repite valores del evento. El abandono tras tres arranques es un mensaje fijo.
 
 #### Escenario
 - GIVEN una fila del outbox
 - WHEN falla con `embed failed: token ghp_<36>`
 - THEN `last_error` es `embed failed: token [REDACTED:github_token]`
+
+- GIVEN una fila del outbox cuyo evento lleva `"importance": "ghp_<36>"`
+- WHEN se cargan las pendientes
+- THEN queda `failed` y su `last_error` no tiene el token
 
 **Tests:** `a_failure_is_stored_masked` (`outbox.rs`).

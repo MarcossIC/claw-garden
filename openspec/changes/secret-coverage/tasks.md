@@ -22,8 +22,8 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 
 ## 4. `last_error` (R9)
 
-- [ ] Test `a_failure_is_stored_masked` (`outbox.rs`).
-- [ ] Los tres escritores de `last_error` enmascaran.
+- [x] Test `a_failure_is_stored_masked` (`outbox.rs`).
+- [x] `outbox_fail` y el evento que no se lee enmascaran su `last_error`.
 - Commit: `fix(core): mask secrets in the error an outbox row records`
 
 ## 5. `clawg secrets` mira los veredictos (R4)

@@ -25,14 +25,14 @@ Las abiertas de la exploración se respondieron en el hilo, con estas opciones:
 - **Cabecera de un save largo** (J). Si la fila purgada es la posición 1 de un save, el `context` de todos los vínculos de ese save queda vacío. El vínculo de la fila queda: guarda un id, que `AUTOINCREMENT` no reusa, y marca el pedazo como faltante (`read_save_core` ya lo muestra así, `crates/clawg-core/src/memory/pieces.rs:133-160`). La salida nombra los otros pedazos del save: comparten con el purgado los tokens del solape.
 - **Revivir en la transacción de `purge`** (O). La fila viva se marca borrada, corre la misma revival que un `delete` (sólo `revision`; lo que reemplazó un veredicto queda escondido) y recién después se borra. La salida lista lo que volvió. Lo ya purgado antes de este cambio queda como está (P no se eligió).
 - **`reason`:** se enmascara al escribirlo (L), `clawg secrets` lo mira (M) y hay una forma de limpiar los viejos (N): `clawg secrets --mask-reasons --yes`, con el daemon parado, reescribe cada `reason` con secreto por su versión enmascarada, compacta la base y vacía el WAL como `purge`, sin snapshot previo.
-- **`last_error` se enmascara siempre** al escribirse en el outbox, en los tres caminos. Es barato e idempotente, y no depende de que ninguna librería cite su entrada.
+- **`last_error` se enmascara siempre** al escribirse en el outbox, en los dos caminos que llevan el texto de un error (el tercero, el abandono tras tres arranques, es un mensaje fijo). Es barato e idempotente, y no depende de que ninguna librería cite su entrada.
 - **Restaurar filas viejas:** se acepta que una regla nueva bloquee `clawg undelete` de una fila borrada que ahora tiene un secreto (`RestoreError::HoldsSecret`, `admin.rs:397`). No se pierde nada: la fila sigue borrada, `clawg secrets` la lista y el mensaje dice cómo purgarla.
 
 ## Alcance
 
 1. `credential`, `huggingface_token`, `slack_webhook`, y `xapp-`, `whsec_` y PGP en los tipos que ya existían, con tablas de casos en los dos sentidos.
 2. `judge_pair` enmascara el `reason`.
-3. `outbox_fail` y los otros dos escritores de `last_error` lo enmascaran.
+3. `outbox_fail` y la carga de un evento que no se lee enmascaran el `last_error`.
 4. `clawg secrets` lista los `reason` con secreto (`pair <new> <old> <tipos>`), y `clawg secrets --mask-reasons --yes` los limpia.
 5. `purge`: outbox por agente e igualdad, con las filas borradas listadas; la cabecera de un save largo; los otros pedazos nombrados; la revival en la transacción; los `workspace.md` nombrados.
 6. Docs: [`specs/secrets`](../../specs/secrets/spec.md) (en el archive), `.claude/CLAUDE.md` y el backlog de `openspec/README.md`.
