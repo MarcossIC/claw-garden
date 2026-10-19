@@ -1,0 +1,15 @@
+change: secret-coverage
+objective: "1"
+depends_on: []
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: skipped  # the decisions are in the proposal
+  tasks: done
+  apply: done
+  verify: done  # Linux, the repository corpus and a real daemon in a test home, no CRITICAL; Windows is a WARNING until the CI
+  archive: done
+updated: 2026-10-19
+main_spec: openspec/specs/secrets/spec.md

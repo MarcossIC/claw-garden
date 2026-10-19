@@ -77,9 +77,17 @@ pub enum Command {
         #[command(flatten)]
         profile: ProfileArg,
     },
-    /// List the stored memories that hold a secret of a known format, by id
-    /// and kind, never the secret. Read-only; works with the daemon running.
+    /// List the stored memories and verdict reasons that hold a secret of a
+    /// known format, by id and kind, never the secret. Read-only; works with
+    /// the daemon running.
     Secrets {
+        /// Replace the secrets of every stored verdict reason with their
+        /// placeholders instead. The daemon must be stopped.
+        #[arg(long)]
+        mask_reasons: bool,
+        /// Confirm that the reasons are to be rewritten for good.
+        #[arg(long, requires = "mask_reasons")]
+        yes: bool,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -771,15 +779,20 @@ mod tests {
     }
 
     #[test]
-    fn secrets_takes_only_a_profile() {
+    fn secrets_takes_a_profile_and_masks_reasons_on_request() {
         assert_eq!(
             parse(&["clawg", "secrets"]).command,
-            Command::Secrets { profile: ProfileArg { profile: None } }
+            Command::Secrets { mask_reasons: false, yes: false, profile: ProfileArg { profile: None } }
         );
         assert_eq!(
             parse(&["clawg", "secrets", "--profile", "dev"]).command,
-            Command::Secrets { profile: ProfileArg { profile: Some("dev".into()) } }
+            Command::Secrets { mask_reasons: false, yes: false, profile: ProfileArg { profile: Some("dev".into()) } }
         );
+        assert_eq!(
+            parse(&["clawg", "secrets", "--mask-reasons", "--yes"]).command,
+            Command::Secrets { mask_reasons: true, yes: true, profile: ProfileArg { profile: None } }
+        );
+        assert!(Cli::try_parse_from(["clawg", "secrets", "--yes"]).is_err(), "--yes confirms a rewrite");
     }
 
     #[test]
