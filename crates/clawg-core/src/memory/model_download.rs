@@ -7,7 +7,7 @@
 //! suite depend on a third-party host being up. So `base_url()` consults the
 //! `CLAWG_HF_BASE_URL` env var; tests
 //! set it to a `mockito::Server::url()` value, prod leaves it unset and falls back to
-//! [`HF_BASE_URL`]. The `ensure_model_with_oracle` test seam also accepts an explicit
+//! [`HF_BASE_URL`]. The [`ModelSource`] a test builds also carries an explicit
 //! `base_url` parameter so individual tests can be parallel-safe (env vars are global).
 
 use std::path::{Path, PathBuf};
@@ -172,17 +172,17 @@ where
     P: FnOnce(&[u8]) -> Option<tokenizers::Tokenizer>,
 {
     let path = tokenizer_path(base_dir);
-    let bytes = match std::fs::read(&path) {
+    let bytes = match read_verified(&path, TOKENIZER_JSON_SHA256) {
         Ok(bytes) => bytes,
-        Err(e) => {
+        Err(Unusable::Unreadable(e)) => {
             log::warn!("tokenizer.json not readable at {} ({e}); chunking by bytes", path.display());
             return None;
         }
+        Err(Unusable::Altered { .. }) => {
+            log::warn!("tokenizer.json at {} is not the pinned file; chunking by bytes", path.display());
+            return None;
+        }
     };
-    if sha256_hex(&bytes) != TOKENIZER_JSON_SHA256 {
-        log::warn!("tokenizer.json at {} is not the pinned file; chunking by bytes", path.display());
-        return None;
-    }
     let started = std::time::Instant::now();
     let Some(tokenizer) = parse(&bytes) else {
         log::warn!("tokenizer.json at {} does not parse; chunking by bytes", path.display());
@@ -341,66 +341,41 @@ pub enum DownloadError {
     },
 }
 
+/// Where the model comes from and how it is fetched: the origin, the disk
+/// probe, the wait between attempts and the files with their hashes. The
+/// daemon uses [`ensure_model`]; a test builds its own to point at a local
+/// server with tiny fixture files.
+pub(crate) struct ModelSource<'a> {
+    pub base_url: &'a str,
+    pub oracle: &'a dyn DiskOracle,
+    pub backoff: &'a dyn BackoffPolicy,
+    pub files: &'a [FileSpec],
+}
+
 /// Production entrypoint: download the embedder model on first run.
-///
-/// Thin wrapper over [`ensure_model_with_oracle`] that hard-codes the
-/// production [`Fs2Oracle`], [`RealBackoff`], and the HF base URL.
 pub async fn ensure_model(
     base_dir: &Path,
     progress: Option<UnboundedSender<DownloadProgress>>,
 ) -> Result<ModelFiles, DownloadError> {
     let url = base_url();
-    ensure_model_with_oracle(base_dir, &Fs2Oracle, &url, Some(&RealBackoff), progress).await
+    let source = ModelSource {
+        base_url: &url,
+        oracle: &Fs2Oracle,
+        backoff: &RealBackoff,
+        files: &ALL_FILES,
+    };
+    ensure_model_from(base_dir, &source, progress).await
 }
 
-/// Test seam: same as [`ensure_model`] but with injectable disk oracle,
-/// base URL, and backoff policy. Iterates over the production [`ALL_FILES`]
-/// manifest. Most tests want to control the SHA constants too, in which case
-/// they call [`ensure_model_with_oracle_spec`] directly.
-pub(crate) async fn ensure_model_with_oracle(
+/// [`ensure_model`] against any [`ModelSource`].
+pub(crate) async fn ensure_model_from(
     base_dir: &Path,
-    oracle: &dyn DiskOracle,
-    base_url_str: &str,
-    backoff: Option<&dyn BackoffPolicy>,
+    source: &ModelSource<'_>,
     progress: Option<UnboundedSender<DownloadProgress>>,
 ) -> Result<ModelFiles, DownloadError> {
-    ensure_model_with_oracle_spec(
-        base_dir,
-        oracle,
-        base_url_str,
-        backoff,
-        progress,
-        &ALL_FILES,
-    )
-    .await
-}
-
-/// Lowest-level test seam: identical to [`ensure_model_with_oracle`] but lets
-/// the caller pass an arbitrary `files` slice instead of using [`ALL_FILES`].
-/// Tests use this to install fixture bytes + matching SHAs that are tiny
-/// (a few bytes) rather than the real 470 MB ONNX.
-pub(crate) async fn ensure_model_with_oracle_spec(
-    base_dir: &Path,
-    oracle: &dyn DiskOracle,
-    base_url_str: &str,
-    backoff: Option<&dyn BackoffPolicy>,
-    progress: Option<UnboundedSender<DownloadProgress>>,
-    files: &[FileSpec],
-) -> Result<ModelFiles, DownloadError> {
-    // Run the pipeline and translate any error into a terminal `Error` event.
-    // The match-on-Result indirection keeps the happy path readable while
-    // guaranteeing exactly one error event on every failure — the UI treats
-    // `Error` as terminal, so a second one would resurrect a finished download.
-    match ensure_model_with_oracle_spec_inner(
-        base_dir,
-        oracle,
-        base_url_str,
-        backoff,
-        progress.as_ref(),
-        files,
-    )
-    .await
-    {
+    // Exactly one error event on every failure: the UI treats `Error` as
+    // terminal, so a second one would resurrect a finished download.
+    match fetch(base_dir, source, progress.as_ref()).await {
         Ok(model_files) => Ok(model_files),
         Err(e) => {
             if let Some(tx) = progress.as_ref() {
@@ -413,15 +388,16 @@ pub(crate) async fn ensure_model_with_oracle_spec(
     }
 }
 
-async fn ensure_model_with_oracle_spec_inner(
+fn cache_dir_of(base_dir: &Path) -> PathBuf {
+    base_dir.join("models").join("multilingual-e5-small")
+}
+
+async fn fetch(
     base_dir: &Path,
-    oracle: &dyn DiskOracle,
-    base_url_str: &str,
-    backoff: Option<&dyn BackoffPolicy>,
+    source: &ModelSource<'_>,
     progress: Option<&UnboundedSender<DownloadProgress>>,
-    files: &[FileSpec],
 ) -> Result<ModelFiles, DownloadError> {
-    let cache_dir = base_dir.join("models").join("multilingual-e5-small");
+    let cache_dir = cache_dir_of(base_dir);
     std::fs::create_dir_all(&cache_dir).map_err(|e| DownloadError::Io {
         file: cache_dir.display().to_string(),
         source: e,
@@ -429,15 +405,15 @@ async fn ensure_model_with_oracle_spec_inner(
 
     // (1) Cache-hit fast path: NO events emitted. Every startup after the first
     // takes this branch, and emitting progress here would flash a download UI
-    // for work that never happens — ConfigPanel stays idle until a real
-    // download fires.
-    if let Some(model_files) = try_load_cached(&cache_dir, files) {
-        return Ok(model_files);
+    // for work that never happens.
+    let mut cached = check_cache(&cache_dir, source.files);
+    if cached.missing.is_empty() {
+        return Ok(cached.into_model_files());
     }
 
     // (2) Disk pre-flight: fail before the first byte rather than half a
     // gigabyte in, when the user can still act on the message.
-    let free = oracle.available_bytes(&cache_dir).map_err(|e| DownloadError::Io {
+    let free = source.oracle.available_bytes(&cache_dir).map_err(|e| DownloadError::Io {
         file: cache_dir.display().to_string(),
         source: e,
     })?;
@@ -448,156 +424,127 @@ async fn ensure_model_with_oracle_spec_inner(
         });
     }
 
-    // (3) Emit `Start`. bytes_total is unknown at this point (no HEAD probes —
-    // adds a round trip without observable UX gain because the values arrive
-    // on the first `Chunk` anyway). Senders may render an indeterminate bar
-    // until the first Chunk arrives.
+    // (3) bytes_total is unknown here (no HEAD probes: a round trip without
+    // observable gain, since the values arrive on the first `Chunk` anyway).
     if let Some(tx) = progress {
         let _ = tx.send(DownloadProgress::Start { bytes_total: 0 });
     }
 
-    // (4) Download every missing/mismatched file with full retry semantics
-    // and chunk-level progress emission.
-    let bp: &dyn BackoffPolicy = backoff.unwrap_or(&RealBackoff);
+    // (4) Download every missing or mismatched file.
     let mut bytes_downloaded_running: u64 = 0;
-    for spec in files {
-        let target = cache_dir.join(spec.path);
-        if file_matches_sha(&target, spec.sha256) {
-            continue;
-        }
+    for spec in std::mem::take(&mut cached.missing) {
         download_one(
             &cache_dir,
-            spec,
-            base_url_str,
-            bp,
+            &spec,
+            source.base_url,
+            source.backoff,
             progress,
             &mut bytes_downloaded_running,
         )
         .await?;
+        let bytes = read_verified(&cache_dir.join(spec.path), spec.sha256)
+            .map_err(|unusable| unusable.into_error(&spec))?;
+        cached.found.push((spec.kind, bytes));
     }
 
-    // (5) Re-read every committed file and assemble ModelFiles.
-    //
-    // Emit `Verify` here, but DO NOT emit `Done`.
-    // The semantic `Done` event means "the embedder is ready to use" and that
-    // is only true after the bootstrap layer (`memory::bootstrap`) has called
-    // the model load + filled the OnceCell. Emitting `Done` here
-    // as well would deliver TWO `done` events on the happy path. On disk the model
-    // is already valid by the time we return Ok — the `ModelFiles` return value
-    // is the contract, the wire event is not.
+    // `Verify` but never `Done`: `Done` means "the embedder is ready to use",
+    // which only the bootstrap knows, after the model load. Emitting it here
+    // too would deliver two `done` events on the happy path.
     if let Some(tx) = progress {
         let _ = tx.send(DownloadProgress::Verify);
     }
-    let model_files = load_cached_or_err(&cache_dir, files)?;
-    Ok(model_files)
+    Ok(cached.into_model_files())
 }
 
-/// Cache fast-path: returns `Some(ModelFiles)` iff every file in `files`
-/// exists on disk AND its SHA-256 matches `spec.sha256`. Otherwise `None`.
-fn try_load_cached(cache_dir: &Path, files: &[FileSpec]) -> Option<ModelFiles> {
-    let mut onnx: Option<Vec<u8>> = None;
-    let mut tokenizer = TokenizerFiles {
-        tokenizer_file: Vec::new(),
-        config_file: Vec::new(),
-        special_tokens_map_file: Vec::new(),
-        tokenizer_config_file: Vec::new(),
-    };
-    for spec in files {
-        let target = cache_dir.join(spec.path);
-        if !target.exists() {
-            return None;
+/// What the cache holds: the bytes of every file that passed its hash, and
+/// the files that are missing or do not.
+struct CacheCheck {
+    found: Vec<(FileKind, Vec<u8>)>,
+    missing: Vec<FileSpec>,
+}
+
+impl CacheCheck {
+    fn into_model_files(self) -> ModelFiles {
+        let mut onnx = Vec::new();
+        let mut tokenizer = TokenizerFiles {
+            tokenizer_file: Vec::new(),
+            config_file: Vec::new(),
+            special_tokens_map_file: Vec::new(),
+            tokenizer_config_file: Vec::new(),
+        };
+        for (kind, bytes) in self.found {
+            match kind {
+                FileKind::Onnx => onnx = bytes,
+                FileKind::TokenizerJson => tokenizer.tokenizer_file = bytes,
+                FileKind::ConfigJson => tokenizer.config_file = bytes,
+                FileKind::SpecialTokensMap => tokenizer.special_tokens_map_file = bytes,
+                FileKind::TokenizerConfig => tokenizer.tokenizer_config_file = bytes,
+            }
         }
-        let bytes = std::fs::read(&target).ok()?;
-        if sha256_hex(&bytes) != spec.sha256 {
-            return None;
-        }
-        place_bytes(&mut onnx, &mut tokenizer, spec.kind, bytes);
+        ModelFiles { onnx, tokenizer }
     }
-    Some(ModelFiles {
-        onnx: onnx.unwrap_or_default(),
-        tokenizer,
-    })
+}
+
+/// Reads every file of `files` once, keeping the bytes of those that pass.
+fn check_cache(cache_dir: &Path, files: &[FileSpec]) -> CacheCheck {
+    let mut check = CacheCheck { found: Vec::new(), missing: Vec::new() };
+    for spec in files {
+        match read_verified(&cache_dir.join(spec.path), spec.sha256) {
+            Ok(bytes) => check.found.push((spec.kind, bytes)),
+            Err(_) => check.missing.push(spec.clone()),
+        }
+    }
+    check
 }
 
 /// Cache-presence probe that never touches the network: true iff every file
-/// in the manifest is already on disk with a matching SHA-256. Every other
-/// entry point into this module downloads on a cache miss, so a caller that
-/// only wants to know "is the model ready" without risking a multi-hundred-
-/// megabyte download as a side effect delegates to the same on-disk check
-/// [`ensure_model`] uses internally rather than a separate reimplementation
-/// that could drift from it.
+/// in the manifest is already on disk with a matching SHA-256, by the same
+/// check [`ensure_model`] makes.
 #[cfg(feature = "eval")]
 pub(crate) fn model_is_cached(base_dir: &Path) -> bool {
-    let cache_dir = base_dir.join("models").join("multilingual-e5-small");
-    try_load_cached(&cache_dir, &ALL_FILES).is_some()
+    check_cache(&cache_dir_of(base_dir), &ALL_FILES).missing.is_empty()
 }
 
-/// Identical to [`try_load_cached`] but turns a missing file or SHA mismatch
-/// into an `Err` (used post-download, when every file MUST be present).
-fn load_cached_or_err(
-    cache_dir: &Path,
-    files: &[FileSpec],
-) -> Result<ModelFiles, DownloadError> {
-    let mut onnx: Option<Vec<u8>> = None;
-    let mut tokenizer = TokenizerFiles {
-        tokenizer_file: Vec::new(),
-        config_file: Vec::new(),
-        special_tokens_map_file: Vec::new(),
-        tokenizer_config_file: Vec::new(),
-    };
-    for spec in files {
-        let target = cache_dir.join(spec.path);
-        let bytes = std::fs::read(&target).map_err(|e| DownloadError::Io {
-            file: spec.path.into(),
-            source: e,
-        })?;
-        let got = sha256_hex(&bytes);
-        if got != spec.sha256 {
-            return Err(DownloadError::ChecksumMismatch {
+/// Why a file on disk cannot be used.
+#[derive(Debug)]
+enum Unusable {
+    Unreadable(std::io::Error),
+    Altered { actual: String },
+}
+
+impl Unusable {
+    fn into_error(self, spec: &FileSpec) -> DownloadError {
+        match self {
+            Unusable::Unreadable(source) => DownloadError::Io { file: spec.path.into(), source },
+            Unusable::Altered { actual } => DownloadError::ChecksumMismatch {
                 file: spec.path.into(),
                 expected: spec.sha256.into(),
-                actual: got,
-            });
+                actual,
+            },
         }
-        place_bytes(&mut onnx, &mut tokenizer, spec.kind, bytes);
-    }
-    Ok(ModelFiles {
-        onnx: onnx.unwrap_or_default(),
-        tokenizer,
-    })
-}
-
-fn place_bytes(
-    onnx: &mut Option<Vec<u8>>,
-    tokenizer: &mut TokenizerFiles,
-    kind: FileKind,
-    bytes: Vec<u8>,
-) {
-    match kind {
-        FileKind::Onnx => *onnx = Some(bytes),
-        FileKind::TokenizerJson => tokenizer.tokenizer_file = bytes,
-        FileKind::ConfigJson => tokenizer.config_file = bytes,
-        FileKind::SpecialTokensMap => tokenizer.special_tokens_map_file = bytes,
-        FileKind::TokenizerConfig => tokenizer.tokenizer_config_file = bytes,
     }
 }
 
-/// Compute SHA-256 hex of file contents; `false` if file missing/unreadable.
-fn file_matches_sha(path: &Path, expected_sha: &str) -> bool {
-    let Ok(bytes) = std::fs::read(path) else {
-        return false;
-    };
-    sha256_hex(&bytes) == expected_sha
+/// The bytes of `path` when their SHA-256 is `expected_sha`: the one place the
+/// cache is read and checked.
+fn read_verified(path: &Path, expected_sha: &str) -> Result<Vec<u8>, Unusable> {
+    let bytes = std::fs::read(path).map_err(Unusable::Unreadable)?;
+    let actual = sha256_hex(&bytes);
+    if actual != expected_sha {
+        return Err(Unusable::Altered { actual });
+    }
+    Ok(bytes)
 }
 
 /// Hex-lowercase SHA-256 of `bytes`.
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
-    let mut h = sha2::Sha256::new();
-    h.update(bytes);
-    let out = h.finalize();
-    let mut s = String::with_capacity(out.len() * 2);
-    for b in out {
+    hex_digest(sha2::Sha256::digest(bytes).as_slice())
+}
+
+fn hex_digest(digest: &[u8]) -> String {
+    let mut s = String::with_capacity(digest.len() * 2);
+    for b in digest {
         use std::fmt::Write as _;
         let _ = write!(s, "{b:02x}");
     }
@@ -860,6 +807,10 @@ mod tests {
         }
     }
 
+    fn source<'a>(base_url: &'a str, oracle: &'a dyn DiskOracle, files: &'a [FileSpec]) -> ModelSource<'a> {
+        ModelSource { base_url, oracle, backoff: &ZeroBackoff, files }
+    }
+
     // ---------- Disk pre-flight ----------
 
     #[tokio::test]
@@ -870,7 +821,7 @@ mod tests {
         let mock = server.mock("GET", mockito::Matcher::Any).expect(0).create_async().await;
 
         let oracle = MockDiskOracle::returning(599 * 1024 * 1024);
-        let err = ensure_model_with_oracle(tmp.path(), &oracle, &server.url(), None, None)
+        let err = ensure_model_from(tmp.path(), &source(&server.url(), &oracle, &ALL_FILES), None)
             .await
             .unwrap_err();
 
@@ -902,13 +853,7 @@ mod tests {
             .create_async()
             .await;
 
-        let err = ensure_model_with_oracle(
-            tmp.path(),
-            &oracle,
-            &server.url(),
-            Some(&ZeroBackoff),
-            None,
-        )
+        let err = ensure_model_from(tmp.path(), &source(&server.url(), &oracle, &ALL_FILES), None)
         .await
         .unwrap_err();
 
@@ -997,14 +942,7 @@ mod tests {
             .await;
 
         let oracle = MockDiskOracle::returning(10 * 1024 * 1024); // Way under threshold.
-        let res = ensure_model_with_oracle_spec(
-            tmp.path(),
-            &oracle,
-            &server.url(),
-            None,
-            None,
-            &specs,
-        )
+        let res = ensure_model_from(tmp.path(), &source(&server.url(), &oracle, &specs), None)
         .await;
         assert!(res.is_ok(), "expected cache hit, got {:?}", res.err());
         mock.assert_async().await;
@@ -1056,14 +994,7 @@ mod tests {
 
         // Sufficient disk so preflight passes for the redownload path.
         let oracle = MockDiskOracle::returning(MIN_FREE_BYTES);
-        let res = ensure_model_with_oracle_spec(
-            tmp.path(),
-            &oracle,
-            &server.url(),
-            Some(&ZeroBackoff),
-            None,
-            &specs,
-        )
+        let res = ensure_model_from(tmp.path(), &source(&server.url(), &oracle, &specs), None)
         .await;
         assert!(
             res.is_ok(),
@@ -1130,14 +1061,7 @@ mod tests {
         let _mocks = mount_all(&mut server, &files, 200).await;
 
         let oracle = MockDiskOracle::returning(MIN_FREE_BYTES);
-        let res = ensure_model_with_oracle_spec(
-            tmp.path(),
-            &oracle,
-            &server.url(),
-            Some(&ZeroBackoff),
-            None,
-            &specs,
-        )
+        let res = ensure_model_from(tmp.path(), &source(&server.url(), &oracle, &specs), None)
         .await;
         assert!(res.is_ok(), "got {:?}", res.err());
         let cache_dir = tmp.path().join("models").join("multilingual-e5-small");
@@ -1159,14 +1083,7 @@ mod tests {
         let _mocks = mount_all(&mut server, &files, 503).await;
 
         let oracle = MockDiskOracle::returning(MIN_FREE_BYTES);
-        let res = ensure_model_with_oracle_spec(
-            tmp.path(),
-            &oracle,
-            &server.url(),
-            Some(&ZeroBackoff),
-            None,
-            &specs,
-        )
+        let res = ensure_model_from(tmp.path(), &source(&server.url(), &oracle, &specs), None)
         .await;
         match res {
             Err(DownloadError::RetryExhausted { attempts, .. }) => assert_eq!(attempts, 3),
@@ -1221,14 +1138,7 @@ mod tests {
         }
 
         let oracle = MockDiskOracle::returning(MIN_FREE_BYTES);
-        let res = ensure_model_with_oracle_spec(
-            tmp.path(),
-            &oracle,
-            &server.url(),
-            Some(&ZeroBackoff),
-            None,
-            &specs,
-        )
+        let res = ensure_model_from(tmp.path(), &source(&server.url(), &oracle, &specs), None)
         .await;
         assert!(res.is_ok(), "got {:?}", res.err());
         m_fail.assert_async().await;
@@ -1264,14 +1174,7 @@ mod tests {
         }
 
         let oracle = MockDiskOracle::returning(MIN_FREE_BYTES);
-        let res = ensure_model_with_oracle_spec(
-            tmp.path(),
-            &oracle,
-            &server.url(),
-            Some(&ZeroBackoff),
-            None,
-            &specs,
-        )
+        let res = ensure_model_from(tmp.path(), &source(&server.url(), &oracle, &specs), None)
         .await;
         match res {
             Err(DownloadError::RetryExhausted { attempts, file }) => {
@@ -1314,14 +1217,7 @@ mod tests {
         }
 
         let oracle = MockDiskOracle::returning(MIN_FREE_BYTES);
-        let res = ensure_model_with_oracle_spec(
-            tmp.path(),
-            &oracle,
-            &server.url(),
-            Some(&ZeroBackoff),
-            None,
-            &specs,
-        )
+        let res = ensure_model_from(tmp.path(), &source(&server.url(), &oracle, &specs), None)
         .await;
         match res {
             Err(DownloadError::ChecksumMismatch { file, .. }) => {
@@ -1391,14 +1287,7 @@ mod tests {
         }
 
         let oracle = MockDiskOracle::returning(MIN_FREE_BYTES);
-        let res = ensure_model_with_oracle_spec(
-            tmp.path(),
-            &oracle,
-            &server.url(),
-            Some(&ZeroBackoff),
-            None,
-            &specs,
-        )
+        let res = ensure_model_from(tmp.path(), &source(&server.url(), &oracle, &specs), None)
         .await;
         assert!(res.is_ok(), "got {:?}", res.err());
         m_missing.assert_async().await;
@@ -1447,14 +1336,7 @@ mod tests {
 
         let oracle = MockDiskOracle::returning(MIN_FREE_BYTES);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DownloadProgress>();
-        let res = ensure_model_with_oracle_spec(
-            tmp.path(),
-            &oracle,
-            &server.url(),
-            Some(&ZeroBackoff),
-            Some(tx),
-            &specs,
-        )
+        let res = ensure_model_from(tmp.path(), &source(&server.url(), &oracle, &specs), Some(tx))
         .await;
         assert!(res.is_ok(), "got {:?}", res.err());
 
@@ -1497,14 +1379,7 @@ mod tests {
 
         let oracle = MockDiskOracle::returning(MIN_FREE_BYTES);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DownloadProgress>();
-        let _ = ensure_model_with_oracle_spec(
-            tmp.path(),
-            &oracle,
-            &server.url(),
-            Some(&ZeroBackoff),
-            Some(tx),
-            &specs,
-        )
+        let _ = ensure_model_from(tmp.path(), &source(&server.url(), &oracle, &specs), Some(tx))
         .await;
 
         let events = drain_progress(&mut rx);
@@ -1542,14 +1417,7 @@ mod tests {
 
         let oracle = MockDiskOracle::returning(MIN_FREE_BYTES);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DownloadProgress>();
-        let res = ensure_model_with_oracle_spec(
-            tmp.path(),
-            &oracle,
-            &server.url(),
-            Some(&ZeroBackoff),
-            Some(tx),
-            &specs,
-        )
+        let res = ensure_model_from(tmp.path(), &source(&server.url(), &oracle, &specs), Some(tx))
         .await;
         assert!(res.is_ok(), "got {:?}", res.err());
         let events = drain_progress(&mut rx);
@@ -1606,14 +1474,7 @@ mod tests {
 
         // Way under the 600 MB threshold — would fail the preflight if reached.
         let oracle = MockDiskOracle::returning(10 * 1024 * 1024);
-        let res = ensure_model_with_oracle_spec(
-            tmp.path(),
-            &oracle,
-            "http://unused.invalid",
-            None,
-            None,
-            &specs,
-        )
+        let res = ensure_model_from(tmp.path(), &source("http://unused.invalid", &oracle, &specs), None)
         .await;
 
         assert!(
