@@ -303,6 +303,16 @@ where
     args.into_iter().nth(1).is_some_and(|a| a.as_ref() == "hook")
 }
 
+/// Whether `args` hold no argument after the program: what a client that does
+/// not know a hook's `args` runs, which must not exit 2 either.
+pub fn is_bare_invocation<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    args.into_iter().nth(1).is_none()
+}
+
 /// The three tables a row can live in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum KindArg {
@@ -660,6 +670,14 @@ mod tests {
         assert!(is_hook_invocation(["clawg", "hook"]));
         assert!(!is_hook_invocation(["clawg", "mcp", "hook"]));
         assert!(!is_hook_invocation(["clawg"]));
+    }
+
+    #[test]
+    fn a_bare_clawg_never_blocks() {
+        assert!(is_bare_invocation(["clawg"]));
+        assert!(is_bare_invocation(Vec::<&str>::new()));
+        assert!(!is_bare_invocation(["clawg", "status"]));
+        assert!(!is_bare_invocation(["clawg", "--help"]));
     }
 
     #[test]

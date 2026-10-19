@@ -653,6 +653,18 @@ async fn a_hook_usage_error_exits_1() {
     }
 }
 
+/// What a client that does not know a hook's `args` runs.
+#[tokio::test]
+async fn a_bare_clawg_exits_1() {
+    let sandbox = Sandbox::new();
+    let out = sandbox.command(&[]).output().expect("run clawg");
+    assert_eq!(out.status.code(), Some(1), "2 would block the client: {}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("Usage"), "{}", stderr_of(&out));
+    assert!(stdout_of(&out).is_empty(), "{}", stdout_of(&out));
+    let typo = sandbox.command(&["statsu"]).output().expect("run clawg");
+    assert_eq!(typo.status.code(), Some(2), "any other usage error stays 2");
+}
+
 #[tokio::test]
 async fn session_start_injects_the_saved_memories() {
     let sandbox = Sandbox::new();
