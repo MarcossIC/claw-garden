@@ -85,11 +85,11 @@ Guardar otra vez exactamente las mismas filas, en el mismo orden, MUST devolver 
 
 ## R4. Un hit por save
 
-La búsqueda (`search_all_memories_inner`, `crates/clawg-core/src/memory/search.rs:1103`) MUST, después de ordenar y antes de cortar en `k`, quedarse con el primer hit de cada save y descartar los demás pedazos de ese save (`collapse_saves`, `search.rs:111`, llamado en `search.rs:1246`; el corte es `search.rs:1252`). Un hit de una fila sin vínculos, o de `episodic_trajectory` o `procedural_skill`, MUST quedar donde está.
+La búsqueda (`search_all_memories_inner`, `crates/clawg-core/src/memory/search.rs:1109`) MUST, después de ordenar y antes de cortar en `k`, quedarse con el primer hit de cada save y descartar los demás pedazos de ese save (`collapse_saves`, `search.rs:111`, llamado en `search.rs:1252`; el corte es `search.rs:1258`). Un hit de una fila sin vínculos, o de `episodic_trajectory` o `procedural_skill`, MUST quedar donde está.
 
 Cada hit de una fila con vínculos MUST llevar su posición y el total de pedazos del save (`RankedHit.piece: Option<PiecePosition>`, `search.rs:89-91`; `PiecePosition`, `search.rs:103`). El descarte corre antes del corte: los lugares que liberan los hermanos los ocupan otras memorias.
 
-El descarte es una función pura sobre los hits y los vínculos de sus filas. Si leer los vínculos falla, la búsqueda MUST devolver los hits sin colapsar y dejar un aviso en el log (`search.rs:1245-1251`): es lo de antes, no un error.
+El descarte es una función pura sobre los hits y los vínculos de sus filas. Si leer los vínculos falla, la búsqueda MUST devolver los hits sin colapsar y dejar un aviso en el log (`search.rs:1251-1257`): es lo de antes, no un error.
 
 #### Escenario: los hermanos no ocupan el top
 - GIVEN un save de 4 pedazos que puntúan 1.º, 2.º, 4.º y 5.º para una consulta, y 10 filas sueltas
@@ -103,7 +103,7 @@ El descarte es una función pura sobre los hits y los vínculos de sus filas. Si
 Un hit con vínculo MUST mostrar `piece=K/N` en su metadato:
 
 - `search_memory` (`crates/clawg-cli/src/mcp/tools.rs:98`): `{rank}. #{id} [{kind}/{type}/t{tier} piece={K}/{N} score={score}] {contenido}`;
-- `recall_context` (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:602-614`): `[YYYY-MM-DD #{id} {type} piece={K}/{N}] {contenido}` para `memory`; las otras tablas llevan su kind antes del tipo, como ya hacían.
+- `recall_context` (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:628-640`): `[YYYY-MM-DD #{id} {type} piece={K}/{N}] {contenido}` para `memory`; las otras tablas llevan su kind antes del tipo, como ya hacían.
 - un hit de otro agente suma ` by <autor>` antes del `]` en los dos ([`specs/sharing`](../sharing/spec.md) R4).
 
 Un hit sin vínculo MUST seguir con el formato de antes. `Hit` en el cliente (`crates/clawg-cli/src/client.rs:163`) MUST leer `piece` con `#[serde(default)]` (`client.rs:179`), así un daemon viejo sigue respondiendo.

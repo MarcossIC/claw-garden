@@ -11,7 +11,7 @@
 | Premisa | Resultado |
 |---|---|
 | Las dos tablas FTS usan `unicode61 remove_diacritics 2` | **Cierta.** `memory_fts` en `crates/clawg-core/migrations/V8__memory_fts.sql:36-43` y `project_doc_fts` en `V12__project_docs.sql:45-48`. La de docs guarda `text` y `project_id UNINDEXED`, sin más columnas. |
-| `_` parte el token y un identificador camelCase queda como uno solo | **Cierta, y el repo ya lo asume.** `holds_identifier` documenta que FTS5 parte en `_` (`search.rs:719-722`). El tokenizador pasa a minúsculas, así que `memoryType` se indexa como `memorytype`; `memory_type` como `memory` y `type`. Una consulta «memory type» no encuentra lo primero y `memoryType` no encuentra lo segundo. |
+| `_` parte el token y un identificador camelCase queda como uno solo | **Cierta, y el repo ya lo asume.** `holds_identifier` documenta que FTS5 parte en `_` (`search.rs:725-728`). El tokenizador pasa a minúsculas, así que `memoryType` se indexa como `memorytype`; `memory_type` como `memory` y `type`. Una consulta «memory type» no encuentra lo primero y `memoryType` no encuentra lo segundo. |
 | La expresión toma hasta 16 tokens unidos con OR, por posición | **Cierta.** `fts_match_expression` (`search.rs:563-571`), `MAX_LEXICAL_TOKENS = 16` (`:543`), comentario que declara «por posición, no por rareza» (`:537-542`). No hay ninguna lista de palabras vacías en el código de recuperación; las únicas son de las herramientas de evaluación (`rag-eval/audit.rs:110`, `golden-mine/synth/vocab.rs:11`). |
 | Docs reusa la misma función | **Cierta, en otra línea.** `project_docs/mod.rs:271` (no 265). La memoria la usa en `lexical_candidates` (`search.rs:660`). Cambiarla cambia los dos canales. |
 | RRF_K = 60, `fuse`, 50 candidatos por canal, KNN partido por proyecto | **Cierta.** `RRF_K` `mod.rs:42`, `CANDIDATES_PER_CHANNEL` `:37`, `fuse` `:243-254`, `search` `:258-305`; partición en `V12__project_docs.sql:36-39`. |
@@ -56,7 +56,7 @@ El protocolo de memoria (22) empuja a los agentes a llamar `search_project` ante
 - `rag-eval --real --docs` y su golden set de 15 preguntas, con Hit@1/3/5 y MRR@10 separados por docs y código (`docs.rs:96-151`). Usa la misma `project_docs::search` que producción (`eval_api.rs:708`), así que mide la ruta real.
 - `check_corpus` (`docs.rs:76-84`): ya falla si un doc esperado falta; es el lugar para que también falle por un doc que cita la pregunta.
 - El patrón de barrido «recompilar con cada valor en un worktree descartable» usado para `RELEVANCE_RATIO` (`verify.md:169`).
-- `fts_tokens` y `identifier_tokens`/`is_identifier` (`search.rs:576`, `:699`, `:712`): extracción pura de identificadores, ya con tests.
+- `fts_tokens` y `identifier_tokens`/`is_identifier` (`search.rs:576`, `:705`, `:718`): extracción pura de identificadores, ya con tests.
 - `plan_refresh` (`mod.rs:104`) y `model_id` en la huella (`project_doc_file.model_id`, `V12:10-18`): un cambio de la cadena reindexa todo sin código extra (`another_model_reindexes_every_doc`, `mod.rs:726`). Es el mecanismo para cualquier cambio de contrato del índice de docs.
 - El índice de docs se deriva del disco y se puede reconstruir (`specs/project-docs`, «Invariantes»): ningún paso toca memorias.
 - `chunk_code` y `header` ya producen etiquetas por contenedor (`code.rs:63`, `:181`).

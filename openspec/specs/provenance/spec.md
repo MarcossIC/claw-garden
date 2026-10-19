@@ -60,7 +60,7 @@ Un evento `chat`, `code_file` o `compaction` MUST sellarse como antes: por el ro
 
 - `GET /v1/disputes` MUST traer la marca de cada lado de cada par pendiente que nombra (`new_mark`, `old_mark` de `OpenPair`, `crates/clawg-core/src/memory/dispute.rs:405-415`).
 - `memory_status` MUST nombrar primero, en cada par, un lado sin marca cuando el otro la tiene, y MUST escribir la marca junto al id del lado que la tiene (`format_open_pairs`, `crates/clawg-cli/src/mcp/tools.rs:162-168`): una inferencia es la que más probablemente cede, aunque el par lo sigue juzgando el agente.
-- ACTIVE CONFLICTS MUST escribir la marca de cada lado que la tiene: en el rótulo cuando imprime su texto (`[AAAA-MM-DD #N disputed inferred] …`) y junto al id cuando lo cita (`format_conflict_block`, `crates/clawg-core/src/memory/prompt_builder.rs:645-678`). No reordena: agrupa por la fila `disputed`, y reordenar rompería el grupo.
+- ACTIVE CONFLICTS MUST escribir la marca de cada lado que la tiene: en el rótulo cuando imprime su texto (`[AAAA-MM-DD #N disputed inferred] …`) y junto al id cuando lo cita (`format_conflict_block`, `crates/clawg-core/src/memory/prompt_builder.rs:671-704`). No reordena: agrupa por la fila `disputed`, y reordenar rompería el grupo.
 - El origen MUST NOT cambiar el estado de un par ni el de sus filas, ni el orden de los pares listados.
 
 #### Escenario: inferencia contra lo dicho

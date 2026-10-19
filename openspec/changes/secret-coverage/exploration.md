@@ -34,7 +34,7 @@
 
 ### 2. `purge` no saca «todo» y saca «de más»
 
-- **a. `workspace.md`.** Si la fila purgada era una preferencia, decisión o procedimiento elegible, su texto está en la sección AUTO de `workspaces/<agente>/<proyecto>/workspace.md`, que se regenera sólo en `recall_context`. `purge` corre con el daemon parado y sin `MemoryStore`. La sección USER es del usuario y nunca se reescribe (`assemble_file`, `workspace.rs:494-584`); puede tener el texto, y sólo se la puede **nombrar**. La copia de un archivo legado a un id de proyecto nuevo nunca mueve el original (`workspace.rs:50-55`), así que el texto puede estar en dos archivos.
+- **a. `workspace.md`.** Si la fila purgada era una preferencia, decisión o procedimiento elegible, su texto está en la sección AUTO de `workspaces/<agente>/<proyecto>/workspace.md`, que se regenera sólo en `recall_context`. `purge` corre con el daemon parado y sin `MemoryStore`. La sección USER es del usuario y nunca se reescribe (`assemble_file`, `workspace.rs:497-587`); puede tener el texto, y sólo se la puede **nombrar**. La copia de un archivo legado a un id de proyecto nuevo nunca mueve el original (`workspace.rs:50-55`), así que el texto puede estar en dos archivos.
 - **b. Subcadena entre agentes.** Un texto corto (`use pnpm`) borra todo save pendiente o `failed` de **cualquier** agente que lo contenga: saves aceptados con `201`/`202` que se pierden sin aviso. Es el mismo contrato que dice «no se pierde nada de lo aceptado» (`.claude/CLAUDE.md`, sección del outbox).
 - **c. Cabecera de un save largo** (backlog de `openspec/README.md`). `memory_piece.context` guarda el principio del save (`V11__memory_piece.sql:4-8`, `:11-16`); `purge` no toca esa tabla (`secrets.rs:103-111`), así que purgar el pedazo 1 deja sus primeros tokens en los vínculos de los pedazos 2..N.
 - **d. Fila `failed` del outbox sin salida** (backlog). Nada la reintenta ni la descarta (`outbox.rs:300-317` sólo la marca). No es un problema de secretos por sí mismo, pero el `last_error` (`IngestFailure::Failed(format!("embed failed: {e}"))`, `worker.rs:766`, `:803`) puede citar el error de una librería; **no se verificó que cite el contenido**, y habría que comprobarlo con un fallo provocado.
@@ -120,7 +120,7 @@ Resultado: **una** columna con texto libre del usuario o el agente que nunca se 
 - **topic-revisions (27) y revision-aware-delete (49), archivados.** Definen la cadena de `superseded`, `supersede_cause` y la revival que O reutiliza (`revival.rs`, `admin.rs:355`).
 - **outbox-lifecycle (53).** Toca el outbox que `purge` también borra; coordinar G con lo que 53 decida sobre filas `failed`. Comparten la pregunta «qué hay en el store que no debería».
 - **project-clone-identity (30).** Hace re-key de ids; el archivo legado de `workspace.md` es otro lugar que `purge` debe nombrar.
-- **Ya arreglado (`92cee20`):** un `project_id` ya no coloca un `workspace.md` fuera de la carpeta de su agente (`project_segment`, `workspace.rs:639`). No hace falta para D.
+- **Ya arreglado (`92cee20`):** un `project_id` ya no coloca un `workspace.md` fuera de la carpeta de su agente (`project_segment`, `workspace.rs:642`). No hace falta para D.
 - **Índice de docs.** Se re-lee por sha256 o modelo, no por cambio de regla (como en 42): un pasaje viejo queda con la regla vieja. Es derivado y no destruye nada del usuario; se acepta.
 
 ## Alcance candidato
