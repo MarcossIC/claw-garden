@@ -36,7 +36,7 @@ Design documents live in `docs/`.
 - `clawg status [--profile P]`: print daemon state and health as JSON; exit 1 if not running.
 - `clawg stop [--profile P]`: stop the daemon and wait for the process to exit.
 - `clawg backup [--profile P]`: write a snapshot of `memory.db` to `<data>/backups` and print its path; goes through the daemon when one is running.
-- `clawg restore <FILE> [--profile P]`: replace `memory.db` with a snapshot. The daemon must be stopped; the replaced store is snapshotted first.
+- `clawg restore <FILE> [--profile P]`: replace `memory.db` with a snapshot. The daemon must be stopped; the replaced store is snapshotted first. A file with a non-empty `-wal` beside it is refused, since only the file is copied in.
 - `clawg secrets [--profile P]`: list the `memory` rows, live or deleted, that hold a secret of a known format, by id and kind and never the secret. Read-only; works with the daemon running.
 - `clawg purge <ID> --yes [--profile P]`: remove one `memory` row for good (text, vector, index terms, outbox rows holding its text, free pages and WAL) and name the backups that still hold it. A conclusion drawn from it keeps the link to its id, which `synthesize` lists as `purged`. The daemon must be stopped; no snapshot is taken.
 - `clawg undelete <ID> [--profile P]`: bring back a deleted `memory` row through the running daemon, which embeds it again; refused when the same text was saved again since, when a live row of another save holds its `topic_key` (not one its own delete brought back), or the row holds a secret; it prints what it supersedes again and the rows saved meanwhile it was paired with.
