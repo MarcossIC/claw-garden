@@ -68,6 +68,34 @@ fn reach_bind(agent_id: &str, reach: &Reach) -> String {
     value.to_string()
 }
 
+/// The reach predicate on the author column `$author`, over the object
+/// [`reach_bind`] binds to `$param`. Every query that reads by reach spells it
+/// through here, so no copy can drift, and a test holds [`Reach::admits`] to
+/// the same rule.
+macro_rules! reach_predicate {
+    ($author:literal, $param:literal) => {
+        concat!(
+            "(", $author, " = (", $param, " ->> '$.reader') OR ((", $param, " ->> '$.hidden') IS NOT NULL AND ",
+            $author, " NOT IN (SELECT value FROM json_each(", $param, ", '$.hidden'))))"
+        )
+    };
+}
+
+/// The project predicate of `memory` rows under the column prefix `$m`
+/// (`"m."`, or `""` without an alias), for the project bound to `$param`: no
+/// project reads every row; a project reads its own, the rows without one and
+/// every `user_preference`, which describes the person and follows them from
+/// project to project.
+macro_rules! memory_project_predicate {
+    ($m:literal, $param:literal) => {
+        concat!(
+            "(", $param, " IS NULL OR ", $m, "project_id = ", $param, " OR ", $m, "project_id IS NULL OR ",
+            $m, "memory_type = 'user_preference')"
+        )
+    };
+}
+pub(crate) use memory_project_predicate;
+
 /// One result row, scored by `score::score`.
 ///
 /// `Serialize` because the `clawg serve` daemon answers retrieval requests
@@ -208,7 +236,8 @@ pub fn serialize_f32_query_pub(v: &[f32]) -> Vec<u8> {
 // `last_accessed_at` and `importance` straight off these rows instead of a
 // SQL-computed column. Rows still arrive in vec0's own distance order, not
 // score order — `knn_one` is what turns this into a score-ordered result.
-const SEARCH_SQL_MEMORY: &str = "
+const SEARCH_SQL_MEMORY: &str = concat!(
+    "
     SELECT m.id, m.content, m.memory_type, m.tier, m.status, knn.distance,
         m.created_at, m.last_accessed_at, m.importance, m.agent_id, m.topic_key
     FROM memory_vectors knn
@@ -217,15 +246,21 @@ const SEARCH_SQL_MEMORY: &str = "
       AND knn.k = ?2
       AND m.status IN ('active', 'disputed')
       AND m.deleted_at IS NULL
-      AND (m.agent_id = (?3 ->> '$.reader') OR ((?3 ->> '$.hidden') IS NOT NULL AND m.agent_id NOT IN (SELECT value FROM json_each(?3, '$.hidden'))))
-      AND (?4 IS NULL OR m.project_id = ?4 OR m.project_id IS NULL OR m.memory_type = 'user_preference')
-";
+      AND ",
+    reach_predicate!("m.agent_id", "?3"),
+    "
+      AND ",
+    memory_project_predicate!("m.", "?4"),
+    "
+"
+);
 
 // SQL for episodic table KNN. The 0.0077 lambda this table always used no
 // longer lives here — it is `DecayLambdas.episode` in score.rs, reached
 // through `lambda_for` dispatching on `TableKind::Episodic` rather than on
 // the `'episode'` string this query still selects for display.
-const SEARCH_SQL_EPISODIC: &str = "
+const SEARCH_SQL_EPISODIC: &str = concat!(
+    "
     SELECT epi.id, epi.task, 'episode' AS memory_type, epi.tier, epi.status, knn.distance,
         epi.created_at, epi.last_accessed_at, epi.importance, epi.agent_id, NULL
     FROM episodic_vectors knn
@@ -234,13 +269,17 @@ const SEARCH_SQL_EPISODIC: &str = "
       AND knn.k = ?2
       AND epi.status IN ('active', 'disputed')
       AND epi.deleted_at IS NULL
-      AND (epi.agent_id = (?3 ->> '$.reader') OR ((?3 ->> '$.hidden') IS NOT NULL AND epi.agent_id NOT IN (SELECT value FROM json_each(?3, '$.hidden'))))
+      AND ",
+    reach_predicate!("epi.agent_id", "?3"),
+    "
       AND (?4 IS NULL OR epi.project_id = ?4 OR epi.project_id IS NULL)
-";
+"
+);
 
 // SQL for procedural table KNN. Same as episodic: 0.0039 now lives in
 // `DecayLambdas.procedure`, dispatched by `TableKind::Procedural`.
-const SEARCH_SQL_PROCEDURAL: &str = "
+const SEARCH_SQL_PROCEDURAL: &str = concat!(
+    "
     SELECT pro.id, pro.skill_name, 'procedure' AS memory_type, pro.tier, pro.status, knn.distance,
         pro.created_at, pro.last_accessed_at, pro.importance, pro.agent_id, NULL
     FROM procedural_vectors knn
@@ -249,9 +288,12 @@ const SEARCH_SQL_PROCEDURAL: &str = "
       AND knn.k = ?2
       AND pro.status IN ('active', 'disputed')
       AND pro.deleted_at IS NULL
-      AND (pro.agent_id = (?3 ->> '$.reader') OR ((?3 ->> '$.hidden') IS NOT NULL AND pro.agent_id NOT IN (SELECT value FROM json_each(?3, '$.hidden'))))
+      AND ",
+    reach_predicate!("pro.agent_id", "?3"),
+    "
       AND (?4 IS NULL OR pro.project_id = ?4 OR pro.project_id IS NULL)
-";
+"
+);
 
 // How many rows THIS caller could receive at most, counted up to a ceiling of
 // `?1` (the pool size) because nothing above that changes any decision.
@@ -266,38 +308,52 @@ const SEARCH_SQL_PROCEDURAL: &str = "
 //
 // The LIMIT stops the count at k rather than walking every row the caller
 // may read.
-const ELIGIBLE_SQL_MEMORY: &str = "
+const ELIGIBLE_SQL_MEMORY: &str = concat!(
+    "
     SELECT COUNT(*) FROM (
         SELECT m.id FROM memory m
         WHERE m.status IN ('active', 'disputed')
           AND m.deleted_at IS NULL
-          AND (m.agent_id = (?2 ->> '$.reader') OR ((?2 ->> '$.hidden') IS NOT NULL AND m.agent_id NOT IN (SELECT value FROM json_each(?2, '$.hidden'))))
-          AND (?3 IS NULL OR m.project_id = ?3 OR m.project_id IS NULL OR m.memory_type = 'user_preference')
+          AND ",
+    reach_predicate!("m.agent_id", "?2"),
+    "
+          AND ",
+    memory_project_predicate!("m.", "?3"),
+    "
         LIMIT ?1
     )
-";
+"
+);
 
-const ELIGIBLE_SQL_EPISODIC: &str = "
+const ELIGIBLE_SQL_EPISODIC: &str = concat!(
+    "
     SELECT COUNT(*) FROM (
         SELECT epi.id FROM episodic_trajectory epi
         WHERE epi.status IN ('active', 'disputed')
           AND epi.deleted_at IS NULL
-          AND (epi.agent_id = (?2 ->> '$.reader') OR ((?2 ->> '$.hidden') IS NOT NULL AND epi.agent_id NOT IN (SELECT value FROM json_each(?2, '$.hidden'))))
+          AND ",
+    reach_predicate!("epi.agent_id", "?2"),
+    "
           AND (?3 IS NULL OR epi.project_id = ?3 OR epi.project_id IS NULL)
         LIMIT ?1
     )
-";
+"
+);
 
-const ELIGIBLE_SQL_PROCEDURAL: &str = "
+const ELIGIBLE_SQL_PROCEDURAL: &str = concat!(
+    "
     SELECT COUNT(*) FROM (
         SELECT pro.id FROM procedural_skill pro
         WHERE pro.status IN ('active', 'disputed')
           AND pro.deleted_at IS NULL
-          AND (pro.agent_id = (?2 ->> '$.reader') OR ((?2 ->> '$.hidden') IS NOT NULL AND pro.agent_id NOT IN (SELECT value FROM json_each(?2, '$.hidden'))))
+          AND ",
+    reach_predicate!("pro.agent_id", "?2"),
+    "
           AND (?3 IS NULL OR pro.project_id = ?3 OR pro.project_id IS NULL)
         LIMIT ?1
     )
-";
+"
+);
 
 /// vec0 refuses to bind a `k` above this — it is the engine's own ceiling, not
 /// a policy choice made here. A widened window has to be clamped to it, or the
@@ -672,27 +728,29 @@ pub(crate) fn viewer_match_expression(query_text: &str) -> Option<String> {
 // vtab is the lowest rowids: the oldest memories, close to the worst
 // possible selection for a candidate budget.
 //
-// The live-status and scope predicates are copied verbatim from
-// `SEARCH_SQL_MEMORY`, including the `?3 IS NULL` tautology (an unscoped
-// caller's row set stays untouched) and the `user_preference` exemption. They
-// run here, before the `LIMIT`, so the budget is spent on candidates the
-// caller can be shown — a row it may not see never occupies one of the `?4`
-// slots. That includes the `superseded` versions of a topic: `memory_fts`
-// drops a row only when it is deleted, and those versions read almost like
-// the current one. Dropping the `user_preference` disjunct would make this
-// channel stricter than the dense one about which project-scoped rows are
-// allowed through.
-const LEXICAL_CANDIDATE_SQL: &str = "
+// The live-status and scope predicates are those of `SEARCH_SQL_MEMORY`, the
+// scope ones from the same macros. They run here, before the `LIMIT`, so the
+// budget is spent on candidates the caller can be shown — a row it may not
+// see never occupies one of the `?4` slots. That includes the `superseded`
+// versions of a topic: `memory_fts` drops a row only when it is deleted, and
+// those versions read almost like the current one.
+const LEXICAL_CANDIDATE_SQL: &str = concat!(
+    "
     SELECT memory_fts.rowid FROM memory_fts
     JOIN memory m ON m.id = memory_fts.rowid
     WHERE memory_fts MATCH ?1
       AND m.status IN ('active', 'disputed')
       AND m.deleted_at IS NULL
-      AND (m.agent_id = (?2 ->> '$.reader') OR ((?2 ->> '$.hidden') IS NOT NULL AND m.agent_id NOT IN (SELECT value FROM json_each(?2, '$.hidden'))))
-      AND (?3 IS NULL OR m.project_id = ?3 OR m.project_id IS NULL OR m.memory_type = 'user_preference')
+      AND ",
+    reach_predicate!("m.agent_id", "?2"),
+    "
+      AND ",
+    memory_project_predicate!("m.", "?3"),
+    "
     ORDER BY bm25(memory_fts)
     LIMIT ?4
-";
+"
+);
 
 /// Hard ceiling on how many candidate rowids one lexical search may carry
 /// into the scoring query, whatever budget the caller asked for.
@@ -812,16 +870,22 @@ fn holds_identifier(content: &str, identifier: &str) -> bool {
 // live-status and `deleted_at` predicates run before the `LIMIT`: a row the
 // caller cannot be shown must not use up the budget that decides whether
 // the identifier is rare enough to reward.
-const IDENTIFIER_MATCH_SQL: &str = "
+const IDENTIFIER_MATCH_SQL: &str = concat!(
+    "
     SELECT memory_fts.rowid, m.content FROM memory_fts
     JOIN memory m ON m.id = memory_fts.rowid
     WHERE memory_fts MATCH ?1
       AND m.status IN ('active', 'disputed')
       AND m.deleted_at IS NULL
-      AND (m.agent_id = (?2 ->> '$.reader') OR ((?2 ->> '$.hidden') IS NOT NULL AND m.agent_id NOT IN (SELECT value FROM json_each(?2, '$.hidden'))))
-      AND (?3 IS NULL OR m.project_id = ?3 OR m.project_id IS NULL OR m.memory_type = 'user_preference')
+      AND ",
+    reach_predicate!("m.agent_id", "?2"),
+    "
+      AND ",
+    memory_project_predicate!("m.", "?3"),
+    "
     LIMIT ?4
-";
+"
+);
 
 /// Ids of the `memory` rows that hold every identifier in `query_text`, or
 /// none at all when more rows than `budget` hold them: a name many rows share
@@ -964,7 +1028,8 @@ async fn identifier_matches(
 // not hypothetical: this query passed its own parity test with
 // `vec_distance_l1` substituted here, and every other test with it, until
 // that fixture was rebuilt to differ in more than one coordinate.
-const LEXICAL_SCORE_SQL_PREFIX: &str = "
+const LEXICAL_SCORE_SQL_PREFIX: &str = concat!(
+    "
     SELECT m.id, m.content, m.memory_type, m.tier, m.status,
         vec_distance_l2(v.embedding, ?1) AS distance,
         m.created_at, m.last_accessed_at, m.importance, m.agent_id, m.topic_key
@@ -972,9 +1037,14 @@ const LEXICAL_SCORE_SQL_PREFIX: &str = "
     JOIN memory m NOT INDEXED ON m.id = v.rowid
     WHERE m.status IN ('active', 'disputed')
       AND m.deleted_at IS NULL
-      AND (m.agent_id = (?2 ->> '$.reader') OR ((?2 ->> '$.hidden') IS NOT NULL AND m.agent_id NOT IN (SELECT value FROM json_each(?2, '$.hidden'))))
-      AND (?3 IS NULL OR m.project_id = ?3 OR m.project_id IS NULL OR m.memory_type = 'user_preference')
-";
+      AND ",
+    reach_predicate!("m.agent_id", "?2"),
+    "
+      AND ",
+    memory_project_predicate!("m.", "?3"),
+    "
+"
+);
 
 /// Builds the `m.id IN (...)` placeholder list for `n` ids, explicitly
 /// numbered starting at `?4` (`LEXICAL_SCORE_SQL_PREFIX` already claims
@@ -5100,6 +5170,22 @@ mod tests {
 
         assert_eq!(ids_and_pieces(&collapsed), vec![(3, None), (11, None), (2, Some((1, 2))), (1, None)]);
         assert_eq!(collapsed[1].kind, TableKind::Episodic);
+    }
+
+    /// `Reach::admits` and the SQL predicate are two spellings of one rule:
+    /// LAST SESSION and the last check on the hits read the first, every query
+    /// the second.
+    #[test]
+    fn the_reach_predicate_agrees_with_admits() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let sql = concat!("SELECT count(*) FROM (SELECT ?2 AS agent_id) t WHERE ", reach_predicate!("t.agent_id", "?1"));
+        let all_but = |names: &[&str]| Reach::AllBut(names.iter().map(|n| n.to_string()).collect());
+        for reach in [Reach::Own, all_but(&[]), all_but(&["b"]), all_but(&["b", "c"])] {
+            for author in ["a", "b", "c"] {
+                let in_sql: i64 = conn.query_row(sql, params![reach_bind("a", &reach), author], |r| r.get(0)).unwrap();
+                assert_eq!(in_sql == 1, reach.admits("a", author), "{reach:?} reading a row of {author}");
+            }
+        }
     }
 
     #[test]

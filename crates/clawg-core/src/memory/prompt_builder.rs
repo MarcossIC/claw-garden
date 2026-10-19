@@ -11,7 +11,7 @@ use crate::memory::{
     admin::MemoryKind,
     clock::TimestampMs,
     embedder::{EmbedError, EmbedRole, Embedder},
-    search::{search_all_memories, RankedHit, SearchScope},
+    search::{memory_project_predicate, search_all_memories, RankedHit, SearchScope},
     sharing::Reach,
     workspace::{EmittedIds, WorkspaceManager},
     MemoryError, MemoryStore, TableKind,
@@ -801,17 +801,21 @@ async fn fetch_last_session(
 /// rows of their own, and they fold into one line. The pieces of a save share
 /// its stamp and are inserted in order, so `id ASC` within a stamp keeps the
 /// opening of a save the pool's cut falls inside.
-const RECENT_ROWS_SQL: &str = "
+const RECENT_ROWS_SQL: &str = concat!(
+    "
     SELECT id, content, memory_type, tier, status, created_at, agent_id, topic_key
     FROM memory
     WHERE status IN ('active', 'disputed')
       AND deleted_at IS NULL
       AND agent_id = ?1
-      AND (?2 IS NULL OR project_id = ?2 OR project_id IS NULL OR memory_type = 'user_preference')
+      AND ",
+    memory_project_predicate!("", "?2"),
+    "
       AND created_at >= ?3
     ORDER BY created_at DESC, id ASC
     LIMIT ?4
-";
+"
+);
 const RECENT_ROW_POOL: i64 = 200;
 
 async fn fetch_recent_rows(
