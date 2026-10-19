@@ -485,7 +485,7 @@ Registra `clawg-dev` con la ruta de ese binario y sus hooks con `--profile dev`;
 - Perfil `dev`: datos en `~/.clawg-dev`, puerto por defecto 27381.
 - Perfil `prod`: datos en `~/.clawg`, puerto por defecto 27380.
 
-El perfil sale de `--profile dev|prod`, luego de la variable de entorno `CLAWG_PROFILE`, y por último del tipo de build (debug es `dev`, release es `prod`). Un build debug rechaza `prod`, así que nunca puede tocar `~/.clawg`. El daemon escucha sólo en 127.0.0.1; los endpoints `/v1` exigen un token bearer guardado en el directorio de datos.
+El perfil sale de `--profile dev|prod`, luego de la variable de entorno `CLAWG_PROFILE`, y por último del tipo de build (debug es `dev`, release es `prod`). Un build debug rechaza `prod`, así que nunca puede tocar `~/.clawg`. El daemon escucha sólo en 127.0.0.1; los endpoints `/v1` exigen un token bearer guardado en el directorio de datos (en Unix, con permisos 0600 desde que se crea). Toda ruta, `/health` incluida, responde 403 a una petición dirigida a un nombre que no sea `127.0.0.1`, `localhost` o `[::1]`, o que traiga una cabecera `Origin`: así una página web abierta en el navegador no llega al daemon, ni con DNS rebinding. No es una barrera contra un proceso del mismo usuario, que puede leer el token.
 
 Cada directorio de datos contiene la base SQLite de memoria, `daemon.json` (pid, puerto, versión), `token`, y `memory.lock` / `memory.owner`, que garantizan que un único proceso sea dueño del almacén. Si se excluyó algo con `clawg sharing`, también `sharing.json`.
 
