@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use clawg_cli::daemon::api::{router, AppCtx, SAVE_CONFIRM_TIMEOUT};
+use clawg_cli::daemon::api::{router, AppCtx, MAX_CONTENT_BYTES, SAVE_CONFIRM_TIMEOUT};
 use clawg_core::memory::bootstrap::EmbedderStatus;
 use clawg_core::memory::embedder::{EmbedError, EmbedRole, Embedder, FakeEmbedder};
 use clawg_core::memory::idle_embedder::{IdleEmbedder, ReloadFn};
@@ -1120,6 +1120,32 @@ async fn saving_empty_content_is_rejected_before_it_reaches_the_queue() {
             "the error must name the offending field: {body}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_save_over_the_content_limit_is_refused_before_the_outbox() {
+    let h = Harness::start_without_worker().await;
+    let (status, body) = h
+        .post_json("/v1/memories", json!({ "content": "x".repeat(MAX_CONTENT_BYTES + 1), "agent_id": "a" }))
+        .await;
+
+    assert_eq!(status, 400, "{body}");
+    let message = body["error"].as_str().expect("error");
+    assert!(message.starts_with(&format!("content is {} bytes; at most {MAX_CONTENT_BYTES}", MAX_CONTENT_BYTES + 1)), "{message}");
+    assert!(outbox(&h).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_save_at_the_content_limit_is_stored() {
+    let h = Harness::start().await;
+    let words: Vec<String> = (0..MAX_CONTENT_BYTES / 7).map(|i| format!("w{i:05}")).collect();
+    let mut content = format!("Notes on the ledger crate. {}", words.join(" "));
+    content.truncate(MAX_CONTENT_BYTES);
+
+    let (status, body) = h.post_json("/v1/memories", json!({ "content": content, "agent_id": "a" })).await;
+
+    assert!(status == 201 || status == 202, "{status} {body}");
+    assert!(h.wait_for_rows("memory", 2).await.len() >= 2, "a long save is stored in pieces");
 }
 
 #[tokio::test]
