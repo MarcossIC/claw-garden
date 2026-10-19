@@ -76,35 +76,50 @@ pub fn generate_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Tightens `path` to owner-only (`0600`) on Unix.
+/// Creates `path` as a new, empty file that is owner-only (`0600`) on Unix from
+/// the moment it exists.
 ///
-/// A no-op on Windows, and deliberately so rather than an error: the file lives
-/// under the user's home directory, whose ACL already excludes other
-/// non-administrator users by default, and NTFS has no mode bits to set. An
-/// administrator can read it either way — on Unix too, where root ignores 0600
-/// — so the platforms end up with the same practical guarantee by different
-/// means.
+/// The previous file is removed rather than truncated: opening an existing file
+/// keeps its mode (an older clawg created these under the umask and only then
+/// tightened them), and anyone who already held it open would read what is
+/// written next.
+///
+/// Windows gets no explicit ACL, deliberately: the file lives under the user's
+/// home directory, whose ACL already excludes other non-administrator users by
+/// default, and NTFS has no mode bits to set. An administrator can read it
+/// either way — on Unix too, where root ignores 0600 — so the platforms end up
+/// with the same practical guarantee by different means. There the file is
+/// truncated in place: a removed file another process still has open stays
+/// pending deletion and would refuse the new one.
 #[cfg(unix)]
-fn restrict_to_owner(path: &Path) -> Result<(), LifecycleError> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+fn create_owner_only(path: &Path) -> Result<File, LifecycleError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(io_err(path)(e)),
+        _ => {}
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
         .map_err(io_err(path))
 }
 
 #[cfg(not(unix))]
-fn restrict_to_owner(_path: &Path) -> Result<(), LifecycleError> {
-    Ok(())
+fn create_owner_only(path: &Path) -> Result<File, LifecycleError> {
+    File::create(path).map_err(io_err(path))
 }
 
 /// Writes `<base_dir>/daemon.json`.
+///
+/// Owner-only too, even though it holds no secret: it names a pid and a port
+/// another local user has no business enumerating.
 pub fn write_state(base_dir: &Path, state: &DaemonState) -> Result<(), LifecycleError> {
     let path = daemon_state_file(base_dir);
     let json = serde_json::to_string_pretty(state)?;
-    let mut f = File::create(&path).map_err(io_err(&path))?;
-    f.write_all(json.as_bytes()).map_err(io_err(&path))?;
-    // 0600 on the state file too, even though it holds no secret: it names a
-    // pid and a port another local user has no business enumerating.
-    restrict_to_owner(&path)
+    let mut f = create_owner_only(&path)?;
+    f.write_all(json.as_bytes()).map_err(io_err(&path))
 }
 
 /// Reads `<base_dir>/daemon.json`, or `None` when it is missing or unparseable.
@@ -121,9 +136,8 @@ pub fn read_state(base_dir: &Path) -> Option<DaemonState> {
 /// Writes `<base_dir>/token` with owner-only permissions.
 pub fn write_token(base_dir: &Path, token: &str) -> Result<(), LifecycleError> {
     let path = token_file(base_dir);
-    let mut f = File::create(&path).map_err(io_err(&path))?;
-    f.write_all(token.as_bytes()).map_err(io_err(&path))?;
-    restrict_to_owner(&path)
+    let mut f = create_owner_only(&path)?;
+    f.write_all(token.as_bytes()).map_err(io_err(&path))
 }
 
 /// Reads `<base_dir>/token`, trimmed. `None` when missing or empty.
@@ -260,5 +274,58 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600, "token must not be group/world readable");
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+    }
+
+    /// The mode has to hold from the moment the file exists, not after a later
+    /// `chmod`: between the two, whatever is written can be read under the
+    /// process umask.
+    #[cfg(unix)]
+    #[test]
+    fn a_created_file_is_owner_only_before_anything_is_written() {
+        let dir = tmp();
+        let path = dir.path().join("token");
+        let _file = create_owner_only(&path).expect("create");
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_old_world_readable_token_is_replaced_by_an_owner_only_file() {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp();
+        let path = dir.path().join("token");
+        std::fs::write(&path, b"old").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let mut held_open = File::open(&path).expect("open");
+
+        write_token(dir.path(), "new").expect("write token");
+
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(read_token(dir.path()), Some("new".to_string()));
+        let mut seen = String::new();
+        held_open.read_to_string(&mut seen).expect("read");
+        assert_eq!(seen, "old", "a handle opened before must not see the new token");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_file_is_owner_only_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp();
+        let path = dir.path().join("daemon.json");
+        std::fs::write(&path, b"{}").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        write_state(dir.path(), &sample_state()).expect("write state");
+
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(read_state(dir.path()), Some(sample_state()));
     }
 }

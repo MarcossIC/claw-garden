@@ -4,8 +4,8 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción o por no c
 
 ## 1. El token y `daemon.json` nacen en 0600 (R5)
 
-- [ ] Tests primero en `lifecycle.rs`: `a_created_file_is_owner_only_before_anything_is_written`, `an_old_world_readable_token_is_replaced_by_an_owner_only_file`, `state_file_is_owner_only_on_unix`.
-- [ ] `create_owner_only` (borra el anterior y crea con `create_new` y modo 0600); `write_token` y `write_state` la usan; `restrict_to_owner` se va.
+- [x] Tests primero en `lifecycle.rs`: `a_created_file_is_owner_only_before_anything_is_written`, `an_old_world_readable_token_is_replaced_by_an_owner_only_file`, `state_file_is_owner_only_on_unix`.
+- [x] `create_owner_only` (borra el anterior y crea con `create_new` y modo 0600); `write_token` y `write_state` la usan; `restrict_to_owner` se va.
 - Commit: `fix(cli): create the token and daemon.json owner-only from the start`
 
 ## 2. La decisión pura y el registro con tope (R1, R4)

@@ -61,6 +61,7 @@ En Unix, `write_token` y `write_state` (`crates/clawg-cli/src/daemon/lifecycle.r
 #### Escenario: un token anterior legible por todos
 - GIVEN `<data>/token` con modo 0644
 - WHEN el daemon escribe su token
-- THEN `<data>/token` tiene modo 0600, es otro archivo (otro inodo) y guarda el token nuevo
+- THEN `<data>/token` tiene modo 0600 y guarda el token nuevo
+- AND quien tenía abierto el archivo anterior sigue leyendo el token viejo
 
 **Tests:** `a_created_file_is_owner_only_before_anything_is_written`, `an_old_world_readable_token_is_replaced_by_an_owner_only_file`, `state_file_is_owner_only_on_unix` (`lifecycle.rs`, mod tests, Unix).
