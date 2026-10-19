@@ -3436,6 +3436,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_revision_records_why_it_replaced() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let old = only_id(&save(&store, &keyed("Storage engine is SQLite", "storage/engine")).await);
+        let new = only_id(&save(&store, &keyed("Storage engine moved to Postgres", "storage/engine")).await);
+
+        let causes: Vec<Option<String>> = store
+            .conn
+            .call(move |c| {
+                let mut stmt = c.prepare("SELECT supersede_cause FROM memory WHERE id IN (?1, ?2) ORDER BY id")?;
+                let rows = stmt.query_map([old, new], |r| r.get(0))?.collect();
+                rows
+            })
+            .await
+            .unwrap();
+        assert_eq!(causes, vec![Some("revision".to_string()), None]);
+    }
+
+    #[tokio::test]
     async fn a_search_hit_carries_its_topic_key() {
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
         let text = "Storage engine is SQLite\nChosen for a single local file.";

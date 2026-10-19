@@ -2741,6 +2741,81 @@ async fn restore_refuses_a_row_whose_topic_is_live_again() {
 }
 
 #[tokio::test]
+async fn deleting_the_current_revision_answers_what_it_revived() {
+    let h = Harness::start().await;
+    let save = |content: &str| json!({ "content": content, "agent_id": "a", "topic_key": "storage/engine" });
+    let old = save_id(&h, save(CONTENT)).await;
+    let current = save_id(&h, save("Storage engine moved to Postgres")).await;
+    assert!(!finds(&h, "a", old).await, "the revision replaced it");
+
+    let (status, body) =
+        h.send(h.http.delete(h.url(&format!("/v1/memories/memory/{current}?agent=a")))).await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["revived"][0]["id"].as_i64(), Some(old), "{body}");
+    assert_eq!(body["revived"][0]["kind"], "memory", "{body}");
+    assert!(body.get("hidden").is_none(), "{body}");
+    assert!(finds(&h, "a", old).await, "the version before is current again");
+
+    let (status, body) = h.restore("memory", current, Some("a")).await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["topic_key"], "storage/engine", "{body}");
+    assert_eq!(body["replaced"][0]["id"].as_i64(), Some(old), "{body}");
+    assert!(!finds(&h, "a", old).await, "the restore replaced it again");
+}
+
+/// `v` normalized, as the store keeps it.
+fn unit(v: &[f32]) -> Vec<f32> {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    v.iter().map(|x| x / norm).collect()
+}
+
+#[tokio::test]
+async fn a_restore_answers_its_key_and_its_new_pairs() {
+    let h = Harness::start().await;
+    let text = "Storage engine is SQLite";
+    let restored = save_id(&h, json!({ "content": text, "agent_id": "a", "topic_key": "storage/engine" })).await;
+    h.delete_row(restored).await;
+    let newer = save_id(&h, json!({ "content": "the store keeps one local file", "agent_id": "a" })).await;
+    // The fake model places unrelated texts far apart; this puts the newer
+    // row inside the detector's band of the restored one.
+    let a = unit(&FakeEmbedder::default().embed_with_role(text, EmbedRole::Passage).await.unwrap());
+    let e = unit(&FakeEmbedder::default().embed_with_role("another direction", EmbedRole::Passage).await.unwrap());
+    let along: f32 = a.iter().zip(&e).map(|(x, y)| x * y).sum();
+    let across = unit(&e.iter().zip(&a).map(|(y, x)| y - along * x).collect::<Vec<_>>());
+    let angle = 2.0 * (0.3f32 / 2.0).asin();
+    let near: Vec<u8> = a
+        .iter()
+        .zip(&across)
+        .map(|(x, y)| x * angle.cos() + y * angle.sin())
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    h.ctx
+        .runtime
+        .store
+        .conn
+        .call(move |c| {
+            c.execute("UPDATE memory SET memory_type = 'semantic_fact' WHERE id = ?1", [restored])?;
+            c.execute("UPDATE memory SET memory_type = 'semantic_fact' WHERE id = ?1", [newer])?;
+            c.execute("UPDATE memory_vectors SET embedding = ?2 WHERE rowid = ?1", rusqlite::params![newer, near])
+        })
+        .await
+        .expect("place");
+
+    let (status, body) = h.restore("memory", restored, Some("a")).await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["topic_key"], "storage/engine", "{body}");
+    assert_eq!(
+        body["related"],
+        json!([{ "kind": "memory", "id": newer, "escalated": false, "excerpt": "the store keeps one local file" }]),
+        "{body}"
+    );
+    assert!(body.get("replaced").is_none() && body.get("superseded_by_deleted").is_none(), "{body}");
+}
+
+#[tokio::test]
 async fn listing_deleted_rows_shows_only_them_newest_deletion_first() {
     let h = Harness::start().await;
     let kept = save_id(&h, json!({ "content": "the go service uses tabs", "agent_id": "a" })).await;

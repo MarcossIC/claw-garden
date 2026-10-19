@@ -1,14 +1,14 @@
 change: revision-aware-delete
 objective: "1"
 depends_on: [recoverable-delete, conflict-candidates, topic-revisions]
-phase: explore
+phase: verify
 artifacts:
   exploration: done
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
-  apply: pending
-  verify: pending
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: partial  # Linux y el binario real en un home temporal; faltan Windows y el perfil dev
   archive: pending
-updated: 2026-10-18
+updated: 2026-10-19

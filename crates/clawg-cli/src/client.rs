@@ -406,12 +406,37 @@ pub struct Updated {
 }
 
 /// How a restored row ended up. A `superseded` one is live but still left out
-/// of searches.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// of searches. Every field after `superseded_by` is absent from a daemon
+/// that predates them.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct Restored {
     pub id: i64,
     pub status: String,
     pub superseded_by: Option<i64>,
+    #[serde(default)]
+    pub topic_key: Option<String>,
+    /// The rows its delete had brought back, superseded by it again.
+    #[serde(default)]
+    pub replaced: Vec<ReplacedMemory>,
+    /// The row that supersedes it is deleted too.
+    #[serde(default)]
+    pub superseded_by_deleted: bool,
+    /// Rows saved while it was deleted that the detector paired with it.
+    #[serde(default)]
+    pub related: Vec<RelatedMemory>,
+}
+
+/// What `DELETE /v1/memories/{kind}/{id}` did. `revived` and `hidden` are
+/// absent from a daemon that predates them.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct Deleted {
+    pub deleted: usize,
+    /// The version of a topic the deleted row had replaced, current again.
+    #[serde(default)]
+    pub revived: Vec<ReplacedMemory>,
+    /// Rows a verdict replaced by the deleted row, still superseded by it.
+    #[serde(default)]
+    pub hidden: Vec<i64>,
 }
 
 /// The save a row belongs to, from `GET /v1/memories/{kind}/{id}/save`: a
@@ -898,11 +923,7 @@ impl DaemonClient {
     }
 
     /// `agent` scopes the delete as in [`DaemonClient::update`].
-    pub async fn delete(&self, kind: &str, id: i64, agent: Option<&str>) -> Result<usize, ClientError> {
-        #[derive(Deserialize)]
-        struct Body {
-            deleted: usize,
-        }
+    pub async fn delete(&self, kind: &str, id: i64, agent: Option<&str>) -> Result<Deleted, ClientError> {
         let resp = self
             .http
             .delete(self.url(&format!("/v1/memories/{kind}/{id}")))
@@ -911,7 +932,7 @@ impl DaemonClient {
             .send()
             .await
             .map_err(Self::map_transport)?;
-        Ok(Self::read_response::<Body>(resp).await?.deleted)
+        Self::read_response::<Deleted>(resp).await
     }
 
     /// Brings back a deleted `memory` row. `agent` scopes it as in
@@ -1503,7 +1524,7 @@ pub(crate) mod tests {
         assert_eq!(synthesis.pending_total, 1);
 
         assert_eq!(c.update("memory", id, Some(9.5), None, None).await.expect("patch").tier, 1);
-        assert_eq!(c.delete("memory", id, None).await.expect("delete"), 1);
+        assert_eq!(c.delete("memory", id, None).await.expect("delete").deleted, 1);
     }
 
     #[test]
