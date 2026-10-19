@@ -26,7 +26,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clawg_core::memory::admin::{
-    delete_memory_core, get_memory_core, list_memories_core, memory_stats_core, query_has_tokens,
+    Deleted, delete_memory_core, get_memory_core, list_memories_core, memory_stats_core, query_has_tokens,
     update_memory_core, ListParams, MemoryAdminRow, MemoryKind, MemoryPatch, MemoryStats, StatsParams,
     UpdatedRow, restore_memory_core, RestoreError, RestoredRow,
 };
@@ -669,11 +669,6 @@ pub struct UpdatedBody {
 }
 
 #[derive(Debug, Serialize)]
-pub struct DeletedBody {
-    pub deleted: usize,
-}
-
-#[derive(Debug, Serialize)]
 pub struct RestoredBody {
     pub restored: usize,
     #[serde(flatten)]
@@ -1264,16 +1259,16 @@ async fn delete_memory(
     State(app): State<Arc<AppCtx>>,
     Path((kind, id)): Path<(String, i64)>,
     Query(owner): Query<OwnerQuery>,
-) -> ApiResult<Json<DeletedBody>> {
+) -> ApiResult<Json<Deleted>> {
     let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
     let deleted = delete_memory_core(&app.runtime.store, id, kind, owner.agent.as_deref())
         .await
         .map_err(ApiError::internal)?;
 
-    if deleted == 0 {
+    if deleted.deleted == 0 {
         return Err(ApiError::not_found(format!("no {kind:?} row with id {id}")));
     }
-    Ok(Json(DeletedBody { deleted }))
+    Ok(Json(deleted))
 }
 
 /// Brings back a deleted `memory` row, scoped like `DELETE`. The kind is
