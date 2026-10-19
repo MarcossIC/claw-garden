@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use clawg_cli::update::signature;
+use clawg_cli::update::{plan, signature};
 
 /// Whether `line` is an attribute that silences an unused-code lint: an
 /// `allow` or `expect`, inner or outer, also behind a `cfg_attr`, naming
@@ -578,6 +578,29 @@ fn the_readme_documents_the_install_and_update_path() {
     ] {
         assert!(readme.contains(wanted), "README.md lacks {why}: `{wanted}`");
     }
+}
+
+/// `install.ps1` and `clawg update` set the installed binary aside under one
+/// name, and each deletes what the other left behind.
+#[test]
+fn the_installer_and_update_set_the_binary_aside_under_one_name() {
+    let script = read_repo_file("scripts/install.ps1");
+    for (wanted, why) in [
+        ("$target = Join-Path $InstallDir 'clawg.exe'", "the installed binary"),
+        (r#"$aside = "$target.old-$(Get-Date -Format yyyyMMddHHmmssfff)""#, "the name it is set aside under"),
+        ("-Filter 'clawg.exe.old-*'", "the cleanup of what earlier runs set aside"),
+    ] {
+        assert!(script.contains(wanted), "install.ps1 lacks {why}: `{wanted}`");
+    }
+
+    let by_update = plan::aside_name("clawg.exe", 1_791_827_476_123);
+    let stamp = by_update.strip_prefix("clawg.exe.old-").expect("the prefix install.ps1 deletes");
+    assert!(
+        stamp.len() == "yyyyMMddHHmmssfff".len() && stamp.bytes().all(|b| b.is_ascii_digit()),
+        "{by_update}"
+    );
+    let by_script = vec!["clawg.exe.old-20261012145116123".to_string()];
+    assert_eq!(plan::leftovers(&by_script, "clawg.exe"), by_script, "update deletes what install.ps1 set aside");
 }
 
 /// The base64 line of a minisign `.pub`, which names the key whatever its
