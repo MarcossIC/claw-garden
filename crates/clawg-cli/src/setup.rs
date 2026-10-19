@@ -1149,7 +1149,7 @@ mod tests {
 
     #[test]
     fn find_claude_takes_the_first_on_the_path() {
-        let name = if cfg!(windows) { "claude.cmd" } else { "claude" };
+        let name = if cfg!(windows) { "claude.exe" } else { "claude" };
         let entries = [PathBuf::new(), PathBuf::from("/a"), PathBuf::from("/b")];
         let found = find_claude(&entries, |p| p.starts_with("/b") || p == Path::new("/c").join(name));
         assert_eq!(found, Some(PathBuf::from("/b").join(name)));
