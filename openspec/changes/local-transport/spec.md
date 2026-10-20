@@ -15,11 +15,11 @@
 - WHEN llega `GET /health` con `Host: localhost`
 - THEN contesta 200; con `Host: clawg` o con un `Origin`, 403
 
-**Tests:** `the_same_uid_is_admitted_and_another_is_not` (`daemon/socket.rs`); `the_router_answers_over_the_socket_behind_the_guard` (`tests/api.rs`, Unix).
+**Tests:** `the_same_uid_is_admitted_and_another_is_not`, `the_router_answers_over_the_socket_behind_the_guard` (`daemon/socket.rs`, Unix).
 
 ## T2. `serve` escucha en el socket (Unix)
 
-Con el candado del store tomado, y antes de publicar `daemon.json`, `serve` MUST borrar un `clawg.sock` que haya quedado y hacer `bind` del socket. Una ruta cuyo largo en bytes no cabe en `sun_path` (108 en Linux, 104 en los demás Unix) MUST fallar al arrancar con un error que nombra la ruta y el límite y dice que `--port` sigue disponible; ninguna otra ubicación se intenta. `clear_state` MUST borrar también el socket. Un clawg anterior no crea socket.
+Con el candado del store tomado, y antes de publicar `daemon.json`, `serve` MUST borrar un `clawg.sock` que haya quedado y hacer `bind` del socket. Una ruta cuyo largo en bytes no cabe en `sun_path` (108 en Linux, 104 en los demás Unix) MUST fallar al arrancar con un error que nombra la ruta y el límite y dice que `--port` sigue disponible; con `--port`, el daemon MUST servir sólo por TCP con un `warn`. Ninguna otra ubicación se intenta. `clear_state` MUST borrar también el socket. Un clawg anterior no crea socket.
 
 #### Escenario: un socket huérfano
 - GIVEN un daemon terminado con SIGKILL que dejó `clawg.sock`
@@ -31,7 +31,7 @@ Con el candado del store tomado, y antes de publicar `daemon.json`, `serve` MUST
 - WHEN corre `clawg serve` sin `--port`
 - THEN sale con 1 y el error nombra la ruta
 
-**Tests:** `the_socket_path_fits_under_the_limit_and_a_longer_one_is_named` (`daemon/socket.rs`); `a_daemon_without_a_port_serves_status_stop_bridge_and_hooks_over_its_socket`, `an_orphan_socket_left_by_a_kill_does_not_keep_the_next_daemon_out`, `a_socket_path_over_the_limit_is_refused_by_name` (`binary.rs`, Unix).
+**Tests:** `the_socket_path_fits_under_the_limit_and_a_longer_one_is_named`, `a_socket_an_earlier_daemon_left_is_replaced` (`daemon/socket.rs`); `clear_state_removes_the_files_and_the_socket_and_tolerates_absence` (`lifecycle.rs`); `a_daemon_without_a_port_serves_status_stop_bridge_and_hooks_over_its_socket`, `an_orphan_socket_left_by_a_kill_does_not_keep_the_next_daemon_out`, `a_socket_path_over_the_limit_is_refused_by_name` (`binary.rs`, Unix).
 
 ## T3. TCP en la transición
 
@@ -45,7 +45,7 @@ Con el candado del store tomado, y antes de publicar `daemon.json`, `serve` MUST
 - WHEN corre `clawg serve` sin `--port`
 - THEN contesta por el socket y `daemon.json` no tiene `port`
 
-**Tests:** `the_tcp_plan_follows_the_port_and_the_socket` (`serve.rs`); `a_taken_profile_port_leaves_the_daemon_on_its_socket` (`binary.rs`, Unix).
+**Tests:** `the_tcp_plan_follows_the_port_and_the_socket`, `the_start_line_names_every_listener` (`serve.rs`); `a_record_without_the_socket_mark_reads_as_tcp_and_one_without_a_port_has_none` (`lifecycle.rs`); `a_taken_profile_port_leaves_the_daemon_on_its_socket` (`binary.rs`, Unix).
 
 ## T4. El cliente va por el socket y nunca cae a TCP
 
@@ -56,7 +56,7 @@ Con el candado del store tomado, y antes de publicar `daemon.json`, `serve` MUST
 - WHEN el puente recibe una llamada
 - THEN arranca un daemon que escucha sólo en el socket y la llamada lo alcanza
 
-**Tests:** `the_socket_wins_when_published_and_tcp_is_used_otherwise` (`client.rs`); `a_client_on_a_published_socket_with_nothing_behind_is_not_running` (`client.rs`, Unix); `a_bridge_starts_its_daemon_through_the_binary` (`binary.rs`, Unix).
+**Tests:** `the_socket_wins_when_published_and_tcp_is_used_otherwise` (`client.rs`); `a_client_reaches_a_daemon_over_its_published_socket`, `a_client_on_a_published_socket_with_nothing_behind_is_not_running` (`client.rs`, Unix); `a_bridge_starts_its_daemon_through_the_binary` (`binary.rs`, Unix).
 
 ## T5. Versiones
 
@@ -85,4 +85,4 @@ Con el candado del store tomado, y antes de publicar `daemon.json`, `serve` MUST
 
 `CLAWG_TEST_DEFAULT_PORT` (`off` o un puerto) y el campo `transport` del sello MUST leerse sólo en un build con `testing`; un build sin él usa el puerto del perfil y habla por el socket.
 
-**Tests:** `a_default_port_override_is_off_or_a_port` y los del sello (`build_info.rs`); `the_release_build_has_no_transport_stand_ins` (`build_info.rs`, `cfg(not(feature = "testing"))`).
+**Tests:** `a_default_port_override_is_off_or_a_port`, `a_stamp_can_restrict_the_binary_to_tcp` y, del lado `cfg(not(feature = "testing"))`, `update_overrides_are_read_only_in_a_test_build` (`build_info.rs`).
