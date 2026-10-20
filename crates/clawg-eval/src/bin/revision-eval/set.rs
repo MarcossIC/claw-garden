@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// The types a chain may be saved as: the ones the detector pairs, so a
 /// transition without a key has a chance to be marked.
@@ -16,7 +16,7 @@ const CHAIN_TYPES: [&str; 3] = ["architectural_decision", "user_preference", "se
 pub const LONG_VERSION_WORDS: usize = 480;
 
 /// How a version differs from the one before it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Change {
     /// Another value in the same wording.
