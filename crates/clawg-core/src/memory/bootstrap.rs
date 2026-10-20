@@ -403,6 +403,25 @@ pub fn serve_deps(
     Ok(production_deps(store, backups, tokenizer))
 }
 
+/// The contract `clawg serve` verifies the store against, without loading a
+/// model: the production embedder's, or in a `testing` build the stand-in's
+/// when [`TEST_EMBEDDER_VAR`] names one (an unknown value is the production
+/// one, which `serve` refuses before it gets that far).
+#[cfg(feature = "testing")]
+pub fn serving_contract() -> EmbeddingIdentity {
+    match TestEmbedder::parse(std::env::var(TEST_EMBEDDER_VAR).ok().as_deref()) {
+        Ok(Some(_)) => EmbeddingIdentity::of(&crate::memory::embedder::FakeEmbedder::default()),
+        _ => crate::memory::embedder::expected_contract(),
+    }
+}
+
+/// The contract `clawg serve` verifies the store against, without loading a
+/// model: always the production embedder's.
+#[cfg(not(feature = "testing"))]
+pub fn serving_contract() -> EmbeddingIdentity {
+    crate::memory::embedder::expected_contract()
+}
+
 /// `load`, with every embedder it builds wrapped in an [`IdleEmbedder`] that
 /// lets the model go after `idle` without use, or never with `None`. A reload
 /// goes through `cached` and `load` again, so it reads and checks the same

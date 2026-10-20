@@ -154,7 +154,7 @@ pub fn run(profile: Profile) -> Result<Report, DoctorError> {
     let inspection = inspect(&data_dir);
     found.extend(checks::schema(&inspection.schema, profile));
     if let Some(facts) = &inspection.facts {
-        found.extend(checks::contract(facts.contract.as_ref(), &clawg_core::memory::embedder::expected_contract()));
+        found.extend(checks::contract(facts.contract.as_ref(), &clawg_core::memory::bootstrap::serving_contract()));
         let has_rows = facts.agents.iter().any(|a| a.total > 0);
         let backups = names_in(&clawg_core::paths::backups_dir(&data_dir));
         found.extend(checks::backups(&backups, has_rows, now_ms(), profile));
