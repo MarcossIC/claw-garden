@@ -70,8 +70,10 @@ Every row competes with the others in search, so leave out:
   short stable name such as `storage/engine`. When it changes, save the new
   version under the same `topic_key`: it replaces the old one, which stays in
   the history, and the answer names what it replaced. `search_memory` and
-  `read_memory` show a memory's key as `topic=K`: save its new version under
-  that key, the one shown, never a new one.
+  `read_memory` show a memory's key as `topic=K` only where saving under it
+  replaces that memory: save its new version under that key, the one shown,
+  never a new one. A memory of another project, or of none, shows no key,
+  since a save here would keep it beside the new one.
 - Write it so it reads on its own months from now, with no conversation
   around it.
 - Write it in English, and search in English too. A memory saved in one

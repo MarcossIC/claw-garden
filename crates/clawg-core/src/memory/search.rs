@@ -127,6 +127,10 @@ pub struct RankedHit {
     /// one and for the tables that have no such column.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topic_key: Option<String>,
+    /// The project the row was saved in; `None` for a row saved without one.
+    /// Sent as `null` rather than left out, so a bridge can tell such a row
+    /// from a daemon that predates the field.
+    pub project_id: Option<String>,
 }
 
 /// Position `piece` (from 1) of a save stored as `pieces` rows.
@@ -239,7 +243,7 @@ pub fn serialize_f32_query_pub(v: &[f32]) -> Vec<u8> {
 const SEARCH_SQL_MEMORY: &str = concat!(
     "
     SELECT m.id, m.content, m.memory_type, m.tier, m.status, knn.distance,
-        m.created_at, m.last_accessed_at, m.importance, m.agent_id, m.topic_key
+        m.created_at, m.last_accessed_at, m.importance, m.agent_id, m.topic_key, m.project_id
     FROM memory_vectors knn
     JOIN memory m ON m.id = knn.rowid
     WHERE knn.embedding MATCH ?1
@@ -262,7 +266,7 @@ const SEARCH_SQL_MEMORY: &str = concat!(
 const SEARCH_SQL_EPISODIC: &str = concat!(
     "
     SELECT epi.id, epi.task, 'episode' AS memory_type, epi.tier, epi.status, knn.distance,
-        epi.created_at, epi.last_accessed_at, epi.importance, epi.agent_id, NULL
+        epi.created_at, epi.last_accessed_at, epi.importance, epi.agent_id, NULL, epi.project_id
     FROM episodic_vectors knn
     JOIN episodic_trajectory epi ON epi.id = knn.rowid
     WHERE knn.embedding MATCH ?1
@@ -281,7 +285,7 @@ const SEARCH_SQL_EPISODIC: &str = concat!(
 const SEARCH_SQL_PROCEDURAL: &str = concat!(
     "
     SELECT pro.id, pro.skill_name, 'procedure' AS memory_type, pro.tier, pro.status, knn.distance,
-        pro.created_at, pro.last_accessed_at, pro.importance, pro.agent_id, NULL
+        pro.created_at, pro.last_accessed_at, pro.importance, pro.agent_id, NULL, pro.project_id
     FROM procedural_vectors knn
     JOIN procedural_skill pro ON pro.id = knn.rowid
     WHERE knn.embedding MATCH ?1
@@ -549,6 +553,7 @@ async fn knn_one(
                             lexical_match: lexical_matches.contains(&id),
                             agent_id: row.get(9)?,
                             topic_key: row.get(10)?,
+                            project_id: row.get(11)?,
                         })
                     },
                 )?;
@@ -609,6 +614,7 @@ async fn knn_one(
                     piece: None,
                     exact: r.lexical_match,
                     topic_key: r.topic_key,
+                    project_id: r.project_id,
                 })
                 .collect();
             // Sorted before the trim, not after: the widened window is cut
@@ -1032,7 +1038,7 @@ const LEXICAL_SCORE_SQL_PREFIX: &str = concat!(
     "
     SELECT m.id, m.content, m.memory_type, m.tier, m.status,
         vec_distance_l2(v.embedding, ?1) AS distance,
-        m.created_at, m.last_accessed_at, m.importance, m.agent_id, m.topic_key
+        m.created_at, m.last_accessed_at, m.importance, m.agent_id, m.topic_key, m.project_id
     FROM memory_vectors v
     JOIN memory m NOT INDEXED ON m.id = v.rowid
     WHERE m.status IN ('active', 'disputed')
@@ -1147,6 +1153,7 @@ async fn score_lexical_candidates(
                     lexical_match: lexical_matches.contains(&id),
                     agent_id: row.get(9)?,
                     topic_key: row.get(10)?,
+                    project_id: row.get(11)?,
                 })
             })?;
 
@@ -1167,6 +1174,7 @@ async fn score_lexical_candidates(
                     piece: None,
                     exact: r.lexical_match,
                     topic_key: r.topic_key,
+                    project_id: r.project_id,
                 });
             }
             Ok(hits)
@@ -1527,6 +1535,7 @@ mod tests {
             piece: None,
             exact: false,
             topic_key: None,
+            project_id: None,
         };
         let h2 = RankedHit {
             id: 2,
@@ -1542,6 +1551,7 @@ mod tests {
             piece: None,
             exact: false,
             topic_key: None,
+            project_id: None,
         };
         let mut hits = vec![h2, h1];
         hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
@@ -1572,6 +1582,7 @@ mod tests {
                 piece: None,
                 exact: false,
                 topic_key: None,
+                project_id: None,
             }
         }
 
@@ -5176,6 +5187,7 @@ mod tests {
             piece: None,
             exact: false,
             topic_key: None,
+            project_id: None,
         }
     }
 

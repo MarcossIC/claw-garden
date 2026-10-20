@@ -3004,6 +3004,30 @@ async fn a_search_hit_and_the_save_read_carry_the_topic_key() {
     assert!(save.get("topic_key").is_none(), "{save}");
 }
 
+/// `null` is sent, not left out: a bridge reads a missing field as a daemon
+/// that predates it.
+#[tokio::test]
+async fn a_search_hit_and_the_save_read_carry_the_project() {
+    let h = Harness::start().await;
+    let placed = save_id(&h, json!({ "content": CONTENT, "agent_id": "a", "project_id": "p" })).await;
+    let unplaced = save_id(&h, json!({ "content": "deploys happen on fridays", "agent_id": "a" })).await;
+
+    let (status, body) = h.post_json("/v1/search", json!({ "query": CONTENT, "agent_id": "a", "limit": 10 })).await;
+    assert_eq!(status, 200, "{body}");
+    let hits = body["hits"].as_array().expect("hits array");
+    let hit = |id: i64| hits.iter().find(|hit| hit["id"].as_i64() == Some(id)).cloned();
+    assert_eq!(hit(placed).expect("placed hit")["project_id"], "p", "{body}");
+    if let Some(unplaced) = hit(unplaced) {
+        assert_eq!(unplaced.get("project_id"), Some(&Value::Null), "{body}");
+    }
+
+    let (status, save) = h.get_json(&format!("/v1/memories/memory/{placed}/save?agent=a")).await;
+    assert_eq!(status, 200, "{save}");
+    assert_eq!(save["project_id"], "p", "{save}");
+    let (_, save) = h.get_json(&format!("/v1/memories/memory/{unplaced}/save?agent=a")).await;
+    assert_eq!(save.get("project_id"), Some(&Value::Null), "{save}");
+}
+
 #[tokio::test]
 async fn restore_refuses_a_row_whose_topic_is_live_again() {
     let h = Harness::start().await;

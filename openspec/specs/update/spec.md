@@ -123,7 +123,7 @@ Sobre una fila que no existe, borrada o de otro agente cuando el cambio tiene sc
 - "No existe" (R3) MUST responder 404.
 - Un cambio hecho MUST responder 200 con `updated = 1` y `importance`, `memory_type` y `tier` de la fila como quedó.
 
-`DaemonClient::update` (`crates/clawg-cli/src/client.rs:1084`) es el lado del cliente. Manda `user_answered` sólo cuando es `true` (`skip_serializing_if`, `client.rs:520`): un daemon anterior, cuyo `PATCH` rechaza los campos que no conoce, sigue aceptando el cambio de siempre de un puente nuevo, y con la declaración lo rechaza como a cualquier campo desconocido, con un 422 de axum que nombra el campo (un daemon anterior tampoco tiene la guarda).
+`DaemonClient::update` (`crates/clawg-cli/src/client.rs:1097`) es el lado del cliente. Manda `user_answered` sólo cuando es `true` (`skip_serializing_if`, `client.rs:533`): un daemon anterior, cuyo `PATCH` rechaza los campos que no conoce, sigue aceptando el cambio de siempre de un puente nuevo, y con la declaración lo rechaza como a cualquier campo desconocido, con un 422 de axum que nombra el campo (un daemon anterior tampoco tiene la guarda).
 
 #### Escenario
 - GIVEN una memoria guardada por HTTP
@@ -143,15 +143,15 @@ Sobre una fila que no existe, borrada o de otro agente cuando el cambio tiene sc
 
 ## R5. Herramienta MCP `update_memory`
 
-El puente MUST exponer `update_memory` con `kind`, `id`, `importance` (opcional) y `memory_type` (opcional; su schema declara los tipos conocidos como `enum`, ver [`specs/mcp`](../mcp/spec.md), «El schema de `memory_type` declara los tipos») y `user_answered` (booleano, opcional) (`UpdateMemoryArgs`, `crates/clawg-cli/src/mcp/server.rs:308`), y MUST mandar siempre el agente que llama y la declaración (`update_memory_impl`, `server.rs:920`).
+El puente MUST exponer `update_memory` con `kind`, `id`, `importance` (opcional) y `memory_type` (opcional; su schema declara los tipos conocidos como `enum`, ver [`specs/mcp`](../mcp/spec.md), «El schema de `memory_type` declara los tipos») y `user_answered` (booleano, opcional) (`UpdateMemoryArgs`, `crates/clawg-cli/src/mcp/server.rs:308`), y MUST mandar siempre el agente que llama y la declaración (`update_memory_impl`, `server.rs:931`).
 
 - Un descenso de una fila protegida sin la declaración MUST fallar con el mensaje del daemon, que nombra `user_answered`.
-- Sobre una fila propia, MUST devolver un texto que nombra el id y cómo quedaron importancia, tipo y tier (`format_update`, `crates/clawg-cli/src/mcp/tools.rs:199`): `updated #12 memory: user_preference, importance 8.0, tier 1`.
+- Sobre una fila propia, MUST devolver un texto que nombra el id y cómo quedaron importancia, tipo y tier (`format_update`, `crates/clawg-cli/src/mcp/tools.rs:220`): `updated #12 memory: user_preference, importance 8.0, tier 1`.
 - Sobre una fila de otro agente, MUST fallar como si el id no existiera ([`specs/visibility`](../visibility/spec.md) R3), y la fila MUST NOT cambiar.
 - Un cambio inválido MUST fallar con el mensaje de la validación.
-- La descripción (`server.rs:1186-1193`) MUST decir que es para cuando el usuario corrige la importancia o el tipo, que sacarle el tipo a una preferencia o a una decisión pide `user_answered`, puesto sólo cuando el usuario lo dijo, y que para cambiar el contenido se guarda el nuevo y se borra el viejo.
+- La descripción (`server.rs:1197-1204`) MUST decir que es para cuando el usuario corrige la importancia o el tipo, que sacarle el tipo a una preferencia o a una decisión pide `user_answered`, puesto sólo cuando el usuario lo dijo, y que para cambiar el contenido se guarda el nuevo y se borra el viejo.
 
-`save_memory` MUST nombrar `update_memory`: en su descripción, junto a `delete_memory` (`server.rs:1063-1071`), y en la respuesta de un refuerzo, que ya dice el id (`save_outcome_text`, `server.rs:595-598`).
+`save_memory` MUST nombrar `update_memory`: en su descripción, junto a `delete_memory` (`server.rs:1074-1082`), y en la respuesta de un refuerzo, que ya dice el id (`save_outcome_text`, `server.rs:595-598`).
 
 `tools/list` MUST listar `update_memory` entre sus herramientas; el conteo vigente, doce, y la lista completa están en [`specs/mcp`](../mcp/spec.md).
 

@@ -189,6 +189,16 @@ pub struct Hit {
     /// predates the field does not send it, and the hit is shown without one.
     #[serde(default)]
     pub topic_key: Option<String>,
+    /// The project the row was saved in: `Some(None)` for a row without one,
+    /// `None` from a daemon that predates the field.
+    #[serde(default, deserialize_with = "sent")]
+    pub project_id: Option<Option<String>>,
+}
+
+/// A field a daemon sends even when it is `null`, read so that `None` means
+/// the daemon did not send it at all.
+fn sent<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(d).map(Some)
 }
 
 /// Position `piece` (from 1) of a save stored as `pieces` rows.
@@ -507,6 +517,9 @@ pub struct SavedText {
     /// not send it, and the save is shown without one.
     #[serde(default)]
     pub topic_key: Option<String>,
+    /// The project of the row asked for, read as [`Hit::project_id`] is.
+    #[serde(default, deserialize_with = "sent")]
+    pub project_id: Option<Option<String>>,
 }
 
 #[derive(Serialize)]
@@ -1427,6 +1440,23 @@ pub(crate) mod tests {
     fn serve_is_started_on_the_profiles_default_port_unless_one_is_given() {
         assert_eq!(serve_args(Profile::Dev, None), ["serve", "--profile", "dev"]);
         assert_eq!(serve_args(Profile::Prod, Some(27380)), ["serve", "--profile", "prod", "--port", "27380"]);
+    }
+
+    #[test]
+    fn a_hit_tells_a_missing_project_from_none() {
+        let hit = |project: &str| -> Hit {
+            let json = format!(r#"{{"id":1,"kind":"Memory","content":"c","memory_type":"semantic_fact","tier":3,"score":0.5{project}}}"#);
+            serde_json::from_str(&json).expect("a hit")
+        };
+        assert_eq!(hit("").project_id, None, "a daemon that predates the field");
+        assert_eq!(hit(r#","project_id":null"#).project_id, Some(None), "a row without a project");
+        assert_eq!(hit(r#","project_id":"p""#).project_id, Some(Some("p".into())));
+
+        let save: SavedText = serde_json::from_str(
+            r#"{"kind":"memory","id":1,"piece":1,"pieces":1,"ids":[1],"missing":[],"text":"t","project_id":null}"#,
+        )
+        .expect("a save");
+        assert_eq!(save.project_id, Some(None));
     }
 
     #[test]
