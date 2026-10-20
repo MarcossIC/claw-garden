@@ -54,6 +54,7 @@ fn main() -> ExitCode {
         Err(e) => e.exit(),
     };
     init_logging();
+    let serves = matches!(cli.command, Command::Serve { .. });
     if cli.command.loads_the_model() {
         // Before the runtime exists: the allocator setting only reaches the
         // threads that have not allocated yet.
@@ -81,6 +82,11 @@ fn main() -> ExitCode {
         // A stdin the client never closed still holds a blocking read, which
         // an ordinary drop of the runtime would wait for past the deadline.
         runtime.shutdown_background();
+    } else if serves {
+        // A model load still running on a blocking thread cannot be
+        // cancelled, and an ordinary drop would wait for it past what
+        // `clawg stop` waits for.
+        runtime.shutdown_timeout(serve::RUNTIME_TEARDOWN);
     }
     code
 }

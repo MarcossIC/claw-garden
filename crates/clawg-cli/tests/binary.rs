@@ -551,6 +551,25 @@ async fn sigterm_stops_the_daemon_in_order() {
     assert!(daemon.log_text().contains("checkpointed the WAL"), "{}", daemon.log_text());
 }
 
+/// A model load runs on a blocking thread nothing can cancel; the process
+/// must still end within what `clawg stop` waits for.
+#[tokio::test]
+async fn stop_ends_a_daemon_whose_model_load_never_returns() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve_with("blocked").await;
+    let deadline = Instant::now() + START_BUDGET;
+    while !daemon.log_text().contains("the test model load blocks") {
+        assert!(Instant::now() < deadline, "the load did not start:\n{}", daemon.log_text());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let stop = sandbox.run(&["stop", "--profile", "dev"]);
+
+    assert_eq!(stop.status.code(), Some(0), "{}\n{}", stderr_of(&stop), daemon.log_text());
+    let exit = daemon.wait_for_exit(Duration::from_secs(5)).await;
+    assert!(exit.success(), "{exit}\n{}", daemon.log_text());
+}
+
 #[tokio::test]
 async fn a_debug_binary_refuses_prod_even_with_a_test_home() {
     let sandbox = Sandbox::new();
