@@ -1,14 +1,14 @@
 change: preference-topic-scope
 objective: "1"
 depends_on: [topic-revisions]
-phase: explore
+phase: apply
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
-  apply: pending
+  exploration: done
+  proposal: done
+  spec: done
+  design: skipped  # no architectural decision beyond the proposal's
+  tasks: done
+  apply: in_progress
   verify: pending
   archive: pending
 updated: 2026-10-20
