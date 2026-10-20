@@ -104,9 +104,9 @@ Cubre S8, incluido el fallo que ya hay en Unix.
 ## 10. Verificación
 
 - [x] `cargo clean --workspace --target-dir target-test`, `cargo test --workspace --target-dir target-test` y clippy (`-A clippy::all -D warnings`) en Windows sobre el último commit.
-- [ ] `cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings` y `cargo test --locked -p clawg-core --lib build_info` (lo que construye el release), y la suite en Linux: el CI del pull request en verde en Linux y Windows. Revisar `dead_code` y `unused` de las variantes y los imports que sólo usa un sistema. En Windows, local, ya pasan los dos comandos del release; falta el CI.
+- [x] `cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings` y `cargo test --locked -p clawg-core --lib build_info` (lo que construye el release), y la suite en Linux: el CI del pull request en verde en Linux y Windows (run 39425043633 sobre `f0dfd21`), con clippy `-D warnings` sin `dead_code` ni `unused` en los dos sistemas.
 - [x] Barra de rendimiento del lote 8, con la tabla en `verify.md` (R12).
-- [ ] Manual, en `verify.md`, con una segunda cuenta local estándar y el daemon real (R13): conectar al socket da 10013; borrar el socket y crear otro en el directorio de datos da acceso denegado.
+- [ ] Manual, en `verify.md`, con una segunda cuenta local estándar y el daemon real (R13): conectar al socket da 10013; borrar el socket y crear otro en el directorio de datos da acceso denegado. No se corrió: queda como advertencia W4 de `verify.md`, con la tabla de pasos para quien la corra.
 - [x] `rag-eval` no aplica: no cambia el ranking ni lo que ve el modelo; `agent_contract.json` no cambia.
 - [x] Ningún directorio de build fuera de `target` y `target-test`; ningún `clawg.exe` detenido; nada en `~/.clawg*`.
 
