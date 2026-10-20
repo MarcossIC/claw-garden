@@ -12,7 +12,7 @@ Fuente de verdad de qué peticiones llegan a la API HTTP del daemon antes de mir
 - **Autoridades de la petición:** la cabecera `Host` y la autoridad de la URI (la `:authority` de HTTP/2, o la de una URI absoluta en HTTP/1.1), las que estén. El daemon sirve HTTP/2 en texto plano: `hyper-util` llega con `http2` a través de `reqwest`.
 - **Directorio de datos:** `<home>/.clawg` o `<home>/.clawg-dev` (`data_dir_in`, `crates/clawg-core/src/paths.rs:159`).
 - **Modo privado:** en Unix, un directorio sin ningún bit de grupo ni de otros (`modo & 0o077 == 0`).
-- **Guardia:** `admit_loopback` (`crates/clawg-cli/src/daemon/api.rs:883`), la capa que `router` (`api.rs:823`) aplica a todas sus rutas, `/health` y `/v1` incluidas, por fuera de `require_bearer` (`api.rs:846`).
+- **Guardia:** `admit_loopback` (`crates/clawg-cli/src/daemon/api.rs:906`), la capa que `router` (`api.rs:846`) aplica a todas sus rutas, `/health` y `/v1` incluidas, por fuera de `require_bearer` (`api.rs:869`).
 
 ## Límite
 

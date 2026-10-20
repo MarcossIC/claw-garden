@@ -220,7 +220,7 @@
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
           "content": {
-            "description": "The memory to store, written as a self-contained statement — it will be\nread back in a future session with none of this conversation around it.",
+            "description": "The memory to store, written as a self-contained statement — it will be\nread back in a future session with none of this conversation around it.\nAt most 64 KiB; split a longer text into several saves.",
             "type": "string"
           },
           "derived_from": {

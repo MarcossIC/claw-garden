@@ -569,6 +569,29 @@ pub struct RelatedMemory {
     pub excerpt: String,
 }
 
+/// Most bytes a save's `content` may hold. Every piece of a long save
+/// rewrites its outbox row with the progress so far, so the bytes a save
+/// writes grow with the square of its length; this keeps the worst case near
+/// 230 pieces and under 10 MB, and still takes the longest note an imported
+/// history was measured to hold (45 372 characters).
+pub const MAX_CONTENT_BYTES: usize = 64 * 1024;
+
+/// A save's `content`, or why it is refused: empty, or over
+/// [`MAX_CONTENT_BYTES`] as received. Refused rather than cut, since a cut
+/// save would store a text the caller never wrote.
+fn check_content(content: &str) -> Result<(), ApiError> {
+    if content.trim().is_empty() {
+        return Err(ApiError::bad_request("content must not be empty"));
+    }
+    if content.len() > MAX_CONTENT_BYTES {
+        return Err(ApiError::bad_request(format!(
+            "content is {} bytes; at most {MAX_CONTENT_BYTES} are accepted: split it into several saves, one fact each",
+            content.len()
+        )));
+    }
+    Ok(())
+}
+
 /// Longest `operation_id` a caller may send.
 pub const MAX_OPERATION_ID_LEN: usize = 128;
 
@@ -1066,9 +1089,7 @@ async fn save_memory(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<SaveRequest>,
 ) -> ApiResult<(StatusCode, Json<SaveBody>)> {
-    if body.content.trim().is_empty() {
-        return Err(ApiError::bad_request("content must not be empty"));
-    }
+    check_content(&body.content)?;
     // Refused here, as `PATCH` refuses it: the worker would store it as
     // `semantic_fact` long after the caller was told the save was accepted.
     if let Some(raw) = body.memory_type.as_deref() {
@@ -1768,6 +1789,24 @@ mod tests {
     fn sources_are_counted_once_and_sorted() {
         assert_eq!(distinct_sources(&[9, 3, 9, 1]).unwrap(), vec![1, 3, 9]);
         assert_eq!(distinct_sources(&[]).unwrap(), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn content_is_checked_in_bytes() {
+        assert!(check_content(&"x".repeat(MAX_CONTENT_BYTES)).is_ok());
+        assert!(check_content(&"ñ".repeat(MAX_CONTENT_BYTES / 2)).is_ok());
+        let over = check_content(&"ñ".repeat(MAX_CONTENT_BYTES / 2 + 1)).unwrap_err();
+        assert_eq!(over.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            over.message,
+            format!(
+                "content is {} bytes; at most {MAX_CONTENT_BYTES} are accepted: split it into several saves, one fact each",
+                MAX_CONTENT_BYTES + 2
+            )
+        );
+        for empty in ["", "  \n "] {
+            assert_eq!(check_content(empty).unwrap_err().message, "content must not be empty");
+        }
     }
 
     #[test]
