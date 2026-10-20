@@ -746,10 +746,7 @@ async fn an_orphan_socket_left_by_a_kill_does_not_keep_the_next_daemon_out() {
 
 #[tokio::test]
 async fn a_socket_path_over_the_limit_is_refused_by_name() {
-    let owned = tempfile::tempdir().expect("tempdir");
-    let used = owned.path().join(".clawg-dev").join("clawg.sock").as_os_str().len();
-    let home = owned.path().join("h".repeat(130usize.saturating_sub(used)));
-    std::fs::create_dir_all(&home).unwrap();
+    let (_owned, home) = home_over_the_socket_limit();
     let sandbox = Sandbox::at(&home);
     let socket = sandbox.data_dir().join("clawg.sock");
 
@@ -1788,14 +1785,67 @@ async fn a_full_update_with_a_daemon_replaces_the_binary_and_a_bridge_reaches_th
     assert_eq!(std::fs::read(&aside[0]).expect("read the old binary"), original);
     assert!(beside(&installed, "clawg.new-").is_empty(), "the staged file is gone");
 
-    #[cfg(unix)]
-    {
-        let state = state_of(&sandbox.data_dir()).expect("daemon.json");
-        assert!(state.get("port").is_none(), "the new daemon was started without a port: {state}");
-    }
+    let state = state_of(&sandbox.data_dir()).expect("daemon.json");
+    assert!(state.get("port").is_none(), "the new daemon was started without a port: {state}");
 
     let reply = bridge.call(3, "memory_status", json!({}));
     assert!(!tool_failed(&reply), "the open bridge must find the new daemon: {reply}");
+}
+
+/// A home whose socket path is over the limit of `sun_path` and under
+/// Windows' `MAX_PATH`: a daemon started there with `--port` serves TCP alone.
+fn home_over_the_socket_limit() -> (tempfile::TempDir, PathBuf) {
+    let owned = tempfile::tempdir().expect("tempdir");
+    let used = owned.path().join(".clawg-dev").join("clawg.sock").as_os_str().len();
+    let home = owned.path().join("h".repeat(130usize.saturating_sub(used)));
+    std::fs::create_dir_all(&home).unwrap();
+    (owned, home)
+}
+
+// The server runs in this process while the binary is waited on.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_keeps_the_port_of_a_daemon_that_serves_tcp_alone() {
+    let (_owned, home) = home_over_the_socket_limit();
+    let sandbox = Sandbox::at(&home);
+    let installed = install(&sandbox, &stamp_json("0.18.0", ""));
+    let old = sandbox.serve_binary(&installed, "fake").await;
+    let before = state_of(&sandbox.data_dir()).expect("daemon.json");
+    assert!(before.get("unix_socket").is_none_or(|v| v == false), "the path does not fit: {before}");
+    let release = signed_release("0.19.0", "");
+    let server = ReleaseServer::serving(release.listing.clone(), release.files.clone()).await;
+    let _stop = StopOnDrop { home: sandbox.home.clone() };
+
+    let out = update_from(&sandbox, &installed, &server.base, &release.public);
+
+    assert_eq!(out.status.code(), Some(0), "{}\n{}", stdout_of(&out), stderr_of(&out));
+    old.wait_for_exit(Duration::from_secs(10)).await;
+    let after = state_of(&sandbox.data_dir()).expect("daemon.json");
+    assert_eq!(after["port"], before["port"], "the new daemon kept the port of the old one: {after}");
+    assert!(after.get("unix_socket").is_none_or(|v| v == false), "{after}");
+    assert_eq!(published_health(&sandbox.data_dir()).await["version"], "0.19.0");
+}
+
+// The server runs in this process while the binary is waited on.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_undone_update_restarts_a_daemon_that_served_tcp_alone_on_its_port() {
+    let (_owned, home) = home_over_the_socket_limit();
+    let sandbox = Sandbox::at(&home);
+    let installed = install(&sandbox, &stamp_json("0.18.0", ""));
+    let old = sandbox.serve_binary(&installed, "fake").await;
+    let before = state_of(&sandbox.data_dir()).expect("daemon.json");
+    let release = signed_release("0.19.0", r#","serve_fault":"before_open""#);
+    let server = ReleaseServer::serving(release.listing.clone(), release.files.clone()).await;
+    let _stop = StopOnDrop { home: sandbox.home.clone() };
+
+    let out = update_from(&sandbox, &installed, &server.base, &release.public);
+
+    assert_eq!(out.status.code(), Some(1), "{}\n{}", stdout_of(&out), stderr_of(&out));
+    let report = stderr_of(&out);
+    assert!(report.contains("Its daemon is running again"), "{report}");
+    old.wait_for_exit(Duration::from_secs(10)).await;
+    let after = state_of(&sandbox.data_dir()).expect("daemon.json");
+    assert_eq!(after["port"], before["port"], "the daemon started again kept its port: {after}");
+    assert_eq!(published_health(&sandbox.data_dir()).await["version"], "0.18.0");
 }
 
 // ── Clients older than the socket ──────────────────────────────────────────

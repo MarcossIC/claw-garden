@@ -12,6 +12,8 @@ pub struct Running {
     pub pid: u32,
     /// Its TCP port, when it has one.
     pub port: Option<u16>,
+    /// Whether it published its socket in `daemon.json`.
+    pub socket: bool,
     pub version: String,
 }
 
@@ -302,7 +304,7 @@ mod plan_cases {
     use super::*;
 
     fn with_daemon() -> Initial {
-        Initial { daemon: Some(Running { pid: 7, port: Some(27381), version: "0.18.0".into() }) }
+        Initial { daemon: Some(Running { pid: 7, port: Some(27381), socket: true, version: "0.18.0".into() }) }
     }
 
     fn steps(planned: &[Planned]) -> Vec<Step> {
@@ -448,7 +450,7 @@ mod apply_cases {
     }
 
     fn with_daemon() -> Vec<Planned> {
-        plan(&Initial { daemon: Some(Running { pid: 7, port: Some(27381), version: "0.18.0".into() }) })
+        plan(&Initial { daemon: Some(Running { pid: 7, port: Some(27381), socket: true, version: "0.18.0".into() }) })
     }
 
     fn without_daemon() -> Vec<Planned> {
