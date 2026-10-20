@@ -2042,6 +2042,37 @@ async fn judge_refuses_scoped_without_reason() {
 }
 
 #[tokio::test]
+async fn a_protected_verdict_without_the_answer_is_a_409() {
+    let h = Harness::start().await;
+    let (old, new) = seed_dispute(&h).await;
+    h.ctx
+        .runtime
+        .store
+        .conn
+        .call(move |c| c.execute("UPDATE memory SET memory_type = 'user_preference' WHERE id = ?1", [old]))
+        .await
+        .expect("make the old row a preference");
+    let judge = |extra: serde_json::Value| {
+        let mut body = json!({ "keep": new, "other": old, "verdict": "supersedes", "agent_id": "agent-http" });
+        body.as_object_mut().expect("object").extend(extra.as_object().expect("object").clone());
+        body
+    };
+
+    let (status, body) = h.post_json("/v1/disputes/judge", judge(json!({}))).await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body["error"].as_str().is_some_and(|e| e.contains("user_answered")), "{body}");
+
+    let (status, body) = h.post_json("/v1/disputes/judge", judge(json!({ "user_answered": true }))).await;
+    assert_eq!(status, 400, "{body}");
+
+    let (status, body) = h
+        .post_json("/v1/disputes/judge", judge(json!({ "user_answered": true, "reason": "port 9090 from now on" })))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["other"], json!({ "id": old, "status": "superseded", "superseded_by": new }));
+}
+
+#[tokio::test]
 async fn disputes_lists_pending_pairs_of_the_agent() {
     let h = Harness::start().await;
     let (old, new) = seed_dispute(&h).await;

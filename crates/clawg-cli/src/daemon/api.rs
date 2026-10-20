@@ -823,6 +823,9 @@ pub struct JudgeRequest {
     /// Why, required for `scoped`.
     #[serde(default)]
     pub reason: Option<String>,
+    /// The caller declares the user answered, with the answer in `reason`.
+    #[serde(default)]
+    pub user_answered: bool,
     /// Scopes the verdict to this agent's rows, as [`OwnerQuery`] does.
     #[serde(default)]
     pub agent_id: Option<String>,
@@ -1520,7 +1523,9 @@ async fn discard_outbox(State(app): State<Arc<AppCtx>>, Json(body): Json<OutboxR
 /// The answer every verdict route gives a refused one.
 fn resolve_error(e: ResolveError) -> ApiError {
     match e {
-            ResolveError::SameRow | ResolveError::ReasonRequired => ApiError::bad_request(e.to_string()),
+            ResolveError::SameRow | ResolveError::ReasonRequired | ResolveError::AnswerRequired => {
+                ApiError::bad_request(e.to_string())
+            }
             ResolveError::NotFound(_) => ApiError::not_found(e.to_string()),
             ResolveError::NotInDispute { .. }
             | ResolveError::SupersededElsewhere { .. }
@@ -1547,7 +1552,15 @@ async fn judge_dispute(
     let verdict: Verdict = body.verdict.parse().map_err(|e: clawg_core::memory::dispute::UnknownVerdict| {
         ApiError::bad_request(e.to_string())
     })?;
-    judge_pair(&app.runtime.store, body.keep, body.other, verdict, body.reason, body.agent_id.as_deref())
+    judge_pair(
+        &app.runtime.store,
+        body.keep,
+        body.other,
+        verdict,
+        body.reason,
+        body.user_answered,
+        body.agent_id.as_deref(),
+    )
         .await
         .map(Json)
         .map_err(resolve_error)
