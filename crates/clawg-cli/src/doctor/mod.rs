@@ -1,14 +1,28 @@
-//! `clawg doctor` — which `clawg` does a terminal actually run?
+//! `clawg doctor` — what is wrong with this install, its data directory and
+//! its store, with the evidence and the next step that is safe to take.
 //!
-//! Two installs can sit on the PATH and both answer `--version` identically, so
-//! nothing flags that the earlier one shadows the later. The analysis here is a
-//! pure function over a list of directories and an "exists" predicate; reading
-//! the environment and the filesystem stays in [`run`].
+//! First, which `clawg` a terminal actually runs: two installs can sit on the
+//! PATH and both answer `--version` identically, so nothing flags that the
+//! earlier one shadows the later. Then the data directory, the store read
+//! without the lock (`clawg_core::memory::inspect`) and Claude Code's
+//! registration. Every decision is a pure function over facts ([`analyze`],
+//! [`checks`], [`mcp`]); reading the environment and the filesystem stays in
+//! [`run`], which never writes.
+
+pub mod checks;
+pub mod finding;
+pub mod mcp;
 
 use std::path::{Path, PathBuf};
 
-use clawg_core::paths::Profile;
+use clawg_core::memory::inspect::inspect;
+use clawg_core::memory::sharing;
+use clawg_core::memory::spill::{REJECTED_FILE, SPILL_FILE};
+use clawg_core::memory::store_lock::{StoreHolder, StoreLock};
+use clawg_core::paths::{PathsError, Profile};
 use serde::Serialize;
+
+use finding::{Finding, Summary};
 
 /// One `clawg` executable found on the PATH.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -81,7 +95,7 @@ fn unquoted(entry: &Path) -> PathBuf {
 /// A comparable form of a path: Windows ignores case, treats `/` as `\` and
 /// may report the `\\?\` form, so none of those may make two spellings of one
 /// file look different.
-fn identity(path: &Path) -> String {
+pub(crate) fn identity(path: &Path) -> String {
     let text = path.to_string_lossy();
     if !cfg!(windows) {
         return text.into_owned();
@@ -90,14 +104,18 @@ fn identity(path: &Path) -> String {
     text.strip_prefix(r"\\?\").unwrap_or(&text).to_lowercase()
 }
 
-/// The JSON document `clawg doctor` prints.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// The JSON document `clawg doctor` prints. The PATH fields stay as they
+/// were before the checks, for whoever reads them.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Report {
     pub exe: PathBuf,
     pub version: String,
     pub profile: String,
     #[serde(flatten)]
     pub analysis: Analysis,
+    pub data_dir: PathBuf,
+    pub checks: Vec<Finding>,
+    pub summary: Summary,
 }
 
 /// Failure gathering what `doctor` needs from the process.
@@ -105,10 +123,18 @@ pub struct Report {
 pub enum DoctorError {
     #[error("cannot locate the running clawg binary: {0}")]
     CurrentExe(#[from] std::io::Error),
+    #[error(transparent)]
+    DataDir(#[from] PathsError),
 }
 
-/// Reads the process PATH and the running executable, then analyses them.
-/// Touches neither the store nor anything under the data directory.
+/// Reads the process PATH, the running executable, the profile's data
+/// directory, its store and Claude Code's configuration, and checks them.
+///
+/// Writes nothing. The store is read without its lock, as `clawg secrets`
+/// reads it, so it works beside a running daemon and leaves a stopped store
+/// without a new byte or file; only confirming who holds the store takes the
+/// lock for an instant, when `memory.owner` names a holder, as `clawg status`
+/// does.
 pub fn run(profile: Profile) -> Result<Report, DoctorError> {
     let exe = std::env::current_exe()?;
     let entries: Vec<PathBuf> = std::env::var_os("PATH")
@@ -116,12 +142,107 @@ pub fn run(profile: Profile) -> Result<Report, DoctorError> {
         .unwrap_or_default();
     let name = if cfg!(windows) { "clawg.exe" } else { "clawg" };
     let analysis = analyze(&exe, &entries, name, |p| p.is_file());
+    let data_dir = clawg_core::paths::data_dir(profile)?;
+
+    let mut found = checks::path(&analysis);
+    found.extend(checks::data_dir(&data_dir, dir_state(&data_dir)));
+    let socket = clawg_core::paths::socket_file(&data_dir);
+    found.extend(checks::socket(&socket, &crate::daemon::socket::check_socket_path(&socket)));
+    let owner = StoreLock::current_owner(&data_dir);
+    found.extend(checks::store_owner(owner.as_ref()));
+
+    let inspection = inspect(&data_dir);
+    found.extend(checks::schema(&inspection.schema, profile));
+    if let Some(facts) = &inspection.facts {
+        found.extend(checks::contract(facts.contract.as_ref(), &clawg_core::memory::embedder::expected_contract()));
+        let has_rows = facts.agents.iter().any(|a| a.total > 0);
+        let backups = names_in(&clawg_core::paths::backups_dir(&data_dir));
+        found.extend(checks::backups(&backups, has_rows, now_ms(), profile));
+    }
+    let rejected = present(&data_dir, REJECTED_FILE)
+        .map(|path| (lines_in(&path), path));
+    found.extend(checks::spill(
+        present(&data_dir, SPILL_FILE).as_deref(),
+        rejected.as_ref().map(|(lines, path)| (path.as_path(), *lines)),
+    ));
+    let sharing_error = sharing::load(&data_dir).err().map(|e| e.to_string());
+    found.extend(checks::sharing(sharing_error.as_deref(), profile));
+    if let Some(facts) = &inspection.facts {
+        let daemon_running = owner.as_ref().is_some_and(|o| o.holder == StoreHolder::Daemon);
+        found.extend(checks::outbox(&facts.outbox, daemon_running, profile));
+        found.extend(checks::agents(&facts.agents));
+        found.extend(checks::projects(&facts.projects));
+        found.extend(checks::invariants(&facts.invariants));
+    }
+    found.extend(claude_code(profile, &exe));
+
+    let summary = Summary::of(&found);
     Ok(Report {
         exe,
         version: clawg_core::build_info::version().to_string(),
         profile: profile.as_str().to_string(),
         analysis,
+        data_dir,
+        checks: found,
+        summary,
     })
+}
+
+#[cfg(unix)]
+fn dir_state(dir: &Path) -> checks::DirState {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(dir) {
+        Ok(m) if m.is_dir() => checks::DirState::Present { mode: Some(m.permissions().mode()) },
+        _ => checks::DirState::Missing,
+    }
+}
+
+#[cfg(not(unix))]
+fn dir_state(dir: &Path) -> checks::DirState {
+    if dir.is_dir() {
+        checks::DirState::Present { mode: None }
+    } else {
+        checks::DirState::Missing
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
+/// The files of a directory, by name; none when it cannot be read.
+fn names_in(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .map(|rd| rd.filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+        .unwrap_or_default()
+}
+
+/// A file of the data directory, when it is there.
+fn present(dir: &Path, name: &str) -> Option<PathBuf> {
+    let path = dir.join(name);
+    path.is_file().then_some(path)
+}
+
+/// The lines of a file, counted and never kept: they are someone's saves.
+fn lines_in(path: &Path) -> usize {
+    std::fs::read(path).map(|b| b.split(|&c| c == b'\n').filter(|l| !l.is_empty()).count()).unwrap_or(0)
+}
+
+/// Claude Code's registration of this profile's server, from the file
+/// `clawg setup claude-code` reads.
+fn claude_code(profile: Profile, exe: &Path) -> Vec<Finding> {
+    let home = clawg_core::paths::home_dir();
+    let Ok((path, _, _)) = crate::setup::locations(home.as_deref(), std::env::var_os("CLAUDE_CONFIG_DIR")) else {
+        return Vec::new();
+    };
+    let config = match std::fs::read_to_string(&path) {
+        Ok(text) => mcp::Config::Text(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => mcp::Config::Missing,
+        Err(e) => mcp::Config::Unreadable(e.to_string()),
+    };
+    mcp::mcp(&path, &config, profile, exe, Path::is_file)
 }
 
 #[cfg(test)]
@@ -230,17 +351,44 @@ mod tests {
 
     #[test]
     fn the_report_serialises_the_documented_fields() {
+        let analysis = analyze(&exe("new"), &dirs(&["old", "new"]), NAME, |_| true);
+        let found = checks::path(&analysis);
         let report = Report {
             exe: exe("new"),
             version: "0.1.0".into(),
             profile: "dev".into(),
-            analysis: analyze(&exe("new"), &dirs(&["old", "new"]), NAME, |_| true),
+            summary: Summary::of(&found),
+            analysis,
+            data_dir: dir(".clawg-dev"),
+            checks: found,
         };
         let json = serde_json::to_value(&report).expect("serialise");
-        for key in ["exe", "version", "profile", "installs", "winner", "shadowed", "duplicates"] {
+        for key in ["exe", "version", "profile", "installs", "winner", "shadowed", "duplicates", "data_dir", "checks", "summary"] {
             assert!(json.get(key).is_some(), "missing {key}: {json}");
         }
         assert_eq!(json["installs"][1]["is_current"], true);
         assert_eq!(json["shadowed"], true);
+        assert_eq!(json["duplicates"], true);
+        assert_eq!(json["checks"][0]["check_id"], "path");
+        assert_eq!(json["summary"]["error"], 2);
+    }
+
+    #[test]
+    fn path_findings() {
+        let kinds = |a: &Analysis| -> Vec<(finding::Severity, &'static str)> {
+            checks::path(a).iter().map(|f| (f.severity, f.reason_code)).collect()
+        };
+        let healthy = analyze(&exe("new"), &dirs(&["new"]), NAME, present(&["new"]));
+        assert_eq!(kinds(&healthy), [(finding::Severity::Ok, "healthy")]);
+        let none = analyze(&exe("build"), &dirs(&["tools"]), NAME, |_| false);
+        assert_eq!(kinds(&none), [(finding::Severity::Ok, "healthy")]);
+        let shadowed = analyze(&exe("new"), &dirs(&["old", "new"]), NAME, present(&["old", "new"]));
+        assert_eq!(
+            kinds(&shadowed),
+            [(finding::Severity::Error, "shadowed"), (finding::Severity::Error, "duplicate")]
+        );
+        assert!(Summary::of(&checks::path(&shadowed)).fails(), "an unhealthy PATH still exits 1");
+        let later = analyze(&exe("new"), &dirs(&["new", "old"]), NAME, present(&["old", "new"]));
+        assert_eq!(kinds(&later), [(finding::Severity::Error, "duplicate")]);
     }
 }
