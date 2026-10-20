@@ -515,6 +515,10 @@ struct UpdateBody<'a> {
     importance: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     memory_type: Option<&'a str>,
+    /// Left out when false: a daemon that predates the field refuses any
+    /// field it does not know.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    user_answered: bool,
 }
 
 /// How the daemon answered a save that did not fail.
@@ -1002,6 +1006,7 @@ impl DaemonClient {
         id: i64,
         importance: Option<f64>,
         memory_type: Option<&str>,
+        user_answered: bool,
         agent: Option<&str>,
     ) -> Result<Updated, ClientError> {
         let resp = self
@@ -1009,7 +1014,7 @@ impl DaemonClient {
             .patch(self.url(&format!("/v1/memories/{kind}/{id}")))
             .query(&owner_query(agent))
             .bearer_auth(&self.token)
-            .json(&UpdateBody { importance, memory_type })
+            .json(&UpdateBody { importance, memory_type, user_answered })
             .send()
             .await
             .map_err(Self::map_transport)?;
@@ -1079,6 +1084,7 @@ impl DaemonClient {
         other: i64,
         verdict: &str,
         reason: Option<&str>,
+        user_answered: bool,
         agent: Option<&str>,
     ) -> Result<Resolution, ClientError> {
         let resp = self
@@ -1086,7 +1092,8 @@ impl DaemonClient {
             .post(self.url("/v1/disputes/judge"))
             .bearer_auth(&self.token)
             .json(&serde_json::json!({
-                "keep": keep, "other": other, "verdict": verdict, "reason": reason, "agent_id": agent,
+                "keep": keep, "other": other, "verdict": verdict, "reason": reason,
+                "user_answered": user_answered, "agent_id": agent,
             }))
             .send()
             .await
@@ -1754,7 +1761,7 @@ pub(crate) mod tests {
         assert_eq!(synthesis.pending.iter().map(|r| r.id).collect::<Vec<_>>(), vec![id]);
         assert_eq!(synthesis.pending_total, 1);
 
-        assert_eq!(c.update("memory", id, Some(9.5), None, None).await.expect("patch").tier, 1);
+        assert_eq!(c.update("memory", id, Some(9.5), None, false, None).await.expect("patch").tier, 1);
         assert_eq!(c.delete("memory", id, None).await.expect("delete").deleted, 1);
     }
 
@@ -1900,7 +1907,7 @@ pub(crate) mod tests {
         publish(&d);
         let c = DaemonClient::from_data_dir(d.dir.path()).expect("client");
 
-        let err = c.judge(1, 1, "compatible", None, None).await.expect_err("a row cannot be judged against itself");
+        let err = c.judge(1, 1, "compatible", None, false, None).await.expect_err("a row cannot be judged against itself");
 
         assert!(matches!(err, ClientError::Daemon { status: 400, .. }), "{err:?}");
     }
