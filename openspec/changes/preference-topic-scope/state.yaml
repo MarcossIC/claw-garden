@@ -1,0 +1,14 @@
+change: preference-topic-scope
+objective: "1"
+depends_on: [topic-revisions]
+phase: explore
+artifacts:
+  exploration: draft
+  proposal: pending
+  spec: pending
+  design: pending
+  tasks: pending
+  apply: pending
+  verify: pending
+  archive: pending
+updated: 2026-10-20
