@@ -27,7 +27,7 @@
 - WHEN corre `clawg stop`
 - THEN sale con 0 y el proceso del daemon terminó
 
-**Tests:** `a_server_that_does_not_finish_is_left_after_the_grace` y `a_server_that_finishes_in_time_gives_its_result` (`serve.rs`, tiempo pausado); `shutdown_gives_up_on_a_worker_that_never_ends` (`crates/clawg-core/tests/shutdown.rs`, tiempo pausado); `stop_ends_a_daemon_whose_model_load_never_returns` (`binary.rs`, con `CLAWG_TEST_EMBEDDER=blocked`).
+**Tests:** `a_server_that_does_not_finish_is_left_after_the_grace`, `a_server_that_finishes_in_time_gives_its_result` y `without_a_shutdown_the_server_has_no_deadline` (`serve.rs`, tiempo pausado); `shutdown_gives_up_on_a_worker_that_never_ends` (`crates/clawg-core/tests/shutdown.rs`, tiempo pausado); `stop_ends_a_daemon_whose_model_load_never_returns` (`binary.rs`, con `CLAWG_TEST_EMBEDDER=blocked`).
 
 ## R2. Las fases caben en `STOP_TIMEOUT` con holgura
 
@@ -65,4 +65,4 @@ Cuando `StopDaemon` falla con el apagado pedido (`ClientError::StopTimeout`), `u
 - WHEN se arma el informe
 - THEN dice que se pidió el apagado y cómo arrancar el daemon cuando termine
 
-**Tests:** `a_daemon_that_does_not_stop_in_time_is_started_again_and_nothing_is_renamed` y `a_stop_that_never_reached_the_daemon_starts_nothing` (`plan.rs`, reemplazan a `a_daemon_that_does_not_stop_renames_nothing`); `a_stop_that_ran_out_of_time_does_not_say_the_daemon_was_not_touched` y `a_daemon_still_shutting_down_says_how_to_start_it_once_it_ends` (`report.rs`).
+**Tests:** `a_daemon_that_does_not_stop_in_time_is_started_again_and_nothing_is_renamed` y `a_stop_that_never_reached_the_daemon_starts_nothing` (`plan.rs`, reemplazan a `a_daemon_that_does_not_stop_renames_nothing`); `a_daemon_still_shutting_down_says_how_to_start_it_once_it_ends` (`report.rs`). Que el informe ya no diga «not touched» lo da `undo StartOldDaemon` en `undone`, que `daemon_state` ya leía como «running again».
