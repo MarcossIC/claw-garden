@@ -28,8 +28,8 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 ## 5. Verificación
 
 - [x] Suite y clippy en Linux sobre el último commit ([verify](verify.md)).
-- [ ] El CI en verde en Linux y Windows.
+- [x] El CI en verde en Linux y Windows (run 39408972625 sobre `b4ea6af`).
 
 ## 6. Archive
 
-- [ ] `specs/disputes` (R3 y `conflicts`), `specs/mcp` (`resolve_conflict`), `specs/update` (R1, R4, R5); `git mv` a `changes/archive/`; `state.yaml`; fila 63 y el orden de ejecución del `README.md` de openspec; subir el minor.
+- [x] `specs/disputes` (R3 y `conflicts`), `specs/mcp` (`resolve_conflict`), `specs/update` (R1, R4, R5); `git mv` a `changes/archive/2026-10-20-protected-verdicts`; `state.yaml`; fila 63 y el orden de ejecución del `README.md` de openspec; subir el minor.
