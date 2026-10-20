@@ -142,7 +142,10 @@ Códigos de salida: hoy 0 sano, 1 no sano (`main.rs:181-185`). Se mantiene 1 par
 - **topic-revisions (27) y revision-aware-delete (49), archivados.** Son quienes introducen las invariantes 1 a 3; el chequeo es su red de seguridad en bases ya existentes.
 - **outbox-lifecycle (53).** Los saves que fallan a la mitad y las filas `failed` son fuente de violaciones; los hallazgos se coordinan con lo que 53 decida sobre ellas.
 - **secret-coverage (51) y project-clone-identity (30).** Cada uno arregla de origen un camino que rompe una invariante (el `purge` de la versión vigente, el re-key que une scopes); `doctor` sólo encuentra lo que ya quedó guardado.
-- **local-isolation (50), local-transport (58) y windows-pipe (59).** `doctor` puede informar, sin abrir el store, el modo del directorio de datos (el A3 de 50), el largo de la ruta del socket frente al tope de `sun_path` (108 bytes en Linux, 104 en macOS) y, en Windows, el descriptor de seguridad de la pipe del daemon que corre.
+- **local-isolation (50), local-transport (58) y windows-socket (59).** Sin abrir el store, `doctor` puede informar:
+  - el modo del directorio de datos (el A3 de 50);
+  - el largo de la ruta del socket frente al tope de `sun_path` (108 bytes en Linux y en Windows, 104 en macOS);
+  - en Windows, el DACL del archivo del socket del daemon que corre.
 
 ## Alcance candidato
 

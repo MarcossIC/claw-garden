@@ -1,9 +1,9 @@
-change: windows-pipe
+change: windows-socket
 objective: "transversal"
 depends_on: [local-transport]
-phase: explore
+phase: propose
 artifacts:
-  exploration: draft
+  exploration: done
   proposal: pending
   spec: pending
   design: pending
@@ -11,4 +11,4 @@ artifacts:
   apply: pending
   verify: pending
   archive: pending
-updated: 2026-10-19
+updated: 2026-10-20
