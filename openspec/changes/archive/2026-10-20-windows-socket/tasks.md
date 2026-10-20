@@ -112,4 +112,4 @@ Cubre S8, incluido el fallo que ya hay en Unix.
 
 ## 11. Archive
 
-- [ ] `specs/daemon-access` (R7 a R9 y R10 a R13), `specs/self-update` (S8, `:122`), `specs/install` (`:112`); `git mv` a `changes/archive/`; `state.yaml`; fila y orden de ejecución del `README.md` de openspec; subir el minor y `cargo update --workspace` en un commit `chore: bump version to X.Y.Z`.
+- [x] `specs/daemon-access` (R7 a R9 y R10 a R13), `specs/self-update` (S8, `:122`), `specs/install` (`:112`); `git mv` a `changes/archive/`; `state.yaml`; fila y orden de ejecución del `README.md` de openspec; subir el minor y `cargo update --workspace` en un commit `chore: bump version to X.Y.Z`.
