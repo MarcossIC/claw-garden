@@ -28,7 +28,7 @@ use axum::{Json, Router};
 use clawg_core::memory::admin::{
     Deleted, delete_memory_core, get_memory_core, list_memories_core, memory_stats_core, query_has_tokens,
     update_memory_core, ListParams, MemoryAdminRow, MemoryKind, MemoryPatch, MemoryStats, StatsParams,
-    UpdatedRow, restore_memory_core, RestoreError, RestoredRow,
+    UpdateError, UpdatedRow, restore_memory_core, RestoreError, RestoredRow,
 };
 use clawg_core::memory::backup::Reason;
 use clawg_core::memory::bootstrap::EmbedderStatus;
@@ -470,6 +470,10 @@ pub struct UpdateRequest {
     pub importance: Option<f64>,
     #[serde(default)]
     pub memory_type: Option<String>,
+    /// The caller declares the user answered, which taking a preference or a
+    /// decision out of its type needs.
+    #[serde(default)]
+    pub user_answered: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1441,13 +1445,17 @@ async fn update_memory(
 ) -> ApiResult<Json<UpdatedBody>> {
     let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
     let patch = MemoryPatch::new(kind, body.importance, body.memory_type.as_deref())
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        .map_err(|e| ApiError::bad_request(e.to_string()))?
+        .answered(body.user_answered);
     // The core answers `None` for "no such row", "already soft-deleted" and
     // "another agent's" alike, and from the caller's side those are the same
     // fact: the row it named is not there to change.
     let row = update_memory_core(&app.runtime.store, id, kind, &patch, owner.agent.as_deref())
         .await
-        .map_err(ApiError::internal)?
+        .map_err(|e| match e {
+            UpdateError::NeedsUser { .. } => ApiError::conflict(e.to_string()),
+            UpdateError::Store(e) => ApiError::internal(e),
+        })?
         .ok_or_else(|| ApiError::not_found(format!("no {kind:?} row with id {id}")))?;
     Ok(Json(UpdatedBody { updated: 1, row }))
 }
