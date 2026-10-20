@@ -7,7 +7,7 @@
 //! `CLAWG_TEST_HOME` and the fake model through `CLAWG_TEST_EMBEDDER`, which
 //! only a `testing` build (this one) reads. Every daemon the tests start binds
 //! `--port 0`, and one started without `--port` (by a bridge, by `update`)
-//! keeps to its socket on Unix (`CLAWG_TEST_DEFAULT_PORT=off`).
+//! keeps to its socket (`CLAWG_TEST_DEFAULT_PORT=off`).
 //!
 //! Children are ended through their own handle when their guard drops, also
 //! when a test panics, and never by name: a `clawg` the user's editor runs
@@ -20,6 +20,7 @@ use std::process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use clawg_cli::client::{Call, DaemonClient};
 use serde_json::{json, Value};
 
 const BIN: &str = env!("CARGO_BIN_EXE_clawg");
@@ -102,7 +103,6 @@ impl Sandbox {
     }
 
     /// A daemon run as `args` say, `--port` or not, with `env` on top.
-    #[cfg(unix)]
     async fn serve_as(&self, args: &[&str], env: &[(&str, &str)]) -> Daemon {
         let log = self.log(&format!("serve-{}", now_ns()));
         let child = self
@@ -128,7 +128,6 @@ impl Sandbox {
 
     /// A bridge that starts a daemon when none answers. That daemon is no
     /// child of the test: a `StopOnDrop` ends it.
-    #[cfg(unix)]
     fn bridge_starting_its_daemon(&self) -> Bridge {
         self.bridge_with(Path::new(BIN), &["mcp", "--profile", "dev", "--agent", "smoke"])
     }
@@ -161,14 +160,9 @@ impl Sandbox {
 }
 
 /// What keeps a daemon started without `--port` (by a bridge, by `update`)
-/// to its socket instead of the profile's port on this machine. Windows has no
-/// socket, and the tests there pass a port.
+/// to its socket instead of the profile's port on this machine.
 fn socket_only() -> Vec<(&'static str, &'static str)> {
-    if cfg!(unix) {
-        vec![("CLAWG_TEST_DEFAULT_PORT", "off")]
-    } else {
-        Vec::new()
-    }
+    vec![("CLAWG_TEST_DEFAULT_PORT", "off")]
 }
 
 fn now_ns() -> u128 {
@@ -194,9 +188,8 @@ struct Daemon {
     child: Arc<Mutex<Child>>,
     pid: u32,
     log: PathBuf,
-    base: String,
     token: String,
-    http: reqwest::Client,
+    client: Option<DaemonClient>,
 }
 
 impl Daemon {
@@ -213,7 +206,7 @@ impl Daemon {
                 std::thread::sleep(Duration::from_millis(50));
             }
         });
-        Self { child, pid, log, base: String::new(), token: String::new(), http: reqwest::Client::new() }
+        Self { child, pid, log, token: String::new(), client: None }
     }
 
     fn exit_status(&self) -> Option<ExitStatus> {
@@ -231,10 +224,10 @@ impl Daemon {
             if let Some(status) = self.exit_status() {
                 panic!("clawg serve exited with {status} before answering:\n{}", self.log_text());
             }
-            if let Some((reach, token)) = published(data_dir, self.pid) {
-                let health = reach.http.get(format!("{}/health", reach.base)).send().await;
-                if health.is_ok_and(|r| r.status().is_success()) {
-                    (self.http, self.base, self.token) = (reach.http, reach.base, token);
+            if let Some(client) = published(data_dir, self.pid) {
+                if client.send(health_call()).await.is_ok_and(|a| a.status.is_success()) {
+                    self.token = std::fs::read_to_string(data_dir.join("token")).unwrap_or_default().trim().to_string();
+                    self.client = Some(client);
                     return self;
                 }
             }
@@ -243,38 +236,26 @@ impl Daemon {
         }
     }
 
-    fn url(&self, path: &str) -> String {
-        format!("{}{path}", self.base)
+    fn client(&self) -> &DaemonClient {
+        self.client.as_ref().expect("the daemon answered")
     }
 
     async fn health(&self) -> Value {
-        let r = self.http.get(self.url("/health")).send().await.expect("health");
-        r.json().await.expect("health json")
+        let answer = self.client().send(health_call()).await.expect("health");
+        serde_json::from_slice(&answer.body).expect("health json")
     }
 
     async fn post(&self, path: &str, body: Value) -> (u16, Value) {
-        let r = self
-            .http
-            .post(self.url(path))
-            .bearer_auth(&self.token)
-            .json(&body)
-            .send()
-            .await
-            .expect("request");
-        let status = r.status().as_u16();
-        (status, r.json().await.unwrap_or(Value::Null))
+        let call = Call::new(reqwest::Method::POST, path).json(&body).expect("request body");
+        let answer = self.client().send(call).await.expect("request");
+        (answer.status.as_u16(), serde_json::from_slice(&answer.body).unwrap_or(Value::Null))
     }
 
     async fn list(&self) -> String {
-        let r = self
-            .http
-            .get(self.url("/v1/memories?limit=100"))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .expect("list");
-        assert!(r.status().is_success(), "{}", r.status());
-        r.text().await.expect("list body")
+        let call = Call::new(reqwest::Method::GET, "/v1/memories").query([("limit", "100")]);
+        let answer = self.client().send(call).await.expect("list");
+        assert!(answer.status.is_success(), "{}", answer.status);
+        String::from_utf8(answer.body).expect("list body")
     }
 
     /// Until the model is loaded. `/health` answers before it is, and a save
@@ -332,23 +313,8 @@ impl Drop for Daemon {
     }
 }
 
-/// How a client reaches the daemon a `daemon.json` describes, as clawg's own
-/// client does: by its socket when it published one, else by its port.
-struct Reach {
-    http: reqwest::Client,
-    base: String,
-}
-
-fn reach(data_dir: &Path, state: &Value) -> Option<Reach> {
-    #[cfg(unix)]
-    if state["unix_socket"] == true {
-        let http = reqwest::Client::builder().no_proxy().unix_socket(data_dir.join("clawg.sock")).build().ok()?;
-        return Some(Reach { http, base: "http://localhost".to_string() });
-    }
-    #[cfg(not(unix))]
-    let _ = data_dir;
-    let port = state["port"].as_u64()?;
-    Some(Reach { http: reqwest::Client::builder().no_proxy().build().ok()?, base: format!("http://127.0.0.1:{port}") })
+fn health_call() -> Call {
+    Call::new(reqwest::Method::GET, "/health").without_bearer()
 }
 
 /// `daemon.json` as JSON, if it is there.
@@ -356,14 +322,13 @@ fn state_of(data_dir: &Path) -> Option<Value> {
     serde_json::from_str(&std::fs::read_to_string(data_dir.join("daemon.json")).ok()?).ok()
 }
 
-/// The way in and the token, once `daemon.json` names `pid`.
-fn published(data_dir: &Path, pid: u32) -> Option<(Reach, String)> {
-    let state = state_of(data_dir)?;
-    if state["pid"].as_u64() != Some(u64::from(pid)) {
+/// A client of the daemon, once `daemon.json` names `pid`: clawg's own, so it
+/// goes by the socket when the daemon published one and by its port otherwise.
+fn published(data_dir: &Path, pid: u32) -> Option<DaemonClient> {
+    if state_of(data_dir)?["pid"].as_u64() != Some(u64::from(pid)) {
         return None;
     }
-    let token = std::fs::read_to_string(data_dir.join("token")).ok()?;
-    Some((reach(data_dir, &state)?, token.trim().to_string()))
+    DaemonClient::from_data_dir(data_dir)
 }
 
 /// A `clawg mcp` child with the test as its host.
@@ -718,12 +683,10 @@ async fn export_and_import_round_trip_through_the_binary() {
     assert!(text.contains("> a second exported memory"), "{text}");
 }
 
-// ── The data directory's socket (Unix) ─────────────────────────────────────
+// ── The data directory's socket ────────────────────────────────────────────
 
-#[cfg(unix)]
 const SERVE_WITHOUT_PORT: [&str; 3] = ["serve", "--profile", "dev"];
 
-#[cfg(unix)]
 #[tokio::test]
 async fn a_daemon_without_a_port_serves_status_stop_bridge_and_hooks_over_its_socket() {
     let sandbox = Sandbox::new();
@@ -768,7 +731,6 @@ async fn a_daemon_without_a_port_serves_status_stop_bridge_and_hooks_over_its_so
     assert!(!sandbox.data_dir().join("daemon.json").exists());
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn an_orphan_socket_left_by_a_kill_does_not_keep_the_next_daemon_out() {
     let sandbox = Sandbox::new();
@@ -782,7 +744,6 @@ async fn an_orphan_socket_left_by_a_kill_does_not_keep_the_next_daemon_out() {
     assert_eq!(second.health().await["status"], "ok");
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn a_socket_path_over_the_limit_is_refused_by_name() {
     let owned = tempfile::tempdir().expect("tempdir");
@@ -801,7 +762,6 @@ async fn a_socket_path_over_the_limit_is_refused_by_name() {
     assert!(daemon.log_text().contains("serving over TCP alone"), "{}", daemon.log_text());
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn a_taken_profile_port_leaves_the_daemon_on_its_socket() {
     let sandbox = Sandbox::new();
@@ -816,7 +776,20 @@ async fn a_taken_profile_port_leaves_the_daemon_on_its_socket() {
     assert!(daemon.log_text().contains(&format!("127.0.0.1:{port}")), "{}", daemon.log_text());
 }
 
-#[cfg(unix)]
+#[tokio::test]
+async fn a_taken_explicit_port_is_fatal_and_publishes_nothing() {
+    let sandbox = Sandbox::new();
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = taken.local_addr().expect("addr").port().to_string();
+
+    let refused = sandbox.run(&["serve", "--profile", "dev", "--port", &port]);
+
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr_of(&refused));
+    assert!(stderr_of(&refused).contains(&port), "{}", stderr_of(&refused));
+    assert!(!sandbox.data_dir().join("daemon.json").exists());
+    assert!(!sandbox.data_dir().join("token").exists());
+}
+
 #[tokio::test]
 async fn a_bridge_starts_its_daemon_through_the_binary() {
     let sandbox = Sandbox::new();
@@ -1361,16 +1334,9 @@ impl Drop for StopOnDrop {
 
 /// `/health` of the daemon the data directory names.
 async fn published_health(data_dir: &Path) -> Value {
-    let reach = reach(data_dir, &state_of(data_dir).expect("daemon.json")).expect("a way in");
-    reach
-        .http
-        .get(format!("{}/health", reach.base))
-        .send()
-        .await
-        .expect("health")
-        .json()
-        .await
-        .expect("health json")
+    let client = DaemonClient::from_data_dir(data_dir).expect("a way in");
+    let answer = client.send(health_call()).await.expect("health");
+    serde_json::from_slice(&answer.body).expect("health json")
 }
 
 /// The files beside the installed binary whose name starts with `prefix`.
@@ -1395,17 +1361,10 @@ fn last_migration() -> i32 {
 
 /// What the daemon the data directory names answers to `method` on `path`.
 async fn published_send(data_dir: &Path, method: reqwest::Method, path: &str) -> String {
-    let reach = reach(data_dir, &state_of(data_dir).expect("daemon.json")).expect("a way in");
-    let token = std::fs::read_to_string(data_dir.join("token")).expect("token");
-    let response = reach
-        .http
-        .request(method, format!("{}{path}", reach.base))
-        .bearer_auth(token.trim())
-        .send()
-        .await
-        .expect("request");
-    assert!(response.status().is_success(), "{path}: {}", response.status());
-    response.text().await.expect("body")
+    let client = DaemonClient::from_data_dir(data_dir).expect("a way in");
+    let answer = client.send(Call::new(method, path)).await.expect("request");
+    assert!(answer.status.is_success(), "{path}: {}", answer.status);
+    String::from_utf8(answer.body).expect("body")
 }
 
 async fn published_get(data_dir: &Path, path: &str) -> String {
@@ -1843,10 +1802,8 @@ async fn a_full_update_with_a_daemon_replaces_the_binary_and_a_bridge_reaches_th
 
 /// A stamp's extra field that makes the copy speak TCP alone, as a clawg
 /// older than the socket.
-#[cfg(unix)]
 const OLDER_TRANSPORT: &str = r#","transport":"tcp""#;
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_older_updater_installs_the_socket_version_and_sees_it_answer() {
     let sandbox = Sandbox::new();
@@ -1868,7 +1825,6 @@ async fn an_older_updater_installs_the_socket_version_and_sees_it_answer() {
     assert_eq!(published_health(&sandbox.data_dir()).await["version"], "0.19.0");
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn an_older_bridge_reaches_a_new_daemon_over_the_profile_port() {
     let sandbox = Sandbox::new();
