@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| transversal | M | 26 client-setup (sólo el chequeo del registro MCP), 29 project-root-guard (sólo el de colisión de `project_id`); el resto no depende de nada; los invariantes de estado suponen 27 y 49 (archivados) y se coordinan con 53 | exploración (borrador) |
+| transversal | M | 26 client-setup (sólo el chequeo del registro MCP), 29 project-root-guard (sólo el de colisión de `project_id`); el resto no depende de nada; los invariantes de estado suponen 27 y 49 (archivados) y se coordinan con 53 | exploración cerrada; las decisiones, en la [propuesta](proposal.md#decisiones) |
 
 **Tesis:** `clawg doctor` hoy responde una sola pregunta: qué `clawg.exe` ejecuta la terminal. Todo lo demás que puede dejar a un usuario con una memoria que "no anda" se descubre por accidente: leyendo el log, probando `memory_status` o viendo que una búsqueda vuelve vacía. Los datos casi nunca están en riesgo. Lo que falta es una sola salida que diga qué está mal, por qué, con qué evidencia y cuál es el siguiente paso seguro, sin tocar la base si no se pide.
 

@@ -294,7 +294,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 "{}",
                 serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
             );
-            Ok(if report.analysis.is_healthy() {
+            Ok(if !report.summary.fails() {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::from(EXIT_FAILURE)

@@ -14,7 +14,9 @@ use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::memory::db::EmbeddingIdentity;
 use crate::memory::model_download::TokenizerFiles;
+use crate::memory::vector::EMBEDDING_DIM;
 use tokenizers::{Encoding, Tokenizer};
 
 /// Which side of an asymmetric embedding model a text plays: the thing being
@@ -137,6 +139,17 @@ pub const E5_MODEL_ID: &str = "multilingual-e5-small/mean";
 /// since e5 is trained with mean pooling. A store under this id holds vectors
 /// that must be re-embedded, never mixed with new ones.
 pub const LEGACY_CLS_MODEL_ID: &str = "multilingual-e5-small";
+
+/// The contract this binary's embedder records its vectors under, known
+/// without loading the model, so a stopped store can be checked against it.
+pub fn expected_contract() -> EmbeddingIdentity {
+    EmbeddingIdentity {
+        model_id: E5_MODEL_ID.to_string(),
+        dim: EMBEDDING_DIM,
+        query_prefix: E5_QUERY_PREFIX.to_string(),
+        passage_prefix: E5_PASSAGE_PREFIX.to_string(),
+    }
+}
 
 /// ONNX Runtime's CPU provider with its arena off. The arena keeps the largest
 /// block an inference run ever asked for and never gives it back, so the
@@ -551,7 +564,7 @@ impl E5Embedder {
 
         Ok(Self {
             req_tx,
-            dimensions: 384,
+            dimensions: EMBEDDING_DIM,
             model_id: E5_MODEL_ID,
         })
     }
@@ -1239,6 +1252,19 @@ mod tests {
         let out = local.embed_with_role("anything", EmbedRole::Passage).await.unwrap();
         assert_eq!(out.len(), 384);
         assert_eq!(out, canned, "worker reply must flow back unchanged");
+    }
+
+    #[test]
+    fn the_expected_contract_is_what_the_embedder_records() {
+        let (req_tx, _req_rx) = mpsc::unbounded_channel::<EmbedRequest>();
+        let embedder = E5Embedder::from_mock_worker(req_tx);
+        let recorded = EmbeddingIdentity::of(&embedder);
+        let expected = expected_contract();
+        assert_eq!(expected.model_id, E5_MODEL_ID);
+        assert_eq!(
+            (expected.dim, expected.query_prefix, expected.passage_prefix),
+            (recorded.dim, recorded.query_prefix, recorded.passage_prefix)
+        );
     }
 
     /// `E5Embedder::embed_batch` must send exactly one channel request
