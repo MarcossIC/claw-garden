@@ -60,10 +60,25 @@ pub fn plan(initial: &Initial) -> Vec<Planned> {
     steps
 }
 
+/// Why a step failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepError {
+    pub cause: String,
+    /// The step left something going on that its undo has to see to: a
+    /// shutdown the daemon accepted and had not finished.
+    pub under_way: bool,
+}
+
+impl From<String> for StepError {
+    fn from(cause: String) -> Self {
+        Self { cause, under_way: false }
+    }
+}
+
 /// The boundary with disk, network and processes. One production
 /// implementation; the unit tests use a model of the installation.
 pub trait Effects {
-    fn run(&mut self, step: Step) -> impl Future<Output = Result<(), String>>;
+    fn run(&mut self, step: Step) -> impl Future<Output = Result<(), StepError>>;
     fn undo(&mut self, undo: Undo) -> impl Future<Output = Result<(), String>>;
     /// Called once the new daemon is gone: gives the store back to the old
     /// binary if the new one migrated it past what the old one opens.
@@ -107,9 +122,10 @@ pub struct Failure {
 }
 
 impl Step {
-    /// Whether the step can leave something behind when it fails, so its undo
-    /// runs too: a download that broke halfway left a file, a daemon that did
-    /// not answer left a process. The other steps either happen or do not.
+    /// Whether the step can leave something behind whenever it fails, so its
+    /// undo runs too: a download that broke halfway left a file, a daemon that
+    /// did not answer left a process. A stop does only when its failure says
+    /// so ([`StepError::under_way`]); the other steps either happen or do not.
     fn leaves_traces_when_it_fails(self) -> bool {
         matches!(self, Step::Stage | Step::StartDaemon)
     }
@@ -122,11 +138,11 @@ pub async fn apply<E: Effects>(plan: &[Planned], fx: &mut E) -> Outcome {
     for &(step, undo) in plan {
         match fx.run(step).await {
             Ok(()) => done.extend(undo),
-            Err(cause) => {
-                if step.leaves_traces_when_it_fails() {
+            Err(error) => {
+                if error.under_way || step.leaves_traces_when_it_fails() {
                     done.extend(undo);
                 }
-                return Outcome::Failed(roll_back(step, cause, done, fx).await);
+                return Outcome::Failed(roll_back(step, error.cause, done, fx).await);
             }
         }
     }
@@ -352,6 +368,8 @@ mod apply_cases {
         daemon: Daemon,
         calls: Vec<String>,
         fail_run: Option<(Step, &'static str)>,
+        /// The failing step left something going on (a shutdown accepted).
+        under_way: bool,
         fail_undo: Option<Undo>,
         restore: Result<StoreRestore, String>,
     }
@@ -365,6 +383,7 @@ mod apply_cases {
                 daemon: Daemon::Old,
                 calls: Vec::new(),
                 fail_run: None,
+                under_way: false,
                 fail_undo: None,
                 restore: Ok(StoreRestore::NotNeeded),
             }
@@ -384,7 +403,7 @@ mod apply_cases {
     }
 
     impl Effects for Fake {
-        async fn run(&mut self, step: Step) -> Result<(), String> {
+        async fn run(&mut self, step: Step) -> Result<(), StepError> {
             self.calls.push(format!("{step:?}"));
             // A step that fails after leaving a trace (a download that broke
             // halfway, a daemon that started and never answered) does; one
@@ -392,14 +411,16 @@ mod apply_cases {
             match step {
                 Step::Stage => self.staged = Some("new"),
                 Step::Smoke => {}
-                Step::StopDaemon if !self.fails(step) => self.daemon = Daemon::Stopped,
+                Step::StopDaemon if !self.fails(step) || self.under_way => self.daemon = Daemon::Stopped,
                 Step::SetAside if !self.fails(step) => self.aside = self.installed.take(),
                 Step::PutInPlace if !self.fails(step) => self.installed = self.staged.take(),
                 Step::StartDaemon => self.daemon = Daemon::New,
                 Step::StopDaemon | Step::SetAside | Step::PutInPlace => {}
             }
             match self.fail_run {
-                Some((failing, cause)) if failing == step => Err(cause.to_string()),
+                Some((failing, cause)) if failing == step => {
+                    Err(StepError { cause: cause.to_string(), under_way: self.under_way })
+                }
                 _ => Ok(()),
             }
         }
@@ -592,9 +613,24 @@ mod apply_cases {
         }
     }
 
+    /// The daemon accepted the shutdown and ends on its own a moment later:
+    /// left alone, the user would have no daemon and a report saying it was
+    /// not touched.
     #[tokio::test]
-    async fn a_daemon_that_does_not_stop_renames_nothing() {
-        let mut fake = Fake::failing(Step::StopDaemon, "still running after 30s");
+    async fn a_daemon_that_does_not_stop_in_time_is_started_again_and_nothing_is_renamed() {
+        let mut fake = Fake { under_way: true, ..Fake::failing(Step::StopDaemon, "still running after 30s") };
+
+        let failure = failure(apply(&with_daemon(), &mut fake).await);
+
+        assert_eq!(failure.step, Step::StopDaemon);
+        assert_eq!(fake.calls, ["Stage", "Smoke", "StopDaemon", "undo StartOldDaemon", "undo RemoveStaged"]);
+        assert_eq!(failure.undone, [Undo::StartOldDaemon, Undo::RemoveStaged]);
+        assert!(fake.as_it_was());
+    }
+
+    #[tokio::test]
+    async fn a_stop_that_never_reached_the_daemon_starts_nothing() {
+        let mut fake = Fake::failing(Step::StopDaemon, "the daemon is not running");
 
         let failure = failure(apply(&with_daemon(), &mut fake).await);
 

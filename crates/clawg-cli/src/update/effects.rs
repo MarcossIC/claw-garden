@@ -10,14 +10,15 @@ use clawg_core::memory::backup;
 use clawg_core::memory::store_lock::StoreLock;
 use clawg_core::paths::{backups_dir, Profile};
 
-use crate::client::{spawn_serve_at, DaemonClient, Health};
+use crate::client::{spawn_serve_at, ClientError, DaemonClient, Health};
 use crate::daemon::lifecycle::{clear_state, read_state};
+use crate::process::{Exit, Watched};
 use crate::stop::{stop_in, STOP_TIMEOUT};
 
 use super::client::ReleaseClient;
 use super::plan::{
-    judge, new_pre_migration, store_needs_restore, Answer, Effects, Observation, Running, Step, StoreRestore,
-    Undo, Verdict,
+    judge, new_pre_migration, store_needs_restore, Answer, Effects, Observation, Running, Step, StepError,
+    StoreRestore, Undo, Verdict,
 };
 use super::release::Release;
 use super::report::{install_dir_access, NewDaemon};
@@ -67,6 +68,8 @@ pub struct Installation {
     /// The daemon that was running when the update began.
     old: Option<Running>,
     child: Option<Child>,
+    /// The daemon that accepted the shutdown and had not ended in time.
+    stopping: Option<u32>,
     backups_before: Option<Vec<String>>,
     set_aside: bool,
     new_daemon: Option<NewDaemon>,
@@ -81,6 +84,7 @@ impl Installation {
             installed,
             old,
             child: None,
+            stopping: None,
             backups_before: None,
             set_aside: false,
             new_daemon: None,
@@ -279,6 +283,22 @@ impl Installation {
     }
 }
 
+/// Waits for the daemon whose shutdown ran out of time to end. Started before
+/// then, the old daemon would lose the store to it, and the daemon still
+/// answering with the same version would pass for the one just started.
+async fn wait_for_end(pid: u32, timeout: Duration) -> Result<(), String> {
+    let Some(watched) = Watched::open(pid) else {
+        return Ok(());
+    };
+    match tokio::task::spawn_blocking(move || watched.wait(timeout)).await {
+        Ok(Exit::Exited) => Ok(()),
+        Ok(Exit::TimedOut) | Err(_) => Err(format!(
+            "the daemon (pid {pid}) was asked to stop and was still running {} s later",
+            timeout.as_secs()
+        )),
+    }
+}
+
 /// Why waiting for a daemon ended without one.
 enum Waited {
     Other(Answer),
@@ -365,15 +385,21 @@ fn held_by_another_process(_: &std::io::Error) -> bool {
 }
 
 impl Effects for Installation {
-    async fn run(&mut self, step: Step) -> Result<(), String> {
+    async fn run(&mut self, step: Step) -> Result<(), StepError> {
         match step {
-            Step::Stage => self.stage().await,
-            Step::Smoke => self.smoke().await,
-            Step::StopDaemon => {
-                let pid = stop_in(&self.paths.base_dir, STOP_TIMEOUT).await.map_err(|e| e.to_string())?;
-                println!("stopped the daemon (pid {pid})");
-                Ok(())
-            }
+            Step::Stage => Ok(self.stage().await?),
+            Step::Smoke => Ok(self.smoke().await?),
+            Step::StopDaemon => match stop_in(&self.paths.base_dir, STOP_TIMEOUT).await {
+                Ok(pid) => {
+                    println!("stopped the daemon (pid {pid})");
+                    Ok(())
+                }
+                Err(e @ ClientError::StopTimeout { pid, .. }) => {
+                    self.stopping = Some(pid);
+                    Err(StepError { cause: e.to_string(), under_way: true })
+                }
+                Err(e) => Err(e.to_string().into()),
+            },
             Step::SetAside => {
                 rename(&self.paths.exe, &self.paths.aside).await?;
                 self.set_aside = true;
@@ -384,10 +410,14 @@ impl Effects for Installation {
                 // Until the directory is synced a power cut can keep the first
                 // rename and lose the second, leaving no binary under the name.
                 let dir = self.paths.exe.parent().unwrap_or(Path::new("."));
-                backup::sync_dir(dir).map_err(|e| format!("cannot sync {}: {e}", dir.display()))
+                Ok(backup::sync_dir(dir).map_err(|e| format!("cannot sync {}: {e}", dir.display()))?)
             }
             Step::StartDaemon => {
-                let port = self.old.as_ref().map(|d| d.port).ok_or("there is no daemon port to start on")?;
+                let port = self
+                    .old
+                    .as_ref()
+                    .map(|d| d.port)
+                    .ok_or_else(|| "there is no daemon port to start on".to_string())?;
                 self.backups_before = Some(self.backup_names());
                 let (exe, version) = (self.paths.exe.clone(), self.candidate.release.version.to_string());
                 let health = self.start_and_wait(&exe, &version, port).await?;
@@ -407,6 +437,9 @@ impl Effects for Installation {
             },
             Undo::StartOldDaemon => {
                 let old = self.old.clone().ok_or("there was no daemon to start again")?;
+                if let Some(pid) = self.stopping.take() {
+                    wait_for_end(pid, STOP_TIMEOUT).await?;
+                }
                 let exe = self.paths.exe.clone();
                 // The daemon that was running may report another version than
                 // the binary put back (one started before the file was replaced).
