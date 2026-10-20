@@ -24,7 +24,7 @@ use clawg_core::runtime::{MemoryRuntime, Workers};
 
 use super::api::{router, AppCtx, SAVE_CONFIRM_TIMEOUT};
 #[cfg(unix)]
-use super::socket::{bind_socket, PeerChecked, SocketError};
+use super::socket::{bind_socket, serves_without_socket, PeerChecked, SocketError};
 use super::lifecycle::{
     clear_state, generate_token, now_ms, write_state, write_token, DaemonState, LifecycleError,
 };
@@ -317,7 +317,7 @@ fn bind_profile_socket(base_dir: &std::path::Path, explicit_port: bool) -> Resul
     }
     match bind_socket(&socket_file(base_dir)) {
         Ok(listener) => Ok(Some(listener)),
-        Err(e @ SocketError::TooLong { .. }) if explicit_port => {
+        Err(e) if serves_without_socket(&e, explicit_port) => {
             log::warn!("{e}; serving over TCP alone");
             Ok(None)
         }

@@ -6,5 +6,4 @@ pub mod guard;
 pub mod lifecycle;
 pub mod serve;
 pub mod sessions;
-#[cfg(unix)]
 pub mod socket;
