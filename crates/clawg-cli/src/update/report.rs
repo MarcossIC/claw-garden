@@ -98,8 +98,14 @@ fn daemon_state(failure: &Failure, had_daemon: bool) -> String {
     } else if failure.undone.contains(&Undo::StartOldDaemon) {
         "Its daemon is running again.".to_string()
     } else if failure.stuck.iter().any(|(undo, _)| *undo == Undo::StartOldDaemon) {
-        "Its daemon is not running: start it with `clawg serve` or by reconnecting the editor's MCP server."
-            .to_string()
+        if failure.step == Step::StopDaemon {
+            "Its daemon was asked to stop and had not ended: once it has, start it with `clawg serve` \
+             or by reconnecting the editor's MCP server."
+                .to_string()
+        } else {
+            "Its daemon is not running: start it with `clawg serve` or by reconnecting the editor's MCP server."
+                .to_string()
+        }
     } else {
         "Its daemon was not touched.".to_string()
     }
@@ -376,6 +382,27 @@ mod tests {
             report.contains("Its daemon is not running: start it with `clawg serve` or by reconnecting the editor's MCP server."),
             "{report}"
         );
+    }
+
+    #[test]
+    fn a_daemon_still_shutting_down_says_how_to_start_it_once_it_ends() {
+        let mut late = failed(
+            Step::StopDaemon,
+            "the daemon (pid 7) accepted the shutdown but is still running after 30s",
+            &[Undo::RemoveStaged],
+        );
+        late.stuck = vec![(Undo::StartOldDaemon, "the daemon (pid 7) is still running".into())];
+
+        let report = failure(&late, &context());
+
+        assert!(
+            report.contains(
+                "Its daemon was asked to stop and had not ended: once it has, start it with `clawg serve` \
+                 or by reconnecting the editor's MCP server."
+            ),
+            "{report}"
+        );
+        assert!(!report.contains("not touched"), "{report}");
     }
 
     #[test]

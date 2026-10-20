@@ -13,7 +13,7 @@ use clawg_core::memory::spill::{REJECTED_FILE, SPILL_FILE};
 use clawg_core::memory::store_lock::StoreHolder;
 use clawg_core::memory::MemoryStore;
 use clawg_core::models::chat::Role;
-use clawg_core::runtime::{MemoryRuntime, Workers};
+use clawg_core::runtime::{MemoryRuntime, Workers, AFTER_DRAIN};
 use once_cell::sync::OnceCell;
 use clawg_core::memory::worker::IngestRequest;
 use clawg_core::runtime::Accepted;
@@ -182,6 +182,30 @@ async fn wait_for_rows(store: &MemoryStore, n: usize) -> Vec<String> {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// A worker stuck on an embed that never returns must not keep the process
+/// past what `clawg stop` waits for: the save stays in its outbox row.
+#[tokio::test(start_paused = true)]
+async fn shutdown_gives_up_on_a_worker_that_never_ends() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (runtime, _rx) = MemoryRuntime::new_for_test(tmp.path().to_path_buf()).await;
+    let (drain, _drain_rx) = tokio::sync::watch::channel(None);
+    let workers = Workers {
+        ingest: tokio::spawn(std::future::pending()),
+        maintenance: tokio::spawn(std::future::pending()),
+        drain,
+    };
+    let drain_deadline = Duration::from_secs(1);
+    let started = tokio::time::Instant::now();
+
+    tokio::time::timeout(Duration::from_secs(3600), runtime.shutdown_within(workers, drain_deadline))
+        .await
+        .expect("the shutdown waited for the worker without end");
+
+    let took = started.elapsed();
+    assert!(took >= drain_deadline + AFTER_DRAIN, "gave up early: {took:?}");
+    assert!(took < drain_deadline + AFTER_DRAIN + Duration::from_secs(1), "gave up late: {took:?}");
 }
 
 #[tokio::test]

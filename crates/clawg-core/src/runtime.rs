@@ -49,11 +49,18 @@ use crate::memory::{MemoryError, MemoryStore};
 pub const INGEST_QUEUE_CAPACITY: usize = 1024;
 
 /// How long a shutdown keeps ingesting what is queued before it leaves the
-/// rest in the outbox for the next start. It must leave `clawg stop`'s timeout
-/// room for the event in flight, the access flush and the checkpoint, so the stop sees
-/// the process end; a test in `clawg-cli` pins that relation. A starting value
-/// chosen for that margin, not measured.
+/// rest in the outbox for the next start. With [`AFTER_DRAIN`] and the
+/// daemon's other phases it has to fit inside `clawg stop`'s timeout, so the
+/// stop sees the process end; a test in `clawg-cli` pins that relation. A
+/// starting value chosen for that margin, not measured.
 pub const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How long a shutdown may go on past its drain deadline: the save in flight,
+/// the access flush, the end of maintenance and the checkpoint, which alone
+/// may wait 5 s on a reader of another process (the busy timeout rusqlite sets
+/// on every connection). Past it the shutdown leaves the rest undone: the save
+/// in flight keeps its outbox row and the WAL is replayed on the next open.
+pub const AFTER_DRAIN: Duration = Duration::from_secs(7);
 
 /// Why [`MemoryRuntime::accept`] refused a save. Nothing of it is kept.
 #[derive(Debug, thiserror::Error)]
@@ -306,7 +313,7 @@ impl MemoryRuntime {
     /// Orderly shutdown, once nothing can send new events: drains the ingest
     /// queue for up to [`DRAIN_DEADLINE`], leaving what is left in the outbox
     /// for the next start, flushes the access tracker, stops maintenance and
-    /// checkpoints the WAL.
+    /// checkpoints the WAL, all of it within [`AFTER_DRAIN`] past the drain.
     pub async fn shutdown(&self, workers: Workers) {
         self.shutdown_by(workers, DRAIN_DEADLINE).await;
     }
@@ -320,6 +327,18 @@ impl MemoryRuntime {
     async fn shutdown_by(&self, workers: Workers, drain_deadline: Duration) {
         // An error means the worker already ended; awaiting it below says how.
         let _ = workers.drain.send(Some(Instant::now() + drain_deadline));
+        let maintenance = workers.maintenance.abort_handle();
+        let bound = drain_deadline + AFTER_DRAIN;
+        if tokio::time::timeout(bound, self.finish(workers)).await.is_err() {
+            maintenance.abort();
+            log::warn!(
+                "the shutdown did not finish within {} s; what is left is in the outbox and the WAL for the next start",
+                bound.as_secs()
+            );
+        }
+    }
+
+    async fn finish(&self, workers: Workers) {
         match workers.ingest.await {
             // Only an event queued without `accept` lacks a row, and only the
             // in-process paths of tests and evaluation queue one.

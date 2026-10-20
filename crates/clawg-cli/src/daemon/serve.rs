@@ -7,8 +7,9 @@
 //! may execute (the bootstrap downloads a 470 MB model). The way to keep that
 //! honest is to leave nothing here worth testing.
 
+use std::future::{Future, IntoFuture};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clawg_core::build_info::{self, ServeFault};
 use clawg_core::memory::bootstrap::{
@@ -61,6 +62,17 @@ pub enum ServeError {
     Injected(String),
 }
 
+/// How long the requests in flight may go on once a shutdown was asked for.
+/// Past it they are cut: a save already has its outbox row, and a snapshot is
+/// only renamed to its final name once complete. One of the phases that
+/// `clawg stop`'s timeout covers; a test in `stop.rs` pins the sum.
+pub const HTTP_GRACE: Duration = Duration::from_secs(3);
+
+/// How long `clawg serve`, once `run` returned, waits for blocking tasks still
+/// running (a model load cannot be cancelled) before the process exits without
+/// them. Another of the phases `clawg stop`'s timeout covers.
+pub const RUNTIME_TEARDOWN: Duration = Duration::from_secs(2);
+
 /// Splits "someone else has the store" from every other reason opening it can
 /// fail; see [`ServeError::StoreInUse`].
 fn classify_open_error(err: MemoryError) -> ServeError {
@@ -70,7 +82,7 @@ fn classify_open_error(err: MemoryError) -> ServeError {
     }
 }
 
-/// Runs the daemon until Ctrl-C or `POST /v1/shutdown`.
+/// Runs the daemon until Ctrl-C, SIGTERM or `POST /v1/shutdown`.
 ///
 /// `port` of `0` asks the OS for an ephemeral port; the real one is what gets
 /// published in `daemon.json`, so clients always dial where the socket actually
@@ -180,9 +192,24 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
         base_dir.display()
     );
 
-    let result = axum::serve(listener, router(ctx.clone()))
-        .with_graceful_shutdown(shutdown_signal(shutdown_rx))
-        .await;
+    // The signal is observed once, and tells the grace when it fired.
+    let (stopping_tx, stopping_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = axum::serve(listener, router(ctx.clone()))
+        .with_graceful_shutdown(async move {
+            shutdown_signal(shutdown_rx).await;
+            let _ = stopping_tx.send(());
+        })
+        .into_future();
+    let result = match within_grace(server, stopping_rx, HTTP_GRACE).await {
+        Some(result) => result,
+        None => {
+            log::warn!(
+                "requests were still in flight {} s after the shutdown began; they were cut",
+                HTTP_GRACE.as_secs()
+            );
+            Ok(())
+        }
+    };
 
     // No request can queue a save any more, so whatever is queued now is all
     // there is to drain or spill.
@@ -196,7 +223,19 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
     result.map_err(ServeError::Server)
 }
 
-/// Completes on Ctrl-C or on the API's shutdown flag, whichever comes first.
+/// Runs `server` to its end, or until `grace` after `stopping` resolved,
+/// whichever comes first; `None` when the grace ran out first.
+async fn within_grace<S: Future>(server: S, stopping: impl Future, grace: Duration) -> Option<S::Output> {
+    tokio::pin!(server);
+    tokio::select! {
+        out = &mut server => return Some(out),
+        _ = stopping => {}
+    }
+    tokio::time::timeout(grace, server).await.ok()
+}
+
+/// Completes on Ctrl-C, on SIGTERM (Unix) or on the API's shutdown flag,
+/// whichever comes first.
 ///
 /// When the watch channel's sender is gone the API can no longer ask for
 /// anything, so that branch parks forever rather than resolving — otherwise a
@@ -206,6 +245,8 @@ async fn shutdown_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
         let _ = tokio::signal::ctrl_c().await;
         log::info!("received Ctrl-C, shutting down");
     };
+
+    let terminate = terminated();
 
     let via_api = async move {
         loop {
@@ -222,8 +263,31 @@ async fn shutdown_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
 
     tokio::select! {
         _ = ctrl_c => {}
+        _ = terminate => {}
         _ = via_api => {}
     }
+}
+
+/// Completes on SIGTERM, what `systemctl stop` and a plain `kill` send.
+#[cfg(unix)]
+async fn terminated() {
+    use tokio::signal::unix::{signal, SignalKind};
+    match signal(SignalKind::terminate()) {
+        Ok(mut sigterm) => {
+            sigterm.recv().await;
+            log::info!("received SIGTERM, shutting down");
+        }
+        Err(e) => {
+            log::warn!("cannot listen for SIGTERM: {e}; it ends the daemon without a shutdown");
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Windows has no SIGTERM; its console events are not handled.
+#[cfg(not(unix))]
+async fn terminated() {
+    std::future::pending::<()>().await;
 }
 
 #[cfg(test)]
@@ -287,6 +351,38 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), shutdown_signal(rx))
             .await
             .expect("an already-raised flag must resolve immediately");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_server_that_does_not_finish_is_left_after_the_grace() {
+        let started = tokio::time::Instant::now();
+
+        let out = within_grace(std::future::pending::<()>(), async {}, Duration::from_secs(3)).await;
+
+        assert_eq!(out, None);
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_server_that_finishes_in_time_gives_its_result() {
+        let server = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            7
+        };
+
+        assert_eq!(within_grace(server, async {}, Duration::from_secs(3)).await, Some(7));
+    }
+
+    /// The grace only starts with a shutdown: a long request in normal
+    /// operation (a backup of a big store) is never cut.
+    #[tokio::test(start_paused = true)]
+    async fn without_a_shutdown_the_server_has_no_deadline() {
+        let server = async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            7
+        };
+
+        assert_eq!(within_grace(server, std::future::pending::<()>(), Duration::from_secs(3)).await, Some(7));
     }
 
     /// If every sender is dropped the API can no longer request anything, so

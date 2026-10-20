@@ -2,14 +2,14 @@
 
 Fuente de verdad de cómo la suite prueba el binario `clawg` mismo: el build de test y las dos variables que sólo él lee (el home de prueba y el embedder de prueba), la regla que las mantiene fuera del binario que se entrega, las pruebas que lanzan el binario como proceso hijo, y el CI. Nada de esto cambia el binario que se entrega. El directorio de datos, el lock y el outbox están en [`specs/storage`](../storage/spec.md); el puente y su reconexión, en [`specs/mcp`](../mcp/spec.md).
 
-**Origen:** [install-smoke](../../changes/archive/2026-10-16-install-smoke/proposal.md), archivado el 2026-10-16. [release-and-self-update](../../changes/archive/2026-10-18-release-and-self-update/proposal.md), archivado el 2026-10-18, reemplazó la sección «CI» (I1): el filtro de rutas del workflow y su relación con el release. [ci-hardening](../../changes/archive/2026-10-19-ci-hardening/proposal.md), archivado el 2026-10-19, la amplió (C1 a C6): `--locked`, la configuración de producción, acciones fijadas, el toolchain fijado y los workflows de avisos y del instalador.
+**Origen:** [install-smoke](../../changes/archive/2026-10-16-install-smoke/proposal.md), archivado el 2026-10-16. [release-and-self-update](../../changes/archive/2026-10-18-release-and-self-update/proposal.md), archivado el 2026-10-18, reemplazó la sección «CI» (I1): el filtro de rutas del workflow y su relación con el release. [ci-hardening](../../changes/archive/2026-10-19-ci-hardening/proposal.md), archivado el 2026-10-19, la amplió (C1 a C6): `--locked`, la configuración de producción, acciones fijadas, el toolchain fijado y los workflows de avisos y del instalador. [shutdown-budget](../../changes/archive/2026-10-20-shutdown-budget/proposal.md), archivado el 2026-10-20, sumó el embedder de prueba `blocked`.
 
 ## Definiciones
 
 - **Feature `testing`:** la feature de clawg-core que compila los sustitutos de prueba (`crates/clawg-core/Cargo.toml:25`).
 - **Build de test:** un binario compilado con `testing`. Es el que cargo arma para los tests de integración de clawg-cli (`CARGO_BIN_EXE_clawg`, `crates/clawg-cli/tests/binary.rs:23`), porque clawg-cli enciende la feature en sus `[dev-dependencies]` (`crates/clawg-cli/Cargo.toml:73`). `cargo build --release` no compila las dev-dependencies, así que el binario que se entrega no la tiene. Efecto aceptado: después de un `cargo test`, `target/debug/clawg` es un build de test. Sólo lee las variables si están puestas, y como build debug ya está limitado al perfil dev.
 - **Home de prueba:** el valor no vacío de `CLAWG_TEST_HOME` (`TEST_HOME_VAR`, `crates/clawg-core/src/paths.rs:169`).
-- **Embedder de prueba:** el valor de `CLAWG_TEST_EMBEDDER` (`TEST_EMBEDDER_VAR`, `crates/clawg-core/src/memory/bootstrap.rs:313`), `fake` o `stalled` (`TestEmbedder`, `bootstrap.rs:318`).
+- **Embedder de prueba:** el valor de `CLAWG_TEST_EMBEDDER` (`TEST_EMBEDDER_VAR`, `crates/clawg-core/src/memory/bootstrap.rs:313`), `fake`, `stalled` o `blocked` (`TestEmbedder`, `bootstrap.rs:318`).
 
 ## El home de prueba
 
@@ -37,12 +37,13 @@ Se reemplaza el home y no el directorio de datos para que el perfil siga eligien
 
 - con `fake`, MUST cargar `FakeEmbedder` sin descargar nada: la «descarga» devuelve archivos vacíos al instante y la carga devuelve el falso, con `model_id` `fake-embedder`;
 - con `stalled`, la descarga MUST NOT terminar nunca, así que el embedder queda en `loading` y cada save responde `202`;
+- con `blocked`, la descarga MUST terminar al instante y la carga MUST NOT volver nunca: bloquea su hilo en el `spawn_blocking` de siempre y lo dice en el log (`the test model load blocks its thread`), así que el embedder queda en `loading` y un apagado tiene que abandonar esa carga ([`specs/storage`](../storage/spec.md), «Cada fase del apagado tiene tope»);
 - sin la variable, o con un valor vacío o de sólo espacios, MUST usar el modelo real (`production_deps`, `bootstrap.rs:289`);
 - con cualquier otro valor, MUST negarse a arrancar con un error que nombra la variable y los valores aceptados (`TestEmbedder::parse`, `bootstrap.rs:327`; `ServeError::Embedder`, `serve.rs:107`). Un typo en un test no puede disparar la descarga de 470 MB.
 
 Un build sin `testing` MUST usar siempre el modelo real (`serve_deps`, `bootstrap.rs:387`).
 
-En los dos sustitutos, la verificación del contrato de embedding MUST ser la real: `TestEmbedder::deps` (`bootstrap.rs:341`) usa la de `production_deps`. Un store de prueba registra el contrato de `fake-embedder` y lo verifica al reiniciar, por el mismo camino que recorre el modelo real.
+En los tres sustitutos, la verificación del contrato de embedding MUST ser la real: `TestEmbedder::deps` (`bootstrap.rs:341`) usa la de `production_deps`. Un store de prueba registra el contrato de `fake-embedder` y lo verifica al reiniciar, por el mismo camino que recorre el modelo real.
 
 #### Escenario: fake
 - WHEN el bootstrap corre con `fake`

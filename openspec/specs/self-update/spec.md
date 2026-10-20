@@ -2,7 +2,7 @@
 
 Fuente de verdad de `clawg update [--check]`: cómo se compara una versión, cuándo un binario puede actualizarse, cómo se elige el release y el asset, cómo se verifica la firma y el hash antes de tocar nada, el plan que intercambia el binario y vuelve a levantar el daemon, la vuelta atrás cuando el nuevo no arranca, las garantías sobre los datos, el informe y lo que sólo existe en un build de test. Cómo se publican los releases y sus claves está en [`specs/release`](../release/spec.md). No tiene que ver con [`specs/update`](../update/spec.md), que es la de `update_memory`.
 
-**Origen:** [release-and-self-update](../../changes/archive/2026-10-18-release-and-self-update/proposal.md), archivado el 2026-10-18. Los ids de requisito son los de esa spec.
+**Origen:** [release-and-self-update](../../changes/archive/2026-10-18-release-and-self-update/proposal.md), archivado el 2026-10-18. Los ids de requisito son los de esa spec. [shutdown-budget](../../changes/archive/2026-10-20-shutdown-budget/proposal.md), archivado el 2026-10-20, sumó a S10 «Un `stop` que vence» y cambió los tests de S11.
 
 ## Definiciones
 
@@ -187,6 +187,27 @@ Si el daemon nuevo no contesta `/health` con la versión nueva en el plazo, `upd
 
 **Pruebas:** `an_update_over_a_pending_migration_leaves_a_pre_migration_snapshot_and_the_data`, `an_update_whose_candidate_refuses_the_store_leaves_the_old_binary_and_its_daemon` y `an_update_over_a_store_without_supersede_causes_keeps_its_rows_and_tells_revisions_from_verdicts` en `binary.rs`, con la base sembrada en la versión anterior (regla de `openspec/config.yaml` para cambios que tocan el esquema). Prerrequisito ya fusionado: `to_prune` conserva el `pre-migration` más nuevo (`crates/clawg-core/src/memory/backup.rs:243-269`, 0.18.1), con su test.
 
+### Un `stop` que vence
+
+`stop` espera el fin del proceso a lo sumo `STOP_TIMEOUT` (30 s, [`specs/storage`](../storage/spec.md), «Las fases caben en `STOP_TIMEOUT`»). Cuando vence con el apagado ya aceptado (`ClientError::StopTimeout`), el daemon termina por su cuenta poco después: el paso `StopDaemon` MUST contar entonces como hecho a medias (`StepError::under_way`, `crates/clawg-cli/src/update/plan.rs`) y su deshacer `StartOldDaemon` MUST correr. Ese deshacer MUST esperar primero el fin de ese pid, a lo sumo otro `STOP_TIMEOUT` (`wait_for_end`, `effects.rs`), y recién entonces arrancar el daemon con el binario instalado, que sigue en su lugar porque el plan se detuvo antes de apartarlo: arrancado antes, `wait_for` vería contestar al daemon que se apaga, con la misma versión, y daría `Ready` en falso. Si el pid sigue vivo, MUST NOT arrancar nada, y el informe MUST decir que se pidió el apagado y cómo arrancar el daemon cuando termine. Un `StopDaemon` que falla sin haber pedido el apagado (sin `/health`, o con el pedido rechazado) MUST NOT correr `StartOldDaemon`, y el informe sigue diciendo que el daemon no se tocó.
+
+#### Escenario: el apagado vence
+- GIVEN un daemon que acepta el apagado y no termina en `STOP_TIMEOUT`
+- WHEN corre `update`
+- THEN no se renombra nada, se borra el candidato y se corre `undo StartOldDaemon`
+
+#### Escenario: el apagado no llegó
+- GIVEN un `stop` que falla antes de pedir el apagado
+- WHEN corre `update`
+- THEN sólo se borra el candidato y el informe dice que el daemon no se tocó
+
+#### Escenario: el daemon sigue cerrándose
+- GIVEN un apagado vencido cuyo deshacer encontró el pid vivo al terminar su espera
+- WHEN se arma el informe
+- THEN dice que se pidió el apagado y cómo arrancar el daemon cuando termine
+
+**Tests:** `a_daemon_that_does_not_stop_in_time_is_started_again_and_nothing_is_renamed` y `a_stop_that_never_reached_the_daemon_starts_nothing` (plan); `a_daemon_still_shutting_down_says_how_to_start_it_once_it_ends` (informe, puro).
+
 ## S11. Informe
 
 Al terminar bien, `update` MUST informar la versión anterior y la nueva, el snapshot `pre-migration` si se escribió (su ruta), que volver atrás pierde lo escrito después de él, y que los editores abiertos siguen con el puente viejo hasta reiniciarse. Un `update` fallido MUST decir en qué estado dejó la instalación y el daemon.
@@ -196,7 +217,7 @@ Al terminar bien, `update` MUST informar la versión anterior y la nueva, el sna
 - WHEN termina
 - THEN la salida contiene ambas versiones, la ruta del `pre-migration` y el aviso de reinicio de los editores
 
-**Test:** `the_update_report_names_versions_snapshot_and_restart_notice` (puro, sobre la función que arma el texto).
+**Tests:** `the_update_report_names_versions_snapshot_and_restart_notice` (puro, sobre la función que arma el texto); el estado del daemon tras un fallo, `a_failure_before_the_stop_says_the_daemon_was_not_touched`, `a_failure_after_the_stop_says_the_old_daemon_is_back`, `a_daemon_that_could_not_be_started_again_says_what_starts_it` y `a_daemon_still_shutting_down_says_how_to_start_it_once_it_ends` (puros).
 
 ## S12. Sustitución sólo en builds de test
 
