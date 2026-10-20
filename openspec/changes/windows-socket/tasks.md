@@ -95,9 +95,9 @@ Cubre S8, incluido el fallo que ya hay en Unix.
 
 ## 9. Docs
 
-- [ ] `.claude/CLAUDE.md`: el párrafo del socket (`On Unix the daemon listens on…`, `:30`) y la línea de `serve` (`:36`) valen para Unix y Windows (AF_UNIX nativo, el tope de 107 bytes, la ruta no UTF-8, sin AF_UNIX TCP en el puerto del perfil); `daemon.json` y `unix_socket`; «On Windows TCP is the only transport» deja de existir; la línea de `update` (`serve_port` por la marca del socket, no por el sistema); la lista de `binary.rs` en Testing (los escenarios del socket y del sello `tcp` corren en Windows; `CLAWG_TEST_DEFAULT_PORT=off` sin la mención de Unix) y el sello `transport: "tcp"`, que apaga también el socket de Windows; `transport_bar.rs` como arnés `#[ignore]`.
-- [ ] `README.md:514` y `:516`: el socket y `clawg.sock` también en Windows.
-- [ ] `crates/clawg-core/src/paths.rs:225`: el comentario de `socket_file` deja de decir «Unix».
+- [x] `.claude/CLAUDE.md`: el párrafo del socket (`On Unix the daemon listens on…`, `:30`) y la línea de `serve` (`:36`) valen para Unix y Windows (AF_UNIX nativo, el tope de 107 bytes, la ruta no UTF-8, sin AF_UNIX TCP en el puerto del perfil); `daemon.json` y `unix_socket`; «On Windows TCP is the only transport» deja de existir; la línea de `update` (`serve_port` por la marca del socket, no por el sistema); la lista de `binary.rs` en Testing (los escenarios del socket y del sello `tcp` corren en Windows; `CLAWG_TEST_DEFAULT_PORT=off` sin la mención de Unix) y el sello `transport: "tcp"`, que apaga también el socket de Windows; `transport_bar.rs` como arnés `#[ignore]`.
+- [x] `README.md:514` y `:516`: el socket y `clawg.sock` también en Windows.
+- [x] `crates/clawg-core/src/paths.rs:225`: el comentario de `socket_file` deja de decir «Unix».
 - [ ] Las specs (`daemon-access` R7 a R9, `self-update` S8, `install`) se tocan al archivar, no acá.
 - Commit: `docs: say that the profile socket and its tests also run on Windows`
 

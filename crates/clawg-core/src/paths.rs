@@ -222,7 +222,8 @@ pub fn token_file(base_dir: &std::path::Path) -> PathBuf {
     base_dir.join("token")
 }
 
-/// The Unix domain socket the daemon listens on (`<base_dir>/clawg.sock`).
+/// The AF_UNIX socket the daemon listens on (`<base_dir>/clawg.sock`), on Unix
+/// and on Windows.
 ///
 /// Derived, never read from `daemon.json`: a tampered record naming another
 /// socket would send the bearer token to whoever listens there. Inside the
