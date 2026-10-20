@@ -102,6 +102,18 @@ pub struct Stamp {
     /// older release.
     pub migrations_up_to: Option<i32>,
     pub serve_fault: Option<ServeFault>,
+    /// The only transport the binary speaks, as if it were an older release.
+    pub transport: Option<Transport>,
+}
+
+/// A transport a stamp can restrict the binary to.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Transport {
+    /// Loopback TCP alone: no socket is bound or dialled, and `clawg update`
+    /// passes the old daemon's port on.
+    Tcp,
 }
 
 /// Where `clawg serve` fails on purpose.
@@ -125,6 +137,51 @@ pub fn migrations_up_to() -> Option<i32> {
 #[cfg(not(feature = "testing"))]
 pub fn migrations_up_to() -> Option<i32> {
     None
+}
+
+/// Whether a `testing` build was stamped to speak TCP alone.
+#[cfg(feature = "testing")]
+pub fn tcp_only() -> bool {
+    stamp().and_then(|s| s.transport) == Some(Transport::Tcp)
+}
+
+/// Always `false`: a build without `testing` speaks every transport it has.
+#[cfg(not(feature = "testing"))]
+pub fn tcp_only() -> bool {
+    false
+}
+
+/// Env var that replaces the profile's port of a `clawg serve` without
+/// `--port` in a `testing` build: `off`, or a port.
+#[cfg(any(test, feature = "testing"))]
+pub const TEST_DEFAULT_PORT_VAR: &str = "CLAWG_TEST_DEFAULT_PORT";
+
+/// What stands in for the profile's port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultPort {
+    /// No TCP unless `--port` asks for it.
+    Off,
+    Port(u16),
+}
+
+/// The stand-in for the profile's port in a `testing` build.
+#[cfg(feature = "testing")]
+pub fn default_port_override() -> Option<DefaultPort> {
+    parse_default_port(&std::env::var(TEST_DEFAULT_PORT_VAR).ok()?)
+}
+
+/// Always `None`: a build without `testing` binds the profile's port.
+#[cfg(not(feature = "testing"))]
+pub fn default_port_override() -> Option<DefaultPort> {
+    None
+}
+
+#[cfg(any(test, feature = "testing"))]
+fn parse_default_port(raw: &str) -> Option<DefaultPort> {
+    match raw {
+        "off" => Some(DefaultPort::Off),
+        port => port.parse().ok().map(DefaultPort::Port),
+    }
 }
 
 /// Fails with a message when a `testing` build was stamped to fail at `at`.
@@ -211,6 +268,24 @@ mod tests {
         assert_eq!(stamp.serve_fault, Some(ServeFault::BeforeOpen));
         assert_eq!(stamp.migrations_up_to, None);
         assert_eq!(parse_stamp(&stamped(r#"{"serve_fault":"somewhere_else"}"#)), None);
+    }
+
+    #[test]
+    fn a_stamp_can_restrict_the_binary_to_tcp() {
+        let stamp = parse_stamp(&stamped(r#"{"transport":"tcp"}"#)).unwrap();
+
+        assert_eq!(stamp.transport, Some(Transport::Tcp));
+        assert_eq!(parse_stamp(&stamped("{}")).unwrap().transport, None);
+        assert_eq!(parse_stamp(&stamped(r#"{"transport":"pigeon"}"#)), None);
+    }
+
+    #[test]
+    fn a_default_port_override_is_off_or_a_port() {
+        assert_eq!(parse_default_port("off"), Some(DefaultPort::Off));
+        assert_eq!(parse_default_port("40123"), Some(DefaultPort::Port(40123)));
+        assert_eq!(parse_default_port(""), None);
+        assert_eq!(parse_default_port("70000"), None);
+        assert_eq!(parse_default_port("OFF"), None);
     }
 
     #[test]
@@ -303,5 +378,8 @@ mod tests {
         assert_eq!(migrations_up_to(), None);
         assert_eq!(inject_serve_fault(ServeFault::AfterOpen), Ok(()));
         assert_eq!(version(), env!("CARGO_PKG_VERSION"));
+        std::env::set_var(TEST_DEFAULT_PORT_VAR, "off");
+        assert_eq!(default_port_override(), None);
+        assert!(!tcp_only());
     }
 }
