@@ -27,8 +27,8 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 ## 4. `chains`: posiciones y M2 (E3)
 
-- [ ] Tests `m2_passes_when_all_three_conditions_hold`, `m2_fails_when_an_old_version_shows`, `m2_fails_when_the_last_drops_two_places`, `m2_needs_thirty_eight_matching_chains`, `an_old_version_above_the_new_one_is_recorded`.
-- [ ] Posiciones por versión desde `format_search` y las cabeceras `[fecha #id` del prompt, sesión del router copiada de `agent_view/runner.rs:82-115`, veredicto y lista de cadenas que rompen; entra en el reporte de `run.rs`.
+- [x] Tests `m2_passes_when_all_three_conditions_hold`, `m2_fails_when_an_old_version_shows`, `m2_fails_when_the_last_drops_two_places`, `m2_needs_thirty_eight_matching_chains`, `an_old_version_above_the_new_one_is_recorded`. Además, la lectura de ids de las dos salidas y la posición por fila propia (`the_ids_are_read_in_the_order_each_output_prints_them`, `a_version_is_placed_by_the_first_hit_of_a_row_of_its_own`).
+- [x] Posiciones por versión desde `format_search` y las cabeceras `[fecha #id` del prompt, sesión del router copiada de `agent_view/runner.rs:82-115` (ya en el grupo 3), veredicto y lista de cadenas que rompen; entra en el reporte de `run.rs`, con las posiciones por brazo y cadena. La corrida `--fake` del set chico lee la última versión en las dos salidas por un identificador de la consulta; la del set entregado sale entera (su M2 sobre el doble prueba la tubería, no la clave).
 - Commit: `feat(eval): check that a keyed revision hides its old versions`
 
 ## 5. `chains`: M4 (E4, E6)
