@@ -39,7 +39,7 @@ use crate::memory::score::{ImportanceFactor, ScoringConfig};
 use crate::memory::search::{lexical_channel_only, search_all_memories_with_scoring, SearchScope};
 use crate::memory::store_insert::{CreatedByType, MemoryType, NewMemoryRecord};
 use crate::memory::store_lock::StoreHolder;
-use crate::memory::worker::{memory_worker, resolve_tokenizer_and_chunker, IngestRequest};
+use crate::memory::worker::{memory_worker, resolve_tokenizer_and_chunker, ChunkOutcome, IngestRequest};
 use crate::memory::TableKind;
 use crate::models::chat::Role;
 use crate::runtime::{MemoryRuntime, INGEST_QUEUE_CAPACITY};
@@ -226,6 +226,8 @@ pub enum EvalError {
     Search(String),
     #[error("unknown memory_type: {0}")]
     UnknownMemoryType(String),
+    #[error("invalid topic_key: {0}")]
+    TopicKey(String),
     #[error("embedding failed: {0}")]
     Embed(String),
     #[error("model load failed: {0}")]
@@ -471,6 +473,68 @@ impl EvalEmbedder {
     }
 }
 
+/// One save for [`EvalIngest::save`].
+pub struct EvalSave<'a> {
+    pub agent_id: &'a str,
+    pub project_id: Option<&'a str>,
+    pub content: &'a str,
+    pub memory_type: &'a str,
+    pub importance: f64,
+    pub topic_key: Option<&'a str>,
+}
+
+/// What a save did, as the daemon would answer it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvalSaved {
+    /// Every row of the save, in order, with whether it was inserted rather
+    /// than absorbed into an existing one.
+    pub rows: Vec<(i64, bool)>,
+    pub related: Vec<EvalCandidate>,
+    /// The rows of the save's topic key it superseded.
+    pub replaced: Vec<i64>,
+}
+
+/// An earlier row the detector paired with a save.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvalCandidate {
+    pub id: i64,
+    pub distance: f64,
+    /// Put to the user rather than only to the agent.
+    pub escalated: bool,
+}
+
+/// The event an explicit save enters the worker as.
+fn explicit_event(
+    agent_id: &str,
+    project_id: Option<&str>,
+    content: &str,
+    memory_type: &str,
+    importance: f64,
+    topic_key: Option<&str>,
+) -> MemoryEvent {
+    let timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    MemoryEvent {
+        agent_id: agent_id.to_string(),
+        project_id: project_id.map(str::to_string),
+        role: Role::User,
+        content: content.to_string(),
+        is_error: None,
+        source: MemorySource::Explicit,
+        timestamp_ms,
+        memory_type: Some(memory_type.to_string()),
+        importance: Some(importance),
+        derived_from: Vec::new(),
+        topic_key: topic_key.map(str::to_string),
+        // Sealed as every save was before provenance, so what the
+        // agent view reads matches the recorded baselines.
+        user_stated: true,
+        session_id: None,
+    }
+}
+
 /// The production ingest pipeline running over an isolated store, for
 /// measuring what an agent actually sees after a save — chunking, the dedup
 /// gate, contradiction detection and tiering all included, none of which the
@@ -530,31 +594,50 @@ impl EvalIngest {
         importance: f64,
     ) -> Result<(), EvalError> {
         parse_memory_type(memory_type)?;
-        let timestamp_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
         self.tx
-            .send(MemoryEvent {
-                agent_id: agent_id.to_string(),
-                project_id: None,
-                role: Role::User,
-                content: content.to_string(),
-                is_error: None,
-                source: MemorySource::Explicit,
-                timestamp_ms,
-                memory_type: Some(memory_type.to_string()),
-                importance: Some(importance),
-                derived_from: Vec::new(),
-                topic_key: None,
-                // Sealed as every save was before provenance, so what the
-                // agent view reads matches the recorded baselines.
-                user_stated: true,
-                session_id: None,
-            }
-            .into())
+            .send(explicit_event(agent_id, None, content, memory_type, importance, None).into())
             .await
             .map_err(|_| EvalError::Insert("the ingest worker has stopped".to_string()))
+    }
+
+    /// Stores one explicit save under the project and topic key it names and
+    /// waits for the report the daemon would answer it with: the rows it
+    /// wrote, the earlier rows the detector paired it with and the rows of its
+    /// key it replaced. Type and key are validated first, as the daemon does
+    /// before its outbox.
+    pub async fn save(&self, save: EvalSave<'_>) -> Result<EvalSaved, EvalError> {
+        parse_memory_type(save.memory_type)?;
+        if let Some(key) = save.topic_key {
+            crate::memory::topic::validate_topic_key(key).map_err(|e| EvalError::TopicKey(e.to_string()))?;
+        }
+        let (reply, report) = tokio::sync::oneshot::channel();
+        let event = explicit_event(
+            save.agent_id,
+            save.project_id,
+            save.content,
+            save.memory_type,
+            save.importance,
+            save.topic_key,
+        );
+        self.tx
+            .send(IngestRequest { event, reply: Some(reply), outbox: None })
+            .await
+            .map_err(|_| EvalError::Insert("the ingest worker has stopped".to_string()))?;
+        let report = report
+            .await
+            .map_err(|_| EvalError::Insert("the ingest worker dropped the report".to_string()))?;
+        if let Some(failure) = report.failure {
+            return Err(EvalError::Insert(failure.to_string()));
+        }
+        Ok(EvalSaved {
+            rows: report.memories.iter().map(|m| (m.id, m.outcome == ChunkOutcome::Inserted)).collect(),
+            related: report
+                .related
+                .iter()
+                .map(|c| EvalCandidate { id: c.id, distance: c.distance, escalated: c.escalated })
+                .collect(),
+            replaced: report.replaced.iter().map(|r| r.id).collect(),
+        })
     }
 
     /// Closes the queue and waits for the worker to finish it. The worker only
@@ -1237,6 +1320,126 @@ mod tests {
                 EvalConflictPair { new_id: 3, old_id: 1, distance: None, escalated: true },
             ]
         );
+    }
+
+    /// Puts a text where its first word says: `base` and `near` land 0.2
+    /// apart, inside the detector's band; anything else is the fake's own
+    /// vector, far from both.
+    struct PlacedByFirstWord;
+
+    #[async_trait::async_trait]
+    impl Embedder for PlacedByFirstWord {
+        async fn embed_with_role(
+            &self,
+            text: &str,
+            role: EmbedRole,
+        ) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+            let turned = |toward: usize, angle: f32| {
+                let mut v = vec![0.0_f32; 384];
+                v[0] = angle.cos();
+                v[toward] = angle.sin();
+                v
+            };
+            match text.split_whitespace().next() {
+                Some("base") => Ok(turned(2, 0.2)),
+                Some("near") => Ok(turned(1, 0.0)),
+                _ => FakeEmbedder::default().embed_with_role(text, role).await,
+            }
+        }
+        fn dimensions(&self) -> usize {
+            384
+        }
+        fn model_id(&self) -> &str {
+            "placed-by-first-word"
+        }
+        fn query_prefix(&self) -> &str {
+            ""
+        }
+        fn passage_prefix(&self) -> &str {
+            ""
+        }
+    }
+
+    fn placed_embedder() -> EvalEmbedder {
+        EvalEmbedder(Arc::new(PlacedByFirstWord))
+    }
+
+    fn keyed<'a>(content: &'a str, key: Option<&'a str>) -> EvalSave<'a> {
+        EvalSave {
+            agent_id: "agent-save",
+            project_id: Some("project-save"),
+            content,
+            memory_type: "semantic_fact",
+            importance: 5.0,
+            topic_key: key,
+        }
+    }
+
+    #[tokio::test]
+    async fn save_stores_under_the_agent_project_and_key_it_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
+
+        let saved = ingest.save(keyed("the build runs on cargo", Some("build/tool"))).await.unwrap();
+
+        assert_eq!(saved.rows.len(), 1);
+        assert!(saved.rows[0].1, "a first save inserts its row");
+        let runtime = ingest.finish().await.unwrap();
+        let stored: (i64, String, Option<String>, Option<String>) = runtime
+            .store
+            .conn
+            .call(|c| {
+                c.query_row("SELECT id, agent_id, project_id, topic_key FROM memory", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(stored.0, saved.rows[0].0);
+        assert_eq!(stored.1, "agent-save");
+        assert_eq!(stored.2.as_deref(), Some("project-save"));
+        assert_eq!(stored.3.as_deref(), Some("build/tool"));
+    }
+
+    #[tokio::test]
+    async fn a_second_save_under_the_same_key_reports_the_first_as_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
+
+        let first = ingest.save(keyed("the build runs on cargo", Some("build/tool"))).await.unwrap();
+        let second = ingest.save(keyed("the build runs on make", Some("build/tool"))).await.unwrap();
+
+        assert!(first.replaced.is_empty());
+        assert_eq!(second.replaced, vec![first.rows[0].0]);
+    }
+
+    #[tokio::test]
+    async fn save_reports_the_candidates_the_detector_paired() {
+        let dir = tempfile::tempdir().unwrap();
+        let ingest = EvalIngest::open(dir.path(), &placed_embedder(), dir.path()).await.unwrap();
+
+        let older = ingest.save(keyed("base the build runs on cargo", None)).await.unwrap();
+        let newer = ingest.save(keyed("near the build runs on make", None)).await.unwrap();
+
+        assert!(older.related.is_empty());
+        assert_eq!(newer.related.len(), 1);
+        let candidate = &newer.related[0];
+        assert_eq!(candidate.id, older.rows[0].0);
+        assert!((candidate.distance - 0.2).abs() < 0.01, "distance was {}", candidate.distance);
+        assert!(!candidate.escalated, "two facts are never put to the user");
+    }
+
+    #[tokio::test]
+    async fn save_with_an_invalid_key_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
+
+        match ingest.save(keyed("content", Some("Not A Key"))).await {
+            Err(EvalError::TopicKey(_)) => {}
+            other => panic!("expected TopicKey, got {other:?}"),
+        }
+        let runtime = ingest.finish().await.unwrap();
+        assert!(stored_rows(&runtime).await.is_empty(), "nothing is queued for an invalid key");
     }
 
     #[tokio::test]
