@@ -12,6 +12,10 @@ use std::path::{Path, PathBuf};
 mod unix;
 #[cfg(unix)]
 pub use unix::{admits_peer, PeerChecked};
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::AfUnixListener;
 
 /// Bytes in `sun_path`, the terminating NUL included: a socket path must be
 /// shorter.
@@ -107,10 +111,16 @@ pub fn remove_stale_socket(path: &Path) -> Result<(), SocketError> {
     }
 }
 
+/// What `bind_socket` returns.
+#[cfg(unix)]
+pub type Listener = PeerChecked;
+#[cfg(windows)]
+pub type Listener = AfUnixListener;
+
 /// Binds the socket at `path`, removing the one an earlier daemon left (see
 /// `remove_stale_socket`).
 #[cfg(unix)]
-pub fn bind_socket(path: &Path) -> Result<PeerChecked, SocketError> {
+pub fn bind_socket(path: &Path) -> Result<Listener, SocketError> {
     check_socket_path(path)?;
     remove_stale_socket(path)?;
     let inner =
@@ -120,25 +130,40 @@ pub fn bind_socket(path: &Path) -> Result<PeerChecked, SocketError> {
     Ok(PeerChecked::new(inner, own_uid, path.to_path_buf()))
 }
 
+#[cfg(windows)]
+pub fn bind_socket(path: &Path) -> Result<Listener, SocketError> {
+    check_socket_path(path)?;
+    remove_stale_socket(path)?;
+    windows::bind(path)
+}
+
+/// The state the router needs, over an in-memory store in `dir`.
+#[cfg(test)]
+async fn test_app(dir: &Path) -> std::sync::Arc<crate::daemon::api::AppCtx> {
+    use crate::daemon::api::{AppCtx, SAVE_CONFIRM_TIMEOUT};
+    let (runtime, _rx) = clawg_core::runtime::MemoryRuntime::new_for_test(dir.to_path_buf()).await;
+    let (shutdown, _) = tokio::sync::watch::channel(false);
+    std::sync::Arc::new(AppCtx {
+        runtime,
+        token: "socket-token".to_string(),
+        profile: clawg_core::paths::Profile::Dev,
+        started_at: std::time::Instant::now(),
+        shutdown,
+        save_timeout: SAVE_CONFIRM_TIMEOUT,
+        sessions: Default::default(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(unix)]
     use std::future::IntoFuture;
     #[cfg(unix)]
-    use std::sync::Arc;
-    #[cfg(unix)]
-    use std::time::Instant;
-
-    #[cfg(unix)]
-    use clawg_core::paths::Profile;
-    #[cfg(unix)]
-    use clawg_core::runtime::MemoryRuntime;
-    #[cfg(unix)]
     use reqwest::StatusCode;
 
     #[cfg(unix)]
-    use crate::daemon::api::{router, AppCtx, SAVE_CONFIRM_TIMEOUT};
+    use crate::daemon::api::router;
 
     #[test]
     fn the_socket_path_fits_under_the_limit_and_a_longer_one_is_named() {
@@ -211,7 +236,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_socket_an_earlier_daemon_left_is_replaced() {
         let dir = tempfile::tempdir().unwrap();
@@ -223,27 +247,12 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn app(dir: &Path) -> Arc<AppCtx> {
-        let (runtime, _rx) = MemoryRuntime::new_for_test(dir.to_path_buf()).await;
-        let (shutdown, _) = tokio::sync::watch::channel(false);
-        Arc::new(AppCtx {
-            runtime,
-            token: "socket-token".to_string(),
-            profile: Profile::Dev,
-            started_at: Instant::now(),
-            shutdown,
-            save_timeout: SAVE_CONFIRM_TIMEOUT,
-            sessions: Default::default(),
-        })
-    }
-
-    #[cfg(unix)]
     #[tokio::test]
     async fn the_router_answers_over_the_socket_behind_the_guard() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("clawg.sock");
         let listener = bind_socket(&path).expect("bind");
-        let server = tokio::spawn(axum::serve(listener, router(app(dir.path()).await)).into_future());
+        let server = tokio::spawn(axum::serve(listener, router(test_app(dir.path()).await)).into_future());
         let http = reqwest::Client::builder().unix_socket(path.as_path()).build().unwrap();
 
         let ok = http.get("http://localhost/health").send().await.expect("health");

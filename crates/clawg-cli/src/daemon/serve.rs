@@ -23,8 +23,7 @@ use clawg_core::private_dir::ensure_private_dir;
 use clawg_core::runtime::{MemoryRuntime, Workers};
 
 use super::api::{router, AppCtx, SAVE_CONFIRM_TIMEOUT};
-#[cfg(unix)]
-use super::socket::{bind_socket, serves_without_socket, PeerChecked, SocketError};
+use super::socket::{bind_socket, serves_without_socket, Listener, SocketError};
 use super::lifecycle::{
     clear_state, generate_token, now_ms, write_state, write_token, DaemonState, LifecycleError,
 };
@@ -48,7 +47,6 @@ pub enum ServeError {
         #[source]
         source: std::io::Error,
     },
-    #[cfg(unix)]
     #[error(transparent)]
     Socket(SocketError),
     #[error("could not create the data directory {path}: {source}")]
@@ -89,8 +87,8 @@ fn classify_open_error(err: MemoryError) -> ServeError {
 
 /// Runs the daemon until Ctrl-C, SIGTERM or `POST /v1/shutdown`.
 ///
-/// On Unix it listens on the data directory's socket, and on TCP as
-/// [`tcp_plan`] says. `port` is `--port`: `0` asks the OS for an ephemeral
+/// It listens on the data directory's socket, and on TCP as [`tcp_plan`]
+/// says. `port` is `--port`: `0` asks the OS for an ephemeral
 /// port, and the real one is what gets published in `daemon.json`, so clients
 /// always dial where the listener actually is.
 pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> {
@@ -160,12 +158,8 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
 
     // With the store lock held, so the socket an earlier daemon left behind is
     // no live daemon's.
-    #[cfg(unix)]
     let socket = bind_profile_socket(&base_dir, port.is_some())?;
-    #[cfg(unix)]
     let has_socket = socket.is_some();
-    #[cfg(not(unix))]
-    let has_socket = false;
 
     let tcp = match tcp_plan(port, profile.default_port(), has_socket, build_info::default_port_override()) {
         TcpPlan::Required(port) => Some(bind_tcp(port).await?),
@@ -231,7 +225,6 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
             }
         }
     };
-    #[cfg(unix)]
     let socket_server = {
         let (app, stopping) = (app, stopping.clone());
         async move {
@@ -241,8 +234,6 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
             }
         }
     };
-    #[cfg(not(unix))]
-    let socket_server = async { Ok(()) };
     let servers = async { tokio::try_join!(tcp_server, socket_server).map(drop) };
     let result = match within_grace(servers, stopped(stopping), HTTP_GRACE).await {
         Some(result) => result,
@@ -308,10 +299,10 @@ async fn bind_tcp(port: u16) -> Result<(tokio::net::TcpListener, u16), ServeErro
     Ok((listener, bound))
 }
 
-/// The data directory's socket, or `None` when this binary speaks TCP alone
-/// or the path is too long for one and `--port` was given.
-#[cfg(unix)]
-fn bind_profile_socket(base_dir: &std::path::Path, explicit_port: bool) -> Result<Option<PeerChecked>, ServeError> {
+/// The data directory's socket, or `None` when this binary speaks TCP alone,
+/// the system has no such sockets, or the path is too long for one and
+/// `--port` was given.
+fn bind_profile_socket(base_dir: &std::path::Path, explicit_port: bool) -> Result<Option<Listener>, ServeError> {
     if build_info::tcp_only() {
         return Ok(None);
     }
@@ -459,6 +450,9 @@ mod tests {
         assert_eq!(listening_on(Some(1), Some(socket)), "127.0.0.1:1 and /d/clawg.sock");
         assert_eq!(listening_on(Some(1), None), "127.0.0.1:1");
         assert_eq!(listening_on(None, Some(socket)), "/d/clawg.sock");
+        let windows = std::path::Path::new(r"C:\d\clawg.sock");
+        assert_eq!(listening_on(Some(1), Some(windows)), r"127.0.0.1:1 and C:\d\clawg.sock");
+        assert_eq!(listening_on(None, None), "nothing");
     }
 
     #[tokio::test]
