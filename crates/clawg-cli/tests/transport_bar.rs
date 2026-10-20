@@ -318,13 +318,16 @@ async fn the_socket_is_not_slower_than_tcp() {
     let mut over = Vec::new();
     let mut burst_failures = 0;
     for scenario in Scenario::ALL {
-        run(scenario, &unix, true, limit).await;
-        run(scenario, &tcp, true, limit).await;
+        // The warm-up counts too: a failed request is left out of the samples.
+        let (mut unix_failures, mut tcp_failures) =
+            (run(scenario, &unix, true, limit).await.failures, run(scenario, &tcp, true, limit).await.failures);
         let (mut unix_runs, mut tcp_runs) = (Vec::new(), Vec::new());
         for _ in 0..RUNS {
             unix_runs.push(run(scenario, &unix, false, limit).await);
             tcp_runs.push(run(scenario, &tcp, false, limit).await);
         }
+        unix_failures += unix_runs.iter().map(|s| s.failures).sum::<usize>();
+        tcp_failures += tcp_runs.iter().map(|s| s.failures).sum::<usize>();
         let (u, t) = (median(unix_runs), median(tcp_runs));
         let ratio = micros(u.mean) / micros(t.mean);
         println!(
@@ -335,17 +338,17 @@ async fn the_socket_is_not_slower_than_tcp() {
             micros(t.mean),
             micros(t.p99),
             ratio,
-            u.failures,
-            t.failures
+            unix_failures,
+            tcp_failures
         );
         if ratio > MAX_RATIO {
             over.push(format!("{}: {ratio:.2}", scenario.name()));
         }
         if scenario == Scenario::Burst {
-            burst_failures = u.failures;
+            burst_failures = unix_failures;
         }
     }
-    println!("failures are unix/tcp");
+    println!("failures are unix/tcp, summed over the warm-up and every run");
 
     assert_eq!(burst_failures, 0, "the AF_UNIX burst had failures");
     assert!(over.is_empty(), "AF_UNIX is over {MAX_RATIO}x TCP in: {}", over.join(", "));
