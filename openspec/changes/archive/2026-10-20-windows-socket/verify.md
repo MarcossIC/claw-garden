@@ -1,6 +1,6 @@
 # windows-socket — Verificación
 
-Modo: Strict TDD (`openspec/config.yaml`). Veredicto local: **pasa con advertencias**, sin hallazgos críticos. El cambio no se archiva hasta que estén en verde las dos secciones pendientes del final: el CI (Linux y Windows) y la prueba manual de R13.
+Modo: Strict TDD (`openspec/config.yaml`). Veredicto: **pasa con advertencias**, sin hallazgos críticos. Local en Windows y en el CI de Linux y Windows (run 39425043633 sobre `f0dfd21`, abajo). La prueba manual de R13, con una segunda cuenta, no se corrió: el CI no tiene dos cuentas y el cambio se archiva con ella como advertencia (W4).
 
 ## Windows (2026-10-20)
 
@@ -50,13 +50,13 @@ Cada fila dice si el test afirma lo que pide el escenario (GIVEN/WHEN/THEN), no 
 | R11 | sin AF_UNIX | `socket/mod.rs` `a_path_that_is_not_unicode_or_a_system_without_sockets_is_decided_apart`; `socket/windows.rs` `only_an_address_family_without_a_provider_lacks_af_unix`; la fila `Required` de `tcp_plan` | son los tests que pide la spec: `Unsupported` cae a TCP con y sin `--port`, sólo 10047 es `lacks_af_unix`, y sin socket el puerto del perfil es `Required`. No hay un Windows sin AF_UNIX donde probarlo de punta a punta (D3) | ✅ |
 | R11 | otra falla | `socket/mod.rs` `only_a_path_that_is_too_long_falls_back_to_tcp_and_only_with_a_port`; `binary.rs` `a_socket_path_over_the_limit_is_refused_by_name` | `Bind` y `Stale` detienen el arranque con y sin `--port`; `bind_profile_socket` corre antes del `bind` de TCP (`serve.rs:161`), así que no se abre TCP; el binario muestra la salida con 1 de un error de socket sin caída | ✅ |
 | R12 | la barra | `transport_bar.rs` `the_socket_is_not_slower_than_tcp` | las cinco medias, la mayor razón 0,80; la ráfaga sin fallas en el precalentamiento ni en ninguna de las 3 corridas | ✅ |
-| R13 | la otra cuenta | — | manual, pendiente (abajo) | ⏳ |
+| R13 | la otra cuenta | — | manual, no corrido (abajo, W4); el mecanismo lo prueban los dos tests de R10, que pasaron también en el runner elevado del CI | ⏳ |
 | S8 | un actualizador nuevo en Windows | `binary.rs` `a_full_update_with_a_daemon_replaces_the_binary_and_a_bridge_reaches_the_new_daemon` | el viejo corre con `--port 0` y socket; tras `update`, `daemon.json` no tiene `port` (la comprobación ya no es `cfg(unix)`) y el puente abierto alcanza al daemon nuevo | ✅ |
 | S8 | un daemon que sirve sólo TCP porque su ruta no entra | `binary.rs` `an_update_keeps_the_port_of_a_daemon_that_serves_tcp_alone`, `an_undone_update_restarts_a_daemon_that_served_tcp_alone_on_its_port`; `effects.rs` `the_new_daemon_gets_a_port_only_where_tcp_is_the_only_transport` | el viejo sin `unix_socket`; el nuevo recibe el mismo puerto y contesta 0.19.0; al deshacer (`serve_fault` `before_open`) el viejo vuelve con ese puerto y contesta 0.18.0 | ✅ |
 | S8 | un actualizador anterior en Windows | `binary.rs` `an_older_updater_installs_the_socket_version_and_sees_it_answer` | el actualizador sellado `tcp` sale con 0, el daemon nuevo publica `unix_socket: true` y el mismo `port`; contesta por el socket al test y por TCP al actualizador, que es `tcp_only` y lo vigiló hasta verlo contestar | ✅ |
 | install | autoarranque en Windows | `binary.rs` `a_bridge_starts_its_daemon_through_the_binary`; `build_info.rs` `a_default_port_override_is_off_or_a_port` | el puente arranca un daemon que publica `unix_socket: true` y no `port`, y `memory_status` lo alcanza; `socket_only` pone `CLAWG_TEST_DEFAULT_PORT=off` en los dos sistemas | ✅ |
 
-Resumen: 17 de 18 escenarios cumplen y 1 está pendiente (R13), más las filas del router, la decisión de `tcp_plan`, el vencimiento de `/health` y el sello, que cumplen.
+Resumen: 17 de 18 escenarios cumplen y 1 no se corrió (R13), más las filas del router, la decisión de `tcp_plan`, el vencimiento de `/health` y el sello, que cumplen.
 
 ## Diseño
 
@@ -91,9 +91,9 @@ La apply no dejó una tabla de rojos por tarea: cada lote es un commit con el te
 - **El test de la ráfaga cambió de nombre.** `thirty_two_simultaneous_clients_over_the_socket_all_answer` corre contra un daemon vivo y exige que las 32 contesten, que es lo que dice el THEN de R9 («las 32 llamadas contestan») y más que «ninguna es `NotRunning`». El nombre de la lista de R9 se corrige al archivar. Sin objeción.
 - **El caso de Windows de `a_stamp_can_restrict_the_binary_to_tcp` no se escribió.** El sello se lee igual en todos los sistemas, así que un test por sistema no prueba nada nuevo. La frase de R9 queda cubierta: del lado del daemon, de punta a punta en Windows por `an_older_updater_installs_the_socket_version_and_sees_it_answer`, que exige `unix_socket: false` a la copia sellada; del lado del cliente, por la fila `endpoint(.., true)` y por `bind_profile_socket`, que mira `tcp_only()` antes que nada. Al archivar, la lista de R9 nombra esa cobertura en lugar del test inexistente. La casilla de `tasks.md` (lote 4) está marcada aunque el test no se escribió como dice; se aclara en el mismo paso.
 - **La carrera tras el `Drop` del listener.** Un cliente que conecta entre `AfUnixListener::drop` y el cierre del socket por el hilo conecta, y su conexión se suelta sin respuesta: se lee como `Http`, no como `NotRunning`. No viola R9, que pide `NotRunning` para un socket publicado que no conecta, y acá sí conectó. Tampoco viola R7: el listener termina dentro de los plazos, y el unitario lo mide por debajo de 1 s. Es la misma clase de error que recibe una conexión TCP o Unix que estaba en el backlog cuando su listener se cierra; en Windows la ventana dura lo que tarda la autoconexión. Leerla como `NotRunning` sería un error, porque `NotRunning` debe seguir significando que la petición nunca llegó al daemon: es lo que deja al puente repetirla sin duplicar un guardado. Solo pasa durante un apagado ordenado, y la repetición tampoco habría encontrado daemon. Se acepta como está (S3).
-- **Los tests de ACL** corrieron y pasaron acá sin elevación. El runner de Windows de GitHub corre elevado, y el deny con un token elevado sigue [sin verificar] (D7): lo dice el CI.
-- **Linux** no se compiló acá. Lo revisado a mano: los `cfg` de `SocketError`, `serves_without_socket`, `Connector`, `socket_transport`, `send_over_af_unix` y de los imports de test de `socket/mod.rs`. El CI tiene la última palabra.
-- **R13** queda para la persona que lo corra, con una segunda cuenta.
+- **Los tests de ACL** corrieron y pasaron acá sin elevación, y en el runner elevado de Windows del CI (`a_socket_whose_file_denies_write_data_refuses_the_connect ... ok`, `the_socket_file_inherits_the_data_directory_acl ... ok`): el deny vale también con un token elevado (D7).
+- **Linux** no se compiló acá; lo compiló el CI, con clippy `-D warnings` y la suite en verde, así que los `cfg` revisados a mano (`SocketError`, `serves_without_socket`, `Connector`, `socket_transport`, `send_over_af_unix` y los imports de test de `socket/mod.rs`) no dejan `dead_code` ni `unused`.
+- **R13** no se corrió: necesita una segunda cuenta de Windows y el CI no la tiene (W4).
 
 ## Hallazgos
 
@@ -117,6 +117,8 @@ La apply no dejó una tabla de rojos por tarea: cada lote es un commit con el te
 
   Quedan sin rojo visto el lote 5, el 7 y el rojo de Unix del lote 6. Se califica de advertencia y no de crítica: los `verify.md` archivados ya aceptaron escenarios del binario no corridos en rojo (local-transport, memory-portability), y el rojo de Unix del lote 6 no se puede observar sin un Linux: el CI sólo muestra el verde del commit final.
 
+- **W4. R13 no se corrió.** La prueba con una segunda cuenta estándar (conectar da 10013; borrar el socket o crear otro da acceso denegado) es manual y el CI no tiene dos cuentas. Lo que sí está probado es el mecanismo del que depende: el DACL del directorio llega al archivo del socket (`the_socket_file_inherits_the_data_directory_acl`) y un deny de `FILE_WRITE_DATA` sobre el archivo hace que `connect` dé 10013 y el cliente lea `NotRunning` (`a_socket_whose_file_denies_write_data_refuses_the_connect`), los dos sin elevar en local y elevados en el CI. Queda sin observar que el ACL por defecto de un perfil de Windows niegue esos permisos a otra cuenta estándar. Se archiva con la advertencia; la tabla de pasos queda abajo para quien la corra.
+
 **SUGGESTION:**
 
 - **S1 (aplicada en `spec.md` del cambio y en `tasks.md` §11). La spec, al archivar.** El encabezado dice «R7 a R9, más R10 a R14», R10 termina en «Con una segunda cuenta, R14» y `tasks.md` §11 archiva «R10 a R14», pero la spec sólo define hasta R13, que es la de la segunda cuenta. Además, en la lista de R9 van el nombre nuevo de la ráfaga y la cobertura real del sello. En la de R8, «con las filas de Windows» de `the_tcp_plan_follows_the_port_and_the_socket` no pedía filas nuevas: la función no depende del sistema.
@@ -124,30 +126,32 @@ La apply no dejó una tabla de rojos por tarea: cada lote es un commit con el te
 - **S3. La carrera tras el `Drop`.** No se cambia; a lo sumo, una línea en la documentación del socket de Windows.
 - **S4. El sello del lado del cliente no tiene un escenario que lo discrimine.** `an_older_bridge_reaches_a_new_daemon_over_the_profile_port` pasaría también si el puente sellado fuera por el socket, porque el daemon sirve los dos. Un test que lo distinga (por ejemplo, un puente sellado frente a un `daemon.json` con `unix_socket: true` cuyo socket no contesta y un `port` que sí) cerraría el hueco.
 
-## Pendiente: CI (Linux y Windows)
+## CI (Linux y Windows)
 
-**Sin correr.** `ci.yml` corre en los pull requests y en los push a `main`; el pull request de `develop` a `main` todavía no está abierto. Tiene que dar en verde:
+Run 39425043633 de `ci.yml`, del pull request de `develop` a `main`, sobre `f0dfd21` (el registro de la verificación local; el último commit de código es `8c72eab`). Los dos jobs salen en verde, cada paso con `--locked`:
 
-- Linux: la compilación con los `cfg` de este cambio (Linux nunca se compiló acá), clippy con `-D warnings` (sin `dead_code` ni `unused` en lo que sólo usa un sistema) y la suite, con los escenarios del socket de `binary.rs`, que ahora corren en los dos sistemas;
-- Windows: la suite en el runner elevado, en especial `a_socket_whose_file_denies_write_data_refuses_the_connect` y `the_socket_file_inherits_the_data_directory_acl` (D7, [sin verificar] con token elevado);
-- en los dos: `cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings` y `cargo test --locked -p clawg-core --lib build_info`.
+| Job | `clippy --workspace --all-targets` | `test --workspace` | `clippy -p clawg-cli` (release) | `test -p clawg-core --lib build_info` | Resultado |
+|---|---|---|---|---|---|
+| `test (ubuntu-latest)` | ok | ok | ok | ok | ✅ |
+| `test (windows-latest)` | ok | ok | ok | ok | ✅ |
 
-| Job | Resultado |
-|---|---|
-| Linux | pendiente |
-| Windows | pendiente |
+Del registro de cada job:
 
-## Pendiente: R13 manual
+- Linux: compila con los `cfg` de este cambio, clippy `-D warnings` sale sin avisos y corren en verde los escenarios del socket de `binary.rs` que ahora valen para los dos sistemas (`an_orphan_socket_left_by_a_kill_does_not_keep_the_next_daemon_out`, `a_socket_path_over_the_limit_is_refused_by_name`, `a_taken_profile_port_leaves_the_daemon_on_its_socket`, `a_shutdown_ends_the_socket_listener_within_its_bounds`, `a_bridge_starts_its_daemon_through_the_binary`) y los de `update` (`an_update_keeps_the_port_of_a_daemon_that_serves_tcp_alone`, `an_undone_update_restarts_a_daemon_that_served_tcp_alone_on_its_port`, `an_older_updater_installs_the_socket_version_and_sees_it_answer`). `an_update_keeps_the_port_of_a_daemon_that_serves_tcp_alone` es el arreglo de Unix del lote 6: su verde está visto; su rojo, no (W3).
+- Windows, en el runner elevado: los mismos escenarios del binario, y `dropping_the_listener_closes_its_socket`, `a_socket_whose_file_denies_write_data_refuses_the_connect` y `the_socket_file_inherits_the_data_directory_acl` dan `ok` (D7 verificado con token elevado).
+- En los dos, el único test ignorado fuera de `transport_bar.rs` es `the_vectors_are_the_ones_fastembed_gave`, que necesita el modelo real; en Windows también `the_socket_is_not_slower_than_tcp`, que corrió aparte (R12).
 
-**Sin correr.** Necesita una segunda cuenta local estándar, sin privilegios, creada para la prueba y borrada al final. Va con el binario de `target-test/debug` (build `testing`, modelo falso), perfil `dev` y `CLAWG_TEST_HOME` dentro del perfil de la primera cuenta (A), para que el directorio de datos herede el ACL de ese perfil como en una instalación real y no se toque ningún `~/.clawg*`.
+## R13 manual
+
+**Sin correr** (W4). Necesita una segunda cuenta local estándar, sin privilegios, creada para la prueba y borrada al final. Va con el binario de `target-test/debug` (build `testing`, modelo falso), perfil `dev` y `CLAWG_TEST_HOME` dentro del perfil de la primera cuenta (A), para que el directorio de datos herede el ACL de ese perfil como en una instalación real y no se toque ningún `~/.clawg*`.
 
 | Paso | Esperado | Resultado |
 |---|---|---|
-| A corre `clawg serve --profile dev` sin `--port` | `daemon.json` con `unix_socket: true`; `<data>\clawg.sock` creado; `clawg status` de A da `running: true` | pendiente |
-| B conecta al socket de A (por ejemplo `curl.exe --unix-socket <data>\clawg.sock http://localhost/health`) | falla con 10013 (`WSAEACCES`) | pendiente |
-| B borra `<data>\clawg.sock` | acceso denegado; el archivo sigue y A sigue contestando | pendiente |
-| B crea un socket en `<data>` | acceso denegado | pendiente |
-| `clawg stop` de A | sale con 0; no quedan `clawg.sock` ni `daemon.json` | pendiente |
+| A corre `clawg serve --profile dev` sin `--port` | `daemon.json` con `unix_socket: true`; `<data>\clawg.sock` creado; `clawg status` de A da `running: true` | sin correr |
+| B conecta al socket de A (por ejemplo `curl.exe --unix-socket <data>\clawg.sock http://localhost/health`) | falla con 10013 (`WSAEACCES`) | sin correr |
+| B borra `<data>\clawg.sock` | acceso denegado; el archivo sigue y A sigue contestando | sin correr |
+| B crea un socket en `<data>` | acceso denegado | sin correr |
+| `clawg stop` de A | sale con 0; no quedan `clawg.sock` ni `daemon.json` | sin correr |
 
 ## Lo que no se midió
 
