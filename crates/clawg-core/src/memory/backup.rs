@@ -135,11 +135,13 @@ pub enum Reason {
     Manual,
     /// Before the daemon re-embedded every stored vector with its model.
     PreReembed,
+    /// Before `clawg import` wrote rows from an export.
+    PreImport,
 }
 
 impl Reason {
-    const ALL: [Reason; 4] =
-        [Reason::PreMigration, Reason::PreRestore, Reason::Manual, Reason::PreReembed];
+    const ALL: [Reason; 5] =
+        [Reason::PreMigration, Reason::PreRestore, Reason::Manual, Reason::PreReembed, Reason::PreImport];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -147,6 +149,7 @@ impl Reason {
             Reason::PreRestore => "pre-restore",
             Reason::Manual => "manual",
             Reason::PreReembed => "pre-reembed",
+            Reason::PreImport => "pre-import",
         }
     }
 
@@ -234,7 +237,7 @@ pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
-/// How many automatic snapshots (`pre-migration`, `pre-restore`,
+/// How many automatic snapshots (`pre-migration`, `pre-restore`, `pre-import`,
 /// `pre-reembed`) are kept. One is taken per upgrade that migrates, per
 /// restore or per re-embed, so five cover several in a row. A starting
 /// value, not measured.

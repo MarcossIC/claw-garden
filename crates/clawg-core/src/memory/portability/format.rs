@@ -140,7 +140,7 @@ pub enum Line {
 }
 
 /// A line that could not be read, by its number from 1.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Invalid {
     pub line: usize,
     pub reason: String,

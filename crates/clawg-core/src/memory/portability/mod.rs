@@ -3,9 +3,11 @@
 
 pub mod export;
 pub mod format;
+pub mod import;
 pub mod markdown;
 
 pub use export::{export, Export, ExportError, ExportFilter};
+pub use import::{import, ImportError, ImportOptions, ImportReport};
 
 #[cfg(test)]
 pub(crate) mod fixtures {
