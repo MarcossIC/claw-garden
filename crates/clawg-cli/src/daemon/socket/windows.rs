@@ -197,7 +197,9 @@ mod tests {
 
     use super::super::{bind_socket, test_app};
     use super::*;
+    use crate::client::{ClientError, DaemonClient};
     use crate::daemon::api::router;
+    use crate::daemon::lifecycle::{write_state, write_token, DaemonState};
 
     /// The `DOMAIN\name` of the account running the test.
     fn account() -> String {
@@ -277,17 +279,38 @@ mod tests {
     async fn a_socket_whose_file_denies_write_data_refuses_the_connect() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("clawg.sock");
-        let _listener = bind_socket(&path).expect("bind");
+        let listener = bind_socket(&path).expect("bind");
+        let server = tokio::spawn(std::future::IntoFuture::into_future(axum::serve(
+            listener,
+            router(test_app(dir.path()).await),
+        )));
+        write_state(
+            dir.path(),
+            &DaemonState {
+                pid: 1,
+                port: None,
+                unix_socket: true,
+                profile: "dev".into(),
+                version: "0.1.0".into(),
+                started_at_ms: 0,
+            },
+        )
+        .expect("write state");
+        write_token(dir.path(), "socket-token").expect("write token");
+        let client = DaemonClient::from_data_dir(dir.path()).expect("client");
         let who = account();
 
         assert!(icacls(&[path.as_os_str(), "/deny".as_ref(), format!("{who}:(WD)").as_ref()]), "deny");
         let refused = connect(&path);
+        let health = client.health().await;
         // Undone before anything can fail, so the directory can be removed.
         assert!(icacls(&[path.as_os_str(), "/remove:d".as_ref(), who.as_ref()]), "remove the deny");
 
         let err = refused.expect_err("the deny refuses the connect");
         assert_eq!(err.raw_os_error(), Some(10013), "{err}");
+        assert!(matches!(health, Err(ClientError::NotRunning)), "a refused connect reads as not running: {health:?}");
         connect(&path).expect("the connect enters once the deny is gone");
+        server.abort();
     }
 
     #[tokio::test]
