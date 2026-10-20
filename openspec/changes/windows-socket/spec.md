@@ -5,7 +5,7 @@ Delta contra `specs/daemon-access` (R7 a R9, más R10 a R14), `specs/self-update
 ## Definiciones
 
 - **Socket del perfil:** `<data>/clawg.sock`, ahora también en Windows: un socket AF_UNIX con ruta, derivado del directorio de datos (`socket_file`, `crates/clawg-core/src/paths.rs:231-233`).
-- **Puerto del perfil, clawg anterior:** como en local-transport. En Windows, un clawg anterior habla sólo TCP (`endpoint` mira `unix_socket` sólo en Unix, `crates/clawg-cli/src/client.rs:621`).
+- **Puerto del perfil, clawg anterior:** como en local-transport. En Windows, un clawg anterior habla sólo TCP (`endpoint` mira `unix_socket` sólo en Unix, `crates/clawg-cli/src/client.rs:622`).
 - **Sistema sin AF_UNIX:** uno cuyo sistema operativo no puede crear un socket AF_UNIX.
 
 ## MODIFIED Requirements
@@ -31,7 +31,7 @@ Delta contra `specs/daemon-access` (R7 a R9, más R10 a R14), `specs/self-update
 - WHEN llega `POST /v1/shutdown`
 - THEN el proceso sale con 0 sin pasar `STOP_TIMEOUT` y el socket se borra
 
-**Tests (Windows, fallan hoy):** `the_socket_path_fits_under_the_limit_and_a_longer_one_is_named` (cuenta bytes UTF-8 con límite 108), `a_socket_an_earlier_daemon_left_is_replaced` (`daemon/socket.rs`, hoy `cfg(unix)`); `clear_state_removes_the_files_and_the_socket_and_tolerates_absence` (`lifecycle.rs`); `a_daemon_without_a_port_serves_status_stop_bridge_and_hooks_over_its_socket`, `an_orphan_socket_left_by_a_kill_does_not_keep_the_next_daemon_out`, `a_socket_path_over_the_limit_is_refused_by_name` (`tests/binary.rs`, sin `cfg(unix)`, `:683-763`); nuevo `a_shutdown_ends_the_socket_listener_within_its_bounds` (`binary.rs`).
+**Tests (Windows, fallan hoy):** `the_socket_path_fits_under_the_limit_and_a_longer_one_is_named` (cuenta bytes UTF-8 con límite 108), `a_socket_an_earlier_daemon_left_is_replaced` (`daemon/socket.rs`, hoy `cfg(unix)`); nuevo `a_non_ascii_path_counts_its_utf8_bytes`; nuevo `dropping_the_listener_closes_its_socket` (`connect` da `ConnectionRefused` en menos de 1 s tras el `Drop`) y los tests del router por AF_UNIX detrás del guardia (otro `Host` da 403, un `Origin` da 403, `/v1` sin token da 401; `daemon/socket/windows.rs`); `clear_state_removes_the_files_and_the_socket_and_tolerates_absence` (`lifecycle.rs`); `a_daemon_without_a_port_serves_status_stop_bridge_and_hooks_over_its_socket`, `an_orphan_socket_left_by_a_kill_does_not_keep_the_next_daemon_out`, `a_socket_path_over_the_limit_is_refused_by_name` (`tests/binary.rs`, sin `cfg(unix)`, `:723-802`); nuevo `a_shutdown_ends_the_socket_listener_within_its_bounds` (`binary.rs`).
 
 ### Requirement: R8. TCP al lado del socket
 
@@ -49,13 +49,13 @@ Delta contra `specs/daemon-access` (R7 a R9, más R10 a R14), `specs/self-update
 - WHEN corre `clawg serve --port N`
 - THEN sale con error y no publica estado
 
-**Tests:** `the_tcp_plan_follows_the_port_and_the_socket` (`serve.rs`, con las filas de Windows: hoy `has_socket` es siempre falso); `the_start_line_names_every_listener`; `a_taken_profile_port_leaves_the_daemon_on_its_socket` (`binary.rs:764`, sin `cfg(unix)`); `socket_only` de `binary.rs` pone `CLAWG_TEST_DEFAULT_PORT=off` también en Windows (`:166-172`).
+**Tests:** `the_tcp_plan_follows_the_port_and_the_socket` (`serve.rs`, con las filas de Windows: hoy `has_socket` es siempre falso); `the_start_line_names_every_listener`; `a_taken_profile_port_leaves_the_daemon_on_its_socket` (`binary.rs:804`, sin `cfg(unix)`); `socket_only` de `binary.rs` pone `CLAWG_TEST_DEFAULT_PORT=off` también en Windows (`:166-172`).
 
 ### Requirement: R9. El cliente va por el socket y nunca cae a TCP (Unix y Windows)
 
-(Previously: «MUST dar el socket ... en Unix»; `endpoint` usa `cfg!(unix)`, `client.rs:621`, y `socket_http` no existe fuera de Unix, `client.rs:640-643`.)
+(Previously: «MUST dar el socket ... en Unix»; `endpoint` usa `cfg!(unix)`, `client.rs:622`, y `socket_http` no existe fuera de Unix, `client.rs:641-644`.)
 
-`endpoint(state, base_dir, tcp_only)` MUST dar el socket del perfil cuando `state.unix_socket` es verdadero y no hay `tcp_only`, en Unix y en Windows, aunque también haya `port`. La ruta MUST derivarse del directorio de datos y MUST NOT leerse de `daemon.json`. Un socket publicado que no conecta MUST leerse como `NotRunning` (`map_transport`, `client.rs:700`) y el cliente MUST NOT probar el puerto. Con 32 clientes simultáneos por el socket, ninguno MUST leerse como `NotRunning`. El sello `transport: "tcp"` MUST apagar también el socket de Windows, tanto en el daemon como en el cliente.
+`endpoint(state, base_dir, tcp_only)` MUST dar el socket del perfil cuando `state.unix_socket` es verdadero y no hay `tcp_only`, en Unix y en Windows, aunque también haya `port`. La ruta MUST derivarse del directorio de datos y MUST NOT leerse de `daemon.json`. Un socket publicado que no conecta MUST leerse como `NotRunning` (`map_transport`, `client.rs:701`) y el cliente MUST NOT probar el puerto. Con 32 clientes simultáneos por el socket, ninguno MUST leerse como `NotRunning`. El sello `transport: "tcp"` MUST apagar también el socket de Windows, tanto en el daemon como en el cliente.
 
 #### Escenario: cliente por el socket en Windows
 - GIVEN un daemon con `unix_socket: true` y `port`
@@ -72,7 +72,7 @@ Delta contra `specs/daemon-access` (R7 a R9, más R10 a R14), `specs/self-update
 - WHEN 32 clientes llaman a la vez por el socket
 - THEN las 32 llamadas contestan
 
-**Tests:** `the_socket_wins_when_published_and_tcp_is_used_otherwise` (`client.rs:1605`, la rama `cfg!(unix)`), `a_client_reaches_a_daemon_over_its_published_socket`, `a_client_on_a_published_socket_with_nothing_behind_is_not_running` (`client.rs`, hoy `cfg(unix)`); nuevo `thirty_two_simultaneous_clients_over_the_socket_are_none_not_running`; `a_bridge_starts_its_daemon_through_the_binary` (`binary.rs:779`); `a_stamp_can_restrict_the_binary_to_tcp` (`build_info.rs`, caso de Windows).
+**Tests:** `the_socket_wins_when_published_and_tcp_is_used_otherwise` (`client.rs:1626`, la rama `cfg!(unix)`), `a_client_reaches_a_daemon_over_its_published_socket`, `a_client_on_a_published_socket_with_nothing_behind_is_not_running` (`client.rs`, hoy `cfg(unix)`); nuevo `thirty_two_simultaneous_clients_over_the_socket_are_none_not_running`; nuevo `health` contra un socket que nunca contesta, que da `NotRunning` dentro de `HEALTH_TIMEOUT`; `a_bridge_starts_its_daemon_through_the_binary` (`binary.rs:819`); `a_stamp_can_restrict_the_binary_to_tcp` (`build_info.rs`, caso de Windows).
 
 ## ADDED Requirements
 
@@ -106,15 +106,15 @@ En un sistema sin AF_UNIX el daemon MUST servir TCP en el puerto del perfil (obl
 - WHEN corre `clawg serve`
 - THEN sale con 1 y no abre TCP
 
-**Tests:** nuevos `a_system_without_af_unix_serves_tcp_on_the_profile_port`, `any_other_socket_failure_stops_the_start` (decisión pura, `serve.rs`).
+**Tests:** la tabla de `serves_without_socket` (decisión pura: sólo `Unsupported` cae a TCP sin `--port`, todo lo demás detiene el arranque) y `lacks_af_unix` (10047 da sí; 10013, 10048 y 10022 dan no), en `daemon/socket/mod.rs` y `daemon/socket/windows.rs`.
 
 ### Requirement: R12. El rendimiento de AF_UNIX no empeora el de TCP (Windows, sólo verify)
 
-Con un build `testing` y un daemon arrancado con `--port`, `DaemonClient` por AF_UNIX MUST NOT superar la media de `DaemonClient` por TCP en más de un 10 % en ninguno de cuatro escenarios: secuencial con conexión reutilizada, conexión nueva por petición, 8 en paralelo y ráfaga de 32 clientes (mediana de 3 corridas tras un precalentamiento). La ráfaga MUST terminar sin fallas. Si no se cumple, el cambio MUST NOT integrarse.
+Con un build `testing` y un daemon arrancado con `--port`, `DaemonClient` por AF_UNIX MUST NOT superar la media de `DaemonClient` por TCP en más de un 10 % en ninguno de cinco escenarios: cuatro con `health()` (secuencial con conexión reutilizada, conexión nueva por petición, 8 en paralelo y ráfaga de 32 clientes) y uno con cuerpo real (el puente secuencial con conexión reutilizada y una respuesta de unos 8 KB), cada uno con la mediana de 3 corridas tras un precalentamiento. La ráfaga MUST terminar sin fallas. Si no se cumple, el cambio MUST NOT integrarse.
 
 #### Escenario: la barra
 - GIVEN el daemon con los dos transportes
-- WHEN se miden los cuatro escenarios
+- WHEN se miden los cinco escenarios
 - THEN ninguna media de AF_UNIX pasa 1,10 veces la de TCP y la ráfaga no falla
 
 **Verificación:** sólo en `verify.md`; no tiene test automático.
@@ -134,21 +134,26 @@ Con una segunda cuenta local estándar y el daemon real, conectar al socket MUST
 
 ### Requirement: S8. Plan e intercambio, el puerto del daemon nuevo
 
-(Previously: «En Windows, único transporte TCP, MUST recibir el puerto del daemon viejo», `openspec/specs/self-update/spec.md:122`; `serve_port` recibe `cfg!(unix)`, `crates/clawg-cli/src/update/effects.rs:295`, `:431`, `:458`.)
+(Previously: «En Windows, único transporte TCP, MUST recibir el puerto del daemon viejo», `openspec/specs/self-update/spec.md:122`; `serve_port` recibe `cfg!(unix)`, `crates/clawg-cli/src/update/effects.rs:295`, `:431`, `:458`. Eso ya falla en Unix desde 0.37.0: un daemon lanzado con `--port N` cuya ruta de socket no entra sirve sólo TCP, `crates/clawg-cli/src/daemon/serve.rs:320-322`; `update` lo reinicia sin `--port`, la ruta larga es fatal sin él, `serve.rs:324`, y ni el daemon nuevo ni el del deshacer arrancan.)
 
-En Unix y en Windows el daemon nuevo, y el viejo al deshacer, MUST lanzarse sin `--port` y vigilarse por `from_data_dir`, que va por el socket; sólo con `tcp_only` (un clawg anterior al socket) recibe el puerto del viejo. Un actualizador anterior pasa `--port`, así que el daemon nuevo enciende TCP (obligatorio) y el socket, y ese actualizador lo ve contestar.
+En Unix y en Windows el daemon nuevo, y el viejo al deshacer, MUST lanzarse sin `--port` y vigilarse por `from_data_dir`, que va por el socket, cuando el daemon que corría publicó su socket (`unix_socket: true` en `daemon.json`). Cuando no lo publicó (sirvió sólo TCP porque su ruta no entra, o es un clawg anterior) o con `tcp_only` (el sello de un clawg anterior al socket), MUST recibir el puerto del viejo. `serve_port(old_port, socket, tcp_only)` toma `socket` de `daemon.json`, no del sistema operativo. Un actualizador anterior pasa `--port`, así que el daemon nuevo enciende TCP (obligatorio) y el socket, y ese actualizador lo ve contestar.
 
 #### Escenario: un actualizador nuevo en Windows
 - GIVEN un daemon con TCP en un puerto efímero
 - WHEN la versión actual instala la siguiente
 - THEN el daemon nuevo no recibió `--port` y `daemon.json` no tiene `port`
 
+#### Escenario: un daemon que sirve sólo TCP porque su ruta no entra (Unix y Windows)
+- GIVEN un daemon lanzado con `--port N` cuya ruta de socket pasa el límite, así que sirve sólo TCP y su `daemon.json` lleva `port` y no `unix_socket`
+- WHEN la versión actual instala la siguiente
+- THEN el daemon nuevo recibe `--port` con el puerto del viejo, arranca y contesta por TCP; y si la actualización se deshace, el viejo vuelve a arrancar con ese puerto
+
 #### Escenario: un actualizador anterior en Windows
 - GIVEN un clawg anterior (sello `tcp`) con su daemon
 - WHEN instala la versión nueva
 - THEN termina con 0 y el daemon nuevo contesta por el socket y por TCP
 
-**Tests:** `the_new_daemon_gets_a_port_only_where_tcp_is_the_only_transport` (`effects.rs`, cambia en Windows); `a_full_update_with_a_daemon_replaces_the_binary_and_a_bridge_reaches_the_new_daemon` (la comprobación de `port` sin `cfg(unix)`, `binary.rs:1792-1796`); `an_older_updater_installs_the_socket_version_and_sees_it_answer`, `an_older_bridge_reaches_a_new_daemon_over_the_profile_port` (`binary.rs:1806-1846`, sin `cfg(unix)`).
+**Tests:** `the_new_daemon_gets_a_port_only_where_tcp_is_the_only_transport` (`effects.rs`, el segundo argumento pasa a ser `socket` y gana la fila que da el puerto del viejo cuando no publicó su socket); los `Running` de `update/plan.rs` llevan `socket`, y `running_daemon` lo lee de `daemon.json`; nuevo `an_update_keeps_the_port_of_a_daemon_that_serves_tcp_alone` (`binary.rs`, Unix y Windows): falla hoy en Unix, porque el daemon nuevo se lanza sin `--port` y se niega a arrancar (`serve.rs:324`); `a_full_update_with_a_daemon_replaces_the_binary_and_a_bridge_reaches_the_new_daemon` (la comprobación de `port` sin `cfg(unix)`, `binary.rs:1832-1836`); `an_older_updater_installs_the_socket_version_and_sees_it_answer`, `an_older_bridge_reaches_a_new_daemon_over_the_profile_port` (`binary.rs:1842-1886`, sin `cfg(unix)`).
 
 ## MODIFIED Requirements (install)
 

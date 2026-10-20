@@ -5,8 +5,8 @@ phase: propose
 artifacts:
   exploration: done
   proposal: done
-  spec: pending
-  design: pending
+  spec: done
+  design: done
   tasks: pending
   apply: pending
   verify: pending
