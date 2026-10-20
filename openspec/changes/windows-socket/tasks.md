@@ -53,9 +53,9 @@ Cubre R9 y los escenarios del sello de R9.
   - `the_socket_wins_when_published_and_tcp_is_used_otherwise` (`:1622`) sin la rama `cfg!(unix)` de `:1626` (R9, «cliente por el socket»);
   - `a_client_reaches_a_daemon_over_its_published_socket` (`:1658`) y `serve_on_socket` (`:1637`) multiplataforma (R9);
   - `a_client_on_a_published_socket_with_nothing_behind_is_not_running` (`:1674`), con el archivo huérfano también (R9, «socket publicado sin nadie detrás»);
-  - `thirty_two_simultaneous_clients_over_the_socket_are_none_not_running` (R9, «ráfaga de 32»);
+  - `thirty_two_simultaneous_clients_over_the_socket_are_none_not_running` (R9, «ráfaga de 32»), que quedó como `thirty_two_simultaneous_clients_over_the_socket_all_answer`, contra un daemon vivo;
   - un `health` contra un socket que nunca contesta da `NotRunning` dentro de `HEALTH_TIMEOUT` (`:48`);
-  - `a_stamp_can_restrict_the_binary_to_tcp` (`build_info.rs`, caso de Windows: el sello `tcp` apaga también el socket del daemon y del cliente, R9).
+  - `a_stamp_can_restrict_the_binary_to_tcp` (`build_info.rs`, caso de Windows: el sello `tcp` apaga también el socket del daemon y del cliente, R9). Quedó sin un caso nuevo, porque el sello se lee igual en todos los sistemas: el cliente lo cubre la fila `tcp_only` de `the_socket_wins_when_published_and_tcp_is_used_otherwise`, que ya corre en Windows, y el daemon `an_older_updater_installs_the_socket_version_and_sees_it_answer` (`binary.rs`), cuya copia sellada publica `unix_socket: false`.
 - [x] `Connector` (`tower_service::Service<Uri>` sobre `connect` y `TcpStream::from_std`, `pub(crate)`) en `daemon/socket/windows.rs`; `Transport::AfUnix(hyper_util::client::legacy::Client<…>)` bajo `cfg(windows)`; el bearer como cabecera sensible, `content-type` con cuerpo; la rama no aplica ningún timeout (el de `health` envuelve a `send`, D4). `hyper`, `hyper-util` y `http-body-util` pasan de `[target.'cfg(windows)'.dev-dependencies]` a `[target.'cfg(windows)'.dependencies]`, con la misma versión y las mismas features, y `tower-service` entra allí; `cargo update --workspace` suma `tower-service` a la lista de `clawg-cli` de `Cargo.lock`, y el paso de tabla no la cambia.
 - [x] `endpoint` (`client.rs:621-626`) sin `cfg!(unix) &&`; `socket_http` (`:636-644`) deja de ser `None` fuera de Unix; `from_data_dir` (`:655-664`) arma el transporte del socket de cada sistema. Los tests del router de `windows.rs` pasan a usar el `Connector`.
 - Commit: `feat(cli): reach the daemon over its socket on Windows`
@@ -90,7 +90,7 @@ Cubre S8, incluido el fallo que ya hay en Unix.
 ## 8. La barra de rendimiento (D8, R12)
 
 - [x] `crates/clawg-cli/tests/transport_bar.rs` nuevo, con `#![cfg(windows)]` e `#[ignore = "…"]`: daemon de `CARGO_BIN_EXE_clawg` con `serve --profile dev --port 0`, `CLAWG_TEST_HOME` y modelo falso; dos `DaemonClient::from_data_dir` (el directorio del daemon y una vista con `token` y un `daemon.json` que sólo lleva `port`); los cinco escenarios (secuencial, cliente nuevo por petición, 8 tareas, ráfaga de 32 con barrera en 20 rondas, y `DaemonClient::list` sobre memorias sembradas con un `Answer.body` de 7 a 9 KB que el arnés comprueba); precalentamiento y 3 corridas alternadas, la mediana; imprime media, p99 y razón; falla si una media de AF_UNIX pasa 1,10 veces la de TCP o la ráfaga de AF_UNIX tiene una falla.
-- [ ] El CI no pasa `--ignored` (`.github/workflows/ci.yml:67`), así que no entra a la suite. Se corre en la verificación: `cargo test -p clawg-cli --release --test transport_bar --target-dir target-test -- --ignored --nocapture` (build `testing`, no es un release que se publica) y el resultado va en `verify.md`. Si la barra no se cumple, el cambio no sale.
+- [x] El CI no pasa `--ignored` (`.github/workflows/ci.yml:67`), así que no entra a la suite. Se corre en la verificación: `cargo test -p clawg-cli --release --test transport_bar --target-dir target-test -- --ignored --nocapture` (build `testing`, no es un release que se publica) y el resultado va en `verify.md`. Si la barra no se cumple, el cambio no sale.
 - Commit: `test(cli): add the transport benchmark harness for Windows`
 
 ## 9. Docs
@@ -103,13 +103,13 @@ Cubre S8, incluido el fallo que ya hay en Unix.
 
 ## 10. Verificación
 
-- [ ] `cargo clean --workspace --target-dir target-test`, `cargo test --workspace --target-dir target-test` y clippy (`-A clippy::all -D warnings`) en Windows sobre el último commit.
-- [ ] `cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings` y `cargo test --locked -p clawg-core --lib build_info` (lo que construye el release), y la suite en Linux: el CI del pull request en verde en Linux y Windows. Revisar `dead_code` y `unused` de las variantes y los imports que sólo usa un sistema.
-- [ ] Barra de rendimiento del lote 8, con la tabla en `verify.md` (R12).
+- [x] `cargo clean --workspace --target-dir target-test`, `cargo test --workspace --target-dir target-test` y clippy (`-A clippy::all -D warnings`) en Windows sobre el último commit.
+- [ ] `cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings` y `cargo test --locked -p clawg-core --lib build_info` (lo que construye el release), y la suite en Linux: el CI del pull request en verde en Linux y Windows. Revisar `dead_code` y `unused` de las variantes y los imports que sólo usa un sistema. En Windows, local, ya pasan los dos comandos del release; falta el CI.
+- [x] Barra de rendimiento del lote 8, con la tabla en `verify.md` (R12).
 - [ ] Manual, en `verify.md`, con una segunda cuenta local estándar y el daemon real (R13): conectar al socket da 10013; borrar el socket y crear otro en el directorio de datos da acceso denegado.
-- [ ] `rag-eval` no aplica: no cambia el ranking ni lo que ve el modelo; `agent_contract.json` no cambia.
-- [ ] Ningún directorio de build fuera de `target` y `target-test`; ningún `clawg.exe` detenido; nada en `~/.clawg*`.
+- [x] `rag-eval` no aplica: no cambia el ranking ni lo que ve el modelo; `agent_contract.json` no cambia.
+- [x] Ningún directorio de build fuera de `target` y `target-test`; ningún `clawg.exe` detenido; nada en `~/.clawg*`.
 
 ## 11. Archive
 
-- [ ] `specs/daemon-access` (R7 a R9 y R10 a R14), `specs/self-update` (S8, `:122`), `specs/install` (`:112`); `git mv` a `changes/archive/`; `state.yaml`; fila y orden de ejecución del `README.md` de openspec; subir el minor y `cargo update --workspace` en un commit `chore: bump version to X.Y.Z`.
+- [ ] `specs/daemon-access` (R7 a R9 y R10 a R13), `specs/self-update` (S8, `:122`), `specs/install` (`:112`); `git mv` a `changes/archive/`; `state.yaml`; fila y orden de ejecución del `README.md` de openspec; subir el minor y `cargo update --workspace` en un commit `chore: bump version to X.Y.Z`.

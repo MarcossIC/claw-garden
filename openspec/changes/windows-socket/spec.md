@@ -1,6 +1,6 @@
 # windows-socket — Especificación
 
-Delta contra `specs/daemon-access` (R7 a R9, más R10 a R14), `specs/self-update` (S8) y `specs/install` (el autoarranque). Es el gemelo de Windows de local-transport: lo que allí es del socket de Unix vale acá con AF_UNIX nativo. R5 y R6 siguen siendo sólo de Unix.
+Delta contra `specs/daemon-access` (R7 a R9, más R10 a R13), `specs/self-update` (S8) y `specs/install` (el autoarranque). Es el gemelo de Windows de local-transport: lo que allí es del socket de Unix vale acá con AF_UNIX nativo. R5 y R6 siguen siendo sólo de Unix.
 
 ## Definiciones
 
@@ -49,7 +49,7 @@ Delta contra `specs/daemon-access` (R7 a R9, más R10 a R14), `specs/self-update
 - WHEN corre `clawg serve --port N`
 - THEN sale con error y no publica estado
 
-**Tests:** `the_tcp_plan_follows_the_port_and_the_socket` (`serve.rs`, con las filas de Windows: hoy `has_socket` es siempre falso); `the_start_line_names_every_listener`; `a_taken_profile_port_leaves_the_daemon_on_its_socket` (`binary.rs:804`, sin `cfg(unix)`); `socket_only` de `binary.rs` pone `CLAWG_TEST_DEFAULT_PORT=off` también en Windows (`:166-172`); nuevo `a_taken_explicit_port_is_fatal_and_publishes_nothing` (`binary.rs`, en los dos sistemas: sale con error sin `daemon.json` ni `token`).
+**Tests:** `the_tcp_plan_follows_the_port_and_the_socket` (`serve.rs`; la decisión no depende del sistema, así que sus filas valen para los dos: lo que cambia en Windows es que `has_socket` deja de ser siempre falso); `the_start_line_names_every_listener`; `a_taken_profile_port_leaves_the_daemon_on_its_socket` (`binary.rs:804`, sin `cfg(unix)`); `socket_only` de `binary.rs` pone `CLAWG_TEST_DEFAULT_PORT=off` también en Windows (`:166-172`); nuevo `a_taken_explicit_port_is_fatal_and_publishes_nothing` (`binary.rs`, en los dos sistemas: sale con error sin `daemon.json` ni `token`).
 
 ### Requirement: R9. El cliente va por el socket y nunca cae a TCP (Unix y Windows)
 
@@ -72,7 +72,7 @@ Delta contra `specs/daemon-access` (R7 a R9, más R10 a R14), `specs/self-update
 - WHEN 32 clientes llaman a la vez por el socket
 - THEN las 32 llamadas contestan
 
-**Tests:** `the_socket_wins_when_published_and_tcp_is_used_otherwise` (`client.rs:1626`, la rama `cfg!(unix)`), `a_client_reaches_a_daemon_over_its_published_socket`, `a_client_on_a_published_socket_with_nothing_behind_is_not_running` (`client.rs`, hoy `cfg(unix)`); nuevo `thirty_two_simultaneous_clients_over_the_socket_are_none_not_running`; nuevo `health` contra un socket que nunca contesta, que da `NotRunning` dentro de `HEALTH_TIMEOUT`; `a_bridge_starts_its_daemon_through_the_binary` (`binary.rs:819`); `a_stamp_can_restrict_the_binary_to_tcp` (`build_info.rs`, caso de Windows).
+**Tests:** `the_socket_wins_when_published_and_tcp_is_used_otherwise` (`client.rs:1626`, la rama `cfg!(unix)`), `a_client_reaches_a_daemon_over_its_published_socket`, `a_client_on_a_published_socket_with_nothing_behind_is_not_running` (`client.rs`, hoy `cfg(unix)`); nuevo `thirty_two_simultaneous_clients_over_the_socket_all_answer` (32 clientes contra un daemon vivo, detrás de una barrera, y todos contestan); nuevo `a_health_against_a_socket_that_never_answers_is_not_running_within_its_timeout`; `a_bridge_starts_its_daemon_through_the_binary` (`binary.rs:819`); el sello, que se lee igual en todos los sistemas: del lado del cliente la fila `tcp_only` de `the_socket_wins_when_published_and_tcp_is_used_otherwise`, y del lado del daemon `an_older_updater_installs_the_socket_version_and_sees_it_answer` (`binary.rs`, cuya copia sellada publica `unix_socket: false`), los dos también en Windows.
 
 ## ADDED Requirements
 
@@ -90,7 +90,7 @@ El socket MUST heredar el DACL del directorio de datos al crearse; no se le apli
 - WHEN el daemon crea el socket
 - THEN el DACL del archivo contiene las entradas heredadas del directorio
 
-**Tests (fallan hoy: no hay socket):** nuevos `a_socket_whose_file_denies_write_data_refuses_the_connect`, `the_socket_file_inherits_the_data_directory_acl` (`daemon/socket/windows.rs`). Con una segunda cuenta, R14.
+**Tests (fallan hoy: no hay socket):** nuevos `a_socket_whose_file_denies_write_data_refuses_the_connect`, `the_socket_file_inherits_the_data_directory_acl` (`daemon/socket/windows.rs`); el primero también comprueba que `DaemonClient` lo lee como `NotRunning`. Con una segunda cuenta, R13.
 
 ### Requirement: R11. Sin AF_UNIX, TCP en el puerto del perfil
 
