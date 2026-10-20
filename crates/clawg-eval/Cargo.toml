@@ -30,6 +30,11 @@ path = "src/bin/golden-mine/main.rs"
 name = "conflict-eval"
 path = "src/bin/conflict-eval/main.rs"
 
+# Measures what a topic key does for a memory that is revised.
+[[bin]]
+name = "revision-eval"
+path = "src/bin/revision-eval/main.rs"
+
 [dependencies]
 clawg-core = { workspace = true, features = ["eval"] }
 # Only `rag-eval --agent-view` uses it: it serves the daemon's own router in-process
