@@ -27,7 +27,7 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 
 ## 5. Verificación
 
-- [ ] Suite y clippy en Linux sobre el último commit ([verify](verify.md)).
+- [x] Suite y clippy en Linux sobre el último commit ([verify](verify.md)).
 - [ ] El CI en verde en Linux y Windows.
 
 ## 6. Archive

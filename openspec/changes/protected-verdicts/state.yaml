@@ -1,14 +1,14 @@
 change: protected-verdicts
 objective: "1, 4"
 depends_on: []
-phase: apply
+phase: verify
 artifacts:
   exploration: done
   proposal: done
   spec: done
   design: done
   tasks: done
-  apply: in_progress
-  verify: pending
+  apply: done
+  verify: in_progress  # the CI of the pull request pending
   archive: pending
 updated: 2026-10-20
