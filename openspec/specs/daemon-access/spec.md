@@ -4,7 +4,8 @@ Fuente de verdad de qué peticiones llegan a la API HTTP del daemon antes de mir
 
 **Origen:**
 - [daemon-hardening](../../changes/archive/2026-10-19-daemon-hardening/proposal.md), archivado el 2026-10-19. Los ids de requisito son los de esa spec; el porqué de cada decisión, y lo descartado (ACL en Windows, recortar `/health`, pipes o sockets, comprobar el puerto), está en su propuesta y su [exploración](../../changes/archive/2026-10-19-daemon-hardening/exploration.md).
-- [local-isolation](../../changes/archive/2026-10-19-local-isolation/proposal.md), archivado el 2026-10-19: agrega R6 y cambia el `Límite` y R5. Por qué el directorio y no cada archivo, sin `umask`, y por qué no poder apretar no detiene a clawg, en su [diseño](../../changes/archive/2026-10-19-local-isolation/design.md); la medición con dos cuentas, `memory.lock` incluido, en su [verify](../../changes/archive/2026-10-19-local-isolation/verify.md).
+- [local-isolation](../../changes/archive/2026-10-19-local-isolation/proposal.md), archivado el 2026-10-19: agrega R6 y cambia el `Límite` y R5.
+- [local-transport](../../changes/archive/2026-10-20-local-transport/proposal.md), archivado el 2026-10-20: agrega R7 a R9 (el socket del directorio de datos, TCP a su lado y el cliente) y cambia el `Límite` y R3. Por qué el chequeo de uid además del directorio, la marca en `daemon.json` en lugar de la ruta y TCP no fatal sin `--port`, en su [diseño](../../changes/archive/2026-10-20-local-transport/design.md); la medición con dos cuentas, en su [verify](../../changes/archive/2026-10-20-local-transport/verify.md). Por qué el directorio y no cada archivo, sin `umask`, y por qué no poder apretar no detiene a clawg, en su [diseño](../../changes/archive/2026-10-19-local-isolation/design.md); la medición con dos cuentas, `memory.lock` incluido, en su [verify](../../changes/archive/2026-10-19-local-isolation/verify.md).
 
 ## Definiciones
 
@@ -12,11 +13,12 @@ Fuente de verdad de qué peticiones llegan a la API HTTP del daemon antes de mir
 - **Autoridades de la petición:** la cabecera `Host` y la autoridad de la URI (la `:authority` de HTTP/2, o la de una URI absoluta en HTTP/1.1), las que estén. El daemon sirve HTTP/2 en texto plano: `hyper-util` llega con `http2` a través de `reqwest`.
 - **Directorio de datos:** `<home>/.clawg` o `<home>/.clawg-dev` (`data_dir_in`, `crates/clawg-core/src/paths.rs:159`).
 - **Modo privado:** en Unix, un directorio sin ningún bit de grupo ni de otros (`modo & 0o077 == 0`).
+- **Socket del perfil:** `<data>/clawg.sock` (`socket_file`, `crates/clawg-core/src/paths.rs`), un socket de dominio Unix con ruta, nunca abstracto.
 - **Guardia:** `admit_loopback` (`crates/clawg-cli/src/daemon/api.rs:906`), la capa que `router` (`api.rs:846`) aplica a todas sus rutas, `/health` y `/v1` incluidas, por fuera de `require_bearer` (`api.rs:869`).
 
 ## Límite
 
-El guardia cierra el paso a una página web abierta en el navegador del usuario, con DNS rebinding o sin él. No es una barrera contra un proceso local: uno que puede leer el token manda también el `Host` correcto. En Unix otro usuario local no lee nada del directorio de datos (R6), ni el token; si llega al puerto, sigue frenado por el token. Nada de esto frena a un proceso del mismo usuario ni a root.
+El guardia cierra el paso a una página web abierta en el navegador del usuario, con DNS rebinding o sin él. No es una barrera contra un proceso local: uno que puede leer el token manda también el `Host` correcto. En Unix otro usuario local no lee nada del directorio de datos (R6), ni el token, ni llega al socket del perfil (R7); un cliente que publica el socket nunca dialoga por TCP (R9), así que un proceso ajeno en el puerto del perfil ya no se hace pasar por el daemon ante él. Mientras TCP siga encendido para los clientes anteriores (R8), otro usuario llega a ese puerto y lee `/health`, y lo demás lo frena el token. Nada de esto frena a un proceso del mismo usuario ni a root.
 
 ## R1. La decisión es pura
 
@@ -60,7 +62,7 @@ Una petición que `admits` rechaza MUST recibir `403` con `{"error":"forbidden"}
 
 ## R3. Los clientes de hoy pasan
 
-`DaemonClient` (`crates/clawg-cli/src/client.rs`) MUST seguir guardando, buscando, leyendo `/health` y apagando contra el router real: dialoga con `http://127.0.0.1:<puerto>` y no manda `Origin`. Un cliente que integre con el daemon MUST usar un nombre de loopback y MUST NOT mandar `Origin`.
+`DaemonClient` (`crates/clawg-cli/src/client.rs`) MUST seguir guardando, buscando, leyendo `/health` y apagando contra el router real: dialoga con `http://127.0.0.1:<puerto>`, o con `http://localhost` por el socket, y no manda `Origin`. Un cliente que integre con el daemon MUST usar un nombre de loopback y MUST NOT mandar `Origin`.
 
 **Tests:** `a_daemon_client_passes_the_guard` (`tests/api.rs`); `tests/binary.rs` (`status`, `stop`, MCP por stdio) sin cambios.
 
@@ -111,3 +113,36 @@ Todo lugar de clawg que crea el directorio de datos o un subdirectorio suyo MUST
 Un descriptor de `memory.lock` que otro usuario abrió mientras el directorio estaba abierto sobrevive hasta que su proceso termina, y mientras tanto el daemon responde `StoreInUse`; después ya no puede volver a abrirlo.
 
 **Tests:** `a_missing_directory_and_its_parents_are_created_private`, `an_open_directory_is_tightened_and_the_rest_left_alone`, `a_private_directory_is_left_as_it_is`, `only_group_and_other_bits_are_taken` (`private_dir.rs`, Unix); `save_creates_a_private_data_directory` (`sharing.rs`), `a_snapshot_directory_is_created_private`, `restore_creates_a_private_data_directory` (`backup.rs`), `opening_a_store_makes_its_directory_private`, `a_data_directory_that_cannot_be_created_is_an_error` (`db.rs`), `workspace_directories_are_created_private` (`workspace.rs`), `the_model_cache_is_created_private` (`model_download.rs`), `the_update_lock_makes_the_data_directory_private` (`update/lock.rs`), `setup_copies_go_in_a_private_directory` (`setup.rs`), `autostart_creates_a_private_data_directory`, `the_serve_log_goes_in_a_private_directory` (`client.rs`); `a_daemon_on_a_fresh_home_leaves_a_private_data_directory`, `an_open_data_directory_is_tightened_and_keeps_its_rows` (`tests/binary.rs`, Unix).
+
+## R7. El socket del perfil admite sólo al mismo uid (Unix)
+
+En Unix, `clawg serve` MUST escuchar en el socket del perfil. Con el candado del store tomado y antes de publicar `daemon.json`, MUST borrar el socket que haya dejado un daemon anterior y hacer `bind` (`bind_socket`, `crates/clawg-cli/src/daemon/socket.rs`); `clear_state` (`crates/clawg-cli/src/daemon/lifecycle.rs`) MUST borrarlo al salir, con el candado todavía tomado. Una ruta cuyo largo en bytes no cabe en `sun_path` (108 en Linux, 104 en los demás Unix, `SUN_PATH_LEN`) MUST impedir el arranque con un error que nombra la ruta y el límite, salvo con `--port`, que sirve sólo por TCP con un `warn`; ninguna otra ubicación se intenta. El listener (`PeerChecked`) MUST pedir el uid del par a cada conexión y cerrar, sin leer un byte, la de otro uid o la que no deja leerlo (`admits_peer`), con un `warn` como mucho una vez por minuto. Sobre el socket corren el mismo router, el mismo guardia (R2) y el mismo token. Un clawg de evaluación que tiene el candado no crea socket.
+
+#### Escenario: otra cuenta con los permisos abiertos
+- GIVEN el directorio de datos en 0755 y el socket en 0777
+- WHEN otra cuenta conecta al socket
+- THEN la conexión se cierra sin respuesta y el daemon registra el rechazo
+
+#### Escenario: un socket huérfano
+- GIVEN un daemon terminado con SIGKILL que dejó `clawg.sock`
+- WHEN arranca otro `serve`
+- THEN arranca y contesta por el socket
+
+**Tests:** `the_same_uid_is_admitted_and_another_is_not`, `the_socket_path_fits_under_the_limit_and_a_longer_one_is_named`, `a_socket_an_earlier_daemon_left_is_replaced`, `the_router_answers_over_the_socket_behind_the_guard` (`daemon/socket.rs`); `clear_state_removes_the_files_and_the_socket_and_tolerates_absence` (`lifecycle.rs`); `a_daemon_without_a_port_serves_status_stop_bridge_and_hooks_over_its_socket`, `an_orphan_socket_left_by_a_kill_does_not_keep_the_next_daemon_out`, `a_socket_path_over_the_limit_is_refused_by_name` (`tests/binary.rs`, Unix). Con dos cuentas reales, en el [verify](../../changes/archive/2026-10-20-local-transport/verify.md).
+
+## R8. TCP al lado del socket
+
+`tcp_plan` (`crates/clawg-cli/src/daemon/serve.rs`) MUST decidir: con `--port N`, `127.0.0.1:N` y un `bind` que falla es fatal; sin `--port` y con socket, el puerto del perfil, y un `bind` que falla MUST registrarse con un `warn` y el daemon MUST seguir sólo por el socket sin publicar `port`; sin socket (Windows, o un clawg anterior), el puerto del perfil, fatal. Los dos servidores MUST terminar con la misma señal y dentro de una sola `HTTP_GRACE`. `daemon.json` MUST llevar `port` siempre que TCP esté encendido y `unix_socket: true` cuando lo esté el socket; los dos campos se leen con valor por defecto, así un archivo anterior se lee sin socket y uno sin `port` es un daemon sin TCP.
+
+#### Escenario: el puerto del perfil tomado por otra cuenta
+- GIVEN el daemon de otra cuenta en el puerto del perfil
+- WHEN corre `clawg serve` sin `--port`
+- THEN arranca, contesta por el socket y `daemon.json` no tiene `port`
+
+**Tests:** `the_tcp_plan_follows_the_port_and_the_socket`, `the_start_line_names_every_listener` (`serve.rs`); `a_record_without_the_socket_mark_reads_as_tcp_and_one_without_a_port_has_none` (`lifecycle.rs`); `a_taken_profile_port_leaves_the_daemon_on_its_socket` (`tests/binary.rs`, Unix).
+
+## R9. El cliente va por el socket y nunca cae a TCP
+
+`endpoint(state, base_dir, tcp_only)` (`crates/clawg-cli/src/client.rs`) MUST dar el socket del perfil cuando `state.unix_socket` es verdadero, en Unix, aunque también haya `port`; `127.0.0.1:port` cuando no; y nada sin ninguno de los dos. `from_data_dir` MUST construir el cliente sobre ese punto, sin proxy, con la base `http://localhost` en el socket. La ruta MUST derivarse del directorio de datos y MUST NOT leerse de `daemon.json`. Un socket publicado que no conecta, falte el archivo o no tenga a nadie detrás, MUST leerse como `NotRunning`, y el cliente MUST NOT probar entonces el puerto.
+
+**Tests:** `the_socket_wins_when_published_and_tcp_is_used_otherwise`, `a_client_reaches_a_daemon_over_its_published_socket`, `a_client_on_a_published_socket_with_nothing_behind_is_not_running` (`client.rs`); `a_bridge_starts_its_daemon_through_the_binary` (`tests/binary.rs`, Unix).

@@ -107,7 +107,6 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
     match cli.command {
         Command::Serve { profile, port } => {
             let profile = profile.resolve().map_err(|e| e.to_string())?;
-            let port = port.unwrap_or_else(|| profile.default_port());
             serve::run(profile, port).await.map_err(|e| e.to_string())?;
             Ok(ExitCode::SUCCESS)
         }

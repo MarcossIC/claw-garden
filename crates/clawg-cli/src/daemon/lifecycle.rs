@@ -22,7 +22,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use clawg_core::paths::{daemon_state_file, token_file};
+use clawg_core::paths::{daemon_state_file, socket_file, token_file};
 use serde::{Deserialize, Serialize};
 
 /// Number of random bytes behind the bearer token; rendered as twice as many
@@ -33,11 +33,20 @@ const TOKEN_BYTES: usize = 32;
 /// What a running `clawg serve` publishes about itself.
 ///
 /// `port` is the real bound port, never the requested one: `--port 0` asks the
-/// OS to choose, and a client that read the request would dial port 0.
+/// OS to choose, and a client that read the request would dial port 0. It is
+/// there whenever TCP is on, which an older clawg needs: without it its
+/// `read_state` finds no daemon.
+///
+/// `unix_socket` says the daemon listens on the data directory's socket. Only
+/// a mark: the client derives the path (`paths::socket_file`) rather than
+/// trust the file with where its token goes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonState {
     pub pid: u32,
-    pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub unix_socket: bool,
     pub profile: String,
     pub version: String,
     pub started_at_ms: u64,
@@ -151,11 +160,14 @@ pub fn read_token(base_dir: &Path) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// Removes `daemon.json` and `token`. Missing files are not an error — this
-/// runs on the shutdown path, where the only wrong outcome is refusing to exit.
+/// Removes `daemon.json`, `token` and the socket. Missing files are not an
+/// error — this runs on the shutdown path, where the only wrong outcome is
+/// refusing to exit. It runs with the store lock still held, so the socket
+/// removed is this daemon's.
 pub fn clear_state(base_dir: &Path) {
     let _ = std::fs::remove_file(daemon_state_file(base_dir));
     let _ = std::fs::remove_file(token_file(base_dir));
+    let _ = std::fs::remove_file(socket_file(base_dir));
 }
 
 #[cfg(test)]
@@ -169,7 +181,8 @@ mod tests {
     fn sample_state() -> DaemonState {
         DaemonState {
             pid: 4242,
-            port: 27381,
+            port: Some(27381),
+            unix_socket: false,
             profile: "dev".to_string(),
             version: "0.1.0".to_string(),
             started_at_ms: 1_700_000_000_000,
@@ -189,6 +202,21 @@ mod tests {
         let dir = tmp();
         write_state(dir.path(), &sample_state()).expect("write");
         assert!(dir.path().join("daemon.json").exists());
+    }
+
+    /// What an older clawg wrote, and what it reads: no mark, and a `port`
+    /// it cannot do without.
+    #[test]
+    fn a_record_without_the_socket_mark_reads_as_tcp_and_one_without_a_port_has_none() {
+        let older = r#"{"pid":7,"port":27381,"profile":"dev","version":"0.36.0","started_at_ms":1}"#;
+        let state: DaemonState = serde_json::from_str(older).unwrap();
+        assert_eq!((state.port, state.unix_socket), (Some(27381), false));
+
+        let socket_only = DaemonState { port: None, unix_socket: true, ..sample_state() };
+        let json = serde_json::to_value(&socket_only).unwrap();
+        assert!(json.get("port").is_none(), "no TCP, no port: {json}");
+        assert_eq!(json["unix_socket"], true);
+        assert_eq!(serde_json::from_value::<DaemonState>(json).unwrap(), socket_only);
     }
 
     #[test]
@@ -251,14 +279,16 @@ mod tests {
     }
 
     #[test]
-    fn clear_state_removes_both_files_and_tolerates_absence() {
+    fn clear_state_removes_the_files_and_the_socket_and_tolerates_absence() {
         let dir = tmp();
         write_state(dir.path(), &sample_state()).expect("write state");
         write_token(dir.path(), "deadbeef").expect("write token");
+        std::fs::write(dir.path().join("clawg.sock"), b"").expect("socket stand-in");
 
         clear_state(dir.path());
         assert!(!dir.path().join("daemon.json").exists());
         assert!(!dir.path().join("token").exists());
+        assert!(!dir.path().join("clawg.sock").exists());
 
         clear_state(dir.path()); // idempotent: shutdown must never fail here
     }

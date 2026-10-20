@@ -2,13 +2,13 @@
 
 Fuente de verdad de `clawg update [--check]`: cómo se compara una versión, cuándo un binario puede actualizarse, cómo se elige el release y el asset, cómo se verifica la firma y el hash antes de tocar nada, el plan que intercambia el binario y vuelve a levantar el daemon, la vuelta atrás cuando el nuevo no arranca, las garantías sobre los datos, el informe y lo que sólo existe en un build de test. Cómo se publican los releases y sus claves está en [`specs/release`](../release/spec.md). No tiene que ver con [`specs/update`](../update/spec.md), que es la de `update_memory`.
 
-**Origen:** [release-and-self-update](../../changes/archive/2026-10-18-release-and-self-update/proposal.md), archivado el 2026-10-18. Los ids de requisito son los de esa spec. [shutdown-budget](../../changes/archive/2026-10-20-shutdown-budget/proposal.md), archivado el 2026-10-20, sumó a S10 «Un `stop` que vence» y cambió los tests de S11.
+**Origen:** [release-and-self-update](../../changes/archive/2026-10-18-release-and-self-update/proposal.md), archivado el 2026-10-18. Los ids de requisito son los de esa spec. [shutdown-budget](../../changes/archive/2026-10-20-shutdown-budget/proposal.md), archivado el 2026-10-20, sumó a S10 «Un `stop` que vence» y cambió los tests de S11. [local-transport](../../changes/archive/2026-10-20-local-transport/proposal.md), archivado el 2026-10-20, sumó a S8 el arranque sin `--port` en Unix y los dos escenarios de un actualizador anterior y del actual.
 
 ## Definiciones
 
 - **Binario instalado:** el `clawg` que corre `clawg update`.
 - **Marca de distribución** y **lista de claves:** las de [`specs/release`](../release/spec.md).
-- **Sello de prueba:** un JSON al final de una copia del binario de prueba (versión, triple de distribución, migraciones que conoce y falla simulada del daemon), que sólo lee un build con la feature `testing`.
+- **Sello de prueba:** un JSON al final de una copia del binario de prueba (versión, triple de distribución, migraciones que conoce, falla simulada del daemon y `transport: "tcp"`, que la hace comportarse como un clawg anterior al socket), que sólo lee un build con la feature `testing`.
 - **Daemon:** el proceso `clawg serve` del perfil `prod`.
 - **Candidato:** el binario nuevo bajado y preparado junto al destino, todavía sin instalar.
 - **Intercambio:** el paso que renombra el binario instalado a `.old-*` y pone el candidato en su lugar.
@@ -119,7 +119,7 @@ Antes del intercambio `update` MUST: bajar el candidato junto al destino, verifi
 
 ## S8. Plan e intercambio
 
-El plan de `update` MUST ser una lista de pasos como datos, ejecutada aparte, de modo que el orden y la deshecha de cada falla se prueben sin disco ni red. Con daemon, el orden MUST ser: parar el daemon con el binario instalado (`stop_in`, `crates/clawg-cli/src/stop.rs:23`); renombrar el binario a `.old-*`; poner el candidato; arrancar el daemon nuevo por su ruta explícita (no por `ProcessSpawner`, que lanza `current_exe()`, `client.rs:1152-1154`); esperar `/health`. Sin daemon, `update` MUST NOT arrancar uno. Al empezar, MUST borrar los `.old-*` de corridas anteriores. Si un editor abre un puente entre la parada y el arranque, `update` MUST confirmar la versión del daemon que contesta e informarla. En Linux el binario instalado también se aparta a `.old-*` antes de poner el candidato: no se reemplaza en el lugar. Dos `update` a la vez MUST NOT intercambiar a la vez: un cerrojo exclusivo del sistema sobre `<data>/update.lock` hace que el segundo falle con un error claro.
+El plan de `update` MUST ser una lista de pasos como datos, ejecutada aparte, de modo que el orden y la deshecha de cada falla se prueben sin disco ni red. Con daemon, el orden MUST ser: parar el daemon con el binario instalado (`stop_in`, `crates/clawg-cli/src/stop.rs:23`); renombrar el binario a `.old-*`; poner el candidato; arrancar el daemon nuevo por su ruta explícita (no por `ProcessSpawner`, que lanza `current_exe()`, `client.rs:1152-1154`); esperar `/health`. En Unix el daemon nuevo, y el viejo cuando un deshacer lo vuelve a arrancar, MUST lanzarse sin `--port` y vigilarse por `from_data_dir`, que va por el socket ([`specs/daemon-access`](../daemon-access/spec.md), R9): así TCP queda encendido sólo donde alguien lo vuelve a pedir y no se arrastra de actualización en actualización. En Windows, único transporte TCP, MUST recibir el puerto del daemon viejo (`serve_port`, `crates/clawg-cli/src/update/effects.rs`). Un actualizador anterior al socket pasa siempre `--port`, así que el daemon nuevo enciende TCP y ese actualizador lo ve contestar. Sin daemon, `update` MUST NOT arrancar uno. Al empezar, MUST borrar los `.old-*` de corridas anteriores. Si un editor abre un puente entre la parada y el arranque, `update` MUST confirmar la versión del daemon que contesta e informarla. En Linux el binario instalado también se aparta a `.old-*` antes de poner el candidato: no se reemplaza en el lugar. Dos `update` a la vez MUST NOT intercambiar a la vez: un cerrojo exclusivo del sistema sobre `<data>/update.lock` hace que el segundo falle con un error claro.
 
 #### Escenario: actualización completa con daemon
 - GIVEN un daemon corriendo y un servidor de release falso con una versión mayor
@@ -136,7 +136,17 @@ El plan de `update` MUST ser una lista de pasos como datos, ejecutada aparte, de
 - WHEN arranca otro
 - THEN el segundo falla con un error claro y no toca el binario
 
-**Pruebas:** `a_full_update_with_a_daemon_replaces_the_binary_and_a_bridge_reaches_the_new_daemon` en `binary.rs` (parte del escenario de `binary.rs:564` con el binario reemplazado); `update_without_a_daemon_does_not_start_one` (plan); `plan_order_with_and_without_daemon` (plan); `two_updates_do_not_swap_at_once` (sobre el cerrojo, en un test de la unidad que lo toma).
+#### Escenario: un actualizador anterior al socket
+- GIVEN un clawg anterior al socket (sello `transport: "tcp"`) con su daemon en un puerto
+- WHEN instala la versión actual
+- THEN termina con 0, y el daemon nuevo contesta por el socket y por el mismo puerto
+
+#### Escenario: el actualizador actual
+- GIVEN un daemon con TCP en un puerto efímero
+- WHEN la versión actual instala la siguiente, en Unix
+- THEN el daemon nuevo no tiene `port` en `daemon.json`
+
+**Pruebas:** `a_full_update_with_a_daemon_replaces_the_binary_and_a_bridge_reaches_the_new_daemon` en `binary.rs` (parte del escenario de `binary.rs:564` con el binario reemplazado); `update_without_a_daemon_does_not_start_one` (plan); `plan_order_with_and_without_daemon` (plan); `two_updates_do_not_swap_at_once` (sobre el cerrojo, en un test de la unidad que lo toma); `the_new_daemon_gets_a_port_only_where_tcp_is_the_only_transport` (`update/effects.rs`); `an_older_updater_installs_the_socket_version_and_sees_it_answer`, `a_full_update_with_a_daemon_replaces_the_binary_and_a_bridge_reaches_the_new_daemon` (`tests/binary.rs`, Unix).
 
 ## S9. Vuelta atrás tras el intercambio
 

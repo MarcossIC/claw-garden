@@ -5,7 +5,9 @@
 //! lock between two daemons, the files a bridge reads to find its daemon, and
 //! MCP over a real stdin and stdout. Each test here gets its own home through
 //! `CLAWG_TEST_HOME` and the fake model through `CLAWG_TEST_EMBEDDER`, which
-//! only a `testing` build (this one) reads. Every daemon binds `--port 0`.
+//! only a `testing` build (this one) reads. Every daemon the tests start binds
+//! `--port 0`, and one started without `--port` (by a bridge, by `update`)
+//! keeps to its socket on Unix (`CLAWG_TEST_DEFAULT_PORT=off`).
 //!
 //! Children are ended through their own handle when their guard drops, also
 //! when a test panics, and never by name: a `clawg` the user's editor runs
@@ -65,9 +67,11 @@ impl Sandbox {
             .env("CLAWG_TEST_HOME", &self.home)
             .env("CLAWG_TEST_EMBEDDER", "fake")
             .env_remove("CLAWG_PROFILE")
+            .env_remove("CLAWG_TEST_DEFAULT_PORT")
             .env("RUST_LOG", "info")
             .current_dir(&self.home)
-            .stdin(Stdio::null());
+            .stdin(Stdio::null())
+            .envs(socket_only());
         cmd
     }
 
@@ -97,6 +101,20 @@ impl Sandbox {
         Daemon::watch(child, log).answering(&self.data_dir()).await
     }
 
+    /// A daemon run as `args` say, `--port` or not, with `env` on top.
+    #[cfg(unix)]
+    async fn serve_as(&self, args: &[&str], env: &[(&str, &str)]) -> Daemon {
+        let log = self.log(&format!("serve-{}", now_ns()));
+        let child = self
+            .command(args)
+            .envs(env.iter().copied())
+            .stdout(Stdio::null())
+            .stderr(File::create(&log).expect("log file"))
+            .spawn()
+            .expect("spawn clawg serve");
+        Daemon::watch(child, log).answering(&self.data_dir()).await
+    }
+
     /// A bridge started in an empty folder of its own, so the root it
     /// registers has nothing to index.
     fn bridge(&self) -> Bridge {
@@ -105,11 +123,22 @@ impl Sandbox {
 
     /// A bridge run from the copy of the binary at `bin`.
     fn bridge_of(&self, bin: &Path) -> Bridge {
+        self.bridge_with(bin, &["mcp", "--profile", "dev", "--no-autostart", "--agent", "smoke"])
+    }
+
+    /// A bridge that starts a daemon when none answers. That daemon is no
+    /// child of the test: a `StopOnDrop` ends it.
+    #[cfg(unix)]
+    fn bridge_starting_its_daemon(&self) -> Bridge {
+        self.bridge_with(Path::new(BIN), &["mcp", "--profile", "dev", "--agent", "smoke"])
+    }
+
+    fn bridge_with(&self, bin: &Path, args: &[&str]) -> Bridge {
         let root = self.home.join(format!("project-{}", now_ns()));
         std::fs::create_dir_all(&root).expect("project dir");
         let log = self.log(&format!("mcp-{}", now_ns()));
         let mut child = self
-            .command_of(bin, &["mcp", "--profile", "dev", "--no-autostart", "--agent", "smoke"])
+            .command_of(bin, args)
             .current_dir(&root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -128,6 +157,17 @@ impl Sandbox {
             }
         });
         Bridge { child, stdin, lines, log }
+    }
+}
+
+/// What keeps a daemon started without `--port` (by a bridge, by `update`)
+/// to its socket instead of the profile's port on this machine. Windows has no
+/// socket, and the tests there pass a port.
+fn socket_only() -> Vec<(&'static str, &'static str)> {
+    if cfg!(unix) {
+        vec![("CLAWG_TEST_DEFAULT_PORT", "off")]
+    } else {
+        Vec::new()
     }
 }
 
@@ -154,7 +194,7 @@ struct Daemon {
     child: Arc<Mutex<Child>>,
     pid: u32,
     log: PathBuf,
-    port: u16,
+    base: String,
     token: String,
     http: reqwest::Client,
 }
@@ -173,7 +213,7 @@ impl Daemon {
                 std::thread::sleep(Duration::from_millis(50));
             }
         });
-        Self { child, pid, log, port: 0, token: String::new(), http: reqwest::Client::new() }
+        Self { child, pid, log, base: String::new(), token: String::new(), http: reqwest::Client::new() }
     }
 
     fn exit_status(&self) -> Option<ExitStatus> {
@@ -191,11 +231,10 @@ impl Daemon {
             if let Some(status) = self.exit_status() {
                 panic!("clawg serve exited with {status} before answering:\n{}", self.log_text());
             }
-            if let Some((port, token)) = published(data_dir, self.pid) {
-                let health = self.http.get(format!("http://127.0.0.1:{port}/health")).send().await;
+            if let Some((reach, token)) = published(data_dir, self.pid) {
+                let health = reach.http.get(format!("{}/health", reach.base)).send().await;
                 if health.is_ok_and(|r| r.status().is_success()) {
-                    self.port = port;
-                    self.token = token;
+                    (self.http, self.base, self.token) = (reach.http, reach.base, token);
                     return self;
                 }
             }
@@ -205,7 +244,7 @@ impl Daemon {
     }
 
     fn url(&self, path: &str) -> String {
-        format!("http://127.0.0.1:{}{path}", self.port)
+        format!("{}{path}", self.base)
     }
 
     async fn health(&self) -> Value {
@@ -293,16 +332,38 @@ impl Drop for Daemon {
     }
 }
 
-/// Port and token, once `daemon.json` names `pid`.
-fn published(data_dir: &Path, pid: u32) -> Option<(u16, String)> {
-    let state: Value =
-        serde_json::from_str(&std::fs::read_to_string(data_dir.join("daemon.json")).ok()?).ok()?;
+/// How a client reaches the daemon a `daemon.json` describes, as clawg's own
+/// client does: by its socket when it published one, else by its port.
+struct Reach {
+    http: reqwest::Client,
+    base: String,
+}
+
+fn reach(data_dir: &Path, state: &Value) -> Option<Reach> {
+    #[cfg(unix)]
+    if state["unix_socket"] == true {
+        let http = reqwest::Client::builder().no_proxy().unix_socket(data_dir.join("clawg.sock")).build().ok()?;
+        return Some(Reach { http, base: "http://localhost".to_string() });
+    }
+    #[cfg(not(unix))]
+    let _ = data_dir;
+    let port = state["port"].as_u64()?;
+    Some(Reach { http: reqwest::Client::builder().no_proxy().build().ok()?, base: format!("http://127.0.0.1:{port}") })
+}
+
+/// `daemon.json` as JSON, if it is there.
+fn state_of(data_dir: &Path) -> Option<Value> {
+    serde_json::from_str(&std::fs::read_to_string(data_dir.join("daemon.json")).ok()?).ok()
+}
+
+/// The way in and the token, once `daemon.json` names `pid`.
+fn published(data_dir: &Path, pid: u32) -> Option<(Reach, String)> {
+    let state = state_of(data_dir)?;
     if state["pid"].as_u64() != Some(u64::from(pid)) {
         return None;
     }
-    let port = u16::try_from(state["port"].as_u64()?).ok()?;
     let token = std::fs::read_to_string(data_dir.join("token")).ok()?;
-    Some((port, token.trim().to_string()))
+    Some((reach(data_dir, &state)?, token.trim().to_string()))
 }
 
 /// A `clawg mcp` child with the test as its host.
@@ -617,6 +678,120 @@ async fn a_restored_backup_brings_back_its_rows_and_keeps_the_replaced_store() {
     assert!(!rows.contains("saved after the backup"), "{rows}");
 }
 
+// ── The data directory's socket (Unix) ─────────────────────────────────────
+
+#[cfg(unix)]
+const SERVE_WITHOUT_PORT: [&str; 3] = ["serve", "--profile", "dev"];
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_daemon_without_a_port_serves_status_stop_bridge_and_hooks_over_its_socket() {
+    let sandbox = Sandbox::new();
+    let root = sandbox.home.join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let project = clawg_core::memory::ProjectIdentity::resolve(&root).id;
+    let daemon = sandbox.serve_as(&SERVE_WITHOUT_PORT, &[]).await;
+    let socket = sandbox.data_dir().join("clawg.sock");
+    assert!(socket.exists());
+    let state = state_of(&sandbox.data_dir()).expect("daemon.json");
+    assert_eq!(state["unix_socket"], true, "{state}");
+    assert!(state.get("port").is_none(), "no TCP was asked for: {state}");
+
+    let status = sandbox.run(&["status", "--profile", "dev"]);
+    assert_eq!(status.status.code(), Some(0), "{}", stderr_of(&status));
+    let report: Value = serde_json::from_slice(&status.stdout).expect("status prints JSON");
+    assert_eq!(report["running"], true);
+    assert_eq!(report["daemon"]["unix_socket"], true, "{report}");
+
+    let mut bridge = sandbox.bridge();
+    bridge.initialize();
+    let saved = bridge.call(2, "save_memory", json!({ "content": "the bridge reaches the daemon over its socket" }));
+    assert!(!tool_failed(&saved), "{saved}");
+
+    let (status, body) = daemon
+        .post(
+            "/v1/memories",
+            json!({ "content": "the deploy script lives in ops/deploy.sh", "agent_id": "smoke", "project_id": project }),
+        )
+        .await;
+    assert!(status == 201 || status == 202, "{body}");
+    daemon.wait_until_ingested().await;
+    let input = json!({ "session_id": "s", "cwd": root, "hook_event_name": "SessionStart", "source": "startup" });
+    let out = hook(&sandbox, &["session-start", "--agent", "smoke", "--profile", "dev"], &input.to_string());
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    assert!(stdout_of(&out).contains("ops/deploy.sh"), "the hook reached the daemon: {}", stdout_of(&out));
+
+    let stop = sandbox.run(&["stop", "--profile", "dev"]);
+    assert_eq!(stop.status.code(), Some(0), "{}", stderr_of(&stop));
+    assert!(daemon.wait_for_exit(Duration::from_secs(5)).await.success());
+    assert!(!socket.exists(), "the socket goes with the daemon");
+    assert!(!sandbox.data_dir().join("daemon.json").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_orphan_socket_left_by_a_kill_does_not_keep_the_next_daemon_out() {
+    let sandbox = Sandbox::new();
+    let first = sandbox.serve_as(&SERVE_WITHOUT_PORT, &[]).await;
+    first.kill();
+    drop(first);
+    assert!(sandbox.data_dir().join("clawg.sock").exists(), "a kill leaves the socket behind");
+
+    let second = sandbox.serve_as(&SERVE_WITHOUT_PORT, &[]).await;
+
+    assert_eq!(second.health().await["status"], "ok");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_socket_path_over_the_limit_is_refused_by_name() {
+    let owned = tempfile::tempdir().expect("tempdir");
+    let used = owned.path().join(".clawg-dev").join("clawg.sock").as_os_str().len();
+    let home = owned.path().join("h".repeat(130usize.saturating_sub(used)));
+    std::fs::create_dir_all(&home).unwrap();
+    let sandbox = Sandbox::at(&home);
+    let socket = sandbox.data_dir().join("clawg.sock");
+
+    let refused = sandbox.run(&SERVE_WITHOUT_PORT);
+
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr_of(&refused));
+    assert!(stderr_of(&refused).contains(&socket.display().to_string()), "{}", stderr_of(&refused));
+    let daemon = sandbox.serve().await;
+    assert_eq!(state_of(&sandbox.data_dir()).expect("daemon.json")["unix_socket"], false);
+    assert!(daemon.log_text().contains("serving over TCP alone"), "{}", daemon.log_text());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_taken_profile_port_leaves_the_daemon_on_its_socket() {
+    let sandbox = Sandbox::new();
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = taken.local_addr().expect("addr").port().to_string();
+
+    let daemon = sandbox.serve_as(&SERVE_WITHOUT_PORT, &[("CLAWG_TEST_DEFAULT_PORT", &port)]).await;
+
+    let state = state_of(&sandbox.data_dir()).expect("daemon.json");
+    assert_eq!(state["unix_socket"], true, "{state}");
+    assert!(state.get("port").is_none(), "a port it does not have is not published: {state}");
+    assert!(daemon.log_text().contains(&format!("127.0.0.1:{port}")), "{}", daemon.log_text());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_bridge_starts_its_daemon_through_the_binary() {
+    let sandbox = Sandbox::new();
+    let _stop = StopOnDrop { home: sandbox.home.clone() };
+    let mut bridge = sandbox.bridge_starting_its_daemon();
+
+    bridge.initialize();
+    let status = bridge.call(2, "memory_status", json!({}));
+
+    assert!(!tool_failed(&status), "{status}");
+    let state = state_of(&sandbox.data_dir()).expect("the bridge started a daemon");
+    assert_eq!(state["unix_socket"], true, "{state}");
+    assert!(state.get("port").is_none(), "{state}");
+}
+
 // ── MCP over real stdio ────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -891,6 +1066,7 @@ fn run_binary(sandbox: &Sandbox, bin: &Path, args: &[&str]) -> Output {
         .args(args)
         .env("CLAWG_TEST_HOME", &sandbox.home)
         .env_remove("CLAWG_PROFILE")
+        .envs(socket_only())
         .current_dir(&sandbox.home)
         .stdin(Stdio::null())
         .output_copy()
@@ -1002,6 +1178,7 @@ fn update(sandbox: &Sandbox, bin: &Path, server: &str, args: &[&str]) -> Output 
         .env("CLAWG_TEST_HOME", &sandbox.home)
         .env("CLAWG_TEST_RELEASE_URL", server)
         .env_remove("CLAWG_PROFILE")
+        .envs(socket_only())
         .current_dir(&sandbox.home)
         .stdin(Stdio::null())
         .output_copy()
@@ -1118,6 +1295,7 @@ fn update_from(sandbox: &Sandbox, installed: &Path, server: &str, public: &str) 
         .env("CLAWG_TEST_RELEASE_URL", server)
         .env("CLAWG_TEST_RELEASE_KEYS", json!([public]).to_string())
         .env_remove("CLAWG_PROFILE")
+        .envs(socket_only())
         .current_dir(&sandbox.home)
         .stdin(Stdio::null())
         .output_copy()
@@ -1143,11 +1321,11 @@ impl Drop for StopOnDrop {
 
 /// `/health` of the daemon the data directory names.
 async fn published_health(data_dir: &Path) -> Value {
-    let state: Value =
-        serde_json::from_str(&std::fs::read_to_string(data_dir.join("daemon.json")).expect("daemon.json"))
-            .expect("daemon.json is JSON");
-    let port = state["port"].as_u64().expect("port");
-    reqwest::get(format!("http://127.0.0.1:{port}/health"))
+    let reach = reach(data_dir, &state_of(data_dir).expect("daemon.json")).expect("a way in");
+    reach
+        .http
+        .get(format!("{}/health", reach.base))
+        .send()
         .await
         .expect("health")
         .json()
@@ -1177,12 +1355,11 @@ fn last_migration() -> i32 {
 
 /// What the daemon the data directory names answers to `method` on `path`.
 async fn published_send(data_dir: &Path, method: reqwest::Method, path: &str) -> String {
-    let state: Value =
-        serde_json::from_str(&std::fs::read_to_string(data_dir.join("daemon.json")).expect("daemon.json"))
-            .expect("daemon.json is JSON");
+    let reach = reach(data_dir, &state_of(data_dir).expect("daemon.json")).expect("a way in");
     let token = std::fs::read_to_string(data_dir.join("token")).expect("token");
-    let response = reqwest::Client::new()
-        .request(method, format!("http://127.0.0.1:{}{path}", state["port"]))
+    let response = reach
+        .http
+        .request(method, format!("{}{path}", reach.base))
         .bearer_auth(token.trim())
         .send()
         .await
@@ -1548,6 +1725,7 @@ async fn a_stale_daemon_is_brought_back_by_the_installed_binary_when_the_new_one
         .env("CLAWG_TEST_RELEASE_URL", &server.base)
         .env("CLAWG_TEST_RELEASE_KEYS", json!([release.public]).to_string())
         .env_remove("CLAWG_PROFILE")
+        .envs(socket_only())
         .current_dir(&sandbox.home)
         .stdin(Stdio::null())
         .stdout(File::create(&out_log).expect("log file"))
@@ -1611,8 +1789,60 @@ async fn a_full_update_with_a_daemon_replaces_the_binary_and_a_bridge_reaches_th
     assert_eq!(std::fs::read(&aside[0]).expect("read the old binary"), original);
     assert!(beside(&installed, "clawg.new-").is_empty(), "the staged file is gone");
 
+    #[cfg(unix)]
+    {
+        let state = state_of(&sandbox.data_dir()).expect("daemon.json");
+        assert!(state.get("port").is_none(), "the new daemon was started without a port: {state}");
+    }
+
     let reply = bridge.call(3, "memory_status", json!({}));
     assert!(!tool_failed(&reply), "the open bridge must find the new daemon: {reply}");
+}
+
+// ── Clients older than the socket ──────────────────────────────────────────
+
+/// A stamp's extra field that makes the copy speak TCP alone, as a clawg
+/// older than the socket.
+#[cfg(unix)]
+const OLDER_TRANSPORT: &str = r#","transport":"tcp""#;
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_older_updater_installs_the_socket_version_and_sees_it_answer() {
+    let sandbox = Sandbox::new();
+    let installed = install(&sandbox, &stamp_json("0.18.0", OLDER_TRANSPORT));
+    let old = sandbox.serve_binary(&installed, "fake").await;
+    let before = state_of(&sandbox.data_dir()).expect("daemon.json");
+    assert_eq!(before["unix_socket"], false, "{before}");
+    let release = signed_release("0.19.0", "");
+    let server = ReleaseServer::serving(release.listing.clone(), release.files.clone()).await;
+    let _stop = StopOnDrop { home: sandbox.home.clone() };
+
+    let out = update_from(&sandbox, &installed, &server.base, &release.public);
+
+    assert_eq!(out.status.code(), Some(0), "{}\n{}", stdout_of(&out), stderr_of(&out));
+    old.wait_for_exit(Duration::from_secs(10)).await;
+    let after = state_of(&sandbox.data_dir()).expect("daemon.json");
+    assert_eq!(after["unix_socket"], true, "{after}");
+    assert_eq!(after["port"], before["port"], "the older updater passed the port on and watched it: {after}");
+    assert_eq!(published_health(&sandbox.data_dir()).await["version"], "0.19.0");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_older_bridge_reaches_a_new_daemon_over_the_profile_port() {
+    let sandbox = Sandbox::new();
+    let port = std::net::TcpListener::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr").port();
+    let _daemon = sandbox.serve_as(&SERVE_WITHOUT_PORT, &[("CLAWG_TEST_DEFAULT_PORT", &port.to_string())]).await;
+    let state = state_of(&sandbox.data_dir()).expect("daemon.json");
+    assert_eq!((state["unix_socket"].clone(), state["port"].clone()), (json!(true), json!(port)), "{state}");
+    let older = stamped_copy(&sandbox.home, &stamp_json(env!("CARGO_PKG_VERSION"), OLDER_TRANSPORT));
+    let mut bridge = sandbox.bridge_of(&older);
+
+    bridge.initialize();
+    let saved = bridge.call(2, "save_memory", json!({ "content": "an older bridge still reaches the daemon" }));
+
+    assert!(!tool_failed(&saved), "{saved}");
 }
 
 // ── Client setup ───────────────────────────────────────────────────────────

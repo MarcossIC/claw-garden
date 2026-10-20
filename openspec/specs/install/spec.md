@@ -2,7 +2,7 @@
 
 Fuente de verdad de cómo la suite prueba el binario `clawg` mismo: el build de test y las dos variables que sólo él lee (el home de prueba y el embedder de prueba), la regla que las mantiene fuera del binario que se entrega, las pruebas que lanzan el binario como proceso hijo, y el CI. Nada de esto cambia el binario que se entrega. El directorio de datos, el lock y el outbox están en [`specs/storage`](../storage/spec.md); el puente y su reconexión, en [`specs/mcp`](../mcp/spec.md).
 
-**Origen:** [install-smoke](../../changes/archive/2026-10-16-install-smoke/proposal.md), archivado el 2026-10-16. [release-and-self-update](../../changes/archive/2026-10-18-release-and-self-update/proposal.md), archivado el 2026-10-18, reemplazó la sección «CI» (I1): el filtro de rutas del workflow y su relación con el release. [ci-hardening](../../changes/archive/2026-10-19-ci-hardening/proposal.md), archivado el 2026-10-19, la amplió (C1 a C6): `--locked`, la configuración de producción, acciones fijadas, el toolchain fijado y los workflows de avisos y del instalador. [shutdown-budget](../../changes/archive/2026-10-20-shutdown-budget/proposal.md), archivado el 2026-10-20, sumó el embedder de prueba `blocked`.
+**Origen:** [install-smoke](../../changes/archive/2026-10-16-install-smoke/proposal.md), archivado el 2026-10-16. [release-and-self-update](../../changes/archive/2026-10-18-release-and-self-update/proposal.md), archivado el 2026-10-18, reemplazó la sección «CI» (I1): el filtro de rutas del workflow y su relación con el release. [ci-hardening](../../changes/archive/2026-10-19-ci-hardening/proposal.md), archivado el 2026-10-19, la amplió (C1 a C6): `--locked`, la configuración de producción, acciones fijadas, el toolchain fijado y los workflows de avisos y del instalador. [shutdown-budget](../../changes/archive/2026-10-20-shutdown-budget/proposal.md), archivado el 2026-10-20, sumó el embedder de prueba `blocked`. [local-transport](../../changes/archive/2026-10-20-local-transport/proposal.md), archivado el 2026-10-20, reemplazó el «Límite conocido» del autoarranque.
 
 ## Definiciones
 
@@ -109,7 +109,14 @@ El test MUST fallar con `manifiesto:línea` de cada hallazgo. Reconocerlos es la
 
 **Tests:** `a_save_accepted_before_a_hard_kill_is_stored_after_the_restart` (`binary.rs:400`), `a_second_daemon_on_the_same_data_directory_is_refused_and_names_the_first` (`binary.rs:430`), `status_and_stop_follow_the_daemon_process` (`binary.rs:446`), `a_restored_backup_brings_back_its_rows_and_keeps_the_replaced_store` (`binary.rs:482`), `a_bridge_on_real_stdio_answers_initialize_and_the_tools_reach_the_daemon` (`binary.rs:520`), `a_bridge_on_real_stdio_serves_a_host_that_never_initializes` (`binary.rs:544`) y `a_bridge_left_open_reaches_the_daemon_after_a_restart` (`binary.rs:564`).
 
-**Límite conocido:** el autoarranque del puente no se prueba a través del binario. El daemon que lanza el puente usa el puerto fijo del perfil (`spawn_serve_at` sin puerto, `crates/clawg-cli/src/client.rs:1160`; `serve_args`, `:1166-1173`), así que en la máquina del usuario chocaría con su daemon dev. Lo cubren los tests en proceso de `crates/clawg-cli/src/mcp/mod.rs`. Probarlo a través del binario pide antes poder elegir ese puerto, y eso es superficie de producto.
+Un daemon que la suite no lanza con `--port` (el que autoarranca un puente, el que arranca `update`, los de las pruebas del socket) MUST NOT tomar el puerto del perfil de la máquina: cada hijo lleva `CLAWG_TEST_DEFAULT_PORT=off` en Unix (`socket_only`, `binary.rs`), que un build con `testing` lee en lugar del puerto del perfil (`off`, o un número que lo reemplaza; `build_info::default_port_override`), y ese daemon escucha sólo en el socket de su home. Así el autoarranque se prueba a través del binario en Unix. En Windows no hay socket y las pruebas pasan un puerto.
+
+#### Escenario: autoarranque
+- GIVEN un home vacío
+- WHEN un puente con autoarranque recibe una llamada
+- THEN arranca un daemon que escucha sólo en su socket y la llamada lo alcanza
+
+**Tests:** `a_bridge_starts_its_daemon_through_the_binary`, `a_daemon_without_a_port_serves_status_stop_bridge_and_hooks_over_its_socket` (Unix); `a_default_port_override_is_off_or_a_port` (`build_info.rs`).
 
 ## Ningún hijo sobrevive a su prueba
 

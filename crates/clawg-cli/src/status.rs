@@ -76,7 +76,8 @@ mod tests {
     fn state() -> DaemonState {
         DaemonState {
             pid: 4242,
-            port: 27381,
+            port: Some(27381),
+            unix_socket: false,
             profile: "dev".into(),
             version: "0.1.0".into(),
             started_at_ms: 1_700_000_000_000,
@@ -126,6 +127,7 @@ mod tests {
         assert!(v["data_dir"].as_str().is_some_and(|d| d.contains(".clawg-dev")));
         assert_eq!(v["daemon"]["pid"], 4242);
         assert_eq!(v["daemon"]["port"], 27381);
+        assert_eq!(v["daemon"]["unix_socket"], false, "the transports are shown");
         assert_eq!(v["health"]["embedder"], "ready");
     }
 
