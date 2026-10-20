@@ -678,6 +678,46 @@ async fn a_restored_backup_brings_back_its_rows_and_keeps_the_replaced_store() {
     assert!(!rows.contains("saved after the backup"), "{rows}");
 }
 
+// ── export and import ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn export_and_import_round_trip_through_the_binary() {
+    let source = Sandbox::new();
+    let daemon = source.serve().await;
+    daemon.wait_until_ready().await;
+    for content in ["exported while the daemon runs", "a second exported memory"] {
+        let (status, body) = daemon.post("/v1/memories", json!({ "content": content, "agent_id": "smoke" })).await;
+        assert_eq!(status, 201, "{body}");
+    }
+    let file = source.home.join("memories.jsonl");
+    let exported = source.run(&["export", "--out", &file.to_string_lossy(), "--profile", "dev"]);
+    assert_eq!(exported.status.code(), Some(0), "{}", stderr_of(&exported));
+    assert!(stdout_of(&exported).starts_with("wrote 2 memories"), "{}", stdout_of(&exported));
+    #[cfg(unix)]
+    assert_eq!(mode_of(&file), 0o600);
+    let again = source.run(&["export", "--out", &file.to_string_lossy(), "--profile", "dev"]);
+    assert_eq!(again.status.code(), Some(1), "an existing file is not overwritten");
+
+    let target = Sandbox::new();
+    let refused = target.run(&["import", &file.to_string_lossy(), "--profile", "dev"]);
+    assert_eq!(refused.status.code(), Some(1), "import needs a running daemon");
+    assert!(!target.data_dir().join("daemon.json").exists(), "and starts none");
+
+    let receiver = target.serve().await;
+    receiver.wait_until_ready().await;
+    let imported = target.run(&["import", &file.to_string_lossy(), "--agent", "moved", "--profile", "dev"]);
+    assert_eq!(imported.status.code(), Some(0), "{}", stderr_of(&imported));
+    assert!(stdout_of(&imported).starts_with("imported 2 of 2 memories"), "{}", stdout_of(&imported));
+    let rows = receiver.list().await;
+    assert!(rows.contains("exported while the daemon runs") && rows.contains("\"agent_id\":\"moved\""), "{rows}");
+
+    let view = target.home.join("memories.md");
+    let markdown = target.run(&["export", "--out", &view.to_string_lossy(), "--format", "markdown", "--profile", "dev"]);
+    assert_eq!(markdown.status.code(), Some(0), "{}", stderr_of(&markdown));
+    let text = std::fs::read_to_string(&view).expect("the view");
+    assert!(text.contains("> a second exported memory"), "{text}");
+}
+
 // ── The data directory's socket (Unix) ─────────────────────────────────────
 
 #[cfg(unix)]

@@ -306,6 +306,28 @@ Detalles útiles:
 - `show` mira por defecto la tabla `memory`; con `--kind episodic` o `--kind procedural` mira las otras. Los ids son por tabla.
 - Un texto largo se guarda partido en fragmentos, y el visor los muestra como filas separadas.
 
+### Llevar memorias a otro perfil o a otra máquina
+
+`clawg export` escribe las memorias en un archivo de texto, una por línea (JSON Lines), con sus fechas, accesos, estado y vínculos. Funciona con el daemon corriendo o sin él, y no modifica nada:
+
+```powershell
+clawg export --out memorias.jsonl --profile prod                      # todas las vivas
+clawg export --out repo.jsonl --project C:\code\repo --include-deleted --profile prod   # un proyecto, también las borradas
+clawg export --out memorias.md --format markdown --profile prod       # una vista para leer, que import no lee
+```
+
+El archivo tiene el texto de las memorias tal como está guardado: sólo lo puede leer su dueño, y `clawg secrets` lista las que tienen un secreto. Las memorias que todavía esperan en el outbox no viajan.
+
+`clawg import` las trae a otro perfil a través de su daemon, que tiene que estar corriendo y las vuelve a embeber. Antes de escribir guarda un snapshot `pre-import` en `backups`, que `clawg restore` devuelve:
+
+```powershell
+clawg import repo.jsonl --dry-run --profile dev                       # qué traería, sin escribir nada
+clawg import repo.jsonl --map-root /work/repo=C:\code\repo --profile dev   # el proyecto vive en otra ruta acá
+clawg import memorias.jsonl --agent claude-code --profile dev         # todas bajo otro agente
+```
+
+Importar dos veces el mismo archivo no agrega nada. Una memoria cuyo texto ya está vivo acá no se duplica, y una cuya `topic_key` ya tiene una versión viva acá queda reemplazada por esa. El reporte dice cuántas trajo por tipo, estado y proyecto, y cuáles no pudo traer y por qué.
+
 ## Conectarlo a Claude Code
 
 Con Claude Code instalado (`claude` en el PATH), un solo comando conecta clawg:
@@ -452,6 +474,8 @@ clawg doctor                  # a qué clawg resuelve el PATH (sale con 1 si hay
 clawg update --check          # dice si hay un release nuevo (100 si lo hay); clawg update lo instala
 clawg memories list|search|show|stats   # visor de sólo lectura (list --deleted: las borradas)
 clawg undelete 12 --profile dev         # devuelve una memoria borrada (con el daemon corriendo)
+clawg export --out m.jsonl --profile dev  # las memorias, una fila por línea (--project, --agent, --include-deleted, --format markdown)
+clawg import m.jsonl --profile dev        # las trae a este perfil, con el daemon corriendo (--dry-run, --agent, --map-root OLD=NEW)
 clawg setup claude-code --profile dev   # conecta Claude Code: servidor MCP, hooks y protocolo (--dry-run, --remove)
 ```
 
