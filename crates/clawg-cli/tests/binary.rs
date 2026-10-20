@@ -1016,6 +1016,110 @@ async fn a_hook_registers_the_session_of_the_saves() {
     assert_eq!(session_of(&list, "the release notes live in docs/releases"), "s2", "a later prompt of another session wins: {list}");
 }
 
+// ── doctor ─────────────────────────────────────────────────────────────────
+
+/// `clawg doctor` with a PATH that holds no `clawg` and no Claude Code
+/// configuration, so its findings are about the sandbox alone.
+fn doctor(sandbox: &Sandbox) -> (Output, Value) {
+    let empty = sandbox.home.join("empty-path");
+    std::fs::create_dir_all(&empty).expect("empty PATH directory");
+    let output = sandbox
+        .command(&["doctor", "--profile", "dev"])
+        .env("PATH", &empty)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .output()
+        .expect("run clawg doctor");
+    let report = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|e| panic!("doctor prints JSON ({e}): {}\n{}", stdout_of(&output), stderr_of(&output)));
+    (output, report)
+}
+
+fn findings<'a>(report: &'a Value, check_id: &str) -> Vec<(&'a str, &'a str)> {
+    report["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .filter(|f| f["check_id"] == check_id)
+        .map(|f| (f["severity"].as_str().unwrap(), f["reason_code"].as_str().unwrap()))
+        .collect()
+}
+
+/// Every file of the data directory with its bytes, the logs aside.
+fn store_files(data_dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(data_dir)
+        .expect("data directory")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.is_file())
+        .map(|p| (p.file_name().unwrap().to_string_lossy().into_owned(), std::fs::read(&p).expect("read")))
+        .collect();
+    files.sort();
+    files
+}
+
+#[tokio::test]
+async fn doctor_reads_a_running_daemons_store_without_changing_it() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+    let (status, body) = daemon.post("/v1/memories", json!({ "content": "doctor reads this store", "agent_id": "smoke" })).await;
+    assert_eq!(status, 201, "{body}");
+
+    let (output, report) = doctor(&sandbox);
+    assert_eq!(output.status.code(), Some(0), "a warning does not fail: {report}");
+    assert_eq!(report["data_dir"].as_str().map(PathBuf::from), Some(sandbox.data_dir()));
+    assert_eq!(findings(&report, "store.owner"), [("info", "held")]);
+    let owner = report["checks"].as_array().unwrap().iter().find(|f| f["check_id"] == "store.owner").unwrap();
+    assert_eq!(owner["evidence"]["pid"], daemon.pid);
+    assert_eq!(findings(&report, "store.schema"), [("ok", "healthy")]);
+    assert_eq!(findings(&report, "store.contract"), [("ok", "healthy")], "the stand-in model's contract: {report}");
+    assert_eq!(findings(&report, "backup.age"), [("warn", "none")]);
+    assert_eq!(findings(&report, "socket"), [("ok", "healthy")]);
+    assert_eq!(findings(&report, "memory.topic"), [("ok", "healthy")]);
+    assert_eq!(findings(&report, "outbox"), [("ok", "healthy")]);
+    assert_eq!(report["summary"]["error"], 0, "{report}");
+
+    assert_eq!(sandbox.run(&["stop", "--profile", "dev"]).status.code(), Some(0));
+    daemon.wait_for_exit(Duration::from_secs(5)).await;
+    let before = store_files(&sandbox.data_dir());
+    let (output, report) = doctor(&sandbox);
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    assert_eq!(findings(&report, "store.owner"), [("ok", "healthy")]);
+    assert_eq!(findings(&report, "agents"), [("ok", "healthy")]);
+    assert_eq!(store_files(&sandbox.data_dir()), before, "a stopped store gains no file and no byte");
+}
+
+#[tokio::test]
+async fn doctor_prints_no_row_content() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+    for content in ["the quartz heron config lives in a.toml", "the quartz heron config lives in b.toml"] {
+        let (status, body) = daemon
+            .post("/v1/memories", json!({ "content": content, "agent_id": "smoke", "topic_key": "heron/config" }))
+            .await;
+        assert_eq!(status, 201, "{body}");
+    }
+    assert_eq!(sandbox.run(&["stop", "--profile", "dev"]).status.code(), Some(0));
+    daemon.wait_for_exit(Duration::from_secs(5)).await;
+    // Two live versions of one topic, which no clawg writes on its own.
+    let c = rusqlite::Connection::open(sandbox.data_dir().join("memory.db")).expect("open the store");
+    let revived = c
+        .execute("UPDATE memory SET status = 'active', superseded_by = NULL, supersede_cause = NULL WHERE status = 'superseded'", [])
+        .expect("revive the replaced version");
+    assert_eq!(revived, 1);
+    drop(c);
+
+    let (output, report) = doctor(&sandbox);
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    assert_eq!(findings(&report, "memory.topic"), [("warn", "several_live_saves")]);
+    let topic = report["checks"].as_array().unwrap().iter().find(|f| f["check_id"] == "memory.topic").unwrap();
+    assert_eq!(topic["evidence"]["saves"].as_array().map(Vec::len), Some(2), "{topic}");
+    let printed = stdout_of(&output);
+    for text in ["quartz heron", "a.toml", "b.toml", "heron/config"] {
+        assert!(!printed.contains(text), "doctor printed {text:?}: {printed}");
+    }
+}
+
 // ── Cleanup ────────────────────────────────────────────────────────────────
 
 #[tokio::test]
