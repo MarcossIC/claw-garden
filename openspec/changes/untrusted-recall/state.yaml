@@ -1,14 +1,14 @@
 change: untrusted-recall
 objective: "3, 4"
 depends_on: []
-phase: apply
+phase: verify
 artifacts:
   exploration: done
   proposal: done
   spec: done
   design: done
   tasks: done
-  apply: in_progress
-  verify: pending
+  apply: done
+  verify: in_progress  # Linux and the binary in a test home; rag-eval --real --agent-view and the CI of the pull request pending
   archive: pending
 updated: 2026-10-20

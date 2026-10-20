@@ -33,8 +33,8 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 
 ## 6. Verificación
 
-- [ ] Suite y clippy en Linux sobre el último commit ([verify](verify.md)).
-- [ ] `rag-eval --real --agent-view` contra la línea base (necesita el modelo real y el golden set de `docs/eval/`).
+- [x] Suite y clippy en Linux sobre el último commit ([verify](verify.md)).
+- [ ] `rag-eval --real --agent-view` contra la línea base (necesita el modelo real y el golden set de `docs/eval/`, fuera de git).
 - [ ] El CI en verde en Linux y Windows.
 
 ## 7. Archive
