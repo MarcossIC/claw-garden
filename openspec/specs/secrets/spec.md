@@ -168,13 +168,13 @@ El worker MUST seguir aplicando `redact` al contenido de cada evento, de cualqui
 
 ### R3. El save dice qué se enmascaró
 
-Una respuesta `201` de `POST /v1/memories` MUST incluir `redacted`, cada tipo una vez y en el orden en que se enmascaró, cuando no está vacía, y MUST omitirlo cuando lo está (`SaveBody.redacted`, `crates/clawg-cli/src/daemon/api.rs:519`; `save_response`, `api.rs:994`). La lista une lo que el daemon enmascaró al aceptar el save con lo que el reporte del worker agrega (`masked_kinds`, `api.rs:1062`; sólo un evento sin fila puede sumar algo en el worker):
+Una respuesta `201` de `POST /v1/memories` MUST incluir `redacted`, cada tipo una vez y en el orden en que se enmascaró, cuando no está vacía, y MUST omitirlo cuando lo está (`SaveBody.redacted`, `crates/clawg-cli/src/daemon/api.rs:524`; `save_response`, `api.rs:1003`). La lista une lo que el daemon enmascaró al aceptar el save con lo que el reporte del worker agrega (`masked_kinds`, `api.rs:1071`; sólo un evento sin fila puede sumar algo en el worker):
 
 ```json
 {"status": "saved", "memories": [{"kind": "memory", "id": 57, "outcome": "inserted"}], "redacted": ["github_token"]}
 ```
 
-`DaemonClient` MUST leerlo en `SaveOutcome::Saved.redacted` (`crates/clawg-cli/src/client.rs:529`), vacío si un daemon anterior no lo manda. `save_memory` MUST agregar al texto de éxito `; masked <tipos> before storing it` (`save_outcome_text`, `crates/clawg-cli/src/mcp/server.rs:564`). Las respuestas `202` no lo llevan, aunque el daemon ya haya enmascarado: su cuerpo es `status`, `reason` y `operation_id` (`SaveBody::queued`, `api.rs:538`).
+`DaemonClient` MUST leerlo en `SaveOutcome::Saved.redacted` (`crates/clawg-cli/src/client.rs:536`), vacío si un daemon anterior no lo manda. `save_memory` MUST agregar al texto de éxito `; masked <tipos> before storing it` (`save_outcome_text`, `crates/clawg-cli/src/mcp/server.rs:588`). Las respuestas `202` no lo llevan, aunque el daemon ya haya enmascarado: su cuerpo es `status`, `reason` y `operation_id` (`SaveBody::queued`, `api.rs:543`).
 
 #### Escenario
 - GIVEN un daemon con el embedder listo
@@ -191,7 +191,7 @@ Una respuesta `201` de `POST /v1/memories` MUST incluir `redacted`, cada tipo un
 
 La lectura MUST hacerse en sólo lectura, sin el lock y sin migrar (`scan`, `secrets.rs:53`, con `open_for_probe`), de modo que funciona con el daemon andando. Sin `memory.db` MUST fallar diciendo que no hay base, sin crearla. El armado de la salida MUST ser puro (`report`, `crates/clawg-cli/src/secrets.rs:13`).
 
-`scan` clasifica cada fila y cada `reason` con `redact`, así que una regla nueva del detector alcanza a lo ya guardado: una fila guardada antes de la regla, con un secreto que sólo esa regla reconoce, MUST listarse con el tipo nuevo. Por la misma razón, `clawg undelete` se niega a restaurar una fila borrada que una regla nueva reconoce (`RestoreError::HoldsSecret`, `crates/clawg-core/src/memory/admin.rs:397`); no se pierde nada: la fila sigue borrada y se lista acá.
+`scan` clasifica cada fila y cada `reason` con `redact`, así que una regla nueva del detector alcanza a lo ya guardado: una fila guardada antes de la regla, con un secreto que sólo esa regla reconoce, MUST listarse con el tipo nuevo. Por la misma razón, `clawg undelete` se niega a restaurar una fila borrada que una regla nueva reconoce (`RestoreError::HoldsSecret`, `crates/clawg-core/src/memory/admin.rs:423`); no se pierde nada: la fila sigue borrada y se lista acá.
 
 #### Escenario: con el daemon andando
 - GIVEN una base con una fila viva con una key AWS, una fila borrada con un JWT y una fila sin secretos, y el lock tomado por otro proceso
@@ -313,7 +313,7 @@ También MUST leer cada `workspaces/<agente>/<proyecto>/workspace.md` del direct
 
 ### R7. El `reason` de un veredicto se guarda enmascarado
 
-`judge_pair` (`crates/clawg-core/src/memory/dispute.rs:317`) MUST pasar el `reason`, ya recortado, por `redact` antes de guardarlo en `memory_conflict.reason` (`dispute.rs:329`): el par vive en `memory.db` y en cada snapshot, y lo llevaría un export. Un `reason` vacío después de recortarlo sigue siendo `None`.
+`judge_pair` (`crates/clawg-core/src/memory/dispute.rs:325`) MUST pasar el `reason`, ya recortado, por `redact` antes de guardarlo en `memory_conflict.reason` (`dispute.rs:338`): el par vive en `memory.db` y en cada snapshot, y lo llevaría un export. Un `reason` vacío después de recortarlo sigue siendo `None`.
 
 #### Escenario
 - GIVEN un par pendiente
