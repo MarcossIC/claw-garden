@@ -26,4 +26,4 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 
 ## 5. Archive
 
-- [ ] `specs/mcp` con R1-R3 y las citas realineadas (y la de `specs/pieces`); `git mv` a `changes/archive/2026-10-20-preference-topic-scope`; `state.yaml` archivado; fila 67 y el orden de ejecución del `README.md` de openspec; subir el minor.
+- [x] `specs/mcp` con R1-R3 y las citas realineadas (y la de `specs/pieces`); `git mv` a `changes/archive/2026-10-20-preference-topic-scope`; `state.yaml` archivado; fila 67, el orden de ejecución y las citas del `README.md` de openspec; subir el minor.
