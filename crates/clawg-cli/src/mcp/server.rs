@@ -3625,7 +3625,8 @@ mod tests {
                 data_dir,
                 &crate::daemon::lifecycle::DaemonState {
                     pid: std::process::id(),
-                    port,
+                    port: Some(port),
+                    unix_socket: false,
                     profile: "dev".into(),
                     version: env!("CARGO_PKG_VERSION").into(),
                     started_at_ms: 0,

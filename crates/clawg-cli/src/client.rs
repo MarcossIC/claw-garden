@@ -623,7 +623,7 @@ impl DaemonClient {
             // Always loopback, never the recorded host: the daemon binds
             // 127.0.0.1 and a state file that claimed otherwise would be a
             // tampered file pointing this client's bearer token elsewhere.
-            format!("http://127.0.0.1:{}", state.port),
+            format!("http://127.0.0.1:{}", state.port?),
             token,
             base_dir.to_path_buf(),
         ))
@@ -1448,7 +1448,8 @@ pub(crate) mod tests {
             d.dir.path(),
             &DaemonState {
                 pid: std::process::id(),
-                port: d.addr.port(),
+                port: Some(d.addr.port()),
+                unix_socket: false,
                 profile: "dev".into(),
                 version: "0.1.0".into(),
                 started_at_ms: 0,
@@ -1530,7 +1531,8 @@ pub(crate) mod tests {
             d.dir.path(),
             &DaemonState {
                 pid: 1,
-                port: d.addr.port(),
+                port: Some(d.addr.port()),
+                unix_socket: false,
                 profile: "dev".into(),
                 version: "0.1.0".into(),
                 started_at_ms: 0,
@@ -1778,7 +1780,8 @@ pub(crate) mod tests {
                 // Port 1 on loopback: nothing binds it, so connecting fails
                 // immediately rather than hanging on a timeout.
                 pid: 1,
-                port: 1,
+                port: Some(1),
+                unix_socket: false,
                 profile: "dev".into(),
                 version: "0.1.0".into(),
                 started_at_ms: 0,
