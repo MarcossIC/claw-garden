@@ -20,9 +20,9 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 ## 3. `chains`: brazos y M1 (E2, E5)
 
-- [ ] Tests puros `every_transition_falls_in_exactly_one_class`, `a_far_pair_is_no_mark_above_the_threshold`, `a_close_pair_of_decisions_is_escalated`, `a_row_beyond_the_candidate_pool_is_out_of_pool`, `a_type_that_asserts_nothing_is_not_claim_bearing`, `the_control_arm_stores_only_the_last_version` (`chains.rs`) y `a_rate_carries_its_wilson_interval` (`stats.rs`).
-- [ ] `stats.rs` (`wilson`, `Rate` copiados de `conflict-eval/measure.rs:107-135` con sus casos fijados), `chains.rs` (clase y razón, D3, cortes por `change`, `lang` y tipo), `run.rs` (brazos por `EvalIngest::save`, distractores de `openspec/specs`, stores en el temporal, fila viva por el router) y `chains` en `main.rs` con el reporte de M1 y `--fake`.
-- [ ] Test `the_router_lists_a_revised_row_superseded_by_the_new_one` y corrida `a_fake_chains_run_stores_every_arm_and_reports_whole` (con limpieza, como `runner.rs:353`).
+- [x] Tests puros `every_transition_falls_in_exactly_one_class`, `a_far_pair_is_no_mark_above_the_threshold`, `a_close_pair_of_decisions_is_escalated`, `a_row_beyond_the_candidate_pool_is_out_of_pool`, `a_type_that_asserts_nothing_is_not_claim_bearing`, `the_control_arm_stores_only_the_last_version` (`chains.rs`) y `a_rate_carries_its_wilson_interval` (`stats.rs`). Además: el orden por rondas de los brazos, el par sólo entre las dos versiones, y las filas compartidas de D3 (`a_row_two_versions_share_is_the_newer_ones`, `the_rows_a_transition_compares_leave_out_the_ones_both_hold`, `an_older_version_the_newer_holds_whole_is_below_the_floor`).
+- [x] `stats.rs` (`wilson`, `Rate` copiados de `conflict-eval/measure.rs:107-135` con sus casos fijados), `chains.rs` (clase y razón, D3, cortes por `change`, `lang` y tipo), `run.rs` (brazos por `EvalIngest::save`, distractores de `openspec/specs`, stores en el temporal, fila viva por el router) y `chains` en `main.rs` con el reporte de M1 y `--fake`.
+- [x] Test `the_router_lists_a_revised_row_superseded_by_the_new_one` y corrida `a_fake_chains_run_stores_every_arm_and_reports_whole` (con limpieza, como `runner.rs:353`). `chains --fake` sobre el set entregado: 40 cadenas, 56 transiciones, 683 distractores, una versión viva por cadena en el brazo con clave y en el control.
 - Commit: `feat(eval): classify each version transition of a chain without a topic key`
 
 ## 4. `chains`: posiciones y M2 (E3)
