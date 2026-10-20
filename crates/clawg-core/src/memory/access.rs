@@ -410,6 +410,7 @@ mod tests {
             piece: None,
             exact: false,
             topic_key: None,
+            project_id: None,
         }
     }
 
