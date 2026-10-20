@@ -35,6 +35,7 @@ pub mod error;
 pub mod identity;
 pub mod migrations;
 pub mod outbox;
+pub mod portability;
 pub(crate) mod pieces;
 pub mod project;
 pub mod project_docs;
