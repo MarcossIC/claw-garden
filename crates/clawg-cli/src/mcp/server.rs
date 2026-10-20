@@ -727,6 +727,13 @@ impl ClawgMcp {
         Ok(Some(project.id))
     }
 
+    /// The project a `save_memory` with `project_path` goes to, which is
+    /// where a key it shows revises. Resolved without registering it: an
+    /// `all_projects` search registers nothing.
+    fn save_project(&self, project_path: Option<&str>) -> Option<String> {
+        resolve_project(self.default_project.as_ref(), project_path, false, ProjectIdentity::resolve).map(|p| p.id)
+    }
+
     // ── Implementations, testable without a Peer ────────────────────────────
 
     pub async fn save_memory_impl(
@@ -777,11 +784,12 @@ impl ClawgMcp {
         args: SearchMemoryArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let args = &args;
+        let all_projects = args.all_projects.unwrap_or(false);
         let result = self
             .call(|client| async move {
-                let project_id = self
-                    .project_for(&client, args.project_path.as_deref(), args.all_projects.unwrap_or(false))
-                    .await?;
+                let project_id = self.project_for(&client, args.project_path.as_deref(), all_projects).await?;
+                let save_project =
+                    if all_projects { self.save_project(args.project_path.as_deref()) } else { project_id.clone() };
                 client
                     .search(SearchArgs {
                         query: args.query.clone(),
@@ -790,10 +798,11 @@ impl ClawgMcp {
                         limit: args.limit,
                     })
                     .await
+                    .map(|found| (found, save_project))
             })
             .await;
         match result {
-            Ok(Ok(found)) => Self::ok(format_search(found, agent_id)),
+            Ok(Ok((found, save_project))) => Self::ok(format_search(found, agent_id, save_project.as_deref())),
             Ok(Err(e)) => Self::failed(Self::explain(&e)),
             Err(failure) => Ok(failure),
         }
@@ -895,7 +904,9 @@ impl ClawgMcp {
             })
             .await;
         match result {
-            Ok(Ok(save)) => Self::ok(format_save(&save)),
+            // `read_memory` names no project, so a save after it goes to the
+            // bridge's own.
+            Ok(Ok(save)) => Self::ok(format_save(&save, self.save_project(None).as_deref())),
             Ok(Err(e)) => Self::failed(Self::route_failure_text(&e, "read a save")),
             Err(failure) => Ok(failure),
         }
@@ -2016,6 +2027,14 @@ mod tests {
     }
 
     #[test]
+    fn the_protocol_says_where_a_key_is_shown() {
+        let save = PROTOCOL.split("\n## How to write a save").nth(1).expect("a section on writing a save");
+        let save = save.split("\n## ").next().unwrap_or(save).split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(save.contains("only where saving under it replaces"), "{save}");
+        assert!(save.contains("another project"), "{save}");
+    }
+
+    #[test]
     fn the_protocol_describes_the_session_summary() {
         let summary = PROTOCOL.split("\n## Session summary").nth(1).expect("a session summary section");
         for section in ["Goal:", "Instructions:", "Discoveries:", "Accomplished:", "Next steps:", "Relevant files:"] {
@@ -3062,6 +3081,55 @@ mod tests {
             .await
             .expect("call");
         assert!(is_error(&bad) && text(&bad).contains("topic_key"), "{}", text(&bad));
+    }
+
+    /// A preference of another project reaches a search from here, but its key
+    /// revises only there: a save here under it keeps both rows live.
+    #[tokio::test]
+    async fn search_memory_shows_a_key_only_in_the_project_it_revises() {
+        let (b, _d) = bridge().await;
+        let (_other, other) = elsewhere();
+        let content = "Indent with tabs";
+        let preference = |content: &str, project_path: Option<String>| SaveMemoryArgs {
+            memory_type: Some("user_preference".into()),
+            topic_key: Some("style/indent".into()),
+            project_path,
+            ..save_args(content)
+        };
+        let saved = b.save_memory_impl("a", preference(content, Some(other.root.display().to_string()))).await.unwrap();
+        let id = text(&saved).trim_start_matches("saved #").to_string();
+        let search = |project_path: Option<String>| {
+            b.search_memory_impl("a", SearchMemoryArgs { query: content.into(), limit: None, project_path, all_projects: None })
+        };
+
+        let here = text(&search(None).await.unwrap());
+        assert!(here.contains(&format!("#{id} [Memory/user_preference/")), "{here}");
+        assert!(!here.contains("topic="), "{here}");
+        let there = text(&search(Some(other.root.display().to_string())).await.unwrap());
+        assert!(there.contains(" topic=style/indent]"), "{there}");
+
+        let again = b.save_memory_impl("a", preference("Indent with two spaces", None)).await.unwrap();
+        assert!(!text(&again).contains("replaces"), "{}", text(&again));
+        assert_eq!(rows_in(&b, &other.id).await, 1);
+        assert_eq!(rows_in(&b, "proj-test").await, 1);
+    }
+
+    #[tokio::test]
+    async fn read_memory_shows_a_key_only_in_the_project_it_revises() {
+        let (b, _d) = bridge().await;
+        let (_other, other) = elsewhere();
+        let keyed = |project_path: Option<String>| SaveMemoryArgs {
+            topic_key: Some("storage/engine".into()),
+            project_path,
+            ..save_args("Storage engine is SQLite")
+        };
+        let id_of = |saved: &CallToolResult| text(saved).trim_start_matches("saved #").parse::<i64>().expect("an id");
+        let there = id_of(&b.save_memory_impl("a", keyed(Some(other.root.display().to_string()))).await.unwrap());
+        let here = id_of(&b.save_memory_impl("a", keyed(None)).await.unwrap());
+        let read = |id: i64| b.read_memory_impl("a", ReadMemoryArgs { id, kind: None });
+
+        assert_eq!(text(&read(there).await.unwrap()), format!("#{there}\nStorage engine is SQLite"));
+        assert_eq!(text(&read(here).await.unwrap()), format!("#{here} topic=storage/engine\nStorage engine is SQLite"));
     }
 
     #[tokio::test]

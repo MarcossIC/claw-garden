@@ -139,7 +139,7 @@ async fn answer_cases(
                 limit: None,
             })
             .await?;
-        let search_text = format_search(found, AGENT_ID);
+        let search_text = format_search(found, AGENT_ID, None);
         let search_ms = elapsed_ms(started);
         let count_tokens = |line: &str| input.counter.count(line);
         let search_read = read_search(&search_text, &count_tokens, &case.expected_refs, corpus)

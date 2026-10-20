@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 | S | topic-revisions (27, archivado); antes de 44 | exploración (borrador) |
+| 1 | S | topic-revisions (27, archivado); antes de 44 | ver [`state.yaml`](state.yaml) |
 
 **Tesis:** `search_memory` muestra ` topic=K` en una fila propia de otro proyecto y `protocol.md` le dice al agente que guarde la versión nueva «bajo esa clave, la que se muestra». Pero una clave revisa sólo dentro de su proyecto, así que el save no reemplaza nada y deja dos filas vivas con la misma clave. La respuesta del save no avisa. Lo más chico que cierra el engaño es que el puente deje de mostrar la clave donde no vale.
 

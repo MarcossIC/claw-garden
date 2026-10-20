@@ -121,15 +121,15 @@ Devuelve el id, el `status` y el `superseded_by` con que quedó la fila (`Restor
 
 ## R5. Herramienta MCP `restore_memory`
 
-El puente MUST exponer `restore_memory` con `kind` e `id`, y MUST mandar siempre el agente que llama (`restore_memory_impl`, `crates/clawg-cli/src/mcp/server.rs:869`; la herramienta, `server.rs:1168`; `DaemonClient::restore`, `crates/clawg-cli/src/client.rs:1107`).
+El puente MUST exponer `restore_memory` con `kind` e `id`, y MUST mandar siempre el agente que llama (`restore_memory_impl`, `crates/clawg-cli/src/mcp/server.rs:878`; la herramienta, `server.rs:1179`; `DaemonClient::restore`, `crates/clawg-cli/src/client.rs:1120`).
 
-- Sobre una borrada propia, MUST devolver un texto que nombra el id (`restored #N`); si sigue `superseded`, MUST decir por cuál y que la búsqueda no la muestra hasta que `resolve_conflict` la conserve, salvo que la que la reemplaza también esté borrada («Restaurar una fila reemplazada por una borrada») (`format_restore`, `crates/clawg-cli/src/mcp/tools.rs:230`).
+- Sobre una borrada propia, MUST devolver un texto que nombra el id (`restored #N`); si sigue `superseded`, MUST decir por cuál y que la búsqueda no la muestra hasta que `resolve_conflict` la conserve, salvo que la que la reemplaza también esté borrada («Restaurar una fila reemplazada por una borrada») (`format_restore`, `crates/clawg-cli/src/mcp/tools.rs:251`).
 - Sobre una de otro agente MUST fallar como si el id no existiera, y la fila MUST NOT cambiar ([`specs/visibility`](../visibility/spec.md) R3).
 - Una gemela viva, un titular de la clave o un secreto MUST fallar con el mensaje del daemon. La descripción de la herramienta nombra la gemela, la clave y el secreto; el mensaje del daemon dice cuál de los tres es.
-- Contra un daemon que no tiene la ruta, su 404 sin el error JSON del daemon (`404 Not Found`) MUST decir que hay que reiniciar el daemon con `clawg stop`, no que la fila no existe; cualquier otro 404 sigue siendo el "no existe" del daemon (`route_failure_text`, `server.rs:907`).
+- Contra un daemon que no tiene la ruta, su 404 sin el error JSON del daemon (`404 Not Found`) MUST decir que hay que reiniciar el daemon con `clawg stop`, no que la fila no existe; cualquier otro 404 sigue siendo el "no existe" del daemon (`route_failure_text`, `server.rs:918`).
 - La descripción MUST decir que deshace un `delete_memory` del propio agente, con el id y el kind que se borraron, y que lo ajeno es de sólo lectura.
 
-`delete_memory` MUST nombrar `restore_memory` en su respuesta (`deleted N; restore_memory with the same id and kind undoes it`, `format_delete`, `crates/clawg-cli/src/mcp/tools.rs:210`, llamada desde `server.rs:862`) y en su descripción (`server.rs:1152-1157`). `tools/list` MUST listar doce herramientas; la lista completa y el orden están en [`specs/mcp`](../mcp/spec.md) (R3).
+`delete_memory` MUST nombrar `restore_memory` en su respuesta (`deleted N; restore_memory with the same id and kind undoes it`, `format_delete`, `crates/clawg-cli/src/mcp/tools.rs:231`, llamada desde `server.rs:871`) y en su descripción (`server.rs:1163-1168`). `tools/list` MUST listar doce herramientas; la lista completa y el orden están en [`specs/mcp`](../mcp/spec.md) (R3).
 
 **Test:** `restore_memory_undoes_an_own_delete`, `an_agent_cannot_restore_another_agents_memory`, `delete_memory_names_the_way_back` y `restore_memory` en la lista de `tool_descriptions_say_shared_memories_are_read_only` en `crates/clawg-cli/src/mcp/server.rs`; `a_daemon_without_the_restore_route_is_named_as_such` en `server.rs`; `format_restore_says_when_the_row_is_still_superseded` en `crates/clawg-cli/src/mcp/tools.rs`; los conteos de `every_tool_is_registered_under_its_wire_name` y `the_viewer_is_not_exposed_to_the_model` (`server.rs`) y de `a_session_without_initialize_lists_the_tools_in_name_order` (`crates/clawg-cli/src/mcp/handshake.rs`). Ningún test del puente restaura con una gemela, con un titular de la clave ni con un secreto: son los de R1 y R4.
 
@@ -160,7 +160,7 @@ Borrar una fila viva (`delete_memory_core`, `crates/clawg-core/src/memory/admin.
 
 Revivir MUST dejar la fila `active` (o `disputed` si sus disputas siguen), sin `superseded_by` ni causa, con `revived_from` igual al id borrado (`REVIVE_SQL`, `crates/clawg-core/src/memory/dispute.rs:266`), de vuelta en el KNN y en el índice de texto, y MUST llevar a su estado de reposo a la fila y a las retadoras que la disputaban antes (`settle_row` y `settle_challengers`, `dispute.rs:211` y `dispute.rs:204`). El borrado de una pieza viva de un save largo cuya primera pieza ya está borrada aplica la regla también a esa primera pieza (`revive_after_delete_of_piece`, `revival.rs:137`). Un borrado que no afectó ninguna fila MUST NOT revivir nada, y las filas de otro agente o proyecto MUST NOT revivir. `clawg purge` de una fila viva la marca borrada y aplica la misma regla antes de sacarla, en la misma transacción ([`specs/secrets`](../secrets/spec.md), R5).
 
-La respuesta de `DELETE /v1/memories/{kind}/{id}` (`DeletedBody`, `crates/clawg-cli/src/daemon/api.rs:723`) MUST sumar `revived` (id y primera línea) y `hidden` (ids), omitidos cuando están vacíos, y `delete_memory` MUST nombrarlos (`format_delete`, `crates/clawg-cli/src/mcp/tools.rs:210`).
+La respuesta de `DELETE /v1/memories/{kind}/{id}` (`DeletedBody`, `crates/clawg-cli/src/daemon/api.rs:723`) MUST sumar `revived` (id y primera línea) y `hidden` (ids), omitidos cuando están vacíos, y `delete_memory` MUST nombrarlos (`format_delete`, `crates/clawg-cli/src/mcp/tools.rs:231`).
 
 #### Escenario: la versión nueva se borra
 - GIVEN v1 reemplazada por v2 con la clave `storage/engine`
@@ -220,7 +220,7 @@ La pasada de mantenimiento (`run_maintenance_once_at`, `crates/clawg-core/src/me
 
 ### Restaurar en HTTP y en la CLI
 
-`POST /v1/memories/{kind}/{id}/restore` suma a su respuesta `topic_key` (si la fila tiene clave), `replaced`, `superseded_by_deleted` y `related`, omitidos cuando están vacíos o son falsos (`RestoredBody`, `crates/clawg-cli/src/daemon/api.rs:745`). `DaemonClient::restore` los lee con `#[serde(default)]` (`crates/clawg-cli/src/client.rs:1107`), así que un daemon anterior no los manda. `clawg undelete` imprime la clave, lo que volvió a reemplazar y cada par nuevo, una línea por candidata, sin juzgarlos (`report`, `crates/clawg-cli/src/undelete.rs:9`).
+`POST /v1/memories/{kind}/{id}/restore` suma a su respuesta `topic_key` (si la fila tiene clave), `replaced`, `superseded_by_deleted` y `related`, omitidos cuando están vacíos o son falsos (`RestoredBody`, `crates/clawg-cli/src/daemon/api.rs:745`). `DaemonClient::restore` los lee con `#[serde(default)]` (`crates/clawg-cli/src/client.rs:1120`), así que un daemon anterior no los manda. `clawg undelete` imprime la clave, lo que volvió a reemplazar y cada par nuevo, una línea por candidata, sin juzgarlos (`report`, `crates/clawg-cli/src/undelete.rs:9`).
 
 **Test:** `a_restore_answers_its_key_and_its_new_pairs` en `crates/clawg-cli/tests/api.rs`; `report_names_the_row_and_a_replacement` en `crates/clawg-cli/src/undelete.rs`; `format_restore_names_key_replacements_and_pairs` en `crates/clawg-cli/src/mcp/tools.rs`.
 

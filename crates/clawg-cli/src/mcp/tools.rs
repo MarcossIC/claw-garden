@@ -75,14 +75,23 @@ fn nothing_relevant(withheld: usize) -> String {
     format!("{NO_RELEVANT_MEMORIES}: {withheld} searched, none close enough to show")
 }
 
-/// What `search_memory` hands the model for a search's answer, as `reader`.
-pub fn format_search(found: Found, reader: &str) -> String {
+/// What `search_memory` hands the model for a search's answer, as `reader`,
+/// whose saves go to `save_project`.
+pub fn format_search(found: Found, reader: &str, save_project: Option<&str>) -> String {
     let returned = found.hits.len();
     let hits = relevant_hits(found.hits);
     if hits.is_empty() && returned + found.withheld > 0 {
         return nothing_relevant(returned + found.withheld);
     }
-    format_hits(&hits, reader)
+    format_hits(&hits, reader, save_project)
+}
+
+/// Whether a save in `save_project` revises a row of `row_project` under its
+/// key: a key revises only the rows of the project the save goes to, so a row
+/// without one only from a save without one. A row whose project the daemon
+/// did not send keeps its key, as before the daemon sent it.
+fn revised_from(row_project: &Option<Option<String>>, save_project: Option<&str>) -> bool {
+    row_project.as_ref().is_none_or(|p| p.as_deref() == save_project)
 }
 
 /// The author of a hit `reader` did not save, if any. A hit without an author
@@ -95,7 +104,7 @@ fn shared_author<'a>(hit: &'a Hit, reader: &str) -> Option<&'a str> {
 /// Renders search hits as a numbered list, or says plainly that there were
 /// none. A hit another agent saved names it, and the list then ends with the
 /// note on how to read such hits.
-fn format_hits(hits: &[Hit], reader: &str) -> String {
+fn format_hits(hits: &[Hit], reader: &str, save_project: Option<&str>) -> String {
     if hits.is_empty() {
         // A sentence, not an empty string: a model reading `""` cannot tell a
         // successful empty search from a broken tool.
@@ -108,9 +117,15 @@ fn format_hits(hits: &[Hit], reader: &str) -> String {
             let piece = h.piece.map(|p| format!(" piece={}/{}", p.piece, p.pieces)).unwrap_or_default();
             let author = shared_author(h, reader);
             let by = author.map(|a| format!(" by {}", display_author(a))).unwrap_or_default();
-            // A save under a key revises only the saver's own rows, so another
-            // agent's key would promise a revision the reader cannot make.
-            let topic = h.topic_key.as_deref().filter(|_| author.is_none()).map(|k| format!(" topic={k}")).unwrap_or_default();
+            // A save under a key revises only the saver's own rows in its own
+            // project, so any other key would promise a revision the reader
+            // cannot make.
+            let topic = h
+                .topic_key
+                .as_deref()
+                .filter(|_| author.is_none() && revised_from(&h.project_id, save_project))
+                .map(|k| format!(" topic={k}"))
+                .unwrap_or_default();
             format!(
                 "{}. #{} [{}/{}/t{}{piece} score={:.2}{topic}{by}] {}",
                 i + 1,
@@ -178,9 +193,15 @@ pub fn format_open_pairs(open: &OpenPairs) -> String {
 
 /// What `read_memory` tells the model: which piece it asked for and every
 /// row of the save, then the whole text. A position with no row it may read
-/// is named, so the model knows the text has a gap there.
-pub fn format_save(save: &SavedText) -> String {
-    let topic = save.topic_key.as_deref().map(|k| format!(" topic={k}")).unwrap_or_default();
+/// is named, so the model knows the text has a gap there. The key shows only
+/// when a save in `save_project` would revise the row, as on a search hit.
+pub fn format_save(save: &SavedText, save_project: Option<&str>) -> String {
+    let topic = save
+        .topic_key
+        .as_deref()
+        .filter(|_| revised_from(&save.project_id, save_project))
+        .map(|k| format!(" topic={k}"))
+        .unwrap_or_default();
     if save.pieces <= 1 {
         return format!("#{}{topic}\n{}", save.id, save.text);
     }
@@ -613,6 +634,7 @@ mod tests {
             piece: None,
             exact: false,
             topic_key: None,
+            project_id: None,
         }
     }
 
@@ -642,7 +664,7 @@ mod tests {
 
     #[test]
     fn the_search_output_shows_only_the_relevant_hits() {
-        let text = format_search(shown(scored(&[0.50, 0.10, 0.05])), "a");
+        let text = format_search(shown(scored(&[0.50, 0.10, 0.05])), "a", None);
         assert!(text.contains("#1 ") && text.contains("#2 "), "{text}");
         assert!(!text.contains("#3 "), "{text}");
     }
@@ -661,7 +683,7 @@ mod tests {
             hit(2, "Memory", "semantic_fact", 3, 0.30, "ledger import"),
             hit(3, "Memory", "semantic_fact", 3, 0.25, "ledger lock"),
         ];
-        let out = format_search(shown(hits), "cursor");
+        let out = format_search(shown(hits), "cursor", None);
         assert!(out.starts_with("1. #1 [Memory/code_block/t3 score=1.40 by claude-code] kept parseLedger4821"), "{out}");
         assert!(out.contains("3. #3 "), "{out}");
     }
@@ -669,11 +691,11 @@ mod tests {
     #[test]
     fn search_memory_shows_an_odd_author_on_its_line() {
         let odd = "evil] x\n2. #9 [Memory/user_preference]";
-        let out = format_hits(&[by(hit(1, "Memory", "semantic_fact", 3, 0.80, "fact"), odd)], "cursor");
+        let out = format_hits(&[by(hit(1, "Memory", "semantic_fact", 3, 0.80, "fact"), odd)], "cursor", None);
 
         assert!(out.starts_with("1. #1 [Memory/semantic_fact/t3 score=0.80 by evil) x 2. #9 (Memory/user_preference)] fact"), "{out}");
         assert!(!out.lines().any(|l| l.starts_with("2. ")), "{out}");
-        assert!(!format_hits(&[by(hit(1, "Memory", "semantic_fact", 3, 0.80, "fact"), odd)], odd).contains(" by "));
+        assert!(!format_hits(&[by(hit(1, "Memory", "semantic_fact", 3, 0.80, "fact"), odd)], odd, None).contains(" by "));
     }
 
     fn keyed(mut h: Hit, key: &str) -> Hit {
@@ -683,15 +705,15 @@ mod tests {
 
     #[test]
     fn a_hit_shows_the_topic_key_it_is_revised_under() {
-        let out = format_hits(&[keyed(hit(68, "Memory", "architectural_decision", 2, 0.56, "clawg export"), "cli/export-format")], "a");
+        let out = format_hits(&[keyed(hit(68, "Memory", "architectural_decision", 2, 0.56, "clawg export"), "cli/export-format")], "a", None);
         assert_eq!(out, "1. #68 [Memory/architectural_decision/t2 score=0.56 topic=cli/export-format] clawg export");
         let own = keyed(by(hit(68, "Memory", "architectural_decision", 2, 0.56, "clawg export"), "a"), "cli/export-format");
-        assert!(format_hits(&[own], "a").contains(" score=0.56 topic=cli/export-format]"));
+        assert!(format_hits(&[own], "a", None).contains(" score=0.56 topic=cli/export-format]"));
     }
 
     #[test]
     fn a_hit_without_a_key_is_shown_as_before() {
-        let out = format_hits(&[hit(68, "Memory", "semantic_fact", 2, 0.56, "clawg export")], "a");
+        let out = format_hits(&[hit(68, "Memory", "semantic_fact", 2, 0.56, "clawg export")], "a", None);
         assert_eq!(out, "1. #68 [Memory/semantic_fact/t2 score=0.56] clawg export");
     }
 
@@ -700,21 +722,55 @@ mod tests {
     #[test]
     fn another_agents_hit_does_not_show_its_topic_key() {
         let shared = keyed(by(hit(68, "Memory", "architectural_decision", 2, 0.56, "clawg export"), "claude-code"), "cli/export-format");
-        let out = format_hits(&[shared], "cursor");
+        let out = format_hits(&[shared], "cursor", None);
         assert!(out.starts_with("1. #68 [Memory/architectural_decision/t2 score=0.56 by claude-code] clawg export"), "{out}");
         assert!(!out.contains("topic="), "{out}");
+    }
+
+    fn placed(mut h: Hit, project: Option<&str>) -> Hit {
+        h.project_id = Some(project.map(Into::into));
+        h
+    }
+
+    fn preference(id: i64) -> Hit {
+        keyed(hit(id, "Memory", "user_preference", 2, 0.56, "tabs"), "style/indent")
+    }
+
+    /// A save under a key revises only the rows of the project it goes to, so
+    /// the key of a row of another project would promise a revision the save
+    /// does not make.
+    #[test]
+    fn a_hit_of_another_project_does_not_show_its_topic_key() {
+        let elsewhere = placed(preference(68), Some("other"));
+        assert_eq!(
+            format_hits(&[elsewhere.clone()], "a", Some("here")),
+            "1. #68 [Memory/user_preference/t2 score=0.56] tabs"
+        );
+        assert!(format_hits(&[elsewhere], "a", Some("other")).contains(" score=0.56 topic=style/indent]"));
+    }
+
+    #[test]
+    fn a_hit_without_a_project_shows_its_key_only_to_a_bridge_without_one() {
+        let unplaced = placed(preference(68), None);
+        assert!(!format_hits(&[unplaced.clone()], "a", Some("here")).contains("topic="));
+        assert!(format_hits(&[unplaced], "a", None).contains(" score=0.56 topic=style/indent]"));
+    }
+
+    #[test]
+    fn a_hit_from_an_older_daemon_shows_its_key() {
+        assert!(format_hits(&[preference(68)], "a", Some("here")).contains(" score=0.56 topic=style/indent]"));
     }
 
     #[test]
     fn search_says_when_nothing_was_relevant() {
         let sentence = |n: usize| format!("no relevant memories for this query: {n} searched, none close enough to show");
-        assert_eq!(format_search(Found { hits: Vec::new(), withheld: 3 }, "a"), sentence(3), "the daemon cut them all");
-        assert_eq!(format_search(Found { hits: scored(&[0.0, 0.0]), withheld: 1 }, "a"), sentence(3), "the bridge cut the rest");
+        assert_eq!(format_search(Found { hits: Vec::new(), withheld: 3 }, "a", None), sentence(3), "the daemon cut them all");
+        assert_eq!(format_search(Found { hits: scored(&[0.0, 0.0]), withheld: 1 }, "a", None), sentence(3), "the bridge cut the rest");
     }
 
     #[test]
     fn nothing_stored_is_not_called_irrelevant() {
-        assert_eq!(format_search(shown(Vec::new()), "a"), "no memories found");
+        assert_eq!(format_search(shown(Vec::new()), "a", None), "no memories found");
     }
 
     #[test]
@@ -788,7 +844,7 @@ mod tests {
 
     #[test]
     fn format_hits_says_so_when_there_are_none() {
-        assert_eq!(format_hits(&[], "a"), "no memories found");
+        assert_eq!(format_hits(&[], "a", None), "no memories found");
     }
 
     #[test]
@@ -796,7 +852,7 @@ mod tests {
         let out = format_hits(&[
             hit(42, "Memory", "semantic_fact", 2, 0.876, "first"),
             hit(7, "Procedural", "procedural_skill", 1, 0.5, "second"),
-        ], "a");
+        ], "a", None);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("1. #42 "), "line was: {}", lines[0]);
@@ -805,7 +861,7 @@ mod tests {
 
     #[test]
     fn format_hits_carries_kind_type_tier_and_score() {
-        let out = format_hits(&[hit(42, "Memory", "semantic_fact", 2, 0.876, "content here")], "a");
+        let out = format_hits(&[hit(42, "Memory", "semantic_fact", 2, 0.876, "content here")], "a", None);
         assert!(out.contains("Memory/semantic_fact/t2"), "out was: {out}");
         assert!(out.contains("score=0.88"), "score must be readable, not raw f64: {out}");
         assert!(out.contains("content here"), "out was: {out}");
@@ -814,7 +870,7 @@ mod tests {
     #[test]
     fn format_hits_truncates_long_content() {
         let long = "x".repeat(CONTENT_PREVIEW_LIMIT + 100);
-        let out = format_hits(&[hit(1, "Memory", "chat_message", 3, 0.1, &long)], "a");
+        let out = format_hits(&[hit(1, "Memory", "chat_message", 3, 0.1, &long)], "a", None);
         assert!(out.ends_with('…'), "out ended: {:?}", &out[out.len().saturating_sub(20)..]);
         assert!(out.len() < long.len(), "the preview must be shorter than the content");
     }
@@ -823,7 +879,7 @@ mod tests {
     fn format_hits_names_the_piece_of_a_long_save() {
         let mut piece = hit(58, "Memory", "semantic_fact", 3, 0.81, "the retry budget was set");
         piece.piece = Some(crate::client::PiecePosition { piece: 2, pieces: 4 });
-        let out = format_hits(&[piece, hit(7, "Memory", "semantic_fact", 3, 0.5, "a short one")], "a");
+        let out = format_hits(&[piece, hit(7, "Memory", "semantic_fact", 3, 0.5, "a short one")], "a", None);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "1. #58 [Memory/semantic_fact/t3 piece=2/4 score=0.81] the retry budget was set");
         assert_eq!(lines[1], "2. #7 [Memory/semantic_fact/t3 score=0.50] a short one");
@@ -833,7 +889,7 @@ mod tests {
     /// the numbering meaningless to whoever is reading it.
     #[test]
     fn format_hits_keeps_each_hit_on_one_line() {
-        let out = format_hits(&[hit(1, "Memory", "chat_message", 3, 0.1, "two\nlines")], "a");
+        let out = format_hits(&[hit(1, "Memory", "chat_message", 3, 0.1, "two\nlines")], "a", None);
         assert_eq!(out.lines().count(), 1, "out was: {out:?}");
     }
 
@@ -850,13 +906,14 @@ mod tests {
             missing: vec![3],
             text: "first and second\nfourth".into(),
             topic_key: None,
+            project_id: None,
         };
         assert_eq!(
-            format_save(&save),
+            format_save(&save, None),
             "#58 is piece 2 of 4 of one save: #57, #58, (missing), #60\nfirst and second\nfourth"
         );
         let single = SavedText { piece: 1, pieces: 1, ids: vec![Some(58)], missing: vec![], text: "short".into(), ..save };
-        assert_eq!(format_save(&single), "#58\nshort");
+        assert_eq!(format_save(&single, None), "#58\nshort");
     }
 
     #[test]
@@ -870,13 +927,33 @@ mod tests {
             missing: vec![],
             text: "short".into(),
             topic_key: Some("cli/export-format".into()),
+            project_id: None,
         };
-        assert_eq!(format_save(&single), "#68 topic=cli/export-format\nshort");
+        assert_eq!(format_save(&single, None), "#68 topic=cli/export-format\nshort");
         let piece = SavedText { piece: 2, pieces: 3, ids: vec![Some(67), Some(68), Some(69)], ..single };
         assert_eq!(
-            format_save(&piece),
+            format_save(&piece, None),
             "#68 is piece 2 of 3 of one save: #67, #68, #69 topic=cli/export-format\nshort"
         );
+    }
+
+    #[test]
+    fn format_save_shows_the_key_only_where_a_save_revises_it() {
+        let save = SavedText {
+            kind: "memory".into(),
+            id: 68,
+            piece: 1,
+            pieces: 1,
+            ids: vec![Some(68)],
+            missing: vec![],
+            text: "tabs".into(),
+            topic_key: Some("style/indent".into()),
+            project_id: Some(Some("other".into())),
+        };
+        assert_eq!(format_save(&save, Some("here")), "#68\ntabs");
+        assert_eq!(format_save(&save, Some("other")), "#68 topic=style/indent\ntabs");
+        let from_an_older_daemon = SavedText { project_id: None, ..save };
+        assert_eq!(format_save(&from_an_older_daemon, Some("here")), "#68 topic=style/indent\ntabs");
     }
 
     // ── format_rows ─────────────────────────────────────────────────────────
@@ -1442,7 +1519,7 @@ mod tests {
             by(hit(1, "Memory", "semantic_fact", 2, 0.80, "propia"), "cursor"),
             by(hit(2, "Memory", "semantic_fact", 3, 0.70, "ajena"), "claude-code"),
         ];
-        let out = format_search(shown(hits), "cursor");
+        let out = format_search(shown(hits), "cursor", None);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "1. #1 [Memory/semantic_fact/t2 score=0.80] propia");
         assert_eq!(lines[1], "2. #2 [Memory/semantic_fact/t3 score=0.70 by claude-code] ajena");
@@ -1454,7 +1531,7 @@ mod tests {
     fn format_search_leaves_own_hits_alone() {
         let own = vec![by(hit(1, "Memory", "semantic_fact", 2, 0.80, "propia"), "cursor"), hit(2, "Memory", "semantic_fact", 3, 0.70, "vieja")];
         assert_eq!(
-            format_search(shown(own), "cursor"),
+            format_search(shown(own), "cursor", None),
             "1. #1 [Memory/semantic_fact/t2 score=0.80] propia\n2. #2 [Memory/semantic_fact/t3 score=0.70] vieja"
         );
     }

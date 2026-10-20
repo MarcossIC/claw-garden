@@ -1418,6 +1418,7 @@ mod tests {
             piece: None,
             exact: false,
             topic_key: None,
+            project_id: None,
         }
     }
 
@@ -2299,6 +2300,7 @@ mod tests {
             piece: None,
             exact: false,
             topic_key: None,
+            project_id: None,
         }
     }
 
@@ -3176,6 +3178,7 @@ mod tests {
             piece: None,
             exact: false,
             topic_key: None,
+            project_id: None,
         }];
 
         assert_eq!(format_skill_hits(&hits), "skill_hits=1");

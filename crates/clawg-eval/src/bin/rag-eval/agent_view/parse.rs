@@ -187,6 +187,7 @@ mod tests {
         let text = clawg_cli::mcp::tools::format_search(
             clawg_cli::client::Found { hits: Vec::new(), withheld: 3 },
             "agent",
+            None,
         );
         assert!(parse_search_output(&text).unwrap().is_empty(), "{text}");
     }
