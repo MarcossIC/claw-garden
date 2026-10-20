@@ -268,6 +268,11 @@ mod tests {
         loop {
             match connect(&path) {
                 Err(e) if e.kind() == ErrorKind::ConnectionRefused => break,
+                // What a connect gets while the listener is closing, for a
+                // fraction of a millisecond before it is refused.
+                Err(e) if e.raw_os_error() == Some(windows_sys::Win32::Networking::WinSock::WSAENOBUFS) => {
+                    assert!(started.elapsed() < Duration::from_secs(1), "the socket is still closing")
+                }
                 Err(e) => panic!("expected ConnectionRefused, got {e}"),
                 Ok(_) => assert!(started.elapsed() < Duration::from_secs(1), "the socket still listens"),
             }
