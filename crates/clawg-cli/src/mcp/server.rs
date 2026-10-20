@@ -154,6 +154,7 @@ fn memory_type_enum(schema: &mut schemars::Schema) {
 pub struct SaveMemoryArgs {
     /// The memory to store, written as a self-contained statement — it will be
     /// read back in a future session with none of this conversation around it.
+    /// At most 64 KiB; split a longer text into several saves.
     pub content: String,
     /// What kind of memory this is, one of the listed values; any other is
     /// refused. Defaults to semantic_fact when omitted. An
@@ -1270,7 +1271,7 @@ mod tests {
     use clawg_core::runtime::MemoryRuntime;
 
     use crate::client::{ErrorDetails, ListArgs, ReplacedMemory, SaveArgs, SaveOutcome, SavedMemory};
-    use crate::daemon::api::{router, AppCtx, SAVE_CONFIRM_TIMEOUT};
+    use crate::daemon::api::{router, AppCtx, MAX_CONTENT_BYTES, SAVE_CONFIRM_TIMEOUT};
     use crate::mcp::tools::CONTENT_PREVIEW_LIMIT;
 
     /// Brings up an in-process daemon and returns a bridge pointed at it.
@@ -2559,6 +2560,22 @@ mod tests {
         assert!(is_error(&r), "text was: {}", text(&r));
         assert!(text(&r).starts_with("not saved: unknown memory_type \"preference\""), "text was: {}", text(&r));
         assert!(text(&r).contains("user_preference"), "text was: {}", text(&r));
+    }
+
+    #[tokio::test]
+    async fn save_memory_says_a_save_over_the_limit_was_not_saved() {
+        let (b, _d) = bridge().await;
+        let r = b
+            .save_memory_impl("agent-mcp", save_args(&"x".repeat(MAX_CONTENT_BYTES + 1)))
+            .await
+            .expect("save");
+
+        assert!(is_error(&r), "text was: {}", text(&r));
+        assert!(
+            text(&r).starts_with(&format!("not saved: content is {} bytes; at most {MAX_CONTENT_BYTES}", MAX_CONTENT_BYTES + 1)),
+            "text was: {}",
+            text(&r)
+        );
     }
 
     fn daemon_error(status: u16, message: &str, details: ErrorDetails) -> ClientError {

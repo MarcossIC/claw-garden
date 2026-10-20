@@ -63,7 +63,8 @@ Every row competes with the others in search, so leave out:
   (function and type names, error codes). A query that names an
   identifier finds the memories that contain it.
 - One fact per call. A save that mixes two topics makes search pick one piece
-  of it.
+  of it. A save holds at most 64 KiB: a longer text is refused, so split it
+  into several saves, each with its own first line.
 - A decision or a preference that may change later gets a `topic_key`, a
   short stable name such as `storage/engine`. When it changes, save the new
   version under the same `topic_key`: it replaces the old one, which stays in

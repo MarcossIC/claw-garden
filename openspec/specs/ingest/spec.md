@@ -12,6 +12,7 @@ Fuente de verdad del comportamiento actual de la ingesta: el contrato de `POST /
 - [session-handoff](../../changes/archive/2026-10-19-session-handoff/proposal.md), archivado el 2026-10-19 (sólo «La sesión del host», sus R1 y R2). El bloque LAST SESSION está en [`specs/retrieval`](../retrieval/spec.md), y el registro desde los hooks en [`specs/hooks`](../hooks/spec.md).
 - [model-download](../../changes/archive/2026-10-19-model-download/proposal.md), archivado el 2026-10-19 (sólo la causa de una descarga que agota sus intentos, en «Estado en `/health` y `clawg status`», y el origen inválido en «Reintento del bootstrap»). La descarga está en [`specs/storage`](../storage/spec.md), «Descarga del modelo».
 - [outbox-lifecycle](../../changes/archive/2026-10-19-outbox-lifecycle/proposal.md), archivado el 2026-10-19 (sólo lo que contesta un save que falla con el que guardó esperando, `pieces` en el bloque `ingest` de `/health` y los textos nuevos de `save_memory` y `memory_status`). El reintento, la pausa del apagado y `clawg outbox` están en [`specs/storage`](../storage/spec.md).
+- [save-bounds](../../changes/archive/2026-10-20-save-bounds/proposal.md), archivado el 2026-10-20 (sólo «El contenido: vacío o sobre el tope» y la fila del `400` por el tope en «Texto que ve el modelo»).
 
 ## Definiciones
 
@@ -34,7 +35,7 @@ Fuente de verdad del comportamiento actual de la ingesta: el contrato de `POST /
 
 ### Aceptar es durable
 
-Después de validar el pedido (contenido, `memory_type`, `operation_id`, `derived_from` y `topic_key`, cada uno un `400`) y de comprobar que el embedder no está `failed`, `POST /v1/memories` MUST pasar por `MemoryRuntime::accept` (`crates/clawg-core/src/runtime.rs:232`, llamado en `save_memory`, `api.rs:1152`), que en este orden:
+Después de validar el pedido (contenido, `memory_type`, `operation_id`, `derived_from` y `topic_key`, cada uno un `400`) y de comprobar que el embedder no está `failed`, `POST /v1/memories` MUST pasar por `MemoryRuntime::accept` (`crates/clawg-core/src/runtime.rs:232`, llamado en `save_memory`, `api.rs:1173`), que en este orden:
 
 1. enmascara el contenido (ver [`specs/secrets`](../secrets/spec.md), R2): la fila guarda el texto ya enmascarado;
 2. escribe y confirma la fila del outbox (`outbox_record`, `crates/clawg-core/src/memory/outbox.rs:254`). El commit MUST hacerse con `synchronous = FULL` y la conexión MUST volver después a su valor (`durably`, `outbox.rs:229`): un save aceptado sobrevive también a un corte de luz, a costa de un fsync por save. El resto de la base, incluidos el progreso y el borrado final de la fila, sigue en `NORMAL`;
@@ -68,7 +69,7 @@ Los tipos de memoria están en un solo lugar, `MemoryType::ALL` (`crates/clawg-c
 unknown memory_type "preference"; expected one of semantic_fact, user_preference, architectural_decision, session_summary, code_block, chat_message, tool_error
 ```
 
-`POST /v1/memories` con un `memory_type` que no es uno de los siete MUST responder `400` con ese mensaje (`save_memory`, `crates/clawg-cli/src/daemon/api.rs:1074-1076`), después de comprobar el contenido y antes de `check_operation_id` y del outbox: MUST NOT escribir la fila del outbox ni encolar el evento. Se valida en el handler y no en el worker porque el worker corre cuando quien guardó ya recibió su `201` o `202`, y un rechazo ahí no le llegaría. Un `memory_type` ausente MUST guardarse como `semantic_fact`, y uno válido como ese tipo. `PATCH /v1/memories/{kind}/{id}` rechaza con el mismo mensaje, porque `PatchError::UnknownType` envuelve el mismo error (`crates/clawg-core/src/memory/admin.rs:147`; [`specs/update`](../update/spec.md)): las dos rutas aceptan y rechazan las mismas cadenas.
+`POST /v1/memories` con un `memory_type` que no es uno de los siete MUST responder `400` con ese mensaje (`save_memory`, `crates/clawg-cli/src/daemon/api.rs:1095-1097`), después de comprobar el contenido y antes de `check_operation_id` y del outbox: MUST NOT escribir la fila del outbox ni encolar el evento. Se valida en el handler y no en el worker porque el worker corre cuando quien guardó ya recibió su `201` o `202`, y un rechazo ahí no le llegaría. Un `memory_type` ausente MUST guardarse como `semantic_fact`, y uno válido como ese tipo. `PATCH /v1/memories/{kind}/{id}` rechaza con el mismo mensaje, porque `PatchError::UnknownType` envuelve el mismo error (`crates/clawg-core/src/memory/admin.rs:147`; [`specs/update`](../update/spec.md)): las dos rutas aceptan y rechazan las mismas cadenas.
 
 Una fila del outbox con un tipo desconocido, escrita antes de esta validación, MUST seguir guardándose como `semantic_fact` al reproducirse (`store_insert.rs:173-178`).
 
@@ -87,7 +88,7 @@ Una fila del outbox con un tipo desconocido, escrita antes de esta validación, 
 
 ### La clave de tema se valida y vuelve en la respuesta
 
-`POST /v1/memories` MUST aceptar `topic_key`, opcional (`SaveRequest.topic_key`, `crates/clawg-cli/src/daemon/api.rs:370`). Una clave que no cumple el formato de «Definiciones» MUST responder `400` con el mensaje de `validate_topic_key`, que empieza con `topic_key`, después de comprobar el contenido y antes de escribir la fila del outbox ni encolar el evento (`save_memory`, `api.rs:1078-1079`). Se valida en el handler y no en el worker por la misma razón que el tipo: un rechazo del worker llegaría cuando quien guardó ya recibió su `201` o `202`. `validate_topic_key` es pura, y su error (`TopicKeyError`, `topic.rs:23`) usa `thiserror`.
+`POST /v1/memories` MUST aceptar `topic_key`, opcional (`SaveRequest.topic_key`, `crates/clawg-cli/src/daemon/api.rs:370`). Una clave que no cumple el formato de «Definiciones» MUST responder `400` con el mensaje de `validate_topic_key`, que empieza con `topic_key`, después de comprobar el contenido y antes de escribir la fila del outbox ni encolar el evento (`save_memory`, `api.rs:1099-1100`). Se valida en el handler y no en el worker por la misma razón que el tipo: un rechazo del worker llegaría cuando quien guardó ya recibió su `201` o `202`. `validate_topic_key` es pura, y su error (`TopicKeyError`, `topic.rs:23`) usa `thiserror`.
 
 Todo `201` y `202` de un save con clave MUST llevarla en `topic_key` (`SaveBody.topic_key`, `api.rs:529`); sin clave, el campo no va. Un daemon anterior ignora el campo del pedido (`SaveRequest` no usa `deny_unknown_fields`) y no lo devuelve: así el puente se entera de que su clave no se aplicó.
 
@@ -150,7 +151,7 @@ La respuesta MUST listar las filas reemplazadas en `replaced`, cada una con su i
 
 ### Un save confirmado devuelve los ids
 
-Con el embedder `ready`, `POST /v1/memories` MUST encolar el evento con un canal de respuesta, esperar el reporte del worker y responder `201` con un elemento por chunk, en el orden de los chunks (`save_memory`, `api.rs:1065`; `save_response`, `api.rs:971`). Todo `201` lleva además el `operation_id` (ver «`operation_id`»):
+Con el embedder `ready`, `POST /v1/memories` MUST encolar el evento con un canal de respuesta, esperar el reporte del worker y responder `201` con un elemento por chunk, en el orden de los chunks (`save_memory`, `api.rs:1088`; `save_response`, `api.rs:994`). Todo `201` lleva además el `operation_id` (ver «`operation_id`»):
 
 ```json
 {"status": "saved", "memories": [{"kind": "memory", "id": 57, "outcome": "inserted"}], "operation_id": "3f0c…"}
@@ -187,7 +188,7 @@ Un save cuyo contenido ya está guardado MUST responder `201` con `outcome: "rei
 
 ### Un fallo del worker llega al que guardó
 
-Si el worker no puede guardar el evento (embedder caído, batch fallido, menos vectores que chunks, insert fallido), el reporte llega al que espera y el save MUST responder con la causa (`save_response`, `api.rs:971`):
+Si el worker no puede guardar el evento (embedder caído, batch fallido, menos vectores que chunks, insert fallido), el reporte llega al que espera y el save MUST responder con la causa (`save_response`, `api.rs:994`):
 
 - un fallo pasajero (`EmbedError::NotReady` o `WorkerGone`, en `ingest_pieces`): `202` con `status: "queued"`, `reason: "retrying"`, la causa en `detail` y el `operation_id`. El worker conserva la fila y la toma otra vez en la misma ejecución ([`specs/storage`](../storage/spec.md), «Un fallo pasajero se reintenta en la misma ejecución»);
 - cualquier otro fallo sin chunks guardados: `500` con `error: "ingest_failed"` y un `detail` legible (`embed failed: …`, `embedder returned N vectors for M chunks`, `store insert failed: …`);
@@ -195,7 +196,7 @@ Si el worker no puede guardar el evento (embedder caído, batch fallido, menos v
 
 El worker MUST cortar el evento en el primer fallo: lo que queda guardado es siempre un prefijo del texto, nunca uno con un hueco en el medio. `memories` MUST incluir los chunks que ya estaban en la base antes del fallo, sean insertados o reforzados, en orden. Los chunks que no se escribieron MUST NOT aparecer. El worker además registra el fallo con `log::warn!`.
 
-El handler MUST borrar la fila del outbox sólo cuando contesta `500` con el reporte del worker (`outbox_forget`, `api.rs:1185`): el que guardó se entera por la respuesta y no se guardó nada. Con chunks guardados la fila es lo único que permite terminar el save, y con un fallo pasajero el worker la sigue usando. Lo hace el handler y no el worker porque sólo el handler sabe si el reporte llegó antes de vencer la espera. Un save cuyo fallo ocurre después de haber contestado (`202`) no tiene a quién contestárselo: su fila queda con la causa y se ve en `/health` (ver «Estado del outbox en `/health`» y [`specs/storage`](../storage/spec.md), «Intentos y fallo a la vista»).
+El handler MUST borrar la fila del outbox sólo cuando contesta `500` con el reporte del worker (`outbox_forget`, `api.rs:1206`): el que guardó se entera por la respuesta y no se guardó nada. Con chunks guardados la fila es lo único que permite terminar el save, y con un fallo pasajero el worker la sigue usando. Lo hace el handler y no el worker porque sólo el handler sabe si el reporte llegó antes de vencer la espera. Un save cuyo fallo ocurre después de haber contestado (`202`) no tiene a quién contestárselo: su fila queda con la causa y se ve en `/health` (ver «Estado del outbox en `/health`» y [`specs/storage`](../storage/spec.md), «Intentos y fallo a la vista»).
 
 #### Escenario: embed fallido
 - GIVEN un embedder de prueba cuyo `embed_batch` devuelve error
@@ -268,7 +269,7 @@ Con el embedder `failed`, el save MUST responder `503` sin encolar y sin escribi
 {"error": "embedder_failed", "detail": "<causa>", "retryable": true}
 ```
 
-`POST /v1/search` MUST responder el mismo cuerpo cuando el embedder está `failed`, y `embedder_not_ready` en los demás casos en que la celda está vacía (`ready_embedder`, `api.rs:1202`, que llama `search`). `POST /v1/context` no responde ninguno de los dos: sin embedder cae a la recuperación léxica.
+`POST /v1/search` MUST responder el mismo cuerpo cuando el embedder está `failed`, y `embedder_not_ready` en los demás casos en que la celda está vacía (`ready_embedder`, `api.rs:1223`, que llama `search`). `POST /v1/context` no responde ninguno de los dos: sin embedder cae a la recuperación léxica.
 
 #### Escenario
 - GIVEN un bootstrap cuya descarga falla
@@ -290,7 +291,7 @@ La cola de ingesta MUST tener capacidad `INGEST_QUEUE_CAPACITY` (1024 eventos). 
 
 ### `operation_id`
 
-Toda respuesta `201` y `202` de `POST /v1/memories` MUST llevar `operation_id`. Sin uno en el pedido, el daemon MUST emitir un UUID v4. Con uno (`SaveRequest.operation_id`, `api.rs:366`), MUST validarlo (1 a 128 caracteres ASCII visibles, `MAX_OPERATION_ID_LEN`; si no, `400`; `check_operation_id`, `api.rs:578`) y usarlo. `SaveRequest` no usa `deny_unknown_fields`, así que el campo es aditivo.
+Toda respuesta `201` y `202` de `POST /v1/memories` MUST llevar `operation_id`. Sin uno en el pedido, el daemon MUST emitir un UUID v4. Con uno (`SaveRequest.operation_id`, `api.rs:366`), MUST validarlo (1 a 128 caracteres ASCII visibles, `MAX_OPERATION_ID_LEN`; si no, `400`; `check_operation_id`, `api.rs:601`) y usarlo. `SaveRequest` no usa `deny_unknown_fields`, así que el campo es aditivo.
 
 Mientras exista una fila con ese `operation_id` para ese agente, un save con el mismo MUST NOT crear otra ni encolar nada (`Accepted::Existing`, `runtime.rs:76`): con la fila `pending` responde `202` con `reason: "already_queued"`; con la fila `failed`, `500 ingest_failed` con su causa en `detail`. Después de completado el save, la fila ya no existe: un reenvío vuelve a guardar y el dedup lo absorbe como `reinforced`. El `operation_id` identifica el save, no su texto: un reenvío con otro contenido y el mismo id no guarda el contenido nuevo mientras la fila exista.
 
@@ -308,17 +309,46 @@ La herramienta `save_memory` MUST NOT tener un argumento `operation_id`: el mode
 
 **Tests:** `a_save_answers_with_an_operation_id` y `an_operation_id_sent_twice_keeps_one_row` (`tests/api.rs`); `operation_ids_are_checked` y `a_confirmed_save_names_its_operation_and_what_was_masked_before_it_was_recorded` (`api.rs`, mod tests); `an_operation_id_already_recorded_is_not_queued_again` (`runtime.rs`, mod tests); `an_operation_id_is_one_row_per_agent` (`outbox.rs`, mod tests). La respuesta `500 ingest_failed` a un id con fila `failed` no tiene test propio.
 
-### Contenido vacío
+### El contenido: vacío o sobre el tope
 
-Un save con contenido vacío o sólo espacios MUST responder `400` antes de consultar el estado del embedder y antes de encolar o escribir una fila. El mensaje nombra el campo (`content must not be empty`).
+`check_content` (`crates/clawg-cli/src/daemon/api.rs:582`), una función pura, es lo primero que `save_memory` comprueba (`api.rs:1092`): antes del tipo, la clave, el `operation_id` y `derived_from`, antes de consultar el estado del embedder y antes de encolar o escribir una fila.
 
-**Test:** `saving_empty_content_is_rejected_before_it_reaches_the_queue` (`tests/api.rs`).
+- Un `content` vacío o de sólo espacios MUST responder `400` con `content must not be empty`.
+- Un `content` de más de `MAX_CONTENT_BYTES` (65 536) bytes en UTF-8, contados como llegan y antes de enmascarar (`api.rs:577`), MUST responder `400` con el tamaño recibido, el tope y qué hacer:
+
+```
+content is 70000 bytes; at most 65536 are accepted: split it into several saves, one fact each
+```
+
+Uno de exactamente `MAX_CONTENT_BYTES` bytes MUST aceptarse como cualquier otro. Se rechaza y no se trunca, porque un save truncado guardaría un texto que quien guardó no escribió, ni se parte en el handler, porque un save es un `operation_id`, una `topic_key` y un vínculo de pedazos.
+
+El tope existe porque cada pedazo de un save largo reescribe su fila del outbox con todo el progreso anterior, y lo que un save escribe crece con el cuadrado de su largo, en la única conexión de escritura y el único worker. Medido con el embedder falso: 64 KiB son 228 pedazos y 8,3 MB de `progress`; 256 KiB, 910 pedazos y 133 MB ([verify](../../changes/archive/2026-10-20-save-bounds/verify.md#medición-del-progreso)). El tope deja pasar la nota más larga de la historia que trae history-import (45 372 caracteres). Lo acota el daemon, no el puente: cualquier cliente con el token pasa por el handler, y su frase llega al modelo como `not saved: …` («Texto que ve el modelo»). La descripción de `content` en `save_memory` MUST nombrar el tope (64 KiB), y `protocol.md` lo dice en «How to write a save».
+
+Una fila del outbox escrita antes del tope, de cualquier tamaño, MUST seguir guardándose al reproducirse: el tope está en el handler y no en el worker.
+
+#### Escenario: sobre el tope
+- GIVEN un daemon sin worker
+- WHEN se guarda un `content` de 65 537 bytes
+- THEN responde `400`, el mensaje nombra `65537` y `65536`
+- AND el outbox queda vacío
+
+#### Escenario: en el tope
+- GIVEN un daemon con el embedder listo
+- WHEN se guarda un `content` de 65 536 bytes
+- THEN el save se acepta y sus pedazos quedan guardados
+
+#### Escenario: bytes, no caracteres
+- GIVEN un texto de 32 769 `ñ` (65 538 bytes)
+- WHEN `check_content` lo evalúa
+- THEN lo rechaza; uno de 32 768 `ñ` (65 536 bytes) pasa
+
+**Tests:** `saving_empty_content_is_rejected_before_it_reaches_the_queue`, `a_save_over_the_content_limit_is_refused_before_the_outbox` y `a_save_at_the_content_limit_is_stored` (`tests/api.rs`); `content_is_checked_in_bytes` (`api.rs`, mod tests); `save_memory_says_a_save_over_the_limit_was_not_saved` (`server.rs`, mod tests); la descripción, `the_agent_contract_matches_its_file`.
 
 ## La sesión del host
 
 ### `POST /v1/sessions` registra la sesión
 
-`POST /v1/sessions`, detrás del token, con `{agent_id, project_id?, session_id}` (`SessionRequest`, `crates/clawg-cli/src/daemon/api.rs:374-379`; `register_session`, `api.rs:1336`), MUST recordar `session_id` para el par `(agent_id, project_id)` y responder `204`. Un registro nuevo del mismo par MUST reemplazar al anterior, y otro agente u otro proyecto MUST NOT verse afectados (`SessionRegistry`, `crates/clawg-cli/src/daemon/sessions.rs:33`). Un `session_id` vacío, de más de 128 caracteres o con algo fuera del ASCII visible MUST ser un `400` (`check_session_id`, `sessions.rs:22`; `MAX_SESSION_ID_LEN`, `:13`). El registro vive en memoria, en `AppCtx` (`api.rs:92`): MUST NOT escribirse en el store y se pierde al reiniciar el daemon, porque una sesión vieja después de un reinicio sería peor que ninguna. No vence: con los hooks instalados se renueva en cada mensaje del usuario ([`specs/hooks`](../hooks/spec.md), R6).
+`POST /v1/sessions`, detrás del token, con `{agent_id, project_id?, session_id}` (`SessionRequest`, `crates/clawg-cli/src/daemon/api.rs:374-379`; `register_session`, `api.rs:1357`), MUST recordar `session_id` para el par `(agent_id, project_id)` y responder `204`. Un registro nuevo del mismo par MUST reemplazar al anterior, y otro agente u otro proyecto MUST NOT verse afectados (`SessionRegistry`, `crates/clawg-cli/src/daemon/sessions.rs:33`). Un `session_id` vacío, de más de 128 caracteres o con algo fuera del ASCII visible MUST ser un `400` (`check_session_id`, `sessions.rs:22`; `MAX_SESSION_ID_LEN`, `:13`). El registro vive en memoria, en `AppCtx` (`api.rs:92`): MUST NOT escribirse en el store y se pierde al reiniciar el daemon, porque una sesión vieja después de un reinicio sería peor que ninguna. No vence: con los hooks instalados se renueva en cada mensaje del usuario ([`specs/hooks`](../hooks/spec.md), R6).
 
 El par lleva el `project_id` tal como lo resuelven el hook y el puente desde el directorio de trabajo (`ProjectIdentity::resolve`), así que el registro y los saves del puente coinciden sin que el daemon resuelva nada. Con dos sesiones del mismo agente en el mismo proyecto gana la última registrada, que es la que recibió el último mensaje; la ambigüedad que queda, dos sesiones trabajando a la vez sin mensajes nuevos, sólo afecta la atribución y nunca el contenido.
 
@@ -331,7 +361,7 @@ El par lleva el `project_id` tal como lo resuelven el hook y el puente desde el 
 
 ### El save sella la sesión
 
-Al aceptar un save, `save_memory` MUST leer el registro de su `(agent_id, project_id)` y ponerlo en `MemoryEvent.session_id` antes de `MemoryRuntime::accept`, o nada si no hay registro (`api.rs:1125`, el campo en `:1143`). Se lee en el handler y no en el worker: una reanudación después de un kill corre en un daemon nuevo, con el registro vacío o con otra sesión, y el outbox tiene que guardar la que valía al aceptar. Cada fila que el save inserta, todos sus pedazos, MUST llevar ese id en `source_session_id` (`NewMemoryRecord.source_session_id`, `crates/clawg-core/src/memory/store_insert.rs:139`, copiado del evento en `:220` y escrito por el `INSERT` en `:443` y `:475`). Un save que refuerza una fila existente (mismo texto) no cambia su sesión: la fila sigue siendo la del primer save, porque sólo el `INSERT` escribe la columna.
+Al aceptar un save, `save_memory` MUST leer el registro de su `(agent_id, project_id)` y ponerlo en `MemoryEvent.session_id` antes de `MemoryRuntime::accept`, o nada si no hay registro (`api.rs:1146`, el campo en `:1164`). Se lee en el handler y no en el worker: una reanudación después de un kill corre en un daemon nuevo, con el registro vacío o con otra sesión, y el outbox tiene que guardar la que valía al aceptar. Cada fila que el save inserta, todos sus pedazos, MUST llevar ese id en `source_session_id` (`NewMemoryRecord.source_session_id`, `crates/clawg-core/src/memory/store_insert.rs:139`, copiado del evento en `:220` y escrito por el `INSERT` en `:443` y `:475`). Un save que refuerza una fila existente (mismo texto) no cambia su sesión: la fila sigue siendo la del primer save, porque sólo el `INSERT` escribe la columna.
 
 `MemoryEvent.session_id` MUST ser `#[serde(default)]` (`crates/clawg-core/src/memory/events.rs:59-60`): un evento de la outbox escrito antes del campo se guarda sin sesión. Las filas sin sesión, las de antes y las de un daemon sin registro, MUST leerse, buscarse y mostrarse como siempre; `clawg memories show` imprime `session: -` (`crates/clawg-cli/src/memories.rs:226`). `save_memory` MUST NOT tener un argumento de sesión: el modelo no la conoce, podría inventarla, y la herramienta se describe en cada sesión.
 
@@ -350,7 +380,7 @@ Con Claude Code sobre el perfil dev, cada save llevó el `session_id` que el hos
 
 `/health` MUST publicar `ingest` (`HealthBody.ingest`, `api.rs:500`; `outbox_summary`, `outbox.rs:521`) con `pending` y `failed` (cantidad de filas de cada estado), `oldest_pending_s` (edad en segundos de la fila `pending` más vieja, `null` sin ninguna) y hasta 5 `problems` (`PROBLEMS_SHOWN`, `outbox.rs:29`): las filas con `last_error`, las modificadas más recientemente primero, cada una con `operation_id`, `agent_id`, `state`, `attempts`, `error` y `pieces`, los ids de las memorias que ese save insertó según su progreso (omitido si no hay; es lo que un descarte borraría). MUST NOT llevar el texto de ninguna fila.
 
-La lectura MUST NOT hacer esperar a `/health` más de 250 ms (`HEALTH_INGEST_WAIT`, `api.rs:929`): `/health` lo consulta `probe_running` antes de cada autoarranque con un tope de 1 s (`HEALTH_TIMEOUT`, `client.rs:45`), y la conexión del store es una sola, así que una escritura larga haría esperar a `/health`. Si la lectura vence o falla, el campo `ingest` MUST omitirse de la respuesta (no se publica como `null`). El cliente lo lee como `Option` con `#[serde(default)]` (`Health.ingest`, `client.rs:140`): un daemon sin outbox, o uno ocupado, no lo trae y el cliente no inventa datos. `memory_status` lo muestra porque imprime el `Health` entero ([`specs/mcp`](../mcp/spec.md)).
+La lectura MUST NOT hacer esperar a `/health` más de 250 ms (`HEALTH_INGEST_WAIT`, `api.rs:952`): `/health` lo consulta `probe_running` antes de cada autoarranque con un tope de 1 s (`HEALTH_TIMEOUT`, `client.rs:45`), y la conexión del store es una sola, así que una escritura larga haría esperar a `/health`. Si la lectura vence o falla, el campo `ingest` MUST omitirse de la respuesta (no se publica como `null`). El cliente lo lee como `Option` con `#[serde(default)]` (`Health.ingest`, `client.rs:140`): un daemon sin outbox, o uno ocupado, no lo trae y el cliente no inventa datos. `memory_status` lo muestra porque imprime el `Health` entero ([`specs/mcp`](../mcp/spec.md)).
 
 #### Escenario: un save fallido
 - GIVEN una fila `failed` con `operation_id` `op-1`, `attempts = 3` y una causa
@@ -364,7 +394,7 @@ La lectura MUST NOT hacer esperar a `/health` más de 250 ms (`HEALTH_INGEST_WAI
 
 ### Estado en `/health` y `clawg status`
 
-`/health` MUST publicar `embedder` con uno de `loading`, `ready` o `failed` (`health`, `api.rs:931`; `HealthBody`, `api.rs:475`). Con `failed` MUST agregar `embedder_error` (texto) y `embedder_retryable` (booleano). Con los otros dos estados esos campos son `null`.
+`/health` MUST publicar `embedder` con uno de `loading`, `ready` o `failed` (`health`, `api.rs:954`; `HealthBody`, `api.rs:475`). Con `failed` MUST agregar `embedder_error` (texto) y `embedder_retryable` (booleano). Con los otros dos estados esos campos son `null`.
 
 `clawg status` serializa el `Health` del cliente (`crates/clawg-cli/src/client.rs:117`), que tiene los mismos campos. `embedder_error` y `embedder_retryable` son `#[serde(default)]`: un cliente nuevo contra un daemon que no los publica sigue parseando.
 
@@ -409,7 +439,7 @@ La espera tras el intento fallido `n` (1, 2, …) MUST ser `min(30 s · 2^(n-1),
 
 ### Texto que ve el modelo
 
-`save_memory` MUST traducir cada respuesta del daemon a un texto para el modelo (`save_outcome_text`, `crates/clawg-cli/src/mcp/server.rs:563`). La función es pura:
+`save_memory` MUST traducir cada respuesta del daemon a un texto para el modelo (`save_outcome_text`, `crates/clawg-cli/src/mcp/server.rs:564`). La función es pura:
 
 | Respuesta | Resultado MCP | Texto |
 |---|---|---|
@@ -423,14 +453,14 @@ La espera tras el intento fallido `n` (1, 2, …) MUST ser `min(30 s · 2^(n-1),
 | `202 already_queued` | éxito | `accepted as operation <id> earlier and still waiting to be stored` |
 | `202 retrying` | éxito | `accepted as operation <id>; the embedding model could not take it (<detail>), and clawg keeps retrying until it is stored (memory_status lists it if it fails)` |
 | `202 partially_saved` | éxito | `partially saved as #57, #58 (<detail>); the rest waits as operation <id>, which clawg retries when the daemon next starts (memory_status lists it if it fails)` |
-| `400` (un `memory_type` desconocido, entre otros) | error | `not saved: <mensaje del daemon>`, por ejemplo `not saved: unknown memory_type "preference"; expected one of semantic_fact, …` |
+| `400` (un `memory_type` desconocido, entre otros) | error | `not saved: <mensaje del daemon>`, por ejemplo `not saved: unknown memory_type "preference"; expected one of semantic_fact, …`, o `not saved: content is 70000 bytes; at most 65536 are accepted: …` |
 | `503 embedder_failed` | error | `not saved: the embedding model failed to load (<causa>)`, más `; clawg will retry` si es reintentable |
 | `500 ingest_failed` / `503 embedder_unavailable` | error | `not saved: <detalle>`, más `; partially saved as #…` si hubo filas (un daemon anterior contestaba así un fallo pasajero o uno con filas guardadas) |
 | `503 ingest_queue_full` | error | `not saved: the ingest queue is full; try again shortly` |
 
 El aviso del daemon anterior sale sólo en un save confirmado (`201`): un `202` no promete ningún reemplazo, y su texto no cambia. Las dos frases de arriba se agregan al texto de `saved`, de `saved as N pieces` y de `already stored`, y van antes de las candidatas de `related` ([`specs/disputes`](../disputes/spec.md), «Las candidatas en la respuesta del save»).
 
-Los textos de un `202` MUST nombrar el `operation_id` (sin él, dicen sólo `accepted`) y decir que un fallo aparece en `memory_status`. MUST NOT contener la palabra `queued` sola. Un save «exitoso» sólo se reporta como `saved` cuando el daemon confirmó las filas. Los ids MUST servir tal cual para `delete_memory` y `update_memory` con `kind: "memory"` (ver [`specs/update`](../update/spec.md), R5). Cualquier otro error pasa por `explain` (`server.rs:507`), que con `embedder_failed` MUST NOT prometer que la búsqueda va a funcionar en un minuto.
+Los textos de un `202` MUST nombrar el `operation_id` (sin él, dicen sólo `accepted`) y decir que un fallo aparece en `memory_status`. MUST NOT contener la palabra `queued` sola. Un save «exitoso» sólo se reporta como `saved` cuando el daemon confirmó las filas. Los ids MUST servir tal cual para `delete_memory` y `update_memory` con `kind: "memory"` (ver [`specs/update`](../update/spec.md), R5). Cualquier otro error pasa por `explain` (`server.rs:508`), que con `embedder_failed` MUST NOT prometer que la búsqueda va a funcionar en un minuto.
 
 #### Escenario: id usable
 - GIVEN `save_memory` devolvió `saved #57`
