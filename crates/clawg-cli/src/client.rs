@@ -595,12 +595,112 @@ fn owner_query(agent: Option<&str>) -> Vec<(&'static str, &str)> {
 
 // ── The client ──────────────────────────────────────────────────────────────
 
+/// How a client reaches its daemon: every call goes through [`DaemonClient::send`],
+/// which is the only place that touches one.
+#[derive(Debug, Clone)]
+enum Transport {
+    Http(reqwest::Client),
+}
+
+/// One request to the daemon, before any transport has seen it.
+///
+/// It has no deadline on purpose: the bridge repeats a call that failed with
+/// [`ClientError::NotRunning`], so a call that gave up waiting may already have
+/// reached the daemon. Only `health` is bounded, from outside `send`.
+#[derive(Debug, Clone)]
+pub struct Call {
+    method: reqwest::Method,
+    path: String,
+    query: Vec<(&'static str, String)>,
+    body: Option<Vec<u8>>,
+    bearer: bool,
+}
+
+impl Call {
+    /// A call that carries the bearer token.
+    pub fn new(method: reqwest::Method, path: impl Into<String>) -> Self {
+        Self { method, path: path.into(), query: Vec::new(), body: None, bearer: true }
+    }
+
+    pub fn without_bearer(mut self) -> Self {
+        self.bearer = false;
+        self
+    }
+
+    /// Adds query pairs. A call with none has no `?` at all: `?agent=` would
+    /// reach the daemon as a scope to the empty agent.
+    pub fn query<V: Into<String>>(mut self, pairs: impl IntoIterator<Item = (&'static str, V)>) -> Self {
+        self.query.extend(pairs.into_iter().map(|(k, v)| (k, v.into())));
+        self
+    }
+
+    pub fn json<B: Serialize + ?Sized>(mut self, body: &B) -> Result<Self, ClientError> {
+        self.body = Some(serde_json::to_vec(body).map_err(|e| ClientError::Http(e.to_string()))?);
+        Ok(self)
+    }
+}
+
+/// What the daemon answered, whole: its status and the entire body.
+#[derive(Debug, Clone)]
+pub struct Answer {
+    pub status: reqwest::StatusCode,
+    pub body: Vec<u8>,
+}
+
+/// The URL of `call` under `base`. The query is encoded the way reqwest's
+/// `.query()` does it, and is absent when there are no pairs.
+fn call_url(base: &str, call: &Call) -> Result<reqwest::Url, ClientError> {
+    let mut url = reqwest::Url::parse(&format!("{base}{}", call.path)).map_err(|e| ClientError::Http(e.to_string()))?;
+    if !call.query.is_empty() {
+        url.query_pairs_mut().extend_pairs(call.query.iter().map(|(k, v)| (*k, v.as_str())));
+    }
+    Ok(url)
+}
+
+/// The failure every non-2xx answer shares: 401 is always `Unauthorized` (a
+/// distinct, actionable failure, since the token file is stale), and every
+/// other status keeps the daemon's own status and `{"error": …}` message
+/// rather than being flattened into a string.
+fn check_status(answer: &Answer) -> Result<(), ClientError> {
+    if answer.status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ClientError::Unauthorized);
+    }
+    if !answer.status.is_success() {
+        return Err(daemon_error(answer.status, serde_json::from_slice(&answer.body).ok()));
+    }
+    Ok(())
+}
+
+/// Turns a whole answer into either its parsed body or the right
+/// [`ClientError`].
+///
+/// One funnel for every call so the mapping cannot drift per endpoint.
+fn read_response<T: serde::de::DeserializeOwned>(answer: Answer) -> Result<T, ClientError> {
+    check_status(&answer)?;
+    serde_json::from_slice(&answer.body).map_err(|_| ClientError::Http("error decoding response body".to_string()))
+}
+
+/// A connection that was refused, reset or timed out means "no daemon" — the
+/// same answer as a missing state file. Anything else is a genuine transport
+/// fault worth reporting as itself.
+fn classify_transport(is_connect: bool, is_timeout: bool, detail: String) -> ClientError {
+    if is_connect || is_timeout {
+        ClientError::NotRunning
+    } else {
+        ClientError::Http(detail)
+    }
+}
+
+fn map_transport(e: reqwest::Error) -> ClientError {
+    classify_transport(e.is_connect(), e.is_timeout(), e.to_string())
+}
+
 /// A handle on one daemon: its address, its token, and a reusable HTTP client.
 #[derive(Debug, Clone)]
 pub struct DaemonClient {
     base_url: String,
     token: String,
-    http: reqwest::Client,
+    transport: Transport,
     /// The data directory this client was resolved from, so callers can report
     /// it without re-deriving the profile.
     base_dir: PathBuf,
@@ -649,7 +749,12 @@ fn socket_http(_path: &Path) -> Option<reqwest::Client> {
 
 impl DaemonClient {
     pub fn new(base_url: impl Into<String>, token: impl Into<String>, base_dir: PathBuf) -> Self {
-        Self { base_url: base_url.into(), token: token.into(), http: loopback_http(), base_dir }
+        Self {
+            base_url: base_url.into(),
+            token: token.into(),
+            transport: Transport::Http(loopback_http()),
+            base_dir,
+        }
     }
 
     /// Builds a client from `<base_dir>/daemon.json` + `<base_dir>/token`.
@@ -667,7 +772,7 @@ impl DaemonClient {
             Endpoint::Unix(path) => (socket_http(&path)?, "http://localhost".to_string()),
             Endpoint::Tcp(port) => (loopback_http(), format!("http://127.0.0.1:{port}")),
         };
-        Some(Self { base_url, token, http, base_dir: base_dir.to_path_buf() })
+        Some(Self { base_url, token, transport: Transport::Http(http), base_dir: base_dir.to_path_buf() })
     }
 
     pub fn base_url(&self) -> &str {
@@ -678,51 +783,40 @@ impl DaemonClient {
         &self.base_dir
     }
 
-    /// Turns a finished response into either its parsed body or the right
-    /// [`ClientError`].
-    ///
-    /// One funnel for every call so the mapping cannot drift per endpoint: 401
-    /// is always `Unauthorized` (a distinct, actionable failure — the token
-    /// file is stale), and every other non-2xx keeps the daemon's own status
-    /// and `{"error": …}` message rather than being flattened into a string.
-    async fn read_response<T: serde::de::DeserializeOwned>(
-        resp: reqwest::Response,
-    ) -> Result<T, ClientError> {
-        let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(ClientError::Unauthorized);
+    /// Sends `call` and reads the whole answer. Every call of this client
+    /// goes through here, so the URL, the bearer and the error mapping cannot
+    /// differ per endpoint or per transport.
+    pub async fn send(&self, call: Call) -> Result<Answer, ClientError> {
+        let url = call_url(&self.base_url, &call)?;
+        match &self.transport {
+            Transport::Http(http) => {
+                let mut request = http.request(call.method, url);
+                if call.bearer {
+                    request = request.bearer_auth(&self.token);
+                }
+                if let Some(body) = call.body {
+                    request = request.header(reqwest::header::CONTENT_TYPE, "application/json").body(body);
+                }
+                let response = request.send().await.map_err(map_transport)?;
+                let status = response.status();
+                let body = match response.bytes().await {
+                    Ok(bytes) => bytes.to_vec(),
+                    // An error answer whose body breaks off is still that
+                    // error: its status is what the caller acts on.
+                    Err(_) if !status.is_success() => Vec::new(),
+                    Err(e) => return Err(ClientError::Http(e.to_string())),
+                };
+                Ok(Answer { status, body })
+            }
         }
-        if !status.is_success() {
-            let body = resp.json::<serde_json::Value>().await.ok();
-            return Err(daemon_error(status, body));
-        }
-        resp.json::<T>().await.map_err(|e| ClientError::Http(e.to_string()))
-    }
-
-    /// A connection that was refused, reset or timed out means "no daemon" —
-    /// the same answer as a missing state file. Anything else is a genuine
-    /// transport fault worth reporting as itself.
-    fn map_transport(e: reqwest::Error) -> ClientError {
-        if e.is_connect() || e.is_timeout() {
-            ClientError::NotRunning
-        } else {
-            ClientError::Http(e.to_string())
-        }
-    }
-
-    fn url(&self, path: &str) -> String {
-        format!("{}{}", self.base_url, path)
     }
 
     pub async fn health(&self) -> Result<Health, ClientError> {
-        let resp = self
-            .http
-            .get(self.url("/health"))
-            .timeout(HEALTH_TIMEOUT)
-            .send()
+        let call = Call::new(reqwest::Method::GET, "/health").without_bearer();
+        let answer = tokio::time::timeout(HEALTH_TIMEOUT, self.send(call))
             .await
-            .map_err(Self::map_transport)?;
-        Self::read_response(resp).await
+            .map_err(|_| ClientError::NotRunning)??;
+        read_response(answer)
     }
 
     /// Saves a memory and reports what the daemon did with it (see
@@ -749,15 +843,8 @@ impl DaemonClient {
             detail: Option<String>,
         }
         let keyed = args.topic_key.is_some();
-        let resp = self
-            .http
-            .post(self.url("/v1/memories"))
-            .bearer_auth(&self.token)
-            .json(&args)
-            .send()
-            .await
-            .map_err(Self::map_transport)?;
-        let body: Body = Self::read_response(resp).await?;
+        let answer = self.send(Call::new(reqwest::Method::POST, "/v1/memories").json(&args)?).await?;
+        let body: Body = read_response(answer)?;
         Ok(match body.status.as_str() {
             "saved" => SaveOutcome::Saved {
                 memories: body.memories,
@@ -776,15 +863,10 @@ impl DaemonClient {
     }
 
     pub async fn search(&self, args: SearchArgs) -> Result<Found, ClientError> {
-        let resp = self
-            .http
-            .post(self.url("/v1/search"))
-            .bearer_auth(&self.token)
-            .json(&search_request(&args))
-            .send()
-            .await
-            .map_err(Self::map_transport)?;
-        Self::read_response(resp).await
+        let answer = self
+            .send(Call::new(reqwest::Method::POST, "/v1/search").json(&search_request(&args))?)
+            .await?;
+        read_response(answer)
     }
 
     /// `budget: None` leaves the size to the daemon's default.
@@ -803,15 +885,8 @@ impl DaemonClient {
         if let Some(budget) = budget {
             body["budget"] = budget.into();
         }
-        let resp = self
-            .http
-            .post(self.url("/v1/context"))
-            .bearer_auth(&self.token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(Self::map_transport)?;
-        Self::read_response(resp).await
+        let answer = self.send(Call::new(reqwest::Method::POST, "/v1/context").json(&body)?).await?;
+        read_response(answer)
     }
 
     /// The context without a query: the workspace and the newest saves, as
@@ -822,15 +897,9 @@ impl DaemonClient {
         project_id: Option<&str>,
         budget: usize,
     ) -> Result<Context, ClientError> {
-        let resp = self
-            .http
-            .post(self.url("/v1/context"))
-            .bearer_auth(&self.token)
-            .json(&serde_json::json!({ "agent_id": agent_id, "project_id": project_id, "budget": budget }))
-            .send()
-            .await
-            .map_err(Self::map_transport)?;
-        Self::read_response(resp).await
+        let body = serde_json::json!({ "agent_id": agent_id, "project_id": project_id, "budget": budget });
+        let answer = self.send(Call::new(reqwest::Method::POST, "/v1/context").json(&body)?).await?;
+        read_response(answer)
     }
 
     /// Tells the daemon which host session `agent_id` works in for
@@ -842,35 +911,14 @@ impl DaemonClient {
         project_id: Option<&str>,
         session_id: &str,
     ) -> Result<(), ClientError> {
-        let resp = self
-            .http
-            .post(self.url("/v1/sessions"))
-            .bearer_auth(&self.token)
-            .json(&serde_json::json!({ "agent_id": agent_id, "project_id": project_id, "session_id": session_id }))
-            .send()
-            .await
-            .map_err(Self::map_transport)?;
-        let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(ClientError::Unauthorized);
-        }
-        if !status.is_success() {
-            let body = resp.json::<serde_json::Value>().await.ok();
-            return Err(daemon_error(status, body));
-        }
-        Ok(())
+        let body = serde_json::json!({ "agent_id": agent_id, "project_id": project_id, "session_id": session_id });
+        let answer = self.send(Call::new(reqwest::Method::POST, "/v1/sessions").json(&body)?).await?;
+        check_status(&answer)
     }
 
     pub async fn synthesis(&self, args: &SynthesisArgs) -> Result<Synthesis, ClientError> {
-        let resp = self
-            .http
-            .post(self.url("/v1/synthesis"))
-            .bearer_auth(&self.token)
-            .json(args)
-            .send()
-            .await
-            .map_err(Self::map_transport)?;
-        Self::read_response(resp).await
+        let answer = self.send(Call::new(reqwest::Method::POST, "/v1/synthesis").json(args)?).await?;
+        read_response(answer)
     }
 
     pub async fn search_docs(
@@ -879,15 +927,11 @@ impl DaemonClient {
         query: &str,
         limit: Option<usize>,
     ) -> Result<DocsSearchBody, ClientError> {
-        let resp = self
-            .http
-            .post(self.url("/v1/projects/docs/search"))
-            .bearer_auth(&self.token)
-            .json(&serde_json::json!({ "project_id": project_id, "query": query, "limit": limit }))
-            .send()
-            .await
-            .map_err(Self::map_transport)?;
-        Self::read_response(resp).await
+        let body = serde_json::json!({ "project_id": project_id, "query": query, "limit": limit });
+        let answer = self
+            .send(Call::new(reqwest::Method::POST, "/v1/projects/docs/search").json(&body)?)
+            .await?;
+        read_response(answer)
     }
 
     pub async fn list(&self, args: ListArgs) -> Result<Vec<MemoryRow>, ClientError> {
@@ -898,7 +942,7 @@ impl DaemonClient {
         // Built as pairs rather than a struct so an absent filter contributes
         // no query parameter at all — `?kind=` would reach the daemon as an
         // empty string and fail the kind parse.
-        let mut query: Vec<(&str, String)> = Vec::new();
+        let mut query: Vec<(&'static str, String)> = Vec::new();
         if let Some(k) = &args.kind {
             query.push(("kind", k.clone()));
         }
@@ -930,15 +974,8 @@ impl DaemonClient {
             query.push(("deleted", "true".into()));
         }
 
-        let resp = self
-            .http
-            .get(self.url("/v1/memories"))
-            .bearer_auth(&self.token)
-            .query(&query)
-            .send()
-            .await
-            .map_err(Self::map_transport)?;
-        Ok(Self::read_response::<Body>(resp).await?.items)
+        let answer = self.send(Call::new(reqwest::Method::GET, "/v1/memories").query(query)).await?;
+        Ok(read_response::<Body>(answer)?.items)
     }
 
     /// One row with every column, soft-deleted rows included (they carry
@@ -948,29 +985,15 @@ impl DaemonClient {
         struct Body {
             item: MemoryRow,
         }
-        let resp = self
-            .http
-            .get(self.url(&format!("/v1/memories/{kind}/{id}")))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(Self::map_transport)?;
-        Ok(Self::read_response::<Body>(resp).await?.item)
+        let answer = self.send(Call::new(reqwest::Method::GET, format!("/v1/memories/{kind}/{id}"))).await?;
+        Ok(read_response::<Body>(answer)?.item)
     }
 
     /// The save `id` belongs to. `agent` scopes it to that agent's rows:
     /// another agent's row is the daemon's 404, like a missing one.
     pub async fn read_save(&self, kind: &str, id: i64, agent: Option<&str>) -> Result<SavedText, ClientError> {
-        let query: Vec<(&str, &str)> = agent.map(|a| ("agent", a)).into_iter().collect();
-        let resp = self
-            .http
-            .get(self.url(&format!("/v1/memories/{kind}/{id}/save")))
-            .bearer_auth(&self.token)
-            .query(&query)
-            .send()
-            .await
-            .map_err(Self::map_transport)?;
-        Self::read_response(resp).await
+        let call = Call::new(reqwest::Method::GET, format!("/v1/memories/{kind}/{id}/save")).query(owner_query(agent));
+        read_response(self.send(call).await?)
     }
 
     /// Counts of what is stored, optionally narrowed to an agent and/or project.
@@ -979,22 +1002,14 @@ impl DaemonClient {
         agent: Option<&str>,
         project: Option<&str>,
     ) -> Result<MemoryStats, ClientError> {
-        let mut query: Vec<(&str, &str)> = Vec::new();
+        let mut query: Vec<(&'static str, &str)> = Vec::new();
         if let Some(a) = agent {
             query.push(("agent", a));
         }
         if let Some(p) = project {
             query.push(("project", p));
         }
-        let resp = self
-            .http
-            .get(self.url("/v1/stats"))
-            .bearer_auth(&self.token)
-            .query(&query)
-            .send()
-            .await
-            .map_err(Self::map_transport)?;
-        Self::read_response(resp).await
+        read_response(self.send(Call::new(reqwest::Method::GET, "/v1/stats").query(query)).await?)
     }
 
     /// Changes a row's importance, type or both; the daemon refuses an empty
@@ -1009,71 +1024,38 @@ impl DaemonClient {
         user_answered: bool,
         agent: Option<&str>,
     ) -> Result<Updated, ClientError> {
-        let resp = self
-            .http
-            .patch(self.url(&format!("/v1/memories/{kind}/{id}")))
-            .query(&owner_query(agent))
-            .bearer_auth(&self.token)
-            .json(&UpdateBody { importance, memory_type, user_answered })
-            .send()
-            .await
-            .map_err(Self::map_transport)?;
-        Self::read_response::<Updated>(resp).await
+        let call = Call::new(reqwest::Method::PATCH, format!("/v1/memories/{kind}/{id}"))
+            .query(owner_query(agent))
+            .json(&UpdateBody { importance, memory_type, user_answered })?;
+        read_response(self.send(call).await?)
     }
 
     /// `agent` scopes the delete as in [`DaemonClient::update`].
     pub async fn delete(&self, kind: &str, id: i64, agent: Option<&str>) -> Result<Deleted, ClientError> {
-        let resp = self
-            .http
-            .delete(self.url(&format!("/v1/memories/{kind}/{id}")))
-            .query(&owner_query(agent))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(Self::map_transport)?;
-        Self::read_response::<Deleted>(resp).await
+        let call = Call::new(reqwest::Method::DELETE, format!("/v1/memories/{kind}/{id}")).query(owner_query(agent));
+        read_response(self.send(call).await?)
     }
 
     /// Brings back a deleted `memory` row. `agent` scopes it as in
     /// [`DaemonClient::update`].
     pub async fn restore(&self, kind: &str, id: i64, agent: Option<&str>) -> Result<Restored, ClientError> {
-        let resp = self
-            .http
-            .post(self.url(&format!("/v1/memories/{kind}/{id}/restore")))
-            .query(&owner_query(agent))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(Self::map_transport)?;
-        Self::read_response::<Restored>(resp).await
+        let call =
+            Call::new(reqwest::Method::POST, format!("/v1/memories/{kind}/{id}/restore")).query(owner_query(agent));
+        read_response(self.send(call).await?)
     }
 
     /// Takes the failed save of `operation_id` back to pending; `agent` is
     /// needed only when another agent used the same id.
     pub async fn outbox_retry(&self, operation_id: &str, agent: Option<&str>) -> Result<OutboxRetried, ClientError> {
-        let resp = self
-            .http
-            .post(self.url("/v1/outbox/retry"))
-            .bearer_auth(&self.token)
-            .json(&serde_json::json!({ "operation_id": operation_id, "agent_id": agent }))
-            .send()
-            .await
-            .map_err(Self::map_transport)?;
-        Self::read_response(resp).await
+        let body = serde_json::json!({ "operation_id": operation_id, "agent_id": agent });
+        read_response(self.send(Call::new(reqwest::Method::POST, "/v1/outbox/retry").json(&body)?).await?)
     }
 
     /// Drops the failed save of `operation_id` and deletes the memories it
     /// had stored; `agent` as in [`DaemonClient::outbox_retry`].
     pub async fn outbox_discard(&self, operation_id: &str, agent: Option<&str>) -> Result<OutboxDiscarded, ClientError> {
-        let resp = self
-            .http
-            .post(self.url("/v1/outbox/discard"))
-            .bearer_auth(&self.token)
-            .json(&serde_json::json!({ "operation_id": operation_id, "agent_id": agent }))
-            .send()
-            .await
-            .map_err(Self::map_transport)?;
-        Self::read_response(resp).await
+        let body = serde_json::json!({ "operation_id": operation_id, "agent_id": agent });
+        read_response(self.send(Call::new(reqwest::Method::POST, "/v1/outbox/discard").json(&body)?).await?)
     }
 
     /// `agent` scopes the verdict as in [`DaemonClient::update`]. A daemon
@@ -1087,32 +1069,18 @@ impl DaemonClient {
         user_answered: bool,
         agent: Option<&str>,
     ) -> Result<Resolution, ClientError> {
-        let resp = self
-            .http
-            .post(self.url("/v1/disputes/judge"))
-            .bearer_auth(&self.token)
-            .json(&serde_json::json!({
-                "keep": keep, "other": other, "verdict": verdict, "reason": reason,
-                "user_answered": user_answered, "agent_id": agent,
-            }))
-            .send()
-            .await
-            .map_err(Self::map_transport)?;
-        Self::read_response::<Resolution>(resp).await
+        let body = serde_json::json!({
+            "keep": keep, "other": other, "verdict": verdict, "reason": reason,
+            "user_answered": user_answered, "agent_id": agent,
+        });
+        read_response(self.send(Call::new(reqwest::Method::POST, "/v1/disputes/judge").json(&body)?).await?)
     }
 
     /// The pairs `agent` has not judged yet. A daemon that predates the pair
     /// table answers a bare 404.
     pub async fn open_disputes(&self, agent: &str) -> Result<OpenPairs, ClientError> {
-        let resp = self
-            .http
-            .get(self.url("/v1/disputes"))
-            .query(&[("agent_id", agent)])
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(Self::map_transport)?;
-        Self::read_response::<OpenPairs>(resp).await
+        let call = Call::new(reqwest::Method::GET, "/v1/disputes").query([("agent_id", agent)]);
+        read_response(self.send(call).await?)
     }
 
     /// Asks the daemon for a manual snapshot and returns where it wrote it.
@@ -1121,14 +1089,8 @@ impl DaemonClient {
         struct Body {
             path: PathBuf,
         }
-        let resp = self
-            .http
-            .post(self.url("/v1/backup"))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(Self::map_transport)?;
-        Ok(Self::read_response::<Body>(resp).await?.path)
+        let answer = self.send(Call::new(reqwest::Method::POST, "/v1/backup")).await?;
+        Ok(read_response::<Body>(answer)?.path)
     }
 
     /// Imports the export `text`. `map_roots` pairs an exported root with
@@ -1140,15 +1102,8 @@ impl DaemonClient {
         agent: Option<&str>,
         map_roots: &[(String, String)],
     ) -> Result<ImportReport, ClientError> {
-        let resp = self
-            .http
-            .post(self.url("/v1/import"))
-            .bearer_auth(&self.token)
-            .json(&serde_json::json!({ "text": text, "dry_run": dry_run, "agent": agent, "map_roots": map_roots }))
-            .send()
-            .await
-            .map_err(Self::map_transport)?;
-        Self::read_response(resp).await
+        let body = serde_json::json!({ "text": text, "dry_run": dry_run, "agent": agent, "map_roots": map_roots });
+        read_response(self.send(Call::new(reqwest::Method::POST, "/v1/import").json(&body)?).await?)
     }
 
     /// Records `root` as a project and moves rows saved under `legacy_ids`
@@ -1165,31 +1120,19 @@ impl DaemonClient {
             project_id: String,
             rekeyed: usize,
         }
-        let resp = self
-            .http
-            .post(self.url("/v1/projects"))
-            .bearer_auth(&self.token)
-            .json(&serde_json::json!({
-                "root_path": root.to_string_lossy(),
-                "legacy_ids": legacy_ids,
-                "index_docs": index_docs,
-            }))
-            .send()
-            .await
-            .map_err(Self::map_transport)?;
-        let body = Self::read_response::<Body>(resp).await?;
+        let body = serde_json::json!({
+            "root_path": root.to_string_lossy(),
+            "legacy_ids": legacy_ids,
+            "index_docs": index_docs,
+        });
+        let answer = self.send(Call::new(reqwest::Method::POST, "/v1/projects").json(&body)?).await?;
+        let body = read_response::<Body>(answer)?;
         Ok((body.project_id, body.rekeyed))
     }
 
     pub async fn shutdown(&self) -> Result<(), ClientError> {
-        let resp = self
-            .http
-            .post(self.url("/v1/shutdown"))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(Self::map_transport)?;
-        let _: serde_json::Value = Self::read_response(resp).await?;
+        let answer = self.send(Call::new(reqwest::Method::POST, "/v1/shutdown")).await?;
+        let _: serde_json::Value = read_response(answer)?;
         Ok(())
     }
 }
@@ -1576,10 +1519,95 @@ pub(crate) mod tests {
     fn only_health_sets_a_timeout() {
         let source = include_str!("client.rs");
         let code = &source[..source.find("#[cfg(test)]").expect("test module")];
-        let timeouts: Vec<&str> = code.lines().filter(|l| l.contains(".timeout(")).collect();
-        assert_eq!(timeouts, ["            .timeout(HEALTH_TIMEOUT)"], "{timeouts:?}");
+        let all = code.replace("is_timeout()", "").matches("timeout(").count();
         let health = &code[code.find("pub async fn health").expect("health")..];
-        assert!(health[..health.find("\n    }").expect("end")].contains(".timeout(HEALTH_TIMEOUT)"));
+        let health = &health[..health.find("\n    }").expect("end")];
+        assert_eq!(all, 1, "a timeout outside `health` would let a repeated call reach the daemon twice");
+        assert!(health.contains("tokio::time::timeout(HEALTH_TIMEOUT, self.send(call))"), "{health}");
+    }
+
+    // ── The funnel's pure parts ─────────────────────────────────────────────
+
+    fn answer(status: u16, body: &str) -> Answer {
+        Answer { status: reqwest::StatusCode::from_u16(status).expect("status"), body: body.as_bytes().to_vec() }
+    }
+
+    #[test]
+    fn a_401_is_unauthorized_whatever_it_carries() {
+        let read = read_response::<Health>(answer(401, r#"{"error":"nope"}"#));
+        assert!(matches!(read, Err(ClientError::Unauthorized)), "{read:?}");
+    }
+
+    #[test]
+    fn an_error_keeps_the_status_and_the_message_of_its_body() {
+        let body = r#"{"error":"ingest_failed","detail":"disk full","retryable":true}"#;
+        match read_response::<Health>(answer(500, body)) {
+            Err(ClientError::Daemon { status, message, details }) => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "ingest_failed");
+                assert_eq!(details.detail.as_deref(), Some("disk full"));
+                assert_eq!(details.retryable, Some(true));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_error_without_json_is_named_by_its_status() {
+        match read_response::<Health>(answer(502, "<html>bad gateway</html>")) {
+            Err(ClientError::Daemon { status, message, details }) => {
+                assert_eq!(status, 502);
+                assert_eq!(message, "502 Bad Gateway");
+                assert_eq!(details, ErrorDetails::default());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_invalid_success_body_is_a_transport_error() {
+        match read_response::<Health>(answer(200, "not json")) {
+            Err(ClientError::Http(message)) => assert_eq!(message, "error decoding response body"),
+            other => panic!("{other:?}"),
+        }
+        let count: serde_json::Value = read_response(answer(200, r#"{"n":1}"#)).expect("valid");
+        assert_eq!(count["n"], 1);
+    }
+
+    #[test]
+    fn a_status_check_ignores_the_body_of_a_success() {
+        assert!(check_status(&answer(201, "")).is_ok());
+        assert!(matches!(check_status(&answer(401, "")), Err(ClientError::Unauthorized)));
+        assert!(matches!(check_status(&answer(404, "")), Err(ClientError::Daemon { status: 404, .. })));
+    }
+
+    #[test]
+    fn a_call_url_encodes_its_query_as_reqwest_does() {
+        let base = "http://127.0.0.1:27381";
+        let client = reqwest::Client::new();
+        let sets: [Vec<(&'static str, String)>; 4] = [
+            vec![],
+            vec![("agent", "a b".to_string())],
+            vec![("q", "x&y=z/é?#+".to_string()), ("limit", "5".to_string())],
+            vec![("deleted", "true".to_string()), ("project", "C:\\src\\p".to_string())],
+        ];
+        for pairs in sets {
+            let call = Call::new(reqwest::Method::GET, "/v1/memories").query(pairs.clone());
+            let expected = client.get(format!("{base}/v1/memories")).query(&pairs).build().expect("request");
+            assert_eq!(call_url(base, &call).expect("url"), *expected.url(), "{pairs:?}");
+        }
+        let bare = call_url(base, &Call::new(reqwest::Method::GET, "/health")).expect("url");
+        assert_eq!(bare.as_str(), "http://127.0.0.1:27381/health", "no `?` without pairs");
+    }
+
+    #[test]
+    fn a_connection_or_a_timeout_means_no_daemon_and_anything_else_is_a_fault() {
+        assert!(matches!(classify_transport(true, false, "refused".into()), ClientError::NotRunning));
+        assert!(matches!(classify_transport(false, true, "slow".into()), ClientError::NotRunning));
+        match classify_transport(false, false, "reset by peer".into()) {
+            ClientError::Http(message) => assert_eq!(message, "reset by peer"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[tokio::test]
