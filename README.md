@@ -233,13 +233,13 @@ clawg --version
 
 Imprime `clawg` y la versión instalada. Si dice que no reconoce el comando, no abriste una terminal nueva o el PATH no se actualizó.
 
-**2. El diagnóstico del PATH**
+**2. El diagnóstico**
 
 ```powershell
 clawg doctor
 ```
 
-Muestra en JSON qué archivos `clawg.exe` encuentra tu PATH. Termina con código `0` si el primero es el que acabás de instalar y no hay copias duplicadas, y con código `1` si hay otra copia que lo tapa. No abre la base de datos, así que se puede correr cuando quieras.
+Muestra en JSON qué archivos `clawg.exe` encuentra tu PATH y, en `checks`, cada cosa que revisó del directorio de datos y de la base: la versión del esquema, el modelo con que se calcularon los vectores, la edad del último backup, los saves que fallaron, las reglas del estado de las memorias y el registro en Claude Code. Cada hallazgo dice su gravedad (`ok`, `info`, `warn`, `error`), la evidencia (ids, conteos y rutas, nunca el texto de una memoria) y, si lo hay, el comando que lo resuelve. Termina con código `1` sólo si hay un `error` (por ejemplo, otra copia que tapa la que acabás de instalar) y con `0` en otro caso. Lee la base sin escribir nada ni tomar el lock, así que se puede correr cuando quieras, con el daemon corriendo o no.
 
 **3. El estado del daemon**
 
@@ -438,7 +438,7 @@ El puente busca solo al daemon nuevo en cuanto vuelve a arrancar, pero no lo arr
 Las versiones anteriores calculaban los vectores de las memorias de una forma que las dejaba casi todas igual de parecidas a cualquier pregunta. La primera vez que arranca esta versión guarda una copia en `~/.clawg/backups` (`…-pre-reembed.db`) y vuelve a calcular el vector de cada memoria; hasta que termina, la búsqueda por sentido no está disponible.
 
 **`clawg doctor` termina con código 1.**
-Hay otro `clawg.exe` en el PATH que gana, o una copia duplicada. El JSON que imprime dice cuál.
+Algún hallazgo es `error`: otro `clawg.exe` en el PATH que gana o una copia duplicada, una base de una versión más nueva, vectores de otro modelo o un registro de Claude Code a un binario que ya no existe. El JSON que imprime dice cuál, con su evidencia y, en `safe_next_step`, el comando que lo resuelve.
 
 ## Desinstalar
 
@@ -470,7 +470,7 @@ clawg serve --profile dev     # el daemon de memoria
 clawg mcp --profile dev       # puente MCP por stdio; arranca un daemon si no hay ninguno
 clawg status --profile dev    # estado y salud del daemon en JSON (sale con 1 si no está corriendo)
 clawg stop --profile dev      # detiene el daemon
-clawg doctor                  # a qué clawg resuelve el PATH (sale con 1 si hay uno que tapa o está duplicado)
+clawg doctor                  # qué está mal en el PATH, los datos y la base, en JSON (sale con 1 sólo si hay un error)
 clawg update --check          # dice si hay un release nuevo (100 si lo hay); clawg update lo instala
 clawg memories list|search|show|stats   # visor de sólo lectura (list --deleted: las borradas)
 clawg undelete 12 --profile dev         # devuelve una memoria borrada (con el daemon corriendo)

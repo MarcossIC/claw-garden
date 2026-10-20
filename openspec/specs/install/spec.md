@@ -141,7 +141,7 @@ La CI MUST correr en cada pull request y en cada push a `main` que cambie algún
 
 El job no descarga el modelo: la suite usa `fake`. La CI es el único disparador de `release.yml`: un release MUST NOT publicarse sin una CI exitosa por push a `main`, y la CI MUST NOT leer secretos, usar un `environment`, pedir `id-token` ni escribir contenidos. Sólo `ci.yml` MUST llamarse `CI`: `release.yml` espera un workflow con ese nombre.
 
-La suite MUST pasar en Linux y en Windows. Para eso, las fixtures de los tests de `doctor` arman sus rutas bajo la raíz de la plataforma, `C:\` o `/` (`dir`, `crates/clawg-cli/src/doctor.rs:135`), y el caso de las grafías de Windows (mayúsculas, barras y `\\?\`) corre sólo en Windows (`windows_spellings_of_one_file_are_the_same_install`, `doctor.rs:219`).
+La suite MUST pasar en Linux y en Windows. Para eso, las fixtures de los tests de `doctor` arman sus rutas bajo la raíz de la plataforma, `C:\` o `/` (`dir`, `crates/clawg-cli/src/doctor/mod.rs:256`), y el caso de las grafías de Windows (mayúsculas, barras y `\\?\`) corre sólo en Windows (`windows_spellings_of_one_file_are_the_same_install`, `doctor/mod.rs:340`).
 
 #### Escenario: bump de versión
 - GIVEN un push a `main` cuyo commit cambia `Cargo.toml` y `Cargo.lock`

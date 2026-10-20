@@ -41,11 +41,11 @@ Ni `evidence` ni `message` ni `safe_next_step` MUST contener el texto de una fil
 - WHEN corre `clawg doctor`
 - THEN hay un hallazgo `backup.age` `warn` y sale 0
 
-**Tests:** `the_exit_code_fails_only_on_an_error` (`doctor`); `doctor_reads_a_running_daemons_store_without_changing_it` (`binary.rs`).
+**Tests:** `the_exit_code_fails_only_on_an_error`, `path_findings` (`doctor`); `doctor_reads_a_running_daemons_store_without_changing_it` y `doctor_prints_no_row_content`, que salen 0 con avisos (`binary.rs`).
 
 ## R3. Se lee el store sin lock y sin escribir
 
-`clawg doctor` MUST leer `memory.db` sin tomar el lock del store y sin escribir: ni el archivo ni su WAL MUST cambiar de contenido, con el daemon vivo o parado, y sin `-wal` ni `-shm` nuevos junto a un store parado. Sin `memory.db` MUST dar `store.schema` `info` `missing` y no correr los chequeos que leen filas.
+`clawg doctor` MUST leer `memory.db` sin tomar el lock del store y sin escribir (sólo `store.owner` lo prueba un instante, cuando `memory.owner` nombra un titular, como hace `clawg status`): ni el archivo ni su WAL MUST cambiar de contenido, con el daemon vivo o parado, y sin `-wal` ni `-shm` nuevos junto a un store parado. Sin `memory.db` MUST dar `store.schema` `info` `missing` y no correr los chequeos que leen filas.
 
 El esquema se compara con el del binario como en `clawg status`:
 
@@ -72,11 +72,11 @@ Un store más nuevo, divergente, ilegible o sin migraciones MUST NOT leerse más
 - WHEN se inspecciona
 - THEN `store.schema` es `pending`, los chequeos que necesitan V11 o posteriores no aportan nada y el archivo no cambia
 
-**Tests:** `inspecting_leaves_the_store_unchanged`, `a_store_at_an_older_schema_is_read_with_what_it_has`, `a_newer_store_is_not_read_past_its_history` (`crates/clawg-core/src/memory/inspect.rs`); `schema_findings_follow_the_plan` (`doctor`); `doctor_reads_a_running_daemons_store_without_changing_it` (`binary.rs`).
+**Tests:** `inspecting_leaves_the_store_unchanged`, `a_store_at_an_older_schema_is_read_with_what_it_has`, `a_newer_store_is_not_read_past_its_history`, `a_missing_store_has_no_facts` (`crates/clawg-core/src/memory/inspect.rs`); `schema_findings_follow_the_plan`, `owner_findings` (`doctor`); `doctor_reads_a_running_daemons_store_without_changing_it` (`binary.rs`).
 
 ## R4. Contrato de embedding sin cargar el modelo
 
-`store.contract` MUST comparar la fila de `embedding_contract` con la identidad del embedder de este binario (`E5_MODEL_ID`, dimensión 384 y sus dos prefijos) sin cargar el modelo:
+`store.contract` MUST comparar la fila de `embedding_contract` con el contrato que `clawg serve` verificaría (`bootstrap::serving_contract`), sin cargar el modelo: el del embedder de producción (`E5_MODEL_ID`, dimensión 384 y sus dos prefijos), o en un build `testing` el del modelo falso cuando `CLAWG_TEST_EMBEDDER` lo nombra, como el daemon de ese build:
 
 | Estado | Severidad | `reason_code` |
 |---|---|---|
@@ -85,7 +85,7 @@ Un store más nuevo, divergente, ilegible o sin migraciones MUST NOT leerse más
 | la misma red con pooling CLS (`is_pooling_upgrade`) | `info` | `pooling_upgrade`; el arranque re-embebe con un snapshot `pre-reembed` |
 | cualquier otra diferencia | `error` | `mismatch`; la evidencia nombra lo guardado y lo esperado |
 
-**Tests:** `contract_findings` (`doctor`).
+**Tests:** `contract_findings` (`doctor`); `the_expected_contract_is_what_the_embedder_records` (`embedder.rs`); el contrato `ok` del modelo falso en `doctor_reads_a_running_daemons_store_without_changing_it` (`binary.rs`).
 
 ## R5. Archivos del directorio de datos
 
@@ -143,7 +143,7 @@ Un vínculo de `memory_piece` hacia una fila que no existe sin `context` no es u
 
 Con filas `pending` y un daemon vivo no hay hallazgo: las está ingiriendo.
 
-**Tests:** `outbox_findings`, `agent_findings`, `project_findings` (`doctor`).
+**Tests:** `the_facts_name_agents_projects_the_outbox_and_the_contract` (`inspect.rs`); `outbox_findings`, `agent_findings`, `project_findings`, `shell_words_are_quoted_only_when_a_shell_would_read_them` (`doctor`).
 
 ## R8. El registro MCP de Claude Code
 

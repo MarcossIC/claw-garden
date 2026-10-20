@@ -4,24 +4,25 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 
 ## 1. Hechos del store (R3, R4, R6, D1)
 
-- [ ] Tests primero en `inspect.rs`: el store no cambia, esquema anterior, esquema más nuevo, base sana y cada invariante; `snapshot_times_come_from_their_names` en `backup.rs`.
-- [ ] `memory::inspect`, `backup::parse_snapshot_time` y `embedder::expected_contract`.
+- [x] Tests en `inspect.rs`: el store no cambia, esquema anterior, esquema más nuevo, base sana y cada invariante; `snapshot_times_come_from_their_names` en `backup.rs`; `the_expected_contract_is_what_the_embedder_records` en `embedder.rs`. Se escribieron junto con el código, en el mismo commit, y no se vieron fallar antes.
+- [x] `memory::inspect`, `backup::parse_snapshot_time` y `embedder::expected_contract`.
 - Commit: `feat(core): read the facts doctor checks without the lock`
 
 ## 2. El sobre y los chequeos (R1, R2, R4, R5, R6, R7, R8, D2–D4)
 
-- [ ] Tests primero en `doctor`: sobre, resumen, código de salida y cada chequeo sano y roto.
-- [ ] `doctor/` como módulo: `Finding`, los chequeos puros, `mcp`, la lectura en `run`, y el código de salida en `main.rs`.
+- [x] Tests en `doctor`: sobre, resumen, código de salida y cada chequeo sano y roto (escritos con el código, como en la tarea 1).
+- [x] `doctor/` como módulo: `Finding`, los chequeos puros, `mcp`, la lectura en `run`, y el código de salida en `main.rs`.
 - Commit: `feat(cli): doctor reports what is wrong with the data directory and the store`
 
 ## 3. El binario (R1, R2, R3)
 
-- [ ] Tests en `binary.rs`: `doctor` con el daemon vivo no cambia el store y sale 0; no imprime contenido de filas.
-- Commit: `test(cli): run doctor against a live daemon's store`
+- [x] Tests en `binary.rs`: `doctor` con el daemon vivo lee el store y sale 0, y con el daemon parado no cambia ningún archivo; no imprime contenido de filas. El primero falló primero: con el modelo falso el contrato salía `mismatch`, porque `doctor` comparaba con el de producción y no con el que verifica el daemon de ese build.
+- [x] `bootstrap::serving_contract`, el contrato que verifica `clawg serve`, y `doctor` compara con él.
+- Commit: `feat(cli): doctor checks the contract the daemon verifies and reads a live store`
 
 ## 4. Docs
 
-- [ ] `.claude/CLAUDE.md` y estas tareas.
+- [x] `.claude/CLAUDE.md`, `.gemini/GEMINI.md`, `README.md`, la cita de `doctor` en `specs/install` y estas tareas.
 - Commit: `docs: say what doctor checks`
 
 ## 5. Verificación
