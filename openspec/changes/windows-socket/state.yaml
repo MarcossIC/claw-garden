@@ -4,7 +4,7 @@ depends_on: [local-transport]
 phase: propose
 artifacts:
   exploration: done
-  proposal: pending
+  proposal: done
   spec: pending
   design: pending
   tasks: pending
