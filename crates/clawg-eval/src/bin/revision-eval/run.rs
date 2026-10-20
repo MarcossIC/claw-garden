@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use clawg_cli::client::{ClientError, DaemonClient, ListArgs, MemoryRow};
+use clawg_cli::client::{ClientError, DaemonClient, ListArgs, MemoryRow, SearchArgs};
 use clawg_cli::daemon::api::{serve_ephemeral, AppCtx, SAVE_CONFIRM_TIMEOUT};
+use clawg_cli::mcp::tools::{format_context, format_search};
 use clawg_core::eval_api::{
     conflict_pairs, is_claim_type, row_distances, EvalEmbedder, EvalError, EvalIngest, EvalSave, EvalSaved,
 };
@@ -21,8 +22,8 @@ use clawg_core::runtime::MemoryRuntime;
 use serde::Serialize;
 
 use crate::chains::{
-    arm_saves, classify, compared_rows, is_live, m1, observe, own_rows, requirement_sentences, Arm, Band, Transition,
-    M1,
+    arm_saves, classify, compared_rows, context_ids, is_live, m1, m2, observe, own_rows, positions,
+    requirement_sentences, search_ids, Arm, Band, ChainView, Outcome, Shown, Transition, M1, M2,
 };
 use crate::set::ChainSet;
 
@@ -97,14 +98,18 @@ pub fn read_distractors(dir: &Path) -> std::io::Result<Vec<String>> {
     Ok(sentences)
 }
 
-/// What one arm stored and what the router lists of it.
+/// What one arm stored and what the router lists and shows of it.
 struct ArmRun<'a> {
     /// The report of each version's save, by chain and version; `None` for a
     /// version the arm does not save.
     saved: Vec<Vec<Option<EvalSaved>>>,
+    /// The same, as each version's own rows ([`own_rows`]).
+    own: Vec<Vec<Option<Vec<i64>>>>,
     /// Every row of the agent, by id, `superseded` ones included.
     listed: HashMap<i64, MemoryRow>,
-    /// Only the no-key arm's: the class of each of its transitions.
+    /// Per chain, where each version shows for the chain's query.
+    shown: Vec<Shown>,
+    /// Only the no-key arm's: what each of its transitions left.
     transitions: Vec<Transition<'a>>,
 }
 
@@ -133,6 +138,9 @@ pub struct ChainsReport {
     pub distractors: usize,
     pub arms: BTreeMap<&'static str, ArmReport>,
     pub m1: M1,
+    pub m2: M2,
+    /// By arm and chain id, where each version shows for the chain's query.
+    pub positions: BTreeMap<&'static str, BTreeMap<String, Shown>>,
 }
 
 /// Runs every arm inside `scratch`, then removes it.
@@ -147,15 +155,28 @@ pub async fn run(input: &ChainsInput<'_>, scratch: &Path) -> Result<ChainsReport
 }
 
 async fn measure(input: &ChainsInput<'_>, scratch: &Path) -> Result<ChainsReport, RunError> {
-    let mut arms = BTreeMap::new();
-    let mut transitions = Vec::new();
+    let mut runs = Vec::new();
     for arm in Arm::ALL {
-        let run = run_arm(input, arm, &scratch.join(arm.as_str())).await?;
-        arms.insert(arm.as_str(), arm_report(&run));
-        if arm == Arm::NoKey {
-            transitions = run.transitions;
-        }
+        runs.push((arm, run_arm(input, arm, &scratch.join(arm.as_str())).await?));
     }
+    let run_of = |arm: Arm| runs.iter().find(|(a, _)| *a == arm).map(|(_, run)| run).expect("every arm ran");
+    let views = |run: &ArmRun<'_>| -> Vec<ChainView<'_>> {
+        input
+            .set
+            .chains
+            .iter()
+            .zip(live_versions(run))
+            .zip(&run.shown)
+            .map(|((chain, live_versions), shown)| ChainView { chain, live_versions, shown: shown.clone() })
+            .collect()
+    };
+    let positions = runs
+        .iter()
+        .map(|(arm, run)| {
+            let by_chain = input.set.chains.iter().zip(&run.shown).map(|(c, s)| (c.id.clone(), s.clone())).collect();
+            (arm.as_str(), by_chain)
+        })
+        .collect();
     Ok(ChainsReport {
         model: input.embedder.model_id().to_string(),
         set_version: input.set.version,
@@ -163,14 +184,16 @@ async fn measure(input: &ChainsInput<'_>, scratch: &Path) -> Result<ChainsReport
         chains: input.set.chains.len(),
         transitions: input.set.transitions(),
         distractors: input.distractors.len(),
-        arms,
-        m1: m1(&transitions),
+        arms: runs.iter().map(|(arm, run)| (arm.as_str(), arm_report(run))).collect(),
+        m1: m1(&run_of(Arm::NoKey).transitions),
+        m2: m2(&views(run_of(Arm::Keyed)), &views(run_of(Arm::Control))),
+        positions,
     })
 }
 
 /// Saves the distractors and then the arm's versions into a store of its own
-/// in `dir`, reads the no-key arm's transitions, and lists every row through
-/// the router.
+/// in `dir`, classifies the no-key arm's transitions, and reads through the
+/// router every row and where each version shows for its chain's query.
 async fn run_arm<'a>(input: &ChainsInput<'a>, arm: Arm, dir: &Path) -> Result<ArmRun<'a>, RunError> {
     std::fs::create_dir_all(dir).map_err(|source| RunError::Scratch { path: dir.to_path_buf(), source })?;
     let ingest = EvalIngest::open(dir, input.embedder, input.tokenizer_dir).await?;
@@ -183,16 +206,62 @@ async fn run_arm<'a>(input: &ChainsInput<'a>, arm: Arm, dir: &Path) -> Result<Ar
         let report = ingest.save(save(content, &planned.chain.memory_type, planned.topic_key)).await?;
         saved[planned.index][planned.version] = Some(report);
     }
+    let own: Vec<Vec<Option<Vec<i64>>>> = saved
+        .iter()
+        .map(|versions| own_rows(&versions.iter().map(|s| s.as_ref().map(row_ids)).collect::<Vec<_>>()))
+        .collect();
     let runtime = ingest.finish().await?;
-    let transitions =
-        if arm == Arm::NoKey { read_transitions(&runtime, input.set, &saved).await? } else { Vec::new() };
+    let outcomes = if arm == Arm::NoKey { read_outcomes(&runtime, input.set, &saved).await? } else { Vec::new() };
 
     let session = serve(runtime).await?;
-    let listed = list_rows(&session.client).await;
+    let read = read_router(&session.client, input.set, &own).await;
     let released = release(session).await;
-    let listed = listed?;
+    let (listed, shown) = read?;
     released?;
-    Ok(ArmRun { saved, listed, transitions })
+
+    let transitions = outcomes
+        .into_iter()
+        .map(|(index, to, outcome)| Transition {
+            chain: &input.set.chains[index],
+            to,
+            outcome,
+            above: shown[index].above_at(to),
+        })
+        .collect();
+    Ok(ArmRun { saved, own, listed, shown, transitions })
+}
+
+/// Per chain, the versions with a row of their own the router lists live.
+fn live_versions(run: &ArmRun<'_>) -> Vec<usize> {
+    let live = |id: &i64| run.listed.get(id).is_some_and(|row| is_live(&row.status));
+    run.own.iter().map(|versions| versions.iter().flatten().filter(|rows| rows.iter().any(live)).count()).collect()
+}
+
+/// Every row of the agent, and where each version of each chain shows when
+/// its query goes through `search_memory` and `recall_context` as the bridge
+/// renders them.
+async fn read_router(
+    client: &DaemonClient,
+    set: &ChainSet,
+    own: &[Vec<Option<Vec<i64>>>],
+) -> Result<(HashMap<i64, MemoryRow>, Vec<Shown>), RunError> {
+    let listed = list_rows(client).await?;
+    let mut shown = Vec::with_capacity(set.chains.len());
+    for (chain, own) in set.chains.iter().zip(own) {
+        let found = client
+            .search(SearchArgs {
+                query: chain.query.clone(),
+                agent_id: AGENT.to_string(),
+                project_id: Some(PROJECT.to_string()),
+                limit: None,
+            })
+            .await?;
+        let search = format_search(found, AGENT, Some(PROJECT));
+        let prompt = client.context(&chain.query, AGENT, Some(PROJECT), None).await?.prompt;
+        let context = format_context(&prompt);
+        shown.push(Shown { search: positions(own, &search_ids(&search)), context: positions(own, &context_ids(&context)) });
+    }
+    Ok((listed, shown))
 }
 
 fn save<'a>(content: &'a str, memory_type: &'a str, topic_key: Option<&'a str>) -> EvalSave<'a> {
@@ -204,15 +273,15 @@ fn row_ids(saved: &EvalSaved) -> Vec<i64> {
 }
 
 /// The class of every transition of the no-key arm, from the pairs and the
-/// distances its store holds.
-async fn read_transitions<'a>(
+/// distances its store holds, as `(chain index, newer version, class)`.
+async fn read_outcomes(
     runtime: &MemoryRuntime,
-    set: &'a ChainSet,
+    set: &ChainSet,
     saved: &[Vec<Option<EvalSaved>>],
-) -> Result<Vec<Transition<'a>>, RunError> {
+) -> Result<Vec<(usize, usize, Outcome)>, RunError> {
     let pairs = conflict_pairs(runtime).await?;
-    let mut transitions = Vec::new();
-    for (chain, versions) in set.chains.iter().zip(saved) {
+    let mut outcomes = Vec::new();
+    for (index, (chain, versions)) in set.chains.iter().zip(saved).enumerate() {
         for to in 1..versions.len() {
             let (Some(newer), Some(older)) = (&versions[to], &versions[to - 1]) else {
                 continue;
@@ -223,28 +292,20 @@ async fn read_transitions<'a>(
             // A pair with any row of the older save is one the store keeps
             // between the two saves, a row both hold included.
             let observed = observe(&pairs, &probes, &older, is_claim_type(&chain.memory_type), distances);
-            transitions.push(Transition { chain, to, outcome: classify(&observed, Band::detector()) });
+            outcomes.push((index, to, classify(&observed, Band::detector())));
         }
     }
-    Ok(transitions)
+    Ok(outcomes)
 }
 
 fn arm_report(run: &ArmRun<'_>) -> ArmReport {
-    let live = |id: &i64| run.listed.get(id).is_some_and(|row| is_live(&row.status));
-    let live_per_chain: Vec<usize> = run
-        .saved
-        .iter()
-        .map(|versions| {
-            let rows: Vec<Option<Vec<i64>>> = versions.iter().map(|s| s.as_ref().map(row_ids)).collect();
-            own_rows(&rows).iter().flatten().filter(|own| own.iter().any(live)).count()
-        })
-        .collect();
     let rows: HashSet<i64> = run.saved.iter().flatten().flatten().flat_map(row_ids).collect();
+    let live = live_versions(run);
     ArmReport {
         saves: run.saved.iter().map(|versions| versions.iter().flatten().count()).sum(),
         rows: rows.len(),
-        live_versions: live_per_chain.iter().sum(),
-        chains_with_one_live_version: live_per_chain.iter().filter(|&&n| n == 1).count(),
+        live_versions: live.iter().sum(),
+        chains_with_one_live_version: live.iter().filter(|&&n| n == 1).count(),
     }
 }
 
@@ -345,13 +406,14 @@ mod tests {
 
     /// A long decision of three versions that differ only at the end, so they
     /// share their first pieces as the long chains of the set do, and a short
-    /// preference of two.
+    /// preference of two. The decision's query names an identifier its
+    /// opening holds, which the search shows even on the fake embedder.
     fn tiny_set() -> ChainSet {
         let opening: String = (1..=120).map(|i| format!(" Order batch {i} is kept on the primary.")).collect();
-        let long = |end: &str| format!("Primary store of the orders service.{opening} {end}");
+        let long = |end: &str| format!("Primary store of orders_service.{opening} {end}");
         let chains: Vec<Chain> = serde_json::from_value(json!([
             {"id": "a", "lang": "en", "memory_type": "architectural_decision", "topic_key": "storage/orders",
-             "query": "Which database does the orders service use?",
+             "query": "Which database does orders_service use?",
              "versions": [
                 {"content": long("The engine is PostgreSQL 15."), "value": "PostgreSQL 15"},
                 {"content": long("The engine is PostgreSQL 16."), "value": "PostgreSQL 16", "change": "value"},
@@ -429,6 +491,19 @@ mod tests {
         assert_eq!(m1.transitions, 3);
         assert_eq!(m1.escalated.k + m1.pending.k + m1.no_mark.k, 3);
         assert_eq!(m1.no_mark_reasons.below_floor.k, 0, "a row two versions share is never compared with itself");
+
+        for arm in ["no_key", "keyed", "control"] {
+            for chain in &set.chains {
+                let shown = &report.positions[arm][&chain.id];
+                assert_eq!((shown.search.len(), shown.context.len()), (chain.versions.len(), chain.versions.len()));
+            }
+        }
+        for arm in ["keyed", "control"] {
+            let shown = &report.positions[arm]["a"];
+            assert!(shown.search[2].is_some() && shown.context[2].is_some(), "{arm}: the last version shows: {shown:?}");
+            assert_eq!((shown.search[..2].to_vec(), shown.context[..2].to_vec()), (vec![None, None], vec![None, None]));
+        }
+        assert!(report.m2.one_live_version.met && report.m2.no_old_version_shown.met, "{:?}", report.m2);
     }
 
     #[tokio::test]
