@@ -5,7 +5,9 @@
 //! lock between two daemons, the files a bridge reads to find its daemon, and
 //! MCP over a real stdin and stdout. Each test here gets its own home through
 //! `CLAWG_TEST_HOME` and the fake model through `CLAWG_TEST_EMBEDDER`, which
-//! only a `testing` build (this one) reads. Every daemon binds `--port 0`.
+//! only a `testing` build (this one) reads. Every daemon the tests start binds
+//! `--port 0`, and one started without `--port` (by a bridge, by `update`)
+//! keeps to its socket on Unix (`CLAWG_TEST_DEFAULT_PORT=off`).
 //!
 //! Children are ended through their own handle when their guard drops, also
 //! when a test panics, and never by name: a `clawg` the user's editor runs
@@ -65,9 +67,11 @@ impl Sandbox {
             .env("CLAWG_TEST_HOME", &self.home)
             .env("CLAWG_TEST_EMBEDDER", "fake")
             .env_remove("CLAWG_PROFILE")
+            .env_remove("CLAWG_TEST_DEFAULT_PORT")
             .env("RUST_LOG", "info")
             .current_dir(&self.home)
-            .stdin(Stdio::null());
+            .stdin(Stdio::null())
+            .envs(socket_only());
         cmd
     }
 
@@ -131,6 +135,17 @@ impl Sandbox {
     }
 }
 
+/// What keeps a daemon started without `--port` (by a bridge, by `update`)
+/// to its socket instead of the profile's port on this machine. Windows has no
+/// socket, and the tests there pass a port.
+fn socket_only() -> Vec<(&'static str, &'static str)> {
+    if cfg!(unix) {
+        vec![("CLAWG_TEST_DEFAULT_PORT", "off")]
+    } else {
+        Vec::new()
+    }
+}
+
 fn now_ns() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -154,7 +169,7 @@ struct Daemon {
     child: Arc<Mutex<Child>>,
     pid: u32,
     log: PathBuf,
-    port: u16,
+    base: String,
     token: String,
     http: reqwest::Client,
 }
@@ -173,7 +188,7 @@ impl Daemon {
                 std::thread::sleep(Duration::from_millis(50));
             }
         });
-        Self { child, pid, log, port: 0, token: String::new(), http: reqwest::Client::new() }
+        Self { child, pid, log, base: String::new(), token: String::new(), http: reqwest::Client::new() }
     }
 
     fn exit_status(&self) -> Option<ExitStatus> {
@@ -191,11 +206,10 @@ impl Daemon {
             if let Some(status) = self.exit_status() {
                 panic!("clawg serve exited with {status} before answering:\n{}", self.log_text());
             }
-            if let Some((port, token)) = published(data_dir, self.pid) {
-                let health = self.http.get(format!("http://127.0.0.1:{port}/health")).send().await;
+            if let Some((reach, token)) = published(data_dir, self.pid) {
+                let health = reach.http.get(format!("{}/health", reach.base)).send().await;
                 if health.is_ok_and(|r| r.status().is_success()) {
-                    self.port = port;
-                    self.token = token;
+                    (self.http, self.base, self.token) = (reach.http, reach.base, token);
                     return self;
                 }
             }
@@ -205,7 +219,7 @@ impl Daemon {
     }
 
     fn url(&self, path: &str) -> String {
-        format!("http://127.0.0.1:{}{path}", self.port)
+        format!("{}{path}", self.base)
     }
 
     async fn health(&self) -> Value {
@@ -293,16 +307,38 @@ impl Drop for Daemon {
     }
 }
 
-/// Port and token, once `daemon.json` names `pid`.
-fn published(data_dir: &Path, pid: u32) -> Option<(u16, String)> {
-    let state: Value =
-        serde_json::from_str(&std::fs::read_to_string(data_dir.join("daemon.json")).ok()?).ok()?;
+/// How a client reaches the daemon a `daemon.json` describes, as clawg's own
+/// client does: by its socket when it published one, else by its port.
+struct Reach {
+    http: reqwest::Client,
+    base: String,
+}
+
+fn reach(data_dir: &Path, state: &Value) -> Option<Reach> {
+    #[cfg(unix)]
+    if state["unix_socket"] == true {
+        let http = reqwest::Client::builder().no_proxy().unix_socket(data_dir.join("clawg.sock")).build().ok()?;
+        return Some(Reach { http, base: "http://localhost".to_string() });
+    }
+    #[cfg(not(unix))]
+    let _ = data_dir;
+    let port = state["port"].as_u64()?;
+    Some(Reach { http: reqwest::Client::builder().no_proxy().build().ok()?, base: format!("http://127.0.0.1:{port}") })
+}
+
+/// `daemon.json` as JSON, if it is there.
+fn state_of(data_dir: &Path) -> Option<Value> {
+    serde_json::from_str(&std::fs::read_to_string(data_dir.join("daemon.json")).ok()?).ok()
+}
+
+/// The way in and the token, once `daemon.json` names `pid`.
+fn published(data_dir: &Path, pid: u32) -> Option<(Reach, String)> {
+    let state = state_of(data_dir)?;
     if state["pid"].as_u64() != Some(u64::from(pid)) {
         return None;
     }
-    let port = u16::try_from(state["port"].as_u64()?).ok()?;
     let token = std::fs::read_to_string(data_dir.join("token")).ok()?;
-    Some((port, token.trim().to_string()))
+    Some((reach(data_dir, &state)?, token.trim().to_string()))
 }
 
 /// A `clawg mcp` child with the test as its host.
@@ -891,6 +927,7 @@ fn run_binary(sandbox: &Sandbox, bin: &Path, args: &[&str]) -> Output {
         .args(args)
         .env("CLAWG_TEST_HOME", &sandbox.home)
         .env_remove("CLAWG_PROFILE")
+        .envs(socket_only())
         .current_dir(&sandbox.home)
         .stdin(Stdio::null())
         .output_copy()
@@ -1002,6 +1039,7 @@ fn update(sandbox: &Sandbox, bin: &Path, server: &str, args: &[&str]) -> Output 
         .env("CLAWG_TEST_HOME", &sandbox.home)
         .env("CLAWG_TEST_RELEASE_URL", server)
         .env_remove("CLAWG_PROFILE")
+        .envs(socket_only())
         .current_dir(&sandbox.home)
         .stdin(Stdio::null())
         .output_copy()
@@ -1118,6 +1156,7 @@ fn update_from(sandbox: &Sandbox, installed: &Path, server: &str, public: &str) 
         .env("CLAWG_TEST_RELEASE_URL", server)
         .env("CLAWG_TEST_RELEASE_KEYS", json!([public]).to_string())
         .env_remove("CLAWG_PROFILE")
+        .envs(socket_only())
         .current_dir(&sandbox.home)
         .stdin(Stdio::null())
         .output_copy()
@@ -1143,11 +1182,11 @@ impl Drop for StopOnDrop {
 
 /// `/health` of the daemon the data directory names.
 async fn published_health(data_dir: &Path) -> Value {
-    let state: Value =
-        serde_json::from_str(&std::fs::read_to_string(data_dir.join("daemon.json")).expect("daemon.json"))
-            .expect("daemon.json is JSON");
-    let port = state["port"].as_u64().expect("port");
-    reqwest::get(format!("http://127.0.0.1:{port}/health"))
+    let reach = reach(data_dir, &state_of(data_dir).expect("daemon.json")).expect("a way in");
+    reach
+        .http
+        .get(format!("{}/health", reach.base))
+        .send()
         .await
         .expect("health")
         .json()
@@ -1177,12 +1216,11 @@ fn last_migration() -> i32 {
 
 /// What the daemon the data directory names answers to `method` on `path`.
 async fn published_send(data_dir: &Path, method: reqwest::Method, path: &str) -> String {
-    let state: Value =
-        serde_json::from_str(&std::fs::read_to_string(data_dir.join("daemon.json")).expect("daemon.json"))
-            .expect("daemon.json is JSON");
+    let reach = reach(data_dir, &state_of(data_dir).expect("daemon.json")).expect("a way in");
     let token = std::fs::read_to_string(data_dir.join("token")).expect("token");
-    let response = reqwest::Client::new()
-        .request(method, format!("http://127.0.0.1:{}{path}", state["port"]))
+    let response = reach
+        .http
+        .request(method, format!("{}{path}", reach.base))
         .bearer_auth(token.trim())
         .send()
         .await
@@ -1548,6 +1586,7 @@ async fn a_stale_daemon_is_brought_back_by_the_installed_binary_when_the_new_one
         .env("CLAWG_TEST_RELEASE_URL", &server.base)
         .env("CLAWG_TEST_RELEASE_KEYS", json!([release.public]).to_string())
         .env_remove("CLAWG_PROFILE")
+        .envs(socket_only())
         .current_dir(&sandbox.home)
         .stdin(Stdio::null())
         .stdout(File::create(&out_log).expect("log file"))

@@ -130,9 +130,7 @@ async fn running_daemon(base_dir: &Path) -> Result<Option<Running>, UpdateError>
     match probe_running(base_dir, false).await {
         Ok(Probe::Running(daemon)) => {
             let health = daemon.health().await.map_err(UpdateError::Daemon)?;
-            let port = read_state(base_dir).and_then(|s| s.port).ok_or_else(|| {
-                UpdateError::Daemon(ClientError::Http("the daemon answered but daemon.json is gone".to_string()))
-            })?;
+            let port = read_state(base_dir).and_then(|s| s.port);
             Ok(Some(Running { pid: health.pid, port, version: health.version }))
         }
         Ok(Probe::NeedsStart) | Err(ClientError::NotRunning) => Ok(None),
