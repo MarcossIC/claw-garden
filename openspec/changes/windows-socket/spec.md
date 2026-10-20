@@ -31,7 +31,7 @@ Delta contra `specs/daemon-access` (R7 a R9, más R10 a R14), `specs/self-update
 - WHEN llega `POST /v1/shutdown`
 - THEN el proceso sale con 0 sin pasar `STOP_TIMEOUT` y el socket se borra
 
-**Tests (Windows, fallan hoy):** `the_socket_path_fits_under_the_limit_and_a_longer_one_is_named` (cuenta bytes UTF-8 con límite 108), `a_socket_an_earlier_daemon_left_is_replaced` (`daemon/socket.rs`, hoy `cfg(unix)`); nuevo `a_non_ascii_path_counts_its_utf8_bytes`; nuevo `dropping_the_listener_closes_its_socket` (`connect` da `ConnectionRefused` en menos de 1 s tras el `Drop`) y los tests del router por AF_UNIX detrás del guardia (otro `Host` da 403, un `Origin` da 403, `/v1` sin token da 401; `daemon/socket/windows.rs`); `clear_state_removes_the_files_and_the_socket_and_tolerates_absence` (`lifecycle.rs`); `a_daemon_without_a_port_serves_status_stop_bridge_and_hooks_over_its_socket`, `an_orphan_socket_left_by_a_kill_does_not_keep_the_next_daemon_out`, `a_socket_path_over_the_limit_is_refused_by_name` (`tests/binary.rs`, sin `cfg(unix)`, `:723-802`); nuevo `a_shutdown_ends_the_socket_listener_within_its_bounds` (`binary.rs`).
+**Tests (Windows, fallan hoy):** `the_socket_path_fits_under_the_limit_and_a_longer_one_is_named` (cuenta bytes UTF-8 con límite 108), `a_socket_an_earlier_daemon_left_is_replaced` (`daemon/socket.rs`, hoy `cfg(unix)`); nuevo `a_non_ascii_path_counts_its_utf8_bytes`; nuevo `dropping_the_listener_closes_its_socket` (`connect` da `ConnectionRefused` en menos de 1 s tras el `Drop`) y los tests del router por AF_UNIX detrás del guardia (otro `Host` da 403, un `Origin` da 403, `/v1` sin token da 401; `daemon/socket/windows.rs`); `a_daemon_without_a_port_serves_status_stop_bridge_and_hooks_over_its_socket`, `an_orphan_socket_left_by_a_kill_does_not_keep_the_next_daemon_out`, `a_socket_path_over_the_limit_is_refused_by_name` (`tests/binary.rs`, sin `cfg(unix)`, `:723-802`); nuevo `a_shutdown_ends_the_socket_listener_within_its_bounds` (`binary.rs`).
 
 ### Requirement: R8. TCP al lado del socket
 
@@ -49,7 +49,7 @@ Delta contra `specs/daemon-access` (R7 a R9, más R10 a R14), `specs/self-update
 - WHEN corre `clawg serve --port N`
 - THEN sale con error y no publica estado
 
-**Tests:** `the_tcp_plan_follows_the_port_and_the_socket` (`serve.rs`, con las filas de Windows: hoy `has_socket` es siempre falso); `the_start_line_names_every_listener`; `a_taken_profile_port_leaves_the_daemon_on_its_socket` (`binary.rs:804`, sin `cfg(unix)`); `socket_only` de `binary.rs` pone `CLAWG_TEST_DEFAULT_PORT=off` también en Windows (`:166-172`).
+**Tests:** `the_tcp_plan_follows_the_port_and_the_socket` (`serve.rs`, con las filas de Windows: hoy `has_socket` es siempre falso); `the_start_line_names_every_listener`; `a_taken_profile_port_leaves_the_daemon_on_its_socket` (`binary.rs:804`, sin `cfg(unix)`); `socket_only` de `binary.rs` pone `CLAWG_TEST_DEFAULT_PORT=off` también en Windows (`:166-172`); nuevo `a_taken_explicit_port_is_fatal_and_publishes_nothing` (`binary.rs`, en los dos sistemas: sale con error sin `daemon.json` ni `token`).
 
 ### Requirement: R9. El cliente va por el socket y nunca cae a TCP (Unix y Windows)
 
@@ -90,7 +90,7 @@ El socket MUST heredar el DACL del directorio de datos al crearse; no se le apli
 - WHEN el daemon crea el socket
 - THEN el DACL del archivo contiene las entradas heredadas del directorio
 
-**Tests (fallan hoy: no hay socket):** nuevos `a_socket_whose_file_denies_write_data_refuses_the_connect`, `the_socket_file_inherits_the_data_directory_acl` (`daemon/socket.rs`, Windows). Con una segunda cuenta, R14.
+**Tests (fallan hoy: no hay socket):** nuevos `a_socket_whose_file_denies_write_data_refuses_the_connect`, `the_socket_file_inherits_the_data_directory_acl` (`daemon/socket/windows.rs`). Con una segunda cuenta, R14.
 
 ### Requirement: R11. Sin AF_UNIX, TCP en el puerto del perfil
 
