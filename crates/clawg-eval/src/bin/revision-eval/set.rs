@@ -66,7 +66,8 @@ struct SetFile {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChainSet {
     pub version: u32,
-    /// Of the file as read, so a result names the exact set it measured.
+    /// Of the file with LF line endings, so a result names the exact set it
+    /// measured whether the checkout turned them into CRLF or not.
     pub sha256: String,
     pub chains: Vec<Chain>,
 }
@@ -98,7 +99,10 @@ pub fn parse_set(text: &str) -> Result<ChainSet, String> {
         }
     }
     check_minimums(&file.chains)?;
-    Ok(ChainSet { version: file.version, sha256: clawg_core::eval_api::sha256_hex(text.as_bytes()), chains: file.chains })
+    // A JSON string holds its line breaks escaped, so a CRLF can only sit
+    // between tokens and changes nothing the set says.
+    let sha256 = clawg_core::eval_api::sha256_hex(text.replace("\r\n", "\n").as_bytes());
+    Ok(ChainSet { version: file.version, sha256, chains: file.chains })
 }
 
 fn check_chain(chain: &Chain) -> Result<(), String> {
@@ -224,8 +228,17 @@ mod tests {
         let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/data/revision-chains.json")).unwrap();
         let set = parse_set(&raw).unwrap();
         assert_eq!(set.version, 1);
-        assert_eq!(set.sha256, clawg_core::eval_api::sha256_hex(raw.as_bytes()));
+        assert_eq!(set.sha256, clawg_core::eval_api::sha256_hex(raw.replace("\r\n", "\n").as_bytes()));
         assert_eq!(set.transitions(), 56);
+    }
+
+    #[test]
+    fn the_set_hash_is_the_same_with_either_line_ending() {
+        let lf = serde_json::to_string_pretty(&minimal_set()).unwrap();
+        let crlf = lf.replace('\n', "\r\n");
+        let hash = parse_set(&lf).unwrap().sha256;
+        assert_eq!(parse_set(&crlf).unwrap().sha256, hash);
+        assert_eq!(hash, clawg_core::eval_api::sha256_hex(lf.as_bytes()));
     }
 
     #[test]
