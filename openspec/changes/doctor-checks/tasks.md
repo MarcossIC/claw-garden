@@ -27,9 +27,9 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 
 ## 5. Verificación
 
-- [ ] Suite y clippy en Linux sobre el último commit ([verify](verify.md)).
+- [x] Suite y clippy en Linux sobre el último commit ([verify](verify.md)).
 - [ ] El CI en verde en Linux y Windows.
 
 ## 6. Archive
 
-- [ ] `specs/doctor` con R1–R8; `git mv` a `changes/archive/AAAA-MM-DD-doctor-checks`; `state.yaml` archivado; fila 31, el backlog que resuelve y el orden de ejecución del `README.md` de openspec; subir el minor.
+- [x] `specs/doctor` con R1–R8; `git mv` a `changes/archive/2026-10-20-doctor-checks`; `state.yaml` archivado; fila 31, el backlog que resuelve y el orden de ejecución del `README.md` de openspec; subir el minor.

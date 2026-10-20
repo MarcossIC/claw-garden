@@ -2,7 +2,7 @@
 
 ## D1. Hechos en `clawg-core`, decisiones en `clawg-cli` (R3, R6)
 
-**Elegido:** `clawg_core::memory::inspect::inspect(base_dir) -> Inspection` abre el store con `open_for_probe` (`crates/clawg-core/src/memory/backup.rs:531`), el mismo camino sin lock de `secrets::scan` (`crates/clawg-core/src/memory/secrets.rs:53`) y de `backup::probe` (`backup.rs:509`), y devuelve **hechos**: el `StoreProbe` del esquema y, sólo cuando el esquema está al día o con migraciones pendientes, un `StoreFacts` con el contrato guardado, los agentes y sus conteos, las filas de `project`, el outbox (cantidad `pending`, cada `failed` por `operation_id`) y las violaciones de las seis invariantes por id. Las severidades, los mensajes y los siguientes pasos son funciones puras en `crates/clawg-cli/src/doctor/` sobre esos hechos.
+**Elegido:** `clawg_core::memory::inspect::inspect(base_dir) -> Inspection` abre el store con `open_for_probe` (`crates/clawg-core/src/memory/backup.rs:559`), el mismo camino sin lock de `secrets::scan` (`crates/clawg-core/src/memory/secrets.rs:53`) y de `backup::probe` (`backup.rs:537`), y devuelve **hechos**: el `StoreProbe` del esquema y, sólo cuando el esquema está al día o con migraciones pendientes, un `StoreFacts` con el contrato guardado, los agentes y sus conteos, las filas de `project`, el outbox (cantidad `pending`, cada `failed` por `operation_id`) y las violaciones de las seis invariantes por id. Las severidades, los mensajes y los siguientes pasos son funciones puras en `crates/clawg-cli/src/doctor/` sobre esos hechos.
 
 Las invariantes son consultas SQL, así que su prueba es contra una base fabricada en `inspect.rs`; lo que se prueba sin base es cómo cada hecho se vuelve un hallazgo.
 

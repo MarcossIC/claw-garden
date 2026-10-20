@@ -6,9 +6,9 @@
 
 ## Problema
 
-Detalle y evidencia en la [exploración](exploration.md); verificado otra vez contra `develop` (`2773c88`). Desde la exploración cambiaron tres cosas: `purge` ya vacía el `context` de los pedazos de su save (`crates/clawg-core/src/memory/secrets.rs:221-224`), `to_prune` ya conserva el más nuevo de cada motivo (`crates/clawg-core/src/memory/backup.rs:246-251`) y el spill sólo lo escribía un clawg anterior: el actual lo pasa al outbox al arrancar (`crates/clawg-core/src/memory/spill.rs:1-4`).
+Detalle y evidencia en la [exploración](exploration.md); verificado otra vez contra `develop` (`2773c88`; las líneas citadas, las de la rama del cambio). Desde la exploración cambiaron tres cosas: `purge` ya vacía el `context` de los pedazos de su save (`crates/clawg-core/src/memory/secrets.rs:221-224`), `to_prune` ya conserva el más nuevo de cada motivo (`crates/clawg-core/src/memory/backup.rs:274-279`) y el spill sólo lo escribía un clawg anterior: el actual lo pasa al outbox al arrancar (`crates/clawg-core/src/memory/spill.rs:1-4`).
 
-`clawg doctor` responde una sola pregunta: qué `clawg` resuelve el PATH (`analyze`, `crates/clawg-cli/src/doctor.rs:46`; `run`, `doctor.rs:112`, que no lee nada del directorio de datos). Lo que deja a un usuario con una memoria que "no anda" se descubre por accidente:
+En `2773c88`, `clawg doctor` responde una sola pregunta: qué `clawg` resuelve el PATH (`analyze`, `crates/clawg-cli/src/doctor.rs:46`; `run`, `doctor.rs:112`, que no lee nada del directorio de datos; el archivo pasa a `doctor/mod.rs` con este cambio). Lo que deja a un usuario con una memoria que "no anda" se descubre por accidente:
 
 1. **Estado que nada comprueba.** El esquema no impone las reglas de `memory`: sin claves foráneas ni `CHECK` sobre `status`, `superseded_by`, `revived_from` ni `disputed_against` (`crates/clawg-core/migrations/V1__init.sql:24-27`; «No foreign keys» en `V11__memory_piece.sql:8` y `V15__memory_conflict.sql:8`), y los índices de tema y de dedup no son únicos (`V16__topic_key.sql:9-15`, `V6__content_hash.sql:9-16`). Dos versiones vivas de un tema, un `superseded_by` hacia una fila que ya no existe o dos filas vivas con el mismo hash no se ven en ningún lado.
 2. **Diagnósticos que exigen el daemon.** El contrato de embedding distinto sólo se ve en `/health` y `clawg status` con el daemon vivo; con el daemon parado no hay forma de saber si va a arrancar con la memoria apagada.
@@ -60,4 +60,4 @@ Tests que fallan hoy (ver [spec](spec.md)), sin modelo real, red ni perfil:
 
 ## Datos y vuelta atrás
 
-No toca el esquema, los identificadores, los estados ni el contrato de embedding: `doctor` sólo lee, sin lock, con `open_for_probe`, que abre `immutable` un store parado y en sólo lectura uno con WAL (`backup.rs:531-543`). Un store de una versión más nueva o divergente no se lee más allá de su historia de migraciones. Volver atrás es volver al binario anterior.
+No toca el esquema, los identificadores, los estados ni el contrato de embedding: `doctor` sólo lee, sin lock, con `open_for_probe`, que abre `immutable` un store parado y en sólo lectura uno con WAL (`backup.rs:555-569`). Un store de una versión más nueva o divergente no se lee más allá de su historia de migraciones. Volver atrás es volver al binario anterior.
