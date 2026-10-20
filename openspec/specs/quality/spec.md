@@ -6,12 +6,12 @@ Fuente de verdad de las redes de tests que vigilan lo que el modelo ve del servi
 
 ## Definiciones
 
-- **Contrato del agente:** lo que el puente le da al cliente para que el modelo decida qué llamar: cada herramienta tal como sale en `tools/list` (nombre, descripción, `inputSchema` y cualquier otro campo que `rmcp` serialice) y el texto de `instructions` (la apertura del protocolo, `opening(PROTOCOL)`, `crates/clawg-cli/src/mcp/server.rs:122`, que `get_info` entrega en `server.rs:1247`; el protocolo está en [`specs/mcp`](../mcp/spec.md)). No incluye `serverInfo`: su nombre depende del perfil y su versión cambia en cada bump.
-- **Archivo del contrato:** `crates/clawg-cli/src/mcp/agent_contract.json`, versionado (`CONTRACT_PATH`, `server.rs:2182`).
+- **Contrato del agente:** lo que el puente le da al cliente para que el modelo decida qué llamar: cada herramienta tal como sale en `tools/list` (nombre, descripción, `inputSchema` y cualquier otro campo que `rmcp` serialice) y el texto de `instructions` (la apertura del protocolo, `opening(PROTOCOL)`, `crates/clawg-cli/src/mcp/server.rs:122`, que `get_info` entrega en `server.rs:1248`; el protocolo está en [`specs/mcp`](../mcp/spec.md)). No incluye `serverInfo`: su nombre depende del perfil y su versión cambia en cada bump.
+- **Archivo del contrato:** `crates/clawg-cli/src/mcp/agent_contract.json`, versionado (`CONTRACT_PATH`, `server.rs:2183`).
 
 ## R1. El contrato del agente está fijado
 
-Un test MUST armar el contrato desde un puente en proceso (`agent_contract`, `server.rs:2185`) y compararlo con el archivo del contrato. Si difieren, MUST fallar con un mensaje que nombre cada herramienta que cambió (con los campos que cambiaron), que sobra o que falta, y si cambiaron las instrucciones (`contract_diff`, `server.rs:2201`). Si el archivo no existe, MUST fallar diciendo cómo crearlo.
+Un test MUST armar el contrato desde un puente en proceso (`agent_contract`, `server.rs:2186`) y compararlo con el archivo del contrato. Si difieren, MUST fallar con un mensaje que nombre cada herramienta que cambió (con los campos que cambiaron), que sobra o que falta, y si cambiaron las instrucciones (`contract_diff`, `server.rs:2202`). Si el archivo no existe, MUST fallar diciendo cómo crearlo.
 
 La comparación MUST ser semántica: el orden de las claves de un objeto JSON y el orden en que el router registra las herramientas MUST NOT cambiar el resultado.
 
@@ -30,13 +30,13 @@ La comparación MUST ser semántica: el orden de las claves de un objeto JSON y 
 - WHEN cambia `[workspace.package] version`
 - THEN el test pasa
 
-**Test:** `the_agent_contract_matches_its_file` (`server.rs:2338`), y los puros `contract_diff_names_the_changed_tool` (`server.rs:2252`) y `contract_diff_ignores_key_order` (`server.rs:2276`).
+**Test:** `the_agent_contract_matches_its_file` (`server.rs:2339`), y los puros `contract_diff_names_the_changed_tool` (`server.rs:2253`) y `contract_diff_ignores_key_order` (`server.rs:2277`).
 
 ## R2. Bendecir un cambio deja el diff a la vista
 
-Con `CLAWG_BLESS=1` el test MUST reescribir el archivo del contrato y MUST fallar igual, con un mensaje que diga que se actualizó y que hay que revisar el diff y volver a correr (`server.rs:2341-2343`). Sin la variable, el test MUST NOT escribir.
+Con `CLAWG_BLESS=1` el test MUST reescribir el archivo del contrato y MUST fallar igual, con un mensaje que diga que se actualizó y que hay que revisar el diff y volver a correr (`server.rs:2342-2344`). Sin la variable, el test MUST NOT escribir.
 
-El archivo MUST escribirse con las claves de cada objeto ordenadas (y por lo tanto las herramientas por nombre), dos espacios de sangría y un salto de línea final (`render_contract`, `server.rs:2245`), de modo que dos bendiciones seguidas del mismo contrato produzcan los mismos bytes.
+El archivo MUST escribirse con las claves de cada objeto ordenadas (y por lo tanto las herramientas por nombre), dos espacios de sangría y un salto de línea final (`render_contract`, `server.rs:2246`), de modo que dos bendiciones seguidas del mismo contrato produzcan los mismos bytes.
 
 #### Escenario
 - GIVEN un contrato que cambió a propósito
@@ -44,13 +44,13 @@ El archivo MUST escribirse con las claves de cada objeto ordenadas (y por lo tan
 - THEN el archivo queda con el contrato nuevo y el test falla
 - AND la corrida siguiente, sin la variable, pasa
 
-**Test:** `render_contract_is_stable_and_sorted` (puro, `server.rs:2287`). Bendecir se comprueba a mano: un test que escribe el archivo versionado no puede correr en la suite.
+**Test:** `render_contract_is_stable_and_sorted` (puro, `server.rs:2288`). Bendecir se comprueba a mano: un test que escribe el archivo versionado no puede correr en la suite.
 
 ## R3. El inventario de `.claude/CLAUDE.md` es el registrado
 
 El conjunto de nombres entre comillas invertidas que siguen al `): ` de la primera línea que empieza con `MCP tools (` en `.claude/CLAUDE.md` (hoy `.claude/CLAUDE.md:67`) MUST ser igual al conjunto de herramientas registradas. Si difieren, el test MUST fallar nombrando las que faltan en el documento y las que el documento nombra sin estar registradas.
 
-Extraer los nombres de esa línea MUST ser una función pura sobre el texto del documento (`tool_names_in_doc`, `server.rs:2302`).
+Extraer los nombres de esa línea MUST ser una función pura sobre el texto del documento (`tool_names_in_doc`, `server.rs:2303`).
 
 #### Escenario: herramienta nueva sin documentar
 - GIVEN `.claude/CLAUDE.md` con las doce herramientas
@@ -62,7 +62,7 @@ Extraer los nombres de esa línea MUST ser una función pura sobre el texto del 
 - WHEN corre el test
 - THEN falla con `missing ["restore_memory"], not registered ["forget_all"]`
 
-**Test:** `the_claude_md_tool_list_is_the_registered_one` (`server.rs:2319`) y el puro `tool_names_in_doc_reads_the_mcp_tools_line` (`server.rs:2309`).
+**Test:** `the_claude_md_tool_list_is_the_registered_one` (`server.rs:2320`) y el puro `tool_names_in_doc_reads_the_mcp_tools_line` (`server.rs:2310`).
 
 ## R4. Ninguna fuente esconde código muerto
 

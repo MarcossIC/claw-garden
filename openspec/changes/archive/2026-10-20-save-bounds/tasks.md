@@ -26,4 +26,4 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 
 ## 5. Archive
 
-- [ ] `specs/ingest` con R1 y R2, el `README.md` de openspec (fila 54, hallazgos, backlog y orden), `git mv` a `changes/archive/`, `state.yaml` archivado, y subir el minor.
+- [x] `specs/ingest` con R1 y R2 (y la fila del `400` en «Texto que ve el modelo»), las citas de `daemon/api.rs` y `mcp/server.rs` realineadas en las specs y el `README.md`; `git mv` a `changes/archive/2026-10-20-save-bounds`; `state.yaml` archivado; fila 54, el backlog que resolvió y el orden de ejecución del `README.md` de openspec; subir el minor.

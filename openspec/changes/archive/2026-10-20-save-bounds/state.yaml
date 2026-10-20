@@ -1,0 +1,15 @@
+change: save-bounds
+objective: "1"
+depends_on: []
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # Linux and the binary in a test home; the CI of the pull request covers Linux and Windows
+  archive: done
+updated: 2026-10-20
+main_spec: openspec/specs/ingest/spec.md
