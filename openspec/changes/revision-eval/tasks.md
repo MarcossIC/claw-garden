@@ -13,9 +13,9 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 ## 2. Esqueleto, `set` y el set de cadenas (E1)
 
-- [ ] Tests `the_shipped_chain_set_meets_every_minimum`, `a_set_below_a_minimum_names_what_is_missing`, `a_query_that_holds_a_versions_value_is_refused`, `a_chain_with_an_invalid_key_or_unknown_field_fails` (`set.rs`): fallan porque ni el módulo ni el set existen.
-- [ ] `[[bin]] revision-eval` en `crates/clawg-eval/Cargo.toml`, `src/bin/revision-eval/{main,set}.rs` (`deny_unknown_fields`, mínimos como `Class::minimum`, `validate_topic_key`) y `main.rs` que carga el set e imprime su `version` y sha256.
-- [ ] `crates/clawg-eval/data/revision-chains.json`: 40 cadenas escritas para medir (20 `es` y 20 `en`; 24 de 2 versiones y 16 de 3; 20 decisiones, 10 preferencias, 10 hechos; al menos 8 con versiones de más de 480 tokens; `value` por versión y `query` sin ningún `value`; cortas y largas, sin datos de usuario). Es trabajo real, no mecánico: la prueba del set entregado es su compuerta y debe pasar los mínimos de E1.
+- [x] Tests `the_shipped_chain_set_meets_every_minimum`, `a_set_below_a_minimum_names_what_is_missing`, `a_query_that_holds_a_versions_value_is_refused`, `a_chain_with_an_invalid_key_or_unknown_field_fails` (`set.rs`): fallan porque ni el módulo ni el set existen.
+- [x] `[[bin]] revision-eval` en `crates/clawg-eval/Cargo.toml`, `src/bin/revision-eval/{main,set}.rs` (`deny_unknown_fields`, mínimos como `Class::minimum`, `validate_topic_key`) y `main.rs` que carga el set e imprime su `version` y sha256. El sha256 se toma con finales de línea LF (`the_set_hash_is_the_same_with_either_line_ending`, `e311cea`): el set está en git y un checkout de Windows con `core.autocrlf` lo trae en CRLF.
+- [x] `crates/clawg-eval/data/revision-chains.json`: 40 cadenas escritas para medir (20 `es` y 20 `en`; 24 de 2 versiones y 16 de 3; 20 decisiones, 10 preferencias, 10 hechos; al menos 8 con versiones de más de 480 tokens; `value` por versión y `query` sin ningún `value`; cortas y largas, sin datos de usuario). Es trabajo real, no mecánico: la prueba del set entregado es su compuerta y debe pasar los mínimos de E1.
 - Commit: `feat(eval): add the revision-eval binary and its chain set`
 
 ## 3. `chains`: brazos y M1 (E2, E5)
@@ -71,5 +71,5 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 - [ ] Sección «`revision-eval`: revisiones por clave» en `specs/eval`; `git mv` al archivo con la fecha; `state.yaml` en `archived` y la fila 48 de `openspec/README.md` como archivada.
 - Commit: `docs(openspec): archive revision-eval`
-- [ ] Subir el minor `0.41.0` → `0.42.0` en `[workspace.package]` del `Cargo.toml` raíz y `cargo update --workspace`; ambos archivos juntos.
-- Commit: `chore: bump version to 0.42.0`
+- [ ] Subir el minor `0.42.0` → `0.43.0` en `[workspace.package]` del `Cargo.toml` raíz y `cargo update --workspace`; ambos archivos juntos (el `0.42.0` lo subió el archivo de doctor-checks, `53b174e`).
+- Commit: `chore: bump version to 0.43.0`
