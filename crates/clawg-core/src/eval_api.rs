@@ -690,6 +690,62 @@ pub async fn conflict_pairs(runtime: &MemoryRuntime) -> Result<Vec<EvalConflictP
         .map_err(|e: tokio_rusqlite::Error| EvalError::Search(e.to_string()))
 }
 
+/// The distance of each stored vector in `from` to each in `to`, as
+/// `(from, to, distance)`. The scalar `vec_distance_l2` gives the values the
+/// KNN reports for the same pair, which no KNN can be asked for a named row
+/// outside its pool. A row without a vector (deleted ones lose theirs) is left
+/// out.
+pub async fn row_distances(
+    runtime: &MemoryRuntime,
+    from: &[i64],
+    to: &[i64],
+) -> Result<Vec<(i64, i64, f64)>, EvalError> {
+    let (from, to) = (from.to_vec(), to.to_vec());
+    runtime
+        .store
+        .conn
+        .call(move |c| -> rusqlite::Result<Vec<(i64, i64, f64)>> {
+            let mut vector = c.prepare("SELECT embedding FROM memory_vectors WHERE rowid = ?1")?;
+            let mut load = |ids: &[i64]| -> rusqlite::Result<Vec<(i64, Vec<u8>)>> {
+                let mut found = Vec::new();
+                for &id in ids {
+                    let mut rows = vector.query([id])?;
+                    if let Some(row) = rows.next()? {
+                        found.push((id, row.get(0)?));
+                    }
+                }
+                Ok(found)
+            };
+            let (from, to) = (load(&from)?, load(&to)?);
+            let mut distance = c.prepare("SELECT vec_distance_l2(?1, ?2)")?;
+            let mut out = Vec::with_capacity(from.len() * to.len());
+            for (a, va) in &from {
+                for (b, vb) in &to {
+                    out.push((*a, *b, distance.query_row(rusqlite::params![va, vb], |r| r.get(0))?));
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e: tokio_rusqlite::Error| EvalError::Search(e.to_string()))
+}
+
+/// Joins the pieces of one save into its text the way `read_memory` does.
+pub fn join_pieces(pieces: &[&str]) -> String {
+    crate::memory::pieces::join_pieces(pieces)
+}
+
+/// Whether a memory type asserts something the detector can pair; a name that
+/// is no memory type does not.
+pub fn is_claim_type(memory_type: &str) -> bool {
+    parse_memory_type(memory_type).is_ok_and(|t| t.is_claim_bearing())
+}
+
+/// The detector's band, `[NEAR_DUPLICATE_FLOOR, CONTRADICTION_THRESHOLD)`:
+/// re-exported so a measurement reads the shipped numbers, not copies.
+pub const NEAR_DUPLICATE_FLOOR: f32 = crate::memory::contradiction::NEAR_DUPLICATE_FLOOR;
+pub const CONTRADICTION_THRESHOLD: f32 = crate::memory::contradiction::CONTRADICTION_THRESHOLD;
+
 /// The token window the live embedder truncates to — re-exported so the eval
 /// binary's `--follow-up` budget reads the exact same number production's
 /// embedder enforces, rather than a second copy that could drift from it.
@@ -1440,6 +1496,90 @@ mod tests {
         }
         let runtime = ingest.finish().await.unwrap();
         assert!(stored_rows(&runtime).await.is_empty(), "nothing is queued for an invalid key");
+    }
+
+    #[tokio::test]
+    async fn joined_pieces_equal_the_text_read_memory_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
+        let text: String = (0..900).map(|i| format!("word{i} ")).collect();
+        let saved = ingest.save(keyed(&text, None)).await.unwrap();
+        assert!(saved.rows.len() > 2, "the fixture is a long save");
+        let runtime = ingest.finish().await.unwrap();
+
+        let pieces: Vec<String> = runtime
+            .store
+            .conn
+            .call(|c| -> rusqlite::Result<Vec<String>> {
+                let mut stmt = c.prepare(
+                    "SELECT m.content FROM memory_piece p JOIN memory m ON m.id = p.memory_id ORDER BY p.piece",
+                )?;
+                let rows = stmt.query_map([], |r| r.get(0))?.collect();
+                rows
+            })
+            .await
+            .unwrap();
+
+        let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
+        assert_eq!(join_pieces(&pieces), text);
+    }
+
+    #[test]
+    fn the_band_constants_are_the_detectors() {
+        assert_eq!(NEAR_DUPLICATE_FLOOR, crate::memory::contradiction::NEAR_DUPLICATE_FLOOR);
+        assert_eq!(CONTRADICTION_THRESHOLD, crate::memory::contradiction::CONTRADICTION_THRESHOLD);
+    }
+
+    #[test]
+    fn is_claim_type_follows_the_memory_type() {
+        assert!(is_claim_type("semantic_fact"));
+        assert!(is_claim_type("user_preference"));
+        assert!(!is_claim_type("session_summary"));
+        assert!(!is_claim_type("not_a_real_type"));
+    }
+
+    #[tokio::test]
+    async fn row_distances_equal_the_knn_distance() {
+        let dir = tempfile::tempdir().unwrap();
+        let ingest = EvalIngest::open(dir.path(), &placed_embedder(), dir.path()).await.unwrap();
+        let base = ingest.save(keyed("base the build runs on cargo", None)).await.unwrap().rows[0].0;
+        let near = ingest.save(keyed("near the build runs on make", None)).await.unwrap().rows[0].0;
+        let runtime = ingest.finish().await.unwrap();
+
+        let from_base = row_distances(&runtime, &[base], &[near, base]).await.unwrap();
+
+        let knn: std::collections::HashMap<i64, f64> = runtime
+            .store
+            .conn
+            .call(move |c| -> rusqlite::Result<_> {
+                let query: Vec<u8> =
+                    c.query_row("SELECT embedding FROM memory_vectors WHERE rowid = ?1", [base], |r| r.get(0))?;
+                let mut stmt = c.prepare(
+                    "SELECT knn.rowid, knn.distance FROM memory_vectors knn WHERE knn.embedding MATCH ?1 AND knn.k = 10",
+                )?;
+                let rows = stmt.query_map([query], |r| Ok((r.get(0)?, r.get(1)?)))?.collect();
+                rows
+            })
+            .await
+            .unwrap();
+        assert_eq!(from_base.len(), 2);
+        for (from, to, distance) in from_base {
+            assert_eq!(from, base);
+            assert_eq!(distance.to_bits(), knn[&to].to_bits(), "row {to}");
+        }
+    }
+
+    #[tokio::test]
+    async fn row_distances_of_nothing_is_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path())
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        assert!(row_distances(&runtime, &[], &[1]).await.unwrap().is_empty());
+        assert!(row_distances(&runtime, &[1], &[]).await.unwrap().is_empty());
     }
 
     #[tokio::test]
