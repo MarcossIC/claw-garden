@@ -1,14 +1,14 @@
 change: windows-socket
 objective: "transversal"
 depends_on: [local-transport]
-phase: apply
+phase: verify
 artifacts:
   exploration: done
   proposal: done
   spec: done
   design: done
   tasks: done
-  apply: in-progress
+  apply: done
   verify: pending
   archive: pending
 updated: 2026-10-20
