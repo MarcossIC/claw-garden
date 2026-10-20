@@ -4,11 +4,11 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 ## 1. `eval_api` (E5)
 
-- [ ] Tests `save_stores_under_the_agent_project_and_key_it_is_given`, `a_second_save_under_the_same_key_reports_the_first_as_replaced`, `save_reports_the_candidates_the_detector_paired`, `save_with_an_invalid_key_fails` (`eval_api.rs`, embedder falso): fallan porque `save` no existe.
-- [ ] `EvalSave`, `EvalSaved`, `EvalCandidate` y `EvalIngest::save` junto a `send` (`:525`), con el armado del `MemoryEvent` en una función privada compartida y `validate_topic_key` antes de encolar; el informe es el `IngestReport` (`worker.rs:81`). `send` no cambia.
+- [x] Tests `save_stores_under_the_agent_project_and_key_it_is_given`, `a_second_save_under_the_same_key_reports_the_first_as_replaced`, `save_reports_the_candidates_the_detector_paired`, `save_with_an_invalid_key_fails` (`eval_api.rs`, embedder falso): fallan porque `save` no existe.
+- [x] `EvalSave`, `EvalSaved`, `EvalCandidate` y `EvalIngest::save` junto a `send` (`:525`), con el armado del `MemoryEvent` en una función privada compartida y `validate_topic_key` antes de encolar; el informe es el `IngestReport` (`worker.rs:81`). `send` no cambia.
 - Commit: `feat(core): save a memory with its project and topic key from the eval api`
-- [ ] Tests `joined_pieces_equal_the_text_read_memory_returns`, `the_band_constants_are_the_detectors` (como `EMBED_MAX_TOKENS`) y uno de `row_distances` contra el KNN.
-- [ ] `row_distances` (`vec_distance_l2` sobre `memory_vectors`), `join_pieces` e `is_claim_type` (delegan en `pieces.rs:61` y `is_claim_bearing`, `store_insert.rs:59`), y re-export de `NEAR_DUPLICATE_FLOOR` y `CONTRADICTION_THRESHOLD`. Son `pub` de un módulo detrás de `eval`: no hay `dead_code`.
+- [x] Tests `joined_pieces_equal_the_text_read_memory_returns`, `the_band_constants_are_the_detectors` (como `EMBED_MAX_TOKENS`) y uno de `row_distances` contra el KNN.
+- [x] `row_distances` (`vec_distance_l2` sobre `memory_vectors`), `join_pieces` e `is_claim_type` (delegan en `pieces.rs:61` y `is_claim_bearing`, `store_insert.rs:59`), y re-export de `NEAR_DUPLICATE_FLOOR` y `CONTRADICTION_THRESHOLD`. Son `pub` de un módulo detrás de `eval`: no hay `dead_code`.
 - Commit: `feat(core): expose piece joining, row distances and the detector band to the eval api`
 
 ## 2. Esqueleto, `set` y el set de cadenas (E1)

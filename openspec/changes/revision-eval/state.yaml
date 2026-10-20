@@ -1,14 +1,14 @@
 change: revision-eval
 objective: "1"
 depends_on: [topic-revisions]
-phase: tasks
+phase: apply
 artifacts:
   exploration: done
   proposal: done  # M3 fuera por su costo; M5 lee un export de prod
   spec: done
   design: done
   tasks: done
-  apply: pending
+  apply: in-progress
   verify: pending
   archive: pending
 updated: 2026-10-20
