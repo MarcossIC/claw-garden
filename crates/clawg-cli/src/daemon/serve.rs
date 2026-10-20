@@ -455,6 +455,30 @@ mod tests {
         assert_eq!(listening_on(None, None), "nothing");
     }
 
+    /// A port a child inherits stays open after the daemon lets it go: it
+    /// takes connections nobody answers, reset when the child exits, and keeps
+    /// the next daemon off the port.
+    #[tokio::test]
+    async fn a_child_started_while_the_port_is_bound_does_not_keep_it() {
+        let (listener, port) = bind_tcp(0).await.expect("bind");
+        let mut command = if cfg!(windows) {
+            let mut c = std::process::Command::new("ping");
+            c.args(["-n", "30", "127.0.0.1"]);
+            c
+        } else {
+            let mut c = std::process::Command::new("sleep");
+            c.arg("30");
+            c
+        };
+        let mut child = command.stdout(std::process::Stdio::null()).spawn().expect("spawn a long-lived process");
+        drop(listener);
+
+        let rebound = std::net::TcpListener::bind(("127.0.0.1", port));
+        let _ = child.kill();
+        let _ = child.wait();
+        rebound.expect("the port is free once the daemon lets it go");
+    }
+
     #[tokio::test]
     async fn shutdown_signal_waits_while_the_flag_is_false() {
         let (_tx, rx) = tokio::sync::watch::channel(false);
