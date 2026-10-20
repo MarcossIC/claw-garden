@@ -594,7 +594,7 @@ mod apply_cases {
 
     #[tokio::test]
     async fn a_daemon_that_does_not_stop_renames_nothing() {
-        let mut fake = Fake::failing(Step::StopDaemon, "still running after 15s");
+        let mut fake = Fake::failing(Step::StopDaemon, "still running after 30s");
 
         let failure = failure(apply(&with_daemon(), &mut fake).await);
 
