@@ -83,8 +83,8 @@ Cubre S8, incluido el fallo que ya hay en Unix.
 
 ## 7. El apagado despierta al listener (D9)
 
-- [ ] Test primero: `a_shutdown_ends_the_socket_listener_within_its_bounds` (`binary.rs`; R7, «el apagado despierta al listener»): `stop` sale con 0 dentro de `STOP_TIMEOUT`, el proceso con 0 y `clawg.sock` desaparece.
-- [ ] Si falla por el despertar, el ajuste va en `windows.rs`; si pasa de entrada el commit es sólo el test, y la nota «sin verificar» de D2 queda cerrada.
+- [x] Test primero: `a_shutdown_ends_the_socket_listener_within_its_bounds` (`binary.rs`; R7, «el apagado despierta al listener»): `stop` sale con 0 dentro de `STOP_TIMEOUT`, el proceso con 0 y `clawg.sock` desaparece.
+- [x] Si falla por el despertar, el ajuste va en `windows.rs`; si pasa de entrada el commit es sólo el test, y la nota «sin verificar» de D2 queda cerrada.
 - Commit: `test(cli): pin that a shutdown ends the socket listener on Windows`
 
 ## 8. La barra de rendimiento (D8, R12)

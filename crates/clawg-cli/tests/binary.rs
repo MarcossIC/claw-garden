@@ -787,6 +787,25 @@ async fn a_taken_explicit_port_is_fatal_and_publishes_nothing() {
     assert!(!sandbox.data_dir().join("token").exists());
 }
 
+/// The thread that accepts on Windows blocks in `accept`; if the shutdown did
+/// not wake it, the socket would stay open and the file could not be removed.
+#[tokio::test]
+async fn a_shutdown_ends_the_socket_listener_within_its_bounds() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    let socket = sandbox.data_dir().join("clawg.sock");
+    assert!(socket.exists());
+
+    let started = Instant::now();
+    let stop = sandbox.run(&["stop", "--profile", "dev"]);
+
+    assert_eq!(stop.status.code(), Some(0), "{}\n{}", stderr_of(&stop), daemon.log_text());
+    assert!(started.elapsed() < clawg_cli::stop::STOP_TIMEOUT, "stop took {:?}", started.elapsed());
+    let exit = daemon.wait_for_exit(Duration::from_secs(5)).await;
+    assert!(exit.success(), "{exit}\n{}", daemon.log_text());
+    assert!(!socket.exists(), "the socket goes with the daemon:\n{}", daemon.log_text());
+}
+
 #[tokio::test]
 async fn a_bridge_starts_its_daemon_through_the_binary() {
     let sandbox = Sandbox::new();
