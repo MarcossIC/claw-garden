@@ -18,7 +18,9 @@ use clawg_cli::client::{probe_running, ClientError, DaemonClient, Probe};
 use clawg_cli::daemon::lifecycle::{now_ms, read_state};
 use clawg_cli::daemon::serve;
 use clawg_cli::doctor;
+use clawg_cli::export;
 use clawg_cli::hook;
+use clawg_cli::import;
 use clawg_cli::mcp;
 use clawg_cli::memories;
 use clawg_cli::outbox;
@@ -33,6 +35,8 @@ use clawg_cli::undelete;
 use clawg_cli::update;
 use clawg_core::memory::backup::{backup_offline, probe, restore};
 use clawg_core::memory::embedder::keep_one_malloc_arena;
+use clawg_core::memory::portability::ExportFilter;
+use clawg_core::memory::ProjectIdentity;
 use clawg_core::memory::secrets::{mask_reasons, purge, scan};
 use clawg_core::paths::data_dir;
 use clap::Parser;
@@ -194,6 +198,33 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
             let restored = restore(&base_dir, &file).map_err(restore::explain)?;
             println!("{}", restore::report(&file, &restored));
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Export { out, project, agent, include_deleted, format, profile } => {
+            let profile = profile.resolve().map_err(|e| e.to_string())?;
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let project_id = project.map(|path| ProjectIdentity::resolve(&path).id);
+            let filter = ExportFilter { project_id, agent, include_deleted };
+            println!("{}", export::run(&base_dir, &out, &filter, format, now_ms() as i64)?);
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Import { file, dry_run, agent, map_root, profile } => {
+            let profile = profile.resolve().map_err(|e| e.to_string())?;
+            let unavailable = |e: ClientError| memories::explain_unavailable(&e, profile);
+            // The daemon is the store's only writer and has the model that
+            // embeds each row; with none running, nothing is started.
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let client = match probe_running(&base_dir, false).await.map_err(unavailable)? {
+                Probe::Running(client) => client,
+                Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
+            };
+            let out = import::run(&client, &file, dry_run, agent.as_deref(), &map_root).await.map_err(|e| match e {
+                import::ImportError::Client(e) => unavailable(e),
+                other => other.to_string(),
+            })?;
+            println!("{out}");
             Ok(ExitCode::SUCCESS)
         }
 

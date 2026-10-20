@@ -40,6 +40,7 @@ use clawg_core::memory::worker::{
 };
 use clawg_core::memory::events::{MemoryEvent, MemorySource};
 use clawg_core::memory::clock::TimestampMs;
+use clawg_core::memory::portability::{self, ImportError, ImportOptions, ImportReport, MAX_IMPORT_BYTES};
 use clawg_core::memory::project::{register_project, RegisterError};
 use clawg_core::memory::prompt_builder::{build_memory_prompt, build_session_prompt, QueryTexts, Retrieval, DEFAULT_BUDGET, MAX_BUDGET};
 use clawg_core::memory::sharing::{self, Reach};
@@ -863,6 +864,7 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         .route("/outbox/discard", post(discard_outbox))
         .route("/stats", get(stats))
         .route("/backup", post(backup))
+        .route("/import", post(import_memories).layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT)))
         .route("/projects", post(register))
         .route("/projects/docs/search", post(search_docs))
         .route("/shutdown", post(shutdown))
@@ -1572,6 +1574,54 @@ async fn backup(State(app): State<Arc<AppCtx>>) -> ApiResult<Json<BackupBody>> {
     Ok(Json(BackupBody { path: path.display().to_string() }))
 }
 
+/// The body of `POST /v1/import`: an export as text, which JSON escaping
+/// makes longer than the file it came from.
+const IMPORT_BODY_LIMIT: usize = 2 * MAX_IMPORT_BYTES;
+
+#[derive(Debug, Deserialize)]
+pub struct ImportRequest {
+    /// The export, as `clawg export` wrote it.
+    pub text: String,
+    #[serde(default)]
+    pub dry_run: bool,
+    /// The agent every row that has one is stored under instead.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Exported project roots and the roots they have here.
+    #[serde(default)]
+    pub map_roots: Vec<(String, String)>,
+}
+
+/// Imports an export. The file is read before the embedder is asked for, so
+/// a file this binary cannot read is a 400 even while the model loads, and a
+/// dry run needs no model at all.
+async fn import_memories(
+    State(app): State<Arc<AppCtx>>,
+    Json(body): Json<ImportRequest>,
+) -> ApiResult<Json<ImportReport>> {
+    if body.text.len() > MAX_IMPORT_BYTES {
+        return Err(ApiError::bad_request(format!(
+            "the file is {} bytes; at most {MAX_IMPORT_BYTES} are imported",
+            body.text.len()
+        )));
+    }
+    let agent = match body.agent.as_deref().map(str::trim) {
+        Some("") => return Err(ApiError::bad_request("agent must not be blank")),
+        agent => agent.map(str::to_string),
+    };
+    portability::format::parse(&body.text).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let embedder = if body.dry_run { None } else { Some(ready_embedder(&app)?) };
+    let options = ImportOptions { dry_run: body.dry_run, agent, map_roots: body.map_roots };
+    let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
+    match portability::import(&app.runtime.store, embedder.as_deref(), &backups, &body.text, &options).await {
+        Ok(report) => Ok(Json(report)),
+        Err(ImportError::Format(e)) => Err(ApiError::bad_request(e.to_string())),
+        Err(ImportError::NoEmbedder) => Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "embedder_not_ready")),
+        Err(ImportError::Embed(e)) => Err(embed_failure(e)),
+        Err(e @ ImportError::Store(_)) => Err(ApiError::internal(e)),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
     /// The canonical project root, as the bridge resolved it.
@@ -1710,9 +1760,10 @@ fn not_accepted(root: &std::path::Path, profile: Profile) -> String {
         other => format!(" --profile {}", other.as_str()),
     };
     format!(
-        "clawg reads the files of the project a bridge was started in, and of the ones the user \
-         added; {root} is neither. Ask the user to run `clawg projects add \"{root}\"{flag}` if \
-         they want it searched, then call again",
+        "clawg reads the files of the projects the user added, and of the one a bridge was \
+         started in when that folder has a .git or a manifest and is not the home directory or a \
+         filesystem root; {root} is neither. Ask the user to run `clawg projects add \"{root}\"{flag}` \
+         if they want it searched, then call again",
         root = root.display()
     )
 }

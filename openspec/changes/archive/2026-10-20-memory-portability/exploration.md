@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1, 2 | M | — (conviene después de los cambios de esquema pendientes: 24, 27, 36, 18; ver «Interacciones») | exploración (borrador) |
+| 1, 2 | M | — (conviene después de los cambios de esquema pendientes: 24, 27, 36, 18; ver «Interacciones») | exploración cerrada; decisiones en la [propuesta](proposal.md#decisiones) |
 
 **Tesis:** hoy la única copia de la memoria es el archivo SQLite. `backup` y `restore` mueven la base entera, atada a su versión de esquema: un binario rechaza una base más nueva. Con eso no se puede:
 
@@ -110,14 +110,14 @@ Una vista para leer, no para importar. Queda como opción de salida del mismo co
 
 Son del usuario.
 
-- [ ] **Por dónde escribe el import:** a través del daemon (un solo escritor; recomendado) o fuera de línea con el daemon parado, como `restore`.
-- [ ] **Borradas:** ¿se exportan con una bandera, y se importan como borradas?
-- [ ] **Agente en el destino:** ¿se conserva el `agent_id` de origen o se reasigna con `--agent`?
-- [ ] **Accesos y tier:** ¿se conservan, o lo importado arranca de cero?
-- [ ] **Detector al importar:** ¿se saltea (las filas ya convivían en el origen) o corre?
-- [ ] **`redact` al exportar** filas anteriores al enmascarado.
-- [ ] **Vectores:** ¿se ofrecen como opción?
-- [ ] **Markdown:** ¿entra o no?
+- [x] **Por dónde escribe el import:** a través del daemon (un solo escritor; recomendado) o fuera de línea con el daemon parado, como `restore`.
+- [x] **Borradas:** ¿se exportan con una bandera, y se importan como borradas?
+- [x] **Agente en el destino:** ¿se conserva el `agent_id` de origen o se reasigna con `--agent`?
+- [x] **Accesos y tier:** ¿se conservan, o lo importado arranca de cero?
+- [x] **Detector al importar:** ¿se saltea (las filas ya convivían en el origen) o corre?
+- [x] **`redact` al exportar** filas anteriores al enmascarado.
+- [x] **Vectores:** ¿se ofrecen como opción?
+- [x] **Markdown:** ¿entra o no?
 
 ## Cómo se mide
 

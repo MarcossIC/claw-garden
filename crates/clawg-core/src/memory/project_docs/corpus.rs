@@ -18,6 +18,21 @@ pub const MAX_DOCS: usize = 2_000;
 
 const MANIFESTS: &[&str] = &["Cargo.toml", "package.json", "pyproject.toml", "go.mod"];
 
+/// Whether a bridge started in `root` may have its files read without the
+/// user adding it: only a project, which `has_marker` says, and never the
+/// home directory or a filesystem root, which hold other people's packages
+/// and the user's private notes even when they carry a `.git`. Pure; `home`
+/// is compared as given, so the caller resolves it as it resolved `root`.
+pub fn auto_indexable(root: &Path, home: Option<&Path>, has_marker: bool) -> bool {
+    has_marker && root.parent().is_some() && home != Some(root)
+}
+
+/// Whether `root` holds a `.git` (a directory, or the file a worktree has) or
+/// a manifest [`classify`] reads.
+pub fn has_project_marker(root: &Path) -> bool {
+    root.join(".git").exists() || MANIFESTS.iter().any(|m| root.join(m).is_file())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocKind {
     Markdown,
@@ -128,6 +143,30 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_indexable_wants_a_project_that_is_not_home() {
+        let home = Path::new("/home/u");
+        assert!(!auto_indexable(home, Some(home), true), "home, even with a .git");
+        assert!(!auto_indexable(Path::new("/"), Some(home), true), "a filesystem root");
+        assert!(!auto_indexable(Path::new("/home/u/Documents"), Some(home), false), "no marker");
+        assert!(auto_indexable(Path::new("/home/u/repo"), Some(home), true));
+        assert!(auto_indexable(Path::new("/srv/repo"), None, true), "no home to compare with");
+    }
+
+    #[test]
+    fn a_git_or_a_manifest_marks_a_project() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!has_project_marker(dir.path()));
+        std::fs::write(dir.path().join("README.md"), "# notes\n").unwrap();
+        assert!(!has_project_marker(dir.path()), "a doc alone is not a project");
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        assert!(has_project_marker(dir.path()));
+
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::write(worktree.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
+        assert!(has_project_marker(worktree.path()), "a .git file, as in a worktree");
+    }
 
     #[test]
     fn classify_takes_markdown_in_any_case() {
