@@ -10,7 +10,8 @@ use clawg_core::memory::backup::{parse_snapshot_name, snapshot_name, ProbeState,
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Running {
     pub pid: u32,
-    pub port: u16,
+    /// Its TCP port, when it has one.
+    pub port: Option<u16>,
     pub version: String,
 }
 
@@ -301,7 +302,7 @@ mod plan_cases {
     use super::*;
 
     fn with_daemon() -> Initial {
-        Initial { daemon: Some(Running { pid: 7, port: 27381, version: "0.18.0".into() }) }
+        Initial { daemon: Some(Running { pid: 7, port: Some(27381), version: "0.18.0".into() }) }
     }
 
     fn steps(planned: &[Planned]) -> Vec<Step> {
@@ -447,7 +448,7 @@ mod apply_cases {
     }
 
     fn with_daemon() -> Vec<Planned> {
-        plan(&Initial { daemon: Some(Running { pid: 7, port: 27381, version: "0.18.0".into() }) })
+        plan(&Initial { daemon: Some(Running { pid: 7, port: Some(27381), version: "0.18.0".into() }) })
     }
 
     fn without_daemon() -> Vec<Planned> {

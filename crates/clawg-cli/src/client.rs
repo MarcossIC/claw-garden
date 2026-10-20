@@ -24,12 +24,13 @@ use clawg_core::memory::dispute::{OpenPairs, Resolution};
 use clawg_core::memory::outbox::OutboxSummary;
 use clawg_core::memory::portability::ImportReport;
 use clawg_core::memory::store_lock::{StoreHolder, StoreLock, StoreOwner};
-use clawg_core::paths::{data_dir, PathsError, Profile};
+use clawg_core::build_info;
+use clawg_core::paths::{data_dir, socket_file, PathsError, Profile};
 use clawg_core::private_dir::ensure_private_dir;
 use serde::{Deserialize, Serialize};
 
 use crate::daemon::api::DocsSearchBody;
-use crate::daemon::lifecycle::{read_state, read_token};
+use crate::daemon::lifecycle::{read_state, read_token, DaemonState};
 use crate::relevance::RELEVANCE_RATIO;
 
 /// How often [`ensure_running`] re-checks a daemon it just asked for.
@@ -601,16 +602,50 @@ pub struct DaemonClient {
     base_dir: PathBuf,
 }
 
+/// Where a client dials its daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Endpoint {
+    /// The data directory's socket.
+    Unix(PathBuf),
+    /// `127.0.0.1` on this port.
+    Tcp(u16),
+}
+
+/// Where the daemon that published `state` is reached: its socket when it
+/// published one, on Unix, whatever port it also has, else its port. `None`
+/// when it has neither, which reads as no daemon.
+///
+/// Never the socket's port as a second try: a process of another user on that
+/// port would be the daemon again. `tcp_only` makes a `testing` build behave
+/// as a clawg that predates the socket.
+pub fn endpoint(state: &DaemonState, base_dir: &Path, tcp_only: bool) -> Option<Endpoint> {
+    if cfg!(unix) && state.unix_socket && !tcp_only {
+        return Some(Endpoint::Unix(socket_file(base_dir)));
+    }
+    state.port.map(Endpoint::Tcp)
+}
+
+/// The daemon is on loopback and the bearer token travels with every call: a
+/// configured or system proxy must never see them.
+fn loopback_http() -> reqwest::Client {
+    reqwest::Client::builder().no_proxy().build().expect("build the daemon HTTP client")
+}
+
+/// A client whose every connection goes to the socket at `path`; no proxy and
+/// no DNS take part.
+#[cfg(unix)]
+fn socket_http(path: &Path) -> Option<reqwest::Client> {
+    reqwest::Client::builder().no_proxy().unix_socket(path).build().ok()
+}
+
+#[cfg(not(unix))]
+fn socket_http(_path: &Path) -> Option<reqwest::Client> {
+    None
+}
+
 impl DaemonClient {
     pub fn new(base_url: impl Into<String>, token: impl Into<String>, base_dir: PathBuf) -> Self {
-        Self {
-            base_url: base_url.into(),
-            token: token.into(),
-            // The daemon is on loopback and the bearer token travels with every
-            // call: a configured or system proxy must never see them.
-            http: reqwest::Client::builder().no_proxy().build().expect("build the daemon HTTP client"),
-            base_dir,
-        }
+        Self { base_url: base_url.into(), token: token.into(), http: loopback_http(), base_dir }
     }
 
     /// Builds a client from `<base_dir>/daemon.json` + `<base_dir>/token`.
@@ -620,14 +655,15 @@ impl DaemonClient {
     pub fn from_data_dir(base_dir: &Path) -> Option<Self> {
         let state = read_state(base_dir)?;
         let token = read_token(base_dir)?;
-        Some(Self::new(
-            // Always loopback, never the recorded host: the daemon binds
-            // 127.0.0.1 and a state file that claimed otherwise would be a
-            // tampered file pointing this client's bearer token elsewhere.
-            format!("http://127.0.0.1:{}", state.port),
-            token,
-            base_dir.to_path_buf(),
-        ))
+        // Always loopback or the derived socket, never a recorded host or
+        // path: the daemon binds 127.0.0.1 and `<base_dir>/clawg.sock`, and a
+        // state file that claimed otherwise would be a tampered file pointing
+        // this client's bearer token elsewhere.
+        let (http, base_url) = match endpoint(&state, base_dir, build_info::tcp_only())? {
+            Endpoint::Unix(path) => (socket_http(&path)?, "http://localhost".to_string()),
+            Endpoint::Tcp(port) => (loopback_http(), format!("http://127.0.0.1:{port}")),
+        };
+        Some(Self { base_url, token, http, base_dir: base_dir.to_path_buf() })
     }
 
     pub fn base_url(&self) -> &str {
@@ -1469,7 +1505,8 @@ pub(crate) mod tests {
             d.dir.path(),
             &DaemonState {
                 pid: std::process::id(),
-                port: d.addr.port(),
+                port: Some(d.addr.port()),
+                unix_socket: false,
                 profile: "dev".into(),
                 version: "0.1.0".into(),
                 started_at_ms: 0,
@@ -1551,7 +1588,8 @@ pub(crate) mod tests {
             d.dir.path(),
             &DaemonState {
                 pid: 1,
-                port: d.addr.port(),
+                port: Some(d.addr.port()),
+                unix_socket: false,
                 profile: "dev".into(),
                 version: "0.1.0".into(),
                 started_at_ms: 0,
@@ -1567,6 +1605,83 @@ pub(crate) mod tests {
         let c = DaemonClient::from_data_dir(d.dir.path()).expect("now both files exist");
         assert!(c.base_url().contains("127.0.0.1"));
         assert!(c.base_url().contains(&d.addr.port().to_string()));
+    }
+
+    fn published(port: Option<u16>, unix_socket: bool) -> DaemonState {
+        DaemonState {
+            pid: 1,
+            port,
+            unix_socket,
+            profile: "dev".into(),
+            version: "0.1.0".into(),
+            started_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn the_socket_wins_when_published_and_tcp_is_used_otherwise() {
+        let base = Path::new("/data");
+        let both = published(Some(27381), true);
+
+        if cfg!(unix) {
+            assert_eq!(endpoint(&both, base, false), Some(Endpoint::Unix(base.join("clawg.sock"))));
+            assert_eq!(endpoint(&published(None, true), base, false), Some(Endpoint::Unix(base.join("clawg.sock"))));
+        } else {
+            assert_eq!(endpoint(&both, base, false), Some(Endpoint::Tcp(27381)), "no socket outside Unix");
+        }
+        assert_eq!(endpoint(&both, base, true), Some(Endpoint::Tcp(27381)), "a clawg older than the socket");
+        assert_eq!(endpoint(&published(Some(27381), false), base, false), Some(Endpoint::Tcp(27381)));
+        assert_eq!(endpoint(&published(None, false), base, false), None);
+    }
+
+    #[cfg(unix)]
+    async fn serve_on_socket(dir: &Path, token: &str) {
+        let (runtime, _rx) = MemoryRuntime::new_for_test(dir.to_path_buf()).await;
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        let ctx = Arc::new(AppCtx {
+            runtime,
+            token: token.to_string(),
+            profile: Profile::Dev,
+            started_at: Instant::now(),
+            shutdown,
+            save_timeout: SAVE_CONFIRM_TIMEOUT,
+            sessions: Default::default(),
+        });
+        let listener = crate::daemon::socket::bind_socket(&dir.join("clawg.sock")).expect("bind the socket");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router(ctx)).await;
+        });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_client_reaches_a_daemon_over_its_published_socket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        serve_on_socket(dir.path(), "socket-token").await;
+        // A port nothing listens on: the socket alone must be dialled.
+        write_state(dir.path(), &published(Some(9), true)).expect("write state");
+        write_token(dir.path(), "socket-token").expect("write token");
+
+        let c = DaemonClient::from_data_dir(dir.path()).expect("client");
+
+        assert_eq!(c.base_url(), "http://localhost");
+        assert_eq!(c.health().await.expect("health").profile, "dev");
+        c.stats(None, None).await.expect("the token is sent over the socket too");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_client_on_a_published_socket_with_nothing_behind_is_not_running() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_state(dir.path(), &published(None, true)).expect("write state");
+        write_token(dir.path(), "t").expect("write token");
+        let c = DaemonClient::from_data_dir(dir.path()).expect("client");
+
+        assert!(matches!(c.health().await, Err(ClientError::NotRunning)), "no socket file");
+
+        // What a kill leaves: the file, with no listener behind it.
+        drop(crate::daemon::socket::bind_socket(&dir.path().join("clawg.sock")).expect("bind"));
+        assert!(matches!(c.health().await, Err(ClientError::NotRunning)), "an orphan socket");
     }
 
     // ── Happy paths ─────────────────────────────────────────────────────────
@@ -1799,7 +1914,8 @@ pub(crate) mod tests {
                 // Port 1 on loopback: nothing binds it, so connecting fails
                 // immediately rather than hanging on a timeout.
                 pid: 1,
-                port: 1,
+                port: Some(1),
+                unix_socket: false,
                 profile: "dev".into(),
                 version: "0.1.0".into(),
                 started_at_ms: 0,

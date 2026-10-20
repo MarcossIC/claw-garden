@@ -6,7 +6,8 @@
 //! and through DNS rebinding read the answers of anything that does not ask for
 //! the token. Such a request names the attacker's host, not a loopback name, or
 //! carries an `Origin`; no client of this daemon does either (`DaemonClient`
-//! dials `http://127.0.0.1:<port>` and sends no `Origin`). The port is not
+//! dials `http://127.0.0.1:<port>`, or `http://localhost` over the socket, and
+//! sends no `Origin`). The port is not
 //! checked: rebinding is stopped by the name, and the port is not known yet
 //! where the router is built for an ephemeral listener.
 //!

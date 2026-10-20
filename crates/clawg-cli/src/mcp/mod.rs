@@ -222,7 +222,8 @@ mod tests {
                     &dir,
                     &DaemonState {
                         pid: std::process::id(),
-                        port,
+                        port: Some(port),
+                        unix_socket: false,
                         profile: "dev".into(),
                         version: "0.1.0".into(),
                         started_at_ms: 0,

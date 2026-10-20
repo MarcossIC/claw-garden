@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use clawg_core::build_info;
 use clawg_core::memory::backup;
 use clawg_core::memory::store_lock::StoreLock;
 use clawg_core::paths::{backups_dir, Profile};
@@ -178,9 +179,9 @@ impl Installation {
     /// until a daemon of `version` answers. When a daemon of another version
     /// got the store first (an editor's bridge started it between the stop and
     /// this start), it is stopped and the start is tried once more.
-    async fn start_and_wait(&mut self, exe: &Path, version: &str, port: u16) -> Result<Health, String> {
+    async fn start_and_wait(&mut self, exe: &Path, version: &str, port: Option<u16>) -> Result<Health, String> {
         for attempt in 1..=2 {
-            let child = spawn_serve_at(exe, &self.paths.base_dir, self.profile, Some(port)).map_err(|e| e.to_string())?;
+            let child = spawn_serve_at(exe, &self.paths.base_dir, self.profile, port).map_err(|e| e.to_string())?;
             println!("starting the daemon (pid {})", child.id());
             self.child = Some(child);
             match self.wait_for(version).await {
@@ -286,6 +287,19 @@ impl Installation {
 /// Waits for the daemon whose shutdown ran out of time to end. Started before
 /// then, the old daemon would lose the store to it, and the daemon still
 /// answering with the same version would pass for the one just started.
+/// The `--port` of a daemon an update starts, the new one or the old one
+/// again. None where the daemon has its socket: it starts as an autostart
+/// does, watched over the socket, and TCP stays only where someone asked for
+/// it again. Where TCP is the only transport the old daemon's port is kept,
+/// and so it is by a clawg older than the socket (`tcp_only`).
+fn serve_port(old_port: Option<u16>, unix: bool, tcp_only: bool) -> Option<u16> {
+    if unix && !tcp_only {
+        None
+    } else {
+        old_port
+    }
+}
+
 async fn wait_for_end(pid: u32, timeout: Duration) -> Result<(), String> {
     let Some(watched) = Watched::open(pid) else {
         return Ok(());
@@ -413,11 +427,8 @@ impl Effects for Installation {
                 Ok(backup::sync_dir(dir).map_err(|e| format!("cannot sync {}: {e}", dir.display()))?)
             }
             Step::StartDaemon => {
-                let port = self
-                    .old
-                    .as_ref()
-                    .map(|d| d.port)
-                    .ok_or_else(|| "there is no daemon port to start on".to_string())?;
+                let old = self.old.as_ref().ok_or_else(|| "there was no daemon to start".to_string())?;
+                let port = serve_port(old.port, cfg!(unix), build_info::tcp_only());
                 self.backups_before = Some(self.backup_names());
                 let (exe, version) = (self.paths.exe.clone(), self.candidate.release.version.to_string());
                 let health = self.start_and_wait(&exe, &version, port).await?;
@@ -444,7 +455,8 @@ impl Effects for Installation {
                 // The daemon that was running may report another version than
                 // the binary put back (one started before the file was replaced).
                 let version = self.installed.to_string();
-                self.start_and_wait(&exe, &version, old.port).await.map(drop)
+                let port = serve_port(old.port, cfg!(unix), build_info::tcp_only());
+                self.start_and_wait(&exe, &version, port).await.map(drop)
             }
             Undo::RestoreAside => {
                 rename(&self.paths.aside, &self.paths.exe).await?;
@@ -478,6 +490,15 @@ impl Effects for Installation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_new_daemon_gets_a_port_only_where_tcp_is_the_only_transport() {
+        assert_eq!(serve_port(Some(40123), true, false), None, "the socket is the way in");
+        assert_eq!(serve_port(None, true, false), None);
+        assert_eq!(serve_port(Some(40123), false, false), Some(40123), "Windows keeps its port");
+        assert_eq!(serve_port(Some(40123), true, true), Some(40123), "as an older updater does");
+        assert_eq!(serve_port(None, false, false), None, "the profile's port then");
+    }
 
     /// A process of the system that runs for half a minute and prints little.
     fn long_running() -> Command {
