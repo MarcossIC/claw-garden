@@ -31,7 +31,7 @@ Las abiertas de la exploración se cierran así; el porqué está en el [diseño
 
 1. `prompt_builder.rs`: `indent_continuations` y `display_author`, puras; usadas en `format_hit_line` y en los lados de ACTIVE CONFLICTS.
 2. `workspace.rs`: `render_rows` y `format_skill_line` aplican el margen y desarman los marcadores; `sections_holding` encuentra un texto en su forma cruda o en la copiada.
-3. `tools.rs`: `search_memory` muestra el autor por `display_author`; `indexes_docs` recibe si la raíz del puente se indexa sola.
+3. `tools.rs`: `search_memory` muestra el autor por `display_author`. `server.rs`: el puente le pasa a `indexes_docs` su raíz sólo cuando se indexa sola.
 4. `project_docs`: `auto_indexable` pura y `has_project_marker`; el puente las usa al construirse.
 5. `daemon/api.rs`: la frase de `not_accepted`.
 6. Docs: `.claude/CLAUDE.md`; al archivar, `specs/retrieval`, `specs/sharing`, `specs/project-docs`.

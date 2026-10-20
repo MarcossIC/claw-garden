@@ -79,4 +79,4 @@ clawg reads the files of the projects the user added, and of the one a bridge wa
 #### Escenario: la tabla de `auto_indexable`
 - `$HOME` con `.git`: no. `/`: no. Una carpeta sin marcador: no. Con `.git`: sí. Con `Cargo.toml`: sí.
 
-**Tests:** `auto_indexable_wants_a_project_that_is_not_home` (`project_docs`); `only_the_bridges_own_root_is_indexed` (`tools.rs`); `a_bridge_in_a_folder_that_is_not_a_project_indexes_nothing` (`server.rs`).
+**Tests:** `auto_indexable_wants_a_project_that_is_not_home`, `a_git_or_a_manifest_marks_a_project` (`project_docs/corpus.rs`); `a_bridge_in_a_folder_that_is_not_a_project_indexes_nothing` (`server.rs`). `indexes_docs` no cambia de firma: el puente le pasa su raíz sólo cuando `auto_indexable` la acepta, así que `only_the_bridges_own_root_is_indexed` queda igual.

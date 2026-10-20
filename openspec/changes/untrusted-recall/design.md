@@ -24,7 +24,7 @@ El margen no basta en `workspace.md`: `split_existing` busca los marcadores con 
 
 ## D4. Qué raíz se indexa sola
 
-**Elegido:** A de la exploración. `auto_indexable(root, home, has_marker)` es pura; `has_project_marker(root)` mira el disco (`.git` o un manifiesto de `MANIFESTS` en la raíz). El puente la calcula una vez al construirse y `indexes_docs` recibe el resultado. `home` se canonicaliza como la raíz (que ya es canónica) para que un enlace simbólico no lo esquive.
+**Elegido:** A de la exploración. `auto_indexable(root, home, has_marker)` es pura; `has_project_marker(root)` mira el disco (`.git` o un manifiesto de `MANIFESTS` en la raíz). El puente la calcula una vez al construirse (`own_root_to_index`) y le pasa a `indexes_docs` su raíz sólo si la acepta, así que `indexes_docs` no cambia. `home` se canonicaliza como la raíz (`canonicalize` y `strip_verbatim`, que ya es canónica) para que un enlace simbólico o el prefijo `\\?\` de Windows no lo esquiven.
 
 **Alternativas:** sólo excluir `$HOME` y `/` (B: no cubre `~/Documents`); validar en `POST /v1/projects` (rompe la decisión de que el token puede indexar cualquier raíz); saltar ocultos (cambia el corpus de todos, es de 20).
 
