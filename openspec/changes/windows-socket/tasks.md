@@ -49,15 +49,15 @@ Refactor sin cambio de conducta, en todos los sistemas, salvo el vencimiento de 
 
 Cubre R9 y los escenarios del sello de R9.
 
-- [ ] Tests primero (`client.rs`, Windows, fallan por no compilar o por ir a `port`):
+- [x] Tests primero (`client.rs`, Windows, fallan por no compilar o por ir a `port`):
   - `the_socket_wins_when_published_and_tcp_is_used_otherwise` (`:1622`) sin la rama `cfg!(unix)` de `:1626` (R9, «cliente por el socket»);
   - `a_client_reaches_a_daemon_over_its_published_socket` (`:1658`) y `serve_on_socket` (`:1637`) multiplataforma (R9);
   - `a_client_on_a_published_socket_with_nothing_behind_is_not_running` (`:1674`), con el archivo huérfano también (R9, «socket publicado sin nadie detrás»);
   - `thirty_two_simultaneous_clients_over_the_socket_are_none_not_running` (R9, «ráfaga de 32»);
   - un `health` contra un socket que nunca contesta da `NotRunning` dentro de `HEALTH_TIMEOUT` (`:48`);
   - `a_stamp_can_restrict_the_binary_to_tcp` (`build_info.rs`, caso de Windows: el sello `tcp` apaga también el socket del daemon y del cliente, R9).
-- [ ] `Connector` (`tower_service::Service<Uri>` sobre `connect` y `TcpStream::from_std`, `pub(crate)`) en `daemon/socket/windows.rs`; `Transport::AfUnix(hyper_util::client::legacy::Client<…>)` bajo `cfg(windows)`; el bearer como cabecera sensible, `content-type` con cuerpo; la rama no aplica ningún timeout (el de `health` envuelve a `send`, D4). `hyper`, `hyper-util` y `http-body-util` pasan de `[target.'cfg(windows)'.dev-dependencies]` a `[target.'cfg(windows)'.dependencies]`, con la misma versión y las mismas features, y `tower-service` entra allí; `cargo update --workspace` suma `tower-service` a la lista de `clawg-cli` de `Cargo.lock`, y el paso de tabla no la cambia.
-- [ ] `endpoint` (`client.rs:621-626`) sin `cfg!(unix) &&`; `socket_http` (`:636-644`) deja de ser `None` fuera de Unix; `from_data_dir` (`:655-664`) arma el transporte del socket de cada sistema. Los tests del router de `windows.rs` pasan a usar el `Connector`.
+- [x] `Connector` (`tower_service::Service<Uri>` sobre `connect` y `TcpStream::from_std`, `pub(crate)`) en `daemon/socket/windows.rs`; `Transport::AfUnix(hyper_util::client::legacy::Client<…>)` bajo `cfg(windows)`; el bearer como cabecera sensible, `content-type` con cuerpo; la rama no aplica ningún timeout (el de `health` envuelve a `send`, D4). `hyper`, `hyper-util` y `http-body-util` pasan de `[target.'cfg(windows)'.dev-dependencies]` a `[target.'cfg(windows)'.dependencies]`, con la misma versión y las mismas features, y `tower-service` entra allí; `cargo update --workspace` suma `tower-service` a la lista de `clawg-cli` de `Cargo.lock`, y el paso de tabla no la cambia.
+- [x] `endpoint` (`client.rs:621-626`) sin `cfg!(unix) &&`; `socket_http` (`:636-644`) deja de ser `None` fuera de Unix; `from_data_dir` (`:655-664`) arma el transporte del socket de cada sistema. Los tests del router de `windows.rs` pasan a usar el `Connector`.
 - Commit: `feat(cli): reach the daemon over its socket on Windows`
 
 ## 5. `binary.rs` en Windows (D6)

@@ -68,12 +68,13 @@ winreg = "0.55"
 # `std::os::windows::net`, so the socket is built here and handed to tokio as a
 # TCP stream. Already in the lockfile through tokio and hyper-util.
 socket2 = "0.6"
-
-# Only the tests of the Windows listener speak HTTP over its socket.
-[target.'cfg(windows)'.dev-dependencies]
+# The client's AF_UNIX transport: reqwest cannot dial a socket on Windows, so a
+# hyper-util client over the `Connector` of `daemon/socket/windows.rs` speaks
+# HTTP/1 on it. All already in the lockfile through reqwest and axum.
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 http-body-util = "0.1"
+tower-service = "0.3"
 
 # `kill(pid, 0)` for the Unix side of `process.rs`. Already in the lockfile.
 [target.'cfg(unix)'.dependencies]

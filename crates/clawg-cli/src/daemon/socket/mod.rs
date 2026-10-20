@@ -16,6 +16,8 @@ pub use unix::{admits_peer, PeerChecked};
 mod windows;
 #[cfg(windows)]
 pub use windows::AfUnixListener;
+#[cfg(windows)]
+pub(crate) use windows::Connector;
 
 /// Bytes in `sun_path`, the terminating NUL included: a socket path must be
 /// shorter.

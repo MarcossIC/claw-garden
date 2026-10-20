@@ -372,6 +372,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tower-service",
  "windows-sys 0.61.2",
  "winreg",
 ]

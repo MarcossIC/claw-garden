@@ -13,6 +13,8 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use hyper::Uri;
+use hyper_util::rt::TokioIo;
 use socket2::{Domain, SockAddr, Socket, Type};
 use tokio::sync::mpsc;
 use windows_sys::Win32::Networking::WinSock::WSAEAFNOSUPPORT;
@@ -76,6 +78,38 @@ pub(crate) fn connect(path: &Path) -> io::Result<TcpStream> {
     socket.connect(&SockAddr::unix(path)?)?;
     socket.set_nonblocking(true)?;
     Ok(socket.into())
+}
+
+/// What a hyper-util client dials with: every connection goes to the socket at
+/// `path`, whatever the URI names, so no proxy and no DNS take part.
+///
+/// The connect runs on the calling runtime thread. A local AF_UNIX connect is
+/// queued by the kernel without waiting for the daemon's `accept`, so it ends
+/// at once; a hop to a blocking thread would cost every new connection, which is
+/// what each hook pays.
+#[derive(Debug, Clone)]
+pub(crate) struct Connector {
+    path: PathBuf,
+}
+
+impl Connector {
+    pub(crate) fn new(path: &Path) -> Self {
+        Self { path: path.to_path_buf() }
+    }
+}
+
+impl tower_service::Service<Uri> for Connector {
+    type Response = TokioIo<tokio::net::TcpStream>;
+    type Error = io::Error;
+    type Future = std::future::Ready<io::Result<Self::Response>>;
+
+    fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _: Uri) -> Self::Future {
+        std::future::ready(connect(&self.path).and_then(tokio::net::TcpStream::from_std).map(TokioIo::new))
+    }
 }
 
 fn accept_loop(listener: Socket, outgoing: mpsc::Sender<TcpStream>) {
@@ -158,7 +192,8 @@ mod tests {
     use http_body_util::Empty;
     use hyper::body::Bytes;
     use hyper::StatusCode;
-    use hyper_util::rt::TokioIo;
+    use hyper_util::client::legacy::Client;
+    use hyper_util::rt::TokioExecutor;
 
     use super::super::{bind_socket, test_app};
     use super::*;
@@ -186,15 +221,12 @@ mod tests {
     }
 
     async fn status_of(path: &Path, host: &str, origin: Option<&str>, uri: &str) -> StatusCode {
-        let stream = tokio::net::TcpStream::from_std(connect(path).expect("connect")).expect("register");
-        let (mut sender, conn) =
-            hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.expect("handshake");
-        tokio::spawn(conn);
-        let mut request = hyper::Request::builder().uri(uri).header("host", host);
+        let client = Client::builder(TokioExecutor::new()).build::<_, Empty<Bytes>>(Connector::new(path));
+        let mut request = hyper::Request::builder().uri(format!("http://localhost{uri}")).header("host", host);
         if let Some(origin) = origin {
             request = request.header("origin", origin);
         }
-        sender.send_request(request.body(Empty::<Bytes>::new()).unwrap()).await.expect("answer").status()
+        client.request(request.body(Empty::<Bytes>::new()).unwrap()).await.expect("answer").status()
     }
 
     #[tokio::test]

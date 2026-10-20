@@ -599,8 +599,16 @@ fn owner_query(agent: Option<&str>) -> Vec<(&'static str, &str)> {
 /// which is the only place that touches one.
 #[derive(Debug, Clone)]
 enum Transport {
+    /// TCP, and the socket on Unix.
     Http(reqwest::Client),
+    /// The socket on Windows, where reqwest cannot dial one.
+    #[cfg(windows)]
+    AfUnix(AfUnixClient),
 }
+
+#[cfg(windows)]
+type AfUnixClient =
+    hyper_util::client::legacy::Client<crate::daemon::socket::Connector, http_body_util::Full<hyper::body::Bytes>>;
 
 /// One request to the daemon, before any transport has seen it.
 ///
@@ -716,14 +724,14 @@ pub enum Endpoint {
 }
 
 /// Where the daemon that published `state` is reached: its socket when it
-/// published one, on Unix, whatever port it also has, else its port. `None`
+/// published one, whatever port it also has, else its port. `None`
 /// when it has neither, which reads as no daemon.
 ///
 /// Never the socket's port as a second try: a process of another user on that
 /// port would be the daemon again. `tcp_only` makes a `testing` build behave
 /// as a clawg that predates the socket.
 pub fn endpoint(state: &DaemonState, base_dir: &Path, tcp_only: bool) -> Option<Endpoint> {
-    if cfg!(unix) && state.unix_socket && !tcp_only {
+    if state.unix_socket && !tcp_only {
         return Some(Endpoint::Unix(socket_file(base_dir)));
     }
     state.port.map(Endpoint::Tcp)
@@ -735,16 +743,72 @@ fn loopback_http() -> reqwest::Client {
     reqwest::Client::builder().no_proxy().build().expect("build the daemon HTTP client")
 }
 
-/// A client whose every connection goes to the socket at `path`; no proxy and
-/// no DNS take part.
+/// A transport whose every connection goes to the socket at `path`; no proxy
+/// and no DNS take part.
 #[cfg(unix)]
-fn socket_http(path: &Path) -> Option<reqwest::Client> {
-    reqwest::Client::builder().no_proxy().unix_socket(path).build().ok()
+fn socket_transport(path: &Path) -> Option<Transport> {
+    reqwest::Client::builder().no_proxy().unix_socket(path).build().ok().map(Transport::Http)
 }
 
-#[cfg(not(unix))]
-fn socket_http(_path: &Path) -> Option<reqwest::Client> {
+#[cfg(windows)]
+fn socket_transport(path: &Path) -> Option<Transport> {
+    use hyper_util::rt::{TokioExecutor, TokioTimer};
+    // The pool idles 90 s by default, as reqwest's does, but only with a timer.
+    let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
+        .pool_timer(TokioTimer::new())
+        .build(crate::daemon::socket::Connector::new(path));
+    Some(Transport::AfUnix(client))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn socket_transport(_path: &Path) -> Option<Transport> {
     None
+}
+
+/// Sends `call` over the socket and reads the whole answer, as the reqwest
+/// branch does: the bearer is a sensitive header, and a connection that cannot
+/// be made is [`ClientError::NotRunning`].
+#[cfg(windows)]
+async fn send_over_af_unix(
+    client: &AfUnixClient,
+    token: &str,
+    url: &reqwest::Url,
+    call: Call,
+) -> Result<Answer, ClientError> {
+    use http_body_util::BodyExt;
+    use hyper::header::{HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+
+    let http_error = |e: &dyn std::fmt::Display| ClientError::Http(e.to_string());
+    let mut request = hyper::Request::builder().method(call.method).uri(url.as_str());
+    if call.bearer {
+        let mut bearer = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|e| http_error(&e))?;
+        bearer.set_sensitive(true);
+        request = request.header(AUTHORIZATION, bearer);
+    }
+    let body = match call.body {
+        Some(body) => {
+            request = request.header(CONTENT_TYPE, "application/json");
+            body
+        }
+        None => Vec::new(),
+    };
+    let request = request
+        .body(http_body_util::Full::new(hyper::body::Bytes::from(body)))
+        .map_err(|e| http_error(&e))?;
+
+    let response = client
+        .request(request)
+        .await
+        .map_err(|e| classify_transport(e.is_connect(), false, e.to_string()))?;
+    let status = response.status();
+    let body = match response.into_body().collect().await {
+        Ok(collected) => collected.to_bytes().to_vec(),
+        // As on the reqwest branch: an error answer whose body breaks off is
+        // still that error.
+        Err(_) if !status.is_success() => Vec::new(),
+        Err(e) => return Err(http_error(&e)),
+    };
+    Ok(Answer { status, body })
 }
 
 impl DaemonClient {
@@ -768,11 +832,11 @@ impl DaemonClient {
         // path: the daemon binds 127.0.0.1 and `<base_dir>/clawg.sock`, and a
         // state file that claimed otherwise would be a tampered file pointing
         // this client's bearer token elsewhere.
-        let (http, base_url) = match endpoint(&state, base_dir, build_info::tcp_only())? {
-            Endpoint::Unix(path) => (socket_http(&path)?, "http://localhost".to_string()),
-            Endpoint::Tcp(port) => (loopback_http(), format!("http://127.0.0.1:{port}")),
+        let (transport, base_url) = match endpoint(&state, base_dir, build_info::tcp_only())? {
+            Endpoint::Unix(path) => (socket_transport(&path)?, "http://localhost".to_string()),
+            Endpoint::Tcp(port) => (Transport::Http(loopback_http()), format!("http://127.0.0.1:{port}")),
         };
-        Some(Self { base_url, token, transport: Transport::Http(http), base_dir: base_dir.to_path_buf() })
+        Some(Self { base_url, token, transport, base_dir: base_dir.to_path_buf() })
     }
 
     pub fn base_url(&self) -> &str {
@@ -808,6 +872,8 @@ impl DaemonClient {
                 };
                 Ok(Answer { status, body })
             }
+            #[cfg(windows)]
+            Transport::AfUnix(client) => send_over_af_unix(client, &self.token, &url, call).await,
         }
     }
 
@@ -1658,18 +1724,13 @@ pub(crate) mod tests {
         let base = Path::new("/data");
         let both = published(Some(27381), true);
 
-        if cfg!(unix) {
-            assert_eq!(endpoint(&both, base, false), Some(Endpoint::Unix(base.join("clawg.sock"))));
-            assert_eq!(endpoint(&published(None, true), base, false), Some(Endpoint::Unix(base.join("clawg.sock"))));
-        } else {
-            assert_eq!(endpoint(&both, base, false), Some(Endpoint::Tcp(27381)), "no socket outside Unix");
-        }
+        assert_eq!(endpoint(&both, base, false), Some(Endpoint::Unix(base.join("clawg.sock"))));
+        assert_eq!(endpoint(&published(None, true), base, false), Some(Endpoint::Unix(base.join("clawg.sock"))));
         assert_eq!(endpoint(&both, base, true), Some(Endpoint::Tcp(27381)), "a clawg older than the socket");
         assert_eq!(endpoint(&published(Some(27381), false), base, false), Some(Endpoint::Tcp(27381)));
         assert_eq!(endpoint(&published(None, false), base, false), None);
     }
 
-    #[cfg(unix)]
     async fn serve_on_socket(dir: &Path, token: &str) {
         let (runtime, _rx) = MemoryRuntime::new_for_test(dir.to_path_buf()).await;
         let (shutdown, _) = tokio::sync::watch::channel(false);
@@ -1688,7 +1749,6 @@ pub(crate) mod tests {
         });
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_client_reaches_a_daemon_over_its_published_socket() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1702,9 +1762,28 @@ pub(crate) mod tests {
         assert_eq!(c.base_url(), "http://localhost");
         assert_eq!(c.health().await.expect("health").profile, "dev");
         c.stats(None, None).await.expect("the token is sent over the socket too");
+        c.search(SearchArgs {
+            query: "a body travels over the socket as JSON".into(),
+            agent_id: "agent-socket".into(),
+            project_id: None,
+            limit: Some(5),
+        })
+        .await
+        .expect("a call with a body");
     }
 
-    #[cfg(unix)]
+    /// What a kill leaves: the socket file, with no listener behind it. A
+    /// dropped Windows listener closes its socket when its accept thread wakes,
+    /// a moment after the drop, so this waits until a connect is refused.
+    async fn leave_an_orphan(dir: &Path, probe: &DaemonClient) {
+        drop(crate::daemon::socket::bind_socket(&dir.join("clawg.sock")).expect("bind"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(probe.health().await, Err(ClientError::NotRunning)) {
+            assert!(Instant::now() < deadline, "the dropped listener still takes connections");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     #[tokio::test]
     async fn a_client_on_a_published_socket_with_nothing_behind_is_not_running() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1714,9 +1793,43 @@ pub(crate) mod tests {
 
         assert!(matches!(c.health().await, Err(ClientError::NotRunning)), "no socket file");
 
-        // What a kill leaves: the file, with no listener behind it.
-        drop(crate::daemon::socket::bind_socket(&dir.path().join("clawg.sock")).expect("bind"));
+        leave_an_orphan(dir.path(), &c).await;
         assert!(matches!(c.health().await, Err(ClientError::NotRunning)), "an orphan socket");
+    }
+
+    #[tokio::test]
+    async fn thirty_two_simultaneous_clients_over_the_socket_are_none_not_running() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_state(dir.path(), &published(None, true)).expect("write state");
+        write_token(dir.path(), "t").expect("write token");
+        let probe = DaemonClient::from_data_dir(dir.path()).expect("client");
+        leave_an_orphan(dir.path(), &probe).await;
+
+        let calls: Vec<_> = (0..32)
+            .map(|_| {
+                let client = DaemonClient::from_data_dir(dir.path()).expect("client");
+                tokio::spawn(async move { client.health().await })
+            })
+            .collect();
+        for call in calls {
+            let answer = call.await.expect("task");
+            assert!(matches!(answer, Err(ClientError::NotRunning)), "{answer:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_health_against_a_socket_that_never_answers_is_not_running_within_its_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Listening, and never served: the connection is taken, the request
+        // is written and nothing comes back.
+        let _listener = crate::daemon::socket::bind_socket(&dir.path().join("clawg.sock")).expect("bind");
+        write_state(dir.path(), &published(None, true)).expect("write state");
+        write_token(dir.path(), "t").expect("write token");
+        let c = DaemonClient::from_data_dir(dir.path()).expect("client");
+
+        let started = Instant::now();
+        assert!(matches!(c.health().await, Err(ClientError::NotRunning)));
+        assert!(started.elapsed() < HEALTH_TIMEOUT * 3, "{:?}", started.elapsed());
     }
 
     // ── Happy paths ─────────────────────────────────────────────────────────
