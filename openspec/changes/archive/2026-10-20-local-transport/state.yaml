@@ -1,14 +1,15 @@
 change: local-transport
 objective: "transversal"
 depends_on: [local-isolation, shutdown-budget]
-phase: apply
+phase: archived
 artifacts:
   exploration: done
   proposal: done
   spec: done
   design: done
   tasks: done
-  apply: in_progress
-  verify: pending
-  archive: pending
+  apply: done
+  verify: done  # Linux and two real accounts; the CI of the pull request covers Linux and Windows
+  archive: done
 updated: 2026-10-20
+main_spec: openspec/specs/daemon-access/spec.md

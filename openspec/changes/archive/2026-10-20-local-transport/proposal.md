@@ -11,7 +11,7 @@ Detalle y evidencia en la [exploración](exploration.md); verificado otra vez co
 1. **Otra cuenta se hace pasar por el daemon.** El daemon sólo escucha en `127.0.0.1:<puerto del perfil>` (`crates/clawg-cli/src/daemon/serve.rs:142-144`), y el cliente marca ese puerto con lo que dice `daemon.json` (`from_data_dir`, `crates/clawg-cli/src/client.rs:599-610`). Cuando el daemon muere sin apagarse quedan `daemon.json` y `token`; cualquier cuenta de la máquina puede tomar el puerto, y el siguiente cliente le manda el token y cada save.
 2. **`/health` es legible por cualquier cuenta**, sin token: nombra agentes, operaciones y causas de fallo.
 3. **Dos usuarios no pueden usar el mismo perfil a la vez:** el puerto es fijo por perfil (`crates/clawg-core/src/paths.rs:139-144`) y el daemon del segundo falla en el `bind` (`ServeError::Bind`, `serve.rs:142-144`) mientras su puente espera `AUTOSTART_TIMEOUT` (60 s, `client.rs:41`).
-4. **El autoarranque del puente no se prueba por el binario:** el daemon que lanza toma el puerto fijo del perfil y chocaría con un daemon dev de la máquina (el «Límite conocido» de [`specs/install`](../../specs/install/spec.md)).
+4. **El autoarranque del puente no se prueba por el binario:** el daemon que lanza toma el puerto fijo del perfil y chocaría con un daemon dev de la máquina (el «Límite conocido» de [`specs/install`](../../../specs/install/spec.md)).
 
 ## Objetivo que sirve
 
