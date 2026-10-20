@@ -768,7 +768,7 @@ Después de `clawg stop --profile prod`, `scripts/install.ps1` MUST ejecutar `cl
 
 ### Escritura atómica de `workspace.md`
 
-`regenerate_auto_section` (`crates/clawg-core/src/memory/workspace.rs:57`) MUST escribir a un archivo temporal en el mismo directorio y hacer `rename` sobre `workspace.md` (`write_atomically`, `workspace.rs:416`). Si la escritura falla, `workspace.md` MUST quedar con su contenido anterior, sección USER incluida, y MUST NOT quedar ningún temporal.
+`regenerate_auto_section` (`crates/clawg-core/src/memory/workspace.rs:108`) MUST escribir a un archivo temporal en el mismo directorio y hacer `rename` sobre `workspace.md` (`write_atomically`, `workspace.rs:482`). Si la escritura falla, `workspace.md` MUST quedar con su contenido anterior, sección USER incluida, y MUST NOT quedar ningún temporal.
 
 #### Escenario
 - GIVEN un `workspace.md` con una sección USER escrita a mano

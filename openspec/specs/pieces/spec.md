@@ -103,7 +103,7 @@ El descarte es una función pura sobre los hits y los vínculos de sus filas. Si
 Un hit con vínculo MUST mostrar `piece=K/N` en su metadato:
 
 - `search_memory` (`crates/clawg-cli/src/mcp/tools.rs:98`): `{rank}. #{id} [{kind}/{type}/t{tier} piece={K}/{N} score={score}] {contenido}`;
-- `recall_context` (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:628-640`): `[YYYY-MM-DD #{id} {type} piece={K}/{N}] {contenido}` para `memory`; las otras tablas llevan su kind antes del tipo, como ya hacían.
+- `recall_context` (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:691-703`): `[YYYY-MM-DD #{id} {type} piece={K}/{N}] {contenido}` para `memory`; las otras tablas llevan su kind antes del tipo, como ya hacían.
 - un hit de otro agente suma ` by <autor>` antes del `]` en los dos ([`specs/sharing`](../sharing/spec.md) R4).
 
 Un hit sin vínculo MUST seguir con el formato de antes. `Hit` en el cliente (`crates/clawg-cli/src/client.rs:163`) MUST leer `piece` con `#[serde(default)]` (`client.rs:179`), así un daemon viejo sigue respondiendo.

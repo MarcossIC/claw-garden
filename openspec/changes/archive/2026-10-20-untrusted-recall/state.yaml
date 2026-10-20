@@ -1,0 +1,15 @@
+change: untrusted-recall
+objective: "3, 4"
+depends_on: []
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # Linux, the binary in a test home, the CI of the pull request on Linux and Windows, and rag-eval --real --agent-view
+  archive: done
+updated: 2026-10-20
+main_spec: openspec/specs/retrieval/spec.md, openspec/specs/sharing/spec.md, openspec/specs/project-docs/spec.md, openspec/specs/project/spec.md, openspec/specs/secrets/spec.md

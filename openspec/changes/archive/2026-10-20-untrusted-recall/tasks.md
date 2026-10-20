@@ -34,9 +34,9 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 ## 6. Verificación
 
 - [x] Suite y clippy en Linux sobre el último commit ([verify](verify.md)).
-- [ ] `rag-eval --real --agent-view` contra la línea base (necesita el modelo real y el golden set de `docs/eval/`, fuera de git).
-- [ ] El CI en verde en Linux y Windows.
+- [x] `rag-eval --real --agent-view` contra la línea base (necesita el modelo real y el golden set de `docs/eval/`, fuera de git); pidió leer el margen en el parser (`516ae81`).
+- [x] El CI en verde en Linux y Windows (run 39362286080 sobre `1706a5b`).
 
 ## 7. Archive
 
-- [ ] `specs/retrieval`, `specs/sharing`, `specs/project-docs`; `git mv` a `changes/archive/`; `state.yaml`; fila 52, `Ideas evaluadas` y el orden de ejecución del `README.md` de openspec; subir el minor.
+- [x] `specs/retrieval`, `specs/sharing`, `specs/project-docs` (y R6 de `specs/project` y R6 de `specs/secrets`, que describían lo que este cambio tocó); `git mv` a `changes/archive/2026-10-20-untrusted-recall`; `state.yaml`; fila 52, `Ideas evaluadas` y el orden de ejecución del `README.md` de openspec; subir el minor.

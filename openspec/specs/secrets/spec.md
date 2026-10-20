@@ -8,6 +8,7 @@ Fuente de verdad del comportamiento actual con secretos: el detector (formatos c
 - [redaction-precision](../../changes/archive/2026-10-15-redaction-precision/proposal.md), archivado el 2026-10-15 (`sk-` con la forma de una clave, la marca privada, los patrones por contexto y cuatro formatos nuevos en R1; lo guardado antes de una regla nueva en R4).
 - [conclusion-upkeep](../../changes/archive/2026-10-19-conclusion-upkeep/proposal.md), archivado el 2026-10-19 (R5: la purga deja los enlaces que nombran la fila como fuente).
 - [secret-coverage](../../changes/archive/2026-10-19-secret-coverage/proposal.md), archivado el 2026-10-19 (R1: `credential`, `huggingface_token`, `slack_webhook` y las formas nuevas de Slack, Stripe y PGP; R4: los `reason` de los veredictos; R5: el outbox del propio save, la cabecera de un save largo y la revival; R6: los `workspace.md`; R7, R8 y R9 nuevos).
+- [untrusted-recall](../../changes/archive/2026-10-20-untrusted-recall/proposal.md), archivado el 2026-10-20 (R6: un `workspace.md` guarda el texto en su forma cruda o en la copiada).
 
 ## Definiciones
 
@@ -283,7 +284,7 @@ MUST NOT hacer snapshot previo: sería una copia más de lo que se quiere sacar.
 
 Después de purgar, MUST revisar cada snapshot de `<data>/backups/` (los archivos con nombre de snapshot) y devolver los que tienen una fila con ese id y el mismo `content`, o una fila del outbox que R5 borraría, ordenados por nombre (`backups_holding`, `secrets.rs:377`). Un snapshot anterior a V14 no tiene la tabla del outbox, y eso MUST NOT contar como «puede tenerla» (`outbox_holds`, `secrets.rs:398`). Uno que no se puede leer MUST listarse también: puede tenerla. MUST NOT modificar ni borrar ningún backup. La salida MUST decir que esos archivos todavía tienen el texto y que borrarlos es decisión del usuario.
 
-También MUST leer cada `workspaces/<agente>/<proyecto>/workspace.md` del directorio de datos y devolver, ordenados por ruta, los que tienen el texto de la fila, cada uno con si está en la sección AUTO, fuera de ella o en los dos lugares (`workspaces_holding` y `sections_holding`, `crates/clawg-core/src/memory/workspace.rs:515` y `workspace.rs:499`; la decisión es pura). La sección AUTO copia el `content` entero de cada fila que elige (`render_rows`), y lo de fuera es del usuario. MUST NOT escribir ningún archivo: la salida MUST decir que la sección AUTO se reescribe en el próximo `recall_context` de ese agente en ese proyecto y que lo de fuera se edita a mano.
+También MUST leer cada `workspaces/<agente>/<proyecto>/workspace.md` del directorio de datos y devolver, ordenados por ruta, los que tienen el texto de la fila, cada uno con si está en la sección AUTO, fuera de ella o en los dos lugares (`workspaces_holding` y `sections_holding`, `crates/clawg-core/src/memory/workspace.rs:523` y `workspace.rs:508`; la decisión es pura). La sección AUTO copia el `content` entero de cada fila que elige (`render_rows`) en su forma copiada, con cada línea después de la primera detrás del margen `  | ` y cada `<!--` como `<! --` ([`specs/retrieval`](../retrieval/spec.md), «Un texto copiado al workspace no rompe `workspace.md`»), y lo de fuera es del usuario. Por eso el texto MUST buscarse en las dos formas: la cruda, que tiene un archivo escrito por una versión anterior, y la copiada. MUST NOT escribir ningún archivo: la salida MUST decir que la sección AUTO se reescribe en el próximo `recall_context` de ese agente en ese proyecto y que lo de fuera se edita a mano.
 
 #### Escenario
 - GIVEN un backup manual tomado con la fila y otro tomado después de borrarla con el delete
@@ -303,7 +304,10 @@ También MUST leer cada `workspaces/<agente>/<proyecto>/workspace.md` del direct
 - WHEN se purga la fila
 - THEN el resultado nombra los dos primeros, cada uno con su sección, y los tres archivos quedan byte a byte iguales
 
-**Tests:** `purge_names_the_backups_that_still_hold_the_row`, `purge_removes_the_text_from_the_outbox` (el backup que sólo tiene el texto en el outbox), `a_backup_from_before_the_outbox_is_not_named_for_it` y `purge_names_the_workspaces_that_still_hold_the_text` (`crates/clawg-core/src/memory/secrets.rs`); `the_sections_holding_a_text_are_told_apart` (`crates/clawg-core/src/memory/workspace.rs`); `the_purge_report_names_backups_to_delete_by_hand` y `the_purge_report_names_what_came_back_and_what_went` (`crates/clawg-cli/src/secrets.rs`).
+- GIVEN un texto de dos líneas con un `<!--`, copiado a la sección AUTO de un `workspace.md` en su forma copiada, y el mismo texto crudo en la sección USER de otro
+- THEN `sections_holding` encuentra el primero en AUTO y el segundo fuera de ella
+
+**Tests:** `purge_names_the_backups_that_still_hold_the_row`, `purge_removes_the_text_from_the_outbox` (el backup que sólo tiene el texto en el outbox), `a_backup_from_before_the_outbox_is_not_named_for_it` y `purge_names_the_workspaces_that_still_hold_the_text` (`crates/clawg-core/src/memory/secrets.rs`); `the_sections_holding_a_text_are_told_apart` y `sections_holding_finds_the_copied_form` (`crates/clawg-core/src/memory/workspace.rs`); `the_purge_report_names_backups_to_delete_by_hand` y `the_purge_report_names_what_came_back_and_what_went` (`crates/clawg-cli/src/secrets.rs`).
 
 ## Texto libre fuera de `memory`
 

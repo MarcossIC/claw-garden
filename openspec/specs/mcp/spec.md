@@ -186,7 +186,7 @@ El texto de `ClientError::Unauthorized` de la CLI (`crates/clawg-cli/src/client.
 
 **Tests:** `a_daemon_stopped_mid_session_is_reported_without_starting_one` (`mcp/server.rs`).
 
-**Registro del proyecto.** `ClawgMcp::project_for` (`crates/clawg-cli/src/mcp/server.rs:671`) registra cada raíz y su id heredado una sola vez por proceso. Si el registro falla con una falla que se resuelve releyendo, la entrada se quita (`server.rs:698-700`) y el siguiente envío, incluida la repetición de la llamada, lo vuelve a mandar. Una colisión (409 `project_root_collision`) también quita la entrada, pero hace fallar la herramienta ([`specs/project`](../project/spec.md), R6). Cualquier otra falla cuenta como enviada, para no costarle un pedido a cada herramienta frente a un daemon que no sabe registrar.
+**Registro del proyecto.** `ClawgMcp::project_for` (`crates/clawg-cli/src/mcp/server.rs:695`) registra cada raíz y su id heredado una sola vez por proceso. Si el registro falla con una falla que se resuelve releyendo, la entrada se quita (`server.rs:722-724`) y el siguiente envío, incluida la repetición de la llamada, lo vuelve a mandar. Una colisión (409 `project_root_collision`) también quita la entrada, pero hace fallar la herramienta ([`specs/project`](../project/spec.md), R6). Cualquier otra falla cuenta como enviada, para no costarle un pedido a cada herramienta frente a un daemon que no sabe registrar.
 
 #### Escenario: el registro que el daemon anterior rechazó
 - GIVEN un puente cuyo daemon se reinició, con el token viejo guardado
@@ -310,7 +310,7 @@ Qué hace un save con clave y cómo se valida está en [`specs/ingest`](../inges
 - Un hit de `search_memory` MUST mostrar ` topic=K` después del `score` cuando la fila es del lector y tiene clave (`format_hits`, `tools.rs:98`): `N. #id [kind/tipo/tN score=S topic=K] contenido`. Uno de otro agente MUST NOT mostrarla, porque un save con esa clave sólo revisa filas propias y la clave prometería una revisión que el lector no puede hacer. Un hit sin clave MUST quedar como antes.
 - `read_memory` MUST mostrarla en la cabecera (`format_save`, `tools.rs:182`; [`specs/pieces`](../pieces/spec.md), R6). Lee siempre filas del lector, así que no necesita la regla de los hits ajenos.
 - `POST /v1/search` MUST devolver `topic_key` en cada hit de una fila que la tiene (`RankedHit.topic_key`, `crates/clawg-core/src/memory/search.rs:129`; el cliente la lee con `#[serde(default)]` en `Hit`, `crates/clawg-cli/src/client.rs:188`), y `GET /v1/memories/{kind}/{id}/save` la de la fila pedida. Un hit de una fila sin clave, y el de `episodic_trajectory` o `procedural_skill`, que no tienen la columna, MUST NOT llevar el campo.
-- `recall_context` no muestra la clave (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:628`): es un prompt con presupuesto y cada byte cuenta.
+- `recall_context` no muestra la clave (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:691`): es un prompt con presupuesto y cada byte cuenta.
 
 #### Escenario: otra sesión revisa la decisión
 - GIVEN una `architectural_decision` guardada con la clave `cli/tui/library`
