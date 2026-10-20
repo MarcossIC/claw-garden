@@ -1760,9 +1760,10 @@ fn not_accepted(root: &std::path::Path, profile: Profile) -> String {
         other => format!(" --profile {}", other.as_str()),
     };
     format!(
-        "clawg reads the files of the project a bridge was started in, and of the ones the user \
-         added; {root} is neither. Ask the user to run `clawg projects add \"{root}\"{flag}` if \
-         they want it searched, then call again",
+        "clawg reads the files of the projects the user added, and of the one a bridge was \
+         started in when that folder has a .git or a manifest and is not the home directory or a \
+         filesystem root; {root} is neither. Ask the user to run `clawg projects add \"{root}\"{flag}` \
+         if they want it searched, then call again",
         root = root.display()
     )
 }

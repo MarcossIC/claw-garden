@@ -29,6 +29,8 @@ use std::sync::Arc;
 use clawg_core::memory::dispute::Verdict;
 use clawg_core::memory::sharing;
 use clawg_core::memory::store_insert::MemoryType;
+use clawg_core::memory::project_docs::corpus::{auto_indexable, has_project_marker};
+use clawg_core::memory::identity::strip_verbatim;
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -375,12 +377,23 @@ pub struct ClawgMcp {
     declared: Arc<std::sync::Mutex<Option<String>>>,
     /// The project the bridge process itself is sitting in.
     default_project: Option<ProjectIdentity>,
+    /// `default_project` when it is a project whose files the daemon may read
+    /// without the user adding it (see [`own_root_to_index`]).
+    docs_root: Option<ProjectIdentity>,
     /// Roots (with the legacy id they were reached through) already sent to
     /// `POST /v1/projects` by this process. Shared by every clone, because rmcp
     /// clones the server per call.
     registered: Arc<tokio::sync::Mutex<HashSet<(PathBuf, String)>>>,
     profile: Profile,
     tool_router: ToolRouter<Self>,
+}
+
+/// The bridge's own project, when its root is one the daemon may read on its
+/// own: a folder with a `.git` or a manifest, other than the home directory.
+/// The working directory is whatever the client was opened in, `~` included.
+fn own_root_to_index(project: Option<&ProjectIdentity>) -> Option<ProjectIdentity> {
+    let home = clawg_core::paths::home_dir().map(|h| std::fs::canonicalize(&h).map(|c| strip_verbatim(&c)).unwrap_or(h));
+    project.filter(|p| auto_indexable(&p.root, home.as_deref(), has_project_marker(&p.root))).cloned()
 }
 
 impl ClawgMcp {
@@ -421,6 +434,7 @@ impl ClawgMcp {
             client,
             configured_agent: None,
             declared: Arc::default(),
+            docs_root: own_root_to_index(default_project.as_ref()),
             default_project,
             registered: Arc::default(),
             profile,
@@ -686,7 +700,7 @@ impl ClawgMcp {
         if registered.insert((project.root.clone(), project.legacy_id.clone())) {
             let legacy: Vec<String> =
                 Some(project.legacy_id.clone()).filter(|l| *l != project.id).into_iter().collect();
-            let index_docs = indexes_docs(&project, self.default_project.as_ref());
+            let index_docs = indexes_docs(&project, self.docs_root.as_ref());
             if let Err(e) = client.register_project(&project.root, &legacy, index_docs).await {
                 if is_root_collision(&e) {
                     registered.remove(&(project.root.clone(), project.legacy_id.clone()));
@@ -1495,6 +1509,26 @@ mod tests {
         assert_eq!(rows_in(&b, &other.id).await, 1);
         assert_eq!(index_docs_of(&store, &other.id).await, Some(0));
         assert_eq!(clawg_core::memory::project_docs::doc_count(&store, &other.id).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_bridge_in_a_folder_that_is_not_a_project_indexes_nothing() {
+        let (_folder, identity) = elsewhere();
+        let (b, _d, store) = bridge_with_store(identity.clone()).await;
+
+        let saved = b.save_memory_impl("a", save_args("kept in a folder of notes")).await.unwrap();
+        assert!(!is_error(&saved), "{}", text(&saved));
+        let found = b
+            .search_project_impl(SearchProjectArgs { query: "What lives outside the repo".into(), limit: None, project_path: None })
+            .await
+            .unwrap();
+
+        let out = text(&found);
+        assert!(is_error(&found), "{out}");
+        assert!(out.contains("has a .git or a manifest and is not the home directory"), "{out}");
+        assert!(out.contains(&format!("clawg projects add \"{}\" --profile dev", identity.root.display())), "{out}");
+        assert_eq!(index_docs_of(&store, &identity.id).await, Some(0));
+        assert_eq!(clawg_core::memory::project_docs::doc_count(&store, &identity.id).await.unwrap(), 0);
     }
 
     #[tokio::test]
