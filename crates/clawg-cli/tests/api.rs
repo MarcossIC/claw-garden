@@ -3135,3 +3135,67 @@ async fn registering_a_project_wakes_an_unloaded_model_without_waiting_for_it() 
     }
     assert_eq!(h.reloads.load(Ordering::SeqCst), 1);
 }
+
+// ── /v1/import ──────────────────────────────────────────────────────────────
+
+/// An export of two rows of agent `a`, the second replaced by the first.
+fn export_file(version: u32) -> String {
+    let header = json!({
+        "kind": "header", "format": "clawg-memories", "version": version, "exported_at": 0, "clawg": "0.0.0",
+        "filter": {"project": null, "agent": null, "include_deleted": false},
+    });
+    let row = |id: i64, content: &str, status: &str, by: Option<i64>| {
+        json!({
+            "kind": "memory", "id": id, "scope": "agent", "agent_id": "a", "content": content,
+            "memory_type": "semantic_fact", "source": "explicit", "created_at": 1_000 + id,
+            "created_by_type": "agent", "last_modified_at": 1_000 + id, "last_accessed_at": 9_000,
+            "access_count": 7, "importance": 6.0, "tier": 2, "status": status, "superseded_by": by,
+            "supersede_cause": by.map(|_| "verdict"),
+        })
+    };
+    [header, row(1, "Imported port is 4000", "active", None), row(2, "Imported port was 3000", "superseded", Some(1))]
+        .iter()
+        .map(|l| format!("{l}\n"))
+        .collect()
+}
+
+#[tokio::test]
+async fn an_import_stores_rows_with_their_state_and_a_dry_run_stores_none() {
+    let h = Harness::start().await;
+    let (status, dry) = h.post_json("/v1/import", json!({ "text": export_file(1), "dry_run": true })).await;
+    assert_eq!(status, 200, "{dry}");
+    assert_eq!((dry["dry_run"].clone(), dry["inserted"].clone(), dry["snapshot"].clone()), (json!(true), json!(2), Value::Null));
+    let (_, listed) = h.get_json("/v1/memories?kind=memory&agent=a").await;
+    assert_eq!(listed["items"].as_array().map(Vec::len), Some(0), "{listed}");
+
+    let (status, report) = h.post_json("/v1/import", json!({ "text": export_file(1), "agent": "b" })).await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(report["inserted"], 2, "{report}");
+    assert_eq!(report["by_state"], json!({ "live": 1, "superseded": 1 }));
+    let snapshot = report["snapshot"].as_str().expect("a snapshot");
+    assert!(snapshot.ends_with("-pre-import.db") && std::path::Path::new(snapshot).exists(), "{snapshot}");
+
+    let (_, listed) = h.get_json("/v1/memories?kind=memory&agent=b&status=active").await;
+    let live = listed["items"].as_array().and_then(|r| r.first()).cloned().unwrap_or(Value::Null);
+    assert_eq!(
+        (live["summary"].clone(), live["access_count"].clone(), live["tier"].clone()),
+        (json!("Imported port is 4000"), json!(7), json!(2)),
+        "{listed}"
+    );
+    let (_, found) = h.post_json("/v1/search", json!({ "query": "Imported port is 4000", "agent_id": "b" })).await;
+    assert_eq!(found["hits"][0]["id"], live["id"], "{found}");
+}
+
+#[tokio::test]
+async fn import_answers_400_for_an_unknown_version_before_the_embedder() {
+    let h = Harness::start_without_embedder().await;
+    let (status, body) = h.post_json("/v1/import", json!({ "text": export_file(2) })).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body["error"].as_str().unwrap_or("").contains("version 2"), "{body}");
+    let (status, body) = h.post_json("/v1/import", json!({ "text": export_file(1) })).await;
+    assert_eq!((status, body["error"].clone()), (503, json!("embedder_not_ready")), "{body}");
+    let (status, body) = h.post_json("/v1/import", json!({ "text": export_file(1), "dry_run": true })).await;
+    assert_eq!(status, 200, "a dry run needs no model: {body}");
+    let (status, body) = h.post_json("/v1/import", json!({ "text": export_file(1), "agent": "  " })).await;
+    assert_eq!(status, 400, "{body}");
+}

@@ -77,6 +77,49 @@ pub enum Command {
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Write the stored memories, one row per line with their states and
+    /// links, to a file another profile or machine can import, or as Markdown
+    /// to read. Read-only; works with the daemon running.
+    Export {
+        /// The file to write. It must not exist yet; on Unix only its owner
+        /// can read it, since it holds the text of every memory it takes.
+        #[arg(long, value_name = "FILE")]
+        out: PathBuf,
+        /// Only the memories of the project this directory is in.
+        #[arg(long, value_name = "PATH")]
+        project: Option<PathBuf>,
+        /// Only this agent's memories.
+        #[arg(long, value_parser = parse_agent)]
+        agent: Option<String>,
+        /// Take the deleted memories too; they are imported deleted.
+        #[arg(long)]
+        include_deleted: bool,
+        /// `jsonl` for `clawg import`, `markdown` to read.
+        #[arg(long, value_enum, default_value_t = ExportFormat::Jsonl)]
+        format: ExportFormat,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Import a file `clawg export` wrote, keeping each memory's dates,
+    /// accesses, state and links. Needs a running daemon, which embeds each
+    /// memory again; the store is snapshotted first. Importing a file twice
+    /// adds nothing.
+    Import {
+        /// The file `clawg export` wrote.
+        file: PathBuf,
+        /// Report what would be imported, and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Store every memory that has an agent under this one instead.
+        #[arg(long, value_parser = parse_agent)]
+        agent: Option<String>,
+        /// Store the memories of the exported project root OLD in the project
+        /// the directory NEW is in. Repeat it for each root that moved.
+        #[arg(long = "map-root", value_name = "OLD=NEW", value_parser = parse_root_map)]
+        map_root: Vec<RootMap>,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
     /// List the stored memories and verdict reasons that hold a secret of a
     /// known format, by id and kind, never the secret. Read-only; works with
     /// the daemon running.
@@ -188,6 +231,33 @@ pub enum Command {
         #[command(subcommand)]
         action: PathAction,
     },
+}
+
+/// What `clawg export` writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ExportFormat {
+    /// JSON Lines, one row per line, that `clawg import` reads.
+    Jsonl,
+    /// A view to read, by project and type.
+    Markdown,
+}
+
+/// An exported project root and the directory whose project takes its rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootMap {
+    pub old: String,
+    pub new: PathBuf,
+}
+
+/// `OLD=NEW`, split at the first `=`. OLD is kept as written: it names a root
+/// on the machine that exported, which need not exist here.
+fn parse_root_map(raw: &str) -> Result<RootMap, String> {
+    match raw.split_once('=') {
+        Some((old, new)) if !old.is_empty() && !new.is_empty() => {
+            Ok(RootMap { old: old.to_string(), new: PathBuf::from(new) })
+        }
+        _ => Err(format!("{raw:?} is not OLD=NEW")),
+    }
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -587,6 +657,61 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).expect("parse")
+    }
+
+    #[test]
+    fn export_takes_its_filters_and_a_format() {
+        assert_eq!(
+            parse(&["clawg", "export", "--out", "m.jsonl"]).command,
+            Command::Export {
+                out: PathBuf::from("m.jsonl"),
+                project: None,
+                agent: None,
+                include_deleted: false,
+                format: ExportFormat::Jsonl,
+                profile: ProfileArg { profile: None },
+            }
+        );
+        assert_eq!(
+            parse(&[
+                "clawg", "export", "--out", "m.md", "--project", ".", "--agent", " codex ", "--include-deleted",
+                "--format", "markdown", "--profile", "dev",
+            ])
+            .command,
+            Command::Export {
+                out: PathBuf::from("m.md"),
+                project: Some(PathBuf::from(".")),
+                agent: Some("codex".into()),
+                include_deleted: true,
+                format: ExportFormat::Markdown,
+                profile: ProfileArg { profile: Some("dev".into()) },
+            }
+        );
+        assert!(Cli::try_parse_from(["clawg", "export"]).is_err(), "--out is required");
+    }
+
+    #[test]
+    fn import_takes_a_file_and_repeated_root_maps() {
+        assert_eq!(
+            parse(&[
+                "clawg", "import", "m.jsonl", "--dry-run", "--agent", "dev", "--map-root", "/a/repo=.",
+                "--map-root", "C:\\work=D:\\work",
+            ])
+            .command,
+            Command::Import {
+                file: PathBuf::from("m.jsonl"),
+                dry_run: true,
+                agent: Some("dev".into()),
+                map_root: vec![
+                    RootMap { old: "/a/repo".into(), new: PathBuf::from(".") },
+                    RootMap { old: "C:\\work".into(), new: PathBuf::from("D:\\work") },
+                ],
+                profile: ProfileArg { profile: None },
+            }
+        );
+        for bad in ["/a/repo", "=.", "/a/repo="] {
+            assert!(Cli::try_parse_from(["clawg", "import", "m.jsonl", "--map-root", bad]).is_err(), "{bad}");
+        }
     }
 
     #[test]

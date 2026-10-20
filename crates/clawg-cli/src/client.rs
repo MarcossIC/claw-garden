@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use clawg_core::memory::dispute::{OpenPairs, Resolution};
 use clawg_core::memory::outbox::OutboxSummary;
+use clawg_core::memory::portability::ImportReport;
 use clawg_core::memory::store_lock::{StoreHolder, StoreLock, StoreOwner};
 use clawg_core::paths::{data_dir, PathsError, Profile};
 use clawg_core::private_dir::ensure_private_dir;
@@ -1085,6 +1086,26 @@ impl DaemonClient {
             .await
             .map_err(Self::map_transport)?;
         Ok(Self::read_response::<Body>(resp).await?.path)
+    }
+
+    /// Imports the export `text`. `map_roots` pairs an exported root with
+    /// the root it has here, already resolved.
+    pub async fn import(
+        &self,
+        text: &str,
+        dry_run: bool,
+        agent: Option<&str>,
+        map_roots: &[(String, String)],
+    ) -> Result<ImportReport, ClientError> {
+        let resp = self
+            .http
+            .post(self.url("/v1/import"))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "text": text, "dry_run": dry_run, "agent": agent, "map_roots": map_roots }))
+            .send()
+            .await
+            .map_err(Self::map_transport)?;
+        Self::read_response(resp).await
     }
 
     /// Records `root` as a project and moves rows saved under `legacy_ids`

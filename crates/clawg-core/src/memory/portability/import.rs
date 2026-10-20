@@ -33,6 +33,10 @@ use crate::memory::redact::redact;
 use crate::memory::vector::to_unit;
 use crate::memory::{MemoryError, MemoryStore};
 
+/// The largest file an import reads, in bytes. Every row of it is held in
+/// memory while it is placed, embedded and written.
+pub const MAX_IMPORT_BYTES: usize = 256 * 1024 * 1024;
+
 /// Rows written per transaction.
 const WRITE_BATCH: usize = 256;
 /// Texts embedded per call.
