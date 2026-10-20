@@ -721,7 +721,7 @@ async fn save_and_patch_accept_the_same_memory_types() {
             .await;
         let patched = h
             .authed(h.http.patch(h.url(&format!("/v1/memories/memory/{id}"))))
-            .json(&json!({ "memory_type": raw }))
+            .json(&json!({ "memory_type": raw, "user_answered": true }))
             .send()
             .await
             .expect("request")
@@ -2042,6 +2042,37 @@ async fn judge_refuses_scoped_without_reason() {
 }
 
 #[tokio::test]
+async fn a_protected_verdict_without_the_answer_is_a_409() {
+    let h = Harness::start().await;
+    let (old, new) = seed_dispute(&h).await;
+    h.ctx
+        .runtime
+        .store
+        .conn
+        .call(move |c| c.execute("UPDATE memory SET memory_type = 'user_preference' WHERE id = ?1", [old]))
+        .await
+        .expect("make the old row a preference");
+    let judge = |extra: serde_json::Value| {
+        let mut body = json!({ "keep": new, "other": old, "verdict": "supersedes", "agent_id": "agent-http" });
+        body.as_object_mut().expect("object").extend(extra.as_object().expect("object").clone());
+        body
+    };
+
+    let (status, body) = h.post_json("/v1/disputes/judge", judge(json!({}))).await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body["error"].as_str().is_some_and(|e| e.contains("user_answered")), "{body}");
+
+    let (status, body) = h.post_json("/v1/disputes/judge", judge(json!({ "user_answered": true }))).await;
+    assert_eq!(status, 400, "{body}");
+
+    let (status, body) = h
+        .post_json("/v1/disputes/judge", judge(json!({ "user_answered": true, "reason": "port 9090 from now on" })))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["other"], json!({ "id": old, "status": "superseded", "superseded_by": new }));
+}
+
+#[tokio::test]
 async fn disputes_lists_pending_pairs_of_the_agent() {
     let h = Harness::start().await;
     let (old, new) = seed_dispute(&h).await;
@@ -2149,6 +2180,30 @@ async fn patch_changes_importance_and_type_and_reports_the_row() {
     assert_eq!(row["item"]["memory_type"], "user_preference", "{row}");
     assert_eq!(row["item"]["tier"], 1, "{row}");
     assert_eq!(row["item"]["update_count"], 1, "{row}");
+}
+
+#[tokio::test]
+async fn a_demotion_without_the_answer_is_a_409() {
+    let h = Harness::start().await;
+    h.post_json(
+        "/v1/memories",
+        json!({ "content": CONTENT, "agent_id": "agent-http", "memory_type": "user_preference" }),
+    )
+    .await;
+    let id = h.wait_for_rows("memory", 1).await[0]["id"].as_i64().expect("id");
+    let patch = |body: Value| h.authed(h.http.patch(h.url(&format!("/v1/memories/memory/{id}")))).json(&body).send();
+
+    let r = patch(json!({ "memory_type": "semantic_fact" })).await.expect("request");
+    assert_eq!(r.status(), 409);
+    let body: Value = r.json().await.expect("json");
+    assert!(body["error"].as_str().is_some_and(|e| e.contains("user_answered")), "{body}");
+    let (_, row) = h.get_json(&format!("/v1/memories/memory/{id}")).await;
+    assert_eq!(row["item"]["memory_type"], "user_preference", "{row}");
+
+    let r = patch(json!({ "memory_type": "semantic_fact", "user_answered": true })).await.expect("request");
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.expect("json");
+    assert_eq!(body["memory_type"], "semantic_fact", "{body}");
 }
 
 #[tokio::test]

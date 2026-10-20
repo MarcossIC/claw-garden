@@ -320,6 +320,10 @@ pub struct UpdateMemoryArgs {
     #[serde(default)]
     #[schemars(transform = memory_type_enum)]
     pub memory_type: Option<String>,
+    /// True only when the user told you to: taking a user_preference or an
+    /// architectural_decision out of its type needs it.
+    #[serde(default)]
+    pub user_answered: bool,
 }
 
 /// The line `save_memory` adds when the save is close to earlier memories:
@@ -359,9 +363,15 @@ pub struct ResolveConflictArgs {
     /// in `reason`. conflicts: they do, and the user has to say which holds.
     #[schemars(transform = verdict_enum)]
     pub verdict: String,
-    /// One sentence on why; required for scoped.
+    /// One sentence on why; required for scoped, and with user_answered the
+    /// user's answer.
     #[serde(default)]
     pub reason: Option<String>,
+    /// True only when the user has said which holds, with their answer in
+    /// reason. Superseding a user_preference or an architectural_decision
+    /// needs it.
+    #[serde(default)]
+    pub user_answered: bool,
 }
 
 // ── The server ──────────────────────────────────────────────────────────────
@@ -916,7 +926,14 @@ impl ClawgMcp {
         let result = self
             .call(|client| async move {
                 client
-                    .update(&args.kind, args.id, args.importance, args.memory_type.as_deref(), Some(agent_id))
+                    .update(
+                        &args.kind,
+                        args.id,
+                        args.importance,
+                        args.memory_type.as_deref(),
+                        args.user_answered,
+                        Some(agent_id),
+                    )
                     .await
             })
             .await;
@@ -936,7 +953,9 @@ impl ClawgMcp {
         let args = &args;
         let result = self
             .call(|client| async move {
-                client.judge(args.keep, args.other, &args.verdict, args.reason.as_deref(), Some(agent_id)).await
+                client
+                    .judge(args.keep, args.other, &args.verdict, args.reason.as_deref(), args.user_answered, Some(agent_id))
+                    .await
             })
             .await;
         match result {
@@ -1166,10 +1185,12 @@ impl ClawgMcp {
         name = "update_memory",
         description = "Correct the importance or the type of one stored memory, by id and kind, \
                        when the user says it matters more or less than it was saved with, or \
-                       that it is a different kind of memory. Pass only what changes. To change \
-                       what a memory says, save the new text and delete the old one instead. \
-                       Returns the memory's importance, type and tier after the change. Only \
-                       your own memories: one marked `by <agent>` is read-only."
+                       that it is a different kind of memory. Pass only what changes. Taking a \
+                       preference or a decision out of its type needs user_answered, set only \
+                       when the user said so. To change what a memory says, save the new text \
+                       and delete the old one instead. Returns the memory's importance, type and \
+                       tier after the change. Only your own memories: one marked `by <agent>` is \
+                       read-only."
     )]
     async fn update_memory(
         &self,
@@ -1184,9 +1205,10 @@ impl ClawgMcp {
         description = "Judge a pair of memories the detector found close to each other: one \
                        that `save_memory` or `memory_status` names, which you judge yourself, or \
                        one under ACTIVE CONFLICTS in `recall_context`, once the user has said \
-                       which holds. A preference or a decision is superseded only after the user \
-                       answered: until then judge it conflicts. Returns the status of both \
-                       memories. Only your own memories: one marked `by <agent>` is read-only."
+                       which holds. A preference or a decision is superseded only on the user's \
+                       word: judge it conflicts and ask, then call supersedes with user_answered \
+                       and their answer in reason. Returns the status of both memories. Only \
+                       your own memories: one marked `by <agent>` is read-only."
     )]
     async fn resolve_conflict(
         &self,
@@ -2918,7 +2940,7 @@ mod tests {
             .expect("mark the dispute");
 
         let r = b
-            .resolve_conflict_impl("agent-mcp", ResolveConflictArgs { keep: new, other: old, verdict: "supersedes".into(), reason: None })
+            .resolve_conflict_impl("agent-mcp", ResolveConflictArgs { keep: new, other: old, verdict: "supersedes".into(), reason: None, user_answered: false })
             .await
             .expect("call");
 
@@ -2928,7 +2950,7 @@ mod tests {
         let r = b
             .resolve_conflict_impl(
                 "agent-mcp",
-                ResolveConflictArgs { keep: old, other: new, verdict: "conflicts".into(), reason: None },
+                ResolveConflictArgs { keep: old, other: new, verdict: "conflicts".into(), reason: None, user_answered: false },
             )
             .await
             .expect("call");
@@ -2939,7 +2961,7 @@ mod tests {
         let r = b
             .resolve_conflict_impl(
                 "agent-mcp",
-                ResolveConflictArgs { keep: old, other: new, verdict: "scoped".into(), reason: None },
+                ResolveConflictArgs { keep: old, other: new, verdict: "scoped".into(), reason: None, user_answered: false },
             )
             .await
             .expect("call");
@@ -3058,7 +3080,7 @@ mod tests {
         let r = b
             .resolve_conflict_impl(
                 "agent-mcp",
-                ResolveConflictArgs { keep: 2, other: 1, verdict: "compatible".into(), reason: None },
+                ResolveConflictArgs { keep: 2, other: 1, verdict: "compatible".into(), reason: None, user_answered: false },
             )
             .await
             .expect("call");
@@ -3071,7 +3093,7 @@ mod tests {
     async fn resolve_conflict_reports_a_refusal() {
         let (b, _d) = bridge().await;
         let r = b
-            .resolve_conflict_impl("agent-mcp", ResolveConflictArgs { keep: 4, other: 4, verdict: "compatible".into(), reason: None })
+            .resolve_conflict_impl("agent-mcp", ResolveConflictArgs { keep: 4, other: 4, verdict: "compatible".into(), reason: None, user_answered: false })
             .await
             .expect("call");
         assert!(is_error(&r));
@@ -3244,7 +3266,7 @@ mod tests {
     }
 
     fn update_args(id: i64, importance: Option<f64>, memory_type: Option<&str>) -> UpdateMemoryArgs {
-        UpdateMemoryArgs { id, kind: "memory".into(), importance, memory_type: memory_type.map(Into::into) }
+        UpdateMemoryArgs { id, kind: "memory".into(), importance, memory_type: memory_type.map(Into::into), user_answered: false }
     }
 
     #[tokio::test]
@@ -3262,6 +3284,58 @@ mod tests {
         let r = b.update_memory_impl("agent-a", update_args(id, Some(11.0), None)).await.expect("call");
         assert!(is_error(&r), "{}", text(&r));
         assert!(text(&r).contains("importance"), "{}", text(&r));
+    }
+
+    #[tokio::test]
+    async fn update_memory_sends_the_users_answer() {
+        let (b, _d) = bridge().await;
+        let id = saved_id(&b, "agent-a", "the user prefers tabs over spaces").await;
+        b.update_memory_impl("agent-a", update_args(id, None, Some("user_preference"))).await.expect("call");
+
+        let r = b.update_memory_impl("agent-a", update_args(id, None, Some("semantic_fact"))).await.expect("call");
+        assert!(is_error(&r) && text(&r).contains("user_answered"), "{}", text(&r));
+
+        let declared = UpdateMemoryArgs { user_answered: true, ..update_args(id, None, Some("semantic_fact")) };
+        let r = b.update_memory_impl("agent-a", declared).await.expect("call");
+        assert!(!is_error(&r), "{}", text(&r));
+        assert!(text(&r).contains("semantic_fact"), "{}", text(&r));
+    }
+
+    #[tokio::test]
+    async fn resolve_conflict_sends_the_users_answer() {
+        let mut store = None;
+        let (b, _d) = bridge_with(|runtime| {
+            store = Some(runtime.store.clone());
+            runtime
+        })
+        .await;
+        let old = saved_id(&b, "agent-a", "the user prefers tabs over spaces").await;
+        let new = saved_id(&b, "agent-a", "the user prefers spaces over tabs").await;
+        store
+            .expect("the runtime's store")
+            .conn
+            .call(move |c| {
+                c.execute_batch(&format!(
+                    "UPDATE memory SET memory_type = 'user_preference' WHERE id = {old}; \
+                     UPDATE memory SET status = 'disputed', disputed_against = '[{old}]' WHERE id = {new};"
+                ))
+            })
+            .await
+            .expect("mark the dispute");
+        let args = |user_answered, reason: Option<&str>| ResolveConflictArgs {
+            keep: new,
+            other: old,
+            verdict: "supersedes".into(),
+            reason: reason.map(Into::into),
+            user_answered,
+        };
+
+        let r = b.resolve_conflict_impl("agent-a", args(false, None)).await.expect("call");
+        assert!(is_error(&r) && text(&r).contains("user_answered"), "{}", text(&r));
+
+        let r = b.resolve_conflict_impl("agent-a", args(true, Some("spaces from now on"))).await.expect("call");
+        assert!(!is_error(&r), "{}", text(&r));
+        assert_eq!(text(&r), format!("#{new} active\n#{old} superseded by #{new}"));
     }
 
     #[tokio::test]
@@ -3311,7 +3385,7 @@ mod tests {
             .expect("mark the dispute");
 
         let r = b
-            .resolve_conflict_impl("agent-b", ResolveConflictArgs { keep: new, other: old, verdict: "supersedes".into(), reason: None })
+            .resolve_conflict_impl("agent-b", ResolveConflictArgs { keep: new, other: old, verdict: "supersedes".into(), reason: None, user_answered: false })
             .await
             .expect("call");
 

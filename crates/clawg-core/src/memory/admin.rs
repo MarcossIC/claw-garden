@@ -155,6 +155,7 @@ pub enum PatchError {
 pub struct MemoryPatch {
     importance: Option<f64>,
     memory_type: Option<MemoryType>,
+    user_answered: bool,
 }
 
 impl MemoryPatch {
@@ -175,8 +176,27 @@ impl MemoryPatch {
             Some(_) if kind != MemoryKind::Memory => return Err(PatchError::TypeOnlyOnMemory(kind)),
             Some(raw) => Some(raw.parse::<MemoryType>()?),
         };
-        Ok(Self { importance, memory_type })
+        Ok(Self { importance, memory_type, user_answered: false })
     }
+
+    /// The caller declares the user answered, which taking a preference or a
+    /// decision out of its type needs. Nothing records it: the row keeps no
+    /// reason for a change.
+    pub fn answered(mut self, user_answered: bool) -> Self {
+        self.user_answered = user_answered;
+        self
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum UpdateError {
+    #[error(
+        "memory {id} is a {from}, so it loses that type only on the user's word: ask the user, \
+         then call again with `user_answered`"
+    )]
+    NeedsUser { id: i64, from: String },
+    #[error(transparent)]
+    Store(#[from] MemoryError),
 }
 
 /// How a changed row ended up.
@@ -216,7 +236,7 @@ pub async fn update_memory_core(
     kind: MemoryKind,
     patch: &MemoryPatch,
     owner: Option<&str>,
-) -> Result<Option<UpdatedRow>, MemoryError> {
+) -> Result<Option<UpdatedRow>, UpdateError> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -231,22 +251,28 @@ pub async fn update_memory_core(
 
     store
         .conn
-        .call(move |c| {
+        .call(move |c| -> Result<Option<UpdatedRow>, UpdateError> {
             use rusqlite::OptionalExtension;
-            let tx = c.transaction()?;
+            let tx = c.transaction().map_err(MemoryError::Sqlite)?;
             let current: Option<(i64, f64, String, i64)> = tx
                 .query_row(read_sql, rusqlite::params![id, owner], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
                 })
-                .optional()?;
+                .optional()
+                .map_err(MemoryError::Sqlite)?;
             let Some((tier, importance, memory_type, access_count)) = current else {
                 return Ok(None);
             };
+            let demoted = patch.memory_type.is_some_and(|t| !t.is_protected());
+            if demoted && MemoryType::is_protected_name(&memory_type) && !patch.user_answered {
+                return Err(UpdateError::NeedsUser { id, from: memory_type });
+            }
             let new_importance = patch.importance.unwrap_or(importance);
             let new_type = patch.memory_type.map_or(memory_type.clone(), |t| t.as_str().to_string());
             let new_tier = retier(tier, access_count, (importance, &memory_type), (new_importance, &new_type));
-            tx.execute(write_sql, rusqlite::params![new_importance, new_type, new_tier, now_ms, id])?;
-            tx.commit()?;
+            tx.execute(write_sql, rusqlite::params![new_importance, new_type, new_tier, now_ms, id])
+                .map_err(MemoryError::Sqlite)?;
+            tx.commit().map_err(MemoryError::Sqlite)?;
             Ok(Some(UpdatedRow {
                 id,
                 kind,
@@ -257,11 +283,11 @@ pub async fn update_memory_core(
         })
         .await
         .map_err(|e| match e {
-            tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
+            tokio_rusqlite::Error::Error(e) => e,
             tokio_rusqlite::Error::ConnectionClosed => {
-                MemoryError::Backend("connection closed during update_memory_core".into())
+                MemoryError::Backend("connection closed during update_memory_core".into()).into()
             }
-            other => MemoryError::Backend(other.to_string()),
+            other => MemoryError::Backend(other.to_string()).into(),
         })
 }
 
@@ -1698,10 +1724,47 @@ mod tests {
         assert_eq!((memory_type.as_str(), update_count), ("user_preference", 1));
         assert!(last_modified_at > 0, "the seed wrote 0");
 
-        let type_only = MemoryPatch::new(MemoryKind::Memory, None, Some("semantic_fact")).unwrap();
+        let type_only = MemoryPatch::new(MemoryKind::Memory, None, Some("architectural_decision")).unwrap();
         let row = update_memory_core(&store, id, MemoryKind::Memory, &type_only, None).await.unwrap().unwrap();
         assert_eq!(row.importance, 8.0, "a field not asked for stays as it was");
         assert_eq!(memory_columns(&store, id).await.1, 2);
+    }
+
+    #[tokio::test]
+    async fn demoting_a_protected_row_needs_the_answer() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        for protected in ["user_preference", "architectural_decision"] {
+            let id = seed_memory_row(&store, protected, 3, 5.0, false).await;
+            let demote = MemoryPatch::new(MemoryKind::Memory, Some(9.0), Some("semantic_fact")).unwrap();
+
+            let refused = update_memory_core(&store, id, MemoryKind::Memory, &demote, None).await;
+
+            assert!(
+                matches!(&refused, Err(UpdateError::NeedsUser { id: refused_id, from }) if *refused_id == id && from == protected),
+                "{refused:?}"
+            );
+            let (memory_type, update_count, ..) = memory_columns(&store, id).await;
+            assert_eq!((memory_type.as_str(), update_count), (protected, 0), "a refused change writes nothing");
+
+            let row = update_memory_core(&store, id, MemoryKind::Memory, &demote.answered(true), None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!((row.memory_type.as_deref(), row.importance), (Some("semantic_fact"), 9.0));
+        }
+    }
+
+    #[tokio::test]
+    async fn promoting_or_changing_importance_needs_no_answer() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let fact = seed_memory_row(&store, "semantic_fact", 3, 5.0, false).await;
+        let promote = MemoryPatch::new(MemoryKind::Memory, None, Some("user_preference")).unwrap();
+        assert!(update_memory_core(&store, fact, MemoryKind::Memory, &promote, None).await.unwrap().is_some());
+
+        let preference = seed_memory_row(&store, "user_preference", 3, 5.0, false).await;
+        assert!(update_memory_core(&store, preference, MemoryKind::Memory, &importance(2.0), None).await.unwrap().is_some());
+        let between = MemoryPatch::new(MemoryKind::Memory, None, Some("architectural_decision")).unwrap();
+        assert!(update_memory_core(&store, preference, MemoryKind::Memory, &between, None).await.unwrap().is_some());
     }
 
     #[tokio::test]

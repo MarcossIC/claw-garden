@@ -26,7 +26,8 @@ names earlier memories close to the new one, judge each with `resolve_conflict`
 while you still have the conversation: supersedes if the new one replaces it,
 compatible or scoped if both hold, conflicts if only the user can tell. When
 `recall_context` lists ACTIVE CONFLICTS, ask the user which memory holds and
-record the answer with `resolve_conflict`. When it says memories are waiting
+record the answer with `resolve_conflict`, `user_answered` and their words in
+`reason`; set it only when the user said so. When it says memories are waiting
 for a review, or the user asks what you have learned, call `synthesize` and
 save the conclusions it leads to.
 

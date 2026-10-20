@@ -28,7 +28,7 @@ use axum::{Json, Router};
 use clawg_core::memory::admin::{
     Deleted, delete_memory_core, get_memory_core, list_memories_core, memory_stats_core, query_has_tokens,
     update_memory_core, ListParams, MemoryAdminRow, MemoryKind, MemoryPatch, MemoryStats, StatsParams,
-    UpdatedRow, restore_memory_core, RestoreError, RestoredRow,
+    UpdateError, UpdatedRow, restore_memory_core, RestoreError, RestoredRow,
 };
 use clawg_core::memory::backup::Reason;
 use clawg_core::memory::bootstrap::EmbedderStatus;
@@ -470,6 +470,10 @@ pub struct UpdateRequest {
     pub importance: Option<f64>,
     #[serde(default)]
     pub memory_type: Option<String>,
+    /// The caller declares the user answered, which taking a preference or a
+    /// decision out of its type needs.
+    #[serde(default)]
+    pub user_answered: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -823,6 +827,9 @@ pub struct JudgeRequest {
     /// Why, required for `scoped`.
     #[serde(default)]
     pub reason: Option<String>,
+    /// The caller declares the user answered, with the answer in `reason`.
+    #[serde(default)]
+    pub user_answered: bool,
     /// Scopes the verdict to this agent's rows, as [`OwnerQuery`] does.
     #[serde(default)]
     pub agent_id: Option<String>,
@@ -1438,13 +1445,17 @@ async fn update_memory(
 ) -> ApiResult<Json<UpdatedBody>> {
     let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
     let patch = MemoryPatch::new(kind, body.importance, body.memory_type.as_deref())
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        .map_err(|e| ApiError::bad_request(e.to_string()))?
+        .answered(body.user_answered);
     // The core answers `None` for "no such row", "already soft-deleted" and
     // "another agent's" alike, and from the caller's side those are the same
     // fact: the row it named is not there to change.
     let row = update_memory_core(&app.runtime.store, id, kind, &patch, owner.agent.as_deref())
         .await
-        .map_err(ApiError::internal)?
+        .map_err(|e| match e {
+            UpdateError::NeedsUser { .. } => ApiError::conflict(e.to_string()),
+            UpdateError::Store(e) => ApiError::internal(e),
+        })?
         .ok_or_else(|| ApiError::not_found(format!("no {kind:?} row with id {id}")))?;
     Ok(Json(UpdatedBody { updated: 1, row }))
 }
@@ -1520,7 +1531,9 @@ async fn discard_outbox(State(app): State<Arc<AppCtx>>, Json(body): Json<OutboxR
 /// The answer every verdict route gives a refused one.
 fn resolve_error(e: ResolveError) -> ApiError {
     match e {
-            ResolveError::SameRow | ResolveError::ReasonRequired => ApiError::bad_request(e.to_string()),
+            ResolveError::SameRow | ResolveError::ReasonRequired | ResolveError::AnswerRequired => {
+                ApiError::bad_request(e.to_string())
+            }
             ResolveError::NotFound(_) => ApiError::not_found(e.to_string()),
             ResolveError::NotInDispute { .. }
             | ResolveError::SupersededElsewhere { .. }
@@ -1547,7 +1560,15 @@ async fn judge_dispute(
     let verdict: Verdict = body.verdict.parse().map_err(|e: clawg_core::memory::dispute::UnknownVerdict| {
         ApiError::bad_request(e.to_string())
     })?;
-    judge_pair(&app.runtime.store, body.keep, body.other, verdict, body.reason, body.agent_id.as_deref())
+    judge_pair(
+        &app.runtime.store,
+        body.keep,
+        body.other,
+        verdict,
+        body.reason,
+        body.user_answered,
+        body.agent_id.as_deref(),
+    )
         .await
         .map(Json)
         .map_err(resolve_error)
