@@ -1787,7 +1787,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_client_on_a_published_socket_with_nothing_behind_is_not_running() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_state(dir.path(), &published(None, true)).expect("write state");
+        // The port is open and belongs to someone else: the client must not try it.
+        let other = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a port");
+        other.set_nonblocking(true).expect("non-blocking");
+        let port = other.local_addr().expect("addr").port();
+        write_state(dir.path(), &published(Some(port), true)).expect("write state");
         write_token(dir.path(), "t").expect("write token");
         let c = DaemonClient::from_data_dir(dir.path()).expect("client");
 
@@ -1795,25 +1799,35 @@ pub(crate) mod tests {
 
         leave_an_orphan(dir.path(), &c).await;
         assert!(matches!(c.health().await, Err(ClientError::NotRunning)), "an orphan socket");
+
+        let touched = other.accept();
+        assert!(
+            matches!(&touched, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "the published port was dialled: {touched:?}"
+        );
     }
 
-    #[tokio::test]
-    async fn thirty_two_simultaneous_clients_over_the_socket_are_none_not_running() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn thirty_two_simultaneous_clients_over_the_socket_all_answer() {
         let dir = tempfile::tempdir().expect("tempdir");
+        serve_on_socket(dir.path(), "burst-token").await;
         write_state(dir.path(), &published(None, true)).expect("write state");
-        write_token(dir.path(), "t").expect("write token");
-        let probe = DaemonClient::from_data_dir(dir.path()).expect("client");
-        leave_an_orphan(dir.path(), &probe).await;
+        write_token(dir.path(), "burst-token").expect("write token");
 
+        let start = Arc::new(tokio::sync::Barrier::new(32));
         let calls: Vec<_> = (0..32)
             .map(|_| {
                 let client = DaemonClient::from_data_dir(dir.path()).expect("client");
-                tokio::spawn(async move { client.health().await })
+                let start = start.clone();
+                tokio::spawn(async move {
+                    start.wait().await;
+                    client.health().await
+                })
             })
             .collect();
         for call in calls {
             let answer = call.await.expect("task");
-            assert!(matches!(answer, Err(ClientError::NotRunning)), "{answer:?}");
+            assert_eq!(answer.expect("every client of the burst is answered").profile, "dev");
         }
     }
 
