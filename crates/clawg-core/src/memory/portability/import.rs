@@ -160,6 +160,11 @@ fn prepare(mut parsed: Parsed, options: &ImportOptions) -> Prepared {
         project_ids.insert(p.id.clone(), id.clone());
         projects.push((id, root));
     }
+    // The head of a save is stored with its pieces, so it is masked as the
+    // text is.
+    for (_, piece) in &mut parsed.pieces {
+        piece.context = redact(&piece.context).text;
+    }
     let mut contexts: HashMap<i64, String> = HashMap::new();
     for (_, piece) in &parsed.pieces {
         if !piece.context.is_empty() {
@@ -865,12 +870,15 @@ mod tests {
         let file = EXAMPLE
             .replace("Storage engine: SQLite with WAL", &format!("Deploy with token {token} on Fridays"))
             .replace("\"status\":\"superseded\",\"superseded_by\":9", "\"status\":\"active\",\"superseded_by\":null")
-            .replace("different scopes", &format!("the token {token} differs"));
+            .replace("different scopes", &format!("the token {token} differs"))
+            .replace("\"memory\":9,\"context\":\"Storage engine\"", &format!("\"memory\":7,\"context\":\"Deploy with token {token}\""));
         let dst = destination().await;
         let (report, _) = run(&dst, &file, ImportOptions::default()).await;
         assert_eq!((report.inserted, report.redacted), (1, 1), "{report:#?}");
         let row = dump(&dst, EVERYTHING).await.memories.into_iter().find(|m| m.content.contains("Fridays")).unwrap();
         assert!(!row.content.contains(&token) && row.content.contains("[REDACTED:"), "{}", row.content);
+        let context = dst.conn.call(|c| c.query_row("SELECT context FROM memory_piece", [], |r| r.get::<_, String>(0))).await.unwrap();
+        assert!(!context.contains(&token) && context.contains("[REDACTED:"), "{context}");
         let hash_matches = count(&dst, "SELECT count(*) FROM memory WHERE content_hash = content_hash(content)").await;
         assert_eq!(hash_matches, 2);
         assert_eq!(count(&dst, "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH 'fridays'").await, 1);
