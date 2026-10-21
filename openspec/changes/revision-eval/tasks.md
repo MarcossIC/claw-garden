@@ -92,5 +92,5 @@ El dueño del store autorizó el export, la reproducción y el etiquetado por ag
 
 - [ ] Sección «`revision-eval`: revisiones por clave» en `specs/eval`; `git mv` al archivo con la fecha; `state.yaml` en `archived` y la fila 48 de `openspec/README.md` como archivada.
 - Commit: `docs(openspec): archive revision-eval`
-- [ ] Subir el minor `0.43.0` → `0.44.0` en `[workspace.package]` del `Cargo.toml` raíz y `cargo update --workspace`; ambos archivos juntos (el `0.43.0` lo subió el archivo de preference-topic-scope, `a0746cf`).
+- [ ] Subir el minor `0.43.1` → `0.44.0` en `[workspace.package]` del `Cargo.toml` raíz y `cargo update --workspace`; ambos archivos juntos (el `0.43.0` lo subió el archivo de preference-topic-scope, `a0746cf`, y el `0.43.1`, el arreglo de dependencias `f17deac`).
 - Commit: `chore: bump version to 0.44.0`
