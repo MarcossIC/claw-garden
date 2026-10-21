@@ -41,7 +41,7 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 - [x] `cargo test --workspace` y el clippy de `.claude/CLAUDE.md` en Linux.
 - [x] Lo mismo en Windows, en `target-test`.
-- [x] `rag-eval --real --diff` contra el ancla, con el modelo real y `docs/eval/`. La compuerta previa no se corrió: pasó a [revision-eval](../../revision-eval/exploration.md).
+- [x] `rag-eval --real --diff` contra el ancla, con el modelo real y `docs/eval/`. La compuerta previa no se corrió: pasó a [revision-eval](../2026-10-21-revision-eval/exploration.md).
 - [x] `verify.md`.
 - [x] Perfil dev con Claude Code.
 

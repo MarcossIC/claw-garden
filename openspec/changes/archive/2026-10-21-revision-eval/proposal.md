@@ -10,7 +10,7 @@ topic-revisions le dio a una decisión que evoluciona una forma de reemplazar a 
 
 1. **Sin clave, la versión vieja puede quedar viva sin marca.** El detector sólo empareja filas de tipos que afirman algo (`crates/clawg-core/src/memory/store_insert.rs:59-63`), a una distancia dentro de `[0,10, 0,42)` (`crates/clawg-core/src/memory/contradiction.rs:37`, `:45`) y si la vieja está entre las cinco más cercanas (`CANDIDATE_POOL`, `:58`). Fuera de eso no queda ningún par, y aun con par una fila `disputed` puntúa igual que una `active` (`crates/clawg-core/src/memory/score.rs:295-301`). No se sabe con qué frecuencia pasa.
 2. **Con clave, el reemplazo nunca se midió con cadenas de versiones.** `revise_in` (`crates/clawg-core/src/memory/topic.rs:111`) deja `superseded` lo anterior, que sigue en `memory_vectors` y `memory_fts`: la búsqueda lo saca por estado después del corte de vec0 (`crates/clawg-core/src/memory/search.rs:225-232`, `:247`). El golden set no puede llevar una clave (`deny_unknown_fields`, `crates/clawg-eval/src/bin/rag-eval/golden.rs:39-40`) y `EvalIngest::send` guarda siempre sin ella (`crates/clawg-core/src/eval_api.rs:549`), así que ningún `rag-eval` la vio.
-3. **El agente ve la clave sólo por algunas herramientas.** La muestran los hits propios de `search_memory` (`crates/clawg-cli/src/mcp/tools.rs:111-113`), `read_memory` (`:183`) y `list_memories` (`:294-302`); `recall_context` y el contexto del hook `session-start`, no (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:691-703`, que usa `render` para todos los bloques, `:515-527`). La verificación de topic-revisions hizo una sola corrida por lado ([verify](../archive/2026-10-18-topic-revisions/verify.md#perfil-dev-con-claude-code-2026-10-18)).
+3. **El agente ve la clave sólo por algunas herramientas.** La muestran los hits propios de `search_memory` (`crates/clawg-cli/src/mcp/tools.rs:111-113`), `read_memory` (`:183`) y `list_memories` (`:294-302`); `recall_context` y el contexto del hook `session-start`, no (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:691-703`, que usa `render` para todos los bloques, `:515-527`). La verificación de topic-revisions hizo una sola corrida por lado ([verify](../2026-10-18-topic-revisions/verify.md#perfil-dev-con-claude-code-2026-10-18)).
 4. **Las herramientas de medición no llevan clave.** `FlowSave` (`crates/clawg-eval/src/bin/conflict-eval/measure.rs:60`) no tiene `topic_key`, así que `conflict-eval --flow` reproduce como saves sueltos lo que en un store fueron revisiones.
 
 Hallazgo al verificar: una preferencia de otro proyecto llega a la búsqueda (`search.rs:92-99`) con su `topic=K`, porque el puente sólo oculta la clave en los hits de otro agente (`tools.rs:111-113`), pero un save bajo esa clave no la revisa, porque el alcance es agente y proyecto (`topic.rs:83-86`). Es determinista y no hace falta medirlo: va aparte (ver al final).
@@ -42,7 +42,7 @@ Hallazgo al verificar: una preferencia de otro proyecto llega a la búsqueda (`s
 
 ## Umbrales, fijados antes de medir
 
-No se ajustan después de medir (regla de [`specs/eval`](../../specs/eval/spec.md#criterio-de-salida)). Cada umbral dice cuándo vale abrir un cambio; abrirlo no decide cómo se hace.
+No se ajustan después de medir (regla de [`specs/eval`](../../../specs/eval/spec.md#criterio-de-salida)). Cada umbral dice cuándo vale abrir un cambio; abrirlo no decide cómo se hace.
 
 | Decisión | Entra con | Vale un cambio si |
 |---|---|---|

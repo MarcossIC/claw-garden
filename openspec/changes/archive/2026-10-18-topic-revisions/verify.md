@@ -46,7 +46,7 @@ Con el modelo cacheado en el perfil dev y `docs/eval/`. Los resultados están en
 
 `--agent-view`: `search_memory` 36/46 con 764,0 tokens de media y `recall_context` 39/46 con 1.083,7, los dos iguales a la línea de base. El diff de agent-view también cubre memory-provenance, que se archivó sin `rag-eval`. La segunda pareja de corridas mide el código con la columna `m.topic_key` agregada a `SEARCH_SQL_MEMORY` y a `LEXICAL_SCORE_SQL_PREFIX`: el ranking no cambia.
 
-La compuerta previa de la [exploración](exploration.md#compuerta-previa) no se corrió. Iba a fijar la prioridad antes de escribir código, y el código ya estaba en `main`. Pasó, con otras mediciones, al cambio [revision-eval](../../revision-eval/exploration.md).
+La compuerta previa de la [exploración](exploration.md#compuerta-previa) no se corrió. Iba a fijar la prioridad antes de escribir código, y el código ya estaba en `main`. Pasó, con otras mediciones, al cambio [revision-eval](../2026-10-21-revision-eval/exploration.md).
 
 ## Perfil dev con Claude Code (2026-10-18)
 
