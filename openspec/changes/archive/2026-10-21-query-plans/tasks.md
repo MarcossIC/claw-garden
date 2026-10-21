@@ -18,7 +18,7 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 - [x] Suite y clippy en Linux sobre el último commit ([verify](verify.md)).
 - [x] Estadísticas evaluadas con las pruebas de plan sobre un store con `ANALYZE` (D5).
 - [x] Tiempo antes y después con filas generadas.
-- [ ] El CI en verde en Linux y Windows.
+- [ ] El CI en verde en Linux y Windows (la primera corrida falló en Linux por el `-wal` que dejaba la salida del daemon; arreglado en el mismo pull request, ver [verify](verify.md#ci)).
 
 ## 4. Archive
 
