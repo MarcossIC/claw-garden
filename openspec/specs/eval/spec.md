@@ -1,6 +1,6 @@
 # eval — Especificación
 
-Fuente de verdad del comportamiento actual de la evaluación de recuperación: el generador sintético de `golden-mine synth`, la etiqueta de subconjunto y el idioma de la consulta en el golden set, sus casos sin respuesta y de versión nueva, el reporte de `rag-eval` (por subconjunto, por pareja de idiomas consulta–fila, aciertos estrictos y parciales con intervalo, partición calibración/prueba), la comparación de dos corridas con `--diff` y su corte por pareja, el brazo sólo léxico, los intrusos del audit, el barrido de contradicciones, `conflict-eval` (el detector de contradicciones entero, sobre pares etiquetados y un flujo de saves), `rag-eval --docs` (la medición del índice de la documentación y el código de un proyecto, [`specs/project-docs`](../project-docs/spec.md)) y la baseline medida.
+Fuente de verdad del comportamiento actual de la evaluación de recuperación: el generador sintético de `golden-mine synth`, la etiqueta de subconjunto y el idioma de la consulta en el golden set, sus casos sin respuesta y de versión nueva, el reporte de `rag-eval` (por subconjunto, por pareja de idiomas consulta–fila, aciertos estrictos y parciales con intervalo, partición calibración/prueba), la comparación de dos corridas con `--diff` y su corte por pareja, el brazo sólo léxico, los intrusos del audit, el barrido de contradicciones, `conflict-eval` (el detector de contradicciones entero, sobre pares etiquetados y un flujo de saves), `revision-eval` (qué cambia la clave de tema, sobre cadenas de versiones y sobre el export de un store real), `rag-eval --docs` (la medición del índice de la documentación y el código de un proyecto, [`specs/project-docs`](../project-docs/spec.md)) y la baseline medida.
 
 **Origen:**
 - [eval-golden-expansion](../../changes/archive/2026-10-12-eval-golden-expansion/proposal.md), archivado el 2026-10-12.
@@ -9,6 +9,7 @@ Fuente de verdad del comportamiento actual de la evaluación de recuperación: e
 - [english-recall](../../changes/archive/2026-10-17-english-recall/proposal.md), archivado el 2026-10-17 (idioma de la consulta, `by_pair`, el corte por pareja de `--diff` y la baseline por pareja).
 - [memory-rank-fusion](../../changes/archive/2026-10-17-memory-rank-fusion/proposal.md), archivado el 2026-10-17 (`all_hit_rate` de agent-view, el subconjunto `lexical_related` y su baseline).
 - [conflict-candidates](../../changes/archive/2026-10-18-conflict-candidates/proposal.md), archivado el 2026-10-18 (sólo «`conflict-eval`: el detector entero» y su baseline).
+- [revision-eval](../../changes/archive/2026-10-21-revision-eval/proposal.md), archivado el 2026-10-21 (sólo «`revision-eval`: revisiones por clave» y su baseline).
 
 ## Definiciones
 
@@ -534,6 +535,100 @@ El reporte MUST dar, por clase y por clase e idioma, la fracción de pares con c
 
 **Tests:** `wilson_interval_cases`, `labelled_pairs_parse_and_cover_every_class`, `a_class_under_its_minimum_is_refused`, `a_flow_file_is_read_in_order`, `the_flow_counts_saves_that_escalate_once` y `outcomes_group_by_class` (`measure.rs`); `the_arguments_parse`, `without_a_flow_file_the_flow_is_the_spec_sentences_as_facts`, `the_repository_specs_make_a_flow_of_at_least_two_hundred_facts` y `a_fake_run_measures_every_class_and_the_flow` (`main.rs`); `conflict_pairs_reads_the_table` (`eval_api.rs`).
 
+## `revision-eval`: revisiones por clave
+
+```
+revision-eval chains (--real | --fake) [--tag SLUG]
+revision-eval store --export FILE [--seed N] (--real | --fake)
+revision-eval store --labels FILE [--tag SLUG]
+```
+
+`revision-eval` (`crates/clawg-eval/src/bin/revision-eval/`; las rutas sin prefijo de esta sección están ahí) mide qué cambia la clave de tema (`topic_key`, [`specs/ingest`](../ingest/spec.md)). `chains` corre un set versionado de cadenas de versiones, y `store`, el export de un store real. Con `--real` lee el modelo del perfil de datos (`data_dir_from_env`, `main.rs:222`) y sale con 3 si no está en caché. Con `--fake` usa el embedder falso, que no empareja nada: prueba la tubería, no los números, y sólo imprime. Sale con 0 si midió, 1 ante una falla, 2 ante una entrada inválida y 3 sin el modelo (`main.rs:21-24`). Los stores que escribe son temporales: no abre el store de ningún perfil. Las clases y los veredictos son lógica pura, probada sin modelo.
+
+**Términos.** La **clave** de un save es su `topic_key`. Una **cadena** es una lista ordenada de versiones de un mismo tema, y una **transición**, el paso de una versión a la siguiente: una cadena de n versiones tiene n-1. `chains` tiene tres **brazos**: **sin clave**, **con clave** y el **control**, que guarda sólo la última versión de cada cadena.
+
+### El set de cadenas
+
+`crates/clawg-eval/data/revision-chains.json` es `{"version": 1, "chains": [...]}`. Cada cadena lleva `id`, `lang` (`es` o `en`), `memory_type`, `topic_key`, `query` y `versions` (2 o 3). Cada versión lleva `content`, `value` (el texto que la distingue de las otras de su cadena) y, salvo la primera, `change`: `value` cambia el valor con la misma redacción, `rewrite` lo reescribe y `extend` suma alcance o motivo. El parseo (`parse_set`, `set.rs:83`) MUST usar `deny_unknown_fields`, MUST validar la clave como un save (`validate_topic_key`, `crates/clawg-core/src/memory/topic.rs:33`) y MUST rechazar, nombrando la cadena por `id`, una `query` que contiene el `value` de alguna versión de su cadena: así ninguna versión gana por una palabra que sólo ella tiene.
+
+El parseo MUST rechazar un set que no llega a estos mínimos, con un error que nombra la clase que falta y cuánto:
+
+- 40 cadenas: 20 `es` y 20 `en`;
+- 24 de dos versiones y 16 de tres, que dan 56 transiciones;
+- 20 `architectural_decision`, 10 `user_preference` y 10 `semantic_fact`;
+- al menos 8 cadenas largas, con alguna versión de más de 480 palabras (`LONG_VERSION_WORDS`, `set.rs:16`). Como cada palabra es al menos un token, esa versión pasa del tope de un pedazo y se parte.
+
+Cada corrida registra la `version` del set y su sha256, que se toma con finales de línea LF: un checkout de Windows con `core.autocrlf` trae el set en CRLF y da el mismo hash.
+
+**Tests:** `the_shipped_chain_set_meets_every_minimum`, `the_set_hash_is_the_same_with_either_line_ending`, `a_set_at_its_minimums_parses`, `a_set_below_a_minimum_names_what_is_missing`, `a_query_that_holds_a_versions_value_is_refused`, `a_chain_with_an_invalid_key_or_unknown_field_fails` y `a_chain_out_of_shape_is_refused` (`set.rs`).
+
+### `chains`: brazos y clases (M1)
+
+`chains` MUST guardar los tres brazos por el worker de producción, con `EvalIngest::save` (`crates/clawg-core/src/eval_api.rs:608`), cada uno en un store propio bajo el directorio temporal del sistema. Los tres brazos guardan antes los mismos distractores, las oraciones con MUST de `openspec/specs` como hechos (`read_distractors`, `run.rs:123`). El brazo sin clave guarda cada versión sin clave, y el brazo con clave, con la clave de su cadena; el agente y el proyecto son los mismos en todo el brazo. Los dos guardan por rondas (todas las primeras versiones, después todas las segundas, después las terceras), así que entre dos versiones de un tema se guardan otras memorias (`arm_saves`, `chains.rs:57`). El control guarda sólo la última versión de cada cadena, con su clave. `save` valida tipo y clave antes de encolar, y devuelve lo que el worker informa del save (`IngestReport`, `crates/clawg-core/src/memory/worker.rs:81`): sus filas, las candidatas del detector y las filas reemplazadas. `EvalIngest::send` (`eval_api.rs:589`) sigue guardando sin proyecto ni clave para `rag-eval --agent-view` y `conflict-eval`.
+
+En el brazo sin clave, cada transición MUST quedar en exactamente una clase (`classify`, `chains.rs:189`), mirando la versión nueva contra la anterior:
+
+| Clase | Condición |
+|---|---|
+| `escalated` | hay entre ambas un par `memory_conflict` escalado |
+| `pending` | hay entre ambas un par `pending` |
+| `no_mark` | no hay par, por una de cuatro razones: `not_claim_bearing` (el tipo no afirma, `is_claim_type`, `eval_api.rs:740`), `out_of_pool` (alguna distancia dentro de la banda), `below_floor` (alguna menor que `NEAR_DUPLICATE_FLOOR`) o `above_threshold` (todas en `CONTRADICTION_THRESHOLD` o más), en ese orden |
+
+El par se lee del store (`conflict_pairs`, `eval_api.rs:670`), con cualquier fila de cada versión. Las distancias salen de `row_distances` (`eval_api.rs:698`, `vec_distance_l2` sobre `memory_vectors`, la misma distancia del KNN). Se miden entre las filas de la nueva que la anterior no tiene, que son con las que el detector probó, y las filas propias de la anterior (`compared_rows`, `chains.rs:104`). Una versión larga que repite casi todo el texto de la anterior guarda cada pedazo sin cambios como una sola fila que los dos saves tienen, y esa fila es de la versión más nueva que la tiene (`own_rows`, `chains.rs:89`). Si la nueva tiene todas las filas de la anterior, la transición es `below_floor`. Las constantes de la banda son las del detector, reexportadas y no copiadas (`eval_api.rs:746-747`; `crates/clawg-core/src/memory/contradiction.rs:45` y `:37`). `out_of_pool` se deduce por descarte, sin recalcular el pool del detector (`CANDIDATE_POOL`, `contradiction.rs:58`).
+
+Una versión está viva si alguna de sus filas propias está `active` o `disputed` (`is_live`, `chains.rs:109`). Las cuatro razones MUST sumar el total de `no_mark`, y las tres clases, el de transiciones. El reporte (`m1`, `chains.rs:456`) da conteo, tasa e intervalo de Wilson al 95 % (z = 1,96, `stats.rs:12`) por clase y razón, y los mismos cortes por `change`, `lang` y tipo. Da además `above`, las transiciones en que la vieja aparece arriba de la nueva, y `unmarked_or_above`, las que son `no_mark` o `above`, contadas una vez.
+
+**Tests:** `every_transition_falls_in_exactly_one_class`, `a_far_pair_is_no_mark_above_the_threshold`, `a_close_pair_of_decisions_is_escalated`, `a_row_beyond_the_candidate_pool_is_out_of_pool`, `a_type_that_asserts_nothing_is_not_claim_bearing`, `the_band_is_the_detectors`, `the_pair_is_read_between_the_two_versions_only`, `a_row_two_versions_share_is_the_newer_ones`, `the_rows_a_transition_compares_leave_out_the_ones_both_hold`, `an_older_version_the_newer_holds_whole_is_below_the_floor`, `a_row_is_live_while_it_is_active_or_disputed`, `the_control_arm_stores_only_the_last_version`, `the_other_arms_save_every_version_one_round_at_a_time` y `the_distractors_are_the_requirement_sentences_of_a_spec` (`chains.rs`); `a_rate_carries_its_wilson_interval` (`stats.rs`); `save_stores_under_the_agent_project_and_key_it_is_given`, `a_second_save_under_the_same_key_reports_the_first_as_replaced`, `save_reports_the_candidates_the_detector_paired`, `save_with_an_invalid_key_fails`, `joined_pieces_equal_the_text_read_memory_returns`, `the_band_constants_are_the_detectors`, `row_distances_equal_the_knn_distance` y `row_distances_of_nothing_is_nothing` (`eval_api.rs`); `the_router_lists_a_revised_row_superseded_by_the_new_one`, `a_fake_chains_run_stores_every_arm_and_reports_whole`, `a_scratch_dir_outside_the_temp_dir_is_refused_before_anything_is_created` y `the_repository_specs_give_at_least_two_hundred_distractors` (`run.rs`).
+
+### `chains`: lo que ve el agente (M2)
+
+Para cada cadena y cada brazo, `chains` MUST hacer la `query` por el router en proceso y cortar el resultado como el puente (`relevant_hits` y `format_search`, `crates/clawg-cli/src/mcp/tools.rs:65` y `:80`, y el prompt de `recall_context`). Los ids se leen en el orden en que cada salida los imprime: `N. #id` en `search_memory` y la cabecera `[fecha #id` de cada hit en el prompt (`search_ids` y `context_ids`, `chains.rs:212` y `:228`). La posición de una versión en una salida es la del primer hit, contando desde 1, que tiene una fila propia de ella; si no aparece ninguno, es `none`. En una transición, la vieja queda **arriba** de la nueva si en alguna salida aparece antes que ella, o aparece y la nueva no (`above`, `chains.rs:255`).
+
+**M2 pasa** (`m2`, `chains.rs:343`) cuando, en el brazo con clave y en todas las cadenas, se cumplen tres condiciones: (a) hay una sola versión viva por clave; (b) ninguna versión vieja aparece en `search_memory` ni en `recall_context`; y (c) la última queda en el mismo puesto que en el control en las dos salidas a la vez, en todas las cadenas salvo a lo sumo dos (`MAX_MOVED`, `chains.rs:297`; 38 de 40), y en ninguna baja dos puestos o más ni falta donde el control la muestra. El reporte da cada condición, el veredicto, las cadenas que se movieron y las que lo rompen, y las posiciones de cada versión por brazo y por cadena.
+
+**Tests:** `the_ids_are_read_in_the_order_each_output_prints_them`, `a_version_is_placed_by_the_first_hit_of_a_row_of_its_own`, `an_old_version_above_the_new_one_is_recorded`, `m2_passes_when_all_three_conditions_hold`, `m2_fails_when_an_old_version_shows`, `m2_fails_when_the_last_drops_two_places` y `m2_needs_thirty_eight_matching_chains` (`chains.rs`).
+
+### `chains`: lo que cuesta la clave (M4)
+
+Con el tokenizador de las líneas de base (`EvalTokenCounter::real`, `eval_api.rs:798`) y sobre las consultas del brazo con clave, `chains` MUST informar (`m4`, `cost.rs:202`):
+
+1. los tokens y los bytes de la respuesta de `search_memory` con ` topic=K` y sin ella. Es la misma respuesta formateada dos veces, con el proyecto del save de cada fila, porque `format_search` muestra la clave sólo donde un save la revisaría (`search_pair`, `cost.rs:87`);
+2. los del prompt de `recall_context` reescrito con ` topic=K` en la cabecera de cada hit con clave de LAST SESSION, RECENT y LONG-TERM, delante de ` by ` o del primer `]` (`rewrite_prompt`, `cost.rs:57`), contra el mismo prompt sin reescribir. Se cuenta cuántos prompts pasan de 8.000 bytes, sin recortar, porque el recorte es del producto;
+3. de los dos anteriores, una cota de arriba para «todas las filas con clave», que pone la clave más larga del set en cada hit sin clave;
+4. el costo fijo de la clave en cada sesión: los tokens de su descripción en el schema de `save_memory` y los de su párrafo de `protocol.md`, leídos de `agent_contract.json` y de `protocol.md` compilados en el binario (`fixed_cost`, `cost.rs:169`);
+5. los tokens de una línea de aviso de referencia, fijada antes de medir (`WARNING_LINE`, `cost.rs:24`). Su costo por save lo da `store`.
+
+La reescritura vive en la herramienta: en producción, `recall_context` no muestra la clave (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:691`).
+
+**Tests:** `the_rewrite_adds_the_key_only_to_keyed_hits`, `the_byte_delta_is_the_sum_of_the_added_keys`, `a_prompt_over_budget_after_the_rewrite_is_counted`, `m4_reports_the_fixed_cost_of_the_key_from_the_contract_and_the_protocol`, `the_key_of_a_search_hit_shows_for_the_save_project_of_its_row` y `m4_sums_the_queries_and_prices_the_warning_line` (`cost.rs`); `the_rewrite_finds_every_keyed_header_of_a_real_prompt` y `the_production_context_still_omits_the_key` (`run.rs`), los dos sobre prompts del router en proceso.
+
+### `store`: revisiones en un store real (M5)
+
+`store` va en dos pasos, porque etiquetar lleva horas. El primero, `--export`, MUST leer un `clawg export --include-deleted` con `format::parse` (`crates/clawg-core/src/memory/portability/format.rs:176`; `read_export`, `store.rs:93`) y unir los pedazos de cada save (`join_pieces`, `eval_api.rs:734`). Si falta un pedazo, el texto queda cortado en tramos. Un formato o una versión desconocidos MUST fallar antes de escribir nada.
+
+**Sin reproducir**, MUST contar: filas y saves; saves con clave; saves de hecho, decisión o preferencia guardados desde la primera clave del store; filas `superseded` por `revision` y por `verdict` (`supersede_cause`); pares juzgados `supersedes`; líneas inválidas; y saves sin agente, que no se envían.
+
+**Reproduciendo**, MUST pasar cada save por `EvalIngest::save` en orden de `(created_at, id)`, con su agente, su proyecto, su tipo y su clave. Nunca usa `import`, que no corre el detector (`crates/clawg-core/src/memory/portability/import.rs:3-5`). El aviso **dispara** (`analyse`, `store.rs:237`) en un save que cumple cuatro condiciones: no tiene clave, es de un tipo que afirma, insertó alguna fila, y entre sus candidatas (`related`) hay una fila de un save anterior de su mismo agente y proyecto, las únicas que una clave podría revisar (`topic.rs:81-86`). Además se cuentan aparte tres cosas: el save cuya única candidata es de otro proyecto, el disparo cuya candidata estaba borrada o reemplazada por veredicto en el store real (porque no se reproducen borrados ni veredictos, es una cota de ese sesgo) y los saves sin clave de un tipo que no afirma. Esos últimos quedan fuera de la población, pero entran en el promedio por save. La **población** son los que disparan más el **resto**, que son los saves sin clave de un tipo que afirma con un save anterior vivo de su agente y proyecto (`store.rs:307`). Un save que sólo reforzó filas no es una revisión y no se etiqueta.
+
+**Etiquetando**, el primer paso MUST dejar `labels.jsonl` y `replay.json` en el directorio de trabajo. Se etiquetan todos los saves que disparan, cada uno con su candidata más cercana en el alcance, y una muestra de hasta 50 del resto (`SAMPLE_OF_REST`, `store.rs:22`), cada uno con su save anterior vivo más cercano por `row_distances`. La muestra y el orden salen de `SplitMix64` con una semilla fija (`DEFAULT_SEED`, `store.rs:19`; `--seed` la cambia): la misma semilla da la misma muestra, y el archivo no dice cuál par disparó. Cada línea es `{"n", "earlier", "later", "proposed": null, "label": null}`, con `proposed` (lo que propone un agente) y `label` (lo que decide el dueño del store) en `revision` u `other`. El nuevo es una **revisión** si trata el mismo tema que el anterior con otro valor, alcance o motivo, de modo que el anterior ya no vale tal como está escrito. `replay.json` guarda por par si disparó y su tipo, y los conteos, sin texto.
+
+El segundo paso, `--labels` (`score`, `store.rs:570`), MUST rechazar un archivo con algún `label` vacío o inválido, MUST puntuar sólo con `label` y MUST informar el acuerdo entre `proposed` y `label` sobre los pares que llevan los dos. El reporte da:
+
+- la tasa de revisión entre los que disparan, con su intervalo de Wilson;
+- la prevalencia en la población, que cuenta a los que disparan como censo y al resto como muestra: `(k_disparo + n_resto · wilson_lo(k_muestra, n_muestra)) / N` como cota inferior. Con 50 o menos en el resto, se etiquetan todos y la cota es Wilson de `k/N`;
+- el costo del aviso: sus tokens donde aparece y su media por save del flujo (tokens × saves que disparan / saves enviados);
+- cada umbral de la fila «Aviso» de la [propuesta](../../changes/archive/2026-10-21-revision-eval/proposal.md#umbrales-fijados-antes-de-medir), con su valor y `met`.
+
+**Privacidad.** El export debe estar en un directorio `revision-eval-*` hijo directo del temporal del sistema (`work_dir`, `run.rs:479`). Si no, el paso se rechaza sin crear ni borrar nada. Todo lo que lleva texto guardado (el export, las etiquetas, `replay.json` y el store de la reproducción) MUST quedar en ese directorio, nunca en el repositorio. El store de la reproducción se borra al final del primer paso. El directorio entero se borra al final del segundo, y también ante cualquier error, salvo un archivo de etiquetas sin terminar, que lo conserva porque las horas de etiquetado están en él. El resultado de `store` MUST llevar sólo conteos, tasas e intervalos, sin texto, ids de fila ni claves.
+
+**Tests:** `the_counts_that_need_no_replay_come_from_the_parsed_export`, `the_pieces_of_a_save_are_joined_and_a_missing_one_cuts_the_text`, `an_unknown_export_format_writes_nothing`, `the_nearest_earlier_save_is_looked_up_within_agent_and_project`, `a_save_a_key_replaced_is_no_longer_an_earlier_save`, `the_warning_fires_on_an_unkeyed_claim_with_a_candidate_of_its_own_scope`, `an_unkeyed_save_of_a_type_that_asserts_nothing_still_counts_in_the_per_save_mean`, `a_candidate_of_another_project_does_not_fire`, `every_firing_save_is_labelled_plus_a_seeded_sample`, `the_same_seed_picks_the_same_sample`, `the_labels_file_does_not_say_which_pair_fired`, `a_labels_file_with_an_empty_label_is_refused`, `the_score_reads_only_the_owners_label_and_reports_the_agreement`, `the_prevalence_bound_counts_the_firing_as_a_census_and_the_rest_as_a_sample` y `the_thresholds_read_the_proposals_table` (`store.rs`); `splitmix_matches_the_golden_mine_sequence` y `a_shuffle_keeps_every_item_and_repeats_for_a_seed` (`stats.rs`); `a_fake_store_run_counts_and_labels_a_small_export`, `the_working_files_are_removed_even_when_the_run_fails`, `a_labels_file_the_owner_has_not_finished_keeps_the_directory`, `a_working_directory_outside_the_temp_dir_is_refused_and_left_alone` (`run.rs`); `the_results_file_of_store_holds_no_stored_text` (`main.rs`).
+
+### Resultados
+
+Una corrida `--real` de `chains`, y `store --labels` después de una reproducción `--real`, MUST escribir `docs/eval/results/{fecha}-real-revision-eval-{chains|store}[-{tag}].json` (`results_filename`, `main.rs:123`; `--tag` nombra una segunda corrida del día). Un archivo existente MUST NOT pisarse: se comprueba antes de correr y se abre con `create_new` (`main.rs:172`). La cabecera lleva la fecha, el contrato del modelo y la versión de clawg. En `chains` lleva también la `version` y el sha256 del set y los distractores, y en `store`, el formato y la versión del export (sin ruta ni nombre) y la semilla. `--fake` sólo imprime.
+
+**Tests:** `the_arguments_parse`, `the_arguments_of_store_parse`, `the_result_file_is_named_by_date_and_tag`, `a_result_is_never_written_over_an_existing_file` y `a_result_header_names_the_model_contract_and_the_set_hash` (`main.rs`).
+
 ## `rag-eval --docs`: medir el índice de documentación
 
 ```
@@ -651,6 +746,20 @@ Si una condición falla, el resultado MUST registrarse tal cual; los umbrales MU
 - Flujo de un store real de 172 saves con sus tipos (`--flow`): 11,0 % de saves con un par escalado (7,2–16,6 %); con sus 24 notas de estado guardadas como `architectural_decision` reetiquetadas como `semantic_fact`, 5,2 % (2,8–9,6 %).
 
 Sobre el cambio tal como se mezcló (`e041ee6`), el flujo de las specs daba 23,4 % y fallaba: el corte del identificador (`IDENTIFIER_ESCALATE_BELOW`) y la regla de los dos lados protegidos ([`specs/disputes`](../disputes/spec.md)) se eligieron después, mirando esos mismos flujos, así que estos números no los confirman sobre datos nuevos. El detalle está en el [verify](../../changes/archive/2026-10-18-conflict-candidates/verify.md#modelo-real-2026-10-18) del cambio.
+
+### Revisiones por clave
+
+`revision-eval` con el modelo real, el 2026-10-21 en Windows. El detalle y los veredictos contra los umbrales de la propuesta están en el [verify](../../changes/archive/2026-10-21-revision-eval/verify.md) del cambio.
+
+- **`chains`**, sobre el set versión 1 (`fcc21149…`, 40 cadenas, 56 transiciones, 684 distractores; `docs/eval/results/2026-10-21-real-revision-eval-chains.json`):
+  - Sin clave, ninguna cadena queda con una sola versión viva (96 vivas). Con clave y en el control, una en cada una.
+  - Transiciones sin clave: 28 escaladas (50 %), 14 `pending` y 14 sin marca (25 %, Wilson 15,5–37,7 %: 6 bajo el piso, 7 sobre el umbral y 1 fuera del pool). La vieja aparece arriba de la nueva en 35, y quedan sin marca o arriba 40 de 56 (71,4 %, 58,5–81,6 %).
+  - M2 no pasa: `en-repo-layout` baja de 7 a 9 en `recall_context` con clave. Ninguna versión vieja aparece con clave.
+  - Mostrar la clave cuesta +45,1 tokens de media en `search_memory` (las claves que hoy muestra) y +54,5 en `recall_context` reescrito. Con todas las filas con clave, la cota de arriba es +85,1 y +111,0. Ningún prompt pasa de 8.000 bytes. La clave cuesta 236 tokens fijos por sesión, y la línea de aviso, 34.
+- **`store`**, sobre un export de 397 saves (`2026-10-21-real-revision-eval-store.json`):
+  - El aviso dispara en 154 de los 220 saves sin clave de un tipo que afirma, y 76 de ellos son revisiones (49,4 %, 41,6–57,2 %).
+  - La prevalencia es del 38,1 %, con cota inferior de 36,2 %, y el aviso cuesta 13,19 tokens de media por save.
+  - Las etiquetas son del dueño del store en 5 de los 204 pares, y de un agente en los demás. Con una lectura estricta de la regla, el agente dio 32 revisiones en vez de 80.
 
 ## Invariantes
 

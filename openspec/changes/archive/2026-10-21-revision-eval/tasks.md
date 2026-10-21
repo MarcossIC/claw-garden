@@ -4,7 +4,7 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 ## Dónde quedó (2026-10-21)
 
-Hechos los grupos 1 a 9: la compuerta de `rag-eval`, `chains --real`, `store --real` (M5) y la [verificación](verify.md). Falta el archivo y la versión (10).
+Hechos los grupos 1 a 9: la compuerta de `rag-eval`, `chains --real`, `store --real` (M5) y la [verificación](verify.md). Archivado el 2026-10-21, con la versión en `0.44.0`.
 
 M5 esperó a una release con `clawg export`: la `0.34.0` no lo traía y una build de debug rechaza el perfil `prod`. Corrió con el `clawg` 0.43.1 instalado.
 
@@ -90,7 +90,7 @@ El dueño del store autorizó el export, la reproducción y el etiquetado por ag
 
 ## 10. Archive y versión
 
-- [ ] Sección «`revision-eval`: revisiones por clave» en `specs/eval`; `git mv` al archivo con la fecha; `state.yaml` en `archived` y la fila 48 de `openspec/README.md` como archivada.
+- [x] Sección «`revision-eval`: revisiones por clave» en `specs/eval`; `git mv` al archivo con la fecha; `state.yaml` en `archived` y la fila 48 de `openspec/README.md` como archivada. Además, en el mapa, 68 (el aviso) y 69 (el M2 que no pasa), y los enlaces relativos de los documentos movidos.
 - Commit: `docs(openspec): archive revision-eval`
-- [ ] Subir el minor `0.43.1` → `0.44.0` en `[workspace.package]` del `Cargo.toml` raíz y `cargo update --workspace`; ambos archivos juntos (el `0.43.0` lo subió el archivo de preference-topic-scope, `a0746cf`, y el `0.43.1`, el arreglo de dependencias `f17deac`).
+- [x] Subir el minor `0.43.1` → `0.44.0` en `[workspace.package]` del `Cargo.toml` raíz y `cargo update --workspace`; ambos archivos juntos (el `0.43.0` lo subió el archivo de preference-topic-scope, `a0746cf`, y el `0.43.1`, el arreglo de dependencias `f17deac`).
 - Commit: `chore: bump version to 0.44.0`
