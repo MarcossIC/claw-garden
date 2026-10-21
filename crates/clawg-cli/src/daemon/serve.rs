@@ -248,7 +248,12 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
 
     // No request can queue a save any more, so whatever is queued now is all
     // there is to drain or spill.
-    ctx.runtime.shutdown(workers).await;
+    // After a shutdown that finished nothing else uses the connection, so the
+    // close runs at once; after one its bound cut, a call may still hold the
+    // connection, and the close would wait behind it past every bound.
+    if ctx.runtime.shutdown(workers).await {
+        ctx.runtime.close().await;
+    }
 
     // Always, on every exit path: a stale `daemon.json` sends the next client
     // to a port nothing is listening on, and the failure looks like a hang.

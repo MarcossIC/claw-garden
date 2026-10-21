@@ -284,6 +284,29 @@ async fn a_save_accepted_while_the_model_loads_survives_a_process_that_dies() {
     assert!(outbox_contents(&runtime.store).await.is_empty());
 }
 
+/// The connection closes on its own thread when its last handle drops, which
+/// a process exit can cut between removing the WAL index and removing the
+/// WAL. Closing it after the shutdown, with the runtime still alive, leaves
+/// the file standing alone before the process ends.
+#[tokio::test]
+async fn closing_after_the_shutdown_leaves_no_wal_beside_the_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (runtime, rx) = MemoryRuntime::open(tmp.path().to_path_buf(), StoreHolder::Daemon)
+        .await
+        .unwrap();
+    runtime.embedder.set(Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>).ok();
+    let workers = start(&runtime, rx);
+    accept(&runtime, "written just before the stop").await;
+    assert_eq!(wait_for_rows(&runtime.store, 1).await.len(), 1);
+
+    assert!(runtime.shutdown(workers).await, "the shutdown finished within its bound");
+    runtime.close().await;
+
+    for name in ["memory.db-wal", "memory.db-shm"] {
+        assert!(!tmp.path().join(name).exists(), "{name} is left beside the store");
+    }
+}
+
 #[tokio::test]
 async fn shutdown_checkpoints_the_wal_into_memory_db() {
     let tmp = tempfile::tempdir().unwrap();
