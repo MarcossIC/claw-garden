@@ -896,7 +896,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_working_directory_outside_the_temp_dir_is_refused_and_left_alone() {
-        let outside = std::env::temp_dir().parent().expect("the temp dir has a parent").join(format!("revision-eval-outside-{}", std::process::id()));
+        // The build directory, not the temp dir's parent: on Linux that is `/`,
+        // where a test cannot create anything.
+        let build = std::env::current_exe().unwrap().parent().expect("the test binary sits in a directory").canonicalize().unwrap();
+        assert!(!build.starts_with(std::env::temp_dir().canonicalize().unwrap()), "{} is inside the temp dir", build.display());
+        let outside = build.join(format!("revision-eval-outside-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&outside).unwrap();
         let export_path = outside.join("export.jsonl");
         std::fs::write(&export_path, "kept").unwrap();
