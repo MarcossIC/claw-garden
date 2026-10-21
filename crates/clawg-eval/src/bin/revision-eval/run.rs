@@ -16,6 +16,7 @@ use clawg_cli::daemon::api::{serve_ephemeral, AppCtx, SAVE_CONFIRM_TIMEOUT};
 use clawg_cli::mcp::tools::{format_context, format_search};
 use clawg_core::eval_api::{
     conflict_pairs, is_claim_type, row_distances, EvalEmbedder, EvalError, EvalIngest, EvalSave, EvalSaved,
+    EvalTokenCounter,
 };
 use clawg_core::paths::Profile;
 use clawg_core::runtime::MemoryRuntime;
@@ -25,6 +26,7 @@ use crate::chains::{
     arm_saves, classify, compared_rows, context_ids, is_live, m1, m2, observe, own_rows, positions,
     requirement_sentences, search_ids, Arm, Band, ChainView, Outcome, Shown, Transition, M1, M2,
 };
+use crate::cost::{self, CostError, Query, M4};
 use crate::set::ChainSet;
 
 /// The one agent that saves every arm.
@@ -61,6 +63,8 @@ pub enum RunError {
     Eval(#[from] EvalError),
     #[error("the daemon API answered with an error: {0}")]
     Client(#[from] ClientError),
+    #[error(transparent)]
+    Cost(#[from] CostError),
 }
 
 /// What a run measures.
@@ -72,6 +76,9 @@ pub struct ChainsInput<'a> {
     /// Where the chunker looks for `tokenizer.json`: the profile directory for
     /// `--real`, so pieces are cut where a real daemon cuts them.
     pub tokenizer_dir: &'a Path,
+    /// Counts the tokens of M4; the same tokenizer the chunker loads for
+    /// `--real`.
+    pub counter: &'a EvalTokenCounter,
 }
 
 /// A fresh scratch directory path under the system temp dir. Not created.
@@ -111,6 +118,8 @@ struct ArmRun<'a> {
     shown: Vec<Shown>,
     /// Only the no-key arm's: what each of its transitions left.
     transitions: Vec<Transition<'a>>,
+    /// What the router answered each chain's query, per chain.
+    queries: Vec<Query>,
 }
 
 /// How much one arm stored.
@@ -139,6 +148,8 @@ pub struct ChainsReport {
     pub arms: BTreeMap<&'static str, ArmReport>,
     pub m1: M1,
     pub m2: M2,
+    /// What showing the key costs, over the keyed arm's queries.
+    pub m4: M4,
     /// By arm and chain id, where each version shows for the chain's query.
     pub positions: BTreeMap<&'static str, BTreeMap<String, Shown>>,
 }
@@ -177,6 +188,11 @@ async fn measure(input: &ChainsInput<'_>, scratch: &Path) -> Result<ChainsReport
             (arm.as_str(), by_chain)
         })
         .collect();
+    let keyed = run_of(Arm::Keyed);
+    let keys: HashMap<i64, String> =
+        keyed.listed.values().filter_map(|row| row.topic_key.clone().map(|key| (row.id, key))).collect();
+    let longest_key = input.set.chains.iter().map(|c| c.topic_key.as_str()).max_by_key(|k| k.len()).unwrap_or_default();
+    let m4 = cost::m4(&keyed.queries, &keys, longest_key, AGENT, PROJECT, input.counter)?;
     Ok(ChainsReport {
         model: input.embedder.model_id().to_string(),
         set_version: input.set.version,
@@ -187,6 +203,7 @@ async fn measure(input: &ChainsInput<'_>, scratch: &Path) -> Result<ChainsReport
         arms: runs.iter().map(|(arm, run)| (arm.as_str(), arm_report(run))).collect(),
         m1: m1(&run_of(Arm::NoKey).transitions),
         m2: m2(&views(run_of(Arm::Keyed)), &views(run_of(Arm::Control))),
+        m4,
         positions,
     })
 }
@@ -216,7 +233,7 @@ async fn run_arm<'a>(input: &ChainsInput<'a>, arm: Arm, dir: &Path) -> Result<Ar
     let session = serve(runtime).await?;
     let read = read_router(&session.client, input.set, &own).await;
     let released = release(session).await;
-    let (listed, shown) = read?;
+    let (listed, shown, queries) = read?;
     released?;
 
     let transitions = outcomes
@@ -228,7 +245,7 @@ async fn run_arm<'a>(input: &ChainsInput<'a>, arm: Arm, dir: &Path) -> Result<Ar
             above: shown[index].above_at(to),
         })
         .collect();
-    Ok(ArmRun { saved, own, listed, shown, transitions })
+    Ok(ArmRun { saved, own, listed, shown, transitions, queries })
 }
 
 /// Per chain, the versions with a row of their own the router lists live.
@@ -244,9 +261,10 @@ async fn read_router(
     client: &DaemonClient,
     set: &ChainSet,
     own: &[Vec<Option<Vec<i64>>>],
-) -> Result<(HashMap<i64, MemoryRow>, Vec<Shown>), RunError> {
+) -> Result<(HashMap<i64, MemoryRow>, Vec<Shown>, Vec<Query>), RunError> {
     let listed = list_rows(client).await?;
     let mut shown = Vec::with_capacity(set.chains.len());
+    let mut queries = Vec::with_capacity(set.chains.len());
     for (chain, own) in set.chains.iter().zip(own) {
         let found = client
             .search(SearchArgs {
@@ -256,12 +274,13 @@ async fn read_router(
                 limit: None,
             })
             .await?;
-        let search = format_search(found, AGENT, Some(PROJECT));
+        let search = format_search(found.clone(), AGENT, Some(PROJECT));
         let prompt = client.context(&chain.query, AGENT, Some(PROJECT), None).await?.prompt;
         let context = format_context(&prompt);
         shown.push(Shown { search: positions(own, &search_ids(&search)), context: positions(own, &context_ids(&context)) });
+        queries.push(Query { found, prompt });
     }
-    Ok((listed, shown))
+    Ok((listed, shown, queries))
 }
 
 fn save<'a>(content: &'a str, memory_type: &'a str, topic_key: Option<&'a str>) -> EvalSave<'a> {
@@ -402,6 +421,7 @@ mod tests {
 
     use serde_json::json;
 
+    use crate::chains::header_id;
     use crate::set::Chain;
 
     /// A long decision of three versions that differ only at the end, so they
@@ -440,7 +460,7 @@ mod tests {
         let set = tiny_set();
         let scratch = scratch_dir();
         let embedder = EvalEmbedder::fake();
-        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &scratch };
+        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &scratch, counter: &EvalTokenCounter::fake() };
 
         let run = run_arm(&input, Arm::Keyed, &scratch.join(Arm::Keyed.as_str())).await;
         remove_scratch(&scratch).await;
@@ -473,7 +493,7 @@ mod tests {
         let set = tiny_set();
         let scratch = scratch_dir();
         let embedder = EvalEmbedder::fake();
-        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &scratch };
+        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &scratch, counter: &EvalTokenCounter::fake() };
 
         let report = run(&input, &scratch).await.expect("the run must succeed");
 
@@ -504,6 +524,57 @@ mod tests {
             assert_eq!((shown.search[..2].to_vec(), shown.context[..2].to_vec()), (vec![None, None], vec![None, None]));
         }
         assert!(report.m2.one_live_version.met && report.m2.no_old_version_shown.met, "{:?}", report.m2);
+        let m4 = &report.m4;
+        assert_eq!((m4.search.outputs, m4.context.outputs), (2, 2));
+        assert!(m4.search.total_byte_delta > 0, "the keyed arm's search shows the keys: {m4:?}");
+        assert!(m4.context.total_byte_delta > 0, "the rewritten prompts carry the keys: {m4:?}");
+        assert!(m4.context_all_keyed.total_byte_delta >= m4.context.total_byte_delta);
+        assert!(m4.fixed.schema_description_tokens > 0 && m4.fixed.protocol_paragraph_tokens > 0 && m4.warning_line_tokens > 0);
+    }
+
+    /// The prompts the keyed arm's router returned, and the key of each row.
+    async fn keyed_prompts() -> (Vec<String>, HashMap<i64, String>) {
+        let set = tiny_set();
+        let scratch = scratch_dir();
+        let embedder = EvalEmbedder::fake();
+        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &scratch, counter: &EvalTokenCounter::fake() };
+        let run = run_arm(&input, Arm::Keyed, &scratch.join(Arm::Keyed.as_str())).await;
+        remove_scratch(&scratch).await;
+        let run = run.expect("the keyed arm must run");
+        let keys = run.listed.values().filter_map(|row| row.topic_key.clone().map(|key| (row.id, key))).collect();
+        (run.queries.into_iter().map(|q| q.prompt).collect(), keys)
+    }
+
+    /// Fails when the product changes the header it prints for a hit: the
+    /// rewrite would then find none and M4 would measure nothing.
+    #[tokio::test]
+    async fn the_rewrite_finds_every_keyed_header_of_a_real_prompt() {
+        let (prompts, keys) = keyed_prompts().await;
+        let mut keyed_headers = 0;
+        for prompt in &prompts {
+            let ids = context_ids(prompt);
+            let expected = ids.iter().filter(|id| keys.contains_key(id)).count();
+            let rewritten = cost::rewrite_prompt(prompt, &keys, None);
+            assert_eq!((rewritten.headers, rewritten.keyed), (ids.len(), expected), "{prompt}");
+            for line in rewritten.prompt.lines() {
+                if let Some(id) = header_id(line) {
+                    assert_eq!(line.contains(" topic="), keys.contains_key(&id), "{line}");
+                }
+            }
+            keyed_headers += expected;
+        }
+        assert!(keyed_headers > 0, "no prompt held a keyed hit: {prompts:?}");
+    }
+
+    #[tokio::test]
+    async fn the_production_context_still_omits_the_key() {
+        let (prompts, _) = keyed_prompts().await;
+        let mut headers = 0;
+        for line in prompts.iter().flat_map(|p| p.lines()).filter(|l| header_id(l).is_some()) {
+            assert!(!line.contains(" topic="), "{line}");
+            headers += 1;
+        }
+        assert!(headers > 0, "no prompt held a hit: {prompts:?}");
     }
 
     #[tokio::test]
@@ -514,7 +585,7 @@ mod tests {
             .parent()
             .expect("the temp dir has a parent")
             .join(format!("revision-eval-must-not-be-created-{}", std::process::id()));
-        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &outside };
+        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &outside, counter: &EvalTokenCounter::fake() };
 
         match run(&input, &outside).await {
             Err(RunError::OutsideTemp(path, _)) => assert_eq!(path, outside),

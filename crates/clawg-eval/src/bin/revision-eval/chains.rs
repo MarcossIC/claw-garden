@@ -226,19 +226,19 @@ pub fn search_ids(text: &str) -> Vec<i64> {
 /// (`indent_continuations`). A conflict's side opens with `NEW` or `OLD`, so
 /// only the hits are read.
 pub fn context_ids(prompt: &str) -> Vec<i64> {
-    prompt
-        .lines()
-        .filter_map(|line| {
-            let rest = line.strip_prefix('[')?;
-            let (date, rest) = (rest.get(..10)?, rest.get(10..)?);
-            let date_shape = date.bytes().enumerate().all(|(i, b)| if i == 4 || i == 7 { b == b'-' } else { b.is_ascii_digit() });
-            let id = rest.strip_prefix(" #")?.split([' ', ']']).next()?;
-            if !date_shape || id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-            id.parse().ok()
-        })
-        .collect()
+    prompt.lines().filter_map(header_id).collect()
+}
+
+/// The row id of a prompt line that opens a hit, `[YYYY-MM-DD #id `.
+pub fn header_id(line: &str) -> Option<i64> {
+    let rest = line.strip_prefix('[')?;
+    let (date, rest) = (rest.get(..10)?, rest.get(10..)?);
+    let date_shape = date.bytes().enumerate().all(|(i, b)| if i == 4 || i == 7 { b == b'-' } else { b.is_ascii_digit() });
+    let id = rest.strip_prefix(" #")?.split([' ', ']']).next()?;
+    if !date_shape || id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    id.parse().ok()
 }
 
 /// The place, from 1, of each version among `ids`: that of the first hit of a

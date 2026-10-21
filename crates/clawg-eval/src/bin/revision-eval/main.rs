@@ -7,13 +7,14 @@
 //! the plumbing and never the numbers.
 
 mod chains;
+mod cost;
 mod run;
 mod set;
 mod stats;
 
 use std::path::Path;
 
-use clawg_core::eval_api::{model_is_cached, EvalEmbedder};
+use clawg_core::eval_api::{model_is_cached, EvalEmbedder, EvalTokenCounter};
 
 const EXIT_OK: i32 = 0;
 const EXIT_RUNTIME_FAILURE: i32 = 1;
@@ -120,11 +121,22 @@ async fn run(args: impl Iterator<Item = String>) -> i32 {
     } else {
         EvalEmbedder::fake()
     };
+    let counter = if real {
+        match EvalTokenCounter::real(&base_dir) {
+            Ok(counter) => counter,
+            Err(e) => {
+                eprintln!("failed to load the tokenizer: {e}");
+                return EXIT_RUNTIME_FAILURE;
+            }
+        }
+    } else {
+        EvalTokenCounter::fake()
+    };
     let scratch = run::scratch_dir();
     // Under --fake the chunker must not find a tokenizer, and the scratch
     // directory holds none.
     let tokenizer_dir = if real { base_dir.clone() } else { scratch.clone() };
-    let input = run::ChainsInput { set: &set, distractors: &distractors, embedder: &embedder, tokenizer_dir: &tokenizer_dir };
+    let input = run::ChainsInput { set: &set, distractors: &distractors, embedder: &embedder, tokenizer_dir: &tokenizer_dir, counter: &counter };
 
     match run::run(&input, &scratch).await {
         Ok(report) => {
