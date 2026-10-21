@@ -676,7 +676,7 @@ mod tests {
 
         let after = conn.call(snapshot).await.unwrap();
         assert_eq!(before, after);
-        assert_eq!(after.0, 17);
+        assert_eq!(after.0, 18);
     }
 
     /// Rows written before `project` existed keep their project ids when the
@@ -1317,6 +1317,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_store_from_before_the_session_indexes_keeps_its_rows_and_gains_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), Some(17)).await;
+
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        let (content, indexes): (String, Vec<String>) = store
+            .conn
+            .call(|c| -> rusqlite::Result<(String, Vec<String>)> {
+                let content = c.query_row("SELECT content FROM memory WHERE agent_id = 'agent-seed'", [], |r| r.get(0))?;
+                let mut stmt = c.prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'memory' \
+                     AND name IN ('idx_memory_session_summary', 'idx_memory_agent_created') ORDER BY name",
+                )?;
+                let indexes = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+                Ok((content, indexes))
+            })
+            .await
+            .unwrap();
+        assert_eq!(content, "seeded on disk");
+        assert_eq!(indexes, ["idx_memory_agent_created", "idx_memory_session_summary"]);
+    }
+
+    #[tokio::test]
     async fn a_runner_with_a_cap_migrates_no_further_than_it() {
         ensure_vec0_registered();
         for (cap, expected) in [(Some(7), 7), (None, backup::latest_known())] {
@@ -1735,7 +1759,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 17, "Expected exactly 17 applied migrations, got {}", count);
+        assert_eq!(count, 18, "Expected exactly 18 applied migrations, got {}", count);
     }
 
     /// V8 — a fresh store records V8 as applied and carries the FTS5 lexical
@@ -2196,7 +2220,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 17);
+        assert_eq!(migration_count, 18);
     }
 
     // -----------------------------------------------------------------------

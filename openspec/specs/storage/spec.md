@@ -166,9 +166,9 @@ Un save con fila que está en curso MUST mirar el plazo antes de insertar cada p
 
 ### Arranque: se ingiere lo pendiente antes que lo nuevo
 
-Al arrancar, el worker (`ingest_worker_future`, `crates/clawg-core/src/runtime.rs:463`) MUST, en este orden:
+Al arrancar, el worker (`ingest_worker_future`, `crates/clawg-core/src/runtime.rs:477`) MUST, en este orden:
 
-1. importar `ingest-pending.jsonl` si existe (`import_spill`, `runtime.rs:506`): cada evento válido pasa a una fila, enmascarado, todos en una transacción con `synchronous = FULL` (`outbox_import`, `outbox.rs:281`); el archivo MUST borrarse sólo después del commit. Si no se pudo borrar, se avisa: una segunda importación la absorbe el dedup;
+1. importar `ingest-pending.jsonl` si existe (`import_spill`, `runtime.rs:520`): cada evento válido pasa a una fila, enmascarado, todos en una transacción con `synchronous = FULL` (`outbox_import`, `outbox.rs:281`); el archivo MUST borrarse sólo después del commit. Si no se pudo borrar, se avisa: una segunda importación la absorbe el dedup;
 2. procesar las filas `pending` en orden de id antes que cualquier evento del canal (`outbox_pending`, `outbox.rs:486`; `Replay`, `worker.rs:179`).
 
 Si no se puede leer el outbox, el worker lo registra y sigue con el canal: esas filas esperan al próximo arranque. Fuera de este arranque, el outbox sólo vuelve al worker por el reintento de un fallo pasajero y por `clawg outbox retry`.
@@ -209,7 +209,7 @@ En un apagado ordenado, el tracker MUST escribir el buffer pendiente antes de te
 
 ### Checkpoint al terminar
 
-Después de drenar y del flush del tracker, el apagado SHOULD hacer `PRAGMA wal_checkpoint(TRUNCATE)` (`checkpoint`, `runtime.rs:440`). Un fallo del checkpoint MUST registrarse y MUST NOT impedir el resto del apagado.
+Después de drenar y del flush del tracker, el apagado SHOULD hacer `PRAGMA wal_checkpoint(TRUNCATE)` (`checkpoint`, `runtime.rs:454`). Un fallo del checkpoint MUST registrarse y MUST NOT impedir el resto del apagado.
 
 #### Escenario
 - GIVEN una base en WAL con escrituras recientes
@@ -217,6 +217,17 @@ Después de drenar y del flush del tracker, el apagado SHOULD hacer `PRAGMA wal_
 - THEN `memory.db-wal` no existe o mide 0 bytes, y una copia de `memory.db` sola contiene las escrituras
 
 **Test:** `shutdown_checkpoints_the_wal_into_memory_db` (`crates/clawg-core/tests/shutdown.rs`).
+
+### El daemon cierra `memory.db` antes de salir
+
+Después de un apagado que terminó dentro de su tope (`shutdown` devuelve `true`), `clawg serve` MUST cerrar la conexión del store y esperar el cierre (`MemoryRuntime::close`, `crates/clawg-core/src/runtime.rs:349`; en `crates/clawg-cli/src/daemon/serve.rs:255`), así SQLite quita `memory.db-wal` y `memory.db-shm` antes de que termine el proceso. Sin cerrarla, el cierre corre en el hilo propio de la conexión cuando cae su último handle, y la salida del proceso puede cortarlo después de quitar el índice del WAL y antes de quitar el WAL: queda un `memory.db-wal` vacío, y `clawg doctor`, que con un WAL presente abre sin `immutable`, crea un `memory.db-shm` junto a un store parado. Después de un apagado que el tope cortó no se cierra: una llamada puede tener todavía la conexión y el cierre esperaría detrás de ella, fuera de todo tope. Un cierre que falla MUST registrarse y nada más; SQLite reproduce lo que quede al abrir.
+
+#### Escenario
+- GIVEN un runtime con un save recién guardado
+- WHEN se apaga y se cierra, con el runtime todavía vivo
+- THEN no hay `memory.db-wal` ni `memory.db-shm` junto al store
+
+**Tests:** `closing_after_the_shutdown_leaves_no_wal_beside_the_store` (`crates/clawg-core/tests/shutdown.rs`); `doctor_reads_a_running_daemons_store_without_changing_it` (`crates/clawg-cli/tests/binary.rs`), que fallaba de forma intermitente en Linux por el `-wal` vacío.
 
 ### SIGTERM es un apagado ordenado
 
@@ -300,7 +311,7 @@ Las migraciones pendientes de un arranque MUST aplicarse en una sola transacció
 
 ### Checksums fijados
 
-Los checksums de las migraciones publicadas (hoy V1–V17) MUST coincidir con una lista fija en el código (`PINNED`, `crates/clawg-core/src/memory/migrations.rs:44`). Cambiar una migración publicada MUST romper un test. Una migración nueva agrega su fila a la lista en el mismo commit.
+Los checksums de las migraciones publicadas (hoy V1–V18) MUST coincidir con una lista fija en el código (`PINNED`, `crates/clawg-core/src/memory/migrations.rs:44`). Cambiar una migración publicada MUST romper un test. Una migración nueva agrega su fila a la lista en el mismo commit.
 
 **Test:** `published_migration_checksums_are_pinned` (`migrations.rs`).
 
@@ -355,12 +366,34 @@ Un binario anterior a V17 MUST NOT abrir una base en V17: la rechaza sin tocarla
 
 Una base escrita por una versión anterior a V17 puede tener una versión reemplazada por una fila borrada, de la misma clave, porque el borrado de la vigente no la revivía. La migración escribe `revision` en esa fila (su reemplazante tiene la clave), y no la revive: el primer paso de mantenimiento la trae de vuelta, `STARTUP_DELAY` después de arrancar el daemon (`crates/clawg-core/src/memory/maintenance.rs:25`). Esto se acepta como está diseñado: el efecto queda sólo en el log del daemon (`maintenance: brought back N rows ...`), `clawg update` no lo informa, y restaurar la fila borrada la vuelve a reemplazar. Ver [`specs/restore`](../restore/spec.md), «Filas de una versión anterior a V17».
 
+### Una base en V17 abre con los índices de las sentencias de sesión
+
+V18 (`crates/clawg-core/migrations/V18__session_indexes.sql`) sólo toca índices de `memory`: crea `idx_memory_session_summary` sobre `(project_id, created_at DESC)` para los `session_summary` no borrados, que lee LAST SESSION, e `idx_memory_agent_created` sobre `(agent_id, created_at DESC)` para las filas no borradas, que lee RECENT ([`specs/retrieval`](../retrieval/spec.md), «Las sentencias de sesión leen por índice»), y reconstruye `idx_memory_dedup` como `(agent_id, COALESCE(project_id, ''), content_hash, created_at)` con el mismo predicado parcial. El índice del agente entrega las filas de `agent_id = ?` por `created_at`, y sin el sello en el de dedup el planificador lo elegía para las búsquedas de dedup (`ORDER BY created_at ASC LIMIT 1`): cada guardado habría recorrido las filas vivas del agente. Con el sello, esas búsquedas (`REINFORCE_LOOKUP_SQL`, `crates/clawg-core/src/memory/store_insert.rs:300`; `TWIN_SQL` del import; `RESTORE_TWIN` del undelete) llegan por el índice de dedup sin ordenar. Ningún predicado nombra `status`: un índice parcial sólo sirve a una sentencia cuyo `WHERE` implica el del índice, y eso ataría el índice al texto de los estados.
+
+Una base en V17 MUST abrir con V18 con cada fila igual y con los tres índices. La migración MUST NOT cambiar ninguna fila.
+
+#### Escenario
+- GIVEN un `memory.db` migrado hasta V17 con una fila
+- WHEN `MemoryStore::open` lo abre
+- THEN la fila sigue y `sqlite_master` tiene `idx_memory_session_summary` e `idx_memory_agent_created` sobre `memory`
+
+#### Escenario: el dedup sigue en su índice
+- GIVEN un store migrado
+- WHEN se pide el plan de `REINFORCE_LOOKUP_SQL`
+- THEN nombra `idx_memory_dedup` y ninguna línea nombra `TEMP B-TREE`
+
+**Tests:** `a_store_from_before_the_session_indexes_keeps_its_rows_and_gains_them` (`crates/clawg-core/src/memory/db.rs:1320`), que abre con `MemoryStore::open`, así que pasa también por el snapshot `pre-migration`; `reinforce_lookup_uses_dedup_index` (`store_insert.rs:2165`); el checksum de V18 en `published_migration_checksums_are_pinned` (`migrations.rs`).
+
+#### Vuelta atrás de V18
+
+Un binario anterior a V18 MUST NOT abrir una base en V18: la rechaza sin tocarla con `SchemaNewer` («Verificación del esquema antes de migrar»). La vuelta atrás es la copia `pre-migration` que se escribió antes de V18, que `clawg update` restaura sola si el binario viejo se niega ([`specs/self-update`](../self-update/spec.md)). Quitar V18 a mano no pierde ninguna fila: `DROP INDEX idx_memory_session_summary; DROP INDEX idx_memory_agent_created; DROP INDEX idx_memory_dedup; CREATE INDEX idx_memory_dedup ON memory (agent_id, COALESCE(project_id, ''), content_hash) WHERE deleted_at IS NULL AND content_hash IS NOT NULL; DELETE FROM refinery_schema_history WHERE version = 18;`.
+
 ### Verificación del esquema antes de migrar
 
 La decisión es pura (`schema_plan`, `backup.rs:93`). `MemoryStore::open` MUST calcularla antes de cualquier pragma y antes del runner (`check_schema`, `crates/clawg-core/src/memory/db.rs:409`, llamada en `db.rs:195`). Con `Newer` o `Diverged`, `open` MUST devolver `MemoryError::SchemaNewer` o `MemoryError::SchemaDiverged` (`crates/clawg-core/src/memory/error.rs:58` y `:64`) y MUST NOT escribir nada en `memory.db`. Los mensajes MUST decir las versiones, que nada cambió, y qué hacer: instalar la versión que la escribió o `clawg restore` de un backup anterior.
 
 #### Escenario: base más nueva
-- GIVEN una base en la última versión del binario, N (hoy V17), con una fila N + 1 agregada en `refinery_schema_history`
+- GIVEN una base en la última versión del binario, N (hoy V18), con una fila N + 1 agregada en `refinery_schema_history`
 - WHEN se abre
 - THEN el error es `SchemaNewer { db: N + 1, binary: N }`, nombra `clawg restore`, y `memory.db` es byte a byte igual
 
@@ -463,7 +496,7 @@ La descarga MUST usar un cliente con 30 s para conectar y 60 s por lectura (`DOW
 
 ### Un hash por archivo, fuera de los hilos del runtime
 
-Leer y hashear la caché MUST correr en una tarea bloqueante (`check_cache_off_runtime`, `model_download.rs:532`), no en un hilo del runtime asíncrono, en el arranque y en cada recarga. El worker de ingest MUST leer, verificar y parsear `tokenizer.json` en una tarea bloqueante (`ingest_worker_future`, `crates/clawg-core/src/runtime.rs:463`). En una corrida, cada archivo MUST hashearse una sola vez: el de la caché al leerlo (`check_cache`, `:572`), el bajado mientras llegan sus bytes, sin volver a leerlo del disco. Los bytes que recibe la carga MUST ser los mismos que se hashearon. El cierre del archivo bajado (`sync_all` y el `rename`) MUST correr en una tarea bloqueante. Como el archivo bajado queda en memoria para entregarlo sin releerlo, un archivo que anuncia o trae más de 600 MB (`MAX_FILE_BYTES`, `:836`, lo que pide libre el chequeo de disco y más que cualquier archivo del modelo) MUST fallar sin reintentar y sin reservar esa memoria (`DownloadError::TooLarge`, `:350`).
+Leer y hashear la caché MUST correr en una tarea bloqueante (`check_cache_off_runtime`, `model_download.rs:532`), no en un hilo del runtime asíncrono, en el arranque y en cada recarga. El worker de ingest MUST leer, verificar y parsear `tokenizer.json` en una tarea bloqueante (`ingest_worker_future`, `crates/clawg-core/src/runtime.rs:477`). En una corrida, cada archivo MUST hashearse una sola vez: el de la caché al leerlo (`check_cache`, `:572`), el bajado mientras llegan sus bytes, sin volver a leerlo del disco. Los bytes que recibe la carga MUST ser los mismos que se hashearon. El cierre del archivo bajado (`sync_all` y el `rename`) MUST correr en una tarea bloqueante. Como el archivo bajado queda en memoria para entregarlo sin releerlo, un archivo que anuncia o trae más de 600 MB (`MAX_FILE_BYTES`, `:836`, lo que pide libre el chequeo de disco y más que cualquier archivo del modelo) MUST fallar sin reintentar y sin reservar esa memoria (`DownloadError::TooLarge`, `:350`).
 
 #### Escenario: falta un archivo chico
 - GIVEN la caché completa salvo `config.json`

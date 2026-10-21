@@ -768,14 +768,16 @@ fn format_conflict_block(pairs: &[ConflictPair], hit_positions: &HashMap<i64, us
 
 /// The live `session_summary` rows of the project, newest first, a long save
 /// by its first piece; the project's own only, since a summary without one is
-/// not this project's last session. Authors are checked by the caller.
+/// not this project's last session. Authors are checked by the caller, which
+/// stops at the first readable row. `IS` rather than an `OR` of the value and
+/// the NULL case, which the planner does not take to `idx_memory_session_summary`.
 const LAST_SESSION_SQL: &str = "
     SELECT id, content, memory_type, tier, status, created_at, agent_id, topic_key, project_id
     FROM memory
     WHERE memory_type = 'session_summary'
       AND status IN ('active', 'disputed')
       AND deleted_at IS NULL
-      AND (project_id = ?1 OR (?1 IS NULL AND project_id IS NULL))
+      AND project_id IS ?1
     ORDER BY created_at DESC, id ASC
 ";
 
@@ -829,7 +831,7 @@ async fn fetch_last_session(
     store
         .conn
         .call(move |c| -> rusqlite::Result<Option<RankedHit>> {
-            let mut stmt = c.prepare(LAST_SESSION_SQL)?;
+            let mut stmt = c.prepare_cached(LAST_SESSION_SQL)?;
             let mut rows = stmt.query(rusqlite::params![project])?;
             while let Some(row) = rows.next()? {
                 let author: Option<String> = row.get(6)?;
@@ -892,7 +894,7 @@ async fn fetch_recent_rows(
     store
         .conn
         .call(move |c| -> rusqlite::Result<Vec<RankedHit>> {
-            let mut stmt = c.prepare(RECENT_ROWS_SQL)?;
+            let mut stmt = c.prepare_cached(RECENT_ROWS_SQL)?;
             let rows = stmt.query_map(rusqlite::params![agent, project, since, RECENT_ROW_POOL], |row| {
                 Ok(RankedHit {
                     id: row.get(0)?,
@@ -3534,5 +3536,96 @@ mod tests {
         let month_old = seed_summary(&old, "agent-1", Some("proj-a"), "Goal: a month ago", 30).await;
         let text = session_prompt(&old, "agent-1", Some("proj-a")).await.text;
         assert!(block(&text, SEP_LAST_SESSION).unwrap().contains(&format!("#{month_old} ")), "with its date, however old: {text}");
+    }
+
+    /// The `detail` column of `EXPLAIN QUERY PLAN` for the production `sql`.
+    async fn plan_of(store: &MemoryStore, sql: &'static str, binds: Vec<rusqlite::types::Value>) -> Vec<String> {
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<Vec<String>> {
+                let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(binds), |r| r.get::<_, String>(3))?;
+                rows.collect()
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Both run on every context and every `session-start`, so they must reach
+    /// the newest rows by key and stop there: a scan or a sort makes their cost
+    /// the size of the store rather than of what they return.
+    #[tokio::test]
+    async fn the_session_statements_read_the_newest_rows_by_index_without_sorting() {
+        use rusqlite::types::Value;
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let cases = [
+            ("LAST SESSION in a project", LAST_SESSION_SQL, vec![Value::Text("proj-a".into())], "idx_memory_session_summary"),
+            ("LAST SESSION without a project", LAST_SESSION_SQL, vec![Value::Null], "idx_memory_session_summary"),
+            (
+                "RECENT",
+                RECENT_ROWS_SQL,
+                vec![Value::Text("agent-1".into()), Value::Text("proj-a".into()), Value::Integer(0), Value::Integer(RECENT_ROW_POOL)],
+                "idx_memory_agent_created",
+            ),
+        ];
+        for (name, sql, binds, index) in cases {
+            let plan = plan_of(&store, sql, binds).await;
+            assert!(
+                plan.iter().any(|l| l.starts_with("SEARCH memory USING INDEX") && l.contains(index)),
+                "{name} does not search `{index}`: {plan:?}"
+            );
+            assert!(!plan.iter().any(|l| l.contains("TEMP B-TREE")), "{name} sorts its rows: {plan:?}");
+        }
+    }
+
+    /// The pieces of one save share its stamp, so the order within a stamp is
+    /// what keeps a save's opening first; the index must give `id ASC` there,
+    /// not the order the rows happen to sit in it.
+    #[tokio::test]
+    async fn the_session_statements_order_rows_of_one_stamp_by_id() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let (older, newer) = (TimestampMs::now().as_millis_i64() - 2 * 86_400_000, TimestampMs::now().as_millis_i64() - 86_400_000);
+        let stamps = [older, newer, older, newer, older, newer];
+        let rows: Vec<(i64, i64)> = store
+            .conn
+            .call(move |c| -> rusqlite::Result<Vec<(i64, i64)>> {
+                stamps
+                    .iter()
+                    .map(|&ts| {
+                        c.execute(
+                            "INSERT INTO memory (scope, agent_id, project_id, content, memory_type, source,
+                             created_at, created_by_type, created_by_ref,
+                             last_modified_at, last_accessed_at, importance, tier, status)
+                             VALUES ('agent', 'agent-1', 'proj-a', 'a summary', 'session_summary', 'explicit', ?1, 'agent', 'agent-1', ?1, ?1, 5.0, 2, 'active')",
+                            [ts],
+                        )?;
+                        Ok((c.last_insert_rowid(), ts))
+                    })
+                    .collect()
+            })
+            .await
+            .unwrap();
+        let mut expected = rows.clone();
+        expected.sort_by_key(|&(id, ts)| (Reverse(ts), id));
+        let expected: Vec<i64> = expected.into_iter().map(|(id, _)| id).collect();
+
+        let ids = |sql: &'static str, binds: Vec<rusqlite::types::Value>| {
+            store.conn.call(move |c| -> rusqlite::Result<Vec<i64>> {
+                let mut stmt = c.prepare(sql)?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(binds), |r| r.get(0))?;
+                rows.collect()
+            })
+        };
+        use rusqlite::types::Value;
+        let last = ids(LAST_SESSION_SQL, vec![Value::Text("proj-a".into())]).await.unwrap();
+        let recent = ids(
+            RECENT_ROWS_SQL,
+            vec![Value::Text("agent-1".into()), Value::Text("proj-a".into()), Value::Integer(0), Value::Integer(RECENT_ROW_POOL)],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(last, expected, "LAST SESSION");
+        assert_eq!(recent, expected, "RECENT");
     }
 }

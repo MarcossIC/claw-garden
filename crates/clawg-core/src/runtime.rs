@@ -314,17 +314,18 @@ impl MemoryRuntime {
     /// queue for up to [`DRAIN_DEADLINE`], leaving what is left in the outbox
     /// for the next start, flushes the access tracker, stops maintenance and
     /// checkpoints the WAL, all of it within [`AFTER_DRAIN`] past the drain.
-    pub async fn shutdown(&self, workers: Workers) {
-        self.shutdown_by(workers, DRAIN_DEADLINE).await;
+    /// `false` when that bound cut it.
+    pub async fn shutdown(&self, workers: Workers) -> bool {
+        self.shutdown_by(workers, DRAIN_DEADLINE).await
     }
 
     /// [`MemoryRuntime::shutdown`] with a drain deadline short enough for a test.
     #[cfg(any(test, feature = "testing"))]
-    pub async fn shutdown_within(&self, workers: Workers, drain_deadline: Duration) {
-        self.shutdown_by(workers, drain_deadline).await;
+    pub async fn shutdown_within(&self, workers: Workers, drain_deadline: Duration) -> bool {
+        self.shutdown_by(workers, drain_deadline).await
     }
 
-    async fn shutdown_by(&self, workers: Workers, drain_deadline: Duration) {
+    async fn shutdown_by(&self, workers: Workers, drain_deadline: Duration) -> bool {
         // An error means the worker already ended; awaiting it below says how.
         let _ = workers.drain.send(Some(Instant::now() + drain_deadline));
         let maintenance = workers.maintenance.abort_handle();
@@ -335,6 +336,19 @@ impl MemoryRuntime {
                 "the shutdown did not finish within {} s; what is left is in the outbox and the WAL for the next start",
                 bound.as_secs()
             );
+            return false;
+        }
+        true
+    }
+
+    /// Closes the store's connection and waits for it, for a host about to
+    /// exit after a [`MemoryRuntime::shutdown`] that finished. Left to the
+    /// last handle's drop, the close runs on the connection's own thread and
+    /// the exit can cut it after the WAL index is removed and before the WAL
+    /// is. Every call on the store fails afterwards.
+    pub async fn close(&self) {
+        if let Err(e) = self.store.conn.clone().close().await {
+            log::warn!("closing memory.db failed: {e}; SQLite replays what is left on the next open");
         }
     }
 

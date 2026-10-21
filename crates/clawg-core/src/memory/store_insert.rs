@@ -2182,5 +2182,9 @@ mod tests {
             plan_text.contains("idx_memory_dedup"),
             "expected the planner to use idx_memory_dedup, got plan: {plan_text}"
         );
+        // Any index that hands `agent_id = ?` its rows by `created_at` competes
+        // for `ORDER BY created_at ASC LIMIT 1`; the dedup index wins only while
+        // it gives the order too.
+        assert!(!plan_text.contains("TEMP B-TREE"), "the lookup sorts its rows: {plan_text}");
     }
 }
