@@ -233,13 +233,13 @@ clawg --version
 
 Imprime `clawg` y la versión instalada. Si dice que no reconoce el comando, no abriste una terminal nueva o el PATH no se actualizó.
 
-**2. El diagnóstico del PATH**
+**2. El diagnóstico**
 
 ```powershell
 clawg doctor
 ```
 
-Muestra en JSON qué archivos `clawg.exe` encuentra tu PATH. Termina con código `0` si el primero es el que acabás de instalar y no hay copias duplicadas, y con código `1` si hay otra copia que lo tapa. No abre la base de datos, así que se puede correr cuando quieras.
+Muestra en JSON qué archivos `clawg.exe` encuentra tu PATH y, en `checks`, cada cosa que revisó del directorio de datos y de la base: la versión del esquema, el modelo con que se calcularon los vectores, la edad del último backup, los saves que fallaron, las reglas del estado de las memorias y el registro en Claude Code. Cada hallazgo dice su gravedad (`ok`, `info`, `warn`, `error`), la evidencia (ids, conteos y rutas, nunca el texto de una memoria) y, si lo hay, el comando que lo resuelve. Termina con código `1` sólo si hay un `error` (por ejemplo, otra copia que tapa la que acabás de instalar) y con `0` en otro caso. Lee la base sin escribir nada ni tomar el lock, así que se puede correr cuando quieras, con el daemon corriendo o no.
 
 **3. El estado del daemon**
 
@@ -305,6 +305,28 @@ Detalles útiles:
 - La búsqueda ignora mayúsculas y acentos: `configuracion` encuentra `configuración`.
 - `show` mira por defecto la tabla `memory`; con `--kind episodic` o `--kind procedural` mira las otras. Los ids son por tabla.
 - Un texto largo se guarda partido en fragmentos, y el visor los muestra como filas separadas.
+
+### Llevar memorias a otro perfil o a otra máquina
+
+`clawg export` escribe las memorias en un archivo de texto, una por línea (JSON Lines), con sus fechas, accesos, estado y vínculos. Funciona con el daemon corriendo o sin él, y no modifica nada:
+
+```powershell
+clawg export --out memorias.jsonl --profile prod                      # todas las vivas
+clawg export --out repo.jsonl --project C:\code\repo --include-deleted --profile prod   # un proyecto, también las borradas
+clawg export --out memorias.md --format markdown --profile prod       # una vista para leer, que import no lee
+```
+
+El archivo tiene el texto de las memorias tal como está guardado: sólo lo puede leer su dueño, y `clawg secrets` lista las que tienen un secreto. Las memorias que todavía esperan en el outbox no viajan.
+
+`clawg import` las trae a otro perfil a través de su daemon, que tiene que estar corriendo y las vuelve a embeber. Antes de escribir guarda un snapshot `pre-import` en `backups`, que `clawg restore` devuelve:
+
+```powershell
+clawg import repo.jsonl --dry-run --profile dev                       # qué traería, sin escribir nada
+clawg import repo.jsonl --map-root /work/repo=C:\code\repo --profile dev   # el proyecto vive en otra ruta acá
+clawg import memorias.jsonl --agent claude-code --profile dev         # todas bajo otro agente
+```
+
+Importar dos veces el mismo archivo no agrega nada. Una memoria cuyo texto ya está vivo acá no se duplica, y una cuya `topic_key` ya tiene una versión viva acá queda reemplazada por esa. El reporte dice cuántas trajo por tipo, estado y proyecto, y cuáles no pudo traer y por qué.
 
 ## Conectarlo a Claude Code
 
@@ -416,7 +438,7 @@ El puente busca solo al daemon nuevo en cuanto vuelve a arrancar, pero no lo arr
 Las versiones anteriores calculaban los vectores de las memorias de una forma que las dejaba casi todas igual de parecidas a cualquier pregunta. La primera vez que arranca esta versión guarda una copia en `~/.clawg/backups` (`…-pre-reembed.db`) y vuelve a calcular el vector de cada memoria; hasta que termina, la búsqueda por sentido no está disponible.
 
 **`clawg doctor` termina con código 1.**
-Hay otro `clawg.exe` en el PATH que gana, o una copia duplicada. El JSON que imprime dice cuál.
+Algún hallazgo es `error`: otro `clawg.exe` en el PATH que gana o una copia duplicada, una base de una versión más nueva, vectores de otro modelo o un registro de Claude Code a un binario que ya no existe. El JSON que imprime dice cuál, con su evidencia y, en `safe_next_step`, el comando que lo resuelve.
 
 ## Desinstalar
 
@@ -448,14 +470,16 @@ clawg serve --profile dev     # el daemon de memoria
 clawg mcp --profile dev       # puente MCP por stdio; arranca un daemon si no hay ninguno
 clawg status --profile dev    # estado y salud del daemon en JSON (sale con 1 si no está corriendo)
 clawg stop --profile dev      # detiene el daemon
-clawg doctor                  # a qué clawg resuelve el PATH (sale con 1 si hay uno que tapa o está duplicado)
+clawg doctor                  # qué está mal en el PATH, los datos y la base, en JSON (sale con 1 sólo si hay un error)
 clawg update --check          # dice si hay un release nuevo (100 si lo hay); clawg update lo instala
 clawg memories list|search|show|stats   # visor de sólo lectura (list --deleted: las borradas)
 clawg undelete 12 --profile dev         # devuelve una memoria borrada (con el daemon corriendo)
+clawg export --out m.jsonl --profile dev  # las memorias, una fila por línea (--project, --agent, --include-deleted, --format markdown)
+clawg import m.jsonl --profile dev        # las trae a este perfil, con el daemon corriendo (--dry-run, --agent, --map-root OLD=NEW)
 clawg setup claude-code --profile dev   # conecta Claude Code: servidor MCP, hooks y protocolo (--dry-run, --remove)
 ```
 
-`clawg mcp --no-autostart` falla en vez de arrancar un daemon, y `clawg mcp --agent <nombre>` fija el agente con el que guarda y busca. `clawg serve --port <n>` cambia el puerto por defecto (`0` elige uno libre). `clawg path add|remove [--dir <dir>]` edita el PATH del usuario en Windows.
+`clawg mcp --no-autostart` falla en vez de arrancar un daemon, y `clawg mcp --agent <nombre>` fija el agente con el que guarda y busca. `clawg serve --port <n>` escucha también en ese puerto TCP (`0` elige uno libre). `clawg path add|remove [--dir <dir>]` edita el PATH del usuario en Windows.
 
 ### Registrar el servidor MCP en un build de desarrollo
 
@@ -487,9 +511,9 @@ Registra `clawg-dev` con la ruta de ese binario y sus hooks con `--profile dev`;
 - Perfil `dev`: datos en `~/.clawg-dev`, puerto por defecto 27381.
 - Perfil `prod`: datos en `~/.clawg`, puerto por defecto 27380.
 
-El perfil sale de `--profile dev|prod`, luego de la variable de entorno `CLAWG_PROFILE`, y por último del tipo de build (debug es `dev`, release es `prod`). Un build debug rechaza `prod`, así que nunca puede tocar `~/.clawg`. El daemon escucha sólo en 127.0.0.1; los endpoints `/v1` exigen un token bearer guardado en el directorio de datos (en Unix, con permisos 0600 desde que se crea). En Unix el directorio de datos es privado de su dueño: clawg lo crea 0700, igual que los directorios que crea adentro, y a uno que ya existía con permisos para el grupo u otros se los quita y lo deja escrito en el registro con el modo anterior y el nuevo (si se compartía por grupo a propósito, `chmod` lo devuelve). Así otro usuario de la máquina no lee la memoria, las copias ni los registros. Toda ruta, `/health` incluida, responde 403 a una petición dirigida a un nombre que no sea `127.0.0.1`, `localhost` o `[::1]`, o que traiga una cabecera `Origin`: así una página web abierta en el navegador no llega al daemon, ni con DNS rebinding. No es una barrera contra un proceso del mismo usuario, que puede leer el token.
+El perfil sale de `--profile dev|prod`, luego de la variable de entorno `CLAWG_PROFILE`, y por último del tipo de build (debug es `dev`, release es `prod`). Un build debug rechaza `prod`, así que nunca puede tocar `~/.clawg`. El daemon escucha en un socket dentro del directorio de datos (`clawg.sock`). En Linux y macOS descarta toda conexión de otro usuario; en Windows es un socket AF_UNIX nativo y lo protegen los permisos del directorio de datos, que el archivo hereda: una cuenta sin acceso de escritura a él no puede conectarse. Los clientes van por él siempre que el daemon lo publique y nunca vuelven a TCP. Además escucha en `127.0.0.1`, en el puerto que pida `--port` o, sin él, en el del perfil, para los clientes de versiones anteriores al socket; si ese puerto está ocupado (por ejemplo por el daemon de otro usuario) sigue sólo por el socket. Si la ruta del socket no cabe en `sun_path` (108 bytes en Linux y Windows, 104 en macOS), el daemon no arranca y nombra la ruta, salvo que se le dé `--port`, y entonces sigue sólo por TCP; si el sistema no tiene AF_UNIX (un Windows antiguo), sigue sólo por TCP. Para mirarlo a mano: `curl --unix-socket ~/.clawg/clawg.sock http://localhost/health`. Los endpoints `/v1` exigen un token bearer guardado en el directorio de datos (en Unix, con permisos 0600 desde que se crea). En Unix el directorio de datos es privado de su dueño: clawg lo crea 0700, igual que los directorios que crea adentro, y a uno que ya existía con permisos para el grupo u otros se los quita y lo deja escrito en el registro con el modo anterior y el nuevo (si se compartía por grupo a propósito, `chmod` lo devuelve). Así otro usuario de la máquina no lee la memoria, las copias ni los registros. Toda ruta, `/health` incluida, responde 403 a una petición dirigida a un nombre que no sea `127.0.0.1`, `localhost` o `[::1]`, o que traiga una cabecera `Origin`: así una página web abierta en el navegador no llega al daemon, ni con DNS rebinding. No es una barrera contra un proceso del mismo usuario, que puede leer el token.
 
-Cada directorio de datos contiene la base SQLite de memoria, `daemon.json` (pid, puerto, versión), `token`, y `memory.lock` / `memory.owner`, que garantizan que un único proceso sea dueño del almacén. Si se excluyó algo con `clawg sharing`, también `sharing.json`.
+Cada directorio de datos contiene la base SQLite de memoria, `daemon.json` (pid, puerto, si hay socket, versión), `token`, `clawg.sock`, y `memory.lock` / `memory.owner`, que garantizan que un único proceso sea dueño del almacén. Si se excluyó algo con `clawg sharing`, también `sharing.json`.
 
 ### Workspace
 

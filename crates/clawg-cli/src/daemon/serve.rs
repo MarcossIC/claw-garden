@@ -7,21 +7,23 @@
 //! may execute (the bootstrap downloads a 470 MB model). The way to keep that
 //! honest is to leave nothing here worth testing.
 
+use std::future::Future;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use clawg_core::build_info::{self, ServeFault};
+use clawg_core::build_info::{self, DefaultPort, ServeFault};
 use clawg_core::memory::bootstrap::{
     run_embedder_bootstrap_with_retry, serve_deps, unloading_when_idle, EmbedderDeps, LogSink,
 };
 use clawg_core::memory::idle_embedder::{idle_after, DEFAULT_IDLE, IDLE_MINUTES_VAR};
 use clawg_core::memory::store_lock::StoreHolder;
 use clawg_core::memory::MemoryError;
-use clawg_core::paths::{data_dir, PathsError, Profile};
+use clawg_core::paths::{data_dir, socket_file, PathsError, Profile};
 use clawg_core::private_dir::ensure_private_dir;
 use clawg_core::runtime::{MemoryRuntime, Workers};
 
 use super::api::{router, AppCtx, SAVE_CONFIRM_TIMEOUT};
+use super::socket::{bind_socket, serves_without_socket, Listener, SocketError};
 use super::lifecycle::{
     clear_state, generate_token, now_ms, write_state, write_token, DaemonState, LifecycleError,
 };
@@ -45,6 +47,8 @@ pub enum ServeError {
         #[source]
         source: std::io::Error,
     },
+    #[error(transparent)]
+    Socket(SocketError),
     #[error("could not create the data directory {path}: {source}")]
     DataDir {
         path: String,
@@ -61,6 +65,17 @@ pub enum ServeError {
     Injected(String),
 }
 
+/// How long the requests in flight may go on once a shutdown was asked for.
+/// Past it they are cut: a save already has its outbox row, and a snapshot is
+/// only renamed to its final name once complete. One of the phases that
+/// `clawg stop`'s timeout covers; a test in `stop.rs` pins the sum.
+pub const HTTP_GRACE: Duration = Duration::from_secs(3);
+
+/// How long `clawg serve`, once `run` returned, waits for blocking tasks still
+/// running (a model load cannot be cancelled) before the process exits without
+/// them. Another of the phases `clawg stop`'s timeout covers.
+pub const RUNTIME_TEARDOWN: Duration = Duration::from_secs(2);
+
 /// Splits "someone else has the store" from every other reason opening it can
 /// fail; see [`ServeError::StoreInUse`].
 fn classify_open_error(err: MemoryError) -> ServeError {
@@ -70,12 +85,13 @@ fn classify_open_error(err: MemoryError) -> ServeError {
     }
 }
 
-/// Runs the daemon until Ctrl-C or `POST /v1/shutdown`.
+/// Runs the daemon until Ctrl-C, SIGTERM or `POST /v1/shutdown`.
 ///
-/// `port` of `0` asks the OS for an ephemeral port; the real one is what gets
-/// published in `daemon.json`, so clients always dial where the socket actually
-/// is.
-pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
+/// It listens on the data directory's socket, and on TCP as [`tcp_plan`]
+/// says. `port` is `--port`: `0` asks the OS for an ephemeral
+/// port, and the real one is what gets published in `daemon.json`, so clients
+/// always dial where the listener actually is.
+pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> {
     let base_dir = data_dir(profile)?;
     ensure_private_dir(&base_dir).map_err(|source| ServeError::DataDir {
         path: base_dir.display().to_string(),
@@ -140,15 +156,25 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
         drain,
     };
 
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-        .await
-        .map_err(|source| ServeError::Bind { port, source })?;
-    let bound_port = listener
-        .local_addr()
-        .map_err(|source| ServeError::Bind { port, source })?
-        .port();
+    // With the store lock held, so the socket an earlier daemon left behind is
+    // no live daemon's.
+    let socket = bind_profile_socket(&base_dir, port.is_some())?;
+    let has_socket = socket.is_some();
 
-    // Token and state are published only once the socket is bound: a client
+    let tcp = match tcp_plan(port, profile.default_port(), has_socket, build_info::default_port_override()) {
+        TcpPlan::Required(port) => Some(bind_tcp(port).await?),
+        TcpPlan::Optional(port) => match bind_tcp(port).await {
+            Ok(bound) => Some(bound),
+            Err(e) => {
+                log::warn!("{e}; serving on the data directory's socket alone, which a clawg older than it cannot reach");
+                None
+            }
+        },
+        TcpPlan::Off => None,
+    };
+    let bound_port = tcp.as_ref().map(|(_, port)| *port);
+
+    // Token and state are published only once the sockets are bound: a client
     // that finds `daemon.json` must find something listening behind it.
     let token = generate_token();
     write_token(&base_dir, &token)?;
@@ -157,6 +183,7 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
         &DaemonState {
             pid: std::process::id(),
             port: bound_port,
+            unix_socket: has_socket,
             profile: profile.as_str().to_string(),
             version: clawg_core::build_info::version().to_string(),
             started_at_ms: now_ms(),
@@ -175,14 +202,49 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
     });
 
     log::info!(
-        "clawg serve {} listening on 127.0.0.1:{bound_port}, data dir {}",
+        "clawg serve {} listening on {}, data dir {}",
         profile.as_str(),
+        listening_on(bound_port, has_socket.then(|| socket_file(&base_dir)).as_deref()),
         base_dir.display()
     );
 
-    let result = axum::serve(listener, router(ctx.clone()))
-        .with_graceful_shutdown(shutdown_signal(shutdown_rx))
-        .await;
+    // The signal is observed once and stops both servers; the grace counts
+    // from it once.
+    let (stopping_tx, stopping) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal(shutdown_rx).await;
+        let _ = stopping_tx.send(true);
+    });
+    let app = router(ctx.clone());
+    let tcp_server = {
+        let (app, stopping) = (app.clone(), stopping.clone());
+        async move {
+            match tcp {
+                Some((listener, _)) => axum::serve(listener, app).with_graceful_shutdown(stopped(stopping)).await,
+                None => Ok(()),
+            }
+        }
+    };
+    let socket_server = {
+        let (app, stopping) = (app, stopping.clone());
+        async move {
+            match socket {
+                Some(listener) => axum::serve(listener, app).with_graceful_shutdown(stopped(stopping)).await,
+                None => Ok(()),
+            }
+        }
+    };
+    let servers = async { tokio::try_join!(tcp_server, socket_server).map(drop) };
+    let result = match within_grace(servers, stopped(stopping), HTTP_GRACE).await {
+        Some(result) => result,
+        None => {
+            log::warn!(
+                "requests were still in flight {} s after the shutdown began; they were cut",
+                HTTP_GRACE.as_secs()
+            );
+            Ok(())
+        }
+    };
 
     // No request can queue a save any more, so whatever is queued now is all
     // there is to drain or spill.
@@ -196,7 +258,91 @@ pub async fn run(profile: Profile, port: u16) -> Result<(), ServeError> {
     result.map_err(ServeError::Server)
 }
 
-/// Completes on Ctrl-C or on the API's shutdown flag, whichever comes first.
+/// How the daemon listens on loopback TCP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpPlan {
+    /// A port asked for, or the only transport there is: a failed bind stops
+    /// the start.
+    Required(u16),
+    /// The profile's port beside the socket, for the clients older than it:
+    /// a failed bind (another user's daemon, another program) is logged and
+    /// the daemon goes on over the socket.
+    Optional(u16),
+    Off,
+}
+
+/// The TCP side of a start: `explicit` is `--port`, `socket` whether the
+/// daemon has its socket, and `stand_in` what a `testing` build puts in place
+/// of the profile's port.
+pub fn tcp_plan(explicit: Option<u16>, profile_port: u16, socket: bool, stand_in: Option<DefaultPort>) -> TcpPlan {
+    if let Some(port) = explicit {
+        return TcpPlan::Required(port);
+    }
+    if !socket {
+        return TcpPlan::Required(match stand_in {
+            Some(DefaultPort::Port(port)) => port,
+            _ => profile_port,
+        });
+    }
+    match stand_in {
+        Some(DefaultPort::Off) => TcpPlan::Off,
+        Some(DefaultPort::Port(port)) => TcpPlan::Optional(port),
+        None => TcpPlan::Optional(profile_port),
+    }
+}
+
+async fn bind_tcp(port: u16) -> Result<(tokio::net::TcpListener, u16), ServeError> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .map_err(|source| ServeError::Bind { port, source })?;
+    let bound = listener.local_addr().map_err(|source| ServeError::Bind { port, source })?.port();
+    Ok((listener, bound))
+}
+
+/// The data directory's socket, or `None` when this binary speaks TCP alone,
+/// the system has no such sockets, or the path is too long for one and
+/// `--port` was given.
+fn bind_profile_socket(base_dir: &std::path::Path, explicit_port: bool) -> Result<Option<Listener>, ServeError> {
+    if build_info::tcp_only() {
+        return Ok(None);
+    }
+    match bind_socket(&socket_file(base_dir)) {
+        Ok(listener) => Ok(Some(listener)),
+        Err(e) if serves_without_socket(&e, explicit_port) => {
+            log::warn!("{e}; serving over TCP alone");
+            Ok(None)
+        }
+        Err(e) => Err(ServeError::Socket(e)),
+    }
+}
+
+fn listening_on(port: Option<u16>, socket: Option<&std::path::Path>) -> String {
+    match (port, socket) {
+        (Some(port), Some(socket)) => format!("127.0.0.1:{port} and {}", socket.display()),
+        (Some(port), None) => format!("127.0.0.1:{port}"),
+        (None, Some(socket)) => socket.display().to_string(),
+        (None, None) => "nothing".to_string(),
+    }
+}
+
+/// Completes once the shutdown was observed.
+async fn stopped(mut stopping: tokio::sync::watch::Receiver<bool>) {
+    let _ = stopping.wait_for(|stopping| *stopping).await;
+}
+
+/// Runs `server` to its end, or until `grace` after `stopping` resolved,
+/// whichever comes first; `None` when the grace ran out first.
+async fn within_grace<S: Future>(server: S, stopping: impl Future, grace: Duration) -> Option<S::Output> {
+    tokio::pin!(server);
+    tokio::select! {
+        out = &mut server => return Some(out),
+        _ = stopping => {}
+    }
+    tokio::time::timeout(grace, server).await.ok()
+}
+
+/// Completes on Ctrl-C, on SIGTERM (Unix) or on the API's shutdown flag,
+/// whichever comes first.
 ///
 /// When the watch channel's sender is gone the API can no longer ask for
 /// anything, so that branch parks forever rather than resolving — otherwise a
@@ -206,6 +352,8 @@ async fn shutdown_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
         let _ = tokio::signal::ctrl_c().await;
         log::info!("received Ctrl-C, shutting down");
     };
+
+    let terminate = terminated();
 
     let via_api = async move {
         loop {
@@ -222,8 +370,31 @@ async fn shutdown_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
 
     tokio::select! {
         _ = ctrl_c => {}
+        _ = terminate => {}
         _ = via_api => {}
     }
+}
+
+/// Completes on SIGTERM, what `systemctl stop` and a plain `kill` send.
+#[cfg(unix)]
+async fn terminated() {
+    use tokio::signal::unix::{signal, SignalKind};
+    match signal(SignalKind::terminate()) {
+        Ok(mut sigterm) => {
+            sigterm.recv().await;
+            log::info!("received SIGTERM, shutting down");
+        }
+        Err(e) => {
+            log::warn!("cannot listen for SIGTERM: {e}; it ends the daemon without a shutdown");
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Windows has no SIGTERM; its console events are not handled.
+#[cfg(not(unix))]
+async fn terminated() {
+    std::future::pending::<()>().await;
 }
 
 #[cfg(test)]
@@ -260,6 +431,54 @@ mod tests {
         assert!(msg.contains("boom"), "{msg}");
     }
 
+    #[test]
+    fn the_tcp_plan_follows_the_port_and_the_socket() {
+        use TcpPlan::*;
+        assert_eq!(tcp_plan(Some(0), 27381, true, None), Required(0), "--port is always honoured");
+        assert_eq!(tcp_plan(Some(4000), 27381, false, Some(DefaultPort::Off)), Required(4000));
+        assert_eq!(tcp_plan(None, 27381, true, None), Optional(27381), "beside the socket for older clients");
+        assert_eq!(tcp_plan(None, 27381, false, None), Required(27381), "the only transport");
+        assert_eq!(tcp_plan(None, 27381, true, Some(DefaultPort::Off)), Off);
+        assert_eq!(tcp_plan(None, 27381, false, Some(DefaultPort::Off)), Required(27381), "never no transport");
+        assert_eq!(tcp_plan(None, 27381, true, Some(DefaultPort::Port(4001))), Optional(4001));
+        assert_eq!(tcp_plan(None, 27381, false, Some(DefaultPort::Port(4001))), Required(4001));
+    }
+
+    #[test]
+    fn the_start_line_names_every_listener() {
+        let socket = std::path::Path::new("/d/clawg.sock");
+        assert_eq!(listening_on(Some(1), Some(socket)), "127.0.0.1:1 and /d/clawg.sock");
+        assert_eq!(listening_on(Some(1), None), "127.0.0.1:1");
+        assert_eq!(listening_on(None, Some(socket)), "/d/clawg.sock");
+        let windows = std::path::Path::new(r"C:\d\clawg.sock");
+        assert_eq!(listening_on(Some(1), Some(windows)), r"127.0.0.1:1 and C:\d\clawg.sock");
+        assert_eq!(listening_on(None, None), "nothing");
+    }
+
+    /// A port a child inherits stays open after the daemon lets it go: it
+    /// takes connections nobody answers, reset when the child exits, and keeps
+    /// the next daemon off the port.
+    #[tokio::test]
+    async fn a_child_started_while_the_port_is_bound_does_not_keep_it() {
+        let (listener, port) = bind_tcp(0).await.expect("bind");
+        let mut command = if cfg!(windows) {
+            let mut c = std::process::Command::new("ping");
+            c.args(["-n", "30", "127.0.0.1"]);
+            c
+        } else {
+            let mut c = std::process::Command::new("sleep");
+            c.arg("30");
+            c
+        };
+        let mut child = command.stdout(std::process::Stdio::null()).spawn().expect("spawn a long-lived process");
+        drop(listener);
+
+        let rebound = std::net::TcpListener::bind(("127.0.0.1", port));
+        let _ = child.kill();
+        let _ = child.wait();
+        rebound.expect("the port is free once the daemon lets it go");
+    }
+
     #[tokio::test]
     async fn shutdown_signal_waits_while_the_flag_is_false() {
         let (_tx, rx) = tokio::sync::watch::channel(false);
@@ -287,6 +506,38 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), shutdown_signal(rx))
             .await
             .expect("an already-raised flag must resolve immediately");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_server_that_does_not_finish_is_left_after_the_grace() {
+        let started = tokio::time::Instant::now();
+
+        let out = within_grace(std::future::pending::<()>(), async {}, Duration::from_secs(3)).await;
+
+        assert_eq!(out, None);
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_server_that_finishes_in_time_gives_its_result() {
+        let server = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            7
+        };
+
+        assert_eq!(within_grace(server, async {}, Duration::from_secs(3)).await, Some(7));
+    }
+
+    /// The grace only starts with a shutdown: a long request in normal
+    /// operation (a backup of a big store) is never cut.
+    #[tokio::test(start_paused = true)]
+    async fn without_a_shutdown_the_server_has_no_deadline() {
+        let server = async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            7
+        };
+
+        assert_eq!(within_grace(server, std::future::pending::<()>(), Duration::from_secs(3)).await, Some(7));
     }
 
     /// If every sender is dropped the API can no longer request anything, so

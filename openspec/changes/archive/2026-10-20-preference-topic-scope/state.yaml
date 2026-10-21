@@ -1,0 +1,15 @@
+change: preference-topic-scope
+objective: "1"
+depends_on: [topic-revisions]
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: skipped  # no architectural decision beyond the proposal's
+  tasks: done
+  apply: done
+  verify: done  # Linux and the binary in a test home; the CI of the pull request covers Linux and Windows
+  archive: done
+updated: 2026-10-20
+main_spec: openspec/specs/mcp/spec.md

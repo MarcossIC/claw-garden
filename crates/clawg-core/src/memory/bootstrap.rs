@@ -304,8 +304,9 @@ pub fn production_deps(
 }
 
 /// Env var that, in a build with the `testing` feature, replaces the model
-/// `clawg serve` loads: `fake` loads [`FakeEmbedder`] at once and `stalled`
-/// never finishes the download. It lets a test run the real binary without
+/// `clawg serve` loads: `fake` loads [`FakeEmbedder`] at once, `stalled`
+/// never finishes the download and `blocked` downloads at once and never
+/// returns from the load, holding its blocking thread. It lets a test run the real binary without
 /// the 470 MB model; a release build never reads it.
 ///
 /// [`FakeEmbedder`]: crate::memory::embedder::FakeEmbedder
@@ -318,6 +319,7 @@ pub const TEST_EMBEDDER_VAR: &str = "CLAWG_TEST_EMBEDDER";
 pub enum TestEmbedder {
     Fake,
     Stalled,
+    Blocked,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -329,8 +331,9 @@ impl TestEmbedder {
             None | Some("") => Ok(None),
             Some("fake") => Ok(Some(Self::Fake)),
             Some("stalled") => Ok(Some(Self::Stalled)),
+            Some("blocked") => Ok(Some(Self::Blocked)),
             Some(other) => Err(format!(
-                "{TEST_EMBEDDER_VAR}={other:?} is not a test embedder; use \"fake\" or \"stalled\""
+                "{TEST_EMBEDDER_VAR}={other:?} is not a test embedder; use \"fake\", \"stalled\" or \"blocked\""
             )),
         }
     }
@@ -341,7 +344,7 @@ impl TestEmbedder {
     pub fn deps(self, store: Arc<MemoryStore>, backups: std::path::PathBuf) -> EmbedderDeps {
         let verify = contract_verifier(store, backups);
         let ensure: EnsureModelFn = match self {
-            Self::Fake => Arc::new(|_base_dir, _progress| {
+            Self::Fake | Self::Blocked => Arc::new(|_base_dir, _progress| {
                 Box::pin(async {
                     Ok(crate::memory::model_download::ModelFiles {
                         onnx: Vec::new(),
@@ -356,9 +359,17 @@ impl TestEmbedder {
             }),
             Self::Stalled => Arc::new(|_base_dir, _progress| Box::pin(futures::future::pending())),
         };
-        let load: LoadEmbedderFn = Arc::new(|_files| {
-            Ok(Arc::new(crate::memory::embedder::FakeEmbedder::default()) as Arc<dyn Embedder>)
-        });
+        let load: LoadEmbedderFn = match self {
+            Self::Blocked => Arc::new(|_files| {
+                log::info!("the test model load blocks its thread and never returns");
+                loop {
+                    std::thread::park();
+                }
+            }),
+            Self::Fake | Self::Stalled => Arc::new(|_files| {
+                Ok(Arc::new(crate::memory::embedder::FakeEmbedder::default()) as Arc<dyn Embedder>)
+            }),
+        };
         let cached: CachedModelFn = {
             let ensure = ensure.clone();
             Arc::new(move |base_dir| ensure(base_dir, None))
@@ -390,6 +401,25 @@ pub fn serve_deps(
     tokenizer: Arc<OnceCell<Arc<tokenizers::Tokenizer>>>,
 ) -> Result<EmbedderDeps, String> {
     Ok(production_deps(store, backups, tokenizer))
+}
+
+/// The contract `clawg serve` verifies the store against, without loading a
+/// model: the production embedder's, or in a `testing` build the stand-in's
+/// when [`TEST_EMBEDDER_VAR`] names one (an unknown value is the production
+/// one, which `serve` refuses before it gets that far).
+#[cfg(feature = "testing")]
+pub fn serving_contract() -> EmbeddingIdentity {
+    match TestEmbedder::parse(std::env::var(TEST_EMBEDDER_VAR).ok().as_deref()) {
+        Ok(Some(_)) => EmbeddingIdentity::of(&crate::memory::embedder::FakeEmbedder::default()),
+        _ => crate::memory::embedder::expected_contract(),
+    }
+}
+
+/// The contract `clawg serve` verifies the store against, without loading a
+/// model: always the production embedder's.
+#[cfg(not(feature = "testing"))]
+pub fn serving_contract() -> EmbeddingIdentity {
+    crate::memory::embedder::expected_contract()
 }
 
 /// `load`, with every embedder it builds wrapped in an [`IdleEmbedder`] that
@@ -1658,6 +1688,7 @@ mod tests {
         assert_eq!(TestEmbedder::parse(Some(" ")), Ok(None));
         assert_eq!(TestEmbedder::parse(Some("fake")), Ok(Some(TestEmbedder::Fake)));
         assert_eq!(TestEmbedder::parse(Some("stalled")), Ok(Some(TestEmbedder::Stalled)));
+        assert_eq!(TestEmbedder::parse(Some("blocked")), Ok(Some(TestEmbedder::Blocked)));
         let err = TestEmbedder::parse(Some("real")).expect_err("an unknown value is refused");
         assert!(err.contains(TEST_EMBEDDER_VAR) && err.contains("\"fake\""), "{err}");
     }

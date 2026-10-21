@@ -26,9 +26,10 @@ context: |
   (docs/eval/results/2026-10-16-real-lexical-only.json).
   Compare two runs with rag-eval --diff: a conclusion needs at least 6 cases moving one way (p < 0.05).
   Agent-view baseline (RELEVANCE_RATIO 0.35): search_memory 36/46 at 761.4 mean tokens,
-  recall_context 37/46 at 1036.5 (docs/eval/results/2026-10-19-real-session-handoff-tip-agent-view.json).
+  recall_context 37/46 at 1037.3 (docs/eval/results/2026-10-20-real-untrusted-recall-fix-agent-view.json).
   recall_context lost c09 and c10 with search-abstention (they only arrived as rows that scored 0), and every
-  prompt of the golden set opens with the same LAST SESSION line since session-handoff (87 tokens).
+  prompt of the golden set opens with the same LAST SESSION line since session-handoff (87 tokens). Since
+  untrusted-recall the 7 prompts that show one of the multi-line rows (c43-c46) carry the `  | ` margin (+0.83 mean).
   recall_context takes a byte budget (default 8000, at most 24000); with the default no golden case is cut and no case
   moves (docs/eval/results/2026-10-17-real-context-budget-tip-agent-view.json).
   Expanded golden (docs/eval/golden-expanded.json, sha256 855c64b98e5403e55777c87873bcf006299502b857dcfbb7920acb48d9d6f2b5,

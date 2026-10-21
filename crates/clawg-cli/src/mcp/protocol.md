@@ -26,7 +26,8 @@ names earlier memories close to the new one, judge each with `resolve_conflict`
 while you still have the conversation: supersedes if the new one replaces it,
 compatible or scoped if both hold, conflicts if only the user can tell. When
 `recall_context` lists ACTIVE CONFLICTS, ask the user which memory holds and
-record the answer with `resolve_conflict`. When it says memories are waiting
+record the answer with `resolve_conflict`, `user_answered` and their words in
+`reason`; set it only when the user said so. When it says memories are waiting
 for a review, or the user asks what you have learned, call `synthesize` and
 save the conclusions it leads to.
 
@@ -63,13 +64,16 @@ Every row competes with the others in search, so leave out:
   (function and type names, error codes). A query that names an
   identifier finds the memories that contain it.
 - One fact per call. A save that mixes two topics makes search pick one piece
-  of it.
+  of it. A save holds at most 64 KiB: a longer text is refused, so split it
+  into several saves, each with its own first line.
 - A decision or a preference that may change later gets a `topic_key`, a
   short stable name such as `storage/engine`. When it changes, save the new
   version under the same `topic_key`: it replaces the old one, which stays in
   the history, and the answer names what it replaced. `search_memory` and
-  `read_memory` show a memory's key as `topic=K`: save its new version under
-  that key, the one shown, never a new one.
+  `read_memory` show a memory's key as `topic=K` only where saving under it
+  replaces that memory: save its new version under that key, the one shown,
+  never a new one. A memory of another project, or of none, shows no key,
+  since a save here would keep it beside the new one.
 - Write it so it reads on its own months from now, with no conversation
   around it.
 - Write it in English, and search in English too. A memory saved in one

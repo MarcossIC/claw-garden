@@ -59,11 +59,22 @@ minisign-verify = "=0.2.5"
 # (see `process.rs`). Already in the lockfile through tokio's `mio`, so this
 # adds no crate to the build.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 # Raw reads and writes of HKCU\Environment\Path for `clawg path` (see
 # `user_path.rs`), so the value keeps its REG_EXPAND_SZ type. Already in the
 # lockfile, so this adds no crate to the build.
 winreg = "0.55"
+# The AF_UNIX listener of `daemon/socket/windows.rs`: std has no stable
+# `std::os::windows::net`, so the socket is built here and handed to tokio as a
+# TCP stream. Already in the lockfile through tokio and hyper-util.
+socket2 = "0.6"
+# The client's AF_UNIX transport: reqwest cannot dial a socket on Windows, so a
+# hyper-util client over the `Connector` of `daemon/socket/windows.rs` speaks
+# HTTP/1 on it. All already in the lockfile through reqwest and axum.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+tower-service = "0.3"
 
 # `kill(pid, 0)` for the Unix side of `process.rs`. Already in the lockfile.
 [target.'cfg(unix)'.dependencies]

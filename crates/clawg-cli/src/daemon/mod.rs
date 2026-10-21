@@ -6,3 +6,4 @@ pub mod guard;
 pub mod lifecycle;
 pub mod serve;
 pub mod sessions;
+pub mod socket;

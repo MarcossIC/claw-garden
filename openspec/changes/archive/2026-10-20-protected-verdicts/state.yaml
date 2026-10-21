@@ -1,0 +1,15 @@
+change: protected-verdicts
+objective: "1, 4"
+depends_on: []
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # Linux, the binary in a test home and the CI of the pull request on Linux and Windows
+  archive: done
+updated: 2026-10-20
+main_spec: openspec/specs/disputes/spec.md, openspec/specs/update/spec.md, openspec/specs/mcp/spec.md

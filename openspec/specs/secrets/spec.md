@@ -8,6 +8,7 @@ Fuente de verdad del comportamiento actual con secretos: el detector (formatos c
 - [redaction-precision](../../changes/archive/2026-10-15-redaction-precision/proposal.md), archivado el 2026-10-15 (`sk-` con la forma de una clave, la marca privada, los patrones por contexto y cuatro formatos nuevos en R1; lo guardado antes de una regla nueva en R4).
 - [conclusion-upkeep](../../changes/archive/2026-10-19-conclusion-upkeep/proposal.md), archivado el 2026-10-19 (R5: la purga deja los enlaces que nombran la fila como fuente).
 - [secret-coverage](../../changes/archive/2026-10-19-secret-coverage/proposal.md), archivado el 2026-10-19 (R1: `credential`, `huggingface_token`, `slack_webhook` y las formas nuevas de Slack, Stripe y PGP; R4: los `reason` de los veredictos; R5: el outbox del propio save, la cabecera de un save largo y la revival; R6: los `workspace.md`; R7, R8 y R9 nuevos).
+- [untrusted-recall](../../changes/archive/2026-10-20-untrusted-recall/proposal.md), archivado el 2026-10-20 (R6: un `workspace.md` guarda el texto en su forma cruda o en la copiada).
 
 ## Definiciones
 
@@ -167,13 +168,13 @@ El worker MUST seguir aplicando `redact` al contenido de cada evento, de cualqui
 
 ### R3. El save dice qué se enmascaró
 
-Una respuesta `201` de `POST /v1/memories` MUST incluir `redacted`, cada tipo una vez y en el orden en que se enmascaró, cuando no está vacía, y MUST omitirlo cuando lo está (`SaveBody.redacted`, `crates/clawg-cli/src/daemon/api.rs:519`; `save_response`, `api.rs:971`). La lista une lo que el daemon enmascaró al aceptar el save con lo que el reporte del worker agrega (`masked_kinds`, `api.rs:1039`; sólo un evento sin fila puede sumar algo en el worker):
+Una respuesta `201` de `POST /v1/memories` MUST incluir `redacted`, cada tipo una vez y en el orden en que se enmascaró, cuando no está vacía, y MUST omitirlo cuando lo está (`SaveBody.redacted`, `crates/clawg-cli/src/daemon/api.rs:524`; `save_response`, `api.rs:1003`). La lista une lo que el daemon enmascaró al aceptar el save con lo que el reporte del worker agrega (`masked_kinds`, `api.rs:1071`; sólo un evento sin fila puede sumar algo en el worker):
 
 ```json
 {"status": "saved", "memories": [{"kind": "memory", "id": 57, "outcome": "inserted"}], "redacted": ["github_token"]}
 ```
 
-`DaemonClient` MUST leerlo en `SaveOutcome::Saved.redacted` (`crates/clawg-cli/src/client.rs:529`), vacío si un daemon anterior no lo manda. `save_memory` MUST agregar al texto de éxito `; masked <tipos> before storing it` (`save_outcome_text`, `crates/clawg-cli/src/mcp/server.rs:563`). Las respuestas `202` no lo llevan, aunque el daemon ya haya enmascarado: su cuerpo es `status`, `reason` y `operation_id` (`SaveBody::queued`, `api.rs:538`).
+`DaemonClient` MUST leerlo en `SaveOutcome::Saved.redacted` (`crates/clawg-cli/src/client.rs:549`), vacío si un daemon anterior no lo manda. `save_memory` MUST agregar al texto de éxito `; masked <tipos> before storing it` (`save_outcome_text`, `crates/clawg-cli/src/mcp/server.rs:588`). Las respuestas `202` no lo llevan, aunque el daemon ya haya enmascarado: su cuerpo es `status`, `reason` y `operation_id` (`SaveBody::queued`, `api.rs:543`).
 
 #### Escenario
 - GIVEN un daemon con el embedder listo
@@ -190,7 +191,7 @@ Una respuesta `201` de `POST /v1/memories` MUST incluir `redacted`, cada tipo un
 
 La lectura MUST hacerse en sólo lectura, sin el lock y sin migrar (`scan`, `secrets.rs:53`, con `open_for_probe`), de modo que funciona con el daemon andando. Sin `memory.db` MUST fallar diciendo que no hay base, sin crearla. El armado de la salida MUST ser puro (`report`, `crates/clawg-cli/src/secrets.rs:13`).
 
-`scan` clasifica cada fila y cada `reason` con `redact`, así que una regla nueva del detector alcanza a lo ya guardado: una fila guardada antes de la regla, con un secreto que sólo esa regla reconoce, MUST listarse con el tipo nuevo. Por la misma razón, `clawg undelete` se niega a restaurar una fila borrada que una regla nueva reconoce (`RestoreError::HoldsSecret`, `crates/clawg-core/src/memory/admin.rs:397`); no se pierde nada: la fila sigue borrada y se lista acá.
+`scan` clasifica cada fila y cada `reason` con `redact`, así que una regla nueva del detector alcanza a lo ya guardado: una fila guardada antes de la regla, con un secreto que sólo esa regla reconoce, MUST listarse con el tipo nuevo. Por la misma razón, `clawg undelete` se niega a restaurar una fila borrada que una regla nueva reconoce (`RestoreError::HoldsSecret`, `crates/clawg-core/src/memory/admin.rs:423`); no se pierde nada: la fila sigue borrada y se lista acá.
 
 #### Escenario: con el daemon andando
 - GIVEN una base con una fila viva con una key AWS, una fila borrada con un JWT y una fila sin secretos, y el lock tomado por otro proceso
@@ -283,7 +284,7 @@ MUST NOT hacer snapshot previo: sería una copia más de lo que se quiere sacar.
 
 Después de purgar, MUST revisar cada snapshot de `<data>/backups/` (los archivos con nombre de snapshot) y devolver los que tienen una fila con ese id y el mismo `content`, o una fila del outbox que R5 borraría, ordenados por nombre (`backups_holding`, `secrets.rs:377`). Un snapshot anterior a V14 no tiene la tabla del outbox, y eso MUST NOT contar como «puede tenerla» (`outbox_holds`, `secrets.rs:398`). Uno que no se puede leer MUST listarse también: puede tenerla. MUST NOT modificar ni borrar ningún backup. La salida MUST decir que esos archivos todavía tienen el texto y que borrarlos es decisión del usuario.
 
-También MUST leer cada `workspaces/<agente>/<proyecto>/workspace.md` del directorio de datos y devolver, ordenados por ruta, los que tienen el texto de la fila, cada uno con si está en la sección AUTO, fuera de ella o en los dos lugares (`workspaces_holding` y `sections_holding`, `crates/clawg-core/src/memory/workspace.rs:515` y `workspace.rs:499`; la decisión es pura). La sección AUTO copia el `content` entero de cada fila que elige (`render_rows`), y lo de fuera es del usuario. MUST NOT escribir ningún archivo: la salida MUST decir que la sección AUTO se reescribe en el próximo `recall_context` de ese agente en ese proyecto y que lo de fuera se edita a mano.
+También MUST leer cada `workspaces/<agente>/<proyecto>/workspace.md` del directorio de datos y devolver, ordenados por ruta, los que tienen el texto de la fila, cada uno con si está en la sección AUTO, fuera de ella o en los dos lugares (`workspaces_holding` y `sections_holding`, `crates/clawg-core/src/memory/workspace.rs:523` y `workspace.rs:508`; la decisión es pura). La sección AUTO copia el `content` entero de cada fila que elige (`render_rows`) en su forma copiada, con cada línea después de la primera detrás del margen `  | ` y cada `<!--` como `<! --` ([`specs/retrieval`](../retrieval/spec.md), «Un texto copiado al workspace no rompe `workspace.md`»), y lo de fuera es del usuario. Por eso el texto MUST buscarse en las dos formas: la cruda, que tiene un archivo escrito por una versión anterior, y la copiada. MUST NOT escribir ningún archivo: la salida MUST decir que la sección AUTO se reescribe en el próximo `recall_context` de ese agente en ese proyecto y que lo de fuera se edita a mano.
 
 #### Escenario
 - GIVEN un backup manual tomado con la fila y otro tomado después de borrarla con el delete
@@ -303,13 +304,16 @@ También MUST leer cada `workspaces/<agente>/<proyecto>/workspace.md` del direct
 - WHEN se purga la fila
 - THEN el resultado nombra los dos primeros, cada uno con su sección, y los tres archivos quedan byte a byte iguales
 
-**Tests:** `purge_names_the_backups_that_still_hold_the_row`, `purge_removes_the_text_from_the_outbox` (el backup que sólo tiene el texto en el outbox), `a_backup_from_before_the_outbox_is_not_named_for_it` y `purge_names_the_workspaces_that_still_hold_the_text` (`crates/clawg-core/src/memory/secrets.rs`); `the_sections_holding_a_text_are_told_apart` (`crates/clawg-core/src/memory/workspace.rs`); `the_purge_report_names_backups_to_delete_by_hand` y `the_purge_report_names_what_came_back_and_what_went` (`crates/clawg-cli/src/secrets.rs`).
+- GIVEN un texto de dos líneas con un `<!--`, copiado a la sección AUTO de un `workspace.md` en su forma copiada, y el mismo texto crudo en la sección USER de otro
+- THEN `sections_holding` encuentra el primero en AUTO y el segundo fuera de ella
+
+**Tests:** `purge_names_the_backups_that_still_hold_the_row`, `purge_removes_the_text_from_the_outbox` (el backup que sólo tiene el texto en el outbox), `a_backup_from_before_the_outbox_is_not_named_for_it` y `purge_names_the_workspaces_that_still_hold_the_text` (`crates/clawg-core/src/memory/secrets.rs`); `the_sections_holding_a_text_are_told_apart` y `sections_holding_finds_the_copied_form` (`crates/clawg-core/src/memory/workspace.rs`); `the_purge_report_names_backups_to_delete_by_hand` y `the_purge_report_names_what_came_back_and_what_went` (`crates/clawg-cli/src/secrets.rs`).
 
 ## Texto libre fuera de `memory`
 
 ### R7. El `reason` de un veredicto se guarda enmascarado
 
-`judge_pair` (`crates/clawg-core/src/memory/dispute.rs:317`) MUST pasar el `reason`, ya recortado, por `redact` antes de guardarlo en `memory_conflict.reason` (`dispute.rs:329`): el par vive en `memory.db` y en cada snapshot, y lo llevaría un export. Un `reason` vacío después de recortarlo sigue siendo `None`.
+`judge_pair` (`crates/clawg-core/src/memory/dispute.rs:325`) MUST pasar el `reason`, ya recortado, por `redact` antes de guardarlo en `memory_conflict.reason` (`dispute.rs:338`): el par vive en `memory.db` y en cada snapshot, y lo llevaría un export. Un `reason` vacío después de recortarlo sigue siendo `None`.
 
 #### Escenario
 - GIVEN un par pendiente

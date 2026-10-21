@@ -135,11 +135,13 @@ pub enum Reason {
     Manual,
     /// Before the daemon re-embedded every stored vector with its model.
     PreReembed,
+    /// Before `clawg import` wrote rows from an export.
+    PreImport,
 }
 
 impl Reason {
-    const ALL: [Reason; 4] =
-        [Reason::PreMigration, Reason::PreRestore, Reason::Manual, Reason::PreReembed];
+    const ALL: [Reason; 5] =
+        [Reason::PreMigration, Reason::PreRestore, Reason::Manual, Reason::PreReembed, Reason::PreImport];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -147,6 +149,7 @@ impl Reason {
             Reason::PreRestore => "pre-restore",
             Reason::Manual => "manual",
             Reason::PreReembed => "pre-reembed",
+            Reason::PreImport => "pre-import",
         }
     }
 
@@ -219,9 +222,37 @@ pub fn parse_snapshot_name(name: &str) -> Option<Reason> {
     Reason::ALL.into_iter().find(|r| r.as_str() == reason)
 }
 
+/// When the snapshot `name` was taken, in milliseconds since the epoch, read
+/// off the name [`snapshot_name`] gave it: a copy or a restore of the file
+/// changes its modification time, never its name. `None` for anything else.
+pub fn parse_snapshot_time(name: &str) -> Option<i64> {
+    parse_snapshot_name(name)?;
+    let stamp = name.strip_prefix("memory-")?.get(..23)?;
+    let field = |range: std::ops::Range<usize>| stamp.get(range)?.parse::<i64>().ok();
+    let (y, mo, d) = (field(0..4)?, field(5..7)?, field(8..10)?);
+    let (h, mi, s, milli) = (field(11..13)?, field(14..16)?, field(17..19)?, field(20..23)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 59 {
+        return None;
+    }
+    let days = days_from_civil(y, mo as u32, d as u32);
+    Some(days * 86_400_000 + h * 3_600_000 + mi * 60_000 + s * 1000 + milli)
+}
+
+/// A proleptic Gregorian (year, month, day) to days since 1970-01-01, the
+/// inverse of [`civil_from_days`]. Howard Hinnant's `days_from_civil`.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (i64::from(m) + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 /// Days since 1970-01-01 to a proleptic Gregorian (year, month, day).
 /// Howard Hinnant's `civil_from_days`.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -234,7 +265,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
-/// How many automatic snapshots (`pre-migration`, `pre-restore`,
+/// How many automatic snapshots (`pre-migration`, `pre-restore`, `pre-import`,
 /// `pre-reembed`) are kept. One is taken per upgrade that migrates, per
 /// restore or per re-embed, so five cover several in a row. A starting
 /// value, not measured.
@@ -644,6 +675,17 @@ mod tests {
             "memory-2026-10-12T17:51:16.123Z-manual.db",
         ] {
             assert_eq!(parse_snapshot_name(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn snapshot_times_come_from_their_names() {
+        let stamps = [0, 999, 86_399_999, 951_782_400_000, 1_709_164_800_000, 1_791_827_476_123, 4_102_444_800_000];
+        for ms in stamps {
+            assert_eq!(parse_snapshot_time(&snapshot_name(ms, Reason::PreImport)), Some(ms), "{ms}");
+        }
+        for other in ["notes.txt", "memory-2026-10-12T17-51-16.123Z-other.db", "memory-2026-13-12T17-51-16.123Z-manual.db"] {
+            assert_eq!(parse_snapshot_time(other), None, "{other}");
         }
     }
 

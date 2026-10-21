@@ -29,6 +29,8 @@ use std::sync::Arc;
 use clawg_core::memory::dispute::Verdict;
 use clawg_core::memory::sharing;
 use clawg_core::memory::store_insert::MemoryType;
+use clawg_core::memory::project_docs::corpus::{auto_indexable, has_project_marker};
+use clawg_core::memory::identity::strip_verbatim;
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -154,6 +156,7 @@ fn memory_type_enum(schema: &mut schemars::Schema) {
 pub struct SaveMemoryArgs {
     /// The memory to store, written as a self-contained statement — it will be
     /// read back in a future session with none of this conversation around it.
+    /// At most 64 KiB; split a longer text into several saves.
     pub content: String,
     /// What kind of memory this is, one of the listed values; any other is
     /// refused. Defaults to semantic_fact when omitted. An
@@ -317,6 +320,10 @@ pub struct UpdateMemoryArgs {
     #[serde(default)]
     #[schemars(transform = memory_type_enum)]
     pub memory_type: Option<String>,
+    /// True only when the user told you to: taking a user_preference or an
+    /// architectural_decision out of its type needs it.
+    #[serde(default)]
+    pub user_answered: bool,
 }
 
 /// The line `save_memory` adds when the save is close to earlier memories:
@@ -356,9 +363,15 @@ pub struct ResolveConflictArgs {
     /// in `reason`. conflicts: they do, and the user has to say which holds.
     #[schemars(transform = verdict_enum)]
     pub verdict: String,
-    /// One sentence on why; required for scoped.
+    /// One sentence on why; required for scoped, and with user_answered the
+    /// user's answer.
     #[serde(default)]
     pub reason: Option<String>,
+    /// True only when the user has said which holds, with their answer in
+    /// reason. Superseding a user_preference or an architectural_decision
+    /// needs it.
+    #[serde(default)]
+    pub user_answered: bool,
 }
 
 // ── The server ──────────────────────────────────────────────────────────────
@@ -374,12 +387,23 @@ pub struct ClawgMcp {
     declared: Arc<std::sync::Mutex<Option<String>>>,
     /// The project the bridge process itself is sitting in.
     default_project: Option<ProjectIdentity>,
+    /// `default_project` when it is a project whose files the daemon may read
+    /// without the user adding it (see [`own_root_to_index`]).
+    docs_root: Option<ProjectIdentity>,
     /// Roots (with the legacy id they were reached through) already sent to
     /// `POST /v1/projects` by this process. Shared by every clone, because rmcp
     /// clones the server per call.
     registered: Arc<tokio::sync::Mutex<HashSet<(PathBuf, String)>>>,
     profile: Profile,
     tool_router: ToolRouter<Self>,
+}
+
+/// The bridge's own project, when its root is one the daemon may read on its
+/// own: a folder with a `.git` or a manifest, other than the home directory.
+/// The working directory is whatever the client was opened in, `~` included.
+fn own_root_to_index(project: Option<&ProjectIdentity>) -> Option<ProjectIdentity> {
+    let home = clawg_core::paths::home_dir().map(|h| std::fs::canonicalize(&h).map(|c| strip_verbatim(&c)).unwrap_or(h));
+    project.filter(|p| auto_indexable(&p.root, home.as_deref(), has_project_marker(&p.root))).cloned()
 }
 
 impl ClawgMcp {
@@ -420,6 +444,7 @@ impl ClawgMcp {
             client,
             configured_agent: None,
             declared: Arc::default(),
+            docs_root: own_root_to_index(default_project.as_ref()),
             default_project,
             registered: Arc::default(),
             profile,
@@ -685,7 +710,7 @@ impl ClawgMcp {
         if registered.insert((project.root.clone(), project.legacy_id.clone())) {
             let legacy: Vec<String> =
                 Some(project.legacy_id.clone()).filter(|l| *l != project.id).into_iter().collect();
-            let index_docs = indexes_docs(&project, self.default_project.as_ref());
+            let index_docs = indexes_docs(&project, self.docs_root.as_ref());
             if let Err(e) = client.register_project(&project.root, &legacy, index_docs).await {
                 if is_root_collision(&e) {
                     registered.remove(&(project.root.clone(), project.legacy_id.clone()));
@@ -700,6 +725,13 @@ impl ClawgMcp {
             }
         }
         Ok(Some(project.id))
+    }
+
+    /// The project a `save_memory` with `project_path` goes to, which is
+    /// where a key it shows revises. Resolved without registering it: an
+    /// `all_projects` search registers nothing.
+    fn save_project(&self, project_path: Option<&str>) -> Option<String> {
+        resolve_project(self.default_project.as_ref(), project_path, false, ProjectIdentity::resolve).map(|p| p.id)
     }
 
     // ── Implementations, testable without a Peer ────────────────────────────
@@ -752,11 +784,12 @@ impl ClawgMcp {
         args: SearchMemoryArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let args = &args;
+        let all_projects = args.all_projects.unwrap_or(false);
         let result = self
             .call(|client| async move {
-                let project_id = self
-                    .project_for(&client, args.project_path.as_deref(), args.all_projects.unwrap_or(false))
-                    .await?;
+                let project_id = self.project_for(&client, args.project_path.as_deref(), all_projects).await?;
+                let save_project =
+                    if all_projects { self.save_project(args.project_path.as_deref()) } else { project_id.clone() };
                 client
                     .search(SearchArgs {
                         query: args.query.clone(),
@@ -765,10 +798,11 @@ impl ClawgMcp {
                         limit: args.limit,
                     })
                     .await
+                    .map(|found| (found, save_project))
             })
             .await;
         match result {
-            Ok(Ok(found)) => Self::ok(format_search(found, agent_id)),
+            Ok(Ok((found, save_project))) => Self::ok(format_search(found, agent_id, save_project.as_deref())),
             Ok(Err(e)) => Self::failed(Self::explain(&e)),
             Err(failure) => Ok(failure),
         }
@@ -870,7 +904,9 @@ impl ClawgMcp {
             })
             .await;
         match result {
-            Ok(Ok(save)) => Self::ok(format_save(&save)),
+            // `read_memory` names no project, so a save after it goes to the
+            // bridge's own.
+            Ok(Ok(save)) => Self::ok(format_save(&save, self.save_project(None).as_deref())),
             Ok(Err(e)) => Self::failed(Self::route_failure_text(&e, "read a save")),
             Err(failure) => Ok(failure),
         }
@@ -901,7 +937,14 @@ impl ClawgMcp {
         let result = self
             .call(|client| async move {
                 client
-                    .update(&args.kind, args.id, args.importance, args.memory_type.as_deref(), Some(agent_id))
+                    .update(
+                        &args.kind,
+                        args.id,
+                        args.importance,
+                        args.memory_type.as_deref(),
+                        args.user_answered,
+                        Some(agent_id),
+                    )
                     .await
             })
             .await;
@@ -921,7 +964,9 @@ impl ClawgMcp {
         let args = &args;
         let result = self
             .call(|client| async move {
-                client.judge(args.keep, args.other, &args.verdict, args.reason.as_deref(), Some(agent_id)).await
+                client
+                    .judge(args.keep, args.other, &args.verdict, args.reason.as_deref(), args.user_answered, Some(agent_id))
+                    .await
             })
             .await;
         match result {
@@ -1151,10 +1196,12 @@ impl ClawgMcp {
         name = "update_memory",
         description = "Correct the importance or the type of one stored memory, by id and kind, \
                        when the user says it matters more or less than it was saved with, or \
-                       that it is a different kind of memory. Pass only what changes. To change \
-                       what a memory says, save the new text and delete the old one instead. \
-                       Returns the memory's importance, type and tier after the change. Only \
-                       your own memories: one marked `by <agent>` is read-only."
+                       that it is a different kind of memory. Pass only what changes. Taking a \
+                       preference or a decision out of its type needs user_answered, set only \
+                       when the user said so. To change what a memory says, save the new text \
+                       and delete the old one instead. Returns the memory's importance, type and \
+                       tier after the change. Only your own memories: one marked `by <agent>` is \
+                       read-only."
     )]
     async fn update_memory(
         &self,
@@ -1169,9 +1216,10 @@ impl ClawgMcp {
         description = "Judge a pair of memories the detector found close to each other: one \
                        that `save_memory` or `memory_status` names, which you judge yourself, or \
                        one under ACTIVE CONFLICTS in `recall_context`, once the user has said \
-                       which holds. A preference or a decision is superseded only after the user \
-                       answered: until then judge it conflicts. Returns the status of both \
-                       memories. Only your own memories: one marked `by <agent>` is read-only."
+                       which holds. A preference or a decision is superseded only on the user's \
+                       word: judge it conflicts and ask, then call supersedes with user_answered \
+                       and their answer in reason. Returns the status of both memories. Only \
+                       your own memories: one marked `by <agent>` is read-only."
     )]
     async fn resolve_conflict(
         &self,
@@ -1270,7 +1318,7 @@ mod tests {
     use clawg_core::runtime::MemoryRuntime;
 
     use crate::client::{ErrorDetails, ListArgs, ReplacedMemory, SaveArgs, SaveOutcome, SavedMemory};
-    use crate::daemon::api::{router, AppCtx, SAVE_CONFIRM_TIMEOUT};
+    use crate::daemon::api::{router, AppCtx, MAX_CONTENT_BYTES, SAVE_CONFIRM_TIMEOUT};
     use crate::mcp::tools::CONTENT_PREVIEW_LIMIT;
 
     /// Brings up an in-process daemon and returns a bridge pointed at it.
@@ -1494,6 +1542,26 @@ mod tests {
         assert_eq!(rows_in(&b, &other.id).await, 1);
         assert_eq!(index_docs_of(&store, &other.id).await, Some(0));
         assert_eq!(clawg_core::memory::project_docs::doc_count(&store, &other.id).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_bridge_in_a_folder_that_is_not_a_project_indexes_nothing() {
+        let (_folder, identity) = elsewhere();
+        let (b, _d, store) = bridge_with_store(identity.clone()).await;
+
+        let saved = b.save_memory_impl("a", save_args("kept in a folder of notes")).await.unwrap();
+        assert!(!is_error(&saved), "{}", text(&saved));
+        let found = b
+            .search_project_impl(SearchProjectArgs { query: "What lives outside the repo".into(), limit: None, project_path: None })
+            .await
+            .unwrap();
+
+        let out = text(&found);
+        assert!(is_error(&found), "{out}");
+        assert!(out.contains("has a .git or a manifest and is not the home directory"), "{out}");
+        assert!(out.contains(&format!("clawg projects add \"{}\" --profile dev", identity.root.display())), "{out}");
+        assert_eq!(index_docs_of(&store, &identity.id).await, Some(0));
+        assert_eq!(clawg_core::memory::project_docs::doc_count(&store, &identity.id).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -1956,6 +2024,14 @@ mod tests {
         ] {
             assert!(instructions.contains(expected), "{expected:?} missing from: {instructions}");
         }
+    }
+
+    #[test]
+    fn the_protocol_says_where_a_key_is_shown() {
+        let save = PROTOCOL.split("\n## How to write a save").nth(1).expect("a section on writing a save");
+        let save = save.split("\n## ").next().unwrap_or(save).split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(save.contains("only where saving under it replaces"), "{save}");
+        assert!(save.contains("another project"), "{save}");
     }
 
     #[test]
@@ -2561,6 +2637,22 @@ mod tests {
         assert!(text(&r).contains("user_preference"), "text was: {}", text(&r));
     }
 
+    #[tokio::test]
+    async fn save_memory_says_a_save_over_the_limit_was_not_saved() {
+        let (b, _d) = bridge().await;
+        let r = b
+            .save_memory_impl("agent-mcp", save_args(&"x".repeat(MAX_CONTENT_BYTES + 1)))
+            .await
+            .expect("save");
+
+        assert!(is_error(&r), "text was: {}", text(&r));
+        assert!(
+            text(&r).starts_with(&format!("not saved: content is {} bytes; at most {MAX_CONTENT_BYTES}", MAX_CONTENT_BYTES + 1)),
+            "text was: {}",
+            text(&r)
+        );
+    }
+
     fn daemon_error(status: u16, message: &str, details: ErrorDetails) -> ClientError {
         ClientError::Daemon { status, message: message.into(), details }
     }
@@ -2867,7 +2959,7 @@ mod tests {
             .expect("mark the dispute");
 
         let r = b
-            .resolve_conflict_impl("agent-mcp", ResolveConflictArgs { keep: new, other: old, verdict: "supersedes".into(), reason: None })
+            .resolve_conflict_impl("agent-mcp", ResolveConflictArgs { keep: new, other: old, verdict: "supersedes".into(), reason: None, user_answered: false })
             .await
             .expect("call");
 
@@ -2877,7 +2969,7 @@ mod tests {
         let r = b
             .resolve_conflict_impl(
                 "agent-mcp",
-                ResolveConflictArgs { keep: old, other: new, verdict: "conflicts".into(), reason: None },
+                ResolveConflictArgs { keep: old, other: new, verdict: "conflicts".into(), reason: None, user_answered: false },
             )
             .await
             .expect("call");
@@ -2888,7 +2980,7 @@ mod tests {
         let r = b
             .resolve_conflict_impl(
                 "agent-mcp",
-                ResolveConflictArgs { keep: old, other: new, verdict: "scoped".into(), reason: None },
+                ResolveConflictArgs { keep: old, other: new, verdict: "scoped".into(), reason: None, user_answered: false },
             )
             .await
             .expect("call");
@@ -2991,6 +3083,55 @@ mod tests {
         assert!(is_error(&bad) && text(&bad).contains("topic_key"), "{}", text(&bad));
     }
 
+    /// A preference of another project reaches a search from here, but its key
+    /// revises only there: a save here under it keeps both rows live.
+    #[tokio::test]
+    async fn search_memory_shows_a_key_only_in_the_project_it_revises() {
+        let (b, _d) = bridge().await;
+        let (_other, other) = elsewhere();
+        let content = "Indent with tabs";
+        let preference = |content: &str, project_path: Option<String>| SaveMemoryArgs {
+            memory_type: Some("user_preference".into()),
+            topic_key: Some("style/indent".into()),
+            project_path,
+            ..save_args(content)
+        };
+        let saved = b.save_memory_impl("a", preference(content, Some(other.root.display().to_string()))).await.unwrap();
+        let id = text(&saved).trim_start_matches("saved #").to_string();
+        let search = |project_path: Option<String>| {
+            b.search_memory_impl("a", SearchMemoryArgs { query: content.into(), limit: None, project_path, all_projects: None })
+        };
+
+        let here = text(&search(None).await.unwrap());
+        assert!(here.contains(&format!("#{id} [Memory/user_preference/")), "{here}");
+        assert!(!here.contains("topic="), "{here}");
+        let there = text(&search(Some(other.root.display().to_string())).await.unwrap());
+        assert!(there.contains(" topic=style/indent]"), "{there}");
+
+        let again = b.save_memory_impl("a", preference("Indent with two spaces", None)).await.unwrap();
+        assert!(!text(&again).contains("replaces"), "{}", text(&again));
+        assert_eq!(rows_in(&b, &other.id).await, 1);
+        assert_eq!(rows_in(&b, "proj-test").await, 1);
+    }
+
+    #[tokio::test]
+    async fn read_memory_shows_a_key_only_in_the_project_it_revises() {
+        let (b, _d) = bridge().await;
+        let (_other, other) = elsewhere();
+        let keyed = |project_path: Option<String>| SaveMemoryArgs {
+            topic_key: Some("storage/engine".into()),
+            project_path,
+            ..save_args("Storage engine is SQLite")
+        };
+        let id_of = |saved: &CallToolResult| text(saved).trim_start_matches("saved #").parse::<i64>().expect("an id");
+        let there = id_of(&b.save_memory_impl("a", keyed(Some(other.root.display().to_string()))).await.unwrap());
+        let here = id_of(&b.save_memory_impl("a", keyed(None)).await.unwrap());
+        let read = |id: i64| b.read_memory_impl("a", ReadMemoryArgs { id, kind: None });
+
+        assert_eq!(text(&read(there).await.unwrap()), format!("#{there}\nStorage engine is SQLite"));
+        assert_eq!(text(&read(here).await.unwrap()), format!("#{here} topic=storage/engine\nStorage engine is SQLite"));
+    }
+
     #[tokio::test]
     async fn resolve_conflict_against_an_older_daemon_asks_for_a_restart() {
         // A daemon from before verdicts has no such route: axum answers a
@@ -3007,7 +3148,7 @@ mod tests {
         let r = b
             .resolve_conflict_impl(
                 "agent-mcp",
-                ResolveConflictArgs { keep: 2, other: 1, verdict: "compatible".into(), reason: None },
+                ResolveConflictArgs { keep: 2, other: 1, verdict: "compatible".into(), reason: None, user_answered: false },
             )
             .await
             .expect("call");
@@ -3020,7 +3161,7 @@ mod tests {
     async fn resolve_conflict_reports_a_refusal() {
         let (b, _d) = bridge().await;
         let r = b
-            .resolve_conflict_impl("agent-mcp", ResolveConflictArgs { keep: 4, other: 4, verdict: "compatible".into(), reason: None })
+            .resolve_conflict_impl("agent-mcp", ResolveConflictArgs { keep: 4, other: 4, verdict: "compatible".into(), reason: None, user_answered: false })
             .await
             .expect("call");
         assert!(is_error(&r));
@@ -3193,7 +3334,7 @@ mod tests {
     }
 
     fn update_args(id: i64, importance: Option<f64>, memory_type: Option<&str>) -> UpdateMemoryArgs {
-        UpdateMemoryArgs { id, kind: "memory".into(), importance, memory_type: memory_type.map(Into::into) }
+        UpdateMemoryArgs { id, kind: "memory".into(), importance, memory_type: memory_type.map(Into::into), user_answered: false }
     }
 
     #[tokio::test]
@@ -3211,6 +3352,58 @@ mod tests {
         let r = b.update_memory_impl("agent-a", update_args(id, Some(11.0), None)).await.expect("call");
         assert!(is_error(&r), "{}", text(&r));
         assert!(text(&r).contains("importance"), "{}", text(&r));
+    }
+
+    #[tokio::test]
+    async fn update_memory_sends_the_users_answer() {
+        let (b, _d) = bridge().await;
+        let id = saved_id(&b, "agent-a", "the user prefers tabs over spaces").await;
+        b.update_memory_impl("agent-a", update_args(id, None, Some("user_preference"))).await.expect("call");
+
+        let r = b.update_memory_impl("agent-a", update_args(id, None, Some("semantic_fact"))).await.expect("call");
+        assert!(is_error(&r) && text(&r).contains("user_answered"), "{}", text(&r));
+
+        let declared = UpdateMemoryArgs { user_answered: true, ..update_args(id, None, Some("semantic_fact")) };
+        let r = b.update_memory_impl("agent-a", declared).await.expect("call");
+        assert!(!is_error(&r), "{}", text(&r));
+        assert!(text(&r).contains("semantic_fact"), "{}", text(&r));
+    }
+
+    #[tokio::test]
+    async fn resolve_conflict_sends_the_users_answer() {
+        let mut store = None;
+        let (b, _d) = bridge_with(|runtime| {
+            store = Some(runtime.store.clone());
+            runtime
+        })
+        .await;
+        let old = saved_id(&b, "agent-a", "the user prefers tabs over spaces").await;
+        let new = saved_id(&b, "agent-a", "the user prefers spaces over tabs").await;
+        store
+            .expect("the runtime's store")
+            .conn
+            .call(move |c| {
+                c.execute_batch(&format!(
+                    "UPDATE memory SET memory_type = 'user_preference' WHERE id = {old}; \
+                     UPDATE memory SET status = 'disputed', disputed_against = '[{old}]' WHERE id = {new};"
+                ))
+            })
+            .await
+            .expect("mark the dispute");
+        let args = |user_answered, reason: Option<&str>| ResolveConflictArgs {
+            keep: new,
+            other: old,
+            verdict: "supersedes".into(),
+            reason: reason.map(Into::into),
+            user_answered,
+        };
+
+        let r = b.resolve_conflict_impl("agent-a", args(false, None)).await.expect("call");
+        assert!(is_error(&r) && text(&r).contains("user_answered"), "{}", text(&r));
+
+        let r = b.resolve_conflict_impl("agent-a", args(true, Some("spaces from now on"))).await.expect("call");
+        assert!(!is_error(&r), "{}", text(&r));
+        assert_eq!(text(&r), format!("#{new} active\n#{old} superseded by #{new}"));
     }
 
     #[tokio::test]
@@ -3260,7 +3453,7 @@ mod tests {
             .expect("mark the dispute");
 
         let r = b
-            .resolve_conflict_impl("agent-b", ResolveConflictArgs { keep: new, other: old, verdict: "supersedes".into(), reason: None })
+            .resolve_conflict_impl("agent-b", ResolveConflictArgs { keep: new, other: old, verdict: "supersedes".into(), reason: None, user_answered: false })
             .await
             .expect("call");
 
@@ -3608,7 +3801,8 @@ mod tests {
                 data_dir,
                 &crate::daemon::lifecycle::DaemonState {
                     pid: std::process::id(),
-                    port,
+                    port: Some(port),
+                    unix_socket: false,
                     profile: "dev".into(),
                     version: env!("CARGO_PKG_VERSION").into(),
                     started_at_ms: 0,

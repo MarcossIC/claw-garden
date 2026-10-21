@@ -100,7 +100,7 @@ fn hit_segments(section: &str) -> Vec<String> {
     for line in section.lines().skip(1) {
         match (hit_text(line), segments.last_mut()) {
             (Some(text), _) => segments.push(vec![text]),
-            (None, Some(lines)) => lines.push(line),
+            (None, Some(lines)) => lines.push(unmargined(line)),
             (None, None) => {}
         }
     }
@@ -118,10 +118,21 @@ fn bullet_segments(section: &str) -> Vec<String> {
         } else if line.starts_with("## ") || line.starts_with("<!-- ") {
             open = false;
         } else if let (true, Some(lines)) = (open, segments.last_mut()) {
-            lines.push(line);
+            lines.push(unmargined(line));
         }
     }
     joined(segments)
+}
+
+/// A continuation line as it was saved: the prompt and the AUTO section of
+/// `workspace.md` print every line of a saved text after its first behind
+/// `  | `, or a bare `  |` when the line is empty, and the matcher compares
+/// against the row's own text.
+fn unmargined(line: &str) -> &str {
+    if line == "  |" {
+        return "";
+    }
+    line.strip_prefix("  | ").unwrap_or(line)
 }
 
 fn joined(segments: Vec<Vec<&str>>) -> Vec<String> {
@@ -176,6 +187,7 @@ mod tests {
         let text = clawg_cli::mcp::tools::format_search(
             clawg_cli::client::Found { hits: Vec::new(), withheld: 3 },
             "agent",
+            None,
         );
         assert!(parse_search_output(&text).unwrap().is_empty(), "{text}");
     }
@@ -280,7 +292,7 @@ mod tests {
 
     #[test]
     fn a_multi_line_hit_runs_until_the_next_header() {
-        let text = "=== LONG-TERM KNOWLEDGE ===\n[2026-08-10 #12 code_block] fn main() {\n    run();\n\n    stop();\n}\n[2026-08-09 #7 chat_message] second\n";
+        let text = "=== LONG-TERM KNOWLEDGE ===\n[2026-08-10 #12 code_block] fn main() {\n  |     run();\n  |\n  |     stop();\n  | }\n[2026-08-09 #7 chat_message] second\n";
         let segments = context_segments(text);
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0], "fn main() {\n    run();\n\n    stop();\n}", "a blank line inside content must not end the hit");
@@ -301,7 +313,7 @@ mod tests {
 
     #[test]
     fn a_hit_may_open_with_a_dash() {
-        let text = "=== RECENT CONTEXT (Last 7 Days) ===\n[2026-08-10 #2 chat_message] notes:\n- first point\n- second point\n";
+        let text = "=== RECENT CONTEXT (Last 7 Days) ===\n[2026-08-10 #2 chat_message] notes:\n  | - first point\n  | - second point\n";
         assert_eq!(context_segments(text), vec!["notes:\n- first point\n- second point".to_string()]);
     }
 
@@ -326,6 +338,12 @@ mod tests {
         let segments = context_segments(text);
         assert_eq!(segments[0], "first line of a decision\nand its second line");
         assert_eq!(segments[1], "next decision");
+    }
+
+    #[test]
+    fn a_copied_workspace_bullet_is_read_without_its_margin() {
+        let text = "=== WORKSPACE ===\n<!-- AUTO-START -->\n## Architectural Decisions\n- first line of a decision\n  | ## not a heading\n  |\n  | last line\n<!-- AUTO-END -->\n";
+        assert_eq!(context_segments(text), vec!["first line of a decision\n## not a heading\n\nlast line".to_string()]);
     }
 
     #[test]

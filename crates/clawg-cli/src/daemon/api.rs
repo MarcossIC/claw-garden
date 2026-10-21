@@ -28,7 +28,7 @@ use axum::{Json, Router};
 use clawg_core::memory::admin::{
     Deleted, delete_memory_core, get_memory_core, list_memories_core, memory_stats_core, query_has_tokens,
     update_memory_core, ListParams, MemoryAdminRow, MemoryKind, MemoryPatch, MemoryStats, StatsParams,
-    UpdatedRow, restore_memory_core, RestoreError, RestoredRow,
+    UpdateError, UpdatedRow, restore_memory_core, RestoreError, RestoredRow,
 };
 use clawg_core::memory::backup::Reason;
 use clawg_core::memory::bootstrap::EmbedderStatus;
@@ -40,6 +40,7 @@ use clawg_core::memory::worker::{
 };
 use clawg_core::memory::events::{MemoryEvent, MemorySource};
 use clawg_core::memory::clock::TimestampMs;
+use clawg_core::memory::portability::{self, ImportError, ImportOptions, ImportReport, MAX_IMPORT_BYTES};
 use clawg_core::memory::project::{register_project, RegisterError};
 use clawg_core::memory::prompt_builder::{build_memory_prompt, build_session_prompt, QueryTexts, Retrieval, DEFAULT_BUDGET, MAX_BUDGET};
 use clawg_core::memory::sharing::{self, Reach};
@@ -469,6 +470,10 @@ pub struct UpdateRequest {
     pub importance: Option<f64>,
     #[serde(default)]
     pub memory_type: Option<String>,
+    /// The caller declares the user answered, which taking a preference or a
+    /// decision out of its type needs.
+    #[serde(default)]
+    pub user_answered: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -567,6 +572,29 @@ pub struct RelatedMemory {
     pub id: i64,
     pub escalated: bool,
     pub excerpt: String,
+}
+
+/// Most bytes a save's `content` may hold. Every piece of a long save
+/// rewrites its outbox row with the progress so far, so the bytes a save
+/// writes grow with the square of its length; this keeps the worst case near
+/// 230 pieces and under 10 MB, and still takes the longest note an imported
+/// history was measured to hold (45 372 characters).
+pub const MAX_CONTENT_BYTES: usize = 64 * 1024;
+
+/// A save's `content`, or why it is refused: empty, or over
+/// [`MAX_CONTENT_BYTES`] as received. Refused rather than cut, since a cut
+/// save would store a text the caller never wrote.
+fn check_content(content: &str) -> Result<(), ApiError> {
+    if content.trim().is_empty() {
+        return Err(ApiError::bad_request("content must not be empty"));
+    }
+    if content.len() > MAX_CONTENT_BYTES {
+        return Err(ApiError::bad_request(format!(
+            "content is {} bytes; at most {MAX_CONTENT_BYTES} are accepted: split it into several saves, one fact each",
+            content.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Longest `operation_id` a caller may send.
@@ -799,6 +827,9 @@ pub struct JudgeRequest {
     /// Why, required for `scoped`.
     #[serde(default)]
     pub reason: Option<String>,
+    /// The caller declares the user answered, with the answer in `reason`.
+    #[serde(default)]
+    pub user_answered: bool,
     /// Scopes the verdict to this agent's rows, as [`OwnerQuery`] does.
     #[serde(default)]
     pub agent_id: Option<String>,
@@ -840,6 +871,7 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         .route("/outbox/discard", post(discard_outbox))
         .route("/stats", get(stats))
         .route("/backup", post(backup))
+        .route("/import", post(import_memories).layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT)))
         .route("/projects", post(register))
         .route("/projects/docs/search", post(search_docs))
         .route("/shutdown", post(shutdown))
@@ -1066,9 +1098,7 @@ async fn save_memory(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<SaveRequest>,
 ) -> ApiResult<(StatusCode, Json<SaveBody>)> {
-    if body.content.trim().is_empty() {
-        return Err(ApiError::bad_request("content must not be empty"));
-    }
+    check_content(&body.content)?;
     // Refused here, as `PATCH` refuses it: the worker would store it as
     // `semantic_fact` long after the caller was told the save was accepted.
     if let Some(raw) = body.memory_type.as_deref() {
@@ -1415,13 +1445,17 @@ async fn update_memory(
 ) -> ApiResult<Json<UpdatedBody>> {
     let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
     let patch = MemoryPatch::new(kind, body.importance, body.memory_type.as_deref())
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        .map_err(|e| ApiError::bad_request(e.to_string()))?
+        .answered(body.user_answered);
     // The core answers `None` for "no such row", "already soft-deleted" and
     // "another agent's" alike, and from the caller's side those are the same
     // fact: the row it named is not there to change.
     let row = update_memory_core(&app.runtime.store, id, kind, &patch, owner.agent.as_deref())
         .await
-        .map_err(ApiError::internal)?
+        .map_err(|e| match e {
+            UpdateError::NeedsUser { .. } => ApiError::conflict(e.to_string()),
+            UpdateError::Store(e) => ApiError::internal(e),
+        })?
         .ok_or_else(|| ApiError::not_found(format!("no {kind:?} row with id {id}")))?;
     Ok(Json(UpdatedBody { updated: 1, row }))
 }
@@ -1497,7 +1531,9 @@ async fn discard_outbox(State(app): State<Arc<AppCtx>>, Json(body): Json<OutboxR
 /// The answer every verdict route gives a refused one.
 fn resolve_error(e: ResolveError) -> ApiError {
     match e {
-            ResolveError::SameRow | ResolveError::ReasonRequired => ApiError::bad_request(e.to_string()),
+            ResolveError::SameRow | ResolveError::ReasonRequired | ResolveError::AnswerRequired => {
+                ApiError::bad_request(e.to_string())
+            }
             ResolveError::NotFound(_) => ApiError::not_found(e.to_string()),
             ResolveError::NotInDispute { .. }
             | ResolveError::SupersededElsewhere { .. }
@@ -1524,7 +1560,15 @@ async fn judge_dispute(
     let verdict: Verdict = body.verdict.parse().map_err(|e: clawg_core::memory::dispute::UnknownVerdict| {
         ApiError::bad_request(e.to_string())
     })?;
-    judge_pair(&app.runtime.store, body.keep, body.other, verdict, body.reason, body.agent_id.as_deref())
+    judge_pair(
+        &app.runtime.store,
+        body.keep,
+        body.other,
+        verdict,
+        body.reason,
+        body.user_answered,
+        body.agent_id.as_deref(),
+    )
         .await
         .map(Json)
         .map_err(resolve_error)
@@ -1549,6 +1593,54 @@ pub struct BackupBody {
 async fn backup(State(app): State<Arc<AppCtx>>) -> ApiResult<Json<BackupBody>> {
     let path = app.runtime.snapshot(Reason::Manual).await.map_err(ApiError::internal)?;
     Ok(Json(BackupBody { path: path.display().to_string() }))
+}
+
+/// The body of `POST /v1/import`: an export as text, which JSON escaping
+/// makes longer than the file it came from.
+const IMPORT_BODY_LIMIT: usize = 2 * MAX_IMPORT_BYTES;
+
+#[derive(Debug, Deserialize)]
+pub struct ImportRequest {
+    /// The export, as `clawg export` wrote it.
+    pub text: String,
+    #[serde(default)]
+    pub dry_run: bool,
+    /// The agent every row that has one is stored under instead.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Exported project roots and the roots they have here.
+    #[serde(default)]
+    pub map_roots: Vec<(String, String)>,
+}
+
+/// Imports an export. The file is read before the embedder is asked for, so
+/// a file this binary cannot read is a 400 even while the model loads, and a
+/// dry run needs no model at all.
+async fn import_memories(
+    State(app): State<Arc<AppCtx>>,
+    Json(body): Json<ImportRequest>,
+) -> ApiResult<Json<ImportReport>> {
+    if body.text.len() > MAX_IMPORT_BYTES {
+        return Err(ApiError::bad_request(format!(
+            "the file is {} bytes; at most {MAX_IMPORT_BYTES} are imported",
+            body.text.len()
+        )));
+    }
+    let agent = match body.agent.as_deref().map(str::trim) {
+        Some("") => return Err(ApiError::bad_request("agent must not be blank")),
+        agent => agent.map(str::to_string),
+    };
+    portability::format::parse(&body.text).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let embedder = if body.dry_run { None } else { Some(ready_embedder(&app)?) };
+    let options = ImportOptions { dry_run: body.dry_run, agent, map_roots: body.map_roots };
+    let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
+    match portability::import(&app.runtime.store, embedder.as_deref(), &backups, &body.text, &options).await {
+        Ok(report) => Ok(Json(report)),
+        Err(ImportError::Format(e)) => Err(ApiError::bad_request(e.to_string())),
+        Err(ImportError::NoEmbedder) => Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "embedder_not_ready")),
+        Err(ImportError::Embed(e)) => Err(embed_failure(e)),
+        Err(e @ ImportError::Store(_)) => Err(ApiError::internal(e)),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1689,9 +1781,10 @@ fn not_accepted(root: &std::path::Path, profile: Profile) -> String {
         other => format!(" --profile {}", other.as_str()),
     };
     format!(
-        "clawg reads the files of the project a bridge was started in, and of the ones the user \
-         added; {root} is neither. Ask the user to run `clawg projects add \"{root}\"{flag}` if \
-         they want it searched, then call again",
+        "clawg reads the files of the projects the user added, and of the one a bridge was \
+         started in when that folder has a .git or a manifest and is not the home directory or a \
+         filesystem root; {root} is neither. Ask the user to run `clawg projects add \"{root}\"{flag}` \
+         if they want it searched, then call again",
         root = root.display()
     )
 }
@@ -1768,6 +1861,24 @@ mod tests {
     fn sources_are_counted_once_and_sorted() {
         assert_eq!(distinct_sources(&[9, 3, 9, 1]).unwrap(), vec![1, 3, 9]);
         assert_eq!(distinct_sources(&[]).unwrap(), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn content_is_checked_in_bytes() {
+        assert!(check_content(&"x".repeat(MAX_CONTENT_BYTES)).is_ok());
+        assert!(check_content(&"ñ".repeat(MAX_CONTENT_BYTES / 2)).is_ok());
+        let over = check_content(&"ñ".repeat(MAX_CONTENT_BYTES / 2 + 1)).unwrap_err();
+        assert_eq!(over.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            over.message,
+            format!(
+                "content is {} bytes; at most {MAX_CONTENT_BYTES} are accepted: split it into several saves, one fact each",
+                MAX_CONTENT_BYTES + 2
+            )
+        );
+        for empty in ["", "  \n "] {
+            assert_eq!(check_content(empty).unwrap_err().message, "content must not be empty");
+        }
     }
 
     #[test]

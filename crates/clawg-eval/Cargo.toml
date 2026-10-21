@@ -30,10 +30,15 @@ path = "src/bin/golden-mine/main.rs"
 name = "conflict-eval"
 path = "src/bin/conflict-eval/main.rs"
 
+# Measures what a topic key does for a memory that is revised.
+[[bin]]
+name = "revision-eval"
+path = "src/bin/revision-eval/main.rs"
+
 [dependencies]
 clawg-core = { workspace = true, features = ["eval"] }
-# Only `rag-eval --agent-view` uses it: it serves the daemon's own router in-process
-# so the text it measures is the text an agent receives.
+# Only `rag-eval --agent-view` and `revision-eval` use it: they serve the daemon's
+# own router in-process so the text they measure is the text an agent receives.
 clawg-cli.workspace = true
 serde.workspace = true
 serde_json.workspace = true

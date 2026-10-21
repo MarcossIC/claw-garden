@@ -63,6 +63,20 @@ impl MemoryType {
         }
     }
 
+    /// A preference or a decision is replaced by a verdict, or loses its type,
+    /// only once the caller declares the user answered.
+    pub(crate) fn is_protected(self) -> bool {
+        match self {
+            Self::UserPreference | Self::ArchitecturalDecision => true,
+            Self::SemanticFact | Self::ChatMessage | Self::ToolError | Self::CodeBlock | Self::SessionSummary => false,
+        }
+    }
+
+    /// A stored type the parser does not know is not protected.
+    pub(crate) fn is_protected_name(s: &str) -> bool {
+        Self::from_db_str(s).is_some_and(Self::is_protected)
+    }
+
     /// Parses the raw DB string. Unknown or legacy values return `None` —
     /// treated as not eligible for the contradiction type gate rather than
     /// panicking on a value written by a future or foreign schema version.

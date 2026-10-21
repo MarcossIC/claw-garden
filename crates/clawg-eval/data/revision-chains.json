@@ -1,0 +1,805 @@
+{
+ "version": 1,
+ "chains": [
+  {
+   "id": "en-orders-database",
+   "lang": "en",
+   "memory_type": "architectural_decision",
+   "topic_key": "storage/primary-database",
+   "query": "Which database engine and version does the orders service use as its primary store?",
+   "versions": [
+    {
+     "content": "Primary database of the orders service: PostgreSQL 15 on the managed cloud instance. Chosen over MySQL because order metadata needs JSONB columns and the status queries need partial indexes on `orders.status`. Connections go through PgBouncer in transaction mode, configured in `deploy/pgbouncer.ini`.",
+     "value": "PostgreSQL 15"
+    },
+    {
+     "content": "Primary database of the orders service: PostgreSQL 16 on the managed cloud instance. Chosen over MySQL because order metadata needs JSONB columns and the status queries need partial indexes on `orders.status`. Connections go through PgBouncer in transaction mode, configured in `deploy/pgbouncer.ini`.",
+     "value": "PostgreSQL 16",
+     "change": "value"
+    },
+    {
+     "content": "Primary database of the orders service: PostgreSQL 16 on the managed cloud instance. Chosen over MySQL because order metadata needs JSONB columns and the status queries need partial indexes on `orders.status`. Connections go through PgBouncer in transaction mode, configured in `deploy/pgbouncer.ini`. The reporting replica is fed by logical replication of `orders` and `order_items` only, so the audit tables never leave the primary.",
+     "value": "logical replication",
+     "change": "extend"
+    }
+   ]
+  },
+  {
+   "id": "en-api-versioning",
+   "lang": "en",
+   "memory_type": "architectural_decision",
+   "topic_key": "api/versioning",
+   "query": "How do clients choose which version of the public REST API they call?",
+   "versions": [
+    {
+     "content": "Versioning of the public REST API: the version goes in the URL path, as in `/v1/orders` and `/v1/customers`. A breaking change ships under a new prefix and the previous one stays up for six months. The routes are declared in `src/http/routes.rs`.",
+     "value": "in the URL path"
+    },
+    {
+     "content": "The public REST API now picks its version from a media type header rather than from the path: a client sends `Accept: application/vnd.acme.v2+json`, and each route keeps one unversioned path such as `/orders`. A request without the header is served the oldest version still supported. The negotiation middleware sits in `src/http/routes.rs`.",
+     "value": "media type header",
+     "change": "rewrite"
+    }
+   ]
+  },
+  {
+   "id": "en-job-queue",
+   "lang": "en",
+   "memory_type": "architectural_decision",
+   "topic_key": "jobs/queue",
+   "query": "Where are background jobs such as emails and webhooks queued?",
+   "versions": [
+    {
+     "content": "Background jobs (emails, PDF invoices, outgoing webhooks) are queued in RabbitMQ, one durable queue per job kind, and consumed by the `worker` binary. It was picked because it moves a job that keeps failing to a dead-letter queue without extra code.",
+     "value": "RabbitMQ"
+    },
+    {
+     "content": "Background jobs moved from the self-hosted broker to Amazon SQS: each job kind has its own standard queue with a redrive policy after five receives, and the `worker` binary long-polls them. The move removes a broker the team had to patch and monitor itself.",
+     "value": "Amazon SQS",
+     "change": "rewrite"
+    },
+    {
+     "content": "Background jobs moved from the self-hosted broker to Amazon SQS: each job kind has its own standard queue with a redrive policy after five receives, and the `worker` binary long-polls them. The move removes a broker the team had to patch and monitor itself. Billing events go to a FIFO queue instead, with `customer_id` as the message group, so the invoices of one customer are produced in order.",
+     "value": "FIFO queue",
+     "change": "extend"
+    }
+   ]
+  },
+  {
+   "id": "en-access-token-ttl",
+   "lang": "en",
+   "memory_type": "architectural_decision",
+   "topic_key": "auth/access-token-ttl",
+   "query": "How long are access tokens valid before they expire?",
+   "versions": [
+    {
+     "content": "Access tokens issued by `auth-service` expire after 15 minutes; refresh tokens last 14 days and rotate on every use. Both lifetimes are set in `config/auth.toml` as `access_ttl` and `refresh_ttl`.",
+     "value": "15 minutes"
+    },
+    {
+     "content": "Access token lifetime raised: `auth-service` now issues access tokens valid for 30 minutes, because mobile clients on poor connections were refreshing so often that the refresh endpoint became the busiest route. Refresh tokens are unchanged. The setting is still `access_ttl` in `config/auth.toml`.",
+     "value": "30 minutes",
+     "change": "rewrite"
+    }
+   ]
+  },
+  {
+   "id": "en-repo-layout",
+   "lang": "en",
+   "memory_type": "architectural_decision",
+   "topic_key": "repo/layout",
+   "query": "How is the code of the services organised into repositories?",
+   "versions": [
+    {
+     "content": "Repository layout: each service lives in its own Git repository (`orders-api`, `billing-api`, `web-app`), and the shared types are published as the npm package `@acme/contracts`, versioned with semver.",
+     "value": "its own Git repository"
+    },
+    {
+     "content": "All services now live in a single monorepo managed with pnpm workspaces: `apps/orders-api`, `apps/billing-api` and `apps/web-app`, with the shared types in `packages/contracts` consumed from source. A change to a contract and to its callers now lands in one pull request instead of a release and three upgrades.",
+     "value": "single monorepo",
+     "change": "rewrite"
+    }
+   ]
+  },
+  {
+   "id": "en-deploy-strategy",
+   "lang": "en",
+   "memory_type": "architectural_decision",
+   "topic_key": "deploy/strategy",
+   "query": "How are new versions of the web API rolled out to production?",
+   "versions": [
+    {
+     "content": "Production deploys of the web API use blue-green on ECS: the new task set takes all the traffic at once after its health checks pass, and the old one stays idle for an hour so a rollback is a switch back.",
+     "value": "blue-green"
+    },
+    {
+     "content": "Production deploys of the web API are canary releases now: the new version first receives 10% of the traffic for twenty minutes while the CloudWatch error-rate alarm watches it, and then the rest. If the alarm fires, the deploy rolls back by itself.",
+     "value": "10% of the traffic",
+     "change": "rewrite"
+    },
+    {
+     "content": "Production deploys of the web API are canary releases now: the new version first receives 25% of the traffic for twenty minutes while the CloudWatch error-rate alarm watches it, and then the rest. If the alarm fires, the deploy rolls back by itself.",
+     "value": "25% of the traffic",
+     "change": "value"
+    }
+   ]
+  },
+  {
+   "id": "en-product-cache",
+   "lang": "en",
+   "memory_type": "architectural_decision",
+   "topic_key": "cache/product-lookups",
+   "query": "Where are product lookups cached and how is that cache invalidated?",
+   "versions": [
+    {
+     "content": "Caching of product lookups: an in-process LRU cache in each API instance, capped at 10,000 entries and invalidated when a product changes through `ProductService::update`.",
+     "value": "in-process LRU cache"
+    },
+    {
+     "content": "Product lookups are cached in a shared Redis cluster instead of inside each instance, with a five-minute expiry and an explicit delete of the key from `ProductService::update`, so every instance sees a price change at the same moment.",
+     "value": "shared Redis cluster",
+     "change": "rewrite"
+    }
+   ]
+  },
+  {
+   "id": "en-web-state",
+   "lang": "en",
+   "memory_type": "architectural_decision",
+   "topic_key": "web/state-management",
+   "query": "How does the web app manage its client-side state?",
+   "versions": [
+    {
+     "content": "State management in the web app: Redux Toolkit, with one slice per feature under `src/store/` and RTK Query for server data.",
+     "value": "Redux Toolkit"
+    },
+    {
+     "content": "The web app keeps its client state in signal-based stores now: each feature exposes a small store built on signals in `src/state/<feature>.ts`, and server data is fetched with TanStack Query. The global Redux store was removed to cut boilerplate and the re-renders it caused.",
+     "value": "signal-based stores",
+     "change": "rewrite"
+    }
+   ]
+  },
+  {
+   "id": "en-commit-messages",
+   "lang": "en",
+   "memory_type": "user_preference",
+   "topic_key": "git/commit-messages",
+   "query": "How does the user want commit messages to be written?",
+   "versions": [
+    {
+     "content": "Commit messages: the user wants conventional commits (`feat:`, `fix:`, `docs:`) with a subject line of at most 72 characters, in the imperative mood.",
+     "value": "at most 72 characters"
+    },
+    {
+     "content": "Commit messages: the user wants conventional commits (`feat:`, `fix:`, `docs:`) with a subject line of at most 50 characters, in the imperative mood.",
+     "value": "at most 50 characters",
+     "change": "value"
+    },
+    {
+     "content": "Commit messages: the user wants conventional commits (`feat:`, `fix:`, `docs:`) with a subject line of at most 50 characters, in the imperative mood. When the reason for a change is not obvious from the diff, a body explains why, wrapped at 72 columns.",
+     "value": "explains why",
+     "change": "extend"
+    }
+   ]
+  },
+  {
+   "id": "en-test-names",
+   "lang": "en",
+   "memory_type": "user_preference",
+   "topic_key": "testing/test-names",
+   "query": "How does the user want tests to be named?",
+   "versions": [
+    {
+     "content": "Test names: the user wants each test named as a full sentence in snake_case that states the behaviour, such as `an_expired_token_is_rejected`, never `test_token_3`.",
+     "value": "a full sentence in snake_case"
+    },
+    {
+     "content": "The user now wants test names to begin with the unit under test, then a double underscore and the scenario, as in `token_validator__rejects_expired_tokens`, so that the tests of one unit sort together in the runner's output.",
+     "value": "double underscore",
+     "change": "rewrite"
+    }
+   ]
+  },
+  {
+   "id": "en-typescript-indent",
+   "lang": "en",
+   "memory_type": "user_preference",
+   "topic_key": "style/typescript-indent",
+   "query": "What indentation does the user want in TypeScript files?",
+   "versions": [
+    {
+     "content": "Indentation in TypeScript files: the user wants 2 spaces, never tabs, enforced through `.editorconfig` and the formatter settings of the repository.",
+     "value": "2 spaces"
+    },
+    {
+     "content": "Indentation in TypeScript files: the user wants 4 spaces, never tabs, enforced through `.editorconfig` and the formatter settings of the repository.",
+     "value": "4 spaces",
+     "change": "value"
+    }
+   ]
+  },
+  {
+   "id": "en-procedure-format",
+   "lang": "en",
+   "memory_type": "user_preference",
+   "topic_key": "answers/procedure-format",
+   "query": "How does the user like a procedure to be explained?",
+   "versions": [
+    {
+     "content": "Format of explanations: when an answer walks through a procedure, the user prefers short bullet points over paragraphs.",
+     "value": "short bullet points"
+    },
+    {
+     "content": "For procedures the user asked for numbered steps, one action per step, instead of bullets or prose, because they follow along while typing and need to know where they are.",
+     "value": "numbered steps",
+     "change": "rewrite"
+    },
+    {
+     "content": "For procedures the user asked for numbered steps, one action per step, instead of bullets or prose, because they follow along while typing and need to know where they are. The last line of the answer is a one-line summary of what the procedure achieves.",
+     "value": "one-line summary",
+     "change": "extend"
+    }
+   ]
+  },
+  {
+   "id": "en-ci-duration",
+   "lang": "en",
+   "memory_type": "semantic_fact",
+   "topic_key": "ci/duration",
+   "query": "How long does the CI pipeline take on each push?",
+   "versions": [
+    {
+     "content": "The CI pipeline on the Linux runner takes about 12 minutes per push, most of it compiling dependencies in the `build` job.",
+     "value": "about 12 minutes"
+    },
+    {
+     "content": "Since the dependency cache was added to the `build` job, a push goes through CI on the Linux runner in roughly 7 minutes; a push that changes `Cargo.lock` still pays the full build.",
+     "value": "roughly 7 minutes",
+     "change": "rewrite"
+    }
+   ]
+  },
+  {
+   "id": "en-staging-port",
+   "lang": "en",
+   "memory_type": "semantic_fact",
+   "topic_key": "staging/api-port",
+   "query": "On which port does the staging API listen?",
+   "versions": [
+    {
+     "content": "The staging API listens on port 8443 behind the nginx reverse proxy on `staging-gw-1`; nginx terminates TLS and forwards to the app over plain HTTP.",
+     "value": "port 8443"
+    },
+    {
+     "content": "The staging API listens on port 9443 behind the nginx reverse proxy on `staging-gw-1`; nginx terminates TLS and forwards to the app over plain HTTP.",
+     "value": "port 9443",
+     "change": "value"
+    },
+    {
+     "content": "The staging API listens on port 9443 behind the nginx reverse proxy on `staging-gw-1`; nginx terminates TLS and forwards to the app over plain HTTP. The same host serves Prometheus metrics on port 9100, reachable only from the VPN.",
+     "value": "Prometheus metrics",
+     "change": "extend"
+    }
+   ]
+  },
+  {
+   "id": "en-node-version",
+   "lang": "en",
+   "memory_type": "semantic_fact",
+   "topic_key": "web/node-version",
+   "query": "Which Node.js release does the web app build and run on?",
+   "versions": [
+    {
+     "content": "The web app builds and runs on Node.js 18 LTS; the version is pinned in `.nvmrc` and in the `engines` field of `package.json`.",
+     "value": "Node.js 18"
+    },
+    {
+     "content": "The web app builds and runs on Node.js 20 LTS; the version is pinned in `.nvmrc` and in the `engines` field of `package.json`.",
+     "value": "Node.js 20",
+     "change": "value"
+    }
+   ]
+  },
+  {
+   "id": "en-rate-limit",
+   "lang": "en",
+   "memory_type": "semantic_fact",
+   "topic_key": "api/rate-limit",
+   "query": "How many requests can a client send to the public API before it is throttled?",
+   "versions": [
+    {
+     "content": "The public API allows 100 requests per minute per API key; past that it answers 429 with a `Retry-After` header. The limiter runs in the gateway and is configured in `gateway/limits.yaml`.",
+     "value": "100 requests per minute"
+    },
+    {
+     "content": "The public API allows 300 requests per minute per API key; past that it answers 429 with a `Retry-After` header. The limiter runs in the gateway and is configured in `gateway/limits.yaml`.",
+     "value": "300 requests per minute",
+     "change": "value"
+    },
+    {
+     "content": "Rate limiting of the public API is a token bucket per API key now: bursts of up to 50 requests, refilled at 5 per second. A request over the limit still gets 429 with `Retry-After`, and the bucket settings live in `gateway/limits.yaml`.",
+     "value": "token bucket",
+     "change": "rewrite"
+    }
+   ]
+  },
+  {
+   "id": "en-rust-error-handling",
+   "lang": "en",
+   "memory_type": "architectural_decision",
+   "topic_key": "rust/error-handling",
+   "query": "How do the Rust services define, convert and log their errors?",
+   "versions": [
+    {
+     "content": "Error handling in the Rust services (`orders-api`, `billing-api` and the shared `acme-core` crate).\n\nLibrary crates define their errors as enums with `thiserror`, one enum per module boundary rather than one per crate, so a caller can match on what actually went wrong instead of on a string. Each variant carries the data a caller needs to react, such as the id that was not found or the limit that was exceeded, and never a preformatted message. Binaries use `anyhow` only at the top level, in `main` and in the job runners, where the only thing left to do with an error is to log it with its chain of causes and then exit or retry.\n\nEvery error that crosses the HTTP boundary carries a stable code of the form `ORD-1234`, listed in `docs/errors.md` together with its HTTP status and a one-line description for client developers. The code is part of the public contract: once published it is never reused for a different meaning, and removing one needs the same deprecation period as removing an endpoint. The response body always has the same JSON shape, with `code`, `message` and an optional `details` object, and the message is written for a developer reading logs, not for an end user; the web app maps codes to translated texts on its side.\n\nConversion from domain errors to HTTP responses happens in exactly one place, the `IntoResponse` implementation in `src/http/error.rs`. Handlers return `Result<T, ApiError>` and use the question mark operator; they never build a response by hand for an error case. This keeps the mapping between a variant and a status code reviewable in a single file, and a new variant without a mapping fails to compile because the match is exhaustive.\n\nPanics are treated as bugs, not as a way to report errors. `unwrap` and `expect` are allowed in tests and in code that runs once at startup, where a missing configuration value should stop the process immediately with a clear message. Anywhere on a request path they are rejected in review. A panic inside a request is caught by the tower layer that turns it into a 500 with the code reserved for internal errors, and it is logged with the request id so it can be traced.\n\nDatabase errors never reach clients as they are. A unique constraint violation on `orders.external_ref` becomes a conflict with its own code, a serialization failure is retried up to three times inside the repository layer, and anything else becomes an internal error whose details only go to the logs. The repository functions in `src/db/` are responsible for this translation, so the domain layer never sees a driver type.\n\nErrors are logged once, at the point where they are handled, not at every layer they pass through. A function that returns an error to its caller does not log it, because the caller may decide that it is expected; the HTTP layer logs every 5xx at error level and every 4xx at debug level. Logged errors include the code, the request id and the full source chain, which `tracing` records in the `error` field.\n\nThis decision was taken after an incident in which three layers logged the same timeout and the engineer on call spent an hour following duplicates instead of the cause.",
+     "value": "`ORD-1234`"
+    },
+    {
+     "content": "Error handling in the Rust services (`orders-api`, `billing-api` and the shared `acme-core` crate).\n\nLibrary crates define their errors as enums with `thiserror`, one enum per module boundary rather than one per crate, so a caller can match on what actually went wrong instead of on a string. Each variant carries the data a caller needs to react, such as the id that was not found or the limit that was exceeded, and never a preformatted message. Binaries use `anyhow` only at the top level, in `main` and in the job runners, where the only thing left to do with an error is to log it with its chain of causes and then exit or retry.\n\nEvery error that crosses the HTTP boundary carries a stable code of the form `orders.not_found`, listed in `docs/errors.md` together with its HTTP status and a one-line description for client developers. The code is part of the public contract: once published it is never reused for a different meaning, and removing one needs the same deprecation period as removing an endpoint. The response body always has the same JSON shape, with `code`, `message` and an optional `details` object, and the message is written for a developer reading logs, not for an end user; the web app maps codes to translated texts on its side.\n\nConversion from domain errors to HTTP responses happens in exactly one place, the `IntoResponse` implementation in `src/http/error.rs`. Handlers return `Result<T, ApiError>` and use the question mark operator; they never build a response by hand for an error case. This keeps the mapping between a variant and a status code reviewable in a single file, and a new variant without a mapping fails to compile because the match is exhaustive.\n\nPanics are treated as bugs, not as a way to report errors. `unwrap` and `expect` are allowed in tests and in code that runs once at startup, where a missing configuration value should stop the process immediately with a clear message. Anywhere on a request path they are rejected in review. A panic inside a request is caught by the tower layer that turns it into a 500 with the code reserved for internal errors, and it is logged with the request id so it can be traced.\n\nDatabase errors never reach clients as they are. A unique constraint violation on `orders.external_ref` becomes a conflict with its own code, a serialization failure is retried up to three times inside the repository layer, and anything else becomes an internal error whose details only go to the logs. The repository functions in `src/db/` are responsible for this translation, so the domain layer never sees a driver type.\n\nErrors are logged once, at the point where they are handled, not at every layer they pass through. A function that returns an error to its caller does not log it, because the caller may decide that it is expected; the HTTP layer logs every 5xx at error level and every 4xx at debug level. Logged errors include the code, the request id and the full source chain, which `tracing` records in the `error` field.\n\nThis decision was taken after an incident in which three layers logged the same timeout and the engineer on call spent an hour following duplicates instead of the cause.",
+     "value": "`orders.not_found`",
+     "change": "value"
+    },
+    {
+     "content": "Error handling in the Rust services (`orders-api`, `billing-api` and the shared `acme-core` crate).\n\nLibrary crates define their errors as enums with `thiserror`, one enum per module boundary rather than one per crate, so a caller can match on what actually went wrong instead of on a string. Each variant carries the data a caller needs to react, such as the id that was not found or the limit that was exceeded, and never a preformatted message. Binaries use `anyhow` only at the top level, in `main` and in the job runners, where the only thing left to do with an error is to log it with its chain of causes and then exit or retry.\n\nEvery error that crosses the HTTP boundary carries a stable code of the form `orders.not_found`, listed in `docs/errors.md` together with its HTTP status and a one-line description for client developers. The code is part of the public contract: once published it is never reused for a different meaning, and removing one needs the same deprecation period as removing an endpoint. The response body always has the same JSON shape, with `code`, `message` and an optional `details` object, and the message is written for a developer reading logs, not for an end user; the web app maps codes to translated texts on its side.\n\nConversion from domain errors to HTTP responses happens in exactly one place, the `IntoResponse` implementation in `src/http/error.rs`. Handlers return `Result<T, ApiError>` and use the question mark operator; they never build a response by hand for an error case. This keeps the mapping between a variant and a status code reviewable in a single file, and a new variant without a mapping fails to compile because the match is exhaustive.\n\nPanics are treated as bugs, not as a way to report errors. `unwrap` and `expect` are allowed in tests and in code that runs once at startup, where a missing configuration value should stop the process immediately with a clear message. Anywhere on a request path they are rejected in review. A panic inside a request is caught by the tower layer that turns it into a 500 with the code reserved for internal errors, and it is logged with the request id so it can be traced.\n\nDatabase errors never reach clients as they are. A unique constraint violation on `orders.external_ref` becomes a conflict with its own code, a serialization failure is retried up to three times inside the repository layer, and anything else becomes an internal error whose details only go to the logs. The repository functions in `src/db/` are responsible for this translation, so the domain layer never sees a driver type.\n\nTransient failures are marked in the response body with `retryable: true`: timeouts of downstream services, a connection pool that stayed full, and serialization failures that still fail after their three retries. Clients may retry those with exponential backoff starting at 200 milliseconds; any other error must not be retried automatically, because repeating it either fails the same way or, for a request that is not idempotent, risks doing the work twice.\n\nErrors are logged once, at the point where they are handled, not at every layer they pass through. A function that returns an error to its caller does not log it, because the caller may decide that it is expected; the HTTP layer logs every 5xx at error level and every 4xx at debug level. Logged errors include the code, the request id and the full source chain, which `tracing` records in the `error` field.\n\nThis decision was taken after an incident in which three layers logged the same timeout and the engineer on call spent an hour following duplicates instead of the cause.",
+     "value": "`retryable: true`",
+     "change": "extend"
+    }
+   ]
+  },
+  {
+   "id": "en-backend-telemetry",
+   "lang": "en",
+   "memory_type": "architectural_decision",
+   "topic_key": "observability/telemetry",
+   "query": "How do the backend services handle their logs, traces and metrics?",
+   "versions": [
+    {
+     "content": "Observability of the backend services: logs, traces and metrics.\n\nAll services write structured logs as JSON lines to standard output, one object per event, through the `tracing` crate and the JSON formatter of `tracing-subscriber`. Nothing writes log files inside the container; the platform collects standard output and ships it to the log store. Every line carries the service name, the version of the build, the environment and, when the event happens inside a request, the request id and the trace id, so a single request can be followed across services without guessing.\n\nLog levels have a fixed meaning. Error is for something that needs a person to look at it, such as a failed payment capture or a job that exhausted its retries. Warn is for a degraded but handled situation, such as a fallback to a cached price. Info records business events worth counting later, like an order placed or a refund issued, and the start and stop of the process. Debug and trace are off in production and can be turned on per service with the `RUST_LOG` variable for a limited time while investigating.\n\nTraces use OpenTelemetry. Each service exports spans over OTLP to the collector that runs as a sidecar, and the collector forwards them to the tracing backend. Incoming HTTP requests start a span named after the route template, not the raw path, so that `/orders/{id}` groups all orders together. Calls to the database, to Redis and to other services are child spans with their own timing. Sampling keeps ten percent of the requests in production, plus every request that ends with a 5xx, which the collector keeps through a tail sampling rule.\n\nMetrics are exposed in Prometheus format on a separate port and scraped every fifteen seconds. Each service exposes the four golden signals of its HTTP server: request rate, error rate, latency histograms per route and saturation of its worker pool. Business counters such as orders created or invoices sent are defined next to the code that produces them, with names that start with the service name. Labels never contain unbounded values like user ids or order ids, because each distinct value creates a new series.\n\nLogs are kept for 14 days in the hot store, where they can be searched in full, and then deleted; traces are kept for seven days and metrics for thirteen months, downsampled after the first month. Personal data must not reach any of the three. Email addresses, names, postal addresses and payment details are either left out of the event or replaced by an internal id before they are logged, and a test in each service checks that the request logger masks the `Authorization` header.\n\nDashboards and alerts live in the repository under `ops/observability/`, written as code and applied by the deploy pipeline, so a change to an alert is reviewed like any other change. Every alert links to a runbook section that says what to check first.\n\nThis setup replaced a mix of plain text logs and per-service metrics libraries that made it impossible to tie an error to the request that caused it.",
+     "value": "kept for 14 days"
+    },
+    {
+     "content": "Observability of the backend services: logs, traces and metrics.\n\nAll services write structured logs as JSON lines to standard output, one object per event, through the `tracing` crate and the JSON formatter of `tracing-subscriber`. Nothing writes log files inside the container; the platform collects standard output and ships it to the log store. Every line carries the service name, the version of the build, the environment and, when the event happens inside a request, the request id and the trace id, so a single request can be followed across services without guessing.\n\nLog levels have a fixed meaning. Error is for something that needs a person to look at it, such as a failed payment capture or a job that exhausted its retries. Warn is for a degraded but handled situation, such as a fallback to a cached price. Info records business events worth counting later, like an order placed or a refund issued, and the start and stop of the process. Debug and trace are off in production and can be turned on per service with the `RUST_LOG` variable for a limited time while investigating.\n\nTraces use OpenTelemetry. Each service exports spans over OTLP to the collector that runs as a sidecar, and the collector forwards them to the tracing backend. Incoming HTTP requests start a span named after the route template, not the raw path, so that `/orders/{id}` groups all orders together. Calls to the database, to Redis and to other services are child spans with their own timing. Sampling keeps ten percent of the requests in production, plus every request that ends with a 5xx, which the collector keeps through a tail sampling rule.\n\nMetrics are exposed in Prometheus format on a separate port and scraped every fifteen seconds. Each service exposes the four golden signals of its HTTP server: request rate, error rate, latency histograms per route and saturation of its worker pool. Business counters such as orders created or invoices sent are defined next to the code that produces them, with names that start with the service name. Labels never contain unbounded values like user ids or order ids, because each distinct value creates a new series.\n\nLogs are kept for 30 days in the hot store, where they can be searched in full, and then deleted; traces are kept for seven days and metrics for thirteen months, downsampled after the first month. Personal data must not reach any of the three. Email addresses, names, postal addresses and payment details are either left out of the event or replaced by an internal id before they are logged, and a test in each service checks that the request logger masks the `Authorization` header.\n\nDashboards and alerts live in the repository under `ops/observability/`, written as code and applied by the deploy pipeline, so a change to an alert is reviewed like any other change. Every alert links to a runbook section that says what to check first.\n\nThis setup replaced a mix of plain text logs and per-service metrics libraries that made it impossible to tie an error to the request that caused it.",
+     "value": "kept for 30 days",
+     "change": "value"
+    }
+   ]
+  },
+  {
+   "id": "en-pull-request-descriptions",
+   "lang": "en",
+   "memory_type": "user_preference",
+   "topic_key": "review/pull-request-descriptions",
+   "query": "How does the user want pull request descriptions to be written?",
+   "versions": [
+    {
+     "content": "How the user wants pull request descriptions written.\n\nEvery pull request opens with a summary of two or three sentences that says what changes for someone using the code, not which files were touched. The file list is already in the diff; the description is for the reasons and the consequences that the diff cannot show. If the change fixes a bug, the summary names the symptom a user saw and the root cause that was found, in that order, and links the issue.\n\nAfter the summary comes a section called Why, which explains the problem or the requirement that motivated the change and the alternatives that were considered. The user wants to see at least the one alternative that came closest to being chosen and the reason it lost, because reviewers usually think of it too and otherwise ask in a comment. If the decision depends on a measurement, the numbers go here with the command that produced them, so anyone can run it again.\n\nThen a section called Risk, which says what could break, who would notice and how the change can be undone. A migration, a change to a public API, a new dependency or anything that touches authentication must be called out in this section, even when the risk looks small. When the change is behind a flag, the section names the flag and its default value.\n\nThen a section called Testing, which lists what was run and what was checked by hand. “Tests pass” is not enough: the user wants the new tests named, with one line on what each one proves, and for a bug fix a sentence confirming that the new test failed before the fix. Manual checks are described as steps someone else could repeat, with the environment they ran in.\n\nThe description is written in plain English, in full sentences, without emojis and without marketing words like “seamless” or “robust”. Headings are plain Markdown level two headings. Code identifiers, paths and commands go in backticks. Long logs go in a collapsed details block rather than in the body, so the description stays readable on a phone.\n\nA pull request should do one thing. If the description needs the word “also” to explain a second change, the user would rather receive two pull requests, even if both are small. Refactoring that the change needed goes first, in its own pull request or at least in its own commit, so that the change of behaviour can be reviewed on its own.\n\nThe title follows the same rules as a commit subject: imperative mood, under seventy characters, and starting with the conventional type when the repository uses conventional commits. The description is updated when the change evolves during review; a description that no longer matches the diff is treated as a bug in the pull request.\n\nDraft pull requests are fine for early feedback, but they must say in their first line what kind of feedback is wanted, so reviewers do not spend time on details that are going to change anyway.",
+     "value": "a section called Testing"
+    },
+    {
+     "content": "How the user wants pull request descriptions written.\n\nEvery pull request opens with a summary of two or three sentences that says what changes for someone using the code, not which files were touched. The file list is already in the diff; the description is for the reasons and the consequences that the diff cannot show. If the change fixes a bug, the summary names the symptom a user saw and the root cause that was found, in that order, and links the issue.\n\nAfter the summary comes a section called Why, which explains the problem or the requirement that motivated the change and the alternatives that were considered. The user wants to see at least the one alternative that came closest to being chosen and the reason it lost, because reviewers usually think of it too and otherwise ask in a comment. If the decision depends on a measurement, the numbers go here with the command that produced them, so anyone can run it again.\n\nThen a section called Risk, which says what could break, who would notice and how the change can be undone. A migration, a change to a public API, a new dependency or anything that touches authentication must be called out in this section, even when the risk looks small. When the change is behind a flag, the section names the flag and its default value.\n\nThen a section called Testing, which lists what was run and what was checked by hand. “Tests pass” is not enough: the user wants the new tests named, with one line on what each one proves, and for a bug fix a sentence confirming that the new test failed before the fix. Manual checks are described as steps someone else could repeat, with the environment they ran in.\n\nAfter Testing, the user also wants a section called Out of scope, listing what the pull request deliberately does not do and where that work is tracked, so that a reviewer neither asks for it nor assumes it was forgotten. Each item is one line with a link to its issue.\n\nThe description is written in plain English, in full sentences, without emojis and without marketing words like “seamless” or “robust”. Headings are plain Markdown level two headings. Code identifiers, paths and commands go in backticks. Long logs go in a collapsed details block rather than in the body, so the description stays readable on a phone.\n\nA pull request should do one thing. If the description needs the word “also” to explain a second change, the user would rather receive two pull requests, even if both are small. Refactoring that the change needed goes first, in its own pull request or at least in its own commit, so that the change of behaviour can be reviewed on its own.\n\nThe title follows the same rules as a commit subject: imperative mood, under seventy characters, and starting with the conventional type when the repository uses conventional commits. The description is updated when the change evolves during review; a description that no longer matches the diff is treated as a bug in the pull request.\n\nDraft pull requests are fine for early feedback, but they must say in their first line what kind of feedback is wanted, so reviewers do not spend time on details that are going to change anyway.",
+     "value": "a section called Out of scope",
+     "change": "extend"
+    }
+   ]
+  },
+  {
+   "id": "en-billing-data-model",
+   "lang": "en",
+   "memory_type": "semantic_fact",
+   "topic_key": "billing/data-model",
+   "query": "Which tables make up the billing database and what does each one hold?",
+   "versions": [
+    {
+     "content": "Data model of the billing service (database `billing`, schema `public`), as it is in production.\n\n`customers` holds one row per paying account, keyed by `customer_id`, a UUID shared with the accounts service. It stores the billing email, the country used for tax rules, the currency the customer is invoiced in and the identifier of the customer at the payment provider. Rows are never deleted; a closed account gets `closed_at` set and keeps its history.\n\n`subscriptions` links a customer to a plan. A customer can have several subscriptions over time but only one active at once, which a partial unique index on `customer_id` where `ended_at` is null enforces. Each row stores the plan code, the price at the moment of subscribing, the billing interval, monthly or yearly, and the anchor day that decides when each period starts. A plan change ends the current row and creates a new one, so the table is also the history of plan changes.\n\n`invoices` holds one row per invoice issued. The number is sequential per country, as tax law in several countries requires, and a database sequence per country assigns it when the invoice is finalised, not when the draft is created, so drafts that are thrown away leave no gaps. An invoice has a status that moves from `draft` to `open` to `paid` or `void`, and the amounts are stored in minor units as integers with their currency, never as floating point numbers.\n\n`invoice_lines` holds the lines of each invoice: the subscription period, usage charges and one-off items such as setup fees. Each line stores its own amount, quantity, unit price and the tax rate applied, so an invoice can be reproduced exactly even after tax rates change. The sum of the lines is checked against the invoice total by a constraint trigger.\n\n`payments` records every attempt to collect an invoice, successful or not, with the reference of the provider, the amount, the result and the error code when it failed. One invoice can have many attempts. Webhooks from the provider update this table and are idempotent: the event id of the provider is unique, so a repeated webhook does nothing.\n\n`credit_notes` cancel all or part of an invoice that was already issued, because an issued invoice can never be edited. A credit note references the invoice and the lines it credits, and it gets its own sequential number per country, like invoices.\n\nThe service owns these tables alone. Other services read billing data through its API or through the `billing.invoice_paid` and `billing.invoice_voided` events it publishes; nobody else connects to the database. Reporting reads from a read-only replica that runs a few seconds behind.\n\nMigrations live in `billing-api/migrations/` and run in the deploy pipeline before the new version starts. They must be backwards compatible with the version currently running, so a column is added in one release and only made mandatory in a later one, and a table is dropped only after a full release in which nothing read it.",
+     "value": "`credit_notes`"
+    },
+    {
+     "content": "Data model of the billing service (database `billing`, schema `public`), as it is in production.\n\n`customers` holds one row per paying account, keyed by `customer_id`, a UUID shared with the accounts service. It stores the billing email, the country used for tax rules, the currency the customer is invoiced in and the identifier of the customer at the payment provider. Rows are never deleted; a closed account gets `closed_at` set and keeps its history.\n\n`subscriptions` links a customer to a plan. A customer can have several subscriptions over time but only one active at once, which a partial unique index on `customer_id` where `ended_at` is null enforces. Each row stores the plan code, the price at the moment of subscribing, the billing interval, monthly or yearly, and the anchor day that decides when each period starts. A plan change ends the current row and creates a new one, so the table is also the history of plan changes.\n\n`invoices` holds one row per invoice issued. The number is sequential per country, as tax law in several countries requires, and a database sequence per country assigns it when the invoice is finalised, not when the draft is created, so drafts that are thrown away leave no gaps. An invoice has a status that moves from `draft` to `open` to `paid` or `void`, and the amounts are stored in minor units as integers with their currency, never as floating point numbers.\n\n`invoice_lines` holds the lines of each invoice: the subscription period, usage charges and one-off items such as setup fees. Each line stores its own amount, quantity, unit price and the tax rate applied, so an invoice can be reproduced exactly even after tax rates change. The sum of the lines is checked against the invoice total by a constraint trigger.\n\n`payments` records every attempt to collect an invoice, successful or not, with the reference of the provider, the amount, the result and the error code when it failed. One invoice can have many attempts. Webhooks from the provider update this table and are idempotent: the event id of the provider is unique, so a repeated webhook does nothing.\n\n`credit_notes` cancel all or part of an invoice that was already issued, because an issued invoice can never be edited. A credit note references the invoice and the lines it credits, and it gets its own sequential number per country, like invoices.\n\n`invoice_adjustments` records corrections to an open invoice before it is paid, such as a goodwill discount or a usage charge that was measured twice. Each adjustment references the invoice and, when it applies to a single line, that line; it stores the amount, a reason code and who approved it. Adjustments are only allowed while the invoice is `open`; once it is paid, a correction must be a credit note.\n\nThe service owns these tables alone. Other services read billing data through its API or through the `billing.invoice_paid` and `billing.invoice_voided` events it publishes; nobody else connects to the database. Reporting reads from a read-only replica that runs a few seconds behind.\n\nMigrations live in `billing-api/migrations/` and run in the deploy pipeline before the new version starts. They must be backwards compatible with the version currently running, so a column is added in one release and only made mandatory in a later one, and a table is dropped only after a full release in which nothing read it.",
+     "value": "`invoice_adjustments`",
+     "change": "extend"
+    }
+   ]
+  },
+  {
+   "id": "es-inventory-data-access",
+   "lang": "es",
+   "memory_type": "architectural_decision",
+   "topic_key": "inventario/acceso-a-datos",
+   "query": "¿Cómo accede a la base de datos el servicio de inventario?",
+   "versions": [
+    {
+     "content": "Acceso a datos del servicio de inventario: usamos Diesel como ORM, con el esquema generado en `src/schema.rs` y las consultas armadas con su DSL.",
+     "value": "Diesel"
+    },
+    {
+     "content": "El servicio de inventario dejó el ORM y pasó a sqlx: las consultas se escriben en SQL plano con la macro `query!`, que las comprueba contra la base al compilar, y los modelos son structs propios en `src/models/`.",
+     "value": "sqlx",
+     "change": "rewrite"
+    },
+    {
+     "content": "El servicio de inventario dejó el ORM y pasó a sqlx: las consultas se escriben en SQL plano con la macro `query!`, que las comprueba contra la base al compilar, y los modelos son structs propios en `src/models/`. Las migraciones también quedan en sqlx: viven en `migrations/` y el servicio las aplica al arrancar con `sqlx::migrate!`.",
+     "value": "las aplica al arrancar",
+     "change": "extend"
+    }
+   ]
+  },
+  {
+   "id": "es-identity-provider",
+   "lang": "es",
+   "memory_type": "architectural_decision",
+   "topic_key": "auth/proveedor-de-identidad",
+   "query": "¿Qué proveedor de identidad usa el login de clientes y empleados?",
+   "versions": [
+    {
+     "content": "Proveedor de identidad: el login de clientes y empleados va por Keycloak, que corre en nuestro clúster con un realm por entorno. El cliente OIDC del backend se configura en `config/oidc.yaml`.",
+     "value": "Keycloak"
+    },
+    {
+     "content": "Dejamos de operar el proveedor de identidad propio: el login de clientes y empleados pasa a Auth0, con un tenant por entorno, porque mantener actualizado el servidor anterior nos llevaba dos días por mes. La configuración OIDC del backend sigue en `config/oidc.yaml`.",
+     "value": "Auth0",
+     "change": "rewrite"
+    }
+   ]
+  },
+  {
+   "id": "es-pagination",
+   "lang": "es",
+   "memory_type": "architectural_decision",
+   "topic_key": "api/paginacion",
+   "query": "¿Cómo se paginan los listados de la API?",
+   "versions": [
+    {
+     "content": "Paginación de los listados de la API: por offset, con los parámetros `page` y `page_size` (como máximo 100), y la respuesta trae el total de filas en `total`.",
+     "value": "por offset"
+    },
+    {
+     "content": "Los listados de la API se paginan ahora con un cursor opaco: la respuesta trae `next_cursor` y el cliente lo devuelve en `cursor` para pedir la página siguiente. Ya no se calcula el total, que en las tablas grandes obligaba a recorrerlas enteras.",
+     "value": "cursor opaco",
+     "change": "rewrite"
+    }
+   ]
+  },
+  {
+   "id": "es-feature-flags",
+   "lang": "es",
+   "memory_type": "architectural_decision",
+   "topic_key": "release/feature-flags",
+   "query": "¿Dónde se definen las feature flags y cómo se cambian?",
+   "versions": [
+    {
+     "content": "Feature flags: se definen en `config/flags.yaml`, dentro del repositorio, y cambiar una exige un deploy. Cada flag lleva un dueño y una fecha de vencimiento.",
+     "value": "dentro del repositorio"
+    },
+    {
+     "content": "Las feature flags pasaron a un servidor Unleash propio: se prenden y se apagan desde su consola sin desplegar, por entorno o por porcentaje de usuarios, y el SDK del backend las consulta cada 15 segundos. Cada flag sigue teniendo dueño y fecha de vencimiento.",
+     "value": "servidor Unleash",
+     "change": "rewrite"
+    }
+   ]
+  },
+  {
+   "id": "es-web-translations",
+   "lang": "es",
+   "memory_type": "architectural_decision",
+   "topic_key": "web/traducciones",
+   "query": "¿Cómo se organizan las traducciones de la app web?",
+   "versions": [
+    {
+     "content": "Traducciones de la app web: un archivo JSON por idioma en `locales/`, con claves planas como `checkout.pay_button`, que carga i18next al iniciar.",
+     "value": "un archivo JSON por idioma"
+    },
+    {
+     "content": "Traducciones de la app web: un archivo Fluent por idioma en `locales/`, con claves planas como `checkout.pay_button`, que carga i18next al iniciar.",
+     "value": "un archivo Fluent por idioma",
+     "change": "value"
+    },
+    {
+     "content": "Traducciones de la app web: un archivo Fluent por idioma en `locales/`, con claves planas como `checkout.pay_button`, que carga i18next al iniciar. Si a un idioma le falta una clave, se muestra el texto en español neutro, el idioma de referencia.",
+     "value": "español neutro",
+     "change": "extend"
+    }
+   ]
+  },
+  {
+   "id": "es-catalog-search",
+   "lang": "es",
+   "memory_type": "architectural_decision",
+   "topic_key": "search/catalogo",
+   "query": "¿Con qué motor se busca en el catálogo de productos?",
+   "versions": [
+    {
+     "content": "Búsqueda del catálogo de productos: un índice en Elasticsearch 8, alimentado desde la base por un consumidor de los eventos `product.updated`.",
+     "value": "Elasticsearch 8"
+    },
+    {
+     "content": "Búsqueda del catálogo de productos: un índice en OpenSearch 2, alimentado desde la base por un consumidor de los eventos `product.updated`.",
+     "value": "OpenSearch 2",
+     "change": "value"
+    },
+    {
+     "content": "Búsqueda del catálogo de productos: un índice en OpenSearch 2, alimentado desde la base por un consumidor de los eventos `product.updated`. Los sinónimos, como «celular» y «móvil», se cargan desde `search/synonyms.txt` y se aplican al consultar, no al indexar.",
+     "value": "Los sinónimos",
+     "change": "extend"
+    }
+   ]
+  },
+  {
+   "id": "es-timestamps",
+   "lang": "es",
+   "memory_type": "architectural_decision",
+   "topic_key": "data/fechas-y-horas",
+   "query": "¿Cómo se guardan y se muestran las fechas y las horas?",
+   "versions": [
+    {
+     "content": "Fechas y horas: se guardan siempre en UTC, en columnas `timestamptz`, y la API las devuelve en ISO 8601 con la `Z` final.",
+     "value": "siempre en UTC"
+    },
+    {
+     "content": "Fechas y horas: se guardan siempre en UTC, en columnas `timestamptz`, y la API las devuelve en ISO 8601 con la `Z` final. La app las muestra en la zona horaria del usuario, que se guarda en su perfil (`users.time_zone`), y nunca en la del servidor.",
+     "value": "zona horaria del usuario",
+     "change": "extend"
+    }
+   ]
+  },
+  {
+   "id": "es-database-backups",
+   "lang": "es",
+   "memory_type": "architectural_decision",
+   "topic_key": "ops/respaldos",
+   "query": "¿Cada cuánto se respalda la base de producción y cuánto tiempo se guardan los respaldos?",
+   "versions": [
+    {
+     "content": "Respaldos de la base de producción: un snapshot diario a las 04:00 UTC con retención de 7 días, y una prueba de restauración el primer lunes de cada mes en un entorno aparte, que mide cuánto tarda en volver a estar lista. El script es `ops/backup.sh` y avisa en el canal de guardia si falla.",
+     "value": "retención de 7 días"
+    },
+    {
+     "content": "Respaldos de la base de producción: un snapshot diario a las 04:00 UTC con retención de 35 días, y una prueba de restauración el primer lunes de cada mes en un entorno aparte, que mide cuánto tarda en volver a estar lista. El script es `ops/backup.sh` y avisa en el canal de guardia si falla.",
+     "value": "retención de 35 días",
+     "change": "value"
+    }
+   ]
+  },
+  {
+   "id": "es-branch-names",
+   "lang": "es",
+   "memory_type": "user_preference",
+   "topic_key": "git/nombres-de-ramas",
+   "query": "¿Cómo quiere el usuario que se llamen las ramas de Git?",
+   "versions": [
+    {
+     "content": "Nombres de ramas: el usuario quiere `feature/<ticket>-<descripcion>`, por ejemplo `feature/inv-231-stock-negativo`.",
+     "value": "`feature/<ticket>-<descripcion>`"
+    },
+    {
+     "content": "Nombres de ramas: el usuario quiere `feat/<ticket>-<descripcion>`, por ejemplo `feat/inv-231-stock-negativo`.",
+     "value": "`feat/<ticket>-<descripcion>`",
+     "change": "value"
+    },
+    {
+     "content": "Nombres de ramas: el usuario quiere `feat/<ticket>-<descripcion>`, por ejemplo `feat/inv-231-stock-negativo`. Todo en minúsculas y con 40 caracteres como máximo.",
+     "value": "40 caracteres como máximo",
+     "change": "extend"
+    }
+   ]
+  },
+  {
+   "id": "es-pull-request-size",
+   "lang": "es",
+   "memory_type": "user_preference",
+   "topic_key": "review/tamano-de-pr",
+   "query": "¿Qué tamaño máximo quiere el usuario para los pull requests?",
+   "versions": [
+    {
+     "content": "Tamaño de los pull requests: el usuario pide que no pasen de 400 líneas cambiadas, sin contar los archivos generados; un cambio más grande se parte en varios.",
+     "value": "400 líneas"
+    },
+    {
+     "content": "El usuario bajó el límite de los pull requests a 250 líneas, porque los de más de eso los terminaba revisando por encima. Los archivos generados y los lockfiles siguen sin contar.",
+     "value": "250 líneas",
+     "change": "rewrite"
+    }
+   ]
+  },
+  {
+   "id": "es-code-formatter",
+   "lang": "es",
+   "memory_type": "user_preference",
+   "topic_key": "style/formateador",
+   "query": "¿Con qué herramienta quiere el usuario que se formatee el código al guardar?",
+   "versions": [
+    {
+     "content": "Formateo de código: el usuario quiere que el editor formatee al guardar con Prettier, usando la configuración del repositorio y no la del editor.",
+     "value": "Prettier"
+    },
+    {
+     "content": "Formateo de código: el usuario quiere que el editor formatee al guardar con Biome, usando la configuración del repositorio y no la del editor.",
+     "value": "Biome",
+     "change": "value"
+    }
+   ]
+  },
+  {
+   "id": "es-deploy-window",
+   "lang": "es",
+   "memory_type": "user_preference",
+   "topic_key": "deploy/ventana",
+   "query": "¿Cuándo no quiere el usuario que se despliegue a producción?",
+   "versions": [
+    {
+     "content": "Ventana de despliegues: el usuario no quiere desplegar a producción los viernes después de las 15:00, hora local.",
+     "value": "después de las 15:00"
+    },
+    {
+     "content": "Ventana de despliegues: el usuario no quiere desplegar a producción los viernes después de las 12:00, hora local.",
+     "value": "después de las 12:00",
+     "change": "value"
+    },
+    {
+     "content": "Ventana de despliegues: el usuario no quiere desplegar a producción los viernes después de las 12:00, hora local. Tampoco la víspera de un feriado.",
+     "value": "víspera de un feriado",
+     "change": "extend"
+    }
+   ]
+  },
+  {
+   "id": "es-database-size",
+   "lang": "es",
+   "memory_type": "semantic_fact",
+   "topic_key": "db/tamano",
+   "query": "¿Cuánto espacio ocupa la base de datos de producción?",
+   "versions": [
+    {
+     "content": "La base de producción ocupa unos 120 GB, y la tabla `events` es casi la mitad.",
+     "value": "unos 120 GB"
+    },
+    {
+     "content": "Después de pasar los eventos viejos al data warehouse, la base de producción quedó en alrededor de 80 GB; la tabla más grande ahora es `orders`.",
+     "value": "alrededor de 80 GB",
+     "change": "rewrite"
+    }
+   ]
+  },
+  {
+   "id": "es-billing-cron",
+   "lang": "es",
+   "memory_type": "semantic_fact",
+   "topic_key": "billing/cron-mensual",
+   "query": "¿A qué hora corre el job de facturación mensual?",
+   "versions": [
+    {
+     "content": "El job de facturación mensual corre a las 02:00 UTC del primer día de cada mes, desde el cron de `billing-worker`.",
+     "value": "a las 02:00 UTC"
+    },
+    {
+     "content": "El job de facturación mensual corre a las 03:30 UTC del primer día de cada mes, desde el cron de `billing-worker`.",
+     "value": "a las 03:30 UTC",
+     "change": "value"
+    },
+    {
+     "content": "El job de facturación mensual corre a las 03:30 UTC del primer día de cada mes, desde el cron de `billing-worker`. Si falla, reintenta solo a las 05:00 UTC y avisa en el canal de guardia.",
+     "value": "reintenta solo",
+     "change": "extend"
+    }
+   ]
+  },
+  {
+   "id": "es-notifications-owner",
+   "lang": "es",
+   "memory_type": "semantic_fact",
+   "topic_key": "ownership/notificaciones",
+   "query": "¿Qué equipo mantiene el servicio de notificaciones?",
+   "versions": [
+    {
+     "content": "El servicio de notificaciones (correo, push y SMS) lo mantiene el equipo de Plataforma, y las alertas de su guardia van a ese equipo.",
+     "value": "equipo de Plataforma"
+    },
+    {
+     "content": "Desde la reorganización, el servicio de notificaciones pasó al equipo de Crecimiento, que ahora atiende su guardia y decide qué canales se agregan.",
+     "value": "equipo de Crecimiento",
+     "change": "rewrite"
+    }
+   ]
+  },
+  {
+   "id": "es-upload-limit",
+   "lang": "es",
+   "memory_type": "semantic_fact",
+   "topic_key": "uploads/limite-de-tamano",
+   "query": "¿Cuál es el tamaño máximo de un archivo que se sube a la app?",
+   "versions": [
+    {
+     "content": "El límite de subida de la app es de 10 MB por archivo: lo aplica nginx con `client_max_body_size` y la API lo vuelve a comprobar.",
+     "value": "10 MB"
+    },
+    {
+     "content": "El límite de subida de la app es de 25 MB por archivo: lo aplica nginx con `client_max_body_size` y la API lo vuelve a comprobar.",
+     "value": "25 MB",
+     "change": "value"
+    },
+    {
+     "content": "El límite de subida depende ahora del plan: 25 MB por archivo en el gratuito y 100 MB en los pagos. nginx deja pasar hasta 100 MB y la API aplica el límite del plan de cada cuenta.",
+     "value": "depende ahora del plan",
+     "change": "rewrite"
+    }
+   ]
+  },
+  {
+   "id": "es-user-file-storage",
+   "lang": "es",
+   "memory_type": "architectural_decision",
+   "topic_key": "storage/archivos-de-usuarios",
+   "query": "¿Dónde y cómo se guardan los archivos que suben los usuarios?",
+   "versions": [
+    {
+     "content": "Almacenamiento de los archivos que suben los usuarios: adjuntos de pedidos, fotos de productos y comprobantes.\n\nLos archivos van a un bucket de S3 por entorno, `acme-uploads-prod`, `acme-uploads-staging` y `acme-uploads-dev`, y nunca al disco de los servidores de la API. La API no recibe el contenido: cuando el cliente quiere subir algo, pide una URL firmada a `POST /uploads`, que valida el tipo y el tamaño declarados, y sube el archivo directo a S3 con esa URL. La URL firmada vale diez minutos y sirve para un solo objeto, con la clave ya decidida por la API.\n\nLas claves de los objetos siguen el esquema `<tipo>/<id de cuenta>/<año>/<mes>/<uuid>.<extensión>`. El nombre original del archivo no forma parte de la clave, porque puede traer caracteres que rompen las herramientas y a veces datos personales; se guarda aparte, en la tabla `uploads`, junto con el tipo de contenido, el tamaño, el hash SHA-256 y la cuenta dueña.\n\nTodo se cifra en reposo con una clave de KMS propia por entorno, no con la clave administrada por defecto, para poder revocar el acceso de un entorno completo sin tocar los otros. El bucket bloquea todo acceso público, y la única forma de leer un objeto es una URL firmada de lectura que genera la API después de comprobar que quien la pide puede ver ese archivo. Esas URL de lectura valen cinco minutos.\n\nCuando termina la subida, S3 publica un evento que consume el worker de archivos. El worker comprueba que el tamaño y el hash coinciden con lo declarado, pasa el archivo por el antivirus y, si es una imagen, genera las miniaturas en tres tamaños, que se guardan en el mismo bucket bajo el prefijo `thumbs/`. Hasta que el worker lo marca como revisado, el archivo no se muestra a nadie más que a quien lo subió.\n\nEl ciclo de vida del bucket mueve los objetos a la clase de almacenamiento Glacier Instant Retrieval a los 90 días de su última modificación, porque casi nadie abre un adjunto viejo y el costo por gigabyte baja mucho. Los objetos que el usuario borra se eliminan de verdad a los treinta días, para poder deshacer un borrado por error, y las versiones anteriores de un objeto se guardan sólo una semana.\n\nLos comprobantes fiscales son la excepción: la ley obliga a conservarlos varios años, así que viven en un prefijo `fiscal/` con una regla de retención propia y bloqueo de objetos en modo de cumplimiento, que impide borrarlos antes de tiempo incluso a un administrador.\n\nLa configuración del bucket, las reglas de ciclo de vida y las políticas de acceso están escritas en Terraform en `infra/storage/` y se aplican desde el pipeline; nadie las cambia a mano desde la consola.\n\nSe eligió este esquema después de que una versión anterior guardara los adjuntos en el disco de la API y se perdieran todos al reemplazar las instancias en una actualización del sistema operativo.",
+     "value": "a los 90 días"
+    },
+    {
+     "content": "Almacenamiento de los archivos que suben los usuarios: adjuntos de pedidos, fotos de productos y comprobantes.\n\nLos archivos van a un bucket de S3 por entorno, `acme-uploads-prod`, `acme-uploads-staging` y `acme-uploads-dev`, y nunca al disco de los servidores de la API. La API no recibe el contenido: cuando el cliente quiere subir algo, pide una URL firmada a `POST /uploads`, que valida el tipo y el tamaño declarados, y sube el archivo directo a S3 con esa URL. La URL firmada vale diez minutos y sirve para un solo objeto, con la clave ya decidida por la API.\n\nLas claves de los objetos siguen el esquema `<tipo>/<id de cuenta>/<año>/<mes>/<uuid>.<extensión>`. El nombre original del archivo no forma parte de la clave, porque puede traer caracteres que rompen las herramientas y a veces datos personales; se guarda aparte, en la tabla `uploads`, junto con el tipo de contenido, el tamaño, el hash SHA-256 y la cuenta dueña.\n\nTodo se cifra en reposo con una clave de KMS propia por entorno, no con la clave administrada por defecto, para poder revocar el acceso de un entorno completo sin tocar los otros. El bucket bloquea todo acceso público, y la única forma de leer un objeto es una URL firmada de lectura que genera la API después de comprobar que quien la pide puede ver ese archivo. Esas URL de lectura valen cinco minutos.\n\nCuando termina la subida, S3 publica un evento que consume el worker de archivos. El worker comprueba que el tamaño y el hash coinciden con lo declarado, pasa el archivo por el antivirus y, si es una imagen, genera las miniaturas en tres tamaños, que se guardan en el mismo bucket bajo el prefijo `thumbs/`. Hasta que el worker lo marca como revisado, el archivo no se muestra a nadie más que a quien lo subió.\n\nEl ciclo de vida del bucket mueve los objetos a la clase de almacenamiento Glacier Instant Retrieval a los 180 días de su última modificación, porque casi nadie abre un adjunto viejo y el costo por gigabyte baja mucho. Los objetos que el usuario borra se eliminan de verdad a los treinta días, para poder deshacer un borrado por error, y las versiones anteriores de un objeto se guardan sólo una semana.\n\nLos comprobantes fiscales son la excepción: la ley obliga a conservarlos varios años, así que viven en un prefijo `fiscal/` con una regla de retención propia y bloqueo de objetos en modo de cumplimiento, que impide borrarlos antes de tiempo incluso a un administrador.\n\nLa configuración del bucket, las reglas de ciclo de vida y las políticas de acceso están escritas en Terraform en `infra/storage/` y se aplican desde el pipeline; nadie las cambia a mano desde la consola.\n\nSe eligió este esquema después de que una versión anterior guardara los adjuntos en el disco de la API y se perdieran todos al reemplazar las instancias en una actualización del sistema operativo.",
+     "value": "a los 180 días",
+     "change": "value"
+    },
+    {
+     "content": "Almacenamiento de los archivos que suben los usuarios: adjuntos de pedidos, fotos de productos y comprobantes.\n\nLos archivos van a un bucket de S3 por entorno, `acme-uploads-prod`, `acme-uploads-staging` y `acme-uploads-dev`, y nunca al disco de los servidores de la API. La API no recibe el contenido: cuando el cliente quiere subir algo, pide una URL firmada a `POST /uploads`, que valida el tipo y el tamaño declarados, y sube el archivo directo a S3 con esa URL. La URL firmada vale diez minutos y sirve para un solo objeto, con la clave ya decidida por la API.\n\nLas claves de los objetos siguen el esquema `<tipo>/<id de cuenta>/<año>/<mes>/<uuid>.<extensión>`. El nombre original del archivo no forma parte de la clave, porque puede traer caracteres que rompen las herramientas y a veces datos personales; se guarda aparte, en la tabla `uploads`, junto con el tipo de contenido, el tamaño, el hash SHA-256 y la cuenta dueña.\n\nTodo se cifra en reposo con una clave de KMS propia por entorno, no con la clave administrada por defecto, para poder revocar el acceso de un entorno completo sin tocar los otros. El bucket bloquea todo acceso público, y la única forma de leer un objeto es una URL firmada de lectura que genera la API después de comprobar que quien la pide puede ver ese archivo. Esas URL de lectura valen cinco minutos.\n\nCuando termina la subida, S3 publica un evento que consume el worker de archivos. El worker comprueba que el tamaño y el hash coinciden con lo declarado, pasa el archivo por el antivirus y, si es una imagen, genera las miniaturas en tres tamaños, que se guardan en el mismo bucket bajo el prefijo `thumbs/`. Hasta que el worker lo marca como revisado, el archivo no se muestra a nadie más que a quien lo subió.\n\nEl ciclo de vida del bucket mueve los objetos a la clase de almacenamiento Glacier Instant Retrieval a los 180 días de su última modificación, porque casi nadie abre un adjunto viejo y el costo por gigabyte baja mucho. Los objetos que el usuario borra se eliminan de verdad a los treinta días, para poder deshacer un borrado por error, y las versiones anteriores de un objeto se guardan sólo una semana.\n\nLos comprobantes fiscales son la excepción: la ley obliga a conservarlos varios años, así que viven en un prefijo `fiscal/` con una regla de retención propia y bloqueo de objetos en modo de cumplimiento, que impide borrarlos antes de tiempo incluso a un administrador.\n\nAdemás, el bucket de producción tiene replicación entre regiones hacia `acme-uploads-prod-dr`, en otra región y con su propia clave de KMS, para seguir sirviendo archivos si la región principal cae. La réplica es de sólo lectura y el procedimiento de recuperación ante desastres la promueve a principal.\n\nLa configuración del bucket, las reglas de ciclo de vida y las políticas de acceso están escritas en Terraform en `infra/storage/` y se aplican desde el pipeline; nadie las cambia a mano desde la consola.\n\nSe eligió este esquema después de que una versión anterior guardara los adjuntos en el disco de la API y se perdieran todos al reemplazar las instancias en una actualización del sistema operativo.",
+     "value": "replicación entre regiones",
+     "change": "extend"
+    }
+   ]
+  },
+  {
+   "id": "es-mobile-framework",
+   "lang": "es",
+   "memory_type": "architectural_decision",
+   "topic_key": "mobile/framework",
+   "query": "¿Con qué framework se construye la app móvil de clientes?",
+   "versions": [
+    {
+     "content": "Framework de la app móvil de clientes, para iOS y Android.\n\nPara la primera versión de la app móvil evaluamos durante dos semanas las dos opciones multiplataforma más usadas y elegimos React Native, con Expo como base del proyecto y su servicio de compilación en la nube para generar los binarios de las dos tiendas. La alternativa de escribir dos apps nativas quedó descartada porque el equipo móvil es de tres personas y mantener dos bases de código duplicaría cada cambio.\n\nEl motivo principal es que el equipo web ya trabaja todos los días con TypeScript y React. Con React Native, los desarrolladores web pueden revisar y escribir código de la app desde el primer día, y podemos compartir con la web la capa de acceso a la API, los tipos generados desde el esquema OpenAPI, la validación de formularios y la lógica de precios y descuentos, que hoy vive en el paquete `@acme/pricing`. Esa lógica es la parte más delicada del producto, y tenerla una sola vez evita que la app y la web calculen distinto un mismo carrito.\n\nEl segundo motivo son las actualizaciones por aire. Con Expo podemos publicar correcciones de JavaScript sin pasar por la revisión de las tiendas, siempre que no cambien el código nativo, y eso nos da una forma rápida de arreglar un error de texto o de lógica en horas en vez de días.\n\nLas desventajas que aceptamos son conocidas. El rendimiento de las animaciones complejas y de las listas muy largas exige cuidado: usamos `FlashList` para los listados de productos y Reanimated para las animaciones, y evitamos los cálculos pesados en el hilo de JavaScript. Algunas funciones del sistema, como los pagos con la billetera del teléfono y el escáner de códigos de barras, necesitan módulos nativos; para cada una usamos primero el módulo de Expo, si existe, y sólo escribimos uno propio cuando no hay una alternativa mantenida.\n\nLa navegación usa Expo Router, con rutas basadas en archivos dentro de `app/`, que se parece a cómo está organizada la web y facilita los enlaces profundos desde los correos y las notificaciones. El estado del servidor se maneja con TanStack Query, igual que en la web, y el estado local de cada pantalla con hooks; no hay un store global.\n\nLas pruebas siguen el mismo criterio que en la web: pruebas unitarias con Jest para la lógica compartida, pruebas de componentes con Testing Library y un conjunto pequeño de pruebas de punta a punta con Maestro, que corren en el pipeline sobre un emulador de Android y un simulador de iOS antes de cada publicación.\n\nLa versión mínima soportada es iOS 15 y Android 8, que cubre más del noventa y cinco por ciento de los clientes según las estadísticas de la web móvil.\n\nRevisaremos la decisión si el rendimiento en los teléfonos Android de gama baja no llega a sesenta cuadros por segundo en el listado de productos, que es la pantalla más usada de la app.",
+     "value": "elegimos React Native"
+    },
+    {
+     "content": "Framework de la app móvil de clientes, revisado después del piloto en Android.\n\nEl piloto no alcanzó el rendimiento que nos habíamos puesto como condición: en los teléfonos Android de gama baja, el listado de productos con imágenes se quedaba en unos cuarenta cuadros por segundo, y las animaciones del carrito se cortaban cuando llegaban datos de la API. Después de un mes de optimizaciones el problema seguía, así que repetimos la evaluación con un prototipo de las tres pantallas principales y elegimos Flutter para la versión que se publica en las tiendas.\n\nFlutter dibuja toda la interfaz con su propio motor en vez de usar los componentes del sistema, y en el prototipo el mismo listado se mantuvo en sesenta cuadros por segundo en los mismos teléfonos, sin trucos especiales. Además, como la app se compila a código nativo, el arranque en frío bajó de casi tres segundos a poco más de uno, que era la otra queja frecuente de los clientes del piloto.\n\nEl costo principal es el lenguaje. La app se escribe en Dart, que nadie del equipo conocía, y ya no podemos compartir código con la web. Para no duplicar la lógica de precios y descuentos, que es la parte más delicada del producto, esa lógica pasa al backend: el carrito se calcula siempre en la API con `POST /carts/quote`, y tanto la web como la app muestran lo que la API devuelve. Los tipos de la API se generan en Dart desde el mismo esquema OpenAPI que usa la web, con `openapi-generator`, así que un cambio de contrato se nota en las dos al compilar.\n\nPerdemos las actualizaciones por aire. Las correcciones pasan por la revisión de las tiendas, que hoy tarda uno o dos días, y para los textos y las reglas que cambian seguido usamos configuración remota: la app los pide al arrancar y los guarda en caché, de modo que podemos cambiarlos sin publicar una versión nueva.\n\nLa arquitectura interna sigue un esquema por funcionalidades dentro de `lib/features/`, cada una con su capa de datos, su lógica y sus pantallas. El estado se maneja con Riverpod, la navegación con `go_router`, y los enlaces profundos desde los correos y las notificaciones se declaran en el mismo lugar que las rutas.\n\nLas pruebas son de tres tipos: pruebas unitarias de la lógica de cada funcionalidad, pruebas de widgets para las pantallas y un conjunto chico de pruebas de integración que corren en el pipeline sobre un emulador de Android y un simulador de iOS antes de cada publicación. Las pruebas de punta a punta con Maestro se conservan, porque no dependen del framework.\n\nLa versión mínima sigue siendo iOS 15 y Android 8. Dos personas del equipo hacen un curso de Dart antes de empezar, y durante el primer mes todo el código se revisa en pareja para que el resto aprenda las convenciones del lenguaje y del framework al mismo tiempo que se escribe la app.",
+     "value": "elegimos Flutter",
+     "change": "rewrite"
+    }
+   ]
+  },
+  {
+   "id": "es-technical-writing",
+   "lang": "es",
+   "memory_type": "user_preference",
+   "topic_key": "docs/estilo-de-escritura",
+   "query": "¿Cómo quiere el usuario que se escriba la documentación técnica?",
+   "versions": [
+    {
+     "content": "Cómo quiere el usuario que se escriba la documentación técnica del proyecto: los README, los documentos de diseño y las guías de `docs/`.\n\nCada documento empieza diciendo para quién es y qué va a poder hacer esa persona después de leerlo, en una o dos oraciones. Si el lector no es quien el documento supone, tiene que darse cuenta en la primera línea y no a la mitad. El README de un servicio, por ejemplo, empieza con qué hace el servicio y quién lo usa, y recién después explica cómo se instala.\n\nEl usuario prefiere oraciones cortas, en voz activa y en presente: «el worker reintenta tres veces», no «los reintentos son realizados por el worker». Cada párrafo trata una sola idea. Las palabras vagas como «fácil», «simplemente» u «obviamente» no van, porque lo que es fácil para quien escribe no lo es para quien lee, y porque no agregan información.\n\nTodo lo que se puede copiar va en bloques de código: comandos, rutas, nombres de variables de entorno y fragmentos de configuración. Un comando se escribe completo, como se pega en la terminal, sin el símbolo del prompt, y con una línea antes que dice qué hace y desde qué directorio se corre. Si un comando necesita un valor que el lector tiene que reemplazar, el valor va entre ángulos, como `<id de cuenta>`, y se explica de dónde sale.\n\nLos ejemplos tienen que ser reales y funcionar. Un ejemplo que no se probó con la versión actual es peor que no tener ejemplo, porque el lector confía en él. Cuando un documento muestra la salida de un comando, es la salida de verdad, recortada si hace falta, pero no inventada.\n\nLas decisiones se explican con su motivo y con la alternativa que se descartó. Un documento de diseño que dice qué se eligió pero no por qué obliga a repetir la discusión cada vez que alguien nuevo llega al proyecto. El motivo tiene que ser concreto: un número medido, una restricción del negocio o un incidente, y no «es la mejor práctica».\n\nLas listas se usan para cosas que son de verdad una lista, como pasos en orden o requisitos independientes. Una explicación con causas y consecuencias se escribe en párrafos, porque una lista de viñetas esconde la relación entre las ideas. Las tablas sirven para comparar opciones con los mismos criterios, y no para acomodar texto largo.\n\nNo se usan emojis, ni signos de exclamación, ni negritas para enfatizar frases enteras. Los títulos son cortos y describen el contenido de la sección en lugar de anunciarla: «Cómo se rota la clave», y no «Rotación de claves: todo lo que necesitás saber».\n\nLa documentación vive en el mismo repositorio que el código y se cambia en el mismo pull request que el comportamiento que describe. Un cambio que deja un documento desactualizado no está terminado. Los documentos viejos que ya no describen nada se borran en lugar de marcarse como obsoletos, porque la historia ya queda en Git.\n\nCuando un documento supera las mil palabras, el usuario quiere al principio un índice con enlaces a cada sección, y al final una lista corta de los documentos relacionados que conviene leer después.",
+     "value": "Las tablas sirven para comparar opciones"
+    },
+    {
+     "content": "Cómo quiere el usuario que se escriba la documentación técnica del proyecto: los README, los documentos de diseño y las guías de `docs/`.\n\nCada documento empieza diciendo para quién es y qué va a poder hacer esa persona después de leerlo, en una o dos oraciones. Si el lector no es quien el documento supone, tiene que darse cuenta en la primera línea y no a la mitad. El README de un servicio, por ejemplo, empieza con qué hace el servicio y quién lo usa, y recién después explica cómo se instala.\n\nEl usuario prefiere oraciones cortas, en voz activa y en presente: «el worker reintenta tres veces», no «los reintentos son realizados por el worker». Cada párrafo trata una sola idea. Las palabras vagas como «fácil», «simplemente» u «obviamente» no van, porque lo que es fácil para quien escribe no lo es para quien lee, y porque no agregan información.\n\nTodo lo que se puede copiar va en bloques de código: comandos, rutas, nombres de variables de entorno y fragmentos de configuración. Un comando se escribe completo, como se pega en la terminal, sin el símbolo del prompt, y con una línea antes que dice qué hace y desde qué directorio se corre. Si un comando necesita un valor que el lector tiene que reemplazar, el valor va entre ángulos, como `<id de cuenta>`, y se explica de dónde sale.\n\nLos ejemplos tienen que ser reales y funcionar. Un ejemplo que no se probó con la versión actual es peor que no tener ejemplo, porque el lector confía en él. Cuando un documento muestra la salida de un comando, es la salida de verdad, recortada si hace falta, pero no inventada.\n\nLas decisiones se explican con su motivo y con la alternativa que se descartó. Un documento de diseño que dice qué se eligió pero no por qué obliga a repetir la discusión cada vez que alguien nuevo llega al proyecto. El motivo tiene que ser concreto: un número medido, una restricción del negocio o un incidente, y no «es la mejor práctica».\n\nLas listas se usan para cosas que son de verdad una lista, como pasos en orden o requisitos independientes. Una explicación con causas y consecuencias se escribe en párrafos, porque una lista de viñetas esconde la relación entre las ideas. Las tablas sirven para comparar opciones con los mismos criterios, y no para acomodar texto largo.\n\nLos diagramas de arquitectura y de secuencia se escriben como diagramas en Mermaid dentro del mismo Markdown, y no como imágenes exportadas de otra herramienta, para que se puedan revisar y cambiar en el pull request igual que el texto. Cada diagrama lleva debajo una oración que dice qué muestra.\n\nNo se usan emojis, ni signos de exclamación, ni negritas para enfatizar frases enteras. Los títulos son cortos y describen el contenido de la sección en lugar de anunciarla: «Cómo se rota la clave», y no «Rotación de claves: todo lo que necesitás saber».\n\nLa documentación vive en el mismo repositorio que el código y se cambia en el mismo pull request que el comportamiento que describe. Un cambio que deja un documento desactualizado no está terminado. Los documentos viejos que ya no describen nada se borran en lugar de marcarse como obsoletos, porque la historia ya queda en Git.\n\nCuando un documento supera las mil palabras, el usuario quiere al principio un índice con enlaces a cada sección, y al final una lista corta de los documentos relacionados que conviene leer después.",
+     "value": "diagramas en Mermaid",
+     "change": "extend"
+    }
+   ]
+  },
+  {
+   "id": "es-usage-event-pipeline",
+   "lang": "es",
+   "memory_type": "semantic_fact",
+   "topic_key": "events/pipeline-de-ingesta",
+   "query": "¿Cómo funciona el pipeline de ingesta de eventos de uso?",
+   "versions": [
+    {
+     "content": "Cómo funciona hoy el pipeline de ingesta de eventos de uso: los clics, las búsquedas y las vistas de producto que mandan las apps.\n\nLa app web y la app móvil mandan los eventos en lotes de hasta cincuenta a `POST /events`, un endpoint del servicio `collector` que sólo valida el formato contra el esquema JSON de cada tipo de evento, agrega la hora de recepción y la versión del esquema, y publica cada evento en el tópico de Kafka `events.raw`. El collector responde 202 apenas Kafka confirma la escritura; si Kafka no está disponible, guarda el lote en un buffer local de hasta cinco minutos y responde igual, y si el buffer se llena responde 503 para que el cliente reintente más tarde.\n\nEl tópico `events.raw` tiene 12 particiones y la clave de partición es el id de sesión, así que todos los eventos de una misma sesión caen en la misma partición y se procesan en orden. La retención del tópico es de siete días, que es el margen que tenemos para reprocesar si un consumidor tiene un error.\n\nEl consumidor principal es el servicio `enricher`, que corre como un grupo de consumidores con, como mucho, una réplica por partición. A cada evento le agrega datos que la app no conoce o no debe mandar: el país a partir de la IP, el segmento del cliente y el id interno del producto cuando el evento trae sólo el código público. El resultado se publica en el tópico `events.enriched`, con el mismo esquema más los campos nuevos.\n\nLos eventos que no pasan la validación del enricher, por ejemplo porque el producto no existe, no se descartan: van al tópico `events.dead` con el motivo del rechazo, y un tablero muestra cuántos llegan por tipo. Si la proporción pasa del uno por ciento durante diez minutos, salta una alerta para el equipo de datos.\n\nDesde `events.enriched` hay dos consumidores. Uno escribe los eventos en el data warehouse en archivos Parquet particionados por día, que se cargan cada quince minutos; de ahí salen los informes de producto y los modelos de recomendación. El otro alimenta los contadores en tiempo real que muestra la app, como «visto por tantas personas hoy», guardados en Redis con expiración de veinticuatro horas.\n\nLos esquemas de los eventos viven en el repositorio `event-schemas`, versionados, y un cambio incompatible exige un tipo de evento nuevo en lugar de modificar el existente. El collector rechaza un evento con una versión de esquema que no conoce, y la app no puede mandar un evento nuevo hasta que su esquema está publicado.\n\nLa identidad del usuario nunca viaja en el evento: la app manda un id de sesión y, si el usuario inició sesión, un id seudónimo que sólo el servicio de cuentas puede traducir. La IP se usa para obtener el país y se descarta en el enricher, antes de escribir en `events.enriched`.\n\nEn un día normal el pipeline recibe unos cuarenta millones de eventos, con picos de dos mil por segundo durante las campañas, y entre que la app manda un evento y que aparece en los contadores en tiempo real pasan menos de diez segundos.",
+     "value": "12 particiones"
+    },
+    {
+     "content": "Cómo funciona hoy el pipeline de ingesta de eventos de uso: los clics, las búsquedas y las vistas de producto que mandan las apps.\n\nLa app web y la app móvil mandan los eventos en lotes de hasta cincuenta a `POST /events`, un endpoint del servicio `collector` que sólo valida el formato contra el esquema JSON de cada tipo de evento, agrega la hora de recepción y la versión del esquema, y publica cada evento en el tópico de Kafka `events.raw`. El collector responde 202 apenas Kafka confirma la escritura; si Kafka no está disponible, guarda el lote en un buffer local de hasta cinco minutos y responde igual, y si el buffer se llena responde 503 para que el cliente reintente más tarde.\n\nEl tópico `events.raw` tiene 24 particiones y la clave de partición es el id de sesión, así que todos los eventos de una misma sesión caen en la misma partición y se procesan en orden. La retención del tópico es de siete días, que es el margen que tenemos para reprocesar si un consumidor tiene un error.\n\nEl consumidor principal es el servicio `enricher`, que corre como un grupo de consumidores con, como mucho, una réplica por partición. A cada evento le agrega datos que la app no conoce o no debe mandar: el país a partir de la IP, el segmento del cliente y el id interno del producto cuando el evento trae sólo el código público. El resultado se publica en el tópico `events.enriched`, con el mismo esquema más los campos nuevos.\n\nLos eventos que no pasan la validación del enricher, por ejemplo porque el producto no existe, no se descartan: van al tópico `events.dead` con el motivo del rechazo, y un tablero muestra cuántos llegan por tipo. Si la proporción pasa del uno por ciento durante diez minutos, salta una alerta para el equipo de datos.\n\nDesde `events.enriched` hay dos consumidores. Uno escribe los eventos en el data warehouse en archivos Parquet particionados por día, que se cargan cada quince minutos; de ahí salen los informes de producto y los modelos de recomendación. El otro alimenta los contadores en tiempo real que muestra la app, como «visto por tantas personas hoy», guardados en Redis con expiración de veinticuatro horas.\n\nLos esquemas de los eventos viven en el repositorio `event-schemas`, versionados, y un cambio incompatible exige un tipo de evento nuevo en lugar de modificar el existente. El collector rechaza un evento con una versión de esquema que no conoce, y la app no puede mandar un evento nuevo hasta que su esquema está publicado.\n\nLa identidad del usuario nunca viaja en el evento: la app manda un id de sesión y, si el usuario inició sesión, un id seudónimo que sólo el servicio de cuentas puede traducir. La IP se usa para obtener el país y se descarta en el enricher, antes de escribir en `events.enriched`.\n\nEn un día normal el pipeline recibe unos cuarenta millones de eventos, con picos de dos mil por segundo durante las campañas, y entre que la app manda un evento y que aparece en los contadores en tiempo real pasan menos de diez segundos.",
+     "value": "24 particiones",
+     "change": "value"
+    }
+   ]
+  }
+ ]
+}

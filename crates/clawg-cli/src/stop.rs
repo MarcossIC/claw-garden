@@ -9,14 +9,17 @@ use std::time::Duration;
 use crate::client::{ClientError, DaemonClient};
 use crate::process::{Exit, Watched};
 
-/// How long `clawg stop` waits for the daemon to end. After the HTTP server
-/// stops, the daemon ingests what is still queued for up to
-/// [`clawg_core::runtime::DRAIN_DEADLINE`], leaves what it could not ingest in
-/// the outbox for the next start, flushes the access counts and checkpoints the WAL.
-/// With an idle queue that is well under a second; this bound has to cover a
-/// full drain plus the rest, so the installer never replaces the binary while
-/// the daemon is still writing.
-pub const STOP_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long `clawg stop` waits for the daemon to end. A shutdown goes through
+/// four phases, each with its own bound: the requests in flight
+/// ([`crate::daemon::serve::HTTP_GRACE`]), the drain of what is still queued
+/// ([`clawg_core::runtime::DRAIN_DEADLINE`], leaving the rest in the outbox),
+/// the save in flight, the access flush and the checkpoint
+/// ([`clawg_core::runtime::AFTER_DRAIN`]), and the blocking tasks the process
+/// waits for before it exits ([`crate::daemon::serve::RUNTIME_TEARDOWN`]).
+/// With an idle daemon that is well under a second; this bound has to cover
+/// all four with room to spare, so the installer never replaces the binary
+/// while the daemon is still writing.
+pub const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Stops the daemon published in `base_dir` and returns its pid once the
 /// process has ended.
@@ -56,15 +59,18 @@ mod tests {
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
-    /// What shutdown does after the drain deadline: finish the event in
-    /// flight, spill the rest, flush access counts and checkpoint.
-    const AFTER_DRAIN: Duration = Duration::from_secs(5);
+    /// What no phase counts: the request, the wait itself, a loaded machine.
+    const SLACK: Duration = Duration::from_secs(5);
 
     #[test]
-    fn the_drain_deadline_leaves_room_inside_the_stop_timeout() {
+    fn every_phase_of_a_shutdown_fits_inside_the_stop_timeout() {
+        use crate::daemon::serve::{HTTP_GRACE, RUNTIME_TEARDOWN};
+        use clawg_core::runtime::{AFTER_DRAIN, DRAIN_DEADLINE};
+
+        let phases = HTTP_GRACE + DRAIN_DEADLINE + AFTER_DRAIN + RUNTIME_TEARDOWN;
         assert!(
-            clawg_core::runtime::DRAIN_DEADLINE + AFTER_DRAIN <= STOP_TIMEOUT,
-            "a full drain must end before `clawg stop` gives up on the process"
+            phases + SLACK <= STOP_TIMEOUT,
+            "a shutdown that uses every phase ({phases:?}) must end before `clawg stop` gives up on the process"
         );
     }
 
@@ -73,7 +79,8 @@ mod tests {
             dir,
             &DaemonState {
                 pid: std::process::id(),
-                port,
+                port: Some(port),
+                unix_socket: false,
                 profile: "dev".into(),
                 version: "0.1.0".into(),
                 started_at_ms: 0,

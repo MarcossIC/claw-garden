@@ -222,6 +222,17 @@ pub fn token_file(base_dir: &std::path::Path) -> PathBuf {
     base_dir.join("token")
 }
 
+/// The AF_UNIX socket the daemon listens on (`<base_dir>/clawg.sock`), on Unix
+/// and on Windows.
+///
+/// Derived, never read from `daemon.json`: a tampered record naming another
+/// socket would send the bearer token to whoever listens there. Inside the
+/// data directory because only who can write there can create it, and that
+/// directory is private to its owner.
+pub fn socket_file(base_dir: &std::path::Path) -> PathBuf {
+    base_dir.join("clawg.sock")
+}
+
 /// The file whose exclusive OS lock means "a process owns this profile's
 /// memory store" (`<base_dir>/memory.lock`). Only ever locked, never read or
 /// written — see [`store_owner_file`] for why the two are separate.
@@ -463,6 +474,12 @@ mod tests {
     fn store_lock_file_and_store_owner_file_are_distinct() {
         let base = PathBuf::from("/base");
         assert_ne!(store_lock_file(&base), store_owner_file(&base));
+    }
+
+    #[test]
+    fn socket_file_is_clawg_sock_under_base_dir() {
+        let base = PathBuf::from("/tmp/x");
+        assert_eq!(socket_file(&base), base.join("clawg.sock"));
     }
 
     #[test]

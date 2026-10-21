@@ -343,7 +343,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clawg-cli"
-version = "0.34.0"
+version = "0.43.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -352,6 +352,9 @@ dependencies = [
  "dirs",
  "env_logger",
  "fs2",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "log",
  "minisign",
@@ -365,16 +368,18 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "socket2",
  "tempfile",
  "thiserror",
  "tokio",
+ "tower-service",
  "windows-sys 0.61.2",
  "winreg",
 ]
 
 [[package]]
 name = "clawg-core"
-version = "0.34.0"
+version = "0.43.1"
 dependencies = [
  "async-trait",
  "dirs",
@@ -410,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "clawg-eval"
-version = "0.34.0"
+version = "0.43.1"
 dependencies = [
  "clawg-cli",
  "clawg-core",
@@ -1606,9 +1611,9 @@ checksum = "22f9645cb765ea72b8111f36c522475d2daa0d22c957a9826437e97534bc4e9e"
 
 [[package]]
 name = "mio"
-version = "1.2.0"
+version = "1.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50b7e5b27aa02a74bac8c3f23f448f8d87ff11f92d3aac1a6ed369ee08cc56c1"
+checksum = "1788edb87fdc09c7e26304471e2f5be8cdefb1b6930d6e3985fc02ff53bf86ee"
 dependencies = [
  "libc",
  "wasi",
@@ -2415,9 +2420,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -3471,9 +3476,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.7"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f31141ce3fc3e300ae89b78c0dd67f9708061d1d2eda54b8209346fd6be9a92c"
+checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
 dependencies = [
  "rustls-pki-types",
 ]

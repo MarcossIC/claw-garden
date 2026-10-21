@@ -46,6 +46,9 @@ pub struct SaveText {
     /// The key the row asked for was saved under, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topic_key: Option<String>,
+    /// The project the row asked for was saved in, `None` without one; sent
+    /// as `null` rather than left out, as a search hit's is.
+    pub project_id: Option<String>,
 }
 
 /// Shortest repeated text treated as the overlap between two neighbours;
@@ -111,6 +114,7 @@ pub async fn read_save_core(
         return Ok(None);
     }
     let topic_key = row.topic_key.clone();
+    let project_id = row.project_id.clone();
     let single = |text: String| SaveText {
         kind,
         id,
@@ -120,6 +124,7 @@ pub async fn read_save_core(
         missing: vec![],
         text,
         topic_key: topic_key.clone(),
+        project_id: project_id.clone(),
     };
     if kind != MemoryKind::Memory {
         return Ok(Some(single(row.summary)));
@@ -175,6 +180,7 @@ pub async fn read_save_core(
         missing,
         text,
         topic_key,
+        project_id,
     }))
 }
 

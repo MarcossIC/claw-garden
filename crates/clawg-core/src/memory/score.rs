@@ -32,6 +32,8 @@ pub(crate) struct RawHit {
     pub agent_id: Option<String>,
     /// The key a save revises the row under, if it has one.
     pub topic_key: Option<String>,
+    /// The project the row was saved in; `None` for a row saved without one.
+    pub project_id: Option<String>,
 }
 
 /// Tier-floor decay minimums — `MAX(tier_floor, exp_decay(...))` never lets a
@@ -334,6 +336,7 @@ mod tests {
             lexical_match: false,
             topic_key: None,
             agent_id: None,
+            project_id: None,
         }
     }
 

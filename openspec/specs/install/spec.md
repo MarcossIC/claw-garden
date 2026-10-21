@@ -2,14 +2,14 @@
 
 Fuente de verdad de cómo la suite prueba el binario `clawg` mismo: el build de test y las dos variables que sólo él lee (el home de prueba y el embedder de prueba), la regla que las mantiene fuera del binario que se entrega, las pruebas que lanzan el binario como proceso hijo, y el CI. Nada de esto cambia el binario que se entrega. El directorio de datos, el lock y el outbox están en [`specs/storage`](../storage/spec.md); el puente y su reconexión, en [`specs/mcp`](../mcp/spec.md).
 
-**Origen:** [install-smoke](../../changes/archive/2026-10-16-install-smoke/proposal.md), archivado el 2026-10-16. [release-and-self-update](../../changes/archive/2026-10-18-release-and-self-update/proposal.md), archivado el 2026-10-18, reemplazó la sección «CI» (I1): el filtro de rutas del workflow y su relación con el release. [ci-hardening](../../changes/archive/2026-10-19-ci-hardening/proposal.md), archivado el 2026-10-19, la amplió (C1 a C6): `--locked`, la configuración de producción, acciones fijadas, el toolchain fijado y los workflows de avisos y del instalador.
+**Origen:** [install-smoke](../../changes/archive/2026-10-16-install-smoke/proposal.md), archivado el 2026-10-16. [release-and-self-update](../../changes/archive/2026-10-18-release-and-self-update/proposal.md), archivado el 2026-10-18, reemplazó la sección «CI» (I1): el filtro de rutas del workflow y su relación con el release. [ci-hardening](../../changes/archive/2026-10-19-ci-hardening/proposal.md), archivado el 2026-10-19, la amplió (C1 a C6): `--locked`, la configuración de producción, acciones fijadas, el toolchain fijado y los workflows de avisos y del instalador. [shutdown-budget](../../changes/archive/2026-10-20-shutdown-budget/proposal.md), archivado el 2026-10-20, sumó el embedder de prueba `blocked`. [local-transport](../../changes/archive/2026-10-20-local-transport/proposal.md), archivado el 2026-10-20, reemplazó el «Límite conocido» del autoarranque. [windows-socket](../../changes/archive/2026-10-20-windows-socket/proposal.md), archivado el 2026-10-20, lo llevó a Windows.
 
 ## Definiciones
 
 - **Feature `testing`:** la feature de clawg-core que compila los sustitutos de prueba (`crates/clawg-core/Cargo.toml:25`).
 - **Build de test:** un binario compilado con `testing`. Es el que cargo arma para los tests de integración de clawg-cli (`CARGO_BIN_EXE_clawg`, `crates/clawg-cli/tests/binary.rs:23`), porque clawg-cli enciende la feature en sus `[dev-dependencies]` (`crates/clawg-cli/Cargo.toml:73`). `cargo build --release` no compila las dev-dependencies, así que el binario que se entrega no la tiene. Efecto aceptado: después de un `cargo test`, `target/debug/clawg` es un build de test. Sólo lee las variables si están puestas, y como build debug ya está limitado al perfil dev.
 - **Home de prueba:** el valor no vacío de `CLAWG_TEST_HOME` (`TEST_HOME_VAR`, `crates/clawg-core/src/paths.rs:169`).
-- **Embedder de prueba:** el valor de `CLAWG_TEST_EMBEDDER` (`TEST_EMBEDDER_VAR`, `crates/clawg-core/src/memory/bootstrap.rs:313`), `fake` o `stalled` (`TestEmbedder`, `bootstrap.rs:318`).
+- **Embedder de prueba:** el valor de `CLAWG_TEST_EMBEDDER` (`TEST_EMBEDDER_VAR`, `crates/clawg-core/src/memory/bootstrap.rs:313`), `fake`, `stalled` o `blocked` (`TestEmbedder`, `bootstrap.rs:318`).
 
 ## El home de prueba
 
@@ -37,12 +37,13 @@ Se reemplaza el home y no el directorio de datos para que el perfil siga eligien
 
 - con `fake`, MUST cargar `FakeEmbedder` sin descargar nada: la «descarga» devuelve archivos vacíos al instante y la carga devuelve el falso, con `model_id` `fake-embedder`;
 - con `stalled`, la descarga MUST NOT terminar nunca, así que el embedder queda en `loading` y cada save responde `202`;
+- con `blocked`, la descarga MUST terminar al instante y la carga MUST NOT volver nunca: bloquea su hilo en el `spawn_blocking` de siempre y lo dice en el log (`the test model load blocks its thread`), así que el embedder queda en `loading` y un apagado tiene que abandonar esa carga ([`specs/storage`](../storage/spec.md), «Cada fase del apagado tiene tope»);
 - sin la variable, o con un valor vacío o de sólo espacios, MUST usar el modelo real (`production_deps`, `bootstrap.rs:289`);
 - con cualquier otro valor, MUST negarse a arrancar con un error que nombra la variable y los valores aceptados (`TestEmbedder::parse`, `bootstrap.rs:327`; `ServeError::Embedder`, `serve.rs:107`). Un typo en un test no puede disparar la descarga de 470 MB.
 
 Un build sin `testing` MUST usar siempre el modelo real (`serve_deps`, `bootstrap.rs:387`).
 
-En los dos sustitutos, la verificación del contrato de embedding MUST ser la real: `TestEmbedder::deps` (`bootstrap.rs:341`) usa la de `production_deps`. Un store de prueba registra el contrato de `fake-embedder` y lo verifica al reiniciar, por el mismo camino que recorre el modelo real.
+En los tres sustitutos, la verificación del contrato de embedding MUST ser la real: `TestEmbedder::deps` (`bootstrap.rs:341`) usa la de `production_deps`. Un store de prueba registra el contrato de `fake-embedder` y lo verifica al reiniciar, por el mismo camino que recorre el modelo real.
 
 #### Escenario: fake
 - WHEN el bootstrap corre con `fake`
@@ -108,7 +109,14 @@ El test MUST fallar con `manifiesto:línea` de cada hallazgo. Reconocerlos es la
 
 **Tests:** `a_save_accepted_before_a_hard_kill_is_stored_after_the_restart` (`binary.rs:400`), `a_second_daemon_on_the_same_data_directory_is_refused_and_names_the_first` (`binary.rs:430`), `status_and_stop_follow_the_daemon_process` (`binary.rs:446`), `a_restored_backup_brings_back_its_rows_and_keeps_the_replaced_store` (`binary.rs:482`), `a_bridge_on_real_stdio_answers_initialize_and_the_tools_reach_the_daemon` (`binary.rs:520`), `a_bridge_on_real_stdio_serves_a_host_that_never_initializes` (`binary.rs:544`) y `a_bridge_left_open_reaches_the_daemon_after_a_restart` (`binary.rs:564`).
 
-**Límite conocido:** el autoarranque del puente no se prueba a través del binario. El daemon que lanza el puente usa el puerto fijo del perfil (`spawn_serve_at` sin puerto, `crates/clawg-cli/src/client.rs:1160`; `serve_args`, `:1166-1173`), así que en la máquina del usuario chocaría con su daemon dev. Lo cubren los tests en proceso de `crates/clawg-cli/src/mcp/mod.rs`. Probarlo a través del binario pide antes poder elegir ese puerto, y eso es superficie de producto.
+Un daemon que la suite no lanza con `--port` (el que autoarranca un puente, el que arranca `update`, los de las pruebas del socket) MUST NOT tomar el puerto del perfil de la máquina: cada hijo lleva `CLAWG_TEST_DEFAULT_PORT=off` en Unix y en Windows (`socket_only`, `binary.rs`), que un build con `testing` lee en lugar del puerto del perfil (`off`, o un número que lo reemplaza; `build_info::default_port_override`), y ese daemon escucha sólo en el socket de su home. Así el autoarranque se prueba a través del binario en los dos sistemas.
+
+#### Escenario: autoarranque
+- GIVEN un home vacío
+- WHEN un puente con autoarranque recibe una llamada
+- THEN arranca un daemon que escucha sólo en su socket y la llamada lo alcanza
+
+**Tests:** `a_bridge_starts_its_daemon_through_the_binary`, `a_daemon_without_a_port_serves_status_stop_bridge_and_hooks_over_its_socket` (Unix y Windows); `a_default_port_override_is_off_or_a_port` (`build_info.rs`).
 
 ## Ningún hijo sobrevive a su prueba
 
@@ -133,7 +141,7 @@ La CI MUST correr en cada pull request y en cada push a `main` que cambie algún
 
 El job no descarga el modelo: la suite usa `fake`. La CI es el único disparador de `release.yml`: un release MUST NOT publicarse sin una CI exitosa por push a `main`, y la CI MUST NOT leer secretos, usar un `environment`, pedir `id-token` ni escribir contenidos. Sólo `ci.yml` MUST llamarse `CI`: `release.yml` espera un workflow con ese nombre.
 
-La suite MUST pasar en Linux y en Windows. Para eso, las fixtures de los tests de `doctor` arman sus rutas bajo la raíz de la plataforma, `C:\` o `/` (`dir`, `crates/clawg-cli/src/doctor.rs:135`), y el caso de las grafías de Windows (mayúsculas, barras y `\\?\`) corre sólo en Windows (`windows_spellings_of_one_file_are_the_same_install`, `doctor.rs:219`).
+La suite MUST pasar en Linux y en Windows. Para eso, las fixtures de los tests de `doctor` arman sus rutas bajo la raíz de la plataforma, `C:\` o `/` (`dir`, `crates/clawg-cli/src/doctor/mod.rs:256`), y el caso de las grafías de Windows (mayúsculas, barras y `\\?\`) corre sólo en Windows (`windows_spellings_of_one_file_are_the_same_install`, `doctor/mod.rs:340`).
 
 #### Escenario: bump de versión
 - GIVEN un push a `main` cuyo commit cambia `Cargo.toml` y `Cargo.lock`

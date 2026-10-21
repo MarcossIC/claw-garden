@@ -2,13 +2,13 @@
 
 Fuente de verdad de `clawg update [--check]`: cómo se compara una versión, cuándo un binario puede actualizarse, cómo se elige el release y el asset, cómo se verifica la firma y el hash antes de tocar nada, el plan que intercambia el binario y vuelve a levantar el daemon, la vuelta atrás cuando el nuevo no arranca, las garantías sobre los datos, el informe y lo que sólo existe en un build de test. Cómo se publican los releases y sus claves está en [`specs/release`](../release/spec.md). No tiene que ver con [`specs/update`](../update/spec.md), que es la de `update_memory`.
 
-**Origen:** [release-and-self-update](../../changes/archive/2026-10-18-release-and-self-update/proposal.md), archivado el 2026-10-18. Los ids de requisito son los de esa spec.
+**Origen:** [release-and-self-update](../../changes/archive/2026-10-18-release-and-self-update/proposal.md), archivado el 2026-10-18. Los ids de requisito son los de esa spec. [shutdown-budget](../../changes/archive/2026-10-20-shutdown-budget/proposal.md), archivado el 2026-10-20, sumó a S10 «Un `stop` que vence» y cambió los tests de S11. [local-transport](../../changes/archive/2026-10-20-local-transport/proposal.md), archivado el 2026-10-20, sumó a S8 el arranque sin `--port` en Unix y los dos escenarios de un actualizador anterior y del actual. [windows-socket](../../changes/archive/2026-10-20-windows-socket/proposal.md), archivado el 2026-10-20, hizo que el puerto del daemon nuevo en S8 dependa de lo que publicó el viejo y no del sistema, en Unix y en Windows.
 
 ## Definiciones
 
 - **Binario instalado:** el `clawg` que corre `clawg update`.
 - **Marca de distribución** y **lista de claves:** las de [`specs/release`](../release/spec.md).
-- **Sello de prueba:** un JSON al final de una copia del binario de prueba (versión, triple de distribución, migraciones que conoce y falla simulada del daemon), que sólo lee un build con la feature `testing`.
+- **Sello de prueba:** un JSON al final de una copia del binario de prueba (versión, triple de distribución, migraciones que conoce, falla simulada del daemon y `transport: "tcp"`, que la hace comportarse como un clawg anterior al socket), que sólo lee un build con la feature `testing`.
 - **Daemon:** el proceso `clawg serve` del perfil `prod`.
 - **Candidato:** el binario nuevo bajado y preparado junto al destino, todavía sin instalar.
 - **Intercambio:** el paso que renombra el binario instalado a `.old-*` y pone el candidato en su lugar.
@@ -119,7 +119,7 @@ Antes del intercambio `update` MUST: bajar el candidato junto al destino, verifi
 
 ## S8. Plan e intercambio
 
-El plan de `update` MUST ser una lista de pasos como datos, ejecutada aparte, de modo que el orden y la deshecha de cada falla se prueben sin disco ni red. Con daemon, el orden MUST ser: parar el daemon con el binario instalado (`stop_in`, `crates/clawg-cli/src/stop.rs:23`); renombrar el binario a `.old-*`; poner el candidato; arrancar el daemon nuevo por su ruta explícita (no por `ProcessSpawner`, que lanza `current_exe()`, `client.rs:1152-1154`); esperar `/health`. Sin daemon, `update` MUST NOT arrancar uno. Al empezar, MUST borrar los `.old-*` de corridas anteriores. Si un editor abre un puente entre la parada y el arranque, `update` MUST confirmar la versión del daemon que contesta e informarla. En Linux el binario instalado también se aparta a `.old-*` antes de poner el candidato: no se reemplaza en el lugar. Dos `update` a la vez MUST NOT intercambiar a la vez: un cerrojo exclusivo del sistema sobre `<data>/update.lock` hace que el segundo falle con un error claro.
+El plan de `update` MUST ser una lista de pasos como datos, ejecutada aparte, de modo que el orden y la deshecha de cada falla se prueben sin disco ni red. Con daemon, el orden MUST ser: parar el daemon con el binario instalado (`stop_in`, `crates/clawg-cli/src/stop.rs:26`); renombrar el binario a `.old-*`; poner el candidato; arrancar el daemon nuevo por su ruta explícita (no por `ProcessSpawner`, que lanza `current_exe()`, `client.rs:1226-1228`); esperar `/health`. En Unix y en Windows, el daemon nuevo, y el viejo cuando un deshacer lo vuelve a arrancar, MUST lanzarse sin `--port` y vigilarse por `from_data_dir`, que va por el socket ([`specs/daemon-access`](../daemon-access/spec.md), R9), cuando el daemon que corría publicó su socket (`unix_socket: true` en `daemon.json`): así TCP queda encendido sólo donde alguien lo vuelve a pedir y no se arrastra de actualización en actualización. Cuando no lo publicó (sirvió sólo TCP porque su ruta no entra en `sun_path`, o es un clawg anterior) o con `tcp_only` (el sello de un clawg anterior al socket), MUST recibir el puerto del viejo. `serve_port(old_port, socket, tcp_only)` (`crates/clawg-cli/src/update/effects.rs`) toma `socket` de `daemon.json` (`Running.socket`), no del sistema operativo. Un actualizador anterior al socket pasa siempre `--port`, así que el daemon nuevo enciende TCP y ese actualizador lo ve contestar. Sin daemon, `update` MUST NOT arrancar uno. Al empezar, MUST borrar los `.old-*` de corridas anteriores. Si un editor abre un puente entre la parada y el arranque, `update` MUST confirmar la versión del daemon que contesta e informarla. En Linux el binario instalado también se aparta a `.old-*` antes de poner el candidato: no se reemplaza en el lugar. Dos `update` a la vez MUST NOT intercambiar a la vez: un cerrojo exclusivo del sistema sobre `<data>/update.lock` hace que el segundo falle con un error claro.
 
 #### Escenario: actualización completa con daemon
 - GIVEN un daemon corriendo y un servidor de release falso con una versión mayor
@@ -136,7 +136,22 @@ El plan de `update` MUST ser una lista de pasos como datos, ejecutada aparte, de
 - WHEN arranca otro
 - THEN el segundo falla con un error claro y no toca el binario
 
-**Pruebas:** `a_full_update_with_a_daemon_replaces_the_binary_and_a_bridge_reaches_the_new_daemon` en `binary.rs` (parte del escenario de `binary.rs:564` con el binario reemplazado); `update_without_a_daemon_does_not_start_one` (plan); `plan_order_with_and_without_daemon` (plan); `two_updates_do_not_swap_at_once` (sobre el cerrojo, en un test de la unidad que lo toma).
+#### Escenario: un actualizador anterior al socket
+- GIVEN un clawg anterior al socket (sello `transport: "tcp"`) con su daemon en un puerto
+- WHEN instala la versión actual
+- THEN termina con 0, y el daemon nuevo contesta por el socket y por el mismo puerto
+
+#### Escenario: el actualizador actual
+- GIVEN un daemon con TCP en un puerto efímero y su socket
+- WHEN la versión actual instala la siguiente
+- THEN el daemon nuevo no recibió `--port` y no tiene `port` en `daemon.json`
+
+#### Escenario: un daemon que sirve sólo TCP porque su ruta no entra
+- GIVEN un daemon lanzado con `--port N` cuya ruta de socket pasa el límite, así que su `daemon.json` lleva `port` y no `unix_socket`
+- WHEN la versión actual instala la siguiente
+- THEN el daemon nuevo recibe `--port` con el puerto del viejo, arranca y contesta por TCP; y si la actualización se deshace, el viejo vuelve a arrancar con ese puerto
+
+**Pruebas:** `a_full_update_with_a_daemon_replaces_the_binary_and_a_bridge_reaches_the_new_daemon` en `binary.rs` (parte del escenario de `binary.rs:564` con el binario reemplazado); `update_without_a_daemon_does_not_start_one` (plan); `plan_order_with_and_without_daemon` (plan); `two_updates_do_not_swap_at_once` (sobre el cerrojo, en un test de la unidad que lo toma); `the_new_daemon_gets_a_port_only_where_tcp_is_the_only_transport` (`update/effects.rs`); `an_older_updater_installs_the_socket_version_and_sees_it_answer`, `an_older_bridge_reaches_a_new_daemon_over_the_profile_port`, `an_update_keeps_the_port_of_a_daemon_that_serves_tcp_alone`, `an_undone_update_restarts_a_daemon_that_served_tcp_alone_on_its_port`, `a_full_update_with_a_daemon_replaces_the_binary_and_a_bridge_reaches_the_new_daemon` (`tests/binary.rs`, Unix y Windows).
 
 ## S9. Vuelta atrás tras el intercambio
 
@@ -187,6 +202,27 @@ Si el daemon nuevo no contesta `/health` con la versión nueva en el plazo, `upd
 
 **Pruebas:** `an_update_over_a_pending_migration_leaves_a_pre_migration_snapshot_and_the_data`, `an_update_whose_candidate_refuses_the_store_leaves_the_old_binary_and_its_daemon` y `an_update_over_a_store_without_supersede_causes_keeps_its_rows_and_tells_revisions_from_verdicts` en `binary.rs`, con la base sembrada en la versión anterior (regla de `openspec/config.yaml` para cambios que tocan el esquema). Prerrequisito ya fusionado: `to_prune` conserva el `pre-migration` más nuevo (`crates/clawg-core/src/memory/backup.rs:243-269`, 0.18.1), con su test.
 
+### Un `stop` que vence
+
+`stop` espera el fin del proceso a lo sumo `STOP_TIMEOUT` (30 s, [`specs/storage`](../storage/spec.md), «Las fases caben en `STOP_TIMEOUT`»). Cuando vence con el apagado ya aceptado (`ClientError::StopTimeout`), el daemon termina por su cuenta poco después: el paso `StopDaemon` MUST contar entonces como hecho a medias (`StepError::under_way`, `crates/clawg-cli/src/update/plan.rs`) y su deshacer `StartOldDaemon` MUST correr. Ese deshacer MUST esperar primero el fin de ese pid, a lo sumo otro `STOP_TIMEOUT` (`wait_for_end`, `effects.rs`), y recién entonces arrancar el daemon con el binario instalado, que sigue en su lugar porque el plan se detuvo antes de apartarlo: arrancado antes, `wait_for` vería contestar al daemon que se apaga, con la misma versión, y daría `Ready` en falso. Si el pid sigue vivo, MUST NOT arrancar nada, y el informe MUST decir que se pidió el apagado y cómo arrancar el daemon cuando termine. Un `StopDaemon` que falla sin haber pedido el apagado (sin `/health`, o con el pedido rechazado) MUST NOT correr `StartOldDaemon`, y el informe sigue diciendo que el daemon no se tocó.
+
+#### Escenario: el apagado vence
+- GIVEN un daemon que acepta el apagado y no termina en `STOP_TIMEOUT`
+- WHEN corre `update`
+- THEN no se renombra nada, se borra el candidato y se corre `undo StartOldDaemon`
+
+#### Escenario: el apagado no llegó
+- GIVEN un `stop` que falla antes de pedir el apagado
+- WHEN corre `update`
+- THEN sólo se borra el candidato y el informe dice que el daemon no se tocó
+
+#### Escenario: el daemon sigue cerrándose
+- GIVEN un apagado vencido cuyo deshacer encontró el pid vivo al terminar su espera
+- WHEN se arma el informe
+- THEN dice que se pidió el apagado y cómo arrancar el daemon cuando termine
+
+**Tests:** `a_daemon_that_does_not_stop_in_time_is_started_again_and_nothing_is_renamed` y `a_stop_that_never_reached_the_daemon_starts_nothing` (plan); `a_daemon_still_shutting_down_says_how_to_start_it_once_it_ends` (informe, puro).
+
 ## S11. Informe
 
 Al terminar bien, `update` MUST informar la versión anterior y la nueva, el snapshot `pre-migration` si se escribió (su ruta), que volver atrás pierde lo escrito después de él, y que los editores abiertos siguen con el puente viejo hasta reiniciarse. Un `update` fallido MUST decir en qué estado dejó la instalación y el daemon.
@@ -196,7 +232,7 @@ Al terminar bien, `update` MUST informar la versión anterior y la nueva, el sna
 - WHEN termina
 - THEN la salida contiene ambas versiones, la ruta del `pre-migration` y el aviso de reinicio de los editores
 
-**Test:** `the_update_report_names_versions_snapshot_and_restart_notice` (puro, sobre la función que arma el texto).
+**Tests:** `the_update_report_names_versions_snapshot_and_restart_notice` (puro, sobre la función que arma el texto); el estado del daemon tras un fallo, `a_failure_before_the_stop_says_the_daemon_was_not_touched`, `a_failure_after_the_stop_says_the_old_daemon_is_back`, `a_daemon_that_could_not_be_started_again_says_what_starts_it` y `a_daemon_still_shutting_down_says_how_to_start_it_once_it_ends` (puros).
 
 ## S12. Sustitución sólo en builds de test
 

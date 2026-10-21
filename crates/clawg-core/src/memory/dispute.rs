@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::memory::clock::TimestampMs;
 use crate::memory::provenance::mark;
 use crate::memory::redact::redact;
+use crate::memory::store_insert::MemoryType;
 use crate::memory::{MemoryError, MemoryStore};
 
 /// How a dispute between two rows is closed.
@@ -74,10 +75,13 @@ pub enum ResolveError {
     #[error("a scoped verdict needs a reason that says where each memory holds")]
     ReasonRequired,
     #[error(
-        "memories {keep} and {other} include a preference or a decision; ask the user first: \
-         judge the pair `conflicts`, and `supersedes` once the user has answered"
+        "memory {other} is a preference or a decision, so {keep} supersedes it only on the user's word: \
+         judge the pair `conflicts` and ask the user, then call again with `user_answered` and their \
+         answer in `reason`"
     )]
     NeedsUser { keep: i64, other: i64 },
+    #[error("`user_answered` needs the user's answer in `reason`")]
+    AnswerRequired,
     #[error("no memory row with id {0}")]
     NotFound(i64),
     #[error("memories {keep} and {other} are not in dispute with each other")]
@@ -127,9 +131,8 @@ impl PairRow {
         (self.status == "superseded").then_some(self.superseded_by).flatten()
     }
 
-    /// A preference or a decision is never superseded on the agent's word.
     fn protected(&self) -> bool {
-        matches!(self.memory_type.as_str(), "user_preference" | "architectural_decision")
+        MemoryType::is_protected_name(&self.memory_type)
     }
 }
 
@@ -308,18 +311,24 @@ pub async fn resolve_dispute_core(
         Outcome::Supersede => Verdict::Supersedes,
         Outcome::KeepBoth => Verdict::Compatible,
     };
-    judge_pair(store, keep, other, verdict, None, owner).await
+    judge_pair(store, keep, other, verdict, None, false, owner).await
 }
 
 /// Judges the pair `keep`, `other` in one transaction, and returns both rows
 /// as they stand afterwards. With `owner`, both rows must belong to that
 /// agent. `keep` only matters for `supersedes`: it is the row that stays.
+///
+/// `user_answered` is the caller's declaration that the user said which
+/// holds, with their answer in `reason`. Superseding a preference or a
+/// decision needs it whatever state the pair is in; it declares, it does not
+/// authenticate, and the pair keeps the answer marked as declared.
 pub async fn judge_pair(
     store: &MemoryStore,
     keep: i64,
     other: i64,
     verdict: Verdict,
     reason: Option<String>,
+    user_answered: bool,
     owner: Option<&str>,
 ) -> Result<Resolution, ResolveError> {
     if keep == other {
@@ -330,6 +339,11 @@ pub async fn judge_pair(
     if verdict == Verdict::Scoped && reason.is_none() {
         return Err(ResolveError::ReasonRequired);
     }
+    let reason = match (user_answered, reason) {
+        (true, None) => return Err(ResolveError::AnswerRequired),
+        (true, Some(r)) => Some(format!("user answered: {r}")),
+        (false, r) => r,
+    };
     let now = TimestampMs::now();
     let owner = owner.map(str::to_owned);
     let (new, old) = (keep.max(other), keep.min(other));
@@ -348,10 +362,7 @@ pub async fn judge_pair(
                 )
                 .optional()?;
             check_pair(&keep_row, &other_row, state.is_some())?;
-            if verdict == Verdict::Supersedes
-                && state.as_deref() == Some("pending")
-                && (keep_row.protected() || other_row.protected())
-            {
+            if verdict == Verdict::Supersedes && other_row.protected() && !user_answered {
                 return Err(ResolveError::NeedsUser { keep, other });
             }
 
@@ -912,13 +923,13 @@ mod tests {
         let new = seed(&store, "the API listens on 9090", "disputed", &[old], 1).await;
         note_pair(&store, new, old, "escalated").await;
 
-        let resolution = judge_pair(&store, new, old, Verdict::Supersedes, None, None).await.unwrap();
+        let resolution = judge_pair(&store, new, old, Verdict::Supersedes, None, false, None).await.unwrap();
 
         assert_eq!(resolution.other, ResolvedRow { id: old, status: "superseded".into(), superseded_by: Some(new) });
         assert_eq!(resolution.pair.as_deref(), Some("judged"));
         assert_eq!(pair_of(&store, new, old).await, judged("supersedes", None));
 
-        let undone = judge_pair(&store, old, new, Verdict::Compatible, None, None).await.unwrap();
+        let undone = judge_pair(&store, old, new, Verdict::Compatible, None, false, None).await.unwrap();
         assert_eq!((undone.keep.status.as_str(), undone.other.status.as_str()), ("active", "active"));
         assert_eq!(pair_of(&store, new, old).await, judged("compatible", None));
     }
@@ -932,8 +943,8 @@ mod tests {
         note_pair(&store, a, old, "pending").await;
         note_pair(&store, b, old, "pending").await;
 
-        judge_pair(&store, a, old, Verdict::Compatible, None, None).await.unwrap();
-        judge_pair(&store, old, b, Verdict::Scoped, Some("one is the dev profile".into()), None).await.unwrap();
+        judge_pair(&store, a, old, Verdict::Compatible, None, false, None).await.unwrap();
+        judge_pair(&store, old, b, Verdict::Scoped, Some("one is the dev profile".into()), false, None).await.unwrap();
 
         assert_eq!(pair_of(&store, a, old).await, judged("compatible", None));
         assert_eq!(pair_of(&store, b, old).await, judged("scoped", Some("one is the dev profile")));
@@ -955,7 +966,7 @@ mod tests {
         let key: String = "Q7ZX".chars().cycle().take(16).collect();
 
         let reason = format!("the staging key AKIA{key} is only for ci");
-        judge_pair(&store, new, old, Verdict::Scoped, Some(reason), None).await.unwrap();
+        judge_pair(&store, new, old, Verdict::Scoped, Some(reason), false, None).await.unwrap();
 
         let stored = "the staging key [REDACTED:aws_access_key] is only for ci";
         assert_eq!(pair_of(&store, new, old).await, judged("scoped", Some(stored)));
@@ -970,7 +981,7 @@ mod tests {
 
         for reason in [None, Some("  ".to_string())] {
             assert!(matches!(
-                judge_pair(&store, new, old, Verdict::Scoped, reason, None).await,
+                judge_pair(&store, new, old, Verdict::Scoped, reason, false, None).await,
                 Err(ResolveError::ReasonRequired)
             ));
         }
@@ -984,7 +995,7 @@ mod tests {
         let new = seed(&store, "new", "active", &[], 1).await;
         note_pair(&store, new, old, "pending").await;
 
-        let resolution = judge_pair(&store, old, new, Verdict::Conflicts, Some("ports differ".into()), None).await.unwrap();
+        let resolution = judge_pair(&store, old, new, Verdict::Conflicts, Some("ports differ".into()), false, None).await.unwrap();
 
         assert_eq!(resolution.pair.as_deref(), Some("escalated"));
         let newer = row(&store, new).await;
@@ -992,27 +1003,119 @@ mod tests {
         let pair = pair_of(&store, new, old).await;
         assert_eq!((pair.state.as_str(), pair.verdict, pair.judged), ("escalated", None, false));
 
-        let again = judge_pair(&store, new, old, Verdict::Conflicts, None, None).await.unwrap();
+        let again = judge_pair(&store, new, old, Verdict::Conflicts, None, false, None).await.unwrap();
         assert_eq!(row(&store, new).await.disputes, Some(format!("[{old}]")), "named once");
         assert_eq!(again.keep.status, "disputed");
     }
 
+    async fn supersede_undeclared(store: &MemoryStore, keep: i64, other: i64) -> Result<Resolution, ResolveError> {
+        judge_pair(store, keep, other, Verdict::Supersedes, None, false, None).await
+    }
+
     #[tokio::test]
-    async fn a_protected_pending_pair_is_not_superseded_without_the_user() {
+    async fn a_protected_row_is_not_superseded_after_conflicts() {
         let store = store().await;
         let old = seed_typed(&store, "user_preference", "active", &[], 0).await;
         let new = seed_typed(&store, "semantic_fact", "active", &[], 1).await;
         note_pair(&store, new, old, "pending").await;
 
         assert!(matches!(
-            judge_pair(&store, new, old, Verdict::Supersedes, None, None).await,
-            Err(ResolveError::NeedsUser { .. })
+            supersede_undeclared(&store, new, old).await,
+            Err(ResolveError::NeedsUser { other, .. }) if other == old
         ));
         assert_eq!(row(&store, old).await.status, "active", "a refused verdict changes nothing");
 
-        judge_pair(&store, new, old, Verdict::Conflicts, None, None).await.unwrap();
-        let resolution = judge_pair(&store, new, old, Verdict::Supersedes, None, None).await.unwrap();
-        assert_eq!(resolution.other.status, "superseded");
+        judge_pair(&store, new, old, Verdict::Conflicts, None, false, None).await.unwrap();
+        assert!(matches!(supersede_undeclared(&store, new, old).await, Err(ResolveError::NeedsUser { .. })));
+        assert_eq!(row(&store, old).await.status, "active");
+        assert_eq!(pair_of(&store, new, old).await.state, "escalated");
+    }
+
+    #[tokio::test]
+    async fn a_pair_escalated_at_save_does_not_open_the_guard() {
+        let store = store().await;
+        let old = seed_typed(&store, "architectural_decision", "active", &[], 0).await;
+        let new = seed_typed(&store, "semantic_fact", "disputed", &[old], 1).await;
+        note_pair(&store, new, old, "escalated").await;
+
+        assert!(matches!(supersede_undeclared(&store, new, old).await, Err(ResolveError::NeedsUser { .. })));
+        assert_eq!(row(&store, old).await.status, "active");
+        assert_eq!(row(&store, new).await.status, "disputed");
+        assert_eq!(pair_of(&store, new, old).await.state, "escalated");
+    }
+
+    #[tokio::test]
+    async fn a_judged_pair_does_not_open_the_guard() {
+        let store = store().await;
+        let old = seed_typed(&store, "user_preference", "active", &[], 0).await;
+        let new = seed_typed(&store, "semantic_fact", "active", &[], 1).await;
+        note_pair(&store, new, old, "pending").await;
+        judge_pair(&store, new, old, Verdict::Compatible, None, false, None).await.unwrap();
+
+        assert!(matches!(supersede_undeclared(&store, new, old).await, Err(ResolveError::NeedsUser { .. })));
+        assert_eq!(row(&store, old).await.status, "active");
+        assert_eq!(pair_of(&store, new, old).await, judged("compatible", None));
+    }
+
+    #[tokio::test]
+    async fn a_pair_without_a_row_does_not_open_the_guard() {
+        let store = store().await;
+        let old = seed_typed(&store, "user_preference", "active", &[], 0).await;
+        let new = seed_typed(&store, "semantic_fact", "disputed", &[old], 1).await;
+
+        assert!(matches!(supersede_undeclared(&store, new, old).await, Err(ResolveError::NeedsUser { .. })));
+        assert_eq!(row(&store, old).await.status, "active");
+        assert_eq!(row(&store, new).await.disputes, Some(format!("[{old}]")));
+    }
+
+    #[tokio::test]
+    async fn a_protected_keep_needs_no_answer() {
+        let store = store().await;
+        let old = seed_typed(&store, "user_preference", "active", &[], 0).await;
+        let new = seed_typed(&store, "semantic_fact", "active", &[], 1).await;
+        note_pair(&store, new, old, "escalated").await;
+        judge_pair(&store, new, old, Verdict::Supersedes, Some("tabs now".into()), true, None).await.unwrap();
+
+        let undone = supersede_undeclared(&store, old, new).await.unwrap();
+
+        assert_eq!(undone.keep, ResolvedRow { id: old, status: "active".into(), superseded_by: None });
+        assert_eq!(undone.other, ResolvedRow { id: new, status: "superseded".into(), superseded_by: Some(old) });
+
+        let fact = seed_typed(&store, "semantic_fact", "active", &[], 2).await;
+        let decision = seed_typed(&store, "architectural_decision", "active", &[], 3).await;
+        note_pair(&store, decision, fact, "pending").await;
+        assert!(supersede_undeclared(&store, decision, fact).await.is_ok(), "only the row that loses is guarded");
+    }
+
+    #[tokio::test]
+    async fn a_declared_answer_supersedes_and_is_recorded() {
+        let store = store().await;
+        let old = seed_typed(&store, "user_preference", "active", &[], 0).await;
+        let new = seed_typed(&store, "user_preference", "disputed", &[old], 1).await;
+        note_pair(&store, new, old, "escalated").await;
+
+        let reason = Some("the user now prefers tabs".to_string());
+        let resolution = judge_pair(&store, new, old, Verdict::Supersedes, reason, true, None).await.unwrap();
+
+        assert_eq!(resolution.other, ResolvedRow { id: old, status: "superseded".into(), superseded_by: Some(new) });
+        assert_eq!(pair_of(&store, new, old).await, judged("supersedes", Some("user answered: the user now prefers tabs")));
+    }
+
+    #[tokio::test]
+    async fn a_declared_answer_needs_a_reason() {
+        let store = store().await;
+        let old = seed_typed(&store, "user_preference", "active", &[], 0).await;
+        let new = seed_typed(&store, "semantic_fact", "active", &[], 1).await;
+        note_pair(&store, new, old, "escalated").await;
+
+        for reason in [None, Some(" ".to_string())] {
+            assert!(matches!(
+                judge_pair(&store, new, old, Verdict::Supersedes, reason, true, None).await,
+                Err(ResolveError::AnswerRequired)
+            ));
+        }
+        assert_eq!(row(&store, old).await.status, "active");
+        assert_eq!(pair_of(&store, new, old).await.state, "escalated");
     }
 
     #[tokio::test]
@@ -1021,13 +1124,13 @@ mod tests {
         let old = seed(&store, "old", "active", &[], 0).await;
         let new = seed(&store, "new", "active", &[], 1).await;
         assert!(matches!(
-            judge_pair(&store, new, old, Verdict::Compatible, None, None).await,
+            judge_pair(&store, new, old, Verdict::Compatible, None, false, None).await,
             Err(ResolveError::NotInDispute { .. })
         ));
 
         note_pair(&store, new, old, "pending").await;
 
-        assert!(judge_pair(&store, new, old, Verdict::Compatible, None, None).await.is_ok());
+        assert!(judge_pair(&store, new, old, Verdict::Compatible, None, false, None).await.is_ok());
     }
 
     #[tokio::test]

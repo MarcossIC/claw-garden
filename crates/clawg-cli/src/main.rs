@@ -18,7 +18,9 @@ use clawg_cli::client::{probe_running, ClientError, DaemonClient, Probe};
 use clawg_cli::daemon::lifecycle::{now_ms, read_state};
 use clawg_cli::daemon::serve;
 use clawg_cli::doctor;
+use clawg_cli::export;
 use clawg_cli::hook;
+use clawg_cli::import;
 use clawg_cli::mcp;
 use clawg_cli::memories;
 use clawg_cli::outbox;
@@ -33,6 +35,8 @@ use clawg_cli::undelete;
 use clawg_cli::update;
 use clawg_core::memory::backup::{backup_offline, probe, restore};
 use clawg_core::memory::embedder::keep_one_malloc_arena;
+use clawg_core::memory::portability::ExportFilter;
+use clawg_core::memory::ProjectIdentity;
 use clawg_core::memory::secrets::{mask_reasons, purge, scan};
 use clawg_core::paths::data_dir;
 use clap::Parser;
@@ -54,6 +58,7 @@ fn main() -> ExitCode {
         Err(e) => e.exit(),
     };
     init_logging();
+    let serves = matches!(cli.command, Command::Serve { .. });
     if cli.command.loads_the_model() {
         // Before the runtime exists: the allocator setting only reaches the
         // threads that have not allocated yet.
@@ -81,6 +86,11 @@ fn main() -> ExitCode {
         // A stdin the client never closed still holds a blocking read, which
         // an ordinary drop of the runtime would wait for past the deadline.
         runtime.shutdown_background();
+    } else if serves {
+        // A model load still running on a blocking thread cannot be
+        // cancelled, and an ordinary drop would wait for it past what
+        // `clawg stop` waits for.
+        runtime.shutdown_timeout(serve::RUNTIME_TEARDOWN);
     }
     code
 }
@@ -101,7 +111,6 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
     match cli.command {
         Command::Serve { profile, port } => {
             let profile = profile.resolve().map_err(|e| e.to_string())?;
-            let port = port.unwrap_or_else(|| profile.default_port());
             serve::run(profile, port).await.map_err(|e| e.to_string())?;
             Ok(ExitCode::SUCCESS)
         }
@@ -192,6 +201,33 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
 
+        Command::Export { out, project, agent, include_deleted, format, profile } => {
+            let profile = profile.resolve().map_err(|e| e.to_string())?;
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let project_id = project.map(|path| ProjectIdentity::resolve(&path).id);
+            let filter = ExportFilter { project_id, agent, include_deleted };
+            println!("{}", export::run(&base_dir, &out, &filter, format, now_ms() as i64)?);
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Import { file, dry_run, agent, map_root, profile } => {
+            let profile = profile.resolve().map_err(|e| e.to_string())?;
+            let unavailable = |e: ClientError| memories::explain_unavailable(&e, profile);
+            // The daemon is the store's only writer and has the model that
+            // embeds each row; with none running, nothing is started.
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let client = match probe_running(&base_dir, false).await.map_err(unavailable)? {
+                Probe::Running(client) => client,
+                Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
+            };
+            let out = import::run(&client, &file, dry_run, agent.as_deref(), &map_root).await.map_err(|e| match e {
+                import::ImportError::Client(e) => unavailable(e),
+                other => other.to_string(),
+            })?;
+            println!("{out}");
+            Ok(ExitCode::SUCCESS)
+        }
+
         Command::Secrets { mask_reasons: true, yes, profile } => {
             secrets::confirm_mask_reasons(yes)?;
             let profile = profile.resolve().map_err(|e| e.to_string())?;
@@ -258,7 +294,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 "{}",
                 serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
             );
-            Ok(if report.analysis.is_healthy() {
+            Ok(if !report.summary.fails() {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::from(EXIT_FAILURE)
