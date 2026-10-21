@@ -166,9 +166,9 @@ Un save con fila que está en curso MUST mirar el plazo antes de insertar cada p
 
 ### Arranque: se ingiere lo pendiente antes que lo nuevo
 
-Al arrancar, el worker (`ingest_worker_future`, `crates/clawg-core/src/runtime.rs:463`) MUST, en este orden:
+Al arrancar, el worker (`ingest_worker_future`, `crates/clawg-core/src/runtime.rs:477`) MUST, en este orden:
 
-1. importar `ingest-pending.jsonl` si existe (`import_spill`, `runtime.rs:506`): cada evento válido pasa a una fila, enmascarado, todos en una transacción con `synchronous = FULL` (`outbox_import`, `outbox.rs:281`); el archivo MUST borrarse sólo después del commit. Si no se pudo borrar, se avisa: una segunda importación la absorbe el dedup;
+1. importar `ingest-pending.jsonl` si existe (`import_spill`, `runtime.rs:520`): cada evento válido pasa a una fila, enmascarado, todos en una transacción con `synchronous = FULL` (`outbox_import`, `outbox.rs:281`); el archivo MUST borrarse sólo después del commit. Si no se pudo borrar, se avisa: una segunda importación la absorbe el dedup;
 2. procesar las filas `pending` en orden de id antes que cualquier evento del canal (`outbox_pending`, `outbox.rs:486`; `Replay`, `worker.rs:179`).
 
 Si no se puede leer el outbox, el worker lo registra y sigue con el canal: esas filas esperan al próximo arranque. Fuera de este arranque, el outbox sólo vuelve al worker por el reintento de un fallo pasajero y por `clawg outbox retry`.
@@ -209,7 +209,7 @@ En un apagado ordenado, el tracker MUST escribir el buffer pendiente antes de te
 
 ### Checkpoint al terminar
 
-Después de drenar y del flush del tracker, el apagado SHOULD hacer `PRAGMA wal_checkpoint(TRUNCATE)` (`checkpoint`, `runtime.rs:440`). Un fallo del checkpoint MUST registrarse y MUST NOT impedir el resto del apagado.
+Después de drenar y del flush del tracker, el apagado SHOULD hacer `PRAGMA wal_checkpoint(TRUNCATE)` (`checkpoint`, `runtime.rs:454`). Un fallo del checkpoint MUST registrarse y MUST NOT impedir el resto del apagado.
 
 #### Escenario
 - GIVEN una base en WAL con escrituras recientes
@@ -217,6 +217,17 @@ Después de drenar y del flush del tracker, el apagado SHOULD hacer `PRAGMA wal_
 - THEN `memory.db-wal` no existe o mide 0 bytes, y una copia de `memory.db` sola contiene las escrituras
 
 **Test:** `shutdown_checkpoints_the_wal_into_memory_db` (`crates/clawg-core/tests/shutdown.rs`).
+
+### El daemon cierra `memory.db` antes de salir
+
+Después de un apagado que terminó dentro de su tope (`shutdown` devuelve `true`), `clawg serve` MUST cerrar la conexión del store y esperar el cierre (`MemoryRuntime::close`, `crates/clawg-core/src/runtime.rs:349`; en `crates/clawg-cli/src/daemon/serve.rs:255`), así SQLite quita `memory.db-wal` y `memory.db-shm` antes de que termine el proceso. Sin cerrarla, el cierre corre en el hilo propio de la conexión cuando cae su último handle, y la salida del proceso puede cortarlo después de quitar el índice del WAL y antes de quitar el WAL: queda un `memory.db-wal` vacío, y `clawg doctor`, que con un WAL presente abre sin `immutable`, crea un `memory.db-shm` junto a un store parado. Después de un apagado que el tope cortó no se cierra: una llamada puede tener todavía la conexión y el cierre esperaría detrás de ella, fuera de todo tope. Un cierre que falla MUST registrarse y nada más; SQLite reproduce lo que quede al abrir.
+
+#### Escenario
+- GIVEN un runtime con un save recién guardado
+- WHEN se apaga y se cierra, con el runtime todavía vivo
+- THEN no hay `memory.db-wal` ni `memory.db-shm` junto al store
+
+**Tests:** `closing_after_the_shutdown_leaves_no_wal_beside_the_store` (`crates/clawg-core/tests/shutdown.rs`); `doctor_reads_a_running_daemons_store_without_changing_it` (`crates/clawg-cli/tests/binary.rs`), que fallaba de forma intermitente en Linux por el `-wal` vacío.
 
 ### SIGTERM es un apagado ordenado
 
@@ -485,7 +496,7 @@ La descarga MUST usar un cliente con 30 s para conectar y 60 s por lectura (`DOW
 
 ### Un hash por archivo, fuera de los hilos del runtime
 
-Leer y hashear la caché MUST correr en una tarea bloqueante (`check_cache_off_runtime`, `model_download.rs:532`), no en un hilo del runtime asíncrono, en el arranque y en cada recarga. El worker de ingest MUST leer, verificar y parsear `tokenizer.json` en una tarea bloqueante (`ingest_worker_future`, `crates/clawg-core/src/runtime.rs:463`). En una corrida, cada archivo MUST hashearse una sola vez: el de la caché al leerlo (`check_cache`, `:572`), el bajado mientras llegan sus bytes, sin volver a leerlo del disco. Los bytes que recibe la carga MUST ser los mismos que se hashearon. El cierre del archivo bajado (`sync_all` y el `rename`) MUST correr en una tarea bloqueante. Como el archivo bajado queda en memoria para entregarlo sin releerlo, un archivo que anuncia o trae más de 600 MB (`MAX_FILE_BYTES`, `:836`, lo que pide libre el chequeo de disco y más que cualquier archivo del modelo) MUST fallar sin reintentar y sin reservar esa memoria (`DownloadError::TooLarge`, `:350`).
+Leer y hashear la caché MUST correr en una tarea bloqueante (`check_cache_off_runtime`, `model_download.rs:532`), no en un hilo del runtime asíncrono, en el arranque y en cada recarga. El worker de ingest MUST leer, verificar y parsear `tokenizer.json` en una tarea bloqueante (`ingest_worker_future`, `crates/clawg-core/src/runtime.rs:477`). En una corrida, cada archivo MUST hashearse una sola vez: el de la caché al leerlo (`check_cache`, `:572`), el bajado mientras llegan sus bytes, sin volver a leerlo del disco. Los bytes que recibe la carga MUST ser los mismos que se hashearon. El cierre del archivo bajado (`sync_all` y el `rename`) MUST correr en una tarea bloqueante. Como el archivo bajado queda en memoria para entregarlo sin releerlo, un archivo que anuncia o trae más de 600 MB (`MAX_FILE_BYTES`, `:836`, lo que pide libre el chequeo de disco y más que cualquier archivo del modelo) MUST fallar sin reintentar y sin reservar esa memoria (`DownloadError::TooLarge`, `:350`).
 
 #### Escenario: falta un archivo chico
 - GIVEN la caché completa salvo `config.json`
