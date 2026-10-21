@@ -201,9 +201,12 @@ pub struct ReplayCounts {
     pub keyed: usize,
     pub unkeyed: usize,
     pub unkeyed_claim: usize,
+    /// Unkeyed saves of a type that asserts nothing: the warning never fires
+    /// on them, so they are left out of the population.
+    pub unkeyed_other: usize,
     pub reinforced: usize,
-    /// Unkeyed saves that can be labelled: those that fire and those with an
-    /// earlier live save of their agent and project.
+    /// Unkeyed saves of a type that asserts that can be labelled: those that
+    /// fire and those with an earlier live save of their agent and project.
     pub population: usize,
     pub fires: usize,
     /// Firings whose candidate was deleted, or replaced by a verdict, in the
@@ -258,6 +261,8 @@ pub fn analyse(flow: &[Save], reports: &[EvalSaved]) -> Analysis {
             let claim = is_claim_type(&save.memory_type);
             if claim {
                 counts.unkeyed_claim += 1;
+            } else {
+                counts.unkeyed_other += 1;
             }
             if report.rows.iter().all(|&(_, inserted)| !inserted) {
                 counts.reinforced += 1;
@@ -285,7 +290,7 @@ pub fn analyse(flow: &[Save], reports: &[EvalSaved]) -> Analysis {
                         if claim && elsewhere {
                             counts.other_project_candidate += 1;
                         }
-                        if analysis.has_live_predecessor(flow, i) {
+                        if claim && analysis.has_live_predecessor(flow, i) {
                             Status::Pairable
                         } else {
                             Status::Alone
@@ -878,7 +883,24 @@ mod tests {
         let c = &analysis.counts;
         assert_eq!((c.sent, c.unkeyed, c.unkeyed_claim, c.reinforced), (4, 4, 3, 1));
         assert_eq!((c.fires, c.fires_with_gone_candidate), (1, 1));
-        assert_eq!((c.population, c.rest), (2, 1), "the session summary has a candidate but asserts nothing");
+        assert_eq!((c.population, c.rest), (1, 0), "the session summary asserts nothing: it is not in the population");
+        assert_eq!(c.unkeyed_other, 1, "it is counted apart");
+        let selected = select(&analysis, DEFAULT_SEED);
+        assert_eq!(selected.iter().map(|s| s.save).collect::<Vec<_>>(), vec![1], "nor is it ever labelled");
+    }
+
+    #[test]
+    fn an_unkeyed_save_of_a_type_that_asserts_nothing_still_counts_in_the_per_save_mean() {
+        let flow = [save("a", "x", "semantic_fact", "0: a fact"), save("a", "x", "session_summary", "1: a summary")];
+        let reports = [report(&[10], &[], &[]), report(&[11], &[], &[])];
+
+        let analysis = analyse(&flow, &reports);
+
+        let c = &analysis.counts;
+        assert_eq!((c.sent, c.unkeyed, c.unkeyed_other, c.population), (2, 2, 1, 0));
+        let replay = ReplayFile { replay: c.clone(), ..replay_file(0, 0, vec![]) };
+        let scored = score(&replay, &[]).unwrap();
+        assert_eq!(scored.warning.fire_rate.n, 2, "the mean divides by every save of the flow");
     }
 
     #[test]
