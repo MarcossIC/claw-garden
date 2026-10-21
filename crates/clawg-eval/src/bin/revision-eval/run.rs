@@ -139,7 +139,8 @@ pub struct ArmReport {
 
 #[derive(Debug, Serialize)]
 pub struct ChainsReport {
-    pub model: String,
+    /// The embedding model's id, which names its contract.
+    pub model_contract: String,
     pub set_version: u32,
     pub set_sha256: String,
     pub chains: usize,
@@ -194,7 +195,7 @@ async fn measure(input: &ChainsInput<'_>, scratch: &Path) -> Result<ChainsReport
     let longest_key = input.set.chains.iter().map(|c| c.topic_key.as_str()).max_by_key(|k| k.len()).unwrap_or_default();
     let m4 = cost::m4(&keyed.queries, &keys, longest_key, AGENT, PROJECT, input.counter)?;
     Ok(ChainsReport {
-        model: input.embedder.model_id().to_string(),
+        model_contract: input.embedder.model_id().to_string(),
         set_version: input.set.version,
         set_sha256: input.set.sha256.clone(),
         chains: input.set.chains.len(),
