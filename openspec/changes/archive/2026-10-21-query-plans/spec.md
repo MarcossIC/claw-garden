@@ -23,7 +23,7 @@
 
 ## R2. La salida no cambia
 
-Las dos sentencias MUST devolver las mismas filas en el mismo orden que antes: `created_at DESC` y, dentro de un mismo sello (los pedazos de un save lo comparten), `id ASC`. El texto de LAST SESSION y RECENT, el pool de 200 filas, la ventana de siete días y el filtro de autores por `Reach::admits` MUST quedar como están ([`specs/retrieval`](../../specs/retrieval/spec.md), «El contexto sin consulta» y «La última sesión»).
+Las dos sentencias MUST devolver las mismas filas en el mismo orden que antes: `created_at DESC` y, dentro de un mismo sello (los pedazos de un save lo comparten), `id ASC`. El texto de LAST SESSION y RECENT, el pool de 200 filas, la ventana de siete días y el filtro de autores por `Reach::admits` MUST quedar como están ([`specs/retrieval`](../../../specs/retrieval/spec.md), «El contexto sin consulta» y «La última sesión»).
 
 #### Escenario: sellos repetidos
 - GIVEN seis resúmenes de un agente en un proyecto, insertados con dos sellos alternados
