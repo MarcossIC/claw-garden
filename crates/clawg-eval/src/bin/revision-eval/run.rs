@@ -28,6 +28,7 @@ use crate::chains::{
 };
 use crate::cost::{self, CostError, Query, M4};
 use crate::set::ChainSet;
+use crate::store::{self, ReplayFile, Scored, StoreError};
 
 /// The one agent that saves every arm.
 const AGENT: &str = "revision-eval";
@@ -65,6 +66,37 @@ pub enum RunError {
     Client(#[from] ClientError),
     #[error(transparent)]
     Cost(#[from] CostError),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error("could not read or write {}: {source}", path.display())]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("{0}")]
+    Refused(String),
+}
+
+impl RunError {
+    /// Whether the run failed on what the owner handed it, not on the run.
+    pub fn is_bad_input(&self) -> bool {
+        match self {
+            Self::Store(e) => !matches!(e, StoreError::Replay(_)),
+            Self::OutsideTemp(..) | Self::Refused(_) => true,
+            _ => false,
+        }
+    }
+
+    /// Whether the working directory stays for another try: the owner's
+    /// labels are in it.
+    fn keeps_work(&self) -> bool {
+        match self {
+            Self::Store(e) => e.keeps_work(),
+            Self::Refused(_) | Self::OutsideTemp(..) => true,
+            _ => false,
+        }
+    }
 }
 
 /// What a run measures.
@@ -416,6 +448,196 @@ async fn remove_scratch(scratch: &Path) {
     eprintln!("warning: could not remove the scratch directory {}", scratch.display());
 }
 
+const LABELS_FILE: &str = "labels.jsonl";
+const REPLAY_FILE: &str = "replay.json";
+const REPLAY_STORE: &str = "replay";
+const WORK_DIR_PREFIX: &str = "revision-eval-";
+
+/// What the first step of `store` replays with.
+pub struct ReplayInput<'a> {
+    pub embedder: &'a EvalEmbedder,
+    /// Where the chunker looks for `tokenizer.json`, as in [`ChainsInput`].
+    pub tokenizer_dir: &'a Path,
+    pub counter: &'a EvalTokenCounter,
+    pub seed: u64,
+    pub fake: bool,
+}
+
+/// What the first step reports: counts only, never a stored text.
+#[derive(Debug, Serialize)]
+pub struct ReplaySummary {
+    pub export: store::ExportCounts,
+    pub replay: store::ReplayCounts,
+    pub labelled_firing: usize,
+    pub labelled_sample: usize,
+    pub seed: u64,
+}
+
+/// The directory `file` sits in: a `revision-eval-*` directory made directly
+/// under the system temp dir. Every file of a `store` run lives in it, and it
+/// is the one thing removed, so nothing else is ever deleted.
+fn work_dir(file: &Path) -> Result<PathBuf, RunError> {
+    let temp = std::env::temp_dir();
+    let outside = || RunError::OutsideTemp(file.to_path_buf(), temp.clone());
+    let dir = file.parent().and_then(|p| p.canonicalize().ok()).ok_or_else(outside)?;
+    let root = temp.canonicalize().map_err(|_| outside())?;
+    if !dir.starts_with(&root) {
+        return Err(outside());
+    }
+    let named = dir.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(WORK_DIR_PREFIX));
+    if dir.parent() != Some(root.as_path()) || !named {
+        return Err(RunError::Refused(format!(
+            "{} must sit in a {WORK_DIR_PREFIX}* directory made directly under {}",
+            file.display(),
+            temp.display()
+        )));
+    }
+    Ok(dir)
+}
+
+fn io_error(path: &Path) -> impl FnOnce(std::io::Error) -> RunError + '_ {
+    move |source| RunError::Io { path: path.to_path_buf(), source }
+}
+
+fn write_new_file(path: &Path, text: &str) -> Result<(), RunError> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path).map_err(io_error(path))?;
+    file.write_all(text.as_bytes()).map_err(io_error(path))
+}
+
+/// The first step: replays the export beside it, leaves `labels.jsonl` and
+/// `replay.json` in its directory and removes the replay store. Any error
+/// removes the directory with the export in it.
+pub async fn store_replay(export: &Path, input: &ReplayInput<'_>) -> Result<ReplaySummary, RunError> {
+    let dir = work_dir(export)?;
+    let replayed = replay_in(&dir, export, input).await;
+    if replayed.is_err() {
+        remove_scratch(&dir).await;
+    }
+    replayed
+}
+
+async fn replay_in(dir: &Path, export: &Path, input: &ReplayInput<'_>) -> Result<ReplaySummary, RunError> {
+    let text = std::fs::read_to_string(export).map_err(io_error(export))?;
+    let parsed = store::read_export(&text)?;
+    drop(text);
+    let flow = &parsed.flow;
+
+    let store_dir = dir.join(REPLAY_STORE);
+    std::fs::create_dir_all(&store_dir).map_err(|source| RunError::Scratch { path: store_dir.clone(), source })?;
+    let ingest = EvalIngest::open(&store_dir, input.embedder, input.tokenizer_dir).await?;
+    // The order the saves were made in, each with what it was saved with:
+    // `import` would insert the rows without running the detector.
+    let mut reports = Vec::with_capacity(flow.len());
+    for save in flow {
+        reports.push(
+            ingest
+                .save(EvalSave {
+                    agent_id: &save.agent,
+                    project_id: save.project.as_deref(),
+                    content: &save.text,
+                    memory_type: &save.memory_type,
+                    importance: save.importance,
+                    topic_key: save.topic_key.as_deref(),
+                })
+                .await?,
+        );
+    }
+    let runtime = ingest.finish().await?;
+
+    let analysis = store::analyse(flow, &reports);
+    let mut selected = store::select(&analysis, input.seed);
+    for pick in selected.iter_mut().filter(|p| p.earlier.is_none()) {
+        pick.earlier = nearest_earlier(&runtime, &analysis, flow, &reports[pick.save], pick.save).await?;
+    }
+    // Closing is awaited, as in `release`: Windows cannot delete the files
+    // of a store whose connection has not closed yet.
+    runtime.store.conn.clone().close().await.map_err(|e| RunError::Close(e.to_string()))?;
+    drop(runtime);
+    remove_scratch(&store_dir).await;
+
+    let labels = store::build_labels(flow, &selected);
+    let replay = ReplayFile {
+        export_format: parsed.format.clone(),
+        export_version: parsed.version,
+        model_contract: input.embedder.model_id().to_string(),
+        seed: input.seed,
+        fake: input.fake,
+        export: parsed.counts.clone(),
+        replay: analysis.counts.clone(),
+        warning_line_tokens: input.counter.count(cost::WARNING_LINE),
+        labelled: labels.meta.clone(),
+    };
+    let lines: String =
+        labels.lines.iter().map(|l| serde_json::to_string(l).expect("a label line serializes") + "\n").collect();
+    write_new_file(&dir.join(LABELS_FILE), &lines)?;
+    let replay_json = serde_json::to_string_pretty(&replay).expect("the replay file serializes");
+    write_new_file(&dir.join(REPLAY_FILE), &replay_json)?;
+    Ok(ReplaySummary {
+        export: parsed.counts.clone(),
+        replay: analysis.counts.clone(),
+        labelled_firing: labels.meta.iter().filter(|m| m.fired).count(),
+        labelled_sample: labels.meta.iter().filter(|m| !m.fired).count(),
+        seed: input.seed,
+    })
+}
+
+/// The earlier save of the same agent and project whose rows lie closest to
+/// the rows the save `later` left, among those still live when it came.
+async fn nearest_earlier(
+    runtime: &MemoryRuntime,
+    analysis: &store::Analysis,
+    flow: &[store::Save],
+    report: &EvalSaved,
+    later: usize,
+) -> Result<Option<usize>, RunError> {
+    let predecessors = analysis.predecessors(flow, later);
+    let to: Vec<i64> = predecessors.iter().flat_map(|&j| analysis.rows_of(j).iter().copied()).collect();
+    let from = row_ids(report);
+    let mut nearest: BTreeMap<usize, f64> = BTreeMap::new();
+    for (_, row, distance) in row_distances(runtime, &from, &to).await? {
+        let Some(earlier) = analysis.owner_of(row) else { continue };
+        let best = nearest.entry(earlier).or_insert(distance);
+        *best = best.min(distance);
+    }
+    Ok(store::closest(&nearest.into_iter().collect::<Vec<_>>()))
+}
+
+/// The second step: reads the labels beside `labels` and the replay file,
+/// scores them, hands the result to `write` and removes the directory. A
+/// labels file the owner has not finished is refused and the directory stays,
+/// since the labelling is in it; every other error removes it.
+pub async fn store_score(
+    labels: &Path,
+    check: impl FnOnce(&ReplayFile) -> Result<(), RunError>,
+    write: impl FnOnce(&Scored) -> Result<(), RunError>,
+) -> Result<Scored, RunError> {
+    let dir = work_dir(labels)?;
+    let scored = read_and_score(&dir, labels, check);
+    match &scored {
+        Err(e) if e.keeps_work() => {}
+        Err(_) => remove_scratch(&dir).await,
+        Ok(scored) => {
+            let written = write(scored);
+            remove_scratch(&dir).await;
+            written?;
+        }
+    }
+    scored
+}
+
+fn read_and_score(
+    dir: &Path,
+    labels: &Path,
+    check: impl FnOnce(&ReplayFile) -> Result<(), RunError>,
+) -> Result<Scored, RunError> {
+    let replay_path = dir.join(REPLAY_FILE);
+    let replay = store::parse_replay(&std::fs::read_to_string(&replay_path).map_err(io_error(&replay_path))?)?;
+    check(&replay)?;
+    let labels = store::parse_labels(&std::fs::read_to_string(labels).map_err(io_error(labels))?)?;
+    Ok(store::score(&replay, &labels)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,6 +815,104 @@ mod tests {
             other => panic!("expected OutsideTemp, got {other:?}"),
         }
         assert!(!outside.exists(), "a refused run must not leave a directory behind");
+    }
+
+    use crate::store::fixtures::{small_export, work_with};
+
+    async fn fake_replay(export: &Path, seed: u64) -> Result<ReplaySummary, RunError> {
+        let embedder = EvalEmbedder::fake();
+        let counter = EvalTokenCounter::fake();
+        let no_tokenizer = scratch_dir();
+        store_replay(export, &ReplayInput { embedder: &embedder, tokenizer_dir: &no_tokenizer, counter: &counter, seed, fake: true }).await
+    }
+
+    #[tokio::test]
+    async fn a_fake_store_run_counts_and_labels_a_small_export() {
+        let (dir, export) = work_with(&small_export());
+
+        let summary = fake_replay(&export, store::DEFAULT_SEED).await.expect("the replay must succeed");
+
+        let (e, r) = (&summary.export, &summary.replay);
+        assert_eq!((e.rows, e.saves, e.without_agent, e.keyed_saves), (6, 6, 1, 1));
+        assert_eq!((r.sent, r.keyed, r.unkeyed, r.reinforced), (5, 1, 4, 1), "the repeated sentence only reinforces");
+        assert_eq!((r.fires, r.population, r.rest), (0, 2, 2), "the double places nothing near");
+        assert_eq!((summary.labelled_firing, summary.labelled_sample), (0, 2));
+
+        let labels = std::fs::read_to_string(dir.join(LABELS_FILE)).unwrap();
+        let lines = store::parse_labels(&labels).unwrap();
+        let replay = store::parse_replay(&std::fs::read_to_string(dir.join(REPLAY_FILE)).unwrap()).unwrap();
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().all(|l| l.proposed.is_none() && l.label.is_none()));
+        assert_eq!(replay.labelled.len(), 2);
+        assert!(replay.fake && replay.warning_line_tokens > 0 && replay.model_contract == EvalEmbedder::fake().model_id());
+        assert!(!dir.join(REPLAY_STORE).exists(), "the replay store is removed at the end of the first step");
+        assert!(export.exists());
+        remove_scratch(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn the_working_files_are_removed_even_when_the_run_fails() {
+        // The first step: an export of a version nobody reads.
+        let (dir, export) = work_with(&small_export());
+        let text = std::fs::read_to_string(&export).unwrap().replacen("\"version\":1", "\"version\":2", 1);
+        std::fs::write(&export, text).unwrap();
+        let error = fake_replay(&export, 1).await.unwrap_err();
+        assert!(matches!(error, RunError::Store(StoreError::Format(_))), "{error}");
+        assert!(error.is_bad_input());
+        assert!(!dir.exists(), "a failed first step removes the directory with the export in it");
+
+        // The second step, on a replay file that cannot be read.
+        let (dir, export) = work_with(&small_export());
+        fake_replay(&export, 1).await.unwrap();
+        std::fs::write(dir.join(REPLAY_FILE), "{").unwrap();
+        let error = store_score(&dir.join(LABELS_FILE), |_| Ok(()), |_| Ok(())).await.unwrap_err();
+        assert!(matches!(error, RunError::Store(StoreError::Replay(_))), "{error}");
+        assert!(!dir.exists());
+
+        // The second step, when the result cannot be written.
+        let (dir, export) = work_with(&small_export());
+        fake_replay(&export, 1).await.unwrap();
+        let labels = std::fs::read_to_string(dir.join(LABELS_FILE)).unwrap().replace("\"label\":null", "\"label\":\"other\"");
+        std::fs::write(dir.join(LABELS_FILE), labels).unwrap();
+        let refused = store_score(&dir.join(LABELS_FILE), |_| Ok(()), |_| Err(RunError::Refused("no".into()))).await;
+        assert!(refused.is_err());
+        assert!(!dir.exists(), "the directory goes whether or not the result is written");
+    }
+
+    #[tokio::test]
+    async fn a_labels_file_the_owner_has_not_finished_keeps_the_directory() {
+        let (dir, export) = work_with(&small_export());
+        fake_replay(&export, 1).await.unwrap();
+
+        let error = store_score(&dir.join(LABELS_FILE), |_| Ok(()), |_| Ok(())).await.unwrap_err();
+
+        assert!(matches!(error, RunError::Store(StoreError::EmptyLabel(1))), "{error}");
+        assert!(dir.join(LABELS_FILE).exists() && dir.join(REPLAY_FILE).exists());
+        let refused = store_score(&dir.join(LABELS_FILE), |_| Err(RunError::Refused("taken".into())), |_| Ok(())).await;
+        assert!(matches!(refused, Err(RunError::Refused(_))));
+        assert!(dir.exists(), "a refusal before scoring leaves the labelling alone");
+        remove_scratch(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn a_working_directory_outside_the_temp_dir_is_refused_and_left_alone() {
+        let outside = std::env::temp_dir().parent().expect("the temp dir has a parent").join(format!("revision-eval-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let export_path = outside.join("export.jsonl");
+        std::fs::write(&export_path, "kept").unwrap();
+        let (inside, _) = work_with(&[]);
+        let loose = inside.parent().unwrap().join(format!("loose-{}.jsonl", uuid::Uuid::new_v4()));
+        std::fs::write(&loose, "kept").unwrap();
+
+        let a = fake_replay(&export_path, 1).await.unwrap_err();
+        let b = fake_replay(&loose, 1).await.unwrap_err();
+
+        assert!(matches!(a, RunError::OutsideTemp(..)), "{a}");
+        assert!(matches!(b, RunError::Refused(_)), "{b}");
+        assert!(export_path.exists() && loose.exists() && inside.exists());
+        std::fs::remove_dir_all(&outside).unwrap();
+        std::fs::remove_file(&loose).unwrap();
+        remove_scratch(&inside).await;
     }
 
     #[test]

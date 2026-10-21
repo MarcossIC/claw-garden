@@ -35,9 +35,62 @@ impl Rate {
     }
 }
 
+/// SplitMix64, the generator `golden-mine` and `rag-eval` carry, copied for
+/// the same reason as the rest of this file. `rand` is avoided because its
+/// sequences may change between versions, and a labelled sample must be the
+/// same one for the same seed.
+pub struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    pub fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    pub fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Fisher-Yates.
+    pub fn shuffle<T>(&mut self, items: &mut [T]) {
+        for i in (1..items.len()).rev() {
+            let j = (self.next_u64() % (i as u64 + 1)) as usize;
+            items.swap(i, j);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splitmix_matches_the_golden_mine_sequence() {
+        let mut rng = SplitMix64::new(0);
+        assert_eq!(rng.next_u64(), 0xE220_A839_7B1D_CDAF);
+        assert_eq!(rng.next_u64(), 0x6E78_9E6A_A1B9_65F4);
+        assert_eq!(rng.next_u64(), 0x06C4_5D18_8009_454F);
+    }
+
+    #[test]
+    fn a_shuffle_keeps_every_item_and_repeats_for_a_seed() {
+        let shuffled = |seed| {
+            let mut items: Vec<u32> = (0..20).collect();
+            SplitMix64::new(seed).shuffle(&mut items);
+            items
+        };
+        let mut sorted = shuffled(3);
+        assert_ne!(sorted, (0..20).collect::<Vec<_>>());
+        assert_eq!(shuffled(3), sorted);
+        assert_ne!(shuffled(4), sorted);
+        sorted.sort();
+        assert_eq!(sorted, (0..20).collect::<Vec<_>>());
+    }
 
     #[test]
     fn a_rate_carries_its_wilson_interval() {

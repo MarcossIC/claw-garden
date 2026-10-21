@@ -11,6 +11,7 @@ mod cost;
 mod run;
 mod set;
 mod stats;
+mod store;
 
 use std::path::{Path, PathBuf};
 
@@ -24,35 +25,54 @@ const EXIT_MODEL_ABSENT: i32 = 3;
 
 const HELP_TEXT: &str = "\
 revision-eval chains (--real | --fake) [--tag SLUG]
+revision-eval store --export FILE [--seed N] (--real | --fake)
+revision-eval store --labels FILE [--tag SLUG]
 
   chains   saves crates/clawg-eval/data/revision-chains.json in three arms
            (without a key, with its key, and only the last version), each
            after the MUST sentences of openspec/specs, and classifies every
            transition of the arm without a key
+  store    measures, on a `clawg export --include-deleted` file, how often a
+           save without a key revises an earlier one, in two steps:
+             --export  replays the saves through the detector and leaves
+                       labels.jsonl and replay.json beside the export
+             --labels  scores the labels the owner filled in, prints and
+                       writes the result, and removes the working directory
+           The export must sit in a revision-eval-* directory made directly
+           under the system temp dir, which holds every file with stored text
+           and is removed at the end, and on any error but a labels file that
+           is not finished yet.
   --real   the cached embedding model of the data profile
   --fake   the deterministic double: checks the pipeline, not the numbers
-  --tag    with --real, names a second run of the day:
-           docs/eval/results/{date}-real-revision-eval-chains-{SLUG}.json
+  --seed   the seed of the sample of labelled pairs
+  --tag    names a second run of the day:
+           docs/eval/results/{date}-real-revision-eval-{chains|store}-{SLUG}.json
 
-Prints the JSON report; --real also writes it to docs/eval/results, never over
-a file that is already there.
+Prints the JSON report; --real (and `store --labels` after a --real replay)
+also writes it to docs/eval/results, never over a file that is already there.
 Exit 0 measured, 1 failed, 2 bad input, 3 model not cached.";
 
 #[derive(Debug, Clone, PartialEq)]
 enum Command {
     Chains { real: bool, tag: Option<String> },
+    StoreReplay { export: PathBuf, seed: u64, real: bool },
+    StoreScore { labels: PathBuf, tag: Option<String> },
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Command>, String> {
     let mut args = args.skip(1);
-    match args.next().as_deref() {
+    let store = match args.next().as_deref() {
         Some("--help" | "-h") => return Ok(None),
-        Some("chains") => {}
+        Some("chains") => false,
+        Some("store") => true,
         Some(other) => return Err(format!("unknown command {other}")),
         None => return Err("name a command".into()),
-    }
+    };
     let mut real = None;
     let mut tag = None;
+    let mut export: Option<PathBuf> = None;
+    let mut labels: Option<PathBuf> = None;
+    let mut seed = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return Ok(None),
@@ -61,8 +81,32 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Command>, Str
             "--fake" => real = Some(false),
             "--tag" if tag.is_some() => return Err("pass --tag once".into()),
             "--tag" => tag = Some(args.next().filter(|t| is_slug(t)).ok_or("--tag takes a slug of a-z, 0-9 and '-'")?),
+            "--export" if store && export.is_none() => export = Some(args.next().ok_or("--export takes a file")?.into()),
+            "--labels" if store && labels.is_none() => labels = Some(args.next().ok_or("--labels takes a file")?.into()),
+            "--seed" if store && seed.is_none() => {
+                seed = Some(args.next().and_then(|s| s.parse::<u64>().ok()).ok_or("--seed takes a number")?)
+            }
             other => return Err(format!("unknown argument {other}")),
         }
+    }
+    if store {
+        return match (export, labels) {
+            (Some(export), None) => {
+                let real = real.ok_or("pass --real or --fake")?;
+                if tag.is_some() {
+                    return Err("--tag names the result file, which --labels writes".into());
+                }
+                Ok(Some(Command::StoreReplay { export, seed: seed.unwrap_or(store::DEFAULT_SEED), real }))
+            }
+            (None, Some(labels)) => {
+                if real.is_some() || seed.is_some() {
+                    return Err("--labels scores what the replay left: --real, --fake and --seed belong to --export".into());
+                }
+                Ok(Some(Command::StoreScore { labels, tag }))
+            }
+            (Some(_), Some(_)) => Err("pass one of --export and --labels".into()),
+            (None, None) => Err("pass --export or --labels".into()),
+        };
     }
     let real = real.ok_or("pass --real or --fake")?;
     if tag.is_some() && !real {
@@ -76,11 +120,31 @@ fn is_slug(text: &str) -> bool {
 }
 
 /// The name of a run's result file, as `rag-eval` names its own.
-fn results_filename(date: &str, tag: Option<&str>) -> String {
+fn results_filename(command: &str, date: &str, tag: Option<&str>) -> String {
     match tag {
-        Some(tag) => format!("{date}-real-revision-eval-chains-{tag}.json"),
-        None => format!("{date}-real-revision-eval-chains.json"),
+        Some(tag) => format!("{date}-real-revision-eval-{command}-{tag}.json"),
+        None => format!("{date}-real-revision-eval-{command}.json"),
     }
+}
+
+/// The directory the dated results go to.
+fn results_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/eval/results")
+}
+
+/// What the result of `store` holds: the day, the clawg that measured and the
+/// scored report, which has counts, rates and bounds and nothing stored.
+#[derive(Serialize)]
+struct StoreResultFile<'a> {
+    date: &'a str,
+    clawg_version: &'static str,
+    #[serde(flatten)]
+    report: &'a store::Scored,
+}
+
+fn store_result_json(date: &str, report: &store::Scored) -> String {
+    let file = StoreResultFile { date, clawg_version: env!("CARGO_PKG_VERSION"), report };
+    serde_json::to_string_pretty(&file).expect("the report always serializes")
 }
 
 /// What a result file holds: the day, the clawg that measured and the whole
@@ -137,17 +201,115 @@ async fn main() {
 }
 
 async fn run(args: impl Iterator<Item = String>) -> i32 {
-    let (real, tag) = match parse_args(args) {
-        Ok(Some(Command::Chains { real, tag })) => (real, tag),
+    match parse_args(args) {
+        Ok(Some(Command::Chains { real, tag })) => run_chains(real, tag).await,
+        Ok(Some(Command::StoreReplay { export, seed, real })) => run_store_replay(&export, seed, real).await,
+        Ok(Some(Command::StoreScore { labels, tag })) => run_store_score(&labels, tag.as_deref()).await,
         Ok(None) => {
             println!("{HELP_TEXT}");
-            return EXIT_OK;
+            EXIT_OK
         }
         Err(e) => {
             eprintln!("error: {e}\n\n{HELP_TEXT}");
-            return EXIT_RUNTIME_FAILURE;
+            EXIT_RUNTIME_FAILURE
+        }
+    }
+}
+
+/// The embedding model and the token counter of a run, with the data
+/// directory they come from: the real ones need the model already cached.
+async fn load_models(real: bool) -> Result<(EvalEmbedder, EvalTokenCounter, PathBuf), i32> {
+    let base_dir = match clawg_core::paths::data_dir_from_env() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("failed to resolve the data directory: {e}");
+            return Err(EXIT_RUNTIME_FAILURE);
         }
     };
+    if !real {
+        return Ok((EvalEmbedder::fake(), EvalTokenCounter::fake(), base_dir));
+    }
+    if !model_is_cached(&base_dir) {
+        eprintln!("the model is not cached under {}; run rag-eval --real once to download it", base_dir.display());
+        return Err(EXIT_MODEL_ABSENT);
+    }
+    let embedder = EvalEmbedder::real(&base_dir).await.map_err(|e| {
+        eprintln!("failed to load the real embedding model: {e}");
+        EXIT_RUNTIME_FAILURE
+    })?;
+    let counter = EvalTokenCounter::real(&base_dir).map_err(|e| {
+        eprintln!("failed to load the tokenizer: {e}");
+        EXIT_RUNTIME_FAILURE
+    })?;
+    Ok((embedder, counter, base_dir))
+}
+
+fn exit_for(error: &run::RunError) -> i32 {
+    if error.is_bad_input() {
+        EXIT_INPUT_INVALID
+    } else {
+        EXIT_RUNTIME_FAILURE
+    }
+}
+
+/// The first step of `store`: replays the export and leaves the labels to fill.
+async fn run_store_replay(export: &Path, seed: u64, real: bool) -> i32 {
+    let (embedder, counter, base_dir) = match load_models(real).await {
+        Ok(models) => models,
+        Err(code) => return code,
+    };
+    // Under --fake the chunker must not find a tokenizer.
+    let tokenizer_dir = if real { base_dir } else { run::scratch_dir() };
+    let input = run::ReplayInput { embedder: &embedder, tokenizer_dir: &tokenizer_dir, counter: &counter, seed, fake: !real };
+    match run::store_replay(export, &input).await {
+        Ok(summary) => {
+            println!("{}", serde_json::to_string_pretty(&summary).expect("the summary always serializes"));
+            let dir = export.parent().unwrap_or(export);
+            eprintln!(
+                "fill `label` (`revision` or `other`) of every pair in {}/labels.jsonl, then run:\n  revision-eval store --labels {}/labels.jsonl",
+                dir.display(),
+                dir.display()
+            );
+            EXIT_OK
+        }
+        Err(e) => {
+            eprintln!("replay failed: {e}");
+            exit_for(&e)
+        }
+    }
+}
+
+/// The second step of `store`: scores the labels, prints the result and, for
+/// a replay on the real model, writes it, never over a file that is there.
+async fn run_store_score(labels: &Path, tag: Option<&str>) -> i32 {
+    let date = current_date();
+    let result_path = |fake: bool| (!fake).then(|| results_dir().join(results_filename("store", &date, tag)));
+    let check = |replay: &store::ReplayFile| match result_path(replay.fake) {
+        Some(path) if path.exists() => {
+            Err(run::RunError::Refused(format!("{} already exists; pass --tag to name this run", path.display())))
+        }
+        _ => Ok(()),
+    };
+    let write = |scored: &store::Scored| {
+        let json = store_result_json(&date, scored);
+        println!("{json}");
+        let Some(path) = result_path(scored.fake) else {
+            return Ok(());
+        };
+        write_new(&path, &json).map_err(|source| run::RunError::Io { path: path.clone(), source })?;
+        eprintln!("wrote {}", path.display());
+        Ok(())
+    };
+    match run::store_score(labels, check, write).await {
+        Ok(_) => EXIT_OK,
+        Err(e) => {
+            eprintln!("scoring failed: {e}");
+            exit_for(&e)
+        }
+    }
+}
+
+async fn run_chains(real: bool, tag: Option<String>) -> i32 {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let path = root.join("data/revision-chains.json");
     let set = match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| set::parse_set(&t)) {
@@ -172,45 +334,15 @@ async fn run(args: impl Iterator<Item = String>) -> i32 {
 
     // Checked before the run: a real one takes minutes of model time.
     let date = current_date();
-    let result_path: Option<PathBuf> =
-        real.then(|| root.join("../../docs/eval/results").join(results_filename(&date, tag.as_deref())));
+    let result_path: Option<PathBuf> = real.then(|| results_dir().join(results_filename("chains", &date, tag.as_deref())));
     if let Some(path) = result_path.as_ref().filter(|p| p.exists()) {
         eprintln!("{} already exists; pass --tag to name this run", path.display());
         return EXIT_INPUT_INVALID;
     }
 
-    let base_dir = match clawg_core::paths::data_dir_from_env() {
-        Ok(dir) => dir,
-        Err(e) => {
-            eprintln!("failed to resolve the data directory: {e}");
-            return EXIT_RUNTIME_FAILURE;
-        }
-    };
-    let embedder = if real {
-        if !model_is_cached(&base_dir) {
-            eprintln!("the model is not cached under {}; run rag-eval --real once to download it", base_dir.display());
-            return EXIT_MODEL_ABSENT;
-        }
-        match EvalEmbedder::real(&base_dir).await {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("failed to load the real embedding model: {e}");
-                return EXIT_RUNTIME_FAILURE;
-            }
-        }
-    } else {
-        EvalEmbedder::fake()
-    };
-    let counter = if real {
-        match EvalTokenCounter::real(&base_dir) {
-            Ok(counter) => counter,
-            Err(e) => {
-                eprintln!("failed to load the tokenizer: {e}");
-                return EXIT_RUNTIME_FAILURE;
-            }
-        }
-    } else {
-        EvalTokenCounter::fake()
+    let (embedder, counter, base_dir) = match load_models(real).await {
+        Ok(models) => models,
+        Err(code) => return code,
     };
     let scratch = run::scratch_dir();
     // Under --fake the chunker must not find a tokenizer, and the scratch
@@ -282,9 +414,42 @@ mod tests {
     }
 
     #[test]
+    fn the_arguments_of_store_parse() {
+        assert_eq!(
+            parse_args(args(&["store", "--export", "d/export.jsonl", "--fake"])).unwrap(),
+            Some(Command::StoreReplay { export: "d/export.jsonl".into(), seed: store::DEFAULT_SEED, real: false })
+        );
+        assert_eq!(
+            parse_args(args(&["store", "--real", "--seed", "9", "--export", "e"])).unwrap(),
+            Some(Command::StoreReplay { export: "e".into(), seed: 9, real: true })
+        );
+        assert_eq!(
+            parse_args(args(&["store", "--labels", "l", "--tag", "again"])).unwrap(),
+            Some(Command::StoreScore { labels: "l".into(), tag: Some("again".into()) })
+        );
+        for bad in [
+            &["store"][..],
+            &["store", "--export", "e"],
+            &["store", "--export", "e", "--labels", "l", "--fake"],
+            &["store", "--export", "e", "--fake", "--tag", "x"],
+            &["store", "--labels", "l", "--fake"],
+            &["store", "--labels", "l", "--seed", "3"],
+            &["store", "--export", "e", "--fake", "--seed", "x"],
+            &["store", "--export"],
+            &["chains", "--fake", "--export", "e"],
+        ] {
+            assert!(parse_args(args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn the_result_file_is_named_by_date_and_tag() {
-        assert_eq!(results_filename("2026-10-21", None), "2026-10-21-real-revision-eval-chains.json");
-        assert_eq!(results_filename("2026-10-21", Some("again")), "2026-10-21-real-revision-eval-chains-again.json");
+        assert_eq!(results_filename("chains", "2026-10-21", None), "2026-10-21-real-revision-eval-chains.json");
+        assert_eq!(
+            results_filename("chains", "2026-10-21", Some("again")),
+            "2026-10-21-real-revision-eval-chains-again.json"
+        );
+        assert_eq!(results_filename("store", "2026-10-21", None), "2026-10-21-real-revision-eval-store.json");
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(10_957), (2000, 1, 1));
     }
@@ -328,5 +493,53 @@ mod tests {
         assert_eq!(result["distractors"], distractors.len());
         let arms: Vec<&str> = result["arms"].as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(arms, ["control", "keyed", "no_key"]);
+    }
+
+    /// The whole of `store` on the double: the result of a run whose export
+    /// holds recognisable texts and a key must hold none of them.
+    #[tokio::test]
+    async fn the_results_file_of_store_holds_no_stored_text() {
+        use store::fixtures::{small_export, work_with};
+
+        let rows = small_export();
+        let (dir, export) = work_with(&rows);
+        let embedder = EvalEmbedder::fake();
+        let counter = EvalTokenCounter::fake();
+        let no_tokenizer = run::scratch_dir();
+        let input = run::ReplayInput { embedder: &embedder, tokenizer_dir: &no_tokenizer, counter: &counter, seed: 5, fake: true };
+        run::store_replay(&export, &input).await.expect("the replay must succeed");
+        let labels_path = dir.join("labels.jsonl");
+        let labels = std::fs::read_to_string(&labels_path).unwrap();
+        // The labels are the one file that carries texts: the check below is not vacuous.
+        assert!(labels.contains("nightly backup"), "{labels}");
+        std::fs::write(&labels_path, labels.replace("\"proposed\":null", "\"proposed\":\"revision\"").replace("\"label\":null", "\"label\":\"other\"")).unwrap();
+
+        let mut result = String::new();
+        let scored = run::store_score(&labels_path, |_| Ok(()), |scored| {
+            result = store_result_json("2026-10-21", scored);
+            Ok(())
+        })
+        .await
+        .expect("the labels score");
+
+        assert!(scored.fake);
+        let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(value["export_format"], "clawg-memories");
+        assert_eq!(value["export_version"], 1);
+        assert_eq!(value["seed"], 5);
+        assert!(value.get("fake").is_none());
+        for row in &rows {
+            assert!(!result.contains(&row.content), "stored text in the result: {}", row.content);
+            for word in row.content.split_whitespace().filter(|w| w.len() > 6) {
+                assert!(!result.contains(word), "a word of a stored text in the result: {word}");
+            }
+            if let Some(key) = row.topic_key {
+                assert!(!result.contains(key), "a topic key in the result");
+            }
+        }
+        for field in ["content", "text", "earlier", "later", "topic_key", "\"id\""] {
+            assert!(!result.contains(field), "{field} in {result}");
+        }
+        assert!(!dir.exists(), "the working directory is gone once the result is out");
     }
 }
