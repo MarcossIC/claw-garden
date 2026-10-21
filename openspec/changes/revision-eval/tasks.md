@@ -4,7 +4,7 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 ## Dónde quedó (2026-10-21)
 
-Hechos los grupos 1 a 8 y 9.1, la compuerta de `rag-eval`, `chains --real` y `store --real` (M5). Falta `verify.md` (9), el archivo y la versión (10).
+Hechos los grupos 1 a 9: la compuerta de `rag-eval`, `chains --real`, `store --real` (M5) y la [verificación](verify.md). Falta el archivo y la versión (10).
 
 M5 esperó a una release con `clawg export`: la `0.34.0` no lo traía y una build de debug rechaza el perfil `prod`. Corrió con el `clawg` 0.43.1 instalado.
 
@@ -84,8 +84,8 @@ El dueño del store autorizó el export, la reproducción y el etiquetado por ag
 
 - [x] `.claude/CLAUDE.md`: `revision-eval` en la fila `clawg-eval` de Workspace y, si hace falta, una frase en Testing como las de los otros binarios.
 - Commit: `docs: describe the revision-eval binary`
-- [ ] `cargo test --workspace --target-dir target-test` y el clippy de `.claude/CLAUDE.md`; `cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings`; sin otro directorio de build que `target` y `target-test`.
-- [ ] `verify.md`: la suite y los clippy pasan (sin contar tests); aviso «pasá `topic_key`» (M5, M4) y mapeo de history-import (M1, M2) contra los umbrales, citando los campos del resultado; búsqueda por clave, clave en `recall_context` y quitar reglas quedan pendientes de M3, con lo medido por M1, M2 y M4.
+- [x] `cargo test --workspace --target-dir target-test` y el clippy de `.claude/CLAUDE.md`; `cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings`; sin otro directorio de build que `target` y `target-test`. Corrido en Windows sobre `4cca8c9`, con `target-test` vaciado antes porque `f17deac` cambió `Cargo.lock`.
+- [x] `verify.md`: la suite y los clippy pasan (sin contar tests); aviso «pasá `topic_key`» (M5, M4) y mapeo de history-import (M1, M2) contra los umbrales, citando los campos del resultado; búsqueda por clave, clave en `recall_context` y quitar reglas quedan pendientes de M3, con lo medido por M1, M2 y M4.
 - Commit: `docs(openspec): record the verification of revision-eval`
 
 ## 10. Archive y versión

@@ -1,14 +1,14 @@
 change: revision-eval
 objective: "1"
 depends_on: [topic-revisions]
-phase: apply
+phase: verify
 artifacts:
   exploration: done
   proposal: done  # M3 fuera por su costo; M5 lee un export de prod
   spec: done
   design: done
   tasks: done
-  apply: in-progress  # grupos 1-8 y 9.1, compuerta de rag-eval, chains --real y store --real hechos
-  verify: pending
+  apply: done
+  verify: done  # Windows; el aviso pasa con salvedad (etiquetas de un agente), history-import no (M2 falla en una cadena), tres decisiones esperan a M3
   archive: pending
 updated: 2026-10-21
