@@ -33,13 +33,13 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 ## 5. `chains`: M4 (E4, E6)
 
-- [ ] Tests `the_rewrite_adds_the_key_only_to_keyed_hits`, `the_byte_delta_is_the_sum_of_the_added_keys`, `a_prompt_over_budget_after_the_rewrite_is_counted`, `m4_reports_the_fixed_cost_of_the_key_from_the_contract_and_the_protocol`, `the_production_context_still_omits_the_key` (este pasa hoy), `the_rewrite_finds_every_keyed_header_of_a_real_prompt`.
-- [ ] `cost.rs` (reescritura de D4, cota de la clave más larga, costo fijo desde `agent_contract.json` y `protocol.md`, línea de aviso constante), usado por `run.rs` con `EvalTokenCounter`.
+- [x] Tests `the_rewrite_adds_the_key_only_to_keyed_hits`, `the_byte_delta_is_the_sum_of_the_added_keys`, `a_prompt_over_budget_after_the_rewrite_is_counted`, `m4_reports_the_fixed_cost_of_the_key_from_the_contract_and_the_protocol`, `the_production_context_still_omits_the_key` (este pasa hoy), `the_rewrite_finds_every_keyed_header_of_a_real_prompt`. Además, `the_key_of_a_search_hit_shows_for_the_save_project_of_its_row` (formatea con el proyecto de la fila: con otro el delta sería 0 sin error) y `m4_sums_the_queries_and_prices_the_warning_line`.
+- [x] `cost.rs` (reescritura de D4, cota de la clave más larga, costo fijo desde `agent_contract.json` y `protocol.md`, línea de aviso constante), usado por `run.rs` con `EvalTokenCounter`. `header_id` sale de `context_ids` para que la reescritura y la lectura de posiciones reconozcan la misma cabecera. `--fake` sobre el set entregado: búsqueda +16 tokens (442 bytes) sobre 40 consultas, contexto +17 tokens (473 bytes), cota de arriba +91 y +115, ningún prompt sobre 8.000 bytes, costo fijo 50 y 101 tokens y línea de aviso de 24 (todos con el contador falso de palabras).
 - Commit: `feat(eval): measure what showing a topic key costs in tokens`
 
 ## 6. Resultado y verificación de `chains` (E9, D6, D7)
 
-- [ ] Test `a_result_header_names_the_model_contract_and_the_set_hash`; `main.rs` escribe `docs/eval/results/{fecha}-real-revision-eval-chains[-{tag}].json` sin pisar uno existente (`--fake` sólo imprime).
+- [x] Test `a_result_header_names_the_model_contract_and_the_set_hash` (más `the_result_file_is_named_by_date_and_tag` y `a_result_is_never_written_over_an_existing_file`); `main.rs` escribe `docs/eval/results/{fecha}-real-revision-eval-chains[-{tag}].json` sin pisar uno existente (`--fake` sólo imprime). Con `--tag SLUG` para dos corridas del mismo día; la existencia del archivo se comprueba antes de correr.
 - Commit: `feat(eval): write the dated result of the chains run`
 - [ ] **[modelo real]** `rag-eval --real --agent-view` y `--real` con `--diff` contra `2026-10-20-real-untrusted-recall-fix-agent-view.json` y `2026-10-18-real-search-abstention.json`: ningún caso movido, y las filas `search.tokens` y `context.tokens` del diff (`crates/clawg-eval/src/bin/rag-eval/diff.rs:120-121`) con cambio medio 0. Perfil dev, golden de `docs/eval/`.
 - [ ] **[modelo real]** `revision-eval chains --real`; el resultado se versiona en `docs/eval/results/`.

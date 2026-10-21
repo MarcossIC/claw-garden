@@ -69,6 +69,8 @@ El par sale de `conflict_pairs` (`eval_api.rs:587`), con `new_id` entre las fila
 
 **Elegido:** en `search_memory`, la misma `Found` se formatea con `format_search` (`tools.rs:79`) tal cual y con `topic_key = None` en cada hit. En `recall_context`, cada línea de LAST SESSION, RECENT y LONG-TERM (`render`, `prompt_builder.rs:515-527`) que empieza con `[AAAA-MM-DD #id ` gana ` topic=K` antes de ` by ` o del primer `]`, donde `format_hits` la pone (`tools.rs:113-115`). Un texto guardado nunca abre línea (`indent_continuations`, `:663`), así que no hay falso positivo, y el workspace no se toca. Para «todas las filas con clave», un hit sin clave (un distractor) recibe la clave más larga del set: es la cota de arriba. Se cuentan tokens, bytes y prompts reescritos sobre 8.000 bytes, sin recortar: el recorte es del producto. El costo fijo se lee del schema de `save_memory` en `agent_contract.json` y del párrafo de `protocol.md` que abre con la clave; la línea de aviso es una constante fijada antes de medir, que `store` cuenta (D5).
 
+La línea de aviso fijada antes de medir es `this save has no topic_key: if it revises #123, save it again under a topic_key naming their subject, so the next revision replaces it`, lo que `save_memory` agregaría tras su línea `close to earlier memories: ...` con un id de tres dígitos como los de un store real.
+
 | Alternativa | Por qué no |
 |---|---|
 | Un parámetro en `format_hit_line` o `render` | Cambia una ruta del producto y obliga a abrir `build_prompt` al binario de eval |
