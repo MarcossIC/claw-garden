@@ -2,6 +2,22 @@
 
 Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque no compila. Cada tarea es un commit convencional que compila y pasa la suite y el clippy de `.claude/CLAUDE.md` (`-D warnings`). Un módulo del binario entra en el mismo commit que su primer llamador fuera de los tests, para no dejar `dead_code`. Antes del primer test: `cargo clean --workspace --target-dir target-test`. Las tareas marcadas **[modelo real]** o **[prod]** nunca forman parte de la suite ni de CI; se confirman con el usuario justo antes de correrlas.
 
+## Dónde quedó (2026-10-21)
+
+Hechos los grupos 1 a 7 y 9.1, la compuerta de `rag-eval` y `chains --real`. Falta M5 (grupo 8), y con él `verify.md` (9), el archivo y la versión (10).
+
+**Bloqueo de M5.** `clawg export` existe en el código desde antes de este cambio, pero ninguna release lo trae: la última publicada es `0.34.0` (`clawg update --check` la da por actual) y no tiene ese subcomando. Una build de debug rechaza el perfil `prod` por diseño, así que no sirve para leerlo. Para seguir hace falta una release con `export` (la `0.43.0` que sale de llevar `develop` a `main`) instalada con `clawg update`; recién ahí se exporta el store real ya cargado y corre el grupo 8.
+
+**Cómo retomar**, con la release instalada:
+
+1. Crear un directorio `revision-eval-<algo>` directamente bajo el temporal del sistema (`work_dir` rechaza cualquier otro lugar) y exportar ahí: `clawg export --profile prod --include-deleted --out <temp>/revision-eval-<algo>/export.jsonl`.
+2. `cargo run -p clawg-eval --bin revision-eval --target-dir target-test -- store --real --export <temp>/revision-eval-<algo>/export.jsonl`, con el modelo del perfil dev.
+3. Un sub-agente Haiku (lo eligió el dueño del store, 2026-10-20) llena `proposed` en `labels.jsonl`; el dueño decide cada `label`.
+4. `revision-eval store --labels <temp>/revision-eval-<algo>/labels.jsonl` y comprobar que el directorio ya no existe.
+5. Grupos 9 y 10.
+
+Fijado antes de medir: la línea de aviso de D4 y que la población de «los sin clave» de M5 son los saves sin clave de un tipo que afirma (D5).
+
 ## 1. `eval_api` (E5)
 
 - [x] Tests `save_stores_under_the_agent_project_and_key_it_is_given`, `a_second_save_under_the_same_key_reports_the_first_as_replaced`, `save_reports_the_candidates_the_detector_paired`, `save_with_an_invalid_key_fails` (`eval_api.rs`, embedder falso): fallan porque `save` no existe.
@@ -41,9 +57,14 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 - [x] Test `a_result_header_names_the_model_contract_and_the_set_hash` (más `the_result_file_is_named_by_date_and_tag` y `a_result_is_never_written_over_an_existing_file`); `main.rs` escribe `docs/eval/results/{fecha}-real-revision-eval-chains[-{tag}].json` sin pisar uno existente (`--fake` sólo imprime). Con `--tag SLUG` para dos corridas del mismo día; la existencia del archivo se comprueba antes de correr.
 - Commit: `feat(eval): write the dated result of the chains run`
-- [ ] **[modelo real]** `rag-eval --real --agent-view` y `--real` con `--diff` contra `2026-10-20-real-untrusted-recall-fix-agent-view.json` y `2026-10-18-real-search-abstention.json`: ningún caso movido, y las filas `search.tokens` y `context.tokens` del diff (`crates/clawg-eval/src/bin/rag-eval/diff.rs:120-121`) con cambio medio 0. Perfil dev, golden de `docs/eval/`.
-- [ ] **[modelo real]** `revision-eval chains --real`; el resultado se versiona en `docs/eval/results/`.
-- Commit: `docs(eval): record the revision chains measurement`
+- [x] **[modelo real]** `rag-eval --real --agent-view` y `--real` con `--diff` contra `2026-10-20-real-untrusted-recall-fix-agent-view.json` y `2026-10-18-real-search-abstention.json`: ningún caso movido, y las filas `search.tokens` y `context.tokens` del diff (`crates/clawg-eval/src/bin/rag-eval/diff.rs:120-121`) con cambio medio 0. Perfil dev, golden de `docs/eval/`. Corrido el 2026-10-21 con `--tag revision-eval` (`2026-10-21-real-revision-eval-agent-view.json` y `2026-10-21-real-revision-eval.json`): 0 casos movidos en recuperación, similitud y vista del agente, y en cada par de idiomas; `search.tokens` y `context.tokens` con cambio medio +0,0000.
+- [x] **[modelo real]** `revision-eval chains --real`: `docs/eval/results/2026-10-21-real-revision-eval-chains.json` (`multilingual-e5-small/mean`, set v1 `fcc21149…`, 40 cadenas, 56 transiciones, 684 distractores). `docs/eval/` dejó de versionarse (`ed2ddff`), así que el archivo queda local y sus números se asientan acá. Lectura preliminar; el veredicto contra los umbrales va en `verify.md`:
+  - **Brazos:** con clave y control, una versión viva en las 40 cadenas; sin clave, 96 versiones vivas y ninguna cadena con una sola.
+  - **M1** (transiciones sin clave): `escalated` 28/56 (50 %, Wilson 37,3–62,7 %), `pending` 14/56 (25 %), `no_mark` 14/56 (25 %, 15,5–37,7 %: 6 `below_floor`, 7 `above_threshold`, 1 `out_of_pool`, 0 `not_claim_bearing`). La vieja queda arriba de la nueva en 35/56 (62,5 %) y `unmarked_or_above` es 40/56 (71,4 %, 58,5–81,6 %).
+  - **M2: no pasa.** (a) y (b) se cumplen; (c) no: coinciden con el control 38 de 40, el mínimo, pero en `en-repo-layout` la última versión baja dos puestos en `recall_context` (7 en el control, 9 con clave; no aparece en `search_memory` en ningún brazo). `en-test-names` baja uno (2 → 3), que se admite. Según E3, no se arregla en este cambio.
+  - **M4** (tokenizador real): `search_memory` con las claves que hoy muestra, +45,075 tokens de media por consulta (1.803 en 40); con todas las filas con clave, +85,05. `recall_context` reescrito, +54,45 (2.178); con todas las filas con clave, +111,0. Ningún prompt pasa de 8.000 bytes en ninguna medida. Costo fijo: 84 tokens de la descripción en el schema y 152 del párrafo de `protocol.md`. Línea de aviso: 34 tokens.
+  - **Contra los umbrales:** history-import no se cumple porque M2 no pasa, aunque su otra mitad sí (71,4 % ≥ 25 %). En «mostrar la clave en `recall_context`» el lado de M4 no se cumple (+111,0 > 60 de media con todas las filas con clave) y M3 sigue pendiente. En el aviso, los 34 tokens quedan bajo el tope de 40 donde aparece; la media por save y las tasas esperan M5.
+- Commit: `docs(openspec): record the revision chains measurement` (el resultado no se versiona: `docs/eval/` está en `.gitignore`)
 
 ## 7. `store` puro (E7, E8)
 
@@ -54,14 +75,16 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 ## 8. `store --real` (M5)
 
-- [ ] **[prod]** Confirmar con el usuario; `clawg export --include-deleted --out <temp>/revision-eval-X/export.jsonl` con el `clawg` instalado. Sin tocar `~/.clawg*` más que esa lectura.
-- [ ] **[modelo real]** `revision-eval store --real --export …`; el agente de costo bajo (Sonnet o Haiku) llena `proposed` en una sesión que autoriza el dueño del store; el dueño decide cada `label`.
-- [ ] `revision-eval store --labels …`: borra el directorio de trabajo; el resultado, sólo conteos, tasas y Wilson, va a `docs/eval/results/`; comprobar que el directorio temporal no existe.
-- Commit: `docs(eval): record the store revision measurement`
+Bloqueado hasta que haya una release con `clawg export` instalada (ver «Dónde quedó»). El dueño del store ya autorizó el export, la reproducción y el etiquetado con Haiku (2026-10-20).
+
+- [ ] **[prod]** `clawg export --profile prod --include-deleted --out <temp>/revision-eval-X/export.jsonl` con el `clawg` instalado, en un `revision-eval-*` directamente bajo el temporal. Sin tocar `~/.clawg*` más que esa lectura.
+- [ ] **[modelo real]** `revision-eval store --real --export …`; un agente Haiku llena `proposed`; el dueño decide cada `label`.
+- [ ] `revision-eval store --labels …`: borra el directorio de trabajo; el resultado, sólo conteos, tasas y Wilson, va a `docs/eval/results/` (local); comprobar que el directorio temporal no existe.
+- Commit: `docs(openspec): record the store revision measurement`
 
 ## 9. Verificación y docs
 
-- [ ] `.claude/CLAUDE.md`: `revision-eval` en la fila `clawg-eval` de Workspace y, si hace falta, una frase en Testing como las de los otros binarios.
+- [x] `.claude/CLAUDE.md`: `revision-eval` en la fila `clawg-eval` de Workspace y, si hace falta, una frase en Testing como las de los otros binarios.
 - Commit: `docs: describe the revision-eval binary`
 - [ ] `cargo test --workspace --target-dir target-test` y el clippy de `.claude/CLAUDE.md`; `cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings`; sin otro directorio de build que `target` y `target-test`.
 - [ ] `verify.md`: la suite y los clippy pasan (sin contar tests); aviso «pasá `topic_key`» (M5, M4) y mapeo de history-import (M1, M2) contra los umbrales, citando los campos del resultado; búsqueda por clave, clave en `recall_context` y quitar reglas quedan pendientes de M3, con lo medido por M1, M2 y M4.
@@ -71,5 +94,5 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 - [ ] Sección «`revision-eval`: revisiones por clave» en `specs/eval`; `git mv` al archivo con la fecha; `state.yaml` en `archived` y la fila 48 de `openspec/README.md` como archivada.
 - Commit: `docs(openspec): archive revision-eval`
-- [ ] Subir el minor `0.42.0` → `0.43.0` en `[workspace.package]` del `Cargo.toml` raíz y `cargo update --workspace`; ambos archivos juntos (el `0.42.0` lo subió el archivo de doctor-checks, `53b174e`).
-- Commit: `chore: bump version to 0.43.0`
+- [ ] Subir el minor `0.43.0` → `0.44.0` en `[workspace.package]` del `Cargo.toml` raíz y `cargo update --workspace`; ambos archivos juntos (el `0.43.0` lo subió el archivo de preference-topic-scope, `a0746cf`).
+- Commit: `chore: bump version to 0.44.0`
