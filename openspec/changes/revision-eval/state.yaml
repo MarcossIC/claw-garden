@@ -8,8 +8,7 @@ artifacts:
   spec: done
   design: done
   tasks: done
-  apply: in-progress  # grupos 1-7 y 9.1, compuerta de rag-eval y chains --real hechos
+  apply: in-progress  # grupos 1-8 y 9.1, compuerta de rag-eval, chains --real y store --real hechos
   verify: pending
   archive: pending
-blocked_on: "M5 (grupo 8) necesita una release con `clawg export` instalada; la última publicada, 0.34.0, no lo trae"
 updated: 2026-10-21

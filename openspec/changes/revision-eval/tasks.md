@@ -4,17 +4,9 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 ## Dónde quedó (2026-10-21)
 
-Hechos los grupos 1 a 7 y 9.1, la compuerta de `rag-eval` y `chains --real`. Falta M5 (grupo 8), y con él `verify.md` (9), el archivo y la versión (10).
+Hechos los grupos 1 a 8 y 9.1, la compuerta de `rag-eval`, `chains --real` y `store --real` (M5). Falta `verify.md` (9), el archivo y la versión (10).
 
-**Bloqueo de M5.** `clawg export` existe en el código desde antes de este cambio, pero ninguna release lo trae: la última publicada es `0.34.0` (`clawg update --check` la da por actual) y no tiene ese subcomando. Una build de debug rechaza el perfil `prod` por diseño, así que no sirve para leerlo. Para seguir hace falta una release con `export` (la `0.43.0` que sale de llevar `develop` a `main`) instalada con `clawg update`; recién ahí se exporta el store real ya cargado y corre el grupo 8.
-
-**Cómo retomar**, con la release instalada:
-
-1. Crear un directorio `revision-eval-<algo>` directamente bajo el temporal del sistema (`work_dir` rechaza cualquier otro lugar) y exportar ahí: `clawg export --profile prod --include-deleted --out <temp>/revision-eval-<algo>/export.jsonl`.
-2. `cargo run -p clawg-eval --bin revision-eval --target-dir target-test -- store --real --export <temp>/revision-eval-<algo>/export.jsonl`, con el modelo del perfil dev.
-3. Un sub-agente Haiku (lo eligió el dueño del store, 2026-10-20) llena `proposed` en `labels.jsonl`; el dueño decide cada `label`.
-4. `revision-eval store --labels <temp>/revision-eval-<algo>/labels.jsonl` y comprobar que el directorio ya no existe.
-5. Grupos 9 y 10.
+M5 esperó a una release con `clawg export`: la `0.34.0` no lo traía y una build de debug rechaza el perfil `prod`. Corrió con el `clawg` 0.43.1 instalado.
 
 Fijado antes de medir: la línea de aviso de D4 y que la población de «los sin clave» de M5 son los saves sin clave de un tipo que afirma (D5).
 
@@ -75,11 +67,17 @@ Fijado antes de medir: la línea de aviso de D4 y que la población de «los sin
 
 ## 8. `store --real` (M5)
 
-Bloqueado hasta que haya una release con `clawg export` instalada (ver «Dónde quedó»). El dueño del store ya autorizó el export, la reproducción y el etiquetado con Haiku (2026-10-20).
+El dueño del store autorizó el export, la reproducción y el etiquetado por agentes (2026-10-20).
 
-- [ ] **[prod]** `clawg export --profile prod --include-deleted --out <temp>/revision-eval-X/export.jsonl` con el `clawg` instalado, en un `revision-eval-*` directamente bajo el temporal. Sin tocar `~/.clawg*` más que esa lectura.
-- [ ] **[modelo real]** `revision-eval store --real --export …`; un agente Haiku llena `proposed`; el dueño decide cada `label`.
-- [ ] `revision-eval store --labels …`: borra el directorio de trabajo; el resultado, sólo conteos, tasas y Wilson, va a `docs/eval/results/` (local); comprobar que el directorio temporal no existe.
+- [x] **[prod]** `clawg export --profile prod --include-deleted --out <temp>/revision-eval-X/export.jsonl` con el `clawg` instalado, en un `revision-eval-*` directamente bajo el temporal. Sin tocar `~/.clawg*` más que esa lectura.
+- [x] **[modelo real]** `revision-eval store --real --export …`: 204 pares, los 154 saves en que dispara el aviso y una muestra de 50 de los 66 restantes (semilla 1592590341).
+- [x] Etiquetas. Proponía Haiku; a pedido del dueño propuso Opus 5.5, en cuatro sub-agentes ciegos, uno por lote de 51 pares, sin leer `replay.json`. Una primera pasada que pedía «el mismo tema» en sentido estricto dio 32 revisiones de 204. En los pares 1 a 5 el dueño marcó revisión el 4 y el 5, donde los dos agentes decían `other` con confianza alta. Leyó la regla así: es revisión si el posterior trata la misma cosa (componente, mecanismo, fixture, procedimiento o práctica) y deja desactualizado algo que el anterior afirma de ella (valor, cómo funciona o se hace, una condición nueva, alcance, motivo o estado), aunque su titular sea otro incidente. Opus se volvió a correr con esa lectura y esos cinco pares como ejemplo: 80 revisiones, 48 pares pasaron de `other` a revisión y ninguno al revés. **El dueño decidió sólo los pares 1 a 5; los 199 restantes llevan la propuesta recalibrada como `label`.** Eso se aparta de «Quién etiqueta M5» (`proposal.md`): el error del agente entra sin medir en los umbrales. El acuerdo medido es el de la primera pasada ciega contra el dueño en esos cinco (`agreement` 3/5); los demás pares no llevan `proposed`.
+- [x] `revision-eval store --labels …`: `docs/eval/results/2026-10-21-real-revision-eval-store.json` (local, sólo conteos, tasas y Wilson); el directorio de trabajo ya no existe. Lectura preliminar; el veredicto va en `verify.md`:
+  - **Sin reproducir:** 802 filas, 397 saves, 114 con clave; 154 saves que afirman desde la primera clave; 111 filas `superseded` por `revision` y 12 por `verdict`; 12 pares juzgados `supersedes`.
+  - **Reproduciendo:** 283 saves sin clave, 220 de un tipo que afirma (la población); el aviso dispara en 154 (19 con la candidata ya ida, 0 de otro proyecto) y 66 quedan como resto.
+  - **Revisiones entre los que disparan:** 76/154 (49,4 %, Wilson 41,6–57,2 %). **Prevalencia:** 6 revisiones en la muestra de 50; estimación 38,1 % de la población, cota inferior 36,2 %.
+  - **Costo del aviso:** 34 tokens donde aparece; dispara en 154 de 397 saves (38,8 %, 34,1–43,7 %), 13,19 tokens de media por save.
+  - **Contra los umbrales:** el aviso «pasá `topic_key`» cumple las tres condiciones (38,1 % ≥ 10 % con cota 36,2 % ≥ 5 %; 49,4 % ≥ 40 %; 34 ≤ 40 y 13,19 ≤ 15). Depende de la lectura de la regla: con la de la primera pasada, que dio 32 revisiones en los 204 pares, la precisión sería a lo sumo 32/154 (20,8 %), bajo el 40 %.
 - Commit: `docs(openspec): record the store revision measurement`
 
 ## 9. Verificación y docs
