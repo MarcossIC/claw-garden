@@ -1,14 +1,15 @@
 change: query-plans
 objective: "1"
 depends_on: []
-phase: explore
+phase: archived
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
-  apply: pending
-  verify: pending
-  archive: pending
-updated: 2026-10-19
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # Linux; the CI of the pull request covers Linux and Windows
+  archive: done
+updated: 2026-10-21
+main_spec: openspec/specs/storage/spec.md

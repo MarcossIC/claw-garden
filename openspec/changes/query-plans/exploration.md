@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 | S | — (antes de 44; la migración se numera junto con 54 y 51) | exploración (borrador) |
+| 1 | S | — (antes de 44) | ver [`state.yaml`](state.yaml) |
 
 **Tesis:** las dos consultas que se corren en cada contexto de sesión, LAST SESSION y RECENT, tienen un costo que crece con el número de filas de `memory` y no con lo que devuelven, porque ningún índice cubre `memory_type` ni `created_at`. Hoy una recorre todas las filas vivas y la otra todas las filas vivas del agente, y las dos ordenan el resultado en un árbol temporal. Con una migración de sólo dos índices parciales el plan pasa a ser una búsqueda por clave que entrega el orden pedido sin ordenar, y el texto de los dos bloques no cambia. Hay un detalle que decide si el índice sirve: la forma actual del predicado de proyecto de LAST SESSION **no usa el índice nuevo**, así que el cambio incluye reescribir esa condición. Van dos asuntos pequeños en el mismo cambio: preparar una vez (`prepare_cached`) las sentencias fijas que el cambio toca, y decidir si se adoptan estadísticas del planificador (`ANALYZE`, `PRAGMA optimize`), que hoy no existen y que pueden mover planes que las pruebas fijan. No hay cambio de ranking.
 
