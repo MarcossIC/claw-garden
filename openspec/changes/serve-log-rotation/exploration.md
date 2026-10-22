@@ -45,7 +45,7 @@ Pierde justo lo que el comentario de `client.rs:1279-1280` protege: la cola de l
 
 ## Decisiones abiertas
 
-- [ ] Tope y cantidad de ficheros (candidato: 10 MB y tres).
+- [x] Tope y cantidad de ficheros: 10 MiB y tres ficheros (`serve.log`, `.1` y `.2`); ver la [propuesta](proposal.md).
 
 ## Cómo se mide
 

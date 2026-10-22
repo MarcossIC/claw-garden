@@ -1,13 +1,13 @@
 change: serve-log-rotation
 objective: "transversal"
 depends_on: []
-phase: explore
+phase: apply
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
+  exploration: done
+  proposal: done
+  spec: done
+  design: skipped  # the decisions are in the proposal
+  tasks: done
   apply: pending
   verify: pending
   archive: pending
