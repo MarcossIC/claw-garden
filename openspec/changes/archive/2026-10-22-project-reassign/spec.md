@@ -1,14 +1,14 @@
 # project-reassign — Especificación
 
-Suma requisitos a [`specs/update`](../../specs/update/spec.md), [`specs/project`](../../specs/project/spec.md), [`specs/mcp`](../../specs/mcp/spec.md), [`specs/visibility`](../../specs/visibility/spec.md) y [`specs/storage`](../../specs/storage/spec.md). Lo que no se nombra aquí sigue como está.
+Suma requisitos a [`specs/update`](../../../specs/update/spec.md), [`specs/project`](../../../specs/project/spec.md), [`specs/mcp`](../../../specs/mcp/spec.md), [`specs/visibility`](../../../specs/visibility/spec.md) y [`specs/storage`](../../../specs/storage/spec.md). Lo que no se nombra aquí sigue como está.
 
 ## Definiciones
 
 - **Movimiento:** cambiar el `project_id` de filas de `memory` a un **destino**, que es un id de proyecto o «sin proyecto».
 - **Unidad:** el cierre de una fila: las filas de todo save de `memory_piece` que la contiene, las que reemplazó con causa `revision` y la que la reemplazó con esa causa, las que un borrado suyo revivió (`revived_from`) y la que revivió por el suyo, repetido hasta que no entra ninguna más. Borradas y `superseded` incluidas. Una fila sin vínculos es su propia unidad.
 - **Fila viva:** `deleted_at IS NULL` y `status IN ('active', 'disputed')`.
-- **Fila protegida:** la de [`specs/update`](../../specs/update/spec.md): `memory_type` `user_preference` o `architectural_decision`.
-- **Lector:** el de [`specs/visibility`](../../specs/visibility/spec.md); sin lector, la llamada es del usuario y alcanza toda fila.
+- **Fila protegida:** la de [`specs/update`](../../../specs/update/spec.md): `memory_type` `user_preference` o `architectural_decision`.
+- **Lector:** el de [`specs/visibility`](../../../specs/visibility/spec.md); sin lector, la llamada es del usuario y alcanza toda fila.
 - **`scope` de destino:** el que el CHECK de `memory` exige: una fila con agente conserva el suyo; una sin agente queda `project` con un destino y `global` sin él.
 
 ## PR1. Mover cambia el proyecto de una unidad entera y nada más
@@ -87,13 +87,13 @@ Una unidad que ya está en el destino MUST quedar `unchanged` y no registrarse.
 
 Una fila borrada MUST moverse con su unidad sin chocar, y un `restore` posterior MUST validar en el proyecto nuevo. Los pares abiertos (`pending`, `escalated`) entre una fila movida y una que queda en otro proyecto MUST nombrarse en el reporte (`split_pairs`) y quedar como están; `disputed` se conserva.
 
-**Test:** `a_deleted_row_moves_with_its_save_and_is_restored_into_the_new_project`, `a_pair_left_across_projects_is_reported` (`relocate.rs`).
+**Test:** `a_deleted_row_moves_with_its_save_and_is_restored_into_the_new_project`, `a_deleted_row_is_selected_only_when_asked`, `a_pair_left_across_projects_is_reported` (`relocate.rs`).
 
 ## PR5. El destino
 
 El daemon MUST rechazar con 404, sin escribir, un destino que no está en `project`. «Sin proyecto» siempre es un destino válido. El puente y `clawg projects move --to PATH` MUST registrar la raíz de la ruta antes (sin `index_docs`), y MUST rechazar una ruta cuya raíz no es un directorio; una raíz cuyo id es de otra MUST ser el 409 `project_root_collision` de siempre.
 
-**Test:** `an_unregistered_target_is_refused` (`relocate.rs`); `a_move_to_an_unregistered_project_is_404` (`tests/api.rs`); `update_memory_moves_a_save_to_the_project_of_a_path` y `update_memory_refuses_a_path_that_is_not_a_directory` (`server.rs`).
+**Test:** `an_unregistered_target_is_refused` (`relocate.rs`); `a_move_to_an_unregistered_project_is_404` (`tests/api.rs`); `an_unregistered_project_is_not_a_place_to_move_to` (`admin.rs`); `update_memory_moves_a_save_to_the_project_of_a_path` y `update_memory_refuses_both_destinations_and_a_path_that_is_not_a_directory` (`server.rs`).
 
 ## PR6. El registro y la vuelta atrás
 
@@ -111,7 +111,7 @@ Con `dry_run` el movimiento MUST responder el mismo reporte que daría sin él, 
 
 `PATCH /v1/memories/memory/{id}` MUST aceptar `project_id` (un destino) o `no_project: true`, no los dos (400), solos o con `importance` y `memory_type`, todo en una transacción: un rechazo de cualquiera no escribe nada. En `episodic` y `procedural` un destino MUST ser un 400. Una unidad rechazada por PR3 MUST ser un 409 cuyo mensaje nombra el motivo y la fila, y un destino no registrado un 404. Una unidad con una fila protegida viva MUST pedir `user_answered`, como sacarle el tipo (409 `NeedsUser` sin él). La respuesta MUST sumar el `project_id` en que quedó la fila (`null` sin proyecto), y, cuando movió, `move_id` y las otras filas que se movieron con ella (`pulled_in`). `?agent=` nombra al lector como en todo `PATCH`.
 
-**Test:** `a_move_and_a_change_of_importance_are_one_write`, `a_protected_row_leaves_its_project_only_on_the_users_word`, `a_patch_needs_a_change` (`admin.rs`); `patch_moves_a_whole_save`, `patch_with_a_clash_is_409_and_changes_nothing`, `patch_with_both_destinations_is_400`, `patch_moves_while_the_embedder_loads` (`tests/api.rs`).
+**Test:** `a_move_and_a_change_of_importance_are_one_write`, `a_move_alone_changes_the_project_and_nothing_it_says`, `a_move_takes_the_rest_of_the_save_along`, `a_protected_row_leaves_its_project_only_on_the_users_word`, `a_patch_needs_a_change_and_moves_only_memory_rows` (`admin.rs`); `an_update_names_one_destination_at_most` (`api.rs`); `patch_moves_a_whole_save`, `patch_with_a_clash_is_409_and_changes_nothing`, `patch_with_both_destinations_is_400`, `patch_moves_while_the_embedder_loads` (`tests/api.rs`).
 
 ## PR9. El lote
 
@@ -119,19 +119,19 @@ Con `dry_run` el movimiento MUST responder el mismo reporte que daría sin él, 
 
 `clawg projects move` MUST mandar ese pedido al daemon que corre (sin arrancar uno), con `--id`, `--from-project`, `--from-none`, `--here`, `--agent`, `--type`, `--source`, `--session`, `--text`, `--include-deleted`, un destino `--to PATH`, `--to-project ID` o `--to-none`, `--dry-run` y `--undo ID`, y MUST imprimir el reporte. El análisis de argumentos es puro.
 
-**Test:** `move_takes_a_selection_and_one_target_or_an_undo` (`cli.rs`); `the_batch_moves_reports_and_snapshots`, `a_batch_without_a_selection_is_400` (`tests/api.rs`); `projects_move_moves_and_undoes_a_seeded_store` (`tests/binary.rs`).
+**Test:** `move_takes_a_selection_and_one_target_or_an_undo` (`cli.rs`); `a_move_asks_for_one_target_or_an_undo` (`api.rs`); `a_selection_needs_a_filter_and_text_only_over_live_rows`, `the_filters_narrow_the_selection` (`relocate.rs`); `the_batch_moves_reports_and_snapshots`, `a_batch_without_a_selection_or_a_target_is_400` (`tests/api.rs`); `a_move_report_names_what_moved_what_stayed_and_the_way_back`, `projects_move_moves_a_memory_and_undoes_it` (`projects.rs`); `projects_move_moves_and_undoes_a_seeded_store` (`tests/binary.rs`).
 
 ## PR10. Listar lo que no tiene proyecto
 
 `GET /v1/memories` MUST aceptar `no_project=true`, que lista sólo las filas sin proyecto; con `project` es un 400. `clawg memories list` y `search` MUST tomar `--no-project`.
 
-**Test:** `a_listing_of_rows_without_a_project`, `no_project_and_project_together_are_refused` (`admin.rs`, `api.rs`); `list_and_search_take_no_project` (`cli.rs`).
+**Test:** `a_listing_of_rows_without_a_project` (`admin.rs`), `no_project_and_project_together_are_refused` (`api.rs`), `the_listing_reaches_the_rows_without_a_project` (`tests/api.rs`); `list_and_search_take_no_project` (`cli.rs`).
 
 ## PR11. La herramienta de los agentes
 
 `update_memory` MUST tomar `to_project_path` (una ruta cuyo proyecto es el destino) o `clear_project` (destino sin proyecto), no los dos; ausentes, el proyecto no cambia. Su descripción MUST decir para qué sirve y que mueve el save entero, y `protocol.md` MUST decir cuándo usarla. La respuesta MUST nombrar el proyecto en que quedó la fila y las otras que se movieron. `agent_contract.json` cambia sólo por eso.
 
-**Test:** `update_memory_moves_a_save_to_the_project_of_a_path`, `update_memory_clears_the_project`, `update_memory_refuses_both_destinations` (`server.rs`); `format_update_names_where_the_row_ended` (`tools.rs`); `the_agent_contract_matches_its_file`.
+**Test:** `update_memory_moves_a_save_to_the_project_of_a_path`, `update_memory_clears_the_project`, `update_memory_refuses_both_destinations_and_a_path_that_is_not_a_directory` (`server.rs`); `format_update_names_where_the_row_ended` (`tools.rs`); `the_agent_contract_matches_its_file`.
 
 ## PR12. V21
 

@@ -744,7 +744,7 @@ Un snapshot MUST incluir el outbox, y con él el texto enmascarado de los saves 
 
 ### Retención
 
-Después de cada snapshot automático, el directorio de backups MUST conservar los 5 automáticos más nuevos (`AUTO_KEEP`, `backup.rs:241`) y, además, el más nuevo de cada motivo automático (`pre-migration`, `pre-restore`, `pre-reembed`), de modo que una racha de restores o re-embeds no saque el `pre-migration` que es la vuelta atrás de una actualización; los demás automáticos se borran. Los `manual` MUST NOT borrarse nunca, y un archivo con otro nombre MUST NOT tocarse. La elección es pura (`to_prune`, `backup.rs:248`); el borrado es best-effort.
+Después de cada snapshot automático, el directorio de backups MUST conservar los 5 automáticos más nuevos (`AUTO_KEEP`, `backup.rs:241`) y, además, el más nuevo de cada motivo automático (`pre-migration`, `pre-restore`, `pre-reembed`, `pre-import`, `pre-move`), de modo que una racha de restores o re-embeds no saque el `pre-migration` que es la vuelta atrás de una actualización; los demás automáticos se borran. Los `manual` MUST NOT borrarse nunca, y un archivo con otro nombre MUST NOT tocarse. La elección es pura (`to_prune`, `backup.rs:248`); el borrado es best-effort.
 
 #### Escenario
 - GIVEN 7 snapshots automáticos, 2 manuales y un `notas.txt`
@@ -883,3 +883,9 @@ Un `clawg serve` lanzado a mano escribe donde lo redirija quien lo lanza, sin ro
 - THEN `workspace.md` es idéntico al anterior y no queda ningún temporal
 
 **Test:** `a_failed_workspace_write_leaves_the_previous_file_intact` (`workspace.rs`).
+
+## El registro de movimientos
+
+V21 MUST crear `memory_move` (`move_id`, `row_id`, `from_project`, `from_scope`, `to_project`, `to_scope`, `moved_at`) con un índice por `move_id`, sin clave foránea a `memory` (un `purge` no debe frenarse por un movimiento viejo) y sin tocar ninguna fila. Una base en V20 MUST abrir con el registro vacío y cada fila igual. La vuelta atrás del esquema es el snapshot `pre-migration`, o deshacer los movimientos y `DROP TABLE memory_move; DELETE FROM refinery_schema_history WHERE version = 21;`. El lote de [`specs/project`](../project/spec.md) R12 escribe antes el snapshot `pre-move` (`Reason::PreMove`).
+
+**Test:** `a_database_from_the_previous_version_opens_with_an_empty_move_log` (`db.rs`), `published_migration_checksums_are_pinned` (`migrations.rs`), `snapshot_names_parse_back_to_their_reason` (`backup.rs`).
