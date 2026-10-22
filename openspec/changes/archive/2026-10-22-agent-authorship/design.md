@@ -27,7 +27,7 @@ Era el alcance del detector. Con D4 el detector usa el del que guarda, y nadie m
 
 ## D3. El worker lee la política
 
-`MemoryStore` ya guarda su directorio (`dir`, `crates/clawg-core/src/memory/db.rs`). El worker, una vez por evento en `process_tracked`, arma el `Reader` del que guarda con `reader_in(dir, agent_id)`; el store en memoria, sin directorio, usa la política vacía (todo compartido), que es lo que un test espera por defecto. Leer `sharing.json` por save es lo que el daemon ya hace por búsqueda: un archivo chico, leído sin bloqueo.
+`MemoryStore` suma `sharing_dir` (`crates/clawg-core/src/memory/db.rs`): el directorio de datos al abrir el store, y en el store en memoria el que el runtime de prueba le da (`with_sharing_dir`), el mismo `base_dir` del que lee el daemon. No reusa `dir`, que dice dónde abrir una segunda conexión y que el store en memoria no tiene. El worker, una vez por evento en `process_tracked`, arma el `Reader` del que guarda con `MemoryStore::reader_for`; sin directorio usa la política vacía (todo compartido), que es lo que un test espera por defecto. Leer `sharing.json` por save es lo que el daemon ya hace por búsqueda: un archivo chico, leído sin bloqueo.
 
 Una reposición después de un reinicio usa la política de ese momento, no la del momento en que se aceptó el save: la política es de lectura, y el save todavía no se comparó con nada.
 

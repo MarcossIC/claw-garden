@@ -18,6 +18,7 @@ Fuente de verdad del comportamiento actual de la recuperación: el corte relativ
 - [session-handoff](../../changes/archive/2026-10-19-session-handoff/proposal.md), archivado el 2026-10-19 (sólo «La última sesión», sus R3, R4 y R6, y lo que cambian en «Definiciones», «Hits de otros agentes», «Línea de hit en `recall_context`», «El contexto sin consulta», los apartados del presupuesto, el parser de `rag-eval --agent-view`, «Medición del contexto» e «Invariantes»; el registro de sesiones y el sello en el save viven en [`specs/ingest`](../ingest/spec.md), y el registro desde los hooks en [`specs/hooks`](../hooks/spec.md)).
 - [untrusted-recall](../../changes/archive/2026-10-20-untrusted-recall/proposal.md), archivado el 2026-10-20 (sólo «Texto guardado», «Salto de línea» y «Margen» en «Definiciones», el margen en «Línea de hit en `recall_context`» y en «Conflictos por referencia», «Un texto copiado al workspace no rompe `workspace.md`», y lo que cambian en el presupuesto, el parser de `rag-eval --agent-view`, «Medición del contexto», «Invariantes» y «Fuera de esta spec»; cómo se muestra el autor está en [`specs/sharing`](../sharing/spec.md) R4, y qué raíz indexa sola el puente, en [`specs/project-docs`](../project-docs/spec.md)).
 - [context-hit-room](../../changes/archive/2026-10-22-context-hit-room/proposal.md), archivado el 2026-10-22 (sólo la reserva de los hits en «El prompt cumple el presupuesto» y en «El primer hit de un bloque se recorta en lugar de saltarse», y lo que cambia en «El contexto sin consulta»).
+- [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22 (sólo ACTIVE CONFLICTS en «Hits de otros agentes»: los pares de cualquier autor que el lector alcanza).
 
 ## Definiciones
 
@@ -276,10 +277,10 @@ Ningún código de producción escribe `episodic_trajectory` ni `procedural_skil
 La búsqueda y el contexto traen, además de lo propio, las filas de los autores que la política de [`specs/sharing`](../sharing/spec.md) deja leer al llamador: `POST /v1/search` y `POST /v1/context` resuelven el alcance del agente del pedido en cada llamada (`reach`, `crates/clawg-cli/src/daemon/api.rs:1291`; usos en `api.rs:1259`, `:1333` y `:1342`). Sobre eso:
 
 - Cada hit de `POST /v1/search` MUST llevar su autor como `agent_id` (`RankedHit.agent_id`, `search.rs:119`); el cliente lo lee con `#[serde(default)]` y un hit sin autor cuenta como propio (`client.rs:178`).
-- El workspace, ACTIVE CONFLICTS, RECENT del contexto sin consulta, el listado, la síntesis y el detector de contradicciones al guardar MUST seguir viendo sólo lo del agente: sólo los hits de búsqueda y el resumen de [LAST SESSION](#la-última-sesión) llegan a filas ajenas.
+- El workspace y RECENT del contexto sin consulta MUST seguir viendo sólo lo del agente. ACTIVE CONFLICTS MUST mostrar los pares escalados con un lado entre las filas que el prompt puede mostrar, de cualquier autor, siempre que el agente alcance los dos lados (`fetch_active_conflicts`, `prompt_builder.rs`, filtra con `Reader::admits`): un lado oculto nunca se imprime, ni como el otro lado de un par que alcanza. El listado, la síntesis y el detector siguen el alcance, no la autoría ([`specs/sharing`](../sharing/spec.md) R5).
 - Un hit ajeno MUST contar como acceso igual que uno propio (`api.rs:1280`).
 
-**Test:** `a_hit_carries_its_author` (`search.rs`), `search_returns_the_author_of_each_hit` y `search_and_context_follow_the_sharing_policy_from_the_next_call` (`crates/clawg-cli/tests/api.rs`), `the_workspace_and_conflicts_stay_own` (`prompt_builder.rs`) y `contradiction_probe_ignores_shared_authors` (`contradiction.rs`).
+**Test:** `a_hit_carries_its_author` (`search.rs`), `search_returns_the_author_of_each_hit` y `search_and_context_follow_the_sharing_policy_from_the_next_call` (`crates/clawg-cli/tests/api.rs`), `the_workspace_stays_own_and_conflicts_are_shared` y `a_hidden_side_keeps_its_pair_out` (`prompt_builder.rs`) y `contradiction_probe_reaches_other_authors` (`contradiction.rs`).
 
 ## Línea de hit en `recall_context`
 

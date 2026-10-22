@@ -1,18 +1,19 @@
 # synthesis — Especificación
 
-Fuente de verdad del comportamiento actual de la síntesis dirigida por el agente: cómo se guarda una conclusión con las memorias de las que sale, cómo se valida y se ve esa procedencia, qué devuelve `synthesize`, cuándo `recall_context` lo recuerda y cómo se revisa una conclusión que perdió una fuente. El ranking, los tiers y el umbral del detector no están acá: no cambiaron. Las filas `episodic_trajectory` y `procedural_skill` que dejó la app de escritorio siguen alcanzables por búsqueda, workspace y listado: eso está en [`specs/retrieval`](../retrieval/spec.md) (su apartado de las filas de la app). Qué agente ve y cita qué filas está en [`specs/visibility`](../visibility/spec.md).
+Fuente de verdad del comportamiento actual de la síntesis dirigida por el agente: cómo se guarda una conclusión con las memorias de las que sale, cómo se valida y se ve esa procedencia, qué devuelve `synthesize`, cuándo `recall_context` lo recuerda y cómo se revisa una conclusión que perdió una fuente. El ranking, los tiers y el umbral del detector no están acá: no cambiaron. Las filas `episodic_trajectory` y `procedural_skill` que dejó la app de escritorio siguen alcanzables por búsqueda, workspace y listado: eso está en [`specs/retrieval`](../retrieval/spec.md) (su apartado de las filas de la app). Qué filas ve y cita un agente lo decide su alcance ([`specs/sharing`](../sharing/spec.md)), no su autoría.
 
 **Origen:**
 - [knowledge-synthesis](../../changes/archive/2026-10-13-knowledge-synthesis/proposal.md), archivado el 2026-10-13. Los ids de requisito son los de esa spec (R1 vive en `specs/retrieval`).
 - [conclusion-upkeep](../../changes/archive/2026-10-19-conclusion-upkeep/proposal.md), archivado el 2026-10-19: «Conclusiones a revisar» y su aviso, el rechazo de una fuente reemplazada (R3) y el enlace que una purga conserva (R6).
+- [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22: el alcance, la memoria pendiente, la revisión y las fuentes de otro agente pasan de agente a proyecto, dentro de lo que alcanza el lector.
 
 ## Definiciones
 
 - **Fila viva:** fila de `memory` con `deleted_at IS NULL` y `status <> 'superseded'` (la misma definición que usa [`specs/disputes`](../disputes/spec.md)).
 - **Conclusión:** fila de `memory` con al menos una fila en `memory_derivation` que la nombra como `memory_id`.
 - **Fuentes de una conclusión:** los `source_id` de sus filas en `memory_derivation`.
-- **Alcance:** un agente y un `project_id`, o todo el store cuando se pide sin proyecto. Como en visibility (y a diferencia de la búsqueda, que alcanza lo que [`specs/sharing`](../sharing/spec.md) comparte), un agente sólo ve sus filas; sin agente el pedido es del dueño de la base (el visor, `curl`) y ve las de todos. Su clave en `synthesis_review` es `(agent_id, scope_key)`: el agente o `''` para el dueño, y el `project_id` o `''` para todo el store.
-- **Memoria pendiente de un alcance:** fila viva del alcance que no es conclusión y que no es fuente de ninguna conclusión viva **del mismo agente** (`PENDING`, `crates/clawg-core/src/memory/synthesis.rs`). La conclusión de otro agente no cubre la memoria, porque este agente no la ve.
+- **Alcance:** un `project_id`, o todo el store cuando se pide sin proyecto, con las filas de cualquier autor que el lector alcanza ([`specs/sharing`](../sharing/spec.md)); sin lector el pedido es del usuario (el visor, `curl`) y ve todas. Su clave en `synthesis_review` es `('', scope_key)`, con el `project_id` o `''` para todo el store: la revisión es del proyecto, no de un agente. Las filas que V10 escribió con un agente quedan y nadie las lee.
+- **Memoria pendiente de un alcance:** fila viva del alcance que no es conclusión y que no es fuente de ninguna conclusión viva, de cualquier autor (`PENDING`, `crates/clawg-core/src/memory/synthesis.rs`).
 - **Memoria sin revisar de un alcance:** memoria pendiente con `created_at` mayor que el `reviewed_at` del alcance, o cualquier pendiente si el alcance nunca se revisó.
 - **Fuente perdida:** fuente que no es una fila viva: su fila no existe (purgada), está borrada o está `superseded`. Una fuente `disputed` no está perdida: la disputa ya sale en ACTIVE CONFLICTS y no dice que la fuente sea falsa.
 - **Conclusión a revisar:** conclusión viva con al menos una fuente perdida.
@@ -40,7 +41,7 @@ Fuente de verdad del comportamiento actual de la síntesis dirigida por el agent
 
 ## R3. Fuentes inválidas
 
-El daemon MUST rechazar con 400, sin encolar nada, un save cuyo `derived_from` nombre un id que no existe en `memory`, que está borrado o que es de otro agente, o que tenga más de 50 ids distintos. El mensaje MUST nombrar los ids rechazados, y MUST NOT distinguir una fila ajena de una que no existe (la misma regla de [`specs/visibility`](../visibility/spec.md)).
+El daemon MUST rechazar con 400, sin encolar nada, un save cuyo `derived_from` nombre un id que no existe en `memory`, que está borrado o que está fuera del alcance del que guarda, o que tenga más de 50 ids distintos. El mensaje MUST nombrar los ids rechazados, y MUST NOT distinguir una fila oculta de una que no existe (la misma regla de [`specs/visibility`](../visibility/spec.md)). Una fila de otro agente que el que guarda alcanza MUST aceptarse.
 
 #### Escenario
 - GIVEN una memoria viva A y una borrada D
@@ -50,9 +51,9 @@ El daemon MUST rechazar con 400, sin encolar nada, un save cuyo `derived_from` n
 #### Escenario: fuente de otro agente
 - GIVEN una memoria M del agente A y una T del agente B
 - WHEN A guarda C con `derived_from = [M, T]`
-- THEN la respuesta es 400 y nombra `T`
+- THEN C se guarda con las dos fuentes; con `hide A B`, la respuesta es 400 y nombra `T`
 
-Una conclusión descansa sólo en filas vivas. El daemon MUST rechazar también con 400, sin encolar nada, un save cuyo `derived_from` nombre una fila propia, no borrada y `superseded`, con un mensaje que nombra cada id rechazado con la fila que lo reemplazó y pide sacar la conclusión de las vigentes: `derived_from names memories that were replaced: 5 (by 9); draw the conclusion from the current ones` (`replaced_memory_ids`, `crates/clawg-core/src/memory/synthesis.rs:330`; el rechazo en `crates/clawg-cli/src/daemon/api.rs:1133-1141`; `replaced_list`, `api.rs:317`). Se mira después de las que faltan, así que un id ausente, borrado o ajeno responde como arriba. Una fuente `disputed` MUST seguir aceptándose. Como el resto de `derived_from`, se valida antes de encolar: una fila de la cola escrita antes enlaza lo que nombra.
+Una conclusión descansa sólo en filas vivas. El daemon MUST rechazar también con 400, sin encolar nada, un save cuyo `derived_from` nombre una fila que alcanza, no borrada y `superseded`, con un mensaje que nombra cada id rechazado con la fila que lo reemplazó y pide sacar la conclusión de las vigentes: `derived_from names memories that were replaced: 5 (by 9); draw the conclusion from the current ones` (`replaced_memory_ids`, `crates/clawg-core/src/memory/synthesis.rs:330`; el rechazo en `crates/clawg-cli/src/daemon/api.rs:1133-1141`; `replaced_list`, `api.rs:317`). Se mira después de las que faltan, así que un id ausente, borrado o ajeno responde como arriba. Una fuente `disputed` MUST seguir aceptándose. Como el resto de `derived_from`, se valida antes de encolar: una fila de la cola escrita antes enlaza lo que nombra.
 
 #### Escenario: fuente reemplazada
 - GIVEN una memoria A reemplazada por A2 (un save con la misma `topic_key`)
@@ -99,8 +100,8 @@ Purgar una fila (`clawg purge`) sí la borra de verdad: MUST borrar en la misma 
 - devolver las conclusiones vivas del alcance (hasta 20, de la más nueva a la más vieja) con su `derived_from`;
 - devolver las conclusiones a revisar del alcance y cuántas son (`to_review` y `to_review_total`, «Conclusiones a revisar»);
 - en `synthesize`, marcar el origen de cada memoria y conclusión que lo tiene (`origin=inferred`, `origin=conclusion`; P5 de [`specs/provenance`](../provenance/spec.md)). Una conclusión se guarda sellada `synthesis` / `agent`, y `user_stated` con `derived_from` es un 400 (P1 y P2);
-- con agente, mirar sólo sus filas; la herramienta MCP siempre manda el agente que llama;
-- registrar `reviewed_at = ahora` para el alcance en `synthesis_review`; la revisión de un agente no apaga el recordatorio de otro;
+- con agente, mirar las filas que alcanza, de cualquier autor; la herramienta MCP siempre manda el agente que llama;
+- registrar `reviewed_at = ahora` para el alcance en `synthesis_review`; la revisión de un agente apaga el recordatorio de todos en ese alcance;
 - MUST NOT escribir nada más: no crea, no borra ni cambia memorias, y no registra accesos.
 
 `synthesize` MUST devolver el texto con las instrucciones: qué es una conclusión, que generaliza dos o más memorias, que se guarda con `save_memory`, el tipo que corresponde y `derived_from`, que una conclusión vieja que quedó mal se corrige guardando la nueva y resolviendo el conflicto, y que si nada generaliza no se guarda nada.
@@ -122,22 +123,22 @@ Sin memorias pendientes, `synthesize` MUST decir que ninguna espera una conclusi
 - WHEN se sintetiza P
 - THEN F no está; y sintetizando sin proyecto, sí
 
-#### Escenario: otro agente no se mezcla
+#### Escenario: otro agente del proyecto
 - GIVEN una memoria del agente A y otra del agente B en P
 - WHEN A sintetiza P
-- THEN sólo está la de A, y B sigue teniendo su memoria sin revisar
+- THEN están las dos, y B ya no tiene memorias sin revisar; con `hide A B`, sólo la de A
 
-#### Escenario: la conclusión de otro agente no cubre
+#### Escenario: la conclusión de otro agente cubre
 - GIVEN una memoria M del agente A, y una conclusión del agente B con `derived_from = [M]`
 - WHEN A sintetiza
-- THEN M sigue pendiente
+- THEN M no está pendiente, y la conclusión de B está entre las ya sacadas
 
 #### Escenario: sin pendientes
 - GIVEN una conclusión C viva y ninguna memoria pendiente
 - WHEN el agente llama `synthesize`
 - THEN el texto dice que ninguna memoria espera una conclusión, lista C con sus fuentes y no trae las instrucciones de `save_memory`
 
-**Test:** `synthesis_lists_what_no_conclusion_covers`, `deleting_a_conclusion_makes_its_sources_pending_again`, `synthesis_stays_in_its_project`, `synthesis_stays_with_its_agent`, `another_agents_conclusion_does_not_cover_a_memory`, `synthesis_records_the_review_and_nothing_else`, `existing_ids_leave_out_unknown_and_deleted_rows` y `existing_ids_leave_out_another_agents_rows` en `crates/clawg-core/src/memory/synthesis.rs`; `synthesis_over_http`, `an_agent_neither_reviews_nor_cites_another_agents_memories` y `a_misspelt_synthesis_field_is_refused` en `crates/clawg-cli/tests/api.rs`; `the_synthesis_text_says_what_to_save`, `a_synthesis_with_nothing_pending_asks_for_nothing` y `the_conclusions_show_even_with_nothing_pending` en `tools.rs`; `synthesize_lists_what_no_conclusion_covers_and_recall_stops_reminding` en `server.rs`.
+**Test:** `synthesis_lists_what_no_conclusion_covers`, `deleting_a_conclusion_makes_its_sources_pending_again`, `synthesis_stays_in_its_project`, `synthesis_reaches_every_author_of_the_project`, `a_review_is_the_projects`, `another_agents_conclusion_covers_a_memory`, `synthesis_records_the_review_and_nothing_else`, `existing_ids_leave_out_unknown_and_deleted_rows` y `existing_ids_follow_the_readers_reach` en `crates/clawg-core/src/memory/synthesis.rs`; `synthesis_over_http`, `an_agent_reviews_another_agents_memories_unless_hidden`, `a_conclusion_may_cite_another_agents_memory_unless_hidden` y `a_misspelt_synthesis_field_is_refused` en `crates/clawg-cli/tests/api.rs`; `the_synthesis_text_says_what_to_save`, `a_synthesis_with_nothing_pending_asks_for_nothing` y `the_conclusions_show_even_with_nothing_pending` en `tools.rs`; `synthesize_lists_what_no_conclusion_covers_and_recall_stops_reminding` en `server.rs`.
 
 No hay filtro de texto: la síntesis le da al modelo lo que no revisó, no un buscador. Buscar por texto es `search_memory`, y el filtro del listado es del visor, que no se le expone al modelo.
 
@@ -147,10 +148,10 @@ Una conclusión MUST quedar a revisar desde una sola fuente perdida: borrar o re
 
 `POST /v1/synthesis` MUST devolver, en la misma transacción que lo demás de R7 (`synthesis_core`, `synthesis.rs:236`):
 
-- `to_review`: las conclusiones a revisar del alcance (mismo agente y proyecto que las pendientes), de la más nueva a la más vieja y hasta 10 (`REVIEW_LIMIT`, `synthesis.rs:48`), cada una con `conclusion` (la fila, con su `derived_from`), `live` (cuántas fuentes siguen vivas) y `lost` (cada fuente perdida con su `id`, su `state` y, si está `superseded`, su `superseded_by`, que se omite cuando no lo tiene) (`LostSource` y `ConclusionReview`, `synthesis.rs:89-104`);
+- `to_review`: las conclusiones a revisar del alcance (el mismo proyecto y alcance del lector que las pendientes), de la más nueva a la más vieja y hasta 10 (`REVIEW_LIMIT`, `synthesis.rs:48`), cada una con `conclusion` (la fila, con su `derived_from`), `live` (cuántas fuentes siguen vivas) y `lost` (cada fuente perdida con su `id`, su `state` y, si está `superseded`, su `superseded_by`, que se omite cuando no lo tiene) (`LostSource` y `ConclusionReview`, `synthesis.rs:89-104`);
 - `to_review_total`: cuántas hay.
 
-Una conclusión de otro agente MUST NOT aparecer. El tope es la mitad del de las conclusiones vivas: cada línea a revisar es más larga, y diez ya son una sesión de trabajo. El cliente MUST leer los dos campos con `#[serde(default)]` (`Synthesis`, `crates/clawg-cli/src/client.rs:315-327`): un daemon anterior no los manda.
+Una conclusión de otro agente que el lector alcanza MUST aparecer; una que le oculta, no. El tope es la mitad del de las conclusiones vivas: cada línea a revisar es más larga, y diez ya son una sesión de trabajo. El cliente MUST leer los dos campos con `#[serde(default)]` (`Synthesis`, `crates/clawg-cli/src/client.rs:315-327`): un daemon anterior no los manda.
 
 `synthesize` MUST mostrarlas en su propio bloque, `Conclusions to review (K of N, newest first).`, seguido de la guía (`REVIEW_GUIDE`, `crates/clawg-cli/src/mcp/tools.rs:352-357`): borrar con `delete_memory` la que ya no vale; borrar y volver a guardar corregida, con `derived_from` en las memorias en que descansa ahora, la que vale en parte o ahora descansa en las que reemplazaron a sus fuentes; dejar la que sigue valiendo. Cada línea MUST llevar `live=K/N` y sus fuentes perdidas (`#4 deleted`, `#5 replaced by #9`, `#6 purged`; `lost_source` y `review_line`, `tools.rs:378-393`). MUST mostrarlo aunque no haya pendientes, y MUST NOT repetir esas conclusiones en «Conclusions already drawn» (`format_synthesis`, `tools.rs:398`). Las instrucciones de `protocol.md` dicen lo mismo en su sección `## Conclusions` (`crates/clawg-cli/src/mcp/protocol.md:134-142`), y la descripción de `synthesize` pide usarla cuando `recall_context` dice que hay conclusiones para revisar (`crates/clawg-cli/src/mcp/server.rs:1232-1242`).
 
@@ -165,11 +166,11 @@ Una conclusión de otro agente MUST NOT aparecer. El tope es la mitad del de las
 - GIVEN una conclusión C con `derived_from = [A]` y A reemplazada por A2
 - THEN `to_review` tiene C con `lost = [A superseded by A2]`, y `synthesize` la muestra con `lost=#A replaced by #A2`
 
-**Test:** `source_state_cases`, `review_needs_one_lost_source`, `a_conclusion_with_a_deleted_source_is_to_review`, `a_conclusion_with_every_source_live_is_not`, `restoring_the_source_takes_the_conclusion_off_the_list`, `a_replaced_source_names_its_replacement`, `a_purged_source_leaves_the_conclusion_to_review`, `the_review_list_is_capped_newest_first` y `another_agents_conclusion_is_not_to_review` en `synthesis.rs`; `synthesis_over_http` en `crates/clawg-cli/tests/api.rs`; `the_synthesis_names_what_each_conclusion_lost` y `conclusions_to_review_show_with_nothing_pending` en `tools.rs`.
+**Test:** `source_state_cases`, `review_needs_one_lost_source`, `a_conclusion_with_a_deleted_source_is_to_review`, `a_conclusion_with_every_source_live_is_not`, `restoring_the_source_takes_the_conclusion_off_the_list`, `a_replaced_source_names_its_replacement`, `a_purged_source_leaves_the_conclusion_to_review`, `the_review_list_is_capped_newest_first` y `another_agents_conclusion_is_to_review_unless_hidden` en `synthesis.rs`; `synthesis_over_http` en `crates/clawg-cli/tests/api.rs`; `the_synthesis_names_what_each_conclusion_lost` y `conclusions_to_review_show_with_nothing_pending` en `tools.rs`.
 
 ### El aviso de revisión
 
-`POST /v1/context` MUST devolver `conclusions_to_review` (`ContextBody`, `crates/clawg-cli/src/daemon/api.rs:650-652`; contado en `api.rs:1354-1358`): las conclusiones a revisar del alcance pedido y del agente del pedido que perdieron una fuente después del `reviewed_at` del alcance, o todas si el alcance nunca se revisó (`conclusions_to_review_count`, `synthesis.rs:294`). Una fuente borrada se perdió en su `deleted_at`; una `superseded`, en su `last_modified_at`, que el reemplazo escribe (`SUPERSEDE_SQL`, `crates/clawg-core/src/memory/dispute.rs:272`). Una fuente purgada MUST contar sólo si el alcance nunca se revisó: no queda cuándo se purgó, y `purge` es una operación a mano del dueño de la base. Así, llamar a `synthesize` apaga el aviso aunque la conclusión siga en la lista, y una pérdida posterior lo vuelve a encender; un aviso que contara todas las conclusiones a revisar no se apagaría nunca si el agente decide que una sigue valiendo. Un conteo que falla se registra y da 0, como `unreviewed`. El cliente MUST leer el campo con `#[serde(default)]` (`Context`, `crates/clawg-cli/src/client.rs:285-288`).
+`POST /v1/context` MUST devolver `conclusions_to_review` (`ContextBody`, `crates/clawg-cli/src/daemon/api.rs:650-652`; contado en `api.rs:1354-1358`): las conclusiones a revisar del alcance pedido, dentro de lo que alcanza el agente del pedido, que perdieron una fuente después del `reviewed_at` del alcance, o todas si el alcance nunca se revisó (`conclusions_to_review_count`, `synthesis.rs:294`). Una fuente borrada se perdió en su `deleted_at`; una `superseded`, en su `last_modified_at`, que el reemplazo escribe (`SUPERSEDE_SQL`, `crates/clawg-core/src/memory/dispute.rs:272`). Una fuente purgada MUST contar sólo si el alcance nunca se revisó: no queda cuándo se purgó, y `purge` es una operación a mano del dueño de la base. Así, llamar a `synthesize` apaga el aviso aunque la conclusión siga en la lista, y una pérdida posterior lo vuelve a encender; un aviso que contara todas las conclusiones a revisar no se apagaría nunca si el agente decide que una sigue valiendo. Un conteo que falla se registra y da 0, como `unreviewed`. El cliente MUST leer el campo con `#[serde(default)]` (`Context`, `crates/clawg-cli/src/client.rs:285-288`).
 
 `recall_context` y el hook `session-start` MUST agregar al final, después del aviso de R8, una línea desde una conclusión a revisar: cuántas conclusiones descansan en memorias borradas o reemplazadas desde la última revisión, y que al terminar la tarea se llame a `synthesize` para revisarlas (`review_nudge`, `crates/clawg-cli/src/mcp/tools.rs:472`; `format_recall`, `tools.rs:510`; `session_start_text`, `crates/clawg-cli/src/hook.rs:86`). El umbral es 1, no el 20 de R8: una conclusión que perdió su base es más rara que una memoria sin revisar, y cuesta más si se deja. La línea MUST NOT ir dentro del prompt de `build_memory_prompt`, así que `rag-eval --agent-view` no cambia.
 
@@ -183,7 +184,7 @@ Una conclusión de otro agente MUST NOT aparecer. El tope es la mitad del de las
 
 ## R8. Recordatorio en `recall_context`
 
-`POST /v1/context` MUST devolver `unreviewed`: cuántas memorias sin revisar tiene el alcance pedido, para el agente del pedido. `recall_context` MUST agregar al final del contexto una línea que nombra `synthesize` y la cantidad cuando `unreviewed` es 20 o más, y no agregar nada debajo de eso. La línea MUST NOT ir dentro del prompt que arma `build_memory_prompt`, para que `rag-eval --agent-view` no cambie. Un contexto vacío (`no context yet`) lleva la línea igual.
+`POST /v1/context` MUST devolver `unreviewed`: cuántas memorias sin revisar tiene el alcance pedido, dentro de lo que alcanza el agente del pedido. `recall_context` MUST agregar al final del contexto una línea que nombra `synthesize` y la cantidad cuando `unreviewed` es 20 o más, y no agregar nada debajo de eso. La línea MUST NOT ir dentro del prompt que arma `build_memory_prompt`, para que `rag-eval --agent-view` no cambie. Un contexto vacío (`no context yet`) lleva la línea igual.
 
 La misma línea llega al inicio de la sesión por el hook `session-start` ([`specs/hooks`](../hooks/spec.md), R4).
 
