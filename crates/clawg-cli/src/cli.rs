@@ -193,6 +193,12 @@ pub enum Command {
         #[command(subcommand)]
         action: ProjectsAction,
     },
+    /// Read what the daemon measured of itself, kept in `<data>/metrics.db`.
+    /// Read-only; works with the daemon running or stopped.
+    Metrics {
+        #[command(subcommand)]
+        action: MetricsAction,
+    },
     /// Browse what the daemon has stored. Read-only; needs a running daemon.
     Memories {
         #[command(subcommand)]
@@ -270,6 +276,64 @@ pub enum ProjectsAction {
         #[command(flatten)]
         profile: ProfileArg,
     },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum MetricsAction {
+    /// Sum one metric by local day, by hour of the local day or by version,
+    /// and print its count, mean and percentiles (or, for a gauge, its
+    /// samples, mean and extremes) as JSON.
+    Report {
+        /// The metric, as `http.duration` or `process.rss_bytes`.
+        #[arg(long)]
+        metric: String,
+        /// Only the series with this label, as `route=/v1/search`. Repeat it
+        /// to ask for several.
+        #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_label)]
+        labels: Vec<(String, String)>,
+        #[arg(long, value_enum, default_value_t = ReportBy::Version)]
+        by: ReportBy,
+        /// How far back, in days (`30d`) or hours (`12h`).
+        #[arg(long, value_name = "AGE", value_parser = parse_since, default_value = "30d")]
+        since: std::time::Duration,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+}
+
+/// What `clawg metrics report` groups by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ReportBy {
+    /// The local date.
+    Day,
+    /// The hour of the local day, 00 to 23, across every day.
+    Hour,
+    /// The clawg version that recorded it.
+    Version,
+}
+
+/// `KEY=VALUE`, both sides trimmed and not empty.
+fn parse_label(raw: &str) -> Result<(String, String), String> {
+    let (key, value) = raw.split_once('=').ok_or_else(|| format!("{raw:?} is not KEY=VALUE"))?;
+    let (key, value) = (key.trim(), value.trim());
+    if key.is_empty() || value.is_empty() {
+        return Err(format!("{raw:?} is not KEY=VALUE"));
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
+/// `30d` or `12h`: a whole number of days or hours.
+fn parse_since(raw: &str) -> Result<std::time::Duration, String> {
+    let raw = raw.trim();
+    let invalid = || format!("{raw:?} is not an age such as 30d or 12h");
+    let (number, unit) = raw.split_at(raw.len().saturating_sub(1));
+    let n: u64 = number.parse().map_err(|_| invalid())?;
+    let hours = match unit {
+        "d" => n.checked_mul(24).ok_or_else(invalid)?,
+        "h" => n,
+        _ => return Err(invalid()),
+    };
+    Ok(std::time::Duration::from_secs(hours.checked_mul(3600).ok_or_else(invalid)?))
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -972,6 +1036,46 @@ mod tests {
             Command::Secrets { mask_reasons: true, yes: true, profile: ProfileArg { profile: None } }
         );
         assert!(Cli::try_parse_from(["clawg", "secrets", "--yes"]).is_err(), "--yes confirms a rewrite");
+    }
+
+    #[test]
+    fn metrics_report_takes_a_metric_labels_a_grouping_and_an_age() {
+        assert_eq!(
+            parse(&["clawg", "metrics", "report", "--metric", "http.duration"]).command,
+            Command::Metrics {
+                action: MetricsAction::Report {
+                    metric: "http.duration".into(),
+                    labels: vec![],
+                    by: ReportBy::Version,
+                    since: std::time::Duration::from_secs(30 * 86_400),
+                    profile: ProfileArg { profile: None },
+                }
+            }
+        );
+        assert_eq!(
+            parse(&[
+                "clawg", "metrics", "report", "--metric", "http.duration", "--label", "route=/v1/search", "--label",
+                " transport = unix ", "--by", "hour", "--since", "12h", "--profile", "dev",
+            ])
+            .command,
+            Command::Metrics {
+                action: MetricsAction::Report {
+                    metric: "http.duration".into(),
+                    labels: vec![("route".into(), "/v1/search".into()), ("transport".into(), "unix".into())],
+                    by: ReportBy::Hour,
+                    since: std::time::Duration::from_secs(12 * 3600),
+                    profile: ProfileArg { profile: Some("dev".into()) },
+                }
+            }
+        );
+        assert!(Cli::try_parse_from(["clawg", "metrics", "report"]).is_err(), "the metric is required");
+        for bad in ["route", "=x", "route=", "a"] {
+            assert!(parse_label(bad).is_err(), "{bad}");
+        }
+        for bad in ["30", "d", "3w", "-1d", "99999999999999999d"] {
+            assert!(parse_since(bad).is_err(), "{bad}");
+        }
+        assert_eq!(parse_since("1d"), Ok(std::time::Duration::from_secs(86_400)));
     }
 
     #[test]

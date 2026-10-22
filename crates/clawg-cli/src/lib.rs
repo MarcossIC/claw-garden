@@ -35,6 +35,7 @@ pub mod hook;
 pub mod import;
 pub mod mcp;
 pub mod memories;
+pub mod metrics;
 pub mod outbox;
 pub mod process;
 pub mod projects;

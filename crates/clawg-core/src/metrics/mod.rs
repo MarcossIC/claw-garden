@@ -3,6 +3,7 @@
 
 pub mod histogram;
 pub mod recorder;
+pub mod report;
 pub mod store;
 
 pub use histogram::{Histogram, Unit};

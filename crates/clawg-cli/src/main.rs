@@ -13,7 +13,9 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use clawg_cli::cli::{is_bare_invocation, is_hook_invocation, sharing_profile, Cli, Command, PathAction, ProjectsAction, SetupClient};
+use clawg_cli::cli::{
+    is_bare_invocation, is_hook_invocation, sharing_profile, Cli, Command, MetricsAction, PathAction, ProjectsAction, SetupClient,
+};
 use clawg_cli::client::{probe_running, ClientError, DaemonClient, Probe};
 use clawg_cli::daemon::lifecycle::{now_ms, read_state};
 use clawg_cli::daemon::serve;
@@ -23,6 +25,7 @@ use clawg_cli::hook;
 use clawg_cli::import;
 use clawg_cli::mcp;
 use clawg_cli::memories;
+use clawg_cli::metrics;
 use clawg_cli::outbox;
 use clawg_cli::projects;
 use clawg_cli::restore;
@@ -306,6 +309,13 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             let (text, code) = update::run(check, profile).await.map_err(|e| e.to_string())?;
             println!("{text}");
             Ok(ExitCode::from(code))
+        }
+
+        Command::Metrics { action: MetricsAction::Report { metric, labels, by, since, profile } } => {
+            let profile = profile.resolve().map_err(|e| e.to_string())?;
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            println!("{}", metrics::report(&base_dir, &metric, &labels, by, since, now_ms() as i64)?);
+            Ok(ExitCode::SUCCESS)
         }
 
         Command::Projects { action: ProjectsAction::Add { path, profile } } => {
