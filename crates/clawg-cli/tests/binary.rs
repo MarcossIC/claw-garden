@@ -790,6 +790,42 @@ async fn export_and_import_round_trip_through_the_binary() {
     assert!(text.contains("> a second exported memory"), "{text}");
 }
 
+#[tokio::test]
+async fn projects_move_moves_and_undoes_a_seeded_store() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+    for content in ["an unfiled note about the parser", "an unfiled note about the lexer"] {
+        let (status, body) = daemon.post("/v1/memories", json!({ "content": content, "agent_id": "smoke" })).await;
+        assert_eq!(status, 201, "{body}");
+    }
+    let repo = sandbox.home.join("repo");
+    std::fs::create_dir_all(repo.join(".git")).expect("repo");
+    let to = repo.to_string_lossy().into_owned();
+    let run = |args: &[&str]| {
+        let mut argv = vec!["projects", "move"];
+        argv.extend_from_slice(args);
+        argv.extend_from_slice(&["--profile", "dev"]);
+        let output = sandbox.run(&argv);
+        assert_eq!(output.status.code(), Some(0), "{argv:?}: {}", stderr_of(&output));
+        stdout_of(&output)
+    };
+
+    let dry = run(&["--from-none", "--to", &to, "--dry-run"]);
+    assert!(dry.starts_with("would move 2 memories to project repo-"), "{dry}");
+    assert!(!daemon.list().await.contains("\"project_id\":\"repo-"), "a dry run moves nothing");
+
+    let moved = run(&["--from-none", "--to", &to]);
+    assert!(moved.starts_with("moved 2 memories to project repo-"), "{moved}");
+    assert!(moved.contains("-pre-move.db; `clawg restore` brings it back"), "{moved}");
+    assert!(moved.contains("this is move 1"), "{moved}");
+    assert_eq!(daemon.list().await.matches("\"project_id\":\"repo-").count(), 2);
+
+    let undone = run(&["--undo", "1"]);
+    assert!(undone.starts_with("moved 2 memories to no project"), "{undone}");
+    assert!(!daemon.list().await.contains("\"project_id\":\"repo-"));
+}
+
 // ── The data directory's socket ────────────────────────────────────────────
 
 const SERVE_WITHOUT_PORT: [&str; 3] = ["serve", "--profile", "dev"];
