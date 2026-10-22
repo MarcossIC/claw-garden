@@ -10,6 +10,8 @@ use clap::{Parser, Subcommand};
 use clawg_core::memory::sharing;
 use clawg_core::paths::{Profile, ProfileError};
 
+use crate::client::MoveRequest;
+
 /// `clawg` — local-first memory for coding agents.
 #[derive(Debug, Parser)]
 #[command(name = "clawg", version = clawg_core::build_info::version(), about, long_about = None)]
@@ -276,6 +278,96 @@ pub enum ProjectsAction {
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Move memories to another project, or out of every project, through the
+    /// running daemon. Each one moves with its whole save and topic history; a
+    /// memory whose text or topic key is live in the target stays where it is.
+    Move(MoveOpts),
+}
+
+/// What `clawg projects move` moves, and where. Exactly one of `--to`,
+/// `--to-project`, `--to-none` and `--undo`.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+#[command(group(clap::ArgGroup::new("target").args(["to", "to_project", "to_none", "undo"]).required(true)))]
+pub struct MoveOpts {
+    /// A memory to move, by id; repeat it for several.
+    #[arg(long = "id", value_name = "ID")]
+    pub ids: Vec<i64>,
+    /// Only memories of this project id.
+    #[arg(long, value_name = "ID", conflicts_with_all = ["from_none", "here"])]
+    pub from_project: Option<String>,
+    /// Only memories saved in no project.
+    #[arg(long, conflicts_with = "here")]
+    pub from_none: bool,
+    /// Only memories of the project of the current directory, as `clawg mcp`
+    /// would scope them.
+    #[arg(long)]
+    pub here: bool,
+    /// Only memories this agent saved.
+    #[arg(long, value_name = "NAME")]
+    pub agent: Option<String>,
+    /// Only memories of this type.
+    #[arg(long = "type", value_name = "T")]
+    pub memory_type: Option<String>,
+    /// Only memories of this source (`explicit`, `synthesis`, `imported`, ...).
+    #[arg(long, value_name = "S")]
+    pub source: Option<String>,
+    /// Only memories saved in this host session.
+    #[arg(long, value_name = "ID")]
+    pub session: Option<String>,
+    /// Only memories whose content matches every word, as `memories search`
+    /// reads them.
+    #[arg(long, value_name = "WORDS")]
+    pub text: Option<String>,
+    /// Select deleted memories too.
+    #[arg(long)]
+    pub include_deleted: bool,
+    /// Move to the project PATH is in, registered first as a bridge would.
+    #[arg(long, value_name = "PATH")]
+    pub to: Option<PathBuf>,
+    /// Move to this registered project id, for a root no longer on disk.
+    #[arg(long, value_name = "ID")]
+    pub to_project: Option<String>,
+    /// Move out of every project, where every project's searches reach them.
+    #[arg(long)]
+    pub to_none: bool,
+    /// Move back what move N moved and is still where it left it.
+    #[arg(
+        long,
+        value_name = "N",
+        conflicts_with_all = [
+            "ids", "from_project", "from_none", "here", "agent", "memory_type", "source", "session", "text",
+            "include_deleted",
+        ]
+    )]
+    pub undo: Option<i64>,
+    /// Report what would move without moving anything.
+    #[arg(long)]
+    pub dry_run: bool,
+    #[command(flatten)]
+    pub profile: ProfileArg,
+}
+
+impl MoveOpts {
+    /// The request to send, given the id of the project of the current
+    /// directory (for `--here`) and of `--to`'s path, both resolved by the
+    /// caller so this stays testable without a filesystem.
+    pub fn request(&self, here: Option<String>, to: Option<String>) -> MoveRequest {
+        MoveRequest {
+            ids: self.ids.clone(),
+            from_project: if self.here { here } else { self.from_project.clone() },
+            from_none: self.from_none,
+            agent: self.agent.clone(),
+            memory_type: self.memory_type.clone(),
+            source: self.source.clone(),
+            session_id: self.session.clone(),
+            q: self.text.clone(),
+            include_deleted: self.include_deleted,
+            to_project: to.or_else(|| self.to_project.clone()),
+            to_none: self.to_none,
+            undo: self.undo,
+            dry_run: self.dry_run,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -562,6 +654,9 @@ pub struct Filters {
     /// Only memories in this lifecycle state.
     #[arg(long, value_enum)]
     pub status: Option<StatusArg>,
+    /// Only rows saved in no project, which every project's searches reach.
+    #[arg(long, conflicts_with_all = ["project", "here"])]
+    pub no_project: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
@@ -1092,6 +1187,75 @@ mod tests {
         assert!(Cli::try_parse_from(["clawg", "projects", "add"]).is_err(), "the path is required");
     }
 
+    fn move_opts(args: &[&str]) -> MoveOpts {
+        let mut argv = vec!["clawg", "projects", "move"];
+        argv.extend_from_slice(args);
+        match parse(&argv).command {
+            Command::Projects { action: ProjectsAction::Move(opts) } => opts,
+            other => panic!("not a move: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn move_takes_a_selection_and_one_target_or_an_undo() {
+        let opts = move_opts(&["--id", "3", "--id", "7", "--from-none", "--type", "semantic_fact", "--to-project", "repo-1a2b"]);
+        assert_eq!(
+            opts.request(None, None),
+            MoveRequest {
+                ids: vec![3, 7],
+                from_none: true,
+                memory_type: Some("semantic_fact".into()),
+                to_project: Some("repo-1a2b".into()),
+                ..MoveRequest::default()
+            }
+        );
+
+        let opts = move_opts(&["--here", "--text", "parser cache", "--to", "/work/other", "--dry-run"]);
+        assert_eq!(opts.to.as_deref(), Some(std::path::Path::new("/work/other")));
+        assert_eq!(
+            opts.request(Some("here-0000".into()), Some("other-1111".into())),
+            MoveRequest {
+                from_project: Some("here-0000".into()),
+                q: Some("parser cache".into()),
+                to_project: Some("other-1111".into()),
+                dry_run: true,
+                ..MoveRequest::default()
+            }
+        );
+
+        assert_eq!(move_opts(&["--undo", "4"]).request(None, None), MoveRequest { undo: Some(4), ..MoveRequest::default() });
+        assert_eq!(move_opts(&["--agent", "a", "--to-none"]).request(None, None).to_none, true);
+
+        for bad in [
+            vec!["--id", "3"],
+            vec!["--id", "3", "--to-none", "--to-project", "repo-1a2b"],
+            vec!["--undo", "4", "--id", "3"],
+            vec!["--from-none", "--here", "--to-none"],
+            vec!["--from-project", "a-0000", "--from-none", "--to-none"],
+        ] {
+            let mut argv = vec!["clawg", "projects", "move"];
+            argv.extend(bad.iter().copied());
+            assert!(Cli::try_parse_from(&argv).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn list_and_search_take_no_project() {
+        let Command::Memories { action: MemoriesAction::List(opts) } = parse(&["clawg", "memories", "list", "--no-project"]).command
+        else {
+            panic!("not a list");
+        };
+        assert!(opts.filters.no_project);
+        let Command::Memories { action: MemoriesAction::Search(opts) } =
+            parse(&["clawg", "memories", "search", "cache", "--no-project"]).command
+        else {
+            panic!("not a search");
+        };
+        assert!(opts.filters.no_project);
+        assert!(Cli::try_parse_from(["clawg", "memories", "list", "--no-project", "--project", "a-0000"]).is_err());
+        assert!(Cli::try_parse_from(["clawg", "memories", "list", "--no-project", "--here"]).is_err());
+    }
+
     #[test]
     fn outbox_takes_an_action_an_operation_id_and_an_agent() {
         assert_eq!(
@@ -1267,6 +1431,7 @@ mod tests {
                     memory_type: Some("semantic_fact".into()),
                     tier: Some(2),
                     status: Some(StatusArg::Disputed),
+                    no_project: false,
                 },
                 limit: 5,
                 offset: 10,

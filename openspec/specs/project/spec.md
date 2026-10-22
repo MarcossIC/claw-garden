@@ -6,6 +6,7 @@ Fuente de verdad del comportamiento actual de la identidad de proyecto. Cubre c�
 - [project-identity](../../changes/archive/2026-10-12-project-identity/proposal.md), archivado el 2026-10-12.
 - [project-root-guard](../../changes/archive/2026-10-15-project-root-guard/proposal.md), archivado el 2026-10-15 (la marca `index_docs` en R4 y R6, y la colisión como error en R6).
 - [untrusted-recall](../../changes/archive/2026-10-20-untrusted-recall/proposal.md), archivado el 2026-10-20 (R6: la raíz del puente pide `index_docs` sólo si es un proyecto).
+- [project-reassign](../../changes/archive/2026-10-22-project-reassign/proposal.md), archivado el 2026-10-22 (R8 a R13: mover filas de `memory` a otro proyecto o a ninguno, con su unidad, su registro y su vuelta atrás).
 
 ## Definiciones
 
@@ -179,3 +180,51 @@ En un re-key, por cada agente con `<workspaces>/<agente>/<id viejo>/workspace.md
 - THEN `agent-a/<id nuevo>/workspace.md` tiene la misma sección USER, y el viejo sigue igual
 
 **Tests:** `a_rekey_copies_the_legacy_workspace_and_keeps_it`, `adopting_never_overwrites_the_projects_own_workspace` y `adopting_without_any_workspace_is_a_no_op` en `crates/clawg-core/src/memory/workspace.rs`; `registering_carries_the_legacy_workspace_over` en `project.rs`.
+
+## R8. Mover cambia el proyecto de una unidad entera y nada más
+
+Un **movimiento** cambia el `project_id` de filas de `memory` a un **destino**: un id de proyecto o «sin proyecto». La **unidad** de una fila es su cierre: las filas de todo save de `memory_piece` que la contiene, las que reemplazó con causa `revision` y la que la reemplazó con esa causa, las que su borrado revivió (`revived_from`) y la que revivió por el suyo, repetido hasta que no entra ninguna más, borradas y `superseded` incluidas (`read_units_in`, `crates/clawg-core/src/memory/relocate.rs`).
+
+Un movimiento MUST cambiar, en una transacción, `project_id` y, en una fila sin agente, `scope` (`project` con destino, `global` sin él; `scope_after`) de cada fila de cada unidad aceptada, y MUST NOT tocar otra columna de `memory` (ni `last_modified_at`, ni `update_count`, ni `status`), `memory_vectors`, `memory_fts`, `memory_conflict`, `memory_derivation` ni `memory_piece`. No MUST necesitar el embedder ni correr el detector. Después, la búsqueda, RECENT, LAST SESSION, la dedup, la clave de tema, el revivir y la revisión de conclusiones MUST tratar las filas como guardadas en el destino. Una fila sin proyecto se sigue viendo desde todos los proyectos.
+
+#### Escenario: sin proyecto a uno
+- GIVEN una fila sin proyecto que se encuentra desde A y desde B
+- WHEN se mueve a B
+- THEN se encuentra desde B, por vector y por texto, y no desde A
+
+#### Escenario: la cadena se mueve con su vigente
+- GIVEN una clave con su vigente y la versión que reemplazó, en A
+- WHEN se mueve la versión vieja a B y después se borra la vigente
+- THEN las dos se movieron y la versión anterior vuelve viva en B
+
+**Test:** `a_row_without_a_project_moves_into_one`, `moving_to_no_project_shows_the_row_from_every_project`, `a_row_without_an_agent_keeps_the_scope_check`, `the_pieces_of_a_save_move_together`, `two_saves_that_share_a_row_move_together`, `a_revision_chain_moves_with_its_head_and_deleting_the_head_still_revives`, `after_a_move_a_save_of_the_same_text_reinforces_the_moved_row`, `after_a_move_a_save_under_its_key_revises_it`, `a_session_summary_moved_into_a_project_is_its_last_session`, `moving_a_superseded_source_does_not_make_its_conclusions_reappear_for_review`, `a_move_leaves_vectors_and_the_text_index_alone` y `scope_after_a_move_follows_the_check` (`relocate.rs`).
+
+## R9. Lo que rechaza una unidad
+
+Una unidad MUST quedarse donde está, sin escribir ninguna de sus filas, cuando una fila viva del destino al alcance del lector tiene el `content_hash` (`live_twin`) o la `topic_key` (`topic_taken`) de una fila viva de la unidad, cuando una unidad aceptada antes en el mismo movimiento lleva ese hash o esa clave a ese destino (se mueve la primera, por id), cuando sus filas están en más de un proyecto (`spans_projects`) o cuando tiene una fila fuera del alcance del lector (`out_of_reach`, sin nombrarla). El motivo MUST nombrar la fila de la unidad y la que sostiene el texto o la clave. Una unidad que ya está en el destino queda `unchanged` y no se registra. Una fila borrada MUST moverse con su unidad sin chocar; un `restore` posterior valida en el proyecto nuevo. Los pares abiertos que quedan entre dos proyectos MUST nombrarse (`split_pairs`) y quedar como están. La decisión es pura (`decide`).
+
+**Test:** `decide_*` (puros), `a_live_row_of_the_same_text_in_the_target_refuses_the_move`, `a_live_holder_of_the_topic_key_in_the_target_refuses_the_move`, `two_selected_saves_that_would_collide_in_the_target_move_only_the_first`, `a_unit_across_projects_is_refused`, `a_hidden_row_in_the_unit_refuses_it_without_naming_it`, `a_clash_is_judged_within_the_readers_reach`, `a_deleted_row_moves_with_its_save_and_is_restored_into_the_new_project` y `a_pair_left_across_projects_is_reported` (`relocate.rs`).
+
+## R10. El destino está registrado
+
+El daemon MUST rechazar con 404, sin escribir, un destino que no está en `project`; «sin proyecto» siempre es un destino. El puente (`to_project_path`) y `clawg projects move --to PATH` MUST registrar antes la raíz de la ruta, sin `index_docs`, y MUST rechazar una raíz que no es un directorio.
+
+**Test:** `an_unregistered_target_is_refused` (`relocate.rs`), `a_move_to_an_unregistered_project_is_404` (`tests/api.rs`), `update_memory_refuses_both_destinations_and_a_path_that_is_not_a_directory` (`server.rs`).
+
+## R11. El registro y la vuelta atrás
+
+Cada fila que un movimiento cambia, por cualquier puerta, MUST dejar en `memory_move` (V21) el número del movimiento (`MAX + 1`), la fila, el proyecto y el `scope` de origen y de destino y el momento, en la misma transacción. Deshacer el movimiento N (`undo_move_core`) MUST mover de vuelta a su origen, con R8 y R9 y sin exigir que el origen esté registrado, las filas de N que siguen en el destino que N anotó, como un movimiento nuevo; una fila que se movió otra vez después queda donde está. Un N que no existe es un 404.
+
+**Test:** `every_moved_row_is_logged_and_the_log_undoes_it` y `undoing_leaves_a_row_that_moved_again` (`relocate.rs`).
+
+## R12. El lote
+
+`POST /v1/memories/move` MUST tomar `dry_run` y una selección (al menos uno de `ids`, `from_project`/`from_none`, `agent`, `memory_type`, `source`, `session_id` o `q`; sin `include_deleted`, filas no borradas; `q` con `include_deleted` es un 400) con un destino (`to_project` o `to_none`), o `undo`. Es del usuario: sin lector y sin `user_answered`; cuenta en `protected` las preferencias y decisiones vivas que movió. Con algo que mover y sin `dry_run`, MUST tomar antes el snapshot `pre-move`. Un ensayo MUST responder lo mismo que el movimiento, salvo `move_id` y `snapshot`, sin escribir nada. `clawg projects move` manda ese pedido al daemon que corre, sin arrancar uno, e imprime el reporte; su análisis de argumentos es puro (`MoveOpts::request`).
+
+**Test:** `a_dry_run_reports_what_a_move_does_and_writes_nothing`, `a_selection_needs_a_filter_and_text_only_over_live_rows` y `the_filters_narrow_the_selection` (`relocate.rs`); `a_move_asks_for_one_target_or_an_undo` (`api.rs`); `the_batch_moves_reports_and_snapshots` y `a_batch_without_a_selection_or_a_target_is_400` (`tests/api.rs`); `move_takes_a_selection_and_one_target_or_an_undo` (`cli.rs`); `a_move_report_names_what_moved_what_stayed_and_the_way_back` y `projects_move_moves_a_memory_and_undoes_it` (`projects.rs`); `projects_move_moves_and_undoes_a_seeded_store` (`tests/binary.rs`).
+
+## R13. Listar lo que no tiene proyecto
+
+`GET /v1/memories?no_project=true` MUST listar sólo las filas sin proyecto; con `project` es un 400. `clawg memories list` y `search` toman `--no-project`.
+
+**Test:** `a_listing_of_rows_without_a_project` (`admin.rs`), `no_project_and_project_together_are_refused` (`api.rs`), `the_listing_reaches_the_rows_without_a_project` (`tests/api.rs`), `list_and_search_take_no_project` (`cli.rs`).

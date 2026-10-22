@@ -3643,3 +3643,166 @@ async fn metrics_speaks_prometheus_text() {
     let r = h.authed(h.http.get(h.url("/v1/metrics?format=yaml"))).send().await.expect("request");
     assert_eq!(r.status(), 400);
 }
+
+// ── Moving memories between projects ───────────────────────────────────────
+
+/// Registers `root` with the daemon and answers its project id.
+async fn registered(h: &Harness, root: &str) -> String {
+    let (status, body) = h.post_json("/v1/projects", json!({ "root_path": root })).await;
+    assert_eq!(status, 200, "{body}");
+    body["project_id"].as_str().expect("project_id").to_string()
+}
+
+async fn patch(h: &Harness, id: i64, body: Value) -> (u16, Value) {
+    let r = h
+        .authed(h.http.patch(h.url(&format!("/v1/memories/memory/{id}"))))
+        .json(&body)
+        .send()
+        .await
+        .expect("request");
+    let status = r.status().as_u16();
+    (status, r.json().await.unwrap_or(Value::Null))
+}
+
+async fn project_of(h: &Harness, id: i64) -> Value {
+    let (_, row) = h.get_json(&format!("/v1/memories/memory/{id}")).await;
+    row["item"]["project_id"].clone()
+}
+
+fn saved_ids(body: &Value) -> Vec<i64> {
+    body["memories"].as_array().expect("memories").iter().map(|m| m["id"].as_i64().unwrap()).collect()
+}
+
+#[tokio::test]
+async fn patch_moves_a_whole_save() {
+    let h = Harness::start().await;
+    let target = registered(&h, "/work/target").await;
+    let content = (0..600).map(|i| format!("w{i:05}")).collect::<Vec<_>>().join(" ");
+    let (_, body) = h.post_json("/v1/memories", json!({ "content": content, "agent_id": "a" })).await;
+    let pieces = saved_ids(&body);
+
+    let (status, body) = patch(&h, pieces[3], json!({ "project_id": target })).await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["project_id"], json!(target), "{body}");
+    assert_eq!(body["move_id"], 1, "{body}");
+    assert_eq!(body["pulled_in"].as_array().map(Vec::len), Some(pieces.len() - 1), "{body}");
+    for id in pieces {
+        assert_eq!(project_of(&h, id).await, json!(target));
+    }
+}
+
+#[tokio::test]
+async fn patch_with_a_clash_is_409_and_changes_nothing() {
+    let h = Harness::start().await;
+    let target = registered(&h, "/work/target").await;
+    let (_, body) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a" })).await;
+    let loose = saved_ids(&body)[0];
+    let (_, body) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a", "project_id": target })).await;
+    let twin = saved_ids(&body)[0];
+
+    let (status, body) = patch(&h, loose, json!({ "project_id": target, "importance": 9.0 })).await;
+
+    assert_eq!(status, 409, "{body}");
+    assert!(body["error"].as_str().unwrap_or_default().contains(&format!("#{twin}")), "{body}");
+    assert_eq!(project_of(&h, loose).await, Value::Null);
+    let (_, row) = h.get_json(&format!("/v1/memories/memory/{loose}")).await;
+    assert_ne!(row["item"]["importance"], 9.0, "{row}");
+}
+
+#[tokio::test]
+async fn patch_with_both_destinations_is_400() {
+    let h = Harness::start().await;
+    let target = registered(&h, "/work/target").await;
+    let (_, body) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a" })).await;
+    let id = saved_ids(&body)[0];
+
+    let (status, body) = patch(&h, id, json!({ "project_id": target, "no_project": true })).await;
+
+    assert_eq!(status, 400, "{body}");
+}
+
+#[tokio::test]
+async fn a_move_to_an_unregistered_project_is_404() {
+    let h = Harness::start().await;
+    let (_, body) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a" })).await;
+    let id = saved_ids(&body)[0];
+
+    let (status, body) = patch(&h, id, json!({ "project_id": "typo-0000" })).await;
+
+    assert_eq!(status, 404, "{body}");
+    assert!(body["error"].as_str().unwrap_or_default().contains("typo-0000"), "{body}");
+}
+
+#[tokio::test]
+async fn patch_moves_while_the_embedder_loads() {
+    let h = Harness::start_serving_without_embedder().await;
+    let target = registered(&h, "/work/target").await;
+    h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a", "project_id": target })).await;
+    let id = h.wait_for_rows("memory", 1).await[0]["id"].as_i64().unwrap();
+
+    let (status, body) = patch(&h, id, json!({ "no_project": true })).await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(project_of(&h, id).await, Value::Null);
+}
+
+#[tokio::test]
+async fn the_listing_reaches_the_rows_without_a_project() {
+    let h = Harness::start().await;
+    let target = registered(&h, "/work/target").await;
+    h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a", "project_id": target })).await;
+    let (_, body) = h.post_json("/v1/memories", json!({ "content": "a note filed nowhere", "agent_id": "a" })).await;
+    let loose = saved_ids(&body)[0];
+
+    let (status, body) = h.get_json("/v1/memories?no_project=true").await;
+    assert_eq!(status, 200, "{body}");
+    let ids: Vec<i64> = body["items"].as_array().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, vec![loose]);
+
+    let (status, body) = h.get_json(&format!("/v1/memories?no_project=true&project={target}")).await;
+    assert_eq!(status, 400, "{body}");
+}
+
+#[tokio::test]
+async fn the_batch_moves_reports_and_snapshots() {
+    let h = Harness::start().await;
+    let target = registered(&h, "/work/target").await;
+    let mut loose = Vec::new();
+    for content in ["the first unfiled note", "the second unfiled note"] {
+        let (_, body) = h.post_json("/v1/memories", json!({ "content": content, "agent_id": "a" })).await;
+        loose.extend(saved_ids(&body));
+    }
+    let request = json!({ "from_none": true, "to_project": target });
+
+    let (status, dry) = h.post_json("/v1/memories/move", json!({ "from_none": true, "to_project": target, "dry_run": true })).await;
+    assert_eq!(status, 200, "{dry}");
+    assert_eq!(dry["moved"].as_array().map(Vec::len), Some(2), "{dry}");
+    assert_eq!(project_of(&h, loose[0]).await, Value::Null, "a dry run moves nothing");
+
+    let (status, done) = h.post_json("/v1/memories/move", request).await;
+    assert_eq!(status, 200, "{done}");
+    assert_eq!(done["move_id"], 1, "{done}");
+    let snapshot = done["snapshot"].as_str().expect("snapshot");
+    assert!(snapshot.ends_with("-pre-move.db") && std::path::Path::new(snapshot).exists(), "{snapshot}");
+    for &id in &loose {
+        assert_eq!(project_of(&h, id).await, json!(target));
+    }
+
+    let (status, undone) = h.post_json("/v1/memories/move", json!({ "undo": 1 })).await;
+    assert_eq!(status, 200, "{undone}");
+    assert_eq!(undone["move_id"], 2, "{undone}");
+    assert_eq!(project_of(&h, loose[1]).await, Value::Null);
+}
+
+#[tokio::test]
+async fn a_batch_without_a_selection_or_a_target_is_400() {
+    let h = Harness::start().await;
+
+    for body in [json!({ "to_none": true }), json!({ "ids": [1] }), json!({ "ids": [1], "to_none": true, "undo": 1 }), json!({ "ids": [1], "to_none": true, "projects": "x" })] {
+        let (status, answer) = h.post_json("/v1/memories/move", body.clone()).await;
+        assert!(status == 400 || status == 422, "{body} -> {status} {answer}");
+    }
+    let (status, answer) = h.post_json("/v1/memories/move", json!({ "undo": 9 })).await;
+    assert_eq!(status, 404, "{answer}");
+}

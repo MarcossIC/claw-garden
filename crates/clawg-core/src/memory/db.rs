@@ -699,7 +699,7 @@ mod tests {
 
         let after = conn.call(snapshot).await.unwrap();
         assert_eq!(before, after);
-        assert_eq!(after.0, 20);
+        assert_eq!(after.0, 21);
     }
 
     /// Rows written before `project` existed keep their project ids when the
@@ -1425,6 +1425,58 @@ mod tests {
         assert_eq!(snapshots, 1, "the pre-migration snapshot is the way back");
     }
 
+    /// Nothing moved a row between projects before the move log, so a store
+    /// from before it opens with the log empty and every row where it was.
+    #[tokio::test]
+    async fn a_database_from_the_previous_version_opens_with_an_empty_move_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), Some(20)).await;
+        let conn = Connection::open(dir.path().join("memory.db")).await.unwrap();
+        conn.call(|c| {
+            for (id, agent, project) in [(10, Some("a"), Some("p-1a2b")), (11, Some("b"), None), (12, None, None)] {
+                c.execute(
+                    "INSERT INTO memory \
+                     (id, scope, agent_id, project_id, content, memory_type, source, \
+                      created_at, created_by_type, created_by_ref, \
+                      last_modified_at, last_accessed_at, importance, tier, status) \
+                     VALUES (?1, CASE WHEN ?2 IS NOT NULL THEN 'agent' WHEN ?3 IS NULL THEN 'global' ELSE 'project' END, \
+                      ?2, ?3, 'row ' || ?1, 'semantic_fact', 'explicit', ?1, 'agent', 'x', ?1, ?1, 5.0, 3, 'active')",
+                    rusqlite::params![id, agent, project],
+                )?;
+            }
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+        conn.close().await.unwrap();
+
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        let (rows, logged): (Vec<(i64, String, Option<String>, Option<String>)>, i64) = store
+            .conn
+            .call(|c| -> rusqlite::Result<_> {
+                let mut stmt =
+                    c.prepare("SELECT id, scope, agent_id, project_id FROM memory WHERE id >= 10 ORDER BY id")?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                    .collect::<rusqlite::Result<_>>()?;
+                let logged = c.query_row("SELECT COUNT(*) FROM memory_move", [], |r| r.get(0))?;
+                Ok((rows, logged))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (10, "agent".to_string(), Some("a".to_string()), Some("p-1a2b".to_string())),
+                (11, "agent".to_string(), Some("b".to_string()), None),
+                (12, "global".to_string(), None, None),
+            ],
+            "migrating changes no row"
+        );
+        assert_eq!(logged, 0);
+    }
+
     #[tokio::test]
     async fn a_store_from_before_the_warning_mark_keeps_its_pairs_unmarked() {
         ensure_vec0_registered();
@@ -1889,7 +1941,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 20, "Expected exactly 20 applied migrations, got {}", count);
+        assert_eq!(count, 21, "Expected exactly 21 applied migrations, got {}", count);
     }
 
     /// V8 — a fresh store records V8 as applied and carries the FTS5 lexical
@@ -2350,7 +2402,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 20);
+        assert_eq!(migration_count, 21);
     }
 
     // -----------------------------------------------------------------------

@@ -42,6 +42,7 @@ use clawg_core::memory::events::{MemoryEvent, MemorySource};
 use clawg_core::memory::clock::TimestampMs;
 use clawg_core::memory::portability::{self, ImportError, ImportOptions, ImportReport, MAX_IMPORT_BYTES};
 use clawg_core::memory::project::{register_project, RegisterError};
+use clawg_core::memory::relocate::{move_memories_core, undo_move_core, MoveError, MoveFilter, MoveReport, ProjectFilter};
 use clawg_core::memory::prompt_builder::{build_memory_prompt, build_session_prompt, QueryTexts, Retrieval, DEFAULT_BUDGET, MAX_BUDGET};
 use clawg_core::memory::sharing::{self, Reach, Reader};
 use clawg_core::memory::topic::validate_topic_key;
@@ -248,12 +249,18 @@ pub fn list_params_from_query(q: ListQuery) -> ApiResult<ListParams> {
         kind.get_or_insert(MemoryKind::Memory);
     }
 
+    let no_project = q.no_project.unwrap_or(false);
+    if no_project && q.project.is_some() {
+        return Err(ApiError::bad_request("project and no_project cannot both be given: a row has one or none"));
+    }
+
     Ok(ListParams {
         kind,
         tier: q.tier,
         memory_type: q.memory_type,
         agent_id: q.agent,
         project_id: q.project,
+        no_project,
         status: q.status,
         query: q.q,
         limit: q.limit,
@@ -433,6 +440,9 @@ pub struct ListQuery {
     pub agent: Option<String>,
     #[serde(default)]
     pub project: Option<String>,
+    /// `true` lists only the rows saved in no project.
+    #[serde(default)]
+    pub no_project: Option<bool>,
     #[serde(default)]
     pub status: Option<String>,
     /// Free text over memory content.
@@ -480,10 +490,28 @@ pub struct UpdateRequest {
     pub importance: Option<f64>,
     #[serde(default)]
     pub memory_type: Option<String>,
+    /// The project to move the row's save to; it must be registered.
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// Moves the row's save out of every project.
+    #[serde(default)]
+    pub no_project: bool,
     /// The caller declares the user answered, which taking a preference or a
-    /// decision out of its type needs.
+    /// decision out of its type, or out of its project, needs.
     #[serde(default)]
     pub user_answered: bool,
+}
+
+impl UpdateRequest {
+    /// Where the request moves the row, `Some(None)` out of every project.
+    pub fn destination(&self) -> ApiResult<Option<Option<String>>> {
+        match (&self.project_id, self.no_project) {
+            (Some(_), true) => Err(ApiError::bad_request("pass project_id or no_project, not both")),
+            (Some(p), false) => Ok(Some(Some(p.clone()))),
+            (None, true) => Ok(Some(None)),
+            (None, false) => Ok(None),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -792,6 +820,78 @@ impl From<RestoredRow> for RestoredBody {
     }
 }
 
+/// A batch move: a selection and one target, or the number of a move to
+/// undo. Strict because every field narrows or aims it: a misspelt filter
+/// would move more than was meant.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MoveRequest {
+    #[serde(default)]
+    pub ids: Vec<i64>,
+    #[serde(default)]
+    pub from_project: Option<String>,
+    #[serde(default)]
+    pub from_none: bool,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub memory_type: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Free text over memory content, as `GET /v1/memories` reads `q`.
+    #[serde(default)]
+    pub q: Option<String>,
+    #[serde(default)]
+    pub include_deleted: bool,
+    #[serde(default)]
+    pub to_project: Option<String>,
+    #[serde(default)]
+    pub to_none: bool,
+    #[serde(default)]
+    pub undo: Option<i64>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// What a [`MoveRequest`] asks for, once it is known to ask for one thing.
+#[derive(Debug, PartialEq)]
+pub enum MovePlan {
+    Move { filter: MoveFilter, target: Option<String> },
+    Undo(i64),
+}
+
+impl MoveRequest {
+    /// Pure, so each refusal is testable without a server.
+    pub fn plan(self) -> ApiResult<MovePlan> {
+        let from = match (self.from_project, self.from_none) {
+            (Some(_), true) => return Err(ApiError::bad_request("pass from_project or from_none, not both")),
+            (Some(p), false) => Some(ProjectFilter::Project(p)),
+            (None, true) => Some(ProjectFilter::None),
+            (None, false) => None,
+        };
+        let filter = MoveFilter {
+            ids: self.ids,
+            from,
+            agent_id: self.agent,
+            memory_type: self.memory_type,
+            source: self.source,
+            session_id: self.session_id,
+            query: self.q,
+            include_deleted: self.include_deleted,
+        };
+        match (self.undo, self.to_project, self.to_none) {
+            (Some(id), None, false) if filter == MoveFilter::default() => Ok(MovePlan::Undo(id)),
+            (Some(_), None, false) => Err(ApiError::bad_request("undo names a move: it takes no selection")),
+            (None, Some(p), false) => Ok(MovePlan::Move { filter, target: Some(p) }),
+            (None, None, true) => Ok(MovePlan::Move { filter, target: None }),
+            (None, None, false) => Err(ApiError::bad_request("name a target: to_project or to_none, or a move to undo")),
+            _ => Err(ApiError::bad_request("pass one of to_project, to_none or undo")),
+        }
+    }
+}
+
 /// Names a save the daemon gave up on: its operation id, and its agent when
 /// another agent holds the same id.
 #[derive(Debug, Deserialize)]
@@ -875,6 +975,7 @@ const OPEN_PAIRS_SHOWN: usize = 5;
 pub fn router(app: Arc<AppCtx>) -> Router {
     let v1 = Router::new()
         .route("/memories", post(save_memory).get(list_memories))
+        .route("/memories/move", post(move_memories))
         .route("/search", post(search))
         .route("/context", post(context))
         .route("/sessions", post(register_session))
@@ -1505,7 +1606,7 @@ async fn update_memory(
     Json(body): Json<UpdateRequest>,
 ) -> ApiResult<Json<UpdatedBody>> {
     let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
-    let patch = MemoryPatch::new(kind, body.importance, body.memory_type.as_deref())
+    let patch = MemoryPatch::new(kind, body.importance, body.memory_type.as_deref(), body.destination()?)
         .map_err(|e| ApiError::bad_request(e.to_string()))?
         .answered(body.user_answered);
     // The core answers `None` for "no such row", "already soft-deleted" and
@@ -1515,11 +1616,41 @@ async fn update_memory(
     let row = update_memory_core(&app.runtime.store, id, kind, &patch, reader.as_ref())
         .await
         .map_err(|e| match e {
-            UpdateError::NeedsUser { .. } => ApiError::conflict(e.to_string()),
+            UpdateError::NeedsUser { .. } | UpdateError::MoveNeedsUser { .. } => ApiError::conflict(e.to_string()),
+            UpdateError::Move(e) => move_error(e),
             UpdateError::Store(e) => ApiError::internal(e),
         })?
         .ok_or_else(|| ApiError::not_found(format!("no {kind:?} row with id {id}")))?;
     Ok(Json(UpdatedBody { updated: 1, row }))
+}
+
+/// The status a refused move answers with: a clash is a conflict, a target
+/// or a move that is not there is missing, a selection that cannot be read
+/// is the caller's mistake.
+fn move_error(e: MoveError) -> ApiError {
+    match e {
+        MoveError::Refused(_) => ApiError::conflict(e.to_string()),
+        MoveError::UnknownProject(_) | MoveError::UnknownMove(_) => ApiError::not_found(e.to_string()),
+        MoveError::NoSelection | MoveError::TextOnDeleted | MoveError::EmptyText => ApiError::bad_request(e.to_string()),
+        MoveError::Store(e) => ApiError::internal(e),
+    }
+}
+
+/// Moves memories between projects, or undoes a move, for the user: no
+/// reader, so a clash is judged against every row of the target. Needs no
+/// embedder.
+async fn move_memories(
+    State(app): State<Arc<AppCtx>>,
+    Json(body): Json<MoveRequest>,
+) -> ApiResult<Json<MoveReport>> {
+    let dry_run = body.dry_run;
+    let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
+    let store = &app.runtime.store;
+    let report = match body.plan()? {
+        MovePlan::Move { filter, target } => move_memories_core(store, &backups, &filter, target, dry_run).await,
+        MovePlan::Undo(id) => undo_move_core(store, &backups, id, dry_run).await,
+    };
+    report.map(Json).map_err(move_error)
 }
 
 async fn delete_memory(
@@ -2336,6 +2467,58 @@ mod tests {
         let params = list_params_from_query(query(|q| q.q = Some("deploy".into())))
             .expect("valid");
         assert_eq!(params.kind, Some(MemoryKind::Memory));
+    }
+
+    #[test]
+    fn a_move_asks_for_one_target_or_an_undo() {
+        let ids = |ids: Vec<i64>| MoveRequest { ids, ..MoveRequest::default() };
+        assert_eq!(
+            MoveRequest { to_project: Some("repo-1a2b".into()), ..ids(vec![3]) }.plan().expect("valid"),
+            MovePlan::Move {
+                filter: MoveFilter { ids: vec![3], ..MoveFilter::default() },
+                target: Some("repo-1a2b".into())
+            }
+        );
+        assert_eq!(
+            MoveRequest { from_none: true, to_none: true, ..MoveRequest::default() }.plan().expect("valid"),
+            MovePlan::Move { filter: MoveFilter { from: Some(ProjectFilter::None), ..MoveFilter::default() }, target: None }
+        );
+        assert_eq!(MoveRequest { undo: Some(4), ..MoveRequest::default() }.plan().expect("valid"), MovePlan::Undo(4));
+        for bad in [
+            ids(vec![3]),
+            MoveRequest { to_project: Some("repo-1a2b".into()), to_none: true, ..ids(vec![3]) },
+            MoveRequest { undo: Some(4), to_none: true, ..MoveRequest::default() },
+            MoveRequest { undo: Some(4), ..ids(vec![3]) },
+            MoveRequest { from_project: Some("a-0000".into()), from_none: true, to_none: true, ..MoveRequest::default() },
+        ] {
+            assert_eq!(bad.plan().expect_err("refused").status, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn no_project_and_project_together_are_refused() {
+        assert!(list_params_from_query(query(|q| q.no_project = Some(true))).expect("valid").no_project);
+        let err = list_params_from_query(query(|q| {
+            q.no_project = Some(true);
+            q.project = Some("repo-1a2b".into());
+        }))
+        .expect_err("a row has one project or none");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn an_update_names_one_destination_at_most() {
+        let request = |project_id: Option<&str>, no_project| UpdateRequest {
+            importance: None,
+            memory_type: None,
+            project_id: project_id.map(str::to_string),
+            no_project,
+            user_answered: false,
+        };
+        assert_eq!(request(None, false).destination().expect("valid"), None);
+        assert_eq!(request(Some("repo-1a2b"), false).destination().expect("valid"), Some(Some("repo-1a2b".into())));
+        assert_eq!(request(None, true).destination().expect("valid"), Some(None));
+        assert_eq!(request(Some("repo-1a2b"), true).destination().expect_err("both").status, StatusCode::BAD_REQUEST);
     }
 
     #[test]

@@ -422,10 +422,15 @@
       "name": "synthesize"
     },
     "update_memory": {
-      "description": "Correct the importance or the type of one stored memory, by id and kind, when the user says it matters more or less than it was saved with, or that it is a different kind of memory. Pass only what changes. Taking a preference or a decision out of its type needs user_answered, set only when the user said so. To change what a memory says, save the new text and delete the old one instead. Returns the memory's importance, type and tier after the change, which every agent that reads it sees.",
+      "description": "Correct the importance, the type or the project of one stored memory, by id and kind, when the user says it matters more or less than it was saved with, that it is a different kind of memory, or that it belongs to another project (to_project_path) or to none (clear_project). Pass only what changes. A memory moves with the rest of its save and topic history, and does not move where the same text or topic key is live. Taking a preference or a decision out of its type, or moving one, needs user_answered, set only when the user said so. To change what a memory says, save the new text and delete the old one instead. Returns the memory's importance, type, tier and, after a move, its project, which every agent that reads it sees.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
+          "clear_project": {
+            "default": false,
+            "description": "True to move this memory out of every project, so every project's\nsearches find it. Not with to_project_path.",
+            "type": "boolean"
+          },
           "id": {
             "description": "The id of the row to change, as printed by `save_memory`,\n`search_memory`, `list_memories` or `recall_context`. A `recall_context`\nhit with no kind in front of its type is a memory.",
             "format": "int64",
@@ -462,9 +467,17 @@
               "null"
             ]
           },
+          "to_project_path": {
+            "default": null,
+            "description": "A directory of the project to move this memory to, with the rest of\nits save and topic history, when it was saved in the wrong project or\nin none. Omit it to leave the memory where it is.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "user_answered": {
             "default": false,
-            "description": "True only when the user told you to: taking a user_preference or an\narchitectural_decision out of its type needs it.",
+            "description": "True only when the user told you to: taking a user_preference or an\narchitectural_decision out of its type, or moving one to another\nproject, needs it.",
             "type": "boolean"
           }
         },

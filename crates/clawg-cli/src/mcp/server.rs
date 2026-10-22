@@ -325,8 +325,18 @@ pub struct UpdateMemoryArgs {
     #[serde(default)]
     #[schemars(transform = memory_type_enum)]
     pub memory_type: Option<String>,
+    /// A directory of the project to move this memory to, with the rest of
+    /// its save and topic history, when it was saved in the wrong project or
+    /// in none. Omit it to leave the memory where it is.
+    #[serde(default)]
+    pub to_project_path: Option<String>,
+    /// True to move this memory out of every project, so every project's
+    /// searches find it. Not with to_project_path.
+    #[serde(default)]
+    pub clear_project: bool,
     /// True only when the user told you to: taking a user_preference or an
-    /// architectural_decision out of its type needs it.
+    /// architectural_decision out of its type, or moving one to another
+    /// project, needs it.
     #[serde(default)]
     pub user_answered: bool,
 }
@@ -941,21 +951,39 @@ impl ClawgMcp {
         }
     }
 
-    /// Reaches what `delete_memory_impl` reaches.
+    /// Reaches what `delete_memory_impl` reaches. A project to move to is
+    /// registered first, as any path a tool names; it must be a directory, so
+    /// a mistyped path does not send the memory where no search looks.
     pub async fn update_memory_impl(
         &self,
         agent_id: &str,
         args: UpdateMemoryArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if args.to_project_path.is_some() && args.clear_project {
+            return Self::failed("pass to_project_path or clear_project, not both");
+        }
+        if let Some(path) = args.to_project_path.as_deref() {
+            let root = ProjectIdentity::resolve(std::path::Path::new(path)).root;
+            if !root.is_dir() {
+                return Self::failed(format!("{} is not a directory: name a directory of the project", root.display()));
+            }
+        }
+        let moved = args.to_project_path.is_some() || args.clear_project;
         let args = &args;
         let result = self
             .call(|client| async move {
+                let project = match args.to_project_path.as_deref() {
+                    Some(path) => Some(self.project_for(&client, Some(path), false).await?),
+                    None if args.clear_project => Some(None),
+                    None => None,
+                };
                 client
                     .update(
                         &args.kind,
                         args.id,
                         args.importance,
                         args.memory_type.as_deref(),
+                        project.as_ref().map(|p| p.as_deref()),
                         args.user_answered,
                         Some(agent_id),
                     )
@@ -963,7 +991,7 @@ impl ClawgMcp {
             })
             .await;
         match result {
-            Ok(Ok(updated)) => Self::ok(format_update(&updated)),
+            Ok(Ok(updated)) => Self::ok(format_update(&updated, moved)),
             Ok(Err(e)) => Self::failed(Self::explain(&e)),
             Err(failure) => Ok(failure),
         }
@@ -1211,13 +1239,17 @@ impl ClawgMcp {
 
     #[tool(
         name = "update_memory",
-        description = "Correct the importance or the type of one stored memory, by id and kind, \
-                       when the user says it matters more or less than it was saved with, or \
-                       that it is a different kind of memory. Pass only what changes. Taking a \
-                       preference or a decision out of its type needs user_answered, set only \
-                       when the user said so. To change what a memory says, save the new text \
-                       and delete the old one instead. Returns the memory's importance, type and \
-                       tier after the change, which every agent that reads it sees."
+        description = "Correct the importance, the type or the project of one stored memory, by id \
+                       and kind, when the user says it matters more or less than it was saved \
+                       with, that it is a different kind of memory, or that it belongs to another \
+                       project (to_project_path) or to none (clear_project). Pass only what \
+                       changes. A memory moves with the rest of its save and topic history, and \
+                       does not move where the same text or topic key is live. Taking a \
+                       preference or a decision out of its type, or moving one, needs \
+                       user_answered, set only when the user said so. To change what a memory \
+                       says, save the new text and delete the old one instead. Returns the \
+                       memory's importance, type, tier and, after a move, its project, which \
+                       every agent that reads it sees."
     )]
     async fn update_memory(
         &self,
@@ -3388,7 +3420,66 @@ mod tests {
     }
 
     fn update_args(id: i64, importance: Option<f64>, memory_type: Option<&str>) -> UpdateMemoryArgs {
-        UpdateMemoryArgs { id, kind: "memory".into(), importance, memory_type: memory_type.map(Into::into), user_answered: false }
+        UpdateMemoryArgs {
+            id,
+            kind: "memory".into(),
+            importance,
+            memory_type: memory_type.map(Into::into),
+            to_project_path: None,
+            clear_project: false,
+            user_answered: false,
+        }
+    }
+
+    async fn project_of(b: &ClawgMcp, id: i64) -> Option<String> {
+        let client = b.client.get().await.expect("daemon");
+        client.get("memory", id).await.expect("get").project_id
+    }
+
+    #[tokio::test]
+    async fn update_memory_moves_a_save_to_the_project_of_a_path() {
+        let (b, _d) = bridge().await;
+        let id = saved_id(&b, "agent-a", "the release job signs SHA256SUMS").await;
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        let other = ProjectIdentity::resolve(repo.path());
+        let args = UpdateMemoryArgs { to_project_path: Some(repo.path().display().to_string()), ..update_args(id, None, None) };
+
+        let r = b.update_memory_impl("agent-a", args).await.expect("call");
+
+        assert!(!is_error(&r), "{}", text(&r));
+        assert!(text(&r).ends_with(&format!(", in project {}", other.id)), "{}", text(&r));
+        assert_eq!(project_of(&b, id).await, Some(other.id));
+    }
+
+    #[tokio::test]
+    async fn update_memory_clears_the_project() {
+        let (b, _d) = bridge().await;
+        let id = saved_id(&b, "agent-a", "the release job signs SHA256SUMS").await;
+        assert_eq!(project_of(&b, id).await.as_deref(), Some("proj-test"));
+
+        let args = UpdateMemoryArgs { clear_project: true, ..update_args(id, None, None) };
+        let r = b.update_memory_impl("agent-a", args).await.expect("call");
+
+        assert!(!is_error(&r), "{}", text(&r));
+        assert!(text(&r).contains("in no project"), "{}", text(&r));
+        assert_eq!(project_of(&b, id).await, None);
+    }
+
+    #[tokio::test]
+    async fn update_memory_refuses_both_destinations_and_a_path_that_is_not_a_directory() {
+        let (b, _d) = bridge().await;
+        let id = saved_id(&b, "agent-a", "the release job signs SHA256SUMS").await;
+        let gone = tempfile::tempdir().expect("tempdir").path().join("gone");
+
+        for args in [
+            UpdateMemoryArgs { to_project_path: Some("/tmp".into()), clear_project: true, ..update_args(id, None, None) },
+            UpdateMemoryArgs { to_project_path: Some(gone.display().to_string()), ..update_args(id, None, None) },
+        ] {
+            let r = b.update_memory_impl("agent-a", args).await.expect("call");
+            assert!(is_error(&r), "{}", text(&r));
+        }
+        assert_eq!(project_of(&b, id).await.as_deref(), Some("proj-test"));
     }
 
     #[tokio::test]

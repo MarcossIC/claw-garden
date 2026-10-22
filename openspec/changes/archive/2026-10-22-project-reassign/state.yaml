@@ -1,0 +1,15 @@
+change: project-reassign
+objective: "2"
+depends_on: [agent-authorship]
+phase: archived
+artifacts:
+  exploration: done  # las diez decisiones abiertas, cerradas con la opción recomendada (la 9 es de history-import)
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # Linux y el binario real en un home temporal; Windows queda al CI y el perfil dev no se corrió
+  archive: done
+updated: 2026-10-22
+main_spec: openspec/specs/project/spec.md, openspec/specs/update/spec.md, openspec/specs/mcp/spec.md, openspec/specs/visibility/spec.md, openspec/specs/storage/spec.md

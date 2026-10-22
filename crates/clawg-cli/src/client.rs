@@ -23,6 +23,7 @@ use std::time::Duration;
 use clawg_core::memory::dispute::{OpenPairs, Resolution};
 use clawg_core::memory::outbox::OutboxSummary;
 use clawg_core::memory::portability::ImportReport;
+use clawg_core::memory::relocate::MoveReport;
 use clawg_core::memory::store_lock::{StoreHolder, StoreLock, StoreOwner};
 use clawg_core::build_info;
 use clawg_core::paths::{data_dir, socket_file, PathsError, Profile};
@@ -444,6 +445,13 @@ pub struct Updated {
     /// Only `memory` rows have one.
     pub memory_type: Option<String>,
     pub tier: i64,
+    /// The project the row is in after the change; a daemon that predates
+    /// moves sends none.
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// The other rows of its save or topic history that moved with it.
+    #[serde(default)]
+    pub pulled_in: Vec<i64>,
 }
 
 /// A failed save taken back to pending. `queued` is false when the daemon's
@@ -528,6 +536,11 @@ struct UpdateBody<'a> {
     importance: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     memory_type: Option<&'a str>,
+    /// Left out when absent, like `user_answered`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    no_project: bool,
     /// Left out when false: a daemon that predates the field refuses any
     /// field it does not know.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -596,6 +609,8 @@ pub struct ListArgs {
     pub memory_type: Option<String>,
     pub agent: Option<String>,
     pub project: Option<String>,
+    /// Lists only the rows saved in no project.
+    pub no_project: bool,
     pub status: Option<String>,
     /// Free text over memory content; the daemon then lists `memory` rows only.
     pub q: Option<String>,
@@ -603,6 +618,38 @@ pub struct ListArgs {
     pub offset: Option<u32>,
     /// Lists the deleted rows instead of the live ones.
     pub deleted: bool,
+}
+
+/// A batch move as `POST /v1/memories/move` takes it: a selection and one
+/// target, or a move to undo. Unset fields are left out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct MoveRequest {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ids: Vec<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_project: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub from_none: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub q: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub include_deleted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_project: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub to_none: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub undo: Option<i64>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
 }
 
 /// The query of a call by id an agent makes: no pair at all for the user's
@@ -1048,6 +1095,9 @@ impl DaemonClient {
         if let Some(p) = &args.project {
             query.push(("project", p.clone()));
         }
+        if args.no_project {
+            query.push(("no_project", "true".into()));
+        }
         if let Some(s) = &args.status {
             query.push(("status", s.clone()));
         }
@@ -1102,21 +1152,36 @@ impl DaemonClient {
         read_response(self.send(Call::new(reqwest::Method::GET, "/v1/stats").query(query)).await?)
     }
 
-    /// Changes a row's importance, type or both; the daemon refuses an empty
-    /// or invalid change. `agent` scopes the change to that agent's rows;
-    /// another agent's row comes back as not found.
+    /// Changes a row's importance, type or project; the daemon refuses an
+    /// empty or invalid change. `project` moves the row's save, `Some(None)`
+    /// out of every project. `agent` names the agent the change is for; a row
+    /// out of its reach comes back as not found.
     pub async fn update(
         &self,
         kind: &str,
         id: i64,
         importance: Option<f64>,
         memory_type: Option<&str>,
+        project: Option<Option<&str>>,
         user_answered: bool,
         agent: Option<&str>,
     ) -> Result<Updated, ClientError> {
+        let body = UpdateBody {
+            importance,
+            memory_type,
+            project_id: project.flatten(),
+            no_project: project == Some(None),
+            user_answered,
+        };
         let call = Call::new(reqwest::Method::PATCH, format!("/v1/memories/{kind}/{id}"))
             .query(reader_query(agent))
-            .json(&UpdateBody { importance, memory_type, user_answered })?;
+            .json(&body)?;
+        read_response(self.send(call).await?)
+    }
+
+    /// Moves memories between projects, or undoes a move, as the user.
+    pub async fn move_memories(&self, request: &MoveRequest) -> Result<MoveReport, ClientError> {
+        let call = Call::new(reqwest::Method::POST, "/v1/memories/move").json(request)?;
         read_response(self.send(call).await?)
     }
 
@@ -1960,7 +2025,7 @@ pub(crate) mod tests {
         assert_eq!(synthesis.pending.iter().map(|r| r.id).collect::<Vec<_>>(), vec![id]);
         assert_eq!(synthesis.pending_total, 1);
 
-        assert_eq!(c.update("memory", id, Some(9.5), None, false, None).await.expect("patch").tier, 1);
+        assert_eq!(c.update("memory", id, Some(9.5), None, None, false, None).await.expect("patch").tier, 1);
         assert_eq!(c.delete("memory", id, None).await.expect("delete").deleted, 1);
     }
 

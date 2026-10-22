@@ -6,6 +6,7 @@ Fuente de verdad del comportamiento actual de la identidad del agente y de qué 
 - [visibility-policy](../../changes/archive/2026-10-12-visibility-policy/proposal.md), partes A y B, archivado el 2026-10-12.
 - [agent-sharing](../../changes/archive/2026-10-14-agent-sharing/proposal.md), archivado el 2026-10-14 (sólo lo que dice de lo ajeno compartido en R3 y R4).
 - [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22: R3 y R4 dejan la frontera por agente y pasan al alcance del lector.
+- [project-reassign](../../changes/archive/2026-10-22-project-reassign/proposal.md), archivado el 2026-10-22: el movimiento de un `PATCH` con lector (R4).
 
 ## Definiciones
 
@@ -84,6 +85,7 @@ El `--agent` de `clawg hook` MUST ser el del puente, para que el hook lea al mis
 - `DELETE`, `PATCH` y `GET …/save` de `/v1/memories/{kind}/{id}` y `POST /v1/memories/memory/{id}/restore` MUST aceptar `agent` en la query, y `POST /v1/disputes/judge`, `POST /v1/disputes/resolve`, `POST /v1/synthesis` y `GET /v1/disputes` MUST aceptar `agent_id`, como antes: un puente anterior que los manda no recibe un 400. Nombran al lector, cuyo alcance el daemon lee de `sharing.json` en cada pedido (`sharing::reader_in`); un `sharing.json` que no se puede leer MUST dejarlo con sus filas y las sin autor.
 - Una fila fuera del alcance del lector (o alguna de las dos, al juzgar) MUST responderse `404`, igual que un id inexistente, sin cambiar nada: ni la fila, ni su vector, ni sus disputas, ni su `last_modified_at`, ni su `update_count`. En el `GET` del save, el alcance se aplica a la fila pedida y a cada posición: un pedazo fuera del alcance figura como faltante con `ids` en `null`.
 - Sin lector, la operación MUST valer sobre cualquier fila.
+- Un `PATCH` que mueve la fila de proyecto ([`specs/update`](../update/spec.md) R7) MUST rechazar, sin nombrarla, una unidad con una fila fuera del alcance del lector (`out_of_reach`), y MUST juzgar los choques en el destino sólo con las filas que el lector alcanza, como la dedup y la clave de un save. El lote de `POST /v1/memories/move` no tiene lector.
 - La misma regla vale para las tres tablas (`memory`, `episodic`, `procedural`), salvo el restore, que sólo existe para `memory`.
 
 #### Escenario: otro agente borra

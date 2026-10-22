@@ -7,6 +7,7 @@ Fuente de verdad del comportamiento actual del puente `clawg mcp`: cómo abre un
 - [agent-sharing](../../changes/archive/2026-10-14-agent-sharing/proposal.md), archivado el 2026-10-14 (sólo "Lo compartido en las herramientas").
 - [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22 ("Lo compartido en las herramientas", la clave en un hit de otro agente y los pares de `memory_status` por proyecto).
 - [project-indexing](../../changes/archive/2026-10-15-project-indexing/proposal.md), archivado el 2026-10-15 (sólo el conteo y la lista de herramientas).
+- [project-reassign](../../changes/archive/2026-10-22-project-reassign/proposal.md), archivado el 2026-10-22 (sólo «Mover una memoria de proyecto»).
 - [bridge-reconnect](../../changes/archive/2026-10-15-bridge-reconnect/proposal.md), archivado el 2026-10-15 (sólo el apartado de reconexión con el daemon).
 - [project-root-guard](../../changes/archive/2026-10-15-project-root-guard/proposal.md), archivado el 2026-10-15 (sólo la colisión en «Registro del proyecto»).
 - [ingest-outbox](../../changes/archive/2026-10-15-ingest-outbox/proposal.md), archivado el 2026-10-15 (sólo el bloque `ingest` de `memory_status` y el texto de `save_memory` ante un `202`).
@@ -423,3 +424,9 @@ Al deserializar, el argumento MUST seguir siendo una cadena libre (`Option<Strin
 La descripción de `save_memory` (`server.rs:1074-1082`) MUST pedir una primera línea que nombre el tema y, después, qué, por qué y dónde, con las rutas e identificadores exactos: las primeras palabras se embeben con cada pieza de un save largo, y un identificador que nombra la consulta es lo que marca un hit como `exact`. MUST conservar "one fact" y `read_memory`.
 
 **Tests:** `save_memory_asks_for_a_title_and_where` y `save_memory_asks_for_one_fact_per_call` (`server.rs`).
+
+## Mover una memoria de proyecto
+
+`update_memory` MUST tomar `to_project_path` (una ruta cuyo proyecto es el destino, registrado antes como toda ruta que nombra una herramienta, y que tiene que ser un directorio) o `clear_project` (sin proyecto), no los dos; ausentes, el proyecto no cambia. El nombre no es `project_path` porque en las otras herramientas su ausencia es el proyecto del puente. La descripción MUST decir que la memoria se mueve con su save y su historia, y no a donde el mismo texto o clave están vivos; `protocol.md` MUST decir cuándo usarla. Tras un movimiento, la respuesta MUST nombrar el proyecto en que quedó la fila (o que está sin proyecto, donde la encuentran todos) y las filas que se movieron con ella (`format_update`).
+
+**Test:** `update_memory_moves_a_save_to_the_project_of_a_path`, `update_memory_clears_the_project` y `update_memory_refuses_both_destinations_and_a_path_that_is_not_a_directory` (`server.rs`); `format_update_names_where_the_row_ended` (`tools.rs`); `the_agent_contract_matches_its_file`.

@@ -109,6 +109,8 @@ memory matters more or less than usual. A `user_preference` at 8 or more is
 printed at the top of every `recall_context`, in every project, and an
 `architectural_decision` at 9 or more at the top of every `recall_context` of
 its project. At 9 or more a memory is never demoted for not being used. `update_memory` corrects the type or the importance later.
+When the user says a memory belongs to another project, or to none, `update_memory`
+moves it with `to_project_path` or `clear_project`.
 
 ## Session summary
 
