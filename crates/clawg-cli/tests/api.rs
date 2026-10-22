@@ -347,6 +347,7 @@ impl Harness {
             shutdown,
             save_timeout,
             sessions: Default::default(),
+            metrics: Default::default(),
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -3456,4 +3457,153 @@ async fn an_unkeyed_save_names_the_row_a_key_would_revise() {
     assert_eq!(status, 201, "{keyed}");
     assert!(keyed["related"].as_array().is_some_and(|r| !r.is_empty()), "{keyed}");
     assert!(keyed.get("revision_candidate").is_none(), "a key already revises: {keyed}");
+}
+
+// ── Metrics ─────────────────────────────────────────────────────────────────
+
+/// The `http.duration` series of the run, as label strings with their count.
+fn http_durations(h: &Harness) -> Vec<(String, u64)> {
+    h.ctx
+        .metrics
+        .run()
+        .iter()
+        .filter(|(key, _)| key.name == "http.duration")
+        .map(|(key, histogram)| (key.labels.clone(), histogram.count()))
+        .collect()
+}
+
+fn count_of(series: &[(String, u64)], labels: &str) -> u64 {
+    series.iter().find(|(l, _)| l == labels).map(|(_, n)| *n).unwrap_or(0)
+}
+
+#[tokio::test]
+async fn every_request_is_timed_by_route_status_and_transport() {
+    let h = Harness::start().await;
+    h.http.get(h.url("/health")).send().await.expect("health");
+    let (status, _) = h.post_json("/v1/search", json!({ "query": "anything", "agent_id": "a" })).await;
+    assert_eq!(status, 200);
+    let (status, _) = h.get_json("/v1/memories/memory/999999").await;
+    assert_eq!(status, 404);
+
+    let series = http_durations(&h);
+    assert_eq!(count_of(&series, "method=GET,route=/health,status=2xx,transport=tcp"), 1, "{series:?}");
+    assert_eq!(count_of(&series, "method=POST,route=/v1/search,status=2xx,transport=tcp"), 1, "{series:?}");
+    assert_eq!(count_of(&series, "method=GET,route=/v1/memories/{kind}/{id},status=4xx,transport=tcp"), 1, "{series:?}");
+
+    let run = h.ctx.metrics.run();
+    let bytes = run
+        .iter()
+        .find(|(key, _)| key.name == "http.request_bytes" && key.labels == "method=POST,route=/v1/search")
+        .map(|(_, histogram)| histogram.clone())
+        .expect("the size of the search is recorded");
+    assert!(bytes.max() > 0, "the size comes from Content-Length");
+    let minute = h.ctx.metrics.minute();
+    let in_flight = minute.gauges.iter().find(|(key, _)| key.name == "http.in_flight").expect("in flight").1;
+    assert!(in_flight.max >= 1.0 && in_flight.last == 0.0, "{in_flight:?}");
+}
+
+#[tokio::test]
+async fn a_server_marked_unix_labels_its_requests_so() {
+    let h = Harness::start().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let app = clawg_cli::daemon::api::router_on(h.ctx.clone(), clawg_cli::daemon::metrics::Transport::Unix);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    h.http.get(format!("http://{addr}/health")).send().await.expect("health");
+
+    let series = http_durations(&h);
+    assert_eq!(count_of(&series, "method=GET,route=/health,status=2xx,transport=unix"), 1, "{series:?}");
+}
+
+#[tokio::test]
+async fn refused_requests_are_timed_too() {
+    let h = Harness::start().await;
+    let r = h.http.post(h.url("/v1/search")).json(&json!({ "query": "q" })).send().await.expect("request");
+    assert_eq!(r.status(), 401);
+    let r = h.http.get(h.url("/health")).header("origin", "http://evil.example").send().await.expect("request");
+    assert_eq!(r.status(), 403);
+
+    let series = http_durations(&h);
+    assert_eq!(count_of(&series, "method=POST,route=/v1/search,status=4xx,transport=tcp"), 1, "{series:?}");
+    assert_eq!(count_of(&series, "method=GET,route=/health,status=4xx,transport=tcp"), 1, "{series:?}");
+}
+
+#[tokio::test]
+async fn no_label_comes_from_the_request() {
+    let h = Harness::start().await;
+    h.authed(h.http.get(h.url("/v1/memories/memory/424242?agent=secretagent")))
+        .body("zebra-colored secret text")
+        .send()
+        .await
+        .expect("request");
+    h.authed(h.http.post(h.url("/nowhere/qwerty"))).body("zebra").send().await.expect("request");
+    h.authed(h.http.request(reqwest::Method::from_bytes(b"BREW").unwrap(), h.url("/health")))
+        .send()
+        .await
+        .expect("request");
+
+    let labels: Vec<String> = h.ctx.metrics.run().keys().map(|key| key.labels.clone()).collect();
+    for label in &labels {
+        for leaked in ["424242", "secretagent", "zebra", "qwerty", "nowhere", "BREW"] {
+            assert!(!label.contains(leaked), "{label} carries {leaked}");
+        }
+    }
+    assert!(labels.iter().any(|l| l.contains("route=/v1/memories/{kind}/{id}")), "{labels:?}");
+    assert!(labels.iter().any(|l| l.contains("method=POST,route=unmatched")), "{labels:?}");
+    assert!(labels.iter().any(|l| l.contains("method=other")), "{labels:?}");
+}
+
+#[tokio::test]
+async fn metrics_needs_the_token_and_answers_the_minute_and_the_run() {
+    let h = Harness::start().await;
+    let r = h.http.get(h.url("/v1/metrics")).send().await.expect("request");
+    assert_eq!(r.status(), 401);
+    h.http.get(h.url("/health")).send().await.expect("health");
+
+    let (status, body) = h.get_json("/v1/metrics").await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["version"], clawg_core::build_info::version());
+    assert!(body["started_at_ms"].as_u64().is_some_and(|ms| ms > 0), "{body}");
+    assert_eq!(body["writing"], false, "a daemon in a test keeps no file");
+    let health = |list: &Value| {
+        list.as_array()
+            .and_then(|l| {
+                l.iter().find(|s| s["name"] == "http.duration" && s["labels"]["route"] == "/health" && s["labels"]["status"] == "2xx")
+            })
+            .cloned()
+    };
+    let minute = health(&body["minute"]["histograms"]).expect("the health check of this minute");
+    assert_eq!(minute["unit"], "us");
+    assert_eq!(minute["count"], 1);
+    assert_eq!(minute["labels"]["transport"], "tcp");
+    assert!(minute["p50"].as_u64().is_some() && minute["p99"].as_u64().is_some(), "{minute}");
+    assert!(minute["buckets"].as_array().is_some_and(|b| !b.is_empty()), "{minute}");
+    let run = health(&body["run"]["histograms"]).expect("the health check of the run");
+    assert_eq!(run["count"], 1);
+    assert!(body["minute"]["gauges"].as_array().is_some_and(|g| g.iter().any(|g| g["name"] == "http.in_flight")), "{body}");
+}
+
+#[tokio::test]
+async fn metrics_speaks_prometheus_text() {
+    let h = Harness::start().await;
+    h.http.get(h.url("/health")).send().await.expect("health");
+
+    let r = h.authed(h.http.get(h.url("/v1/metrics?format=prometheus"))).send().await.expect("request");
+
+    assert_eq!(r.status(), 200);
+    let kind = r.headers()["content-type"].to_str().unwrap().to_string();
+    assert!(kind.starts_with("text/plain") && kind.contains("version=0.0.4"), "{kind}");
+    let text = r.text().await.expect("text");
+    assert!(text.contains("# TYPE clawg_http_duration_seconds histogram"), "{text}");
+    let health = r#"method="GET",route="/health",status="2xx",transport="tcp""#;
+    assert!(text.contains(&format!("clawg_http_duration_seconds_count{{{health}}} 1")), "{text}");
+    assert!(text.contains(&format!("clawg_http_duration_seconds_bucket{{{health},le=\"+Inf\"}} 1")), "{text}");
+    assert!(text.contains(&format!("clawg_http_duration_seconds_bucket{{{health},le=\"0.00005\"}}")), "{text}");
+    assert!(text.contains("# TYPE clawg_http_request_bytes histogram"), "{text}");
+    assert!(text.contains("# TYPE clawg_http_in_flight gauge"), "{text}");
+    let r = h.authed(h.http.get(h.url("/v1/metrics?format=yaml"))).send().await.expect("request");
+    assert_eq!(r.status(), 400);
 }

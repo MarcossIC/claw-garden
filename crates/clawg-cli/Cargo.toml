@@ -55,11 +55,12 @@ schemars = "1"
 minisign-verify = "=0.2.5"
 
 # Clears the inherit flag on the bridge's own stdio before it spawns the daemon
-# (see `detach.rs`) and waits on the daemon's process handle in `clawg stop`
-# (see `process.rs`). Already in the lockfile through tokio's `mio`, so this
-# adds no crate to the build.
+# (see `detach.rs`), waits on the daemon's process handle in `clawg stop` (see
+# `process.rs`), and reads the daemon's memory, CPU time, handles and time zone
+# for its metrics (see `daemon/process.rs`). Already in the lockfile through
+# tokio's `mio`, so this adds no crate to the build.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_System_Time", "Win32_UI_WindowsAndMessaging"] }
 # Raw reads and writes of HKCU\Environment\Path for `clawg path` (see
 # `user_path.rs`), so the value keeps its REG_EXPAND_SZ type. Already in the
 # lockfile, so this adds no crate to the build.

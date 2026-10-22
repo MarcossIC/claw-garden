@@ -596,6 +596,103 @@ async fn stop_ends_a_daemon_whose_model_load_never_returns() {
     assert!(exit.success(), "{exit}\n{}", daemon.log_text());
 }
 
+// ── Metrics ─────────────────────────────────────────────────────────────────
+
+fn metrics_report(sandbox: &Sandbox, args: &[&str]) -> Value {
+    let mut all = vec!["metrics", "report", "--profile", "dev"];
+    all.extend_from_slice(args);
+    let out = sandbox.run(&all);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    serde_json::from_slice(&out.stdout).expect("report prints JSON")
+}
+
+/// The run's `http.duration` count of `route` over `transport`, as
+/// `GET /v1/metrics` answers it.
+fn run_count(metrics: &Value, route: &str, transport: &str) -> u64 {
+    metrics["run"]["histograms"]
+        .as_array()
+        .expect("histograms")
+        .iter()
+        .filter(|h| h["name"] == "http.duration" && h["labels"]["route"] == route && h["labels"]["transport"] == transport)
+        .map(|h| h["count"].as_u64().unwrap_or(0))
+        .sum()
+}
+
+#[tokio::test]
+async fn a_daemon_records_its_requests_and_report_reads_them_after_stop() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+    let data_dir = sandbox.data_dir();
+    let port = state_of(&data_dir).and_then(|s| s["port"].as_u64()).expect("--port 0 serves TCP too");
+    let tcp = DaemonClient::new(format!("http://127.0.0.1:{port}"), daemon.token.clone(), data_dir.clone());
+
+    let save = json!({ "content": "the metrics smoke test saves this", "agent_id": "smoke" });
+    let search = json!({ "query": "metrics smoke test", "agent_id": "smoke" });
+    assert_eq!(daemon.post("/v1/memories", save.clone()).await.0, 201);
+    assert_eq!(daemon.post("/v1/search", search.clone()).await.0, 200);
+    for (path, body) in [("/v1/memories", &save), ("/v1/search", &search)] {
+        let call = Call::new(reqwest::Method::POST, path).json(body).expect("request body");
+        assert!(tcp.send(call).await.expect("over TCP").status.is_success());
+    }
+
+    let answer = daemon.client().send(Call::new(reqwest::Method::GET, "/v1/metrics")).await.expect("metrics");
+    assert_eq!(answer.status.as_u16(), 200);
+    let metrics: Value = serde_json::from_slice(&answer.body).expect("metrics JSON");
+    assert_eq!(metrics["writing"], true, "{metrics}");
+    assert_eq!(run_count(&metrics, "/v1/search", "unix"), 1, "{metrics}");
+    assert_eq!(run_count(&metrics, "/v1/search", "tcp"), 1, "{metrics}");
+    assert!(run_count(&metrics, "/v1/memories", "unix") >= 1, "{metrics}");
+
+    let stop = sandbox.run(&["stop", "--profile", "dev"]);
+    assert_eq!(stop.status.code(), Some(0), "{}", stderr_of(&stop));
+    daemon.wait_for_exit(Duration::from_secs(5)).await;
+    assert!(data_dir.join("metrics.db").is_file());
+
+    let report = metrics_report(&sandbox, &["--metric", "http.duration", "--label", "route=/v1/search"]);
+    assert_eq!(report["groups"][0]["key"], clawg_core::build_info::version(), "{report}");
+    assert_eq!(report["groups"][0]["count"], 2, "both transports: {report}");
+    assert_eq!(report["groups"][0]["not_stopped"], 0, "{report}");
+    assert_eq!(report["runs"], json!({ "total": 1, "not_stopped": 0 }), "{report}");
+    let unix = metrics_report(&sandbox, &["--metric", "http.duration", "--label", "route=/v1/search", "--label", "transport=unix"]);
+    assert_eq!(unix["groups"][0]["count"], 1, "{unix}");
+    let memory = metrics_report(&sandbox, &["--metric", "process.rss_bytes", "--by", "day"]);
+    assert_eq!(memory["kind"], "gauge", "{memory}");
+    assert!(memory["groups"][0]["max"].as_f64().is_some_and(|b| b > 0.0) || !cfg!(any(target_os = "linux", windows)), "{memory}");
+}
+
+#[tokio::test]
+async fn a_killed_daemon_leaves_its_run_not_stopped() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    assert_eq!(sandbox.run(&["stop", "--profile", "dev"]).status.code(), Some(0));
+    daemon.wait_for_exit(Duration::from_secs(5)).await;
+    drop(daemon);
+
+    let killed = sandbox.serve().await;
+    killed.kill();
+    drop(killed);
+
+    let report = metrics_report(&sandbox, &["--metric", "http.duration"]);
+    assert_eq!(report["runs"], json!({ "total": 2, "not_stopped": 1 }), "{report}");
+}
+
+#[tokio::test]
+async fn metrics_off_leaves_no_metrics_file() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve_as(&["serve", "--profile", "dev", "--port", "0"], &[("CLAWG_METRICS", "off")]).await;
+    let answer = daemon.client().send(Call::new(reqwest::Method::GET, "/v1/metrics")).await.expect("metrics");
+    let metrics: Value = serde_json::from_slice(&answer.body).expect("metrics JSON");
+    assert_eq!(metrics["writing"], false, "{metrics}");
+    assert_eq!(sandbox.run(&["stop", "--profile", "dev"]).status.code(), Some(0));
+    daemon.wait_for_exit(Duration::from_secs(5)).await;
+
+    assert!(!sandbox.data_dir().join("metrics.db").exists());
+    let out = sandbox.run(&["metrics", "report", "--profile", "dev", "--metric", "http.duration"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr_of(&out).contains("CLAWG_METRICS=off"), "{}", stderr_of(&out));
+}
+
 #[tokio::test]
 async fn a_debug_binary_refuses_prod_even_with_a_test_home() {
     let sandbox = Sandbox::new();

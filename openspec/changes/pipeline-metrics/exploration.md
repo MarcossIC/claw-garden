@@ -1,6 +1,6 @@
 # pipeline-metrics — Exploración
 
-Objetivo transversal. Sobre la base de [usage-metrics](../usage-metrics/exploration.md) (71), mide dónde se va el tiempo dentro del daemon: la espera en la única conexión de SQLite, las ramas de la búsqueda, las etapas del ingest, el embedder y el índice de docs, más los eventos raros de cada ejecución. Junta las propuestas M4, M5 y M6 de una propuesta de medición escrita sobre 0.26.0. Su razón de ser hoy es dar datos a las puertas de medición que ya esperan en read-connections (57), embedder-footprint (62) y docs-refresh-background (64), en lugar de que cada una arme su propia medición.
+Objetivo transversal. Sobre la base de [usage-metrics](../archive/2026-10-22-usage-metrics/exploration.md) (71), mide dónde se va el tiempo dentro del daemon: la espera en la única conexión de SQLite, las ramas de la búsqueda, las etapas del ingest, el embedder y el índice de docs, más los eventos raros de cada ejecución. Junta las propuestas M4, M5 y M6 de una propuesta de medición escrita sobre 0.26.0. Su razón de ser hoy es dar datos a las puertas de medición que ya esperan en read-connections (57), embedder-footprint (62) y docs-refresh-background (64), en lugar de que cada una arme su propia medición.
 
 ## Premisas que se verificaron y cuáles no eran del todo ciertas
 
