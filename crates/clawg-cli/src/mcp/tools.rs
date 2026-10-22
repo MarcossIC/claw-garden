@@ -117,13 +117,13 @@ fn format_hits(hits: &[Hit], reader: &str, save_project: Option<&str>) -> String
             let piece = h.piece.map(|p| format!(" piece={}/{}", p.piece, p.pieces)).unwrap_or_default();
             let author = shared_author(h, reader);
             let by = author.map(|a| format!(" by {}", display_author(a))).unwrap_or_default();
-            // A save under a key revises only the saver's own rows in its own
-            // project, so any other key would promise a revision the reader
-            // cannot make.
+            // A save under a key revises the rows of the project it goes to,
+            // whoever saved them, so a key of another project would promise a
+            // revision the reader cannot make.
             let topic = h
                 .topic_key
                 .as_deref()
-                .filter(|_| author.is_none() && revised_from(&h.project_id, save_project))
+                .filter(|_| revised_from(&h.project_id, save_project))
                 .map(|k| format!(" topic={k}"))
                 .unwrap_or_default();
             format!(
@@ -297,15 +297,23 @@ pub fn format_restore(r: &Restored) -> String {
     out
 }
 
-/// Renders inventory rows as a compact one-line-per-row table.
-pub fn format_rows(rows: &[MemoryRow]) -> String {
+/// Renders inventory rows as a compact one-line-per-row table. A row another
+/// agent than `reader` saved names it after `by `, as a search hit does; the
+/// `by=#N` of a replaced row always carries its `=`.
+pub fn format_rows(rows: &[MemoryRow], reader: &str) -> String {
     if rows.is_empty() {
         return "no memories stored".to_string();
     }
     rows.iter()
         .map(|r| {
+            let by = r
+                .agent_id
+                .as_deref()
+                .filter(|a| *a != reader)
+                .map(|a| format!(" by {}", display_author(a)))
+                .unwrap_or_default();
             format!(
-                "#{} {} {} t{} imp={:.1} acc={} {}{}{} {}",
+                "#{} {} {} t{} imp={:.1} acc={} {}{by}{}{} {}",
                 r.id,
                 r.kind,
                 // Only `memory` rows have a type; a dash keeps every later
@@ -581,9 +589,9 @@ pub fn indexes_docs(project: &ProjectIdentity, bridge: Option<&ProjectIdentity>)
 pub fn format_sharing(policy: &Result<SharingPolicy, SharingError>, reader: &str) -> String {
     match policy {
         Ok(p) => match p.reach_for(reader) {
-            Reach::Own => "shared: none (reads no other agent)".to_string(),
-            Reach::AllBut(hidden) if hidden.is_empty() => "shared: reads every agent".to_string(),
-            Reach::AllBut(hidden) => format!("shared: reads every agent but {}", hidden.join(", ")),
+            Reach::Own => "shared: none (reads and changes no other agent's memories)".to_string(),
+            Reach::AllBut(hidden) if hidden.is_empty() => "shared: reads and changes every agent's memories".to_string(),
+            Reach::AllBut(hidden) => format!("shared: reads and changes every agent's memories but {}'s", hidden.join("'s, ")),
         },
         Err(e) => format!("shared: none ({e})"),
     }
@@ -729,14 +737,16 @@ mod tests {
         assert_eq!(out, "1. #68 [Memory/semantic_fact/t2 score=0.56] clawg export");
     }
 
-    /// A save under a key revises only the saver's own rows, so the key on
-    /// another agent's hit would send the reader to a revision that cannot happen.
+    /// A save under a key revises the project's rows whoever saved them, so
+    /// another agent's hit shows its key as the reader's own would.
     #[test]
-    fn another_agents_hit_does_not_show_its_topic_key() {
+    fn another_agents_hit_shows_its_topic_key() {
         let shared = keyed(by(hit(68, "Memory", "architectural_decision", 2, 0.56, "clawg export"), "claude-code"), "cli/export-format");
         let out = format_hits(&[shared], "cursor", None);
-        assert!(out.starts_with("1. #68 [Memory/architectural_decision/t2 score=0.56 by claude-code] clawg export"), "{out}");
-        assert!(!out.contains("topic="), "{out}");
+        assert!(
+            out.starts_with("1. #68 [Memory/architectural_decision/t2 score=0.56 topic=cli/export-format by claude-code] clawg export"),
+            "{out}"
+        );
     }
 
     fn placed(mut h: Hit, project: Option<&str>) -> Hit {
@@ -815,7 +825,7 @@ mod tests {
         };
         let plain = row(2, "memory", Some("semantic_fact"), "tabs");
 
-        let out = format_rows(&[current, old, plain]);
+        let out = format_rows(&[current, old, plain], "a");
 
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "#9 memory architectural_decision t2 imp=5.0 acc=3 active topic=storage/engine postgres");
@@ -972,7 +982,21 @@ mod tests {
 
     #[test]
     fn format_rows_says_so_when_there_are_none() {
-        assert_eq!(format_rows(&[]), "no memories stored");
+        assert_eq!(format_rows(&[], "a"), "no memories stored");
+    }
+
+    #[test]
+    fn a_row_of_another_agent_names_it() {
+        let mut theirs = row(12, "memory", Some("semantic_fact"), "a fact");
+        theirs.agent_id = Some("claude-code".into());
+        let mut mine = row(13, "memory", Some("semantic_fact"), "another fact");
+        mine.agent_id = Some("cursor".into());
+        let out = format_rows(&[theirs, mine], "cursor");
+        assert_eq!(
+            out,
+            "#12 memory semantic_fact t2 imp=5.0 acc=3 active by claude-code a fact\n\
+             #13 memory semantic_fact t2 imp=5.0 acc=3 active another fact"
+        );
     }
 
     #[test]
@@ -980,7 +1004,7 @@ mod tests {
         let out = format_rows(&[
             row(12, "memory", Some("semantic_fact"), "a fact"),
             row(3, "episodic", None, "a trajectory"),
-        ]);
+        ], "a");
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("#12 "), "line was: {}", lines[0]);
@@ -994,14 +1018,14 @@ mod tests {
     /// other two kinds rather than shifting every field after it.
     #[test]
     fn format_rows_renders_a_missing_memory_type_as_a_dash() {
-        let out = format_rows(&[row(3, "episodic", None, "a trajectory")]);
+        let out = format_rows(&[row(3, "episodic", None, "a trajectory")], "a");
         assert!(out.contains(" - "), "out was: {out}");
     }
 
     #[test]
     fn format_rows_truncates_and_keeps_one_line_per_row() {
         let long = "y".repeat(CONTENT_PREVIEW_LIMIT + 50);
-        let out = format_rows(&[row(1, "memory", Some("chat_message"), &format!("{long}\nmore"))]);
+        let out = format_rows(&[row(1, "memory", Some("chat_message"), &format!("{long}\nmore"))], "a");
         assert_eq!(out.lines().count(), 1);
         assert!(out.ends_with('…'));
     }
@@ -1081,7 +1105,7 @@ mod tests {
     #[test]
     fn rows_show_where_a_conclusion_came_from() {
         let conclusion = MemoryRow { derived_from: Some(vec![3, 7]), ..row(9, "memory", Some("user_preference"), "tabs") };
-        let out = format_rows(&[conclusion, row(3, "memory", Some("semantic_fact"), "a fact")]);
+        let out = format_rows(&[conclusion, row(3, "memory", Some("semantic_fact"), "a fact")], "a");
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[0].contains(" from=#3,#7 "), "line was: {}", lines[0]);
         assert!(!lines[1].contains("from="), "line was: {}", lines[1]);
@@ -1457,15 +1481,15 @@ mod tests {
     #[test]
     fn format_status_says_whom_the_agent_reads() {
         let policy = SharingPolicy::parse(r#"{"version":1,"hides":{"cursor":["codex","claude-code"],"aider":["*"]}}"#);
-        assert_eq!(format_sharing(&policy, "cursor"), "shared: reads every agent but claude-code, codex");
-        assert_eq!(format_sharing(&policy, "codex"), "shared: reads every agent");
-        assert_eq!(format_sharing(&policy, "aider"), "shared: none (reads no other agent)");
+        assert_eq!(format_sharing(&policy, "cursor"), "shared: reads and changes every agent's memories but claude-code's, codex's");
+        assert_eq!(format_sharing(&policy, "codex"), "shared: reads and changes every agent's memories");
+        assert_eq!(format_sharing(&policy, "aider"), "shared: none (reads and changes no other agent's memories)");
         let broken = SharingPolicy::parse(r#"{"version":2}"#);
         let line = format_sharing(&broken, "cursor");
         assert!(line.starts_with("shared: none (") && line.contains("version 2"), "{line}");
 
         let out = format_status(&health(), Profile::Dev, Path::new("/d"), "cursor", "from --agent", &format_sharing(&policy, "cursor"), None);
-        assert!(out.ends_with("\nshared: reads every agent but claude-code, codex"), "out was: {out}");
+        assert!(out.ends_with("\nshared: reads and changes every agent's memories but claude-code's, codex's"), "out was: {out}");
     }
 
     fn open_pair(new_id: i64, old_id: i64, new_mark: Option<&str>, old_mark: Option<&str>) -> OpenPair {

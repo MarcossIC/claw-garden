@@ -2141,7 +2141,7 @@ async fn a_protected_verdict_without_the_answer_is_a_409() {
 }
 
 #[tokio::test]
-async fn disputes_lists_pending_pairs_of_the_agent() {
+async fn disputes_lists_the_pending_pairs_an_agent_reaches_in_a_project() {
     let h = Harness::start().await;
     let (old, new) = seed_dispute(&h).await;
     h.ctx
@@ -2164,7 +2164,13 @@ async fn disputes_lists_pending_pairs_of_the_agent() {
     assert_eq!(body["pairs"][0]["old_id"], old, "{body}");
 
     let (_, other) = h.get_json("/v1/disputes?agent_id=agent-other").await;
-    assert_eq!(other["pending"], 0, "{other}");
+    assert_eq!(other["pending"], 1, "another agent judges it too: {other}");
+    let (_, elsewhere) = h.get_json("/v1/disputes?agent_id=agent-other&project_id=p").await;
+    assert_eq!(elsewhere["pending"], 1, "a pair without a project is every project's: {elsewhere}");
+
+    write_policy(&h, HIDE_AUTHOR);
+    let (_, hidden) = h.get_json("/v1/disputes?agent_id=agent-other").await;
+    assert_eq!(hidden["pending"], 0, "{hidden}");
 }
 
 #[tokio::test]

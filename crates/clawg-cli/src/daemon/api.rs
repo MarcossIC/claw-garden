@@ -259,6 +259,7 @@ pub fn list_params_from_query(q: ListQuery) -> ApiResult<ListParams> {
         limit: q.limit,
         offset: q.offset,
         deleted,
+        ..Default::default()
     })
 }
 
@@ -418,6 +419,10 @@ pub struct ContextRequest {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListQuery {
+    /// The agent the listing is for: it lists what that agent reaches, as a
+    /// call by id does ([`ReaderQuery`]). `agent` stays a filter by author.
+    #[serde(default)]
+    pub reader: Option<String>,
     #[serde(default)]
     pub kind: Option<String>,
     #[serde(default)]
@@ -849,8 +854,13 @@ pub struct JudgeRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DisputesQuery {
+    /// The agent that judges, as in [`ReaderQuery`].
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// Only the pairs whose newer row this project reaches, as a search reads
+    /// it; absent, the whole store.
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 /// How many pending pairs `GET /v1/disputes` names.
@@ -1413,7 +1423,9 @@ async fn list_memories(
     State(app): State<Arc<AppCtx>>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<ListBody>> {
-    let items = list_memories_core(&app.runtime.store, list_params_from_query(q)?)
+    let reader = named_reader(&app, q.reader.as_deref());
+    let params = ListParams { reader, ..list_params_from_query(q)? };
+    let items = list_memories_core(&app.runtime.store, params)
         .await
         .map_err(ApiError::internal)?;
 
@@ -1625,7 +1637,8 @@ async fn disputes(
     State(app): State<Arc<AppCtx>>,
     Query(q): Query<DisputesQuery>,
 ) -> ApiResult<Json<OpenPairs>> {
-    open_pairs(&app.runtime.store, q.agent_id.as_deref(), OPEN_PAIRS_SHOWN)
+    let reader = named_reader(&app, q.agent_id.as_deref());
+    open_pairs(&app.runtime.store, reader.as_ref(), q.project_id.as_deref(), OPEN_PAIRS_SHOWN)
         .await
         .map(Json)
         .map_err(ApiError::internal)

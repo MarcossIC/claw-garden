@@ -12,7 +12,7 @@ use crate::memory::contradiction::{detect_contradiction, excerpt, Candidate};
 use crate::memory::dispute::{add_dispute_in, release_challengers, settle_challengers, settle_row, SUPERSEDE_SQL};
 use crate::memory::revival::{revive_after_delete, revive_after_delete_of_piece};
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
-use crate::memory::search::{reader_bind, reader_predicate, viewer_match_expression, RankedHit};
+use crate::memory::search::{reach_predicate, reader_bind, reader_predicate, viewer_match_expression, RankedHit};
 use crate::memory::sharing::{Reach, Reader};
 use crate::memory::store_insert::{MemoryType, UnknownMemoryType};
 use crate::memory::tier::retier;
@@ -821,10 +821,12 @@ pub struct MemoryAdminRow {
 /// non-`Memory` kinds, the only table with a text index. `agent_id`,
 /// `project_id` and `status` are exact matches applied to every table.
 ///
-/// Unlike retrieval, `agent_id` is not a visibility rule: this is the owner's
-/// inspection tool, so it filters instead of scoping.
+/// `agent_id` filters by author; `reader` is the agent the listing is for,
+/// which sees what the sharing policy lets it reach. Without one the listing
+/// is the user's and reaches every row.
 #[derive(Debug, Clone, Default)]
 pub struct ListParams {
+    pub reader: Option<Reader>,
     pub kind: Option<MemoryKind>,
     pub tier: Option<i64>,
     pub memory_type: Option<String>,
@@ -852,6 +854,8 @@ pub fn query_has_tokens(query: &str) -> bool {
 /// the SQL builders. Every value reaches SQL as a bound parameter.
 #[derive(Default)]
 struct RowFilter {
+    /// The reader's reach as `reader_bind` binds it.
+    reach: Option<String>,
     tier: Option<i64>,
     memory_type: Option<String>,
     agent_id: Option<String>,
@@ -882,6 +886,14 @@ fn push_filters(
     memory_table: bool,
 ) {
     use rusqlite::types::Value;
+    if let Some(reach) = &f.reach {
+        sql.push_str(concat!(" AND ", reach_predicate!("agent_id", "?")));
+        // `reach_predicate!` names its parameter four times; an anonymous `?`
+        // is a new parameter each time.
+        for _ in 0..4 {
+            params.push(Value::Text(reach.clone()));
+        }
+    }
     if let Some(t) = f.tier {
         sql.push_str(" AND tier = ?");
         params.push(Value::Integer(t));
@@ -929,6 +941,7 @@ pub async fn list_memories_core(
     let offset = params.offset.unwrap_or(0) as i64;
     let kind = params.kind;
     let filter = RowFilter {
+        reach: reader_bind(params.reader.as_ref()),
         tier: params.tier,
         memory_type: params.memory_type,
         agent_id: params.agent_id,
@@ -2769,6 +2782,25 @@ mod tests {
         .unwrap();
 
         assert_eq!(ids_of(&rows), vec![a]);
+    }
+
+    #[tokio::test]
+    async fn a_list_reaches_what_its_reader_reaches() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let mine = seed_memory_scoped(&store, "one", "agent-a", None, "active").await;
+        let theirs = seed_memory_scoped(&store, "two", "agent-b", None, "active").await;
+        let hidden = seed_memory_scoped(&store, "three", "agent-c", None, "active").await;
+        let list = |reader: Reader, agent: Option<&str>| {
+            let params = ListParams { reader: Some(reader), agent_id: agent.map(Into::into), kind: Some(MemoryKind::Memory), ..Default::default() };
+            list_memories_core(&store, params)
+        };
+
+        let rows = list(hiding("agent-a", "agent-c"), None).await.unwrap();
+        assert_eq!(ids_of(&rows), vec![mine, theirs], "every author it reaches, not the hidden one");
+        let rows = list(hiding("agent-a", "agent-c"), Some("agent-b")).await.unwrap();
+        assert_eq!(ids_of(&rows), vec![theirs], "`agent_id` filters by author within the reach");
+        let rows = list(shared("agent-a"), None).await.unwrap();
+        assert_eq!(ids_of(&rows), vec![mine, theirs, hidden]);
     }
 
     #[tokio::test]

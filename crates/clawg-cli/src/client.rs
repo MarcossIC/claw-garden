@@ -589,6 +589,8 @@ fn search_request(args: &SearchArgs) -> SearchRequest<'_> {
 
 #[derive(Debug, Clone, Default)]
 pub struct ListArgs {
+    /// The agent the listing is for: the daemon lists what it reaches.
+    pub reader: Option<String>,
     pub kind: Option<String>,
     pub tier: Option<i64>,
     pub memory_type: Option<String>,
@@ -603,9 +605,9 @@ pub struct ListArgs {
     pub deleted: bool,
 }
 
-/// The query of a scoped change: no pair at all when unscoped, because
-/// `?agent=` would reach the daemon as a scope to the empty agent.
-fn owner_query(agent: Option<&str>) -> Vec<(&'static str, &str)> {
+/// The query of a call by id an agent makes: no pair at all for the user's
+/// own call, because `?agent=` would reach the daemon as the empty agent.
+fn reader_query(agent: Option<&str>) -> Vec<(&'static str, &str)> {
     agent.map(|a| ("agent", a)).into_iter().collect()
 }
 
@@ -1028,6 +1030,9 @@ impl DaemonClient {
         // no query parameter at all — `?kind=` would reach the daemon as an
         // empty string and fail the kind parse.
         let mut query: Vec<(&'static str, String)> = Vec::new();
+        if let Some(r) = &args.reader {
+            query.push(("reader", r.clone()));
+        }
         if let Some(k) = &args.kind {
             query.push(("kind", k.clone()));
         }
@@ -1077,7 +1082,7 @@ impl DaemonClient {
     /// The save `id` belongs to. `agent` scopes it to that agent's rows:
     /// another agent's row is the daemon's 404, like a missing one.
     pub async fn read_save(&self, kind: &str, id: i64, agent: Option<&str>) -> Result<SavedText, ClientError> {
-        let call = Call::new(reqwest::Method::GET, format!("/v1/memories/{kind}/{id}/save")).query(owner_query(agent));
+        let call = Call::new(reqwest::Method::GET, format!("/v1/memories/{kind}/{id}/save")).query(reader_query(agent));
         read_response(self.send(call).await?)
     }
 
@@ -1110,14 +1115,14 @@ impl DaemonClient {
         agent: Option<&str>,
     ) -> Result<Updated, ClientError> {
         let call = Call::new(reqwest::Method::PATCH, format!("/v1/memories/{kind}/{id}"))
-            .query(owner_query(agent))
+            .query(reader_query(agent))
             .json(&UpdateBody { importance, memory_type, user_answered })?;
         read_response(self.send(call).await?)
     }
 
     /// `agent` scopes the delete as in [`DaemonClient::update`].
     pub async fn delete(&self, kind: &str, id: i64, agent: Option<&str>) -> Result<Deleted, ClientError> {
-        let call = Call::new(reqwest::Method::DELETE, format!("/v1/memories/{kind}/{id}")).query(owner_query(agent));
+        let call = Call::new(reqwest::Method::DELETE, format!("/v1/memories/{kind}/{id}")).query(reader_query(agent));
         read_response(self.send(call).await?)
     }
 
@@ -1125,7 +1130,7 @@ impl DaemonClient {
     /// [`DaemonClient::update`].
     pub async fn restore(&self, kind: &str, id: i64, agent: Option<&str>) -> Result<Restored, ClientError> {
         let call =
-            Call::new(reqwest::Method::POST, format!("/v1/memories/{kind}/{id}/restore")).query(owner_query(agent));
+            Call::new(reqwest::Method::POST, format!("/v1/memories/{kind}/{id}/restore")).query(reader_query(agent));
         read_response(self.send(call).await?)
     }
 
@@ -1163,8 +1168,11 @@ impl DaemonClient {
 
     /// The pairs `agent` has not judged yet. A daemon that predates the pair
     /// table answers a bare 404.
-    pub async fn open_disputes(&self, agent: &str) -> Result<OpenPairs, ClientError> {
-        let call = Call::new(reqwest::Method::GET, "/v1/disputes").query([("agent_id", agent)]);
+    /// The open pairs `agent` judges, in `project_id` when one is given.
+    pub async fn open_disputes(&self, agent: &str, project_id: Option<&str>) -> Result<OpenPairs, ClientError> {
+        let mut query = vec![("agent_id", agent)];
+        query.extend(project_id.map(|p| ("project_id", p)));
+        let call = Call::new(reqwest::Method::GET, "/v1/disputes").query(query);
         read_response(self.send(call).await?)
     }
 

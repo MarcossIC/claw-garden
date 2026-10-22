@@ -69,7 +69,9 @@ Every row competes with the others in search, so leave out:
 - A decision or a preference that may change later gets a `topic_key`, a
   short stable name such as `storage/engine`. When it changes, save the new
   version under the same `topic_key`: it replaces the old one, which stays in
-  the history, and the answer names what it replaced. `search_memory` and
+  the history, and the answer names what it replaced. A key names a topic of
+  the project, not of one agent: saving under it replaces the version another
+  agent saved, so pick a name that says the topic, never a generic word. `search_memory` and
   `read_memory` show a memory's key as `topic=K` only where saving under it
   replaces that memory: save its new version under that key, the one shown,
   never a new one. A memory of another project, or of none, shows no key,
@@ -152,10 +154,11 @@ says so; check what it claims against the code or ask the user.
 
 ## The other tools
 
-- `list_memories` browses what is stored, newest first.
+- `list_memories` browses what is stored, newest first, and `agent` narrows
+  it to one agent's memories.
 - `read_memory` returns the whole text of a save that search showed as one
   piece, marked `piece=K/N`.
-- `delete_memory` removes a memory of your own, and `restore_memory` undoes
-  it.
+- `delete_memory` removes a memory, yours or one marked `by <agent>`, for
+  every agent, and `restore_memory` undoes it.
 - `memory_status` says why a memory tool failed: the daemon, the profile or
   the embedding model.
