@@ -27,9 +27,9 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 
 ## 5. Verificación
 
-- [ ] Suite y clippy en Linux sobre el último commit, y cada commit de código por separado ([verify](verify.md)).
+- [x] Suite y clippy en Linux sobre el último commit, y cada commit de código por separado ([verify](verify.md)).
 - [ ] El CI en verde en Linux y Windows.
 
 ## 6. Archive
 
-- [ ] `specs/project-docs` con R1, R2 y R3, las citas realineadas; `git mv` a `changes/archive/AAAA-MM-DD-docs-refresh-background`; `state.yaml` archivado; fila 64 y el orden de ejecución del `README.md` de openspec; subir el minor.
+- [x] `specs/project-docs` con R1, R2 y R3, y `specs/eval` con el fallo de `rag-eval --docs`, las citas realineadas; `git mv` a `changes/archive/2026-10-22-docs-refresh-background`; `state.yaml` archivado; fila 64 y el orden de ejecución del `README.md` de openspec; subir el minor.
