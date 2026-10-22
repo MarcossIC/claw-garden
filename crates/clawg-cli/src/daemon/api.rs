@@ -63,7 +63,7 @@ use crate::relevance::shown_hits;
 
 use super::guard::{admits, RefusalLog};
 use super::lifecycle::now_ms;
-use super::metrics::{time_request, HttpMeter, Transport};
+use super::metrics::{metrics_body, prometheus_text, time_request, HttpMeter, Transport};
 use super::sessions::{check_session_id, SessionRegistry};
 
 /// Largest `limit` any search will honour. A retrieval request is a vector
@@ -880,6 +880,7 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         .route("/outbox/retry", post(retry_outbox))
         .route("/outbox/discard", post(discard_outbox))
         .route("/stats", get(stats))
+        .route("/metrics", get(metrics))
         .route("/backup", post(backup))
         .route("/import", post(import_memories).layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT)))
         .route("/projects", post(register))
@@ -1413,6 +1414,28 @@ async fn list_memories(
 }
 
 /// Counts what is stored, optionally narrowed to an agent and/or project.
+#[derive(Debug, Deserialize)]
+struct MetricsQuery {
+    format: Option<String>,
+}
+
+/// What this run measured: the minute in progress and the whole run, as JSON
+/// or, with `format=prometheus`, as Prometheus text.
+async fn metrics(State(app): State<Arc<AppCtx>>, Query(q): Query<MetricsQuery>) -> ApiResult<Response> {
+    match q.format.as_deref() {
+        None | Some("json") => {
+            let started_at_ms = now_ms().saturating_sub(app.started_at.elapsed().as_millis() as u64);
+            Ok(Json(metrics_body(&app.metrics, clawg_core::build_info::version(), started_at_ms)).into_response())
+        }
+        Some("prometheus") => Ok((
+            [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+            prometheus_text(&app.metrics),
+        )
+            .into_response()),
+        Some(other) => Err(ApiError::bad_request(format!("unknown format {other:?}; use json or prometheus"))),
+    }
+}
+
 async fn stats(
     State(app): State<Arc<AppCtx>>,
     Query(q): Query<StatsQuery>,

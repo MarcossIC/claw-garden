@@ -12,7 +12,8 @@ use axum::http::{HeaderMap, Method};
 use axum::middleware::Next;
 use axum::response::Response;
 use clawg_core::metrics::store::{MetricsDb, RunInfo, METRICS_FILE};
-use clawg_core::metrics::{Recorder, Unit};
+use clawg_core::metrics::{Gauge, Histogram, Recorder, SeriesKey, Unit};
+use serde::Serialize;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
@@ -284,6 +285,172 @@ async fn run_writer(mut writer: Writer, mut stopped: oneshot::Receiver<()>, resi
     let _ = tokio::task::spawn_blocking(move || writer.stop(now())).await;
 }
 
+// ── Reading ─────────────────────────────────────────────────────────────────
+
+/// The answer of `GET /v1/metrics`.
+#[derive(Debug, Serialize)]
+pub struct MetricsBody {
+    pub version: String,
+    pub started_at_ms: u64,
+    /// Whether the minutes are kept in `metrics.db`.
+    pub writing: bool,
+    pub minute: MinuteBody,
+    pub run: RunBody,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MinuteBody {
+    pub histograms: Vec<HistogramBody>,
+    pub gauges: Vec<GaugeBody>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RunBody {
+    pub histograms: Vec<HistogramBody>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HistogramBody {
+    pub name: String,
+    pub labels: std::collections::BTreeMap<String, String>,
+    pub unit: &'static str,
+    pub count: u64,
+    pub sum: u64,
+    pub min: u64,
+    pub max: u64,
+    pub p50: Option<u64>,
+    pub p95: Option<u64>,
+    pub p99: Option<u64>,
+    /// Each bucket's upper bound (`null` for the open one) and count.
+    pub buckets: Vec<BucketBody>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BucketBody {
+    pub le: Option<u64>,
+    pub count: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GaugeBody {
+    pub name: String,
+    pub labels: std::collections::BTreeMap<String, String>,
+    pub count: u64,
+    pub mean: f64,
+    pub min: f64,
+    pub max: f64,
+    pub last: f64,
+}
+
+fn labels_of(key: &SeriesKey) -> std::collections::BTreeMap<String, String> {
+    key.label_pairs().into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+}
+
+fn histogram_body(key: &SeriesKey, h: &Histogram) -> HistogramBody {
+    let bounds = h.unit().bounds();
+    HistogramBody {
+        name: key.name.clone(),
+        labels: labels_of(key),
+        unit: h.unit().as_str(),
+        count: h.count(),
+        sum: h.sum(),
+        min: h.min(),
+        max: h.max(),
+        p50: h.quantile(0.5),
+        p95: h.quantile(0.95),
+        p99: h.quantile(0.99),
+        buckets: h.buckets().iter().enumerate().map(|(i, n)| BucketBody { le: bounds.get(i).copied(), count: *n }).collect(),
+    }
+}
+
+fn gauge_body(key: &SeriesKey, g: &Gauge) -> GaugeBody {
+    GaugeBody {
+        name: key.name.clone(),
+        labels: labels_of(key),
+        count: g.count,
+        mean: g.mean(),
+        min: g.min,
+        max: g.max,
+        last: g.last,
+    }
+}
+
+/// What the recorder holds now, as `GET /v1/metrics` answers it.
+pub fn metrics_body(recorder: &Recorder, version: &str, started_at_ms: u64) -> MetricsBody {
+    let minute = recorder.minute();
+    MetricsBody {
+        version: version.to_string(),
+        started_at_ms,
+        writing: recorder.writing(),
+        minute: MinuteBody {
+            histograms: minute.histograms.iter().map(|(k, h)| histogram_body(k, h)).collect(),
+            gauges: minute.gauges.iter().map(|(k, g)| gauge_body(k, g)).collect(),
+        },
+        run: RunBody { histograms: recorder.run().iter().map(|(k, h)| histogram_body(k, h)).collect() },
+    }
+}
+
+/// The histograms of the run and the last value of each gauge in the text
+/// format Prometheus reads (version 0.0.4): durations in seconds, sizes in
+/// bytes, buckets cumulative.
+pub fn prometheus_text(recorder: &Recorder) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let mut last_name = String::new();
+    for (key, h) in &recorder.run() {
+        // Divided rather than multiplied: 50 / 1e6 prints 0.00005, 50 * 1e-6 does not.
+        let (name, per_unit) = match h.unit() {
+            Unit::Micros => (format!("clawg_{}_seconds", key.name.replace('.', "_")), 1e6),
+            Unit::Bytes => (with_suffix(&format!("clawg_{}", key.name.replace('.', "_")), "_bytes"), 1.0),
+        };
+        if name != last_name {
+            let _ = writeln!(out, "# TYPE {name} histogram");
+            last_name = name.clone();
+        }
+        let labels = prometheus_labels(key);
+        let mut cumulative = 0u64;
+        for (i, n) in h.buckets().iter().enumerate() {
+            cumulative += n;
+            let le = match h.unit().bounds().get(i) {
+                Some(bound) => format!("{}", *bound as f64 / per_unit),
+                None => "+Inf".to_string(),
+            };
+            let _ = writeln!(out, "{name}_bucket{{{}le=\"{le}\"}} {cumulative}", with_comma(&labels));
+        }
+        let _ = writeln!(out, "{name}_sum{} {}", braced(&labels), h.sum() as f64 / per_unit);
+        let _ = writeln!(out, "{name}_count{} {}", braced(&labels), h.count());
+    }
+    for (key, value) in &recorder.latest_gauges() {
+        let name = format!("clawg_{}", key.name.replace('.', "_"));
+        if name != last_name {
+            let _ = writeln!(out, "# TYPE {name} gauge");
+            last_name = name.clone();
+        }
+        let _ = writeln!(out, "{name}{} {value}", braced(&prometheus_labels(key)));
+    }
+    out
+}
+
+fn with_suffix(name: &str, suffix: &str) -> String {
+    if name.ends_with(suffix) { name.to_string() } else { format!("{name}{suffix}") }
+}
+
+fn prometheus_labels(key: &SeriesKey) -> String {
+    key.label_pairs()
+        .iter()
+        .map(|(k, v)| format!("{k}=\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn with_comma(labels: &str) -> String {
+    if labels.is_empty() { String::new() } else { format!("{labels},") }
+}
+
+fn braced(labels: &str) -> String {
+    if labels.is_empty() { String::new() } else { format!("{{{labels}}}") }
+}
+
 fn method_label(method: &Method) -> &'static str {
     match *method {
         Method::GET => "GET",
@@ -425,6 +592,14 @@ mod tests {
     fn rusqlite_drop_tables(path: &Path) {
         let conn = rusqlite::Connection::open(path).unwrap();
         conn.execute_batch("DROP TABLE hist_minute; DROP TABLE gauge_minute;").unwrap();
+    }
+
+    #[test]
+    fn a_label_value_is_escaped_for_prometheus() {
+        let key = SeriesKey { name: "m".into(), labels: "route=a\"b\\c".into() };
+        assert_eq!(prometheus_labels(&key), r#"route="a\"b\\c""#);
+        assert_eq!(braced(""), "");
+        assert_eq!(with_suffix("clawg_http_request_bytes", "_bytes"), "clawg_http_request_bytes");
     }
 
     #[test]

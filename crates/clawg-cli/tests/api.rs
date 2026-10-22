@@ -3554,3 +3554,56 @@ async fn no_label_comes_from_the_request() {
     assert!(labels.iter().any(|l| l.contains("method=POST,route=unmatched")), "{labels:?}");
     assert!(labels.iter().any(|l| l.contains("method=other")), "{labels:?}");
 }
+
+#[tokio::test]
+async fn metrics_needs_the_token_and_answers_the_minute_and_the_run() {
+    let h = Harness::start().await;
+    let r = h.http.get(h.url("/v1/metrics")).send().await.expect("request");
+    assert_eq!(r.status(), 401);
+    h.http.get(h.url("/health")).send().await.expect("health");
+
+    let (status, body) = h.get_json("/v1/metrics").await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["version"], clawg_core::build_info::version());
+    assert!(body["started_at_ms"].as_u64().is_some_and(|ms| ms > 0), "{body}");
+    assert_eq!(body["writing"], false, "a daemon in a test keeps no file");
+    let health = |list: &Value| {
+        list.as_array()
+            .and_then(|l| {
+                l.iter().find(|s| s["name"] == "http.duration" && s["labels"]["route"] == "/health" && s["labels"]["status"] == "2xx")
+            })
+            .cloned()
+    };
+    let minute = health(&body["minute"]["histograms"]).expect("the health check of this minute");
+    assert_eq!(minute["unit"], "us");
+    assert_eq!(minute["count"], 1);
+    assert_eq!(minute["labels"]["transport"], "tcp");
+    assert!(minute["p50"].as_u64().is_some() && minute["p99"].as_u64().is_some(), "{minute}");
+    assert!(minute["buckets"].as_array().is_some_and(|b| !b.is_empty()), "{minute}");
+    let run = health(&body["run"]["histograms"]).expect("the health check of the run");
+    assert_eq!(run["count"], 1);
+    assert!(body["minute"]["gauges"].as_array().is_some_and(|g| g.iter().any(|g| g["name"] == "http.in_flight")), "{body}");
+}
+
+#[tokio::test]
+async fn metrics_speaks_prometheus_text() {
+    let h = Harness::start().await;
+    h.http.get(h.url("/health")).send().await.expect("health");
+
+    let r = h.authed(h.http.get(h.url("/v1/metrics?format=prometheus"))).send().await.expect("request");
+
+    assert_eq!(r.status(), 200);
+    let kind = r.headers()["content-type"].to_str().unwrap().to_string();
+    assert!(kind.starts_with("text/plain") && kind.contains("version=0.0.4"), "{kind}");
+    let text = r.text().await.expect("text");
+    assert!(text.contains("# TYPE clawg_http_duration_seconds histogram"), "{text}");
+    let health = r#"method="GET",route="/health",status="2xx",transport="tcp""#;
+    assert!(text.contains(&format!("clawg_http_duration_seconds_count{{{health}}} 1")), "{text}");
+    assert!(text.contains(&format!("clawg_http_duration_seconds_bucket{{{health},le=\"+Inf\"}} 1")), "{text}");
+    assert!(text.contains(&format!("clawg_http_duration_seconds_bucket{{{health},le=\"0.00005\"}}")), "{text}");
+    assert!(text.contains("# TYPE clawg_http_request_bytes histogram"), "{text}");
+    assert!(text.contains("# TYPE clawg_http_in_flight gauge"), "{text}");
+    let r = h.authed(h.http.get(h.url("/v1/metrics?format=yaml"))).send().await.expect("request");
+    assert_eq!(r.status(), 400);
+}
