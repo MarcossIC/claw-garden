@@ -57,8 +57,12 @@ pub enum DocIndexError {
         #[source]
         source: EmbedError,
     },
+    /// One vector of the doc was not usable: of the doc, not of the embedder,
+    /// so a refresh skips the doc and goes on.
     #[error("the embedder returned an unusable vector for {path}: {reason}")]
     Vector { path: String, reason: String },
+    #[error("the embedder returned {vectors} vectors for the {passages} passages of {path}")]
+    VectorCount { path: String, vectors: usize, passages: usize },
     #[error("embedding the query failed: {0}")]
     Query(String),
     #[error("documentation index store error: {0}")]
@@ -77,6 +81,15 @@ pub struct RefreshReport {
     pub skipped: usize,
     /// Passages written by this refresh.
     pub passages: usize,
+    /// Docs left as they were because a vector of theirs was unusable; the
+    /// next refresh tries them again.
+    pub failed: Vec<FailedDoc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedDoc {
+    pub path: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -385,7 +398,14 @@ pub(crate) async fn refresh(
             DocKind::Manifest => chunk_manifest(path, &masked, splitter),
             DocKind::Code(lang) => chunk_code(path, &masked, lang, splitter),
         };
-        let vectors = embed_passages(embedder, path, &passages).await?;
+        let vectors = match embed_passages(embedder, path, &passages).await {
+            Ok(vectors) => vectors,
+            Err(DocIndexError::Vector { path, reason }) => {
+                report.failed.push(FailedDoc { path, reason });
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         report.passages += passages.len();
         let doc = IndexedDoc { path: path.clone(), hash, model_id: model_id.clone(), passages, vectors };
         replace_doc(store, project_id, doc).await?;
@@ -410,9 +430,10 @@ async fn embed_passages(
         .await
         .map_err(|source| DocIndexError::Embed { path: path.to_string(), source })?;
     if vectors.len() != texts.len() {
-        return Err(DocIndexError::Vector {
+        return Err(DocIndexError::VectorCount {
             path: path.to_string(),
-            reason: format!("{} vectors for {} passages", vectors.len(), texts.len()),
+            vectors: vectors.len(),
+            passages: texts.len(),
         });
     }
     vectors
@@ -784,6 +805,84 @@ mod tests {
         let retried = refreshed(&index, &store, &Counting::new("m1"), "p").await;
         assert_eq!(retried.indexed, 1, "the next refresh picks the doc up again");
         assert_eq!(passages(&store, "p").await[0].2, "second");
+    }
+
+    /// `FakeEmbedder`, except that a text holding `BROKEN` embeds to a
+    /// vector with a NaN in it.
+    struct Unusable;
+
+    #[async_trait::async_trait]
+    impl Embedder for Unusable {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+            let mut v = FakeEmbedder::default().embed_with_role(text, role).await?;
+            if text.contains("BROKEN") {
+                v[0] = f32::NAN;
+            }
+            Ok(v)
+        }
+        fn dimensions(&self) -> usize { 384 }
+        fn model_id(&self) -> &str { "m1" }
+        fn query_prefix(&self) -> &str { "" }
+        fn passage_prefix(&self) -> &str { "" }
+    }
+
+    /// Answers a batch with one vector fewer than it was given texts.
+    struct ShortBatch;
+
+    #[async_trait::async_trait]
+    impl Embedder for ShortBatch {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+            FakeEmbedder::default().embed_with_role(text, role).await
+        }
+        async fn embed_batch(&self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
+            let mut out = Vec::new();
+            for text in texts.iter().skip(1) {
+                out.push(self.embed_with_role(text, role).await?);
+            }
+            Ok(out)
+        }
+        fn dimensions(&self) -> usize { 384 }
+        fn model_id(&self) -> &str { "m1" }
+        fn query_prefix(&self) -> &str { "" }
+        fn passage_prefix(&self) -> &str { "" }
+    }
+
+    #[tokio::test]
+    async fn an_unusable_vector_skips_its_doc_and_the_rest_go_on() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "gone.md", "# Gone\nsoon deleted\n");
+        let store = store_with_project("p", dir.path()).await;
+        let index = Arc::new(DocIndex::default());
+        refreshed(&index, &store, &Counting::new("m1"), "p").await;
+
+        std::fs::remove_file(dir.path().join("gone.md")).unwrap();
+        write(dir.path(), "a.md", "# A\nBROKEN passage\n");
+        write(dir.path(), "b.md", "# B\nsound passage\n");
+        let report = refreshed(&index, &store, &Unusable, "p").await;
+
+        assert_eq!(report.indexed, 1, "{report:?}");
+        assert_eq!(report.removed, 1, "{report:?}");
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert_eq!(report.failed[0].path, "a.md");
+        assert!(report.failed[0].reason.contains("finite"), "{report:?}");
+        assert_eq!(passages(&store, "p").await, [("b.md".into(), "b.md > B".into(), "sound passage".into())]);
+
+        let retried = refreshed(&index, &store, &Counting::new("m1"), "p").await;
+        assert_eq!((retried.indexed, retried.failed.len()), (1, 0), "the next refresh picks the doc up again");
+    }
+
+    #[tokio::test]
+    async fn a_short_batch_still_aborts_the_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.md", "# A\na\n");
+        write(dir.path(), "b.md", "# B\nb\n");
+        let store = store_with_project("p", dir.path()).await;
+        let index = Arc::new(DocIndex::default());
+
+        let result = index.try_refresh(&store, &ShortBatch, None, "p").await;
+
+        assert!(matches!(result, Err(DocIndexError::VectorCount { ref path, .. }) if path == "a.md"), "{result:?}");
+        assert_eq!(index_sizes(&store).await, (0, 0, 0, 0));
     }
 
     #[tokio::test]

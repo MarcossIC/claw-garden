@@ -1727,10 +1727,15 @@ fn spawn_doc_refresh(app: Arc<AppCtx>, project_id: String) {
         };
         let tokenizer = app.runtime.tokenizer.get().cloned();
         match app.runtime.project_docs.try_refresh(&app.runtime.store, embedder.as_ref(), tokenizer, &project_id).await {
-            Ok(RefreshOutcome::Refreshed(r)) => log::info!(
-                "indexed the docs of {project_id}: {} docs, {} reindexed, {} removed, {} skipped, {} passages",
-                r.docs, r.indexed, r.removed, r.skipped, r.passages
-            ),
+            Ok(RefreshOutcome::Refreshed(r)) => {
+                log::info!(
+                    "indexed the docs of {project_id}: {} docs, {} reindexed, {} removed, {} skipped, {} passages",
+                    r.docs, r.indexed, r.removed, r.skipped, r.passages
+                );
+                for f in &r.failed {
+                    log::warn!("left {} of {project_id} as it was: {}", f.path, f.reason);
+                }
+            }
             Ok(RefreshOutcome::AlreadyRunning) => {}
             Err(e) => log::warn!("could not index the docs of {project_id}: {e}"),
         }
