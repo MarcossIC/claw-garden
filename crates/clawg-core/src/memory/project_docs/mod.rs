@@ -217,6 +217,20 @@ impl DocIndex {
         Some(RefreshGuard { index: self.clone(), project_id: project_id.to_string() })
     }
 
+    /// Claims the project's refresh if a search at `now` should start one
+    /// (see [`DocIndex::is_due`]), checked and claimed under one lock so two
+    /// searches never both start it.
+    pub fn begin_if_due(self: &Arc<Self>, project_id: &str, now: Instant) -> Option<RefreshGuard> {
+        let mut projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
+        let progress = projects.entry(project_id.to_string()).or_default();
+        if progress.running || !needs_refresh(progress.last_started, now, REFRESH_INTERVAL) {
+            return None;
+        }
+        progress.running = true;
+        progress.last_started = Some(Instant::now());
+        Some(RefreshGuard { index: self.clone(), project_id: project_id.to_string() })
+    }
+
     pub fn is_running(&self, project_id: &str) -> bool {
         self.progress(project_id).running
     }
@@ -985,6 +999,18 @@ mod tests {
         drop(guard);
         assert!(!index.is_due("p", Instant::now()));
         assert!(index.is_due("p", Instant::now() + REFRESH_INTERVAL));
+    }
+
+    #[tokio::test]
+    async fn begin_if_due_claims_only_a_due_idle_project() {
+        let index = Arc::new(DocIndex::default());
+        let now = Instant::now();
+        let guard = index.begin_if_due("p", now).expect("never refreshed, so due");
+        assert!(index.is_running("p"));
+        assert!(index.begin_if_due("p", now + REFRESH_INTERVAL * 2).is_none(), "not while running");
+        drop(guard);
+        assert!(index.begin_if_due("p", Instant::now()).is_none(), "not before the interval");
+        assert!(index.begin_if_due("p", Instant::now() + REFRESH_INTERVAL).is_some());
     }
 
     #[tokio::test]

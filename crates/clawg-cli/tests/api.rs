@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use clawg_cli::daemon::api::{router, AppCtx, MAX_CONTENT_BYTES, SAVE_CONFIRM_TIMEOUT};
+use clawg_cli::daemon::api::{router, AppCtx, MAX_CONTENT_BYTES, REFRESH_GRACE, SAVE_CONFIRM_TIMEOUT};
 use clawg_core::memory::bootstrap::EmbedderStatus;
 use clawg_core::memory::embedder::{EmbedError, EmbedRole, Embedder, FakeEmbedder};
 use clawg_core::memory::idle_embedder::{IdleEmbedder, ReloadFn};
@@ -2932,6 +2932,83 @@ async fn a_background_refresh_that_failed_warns_the_next_search() {
     assert_eq!(status, 200, "{body}");
     assert!(body["warning"].as_str().is_some_and(|w| w.contains("passages refused")), "{body}");
     assert_eq!(body["docs"], 0);
+}
+
+/// A project indexed with `a.md` outside the daemon's own bookkeeping, so the
+/// daemon finds it due for a refresh, whose `a.md` then changed and which got a
+/// `b.md`.
+async fn indexed_project_that_changed(h: &Harness) -> (tempfile::TempDir, String) {
+    let (dir, id) = project_with_docs(h, &[("a.md", "# A\nold passage\n")]).await;
+    let elsewhere = Arc::new(clawg_core::memory::project_docs::DocIndex::default());
+    elsewhere.try_refresh(&h.ctx.runtime.store, &FakeEmbedder::default(), None, &id).await.unwrap();
+    std::fs::write(dir.path().join("a.md"), "# A\nnew passage\n").unwrap();
+    std::fs::write(dir.path().join("b.md"), "# B\nanother passage\n").unwrap();
+    (dir, id)
+}
+
+fn texts(body: &Value) -> Vec<&str> {
+    body["hits"].as_array().expect("hits").iter().filter_map(|h| h["text"].as_str()).collect()
+}
+
+#[tokio::test]
+async fn a_search_answers_from_the_index_while_a_long_refresh_runs() {
+    let (embedder, gate) = docs_embedder(false, false);
+    let h = Harness::start_inner(EmbedderState::Docs(embedder)).await;
+    let (_dir, id) = indexed_project_that_changed(&h).await;
+
+    let search = h.post_json("/v1/projects/docs/search", json!({ "project_id": id, "query": "passage" }));
+    let (status, body) = tokio::time::timeout(REFRESH_GRACE + Duration::from_secs(5), search)
+        .await
+        .expect("the search waited for the whole refresh");
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["indexing"], true, "{body}");
+    assert_eq!(body["docs"], 1, "{body}");
+    assert_eq!(texts(&body), ["old passage"]);
+
+    gate.send(true).unwrap();
+    assert!(h.ctx.runtime.project_docs.wait_idle(&id, Duration::from_secs(10)).await);
+    let (status, body) = h.post_json("/v1/projects/docs/search", json!({ "project_id": id, "query": "passage" })).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["indexing"], false, "{body}");
+    assert_eq!(body["docs"], 2, "{body}");
+    let mut found = texts(&body);
+    found.sort();
+    assert_eq!(found, ["another passage", "new passage"]);
+}
+
+#[tokio::test]
+async fn a_small_edit_is_found_by_the_search_that_refreshes() {
+    let h = Harness::start().await;
+    let (_dir, id) = indexed_project_that_changed(&h).await;
+
+    let (status, body) = h.post_json("/v1/projects/docs/search", json!({ "project_id": id, "query": "passage" })).await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["indexing"], false, "{body}");
+    assert_eq!(body["docs"], 2, "{body}");
+    assert!(texts(&body).contains(&"new passage"), "{body}");
+    assert!(!texts(&body).contains(&"old passage"), "{body}");
+}
+
+#[tokio::test]
+async fn the_refresh_outlives_the_search_that_started_it() {
+    let (embedder, gate) = docs_embedder(false, false);
+    let h = Harness::start_inner(EmbedderState::Docs(embedder)).await;
+    let (_dir, id) = indexed_project_that_changed(&h).await;
+
+    let gone = h
+        .authed(h.http.post(h.url("/v1/projects/docs/search")))
+        .json(&json!({ "project_id": id, "query": "passage" }))
+        .timeout(Duration::from_millis(200))
+        .send()
+        .await;
+    assert!(gone.is_err(), "the client was meant to give up first: {gone:?}");
+    // Let the server see the closed connection before the refresh can go on.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    gate.send(true).unwrap();
+    wait_for_docs(&h, &id, 2).await;
 }
 
 #[tokio::test]
