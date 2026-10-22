@@ -23,8 +23,8 @@ pub const DEFAULT_SEED: u64 = 0x5EED_0005;
 pub const SAMPLE_OF_REST: usize = 50;
 
 /// The two values a label takes.
-const REVISION: &str = "revision";
-const OTHER: &str = "other";
+pub(crate) const REVISION: &str = "revision";
+pub(crate) const OTHER: &str = "other";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -94,9 +94,9 @@ pub struct Export {
 pub fn read_export(text: &str) -> Result<Export, StoreError> {
     let (header, parsed) = format::parse(text)?;
     let mut heads = saves_of(&parsed);
-    heads.sort_by_key(|(head, _)| (head.created_at, head.id));
+    heads.sort_by_key(|save| (save.head.created_at, save.head.id));
 
-    let first_key_at = heads.iter().filter(|(head, _)| head.topic_key.is_some()).map(|(head, _)| head.created_at).min();
+    let first_key_at = heads.iter().filter(|save| save.head.topic_key.is_some()).map(|save| save.head.created_at).min();
     let mut counts = ExportCounts {
         rows: parsed.memories.len(),
         saves: heads.len(),
@@ -118,7 +118,7 @@ pub fn read_export(text: &str) -> Result<Export, StoreError> {
         }
     }
     let mut flow = Vec::new();
-    for (head, text) in heads {
+    for SaveGroup { head, text, .. } in heads {
         if head.topic_key.is_some() {
             counts.keyed_saves += 1;
         }
@@ -203,11 +203,20 @@ pub fn background(export: Export) -> Background {
     Background { saves, counts }
 }
 
-/// Each save's first row and its text. A save of several pieces is joined as
+/// A save of the export: its first row, every row it holds and its text.
+pub(crate) struct SaveGroup<'a> {
+    pub head: &'a MemoryLine,
+    /// The rows of the save's pieces that the export holds, in piece order; a
+    /// lone row is a save of one.
+    pub rows: Vec<&'a MemoryLine>,
+    pub text: String,
+}
+
+/// Each save's first row, rows and text. A save of several pieces is joined as
 /// `read_memory` joins it; a piece the export does not hold cuts the text in
 /// two runs, joined by a line break, as `read_save_core` does for a piece that
 /// is gone.
-fn saves_of(parsed: &Parsed) -> Vec<(&MemoryLine, String)> {
+pub(crate) fn saves_of(parsed: &Parsed) -> Vec<SaveGroup<'_>> {
     let rows: HashMap<i64, &MemoryLine> = parsed.memories.iter().map(|(_, m)| (m.id, m)).collect();
     let mut groups: BTreeMap<i64, BTreeMap<i64, i64>> = BTreeMap::new();
     for (_, piece) in &parsed.pieces {
@@ -218,6 +227,7 @@ fn saves_of(parsed: &Parsed) -> Vec<(&MemoryLine, String)> {
     let mut saves = Vec::new();
     for pieces in groups.values() {
         let mut head: Option<&MemoryLine> = None;
+        let mut held: Vec<&MemoryLine> = Vec::new();
         let mut previous: Option<i64> = None;
         let mut runs: Vec<Vec<&str>> = vec![Vec::new()];
         for (&position, memory) in pieces {
@@ -227,16 +237,17 @@ fn saves_of(parsed: &Parsed) -> Vec<(&MemoryLine, String)> {
             }
             previous = Some(position);
             head.get_or_insert(row);
+            held.push(row);
             runs.last_mut().expect("runs starts non-empty").push(&row.content);
         }
         if let Some(head) = head {
             let text = runs.iter().filter(|r| !r.is_empty()).map(|r| join_pieces(r)).collect::<Vec<_>>().join("\n");
-            saves.push((head, text));
+            saves.push(SaveGroup { head, rows: held, text });
         }
     }
     for (_, row) in &parsed.memories {
         if !in_a_save.contains(&row.id) {
-            saves.push((row, row.content.clone()));
+            saves.push(SaveGroup { head: row, rows: vec![row], text: row.content.clone() });
         }
     }
     saves
@@ -530,7 +541,7 @@ pub struct Prevalence {
     pub lower_bound: f64,
 }
 
-fn prevalence(
+pub(crate) fn prevalence(
     population: usize,
     firing: usize,
     revisions_among_firing: usize,
@@ -565,11 +576,11 @@ pub struct Gate {
 }
 
 impl Gate {
-    fn at_least(value: f64, limit: f64) -> Self {
+    pub(crate) fn at_least(value: f64, limit: f64) -> Self {
         Self { value, limit, met: value >= limit }
     }
 
-    fn at_most(value: f64, limit: f64) -> Self {
+    pub(crate) fn at_most(value: f64, limit: f64) -> Self {
         Self { value, limit, met: value <= limit }
     }
 }
@@ -622,7 +633,7 @@ pub struct Scored {
     pub thresholds: Thresholds,
 }
 
-fn valid(value: &str) -> bool {
+pub(crate) fn valid(value: &str) -> bool {
     value == REVISION || value == OTHER
 }
 
@@ -711,6 +722,12 @@ pub(crate) mod fixtures {
 
     use serde_json::json;
 
+    /// When a row of this id was created, unless its `created_at` says otherwise:
+    /// a second apart from its neighbours, so ids order rows in time.
+    pub fn at(id: i64) -> i64 {
+        1_750_000_000_000_i64 + id * 1000
+    }
+
     /// A row of an export; the rest of its columns are the ones a plain save has.
     pub struct Row {
         pub id: i64,
@@ -721,7 +738,9 @@ pub(crate) mod fixtures {
         pub topic_key: Option<&'static str>,
         pub status: &'static str,
         pub cause: Option<&'static str>,
-        pub deleted: bool,
+        pub superseded_by: Option<i64>,
+        pub created_at: i64,
+        pub deleted_at: Option<i64>,
     }
 
     impl Row {
@@ -735,7 +754,9 @@ pub(crate) mod fixtures {
                 topic_key: None,
                 status: "active",
                 cause: None,
-                deleted: false,
+                superseded_by: None,
+                created_at: at(id),
+                deleted_at: None,
             }
         }
 
@@ -745,14 +766,29 @@ pub(crate) mod fixtures {
                 "scope": if self.agent.is_some() { "agent" } else { "global" },
                 "agent_id": self.agent, "project_id": self.project,
                 "content": self.content, "memory_type": self.memory_type, "source": "explicit",
-                "created_at": 1_750_000_000_000_i64 + self.id * 1000, "created_by_type": "agent",
+                "created_at": self.created_at, "created_by_type": "agent",
                 "created_by_ref": "test", "last_modified_at": 0, "last_accessed_at": 0,
                 "importance": 5.0, "tier": 1, "status": self.status, "supersede_cause": self.cause,
-                "deleted_at": if self.deleted { json!(1_760_000_000_000_i64) } else { json!(null) },
+                "superseded_by": self.superseded_by,
+                "deleted_at": self.deleted_at,
                 "topic_key": self.topic_key,
             })
             .to_string()
         }
+    }
+
+    /// A pair of the detector's, as an export writes it.
+    pub fn conflict(new_id: i64, old_id: i64, distance: Option<f64>, warned: bool) -> String {
+        json!({"kind": "conflict", "new_id": new_id, "old_id": old_id, "distance": distance,
+               "state": "pending", "created_at": at(new_id), "topic_key_warned": warned})
+        .to_string()
+    }
+
+    /// A pair a verdict of `supersedes` settled at `judged_at`.
+    pub fn judged(new_id: i64, old_id: i64, judged_at: i64) -> String {
+        json!({"kind": "conflict", "new_id": new_id, "old_id": old_id, "distance": 0.2,
+               "state": "judged", "verdict": "supersedes", "created_at": at(new_id), "judged_at": judged_at})
+        .to_string()
     }
 
     pub fn piece(save: i64, piece: i64, memory: i64) -> String {
@@ -760,18 +796,28 @@ pub(crate) mod fixtures {
     }
 
     pub fn header(version: u32) -> String {
+        header_filtered(version, json!({"include_deleted": true}))
+    }
+
+    /// A header whose export was limited as `filter` says.
+    pub fn header_filtered(version: u32, filter: serde_json::Value) -> String {
         json!({"kind": "header", "format": "clawg-memories", "version": version, "exported_at": 0,
-               "clawg": "0.0.0", "embedding_model": "test", "filter": {"include_deleted": true}})
+               "clawg": "0.0.0", "embedding_model": "test", "filter": filter})
         .to_string()
     }
 
     /// A fresh working directory, as `clawg export --out` would be told to
     /// make one, holding an export of these rows.
     pub fn work_with(rows: &[Row]) -> (PathBuf, PathBuf) {
+        work_with_lines(&rows.iter().map(Row::line).collect::<Vec<_>>())
+    }
+
+    /// The same for an export of any lines, pairs and pieces included.
+    pub fn work_with_lines(lines: &[String]) -> (PathBuf, PathBuf) {
         let dir = std::env::temp_dir().join(format!("revision-eval-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("export.jsonl");
-        std::fs::write(&path, export(&rows.iter().map(Row::line).collect::<Vec<_>>())).unwrap();
+        std::fs::write(&path, export(lines)).unwrap();
         (dir, path)
     }
 
@@ -790,9 +836,42 @@ pub(crate) mod fixtures {
         ]
     }
 
+    /// The rows of an export in which two saves of the window that starts at
+    /// `at(10)` were warned, one of them then saved under a key, and three
+    /// others were not.
+    pub fn warned_rows() -> Vec<Row> {
+        let mut followed = Row::new(12, "claude-code", "repo", "The nightly backup keeps the last fourteen snapshots.");
+        followed.topic_key = Some("backup/retention");
+        let mut shared = Row::new(15, "claude-code", "repo", "A shared note no agent saved.");
+        (shared.agent, shared.project) = (None, None);
+        vec![
+            Row::new(1, "claude-code", "repo", "Deploys go out on Tuesdays after the freeze."),
+            Row::new(2, "claude-code", "repo", "The nightly backup keeps the last seven snapshots."),
+            Row::new(10, "claude-code", "repo", "Deploys now go out on Thursdays after the freeze."),
+            Row::new(11, "claude-code", "repo", "Logs rotate daily and are shipped to cold storage."),
+            followed,
+            Row::new(13, "claude-code", "repo", "Cache layer: a Redis cluster for sessions."),
+            Row::new(14, "claude-code", "repo", "Cache layer: a Redis cluster for sessions and rate limits."),
+            shared,
+        ]
+    }
+
+    /// Those rows and the pairs of the detector: the warned saves 10 and 12
+    /// against the rows 1 and 2, and an unmarked one.
+    pub fn warned_lines() -> Vec<String> {
+        let mut lines: Vec<String> = warned_rows().iter().map(Row::line).collect();
+        lines.extend([conflict(10, 1, Some(0.21), true), conflict(12, 2, Some(0.33), true), conflict(11, 1, Some(0.4), false)]);
+        lines
+    }
+
     /// The file an export writes: its header and then `lines`.
     pub fn export(lines: &[String]) -> String {
-        let mut text = header(1);
+        export_with(header(1), lines)
+    }
+
+    /// The same under a header of the caller's.
+    pub fn export_with(header: String, lines: &[String]) -> String {
+        let mut text = header;
         for line in lines {
             text.push('\n');
             text.push_str(line);

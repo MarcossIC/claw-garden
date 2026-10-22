@@ -29,6 +29,7 @@ use crate::chains::{
 use crate::cost::{self, CostError, Query, M4};
 use crate::set::ChainSet;
 use crate::store::{self, ReplayFile, Scored, StoreError};
+use crate::warned::{self, PickKind, ReplayRows, WarnedError, WarnedFile};
 
 /// The one agent that saves every arm.
 const AGENT: &str = "revision-eval";
@@ -68,6 +69,8 @@ pub enum RunError {
     Cost(#[from] CostError),
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error(transparent)]
+    Warned(#[from] WarnedError),
     #[error("could not read or write {}: {source}", path.display())]
     Io {
         path: PathBuf,
@@ -83,6 +86,7 @@ impl RunError {
     pub fn is_bad_input(&self) -> bool {
         match self {
             Self::Store(e) => !matches!(e, StoreError::Replay(_)),
+            Self::Warned(e) => !matches!(e, WarnedError::Replay(_)),
             Self::OutsideTemp(..) | Self::Refused(_) => true,
             _ => false,
         }
@@ -93,6 +97,7 @@ impl RunError {
     fn keeps_work(&self) -> bool {
         match self {
             Self::Store(e) => e.keeps_work(),
+            Self::Warned(e) => e.keeps_work(),
             Self::Refused(_) | Self::OutsideTemp(..) => true,
             _ => false,
         }
@@ -499,6 +504,7 @@ async fn remove_scratch(scratch: &Path) {
 
 const LABELS_FILE: &str = "labels.jsonl";
 const REPLAY_FILE: &str = "replay.json";
+const WARNED_FILE: &str = "warned.json";
 const REPLAY_STORE: &str = "replay";
 const WORK_DIR_PREFIX: &str = "revision-eval-";
 
@@ -683,12 +689,23 @@ pub async fn store_score(
 ) -> Result<Scored, RunError> {
     let dir = work_dir(labels)?;
     let scored = read_and_score(&dir, labels, check);
+    settle(&dir, scored, write).await
+}
+
+/// What a second step does with its outcome: a result is written and the
+/// directory removed, whether or not the writing worked; an error removes the
+/// directory too, unless the labelling in it is what needs fixing.
+async fn settle<T>(
+    dir: &Path,
+    scored: Result<T, RunError>,
+    write: impl FnOnce(&T) -> Result<(), RunError>,
+) -> Result<T, RunError> {
     match &scored {
         Err(e) if e.keeps_work() => {}
-        Err(_) => remove_scratch(&dir).await,
+        Err(_) => remove_scratch(dir).await,
         Ok(scored) => {
             let written = write(scored);
-            remove_scratch(&dir).await;
+            remove_scratch(dir).await;
             written?;
         }
     }
@@ -705,6 +722,133 @@ fn read_and_score(
     check(&replay)?;
     let labels = store::parse_labels(&std::fs::read_to_string(labels).map_err(io_error(labels))?)?;
     Ok(store::score(&replay, &labels)?)
+}
+
+/// What the first step of `warned` reports: counts only, never a stored text.
+#[derive(Debug, Serialize)]
+pub struct WarnedSummary {
+    pub counts: warned::WindowCounts,
+    pub labelled_marked: usize,
+    pub labelled_rest: usize,
+    pub window_start_ms: i64,
+    pub seed: u64,
+}
+
+/// The first step of `warned`: reads the window of the export beside it,
+/// leaves `labels.jsonl` and `warned.json` in its directory and removes the
+/// replay store. Any error removes the directory with the export in it.
+pub async fn warned_replay(export: &Path, since_ms: i64, input: &ReplayInput<'_>) -> Result<WarnedSummary, RunError> {
+    let dir = work_dir(export)?;
+    let replayed = warned_replay_in(&dir, export, since_ms, input).await;
+    if replayed.is_err() {
+        remove_scratch(&dir).await;
+    }
+    replayed
+}
+
+async fn warned_replay_in(
+    dir: &Path,
+    export: &Path,
+    since_ms: i64,
+    input: &ReplayInput<'_>,
+) -> Result<WarnedSummary, RunError> {
+    let text = std::fs::read_to_string(export).map_err(io_error(export))?;
+    let selection = warned::select(&text, since_ms, input.seed)?;
+    drop(text);
+
+    let store_dir = dir.join(REPLAY_STORE);
+    std::fs::create_dir_all(&store_dir).map_err(|source| RunError::Scratch { path: store_dir.clone(), source })?;
+    let ingest = EvalIngest::open(&store_dir, input.embedder, input.tokenizer_dir).await?;
+    // Every save with an agent, in the order they were made: the rest is
+    // paired by the distances between the rows these leave.
+    let mut reports = Vec::with_capacity(selection.flow.len());
+    for &i in &selection.flow {
+        let save = &selection.saves[i];
+        reports.push(
+            ingest
+                .save(EvalSave {
+                    agent_id: save.agent.as_deref().expect("the flow holds the saves that have an agent"),
+                    project_id: save.project.as_deref(),
+                    content: &save.text,
+                    memory_type: &save.memory_type,
+                    importance: save.importance,
+                    topic_key: save.topic_key.as_deref(),
+                })
+                .await?,
+        );
+    }
+    let runtime = ingest.finish().await?;
+
+    let rows = ReplayRows::new(&selection.flow, &reports);
+    let mut found = Vec::with_capacity(selection.picks.len());
+    for pick in &selection.picks {
+        found.push(match &pick.kind {
+            PickKind::Marked { .. } => None,
+            PickKind::Rest { predecessors } => {
+                let distances = row_distances(&runtime, &rows.reported(pick.later), &rows.inserted(predecessors)).await?;
+                rows.nearest(&distances)
+            }
+        });
+    }
+    // Closing is awaited, as in `release`: Windows cannot delete the files
+    // of a store whose connection has not closed yet.
+    runtime.store.conn.clone().close().await.map_err(|e| RunError::Close(e.to_string()))?;
+    drop(runtime);
+    remove_scratch(&store_dir).await;
+
+    let labels = warned::build_labels(&selection, &found);
+    let mut counts = selection.counts.clone();
+    counts.rest_unpaired = labels.unpaired;
+    let file = WarnedFile {
+        export_format: selection.format.clone(),
+        export_version: selection.version,
+        model_contract: input.embedder.model_id().to_string(),
+        seed: input.seed,
+        fake: input.fake,
+        window_start_ms: selection.window_start_ms,
+        counts: counts.clone(),
+        warning_line_tokens: input.counter.count(cost::WARNING_LINE),
+        store_sizes: selection.store_sizes.clone(),
+        pairs: labels.pairs.clone(),
+    };
+    let lines: String =
+        labels.lines.iter().map(|l| serde_json::to_string(l).expect("a label line serializes") + "\n").collect();
+    write_new_file(&dir.join(LABELS_FILE), &lines)?;
+    let file_json = serde_json::to_string_pretty(&file).expect("the warned file serializes");
+    write_new_file(&dir.join(WARNED_FILE), &file_json)?;
+    Ok(WarnedSummary {
+        counts,
+        labelled_marked: labels.pairs.iter().filter(|p| p.marked).count(),
+        labelled_rest: labels.pairs.iter().filter(|p| !p.marked).count(),
+        window_start_ms: selection.window_start_ms,
+        seed: input.seed,
+    })
+}
+
+/// The second step of `warned`: reads the labels beside `labels` and the file
+/// the first step left, scores them, hands the result to `write` and removes
+/// the directory. A labels file the owner has not finished is refused and the
+/// directory stays, since the labelling is in it; every other error removes it.
+pub async fn warned_score(
+    labels: &Path,
+    check: impl FnOnce(&WarnedFile) -> Result<(), RunError>,
+    write: impl FnOnce(&warned::Scored) -> Result<(), RunError>,
+) -> Result<warned::Scored, RunError> {
+    let dir = work_dir(labels)?;
+    let scored = read_and_score_warned(&dir, labels, check);
+    settle(&dir, scored, write).await
+}
+
+fn read_and_score_warned(
+    dir: &Path,
+    labels: &Path,
+    check: impl FnOnce(&WarnedFile) -> Result<(), RunError>,
+) -> Result<warned::Scored, RunError> {
+    let path = dir.join(WARNED_FILE);
+    let file = warned::parse_warned(&std::fs::read_to_string(&path).map_err(io_error(&path))?)?;
+    check(&file)?;
+    let labels = warned::parse_labels(&std::fs::read_to_string(labels).map_err(io_error(labels))?)?;
+    Ok(warned::score(&file, &labels)?)
 }
 
 #[cfg(test)]
@@ -1037,6 +1181,160 @@ mod tests {
         std::fs::remove_dir_all(&outside).unwrap();
         std::fs::remove_file(&loose).unwrap();
         remove_scratch(&inside).await;
+    }
+
+    use crate::store::fixtures::{at, header_filtered, warned_lines, work_with_lines};
+
+    async fn fake_warned(export: &Path, since: i64, seed: u64) -> Result<WarnedSummary, RunError> {
+        let embedder = EvalEmbedder::fake();
+        let counter = EvalTokenCounter::fake();
+        let no_tokenizer = scratch_dir();
+        warned_replay(export, since, &ReplayInput { embedder: &embedder, tokenizer_dir: &no_tokenizer, counter: &counter, seed, fake: true }).await
+    }
+
+    #[tokio::test]
+    async fn a_fake_warned_run_counts_and_labels_the_marked_pairs_and_the_rest_of_a_small_export() {
+        let (dir, export) = work_with_lines(&warned_lines());
+
+        let summary = fake_warned(&export, at(10), warned::DEFAULT_SEED).await.expect("the replay must succeed");
+
+        let c = &summary.counts;
+        assert_eq!((c.rows, c.saves, c.window_saves, c.window_saves_with_agent), (8, 8, 6, 5));
+        assert_eq!((c.marked, c.rest, c.rest_chosen, c.rest_unpaired), (2, 3, 3, 0));
+        assert_eq!((summary.labelled_marked, summary.labelled_rest, summary.window_start_ms), (2, 3, at(10)));
+
+        let labels = warned::parse_labels(&std::fs::read_to_string(dir.join(LABELS_FILE)).unwrap()).unwrap();
+        let file = warned::parse_warned(&std::fs::read_to_string(dir.join(WARNED_FILE)).unwrap()).unwrap();
+        assert_eq!((labels.len(), file.pairs.len()), (5, 5));
+        assert!(labels.iter().all(|l| l.a.is_none() && l.b.is_none() && l.c.is_none()));
+        assert!(file.fake && file.warning_line_tokens > 0 && file.model_contract == EvalEmbedder::fake().model_id());
+        assert_eq!((file.window_start_ms, file.store_sizes.len()), (at(10), 5));
+        assert_eq!(file.pairs.iter().filter(|p| p.marked).count(), 2);
+        let pair_of = |later: &str| {
+            let line = labels.iter().find(|l| l.later.starts_with(later)).expect("the pair is labelled");
+            (line.earlier.clone(), file.pairs[line.n - 1].clone())
+        };
+        let (earlier, thursdays) = pair_of("Deploys now go out on Thursdays");
+        assert_eq!(earlier, "Deploys go out on Tuesdays after the freeze.");
+        assert!(thursdays.marked && thursdays.actions == Some(warned::Actions::default()));
+        let (earlier, fourteen) = pair_of("The nightly backup keeps the last fourteen");
+        assert_eq!(earlier, "The nightly backup keeps the last seven snapshots.");
+        assert!(fourteen.marked && fourteen.actions.is_some_and(|a| a.followed && !a.hid && !a.reused));
+        assert!(!dir.join(REPLAY_STORE).exists(), "the replay store is removed at the end of the first step");
+        assert!(export.exists());
+        remove_scratch(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn the_same_seed_labels_the_same_pairs_in_the_same_order() {
+        let (dir_a, export_a) = work_with_lines(&warned_lines());
+        let (dir_b, export_b) = work_with_lines(&warned_lines());
+        fake_warned(&export_a, at(10), 3).await.unwrap();
+        fake_warned(&export_b, at(10), 3).await.unwrap();
+
+        let read = |dir: &Path| std::fs::read_to_string(dir.join(LABELS_FILE)).unwrap();
+
+        assert_eq!(read(&dir_a), read(&dir_b));
+        remove_scratch(&dir_a).await;
+        remove_scratch(&dir_b).await;
+    }
+
+    #[tokio::test]
+    async fn an_export_the_first_step_refuses_is_removed_with_its_directory() {
+        let lines = warned_lines();
+
+        // Made without the deleted rows.
+        let (dir, export) = work_with_lines(&lines);
+        let text = std::fs::read_to_string(&export).unwrap().replacen("\"include_deleted\":true", "\"include_deleted\":false", 1);
+        std::fs::write(&export, text).unwrap();
+        let error = fake_warned(&export, at(10), 1).await.unwrap_err();
+        assert!(matches!(error, RunError::Warned(WarnedError::WithoutDeleted)), "{error}");
+        assert!(error.is_bad_input());
+        assert!(!dir.exists(), "a failed first step removes the directory with the export in it");
+
+        // Limited to a project.
+        let (dir, export) = work_with_lines(&lines);
+        let filtered = crate::store::fixtures::export_with(header_filtered(1, serde_json::json!({"include_deleted": true, "project": "repo-1"})), &lines);
+        std::fs::write(&export, filtered).unwrap();
+        let error = fake_warned(&export, at(10), 1).await.unwrap_err();
+        assert!(matches!(error, RunError::Warned(WarnedError::Filtered(_))), "{error}");
+        assert!(!dir.exists());
+
+        // Outside a work directory: refused, and left alone.
+        let (inside, _) = work_with_lines(&[]);
+        let loose = inside.parent().unwrap().join(format!("loose-{}.jsonl", uuid::Uuid::new_v4()));
+        std::fs::write(&loose, "kept").unwrap();
+        let error = fake_warned(&loose, at(10), 1).await.unwrap_err();
+        assert!(matches!(error, RunError::Refused(_)), "{error}");
+        assert!(loose.exists() && inside.exists());
+        std::fs::remove_file(&loose).unwrap();
+        remove_scratch(&inside).await;
+    }
+
+    /// Fills every pass of the labels file with `label`.
+    fn fill(dir: &Path, label: &str) {
+        let path = dir.join(LABELS_FILE);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let filled = ["a", "b"].iter().fold(text, |text, pass| text.replace(&format!("\"{pass}\":null"), &format!("\"{pass}\":\"{label}\"")));
+        std::fs::write(path, filled).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_second_step_scores_the_labels_and_removes_the_directory() {
+        let (dir, export) = work_with_lines(&warned_lines());
+        fake_warned(&export, at(10), 1).await.unwrap();
+        fill(&dir, "revision");
+        let mut seen: Option<bool> = None;
+
+        let scored = warned_score(
+            &dir.join(LABELS_FILE),
+            |file: &WarnedFile| {
+                seen = Some(file.fake);
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .await
+        .expect("the labels score");
+
+        assert_eq!(seen, Some(true));
+        assert_eq!((scored.labelled.marked, scored.labelled.rest), (2, 3));
+        assert_eq!((scored.precision.k, scored.precision.n), (2, 2));
+        assert!(!dir.exists(), "the directory goes once the result is out");
+    }
+
+    #[tokio::test]
+    async fn a_labels_file_the_owner_has_not_finished_keeps_the_directory_of_the_second_step() {
+        let (dir, export) = work_with_lines(&warned_lines());
+        fake_warned(&export, at(10), 1).await.unwrap();
+
+        let error = warned_score(&dir.join(LABELS_FILE), |_| Ok(()), |_| Ok(())).await.unwrap_err();
+
+        assert!(matches!(error, RunError::Warned(WarnedError::EmptyLabel { n: 1, field: "a" })), "{error}");
+        assert!(error.is_bad_input());
+        assert!(dir.join(LABELS_FILE).exists() && dir.join(WARNED_FILE).exists());
+        let refused = warned_score(&dir.join(LABELS_FILE), |_| Err(RunError::Refused("taken".into())), |_| Ok(())).await;
+        assert!(matches!(refused, Err(RunError::Refused(_))));
+        assert!(dir.exists(), "a refusal before scoring leaves the labelling alone");
+        remove_scratch(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn the_second_step_removes_the_directory_when_the_replay_file_or_the_result_fails() {
+        let (dir, export) = work_with_lines(&warned_lines());
+        fake_warned(&export, at(10), 1).await.unwrap();
+        std::fs::write(dir.join(WARNED_FILE), "{").unwrap();
+        let error = warned_score(&dir.join(LABELS_FILE), |_| Ok(()), |_| Ok(())).await.unwrap_err();
+        assert!(matches!(error, RunError::Warned(WarnedError::Replay(_))), "{error}");
+        assert!(!error.is_bad_input(), "the owner did not write that file");
+        assert!(!dir.exists());
+
+        let (dir, export) = work_with_lines(&warned_lines());
+        fake_warned(&export, at(10), 1).await.unwrap();
+        fill(&dir, "other");
+        let refused = warned_score(&dir.join(LABELS_FILE), |_| Ok(()), |_| Err(RunError::Refused("no".into()))).await;
+        assert!(refused.is_err());
+        assert!(!dir.exists(), "the directory goes whether or not the result is written");
     }
 
     #[test]
