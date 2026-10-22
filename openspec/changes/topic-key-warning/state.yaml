@@ -1,14 +1,14 @@
 change: topic-key-warning
 objective: "1"
 depends_on: [revision-eval]
-phase: apply
+phase: verify
 artifacts:
   exploration: skipped  # el problema y la medición están en revision-eval (48) y revision-recheck (70)
   proposal: done
   spec: done
   design: skipped  # ninguna decisión de arquitectura más allá de la propuesta
   tasks: done
-  apply: pending  # R1-R3 hechos; falta la marca del disparo (R4)
+  apply: done  # R1-R4
   verify: pending  # pide casos reales de un clawg con la marca, etiquetados con el protocolo de la propuesta
   archive: pending
 main_spec: openspec/specs/mcp/spec.md

@@ -786,7 +786,7 @@ Sobre el cambio tal como se mezcló (`e041ee6`), el flujo de las specs daba 23,4
   - El aviso dispara en 154 de los 220 saves sin clave de un tipo que afirma, y 76 de ellos son revisiones (49,4 %, 41,6–57,2 %).
   - La prevalencia es del 38,1 %, con cota inferior de 36,2 %, y el aviso cuesta 13,19 tokens de media por save.
   - Las etiquetas son del dueño del store en 5 de los 204 pares, y de un agente en los demás. Con una lectura estricta de la regla, el agente dio 32 revisiones en vez de 80.
-  - El veredicto del aviso es provisional hasta que revision-recheck (70) fije el criterio de revisión y el protocolo de etiquetas, y se vuelva a medir.
+  - El veredicto del aviso es provisional hasta que se compruebe en casos reales con el criterio de la propuesta de topic-key-warning (68), fijado en revision-recheck (70) antes de etiquetar. Se mide sobre los pares que el producto marca al disparar (`memory_conflict.topic_key_warned`), porque un save que siguió el aviso ya no se distingue en el export de uno que nació con clave. El umbral es relativo a la prevalencia (razón de verosimilitud positiva ≥ 2), con tres salidas sobre la cota de Wilson y hasta 200 pares marcados.
 
 ## Invariantes
 

@@ -1,15 +1,15 @@
 change: revision-recheck
 objective: "1"
 depends_on: [revision-eval]
-phase: apply
+phase: archived
 artifacts:
   exploration: skipped  # los hallazgos están en tasks.md
   proposal: skipped
   spec: skipped
   design: skipped
   tasks: done
-  apply: pending
-  verify: pending
-  archive: pending
+  apply: done
+  verify: skipped  # sin spec propia; lo medido está en tasks.md y en openspec/specs/eval/spec.md, y la suite y el clippy pasaron al archivar
+  archive: done
 main_spec: openspec/specs/eval/spec.md
 updated: 2026-10-22

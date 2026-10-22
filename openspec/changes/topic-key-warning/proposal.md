@@ -14,7 +14,7 @@ Sale de la medición de 48 y de lo que revisó 70; no tiene exploración propia.
 
 ## Lo que midió 48
 
-En el export de `prod` el aviso dispara en 154 de 397 saves, el 49,4 % de ellos son revisiones, y cuesta 34 tokens donde aparece y 13,19 de media por save. Pasa sus umbrales con una salvedad: 199 de las 204 etiquetas son de un agente, bajo la lectura amplia de la regla; con la estricta la precisión sería a lo sumo 20,8 %. Por eso el aviso es **provisional** hasta que su criterio se compruebe en casos reales con el protocolo de abajo ([revision-recheck](../revision-recheck/tasks.md#decisión-sobre-el-aviso-68)).
+En el export de `prod` el aviso dispara en 154 de 397 saves, el 49,4 % de ellos son revisiones, y cuesta 34 tokens donde aparece y 13,19 de media por save. Pasa sus umbrales con una salvedad: 199 de las 204 etiquetas son de un agente, bajo la lectura amplia de la regla; con la estricta la precisión sería a lo sumo 20,8 %. Por eso el aviso es **provisional** hasta que su criterio se compruebe en casos reales con el protocolo de abajo ([revision-recheck](../archive/2026-10-22-revision-recheck/tasks.md#decisión-sobre-el-aviso-68)).
 
 ## Decisiones
 
@@ -28,7 +28,7 @@ En el export de `prod` el aviso dispara en 154 de 397 saves, el 49,4 % de ellos 
 
 ## Criterio fijado antes de medir
 
-Lo pide la tarea 3 de [revision-recheck](../revision-recheck/tasks.md#3-el-criterio-del-aviso-para-68-antes-de-implementarlo) y queda fijado acá, antes de ver ningún caso real. Es el único lugar donde está escrito; [Cómo cambió el criterio](#cómo-cambió-el-criterio) dice qué reemplazó y por qué.
+Lo pide la tarea 3 de [revision-recheck](../archive/2026-10-22-revision-recheck/tasks.md#3-el-criterio-del-aviso-para-68-antes-de-implementarlo) y queda fijado acá, antes de ver ningún caso real. Es el único lugar donde está escrito; [Cómo cambió el criterio](#cómo-cambió-el-criterio) dice qué reemplazó y por qué.
 
 - **Qué es una revisión.** El save posterior revisa al anterior si, guardado el posterior, ocultar al anterior (que es lo que haría la clave) no pierde nada que siga siendo cierto y que el posterior no diga. Sale del mecanismo, no de la lectura de nadie: no hace falta que los dos tengan el mismo titular ni que el posterior contradiga al anterior. Es también la condición en que `supersedes` sobre la fila nombrada es correcto.
 - **Protocolo de etiquetas.** Dos pasadas de LLM ciegas e independientes sobre los mismos pares, cada una con la definición de arriba y sin ejemplos etiquetados, sin saber si el aviso disparó. Se informa su acuerdo como kappa de Cohen con su intervalo. Los desacuerdos los resuelve una tercera pasada, también ciega. No hay pasada contra el dueño del store.

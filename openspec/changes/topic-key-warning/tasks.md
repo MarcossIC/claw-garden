@@ -14,7 +14,7 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 
 ## 3. Docs
 
-- [x] `.claude/CLAUDE.md`, el mapa de `openspec/README.md` y la tarea 3 de [revision-recheck](../revision-recheck/tasks.md), cuyo criterio, protocolo y umbral fija la [propuesta](proposal.md#criterio-fijado-antes-de-medir).
+- [x] `.claude/CLAUDE.md`, el mapa de `openspec/README.md` y la tarea 3 de [revision-recheck](../archive/2026-10-22-revision-recheck/tasks.md), cuyo criterio, protocolo y umbral fija la [propuesta](proposal.md#criterio-fijado-antes-de-medir).
 
 ## 4. La marca del disparo (R4)
 
