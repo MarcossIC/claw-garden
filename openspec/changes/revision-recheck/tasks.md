@@ -18,6 +18,8 @@ Revisa lo que dejó [revision-eval](../archive/2026-10-21-revision-eval/verify.m
 
 El veredicto de 48 no cambia: «pasa con salvedad», que es lo menos extremo. Queda **provisional**: 68 no se cierra hasta que su criterio se compruebe con el protocolo de la tarea 3 y en casos reales, y esos casos tienen que poder recuperarse para volver a juzgarlos.
 
+El mismo día, antes de etiquetar un solo caso, cambió cómo se comprueba. El umbral no es el 40 % de la propuesta de 68 ni la precisión de equilibrio de la tarea 3: es un umbral relativo a la prevalencia, con tres salidas. Se mide sobre pares que el producto marca al disparar, porque sin marca un export sólo deja ver los avisos que el agente ignoró. El criterio y por qué cambió están en la [propuesta de 68](../topic-key-warning/proposal.md#cómo-cambió-el-criterio), el único lugar donde está escrito.
+
 ## 1. La causa de M2 (decide 69)
 
 - [x] Test en `eval_api.rs` con el embedder falso (`dropping_the_superseded_vectors_leaves_every_live_row_its_own`): después de quitar los vectores de las filas `superseded`, ninguna de ellas tiene vector, las vivas conservan el suyo y la función cuenta lo que quitó.
@@ -66,21 +68,26 @@ El veredicto de 48 no cambia: «pasa con salvedad», que es lo menos extremo. Qu
 
 ## 3. El criterio del aviso (para 68, antes de implementarlo)
 
-Los tres primeros puntos quedaron aprobados el 2026-10-22, antes de volver a etiquetar un solo par.
+Los tres primeros puntos quedaron aprobados el 2026-10-22, antes de volver a etiquetar un solo par. El tercero se reemplazó ese mismo día, también antes de etiquetar.
 
 - [x] Definición de revisión escrita antes de ver un par, sacada del mecanismo y no del juicio de nadie: el posterior revisa al anterior si, guardado el posterior, ocultar al anterior (que es lo que haría la clave) no pierde nada que siga siendo cierto y que el posterior no diga.
 - [x] Protocolo de etiquetas: dos pasadas ciegas e independientes de LLM sobre los mismos pares, de dos modelos distintos que se fijan antes de ver un par. Su acuerdo se informa como kappa de Cohen con intervalo. Los desacuerdos los resuelve una tercera pasada. No hay pasada contra el dueño del store.
-- [x] El umbral de precisión con una base: la **precisión de equilibrio** `p* = W / (s · T · A)`. El aviso vale si su precisión entre los saves en que dispara es al menos `p*`. Se fija la fórmula y de dónde sale cada insumo; los insumos se miden y el umbral se calcula, no se elige.
-  - `W`: tokens de la línea de aviso donde aparece (`m4.warning_line_tokens`, hoy 34).
-  - `s`: fracción de las transiciones del brazo sin clave en que la versión vieja aparece en `search_memory` o en `recall_context` para la consulta de su tema (posiciones de `no_key` en `chains`).
-  - `T`: tokens medios de un hit en esas salidas.
-  - `A`: accesos medios de una fila viva en el store real (`access_count` del export), una cota baja de cuántas veces se recupera una memoria en su vida.
+- [x] El umbral de precisión con una base: **relativo a la prevalencia**, con tres salidas. El criterio completo está en la [propuesta de 68](../topic-key-warning/proposal.md#criterio-fijado-antes-de-medir).
+  - El aviso vale si su razón de verosimilitud positiva es al menos 2, es decir, si su precisión llega a `p_min = 2π / (1 + π)`, con π la prevalencia medida con la misma definición. Se decide con la cota de Wilson: se queda, se ajusta o se quita, o se juntan casos hasta un máximo fijado antes. Antes de quitarlo o ajustarlo se mira la precisión por distancia.
+  - Primero se aprobó la **precisión de equilibrio** `p* = W / (s · T · A)`: `W` los tokens de la línea, `s` la fracción de transiciones sin clave en que la versión vieja aparece, `T` los tokens de un hit y `A` los accesos medios de una fila viva. Se reemplazó porque su beneficio no corresponde al mecanismo: seguir el aviso no oculta la fila nombrada, sólo deja la clave para la próxima versión del tema.
+  - Tampoco vale el 40 % que la propuesta de 68 había escrito en paralelo. Con la prevalencia de 48 (38,1 %), un aviso que dispara siempre casi lo pasa, así que no prueba que el detector discrimine. La divergencia entre los dos documentos queda resuelta: el criterio vive sólo en la propuesta de 68.
   - Siguen los topes de tokens de 48 (como mucho 40 donde aparece y 15 de media por save) y la prevalencia (al menos 10 % de revisiones, con cota inferior de Wilson ≥ 5 %), que no dependen de la lectura de la regla.
-  - Divergencia abierta: la [propuesta de 68](../topic-key-warning/proposal.md#criterio-fijado-antes-de-medir), escrita en paralelo, fija la misma definición y el mismo protocolo, pero deja el umbral en el 40 % con una base de costo. Falta decidir cuál vale antes de medir, y escribirlo en los dos documentos.
 - [x] La precisión y la tasa de disparo, también por tamaño del store en el momento de cada save. Pasa a 68, que la tiene en su tarea de casos reales. La reproducción ya va en orden de `(created_at, id)`, así que no cuesta otra corrida.
 - [x] Casos reales: comprobar en un export que los saves en que dispararía el aviso se reconocen sin una marca nueva. Un save así es un save sin clave, de un tipo que afirma, con una línea `conflict` hacia una fila de su agente y proyecto. Si se reconocen, 68 no agrega marca y `revision-eval store` gana un modo que lista sólo esos pares para volver a juzgarlos. Si no, 68 agrega la marca.
-  - **Se reconocen, comprobado en el código.** `related` son los candidatos de cada pieza insertada, que se escriben como pares en el mismo insert. Una pieza absorbida por su gemela no deja par ni candidato (`crates/clawg-core/src/memory/worker.rs`, el bucle de `detect_contradiction`). El export lleva lo que hace falta para reconocerlos: agente, proyecto, tipo y clave de cada fila; las líneas `piece`, que agrupan el save; y las líneas `conflict` (`crates/clawg-core/src/memory/portability/format.rs:54-129`).
-  - Vale para los pares que escribió el detector vigente al disparar. Por eso sirve para los casos que vengan después de 68, no para el pasado (D5 de 48). 68 no agrega marca. El modo de `revision-eval store` que los lista va con 68, cuando haya casos.
+  - **Se reconocen sólo los que el agente ignoró.** Primero se dio por comprobado en el código. `related` son los candidatos de cada pieza insertada, que se escriben como pares en el mismo insert, y una pieza absorbida por su gemela no deja par ni candidato (`crates/clawg-core/src/memory/worker.rs`, el bucle de `detect_contradiction`). El export lleva agente, proyecto, tipo y clave de cada fila, y las líneas `piece` y `conflict` (`crates/clawg-core/src/memory/portability/format.rs:54-129`).
+  - Pero seguir el aviso borra lo que identifica al caso:
+    - el save repetido se absorbe en su fila, y `reinforce_in` (`store_insert.rs`) sólo toca `last_accessed_at`, `access_count` y `tier`;
+    - la fila toma la clave sin cambiar `last_modified_at` (`revise_in`, `topic.rs`);
+    - la fila del outbox se borra al terminar (`outbox_finish`).
+
+    El export lleva sólo la clave actual. Ese save queda igual que uno que nació con clave, y la reproducción lo guarda con ella, donde `unkeyed_revision` no nombra nada.
+  - El sesgo va contra el aviso. Con una precisión real de 50 %, si el agente sigue el 80 % de los aciertos y el 10 % de las falsas alarmas, quedan visibles 10 aciertos y 45 falsas alarmas: 18 %. Tampoco se puede medir la tasa con que el agente sigue el aviso.
+  - **68 agrega la marca.** El par que une el save con la fila nombrada queda marcado al terminar el save, y el export y la importación la llevan ([R4 de 68](../topic-key-warning/spec.md#r4-el-par-registra-que-el-aviso-disparó)). Cuentan los casos de un clawg con la marca, no los anteriores (D5 de 48). El modo de `revision-eval store` que los lista lee la marca y va con 68, cuando haya casos.
 
 ## 4. Cierre
 

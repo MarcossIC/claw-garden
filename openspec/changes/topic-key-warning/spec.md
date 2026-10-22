@@ -35,3 +35,28 @@ Cuando la respuesta trae `revision_candidate`, `save_memory` MUST agregar, en un
 - THEN el texto es `saved #57`, la línea `close to earlier memories: #412 "Build tool"…` y, en la última línea, el aviso con `#412`
 
 **Tests:** `an_unkeyed_save_close_to_its_own_row_is_told_to_take_a_key` (`server.rs`); `save_memory_ships_the_warning_line_that_was_measured` (`crates/clawg-eval/src/bin/revision-eval/cost.rs`).
+
+## R4. El par registra que el aviso disparó
+
+Cuando el worker nombra `revision_candidate` para un save, el par de `memory_conflict` que une el save con esa fila MUST quedar marcado (`topic_key_warned`), en la misma transacción que termina el save (`outbox_finish` o `finish_save`). Ningún otro par del save MUST quedar marcado, y un save que falla MUST NOT marcar nada. La marca dice que el detector disparó, no que el agente vio la línea: un save que respondió `202` también la lleva. Una vez escrita, la marca MUST NOT cambiar: no la quitan un veredicto, ni una clave que la fila tome después, ni un borrado. V19 MUST agregar la columna sin marca en los pares que ya existen. El export MUST llevarla en la línea `conflict` (`topic_key_warned`), y la importación MUST conservarla; una línea sin el campo MUST valer sin marca.
+
+#### Escenario: dispara
+- GIVEN dos filas del agente en `p`, una a distancia 0,2 del save y otra a 0,3
+- WHEN el agente guarda sin clave en `p`
+- THEN el par con la de 0,2, que es `revision_candidate`, queda marcado, y el par con la de 0,3 no
+
+#### Escenario: seguir el aviso no borra la marca
+- GIVEN el save de arriba, con su par marcado
+- WHEN el agente guarda el mismo texto bajo `build/tool`
+- THEN la fila del save toma la clave y el par sigue marcado
+- AND el export muestra la fila con `topic_key` `build/tool` y el par con `topic_key_warned`
+
+#### Escenario: con clave
+- GIVEN una fila del agente en `p`
+- WHEN el agente guarda bajo `build/tool` un texto cercano en `p`
+- THEN el par se escribe sin marca
+
+#### Escenario: una línea anterior
+- GIVEN un export cuya línea `conflict` no tiene `topic_key_warned`
+- WHEN se importa
+- THEN el par queda sin marca
