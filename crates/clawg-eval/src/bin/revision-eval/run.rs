@@ -111,6 +111,9 @@ pub struct ChainsInput<'a> {
     /// Counts the tokens of M4; the same tokenizer the chunker loads for
     /// `--real`.
     pub counter: &'a EvalTokenCounter,
+    /// Saved in every arm before anything else, under the arm's agent and
+    /// project: the history of a real store the chains are saved on top of.
+    pub background: Option<&'a store::Background>,
 }
 
 /// A fresh scratch directory path under the system temp dir. Not created.
@@ -156,6 +159,8 @@ struct ArmRun<'a> {
     old_vectors_dropped: usize,
     /// `superseded` rows taken out of `memory_fts` before the queries.
     old_texts_dropped: usize,
+    /// Background saves stored before the distractors.
+    background_saves: usize,
 }
 
 /// How much one arm stored.
@@ -177,6 +182,8 @@ pub struct ArmReport {
     /// `superseded` rows the arm took out of `memory_fts` before its queries;
     /// only the unindexed arm takes any.
     pub old_texts_dropped: usize,
+    /// Background saves the arm stored before its distractors.
+    pub background_saves: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -188,6 +195,8 @@ pub struct ChainsReport {
     pub chains: usize,
     pub transitions: usize,
     pub distractors: usize,
+    /// What the background held, when the run had one.
+    pub background: Option<store::BackgroundCounts>,
     pub arms: BTreeMap<&'static str, ArmReport>,
     pub m1: M1,
     /// The keyed arm against the unindexed one: the same store with the older
@@ -250,6 +259,7 @@ async fn measure(input: &ChainsInput<'_>, scratch: &Path) -> Result<ChainsReport
         chains: input.set.chains.len(),
         transitions: input.set.transitions(),
         distractors: input.distractors.len(),
+        background: input.background.map(|b| b.counts.clone()),
         arms: runs.iter().map(|(arm, run)| (arm.as_str(), arm_report(run))).collect(),
         m1: m1(&run_of(Arm::NoKey).transitions),
         m2: m2(&views(run_of(Arm::Keyed)), &views(run_of(Arm::KeyedUnindexed))),
@@ -265,6 +275,11 @@ async fn measure(input: &ChainsInput<'_>, scratch: &Path) -> Result<ChainsReport
 async fn run_arm<'a>(input: &ChainsInput<'a>, arm: Arm, dir: &Path) -> Result<ArmRun<'a>, RunError> {
     std::fs::create_dir_all(dir).map_err(|source| RunError::Scratch { path: dir.to_path_buf(), source })?;
     let ingest = EvalIngest::open(dir, input.embedder, input.tokenizer_dir).await?;
+    let background = input.background.map_or(&[][..], |b| b.saves.as_slice());
+    for older in background {
+        let topic_key = older.topic_key.as_deref();
+        ingest.save(EvalSave { importance: older.importance, ..save(&older.text, &older.memory_type, topic_key) }).await?;
+    }
     for distractor in input.distractors {
         ingest.save(save(distractor, "semantic_fact", None)).await?;
     }
@@ -299,7 +314,17 @@ async fn run_arm<'a>(input: &ChainsInput<'a>, arm: Arm, dir: &Path) -> Result<Ar
             above: shown[index].above_at(to),
         })
         .collect();
-    Ok(ArmRun { saved, own, listed, shown, transitions, queries, old_vectors_dropped, old_texts_dropped })
+    Ok(ArmRun {
+        saved,
+        own,
+        listed,
+        shown,
+        transitions,
+        queries,
+        old_vectors_dropped,
+        old_texts_dropped,
+        background_saves: background.len(),
+    })
 }
 
 /// Per chain, the versions with a row of their own the router lists live.
@@ -381,6 +406,7 @@ fn arm_report(run: &ArmRun<'_>) -> ArmReport {
         chains_with_one_live_version: live.iter().filter(|&&n| n == 1).count(),
         old_vectors_dropped: run.old_vectors_dropped,
         old_texts_dropped: run.old_texts_dropped,
+        background_saves: run.background_saves,
     }
 }
 
@@ -526,6 +552,26 @@ fn write_new_file(path: &Path, text: &str) -> Result<(), RunError> {
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path).map_err(io_error(path))?;
     file.write_all(text.as_bytes()).map_err(io_error(path))
+}
+
+/// Runs every arm on top of the export at `export`, which must sit in a
+/// `revision-eval-*` directory made directly under the system temp dir, and
+/// then removes that directory and the scratch one, whatever the outcome.
+pub async fn run_with_background(
+    input: &ChainsInput<'_>,
+    scratch: &Path,
+    export: &Path,
+) -> Result<ChainsReport, RunError> {
+    let dir = work_dir(export)?;
+    let measured = async {
+        let text = std::fs::read_to_string(export).map_err(io_error(export))?;
+        let background = store::background(store::read_export(&text)?);
+        drop(text);
+        run(&ChainsInput { background: Some(&background), ..*input }, scratch).await
+    }
+    .await;
+    remove_scratch(&dir).await;
+    measured
 }
 
 /// The first step: replays the export beside it, leaves `labels.jsonl` and
@@ -706,7 +752,7 @@ mod tests {
         let set = tiny_set();
         let scratch = scratch_dir();
         let embedder = EvalEmbedder::fake();
-        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &scratch, counter: &EvalTokenCounter::fake() };
+        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &scratch, counter: &EvalTokenCounter::fake(), background: None };
 
         let run = run_arm(&input, Arm::Keyed, &scratch.join(Arm::Keyed.as_str())).await;
         remove_scratch(&scratch).await;
@@ -739,7 +785,7 @@ mod tests {
         let set = tiny_set();
         let scratch = scratch_dir();
         let embedder = EvalEmbedder::fake();
-        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &scratch, counter: &EvalTokenCounter::fake() };
+        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &scratch, counter: &EvalTokenCounter::fake(), background: None };
 
         let report = run(&input, &scratch).await.expect("the run must succeed");
 
@@ -795,7 +841,7 @@ mod tests {
         let set = tiny_set();
         let scratch = scratch_dir();
         let embedder = EvalEmbedder::fake();
-        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &scratch, counter: &EvalTokenCounter::fake() };
+        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &scratch, counter: &EvalTokenCounter::fake(), background: None };
         let run = run_arm(&input, Arm::Keyed, &scratch.join(Arm::Keyed.as_str())).await;
         remove_scratch(&scratch).await;
         let run = run.expect("the keyed arm must run");
@@ -843,7 +889,7 @@ mod tests {
             .parent()
             .expect("the temp dir has a parent")
             .join(format!("revision-eval-must-not-be-created-{}", std::process::id()));
-        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &outside, counter: &EvalTokenCounter::fake() };
+        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &outside, counter: &EvalTokenCounter::fake(), background: None };
 
         match run(&input, &outside).await {
             Err(RunError::OutsideTemp(path, _)) => assert_eq!(path, outside),
@@ -883,6 +929,45 @@ mod tests {
         assert!(!dir.join(REPLAY_STORE).exists(), "the replay store is removed at the end of the first step");
         assert!(export.exists());
         remove_scratch(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn a_fake_chains_run_stores_the_background_in_every_arm_and_removes_its_export() {
+        let set = tiny_set();
+        let scratch = scratch_dir();
+        let embedder = EvalEmbedder::fake();
+        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &scratch, counter: &EvalTokenCounter::fake(), background: None };
+        let rows = small_export();
+        let (dir, export) = work_with(&rows);
+
+        let report = run_with_background(&input, &scratch, &export).await.expect("the run must succeed");
+
+        assert!(!dir.exists() && !scratch.exists(), "the export's directory and the scratch one are removed");
+        let background = report.background.as_ref().expect("the report says what the background held");
+        assert_eq!((background.saves, background.without_agent, background.gone), (5, 1, 0));
+        assert!(report.arms.values().all(|arm| arm.background_saves == 5), "{:?}", report.arms);
+        assert!(report.m2.one_live_version.met, "a background key never revises a chain: {:?}", report.m2);
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(rows.iter().all(|r| !json.contains(&r.content)), "no background text reaches the result");
+        assert!(!json.contains("cache/layer"), "nor a background key");
+    }
+
+    #[tokio::test]
+    async fn a_background_outside_a_work_dir_is_refused_and_left_alone() {
+        let set = tiny_set();
+        let scratch = scratch_dir();
+        let embedder = EvalEmbedder::fake();
+        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &scratch, counter: &EvalTokenCounter::fake(), background: None };
+        let dir = std::env::temp_dir().join(format!("not-a-work-dir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let export = dir.join("export.jsonl");
+        std::fs::write(&export, "not read").unwrap();
+
+        let error = run_with_background(&input, &scratch, &export).await.unwrap_err();
+
+        assert!(matches!(error, RunError::Refused(_)), "{error}");
+        assert!(export.exists() && !scratch.exists(), "nothing is removed and no store is made");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

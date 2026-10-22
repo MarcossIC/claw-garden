@@ -24,7 +24,7 @@ const EXIT_INPUT_INVALID: i32 = 2;
 const EXIT_MODEL_ABSENT: i32 = 3;
 
 const HELP_TEXT: &str = "\
-revision-eval chains (--real | --fake) [--tag SLUG]
+revision-eval chains (--real | --fake) [--tag SLUG] [--background FILE]
 revision-eval store --export FILE [--seed N] (--real | --fake)
 revision-eval store --labels FILE [--tag SLUG]
 
@@ -34,6 +34,12 @@ revision-eval store --labels FILE [--tag SLUG]
            versions in no index; and only the last version), each after the
            MUST sentences of openspec/specs, and classifies every transition
            of the arm without a key
+             --background  first saves in every arm, under the arm's agent
+                           and project, the live saves of a `clawg export`
+                           file, in the order they were made and with their
+                           keys behind bg/; the export must sit in a
+                           revision-eval-* directory made directly under the
+                           system temp dir, which is removed at the end
   store    measures, on a `clawg export --include-deleted` file, how often a
            save without a key revises an earlier one, in two steps:
              --export  replays the saves through the detector and leaves
@@ -56,7 +62,7 @@ Exit 0 measured, 1 failed, 2 bad input, 3 model not cached.";
 
 #[derive(Debug, Clone, PartialEq)]
 enum Command {
-    Chains { real: bool, tag: Option<String> },
+    Chains { real: bool, tag: Option<String>, background: Option<PathBuf> },
     StoreReplay { export: PathBuf, seed: u64, real: bool },
     StoreScore { labels: PathBuf, tag: Option<String> },
 }
@@ -74,6 +80,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Command>, Str
     let mut tag = None;
     let mut export: Option<PathBuf> = None;
     let mut labels: Option<PathBuf> = None;
+    let mut background: Option<PathBuf> = None;
     let mut seed = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -85,6 +92,9 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Command>, Str
             "--tag" => tag = Some(args.next().filter(|t| is_slug(t)).ok_or("--tag takes a slug of a-z, 0-9 and '-'")?),
             "--export" if store && export.is_none() => export = Some(args.next().ok_or("--export takes a file")?.into()),
             "--labels" if store && labels.is_none() => labels = Some(args.next().ok_or("--labels takes a file")?.into()),
+            "--background" if !store && background.is_none() => {
+                background = Some(args.next().ok_or("--background takes a file")?.into())
+            }
             "--seed" if store && seed.is_none() => {
                 seed = Some(args.next().and_then(|s| s.parse::<u64>().ok()).ok_or("--seed takes a number")?)
             }
@@ -114,7 +124,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Command>, Str
     if tag.is_some() && !real {
         return Err("--tag names a file, and only --real writes one".into());
     }
-    Ok(Some(Command::Chains { real, tag }))
+    Ok(Some(Command::Chains { real, tag, background }))
 }
 
 fn is_slug(text: &str) -> bool {
@@ -204,7 +214,7 @@ async fn main() {
 
 async fn run(args: impl Iterator<Item = String>) -> i32 {
     match parse_args(args) {
-        Ok(Some(Command::Chains { real, tag })) => run_chains(real, tag).await,
+        Ok(Some(Command::Chains { real, tag, background })) => run_chains(real, tag, background.as_deref()).await,
         Ok(Some(Command::StoreReplay { export, seed, real })) => run_store_replay(&export, seed, real).await,
         Ok(Some(Command::StoreScore { labels, tag })) => run_store_score(&labels, tag.as_deref()).await,
         Ok(None) => {
@@ -311,7 +321,7 @@ async fn run_store_score(labels: &Path, tag: Option<&str>) -> i32 {
     }
 }
 
-async fn run_chains(real: bool, tag: Option<String>) -> i32 {
+async fn run_chains(real: bool, tag: Option<String>, background: Option<&Path>) -> i32 {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let path = root.join("data/revision-chains.json");
     let set = match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| set::parse_set(&t)) {
@@ -356,9 +366,14 @@ async fn run_chains(real: bool, tag: Option<String>) -> i32 {
         embedder: &embedder,
         tokenizer_dir: &tokenizer_dir,
         counter: &counter,
+        background: None,
     };
 
-    match run::run(&input, &scratch).await {
+    let measured = match background {
+        Some(export) => run::run_with_background(&input, &scratch, export).await,
+        None => run::run(&input, &scratch).await,
+    };
+    match measured {
         Ok(report) => {
             let json = result_json(&date, &report);
             println!("{json}");
@@ -378,7 +393,7 @@ async fn run_chains(real: bool, tag: Option<String>) -> i32 {
         }
         Err(e) => {
             eprintln!("measurement failed: {e}");
-            EXIT_RUNTIME_FAILURE
+            exit_for(&e)
         }
     }
 }
@@ -393,12 +408,17 @@ mod tests {
 
     #[test]
     fn the_arguments_parse() {
-        assert_eq!(parse_args(args(&["chains", "--fake"])).unwrap(), Some(Command::Chains { real: false, tag: None }));
-        assert_eq!(parse_args(args(&["chains", "--real"])).unwrap(), Some(Command::Chains { real: true, tag: None }));
+        let chains = |real: bool, tag: Option<&str>, background: Option<&str>| {
+            Some(Command::Chains { real, tag: tag.map(Into::into), background: background.map(Into::into) })
+        };
+        assert_eq!(parse_args(args(&["chains", "--fake"])).unwrap(), chains(false, None, None));
+        assert_eq!(parse_args(args(&["chains", "--real"])).unwrap(), chains(true, None, None));
+        assert_eq!(parse_args(args(&["chains", "--tag", "second-run", "--real"])).unwrap(), chains(true, Some("second-run"), None));
         assert_eq!(
-            parse_args(args(&["chains", "--tag", "second-run", "--real"])).unwrap(),
-            Some(Command::Chains { real: true, tag: Some("second-run".into()) })
+            parse_args(args(&["chains", "--real", "--background", "d/export.jsonl"])).unwrap(),
+            chains(true, None, Some("d/export.jsonl"))
         );
+        assert_eq!(parse_args(args(&["chains", "--background", "e", "--fake"])).unwrap(), chains(false, None, Some("e")));
         assert_eq!(parse_args(args(&["--help"])).unwrap(), None);
         assert_eq!(parse_args(args(&["chains", "--help"])).unwrap(), None);
         for bad in [
@@ -410,6 +430,9 @@ mod tests {
             &["chains", "--fake", "--tag", "x"],
             &["chains", "--real", "--tag"],
             &["chains", "--real", "--tag", "Bad Tag"],
+            &["chains", "--real", "--background"],
+            &["chains", "--real", "--background", "a", "--background", "b"],
+            &["store", "--real", "--export", "e", "--background", "b"],
         ] {
             assert!(parse_args(args(bad)).is_err(), "{bad:?}");
         }
@@ -482,6 +505,7 @@ mod tests {
             embedder: &embedder,
             tokenizer_dir: &scratch,
             counter: &counter,
+            background: None,
         };
         let report = run::run(&input, &scratch).await.expect("the fake run must succeed");
 

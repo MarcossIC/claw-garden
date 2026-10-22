@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use clawg_core::eval_api::{is_claim_type, join_pieces, EvalSaved};
 use clawg_core::memory::portability::format::{self, FormatError, MemoryLine, Parsed};
+use clawg_core::memory::topic::validate_topic_key;
 use serde::{Deserialize, Serialize};
 
 use crate::stats::{Rate, SplitMix64};
@@ -140,6 +141,66 @@ pub fn read_export(text: &str) -> Result<Export, StoreError> {
         });
     }
     Ok(Export { format: header.format, version: header.version, flow, counts })
+}
+
+/// What the key of a background save is stored behind, so that no background
+/// save revises a version of the chain set, whose keys never sit behind it.
+pub const BACKGROUND_KEY_PREFIX: &str = "bg/";
+
+/// The saves `chains --background` stores before the chain set, and what was
+/// left out of them.
+pub struct Background {
+    pub saves: Vec<Save>,
+    pub counts: BackgroundCounts,
+}
+
+/// What a background held: counts only, never a stored text or a key.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BackgroundCounts {
+    pub export_format: String,
+    pub export_version: u32,
+    pub rows: usize,
+    /// Saves stored before the chain set.
+    pub saves: usize,
+    /// Saves of rows no agent saved, which a replay does not send.
+    pub without_agent: usize,
+    /// Saves deleted, or replaced by a verdict, in the store: a replay cannot
+    /// leave them so, and would store them live.
+    pub gone: usize,
+    /// Keys the prefix does not fit: their saves are stored without one.
+    pub keys_dropped: usize,
+}
+
+/// The saves of `export` a replay leaves as the store had them, in the order
+/// they were made, each key behind [`BACKGROUND_KEY_PREFIX`].
+pub fn background(export: Export) -> Background {
+    let mut counts = BackgroundCounts {
+        export_format: export.format,
+        export_version: export.version,
+        rows: export.counts.rows,
+        saves: 0,
+        without_agent: export.counts.without_agent,
+        gone: 0,
+        keys_dropped: 0,
+    };
+    let mut saves = Vec::new();
+    for mut save in export.flow {
+        if save.gone {
+            counts.gone += 1;
+            continue;
+        }
+        if let Some(key) = save.topic_key.take() {
+            let behind = format!("{BACKGROUND_KEY_PREFIX}{key}");
+            if validate_topic_key(&behind).is_ok() {
+                save.topic_key = Some(behind);
+            } else {
+                counts.keys_dropped += 1;
+            }
+        }
+        saves.push(save);
+    }
+    counts.saves = saves.len();
+    Background { saves, counts }
 }
 
 /// Each save's first row and its text. A save of several pieces is joined as
@@ -766,6 +827,48 @@ mod tests {
             related: related.iter().map(|&id| EvalCandidate { id, distance: 0.3, escalated: false }).collect(),
             replaced: replaced.to_vec(),
         }
+    }
+
+    /// Long enough that the background's prefix pushes it past what a key may
+    /// hold.
+    const KEY_WITHOUT_ROOM: &str = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyza";
+
+    #[test]
+    fn the_background_keeps_the_saves_a_replay_leaves_live_with_their_keys_behind_the_prefix() {
+        let mut gone = Row::new(7, "claude-code", "repo", "Replaced by a verdict.");
+        (gone.status, gone.cause) = ("superseded", Some("verdict"));
+        let mut no_room = Row::new(8, "claude-code", "other", "A key with no room for the prefix.");
+        no_room.topic_key = Some(KEY_WITHOUT_ROOM);
+        let mut rows = small_export();
+        rows.extend([gone, no_room]);
+        let export = read_export(&export(&rows.iter().map(Row::line).collect::<Vec<_>>())).unwrap();
+
+        let background = background(export);
+
+        let texts: Vec<&str> = background.saves.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "Deploys go out on Tuesdays after the freeze.",
+                "The nightly backup keeps the last seven snapshots.",
+                "Logs rotate daily and are shipped to cold storage.",
+                "The nightly backup keeps the last seven snapshots.",
+                "Cache layer: a Redis cluster for sessions.",
+                "A key with no room for the prefix.",
+            ]
+        );
+        assert_eq!(background.saves[4].topic_key.as_deref(), Some("bg/cache/layer"));
+        assert_eq!(background.saves[5].topic_key, None, "a key the prefix does not fit is dropped");
+        let counts = &background.counts;
+        assert_eq!((counts.saves, counts.gone, counts.without_agent, counts.keys_dropped), (6, 1, 1, 1));
+        assert_eq!((counts.export_format.as_str(), counts.export_version, counts.rows), ("clawg-memories", 1, 8));
+    }
+
+    #[test]
+    fn no_key_of_the_shipped_chain_set_sits_behind_the_background_prefix() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let set = crate::set::parse_set(&std::fs::read_to_string(root.join("data/revision-chains.json")).unwrap()).unwrap();
+        assert!(set.chains.iter().all(|c| !c.topic_key.starts_with(BACKGROUND_KEY_PREFIX)));
     }
 
     #[test]
