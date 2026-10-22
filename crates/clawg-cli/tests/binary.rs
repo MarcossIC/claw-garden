@@ -928,6 +928,27 @@ async fn a_bridge_starts_its_daemon_through_the_binary() {
     assert!(state.get("port").is_none(), "{state}");
 }
 
+#[tokio::test]
+async fn an_autostart_rotates_a_full_serve_log() {
+    let sandbox = Sandbox::new();
+    let _stop = StopOnDrop { home: sandbox.home.clone() };
+    let logs = sandbox.data_dir().join("logs");
+    std::fs::create_dir_all(&logs).expect("logs dir");
+    let full = vec![b'x'; clawg_cli::serve_log::SERVE_LOG_LIMIT as usize + 1];
+    std::fs::write(logs.join("serve.log"), &full).expect("full log");
+    let mut bridge = sandbox.bridge_starting_its_daemon();
+
+    bridge.initialize();
+    let status = bridge.call(2, "memory_status", json!({}));
+
+    assert!(!tool_failed(&status), "{status}");
+    assert_eq!(std::fs::read(logs.join("serve.log.1")).expect("the old log moved aside"), full);
+    let log = std::fs::read_to_string(logs.join("serve.log")).expect("a new log");
+    let first = log.lines().next().unwrap_or_default();
+    let opening: String = first.chars().take(200).collect();
+    assert!(first.contains(&format!("clawg serve {} starting", env!("CARGO_PKG_VERSION"))), "{opening}");
+}
+
 // ── MCP over real stdio ────────────────────────────────────────────────────
 
 #[tokio::test]

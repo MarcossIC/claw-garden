@@ -1278,14 +1278,12 @@ pub fn spawn_serve_at(
 
     // Both streams go to one appended log file. Appending, not truncating:
     // a daemon that died is exactly when the previous run's tail matters.
+    // Only a log past its limit is moved aside, whole.
     let log_dir = base_dir.join("logs");
     ensure_private_dir(&log_dir)
         .map_err(|e| ClientError::Spawn(format!("cannot create {}: {e}", log_dir.display())))?;
     let log_path = log_dir.join("serve.log");
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
+    let log = crate::serve_log::open(&log_path)
         .map_err(|e| ClientError::Spawn(format!("cannot open {}: {e}", log_path.display())))?;
     let log_err = log
         .try_clone()
