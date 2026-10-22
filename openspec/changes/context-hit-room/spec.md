@@ -34,8 +34,10 @@ El workspace MUST NOT cortarse, como hoy. Un texto que entra entero MUST quedar 
 En el paso 1, un hit que queda solo en su bloque MUST acortarse sólo en lo que los hits pasan de la reserva (o en lo que el texto pasa del presupuesto, si es menos), con la marca ` [truncated]` de 23, y MUST NOT quitarse en ese paso. Lo que siga sobrando lo cortan los pasos 2 a 4.
 
 #### Escenario: un hit largo y relevante
-- GIVEN un hit de 5.000 bytes y un resumen de LAST SESSION de 1.000, y un presupuesto de 4.000 con reserva de 1.000
-- THEN el hit queda acortado a lo sumo a la reserva y LAST SESSION queda entero
+- GIVEN un hit de 5.000 bytes solo en RECENT, un resumen de LAST SESSION de 1.000 y una reserva de 1.000
+- WHEN el presupuesto es de 2.000
+- THEN el hit queda acortado hasta la reserva y después se acorta el resumen
+- AND con un presupuesto de 4.000 el resumen queda entero y el hit se acorta sólo en lo que sobra
 
 **Test:** `a_lone_hit_over_its_room_is_shortened_to_it` (`prompt_builder.rs`).
 
