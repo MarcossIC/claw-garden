@@ -3278,3 +3278,31 @@ async fn import_answers_400_for_an_unknown_version_before_the_embedder() {
     let (status, body) = h.post_json("/v1/import", json!({ "text": export_file(1), "agent": "  " })).await;
     assert_eq!(status, 400, "{body}");
 }
+
+#[tokio::test]
+async fn an_unkeyed_save_names_the_row_a_key_would_revise() {
+    let vectors = vec![
+        ("builds with cargo", at_cosine(1.0, 1)),
+        ("builds with make", at_cosine(0.96, 2)),
+        ("builds with ninja", at_cosine(0.96, 3)),
+    ];
+    let h = Harness::start_inner(EmbedderState::Fixed(vectors)).await;
+    let save = |content: &str, key: Option<&str>| {
+        let mut body = json!({ "content": content, "agent_id": "a", "project_id": "p", "memory_type": "semantic_fact" });
+        if let Some(key) = key {
+            body["topic_key"] = json!(key);
+        }
+        body
+    };
+    let older = save_id(&h, save("the project builds with cargo", None)).await;
+
+    let (status, unkeyed) = h.post_json("/v1/memories", save("the project builds with make", None)).await;
+    assert_eq!(status, 201, "{unkeyed}");
+    assert_eq!(unkeyed["related"][0]["id"], older, "{unkeyed}");
+    assert_eq!(unkeyed["revision_candidate"], older, "{unkeyed}");
+
+    let (status, keyed) = h.post_json("/v1/memories", save("the project builds with ninja", Some("build/tool"))).await;
+    assert_eq!(status, 201, "{keyed}");
+    assert!(keyed["related"].as_array().is_some_and(|r| !r.is_empty()), "{keyed}");
+    assert!(keyed.get("revision_candidate").is_none(), "a key already revises: {keyed}");
+}

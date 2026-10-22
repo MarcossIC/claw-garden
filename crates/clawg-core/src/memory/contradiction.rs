@@ -81,6 +81,10 @@ pub struct Candidate {
     pub escalated: bool,
     /// The first line of the candidate, cut to [`EXCERPT_CHARS`].
     pub excerpt: String,
+    /// Saved in the new row's own project, or like it in none: a row a
+    /// `topic_key` of the new save could revise. The detector also reaches
+    /// rows without a project and preferences of other projects.
+    pub same_scope: bool,
 }
 
 /// The save a candidate belongs to: the `memory_piece` save of a piece, the
@@ -218,7 +222,8 @@ pub(crate) async fn detect_contradiction(
         .filter_map(|h| {
             let old_type = MemoryType::from_db_str(&h.memory_type).filter(|t| t.is_claim_bearing())?;
             let escalated = needs_user(candidate_type, old_type, Some(h.distance), shares_identifier(text, &h.content));
-            Some(Candidate { id: h.id, distance: h.distance, escalated, excerpt: excerpt(&h.content) })
+            let same_scope = h.project_id.as_deref() == project_id;
+            Some(Candidate { id: h.id, distance: h.distance, escalated, excerpt: excerpt(&h.content), same_scope })
         })
         .collect();
     if found.is_empty() {

@@ -543,13 +543,16 @@ pub enum SaveOutcome {
     /// that predates the pair table sends none. `replaced` names the rows of
     /// the save's topic key it superseded, and `key_dropped` says the save
     /// named a key the daemon did not echo: one that predates topic keys
-    /// stored it as a new memory and replaced nothing.
+    /// stored it as a new memory and replaced nothing. `revision_candidate`
+    /// is the row of `related` a save without a key most likely revises; a
+    /// daemon that predates it sends none.
     Saved {
         memories: Vec<SavedMemory>,
         redacted: Vec<String>,
         related: Vec<RelatedMemory>,
         replaced: Vec<ReplacedMemory>,
         key_dropped: bool,
+        revision_candidate: Option<i64>,
     },
     /// Accepted but not confirmed; `reason` says why (`"unconfirmed"`,
     /// `"embedder_loading"`, `"already_queued"`, `"partially_saved"`), and
@@ -915,6 +918,8 @@ impl DaemonClient {
             #[serde(default)]
             replaced: Vec<ReplacedMemory>,
             #[serde(default)]
+            revision_candidate: Option<i64>,
+            #[serde(default)]
             topic_key: Option<String>,
             #[serde(default)]
             operation_id: Option<String>,
@@ -931,6 +936,7 @@ impl DaemonClient {
                 related: body.related,
                 replaced: body.replaced,
                 key_dropped: keyed && body.topic_key.is_none(),
+                revision_candidate: body.revision_candidate,
             },
             _ => SaveOutcome::Queued {
                 reason: body.reason,
@@ -2028,7 +2034,8 @@ pub(crate) mod tests {
             second,
             SaveOutcome::Saved {
                 memories: vec![SavedMemory { kind: "memory".into(), id: memories[0].id, outcome: "reinforced".into() }],
-                redacted: vec![], related: vec![], replaced: vec![], key_dropped: false
+                redacted: vec![], related: vec![], replaced: vec![], key_dropped: false,
+                revision_candidate: None
             }
         );
     }

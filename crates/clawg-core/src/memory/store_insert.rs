@@ -1301,7 +1301,7 @@ mod tests {
     }
 
     fn candidate(id: i64, distance: f64, escalated: bool) -> Candidate {
-        Candidate { id, distance, escalated, excerpt: String::new() }
+        Candidate { id, distance, escalated, excerpt: String::new(), same_scope: true }
     }
 
     #[tokio::test]
