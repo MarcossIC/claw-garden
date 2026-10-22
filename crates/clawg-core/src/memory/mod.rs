@@ -43,6 +43,7 @@ pub mod provenance;
 pub mod model_download;
 pub mod record;
 pub mod redact;
+pub mod relocate;
 pub mod inspect;
 pub mod secrets;
 pub mod sharing;

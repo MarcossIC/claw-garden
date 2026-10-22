@@ -10,6 +10,7 @@ use crate::memory::clock::TimestampMs;
 use crate::memory::chunker::embedding_text;
 use crate::memory::contradiction::{detect_contradiction, excerpt, Candidate};
 use crate::memory::dispute::{add_dispute_in, release_challengers, settle_challengers, settle_row, SUPERSEDE_SQL};
+use crate::memory::relocate::{apply_one_in, plan_one_in, MoveError, MoveReport};
 use crate::memory::revival::{revive_after_delete, revive_after_delete_of_piece};
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::search::{reach_predicate, reader_bind, reader_predicate, viewer_match_expression, RankedHit};
@@ -125,10 +126,11 @@ pub fn format_channel_attribution(dense: usize, lexical_only: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// update_memory — a correction of importance and/or type. The row is read and
-// written inside one transaction on the store's single connection: the new
-// tier depends on the old values (`tier::retier`), and no reader can see the
-// two statements apart.
+// update_memory — a correction of importance, type and/or project. The row is
+// read and written inside one transaction on the store's single connection:
+// the new tier depends on the old values (`tier::retier`), a move is decided
+// on what is stored (`relocate.rs`), and no reader can see the statements
+// apart.
 //
 // Outside `memory` the type is the table literal `store_insert.rs` writes at
 // INSERT time, so a tier recomputed here matches the one computed at ingest.
@@ -140,7 +142,7 @@ pub fn format_channel_attribution(dense: usize, lexical_only: usize) -> String {
 /// Why a requested change was refused before touching the store.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum PatchError {
-    #[error("nothing to change: pass importance, memory_type or both")]
+    #[error("nothing to change: pass importance, memory_type, a project to move to, or none")]
     Empty,
     #[error("importance must be a number from 0 to 10, got {0}")]
     ImportanceOutOfScale(f64),
@@ -148,14 +150,19 @@ pub enum PatchError {
     UnknownType(#[from] UnknownMemoryType),
     #[error("memory_type can only be changed on memory rows, not on {0:?} rows")]
     TypeOnlyOnMemory(MemoryKind),
+    #[error("only memory rows move to another project, not {0:?} rows")]
+    ProjectOnlyOnMemory(MemoryKind),
 }
 
 /// A valid change to one row: at least one field, importance on the store's
-/// scale, and a type only where the table has one.
+/// scale, and a type or a project only where the table has one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryPatch {
     importance: Option<f64>,
     memory_type: Option<MemoryType>,
+    /// The project to move the row's save to, `Some(None)` for none; `None`
+    /// leaves it where it is.
+    project: Option<Option<String>>,
     user_answered: bool,
 }
 
@@ -163,9 +170,17 @@ impl MemoryPatch {
     /// Unlike a save, which clamps the estimate an agent makes in passing,
     /// an out-of-scale importance here is refused: a correction is explicit,
     /// and clamping it would report a value nobody asked for as done.
-    pub fn new(kind: MemoryKind, importance: Option<f64>, memory_type: Option<&str>) -> Result<Self, PatchError> {
-        if importance.is_none() && memory_type.is_none() {
+    pub fn new(
+        kind: MemoryKind,
+        importance: Option<f64>,
+        memory_type: Option<&str>,
+        project: Option<Option<String>>,
+    ) -> Result<Self, PatchError> {
+        if importance.is_none() && memory_type.is_none() && project.is_none() {
             return Err(PatchError::Empty);
+        }
+        if project.is_some() && kind != MemoryKind::Memory {
+            return Err(PatchError::ProjectOnlyOnMemory(kind));
         }
         if let Some(v) = importance {
             if !(0.0..=10.0).contains(&v) {
@@ -177,12 +192,12 @@ impl MemoryPatch {
             Some(_) if kind != MemoryKind::Memory => return Err(PatchError::TypeOnlyOnMemory(kind)),
             Some(raw) => Some(raw.parse::<MemoryType>()?),
         };
-        Ok(Self { importance, memory_type, user_answered: false })
+        Ok(Self { importance, memory_type, project, user_answered: false })
     }
 
     /// The caller declares the user answered, which taking a preference or a
-    /// decision out of its type needs. Nothing records it: the row keeps no
-    /// reason for a change.
+    /// decision out of its type, or out of its project, needs. Nothing records
+    /// it: the row keeps no reason for a change.
     pub fn answered(mut self, user_answered: bool) -> Self {
         self.user_answered = user_answered;
         self
@@ -196,6 +211,13 @@ pub enum UpdateError {
          then call again with `user_answered`"
     )]
     NeedsUser { id: i64, from: String },
+    #[error(
+        "memory {id} is a {from}, so it changes project only on the user's word: ask the user, \
+         then call again with `user_answered`"
+    )]
+    MoveNeedsUser { id: i64, from: String },
+    #[error(transparent)]
+    Move(#[from] MoveError),
     #[error(transparent)]
     Store(#[from] MemoryError),
 }
@@ -209,19 +231,28 @@ pub struct UpdatedRow {
     /// `Some` only for `kind == Memory`.
     pub memory_type: Option<String>,
     pub tier: i64,
+    /// The project the row is in after the change, `None` without one.
+    pub project_id: Option<String>,
+    /// The move that changed its project, when one did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub move_id: Option<i64>,
+    /// The other rows of its save or topic history that moved with it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pulled_in: Vec<i64>,
 }
 
 const UPDATE_READ_MEMORY: &str = concat!(
-    "SELECT tier, importance, memory_type, access_count FROM memory WHERE id = ?1 AND deleted_at IS NULL AND ",
+    "SELECT tier, importance, memory_type, access_count, project_id FROM memory \
+     WHERE id = ?1 AND deleted_at IS NULL AND ",
     reader_predicate!("agent_id", "?2")
 );
 const UPDATE_READ_EPISODIC: &str = concat!(
-    "SELECT tier, importance, 'episodic_trajectory', access_count \
+    "SELECT tier, importance, 'episodic_trajectory', access_count, project_id \
      FROM episodic_trajectory WHERE id = ?1 AND deleted_at IS NULL AND ",
     reader_predicate!("agent_id", "?2")
 );
 const UPDATE_READ_PROCEDURAL: &str = concat!(
-    "SELECT tier, importance, 'procedural_skill', access_count \
+    "SELECT tier, importance, 'procedural_skill', access_count, project_id \
      FROM procedural_skill WHERE id = ?1 AND deleted_at IS NULL AND ",
     reader_predicate!("agent_id", "?2")
 );
@@ -239,6 +270,11 @@ const UPDATE_WRITE_PROCEDURAL: &str = "UPDATE procedural_skill \
 /// Applies `patch` to the live row `id` of `kind` and returns how it ended
 /// up, or `None` when there is no such live row within `reader`'s reach — in
 /// which case nothing is written.
+///
+/// A new project moves the row's whole unit (`relocate.rs`), clashes judged
+/// within `reader`'s reach. Any refusal, of the type or of the move, writes
+/// nothing, and a move alone leaves `last_modified_at` and `update_count` as
+/// they were: it changes where a row is, not what it says.
 pub async fn update_memory_core(
     store: &MemoryStore,
     id: i64,
@@ -263,31 +299,54 @@ pub async fn update_memory_core(
         .call(move |c| -> Result<Option<UpdatedRow>, UpdateError> {
             use rusqlite::OptionalExtension;
             let tx = c.transaction().map_err(MemoryError::Sqlite)?;
-            let current: Option<(i64, f64, String, i64)> = tx
+            let current: Option<(i64, f64, String, i64, Option<String>)> = tx
                 .query_row(read_sql, rusqlite::params![id, reach], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
                 })
                 .optional()
                 .map_err(MemoryError::Sqlite)?;
-            let Some((tier, importance, memory_type, access_count)) = current else {
+            let Some((tier, importance, memory_type, access_count, project_id)) = current else {
                 return Ok(None);
             };
             let demoted = patch.memory_type.is_some_and(|t| !t.is_protected());
             if demoted && MemoryType::is_protected_name(&memory_type) && !patch.user_answered {
                 return Err(UpdateError::NeedsUser { id, from: memory_type });
             }
+            let mut moved: Option<MoveReport> = match &patch.project {
+                Some(target) => Some(plan_one_in(&tx, id, target.as_deref(), reach.as_deref())?),
+                None => None,
+            };
+            if let Some(report) = &moved {
+                if let Some(skipped) = report.skipped.first() {
+                    return Err(MoveError::Refused(skipped.clone()).into());
+                }
+                let protected = report.moved.iter().find_map(|m| Some((m.id, m.protected.clone()?)));
+                if let (Some((row, from)), false) = (protected, patch.user_answered) {
+                    return Err(UpdateError::MoveNeedsUser { id: row, from });
+                }
+            }
             let new_importance = patch.importance.unwrap_or(importance);
             let new_type = patch.memory_type.map_or(memory_type.clone(), |t| t.as_str().to_string());
             let new_tier = retier(tier, access_count, (importance, &memory_type), (new_importance, &new_type));
-            tx.execute(write_sql, rusqlite::params![new_importance, new_type, new_tier, now_ms, id])
-                .map_err(MemoryError::Sqlite)?;
+            if patch.importance.is_some() || patch.memory_type.is_some() {
+                tx.execute(write_sql, rusqlite::params![new_importance, new_type, new_tier, now_ms, id])
+                    .map_err(MemoryError::Sqlite)?;
+            }
+            if let Some(report) = &mut moved {
+                apply_one_in(&tx, report, TimestampMs::from_unix_millis(now_ms)).map_err(MemoryError::Sqlite)?;
+            }
             tx.commit().map_err(MemoryError::Sqlite)?;
+            // Moved or already there, the row is in the target now.
+            let project_id = patch.project.clone().unwrap_or(project_id);
             Ok(Some(UpdatedRow {
                 id,
                 kind,
                 importance: new_importance,
                 memory_type: (kind == MemoryKind::Memory).then_some(new_type),
                 tier: new_tier,
+                project_id,
+                move_id: moved.as_ref().and_then(|r| r.move_id),
+                pulled_in: moved.map(|r| r.pulled_in).unwrap_or_default(),
             }))
         })
         .await
@@ -832,6 +891,9 @@ pub struct ListParams {
     pub memory_type: Option<String>,
     pub agent_id: Option<String>,
     pub project_id: Option<String>,
+    /// Only the rows saved in no project, which a search reaches from every
+    /// project; the caller does not set `project_id` with it.
+    pub no_project: bool,
     pub status: Option<String>,
     /// Free text over `memory.content`: every token must match, each as a
     /// prefix, ignoring case and accents. A query with no token filters nothing.
@@ -860,6 +922,7 @@ struct RowFilter {
     memory_type: Option<String>,
     agent_id: Option<String>,
     project_id: Option<String>,
+    no_project: bool,
     status: Option<String>,
     match_expr: Option<String>,
     deleted: bool,
@@ -906,6 +969,9 @@ fn push_filters(
         sql.push_str(" AND project_id = ?");
         params.push(Value::Text(p.clone()));
     }
+    if f.no_project {
+        sql.push_str(" AND project_id IS NULL");
+    }
     if let Some(s) = &f.status {
         sql.push_str(" AND status = ?");
         params.push(Value::Text(s.clone()));
@@ -946,6 +1012,7 @@ pub async fn list_memories_core(
         memory_type: params.memory_type,
         agent_id: params.agent_id,
         project_id: params.project_id,
+        no_project: params.no_project,
         status: params.status,
         match_expr: params.query.as_deref().and_then(viewer_match_expression),
         deleted: params.deleted,
@@ -1666,7 +1733,7 @@ mod tests {
     }
 
     fn importance(v: f64) -> MemoryPatch {
-        MemoryPatch::new(MemoryKind::Memory, Some(v), None).unwrap()
+        MemoryPatch::new(MemoryKind::Memory, Some(v), None, None).unwrap()
     }
 
     async fn memory_columns(store: &MemoryStore, id: i64) -> (String, i64, i64, String, i64, i64) {
@@ -1686,36 +1753,159 @@ mod tests {
 
     #[test]
     fn a_change_needs_at_least_one_field() {
-        assert_eq!(MemoryPatch::new(MemoryKind::Memory, None, None), Err(PatchError::Empty));
+        assert_eq!(MemoryPatch::new(MemoryKind::Memory, None, None, None), Err(PatchError::Empty));
+    }
+
+    #[test]
+    fn a_patch_needs_a_change_and_moves_only_memory_rows() {
+        assert!(MemoryPatch::new(MemoryKind::Memory, None, None, Some(Some("q-1a2b".into()))).is_ok());
+        assert!(MemoryPatch::new(MemoryKind::Memory, None, None, Some(None)).is_ok(), "to no project");
+        for kind in [MemoryKind::Episodic, MemoryKind::Procedural] {
+            let err = MemoryPatch::new(kind, Some(5.0), None, Some(None)).unwrap_err();
+            assert_eq!(err, PatchError::ProjectOnlyOnMemory(kind));
+        }
+    }
+
+    async fn register_project_row(store: &MemoryStore, id: &str) {
+        let id = id.to_string();
+        store
+            .conn
+            .call(move |c| c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, '/work/' || ?1, 0)", [id]))
+            .await
+            .unwrap();
+    }
+
+    fn move_to(project: Option<&str>) -> MemoryPatch {
+        MemoryPatch::new(MemoryKind::Memory, None, None, Some(project.map(str::to_string))).unwrap()
+    }
+
+    async fn project_of(store: &MemoryStore, id: i64) -> Option<String> {
+        store
+            .conn
+            .call(move |c| c.query_row("SELECT project_id FROM memory WHERE id = ?1", [id], |r| r.get(0)))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_move_alone_changes_the_project_and_nothing_it_says() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        register_project_row(&store, "q-1a2b").await;
+        let id = save(&store, "agent-a", "the parser is hand written").await;
+        let before = memory_columns(&store, id).await;
+
+        let row = update_memory_core(&store, id, MemoryKind::Memory, &move_to(Some("q-1a2b")), None)
+            .await
+            .unwrap()
+            .expect("updated");
+
+        assert_eq!((row.project_id.as_deref(), row.move_id), (Some("q-1a2b"), Some(1)));
+        assert_eq!(project_of(&store, id).await.as_deref(), Some("q-1a2b"));
+        assert_eq!(memory_columns(&store, id).await, before, "no update_count, no last_modified_at");
+    }
+
+    #[tokio::test]
+    async fn a_move_and_a_change_of_importance_are_one_write() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        register_project_row(&store, "q-1a2b").await;
+        let id = save(&store, "agent-a", "the parser is hand written").await;
+        let both = MemoryPatch::new(MemoryKind::Memory, Some(8.0), None, Some(Some("q-1a2b".into()))).unwrap();
+
+        let row = update_memory_core(&store, id, MemoryKind::Memory, &both, None).await.unwrap().expect("updated");
+        assert_eq!((row.importance, row.project_id.as_deref()), (8.0, Some("q-1a2b")));
+
+        let other = save(&store, "agent-a", "the lexer is generated").await;
+        let twin = save(&store, "agent-a", "the lexer is generated").await;
+        assert_ne!(other, twin, "a twin in another project");
+        store.conn.call(move |c| c.execute("UPDATE memory SET project_id = 'q-1a2b' WHERE id = ?1", [twin])).await.unwrap();
+        let clash = MemoryPatch::new(MemoryKind::Memory, Some(1.0), None, Some(Some("q-1a2b".into()))).unwrap();
+
+        let err = update_memory_core(&store, other, MemoryKind::Memory, &clash, None).await.unwrap_err();
+
+        assert!(err.to_string().contains(&format!("#{twin}")), "{err}");
+        assert_eq!(memory_tier_importance(&store, other).await.1, 5.0, "the importance waits for the move");
+        assert_eq!(project_of(&store, other).await.as_deref(), Some("p"));
+    }
+
+    #[tokio::test]
+    async fn an_unregistered_project_is_not_a_place_to_move_to() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let id = save(&store, "agent-a", "the parser is hand written").await;
+
+        let err = update_memory_core(&store, id, MemoryKind::Memory, &move_to(Some("typo-0000")), None).await.unwrap_err();
+
+        assert!(matches!(err, UpdateError::Move(MoveError::UnknownProject(_))), "{err:?}");
+        let row = update_memory_core(&store, id, MemoryKind::Memory, &move_to(None), None).await.unwrap().unwrap();
+        assert_eq!(row.project_id, None, "no project is always a place");
+    }
+
+    #[tokio::test]
+    async fn a_protected_row_leaves_its_project_only_on_the_users_word() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        register_project_row(&store, "q-1a2b").await;
+        let id = save(&store, "agent-a", "the store is SQLite").await;
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE memory SET memory_type = 'architectural_decision' WHERE id = ?1", [id]))
+            .await
+            .unwrap();
+
+        let err = update_memory_core(&store, id, MemoryKind::Memory, &move_to(Some("q-1a2b")), Some(&shared("agent-b")))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, UpdateError::MoveNeedsUser { id: row, .. } if row == id), "{err:?}");
+        assert_eq!(project_of(&store, id).await.as_deref(), Some("p"));
+
+        let answered = move_to(Some("q-1a2b")).answered(true);
+        update_memory_core(&store, id, MemoryKind::Memory, &answered, Some(&shared("agent-b"))).await.unwrap().unwrap();
+        assert_eq!(project_of(&store, id).await.as_deref(), Some("q-1a2b"));
+    }
+
+    #[tokio::test]
+    async fn a_move_takes_the_rest_of_the_save_along() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        register_project_row(&store, "q-1a2b").await;
+        let head = save(&store, "agent-a", "the opening of a long save").await;
+        let tail = save(&store, "agent-a", "and the rest of it").await;
+        store
+            .conn
+            .call(move |c| c.execute("INSERT INTO memory_piece VALUES (1, 1, ?1, ''), (1, 2, ?2, 'the opening')", [head, tail]))
+            .await
+            .unwrap();
+
+        let row = update_memory_core(&store, tail, MemoryKind::Memory, &move_to(Some("q-1a2b")), None).await.unwrap().unwrap();
+
+        assert_eq!(row.pulled_in, vec![head]);
+        assert_eq!(project_of(&store, head).await.as_deref(), Some("q-1a2b"));
     }
 
     #[test]
     fn importance_outside_the_scale_is_refused() {
         for v in [-0.5, 10.5, 50.0, f64::NAN, f64::INFINITY] {
-            let err = MemoryPatch::new(MemoryKind::Memory, Some(v), None).unwrap_err();
+            let err = MemoryPatch::new(MemoryKind::Memory, Some(v), None, None).unwrap_err();
             assert!(matches!(err, PatchError::ImportanceOutOfScale(_)), "{v}: {err:?}");
             assert!(err.to_string().contains("importance"), "{err}");
         }
         for v in [0.0, 10.0, 7.5] {
-            assert!(MemoryPatch::new(MemoryKind::Memory, Some(v), None).is_ok(), "{v}");
+            assert!(MemoryPatch::new(MemoryKind::Memory, Some(v), None, None).is_ok(), "{v}");
         }
     }
 
     #[test]
     fn an_unknown_memory_type_is_refused() {
-        let err = MemoryPatch::new(MemoryKind::Memory, None, Some("preference")).unwrap_err();
+        let err = MemoryPatch::new(MemoryKind::Memory, None, Some("preference"), None).unwrap_err();
         assert_eq!(err, PatchError::UnknownType(UnknownMemoryType("preference".into())));
         assert!(err.to_string().contains("memory_type"), "{err}");
-        assert!(MemoryPatch::new(MemoryKind::Memory, None, Some("user_preference")).is_ok());
+        assert!(MemoryPatch::new(MemoryKind::Memory, None, Some("user_preference"), None).is_ok());
     }
 
     #[test]
     fn only_memory_rows_have_a_type_to_change() {
         for kind in [MemoryKind::Episodic, MemoryKind::Procedural] {
-            let err = MemoryPatch::new(kind, Some(5.0), Some("user_preference")).unwrap_err();
+            let err = MemoryPatch::new(kind, Some(5.0), Some("user_preference"), None).unwrap_err();
             assert_eq!(err, PatchError::TypeOnlyOnMemory(kind));
             assert!(err.to_string().contains("memory_type"), "{err}");
-            assert!(MemoryPatch::new(kind, Some(5.0), None).is_ok());
+            assert!(MemoryPatch::new(kind, Some(5.0), None, None).is_ok());
         }
     }
 
@@ -1751,7 +1941,7 @@ mod tests {
     async fn an_update_writes_what_was_asked_and_counts_itself() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let id = seed_memory_row(&store, "semantic_fact", 3, 5.0, false).await;
-        let patch = MemoryPatch::new(MemoryKind::Memory, Some(8.0), Some("user_preference")).unwrap();
+        let patch = MemoryPatch::new(MemoryKind::Memory, Some(8.0), Some("user_preference"), None).unwrap();
 
         let row = update_memory_core(&store, id, MemoryKind::Memory, &patch, None).await.unwrap();
 
@@ -1763,13 +1953,16 @@ mod tests {
                 importance: 8.0,
                 memory_type: Some("user_preference".into()),
                 tier: 1,
+                project_id: None,
+                move_id: None,
+                pulled_in: Vec::new(),
             })
         );
         let (memory_type, update_count, last_modified_at, ..) = memory_columns(&store, id).await;
         assert_eq!((memory_type.as_str(), update_count), ("user_preference", 1));
         assert!(last_modified_at > 0, "the seed wrote 0");
 
-        let type_only = MemoryPatch::new(MemoryKind::Memory, None, Some("architectural_decision")).unwrap();
+        let type_only = MemoryPatch::new(MemoryKind::Memory, None, Some("architectural_decision"), None).unwrap();
         let row = update_memory_core(&store, id, MemoryKind::Memory, &type_only, None).await.unwrap().unwrap();
         assert_eq!(row.importance, 8.0, "a field not asked for stays as it was");
         assert_eq!(memory_columns(&store, id).await.1, 2);
@@ -1780,7 +1973,7 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         for protected in ["user_preference", "architectural_decision"] {
             let id = seed_memory_row(&store, protected, 3, 5.0, false).await;
-            let demote = MemoryPatch::new(MemoryKind::Memory, Some(9.0), Some("semantic_fact")).unwrap();
+            let demote = MemoryPatch::new(MemoryKind::Memory, Some(9.0), Some("semantic_fact"), None).unwrap();
 
             let refused = update_memory_core(&store, id, MemoryKind::Memory, &demote, None).await;
 
@@ -1803,12 +1996,12 @@ mod tests {
     async fn promoting_or_changing_importance_needs_no_answer() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let fact = seed_memory_row(&store, "semantic_fact", 3, 5.0, false).await;
-        let promote = MemoryPatch::new(MemoryKind::Memory, None, Some("user_preference")).unwrap();
+        let promote = MemoryPatch::new(MemoryKind::Memory, None, Some("user_preference"), None).unwrap();
         assert!(update_memory_core(&store, fact, MemoryKind::Memory, &promote, None).await.unwrap().is_some());
 
         let preference = seed_memory_row(&store, "user_preference", 3, 5.0, false).await;
         assert!(update_memory_core(&store, preference, MemoryKind::Memory, &importance(2.0), None).await.unwrap().is_some());
-        let between = MemoryPatch::new(MemoryKind::Memory, None, Some("architectural_decision")).unwrap();
+        let between = MemoryPatch::new(MemoryKind::Memory, None, Some("architectural_decision"), None).unwrap();
         assert!(update_memory_core(&store, preference, MemoryKind::Memory, &between, None).await.unwrap().is_some());
     }
 
@@ -1842,7 +2035,7 @@ mod tests {
     async fn update_on_episodic_has_no_type_rule_below_importance_9() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let id = seed_episodic_row(&store, 3, 5.0).await;
-        let patch = MemoryPatch::new(MemoryKind::Episodic, Some(7.0), None).unwrap();
+        let patch = MemoryPatch::new(MemoryKind::Episodic, Some(7.0), None, None).unwrap();
 
         let row = update_memory_core(&store, id, MemoryKind::Episodic, &patch, None).await.unwrap().unwrap();
 
@@ -1854,7 +2047,7 @@ mod tests {
     async fn update_on_procedural_keeps_the_tier_its_table_gives() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let id = seed_procedural_row(&store, 1, 8.0).await;
-        let patch = MemoryPatch::new(MemoryKind::Procedural, Some(3.0), None).unwrap();
+        let patch = MemoryPatch::new(MemoryKind::Procedural, Some(3.0), None, None).unwrap();
 
         update_memory_core(&store, id, MemoryKind::Procedural, &patch, None).await.unwrap().unwrap();
 
@@ -1892,7 +2085,7 @@ mod tests {
         let epi = seed_episodic_row(&store, 1, 5.0).await;
         let pro = seed_procedural_row(&store, 2, 5.0).await;
 
-        let lower = |kind| MemoryPatch::new(kind, Some(2.0), None).unwrap();
+        let lower = |kind| MemoryPatch::new(kind, Some(2.0), None, None).unwrap();
         let tier_of = |row: Option<UpdatedRow>| row.expect("updated").tier;
         assert_eq!(tier_of(update_memory_core(&store, earned, MemoryKind::Memory, &lower(MemoryKind::Memory), None).await.unwrap()), 3);
         assert_eq!(tier_of(update_memory_core(&store, foreign, MemoryKind::Memory, &lower(MemoryKind::Memory), None).await.unwrap()), 1);
@@ -2031,7 +2224,7 @@ mod tests {
         let pro = seed_procedural_row(&store, 3, 5.0).await;
 
         for (id, kind) in [(mem, MemoryKind::Memory), (epi, MemoryKind::Episodic), (pro, MemoryKind::Procedural)] {
-            let patch = MemoryPatch::new(kind, Some(9.5), None).unwrap();
+            let patch = MemoryPatch::new(kind, Some(9.5), None, None).unwrap();
             let hidden = hiding("other-agent", "test-agent");
             assert_eq!(update_memory_core(&store, id, kind, &patch, Some(&hidden)).await.unwrap(), None);
         }
@@ -2818,6 +3011,17 @@ mod tests {
         .unwrap();
 
         assert_eq!(ids_of(&rows), vec![exact], "project filter is equality, not prefix");
+    }
+
+    #[tokio::test]
+    async fn a_listing_of_rows_without_a_project() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed_memory_scoped(&store, "one", "a", Some("proj"), "active").await;
+        let loose = seed_memory_scoped(&store, "two", "a", None, "active").await;
+
+        let rows = list_memories_core(&store, ListParams { no_project: true, ..Default::default() }).await.unwrap();
+
+        assert_eq!(ids_of(&rows), vec![loose]);
     }
 
     #[tokio::test]

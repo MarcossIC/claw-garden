@@ -137,11 +137,19 @@ pub enum Reason {
     PreReembed,
     /// Before `clawg import` wrote rows from an export.
     PreImport,
+    /// Before `clawg projects move` moved rows to another project.
+    PreMove,
 }
 
 impl Reason {
-    const ALL: [Reason; 5] =
-        [Reason::PreMigration, Reason::PreRestore, Reason::Manual, Reason::PreReembed, Reason::PreImport];
+    const ALL: [Reason; 6] = [
+        Reason::PreMigration,
+        Reason::PreRestore,
+        Reason::Manual,
+        Reason::PreReembed,
+        Reason::PreImport,
+        Reason::PreMove,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -150,6 +158,7 @@ impl Reason {
             Reason::Manual => "manual",
             Reason::PreReembed => "pre-reembed",
             Reason::PreImport => "pre-import",
+            Reason::PreMove => "pre-move",
         }
     }
 
@@ -266,8 +275,9 @@ pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 /// How many automatic snapshots (`pre-migration`, `pre-restore`, `pre-import`,
-/// `pre-reembed`) are kept. One is taken per upgrade that migrates, per
-/// restore or per re-embed, so five cover several in a row. A starting
+/// `pre-reembed`, `pre-move`) are kept. One is taken per upgrade that migrates,
+/// per restore, per import, per re-embed or per batch move, so five cover
+/// several in a row. A starting
 /// value, not measured.
 pub const AUTO_KEEP: usize = 5;
 

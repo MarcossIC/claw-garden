@@ -650,6 +650,16 @@ fn note_for(
     }
 }
 
+/// Stores `evt` as the worker does, with the fake embedder, for the tests of
+/// other modules that need the rows a real save leaves.
+#[cfg(test)]
+pub(crate) async fn save_for_test(store: &Arc<MemoryStore>, evt: &MemoryEvent) -> IngestReport {
+    let cell: OnceCell<Arc<dyn Embedder>> = OnceCell::new();
+    cell.set(Arc::new(crate::memory::embedder::FakeEmbedder::default())).ok();
+    let mut absorbed = 0;
+    process_event(evt, store, &Arc::new(cell), &Arc::new(ChatChunker::with_fallback()), &mut absorbed).await
+}
+
 /// [`process_tracked`] for an event no outbox row holds.
 #[cfg(test)]
 async fn process_event(
