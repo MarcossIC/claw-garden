@@ -225,6 +225,18 @@ pub fn format_update(u: &Updated) -> String {
     format!("updated #{} {}: {fields}, tier {}", u.id, u.kind, u.tier)
 }
 
+/// The line `save_memory` adds for a save without a key that is close to row
+/// `id` of its own agent and project. The same text saved again under a key
+/// only gives the stored row that key, so the next version under it replaces
+/// this one; the `close to earlier memories` line above says how to replace
+/// `id` itself.
+pub fn topic_key_warning(id: i64) -> String {
+    format!(
+        "this save has no topic_key: if it revises #{id}, save it again under a topic_key naming their subject, \
+         so the next revision replaces it"
+    )
+}
+
 /// What `delete_memory` tells the model. Deleting the current version of a
 /// topic brings back the one it replaced, which the model would not expect;
 /// a row a verdict replaced stays out of searches with it.

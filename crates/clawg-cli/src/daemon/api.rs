@@ -528,6 +528,11 @@ pub struct SaveBody {
     /// The memories of the save's topic key it superseded.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub replaced: Vec<ReplacedMemory>,
+    /// For a save without a topic key, the `memory` row of `related` in its
+    /// own agent and project it is closest to: if the save revises it, the
+    /// subject belongs under a key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision_candidate: Option<i64>,
     /// The key the save was taken under. A bridge that sent one and finds it
     /// missing is talking to a daemon that ignored it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -548,6 +553,7 @@ impl SaveBody {
             redacted: Vec::new(),
             related: Vec::new(),
             replaced: Vec::new(),
+            revision_candidate: None,
             topic_key: None,
             detail: None,
             operation_id,
@@ -1029,6 +1035,7 @@ fn save_response(
                         .into_iter()
                         .map(|r| ReplacedMemory { kind: "memory", id: r.id, excerpt: r.excerpt })
                         .collect(),
+                    revision_candidate: report.revision_candidate,
                     topic_key: None,
                     detail: None,
                     operation_id,
@@ -1996,6 +2003,7 @@ mod tests {
             distance: 0.3,
             escalated: true,
             excerpt: "Ports".into(),
+            same_scope: true,
         };
         let (_, body) = save_response(
             Confirmation::Reported(IngestReport {
@@ -2009,6 +2017,23 @@ mod tests {
         .expect("a clean report is a success");
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["related"], serde_json::json!([{ "kind": "memory", "id": 12, "escalated": true, "excerpt": "Ports" }]));
+    }
+
+    #[test]
+    fn a_confirmed_save_names_its_revision_candidate_only_when_it_has_one() {
+        let report = |revision_candidate| IngestReport {
+            memories: vec![chunk(57, ChunkOutcome::Inserted)],
+            revision_candidate,
+            ..Default::default()
+        };
+        let (_, body) = save_response(Confirmation::Reported(report(Some(12))), "op-1".into(), &[])
+            .expect("a clean report is a success");
+        assert_eq!(serde_json::to_value(&body).unwrap()["revision_candidate"], 12);
+
+        let (_, body) = save_response(Confirmation::Reported(report(None)), "op-1".into(), &[])
+            .expect("a clean report is a success");
+        let json = serde_json::to_value(&body).unwrap();
+        assert!(json.get("revision_candidate").is_none(), "{json}");
     }
 
     #[test]

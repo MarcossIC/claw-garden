@@ -332,4 +332,9 @@ mod tests {
         assert_eq!(m4.warning_line_tokens, counter.count(WARNING_LINE));
         assert!(m4.warning_line_tokens > 10);
     }
+
+    #[test]
+    fn save_memory_ships_the_warning_line_that_was_measured() {
+        assert_eq!(clawg_cli::mcp::tools::topic_key_warning(123), WARNING_LINE);
+    }
 }
