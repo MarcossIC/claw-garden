@@ -12,7 +12,7 @@ use crate::memory::{
     clock::TimestampMs,
     embedder::{EmbedError, EmbedRole, Embedder},
     search::{memory_project_predicate, search_all_memories, RankedHit, SearchScope},
-    sharing::Reach,
+    sharing::{Reach, Reader},
     workspace::{EmittedIds, WorkspaceManager},
     MemoryError, MemoryStore, TableKind,
 };
@@ -845,7 +845,8 @@ async fn with_last_session(
     let Some(piece) = links.get(&summary.id).map(|l| l.position) else {
         return (Some(summary), hits);
     };
-    let summary = match read_save_core(store, MemoryKind::Memory, summary.id, summary.agent_id.as_deref()).await {
+    let reader = Reader::new(agent_id, reach.clone());
+    let summary = match read_save_core(store, MemoryKind::Memory, summary.id, Some(&reader)).await {
         Ok(Some(save)) => RankedHit { content: save.text, ..summary },
         Ok(None) => RankedHit { piece: Some(piece), ..summary },
         Err(e) => {

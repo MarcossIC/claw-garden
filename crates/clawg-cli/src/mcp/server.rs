@@ -3235,26 +3235,34 @@ mod tests {
         ListMemoriesArgs { kind: None, tier: None, memory_type: None, limit: None, offset: None }
     }
 
+    /// Takes every exclusion away.
+    fn share_all(dir: &tempfile::TempDir) {
+        sharing::save(dir.path(), &sharing::SharingPolicy::default()).expect("save policy");
+    }
+
     #[tokio::test]
-    async fn an_agent_cannot_delete_another_agents_memory() {
-        let (b, _d) = bridge().await;
+    async fn another_agent_deletes_a_memory_unless_hidden() {
+        let (b, d) = bridge().await;
         let content = "agent a keeps its release notes in the wiki";
         let id = saved_id(&b, "agent-a", content).await;
 
+        hide(&d, "agent-b", "agent-a");
         let r = b
             .delete_memory_impl("agent-b", DeleteMemoryArgs { id, kind: "memory".into() })
             .await
             .expect("call");
-        assert!(is_error(&r), "another agent's memory must not be deletable: {}", text(&r));
-
+        assert!(is_error(&r), "a hidden author's memory must not be deletable: {}", text(&r));
         let listed = b.list_memories_impl("agent-a", list_all()).await.expect("list");
         assert!(text(&listed).contains(content), "the row must survive: {}", text(&listed));
 
+        share_all(&d);
         let r = b
-            .delete_memory_impl("agent-a", DeleteMemoryArgs { id, kind: "memory".into() })
+            .delete_memory_impl("agent-b", DeleteMemoryArgs { id, kind: "memory".into() })
             .await
             .expect("call");
-        assert!(!is_error(&r), "the owner deletes it: {}", text(&r));
+        assert!(!is_error(&r), "another agent deletes what it reaches: {}", text(&r));
+        let listed = b.list_memories_impl("agent-a", list_all()).await.expect("list");
+        assert!(!text(&listed).contains(content), "and its author sees it gone: {}", text(&listed));
     }
 
     fn restore_args(id: i64) -> RestoreMemoryArgs {
@@ -3282,18 +3290,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_agent_cannot_restore_another_agents_memory() {
-        let (b, _d) = bridge().await;
+    async fn another_agent_restores_a_memory_unless_hidden() {
+        let (b, d) = bridge().await;
         let content = "agent a keeps its release notes in the wiki";
         let id = saved_id(&b, "agent-a", content).await;
         b.delete_memory_impl("agent-a", DeleteMemoryArgs { id, kind: "memory".into() }).await.expect("call");
 
+        hide(&d, "agent-b", "agent-a");
         let r = b.restore_memory_impl("agent-b", restore_args(id)).await.expect("call");
-
-        assert!(is_error(&r), "another agent's memory must not be restorable: {}", text(&r));
+        assert!(is_error(&r), "a hidden author's memory must not be restorable: {}", text(&r));
         assert!(!text(&b.list_memories_impl("agent-a", list_all()).await.expect("list")).contains(content));
-        let r = b.restore_memory_impl("agent-a", restore_args(id)).await.expect("call");
-        assert!(!is_error(&r), "the owner restores it: {}", text(&r));
+
+        share_all(&d);
+        let r = b.restore_memory_impl("agent-b", restore_args(id)).await.expect("call");
+        assert!(!is_error(&r), "another agent restores what it reaches: {}", text(&r));
+        assert!(text(&b.list_memories_impl("agent-a", list_all()).await.expect("list")).contains(content));
     }
 
     #[tokio::test]
@@ -3330,17 +3341,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_agent_cannot_read_another_agents_save() {
-        let (b, _d) = bridge().await;
+    async fn another_agent_reads_a_save_unless_hidden() {
+        let (b, d) = bridge().await;
         let id = saved_id(&b, "agent-a", "agent a keeps its release notes in the wiki").await;
 
         let other = b.read_memory_impl("agent-b", read_args(id)).await.expect("call");
-        let missing = b.read_memory_impl("agent-b", read_args(999_999)).await.expect("call");
+        assert_eq!(text(&other), format!("#{id}\nagent a keeps its release notes in the wiki"));
 
-        assert!(is_error(&other), "another agent's save must not be readable: {}", text(&other));
-        assert_eq!(text(&other).replace(&id.to_string(), "N"), text(&missing).replace("999999", "N"));
-        let own = b.read_memory_impl("agent-a", read_args(id)).await.expect("call");
-        assert_eq!(text(&own), format!("#{id}\nagent a keeps its release notes in the wiki"));
+        hide(&d, "agent-b", "agent-a");
+        let hidden = b.read_memory_impl("agent-b", read_args(id)).await.expect("call");
+        let missing = b.read_memory_impl("agent-b", read_args(999_999)).await.expect("call");
+        assert!(is_error(&hidden), "a hidden author's save must not be readable: {}", text(&hidden));
+        assert_eq!(text(&hidden).replace(&id.to_string(), "N"), text(&missing).replace("999999", "N"));
     }
 
     #[test]
@@ -3435,15 +3447,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_agent_cannot_update_another_agents_memory() {
-        let (b, _d) = bridge().await;
+    async fn another_agent_updates_a_memory_unless_hidden() {
+        let (b, d) = bridge().await;
         let id = saved_id(&b, "agent-a", "agent a reviews pull requests on mondays").await;
 
+        hide(&d, "agent-b", "agent-a");
         let r = b.update_memory_impl("agent-b", update_args(id, Some(9.5), None)).await.expect("call");
-
-        assert!(is_error(&r), "another agent's memory must not change: {}", text(&r));
+        assert!(is_error(&r), "a hidden author's memory must not change: {}", text(&r));
         let listed = text(&b.list_memories_impl("agent-a", list_all()).await.expect("list"));
         assert!(listed.contains("imp=5.0"), "the row must stay as it was: {listed}");
+
+        share_all(&d);
+        let r = b.update_memory_impl("agent-b", update_args(id, Some(9.5), None)).await.expect("call");
+        assert!(!is_error(&r), "another agent changes what it reaches: {}", text(&r));
+        let listed = text(&b.list_memories_impl("agent-a", list_all()).await.expect("list"));
+        assert!(listed.contains("imp=9.5"), "and its author sees the change: {listed}");
     }
 
     #[tokio::test]
@@ -3459,9 +3477,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_agent_cannot_resolve_another_agents_conflict() {
+    async fn another_agent_resolves_a_conflict_unless_hidden() {
         let mut store = None;
-        let (b, _d) = bridge_with(|runtime| {
+        let (b, d) = bridge_with(|runtime| {
             store = Some(runtime.store.clone());
             runtime
         })
@@ -3480,20 +3498,26 @@ mod tests {
             .await
             .expect("mark the dispute");
 
-        let r = b
-            .resolve_conflict_impl("agent-b", ResolveConflictArgs { keep: new, other: old, verdict: "supersedes".into(), reason: None, user_answered: false })
-            .await
-            .expect("call");
+        let verdict = || ResolveConflictArgs { keep: new, other: old, verdict: "supersedes".into(), reason: None, user_answered: false };
+        let statuses = || async {
+            let client = b.client.get().await.expect("daemon");
+            let mut rows = client
+                .list(ListArgs { kind: Some("memory".into()), ..Default::default() })
+                .await
+                .expect("list");
+            rows.sort_by_key(|r| r.id);
+            rows.into_iter().map(|r| r.status).collect::<Vec<_>>()
+        };
 
-        assert!(is_error(&r), "another agent's conflict must not be resolvable: {}", text(&r));
-        let client = b.client.get().await.expect("daemon");
-        let mut rows = client
-            .list(ListArgs { kind: Some("memory".into()), ..Default::default() })
-            .await
-            .expect("list");
-        rows.sort_by_key(|r| r.id);
-        let statuses: Vec<&str> = rows.iter().map(|r| r.status.as_str()).collect();
-        assert_eq!(statuses, ["active", "disputed"], "a refused resolution changes nothing");
+        hide(&d, "agent-b", "agent-a");
+        let r = b.resolve_conflict_impl("agent-b", verdict()).await.expect("call");
+        assert!(is_error(&r), "a hidden author's conflict must not be resolvable: {}", text(&r));
+        assert_eq!(statuses().await, ["active", "disputed"], "a refused resolution changes nothing");
+
+        share_all(&d);
+        let r = b.resolve_conflict_impl("agent-b", verdict()).await.expect("call");
+        assert!(!is_error(&r), "another agent judges a pair it reaches: {}", text(&r));
+        assert_eq!(statuses().await, ["superseded", "active"]);
     }
 
     // ── project scoping ─────────────────────────────────────────────────────
@@ -3655,20 +3679,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_shared_memory_is_read_only() {
+    async fn a_shared_memory_is_changed_by_the_agent_that_found_it() {
         let (b, _d) = bridge().await;
         let content = "claude-code keeps the incident runbook in docs/runbook.md";
         let id = saved_id(&b, "claude-code", content).await;
         assert!(text(&b.search_memory_impl("cursor", search_args(content)).await.expect("search")).contains(content));
 
-        let r = b.delete_memory_impl("cursor", DeleteMemoryArgs { id, kind: "memory".into() }).await.expect("call");
-        assert!(is_error(&r), "a shared memory must not be deletable by its reader: {}", text(&r));
         let r = b.update_memory_impl("cursor", update_args(id, Some(9.5), None)).await.expect("call");
-        assert!(is_error(&r), "nor changed: {}", text(&r));
-
+        assert!(!is_error(&r), "the agent that found it changes it: {}", text(&r));
         let listed = text(&b.list_memories_impl("claude-code", list_all()).await.expect("list"));
-        assert!(listed.contains("imp=5.0") && listed.contains(&format!("#{id} ")), "the row stays as it was: {listed}");
-        assert!(!text(&b.list_memories_impl("cursor", list_all()).await.expect("list")).contains(content), "and is not listed as cursor's");
+        assert!(listed.contains("imp=9.5") && listed.contains(&format!("#{id} ")), "its author sees the change: {listed}");
+
+        let r = b.delete_memory_impl("cursor", DeleteMemoryArgs { id, kind: "memory".into() }).await.expect("call");
+        assert!(!is_error(&r), "and deletes it: {}", text(&r));
+        assert!(!text(&b.search_memory_impl("cursor", search_args(content)).await.expect("search")).contains(content));
     }
 
     #[tokio::test]

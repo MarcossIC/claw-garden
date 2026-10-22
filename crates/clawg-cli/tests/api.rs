@@ -863,18 +863,20 @@ async fn get_save_returns_the_whole_text() {
 }
 
 #[tokio::test]
-async fn get_save_of_another_agent_is_404() {
+async fn get_save_of_another_agent_reads_whole_unless_hidden() {
     let h = Harness::start().await;
     let (_, body) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "agent-http" })).await;
     let id = body["memories"][0]["id"].as_i64().expect("id");
 
-    let (status, _) = h.get_json(&format!("/v1/memories/memory/{id}/save?agent=agent-other")).await;
-    assert_eq!(status, 404, "another agent's save reads as missing");
+    let (status, save) = h.get_json(&format!("/v1/memories/memory/{id}/save?agent=agent-other")).await;
+    assert_eq!(status, 200, "another agent reads it whole: {save}");
+    assert_eq!((save["pieces"].as_i64(), save["text"].as_str()), (Some(1), Some(CONTENT)));
     let (status, _) = h.get_json("/v1/memories/memory/999999/save?agent=agent-http").await;
     assert_eq!(status, 404);
-    let (status, save) = h.get_json(&format!("/v1/memories/memory/{id}/save?agent=agent-http")).await;
-    assert_eq!(status, 200, "{save}");
-    assert_eq!((save["pieces"].as_i64(), save["text"].as_str()), (Some(1), Some(CONTENT)));
+
+    write_policy(&h, HIDE_AUTHOR);
+    let (status, _) = h.get_json(&format!("/v1/memories/memory/{id}/save?agent=agent-other")).await;
+    assert_eq!(status, 404, "a hidden author's save reads as missing");
 }
 
 #[tokio::test]
@@ -1893,24 +1895,37 @@ async fn user_stated_with_derived_from_is_refused() {
 }
 
 #[tokio::test]
-async fn an_agent_neither_reviews_nor_cites_another_agents_memories() {
+async fn an_agent_neither_reviews_another_agents_memories() {
     let h = Harness::start().await;
     let mine = save_id(&h, json!({ "content": "the go service uses tabs", "agent_id": "a", "project_id": "p" })).await;
-    let theirs = save_id(&h, json!({ "content": "the deploy runs on fridays", "agent_id": "b", "project_id": "p" })).await;
+    save_id(&h, json!({ "content": "the deploy runs on fridays", "agent_id": "b", "project_id": "p" })).await;
 
     let (status, body) = h.post_json("/v1/synthesis", json!({ "agent_id": "a", "project_id": "p" })).await;
     assert_eq!(status, 200, "{body}");
     let pending: Vec<i64> = body["pending"].as_array().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect();
     assert_eq!(pending, vec![mine], "{body}");
+}
 
-    let (status, body) = h
-        .post_json(
+#[tokio::test]
+async fn a_conclusion_may_cite_another_agents_memory_unless_hidden() {
+    let h = Harness::start().await;
+    let mine = save_id(&h, json!({ "content": "the go service uses tabs", "agent_id": "a", "project_id": "p" })).await;
+    let theirs = save_id(&h, json!({ "content": "the deploy runs on fridays", "agent_id": "b", "project_id": "p" })).await;
+    let conclude = |content: &'static str| {
+        h.post_json(
             "/v1/memories",
-            json!({ "content": "a conclusion", "agent_id": "a", "project_id": "p", "derived_from": [mine, theirs] }),
+            json!({ "content": content, "agent_id": "a", "project_id": "p", "derived_from": [mine, theirs] }),
         )
-        .await;
+    };
+
+    write_policy(&h, r#"{"version":1,"hides":{"a":["b"]}}"#);
+    let (status, body) = conclude("a conclusion the policy refuses").await;
     assert_eq!(status, 400, "{body}");
     assert!(body.to_string().contains(&theirs.to_string()), "{body}");
+
+    write_policy(&h, r#"{"version":1,"hides":{}}"#);
+    let (status, body) = conclude("a conclusion drawn from both agents").await;
+    assert_eq!(status, 201, "{body}");
 }
 
 #[tokio::test]
@@ -2183,27 +2198,38 @@ async fn resolve_rows_without_a_dispute_conflict() {
     assert_eq!(status, 409, "{body}");
 }
 
+/// `agent-other` does not read `agent-http`.
+const HIDE_AUTHOR: &str = r#"{"version":1,"hides":{"agent-other":["agent-http"]}}"#;
+
 #[tokio::test]
-async fn delete_with_another_agent_is_404_and_keeps_the_row() {
+async fn delete_with_a_hidden_author_is_404_and_another_agent_deletes_otherwise() {
+    let h = Harness::start().await;
+    h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "agent-http" })).await;
+    let id = h.wait_for_rows("memory", 1).await[0]["id"].as_i64().expect("id");
+    let delete = || h.authed(h.http.delete(h.url(&format!("/v1/memories/memory/{id}?agent=agent-other")))).send();
+
+    write_policy(&h, HIDE_AUTHOR);
+    assert_eq!(delete().await.expect("request").status(), 404, "a hidden author's row reads as missing");
+    let (_, row) = h.get_json(&format!("/v1/memories/memory/{id}")).await;
+    assert!(row["item"]["deleted_at"].is_null(), "{row}");
+
+    write_policy(&h, r#"{"version":1,"hides":{}}"#);
+    assert_eq!(delete().await.expect("request").status(), 200, "another agent deletes what it reaches");
+    let (_, row) = h.get_json(&format!("/v1/memories/memory/{id}")).await;
+    assert!(!row["item"]["deleted_at"].is_null(), "{row}");
+}
+
+#[tokio::test]
+async fn an_unreadable_policy_leaves_an_agent_its_own_rows_and_the_authorless() {
     let h = Harness::start().await;
     h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "agent-http" })).await;
     let id = h.wait_for_rows("memory", 1).await[0]["id"].as_i64().expect("id");
 
-    let r = h
-        .authed(h.http.delete(h.url(&format!("/v1/memories/memory/{id}?agent=agent-other"))))
-        .send()
-        .await
-        .expect("request");
-    assert_eq!(r.status(), 404, "another agent's row reads as missing");
-    let (_, row) = h.get_json(&format!("/v1/memories/memory/{id}")).await;
-    assert!(row["item"]["deleted_at"].is_null(), "{row}");
-
-    let r = h
-        .authed(h.http.delete(h.url(&format!("/v1/memories/memory/{id}?agent=agent-http"))))
-        .send()
-        .await
-        .expect("request");
-    assert_eq!(r.status(), 200, "the owner can delete it");
+    write_policy(&h, "{ not json");
+    let (status, _) = h.get_json(&format!("/v1/memories/memory/{id}/save?agent=agent-other")).await;
+    assert_eq!(status, 404, "an unreadable policy shares nothing");
+    let (status, _) = h.get_json(&format!("/v1/memories/memory/{id}/save?agent=agent-http")).await;
+    assert_eq!(status, 200, "its author still reads it");
 }
 
 #[tokio::test]
@@ -2284,47 +2310,45 @@ async fn an_invalid_patch_changes_nothing() {
 }
 
 #[tokio::test]
-async fn patch_with_another_agent_is_404_and_keeps_the_importance() {
+async fn patch_with_a_hidden_author_is_404_and_another_agent_patches_otherwise() {
     let h = Harness::start().await;
     h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "agent-http" })).await;
     let item = h.wait_for_rows("memory", 1).await.remove(0);
     let id = item["id"].as_i64().expect("id");
+    let patch = || {
+        h.authed(h.http.patch(h.url(&format!("/v1/memories/memory/{id}?agent=agent-other"))))
+            .json(&json!({ "importance": 9.5 }))
+            .send()
+    };
 
-    let r = h
-        .authed(h.http.patch(h.url(&format!("/v1/memories/memory/{id}?agent=agent-other"))))
-        .json(&json!({ "importance": 9.5 }))
-        .send()
-        .await
-        .expect("request");
-    assert_eq!(r.status(), 404);
+    write_policy(&h, HIDE_AUTHOR);
+    assert_eq!(patch().await.expect("request").status(), 404);
     let (_, row) = h.get_json(&format!("/v1/memories/memory/{id}")).await;
     assert_eq!(row["item"]["importance"], item["importance"], "{row}");
 
-    let r = h
-        .authed(h.http.patch(h.url(&format!("/v1/memories/memory/{id}?agent=agent-http"))))
-        .json(&json!({ "importance": 9.5 }))
-        .send()
-        .await
-        .expect("request");
-    assert_eq!(r.status(), 200);
+    write_policy(&h, r#"{"version":1,"hides":{}}"#);
+    assert_eq!(patch().await.expect("request").status(), 200);
+    let (_, row) = h.get_json(&format!("/v1/memories/memory/{id}")).await;
+    assert_eq!(row["item"]["importance"], 9.5, "{row}");
 }
 
 #[tokio::test]
-async fn resolve_with_another_agent_is_404_and_changes_nothing() {
+async fn resolve_with_a_hidden_author_is_404_and_another_agent_resolves_otherwise() {
     let h = Harness::start().await;
     let (old, new) = seed_dispute(&h).await;
+    let resolve = || h.post_json("/v1/disputes/resolve", json!({ "keep": new, "other": old, "agent_id": "agent-other" }));
 
-    let (status, body) = h
-        .post_json("/v1/disputes/resolve", json!({ "keep": new, "other": old, "agent_id": "agent-other" }))
-        .await;
+    write_policy(&h, HIDE_AUTHOR);
+    let (status, body) = resolve().await;
     assert_eq!(status, 404, "{body}");
     let (_, row) = h.get_json(&format!("/v1/memories/memory/{new}")).await;
     assert_eq!(row["item"]["status"], "disputed", "{row}");
 
-    let (status, body) = h
-        .post_json("/v1/disputes/resolve", json!({ "keep": new, "other": old, "agent_id": "agent-http" }))
-        .await;
+    write_policy(&h, r#"{"version":1,"hides":{}}"#);
+    let (status, body) = resolve().await;
     assert_eq!(status, 200, "{body}");
+    let (_, row) = h.get_json(&format!("/v1/memories/memory/{old}")).await;
+    assert_eq!(row["item"]["status"], "superseded", "{row}");
 }
 
 #[tokio::test]
@@ -3056,17 +3080,19 @@ impl Harness {
 }
 
 #[tokio::test]
-async fn restore_brings_a_deleted_memory_back_for_its_owner() {
+async fn restore_brings_a_deleted_memory_back_for_any_agent_that_reaches_it() {
     let h = Harness::start().await;
     let id = save_id(&h, json!({ "content": CONTENT, "agent_id": "a" })).await;
     h.delete_row(id).await;
     assert!(!finds(&h, "a", id).await);
 
+    write_policy(&h, r#"{"version":1,"hides":{"b":["a"]}}"#);
     let (status, body) = h.restore("memory", id, Some("b")).await;
-    assert_eq!(status, 404, "another agent's row reads as missing: {body}");
+    assert_eq!(status, 404, "a hidden author's row reads as missing: {body}");
     assert!(!finds(&h, "a", id).await);
 
-    let (status, body) = h.restore("memory", id, Some("a")).await;
+    write_policy(&h, r#"{"version":1,"hides":{}}"#);
+    let (status, body) = h.restore("memory", id, Some("b")).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body, json!({ "restored": 1, "id": id, "status": "active", "superseded_by": null }));
     assert!(finds(&h, "a", id).await, "it is found again");

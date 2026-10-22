@@ -43,7 +43,7 @@ use clawg_core::memory::clock::TimestampMs;
 use clawg_core::memory::portability::{self, ImportError, ImportOptions, ImportReport, MAX_IMPORT_BYTES};
 use clawg_core::memory::project::{register_project, RegisterError};
 use clawg_core::memory::prompt_builder::{build_memory_prompt, build_session_prompt, QueryTexts, Retrieval, DEFAULT_BUDGET, MAX_BUDGET};
-use clawg_core::memory::sharing::{self, Reach};
+use clawg_core::memory::sharing::{self, Reach, Reader};
 use clawg_core::memory::topic::validate_topic_key;
 use clawg_core::memory::synthesis::{
     conclusions_to_review_count, existing_memory_ids, replaced_memory_ids, synthesis_core, unreviewed_count, Synthesis, SynthesisParams,
@@ -453,13 +453,14 @@ pub struct StatsQuery {
     pub project: Option<String>,
 }
 
-/// Which agent a change acts for. Absent, the change is the store owner's and
-/// reaches any row; present, another agent's row is answered as missing.
-/// Strict for the same reason as [`ListQuery`]: a misspelt `agent` would
-/// quietly lift the scope.
+/// Which agent a call by id acts for: it reaches what `sharing.json` lets
+/// that agent read, whoever saved it, and a row out of its reach is answered
+/// as missing. Absent, the call is the user's and reaches any row. Strict for
+/// the same reason as [`ListQuery`]: a misspelt `agent` would quietly lift the
+/// reach.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OwnerQuery {
+pub struct ReaderQuery {
     #[serde(default)]
     pub agent: Option<String>,
 }
@@ -695,11 +696,11 @@ impl RetrievalState {
     }
 }
 
-/// Strict for the same reason as [`OwnerQuery`].
+/// Strict for the same reason as [`ReaderQuery`].
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SynthesisRequest {
-    /// Reviews only this agent's memories, as [`OwnerQuery`] scopes a change.
+    /// Reviews what this agent reaches, as [`ReaderQuery`] does.
     #[serde(default)]
     pub agent_id: Option<String>,
     /// Absent: the whole store.
@@ -822,7 +823,7 @@ pub struct ResolveRequest {
     /// Both rows stand instead of `other` being superseded by `keep`.
     #[serde(default)]
     pub keep_both: bool,
-    /// Scopes the resolution to this agent's rows, as [`OwnerQuery`] does.
+    /// The agent the resolution acts for, as in [`ReaderQuery`].
     #[serde(default)]
     pub agent_id: Option<String>,
 }
@@ -840,7 +841,7 @@ pub struct JudgeRequest {
     /// The caller declares the user answered, with the answer in `reason`.
     #[serde(default)]
     pub user_answered: bool,
-    /// Scopes the verdict to this agent's rows, as [`OwnerQuery`] does.
+    /// The agent the verdict acts for, as in [`ReaderQuery`].
     #[serde(default)]
     pub agent_id: Option<String>,
 }
@@ -1139,7 +1140,8 @@ async fn save_memory(
         ));
     }
     if !derived_from.is_empty() {
-        let existing = existing_memory_ids(&app.runtime.store, &derived_from, Some(&body.agent_id))
+        let saver = reader(&app, &body.agent_id);
+        let existing = existing_memory_ids(&app.runtime.store, &derived_from, Some(&saver))
             .await
             .map_err(ApiError::internal)?;
         let missing = missing_sources(&derived_from, &existing);
@@ -1149,7 +1151,7 @@ async fn save_memory(
                 "derived_from names memories that do not exist or were deleted: {ids}"
             )));
         }
-        let replaced = replaced_memory_ids(&app.runtime.store, &derived_from, Some(&body.agent_id))
+        let replaced = replaced_memory_ids(&app.runtime.store, &derived_from, Some(&saver))
             .await
             .map_err(ApiError::internal)?;
         if !replaced.is_empty() {
@@ -1302,19 +1304,22 @@ async fn search(
     Ok(Json(SearchBody { hits, withheld }))
 }
 
-/// Whose memories `reader` may read, from the policy in the data directory,
-/// read on every call so a change counts from the next request on. A policy
-/// that cannot be read shares nothing, so an exclusion the user wrote is never
-/// lost to a typo: the agent keeps its own memories and the user finds the
-/// reason here and in `memory_status`.
-fn reach(app: &AppCtx, reader: &str) -> Reach {
-    match sharing::load(&app.runtime.base_dir) {
-        Ok(policy) => policy.reach_for(reader),
-        Err(e) => {
-            log::warn!("{e}; nothing is shared");
-            Reach::Own
-        }
-    }
+/// `agent` with what the policy in the data directory lets it reach, read on
+/// every call so a change counts from the next request on. A policy that
+/// cannot be read shares nothing (`sharing::reader_in`), and the user finds
+/// the reason in the log and in `memory_status`.
+fn reader(app: &AppCtx, agent: &str) -> Reader {
+    sharing::reader_in(&app.runtime.base_dir, agent)
+}
+
+/// The reader a call by id names, or `None` for the user's own call.
+fn named_reader(app: &AppCtx, agent: Option<&str>) -> Option<Reader> {
+    agent.map(|a| reader(app, a))
+}
+
+/// What `agent`'s searches reach.
+fn reach(app: &AppCtx, agent: &str) -> Reach {
+    reader(app, agent).reach
 }
 
 /// Builds the 4-block memory prefix for a query.
@@ -1463,15 +1468,16 @@ async fn get_memory(
     Ok(Json(ItemBody { item }))
 }
 
-/// The save the row is a piece of, scoped like the other routes by id: a
-/// row that is missing, deleted or another agent's is the same 404.
+/// The save the row is a piece of, as far as the reader reaches it: a row
+/// that is missing, deleted or out of reach is the same 404.
 async fn get_save(
     State(app): State<Arc<AppCtx>>,
     Path((kind, id)): Path<(String, i64)>,
-    Query(owner): Query<OwnerQuery>,
+    Query(q): Query<ReaderQuery>,
 ) -> ApiResult<Json<SaveText>> {
     let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
-    let save = read_save_core(&app.runtime.store, kind, id, owner.agent.as_deref())
+    let reader = named_reader(&app, q.agent.as_deref());
+    let save = read_save_core(&app.runtime.store, kind, id, reader.as_ref())
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("no {kind:?} row with id {id}")))?;
@@ -1481,7 +1487,7 @@ async fn get_save(
 async fn update_memory(
     State(app): State<Arc<AppCtx>>,
     Path((kind, id)): Path<(String, i64)>,
-    Query(owner): Query<OwnerQuery>,
+    Query(q): Query<ReaderQuery>,
     Json(body): Json<UpdateRequest>,
 ) -> ApiResult<Json<UpdatedBody>> {
     let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
@@ -1489,9 +1495,10 @@ async fn update_memory(
         .map_err(|e| ApiError::bad_request(e.to_string()))?
         .answered(body.user_answered);
     // The core answers `None` for "no such row", "already soft-deleted" and
-    // "another agent's" alike, and from the caller's side those are the same
+    // "out of reach" alike, and from the caller's side those are the same
     // fact: the row it named is not there to change.
-    let row = update_memory_core(&app.runtime.store, id, kind, &patch, owner.agent.as_deref())
+    let reader = named_reader(&app, q.agent.as_deref());
+    let row = update_memory_core(&app.runtime.store, id, kind, &patch, reader.as_ref())
         .await
         .map_err(|e| match e {
             UpdateError::NeedsUser { .. } => ApiError::conflict(e.to_string()),
@@ -1504,10 +1511,11 @@ async fn update_memory(
 async fn delete_memory(
     State(app): State<Arc<AppCtx>>,
     Path((kind, id)): Path<(String, i64)>,
-    Query(owner): Query<OwnerQuery>,
+    Query(q): Query<ReaderQuery>,
 ) -> ApiResult<Json<DeletedBody>> {
     let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
-    let deleted = delete_memory_core(&app.runtime.store, id, kind, owner.agent.as_deref())
+    let reader = named_reader(&app, q.agent.as_deref());
+    let deleted = delete_memory_core(&app.runtime.store, id, kind, reader.as_ref())
         .await
         .map_err(ApiError::internal)?;
 
@@ -1523,14 +1531,15 @@ async fn delete_memory(
 async fn restore_memory(
     State(app): State<Arc<AppCtx>>,
     Path((kind, id)): Path<(String, i64)>,
-    Query(owner): Query<OwnerQuery>,
+    Query(q): Query<ReaderQuery>,
 ) -> ApiResult<Json<RestoredBody>> {
     let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
     if kind != MemoryKind::Memory {
         return Err(ApiError::bad_request(RestoreError::OnlyMemory(kind).to_string()));
     }
     let embedder = ready_embedder(&app)?;
-    match restore_memory_core(&app.runtime.store, embedder.as_ref(), kind, id, owner.agent.as_deref()).await {
+    let reader = named_reader(&app, q.agent.as_deref());
+    match restore_memory_core(&app.runtime.store, embedder.as_ref(), kind, id, reader.as_ref()).await {
         Ok(row) => Ok(Json(row.into())),
         Err(e @ RestoreError::OnlyMemory(_)) => Err(ApiError::bad_request(e.to_string())),
         Err(RestoreError::NotFound(_)) => Err(ApiError::not_found(format!("no deleted {kind:?} row with id {id}"))),
@@ -1588,7 +1597,8 @@ async fn resolve_dispute(
     Json(body): Json<ResolveRequest>,
 ) -> ApiResult<Json<Resolution>> {
     let outcome = if body.keep_both { Outcome::KeepBoth } else { Outcome::Supersede };
-    resolve_dispute_core(&app.runtime.store, body.keep, body.other, outcome, body.agent_id.as_deref())
+    let reader = named_reader(&app, body.agent_id.as_deref());
+    resolve_dispute_core(&app.runtime.store, body.keep, body.other, outcome, reader.as_ref())
         .await
         .map(Json)
         .map_err(resolve_error)
@@ -1601,15 +1611,8 @@ async fn judge_dispute(
     let verdict: Verdict = body.verdict.parse().map_err(|e: clawg_core::memory::dispute::UnknownVerdict| {
         ApiError::bad_request(e.to_string())
     })?;
-    judge_pair(
-        &app.runtime.store,
-        body.keep,
-        body.other,
-        verdict,
-        body.reason,
-        body.user_answered,
-        body.agent_id.as_deref(),
-    )
+    let reader = named_reader(&app, body.agent_id.as_deref());
+    judge_pair(&app.runtime.store, body.keep, body.other, verdict, body.reason, body.user_answered, reader.as_ref())
         .await
         .map(Json)
         .map_err(resolve_error)
@@ -1812,7 +1815,7 @@ pub fn clamp_docs_limit(limit: Option<usize>) -> usize {
     limit.unwrap_or(DEFAULT_DOCS_LIMIT).clamp(1, MAX_DOCS_LIMIT)
 }
 
-/// Strict for the same reason as [`OwnerQuery`].
+/// Strict for the same reason as [`ReaderQuery`].
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DocsSearchRequest {

@@ -7,7 +7,7 @@ use std::time::Instant;
 use crate::memory::clock::TimestampMs;
 use crate::memory::pieces::SaveLink;
 use crate::memory::score::{score as compute_score, RawHit, ScoringConfig};
-use crate::memory::sharing::Reach;
+use crate::memory::sharing::{Reach, Reader};
 use crate::memory::vector::to_unit;
 use crate::memory::{MemoryError, MemoryStore, TableKind};
 
@@ -83,6 +83,22 @@ macro_rules! reach_predicate {
         )
     };
 }
+pub(crate) use reach_predicate;
+
+/// The reach of `reader` as [`reach_bind`] binds it, or NULL for a call with
+/// no reader, which is the user's: [`reader_predicate!`] lets it reach every row.
+pub(crate) fn reader_bind(reader: Option<&Reader>) -> Option<String> {
+    reader.map(|r| reach_bind(&r.agent_id, &r.reach))
+}
+
+/// [`reach_predicate!`] over what [`reader_bind`] binds to `$param`, true for
+/// every row when it bound NULL.
+macro_rules! reader_predicate {
+    ($author:literal, $param:literal) => {
+        concat!("(", $param, " IS NULL OR ", $crate::memory::search::reach_predicate!($author, $param), ")")
+    };
+}
+pub(crate) use reader_predicate;
 
 /// The project predicate of `memory` rows under the column prefix `$m`
 /// (`"m."`, or `""` without an alias), for the project bound to `$param`: no

@@ -290,7 +290,7 @@ impl MemoryRuntime {
         let failed = self.store.outbox_find_failed(operation_id, agent).await?;
         let mut deleted = Vec::new();
         for id in failed.inserted() {
-            if delete_memory_core(&self.store, id, MemoryKind::Memory, Some(&failed.agent_id)).await?.deleted == 1 {
+            if delete_memory_core(&self.store, id, MemoryKind::Memory, None).await?.deleted == 1 {
                 deleted.push(id);
             }
         }

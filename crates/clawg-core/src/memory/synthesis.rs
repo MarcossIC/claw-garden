@@ -15,6 +15,8 @@ use serde::Serialize;
 
 use crate::memory::admin::{map_memory_row, MemoryAdminRow, SELECT_MEMORY};
 use crate::memory::clock::TimestampMs;
+use crate::memory::search::{reader_bind, reader_predicate};
+use crate::memory::sharing::Reader;
 use crate::memory::{MemoryError, MemoryStore};
 
 /// Pending memories returned when the caller does not say how many.
@@ -325,26 +327,27 @@ pub async fn conclusions_to_review_count(
 }
 
 /// The ids among `ids` that name a `memory` row not deleted but superseded,
-/// ascending, each with the row that replaced it. With an agent, another
-/// agent's row is left out, as in [`existing_memory_ids`].
+/// ascending, each with the row that replaced it. A row out of `reader`'s
+/// reach is left out, as in [`existing_memory_ids`].
 pub async fn replaced_memory_ids(
     store: &MemoryStore,
     ids: &[i64],
-    agent_id: Option<&str>,
+    reader: Option<&Reader>,
 ) -> Result<Vec<(i64, Option<i64>)>, MemoryError> {
     let ids = ids.to_vec();
-    let agent_id = agent_id.map(str::to_owned);
+    let reach = reader_bind(reader);
     store
         .conn
         .call(move |c| -> rusqlite::Result<Vec<(i64, Option<i64>)>> {
             use rusqlite::OptionalExtension;
-            let mut stmt = c.prepare_cached(
+            let mut stmt = c.prepare_cached(concat!(
                 "SELECT superseded_by FROM memory WHERE id = ?1 AND deleted_at IS NULL \
-                 AND status = 'superseded' AND (?2 IS NULL OR agent_id = ?2)",
-            )?;
+                 AND status = 'superseded' AND ",
+                reader_predicate!("agent_id", "?2")
+            ))?;
             let mut found = Vec::new();
             for id in ids {
-                if let Some(by) = stmt.query_row(rusqlite::params![id, agent_id], |r| r.get(0)).optional()? {
+                if let Some(by) = stmt.query_row(rusqlite::params![id, reach], |r| r.get(0)).optional()? {
                     found.push((id, by));
                 }
             }
@@ -356,26 +359,26 @@ pub async fn replaced_memory_ids(
         .map_err(backend("source lookup"))
 }
 
-/// The ids among `ids` that name a `memory` row not deleted, ascending. With
-/// an agent, another agent's row counts as missing, like an id that is not
-/// there.
+/// The ids among `ids` that name a `memory` row not deleted, ascending. A row
+/// out of `reader`'s reach counts as missing, like an id that is not there, so
+/// a refusal never confirms a row the policy hides.
 pub async fn existing_memory_ids(
     store: &MemoryStore,
     ids: &[i64],
-    agent_id: Option<&str>,
+    reader: Option<&Reader>,
 ) -> Result<Vec<i64>, MemoryError> {
     let ids = ids.to_vec();
-    let agent_id = agent_id.map(str::to_owned);
+    let reach = reader_bind(reader);
     store
         .conn
         .call(move |c| -> rusqlite::Result<Vec<i64>> {
-            let mut stmt = c.prepare_cached(
-                "SELECT id FROM memory WHERE id = ?1 AND deleted_at IS NULL \
-                 AND (?2 IS NULL OR agent_id = ?2)",
-            )?;
+            let mut stmt = c.prepare_cached(concat!(
+                "SELECT id FROM memory WHERE id = ?1 AND deleted_at IS NULL AND ",
+                reader_predicate!("agent_id", "?2")
+            ))?;
             let mut found = Vec::new();
             for id in ids {
-                if stmt.exists(rusqlite::params![id, agent_id])? {
+                if stmt.exists(rusqlite::params![id, reach])? {
                     found.push(id);
                 }
             }
@@ -390,6 +393,7 @@ pub async fn existing_memory_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::sharing::Reach;
     use crate::memory::admin::{delete_memory_core, MemoryKind};
 
     async fn seed(store: &MemoryStore, project: Option<&str>, content: &str, created_at: i64) -> i64 {
@@ -612,7 +616,8 @@ mod tests {
         let theirs = seed_as(&store, "b", None, "theirs", 4).await;
         supersede(&store, theirs, new, 4).await;
 
-        assert_eq!(replaced_memory_ids(&store, &[new, old, live, theirs], Some("a")).await.unwrap(), vec![(old, Some(new))]);
+        let hidden = Reader::new("a", Reach::AllBut(vec!["b".into()]));
+        assert_eq!(replaced_memory_ids(&store, &[new, old, live, theirs], Some(&hidden)).await.unwrap(), vec![(old, Some(new))]);
         assert_eq!(
             replaced_memory_ids(&store, &[old, theirs], None).await.unwrap(),
             vec![(old, Some(new)), (theirs, Some(new))]
@@ -620,12 +625,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_ids_leave_out_another_agents_rows() {
+    async fn existing_ids_follow_the_readers_reach() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let mine = seed_as(&store, "a", None, "mine", 1).await;
         let theirs = seed_as(&store, "b", None, "theirs", 2).await;
 
-        assert_eq!(existing_memory_ids(&store, &[mine, theirs], Some("a")).await.unwrap(), vec![mine]);
+        let shared = Reader::new("a", Reach::AllBut(Vec::new()));
+        let hidden = Reader::new("a", Reach::AllBut(vec!["b".into()]));
+        assert_eq!(existing_memory_ids(&store, &[mine, theirs], Some(&shared)).await.unwrap(), vec![mine, theirs]);
+        assert_eq!(existing_memory_ids(&store, &[mine, theirs], Some(&hidden)).await.unwrap(), vec![mine]);
         assert_eq!(existing_memory_ids(&store, &[mine, theirs], None).await.unwrap(), vec![mine, theirs]);
     }
 

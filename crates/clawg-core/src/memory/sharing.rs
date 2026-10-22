@@ -62,6 +62,40 @@ impl Reach {
     }
 }
 
+/// An agent acting on the store, with what the policy lets it reach. What it
+/// reaches it reads whole, changes, deletes, restores and judges, whoever
+/// saved it; a call with no reader is the user's and reaches every row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reader {
+    pub agent_id: String,
+    pub reach: Reach,
+}
+
+impl Reader {
+    pub fn new(agent_id: impl Into<String>, reach: Reach) -> Self {
+        Self { agent_id: agent_id.into(), reach }
+    }
+
+    /// Whether this reader reaches a row `author` saved; `None` when no agent did.
+    pub fn admits(&self, author: Option<&str>) -> bool {
+        self.reach.admits(&self.agent_id, author)
+    }
+}
+
+/// `agent_id` as the policy in `base_dir` lets it reach. A policy that cannot
+/// be read shares nothing, so an exclusion the user wrote is never lost to a
+/// typo: the agent keeps its own rows and the ones no agent saved.
+pub fn reader_in(base_dir: &Path, agent_id: &str) -> Reader {
+    let reach = match load(base_dir) {
+        Ok(policy) => policy.reach_for(agent_id),
+        Err(e) => {
+            log::warn!("{e}; nothing is shared");
+            Reach::Own
+        }
+    };
+    Reader::new(agent_id, reach)
+}
+
 /// The file as written. `deny_unknown_fields` because a misspelled key
 /// (`"hide"`) would otherwise parse as an empty policy, and a user who meant to
 /// hide something would see it shared with no word about why.
@@ -218,6 +252,23 @@ mod tests {
         }
         assert!(!Reach::OwnOnly.admits("cursor", None), "a save is compared only against its agent's rows");
         assert!(Reach::OwnOnly.admits("cursor", Some("cursor")) && !Reach::OwnOnly.admits("cursor", Some("codex")));
+    }
+
+    #[test]
+    fn a_reader_admits_what_its_reach_admits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = SharingPolicy::default();
+        p.hide("b", "a");
+        save(dir.path(), &p).unwrap();
+        let b = reader_in(dir.path(), "b");
+        assert!(b.admits(Some("b")) && b.admits(Some("c")) && b.admits(None));
+        assert!(!b.admits(Some("a")), "a hidden author is out of reach");
+        assert!(reader_in(dir.path(), "a").admits(Some("b")), "an exclusion has a direction");
+
+        std::fs::write(sharing_file(dir.path()), "{ not json").unwrap();
+        let b = reader_in(dir.path(), "b");
+        assert_eq!(b.reach, Reach::Own, "an unreadable policy shares nothing");
+        assert!(b.admits(None) && !b.admits(Some("c")));
     }
 
     #[test]
