@@ -458,6 +458,16 @@ fn mode_of(path: &Path) -> u32 {
     std::fs::metadata(path).expect("metadata").permissions().mode() & 0o777
 }
 
+#[tokio::test]
+async fn a_daemon_names_its_version_first() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+
+    let log = daemon.log_text();
+    let first = log.lines().next().unwrap_or_default();
+    assert!(first.contains(&format!("clawg serve {} starting, profile dev", env!("CARGO_PKG_VERSION"))), "{log}");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn a_daemon_on_a_fresh_home_leaves_a_private_data_directory() {
@@ -916,6 +926,27 @@ async fn a_bridge_starts_its_daemon_through_the_binary() {
     let state = state_of(&sandbox.data_dir()).expect("the bridge started a daemon");
     assert_eq!(state["unix_socket"], true, "{state}");
     assert!(state.get("port").is_none(), "{state}");
+}
+
+#[tokio::test]
+async fn an_autostart_rotates_a_full_serve_log() {
+    let sandbox = Sandbox::new();
+    let _stop = StopOnDrop { home: sandbox.home.clone() };
+    let logs = sandbox.data_dir().join("logs");
+    std::fs::create_dir_all(&logs).expect("logs dir");
+    let full = vec![b'x'; clawg_cli::serve_log::SERVE_LOG_LIMIT as usize + 1];
+    std::fs::write(logs.join("serve.log"), &full).expect("full log");
+    let mut bridge = sandbox.bridge_starting_its_daemon();
+
+    bridge.initialize();
+    let status = bridge.call(2, "memory_status", json!({}));
+
+    assert!(!tool_failed(&status), "{status}");
+    assert_eq!(std::fs::read(logs.join("serve.log.1")).expect("the old log moved aside"), full);
+    let log = std::fs::read_to_string(logs.join("serve.log")).expect("a new log");
+    let first = log.lines().next().unwrap_or_default();
+    let opening: String = first.chars().take(200).collect();
+    assert!(first.contains(&format!("clawg serve {} starting", env!("CARGO_PKG_VERSION"))), "{opening}");
 }
 
 // ── MCP over real stdio ────────────────────────────────────────────────────

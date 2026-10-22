@@ -1,6 +1,6 @@
 # serve-log-rotation — Exploración
 
-Objetivo transversal, tamaño S. `logs/serve.log` crece sin límite y no dice qué versión escribió cada parte. Es la propuesta M9 de una propuesta de medición escrita sobre 0.26.0; se separa de [usage-metrics](../archive/2026-10-22-usage-metrics/exploration.md) (71) porque no depende de nada y se puede entregar antes.
+Objetivo transversal, tamaño S. `logs/serve.log` crece sin límite y no dice qué versión escribió cada parte. Es la propuesta M9 de una propuesta de medición escrita sobre 0.26.0; se separa de [usage-metrics](../2026-10-22-usage-metrics/exploration.md) (71) porque no depende de nada y se puede entregar antes.
 
 ## Premisas que se verificaron y cuáles no eran del todo ciertas
 
@@ -45,7 +45,7 @@ Pierde justo lo que el comentario de `client.rs:1279-1280` protege: la cola de l
 
 ## Decisiones abiertas
 
-- [ ] Tope y cantidad de ficheros (candidato: 10 MB y tres).
+- [x] Tope y cantidad de ficheros: 10 MiB y tres ficheros (`serve.log`, `.1` y `.2`); ver la [propuesta](proposal.md).
 
 ## Cómo se mide
 

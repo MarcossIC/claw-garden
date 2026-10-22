@@ -103,6 +103,9 @@ fn classify_open_error(err: MemoryError) -> ServeError {
 /// port, and the real one is what gets published in `daemon.json`, so clients
 /// always dial where the listener actually is.
 pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> {
+    // First, before anything can fail: `serve.log` outlives binaries, since
+    // `update` starts the new one on the same file.
+    log::info!("{}", starting_line(profile, build_info::version(), build_info::dist_target()));
     let base_dir = data_dir(profile)?;
     ensure_private_dir(&base_dir).map_err(|source| ServeError::DataDir {
         path: base_dir.display().to_string(),
@@ -366,6 +369,13 @@ fn bind_profile_socket(base_dir: &std::path::Path, explicit_port: bool) -> Resul
     }
 }
 
+fn starting_line(profile: Profile, version: &str, dist_target: Option<&str>) -> String {
+    match dist_target {
+        Some(target) => format!("clawg serve {version} ({target}) starting, profile {}", profile.as_str()),
+        None => format!("clawg serve {version} starting, profile {}", profile.as_str()),
+    }
+}
+
 fn listening_on(port: Option<u16>, socket: Option<&std::path::Path>) -> String {
     match (port, socket) {
         (Some(port), Some(socket)) => format!("127.0.0.1:{port} and {}", socket.display()),
@@ -492,6 +502,15 @@ mod tests {
         assert_eq!(tcp_plan(None, 27381, false, Some(DefaultPort::Off)), Required(27381), "never no transport");
         assert_eq!(tcp_plan(None, 27381, true, Some(DefaultPort::Port(4001))), Optional(4001));
         assert_eq!(tcp_plan(None, 27381, false, Some(DefaultPort::Port(4001))), Required(4001));
+    }
+
+    #[test]
+    fn the_starting_line_names_the_version_and_the_build() {
+        assert_eq!(
+            starting_line(Profile::Dev, "0.50.0", Some("x86_64-unknown-linux-gnu")),
+            "clawg serve 0.50.0 (x86_64-unknown-linux-gnu) starting, profile dev"
+        );
+        assert_eq!(starting_line(Profile::Prod, "0.50.0", None), "clawg serve 0.50.0 starting, profile prod");
     }
 
     #[test]
