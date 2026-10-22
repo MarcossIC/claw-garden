@@ -30,7 +30,7 @@ Si la rotación falla, `spawn_serve_at` MUST abrir `serve.log` igual, en append,
 - WHEN se rota y ese manejador escribe
 - THEN lo escrito queda en `serve.log.1`
 
-**Tests:** `nothing_rotates_up_to_the_limit`, `over_the_limit_each_file_moves_one_place`, `rotating_keeps_three_files`, `a_file_open_for_writing_still_rotates`, `a_failed_rotation_is_written_to_the_log` (`serve_log.rs`); `an_autostart_rotates_a_full_serve_log` (`tests/binary.rs`).
+**Tests:** `nothing_rotates_up_to_the_limit`, `a_log_under_the_limit_is_appended_to`, `over_the_limit_each_file_moves_one_place`, `rotating_keeps_three_files`, `a_file_open_for_writing_still_rotates`, `a_failed_rotation_is_written_to_the_log` (`serve_log.rs`); `an_autostart_rotates_a_full_serve_log` (`tests/binary.rs`).
 
 ## R2. La primera línea del daemon nombra su versión
 
