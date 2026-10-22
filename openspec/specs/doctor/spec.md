@@ -4,6 +4,7 @@ Fuente de verdad de `clawg doctor`: qué `clawg` resuelve el PATH y qué está m
 
 **Origen:**
 - [doctor-checks](../../changes/archive/2026-10-20-doctor-checks/proposal.md), archivado el 2026-10-20. Los ids de requisito son los de esa spec. El análisis del PATH (`analyze`) es anterior y queda como estaba.
+- [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22: `memory.topic` y `memory.content_hash` agrupan por proyecto y nombran a los autores; el texto de `fallback_agent`.
 
 **Dónde vive:** las decisiones en `crates/clawg-cli/src/doctor/` (`finding.rs`, el sobre y el resumen; `checks.rs`, los chequeos puros; `mcp.rs`, el registro; `mod.rs`, el PATH y la lectura en `run`); los hechos del store en `crates/clawg-core/src/memory/inspect.rs`. Un test citado como «(`doctor`)» está en el `mod tests` de alguno de esos archivos.
 
@@ -117,14 +118,16 @@ Una fila está viva cuando `deleted_at IS NULL AND status <> 'superseded'`. Un s
 
 | # | `check_id` | Violación | Severidad | `reason_code` |
 |---|---|---|---|---|
-| 1 | `memory.topic` | más de un save vivo por (agente, proyecto, `topic_key`) | `warn` | `several_live_saves`, con el agente, el proyecto y la primera fila de cada save |
+| 1 | `memory.topic` | más de un save vivo por (proyecto, `topic_key`), de cualquier autor | `warn` | `several_live_saves`, con los autores (`agents`, `null` por una fila sin autor), el proyecto y la primera fila de cada save |
 | 2 | `memory.superseded_by` | una fila no borrada `superseded` cuyo `superseded_by` es nulo o no existe | `warn` (`dangling`) si su causa es `revision` o nula; `info` (`dangling_verdict`) si es `verdict`, que `purge` deja a propósito | |
 | 3 | `memory.revived_from` | `revived_from` que no existe | `info` | `dangling` (sólo impide volver a ocultarla al restaurar una fila purgada) |
-| 4 | `memory.content_hash` | dos filas vivas con el mismo `content_hash` en el mismo (agente, proyecto) | `warn` | `live_duplicates` |
+| 4 | `memory.content_hash` | dos filas vivas con el mismo `content_hash` en el mismo proyecto, de cualquier autor | `warn` | `live_duplicates`, con los autores (`agents`), el proyecto y los ids |
 | 5 | `memory.pieces` | un save cuyo primer pedazo ya no existe y algún otro vínculo guarda `context` | `warn` | `purged_header`, con el `save_id`: el texto purgado sigue en `memory.db` |
 | 6 | `memory.disputed` | una fila viva `disputed` sin ninguna fila viva en `disputed_against` | `info` | `no_live_rival` (la limpieza diaria la devuelve a `active`) |
 
 Un vínculo de `memory_piece` hacia una fila que no existe sin `context` no es una violación: `purge` lo deja a propósito para decir qué pedazo falta.
+
+Las reglas 1 y 4 agrupan por proyecto, como la clave de tema y el dedup ([`specs/ingest`](../ingest/spec.md)). Una base de una versión anterior, cuando esas reglas eran por agente y proyecto, puede tener dos agentes con un titular o un mismo texto vivo cada uno en un proyecto: el doctor los marca, sin `safe_next_step`, y el próximo save con esa clave reemplaza a los dos. Dos agentes que `sharing.json` oculta entre sí también pueden dejar un titular cada uno a propósito, y el doctor, que no lee la política, los marca igual.
 
 #### Escenario: pedazos de un save
 - GIVEN un save largo de tres pedazos vivos bajo un mismo `topic_key`
@@ -145,7 +148,7 @@ Un vínculo de `memory_piece` hacia una fila que no existe sin `context` no es u
 | `outbox` | filas `pending` sin daemon | `info` `pending`, con la cantidad | `clawg serve --profile P` |
 | `outbox` | una fila `failed` | `warn` `failed`, una por fila, con el `operation_id`, el agente y los intentos | `clawg outbox retry <OPERATION_ID> --agent <AGENT> --profile P` |
 | `agents` | siempre que haya filas | `ok`, con cada agente y sus filas vivas y totales | — |
-| `agents` | filas vivas del agente de respaldo `mcp` | `warn` `fallback_agent`, con la cantidad: un cliente no dio `--agent` ni `clientInfo.name` | — |
+| `agents` | filas vivas del agente de respaldo `mcp` | `warn` `fallback_agent`, con la cantidad: un cliente no dio `--agent` ni `clientInfo.name`; todo agente las lee y las cambia, pero el workspace y RECENT del agente real del cliente no las incluyen | — |
 | `projects` | una fila de `project` cuyo id no es `derive_project_id(root_path)` | `warn` `id_mismatch`, con el id y la ruta | — |
 
 Con filas `pending` y un daemon vivo no hay hallazgo: las está ingiriendo.

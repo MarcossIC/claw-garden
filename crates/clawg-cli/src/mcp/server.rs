@@ -60,9 +60,9 @@ fn is_root_collision(err: &ClientError) -> bool {
 
 /// Agent id used when neither `--agent` nor the MCP client named one.
 ///
-/// Memories are scoped per agent, so this is not cosmetic: everything saved
-/// under it is retrievable under it, and a client that changes its reported
-/// name effectively gets a new memory.
+/// Not cosmetic: every agent reads and changes what it saves under it, but
+/// the workspace, RECENT and the hook's reminder are per agent, so a client
+/// that changes its reported name leaves those behind.
 pub const FALLBACK_AGENT_ID: &str = "mcp";
 
 /// Where the agent id of a call came from.
@@ -256,6 +256,10 @@ pub struct SynthesizeArgs {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ListMemoriesArgs {
+    /// Only the memories this agent saved, as named after `by` in a listing
+    /// or a search. Lists every agent's you can read when omitted.
+    #[serde(default)]
+    pub agent: Option<String>,
     /// Which table to list: memory, episodic or procedural. Lists all three
     /// when omitted.
     #[serde(default)]
@@ -832,8 +836,9 @@ impl ClawgMcp {
         }
     }
 
-    /// Lists the calling agent's rows only, across all of its projects: the
-    /// agent is the visibility boundary, the project is not.
+    /// Lists every row the calling agent reaches, across all projects, or one
+    /// author's with `agent`. The project is no boundary here, as it is none
+    /// for the agent's search with `all_projects`.
     pub async fn list_memories_impl(
         &self,
         agent_id: &str,
@@ -849,20 +854,23 @@ impl ClawgMcp {
                         memory_type: args.memory_type.clone(),
                         limit: args.limit,
                         offset: args.offset,
-                        agent: Some(agent_id.to_string()),
+                        reader: Some(agent_id.to_string()),
+                        agent: args.agent.clone(),
                         ..Default::default()
                     })
                     .await
             })
             .await;
         match result {
-            Ok(Ok(rows)) => Self::ok(format_rows(&rows)),
+            Ok(Ok(rows)) => Self::ok(format_rows(&rows, agent_id)),
             Ok(Err(e)) => Self::failed(Self::explain(&e)),
             Err(failure) => Ok(failure),
         }
     }
 
-    /// Another agent's row is refused as missing, like an id that is not there.
+    /// A row the sharing policy hides from the agent is refused as missing,
+    /// like an id that is not there; any other the agent may delete, whoever
+    /// saved it.
     pub async fn delete_memory_impl(
         &self,
         agent_id: &str,
@@ -879,7 +887,7 @@ impl ClawgMcp {
         }
     }
 
-    /// Another agent's row is refused as missing, as in `delete_memory_impl`.
+    /// Reaches what `delete_memory_impl` reaches.
     pub async fn restore_memory_impl(
         &self,
         agent_id: &str,
@@ -896,7 +904,8 @@ impl ClawgMcp {
         }
     }
 
-    /// Another agent's save is refused as missing, as in `delete_memory_impl`.
+    /// Reaches what `delete_memory_impl` reaches; a piece the agent cannot
+    /// read is named as missing.
     pub async fn read_memory_impl(
         &self,
         agent_id: &str,
@@ -932,7 +941,7 @@ impl ClawgMcp {
         }
     }
 
-    /// Another agent's row is refused as missing, as in `delete_memory_impl`.
+    /// Reaches what `delete_memory_impl` reaches.
     pub async fn update_memory_impl(
         &self,
         agent_id: &str,
@@ -960,7 +969,7 @@ impl ClawgMcp {
         }
     }
 
-    /// Both rows must be the calling agent's, as in `delete_memory_impl`.
+    /// Both rows must be within the agent's reach, as in `delete_memory_impl`.
     pub async fn resolve_conflict_impl(
         &self,
         agent_id: &str,
@@ -1016,7 +1025,7 @@ impl ClawgMcp {
         }
     }
 
-    /// Only the calling agent's memories, as in `list_memories_impl`.
+    /// Every memory of the project the calling agent reaches, whoever saved it.
     pub async fn synthesize_impl(
         &self,
         agent_id: &str,
@@ -1053,7 +1062,9 @@ impl ClawgMcp {
                 let sharing = format_sharing(&sharing::load(client.base_dir()), &agent_id);
                 // A daemon that predates the pair table has nothing to count,
                 // and a status must not fail over a line it can leave out.
-                let conflicts = client.open_disputes(&agent_id).await.map(|open| format_open_pairs(&open)).ok();
+                let project = self.save_project(None);
+                let conflicts =
+                    client.open_disputes(&agent_id, project.as_deref()).await.map(|open| format_open_pairs(&open)).ok();
                 Self::ok(format_status(
                     &health,
                     self.profile,
@@ -1135,9 +1146,11 @@ impl ClawgMcp {
     #[tool(
         name = "list_memories",
         description = "Browse what is stored, newest first, without searching. Use this to \
-                       show the user their memory inventory or to find an id to delete. \
-                       Returns one line per row: id, kind, type, tier, importance, access \
-                       count, status and a truncated summary."
+                       show the user their memory inventory or to find an id to delete. Lists \
+                       every memory you can read, yours and other agents'; `agent` lists one \
+                       agent's only. Returns one line per row: id, kind, type, tier, importance, \
+                       access count, status, `by <agent>` when another agent saved it, and a \
+                       truncated summary."
     )]
     async fn list_memories(
         &self,
@@ -1167,10 +1180,10 @@ impl ClawgMcp {
         name = "delete_memory",
         description = "Delete one stored memory by id and kind. Get the id from \
                        `search_memory`, `list_memories` or `recall_context` first — ids are \
-                       per-kind, so the same number exists in all three tables. Only your own \
-                       memories: one marked `by <agent>` was saved by another agent and is \
-                       read-only. Deleting the current memory of a `topic_key` makes the version \
-                       it replaced current again. `restore_memory` undoes it."
+                       per-kind, so the same number exists in all three tables. A memory marked \
+                       `by <agent>` was saved by another agent, and deleting it takes it from every \
+                       agent. Deleting the current memory of a `topic_key` makes the version it \
+                       replaced current again. `restore_memory` undoes it."
     )]
     async fn delete_memory(
         &self,
@@ -1182,12 +1195,11 @@ impl ClawgMcp {
 
     #[tool(
         name = "restore_memory",
-        description = "Undo a `delete_memory`: bring a memory you deleted back, with the id and \
-                       kind you deleted it with, when the user says the delete was a mistake. \
-                       Refused when the same text was saved again since, when a newer memory holds \
-                       its `topic_key`, or when the memory holds a secret. Names the memories saved \
-                       meanwhile that are close to it, to judge with `resolve_conflict`. Only your own \
-                       memories: one marked `by <agent>` is read-only."
+        description = "Undo a `delete_memory`: bring a deleted memory back, with the id and kind \
+                       it was deleted with, when the user says the delete was a mistake. Refused \
+                       when the same text was saved again since, when a newer memory holds its \
+                       `topic_key`, or when the memory holds a secret. Names the memories saved \
+                       meanwhile that are close to it, to judge with `resolve_conflict`."
     )]
     async fn restore_memory(
         &self,
@@ -1205,8 +1217,7 @@ impl ClawgMcp {
                        preference or a decision out of its type needs user_answered, set only \
                        when the user said so. To change what a memory says, save the new text \
                        and delete the old one instead. Returns the memory's importance, type and \
-                       tier after the change. Only your own memories: one marked `by <agent>` is \
-                       read-only."
+                       tier after the change, which every agent that reads it sees."
     )]
     async fn update_memory(
         &self,
@@ -1223,8 +1234,8 @@ impl ClawgMcp {
                        one under ACTIVE CONFLICTS in `recall_context`, once the user has said \
                        which holds. A preference or a decision is superseded only on the user's \
                        word: judge it conflicts and ask, then call supersedes with user_answered \
-                       and their answer in reason. Returns the status of both memories. Only \
-                       your own memories: one marked `by <agent>` is read-only."
+                       and their answer in reason. Returns the status of both memories. Either \
+                       side may be another agent's."
     )]
     async fn resolve_conflict(
         &self,
@@ -2104,9 +2115,10 @@ mod tests {
     }
 
     /// The memory viewer (`clawg memories`) is for the person at the terminal.
-    /// Handing a model its filters by agent and project, or its text search over
-    /// every row, would let it read across agents; so the tool a model sees keeps
-    /// exactly its five arguments, and no other tool takes the viewer's filters.
+    /// A model lists what its agent reaches, and may narrow it to one author,
+    /// but never by the viewer's project filter or its text search over every
+    /// row, which `search_memory` does by meaning; so the tool keeps exactly
+    /// these six arguments, and no other tool takes the viewer's filters.
     #[tokio::test]
     async fn the_viewer_is_not_exposed_to_the_model() {
         let (b, _d) = bridge().await;
@@ -2142,7 +2154,7 @@ mod tests {
             .map(String::as_str)
             .collect();
         properties.sort();
-        assert_eq!(properties, ["kind", "limit", "memory_type", "offset", "tier"]);
+        assert_eq!(properties, ["agent", "kind", "limit", "memory_type", "offset", "tier"]);
     }
 
     /// The model has to pick `memory_type` from the set the store recognises;
@@ -2209,7 +2221,7 @@ mod tests {
 
         let listed = text(&b.synthesize_impl("agent-mcp", SynthesizeArgs::default()).await.expect("synthesize"));
         assert!(listed.contains(&format!("#{} ", ids[0])), "{listed}");
-        assert!(!listed.contains(&format!("#{foreign} ")), "another agent's memory is not this one's to review: {listed}");
+        assert!(listed.contains(&format!("#{foreign} ")), "another agent's memory of the project is reviewed too: {listed}");
         assert!(!text(&recall().await.expect("recall")).contains("`synthesize`"), "the review turns the reminder off");
 
         let conclusion = SaveMemoryArgs {
@@ -2558,6 +2570,7 @@ mod tests {
 
         let listed = b
             .list_memories_impl("agent-mcp", ListMemoriesArgs {
+                agent: None,
                 kind: Some("memory".into()),
                 tier: None,
                 memory_type: None,
@@ -2918,7 +2931,8 @@ mod tests {
         let t = status("agent-mcp").await;
         assert!(t.contains("conflict candidates: 1 for you to judge, 0 waiting for the user"), "{t}");
         assert!(t.contains(&format!("#{new} inferred close to #{old} inferred")), "two undeclared saves: {t}");
-        assert!(status("agent-other").await.ends_with("\nconflict candidates: none open"));
+        let other = status("agent-other").await;
+        assert!(other.contains("conflict candidates: 1 for you to judge"), "another agent judges it too: {other}");
     }
 
     #[tokio::test]
@@ -3232,29 +3246,37 @@ mod tests {
     }
 
     fn list_all() -> ListMemoriesArgs {
-        ListMemoriesArgs { kind: None, tier: None, memory_type: None, limit: None, offset: None }
+        ListMemoriesArgs { agent: None, kind: None, tier: None, memory_type: None, limit: None, offset: None }
+    }
+
+    /// Takes every exclusion away.
+    fn share_all(dir: &tempfile::TempDir) {
+        sharing::save(dir.path(), &sharing::SharingPolicy::default()).expect("save policy");
     }
 
     #[tokio::test]
-    async fn an_agent_cannot_delete_another_agents_memory() {
-        let (b, _d) = bridge().await;
+    async fn another_agent_deletes_a_memory_unless_hidden() {
+        let (b, d) = bridge().await;
         let content = "agent a keeps its release notes in the wiki";
         let id = saved_id(&b, "agent-a", content).await;
 
+        hide(&d, "agent-b", "agent-a");
         let r = b
             .delete_memory_impl("agent-b", DeleteMemoryArgs { id, kind: "memory".into() })
             .await
             .expect("call");
-        assert!(is_error(&r), "another agent's memory must not be deletable: {}", text(&r));
-
+        assert!(is_error(&r), "a hidden author's memory must not be deletable: {}", text(&r));
         let listed = b.list_memories_impl("agent-a", list_all()).await.expect("list");
         assert!(text(&listed).contains(content), "the row must survive: {}", text(&listed));
 
+        share_all(&d);
         let r = b
-            .delete_memory_impl("agent-a", DeleteMemoryArgs { id, kind: "memory".into() })
+            .delete_memory_impl("agent-b", DeleteMemoryArgs { id, kind: "memory".into() })
             .await
             .expect("call");
-        assert!(!is_error(&r), "the owner deletes it: {}", text(&r));
+        assert!(!is_error(&r), "another agent deletes what it reaches: {}", text(&r));
+        let listed = b.list_memories_impl("agent-a", list_all()).await.expect("list");
+        assert!(!text(&listed).contains(content), "and its author sees it gone: {}", text(&listed));
     }
 
     fn restore_args(id: i64) -> RestoreMemoryArgs {
@@ -3282,18 +3304,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_agent_cannot_restore_another_agents_memory() {
-        let (b, _d) = bridge().await;
+    async fn another_agent_restores_a_memory_unless_hidden() {
+        let (b, d) = bridge().await;
         let content = "agent a keeps its release notes in the wiki";
         let id = saved_id(&b, "agent-a", content).await;
         b.delete_memory_impl("agent-a", DeleteMemoryArgs { id, kind: "memory".into() }).await.expect("call");
 
+        hide(&d, "agent-b", "agent-a");
         let r = b.restore_memory_impl("agent-b", restore_args(id)).await.expect("call");
-
-        assert!(is_error(&r), "another agent's memory must not be restorable: {}", text(&r));
+        assert!(is_error(&r), "a hidden author's memory must not be restorable: {}", text(&r));
         assert!(!text(&b.list_memories_impl("agent-a", list_all()).await.expect("list")).contains(content));
-        let r = b.restore_memory_impl("agent-a", restore_args(id)).await.expect("call");
-        assert!(!is_error(&r), "the owner restores it: {}", text(&r));
+
+        share_all(&d);
+        let r = b.restore_memory_impl("agent-b", restore_args(id)).await.expect("call");
+        assert!(!is_error(&r), "another agent restores what it reaches: {}", text(&r));
+        assert!(text(&b.list_memories_impl("agent-a", list_all()).await.expect("list")).contains(content));
     }
 
     #[tokio::test]
@@ -3330,17 +3355,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_agent_cannot_read_another_agents_save() {
-        let (b, _d) = bridge().await;
+    async fn another_agent_reads_a_save_unless_hidden() {
+        let (b, d) = bridge().await;
         let id = saved_id(&b, "agent-a", "agent a keeps its release notes in the wiki").await;
 
         let other = b.read_memory_impl("agent-b", read_args(id)).await.expect("call");
-        let missing = b.read_memory_impl("agent-b", read_args(999_999)).await.expect("call");
+        assert_eq!(text(&other), format!("#{id}\nagent a keeps its release notes in the wiki"));
 
-        assert!(is_error(&other), "another agent's save must not be readable: {}", text(&other));
-        assert_eq!(text(&other).replace(&id.to_string(), "N"), text(&missing).replace("999999", "N"));
-        let own = b.read_memory_impl("agent-a", read_args(id)).await.expect("call");
-        assert_eq!(text(&own), format!("#{id}\nagent a keeps its release notes in the wiki"));
+        hide(&d, "agent-b", "agent-a");
+        let hidden = b.read_memory_impl("agent-b", read_args(id)).await.expect("call");
+        let missing = b.read_memory_impl("agent-b", read_args(999_999)).await.expect("call");
+        assert!(is_error(&hidden), "a hidden author's save must not be readable: {}", text(&hidden));
+        assert_eq!(text(&hidden).replace(&id.to_string(), "N"), text(&missing).replace("999999", "N"));
     }
 
     #[test]
@@ -3435,33 +3461,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_agent_cannot_update_another_agents_memory() {
-        let (b, _d) = bridge().await;
+    async fn another_agent_updates_a_memory_unless_hidden() {
+        let (b, d) = bridge().await;
         let id = saved_id(&b, "agent-a", "agent a reviews pull requests on mondays").await;
 
+        hide(&d, "agent-b", "agent-a");
         let r = b.update_memory_impl("agent-b", update_args(id, Some(9.5), None)).await.expect("call");
-
-        assert!(is_error(&r), "another agent's memory must not change: {}", text(&r));
+        assert!(is_error(&r), "a hidden author's memory must not change: {}", text(&r));
         let listed = text(&b.list_memories_impl("agent-a", list_all()).await.expect("list"));
         assert!(listed.contains("imp=5.0"), "the row must stay as it was: {listed}");
+
+        share_all(&d);
+        let r = b.update_memory_impl("agent-b", update_args(id, Some(9.5), None)).await.expect("call");
+        assert!(!is_error(&r), "another agent changes what it reaches: {}", text(&r));
+        let listed = text(&b.list_memories_impl("agent-a", list_all()).await.expect("list"));
+        assert!(listed.contains("imp=9.5"), "and its author sees the change: {listed}");
     }
 
     #[tokio::test]
-    async fn an_agent_lists_only_its_own_memories() {
-        let (b, _d) = bridge().await;
-        saved_id(&b, "agent-a", "agent a prefers tabs over spaces").await;
-        saved_id(&b, "agent-b", "agent b prefers spaces over tabs").await;
+    async fn list_memories_names_other_authors_and_filters_by_agent() {
+        let (b, d) = bridge().await;
+        let a = saved_id(&b, "agent-a", "agent a prefers tabs over spaces").await;
+        let own = saved_id(&b, "agent-b", "agent b prefers spaces over tabs").await;
 
         let listed = text(&b.list_memories_impl("agent-b", list_all()).await.expect("list"));
+        let line = |id: i64| listed.lines().find(|l| l.starts_with(&format!("#{id} "))).unwrap_or_default().to_string();
+        assert!(line(a).contains(" by agent-a ") && line(a).contains("agent a prefers"), "{listed}");
+        assert!(!line(own).contains(" by "), "the agent's own rows name nobody: {listed}");
 
-        assert!(listed.contains("agent b prefers"), "{listed}");
-        assert!(!listed.contains("agent a prefers"), "another agent's memory leaked: {listed}");
+        let only_a = ListMemoriesArgs { agent: Some("agent-a".into()), ..list_all() };
+        let listed = text(&b.list_memories_impl("agent-b", only_a).await.expect("list"));
+        assert!(listed.contains("agent a prefers") && !listed.contains("agent b prefers"), "{listed}");
+
+        hide(&d, "agent-b", "agent-a");
+        let listed = text(&b.list_memories_impl("agent-b", list_all()).await.expect("list"));
+        assert!(!listed.contains("agent a prefers"), "a hidden author is not listed: {listed}");
     }
 
     #[tokio::test]
-    async fn an_agent_cannot_resolve_another_agents_conflict() {
+    async fn another_agent_resolves_a_conflict_unless_hidden() {
         let mut store = None;
-        let (b, _d) = bridge_with(|runtime| {
+        let (b, d) = bridge_with(|runtime| {
             store = Some(runtime.store.clone());
             runtime
         })
@@ -3480,20 +3520,26 @@ mod tests {
             .await
             .expect("mark the dispute");
 
-        let r = b
-            .resolve_conflict_impl("agent-b", ResolveConflictArgs { keep: new, other: old, verdict: "supersedes".into(), reason: None, user_answered: false })
-            .await
-            .expect("call");
+        let verdict = || ResolveConflictArgs { keep: new, other: old, verdict: "supersedes".into(), reason: None, user_answered: false };
+        let statuses = || async {
+            let client = b.client.get().await.expect("daemon");
+            let mut rows = client
+                .list(ListArgs { kind: Some("memory".into()), ..Default::default() })
+                .await
+                .expect("list");
+            rows.sort_by_key(|r| r.id);
+            rows.into_iter().map(|r| r.status).collect::<Vec<_>>()
+        };
 
-        assert!(is_error(&r), "another agent's conflict must not be resolvable: {}", text(&r));
-        let client = b.client.get().await.expect("daemon");
-        let mut rows = client
-            .list(ListArgs { kind: Some("memory".into()), ..Default::default() })
-            .await
-            .expect("list");
-        rows.sort_by_key(|r| r.id);
-        let statuses: Vec<&str> = rows.iter().map(|r| r.status.as_str()).collect();
-        assert_eq!(statuses, ["active", "disputed"], "a refused resolution changes nothing");
+        hide(&d, "agent-b", "agent-a");
+        let r = b.resolve_conflict_impl("agent-b", verdict()).await.expect("call");
+        assert!(is_error(&r), "a hidden author's conflict must not be resolvable: {}", text(&r));
+        assert_eq!(statuses().await, ["active", "disputed"], "a refused resolution changes nothing");
+
+        share_all(&d);
+        let r = b.resolve_conflict_impl("agent-b", verdict()).await.expect("call");
+        assert!(!is_error(&r), "another agent judges a pair it reaches: {}", text(&r));
+        assert_eq!(statuses().await, ["superseded", "active"]);
     }
 
     // ── project scoping ─────────────────────────────────────────────────────
@@ -3655,30 +3701,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_shared_memory_is_read_only() {
+    async fn a_shared_memory_is_changed_by_the_agent_that_found_it() {
         let (b, _d) = bridge().await;
         let content = "claude-code keeps the incident runbook in docs/runbook.md";
         let id = saved_id(&b, "claude-code", content).await;
         assert!(text(&b.search_memory_impl("cursor", search_args(content)).await.expect("search")).contains(content));
 
-        let r = b.delete_memory_impl("cursor", DeleteMemoryArgs { id, kind: "memory".into() }).await.expect("call");
-        assert!(is_error(&r), "a shared memory must not be deletable by its reader: {}", text(&r));
         let r = b.update_memory_impl("cursor", update_args(id, Some(9.5), None)).await.expect("call");
-        assert!(is_error(&r), "nor changed: {}", text(&r));
-
+        assert!(!is_error(&r), "the agent that found it changes it: {}", text(&r));
         let listed = text(&b.list_memories_impl("claude-code", list_all()).await.expect("list"));
-        assert!(listed.contains("imp=5.0") && listed.contains(&format!("#{id} ")), "the row stays as it was: {listed}");
-        assert!(!text(&b.list_memories_impl("cursor", list_all()).await.expect("list")).contains(content), "and is not listed as cursor's");
+        assert!(listed.contains("imp=9.5") && listed.contains(&format!("#{id} ")), "its author sees the change: {listed}");
+
+        let r = b.delete_memory_impl("cursor", DeleteMemoryArgs { id, kind: "memory".into() }).await.expect("call");
+        assert!(!is_error(&r), "and deletes it: {}", text(&r));
+        assert!(!text(&b.search_memory_impl("cursor", search_args(content)).await.expect("search")).contains(content));
     }
 
     #[tokio::test]
-    async fn tool_descriptions_say_shared_memories_are_read_only() {
+    async fn tool_descriptions_say_shared_memories_can_be_changed() {
         let (b, _d) = bridge().await;
-        for name in ["delete_memory", "update_memory", "resolve_conflict", "restore_memory"] {
-            let tool = b.tool_router.list_all().into_iter().find(|t| t.name == name).expect(name);
-            let description = tool.description.as_deref().unwrap_or_default();
-            assert!(description.contains("Only your own memories") && description.contains("read-only"), "{name}: {description}");
+        for name in ["delete_memory", "update_memory", "resolve_conflict", "restore_memory", "read_memory", "list_memories"] {
+            let description = description(&b, name);
+            assert!(!description.contains("Only your own") && !description.contains("read-only"), "{name}: {description}");
         }
+        assert!(description(&b, "list_memories").contains("`by <agent>`"));
     }
 
     #[tokio::test]
@@ -3688,12 +3734,12 @@ mod tests {
             let b = &b;
             async move { text(&b.memory_status_impl((agent.to_string(), AgentSource::Flag)).await.expect("status")) }
         };
-        assert!(status("cursor").await.contains("shared: reads every agent\n"));
+        assert!(status("cursor").await.contains("shared: reads and changes every agent's memories\n"));
         hide(&d, "cursor", "claude-code");
         hide(&d, "cursor", "codex");
-        assert!(status("cursor").await.contains("shared: reads every agent but claude-code, codex\n"));
+        assert!(status("cursor").await.contains("shared: reads and changes every agent's memories but claude-code's, codex's\n"));
         hide(&d, "cursor", "*");
-        assert!(status("cursor").await.contains("shared: none (reads no other agent)\n"));
+        assert!(status("cursor").await.contains("shared: none (reads and changes no other agent's memories)\n"));
         std::fs::write(clawg_core::paths::sharing_file(d.path()), "{").unwrap();
         let t = status("cursor").await;
         assert!(t.contains("shared: none (sharing.json is not valid"), "{t}");

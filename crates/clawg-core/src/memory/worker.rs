@@ -22,6 +22,7 @@ use crate::memory::pieces::StoredPiece;
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::events::{MemoryEvent, MemorySource};
 use crate::memory::redact::{redact, SecretKind};
+use crate::memory::sharing::Reader;
 use crate::memory::store_insert::{NewMemoryRecord, Stored};
 use crate::memory::topic::{inherit, unkeyed_revision, Replaced, Revision, TopicScope};
 use crate::memory::MemoryStore;
@@ -586,13 +587,14 @@ fn unstarted(
 async fn absorb_duplicate(
     store: &Arc<MemoryStore>,
     evt: &MemoryEvent,
+    saver: &Reader,
     content_hash: &str,
     absorbed: &mut u64,
     note: impl FnOnce(i64) -> Option<OutboxNote> + Send + 'static,
 ) -> Option<i64> {
     match store
         .reinforce_noting(
-            &evt.agent_id,
+            saver,
             evt.project_id.as_deref(),
             content_hash,
             evt.sources(),
@@ -674,8 +676,11 @@ async fn process_tracked(
     drain: DrainWatch<'_>,
 ) -> IngestReport {
     let row = track.as_ref().map(|t| t.row);
+    // Read once per event: the dedup, the detector and the key all compare
+    // the save with what its agent reaches in its project.
+    let saver = store.reader_for(&evt.agent_id);
     let scope = evt.topic().map(|key| TopicScope {
-        agent_id: evt.agent_id.clone(),
+        saver: saver.clone(),
         project_id: evt.project_id.clone(),
         key: key.to_string(),
     });
@@ -692,7 +697,7 @@ async fn process_tracked(
     let evt = inherited.as_ref().unwrap_or(evt);
     let earlier: Vec<i64> = earlier.iter().map(|r| r.id).collect();
     let (mut report, pieces) =
-        ingest_pieces(evt, store, embedder_cell, chat_chunker, absorbed, track, &earlier, drain).await;
+        ingest_pieces(evt, &saver, store, embedder_cell, chat_chunker, absorbed, track, &earlier, drain).await;
     if report.failure.is_some() || report.paused {
         return report;
     }
@@ -719,6 +724,7 @@ async fn process_tracked(
 /// in order, each with the head its vector was embedded behind.
 async fn ingest_pieces(
     evt: &MemoryEvent,
+    saver: &Reader,
     store: &Arc<MemoryStore>,
     embedder_cell: &Arc<OnceCell<Arc<dyn Embedder>>>,
     chat_chunker: &Arc<ChatChunker>,
@@ -813,7 +819,7 @@ async fn ingest_pieces(
             continue;
         }
         let note = note_for(track.as_ref(), &noted, position, &pending.content_hash, false, "");
-        if let Some(id) = absorb_duplicate(store, evt, &pending.content_hash, absorbed, note).await {
+        if let Some(id) = absorb_duplicate(store, evt, saver, &pending.content_hash, absorbed, note).await {
             if track.is_some() {
                 noted.push(NotedPiece {
                     position,
@@ -824,7 +830,7 @@ async fn ingest_pieces(
                 });
             }
             for _ in 1..pending.multiplicity {
-                absorb_duplicate(store, evt, &pending.content_hash, absorbed, |_| None).await;
+                absorb_duplicate(store, evt, saver, &pending.content_hash, absorbed, |_| None).await;
             }
             stored[position] = Some(SavedChunk { id, outcome: ChunkOutcome::Reinforced });
             continue;
@@ -909,7 +915,7 @@ async fn ingest_pieces(
         // must be attached to the record before it is written, not after.
         let mut record = NewMemoryRecord::from_event_and_chunk(evt, &chunk);
         record.candidates = crate::memory::contradiction::detect_contradiction(
-            store, &vec, &chunk.text, &evt.agent_id, evt.project_id.as_deref(), record.memory_type, &siblings,
+            store, &vec, &chunk.text, saver, evt.project_id.as_deref(), record.memory_type, &siblings,
         )
         .await
         .into_iter()
@@ -919,7 +925,7 @@ async fn ingest_pieces(
         let candidates = record.candidates.clone();
         let note = note_for(track.as_ref(), &noted, position, &content_hash, true, context(position));
         let absorbed_note = note_for(track.as_ref(), &noted, position, &content_hash, false, "");
-        let id = match store.insert_unless_twin(record, vec, note, absorbed_note).await {
+        let id = match store.insert_unless_twin(saver, record, vec, note, absorbed_note).await {
             Ok(Stored::Inserted(id)) => id,
             Ok(Stored::Absorbed(id)) => {
                 *absorbed += 1;
@@ -929,7 +935,7 @@ async fn ingest_pieces(
                 }
                 stored[position] = Some(SavedChunk { id, outcome: ChunkOutcome::Reinforced });
                 for _ in 1..multiplicity {
-                    absorb_duplicate(store, evt, &content_hash, absorbed, |_| None).await;
+                    absorb_duplicate(store, evt, saver, &content_hash, absorbed, |_| None).await;
                 }
                 continue;
             }
@@ -954,7 +960,7 @@ async fn ingest_pieces(
         // The extra copies now find the row this iteration just wrote and
         // take the same branch a copy from a later event takes.
         for _ in 1..multiplicity {
-            absorb_duplicate(store, evt, &content_hash, absorbed, |_| None).await;
+            absorb_duplicate(store, evt, saver, &content_hash, absorbed, |_| None).await;
         }
     }
     (IngestReport { related, ..report(&stored, None) }, pieces(&stored, &contexts))
@@ -4180,16 +4186,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_key_is_scoped_to_its_agent_and_project() {
+    async fn a_key_is_scoped_to_its_project() {
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
         let old = only_id(&save(&store, &keyed("Storage engine is SQLite", "storage/engine")).await);
 
-        let other_agent = MemoryEvent { agent_id: "agent-other".into(), ..keyed("Storage engine moved to Postgres", "storage/engine") };
         let other_project = MemoryEvent { project_id: Some("p-2".into()), ..keyed("Storage engine moved to Oracle", "storage/engine") };
-        assert!(save(&store, &other_agent).await.replaced.is_empty());
         assert!(save(&store, &other_project).await.replaced.is_empty());
-
         assert_eq!(revision_state(&store, old).await.0, "active");
+
+        let other_agent = MemoryEvent { agent_id: "agent-other".into(), ..keyed("Storage engine moved to Postgres", "storage/engine") };
+        let report = save(&store, &other_agent).await;
+        let new = only_id(&report);
+        assert_eq!(report.replaced.iter().map(|r| r.id).collect::<Vec<_>>(), vec![old], "a key names a topic of the project");
+        assert_eq!(revision_state(&store, old).await, ("superseded".into(), Some(new), Some("storage/engine".into())));
+    }
+
+    /// What agent-scoped keys let a store hold: two live holders of one key in
+    /// a project, from two agents. The next save under the key replaces both.
+    #[tokio::test]
+    async fn a_keyed_save_replaces_every_holder_of_its_project() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let first = only_id(&save(&store, &keyed("Storage engine is SQLite", "storage/engine")).await);
+        let second = store
+            .conn
+            .call(|c| -> rusqlite::Result<i64> {
+                c.execute(
+                    "INSERT INTO memory (scope, agent_id, content, memory_type, source, created_at, created_by_type, \
+                     created_by_ref, last_modified_at, last_accessed_at, importance, tier, status, topic_key) \
+                     VALUES ('agent', 'agent-other', 'Storage engine is DuckDB', 'architectural_decision', 'explicit', \
+                     1, 'agent', 'agent-other', 1, 1, 5.0, 3, 'active', 'storage/engine')",
+                    [],
+                )?;
+                Ok(c.last_insert_rowid())
+            })
+            .await
+            .unwrap();
+
+        let report = save(&store, &keyed("Storage engine moved to Postgres", "storage/engine")).await;
+
+        let mut replaced: Vec<i64> = report.replaced.iter().map(|r| r.id).collect();
+        replaced.sort_unstable();
+        assert_eq!(replaced, vec![first, second]);
+        assert_eq!(live_with_key(&store, "storage/engine").await, vec![only_id(&report)]);
+    }
+
+    #[tokio::test]
+    async fn a_key_leaves_a_hidden_authors_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut policy = crate::memory::sharing::SharingPolicy::default();
+        policy.hide("agent-other", "agent-test");
+        crate::memory::sharing::save(dir.path(), &policy).unwrap();
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap().with_sharing_dir(dir.path().to_path_buf()));
+        let old = only_id(&save(&store, &keyed("Storage engine is SQLite", "storage/engine")).await);
+
+        let hidden = MemoryEvent { agent_id: "agent-other".into(), ..keyed("Storage engine moved to Postgres", "storage/engine") };
+        assert!(save(&store, &hidden).await.replaced.is_empty(), "a save never replaces what its agent cannot read");
+        assert_eq!(revision_state(&store, old).await.0, "active");
+    }
+
+    #[tokio::test]
+    async fn the_same_text_from_another_agent_reinforces_the_row_already_there() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let first = only_id(&save(&store, &explicit("The deploy runs on fridays", "semantic_fact")).await);
+
+        let other = MemoryEvent { agent_id: "agent-other".into(), ..explicit("The deploy runs on fridays", "semantic_fact") };
+        let report = save(&store, &other).await;
+
+        assert_eq!(report.memories.len(), 1, "{report:?}");
+        assert_eq!((report.memories[0].id, report.memories[0].outcome), (first, ChunkOutcome::Reinforced));
     }
 
     fn other_text(words: usize) -> String {

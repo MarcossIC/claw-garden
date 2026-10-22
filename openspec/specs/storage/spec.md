@@ -16,6 +16,7 @@ Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde q
 - [outbox-lifecycle](../../changes/archive/2026-10-19-outbox-lifecycle/proposal.md), archivado el 2026-10-19 (el reintento de un fallo pasajero en la misma ejecución, la regla única de `failed`, la pausa del apagado entre pedazos y «Una fila `failed` se reintenta o se descarta»). Lo que contesta un save que falla a medias está en [`specs/ingest`](../ingest/spec.md).
 - [shutdown-budget](../../changes/archive/2026-10-20-shutdown-budget/proposal.md), archivado el 2026-10-20 (SIGTERM como apagado ordenado, «Cada fase del apagado tiene tope» y «Las fases caben en `STOP_TIMEOUT`»). Lo que hace `clawg update` cuando `stop` vence está en [`specs/self-update`](../self-update/spec.md).
 - [serve-log-rotation](../../changes/archive/2026-10-22-serve-log-rotation/proposal.md), archivado el 2026-10-22 («El log del daemon»).
+- [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22 (sólo «Una base en V19 abre con los índices por proyecto» y su vuelta atrás).
 
 ## Definiciones
 
@@ -312,7 +313,7 @@ Las migraciones pendientes de un arranque MUST aplicarse en una sola transacció
 
 ### Checksums fijados
 
-Los checksums de las migraciones publicadas (hoy V1–V18) MUST coincidir con una lista fija en el código (`PINNED`, `crates/clawg-core/src/memory/migrations.rs:44`). Cambiar una migración publicada MUST romper un test. Una migración nueva agrega su fila a la lista en el mismo commit.
+Los checksums de las migraciones publicadas (hoy V1–V20) MUST coincidir con una lista fija en el código (`PINNED`, `crates/clawg-core/src/memory/migrations.rs:44`). Cambiar una migración publicada MUST romper un test. Una migración nueva agrega su fila a la lista en el mismo commit.
 
 **Test:** `published_migration_checksums_are_pinned` (`migrations.rs`).
 
@@ -389,12 +390,34 @@ Una base en V17 MUST abrir con V18 con cada fila igual y con los tres índices. 
 
 Un binario anterior a V18 MUST NOT abrir una base en V18: la rechaza sin tocarla con `SchemaNewer` («Verificación del esquema antes de migrar»). La vuelta atrás es la copia `pre-migration` que se escribió antes de V18, que `clawg update` restaura sola si el binario viejo se niega ([`specs/self-update`](../self-update/spec.md)). Quitar V18 a mano no pierde ninguna fila: `DROP INDEX idx_memory_session_summary; DROP INDEX idx_memory_agent_created; DROP INDEX idx_memory_dedup; CREATE INDEX idx_memory_dedup ON memory (agent_id, COALESCE(project_id, ''), content_hash) WHERE deleted_at IS NULL AND content_hash IS NOT NULL; DELETE FROM refinery_schema_history WHERE version = 18;`.
 
+### Una base en V19 abre con los índices por proyecto
+
+V20 (`crates/clawg-core/migrations/V20__project_scoped_indexes.sql`) sólo toca índices de `memory`: reconstruye `idx_memory_dedup` como `(COALESCE(project_id, ''), content_hash, created_at)` e `idx_memory_topic` como `(COALESCE(project_id, ''), topic_key)`, con los mismos predicados parciales. La dedup y la clave de tema comparan un save con su proyecto, de cualquier autor ([`specs/ingest`](../ingest/spec.md)), y ninguna búsqueda trae ya una igualdad sobre `agent_id`, con la que empezaban los dos. El autor queda como filtro residual del alcance del que guarda (`reach_predicate!`): el índice lleva a las filas del proyecto con ese hash o esa clave, que son pocas. Usan el de dedup `REINFORCE_LOOKUP_SQL` (refuerzo y `insert_unless_twin`), `RESTORE_TWIN` y `TWIN_SQL` del import; el de la clave, `SCOPE_ROWS_SQL` (`crates/clawg-core/src/memory/topic.rs`), `RESTORE_TOPIC_HOLDER`, `KEY_HELD_SQL` y `TOPIC_HOLDERS_SQL`.
+
+Una base en V19 MUST abrir con V20 con cada fila igual, con `synthesis_review` igual y con los dos índices nuevos. La migración MUST NOT cambiar ninguna fila. Lo que las reglas por agente dejaban convivir (dos titulares de una clave o dos filas con un mismo texto en un proyecto, de agentes distintos) sigue vivo y alcanzable: el doctor lo marca ([`specs/doctor`](../doctor/spec.md)) y el próximo save con esa clave reemplaza a los dos.
+
+#### Escenario
+- GIVEN un `memory.db` migrado hasta V19 con dos agentes que tienen viva la misma clave en un proyecto, dos filas vivas de un mismo texto de agentes distintos, una fila sin autor y una `synthesis_review` de un agente
+- WHEN `MemoryStore::open` lo abre
+- THEN cada fila sigue igual y `active`, la revisión sigue, hay un snapshot `pre-migration`, y `sqlite_master` tiene los dos índices sobre `COALESCE(project_id, '')`
+
+#### Escenario: las búsquedas usan los índices
+- GIVEN un store migrado
+- WHEN se pide el plan de `REINFORCE_LOOKUP_SQL` y el de `SCOPE_ROWS_SQL`
+- THEN nombran `idx_memory_dedup` (sin `TEMP B-TREE`) e `idx_memory_topic`
+
+**Tests:** `a_store_from_before_project_scoped_rules_keeps_its_rows` (`crates/clawg-core/src/memory/db.rs`), que abre con `MemoryStore::open`; `reinforce_lookup_uses_dedup_index` (`store_insert.rs`); `the_scope_lookup_uses_the_topic_index` (`topic.rs`); `a_keyed_save_replaces_every_holder_of_its_project` (`worker.rs`); el checksum de V20 en `published_migration_checksums_are_pinned` (`migrations.rs`).
+
+#### Vuelta atrás de V20
+
+Un binario anterior a V20 MUST NOT abrir una base en V20: la rechaza sin tocarla con `SchemaNewer`. La vuelta atrás es la copia `pre-migration` que se escribió antes de V20, que `clawg update` restaura sola si el binario viejo se niega ([`specs/self-update`](../self-update/spec.md)). Quitar V20 a mano no pierde ninguna fila: `DROP INDEX idx_memory_dedup; CREATE INDEX idx_memory_dedup ON memory (agent_id, COALESCE(project_id, ''), content_hash, created_at) WHERE deleted_at IS NULL AND content_hash IS NOT NULL; DROP INDEX idx_memory_topic; CREATE INDEX idx_memory_topic ON memory (agent_id, COALESCE(project_id, ''), topic_key) WHERE deleted_at IS NULL AND topic_key IS NOT NULL; DELETE FROM refinery_schema_history WHERE version = 20;`. Lo que las reglas por proyecto hicieron mientras tanto (una fila reforzada por otro agente, una versión reemplazada por la clave de otro agente) queda: son filas y estados que la versión anterior sabe leer.
+
 ### Verificación del esquema antes de migrar
 
 La decisión es pura (`schema_plan`, `backup.rs:93`). `MemoryStore::open` MUST calcularla antes de cualquier pragma y antes del runner (`check_schema`, `crates/clawg-core/src/memory/db.rs:409`, llamada en `db.rs:195`). Con `Newer` o `Diverged`, `open` MUST devolver `MemoryError::SchemaNewer` o `MemoryError::SchemaDiverged` (`crates/clawg-core/src/memory/error.rs:58` y `:64`) y MUST NOT escribir nada en `memory.db`. Los mensajes MUST decir las versiones, que nada cambió, y qué hacer: instalar la versión que la escribió o `clawg restore` de un backup anterior.
 
 #### Escenario: base más nueva
-- GIVEN una base en la última versión del binario, N (hoy V18), con una fila N + 1 agregada en `refinery_schema_history`
+- GIVEN una base en la última versión del binario, N (hoy V20), con una fila N + 1 agregada en `refinery_schema_history`
 - WHEN se abre
 - THEN el error es `SchemaNewer { db: N + 1, binary: N }`, nombra `clawg restore`, y `memory.db` es byte a byte igual
 

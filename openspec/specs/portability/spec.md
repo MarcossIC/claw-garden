@@ -2,7 +2,7 @@
 
 Fuente de verdad de cómo las memorias salen de un store y entran en otro, fila por fila: el formato `clawg-memories`, `clawg export`, `clawg import` y `POST /v1/import`. Los snapshots de archivo entero (`backup` y `restore`) están en [`specs/restore`](../restore/spec.md); el enmascarado que el import aplica, en [`specs/secrets`](../secrets/spec.md).
 
-**Origen:** [memory-portability](../../changes/archive/2026-10-20-memory-portability/proposal.md), archivado el 2026-10-20. Los ids de requisito son los de esa spec.
+**Origen:** [memory-portability](../../changes/archive/2026-10-20-memory-portability/proposal.md), archivado el 2026-10-20. Los ids de requisito son los de esa spec. [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22, llevó a proyecto el texto vivo y el titular de la clave de R5.
 
 ## Dónde está
 
@@ -96,7 +96,9 @@ Cada fila de un proyecto con línea `project` MUST quedar con el `project_id` qu
 
 Una fila del archivo cuyo agente, proyecto, hash del texto enmascarado y `created_at` coinciden con una fila del destino (viva, reemplazada o borrada) MUST contarse como ya presente: no se inserta ni se le suman accesos, y sus vínculos apuntan a esa fila. Los vínculos de una fila presente sólo MUST completarse donde están vacíos; una save en piezas se importa sólo si ninguna de sus filas tiene ya una pieza.
 
-Una fila viva cuyo texto ya está vivo en el mismo agente y proyecto con otra fecha MUST fundirse con esa fila (no se inserta; sus vínculos apuntan a ella), para que no haya dos vivas iguales. Una fila viva con una `topic_key` que en el destino tiene otra fila viva del mismo agente y proyecto, que no vino de este import, MUST insertarse `superseded` por esa fila con causa `revision`.
+Una fila viva cuyo texto ya está vivo en su proyecto, de cualquier autor, con otra fecha MUST fundirse con esa fila (no se inserta; sus vínculos apuntan a ella), para que no haya dos vivas iguales. Una fila viva con una `topic_key` que en el destino tiene otra fila viva de su proyecto, de cualquier autor, que no vino de este import, MUST insertarse `superseded` por esa fila con causa `revision`. El import es del usuario: `sharing.json` no lo acota (`TWIN_SQL` y `TOPIC_HOLDERS_SQL`, `crates/clawg-core/src/memory/portability/import.rs`). La identidad de una fila ya importada sigue incluyendo su agente.
+
+**Test (alcance por proyecto):** `an_import_merges_into_another_agents_live_text_and_key` (`import.rs`).
 
 #### Escenario: dos veces
 - GIVEN un archivo ya importado

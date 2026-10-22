@@ -8,6 +8,7 @@ use crate::memory::backup::{self, SchemaPlan};
 use crate::memory::embedder::Embedder;
 use crate::memory::error::MemoryError;
 use crate::memory::latency::KnnLatency;
+use crate::memory::sharing::{self, Reader};
 use crate::memory::store_lock::{StoreHolder, StoreLock};
 
 // ---------------------------------------------------------------------------
@@ -161,6 +162,10 @@ pub struct MemoryStore {
     /// The data directory holding `memory.db`, where a second connection can
     /// open it. `None` for the in-memory test store, which has no file.
     dir: Option<PathBuf>,
+    /// Where `sharing.json` is read from when a save is compared with what
+    /// its agent reaches. The data directory; `None` for an in-memory store
+    /// no runtime placed, which shares everything.
+    sharing_dir: Option<PathBuf>,
 }
 
 /// Bytes of WAL a checkpoint may leave on disk. A checkpoint rewinds the WAL
@@ -237,6 +242,7 @@ impl MemoryStore {
             knn_latency: Arc::new(KnnLatency::new()),
             _lock: Some(Arc::new(lock)),
             dir: Some(base_dir.to_path_buf()),
+            sharing_dir: Some(base_dir.to_path_buf()),
         })
     }
 
@@ -258,7 +264,24 @@ impl MemoryStore {
             knn_latency: Arc::new(KnnLatency::new()),
             _lock: None,
             dir: None,
+            sharing_dir: None,
         })
+    }
+
+    /// This in-memory store reading `sharing.json` from `dir`, as a runtime
+    /// over a real data directory does.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_sharing_dir(self, dir: PathBuf) -> Self {
+        Self { sharing_dir: Some(dir), ..self }
+    }
+
+    /// `agent_id` with what the sharing policy lets it reach, read now, so a
+    /// change to the policy counts from the next save on.
+    pub(crate) fn reader_for(&self, agent_id: &str) -> Reader {
+        match &self.sharing_dir {
+            Some(dir) => sharing::reader_in(dir, agent_id),
+            None => Reader::new(agent_id, sharing::SharingPolicy::default().reach_for(agent_id)),
+        }
     }
 
     /// Writes a snapshot of the store into `into` and returns its path.
@@ -676,7 +699,7 @@ mod tests {
 
         let after = conn.call(snapshot).await.unwrap();
         assert_eq!(before, after);
-        assert_eq!(after.0, 19);
+        assert_eq!(after.0, 20);
     }
 
     /// Rows written before `project` existed keep their project ids when the
@@ -1341,6 +1364,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_store_from_before_project_scoped_rules_keeps_its_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), Some(19)).await;
+        let conn = Connection::open(dir.path().join("memory.db")).await.unwrap();
+        conn.call(|c| {
+            // Two agents holding one key and one text in project p, and a row
+            // no agent saved: what agent-scoped rules let live side by side.
+            for (id, agent, content, hash, key) in [
+                (10, Some("a"), "storage engine is sqlite", "h1", Some("storage/engine")),
+                (11, Some("b"), "storage engine is postgres", "h2", Some("storage/engine")),
+                (12, Some("a"), "the build uses cargo", "h3", None),
+                (13, Some("b"), "the build uses cargo", "h3", None),
+                (14, None, "a note nobody saved", "h4", None),
+            ] {
+                c.execute(
+                    "INSERT INTO memory \
+                     (id, scope, agent_id, project_id, content, memory_type, source, \
+                      created_at, created_by_type, created_by_ref, \
+                      last_modified_at, last_accessed_at, importance, tier, status, content_hash, topic_key) \
+                     VALUES (?1, CASE WHEN ?2 IS NULL THEN 'project' ELSE 'agent' END, ?2, 'p', ?3, \
+                      'semantic_fact', 'explicit', ?1, 'agent', 'x', ?1, ?1, 5.0, 3, 'active', ?4, ?5)",
+                    rusqlite::params![id, agent, content, hash, key],
+                )?;
+            }
+            c.execute("INSERT INTO synthesis_review (agent_id, scope_key, reviewed_at) VALUES ('a', 'p', 5)", [])
+        })
+        .await
+        .unwrap();
+        conn.close().await.unwrap();
+
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        let (rows, reviews, indexes): (Vec<(i64, Option<String>, String)>, i64, Vec<String>) = store
+            .conn
+            .call(|c| -> rusqlite::Result<_> {
+                let mut stmt = c.prepare("SELECT id, agent_id, status FROM memory WHERE id >= 10 ORDER BY id")?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+                let reviews = c.query_row("SELECT COUNT(*) FROM synthesis_review", [], |r| r.get(0))?;
+                let mut stmt = c.prepare(
+                    "SELECT sql FROM sqlite_master WHERE type = 'index' \
+                     AND name IN ('idx_memory_dedup', 'idx_memory_topic') ORDER BY name",
+                )?;
+                let indexes = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+                Ok((rows, reviews, indexes))
+            })
+            .await
+            .unwrap();
+        let active = |id: i64, agent: Option<&str>| (id, agent.map(str::to_owned), "active".to_string());
+        assert_eq!(
+            rows,
+            vec![active(10, Some("a")), active(11, Some("b")), active(12, Some("a")), active(13, Some("b")), active(14, None)],
+            "migrating changes no row"
+        );
+        assert_eq!(reviews, 1, "the agent's review stays");
+        assert_eq!(indexes.len(), 2);
+        assert!(indexes[0].contains("(COALESCE(project_id, ''), content_hash, created_at)"), "{}", indexes[0]);
+        assert!(indexes[1].contains("(COALESCE(project_id, ''), topic_key)"), "{}", indexes[1]);
+        let snapshots = std::fs::read_dir(crate::paths::backups_dir(dir.path())).unwrap().count();
+        assert_eq!(snapshots, 1, "the pre-migration snapshot is the way back");
+    }
+
+    #[tokio::test]
     async fn a_store_from_before_the_warning_mark_keeps_its_pairs_unmarked() {
         ensure_vec0_registered();
         let conn = Connection::open_in_memory().await.unwrap();
@@ -1804,7 +1889,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 19, "Expected exactly 19 applied migrations, got {}", count);
+        assert_eq!(count, 20, "Expected exactly 20 applied migrations, got {}", count);
     }
 
     /// V8 — a fresh store records V8 as applied and carries the FTS5 lexical
@@ -2265,7 +2350,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 19);
+        assert_eq!(migration_count, 20);
     }
 
     // -----------------------------------------------------------------------

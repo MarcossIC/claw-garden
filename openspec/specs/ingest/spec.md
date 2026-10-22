@@ -12,6 +12,7 @@ Fuente de verdad del comportamiento actual de la ingesta: el contrato de `POST /
 - [session-handoff](../../changes/archive/2026-10-19-session-handoff/proposal.md), archivado el 2026-10-19 (sólo «La sesión del host», sus R1 y R2). El bloque LAST SESSION está en [`specs/retrieval`](../retrieval/spec.md), y el registro desde los hooks en [`specs/hooks`](../hooks/spec.md).
 - [model-download](../../changes/archive/2026-10-19-model-download/proposal.md), archivado el 2026-10-19 (sólo la causa de una descarga que agota sus intentos, en «Estado en `/health` y `clawg status`», y el origen inválido en «Reintento del bootstrap»). La descarga está en [`specs/storage`](../storage/spec.md), «Descarga del modelo».
 - [outbox-lifecycle](../../changes/archive/2026-10-19-outbox-lifecycle/proposal.md), archivado el 2026-10-19 (sólo lo que contesta un save que falla con el que guardó esperando, `pieces` en el bloque `ingest` de `/health` y los textos nuevos de `save_memory` y `memory_status`). El reintento, la pausa del apagado y `clawg outbox` están en [`specs/storage`](../storage/spec.md).
+- [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22 (el alcance de la clave y del dedup pasa de agente y proyecto a proyecto, dentro de lo que alcanza el que guarda).
 - [save-bounds](../../changes/archive/2026-10-20-save-bounds/proposal.md), archivado el 2026-10-20 (sólo «El contenido: vacío o sobre el tope» y la fila del `400` por el tope en «Texto que ve el modelo»).
 
 ## Definiciones
@@ -27,7 +28,7 @@ Fuente de verdad del comportamiento actual de la ingesta: el contrato de `POST /
 - **Save confirmado:** el handler recibió el reporte del worker antes de `SAVE_CONFIRM_TIMEOUT`.
 - **Timeout de confirmación (`SAVE_CONFIRM_TIMEOUT`, `crates/clawg-cli/src/daemon/api.rs:99`):** 10 s. Vive en `AppCtx::save_timeout` para que un test lo reduzca.
 - **Clave de tema (`topic_key`):** el nombre estable con el que un save explícito dice de qué tema es una versión: segmentos no vacíos de `[a-z0-9._-]` separados por `/`, de 1 a 80 caracteres en total (`validate_topic_key`, `crates/clawg-core/src/memory/topic.rs:33`). Minúsculas solamente, para que un tema escrito en otra caja siga siendo una sola clave.
-- **Alcance de una clave:** `(agent_id, COALESCE(project_id, ''), topic_key)`: las filas de un agente, en un proyecto o en ninguno, bajo una clave. Es el mismo alcance del dedup, así que otro agente u otro proyecto con la misma clave no se tocan.
+- **Alcance de una clave:** `(COALESCE(project_id, ''), topic_key)` dentro de lo que alcanza el que guarda ([`specs/sharing`](../sharing/spec.md)): las filas de un proyecto, o de ninguno, bajo una clave, de cualquier autor que `sharing.json` no le oculta. Es el mismo alcance del dedup, así que otro proyecto con la misma clave no se toca, y la clave nombra un tema del proyecto, no de un agente.
 - **Fila viva:** una fila de `memory` sin `deleted_at` y con `status` `active` o `disputed`.
 - **Capacidad de la cola (`INGEST_QUEUE_CAPACITY`, `crates/clawg-core/src/runtime.rs:49`):** 1024 eventos.
 
@@ -128,11 +129,11 @@ La respuesta MUST listar las filas reemplazadas en `replaced`, cada una con su i
 
 **Tipo e importancia.** Si el save con clave no trae `memory_type` o `importance`, las filas nuevas MUST tomar los de la fila viva más antigua del alcance (`inherit`, `topic.rs:154`; el worker la lee con `topic_rows`, `topic.rs:164`, antes de guardar nada, `worker.rs:674-690`). En una reposición se lee otra vez y da lo mismo, porque la versión vieja sigue viva hasta el final.
 
-**Alcance y orden.** Otro agente u otro proyecto con la misma clave MUST NOT reemplazar ni heredar nada. Dos saves con la misma clave en cola MUST aplicarse en orden, y la fila viva final es la del segundo: el worker es el único escritor de saves. No hay un índice único sobre la clave porque las piezas de un save la comparten (`idx_memory_topic` es parcial y no único, [`specs/storage`](../storage/spec.md)); la unicidad de lo vivo la mantienen el worker y `restore` ([`specs/disputes`](../disputes/spec.md), R4).
+**Alcance y orden.** Un save con clave MUST reemplazar a todo titular vivo de la clave en su proyecto que alcanza, también el de otro agente, y MUST NOT reemplazar ni heredar nada de otro proyecto ni de un autor que `sharing.json` le oculta. Dos agentes que se ocultan entre sí pueden quedar con un titular cada uno, que el doctor marca ([`specs/doctor`](../doctor/spec.md)). Dos saves con la misma clave en cola MUST aplicarse en orden, y la fila viva final es la del segundo: el worker es el único escritor de saves. No hay un índice único sobre la clave porque las piezas de un save la comparten (`idx_memory_topic` es parcial y no único, [`specs/storage`](../storage/spec.md)); la unicidad de lo vivo la mantienen el worker y `restore` ([`specs/disputes`](../disputes/spec.md), R4).
 
 #### Escenario: una decisión revisada
 - GIVEN una `architectural_decision` guardada con la clave `storage/engine`
-- WHEN el mismo agente guarda otro texto con esa clave en el mismo proyecto
+- WHEN ese agente, u otro, guarda otro texto con esa clave en el mismo proyecto
 - THEN hay una sola fila viva con la clave, la nueva
 - AND la vieja queda `superseded` por la nueva, y ni la búsqueda por vectores ni el índice de texto la devuelven
 - AND la respuesta del save lleva la vieja en `replaced`
@@ -147,7 +148,7 @@ La respuesta MUST listar las filas reemplazadas en `replaced`, cada una con su i
 - WHEN se guarda otra vez el texto de la versión 1 con K
 - THEN se inserta una fila nueva que reemplaza a la versión 2, y la versión 1 sigue `superseded`
 
-**Tests** (todos en `worker.rs`, mod tests): `a_keyed_save_replaces_the_live_row_of_its_key`, `the_same_text_under_its_key_only_reinforces`, `saving_an_earlier_text_again_is_another_revision`, `a_revision_inherits_tier_and_accesses`, `a_revision_releases_the_rows_disputing_the_old_one`, `a_failed_revision_replaces_nothing`, `a_reinforced_row_without_a_key_takes_it`, `a_save_without_a_key_replaces_nothing`, `a_revision_is_finished_with_its_outbox_row`, `a_revision_keeps_the_type_and_importance_it_does_not_name`, `a_key_is_scoped_to_its_agent_and_project` y `two_queued_revisions_apply_in_order`.
+**Tests** (todos en `worker.rs`, mod tests): `a_keyed_save_replaces_the_live_row_of_its_key`, `the_same_text_under_its_key_only_reinforces`, `saving_an_earlier_text_again_is_another_revision`, `a_revision_inherits_tier_and_accesses`, `a_revision_releases_the_rows_disputing_the_old_one`, `a_failed_revision_replaces_nothing`, `a_reinforced_row_without_a_key_takes_it`, `a_save_without_a_key_replaces_nothing`, `a_revision_is_finished_with_its_outbox_row`, `a_revision_keeps_the_type_and_importance_it_does_not_name`, `a_key_is_scoped_to_its_project`, `a_keyed_save_replaces_every_holder_of_its_project`, `a_key_leaves_a_hidden_authors_holder` y `two_queued_revisions_apply_in_order`.
 
 ### Un save confirmado devuelve los ids
 
@@ -177,14 +178,14 @@ Si el detector de contradicciones encontró memorias cercanas, la respuesta llev
 
 ### Un duplicado devuelve la fila existente
 
-Un save cuyo contenido ya está guardado MUST responder `201` con `outcome: "reinforced"` y el id de la fila existente. MUST NOT insertar otra fila. Vale también para un gemelo que vuelve a estar vivo mientras el save se embebe, como un `restore_memory` del mismo texto: el insert lo busca de nuevo en su transacción y lo refuerza (`insert_unless_twin`, `crates/clawg-core/src/memory/store_insert.rs:443`).
+Un save cuyo contenido ya está vivo en su proyecto MUST responder `201` con `outcome: "reinforced"` y el id de la fila existente, la más vieja, sea de quien sea entre los autores que el que guarda alcanza (`REINFORCE_LOOKUP_SQL`, `crates/clawg-core/src/memory/store_insert.rs`, sobre `idx_memory_dedup` de V20). MUST NOT insertar otra fila. Una fila que `sharing.json` le oculta MUST NOT reforzarse: el save inserta la suya. Vale también para un gemelo que vuelve a estar vivo mientras el save se embebe, como un `restore_memory` del mismo texto: el insert lo busca de nuevo en su transacción y lo refuerza (`insert_unless_twin`, `crates/clawg-core/src/memory/store_insert.rs:443`).
 
 #### Escenario
 - GIVEN un save de `X` que devolvió el id 57
-- WHEN se guarda `X` otra vez, con el mismo agente y proyecto
+- WHEN se guarda `X` otra vez en el mismo proyecto, con el mismo agente o con otro
 - THEN la respuesta tiene un elemento `{"id": 57, "outcome": "reinforced"}` y la tabla sigue con una fila
 
-**Tests:** `saving_the_same_text_twice_returns_the_same_id_as_reinforced` (`tests/api.rs`) y `process_event_reports_reinforced_with_the_existing_id` y `a_twin_restored_while_the_save_is_embedded_is_reinforced_not_copied` (`worker.rs`, mod tests).
+**Tests:** `saving_the_same_text_twice_returns_the_same_id_as_reinforced` (`tests/api.rs`); `process_event_reports_reinforced_with_the_existing_id`, `a_twin_restored_while_the_save_is_embedded_is_reinforced_not_copied` y `the_same_text_from_another_agent_reinforces_the_row_already_there` (`worker.rs`, mod tests); `reinforce_if_duplicate_reinforces_another_agents_row` y `reinforce_if_duplicate_leaves_a_hidden_authors_row` (`store_insert.rs`).
 
 ### Un fallo del worker llega al que guardó
 

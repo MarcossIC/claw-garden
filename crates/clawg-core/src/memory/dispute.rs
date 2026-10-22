@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 use crate::memory::clock::TimestampMs;
 use crate::memory::provenance::mark;
 use crate::memory::redact::redact;
+use crate::memory::search::{memory_project_predicate, reader_bind, reader_predicate};
+use crate::memory::sharing::Reader;
 use crate::memory::store_insert::MemoryType;
 use crate::memory::{MemoryError, MemoryStore};
 
@@ -219,15 +221,18 @@ pub(crate) fn settle_disputed(c: &Connection, now: TimestampMs) -> rusqlite::Res
     c.execute(&settle_sql("status = 'disputed'"), rusqlite::params![now])
 }
 
-const SELECT_PAIR_ROW: &str = "SELECT id, status, superseded_by, disputed_against, memory_type FROM memory \
-     WHERE id = ?1 AND deleted_at IS NULL AND (?2 IS NULL OR agent_id = ?2)";
+const SELECT_PAIR_ROW: &str = concat!(
+    "SELECT id, status, superseded_by, disputed_against, memory_type FROM memory \
+     WHERE id = ?1 AND deleted_at IS NULL AND ",
+    reader_predicate!("agent_id", "?2")
+);
 
-/// Another agent's row reads as missing, so a scoped caller learns nothing
-/// about ids it does not own.
-fn read_pair_row(c: &Connection, id: i64, owner: Option<&str>) -> Result<PairRow, ResolveError> {
+/// A row out of the reader's reach (bound as `reach_bind` binds it) reads as
+/// missing, so a reader learns nothing about ids the policy hides from it.
+fn read_pair_row(c: &Connection, id: i64, reach: Option<&str>) -> Result<PairRow, ResolveError> {
     use rusqlite::OptionalExtension;
     let row = c
-        .query_row(SELECT_PAIR_ROW, rusqlite::params![id, owner], |r| {
+        .query_row(SELECT_PAIR_ROW, rusqlite::params![id, reach], |r| {
             Ok(PairRow {
                 id: r.get(0)?,
                 status: r.get(1)?,
@@ -305,18 +310,18 @@ pub async fn resolve_dispute_core(
     keep: i64,
     other: i64,
     outcome: Outcome,
-    owner: Option<&str>,
+    reader: Option<&Reader>,
 ) -> Result<Resolution, ResolveError> {
     let verdict = match outcome {
         Outcome::Supersede => Verdict::Supersedes,
         Outcome::KeepBoth => Verdict::Compatible,
     };
-    judge_pair(store, keep, other, verdict, None, false, owner).await
+    judge_pair(store, keep, other, verdict, None, false, reader).await
 }
 
 /// Judges the pair `keep`, `other` in one transaction, and returns both rows
-/// as they stand afterwards. With `owner`, both rows must belong to that
-/// agent. `keep` only matters for `supersedes`: it is the row that stays.
+/// as they stand afterwards. Both rows must be within `reader`'s reach, of
+/// whichever author. `keep` only matters for `supersedes`: it is the row that stays.
 ///
 /// `user_answered` is the caller's declaration that the user said which
 /// holds, with their answer in `reason`. Superseding a preference or a
@@ -329,7 +334,7 @@ pub async fn judge_pair(
     verdict: Verdict,
     reason: Option<String>,
     user_answered: bool,
-    owner: Option<&str>,
+    reader: Option<&Reader>,
 ) -> Result<Resolution, ResolveError> {
     if keep == other {
         return Err(ResolveError::SameRow);
@@ -345,15 +350,15 @@ pub async fn judge_pair(
         (false, r) => r,
     };
     let now = TimestampMs::now();
-    let owner = owner.map(str::to_owned);
+    let reach = reader_bind(reader);
     let (new, old) = (keep.max(other), keep.min(other));
     store
         .conn
         .call(move |c| -> Result<Resolution, ResolveError> {
             use rusqlite::OptionalExtension;
             let tx = c.transaction()?;
-            let keep_row = read_pair_row(&tx, keep, owner.as_deref())?;
-            let other_row = read_pair_row(&tx, other, owner.as_deref())?;
+            let keep_row = read_pair_row(&tx, keep, reach.as_deref())?;
+            let other_row = read_pair_row(&tx, other, reach.as_deref())?;
             let state: Option<String> = tx
                 .query_row(
                     "SELECT state FROM memory_conflict WHERE new_id = ?1 AND old_id = ?2",
@@ -437,16 +442,31 @@ pub struct OpenPairs {
     pub pairs: Vec<OpenPair>,
 }
 
-/// A pair counts while both rows are live; with `owner`, only that agent's.
-const OPEN_PAIR_FROM: &str = "FROM memory_conflict p \
+/// A pair counts while both rows are live, its newer row in the project
+/// bound to `?3` as a search reads it (no project: the whole store), and both
+/// rows within the reader's reach bound to `?1`, of whichever author.
+const OPEN_PAIR_FROM: &str = concat!(
+    "FROM memory_conflict p \
      JOIN memory n ON n.id = p.new_id JOIN memory o ON o.id = p.old_id \
      WHERE n.deleted_at IS NULL AND o.deleted_at IS NULL \
-       AND n.status <> 'superseded' AND o.status <> 'superseded' \
-       AND (?1 IS NULL OR n.agent_id = ?1)";
+       AND n.status <> 'superseded' AND o.status <> 'superseded' AND ",
+    reader_predicate!("n.agent_id", "?1"),
+    " AND ",
+    reader_predicate!("o.agent_id", "?1"),
+    " AND ",
+    memory_project_predicate!("n.", "?3")
+);
 
-/// Counts the open pairs and lists the `limit` oldest pending ones.
-pub async fn open_pairs(store: &MemoryStore, owner: Option<&str>, limit: usize) -> Result<OpenPairs, MemoryError> {
-    let owner = owner.map(str::to_owned);
+/// Counts the open pairs `reader` reaches in `project_id` and lists the
+/// `limit` oldest pending ones.
+pub async fn open_pairs(
+    store: &MemoryStore,
+    reader: Option<&Reader>,
+    project_id: Option<&str>,
+    limit: usize,
+) -> Result<OpenPairs, MemoryError> {
+    let reach = reader_bind(reader);
+    let project = project_id.map(str::to_owned);
     store
         .conn
         .call(move |c| -> rusqlite::Result<OpenPairs> {
@@ -455,7 +475,7 @@ pub async fn open_pairs(store: &MemoryStore, owner: Option<&str>, limit: usize) 
                     "SELECT COALESCE(SUM(p.state = 'pending'), 0), COALESCE(SUM(p.state = 'escalated'), 0) \
                      {OPEN_PAIR_FROM}"
                 ),
-                [&owner],
+                rusqlite::params![reach, Option::<i64>::None, project],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
             let mut stmt = c.prepare(&format!(
@@ -468,7 +488,7 @@ pub async fn open_pairs(store: &MemoryStore, owner: Option<&str>, limit: usize) 
                 Ok(mark(&source, &by).map(str::to_owned))
             };
             let pairs = stmt
-                .query_map(rusqlite::params![owner, limit as i64], |r| {
+                .query_map(rusqlite::params![reach, limit as i64, project], |r| {
                     Ok(OpenPair {
                         new_id: r.get(0)?,
                         old_id: r.get(1)?,
@@ -491,7 +511,12 @@ pub async fn open_pairs(store: &MemoryStore, owner: Option<&str>, limit: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::sharing::Reach;
     use crate::memory::admin::{list_memories_core, ListParams, MemoryKind};
+
+    fn reader(agent: &str) -> Reader {
+        Reader::new(agent, Reach::AllBut(Vec::new()))
+    }
     use crate::memory::search::{search_all_memories, SearchScope};
 
     fn pair_row(id: i64, status: &str, superseded_by: Option<i64>, disputes: &[i64]) -> PairRow {
@@ -790,19 +815,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pair_of_another_agent_is_not_found() {
+    async fn a_pair_with_a_hidden_side_is_not_found() {
         let store = store().await;
         let old = seed(&store, "old", "active", &[], 0).await;
         let new = seed(&store, "new", "disputed", &[old], 1).await;
 
+        let hidden = Reader::new("agent-x", Reach::AllBut(vec!["agent-d".into()]));
         assert!(matches!(
-            resolve_dispute_core(&store, new, old, Outcome::Supersede, Some("agent-x")).await,
+            resolve_dispute_core(&store, new, old, Outcome::Supersede, Some(&hidden)).await,
             Err(ResolveError::NotFound(id)) if id == new
         ));
         assert_eq!(row(&store, new).await.status, "disputed", "a refused resolution changes nothing");
         assert_eq!(row(&store, old).await.status, "active");
+    }
 
-        let resolution = resolve_dispute_core(&store, new, old, Outcome::Supersede, Some("agent-d")).await.unwrap();
+    #[tokio::test]
+    async fn another_agent_judges_a_pair_it_reaches() {
+        let store = store().await;
+        let old = seed(&store, "old", "active", &[], 0).await;
+        let new = seed(&store, "new", "disputed", &[old], 1).await;
+
+        let other = Reader::new("agent-x", Reach::AllBut(Vec::new()));
+        let resolution = resolve_dispute_core(&store, new, old, Outcome::Supersede, Some(&other)).await.unwrap();
         assert_eq!(resolution.other.status, "superseded");
     }
 
@@ -1156,11 +1190,35 @@ mod tests {
         note_pair(&store, gone, old, "pending").await;
         soft_delete(&store, gone).await;
 
-        let open = open_pairs(&store, Some("agent-d"), 5).await.unwrap();
+        let open = open_pairs(&store, Some(&reader("agent-d")), None, 5).await.unwrap();
 
         assert_eq!((open.pending, open.escalated), (1, 1));
         assert_eq!(open.pairs.iter().map(|p| (p.new_id, p.old_id)).collect::<Vec<_>>(), vec![(a, old)]);
-        assert_eq!(open_pairs(&store, Some("agent-x"), 5).await.unwrap().pending, 0);
+    }
+
+    #[tokio::test]
+    async fn open_pairs_count_by_project_and_reach() {
+        let store = store().await;
+        let old = seed(&store, "old", "active", &[], 0).await;
+        let here = seed(&store, "here", "active", &[], 1).await;
+        let there = seed(&store, "there", "active", &[], 2).await;
+        note_pair(&store, here, old, "pending").await;
+        note_pair(&store, there, old, "pending").await;
+        store
+            .conn
+            .call(move |c| {
+                c.execute("UPDATE memory SET project_id = 'p' WHERE id = ?1", [here])?;
+                c.execute("UPDATE memory SET project_id = 'q' WHERE id = ?1", [there])
+            })
+            .await
+            .unwrap();
+
+        let another = reader("agent-x");
+        assert_eq!(open_pairs(&store, Some(&another), None, 5).await.unwrap().pending, 2, "another agent judges them too");
+        let in_p = open_pairs(&store, Some(&another), Some("p"), 5).await.unwrap();
+        assert_eq!(in_p.pairs.iter().map(|p| p.new_id).collect::<Vec<_>>(), vec![here], "only the project's");
+        let hiding = Reader::new("agent-x", Reach::AllBut(vec!["agent-d".into()]));
+        assert_eq!(open_pairs(&store, Some(&hiding), None, 5).await.unwrap().pending, 0, "a pair it cannot read is not counted");
     }
 
     #[tokio::test]
@@ -1175,7 +1233,7 @@ mod tests {
             .unwrap();
         note_pair(&store, new, old, "pending").await;
 
-        let open = open_pairs(&store, Some("agent-d"), 5).await.unwrap();
+        let open = open_pairs(&store, Some(&reader("agent-d")), None, 5).await.unwrap();
 
         let pair = &open.pairs[0];
         assert_eq!((pair.new_mark.as_deref(), pair.old_mark.as_deref()), (Some("inferred"), None));

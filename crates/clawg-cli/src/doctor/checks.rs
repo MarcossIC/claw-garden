@@ -359,7 +359,8 @@ pub fn agents(rows: &[AgentRows]) -> Vec<Finding> {
                 "fallback_agent",
                 format!(
                     "{} live memories are under `{FALLBACK_AGENT_ID}`, the id a bridge takes when its client gives \
-                     neither --agent nor its own name; the client's own agent does not own them",
+                     neither --agent nor its own name; every agent reads and changes them, but the workspace and the \
+                     recent saves of the client's own agent leave them out",
                     fallback.live
                 ),
             )
@@ -411,9 +412,12 @@ pub fn invariants(inv: &Invariants) -> Vec<Finding> {
                     "memory.topic",
                     Severity::Warn,
                     "several_live_saves",
-                    format!("{} live saves hold one topic key, where each should have replaced the one before", t.saves.len()),
+                    format!(
+                        "{} live saves hold one topic key of a project, where each should have replaced the one before",
+                        t.saves.len()
+                    ),
                 )
-                .evidence(json!({ "agent_id": t.agent_id, "project_id": t.project_id, "saves": t.saves }))
+                .evidence(json!({ "agents": t.agents, "project_id": t.project_id, "saves": t.saves }))
             })
             .collect(),
     );
@@ -462,7 +466,7 @@ pub fn invariants(inv: &Invariants) -> Vec<Finding> {
     );
     check(
         "memory.content_hash",
-        "no two live rows of one agent and project hold the same text",
+        "no two live rows of one project hold the same text",
         inv.hash_duplicates
             .iter()
             .map(|h| {
@@ -470,9 +474,9 @@ pub fn invariants(inv: &Invariants) -> Vec<Finding> {
                     "memory.content_hash",
                     Severity::Warn,
                     "live_duplicates",
-                    format!("{} live rows of one agent and project hold the same text", h.ids.len()),
+                    format!("{} live rows of one project hold the same text", h.ids.len()),
                 )
-                .evidence(json!({ "agent_id": h.agent_id, "project_id": h.project_id, "ids": h.ids }))
+                .evidence(json!({ "agents": h.agents, "project_id": h.project_id, "ids": h.ids }))
             })
             .collect(),
     );
@@ -709,14 +713,14 @@ mod tests {
             ]
         );
         let broken = Invariants {
-            topic_versions: vec![TopicVersions { agent_id: Some("a".into()), project_id: None, saves: vec![1, 4] }],
+            topic_versions: vec![TopicVersions { agents: vec![Some("a".into()), None], project_id: None, saves: vec![1, 4] }],
             dangling_superseded: vec![
                 DanglingSuperseded { id: 2, superseded_by: Some(9), cause: Some("revision".into()) },
                 DanglingSuperseded { id: 3, superseded_by: Some(9), cause: Some("verdict".into()) },
                 DanglingSuperseded { id: 5, superseded_by: None, cause: None },
             ],
             dangling_revived: vec![DanglingRevived { id: 6, revived_from: 8 }],
-            hash_duplicates: vec![HashDuplicates { agent_id: Some("a".into()), project_id: None, ids: vec![10, 11] }],
+            hash_duplicates: vec![HashDuplicates { agents: vec![Some("a".into())], project_id: None, ids: vec![10, 11] }],
             purged_headers: vec![PurgedHeader { save_id: 3, first_piece: 40 }],
             lonely_disputes: vec![12],
         };
@@ -735,6 +739,7 @@ mod tests {
             ]
         );
         assert_eq!(found[0].evidence["saves"], json!([1, 4]));
+        assert_eq!(found[0].evidence["agents"], json!(["a", null]), "the authors, a row no agent saved as null");
         assert_eq!(found[6].evidence["save_id"], 3);
     }
 }

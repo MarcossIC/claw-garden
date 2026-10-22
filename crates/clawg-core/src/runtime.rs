@@ -290,7 +290,7 @@ impl MemoryRuntime {
         let failed = self.store.outbox_find_failed(operation_id, agent).await?;
         let mut deleted = Vec::new();
         for id in failed.inserted() {
-            if delete_memory_core(&self.store, id, MemoryKind::Memory, Some(&failed.agent_id)).await?.deleted == 1 {
+            if delete_memory_core(&self.store, id, MemoryKind::Memory, None).await?.deleted == 1 {
                 deleted.push(id);
             }
         }
@@ -418,7 +418,8 @@ impl MemoryRuntime {
         let store = Arc::new(
             MemoryStore::new_for_test()
                 .await
-                .expect("in-memory test store"),
+                .expect("in-memory test store")
+                .with_sharing_dir(base_dir.clone()),
         );
         let (memory_tx, memory_rx) = tokio::sync::mpsc::channel(capacity);
         let access_tracker = Arc::new(AccessTracker::new(store.conn.clone()));
