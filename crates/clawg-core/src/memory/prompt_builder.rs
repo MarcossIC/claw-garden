@@ -54,6 +54,10 @@ const MAX_CONFLICT_PAIRS: usize = 5;
 pub const DEFAULT_BUDGET: usize = 8_000;
 /// The most a caller may ask for; a larger budget is cut down to this.
 pub const MAX_BUDGET: usize = 24_000;
+/// A context with a query keeps a quarter of its budget for its hits. With
+/// the default, the other three quarters are what the workspace's AUTO
+/// section may take, so a stocked workspace no longer leaves the hits out.
+const HIT_ROOM_DIVISOR: usize = 4;
 /// Ends a hit whose text the budget shortened.
 const TRUNCATED: &str = " [truncated]";
 
@@ -246,7 +250,8 @@ pub async fn build_memory_prompt(
     );
 
     let (last_session, hits) = with_last_session(store, agent_id, project_id, reach, hits).await;
-    let fitted = assemble(store, &workspace_content, last_session, hits, emitted, agent_id, budget).await;
+    let hit_room = budget / HIT_ROOM_DIVISOR;
+    let fitted = assemble(store, &workspace_content, last_session, hits, emitted, agent_id, budget, hit_room).await;
 
     // Fire-and-forget access recording, of the hits the text kept: a row this
     // channel suppressed or the budget cut was not retrieved for the agent,
@@ -286,7 +291,9 @@ pub async fn build_session_prompt(
     let hits = one_row_per_save(rows, &links, K_FINAL);
     let retrieval = Retrieval::Recent { hits: hits.len() };
     let (last_session, hits) = with_last_session(store, agent_id, project_id, reach, hits).await;
-    let fitted = assemble(store, &workspace_content, last_session, hits, emitted, agent_id, budget).await;
+    // No room: at a session start the summary is the handoff, and these rows
+    // are only the newest, not what anything asked for.
+    let fitted = assemble(store, &workspace_content, last_session, hits, emitted, agent_id, budget, 0).await;
     Ok(MemoryPrompt { text: fitted.text, retrieval })
 }
 
@@ -301,7 +308,7 @@ async fn read_workspace(workspace: &WorkspaceManager, agent_id: &str, project_id
 }
 
 /// Lays `hits` out under the workspace, with the conflicts on what the
-/// prompt could show, cut to `budget`.
+/// prompt could show, cut to `budget` with `hit_room` kept for the hits.
 async fn assemble(
     store: &MemoryStore,
     workspace_content: &str,
@@ -310,6 +317,7 @@ async fn assemble(
     emitted: &EmittedIds,
     agent_id: &str,
     budget: usize,
+    hit_room: usize,
 ) -> Fitted {
     // Taken before `bucket_by_recency` consumes `hits`.
     let shown: Vec<i64> = hits
@@ -342,6 +350,7 @@ async fn assemble(
             conflicts,
             conflicts_omitted,
             reader: agent_id,
+            hit_room,
         },
         budget,
     )
@@ -360,6 +369,9 @@ struct PromptParts<'a> {
     conflicts: Vec<ConflictPair>,
     conflicts_omitted: usize,
     reader: &'a str,
+    /// Bytes RECENT and LONG-TERM keep until the summary and the conflicts
+    /// are gone; 0 cuts every hit first.
+    hit_room: usize,
 }
 
 /// What the budget took out, said at the end of the prompt.
@@ -384,15 +396,20 @@ struct Fitted {
 
 /// Renders `parts` in at most `budget` bytes.
 ///
-/// While the text is over, the hit of RECENT or LONG-TERM that scored lowest
-/// goes (see [`next_to_cut`]), then the last session's summary, then the
-/// last conflict pair, which joins the count of pairs not shown. The blocks
-/// say how old a hit is, not how relevant: cutting a whole block first would
-/// drop an `exact` hit of last week before a recent one that barely passed
-/// the floor. The summary outlasts the hits because no query brings it back,
-/// and gives way to the conflicts because they ask for the user. A hit left
-/// alone in its block is shortened instead, and goes only when no text is
-/// left of it: one shortened hit and its id say more than an empty block.
+/// While the text is over, and RECENT and LONG-TERM take more than
+/// `hit_room`, the hit of either that scored lowest goes (see
+/// [`next_to_cut`]); then the last session's summary, then the last conflict
+/// pair, which joins the count of pairs not shown, then the hits left in the
+/// room, by the same rule. The blocks say how old a hit is, not how relevant:
+/// cutting a whole block first would drop an `exact` hit of last week before
+/// a recent one that barely passed the floor. The summary outlasts the hits
+/// beyond the room because no query brings it back, and gives way to the
+/// conflicts because they ask for the user; the room keeps the best hits past
+/// both, since they are what a context with a query was asked for, and a
+/// stocked workspace with a long summary and a dispute would otherwise leave
+/// none. A hit left alone in its block is shortened instead, while over the
+/// room only by what is over it, and goes only when no text is left of it:
+/// one shortened hit and its id say more than an empty block.
 /// Each step renders the whole text, so the closing note, the SHARED note and
 /// the text a conflict gains when its hit goes are all counted as they are.
 ///
@@ -414,42 +431,60 @@ fn fit_to_budget(mut parts: PromptParts<'_>, budget: usize) -> Fitted {
         let Some(over) = text.len().checked_sub(budget).filter(|&over| over > 0) else {
             return Fitted { text, shown: parts.recent.into_iter().chain(parts.longterm).collect() };
         };
-        let (block, at) = match next_to_cut(&parts.recent, &parts.longterm) {
-            Some((Bucket::LongTerm, at)) => (&mut parts.longterm, at),
-            Some((Bucket::Recent, at)) => (&mut parts.recent, at),
-            None => (&mut parts.last_session, 0),
-        };
-        match block.len() {
-            0 if parts.conflicts.is_empty() => {
+        let hits_over = hit_bytes(&parts).saturating_sub(parts.hit_room);
+        let (block, at, by) = match next_to_cut(&parts.recent, &parts.longterm) {
+            Some((bucket, at)) if hits_over > 0 => (hits_in(&mut parts, bucket), at, over.min(hits_over)),
+            _ if !parts.last_session.is_empty() => (&mut parts.last_session, 0, over),
+            _ if !parts.conflicts.is_empty() => {
+                parts.conflicts.pop();
+                parts.conflicts_omitted += 1;
+                continue;
+            }
+            Some((bucket, at)) => (hits_in(&mut parts, bucket), at, over),
+            None => {
                 cut.workspace_over = true;
                 return Fitted { text: render(&parts, Some(&cut)), shown: Vec::new() };
             }
-            0 => {
-                parts.conflicts.pop();
-                parts.conflicts_omitted += 1;
-            }
-            1 => {
-                let hit = &mut block[0];
-                let id = (hit.kind, hit.id);
-                match shorten(&hit.content, over, cut.shortened.contains(&id)) {
-                    Some(content) => {
-                        hit.content = content;
-                        if !cut.shortened.contains(&id) {
-                            cut.shortened.push(id);
-                        }
-                    }
-                    None => {
-                        block.pop();
-                        cut.shortened.retain(|s| *s != id);
-                        cut.left_out.push(id);
+        };
+        if block.len() == 1 {
+            let hit = &mut block[0];
+            let id = (hit.kind, hit.id);
+            match shorten(&hit.content, by, cut.shortened.contains(&id)) {
+                Some(content) => {
+                    hit.content = content;
+                    if !cut.shortened.contains(&id) {
+                        cut.shortened.push(id);
                     }
                 }
+                None => {
+                    block.pop();
+                    cut.shortened.retain(|s| *s != id);
+                    cut.left_out.push(id);
+                }
             }
-            _ => {
-                let hit = block.remove(at);
-                cut.left_out.push((hit.kind, hit.id));
-            }
+        } else {
+            let hit = block.remove(at);
+            cut.left_out.push((hit.kind, hit.id));
         }
+    }
+}
+
+/// What RECENT and LONG-TERM take of the text: each block with its
+/// separator, its lines and the blank line that opens it.
+fn hit_bytes(parts: &PromptParts<'_>) -> usize {
+    [(SEP_RECENT, &parts.recent), (SEP_LONGTERM, &parts.longterm)]
+        .into_iter()
+        .filter(|(_, hits)| !hits.is_empty())
+        .map(|(separator, hits)| {
+            separator.len() + 2 + hits.iter().map(|h| format_hit_line(h, parts.reader).len() + 1).sum::<usize>()
+        })
+        .sum()
+}
+
+fn hits_in<'p>(parts: &'p mut PromptParts<'_>, bucket: Bucket) -> &'p mut Vec<RankedHit> {
+    match bucket {
+        Bucket::Recent => &mut parts.recent,
+        Bucket::LongTerm => &mut parts.longterm,
     }
 }
 
@@ -502,7 +537,7 @@ fn positions(recent: &[RankedHit], longterm: &[RankedHit]) -> HashMap<i64, usize
 }
 
 fn render(parts: &PromptParts<'_>, cut: Option<&Cut>) -> String {
-    let PromptParts { workspace, last_session, recent, longterm, conflicts, conflicts_omitted, reader } = parts;
+    let PromptParts { workspace, last_session, recent, longterm, conflicts, conflicts_omitted, reader, .. } = parts;
     let mut out = String::new();
     if !workspace.is_empty() {
         out.push_str(SEP_WORKSPACE);
@@ -1240,6 +1275,7 @@ mod tests {
             conflicts: Vec::new(),
             conflicts_omitted: 0,
             reader: "agent-1",
+            hit_room: 0,
         };
         render(&parts, None)
     }
@@ -1500,6 +1536,7 @@ mod tests {
             conflicts,
             conflicts_omitted: 0,
             reader: "agent-1",
+            hit_room: 0,
         }
     }
 
@@ -1669,6 +1706,77 @@ mod tests {
         let conflicts = block(&fitted.text, SEP_CONFLICTS).unwrap();
         assert!(conflicts.contains("\nNEW #1\n"), "a printed hit is cited by id: {conflicts}");
         assert!(conflicts.contains("OLD [2023-07-22 #2] the hit text the cut removed"), "a cut one carries its text: {conflicts}");
+    }
+
+    /// Four hits of 1,000 bytes, #1 and #3 the best, a summary and a pair,
+    /// with room for two hits.
+    fn with_room<'a>() -> PromptParts<'a> {
+        let mut parts = PromptParts {
+            last_session: vec![sized_hit(9, 1_000)],
+            hit_room: 2_300,
+            ..parts("", &[(1, 1_000), (2, 1_000)], &[(3, 1_000), (4, 1_000)], vec![pair(301, 302)])
+        };
+        for (hit, score) in parts.recent.iter_mut().chain(&mut parts.longterm).zip([0.9, 0.1, 0.8, 0.2]) {
+            hit.score = score;
+        }
+        parts
+    }
+
+    #[test]
+    fn the_hits_over_their_room_go_before_the_last_session() {
+        let fitted = fit_to_budget(with_room(), 4_000);
+        assert_eq!(header_ids(&fitted.text), [9, 1, 3], "{}", fitted.text);
+        let cut = block(&fitted.text, SEP_BUDGET).unwrap();
+        assert!(cut.contains("Left out: #2, #4.") && !cut.contains("Shortened"), "{}", fitted.text);
+        assert!(block(&fitted.text, SEP_CONFLICTS).is_some(), "{}", fitted.text);
+    }
+
+    #[test]
+    fn the_hits_in_their_room_outlast_the_last_session_and_the_conflicts() {
+        let fitted = fit_to_budget(with_room(), 2_600);
+        assert_eq!(header_ids(&fitted.text), [1, 3], "{}", fitted.text);
+        assert!(block(&fitted.text, SEP_BUDGET).unwrap().contains("Left out: #9, #2, #4."), "{}", fitted.text);
+        assert!(!fitted.text.contains(TRUNCATED), "{}", fitted.text);
+
+        for budget in (300..4_000).step_by(37) {
+            let text = fit_to_budget(with_room(), budget).text;
+            let ids = header_ids(&text);
+            let shortened = block(&text, SEP_BUDGET)
+                .and_then(|b| b.split("Shortened: ").nth(1))
+                .map_or("", |s| s.split('.').next().unwrap_or(""));
+            let room_cut = !ids.contains(&1) || !ids.contains(&3) || shortened.contains("#1") || shortened.contains("#3");
+            if room_cut {
+                assert!(!ids.contains(&9), "the summary goes before a hit in the room, at {budget}: {text}");
+                assert!(block(&text, SEP_CONFLICTS).is_none(), "and so do the conflicts, at {budget}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_lone_hit_over_its_room_is_shortened_to_it() {
+        let lone = || PromptParts { last_session: vec![sized_hit(9, 1_000)], hit_room: 1_000, ..parts("", &[(7, 5_000)], &[], vec![]) };
+
+        let fitted = fit_to_budget(lone(), 2_000);
+        assert!(fitted.text.len() <= 2_000, "{}", fitted.text);
+        let recent = block(&fitted.text, SEP_RECENT).expect("the hit stays");
+        assert!(recent.len() > 900 && recent.len() <= 1_000, "shortened to its room: {} bytes", recent.len());
+        assert!(recent.trim_end().ends_with(TRUNCATED), "{recent}");
+        assert!(block(&fitted.text, SEP_BUDGET).unwrap().contains("Shortened: #7, #9."), "{}", fitted.text);
+
+        let roomier = fit_to_budget(lone(), 4_000);
+        assert!(!block(&roomier.text, SEP_BUDGET).unwrap().contains("#9"), "a budget that fits the summary keeps it whole: {}", roomier.text);
+        assert!(block(&roomier.text, SEP_RECENT).unwrap().len() > 1_000, "and the hit is cut only by what is over: {}", roomier.text);
+    }
+
+    #[test]
+    fn a_room_never_takes_the_prompt_over_the_budget() {
+        for budget in (600..30_000).step_by(397) {
+            for hit_room in [budget / 4, budget, usize::MAX] {
+                let parts = PromptParts { last_session: vec![sized_hit(11, 3_000)], hit_room, ..ten_long_hits() };
+                let fitted = fit_to_budget(parts, budget);
+                assert!(fitted.text.len() <= budget, "{} bytes over a budget of {budget}:\n{}", fitted.text.len(), fitted.text);
+            }
+        }
     }
 
     #[test]
@@ -2976,6 +3084,77 @@ mod tests {
         }
     }
 
+    /// Writes `content` as the workspace file `agent_id` reads in `project_id`.
+    fn write_workspace(wm: &WorkspaceManager, agent_id: &str, project_id: Option<&str>, content: &str) {
+        let path = wm.workspace_path(agent_id, project_id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    /// The store whose context once came back without a single hit: a
+    /// stocked workspace, a long summary, a pair in dispute with both sides
+    /// long, and ten long hits around the one the query is about.
+    #[tokio::test]
+    async fn a_mature_store_still_shows_the_hit_of_the_query() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let agent = "agent-mature";
+        write_workspace(&wm, agent, Some("proj-a"), &"- a standing preference of the user\n".repeat(140));
+        seed_summary(&store, agent, Some("proj-a"), &format!("Goal: the last session. {}", "Next steps: more work. ".repeat(130)), 1).await;
+        let mut like_query = vec![0.0_f32; 384];
+        like_query[0] = 1.0;
+        let mut close = vec![0.0_f32; 384];
+        close[0] = 0.95;
+        close[1] = 0.31;
+        let mut others = Vec::new();
+        for i in 0..10 {
+            others.push(seed_memory(&store, agent, &format!("note {i} ").repeat(130), "semantic_fact", 2, 5.0, unit_bytes(&close)).await);
+        }
+        let asked = seed_memory(&store, agent, &"the deploy job runs on tag pushes. ".repeat(15), "semantic_fact", 2, 5.0, unit_bytes(&like_query)).await;
+        let disputed = others[0];
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<()> {
+                c.execute(
+                    "INSERT INTO memory (scope, agent_id, content, memory_type, source,
+                     created_at, created_by_type, created_by_ref,
+                     last_modified_at, last_accessed_at, importance, tier, status)
+                     VALUES ('agent', ?1, ?2, 'semantic_fact', 'explicit', 1000, 'agent', ?1, 1000, 1000, 5.0, 2, 'active')",
+                    rusqlite::params![agent, "the older side of the dispute. ".repeat(33)],
+                )?;
+                let old = c.last_insert_rowid();
+                c.execute(
+                    "UPDATE memory SET status = 'disputed', disputed_against = json('[' || ?1 || ']') WHERE id = ?2",
+                    rusqlite::params![old, disputed],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let prompt = build_memory_prompt(
+            &store,
+            &wm,
+            Some(Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>),
+            agent,
+            Some("proj-a"),
+            &Reach::Own,
+            QueryTexts::single_shot("when does the deploy job run"),
+            &EmittedIds::default(),
+            None,
+            DEFAULT_BUDGET,
+        )
+        .await
+        .unwrap()
+        .text;
+
+        assert!(prompt.len() <= DEFAULT_BUDGET, "{} bytes", prompt.len());
+        assert!(prompt.contains(SEP_BUDGET), "the fixture has to overflow the budget: {prompt}");
+        let hits = [block(&prompt, SEP_RECENT), block(&prompt, SEP_LONGTERM)].into_iter().flatten().collect::<String>();
+        assert!(hits.contains(&format!("#{asked} ")), "the hit the query asked for is shown: {prompt}");
+    }
+
     #[tokio::test]
     async fn e2e_full_4_block_output() {
         use crate::memory::embedder::FakeEmbedder;
@@ -3536,6 +3715,33 @@ mod tests {
         let month_old = seed_summary(&old, "agent-1", Some("proj-a"), "Goal: a month ago", 30).await;
         let text = session_prompt(&old, "agent-1", Some("proj-a")).await.text;
         assert!(block(&text, SEP_LAST_SESSION).unwrap().contains(&format!("#{month_old} ")), "with its date, however old: {text}");
+    }
+
+    /// At a session start the summary is the handoff and RECENT only the
+    /// newest saves, so they keep no room of their own.
+    #[tokio::test]
+    async fn a_context_without_a_query_keeps_the_last_session_over_its_saves() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        write_workspace(&wm, "agent-1", Some("proj-a"), &"- a standing preference of the user\n".repeat(110));
+        let summary = seed_summary(&store, "agent-1", Some("proj-a"), &format!("Goal: the last session. {}", "Next steps: more work. ".repeat(130)), 1).await;
+        for i in 0..10 {
+            seed_dated(&store, "agent-1", Some("proj-a"), &format!("save {i} ").repeat(130), 0).await;
+        }
+
+        let text = build_session_prompt(&store, &wm, "agent-1", Some("proj-a"), &Reach::Own, &EmittedIds::default(), DEFAULT_BUDGET)
+            .await
+            .unwrap()
+            .text;
+
+        assert!(text.len() <= DEFAULT_BUDGET, "{} bytes", text.len());
+        let cut = block(&text, SEP_BUDGET).expect("the fixture has to overflow the budget");
+        assert!(block(&text, SEP_LAST_SESSION).is_some_and(|b| b.contains(&format!("#{summary} "))), "{text}");
+        let named = cut.split([' ', ',', '.']).any(|word| word == format!("#{summary}"));
+        assert!(!named, "the summary is neither cut nor shortened: {text}");
+        let saves = block(&text, SEP_RECENT).map_or(0, |b| b.lines().filter(|l| l.starts_with('[')).count());
+        assert!(saves <= 1, "the saves go before it: {text}");
     }
 
     /// The `detail` column of `EXPLAIN QUERY PLAN` for the production `sql`.

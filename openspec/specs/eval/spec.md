@@ -617,7 +617,7 @@ Con el tokenizador de las líneas de base (`EvalTokenCounter::real`, `eval_api.r
 4. el costo fijo de la clave en cada sesión: los tokens de su descripción en el schema de `save_memory` y los de su párrafo de `protocol.md`, leídos de `agent_contract.json` y de `protocol.md` compilados en el binario (`fixed_cost`, `cost.rs:169`);
 5. los tokens de una línea de aviso de referencia, fijada antes de medir (`WARNING_LINE`, `cost.rs:24`). Su costo por save lo da `store`.
 
-La reescritura vive en la herramienta: en producción, `recall_context` no muestra la clave (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:691`).
+La reescritura vive en la herramienta: en producción, `recall_context` no muestra la clave (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:726`).
 
 **Tests:** `the_rewrite_adds_the_key_only_to_keyed_hits`, `the_byte_delta_is_the_sum_of_the_added_keys`, `a_prompt_over_budget_after_the_rewrite_is_counted`, `m4_reports_the_fixed_cost_of_the_key_from_the_contract_and_the_protocol`, `the_key_of_a_search_hit_shows_for_the_save_project_of_its_row` y `m4_sums_the_queries_and_prices_the_warning_line` (`cost.rs`); `the_rewrite_finds_every_keyed_header_of_a_real_prompt` y `the_production_context_still_omits_the_key` (`run.rs`), los dos sobre prompts del router en proceso.
 
@@ -780,7 +780,7 @@ Sobre el cambio tal como se mezcló (`e041ee6`), el flujo de las specs daba 23,4
   - Sobre el fondo de un export de prod, con 393 saves por brazo y 207 filas `superseded` en el brazo con clave (`…-recheck-bg.json`):
     - M2 pasa, 40 de 40, y contra el control da 39 de 40.
     - M1 y las posiciones en `search_memory` no cambian. Los temas del set quedan lejos del contenido del store, así que el fondo suma volumen pero no densidad alrededor de ellos.
-    - En `recall_context` la última versión no aparece en ninguna cadena: el workspace, LAST SESSION y ACTIVE CONFLICTS ocupan el presupuesto de 8.000 bytes, y el recorte saca todos los hits. La mitad de contexto de M2 coincide, entonces, sin informar nada.
+    - En `recall_context` la última versión no aparece en ninguna cadena: el workspace, LAST SESSION y ACTIVE CONFLICTS ocupan el presupuesto de 8.000 bytes, y el recorte saca todos los hits. La mitad de contexto de M2 coincide, entonces, sin informar nada. Medido antes de [context-hit-room](../../changes/archive/2026-10-22-context-hit-room/proposal.md), que les reserva a los hits de una consulta un cuarto del presupuesto; esta corrida no se repitió después.
   - Mostrar la clave cuesta +45,1 tokens de media en `search_memory` (las claves que hoy muestra) y +54,5 en `recall_context` reescrito. Con todas las filas con clave, la cota de arriba es +85,1 y +111,0. Ningún prompt pasa de 8.000 bytes. La clave cuesta 236 tokens fijos por sesión, y la línea de aviso, 34.
 - **`store`**, sobre un export de 397 saves (`2026-10-21-real-revision-eval-store.json`):
   - El aviso dispara en 154 de los 220 saves sin clave de un tipo que afirma, y 76 de ellos son revisiones (49,4 %, 41,6–57,2 %).
