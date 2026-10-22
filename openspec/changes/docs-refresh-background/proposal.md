@@ -31,7 +31,7 @@ Las decisiones abiertas de la exploración se cierran así; el porqué está en 
 ## Alcance
 
 1. `project_docs`: `RefreshGuard::run`, que refresca con la marca tomada y deja el resultado en `Progress`; `DocIndex::begin_if_due` y `last_error`; `refresh` saltea un doc con `DocIndexError::Vector`, lo cuenta en `failed` y sigue; la cuenta distinta pasa a `DocIndexError::VectorCount`.
-2. `daemon/api.rs`: `search_docs` lanza el refresco vencido en una tarea (la misma que usa el registro, extraída de `spawn_doc_refresh`) y lo espera `REFRESH_GRACE`, o `FIRST_INDEX_WAIT` con el índice vacío; `warning` sale de `last_error`.
+2. `daemon/api.rs`: `search_docs` lanza el refresco vencido en una tarea (`refresh_docs_in_background`; el registro usa el mismo `refresh_docs` desde `spawn_doc_refresh`) y lo espera `REFRESH_GRACE`, o `FIRST_INDEX_WAIT` con el índice vacío; `warning` sale de `last_error`.
 3. `clawg-eval`: `EvalDocIndex::index` falla si un doc quedó en `failed`, como fallaba antes, para que una medición no pierda docs en silencio.
 4. Docs: `specs/project-docs` (al archivar) y `.claude/CLAUDE.md` si nombra la conducta.
 

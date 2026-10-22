@@ -2,7 +2,7 @@
 
 ## D1. Tarea propia y espera acotada (R1)
 
-**Elegido:** la búsqueda toma la marca con `DocIndex::begin_if_due` (comprueba y toma en el mismo lock, así no hay carrera entre `is_due` y `begin`) y pasa el `RefreshGuard` a una tarea de `tokio::spawn`, la misma que lanza el registro (`refresh_in_background`, extraída de `spawn_doc_refresh`). La tarea tiene su propia copia del `AppCtx` y del embedder, así que no se cae con el futuro del handler. La búsqueda espera con `wait_idle`, que ya existía.
+**Elegido:** la búsqueda toma la marca con `DocIndex::begin_if_due` (comprueba y toma en el mismo lock, así no hay carrera entre `is_due` y `begin`) y pasa el `RefreshGuard` a una tarea de `tokio::spawn`, la misma que lanza el registro (`refresh_docs_in_background`, que con `spawn_doc_refresh` comparte `refresh_docs`). La tarea tiene su propia copia del `AppCtx` y del embedder, así que no se cae con el futuro del handler. La búsqueda espera con `wait_idle`, que ya existía.
 
 Como la marca se toma antes del `spawn`, `is_running` es cierto desde que la búsqueda decide; no hay un instante en que una segunda búsqueda vea el proyecto vencido y lance otro.
 
