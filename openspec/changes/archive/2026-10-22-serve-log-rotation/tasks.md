@@ -26,4 +26,4 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 
 ## 5. Archive
 
-- [ ] «El log del daemon» en `specs/storage`; `git mv` a `changes/archive/<fecha>-serve-log-rotation`; `state.yaml` archivado; fila 72 y el orden de ejecución del `README.md` de openspec; subir el minor.
+- [x] «El log del daemon» en `specs/storage`; `git mv` a `changes/archive/2026-10-22-serve-log-rotation`; `state.yaml` archivado; fila 72 y el orden de ejecución del `README.md` de openspec; subir el minor.

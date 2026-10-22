@@ -1,6 +1,6 @@
 # storage — Especificación
 
-Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde queda un save aceptado hasta que termina de guardarse, el apagado del daemon, la reinyección de lo pendiente al arrancar y la importación del volcado de versiones anteriores, la resolución del directorio de datos, el runner de migraciones y la verificación del esquema, el pooling del modelo y el re-embebido de un store CLS al arrancar, la descarga del modelo (la caché, los plazos de red, un hash por archivo fuera de los hilos del runtime y el origen `CLAWG_HF_BASE_URL`), el ciclo de vida del embedder (soltar el modelo ocioso, recargarlo desde la caché y repararla, recuperar un hilo de inferencia muerto, un solo tokenizer por proceso y la memoria que vuelve al sistema), los snapshots, `clawg backup` y `clawg restore`, la escritura de `workspace.md`, y lo que `clawg status`, MCP y el instalador dicen cuando la base no se puede abrir.
+Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde queda un save aceptado hasta que termina de guardarse, el apagado del daemon, la reinyección de lo pendiente al arrancar y la importación del volcado de versiones anteriores, la resolución del directorio de datos, el runner de migraciones y la verificación del esquema, el pooling del modelo y el re-embebido de un store CLS al arrancar, la descarga del modelo (la caché, los plazos de red, un hash por archivo fuera de los hilos del runtime y el origen `CLAWG_HF_BASE_URL`), el ciclo de vida del embedder (soltar el modelo ocioso, recargarlo desde la caché y repararla, recuperar un hilo de inferencia muerto, un solo tokenizer por proceso y la memoria que vuelve al sistema), los snapshots, `clawg backup` y `clawg restore`, la escritura de `workspace.md`, el log del daemon (su rotación y la versión en su primera línea), y lo que `clawg status`, MCP y el instalador dicen cuando la base no se puede abrir.
 
 **Origen:**
 - [data-preservation](../../changes/archive/2026-10-12-data-preservation/proposal.md) (partes A + F), archivado el 2026-10-12.
@@ -15,6 +15,7 @@ Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde q
 - [embedder-recovery](../../changes/archive/2026-10-19-embedder-recovery/proposal.md), archivado el 2026-10-19 («Un pánico en la inferencia contesta y suelta la sesión», «Un hilo muerto se recupera en la misma llamada», y el `IdleEmbedder` sin barrido con ocio `0`).
 - [outbox-lifecycle](../../changes/archive/2026-10-19-outbox-lifecycle/proposal.md), archivado el 2026-10-19 (el reintento de un fallo pasajero en la misma ejecución, la regla única de `failed`, la pausa del apagado entre pedazos y «Una fila `failed` se reintenta o se descarta»). Lo que contesta un save que falla a medias está en [`specs/ingest`](../ingest/spec.md).
 - [shutdown-budget](../../changes/archive/2026-10-20-shutdown-budget/proposal.md), archivado el 2026-10-20 (SIGTERM como apagado ordenado, «Cada fase del apagado tiene tope» y «Las fases caben en `STOP_TIMEOUT`»). Lo que hace `clawg update` cuando `stop` vence está en [`specs/self-update`](../self-update/spec.md).
+- [serve-log-rotation](../../changes/archive/2026-10-22-serve-log-rotation/proposal.md), archivado el 2026-10-22 («El log del daemon»).
 
 ## Definiciones
 
@@ -796,6 +797,56 @@ Con `StartTimeout`, el texto de la herramienta MUST decir que clawg intentó arr
 Después de `clawg stop --profile prod`, `scripts/install.ps1` MUST ejecutar `clawg status --profile prod` con el binario anterior (`install.ps1:266`). Si sale con 0, MUST abortar antes de mover el binario, diciendo que el daemon sigue corriendo y que el binario no se reemplazó.
 
 **Verificación:** manual en Windows; no hay PowerShell en Linux ni en CI.
+
+## El log del daemon
+
+### `serve.log` se rota al abrirse
+
+`spawn_serve_at` (`crates/clawg-cli/src/client.rs:1271`), que usan el autoarranque del puente y `clawg update`, MUST abrir `<data>/logs/serve.log` en append con `serve_log::open` (`crates/clawg-cli/src/serve_log.rs:21`), que antes lo rota si su tamaño pasa de `SERVE_LOG_LIMIT` (10 MiB, `serve_log.rs:14`): `serve.log.1`, si existe, MUST pasar a `serve.log.2`, reemplazando el que hubiera, y `serve.log` MUST pasar a `serve.log.1`. Con el tamaño igual o menor, o sin `serve.log`, MUST NOT renombrar nada. La decisión de qué renombrar MUST ser una función pura del tamaño, el tope y la cantidad de ficheros (`rotation`, `serve_log.rs:57`). El daemon que corre MUST NOT rotar su log: sólo hereda el fichero, así que sus `panic` y lo que ONNX Runtime escribe en stderr van ahí, y un daemon que vive semanas puede pasar el tope hasta el próximo arranque.
+
+Un fichero que otro proceso tiene abierto MUST poder rotarse, y lo que ese proceso escribe después MUST quedar en el fichero renombrado, en Unix y en Windows (`rotate`, `serve_log.rs:39`: se renombra, no se copia).
+
+Si la rotación falla, MUST abrir `serve.log` igual, en append, y MUST escribir en él una línea que nombre la causa antes de lanzar el daemon (`open_with`, `serve_log.rs:27`).
+
+Un `clawg serve` lanzado a mano escribe donde lo redirija quien lo lanza, sin rotación.
+
+#### Escenario: el autoarranque rota
+- GIVEN un home de prueba con un `serve.log` de más de `SERVE_LOG_LIMIT`
+- WHEN un puente con autoarranque recibe una llamada
+- THEN `serve.log.1` tiene el contenido viejo y `serve.log` empieza con la línea de arranque del daemon
+
+#### Escenario: bajo el tope
+- GIVEN un `serve.log` de `SERVE_LOG_LIMIT` bytes
+- WHEN se decide la rotación
+- THEN no se renombra nada
+
+#### Escenario: tres ficheros
+- GIVEN `serve.log` sobre el tope, `serve.log.1` y `serve.log.2`
+- WHEN se rota
+- THEN el viejo `serve.log.2` desaparece, `serve.log.1` pasó a `.2` y `serve.log` a `.1`
+
+#### Escenario: otro escritor
+- GIVEN `serve.log` sobre el tope y abierto en append por otro manejador
+- WHEN se rota y ese manejador escribe
+- THEN lo escrito queda en `serve.log.1`
+
+**Tests:** `nothing_rotates_up_to_the_limit`, `a_log_under_the_limit_is_appended_to`, `over_the_limit_each_file_moves_one_place`, `rotating_keeps_three_files`, `a_file_open_for_writing_still_rotates`, `a_failed_rotation_is_written_to_the_log` (`serve_log.rs`); `an_autostart_rotates_a_full_serve_log` (`tests/binary.rs`).
+
+### La primera línea del daemon nombra su versión
+
+`clawg serve` MUST registrar como su primera línea, con nivel `info` y antes de resolver el directorio de datos o abrir el store, `clawg serve <versión> starting, profile <perfil>`, con ` (<dist_target>)` después de la versión cuando el binario lo lleva (`starting_line`, `crates/clawg-cli/src/daemon/serve.rs:372`, registrada en `serve.rs:108`). La versión y el `dist_target` MUST ser los de `build_info`, así que en un build de test los del sello. Vale también cuando el daemon escribe en la terminal. Así un `serve.log` que `update` comparte entre binarios dice qué versión escribió cada tramo, también el de un arranque que falló antes de escuchar.
+
+#### Escenario: un build de release
+- GIVEN la versión `0.50.0` y el `dist_target` `x86_64-unknown-linux-gnu`
+- WHEN se arma la línea para `dev`
+- THEN es `clawg serve 0.50.0 (x86_64-unknown-linux-gnu) starting, profile dev`
+
+#### Escenario: un daemon lanzado a mano
+- GIVEN un home de prueba
+- WHEN arranca `clawg serve` con su stderr en un fichero
+- THEN la primera línea del fichero nombra la versión del binario
+
+**Tests:** `the_starting_line_names_the_version_and_the_build` (`daemon/serve.rs`); `a_daemon_names_its_version_first` y `an_autostart_rotates_a_full_serve_log` (`tests/binary.rs`).
 
 ## Archivos del workspace
 

@@ -1,14 +1,15 @@
 change: serve-log-rotation
 objective: "transversal"
 depends_on: []
-phase: apply
+phase: archived
 artifacts:
   exploration: done
   proposal: done
   spec: done
   design: skipped  # the decisions are in the proposal
   tasks: done
-  apply: pending
-  verify: pending
-  archive: pending
+  apply: done
+  verify: done  # Linux and the binary in a test home; the CI of the pull request covers Linux and Windows
+  archive: done
 updated: 2026-10-22
+main_spec: openspec/specs/storage/spec.md
