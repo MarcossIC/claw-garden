@@ -336,6 +336,23 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
 
+        Command::Projects { action: ProjectsAction::Move(opts) } => {
+            let profile = opts.profile.resolve().map_err(|e| e.to_string())?;
+            let unavailable = |e: ClientError| memories::explain_unavailable(&e, profile);
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let client = match probe_running(&base_dir, false).await.map_err(unavailable)? {
+                Probe::Running(client) => client,
+                Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
+            };
+            let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+            let moved = projects::move_memories(&client, &opts, &cwd).await.map_err(|e| match e {
+                projects::AddError::Client(e) => unavailable(e),
+                other => other.to_string(),
+            })?;
+            println!("{moved}");
+            Ok(ExitCode::SUCCESS)
+        }
+
         Command::Memories { action } => {
             let profile = action.profile().resolve().map_err(|e| e.to_string())?;
             let unavailable = |e: ClientError| memories::explain_unavailable(&e, profile);

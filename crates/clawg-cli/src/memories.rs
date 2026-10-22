@@ -346,6 +346,7 @@ fn filter_args(filters: &Filters, project: Option<String>) -> ListArgs {
         memory_type: filters.memory_type.clone(),
         agent: filters.scope.agent.clone(),
         project,
+        no_project: filters.no_project,
         status: filters.status.map(|s| s.as_str().to_owned()),
         ..ListArgs::default()
     }
@@ -963,6 +964,7 @@ mod tests {
                 memory_type: Some("preference".into()),
                 tier: Some(1),
                 status: Some(StatusArg::Superseded),
+                no_project: true,
             },
             limit: 7,
             offset: 14,
@@ -979,6 +981,7 @@ mod tests {
         assert_eq!(args.memory_type.as_deref(), Some("preference"));
         assert_eq!(args.tier, Some(1));
         assert_eq!(args.status.as_deref(), Some("superseded"));
+        assert!(args.no_project);
         assert_eq!(args.q, None);
         assert_eq!((args.limit, args.offset), (Some(7), Some(14)));
     }

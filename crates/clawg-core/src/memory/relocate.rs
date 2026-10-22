@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::memory::backup::Reason;
 use crate::memory::clock::TimestampMs;
@@ -24,7 +24,7 @@ use crate::memory::store_insert::MemoryType;
 use crate::memory::{MemoryError, MemoryStore};
 
 /// Why a unit stays where it is. Nothing of it is written.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum Refusal {
     #[error("#{row} holds the same text as #{twin}, live in the target; delete one of them and move again")]
@@ -38,7 +38,7 @@ pub enum Refusal {
 }
 
 /// A unit left where it was: its first selected row, and why.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[error("memory #{id} cannot move: {refusal}")]
 pub struct Skipped {
     pub id: i64,
@@ -46,8 +46,8 @@ pub struct Skipped {
     pub refusal: Refusal,
 }
 
-/// A row a move changes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// A row a move changes. What it skips on the wire reads back empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MovedRow {
     pub id: i64,
     pub from_project: Option<String>,
@@ -63,7 +63,7 @@ pub struct MovedRow {
 }
 
 /// What a move does, or would do on a dry run.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MoveReport {
     pub dry_run: bool,
     /// The move's number in `memory_move`; `None` when nothing was written.

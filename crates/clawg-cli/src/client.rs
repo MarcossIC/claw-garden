@@ -23,6 +23,7 @@ use std::time::Duration;
 use clawg_core::memory::dispute::{OpenPairs, Resolution};
 use clawg_core::memory::outbox::OutboxSummary;
 use clawg_core::memory::portability::ImportReport;
+use clawg_core::memory::relocate::MoveReport;
 use clawg_core::memory::store_lock::{StoreHolder, StoreLock, StoreOwner};
 use clawg_core::build_info;
 use clawg_core::paths::{data_dir, socket_file, PathsError, Profile};
@@ -596,6 +597,8 @@ pub struct ListArgs {
     pub memory_type: Option<String>,
     pub agent: Option<String>,
     pub project: Option<String>,
+    /// Lists only the rows saved in no project.
+    pub no_project: bool,
     pub status: Option<String>,
     /// Free text over memory content; the daemon then lists `memory` rows only.
     pub q: Option<String>,
@@ -603,6 +606,38 @@ pub struct ListArgs {
     pub offset: Option<u32>,
     /// Lists the deleted rows instead of the live ones.
     pub deleted: bool,
+}
+
+/// A batch move as `POST /v1/memories/move` takes it: a selection and one
+/// target, or a move to undo. Unset fields are left out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct MoveRequest {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ids: Vec<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_project: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub from_none: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub q: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub include_deleted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_project: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub to_none: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub undo: Option<i64>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
 }
 
 /// The query of a call by id an agent makes: no pair at all for the user's
@@ -1048,6 +1083,9 @@ impl DaemonClient {
         if let Some(p) = &args.project {
             query.push(("project", p.clone()));
         }
+        if args.no_project {
+            query.push(("no_project", "true".into()));
+        }
         if let Some(s) = &args.status {
             query.push(("status", s.clone()));
         }
@@ -1117,6 +1155,12 @@ impl DaemonClient {
         let call = Call::new(reqwest::Method::PATCH, format!("/v1/memories/{kind}/{id}"))
             .query(reader_query(agent))
             .json(&UpdateBody { importance, memory_type, user_answered })?;
+        read_response(self.send(call).await?)
+    }
+
+    /// Moves memories between projects, or undoes a move, as the user.
+    pub async fn move_memories(&self, request: &MoveRequest) -> Result<MoveReport, ClientError> {
+        let call = Call::new(reqwest::Method::POST, "/v1/memories/move").json(request)?;
         read_response(self.send(call).await?)
     }
 

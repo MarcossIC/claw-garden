@@ -3763,3 +3763,46 @@ async fn the_listing_reaches_the_rows_without_a_project() {
     let (status, body) = h.get_json(&format!("/v1/memories?no_project=true&project={target}")).await;
     assert_eq!(status, 400, "{body}");
 }
+
+#[tokio::test]
+async fn the_batch_moves_reports_and_snapshots() {
+    let h = Harness::start().await;
+    let target = registered(&h, "/work/target").await;
+    let mut loose = Vec::new();
+    for content in ["the first unfiled note", "the second unfiled note"] {
+        let (_, body) = h.post_json("/v1/memories", json!({ "content": content, "agent_id": "a" })).await;
+        loose.extend(saved_ids(&body));
+    }
+    let request = json!({ "from_none": true, "to_project": target });
+
+    let (status, dry) = h.post_json("/v1/memories/move", json!({ "from_none": true, "to_project": target, "dry_run": true })).await;
+    assert_eq!(status, 200, "{dry}");
+    assert_eq!(dry["moved"].as_array().map(Vec::len), Some(2), "{dry}");
+    assert_eq!(project_of(&h, loose[0]).await, Value::Null, "a dry run moves nothing");
+
+    let (status, done) = h.post_json("/v1/memories/move", request).await;
+    assert_eq!(status, 200, "{done}");
+    assert_eq!(done["move_id"], 1, "{done}");
+    let snapshot = done["snapshot"].as_str().expect("snapshot");
+    assert!(snapshot.ends_with("-pre-move.db") && std::path::Path::new(snapshot).exists(), "{snapshot}");
+    for &id in &loose {
+        assert_eq!(project_of(&h, id).await, json!(target));
+    }
+
+    let (status, undone) = h.post_json("/v1/memories/move", json!({ "undo": 1 })).await;
+    assert_eq!(status, 200, "{undone}");
+    assert_eq!(undone["move_id"], 2, "{undone}");
+    assert_eq!(project_of(&h, loose[1]).await, Value::Null);
+}
+
+#[tokio::test]
+async fn a_batch_without_a_selection_or_a_target_is_400() {
+    let h = Harness::start().await;
+
+    for body in [json!({ "to_none": true }), json!({ "ids": [1] }), json!({ "ids": [1], "to_none": true, "undo": 1 }), json!({ "ids": [1], "to_none": true, "projects": "x" })] {
+        let (status, answer) = h.post_json("/v1/memories/move", body.clone()).await;
+        assert!(status == 400 || status == 422, "{body} -> {status} {answer}");
+    }
+    let (status, answer) = h.post_json("/v1/memories/move", json!({ "undo": 9 })).await;
+    assert_eq!(status, 404, "{answer}");
+}
