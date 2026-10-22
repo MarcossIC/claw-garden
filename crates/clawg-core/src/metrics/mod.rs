@@ -3,6 +3,7 @@
 
 pub mod histogram;
 pub mod recorder;
+pub mod store;
 
 pub use histogram::{Histogram, Unit};
 pub use recorder::{Gauge, Recorder, SeriesKey, Window};
