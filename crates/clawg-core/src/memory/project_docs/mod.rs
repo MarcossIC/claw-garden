@@ -57,8 +57,12 @@ pub enum DocIndexError {
         #[source]
         source: EmbedError,
     },
+    /// One vector of the doc was not usable: of the doc, not of the embedder,
+    /// so a refresh skips the doc and goes on.
     #[error("the embedder returned an unusable vector for {path}: {reason}")]
     Vector { path: String, reason: String },
+    #[error("the embedder returned {vectors} vectors for the {passages} passages of {path}")]
+    VectorCount { path: String, vectors: usize, passages: usize },
     #[error("embedding the query failed: {0}")]
     Query(String),
     #[error("documentation index store error: {0}")]
@@ -77,6 +81,15 @@ pub struct RefreshReport {
     pub skipped: usize,
     /// Passages written by this refresh.
     pub passages: usize,
+    /// Docs left as they were because a vector of theirs was unusable; the
+    /// next refresh tries them again.
+    pub failed: Vec<FailedDoc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedDoc {
+    pub path: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,10 +139,13 @@ pub fn needs_refresh(last_started: Option<Instant>, now: Instant, interval: Dura
     last_started.map_or(true, |t| now.saturating_duration_since(t) >= interval)
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct Progress {
     running: bool,
     last_started: Option<Instant>,
+    /// Why the last refresh that ran to its end failed; cleared by one that
+    /// succeeds.
+    last_error: Option<String>,
 }
 
 /// Which projects are being refreshed and when each last started, so one
@@ -160,12 +176,54 @@ impl Drop for RefreshGuard {
     }
 }
 
+impl RefreshGuard {
+    /// Brings the project's index in step with its registered root and keeps
+    /// how it ended for [`DocIndex::last_error`], written before the claim is
+    /// released so whoever waited for it reads it already there.
+    pub async fn run(
+        self,
+        store: &MemoryStore,
+        embedder: &dyn Embedder,
+        tokenizer: Option<Arc<tokenizers::Tokenizer>>,
+    ) -> Result<RefreshReport, DocIndexError> {
+        let result = async {
+            let root = root_of(store, &self.project_id).await?;
+            let splitter = match tokenizer {
+                Some(tok) => TokenSplitter::with_tokenizer(tok),
+                None => TokenSplitter::fallback(),
+            };
+            refresh(store, embedder, &splitter, &self.project_id, &root).await
+        }
+        .await;
+        let mut projects = self.index.projects.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(p) = projects.get_mut(&self.project_id) {
+            p.last_error = result.as_ref().err().map(ToString::to_string);
+        }
+        drop(projects);
+        result
+    }
+}
+
 impl DocIndex {
     /// Claims the project's refresh, or `None` if one is already running.
     pub fn begin(self: &Arc<Self>, project_id: &str) -> Option<RefreshGuard> {
         let mut projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
         let progress = projects.entry(project_id.to_string()).or_default();
         if progress.running {
+            return None;
+        }
+        progress.running = true;
+        progress.last_started = Some(Instant::now());
+        Some(RefreshGuard { index: self.clone(), project_id: project_id.to_string() })
+    }
+
+    /// Claims the project's refresh if a search at `now` should start one
+    /// (see [`DocIndex::is_due`]), checked and claimed under one lock so two
+    /// searches never both start it.
+    pub fn begin_if_due(self: &Arc<Self>, project_id: &str, now: Instant) -> Option<RefreshGuard> {
+        let mut projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
+        let progress = projects.entry(project_id.to_string()).or_default();
+        if progress.running || !needs_refresh(progress.last_started, now, REFRESH_INTERVAL) {
             return None;
         }
         progress.running = true;
@@ -203,9 +261,14 @@ impl DocIndex {
         }
     }
 
+    /// Why the project's last finished refresh failed, until one succeeds.
+    pub fn last_error(&self, project_id: &str) -> Option<String> {
+        self.progress(project_id).last_error
+    }
+
     fn progress(&self, project_id: &str) -> Progress {
         let projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
-        projects.get(project_id).copied().unwrap_or_default()
+        projects.get(project_id).cloned().unwrap_or_default()
     }
 
     /// Brings the project's index in step with its registered root, unless a
@@ -219,15 +282,10 @@ impl DocIndex {
         tokenizer: Option<Arc<tokenizers::Tokenizer>>,
         project_id: &str,
     ) -> Result<RefreshOutcome, DocIndexError> {
-        let Some(_guard) = self.begin(project_id) else {
+        let Some(guard) = self.begin(project_id) else {
             return Ok(RefreshOutcome::AlreadyRunning);
         };
-        let root = root_of(store, project_id).await?;
-        let splitter = match tokenizer {
-            Some(tok) => TokenSplitter::with_tokenizer(tok),
-            None => TokenSplitter::fallback(),
-        };
-        refresh(store, embedder, &splitter, project_id, &root).await.map(RefreshOutcome::Refreshed)
+        guard.run(store, embedder, tokenizer).await.map(RefreshOutcome::Refreshed)
     }
 }
 
@@ -385,7 +443,14 @@ pub(crate) async fn refresh(
             DocKind::Manifest => chunk_manifest(path, &masked, splitter),
             DocKind::Code(lang) => chunk_code(path, &masked, lang, splitter),
         };
-        let vectors = embed_passages(embedder, path, &passages).await?;
+        let vectors = match embed_passages(embedder, path, &passages).await {
+            Ok(vectors) => vectors,
+            Err(DocIndexError::Vector { path, reason }) => {
+                report.failed.push(FailedDoc { path, reason });
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         report.passages += passages.len();
         let doc = IndexedDoc { path: path.clone(), hash, model_id: model_id.clone(), passages, vectors };
         replace_doc(store, project_id, doc).await?;
@@ -410,9 +475,10 @@ async fn embed_passages(
         .await
         .map_err(|source| DocIndexError::Embed { path: path.to_string(), source })?;
     if vectors.len() != texts.len() {
-        return Err(DocIndexError::Vector {
+        return Err(DocIndexError::VectorCount {
             path: path.to_string(),
-            reason: format!("{} vectors for {} passages", vectors.len(), texts.len()),
+            vectors: vectors.len(),
+            passages: texts.len(),
         });
     }
     vectors
@@ -786,6 +852,105 @@ mod tests {
         assert_eq!(passages(&store, "p").await[0].2, "second");
     }
 
+    /// `FakeEmbedder`, except that a text holding `BROKEN` embeds to a
+    /// vector with a NaN in it.
+    struct Unusable;
+
+    #[async_trait::async_trait]
+    impl Embedder for Unusable {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+            let mut v = FakeEmbedder::default().embed_with_role(text, role).await?;
+            if text.contains("BROKEN") {
+                v[0] = f32::NAN;
+            }
+            Ok(v)
+        }
+        fn dimensions(&self) -> usize { 384 }
+        fn model_id(&self) -> &str { "m1" }
+        fn query_prefix(&self) -> &str { "" }
+        fn passage_prefix(&self) -> &str { "" }
+    }
+
+    /// Answers a batch with one vector fewer than it was given texts.
+    struct ShortBatch;
+
+    #[async_trait::async_trait]
+    impl Embedder for ShortBatch {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+            FakeEmbedder::default().embed_with_role(text, role).await
+        }
+        async fn embed_batch(&self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
+            let mut out = Vec::new();
+            for text in texts.iter().skip(1) {
+                out.push(self.embed_with_role(text, role).await?);
+            }
+            Ok(out)
+        }
+        fn dimensions(&self) -> usize { 384 }
+        fn model_id(&self) -> &str { "m1" }
+        fn query_prefix(&self) -> &str { "" }
+        fn passage_prefix(&self) -> &str { "" }
+    }
+
+    #[tokio::test]
+    async fn an_unusable_vector_skips_its_doc_and_the_rest_go_on() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "gone.md", "# Gone\nsoon deleted\n");
+        let store = store_with_project("p", dir.path()).await;
+        let index = Arc::new(DocIndex::default());
+        refreshed(&index, &store, &Counting::new("m1"), "p").await;
+
+        std::fs::remove_file(dir.path().join("gone.md")).unwrap();
+        write(dir.path(), "a.md", "# A\nBROKEN passage\n");
+        write(dir.path(), "b.md", "# B\nsound passage\n");
+        let report = refreshed(&index, &store, &Unusable, "p").await;
+
+        assert_eq!(report.indexed, 1, "{report:?}");
+        assert_eq!(report.removed, 1, "{report:?}");
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert_eq!(report.failed[0].path, "a.md");
+        assert!(report.failed[0].reason.contains("finite"), "{report:?}");
+        assert_eq!(passages(&store, "p").await, [("b.md".into(), "b.md > B".into(), "sound passage".into())]);
+
+        let retried = refreshed(&index, &store, &Counting::new("m1"), "p").await;
+        assert_eq!((retried.indexed, retried.failed.len()), (1, 0), "the next refresh picks the doc up again");
+    }
+
+    #[tokio::test]
+    async fn a_short_batch_still_aborts_the_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.md", "# A\na\n");
+        write(dir.path(), "b.md", "# B\nb\n");
+        let store = store_with_project("p", dir.path()).await;
+        let index = Arc::new(DocIndex::default());
+
+        let result = index.try_refresh(&store, &ShortBatch, None, "p").await;
+
+        assert!(matches!(result, Err(DocIndexError::VectorCount { ref path, .. }) if path == "a.md"), "{result:?}");
+        assert_eq!(index_sizes(&store).await, (0, 0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn the_last_error_lasts_until_a_refresh_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.md", "# A\na\n");
+        let store = store_with_project("p", dir.path()).await;
+        let index = Arc::new(DocIndex::default());
+        assert_eq!(index.last_error("p"), None);
+
+        index.try_refresh(&store, &Failing, None, "p").await.unwrap_err();
+        assert!(index.last_error("p").is_some_and(|e| e.contains("boom")), "{:?}", index.last_error("p"));
+
+        let running = index.begin("p").unwrap();
+        let skipped = index.try_refresh(&store, &Counting::new("m1"), None, "p").await.unwrap();
+        assert_eq!(skipped, RefreshOutcome::AlreadyRunning);
+        drop(running);
+        assert!(index.last_error("p").is_some(), "a refresh that did not run changes nothing");
+
+        refreshed(&index, &store, &Counting::new("m1"), "p").await;
+        assert_eq!(index.last_error("p"), None);
+    }
+
     #[tokio::test]
     async fn a_second_refresh_does_not_wait_for_the_first() {
         let dir = tempfile::tempdir().unwrap();
@@ -834,6 +999,18 @@ mod tests {
         drop(guard);
         assert!(!index.is_due("p", Instant::now()));
         assert!(index.is_due("p", Instant::now() + REFRESH_INTERVAL));
+    }
+
+    #[tokio::test]
+    async fn begin_if_due_claims_only_a_due_idle_project() {
+        let index = Arc::new(DocIndex::default());
+        let now = Instant::now();
+        let guard = index.begin_if_due("p", now).expect("never refreshed, so due");
+        assert!(index.is_running("p"));
+        assert!(index.begin_if_due("p", now + REFRESH_INTERVAL * 2).is_none(), "not while running");
+        drop(guard);
+        assert!(index.begin_if_due("p", Instant::now()).is_none(), "not before the interval");
+        assert!(index.begin_if_due("p", Instant::now() + REFRESH_INTERVAL).is_some());
     }
 
     #[tokio::test]

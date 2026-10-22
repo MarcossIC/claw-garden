@@ -34,7 +34,7 @@ use clawg_core::memory::backup::Reason;
 use clawg_core::memory::bootstrap::EmbedderStatus;
 use clawg_core::memory::dispute::{judge_pair, open_pairs, resolve_dispute_core, OpenPairs, Outcome, Resolution, ResolveError, Verdict};
 use clawg_core::memory::embedder::{EmbedError, EmbedRole, Embedder};
-use clawg_core::memory::project_docs::{self, DocHit, DocIndexError, RefreshOutcome};
+use clawg_core::memory::project_docs::{self, DocHit, DocIndexError, RefreshGuard};
 use clawg_core::memory::worker::{
     ChunkOutcome, IngestFailure, IngestReport, SavedChunk,
 };
@@ -1713,8 +1713,7 @@ async fn register(
 
 /// Refreshes the project's documentation index in the background, once the
 /// embedder has loaded: the bridge registers a root as its session starts,
-/// usually before the model is ready. Nobody waits on it, so a failure is
-/// logged and the next search tries again.
+/// usually before the model is ready.
 fn spawn_doc_refresh(app: Arc<AppCtx>, project_id: String) {
     tokio::spawn(async move {
         let mut status = app.runtime.embedder_status.subscribe();
@@ -1725,22 +1724,46 @@ fn spawn_doc_refresh(app: Arc<AppCtx>, project_id: String) {
             log::warn!("not indexing the docs of {project_id}: the embedder did not load");
             return;
         };
-        let tokenizer = app.runtime.tokenizer.get().cloned();
-        match app.runtime.project_docs.try_refresh(&app.runtime.store, embedder.as_ref(), tokenizer, &project_id).await {
-            Ok(RefreshOutcome::Refreshed(r)) => log::info!(
-                "indexed the docs of {project_id}: {} docs, {} reindexed, {} removed, {} skipped, {} passages",
-                r.docs, r.indexed, r.removed, r.skipped, r.passages
-            ),
-            Ok(RefreshOutcome::AlreadyRunning) => {}
-            Err(e) => log::warn!("could not index the docs of {project_id}: {e}"),
+        if let Some(guard) = app.runtime.project_docs.begin(&project_id) {
+            refresh_docs(&app, guard, embedder.as_ref(), &project_id).await;
         }
     });
+}
+
+/// Runs a claimed refresh in a task of its own, so it ends even when whoever
+/// started it stops waiting.
+fn refresh_docs_in_background(app: Arc<AppCtx>, guard: RefreshGuard, embedder: Arc<dyn Embedder>, project_id: String) {
+    tokio::spawn(async move { refresh_docs(&app, guard, embedder.as_ref(), &project_id).await });
+}
+
+/// Nobody waits on the outcome: a failure is logged and kept for the next
+/// search to name.
+async fn refresh_docs(app: &AppCtx, guard: RefreshGuard, embedder: &dyn Embedder, project_id: &str) {
+    let tokenizer = app.runtime.tokenizer.get().cloned();
+    match guard.run(&app.runtime.store, embedder, tokenizer).await {
+        Ok(r) => {
+            log::info!(
+                "indexed the docs of {project_id}: {} docs, {} reindexed, {} removed, {} skipped, {} passages",
+                r.docs, r.indexed, r.removed, r.skipped, r.passages
+            );
+            for f in &r.failed {
+                log::warn!("left {} of {project_id} as it was: {}", f.path, f.reason);
+            }
+        }
+        Err(e) => log::warn!("could not index the docs of {project_id}: {e}"),
+    }
 }
 
 /// How long a search waits for a project's first index before answering
 /// with what there is. Longer than indexing a typical repository's docs takes,
 /// and short of what an MCP host waits for a tool.
 pub const FIRST_INDEX_WAIT: Duration = Duration::from_secs(20);
+
+/// How long a search waits for the refresh it started over an index that
+/// already holds docs before answering from it. About what one doc took in
+/// the one full reindex measured (a debug build), so an edit is usually found
+/// by the search that finds it, and a checkout costs that search no more.
+pub const REFRESH_GRACE: Duration = Duration::from_secs(3);
 
 async fn docs_in(store: &clawg_core::memory::MemoryStore, project_id: &str) -> ApiResult<usize> {
     project_docs::doc_count(store, project_id).await.map_err(ApiError::internal)
@@ -1772,8 +1795,8 @@ pub struct DocsSearchBody {
     pub docs: usize,
     /// A refresh of the project is still running, so the hits may be partial.
     pub indexing: bool,
-    /// Why the refresh before this search failed; the hits come from what was
-    /// already indexed.
+    /// Why the project's last finished refresh failed, until one succeeds;
+    /// the hits come from what was already indexed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
 }
@@ -1796,8 +1819,9 @@ fn not_accepted(root: &std::path::Path, profile: Profile) -> String {
     )
 }
 
-/// Searches a registered project's documentation, refreshing its index first
-/// when the last refresh is older than [`project_docs::REFRESH_INTERVAL`].
+/// Searches a registered project's documentation. When the last refresh is
+/// older than [`project_docs::REFRESH_INTERVAL`] it starts one in the
+/// background and waits for it at most [`REFRESH_GRACE`].
 async fn search_docs(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<DocsSearchRequest>,
@@ -1813,22 +1837,21 @@ async fn search_docs(
     })?;
     let embedder = ready_embedder(&app)?;
     let index = &app.runtime.project_docs;
-    let mut warning = None;
-    if index.is_due(&body.project_id, Instant::now()) {
-        let tokenizer = app.runtime.tokenizer.get().cloned();
-        if let Err(e) = index.try_refresh(store, embedder.as_ref(), tokenizer, &body.project_id).await {
-            warning = Some(e.to_string());
-        }
+    // An empty index waits longer: answering from it would read as "the docs
+    // say nothing". The first index is usually started by the bridge's
+    // registration a moment before this search.
+    if let Some(guard) = index.begin_if_due(&body.project_id, Instant::now()) {
+        refresh_docs_in_background(app.clone(), guard, embedder.clone(), body.project_id.clone());
+        let limit = if docs_in(store, &body.project_id).await? == 0 { FIRST_INDEX_WAIT } else { REFRESH_GRACE };
+        index.wait_idle(&body.project_id, limit).await;
     } else if index.is_running(&body.project_id) && docs_in(store, &body.project_id).await? == 0 {
-        // The first index of a project is usually started by the bridge's
-        // registration a moment before this search; answering from an empty
-        // index would read as "the docs say nothing".
         index.wait_idle(&body.project_id, FIRST_INDEX_WAIT).await;
     }
     let hits = project_docs::search(store, embedder.as_ref(), &body.project_id, &body.query, clamp_docs_limit(body.limit))
         .await
         .map_err(ApiError::internal)?;
     let docs = docs_in(store, &body.project_id).await?;
+    let warning = index.last_error(&body.project_id);
     Ok(Json(DocsSearchBody { hits, docs, indexing: index.is_running(&body.project_id), warning }))
 }
 

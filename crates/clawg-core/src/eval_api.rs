@@ -963,6 +963,11 @@ impl EvalDocIndex {
         let r = project_docs::refresh(&self.store, self.embedder.as_ref(), &self.splitter, EVAL_DOCS_PROJECT, root)
             .await
             .map_err(|e| EvalError::Insert(e.to_string()))?;
+        // A measurement without a doc measures another corpus, so a doc the
+        // daemon would skip and retry fails the run here.
+        if let Some(f) = r.failed.first() {
+            return Err(EvalError::Insert(format!("{} could not be indexed: {}", f.path, f.reason)));
+        }
         Ok(EvalDocReport { docs: r.docs, passages: r.passages, skipped: r.skipped })
     }
 
@@ -1759,6 +1764,39 @@ mod tests {
         assert_eq!(doc_paths(root.path()).unwrap(), ["README.md"]);
         assert!(is_code_path("src/lib.rs") && !is_code_path("README.md"));
         assert_eq!(hits[0], EvalDocHit { path: "README.md".into(), breadcrumb: "README.md > Guía > Uso".into() });
+    }
+
+    /// `FakeEmbedder`, except that a text holding `BROKEN` embeds to a
+    /// vector with a NaN in it.
+    struct Unusable;
+
+    #[async_trait::async_trait]
+    impl Embedder for Unusable {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+            let mut v = FakeEmbedder::default().embed_with_role(text, role).await?;
+            if text.contains("BROKEN") {
+                v[0] = f32::NAN;
+            }
+            Ok(v)
+        }
+        fn dimensions(&self) -> usize { 384 }
+        fn model_id(&self) -> &str { "unusable" }
+        fn query_prefix(&self) -> &str { "" }
+        fn passage_prefix(&self) -> &str { "" }
+    }
+
+    #[tokio::test]
+    async fn a_doc_the_index_could_not_embed_fails_the_measurement() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.md"), "# A\nBROKEN passage\n").unwrap();
+        std::fs::write(root.path().join("b.md"), "# B\nsound passage\n").unwrap();
+
+        let embedder = EvalEmbedder(Arc::new(Unusable));
+        let index = EvalDocIndex::open(store_dir.path(), &embedder, store_dir.path()).await.unwrap();
+        let result = index.index(root.path()).await;
+
+        assert!(matches!(result, Err(EvalError::Insert(ref e)) if e.contains("a.md")), "{result:?}");
     }
 
     #[tokio::test]
