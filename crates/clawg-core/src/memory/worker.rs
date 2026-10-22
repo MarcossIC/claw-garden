@@ -4201,6 +4201,35 @@ mod tests {
         assert_eq!(revision_state(&store, old).await, ("superseded".into(), Some(new), Some("storage/engine".into())));
     }
 
+    /// What agent-scoped keys let a store hold: two live holders of one key in
+    /// a project, from two agents. The next save under the key replaces both.
+    #[tokio::test]
+    async fn a_keyed_save_replaces_every_holder_of_its_project() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let first = only_id(&save(&store, &keyed("Storage engine is SQLite", "storage/engine")).await);
+        let second = store
+            .conn
+            .call(|c| -> rusqlite::Result<i64> {
+                c.execute(
+                    "INSERT INTO memory (scope, agent_id, content, memory_type, source, created_at, created_by_type, \
+                     created_by_ref, last_modified_at, last_accessed_at, importance, tier, status, topic_key) \
+                     VALUES ('agent', 'agent-other', 'Storage engine is DuckDB', 'architectural_decision', 'explicit', \
+                     1, 'agent', 'agent-other', 1, 1, 5.0, 3, 'active', 'storage/engine')",
+                    [],
+                )?;
+                Ok(c.last_insert_rowid())
+            })
+            .await
+            .unwrap();
+
+        let report = save(&store, &keyed("Storage engine moved to Postgres", "storage/engine")).await;
+
+        let mut replaced: Vec<i64> = report.replaced.iter().map(|r| r.id).collect();
+        replaced.sort_unstable();
+        assert_eq!(replaced, vec![first, second]);
+        assert_eq!(live_with_key(&store, "storage/engine").await, vec![only_id(&report)]);
+    }
+
     #[tokio::test]
     async fn a_key_leaves_a_hidden_authors_holder() {
         let dir = tempfile::tempdir().unwrap();
