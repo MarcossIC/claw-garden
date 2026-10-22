@@ -159,6 +159,19 @@ pub(crate) fn inherit(evt: &MemoryEvent, earlier: &TopicRow) -> MemoryEvent {
     }
 }
 
+/// Marks, inside the caller's transaction, the pair that joins the save of
+/// `pieces` to `candidate`, the row its warning names. Taking the key the
+/// warning asks for keys the save's own row, which from then on reads like a
+/// row saved under a key from the start, so only the pair says it was warned.
+pub(crate) fn mark_warned_in(c: &Connection, pieces: &[StoredPiece], candidate: i64) -> rusqlite::Result<()> {
+    let mut mark =
+        c.prepare_cached("UPDATE memory_conflict SET topic_key_warned = 1 WHERE new_id = ?1 AND old_id = ?2")?;
+    for piece in pieces {
+        mark.execute([piece.memory_id, candidate])?;
+    }
+    Ok(())
+}
+
 /// The earlier row a save without a key most likely revises: the closest of
 /// the detector's candidates in the save's own agent and project, the only
 /// rows a key could revise, and of two as close the first found. A save under
@@ -181,11 +194,13 @@ impl MemoryStore {
     }
 
     /// Finishes a save no outbox row holds: links its pieces when there are
-    /// two or more and applies its revision, in one transaction.
+    /// two or more, applies its revision and marks the pair with the row its
+    /// warning names, in one transaction.
     pub(crate) async fn finish_save(
         &self,
         pieces: Vec<StoredPiece>,
         revision: Option<Revision>,
+        warned: Option<i64>,
     ) -> Result<Vec<Replaced>, MemoryError> {
         let now = TimestampMs::now();
         self.conn
@@ -198,6 +213,9 @@ impl MemoryStore {
                     Some(revision) => revise_in(&tx, revision, now)?,
                     None => Vec::new(),
                 };
+                if let Some(candidate) = warned {
+                    mark_warned_in(&tx, &pieces, candidate)?;
+                }
                 tx.commit()?;
                 Ok(replaced)
             })

@@ -118,10 +118,13 @@ pub(crate) fn read(c: &Connection, filter: &ExportFilter, now_ms: i64) -> Result
         Vec::new()
     };
     let conflicts = if has_table(c, "memory_conflict")? {
+        let warned = if columns_of(c, "memory_conflict")?.contains("topic_key_warned") { "topic_key_warned" } else { "0" };
         collect(
             c,
-            "SELECT new_id, old_id, distance, state, verdict, reason, created_at, judged_at \
-             FROM memory_conflict ORDER BY new_id, old_id",
+            &format!(
+                "SELECT new_id, old_id, distance, state, verdict, reason, created_at, judged_at, {warned} \
+                 FROM memory_conflict ORDER BY new_id, old_id"
+            ),
             |r| {
                 Ok(ConflictLine {
                     new_id: r.get(0)?,
@@ -132,6 +135,7 @@ pub(crate) fn read(c: &Connection, filter: &ExportFilter, now_ms: i64) -> Result
                     reason: r.get(5)?,
                     created_at: r.get(6)?,
                     judged_at: r.get(7)?,
+                    topic_key_warned: r.get(8)?,
                 })
             },
         )?
@@ -357,6 +361,27 @@ mod tests {
             assert!(exported.conflicts.is_empty());
             assert_eq!(exported.outbox_waiting, 0);
         }
+    }
+
+    #[tokio::test]
+    async fn a_store_from_before_the_warning_mark_exports_its_pairs_unmarked() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_on_disk(dir.path(), Some(18)).await;
+        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+        c.execute_batch(
+            "INSERT INTO memory (scope, agent_id, content, memory_type, source, created_at, created_by_type, \
+              created_by_ref, last_modified_at, last_accessed_at, importance, tier, status) \
+             SELECT scope, agent_id, 'seeded again', memory_type, source, 1, created_by_type, created_by_ref, 1, 1, \
+              importance, tier, status FROM memory;
+             INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (2, 1, 0.2, 'pending', 1);",
+        )
+        .unwrap();
+        drop(c);
+
+        let exported = export(dir.path(), &ExportFilter::default(), 0).unwrap();
+
+        let pairs: Vec<(i64, i64, bool)> = exported.conflicts.iter().map(|p| (p.new_id, p.old_id, p.topic_key_warned)).collect();
+        assert_eq!(pairs, vec![(2, 1, false)]);
     }
 
     #[tokio::test]

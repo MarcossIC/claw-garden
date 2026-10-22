@@ -38,7 +38,7 @@ Cuando la respuesta trae `revision_candidate`, `save_memory` MUST agregar, en un
 
 ## R4. El par registra que el aviso disparó
 
-Cuando el worker nombra `revision_candidate` para un save, el par de `memory_conflict` que une el save con esa fila MUST quedar marcado (`topic_key_warned`), en la misma transacción que termina el save (`outbox_finish` o `finish_save`). Ningún otro par del save MUST quedar marcado, y un save que falla MUST NOT marcar nada. La marca dice que el detector disparó, no que el agente vio la línea: un save que respondió `202` también la lleva. Una vez escrita, la marca MUST NOT cambiar: no la quitan un veredicto, ni una clave que la fila tome después, ni un borrado. V19 MUST agregar la columna sin marca en los pares que ya existen. El export MUST llevarla en la línea `conflict` (`topic_key_warned`), y la importación MUST conservarla; una línea sin el campo MUST valer sin marca.
+Cuando el worker nombra `revision_candidate` para un save, el par de `memory_conflict` que une el save con esa fila MUST quedar marcado (`topic_key_warned`), en la misma transacción que termina el save (`outbox_finish` o `finish_save`). Ningún otro par del save MUST quedar marcado, y un save que falla MUST NOT marcar nada. La marca dice que el detector disparó, no que el agente vio la línea: un save que respondió `202` también la lleva. Una vez escrita, la marca MUST NOT cambiar: no la quitan un veredicto, ni una clave que la fila tome después, ni un borrado. Sólo un `purge` de una de las dos filas se lleva el par entero, como con cualquier otro par. V19 MUST agregar la columna sin marca en los pares que ya existen. El export MUST llevarla en la línea `conflict` (`topic_key_warned`), y la importación MUST conservarla; una línea sin el campo MUST valer sin marca.
 
 #### Escenario: dispara
 - GIVEN dos filas del agente en `p`, una a distancia 0,2 del save y otra a 0,3
@@ -60,3 +60,5 @@ Cuando el worker nombra `revision_candidate` para un save, el par de `memory_con
 - GIVEN un export cuya línea `conflict` no tiene `topic_key_warned`
 - WHEN se importa
 - THEN el par queda sin marca
+
+**Tests:** `an_unkeyed_save_marks_the_pair_with_its_revision_candidate`, `a_save_under_a_key_marks_no_pair`, `following_the_warning_keeps_the_pair_marked` y `a_verdict_or_a_delete_leaves_the_mark` (`worker.rs`); `a_store_from_before_the_warning_mark_keeps_its_pairs_unmarked` (`db.rs`); `a_store_from_before_the_warning_mark_exports_its_pairs_unmarked` (`export.rs`); `the_export_carries_the_warning_mark_and_the_import_keeps_it` (`import.rs`); `a_conflict_line_without_the_mark_reads_unmarked` (`format.rs`).

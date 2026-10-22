@@ -477,9 +477,19 @@ fn write_links(tx: &Transaction<'_>, prepared: &Prepared, ledger: &mut Ledger) -
                 let reason = c.reason.as_deref().map(|r| redact(r).text);
                 tx.execute(
                     "INSERT OR IGNORE INTO memory_conflict \
-                     (new_id, old_id, distance, state, verdict, reason, created_at, judged_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    rusqlite::params![new_id, old_id, c.distance, c.state, c.verdict, reason, c.created_at, c.judged_at],
+                     (new_id, old_id, distance, state, verdict, reason, created_at, judged_at, topic_key_warned) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    rusqlite::params![
+                        new_id,
+                        old_id,
+                        c.distance,
+                        c.state,
+                        c.verdict,
+                        reason,
+                        c.created_at,
+                        c.judged_at,
+                        c.topic_key_warned
+                    ],
                 )?;
             }
             (Some(_), Some(_)) => {}
@@ -793,6 +803,36 @@ mod tests {
                 .unwrap();
             assert!(hits.iter().any(|h| h.id == m.id), "{} is not found", m.content);
         }
+    }
+
+    #[tokio::test]
+    async fn the_export_carries_the_warning_mark_and_the_import_keeps_it() {
+        let source = MemoryStore::new_for_test().await.unwrap();
+        seed(&source).await;
+        source
+            .conn
+            .call(|c| c.execute("UPDATE memory_conflict SET topic_key_warned = 1 WHERE new_id = 13 AND old_id = 12", []))
+            .await
+            .unwrap();
+        let before = dump(&source, EVERYTHING).await;
+        let marked: Vec<(i64, i64)> =
+            before.conflicts.iter().filter(|c| c.topic_key_warned).map(|c| (c.new_id, c.old_id)).collect();
+        assert_eq!(marked, vec![(13, 12)]);
+        let file = before.to_jsonl();
+        assert!(file.contains("\"topic_key_warned\":true"), "{file}");
+
+        let dst = destination().await;
+        run(&dst, &file, ImportOptions::default()).await;
+
+        let after = dump(&dst, EVERYTHING).await;
+        let by_text = |e: &Export| {
+            let content = |id: i64| e.memories.iter().find(|m| m.id == id).unwrap().content.clone();
+            let mut p: Vec<(String, String, bool)> =
+                e.conflicts.iter().map(|c| (content(c.new_id), content(c.old_id), c.topic_key_warned)).collect();
+            p.sort();
+            p
+        };
+        assert_eq!(by_text(&after), by_text(&before));
     }
 
     #[tokio::test]

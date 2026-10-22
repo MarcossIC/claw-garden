@@ -701,16 +701,17 @@ async fn process_tracked(
         save: pieces.iter().map(|p| p.memory_id).collect(),
         inserted: report.memories.iter().filter(|m| m.outcome == ChunkOutcome::Inserted).map(|m| m.id).collect(),
     });
+    report.revision_candidate = unkeyed_revision(evt.topic(), &report.related);
+    let warned = report.revision_candidate;
     report.replaced = match row {
         // A failure here leaves the row with every piece noted: the next start
         // only finishes it.
-        Some(row) => store.outbox_finish(row, pieces, revision).await.unwrap_or_else(|e| {
+        Some(row) => store.outbox_finish(row, pieces, revision, warned).await.unwrap_or_else(|e| {
             log::warn!("could not finish outbox row {row}: {e}; the next start finishes it");
             Vec::new()
         }),
-        None => finish_save(store, pieces, revision).await,
+        None => finish_save(store, pieces, revision, warned).await,
     };
-    report.revision_candidate = unkeyed_revision(evt.topic(), &report.related);
     report
 }
 
@@ -960,19 +961,24 @@ async fn ingest_pieces(
 }
 
 /// Finishes a save that no outbox row stands for: links its pieces when there
-/// are two or more and applies its revision. A position absorbed into an
-/// existing row keeps that row's vector, made without this save's head, so its
-/// link carries none.
+/// are two or more, applies its revision and marks the pair with the row its
+/// warning names. A position absorbed into an existing row keeps that row's
+/// vector, made without this save's head, so its link carries none.
 ///
 /// A failure here leaves the rows unlinked and the earlier version live, which
 /// is how every save was stored before links and keys existed; the save itself
 /// did not fail and is not reported as failed.
-async fn finish_save(store: &Arc<MemoryStore>, pieces: Vec<StoredPiece>, revision: Option<Revision>) -> Vec<Replaced> {
-    if pieces.len() < 2 && revision.is_none() {
+async fn finish_save(
+    store: &Arc<MemoryStore>,
+    pieces: Vec<StoredPiece>,
+    revision: Option<Revision>,
+    warned: Option<i64>,
+) -> Vec<Replaced> {
+    if pieces.len() < 2 && revision.is_none() && warned.is_none() {
         return Vec::new();
     }
     let count = pieces.len();
-    store.finish_save(pieces, revision).await.unwrap_or_else(|e| {
+    store.finish_save(pieces, revision, warned).await.unwrap_or_else(|e| {
         log::warn!("could not finish a save of {count} pieces: {e}; they stay unlinked and replace nothing");
         Vec::new()
     })
@@ -2100,6 +2106,81 @@ mod tests {
         let unprojected = save_placed(&store, turned(3, 0.05), &fact_in("the build uses ninja", None)).await;
         assert!(unprojected.related.iter().all(|c| !c.same_scope), "{:?}", unprojected.related);
         assert_eq!(unprojected.revision_candidate, None, "rows of a project are out of a save without one");
+    }
+
+    async fn warned_pairs(store: &MemoryStore) -> Vec<(i64, i64)> {
+        store
+            .conn
+            .call(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT new_id, old_id FROM memory_conflict WHERE topic_key_warned ORDER BY new_id, old_id",
+                )?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect();
+                rows
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_unkeyed_save_marks_the_pair_with_its_revision_candidate() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let far = only_id(&save_placed(&store, turned(2, 0.3), &fact_in("the build uses cargo", Some("p-1"))).await);
+        let near = only_id(&save_placed(&store, turned(3, 0.2), &fact_in("the build uses cargo 1.90", Some("p-1"))).await);
+
+        let report = save_placed(&store, turned(1, 0.0), &fact_in("the build uses make", Some("p-1"))).await;
+        let new = only_id(&report);
+
+        assert_eq!(report.revision_candidate, Some(near));
+        let written: Vec<(i64, i64)> = pairs(&store).await.into_iter().map(|(n, o, _)| (n, o)).collect();
+        assert!(written.contains(&(new, far)) && written.contains(&(new, near)), "{written:?}");
+        let marked: Vec<(i64, i64)> = warned_pairs(&store).await.into_iter().filter(|(n, _)| *n == new).collect();
+        assert_eq!(marked, vec![(new, near)], "only the pair with the row the warning names");
+    }
+
+    #[tokio::test]
+    async fn a_save_under_a_key_marks_no_pair() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let older = only_id(&save_placed(&store, turned(2, 0.2), &fact_in("the build uses cargo", Some("p-1"))).await);
+
+        let keyed = MemoryEvent { topic_key: Some("build/tool".into()), ..fact_in("the build uses make", Some("p-1")) };
+        let new = only_id(&save_placed(&store, turned(1, 0.0), &keyed).await);
+
+        assert!(pairs(&store).await.iter().any(|(n, o, _)| (*n, *o) == (new, older)), "the pair is still written");
+        assert!(warned_pairs(&store).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn following_the_warning_keeps_the_pair_marked() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let older = only_id(&save_placed(&store, turned(2, 0.2), &fact_in("the build uses cargo", Some("p-1"))).await);
+        let warned = save_placed(&store, turned(1, 0.0), &fact_in("the build uses make", Some("p-1"))).await;
+        let new = only_id(&warned);
+        assert_eq!(warned.revision_candidate, Some(older));
+
+        let keyed = MemoryEvent { topic_key: Some("build/tool".into()), ..fact_in("the build uses make", Some("p-1")) };
+        let again = save_placed(&store, turned(1, 0.0), &keyed).await;
+
+        assert_eq!(again.memories, vec![SavedChunk { id: new, outcome: ChunkOutcome::Reinforced }]);
+        assert_eq!(live_with_key(&store, "build/tool").await, vec![new], "the warned row took the key");
+        assert_eq!(warned_pairs(&store).await, vec![(new, older)], "and its pair keeps the mark");
+    }
+
+    #[tokio::test]
+    async fn a_verdict_or_a_delete_leaves_the_mark() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let older = only_id(&save_placed(&store, turned(2, 0.2), &fact_in("the build uses cargo", Some("p-1"))).await);
+        let new = only_id(&save_placed(&store, turned(1, 0.0), &fact_in("the build uses make", Some("p-1"))).await);
+
+        crate::memory::dispute::judge_pair(&store, new, older, crate::memory::dispute::Verdict::Supersedes, None, false, None)
+            .await
+            .unwrap();
+        assert_eq!(warned_pairs(&store).await, vec![(new, older)], "after a verdict");
+
+        crate::memory::admin::delete_memory_core(&store, new, crate::memory::admin::MemoryKind::Memory, None)
+            .await
+            .unwrap();
+        assert_eq!(warned_pairs(&store).await, vec![(new, older)], "after a delete");
     }
 
     #[tokio::test]

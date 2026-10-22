@@ -20,18 +20,19 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 
 Sin la marca, un export reconoce sólo los avisos que el agente ignoró ([Cómo cambió el criterio](proposal.md#cómo-cambió-el-criterio)). Tiene que llegar en el mismo release que el aviso: los casos de un release con el aviso y sin la marca no cuentan.
 
-- [ ] Tests primero:
+- [x] Tests primero:
   - `an_unkeyed_save_marks_the_pair_with_its_revision_candidate` y `a_save_under_a_key_marks_no_pair` (`worker.rs`);
   - `following_the_warning_keeps_the_pair_marked` (`worker.rs`): el mismo texto bajo una clave, la fila toma la clave y el par sigue marcado;
-  - la migración: V19 deja sin marca los pares que ya existen;
-  - `the_export_carries_the_warning_mark_and_the_import_keeps_it` y `a_conflict_line_without_the_mark_reads_unmarked` (`portability`).
-- [ ] `V19`, con `memory_conflict.topic_key_warned`. El worker calcula `unkeyed_revision` antes de `outbox_finish` o `finish_save`, y esa transacción marca el par. `ConflictLine.topic_key_warned` va en el export y en la importación.
-- [ ] Docs: `.claude/CLAUDE.md` (la marca, V19 y la línea `conflict` del export).
+  - la migración: `a_store_from_before_the_warning_mark_keeps_its_pairs_unmarked` (`db.rs`), y el export de un store en V18, `a_store_from_before_the_warning_mark_exports_its_pairs_unmarked` (`export.rs`);
+  - `the_export_carries_the_warning_mark_and_the_import_keeps_it` (`import.rs`) y `a_conflict_line_without_the_mark_reads_unmarked` (`format.rs`; el ejemplo fijado del formato lleva el campo).
+  - Después, como guarda de lo que ya hace el código: `a_verdict_or_a_delete_leaves_the_mark` (`worker.rs`).
+- [x] `V19__conflict_topic_key_warned.sql`, con su checksum fijado en `migrations.rs`. El worker calcula `unkeyed_revision` antes de `outbox_finish` o `finish_save`, y esa transacción marca el par (`mark_warned_in`, `topic.rs`). `ConflictLine.topic_key_warned` va en el export (`0` para un store anterior a V19) y en la importación.
+- [x] Docs: `.claude/CLAUDE.md` (la marca, V19 y la línea `conflict` del export).
 
 ## 5. Verificación
 
 - [x] Suite y clippy de `.claude/CLAUDE.md` en Linux, con R1-R3.
-- [ ] Suite y clippy de `.claude/CLAUDE.md` con R4.
+- [x] Suite y clippy de `.claude/CLAUDE.md` con R4, en Windows (`target-test`).
 - [ ] El CI en verde en Linux y Windows.
 - [x] Fijar, antes del primer caso real, `N_MAX` y la decisión por defecto de la regla de tres salidas ([criterio](proposal.md#criterio-fijado-antes-de-medir)): 200 pares marcados y, si al llegar sigue sin definirse, el aviso se queda.
 - [ ] **[casos reales]** `revision-eval store`: un modo que lista, de un export, los pares marcados (`topic_key_warned`) con su save, y una muestra al azar de los saves sin clave en que no disparó (`rest`), mezclados para etiquetarlos a ciegas. Por cada par marcado dice también si la fila avisada tiene clave, si el par tiene `supersedes` y si un save posterior reusó la clave. Tests primero, con un export armado a mano.

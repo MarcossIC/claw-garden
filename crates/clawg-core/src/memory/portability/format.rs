@@ -126,6 +126,9 @@ pub struct ConflictLine {
     pub created_at: i64,
     #[serde(default)]
     pub judged_at: Option<i64>,
+    /// The save without a key was warned that it may revise `old_id`.
+    #[serde(default)]
+    pub topic_key_warned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -297,7 +300,7 @@ pub(crate) mod tests {
         "\n",
         r#"{"kind":"piece","save":3,"piece":2,"memory":9,"context":"Storage engine"}"#,
         "\n",
-        r#"{"kind":"conflict","new_id":9,"old_id":7,"distance":0.31,"state":"judged","verdict":"compatible","reason":"different scopes","created_at":1751000000000,"judged_at":1752000000000}"#,
+        r#"{"kind":"conflict","new_id":9,"old_id":7,"distance":0.31,"state":"judged","verdict":"compatible","reason":"different scopes","created_at":1751000000000,"judged_at":1752000000000,"topic_key_warned":false}"#,
         "\n",
     );
 
@@ -324,6 +327,19 @@ pub(crate) mod tests {
         let headless = EXAMPLE.lines().skip(1).collect::<Vec<_>>().join("\n");
         assert!(matches!(parse(&headless).unwrap_err(), FormatError::NoHeader(_)));
         assert_eq!(parse("\n  \n").unwrap_err(), FormatError::Empty);
+    }
+
+    #[test]
+    fn a_conflict_line_without_the_mark_reads_unmarked() {
+        let older = EXAMPLE.replacen(",\"topic_key_warned\":false", "", 1);
+        assert_ne!(older, EXAMPLE);
+        let (_, parsed) = parse(&older).unwrap();
+        assert!(parsed.invalid.is_empty(), "{:?}", parsed.invalid);
+        assert!(!parsed.conflicts[0].1.topic_key_warned);
+
+        let marked = EXAMPLE.replacen("\"topic_key_warned\":false", "\"topic_key_warned\":true", 1);
+        let (_, parsed) = parse(&marked).unwrap();
+        assert!(parsed.conflicts[0].1.topic_key_warned);
     }
 
     #[test]

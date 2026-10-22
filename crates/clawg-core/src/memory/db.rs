@@ -676,7 +676,7 @@ mod tests {
 
         let after = conn.call(snapshot).await.unwrap();
         assert_eq!(before, after);
-        assert_eq!(after.0, 18);
+        assert_eq!(after.0, 19);
     }
 
     /// Rows written before `project` existed keep their project ids when the
@@ -1341,6 +1341,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_store_from_before_the_warning_mark_keeps_its_pairs_unmarked() {
+        ensure_vec0_registered();
+        let conn = Connection::open_in_memory().await.unwrap();
+        register_udfs(&conn).await.unwrap();
+        conn.call(|c| {
+            configured(crate::memory::migrations::runner())
+                .set_target(refinery::Target::Version(18))
+                .run(c)
+        })
+        .await
+        .unwrap();
+        conn.call(|c| {
+            for id in [1, 2] {
+                c.execute(
+                    "INSERT INTO memory \
+                     (id, scope, agent_id, content, memory_type, source, \
+                      created_at, created_by_type, created_by_ref, \
+                      last_modified_at, last_accessed_at, importance, tier, status) \
+                     VALUES (?1, 'agent', 'a', 'the build uses cargo ' || ?1, 'semantic_fact', 'explicit', \
+                      ?1, 'agent', 'a', 1, 1, 5.0, 3, 'active')",
+                    [id],
+                )?;
+            }
+            c.execute(
+                "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (2, 1, 0.2, 'pending', 2)",
+                [],
+            )
+        })
+        .await
+        .unwrap();
+
+        run_migrations(&conn).await.unwrap();
+
+        let pairs: Vec<(i64, i64, String, bool)> = conn
+            .call(|c| {
+                let mut stmt = c.prepare("SELECT new_id, old_id, state, topic_key_warned FROM memory_conflict")?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect();
+                rows
+            })
+            .await
+            .unwrap();
+        assert_eq!(pairs, vec![(2, 1, "pending".to_string(), false)]);
+    }
+
+    #[tokio::test]
     async fn a_runner_with_a_cap_migrates_no_further_than_it() {
         ensure_vec0_registered();
         for (cap, expected) in [(Some(7), 7), (None, backup::latest_known())] {
@@ -1759,7 +1804,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 18, "Expected exactly 18 applied migrations, got {}", count);
+        assert_eq!(count, 19, "Expected exactly 19 applied migrations, got {}", count);
     }
 
     /// V8 — a fresh store records V8 as applied and carries the FTS5 lexical
@@ -2220,7 +2265,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 18);
+        assert_eq!(migration_count, 19);
     }
 
     // -----------------------------------------------------------------------
