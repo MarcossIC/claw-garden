@@ -1,13 +1,13 @@
 change: project-reassign
 objective: "2"
 depends_on: [agent-authorship]
-phase: explore
+phase: apply
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
+  exploration: done  # las diez decisiones abiertas, cerradas con la opción recomendada (la 9 es de history-import)
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
   apply: pending
   verify: pending
   archive: pending
