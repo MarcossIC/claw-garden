@@ -15,15 +15,19 @@ use clawg_core::build_info::{self, DefaultPort, ServeFault};
 use clawg_core::memory::bootstrap::{
     run_embedder_bootstrap_with_retry, serve_deps, unloading_when_idle, EmbedderDeps, LogSink,
 };
+use clawg_core::memory::embedder::E5_MODEL_ID;
 use clawg_core::memory::idle_embedder::{idle_after, DEFAULT_IDLE, IDLE_MINUTES_VAR};
 use clawg_core::memory::store_lock::StoreHolder;
 use clawg_core::memory::MemoryError;
+use clawg_core::metrics::store::RunInfo;
+use clawg_core::metrics::Recorder;
 use clawg_core::paths::{data_dir, socket_file, PathsError, Profile};
 use clawg_core::private_dir::ensure_private_dir;
 use clawg_core::runtime::{MemoryRuntime, Workers};
 
 use super::api::{router_on, AppCtx, SAVE_CONFIRM_TIMEOUT};
-use super::metrics::Transport;
+use super::metrics::{metrics_path, Transport, Writer, WriterTask, METRICS_VAR};
+use super::process::utc_offset_s;
 use super::socket::{bind_socket, serves_without_socket, Listener, SocketError};
 use super::lifecycle::{
     clear_state, generate_token, now_ms, write_state, write_token, DaemonState, LifecycleError,
@@ -76,6 +80,12 @@ pub const HTTP_GRACE: Duration = Duration::from_secs(3);
 /// running (a model load cannot be cancelled) before the process exits without
 /// them. Another of the phases `clawg stop`'s timeout covers.
 pub const RUNTIME_TEARDOWN: Duration = Duration::from_secs(2);
+
+/// How long the metrics writer may take to write the last minute and the end
+/// of the run once the servers stopped. Past it the run is left without an
+/// end, as a kill leaves it. Another of the phases `clawg stop`'s timeout
+/// covers.
+pub const METRICS_CLOSE: Duration = Duration::from_secs(1);
 
 /// Splits "someone else has the store" from every other reason opening it can
 /// fail; see [`ServeError::StoreInUse`].
@@ -191,6 +201,21 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
         },
     )?;
 
+    let metrics = Arc::new(Recorder::default());
+    let writer = {
+        let path = metrics_path(&base_dir, std::env::var(METRICS_VAR).ok().as_deref());
+        let run = run_info(profile, idle);
+        let (metrics, path) = (metrics.clone(), path.clone());
+        tokio::task::spawn_blocking(move || Writer::start(path.as_deref(), metrics, &run, now_ms() as i64))
+            .await
+            .map_err(|e| ServeError::Server(std::io::Error::other(e)))?
+    };
+    let resident = {
+        let embedder = runtime.embedder.clone();
+        move || embedder.get().map(|e| e.resident())
+    };
+    let writer = WriterTask::spawn(writer, resident);
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let ctx = Arc::new(AppCtx {
         runtime,
@@ -200,7 +225,7 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
         shutdown: shutdown_tx,
         save_timeout: SAVE_CONFIRM_TIMEOUT,
         sessions: Default::default(),
-        metrics: Default::default(),
+        metrics,
     });
 
     log::info!(
@@ -247,6 +272,9 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
         }
     };
 
+    // No request comes in any more, so the last minute is complete.
+    writer.close(METRICS_CLOSE).await;
+
     // No request can queue a save any more, so whatever is queued now is all
     // there is to drain or spill.
     // After a shutdown that finished nothing else uses the connection, so the
@@ -262,6 +290,22 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
     log::info!("clawg serve {} stopped", profile.as_str());
 
     result.map_err(ServeError::Server)
+}
+
+/// What this run records about itself in `metrics.db`.
+fn run_info(profile: Profile, idle: Option<Duration>) -> RunInfo {
+    RunInfo {
+        started_at_ms: now_ms() as i64,
+        version: build_info::version().to_string(),
+        dist_target: build_info::dist_target().map(str::to_string),
+        profile: profile.as_str().to_string(),
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        cpus: std::thread::available_parallelism().map_or(1, |n| n.get() as i64),
+        embedding_model: E5_MODEL_ID.to_string(),
+        idle_minutes: Some(idle.map_or(0, |d| (d.as_secs() / 60) as i64)),
+        utc_offset_s: utc_offset_s(),
+    }
 }
 
 /// How the daemon listens on loopback TCP.

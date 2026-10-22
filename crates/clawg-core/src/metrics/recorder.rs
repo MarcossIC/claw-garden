@@ -3,6 +3,7 @@
 //! `GET /v1/metrics` reads.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use super::histogram::{Histogram, Unit};
@@ -102,6 +103,7 @@ struct State {
 #[derive(Debug, Default)]
 pub struct Recorder {
     state: Mutex<State>,
+    writing: AtomicBool,
 }
 
 impl Recorder {
@@ -142,6 +144,16 @@ impl Recorder {
     /// The last value each gauge took, whatever minute it was in.
     pub fn latest_gauges(&self) -> BTreeMap<SeriesKey, f64> {
         self.lock().latest.clone()
+    }
+
+    /// Whether the minutes are being kept in `metrics.db`, as the writer
+    /// last said.
+    pub fn writing(&self) -> bool {
+        self.writing.load(Ordering::Relaxed)
+    }
+
+    pub fn set_writing(&self, writing: bool) {
+        self.writing.store(writing, Ordering::Relaxed);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
