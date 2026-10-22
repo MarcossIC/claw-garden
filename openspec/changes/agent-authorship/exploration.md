@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 2, 4 | M–L | nada pendiente: los cambios que fijan la regla de hoy (visibility-policy 6, agent-sharing 16, topic-revisions 27, memory-provenance 41, protected-verdicts 63) están archivados. history-import (44) depende de este cambio | exploración |
+| 2, 4 | M–L | nada pendiente: los cambios que fijan la regla de hoy (visibility-policy 6, agent-sharing 16, topic-revisions 27, memory-provenance 41, protected-verdicts 63) están archivados. history-import (44) depende de este cambio | propuesta; las seis decisiones abiertas se cerraron con la opción recomendada ([propuesta](proposal.md#decisiones)) |
 
 **Tesis:** hoy `agent_id` hace dos trabajos: dice quién escribió una fila y decide qué puede hacer con ella cada agente. El segundo nació cuando nada se compartía y cualquier agente podía borrar una fila ajena con sólo conocer su id (visibility-policy); agent-sharing abrió la lectura por búsqueda y dejó todo lo demás atado al autor. El resultado es un cerebro compartido a medias: un agente encuentra la nota de otro en `search_memory` y no puede leerla entera, corregirla, borrarla ni juzgarla; guarda un texto que otro ya guardó y queda repetido; revisa un tema que otro ya cambió y quedan dos versiones vigentes. El cambio separa los dos trabajos: `agent_id` dice quién escribió una fila y nunca quién puede leerla o cambiarla, y las reglas que comparan un save con lo guardado (dedup, detector de contradicciones, clave de tema, síntesis) se aplican por proyecto y no por agente y proyecto. Lo que describe la actividad propia de un agente (su `workspace.md`, RECENT, la sesión del host que tiene registrada, el aviso del hook) sigue siendo por agente, y el autor se sigue mostrando. La única frontera que queda es la que el usuario escribe a propósito en `sharing.json`. Es de tamaño M–L porque son 36 lugares que hoy filtran por agente o describen ese filtro, un cambio de índices (V20) que no toca ninguna fila, y trece specs. Importa ahora porque history-import (44) trae 3.713 notas bajo el autor `migrated`, el 55 % más largas que una pieza, y hoy el agente del usuario sólo las vería como fragmentos de 500 caracteres que no puede leer enteros ni corregir.
 
@@ -179,28 +179,28 @@ El 2026-10-22, antes de esta exploración:
 
 ## Decisiones abiertas
 
-- [ ] **1. ¿`sharing.json` acota también lo que un agente modifica?**
+- [x] **1. ¿`sharing.json` acota también lo que un agente modifica?**
   - **a. Sí (recomendado).** Un agente cambia lo que alcanza: un autor oculto no se lee ni se cambia, y dedup, detector, clave y síntesis se aplican a *el proyecto dentro del alcance del que guarda*. Es la única forma de que `hide` siga significando algo cuando el usuario no quiere que un agente toque lo de otro, y de no imprimir texto oculto en `replaced`, `related`, ACTIVE CONFLICTS ni en el 400 de `derived_from`. Con `hide '*' '*'` vuelve el aislamiento de antes, ahora también al modificar. Costo: cada ruta que modifica necesita el alcance del lector (hoy lleva un `Option<&str>`); el worker tiene que leer `sharing.json` por save (hoy sólo el daemon lo lee, `api.rs:1310`); y «una versión viva por clave» pasa a valer por proyecto y alcance, así que dos agentes que se ocultan mutuamente pueden dejar dos titulares legítimos que el doctor no distingue de un defecto sin leer la política.
   - **b. No: `sharing.json` sólo acota lecturas.** Menos código. Pero un agente que no puede leer a otro lo reemplazaría, lo borraría o lo repetiría a ciegas, y las respuestas de los saves mostrarían su texto. Contradice el objetivo 4 («el usuario controla qué ve cada uno»).
   - **c. `sharing.json` define aparte quién escribe.** Un mecanismo de restricción nuevo, que lo decidido descarta.
-- [ ] **2. ¿Qué pasa con `?agent=` y los `agent_id` del cuerpo?**
+- [x] **2. ¿Qué pasa con `?agent=` y los `agent_id` del cuerpo?**
   - **a. Se quedan aceptados y pasan a decir quién es el lector (recomendado)**, para aplicar su alcance (decisión 1.a). Sin ellos la operación es del usuario y no tiene frontera, como hoy. Un puente anterior sigue funcionando (premisa del `deny_unknown_fields`). Costo: `OwnerQuery` y los «owner» de los núcleos mienten, y se renombran sin cambiar el nombre del parámetro.
   - **b. Se quitan.** Más simple, pero sin lector no hay alcance (1.a) y un puente anterior recibe un 400.
   - **c. Se quedan como filtro de autor opcional.** Sirve al visor, que ya lo tiene en `list` y `stats`; en las rutas por id no hace falta.
-- [ ] **3. ¿Cómo se cuentan los pares por proyecto en `memory_status`, ACTIVE CONFLICTS y el recordatorio?**
+- [x] **3. ¿Cómo se cuentan los pares por proyecto en `memory_status`, ACTIVE CONFLICTS y el recordatorio?**
   - **a. (recomendado)** `memory_status` cuenta los pares cuya fila nueva está en el proyecto del puente y cuyos dos lados alcanza el lector (sin proyecto, todo el store, como `synthesize`); `GET /v1/disputes` suma `project_id`. ACTIVE CONFLICTS quita la condición de agente, conserva la de estar entre las filas mostradas y exige que el lector alcance los dos lados. `unreviewed` y `conclusions_to_review` se cuentan por proyecto.
   - **b. Todos los pares que alcanza el lector, sin proyecto.** Más sencillo, pero arrastra pares de proyectos donde no está trabajando.
   - **c. Seguir con «los pares que abrieron los saves del agente».** Conserva a quién se le pidió juzgar y no agrega ruido, pero un par que abrió un agente que ya no trabaja no lo ve nadie, que es lo que el modelo nuevo quiere evitar.
-- [ ] **4. ¿Qué lista `list_memories`?**
+- [x] **4. ¿Qué lista `list_memories`?**
   - **a. Todo lo que alcanza, lo más nuevo primero, con ` by <autor>` en lo ajeno y un argumento opcional `agent` (recomendado).** El inventario pasa de «mis filas» a «las del cerebro», que es lo que `read_memory` y `delete_memory` ya aceptan, y el filtro devuelve lo de antes en una llamada. Cambia el contrato y el test que fija los cinco argumentos (`server.rs:2106-2140`), cuyo motivo («leer entre agentes») ya no vale; el buscador de texto del visor sigue sin exponerse. La marca ` by <autor>` no debe confundirse con la ` by=#N` de una fila reemplazada (`tools.rs:329-338`).
   - **b. Sólo las propias por defecto y un `all_agents`.** No cambia lo que el modelo ve hoy, pero pide un argumento para ver lo que las demás herramientas ya muestran.
   - **c. Todo, sin argumento nuevo.** Con 3.713 notas de `migrated` el modelo no puede acotar el listado.
-- [ ] **5. ¿Cómo se nombra la regla del doctor?**
+- [x] **5. ¿Cómo se nombra la regla del doctor?**
   - **a. Mismos `check_id` y `reason_code`, nuevo alcance (recomendado).** `memory.topic` y `memory.content_hash` agrupan por proyecto; el mensaje y la evidencia cambian (`agents` con los autores implicados en lugar de `agent_id`). Los ids nombran la regla, no su alcance, y quien filtre por ellos no se rompe. En una base existente avisan de (a) y (b), sin `safe_next_step`, como hoy.
   - **b. Ids nuevos** (`memory.topic_project`): rompe a quien filtre por id y deja dos reglas en la spec.
   - **c. Las dos reglas a la vez**: redundante, la de agente y proyecto queda contenida en la de proyecto.
   - El hallazgo `fallback_agent` se queda con otro texto y el mismo `warn`, porque las filas bajo `mcp` siguen fuera del workspace y RECENT del agente real.
-- [ ] **6. ¿La guarda de `user_answered` llega a borrar y a cambiar la importancia de una fila protegida ajena?** (la encontró la exploración)
+- [x] **6. ¿La guarda de `user_answered` llega a borrar y a cambiar la importancia de una fila protegida ajena?** (la encontró la exploración)
   - **a. No en este cambio (recomendado).** Borrar es un soft delete que `restore_memory` y `undelete` deshacen, y la guarda de 63 existe para que un agente no reemplace la palabra del usuario con un veredicto; borrar una fila propia tampoco la tenía.
   - **b. Sí, sólo para una fila protegida de otro autor.** Cierra el caso de un agente que borra la preferencia que otro guardó por pedido del usuario. Cuesta un argumento más en `delete_memory` y `update_memory` y otro cambio de contrato.
   - **c. Sí, para toda fila protegida.** Cambia el comportamiento de borrar lo propio.
