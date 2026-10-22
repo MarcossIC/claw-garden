@@ -33,12 +33,21 @@ Lo pide la tarea 3 de [revision-recheck](../archive/2026-10-22-revision-recheck/
 - **Qué es una revisión.** El save posterior revisa al anterior si, guardado el posterior, ocultar al anterior (que es lo que haría la clave) no pierde nada que siga siendo cierto y que el posterior no diga. Sale del mecanismo, no de la lectura de nadie: no hace falta que los dos tengan el mismo titular ni que el posterior contradiga al anterior. Es también la condición en que `supersedes` sobre la fila nombrada es correcto.
 - **Protocolo de etiquetas.** Dos pasadas de LLM ciegas e independientes sobre los mismos pares, cada una con la definición de arriba y sin ejemplos etiquetados, sin saber si el aviso disparó. Se informa su acuerdo como kappa de Cohen con su intervalo. Los desacuerdos los resuelve una tercera pasada, también ciega. No hay pasada contra el dueño del store.
 - **Población.** Los pares marcados de un export (R4), se haya seguido el aviso o no. Se suma una muestra al azar de los saves sin clave, de un tipo que afirma, en que no disparó y que tienen un save anterior vivo de su agente y proyecto, con su par como en 48 (`rest`). Las dos partes se etiquetan juntas. La muestra da la prevalencia y la sensibilidad, que mirando sólo los disparos no se ven.
+  - **Son 100 saves, o todos si hay menos**, y entonces son un censo como los marcados. No son 50 como en 48 porque la regla de abajo toma π puntual, y todo su error de muestreo pasa a `p_min` sin que la regla lo vea.
+  - Con las proporciones de 48 (66 de resto por 154 disparos), el resto es unos 0,43 de los marcados. 100 lo cubren entero hasta unos 233 marcados, más allá de `N_MAX`. 50 lo cubrían sólo hasta unos 116.
+  - Con 50 y 200 marcados, el error de `p_min` sería de unos 0,9 puntos, contra 3,5 de la precisión. Llegaría a 3 o 4 puntos si el resto fuera 1,5 veces los marcados.
+  - Los 50 pares de más cuestan sólo pasadas de LLM.
 - **Umbral de precisión, relativo a la prevalencia.** El aviso vale si dispara al menos el doble en las revisiones que en las demás: razón de verosimilitud positiva (sensibilidad sobre tasa de falsas alarmas) de al menos 2. Con la prevalencia π de la población, medida con la misma definición, eso es una precisión de al menos `p_min = 2π / (1 + π)`: cerca de 55 % con π = 38 %, cerca de 26 % con π = 15 %. Un aviso que dispara siempre tiene precisión π, así que el umbral pide que el detector discrimine con cualquier lectura de la regla.
 - **Regla de decisión, con tres salidas.** Se usa la cota de Wilson del 95 % de la precisión entre los pares marcados, y `p_min` con la estimación puntual de π.
   - El aviso se queda si la cota inferior supera `p_min`.
   - Se ajusta o se quita si la cota superior queda por debajo.
   - Si no, se juntan casos hasta `N_MAX` = 200 pares marcados, unos 500 saves al ritmo de disparo de 48 (38,8 %). Si al llegar sigue sin definirse, el aviso se queda: su costo ya pasa los topes de tokens de 48, y una falsa alarma sólo le pone una clave a su propia fila. Como referencia, con una precisión real 10 puntos sobre `p_min`, la cota se despega con unos 90 a 100 avisos.
-- **Antes de quitar o ajustar, la precisión por distancia.** El par guarda la distancia del detector. Si el tramo más cercano acierta y el resto no, se ajusta la regla a ese tramo en vez de quitar el aviso, en un cambio propio que se vuelve a medir.
+- **Antes de quitar o ajustar, la precisión por distancia.** El par guarda la distancia del detector. Se mira sólo cuando la cota superior de la precisión quedó por debajo de `p_min`.
+  - **Los tramos son tercios.** Los pares marcados se ordenan por distancia y el primer tercio, redondeado hacia arriba, es el más cercano. Un par a la misma distancia que el último de un tramo va con él.
+  - **Los cortes salen sólo de las distancias**, antes de leer una etiqueta, así que fijarlos no es mirar resultados.
+  - **Un tramo acierta si su cota inferior de Wilson supera `p_min`.**
+  - Si el tercio más cercano acierta, se ajusta la regla a ese tramo en vez de quitar el aviso, en un cambio propio que se vuelve a medir. Si no acierta, se quita.
+  - Con `N_MAX`, cada tercio tiene unos 67 pares. Partir en mitades daría más pares por tramo y menos resolución. Unos tramos fijos en la banda del detector (de 0,10 a 0,42) servirían para comparar stores, pero alguno podría quedar casi vacío.
 - **Lo que hizo el agente, informado sin decidir.** Entre los pares marcados, en aciertos y en falsas alarmas por separado:
   - cuántas filas avisadas tienen clave (siguió el aviso);
   - cuántos pares tienen `supersedes` (ocultó la fila nombrada);
@@ -61,6 +70,8 @@ El 2026-10-22, antes de etiquetar un solo caso real, se reemplazaron tres piezas
 
 La definición de revisión y el protocolo de etiquetas no cambian.
 
+El mismo día, también antes de ver ningún caso real, se fijaron dos cosas que el criterio dejaba abiertas: el tamaño de la muestra del resto (en «Población») y los tramos de distancia con lo que cuenta como acertar (en «Antes de quitar o ajustar»).
+
 ## Alcance
 
 1. `clawg-core`: `Candidate.same_scope`; `unkeyed_revision`; `IngestReport.revision_candidate`, que el worker calcula antes de terminar el save. La marca del par (`memory_conflict.topic_key_warned`, V19) se escribe en la transacción que lo termina, y `ConflictLine.topic_key_warned` va en el export y en la importación.
@@ -71,7 +82,7 @@ La definición de revisión y el protocolo de etiquetas no cambian.
 
 ## Fuera de alcance
 
-- El modo de `revision-eval store` que lista los pares marcados: va con la verificación, cuando haya casos.
+- El modo de `revision-eval` que lista y puntúa los pares marcados no es parte del producto: va con la verificación ([R5](spec.md#r5-revision-eval-warned-mide-el-aviso-sobre-los-pares-marcados)), y se arma antes del primer caso real para que el criterio quede escrito en código antes de ver ninguno.
 - Cambiar la línea para que pida también `supersedes` sobre la fila nombrada. La línea es la que midió 48 (R3), y ocultar esa fila ya lo pide `close to earlier memories`. Con la marca, la verificación mide las dos acciones. Si el agente pone la clave pero no oculta la fila nombrada, cambiar la línea va en un cambio propio que vuelve a medir su costo.
 - Suprimir el aviso en una parte de los saves, por la paridad de un hash del id, para medir su efecto causal: con el volumen de un solo store la potencia no alcanza. Se reconsidera con más casos.
 - La búsqueda por clave, la clave en `recall_context` y quitar reglas (M3 de 48).

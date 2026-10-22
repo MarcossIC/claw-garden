@@ -35,7 +35,12 @@ Sin la marca, un export reconoce sólo los avisos que el agente ignoró ([Cómo 
 - [x] Suite y clippy de `.claude/CLAUDE.md` con R4, en Windows (`target-test`).
 - [ ] El CI en verde en Linux y Windows.
 - [x] Fijar, antes del primer caso real, `N_MAX` y la decisión por defecto de la regla de tres salidas ([criterio](proposal.md#criterio-fijado-antes-de-medir)): 200 pares marcados y, si al llegar sigue sin definirse, el aviso se queda.
-- [ ] **[casos reales]** `revision-eval store`: un modo que lista, de un export, los pares marcados (`topic_key_warned`) con su save, y una muestra al azar de los saves sin clave en que no disparó (`rest`), mezclados para etiquetarlos a ciegas. Por cada par marcado dice también si la fila avisada tiene clave, si el par tiene `supersedes` y si un save posterior reusó la clave. Tests primero, con un export armado a mano.
+- [x] Fijar, también antes del primer caso real, el tamaño de la muestra del resto y los tramos de distancia ([criterio](proposal.md#criterio-fijado-antes-de-medir)): 100 saves, o todos si hay menos; tercios de la distancia de los pares marcados, y un tramo acierta si su cota inferior de Wilson supera `p_min`.
+- [x] `revision-eval warned` ([R5](spec.md#r5-revision-eval-warned-mide-el-aviso-sobre-los-pares-marcados)).
+  - Lista, de un export, los pares marcados (`topic_key_warned`) con su save y una muestra al azar de los saves sin clave en que no disparó (`rest`), mezclados para etiquetarlos a ciegas.
+  - Por cada par marcado dice también si la fila avisada tiene clave, si la nombrada quedó oculta por veredicto y si un save posterior reusó la clave.
+  - Puntúa las etiquetas con el criterio.
+  - Tests primero, con un export armado a mano. Docs: `.claude/CLAUDE.md`, que va con `revision-eval`.
 - [ ] **[casos reales]** Un export de un store que haya usado un clawg con la marca.
   - Etiquetar los pares con el protocolo de la propuesta: dos pasadas ciegas, kappa con su intervalo, tercera pasada para los desacuerdos.
   - Aplicar la regla de decisión: la precisión contra `p_min` de la prevalencia medida, con la cota de Wilson y sus tres salidas, y la precisión por distancia antes de quitar o ajustar.
@@ -46,4 +51,4 @@ Sin la marca, un export reconoce sólo los avisos que el agente ignoró ([Cómo 
 
 ## 6. Archive
 
-- [ ] `specs/mcp` con R1-R4; `git mv` a `changes/archive/AAAA-MM-DD-topic-key-warning`; `state.yaml` archivado; fila 68 y el orden de ejecución del `README.md` de openspec; subir el minor.
+- [ ] `specs/mcp` con R1-R4 y `specs/eval` con R5; `git mv` a `changes/archive/AAAA-MM-DD-topic-key-warning`; `state.yaml` archivado; fila 68 y el orden de ejecución del `README.md` de openspec; subir el minor.
