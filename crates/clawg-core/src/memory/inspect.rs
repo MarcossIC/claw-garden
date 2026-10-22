@@ -69,13 +69,13 @@ pub struct FailedSave {
 /// `memory_piece`, or a row alone when it has no link.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Invariants {
-    /// More than one live save under one topic key of an agent and project.
+    /// More than one live save under one topic key of a project.
     pub topic_versions: Vec<TopicVersions>,
     /// A superseded row whose `superseded_by` is NULL or names no row.
     pub dangling_superseded: Vec<DanglingSuperseded>,
     /// A row whose `revived_from` names no row.
     pub dangling_revived: Vec<DanglingRevived>,
-    /// Live rows of one agent and project with one `content_hash`.
+    /// Live rows of one project with one `content_hash`.
     pub hash_duplicates: Vec<HashDuplicates>,
     /// A save whose first piece is gone while a link still keeps its opening.
     pub purged_headers: Vec<PurgedHeader>,
@@ -92,7 +92,8 @@ impl Invariants {
 /// The saves live under one key, each by its first row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopicVersions {
-    pub agent_id: Option<String>,
+    /// Who saved the saves, each once, `None` for a row no agent saved.
+    pub agents: Vec<Option<String>>,
     pub project_id: Option<String>,
     pub saves: Vec<i64>,
 }
@@ -113,7 +114,8 @@ pub struct DanglingRevived {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HashDuplicates {
-    pub agent_id: Option<String>,
+    /// Who saved the rows, each once, `None` for a row no agent saved.
+    pub agents: Vec<Option<String>>,
     pub project_id: Option<String>,
     pub ids: Vec<i64>,
 }
@@ -228,8 +230,10 @@ fn outbox(c: &Connection) -> rusqlite::Result<OutboxFacts> {
     Ok(OutboxFacts { pending, failed: rows.collect::<rusqlite::Result<_>>()? })
 }
 
-/// One live save per key: the pieces of a long save share the key and are
-/// one version, so rows are grouped by save before they are counted.
+/// One live save per key in a project, whoever saved it: the pieces of a long
+/// save share the key and are one version, so rows are grouped by save before
+/// they are counted. Two agents the sharing policy hides from each other may
+/// hold one key each, which this cannot tell from a fault without the policy.
 fn topic_versions(c: &Connection, has: &Has) -> rusqlite::Result<Vec<TopicVersions>> {
     let save = if has.table("memory_piece") {
         "COALESCE((SELECT 's' || MIN(p.save_id) FROM memory_piece p WHERE p.memory_id = m.id), 'r' || m.id)"
@@ -237,11 +241,11 @@ fn topic_versions(c: &Connection, has: &Has) -> rusqlite::Result<Vec<TopicVersio
         "'r' || m.id"
     };
     let mut stmt = c.prepare(&format!(
-        "SELECT agent_id, project_id, topic_key, MIN(id) FROM ( \
+        "SELECT MIN(agent_id), project_id, topic_key, MIN(id) FROM ( \
              SELECT m.id, m.agent_id, m.project_id, m.topic_key, {save} AS save FROM memory m \
              WHERE m.{LIVE} AND m.topic_key IS NOT NULL) \
-         GROUP BY agent_id, COALESCE(project_id, ''), topic_key, save \
-         ORDER BY agent_id, COALESCE(project_id, ''), topic_key, MIN(id)"
+         GROUP BY COALESCE(project_id, ''), topic_key, save \
+         ORDER BY COALESCE(project_id, ''), topic_key, MIN(id)"
     ))?;
     let rows = stmt.query_map([], |r| {
         Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?))
@@ -250,10 +254,11 @@ fn topic_versions(c: &Connection, has: &Has) -> rusqlite::Result<Vec<TopicVersio
     for row in rows {
         let (agent_id, project_id, key, first) = row?;
         match found.last_mut() {
-            Some((group, k)) if *k == key && same_scope(&group.agent_id, &group.project_id, &agent_id, &project_id) => {
-                group.saves.push(first)
+            Some((group, k)) if *k == key && same_project(&group.project_id, &project_id) => {
+                group.saves.push(first);
+                add_agent(&mut group.agents, agent_id);
             }
-            _ => found.push((TopicVersions { agent_id, project_id, saves: vec![first] }, key)),
+            _ => found.push((TopicVersions { agents: vec![agent_id], project_id, saves: vec![first] }, key)),
         }
     }
     Ok(found.into_iter().map(|(group, _)| group).filter(|g| g.saves.len() > 1).collect())
@@ -261,8 +266,15 @@ fn topic_versions(c: &Connection, has: &Has) -> rusqlite::Result<Vec<TopicVersio
 
 /// The scope the topic and the dedup indexes key on: a NULL project is the
 /// empty one, as their `COALESCE` reads it.
-fn same_scope(agent: &Option<String>, project: &Option<String>, other_agent: &Option<String>, other_project: &Option<String>) -> bool {
-    agent == other_agent && project.as_deref().unwrap_or("") == other_project.as_deref().unwrap_or("")
+fn same_project(project: &Option<String>, other: &Option<String>) -> bool {
+    project.as_deref().unwrap_or("") == other.as_deref().unwrap_or("")
+}
+
+/// Names `agent` among `agents` once, in the order they were found.
+fn add_agent(agents: &mut Vec<Option<String>>, agent: Option<String>) {
+    if !agents.contains(&agent) {
+        agents.push(agent);
+    }
 }
 
 fn dangling_superseded(c: &Connection, has: &Has) -> rusqlite::Result<Vec<DanglingSuperseded>> {
@@ -292,10 +304,10 @@ fn hash_duplicates(c: &Connection) -> rusqlite::Result<Vec<HashDuplicates>> {
     let mut stmt = c.prepare(&format!(
         "SELECT agent_id, project_id, content_hash, id FROM ( \
              SELECT agent_id, project_id, content_hash, id, \
-                    COUNT(*) OVER (PARTITION BY agent_id, COALESCE(project_id, ''), content_hash) AS n \
+                    COUNT(*) OVER (PARTITION BY COALESCE(project_id, ''), content_hash) AS n \
              FROM memory WHERE {LIVE} AND content_hash IS NOT NULL) \
          WHERE n > 1 \
-         ORDER BY agent_id, COALESCE(project_id, ''), content_hash, id"
+         ORDER BY COALESCE(project_id, ''), content_hash, id"
     ))?;
     let rows = stmt.query_map([], |r| {
         Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?))
@@ -304,10 +316,11 @@ fn hash_duplicates(c: &Connection) -> rusqlite::Result<Vec<HashDuplicates>> {
     for row in rows {
         let (agent_id, project_id, hash, id) = row?;
         match found.last_mut() {
-            Some((group, h)) if *h == hash && same_scope(&group.agent_id, &group.project_id, &agent_id, &project_id) => {
-                group.ids.push(id)
+            Some((group, h)) if *h == hash && same_project(&group.project_id, &project_id) => {
+                group.ids.push(id);
+                add_agent(&mut group.agents, agent_id);
             }
-            _ => found.push((HashDuplicates { agent_id, project_id, ids: vec![id] }, hash)),
+            _ => found.push((HashDuplicates { agents: vec![agent_id], project_id, ids: vec![id] }, hash)),
         }
     }
     Ok(found.into_iter().map(|(group, _)| group).collect())
@@ -474,7 +487,7 @@ mod tests {
         insert(c, &Row { revived_from: Some(deleted), ..row("a revived version") });
         let rival = insert(c, &row("the rival"));
         insert(c, &Row { status: "disputed", disputed_against: Some(format!("[{rival}]")), ..row("the challenger") });
-        insert(c, &Row { agent: Some("agent-b"), ..row("tokens last an hour") });
+        insert(c, &Row { agent: Some("agent-b"), project: Some("proj-3c4d"), ..row("tokens last an hour") });
         insert(c, &Row { project: None, ..row("tokens last an hour") });
     }
 
@@ -490,11 +503,17 @@ mod tests {
             insert(c, &Row { topic: Some("auth/tokens"), ..row("tokens last a day") });
             insert(c, &Row { topic: Some("auth/tokens"), ..row("tokens last an hour") });
             insert(c, &Row { topic: Some("auth/tokens"), agent: Some("agent-b"), ..row("another agent's") });
+            insert(c, &Row { topic: Some("auth/tokens"), project: Some("proj-3c4d"), ..row("another project's") });
         })
         .await;
         assert_eq!(
             found.topic_versions,
-            [TopicVersions { agent_id: Some("agent-a".into()), project_id: Some("proj-1a2b".into()), saves: vec![1, 2] }]
+            [TopicVersions {
+                agents: vec![Some("agent-a".into()), Some("agent-b".into())],
+                project_id: Some("proj-1a2b".into()),
+                saves: vec![1, 2, 3]
+            }],
+            "a key is the project's, whoever saved under it"
         );
         assert_eq!(Invariants { topic_versions: Vec::new(), ..found }, Invariants::default());
     }
@@ -553,12 +572,14 @@ mod tests {
             insert(c, &row("  the same text "));
             insert(c, &Row { deleted: true, ..row("the same text") });
             insert(c, &Row { status: "superseded", superseded_by: Some(1), ..row("the same text") });
+            insert(c, &Row { agent: None, ..row("the same text") });
+            insert(c, &Row { agent: Some("agent-b"), project: Some("proj-3c4d"), ..row("the same text") });
         })
         .await;
         assert_eq!(
             found.hash_duplicates,
-            [HashDuplicates { agent_id: Some("agent-a".into()), project_id: Some("proj-1a2b".into()), ids: vec![1, 2] }],
-            "trimmed text hashes the same; deleted and superseded rows are not live"
+            [HashDuplicates { agents: vec![Some("agent-a".into()), None], project_id: Some("proj-1a2b".into()), ids: vec![1, 2, 5] }],
+            "trimmed text hashes the same; deleted and superseded rows are not live; another project keeps its own"
         );
     }
 
