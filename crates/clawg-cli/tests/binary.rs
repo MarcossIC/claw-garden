@@ -458,6 +458,16 @@ fn mode_of(path: &Path) -> u32 {
     std::fs::metadata(path).expect("metadata").permissions().mode() & 0o777
 }
 
+#[tokio::test]
+async fn a_daemon_names_its_version_first() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+
+    let log = daemon.log_text();
+    let first = log.lines().next().unwrap_or_default();
+    assert!(first.contains(&format!("clawg serve {} starting, profile dev", env!("CARGO_PKG_VERSION"))), "{log}");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn a_daemon_on_a_fresh_home_leaves_a_private_data_directory() {
