@@ -49,6 +49,7 @@ use clawg_core::memory::synthesis::{
     conclusions_to_review_count, existing_memory_ids, replaced_memory_ids, synthesis_core, unreviewed_count, Synthesis, SynthesisParams,
 };
 use clawg_core::memory::{read_save_core, search_all_memories, RankedHit, SaveText, SearchScope};
+use clawg_core::metrics::Recorder;
 use clawg_core::models::chat::Role;
 use clawg_core::paths::Profile;
 use clawg_core::memory::outbox::{OutboxActionError, OutboxState, OutboxSummary};
@@ -62,6 +63,7 @@ use crate::relevance::shown_hits;
 
 use super::guard::{admits, RefusalLog};
 use super::lifecycle::now_ms;
+use super::metrics::{time_request, HttpMeter, Transport};
 use super::sessions::{check_session_id, SessionRegistry};
 
 /// Largest `limit` any search will honour. A retrieval request is a vector
@@ -91,6 +93,8 @@ pub struct AppCtx {
     /// The host session each agent works in, per project, that saves are
     /// stamped with.
     pub sessions: SessionRegistry,
+    /// The metrics of this run: every request, and what the writer samples.
+    pub metrics: Arc<Recorder>,
 }
 
 /// How long a save waits for the worker. Long enough for a multi-chunk save
@@ -883,6 +887,7 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         .route("/shutdown", post(shutdown))
         .layer(axum::middleware::from_fn_with_state(app.clone(), require_bearer));
 
+    let meter = Arc::new(HttpMeter::new(app.metrics.clone()));
     Router::new()
         .route("/health", get(health))
         .nest("/v1", v1)
@@ -891,6 +896,12 @@ pub fn router(app: Arc<AppCtx>) -> Router {
             Arc::new(RefusalLog::default()),
             admit_loopback,
         ))
+        .layer(axum::middleware::from_fn_with_state(meter, time_request))
+}
+
+/// [`router`] with its requests labelled as coming in on `transport`.
+pub fn router_on(app: Arc<AppCtx>, transport: Transport) -> Router {
+    router(app).layer(axum::Extension(transport))
 }
 
 /// Serves [`router`] on an OS-picked loopback port in a background task and
@@ -2111,6 +2122,7 @@ mod tests {
             shutdown,
             save_timeout: SAVE_CONFIRM_TIMEOUT,
             sessions: Default::default(),
+            metrics: Default::default(),
         });
 
         let (addr, server) = serve_ephemeral(app).await.expect("bind an ephemeral loopback port");

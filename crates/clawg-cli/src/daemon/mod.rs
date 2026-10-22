@@ -4,6 +4,7 @@
 pub mod api;
 pub mod guard;
 pub mod lifecycle;
+pub mod metrics;
 pub mod serve;
 pub mod sessions;
 pub mod socket;

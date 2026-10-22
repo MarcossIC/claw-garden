@@ -22,7 +22,8 @@ use clawg_core::paths::{data_dir, socket_file, PathsError, Profile};
 use clawg_core::private_dir::ensure_private_dir;
 use clawg_core::runtime::{MemoryRuntime, Workers};
 
-use super::api::{router, AppCtx, SAVE_CONFIRM_TIMEOUT};
+use super::api::{router_on, AppCtx, SAVE_CONFIRM_TIMEOUT};
+use super::metrics::Transport;
 use super::socket::{bind_socket, serves_without_socket, Listener, SocketError};
 use super::lifecycle::{
     clear_state, generate_token, now_ms, write_state, write_token, DaemonState, LifecycleError,
@@ -199,6 +200,7 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
         shutdown: shutdown_tx,
         save_timeout: SAVE_CONFIRM_TIMEOUT,
         sessions: Default::default(),
+        metrics: Default::default(),
     });
 
     log::info!(
@@ -215,9 +217,8 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
         shutdown_signal(shutdown_rx).await;
         let _ = stopping_tx.send(true);
     });
-    let app = router(ctx.clone());
     let tcp_server = {
-        let (app, stopping) = (app.clone(), stopping.clone());
+        let (app, stopping) = (router_on(ctx.clone(), Transport::Tcp), stopping.clone());
         async move {
             match tcp {
                 Some((listener, _)) => axum::serve(listener, app).with_graceful_shutdown(stopped(stopping)).await,
@@ -226,7 +227,7 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
         }
     };
     let socket_server = {
-        let (app, stopping) = (app, stopping.clone());
+        let (app, stopping) = (router_on(ctx.clone(), Transport::Unix), stopping.clone());
         async move {
             match socket {
                 Some(listener) => axum::serve(listener, app).with_graceful_shutdown(stopped(stopping)).await,

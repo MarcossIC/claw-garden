@@ -108,6 +108,7 @@ async fn start(input: &AgentViewInput<'_>, scratch: &Path) -> Result<Session, Ru
         shutdown,
         save_timeout: SAVE_CONFIRM_TIMEOUT,
         sessions: Default::default(),
+        metrics: Default::default(),
     });
     let (addr, server) = serve_ephemeral(app.clone()).await.map_err(RunError::Serve)?;
     let client = DaemonClient::new(format!("http://{addr}"), TOKEN, scratch.to_path_buf());
