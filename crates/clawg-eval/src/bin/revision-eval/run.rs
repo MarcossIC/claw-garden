@@ -15,8 +15,8 @@ use clawg_cli::client::{ClientError, DaemonClient, ListArgs, MemoryRow, SearchAr
 use clawg_cli::daemon::api::{serve_ephemeral, AppCtx, SAVE_CONFIRM_TIMEOUT};
 use clawg_cli::mcp::tools::{format_context, format_search};
 use clawg_core::eval_api::{
-    conflict_pairs, is_claim_type, row_distances, EvalEmbedder, EvalError, EvalIngest, EvalSave, EvalSaved,
-    EvalTokenCounter,
+    conflict_pairs, drop_superseded_text, drop_superseded_vectors, is_claim_type, row_distances, EvalEmbedder,
+    EvalError, EvalIngest, EvalSave, EvalSaved, EvalTokenCounter,
 };
 use clawg_core::paths::Profile;
 use clawg_core::runtime::MemoryRuntime;
@@ -152,6 +152,10 @@ struct ArmRun<'a> {
     transitions: Vec<Transition<'a>>,
     /// What the router answered each chain's query, per chain.
     queries: Vec<Query>,
+    /// Vectors of `superseded` rows removed before the queries.
+    old_vectors_dropped: usize,
+    /// `superseded` rows taken out of `memory_fts` before the queries.
+    old_texts_dropped: usize,
 }
 
 /// How much one arm stored.
@@ -167,6 +171,12 @@ pub struct ArmReport {
     pub live_versions: usize,
     /// Chains with exactly one live version.
     pub chains_with_one_live_version: usize,
+    /// Vectors of `superseded` rows the arm removed before its queries; only
+    /// the bare arms remove any.
+    pub old_vectors_dropped: usize,
+    /// `superseded` rows the arm took out of `memory_fts` before its queries;
+    /// only the unindexed arm takes any.
+    pub old_texts_dropped: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -180,7 +190,14 @@ pub struct ChainsReport {
     pub distractors: usize,
     pub arms: BTreeMap<&'static str, ArmReport>,
     pub m1: M1,
+    /// The keyed arm against the unindexed one: the same store with the older
+    /// versions in no index, so they are all that tells the two apart. The
+    /// control also differs in the store's history (the superseded rows, the
+    /// pairs written against versions still live then, the rows' ages), which
+    /// orders hits that score almost the same.
     pub m2: M2,
+    /// The keyed arm against the control, kept as a reference.
+    pub m2_control: M2,
     /// What showing the key costs, over the keyed arm's queries.
     pub m4: M4,
     /// By arm and chain id, where each version shows for the chain's query.
@@ -235,7 +252,8 @@ async fn measure(input: &ChainsInput<'_>, scratch: &Path) -> Result<ChainsReport
         distractors: input.distractors.len(),
         arms: runs.iter().map(|(arm, run)| (arm.as_str(), arm_report(run))).collect(),
         m1: m1(&run_of(Arm::NoKey).transitions),
-        m2: m2(&views(run_of(Arm::Keyed)), &views(run_of(Arm::Control))),
+        m2: m2(&views(run_of(Arm::Keyed)), &views(run_of(Arm::KeyedUnindexed))),
+        m2_control: m2(&views(run_of(Arm::Keyed)), &views(run_of(Arm::Control))),
         m4,
         positions,
     })
@@ -262,6 +280,9 @@ async fn run_arm<'a>(input: &ChainsInput<'a>, arm: Arm, dir: &Path) -> Result<Ar
         .collect();
     let runtime = ingest.finish().await?;
     let outcomes = if arm == Arm::NoKey { read_outcomes(&runtime, input.set, &saved).await? } else { Vec::new() };
+    let bare = matches!(arm, Arm::KeyedBare | Arm::KeyedUnindexed);
+    let old_vectors_dropped = if bare { drop_superseded_vectors(&runtime).await? } else { 0 };
+    let old_texts_dropped = if arm == Arm::KeyedUnindexed { drop_superseded_text(&runtime).await? } else { 0 };
 
     let session = serve(runtime).await?;
     let read = read_router(&session.client, input.set, &own).await;
@@ -278,7 +299,7 @@ async fn run_arm<'a>(input: &ChainsInput<'a>, arm: Arm, dir: &Path) -> Result<Ar
             above: shown[index].above_at(to),
         })
         .collect();
-    Ok(ArmRun { saved, own, listed, shown, transitions, queries })
+    Ok(ArmRun { saved, own, listed, shown, transitions, queries, old_vectors_dropped, old_texts_dropped })
 }
 
 /// Per chain, the versions with a row of their own the router lists live.
@@ -358,6 +379,8 @@ fn arm_report(run: &ArmRun<'_>) -> ArmReport {
         rows: rows.len(),
         live_versions: live.iter().sum(),
         chains_with_one_live_version: live.iter().filter(|&&n| n == 1).count(),
+        old_vectors_dropped: run.old_vectors_dropped,
+        old_texts_dropped: run.old_texts_dropped,
     }
 }
 
@@ -730,23 +753,35 @@ mod tests {
         assert_eq!((keyed.saves, keyed.live_versions, keyed.chains_with_one_live_version), (5, 2, 2));
         let control = arm("control");
         assert_eq!((control.saves, control.live_versions, control.chains_with_one_live_version), (2, 2, 2));
+        let bare = arm("keyed_bare");
+        assert_eq!((bare.saves, bare.live_versions, bare.chains_with_one_live_version), (5, 2, 2));
+        assert!(bare.old_vectors_dropped > 0, "the older versions' own rows lose their vectors");
+        assert!([&no_key, &keyed, &control].iter().all(|a| a.old_vectors_dropped == 0));
+        let unindexed = arm("keyed_unindexed");
+        assert_eq!((unindexed.saves, unindexed.live_versions, unindexed.chains_with_one_live_version), (5, 2, 2));
+        assert_eq!(unindexed.old_vectors_dropped, bare.old_vectors_dropped);
+        assert_eq!(unindexed.old_texts_dropped, bare.old_vectors_dropped, "the same rows leave the text index");
+        assert!([&no_key, &keyed, &bare, &control].iter().all(|a| a.old_texts_dropped == 0));
         let m1 = &report.m1.all;
         assert_eq!(m1.transitions, 3);
         assert_eq!(m1.escalated.k + m1.pending.k + m1.no_mark.k, 3);
         assert_eq!(m1.no_mark_reasons.below_floor.k, 0, "a row two versions share is never compared with itself");
 
-        for arm in ["no_key", "keyed", "control"] {
+        for arm in ["no_key", "keyed", "keyed_bare", "keyed_unindexed", "control"] {
             for chain in &set.chains {
                 let shown = &report.positions[arm][&chain.id];
                 assert_eq!((shown.search.len(), shown.context.len()), (chain.versions.len(), chain.versions.len()));
             }
         }
-        for arm in ["keyed", "control"] {
+        for arm in ["keyed", "keyed_bare", "keyed_unindexed", "control"] {
             let shown = &report.positions[arm]["a"];
             assert!(shown.search[2].is_some() && shown.context[2].is_some(), "{arm}: the last version shows: {shown:?}");
             assert_eq!((shown.search[..2].to_vec(), shown.context[..2].to_vec()), (vec![None, None], vec![None, None]));
         }
         assert!(report.m2.one_live_version.met && report.m2.no_old_version_shown.met, "{:?}", report.m2);
+        assert!(report.m2.last_where_reference.met, "the keyed arm places its last versions as the unindexed arm: {:?}", report.m2);
+        let m2_control = &report.m2_control;
+        assert!(m2_control.one_live_version.met && m2_control.no_old_version_shown.met, "{m2_control:?}");
         let m4 = &report.m4;
         assert_eq!((m4.search.outputs, m4.context.outputs), (2, 2));
         assert!(m4.search.total_byte_delta > 0, "the keyed arm's search shows the keys: {m4:?}");

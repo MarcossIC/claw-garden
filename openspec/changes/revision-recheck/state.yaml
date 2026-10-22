@@ -1,0 +1,15 @@
+change: revision-recheck
+objective: "1"
+depends_on: [revision-eval]
+phase: apply
+artifacts:
+  exploration: skipped  # los hallazgos están en tasks.md
+  proposal: skipped
+  spec: skipped
+  design: skipped
+  tasks: done
+  apply: pending
+  verify: pending
+  archive: pending
+main_spec: openspec/specs/eval/spec.md
+updated: 2026-10-21

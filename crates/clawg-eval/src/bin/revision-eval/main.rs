@@ -28,10 +28,12 @@ revision-eval chains (--real | --fake) [--tag SLUG]
 revision-eval store --export FILE [--seed N] (--real | --fake)
 revision-eval store --labels FILE [--tag SLUG]
 
-  chains   saves crates/clawg-eval/data/revision-chains.json in three arms
-           (without a key, with its key, and only the last version), each
-           after the MUST sentences of openspec/specs, and classifies every
-           transition of the arm without a key
+  chains   saves crates/clawg-eval/data/revision-chains.json in five arms
+           (without a key; with its key; with its key and without the
+           vectors of the replaced versions; with its key and the replaced
+           versions in no index; and only the last version), each after the
+           MUST sentences of openspec/specs, and classifies every transition
+           of the arm without a key
   store    measures, on a `clawg export --include-deleted` file, how often a
            save without a key revises an earlier one, in two steps:
              --export  replays the saves through the detector and leaves
@@ -492,7 +494,7 @@ mod tests {
         assert_eq!(result["set_sha256"], set.sha256.as_str());
         assert_eq!(result["distractors"], distractors.len());
         let arms: Vec<&str> = result["arms"].as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(arms, ["control", "keyed", "no_key"]);
+        assert_eq!(arms, ["control", "keyed", "keyed_bare", "keyed_unindexed", "no_key"]);
     }
 
     /// The whole of `store` on the double: the result of a run whose export
