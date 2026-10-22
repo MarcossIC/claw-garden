@@ -50,6 +50,7 @@ use crate::mcp::startup::{on_failure, ClientHandle, Next};
 use crate::mcp::tools::{
     format_docs, format_recall, format_resolution, format_rows, format_save, format_search, format_sharing,
     format_delete, format_open_pairs, format_restore, format_status, format_synthesis, format_update, indexes_docs, resolve_project,
+    topic_key_warning,
 };
 
 /// The daemon refused a root because its id already belongs to another one.
@@ -590,7 +591,7 @@ impl ClawgMcp {
             memories.iter().map(|m| format!("#{}", m.id)).collect::<Vec<_>>().join(", ")
         };
         match result {
-            Ok(SaveOutcome::Saved { memories, redacted, related, replaced, key_dropped }) => {
+            Ok(SaveOutcome::Saved { memories, redacted, related, replaced, key_dropped, revision_candidate }) => {
                 let mut text = match memories.as_slice() {
                     [one] if one.outcome == "reinforced" => format!(
                         "already stored as #{}; reinforced it instead of saving a copy \
@@ -619,6 +620,10 @@ impl ClawgMcp {
                 }
                 if !related.is_empty() {
                     text.push_str(&related_text(&related));
+                }
+                if let Some(id) = revision_candidate {
+                    text.push('\n');
+                    text.push_str(&topic_key_warning(id));
                 }
                 Ok(text)
             }
@@ -2667,14 +2672,14 @@ mod tests {
         assert_eq!(
             text(Ok(SaveOutcome::Saved {
                 memories: vec![saved(57, "inserted")],
-                redacted: vec!["slack_token".into()], related: vec![], replaced: vec![], key_dropped: false
+                redacted: vec!["slack_token".into()], related: vec![], replaced: vec![], key_dropped: false, revision_candidate: None
             })),
             Ok("saved #57; masked slack_token before storing it".to_string())
         );
         assert_eq!(
             text(Ok(SaveOutcome::Saved {
                 memories: vec![saved(57, "reinforced")],
-                redacted: vec!["github_token".into(), "jwt".into()], related: vec![], replaced: vec![], key_dropped: false
+                redacted: vec!["github_token".into(), "jwt".into()], related: vec![], replaced: vec![], key_dropped: false, revision_candidate: None
             })),
             Ok("already stored as #57; reinforced it instead of saving a copy \
                 (update_memory changes its importance or type); \
@@ -2687,18 +2692,18 @@ mod tests {
     fn save_outcome_text_covers_every_daemon_answer() {
         let text = |r| ClawgMcp::save_outcome_text(r);
         assert_eq!(
-            text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "inserted")], redacted: vec![], related: vec![], replaced: vec![], key_dropped: false })),
+            text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "inserted")], redacted: vec![], related: vec![], replaced: vec![], key_dropped: false, revision_candidate: None })),
             Ok("saved #57".to_string())
         );
         assert_eq!(
             text(Ok(SaveOutcome::Saved {
                 memories: vec![saved(57, "inserted"), saved(58, "inserted"), saved(59, "reinforced")],
-                redacted: vec![], related: vec![], replaced: vec![], key_dropped: false
+                redacted: vec![], related: vec![], replaced: vec![], key_dropped: false, revision_candidate: None
             })),
             Ok("saved as 3 pieces: #57, #58, #59; read_memory with any of them returns the whole text".to_string())
         );
         assert_eq!(
-            text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "reinforced")], redacted: vec![], related: vec![], replaced: vec![], key_dropped: false })),
+            text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "reinforced")], redacted: vec![], related: vec![], replaced: vec![], key_dropped: false, revision_candidate: None })),
             Ok("already stored as #57; reinforced it instead of saving a copy \
                 (update_memory changes its importance or type)"
                 .to_string())
@@ -2996,6 +3001,7 @@ mod tests {
             related: vec![related(12, false), related(15, true)],
             replaced: vec![],
             key_dropped: false,
+            revision_candidate: None,
         }));
         assert_eq!(
             text,
@@ -3003,6 +3009,26 @@ mod tests {
                 If this save replaces one, call resolve_conflict with verdict supersedes (keep = the new id); \
                 if both hold, compatible or scoped"
                 .to_string())
+        );
+    }
+
+    #[test]
+    fn an_unkeyed_save_close_to_its_own_row_is_told_to_take_a_key() {
+        let text = ClawgMcp::save_outcome_text(Ok(SaveOutcome::Saved {
+            memories: vec![saved(57, "inserted")],
+            redacted: vec![],
+            related: vec![RelatedMemory { id: 412, escalated: false, excerpt: "Build tool".into() }],
+            replaced: vec![],
+            key_dropped: false,
+            revision_candidate: Some(412),
+        }))
+        .expect("a success");
+        let (first, warning) = text.rsplit_once('\n').expect("the warning has a line of its own");
+        assert!(first.starts_with("saved #57\nclose to earlier memories: #412 \"Build tool\""), "{text}");
+        assert_eq!(
+            warning,
+            "this save has no topic_key: if it revises #412, save it again under a topic_key naming their \
+             subject, so the next revision replaces it"
         );
     }
 
@@ -3015,6 +3041,7 @@ mod tests {
             related: vec![],
             replaced: vec![replaced(12), replaced(13)],
             key_dropped: false,
+            revision_candidate: None,
         }));
         assert_eq!(text, Ok("saved #57; replaces #12 \"claim 12\", #13 \"claim 13\"".to_string()));
     }

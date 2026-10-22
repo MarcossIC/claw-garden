@@ -8,7 +8,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::memory::clock::TimestampMs;
-use crate::memory::contradiction::excerpt;
+use crate::memory::contradiction::{excerpt, Candidate};
 use crate::memory::dispute::{release_challengers, SUPERSEDE_SQL};
 use crate::memory::error::MemoryError;
 use crate::memory::events::MemoryEvent;
@@ -159,6 +159,17 @@ pub(crate) fn inherit(evt: &MemoryEvent, earlier: &TopicRow) -> MemoryEvent {
     }
 }
 
+/// The earlier row a save without a key most likely revises: the closest of
+/// the detector's candidates in the save's own agent and project, the only
+/// rows a key could revise, and of two as close the first found. A save under
+/// a key has none: the key already revises.
+pub(crate) fn unkeyed_revision(topic: Option<&str>, related: &[Candidate]) -> Option<i64> {
+    if topic.is_some() {
+        return None;
+    }
+    related.iter().filter(|c| c.same_scope).min_by(|a, b| a.distance.total_cmp(&b.distance)).map(|c| c.id)
+}
+
 impl MemoryStore {
     /// The live rows of `scope`, oldest first.
     pub(crate) async fn topic_rows(&self, scope: &TopicScope) -> Result<Vec<TopicRow>, MemoryError> {
@@ -206,6 +217,21 @@ fn backend(context: &'static str) -> impl Fn(tokio_rusqlite::Error) -> MemoryErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn candidate(id: i64, distance: f64, same_scope: bool) -> Candidate {
+        Candidate { id, distance, escalated: false, excerpt: String::new(), same_scope }
+    }
+
+    #[test]
+    fn an_unkeyed_save_revises_its_closest_candidate_of_its_own_scope() {
+        let related = [candidate(1, 0.30, true), candidate(2, 0.12, false), candidate(3, 0.20, true)];
+        assert_eq!(unkeyed_revision(None, &related), Some(3));
+        assert_eq!(unkeyed_revision(Some("build/tool"), &related), None, "a key already revises");
+        assert_eq!(unkeyed_revision(None, &related[1..2]), None, "a row of another scope is no key's");
+        assert_eq!(unkeyed_revision(None, &[]), None);
+        let tied = [candidate(4, 0.2, true), candidate(5, 0.2, true)];
+        assert_eq!(unkeyed_revision(None, &tied), Some(4), "of two as close, the first found");
+    }
 
     #[test]
     fn topic_key_cases() {

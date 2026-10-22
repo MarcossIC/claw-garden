@@ -23,7 +23,7 @@ use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::events::{MemoryEvent, MemorySource};
 use crate::memory::redact::{redact, SecretKind};
 use crate::memory::store_insert::{NewMemoryRecord, Stored};
-use crate::memory::topic::{inherit, Replaced, Revision, TopicScope};
+use crate::memory::topic::{inherit, unkeyed_revision, Replaced, Revision, TopicScope};
 use crate::memory::MemoryStore;
 
 /// What happened to one chunk that reached the store.
@@ -87,6 +87,9 @@ pub struct IngestReport {
     pub related: Vec<Candidate>,
     /// The rows of the save's topic key it superseded.
     pub replaced: Vec<Replaced>,
+    /// For a save without a topic key, the earlier row of its own agent and
+    /// project it most likely revises ([`unkeyed_revision`]).
+    pub revision_candidate: Option<i64>,
     /// A shutdown stopped the save between two pieces; its outbox row notes
     /// the ones stored, and the next start resumes after them.
     pub paused: bool,
@@ -707,6 +710,7 @@ async fn process_tracked(
         }),
         None => finish_save(store, pieces, revision).await,
     };
+    report.revision_candidate = unkeyed_revision(evt.topic(), &report.related);
     report
 }
 
@@ -832,6 +836,7 @@ async fn ingest_pieces(
         redacted: redacted.clone(),
         related: Vec::new(),
         replaced: Vec::new(),
+        revision_candidate: None,
         paused: false,
     };
     let pieces = |stored: &[Option<SavedChunk>], contexts: &[String]| -> Vec<StoredPiece> {
@@ -2055,6 +2060,46 @@ mod tests {
         assert_eq!(report.related.len(), 1, "{:?}", report.related);
         let related = &report.related[0];
         assert_eq!((related.id, related.escalated, related.excerpt.as_str()), (older, false, "Build tool"));
+    }
+
+    fn fact_in(content: &str, project: Option<&str>) -> MemoryEvent {
+        MemoryEvent { project_id: project.map(str::to_owned), ..explicit_fact(content) }
+    }
+
+    async fn save_placed(store: &Arc<MemoryStore>, vector: Vec<f32>, evt: &MemoryEvent) -> IngestReport {
+        let report = process_with(Arc::new(PlacedEmbedder { vectors: vec![vector] }), store, evt).await;
+        assert_eq!(report.failure, None);
+        report
+    }
+
+    #[tokio::test]
+    async fn an_unkeyed_save_names_the_closest_candidate_its_key_could_revise() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let far = only_id(&save_placed(&store, turned(2, 0.3), &fact_in("the build uses cargo", Some("p-1"))).await);
+        let unscoped = only_id(&save_placed(&store, turned(3, 0.15), &fact_in("builds take a minute", None)).await);
+        let near = only_id(&save_placed(&store, turned(4, 0.2), &fact_in("the build uses cargo 1.90", Some("p-1"))).await);
+
+        let report = save_placed(&store, turned(1, 0.0), &fact_in("the build uses make", Some("p-1"))).await;
+
+        let scope: Vec<(i64, bool)> = report.related.iter().map(|c| (c.id, c.same_scope)).collect();
+        assert!(scope.contains(&(far, true)) && scope.contains(&(near, true)), "{scope:?}");
+        assert!(scope.contains(&(unscoped, false)), "a row without a project is no key's: {scope:?}");
+        assert_eq!(report.revision_candidate, Some(near), "the closest of its own project, not the closest of all");
+    }
+
+    #[tokio::test]
+    async fn a_save_under_a_key_or_without_a_candidate_of_its_scope_names_none() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let older = only_id(&save_placed(&store, turned(2, 0.2), &fact_in("the build uses cargo", Some("p-1"))).await);
+
+        let keyed = MemoryEvent { topic_key: Some("build/tool".into()), ..fact_in("the build uses make", Some("p-1")) };
+        let keyed = save_placed(&store, turned(1, 0.0), &keyed).await;
+        assert_eq!(keyed.related.iter().map(|c| c.id).collect::<Vec<_>>(), vec![older]);
+        assert_eq!(keyed.revision_candidate, None, "a key already revises");
+
+        let unprojected = save_placed(&store, turned(3, 0.05), &fact_in("the build uses ninja", None)).await;
+        assert!(unprojected.related.iter().all(|c| !c.same_scope), "{:?}", unprojected.related);
+        assert_eq!(unprojected.revision_candidate, None, "rows of a project are out of a save without one");
     }
 
     #[tokio::test]
