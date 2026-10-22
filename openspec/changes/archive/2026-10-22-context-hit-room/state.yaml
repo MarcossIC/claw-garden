@@ -1,15 +1,15 @@
 change: context-hit-room
 objective: "1"
 depends_on: [context-budget]
-phase: apply
+phase: archived
 artifacts:
   exploration: done
   proposal: done
   spec: done
   design: done
   tasks: done
-  apply: pending
-  verify: pending
-  archive: pending
+  apply: done
+  verify: done  # Linux; the CI of the pull request covers Linux and Windows; the real store and revision-eval --background need the real model and an export of the store
+  archive: done
 updated: 2026-10-22
 main_spec: openspec/specs/retrieval/spec.md

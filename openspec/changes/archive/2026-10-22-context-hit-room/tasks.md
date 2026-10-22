@@ -15,10 +15,10 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 
 ## 3. Verificación
 
-- [ ] Suite y clippy en Linux sobre el último commit ([verify](verify.md)).
+- [x] Suite y clippy en Linux sobre el último commit ([verify](verify.md)).
 - [ ] El CI en verde en Linux y Windows.
 - [ ] **[modelo real, export del store]** El `recall_context` real que cortaba los 10 hits, y `revision-eval chains --real --background`: la última versión de cada cadena tiene que aparecer en `recall_context`.
 
 ## 4. Archive
 
-- [ ] `specs/retrieval` con R1, R2 y R3 y las citas realineadas; `git mv` a `changes/archive/2026-10-22-context-hit-room`; `state.yaml` archivado; fila 75 y el orden de ejecución del `README.md` de openspec; subir el minor.
+- [x] `specs/retrieval` con R1, R2 y R3 y las citas de `prompt_builder.rs` realineadas en todas las specs, y la nota de la corrida con fondo en `specs/eval`; `git mv` a `changes/archive/2026-10-22-context-hit-room`; `state.yaml` archivado; fila 75 y el orden de ejecución del `README.md` de openspec; subir el minor.

@@ -8,7 +8,7 @@
 
 ## Evidencia
 
-- `revision-eval chains --real --background` con un export de prod (829 memorias): la última versión de una cadena no aparece en `recall_context` en ninguna de las 40 cadenas, en ningún brazo. El prompt medio pasa de 3.780 a 7.357 bytes y ningún hit queda con cabecera ([revision-recheck](../archive/2026-10-22-revision-recheck/tasks.md), §2).
+- `revision-eval chains --real --background` con un export de prod (829 memorias): la última versión de una cadena no aparece en `recall_context` en ninguna de las 40 cadenas, en ningún brazo. El prompt medio pasa de 3.780 a 7.357 bytes y ningún hit queda con cabecera ([revision-recheck](../2026-10-22-revision-recheck/tasks.md), §2).
 - Un `recall_context` real de este proyecto, el 2026-10-22: «Cut to fit 8000 bytes; the full context is 19134 bytes», con los 10 hits afuera, los de la consulta incluidos, y el contexto hecho del workspace, LAST SESSION recortado y un conflicto (misma fuente).
 - `search_memory` no se ve afectado: no tiene presupuesto ni workspace.
 
@@ -17,7 +17,7 @@
 | Premisa | Resultado |
 |---|---|
 | El recorte saca primero los hits | **Cierta.** `fit_to_budget` elige el bloque con `next_to_cut` sobre RECENT y LONG-TERM, y sólo cuando no queda ninguno pasa a LAST SESSION y después a los conflictos (`crates/clawg-core/src/memory/prompt_builder.rs:417-421`, `:423-430`). |
-| El workspace nunca se corta | **Cierta, por diseño.** `fit_to_budget` no tiene un paso para él (`prompt_builder.rs:399-403`); las filas que imprimió están en `EmittedIds` y la búsqueda las saltea (`:217`), así que cortarlas las dejaría sin canal (D2 de [context-budget](../archive/2026-10-17-context-budget/design.md)). |
+| El workspace nunca se corta | **Cierta, por diseño.** `fit_to_budget` no tiene un paso para él (`prompt_builder.rs:399-403`); las filas que imprimió están en `EmittedIds` y la búsqueda las saltea (`:217`), así que cortarlas las dejaría sin canal (D2 de [context-budget](../2026-10-17-context-budget/design.md)). |
 | El workspace puede ocupar casi todo el presupuesto | **Cierta.** La sección AUTO tiene un tope de 6.000 bytes (`AUTO_BYTE_CAP`, `crates/clawg-core/src/memory/workspace.rs:19-20`) que nunca recorta las preferencias (`workspace.rs:395-397`), y la sección USER no tiene tope. Con el default de 8.000, un AUTO lleno deja 2.000 bytes para todo lo demás. |
 | LAST SESSION puede ser largo | **Cierta.** El bloque muestra el save entero, sus pedazos unidos (`with_last_session`, `prompt_builder.rs:813-820`), y un resumen sigue el protocolo hasta «Next steps» y «Relevant files». |
 | Los conflictos ocupan texto aunque su hit se haya cortado | **Cierta.** Un lado cuyo hit se cortó se imprime con su texto (`format_conflict_block`, `prompt_builder.rs:745-751`), hasta cinco pares (`MAX_CONFLICT_PAIRS`, `:49`). Cortar los hits primero hace crecer el bloque de conflictos. |

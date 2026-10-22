@@ -2,7 +2,7 @@
 
 ## D1. Una reserva para los hits dentro del recorte de 23
 
-`fit_to_budget` sigue siendo un bucle que renderiza el prompt entero y quita una pieza por vuelta (D1 de [context-budget](../archive/2026-10-17-context-budget/design.md)). Lo único nuevo es qué pieza toca:
+`fit_to_budget` sigue siendo un bucle que renderiza el prompt entero y quita una pieza por vuelta (D1 de [context-budget](../2026-10-17-context-budget/design.md)). Lo único nuevo es qué pieza toca:
 
 1. mientras los bloques RECENT y LONG-TERM ocupen más bytes que la reserva, un hit de ellos, con `next_to_cut`;
 2. si no, el resumen de LAST SESSION;
@@ -27,7 +27,7 @@ La proporción, y no una cifra fija, sigue al presupuesto que pide el llamador: 
 
 ## D3. Sin consulta no hay reserva
 
-`build_session_prompt` pasa 0. El contexto sin consulta es el que abre una sesión: LAST SESSION es el traspaso que [session-handoff](../archive/2026-10-19-session-handoff/proposal.md) puso para eso, y RECENT son los saves más nuevos, todos con score 0, no la respuesta a una pregunta. Reservarles lugar cortaría el resumen para mostrar un save por ser nuevo.
+`build_session_prompt` pasa 0. El contexto sin consulta es el que abre una sesión: LAST SESSION es el traspaso que [session-handoff](../2026-10-19-session-handoff/proposal.md) puso para eso, y RECENT son los saves más nuevos, todos con score 0, no la respuesta a una pregunta. Reservarles lugar cortaría el resumen para mostrar un save por ser nuevo.
 
 ## D4. El workspace sigue entero
 

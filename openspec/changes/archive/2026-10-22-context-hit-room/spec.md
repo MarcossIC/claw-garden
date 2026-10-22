@@ -1,6 +1,6 @@
 # context-hit-room — Especificación
 
-Cambia [`specs/retrieval`](../../specs/retrieval/spec.md): «El prompt cumple el presupuesto» y «El primer hit de un bloque se recorta en lugar de saltarse».
+Cambia [`specs/retrieval`](../../../specs/retrieval/spec.md): «El prompt cumple el presupuesto» y «El primer hit de un bloque se recorta en lugar de saltarse».
 
 ## R1. Un contexto con consulta reserva lugar para sus hits
 
