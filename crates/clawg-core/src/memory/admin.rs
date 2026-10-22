@@ -13,7 +13,7 @@ use crate::memory::dispute::{add_dispute_in, release_challengers, settle_challen
 use crate::memory::revival::{revive_after_delete, revive_after_delete_of_piece};
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::search::{reader_bind, reader_predicate, viewer_match_expression, RankedHit};
-use crate::memory::sharing::Reader;
+use crate::memory::sharing::{Reach, Reader};
 use crate::memory::store_insert::{MemoryType, UnknownMemoryType};
 use crate::memory::tier::retier;
 use crate::memory::topic::Replaced;
@@ -458,7 +458,6 @@ pub struct RestoredRow {
 struct DeletedRow {
     content: String,
     context: Option<String>,
-    agent_id: Option<String>,
     project_id: Option<String>,
     memory_type: String,
 }
@@ -477,26 +476,32 @@ const RESTORE_READ: &str = concat!(
 );
 
 /// The live row a save of the same text would reinforce instead of storing
-/// it again (`REINFORCE_LOOKUP_SQL` in `store_insert.rs`).
-const RESTORE_TWIN: &str = "SELECT t.id FROM memory m JOIN memory t \
-     ON t.agent_id IS m.agent_id AND COALESCE(t.project_id, '') = COALESCE(m.project_id, '') \
-     AND t.content_hash = m.content_hash \
+/// it again (`REINFORCE_LOOKUP_SQL` in `store_insert.rs`): the project's, of
+/// any author the restoring reader (`?2`) reaches.
+const RESTORE_TWIN: &str = concat!(
+    "SELECT t.id FROM memory m JOIN memory t \
+     ON COALESCE(t.project_id, '') = COALESCE(m.project_id, '') AND t.content_hash = m.content_hash \
      WHERE m.id = ?1 AND m.content_hash IS NOT NULL AND t.id <> m.id \
-     AND t.deleted_at IS NULL AND t.status IN ('active', 'disputed') \
-     ORDER BY t.created_at ASC LIMIT 1";
+     AND t.deleted_at IS NULL AND t.status IN ('active', 'disputed') AND ",
+    reader_predicate!("t.agent_id", "?2"),
+    " ORDER BY t.created_at ASC LIMIT 1"
+);
 
 /// The live row that holds the deleted row's topic key now, in the same scope
-/// as `SCOPE_ROWS_SQL` in `topic.rs`. The other pieces of the row's own save
-/// are not holders: a keyed long save gives its key to every piece. Nor is a
-/// row the deleted one's delete brought back: the restore takes it back.
-const RESTORE_TOPIC_HOLDER: &str = "SELECT m.topic_key, t.id FROM memory m JOIN memory t \
-     ON t.agent_id IS m.agent_id AND COALESCE(t.project_id, '') = COALESCE(m.project_id, '') \
-     AND t.topic_key = m.topic_key \
+/// as `SCOPE_ROWS_SQL` in `topic.rs`, with the restoring reader (`?2`) as the
+/// saver. The other pieces of the row's own save are not holders: a keyed
+/// long save gives its key to every piece. Nor is a row the deleted one's
+/// delete brought back: the restore takes it back.
+const RESTORE_TOPIC_HOLDER: &str = concat!(
+    "SELECT m.topic_key, t.id FROM memory m JOIN memory t \
+     ON COALESCE(t.project_id, '') = COALESCE(m.project_id, '') AND t.topic_key = m.topic_key \
      WHERE m.id = ?1 AND t.id <> m.id AND t.revived_from IS NOT m.id \
      AND NOT EXISTS (SELECT 1 FROM memory_piece a JOIN memory_piece b ON b.save_id = a.save_id \
                      WHERE a.memory_id = m.id AND b.memory_id = t.id) \
-     AND t.deleted_at IS NULL AND t.status IN ('active', 'disputed') \
-     ORDER BY t.id LIMIT 1";
+     AND t.deleted_at IS NULL AND t.status IN ('active', 'disputed') AND ",
+    reader_predicate!("t.agent_id", "?2"),
+    " ORDER BY t.id LIMIT 1"
+);
 
 const RESTORE_ROW: &str = "UPDATE memory SET deleted_at = NULL, last_modified_at = ?2, \
      update_count = update_count + 1 WHERE id = ?1 AND deleted_at IS NOT NULL";
@@ -519,19 +524,21 @@ const RESTORED_SQL: &str = "SELECT m.status, m.superseded_by, m.topic_key, \
 /// `unit`, before the restore's transaction: the row is not live yet, so it
 /// cannot find itself. The rows it already forms a pair with and the ones it
 /// will take back from a revival are left out and widen the pool, so they do
-/// not take the places of rows saved while it was deleted.
+/// not take the places of rows saved while it was deleted. The restoring
+/// reader is the saver; the user's own restore compares with every row.
 async fn restore_candidates(
     store: &MemoryStore,
     id: i64,
     unit: &[f32],
     content: &str,
-    agent_id: Option<String>,
+    reader: Option<&Reader>,
     project_id: Option<String>,
     memory_type: &str,
 ) -> Result<Vec<Candidate>, MemoryError> {
-    let (Some(agent_id), Some(memory_type)) = (agent_id, MemoryType::from_db_str(memory_type)) else {
+    let Some(memory_type) = MemoryType::from_db_str(memory_type) else {
         return Ok(Vec::new());
     };
+    let saver = reader.cloned().unwrap_or_else(|| Reader::new("", Reach::AllBut(Vec::new())));
     let siblings: Vec<i64> = store
         .conn
         .call(move |c| -> rusqlite::Result<Vec<i64>> {
@@ -545,7 +552,7 @@ async fn restore_candidates(
         })
         .await
         .map_err(backend("restore_memory_core"))?;
-    Ok(detect_contradiction(store, unit, content, &agent_id, project_id.as_deref(), memory_type, &siblings)
+    Ok(detect_contradiction(store, unit, content, &saver, project_id.as_deref(), memory_type, &siblings)
         .await
         .into_iter()
         .map(|(_, candidate)| candidate)
@@ -639,7 +646,6 @@ pub async fn restore_memory_core(
                 Ok(DeletedRow {
                     content: r.get(0)?,
                     context: r.get(1)?,
-                    agent_id: r.get(2)?,
                     project_id: r.get(3)?,
                     memory_type: r.get(4)?,
                 })
@@ -648,7 +654,7 @@ pub async fn restore_memory_core(
         })
         .await
         .map_err(backend("restore_memory_core"))?;
-    let Some(DeletedRow { content, context, agent_id, project_id, memory_type }) = found else {
+    let Some(DeletedRow { content, context, project_id, memory_type }) = found else {
         return Err(RestoreError::NotFound(id));
     };
 
@@ -665,7 +671,7 @@ pub async fn restore_memory_core(
     let unit = crate::memory::vector::to_unit(&vector)
         .map_err(|e| RestoreError::Embed(id, EmbedError::InferenceFailed(e.to_string())))?;
     let bytes: Vec<u8> = unit.iter().flat_map(|f| f.to_le_bytes()).collect();
-    let candidates = restore_candidates(store, id, &unit, &content, agent_id, project_id, &memory_type).await?;
+    let candidates = restore_candidates(store, id, &unit, &content, reader, project_id, &memory_type).await?;
     let now = TimestampMs::now();
 
     enum Outcome {
@@ -685,11 +691,12 @@ pub async fn restore_memory_core(
             else {
                 return Ok(Outcome::Gone);
             };
-            if let Some(twin) = tx.query_row(RESTORE_TWIN, [id], |r| r.get(0)).optional()? {
+            if let Some(twin) = tx.query_row(RESTORE_TWIN, rusqlite::params![id, reach], |r| r.get(0)).optional()? {
                 return Ok(Outcome::Twin(twin));
             }
-            if let Some((key, live)) =
-                tx.query_row(RESTORE_TOPIC_HOLDER, [id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?
+            if let Some((key, live)) = tx
+                .query_row(RESTORE_TOPIC_HOLDER, rusqlite::params![id, reach], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?
             {
                 return Ok(Outcome::TopicTaken(key, live));
             }
@@ -3471,8 +3478,6 @@ mod tests {
         delete(&store, first).await;
         let current = save(&store, "a", "storage engine moved to postgres").await;
         set_key(&store, current, "storage/engine").await;
-        let elsewhere = save(&store, "b", "storage engine is duckdb").await;
-        set_key(&store, elsewhere, "storage/engine").await;
 
         let err = restore(&store, first, Some(&shared("a"))).await.unwrap_err();
 
@@ -3486,6 +3491,34 @@ mod tests {
 
         delete(&store, current).await;
         assert_eq!(restore(&store, first, Some(&shared("a"))).await.unwrap().status, "active");
+    }
+
+    #[tokio::test]
+    async fn a_row_whose_key_another_agent_holds_is_not_restored() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let first = save(&store, "a", "storage engine is sqlite").await;
+        set_key(&store, first, "storage/engine").await;
+        delete(&store, first).await;
+        let theirs = save(&store, "b", "storage engine is duckdb").await;
+        set_key(&store, theirs, "storage/engine").await;
+
+        let err = restore(&store, first, Some(&shared("a"))).await.unwrap_err();
+        assert!(matches!(err, RestoreError::TopicTaken { live, .. } if live == theirs), "{err:?}");
+
+        let row = restore(&store, first, Some(&hiding("a", "b"))).await.unwrap();
+        assert_eq!(row.status, "active", "a holder the reader cannot see does not hold the key for it");
+    }
+
+    #[tokio::test]
+    async fn a_restore_finds_another_agents_twin() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let first = save(&store, "a", "the deploy runs on fridays").await;
+        delete(&store, first).await;
+        let twin = save(&store, "b", "the deploy runs on fridays").await;
+
+        let err = restore(&store, first, Some(&shared("a"))).await.unwrap_err();
+
+        assert!(matches!(err, RestoreError::LiveTwin { id, twin: t } if id == first && t == twin), "{err:?}");
     }
 
     #[tokio::test]
@@ -3898,7 +3931,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_revival_stays_in_its_scope() {
+    async fn deleting_another_agents_revision_revives_the_earlier_one() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let theirs = keyed(&store, "b", "api port is 8080", "api/port").await;
         let mine = keyed(&store, "a", "api port is 9090", "api/port").await;
@@ -3906,8 +3939,26 @@ mod tests {
 
         let outcome = delete_reporting(&store, mine).await;
 
+        assert_eq!(outcome.revived.iter().map(|r| r.id).collect::<Vec<_>>(), vec![theirs], "{outcome:?}");
+        assert_eq!(lineage(&store, theirs).await, revived_by(mine));
+    }
+
+    #[tokio::test]
+    async fn a_revival_stays_in_its_project() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let elsewhere = keyed(&store, "a", "api port is 8080", "api/port").await;
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE memory SET project_id = 'q' WHERE id = ?1", [elsewhere]))
+            .await
+            .unwrap();
+        let mine = keyed(&store, "a", "api port is 9090", "api/port").await;
+        supersede(&store, elsewhere, mine, "revision").await;
+
+        let outcome = delete_reporting(&store, mine).await;
+
         assert!(outcome.revived.is_empty(), "{outcome:?}");
-        assert_eq!(lineage(&store, theirs).await, replaced_by(mine, "revision"));
+        assert_eq!(lineage(&store, elsewhere).await, replaced_by(mine, "revision"));
     }
 
     #[tokio::test]

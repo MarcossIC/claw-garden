@@ -63,7 +63,6 @@ impl SearchScope {
 /// policy, so no placeholder numbering moves.
 fn reach_bind(agent_id: &str, reach: &Reach) -> String {
     let value = match reach {
-        Reach::OwnOnly => serde_json::json!({ "reader": agent_id }),
         Reach::Own => serde_json::json!({ "reader": agent_id, "authorless": true }),
         Reach::AllBut(hidden) => serde_json::json!({ "reader": agent_id, "authorless": true, "hidden": hidden }),
     };
@@ -5063,8 +5062,6 @@ mod tests {
                     search_all_memories(&store, &axis(0), Some("flyio_4821"), "b", scope.clone().with_reach(reach.clone()), 10).await.unwrap();
                 assert!(ids_of(&hits).contains(&global), "{channel}, {reach:?}: no exclusion names a row without an author");
             }
-            let probe = search_all_memories(&store, &axis(0), Some("flyio_4821"), "b", scope.with_reach(Reach::OwnOnly), 10).await.unwrap();
-            assert!(!ids_of(&probe).contains(&global), "{channel}: what a save is compared against holds only its agent's rows");
         }
     }
 
@@ -5248,11 +5245,19 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         let sql = concat!("SELECT count(*) FROM (SELECT ?2 AS agent_id) t WHERE ", reach_predicate!("t.agent_id", "?1"));
         let all_but = |names: &[&str]| Reach::AllBut(names.iter().map(|n| n.to_string()).collect());
-        for reach in [Reach::OwnOnly, Reach::Own, all_but(&[]), all_but(&["b"]), all_but(&["b", "c"])] {
+        for reach in [Reach::Own, all_but(&[]), all_but(&["b"]), all_but(&["b", "c"])] {
             for author in [Some("a"), Some("b"), Some("c"), None] {
                 let in_sql: i64 = conn.query_row(sql, params![reach_bind("a", &reach), author], |r| r.get(0)).unwrap();
                 assert_eq!(in_sql == 1, reach.admits("a", author), "{reach:?} reading a row of {author:?}");
             }
+        }
+        let sql = concat!("SELECT count(*) FROM (SELECT ?2 AS agent_id) t WHERE ", reader_predicate!("t.agent_id", "?1"));
+        for author in [Some("a"), Some("b"), None] {
+            let in_sql: i64 = conn.query_row(sql, params![reader_bind(None), author], |r| r.get(0)).unwrap();
+            assert_eq!(in_sql, 1, "a call with no reader reaches a row of {author:?}");
+            let hidden = Reader::new("a", all_but(&["b"]));
+            let in_sql: i64 = conn.query_row(sql, params![reader_bind(Some(&hidden)), author], |r| r.get(0)).unwrap();
+            assert_eq!(in_sql == 1, hidden.admits(author), "a reader reading a row of {author:?}");
         }
     }
 
@@ -5269,11 +5274,8 @@ mod tests {
         let kept = readable_hits(hits.clone(), "me", &reach);
         assert_eq!(kept.iter().map(|h| h.id).collect::<Vec<_>>(), vec![2, 3, 4]);
 
-        let own = readable_hits(hits.clone(), "me", &Reach::Own);
+        let own = readable_hits(hits, "me", &Reach::Own);
         assert_eq!(own.iter().map(|h| h.id).collect::<Vec<_>>(), vec![2, 3]);
-
-        let only_own = readable_hits(hits, "me", &Reach::OwnOnly);
-        assert_eq!(only_own.iter().map(|h| h.id).collect::<Vec<_>>(), vec![2]);
     }
 
     async fn seed_linked_save(store: &MemoryStore, agent: &str) -> Vec<i64> {

@@ -418,7 +418,8 @@ impl MemoryRuntime {
         let store = Arc::new(
             MemoryStore::new_for_test()
                 .await
-                .expect("in-memory test store"),
+                .expect("in-memory test store")
+                .with_sharing_dir(base_dir.clone()),
         );
         let (memory_tx, memory_rx) = tokio::sync::mpsc::channel(capacity);
         let access_tracker = Arc::new(AccessTracker::new(store.conn.clone()));

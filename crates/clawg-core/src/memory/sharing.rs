@@ -45,16 +45,12 @@ pub enum Reach {
     Own,
     /// Every agent's rows except these authors', and the rows no agent saved.
     AllBut(Vec<String>),
-    /// Its own rows alone, not even the ones no agent saved: what a save is
-    /// compared against, since an agent can only judge a pair it owns.
-    OwnOnly,
 }
 
 impl Reach {
     /// Whether `reader` may read a row `author` saved; `None` when no agent did.
     pub(crate) fn admits(&self, reader: &str, author: Option<&str>) -> bool {
         match (self, author) {
-            (Reach::OwnOnly, author) => author == Some(reader),
             (_, None) => true,
             (Reach::Own, Some(author)) => author == reader,
             (Reach::AllBut(hidden), Some(author)) => author == reader || !hidden.iter().any(|h| h == author),
@@ -250,8 +246,6 @@ mod tests {
         for reach in [Reach::Own, all_but(&[]), all_but(&["codex"]), nothing_shared] {
             assert!(reach.admits("cursor", None), "no exclusion names a row without an author: {reach:?}");
         }
-        assert!(!Reach::OwnOnly.admits("cursor", None), "a save is compared only against its agent's rows");
-        assert!(Reach::OwnOnly.admits("cursor", Some("cursor")) && !Reach::OwnOnly.admits("cursor", Some("codex")));
     }
 
     #[test]

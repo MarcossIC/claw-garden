@@ -1371,12 +1371,13 @@ async fn context(
 
     // Same degradation as the regen above: a reminder that cannot be counted
     // is a reminder skipped, not a failed request.
-    let unreviewed = unreviewed_count(&app.runtime.store, Some(&body.agent_id), project_id).await.unwrap_or_else(|e| {
+    let caller = reader(&app, &body.agent_id);
+    let unreviewed = unreviewed_count(&app.runtime.store, Some(&caller), project_id).await.unwrap_or_else(|e| {
         log::warn!("unreviewed count failed: {e}");
         0
     });
     let conclusions_to_review =
-        conclusions_to_review_count(&app.runtime.store, Some(&body.agent_id), project_id).await.unwrap_or_else(|e| {
+        conclusions_to_review_count(&app.runtime.store, Some(&caller), project_id).await.unwrap_or_else(|e| {
             log::warn!("conclusions to review count failed: {e}");
             0
         });
@@ -1400,7 +1401,8 @@ async fn synthesis(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<SynthesisRequest>,
 ) -> ApiResult<Json<Synthesis>> {
-    let params = SynthesisParams { agent_id: body.agent_id, project_id: body.project_id, limit: body.limit };
+    let reader = named_reader(&app, body.agent_id.as_deref());
+    let params = SynthesisParams { reader, project_id: body.project_id, limit: body.limit };
     synthesis_core(&app.runtime.store, params, TimestampMs::now())
         .await
         .map(Json)

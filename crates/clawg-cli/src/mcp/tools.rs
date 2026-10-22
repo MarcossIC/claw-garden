@@ -581,7 +581,7 @@ pub fn indexes_docs(project: &ProjectIdentity, bridge: Option<&ProjectIdentity>)
 pub fn format_sharing(policy: &Result<SharingPolicy, SharingError>, reader: &str) -> String {
     match policy {
         Ok(p) => match p.reach_for(reader) {
-            Reach::Own | Reach::OwnOnly => "shared: none (reads no other agent)".to_string(),
+            Reach::Own => "shared: none (reads no other agent)".to_string(),
             Reach::AllBut(hidden) if hidden.is_empty() => "shared: reads every agent".to_string(),
             Reach::AllBut(hidden) => format!("shared: reads every agent but {}", hidden.join(", ")),
         },

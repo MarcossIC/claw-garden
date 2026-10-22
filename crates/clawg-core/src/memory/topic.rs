@@ -1,8 +1,8 @@
 //! The topic key a deliberate save is a version of.
 //!
-//! A save that names a key replaces the live rows its agent saved under the
-//! same key in the same project; the replaced rows stay, `superseded` by the
-//! new save, as its history.
+//! A save that names a key replaces the live rows under the same key in the
+//! same project, whoever saved them, as far as its agent reaches them; the
+//! replaced rows stay, `superseded` by the new save, as its history.
 
 use rusqlite::Connection;
 use serde::Serialize;
@@ -13,6 +13,8 @@ use crate::memory::dispute::{release_challengers, SUPERSEDE_SQL};
 use crate::memory::error::MemoryError;
 use crate::memory::events::MemoryEvent;
 use crate::memory::pieces::{link_in, StoredPiece};
+use crate::memory::search::{reach_predicate, reader_bind};
+use crate::memory::sharing::Reader;
 use crate::memory::MemoryStore;
 
 /// Longest key accepted, in characters.
@@ -44,11 +46,12 @@ pub fn validate_topic_key(key: &str) -> Result<(), TopicKeyError> {
     }
 }
 
-/// The rows a key reaches: one agent's, in one project (or in none), under
-/// one key.
+/// The rows a key reaches: in one project (or in none), under one key, of
+/// any author the saver reaches. A key names a topic of the project, so two
+/// agents that save under it revise one topic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TopicScope {
-    pub agent_id: String,
+    pub saver: Reader,
     pub project_id: Option<String>,
     pub key: String,
 }
@@ -79,11 +82,14 @@ pub(crate) struct Revision {
 }
 
 /// The live rows of a scope; `?2` is the project, matched as `idx_memory_topic`
-/// indexes it.
-const SCOPE_ROWS_SQL: &str = "SELECT id, memory_type, importance, content, tier, access_count FROM memory \
-     WHERE agent_id = ?1 AND COALESCE(project_id, '') = COALESCE(?2, '') AND topic_key = ?3 \
-       AND deleted_at IS NULL AND status IN ('active', 'disputed') \
-     ORDER BY id";
+/// indexes it, and `?1` the saver's reach (`reach_bind`).
+const SCOPE_ROWS_SQL: &str = concat!(
+    "SELECT id, memory_type, importance, content, tier, access_count FROM memory \
+     WHERE COALESCE(project_id, '') = COALESCE(?2, '') AND topic_key = ?3 \
+       AND deleted_at IS NULL AND status IN ('active', 'disputed') AND ",
+    reach_predicate!("agent_id", "?1"),
+    " ORDER BY id"
+);
 
 /// Whether row `?1` is a piece of a save that belongs to something else: one
 /// whose first piece is live without key `?2`. Superseding it would cut a hole
@@ -97,7 +103,8 @@ const SHARED_PIECE_SQL: &str = "SELECT EXISTS (SELECT 1 FROM memory_piece p \
 /// Reads the live rows of `scope`, oldest first.
 fn scope_rows(c: &Connection, scope: &TopicScope) -> rusqlite::Result<Vec<(TopicRow, String, i64, i64)>> {
     let mut stmt = c.prepare_cached(SCOPE_ROWS_SQL)?;
-    let rows = stmt.query_map(rusqlite::params![scope.agent_id, scope.project_id, scope.key], |r| {
+    let reach = reader_bind(Some(&scope.saver));
+    let rows = stmt.query_map(rusqlite::params![reach, scope.project_id, scope.key], |r| {
         Ok((TopicRow { id: r.get(0)?, memory_type: r.get(1)?, importance: r.get(2)? }, r.get(3)?, r.get(4)?, r.get(5)?))
     })?;
     rows.collect()
@@ -173,8 +180,8 @@ pub(crate) fn mark_warned_in(c: &Connection, pieces: &[StoredPiece], candidate: 
 }
 
 /// The earlier row a save without a key most likely revises: the closest of
-/// the detector's candidates in the save's own agent and project, the only
-/// rows a key could revise, and of two as close the first found. A save under
+/// the detector's candidates in the save's own project, the only rows a key
+/// could revise, whoever saved them, and of two as close the first found. A save under
 /// a key has none: the key already revises.
 pub(crate) fn unkeyed_revision(topic: Option<&str>, related: &[Candidate]) -> Option<i64> {
     if topic.is_some() {
@@ -281,5 +288,24 @@ mod tests {
         for e in [TopicKeyError::Length, TopicKeyError::Shape] {
             assert!(e.to_string().starts_with("topic_key "), "{e}");
         }
+    }
+
+    #[tokio::test]
+    async fn the_scope_lookup_uses_the_topic_index() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let plan: Vec<String> = store
+            .conn
+            .call(|c| -> rusqlite::Result<Vec<String>> {
+                let saver = Reader::new("a", crate::memory::sharing::Reach::AllBut(Vec::new()));
+                let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {SCOPE_ROWS_SQL}"))?;
+                let rows = stmt
+                    .query_map(rusqlite::params![reader_bind(Some(&saver)), Option::<String>::None, "k"], |r| r.get(3))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        let plan = plan.join(" | ");
+        assert!(plan.contains("idx_memory_topic"), "{plan}");
     }
 }

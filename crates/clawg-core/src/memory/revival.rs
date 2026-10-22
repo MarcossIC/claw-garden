@@ -17,7 +17,7 @@ use crate::memory::topic::Replaced;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Replacement {
     pub id: i64,
-    /// Replaced by a revision of the deleted row's own topic, in its scope.
+    /// Replaced by a revision of the deleted row's own topic, in its project.
     pub revision: bool,
     /// The `memory_piece` save it belongs to, if any.
     pub save: Option<i64>,
@@ -62,9 +62,10 @@ pub(crate) struct Revived {
 }
 
 /// The live rows `?1` superseded, each marked a revision when it was
-/// replaced by a save of the deleted row's agent and project under its key.
+/// replaced by a save of the deleted row's project under its key, whoever
+/// saved either: a key names a topic of the project.
 const REPLACED_SQL: &str = "SELECT r.id, \
-       r.supersede_cause = 'revision' AND r.agent_id IS d.agent_id \
+       r.supersede_cause = 'revision' \
          AND COALESCE(r.project_id, '') = COALESCE(d.project_id, '') AND r.topic_key IS NOT NULL, \
        (SELECT MIN(p.save_id) FROM memory_piece p WHERE p.memory_id = r.id), \
        r.content \
@@ -73,9 +74,11 @@ const REPLACED_SQL: &str = "SELECT r.id, \
      ORDER BY r.id";
 
 /// Whether a live row other than the deleted `?1` holds the topic key `?2`
-/// in `?1`'s scope.
+/// in `?1`'s project, whoever saved it. A delete may have no reader, so the
+/// sharing policy plays no part: the same delete revives the same rows
+/// whoever makes it.
 const KEY_HELD_SQL: &str = "SELECT EXISTS (SELECT 1 FROM memory d JOIN memory t \
-       ON t.agent_id IS d.agent_id AND COALESCE(t.project_id, '') = COALESCE(d.project_id, '') \
+       ON COALESCE(t.project_id, '') = COALESCE(d.project_id, '') \
      WHERE d.id = ?1 AND t.id <> d.id AND t.topic_key = ?2 \
        AND t.deleted_at IS NULL AND t.status IN ('active', 'disputed'))";
 

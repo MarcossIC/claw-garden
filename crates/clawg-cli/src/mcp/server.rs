@@ -2209,7 +2209,7 @@ mod tests {
 
         let listed = text(&b.synthesize_impl("agent-mcp", SynthesizeArgs::default()).await.expect("synthesize"));
         assert!(listed.contains(&format!("#{} ", ids[0])), "{listed}");
-        assert!(!listed.contains(&format!("#{foreign} ")), "another agent's memory is not this one's to review: {listed}");
+        assert!(listed.contains(&format!("#{foreign} ")), "another agent's memory of the project is reviewed too: {listed}");
         assert!(!text(&recall().await.expect("recall")).contains("`synthesize`"), "the review turns the reminder off");
 
         let conclusion = SaveMemoryArgs {

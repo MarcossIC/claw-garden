@@ -60,8 +60,8 @@ pub struct Merged {
     pub into: i64,
 }
 
-/// A live row stored superseded, because another live row of its agent and
-/// project already holds its topic key here.
+/// A live row stored superseded, because another live row of its project
+/// already holds its topic key here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopicTaken {
     pub line: usize,
@@ -238,15 +238,16 @@ const PRESENT_SQL: &str = "SELECT id FROM memory \
        AND content_hash = ?3 AND created_at = ?4 \
      ORDER BY id LIMIT 1";
 
-/// The live row of the same text, as the worker's dedup finds it.
+/// The live row of the same text in the project, whoever saved it, as the
+/// worker's dedup finds it. An import is the user's, so no policy narrows it.
 const TWIN_SQL: &str = "SELECT id FROM memory \
-     WHERE agent_id IS ?1 AND COALESCE(project_id, '') = COALESCE(?2, '') \
-       AND content_hash = ?3 AND deleted_at IS NULL AND status IN ('active', 'disputed') \
+     WHERE COALESCE(project_id, '') = COALESCE(?1, '') \
+       AND content_hash = ?2 AND deleted_at IS NULL AND status IN ('active', 'disputed') \
      ORDER BY created_at ASC LIMIT 1";
 
 const TOPIC_HOLDERS_SQL: &str = "SELECT id FROM memory \
-     WHERE agent_id IS ?1 AND COALESCE(project_id, '') = COALESCE(?2, '') \
-       AND topic_key = ?3 AND deleted_at IS NULL AND status IN ('active', 'disputed') \
+     WHERE COALESCE(project_id, '') = COALESCE(?1, '') \
+       AND topic_key = ?2 AND deleted_at IS NULL AND status IN ('active', 'disputed') \
      ORDER BY id";
 
 /// `disputed_against`, `revived_from` and a `superseded_by` from the file
@@ -293,14 +294,14 @@ fn place(
     let mut topic_holder = None;
     if row.live() {
         let twin: Option<i64> =
-            tx.query_row(TWIN_SQL, rusqlite::params![row.agent, row.project, row.hash], |r| r.get(0)).optional()?;
+            tx.query_row(TWIN_SQL, rusqlite::params![row.project, row.hash], |r| r.get(0)).optional()?;
         if let Some(id) = twin {
             return Ok(Some(Placement::Merged(id)));
         }
         if let Some(key) = &row.src.topic_key {
             let mut stmt = tx.prepare_cached(TOPIC_HOLDERS_SQL)?;
             let holders: Vec<i64> =
-                stmt.query_map(rusqlite::params![row.agent, row.project, key], |r| r.get(0))?.collect::<Result<_, _>>()?;
+                stmt.query_map(rusqlite::params![row.project, key], |r| r.get(0))?.collect::<Result<_, _>>()?;
             // The pieces of one save in the file share its key.
             topic_holder = holders.into_iter().find(|id| match ledger.import_agents.get(id) {
                 Some(agent) => *agent != row.src.agent_id,
@@ -1012,6 +1013,20 @@ mod tests {
         assert_eq!((imported.status.as_str(), imported.superseded_by, imported.supersede_cause.as_deref()), ("superseded", Some(holder), Some("revision")));
         assert_eq!(after["Storage engine: Postgres"].superseded_by, Some(imported.id));
         assert_eq!(after["Storage engine: DuckDB"].status, "active");
+    }
+
+    #[tokio::test]
+    async fn an_import_merges_into_another_agents_live_text_and_key() {
+        let file = seeded_file().await;
+        let dst = destination().await;
+        let twin = insert_row(&dst, "cursor", Some(project()), "Storage engine: SQLite with WAL", None, 5).await;
+        let (report, _) = run(&dst, &file, ImportOptions::default()).await;
+        assert_eq!(report.merged, vec![Merged { line: report.merged[0].line, id: 2, into: twin }], "the text is the project's");
+
+        let dst = destination().await;
+        let holder = insert_row(&dst, "cursor", Some(project()), "Storage engine: DuckDB", Some("storage/engine"), 5).await;
+        let (report, _) = run(&dst, &file, ImportOptions::default()).await;
+        assert_eq!(report.topic_taken.iter().map(|t| t.by).collect::<Vec<_>>(), vec![holder], "so is the key");
     }
 
     #[tokio::test]

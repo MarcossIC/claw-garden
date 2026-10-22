@@ -8,6 +8,7 @@ use crate::memory::backup::{self, SchemaPlan};
 use crate::memory::embedder::Embedder;
 use crate::memory::error::MemoryError;
 use crate::memory::latency::KnnLatency;
+use crate::memory::sharing::{self, Reader};
 use crate::memory::store_lock::{StoreHolder, StoreLock};
 
 // ---------------------------------------------------------------------------
@@ -161,6 +162,10 @@ pub struct MemoryStore {
     /// The data directory holding `memory.db`, where a second connection can
     /// open it. `None` for the in-memory test store, which has no file.
     dir: Option<PathBuf>,
+    /// Where `sharing.json` is read from when a save is compared with what
+    /// its agent reaches. The data directory; `None` for an in-memory store
+    /// no runtime placed, which shares everything.
+    sharing_dir: Option<PathBuf>,
 }
 
 /// Bytes of WAL a checkpoint may leave on disk. A checkpoint rewinds the WAL
@@ -237,6 +242,7 @@ impl MemoryStore {
             knn_latency: Arc::new(KnnLatency::new()),
             _lock: Some(Arc::new(lock)),
             dir: Some(base_dir.to_path_buf()),
+            sharing_dir: Some(base_dir.to_path_buf()),
         })
     }
 
@@ -258,7 +264,24 @@ impl MemoryStore {
             knn_latency: Arc::new(KnnLatency::new()),
             _lock: None,
             dir: None,
+            sharing_dir: None,
         })
+    }
+
+    /// This in-memory store reading `sharing.json` from `dir`, as a runtime
+    /// over a real data directory does.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_sharing_dir(self, dir: PathBuf) -> Self {
+        Self { sharing_dir: Some(dir), ..self }
+    }
+
+    /// `agent_id` with what the sharing policy lets it reach, read now, so a
+    /// change to the policy counts from the next save on.
+    pub(crate) fn reader_for(&self, agent_id: &str) -> Reader {
+        match &self.sharing_dir {
+            Some(dir) => sharing::reader_in(dir, agent_id),
+            None => Reader::new(agent_id, sharing::SharingPolicy::default().reach_for(agent_id)),
+        }
     }
 
     /// Writes a snapshot of the store into `into` and returns its path.

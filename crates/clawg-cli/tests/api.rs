@@ -1654,11 +1654,11 @@ async fn context_reports_unreviewed_memories() {
     let (status, body) = h.post_json("/v1/synthesis", json!({ "agent_id": "b", "project_id": "p" })).await;
     assert_eq!(status, 200, "{body}");
     let (_, body) = context().await;
-    assert_eq!(body["unreviewed"], 2, "another agent's review is not this one's: {body}");
+    assert_eq!(body["unreviewed"], 0, "a review is the project's, whichever agent made it: {body}");
 
-    h.post_json("/v1/synthesis", json!({ "agent_id": "a", "project_id": "p" })).await;
+    h.post_json("/v1/memories", json!({ "content": "the python package uses spaces", "agent_id": "b", "project_id": "p" })).await;
     let (_, body) = context().await;
-    assert_eq!(body["unreviewed"], 0, "{body}");
+    assert_eq!(body["unreviewed"], 1, "another agent's new memory is this one's to review too: {body}");
 }
 
 // ── conclusions and synthesis ───────────────────────────────────────────────
@@ -1895,15 +1895,19 @@ async fn user_stated_with_derived_from_is_refused() {
 }
 
 #[tokio::test]
-async fn an_agent_neither_reviews_another_agents_memories() {
+async fn an_agent_reviews_another_agents_memories_unless_hidden() {
     let h = Harness::start().await;
     let mine = save_id(&h, json!({ "content": "the go service uses tabs", "agent_id": "a", "project_id": "p" })).await;
-    save_id(&h, json!({ "content": "the deploy runs on fridays", "agent_id": "b", "project_id": "p" })).await;
+    let theirs = save_id(&h, json!({ "content": "the deploy runs on fridays", "agent_id": "b", "project_id": "p" })).await;
+    let pending = || async {
+        let (status, body) = h.post_json("/v1/synthesis", json!({ "agent_id": "a", "project_id": "p" })).await;
+        assert_eq!(status, 200, "{body}");
+        body["pending"].as_array().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect::<Vec<i64>>()
+    };
 
-    let (status, body) = h.post_json("/v1/synthesis", json!({ "agent_id": "a", "project_id": "p" })).await;
-    assert_eq!(status, 200, "{body}");
-    let pending: Vec<i64> = body["pending"].as_array().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect();
-    assert_eq!(pending, vec![mine], "{body}");
+    assert_eq!(pending().await, vec![theirs, mine]);
+    write_policy(&h, r#"{"version":1,"hides":{"a":["b"]}}"#);
+    assert_eq!(pending().await, vec![mine]);
 }
 
 #[tokio::test]
