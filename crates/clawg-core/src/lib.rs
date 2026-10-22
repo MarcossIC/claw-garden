@@ -5,6 +5,7 @@
 
 pub mod build_info;
 pub mod memory;
+pub mod metrics;
 pub mod models;
 pub mod paths;
 pub mod private_dir;
