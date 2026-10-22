@@ -216,13 +216,25 @@ pub fn format_save(save: &SavedText, save_project: Option<&str>) -> String {
 
 /// What `update_memory` tells the model about the row it changed. The tier is
 /// the one thing the model cannot work out from its own request, and the one
-/// that says whether the row is still in the workspace.
-pub fn format_update(u: &Updated) -> String {
+/// that says whether the row is still in the workspace. After a move
+/// (`moved`), where the row is and what went with it.
+pub fn format_update(u: &Updated, moved: bool) -> String {
     let fields = match &u.memory_type {
         Some(t) => format!("{t}, importance {:.1}", u.importance),
         None => format!("importance {:.1}", u.importance),
     };
-    format!("updated #{} {}: {fields}, tier {}", u.id, u.kind, u.tier)
+    let mut out = format!("updated #{} {}: {fields}, tier {}", u.id, u.kind, u.tier);
+    if moved {
+        match &u.project_id {
+            Some(p) => out.push_str(&format!(", in project {p}")),
+            None => out.push_str(", in no project, where every project's searches find it"),
+        }
+        if !u.pulled_in.is_empty() {
+            let ids: Vec<String> = u.pulled_in.iter().map(|id| format!("#{id}")).collect();
+            out.push_str(&format!("; moved with it, from its save or topic history: {}", ids.join(", ")));
+        }
+    }
+    out
 }
 
 /// The line `save_memory` adds for a save without a key that is close to row
@@ -1038,10 +1050,43 @@ mod tests {
             importance: 8.0,
             memory_type: Some("user_preference".into()),
             tier: 1,
+            project_id: None,
+            pulled_in: Vec::new(),
         };
-        assert_eq!(format_update(&memory), "updated #12 memory: user_preference, importance 8.0, tier 1");
-        let skill = Updated { kind: "procedural".into(), id: 3, importance: 2.0, memory_type: None, tier: 1 };
-        assert_eq!(format_update(&skill), "updated #3 procedural: importance 2.0, tier 1");
+        assert_eq!(format_update(&memory, false), "updated #12 memory: user_preference, importance 8.0, tier 1");
+        let skill = Updated {
+            kind: "procedural".into(),
+            id: 3,
+            importance: 2.0,
+            memory_type: None,
+            tier: 1,
+            project_id: None,
+            pulled_in: Vec::new(),
+        };
+        assert_eq!(format_update(&skill, false), "updated #3 procedural: importance 2.0, tier 1");
+    }
+
+    #[test]
+    fn format_update_names_where_the_row_ended() {
+        let moved = Updated {
+            kind: "memory".into(),
+            id: 12,
+            importance: 5.0,
+            memory_type: Some("semantic_fact".into()),
+            tier: 3,
+            project_id: Some("repo-1a2b".into()),
+            pulled_in: vec![13, 14],
+        };
+        assert_eq!(
+            format_update(&moved, true),
+            "updated #12 memory: semantic_fact, importance 5.0, tier 3, in project repo-1a2b; \
+             moved with it, from its save or topic history: #13, #14"
+        );
+        let out = Updated { project_id: None, pulled_in: Vec::new(), ..moved };
+        assert_eq!(
+            format_update(&out, true),
+            "updated #12 memory: semantic_fact, importance 5.0, tier 3, in no project, where every project's searches find it"
+        );
     }
 
     fn restored(id: i64, status: &str, superseded_by: Option<i64>) -> Restored {
