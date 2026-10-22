@@ -139,10 +139,13 @@ pub fn needs_refresh(last_started: Option<Instant>, now: Instant, interval: Dura
     last_started.map_or(true, |t| now.saturating_duration_since(t) >= interval)
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct Progress {
     running: bool,
     last_started: Option<Instant>,
+    /// Why the last refresh that ran to its end failed; cleared by one that
+    /// succeeds.
+    last_error: Option<String>,
 }
 
 /// Which projects are being refreshed and when each last started, so one
@@ -170,6 +173,34 @@ impl Drop for RefreshGuard {
         }
         drop(projects);
         self.index.finished.notify_waiters();
+    }
+}
+
+impl RefreshGuard {
+    /// Brings the project's index in step with its registered root and keeps
+    /// how it ended for [`DocIndex::last_error`], written before the claim is
+    /// released so whoever waited for it reads it already there.
+    pub async fn run(
+        self,
+        store: &MemoryStore,
+        embedder: &dyn Embedder,
+        tokenizer: Option<Arc<tokenizers::Tokenizer>>,
+    ) -> Result<RefreshReport, DocIndexError> {
+        let result = async {
+            let root = root_of(store, &self.project_id).await?;
+            let splitter = match tokenizer {
+                Some(tok) => TokenSplitter::with_tokenizer(tok),
+                None => TokenSplitter::fallback(),
+            };
+            refresh(store, embedder, &splitter, &self.project_id, &root).await
+        }
+        .await;
+        let mut projects = self.index.projects.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(p) = projects.get_mut(&self.project_id) {
+            p.last_error = result.as_ref().err().map(ToString::to_string);
+        }
+        drop(projects);
+        result
     }
 }
 
@@ -216,9 +247,14 @@ impl DocIndex {
         }
     }
 
+    /// Why the project's last finished refresh failed, until one succeeds.
+    pub fn last_error(&self, project_id: &str) -> Option<String> {
+        self.progress(project_id).last_error
+    }
+
     fn progress(&self, project_id: &str) -> Progress {
         let projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
-        projects.get(project_id).copied().unwrap_or_default()
+        projects.get(project_id).cloned().unwrap_or_default()
     }
 
     /// Brings the project's index in step with its registered root, unless a
@@ -232,15 +268,10 @@ impl DocIndex {
         tokenizer: Option<Arc<tokenizers::Tokenizer>>,
         project_id: &str,
     ) -> Result<RefreshOutcome, DocIndexError> {
-        let Some(_guard) = self.begin(project_id) else {
+        let Some(guard) = self.begin(project_id) else {
             return Ok(RefreshOutcome::AlreadyRunning);
         };
-        let root = root_of(store, project_id).await?;
-        let splitter = match tokenizer {
-            Some(tok) => TokenSplitter::with_tokenizer(tok),
-            None => TokenSplitter::fallback(),
-        };
-        refresh(store, embedder, &splitter, project_id, &root).await.map(RefreshOutcome::Refreshed)
+        guard.run(store, embedder, tokenizer).await.map(RefreshOutcome::Refreshed)
     }
 }
 
@@ -883,6 +914,27 @@ mod tests {
 
         assert!(matches!(result, Err(DocIndexError::VectorCount { ref path, .. }) if path == "a.md"), "{result:?}");
         assert_eq!(index_sizes(&store).await, (0, 0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn the_last_error_lasts_until_a_refresh_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.md", "# A\na\n");
+        let store = store_with_project("p", dir.path()).await;
+        let index = Arc::new(DocIndex::default());
+        assert_eq!(index.last_error("p"), None);
+
+        index.try_refresh(&store, &Failing, None, "p").await.unwrap_err();
+        assert!(index.last_error("p").is_some_and(|e| e.contains("boom")), "{:?}", index.last_error("p"));
+
+        let running = index.begin("p").unwrap();
+        let skipped = index.try_refresh(&store, &Counting::new("m1"), None, "p").await.unwrap();
+        assert_eq!(skipped, RefreshOutcome::AlreadyRunning);
+        drop(running);
+        assert!(index.last_error("p").is_some(), "a refresh that did not run changes nothing");
+
+        refreshed(&index, &store, &Counting::new("m1"), "p").await;
+        assert_eq!(index.last_error("p"), None);
     }
 
     #[tokio::test]

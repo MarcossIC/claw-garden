@@ -53,6 +53,48 @@ enum EmbedderState {
     /// Texts holding one of these keys embed to its vector, so a test decides
     /// the cosines; any other text embeds as the fake model would.
     Fixed(Vec<(&'static str, Vec<f32>)>),
+    /// Queries embed as the fake model does; passages wait for a gate to
+    /// open, and may then fail.
+    Docs(DocsEmbedder),
+}
+
+/// `FakeEmbedder` under the same model id, except that a passage waits until
+/// the gate reads true and then fails if `fail`, so a test holds or breaks a
+/// docs refresh without touching searches.
+struct DocsEmbedder {
+    open: tokio::sync::watch::Receiver<bool>,
+    fail: bool,
+}
+
+/// The embedder and the sender of its gate.
+fn docs_embedder(open: bool, fail: bool) -> (DocsEmbedder, tokio::sync::watch::Sender<bool>) {
+    let (gate, open) = tokio::sync::watch::channel(open);
+    (DocsEmbedder { open, fail }, gate)
+}
+
+#[async_trait::async_trait]
+impl Embedder for DocsEmbedder {
+    async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+        if role == EmbedRole::Passage {
+            let _ = self.open.clone().wait_for(|open| *open).await;
+            if self.fail {
+                return Err(EmbedError::InferenceFailed("passages refused".into()));
+            }
+        }
+        FakeEmbedder::default().embed_with_role(text, role).await
+    }
+    fn dimensions(&self) -> usize {
+        384
+    }
+    fn model_id(&self) -> &str {
+        "fake-embedder"
+    }
+    fn query_prefix(&self) -> &str {
+        ""
+    }
+    fn passage_prefix(&self) -> &str {
+        ""
+    }
 }
 
 struct FixedEmbedder(Vec<(&'static str, Vec<f32>)>);
@@ -267,6 +309,12 @@ impl Harness {
             EmbedderState::Fixed(vectors) => {
                 let runtime = with_empty_embedder(runtime, EmbedderStatus::Ready);
                 runtime.embedder.set(Arc::new(FixedEmbedder(vectors)) as Arc<dyn Embedder>).ok();
+                tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
+                (runtime, None)
+            }
+            EmbedderState::Docs(embedder) => {
+                let runtime = with_empty_embedder(runtime, EmbedderStatus::Ready);
+                runtime.embedder.set(Arc::new(embedder) as Arc<dyn Embedder>).ok();
                 tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
                 (runtime, None)
             }
@@ -2858,6 +2906,32 @@ async fn registering_a_missing_root_to_index_it_is_a_bad_request() {
     // As a label for memories it is still taken, as it always was.
     let (status, body) = h.post_json("/v1/projects", json!({ "root_path": missing })).await;
     assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test]
+async fn a_background_refresh_that_failed_warns_the_next_search() {
+    let (embedder, _gate) = docs_embedder(true, true);
+    let h = Harness::start_inner(EmbedderState::Docs(embedder)).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("README.md"), "# Readme\nnever embedded\n").unwrap();
+
+    let (status, body) = h
+        .post_json("/v1/projects", json!({ "root_path": dir.path().display().to_string(), "index_docs": true }))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let id = body["project_id"].as_str().expect("project_id").to_string();
+    let index = &h.ctx.runtime.project_docs;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while index.is_due(&id, Instant::now()) || index.is_running(&id) {
+        assert!(Instant::now() < deadline, "the background refresh never ended");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let (status, body) = h.post_json("/v1/projects/docs/search", json!({ "project_id": id, "query": "readme" })).await;
+
+    assert_eq!(status, 200, "{body}");
+    assert!(body["warning"].as_str().is_some_and(|w| w.contains("passages refused")), "{body}");
+    assert_eq!(body["docs"], 0);
 }
 
 #[tokio::test]

@@ -1777,8 +1777,8 @@ pub struct DocsSearchBody {
     pub docs: usize,
     /// A refresh of the project is still running, so the hits may be partial.
     pub indexing: bool,
-    /// Why the refresh before this search failed; the hits come from what was
-    /// already indexed.
+    /// Why the project's last finished refresh failed, until one succeeds;
+    /// the hits come from what was already indexed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
 }
@@ -1818,12 +1818,11 @@ async fn search_docs(
     })?;
     let embedder = ready_embedder(&app)?;
     let index = &app.runtime.project_docs;
-    let mut warning = None;
     if index.is_due(&body.project_id, Instant::now()) {
         let tokenizer = app.runtime.tokenizer.get().cloned();
-        if let Err(e) = index.try_refresh(store, embedder.as_ref(), tokenizer, &body.project_id).await {
-            warning = Some(e.to_string());
-        }
+        // Its error, like one of a refresh in the background, is read from
+        // the index below.
+        let _ = index.try_refresh(store, embedder.as_ref(), tokenizer, &body.project_id).await;
     } else if index.is_running(&body.project_id) && docs_in(store, &body.project_id).await? == 0 {
         // The first index of a project is usually started by the bridge's
         // registration a moment before this search; answering from an empty
@@ -1834,6 +1833,7 @@ async fn search_docs(
         .await
         .map_err(ApiError::internal)?;
     let docs = docs_in(store, &body.project_id).await?;
+    let warning = index.last_error(&body.project_id);
     Ok(Json(DocsSearchBody { hits, docs, indexing: index.is_running(&body.project_id), warning }))
 }
 
