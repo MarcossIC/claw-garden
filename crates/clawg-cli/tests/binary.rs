@@ -1314,6 +1314,62 @@ async fn doctor_names_a_broken_preferences_file() {
     assert_eq!(findings(&report, "protocol_block"), [("info", "not_installed")], "{report}");
 }
 
+/// Every finding but its message, so two reports of the same facts compare.
+fn without_messages(report: &Value) -> Vec<Value> {
+    let mut checks = report["checks"].as_array().expect("checks").clone();
+    for finding in &mut checks {
+        finding["message"] = Value::Null;
+    }
+    checks
+}
+
+#[tokio::test]
+async fn doctor_speaks_the_preferred_language() {
+    let sandbox = Sandbox::new();
+    std::fs::create_dir_all(sandbox.data_dir()).expect("data dir");
+    std::fs::write(sandbox.data_dir().join("preferences.json"), r#"{"version":1,"language":"en"}"#).expect("write");
+    let (en_output, en) = doctor(&sandbox);
+    std::fs::write(sandbox.data_dir().join("preferences.json"), r#"{"version":1,"language":"es"}"#).expect("write");
+    let (es_output, es) = doctor(&sandbox);
+
+    assert_eq!(es_output.status.code(), en_output.status.code());
+    assert_eq!(without_messages(&es), without_messages(&en), "only the messages change");
+    let message = |report: &Value, id: &str| {
+        let checks = report["checks"].as_array().unwrap();
+        checks.iter().find(|f| f["check_id"] == id).unwrap()["message"].as_str().unwrap().to_string()
+    };
+    assert_eq!(message(&en, "store.schema"), "there is no memory.db yet: the daemon creates it on its first start");
+    assert_eq!(message(&es, "store.schema"), "todavía no hay memory.db: el daemon lo crea la primera vez que arranca");
+    assert_eq!(message(&es, "preferences"), "las preferencias se pueden leer");
+}
+
+#[tokio::test]
+async fn stop_speaks_the_preferred_language() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+    let set = sandbox.run(&["preferences", "set", "language", "es", "--profile", "dev"]);
+    assert_eq!(set.status.code(), Some(0), "{}", stderr_of(&set));
+
+    let stopped = sandbox.run(&["stop", "--profile", "dev"]);
+    assert_eq!(stopped.status.code(), Some(0), "{}", stderr_of(&stopped));
+    assert!(stdout_of(&stopped).starts_with("se detuvo el daemon dev (pid "), "{}", stdout_of(&stopped));
+    daemon.wait_for_exit(Duration::from_secs(5)).await;
+
+    let again = sandbox.run(&["stop", "--profile", "dev"]);
+    assert_eq!(again.status.code(), Some(1));
+    assert!(
+        stderr_of(&again).contains("clawg: no hay ningún daemon de clawg corriendo para el perfil dev"),
+        "{}",
+        stderr_of(&again)
+    );
+
+    std::fs::write(sandbox.data_dir().join("preferences.json"), "{ not json").expect("write");
+    let broken = sandbox.run(&["stop", "--profile", "dev"]);
+    assert_eq!(broken.status.code(), Some(1), "a broken file changes no exit code");
+    assert!(stderr_of(&broken).contains("clawg: no clawg daemon is running for profile dev"), "{}", stderr_of(&broken));
+}
+
 #[tokio::test]
 async fn doctor_prints_no_row_content() {
     let sandbox = Sandbox::new();
