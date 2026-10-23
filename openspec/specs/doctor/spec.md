@@ -6,6 +6,7 @@ Fuente de verdad de `clawg doctor`: qué `clawg` resuelve el PATH y qué está m
 - [doctor-checks](../../changes/archive/2026-10-20-doctor-checks/proposal.md), archivado el 2026-10-20. Los ids de requisito son los de esa spec. El análisis del PATH (`analyze`) es anterior y queda como estaba.
 - [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22: `memory.topic` y `memory.content_hash` agrupan por proyecto y nombran a los autores; el texto de `fallback_agent`.
 - [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23: los chequeos `preferences` y `protocol_block` (LP14).
+- [cli-language](../../changes/archive/2026-10-23-cli-language/proposal.md), archivado el 2026-10-23: `message` en el idioma del comando (R1) y el resto del hallazgo igual en los dos idiomas (CL4).
 
 **Dónde vive:** las decisiones en `crates/clawg-cli/src/doctor/` (`finding.rs`, el sobre y el resumen; `checks.rs`, los chequeos puros; `mcp.rs`, el registro; `mod.rs`, el PATH y la lectura en `run`); los hechos del store en `crates/clawg-core/src/memory/inspect.rs`. Un test citado como «(`doctor`)» está en el `mod tests` de alguno de esos archivos.
 
@@ -20,7 +21,7 @@ Fuente de verdad de `clawg doctor`: qué `clawg` resuelve el PATH y qué está m
 | `check_id` | Estable, en inglés (`path`, `store.schema`, `memory.topic`, …) |
 | `severity` | `ok`, `info`, `warn` o `error` |
 | `reason_code` | Estable por causa (`shadowed`, `stale`, `dangling`, …); `healthy` para `ok` |
-| `message` | Una frase en inglés para una persona |
+| `message` | Una frase para una persona, en el idioma del comando ([`specs/preferences`](../preferences/spec.md), CL1): en inglés sin preferencia |
 | `evidence` | Un objeto con hechos medidos: rutas, conteos, ids, fechas, nombres de agente o de proyecto |
 | `safe_next_step` | Un comando que se puede copiar, o `null` |
 | `requires_confirmation` | `true` cuando ese paso cambia datos |
@@ -118,6 +119,17 @@ La edad de un snapshot MUST salir de su nombre (`parse_snapshot_time`, pura), no
 Cuando `preferences.json` existe, `doctor` MUST sumar el chequeo `preferences` (`checks::preferences`, `crates/clawg-cli/src/doctor/checks.rs:322`): `ok` legible, o `warn` `invalid` con la causa en `message`, sin `safe_next_step` y con el path en `evidence`. Con preferencia, MUST sumar el chequeo `protocol_block` (`checks.rs:350`) sobre el `CLAUDE.md` del usuario que lee `setup`: `ok` cuando el bloque es el que `setup` escribiría, `warn` `stale` cuando es otro e `info` `not_installed` sin bloque, las dos con `safe_next_step` `clawg setup claude-code --profile P`, y `warn` `unreadable` cuando el archivo no se puede leer o tiene un marcador suelto. Sin el archivo MUST NOT sumar ninguno de los dos.
 
 **Test:** `preferences_findings` y `protocol_block_findings` (`doctor/checks.rs`); `doctor_names_a_broken_preferences_file` (`tests/binary.rs`).
+
+## CL4. Sólo `message` cambia de idioma
+
+Cada chequeo de `checks.rs` y `mcp.rs` MUST recibir el idioma del comando, que `doctor::run` lee de `preferences.json`, y componer su `message` con un `match` sobre `Lang`. Los hallazgos de unos mismos hechos MUST tener, en `en` y en `es`, el mismo `check_id`, `severity`, `reason_code`, `evidence`, `safe_next_step` y `requires_confirmation`; sólo `message` cambia. Una causa que va en `evidence` (la de `config_unreadable`, por ejemplo) MUST quedar en inglés. Las claves y los demás valores del JSON de `doctor`, y su código de salida, MUST NOT cambiar.
+
+#### Escenario: mismos hechos, dos idiomas
+- GIVEN los hechos que hacen saltar cada `reason_code` de `checks.rs` y `mcp.rs`
+- WHEN se corren los chequeos con `en` y con `es`
+- THEN las dos listas de hallazgos son iguales salvo en `message`, y cada `message` de `es` es distinto del de `en`
+
+**Test:** `the_findings_are_the_same_in_both_languages_but_their_message` y `a_finding_in_spanish_agrees_with_its_number` (`doctor/checks.rs`), `the_mcp_findings_are_the_same_in_both_languages_but_their_message` (`doctor/mcp.rs`); `doctor_speaks_the_preferred_language` (`tests/binary.rs`).
 
 ## R6. Invariantes del estado de `memory`
 

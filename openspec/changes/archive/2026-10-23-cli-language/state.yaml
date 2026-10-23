@@ -1,0 +1,15 @@
+change: cli-language
+objective: "1"
+depends_on: [language-preference]
+phase: archived
+artifacts:
+  exploration: done  # la parte B de la exploración de language-preference
+  proposal: done
+  spec: done
+  design: skipped  # las decisiones 6 y 10 de la exploración; la propuesta las concreta
+  tasks: done
+  apply: done
+  verify: done  # Linux y el binario real en un home temporal; Windows por el CI del pull request; el perfil dev no se corrió
+  archive: done
+updated: 2026-10-23
+main_spec: openspec/specs/preferences/spec.md, openspec/specs/doctor/spec.md, openspec/specs/setup/spec.md, openspec/specs/self-update/spec.md, openspec/specs/secrets/spec.md, openspec/specs/portability/spec.md

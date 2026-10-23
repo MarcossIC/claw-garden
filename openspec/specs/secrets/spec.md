@@ -9,6 +9,7 @@ Fuente de verdad del comportamiento actual con secretos: el detector (formatos c
 - [conclusion-upkeep](../../changes/archive/2026-10-19-conclusion-upkeep/proposal.md), archivado el 2026-10-19 (R5: la purga deja los enlaces que nombran la fila como fuente).
 - [secret-coverage](../../changes/archive/2026-10-19-secret-coverage/proposal.md), archivado el 2026-10-19 (R1: `credential`, `huggingface_token`, `slack_webhook` y las formas nuevas de Slack, Stripe y PGP; R4: los `reason` de los veredictos; R5: el outbox del propio save, la cabecera de un save largo y la revival; R6: los `workspace.md`; R7, R8 y R9 nuevos).
 - [untrusted-recall](../../changes/archive/2026-10-20-untrusted-recall/proposal.md), archivado el 2026-10-20 (R6: un `workspace.md` guarda el texto en su forma cruda o en la copiada).
+- [cli-language](../../changes/archive/2026-10-23-cli-language/proposal.md), archivado el 2026-10-23 (CL3: la salida y las negativas de `secrets` y `purge` en el idioma del comando).
 
 ## Definiciones
 
@@ -352,3 +353,20 @@ Todo `last_error` del outbox que lleva el texto de un error MUST pasar por `reda
 - THEN queda `failed` y su `last_error` no tiene el token
 
 **Tests:** `a_failure_is_stored_masked` (`outbox.rs`, mod tests).
+
+## El idioma de la salida
+
+### CL3. `secrets` y `purge` en el idioma del comando
+
+La salida de `clawg secrets` (`report`), la de `--mask-reasons` (`mask_report`), la de `clawg purge` (`purge_report`), las negativas sin `--yes` (`confirm`, `confirm_mask_reasons`) y la frase que enmarca un fallo al abrir el store (`explain`), todas en `crates/clawg-cli/src/secrets.rs`, MUST salir en el idioma del comando ([`specs/preferences`](../preferences/spec.md), CL1 a CL3); las frases citadas en R4, R5 y R8 son las de `en`, que sin preferencia no cambian. Los ids, los tipos de secreto, los estados (`live`, `deleted`), los `operation_id`, las rutas y los comandos MUST NOT cambiar, y la causa técnica de un fallo va tal cual. Una frase con un número MUST concordar con él en cada idioma (CL5).
+
+#### Escenario: una memoria y varias
+- WHEN `clawg secrets` encuentra una fila con un secreto, y después dos
+- THEN en `es` dice `1 memoria guarda un secreto` y `2 memorias guardan un secreto`, con el mismo `memory <id> <tipos> <estado>` que en inglés
+
+#### Escenario: el informe de un purge
+- GIVEN el idioma del comando `es`
+- WHEN `clawg purge 7 --yes` borra la fila y revive la #3
+- THEN la salida empieza por `se purgó la memoria #7` y nombra `#3`, con los mismos ids que en inglés
+
+**Tests:** `the_secrets_report_speaks_spanish` y `the_purge_report_speaks_spanish` (`crates/clawg-cli/src/secrets.rs`).

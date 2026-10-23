@@ -2,7 +2,7 @@
 
 Fuente de verdad de `clawg update [--check]`: cómo se compara una versión, cuándo un binario puede actualizarse, cómo se elige el release y el asset, cómo se verifica la firma y el hash antes de tocar nada, el plan que intercambia el binario y vuelve a levantar el daemon, la vuelta atrás cuando el nuevo no arranca, las garantías sobre los datos, el informe y lo que sólo existe en un build de test. Cómo se publican los releases y sus claves está en [`specs/release`](../release/spec.md). No tiene que ver con [`specs/update`](../update/spec.md), que es la de `update_memory`.
 
-**Origen:** [release-and-self-update](../../changes/archive/2026-10-18-release-and-self-update/proposal.md), archivado el 2026-10-18. Los ids de requisito son los de esa spec. [shutdown-budget](../../changes/archive/2026-10-20-shutdown-budget/proposal.md), archivado el 2026-10-20, sumó a S10 «Un `stop` que vence» y cambió los tests de S11. [local-transport](../../changes/archive/2026-10-20-local-transport/proposal.md), archivado el 2026-10-20, sumó a S8 el arranque sin `--port` en Unix y los dos escenarios de un actualizador anterior y del actual. [windows-socket](../../changes/archive/2026-10-20-windows-socket/proposal.md), archivado el 2026-10-20, hizo que el puerto del daemon nuevo en S8 dependa de lo que publicó el viejo y no del sistema, en Unix y en Windows.
+**Origen:** [release-and-self-update](../../changes/archive/2026-10-18-release-and-self-update/proposal.md), archivado el 2026-10-18. Los ids de requisito son los de esa spec. [shutdown-budget](../../changes/archive/2026-10-20-shutdown-budget/proposal.md), archivado el 2026-10-20, sumó a S10 «Un `stop` que vence» y cambió los tests de S11. [local-transport](../../changes/archive/2026-10-20-local-transport/proposal.md), archivado el 2026-10-20, sumó a S8 el arranque sin `--port` en Unix y los dos escenarios de un actualizador anterior y del actual. [windows-socket](../../changes/archive/2026-10-20-windows-socket/proposal.md), archivado el 2026-10-20, hizo que el puerto del daemon nuevo en S8 dependa de lo que publicó el viejo y no del sistema, en Unix y en Windows. [cli-language](../../changes/archive/2026-10-23-cli-language/proposal.md), archivado el 2026-10-23, sumó a S11 el idioma del informe.
 
 ## Definiciones
 
@@ -227,12 +227,18 @@ Si el daemon nuevo no contesta `/health` con la versión nueva en el plazo, `upd
 
 Al terminar bien, `update` MUST informar la versión anterior y la nueva, el snapshot `pre-migration` si se escribió (su ruta), que volver atrás pierde lo escrito después de él, y que los editores abiertos siguen con el puente viejo hasta reiniciarse. Un `update` fallido MUST decir en qué estado dejó la instalación y el daemon.
 
+El informe de éxito (`success`), el de fallo (`failure`, `crates/clawg-cli/src/update/report.rs`) y el de `--check` (`report`, `update/mod.rs`) MUST salir en el idioma del comando ([`specs/preferences`](../preferences/spec.md), CL1 a CL3), en inglés sin preferencia. Lo que un paso fallido da como causa MUST ir tal cual, en inglés, dentro de la frase que lo enmarca, aunque lo componga clawg: `install_dir_access`, las verificaciones de `release.rs` y `signature.rs`, los errores de `effects.rs` y de `client.rs`. Las versiones, las rutas, los comandos y los códigos de salida MUST NOT cambiar.
+
 #### Escenario: informe de éxito
 - GIVEN una actualización completa de una versión a otra mayor, con migración
 - WHEN termina
 - THEN la salida contiene ambas versiones, la ruta del `pre-migration` y el aviso de reinicio de los editores
 
-**Tests:** `the_update_report_names_versions_snapshot_and_restart_notice` (puro, sobre la función que arma el texto); el estado del daemon tras un fallo, `a_failure_before_the_stop_says_the_daemon_was_not_touched`, `a_failure_after_the_stop_says_the_old_daemon_is_back`, `a_daemon_that_could_not_be_started_again_says_what_starts_it` y `a_daemon_still_shutting_down_says_how_to_start_it_once_it_ends` (puros).
+#### Escenario: una causa en otro idioma
+- GIVEN el idioma del comando `es` y una actualización que falla al bajar el binario por `the download does not match SHA256SUMS`
+- THEN la primera línea está en español y contiene `the download does not match SHA256SUMS` tal cual
+
+**Tests:** `the_update_report_names_versions_snapshot_and_restart_notice` (puro, sobre la función que arma el texto); el estado del daemon tras un fallo, `a_failure_before_the_stop_says_the_daemon_was_not_touched`, `a_failure_after_the_stop_says_the_old_daemon_is_back`, `a_daemon_that_could_not_be_started_again_says_what_starts_it` y `a_daemon_still_shutting_down_says_how_to_start_it_once_it_ends` (puros); en español, `the_update_reports_speak_spanish` (`update/report.rs`) y `the_report_names_the_versions` (`update/mod.rs`).
 
 ## S12. Sustitución sólo en builds de test
 
