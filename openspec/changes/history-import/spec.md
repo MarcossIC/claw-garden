@@ -188,7 +188,7 @@ Una nota con `deleted_at` MUST entrar borrada en esa fecha, sin vector y fuera d
 | `supersedes` | juzgado `supersedes`: las filas vivas de la nota destino `superseded` por la primera fila de la nota fuente, con causa `verdict` |
 | `supersedes` sobre una nota protegida, sin `marked_by_kind` `human` | `escalated`, como `conflicts_with` |
 
-El motivo MUST guardarse enmascarado, con la evidencia debajo cuando la hay. Una relación `orphaned`, una con un extremo que no está en el archivo ni en el store, y una reemplazada por otra MUST contarse y no guardarse.
+El motivo MUST guardarse enmascarado, con la evidencia debajo cuando la hay. Una relación `orphaned`, una con un extremo que no da filas en el archivo, y una reemplazada por otra MUST contarse y no guardarse. Una relación entre dos notas que ya estaban MUST guardar su par sin cambiar el estado de sus filas.
 
 #### Escenario: un veredicto protegido
 - GIVEN una `decision` A y una nota B con la relación `B supersedes A` marcada por un agente

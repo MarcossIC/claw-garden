@@ -75,7 +75,9 @@ Se agrupan las notas vivas por grupo de origen y hash del texto enmascarado. La 
 
 ## D8. Relaciones
 
-La tabla de HI14 es una función pura (`pair_for`). Los extremos son las primeras filas de las notas, después de los grupos de igual texto. Para `supersedes`, la nota destino lleva en sus filas vivas `superseded`, `superseded_by` la primera fila de la fuente y causa `verdict`, y el par va juzgado; para `conflicts_with` (y `supersedes` protegido), la primera fila de la nota más nueva lleva `disputed` y la otra en `disputed_against`, y el par va `escalated`. `write_links` ya activa una `disputed` sin par. Entre dos notas, vale la relación vigente más nueva; las reemplazadas se cuentan.
+La tabla de HI14 es una función pura (`pair_for`). Los extremos son las primeras filas de las notas, después de los grupos de igual texto. Para `supersedes`, la nota destino lleva en sus filas vivas `superseded`, `superseded_by` la primera fila de la fuente y causa `verdict`, y el par va juzgado; para `conflicts_with` (y `supersedes` protegido), la primera fila de la nota más nueva lleva `disputed` y la otra en `disputed_against`, y el par va `escalated`. `write_links` ya activa una `disputed` sin par. Entre dos notas, vale la relación vigente más nueva; las reemplazadas se cuentan. Un `supersedes` cuya fuente está borrada no reemplaza a la otra, y un par escalado disputa la fila nueva sólo si está viva.
+
+Un extremo que no da filas en el archivo no se busca en el store: el estado que un par les da a sus filas se escribe al insertarlas, y el import no reemplaza ni disputa una fila que ya estaba. Un export completo trae los dos extremos de cada relación. Por lo mismo, una relación nueva entre dos notas que ya estaban guarda su par y no cambia sus filas: `write_links` llena `superseded_by` sólo en una fila reemplazada y `disputed_against` sólo en una disputada, también para un archivo de clawg.
 
 | Alternativa | Por qué no |
 |---|---|
