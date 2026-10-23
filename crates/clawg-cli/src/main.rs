@@ -44,6 +44,7 @@ use clawg_core::memory::portability::ExportFilter;
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::memory::secrets::{mask_reasons, purge, scan};
 use clawg_core::paths::data_dir;
+use clawg_core::preferences::{language_in, Lang};
 use clap::Parser;
 
 /// Exit code for "the command ran and failed", as opposed to clap's `2` for
@@ -98,6 +99,12 @@ fn main() -> ExitCode {
         runtime.shutdown_timeout(serve::RUNTIME_TEARDOWN);
     }
     code
+}
+
+/// The language a command speaks to the user in: the profile's preference,
+/// read once, and English without one.
+fn language(base_dir: &std::path::Path) -> Lang {
+    language_in(base_dir).unwrap_or(Lang::En)
 }
 
 /// Logging to stderr, `info` by default, `RUST_LOG` overriding.
@@ -234,11 +241,13 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         }
 
         Command::Secrets { mask_reasons: true, yes, profile } => {
-            secrets::confirm_mask_reasons(yes)?;
             let profile = profile.resolve().map_err(|e| e.to_string())?;
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
-            let masked = mask_reasons(&base_dir).map_err(|e| secrets::explain(e, "mask the reasons"))?;
-            println!("{}", secrets::mask_report(&masked));
+            let lang = language(&base_dir);
+            secrets::confirm_mask_reasons(lang, yes)?;
+            let masked =
+                mask_reasons(&base_dir).map_err(|e| secrets::explain(lang, e, secrets::Rewrite::MaskReasons))?;
+            println!("{}", secrets::mask_report(lang, &masked));
             Ok(ExitCode::SUCCESS)
         }
 
@@ -246,16 +255,17 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             let profile = profile.resolve().map_err(|e| e.to_string())?;
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
             let scanned = scan(&base_dir).map_err(|e| e.to_string())?;
-            println!("{}", secrets::report(&scanned));
+            println!("{}", secrets::report(language(&base_dir), &scanned));
             Ok(ExitCode::SUCCESS)
         }
 
         Command::Purge { id, yes, profile } => {
-            secrets::confirm(id, yes)?;
             let profile = profile.resolve().map_err(|e| e.to_string())?;
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
-            let purged = purge(&base_dir, id).map_err(|e| secrets::explain(e, "purge"))?;
-            println!("{}", secrets::purge_report(id, &purged));
+            let lang = language(&base_dir);
+            secrets::confirm(lang, id, yes)?;
+            let purged = purge(&base_dir, id).map_err(|e| secrets::explain(lang, e, secrets::Rewrite::Purge))?;
+            println!("{}", secrets::purge_report(lang, id, &purged));
             Ok(ExitCode::SUCCESS)
         }
 
