@@ -325,6 +325,10 @@ pub struct MoveOpts {
     /// Only memories saved in this host session.
     #[arg(long, value_name = "ID")]
     pub session: Option<String>,
+    /// Only memories that came from this project of the tool they were
+    /// imported from, by its exact name.
+    #[arg(long, value_name = "NAME")]
+    pub origin_project: Option<String>,
     /// Only memories whose content matches every word, as `memories search`
     /// reads them.
     #[arg(long, value_name = "WORDS")]
@@ -347,7 +351,7 @@ pub struct MoveOpts {
         value_name = "N",
         conflicts_with_all = [
             "ids", "from_project", "from_none", "here", "agent", "memory_type", "source", "session", "text",
-            "include_deleted",
+            "origin_project", "include_deleted",
         ]
     )]
     pub undo: Option<i64>,
@@ -372,6 +376,7 @@ impl MoveOpts {
             source: self.source.clone(),
             session_id: self.session.clone(),
             q: self.text.clone(),
+            origin_project: self.origin_project.clone(),
             include_deleted: self.include_deleted,
             to_project: to.or_else(|| self.to_project.clone()),
             to_none: self.to_none,
@@ -745,6 +750,10 @@ pub struct ListOpts {
     /// List the deleted rows instead, most recently deleted first.
     #[arg(long)]
     pub deleted: bool,
+    /// Only memories that came from this project of the tool they were
+    /// imported from, by its exact name (memory rows only).
+    #[arg(long, value_name = "NAME")]
+    pub origin_project: Option<String>,
     #[command(flatten)]
     pub profile: ProfileArg,
 }
@@ -1346,6 +1355,31 @@ mod tests {
     }
 
     #[test]
+    fn move_and_list_take_an_origin_project() {
+        let opts = move_opts(&["--origin-project", "my repo", "--to-project", "repo-1a2b"]);
+        assert_eq!(
+            opts.request(None, None),
+            MoveRequest {
+                origin_project: Some("my repo".into()),
+                to_project: Some("repo-1a2b".into()),
+                ..MoveRequest::default()
+            }
+        );
+        assert!(
+            Cli::try_parse_from(["clawg", "projects", "move", "--origin-project", "a", "--undo", "4"]).is_err(),
+            "an undo takes no selection"
+        );
+
+        let Command::Memories { action: MemoriesAction::List(opts) } =
+            parse(&["clawg", "memories", "list", "--origin-project", "my repo"]).command
+        else {
+            panic!("not a list");
+        };
+        assert_eq!(opts.origin_project.as_deref(), Some("my repo"));
+        assert_eq!(crate::memories::list_args(&opts, None).origin_project.as_deref(), Some("my repo"));
+    }
+
+    #[test]
     fn list_and_search_take_no_project() {
         let Command::Memories { action: MemoriesAction::List(opts) } = parse(&["clawg", "memories", "list", "--no-project"]).command
         else {
@@ -1508,6 +1542,7 @@ mod tests {
                 offset: 0,
                 json: false,
                 deleted: false,
+                origin_project: None,
                 profile: ProfileArg { profile: None },
             })
         );
@@ -1543,6 +1578,7 @@ mod tests {
                 offset: 10,
                 json: true,
                 deleted: false,
+                origin_project: None,
                 profile: ProfileArg { profile: Some("dev".into()) },
             })
         );

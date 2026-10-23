@@ -10,8 +10,8 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 ## 2. El filtro (HI3)
 
-- [ ] Tests de `relocate.rs`, `admin.rs`, `cli.rs` y `tests/api.rs`.
-- [ ] `MoveFilter.origin_project`, `ListParams.origin_project`; `origin_project` en `POST /v1/memories/move` y `GET /v1/memories`; `--origin-project` en `projects move` y `memories list`.
+- [x] Tests de `relocate.rs`, `admin.rs`, `cli.rs` y `tests/api.rs`.
+- [x] `MoveFilter.origin_project`, `ListParams.origin_project`; `origin_project` en `POST /v1/memories/move` y `GET /v1/memories`; `--origin-project` en `projects move` y `memories list`.
 - Commit: `feat: select memories by the project they had in another tool`
 
 ## 3. El modelo común y el adaptador (HI4)

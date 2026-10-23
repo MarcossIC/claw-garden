@@ -3875,6 +3875,53 @@ async fn the_batch_moves_reports_and_snapshots() {
 }
 
 #[tokio::test]
+async fn move_and_list_select_by_origin_project() {
+    let h = Harness::start().await;
+    let target = registered(&h, "/work/target").await;
+    let from = |origin: &'static str, content: &'static str| {
+        let h = &h;
+        async move {
+            let (_, body) = h.post_json("/v1/memories", json!({ "content": content, "agent_id": "a" })).await;
+            let id = saved_ids(&body)[0];
+            h.ctx
+                .runtime
+                .store
+                .conn
+                .call(move |c| c.execute("UPDATE memory SET origin_project = ?1 WHERE id = ?2", rusqlite::params![origin, id]))
+                .await
+                .expect("seed");
+            id
+        }
+    };
+    let (a1, a2) = (from("a", "the first note of a").await, from("a", "the second note of a").await);
+    let b = from("b", "the only note of b").await;
+    let ids_of = |body: &Value| -> Vec<i64> {
+        let mut ids: Vec<i64> = body["items"].as_array().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect();
+        ids.sort_unstable();
+        ids
+    };
+
+    let (status, body) = h.get_json("/v1/memories?origin_project=a").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(ids_of(&body), vec![a1, a2]);
+    let (_, body) = h.get_json("/v1/memories?origin_project=b&agent=a").await;
+    assert_eq!(ids_of(&body), vec![b]);
+
+    let (status, dry) = h.post_json("/v1/memories/move", json!({ "origin_project": "a", "to_project": target, "dry_run": true })).await;
+    assert_eq!(status, 200, "{dry}");
+    assert_eq!(dry["moved"].as_array().map(Vec::len), Some(2), "{dry}");
+
+    let (status, done) = h.post_json("/v1/memories/move", json!({ "origin_project": "a", "to_project": target })).await;
+    assert_eq!(status, 200, "{done}");
+    assert_eq!(project_of(&h, a1).await, json!(target));
+    assert_eq!(project_of(&h, a2).await, json!(target));
+    assert_eq!(project_of(&h, b).await, Value::Null);
+
+    let (status, answer) = h.post_json("/v1/memories/move", json!({ "origin_project": "a", "undo": 1 })).await;
+    assert_eq!(status, 400, "an undo takes no selection: {answer}");
+}
+
+#[tokio::test]
 async fn a_batch_without_a_selection_or_a_target_is_400() {
     let h = Harness::start().await;
 

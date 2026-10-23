@@ -408,6 +408,7 @@ pub fn list_args(opts: &ListOpts, project: Option<String>) -> ListArgs {
         limit: Some(opts.limit),
         offset: Some(opts.offset),
         deleted: opts.deleted,
+        origin_project: opts.origin_project.clone(),
         ..filter_args(&opts.filters, project)
     }
 }
@@ -1023,6 +1024,7 @@ mod tests {
             offset: 0,
             json: false,
             deleted: false,
+            origin_project: None,
             profile: ProfileArg { profile: None },
         }
     }

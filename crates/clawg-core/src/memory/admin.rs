@@ -895,6 +895,9 @@ pub struct ListParams {
     /// project; the caller does not set `project_id` with it.
     pub no_project: bool,
     pub status: Option<String>,
+    /// The project the row had in the tool it came from, compared whole; only
+    /// `memory` rows have one, so no other kind matches.
+    pub origin_project: Option<String>,
     /// Free text over `memory.content`: every token must match, each as a
     /// prefix, ignoring case and accents. A query with no token filters nothing.
     pub query: Option<String>,
@@ -924,6 +927,7 @@ struct RowFilter {
     project_id: Option<String>,
     no_project: bool,
     status: Option<String>,
+    origin_project: Option<String>,
     match_expr: Option<String>,
     deleted: bool,
 }
@@ -983,6 +987,10 @@ fn push_filters(
         sql.push_str(" AND memory_type = ?");
         params.push(Value::Text(mt.clone()));
     }
+    if let Some(o) = &f.origin_project {
+        sql.push_str(" AND origin_project = ?");
+        params.push(Value::Text(o.clone()));
+    }
     if let Some(expr) = &f.match_expr {
         // No LIMIT inside: a cap here would drop matches before the live,
         // filtered rows are chosen and make the page depend on index order.
@@ -1014,6 +1022,7 @@ pub async fn list_memories_core(
         project_id: params.project_id,
         no_project: params.no_project,
         status: params.status,
+        origin_project: params.origin_project,
         match_expr: params.query.as_deref().and_then(viewer_match_expression),
         deleted: params.deleted,
     };
@@ -1023,8 +1032,9 @@ pub async fn list_memories_core(
         .conn
         .call(move |c| -> rusqlite::Result<Vec<MemoryAdminRow>> {
             let want_memory = matches!(kind, None | Some(MemoryKind::Memory));
-            let want_episodic = matches!(kind, None | Some(MemoryKind::Episodic));
-            let want_procedural = matches!(kind, None | Some(MemoryKind::Procedural));
+            let only_memory = filter.origin_project.is_some();
+            let want_episodic = !only_memory && matches!(kind, None | Some(MemoryKind::Episodic));
+            let want_procedural = !only_memory && matches!(kind, None | Some(MemoryKind::Procedural));
 
             // When merging across tables (`kind: None`) each table is queried
             // with LIMIT=offset+limit/OFFSET=0 so the post-merge global sort
@@ -3022,6 +3032,44 @@ mod tests {
         let rows = list_memories_core(&store, ListParams { no_project: true, ..Default::default() }).await.unwrap();
 
         assert_eq!(ids_of(&rows), vec![loose]);
+    }
+
+    #[tokio::test]
+    async fn a_listing_filters_by_origin_project() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let from_a = seed_memory_scoped(&store, "one", "agent-a", None, "active").await;
+        let from_a_other = seed_memory_scoped(&store, "two", "agent-b", None, "active").await;
+        let from_b = seed_memory_scoped(&store, "three", "agent-a", None, "active").await;
+        seed_memory_scoped(&store, "four", "agent-a", None, "active").await;
+        seed_episodic_scoped(&store, "agent-a", "t1").await;
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<()> {
+                for (id, origin) in [(from_a, "a"), (from_a_other, "a"), (from_b, "b")] {
+                    c.execute("UPDATE memory SET origin_project = ?1 WHERE id = ?2", rusqlite::params![origin, id])?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let rows = list_memories_core(&store, ListParams { origin_project: Some("a".into()), ..Default::default() })
+            .await
+            .unwrap();
+        assert_eq!(ids_of(&rows), vec![from_a, from_a_other], "{rows:?}");
+
+        let rows = list_memories_core(
+            &store,
+            ListParams { origin_project: Some("a".into()), agent_id: Some("agent-a".into()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+        assert_eq!(ids_of(&rows), vec![from_a]);
+
+        let rows = list_memories_core(&store, ListParams { origin_project: Some("A".into()), ..Default::default() })
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "the name is compared whole: {rows:?}");
     }
 
     #[tokio::test]
