@@ -218,7 +218,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
             let project_id = project.map(|path| ProjectIdentity::resolve(&path).id);
             let filter = ExportFilter { project_id, agent, include_deleted };
-            println!("{}", export::run(&base_dir, &out, &filter, format, now_ms() as i64)?);
+            println!("{}", export::run(language(&base_dir), &base_dir, &out, &filter, format, now_ms() as i64)?);
             Ok(ExitCode::SUCCESS)
         }
 
@@ -232,7 +232,8 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 Probe::Running(client) => client,
                 Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
             };
-            let out = import::run(&client, &file, dry_run, agent.as_deref(), &map_root).await.map_err(|e| match e {
+            let lang = language(&base_dir);
+            let out = import::run(lang, &client, &file, dry_run, agent.as_deref(), &map_root).await.map_err(|e| match e {
                 import::ImportError::Client(e) => unavailable(e),
                 other => other.to_string(),
             })?;
