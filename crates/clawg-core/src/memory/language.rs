@@ -57,6 +57,12 @@ pub async fn count_saves_in(
 /// before a text is given a language.
 const MIN_EVIDENCE: usize = 3;
 
+/// Words of prose, identifiers left out, from which a single point of one
+/// language is enough when the other has none: a terse technical note in
+/// English holds few function words, and Spanish prose of that length
+/// always shows some of its own.
+const TERSE_PROSE: usize = 8;
+
 /// Words that, alone, say a text is English. Words that are also Spanish
 /// (`a`, `no`, `me`, `he`, `has`) are left out.
 const ENGLISH: &[&str] = &[
@@ -81,20 +87,22 @@ const SPANISH: &[&str] = &[
 /// or neither language clearly wins.
 pub fn detect(text: &str) -> Option<Lang> {
     let prose = without_code(text);
-    let (mut english, mut spanish) = (0usize, 0usize);
+    let (mut english, mut spanish, mut words) = (0usize, 0usize, 0usize);
     spanish += prose.chars().filter(|c| matches!(c, '¿' | '¡')).count();
     for token in prose.split_whitespace().filter(|t| !is_identifier(t)) {
         let word = token.trim_matches(|c: char| !c.is_alphabetic()).to_lowercase();
         if word.is_empty() {
             continue;
         }
+        words += 1;
         if ENGLISH.contains(&word.as_str()) {
             english += 1;
         } else if SPANISH.contains(&word.as_str()) || word.chars().any(is_spanish_letter) {
             spanish += 1;
         }
     }
-    if english + spanish < MIN_EVIDENCE {
+    let one_sided = (english == 0) != (spanish == 0) && words >= TERSE_PROSE;
+    if english + spanish < MIN_EVIDENCE && !one_sided {
         return None;
     }
     if spanish >= 2 * english {
@@ -181,6 +189,14 @@ mod tests {
         for text in ["the end", "por fin", "Fixed lexical bonus ignoring paths", "Se rompió"] {
             assert_eq!(detect(text), None, "{text:?}");
         }
+    }
+
+    #[test]
+    fn a_terse_note_with_evidence_of_one_language_alone_is_that_language() {
+        assert_eq!(detect("Prefer bounded batches so saves never wait long behind backfill writes"), Some(Lang::En));
+        assert_eq!(detect("Preferir tandas acotadas: guardados nunca esperan mucho detrás relleno nuevo"), Some(Lang::Es));
+        assert_eq!(detect("Prefer bounded batches so saves never wait"), None, "too few words to go on one point");
+        assert_eq!(detect("Bounded batches keep saves moving behind backfill writes always"), None, "no evidence at all");
     }
 
     #[test]
