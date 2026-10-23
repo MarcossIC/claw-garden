@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use clawg_core::memory::sharing;
 use clawg_core::paths::{Profile, ProfileError};
+use clawg_core::preferences::Lang;
 
 use crate::client::MoveRequest;
 
@@ -170,6 +171,16 @@ pub enum Command {
     Sharing {
         #[command(subcommand)]
         action: Option<SharingAction>,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Show the user's preferences, or change one with `set` and `unset`. The
+    /// language (`es` or `en`) is the one memories are saved and searched in
+    /// and the agent answers in. A change reaches the Claude Code sessions
+    /// opened after it; `clawg setup claude-code` rewrites the protocol block.
+    Preferences {
+        #[command(subcommand)]
+        action: Option<PreferencesAction>,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -490,6 +501,59 @@ impl SharingAction {
 /// would leave the daemon sharing what the user believes is hidden.
 pub fn sharing_profile<'a>(action: Option<&'a SharingAction>, own: &'a ProfileArg) -> &'a ProfileArg {
     action.map(SharingAction::profile).filter(|p| p.profile.is_some()).unwrap_or(own)
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum PreferencesAction {
+    /// Set a preference: `language es` or `language en`.
+    Set(SetPreference),
+    /// Take a preference away, back to how clawg behaves without it.
+    Unset(UnsetPreference),
+}
+
+/// What a preference is about. One for now; the next preference is another
+/// value here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum PreferenceKey {
+    Language,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct SetPreference {
+    pub key: PreferenceKey,
+    /// `es` or `en`.
+    #[arg(value_parser = parse_lang)]
+    pub value: Lang,
+    #[command(flatten)]
+    pub profile: ProfileArg,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct UnsetPreference {
+    pub key: PreferenceKey,
+    #[command(flatten)]
+    pub profile: ProfileArg,
+}
+
+fn parse_lang(raw: &str) -> Result<Lang, String> {
+    Lang::parse(raw).ok_or_else(|| format!("{raw:?} is not a language clawg knows: use es or en"))
+}
+
+impl PreferencesAction {
+    /// The `--profile` the action was given, if any.
+    pub fn profile(&self) -> &ProfileArg {
+        match self {
+            PreferencesAction::Set(s) => &s.profile,
+            PreferencesAction::Unset(u) => &u.profile,
+        }
+    }
+}
+
+/// The `--profile` a `clawg preferences` run uses, by the rule of
+/// [`sharing_profile`]: a preference written to another profile's data
+/// directory would leave the user's sessions in the language they left.
+pub fn preferences_profile<'a>(action: Option<&'a PreferencesAction>, own: &'a ProfileArg) -> &'a ProfileArg {
+    action.map(PreferencesAction::profile).filter(|p| p.profile.is_some()).unwrap_or(own)
 }
 
 /// One directed exclusion: READER does not read what AUTHOR saved.
@@ -1028,6 +1092,45 @@ mod tests {
             parse(&["clawg", "sharing", "unhide", "cursor", "claude-code", "--profile", "dev"]).command,
             Command::Sharing { action: Some(SharingAction::Unhide(e)), profile: ProfileArg { profile: None } }
         );
+    }
+
+    #[test]
+    fn preferences_parses_set_and_unset() {
+        assert_eq!(
+            parse(&["clawg", "preferences"]).command,
+            Command::Preferences { action: None, profile: ProfileArg { profile: None } }
+        );
+        let dev = ProfileArg { profile: Some("dev".into()) };
+        assert_eq!(
+            parse(&["clawg", "preferences", "set", "language", "es", "--profile", "dev"]).command,
+            Command::Preferences {
+                action: Some(PreferencesAction::Set(SetPreference {
+                    key: PreferenceKey::Language,
+                    value: Lang::Es,
+                    profile: dev.clone()
+                })),
+                profile: ProfileArg { profile: None },
+            }
+        );
+        assert_eq!(
+            parse(&["clawg", "preferences", "--profile", "dev", "unset", "language"]).command,
+            Command::Preferences {
+                action: Some(PreferencesAction::Unset(UnsetPreference {
+                    key: PreferenceKey::Language,
+                    profile: ProfileArg { profile: None }
+                })),
+                profile: dev,
+            }
+        );
+        for bad in [["clawg", "preferences", "set", "language", "fr"], ["clawg", "preferences", "set", "idioma", "es"]] {
+            assert!(Cli::try_parse_from(bad).is_err(), "{bad:?}");
+        }
+        let Command::Preferences { action, profile } =
+            parse(&["clawg", "preferences", "set", "language", "en", "--profile", "dev"]).command
+        else {
+            panic!("expected preferences");
+        };
+        assert_eq!(preferences_profile(action.as_ref(), &profile).profile.as_deref(), Some("dev"));
     }
 
     fn hide_of(args: &[&str]) -> Exclusion {
