@@ -12,6 +12,7 @@ Fuente de verdad del comportamiento actual de la evaluación de recuperación: e
 - [conflict-candidates](../../changes/archive/2026-10-18-conflict-candidates/proposal.md), archivado el 2026-10-18 (sólo «`conflict-eval`: el detector entero» y su baseline).
 - [revision-eval](../../changes/archive/2026-10-21-revision-eval/proposal.md), archivado el 2026-10-21 (sólo «`revision-eval`: revisiones por clave» y su baseline).
 - [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23 (sólo «`rag-eval --lang-detect`», LP15 de esa spec).
+- [agent-language](../../changes/archive/2026-10-23-agent-language/proposal.md), archivado el 2026-10-23 (sólo la línea del aviso en español en «`chains`: lo que cuesta la clave (M4)»; el parser que lee las respuestas vacías en los dos idiomas, AL7 de esa spec, está en [`specs/retrieval`](../retrieval/spec.md), y la paridad español contra inglés y el store mezclado, sus M1 y M2, no se midieron: piden el golden pareado y el modelo real).
 
 ## Definiciones
 
@@ -616,7 +617,7 @@ Con el tokenizador de las líneas de base (`EvalTokenCounter::real`, `eval_api.r
 2. los del prompt de `recall_context` reescrito con ` topic=K` en la cabecera de cada hit con clave de LAST SESSION, RECENT y LONG-TERM, delante de ` by ` o del primer `]` (`rewrite_prompt`, `cost.rs:57`), contra el mismo prompt sin reescribir. Se cuenta cuántos prompts pasan de 8.000 bytes, sin recortar, porque el recorte es del producto;
 3. de los dos anteriores, una cota de arriba para «todas las filas con clave», que pone la clave más larga del set en cada hit sin clave;
 4. el costo fijo de la clave en cada sesión: los tokens de su descripción en el schema de `save_memory` y los de su párrafo de `protocol.md`, leídos de `agent_contract.json` y de `protocol.md` compilados en el binario (`fixed_cost`, `cost.rs:169`);
-5. los tokens de una línea de aviso de referencia, fijada antes de medir (`WARNING_LINE`, `cost.rs:24`). Su costo por save lo da `store`.
+5. los tokens de una línea de aviso de referencia, fijada antes de medir (`WARNING_LINE`, `cost.rs:24`). Su costo por save lo da `store`. Es la línea en inglés: un test la compara con la que da el puente sin preferencia (`topic_key_warning(Lang::En, 123)`, `crates/clawg-cli/src/mcp/tools.rs:373`). La que el puente da en una sesión en español ([`specs/mcp`](../mcp/spec.md), AL4) no se midió en tokens.
 
 La reescritura vive en la herramienta: en producción, `recall_context` no muestra la clave (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:763`).
 

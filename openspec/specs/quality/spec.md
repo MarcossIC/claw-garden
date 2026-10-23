@@ -2,16 +2,18 @@
 
 Fuente de verdad de las redes de tests que vigilan lo que el modelo ve del servidor MCP, los docs que enumeran sus herramientas y la convención de no esconder código muerto, y de dónde están documentados esos chequeos. Ninguno cambia el comportamiento de un comando, una ruta o una herramienta. Lo que hace cada herramienta está en [`specs/mcp`](../mcp/spec.md).
 
-**Origen:** [quality-guards](../../changes/archive/2026-10-15-quality-guards/proposal.md), archivado el 2026-10-15. Los ids de requisito son los de esa spec. R5 (borrar el código sin llamador que escondían los `allow`) fue un arreglo de una vez y no queda como requisito: lo que impide que vuelva es R4 y el comando de `clippy` de R6.
+**Origen:**
+- [quality-guards](../../changes/archive/2026-10-15-quality-guards/proposal.md), archivado el 2026-10-15. Los ids de requisito son los de esa spec. R5 (borrar el código sin llamador que escondían los `allow`) fue un arreglo de una vez y no queda como requisito: lo que impide que vuelva es R4 y el comando de `clippy` de R6.
+- [agent-language](../../changes/archive/2026-10-23-agent-language/proposal.md), archivado el 2026-10-23 (sólo el contrato de una sesión en español en R1 y R2; qué lee esa sesión está en [`specs/mcp`](../mcp/spec.md), AL2 a AL4).
 
 ## Definiciones
 
-- **Contrato del agente:** lo que el puente le da al cliente para que el modelo decida qué llamar: cada herramienta tal como sale en `tools/list` (nombre, descripción, `inputSchema` y cualquier otro campo que `rmcp` serialice) y el texto de `instructions` (la apertura del protocolo, `opening(PROTOCOL)`, `crates/clawg-cli/src/mcp/protocol.rs:33`, que `get_info` entrega en `server.rs:1534`; el protocolo está en [`specs/mcp`](../mcp/spec.md)). No incluye `serverInfo`: su nombre depende del perfil y su versión cambia en cada bump.
-- **Archivo del contrato:** `crates/clawg-cli/src/mcp/agent_contract.json`, versionado (`CONTRACT_PATH`, `server.rs:2563`).
+- **Contrato del agente:** lo que el puente le da al cliente para que el modelo decida qué llamar: cada herramienta tal como sale en `tools/list` (nombre, descripción, `inputSchema` y cualquier otro campo que `rmcp` serialice) y el texto de `instructions` (la apertura del protocolo del idioma de la sesión, `opening`, `crates/clawg-cli/src/mcp/protocol.rs:33`, que `get_info` entrega en `server.rs:1534`; el protocolo está en [`specs/mcp`](../mcp/spec.md)). No incluye `serverInfo`: su nombre depende del perfil y su versión cambia en cada bump.
+- **Archivo del contrato:** `crates/clawg-cli/src/mcp/agent_contract.json`, versionado (`CONTRACT_PATH`, `server.rs:2563`), con el contrato del puente sin preferencia; `agent_contract.es.json` (`CONTRACT_ES_PATH`, `server.rs:2737`), con el del puente en español (`with_language(Some(Lang::Es))`). Con la preferencia `en` sólo cambian dos frases del protocolo, que fijan los tests de [`specs/mcp`](../mcp/spec.md) (LP9), y no hay un tercer archivo.
 
 ## R1. El contrato del agente está fijado
 
-Un test MUST armar el contrato desde un puente en proceso (`agent_contract`, `server.rs:2566`) y compararlo con el archivo del contrato. Si difieren, MUST fallar con un mensaje que nombre cada herramienta que cambió (con los campos que cambiaron), que sobra o que falta, y si cambiaron las instrucciones (`contract_diff`, `server.rs:2582`). Si el archivo no existe, MUST fallar diciendo cómo crearlo.
+Un test MUST armar el contrato desde un puente en proceso (`agent_contract`, `server.rs:2566`) y compararlo con el archivo del contrato, y otro MUST hacer lo mismo con el puente en español y `agent_contract.es.json`. Si difieren, MUST fallar con un mensaje que nombre cada herramienta que cambió (con los campos que cambiaron), que sobra o que falta, y si cambiaron las instrucciones (`contract_diff`, `server.rs:2582`). Si el archivo no existe, MUST fallar diciendo cómo crearlo.
 
 La comparación MUST ser semántica: el orden de las claves de un objeto JSON y el orden en que el router registra las herramientas MUST NOT cambiar el resultado.
 
@@ -30,11 +32,11 @@ La comparación MUST ser semántica: el orden de las claves de un objeto JSON y 
 - WHEN cambia `[workspace.package] version`
 - THEN el test pasa
 
-**Test:** `the_agent_contract_matches_its_file` (`server.rs:2719`), y los puros `contract_diff_names_the_changed_tool` (`server.rs:2633`) y `contract_diff_ignores_key_order` (`server.rs:2657`).
+**Test:** `the_agent_contract_matches_its_file` (`server.rs:2719`) y `the_spanish_agent_contract_matches_its_file` (`server.rs:2742`), y los puros `contract_diff_names_the_changed_tool` (`server.rs:2633`) y `contract_diff_ignores_key_order` (`server.rs:2657`).
 
 ## R2. Bendecir un cambio deja el diff a la vista
 
-Con `CLAWG_BLESS=1` el test MUST reescribir el archivo del contrato y MUST fallar igual, con un mensaje que diga que se actualizó y que hay que revisar el diff y volver a correr (`server.rs:2722-2724`). Sin la variable, el test MUST NOT escribir.
+Con `CLAWG_BLESS=1` el test MUST reescribir el archivo del contrato y MUST fallar igual, con un mensaje que diga que se actualizó y que hay que revisar el diff y volver a correr (`server.rs:2722-2724`, y `:2745-2747` para el español, que se bendice con `CLAWG_BLESS=1 cargo test -p clawg-cli the_spanish_agent_contract_matches_its_file`). Sin la variable, el test MUST NOT escribir.
 
 El archivo MUST escribirse con las claves de cada objeto ordenadas (y por lo tanto las herramientas por nombre), dos espacios de sangría y un salto de línea final (`render_contract`, `server.rs:2626`), de modo que dos bendiciones seguidas del mismo contrato produzcan los mismos bytes.
 

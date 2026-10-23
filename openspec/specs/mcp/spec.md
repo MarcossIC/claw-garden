@@ -1,6 +1,6 @@
 # mcp — Especificación
 
-Fuente de verdad del comportamiento actual del puente `clawg mcp`: cómo abre una sesión por stdio, en el ciclo legacy (`initialize`) y en el 2026-07-28 (`_meta` en cada request), y de qué nombre saca el `agent_id` de cada request. Qué filas lee, modifica y lista cada agente está en [`specs/visibility`](../visibility/spec.md), con el alcance que le da [`specs/sharing`](../sharing/spec.md); este dominio sólo decide qué nombre entra como `client` en `resolve_agent` y cómo las herramientas muestran lo compartido (último apartado). Cómo el puente vuelve a encontrar al daemon después de un reinicio está en el apartado «Reconectar con el daemon tras un reinicio». Cómo `recall_context` pide un presupuesto de bytes y avisa que no buscó memorias está en «El presupuesto de `recall_context`» y «`recall_context` dice si buscó memorias»; qué entra en el presupuesto y qué se corta, en [`specs/retrieval`](../retrieval/spec.md). Qué le dice el servidor al agente sobre guardar y leer memorias (las instrucciones, el protocolo y lo que declaran los schemas de `memory_type` y la descripción de `save_memory`) está en «El protocolo de memoria» y los apartados que lo siguen. La herramienta `search_project`, que busca en la documentación y el código del proyecto, está en [`specs/project-docs`](../project-docs/spec.md); acá sólo se la cuenta entre las herramientas que lista el puente.
+Fuente de verdad del comportamiento actual del puente `clawg mcp`: cómo abre una sesión por stdio, en el ciclo legacy (`initialize`) y en el 2026-07-28 (`_meta` en cada request), y de qué nombre saca el `agent_id` de cada request. Qué filas lee, modifica y lista cada agente está en [`specs/visibility`](../visibility/spec.md), con el alcance que le da [`specs/sharing`](../sharing/spec.md); este dominio sólo decide qué nombre entra como `client` en `resolve_agent` y cómo las herramientas muestran lo compartido (último apartado). Cómo el puente vuelve a encontrar al daemon después de un reinicio está en el apartado «Reconectar con el daemon tras un reinicio». Cómo `recall_context` pide un presupuesto de bytes y avisa que no buscó memorias está en «El presupuesto de `recall_context`» y «`recall_context` dice si buscó memorias»; qué entra en el presupuesto y qué se corta, en [`specs/retrieval`](../retrieval/spec.md). Qué le dice el servidor al agente sobre guardar y leer memorias (las instrucciones, el protocolo y lo que declaran los schemas de `memory_type` y la descripción de `save_memory`) está en «El protocolo de memoria» y los apartados que lo siguen. En qué idioma lee el agente todo eso, y en cuál le contesta el puente, está desde «LP8» hasta el final. La herramienta `search_project`, que busca en la documentación y el código del proyecto, está en [`specs/project-docs`](../project-docs/spec.md); acá sólo se la cuenta entre las herramientas que lista el puente.
 
 **Origen:**
 - [mcp-protocol-upgrade](../../changes/archive/2026-10-13-mcp-protocol-upgrade/proposal.md), archivado el 2026-10-13.
@@ -21,7 +21,8 @@ Fuente de verdad del comportamiento actual del puente `clawg mcp`: cómo abre un
 - [agent-lifecycle-hooks](../../changes/archive/2026-10-18-agent-lifecycle-hooks/proposal.md), archivado el 2026-10-18 (sólo el estado `recent` en «`recall_context` dice si buscó memorias» y la `query` opcional de `POST /v1/context`).
 - [session-handoff](../../changes/archive/2026-10-19-session-handoff/proposal.md), archivado el 2026-10-19 (sólo lo que el protocolo completo dice de LAST SESSION).
 - [protected-verdicts](../../changes/archive/2026-10-20-protected-verdicts/proposal.md), archivado el 2026-10-20 (sólo `user_answered` en «Los conflictos en las herramientas», la respuesta del usuario en la apertura y su largo).
-- [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23 (desde «LP8. La línea del otro idioma» hasta el final). La preferencia está en [`specs/preferences`](../preferences/spec.md).
+- [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23 (desde «LP8. La línea del otro idioma» hasta «LP11»). La preferencia está en [`specs/preferences`](../preferences/spec.md).
+- [agent-language](../../changes/archive/2026-10-23-agent-language/proposal.md), archivado el 2026-10-23 (desde «AL1. Sin preferencia o con `en`, lo de antes» hasta el final, el protocolo en español en «El protocolo de memoria» y sus apartados, y LP9 con `es`). Las notas del contexto y el parser de `rag-eval` en español están en [`specs/retrieval`](../retrieval/spec.md) (AL5, AL7), los hooks en [`specs/hooks`](../hooks/spec.md) (AL6) y el contrato en español en [`specs/quality`](../quality/spec.md).
 
 ## Definiciones
 
@@ -29,6 +30,8 @@ Fuente de verdad del comportamiento actual del puente `clawg mcp`: cómo abre un
 - **Ciclo de vida 2026-07-28:** no hay `initialize`. Cada request lleva en `params._meta` `io.modelcontextprotocol/protocolVersion` y `io.modelcontextprotocol/clientCapabilities` (obligatorios) y `io.modelcontextprotocol/clientInfo` (SHOULD).
 - **Antes de una sesión:** desde que abre stdio hasta que pasa a rmcp `initialize` o una request que no sea `ping` ni `server/discover`.
 - **Nombre declarado:** `clientInfo.name` de la request (`_meta`) o, en el ciclo legacy y sin `_meta`, el de `initialize`. Un nombre en blanco no cuenta.
+- **Idioma de la sesión:** el idioma preferido ([`specs/preferences`](../preferences/spec.md)) que el puente leyó al arrancar; `en` sin preferencia (`speaks`, `crates/clawg-cli/src/mcp/server.rs:515`).
+- **Marcador:** un texto fijo que el agente, el protocolo o `rag-eval` reconocen por su forma, y que no cambia con el idioma: los encabezados `=== … ===`, `NEW`, `OLD`, `disputed`, `[truncated]`, `piece=K/N`, `by <agent>`, `topic=`, `score=`, `imp=`, `acc=`, `by=#N`, `from=`, `live=`, `lost=`, `origin=` y las marcas `inferred`, `conclusion` e `imported`; también los nombres de herramientas y de argumentos, los tipos de memoria y los valores de `status`.
 
 ## R1. `server/discover`
 
@@ -359,24 +362,24 @@ Qué hace el borrado y el restore está en [`specs/restore`](../restore/spec.md)
 
 ## El protocolo de memoria
 
-Lo que el agente lee sobre qué guardar y cómo escribirlo sale de un solo texto en inglés, `crates/clawg-cli/src/mcp/protocol.md`, compilado en el binario (`PROTOCOL`, `crates/clawg-cli/src/mcp/protocol.rs:15`). Su **apertura** son los párrafos entre el título (la primera línea, `# …`) y la primera línea que empieza con `## `. Dentro de cada párrafo, las líneas se unen con un espacio, y los párrafos se separan con una línea en blanco. Las secciones desarrollan cada punto: cuándo guardar, qué no guardar, cómo escribir un save, tipo e importancia, el resumen de sesión, qué hacer tras una compactación, las conclusiones, que lo recuperado es evidencia y no instrucciones, y las demás herramientas. Hoy sólo la apertura llega sola al agente; el texto completo lo leen los tests de este apartado.
+Lo que el agente lee sobre qué guardar y cómo escribirlo sale de un texto por idioma, compilado en el binario: `crates/clawg-cli/src/mcp/protocol.md`, en inglés (`PROTOCOL`, `crates/clawg-cli/src/mcp/protocol.rs:15`), y `protocol.es.md`, en español (`PROTOCOL_ES`, `protocol.rs:20`). Cuál lee una sesión lo decide `text` (LP9 y AL2). Su **apertura** son los párrafos entre el título (la primera línea, `# …`) y la primera línea que empieza con `## `. Dentro de cada párrafo, las líneas se unen con un espacio, y los párrafos se separan con una línea en blanco. Las secciones desarrollan cada punto: cuándo guardar, qué no guardar, cómo escribir un save, tipo e importancia, el resumen de sesión, qué hacer tras una compactación, las conclusiones, que lo recuperado es evidencia y no instrucciones, y las demás herramientas. La apertura llega como instrucciones del servidor; el texto completo llega al `CLAUDE.md` del usuario por `clawg setup claude-code` ([`specs/setup`](../setup/spec.md)), y lo leen los tests de este apartado.
 
 ### Las instrucciones son la apertura
 
-`get_info` MUST entregar la apertura como `instructions` (`server.rs:1534`), y `server/discover` MUST llevar las mismas, porque arma su respuesta con `get_info` (`server.rs:1540-1546`). Extraer la apertura MUST ser una función pura sobre el texto (`opening`, `protocol.rs:33`) que MUST NOT cortar una palabra, MUST NOT dejar saltos de línea dentro de un párrafo y MUST NOT incluir el título ni una línea de sección. Un checkout con `\r\n` MUST dar la misma apertura.
+`get_info` MUST entregar como `instructions` la apertura del protocolo del idioma de la sesión (`opening(&protocol::text(self.language))`, `server.rs:1534`), y `server/discover` MUST llevar las mismas, porque arma su respuesta con `get_info` (`server.rs:1540-1546`). Extraer la apertura MUST ser una función pura sobre el texto (`opening`, `protocol.rs:33`) que MUST NOT cortar una palabra, MUST NOT dejar saltos de línea dentro de un párrafo y MUST NOT incluir el título ni una línea de sección. Un checkout con `\r\n` MUST dar la misma apertura.
 
 #### Escenario: un párrafo cortado en dos líneas
 - GIVEN `# T\n\nuno\ndos\n\ntres\n## S\ncuatro`
 - WHEN se extrae la apertura
 - THEN es `uno dos\n\ntres`, y lo mismo con `\r\n` en lugar de `\n`
 
-**Tests:** el puro `opening_joins_the_lines_of_each_paragraph` y `the_instructions_are_the_opening_of_the_protocol` (`server.rs`). Como `discover` usa `get_info`, un solo test fija las dos puertas.
+**Tests:** el puro `opening_joins_the_lines_of_each_paragraph` (`protocol.rs`) y `the_instructions_are_the_opening_of_the_protocol` (`server.rs`). Como `discover` usa `get_info`, un solo test fija las dos puertas.
 
 ### Las instrucciones caben en 2.048 caracteres
 
-La apertura MUST medir 2.048 caracteres o menos, contados como `char`: Claude Code anterior a la v2.1.296 corta las instrucciones de un servidor en ese largo, y se pagan en cada sesión. Hoy mide 2.028: la frase que pide registrar la respuesta del usuario con `user_answered` sumó 80, así que quedan 20 de margen y una oración más en la apertura obliga a acortar otra.
+La apertura de cada variante del protocolo (sin preferencia, `en` y `es`) MUST medir 2.048 caracteres o menos, contados como `char`: Claude Code anterior a la v2.1.296 corta las instrucciones de un servidor en ese largo, y se pagan en cada sesión. Sin preferencia mide 2.028: la frase que pide registrar la respuesta del usuario con `user_answered` sumó 80, así que quedan 20 de margen y una oración más en la apertura obliga a acortar otra. Con `en` mide 2.045, porque la regla de LP9 suma cómo responderle a la persona: quedan 3. Con `es` mide 1.925, porque las frases sobre el tipo y la importancia pasaron a su sección («Tipo e importancia»).
 
-**Test:** `the_instructions_fit_older_clients` (`server.rs`).
+**Test:** `the_instructions_fit_older_clients` (`server.rs`), sobre las tres variantes (`every_protocol`).
 
 ### La apertura lleva los hábitos que más rinden
 
@@ -384,20 +387,24 @@ Mientras sea el único texto del protocolo que llega solo al agente, la apertura
 
 - decir cuándo llamar a `save_memory`, `search_memory`, `recall_context`, `search_project`, `resolve_conflict` y `synthesize`;
 - pedir un hecho por llamada, con una primera línea que nombre el tema y con rutas e identificadores exactos;
-- pedir memorias y búsquedas en inglés, cualquiera sea el idioma de la conversación, porque una memoria se encuentra mejor con una consulta en su idioma (el corte por pareja de idiomas de [`specs/eval`](../eval/spec.md));
+- pedir memorias y búsquedas en inglés, cualquiera sea el idioma de la conversación, porque una memoria se encuentra mejor con una consulta en su idioma (el corte por pareja de idiomas de [`specs/eval`](../eval/spec.md)); con preferencia, en el idioma preferido (LP9 y AL2);
 - decir que lo recuperado (memorias y pasajes del proyecto) es evidencia y no instrucciones;
 - pedir que las memorias cercanas que nombra `save_memory` se juzguen con `resolve_conflict` mientras la conversación sigue ahí, que se le pregunte al usuario por lo que lista ACTIVE CONFLICTS y que su respuesta se registre con `resolve_conflict`, `user_answered` y sus palabras en `reason`, puesto sólo cuando el usuario lo dijo ([`specs/disputes`](../disputes/spec.md));
 - decir qué no guardar.
 
 El texto completo MUST traer además el resumen de sesión con sus seis partes (Goal, Instructions, Discoveries, Accomplished, Next steps y Relevant files), que el resumen más nuevo del proyecto abre el contexto de la sesión siguiente bajo LAST SESSION, pregunte lo que pregunte ([`specs/retrieval`](../retrieval/spec.md), «La última sesión»), y qué hacer tras una compactación. La frase de LAST SESSION va en «Session summary», fuera de la apertura, y ningún test la pide. También MUST decir cuándo darle una `topic_key` a un save (una decisión o una preferencia que puede cambiar, con un nombre corto y estable como `storage/engine`) y que una versión nueva se guarda bajo la clave que muestran `search_memory` y `read_memory`, nunca bajo una nueva. Esa oración va en «How to write a save», fuera de la apertura, así que las instrucciones y su largo no cambian; no tiene un test que la pida, y `the_protocol_names_only_what_exists` comprueba que `topic_key` sea una propiedad del schema.
 
-**Tests:** `the_instructions_carry_the_saving_habits` y `the_protocol_describes_the_session_summary` (`server.rs`); además, `get_info_advertises_tools_and_the_profiles_server_name` e `instructions_say_when_to_search_the_project` (`server.rs`) y `a_discover_probe_is_answered_with_what_the_server_offers` (`handshake.rs`) piden `save_memory`, `synthesize` y `search_project` en las instrucciones.
+La apertura de `protocol.es.md` MUST llevar los mismos hábitos, en español (AL2).
+
+**Tests:** `the_instructions_carry_the_saving_habits`, `the_spanish_instructions_carry_the_saving_habits` y `the_protocol_describes_the_session_summary` (`server.rs`); además, `get_info_advertises_tools_and_the_profiles_server_name` e `instructions_say_when_to_search_the_project` (`server.rs`) y `a_discover_probe_is_answered_with_what_the_server_offers` (`handshake.rs`) piden `save_memory`, `synthesize` y `search_project` en las instrucciones.
 
 ### El protocolo nombra sólo lo que existe
 
 - Cada herramienta registrada en `tool_router` MUST aparecer entre comillas invertidas en el protocolo.
 - Cada texto entre comillas invertidas que sea un nombre en minúsculas, con o sin `_` (`[a-z]+(_[a-z]+)*`), MUST ser una herramienta registrada, una propiedad del `inputSchema` de alguna herramienta o un tipo de memoria. Los ejemplos y las marcas (`` `Fixed lexical bonus ignoring paths` ``, `` `<private>` ``, `` `piece=K/N` ``, `` `by <agent>` ``) no cuentan.
 - Cada tipo de memoria MUST aparecer en el protocolo.
+
+Vale para cada variante: sin preferencia, `en` y `es`.
 
 Juntar los textos entre comillas invertidas MUST ser una función pura (`code_spans` e `is_name`, en los tests de `server.rs`).
 
@@ -449,18 +456,22 @@ Con preferencia, `search_memory` y `recall_context` con consulta MUST mandar `la
 
 ## LP9. Las instrucciones y el protocolo con preferencia
 
-`crates/clawg-cli/src/mcp/protocol.rs` es dueño del texto (`PROTOCOL`, `opening`, `text`), para el puente y para `setup`. Con preferencia, `text` (`protocol.rs:58`) MUST dar `protocol.md` con dos cambios: la frase de la apertura que pide guardar y buscar en inglés pide hacerlo en el idioma preferido y suma que se le responda a la persona en ese idioma salvo que escriba en otro; y la línea de «How to write a save» pide guardar y buscar en el idioma preferido y, cuando una búsqueda diga que quedan memorias en el otro idioma, buscar otra vez con la consulta en él. Cada una de las dos reglas MUST aparecer una sola vez en `protocol.md`, aunque cruce saltos de línea. Sin preferencia, `text` es el archivo tal cual. Las instrucciones del servidor MUST ser la apertura de ese texto y MUST caber en 2.048 caracteres con cada idioma. El protocolo MUST seguir nombrando sólo herramientas, argumentos y tipos que existen. El puente MUST leer la preferencia una vez, al arrancar (`ClawgMcp::with_language`, `crates/clawg-cli/src/mcp/server.rs:506`, desde `crates/clawg-cli/src/mcp/mod.rs:133`).
+`crates/clawg-cli/src/mcp/protocol.rs` es dueño del texto (`PROTOCOL`, `PROTOCOL_ES`, `opening`, `text`), para el puente y para `setup`. Con la preferencia `en`, `text` (`protocol.rs:58`) MUST dar `protocol.md` con dos cambios: la frase de la apertura que pide guardar y buscar en inglés pide hacerlo en el idioma preferido y suma que se le responda a la persona en ese idioma salvo que escriba en otro; y la línea de «How to write a save» pide guardar y buscar en el idioma preferido y, cuando una búsqueda diga que quedan memorias en el otro idioma, buscar otra vez con la consulta en él. Cada una de las dos reglas MUST aparecer una sola vez en `protocol.md`, aunque cruce saltos de línea. Con `es`, `text` MUST dar `protocol.es.md` tal cual (AL2). Sin preferencia, `text` es `protocol.md` tal cual. Las instrucciones del servidor MUST ser la apertura de ese texto y MUST caber en 2.048 caracteres con cada idioma. El protocolo MUST seguir nombrando sólo herramientas, argumentos y tipos que existen. El puente MUST leer la preferencia una vez, al arrancar (`ClawgMcp::with_language`, `crates/clawg-cli/src/mcp/server.rs:506`, desde `crates/clawg-cli/src/mcp/mod.rs:133`).
+
+#### Escenario: inglés
+- GIVEN la preferencia `en`
+- THEN el protocolo dice `Save memories and search in English:` y `Reply to the user in English unless`, y cuando quedan memorias en español pide buscar otra vez con la consulta en español; nada más cambia
 
 #### Escenario: español
 - GIVEN la preferencia `es`
-- THEN las instrucciones dicen `in Spanish` donde sin preferencia dicen `in English`, nombran cómo responderle a la persona, no dicen `in English` y miden 2.048 caracteres o menos
+- THEN las instrucciones son la apertura de `protocol.es.md`: dicen `Guarda las memorias y busca en español` y `Responde a la persona en español salvo que escriba en otro idioma`, no dicen `English` y miden 2.048 caracteres o menos
 
 #### Escenario: la sesión no cambia sola
 - GIVEN un puente arrancado con la preferencia `en`
 - WHEN el archivo pasa a decir `es`
 - THEN sus instrucciones y sus búsquedas siguen en `en`
 
-**Test:** `the_instructions_follow_the_preferred_language`, `the_instructions_fit_older_clients` y `the_protocol_names_only_what_exists` para cada idioma, y `the_bridge_keeps_the_language_it_started_with` (`server.rs`); `the_language_rules_occur_once_in_the_protocol` (`protocol.rs`). `agent_contract.json` fija el servidor sin preferencia.
+**Test:** `the_instructions_follow_the_preferred_language`, `the_instructions_fit_older_clients` y `the_protocol_names_only_what_exists` para cada idioma, `without_a_preference_the_instructions_are_the_opening` y `the_bridge_keeps_the_language_it_started_with` (`server.rs`); `the_language_rules_occur_once_in_the_protocol`, `without_a_language_the_protocol_is_the_file` y `a_language_rewrites_both_rules_of_the_english_protocol` (`protocol.rs`). `agent_contract.json` fija el servidor sin preferencia, y `agent_contract.es.json` en español ([`specs/quality`](../quality/spec.md)).
 
 ## LP10. La descripción de `search_memory`
 
@@ -473,3 +484,44 @@ La descripción de `search_memory` MUST NOT decir que encuentra memorias escrita
 Con preferencia al arrancar, `memory_status` MUST decir el idioma de la sesión. Cuando `preferences.json` dice otro idioma que el de la sesión (o una preferencia que la sesión no tenía, o ninguna) MUST decir el actual y que se aplica en una sesión nueva. Sin preferencia al arrancar ni ahora, MUST NOT agregar nada (`format_language`, `tools.rs:910`).
 
 **Test:** `memory_status_names_the_sessions_language`, `memory_status_says_when_the_preference_changed` y `memory_status_without_a_preference_says_nothing_of_it` (`tools.rs`); `memory_status_names_the_language_of_the_session` (`server.rs`).
+
+## AL1. Sin preferencia o con `en`, lo de antes
+
+Sin preferencia o con `en`, las instrucciones (salvo las dos reglas de LP9 con `en`), `tools/list` y cada respuesta del puente MUST ser idénticas, byte a byte, a las de antes de que el puente hablara español: cada frase es un `match` sobre `Lang` cuya rama `Lang::En` es el texto de antes. Lo mismo vale para las notas del contexto ([`specs/retrieval`](../retrieval/spec.md), AL5) y los hooks ([`specs/hooks`](../hooks/spec.md), AL6).
+
+**Test:** `the_agent_contract_matches_its_file` ([`specs/quality`](../quality/spec.md)), que pasó sin cambios en `agent_contract.json`; los tests anteriores de `tools.rs`, `server.rs`, `prompt_builder.rs` y `hook.rs` pasan con `Lang::En` sin cambiar el texto que esperan.
+
+## AL2. El protocolo en español
+
+Con `es`, `protocol::text` MUST ser `protocol.es.md` (`PROTOCOL_ES`, `protocol.rs:20`), escrito para el español y no traducido frase a frase, y las instrucciones del servidor su apertura, de 2.048 caracteres o menos. `protocol.es.md` MUST tener tantas secciones `##` como `protocol.md` (las nueve, en el mismo orden: «Cuándo guardar» es «When to save», y así hasta «Las otras herramientas») y el mismo conjunto de nombres y marcadores entre comillas invertidas: los textos sin espacio, o con `<` (`names_and_markers`, `protocol.rs:168`). Los ejemplos de un save, con espacios, se escriben en cada idioma. Los marcadores en prosa (`ACTIVE CONFLICTS`, `LAST SESSION`, los veredictos, `inferred`) MUST estar en los dos o en ninguno, y cada nombre entre comillas MUST ser una herramienta registrada, un argumento suyo o un tipo de memoria («El protocolo nombra sólo lo que existe»). Su apertura MUST pedir guardar y buscar en español, responder a la persona en español salvo que escriba en otro idioma, y nombrar `save_memory`, `search_memory`, `recall_context`, `search_project`, `resolve_conflict` y `synthesize`; y «Cómo escribir un save», buscar otra vez con la consulta en inglés cuando una búsqueda diga que quedan memorias en inglés.
+
+Un protocolo por idioma, y no frases reescritas sobre el inglés como hace LP9 con `en`: el español no se escribe palabra por palabra como el inglés, y la apertura tiene que caber en 2.048 caracteres moviendo frases entre la apertura y las secciones. Lo que cuesta mantener dos textos lo vigilan los tests de paridad.
+
+#### Escenario: setup escribe el protocolo en español
+- GIVEN la preferencia `es`
+- WHEN corre `clawg setup claude-code`
+- THEN el bloque entre los marcadores es `protocol.es.md`, y `doctor` da `protocol_block` `ok` ([`specs/setup`](../setup/spec.md), [`specs/doctor`](../doctor/spec.md))
+
+**Test:** `spanish_is_the_spanish_protocol` y `the_spanish_protocol_has_the_sections_and_spans_of_the_english_one` (`protocol.rs`); `the_instructions_fit_older_clients` y `the_protocol_names_only_what_exists` sobre cada variante, `the_spanish_instructions_carry_the_saving_habits` y `the_instructions_follow_the_preferred_language` (`server.rs`); `the_block_follows_the_preferred_language` (`setup.rs`).
+
+## AL3. Las herramientas en español
+
+Con `es`, la descripción de cada herramienta y de cada argumento MUST ser la de la tabla `DESCRIPTIONS` (`crates/clawg-cli/src/mcp/tools_es.rs:9`: la herramienta, el argumento o `None` para la herramienta, y el texto), que `ClawgMcp::with_language` pone en el router una sola vez, al fijar el idioma (`server.rs:506`; `describe`, `server.rs:112`, reemplaza la descripción de la herramienta y la de cada propiedad de su `inputSchema`): `tools/list` y los tests leen la misma lista, y MUST coincidir con `agent_contract.es.json` ([`specs/quality`](../quality/spec.md)). La tabla MUST tener una entrada por herramienta registrada y por argumento suyo, y ninguna más; cada descripción en español MUST nombrar entre comillas invertidas los mismos textos que la inglesa. Los nombres, los tipos, los `default` y los `enum` de los esquemas MUST NOT cambiar. Sin preferencia y con `en` las descripciones son las de los atributos `#[tool]` y los comentarios `///` de cada `*Args`.
+
+Una tabla en lugar de dos routers o de traducir en `list_tools`: el macro de `rmcp` une nombre, descripción y función, así que dos routers duplicarían las doce funciones, y cambiar el router una vez deja un solo camino para el cliente y para los tests.
+
+**Test:** `the_spanish_table_covers_every_tool_and_argument`, `the_spanish_descriptions_name_what_the_english_ones_name`, `only_descriptions_change_with_the_language` y `the_spanish_agent_contract_matches_its_file` (`server.rs`).
+
+## AL4. Las respuestas del puente
+
+Con el idioma de la sesión `es`, la prosa de cada respuesta del puente MUST estar en español: cada `format_*` de `crates/clawg-cli/src/mcp/tools.rs`, `topic_key_warning`, `synthesis_nudge`, `review_nudge`, `other_language_line`, y las frases que compone `server.rs` (lo que responde un save, sus negativas, los rechazos del puente, `AgentSource::describe`, `server.rs:83`). Cada frase es un `match` sobre `Lang` con las dos ramas juntas, y cada función recibe el idioma de la sesión. Los marcadores MUST NOT cambiar. Una frase que el daemon devuelve en un error (el `message` de un 400, un 404 o un 409) y el `Display` de un error tipado MUST ir tal cual dentro de la frase del puente, que los enmarca (`not_saved`, `server.rs:376`: `no se guardó: {causa}`): los leen también los clientes de la API y el CLI, y mezclan códigos con texto.
+
+#### Escenario: una búsqueda sin nada cerca
+- GIVEN una sesión en `es` y una búsqueda cuyos hits puntúan 0
+- THEN `search_memory` dice `no hay memorias relevantes para esta consulta: 3 buscadas, ninguna lo bastante cerca para mostrarla`
+
+#### Escenario: un hit
+- GIVEN una sesión en `es` y un hit de `cursor`, pieza 2 de 3, con la clave `api/port`
+- THEN la línea del hit es `1. #4 [memory/semantic_fact/t3 piece=2/3 score=0.91 topic=api/port by cursor] El puerto es 8080`, igual que en inglés, y la nota de lo compartido que la sigue está en español
+
+**Test:** `a_spanish_search_keeps_its_markers`, `the_spanish_answers_of_each_tool`, `the_spanish_synthesis_and_nudges`, `the_spanish_status_docs_and_recall` y los de la línea del otro idioma (`tools.rs`); `a_spanish_session_answers_in_spanish` y `memory_status_names_the_language_of_the_session` (`server.rs`).

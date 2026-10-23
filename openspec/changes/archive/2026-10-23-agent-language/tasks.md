@@ -42,3 +42,11 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 - [x] `.claude/CLAUDE.md`, el mapa de `openspec/README.md`, las verificaciones de los dos cambios con la medida de caracteres.
 - Commit: `docs: describe what the agent reads in the preferred language`
+
+## Verificación
+
+- [x] La suite y clippy en Linux (`target`) y, por el CI del pull request, en Linux y en Windows.
+- [x] `a_context_in_spanish_keeps_its_markers` contra el daemon armado en proceso (`tests/api.rs`), y `tests/binary.rs` con el binario real en un home temporal.
+- [x] M3, en caracteres: las instrucciones, `tools/list` y la línea del otro idioma en cada idioma.
+- [ ] M1 y M2, con el golden pareado y el modelo real: no se corrieron (fuera de alcance, ver la propuesta).
+- [ ] Con autorización, M6 a mano sobre el perfil `dev`: no se corrió.

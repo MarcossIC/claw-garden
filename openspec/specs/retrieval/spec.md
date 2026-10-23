@@ -20,6 +20,7 @@ Fuente de verdad del comportamiento actual de la recuperación: el corte relativ
 - [context-hit-room](../../changes/archive/2026-10-22-context-hit-room/proposal.md), archivado el 2026-10-22 (sólo la reserva de los hits en «El prompt cumple el presupuesto» y en «El primer hit de un bloque se recorta en lugar de saltarse», y lo que cambia en «El contexto sin consulta»).
 - [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22 (sólo ACTIVE CONFLICTS en «Hits de otros agentes»: los pares de cualquier autor que el lector alcanza).
 - [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23 (sólo «`other_language` en la búsqueda y el contexto», LP7 de esa spec; la línea que el puente arma con el conteo está en [`specs/mcp`](../mcp/spec.md), LP8).
+- [agent-language](../../changes/archive/2026-10-23-agent-language/proposal.md), archivado el 2026-10-23 (sólo «AL5. Las notas del contexto en el idioma del pedido», las respuestas vacías en español en el parser de `rag-eval --agent-view`, AL7 de esa spec, y el idioma de la NOTE, de la línea de omitidos y del bloque `BUDGET`; lo que el puente responde en español está en [`specs/mcp`](../mcp/spec.md), AL1 a AL4).
 
 ## Definiciones
 
@@ -374,7 +375,7 @@ Los pares que comparten `new_id` MUST formar un grupo: una línea `NEW`, y una l
 
 ## Una NOTE por bloque de conflictos
 
-La NOTE MUST imprimirse una sola vez por bloque, justo bajo el separador y antes de los grupos (`CONFLICT_NOTE`, `prompt_builder.rs:778-781`). MUST estar en inglés, como todo lo que el agente lee de clawg, y empezar con `NOTE:`. MUST NOT afirmar que las memorias se contradicen: el detector mide cercanía ([`specs/disputes`](../disputes/spec.md)). MUST pedir que se pregunte al usuario y nombrar `resolve_conflict` con sus veredictos y el significado de `keep`. Se imprime en cada bloque, así que MUST NOT pasar de los 228 bytes de la NOTE que no nombraba veredictos:
+La NOTE MUST imprimirse una sola vez por bloque, justo bajo el separador y antes de los grupos (`CONFLICT_NOTE`, `prompt_builder.rs:778-781`). Sin `lang` o con `en`, MUST estar en inglés y empezar con `NOTE:`; con `lang: es`, en español y empezar con `NOTA:` (`conflict_note`, `:784`; AL5). MUST NOT afirmar que las memorias se contradicen: el detector mide cercanía ([`specs/disputes`](../disputes/spec.md)). MUST pedir que se pregunte al usuario y nombrar `resolve_conflict` con sus veredictos y el significado de `keep`, que son nombres y quedan iguales en los dos idiomas. Se imprime en cada bloque, así que la inglesa MUST NOT pasar de los 228 bytes de la NOTE que no nombraba veredictos (mide 227). La española mide 245, y ningún test le pone tope:
 
 ```
 NOTE: these memories may conflict; the user has not said which holds.
@@ -397,7 +398,7 @@ Una función pura sobre los pares leídos (`rank_conflicts`, `prompt_builder.rs:
 
 El resultado MUST NOT depender del orden de entrada. Los grupos salen en orden de su primer par.
 
-Tras ordenar, el bloque MUST conservar los primeros 5 pares (`MAX_CONFLICT_PAIRS`, `prompt_builder.rs:59`; el tope cuenta pares, antes de agrupar). Si quedan N > 0 afuera, la última línea del bloque MUST ser `(+N more conflicts not shown)` (`prompt_builder.rs:846-851`). Con N = 0 MUST NOT haber esa línea. Los pares que el presupuesto quita después ([El prompt cumple el presupuesto](#el-prompt-cumple-el-presupuesto)) se suman a N.
+Tras ordenar, el bloque MUST conservar los primeros 5 pares (`MAX_CONFLICT_PAIRS`, `prompt_builder.rs:59`; el tope cuenta pares, antes de agrupar). Si quedan N > 0 afuera, la última línea del bloque MUST ser `(+N more conflicts not shown)`, o `(+N conflictos más que no se muestran)` con `lang: es` (`prompt_builder.rs:846-851`). Con N = 0 MUST NOT haber esa línea. Los pares que el presupuesto quita después ([El prompt cumple el presupuesto](#el-prompt-cumple-el-presupuesto)) se suman a N.
 
 #### Escenario: posición
 - GIVEN un par cuyo hit está en posición 0 y otro en posición 4
@@ -580,6 +581,8 @@ Si algo se cortó o recortó, el prompt MUST terminar con un bloque `=== BUDGET 
 Cut to fit 8000 bytes; the full context is 12040 bytes. Left out: #40, #41. Shortened: #12. read_memory returns any of them whole.
 ```
 
+Con `lang: es` el texto MUST ser el mismo en español, con los ids, `read_memory` y el encabezado intactos: `Recortado para entrar en 8000 bytes; el contexto completo mide 12040 bytes. Quedaron afuera: #40, #41. Se acortaron: #12. read_memory devuelve cualquiera de ellas entera.` (AL5).
+
 Sin recorte el bloque MUST NOT aparecer. El bloque MUST NOT quitarse para entrar.
 
 #### Escenario: pedir lo que quedó afuera
@@ -591,7 +594,7 @@ Sin recorte el bloque MUST NOT aparecer. El bloque MUST NOT quitarse para entrar
 
 ## Un workspace más grande que el presupuesto se entrega y se dice
 
-Si sin ningún hit, resumen ni par el texto sigue por encima del presupuesto, el prompt MUST llevar el workspace entero, ningún hit y el bloque `BUDGET` con cuántos bytes ocupa el contexto entero y la frase `The workspace alone is over the budget and is shown whole.` (`prompt_builder.rs:463-466` y `:645-650`). Es el único caso en que el prompt supera el presupuesto.
+Si sin ningún hit, resumen ni par el texto sigue por encima del presupuesto, el prompt MUST llevar el workspace entero, ningún hit y el bloque `BUDGET` con cuántos bytes ocupa el contexto entero y la frase `The workspace alone is over the budget and is shown whole.`, o `El workspace solo ya pasa el presupuesto y se muestra entero.` con `lang: es` (`prompt_builder.rs:463-466` y `:645-650`). Es el único caso en que el prompt supera el presupuesto.
 
 **Test:** `a_workspace_over_the_budget_is_kept_and_said` (`prompt_builder.rs`).
 
@@ -599,7 +602,7 @@ Si sin ningún hit, resumen ni par el texto sigue por encima del presupuesto, el
 
 `context_segments` (`crates/clawg-eval/src/bin/rag-eval/agent_view/parse.rs:88`) MUST segmentar por sección (`context_sections`, `parse.rs:71`): los segmentos de hit salen sólo de LAST SESSION, RECENT CONTEXT y LONG-TERM KNOWLEDGE (`parse.rs:93`), así que un `session_summary` esperado que pasa a LAST SESSION sigue contando como encontrado; los bullets, sólo de WORKSPACE; el texto de ACTIVE CONFLICTS, SHARED y BUDGET MUST NOT contar para `found`. Encabezado de hit = línea que cumple `[` + `YYYY-MM-DD` + ` #` + dígitos + (` ` + palabra sin espacios)? + `]` + ` ` (`hit_text`, `parse.rs:152`); el texto es lo que sigue en la misma línea, y el segmento corre hasta el próximo encabezado o separador. Un marcador `<!--` cierra un bullet. Cada línea de continuación de un hit o de un bullet MUST leerse sin el [margen](#definiciones), `  | ` delante o `  |` sola como línea vacía (`unmargined`, `parse.rs:135`), porque el matcher busca el segmento dentro del texto de la fila tal como se guardó (`refs_containing`, `crates/clawg-eval/src/bin/rag-eval/agent_view/matcher.rs:64`): con el margen, una fila de varias líneas que el prompt mostró no contaría como encontrada.
 
-La salida de `search_memory` MUST leerse como cero líneas cuando es `no memories found` o empieza con la frase de abstención (`parse_search_output`, `parse.rs:33-40`), así que un caso `unanswerable` cuya búsqueda la dice cuenta como `abstained`.
+La salida de `search_memory` MUST leerse como cero líneas cuando es la de un alcance vacío o empieza con la frase de abstención, en cualquiera de los dos idiomas que habla el puente: `no memories found` o `no se encontraron memorias`, `no relevant memories for this query` o `no hay memorias relevantes para esta consulta` (AL7; `parse_search_output`, `parse.rs:33-40`, lee las dos frases de `no_memories_found` y `no_relevant_memories`, `crates/clawg-cli/src/mcp/tools.rs:89` y `:81`, para cada `Lang`, así que una frase nueva del puente no puede dejar al medidor contando hits que no hay). Un caso `unanswerable` cuya búsqueda la dice cuenta como `abstained`.
 
 #### Escenario: multilínea
 - GIVEN dos hits, el primero con código y línea en blanco, cada línea de continuación detrás del margen
@@ -609,7 +612,7 @@ La salida de `search_memory` MUST leerse como cero líneas cuando es `no memorie
 - GIVEN una sección ACTIVE CONFLICTS con `NEW [..#2 disputed] x` y `OLD [..#1] y`
 - THEN no se genera ningún segmento
 
-**Test:** `a_hit_line_is_one_segment`, `a_hit_of_another_kind_is_one_segment`, `a_multi_line_hit_runs_until_the_next_header`, `a_hit_ends_at_the_next_section_separator`, `a_hit_may_open_with_a_dash`, `a_copied_workspace_bullet_is_read_without_its_margin`, `conflict_text_yields_no_segments`, `workspace_markers_end_a_bullet`, `the_abstention_sentence_parses_to_no_lines` y `the_last_session_block_counts_as_shown` en `parse.rs`; `read_context_finds_rows_in_hit_lines_and_workspace_bullets` en `agent_view/mod.rs`. El punta a punta del agent-view (`runner.rs`) arma un prompt real y lo lee con este parser.
+**Test:** `a_hit_line_is_one_segment`, `a_hit_of_another_kind_is_one_segment`, `a_multi_line_hit_runs_until_the_next_header`, `a_hit_ends_at_the_next_section_separator`, `a_hit_may_open_with_a_dash`, `a_copied_workspace_bullet_is_read_without_its_margin`, `conflict_text_yields_no_segments`, `workspace_markers_end_a_bullet`, `the_abstention_sentence_parses_to_no_lines`, `an_empty_answer_reads_as_empty_in_both_languages` y `the_last_session_block_counts_as_shown` en `parse.rs`; `read_context_finds_rows_in_hit_lines_and_workspace_bullets` en `agent_view/mod.rs`. El punta a punta del agent-view (`runner.rs`) arma un prompt real y lo lee con este parser.
 
 ## Los ids de `recall_context` en `delete_memory` y `update_memory`
 
@@ -690,3 +693,17 @@ Con un proyecto indexado ([`specs/project-docs`](../project-docs/spec.md)), `sea
 - THEN la respuesta no tiene `other_language`
 
 **Test:** `counting_the_other_language_follows_the_search_scope` (`language.rs`); `a_search_with_a_language_counts_the_other_one`, `a_search_without_a_language_has_no_count`, `an_unknown_language_is_a_bad_request` y `a_context_with_a_query_counts_the_other_language` (`tests/api.rs`); `a_search_answer_without_other_language_still_parses` (`client.rs`).
+
+## AL5. Las notas del contexto en el idioma del pedido
+
+`POST /v1/context` con `lang: es`, con consulta o sin ella, MUST escribir en español las notas que arma el daemon: la de lo compartido (`shared_note`, `crates/clawg-core/src/memory/prompt_builder.rs:40`), la NOTE de los conflictos (`conflict_note`, `:784`), la línea de los conflictos que no se muestran (`format_conflict_block`, `:846-851`) y el texto del bloque `BUDGET` (`format_cut`, `:613`). Los encabezados `=== … ===`, `NEW`, `OLD`, `disputed`, `by <agent>` y los demás marcadores de [`specs/mcp`](../mcp/spec.md), los ids, los nombres de herramientas y de veredictos y el texto de cada fila MUST NOT cambiar. Sin `lang` o con `en`, el prompt MUST ser el de antes, byte a byte (`SHARED_NOTE` y `CONFLICT_NOTE` son las ramas `Lang::En`).
+
+El daemon toma el idioma del pedido (`check_lang`, `crates/clawg-cli/src/daemon/api.rs:727`, en `context`, `api.rs:1497`) y se lo pasa a `build_memory_prompt` y a `build_session_prompt` (`prompt_builder.rs:170` y `:289`; `Lang::En` sin él, `api.rs:1521` y `:1538`). No lee `preferences.json`: la sesión fija su idioma al arrancar ([`specs/mcp`](../mcp/spec.md), LP9), y una llamada a la API sin puente no recibe español sin pedirlo. El puente MUST mandar el idioma de la sesión cuando hay preferencia (`DaemonClient::context`, `crates/clawg-cli/src/client.rs:1034`, desde `recall_context`, `crates/clawg-cli/src/mcp/server.rs:985`), y `session-start` el idioma preferido que lee en cada evento (`DaemonClient::recent_context`, `client.rs:1060`; [`specs/hooks`](../hooks/spec.md), AL6). Un daemon anterior acepta `lang` (lo lee desde LP7) o lo ignora (`ContextRequest` no rechaza campos desconocidos), y escribe sus notas en inglés.
+
+#### Escenario: un contexto en español
+- GIVEN un hit de otro agente, un par escalado y dos pares que quedaron afuera del tope
+- WHEN se pide el contexto con `lang: es`
+- THEN el prompt dice `NOTA: estas memorias pueden contradecirse; la persona no dijo cuál vale.` y `(+2 conflictos más que no se muestran)`, cierra con la nota de lo compartido en español, y conserva `=== ACTIVE CONFLICTS (review needed) ===`, `=== SHARED ===`, `NEW `, `OLD `, ` disputed` y ` by agent-2]`
+- AND recortado a 200 bytes, el bloque `BUDGET` dice `Recortado para entrar en 200 bytes; el contexto completo mide …`
+
+**Test:** `the_notes_of_the_prompt_follow_its_language` (`prompt_builder.rs`); `a_context_in_spanish_keeps_its_markers` (`tests/api.rs`), contra el daemon, con un contexto sin consulta: LAST SESSION de otro agente, `by b]` y `=== SHARED ===` intactos y la nota en español, y en inglés sin `lang`. Los tests anteriores del prompt pasan con `Lang::En` sin cambiar su texto.
