@@ -176,15 +176,19 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             // serve` cannot lose the race for the lock, and an installer can
             // replace `clawg.exe` right after.
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
-            let pid = stop_in(&base_dir, STOP_TIMEOUT)
-                .await
-                .map_err(|e| match e {
-                    ClientError::NotRunning => {
-                        format!("no clawg daemon is running for profile {}", profile.as_str())
-                    }
-                    other => other.to_string(),
-                })?;
-            println!("stopped the {} daemon (pid {pid})", profile.as_str());
+            let lang = language(&base_dir);
+            let name = profile.as_str();
+            let pid = stop_in(&base_dir, STOP_TIMEOUT).await.map_err(|e| match (e, lang) {
+                (ClientError::NotRunning, Lang::En) => format!("no clawg daemon is running for profile {name}"),
+                (ClientError::NotRunning, Lang::Es) => {
+                    format!("no hay ningún daemon de clawg corriendo para el perfil {name}")
+                }
+                (other, _) => other.to_string(),
+            })?;
+            match lang {
+                Lang::En => println!("stopped the {name} daemon (pid {pid})"),
+                Lang::Es => println!("se detuvo el daemon {name} (pid {pid})"),
+            }
             Ok(ExitCode::SUCCESS)
         }
 
@@ -208,8 +212,9 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         Command::Restore { file, profile } => {
             let profile = profile.resolve().map_err(|e| e.to_string())?;
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
-            let restored = restore(&base_dir, &file).map_err(restore::explain)?;
-            println!("{}", restore::report(&file, &restored));
+            let lang = language(&base_dir);
+            let restored = restore(&base_dir, &file).map_err(|e| restore::explain(lang, e))?;
+            println!("{}", restore::report(lang, &file, &restored));
             Ok(ExitCode::SUCCESS)
         }
 
@@ -224,15 +229,15 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
 
         Command::Import { file, dry_run, agent, map_root, profile } => {
             let profile = profile.resolve().map_err(|e| e.to_string())?;
-            let unavailable = |e: ClientError| memories::explain_unavailable(&e, profile);
             // The daemon is the store's only writer and has the model that
             // embeds each row; with none running, nothing is started.
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let lang = language(&base_dir);
+            let unavailable = |e: ClientError| memories::explain_unavailable(lang, &e, profile);
             let client = match probe_running(&base_dir, false).await.map_err(unavailable)? {
                 Probe::Running(client) => client,
                 Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
             };
-            let lang = language(&base_dir);
             let out = import::run(lang, &client, &file, dry_run, agent.as_deref(), &map_root).await.map_err(|e| match e {
                 import::ImportError::Client(e) => unavailable(e),
                 other => other.to_string(),
@@ -272,34 +277,36 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
 
         Command::Undelete { id, profile } => {
             let profile = profile.resolve().map_err(|e| e.to_string())?;
-            let unavailable = |e: ClientError| memories::explain_unavailable(&e, profile);
             // The model that embeds the row again lives in the daemon; with
             // none running, nothing is started and the store is not opened.
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let lang = language(&base_dir);
+            let unavailable = |e: ClientError| memories::explain_unavailable(lang, &e, profile);
             let client = match probe_running(&base_dir, false).await.map_err(unavailable)? {
                 Probe::Running(client) => client,
                 Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
             };
-            println!("{}", undelete::run(&client, id).await.map_err(unavailable)?);
+            println!("{}", undelete::run(lang, &client, id).await.map_err(unavailable)?);
             Ok(ExitCode::SUCCESS)
         }
 
         Command::Outbox { action } => {
             let profile = action.target().profile.resolve().map_err(|e| e.to_string())?;
-            let unavailable = |e: ClientError| memories::explain_unavailable(&e, profile);
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let lang = language(&base_dir);
+            let unavailable = |e: ClientError| memories::explain_unavailable(lang, &e, profile);
             let client = match probe_running(&base_dir, false).await.map_err(unavailable)? {
                 Probe::Running(client) => client,
                 Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
             };
-            println!("{}", outbox::run(&client, &action).await.map_err(unavailable)?);
+            println!("{}", outbox::run(lang, &client, &action).await.map_err(unavailable)?);
             Ok(ExitCode::SUCCESS)
         }
 
         Command::Sharing { action, profile } => {
             let profile = sharing_profile(action.as_ref(), &profile).resolve().map_err(|e| e.to_string())?;
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
-            println!("{}", sharing::run(&base_dir, action.as_ref())?);
+            println!("{}", sharing::run(language(&base_dir), &base_dir, action.as_ref())?);
             Ok(ExitCode::SUCCESS)
         }
 
@@ -334,21 +341,22 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         Command::Metrics { action: MetricsAction::Report { metric, labels, by, since, profile } } => {
             let profile = profile.resolve().map_err(|e| e.to_string())?;
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
-            println!("{}", metrics::report(&base_dir, &metric, &labels, by, since, now_ms() as i64)?);
+            println!("{}", metrics::report(language(&base_dir), &base_dir, &metric, &labels, by, since, now_ms() as i64)?);
             Ok(ExitCode::SUCCESS)
         }
 
         Command::Projects { action: ProjectsAction::Add { path, profile } } => {
             let profile = profile.resolve().map_err(|e| e.to_string())?;
-            let unavailable = |e: ClientError| memories::explain_unavailable(&e, profile);
             // The daemon owns the store and does the indexing; with none
             // running, nothing is started and the store is not opened.
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let lang = language(&base_dir);
+            let unavailable = |e: ClientError| memories::explain_unavailable(lang, &e, profile);
             let client = match probe_running(&base_dir, false).await.map_err(unavailable)? {
                 Probe::Running(client) => client,
                 Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
             };
-            let added = projects::add(&client, &path).await.map_err(|e| match e {
+            let added = projects::add(lang, &client, &path).await.map_err(|e| match e {
                 projects::AddError::Client(e) => unavailable(e),
                 other => other.to_string(),
             })?;
@@ -358,14 +366,15 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
 
         Command::Projects { action: ProjectsAction::Move(opts) } => {
             let profile = opts.profile.resolve().map_err(|e| e.to_string())?;
-            let unavailable = |e: ClientError| memories::explain_unavailable(&e, profile);
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let lang = language(&base_dir);
+            let unavailable = |e: ClientError| memories::explain_unavailable(lang, &e, profile);
             let client = match probe_running(&base_dir, false).await.map_err(unavailable)? {
                 Probe::Running(client) => client,
                 Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
             };
             let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-            let moved = projects::move_memories(&client, &opts, &cwd).await.map_err(|e| match e {
+            let moved = projects::move_memories(lang, &client, &opts, &cwd).await.map_err(|e| match e {
                 projects::AddError::Client(e) => unavailable(e),
                 other => other.to_string(),
             })?;
@@ -375,11 +384,12 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
 
         Command::Memories { action } => {
             let profile = action.profile().resolve().map_err(|e| e.to_string())?;
-            let unavailable = |e: ClientError| memories::explain_unavailable(&e, profile);
 
             // No autostart: reading must not launch a process, and a daemon
             // the user did not ask for would also hold the store lock.
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let lang = language(&base_dir);
+            let unavailable = |e: ClientError| memories::explain_unavailable(lang, &e, profile);
             let client = match probe_running(&base_dir, false)
                 .await
                 .map_err(unavailable)?
@@ -387,7 +397,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 Probe::Running(client) => client,
                 Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
             };
-            let out = memories::run(&client, action, now_ms() as i64)
+            let out = memories::run(lang, &client, action, now_ms() as i64)
                 .await
                 .map_err(unavailable)?;
             println!("{out}");
