@@ -51,7 +51,7 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 ## 9. Docs
 
-- [ ] `.claude/CLAUDE.md`: el comando, la API, la columna, el filtro y cómo exportar todo (`engram export --all`) fuera del repo.
+- [x] `.claude/CLAUDE.md`: el comando, la API, la columna, el filtro y cómo exportar todo (`engram export --all`) fuera del repo; `README.md`: traer memorias de otra herramienta, el mapeo y que `migrated` sólo nombra al autor.
 - Commit: `docs: describe importing memories from another tool`
 
 ## 10. Verificación
