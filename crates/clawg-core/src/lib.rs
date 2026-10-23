@@ -8,6 +8,7 @@ pub mod memory;
 pub mod metrics;
 pub mod models;
 pub mod paths;
+pub mod preferences;
 pub mod private_dir;
 /// Host-agnostic assembly of the memory substrate — the store, the ingest
 /// channel and the background workers, without any UI runtime.
