@@ -1,0 +1,14 @@
+change: cli-language
+objective: "1"
+depends_on: [language-preference]
+phase: apply
+artifacts:
+  exploration: done  # la parte B de la exploración de language-preference
+  proposal: done
+  spec: done
+  design: skipped  # las decisiones 6 y 10 de la exploración; la propuesta las concreta
+  tasks: done
+  apply: in_progress
+  verify: pending
+  archive: pending
+updated: 2026-10-23
