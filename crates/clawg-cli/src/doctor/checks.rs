@@ -308,6 +308,73 @@ pub fn sharing(error: Option<&str>, profile: Profile) -> Vec<Finding> {
     }
 }
 
+/// What `preferences.json` is, as `doctor` reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreferencesState {
+    Missing,
+    Readable,
+    /// Why it cannot be used, as the user is shown it.
+    Invalid(String),
+}
+
+/// Only a file that exists is checked: without one, clawg behaves as it did
+/// before preferences, and saying so in every report would be noise.
+pub fn preferences(state: &PreferencesState, path: &Path) -> Vec<Finding> {
+    match state {
+        PreferencesState::Missing => Vec::new(),
+        PreferencesState::Readable => vec![Finding::ok("preferences", "the preferences are readable")],
+        PreferencesState::Invalid(error) => vec![Finding::new(
+            "preferences",
+            Severity::Warn,
+            "invalid",
+            format!("{error}; clawg goes on without a language preference until it is fixed or removed"),
+        )
+        .evidence(json!({ "path": path, "error": error }))],
+    }
+}
+
+/// What the user's `CLAUDE.md` holds of clawg's protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockState {
+    Missing,
+    /// The file could not be read, or has a marker without its pair.
+    Unreadable(String),
+    /// The block from its first marker to the end of its last.
+    Installed(String),
+}
+
+/// Whether the installed block is the one `clawg setup claude-code` would
+/// write now (`wanted`), line endings aside. A block that differs may hold
+/// another language's rules or an older clawg's protocol; the remedy is the
+/// same.
+pub fn protocol_block(state: &BlockState, wanted: &str, path: &Path, profile: Profile) -> Vec<Finding> {
+    let setup = with_profile("clawg setup claude-code", profile);
+    let finding = match state {
+        BlockState::Installed(text) if text.replace("\r\n", "\n") == wanted.replace("\r\n", "\n") => {
+            Finding::ok("protocol_block", "the protocol block of CLAUDE.md is the one clawg setup writes")
+        }
+        BlockState::Installed(_) => Finding::new(
+            "protocol_block",
+            Severity::Warn,
+            "stale",
+            "the protocol block of CLAUDE.md is not the one clawg setup writes for the preferred language, \
+             so the agent may read other rules there than in the server's instructions",
+        )
+        .step(setup),
+        BlockState::Missing => Finding::new(
+            "protocol_block",
+            Severity::Info,
+            "not_installed",
+            "CLAUDE.md has no clawg protocol block; the agent reads the preferred language only in the server's instructions",
+        )
+        .step(setup),
+        BlockState::Unreadable(error) => {
+            Finding::new("protocol_block", Severity::Warn, "unreadable", format!("cannot check the protocol block: {error}"))
+        }
+    };
+    vec![finding.evidence(json!({ "path": path }))]
+}
+
 /// Pending rows with a daemon running are being stored; without one, they
 /// wait for the next start.
 pub fn outbox(facts: &OutboxFacts, daemon_running: bool, profile: Profile) -> Vec<Finding> {
@@ -651,6 +718,35 @@ mod tests {
         let bad = sharing(Some("sharing.json has version 2; this clawg reads version 1"), P);
         assert_eq!(kinds(&bad), [("sharing", Severity::Warn, "invalid")]);
         assert_eq!(bad[0].safe_next_step.as_deref(), Some("clawg sharing --profile dev"));
+    }
+
+    #[test]
+    fn preferences_findings() {
+        let path = Path::new("/d/preferences.json");
+        assert!(preferences(&PreferencesState::Missing, path).is_empty(), "no file, no finding");
+        assert_eq!(kinds(&preferences(&PreferencesState::Readable, path)), [("preferences", Severity::Ok, "healthy")]);
+        let bad = preferences(&PreferencesState::Invalid("preferences.json has version 2; this clawg reads version 1".into()), path);
+        assert_eq!(kinds(&bad), [("preferences", Severity::Warn, "invalid")]);
+        assert!(bad[0].message.contains("version 2") && bad[0].message.contains("without a language preference"), "{}", bad[0].message);
+        assert_eq!(bad[0].safe_next_step, None, "the file is the user's to fix");
+        assert_eq!(bad[0].evidence["path"], "/d/preferences.json");
+    }
+
+    #[test]
+    fn protocol_block_findings() {
+        let path = Path::new("/home/u/.claude/CLAUDE.md");
+        let wanted = "<!-- BEGIN -->\nrules\n<!-- END -->";
+        let ok = protocol_block(&BlockState::Installed(wanted.replace('\n', "\r\n")), wanted, path, P);
+        assert_eq!(kinds(&ok), [("protocol_block", Severity::Ok, "healthy")]);
+        let stale = protocol_block(&BlockState::Installed("<!-- BEGIN -->\nold\n<!-- END -->".into()), wanted, path, P);
+        assert_eq!(kinds(&stale), [("protocol_block", Severity::Warn, "stale")]);
+        assert_eq!(stale[0].safe_next_step.as_deref(), Some("clawg setup claude-code --profile dev"));
+        let missing = protocol_block(&BlockState::Missing, wanted, path, P);
+        assert_eq!(kinds(&missing), [("protocol_block", Severity::Info, "not_installed")]);
+        assert_eq!(missing[0].safe_next_step.as_deref(), Some("clawg setup claude-code --profile dev"));
+        let unreadable = protocol_block(&BlockState::Unreadable("a lone marker".into()), wanted, path, P);
+        assert_eq!(kinds(&unreadable), [("protocol_block", Severity::Warn, "unreadable")]);
+        assert_eq!(unreadable[0].evidence["path"], "/home/u/.claude/CLAUDE.md");
     }
 
     #[test]

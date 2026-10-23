@@ -21,6 +21,7 @@ Fuente de verdad del comportamiento actual del puente `clawg mcp`: cómo abre un
 - [agent-lifecycle-hooks](../../changes/archive/2026-10-18-agent-lifecycle-hooks/proposal.md), archivado el 2026-10-18 (sólo el estado `recent` en «`recall_context` dice si buscó memorias» y la `query` opcional de `POST /v1/context`).
 - [session-handoff](../../changes/archive/2026-10-19-session-handoff/proposal.md), archivado el 2026-10-19 (sólo lo que el protocolo completo dice de LAST SESSION).
 - [protected-verdicts](../../changes/archive/2026-10-20-protected-verdicts/proposal.md), archivado el 2026-10-20 (sólo `user_answered` en «Los conflictos en las herramientas», la respuesta del usuario en la apertura y su largo).
+- [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23 (desde «LP8. La línea del otro idioma» hasta el final). La preferencia está en [`specs/preferences`](../preferences/spec.md).
 
 ## Definiciones
 
@@ -430,3 +431,45 @@ La descripción de `save_memory` (`server.rs:1074-1082`) MUST pedir una primera 
 `update_memory` MUST tomar `to_project_path` (una ruta cuyo proyecto es el destino, registrado antes como toda ruta que nombra una herramienta, y que tiene que ser un directorio) o `clear_project` (sin proyecto), no los dos; ausentes, el proyecto no cambia. El nombre no es `project_path` porque en las otras herramientas su ausencia es el proyecto del puente. La descripción MUST decir que la memoria se mueve con su save y su historia, y no a donde el mismo texto o clave están vivos; `protocol.md` MUST decir cuándo usarla. Tras un movimiento, la respuesta MUST nombrar el proyecto en que quedó la fila (o que está sin proyecto, donde la encuentran todos) y las filas que se movieron con ella (`format_update`).
 
 **Test:** `update_memory_moves_a_save_to_the_project_of_a_path`, `update_memory_clears_the_project` y `update_memory_refuses_both_destinations_and_a_path_that_is_not_a_directory` (`server.rs`); `format_update_names_where_the_row_ended` (`tools.rs`); `the_agent_contract_matches_its_file`.
+
+## LP8. La línea del otro idioma
+
+Con preferencia, `search_memory` y `recall_context` con consulta MUST mandar `lang` y MUST agregar, al final de su respuesta, una línea que dice cuántas memorias del alcance están en el otro idioma y que, si lo mostrado no responde, se busque otra vez con la consulta en ese idioma, cuando `other_language.memories` es mayor que cero y la búsqueda mostró menos de `FEW_SHOWN` (3) memorias, ninguna incluida (`other_language_line`, `crates/clawg-cli/src/mcp/tools.rs:96-110`). En cualquier otro caso MUST NOT agregarla. `FEW_SHOWN` no está medido.
+
+#### Escenario: una búsqueda pobre
+- GIVEN la preferencia `es` y 12 memorias en inglés en el alcance
+- WHEN `search_memory` muestra una memoria, o dice `no relevant memories for this query`
+- THEN la respuesta termina con la línea, que nombra 12 y el inglés
+
+#### Escenario: cuándo no sale
+- WHEN la búsqueda muestra tres memorias o más, el conteo es cero, no hay preferencia, o el daemon no manda `other_language`
+- THEN la respuesta es la de antes
+
+**Test:** `a_poor_search_names_the_memories_in_the_other_language`, `a_search_that_shows_enough_says_nothing_of_the_other_language`, `no_memories_in_the_other_language_means_no_line`, `without_a_preference_no_line`, `a_daemon_without_the_count_means_no_line` y `recall_context_names_the_other_language_after_a_poor_context` (`tools.rs`); `search_memory_sends_the_bridges_language` (`server.rs`).
+
+## LP9. Las instrucciones y el protocolo con preferencia
+
+`crates/clawg-cli/src/mcp/protocol.rs` es dueño del texto (`PROTOCOL`, `opening`, `text`), para el puente y para `setup`. Con preferencia, `text` (`protocol.rs:50`) MUST dar `protocol.md` con dos cambios: la frase de la apertura que pide guardar y buscar en inglés pide hacerlo en el idioma preferido y suma que se le responda a la persona en ese idioma salvo que escriba en otro; y la línea de «How to write a save» pide guardar y buscar en el idioma preferido y, cuando una búsqueda diga que quedan memorias en el otro idioma, buscar otra vez con la consulta en él. Cada una de las dos reglas MUST aparecer una sola vez en `protocol.md`, aunque cruce saltos de línea. Sin preferencia, `text` es el archivo tal cual. Las instrucciones del servidor MUST ser la apertura de ese texto y MUST caber en 2.048 caracteres con cada idioma. El protocolo MUST seguir nombrando sólo herramientas, argumentos y tipos que existen. El puente MUST leer la preferencia una vez, al arrancar (`ClawgMcp::with_language`, `crates/clawg-cli/src/mcp/server.rs:449`, desde `crates/clawg-cli/src/mcp/mod.rs:132`).
+
+#### Escenario: español
+- GIVEN la preferencia `es`
+- THEN las instrucciones dicen `in Spanish` donde sin preferencia dicen `in English`, nombran cómo responderle a la persona, no dicen `in English` y miden 2.048 caracteres o menos
+
+#### Escenario: la sesión no cambia sola
+- GIVEN un puente arrancado con la preferencia `en`
+- WHEN el archivo pasa a decir `es`
+- THEN sus instrucciones y sus búsquedas siguen en `en`
+
+**Test:** `the_instructions_follow_the_preferred_language`, `the_instructions_fit_older_clients` y `the_protocol_names_only_what_exists` para cada idioma, y `the_bridge_keeps_the_language_it_started_with` (`server.rs`); `the_language_rules_occur_once_in_the_protocol` (`protocol.rs`). `agent_contract.json` fija el servidor sin preferencia.
+
+## LP10. La descripción de `search_memory`
+
+La descripción de `search_memory` MUST NOT decir que encuentra memorias escritas en otro idioma, y MUST decir que una memoria en otro idioma que la consulta suele no encontrarse. Vale con preferencia y sin ella.
+
+**Test:** `search_memory_does_not_promise_other_languages` (`server.rs`); `the_agent_contract_matches_its_file`.
+
+## LP11. El idioma en `memory_status`
+
+Con preferencia al arrancar, `memory_status` MUST decir el idioma de la sesión. Cuando `preferences.json` dice otro idioma que el de la sesión (o una preferencia que la sesión no tenía, o ninguna) MUST decir el actual y que se aplica en una sesión nueva. Sin preferencia al arrancar ni ahora, MUST NOT agregar nada (`format_language`, `tools.rs:656`).
+
+**Test:** `memory_status_names_the_sessions_language`, `memory_status_says_when_the_preference_changed` y `memory_status_without_a_preference_says_nothing_of_it` (`tools.rs`); `memory_status_names_the_language_of_the_session` (`server.rs`).

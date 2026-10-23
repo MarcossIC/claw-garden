@@ -699,7 +699,7 @@ mod tests {
 
         let after = conn.call(snapshot).await.unwrap();
         assert_eq!(before, after);
-        assert_eq!(after.0, 21);
+        assert_eq!(after.0, 22);
     }
 
     /// Rows written before `project` existed keep their project ids when the
@@ -1477,6 +1477,68 @@ mod tests {
         assert_eq!(logged, 0);
     }
 
+    /// No row said its language before the column, so a store from before it
+    /// opens with every row as it was and the column empty, for the
+    /// maintenance pass to fill.
+    #[tokio::test]
+    async fn a_store_from_before_the_language_column_keeps_its_rows_and_gains_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), Some(21)).await;
+        let conn = Connection::open(dir.path().join("memory.db")).await.unwrap();
+        conn.call(|c| {
+            for (id, agent, content, status, deleted, key) in [
+                (10, Some("a"), "The daemon stores every memory in one transaction.", "active", None, Some("storage/engine")),
+                (11, Some("b"), "El daemon guarda cada memoria en una sola transacción.", "superseded", None, None),
+                (12, None, "Una nota que no guardó ningún agente.", "active", None, None),
+                (13, Some("a"), "A deleted row that can come back.", "active", Some(13), None),
+            ] {
+                c.execute(
+                    "INSERT INTO memory \
+                     (id, scope, agent_id, project_id, content, memory_type, source, \
+                      created_at, created_by_type, created_by_ref, \
+                      last_modified_at, last_accessed_at, importance, tier, status, deleted_at, topic_key) \
+                     VALUES (?1, CASE WHEN ?2 IS NULL THEN 'project' ELSE 'agent' END, ?2, 'p', ?3, 'semantic_fact', \
+                      'explicit', ?1, 'agent', 'x', ?1, ?1, 5.0, 3, ?4, ?5, ?6)",
+                    rusqlite::params![id, agent, content, status, deleted, key],
+                )?;
+            }
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+        conn.close().await.unwrap();
+
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        type Row = (i64, Option<String>, String, String, Option<i64>, Option<String>, Option<String>);
+        let (rows, indexes): (Vec<Row>, Vec<String>) = store
+            .conn
+            .call(|c| -> rusqlite::Result<_> {
+                let mut stmt = c.prepare(
+                    "SELECT id, agent_id, content, status, deleted_at, topic_key, lang FROM memory WHERE id >= 10 ORDER BY id",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?
+                    .collect::<rusqlite::Result<_>>()?;
+                let mut stmt = c.prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'memory' \
+                     AND name LIKE 'idx_memory_lang%' ORDER BY name",
+                )?;
+                let indexes = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+                Ok((rows, indexes))
+            })
+            .await
+            .unwrap();
+        let contents: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
+        assert_eq!(contents.len(), 4, "migrating loses no row");
+        assert_eq!(rows[0].5.as_deref(), Some("storage/engine"));
+        assert_eq!((rows[1].3.as_str(), rows[3].4), ("superseded", Some(13)));
+        assert!(rows.iter().all(|r| r.6.is_none()), "no row is classified by the migration: {rows:?}");
+        assert_eq!(indexes, ["idx_memory_lang", "idx_memory_lang_unset"]);
+        let snapshots = std::fs::read_dir(crate::paths::backups_dir(dir.path())).unwrap().count();
+        assert_eq!(snapshots, 1, "the pre-migration snapshot is the way back");
+    }
+
     #[tokio::test]
     async fn a_store_from_before_the_warning_mark_keeps_its_pairs_unmarked() {
         ensure_vec0_registered();
@@ -1941,7 +2003,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 21, "Expected exactly 21 applied migrations, got {}", count);
+        assert_eq!(count, 22, "Expected exactly 22 applied migrations, got {}", count);
     }
 
     /// V8 — a fresh store records V8 as applied and carries the FTS5 lexical
@@ -2402,7 +2464,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 21);
+        assert_eq!(migration_count, 22);
     }
 
     // -----------------------------------------------------------------------

@@ -197,13 +197,14 @@ fn read_memories(c: &Connection, filter: &ExportFilter) -> rusqlite::Result<Vec<
         "SELECT id, scope, agent_id, project_id, content, memory_type, source, created_at, created_by_type, \
          created_by_ref, source_session_id, last_modified_at, last_modified_by, update_count, last_accessed_at, \
          access_count, importance, tier, status, superseded_by, {}, dispute_count, disputed_against, \
-         last_disputed_at, deleted_at, {}, {} \
+         last_disputed_at, deleted_at, {}, {}, {} \
          FROM memory \
          WHERE (?1 IS NULL OR project_id = ?1) AND (?2 IS NULL OR agent_id = ?2) AND (?3 OR deleted_at IS NULL) \
          ORDER BY id",
         or_null("supersede_cause"),
         or_null("topic_key"),
         or_null("revived_from"),
+        or_null("lang"),
     );
     let mut stmt = c.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params![filter.project_id, filter.agent, filter.include_deleted], |r| {
@@ -238,6 +239,7 @@ fn read_memories(c: &Connection, filter: &ExportFilter) -> rusqlite::Result<Vec<
             deleted_at: r.get(24)?,
             topic_key: r.get(25)?,
             revived_from: r.get(26)?,
+            lang: r.get(27)?,
         })
     })?;
     rows.collect()
@@ -327,6 +329,23 @@ mod tests {
         assert_eq!(row(10).source, "synthesis");
         let seventeen = row(17);
         assert_eq!((seventeen.scope.as_str(), seventeen.agent_id.clone()), ("project", None));
+    }
+
+    #[tokio::test]
+    async fn an_export_carries_the_language_of_each_row() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed(&store).await;
+        store.conn.call(|c| c.execute("UPDATE memory SET lang = 'es' WHERE id = 2", [])).await.unwrap();
+        let exported = store
+            .conn
+            .call(|c| Ok::<_, rusqlite::Error>(read(c, &ExportFilter::default(), 0)))
+            .await
+            .unwrap()
+            .unwrap();
+        let lang = |id: i64| exported.memories.iter().find(|m| m.id == id).unwrap().lang.clone();
+        assert_eq!((lang(2), lang(3)), (Some("es".to_string()), None), "a row not yet classified exports null");
+        let (_, parsed) = parse(&exported.to_jsonl()).unwrap();
+        assert_eq!(parsed.memories.into_iter().map(|(_, m)| m).collect::<Vec<_>>(), exported.memories);
     }
 
     #[tokio::test]

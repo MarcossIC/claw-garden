@@ -138,9 +138,10 @@ async fn answer_cases(
                 agent_id: AGENT_ID.to_string(),
                 project_id: None,
                 limit: None,
+                lang: None,
             })
             .await?;
-        let search_text = format_search(found, AGENT_ID, None);
+        let search_text = format_search(found, AGENT_ID, None, None);
         let search_ms = elapsed_ms(started);
         let count_tokens = |line: &str| input.counter.count(line);
         let search_read = read_search(&search_text, &count_tokens, &case.expected_refs, corpus)
@@ -148,7 +149,7 @@ async fn answer_cases(
         let search_lines_printed = search_read.lines.len();
 
         let started = Instant::now();
-        let prompt = session.client.context(&case.query, AGENT_ID, None, None).await?.prompt;
+        let prompt = session.client.context(&case.query, AGENT_ID, None, None, None).await?.prompt;
         let context_text = format_context(&prompt);
         let context_ms = elapsed_ms(started);
         let context_found = read_context(&context_text, &case.expected_refs, corpus);

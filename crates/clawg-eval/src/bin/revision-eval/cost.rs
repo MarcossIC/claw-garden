@@ -95,7 +95,7 @@ pub fn search_pair(found: &Found, reader: &str, project: &str, fallback: Option<
     for hit in &mut without.hits {
         hit.topic_key = None;
     }
-    (format_search(without, reader, Some(project)), format_search(with, reader, Some(project)))
+    (format_search(without, reader, Some(project), None), format_search(with, reader, Some(project), None))
 }
 
 /// What a set of outputs weighs without the keys and with them.

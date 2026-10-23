@@ -5,6 +5,7 @@ Fuente de verdad del comportamiento actual de `clawg setup <cliente>`: el subcom
 **Origen:**
 - [client-setup](../../changes/archive/2026-10-19-client-setup/proposal.md), archivado el 2026-10-19. Los ids de requisito son los de esa spec; el porqué de cada decisión está en su [diseño](../../changes/archive/2026-10-19-client-setup/design.md).
 - [setup-exec-hooks](../../changes/archive/2026-10-19-setup-exec-hooks/proposal.md), archivado el 2026-10-19: los hooks en forma exec y la migración de la forma heredada (R3, R6), la escritura por el destino de un enlace con el modo del archivo y la poda de copias (R7), y R8. El porqué, en su [diseño](../../changes/archive/2026-10-19-setup-exec-hooks/design.md): la forma de shell que reemplaza la había elegido client-setup porque `args` era nuevo, y un shell entre el cliente y clawg puede no ejecutar una ruta entre comillas (PowerShell, en Windows sin Git Bash) o imprimir antes del JSON del hook.
+- [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23: el bloque del protocolo sigue la preferencia del perfil (LP13).
 
 ## Definiciones
 
@@ -105,6 +106,12 @@ Cada archivo MUST escribirse por un temporal en el directorio del archivo real y
 - THEN `clawg` sale con 1 y la sesión no se bloquea
 
 **Tests:** `a_bare_clawg_never_blocks` (`cli.rs`), `a_bare_clawg_exits_1` (`tests/binary.rs`).
+
+## LP13. El bloque sigue la preferencia
+
+`clawg setup claude-code` MUST escribir entre los marcadores el protocolo de [`specs/mcp`](../mcp/spec.md) LP9 para la preferencia del perfil (`protocol::text`; el archivo tal cual sin preferencia), que `read_state` lee en `State.language`. Con un bloque instalado para otro idioma MUST reescribirlo, y `--dry-run` MUST decirlo sin escribir.
+
+**Test:** `the_block_follows_the_preferred_language` y `another_language_rewrites_the_block` (`setup.rs`, sobre `plan`).
 
 ## Verificación
 

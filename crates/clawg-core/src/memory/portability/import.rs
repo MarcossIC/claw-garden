@@ -28,6 +28,7 @@ use crate::memory::clock::TimestampMs;
 use crate::memory::dedup::content_hash;
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::identity::derive_project_id;
+use crate::memory::language;
 use crate::memory::portability::format::{parse, FormatError, Invalid, MemoryLine, Parsed};
 use crate::memory::redact::redact;
 use crate::memory::vector::to_unit;
@@ -255,8 +256,9 @@ const TOPIC_HOLDERS_SQL: &str = "SELECT id FROM memory \
 const INSERT_SQL: &str = "INSERT INTO memory \
      (scope, agent_id, project_id, content, memory_type, source, created_at, created_by_type, created_by_ref, \
       source_session_id, last_modified_at, last_modified_by, update_count, last_accessed_at, access_count, \
-      importance, tier, status, superseded_by, supersede_cause, dispute_count, last_disputed_at, content_hash, topic_key) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)";
+      importance, tier, status, superseded_by, supersede_cause, dispute_count, last_disputed_at, content_hash, topic_key, \
+      lang) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)";
 
 /// Records each project, and returns the ids that already belong to another
 /// root, with that root.
@@ -342,6 +344,9 @@ fn place(
         src.last_disputed_at,
         row.hash,
         src.topic_key,
+        // Read from the text stored here, never from the file's `lang`: a
+        // file cannot say what its text does not.
+        language::column_value(language::detect(&row.content)),
     ])?;
     let id = tx.last_insert_rowid();
     match src.deleted_at {
@@ -923,6 +928,45 @@ mod tests {
         let hash_matches = count(&dst, "SELECT count(*) FROM memory WHERE content_hash = content_hash(content)").await;
         assert_eq!(hash_matches, 2);
         assert_eq!(count(&dst, "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH 'fridays'").await, 1);
+    }
+
+    /// `EXAMPLE` with its one memory live, so the import inserts it.
+    fn live_example() -> String {
+        EXAMPLE.replace("\"status\":\"superseded\",\"superseded_by\":9", "\"status\":\"active\",\"superseded_by\":null")
+    }
+
+    async fn imported_lang(dst: &MemoryStore, needle: &'static str) -> Option<String> {
+        dst.conn
+            .call(move |c| {
+                c.query_row("SELECT lang FROM memory WHERE instr(content, ?1) > 0", [needle], |r| r.get(0))
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_import_computes_the_language_whatever_the_file_says() {
+        let file = live_example()
+            .replace(
+                "\"content\":\"Storage engine: SQLite with WAL\"",
+                "\"content\":\"El motor de almacenamiento es SQLite con WAL, y se eligió por su única conexión de escritura.\"",
+            )
+            .replace("\"lang\":\"und\"", "\"lang\":\"en\"");
+        let dst = destination().await;
+        let (report, _) = run(&dst, &file, ImportOptions::default()).await;
+        assert!(report.invalid.is_empty(), "a line with lang parses: {report:#?}");
+        assert_eq!(report.inserted, 1);
+        assert_eq!(imported_lang(&dst, "motor de almacenamiento").await.as_deref(), Some("es"));
+    }
+
+    #[tokio::test]
+    async fn an_export_without_languages_imports() {
+        let dst = destination().await;
+        let older = live_example().replacen(",\"lang\":\"und\"", "", 1);
+        assert!(!older.contains("\"lang\""));
+        let (report, _) = run(&dst, &older, ImportOptions::default()).await;
+        assert_eq!((report.inserted, report.invalid.len()), (1, 0), "{report:#?}");
+        assert_eq!(imported_lang(&dst, "Storage engine").await.as_deref(), Some("und"), "too few words to tell");
     }
 
     #[tokio::test]

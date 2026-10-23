@@ -33,9 +33,9 @@ pub const AGENT: &str = "claude-code";
 pub const BEGIN_MARKER: &str = "<!-- BEGIN CLAWG MEMORY PROTOCOL -->";
 pub const END_MARKER: &str = "<!-- END CLAWG MEMORY PROTOCOL -->";
 
-/// What the agent is told about memory, the same text the MCP server's
-/// instructions open with.
-const PROTOCOL: &str = include_str!("mcp/protocol.md");
+use clawg_core::preferences::{self, Lang};
+
+use crate::mcp::protocol;
 
 const SESSION_START_MATCHER: &str = "startup|resume|clear|compact";
 
@@ -76,6 +76,8 @@ pub struct State {
     pub settings: File,
     /// The user `CLAUDE.md`, where the protocol goes.
     pub instructions: File,
+    /// The profile's preferred language, which the protocol's rules name.
+    pub language: Option<Lang>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -235,7 +237,7 @@ pub fn plan(state: &State, mode: Mode) -> Result<Plan, SetupError> {
     };
     let other_registered = registered(other.mcp_server_name()).is_some_and(is_clawg_server);
     let (block, instructions) = match mode {
-        Mode::Install => install_block(&state.instructions)?,
+        Mode::Install => install_block(&state.instructions, state.language)?,
         Mode::Remove if other_registered => {
             find_block(&state.instructions)?;
             (BlockStep::Kept, FileStep::Unchanged)
@@ -554,9 +556,10 @@ fn line_ending(text: &str) -> &'static str {
     }
 }
 
-/// The protocol between its markers, without a final line ending.
-fn block(eol: &str) -> String {
-    let protocol = PROTOCOL.replace("\r\n", "\n");
+/// The protocol for `language` ([`protocol::text`]) between its markers,
+/// without a final line ending.
+pub(crate) fn block(eol: &str, language: Option<Lang>) -> String {
+    let protocol = protocol::text(language).replace("\r\n", "\n");
     let body = protocol.trim_end().replace('\n', eol);
     format!("{BEGIN_MARKER}{eol}{body}{eol}{END_MARKER}")
 }
@@ -564,7 +567,7 @@ fn block(eol: &str) -> String {
 /// Where the block is in the file: from its first marker to the end of its
 /// last. A marker without its pair is an error, since there is no knowing
 /// where clawg's text ends.
-fn find_block(file: &File) -> Result<Option<(usize, usize)>, SetupError> {
+pub(crate) fn find_block(file: &File) -> Result<Option<(usize, usize)>, SetupError> {
     let Some(text) = &file.text else { return Ok(None) };
     let lone = || SetupError::LoneMarker { path: file.path.clone() };
     match (text.find(BEGIN_MARKER), text.find(END_MARKER)) {
@@ -580,13 +583,13 @@ fn find_block(file: &File) -> Result<Option<(usize, usize)>, SetupError> {
     }
 }
 
-fn install_block(file: &File) -> Result<(BlockStep, FileStep), SetupError> {
+fn install_block(file: &File, language: Option<Lang>) -> Result<(BlockStep, FileStep), SetupError> {
     let range = find_block(file)?;
     let Some(text) = &file.text else {
-        return Ok((BlockStep::Added, FileStep::Write(block("\n") + "\n")));
+        return Ok((BlockStep::Added, FileStep::Write(block("\n", language) + "\n")));
     };
     let eol = line_ending(text);
-    let wanted = block(eol);
+    let wanted = block(eol, language);
     if let Some((begin, end)) = range {
         if text[begin..end] == wanted {
             return Ok((BlockStep::Unchanged, FileStep::Unchanged));
@@ -645,10 +648,23 @@ fn read(path: PathBuf) -> Result<File, SetupError> {
     }
 }
 
-/// Reads what [`plan`] decides from.
-pub fn read_state(exe: PathBuf, profile: Profile, home: Option<&Path>, config_dir: Option<OsString>) -> Result<State, SetupError> {
+/// Reads what [`plan`] decides from, the preferred language from `data_dir`.
+pub fn read_state(
+    exe: PathBuf,
+    profile: Profile,
+    home: Option<&Path>,
+    config_dir: Option<OsString>,
+    data_dir: &Path,
+) -> Result<State, SetupError> {
     let (servers, settings, instructions) = locations(home, config_dir)?;
-    Ok(State { exe, profile, servers: read(servers)?, settings: read(settings)?, instructions: read(instructions)? })
+    Ok(State {
+        exe,
+        profile,
+        servers: read(servers)?,
+        settings: read(settings)?,
+        instructions: read(instructions)?,
+        language: preferences::language_in(data_dir),
+    })
 }
 
 /// The first `claude` the PATH resolves to.
@@ -974,7 +990,7 @@ pub fn run_in(
 pub fn run(profile: Profile, mode: Mode, dry_run: bool) -> Result<(String, u8), SetupError> {
     let base_dir = clawg_core::paths::data_dir(profile).map_err(|_| SetupError::NoHome)?;
     let home = clawg_core::paths::home_dir();
-    let state = read_state(current_exe()?, profile, home.as_deref(), std::env::var_os("CLAUDE_CONFIG_DIR"))?;
+    let state = read_state(current_exe()?, profile, home.as_deref(), std::env::var_os("CLAUDE_CONFIG_DIR"), &base_dir)?;
     let entries: Vec<PathBuf> = std::env::var_os("PATH").map(|raw| std::env::split_paths(&raw).collect()).unwrap_or_default();
     let claude = find_claude(&entries, Path::is_file);
     let now_ms = std::time::SystemTime::now()
@@ -1017,6 +1033,7 @@ mod tests {
             servers: file(".claude.json", servers),
             settings: file("settings.json", settings),
             instructions: file("CLAUDE.md", instructions),
+            language: None,
         }
     }
 
@@ -1253,16 +1270,37 @@ mod tests {
     }
 
     #[test]
+    fn the_block_follows_the_preferred_language() {
+        let spanish = State { language: Some(Lang::Es), ..state(None, None, None) };
+        let plan_ = plan(&spanish, Mode::Install).unwrap();
+        let text = written(&plan_.instructions);
+        assert!(text.contains("Save memories and search in Spanish"), "{text}");
+        assert!(text.contains("Reply to the user in Spanish unless they write in another language"), "{text}");
+        assert_eq!(text, format!("{}\n", block("\n", Some(Lang::Es))));
+        assert_ne!(block("\n", Some(Lang::Es)), block("\n", None));
+    }
+
+    #[test]
+    fn another_language_rewrites_the_block() {
+        let installed = format!("# Mine\n\n{}\n", block("\n", None));
+        assert_eq!(plan(&state(None, None, Some(&installed)), Mode::Install).unwrap().block, BlockStep::Unchanged);
+        let spanish = State { language: Some(Lang::Es), ..state(None, None, Some(&installed)) };
+        let plan_ = plan(&spanish, Mode::Install).unwrap();
+        assert_eq!(plan_.block, BlockStep::Rewritten, "what a --dry-run reports, since it plans the same");
+        assert_eq!(written(&plan_.instructions), format!("# Mine\n\n{}\n", block("\n", Some(Lang::Es))));
+    }
+
+    #[test]
     fn the_block_is_appended_and_rewritten_in_place() {
         let mine = "# My rules\n\nUse tabs.\n";
         let plan_ = plan(&state(None, None, Some(mine)), Mode::Install).unwrap();
         let added = written(&plan_.instructions).to_string();
-        assert_eq!(added, format!("{mine}\n{}\n", block("\n")));
+        assert_eq!(added, format!("{mine}\n{}\n", block("\n", None)));
 
         let stale = format!("# My rules\n\n{BEGIN_MARKER}\nold protocol\n{END_MARKER}\n\nAfter.\n");
         let plan_ = plan(&state(None, None, Some(&stale)), Mode::Install).unwrap();
         assert_eq!(plan_.block, BlockStep::Rewritten);
-        assert_eq!(written(&plan_.instructions), format!("# My rules\n\n{}\n\nAfter.\n", block("\n")));
+        assert_eq!(written(&plan_.instructions), format!("# My rules\n\n{}\n\nAfter.\n", block("\n", None)));
 
         let crlf = "line one\r\nline two\r\n";
         let plan_ = plan(&state(None, None, Some(crlf)), Mode::Install).unwrap();
@@ -1372,7 +1410,7 @@ mod tests {
     #[test]
     fn remove_keeps_the_block_while_the_other_profile_is_registered() {
         let both = r#"{"mcpServers":{"clawg":{"command":"/opt/clawg/clawg","args":["mcp","--profile","prod"]},"clawg-dev":{"command":"/x/clawg","args":["mcp"]}}}"#;
-        let md = format!("{}\n", block("\n"));
+        let md = format!("{}\n", block("\n", None));
         let plan = plan(&state(Some(both), None, Some(&md)), Mode::Remove).unwrap();
         assert_eq!(plan.server_step, ServerStep::Remove);
         assert_eq!((plan.block, &plan.instructions), (BlockStep::Kept, &FileStep::Unchanged));

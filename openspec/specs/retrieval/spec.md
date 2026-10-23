@@ -19,6 +19,7 @@ Fuente de verdad del comportamiento actual de la recuperación: el corte relativ
 - [untrusted-recall](../../changes/archive/2026-10-20-untrusted-recall/proposal.md), archivado el 2026-10-20 (sólo «Texto guardado», «Salto de línea» y «Margen» en «Definiciones», el margen en «Línea de hit en `recall_context`» y en «Conflictos por referencia», «Un texto copiado al workspace no rompe `workspace.md`», y lo que cambian en el presupuesto, el parser de `rag-eval --agent-view`, «Medición del contexto», «Invariantes» y «Fuera de esta spec»; cómo se muestra el autor está en [`specs/sharing`](../sharing/spec.md) R4, y qué raíz indexa sola el puente, en [`specs/project-docs`](../project-docs/spec.md)).
 - [context-hit-room](../../changes/archive/2026-10-22-context-hit-room/proposal.md), archivado el 2026-10-22 (sólo la reserva de los hits en «El prompt cumple el presupuesto» y en «El primer hit de un bloque se recorta en lugar de saltarse», y lo que cambia en «El contexto sin consulta»).
 - [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22 (sólo ACTIVE CONFLICTS en «Hits de otros agentes»: los pares de cualquier autor que el lector alcanza).
+- [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23 (sólo «`other_language` en la búsqueda y el contexto», LP7 de esa spec; la línea que el puente arma con el conteo está en [`specs/mcp`](../mcp/spec.md), LP8).
 
 ## Definiciones
 
@@ -672,3 +673,20 @@ Con un proyecto indexado ([`specs/project-docs`](../project-docs/spec.md)), `sea
 - Qué pares se disputan y cómo se resuelven: [`specs/disputes`](../disputes/spec.md). Acá sólo está cómo se imprimen.
 - Un id en los bullets del workspace. Hoy no lo tienen, y por eso una fila del workspace que está en un conflicto lleva su texto también en el bloque.
 - Una línea de un texto guardado que diga algo con forma de orden («ignorá lo anterior»). El margen impide imitar la estructura del prompt, no el contenido: eso lo cubren la frase de evidencia de las instrucciones del servidor y la nota `SHARED`. Tampoco hay un clasificador de «parece una instrucción», ni se distingue en la sección AUTO lo que dijo el usuario de lo que infirió el agente (`created_by_type`).
+
+## LP7. `other_language` en la búsqueda y el contexto
+
+**Alcance de una búsqueda:** las filas que la búsqueda puede devolver: las del proyecto pedido, las sin proyecto y toda `user_preference` (o todas, sin proyecto), que el lector alcanza según [`specs/sharing`](../sharing/spec.md). Un save de varias piezas cuenta como uno.
+
+`POST /v1/search` y `POST /v1/context` MUST aceptar `lang` (`es` o `en`; otro valor es un 400 antes de buscar). Con `lang`, `POST /v1/search` y `POST /v1/context` con una consulta no vacía MUST responder `other_language: {"lang": <el otro idioma>, "memories": N}`, con N la cantidad de saves vivos del alcance de esa búsqueda cuyo idioma es el otro (`count_saves_in`, `crates/clawg-core/src/memory/language.rs:34`, sobre `idx_memory_lang`; `other_language`, `crates/clawg-cli/src/daemon/api.rs:730`). Las filas `und` y NULL MUST NOT contar. Sin `lang`, o en un contexto sin consulta, el campo MUST NOT aparecer. El cliente MUST leer una respuesta sin el campo.
+
+#### Escenario: lo que cuenta
+- GIVEN en el proyecto A dos saves vivos en inglés, uno de tres piezas, uno borrado, uno reemplazado, uno en inglés de un autor que `sharing.json` oculta al lector, uno en inglés del proyecto B y una `user_preference` en inglés del proyecto B
+- WHEN el lector busca en A con `lang: "es"`
+- THEN `other_language` es `{"lang": "en", "memories": 3}`: los dos saves y la preferencia
+
+#### Escenario: sin el campo
+- WHEN la búsqueda no lleva `lang`, o el contexto no lleva consulta
+- THEN la respuesta no tiene `other_language`
+
+**Test:** `counting_the_other_language_follows_the_search_scope` (`language.rs`); `a_search_with_a_language_counts_the_other_one`, `a_search_without_a_language_has_no_count`, `an_unknown_language_is_a_bad_request` y `a_context_with_a_query_counts_the_other_language` (`tests/api.rs`); `a_search_answer_without_other_language_still_parses` (`client.rs`).

@@ -356,10 +356,11 @@ async fn read_router(
                 agent_id: AGENT.to_string(),
                 project_id: Some(PROJECT.to_string()),
                 limit: None,
+                lang: None,
             })
             .await?;
-        let search = format_search(found.clone(), AGENT, Some(PROJECT));
-        let prompt = client.context(&chain.query, AGENT, Some(PROJECT), None).await?.prompt;
+        let search = format_search(found.clone(), AGENT, Some(PROJECT), None);
+        let prompt = client.context(&chain.query, AGENT, Some(PROJECT), None, None).await?.prompt;
         let context = format_context(&prompt);
         shown.push(Shown { search: positions(own, &search_ids(&search)), context: positions(own, &context_ids(&context)) });
         queries.push(Query { found, prompt });

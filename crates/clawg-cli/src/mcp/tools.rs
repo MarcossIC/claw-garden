@@ -17,10 +17,11 @@ use clawg_core::memory::provenance::mark;
 use clawg_core::memory::sharing::{Reach, SharingError, SharingPolicy};
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
+use clawg_core::preferences::Lang;
 
 use crate::client::{
-    ConclusionReview, Context, Deleted, Found, Health, Hit, LostSource, MemoryRow, Restored, Retrieval, SavedText, Synthesis,
-    Updated,
+    ConclusionReview, Context, Deleted, Found, Health, Hit, LostSource, MemoryRow, OtherLanguage, Restored, Retrieval,
+    SavedText, Synthesis, Updated,
 };
 use crate::daemon::api::DocsSearchBody;
 use crate::relevance::{shown_hits, RELEVANCE_RATIO};
@@ -76,14 +77,47 @@ fn nothing_relevant(withheld: usize) -> String {
 }
 
 /// What `search_memory` hands the model for a search's answer, as `reader`,
-/// whose saves go to `save_project`.
-pub fn format_search(found: Found, reader: &str, save_project: Option<&str>) -> String {
+/// whose saves go to `save_project`, in a session whose preferred language
+/// is `language`.
+pub fn format_search(found: Found, reader: &str, save_project: Option<&str>, language: Option<Lang>) -> String {
     let returned = found.hits.len();
     let hits = relevant_hits(found.hits);
-    if hits.is_empty() && returned + found.withheld > 0 {
-        return nothing_relevant(returned + found.withheld);
+    let text = if hits.is_empty() && returned + found.withheld > 0 {
+        nothing_relevant(returned + found.withheld)
+    } else {
+        format_hits(&hits, reader, save_project)
+    };
+    with_other_language(text, language, found.other_language.as_ref(), hits.len())
+}
+
+/// Fewer memories shown than this, while the scope holds memories in the
+/// other language, and the answer says to search again in it. Not measured
+/// yet: the mixed-store measurement calibrates it.
+pub const FEW_SHOWN: usize = 3;
+
+/// `text`, then the line on the other language when it applies.
+fn with_other_language(text: String, language: Option<Lang>, other: Option<&OtherLanguage>, shown: usize) -> String {
+    match other_language_line(language, other, shown) {
+        Some(line) => format!("{text}\n\n{line}"),
+        None => text,
     }
-    format_hits(&hits, reader, save_project)
+}
+
+/// How many memories of the scope are in the other language and what to do
+/// about it, for a session with a preferred language whose search showed
+/// fewer than [`FEW_SHOWN`]. Nothing when no memory is left in the other
+/// language, which is how the second search stops being asked for.
+pub fn other_language_line(language: Option<Lang>, other: Option<&OtherLanguage>, shown: usize) -> Option<String> {
+    language?;
+    let other = other.filter(|o| o.memories > 0 && shown < FEW_SHOWN)?;
+    let name = Lang::parse(&other.lang)?.name();
+    let (count, finds) = match other.memories {
+        1 => ("1 memory in this scope is".to_string(), "a query finds a memory best in its own language"),
+        n => (format!("{n} memories in this scope are"), "a query finds memories best in their own language"),
+    };
+    Some(format!(
+        "clawg: {count} still in {name}, and {finds}: if this does not answer, search again with the query in {name}."
+    ))
 }
 
 /// Whether a save in `save_project` revises a row of `row_project` under its
@@ -538,8 +572,9 @@ fn retrieval_notice(retrieval: &Retrieval, has_context: bool) -> Option<String> 
 
 /// What `recall_context` hands the model: why memories were not searched when
 /// they were not, the context, then the reminder to synthesize when enough
-/// memories wait for it, and to review conclusions that lost a source.
-pub fn format_recall(context: &Context) -> String {
+/// memories wait for it, to review conclusions that lost a source, and, in a
+/// session with a preferred language, to search again in the other one.
+pub fn format_recall(context: &Context, language: Option<Lang>) -> String {
     let has_context = !context.prompt.trim().is_empty();
     let notice = context.retrieval.as_ref().and_then(|r| retrieval_notice(r, has_context));
     let text = match notice {
@@ -550,6 +585,11 @@ pub fn format_recall(context: &Context) -> String {
     let mut out = vec![text];
     out.extend(synthesis_nudge(context.unreviewed));
     out.extend(review_nudge(context.conclusions_to_review));
+    // Only after a search: a context that could not search has nothing a
+    // query in the other language would do better.
+    if let Some(Retrieval::Searched { hits, .. }) = &context.retrieval {
+        out.extend(other_language_line(language, context.other_language.as_ref(), *hits));
+    }
     out.join("\n\n")
 }
 
@@ -609,9 +649,31 @@ pub fn format_sharing(policy: &Result<SharingPolicy, SharingError>, reader: &str
     }
 }
 
+/// The `memory_status` line on language: the one this session kept from its
+/// start, and what `preferences.json` says now when that differs, since a
+/// change reaches only a new session. Nothing without a preference either
+/// way.
+pub fn format_language(session: Option<Lang>, now: Option<Lang>) -> Option<String> {
+    let named = |l: Option<Lang>| l.map_or("none", Lang::name);
+    match (session, now) {
+        (None, None) => None,
+        (Some(s), Some(n)) if s == n => Some(format!("language: {} (preferences.json)", s.name())),
+        (s, None) => Some(format!(
+            "language: {} for this session; preferences.json now sets none, which a new session uses",
+            named(s)
+        )),
+        (s, Some(n)) => Some(format!(
+            "language: {} for this session; preferences.json now says {}, which a new session uses",
+            named(s),
+            n.name()
+        )),
+    }
+}
+
 /// Renders `memory_status`: the daemon's health as pretty JSON, plus the
 /// facts health cannot carry — which data directory, profile and agent this
-/// bridge is attached to, and whose memories the agent reads.
+/// bridge is attached to, whose memories the agent reads, and the language
+/// line of [`format_language`] when there is one.
 pub fn format_status(
     health: &Health,
     profile: Profile,
@@ -620,6 +682,7 @@ pub fn format_status(
     origin: &str,
     sharing: &str,
     conflicts: Option<&str>,
+    language: Option<&str>,
 ) -> String {
     // `to_string_pretty` on a struct that always serializes cannot fail; the
     // fallback exists so this function has no panic in it rather than because
@@ -631,6 +694,9 @@ pub fn format_status(
         profile.as_str(),
         base_dir.display()
     );
+    if let Some(language) = language {
+        out.push_str(&format!("\n{language}"));
+    }
     if let Some(conflicts) = conflicts {
         out.push_str(&format!("\n{conflicts}"));
     }
@@ -681,11 +747,112 @@ mod tests {
 
     /// A search answer that held nothing back.
     fn shown(hits: Vec<Hit>) -> Found {
-        Found { hits, withheld: 0 }
+        Found { hits, withheld: 0, other_language: None }
     }
 
     fn ids(hits: &[Hit]) -> Vec<i64> {
         hits.iter().map(|h| h.id).collect()
+    }
+
+    // ── the other language ──────────────────────────────────────────────
+
+    fn other(lang: &str, memories: usize) -> Option<OtherLanguage> {
+        Some(OtherLanguage { lang: lang.into(), memories })
+    }
+
+    const TWELVE_IN_ENGLISH: &str = "clawg: 12 memories in this scope are still in English, and a query finds memories \
+                                     best in their own language: if this does not answer, search again with the query in English.";
+
+    #[test]
+    fn a_poor_search_names_the_memories_in_the_other_language() {
+        let found = Found { other_language: other("en", 12), ..shown(scored(&[0.5])) };
+        let out = format_search(found, "a", None, Some(Lang::Es));
+        assert!(out.ends_with(&format!("\n\n{TWELVE_IN_ENGLISH}")), "{out}");
+
+        let nothing = Found { hits: Vec::new(), withheld: 4, other_language: other("en", 1) };
+        let out = format_search(nothing, "a", None, Some(Lang::Es));
+        assert!(out.starts_with(NO_RELEVANT_MEMORIES), "{out}");
+        assert!(
+            out.ends_with("clawg: 1 memory in this scope is still in English, and a query finds a memory best in its own \
+                           language: if this does not answer, search again with the query in English."),
+            "{out}"
+        );
+        let empty = Found { hits: Vec::new(), withheld: 0, other_language: other("es", 2) };
+        assert!(format_search(empty, "a", None, Some(Lang::En)).contains("2 memories in this scope are still in Spanish"));
+    }
+
+    #[test]
+    fn a_search_that_shows_enough_says_nothing_of_the_other_language() {
+        let three = scored(&[0.5, 0.5, 0.5]);
+        let with = format_search(Found { other_language: other("en", 12), ..shown(three.clone()) }, "a", None, Some(Lang::Es));
+        assert_eq!(with, format_search(shown(three), "a", None, None));
+    }
+
+    #[test]
+    fn no_memories_in_the_other_language_means_no_line() {
+        let one = scored(&[0.5]);
+        let with = format_search(Found { other_language: other("en", 0), ..shown(one.clone()) }, "a", None, Some(Lang::Es));
+        assert_eq!(with, format_search(shown(one), "a", None, None));
+    }
+
+    #[test]
+    fn without_a_preference_no_line() {
+        let one = scored(&[0.5]);
+        let with = format_search(Found { other_language: other("en", 12), ..shown(one.clone()) }, "a", None, None);
+        assert_eq!(with, format_search(shown(one), "a", None, None));
+    }
+
+    #[test]
+    fn a_daemon_without_the_count_means_no_line() {
+        let one = scored(&[0.5]);
+        assert_eq!(format_search(shown(one.clone()), "a", None, Some(Lang::Es)), format_search(shown(one), "a", None, None));
+        let unknown = Found { other_language: other("fr", 12), ..shown(scored(&[0.5])) };
+        assert!(!format_search(unknown, "a", None, Some(Lang::Es)).contains("still in"), "a language this bridge cannot name");
+    }
+
+    #[test]
+    fn recall_context_names_the_other_language_after_a_poor_context() {
+        let poor = |retrieval| Context {
+            prompt: "## WORKSPACE\nstuff".into(),
+            retrieval: Some(retrieval),
+            other_language: other("en", 12),
+            ..Default::default()
+        };
+        let out = format_recall(&poor(Retrieval::Searched { hits: 1, withheld: 0 }), Some(Lang::Es));
+        assert!(out.ends_with(&format!("\n\n{TWELVE_IN_ENGLISH}")), "{out}");
+        for unsaid in [Retrieval::Searched { hits: 3, withheld: 0 }, Retrieval::EmbedderNotReady] {
+            let out = format_recall(&poor(unsaid.clone()), Some(Lang::Es));
+            assert!(!out.contains("still in English"), "{unsaid:?}: {out}");
+        }
+        assert!(!format_recall(&poor(Retrieval::Searched { hits: 0, withheld: 0 }), None).contains("still in"));
+    }
+
+    #[test]
+    fn memory_status_names_the_sessions_language() {
+        assert_eq!(format_language(Some(Lang::Es), Some(Lang::Es)).as_deref(), Some("language: Spanish (preferences.json)"));
+        let out = format_status(&health(), Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", None, Some("language: X"));
+        assert!(out.contains("\nshared: none\nlanguage: X"), "{out}");
+    }
+
+    #[test]
+    fn memory_status_says_when_the_preference_changed() {
+        assert_eq!(
+            format_language(Some(Lang::En), Some(Lang::Es)).as_deref(),
+            Some("language: English for this session; preferences.json now says Spanish, which a new session uses")
+        );
+        assert_eq!(
+            format_language(Some(Lang::Es), None).as_deref(),
+            Some("language: Spanish for this session; preferences.json now sets none, which a new session uses")
+        );
+        assert_eq!(
+            format_language(None, Some(Lang::Es)).as_deref(),
+            Some("language: none for this session; preferences.json now says Spanish, which a new session uses")
+        );
+    }
+
+    #[test]
+    fn memory_status_without_a_preference_says_nothing_of_it() {
+        assert_eq!(format_language(None, None), None);
     }
 
     #[test]
@@ -696,7 +863,7 @@ mod tests {
 
     #[test]
     fn the_search_output_shows_only_the_relevant_hits() {
-        let text = format_search(shown(scored(&[0.50, 0.10, 0.05])), "a", None);
+        let text = format_search(shown(scored(&[0.50, 0.10, 0.05])), "a", None, None);
         assert!(text.contains("#1 ") && text.contains("#2 "), "{text}");
         assert!(!text.contains("#3 "), "{text}");
     }
@@ -715,7 +882,7 @@ mod tests {
             hit(2, "Memory", "semantic_fact", 3, 0.30, "ledger import"),
             hit(3, "Memory", "semantic_fact", 3, 0.25, "ledger lock"),
         ];
-        let out = format_search(shown(hits), "cursor", None);
+        let out = format_search(shown(hits), "cursor", None, None);
         assert!(out.starts_with("1. #1 [Memory/code_block/t3 score=1.40 by claude-code] kept parseLedger4821"), "{out}");
         assert!(out.contains("3. #3 "), "{out}");
     }
@@ -798,13 +965,13 @@ mod tests {
     #[test]
     fn search_says_when_nothing_was_relevant() {
         let sentence = |n: usize| format!("no relevant memories for this query: {n} searched, none close enough to show");
-        assert_eq!(format_search(Found { hits: Vec::new(), withheld: 3 }, "a", None), sentence(3), "the daemon cut them all");
-        assert_eq!(format_search(Found { hits: scored(&[0.0, 0.0]), withheld: 1 }, "a", None), sentence(3), "the bridge cut the rest");
+        assert_eq!(format_search(Found { hits: Vec::new(), withheld: 3, other_language: None }, "a", None, None), sentence(3), "the daemon cut them all");
+        assert_eq!(format_search(Found { hits: scored(&[0.0, 0.0]), withheld: 1, other_language: None }, "a", None, None), sentence(3), "the bridge cut the rest");
     }
 
     #[test]
     fn nothing_stored_is_not_called_irrelevant() {
-        assert_eq!(format_search(shown(Vec::new()), "a", None), "no memories found");
+        assert_eq!(format_search(shown(Vec::new()), "a", None, None), "no memories found");
     }
 
     #[test]
@@ -1217,12 +1384,12 @@ mod tests {
     fn the_review_nudge_appears_from_one() {
         let context = |n| Context { prompt: "## WORKSPACE\nstuff".into(), conclusions_to_review: n, ..Default::default() };
 
-        assert_eq!(format_recall(&context(0)), "## WORKSPACE\nstuff");
-        let one = format_recall(&context(1));
+        assert_eq!(format_recall(&context(0), None), "## WORKSPACE\nstuff");
+        let one = format_recall(&context(1), None);
         assert!(one.starts_with("## WORKSPACE\nstuff\n\n1 conclusion here rests "), "{one}");
         assert!(one.contains("rests on memories that were deleted or replaced"), "the verb agrees with memories: {one}");
         assert!(one.contains("`synthesize`"), "{one}");
-        let two = format_recall(&Context { unreviewed: SYNTHESIS_NUDGE_THRESHOLD, ..context(2) });
+        let two = format_recall(&Context { unreviewed: SYNTHESIS_NUDGE_THRESHOLD, ..context(2) }, None);
         assert!(two.ends_with(&review_nudge(2).unwrap()), "the review comes after the synthesis reminder: {two}");
         assert!(two.contains("2 conclusions here rest "), "{two}");
     }
@@ -1331,8 +1498,8 @@ mod tests {
     fn the_nudge_appears_from_the_threshold() {
         let context = |unreviewed| Context { prompt: "## WORKSPACE\nstuff".into(), unreviewed, retrieval: None, ..Default::default() };
 
-        assert_eq!(format_recall(&context(SYNTHESIS_NUDGE_THRESHOLD - 1)), "## WORKSPACE\nstuff");
-        let out = format_recall(&context(SYNTHESIS_NUDGE_THRESHOLD));
+        assert_eq!(format_recall(&context(SYNTHESIS_NUDGE_THRESHOLD - 1), None), "## WORKSPACE\nstuff");
+        let out = format_recall(&context(SYNTHESIS_NUDGE_THRESHOLD), None);
         assert!(out.starts_with("## WORKSPACE\nstuff\n\n"), "the context comes first, untouched: {out}");
         assert!(out.contains("synthesize"), "{out}");
         assert!(out.contains(&SYNTHESIS_NUDGE_THRESHOLD.to_string()), "{out}");
@@ -1341,7 +1508,7 @@ mod tests {
     #[test]
     fn recall_says_when_memories_were_not_searched() {
         let recall = |prompt: &str, retrieval| {
-            format_recall(&Context { prompt: prompt.into(), unreviewed: 0, retrieval: Some(retrieval), ..Default::default() })
+            format_recall(&Context { prompt: prompt.into(), unreviewed: 0, retrieval: Some(retrieval), ..Default::default() }, None)
         };
         let cases = [
             (Retrieval::EmbedderNotReady, "still loading"),
@@ -1366,7 +1533,7 @@ mod tests {
     fn recall_says_when_nothing_was_relevant() {
         let recall = |prompt: &str| {
             let retrieval = Some(Retrieval::Searched { hits: 0, withheld: 2 });
-            format_recall(&Context { prompt: prompt.into(), unreviewed: 0, retrieval, ..Default::default() })
+            format_recall(&Context { prompt: prompt.into(), unreviewed: 0, retrieval, ..Default::default() }, None)
         };
         let sentence = "no relevant memories for this query: 2 searched, none close enough to show";
         assert_eq!(
@@ -1380,13 +1547,13 @@ mod tests {
     fn an_old_daemon_gets_no_invented_notice() {
         for retrieval in [None, Some(Retrieval::Unknown), Some(Retrieval::Searched { hits: 0, withheld: 0 })] {
             let context = Context { prompt: String::new(), unreviewed: 0, retrieval, ..Default::default() };
-            assert_eq!(format_recall(&context), "no context yet");
+            assert_eq!(format_recall(&context, None), "no context yet");
         }
     }
 
     #[test]
     fn the_nudge_follows_an_empty_context_too() {
-        let out = format_recall(&Context { prompt: String::new(), unreviewed: 50, retrieval: None, ..Default::default() });
+        let out = format_recall(&Context { prompt: String::new(), unreviewed: 50, retrieval: None, ..Default::default() }, None);
         assert!(out.starts_with("no context yet\n\n"), "{out}");
     }
 
@@ -1478,7 +1645,7 @@ mod tests {
 
     #[test]
     fn format_status_includes_the_health_json_the_data_dir_and_the_profile() {
-        let out = format_status(&health(), Profile::Dev, Path::new("/home/u/.clawg-dev"), "a", "from --agent", "shared: none", None);
+        let out = format_status(&health(), Profile::Dev, Path::new("/home/u/.clawg-dev"), "a", "from --agent", "shared: none", None, None);
         assert!(out.contains("\"pid\": 4242"), "health must be pretty JSON: {out}");
         assert!(out.contains("loading"), "out was: {out}");
         assert!(out.contains(".clawg-dev"), "the data dir must be named: {out}");
@@ -1503,7 +1670,7 @@ mod tests {
             }),
             ..health()
         };
-        let out = format_status(&h, Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", None);
+        let out = format_status(&h, Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", None, None);
         assert!(out.contains("\"failed\": 1"), "out was: {out}");
         assert!(out.contains("\"operation_id\": \"op-1\""), "out was: {out}");
         assert!(
@@ -1513,13 +1680,13 @@ mod tests {
             ),
             "out was: {out}"
         );
-        let none_failed = format_status(&health(), Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", None);
+        let none_failed = format_status(&health(), Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", None, None);
         assert!(!none_failed.contains("clawg outbox"), "out was: {none_failed}");
     }
 
     #[test]
     fn format_status_names_the_agent() {
-        let out = format_status(&health(), Profile::Dev, Path::new("/d"), "claude-code", "from --agent", "shared: none", None);
+        let out = format_status(&health(), Profile::Dev, Path::new("/d"), "claude-code", "from --agent", "shared: none", None, None);
         assert!(out.contains("\nagent: claude-code (from --agent)\n"), "out was: {out}");
     }
 
@@ -1533,7 +1700,7 @@ mod tests {
         let line = format_sharing(&broken, "cursor");
         assert!(line.starts_with("shared: none (") && line.contains("version 2"), "{line}");
 
-        let out = format_status(&health(), Profile::Dev, Path::new("/d"), "cursor", "from --agent", &format_sharing(&policy, "cursor"), None);
+        let out = format_status(&health(), Profile::Dev, Path::new("/d"), "cursor", "from --agent", &format_sharing(&policy, "cursor"), None, None);
         assert!(out.ends_with("\nshared: reads and changes every agent's memories but claude-code's, codex's"), "out was: {out}");
     }
 
@@ -1577,7 +1744,7 @@ mod tests {
                 open_pair(12, 4, None, None),
             ],
         };
-        let out = format_status(&health(), Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", Some(&format_open_pairs(&open)));
+        let out = format_status(&health(), Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", Some(&format_open_pairs(&open)), None);
         assert!(
             out.ends_with(
                 "\nconflict candidates: 2 for you to judge, 1 waiting for the user in ACTIVE CONFLICTS\n  #9 close to #4\n  \
@@ -1600,7 +1767,7 @@ mod tests {
             by(hit(1, "Memory", "semantic_fact", 2, 0.80, "propia"), "cursor"),
             by(hit(2, "Memory", "semantic_fact", 3, 0.70, "ajena"), "claude-code"),
         ];
-        let out = format_search(shown(hits), "cursor", None);
+        let out = format_search(shown(hits), "cursor", None, None);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "1. #1 [Memory/semantic_fact/t2 score=0.80] propia");
         assert_eq!(lines[1], "2. #2 [Memory/semantic_fact/t3 score=0.70 by claude-code] ajena");
@@ -1612,7 +1779,7 @@ mod tests {
     fn format_search_leaves_own_hits_alone() {
         let own = vec![by(hit(1, "Memory", "semantic_fact", 2, 0.80, "propia"), "cursor"), hit(2, "Memory", "semantic_fact", 3, 0.70, "vieja")];
         assert_eq!(
-            format_search(shown(own), "cursor", None),
+            format_search(shown(own), "cursor", None, None),
             "1. #1 [Memory/semantic_fact/t2 score=0.80] propia\n2. #2 [Memory/semantic_fact/t3 score=0.70] vieja"
         );
     }

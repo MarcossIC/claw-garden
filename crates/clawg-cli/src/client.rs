@@ -27,6 +27,7 @@ use clawg_core::memory::relocate::MoveReport;
 use clawg_core::memory::store_lock::{StoreHolder, StoreLock, StoreOwner};
 use clawg_core::build_info;
 use clawg_core::paths::{data_dir, socket_file, PathsError, Profile};
+use clawg_core::preferences::Lang;
 use clawg_core::private_dir::ensure_private_dir;
 use serde::{Deserialize, Serialize};
 
@@ -160,6 +161,19 @@ pub struct Found {
     /// count does not send it; its cut always left two hits standing.
     #[serde(default)]
     pub withheld: usize,
+    /// Live saves of the searched scope in the other language, when the
+    /// search named its own. A daemon that predates it never sends it.
+    #[serde(default)]
+    pub other_language: Option<OtherLanguage>,
+}
+
+/// How many memories a search in one language is likely to miss for being
+/// in the other. `lang` stays text, so a language this bridge does not know
+/// leaves the answer readable.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct OtherLanguage {
+    pub lang: String,
+    pub memories: usize,
 }
 
 /// One retrieval hit, as much of it as a caller formats.
@@ -291,6 +305,9 @@ pub struct Context {
     /// the field omits it, and then nothing can be said either way.
     #[serde(default)]
     pub retrieval: Option<Retrieval>,
+    /// As in [`Found`], for a context asked with a query and a language.
+    #[serde(default)]
+    pub other_language: Option<OtherLanguage>,
 }
 
 /// Whether `POST /v1/context` searched memories, and if not, why.
@@ -581,6 +598,11 @@ pub struct SearchArgs {
     pub agent_id: String,
     pub project_id: Option<String>,
     pub limit: Option<usize>,
+    /// The language the query is in; the answer then counts the memories in
+    /// the other one. Left out without it, as a daemon that predates it
+    /// expects.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lang: Option<Lang>,
 }
 
 /// The body of `POST /v1/search`: the caller's arguments plus the bridge's
@@ -1003,13 +1025,15 @@ impl DaemonClient {
         read_response(answer)
     }
 
-    /// `budget: None` leaves the size to the daemon's default.
+    /// `budget: None` leaves the size to the daemon's default; `lang` is as
+    /// in [`SearchArgs`].
     pub async fn context(
         &self,
         query: &str,
         agent_id: &str,
         project_id: Option<&str>,
         budget: Option<usize>,
+        lang: Option<Lang>,
     ) -> Result<Context, ClientError> {
         let mut body = serde_json::json!({
             "query": query,
@@ -1018,6 +1042,9 @@ impl DaemonClient {
         });
         if let Some(budget) = budget {
             body["budget"] = budget.into();
+        }
+        if let Some(lang) = lang {
+            body["lang"] = lang.as_str().into();
         }
         let answer = self.send(Call::new(reqwest::Method::POST, "/v1/context").json(&body)?).await?;
         read_response(answer)
@@ -1557,6 +1584,28 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_search_answer_without_other_language_still_parses() {
+        let old: Found = serde_json::from_str(r#"{"hits":[],"withheld":0}"#).expect("a daemon that never said");
+        assert_eq!(old.other_language, None);
+        let old: Context = serde_json::from_str(r#"{"prompt":""}"#).expect("a daemon that never said");
+        assert_eq!(old.other_language, None);
+        let new: Found = serde_json::from_str(r#"{"hits":[],"other_language":{"lang":"en","memories":3}}"#).unwrap();
+        assert_eq!(new.other_language, Some(OtherLanguage { lang: "en".into(), memories: 3 }));
+        let newer: Found = serde_json::from_str(r#"{"hits":[],"other_language":{"lang":"fr","memories":3}}"#)
+            .expect("a language this bridge does not know still parses");
+        assert_eq!(newer.other_language.map(|o| o.lang), Some("fr".to_string()));
+    }
+
+    #[test]
+    fn a_search_names_its_language_only_when_it_has_one() {
+        let args = |lang| SearchArgs { query: "q".into(), agent_id: "a".into(), project_id: None, limit: None, lang };
+        let without = serde_json::to_value(search_request(&args(None))).unwrap();
+        assert!(without.get("lang").is_none(), "{without}");
+        let with = serde_json::to_value(search_request(&args(Some(Lang::Es)))).unwrap();
+        assert_eq!(with["lang"], "es", "{with}");
+    }
+
+    #[test]
     fn a_searched_context_without_counts_still_parses() {
         let old: Context =
             serde_json::from_str(r#"{"prompt":"","unreviewed":0,"retrieval":{"state":"searched"}}"#).expect("parses");
@@ -1876,6 +1925,7 @@ pub(crate) mod tests {
             agent_id: "agent-socket".into(),
             project_id: None,
             limit: Some(5),
+            lang: None,
         })
         .await
         .expect("a call with a body");
@@ -2012,13 +2062,14 @@ pub(crate) mod tests {
                 agent_id: "agent-client".into(),
                 project_id: None,
                 limit: Some(5),
+                lang: None,
             })
             .await
             .expect("search")
             .hits;
         assert!(hits.iter().any(|h| h.id == id), "the saved row must be retrievable");
 
-        let context = c.context(content, "agent-client", None, None).await.expect("context");
+        let context = c.context(content, "agent-client", None, None, None).await.expect("context");
         assert_eq!(context.unreviewed, 1, "the one saved memory has not been reviewed yet");
 
         let synthesis = c.synthesis(&SynthesisArgs::default()).await.expect("synthesis");
@@ -2036,6 +2087,7 @@ pub(crate) mod tests {
             agent_id: "a".into(),
             project_id: None,
             limit: Some(5),
+            lang: None,
         };
         let body = serde_json::to_value(search_request(&args)).expect("serializes");
         assert_eq!(body["min_relative_score"], serde_json::json!(crate::relevance::RELEVANCE_RATIO));

@@ -33,6 +33,7 @@ pub mod store_lock;
 pub mod worker;
 pub mod error;
 pub mod identity;
+pub mod language;
 pub mod migrations;
 pub mod outbox;
 pub mod portability;

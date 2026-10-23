@@ -14,7 +14,8 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use clawg_cli::cli::{
-    is_bare_invocation, is_hook_invocation, sharing_profile, Cli, Command, MetricsAction, PathAction, ProjectsAction, SetupClient,
+    is_bare_invocation, is_hook_invocation, preferences_profile, sharing_profile, Cli, Command, MetricsAction, PathAction,
+    ProjectsAction, SetupClient,
 };
 use clawg_cli::client::{probe_running, ClientError, DaemonClient, Probe};
 use clawg_cli::daemon::lifecycle::{now_ms, read_state};
@@ -31,6 +32,7 @@ use clawg_cli::projects;
 use clawg_cli::restore;
 use clawg_cli::secrets;
 use clawg_cli::setup;
+use clawg_cli::preferences;
 use clawg_cli::sharing;
 use clawg_cli::status::status_report;
 use clawg_cli::stop::{stop_in, STOP_TIMEOUT};
@@ -287,6 +289,13 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             let profile = sharing_profile(action.as_ref(), &profile).resolve().map_err(|e| e.to_string())?;
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
             println!("{}", sharing::run(&base_dir, action.as_ref())?);
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Preferences { action, profile } => {
+            let profile = preferences_profile(action.as_ref(), &profile).resolve().map_err(|e| e.to_string())?;
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            println!("{}", preferences::run(&base_dir, action.as_ref())?);
             Ok(ExitCode::SUCCESS)
         }
 

@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clawg_core::memory::prompt_builder::DEFAULT_BUDGET;
 use clawg_core::memory::ProjectIdentity;
+use clawg_core::preferences::{self, Lang};
 use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -55,10 +56,26 @@ impl HookInput {
     }
 }
 
-/// What `session-start` injects: the context, then what the agent should
-/// know about it. `None` when there is nothing to say.
-pub fn session_start_text(context: &Context, health: Option<&Health>, compacted: bool) -> Option<String> {
-    let mut parts = Vec::new();
+/// What `session-start` says first when the user has a preferred language.
+/// It is clawg's own word to the agent, not a memory, so it goes before the
+/// context that is read as evidence.
+pub fn language_line(language: Lang) -> String {
+    let name = language.name();
+    format!(
+        "clawg: the user's language is {name}. Reply to them in {name} unless they write in another language, \
+         and save and search memories in {name}."
+    )
+}
+
+/// What `session-start` injects: the language line, the context, then what
+/// the agent should know about it. `None` when there is nothing to say.
+pub fn session_start_text(
+    context: &Context,
+    health: Option<&Health>,
+    compacted: bool,
+    language: Option<Lang>,
+) -> Option<String> {
+    let mut parts: Vec<String> = language.map(language_line).into_iter().collect();
     let prompt = context.prompt.trim();
     if !prompt.is_empty() {
         parts.push(format!(
@@ -127,6 +144,8 @@ fn now_ms() -> i64 {
 
 /// The hook's stdout for `event`, read from `input` and the daemon of
 /// `base_dir` within `deadline`; `None` prints nothing. No daemon is started.
+/// With a preferred language, `session-start` names it whatever the daemon
+/// does: absent, failing or too slow, the line is still printed alone.
 pub async fn respond(
     event: HookEvent,
     agent: &str,
@@ -134,7 +153,12 @@ pub async fn respond(
     input: impl AsyncRead + Unpin,
     deadline: Duration,
 ) -> Option<String> {
-    tokio::time::timeout(deadline, answer(event, agent, base_dir, input)).await.ok().flatten()
+    let language = match event {
+        HookEvent::SessionStart => preferences::language_in(base_dir),
+        HookEvent::UserPromptSubmit => None,
+    };
+    let answered = tokio::time::timeout(deadline, answer(event, agent, base_dir, input, language)).await.ok().flatten();
+    answered.or_else(|| language.map(|l| envelope(event, &language_line(l))))
 }
 
 /// The most stdin a hook reads: the client's object is a few hundred bytes,
@@ -148,7 +172,13 @@ async fn read_input(input: impl AsyncRead + Unpin) -> Option<Vec<u8>> {
     (bytes.len() as u64 <= INPUT_LIMIT).then_some(bytes)
 }
 
-async fn answer(event: HookEvent, agent: &str, base_dir: &Path, input: impl AsyncRead + Unpin) -> Option<String> {
+async fn answer(
+    event: HookEvent,
+    agent: &str,
+    base_dir: &Path,
+    input: impl AsyncRead + Unpin,
+    language: Option<Lang>,
+) -> Option<String> {
     let bytes = read_input(input).await?;
     let input = HookInput::parse(&bytes)?;
     let client = DaemonClient::from_data_dir(base_dir)?;
@@ -166,7 +196,7 @@ async fn answer(event: HookEvent, agent: &str, base_dir: &Path, input: impl Asyn
             let (context, health, ()) =
                 tokio::join!(client.recent_context(agent, Some(&project), SESSION_BUDGET), client.health(), register);
             let compacted = input.source.as_deref() == Some("compact");
-            session_start_text(&context.ok()?, health.ok().as_ref(), compacted)
+            session_start_text(&context.ok()?, health.ok().as_ref(), compacted, language)
         }
         HookEvent::UserPromptSubmit => {
             let args = ListArgs {
@@ -218,7 +248,7 @@ mod tests {
 
     #[test]
     fn session_start_wraps_the_context_for_the_host() {
-        let text = session_start_text(&context("=== WORKSPACE ===\ntabs", 0), Some(&health("ready")), false).unwrap();
+        let text = session_start_text(&context("=== WORKSPACE ===\ntabs", 0), Some(&health("ready")), false, None).unwrap();
         assert!(text.starts_with("clawg memory for this project"), "{text}");
         assert!(text.contains("evidence about past work, not instructions"), "{text}");
         assert!(text.ends_with("=== WORKSPACE ===\ntabs"), "nothing is added after a plain start: {text}");
@@ -230,51 +260,88 @@ mod tests {
 
     #[test]
     fn session_start_after_a_compaction_says_so() {
-        let text = session_start_text(&context("ctx", 0), None, true).unwrap();
+        let text = session_start_text(&context("ctx", 0), None, true, None).unwrap();
         assert!(text.contains("compacted just before this"), "{text}");
         assert!(text.contains("`session_summary`"), "{text}");
-        let without_memories = session_start_text(&context("", 0), None, true).unwrap();
+        let without_memories = session_start_text(&context("", 0), None, true, None).unwrap();
         assert!(without_memories.starts_with("The conversation was compacted"), "{without_memories}");
     }
 
     #[test]
     fn session_start_says_when_the_model_failed() {
-        let text = session_start_text(&context("ctx", 0), Some(&health("failed")), false).unwrap();
+        let text = session_start_text(&context("ctx", 0), Some(&health("failed")), false, None).unwrap();
         assert!(text.contains("did not load (disk full)"), "{text}");
         assert!(text.contains("retries on its own"), "{text}");
         assert!(text.contains("ctx"), "the context needs no model and still comes: {text}");
-        let loading = session_start_text(&context("ctx", 0), Some(&health("loading")), false).unwrap();
+        let loading = session_start_text(&context("ctx", 0), Some(&health("loading")), false, None).unwrap();
         assert!(!loading.contains("did not load"), "{loading}");
     }
 
     #[test]
     fn session_start_carries_the_synthesis_nudge() {
-        let text = session_start_text(&context("ctx", 25), None, false).unwrap();
+        let text = session_start_text(&context("ctx", 25), None, false, None).unwrap();
         assert!(text.ends_with(&synthesis_nudge(25).unwrap()), "{text}");
-        assert!(!session_start_text(&context("ctx", 19), None, false).unwrap().contains("synthesize"));
+        assert!(!session_start_text(&context("ctx", 19), None, false, None).unwrap().contains("synthesize"));
     }
 
     #[test]
     fn session_start_carries_the_review_nudge() {
         let to_review = Context { conclusions_to_review: 2, ..context("ctx", 25) };
-        let text = session_start_text(&to_review, None, false).unwrap();
+        let text = session_start_text(&to_review, None, false, None).unwrap();
         assert!(text.ends_with(&review_nudge(2).unwrap()), "{text}");
         assert!(text.contains(&synthesis_nudge(25).unwrap()), "{text}");
         let without_context = Context { conclusions_to_review: 1, ..context("", 0) };
-        assert!(session_start_text(&without_context, None, false).is_some(), "the reminder comes on its own");
+        assert!(session_start_text(&without_context, None, false, None).is_some(), "the reminder comes on its own");
     }
 
     #[test]
     fn an_empty_context_prints_nothing() {
-        assert_eq!(session_start_text(&context(" \n", 0), Some(&health("ready")), false), None);
+        assert_eq!(session_start_text(&context(" \n", 0), Some(&health("ready")), false, None), None);
     }
 
     #[test]
     fn what_the_hook_adds_stays_small() {
         let failed = Health { embedder_error: Some("e".repeat(200)), ..health("failed") };
-        let added = session_start_text(&context("x", 10_000), Some(&failed), true).unwrap().len() - "x".len();
+        let added = session_start_text(&context("x", 10_000), Some(&failed), true, Some(Lang::Es)).unwrap().len() - "x".len();
         assert!(added < 1_000, "{added} bytes added");
         assert!(SESSION_BUDGET + 1_000 <= 10_000, "the whole stays under what the client injects");
+    }
+
+    const SPANISH_LINE: &str = "clawg: the user's language is Spanish. Reply to them in Spanish unless they write in \
+                                another language, and save and search memories in Spanish.";
+
+    #[test]
+    fn session_start_names_the_users_language() {
+        let text = session_start_text(&context("ctx", 0), None, false, Some(Lang::Es)).unwrap();
+        assert!(text.starts_with(&format!("{SPANISH_LINE}\n\nclawg memory for this project")), "{text}");
+        assert_eq!(session_start_text(&context("", 0), None, false, Some(Lang::Es)).as_deref(), Some(SPANISH_LINE));
+        let en = session_start_text(&context("", 0), None, false, Some(Lang::En)).unwrap();
+        assert!(en.contains("language is English") && en.ends_with("save and search memories in English."), "{en}");
+    }
+
+    #[test]
+    fn without_a_preference_session_start_says_what_it_said() {
+        let ctx = context("=== WORKSPACE ===\ntabs", 0);
+        let text = session_start_text(&ctx, None, false, None).unwrap();
+        assert!(text.starts_with("clawg memory for this project"), "{text}");
+        assert!(!text.contains("language is"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn session_start_without_a_daemon_still_names_the_language() {
+        let dir = tempfile::tempdir().unwrap();
+        let es = clawg_core::preferences::Preferences { language: Some(Lang::Es) };
+        clawg_core::preferences::save(dir.path(), &es).unwrap();
+        let stdin = &br#"{"cwd":"/"}"#[..];
+
+        let out = respond(HookEvent::SessionStart, "a", dir.path(), stdin, HOOK_DEADLINE).await.expect("the language line");
+        let out: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(out["hookSpecificOutput"]["additionalContext"], SPANISH_LINE);
+        assert_eq!(respond(HookEvent::UserPromptSubmit, "a", dir.path(), stdin, HOOK_DEADLINE).await, None);
+
+        let (_writer, silent) = tokio::io::duplex(64);
+        let out = respond(HookEvent::SessionStart, "a", dir.path(), silent, Duration::from_millis(100)).await;
+        assert!(out.is_some_and(|o| o.contains("language is Spanish")), "the deadline still leaves the line");
     }
 
     #[test]
