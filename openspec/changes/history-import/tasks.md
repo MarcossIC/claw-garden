@@ -56,9 +56,9 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 ## 10. Verificación
 
-- [ ] `cargo test --workspace --target-dir target-test` y el clippy de `.claude/CLAUDE.md` en Windows.
+- [x] `cargo test --workspace --target-dir target-test` y el clippy de `.claude/CLAUDE.md` en Windows.
 - [ ] Linux: queda al CI del pull request.
-- [ ] El binario real en un home temporal.
+- [x] El binario real en un home temporal (2026-10-23): el binario de la suite con `CLAWG_TEST_HOME` y el modelo real descargado. Sin el modelo cargado, `503 tokenizer_not_ready` también en `--dry-run`; con él, un export sintético de 9 notas da el mismo reporte en el ensayo y en el import, y un segundo import las encuentra a las 9. Un export más nuevo con una nota de 1.740 palabras la parte en 33 piezas con el tokenizer real, enlazadas, y `/save` de la pieza 17 la devuelve entera; la nota en español reescrita entra como revisión (la vieja `superseded`, causa `revision`). La decisión con un `supersedes` marcado por un agente queda viva y el par `escalated`, con motivo y evidencia; secreto enmascarado, clave reescrita, borrada sin vector, `origin_project` guardado. Un segundo import sin nada que insertar igual escribe su snapshot `pre-import`, como el de un archivo de clawg.
 - [ ] Perfil dev, con autorización: el export real (`engram export --all`) con `--dry-run`, el import, una docena de búsquedas, cuánto tarda, si el daemon contesta mientras tanto, y `projects move --origin-project`.
 
 ## 11. Archive
