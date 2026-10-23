@@ -75,6 +75,23 @@ pub fn export(base_dir: &Path, filter: &ExportFilter, now_ms: i64) -> Result<Exp
     read(&c, filter, now_ms)
 }
 
+/// The project id the root `root` (with the key of its remote, `remote`)
+/// reads and writes under in `<base_dir>/memory.db`, read without writing; the
+/// id derived from the root for a store from before roots were recorded.
+pub fn project_id_of(base_dir: &Path, root: &Path, remote: Option<&str>) -> Result<String, ExportError> {
+    let path = base_dir.join("memory.db");
+    if !path.exists() {
+        return Err(MemoryError::from(BackupError::NoStore { path }).into());
+    }
+    crate::memory::db::ensure_vec0_registered();
+    let c = open_for_probe(&path)?;
+    if !has_table(&c, "project")? {
+        return Ok(crate::memory::identity::derive_project_id(root));
+    }
+    let remote = if has_table(&c, "project_remote")? { remote } else { None };
+    Ok(crate::memory::project::project_id_in(&c, root, remote)?)
+}
+
 /// [`export`] over an open connection. A store from an older schema is read
 /// with the columns and tables it has, and what it lacks is `null`.
 pub(crate) fn read(c: &Connection, filter: &ExportFilter, now_ms: i64) -> Result<Export, ExportError> {
@@ -468,5 +485,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = export(dir.path(), &ExportFilter::default(), 0).unwrap_err();
         assert!(err.to_string().contains("no memory store"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn export_reads_the_project_id_from_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_on_disk(dir.path(), None).await;
+        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+        c.execute_batch(
+            "INSERT INTO project (id, root_path, created_at) VALUES ('app-1a2b', '/work/app', 1), ('app-3c4d', '/review/app', 2);
+             INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/app', 'app-1a2b', 1);",
+        )
+        .unwrap();
+        drop(c);
+        let of = |root: &str, remote: Option<&str>| project_id_of(dir.path(), Path::new(root), remote).unwrap();
+
+        assert_eq!(of("/review/app", Some("github.com/acme/app")), "app-1a2b", "the project its remote shares");
+        assert_eq!(of("/review/app", None), "app-3c4d", "its own id without a remote");
+        let free = Path::new("/fresh/app");
+        assert_eq!(of("/fresh/app", None), crate::memory::identity::derive_project_id(free));
+    }
+
+    #[tokio::test]
+    async fn a_store_from_before_roots_were_recorded_gives_the_derived_id() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_on_disk(dir.path(), Some(8)).await;
+        let root = Path::new("/work/app");
+        assert_eq!(project_id_of(dir.path(), root, Some("github.com/acme/app")).unwrap(), crate::memory::identity::derive_project_id(root));
     }
 }

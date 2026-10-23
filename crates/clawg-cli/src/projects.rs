@@ -31,7 +31,7 @@ pub async fn add(lang: Lang, client: &DaemonClient, path: &Path) -> Result<Strin
     if !project.root.is_dir() {
         return Err(AddError::NotADirectory(project.root));
     }
-    let legacy: Vec<String> = Some(project.legacy_id.clone()).filter(|l| *l != project.id).into_iter().collect();
+    let legacy = project.legacy_ids();
     let id = client.register_project(&project.root, &legacy, true).await?.project_id;
     let root = project.root.display();
     Ok(match lang {
@@ -50,13 +50,17 @@ pub async fn move_memories(lang: Lang, client: &DaemonClient, opts: &MoveOpts, c
             if !project.root.is_dir() {
                 return Err(AddError::NotADirectory(project.root));
             }
-            let legacy: Vec<String> =
-                Some(project.legacy_id.clone()).filter(|l| *l != project.id).into_iter().collect();
+            let legacy = project.legacy_ids();
             Some(client.register_project(&project.root, &legacy, false).await?.project_id)
         }
         None => None,
     };
-    let here = opts.here.then(|| ProjectIdentity::resolve(cwd).id);
+    let here = if opts.here {
+        let project = ProjectIdentity::resolve(cwd);
+        Some(client.register_project(&project.root, &project.legacy_ids(), false).await?.project_id)
+    } else {
+        None
+    };
     let report = client.move_memories(&opts.request(here, to)).await?;
     Ok(render_move(lang, &report))
 }

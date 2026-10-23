@@ -83,6 +83,14 @@ pub enum ClientError {
     DataDir(#[from] PathsError),
 }
 
+impl ClientError {
+    /// A daemon from before assigned ids refusing a root whose id belongs to
+    /// another root: reading or writing under it would mix two projects.
+    pub fn is_root_collision(&self) -> bool {
+        matches!(self, ClientError::Daemon { status: 409, message, .. } if message == "project_root_collision")
+    }
+}
+
 /// The parts of a daemon error body beyond its `error` code, kept so a caller
 /// can say why something failed and what a failed save still stored.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -1333,6 +1341,7 @@ impl DaemonClient {
             "root_path": root.to_string_lossy(),
             "legacy_ids": legacy_ids,
             "index_docs": index_docs,
+            "assigned": true,
         });
         let answer = self.send(Call::new(reqwest::Method::POST, "/v1/projects").json(&body)?).await?;
         let body = read_response::<Body>(answer)?;

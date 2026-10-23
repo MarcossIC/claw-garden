@@ -141,6 +141,46 @@ pub fn project_id_in(c: &Connection, root: &Path, remote: Option<&str>) -> rusql
     }
 }
 
+/// The ids each of `roots` (with the key of its remote) would get, as
+/// [`register_project`] gives them, read without writing: a root later in the
+/// list never takes an id or a remote an earlier one was given. Each answer is
+/// `(root id, project id)`.
+pub(crate) fn plan_ids_in(c: &Connection, roots: &[(PathBuf, Option<String>)]) -> rusqlite::Result<Vec<(String, String)>> {
+    let mut claimed: Vec<String> = Vec::new();
+    let mut remotes: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut out = Vec::new();
+    for (root, remote) in roots {
+        let root_id = match recorded_id_in(c, &root.to_string_lossy())? {
+            Some(id) => id,
+            None => {
+                let mut free = None;
+                for n in 0..CANDIDATES {
+                    let id = candidate_id(root, n);
+                    if !claimed.contains(&id) && root_of_in(c, &id)?.is_none() {
+                        free = Some(id);
+                        break;
+                    }
+                }
+                free.unwrap_or_else(|| derive_project_id(root))
+            }
+        };
+        claimed.push(root_id.clone());
+        let project_id = match remote {
+            Some(r) => match remotes.get(r) {
+                Some(p) => p.clone(),
+                None => {
+                    let p = remote_project_in(c, r)?.unwrap_or_else(|| root_id.clone());
+                    remotes.insert(r.clone(), p.clone());
+                    p
+                }
+            },
+            None => root_id.clone(),
+        };
+        out.push((root_id, project_id));
+    }
+    Ok(out)
+}
+
 /// Settles the ids of a registration inside the caller's transaction.
 fn plan_in(c: &Connection, reg: &Registration<'_>) -> Result<Plan, RegisterError> {
     let root_path = reg.root.to_string_lossy().into_owned();

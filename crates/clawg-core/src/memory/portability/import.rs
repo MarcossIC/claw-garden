@@ -16,7 +16,7 @@
 //! transactions, does no harm.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rusqlite::{OptionalExtension, Transaction};
@@ -27,7 +27,8 @@ use crate::memory::chunker::embedding_text;
 use crate::memory::clock::TimestampMs;
 use crate::memory::dedup::content_hash;
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
-use crate::memory::identity::derive_project_id;
+use crate::memory::identity::origin_key;
+use crate::memory::project::plan_ids_in;
 use crate::memory::language;
 use crate::memory::portability::format::{parse, FormatError, Invalid, MemoryLine, Parsed};
 use crate::memory::redact::redact;
@@ -142,24 +143,51 @@ impl Row {
 #[derive(Debug)]
 struct Prepared {
     rows: Vec<Row>,
-    /// Every project to record: id here, root here.
-    projects: Vec<(String, String)>,
+    /// Every project to record: its root here, the root's id and remote, and
+    /// the project its rows go to.
+    projects: Vec<ProjectHere>,
     parsed: Parsed,
 }
 
-fn prepare(mut parsed: Parsed, options: &ImportOptions) -> Prepared {
+/// A project of the file, as it is recorded here.
+#[derive(Debug, Clone)]
+struct ProjectHere {
+    root: String,
+    root_id: String,
+    remote: Option<String>,
+    project_id: String,
+}
+
+/// The root here of every project line, with the key of its remote.
+fn roots_here(parsed: &Parsed, options: &ImportOptions) -> Vec<(PathBuf, Option<String>)> {
+    parsed
+        .projects
+        .iter()
+        .map(|(_, p)| {
+            let root = options
+                .map_roots
+                .iter()
+                .find(|(old, _)| *old == p.root_path)
+                .map(|(_, new)| new.clone())
+                .unwrap_or_else(|| p.root_path.clone());
+            let remote = origin_key(Path::new(&root));
+            (PathBuf::from(root), remote)
+        })
+        .collect()
+}
+
+/// `ids` are what [`plan_ids_in`] gave the roots of [`roots_here`], in order.
+fn prepare(mut parsed: Parsed, roots: &[(PathBuf, Option<String>)], ids: &[(String, String)], options: &ImportOptions) -> Prepared {
     let mut project_ids: HashMap<String, String> = HashMap::new();
     let mut projects = Vec::new();
-    for (_, p) in &parsed.projects {
-        let root = options
-            .map_roots
-            .iter()
-            .find(|(old, _)| *old == p.root_path)
-            .map(|(_, new)| new.clone())
-            .unwrap_or_else(|| p.root_path.clone());
-        let id = derive_project_id(Path::new(&root));
-        project_ids.insert(p.id.clone(), id.clone());
-        projects.push((id, root));
+    for (((_, p), (root, remote)), (root_id, project_id)) in parsed.projects.iter().zip(roots).zip(ids) {
+        project_ids.insert(p.id.clone(), project_id.clone());
+        projects.push(ProjectHere {
+            root: root.to_string_lossy().into_owned(),
+            root_id: root_id.clone(),
+            remote: remote.clone(),
+            project_id: project_id.clone(),
+        });
     }
     // The head of a save is stored with its pieces, so it is masked as the
     // text is.
@@ -260,18 +288,26 @@ const INSERT_SQL: &str = "INSERT INTO memory \
       lang, origin_project) \
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)";
 
-/// Records each project, and returns the ids that already belong to another
-/// root, with that root.
-fn record_projects(tx: &Transaction<'_>, projects: &[(String, String)], now: i64) -> rusqlite::Result<HashMap<String, String>> {
+/// Records each project, and returns the project ids whose rows stay out,
+/// with the root that holds them: an id a registration gave another root
+/// since the ids were planned.
+fn record_projects(tx: &Transaction<'_>, projects: &[ProjectHere], now: i64) -> rusqlite::Result<HashMap<String, String>> {
     let mut taken = HashMap::new();
-    for (id, root) in projects {
+    for p in projects {
         tx.execute(
             "INSERT OR IGNORE INTO project (id, root_path, created_at, index_docs) VALUES (?1, ?2, ?3, 0)",
-            rusqlite::params![id, root, now],
+            rusqlite::params![p.root_id, p.root, now],
         )?;
-        let existing: String = tx.query_row("SELECT root_path FROM project WHERE id = ?1", [id], |r| r.get(0))?;
-        if existing != *root {
-            taken.insert(id.clone(), existing);
+        let existing: String = tx.query_row("SELECT root_path FROM project WHERE id = ?1", [&p.root_id], |r| r.get(0))?;
+        if existing != p.root && p.project_id == p.root_id {
+            taken.insert(p.project_id.clone(), existing);
+            continue;
+        }
+        if let Some(remote) = &p.remote {
+            tx.execute(
+                "INSERT OR IGNORE INTO project_remote (remote, project_id, created_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![remote, p.project_id, now],
+            )?;
         }
     }
     Ok(taken)
@@ -552,7 +588,14 @@ pub async fn import(
     options: &ImportOptions,
 ) -> Result<ImportReport, ImportError> {
     let (_, parsed) = parse(text)?;
-    let prepared = Arc::new(prepare(parsed, options));
+    let roots = roots_here(&parsed, options);
+    let planned = roots.clone();
+    let ids = store
+        .conn
+        .call(move |c| plan_ids_in(c, &planned))
+        .await
+        .map_err(MemoryError::Connection)?;
+    let prepared = Arc::new(prepare(parsed, &roots, &ids, options));
     let now = TimestampMs::now().as_millis_i64();
 
     let decide = prepared.clone();
@@ -1036,7 +1079,7 @@ mod tests {
         let elsewhere = "/elsewhere/repo";
         let options = ImportOptions { map_roots: vec![(ROOT.into(), elsewhere.into())], ..Default::default() };
         let (report, _) = run(&dst, &file, options).await;
-        let moved = derive_project_id(Path::new(elsewhere));
+        let moved = crate::memory::identity::derive_project_id(Path::new(elsewhere));
         assert_eq!(report.by_project.get(&moved), Some(&13));
         let roots = dst
             .conn
@@ -1051,7 +1094,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_project_id_of_another_root_is_reported_and_skipped() {
+    async fn an_import_gives_a_colliding_root_its_own_id() {
         let file = seeded_file().await;
         let dst = destination().await;
         let id = project();
@@ -1060,9 +1103,34 @@ mod tests {
             .await
             .unwrap();
         let (report, _) = run(&dst, &file, ImportOptions::default()).await;
-        assert_eq!(report.inserted, 4, "the rows without a project and the other project's");
-        assert_eq!(report.invalid.len(), 13);
-        assert!(report.invalid[0].reason.contains("already belongs to /not/the/repo"), "{:?}", report.invalid[0]);
+        assert!(report.invalid.is_empty(), "{:?}", report.invalid);
+        let own = crate::memory::identity::candidate_id(Path::new(ROOT), 1);
+        assert_eq!(report.by_project.get(&own), Some(&13));
+        assert_eq!(report.by_project.get(&project()), None, "nothing goes to the other root's project");
+    }
+
+    #[tokio::test]
+    async fn an_import_into_a_clone_goes_to_the_project_of_its_remote() {
+        let file = seeded_file().await;
+        let dst = destination().await;
+        dst.conn
+            .call(|c| {
+                c.execute_batch(
+                    "INSERT INTO project (id, root_path, created_at) VALUES ('app-1a2b', '/work/app', 0);
+                     INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/app', 'app-1a2b', 0);",
+                )
+            })
+            .await
+            .unwrap();
+        let clone = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(clone.path().join(".git")).unwrap();
+        std::fs::write(clone.path().join(".git").join("config"), "[remote \"origin\"]\n\turl = https://github.com/acme/app\n").unwrap();
+        let here = clone.path().to_string_lossy().into_owned();
+        let options = ImportOptions { map_roots: vec![(ROOT.into(), here)], ..Default::default() };
+
+        let (report, _) = run(&dst, &file, options).await;
+
+        assert_eq!(report.by_project.get("app-1a2b"), Some(&13), "{:?}", report.by_project);
     }
 
     #[tokio::test]

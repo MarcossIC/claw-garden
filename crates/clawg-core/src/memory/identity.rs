@@ -50,6 +50,12 @@ impl ProjectIdentity {
         let root = resolve_project_root(path);
         Self { id: derive_project_id(&root), legacy_id: derive_project_id(path), root }
     }
+
+    /// What a registration of this project names as its legacy ids: the id of
+    /// the path it was reached through, when that is not the root's.
+    pub fn legacy_ids(&self) -> Vec<String> {
+        Some(self.legacy_id.clone()).filter(|l| *l != self.id).into_iter().collect()
+    }
 }
 
 /// The root of the project `path` belongs to: the nearest ancestor of its
