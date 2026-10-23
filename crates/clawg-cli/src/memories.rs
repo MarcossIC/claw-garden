@@ -7,6 +7,7 @@
 
 use std::fmt::Write as _;
 
+use clawg_core::memory::portability::export::project_id_of;
 use clawg_core::paths::Profile;
 use clawg_core::preferences::Lang;
 
@@ -424,12 +425,17 @@ pub fn search_args(opts: &SearchOpts, project: Option<String>) -> ListArgs {
     }
 }
 
-fn resolve_project(scope: &Scope) -> Result<Option<String>, ClientError> {
+/// `--here` is the project of the working directory as the store records it,
+/// read without the daemon and without writing: a viewer registers nothing.
+fn resolve_project(client: &DaemonClient, scope: &Scope) -> Result<Option<String>, ClientError> {
     if !scope.here {
         return Ok(scope.project_id(None));
     }
     let cwd = std::env::current_dir().map_err(|e| ClientError::WorkingDir(e.to_string()))?;
-    Ok(scope.project_id(Some(clawg_core::memory::ProjectIdentity::resolve(&cwd).id)))
+    let identity = clawg_core::memory::ProjectIdentity::resolve(&cwd);
+    let remote = clawg_core::memory::identity::origin_key(&identity.root);
+    let recorded = project_id_of(client.base_dir(), &identity.root, remote.as_deref()).unwrap_or(identity.id);
+    Ok(scope.project_id(Some(recorded)))
 }
 
 // ── Running ─────────────────────────────────────────────────────────────────
@@ -452,7 +458,7 @@ pub async fn run(
 
     match action {
         MemoriesAction::List(opts) => {
-            let args = list_args(&opts, resolve_project(&opts.filters.scope)?);
+            let args = list_args(&opts, resolve_project(client, &opts.filters.scope)?);
             let rows = client.list(args).await?;
             Ok(if opts.json {
                 rows_json(&rows)
@@ -463,7 +469,7 @@ pub async fn run(
             })
         }
         MemoriesAction::Search(opts) => {
-            let args = search_args(&opts, resolve_project(&opts.filters.scope)?);
+            let args = search_args(&opts, resolve_project(client, &opts.filters.scope)?);
             let rows = client.list(args).await?;
             Ok(if opts.json {
                 rows_json(&rows)
@@ -480,7 +486,7 @@ pub async fn run(
             })
         }
         MemoriesAction::Stats(opts) => {
-            let project = resolve_project(&opts.scope)?;
+            let project = resolve_project(client, &opts.scope)?;
             let stats = client
                 .stats(opts.scope.agent.as_deref(), project.as_deref())
                 .await?;

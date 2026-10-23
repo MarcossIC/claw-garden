@@ -1195,6 +1195,10 @@ async fn two_clones_share_their_memories_through_a_real_daemon() {
     let reply: Value = serde_json::from_str(&stdout_of(&out)).expect("one JSON object");
     let context = reply["hookSpecificOutput"]["additionalContext"].as_str().expect("context");
     assert!(context.contains("ops/deploy.sh"), "the other clone's memory: {context}");
+
+    let listed = sandbox.command(&["memories", "list", "--here", "--profile", "dev"]).current_dir(&review).output().unwrap();
+    assert_eq!(listed.status.code(), Some(0), "{}", stderr_of(&listed));
+    assert!(stdout_of(&listed).contains("ops/deploy.sh"), "{}", stdout_of(&listed));
 }
 
 #[tokio::test]
