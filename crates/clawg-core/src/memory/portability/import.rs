@@ -4,7 +4,9 @@
 //! row's state: it counts one access, derives the tier, stores only live rows
 //! and runs the contradiction detector. Each guarantee the worker gives a
 //! stored row is kept here too: the text masked, its hash, its text index
-//! entry, one live row per text and one live save per topic key.
+//! entry, one live row per text and one live save per topic key. An export
+//! of another tool takes the same passes once [`super::translate`] has made
+//! its notes rows, each masked whole and split as a save of its text.
 //!
 //! Three passes. The first places every row and link inside a transaction it
 //! then drops, so rows of one file see each other and a dry run is exactly
@@ -23,13 +25,18 @@ use rusqlite::{OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 
 use crate::memory::backup::Reason;
-use crate::memory::chunker::embedding_text;
+use crate::memory::chunker::{embedding_text, ChatChunker};
 use crate::memory::clock::TimestampMs;
 use crate::memory::dedup::content_hash;
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::identity::derive_project_id;
 use crate::memory::language;
+use crate::memory::portability::foreign::ForeignExport;
 use crate::memory::portability::format::{parse, FormatError, Invalid, MemoryLine, Parsed};
+use crate::memory::portability::translate::{
+    translate, ForeignReport, LeftOut, MergedNote, NoteRows, TakenKey, TakenProject, TranslateOptions, Translated,
+    MIGRATED_AGENT,
+};
 use crate::memory::redact::redact;
 use crate::memory::vector::to_unit;
 use crate::memory::{MemoryError, MemoryStore};
@@ -51,6 +58,8 @@ pub struct ImportOptions {
     pub agent: Option<String>,
     /// An exported project root and the root it has here.
     pub map_roots: Vec<(String, String)>,
+    /// A project name of another tool and the root it has here.
+    pub project_map: Vec<(String, String)>,
 }
 
 /// A live row stored as the live row of the same text that was already here.
@@ -77,7 +86,8 @@ pub struct TopicTaken {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportReport {
     pub dry_run: bool,
-    /// `memory` lines in the file that could be read.
+    /// `memory` lines in the file that could be read; for another tool's
+    /// export, the rows its notes split into.
     pub rows: usize,
     pub inserted: usize,
     pub by_type: BTreeMap<String, usize>,
@@ -96,6 +106,14 @@ pub struct ImportReport {
     pub dropped_links: Vec<Invalid>,
     /// The `pre-import` snapshot, when one was written.
     pub snapshot: Option<String>,
+    /// Inserted rows by the language of their text: `en`, `es` or `und`.
+    #[serde(default)]
+    pub by_lang: BTreeMap<String, usize>,
+    /// For another tool's export, what became of each note. Its lines and
+    /// ids are the translation's, so `merged`, `topic_taken` and `invalid`
+    /// are told here by note instead.
+    #[serde(default)]
+    pub foreign: Option<ForeignReport>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -122,6 +140,9 @@ struct Row {
     redacted: bool,
     /// The head a piece's vector is embedded behind, as the worker does.
     context: String,
+    /// Read from the text stored here, never from the file's `lang`: a file
+    /// cannot say what its text does not.
+    lang: &'static str,
 }
 
 impl Row {
@@ -147,7 +168,17 @@ struct Prepared {
     parsed: Parsed,
 }
 
-fn prepare(mut parsed: Parsed, options: &ImportOptions) -> Prepared {
+/// Whether the texts of a file are masked yet.
+#[derive(Clone, Copy)]
+enum Texts<'a> {
+    /// As a clawg export carries them: masked here.
+    Raw,
+    /// Masked whole before they were split, which masking a piece alone
+    /// could undo; the rows whose text held a secret.
+    Masked(&'a HashSet<i64>),
+}
+
+fn prepare(mut parsed: Parsed, options: &ImportOptions, texts: Texts<'_>) -> Prepared {
     let mut project_ids: HashMap<String, String> = HashMap::new();
     let mut projects = Vec::new();
     for (_, p) in &parsed.projects {
@@ -161,10 +192,12 @@ fn prepare(mut parsed: Parsed, options: &ImportOptions) -> Prepared {
         project_ids.insert(p.id.clone(), id.clone());
         projects.push((id, root));
     }
-    // The head of a save is stored with its pieces, so it is masked as the
-    // text is.
-    for (_, piece) in &mut parsed.pieces {
-        piece.context = redact(&piece.context).text;
+    if let Texts::Raw = texts {
+        // The head of a save is stored with its pieces, so it is masked as
+        // the text is.
+        for (_, piece) in &mut parsed.pieces {
+            piece.context = redact(&piece.context).text;
+        }
     }
     let mut contexts: HashMap<i64, String> = HashMap::new();
     for (_, piece) in &parsed.pieces {
@@ -177,15 +210,22 @@ fn prepare(mut parsed: Parsed, options: &ImportOptions) -> Prepared {
     let rows = lines
         .into_iter()
         .map(|(line, src)| {
-            let masked = redact(&src.content);
+            let (content, redacted) = match texts {
+                Texts::Raw => {
+                    let masked = redact(&src.content);
+                    (masked.text, !masked.kinds.is_empty())
+                }
+                Texts::Masked(secret) => (src.content.clone(), secret.contains(&src.id)),
+            };
             Row {
                 line,
                 agent: src.agent_id.as_ref().map(|a| options.agent.clone().unwrap_or_else(|| a.clone())),
                 project: src.project_id.as_ref().map(|p| project_ids.get(p).cloned().unwrap_or_else(|| p.clone())),
-                hash: content_hash(&masked.text),
-                redacted: !masked.kinds.is_empty(),
+                hash: content_hash(&content),
+                redacted,
                 context: contexts.get(&src.id).cloned().unwrap_or_default(),
-                content: masked.text,
+                lang: language::column_value(language::detect(&content)),
+                content,
                 src,
             }
         })
@@ -230,6 +270,9 @@ struct Ledger {
     /// The agent each row inserted here had in the file, so two agents'
     /// rows merged under one `--agent` still keep one live save per key.
     import_agents: HashMap<i64, Option<String>>,
+    /// Project ids of the file that belong to another root here, with that
+    /// root: their rows are left out.
+    taken: HashMap<String, String>,
     invalid: Vec<Invalid>,
     dropped: Vec<Invalid>,
 }
@@ -344,9 +387,7 @@ fn place(
         src.last_disputed_at,
         row.hash,
         src.topic_key,
-        // Read from the text stored here, never from the file's `lang`: a
-        // file cannot say what its text does not.
-        language::column_value(language::detect(&row.content)),
+        row.lang,
         src.origin_project,
     ])?;
     let id = tx.last_insert_rowid();
@@ -374,17 +415,13 @@ fn place(
 fn place_rows(
     tx: &Transaction<'_>,
     rows: &[Row],
-    taken: &HashMap<String, String>,
     ledger: &mut Ledger,
     vectors: &HashMap<i64, Vec<u8>>,
     needs_vector: bool,
 ) -> rusqlite::Result<()> {
     for row in rows {
-        if let Some(existing) = row.project.as_ref().and_then(|p| taken.get(p).map(|root| (p, root))) {
-            ledger.invalid.push(Invalid {
-                line: row.line,
-                reason: format!("project id {} already belongs to {}", existing.0, existing.1),
-            });
+        if let Some((id, root)) = row.project.as_ref().and_then(|p| ledger.taken.get(p).map(|root| (p, root))) {
+            ledger.invalid.push(Invalid { line: row.line, reason: format!("project id {id} already belongs to {root}") });
             continue;
         }
         match place(tx, row, ledger, vectors.get(&row.src.id).map(Vec::as_slice), needs_vector)? {
@@ -552,17 +589,60 @@ pub async fn import(
     options: &ImportOptions,
 ) -> Result<ImportReport, ImportError> {
     let (_, parsed) = parse(text)?;
-    let prepared = Arc::new(prepare(parsed, options));
-    let now = TimestampMs::now().as_millis_i64();
+    let prepared = Arc::new(prepare(parsed, options, Texts::Raw));
+    let (ledger, snapshot) = write(store, embedder, backups, &prepared, options.dry_run).await?;
+    Ok(report(&prepared, &ledger, options.dry_run, snapshot))
+}
 
+/// Imports the notes of another tool's export as [`import`] imports a file:
+/// each note masked whole and split by `chunker` into the rows a save of its
+/// text would store, under the agent of `options` or [`MIGRATED_AGENT`], in
+/// the project `options.project_map` gives its project or in none.
+pub async fn import_foreign(
+    store: &MemoryStore,
+    embedder: Option<&dyn Embedder>,
+    chunker: Arc<ChatChunker>,
+    backups: &Path,
+    export: ForeignExport,
+    options: &ImportOptions,
+) -> Result<ImportReport, ImportError> {
+    let translate_options = TranslateOptions {
+        agent: options.agent.clone().unwrap_or_else(|| MIGRATED_AGENT.to_owned()),
+        project_map: options.project_map.clone(),
+    };
+    let now = TimestampMs::now().as_millis_i64();
+    // Masking and splitting thousands of notes is work the daemon's other
+    // requests should not wait behind.
+    let (prepared, notes, foreign) = tokio::task::spawn_blocking(move || {
+        let Translated { parsed, notes, report } = translate(&export, &translate_options, &chunker, now);
+        let secret: HashSet<i64> = notes.iter().filter(|n| n.masked).flat_map(|n| n.rows.clone()).collect();
+        (prepare(parsed, &ImportOptions::default(), Texts::Masked(&secret)), notes, report)
+    })
+    .await
+    .map_err(|e| MemoryError::Internal(format!("could not translate the export: {e}")))?;
+    let prepared = Arc::new(prepared);
+    let (ledger, snapshot) = write(store, embedder, backups, &prepared, options.dry_run).await?;
+    Ok(with_foreign(report(&prepared, &ledger, options.dry_run, snapshot), foreign, &notes, &ledger))
+}
+
+/// Places every row and link of `prepared` and, unless this is a dry run,
+/// embeds the rows to insert and writes them after a `pre-import` snapshot,
+/// whose path it returns.
+async fn write(
+    store: &MemoryStore,
+    embedder: Option<&dyn Embedder>,
+    backups: &Path,
+    prepared: &Arc<Prepared>,
+    dry_run: bool,
+) -> Result<(Ledger, Option<String>), ImportError> {
+    let now = TimestampMs::now().as_millis_i64();
     let decide = prepared.clone();
     let decided = store
         .conn
         .call(move |c| -> rusqlite::Result<Ledger> {
             let tx = c.transaction()?;
-            let taken = record_projects(&tx, &decide.projects, now)?;
-            let mut ledger = Ledger::default();
-            place_rows(&tx, &decide.rows, &taken, &mut ledger, &HashMap::new(), false)?;
+            let mut ledger = Ledger { taken: record_projects(&tx, &decide.projects, now)?, ..Default::default() };
+            place_rows(&tx, &decide.rows, &mut ledger, &HashMap::new(), false)?;
             write_links(&tx, &decide, &mut ledger)?;
             // Dropped, never committed: this pass only finds out.
             Ok(ledger)
@@ -570,8 +650,8 @@ pub async fn import(
         .await
         .map_err(MemoryError::Connection)?;
 
-    if options.dry_run {
-        return Ok(report(&prepared, decided, true, None));
+    if dry_run {
+        return Ok((decided, None));
     }
     let embedder = embedder.ok_or(ImportError::NoEmbedder)?;
 
@@ -594,21 +674,20 @@ pub async fn import(
 
     let vectors = Arc::new(vectors);
     let mut ledger = Ledger::default();
-    let mut taken: HashMap<String, String> = HashMap::new();
     for start in (0..prepared.rows.len().max(1)).step_by(WRITE_BATCH) {
         let (batch, vectors) = (prepared.clone(), vectors.clone());
-        let (mut placed, mut held) = (std::mem::take(&mut ledger), std::mem::take(&mut taken));
-        (ledger, taken) = store
+        let mut placed = std::mem::take(&mut ledger);
+        ledger = store
             .conn
-            .call(move |c| -> rusqlite::Result<(Ledger, HashMap<String, String>)> {
+            .call(move |c| -> rusqlite::Result<Ledger> {
                 let tx = c.transaction()?;
                 if start == 0 {
-                    held = record_projects(&tx, &batch.projects, now)?;
+                    placed.taken = record_projects(&tx, &batch.projects, now)?;
                 }
                 let end = (start + WRITE_BATCH).min(batch.rows.len());
-                place_rows(&tx, &batch.rows[start..end], &held, &mut placed, &vectors, true)?;
+                place_rows(&tx, &batch.rows[start..end], &mut placed, &vectors, true)?;
                 tx.commit()?;
-                Ok((placed, held))
+                Ok(placed)
             })
             .await
             .map_err(MemoryError::Connection)?;
@@ -625,10 +704,10 @@ pub async fn import(
         .await
         .map_err(MemoryError::Connection)?;
 
-    Ok(report(&prepared, ledger, false, Some(snapshot.display().to_string())))
+    Ok((ledger, Some(snapshot.display().to_string())))
 }
 
-fn report(prepared: &Prepared, ledger: Ledger, dry_run: bool, snapshot: Option<String>) -> ImportReport {
+fn report(prepared: &Prepared, ledger: &Ledger, dry_run: bool, snapshot: Option<String>) -> ImportReport {
     let mut report = ImportReport {
         dry_run,
         rows: prepared.rows.len(),
@@ -636,9 +715,9 @@ fn report(prepared: &Prepared, ledger: Ledger, dry_run: bool, snapshot: Option<S
         snapshot,
         ..Default::default()
     };
-    report.invalid.extend(ledger.invalid);
+    report.invalid.extend(ledger.invalid.iter().cloned());
     report.invalid.sort_by_key(|i| i.line);
-    report.dropped_links = ledger.dropped;
+    report.dropped_links = ledger.dropped.clone();
     report.dropped_links.sort_by_key(|i| i.line);
     let skipped: HashSet<usize> = report.invalid.iter().map(|i| i.line).collect();
     for row in &prepared.rows {
@@ -654,6 +733,7 @@ fn report(prepared: &Prepared, ledger: Ledger, dry_run: bool, snapshot: Option<S
                 let state = if matches!(placement, Placement::TopicTaken { .. }) { "superseded" } else { row.state() };
                 *report.by_state.entry(state.to_string()).or_default() += 1;
                 *report.by_project.entry(row.project.clone().unwrap_or_default()).or_default() += 1;
+                *report.by_lang.entry(row.lang.to_string()).or_default() += 1;
                 report.redacted += usize::from(row.redacted);
                 if let Placement::TopicTaken { id, by } = placement {
                     report.topic_taken.push(TopicTaken {
@@ -671,6 +751,55 @@ fn report(prepared: &Prepared, ledger: Ledger, dry_run: bool, snapshot: Option<S
     report
 }
 
+/// Tells what the import did with the rows of a translated export by the
+/// note each came from, since the translation's lines and ids mean nothing
+/// outside it.
+fn with_foreign(mut report: ImportReport, mut foreign: ForeignReport, notes: &[NoteRows], ledger: &Ledger) -> ImportReport {
+    let note_of: HashMap<i64, &NoteRows> = notes.iter().flat_map(|n| n.rows.clone().map(move |id| (id, n))).collect();
+    for merged in std::mem::take(&mut report.merged) {
+        if let Some(note) = note_of.get(&merged.id) {
+            let piece = merged.id - note.rows.start + 1;
+            foreign.merged.push(MergedNote { origin: note.origin.clone(), piece, into: merged.into });
+        }
+    }
+    let mut named = HashSet::new();
+    for taken in std::mem::take(&mut report.topic_taken) {
+        match note_of.get(&taken.id) {
+            Some(note) if named.insert(note.origin.as_str()) => foreign.topic_taken.push(TakenKey {
+                origin: note.origin.clone(),
+                topic_key: taken.topic_key,
+                by: taken.by,
+            }),
+            _ => {}
+        }
+    }
+    let mut named = HashSet::new();
+    for invalid in std::mem::take(&mut report.invalid) {
+        let Some(note) = note_of.get(&(invalid.line as i64)) else { continue };
+        // Told by project below.
+        if note.project_id.as_ref().is_some_and(|id| ledger.taken.contains_key(id)) {
+            continue;
+        }
+        if named.insert(note.origin.as_str()) {
+            foreign.left_out.push(LeftOut { origin: note.origin.clone(), reason: invalid.reason });
+        }
+    }
+    foreign.taken_projects = foreign
+        .by_source_project
+        .iter()
+        .filter_map(|p| {
+            let belongs_to = ledger.taken.get(p.project_id.as_ref()?)?;
+            Some(TakenProject {
+                project: p.project.clone()?,
+                root: p.root.clone()?,
+                belongs_to: belongs_to.clone(),
+                notes: p.notes,
+            })
+        })
+        .collect();
+    report.foreign = Some(foreign);
+    report
+}
 
 #[cfg(test)]
 mod tests {
@@ -678,10 +807,16 @@ mod tests {
     use crate::memory::admin::{restore_memory_core, MemoryKind};
     use crate::memory::db::seed_on_disk;
     use crate::memory::embedder::FakeEmbedder;
+    use crate::memory::events::{MemoryEvent, MemorySource};
     use crate::memory::portability::export::{read, Export, ExportFilter};
     use crate::memory::portability::fixtures::{other_project, project, seed, ROOT};
+    use crate::memory::portability::foreign::ForeignNote;
     use crate::memory::portability::format::tests::EXAMPLE;
+    use crate::memory::portability::translate::tests::{export as foreign_export, note as foreign_note};
+    use crate::memory::portability::translate::{TakenKey, TakenProject};
     use crate::memory::search::{search_all_memories, SearchScope};
+    use crate::memory::worker::save_for_test;
+    use crate::models::chat::Role;
 
     const EVERYTHING: ExportFilter = ExportFilter { project_id: None, agent: None, include_deleted: true };
 
@@ -957,6 +1092,7 @@ mod tests {
         let (report, _) = run(&dst, &file, ImportOptions::default()).await;
         assert!(report.invalid.is_empty(), "a line with lang parses: {report:#?}");
         assert_eq!(report.inserted, 1);
+        assert_eq!(report.by_lang, BTreeMap::from([("es".to_string(), 1)]));
         assert_eq!(imported_lang(&dst, "motor de almacenamiento").await.as_deref(), Some("es"));
     }
 
@@ -1145,6 +1281,147 @@ mod tests {
         let (report, _) = run(&dst, &file, ImportOptions::default()).await;
         let reasons: Vec<&str> = report.dropped_links.iter().map(|d| d.reason.as_str()).collect();
         assert_eq!(reasons, vec!["memory 15 was revived by deleting 16, which is not in the file"], "{report:#?}");
+    }
+
+    async fn run_foreign(store: &MemoryStore, notes: Vec<ForeignNote>, options: ImportOptions) -> (ImportReport, tempfile::TempDir) {
+        let backups = tempfile::tempdir().unwrap();
+        let chunker = Arc::new(ChatChunker::with_fallback());
+        let report = import_foreign(store, Some(&FakeEmbedder::default()), chunker, backups.path(), foreign_export(notes), &options)
+            .await
+            .unwrap();
+        (report, backups)
+    }
+
+    /// Each piece of every linked save, in order: its text, the head it was
+    /// embedded behind and its vector.
+    async fn linked_pieces(store: &MemoryStore) -> Vec<(i64, String, String, Vec<u8>)> {
+        store
+            .conn
+            .call(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT p.piece, m.content, p.context, v.embedding FROM memory_piece p \
+                     JOIN memory m ON m.id = p.memory_id JOIN memory_vectors v ON v.rowid = m.id \
+                     ORDER BY p.save_id, p.piece",
+                )?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await
+            .unwrap()
+    }
+
+    /// The rows imported from `origin`: id, status, what supersedes it and why.
+    async fn imported(store: &MemoryStore, origin: &'static str) -> Vec<(i64, String, Option<i64>, Option<String>)> {
+        store
+            .conn
+            .call(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT id, status, superseded_by, supersede_cause FROM memory \
+                     WHERE source = 'import' AND created_by_ref = ?1 ORDER BY id",
+                )?;
+                let rows = stmt.query_map([origin], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_imported_note_has_the_rows_of_a_save_of_its_text() {
+        let title = "Notes on clawg-ledger";
+        let words: Vec<String> = (0..700).map(|i| format!("w{i}")).collect();
+        let content = format!("{}{}", words.join(" "), " word".repeat(600));
+        let dst = destination().await;
+        let notes = vec![foreign_note("engram:long", title, &content)];
+        let backups = tempfile::tempdir().unwrap();
+        let chunker = Arc::new(ChatChunker::with_fallback());
+        let dry_run = ImportOptions { dry_run: true, ..Default::default() };
+        let dry = import_foreign(&dst, None, chunker, backups.path(), foreign_export(notes.clone()), &dry_run).await.unwrap();
+        assert!(files_in(backups.path()).is_empty());
+        let (report, _) = run_foreign(&dst, notes, ImportOptions::default()).await;
+        assert_eq!(ImportReport { dry_run: false, snapshot: report.snapshot.clone(), ..dry }, report);
+
+        let saved = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let event = MemoryEvent {
+            agent_id: MIGRATED_AGENT.into(),
+            project_id: None,
+            role: Role::User,
+            content: format!("{title}\n{content}"),
+            is_error: None,
+            source: MemorySource::Explicit,
+            timestamp_ms: 1,
+            memory_type: None,
+            importance: None,
+            derived_from: Vec::new(),
+            topic_key: None,
+            user_stated: false,
+            session_id: None,
+        };
+        save_for_test(&saved, &event).await;
+        let pieces = linked_pieces(&saved).await;
+        assert!(pieces.len() > 2, "the text is long enough to split");
+        assert_eq!(linked_pieces(&dst).await, pieces, "the same pieces, heads and vectors as a save");
+
+        assert_eq!((report.inserted, report.rows), (pieces.len(), pieces.len()));
+        assert_eq!(report.by_lang.values().sum::<usize>(), pieces.len());
+        let foreign = report.foreign.clone().unwrap();
+        assert_eq!((foreign.source.as_str(), foreign.rows, foreign.split_notes), ("engram", pieces.len(), 1));
+        assert!(report.merged.is_empty() && report.topic_taken.is_empty() && report.invalid.is_empty(), "{report:#?}");
+    }
+
+    #[tokio::test]
+    async fn a_key_held_here_supersedes_the_imported_note() {
+        let root = "/work/notes";
+        let dst = destination().await;
+        let holder = insert_row(&dst, "claude-code", Some(derive_project_id(Path::new(root))), "Storage engine: DuckDB", Some("storage/engine"), 5).await;
+        let long = ForeignNote {
+            project: Some("a".into()),
+            topic_key: Some("storage/engine".into()),
+            ..foreign_note("engram:a", "Storage engine", &"SQLite with WAL, one writer ".repeat(150))
+        };
+        let options = ImportOptions { project_map: vec![("a".into(), root.into())], ..Default::default() };
+        let (report, _) = run_foreign(&dst, vec![long], options).await;
+
+        let rows = imported(&dst, "engram:a").await;
+        assert!(rows.len() > 1);
+        for (_, status, by, cause) in &rows {
+            assert_eq!((status.as_str(), *by, cause.as_deref()), ("superseded", Some(holder), Some("revision")));
+        }
+        let foreign = report.foreign.clone().unwrap();
+        assert_eq!(foreign.topic_taken, vec![TakenKey { origin: "engram:a".into(), topic_key: "storage/engine".into(), by: holder }]);
+        assert!(report.topic_taken.is_empty(), "the translation's ids mean nothing outside it");
+        assert_eq!(report.by_state, BTreeMap::from([("superseded".to_string(), rows.len())]));
+        let holder_status = dst
+            .conn
+            .call(move |c| c.query_row("SELECT status FROM memory WHERE id = ?1", [holder], |r| r.get::<_, String>(0)))
+            .await
+            .unwrap();
+        assert_eq!(holder_status, "active");
+    }
+
+    #[tokio::test]
+    async fn a_mapped_root_of_another_project_is_reported_and_skipped() {
+        let root = "/work/notes";
+        let dst = destination().await;
+        let id = derive_project_id(Path::new(root));
+        dst.conn
+            .call(move |c| c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, '/not/the/notes', 0)", [id]))
+            .await
+            .unwrap();
+        let in_a = |origin: &str, content: &str| ForeignNote { project: Some("a".into()), ..foreign_note(origin, "In a", content) };
+        let notes = vec![in_a("engram:a1", "one"), in_a("engram:a2", "two"), foreign_note("engram:loose", "Loose", "three")];
+        let options = ImportOptions { project_map: vec![("a".into(), root.into())], ..Default::default() };
+        let (report, _) = run_foreign(&dst, notes, options).await;
+
+        assert_eq!(report.inserted, 1, "{report:#?}");
+        assert_eq!(imported(&dst, "engram:loose").await.len(), 1);
+        assert!(imported(&dst, "engram:a1").await.is_empty() && imported(&dst, "engram:a2").await.is_empty());
+        let foreign = report.foreign.clone().unwrap();
+        assert_eq!(
+            foreign.taken_projects,
+            vec![TakenProject { project: "a".into(), root: root.into(), belongs_to: "/not/the/notes".into(), notes: 2 }]
+        );
+        assert!(report.invalid.is_empty() && foreign.left_out.is_empty(), "{report:#?}");
     }
 
     #[tokio::test]

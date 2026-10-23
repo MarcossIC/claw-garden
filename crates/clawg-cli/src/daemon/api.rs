@@ -1896,7 +1896,7 @@ async fn import_memories(
     };
     portability::format::parse(&body.text).map_err(|e| ApiError::bad_request(e.to_string()))?;
     let embedder = if body.dry_run { None } else { Some(ready_embedder(&app)?) };
-    let options = ImportOptions { dry_run: body.dry_run, agent, map_roots: body.map_roots };
+    let options = ImportOptions { dry_run: body.dry_run, agent, map_roots: body.map_roots, project_map: Vec::new() };
     let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
     match portability::import(&app.runtime.store, embedder.as_deref(), &backups, &body.text, &options).await {
         Ok(report) => Ok(Json(report)),

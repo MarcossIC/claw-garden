@@ -22,8 +22,8 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 ## 4. La traducción y el import de notas nuevas (HI5 a HI10, HI15)
 
-- [ ] Tests de `translate.rs` y `an_imported_note_has_the_rows_of_a_save_of_its_text`, `a_key_held_here_supersedes_the_imported_note`, `a_mapped_root_of_another_project_is_reported_and_skipped` (`import.rs`).
-- [ ] `translate.rs` (`translate`, `rewrite_key`, grupos de clave y de texto); `import_foreign` con filas ya enmascaradas, `by_lang` y `ForeignReport`.
+- [x] Tests de `translate.rs` y `an_imported_note_has_the_rows_of_a_save_of_its_text`, `a_key_held_here_supersedes_the_imported_note`, `a_mapped_root_of_another_project_is_reported_and_skipped` (`import.rs`).
+- [x] `translate.rs` (`translate`, `rewrite_key`, grupos de clave y de texto); `import_foreign` con filas ya enmascaradas, `by_lang` y `ForeignReport`.
 - Commit: `feat(core): import notes from another tool split and masked as saves`
 
 ## 5. Reconocimiento por origen y revisiones (HI11 a HI13)

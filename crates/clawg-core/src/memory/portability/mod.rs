@@ -7,9 +7,10 @@ pub mod foreign;
 pub mod format;
 pub mod import;
 pub mod markdown;
+pub mod translate;
 
 pub use export::{export, Export, ExportError, ExportFilter};
-pub use import::{import, ImportError, ImportOptions, ImportReport, MAX_IMPORT_BYTES};
+pub use import::{import, import_foreign, ImportError, ImportOptions, ImportReport, MAX_IMPORT_BYTES};
 
 #[cfg(test)]
 pub(crate) mod fixtures {
