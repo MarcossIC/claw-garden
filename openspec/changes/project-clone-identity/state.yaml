@@ -1,14 +1,14 @@
 change: project-clone-identity
 objective: "2"
-depends_on: [project-root-guard]
-phase: explore
+depends_on: [project-root-guard, project-reassign]
+phase: apply
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
+  exploration: done  # decisiones con el usuario: remoto como pista, W3, Q1, I1
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
   apply: pending
   verify: pending
   archive: pending
-updated: 2026-10-19
+updated: 2026-10-23
