@@ -168,6 +168,7 @@ struct ConflictPair {
 /// `budget` is the most bytes the text may take; see [`fit_to_budget`] for
 /// what gives way and the one case that can still go over it.
 pub async fn build_memory_prompt(
+    lang: Lang,
     store: &MemoryStore,
     workspace: &WorkspaceManager,
     embedder: Option<Arc<dyn Embedder>>,
@@ -262,7 +263,7 @@ pub async fn build_memory_prompt(
     let (last_session, hits) = with_last_session(store, agent_id, project_id, reach, hits).await;
     let hit_room = budget / HIT_ROOM_DIVISOR;
     let reader = Reader::new(agent_id, reach.clone());
-    let fitted = assemble(store, &workspace_content, last_session, hits, emitted, &reader, budget, hit_room).await;
+    let fitted = assemble(lang, store, &workspace_content, last_session, hits, emitted, &reader, budget, hit_room).await;
 
     // Fire-and-forget access recording, of the hits the text kept: a row this
     // channel suppressed or the budget cut was not retrieved for the agent,
@@ -286,6 +287,7 @@ pub async fn build_memory_prompt(
 /// access is recorded: these rows were picked for being new, not relevant,
 /// and counting them at every session start would promote a row for its age.
 pub async fn build_session_prompt(
+    lang: Lang,
     store: &MemoryStore,
     workspace: &WorkspaceManager,
     agent_id: &str,
@@ -305,7 +307,7 @@ pub async fn build_session_prompt(
     // No room: at a session start the summary is the handoff, and these rows
     // are only the newest, not what anything asked for.
     let reader = Reader::new(agent_id, reach.clone());
-    let fitted = assemble(store, &workspace_content, last_session, hits, emitted, &reader, budget, 0).await;
+    let fitted = assemble(lang, store, &workspace_content, last_session, hits, emitted, &reader, budget, 0).await;
     Ok(MemoryPrompt { text: fitted.text, retrieval })
 }
 
@@ -322,6 +324,7 @@ async fn read_workspace(workspace: &WorkspaceManager, agent_id: &str, project_id
 /// Lays `hits` out under the workspace, with the conflicts on what the
 /// prompt could show, cut to `budget` with `hit_room` kept for the hits.
 async fn assemble(
+    lang: Lang,
     store: &MemoryStore,
     workspace_content: &str,
     last_session: Option<RankedHit>,
@@ -355,6 +358,7 @@ async fn assemble(
     // 5. Assemble in order: WORKSPACE → LAST SESSION → RECENT → LONG-TERM → CONFLICTS, cut to the budget.
     fit_to_budget(
         PromptParts {
+            lang,
             workspace: workspace_content,
             last_session: last_session.into_iter().collect(),
             recent,
@@ -371,6 +375,9 @@ async fn assemble(
 
 /// Everything the prompt can hold, before the budget is applied.
 struct PromptParts<'a> {
+    /// The language of the notes the prompt adds; the blocks' headings and
+    /// markers are the same in every language.
+    lang: Lang,
     workspace: &'a str,
     /// The last session's summary, or nothing. A block of its own rather than
     /// an option so the budget cuts it as it cuts the last hit of any block.
@@ -549,7 +556,7 @@ fn positions(recent: &[RankedHit], longterm: &[RankedHit]) -> HashMap<i64, usize
 }
 
 fn render(parts: &PromptParts<'_>, cut: Option<&Cut>) -> String {
-    let PromptParts { workspace, last_session, recent, longterm, conflicts, conflicts_omitted, reader, .. } = parts;
+    let PromptParts { lang, workspace, last_session, recent, longterm, conflicts, conflicts_omitted, reader, .. } = parts;
     let mut out = String::new();
     if !workspace.is_empty() {
         out.push_str(SEP_WORKSPACE);
@@ -579,13 +586,13 @@ fn render(parts: &PromptParts<'_>, cut: Option<&Cut>) -> String {
         }
         out.push_str(SEP_CONFLICTS);
         out.push('\n');
-        out.push_str(&format_conflict_block(conflicts, &positions(recent, longterm), *conflicts_omitted));
+        out.push_str(&format_conflict_block(*lang, conflicts, &positions(recent, longterm), *conflicts_omitted));
     }
     if last_session.iter().chain(recent).chain(longterm).any(|h| is_shared(h, reader)) {
         out.push('\n');
         out.push_str(SEP_SHARED);
         out.push('\n');
-        out.push_str(SHARED_NOTE);
+        out.push_str(shared_note(*lang));
         out.push('\n');
     }
     if let Some(cut) = cut {
@@ -594,7 +601,7 @@ fn render(parts: &PromptParts<'_>, cut: Option<&Cut>) -> String {
         }
         out.push_str(SEP_BUDGET);
         out.push('\n');
-        out.push_str(&format_cut(cut));
+        out.push_str(&format_cut(*lang, cut));
         out.push('\n');
     }
     out
@@ -603,25 +610,43 @@ fn render(parts: &PromptParts<'_>, cut: Option<&Cut>) -> String {
 /// The closing note of a cut prompt: the budget, the size of the whole
 /// context, and the ids the cut left out or shortened, which `read_memory`
 /// returns whole. Ids are listed in the order the prompt would print them.
-fn format_cut(cut: &Cut) -> String {
+fn format_cut(lang: Lang, cut: &Cut) -> String {
     let label = |&(kind, id): &(TableKind, i64)| match kind {
         TableKind::Memory => format!("#{id}"),
         other => format!("{} #{id}", format!("{other:?}").to_lowercase()),
     };
     let mut left_out = cut.left_out.clone();
     left_out.sort_by_key(|id| cut.printed.iter().position(|p| p == id));
-    let mut out = format!("Cut to fit {} bytes; the full context is {} bytes.", cut.budget, cut.full);
+    let (budget, full) = (cut.budget, cut.full);
+    let mut out = match lang {
+        Lang::En => format!("Cut to fit {budget} bytes; the full context is {full} bytes."),
+        Lang::Es => format!("Recortado para entrar en {budget} bytes; el contexto completo mide {full} bytes."),
+    };
     if !left_out.is_empty() {
-        out.push_str(&format!(" Left out: {}.", left_out.iter().map(label).collect::<Vec<_>>().join(", ")));
+        let ids = left_out.iter().map(label).collect::<Vec<_>>().join(", ");
+        out.push_str(&match lang {
+            Lang::En => format!(" Left out: {ids}."),
+            Lang::Es => format!(" Quedaron afuera: {ids}."),
+        });
     }
     if !cut.shortened.is_empty() {
-        out.push_str(&format!(" Shortened: {}.", cut.shortened.iter().map(label).collect::<Vec<_>>().join(", ")));
+        let ids = cut.shortened.iter().map(label).collect::<Vec<_>>().join(", ");
+        out.push_str(&match lang {
+            Lang::En => format!(" Shortened: {ids}."),
+            Lang::Es => format!(" Se acortaron: {ids}."),
+        });
     }
     if !left_out.is_empty() || !cut.shortened.is_empty() {
-        out.push_str(" read_memory returns any of them whole.");
+        out.push_str(match lang {
+            Lang::En => " read_memory returns any of them whole.",
+            Lang::Es => " read_memory devuelve cualquiera de ellas entera.",
+        });
     }
     if cut.workspace_over {
-        out.push_str(" The workspace alone is over the budget and is shown whole.");
+        out.push_str(match lang {
+            Lang::En => " The workspace alone is over the budget and is shown whole.",
+            Lang::Es => " El workspace solo ya pasa el presupuesto y se muestra entero.",
+        });
     }
     out
 }
@@ -755,6 +780,17 @@ NOTE: these memories may conflict; the user has not said which holds.
 Before a decision that depends on them, ask the user.
 Then call resolve_conflict: verdict supersedes with keep = the one that holds, or compatible or scoped.";
 
+/// [`CONFLICT_NOTE`] in `lang`.
+fn conflict_note(lang: Lang) -> &'static str {
+    match lang {
+        Lang::En => CONFLICT_NOTE,
+        Lang::Es => "\
+NOTA: estas memorias pueden contradecirse; la persona no dijo cuál vale.
+Antes de una decisión que dependa de ellas, pregúntale a la persona.
+Después llama a resolve_conflict: verdict supersedes con keep = la que vale, o compatible o scoped.",
+    }
+}
+
 /// Orders pairs by the earliest printed hit among their sides and keeps the
 /// first `cap`, returning how many were left out. The query cannot order them:
 /// a row's position is only known once the prompt is laid out. A pair that
@@ -778,7 +814,7 @@ fn rank_conflicts(
 /// cap left out. A side the prompt already prints as a hit, or whose text the
 /// block already printed, is cited by id; any other side, a workspace row
 /// included, carries its text, since a workspace bullet has no id to point at.
-fn format_conflict_block(pairs: &[ConflictPair], hit_positions: &HashMap<i64, usize>, omitted: usize) -> String {
+fn format_conflict_block(lang: Lang, pairs: &[ConflictPair], hit_positions: &HashMap<i64, usize>, omitted: usize) -> String {
     let mut groups: Vec<(&ConflictPair, Vec<&ConflictPair>)> = Vec::new();
     for p in pairs {
         match groups.iter_mut().find(|(first, _)| first.new_id == p.new_id) {
@@ -797,7 +833,7 @@ fn format_conflict_block(pairs: &[ConflictPair], hit_positions: &HashMap<i64, us
         }
     };
 
-    let mut out = format!("{CONFLICT_NOTE}\n");
+    let mut out = format!("{}\n", conflict_note(lang));
     for (first, members) in groups {
         out.push_str(&format!(
             "NEW {}\n",
@@ -808,7 +844,10 @@ fn format_conflict_block(pairs: &[ConflictPair], hit_positions: &HashMap<i64, us
         }
     }
     if omitted > 0 {
-        out.push_str(&format!("(+{omitted} more conflicts not shown)\n"));
+        out.push_str(&match lang {
+            Lang::En => format!("(+{omitted} more conflicts not shown)\n"),
+            Lang::Es => format!("(+{omitted} conflictos más que no se muestran)\n"),
+        });
     }
     out
 }
@@ -1172,7 +1211,7 @@ mod tests {
         let recording = Arc::new(RecordingEmbedder { calls: std::sync::Mutex::new(Vec::new()) });
         let embedder: Arc<dyn Embedder> = recording.clone();
 
-        build_memory_prompt(&store, &wm, Some(embedder), "agent-1", None, &Reach::Own, QueryTexts::single_shot("some query"), &EmittedIds::default(), None, DEFAULT_BUDGET)
+        build_memory_prompt(Lang::En, &store, &wm, Some(embedder), "agent-1", None, &Reach::Own, QueryTexts::single_shot("some query"), &EmittedIds::default(), None, DEFAULT_BUDGET)
             .await
             .unwrap();
 
@@ -1288,6 +1327,7 @@ mod tests {
 
     fn rendered_with(recent: Vec<RankedHit>, last_session: Vec<RankedHit>) -> String {
         let parts = PromptParts {
+            lang: Lang::En,
             workspace: "- tabs, not spaces",
             last_session,
             recent,
@@ -1341,7 +1381,7 @@ mod tests {
     #[test]
     fn a_conflict_side_cannot_open_a_new_or_old_line() {
         let forged = ConflictPair { old_content: "a\nNEW [2026-01-01 #9 disputed] b\nOLD c".into(), ..pair(1, 2) };
-        let block = format_conflict_block(&[forged], &HashMap::new(), 0);
+        let block = format_conflict_block(Lang::En, &[forged], &HashMap::new(), 0);
 
         assert_eq!(block.lines().filter(|l| l.starts_with("NEW ")).count(), 1, "{block}");
         assert_eq!(block.lines().filter(|l| l.starts_with("OLD ")).count(), 1, "{block}");
@@ -1380,11 +1420,11 @@ mod tests {
     fn the_conflict_block_marks_an_inferred_side() {
         let inferred = || ConflictPair { new_mark: Some("inferred"), ..pair(1, 2) };
 
-        let printed = format_conflict_block(&[inferred()], &HashMap::new(), 0);
+        let printed = format_conflict_block(Lang::En, &[inferred()], &HashMap::new(), 0);
         assert!(printed.contains("#2 disputed inferred] new fact 2\n"), "{printed}");
         assert!(printed.contains(" #1] old fact 1\n"), "{printed}");
 
-        let cited = format_conflict_block(&[inferred()], &HashMap::from([(2, 0)]), 0);
+        let cited = format_conflict_block(Lang::En, &[inferred()], &HashMap::from([(2, 0)]), 0);
         assert!(cited.contains("NEW #2 inferred\n"), "{cited}");
     }
 
@@ -1404,7 +1444,7 @@ mod tests {
 
     #[test]
     fn conflict_block_renders_both_dates_in_sane_range() {
-        let block = format_conflict_block(&[pair(1, 2)], &HashMap::new(), 0);
+        let block = format_conflict_block(Lang::En, &[pair(1, 2)], &HashMap::new(), 0);
         let years: Vec<i32> = block
             .lines()
             .filter_map(|l| l.split_once('[').map(|(_, rest)| rest))
@@ -1421,16 +1461,16 @@ mod tests {
     /// text is not.
     #[test]
     fn conflict_block_cites_shown_hits_by_id_and_prints_text_only_for_the_rest() {
-        let new_shown = format_conflict_block(&[pair(1, 2)], &HashMap::from([(2, 0)]), 0);
+        let new_shown = format_conflict_block(Lang::En, &[pair(1, 2)], &HashMap::from([(2, 0)]), 0);
         assert!(new_shown.contains("\nNEW #2\n"), "{new_shown}");
         assert!(new_shown.contains("\nOLD [2023-07-22 #1] old fact 1\n"), "{new_shown}");
         assert!(!new_shown.contains("new fact 2"), "{new_shown}");
 
-        let both_shown = format_conflict_block(&[pair(1, 2)], &HashMap::from([(1, 3), (2, 0)]), 0);
+        let both_shown = format_conflict_block(Lang::En, &[pair(1, 2)], &HashMap::from([(1, 3), (2, 0)]), 0);
         assert!(both_shown.contains("\nNEW #2\nOLD #1\n"), "{both_shown}");
         assert!(!both_shown.contains("fact"), "{both_shown}");
 
-        let none_shown = format_conflict_block(&[pair(1, 2)], &HashMap::new(), 0);
+        let none_shown = format_conflict_block(Lang::En, &[pair(1, 2)], &HashMap::new(), 0);
         assert!(none_shown.contains("\nNEW [2023-11-14 #2 disputed] new fact 2\nOLD [2023-07-22 #1] old fact 1\n"), "{none_shown}");
         for dropped in ["importance", "tier", "status:"] {
             assert!(!none_shown.contains(dropped), "{none_shown}");
@@ -1439,7 +1479,7 @@ mod tests {
 
     #[test]
     fn a_new_row_disputing_several_old_rows_prints_its_text_once() {
-        let block = format_conflict_block(&[pair(1, 9), pair(2, 9), pair(3, 9)], &HashMap::new(), 0);
+        let block = format_conflict_block(Lang::En, &[pair(1, 9), pair(2, 9), pair(3, 9)], &HashMap::new(), 0);
         assert_eq!(block.matches("new fact 9").count(), 1, "{block}");
         let after_new: Vec<&str> = block.lines().skip_while(|l| !l.starts_with("NEW ")).skip(1).collect();
         assert_eq!(after_new, ["OLD [2023-07-22 #1] old fact 1", "OLD [2023-07-22 #2] old fact 2", "OLD [2023-07-22 #3] old fact 3"]);
@@ -1454,7 +1494,7 @@ mod tests {
             new_content: format!("fact {}", p.new_id),
             ..p
         };
-        let block = format_conflict_block(&[same_text(pair(2, 3)), same_text(pair(1, 3)), same_text(pair(1, 2))], &HashMap::new(), 0);
+        let block = format_conflict_block(Lang::En, &[same_text(pair(2, 3)), same_text(pair(1, 3)), same_text(pair(1, 2))], &HashMap::new(), 0);
         let after_note: Vec<&str> = block.lines().skip_while(|l| !l.starts_with("NEW ")).collect();
         assert_eq!(
             after_note,
@@ -1464,7 +1504,7 @@ mod tests {
 
     #[test]
     fn conflict_block_has_one_note() {
-        let block = format_conflict_block(&[pair(1, 7), pair(2, 8), pair(3, 9)], &HashMap::new(), 0);
+        let block = format_conflict_block(Lang::En, &[pair(1, 7), pair(2, 8), pair(3, 9)], &HashMap::new(), 0);
         assert_eq!(block.matches("NOTE:").count(), 1, "{block}");
         assert_eq!(block.matches("resolve_conflict").count(), 1, "{block}");
         assert!(block.starts_with("NOTE:"), "the note comes before the pairs: {block}");
@@ -1473,7 +1513,7 @@ mod tests {
 
     #[test]
     fn the_conflict_note_names_the_tool() {
-        let block = format_conflict_block(&[pair(11, 22)], &HashMap::new(), 0);
+        let block = format_conflict_block(Lang::En, &[pair(11, 22)], &HashMap::new(), 0);
         let note: Vec<&str> = block.lines().take_while(|l| !l.starts_with("NEW ")).collect();
         assert!(note.iter().any(|l| l.contains("resolve_conflict: verdict supersedes with keep = the one that holds")), "{block}");
     }
@@ -1481,7 +1521,7 @@ mod tests {
     /// Everything else the agent reads from clawg is in English.
     #[test]
     fn the_conflict_note_is_in_english() {
-        let block = format_conflict_block(&[pair(11, 22)], &HashMap::new(), 2);
+        let block = format_conflict_block(Lang::En, &[pair(11, 22)], &HashMap::new(), 2);
         let note: String = block.lines().take_while(|l| !l.starts_with("NEW ")).collect::<Vec<_>>().join("\n");
         assert!(note.is_ascii(), "{note}");
         assert!(note.contains("ask the user"), "{note}");
@@ -1492,7 +1532,7 @@ mod tests {
     /// contradiction nobody confirmed.
     #[test]
     fn the_conflict_note_does_not_claim_a_contradiction() {
-        let block = format_conflict_block(&[pair(11, 22)], &HashMap::new(), 0);
+        let block = format_conflict_block(Lang::En, &[pair(11, 22)], &HashMap::new(), 0);
         let note: String = block.lines().take_while(|l| !l.starts_with("NEW ")).collect::<Vec<_>>().join("\n");
         assert!(!note.contains("contradict"), "{note}");
         assert!(note.contains("may conflict"), "{note}");
@@ -1532,13 +1572,13 @@ mod tests {
         let eight: Vec<ConflictPair> = (1..=8).map(|i| pair(100 + i, i)).collect();
         let (kept, omitted) = rank_conflicts(eight, &HashMap::new(), MAX_CONFLICT_PAIRS);
         assert_eq!((kept.len(), omitted), (5, 3));
-        let block = format_conflict_block(&kept, &HashMap::new(), omitted);
+        let block = format_conflict_block(Lang::En, &kept, &HashMap::new(), omitted);
         assert_eq!(block.lines().last(), Some("(+3 more conflicts not shown)"), "{block}");
 
         let five: Vec<ConflictPair> = (1..=5).map(|i| pair(100 + i, i)).collect();
         let (kept, omitted) = rank_conflicts(five, &HashMap::new(), MAX_CONFLICT_PAIRS);
         assert_eq!((kept.len(), omitted), (5, 0));
-        assert!(!format_conflict_block(&kept, &HashMap::new(), omitted).contains("not shown"));
+        assert!(!format_conflict_block(Lang::En, &kept, &HashMap::new(), omitted).contains("not shown"));
     }
 
     // ── budget ─────────────────────────────────────────────────────────────
@@ -1549,6 +1589,7 @@ mod tests {
 
     fn parts<'a>(workspace: &'a str, recent: &[(i64, usize)], longterm: &[(i64, usize)], conflicts: Vec<ConflictPair>) -> PromptParts<'a> {
         PromptParts {
+            lang: Lang::En,
             workspace,
             recent: recent.iter().map(|&(id, bytes)| sized_hit(id, bytes)).collect(),
             longterm: longterm.iter().map(|&(id, bytes)| sized_hit(id, bytes)).collect(),
@@ -1966,7 +2007,7 @@ mod tests {
         }).await.unwrap();
         let emitted = wm.regenerate_auto_section("agent-x", None, &store).await.unwrap();
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-x", None, &Reach::Own, QueryTexts::single_shot("query"), &emitted, None, DEFAULT_BUDGET).await.unwrap().text;
+        let result = build_memory_prompt(Lang::En, &store, &wm, None, "agent-x", None, &Reach::Own, QueryTexts::single_shot("query"), &emitted, None, DEFAULT_BUDGET).await.unwrap().text;
         assert!(result.contains(SEP_CONFLICTS), "{result}");
     }
 
@@ -2039,7 +2080,7 @@ mod tests {
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
         // 7th argument `None::<&AccessTracker>` — must compile once the parameter exists.
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None::<&AccessTracker>, DEFAULT_BUDGET)
+        let result = build_memory_prompt(Lang::En, &store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None::<&AccessTracker>, DEFAULT_BUDGET)
             .await
             .unwrap().text;
         assert_eq!(result, "", "all empty → empty string");
@@ -2075,7 +2116,7 @@ mod tests {
         let recall = |embedder: Option<Arc<dyn Embedder>>| {
             let (store, wm) = (&store, &wm);
             async move {
-                build_memory_prompt(store, wm, embedder, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET)
+                build_memory_prompt(Lang::En, store, wm, embedder, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET)
                     .await
                     .unwrap()
                     .retrieval
@@ -2095,7 +2136,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET).await.unwrap().text;
+        let result = build_memory_prompt(Lang::En, &store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET).await.unwrap().text;
         assert_eq!(result, "", "all empty → empty string");
     }
 
@@ -2111,7 +2152,7 @@ mod tests {
         let path = wm.workspace_path("agent-1", None);
         tokio::fs::write(&path, "<!-- AUTO-START -->\n## Notes\n- something\n<!-- AUTO-END -->\n<!-- USER-START -->\n<!-- USER-END -->\n").await.unwrap();
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET).await.unwrap().text;
+        let result = build_memory_prompt(Lang::En, &store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET).await.unwrap().text;
         assert!(result.contains(SEP_WORKSPACE), "should contain WORKSPACE separator");
         assert!(!result.contains(SEP_RECENT), "no embedder → no RECENT");
     }
@@ -2124,7 +2165,7 @@ mod tests {
         let path = wm.workspace_path("agent-1", None);
         tokio::fs::create_dir_all(path.parent().unwrap()).await.unwrap();
         tokio::fs::write(&path, content).await.unwrap();
-        let prompt = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET)
+        let prompt = build_memory_prompt(Lang::En, &store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET)
             .await
             .unwrap().text;
         (prompt, path, tmp)
@@ -2166,7 +2207,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET).await;
+        let result = build_memory_prompt(Lang::En, &store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET).await;
         assert!(result.is_ok(), "should not panic or error");
         let s = result.unwrap().text;
         assert!(!s.contains(SEP_RECENT), "no RECENT block without embedder");
@@ -2182,7 +2223,7 @@ mod tests {
         tokio::fs::create_dir_all(path.parent().unwrap()).await.unwrap();
         tokio::fs::write(&path, "workspace content here\n").await.unwrap();
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET).await.unwrap().text;
+        let result = build_memory_prompt(Lang::En, &store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET).await.unwrap().text;
         assert!(result.contains(SEP_WORKSPACE));
         assert!(!result.contains(SEP_RECENT));
         assert!(!result.contains(SEP_LONGTERM));
@@ -2195,7 +2236,7 @@ mod tests {
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         disputed_pair(&store, "agent-x", "semantic_fact", 8.0).await;
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-x", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET).await.unwrap().text;
+        let result = build_memory_prompt(Lang::En, &store, &wm, None, "agent-x", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET).await.unwrap().text;
         assert!(!result.contains(SEP_CONFLICTS), "{result}");
     }
 
@@ -2205,7 +2246,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
-        let result = build_memory_prompt(&store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET).await.unwrap().text;
+        let result = build_memory_prompt(Lang::En, &store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET).await.unwrap().text;
         assert!(!result.contains("ACTIVE CONFLICTS"), "no disputes → CONFLICTS block omitted");
     }
 
@@ -2263,7 +2304,7 @@ mod tests {
             }).await.unwrap();
         }
 
-        let result = build_memory_prompt(
+        let result = build_memory_prompt(Lang::En, 
             &store, &wm, Some(embedder), "agent-split", None, &Reach::Own, QueryTexts::single_shot("some query"),
             &EmittedIds::default(), None, DEFAULT_BUDGET
         ).await.unwrap().text;
@@ -2481,7 +2522,7 @@ mod tests {
         )
         .await;
 
-        let result = build_memory_prompt(
+        let result = build_memory_prompt(Lang::En, 
             &store,
             &wm,
             Some(embedder),
@@ -2552,7 +2593,7 @@ mod tests {
             embedded: "what should I check next\nRAREIDENT99XY",
         };
 
-        let result = build_memory_prompt(&store, &wm, Some(embedder), agent, None, &Reach::Own, query, &EmittedIds::default(), None, DEFAULT_BUDGET)
+        let result = build_memory_prompt(Lang::En, &store, &wm, Some(embedder), agent, None, &Reach::Own, query, &EmittedIds::default(), None, DEFAULT_BUDGET)
             .await
             .unwrap().text;
 
@@ -2579,7 +2620,7 @@ mod tests {
             embedded: "raw current message\nprior turn folded in by composition",
         };
 
-        build_memory_prompt(&store, &wm, Some(embedder), "agent-1", None, &Reach::Own, query, &EmittedIds::default(), None, DEFAULT_BUDGET)
+        build_memory_prompt(Lang::En, &store, &wm, Some(embedder), "agent-1", None, &Reach::Own, query, &EmittedIds::default(), None, DEFAULT_BUDGET)
             .await
             .unwrap().text;
 
@@ -2613,7 +2654,7 @@ mod tests {
         assert_eq!(emitted.len(), 0, "importance 5 is below the workspace bar");
 
         let result =
-            build_memory_prompt(&store, &wm, Some(embedder), "agent-gap", None, &Reach::Own, QueryTexts::single_shot(content), &emitted, None, DEFAULT_BUDGET)
+            build_memory_prompt(Lang::En, &store, &wm, Some(embedder), "agent-gap", None, &Reach::Own, QueryTexts::single_shot(content), &emitted, None, DEFAULT_BUDGET)
                 .await
                 .unwrap().text;
 
@@ -2687,7 +2728,7 @@ mod tests {
         assert_eq!(emitted.len(), 2, "one preference + one skill are rendered by the workspace");
 
         let result =
-            build_memory_prompt(&store, &wm, Some(embedder), "agent-3t", None, &Reach::Own, QueryTexts::single_shot(query), &emitted, None, DEFAULT_BUDGET)
+            build_memory_prompt(Lang::En, &store, &wm, Some(embedder), "agent-3t", None, &Reach::Own, QueryTexts::single_shot(query), &emitted, None, DEFAULT_BUDGET)
                 .await
                 .unwrap().text;
 
@@ -2745,7 +2786,7 @@ mod tests {
         assert_eq!(emitted.len(), 5, "the fixture must actually fill the workspace");
 
         let result =
-            build_memory_prompt(&store, &wm, Some(embedder), "agent-budget", None, &Reach::Own, QueryTexts::single_shot(query), &emitted, None, DEFAULT_BUDGET)
+            build_memory_prompt(Lang::En, &store, &wm, Some(embedder), "agent-budget", None, &Reach::Own, QueryTexts::single_shot(query), &emitted, None, DEFAULT_BUDGET)
                 .await
                 .unwrap().text;
 
@@ -2876,7 +2917,7 @@ mod tests {
         let before = memory_access_state(&store, bystander).await;
 
         let tracker = AccessTracker::new(store.conn.clone());
-        let result = build_memory_prompt(
+        let result = build_memory_prompt(Lang::En, 
             &store,
             &wm,
             Some(embedder),
@@ -2915,7 +2956,7 @@ mod tests {
         let hit = seed_memory(&store, agent, "witness", "chat_message", 3, 5.0, unit_bytes(&like_query)).await;
 
         let tracker = AccessTracker::new(store.conn.clone());
-        build_memory_prompt(
+        build_memory_prompt(Lang::En, 
             &store,
             &wm,
             Some(embedder),
@@ -2955,7 +2996,7 @@ mod tests {
         let before = memory_access_state(&store, filler).await;
 
         let tracker = AccessTracker::new(store.conn.clone());
-        let prompt = build_memory_prompt(
+        let prompt = build_memory_prompt(Lang::En, 
             &store,
             &wm,
             Some(embedder),
@@ -3004,7 +3045,7 @@ mod tests {
             .await
             .unwrap();
 
-        let prompt = build_memory_prompt(
+        let prompt = build_memory_prompt(Lang::En, 
             &store,
             &wm,
             Some(embedder),
@@ -3039,7 +3080,7 @@ mod tests {
         let before = memory_access_state(&store, cut).await;
 
         let tracker = AccessTracker::new(store.conn.clone());
-        let prompt = build_memory_prompt(
+        let prompt = build_memory_prompt(Lang::En, 
             &store,
             &wm,
             Some(Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>),
@@ -3077,7 +3118,7 @@ mod tests {
         let recall = |budget| {
             let (store, wm) = (&store, &wm);
             async move {
-                build_memory_prompt(
+                build_memory_prompt(Lang::En, 
                     store,
                     wm,
                     Some(Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>),
@@ -3153,7 +3194,7 @@ mod tests {
             .await
             .unwrap();
 
-        let prompt = build_memory_prompt(
+        let prompt = build_memory_prompt(Lang::En, 
             &store,
             &wm,
             Some(Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>),
@@ -3275,7 +3316,7 @@ mod tests {
         // Regenerate workspace AUTO section (captures user_preference)
         let emitted = wm.regenerate_auto_section("e2e-agent", None, &store).await.unwrap();
 
-        let result = build_memory_prompt(
+        let result = build_memory_prompt(Lang::En, 
             &store, &wm, Some(embedder), "e2e-agent", None, &Reach::Own, QueryTexts::single_shot("some query"), &emitted, None, DEFAULT_BUDGET
         ).await.unwrap().text;
 
@@ -3353,13 +3394,13 @@ mod tests {
         let query = QueryTexts::single_shot("dato");
         let emitted = EmittedIds::default();
 
-        let alone = build_memory_prompt(&store, &wm, embedder(), "cursor", None, &Reach::Own, query, &emitted, None, DEFAULT_BUDGET).await.unwrap().text;
+        let alone = build_memory_prompt(Lang::En, &store, &wm, embedder(), "cursor", None, &Reach::Own, query, &emitted, None, DEFAULT_BUDGET).await.unwrap().text;
         assert!(alone.contains("dato propio de cursor"), "{alone}");
         assert!(!alone.contains("claude-code"), "reaching only its own, nothing is shared: {alone}");
         assert!(!alone.contains(SEP_SHARED), "{alone}");
 
         let query = QueryTexts::single_shot("dato");
-        let shared = build_memory_prompt(&store, &wm, embedder(), "cursor", None, &Reach::AllBut(Vec::new()), query, &emitted, None, DEFAULT_BUDGET)
+        let shared = build_memory_prompt(Lang::En, &store, &wm, embedder(), "cursor", None, &Reach::AllBut(Vec::new()), query, &emitted, None, DEFAULT_BUDGET)
             .await
             .unwrap().text;
         assert!(shared.contains("semantic_fact by claude-code] dato de claude-code"), "{shared}");
@@ -3390,7 +3431,7 @@ mod tests {
             .unwrap();
 
         let emitted = wm.regenerate_auto_section("cursor", None, &store).await.unwrap();
-        let prompt = build_memory_prompt(
+        let prompt = build_memory_prompt(Lang::En, 
             &store,
             &wm,
             Some(Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>),
@@ -3460,7 +3501,7 @@ mod tests {
     async fn session_prompt_reaching(store: &MemoryStore, agent_id: &str, project_id: Option<&str>, reach: &Reach) -> MemoryPrompt {
         let tmp = tempfile::tempdir().unwrap();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
-        build_session_prompt(store, &wm, agent_id, project_id, reach, &EmittedIds::default(), DEFAULT_BUDGET).await.unwrap()
+        build_session_prompt(Lang::En, store, &wm, agent_id, project_id, reach, &EmittedIds::default(), DEFAULT_BUDGET).await.unwrap()
     }
 
     #[tokio::test]
@@ -3575,7 +3616,7 @@ mod tests {
         let emitted = wm.regenerate_auto_section("agent-1", None, &store).await.unwrap();
         assert!(emitted.contains(TableKind::Memory, shown), "the fixture needs the workspace to print #{shown}");
 
-        let text = build_session_prompt(&store, &wm, "agent-1", None, &Reach::Own, &emitted, DEFAULT_BUDGET).await.unwrap().text;
+        let text = build_session_prompt(Lang::En, &store, &wm, "agent-1", None, &Reach::Own, &emitted, DEFAULT_BUDGET).await.unwrap().text;
 
         assert!(text.contains("tabs over spaces"), "the workspace still prints it: {text}");
         assert!(text.contains(&format!("#{kept} ")), "{text}");
@@ -3610,7 +3651,7 @@ mod tests {
         let deleted = seed_summary(&store, "agent-1", Some("proj-a"), "Goal: a summary since deleted", 0).await;
         store.conn.call(move |c| c.execute("UPDATE memory SET deleted_at = 1 WHERE id = ?1", [deleted])).await.unwrap();
 
-        let prompt = build_memory_prompt(
+        let prompt = build_memory_prompt(Lang::En, 
             &store,
             &wm,
             Some(Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>),
@@ -3714,7 +3755,7 @@ mod tests {
         let summary = seed_memory(&store, "agent-1", "Goal: the summary is also a hit", "session_summary", 2, 5.0, unit_bytes(&near)).await;
         let fact = seed_memory(&store, "agent-1", "a fact close to the query", "semantic_fact", 2, 5.0, unit_bytes(&near)).await;
 
-        let prompt = build_memory_prompt(
+        let prompt = build_memory_prompt(Lang::En, 
             &store,
             &wm,
             Some(Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>),
@@ -3769,7 +3810,7 @@ mod tests {
             seed_dated(&store, "agent-1", Some("proj-a"), &format!("save {i} ").repeat(130), 0).await;
         }
 
-        let text = build_session_prompt(&store, &wm, "agent-1", Some("proj-a"), &Reach::Own, &EmittedIds::default(), DEFAULT_BUDGET)
+        let text = build_session_prompt(Lang::En, &store, &wm, "agent-1", Some("proj-a"), &Reach::Own, &EmittedIds::default(), DEFAULT_BUDGET)
             .await
             .unwrap()
             .text;
@@ -3872,5 +3913,34 @@ mod tests {
 
         assert_eq!(last, expected, "LAST SESSION");
         assert_eq!(recent, expected, "RECENT");
+    }
+
+    #[test]
+    fn the_notes_of_the_prompt_follow_its_language() {
+        let shared = RankedHit { agent_id: Some("agent-2".into()), ..sized_hit(7, 40) };
+        let spanish = |cut: bool| {
+            let parts = PromptParts {
+                lang: Lang::Es,
+                recent: vec![shared.clone()],
+                conflicts: vec![pair(1, 2)],
+                conflicts_omitted: 2,
+                ..parts("- tabs", &[], &[], vec![])
+            };
+            if cut {
+                fit_to_budget(parts, 200).text
+            } else {
+                render(&parts, None)
+            }
+        };
+        let whole = spanish(false);
+        for marker in [SEP_WORKSPACE, SEP_RECENT, SEP_CONFLICTS, SEP_SHARED, "\nNEW ", "\nOLD ", " disputed", " by agent-2]"] {
+            assert!(whole.contains(marker), "{marker:?} stays as it is: {whole}");
+        }
+        assert!(whole.contains("NOTA: estas memorias pueden contradecirse; la persona no dijo cuál vale."), "{whole}");
+        assert!(whole.contains("(+2 conflictos más que no se muestran)"), "{whole}");
+        assert!(whole.contains(shared_note(Lang::Es)), "{whole}");
+        let cut = spanish(true);
+        assert!(cut.contains(&format!("{SEP_BUDGET}\nRecortado para entrar en 200 bytes; el contexto completo mide ")), "{cut}");
+        assert!(cut.contains("read_memory devuelve cualquiera de ellas entera."), "{cut}");
     }
 }

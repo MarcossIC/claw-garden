@@ -195,7 +195,7 @@ async fn answer(
     let text = match event {
         HookEvent::SessionStart => {
             let (context, health, ()) =
-                tokio::join!(client.recent_context(agent, Some(&project), SESSION_BUDGET), client.health(), register);
+                tokio::join!(client.recent_context(agent, Some(&project), SESSION_BUDGET, language), client.health(), register);
             let compacted = input.source.as_deref() == Some("compact");
             session_start_text(&context.ok()?, health.ok().as_ref(), compacted, language)
         }

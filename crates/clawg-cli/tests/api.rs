@@ -1639,6 +1639,28 @@ async fn context_without_a_query_does_not_need_the_embedder() {
     assert_eq!(body["retrieval"], json!({ "state": "recent", "hits": 0 }), "nothing was embedded: {body}");
 }
 
+#[tokio::test]
+async fn a_context_in_spanish_keeps_its_markers() {
+    let h = Harness::start().await;
+    let summary = json!({
+        "content": "Objetivo: cortar la rama. Próximos pasos: etiquetar la versión.",
+        "agent_id": "b",
+        "project_id": "p",
+        "memory_type": "session_summary",
+    });
+    h.post_json("/v1/memories", summary).await;
+    h.wait_for_rows("memory", 1).await;
+    let (status, body) = h.post_json("/v1/context", json!({ "agent_id": "a", "project_id": "p", "lang": "es" })).await;
+    assert_eq!(status, 200, "{body}");
+    let prompt = body["prompt"].as_str().unwrap();
+    for marker in ["=== LAST SESSION ===", "session_summary by b]", "=== SHARED ==="] {
+        assert!(prompt.contains(marker), "{marker:?} stays as it is: {prompt}");
+    }
+    assert!(prompt.contains("Las líneas marcadas \"by <agent>\" las guardó otro agente."), "{prompt}");
+    let (_, english) = h.post_json("/v1/context", json!({ "agent_id": "a", "project_id": "p" })).await;
+    assert!(english["prompt"].as_str().unwrap().contains("Lines marked \"by <agent>\" were saved by another agent."), "{english}");
+}
+
 /// Under the fake model only the row identical to the query scores; the
 /// others land below the cosine floor.
 #[tokio::test]

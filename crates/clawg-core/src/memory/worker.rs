@@ -2912,6 +2912,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let prompt = build_memory_prompt(
+            crate::preferences::Lang::En,
             &store, &wm, Some(embedder.clone() as Arc<dyn Embedder>),
             AGENT, None, &crate::memory::sharing::Reach::Own, QueryTexts::single_shot(&fresh.content),
             &crate::memory::workspace::EmittedIds::default(), None, DEFAULT_BUDGET,

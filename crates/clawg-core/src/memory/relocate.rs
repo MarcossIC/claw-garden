@@ -1225,6 +1225,7 @@ mod tests {
         let (reach, emitted) = (Reach::AllBut(Vec::new()), EmittedIds::default());
         let prompt = |project: &'static str| {
             build_memory_prompt(
+                crate::preferences::Lang::En,
                 &store,
                 &workspaces,
                 Some(Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>),
