@@ -1977,10 +1977,11 @@ async fn register(
         })?;
     if outcome.rekeyed > 0 {
         log::info!(
-            "{} joined {} rows of its earlier ids into project {}{}",
+            "{} joined {} rows of its earlier ids into project {}{}{}",
             root.display(),
             outcome.rekeyed,
             outcome.project_id,
+            outcome.move_id.map(|n| format!("; `clawg projects move --undo {n}` moves its memories back")).unwrap_or_default(),
             outcome.snapshot.as_ref().map(|s| format!("; the store before is {}", s.display())).unwrap_or_default()
         );
     }

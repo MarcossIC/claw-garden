@@ -51,6 +51,9 @@ pub struct RegisterOutcome {
     pub rekeyed: usize,
     /// Whether the daemon may read the root's files, as stored after this call.
     pub index_docs: bool,
+    /// The move in `memory_move` that joined the rows of `memory`, which
+    /// `clawg projects move --undo` takes.
+    pub move_id: Option<i64>,
     /// The `pre-rekey` snapshot taken before rows moved.
     pub snapshot: Option<PathBuf>,
 }
@@ -228,8 +231,14 @@ fn plan_in(c: &Connection, reg: &Registration<'_>) -> Result<Plan, RegisterError
 }
 
 /// Writes `plan` inside the caller's transaction and returns how many rows
-/// moved and the mark `index_docs` keeps.
-fn write_in(c: &Connection, reg: &Registration<'_>, plan: &Plan, now: TimestampMs) -> rusqlite::Result<(usize, bool)> {
+/// moved, the move that joined the rows of `memory`, and the mark
+/// `index_docs` keeps.
+fn write_in(
+    c: &Connection,
+    reg: &Registration<'_>,
+    plan: &Plan,
+    now: TimestampMs,
+) -> rusqlite::Result<(usize, Option<i64>, bool)> {
     let root_path = reg.root.to_string_lossy().into_owned();
     if plan.new_root {
         c.execute(
@@ -247,9 +256,10 @@ fn write_in(c: &Connection, reg: &Registration<'_>, plan: &Plan, now: TimestampM
             rusqlite::params![remote, plan.project_id, now],
         )?;
     }
-    let mut moved = 0;
+    let (mut moved, mut move_id) = (0, None);
     if !plan.legacy.is_empty() {
-        moved += merge_in(c, &plan.legacy, &plan.project_id, now)?.moved.len();
+        let merged = merge_in(c, &plan.legacy, &plan.project_id, now)?;
+        (moved, move_id) = (merged.moved.len(), merged.move_id);
         for legacy_id in &plan.legacy {
             for table in OTHER_PROJECT_TABLES {
                 c.execute(
@@ -266,7 +276,7 @@ fn write_in(c: &Connection, reg: &Registration<'_>, plan: &Plan, now: TimestampM
             }
         }
     }
-    Ok((moved, indexed || reg.index_docs))
+    Ok((moved, move_id, indexed || reg.index_docs))
 }
 
 /// The outcome of one pass of [`register_project`].
@@ -307,13 +317,15 @@ pub async fn register_project(
             if plan.moves && snapshot.is_none() {
                 return Ok(Pass::WouldMove);
             }
-            let (rekeyed, index_docs) = write_in(&tx, &reg, &plan, TimestampMs::now()).map_err(MemoryError::Sqlite)?;
+            let (rekeyed, move_id, index_docs) =
+                write_in(&tx, &reg, &plan, TimestampMs::now()).map_err(MemoryError::Sqlite)?;
             tx.commit().map_err(MemoryError::Sqlite)?;
             let outcome = RegisterOutcome {
                 project_id: plan.project_id,
                 root_id: plan.root_id,
                 rekeyed,
                 index_docs,
+                move_id,
                 snapshot,
             };
             Ok(Pass::Done(outcome, plan.legacy))
@@ -551,7 +563,9 @@ mod tests {
         let f = Fixture::seeded().await;
         let before = project_ids(&f.store).await;
         let legacy = ["src-1a2b".to_string()];
-        f.register(reg(Path::new("/work/repo"), &legacy)).await.unwrap();
+        let moved = f.register(reg(Path::new("/work/repo"), &legacy)).await.unwrap();
+        let again = f.register(reg(Path::new("/work/repo"), &legacy)).await.unwrap();
+        assert_eq!((moved.move_id, again.move_id), (Some(1), None), "a registration that moves nothing makes no move");
 
         undo_move_core(&f.store, &f.backups, 1, false).await.unwrap();
         f.store
