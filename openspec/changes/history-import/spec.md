@@ -48,16 +48,26 @@ El export MUST escribir `origin_project` en cada línea `memory` (`null` cuando 
 
 ## HI4. El adaptador de engram
 
-`engram::read` MUST ser una función pura que lee el JSON de un export de engram y devuelve sus notas, sus relaciones y lo que no se traduce. MUST aceptar `"version"` `0.1.0` y `0.2.0`, y MUST rechazar sin devolver nada un texto que no es JSON, que no es un objeto, sin `version` o con otra. Las fechas MUST leerse en UTC, como `YYYY-MM-DD HH:MM:SS` o RFC 3339.
+`engram::read` MUST ser una función pura que lee el JSON de un export de engram y devuelve sus notas, sus relaciones y lo que no se traduce. MUST aceptar `"version"` `0.1.0` y `0.2.0`, y MUST rechazar sin devolver nada un texto que no es JSON, que no es un objeto, sin `version` o con otra. Una lista de nivel superior ausente o `null` MUST leerse como vacía. Las fechas MUST leerse en UTC, como `YYYY-MM-DD HH:MM:SS` con o sin fracción de segundo (hasta 9 dígitos, truncada a milisegundos) o RFC 3339.
 
-De cada observación MUST tomar id, `sync_id`, sesión, tipo, título, contenido, proyecto (el de su sesión si la nota no tiene), scope, `topic_key`, `duplicate_count`, `last_seen_at`, `created_at`, `updated_at`, `deleted_at` y, en `0.2.0`, `pinned`; de cada prompt, id, `sync_id`, sesión, contenido, proyecto y fecha; de cada sesión con `summary`, el resumen como una nota más. MUST contar lo que no tiene lugar: `tool_name`, `review_after`, `superseded_by_sync_id` y `prompt_tombstones`.
+De cada observación MUST tomar id, `sync_id`, sesión, tipo, título, contenido, proyecto (el de su sesión si la nota no tiene), scope, `topic_key`, `revision_count`, `duplicate_count`, `last_seen_at`, `created_at`, `updated_at`, `deleted_at` y, en `0.2.0`, `pinned`; de cada prompt, id, `sync_id`, sesión, contenido, proyecto y fecha; de cada sesión con `summary`, el resumen como una nota más. MUST contar por su nombre lo que no tiene lugar: `tool_name`, `review_after`, `superseded_by_sync_id`, `prompt_tombstones` y todo campo presente, no nulo ni vacío, de una observación, un prompt, una sesión o una relación que el adaptador no lee, también uno que no conoce. MUST contar las notas con `revision_count` mayor que 1, que la fuente reescribió y cuyas versiones anteriores el export no trae.
 
 #### Escenario: versión desconocida
 - GIVEN un export con `"version":"0.3.0"`
 - WHEN se lee
 - THEN devuelve un error que nombra la versión y las que lee
 
-**Tests:** `an_unknown_or_missing_version_is_refused`, `a_0_1_0_export_reads_its_notes_prompts_and_session_summaries`, `a_0_2_0_export_reads_deletions_pins_and_relations`, `a_note_without_a_project_takes_its_sessions`, `dates_read_as_utc` (`crates/clawg-core/src/memory/portability/engram.rs`).
+#### Escenario: un export sin notas
+- GIVEN un export `0.2.0` con `"sessions": null`, `"observations": []` y `"prompts": null`
+- WHEN se lee
+- THEN no hay notas ni error
+
+#### Escenario: un campo que el adaptador no conoce
+- GIVEN una observación con un campo que el adaptador no lee
+- WHEN se lee
+- THEN la nota se lee igual y el campo se cuenta por su nombre
+
+**Tests:** `an_unknown_or_missing_version_is_refused`, `a_0_1_0_export_reads_its_notes_prompts_and_session_summaries`, `a_0_2_0_export_reads_deletions_pins_and_relations`, `null_lists_read_as_empty`, `fields_without_a_place_are_counted_by_name`, `notes_rewritten_at_the_source_are_counted`, `a_note_without_a_project_takes_its_sessions`, `dates_read_as_utc` (`crates/clawg-core/src/memory/portability/engram.rs`).
 
 ## HI5. Tipos y texto
 
@@ -194,11 +204,16 @@ Un prompt con texto MUST guardarse como `chat_message` del usuario, y el `summar
 - WHEN se corre con `--dry-run` y después sin él
 - THEN los dos reportes coinciden salvo `dry_run` y el snapshot, y el segundo dejó las filas
 
-**Tests:** `an_engram_import_stores_notes_and_a_dry_run_reports_the_same`, `import_refuses_an_unknown_source_or_a_mixed_map`, `an_engram_export_without_from_is_a_400`, `a_foreign_import_without_the_tokenizer_is_a_503` (`crates/clawg-cli/tests/api.rs`); `import_takes_a_source_and_project_maps` (`crates/clawg-cli/src/cli.rs`); `a_project_map_must_name_a_directory` (`crates/clawg-cli/src/import.rs`); `an_engram_export_imports_through_the_binary` (`crates/clawg-cli/tests/binary.rs`).
+#### Escenario: un export sin notas
+- GIVEN un export de engram sin notas, con `sessions` y `prompts` en `null`
+- WHEN se importa
+- THEN responde el reporte sin error y no inserta ninguna fila
+
+**Tests:** `an_engram_import_stores_notes_and_a_dry_run_reports_the_same`, `an_engram_export_without_notes_imports_nothing`, `import_refuses_an_unknown_source_or_a_mixed_map`, `an_engram_export_without_from_is_a_400`, `a_foreign_import_without_the_tokenizer_is_a_503` (`crates/clawg-cli/tests/api.rs`); `import_takes_a_source_and_project_maps` (`crates/clawg-cli/src/cli.rs`); `a_project_map_must_name_a_directory` (`crates/clawg-cli/src/import.rs`); `an_engram_export_imports_through_the_binary` (`crates/clawg-cli/tests/binary.rs`).
 
 ## HI17. El reporte
 
-El reporte MUST traer, además de lo de R7 de `specs/portability`, las filas insertadas por idioma (`by_lang`, para los dos formatos) y, para otra fuente, en `foreign`: la fuente y su versión; notas por tipo de la fuente con su tipo de destino; notas por proyecto de la fuente con su destino; los nombres sin mapa y las entradas del mapa sin notas; cuántas filas y cuántas notas en más de una pieza; cuántas notas se enmascararon; las claves reescritas y las calificadas, de qué a qué; las notas reemplazadas por otra de su origen; las absorbidas por igual texto; las presentes por proyecto donde están; las revisadas y las versiones viejas; las fechas acotadas; las borradas; las relaciones guardadas por estado y las contadas por motivo; lo que no tiene lugar, por campo; las sesiones descartadas; y las notas sin texto. `clawg import` MUST imprimirlo en el idioma del comando (CL3).
+El reporte MUST traer, además de lo de R7 de `specs/portability`, las filas insertadas por idioma (`by_lang`, para los dos formatos) y, para otra fuente, en `foreign`: la fuente y su versión; notas por tipo de la fuente con su tipo de destino; notas por proyecto de la fuente con su destino; los nombres sin mapa y las entradas del mapa sin notas; cuántas filas y cuántas notas en más de una pieza; cuántas notas se enmascararon; las claves reescritas y las calificadas, de qué a qué; las notas reemplazadas por otra de su origen; las absorbidas por igual texto; las presentes por proyecto donde están; las revisadas y las versiones viejas; las fechas acotadas; las borradas; las relaciones guardadas por estado y las contadas por motivo; lo que no tiene lugar, por campo, también los que el adaptador no conoce; las notas que la fuente reescribió; las sesiones descartadas; y las notas sin texto. `clawg import` MUST imprimirlo en el idioma del comando (CL3).
 
 **Tests:** `the_foreign_report_counts_what_the_import_did` (`import.rs`); `render_names_what_a_foreign_import_did` y `the_foreign_report_speaks_spanish` (`crates/clawg-cli/src/import.rs`).
 

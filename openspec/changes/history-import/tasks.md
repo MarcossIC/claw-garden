@@ -16,8 +16,8 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 ## 3. El modelo común y el adaptador (HI4)
 
-- [ ] Tests de `engram.rs` sobre exports escritos a mano, `0.1.0` y `0.2.0`, y los de `parse_utc` (`foreign.rs`).
-- [ ] `foreign.rs`, `engram.rs`; `days_from_civil` pasa a `pub(crate)`.
+- [ ] Tests de `engram.rs` sobre exports escritos a mano, `0.1.0` y `0.2.0` (listas en `null`, un campo que no conoce, notas reescritas en la fuente), y los de `parse_utc` (`foreign.rs`), con y sin fracción de segundo.
+- [ ] `foreign.rs`, `engram.rs` (listas `Option<Vec<_>>`, `extra` con `#[serde(flatten)]` contado por nombre); `days_from_civil` pasa a `pub(crate)`.
 - Commit: `feat(core): read an engram export into notes of a common model`
 
 ## 4. La traducción y el import de notas nuevas (HI5 a HI10, HI15)
@@ -51,7 +51,7 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 ## 9. Docs
 
-- [ ] `.claude/CLAUDE.md`: el comando, la API, la columna, el filtro y cómo exportar fuera del repo.
+- [ ] `.claude/CLAUDE.md`: el comando, la API, la columna, el filtro y cómo exportar todo (`engram export --all`) fuera del repo.
 - Commit: `docs: describe importing memories from another tool`
 
 ## 10. Verificación
@@ -59,7 +59,7 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 - [ ] `cargo test --workspace --target-dir target-test` y el clippy de `.claude/CLAUDE.md` en Windows.
 - [ ] Linux: queda al CI del pull request.
 - [ ] El binario real en un home temporal.
-- [ ] Perfil dev, con autorización: el export real con `--dry-run`, el import, una docena de búsquedas, cuánto tarda, si el daemon contesta mientras tanto, y `projects move --origin-project`.
+- [ ] Perfil dev, con autorización: el export real (`engram export --all`) con `--dry-run`, el import, una docena de búsquedas, cuánto tarda, si el daemon contesta mientras tanto, y `projects move --origin-project`.
 
 ## 11. Archive
 

@@ -6,8 +6,8 @@ Los enfoques de fondo están en la [exploración](exploration.md#enfoques-posibl
 
 En `crates/clawg-core/src/memory/portability/`:
 
-1. `foreign.rs`, el modelo común: `ForeignExport` (la fuente, su versión, las notas, las relaciones y los conteos de lo que no tiene lugar), `ForeignNote` (origen, clase `Observation | Prompt | SessionSummary`, tipo de la fuente, título, contenido, proyecto, si es `personal`, clave, sesión, fecha del texto, accesos, última vista, borrado, fijada) y `ForeignRelation` (origen de las dos notas, verbo, estado del juicio, si la marcó el usuario, motivo, evidencia, fechas, si fue reemplazada). Sin I/O ni dependencias del store.
-2. `engram.rs`, el adaptador: `read(text) -> Result<ForeignExport, ForeignError>`. Lee con `serde_json` structs propios del formato, con `#[serde(default)]` en lo opcional, así un campo que la fuente agregue después se ignora.
+1. `foreign.rs`, el modelo común: `ForeignExport` (la fuente, su versión, las notas, las relaciones, los conteos por campo de lo que no tiene lugar y cuántas notas reescribió la fuente), `ForeignNote` (origen, clase `Observation | Prompt | SessionSummary`, tipo de la fuente, título, contenido, proyecto, si es `personal`, clave, sesión, fecha del texto, accesos, última vista, borrado, fijada) y `ForeignRelation` (origen de las dos notas, verbo, estado del juicio, si la marcó el usuario, motivo, evidencia, fechas, si fue reemplazada). Sin I/O ni dependencias del store.
+2. `engram.rs`, el adaptador: `read(text) -> Result<ForeignExport, ForeignError>`. Lee con `serde_json` structs propios del formato, con `#[serde(default)]` en lo opcional. Las listas de nivel superior son `Option<Vec<_>>`: la fuente escribe `null` para una lista vacía, y `#[serde(default)]` cubre una clave ausente pero no un `null`, que serde rechaza (`invalid type: null, expected a sequence`). Cada struct junta en `#[serde(flatten)] extra: BTreeMap<String, Value>` las claves que no lee, y el adaptador cuenta por nombre cada una que no es `null` ni vacía, sumada a los campos conocidos sin lugar (`tool_name`, `review_after`, `superseded_by_sync_id`): un campo que la fuente agregue después aparece en el reporte en vez de perderse sin aviso.
 3. `translate.rs`, la traducción común: `translate(&ForeignExport, &TranslateOptions, &ChatChunker, now_ms) -> Translated`. Devuelve un `Parsed` de líneas `clawg-memories` (filas `memory`, `piece` y `conflict`, con ids sintéticos), el plan de cada nota (su origen, su fecha, si se acotó, el rango de sus filas) y la parte del reporte que no depende del store. Es pura salvo el chunker, que corta sin I/O con el tokenizer que ya tiene.
 
 Después, `import.rs` sigue por las tres pasadas de 43 (`prepare`, `place`, `write_links`) con dos agregados: el reconocimiento por origen (D3) y las transacciones por nota (D4).
@@ -17,6 +17,8 @@ Después, `import.rs` sigue por las tres pasadas de 43 (`prepare`, `place`, `wri
 | Un camino de escritura propio para notas | Repetiría `place` y `write_links` (piezas, pares, cadenas, gemelos, claves tomadas), que ya resuelven idempotencia y vínculos entre transacciones |
 | Traducir a texto JSON Lines y volver a leerlo | Un ida y vuelta sin uso: `Parsed` es lo que `prepare` recibe |
 | El adaptador en `clawg-cli` | Partir y enmascarar como un save necesita el chunker del daemon (A1 de la exploración) |
+| Ignorar los campos que el adaptador no lee | Un campo nuevo de la fuente se perdería sin que el reporte lo diga, contra «todo entra, sin pérdidas» |
+| Una lista cerrada de campos sin lugar | Cuenta sólo los que se conocían al escribirla: el próximo campo de la fuente se pierde igual |
 
 ## D2. Ids sintéticos en orden de fecha
 
@@ -67,7 +69,7 @@ Se agrupan las notas vivas por grupo de origen y hash del texto enmascarado. La 
 
 ## D7. Fechas
 
-`parse_utc` (pura, en `foreign.rs`) lee `YYYY-MM-DD HH:MM:SS`, el formato que engram escribe, y RFC 3339 (`T`, fracción opcional, `Z` o un desfasaje), y devuelve milisegundos UTC con `days_from_civil` de `crates/clawg-core/src/memory/backup.rs:252`, que pasa a `pub(crate)`. No se agrega una biblioteca de fechas para dos formatos.
+`parse_utc` (pura, en `foreign.rs`) lee `YYYY-MM-DD HH:MM:SS` con una fracción opcional de hasta 9 dígitos, las dos formas que engram escribe (sin fracción al guardar una nota; con nanosegundos al borrarla o revisarla, y en `exported_at`), y RFC 3339 (`T`, fracción opcional, `Z` o un desfasaje). La fracción se trunca a milisegundos, sin redondear, así una fecha nunca pasa al segundo siguiente y la misma da siempre el mismo `created_at`, que es lo que compara el reconocimiento por origen (D3). Devuelve milisegundos UTC con `days_from_civil` de `crates/clawg-core/src/memory/backup.rs:252`, que pasa a `pub(crate)`. No se agrega una biblioteca de fechas para dos formatos.
 
 ## D8. Relaciones
 
@@ -99,3 +101,12 @@ CREATE INDEX IF NOT EXISTS idx_memory_import_origin ON memory (created_by_ref)
 ```
 
 `MoveFilter` y `ListParams` suman `origin_project`, una igualdad más en el SQL que ya arman (`relocate.rs:490`, `push_filters` en `admin.rs`).
+
+## D12. El alcance del export
+
+Las versiones nuevas de engram exportan sólo el proyecto del directorio en que se corren, salvo con `--all`, y el archivo no dice qué alcance tuvo. El import no lo adivina: un export vacío se importa sin error y sin filas, y uno parcial se ve en las notas por proyecto de la fuente del reporte (HI17), que `--dry-run` muestra antes de escribir. El comando y las docs piden `engram export --all`.
+
+| Alternativa | Por qué no |
+|---|---|
+| Rechazar un export vacío | No protege ningún dato: no escribe nada igual, y el reporte ya dice que no trae notas |
+| Avisar cuando todas las notas vienen de un proyecto | Exportar un solo proyecto es válido, y el reporte ya lo muestra |
